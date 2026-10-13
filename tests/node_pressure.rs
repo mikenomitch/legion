@@ -294,12 +294,29 @@ async fn a_reported_eviction_removes_the_allocation_with_node_pressure() -> R<()
         .context("a stop notice for the evicted allocation")?;
     assert_eq!(notice.cause, StopCause::NodePressure);
 
-    let eval = cluster
+    // `evict-bursting` is the task's own doing, so the replacement waits out
+    // the move backoff: a delayed `job_reschedule`, announced by an
+    // `allocation.reschedule_deferred` event.
+    assert!(
+        cluster
+            .store()
+            .get_evals()?
+            .iter()
+            .any(|eval| eval.kind == "job_reschedule" && eval.job_id == "batch"),
+        "a delayed replacement eval was queued"
+    );
+    let deferred = cluster
         .store()
-        .get_next_eval()?
-        .context("a replacement eval was queued")?;
-    assert_eq!(eval.kind, "job_reschedule");
-    assert_eq!(eval.job_id, "batch");
+        .list_scheduler_events(&SchedulerEventFilter {
+            kind: Some("allocation.reschedule_deferred".into()),
+            ..Default::default()
+        })?;
+    assert!(
+        deferred
+            .iter()
+            .any(|event| event.allocation_id == Some(batch.id)),
+        "the deferral is announced: {deferred:?}"
+    );
 
     let events = cluster
         .store()

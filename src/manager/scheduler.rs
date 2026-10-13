@@ -30,7 +30,7 @@ pub use policy::{
     load_policy, SchedulerWeights, SchedulingContext, SchedulingPolicy,
     DEF_SCHEDULER_LOCALITY_WEIGHT,
 };
-use preemption::{eligible_victims, preemption_cost, select_victims, VictimCandidate};
+use preemption::{choose_victims, preemption_cost, VictimCandidate};
 pub use preemption::{
     PlannedPreemption, PreemptionMode, PreemptionSettings, DEFAULT_VICTIM_EXEMPT_AGE,
 };
@@ -221,6 +221,10 @@ pub struct PlanOutcome {
     /// not met yet (a batch dependency that has not exited). They are placed
     /// by the eval queued when the dependency reaches a terminal state.
     pub held_tasks: Vec<String>,
+    /// Replacements this pass withheld because they wait out a reschedule
+    /// backoff, as `task (count)`. The delayed `job_reschedule` the failure
+    /// queued places them once the backoff lapses.
+    pub backoff_held: Vec<String>,
 }
 
 impl PlanOutcome {
@@ -233,6 +237,7 @@ impl PlanOutcome {
             timings,
             unplaced: Vec::new(),
             held_tasks: Vec::new(),
+            backoff_held: Vec::new(),
         }
     }
 
@@ -254,6 +259,12 @@ impl PlanOutcome {
             parts.push(format!(
                 "waiting on dependencies: {}",
                 self.held_tasks.join(", ")
+            ));
+        }
+        if !self.backoff_held.is_empty() {
+            parts.push(format!(
+                "waiting out reschedule backoff: {}",
+                self.backoff_held.join(", ")
             ));
         }
         parts.join("; ")
@@ -488,6 +499,21 @@ struct PreemptorContext<'a> {
 struct PreemptionChoice {
     node_id: String,
     victims: Vec<VictimCandidate>,
+    /// True when the victims are only evictable once they age past
+    /// `victimExemptAge`. Only a dry run places on such a choice.
+    deferred: bool,
+}
+
+/// One preemption pass's findings across a placement's candidate nodes
+/// ([`Scheduler::cheapest_preemption`]).
+#[derive(Default)]
+struct PreemptionSearch {
+    /// The cheapest node's victim set, and its cost.
+    best: Option<(PreemptionChoice, (usize, u32))>,
+    /// The cost of every node that could be freed, for the tiebreak.
+    node_scores: HashMap<String, (usize, u32)>,
+    /// Why each node's candidates were rejected.
+    tallies: Vec<preemption::IneligibleTally>,
 }
 
 /// The preemption state of one `build_plan` run.
@@ -512,6 +538,16 @@ struct PreemptionPass {
     /// that emitted events would make repeatedly previewing a job look like
     /// repeatedly nearly-preempting one.
     journal_observed: bool,
+    /// True for a dry run (`job plan`). A preview reports the victims a
+    /// placement will take once they age past `victimExemptAge`, where the
+    /// applying plan has to wait for them instead (see `deferred_wait`).
+    preview: bool,
+    /// Set by the latest preemption attempt when `victimExemptAge` was all
+    /// that kept it from finding room: the seconds until the victims it would
+    /// take age past the guard. An applying plan puts it on the placement's
+    /// [`crate::manager::blocked::PlacementBlocked`], so the eval retries
+    /// then instead of waiting blocked for an unrelated capacity change.
+    deferred_wait: Option<u64>,
     /// Victim metadata by node, loaded lazily for the nodes actually asked
     /// about. `None` until the first preemption attempt in this plan.
     by_node: Option<HashMap<String, Vec<VictimCandidate>>>,
@@ -543,6 +579,7 @@ impl PreemptionPass {
         preemptor_job: &str,
         preemptor_config_id: &str,
         journal_observed: bool,
+        preview: bool,
         settings: &PreemptionSettings,
     ) -> Self {
         Self {
@@ -550,6 +587,8 @@ impl PreemptionPass {
             preemptor_job: preemptor_job.to_string(),
             preemptor_config_id: preemptor_config_id.to_string(),
             journal_observed,
+            preview,
+            deferred_wait: None,
             by_node: None,
             victims: Vec::new(),
             observed: Vec::new(),
@@ -728,6 +767,12 @@ impl PreemptionPass {
             );
         }
         let detail = self.rejected.describe();
+        if let Some(wait) = self.deferred_wait {
+            return format!(
+                "{base}; preemption found no eligible victims yet ({detail}). The victims it \
+                 would take age past victimExemptAge in {wait}s, and placement retries then"
+            );
+        }
         if detail.is_empty() {
             format!(
                 "{base}. Preemption found no eligible victims on any feasible node. \
@@ -1853,8 +1898,24 @@ impl<'a> Scheduler<'a> {
             }
         }
 
-        let required_counts =
+        let mut required_counts =
             Self::required_counts_for_mode(&tasks, mode.clone(), &snapshot.own_by_node);
+        // Replacements of failed allocations wait out their reschedule
+        // backoff (`Store::remove_failed_allocation`): whatever eval this is
+        // (the failure's own delayed reschedule, a capacity pass, a node
+        // join, regeneration), it leaves one replacement per active hold
+        // unplaced. A `Fresh` plan is a restart, whose `job_update` cleared
+        // the holds, or a new config, which has none.
+        let backoff_held = if matches!(mode, PlanMode::Reschedule) {
+            Self::withhold_backoff_replacements(
+                self.store,
+                job_config_id,
+                &tasks,
+                &mut required_counts,
+            )?
+        } else {
+            Vec::new()
+        };
 
         let build_started = std::time::Instant::now();
         let BuiltPlan {
@@ -1942,6 +2003,7 @@ impl<'a> Scheduler<'a> {
                 timings,
                 unplaced,
                 held_tasks,
+                backoff_held,
             });
         }
 
@@ -2105,6 +2167,7 @@ impl<'a> Scheduler<'a> {
             timings,
             unplaced,
             held_tasks,
+            backoff_held,
         };
         info!(
             %job_config_id,
@@ -2158,6 +2221,40 @@ impl<'a> Scheduler<'a> {
                 (*id, desired.saturating_sub(placed))
             })
             .collect()
+    }
+
+    /// Lower `required_counts` by the replacements waiting out a reschedule
+    /// backoff ([`Store::held_replacements_for_job_config`]), and name the
+    /// tasks that lost any, as `task (count)`, for the eval's outcome line.
+    fn withhold_backoff_replacements(
+        store: &Store,
+        job_config_id: &str,
+        tasks: &[(i64, TaskConfig, u32)],
+        required_counts: &mut HashMap<i64, u32>,
+    ) -> R<Vec<String>> {
+        let held = store.held_replacements_for_job_config(job_config_id)?;
+        let mut withheld = Vec::new();
+        for (task_id, task, _desired) in tasks {
+            let (Some(held), Some(required)) =
+                (held.get(task_id), required_counts.get_mut(task_id))
+            else {
+                continue;
+            };
+            let withhold = (*held).min(*required);
+            if withhold == 0 {
+                continue;
+            }
+            *required -= withhold;
+            withheld.push(format!("{} ({withhold})", task.name));
+        }
+        if !withheld.is_empty() {
+            info!(
+                %job_config_id,
+                withheld = %withheld.join(", "),
+                "Replacements wait out their reschedule backoff"
+            );
+        }
+        Ok(withheld)
     }
 
     fn existing_alloc_counts_by_task_node(
@@ -2224,6 +2321,7 @@ impl<'a> Scheduler<'a> {
             preemptor.job,
             job_config_id,
             preemptor.journal_observed,
+            !applying,
             &self.preemption,
         );
 
@@ -3387,17 +3485,11 @@ impl<'a> Scheduler<'a> {
                             &plan.task_request,
                         );
                     }
+                    let exempt_age = self.preemption.victim_exempt_age;
                     preemption
                         .victims
-                        .extend(chosen.victims.iter().map(|victim| PlannedPreemption {
-                            allocation_id: victim.allocation_id,
-                            node_id: victim.node_id.clone(),
-                            job_id: victim.job_id.clone(),
-                            job_config_id: victim.job_config_id.clone(),
-                            task_config_id: victim.task_config_id,
-                            task_name: victim.task_name.clone(),
-                            band: victim.band,
-                            kill_after_secs: victim.kill_after_secs,
+                        .extend(chosen.victims.iter().map(|victim| {
+                            victim.planned(Self::victim_wait(&chosen, victim, exempt_age))
                         }));
                     eligible = full_but_allowed
                         .iter()
@@ -3422,25 +3514,56 @@ impl<'a> Scheduler<'a> {
                 // blocks the eval under the task's class (or the node a
                 // restore is pinned to) until capacity that could help
                 // appears (docs/scheduler-and-eval-loop.md, "Blocked evals").
-                let reason = match port_conflict {
-                    Some(port) => format!(
+                let next_pin = if hard_restore_pins > 0 || floating_restores.is_empty() {
+                    pins.front()
+                } else {
+                    None
+                };
+                let reason = match (port_conflict, next_pin) {
+                    (Some(port), _) => format!(
                         "Failed to place task {}: static port {port} is already in use on every \
                          node it is allowed on that has room for it. A static port fits one \
                          allocation per node: add nodes, lower the count, or use a dynamic port",
                         task_config.name
                     ),
-                    None => preemption.no_placement_error(task_config),
+                    // The placement can only go to its pinned node, and that
+                    // node is not a candidate at all (left out of this pass,
+                    // unschedulable, or no longer matching the task). That is
+                    // the whole story: the other nodes being full, and
+                    // preemption having nothing to look at there, are not.
+                    // The generic message hid this on the spot check.
+                    (None, Some((instance_id, node_id)))
+                        if !candidates.iter().any(|node| node.id == *node_id) =>
+                    {
+                        format!(
+                            "Failed to place task {}: instance {instance_id} holds node-local \
+                             storage on node {node_id}, {}",
+                            task_config.name,
+                            self.pinned_node_unusable_reason(
+                                node_id,
+                                node_lookup,
+                                &candidates,
+                                &static_ports,
+                                port_ledger,
+                                allocations_by_node,
+                            )
+                        )
+                    }
+                    (None, _) => preemption.no_placement_error(task_config),
                 };
-                let pinned_node = if hard_restore_pins > 0 || floating_restores.is_empty() {
-                    pins.front().map(|(_, node_id)| node_id.as_str())
-                } else {
-                    None
-                };
+                let pinned_node = next_pin.map(|(_, node_id)| node_id.as_str());
                 let blocked = crate::manager::blocked::PlacementBlocked::for_task(
                     task_config,
                     task_id,
                     pinned_node,
                     reason.clone(),
+                )
+                // Victims too young to take now are old enough in this
+                // long; one more second covers the timestamps' rounding.
+                .with_retry_after(
+                    preemption
+                        .deferred_wait
+                        .map(|wait| std::time::Duration::from_secs(wait + 1)),
                 );
                 return Self::record_unplaced(
                     partial,
@@ -3460,10 +3583,26 @@ impl<'a> Scheduler<'a> {
             // plan already put there) cannot hold the task's node-local
             // volumes. Nodes that don't report disk are not excluded — missing
             // data is not evidence of a full disk.
+            //
+            // An instance going back to the node that already holds its
+            // volume provisions nothing there, so its storage `size` is not
+            // charged on that node: the bytes are already in the node's used
+            // space. Charging them again stranded a failed slot instance whose
+            // node had less free disk than its declared size (spot check
+            // 2026-10-12: "healthy but has no room" on a 12%-reserved node).
+            // With no restore ahead of it, the next placement takes the front
+            // volume pin.
+            let provisioned_on = (hard_restore_pins == 0 && floating_restores.is_empty())
+                .then(|| pins.front().map(|(_, node_id)| node_id.as_str()))
+                .flatten();
             let eligible: Vec<&Node> = eligible
                 .into_iter()
                 .filter(|node| {
-                    let wanted = task_local_volume_bytes(node, task_config);
+                    let wanted = task_local_volume_bytes(
+                        node,
+                        task_config,
+                        provisioned_on == Some(node.id.as_str()),
+                    );
                     if wanted == 0 {
                         return true;
                     }
@@ -3497,6 +3636,9 @@ impl<'a> Scheduler<'a> {
             // A pinned instance is not a preference: placing it elsewhere would
             // silently start the workload on empty storage, so failing the eval
             // with a diagnostic is the correct outcome.
+            // Whether the pin this placement takes is a volume pin (its
+            // storage already exists on that node), for the disk ledger.
+            let takes_volume_pin = provisioned_on.is_some();
             let (pin, floating) = if hard_restore_pins > 0 {
                 hard_restore_pins -= 1;
                 (pins.pop_front(), None)
@@ -3629,34 +3771,14 @@ impl<'a> Scheduler<'a> {
                         // advice; a healthy node that is full, port-blocked,
                         // or excluded from this pass must never prompt anyone
                         // to delete data they have not lost.
-                        let why = if node_lookup.get(node_id.as_str()).is_none() {
-                            self.pinned_node_absent_reason(node_id)
-                        } else if !candidates.iter().any(|node| node.id == *node_id) {
-                            "which is healthy but no longer satisfies the task's constraints, \
-                             permit, or volume drivers. Its data is intact; restore the node's \
-                             attributes to place it there again"
-                                .to_string()
-                        } else if let Some(port) = (!static_ports.is_empty())
-                            .then(|| {
-                                port_ledger.conflict(
-                                    node_id.as_str(),
-                                    &static_ports,
-                                    allocations_by_node,
-                                )
-                            })
-                            .flatten()
-                        {
-                            format!(
-                                "which is healthy but has static port {port} in use by another \
-                                 allocation. Its data is intact; it is placed there once the \
-                                 port is free"
-                            )
-                        } else {
-                            "which is healthy but has no room for it right now (CPU, memory, \
-                             disk, or a `distinct` rule). Its data is intact; it is placed \
-                             there once the node has room"
-                                .to_string()
-                        };
+                        let why = self.pinned_node_unusable_reason(
+                            node_id,
+                            node_lookup,
+                            &candidates,
+                            &static_ports,
+                            port_ledger,
+                            allocations_by_node,
+                        );
                         let reason = format!(
                             "Failed to place task {}: instance {instance_id} holds \
                              node-local storage on node {node_id}, {why}",
@@ -3802,7 +3924,9 @@ impl<'a> Scheduler<'a> {
             }
             let placed_node = node_lookup.get(node_id.as_str());
             if let Some(node) = placed_node {
-                let wanted = task_local_volume_bytes(node, task_config);
+                let storage_provisioned =
+                    takes_volume_pin && pin.as_ref().is_some_and(|(_, pinned)| *pinned == node_id);
+                let wanted = task_local_volume_bytes(node, task_config, storage_provisioned);
                 if wanted > 0 {
                     *planned_local_bytes.entry(node_id.clone()).or_default() += wanted;
                 }
@@ -3858,12 +3982,54 @@ impl<'a> Scheduler<'a> {
         }
     }
 
+    /// Why a pinned instance's node cannot take it in this pass, worded as
+    /// the tail of "holds node-local storage on node X, …". Only a node that
+    /// is really gone gets the "abandon the data" advice: a healthy node that
+    /// is full, port-blocked, or left out of this pass must never prompt
+    /// anyone to delete data they have not lost.
+    fn pinned_node_unusable_reason(
+        &self,
+        node_id: &str,
+        node_lookup: &AvailableNodes,
+        candidates: &[&Node],
+        static_ports: &[u16],
+        port_ledger: &mut PortLedger,
+        allocations_by_node: &SharedNodeAllocations,
+    ) -> String {
+        if node_lookup.get(node_id).is_none() {
+            return self.pinned_node_absent_reason(node_id);
+        }
+        if !candidates.iter().any(|node| node.id == node_id) {
+            return "which is healthy but no longer satisfies the task's constraints, permit, \
+                    or volume drivers. Its data is intact; restore the node's attributes to \
+                    place it there again"
+                .to_string();
+        }
+        if !static_ports.is_empty() {
+            if let Some(port) = port_ledger.conflict(node_id, static_ports, allocations_by_node) {
+                return format!(
+                    "which is healthy but has static port {port} in use by another allocation. \
+                     Its data is intact; it is placed there once the port is free"
+                );
+            }
+        }
+        "which is healthy but has no room for it right now (CPU, memory, disk, or a `distinct` \
+         rule). Its data is intact; it is placed there once the node has room"
+            .to_string()
+    }
+
     /// Why a stateful instance's pinned node is not in this plan's node set
     /// at all, worded as the tail of "holds node-local storage on node X, …".
     /// Only a node that is lost or gone is called unavailable, and only then
     /// does the message mention abandoning the data.
     fn pinned_node_absent_reason(&self, node_id: &str) -> String {
-        match self.store.get_node(node_id) {
+        // The read model is what placement sees; the stored row is the
+        // fallback for a node it does not hold.
+        let node = match self.store.cached_node(node_id) {
+            Ok(Some(node)) => Ok(Node::clone(&node)),
+            _ => self.store.get_node(node_id),
+        };
+        match node {
             Ok(node) if node.status == "lost" || node.availability == "unavailable" => {
                 "which is unavailable. Waiting for that node to return; use `legion volume \
                  delete --force <id>` to abandon the data if it never will"
@@ -4191,6 +4357,7 @@ impl<'a> Scheduler<'a> {
         pinned_volume_node: Option<String>,
         pass: &mut PreemptionPass,
     ) -> R<Option<PreemptionChoice>> {
+        pass.deferred_wait = None;
         if !pass.preemptor_band.can_preempt() {
             return Ok(None);
         }
@@ -4234,44 +4401,43 @@ impl<'a> Scheduler<'a> {
         pass.considered += 1;
         pass.load_candidates(self.store, &self.store.resource_policy, &candidates)?;
 
-        let mut best: Option<(PreemptionChoice, (usize, u32))> = None;
-        let mut node_scores: HashMap<String, (usize, u32)> = HashMap::new();
-        for node in &candidates {
-            let Some(free) = resource_ledger.pools.get(node.id.as_str()) else {
-                continue;
-            };
-            let on_node = pass.candidates_on_node(&node.id);
-            let (eligible, tally) = eligible_victims(
-                &on_node,
-                pass.preemptor_band,
-                self.preemption.victim_exempt_age,
-                &pass.taken_by_task,
-            );
+        let exempt_age = self.preemption.victim_exempt_age;
+        let mut found = self.cheapest_preemption(&candidates, ask, resource_ledger, pass, false);
+        let mut young_rejected = false;
+        for tally in std::mem::take(&mut found.tallies) {
+            young_rejected |= tally.too_young > 0;
             pass.record_tally(tally);
-            let Some(victims) = select_victims(ask, free, &eligible) else {
-                continue;
-            };
-            // A node that needs no victims would have passed the resource
-            // check and never reached this pass; treat it as free anyway.
-            let cost = preemption_cost(&victims);
-            node_scores.insert(node.id.clone(), cost);
-            let better = best
-                .as_ref()
-                .map(|(_, best_cost)| cost < *best_cost)
-                .unwrap_or(true);
-            if better {
-                best = Some((
-                    PreemptionChoice {
-                        node_id: node.id.clone(),
-                        victims,
-                    },
-                    cost,
-                ));
+        }
+        // `victimExemptAge` was all that stood in the way when the same pass
+        // with the guard lifted finds room. The placement cannot take that
+        // room yet, but it will once the victims age past the guard: a dry
+        // run previews exactly that, and an applying plan records when, so
+        // its eval retries then (the 2026-10-12 spot check: `job plan`
+        // failed seconds after the fill landed, while the submit placed a
+        // minute later).
+        if found.best.is_none() && young_rejected {
+            let lifted = self.cheapest_preemption(&candidates, ask, resource_ledger, pass, true);
+            if let Some((choice, _)) = lifted.best.as_ref() {
+                // Only enforce mode ever takes them, so only it has a time
+                // worth retrying at.
+                if matches!(self.preemption.mode, PreemptionMode::Enforce) {
+                    pass.deferred_wait = choice
+                        .victims
+                        .iter()
+                        .map(|victim| victim.exempt_for_secs(exempt_age))
+                        .max();
+                }
+                found = lifted;
             }
         }
+        let deferred = found
+            .best
+            .as_ref()
+            .is_some_and(|(choice, _)| choice.deferred);
 
-        let Some((mut choice, best_cost)) = best else {
-            // The pass ran and could not help. Worth a metric of its own:
+        let Some((mut choice, best_cost)) = found.best.filter(|_| !deferred || pass.preview) else {
+            // The pass ran and could not help (or, for an applying plan,
+            // cannot help until the victims age). Worth a metric of its own:
             // "preemption is enabled and still not placing this" is a
             // different operational story from "preemption never ran", and
             // only the counter distinguishes them at a glance.
@@ -4280,13 +4446,18 @@ impl<'a> Scheduler<'a> {
                 .inc(&["no_victims"]);
             return Ok(None);
         };
+        let selection_age = if deferred {
+            std::time::Duration::ZERO
+        } else {
+            exempt_age
+        };
 
         // Tiebreak within the cheapest group using the normal policy score,
         // so preemption does not undo the cluster's packing strategy.
         let tied: Vec<&Node> = candidates
             .iter()
             .copied()
-            .filter(|node| node_scores.get(&node.id).copied() == Some(best_cost))
+            .filter(|node| found.node_scores.get(&node.id).copied() == Some(best_cost))
             .collect();
         if tied.len() > 1 {
             let mut ids: Vec<&str> = tied.iter().map(|node| node.id.as_str()).collect();
@@ -4298,16 +4469,19 @@ impl<'a> Scheduler<'a> {
                     if let Some(node) = tied.iter().find(|node| node.id == *first) {
                         if let Some(free) = resource_ledger.pools.get(node.id.as_str()) {
                             let on_node = pass.candidates_on_node(&node.id);
-                            let (eligible, _) = eligible_victims(
+                            let (victims, _) = choose_victims(
+                                ask,
+                                free,
                                 &on_node,
                                 pass.preemptor_band,
-                                self.preemption.victim_exempt_age,
+                                selection_age,
                                 &pass.taken_by_task,
                             );
-                            if let Some(victims) = select_victims(ask, free, &eligible) {
+                            if let Some(victims) = victims {
                                 choice = PreemptionChoice {
                                     node_id: node.id.clone(),
                                     victims,
+                                    deferred,
                                 };
                             }
                         }
@@ -4319,17 +4493,12 @@ impl<'a> Scheduler<'a> {
         if matches!(self.preemption.mode, PreemptionMode::Observe) {
             // Same selection, no commitment. The placement fails exactly as
             // it does with preemption off; the operator gets the evidence.
-            pass.observed
-                .extend(choice.victims.iter().map(|victim| PlannedPreemption {
-                    allocation_id: victim.allocation_id,
-                    node_id: victim.node_id.clone(),
-                    job_id: victim.job_id.clone(),
-                    job_config_id: victim.job_config_id.clone(),
-                    task_config_id: victim.task_config_id,
-                    task_name: victim.task_name.clone(),
-                    band: victim.band,
-                    kill_after_secs: victim.kill_after_secs,
-                }));
+            pass.observed.extend(
+                choice
+                    .victims
+                    .iter()
+                    .map(|victim| victim.planned(Self::victim_wait(&choice, victim, exempt_age))),
+            );
             info!(
                 task = %task_config.name,
                 preemptor_job = %pass.preemptor_job,
@@ -4353,6 +4522,78 @@ impl<'a> Scheduler<'a> {
             return Ok(None);
         }
         Ok(Some(choice))
+    }
+
+    /// Seconds until `victim` may be evicted under `choice`: 0 unless the
+    /// choice is a dry run's deferred one (see [`PreemptionChoice::deferred`]).
+    fn victim_wait(
+        choice: &PreemptionChoice,
+        victim: &VictimCandidate,
+        exempt_age: std::time::Duration,
+    ) -> u64 {
+        if choice.deferred {
+            victim.exempt_for_secs(exempt_age)
+        } else {
+            0
+        }
+    }
+
+    /// One preemption pass over `candidates`: the cheapest node's victim
+    /// set, every node's cost, and each node's rejection tally. `lift_guard`
+    /// runs it as though `victimExemptAge` were zero, which is how a
+    /// placement learns that the guard alone is in its way.
+    fn cheapest_preemption(
+        &self,
+        candidates: &[&Node],
+        ask: &ResourceRequest,
+        resource_ledger: &ResourceLedger,
+        pass: &PreemptionPass,
+        lift_guard: bool,
+    ) -> PreemptionSearch {
+        let exempt_age = if lift_guard {
+            std::time::Duration::ZERO
+        } else {
+            self.preemption.victim_exempt_age
+        };
+        let mut search = PreemptionSearch::default();
+        for node in candidates {
+            let Some(free) = resource_ledger.pools.get(node.id.as_str()) else {
+                continue;
+            };
+            let on_node = pass.candidates_on_node(&node.id);
+            let (victims, tally) = choose_victims(
+                ask,
+                free,
+                &on_node,
+                pass.preemptor_band,
+                exempt_age,
+                &pass.taken_by_task,
+            );
+            search.tallies.push(tally);
+            let Some(victims) = victims else {
+                continue;
+            };
+            // A node that needs no victims would have passed the resource
+            // check and never reached this pass; treat it as free anyway.
+            let cost = preemption_cost(&victims);
+            search.node_scores.insert(node.id.clone(), cost);
+            let better = search
+                .best
+                .as_ref()
+                .map(|(_, best_cost)| cost < *best_cost)
+                .unwrap_or(true);
+            if better {
+                search.best = Some((
+                    PreemptionChoice {
+                        node_id: node.id.clone(),
+                        victims,
+                        deferred: lift_guard,
+                    },
+                    cost,
+                ));
+            }
+        }
+        search
     }
 
     /// The subset of `candidates` one placement may still use: the nodes
@@ -5394,12 +5635,27 @@ fn filter_restore_compat<'b>(
 /// not advertise fall back to the built-in set's locality. `tmpfs` is
 /// node-local but RAM-backed, so it is excluded from *disk* accounting too.
 /// Declarations without a parseable `size` contribute nothing — this is
-/// placement sanity, not quota enforcement.
-fn task_local_volume_bytes(node: &Node, task_config: &TaskConfig) -> u64 {
+/// placement sanity, not quota enforcement. `storage_provisioned` leaves out
+/// the instance storage (`stateful.storage`): the placement returns an
+/// instance to the node that already holds its volume, so it adds nothing.
+fn task_local_volume_bytes(
+    node: &Node,
+    task_config: &TaskConfig,
+    storage_provisioned: bool,
+) -> u64 {
     let advertised = node.fingerprint_attrs.get("volumeDrivers");
+    // Instance storage comes first in the declarations.
+    let skip = usize::from(
+        storage_provisioned
+            && task_config
+                .stateful
+                .as_ref()
+                .is_some_and(|stateful| stateful.storage.is_some()),
+    );
     task_config
         .volume_size_declarations()
         .into_iter()
+        .skip(skip)
         .filter_map(|(driver, size)| {
             let size = size?;
             if driver == "tmpfs" {
@@ -9812,6 +10068,166 @@ mod tests {
             err.to_string().contains("victimExemptAge"),
             "the error names the guard that bound: {err}"
         );
+        Ok(())
+    }
+
+    /// Spot check 2026-10-12: `job plan` for a high-band claim failed "no
+    /// available nodes" seconds after the low-band fill landed, while the
+    /// submit went on to preempt it. The guard alone stood in the way, so
+    /// the preview shows the victims the submit will take, with the wait.
+    #[test]
+    fn a_plan_previews_preemption_that_waits_on_victim_exempt_age() -> R<()> {
+        let store = setup_store()?;
+        small_node(&store, "node-a")?;
+        let scheduler = Scheduler::new(&store)?;
+        let fill = submit_banded(&store, "band-fill", Band::Low, 2, None)?;
+        scheduler.plan_and_apply(&fill, PlanMode::Fresh)?;
+        // Deliberately NOT aged: the fill is seconds old.
+
+        // A not-yet-submitted claim: `job plan`'s new-job path.
+        let claim = JobConfig {
+            priority: Band::High,
+            rollout: None,
+            rollout_by_group: Default::default(),
+            name: "band-claim".into(),
+            tasks: vec![TaskConfig {
+                resources: json!({ "memory": 256 }),
+                ..TaskConfig::new("vm", "noop")
+            }],
+            version: None,
+        };
+        let outcome = scheduler.plan_for_config(&claim, PlanMode::Fresh, None)?;
+        assert_eq!(outcome.allocations.len(), 1, "the preview places the claim");
+        assert_eq!(outcome.preemptions.len(), 1, "by taking one victim");
+        let victim = &outcome.preemptions[0];
+        assert_eq!(victim.job_id, "band-fill");
+        assert!(
+            (1..=60).contains(&victim.eligible_in_secs),
+            "the victim is evictable once past the 60s guard, not now: {}",
+            victim.eligible_in_secs
+        );
+
+        // The submitted claim's preview (`plan_only_with_report`) agrees.
+        let submitted = submit_banded(&store, "band-claim", Band::High, 1, None)?;
+        let (placements, _, preemptions) =
+            scheduler.plan_only_with_report(&submitted, PlanMode::Fresh)?;
+        assert_eq!(placements.len(), 1);
+        assert_eq!(preemptions.len(), 1);
+        assert!(preemptions[0].eligible_in_secs > 0);
+
+        // Old enough, the same preview evicts right away.
+        age_allocations(&store)?;
+        let (_, _, preemptions) = scheduler.plan_only_with_report(&submitted, PlanMode::Fresh)?;
+        assert_eq!(preemptions.len(), 1);
+        assert_eq!(preemptions[0].eligible_in_secs, 0);
+        Ok(())
+    }
+
+    /// The submit side of the same window: nothing evicts early, and the
+    /// blocked placement carries when to retry, since a victim getting older
+    /// is not a capacity event that would wake a blocked eval.
+    #[test]
+    fn a_placement_waiting_on_victim_exempt_age_says_when_to_retry() -> R<()> {
+        let store = setup_store()?;
+        small_node(&store, "node-a")?;
+        let scheduler = Scheduler::new(&store)?;
+        let fill = submit_banded(&store, "band-fill", Band::Low, 2, None)?;
+        scheduler.plan_and_apply(&fill, PlanMode::Fresh)?;
+
+        let claim = submit_banded(&store, "band-claim", Band::High, 1, None)?;
+        let err = scheduler
+            .plan_and_apply(&claim, PlanMode::Fresh)
+            .expect_err("the guard holds for the real placement");
+        let blocked =
+            crate::manager::blocked::PlacementBlocked::in_chain(&err).expect("a blocked placement");
+        let retry = blocked.retry_after.expect("a retry time");
+        assert!(
+            retry > std::time::Duration::from_secs(1)
+                && retry <= std::time::Duration::from_secs(61),
+            "retry once the fill ages past the 60s guard: {retry:?}"
+        );
+        assert!(
+            blocked.message.contains("victimExemptAge in"),
+            "the message says when: {}",
+            blocked.message
+        );
+        assert_eq!(store.allocs_for_node("node-a")?.len(), 2, "nothing evicted");
+
+        // A partial plan carries the same retry on the replica it left.
+        let store = setup_store()?;
+        small_node(&store, "node-a")?;
+        let scheduler = Scheduler::new(&store)?;
+        let fill = submit_banded(&store, "band-fill", Band::Low, 1, None)?;
+        scheduler.plan_and_apply(&fill, PlanMode::Fresh)?;
+        let claim = submit_banded(&store, "band-claim", Band::High, 2, None)?;
+        let outcome = scheduler.plan_and_apply(&claim, PlanMode::Fresh)?;
+        assert_eq!(outcome.allocations.len(), 1, "the free slot is taken");
+        assert!(outcome.evictions.is_empty());
+        assert_eq!(outcome.unplaced.len(), 1);
+        assert!(outcome.unplaced[0].blocked.retry_after.is_some());
+
+        // A guard that is not the only obstacle sets no retry: a peer band
+        // can never be taken, however old.
+        let store = setup_store()?;
+        small_node(&store, "node-a")?;
+        let scheduler = Scheduler::new(&store)?;
+        let peer = submit_banded(&store, "peer", Band::High, 2, None)?;
+        scheduler.plan_and_apply(&peer, PlanMode::Fresh)?;
+        let claim = submit_banded(&store, "band-claim", Band::High, 1, None)?;
+        let err = scheduler
+            .plan_and_apply(&claim, PlanMode::Fresh)
+            .expect_err("a peer is never a victim");
+        let blocked =
+            crate::manager::blocked::PlacementBlocked::in_chain(&err).expect("a blocked placement");
+        assert_eq!(blocked.retry_after, None);
+        Ok(())
+    }
+
+    /// Spot check 2026-10-12: `band-claim (high)` preempted
+    /// `hello-container (normal)` while `band-fill (low)` sat on the same
+    /// node, because the low-band microVMs were younger than
+    /// `victimExemptAge`. hello-container then preempted band-fill to come
+    /// back: two evictions where one would do. The guard must not push a
+    /// placement up the band ladder.
+    #[test]
+    fn a_young_lower_band_victim_is_taken_before_an_older_higher_band_one() -> R<()> {
+        let store = setup_store()?;
+        small_node(&store, "node-a")?;
+        let scheduler = Scheduler::new(&store)?;
+        let submit = |name: &str, band: Band, memory: u64| -> R<String> {
+            let job = JobConfig {
+                priority: band,
+                rollout: None,
+                rollout_by_group: Default::default(),
+                name: name.into(),
+                tasks: vec![TaskConfig {
+                    resources: json!({ "memory": memory }),
+                    ..TaskConfig::new("worker", "noop")
+                }],
+                version: None,
+            };
+            store.handle_job_submit(&job, &[dummy_submission()])?;
+            Ok(store.get_job_config(name)?.id())
+        };
+
+        // A small, long-running normal service, then a fresh low-band fill.
+        // 512 MiB node: 64 + 256 placed leaves 192 free, so evicting EITHER
+        // one makes room for the 256 MiB claim.
+        let hello = submit("hello-container", Band::Normal, 64)?;
+        scheduler.plan_and_apply(&hello, PlanMode::Fresh)?;
+        age_allocations(&store)?;
+        let fill = submit("band-fill", Band::Low, 256)?;
+        scheduler.plan_and_apply(&fill, PlanMode::Fresh)?;
+
+        let claim = submit("band-claim", Band::High, 256)?;
+        let outcome = scheduler.plan_and_apply(&claim, PlanMode::Fresh)?;
+        assert_eq!(outcome.allocations.len(), 1, "the claim places");
+        assert_eq!(outcome.evictions.len(), 1);
+        assert_eq!(
+            outcome.evictions[0].job_id, "band-fill",
+            "the low-band work goes, not the normal-band service"
+        );
+        assert_eq!(outcome.evictions[0].band, "low");
         Ok(())
     }
 

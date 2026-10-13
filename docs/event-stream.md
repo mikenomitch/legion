@@ -25,6 +25,8 @@ It is available from the CLI, the MCP server, the UI, and raw gRPC.
 | `allocation.preempted` | warn | Allocations were displaced to make room for higher-band work. Metadata carries the victim's `band` plus `preemptorJob` and `preemptorBand`, which link the victim to the preemptor. One event per victim job. See [Preemption and Eviction](preemption-and-eviction.md). |
 | `allocation.preempt_planned` | info | `preemption.mode = "observe"` only: the victim selection ran and committed nothing. Metadata lists the `victims` enforce mode would have taken. |
 | `allocation.failed` | warn | A worker reported an allocation failure (includes the reason). |
+| `allocation.reschedule_deferred` | warn | A failed allocation's replacement waits out the task's reschedule backoff. Nothing places it before `nextAttemptAt` unless an operator lifts the backoff (`legion job run <spec> --force-reschedule`, or `legion instance start <id>` for a keyed instance). Metadata carries `task`, `group`, `instanceId` (null for a stateless task), `attempt` (the consecutive failure count, from 1; the backoff doubles per earlier one), `delaySecs`, `nextAttemptAt` (RFC 3339), `reason` (one line, at most 400 characters; `allocation.failed` has the full text), `jobConfigId`, and `taskConfigId`. Also emitted for an `evict-bursting` eviction, which spends the same budget. See [Manager-side move logic](jobs-tasks-and-scheduling.md#manager-side-move-logic). |
+| `allocation.reschedule_exhausted` | error | A failed allocation found its task's move budget spent (`move_count` moves inside `move_period`), so the task is not moved again and the job is marked failed. A `job.failed` event follows. Metadata carries `task`, `instanceId`, `moves`, `moveCount`, `movePeriodSecs`, `reason`, `jobConfigId`, and `taskConfigId`. |
 | `allocation.terminated` | info/warn | A task's process exited and the allocation reached a terminal state without being rescheduled (info when the exit was a success, warn otherwise). Metadata carries `success` and the exit message. See [Task Supervision](task-supervision.md). |
 | `allocation.plan_rejected` | warn | Optimistic concurrency rejected a placement plan (it will be retried). |
 | `artifact.staging` | info | An allocation began staging its [artifacts](artifacts.md) (artifact list in metadata). |
@@ -65,7 +67,7 @@ It is available from the CLI, the MCP server, the UI, and raw gRPC.
 | `node.drained` | info | A drain pass evicted a drained node's allocations for replacement elsewhere (evicted and held counts in metadata, where held means stateful allocations protected by `onLost`). |
 | `job.submitted` / `job.updated` | info | A job config was created / updated. |
 | `job.stopped` / `job.destroyed` | info | A job was stopped / destroyed. |
-| `job.failed` | error | A job was marked failed (for example, move limit exceeded). |
+| `job.failed` | error | A job was marked failed (for example, move limit exceeded, which `allocation.reschedule_exhausted` explains). |
 | `scale.applied` | info | A count override was applied ([Scaling Jobs](autoscaling.md)). Previous and new counts, source, and reason are in metadata. |
 | `scale.deferred` | info | A scale-in was recorded but deferred until the active rollout completes. |
 | `scale.reset` | info | An override was dropped (an explicit `--reset`, or a resubmit that changed the spec count and reclaimed ownership). |
@@ -130,7 +132,8 @@ no ids and never matches.
 `--instance` matches an event that is *about* the stateful instance:
 
 - its metadata names it as `instanceId` (suspend, resume, restore, fork,
-  snapshot, volume, promotion, and provisional-start events) or `instance_id`
+  snapshot, volume, promotion, provisional-start, and reschedule backoff
+  events) or `instance_id`
   (`node.pressure`);
 - it lists it in `instances` (the forks of `instance.forked` and
   `instance.fork_failed`) or `suspending` (`instance.make_room`);
@@ -204,6 +207,11 @@ See `proto/legion.proto` for the authoritative message documentation.
   ([`src/storage/store.rs`](../src/storage/store.rs)).
 - Emission is **best-effort**. Scheduling work never fails because an event
   could not be recorded. Errors are logged and swallowed.
+- Every manager can emit. Events raised while handling a worker's heartbeat
+  (`node.pressure`, `net.denied`) come from whichever
+  manager that worker dials. A manager that leads no raft lane, such as a
+  follower in the default `single` topology, forwards the event to the
+  status-lane leader, so it lands in the shared journal like any other.
 - When a `StreamEvents` subscriber falls behind the broadcast buffer, Legion
   backfills it from the journal using its last-sent event ID. Slow consumers
   fall back to catch-up reads instead of dropping events.

@@ -177,10 +177,15 @@ impl WorkerPlane {
     /// This manager's TLS material for the cluster `store` belongs to,
     /// minted on first use and re-minted after a third of its life. Creates
     /// the cluster CA when none exists yet (a replicated write, so only a
-    /// control-lane leader can).
+    /// control-lane leader can). A non-leader without a CA returns an error
+    /// without proposing anything: its callers retry until the leader's CA
+    /// replicates, and a doomed proposal would log an ERROR per attempt.
     pub fn materials(&self, store: &Store) -> R<Arc<ManagerMaterials>> {
         let ca = match store.mesh_ca()? {
             Some(ca) => ca,
+            None if !store.is_raft_leader(crate::storage::Lane::Control) => {
+                bail!("the cluster CA has not replicated to this manager yet")
+            }
             None => store
                 .ensure_mesh_ca()
                 .context("the cluster CA does not exist yet and could not be created")?,
@@ -520,5 +525,28 @@ mod worker_plane_test {
             WorkerTarget::for_node(&node("none", json!({}), json!({"protocolVersion": 3})))
                 .expect_err("no address");
         assert!(missing.message().contains("worker address"));
+    }
+
+    /// A manager that may not write the control lane (a raft follower, here
+    /// a streaming standby) waits for the leader's CA instead of proposing
+    /// one: each doomed proposal used to log an ERROR at startup.
+    #[test]
+    fn a_non_leader_without_a_ca_waits_instead_of_creating_one_test() -> R<()> {
+        let dir = tempfile::tempdir()?;
+        let mut config = crate::structs::ManagerConfigFull {
+            store_path: dir.path().display().to_string(),
+            ..Default::default()
+        };
+        config.persistence.r#type = crate::structs::PersistenceType::Streaming;
+        config.persistence.streaming.lease.provider =
+            crate::structs::StreamingLeaseProvider::ObjectStorage;
+        let store = Store::start_storage(&config)?;
+
+        let err = WorkerPlane::global()
+            .materials(&store)
+            .expect_err("no CA on a non-leader");
+        assert!(format!("{err:#}").contains("not replicated"), "{err:#}");
+        assert!(store.mesh_ca()?.is_none());
+        Ok(())
     }
 }

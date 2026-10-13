@@ -48,6 +48,32 @@ pub fn vmm_version_attr(vmm: &str) -> String {
     format!("sandbox.vmm.{vmm}.version")
 }
 
+/// A VMM version in the one form Legion records and compares: bare
+/// `MAJOR.MINOR.PATCH`, with any leading `v`, missing patch, and trailing
+/// build suffix normalized away (`v51.2` and `51.2.0` are both `51.2.0`).
+/// A string that does not parse as a version is returned trimmed, so it
+/// still compares by exact equality.
+///
+/// The two sides of a memory checkpoint's VMM check come from different
+/// sources: the node attribute from the binary's `--version` banner, the
+/// checkpoint from the running VMM's API. cloud-hypervisor's banner prints
+/// its git describe (`v51.2`, or `v51.2-5-gabc1234-dirty` for a dev build)
+/// while `vmm.ping` reports the crate version (`51.2.0`), so the same binary
+/// reports two strings and only the release triple is common to both.
+pub fn canonical_vmm_version(raw: &str) -> String {
+    let trimmed = raw.trim();
+    match crate::structs::fork::parse_vmm_semver(trimmed) {
+        Some((major, minor, patch)) => format!("{major}.{minor}.{patch}"),
+        None => trimmed.trim_start_matches('v').to_string(),
+    }
+}
+
+/// Whether two VMM version strings name the same release
+/// ([`canonical_vmm_version`] on both sides).
+pub fn vmm_versions_match(left: &str, right: &str) -> bool {
+    canonical_vmm_version(left) == canonical_vmm_version(right)
+}
+
 /// What a checkpoint captured.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -380,6 +406,24 @@ fn require(
     }
 }
 
+/// [`require`] for a VMM version attribute: equal when both sides name the
+/// same release ([`vmm_versions_match`]), so `51.2` on the node matches a
+/// checkpoint that recorded `51.2.0`.
+fn require_vmm_version(
+    attrs: &Map<String, Value>,
+    attribute: &str,
+    wanted: &str,
+) -> Result<(), CompatMismatch> {
+    match attr_str(attrs, attribute) {
+        Some(found) if vmm_versions_match(found, wanted) => Ok(()),
+        found => Err(CompatMismatch {
+            attribute: attribute.to_string(),
+            wanted: wanted.to_string(),
+            found: found.map(str::to_string),
+        }),
+    }
+}
+
 /// Can a node with these fingerprint attributes restore this checkpoint?
 ///
 /// Pure, so the manager can call it per candidate node at placement time and
@@ -389,8 +433,10 @@ fn require(
 ///
 /// The VMM check accepts either the per-VMM attribute
 /// (`sandbox.vmm.firecracker.version`) or the node's default VMM
-/// (`sandbox.vmm` + `sandbox.vmm.version`). CPU vendor and model must match
-/// exactly, and so must the feature digest when the checkpoint recorded one.
+/// (`sandbox.vmm` + `sandbox.vmm.version`). The version must name the same
+/// release ([`canonical_vmm_version`]: `v51.2` and `51.2.0` match, `51.2.0`
+/// and `51.3.0` do not). CPU vendor and model must match exactly, and so
+/// must the feature digest when the checkpoint recorded one.
 /// Firecracker CPU templates could widen this later.
 pub fn compat_matches(
     manifest: &SnapshotManifest,
@@ -400,10 +446,10 @@ pub fn compat_matches(
     if let Some(vmm) = compat.vmm.as_ref() {
         let per_vmm = vmm_version_attr(&vmm.kind);
         if attr_str(node_attrs, &per_vmm).is_some() {
-            require(node_attrs, &per_vmm, &vmm.version)?;
+            require_vmm_version(node_attrs, &per_vmm, &vmm.version)?;
         } else {
             require(node_attrs, ATTR_SANDBOX_VMM, &vmm.kind)?;
-            require(node_attrs, ATTR_SANDBOX_VMM_VERSION, &vmm.version)?;
+            require_vmm_version(node_attrs, ATTR_SANDBOX_VMM_VERSION, &vmm.version)?;
         }
     }
     if let Some(cpu) = compat.cpu.as_ref() {
@@ -534,6 +580,64 @@ mod tests {
         node.insert("sandbox.vmm.version".into(), json!("1.8.0"));
         let err = compat_matches(&memory_manifest(), &node).unwrap_err();
         assert_eq!(err.attribute, "sandbox.vmm.version");
+    }
+
+    /// The AWS spot check: cloud-hypervisor's banner says `v51.2`, its API
+    /// says `51.2.0`, and the same node must resume its own checkpoint.
+    #[test]
+    fn vmm_versions_naming_the_same_release_match() {
+        let mut manifest = memory_manifest();
+        manifest.compat.vmm = Some(VmmCompat {
+            kind: "cloud-hypervisor".into(),
+            version: "51.2.0".into(),
+        });
+        let mut node = matching_node();
+        node.insert("sandbox.vmm".into(), json!("cloud-hypervisor"));
+        node.insert("sandbox.vmm.version".into(), json!("51.2"));
+        assert_eq!(compat_matches(&manifest, &node), Ok(()));
+
+        // Through the per-VMM attribute too, and the other way around.
+        node.insert(
+            "sandbox.vmm.cloud-hypervisor.version".into(),
+            json!("v51.2"),
+        );
+        assert_eq!(compat_matches(&manifest, &node), Ok(()));
+        manifest.compat.vmm.as_mut().unwrap().version = "51.2".into();
+        node.insert(
+            "sandbox.vmm.cloud-hypervisor.version".into(),
+            json!("51.2.0"),
+        );
+        assert_eq!(compat_matches(&manifest, &node), Ok(()));
+    }
+
+    #[test]
+    fn a_different_vmm_release_is_still_refused() {
+        let mut manifest = memory_manifest();
+        manifest.compat.vmm = Some(VmmCompat {
+            kind: "cloud-hypervisor".into(),
+            version: "51.2.0".into(),
+        });
+        let mut node = matching_node();
+        node.insert("sandbox.vmm".into(), json!("cloud-hypervisor"));
+        for other in ["51.3", "51.2.1", "52.0.0", "unknown"] {
+            node.insert("sandbox.vmm.version".into(), json!(other));
+            let err = compat_matches(&manifest, &node).unwrap_err();
+            assert_eq!(err.attribute, "sandbox.vmm.version");
+            assert_eq!(err.found.as_deref(), Some(other));
+        }
+    }
+
+    #[test]
+    fn vmm_versions_canonicalize_to_a_bare_triple() {
+        assert_eq!(canonical_vmm_version("v51.2"), "51.2.0");
+        assert_eq!(canonical_vmm_version(" 51.2.0 "), "51.2.0");
+        assert_eq!(canonical_vmm_version("v51.2-5-gabc1234-dirty"), "51.2.0");
+        assert_eq!(canonical_vmm_version("1.7.0"), "1.7.0");
+        // Unparseable versions fall back to exact equality.
+        assert_eq!(canonical_vmm_version("vnext"), "next");
+        assert!(vmm_versions_match("custom-build", "custom-build"));
+        assert!(!vmm_versions_match("custom-build", "custom-build-2"));
+        assert!(!vmm_versions_match("1.7.0", "1.7.1"));
     }
 
     #[test]

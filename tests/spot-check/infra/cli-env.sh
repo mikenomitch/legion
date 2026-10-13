@@ -23,6 +23,9 @@ for name in "${SC_MANAGERS[@]}"; do
     fi
 done
 leader="${leader:-$(sc_public_ip "${SC_MANAGERS[0]}")}"
+# Fail loudly without the rig's token: falling through would leave callers on
+# whatever LEGION_ADDR the shell already has (mise points it at localhost).
+[ -s "$SC_STATE/token" ] || { echo "no rig token at $SC_STATE/token; run install.sh (or work from the checkout that did)" >&2; exit 1; }
 token="$(cat "$SC_STATE/token")"
 
 if [ "${1:-}" = "--fish" ]; then

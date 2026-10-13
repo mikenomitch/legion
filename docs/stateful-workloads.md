@@ -101,7 +101,12 @@ pending -> active -> rescheduling -> active -> ... -> stopped/terminated
   detail that explains it. See [Node loss and fencing
   (at-most-one)](#node-loss-and-fencing-at-most-one).
 - `rescheduling`: its allocation died. The replacement will reuse the same
-  instance id and storage handle.
+  instance id and storage handle. When the allocation failed (rather than
+  being lost with its node or drained), the replacement first waits out the
+  task's reschedule backoff, and `legion instance get/list` shows a
+  `rescheduling:` detail with the failed attempt, its reason, and the next
+  attempt time. See [Manager-side move
+  logic](jobs-tasks-and-scheduling.md#manager-side-move-logic).
 - `stopped`: paused (keyed only). The allocation was stopped, but the row and
   storage handle are kept, so `legion instance start <id>` brings back the
   same identity with its data. A job stop puts keyed instances here. Stopped
@@ -595,8 +600,11 @@ CreateInstance ──> pending ──placed──> active ──alloc dies──
   uses). If the task declares `stateful.storage`, the storage handle is
   created on first placement.
 - **Failure** of the allocation moves the instance to `rescheduling`. The
-  replacement allocation re-binds the same instance id and storage handle.
-  Allocation churn never terminates or stops a keyed instance.
+  replacement allocation re-binds the same instance id and storage handle,
+  after the task's reschedule backoff. Each instance backs off on its own,
+  so other instances of the task keep placing. `legion instance start <id>`
+  lifts the backoff and retries now. Allocation churn never terminates or
+  stops a keyed instance.
 - **Stop** (`StopInstance` or `legion instance stop`) pauses the instance. It
   stops the allocation through the normal allocation-stop path and moves the
   row to `stopped`, **keeping the row and its storage handle**. The id stays
@@ -648,10 +656,14 @@ legion instance create sandbox-demo --id a --id b --count 3 -j
 legion instance list sandbox-demo -j
 # => { "ok": true, "data": [ { "instanceId": "user-42", "jobId": "sandbox-demo",
 #      "group": "sandboxes", "task": "sandbox", "mode": "keyed",
-#      "state": "active", "currentAllocId": 7,
+#      "state": "active", "currentAllocId": 7, "nodeId": "node-a",
 #      "storageHandle": "local-dir/…", "createdAt": "…", "updatedAt": "…" } ] }
 
 legion instance get user-42 -j
+
+# `nodeId` (and the table's NODE column) is the node of the current
+# allocation, and unset while the instance has none (pending, rescheduling,
+# stopped, suspended, terminated).
 
 # Pause (reversible): stop the allocation, retain row + storage handle
 legion instance stop user-42 -j        # state -> "stopped"
@@ -673,7 +685,9 @@ fails instead of guessing.
 ### Stopping and starting
 
 `stop` and `start` work in keyed mode only. (In slot mode, the scheduler
-manages the lifecycle through `count.num`.) They let you pause a keyed
+manages the lifecycle through `count.num`. The one exception: `start` on a
+slot instance that is `rescheduling` lifts its reschedule backoff and places
+it now.) They let you pause a keyed
 instance and resume it later, unlike `destroy`, which is permanent:
 
 | | `stop` | `destroy` |
@@ -692,7 +706,9 @@ instance and resume it later, unlike `destroy`, which is permanent:
 - **Start** moves the instance from `stopped` to `pending` and enqueues
   placement. The new allocation re-binds the same instance id and its kept
   storage handle, so the revived sandbox is the same logical instance with
-  its data.
+  its data. On a `rescheduling` instance waiting out a reschedule backoff,
+  start lifts the backoff and places it now. On any other live instance it
+  is a no-op.
 - **Terminated** (destroyed) instances can't be stopped or started. The id is
   tombstoned for the job's lifetime, so create a new id instead.
 

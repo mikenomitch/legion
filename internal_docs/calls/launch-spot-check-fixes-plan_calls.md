@@ -1272,7 +1272,52 @@ it now prints `[code=FailedPrecondition]`, and one `hint_for(code, message)`
 serves both formats. `Unavailable` distinguishes a transport failure (the
 manager is unreachable) from a manager answer (a worker or leader behind it).
 
-## 51. Linux `command` still replaces `ENTRYPOINT`; examples name the entrypoint instead
+## 51. Stored CLI tokens are keyed by manager address, and a first start replaces the file for its address
+
+*Workstream: CLI and diagnostics (2026-10-12 re-run).*
+
+**The call.** The CLI token file moved from one `~/.legion/token` to
+`~/.legion/tokens/<host>_<port>`, named from `LEGION_ADDR` with the scheme
+dropped. `legion login`, `legion logout`, the CLI's lookup and the manager's
+first-start write all use that one name. The manager writes under its
+*local* address (`server.host`/`server.port`, `0.0.0.0` as `127.0.0.1`),
+not `advertiseAddr`, and it now replaces a file already there instead of
+leaving it alone. An `Unauthenticated` reply's hint names the file (or
+`LEGION_TOKEN`) and the address the CLI used:
+
+```text
+Hint: the CLI sent the token stored for http://127.0.0.1:4757 in
+/home/me/.legion/tokens/127.0.0.1_4757, which this manager does not accept ...
+```
+
+**Alternatives.**
+- Keep one file and warn louder. The second cluster's operator still gets
+  the wrong token, which is the bug.
+- Key by cluster name, as the federation plan's contexts would
+  (`~/.legion/tokens/<name>`). The CLI does not know a cluster's name before
+  its first call, so that needs contexts first.
+- Fall back to the old `~/.legion/token` when no per-address file exists.
+  AGENTS.md says no compatibility shims, and a fallback reintroduces the
+  cross-cluster leak for any address without its own file.
+- Keep "leave an existing file alone" for the per-address file. A cluster
+  rebuilt on the same port (the common dev loop) would then present the dead
+  cluster's token, the same bug one level down.
+
+**Trade-off.** A raft cluster reached through several managers needs a file
+per address (`legion login` against each, or `LEGION_TOKEN`). The rig's
+`rig_install_cli_token` now writes one per control-plane address. Two
+clusters that take turns on one address replace each other's file, and the
+older one's CLI then fails `Unauthenticated` with a hint naming the file to
+fix. A manager behind `advertiseAddr` is reached from its own machine by its
+listen address, which is what the name uses.
+
+**Why.** Simplicity: the name comes from what the CLI already knows, so there
+is nothing new to configure, and two local clusters on different ports just
+work. The mint only runs on a cluster with no management token, so a file it
+replaces held a token that cluster would reject anyway (or a lesser login to
+it). Documented in [auth-and-acls.md](../../docs/auth-and-acls.md#where-the-initial-token-goes).
+
+## 52. Linux `command` still replaces `ENTRYPOINT`; examples name the entrypoint instead
 
 *Workstream: Linux containers.*
 
@@ -1291,7 +1336,7 @@ on Linux, with Postgres refusing to run as root.
 `command` optional: a user-facing surface change that needs its own plan, not
 a fix folded into a capability change.
 
-## 52. `postgres.ncl` drops `to = 5432` and listens on the assigned port
+## 53. `postgres.ncl` drops `to = 5432` and listens on the assigned port
 
 *Workstream: Linux containers.*
 
@@ -1308,3 +1353,471 @@ port, and listen on 5432 inside.
 collides with a second Postgres on the node and is not the port the service
 and health check use; on macOS, `to` would publish the host port to 5432 while
 Postgres listens on the assigned one. Without `to`, one command works on both.
+
+## 54. A worker's manager trust is shared per cluster by aliasing every reported address to the token's verifier
+
+*Workstream: Manager availability (found on the AWS spot check, after entry 7
+shipped).*
+
+**The call.** After a leader failover a worker's active manager was one its
+token never named. Heartbeats kept working (the failover connector fell back
+to the token's verifier), but every call that dials a manager by address
+failed:
+
+```text
+artifact staging failed: ... credentials from kv secrets/ecr-pull: connect to manager for
+artifact credential: no cluster CA pin for the manager at http://172.31.80.241:4747; ...
+```
+
+The registry in `src/worker/plane.rs` stays keyed by address, but every
+address of a cluster now maps to the *same* `PinnedManagerVerifier`.
+`trust_cluster_managers(seed, addrs)` adds the addresses a manager reported
+(and the persisted `managers.json` set) under the token's verifier, from
+`ManagerEndpoints::new` and `learn`, before the known set changes. The
+connector's seed fallback is gone, and the bundle swap now moves the whole
+cluster at once because the verifier is shared. The JWKS source resolves the
+active manager per fetch instead of dialing the token's address forever.
+
+**Alternatives.**
+- One process-wide trust used for any address.
+- Have `ManagerEndpoints` own the verifier, and route every caller through
+  it instead of through an address lookup.
+
+**Trade-off.** A manager address the cluster never reported is still
+refused, even though the CA check alone would make it safe to dial. A worker
+can reach a new manager by address only after a reply has reported it, which
+happens on registration and every heartbeat.
+
+**Why.** Process-wide trust breaks processes that hold several clusters (the
+simulator and the tests run workers for several side by side), and it would
+drop the defense-in-depth rule that the worker dials only addresses its
+cluster vouched for. Routing every caller through `ManagerEndpoints` would
+mean changing each call site's signature (artifact credentials, the JWKS,
+`connect_manager_with_retry`, the simulator) for no change in behavior.
+Aliasing fixes every caller that dials by address in one place, so
+simplicity won. The security property does not change: an address only says
+where to dial, and the manager there must still present a `manager.legion`
+certificate chained to the CA the token pinned.
+
+## 55. The reschedule backoff is a replicated hold the planner honors, not a timer
+
+*Workstream: Scheduling (found on the AWS spot-check re-run, after the
+backoff shipped).*
+
+**The call.** On the rig, `sandbox-store` got a new allocation about every
+minute (1195, 1202, 1212, 1214, 1221) while each failure logged
+`delay_secs: 1800`, and its instance sat `rescheduling` with nothing saying
+why. The backoff only delayed the `job_reschedule` the failure queued. Any
+other `Reschedule` eval for the job placed every missing replica at once: the
+capacity pass that each failure's freed room triggered, a node join, the
+divergent-leadership regeneration. Now the failure's scheduler-lane removal op
+also writes a `reschedule_hold` row (`Store::remove_failed_allocation`), and
+`plan_and_apply` subtracts one replacement per active hold from every
+`Reschedule` plan's required counts. The keyed and slot binders put held
+instances last. The rows are also the move history, so the in-memory
+`AllocationFailureTracker` history is gone, and the replacement is a
+replicated delayed eval instead of a `tokio::sleep`. Operators see it as
+follows:
+
+```text
+detail: rescheduling: attempt 4 failed (artifact staging failed: 404 Not Found);
+next attempt at 2026-10-12T02:31:05Z (backoff 4m); `legion instance start sb-1` retries now
+```
+
+There's also an `allocation.reschedule_deferred` event and
+`Job.reschedule_backoffs` on `job info`.
+
+**Alternatives.**
+- Keep the in-memory tracker, and only add the event and an in-memory
+  "deferred until" for display. The display would read empty on every
+  manager but one, and nothing would stop the early re-placements.
+- Have only the capacity pass and the regeneration skip held jobs. Every
+  other path that places (node join, scale, blocked-eval wake) would still
+  bypass the backoff, and each future path would have to remember to.
+- Put "not before" on the instance row only. It covers stateful tasks and
+  leaves stateless ones, which fail the same way, unprotected.
+
+**Trade-off.** The scheduler-lane removal op got a new forwarded variant
+(`RemoveFailedAllocation`), a new table, and one more indexed read per
+`Reschedule` plan. A stateless task's holds are counts, not identities. While
+a stateless task holds N replacements, its next N missing replicas wait,
+whatever made them go missing (a lost node included). The rows prune lazily,
+on the next failure's removal.
+
+**Why.** Honoring the hold in the planner is the only place that covers
+every path that places, now and later. That's the property the user made a
+condition of keeping the backoff at all. Recording it in the op that removes
+the allocation means no eval can slip in between the removal and the hold.
+Replicating it makes the operator-facing state truthful on every manager and
+makes the backoff survive the restarts and leader changes the rig does
+routinely. Correctness and operator clarity won over a smaller diff.
+
+## 56. The backoff doubles per consecutive failure, per instance, and resets once a replacement survives `move_period`
+
+*Workstream: Scheduling.*
+
+**The call.** `attempt` counts a chain. A failure continues the chain when it
+comes within `move_period` of the previous hold's release (`created_at +
+delay`, so a lifted hold still continues it). The chain is keyed by instance
+for stateful tasks and by task for stateless ones. `move_count`, the
+job-failing budget, still counts every move of the task inside
+`move_period`, as before.
+
+**Alternatives.**
+- Keep doubling per move inside `move_period`, which is what the previous fix
+  did. With the default 30m period, the count of moves in the window drops as
+  the delays grow, so the backoff oscillated
+  (30s, 1m, 2m, 4m, 8m, 16m, 4m, 4m, 4m, 8m, ...) and never reached the
+  documented 30m cap.
+- Key the chain per task for keyed tasks too.
+
+**Trade-off.** The backoff and the budget now count different things, which
+the docs have to explain. A slow failure cadence (a replacement that runs
+29 minutes before failing) keeps doubling.
+
+**Why.** A chain gives the monotone 30s, 1m, ... 30m the docs promise, and
+"survives a whole `move_period`" is a clear reset rule. Keying it per
+instance keeps one broken sandbox from making every other sandbox of the task
+wait 30 minutes on its first failure. That would have turned a backoff meant
+for safety into an outage for a keyed sandbox fleet.
+
+## 57. `--force-reschedule` drops the job's move history, `instance start` keeps it
+
+*Workstream: Scheduling.*
+
+**The call.** A `job_update` eval (`job run --force-reschedule`, restarting a
+stopped or failed job) deletes the job's holds, so it places everything now
+and starts the budget over. `instance start <id>` on a `rescheduling` keyed
+instance only lifts that instance's hold (`not_before_unix = 0`). It answers
+`Retrying instance <id> now: lifted its reschedule backoff`, and another
+failure continues its chain.
+
+**Alternatives.** Have both keep history, or have both reset it. A new
+`legion instance retry` verb was the other option.
+
+**Trade-off.** A job restart forgets that the task was failing. A restarted
+job with `move_count` gets the full budget again.
+
+**Why.** A job restart already means "run it from the top" (task statuses
+reset too), and a restarted failed job must not fail again on its first
+failure because of the old budget. `instance start` is a nudge on one
+instance of a job that may still be broken, so keeping the chain stops a
+script that calls start in a loop from defeating the backoff. Reusing
+`start` instead of a new verb keeps the surface small. Start already meant
+"make this instance run", and for a `rescheduling` instance it used to do
+nothing.
+
+## 58. A one-shot CLI command dies by SIGPIPE (status 141) on a closed pipe
+
+*Workstream: CLI and diagnostics (2026-10-12 re-run).*
+
+**The call.** `legion raft status | head` panicked with "failed printing to
+stdout: Broken pipe". `main` now restores the default SIGPIPE disposition
+for every command except the long-running ones (`start`, `join`, `mcp`,
+`guest-agent`, `guest-resume`), so the CLI ends the way `cat` and `grep` do:
+killed by the signal, which the shell reports as 141.
+
+**Alternatives.** Handle `EPIPE` in the output layer and exit 0. Every
+`println!` in `src/cmd` (hundreds of them, plus `print_table`) would have to
+become a fallible write, or the panic would have to be caught and
+classified.
+
+**Trade-off.** Under `set -o pipefail`, `legion job list | head -1` reports
+141 instead of 0, exactly as `cat file | head -1` does. Servers keep ignoring
+SIGPIPE, so a dropped peer stays an error they handle.
+
+**Why.** Simplicity: one call at startup covers every print site, present
+and future, and 141 is the convention pipeline scripts already know.
+
+## 59. CLI handlers drop `#[instrument(err)]` across `src/cmd`, not only on `state query`
+
+*Workstream: CLI and diagnostics (2026-10-12 re-run).*
+
+**The call.** The ANSI `ERROR legion::cmd::state: error: …` line the re-run
+saw came from `#[instrument(err, skip_all)]` on the command handler, and it
+went to stdout on top of the `Error: …` line `main` prints on stderr. Every
+human-mode error of every command printed twice. All 74 CLI handlers now use
+`#[instrument(skip_all)]`, and docs/codebase-conventions.md says why.
+
+**Alternatives.** Fix only `state.rs` (the reported command), or raise the
+console filter for `legion::cmd` in one-shot mode, which would also hide
+the `warn!` lines commands print on purpose.
+
+**Trade-off.** A command's error no longer reaches `./logs/events.log` as a
+JSON event. It still reaches the user, once, on stderr.
+
+**Why.** The double print is the same bug everywhere, and one convention is
+easier to keep than a list of exceptions.
+
+## 60. User SQL errors are `InvalidArgument` only on the `state query` path
+
+*Workstream: CLI and diagnostics (2026-10-12 re-run).*
+
+**The call.** In `query_state_store`, a statement that does not compile
+(`SqlInputError`), any other `SQLITE_ERROR`, and a second statement map to
+`StorageError::InvalidInput` with SQLite's message (`no such column: x in
+SELECT x FROM job at offset 7`), so the RPC answers `InvalidArgument`. The
+store function also stops logging its errors at ERROR.
+
+**Alternatives.** Classify `SQLITE_ERROR` as `InvalidInput` in
+`StorageError::from_rusqlite` for every caller.
+
+**Trade-off.** A second classifier next to the shared one.
+
+**Why.** From Legion's own SQL, `SQLITE_ERROR` is a bug. The re-run's
+`allocation.job_id` lookup was exactly that, and it must stay `Internal`
+and logged at ERROR. Only raw user SQL makes it the caller's mistake.
+
+## 61. Server disambiguation errors name the CLI flag first, the API field second
+
+*Workstream: CLI and diagnostics (2026-10-12 re-run).*
+
+**The call.** "name one with task_name" now reads `name one with --task
+(task_name in the API): ws, idler`, and the same for `job scale` (`--group`
+and `--task`), session task selection, and `state query`'s `--allow-write`.
+
+**Alternatives.** Have the CLI pre-check (it would need the job's task list
+first, an extra RPC per call), or rewrite server messages in the CLI by
+string matching.
+
+**Trade-off.** API, MCP and UI callers see a CLI flag before the field they
+set. The MCP tools' argument is `task` too, so the flag name still reads
+right there.
+
+**Why.** Simplicity: the CLI is the surface people and agents use most, the
+server already puts CLI fixes in its hints ("use --disk"), and keeping the
+field name in parentheses leaves API callers a clear path.
+
+## 62. MCP decodes node attributes in the tool layer; the proto keeps JSON text
+
+*Workstream: CLI and diagnostics (2026-10-12 re-run).*
+
+**The call.** `legion_node_list`, `legion_node_claims` and `legion_node_drain`
+decode `configAttrs`, `fingerprintAttrs`, `dynamicAttrs` and `healthChecks`
+from JSON text into objects before returning. `legion node list --json`
+already decoded them (through `Node::from`), and a test now pins both shapes.
+
+**Alternatives.** Change the `NodeMsg` fields to `google.protobuf.Struct` or
+a typed message, a wire change for every client including the UI.
+
+**Trade-off.** The gRPC `NodeMsg` still carries strings, so a raw gRPC caller
+decodes them itself, as the proto comments say.
+
+**Why.** The papercut was the agent surface. Fixing it where the JSON is
+built keeps the wire format and the UI untouched.
+
+## 63. A restoring node reads published parts with its own `contentStore` credential, and only for URLs under its own `contentStore.url`
+
+*Workstream: Suspend and resume (durable checkpoints).*
+
+**The call.** `ArtifactStager::fetch_sealed_into_store` checks whether a
+part URL is under the node's own `contentStore.url` (same scheme, bucket,
+and `endpoint`, under the prefix at a `/` boundary). If it is, the fetch is
+signed with the node's `contentStore.auth`: the KV credential, read on every
+fetch so a rotated STS credential is picked up the way the publisher picks
+it up, or the ambient AWS chain when `auth` is omitted. The ambient case is
+a new `Credential::AwsAmbient` variant, which the `s3://` fetcher signs with
+instead of `with_skip_signature`. It cannot be written in KV. Any other part
+URL is fetched anonymously, and a failure names the store:
+
+```text
+this node has no credential for content store s3://legion-content-use1/:
+a restoring node signs part fetches only for URLs under its own
+contentStore.url (here: s3://legion-content-usw2/), so this fetch was
+anonymous. Give this node the same contentStore url and auth as the node
+that published the snapshot
+```
+
+**Alternatives.**
+- Apply cluster `artifacts.auth` matchers to part URLs, as the bug report
+  first assumed already happened. The matchers live on the manager and
+  apply at job admission. Part URLs never pass admission, so the manager
+  would have to match them and send the result with every restore and warm
+  (a new field on `SnapshotRestore` and `CheckpointRequest`). That would
+  also let one node read many stores.
+- A worker-side list of read credentials per store (`contentStore.readAuth
+  = [{ match, kv }]`).
+- Sign every part fetch with the ambient chain, not only fetches from the
+  node's own store.
+
+**Trade-off.** A node can read only the store it publishes to. A cluster with
+one bucket per region cannot restore across regions, and placement does not
+yet know which store a node has, so a resume can land on a node pointed at
+another bucket and fail with the message above. Both are open in TODO.md and
+stated in `docs/suspend-and-resume.md` ("Limitations"). The bug report asked
+for an explicit `artifacts.auth` matcher to win over the store credential.
+That is not built, because no matcher ever reached this path.
+
+**Why.** Simplicity. The publisher and the reader use the same block with the
+same credential, so "this node can publish to the store" means "this node can
+restore from it", and the operator configures nothing new. Store identity
+includes the endpoint and the prefix boundary, so the store's credential is
+never sent to another bucket, a sibling prefix, or a different S3-compatible
+endpoint that serves the same bucket name. Matchers sent over the wire would
+add a wire field and a second credential path for one cross-region case
+nobody has asked for yet. A blanket ambient chain would quietly sign
+requests to buckets the operator never named, and on a non-AWS host it can
+stall on instance-metadata lookups before it fails.
+## 64. `job plan` previews a preemption that only waits on `victimExemptAge`, and the submit retries on the clock
+
+*Workstream: Scheduling (2026-10-12 re-run papercut).*
+
+**The call.** Seconds after `band-fill` landed, `job plan` for the high-band
+claim failed "no available nodes", while the `job run` right after it
+preempted a minute later. Both ran the same pass. The victims were younger
+than `victimExemptAge`, so the plan failed honestly for that instant, and the
+submit blocked and happened to be woken by later churn. Now a pass that finds
+nothing re-runs with the guard lifted. When that finds room, the guard alone
+is in the way:
+
+- A dry run places on it and lists the victims with `eligibleInSeconds`,
+  printed as `once past victimExemptAge in 23s`.
+- An applying plan still evicts nothing. The blocked placement carries a
+  `retry_after`, and the eval worker requeues the eval for that moment
+  instead of blocking it. A partial plan queues a delayed `job_reschedule`.
+
+**Alternatives.**
+- Keep the plan's error and only reword it. The preview would still
+  contradict what the submit does a minute later, which is the bug.
+- Lift the guard in the plan without saying so. The plan would claim an
+  eviction the submit cannot make yet.
+- Leave the submit blocked and rely on capacity events. Nothing marks a
+  victim getting older, so a quiet cluster could leave the claim blocked
+  indefinitely, and the preview's "in 23s" would be wrong.
+
+**Trade-off.** One more pass over the candidate nodes when the guard rejects
+something and nothing else fits, and a timed requeue that runs even if the
+cluster changed meanwhile (it re-plans and blocks again if so). The retry is
+set only in `enforce` mode, since `observe` never acts on it.
+
+**Why.** The plan's job is to preview what the submit converges to. Saying
+"would preempt, in 23s" is that answer, and the clock-based retry makes it
+true instead of probable. Simplicity: one more field on an existing message,
+no new knob.
+
+## 65. The macOS in-process worker stops its tasks on a clean shutdown, and the next start runs them again
+
+*Workstream: macOS local dev (2026-10-12 re-run papercut).*
+
+**The call.** SIGTERM to `legion start manager --run-worker` left Apple
+containers running. On macOS only, the in-process worker now stops every task
+on SIGTERM or SIGINT, after session checkpoints, with each task's stop signal
+and `killAfter` inside a 30 second cap. It leaves the worker state file alone,
+so the next start finds the processes gone and re-runs the same allocations.
+The in-process worker also no longer calls `process::exit` on any platform:
+it returns, and the manager waits for it before finishing its own drain and
+persistence shutdown. Before, the worker's exit could cut the manager's
+drain short.
+
+**Alternatives.**
+- Leave tasks running and rely on re-adoption, which already works while the
+  `container run` process lives. It keeps VMs holding memory after the
+  developer stopped the cluster, which is the complaint.
+- Stop tasks on every in-process worker, Linux included. A combined
+  manager-and-worker node under systemd would restart every task on each
+  upgrade, breaking the documented `KillMode=process` re-adoption story.
+- Add a flag to choose. More surface for a dev-mode default nobody has asked
+  to turn off.
+
+**Trade-off.** Containers restart across a dev cluster restart, so in-memory
+state is lost (volumes keep their data). A SIGKILL or crash still stops
+nothing, and there is no opt-out.
+
+**Why.** On macOS the single process is the cluster a developer runs in a
+terminal, and stopping it should stop its work, as `docker compose up` does.
+Keeping the state file means nothing new has to happen at start: the existing
+dead-pid path and the manager's desired set bring the work back. Ease of use
+for local dev, at no cost to the Linux operations story.
+
+## 66. An instance's node is read from its current allocation, not stored on the row
+
+*Workstream: Stateful (2026-10-12 re-run papercut).*
+
+**The call.** `InstanceInfo.node_id` was only ever set for sessions, so every
+row-backed instance read `nodeId: null`. `map_instance_info` now loads the
+current allocation once (it already did, for the loss diagnostic) and reports
+its node. `instance list` gained a NODE column.
+
+**Alternatives.** Add a `node_id` column to `instance` and keep it in sync on
+every bind, rebind, and release.
+
+**Trade-off.** One allocation read per bound instance on get and list, the
+same read the loss diagnostic already paid.
+
+**Why.** The allocation is the source of truth for where an instance runs. A
+second copy would need every placement path to update it, and the spot check
+shows what happens when one copy is set on only some paths. Simplicity.
+## 67. An instance returning to its volume's node is not charged its storage `size` there
+
+*Workstream: Scheduling. Found on the rig after the reschedule holds.*
+
+**The call.** The disk-fit check skips a task's `stateful.storage` size on
+one node only: the node the next placement's volume pin names, when that
+pin is a volume pin (no restore ahead of it). Every other node, and every
+fresh instance, is still charged the full declared size. The rig's
+`fullstack-db-0` sat behind "healthy but has no room for it right now" on a
+node 12% reserved, because its node's free disk read under the 2G it
+declared, although the volume was already there.
+
+**Alternatives.** Keep charging the size (right only for a first
+provision). Charge the volume's measured usage instead (the manager has no
+such number). Exempt every `Reschedule` plan (wrong for an instance moving
+to a new node, where a fresh volume is created).
+
+**Trade-off.** If a node lost a volume's directory out of band, its instance
+goes back without a disk check, and the driver re-creates the directory at
+mount. The store still says the volume lives there, so that is also what the
+pin already assumes.
+
+**Why.** Correctness and simplicity. The bytes are already in the node's
+used space, so charging them again double-counts them, and the pin means no
+other node can take the instance. One `Option` compare in the existing
+filter, no new state. Stated in [volumes.md](../../docs/volumes.md).
+
+## 68. `instance start` retries a `rescheduling` slot instance, and does nothing else for slot instances
+
+*Workstream: Scheduling.*
+
+**The call.** StartInstance on a slot-mode instance in `rescheduling` lifts
+its reschedule hold, exactly as for a keyed instance (entry 56), and the
+reply is `Retrying instance <id> now: lifted its reschedule backoff`. Any
+other start of a slot instance is still `InvalidArgument`, now naming the
+one case it accepts. The `rescheduling:` detail suggests `instance start
+<id>` for any stateful instance.
+
+**Alternatives.** Keep slot instances refused, so `job run
+--force-reschedule` is the only retry (it restarts every task of the job:
+on the rig, the frontend, API, and cache along with the database). Add a
+`legion instance retry` verb.
+
+**Trade-off.** `start` means less for a slot instance than for a keyed one.
+A slot instance's lifecycle still belongs to `count.num`.
+
+**Why.** Ease. Retrying one database replica should not restart the rest of
+the stack, and the verb the hint already printed for keyed instances is the
+one an operator reaches for. Stated in
+[jobs-tasks-and-scheduling.md](../../docs/jobs-tasks-and-scheduling.md#manager-side-move-logic)
+and [stateful-workloads.md](../../docs/stateful-workloads.md).
+
+## 69. A pinned placement whose node is not a candidate says so, not "no available nodes"
+
+*Workstream: Scheduling.*
+
+**The call.** When nothing fits and the next placement is pinned to a node
+that is not among the task's candidates (left out of the pass, unschedulable
+in the scheduler's read model, or no longer matching the task), the error is
+the pinned-node sentence (`instance <id> holds node-local storage on node
+<node>, which is …`) instead of `no available nodes matching constraints …
+Preemption did not run: no node this task is allowed on had any allocation
+to consider`. Why the node is absent is read from the read model first, the
+stored row second.
+
+**Alternatives.** Keep the generic message, which is accurate about the
+other nodes and silent about the only one that matters.
+
+**Trade-off.** The preemption detail is dropped in that case. Preemption
+could not have helped: it only looks at the pinned node.
+
+**Why.** Ease. On the rig the generic message pointed at capacity on the
+wrong node. The read model is what placement uses, so the reason matches
+what the scheduler saw even when the stored row disagrees (spot-check P0-6).

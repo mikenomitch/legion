@@ -152,7 +152,7 @@ file is always there.
 | --- | --- |
 | `exec` | Signals the task's process group directly. Full support. |
 | `container` | Signals the container's init, not the launching CLI. On Linux (OCI runtimes), `stop.signal` is delivered as configured. When the jobspec has no `stop` block, the image's own `STOPSIGNAL` is used before falling back to `SIGTERM`, matching Docker's behavior (see [task-runtime-container.md](task-runtime-container.md#graceful-stop)). On macOS, the Apple `container` runtime runs its own ladder and may SIGKILL on its own schedule if `killAfter` exceeds what it accepts. |
-| `sandbox` | **No graceful stop.** A sandbox is a guest OS behind a VMM. Signaling the VMM terminates the hypervisor instead of asking the workload inside to shut down, and Legion has no in-guest agent to pass a notice to. `stop { signal, killAfter }` has no effect, and these allocations are torn down immediately. |
+| `sandbox` | On a microVM, the guest agent signals the guest's init with `stop.signal`. Init flushes the guest's disks, passes the signal to the command, waits for it, unmounts the volumes, and powers off. The VMM is killed at `killAfter` only if the guest is still up, after one more flush. `SIGINT` and `SIGQUIT` reach the command ignored, so a shell-script command cannot act on them. See [task-runtime-sandbox.md](task-runtime-sandbox.md#stopping-a-sandbox). The dev-mode backends (Apple `container`, an OCI runtime) are torn down immediately. |
 | Out-of-tree plugins | A runtime that tracks a host process gets the default (signal the process group). A runtime that does not declines the notice, and the worker tears the allocation down immediately, as it did before graceful stop existed. |
 
 ## Why this exists
@@ -325,9 +325,10 @@ lost. A stop whose notice has not arrived is still graceful. It just reports
 
 ## Known limitations
 
-- **`sandbox` tasks get no grace period.** See
-  [Runtime support](#runtime-support). This follows from the design (there
-  is no in-guest agent).
+- **Dev-mode `sandbox` tasks get no grace period.** Only a microVM has a
+  guest to ask. A microVM whose guest agent cannot be reached is also
+  stopped at once, after a flush attempt. See
+  [Runtime support](#runtime-support).
 - **The Apple `container` runtime runs its own ladder.** `stop.signal` is
   passed through, but the runtime's own timeout may fire before Legion's
   `killAfter`. Linux/OCI workers follow `killAfter` exactly.

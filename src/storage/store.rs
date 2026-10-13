@@ -28,6 +28,9 @@ mod snapshot_ops;
 mod suspend_ops;
 // The job status GetJobInfo/ListJobs report, derived from the workload.
 mod job_status_ops;
+// Reschedule backoff: the failed-allocation removal op, its holds, and the
+// move history they double as.
+mod reschedule_holds;
 use crate::storage::persistence::{
     build_persistence_driver, PersistenceDriver, PersistenceRole, PersistenceStatus,
     RaftHistoryEvent, RaftStatus,
@@ -37,6 +40,10 @@ use crate::storage::Lane;
 pub use fork_ops::{alias_target_problem, AliasOutcome, ForkCreated};
 pub use job_status_ops::{derive_job_status, JobStatusFacts, TaskStatusFact};
 pub use keyring_ops::{KeyringInit, KeyringReset, RewrapBatch, RewrapRun, RootKeyRewrap};
+pub use reschedule_holds::{
+    move_backoff, summarize_reason, FailedMove, FailedRemoval, MovePolicy, MoveVerdict,
+    RescheduleHold, MOVE_DELAY_MAX,
+};
 pub use session_ops::{PromoteSession, PromotedSession};
 pub use snapshot_ops::{
     DeleteSnapshotOutcome, NewSnapshot, RestoreInstanceOutcome, RestorePin, SnapshotFilter,
@@ -729,6 +736,16 @@ pub struct DeclaredConsumer {
     pub job_id: String,
     pub task_name: String,
     pub upstreams: Vec<crate::structs::UpstreamConfig>,
+}
+
+/// What the scheduler-lane half of [`Store::complete_allocation`] commits
+/// and decides: the completed row, and the status its task should move to
+/// (`None` leaves it, while other replicas still run). Serialized because a
+/// follower forwards this half to the lane leader and gets it back.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub(crate) struct CompletedAllocation {
+    pub allocation: Allocation,
+    pub task_status: Option<TaskStatusState>,
 }
 
 /// What [`Store::plan_capacity_snapshot`] hands the scheduler: current
@@ -1446,6 +1463,9 @@ pub enum StartInstanceOutcome {
     /// The instance was already live (pending/active/rescheduling); nothing
     /// changed (idempotent no-op).
     AlreadyRunning,
+    /// The instance was `rescheduling` and waiting out its reschedule
+    /// backoff; the hold is lifted, so the next plan places it now.
+    BackoffLifted,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1644,6 +1664,13 @@ fn reconcile_conflict_forced() -> bool {
 #[cfg(not(test))]
 fn reconcile_conflict_forced() -> bool {
     false
+}
+
+// Test seam for `project_committed_changeset`: the projection only fails on
+// a bug or an unreadable DB, so tests make the next one on this thread fail.
+#[cfg(test)]
+thread_local! {
+    static FAIL_NEXT_PROJECTION: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 /// SQL fragment: the id of the newest `job_config` for the job aliased `j`
@@ -2168,6 +2195,17 @@ impl Store {
             .as_any()
             .downcast_ref::<crate::storage::raft::driver::MultiRaftDriver>()
             .map(|driver| driver.member_addresses())
+            .unwrap_or_default()
+    }
+
+    /// Every raft member as `(node id, advertised host:port)`, sorted by node
+    /// id, from the replicated membership. Empty outside raft mode. Backs
+    /// `ListManagers`.
+    pub fn raft_members(&self) -> Vec<(String, String)> {
+        self.persistence_driver
+            .as_any()
+            .downcast_ref::<crate::storage::raft::driver::MultiRaftDriver>()
+            .map(|driver| driver.members())
             .unwrap_or_default()
     }
 
@@ -3128,12 +3166,12 @@ impl Store {
         drop(read_guards);
         drop(write_guard);
 
-        // The read model caches rows from the replaced database; rebuild it
-        // from the installed one.
-        self.refresh_read_model()?;
-        // So does the keyring: the installed image carries the cluster's
-        // data keys, which a fresh joiner sees here for the first time.
-        self.keyring_rows_changed();
+        // The read model and the work-stream logs describe the replaced
+        // database, and the installed image carries the cluster's data keys
+        // (a fresh joiner sees them here for the first time): rebuild all
+        // three from the installed one. Infallible: the swap is done, and
+        // the raft install path turns an error into a fatal one.
+        self.rebuild_node_local_state(true);
         info!(path = %self.db_path.display(), "Installed replacement state database");
         Ok(())
     }
@@ -6767,6 +6805,8 @@ impl Store {
             // A read-side overlay (`Store::overlay_blocked_jobs`), never
             // stored on the job row.
             blocked: None,
+            // Overlaid by GetJobInfo (`Store::reschedule_holds_for_job`).
+            reschedule_backoffs: Vec::new(),
         };
 
         Ok(job)
@@ -9416,6 +9456,7 @@ impl Store {
             [job_id],
         )?;
         tx.execute("DELETE FROM instance WHERE job_id = ?1;", [job_id])?;
+        tx.execute("DELETE FROM reschedule_hold WHERE job_id = ?1;", [job_id])?;
         Self::destroy_job_snapshots_tx(&tx, job_id)?;
         tx.execute("DELETE FROM rollout_event WHERE job_id = ?1;", [job_id])?;
         tx.execute("DELETE FROM rollout WHERE job_id = ?1;", [job_id])?;
@@ -11009,18 +11050,44 @@ impl Store {
         // that did not lead that lane under divergent lane leadership
         // (plan §8). The choice only decides whose log carries the entry;
         // ids stay lane-residued (JC-42) and the journal is id-ordered.
-        // Emission stays best-effort: a replication failure is logged and
-        // swallowed, never propagated.
-        let lane = [Lane::Status, Lane::Control, Lane::Scheduler]
+        let led = [Lane::Status, Lane::Control, Lane::Scheduler]
             .into_iter()
-            .find(|lane| self.is_raft_leader(*lane))
-            .unwrap_or(Lane::Status);
-        if let Err(err) = self.replicated(lane, "emit_event", move |s| {
-            s.emit_event_apply(draft);
-            Ok(())
-        }) {
+            .find(|lane| self.is_raft_leader(*lane));
+        // A manager that leads NO lane — every follower in the default
+        // `single` topology — forwards the event to the status-lane leader.
+        // Events emitted while handling worker heartbeats (`node.pressure`,
+        // `net.denied`) run on whichever manager the worker dials, so
+        // without this they were dropped on two managers out of three.
+        let forward =
+            (led.is_none() && self.raft_mode() && !capture::in_capture()).then(|| draft.clone());
+        // Emission stays best-effort: a replication or forwarding failure is
+        // logged and swallowed, never propagated.
+        let result = match self.emit_event_on(led.unwrap_or(Lane::Status), draft) {
+            Err(err) if crate::storage::raft::driver::NotRaftLeader::in_chain(&err) => {
+                match forward {
+                    Some(draft) => self.forward_after_rejection::<()>(
+                        crate::storage::raft::forward::ForwardableLaneWrite::EmitEvent { draft },
+                        err,
+                    ),
+                    None => Err(err),
+                }
+            }
+            other => other,
+        };
+        if let Err(err) = result {
             warn!(%kind, error = ?err, "Failed replicating scheduler event");
         }
+    }
+
+    /// Propose one standalone event on `lane`. The non-forwarding half of
+    /// [`Self::emit_event`], and what a forwarded `EmitEvent` executes on the
+    /// lane leader, so a leader change mid-forward comes back as a typed
+    /// `NotRaftLeader` instead of a second hop.
+    pub(crate) fn emit_event_on(&self, lane: Lane, draft: EventDraft) -> R<()> {
+        self.replicated(lane, "emit_event", move |s| {
+            s.emit_event_apply(draft);
+            Ok(())
+        })
     }
 
     fn emit_event_apply(&self, draft: EventDraft) {
@@ -11105,9 +11172,11 @@ impl Store {
     /// omit unchanged non-PK columns) are recovered by re-reading the row by
     /// primary key, and cache patches re-read from the DB rather than
     /// decoding full rows out of the changeset.
+    ///
+    /// Never fails: see [`Self::project_committed_changeset`].
     #[allow(dead_code)] // called from capture::apply_changeset (A-0 tests) and the A-1 state machine
-    pub(crate) fn project_changeset_side_effects(&self, bytes: &[u8]) -> R<()> {
-        self.project_changeset(bytes, false)
+    pub(crate) fn project_changeset_side_effects(&self, bytes: &[u8]) {
+        self.project_committed_changeset(bytes, false)
     }
 
     /// The read-model half of [`Self::project_changeset_side_effects`], for
@@ -11115,8 +11184,66 @@ impl Store {
     /// broadcast, journal pruning, keyring reloads, and eval wakes keep
     /// their direct paths in that mode, so only the cache follows the
     /// changeset (read-model-coherence plan § 5.4).
-    pub(crate) fn project_read_model_from_changeset(&self, bytes: &[u8]) -> R<()> {
-        self.project_changeset(bytes, true)
+    pub(crate) fn project_read_model_from_changeset(&self, bytes: &[u8]) {
+        self.project_committed_changeset(bytes, true)
+    }
+
+    /// Project a changeset that has already committed, falling back to a
+    /// full rebuild of this manager's node-local state when the projection
+    /// fails part way.
+    ///
+    /// The projection must never fail its caller. In raft mode it runs
+    /// inside the state machine's `apply`, after the rows and the applied
+    /// marker committed: an error there reaches openraft as a fatal storage
+    /// error and stops this replica's raft core for good (on a leader, the
+    /// whole cluster goes leaderless until a restart), although every
+    /// replica holds the same rows. In `local_disk` mode it would report a
+    /// committed write as failed. Everything the projection maintains is
+    /// derived from the committed DB, so rebuilding it is always correct.
+    fn project_committed_changeset(&self, bytes: &[u8], read_model_only: bool) {
+        #[cfg(test)]
+        let projected = if FAIL_NEXT_PROJECTION.with(|fail| fail.replace(false)) {
+            Err(anyhow!("injected projection failure"))
+        } else {
+            self.project_changeset(bytes, read_model_only)
+        };
+        #[cfg(not(test))]
+        let projected = self.project_changeset(bytes, read_model_only);
+        let Err(err) = projected else {
+            return;
+        };
+        error!(
+            error = ?err,
+            "Failed projecting a committed changeset; rebuilding this manager's read model \
+             and resyncing its work streams"
+        );
+        self.rebuild_node_local_state(!read_model_only);
+        if !read_model_only {
+            // The eval wakes may not have run: wake every parked worker, and
+            // leave a permit for the next one to park. A spurious wake costs
+            // one empty claim.
+            self.eval_notify.notify_waiters();
+            self.eval_notify.notify_one();
+        }
+    }
+
+    /// Rebuild what this manager derives from its committed DB: the
+    /// scheduling read model, the work-stream logs (a full resync for every
+    /// streaming worker), and, when `keyring` is set, the unwrapped KV data
+    /// keys. Used after a snapshot install replaced rows under the caches
+    /// and after a failed changeset projection. Never fails, since its
+    /// callers run inside the raft state machine (see
+    /// [`Self::project_committed_changeset`]). A read model that cannot be
+    /// reloaded is logged and left as it was: the DB itself is unreadable
+    /// then, which the next apply reports as the storage error it is.
+    pub(crate) fn rebuild_node_local_state(&self, keyring: bool) {
+        if let Err(err) = self.refresh_read_model() {
+            error!(error = ?err, "Failed rebuilding the scheduling read model from the state db");
+        }
+        self.work_log.resync_all();
+        if keyring {
+            self.keyring_rows_changed();
+        }
     }
 
     fn project_changeset(&self, bytes: &[u8], read_model_only: bool) -> R<()> {
@@ -11152,6 +11279,7 @@ impl Store {
         // changeset touched, for the work delivery log.
         let mut changed_instances: HashSet<String> = HashSet::new();
         let mut changed_volume_jobs: HashSet<String> = HashSet::new();
+        let mut changed_volume_ids: HashSet<String> = HashSet::new();
         let mut event_ids: Vec<i64> = Vec::new();
         let mut evals_made_claimable = 0usize;
         // Changes that may have made room, for the blocked-eval wake pass
@@ -11394,6 +11522,13 @@ impl Store {
                             changed_instances.insert(instance);
                         } else if let Some(job) = value_of("job_id", &mut column_cache)? {
                             changed_volume_jobs.insert(job);
+                        } else if action == Action::SQLITE_UPDATE {
+                            // An UPDATE record omits unchanged columns, so a
+                            // state or pin change names neither owner: re-read
+                            // the row by its key after the scan.
+                            if let Some(id) = value_of("volume_id", &mut column_cache)? {
+                                changed_volume_ids.insert(id);
+                            }
                         }
                     }
                 }
@@ -11591,12 +11726,14 @@ impl Store {
 
         // Tell the work delivery log which allocations moved, on every
         // replica and in every mode, after the read model reflects them.
+        // Infallible by design: see `note_work_changes`.
         self.note_work_changes(
             &alloc_delta,
             &refresh_nodes,
             &changed_instances,
             &changed_volume_jobs,
-        )?;
+            &changed_volume_ids,
+        );
 
         if read_model_only {
             return Ok(());
@@ -11654,63 +11791,126 @@ impl Store {
     /// whose job-level volume changed. A changeset whose allocation records
     /// could not be classified marks its nodes for a full resync instead.
     /// Costs nothing on a manager no worker streams from.
+    ///
+    /// Never fails. It runs after the changeset and its applied marker
+    /// committed, inside the raft state machine's `apply`, where an error
+    /// stops this replica's raft group (openraft treats a state-machine
+    /// `StorageError` as fatal), while replicas no worker streams from apply
+    /// the same entry cleanly. The work log is a node-local delivery cache
+    /// that a resync rebuilds, so a lookup failure resyncs every streaming
+    /// node instead.
     fn note_work_changes(
         &self,
         delta: &AllocationDelta,
         refresh_nodes: &BTreeSet<String>,
         changed_instances: &HashSet<String>,
         changed_volume_jobs: &HashSet<String>,
-    ) -> R<()> {
+        changed_volume_ids: &HashSet<String>,
+    ) {
         if !self.work_log.has_nodes() {
-            return Ok(());
+            return;
         }
         if !delta.usable {
             self.work_log
                 .resync_nodes(refresh_nodes.iter().map(String::as_str));
         }
+        match self.work_changes(
+            delta,
+            changed_instances,
+            changed_volume_jobs,
+            changed_volume_ids,
+        ) {
+            Ok(changes) => self
+                .work_log
+                .note_changes(changes.iter().map(|(node, id)| (node.as_str(), *id))),
+            Err(err) => {
+                warn!(
+                    error = ?err,
+                    "Failed resolving a committed changeset's allocation changes for the work \
+                     stream; resyncing every streaming node"
+                );
+                self.work_log.resync_all();
+            }
+        }
+    }
+
+    /// The `(node, allocation)` pairs [`Self::note_work_changes`] feeds to
+    /// the work log, resolved against the committed DB.
+    fn work_changes(
+        &self,
+        delta: &AllocationDelta,
+        changed_instances: &HashSet<String>,
+        changed_volume_jobs: &HashSet<String>,
+        changed_volume_ids: &HashSet<String>,
+    ) -> R<Vec<(String, i64)>> {
         let mut changes: Vec<(String, i64)> = delta
             .removals
             .iter()
             .map(|(id, node)| (node.clone(), *id))
             .collect();
-        let ids: Vec<i64> = delta.upserts.iter().copied().collect();
-        if !ids.is_empty() || !changed_instances.is_empty() || !changed_volume_jobs.is_empty() {
-            let conn = self.read_connection()?;
-            for id in ids {
-                let node: Option<String> = conn
-                    .prepare_cached("SELECT node_id FROM allocation WHERE id = ?1;")?
-                    .query_row([id], |row| row.get(0))
-                    .optional()?;
-                if let Some(node) = node {
-                    changes.push((node, id));
-                }
-            }
-            for instance_id in changed_instances {
-                let mut stmt = conn
-                    .prepare_cached("SELECT id, node_id FROM allocation WHERE instance_id = ?1;")?;
-                let rows = stmt.query_map([instance_id], |row| {
-                    Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
-                })?;
-                for row in rows {
-                    let (id, node) = row?;
-                    changes.push((node, id));
-                }
-            }
-            for job_id in changed_volume_jobs {
-                let mut stmt =
-                    conn.prepare_cached("SELECT id, node_id FROM allocation WHERE job_id = ?1;")?;
-                let rows = stmt.query_map([job_id], |row| {
-                    Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
-                })?;
-                for row in rows {
-                    let (id, node) = row?;
-                    changes.push((node, id));
-                }
+        if delta.upserts.is_empty()
+            && changed_instances.is_empty()
+            && changed_volume_jobs.is_empty()
+            && changed_volume_ids.is_empty()
+        {
+            return Ok(changes);
+        }
+        let conn = self.read_connection()?;
+        for &id in &delta.upserts {
+            let node: Option<String> = conn
+                .prepare_cached("SELECT node_id FROM allocation WHERE id = ?1;")?
+                .query_row([id], |row| row.get(0))
+                .optional()?;
+            if let Some(node) = node {
+                changes.push((node, id));
             }
         }
-        self.work_log
-            .note_changes(changes.iter().map(|(node, id)| (node.as_str(), *id)));
-        Ok(())
+        // Volume UPDATEs whose record named neither owner: look it up now.
+        let mut instances: BTreeSet<String> = changed_instances.iter().cloned().collect();
+        let mut jobs: BTreeSet<String> = changed_volume_jobs.iter().cloned().collect();
+        for volume_id in changed_volume_ids {
+            let owner: Option<(Option<String>, Option<String>)> = conn
+                .prepare_cached("SELECT instance_id, job_id FROM volume WHERE volume_id = ?1;")?
+                .query_row([volume_id], |row| Ok((row.get(0)?, row.get(1)?)))
+                .optional()?;
+            match owner {
+                Some((Some(instance), _)) => {
+                    instances.insert(instance);
+                }
+                Some((None, Some(job))) => {
+                    jobs.insert(job);
+                }
+                _ => {}
+            }
+        }
+        for instance_id in &instances {
+            let mut stmt =
+                conn.prepare_cached("SELECT id, node_id FROM allocation WHERE instance_id = ?1;")?;
+            let rows = stmt.query_map([instance_id], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+            })?;
+            for row in rows {
+                let (id, node) = row?;
+                changes.push((node, id));
+            }
+        }
+        // `volume.job_id` names the job, and an allocation reaches its job
+        // only through its job config.
+        for job_id in &jobs {
+            let mut stmt = conn.prepare_cached(
+                "SELECT allocation.id, allocation.node_id FROM allocation \
+                 JOIN job_config ON job_config.id = allocation.job_config_id \
+                 WHERE job_config.job_id = ?1;",
+            )?;
+            let rows = stmt.query_map([job_id], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+            })?;
+            for row in rows {
+                let (id, node) = row?;
+                changes.push((node, id));
+            }
+        }
+        Ok(changes)
     }
 
     /// Prune this node's scheduler-event journal down to the newest
@@ -12349,7 +12549,30 @@ impl Store {
         Ok(statuses)
     }
 
+    /// Move a task to `status` (status lane). Forwards to the lane leader
+    /// from a follower: worker reports (a batch exit through
+    /// [`Self::complete_allocation`], a task failed for good) land on
+    /// whichever manager the worker dials, and a rejected write here would
+    /// leave the task's dependents waiting on a status that never comes.
     pub fn set_task_status(&self, task_config_id: i64, status: TaskStatusState) -> R<()> {
+        match self.set_task_status_local(task_config_id, status) {
+            Err(err) if crate::storage::raft::driver::NotRaftLeader::in_chain(&err) => self
+                .forward_after_rejection(
+                    crate::storage::raft::forward::ForwardableLaneWrite::SetTaskStatus {
+                        task_config_id,
+                        status,
+                    },
+                    err,
+                ),
+            other => other,
+        }
+    }
+
+    pub(crate) fn set_task_status_local(
+        &self,
+        task_config_id: i64,
+        status: TaskStatusState,
+    ) -> R<()> {
         self.replicated(Lane::Status, "set_task_status", move |s| {
             s.set_task_status_apply(task_config_id, status)
         })
@@ -12358,8 +12581,12 @@ impl Store {
     fn set_task_status_apply(&self, task_config_id: i64, status: TaskStatusState) -> R<()> {
         let conn = self.write_connection()?;
         let now = Self::now_rfc3339()?;
+        // Only a change is written, so a repeated report (a retried batch
+        // completion) is an empty changeset. `updated_at` is when the status
+        // last changed, as in `apply_task_status_updates_tx`.
         conn.execute(
-            "UPDATE task_status SET status = ?, updated_at = ? WHERE task_config_id = ?;",
+            "UPDATE task_status SET status = ?1, updated_at = ?2 \
+             WHERE task_config_id = ?3 AND status IS NOT ?1;",
             params![status.as_str(), now, task_config_id],
         )?;
         Ok(())
@@ -13297,6 +13524,21 @@ impl Store {
         .map(|slot| slot as u32)
         .collect();
 
+        // Slots whose replacement waits out a reschedule backoff: the planner
+        // withheld their placements, so prefer any other free slot (a slot
+        // lost to a node, or a scale-out).
+        let mut held_stmt = tx.prepare_cached(
+            "SELECT instance_id FROM reschedule_hold \
+             WHERE task_config_id = ?1 AND instance_id IS NOT NULL AND not_before_unix > ?2;",
+        )?;
+        let held: HashSet<String> = Self::collect_rows(
+            held_stmt.query_map(params![task_id, Self::now_unix()], |row| row.get(0))?,
+        )?
+        .into_iter()
+        .collect();
+        drop(held_stmt);
+        let not_held = |slot: &u32| !held.contains(&slot_instance_id(&job_id, &group, *slot));
+
         let desired = count.max(0) as u32;
         // Node-local storage makes slot choice matter: an allocation that
         // landed on node-a1 must bind the slot whose data is ON node-a1, not
@@ -13304,7 +13546,7 @@ impl Store {
         // planner's pin and the binder's choice agree even if their orderings
         // diverge — the allocation always meets its own data.
         let pinned_slot = (0..desired)
-            .filter(|slot| !taken.contains(slot))
+            .filter(|slot| !taken.contains(slot) && not_held(slot))
             .find(|slot| {
                 let candidate = slot_instance_id(&job_id, &group, *slot);
                 matches!(
@@ -13314,8 +13556,11 @@ impl Store {
             });
         let slot = pinned_slot
             .or_else(|| {
-                (0..desired).find(|slot| !taken.contains(slot) && !job_taken.contains(slot))
+                (0..desired).find(|slot| {
+                    !taken.contains(slot) && !job_taken.contains(slot) && not_held(slot)
+                })
             })
+            .or_else(|| (0..desired).find(|slot| !taken.contains(slot) && not_held(slot)))
             .or_else(|| (0..desired).find(|slot| !taken.contains(slot)))
             .with_context(|| {
                 format!(
@@ -13431,7 +13676,10 @@ impl Store {
         target_instance: Option<&str>,
     ) -> R<String> {
         // Unbound live instances of this (job, group, task), oldest first.
-        // Ordering by `node_local_pin DESC` first makes an allocation bind the
+        // An instance waiting out a reschedule backoff goes last: the planner
+        // withheld its replacement, so a placement of this task is for some
+        // other instance (a new one, or one lost to a node).
+        // Ordering by `node_local_pin DESC` then makes an allocation bind the
         // instance whose node-local data already lives on the node it landed
         // on; without a pin the ordering is unchanged (oldest wins), so keyed
         // binding without volumes behaves exactly as before. A restoring
@@ -13464,7 +13712,11 @@ impl Store {
                      ELSE snapshot.node_id END FROM snapshot \
                      WHERE snapshot.snapshot_id = instance.restore_from\
                  ), ?5) = ?5) \
-                 ORDER BY (instance.restore_from IS NOT NULL) DESC, (volume.node_id = ?5) DESC, \
+                 ORDER BY EXISTS (SELECT 1 FROM reschedule_hold \
+                     WHERE reschedule_hold.instance_id = instance.instance_id \
+                     AND reschedule_hold.task_config_id = ?4 \
+                     AND reschedule_hold.not_before_unix > ?7) ASC, \
+                 (instance.restore_from IS NOT NULL) DESC, (volume.node_id = ?5) DESC, \
                  COALESCE((SELECT snapshot.node_id = ?5 FROM snapshot \
                      WHERE snapshot.snapshot_id = instance.restore_from), 0) DESC, \
                  instance.created_at ASC, instance.instance_id ASC LIMIT 1;",
@@ -13474,7 +13726,8 @@ impl Store {
                     task_name,
                     task_id,
                     node_id,
-                    target_instance.unwrap_or_default()
+                    target_instance.unwrap_or_default(),
+                    Self::now_unix()
                 ],
                 |row| self.instance_from_row(row),
             )
@@ -14830,11 +15083,33 @@ impl Store {
 
         let mut conn = self.write_connection()?;
         let tx = Self::write_tx(&mut conn)?;
-        tx.execute("DELETE FROM allocation WHERE id = ?;", [allocation_id])?;
-        self.release_instance_bindings_tx(&tx, std::slice::from_ref(&allocation))?;
-        self.bump_job_config_epoch_tx(&tx, &allocation.job_config_id)?;
+        let stopping_event = self.remove_allocation_row_tx(&tx, &allocation, cause, explanation)?;
+        tx.commit()?;
+        self.publish_staged(stopping_event);
+
+        self.cache_remove_allocations(std::slice::from_ref(&allocation))?;
+
+        Ok(Some(allocation))
+    }
+
+    /// The body of a one-allocation removal, inside the caller's
+    /// transaction: delete the row, release its instance binding, bump the
+    /// epoch, record the stop notice and the instance's `last_stop`. Returns
+    /// the staged `allocation.stopping` event for the caller to publish
+    /// after commit. Shared by [`Self::remove_allocation_by_id_explained`]
+    /// and the failed-allocation removal (`reschedule_holds.rs`).
+    fn remove_allocation_row_tx(
+        &self,
+        tx: &Connection,
+        allocation: &Allocation,
+        cause: StopCause,
+        explanation: Option<&StopExplanation>,
+    ) -> R<Option<SchedulerEventRecord>> {
+        tx.execute("DELETE FROM allocation WHERE id = ?;", [allocation.id])?;
+        self.release_instance_bindings_tx(tx, std::slice::from_ref(allocation))?;
+        self.bump_job_config_epoch_tx(tx, &allocation.job_config_id)?;
         let stopping_event =
-            self.record_stop_notices_tx(&tx, std::slice::from_ref(&allocation), cause)?;
+            self.record_stop_notices_tx(tx, std::slice::from_ref(allocation), cause)?;
         if let (Some(explanation), Some(instance_id)) =
             (explanation, allocation.instance_id.as_deref())
         {
@@ -14849,14 +15124,9 @@ impl Store {
                 record.detail = explanation.detail.clone();
             }
             record.hint = explanation.hint.clone();
-            Self::write_instance_last_stop_tx(&tx, instance_id, &record)?;
+            Self::write_instance_last_stop_tx(tx, instance_id, &record)?;
         }
-        tx.commit()?;
-        self.publish_staged(stopping_event);
-
-        self.cache_remove_allocations(std::slice::from_ref(&allocation))?;
-
-        Ok(Some(allocation))
+        Ok(stopping_event)
     }
 
     /// Record a terminal, non-failure outcome for an allocation: its task's
@@ -14872,25 +15142,51 @@ impl Store {
     /// The task's status follows the outcome: `Success` for a successful exit,
     /// `Failed` otherwise (a `restart: { policy: "never" }` task that exits
     /// non-zero terminates without going through the reschedule path).
+    ///
+    /// Two lanes, in order: the allocation row is scheduler-lane state and
+    /// `task_status` is status-lane state, and one op may write only its own
+    /// lane's tables. The scheduler half marks the row and decides the task's
+    /// status from every replica's row (it owns them, so the read is
+    /// coherent); the status half writes that decision. Writing both in the
+    /// scheduler op failed the ownership guard on every raft cluster, so no
+    /// batch completion ever committed. If the status half fails after the
+    /// scheduler half committed, the call errors and a repeat converges: the
+    /// row update is idempotent and the status is re-derived from the rows.
+    /// Both halves forward to their lane's leader from a follower, because
+    /// worker reports land on whichever manager the worker dials.
     pub fn complete_allocation(&self, allocation_id: i64, success: bool) -> R<Option<Allocation>> {
-        match self.complete_allocation_local(allocation_id, success) {
-            Err(err) if crate::storage::raft::driver::NotRaftLeader::in_chain(&err) => self
-                .forward_after_rejection(
-                    crate::storage::raft::forward::ForwardableLaneWrite::CompleteAllocation {
-                        allocation_id,
-                        success,
-                    },
-                    err,
-                ),
-            other => other,
+        let completed: Option<CompletedAllocation> =
+            match self.complete_allocation_local(allocation_id, success) {
+                Err(err) if crate::storage::raft::driver::NotRaftLeader::in_chain(&err) => self
+                    .forward_after_rejection(
+                        crate::storage::raft::forward::ForwardableLaneWrite::CompleteAllocation {
+                            allocation_id,
+                            success,
+                        },
+                        err,
+                    )?,
+                other => other?,
+            };
+        let Some(CompletedAllocation {
+            allocation,
+            task_status,
+        }) = completed
+        else {
+            return Ok(None);
+        };
+        if let Some(task_status) = task_status {
+            self.set_task_status(allocation.task_config_id, task_status)?;
         }
+        Ok(Some(allocation))
     }
 
+    /// The scheduler-lane half of [`Self::complete_allocation`], which is
+    /// also what a forwarded `CompleteAllocation` runs on the lane leader.
     pub(crate) fn complete_allocation_local(
         &self,
         allocation_id: i64,
         success: bool,
-    ) -> R<Option<Allocation>> {
+    ) -> R<Option<CompletedAllocation>> {
         self.replicated(Lane::Scheduler, "complete_allocation", move |s| {
             s.complete_allocation_apply(allocation_id, success)
         })
@@ -14900,7 +15196,7 @@ impl Store {
         &self,
         allocation_id: i64,
         success: bool,
-    ) -> R<Option<Allocation>> {
+    ) -> R<Option<CompletedAllocation>> {
         let Some(allocation) = self.get_allocation_by_id(allocation_id)? else {
             return Ok(None);
         };
@@ -14926,21 +15222,20 @@ impl Store {
         // The TASK is done only when every replica is: a `success`
         // dependent of a `count = 3` batch task must not start when the
         // first of the three exits. One failed replica fails the task.
+        // Decided here, written by the status-lane half.
         let task_status = if success {
             Self::batch_task_outcome_tx(&tx, allocation.task_config_id)?
         } else {
             Some(TaskStatusState::Failed)
         };
-        if let Some(task_status) = task_status {
-            let mut updates = HashMap::new();
-            updates.insert(allocation.task_config_id, task_status);
-            self.apply_task_status_updates_tx(&tx, &updates)?;
-        }
         tx.commit()?;
 
-        Ok(Some(Allocation {
-            status: status.to_string(),
-            ..allocation
+        Ok(Some(CompletedAllocation {
+            allocation: Allocation {
+                status: status.to_string(),
+                ..allocation
+            },
+            task_status,
         }))
     }
 
@@ -16936,8 +17231,11 @@ impl Store {
     /// nothing) lives in the RPC handler.
     ///
     /// Starting an already-live (pending/active/rescheduling) instance is a
-    /// no-op (returns [`StartInstanceOutcome::AlreadyRunning`]). Slot-mode
-    /// instances and terminated tombstones are rejected with
+    /// no-op (returns [`StartInstanceOutcome::AlreadyRunning`]), except a
+    /// `rescheduling` one waiting out its reschedule backoff: its hold is
+    /// lifted ([`StartInstanceOutcome::BackoffLifted`]). That lift is the
+    /// one start a slot-mode instance accepts; any other start of a slot
+    /// instance, and of a terminated tombstone, is rejected with
     /// [`StorageError::InvalidInput`]; the RPC layer pre-checks the
     /// terminated case to surface FailedPrecondition.
     #[instrument(err, skip_all)]
@@ -16952,7 +17250,10 @@ impl Store {
         let instance = self
             .get_instance(instance_id)?
             .ok_or_else(|| StorageError::not_found("instance", instance_id))?;
-        if instance.mode != InstanceMode::Keyed {
+        // A slot instance's lifecycle belongs to `count.num`, but retrying
+        // its replacement now is the same lift as for a keyed one, and the
+        // alternative (`job run --force-reschedule`) restarts the whole job.
+        if instance.mode != InstanceMode::Keyed && instance.state != InstanceState::Rescheduling {
             bail!(StorageError::InvalidInput {
                 message: format!(
                     "instance {instance_id} is slot-mode; slot instances are managed by the \
@@ -16961,7 +17262,18 @@ impl Store {
             });
         }
         match instance.state {
-            InstanceState::Pending | InstanceState::Active | InstanceState::Rescheduling => {
+            // A replacement waiting out its reschedule backoff is the one
+            // live instance a start changes: the hold is lifted so the next
+            // plan places it now (docs/jobs-tasks-and-scheduling.md,
+            // "Manager-side move logic").
+            InstanceState::Rescheduling => {
+                let conn = self.write_connection()?;
+                if Self::lift_instance_reschedule_hold_tx(&conn, instance_id)? {
+                    return Ok(StartInstanceOutcome::BackoffLifted);
+                }
+                return Ok(StartInstanceOutcome::AlreadyRunning);
+            }
+            InstanceState::Pending | InstanceState::Active => {
                 return Ok(StartInstanceOutcome::AlreadyRunning);
             }
             InstanceState::Terminated => bail!(StorageError::InvalidInput {
@@ -18804,7 +19116,9 @@ impl Store {
         Ok(Some(lock))
     }
 
-    #[instrument(err, skip_all)]
+    // No `err` here: most failures are the caller's SQL, which the RPC layer
+    // logs at debug; it logs the real server errors itself.
+    #[instrument(skip_all)]
     pub fn query_state_store(&self, sql: &str, allow_write: bool) -> R<StateStoreQueryResult> {
         let trimmed = sql.trim();
         if trimmed.is_empty() {
@@ -18817,7 +19131,7 @@ impl Store {
         if !allow_write && !Self::is_read_only_statement(&statement_type) {
             return Err(anyhow::Error::new(StorageError::InvalidInput {
                 message: format!(
-                    "statement type '{statement_type}' is not allowed in read-only mode; pass allow_write to enable mutating queries"
+                    "statement type '{statement_type}' is not allowed in read-only mode; pass --allow-write (allow_write in the API) to enable mutating queries"
                 ),
             }));
         }
@@ -18829,15 +19143,15 @@ impl Store {
                 self.read_connection()?
             };
             let redaction = RedactSecretColumns::install(&conn);
-            let mut stmt = conn.prepare(trimmed)?;
+            let mut stmt = conn.prepare(trimmed).map_err(Self::user_sql_error)?;
             let columns: Vec<String> = stmt
                 .column_names()
                 .iter()
                 .map(|column| (*column).to_string())
                 .collect();
-            let mut rows = stmt.query([])?;
+            let mut rows = stmt.query([]).map_err(Self::user_sql_error)?;
             let mut output_rows = Vec::new();
-            while let Some(row) = rows.next()? {
+            while let Some(row) = rows.next().map_err(Self::user_sql_error)? {
                 let mut map = serde_json::Map::new();
                 for (index, column_name) in columns.iter().enumerate() {
                     let value = match row.get_ref(index)? {
@@ -18907,7 +19221,7 @@ impl Store {
         // Redacted here too, so `INSERT ... SELECT key_pem ...` cannot copy a
         // secret into a table the caller can read.
         let redaction = RedactSecretColumns::install(&conn);
-        let affected_rows = conn.execute(sql, [])? as u64;
+        let affected_rows = conn.execute(sql, []).map_err(Self::user_sql_error)? as u64;
         drop(redaction);
 
         Ok(StateStoreQueryResult {
@@ -18916,6 +19230,28 @@ impl Store {
             rows: Vec::new(),
             affected_rows,
         })
+    }
+
+    /// Classify an error from the caller's own SQL. SQLITE_ERROR (a syntax
+    /// error, an unknown table or column) or a second statement is the
+    /// caller's mistake, so `InvalidInput` with SQLite's own message. From
+    /// Legion's own SQL the same code is a bug, which is why
+    /// [`StorageError::from_rusqlite`] keeps it `Internal` everywhere else.
+    fn user_sql_error(err: rusqlite::Error) -> anyhow::Error {
+        let message = match &err {
+            // A statement that does not compile, with where in the SQL.
+            rusqlite::Error::SqlInputError { .. } => err.to_string(),
+            rusqlite::Error::SqliteFailure(failure, message)
+                if failure.code == rusqlite::ErrorCode::Unknown =>
+            {
+                message.clone().unwrap_or_else(|| err.to_string())
+            }
+            rusqlite::Error::MultipleStatement => {
+                "the SQL holds more than one statement; run one at a time".to_string()
+            }
+            _ => return anyhow::Error::new(err),
+        };
+        anyhow::Error::new(StorageError::InvalidInput { message })
     }
 
     #[instrument(err, skip_all)]
@@ -29669,6 +30005,49 @@ mod tests {
         Ok(())
     }
 
+    /// A projection that fails after the changeset committed must not fail
+    /// the apply. In raft mode that error stops the replica's raft core for
+    /// good (the spot-check outage: a failed work-log lookup on the leader
+    /// left the cluster leaderless). The rows stay applied, the read model
+    /// is rebuilt from them, and every streaming worker is resynced.
+    #[test]
+    fn a_failed_projection_recovers_instead_of_failing_test() -> R<()> {
+        use crate::storage::work_log::{PendingWork, WorkLog};
+
+        let src = setup_store()?;
+        let dst = setup_store()?;
+        src.insert_node(make_node_msg("node-a", "active"))?;
+        dst.insert_node(make_node_msg("node-a", "active"))?;
+        let attached = dst.work_log().attach("node-a", 0, 0);
+        assert!(matches!(
+            WorkLog::take_pending(&attached.log),
+            PendingWork::Resync
+        ));
+
+        let ((), changeset) = raft_capture::capture_mutation(&src, Lane::Control, |s| {
+            s.mark_node_ready("node-a", "2026-01-01T00:00:00Z")?;
+            Ok(())
+        })?;
+        FAIL_NEXT_PROJECTION.with(|fail| fail.set(true));
+        raft_capture::apply_changeset(&dst, &changeset)?;
+        assert!(
+            !FAIL_NEXT_PROJECTION.with(|fail| fail.get()),
+            "the injected failure fired"
+        );
+
+        assert_eq!(dst.get_node("node-a")?.status, "ready", "rows applied");
+        assert_eq!(
+            dst.cached_nodes()?[0].status,
+            "ready",
+            "read model rebuilt from the committed rows"
+        );
+        assert!(
+            matches!(WorkLog::take_pending(&attached.log), PendingWork::Resync),
+            "streaming workers are resynced"
+        );
+        Ok(())
+    }
+
     /// JC-41 (reversing JC-27): eval writes are ordinary REPLICATED
     /// scheduler-lane ops. An enqueue captured on the scheduler lane rides
     /// that lane's changeset and passes the ownership guard; the same
@@ -30555,6 +30934,30 @@ mod tests {
         // Reads are unaffected.
         store.query_state_store("SELECT 1;", false)?;
         store.set_raft_mode(false);
+        Ok(())
+    }
+
+    /// AWS spot-check re-run: a bad column came back `Internal`. The
+    /// caller's SQL mistakes are `InvalidInput` carrying SQLite's message.
+    #[test]
+    fn a_bad_state_query_is_invalid_input_with_the_sqlite_message_test() -> R<()> {
+        let store = setup_store()?;
+        for (sql, needle) in [
+            ("SELECT no_such_column FROM job_config", "no such column"),
+            ("SELECT * FROM no_such_table", "no such table"),
+            ("SELECT FROM job_config", "syntax error"),
+        ] {
+            let err = store
+                .query_state_store(sql, false)
+                .err()
+                .with_context(|| format!("{sql} should fail"))?;
+            let storage = StorageError::from_anyhow(&err);
+            assert!(
+                matches!(storage, Some(StorageError::InvalidInput { .. })),
+                "{sql}: {storage:?}"
+            );
+            assert!(format!("{err:#}").contains(needle), "{sql}: {err:#}");
+        }
         Ok(())
     }
 

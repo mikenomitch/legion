@@ -129,22 +129,19 @@ async fn dial_active(
 ) -> std::io::Result<hyper_util::rt::TokioIo<tokio_rustls::client::TlsStream<tokio::net::TcpStream>>>
 {
     let io = |err: anyhow::Error| std::io::Error::other(format!("{err:#}"));
-    let (active, seed) = {
-        let state = lock_state(&state);
-        (state.active.clone(), state.seed.clone())
-    };
+    let active = lock_state(&state).active.clone();
     let target = crate::cluster_tls::host_port(&active).map_err(io)?;
-    let verifier = crate::worker::plane::manager_verifier(&active)
-        .or_else(|| crate::worker::plane::manager_verifier(&seed))
-        .ok_or_else(|| {
-            std::io::Error::new(
-                std::io::ErrorKind::PermissionDenied,
-                format!(
-                    "no cluster CA pin for the manager at {active}; workers reach managers \
+    // Every known address shares the seed's verifier (`new` and `learn`
+    // extend it), so the active manager is always covered.
+    let verifier = crate::worker::plane::manager_verifier(&active).ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!(
+                "no cluster CA pin for the manager at {active}; workers reach managers \
                      only over TLS verified against their join token's pin"
-                ),
-            )
-        })?;
+            ),
+        )
+    })?;
     let config = crate::cluster_tls::client_config(verifier, None).map_err(io)?;
     let name = rustls_pki_types::ServerName::try_from(crate::cluster_tls::MANAGER_SERVER_NAME)
         .map_err(|err| std::io::Error::other(err.to_string()))?;
@@ -168,6 +165,9 @@ impl ManagerEndpoints {
                 known.push(addr);
             }
         }
+        // The persisted addresses were reported by this cluster's managers
+        // in an earlier run: they share the token's trust.
+        crate::worker::plane::trust_cluster_managers(&seed, &known);
         let state = Arc::new(StdMutex::new(State {
             seed: seed.clone(),
             known,
@@ -243,6 +243,11 @@ impl ManagerEndpoints {
                     known.push(keep);
                 }
             }
+            // The report came over a connection verified against the
+            // token's trust, so every address in it is a manager of the same
+            // cluster. Extend the trust before the set changes, so no
+            // failover can pick an address nothing trusts yet.
+            crate::worker::plane::trust_cluster_managers(&state.seed, &known);
             let changed = known != state.known;
             if changed {
                 info!(managers = ?known, "Learned the cluster's manager set");
@@ -443,6 +448,55 @@ mod tests {
             .who_am_i(crate::structs::WhoAmIRequest::default())
             .await
             .expect("the same client now reaches the live manager");
+        Ok(())
+    }
+
+    /// The spot-check regression: after a failover, calls that dial the
+    /// active manager by address (artifact credentials, node identity
+    /// tokens) failed with "no cluster CA pin for the manager at ..."
+    /// because only the token's address had a recorded trust. A manager the
+    /// cluster reports shares it.
+    #[tokio::test]
+    async fn a_learned_manager_is_reachable_by_address_test() -> R<()> {
+        use crate::structs::manager_client::ManagerClient;
+        use crate::structs::manager_server::ManagerServer;
+
+        let store = crate::storage::store::Store::start_storage(
+            &crate::structs::config::ManagerConfigFull {
+                store_path: tempfile::tempdir()?.keep().display().to_string(),
+                ..Default::default()
+            },
+        )?;
+        let pin = store.ensure_mesh_ca()?.pin()?;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let live = format!("http://{}", listener.local_addr()?);
+        let incoming = crate::manager::daemon::manager_incoming(&store, listener, None)?;
+        let service = crate::manager::server::ManagerDaemonService::new(store);
+        tokio::spawn(
+            tonic::transport::Server::builder()
+                .add_service(ManagerServer::new(service))
+                .serve_with_incoming(incoming),
+        );
+        let seed = {
+            let probe = std::net::TcpListener::bind("127.0.0.1:0")?;
+            format!("http://{}", probe.local_addr()?)
+        };
+        crate::worker::plane::trust_manager(&seed, &pin)?;
+        let managers = ManagerEndpoints::new(&seed, Vec::new())?;
+        let before = crate::worker::plane::manager_channel(&live)
+            .await
+            .expect_err("not reported yet");
+        assert!(
+            format!("{before:#}").contains("no cluster CA pin"),
+            "{before:#}"
+        );
+
+        managers.learn(std::slice::from_ref(&live));
+        let channel = crate::worker::plane::manager_channel(&live).await?;
+        ManagerClient::new(channel)
+            .who_am_i(crate::structs::WhoAmIRequest::default())
+            .await
+            .expect("the learned manager answers over the cluster's trust");
         Ok(())
     }
 }

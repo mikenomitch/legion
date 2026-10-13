@@ -418,7 +418,10 @@ pub enum TaskLifecycle {
     Sidecar,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+// Serialized (same spelling as `as_str`) only to cross a forwarded lane
+// write (`storage::raft::forward`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum TaskStatusState {
     Pending,
     Running,

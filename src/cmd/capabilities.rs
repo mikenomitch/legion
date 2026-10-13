@@ -1116,6 +1116,17 @@ pub fn catalog() -> Vec<Capability> {
             read_only_safe: true,
         },
         Capability {
+            name: "raft.members",
+            cli: "legion raft members",
+            grpc: Some("Manager/ListManagers"),
+            summary: "Every manager in the cluster from the replicated raft membership: role \
+                 (leader/follower/learner, or standalone outside raft), advertised address, \
+                 and whether the answering manager can reach it, with each reachable \
+                 member's term and applied index. Any manager answers with the full list.",
+            mutates: false,
+            read_only_safe: true,
+        },
+        Capability {
             name: "raft.history",
             cli: "legion raft history [--limit <N>]",
             grpc: Some("Manager/ListRaftHistory"),
@@ -1168,7 +1179,7 @@ pub fn config() -> Command {
 }
 
 /// Handle `legion capabilities`.
-#[instrument(err, skip_all)]
+#[instrument(skip_all)]
 pub async fn handle(matches: &ArgMatches) -> R<()> {
     let format = OutputFormat::from_matches(matches);
     let caps = catalog();

@@ -470,6 +470,8 @@
                 restart_delay = "30s",
                 move_count = 3,
                 move_period = "30m",
+                # The first reschedule's wait. It doubles for each earlier
+                # move within move_period, capped at 30m.
                 move_delay = "30s",
             },
             # What happens when the task PROCESS exits, as opposed to a health

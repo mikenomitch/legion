@@ -496,9 +496,12 @@ memory back first and is the first thing stopped if that isn't enough. A
 task that sets `suspend.onPressure = true` is suspended with its state intact
 instead of stopped.
 
-A stopped task is rescheduled like any other platform-initiated stop, and its
-stop reason says `node_pressure`, with the numbers. A suspended one waits,
-holding no memory, until `legion instance start` resumes it (see
+A stopped task is rescheduled, and its stop reason says `node_pressure`,
+with the numbers. A task stopped for bursting above its reservation is
+treated like a failed allocation: its replacement waits the task's
+`on_unhealthy.move_delay` and counts toward `move_count` (see
+[task supervision](task-supervision.md)). A suspended one waits, holding no
+memory, until `legion instance start` resumes it (see
 [suspend and resume](suspend-and-resume.md#under-memory-pressure)).
 
 Operators set nothing to get this. The response is on whenever
@@ -516,8 +519,8 @@ that was enough before it takes another.
 | --- | --- | --- | --- |
 | `reclaim` | Writes the bytes above the reservation to the cgroup's `memory.reclaim`, or for a sandbox with a balloon, inflates the balloon by that much | Allocations above their reservation | Yes, nothing stops. A balloon deflates when the episode ends |
 | `suspend` | Checkpoints and stops the instance, keeping its state. The node acts first and the manager records it | Instances whose task sets `suspend.onPressure = true`, most idle first | Yes, `instance start` resumes it |
-| `evict-bursting` | Stops allocations above their reservation | Allocations above their reservation | Rescheduled, `cause = node_pressure` |
-| `evict-reserved` | Stops allocations within their reservation. Only when `oversubscribe.memory > 1` | Anyone below `critical` | Rescheduled, `cause = node_pressure` |
+| `evict-bursting` | Stops allocations above their reservation | Allocations above their reservation | Rescheduled after `on_unhealthy.move_delay`, counted toward `move_count`, `cause = node_pressure` |
+| `evict-reserved` | Stops allocations within their reservation. Only when `oversubscribe.memory > 1` | Anyone below `critical` | Rescheduled at once, `cause = node_pressure` |
 
 Within a step, candidates go **lowest band first** (the preemption order,
 `background` before `critical`), then **most memory freed first** (`suspend`:
@@ -689,6 +692,11 @@ Metrics: `legion_node_pressure_actions_total{node,step}` on the manager and
 - **A replacement can land on the same node.** The scheduler has no memory
   of pressure, so an evicted allocation may be placed back on the node that
   evicted it if it is the best fit by reservations.
+- **A task that always outgrows its reservation keeps coming back.** Each
+  `evict-bursting` stop is a move, so the replacement waits `move_delay`
+  first, but `move_count` is unlimited by default. Set
+  `on_unhealthy.move_count` to fail the job instead, or raise
+  `resources.memory` toward real usage.
 - **Only governed allocations are candidates.** Tasks on `noop` and on
   plugins that haven't opted in are never measured, never reclaimed, and
   never evicted.
@@ -708,7 +716,8 @@ Metrics: `legion_node_pressure_actions_total{node,step}` on the manager and
 | `legion node usage` says "no usage reported" | Enforcement is off on that worker, the worker predates usage reporting, no report has reached this manager since it started, or the node reports to another manager | Turn on `resourceEnforcement.enabled`, upgrade the worker, wait 10 seconds, or ask the manager the node reports to |
 | `usage sampled` age keeps growing past 10s | The node stopped heartbeating, or stopped sending reports | Check `legion node list`. Reports older than 2 minutes are dropped and the node's gauges fall to zero |
 | A sandbox is OOM-killed with plenty of guest memory free | The VMM needs more than `sandbox.vmmOverheadMiB` | Raise `sandbox.vmmOverheadMiB` on that worker type |
-| Allocation fails: "failed to place task … within this node's resource limits" | A cgroup write failed (permissions, missing controller) | The wrapped error names the file. The reservation is rolled back, so no cores are left stranded |
+| Allocation fails: "failed to place task … within this node's resource limits: cgroup … does not delegate the … controller(s)" | A cgroup in Legion's hierarchy (`cgroupParent`, `share`, or `reserve`) could not put `cpuset`, `cpu`, and `memory` in its `cgroup.subtree_control`, usually because its parent doesn't offer them (`cgroup.controllers`) | The message prints both files. Delegate the missing controller from the parent cgroup down. Processes found sitting in `share` or `reserve` themselves are moved into a `stray` child first, since the kernel won't delegate from a cgroup that holds processes |
+| Allocation fails: "failed to place task … within this node's resource limits" with any other cause | A cgroup write failed (permissions, a missing interface file) | The full error chain names the file and errno. It reaches the manager log and the allocation's failure reason, and the worker answers `FAILED_PRECONDITION` (`RESOURCE_EXHAUSTED` when cores ran out). The reservation and the half-built task cgroup are both rolled back. Empty `legion-<alloc>` cgroups that no allocation owns are removed when the worker starts |
 | Submit fails: "resources.memoryMax (N MiB) is below resources.memory" | The ceiling is under the reservation, possibly a `memory` from `taskResourceDefaults` | Raise `memoryMax`, or lower `memory` |
 | Submit warns: "sets resources.memoryMax, but the … runtime does not enforce resources" | `memoryMax` on `noop` or a plugin that hasn't opted in | Nothing caps the task. Use a governed runtime, or drop the field |
 | Manager fails to start: "resourceEnforcement.oversubscribe and resourceEnforcement.memoryPressure need resourceEnforcement.enabled = true" | A ratio or a pressure block on a worker type without enforcement | Turn enforcement on, or remove the block |

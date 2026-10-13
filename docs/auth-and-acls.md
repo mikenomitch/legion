@@ -14,14 +14,16 @@ up, and there is no bootstrap endpoint for anything else to race you to.
 
 ```bash
 # 1. Start a manager. At first start it mints the initial management token
-#    and writes the secret, mode 0600, to <dataDir>/bootstrap-token and (when
-#    that file does not exist yet) ~/.legion/token:
+#    and writes the secret, mode 0600, to <dataDir>/bootstrap-token and to
+#    the CLI token file for the manager's address, ~/.legion/tokens/127.0.0.1_4747:
 legion start manager --run-worker
 #   INFO ACLs are on. Created the initial management token (accessor 7c1f...).
-#        Secret written to .legion/bootstrap-token and /home/me/.legion/token (mode 0600).
+#        Secret written to .legion/bootstrap-token and
+#        /home/me/.legion/tokens/127.0.0.1_4747 (mode 0600).
 #        The CLI on this machine uses it automatically. Treat it like a root password.
 
-# 2. The CLI on the same machine already works: it reads ~/.legion/token.
+# 2. The CLI on the same machine already works: it reads the token stored for
+#    the address it dials (LEGION_ADDR, default http://127.0.0.1:4747).
 legion job run configs/jobs/demo.ncl
 
 # 3. Create a policy and a narrower token for everyone and everything else.
@@ -44,13 +46,22 @@ On another machine, export the secret (`LEGION_TOKEN=lgn_...`) or run
 | File | Written | Mode |
 | --- | --- | --- |
 | `<dataDir>/bootstrap-token` (`$LEGION_DATA_DIR`, else `./.legion`) | every time the manager mints the initial token | `0600` |
-| `~/.legion/token` for the user running the manager (`$LEGION_TOKEN_FILE` overrides the path) | only when the file does not exist yet, so an existing login is never overwritten | `0600` |
+| `~/.legion/tokens/<host>_<port>` for the user running the manager, keyed by the address a CLI on that machine dials (`$LEGION_TOKEN_FILE` overrides the path) | every time the manager mints the initial token | `0600` |
 
 The manager logs the accessor ID and the file paths once, and never logs the
-secret. When `~/.legion/token` already exists it is left alone and the
-manager logs a warning saying how to use the new token instead
-(`export LEGION_TOKEN="$(cat <dataDir>/bootstrap-token)"`). This matters on
-a laptop where an older cluster's token is still in that file.
+secret.
+
+The CLI file is named for the manager's local address: its `server.host`
+and `server.port`, with a wildcard host (`0.0.0.0`) as `127.0.0.1`. A
+manager on port 4747 writes `~/.legion/tokens/127.0.0.1_4747`, and a second
+local cluster on port 4757 writes `~/.legion/tokens/127.0.0.1_4757`, so two
+clusters on one laptop never present each other's token. `server.advertiseAddr`
+does not change the name, because it names the manager for other machines.
+
+If the file for this address already exists, the manager replaces it and
+logs that it did. The mint only happens on a cluster with no management
+token, so that file held a token from an earlier cluster at the same address
+(or a lesser login to this one) that the new cluster would reject anyway.
 
 The mint is a replicated control-lane write. In a raft cluster only the
 manager that leads the control lane mints the token, at first start or when
@@ -304,9 +315,33 @@ management token's secret (see [Pre-seeding the
 secret](#pre-seeding-the-secret-infrastructure-as-code)).
 
 Clients send the secret as a bearer credential. The CLI checks the
-`LEGION_TOKEN` env var first, then `~/.legion/token` (written by
-`legion login`, override the path with `LEGION_TOKEN_FILE`). The UI stores it
-in browser localStorage via the **Access** page.
+`LEGION_TOKEN` env var first, then the token file for the manager it dials,
+`~/.legion/tokens/<host>_<port>`. The name comes from `LEGION_ADDR` (default
+`http://127.0.0.1:4747`) with the scheme dropped, so `http://10.0.1.5:4747`
+reads `~/.legion/tokens/10.0.1.5_4747`. `legion login` writes that file and
+`legion logout` removes it, both for the address in `LEGION_ADDR`.
+`LEGION_TOKEN_FILE` names one file for every address instead. The UI stores
+the secret in browser localStorage via the **Access** page.
+
+A token works against every manager of its cluster, but the file is per
+address. To use a raft cluster through several managers, run `legion login`
+against each address, copy the file to each address's name, or set
+`LEGION_TOKEN`.
+
+When the manager answers `Unauthenticated`, the CLI's hint names the
+credential it sent, because a revoked token and another cluster's token look
+the same from the manager's side:
+
+```text
+Error: failed to list jobs: unknown or revoked ACL token [code=Unauthenticated]
+Hint: the CLI sent the token stored for http://127.0.0.1:4757 in
+/home/me/.legion/tokens/127.0.0.1_4757, which this manager does not accept
+(revoked, expired, or issued by another cluster); run `legion login`, set
+LEGION_TOKEN, or on the manager's machine use <dataDir>/bootstrap-token
+```
+
+With no token at all, the hint names the file the CLI looked for. The `--json`
+envelope carries the same text in `error.hint`.
 
 ### Logging in (userpass, JWT, OIDC / SSO)
 
@@ -389,6 +424,23 @@ legion join-token create --type default --ttl 24h
 # On the worker host (paste the printed token):
 legion join lgnjoin_...
 ```
+
+Pasting the token is fine for a first try. For a worker that keeps running,
+pass it in a file instead: a token on the command line stays in the
+process's argv, which any local user can read with `ps` or
+`/proc/<pid>/cmdline`, and the worker warns about it.
+
+```bash
+legion join-token create --type default --ttl 24h -j | jq -r .data.token \
+  | sudo install -m 0600 /dev/stdin /etc/legion/join-token
+legion join --token-file /etc/legion/join-token
+```
+
+`legion start worker --token-file <PATH>` takes the same flag. There is no
+environment variable for the token, because exec tasks inherit the worker's
+environment. See
+[Running a worker under a service manager](architecture-managers-workers.md#running-a-worker-under-a-service-manager)
+for a systemd unit.
 
 The join token bundles the manager address, the worker type, and a random
 secret, so the worker needs no other configuration. The manager stores only

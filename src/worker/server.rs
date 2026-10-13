@@ -3,7 +3,7 @@ use crate::structs::edge_boot::{Gate, RefusalReason};
 use crate::structs::{
     worker_server::Worker, ExecClientFrame, GetTaskLogsReply, GetTaskLogsRequest, PostWorkReply,
     PostWorkRequest, RestartWorkerReply, RestartWorkerRequest, StartClaimReply, StartClaimRequest,
-    TaskLogStream,
+    TaskAllocation, TaskLogStream,
 };
 use crate::worker::boot_ticket::BootTicketVerifier;
 use crate::worker::edge;
@@ -79,6 +79,32 @@ fn store_status(
     })
 }
 
+/// The status a task that did not start answers `PostWork` with.
+///
+/// The message carries the whole error chain (`{err:#}`), not just the
+/// outermost context: "failed to place task web within this node's resource
+/// limits" says nothing an operator can act on, while the cgroup file and
+/// errno underneath it do. The code says whose move it is:
+/// RESOURCE_EXHAUSTED when the node has no room right now (the manager can
+/// place elsewhere), the code of a gRPC call that failed underneath (a
+/// manager round trip), and FAILED_PRECONDITION otherwise, because a start
+/// failure is this node or this task config being unable to run the task,
+/// not a bug in the worker. INTERNAL stays for panics and poisoned locks.
+fn task_start_status(context: &str, err: &anyhow::Error) -> Status {
+    let message = format!("{context}: {err:#}");
+    let code = if err
+        .chain()
+        .any(|cause| cause.is::<crate::worker::resources::PlacementExhausted>())
+    {
+        tonic::Code::ResourceExhausted
+    } else if let Some(status) = err.chain().find_map(|cause| cause.downcast_ref::<Status>()) {
+        status.code()
+    } else {
+        tonic::Code::FailedPrecondition
+    };
+    Status::new(code, message)
+}
+
 /// How long a move waits for the node a session's manifest names before it
 /// calls that node unreachable (session durability plan §6.7, "Moving is
 /// cautious for running sessions").
@@ -124,23 +150,19 @@ impl WorkerDaemonService {
             .await
             .map_err(|full| Status::resource_exhausted(full.to_string()))
     }
-}
 
-#[tonic::async_trait]
-impl Worker for WorkerDaemonService {
-    #[instrument(err, skip_all)]
-    async fn post_work(
+    /// Start one allocation the manager handed this node, by whichever route
+    /// it arrived: a `PostWork` push (after the plane's manager check) or a
+    /// `StreamWork` delta (`daemon::launch_streamed_work`). The stream was
+    /// authenticated when the worker opened it to its manager, so its deltas
+    /// come here directly. Routing them through `post_work` as an in-process
+    /// call fails the manager-certificate check, because a request built in
+    /// process carries no peer certificate at all.
+    #[instrument(skip_all, fields(allocation_id = allocation.allocation_id))]
+    pub async fn accept_work(
         &self,
-        request: Request<PostWorkRequest>,
-    ) -> Result<Response<PostWorkReply>, Status> {
-        // Caller class: manager only.
-        let manager = crate::worker::plane::require_manager(&request, "PostWork")?;
-        debug!(manager = %manager, "PostWork from manager");
-        let mut allocation = request
-            .into_inner()
-            .allocation
-            .ok_or_else(|| Status::invalid_argument("Missing allocation"))?;
-
+        mut allocation: TaskAllocation,
+    ) -> Result<PostWorkReply, Status> {
         // Every payload this node is handed teaches it a job config it may
         // later be asked to start from a boot ticket (docs/edge-boot.md).
         if let Some(edge_boot) = self.edge_boot.as_ref() {
@@ -173,9 +195,9 @@ impl Worker for WorkerDaemonService {
                     Some(slot),
                 )
                 .map_err(|err| admission_status(&err))?;
-                return Ok(Response::new(PostWorkReply {
+                return Ok(PostWorkReply {
                     message: format!("Provisional start {} admitted", admitted.claim_id),
-                }));
+                });
             }
             // A ratification: the committed payload, carrying the claim id it
             // settles.
@@ -186,9 +208,9 @@ impl Worker for WorkerDaemonService {
                 RefusalReason::Unspecified,
                 "",
             );
-            return Ok(Response::new(PostWorkReply {
+            return Ok(PostWorkReply {
                 message: format!("Claim {} ratified", provisional.claim_id),
-            }));
+            });
         }
 
         // Fetch + deliver identity tokens before the task starts (env tokens
@@ -216,12 +238,12 @@ impl Worker for WorkerDaemonService {
             {
                 Ok(prepared) => prepared,
                 Err(err) => {
-                    let reason = format!("Failed to deliver workload identities: {err}");
+                    let status = task_start_status("Failed to deliver workload identities", &err);
                     self.task_manager
                         .lock()
                         .map_err(|_| Status::internal("Task manager lock poisoned"))?
-                        .record_failure(allocation.allocation_id, reason.clone());
-                    return Err(Status::internal(reason));
+                        .record_failure(allocation.allocation_id, status.message());
+                    return Err(status);
                 }
             },
             None => Vec::new(),
@@ -238,7 +260,7 @@ impl Worker for WorkerDaemonService {
                 .await
                 .map_err(|err| Status::internal(format!("launch task panicked: {err}")))?;
         if let Err(err) = launched {
-            return Err(Status::internal(format!("Failed to start task: {err}")));
+            return Err(task_start_status("Failed to start task", &err));
         }
 
         // Refresh loops are keyed by allocation id; identity_manager.retain
@@ -247,11 +269,27 @@ impl Worker for WorkerDaemonService {
             identity.spawn_refreshers(allocation_id, prepared, self.task_manager.clone());
         }
 
-        let reply = PostWorkReply {
+        Ok(PostWorkReply {
             message: "Task accepted".into(),
-        };
+        })
+    }
+}
 
-        Ok(Response::new(reply))
+#[tonic::async_trait]
+impl Worker for WorkerDaemonService {
+    #[instrument(err, skip_all)]
+    async fn post_work(
+        &self,
+        request: Request<PostWorkRequest>,
+    ) -> Result<Response<PostWorkReply>, Status> {
+        // Caller class: manager only.
+        let manager = crate::worker::plane::require_manager(&request, "PostWork")?;
+        debug!(manager = %manager, "PostWork from manager");
+        let allocation = request
+            .into_inner()
+            .allocation
+            .ok_or_else(|| Status::invalid_argument("Missing allocation"))?;
+        self.accept_work(allocation).await.map(Response::new)
     }
 
     #[instrument(err, skip_all)]
@@ -812,7 +850,7 @@ impl Worker for WorkerDaemonService {
             {
                 Ok(true) => "running".to_string(),
                 Ok(false) => "starting".to_string(),
-                Err(err) => return Err(Status::internal(format!("{err:#}"))),
+                Err(err) => return Err(task_start_status("Failed to start session", &err)),
             }
         };
         let generation = self
@@ -1393,5 +1431,58 @@ fn running_elsewhere(err: &anyhow::Error) -> Option<SessionSleepErrorRef> {
             generation: *generation,
         }),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A start failure carries its whole chain, so the cause under the
+    /// outermost context (here, the cgroup file and errno) reaches the
+    /// manager log and the allocation's failure record.
+    #[test]
+    fn a_start_failure_carries_its_cause_and_is_not_internal_test() {
+        let err = anyhow::Error::new(std::io::Error::from(std::io::ErrorKind::NotFound))
+            .context("write /sys/fs/cgroup/legion/share/legion-923/memory.max = \"67108864\"")
+            .context("failed to place task web within this node's resource limits");
+        let status = task_start_status("Failed to start task", &err);
+        assert_eq!(status.code(), tonic::Code::FailedPrecondition);
+        assert!(
+            status.message().contains("legion-923/memory.max"),
+            "{}",
+            status.message()
+        );
+        assert!(status
+            .message()
+            .starts_with("Failed to start task: failed to place task web"));
+    }
+
+    #[test]
+    fn a_node_out_of_cores_answers_resource_exhausted_test() {
+        let err = anyhow::Error::new(crate::worker::resources::PlacementExhausted(
+            "cannot reserve 2 exclusive core(s)".into(),
+        ))
+        .context("failed to place task web within this node's resource limits");
+        let status = task_start_status("Failed to start task", &err);
+        assert_eq!(status.code(), tonic::Code::ResourceExhausted);
+        assert!(
+            status.message().contains("cannot reserve 2"),
+            "{}",
+            status.message()
+        );
+    }
+
+    #[test]
+    fn a_failed_grpc_call_underneath_keeps_its_code_test() {
+        let err = anyhow::Error::new(Status::unavailable("manager unreachable"))
+            .context("fetch identity token");
+        let status = task_start_status("Failed to deliver workload identities", &err);
+        assert_eq!(status.code(), tonic::Code::Unavailable);
+        assert!(
+            status.message().contains("manager unreachable"),
+            "{}",
+            status.message()
+        );
     }
 }

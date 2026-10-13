@@ -67,7 +67,7 @@ pub fn config() -> Command {
         .arg(json_flag())
 }
 
-#[instrument(err, skip_all)]
+#[instrument(skip_all)]
 pub async fn handle(sub_matches: &ArgMatches) -> R<()> {
     match sub_matches.subcommand() {
         Some(("create", arg_matches)) => create(arg_matches).await,
@@ -121,6 +121,11 @@ async fn create(arg_matches: &ArgMatches) -> R<()> {
         println!("Join token created (id {}).\n", info.id);
         println!("Run this on the worker host:\n");
         println!("  legion join {}\n", reply.token);
+        println!(
+            "For a worker that keeps running, save the token to a 0600 file and pass \
+             `--token-file <PATH>` instead: a token on the command line is visible to every \
+             local user.\n"
+        );
         if let Some(expires) = info.expires_at {
             println!("Expires: {expires}");
         }

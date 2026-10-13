@@ -12,6 +12,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::process::{Child, Command};
 
+pub(crate) mod apple_container;
 pub mod checkpoint;
 mod container;
 mod envelope;
@@ -420,6 +421,15 @@ pub struct TaskInstance {
     /// (see [`sandbox_checkpoint`]). `false`, the default, launches exactly
     /// as before checkpoints existed.
     pub checkpoint_launch: bool,
+    /// Node-level directory holding the stable device links a
+    /// memory-checkpointable sandbox hands its VMM (`<data dir>/vmdev`).
+    ///
+    /// Set by worker core. It must not depend on the worker id: a VMM
+    /// reopens a restored guest's disks at the exact paths it captured, so
+    /// a checkpoint restored on another node only finds its links when both
+    /// nodes put them in the same place. `None` (tests, dev runtimes) puts
+    /// them beside the allocation directories.
+    pub device_link_root: Option<PathBuf>,
 }
 
 impl TaskInstance {
@@ -1058,6 +1068,22 @@ impl LoadedTaskPlugin {
     }
 }
 
+/// Every plugin's readiness checks, merged.
+///
+/// Takes plugin handles rather than the registry because a readiness probe
+/// can shell out (the container runtime runs `container system status`).
+/// Run under the worker's task-manager lock, a hung runtime CLI held that
+/// lock, and every heartbeat, launch, and RPC waiting on it, for as long as
+/// the CLI hung. Callers take the handles under the lock and probe after
+/// releasing it, on a blocking thread.
+pub fn readiness_of(plugins: &[Arc<LoadedTaskPlugin>]) -> Map<String, Value> {
+    let mut checks = Map::new();
+    for plugin in plugins {
+        checks.extend(plugin.plugin.readiness());
+    }
+    checks
+}
+
 #[derive(Default)]
 pub struct TaskPluginRegistry {
     // `Arc` so a caller can hold a plugin (and, through it, the dylib that
@@ -1093,12 +1119,10 @@ impl TaskPluginRegistry {
         self.plugins.get(runtime).cloned()
     }
 
-    pub fn readiness_checks(&self) -> Map<String, Value> {
-        let mut checks = Map::new();
-        for plugin in self.plugins.values() {
-            checks.extend(plugin.plugin.readiness());
-        }
-        checks
+    /// Every loaded plugin, for calls made after the registry's owner has
+    /// been unlocked (see [`readiness_of`]).
+    pub fn plugin_handles(&self) -> Vec<Arc<LoadedTaskPlugin>> {
+        self.plugins.values().cloned().collect()
     }
 
     pub fn validate_task_config(&mut self, task: &TaskConfig) -> R<()> {

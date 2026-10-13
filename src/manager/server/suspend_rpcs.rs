@@ -164,7 +164,7 @@ pub(super) fn sandbox_vmm_on_node(task: &TaskConfig, node: &Node) -> (String, Op
 /// Why a memory capture of a gated sandbox's `allocation` would produce a
 /// checkpoint its node's VMM cannot restore: a Firecracker older than
 /// 1.16.1 cannot move the guest's vsock to the restoring allocation's
-/// socket (gated plan §6.2). Compat is an exact VMM version match, so this
+/// socket (gated plan §6.2). Compat requires the same VMM release, so this
 /// check at capture covers every later restore. `None` when it can.
 pub(super) fn gated_capture_refusal(
     task: &TaskConfig,

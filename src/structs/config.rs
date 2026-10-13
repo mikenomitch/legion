@@ -1787,6 +1787,15 @@ impl ServerConfigFull {
         if let Some(addr) = &self.advertise_addr {
             return addr.clone();
         }
+        self.local_address()
+    }
+
+    /// The address a CLI on the manager's own machine dials: scheme, host,
+    /// and port, with a wildcard host as 127.0.0.1. Unlike
+    /// [`Self::advertised_address`] it ignores `advertiseAddr`, which names
+    /// the manager for other machines. The manager stores the initial
+    /// management token under this address's CLI token file.
+    pub fn local_address(&self) -> String {
         let host = match self.host.as_str() {
             "0.0.0.0" | "::" => "127.0.0.1",
             other => other,

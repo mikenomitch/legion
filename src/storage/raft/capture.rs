@@ -632,11 +632,11 @@ pub(crate) fn local_projected_mutation<T>(
         Err(panic) => std::panic::resume_unwind(panic),
     };
     extract?;
-    // Projection failures never un-commit the write; surface them after the
-    // body's own error, which is the more useful one when both happen.
-    let projected = store.project_read_model_from_changeset(&changeset);
+    // The write committed: a projection failure rebuilds the read model
+    // rather than reporting the write as failed (see
+    // `Store::project_committed_changeset`).
+    store.project_read_model_from_changeset(&changeset);
     let value = result?;
-    projected?;
     after(store);
     Ok(value)
 }
@@ -815,9 +815,12 @@ pub(crate) fn apply_changeset_with(
     }
 
     // Side effects are driven by the committed changeset on every replica
-    // (JC-11). Projection failures must not un-commit the state change;
-    // they are surfaced to the caller after the data is durable.
-    store.project_changeset_side_effects(bytes)
+    // (JC-11). They are node-local and derived from the committed rows, so
+    // a projection failure is recovered in place, never returned: the raft
+    // state machine would turn it into a fatal storage error and stop this
+    // replica's raft core over an entry it applied correctly.
+    store.project_changeset_side_effects(bytes);
+    Ok(())
 }
 
 #[cfg(test)]

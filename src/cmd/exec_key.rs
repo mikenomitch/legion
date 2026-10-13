@@ -80,7 +80,7 @@ pub fn config() -> Command {
         .subcommand(delete_cmd)
 }
 
-#[instrument(err, skip_all)]
+#[instrument(skip_all)]
 pub async fn handle(matches: &ArgMatches) -> R<()> {
     match matches.subcommand() {
         Some(("create", sub)) => create(sub).await,

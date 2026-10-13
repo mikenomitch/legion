@@ -137,7 +137,7 @@ pub fn config() -> Command {
         .subcommand(stop_cmd)
 }
 
-#[instrument(err, skip_all)]
+#[instrument(skip_all)]
 pub async fn handle(sub_matches: &ArgMatches) -> R<()> {
     match sub_matches.subcommand() {
         Some(("nodes", matches)) => nodes(matches).await,

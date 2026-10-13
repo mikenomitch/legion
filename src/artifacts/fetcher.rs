@@ -72,6 +72,12 @@ pub enum Credential {
     Headers {
         headers: BTreeMap<String, String>,
     },
+    /// Sign S3 requests with the node's ambient AWS credential chain (the
+    /// `AWS_*` variables, web identity, then the instance profile) instead
+    /// of reading anonymously. Never parsed from KV: only a worker's own
+    /// `contentStore` without `auth.kv` produces it, so a restoring node
+    /// reads published parts the way it would publish them.
+    AwsAmbient,
 }
 
 impl fmt::Debug for Credential {
@@ -81,6 +87,7 @@ impl fmt::Debug for Credential {
             Credential::Bearer { .. } => "bearer",
             Credential::Aws { .. } => "aws",
             Credential::Headers { .. } => "headers",
+            Credential::AwsAmbient => "aws-ambient",
         };
         write!(f, "Credential({kind}, redacted)")
     }

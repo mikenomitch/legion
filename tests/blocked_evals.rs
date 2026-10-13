@@ -473,6 +473,65 @@ fn raft_manager(
     })
 }
 
+/// Spot check 2026-10-12: a high-band claim whose only victims were younger
+/// than `victimExemptAge` blocked, and nothing but unrelated churn woke it,
+/// since a victim getting older is not a capacity event. Its eval now goes
+/// back to `pending` with a delay instead, so it re-plans once the victims
+/// may be taken.
+#[test]
+fn a_claim_waiting_on_young_victims_retries_on_the_clock_instead_of_blocking() -> R<()> {
+    let cluster = Cluster::new()?;
+    let store = cluster.store();
+    store.insert_node(NodeMsg::from(node("n-1", "default")))?;
+    let banded = |name: &str, band: legion::structs::Band| JobConfig {
+        priority: band,
+        name: name.to_string(),
+        tasks: vec![TaskConfig {
+            resources: json!({ "memory": 3000, "cpu": 500 }),
+            ..TaskConfig::new("vm", "noop")
+        }],
+        rollout: None,
+        rollout_by_group: Default::default(),
+        version: None,
+    };
+    // What `RunJob` does: store the config, then queue its submit eval.
+    let run = |job: &JobConfig| -> R<String> {
+        submit(store, job)?;
+        let config_id = store.get_job_config(&job.name)?.id();
+        store.enqueue_eval("job_submit", Some(&job.name), Some(&config_id), None, None)?;
+        Ok(config_id)
+    };
+    run(&banded("band-fill", legion::structs::Band::Low))?;
+    run_eval_worker(store)?;
+    assert_eq!(
+        store.allocs_for_job("band-fill")?.len(),
+        1,
+        "the node is full"
+    );
+
+    // Seconds later, the fill is still inside the 60s guard.
+    let claim_config = run(&banded("band-claim", legion::structs::Band::High))?;
+    run_eval_worker(store)?;
+    assert!(store.allocs_for_job("band-claim")?.is_empty());
+    assert_eq!(
+        store.allocs_for_job("band-fill")?.len(),
+        1,
+        "nothing evicted early"
+    );
+    assert!(
+        cluster
+            .blocked()?
+            .iter()
+            .all(|blocked| blocked.job_id != "band-claim"),
+        "the claim is not parked waiting for a capacity event"
+    );
+    assert!(
+        store.delayed_eval_pending("job_submit", &claim_config)?,
+        "its eval waits for the guard to lapse"
+    );
+    Ok(())
+}
+
 /// The blocked rows replicate, and so does every replica's view of the
 /// capacity events: when the scheduler-lane leader dies after a node
 /// joined but before its wake pass ran, the new leader replays the recent

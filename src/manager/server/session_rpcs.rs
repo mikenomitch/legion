@@ -78,7 +78,7 @@ impl ManagerDaemonService {
             "" if session_tasks.len() == 1 => session_tasks[0],
             "" => {
                 return Err(Status::failed_precondition(format!(
-                    "job {} has {} session tasks; name one with task_name",
+                    "job {} has {} session tasks; name one with --task (task_name in the API)",
                     request.job_id,
                     session_tasks.len()
                 )))

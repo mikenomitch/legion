@@ -32,7 +32,9 @@ use http_body_util::Full;
 use tonic::body::BoxBody;
 use tower::{Layer, Service};
 
-use crate::manager::workload_identity::{WorkloadIdentityState, DISCOVERY_PATH};
+use crate::manager::workload_identity::{
+    SigningKeyUnavailable, WorkloadIdentityState, DISCOVERY_PATH,
+};
 use crate::prelude::*;
 
 /// Mounts the OIDC discovery + JWKS routes in front of an HTTP service.
@@ -104,6 +106,18 @@ where
 
         match body {
             Some(Ok(document)) => Either::Left(std::future::ready(Ok(json_response(&document)))),
+            // A follower that started before the leader's signing key
+            // replicated has no keys to publish yet. Answer a retryable 503
+            // rather than an empty JWKS a relying party might cache.
+            Some(Err(err)) if SigningKeyUnavailable::in_chain(&err) => {
+                debug!(path, "JWKS requested before a signing key replicated");
+                let mut response = status_response(http::StatusCode::SERVICE_UNAVAILABLE);
+                response.headers_mut().insert(
+                    http::header::RETRY_AFTER,
+                    http::HeaderValue::from_static("5"),
+                );
+                Either::Left(std::future::ready(Ok(response)))
+            }
             Some(Err(err)) => {
                 error!(error = ?err, path, "Failed to render OIDC document");
                 Either::Left(std::future::ready(Ok(status_response(
@@ -337,6 +351,44 @@ mod tests {
             !status.is_success() || !looks_like_discovery,
             "discovery document must not be served when disabled (status {status}, body {body:?})"
         );
+
+        let _ = shutdown.send(());
+        Ok(())
+    }
+
+    /// A follower that started before the leader's signing key replicated
+    /// answers the JWKS with a retryable 503, never an empty key set, and
+    /// keeps serving discovery.
+    #[tokio::test]
+    async fn keyless_manager_answers_jwks_with_503() -> R<()> {
+        // A streaming standby can't write, so it initializes keyless.
+        let dir = tempfile::tempdir()?.keep();
+        let mut config = ManagerConfigFull {
+            store_path: dir
+                .to_str()
+                .context("error parsing store path")?
+                .to_string(),
+            ..Default::default()
+        };
+        config.persistence.r#type = crate::structs::PersistenceType::Streaming;
+        config.persistence.streaming.lease.provider =
+            crate::structs::StreamingLeaseProvider::ObjectStorage;
+        let store = Store::start_storage(&config)?;
+        let state = enabled_state(&store, "https://manager.example.com:4747")?;
+        assert!(!state.has_active_key());
+        let (base, shutdown) = boot_manager(store, Some(state)).await?;
+
+        let resp = reqwest::get(format!("{base}/.well-known/jwks.json")).await?;
+        assert_eq!(resp.status(), reqwest::StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            resp.headers()
+                .get(reqwest::header::RETRY_AFTER)
+                .and_then(|v| v.to_str().ok()),
+            Some("5")
+        );
+        reqwest::get(format!("{base}{DISCOVERY_PATH}"))
+            .await?
+            .error_for_status()?;
 
         let _ = shutdown.send(());
         Ok(())

@@ -83,9 +83,19 @@ What happens on an exit:
 | Situation | Outcome |
 | --- | --- |
 | policy wants a restart, budget available | wait `delay`, relaunch in place |
-| policy wants a restart, budget exhausted | allocation fails → manager reschedules it (`move_*` budget) → job fails when that is spent too |
+| policy wants a restart, budget exhausted | allocation fails → manager reschedules it after a backoff that doubles per consecutive failure, capped at 30 minutes (`move_*` budget, see [Manager-side move logic](jobs-tasks-and-scheduling.md#manager-side-move-logic)) → job fails when `move_count` is set and spent |
 | policy does not want a restart, exit was a success | allocation is complete |
 | policy does not want a restart, exit was not a success | allocation fails, as above |
+
+While a replacement waits out its backoff, nothing places it, whichever eval
+runs for the job. Each deferral emits an `allocation.reschedule_deferred`
+event. `legion instance get` (for a stateful instance) and `legion job info`
+say which attempt failed, why, and when the next one is. `legion job run
+<spec> --force-reschedule` retries every waiting replacement now, and
+`legion instance start <id>` retries one stateful instance. The backoff
+doubles from `move_delay` up to 30 minutes and starts over once a
+replacement survives `move_period`. Raise `move_delay` to back off harder,
+and set `move_count` to fail the job instead of retrying forever.
 
 A process killed by a signal has no exit code and never counts as a success.
 With `policy = "never"`, a `SIGKILL` is a failure.
@@ -137,6 +147,15 @@ Know two things before you upgrade:
   opt in) report their batch tasks as complete at start. Earlier releases
   assumed this for every runtime. The worker now says so in the allocation's
   status message.
+
+The worker reports the exit on its next heartbeat, and keeps reporting it
+until a manager records it. That heartbeat can land on any manager. When the
+manager can't record the exit yet (it hasn't applied the placement, or the
+write can't reach the raft leader), it asks the worker to send the report
+again on the next beat. A report from a node that doesn't own the allocation
+is ignored. The worker stops re-sending once it no longer holds the
+allocation. If a `success` dependent stays held after its dependency exited,
+look in the manager logs for `asking the worker to report it again`.
 
 A completed allocation keeps its row and its slot, and Legion never dispatches
 it to a worker again. It no longer counts against the node's resources or

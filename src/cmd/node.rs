@@ -189,7 +189,7 @@ pub fn config() -> Command {
         .subcommand(uncordon_node_cmd)
 }
 
-#[instrument(err, skip_all)]
+#[instrument(skip_all)]
 pub async fn handle(sub_matches: &ArgMatches) -> R<()> {
     match sub_matches.subcommand() {
         Some(("list", arg_matches)) => {
@@ -296,7 +296,7 @@ pub async fn handle(sub_matches: &ArgMatches) -> R<()> {
     }
 }
 
-#[instrument(err, skip_all)]
+#[instrument(skip_all)]
 async fn get_nodes(format: OutputFormat) -> R<()> {
     let mut client = connect_manager_client().await?;
     let request = tonic::Request::new(GetNodesRequest {
@@ -325,7 +325,7 @@ async fn get_nodes(format: OutputFormat) -> R<()> {
 /// Deliberately a command rather than only a metric: an operator debugging
 /// "why did detection take 90s" needs the answer without a Prometheus scrape,
 /// and cadence changes make cluster behavior time-varying.
-#[instrument(err, skip_all)]
+#[instrument(skip_all)]
 async fn get_heartbeat_cadence(format: OutputFormat) -> R<()> {
     let mut client = connect_manager_client().await?;
     let reply = output::resolve(
@@ -417,7 +417,7 @@ async fn get_heartbeat_cadence(format: OutputFormat) -> R<()> {
 
 /// `legion node usage <NODE>` — what the node has, what is reserved on it,
 /// and what its allocations actually use.
-#[instrument(err, skip_all)]
+#[instrument(skip_all)]
 async fn get_node_usage(node_id: String, format: OutputFormat) -> R<()> {
     let mut client = connect_manager_client().await?;
     let reply = output::resolve(
@@ -442,7 +442,7 @@ async fn get_node_usage(node_id: String, format: OutputFormat) -> R<()> {
 
 /// `legion node usage` with no node — one summary line per node, from
 /// ListNodeUsage.
-#[instrument(err, skip_all)]
+#[instrument(skip_all)]
 async fn list_node_usage(format: OutputFormat) -> R<()> {
     let mut client = connect_manager_client().await?;
     let reply = output::resolve(
@@ -553,7 +553,7 @@ fn cpu_capacity_label(cpu: &crate::structs::NodeResourceUsage) -> String {
 
 /// `legion node content <NODE>` — the node's advertised content and the
 /// snapshots it holds.
-#[instrument(err, skip_all)]
+#[instrument(skip_all)]
 async fn get_node_content(node_id: String, format: OutputFormat) -> R<()> {
     let mut client = connect_manager_client().await?;
     let reply = output::resolve(
@@ -984,7 +984,7 @@ fn render_pressure_order(reply: &GetNodeUsageReply) -> String {
     out
 }
 
-#[instrument(err, skip_all)]
+#[instrument(skip_all)]
 async fn update_node(
     node_id: String,
     dynamic_diff: Map<String, Value>,
@@ -1017,7 +1017,7 @@ async fn update_node(
     Ok(())
 }
 
-#[instrument(err, skip_all)]
+#[instrument(skip_all)]
 async fn get_node_info(node_id: String, format: OutputFormat) -> R<()> {
     let mut client = connect_manager_client().await?;
     let request = tonic::Request::new(GetNodeRequest { id: node_id });
@@ -1047,7 +1047,7 @@ async fn get_node_info(node_id: String, format: OutputFormat) -> R<()> {
 /// Deliberately a separate view from `node info`: unratified work is live,
 /// short-lived state reported on the last heartbeat, not part of the node
 /// record, and mixing the two would suggest a durability it does not have.
-#[instrument(err, skip_all)]
+#[instrument(skip_all)]
 async fn get_node_claims(node_id: String, format: OutputFormat) -> R<()> {
     let mut client = connect_manager_client().await?;
     let request = tonic::Request::new(GetNodeRequest { id: node_id });
@@ -1095,7 +1095,7 @@ async fn get_node_claims(node_id: String, format: OutputFormat) -> R<()> {
     Ok(())
 }
 
-#[instrument(err, skip_all)]
+#[instrument(skip_all)]
 async fn restart_node(node_id: String, format: OutputFormat) -> R<()> {
     let mut client = connect_manager_client().await?;
     let request = tonic::Request::new(RestartWorkerRequest { node_id });
@@ -1115,7 +1115,7 @@ async fn restart_node(node_id: String, format: OutputFormat) -> R<()> {
     Ok(())
 }
 
-#[instrument(err, skip_all)]
+#[instrument(skip_all)]
 async fn set_node_availability(
     node_id: String,
     availability: &str,

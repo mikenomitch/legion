@@ -156,6 +156,39 @@ uniform membership. Under `topology = "lanes"`, this is stricter than any
 single lane's list, so the headline never reports a fault-tolerant cluster
 while one lane is still mid-join.
 
+### Members
+
+`legion raft status` describes the manager you ask. To see every manager at
+once, ask any of them for the member list:
+
+```bash
+legion raft members
+```
+
+```
+  NODE                     ROLE       ADDRESS                  REACHABLE     TERM    APPLIED
+  mgr-1                    leader     10.0.1.11:4747           yes 2ms          4       1802
+* mgr-2                    follower   10.0.1.12:4747           self             4       1802
+  mgr-3                    follower   10.0.1.13:4747           no               -          -  (Unavailable: tcp connect error)
+```
+
+The list comes from the replicated raft membership, so a follower answers
+with the same roster as the leader, and a manager that is down stays listed.
+The answering manager is marked `*`. Roles are:
+
+- `leader`: leads the control lane.
+- `follower`: a settled voter on every lane.
+- `learner`: a non-voting member, or a joiner whose promotion has not
+  settled yet.
+- `standalone`: raft is off and this is the only manager.
+
+Reachability, term, and applied index are probed live. The answering
+manager calls `GetRaftStatus` on each other member with the caller's
+credential and a 2-second timeout. So the list is that manager's view: a
+manager cut off from the others reports them all unreachable. An applied
+index well behind the others means that member is lagging. `--json` returns
+the `ListManagers` reply, and MCP exposes it as `legion_manager_list`.
+
 ### History
 
 ```bash
@@ -291,6 +324,11 @@ target node ID in a form that opens under the buttons, and suggest the ids
 the manager knows (voters, learners and configured `peers`). Remove Member
 asks for a second click to confirm. Transfer Leader is disabled on a
 single-voter cluster, because there is no other voter to hand leadership to.
+
+**Cluster → Managers** lists every member with its role, address,
+reachability, term, and applied index, the same data as
+`legion raft members`. It works the same whether the UI points at the
+leader or a follower.
 
 ## Operational notes
 

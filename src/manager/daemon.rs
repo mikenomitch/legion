@@ -5,7 +5,6 @@ use crate::manager::server::ManagerDaemonService;
 use crate::manager::workload_identity::WorkloadIdentityState;
 use crate::prelude::*;
 use crate::storage::events::drafts;
-use crate::storage::persistence::PersistenceRole;
 use crate::storage::store::{ClaimScope, EvalBatchLimits, EvalCompletion, Store};
 use crate::structs::{
     manager_server::ManagerServer, Eval, JobConfig, KvValueType, ManagerConfig, NodeMsg,
@@ -45,6 +44,15 @@ const ERROR_BACKOFF_MAX: Duration = Duration::from_secs(30);
 // (eval workers, node status checker). Bounds the takeover delay after a
 // leadership change to "a few seconds" (plan JC-15).
 const LEADER_POLL_INTERVAL: Duration = Duration::from_secs(1);
+
+/// How often a manager without a workload-identity signing key re-checks the
+/// store (follower) or tries to generate one (leader). See
+/// `start_workload_identity_rotation`.
+const KEYLESS_SIGNING_KEY_RETRY: Duration = Duration::from_secs(5);
+
+/// How often the control-lane leader prunes expired ACL and join tokens.
+/// A manager also prunes as soon as it acquires control-lane leadership.
+const CREDENTIAL_PRUNE_INTERVAL: Duration = Duration::from_secs(60 * 60);
 
 /// How long a keyed mutation's idempotency record is kept. Retries within
 /// this window are deduplicated; after it, the same key runs again. A day
@@ -152,8 +160,15 @@ pub async fn run_manager_with(
         crate::manager::concurrency::AdaptiveConcurrencySettings::from_scheduler_settings(
             full_config.scheduler_settings.as_ref(),
         )?;
-    let manager_node_id = format!("{}:{}", full_config.server.host, full_config.server.port);
     let store = Store::start_storage(&full_config)?;
+    // This manager's identity for its config row and its liveness digests.
+    // Under raft it is the raft node id, the one name that is unique across
+    // the cluster and matches the membership `ListManagers` reports; the
+    // listener's `host:port` is usually `0.0.0.0:4747` on every manager, so
+    // keying by it made all managers share one row (spot-check P2-12).
+    let manager_node_id = store
+        .raft_node_id()
+        .unwrap_or_else(|| format!("{}:{}", full_config.server.host, full_config.server.port));
     let store_for_api = store.clone();
     // A restore is an explicit operator action with the operator present:
     // fail fast, naming the missing root key, rather than serve a cluster
@@ -266,21 +281,10 @@ pub async fn run_manager_with(
     // before the authenticator so the control-plane identity method can verify
     // `legion` tokens against the same in-process issuer.
     let workload_identity_state = if full_config.workload_identity.enabled {
-        // When the issuer URL is unset, fall back to this manager's own
-        // listener. Match the scheme to the listener: with server TLS on it
-        // speaks only HTTPS, so an http:// issuer would make `iss`/`jwks_uri`
-        // point at an endpoint the manager won't answer. Operators should still
-        // set an externally-reachable HTTPS issuer for real federation.
-        let scheme = if full_config.server.tls.enabled {
-            "https"
-        } else {
-            "http"
-        };
-        let default_issuer = format!(
-            "{scheme}://{}:{}",
-            resolve_manager_host(&full_config.server.host),
-            full_config.server.port
-        );
+        // When the issuer URL is unset, every manager of the cluster must
+        // still agree on one (see `default_issuer`). Operators should set an
+        // externally-reachable HTTPS issuer for real federation.
+        let default_issuer = crate::manager::workload_identity::default_issuer(&full_config);
         let state = WorkloadIdentityState::initialize(
             &store,
             &full_config.workload_identity,
@@ -331,7 +335,9 @@ pub async fn run_manager_with(
         // mint is a replicated control-lane write, so in raft mode only the
         // control-lane leader does it, now or when it later wins leadership.
         let bootstrap_paths =
-            crate::manager::bootstrap_token::BootstrapTokenPaths::for_this_process();
+            crate::manager::bootstrap_token::BootstrapTokenPaths::for_this_process(
+                &full_config.server.local_address(),
+            );
         let secret_file = full_config.acl.bootstrap_secret_file.clone();
         if is_control_leader {
             let outcome = crate::manager::bootstrap_token::ensure_initial_management_token(
@@ -378,18 +384,27 @@ pub async fn run_manager_with(
             }
         });
         // Keep credential tables tidy: expired tokens are already rejected at
-        // authentication time, pruning just removes the rows.
+        // authentication time, pruning just removes the rows. The delete is a
+        // replicated control-lane write, so only the control-lane leader
+        // prunes: at startup or on acquiring leadership, then hourly.
         let prune_store = store.clone();
         tokio::spawn(async move {
+            let mut last_prune: Option<std::time::Instant> = None;
             loop {
-                match prune_store.prune_expired_credentials() {
-                    Ok((acl_tokens, join_tokens)) if acl_tokens + join_tokens > 0 => {
-                        info!(acl_tokens, join_tokens, "Pruned expired credentials");
+                if !prune_store.is_raft_leader(crate::storage::Lane::Control) {
+                    // Forget the schedule so a later leadership win prunes at once.
+                    last_prune = None;
+                } else if last_prune.is_none_or(|at| at.elapsed() >= CREDENTIAL_PRUNE_INTERVAL) {
+                    last_prune = Some(std::time::Instant::now());
+                    match prune_store.prune_expired_credentials() {
+                        Ok((acl_tokens, join_tokens)) if acl_tokens + join_tokens > 0 => {
+                            info!(acl_tokens, join_tokens, "Pruned expired credentials");
+                        }
+                        Ok(_) => {}
+                        Err(err) => warn!(error = ?err, "Failed pruning expired credentials"),
                     }
-                    Ok(_) => {}
-                    Err(err) => warn!(error = ?err, "Failed pruning expired credentials"),
                 }
-                tokio::time::sleep(Duration::from_secs(60 * 60)).await;
+                tokio::time::sleep(LEADER_POLL_INTERVAL).await;
             }
         });
     } else {
@@ -537,7 +552,8 @@ pub async fn run_manager_with(
         .with_workload_identity(workload_identity_state.clone())
         .with_kv_debounce(Duration::from_millis(full_config.kv_debounce_ms))
         .with_authenticator(authenticator)
-        .with_advertise_addr(full_config.server.advertised_address());
+        .with_advertise_addr(full_config.server.advertised_address())
+        .with_manager_id(manager_node_id.clone());
 
     let addr: std::net::SocketAddr =
         format!("{}:{}", full_config.server.host, full_config.server.port).parse()?;
@@ -707,23 +723,29 @@ pub async fn run_manager_with(
         } else {
             None
         };
-    let worker_fut = async move {
-        if run_worker {
+    // Its own task rather than one of the background loops: it stops on the
+    // same signal the manager does (stopping its tasks first on macOS), and
+    // the shutdown below waits for that instead of aborting it mid-stop.
+    let worker_task = run_worker.then(|| {
+        tokio::spawn(async move {
             info!(%manager_addr, "Starting in-process worker");
-            run_worker_local(
+            let result = run_worker_local(
                 crate::worker::daemon::WorkerJoin {
                     manager_addr,
                     worker_type: "default".to_string(),
                     join_secret: local_worker_join_secret,
                     ca_pin: local_worker_ca_pin,
                     advertise_addr: local_worker_advertise,
+                    in_process: true,
                 },
                 None,
             )
-            .await?;
-        }
-        Ok::<(), anyhow::Error>(())
-    };
+            .await;
+            if let Err(err) = result {
+                error!(error = ?err, "In-process worker exited");
+            }
+        })
+    });
     let rotation_fut = async move {
         if let Some(state) = workload_identity_state {
             start_workload_identity_rotation(store_for_rotation, state).await?;
@@ -734,11 +756,10 @@ pub async fn run_manager_with(
     // The background loops run as one task the daemon can abort: without an
     // API and raft transport they must not keep acting on the cluster.
     let background = tokio::spawn(async move {
-        let (checker, evals, concurrency, worker, rotation, keyring) = join!(
+        let (checker, evals, concurrency, rotation, keyring) = join!(
             node_checker_fut,
             eval_loop_fut,
             concurrency_fut,
-            worker_fut,
             rotation_fut,
             keyring_fut
         );
@@ -746,7 +767,6 @@ pub async fn run_manager_with(
             ("node status checker", checker),
             ("eval loop", evals),
             ("adaptive scheduler concurrency", concurrency),
-            ("in-process worker", worker),
             ("workload identity rotation", rotation),
             ("keyring maintenance", keyring),
         ] {
@@ -764,6 +784,9 @@ pub async fn run_manager_with(
     let signal = tokio::select! {
         serve_result = &mut start_server_fut => {
             background.abort();
+            if let Some(worker) = &worker_task {
+                worker.abort();
+            }
             let err = manager_server_exit_error(&addr, serve_result);
             shutdown_persistence(&store_for_shutdown).await;
             return Err(err);
@@ -789,6 +812,26 @@ pub async fn run_manager_with(
             warn!(signal = second, "Second shutdown signal; exiting now");
             background.abort();
             return Ok(());
+        }
+    }
+    // The in-process worker heard the same signal and is stopping too. Wait
+    // for it, so the process does not exit under its session checkpoints or
+    // (on macOS) the task stops. A second signal still exits at once.
+    if let Some(worker) = worker_task {
+        tokio::select! {
+            stopped = tokio::time::timeout(IN_PROCESS_WORKER_STOP_TIMEOUT, worker) => {
+                if stopped.is_err() {
+                    warn!(
+                        timeout_secs = IN_PROCESS_WORKER_STOP_TIMEOUT.as_secs(),
+                        "In-process worker did not stop in time; exiting anyway"
+                    );
+                }
+            }
+            second = shutdown_signal() => {
+                warn!(signal = second, "Second shutdown signal; exiting now");
+                background.abort();
+                return Ok(());
+            }
         }
     }
     // Leader-only loops stop before the store does, so nothing proposes
@@ -834,6 +877,12 @@ fn in_process_worker_advertise_host(
 /// How long a graceful shutdown waits for in-flight RPCs and open streams
 /// (event streams, worker connections) once the listener stops accepting.
 const SHUTDOWN_DRAIN_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// How long a graceful shutdown waits for the in-process worker
+/// (`--run-worker`) to stop: its session checkpoints
+/// (`edgeBoot.stopCheckpointTimeout`, 60s by default) plus, on macOS, its
+/// task stops (30s).
+const IN_PROCESS_WORKER_STOP_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// Budget for the persistence backend's orderly stop: the final streaming
 /// replica sync plus lease release, or the raft lane shutdown. Drain plus
@@ -1061,7 +1110,10 @@ async fn start_workload_identity_rotation(
         "Beginning workload identity key rotation loop"
     );
     loop {
-        if store.persistence_role() == PersistenceRole::Primary {
+        // Signing keys are control-lane rows, so "primary" here means the
+        // control-lane leader (the streaming primary, or any local-disk
+        // manager, outside raft mode).
+        if store.is_raft_leader(crate::storage::Lane::Control) {
             match state.rotation_tick(&store, std::time::SystemTime::now()) {
                 Ok(true) => info!("Workload identity signing key rotated"),
                 Ok(false) => debug!("Workload identity rotation not due"),
@@ -1076,7 +1128,16 @@ async fn start_workload_identity_rotation(
                 Err(err) => warn!(error = ?err, "Failed to refresh signing keys on standby"),
             }
         }
-        tokio::time::sleep(interval).await;
+        // A keyless manager (a follower that started before the leader's key
+        // replicated, or a new leader that must generate one) retries fast:
+        // the rotation interval can be hours, and it serves no tokens or
+        // JWKS until it holds a key.
+        let delay = if state.has_active_key() {
+            interval
+        } else {
+            KEYLESS_SIGNING_KEY_RETRY
+        };
+        tokio::time::sleep(delay).await;
     }
 }
 
@@ -3362,6 +3423,31 @@ pub fn resolve_claimed_eval(store: &Store, worker_id: usize, eval: &Eval) -> Eva
             let blocked = PlacementBlocked::in_chain(&e)
                 .cloned()
                 .expect("matched by the guard");
+            // Preemption that only waits on `victimExemptAge`: the room
+            // exists once the victims age, and no capacity event would wake a
+            // blocked eval for that, so retry on the clock instead.
+            if let Some(delay) = blocked.retry_after {
+                info!(
+                    worker_id,
+                    eval_id = %eval.id,
+                    kind = %eval.kind,
+                    delay_ms = delay.as_millis() as u64,
+                    "Eval waits for preemption victims to age past victimExemptAge: {}",
+                    blocked.message
+                );
+                clear_not_leader_attempts(&eval.id);
+                // `eval.blocked` still, since the job is: its message names
+                // the guard and when placement retries.
+                return EvalCompletion::Released {
+                    delay,
+                    event: Some(drafts::eval_blocked(
+                        eval,
+                        &blocked.key,
+                        &blocked.detail,
+                        &blocked.message,
+                    )),
+                };
+            }
             warn!(
                 worker_id,
                 eval_id = %eval.id,

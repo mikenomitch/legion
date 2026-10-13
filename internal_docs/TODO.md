@@ -61,7 +61,7 @@ How to use it:
         [task-runtime-container.md](../docs/task-runtime-container.md#networking-gated-by-default-on-linux),
         [network-handlers.md](../docs/network-handlers.md#networkmode).
   - [ ] Run a real gated container end to end on a Linux node (runc or
-        youki) with the default mode: a stock `nginx` reachable on its
+        crun) with the default mode: a stock `nginx` reachable on its
         advertised port, `curl` through the proxy refused with
         `gated-default`, then allowed after `network.egress.allow`. This
         repository's CI starts no OCI runtime; the placement, port, resolver,
@@ -98,9 +98,45 @@ How to use it:
         under a user namespace, the `security` block, and opt-out warnings
         (plan §6.14; calls 37 to 39). Docs:
         [task-runtime-container.md](../docs/task-runtime-container.md#security).
-  - [ ] Run the privilege floor on youki and crun
-        (`LEGION_OCI_RUNTIME=youki cargo test --lib oci_runtime_security -- --ignored`).
-        Only runc 1.5 was available when it was built.
+  - [x] AWS spot-check fixes to the floor (Ubuntu 24.04, runc 1.5.2,
+        youki 0.7.0): the worker state dir and `allocs/` are traverse-only
+        and a user-namespaced allocation's directory is `0710` to its own
+        range, so runc can reach the bundle as container root (it failed
+        every start with `remount-propagation … permission denied`); the
+        default OCI runtime is runc, and youki or runc before 1.2 is refused
+        at a user-namespaced start (youki rejects idmapped mounts); `exec`
+        and actions no longer pass `--` to runc/crun, which ran it as the
+        command (calls 40, 41 here, and
+        [container-runtime-exec calls](calls/container-runtime-exec-and-signals-plan_calls.md)
+        21). Docs:
+        [task-runtime-container.md](../docs/task-runtime-container.md#security),
+        [installation.md](../docs/installation.md#runc-the-default).
+  - [x] Dropped youki (2026-10-12): Legion runs containers on runc 1.2+
+        (the default) or crun only, identified by the `--version` banner,
+        and refuses any other runtime at preflight on every start (container
+        and Linux dev-mode sandbox), which also withholds `container: pass`.
+        The youki-only `--` exec argv is gone, and the spot-check rig no
+        longer installs youki or sets `LEGION_OCI_RUNTIME` (calls 40). Docs:
+        [installation.md](../docs/installation.md#crun-instead),
+        [task-runtime-container.md](../docs/task-runtime-container.md).
+  - [ ] Re-run the spot check's container and exec paths on these fixes,
+        with no shim: the `0710` group grant was checked by unit tests
+        only. By hand, `0711` on both directories was what let runc run the
+        bundle as uid 1048576.
+  - [ ] Run the privilege floor on crun
+        (`LEGION_OCI_RUNTIME=crun cargo test --lib oci_runtime_security -- --ignored`).
+        Only runc 1.5 was available when it was built, so crun is
+        supported on trust (calls 40).
+  - [ ] `container: pass` readiness means the runtime is an installed runc
+        or crun, but not that it is new enough. A runc older than 1.2
+        advertises it and fails every default (`userNamespace = true`)
+        start. Consider a separate readiness key for idmapped-mount support
+        so the scheduler can avoid such nodes (calls 40).
+  - [ ] An `exec` task with a `user` still can't reach a `local-dir`
+        volume's host path (`<state dir>/volumes/…` is owner-only, as the
+        whole state dir was before). Volume data dirs are created
+        at the umask, so `volumes/` stays the guard until each volume
+        guards itself.
   - [ ] Vendor Docker's default seccomp allowlist once CI can run it on every
         runtime (calls entry 37): the shipped profile is a denylist over the
         same blocked set.
@@ -137,15 +173,130 @@ How to use it:
       evidence and a root cause in
       [launch-spot-check-findings.md](launch-spot-check-findings.md) (the IDs
       below are that doc's); rerun with `tests/spot-check/smoke.sh`.
-  - [ ] **Batch tasks never finish (P0-2).** The worker rebuilds `TaskConfig`
+  - [x] **Batch tasks never finish (P0-2).** The worker rebuilds `TaskConfig`
         without `lifecycle` or `restart`, so batch tasks restart forever after
-        exit 0 and jobspec restart policies are ignored.
+        exit 0 and jobspec restart policies are ignored. Fixed in #17 (Done,
+        "Task lifecycle"). The 2026-10-12 rerun saw `fetch` exit once and
+        stop.
   - [ ] **Health checks never start for artifact-staged tasks (P0-3),** which
         includes every container image under `containerImageDesugar`. The
         staging thread calls `tokio::spawn` outside a runtime. Shimmed in
         `tests/spot-check/shims.patch`, and the shim is likely the real fix.
-  - [ ] **DAG ordering is not enforced (P0-4).** The scheduler treats planned
-        batch deps as satisfied, and the worker has no gating.
+  - [x] **DAG ordering is not enforced (P0-4).** The scheduler treats planned
+        batch deps as satisfied, and the worker has no gating. Fixed in #17
+        (Done, "Scheduler"). The 2026-10-12 rerun held every dependent.
+  - [ ] **A DAG never advances past its first step (2026-10-12 rerun).**
+        `fetch` exited 0 on the worker, but its allocation stayed `placed`
+        and every `success` dependent stayed held. Fixes are in the working
+        tree, not yet in a PR:
+    - [x] The root cause: `complete_allocation` wrote `task_status` (status
+          lane) from its scheduler-lane op, so the ownership guard refused
+          every batch completion on a raft cluster. It is now two writes in
+          order: the scheduler half marks the row and decides the status,
+          and `set_task_status` (status lane) records it. Both forward from a
+          follower (`SetTaskStatus` is a new forwardable op). Covered by
+          `tests/raft_ownership_guard.rs` and `tests/raft_follower_writes.rs`.
+    - [ ] In the `lanes` topology the dependency eval can run before the
+          scheduler leader applies the status-lane write, and then nothing
+          re-evaluates the job (`docs/multi-raft.md`, "Non-leader write
+          redirects and forwarding"). `single` is not affected.
+    - [x] A terminal report the manager can't record (row not applied yet,
+          forward to the lane leader failed) is handed back in
+          `HeartbeatReply.retry_terminated_allocations` and re-sent, instead
+          of being logged and dropped (`handle_terminated_allocations`,
+          `src/manager/server.rs`, `docs/task-supervision.md`).
+    - [x] A failed changeset projection no longer fails the raft state
+          machine's apply. openraft treats that as fatal and stopped the raft
+          group on any manager a worker streamed from
+          (`capture::apply_changeset_with`, `docs/state-store.md`).
+    - [ ] The projection error itself: `note_work_changes` queries
+          `allocation.job_id`, which does not exist, whenever a job-level
+          volume row is inserted or deleted (first submit of a job with
+          `volumes`) on a manager with a streaming worker. Being fixed
+          separately.
+    - [ ] `handle_failed_allocations` has the same log-and-drop shape: a
+          failure report whose `remove_allocation_by_id` forward fails is
+          lost (seen on the rerun: `forwarded remove_allocation_by_id but the
+          target no longer leads the lane`).
+    - [ ] Explain the missing sidecar: the plan placed `fetch` and
+          `progress`, but only `fetch` has an allocation row.
+    - [ ] Rerun `05-dag.ncl` on the 3-manager rig to confirm.
+  - [ ] **A resubmitted DAG job's rollout never progresses (2026-10-12
+        rerun).** `05-dag.ncl --var run=<new>` started a rollout that logged
+        `waiting for batch retire window` every 2 s for 10+ minutes.
+    - [x] The root cause: finished old allocations (`complete`/`failed`)
+          still counted as old allocations to retire, and with
+          `batchKillAfter` unset the batch retire window refused to retire
+          any batch allocation, finished or not. Finished ones are now
+          retired at once and first; only running batch steps wait
+          (`retire_old_allocations_for_group`, `src/manager/rollout.rs`;
+          [rollouts.md](../docs/rollouts.md#lifecycle-specific-behavior)).
+          Uncommitted on `fix-rollout-retire`, not yet in a PR.
+    - [x] The old version's `serve` never started. Not a dependency bug:
+          the scheduler places a service that depends on a finished batch
+          step in the same group (`dag_batch_success_allows_service_within_group`),
+          and so does the rollout path now
+          (`rollout_over_finished_batch_steps_retires_them_and_runs_the_new_dag`).
+          While a rollout targets a config, `report`'s exit releases `serve`
+          through a `rollout_tick`, so a rollout stuck on the same retire
+          window froze it. Once the resubmit superseded that version, the
+          scheduler and `queue_dependency_progress` skip it by design, and
+          the new version's `serve` replaces it.
+    - [ ] A config under rollout releases its held dependents through a
+          `rollout_tick`, so a rollout that is paused, waiting for a manual
+          advance, or stuck on anything else freezes the DAG along with it.
+          Decide whether a dependency release should place through the
+          rollout regardless of its step gating
+          (`Store::queue_dependency_progress`).
+    - [ ] Rerun `05-dag.ncl` twice with different `run` values to confirm.
+  - [ ] **A `durability = "store"` checkpoint never resumed on another node
+        (2026-10-12 rerun).** The part fetch went through the artifact
+        fetchers with no credential (an unsigned GET), so the private
+        bucket answered 403, though the publisher had used the
+        `contentStore.auth.kv` credential.
+    - [x] A part URL under the restoring node's own `contentStore.url` is
+          now fetched with that node's `contentStore.auth` (KV credential
+          read at fetch time, or the ambient AWS chain via the new
+          `Credential::AwsAmbient`). Any other URL stays anonymous and its
+          failure says the node has no credential for that store
+          (`ArtifactStager::fetch_sealed_into_store`,
+          [artifacts.md](../docs/artifacts.md#publishing-content),
+          [calls #63](calls/launch-spot-check-fixes-plan_calls.md)).
+          Unit-tested, not yet re-run on the rig.
+    - [x] With the fetch fixed, the restore failed in cloud-hypervisor with
+          `Cannot open disk path`: the saved state names each disk by its
+          device link, and links lived under the worker-id-keyed
+          `<data dir>/workers/<id>/allocs/.vmdev/`, which no other node
+          has. Links now live at `<data dir>/vmdev/<key>/`, the launch
+          records the link dir in the checkpoint, and a cloud-hypervisor
+          restore rewrites its `config.json` disks to this node's links
+          ([calls #1, #2](calls/sandbox-snapshots-and-fast-start-plan_calls.md),
+          [docs](../docs/task-runtime-sandbox.md#where-a-memory-checkpoint-can-be-restored)).
+          Unit-tested with fake VMMs, not yet re-run on the rig.
+    - [ ] A published Firecracker checkpoint still cannot move between
+          nodes with different data dirs: its `vm-state` cannot be
+          rewritten and `PUT /snapshot/load` has no drive override. The
+          restore is refused by name. Revisit if Firecracker adds drive
+          overrides, or if placement should prefer matching data dirs.
+    - [ ] The same restore logged `Resuming a restored gated sandbox before
+          its egress proxy socket is bound` (5s wait for
+          `<alloc>/.sandbox/vsock.sock_1080`). The paths the daemon binds
+          and the restore waits for agree, so the cause is unknown. If the
+          allocation was not actually gated, the next item explains it.
+          Check `legion net doctor` and the socket during the rerun.
+    - [ ] Every microVM sandbox has a vsock (for exec), so every checkpoint
+          records `network = gated` and every restore sets
+          `RestoreTarget.vsock`. A non-gated (TAP or loopback-only) sandbox
+          therefore waits the full 5s `DATAPATH_WAIT` and warns on every
+          restore, and the gated-vs-TAP refusal in `check_restorable` never
+          fires. Derive both from the allocation's network mode.
+    - [ ] Rerun the store suspend and cross-node resume on the rig.
+    - [ ] Placement ignores which `contentStore` a node has, so a resume can
+          land on a node pointed at another bucket and fail. Prefer or
+          require nodes whose `contentStore.url` covers the part URLs.
+    - [ ] A node has no way to read a store other than its own (no per-store
+          read credentials, and cluster `artifacts.auth` never reaches part
+          URLs). Decide whether cross-store restores are worth a surface.
   - [ ] **One manager down strands every worker (P0-5).** Followers fail to
         forward heartbeats in the `single` topology (lane mismatch), and
         workers know one manager.
@@ -173,7 +324,7 @@ How to use it:
       follower, `tls-edge.ncl`, and the dev guide's `:4748`) are in Done,
       "Pre-launch spot check (2026-10-11)".
   - [ ] **The installation guide's release versions are placeholders.**
-        `docs/installation.md` names youki, cloud-hypervisor, and guest
+        `docs/installation.md` names cloud-hypervisor and guest
         kernel release tags that were not checked against the upstream
         release pages (GitHub was unreachable when it was written). Confirm
         the tags and asset names before launch.
@@ -201,12 +352,77 @@ How to use it:
         memory pressure, preemption, and session mode. Needs `legion-guest`
         on the workers and the config changes in RUNBOOK §12.0. The steps
         marked PR #36 need the session-durability work.
+  - [ ] **Verify the sandbox clean stop on the KVM rig.** The P0 volume
+        data-loss fix (guest stop request, flush before kill, unmount in
+        init) is unit-tested only. Re-run `tests/spot-check/jobs/09-sandboxes.ncl`
+        task `ws`: write `/workspace/probe`, `instance stop` + `start`, and
+        the smoke `sandbox-suspend` boots count, on cloud-hypervisor and
+        Firecracker ([calls](calls/sandbox-clean-stop_calls.md),
+        [docs](../docs/task-runtime-sandbox.md#stopping-a-sandbox)).
+  - [ ] **A guest without an agent still loses unflushed writes on stop.**
+        The stop request and the flush both go through the guest agent
+        (calls 1). Firecracker's `SendCtrlAltDel` could reach init without
+        it on a guest booted with an API socket. Worth it only if agent-less
+        guests turn out to be common.
+  - [ ] **`SIGINT`/`SIGQUIT` as `stop.signal` reach a sandbox command
+        ignored** (background job, calls 3). A shell-script workload cannot
+        act on them. Documented. A launcher that resets dispositions would fix
+        it.
   - [ ] **Re-run the AWS spot check without the shims**
         (`tests/spot-check/smoke.sh` and the RUNBOOK human pass on the
         `spot-check/launch` branch). Nothing in #17 ran on the real rig.
         Smoke-test edge-boot speculative dispatch in particular: the
         dispatcher read `protocolVersion` from the wrong attribute map, so
         it had never fired for a real worker before #17.
+  - [ ] **`move_count` is counted per task, even for keyed tasks.** The
+        reschedule backoff runs per instance (2026-10-12 re-run fixes, in
+        Done), but the job-failing budget still counts every move of the
+        task inside `move_period`, so with `move_count` set, a few
+        unrelated sandboxes failing fails the whole keyed job. A per-instance
+        budget that fails (or stops) just the instance is the likely shape
+        (`Store::remove_failed_allocation` in
+        `src/storage/store/reschedule_holds.rs`).
+  - [ ] **A worker-reported failure leaves no `last_stop` on the
+        instance.** The failure path removes the allocation with
+        `StopCause::Unknown`, which records no `last_stop`, so once the
+        reschedule hold lapses the instance row no longer says why its last
+        allocation ended. A `failed` stop cause carrying the reason would
+        close it (`remove_allocation_row_tx`).
+  - [ ] **Scheduler benchmark numbers for the reschedule holds.** The
+        holds add one indexed `reschedule_hold` read per `Reschedule` plan
+        and a subquery to the keyed binder's ordering. AGENTS.md asks for
+        before/after `scheduler_bench` numbers on scheduler changes; they
+        were not taken in the change that added them. (The pinned-storage
+        disk exemption that followed was measured: `scheduler_speed` and
+        `restore` unchanged within noise.)
+  - [ ] **The disk-fit check may read the wrong disk.** The kitchen-sink
+        fingerprint writes `disk_available_space` once per disk it lists, so
+        the node reports whichever disk came last (`/boot/efi` on some
+        hosts), not the one holding the worker's volumes
+        (`src/worker/node_check/node_checkers/kitchen_sink.rs`). It may be
+        why the rig's sc-wkr-1 failed the check for a 2G volume while 12%
+        reserved (unconfirmed: a full root disk would do the same). Report
+        the free space of the disk holding the state dir instead.
+  - [ ] **A rollout's replacement skips the previous version's backoff.**
+        A hold is keyed by job config, so when an instance fails on the old
+        version and a rollout then places the new one, the new version's
+        plan does not see the hold and places at once
+        (`Store::held_replacements_for_job_config`). Harmless for a fixed
+        config, but a crash-looping task gets one undelayed retry per
+        rollout.
+  - [ ] **A failed changeset projection drops that changeset's capacity
+        events.** The recovery rebuilds the read model and resyncs work
+        streams, but blocked evals waiting on the freed capacity wait for the
+        next capacity event (`Store::project_committed_changeset`).
+  - [ ] **Followers never publish a config snapshot.** P2-12 fixed the
+        Managers page roster, but a manager still writes its config row only
+        when it leads the control lane (`upsert_manager_config` in
+        `src/manager/daemon.rs`), so a manager that has never led has no
+        config page and shows `—` in the Config column. Fix by forwarding
+        the write to the leader (`ForwardableLaneWrite`) from every manager
+        at startup. Rows written before P2-12 under the old `host:port` key
+        linger until the store is reset
+        ([calls](calls/managers-page-raft-members_calls.md) 3).
   - [ ] **Capability-aware placement.** A task that adds capabilities places
         like any other and fails at start on a node whose
         `container.allowCaps` refuses them; authors pin such tasks by pool
@@ -227,6 +443,13 @@ How to use it:
         (`HeartbeatReply.manager_addresses`), which must be reachable from
         workers. Consider serving each manager's `server.advertiseAddr`
         instead (calls 7).
+  - [ ] **Check the ticket `iss` a worker expects across managers
+        (unverified).** `build_jwks_verifier` in `src/worker/daemon.rs`
+        requires `iss` to equal the join token's manager address, while each
+        manager's issuer defaults to its own listener address
+        (`WorkloadIdentityState::initialize`) unless `workloadIdentity.issuer`
+        is set. If that holds, boot and exec tickets minted by any other
+        manager are rejected, failover or not. Found while fixing calls 53.
   - [ ] **Fold the partial-placement remainder into blocked evals.** A plan
         that places nothing blocks on main's blocked evals, but the unplaced
         remainder of a partial plan still waits for the free-triggered
@@ -914,6 +1137,15 @@ How to use it:
 - [ ] Edge boot follow-ups — the feature shipped (phases 1–4;
       [plan](plans/edge-boot-plan.md) · [docs](../docs/edge-boot.md) ·
       [calls](calls/edge-boot-plan_calls.md)); these are what it left open.
+  - [ ] **`edgeBoot.maxProvisionalPerNode` is parsed but enforced nowhere.**
+        The manager config accepts it and docs/edge-boot.md shows it, but the
+        value never leaves `ManagerConfigFull`: nothing mirrors it onto a
+        dispatch or heartbeat, so `LocalLedger::set_max_provisional`
+        (`src/worker/claims.rs`) has no production caller and a node's cap is
+        always 0 (unlimited). Wire it to the worker (a heartbeat-reply or
+        dispatch field) or drop the knob and its docs. Found in the
+        2026-10-12 AWS spot check's config audit, alongside `edgeBoot` never
+        reaching the manager service at all (fixed).
   - [ ] **Phase 0's measurement matrix was never run.** The start-path
         breakdown (submit → eval claim → plan → apply → dispatch → prepare →
         boot → first byte) in both persistence modes, cold and warm image,
@@ -2107,7 +2339,7 @@ Plans: [task-runtime-plugins](../docs/task-runtime-plugins.md).
       `exec_runs_inside_the_container` (empty output),
       `sees_task_dir_files_and_their_rewrites`, and
       `enforces_a_declared_memory_limit` (cgroup v1) are unexplained. Rerun
-      on a cgroup v2 host with `youki`, then fix the tests or the runtime
+      on a cgroup v2 host with `runc`, then fix the tests or the runtime
       (`src/task_plugins/container.rs`).
 - [ ] `exec`: unveil support
 - [ ] `exec`: network namespaces (netavark? CNI?) — see *Networking* below
@@ -2729,8 +2961,10 @@ Plans: [task-runtime-plugins](../docs/task-runtime-plugins.md).
     - [ ] Dev mode (Apple `container`) does not mirror env-delivered tokens
           into `/legion/identity`, so env tokens there keep their boot value.
     - [ ] The `container stats` call runs synchronously on the heartbeat
-          path every 10s while a dev sandbox runs. Move it off the loop if it
-          ever shows up in heartbeat latency.
+          path every 10s while a dev sandbox runs. It once hung there
+          indefinitely on a wedged `container` service; it is now killed past
+          5s (`apple_container::STATS_TIMEOUT`), but still costs up to that on
+          the heartbeat. Move it off the loop.
     - [x] Track 1's calls are inserted at their ranks and every citation
           renumbered.
   - [ ] Phase 8: fast paths, each needing its own review (wake on connect,
@@ -2755,6 +2989,17 @@ Plans: [task-runtime-plugins](../docs/task-runtime-plugins.md).
       `src/worker/task_manager.rs`). `heartbeat_tick`
       also locks a std mutex from async code. Teardown needs a "tearing down"
       state so starts still wait behind stops. [calls #11](calls/architecture-audit-2026-10-09_calls.md).
+      The node-check readiness probe (`container system status`) moved off
+      the lock in the 2026-10-12 macOS fixes, and every runtime CLI call now
+      has a deadline (`crate::util::output_with_timeout`). Teardown on
+      reconcile still runs `container stop` under the lock, now bounded at
+      30s rather than unbounded.
+- [ ] **Linux container ids are not node-scoped.** macOS Apple containers are
+      `legion-<node>-<alloc>` and labeled, so stale cleanup checks ownership
+      before `rm --force`. Linux OCI ids stay `legion-<alloc>` (shared with
+      the cgroup leaf and hostname) and stale cleanup deletes by name, so two
+      clusters sharing one host and runtime state dir can still collide.
+      See `container_name` in `src/task_plugins/container.rs`.
 - [ ] **The worker boot fence is silent (audit W6).** A task fenced at boot is
       never reported as self-fenced, so the manager learns only from its
       absence. A volume left mounted by a boot-fenced task, or by any task
@@ -3183,6 +3428,13 @@ Phases 1 and 2 shipped (see Done, KV & secrets).
 
 Plans: [persistence-plan.md](plans/persistence-plan.md), [multi-raft-persistence-plan.md](plans/multi-raft-persistence-plan.md), [manager-workload-identity-plan.md](plans/manager-workload-identity-plan.md) · docs: [state-store.md](../docs/state-store.md), [raft-operations.md](../docs/raft-operations.md), [persistence-streaming.md](../docs/persistence-streaming.md)
 
+- [ ] **A manager with no raft leader holds a read instead of failing it.**
+      In the AWS spot check, with the leader's raft core dead, `legion job
+      list` hung with no reply. The CLI now gives up at its 30s request
+      deadline with a retryable `DeadlineExceeded`
+      ([calls #2](calls/join-token-file-and-cli-timeouts_calls.md)), but the
+      manager should answer `Unavailable` promptly when it has no leader to
+      read through. Where the request blocks is not yet found.
 - [ ] **`--restore-from` should pull from the replica URL.** It takes a local
       file, so disaster recovery onto a fresh box needs a separate tool and
       credential to download the replica first. Accept an `s3://` URL and
@@ -3544,6 +3796,19 @@ Plan: [auth-acl-plan.md](plans/auth-acl-plan.md) · docs: [auth-and-acls.md](../
 - [ ] **Idempotency keys don't cover the request body (audit S4).** The same
       key with different arguments replays the first reply. Documented in
       [agent-readiness.md](../docs/agent-readiness.md).
+- [ ] **Exec tasks inherit the worker's whole environment.**
+      `src/task_plugins/exec.rs` adds the allocation env to the worker's and
+      never clears it, so anything in the worker's environment (a
+      `LEGION_TOKEN`, cloud credentials, `RUST_LOG`) reaches every host-mode
+      exec task. It is why the join token went to `--token-file` and not an
+      env var. Decide on an allowlist (Nomad's exec driver passes a filtered
+      set). [calls #1](calls/join-token-file-and-cli-timeouts_calls.md)
+- [ ] **A restarted worker still needs its join token string.** It
+      re-registers with its persisted node token, but reads the manager
+      address, worker type, and CA pin from the join token at every start.
+      Persist those beside `node_token` so `legion start worker` runs with no
+      token after the first registration and the token file can be deleted.
+      [calls #6](calls/join-token-file-and-cli-timeouts_calls.md)
 - [ ] **`prune_expired_boot_tickets` is never called outside tests.**
 - [ ] **The ACL credential pruner runs only with ACLs enabled and isn't gated
       to the raft leader.**
@@ -3856,6 +4121,62 @@ Deferred from [operator-ui-gaps-plan.md](plans/operator-ui-gaps-plan.md):
       grows ([calls 3](calls/operator-ui-gaps-plan_calls.md#3-the-instance-event-filter-reads-metadata-not-a-new-column))
 
 ## Cross-cutting
+
+- [ ] **AWS spot-check re-run (2026-10-12): open papercuts.** Found on the
+      rig, not fixed on `spot-check/fixes-2026-10-12`
+      ([findings](launch-spot-check-findings.md#re-run-2026-10-12)).
+  - [ ] **Keep the mesh datapath alive across a worker restart.** Re-adopted
+        tasks keep running, but the datapath lives in the worker, so their
+        upstream connections drop and an app without reconnect logic fails
+        until rescheduled. Documented now
+        ([upgrades.md](../docs/upgrades.md#restarting-a-worker-in-place)).
+        Running the listeners in a process that outlives the worker would
+        remove the limitation.
+  - [ ] **Stopping the macOS manager leaves its Apple containers running.**
+        SIGTERM to `legion start manager --run-worker` exits without tearing
+        down the containers it started.
+  - [ ] **The CLI writes its tracing to stdout and logs into the working
+        directory.** One-shot commands print `info`/`warn` events in the
+        pretty ANSI format on stdout, where they mix with `--json` output,
+        and every command creates `./logs` and `./traces` wherever it runs
+        (`src/tracing_util.rs`, `init_tracing_with_options`). Found while
+        fixing the double-printed command errors.
+  - [ ] **`state query` runs only the first of several statements.** The
+        read path prepares the SQL once, so `SELECT 1; SELECT 2` silently
+        returns the first result and ignores the rest. Refuse a trailing
+        statement instead (`src/storage/store.rs`, `query_state_store`).
+  - [ ] **`job plan` errors where `job run` would preempt.** With the
+        workers full of low-band microVMs, `job plan` for a high-band claim
+        failed "no available nodes", while the run preempted and placed.
+  - [ ] **Instance JSON shows `nodeId: null`** for an active instance with a
+        current allocation.
+        until rescheduled. Document it in `docs/upgrades.md`, or keep the
+        datapath alive across a worker restart.
+  - [ ] **One `~/.legion/token` for every cluster.** A second local manager
+        logs "token already exists and was left alone" and the CLI then
+        presents the other cluster's token ("unknown or revoked ACL
+        token"). Key stored tokens by manager address.
+  - [ ] **The CLI panics on a closed pipe.** `legion raft status | head`
+        prints "failed printing to stdout: Broken pipe" and a panic.
+  - [ ] **`job plan` of an unsubmitted job uses positional task ids.**
+        `Scheduler::tasks_for_plan` numbers its tasks 1, 2, ..., and
+        `place_task_allocations` looks up volume and restore pins by task
+        config id, so a preview can pick up another job's pins for the task
+        whose real id matches. Found while fixing the plan's preemption
+        preview, not seen on the rig. Skip the pin lookups for configs with no
+        stored id.
+  - [ ] **No CLI lists a job's allocations.** `job info` shows none, and
+        there is no `job status`, so finding a failing allocation means
+        `legion state query`.
+  - [ ] **Storage tests need a higher fd limit.** Under the default 1024 on a
+        32-core box, about ten `storage::` tests fail "unable to open
+        database file". They pass with `ulimit -n 65536`. Note it in
+        `docs/testing-and-benchmarks.md` or lower the per-test fd use.
+  - [ ] **Re-verify on the rig:** the microVM clean stop (volume writes
+        survive `instance stop`) and image pulls after a leader failover.
+        Both fixes are unit-tested only. Also two local managers on
+        different ports, each with its own `~/.legion/tokens/` file, and
+        `rig_install_cli_token`'s per-address files on a 3-manager rig.
 
 - [ ] **Ship a Nickel contract library for the jobspec.** `legion job schema`
       emits JSON Schema for the *rendered* JSON; an importable
@@ -4370,6 +4691,14 @@ docs: [scheduler-and-eval-loop.md](../docs/scheduler-and-eval-loop.md), [jobs-ta
 docs: [task-runtime-plugins.md](../docs/task-runtime-plugins.md)
 
 - [x] A framework for task-runtime plugins
+- [x] **microVM sandboxes stop cleanly, so volume writes survive a stop**
+      (P0 from the 2026-10-12 AWS spot check). The guest agent signals init
+      with `stop.signal`, init flushes, forwards it, unmounts the volumes,
+      and powers off, and the worker holds the volumes until the VMM exits.
+      Hard stops, restarts, disk suspends, and memory captures flush the
+      guest first. `stop { signal, killAfter }` now applies to sandboxes —
+      [calls](calls/sandbox-clean-stop_calls.md) ·
+      [docs](../docs/task-runtime-sandbox.md#stopping-a-sandbox)
 - [x] Rename "task kind" → "task runtime"
       ([plan](plans/task-runtime-rename-plan.md), single-pass, no shim)
 - [x] A **noop** runtime ([docs](../docs/task-runtime-noop.md))
@@ -4456,9 +4785,9 @@ docs: [task-runtime-plugins.md](../docs/task-runtime-plugins.md)
       with landlock
 - [x] A **container** runtime ([docs](../docs/task-runtime-container.md)) with no
       Docker dependency: macOS uses Apple `container`; Linux uses a low-level OCI
-      runtime (`youki` by default, or any OCI-spec runtime via
-      `LEGION_OCI_RUNTIME`). Linux runtimes can't pull images, so the runtime
-      builds an OCI bundle from the image's OCI layout
+      runtime (`runc` 1.2+ by default, or `crun` via `LEGION_OCI_RUNTIME`;
+      youki, the original default, was dropped on 2026-10-12). Linux runtimes
+      can't pull images, so the runtime builds an OCI bundle from the image's OCI layout
       ([oci_bundle.rs](../src/task_plugins/oci_bundle.rs)).
 - [x] A **sandbox** runtime ([docs](../docs/task-runtime-sandbox.md)) — OCI images
       in microVMs for untrusted code and agent workspaces
@@ -4476,7 +4805,7 @@ docs: [task-runtime-plugins.md](../docs/task-runtime-plugins.md)
       its seven phases; Phase 3 (graceful stop) was **superseded before merge**
       by the preemption plan's Phase 1b, which shipped the same ladder as
       `stop { signal, killAfter }` — see the Phase 3 entry below:
-  - [x] Phase 1 — exec on Linux via `<runtime> exec` for youki/runc/crun, so
+  - [x] Phase 1 — exec on Linux via `<runtime> exec` for runc/crun, so
         `legion exec`, actions, the UI terminal, and MCP exec work on the OS
         the workloads ship on ([docs](../docs/exec-and-actions.md))
   - [x] Phase 2 — `TaskPlugin::signal()` seam with a tracked-pid default, and
@@ -4524,6 +4853,14 @@ docs: [task-runtime-plugins.md](../docs/task-runtime-plugins.md)
     step, ordered strictly behind the reap so a cgroup is never removed while
     it still holds a live process
     ([calls 19](calls/container-runtime-exec-and-signals-plan_calls.md)).
+- [x] **macOS local-dev spot check fixes** (2026-10-12): Apple `container`
+      task containers are named `legion-<node>-<alloc>` and labeled
+      `legion.node`/`legion.allocation`, and stale cleanup (`container` and sandbox dev mode)
+      removes only a container labeled as this node's; every runtime CLI call
+      has a deadline and kills its process group past it; readiness probes
+      run off the task-manager lock; the gated-egress warning follows the
+      task's `os` constraint
+      ([docs](../docs/task-runtime-container.md#runtime-behavior)).
 
 ## Artifacts
 
@@ -4862,6 +5199,14 @@ docs: [task-runtime-plugins.md](../docs/task-runtime-plugins.md)
       [docs](../docs/workload-identity.md#forks-and-snapshots)). Offline
       verifiers (AWS, GCP, Vault) cannot see the epoch, and login-minted ACL
       tokens are still open (Task runtimes, Phase 6 follow-ups).
+- [x] A raft follower with `workloadIdentity` on no longer crashes at
+      startup proposing `insert_signing_key`. It starts keyless (issuance
+      `UNAVAILABLE`, JWKS 503) and adopts the leader's key within 5 seconds.
+      A keyless node that wins leadership generates one, and a new leader
+      rotates from the store's key set. Followers also stop logging ERRORs
+      for leader-only `ensure_mesh_ca` and `prune_expired_credentials`.
+      Found on the AWS spot-check rig, 2026-10-12
+      ([docs](../docs/workload-identity.md)).
 
 ## Auth & ACLs
 
@@ -4883,6 +5228,12 @@ docs: [task-runtime-plugins.md](../docs/task-runtime-plugins.md)
       `RotateMeshCa` (S5), stream re-auth (S7). See the
       [audit](architecture-audit-2026-10-09.md) and
       [auth-and-acls.md](../docs/auth-and-acls.md).
+- [x] The join token can stay off the worker's command line:
+      `--token-file` on `legion join` and `legion start worker`, a warning
+      when the token arrives on argv or the file is readable by others, and
+      the spot-check rig's unit reads a `0600` file (AWS spot check P1).
+      [calls](calls/join-token-file-and-cli-timeouts_calls.md) ·
+      [docs](../docs/architecture-managers-workers.md#running-a-worker-under-a-service-manager)
 
 ## Exec & actions
 
@@ -4962,6 +5313,12 @@ docs: [task-runtime-plugins.md](../docs/task-runtime-plugins.md)
 - [x] An MCP server (`legion mcp serve`), with mutating tools gated behind
       `--allow-write`
 - [x] Idempotency keys on mutating RPCs; validate/plan/preview paths
+- [x] The CLI never hangs on a silent manager: `LEGION_REQUEST_TIMEOUT`
+      (30s) on every call but streams and whole-store operations,
+      `LEGION_CONNECT_TIMEOUT` (5s), and both failures as retryable envelope
+      errors (`DeadlineExceeded`, `Unavailable`) (AWS spot check P2).
+      [calls](calls/join-token-file-and-cli-timeouts_calls.md) ·
+      [docs](../docs/agent-readiness.md#connecting)
 
 ## UI
 
@@ -5119,6 +5476,14 @@ outcomes are in the plan's §8; what it deferred is open above under
       quiet restart for raft members
       ([raft-operations.md](../docs/raft-operations.md),
       [node-liveness.md](../docs/node-liveness.md)).
+- [x] **Calls that dial a manager by address work after a failover**
+      (found on the AWS run, 2026-10-12). Only the join token's manager had a
+      recorded CA pin, so after a leader failover every artifact pull that
+      needed a KV credential failed with `no cluster CA pin for the manager
+      at ...`. Trust is now shared per cluster: every manager address the
+      cluster reports maps to the token's verifier, and the JWKS is fetched
+      from the active manager (calls 53,
+      [architecture-managers-workers.md](../docs/architecture-managers-workers.md#managers-a-worker-can-reach)).
 - [x] **Linux containers** (P0-7, P1-6, P2-6, P2-9, P2-11): Docker's default
       capabilities less `NET_RAW` with `security.capabilities` bounded by
       `container.allowCaps`, ownership kept on extraction, reopenable stdio,
@@ -5133,9 +5498,172 @@ outcomes are in the plan's §8; what it deferred is open above under
       keep their cause, `kv get` misses exit non-zero, `--json` on every
       command and camelCase everywhere ([logging.md](../docs/logging.md),
       [agent-readiness.md](../docs/agent-readiness.md)).
+- [x] **The Managers page lists every raft member** (P2-12, found on the
+      second AWS pass): the page read the config table, which only the
+      control-lane leader writes, so a three-voter cluster showed one
+      manager. New `ListManagers` RPC (`legion raft members`, MCP
+      `legion_manager_list`) reads the replicated membership and probes each
+      member live, so any manager, leader or follower, lists them all with
+      role, address, reachability, term, and applied index. Config rows are
+      now keyed by the raft node id instead of the shared `0.0.0.0:4747`
+      listener address ([raft-operations.md](../docs/raft-operations.md#members),
+      [ui-architecture.md](../docs/ui-architecture.md);
+      [calls](calls/managers-page-raft-members_calls.md)).
 - [x] **Small fixes from the earlier read-through**: `tls-edge.ncl` listens
       on its advertised port on Linux, and `internal_docs/development.md`
       points workers at :4747.
+- [x] **Memory resumes on cloud-hypervisor always booted cold** (found on
+      the AWS sandbox run, 2026-10-12): the node attribute read `51.2` from
+      the `--version` banner and the checkpoint `51.2.0` from `vmm.ping`, and
+      compat compared strings. VMM versions are now recorded and compared as
+      `MAJOR.MINOR.PATCH`, and a local checkpoint its node refuses settles
+      within a sweep instead of waiting out `resumeTimeout`
+      ([suspend-and-resume.md](../docs/suspend-and-resume.md#where-a-restore-can-run)).
+
+## AWS spot-check re-run fixes (2026-10-12)
+
+Bug fixes, no plan. Uncommitted at the time of writing.
+
+- [x] **A job-level volume claim killed the leader's raft core.** The
+      work-stream projection looked up `allocation.job_id`, a column that
+      does not exist, inside the state machine's apply once any worker
+      streamed. openraft treats an apply error as fatal, so the leader's
+      `RaftCore` stopped and the cluster went leaderless until a restart.
+      Fixed the lookup (through `job_config`), and made every post-commit
+      projection infallible: a failure now rebuilds the read model and
+      resyncs every work stream instead of failing the apply. Snapshot
+      installs rebuild the same state and now resync work streams too
+      ([architecture-managers-workers.md](../docs/architecture-managers-workers.md)).
+      Volume UPDATEs (mount reports) now reach the work stream as well.
+- [x] **A task that fails on every start was re-placed every 30s forever.**
+      The manager's reschedule delay now doubles per consecutive failure,
+      capped at 30m
+      ([jobs-tasks-and-scheduling.md](../docs/jobs-tasks-and-scheduling.md#manager-side-move-logic)).
+- [x] **The reschedule backoff was invisible, and other evals ignored it.**
+      On the rig a keyed instance sat `rescheduling` with nothing saying
+      why, while the capacity pass re-placed it about once a minute despite
+      `delay_secs: 1800`. The failure's removal op now records a replicated
+      reschedule hold (`reschedule_hold`, also the move history, so every
+      manager backs off the same), the planner leaves held replacements
+      unplaced in every `Reschedule` plan, and the replacement is a
+      replicated delayed eval instead of a timer in one manager's memory.
+      Operators get an `allocation.reschedule_deferred` event per deferral
+      and `allocation.reschedule_exhausted` when the budget runs out,
+      a `rescheduling:` detail on `instance get/list`, the waiting
+      replacements on `job info` (`InstanceInfo.reschedule_backoff`,
+      `Job.reschedule_backoffs`), and `instance start` lifts one keyed
+      instance's hold (`--force-reschedule` lifts the job's)
+      ([jobs-tasks-and-scheduling.md](../docs/jobs-tasks-and-scheduling.md#manager-side-move-logic),
+      [event-stream.md](../docs/event-stream.md),
+      [calls](calls/launch-spot-check-fixes-plan_calls.md#55-the-reschedule-backoff-is-a-replicated-hold-the-planner-honors-not-a-timer)).
+      [calls](calls/launch-spot-check-fixes-plan_calls.md#54-the-reschedule-backoff-is-a-replicated-hold-the-planner-honors-not-a-timer)).
+- [x] **A failed slot instance could never go back to its node (rig
+      P0, P1-3's last case).** `fullstack-db-0` (local-dir, `size = "2G"`)
+      failed on sc-wkr-1 and every rollout tick said "healthy but has no
+      room" on a node 12% reserved: the disk-fit check charged the volume's
+      `size` again on the node that already holds it, and that node's free
+      disk read under 2 GiB. An instance returning to its volume's node is
+      no longer charged its storage. The pinned-node message also replaces
+      the generic "no available nodes … preemption did not run" when the
+      pinned node is not a candidate at all, and reads the scheduler's own
+      view of the node. `instance start` now retries a `rescheduling`
+      slot instance too. Covered for the reschedule eval (after the
+      backoff, other node free or full), `--force-reschedule`, `instance
+      start`, and rollouts (failure before or during the rollout)
+      ([volumes.md](../docs/volumes.md),
+      [jobs-tasks-and-scheduling.md](../docs/jobs-tasks-and-scheduling.md#manager-side-move-logic),
+      [calls](calls/launch-spot-check-fixes-plan_calls.md) 57 to 59).
+- [x] **Two seeded saved queries** (`agent:recent-failed-evals`,
+      `agent:pending-evals`) named eval columns that do not exist (`kind`,
+      `node_name`). Fixed, with a test that runs every seeded query.
+- [x] **One allocation was launched twice, and the two launches deleted
+      each other's rootfs.** The heartbeat's reconcile and the work stream
+      (or a push) each decide to launch under their own lock, with identity
+      delivery awaited in between. A second dispatch of an allocation still
+      staging artifacts tore the staging down and restaged it, the first
+      staging thread launched anyway, and the cancelled launch's teardown
+      removed `allocs/<id>` under the live one. Seen as `python:3.12-alpine`
+      failing with "No such file or directory while canonicalizing
+      .../zoneinfo/Asia/Hong_Kong". A duplicate of the same payload while
+      staging is now ignored, and a staging thread starts its allocation
+      only while its generation is still the current one.
+- [x] **Layer extraction followed host symlinks and refused cross-layer
+      replacements.** It now resolves paths inside the rootfs (an image's
+      `lib -> /usr/lib` works, and a whiteout under an absolute symlink no
+      longer deletes the host file it names), lets a hard link replace a
+      lower layer's file, and lets a file replace a directory
+      ([task-runtime-container.md](../docs/task-runtime-container.md)).
+- [x] **One `~/.legion/token` served every cluster.** A second local manager
+      left the file alone and the CLI presented the other cluster's token.
+      Stored tokens are now keyed by manager address
+      (`~/.legion/tokens/<host>_<port>`) for `legion login`, `logout`, the
+      CLI lookup and the manager's first-start write, which replaces a stale
+      file for its own address. An `Unauthenticated` hint names the file and
+      address the CLI used
+      ([auth-and-acls.md](../docs/auth-and-acls.md#where-the-initial-token-goes),
+      [calls](calls/launch-spot-check-fixes-plan_calls.md#51-stored-cli-tokens-are-keyed-by-manager-address-and-a-first-start-replaces-the-file-for-its-address)).
+- [x] **The CLI panicked on a closed pipe.** One-shot commands restore the
+      default SIGPIPE disposition and end with status 141 like `cat`
+      (`tests/cli_closed_pipe.rs`,
+      [calls](calls/launch-spot-check-fixes-plan_calls.md#58-a-one-shot-cli-command-dies-by-sigpipe-status-141-on-a-closed-pipe)).
+- [x] **`state query` user errors were `Internal`, with an ANSI tracing
+      line.** SQL that does not compile or names a missing column or table
+      is `InvalidArgument` with SQLite's message. CLI handlers no longer
+      carry `#[instrument(err)]`, which printed every command error a
+      second time on stdout
+      ([codebase-conventions.md](../docs/codebase-conventions.md#tracing-and-diagnostics),
+      [calls](calls/launch-spot-check-fixes-plan_calls.md#59-cli-handlers-drop-instrumenterr-across-srccmd-not-only-on-state-query)).
+- [x] **Server errors named proto fields.** `net policy test`, session task
+      selection, `job scale` and `state query` now name the CLI flag
+      (`--task`, `--group`, `--allow-write`) with the API field in
+      parentheses.
+- [x] **Node attrs were JSON strings in the MCP tools.** `legion_node_list`,
+      `legion_node_claims` and `legion_node_drain` return `configAttrs`,
+      `fingerprintAttrs`, `dynamicAttrs` and `healthChecks` as objects, like
+      `legion node list --json`
+      ([calls](calls/launch-spot-check-fixes-plan_calls.md#62-mcp-decodes-node-attributes-in-the-tool-layer-the-proto-keeps-json-text)).
+- [x] **A worker restart's effect on mesh connections was undocumented.**
+      [upgrades.md](../docs/upgrades.md#restarting-a-worker-in-place) and
+      [architecture-managers-workers.md](../docs/architecture-managers-workers.md#running-a-worker-under-a-service-manager)
+      now say re-adopted tasks keep running but lose in-flight datapath
+      connections, so apps should reconnect. Keeping the datapath alive
+      stays open.
+- [x] **The macOS spot-check config said "no ACLs".** The comment and
+      RUNBOOK section 10 now say where the token is.
+- [ ] **A count=1 job got repeated second placements after a KV env-change
+      restart** (kv-demo: 1273, 1274 failing on sc-wkr-2 every ~90s while
+      1272 served on sc-wkr-1). Not root-caused from the code. A reschedule
+      plan counts only allocations of its own `job_config_id`, so check
+      whether the failing allocations ran a different config than 1272 and
+      whether `job_config_unwanted_reason` let a superseded config through.
+- [ ] **Layer extraction applies directory modes as it goes.** A layer
+      whose directory is read-only (`0555`) and has entries after it fails
+      for a worker that is not root. Root bypasses the mode, so the Linux
+      worker is unaffected. Deferring directory modes to the end of a layer,
+      as `tar::Archive::unpack` does, would fix it.
+- [x] **`job plan` errored where `job run` would preempt.** The victims were
+      younger than `victimExemptAge`, so the plan failed "no available
+      nodes", and the submit blocked until unrelated churn woke it. The plan
+      now shows the victims with how long the submit waits
+      (`PlannedPreemption.eligible_in_seconds`), and the submit's eval
+      retries when they age past the guard instead of waiting for a capacity
+      event
+      ([preemption-and-eviction.md](../docs/preemption-and-eviction.md#previewing-before-you-displace-anyone),
+      [scheduler-and-eval-loop.md](../docs/scheduler-and-eval-loop.md#what-blocks),
+      [calls](calls/launch-spot-check-fixes-plan_calls.md#64-job-plan-previews-a-preemption-that-only-waits-on-victimexemptage-and-the-submit-retries-on-the-clock)).
+- [x] **Instance JSON showed `nodeId: null`** for every active row-backed
+      instance. `nodeId` is now the current allocation's node, and
+      `instance list` has a NODE column
+      ([stateful-workloads.md](../docs/stateful-workloads.md),
+      [calls](calls/launch-spot-check-fixes-plan_calls.md#66-an-instances-node-is-read-from-its-current-allocation-not-stored-on-the-row)).
+- [x] **Stopping the macOS manager left its Apple containers running.** The
+      in-process worker of `--run-worker` on macOS now stops every task on
+      SIGTERM or SIGINT, and the next start runs them again. On every
+      platform the in-process worker no longer exits the process under the
+      manager's drain
+      ([task-runtime-container.md](../docs/task-runtime-container.md#stopping-a-single-process-cluster-macos),
+      [calls](calls/launch-spot-check-fixes-plan_calls.md#65-the-macos-in-process-worker-stops-its-tasks-on-a-clean-shutdown-and-the-next-start-runs-them-again)).
+      *Unit-tested; not yet re-run on a Mac.*
 
 ## Architecture audit (2026-10-09)
 
@@ -5157,3 +5685,34 @@ outcomes are in the plan's §8; what it deferred is open above under
       failure (M2), graceful SIGTERM (M3), a KV reconciliation sweep (M4), a
       proto breaking-change check in CI (M5), plugin build fingerprints (M6,
       partial).
+
+## Sandbox spot check (2026-10-12): pressure, preemption, volumes
+
+Found on the live AWS rig (3 raft managers, 2 workers). Bug fixes, so no plan.
+
+- [x] **`node.pressure` events were never journaled.** A follower leads no
+      lane in `single` topology, so standalone events it emitted while
+      handling a heartbeat were dropped. A manager that leads no lane now
+      forwards them (`ForwardableLaneWrite::EmitEvent`;
+      [event-stream.md](../docs/event-stream.md),
+      [calls](calls/durability-and-ops-execution-plan_calls.md) entry 15).
+- [x] **A bursting hog was re-placed and evicted every 1-2 minutes.**
+      `evict-bursting` now spends the task's `on_unhealthy` move budget
+      (`move_delay`, `move_count`), like a failed allocation; `evict-reserved`
+      still replaces at once
+      ([resource-enforcement.md](../docs/resource-enforcement.md#memory-pressure)).
+- [x] **Preemption took a `normal` victim while `low` work would do.** The
+      `victimExemptAge` guard no longer pushes a placement up the band ladder
+      ([preemption-and-eviction.md](../docs/preemption-and-eviction.md#which-of-them-are-taken)).
+- [x] **`legion volume list` showed destroyed tombstones by default.** Hidden
+      now; `--all` (`include_destroyed`) or `--state destroyed` shows them
+      ([volumes.md](../docs/volumes.md#lifecycle)).
+- [ ] **Pressure evictions still loop forever by default.** `move_count` is
+      unlimited, so the move delay only slows the loop; the exponential move
+      backoff (`move_backoff` in `src/manager/server.rs`) widens it once it
+      lands. The scheduler also has no memory of pressure, so the replacement
+      can land on the node that evicted it.
+- [ ] **The preemption floor counts only loaded nodes.** `load_candidates`
+      in `src/manager/scheduler.rs` builds `task_running` from the candidate
+      nodes' rows, not the fleet, so `disruption.minAvailable` can bind
+      tighter than documented when a task runs on nodes outside the pass.

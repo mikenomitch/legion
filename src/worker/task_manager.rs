@@ -211,6 +211,52 @@ pub struct DrainingAllocation {
     until: std::time::Instant,
 }
 
+/// One task an exiting in-process worker stops on its way out
+/// ([`WorkerTaskManager::take_tasks_for_shutdown`]), with everything the
+/// stop needs once the task manager is no longer involved.
+pub struct ShutdownStop {
+    allocation: Allocation,
+    task: TaskConfig,
+    instance: TaskInstance,
+    plugin: Arc<crate::task_plugins::LoadedTaskPlugin>,
+}
+
+impl ShutdownStop {
+    pub fn allocation_id(&self) -> i64 {
+        self.allocation.id
+    }
+
+    /// Stop the task the way a reconcile does, signal first and hard
+    /// teardown last, with the grace window cut short at `deadline`. Blocks,
+    /// so callers run each on its own blocking thread.
+    pub fn run(mut self, deadline: std::time::Instant) {
+        let stop = self.task.stop_config();
+        let grace = stop
+            .kill_after
+            .min(deadline.saturating_duration_since(std::time::Instant::now()));
+        // No stop notice: the platform is not moving this work anywhere, and
+        // the next start brings it back under the same allocation.
+        let ctx = StopContext::with_ladder(StopCause::Unknown, &stop.signal, grace);
+        let plugin = &self.plugin.plugin;
+        let signalled = plugin
+            .stop_with(&self.allocation, &self.task, &mut self.instance, &ctx)
+            .unwrap_or(false);
+        if signalled {
+            while !ctx.expired() && WorkerTaskManager::instance_process_alive(&mut self.instance) {
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+        }
+        if let Err(err) = plugin.stop(&self.allocation, &self.task, &mut self.instance) {
+            warn!(
+                allocation_id = self.allocation.id,
+                task_name = %self.task.name,
+                error = ?err,
+                "Failed to stop task at worker shutdown"
+            );
+        }
+    }
+}
+
 /// Why [`WorkerTaskManager::reap_terminating`] finished an allocation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReapOutcome {
@@ -219,6 +265,18 @@ pub enum ReapOutcome {
     /// The grace window closed with the process still running, so it was
     /// SIGKILLed.
     Killed,
+}
+
+/// What a staging thread may do once its fetch returns
+/// ([`WorkerTaskManager::finish_staging`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StagingVerdict {
+    /// Still the allocation's latest staging: start it.
+    Current,
+    /// A re-dispatch with a different payload restaged the allocation.
+    Superseded,
+    /// The allocation was stopped or failed while staging.
+    Gone,
 }
 
 /// A staging job handed to a dedicated thread: everything needed to fetch a
@@ -241,6 +299,9 @@ pub struct StagingJob {
         crate::structs::checkpoint::SnapshotManifest,
         crate::checkpoint_seal::PartKeys,
     )>,
+    /// This staging's entry in [`WorkerTaskManager::staging`]. The thread
+    /// may start the allocation only while it is still the current one.
+    generation: u64,
 }
 
 impl StagingJob {
@@ -605,6 +666,10 @@ pub struct WorkerTaskManager {
     state_store: WorkerStateStore,
     /// Root of per-allocation directories: `<state dir>/allocs/<alloc_id>/<task>/`.
     alloc_root: PathBuf,
+    /// Where checkpointable sandboxes keep their device links
+    /// ([`TaskInstance::device_link_root`]): `<data dir>/vmdev`, never under
+    /// the worker-id-keyed state dir.
+    device_link_root: PathBuf,
     artifact_status: ArtifactStatusBoard,
     stager: Arc<ArtifactStager>,
     /// The node content store (`None` when disabled or it failed to open).
@@ -643,6 +708,14 @@ pub struct WorkerTaskManager {
     /// [`UnlockedLaunch`]). While listed, the allocation sits in `instances`
     /// as a pid-less placeholder, exactly like one that is staging artifacts.
     launching: HashMap<i64, u64>,
+    /// Allocations whose artifacts a staging thread is fetching, keyed to
+    /// that staging's generation (drawn from `next_launch_generation`). A
+    /// duplicate dispatch of the same payload while listed is ignored, and a
+    /// staging thread whose generation is no longer listed (the allocation
+    /// was stopped, failed, or re-dispatched with a new payload) starts
+    /// nothing: two threads launching one allocation would build its bundle
+    /// in the same directory at once.
+    staging: HashMap<i64, u64>,
     /// Launches stopped or failed while their runtime was still working.
     /// The launch thread tears them down when the runtime call returns, and
     /// the id cannot be launched again until it has.
@@ -760,6 +833,7 @@ impl WorkerTaskManager {
             drain_window: std::time::Duration::ZERO,
             state_store,
             alloc_root,
+            device_link_root: Self::default_device_link_root(),
             artifact_status: ArtifactStatusBoard::new(),
             stager: Arc::new(ArtifactStager::new(
                 WorkerArtifactFetchConfigFull::default(),
@@ -785,6 +859,7 @@ impl WorkerTaskManager {
             // constructor runs before the daemon has read that config.
             resources: NodeResourceGovernor::disabled(),
             launching: HashMap::new(),
+            staging: HashMap::new(),
             cancelled_launches: std::collections::HashSet::new(),
             next_launch_generation: 0,
             checkpoints: Default::default(),
@@ -882,6 +957,21 @@ impl WorkerTaskManager {
         // the exec cwd — all of which break if they are relative (a command
         // resolved against a cwd that is itself the task dir). Absolutize
         // once here.
+        if root.is_absolute() {
+            root
+        } else {
+            std::env::current_dir()
+                .map(|cwd| cwd.join(&root))
+                .unwrap_or(root)
+        }
+    }
+
+    /// `<data dir>/vmdev`, absolute. A VMM reopens a restored guest's disks
+    /// at the link paths it captured, so this must be the same on every node
+    /// a checkpoint can move between: the data dir is, the worker id in the
+    /// state dir's path is not.
+    fn default_device_link_root() -> PathBuf {
+        let root = crate::constants::data_dir().join("vmdev");
         if root.is_absolute() {
             root
         } else {
@@ -1107,13 +1197,18 @@ impl WorkerTaskManager {
 
     /// Applies the worker's artifact fetch settings and credential source
     /// (called once after pre-registration delivers the worker config).
+    /// `content_store_target` is the worker's `contentStore`, whose
+    /// credential reads published snapshot parts under its URL.
     pub fn configure_artifacts(
         &mut self,
         config: WorkerArtifactFetchConfigFull,
         credentials: Box<dyn CredentialSource>,
+        content_store_target: Option<crate::content_publish::ContentStoreTarget>,
     ) {
         self.stager = Arc::new(
-            ArtifactStager::new(config, credentials).with_content_store(self.content_store.clone()),
+            ArtifactStager::new(config, credentials)
+                .with_content_store(self.content_store.clone())
+                .with_content_store_target(content_store_target),
         );
     }
 
@@ -1215,8 +1310,10 @@ impl WorkerTaskManager {
         load_builtin_plugins_into(&mut self.registry);
     }
 
-    pub fn readiness_checks(&self) -> Map<String, Value> {
-        self.registry.readiness_checks()
+    /// The loaded task plugins, to probe readiness with the lock released
+    /// ([`crate::task_plugins::readiness_of`]).
+    pub fn plugin_handles(&self) -> Vec<Arc<crate::task_plugins::LoadedTaskPlugin>> {
+        self.registry.plugin_handles()
     }
 
     /// The allocation ids this node is running, as the **manager** knows
@@ -1893,6 +1990,28 @@ impl WorkerTaskManager {
         self.terminated_reports.extend(reports);
     }
 
+    /// Put back the terminal reports a manager answered but could not record
+    /// (`HeartbeatReply.retry_terminated_allocations`), so the next heartbeat
+    /// sends them again. A report for an allocation this node no longer holds
+    /// is dropped: the manager removed it, and there is nothing left to
+    /// complete. That is also what ends the retries for a report no manager
+    /// will ever accept.
+    pub fn requeue_unrecorded_terminations(
+        &mut self,
+        sent: Vec<TerminatedAllocationReport>,
+        retry: &[i64],
+    ) {
+        if retry.is_empty() {
+            return;
+        }
+        let requeue = sent
+            .into_iter()
+            .filter(|report| retry.contains(&report.allocation_id))
+            .filter(|report| self.has_allocation(report.allocation_id))
+            .collect::<Vec<_>>();
+        self.terminated_reports.extend(requeue);
+    }
+
     /// Failures owed to the manager, addressed by the ids it knows. A
     /// failure on unratified provisional work is dropped for the same reason
     /// a terminal report is: there is nothing for the manager to reschedule,
@@ -1976,9 +2095,15 @@ impl WorkerTaskManager {
         let task_dir = alloc_dir.join(&task.name);
         std::fs::create_dir_all(&task_dir)
             .with_context(|| format!("create task directory {}", task_dir.display()))?;
-        // Owner-only: the alloc dir is the isolation boundary between
-        // allocations sharing a node — other tasks must not be able to reach
-        // this allocation's artifacts, injected secrets, or output.
+        // The alloc dir is the isolation boundary between allocations sharing
+        // a node: other tasks must not be able to reach this allocation's
+        // artifacts, injected secrets, or output. Owner-only here. A runtime
+        // whose process is not the worker's user widens it to exactly that
+        // process (`exec` chowns the tree to its `user`, a user-namespaced
+        // container grants its own id range traversal). The `allocs/` root
+        // above it is traverse-only, so those processes can reach their own
+        // directory, and no one can list the others.
+        crate::util::restrict_dir_to_traverse_only(&self.alloc_root)?;
         crate::util::restrict_dir_to_owner(&alloc_dir)?;
         crate::util::restrict_dir_to_owner(&task_dir)?;
         let mut instance = TaskInstance::default();
@@ -1999,6 +2124,7 @@ impl WorkerTaskManager {
                 .to_string(),
         );
         instance.alloc_dir = Some(alloc_dir);
+        instance.device_link_root = Some(self.device_link_root.clone());
         instance.task_dir = Some(task_dir);
         Ok(instance)
     }
@@ -2023,6 +2149,8 @@ impl WorkerTaskManager {
             .allocations
             .get(&allocation_id)
             .is_some_and(crate::task_plugins::allocation_is_gated);
+        // A staging thread still fetching sees this and starts nothing.
+        self.staging.remove(&allocation_id);
         // A launch still inside its runtime call is cancelled rather than
         // destroyed here: its launch thread owns the real instance and tears
         // it down (runtime, volumes, cores) once the call returns.
@@ -2347,6 +2475,8 @@ impl WorkerTaskManager {
         self.terminated.remove(&allocation_id);
         self.restart_history.remove(&allocation_id);
         self.artifact_status.remove(allocation_id);
+        // A staging thread still fetching sees this and starts nothing.
+        self.staging.remove(&allocation_id);
 
         if self.launching.remove(&allocation_id).is_some() {
             // Its runtime is mid-`prepare`/`start` on a launch thread. Tearing
@@ -2643,6 +2773,52 @@ impl WorkerTaskManager {
         self.persist_state();
     }
 
+    /// Hand over every task this worker is running or still stopping, for
+    /// an in-process worker that stops its work when the process exits
+    /// (macOS single-process dev mode; docs/task-runtime-container.md,
+    /// "Stopping a single-process cluster").
+    ///
+    /// The worker state file is deliberately left as it is. The next start
+    /// finds these processes gone, skips them, and runs what the manager
+    /// still wants on this node again: the same allocations, restarted
+    /// rather than re-adopted.
+    pub fn take_tasks_for_shutdown(&mut self) -> Vec<ShutdownStop> {
+        let mut tasks: Vec<(Allocation, TaskConfig, TaskInstance)> = Vec::new();
+        for (allocation_id, instance) in std::mem::take(&mut self.instances) {
+            if let (Some(allocation), Some(task)) = (
+                self.allocations.get(&allocation_id).cloned(),
+                self.task_configs.get(&allocation_id).cloned(),
+            ) {
+                tasks.push((allocation, task, instance));
+            }
+        }
+        for (_, entry) in std::mem::take(&mut self.draining) {
+            tasks.push((entry.allocation, entry.task, entry.instance));
+        }
+        for (_, entry) in std::mem::take(&mut self.terminating) {
+            tasks.push((entry.allocation, entry.task, entry.instance));
+        }
+        tasks
+            .into_iter()
+            .filter_map(|(allocation, task, instance)| {
+                let Some(plugin) = self.registry.plugin_handle(&task.runtime) else {
+                    warn!(
+                        allocation_id = allocation.id,
+                        runtime = %task.runtime,
+                        "No runtime plugin to stop a task at worker shutdown"
+                    );
+                    return None;
+                };
+                Some(ShutdownStop {
+                    allocation,
+                    task,
+                    instance,
+                    plugin,
+                })
+            })
+            .collect()
+    }
+
     /// Finish every terminating allocation whose process has exited, and hard
     /// kill every one whose grace window has closed. Driven by the worker's
     /// task supervisor (once a second), never by the heartbeat path.
@@ -2738,6 +2914,25 @@ impl WorkerTaskManager {
     /// detect cancellation while they were fetching).
     pub fn is_allocation_active(&self, allocation_id: i64) -> bool {
         self.instances.contains_key(&allocation_id)
+    }
+
+    /// Settle a staging thread's claim to start its allocation: `Current`
+    /// (and no longer staging) when it is still the allocation's latest
+    /// staging, `Superseded` when a re-dispatch started a newer one, and
+    /// `Gone` when the allocation was stopped or failed meanwhile.
+    fn finish_staging(&mut self, allocation_id: i64, generation: u64) -> StagingVerdict {
+        match self.staging.get(&allocation_id) {
+            Some(current) if *current == generation => {
+                self.staging.remove(&allocation_id);
+                if self.instances.contains_key(&allocation_id) {
+                    StagingVerdict::Current
+                } else {
+                    StagingVerdict::Gone
+                }
+            }
+            Some(_) => StagingVerdict::Superseded,
+            None => StagingVerdict::Gone,
+        }
     }
 
     /// Open a live exec session against a local allocation. Resolves the task
@@ -3657,6 +3852,38 @@ impl WorkerTaskManager {
             );
             return Ok(BeginOutcome::InFlight);
         }
+        // The same payload again while its artifacts stage: the heartbeat's
+        // reconcile and a push (or the work stream) each decide to launch
+        // under their own lock, with identity delivery awaited in between,
+        // so both can arrive. Restarting the staging would leave two threads
+        // building one bundle directory, each deleting the other's files.
+        if self.staging.contains_key(&alloc.id)
+            && self.allocations.get(&alloc.id) == Some(&alloc)
+            && self.task_configs.get(&alloc.id) == Some(&task)
+        {
+            debug!(
+                allocation_id = alloc.id,
+                "Allocation already staging; ignoring the duplicate dispatch"
+            );
+            return Ok(BeginOutcome::InFlight);
+        }
+        // The same payload again for an allocation this node already runs:
+        // the work stream re-sends its desired set on a resync, and the
+        // heartbeat's reconcile can race it. Nothing changed, so there is
+        // nothing to update; tearing it down (below) would restart a healthy
+        // task, or kill a VMM mid-restore. A changed payload (a config change
+        // reusing the id, or a different restore) still takes the in-place
+        // update path.
+        if self.instances.contains_key(&alloc.id)
+            && self.allocations.get(&alloc.id) == Some(&alloc)
+            && self.task_configs.get(&alloc.id) == Some(&task)
+        {
+            debug!(
+                allocation_id = alloc.id,
+                "Allocation already running with this payload; ignoring the duplicate dispatch"
+            );
+            return Ok(BeginOutcome::InFlight);
+        }
         // The manager resolved these against the volume table, so they carry
         // concrete ids and the driver attrs from previous mounts. Recorded
         // before any start path so both the direct and post-staging routes
@@ -3819,6 +4046,9 @@ impl WorkerTaskManager {
                 std::time::Duration::from_secs(allocation.self_terminate_after_seconds),
             );
         }
+        self.next_launch_generation += 1;
+        let generation = self.next_launch_generation;
+        self.staging.insert(alloc.id, generation);
 
         Ok(BeginOutcome::Staging(Box::new(StagingJob {
             allocation: alloc,
@@ -3828,6 +4058,7 @@ impl WorkerTaskManager {
             stager: self.stager.clone(),
             board: self.artifact_status.clone(),
             restore_fetch,
+            generation,
         })))
     }
 
@@ -4366,6 +4597,7 @@ impl WorkerTaskManager {
                 .extra_env
                 .insert("LEGION_TASK_DIR".into(), task_dir.display().to_string());
             instance.alloc_dir = Some(alloc_dir);
+            instance.device_link_root = Some(self.device_link_root.clone());
             instance.task_dir = Some(task_dir);
             // Re-adopt the CPU/memory assignment this worker handed out
             // before it restarted, so the allocator does not hand a running
@@ -4491,6 +4723,16 @@ impl WorkerTaskManager {
         // One mask write for the whole restored set, after every
         // reservation is back in the allocator's view.
         self.resources.resync_masks();
+        // Every allocation this worker still runs is in `instances` or
+        // finishing its stop now, so any other `legion-<alloc>` leaf is
+        // residue (a crash mid-teardown, a leaked failed start).
+        let instances = &self.instances;
+        self.resources.sweep_orphan_cgroups(|allocation_id| {
+            instances.contains_key(&allocation_id)
+                || resumed_stops
+                    .iter()
+                    .any(|(allocation, ..)| allocation.id == allocation_id)
+        });
         self.persist_state_with(&active);
 
         // After the whole set is persisted, because these persist again as
@@ -4648,6 +4890,7 @@ impl WorkerTaskManager {
                 .extra_env
                 .insert("LEGION_TASK_DIR".into(), task_dir.display().to_string());
             instance.alloc_dir = Some(alloc_dir);
+            instance.device_link_root = Some(self.device_link_root.clone());
             instance.task_dir = Some(task_dir);
             if let Some(assignment) = process.resource_assignment.as_ref() {
                 self.resources.restore(local_key, assignment);
@@ -5145,7 +5388,7 @@ pub fn launch_task_allocation(
         match guard.begin_task_allocation(allocation) {
             Ok(outcome) => outcome,
             Err(err) => {
-                guard.record_failure(allocation.allocation_id, err.to_string());
+                guard.record_failure(allocation.allocation_id, format!("{err:#}"));
                 return Err(err);
             }
         }
@@ -5333,12 +5576,19 @@ fn spawn_provisional_staging_thread(
 
             let started = {
                 let mut guard = manager.lock().expect("task manager");
-                if !guard.is_allocation_active(allocation_id) {
-                    debug!(allocation_id, "Claim removed while staging artifacts");
-                    if job.restore_fetch.is_some() {
-                        guard.release_restore_fetch_pins(allocation_id);
+                match guard.finish_staging(allocation_id, job.generation) {
+                    StagingVerdict::Current => {}
+                    StagingVerdict::Superseded => {
+                        debug!(allocation_id, "Claim re-dispatched while staging artifacts");
+                        return;
                     }
-                    return;
+                    StagingVerdict::Gone => {
+                        debug!(allocation_id, "Claim removed while staging artifacts");
+                        if job.restore_fetch.is_some() {
+                            guard.release_restore_fetch_pins(allocation_id);
+                        }
+                        return;
+                    }
                 }
                 let claim_id = claim_for_thread.as_str();
                 let started = match result.and_then(|staged| {
@@ -5410,14 +5660,26 @@ fn spawn_staging_thread(manager: Arc<Mutex<WorkerTaskManager>>, job: StagingJob)
             const START_FAILED: &str = "start after artifact staging failed: ";
             let launch = {
                 let mut guard = manager.lock().expect("task manager");
-                if !guard.is_allocation_active(allocation_id) {
-                    if job.restore_fetch.is_some() {
-                        guard.release_restore_fetch_pins(allocation_id);
+                match guard.finish_staging(allocation_id, job.generation) {
+                    StagingVerdict::Current => {}
+                    StagingVerdict::Superseded => {
+                        // A re-dispatch with a new payload restaged it; that
+                        // thread starts it (and owns any restore pins).
+                        debug!(
+                            allocation_id,
+                            "Allocation re-dispatched while staging artifacts"
+                        );
+                        return;
                     }
-                    // Stopped while staging; stop_allocation already cleaned
-                    // the directories and status rows.
-                    debug!(allocation_id, "Allocation removed while staging artifacts");
-                    return;
+                    StagingVerdict::Gone => {
+                        if job.restore_fetch.is_some() {
+                            guard.release_restore_fetch_pins(allocation_id);
+                        }
+                        // Stopped while staging; stop_allocation already
+                        // cleaned the directories and status rows.
+                        debug!(allocation_id, "Allocation removed while staging artifacts");
+                        return;
+                    }
                 }
                 let staged = match result {
                     Ok(staged) => staged,
@@ -6302,6 +6564,7 @@ mod tests {
         manager.configure_artifacts(
             crate::structs::WorkerArtifactFetchConfigFull::default(),
             Box::new(crate::artifacts::AnonymousCredentials),
+            None,
         );
         Ok(Arc::new(Mutex::new(manager)))
     }
@@ -8168,7 +8431,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn alloc_and_task_dirs_are_owner_only() -> R<()> {
+    fn alloc_and_task_dirs_are_owner_only_under_a_traverse_only_root() -> R<()> {
         use std::os::unix::fs::PermissionsExt;
 
         let temp_dir = TempDir::new()?;
@@ -8182,8 +8445,10 @@ mod tests {
 
         // The alloc dir is the isolation boundary between tasks on the node:
         // anything looser than 0700 exposes artifacts/secrets/output to
-        // every other local process.
-        let alloc_dir = temp_dir.path().join("allocs").join("5");
+        // every other local process. (Only a runtime whose process is not
+        // the worker's user widens it, to that process alone.)
+        let alloc_root = temp_dir.path().join("allocs");
+        let alloc_dir = alloc_root.join("5");
         for dir in [alloc_dir.clone(), alloc_dir.join("exec-task")] {
             let mode = std::fs::metadata(&dir)?.permissions().mode() & 0o777;
             assert_eq!(
@@ -8193,6 +8458,11 @@ mod tests {
                 dir.display()
             );
         }
+        // The root above them is traverse-only: a user-namespaced container
+        // root or an exec task's `user` must reach its own alloc dir by
+        // path, but nobody may list the allocations on the node.
+        let mode = std::fs::metadata(&alloc_root)?.permissions().mode() & 0o777;
+        assert_eq!(mode, 0o711, "allocs/ must be traverse-only, got {mode:o}");
         Ok(())
     }
 
@@ -8349,6 +8619,60 @@ mod tests {
                 .is_empty(),
             "a finished stop leaves nothing persisted"
         );
+        Ok(())
+    }
+
+    /// Spot check 2026-10-12: stopping `legion start manager --run-worker`
+    /// on macOS left its Apple containers running. The in-process worker
+    /// there stops every task on its way out, signal first, and leaves the
+    /// state file alone, so the next start finds the process gone and runs
+    /// the allocation again rather than adopting a stranger.
+    #[test]
+    fn a_shutdown_stop_ends_running_and_stopping_tasks_and_keeps_their_records() -> R<()> {
+        let temp_dir = TempDir::new()?;
+        let mut manager = manager_in(&temp_dir);
+        let ready = temp_dir.path().join("ready");
+        let stopped = temp_dir.path().join("stopped");
+        // Exits on SIGTERM, leaving a mark that it got the signal rather
+        // than a SIGKILL.
+        let task = TaskConfig {
+            config: json!({
+                "command": [
+                    "sh",
+                    "-c",
+                    format!(
+                        "trap ': > \"{}\"; exit 0' TERM; : > '{}'; while :; do sleep 0.1; done",
+                        stopped.display(),
+                        ready.display()
+                    ),
+                ],
+            }),
+            ..TaskConfig::new("api", "exec")
+        };
+        manager.run_allocation(&alloc(), &task)?;
+        wait_for_marker(&ready);
+        let pid = manager.allocation_pid(alloc().id).expect("pid");
+
+        let stops = manager.take_tasks_for_shutdown();
+        assert_eq!(
+            stops
+                .iter()
+                .map(ShutdownStop::allocation_id)
+                .collect::<Vec<_>>(),
+            vec![alloc().id]
+        );
+        for stop in stops {
+            stop.run(std::time::Instant::now() + Duration::from_secs(10));
+        }
+        assert!(!pid_is_running(pid), "the task is gone");
+        assert!(stopped.exists(), "it got its stop signal before any kill");
+
+        // The record stays, so a restart knows the allocation, finds its
+        // process gone, and leaves it for the manager to run again.
+        let persisted = WorkerStateStore::new(temp_dir.path().join("worker_state.json")).load()?;
+        assert_eq!(persisted.len(), 1);
+        let mut restarted = manager_in(&temp_dir);
+        assert!(restarted.restore_allocations()?.is_empty());
         Ok(())
     }
 
@@ -9285,6 +9609,94 @@ mod tests {
         Ok(())
     }
 
+    fn staging_payload(allocation_id: i64, command: &str) -> R<TaskAllocation> {
+        let artifacts = vec![ArtifactSpec::from_source("https://example.com/image.tar")];
+        Ok(TaskAllocation {
+            allocation_id,
+            job_id: "job".into(),
+            job_config_id: "job-1".into(),
+            node_id: "node-1".into(),
+            task_config_id: 1,
+            task_name: "web".into(),
+            task_runtime: "exec".into(),
+            task_config: json!({ "command": [command] }).to_string(),
+            task_artifacts: serde_json::to_string(&artifacts)?,
+            ..Default::default()
+        })
+    }
+
+    fn expect_staging(outcome: BeginOutcome) -> Box<StagingJob> {
+        match outcome {
+            BeginOutcome::Staging(job) => job,
+            _ => panic!("expected the allocation to stage"),
+        }
+    }
+
+    /// The spot-check failure: the heartbeat's reconcile and a streamed
+    /// launch both dispatched one artifact-bearing allocation. The second
+    /// dispatch tore down the staging one and restaged it, so two threads
+    /// built the same bundle directory at once and one deleted the zone
+    /// file the other's next hard link needed ("No such file or directory
+    /// while canonicalizing .../zoneinfo/Asia/Hong_Kong"). The duplicate is
+    /// now ignored, and only the one staging thread may start it.
+    #[test]
+    fn a_duplicate_dispatch_while_staging_is_ignored() -> R<()> {
+        let temp_dir = TempDir::new()?;
+        let mut manager = manager_in(&temp_dir);
+        let payload = staging_payload(21, "serve")?;
+
+        let job = expect_staging(manager.begin_task_allocation(&payload)?);
+        assert!(matches!(
+            manager.begin_task_allocation(&payload)?,
+            BeginOutcome::InFlight
+        ));
+        assert_eq!(
+            manager.finish_staging(21, job.generation),
+            StagingVerdict::Current
+        );
+        assert!(manager.is_allocation_active(21));
+        Ok(())
+    }
+
+    /// A re-dispatch with a different payload while staging (an in-place
+    /// update) restages, and the first staging thread stands down instead
+    /// of launching the old payload over the new one.
+    #[test]
+    fn a_changed_redispatch_while_staging_supersedes_the_first_thread() -> R<()> {
+        let temp_dir = TempDir::new()?;
+        let mut manager = manager_in(&temp_dir);
+
+        let first = expect_staging(manager.begin_task_allocation(&staging_payload(22, "v1")?)?);
+        let second = expect_staging(manager.begin_task_allocation(&staging_payload(22, "v2")?)?);
+        assert_eq!(
+            manager.finish_staging(22, first.generation),
+            StagingVerdict::Superseded
+        );
+        assert_eq!(
+            manager.finish_staging(22, second.generation),
+            StagingVerdict::Current
+        );
+        Ok(())
+    }
+
+    /// A stop while staging leaves the staging thread nothing to start.
+    #[test]
+    fn a_stop_while_staging_leaves_the_thread_nothing_to_start() -> R<()> {
+        let temp_dir = TempDir::new()?;
+        let mut manager = manager_in(&temp_dir);
+
+        let job = expect_staging(manager.begin_task_allocation(&staging_payload(23, "serve")?)?);
+        manager.stop_allocation(23)?;
+        assert_eq!(
+            manager.finish_staging(23, job.generation),
+            StagingVerdict::Gone
+        );
+        // And a fresh dispatch afterwards stages again rather than being
+        // mistaken for a duplicate.
+        expect_staging(manager.begin_task_allocation(&staging_payload(23, "serve")?)?);
+        Ok(())
+    }
+
     #[test]
     fn start_staged_allocation_interpolates_and_injects_env() -> R<()> {
         let temp_dir = TempDir::new()?;
@@ -9898,6 +10310,7 @@ mod tests {
                 ..Default::default()
             },
             Box::new(crate::artifacts::AnonymousCredentials),
+            None,
         );
         let source = temp_dir.path().join("tool.sh");
         std::fs::write(&source, "#!/bin/sh\nsleep 30\n")?;

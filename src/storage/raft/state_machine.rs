@@ -645,12 +645,13 @@ impl StoreStateMachine {
         drop(snap);
         let _ = std::fs::remove_file(&staged);
 
-        // The read model caches rows from tables this install may have
-        // replaced; rebuild it from the committed state.
-        self.store.refresh_read_model()?;
-        // The control lane's dump carries `keyring_key`: unwrap whatever
-        // data keys arrived with it.
-        self.store.keyring_rows_changed();
+        // The read model and the work-stream logs describe tables this
+        // install may have replaced, and the control lane's dump carries
+        // `keyring_key`: rebuild them from the committed state. Infallible,
+        // so a cache that cannot reload never stops the raft core over an
+        // install that committed (the check below still catches a DB that
+        // cannot be read at all).
+        self.store.rebuild_node_local_state(true);
 
         // Verify: the applied marker now reported for this lane must equal
         // the snapshot meta.

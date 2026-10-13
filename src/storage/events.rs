@@ -7,7 +7,7 @@
 //! published on an in-process broadcast channel that backs the `StreamEvents`
 //! gRPC stream. See `Store::emit_event`.
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
 use std::time::Duration;
@@ -55,7 +55,10 @@ pub struct SchedulerEventRecord {
 ///         .eval("7"),
 /// );
 /// ```
-#[derive(Debug, Clone)]
+///
+/// Serializable because a manager that leads no raft lane forwards its
+/// standalone events to a lane leader (`ForwardableLaneWrite::EmitEvent`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EventDraft {
     pub kind: String,
     pub level: String,
@@ -671,6 +674,78 @@ pub mod drafts {
             "reason": reason,
             "taskConfigId": task_config_id,
             "jobConfigId": job_config_id,
+        }))
+    }
+
+    /// `allocation.reschedule_deferred` — a failed allocation's replacement
+    /// waits out the task's reschedule backoff (`on_unhealthy.move_delay`,
+    /// doubled per consecutive failure, capped at 30 minutes).
+    /// Nothing re-places the task before `nextAttemptAt` unless an operator
+    /// lifts the hold (`job run --force-reschedule`, or `instance start` for
+    /// one stateful instance). See docs/jobs-tasks-and-scheduling.md.
+    pub fn allocation_reschedule_deferred(
+        hold: &crate::storage::store::RescheduleHold,
+    ) -> EventDraft {
+        let subject = match hold.instance_id.as_deref() {
+            Some(instance_id) => format!("task {} (instance {instance_id})", hold.task_name),
+            None => format!("task {}", hold.task_name),
+        };
+        EventDraft::warn(
+            "allocation.reschedule_deferred",
+            format!(
+                "Replacement for allocation {} of {subject} deferred: {}",
+                hold.allocation_id,
+                hold.summary()
+            ),
+        )
+        .job(&hold.job_id)
+        .node(&hold.node_id)
+        .allocation(hold.allocation_id)
+        .meta(json!({
+            "jobConfigId": hold.job_config_id,
+            "taskConfigId": hold.task_config_id,
+            "task": hold.task_name,
+            "group": hold.group,
+            "instanceId": hold.instance_id,
+            "attempt": hold.attempt,
+            "delaySecs": hold.delay_secs,
+            "nextAttemptAt": hold.next_attempt_at(),
+            "reason": hold.reason,
+        }))
+    }
+
+    /// `allocation.reschedule_exhausted` — a failed allocation found its
+    /// task's move budget spent (`move_count` moves inside `move_period`):
+    /// the task is not moved again, and the job is marked failed (a
+    /// `job.failed` event follows).
+    pub fn allocation_reschedule_exhausted(
+        allocation: &Allocation,
+        task_name: &str,
+        moves: u32,
+        move_count: u32,
+        move_period_secs: u64,
+        reason: &str,
+    ) -> EventDraft {
+        EventDraft::error(
+            "allocation.reschedule_exhausted",
+            format!(
+                "Allocation {} of task {task_name} failed after {moves} moves in {}s \
+                 (move_count {move_count}); marking job {} failed: {reason}",
+                allocation.id, move_period_secs, allocation.job_id
+            ),
+        )
+        .job(&allocation.job_id)
+        .node(&allocation.node_id)
+        .allocation(allocation.id)
+        .meta(json!({
+            "jobConfigId": allocation.job_config_id,
+            "taskConfigId": allocation.task_config_id,
+            "task": task_name,
+            "instanceId": allocation.instance_id,
+            "moves": moves,
+            "moveCount": move_count,
+            "movePeriodSecs": move_period_secs,
+            "reason": reason,
         }))
     }
 
@@ -2177,6 +2252,29 @@ impl EventRecorder<'_> {
             job_id,
             job_config_id,
             task_config_id,
+            reason,
+        ));
+    }
+
+    pub fn allocation_reschedule_deferred(self, hold: &crate::storage::store::RescheduleHold) {
+        self.emit(drafts::allocation_reschedule_deferred(hold));
+    }
+
+    pub fn allocation_reschedule_exhausted(
+        self,
+        allocation: &Allocation,
+        task_name: &str,
+        moves: u32,
+        move_count: u32,
+        move_period_secs: u64,
+        reason: &str,
+    ) {
+        self.emit(drafts::allocation_reschedule_exhausted(
+            allocation,
+            task_name,
+            moves,
+            move_count,
+            move_period_secs,
             reason,
         ));
     }

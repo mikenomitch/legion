@@ -810,6 +810,15 @@ for a task:
   checkpoint, is unavailable;
 - the cluster has no schedulable node at all.
 
+One placement waits on the clock instead of blocking: preemption that could
+make room, but only once its victims age past `preemption.victimExemptAge`.
+No capacity event marks a victim getting older, so a blocked eval would wait
+for an unrelated one. The eval goes back to `pending` with a delay that ends
+when the youngest victim it needs is old enough, and records `eval.blocked`
+with a message that names the wait. A plan that placed part of the job and
+left a replica waiting this way queues a delayed `job_reschedule` instead
+([Preemption and eviction](preemption-and-eviction.md#which-of-them-are-taken)).
+
 Node-scoped passes (`node_lost_reschedule`, `node_drain`, the capacity pass)
 already queue a per-job `job_reschedule` for each job they could not place,
 and that reschedule is what blocks. A `rollout_tick` that cannot place still

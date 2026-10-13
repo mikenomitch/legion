@@ -267,7 +267,7 @@ async fn sign_cmd(matches: &ArgMatches) -> R<()> {
     Ok(())
 }
 
-#[instrument(err, skip_all)]
+#[instrument(skip_all)]
 pub async fn handle(matches: &ArgMatches) -> R<()> {
     match matches.subcommand() {
         Some(("mint", sub)) => mint_cmd(sub).await,

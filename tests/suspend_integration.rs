@@ -730,6 +730,95 @@ async fn a_resume_whose_checkpoint_is_lost_boots_cold_through_the_sweep() -> R<(
     Ok(())
 }
 
+/// Suspend, with the node reporting a capture whose `compat.vmm.version` is
+/// `version` (the test node reports `firecracker` `1.7.0`). Returns the
+/// checkpoint id.
+async fn suspended_with_vmm_version(cluster: &Cluster, version: &str) -> R<String> {
+    let allocation_id = cluster.active_instance()?;
+    let reply = cluster.suspend(None, None).await?;
+    let mut manifest: Value =
+        serde_json::from_str(&manifest(&reply.snapshot_id, allocation_id, &reply.kind))?;
+    manifest["compat"] = json!({
+        "vmm": { "type": "firecracker", "version": version },
+        "cpu": { "vendor": "GenuineIntel", "model": "6:106:6", "features": "3f9a0c21" },
+    });
+    let mut report = capture_ok(&reply.snapshot_id, allocation_id, &reply.kind);
+    report.manifest_json = manifest.to_string();
+    cluster.heartbeat(vec![report]).await?;
+    Ok(reply.snapshot_id)
+}
+
+/// The AWS spot check: cloud-hypervisor's banner said `v51.2` (the node
+/// attribute) and its API said `51.2.0` (the checkpoint), and every resume
+/// fell back to a cold boot. The same release in two spellings resumes.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_checkpoint_resumes_on_its_node_when_the_vmm_version_differs_only_in_spelling() -> R<()> {
+    let cluster = Cluster::new()?;
+    cluster.add_node(json!(["checkpoint"]))?;
+    cluster.submit(job("exec", None))?;
+    let checkpoint = suspended_with_vmm_version(&cluster, "v1.7").await?;
+    let started = cluster.start(false).await?;
+    assert_eq!(started.resuming_from, checkpoint);
+    // The sweep leaves it alone, and placement puts it on its node.
+    settle_stalled_resumes(cluster.store());
+    cluster.reschedule()?;
+    let info = cluster.info().await?;
+    assert!(info.current_alloc_id.is_some(), "the resume was placed");
+    assert_eq!(info.pending_op.as_deref(), Some("resuming"));
+    assert!(info.cold_boot.is_none());
+    assert!(cluster.events("instance.restore_failed")?.is_empty());
+    Ok(())
+}
+
+/// A local checkpoint whose node now runs a different VMM release can never
+/// resume there, so the sweep settles it at once instead of letting every
+/// eval fail until `resumeTimeout`: cold under `"cold"`, back to suspended
+/// (checkpoint kept) under `"fail"`.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_resume_its_node_cannot_run_settles_without_waiting_out_the_timeout() -> R<()> {
+    for policy in ["cold", "fail"] {
+        let cluster = Cluster::new()?;
+        cluster.add_node(json!(["checkpoint"]))?;
+        cluster.submit(job(
+            "exec",
+            Some(SuspendConfig {
+                on_restore_failure: Some(policy.into()),
+                ..Default::default()
+            }),
+        ))?;
+        let checkpoint = suspended_with_vmm_version(&cluster, "1.8.0").await?;
+        cluster.start(false).await?;
+        // Well inside the default 30s resumeTimeout.
+        settle_stalled_resumes(cluster.store());
+        let info = cluster.info().await?;
+        assert!(info.pending_op.is_none(), "{policy}: the resume settled");
+        let failed = cluster.events("instance.restore_failed")?;
+        assert_eq!(failed.len(), 1, "{policy}");
+        let reason = failed[0]["error"].as_str().unwrap_or_default().to_string();
+        assert!(
+            reason.contains("sandbox.vmm.version is \"1.7.0\", the checkpoint needs \"1.8.0\""),
+            "{policy}: {reason}"
+        );
+        if policy == "cold" {
+            let cold = info.cold_boot.context("a cold boot is recorded")?;
+            assert_eq!(cold.snapshot_id, checkpoint);
+            assert!(
+                cold.reason.contains("sandbox.vmm.version"),
+                "{}",
+                cold.reason
+            );
+        } else {
+            assert_eq!(info.state, "suspended");
+            assert_eq!(info.checkpoint_id.as_deref(), Some(checkpoint.as_str()));
+            assert!(info
+                .detail
+                .as_deref()
+                .is_some_and(|detail| detail.contains("sandbox.vmm.version")));
+        }
+    }
+    Ok(())
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn a_worker_without_the_checkpoint_capability_is_named() -> R<()> {
     let cluster = Cluster::new()?;
@@ -1332,8 +1421,17 @@ async fn an_instance_records_its_last_stop_and_its_checkpoint_support() -> R<()>
         Some("node_pressure")
     );
 
-    // A later stop replaces it with the generic sentence for its cause.
+    // A later stop replaces it with the generic sentence for its cause. The
+    // eviction spent the task's move budget, so the replacement waits out a
+    // reschedule backoff: retry it now, as an operator would, so there is a
+    // running allocation to stop.
+    let retried = cluster.start(false).await?;
+    assert!(retried.message.contains("lifted"), "{}", retried.message);
     cluster.reschedule()?;
+    assert!(
+        cluster.info().await?.checkpoint_support.is_some(),
+        "the replacement is running"
+    );
     cluster
         .svc
         .stop_instance(Request::new(StopInstanceRequest {

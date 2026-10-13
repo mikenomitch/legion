@@ -312,8 +312,14 @@ holding or booting anything.
    cached keys**). The JWKS is fetched over TLS that verifies the manager's
    cluster certificate (`manager.legion`) against the cluster CA, so an
    on-path attacker cannot swap the keys
-   ([auth-and-acls.md](auth-and-acls.md#workers-reach-managers-over-tls))
-2. `iss`, `aud == legion:node`, `exp`/`nbf` with bounded clock skew
+   ([auth-and-acls.md](auth-and-acls.md#workers-reach-managers-over-tls)).
+   Every manager serves the same keys, so the node asks the managers it
+   knows in failover order and takes the first answer
+2. `iss` against the cluster issuer, `aud == legion:node`, `exp`/`nbf` with
+   bounded clock skew. The node learns the issuer from the managers
+   (pre-registration and every heartbeat) rather than assuming it is the
+   address in its join token, so a ticket minted on any manager verifies on
+   any node
 3. `legion.io/pool` against this node's own pool
 4. `legion.io/gate` intersected with the task's `speculativeStart.mode` (the
    lower wins)
@@ -473,6 +479,16 @@ skew fails closed.
 }
 ```
 
+Tickets carry the cluster's workload-identity issuer as `iss`. It is one
+value for the whole cluster: set `workloadIdentity.issuer` to the same URL on
+every manager, or leave it unset for the default, which every manager of a
+`raft` or `streaming` cluster shares (`https://manager.legion`) and which is
+the advertised address of a single `localDisk` manager
+([workload-identity.md](workload-identity.md#the-issuer)). A node that
+refuses a ticket with `InvalidIssuer` names the issuer it expected in the
+error. That error means managers disagree on an explicit
+`workloadIdentity.issuer`.
+
 `enabled = false` refuses `IssueBootTicket` and any `RatifyClaim` that
 carries a ticket. **Manager-side speculative dispatch does not need this
 switch.** It adds no new authorization, and a job's own `speculativeStart`
@@ -564,12 +580,10 @@ Upgrade managers in the usual order ([`docs/upgrades.md`](upgrades.md)).
 
 ## Known limitations
 
-- **The JWKS is fetched over the plaintext worker-to-manager channel** unless
-  the manager serves `server.tls`. Someone on the path between an edge node
-  and its manager could swap the keys that verify boot tickets. Keep that
-  path on a trusted network until encrypted worker connections ship
-  ([auth-and-acls.md](auth-and-acls.md#the-worker-plane)). The router-to-node
-  hop (`StartClaim` on 4848) is TLS, verified against the cluster CA.
+- **Managers must agree on an explicit issuer.** Legion cannot check that
+  every manager was given the same `workloadIdentity.issuer`. A manager with
+  a different value mints tickets that nodes refuse with `InvalidIssuer`,
+  and nodes follow whichever manager answered their latest heartbeat.
 - **No island mode.** An unratified start that cannot reach a manager dies
   when its lease expires. Edge boot does not keep work running through a long
   control-plane outage.

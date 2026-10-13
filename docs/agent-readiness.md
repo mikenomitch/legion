@@ -62,7 +62,7 @@ Even with `--allow-write`, `legion_state_query` stays read-only.
 | `legion_rollout_status` | no | Rollout progress + allocation health. |
 | `legion_instance_list` | no | List a job's stateful instances (slot + keyed), then its running [sessions](session-mode.md) (`mode: "session"`, `durable: false`) from the session index. The reply is `{ instances, nextIdlePageToken, complete, asOf }`: `complete: false` means some node that runs the job's sessions has not reported yet, so sessions may be missing. `include_idle: true` also lists instances [archived](suspend-and-resume.md#archiving-idle-instances) with `manifestOnly`, which have no row, from the bucket a page at a time (`idle_page_token`, `idle_page_size`); page until the token is empty, since a page can come back short. |
 | `legion_instance_get` | no | Inspect one stateful instance, including a live unratified claim when one exists ([edge-boot.md](edge-boot.md)), or a running session by its id. |
-| `legion_volume_list` | no | List volumes, the storage behind stateful instances. Filters by job/node/plugin/instance/state. |
+| `legion_volume_list` | no | List volumes, the storage behind stateful instances. Filters by job/node/plugin/instance/state. Destroyed tombstones only with `include_destroyed` or `state = destroyed`. |
 | `legion_volume_get` | no | Inspect one volume: plugin, params, node pin, mount path, last driver error. |
 | `legion_volume_drivers` | no | Volume plugins installed across the cluster and which nodes can use them. Use it to find out why a job was rejected for plugin X. |
 | `legion_snapshot_list` | no | List instance [snapshots](suspend-and-resume.md), newest first. Filters by job, instance, and state. |
@@ -73,6 +73,7 @@ Even with `--allow-write`, `legion_state_query` stays read-only.
 | `legion_node_usage_list` | no | Memory and CPU for many nodes in one call (`ListNodeUsage`): per node, capacity with the oversubscription ratio, reservations, measured use, and memory pressure status, plus CPU `cores` and `usedMillicores` (filled even where the platform reports no clock speed). Per-allocation rows only with `include_allocations`. Empty `node_ids` means every node, up to 500. Use it to find tight or pressured nodes before drilling in with `legion_node_usage` ([resource-enforcement.md](resource-enforcement.md#measuring-usage)). |
 | `legion_node_content` | no | What one node holds for content locality: the content it advertises to the manager's location index (digest, bytes, holder count, and the snapshot and part role it belongs to), whether its worker can publish and checkpoint, and its snapshots with `parts_here` of `parts_total`. `index_reported: false` means no content report reached this manager. Use it to see why placement preferred a node, or whether a node is warm for a snapshot before a resume or fork ([artifacts.md](artifacts.md)). |
 | `legion_scheduler_concurrency` | no | How many evals the manager will plan at once, and why: the current limit against `evalThreads`, the plan-conflict and fallback rates, goodput, and a `state` of steady/throttled/probing/**saturated**. `throttled` means work will drain, so wait. `saturated` means the conflicts are capacity-driven, so ask for nodes rather than resubmitting ([adaptive-scheduler-concurrency.md](adaptive-scheduler-concurrency.md)). |
+| `legion_manager_list` | no | Every manager in the control plane from the replicated raft membership: role (`leader`, `follower`, `learner`, or `standalone` outside raft), advertised address, whether the answering manager reached it just now (with the probe error when not), and each reachable member's term and applied index. Any manager answers with the full list. Use it to find the leader or a manager that is down or lagging ([raft-operations.md](raft-operations.md#members)). |
 | `legion_keyring_status` | no | KV encryption at rest on the answering manager ([kv-encryption.md](kv-encryption.md)): `state` (`unlocked`, `locked`, `pending_upgrade`, …), the root key provider and location, each data key with how many values it protects, plaintext rows, rewrap progress, and a one-line `hint` with the next step when something needs doing. |
 | `legion_keyring_rotate` | **yes** | Rotate the KV data key now. Values are re-encrypted in the background with no job restarts. Takes an optional `idempotency_key`. |
 | `legion_node_claims` | no | A node's live provisional (unratified) allocations, meaning work that started but is not yet confirmed ([edge-boot.md](edge-boot.md)). Tells "still booting" apart from "already confirmed". |
@@ -188,6 +189,12 @@ step: the server's own `Hint:` line when it sent one, else a per-code default
 (`legion acl whoami` for `PermissionDenied`, `legion login` for
 `Unauthenticated`, LEGION_ADDR for a manager that cannot be reached). Human
 output prints the same message and hint, ending in `[code=FailedPrecondition]`.
+
+A command never hangs on a silent manager. A connection that cannot be opened
+is `Unavailable`, and a request with no reply by the request deadline (see
+[Connecting](#connecting)) is `DeadlineExceeded`. Both are retryable. The
+deadline's hint names the usual cause: a manager that accepts connections but
+has no raft leader, which `legion raft status` against each manager shows.
 
 A lookup that finds nothing is a failure too: `legion kv get` on a missing key
 returns `NotFound` and exits 1 rather than `{ "ok": true, "data": null }`, so
@@ -512,6 +519,14 @@ Other signals an agent can use to close the loop:
 - `legion job logs <NAME> --json`: captured task stdout/stderr (see below).
 - `legion state query "<SQL>" --json`: inspect `task_status`, `allocation_health`,
   `eval`, and so on (read-only by default).
+- `legion job info <NAME> --json` (`rescheduleBackoffs`) and
+  `legion_instance_get` (`rescheduleBackoff`): replacements of failed
+  allocations waiting out their reschedule backoff, with the attempt, reason,
+  and `nextAttemptAt`. A job that reads `pending` with entries here is not
+  stuck. It retries on its own at that time, or now after `legion job run
+  <spec> --force-reschedule` (or `legion instance start <id>` for one keyed
+  instance). The `allocation.reschedule_deferred` event announces each one
+  ([Manager-side move logic](jobs-tasks-and-scheduling.md#manager-side-move-logic)).
 
 ### The scheduler event stream
 
@@ -693,14 +708,29 @@ All client commands and the MCP server read:
 - `LEGION_TLS_CA_CERT`: CA certificate path for `https`/`grpcs` addresses.
 - `LEGION_TOKEN`: ACL token sent as a bearer credential. ACLs are on by
   default, so the CLI and the MCP server need a token for every call. Falls
-  back to the token file, `~/.legion/token` (`$LEGION_TOKEN_FILE` overrides
-  the path), which `legion login` writes and which a manager writes at first
-  start for the user running it. An MCP server started on the manager's own
+  back to the token file for the manager's address,
+  `~/.legion/tokens/<host>_<port>` (`$LEGION_TOKEN_FILE` overrides the path),
+  which `legion login` writes and which a manager writes at first start for
+  the user running it. On `Unauthenticated`, `error.hint` names the file and
+  address the CLI used. An MCP server started on the manager's own
   machine therefore works with nothing set. Elsewhere, give it a scoped token,
   not the management token. A call with no token fails with
   `Unauthenticated` and a hint naming `<dataDir>/bootstrap-token`. On a
   `PermissionDenied`, call `legion acl whoami` (or the `legion_acl_whoami` MCP
   tool) to see the caller's policies. See [Auth & ACLs](auth-and-acls.md).
+- `LEGION_CONNECT_TIMEOUT`: how long to wait for the connection to the
+  manager to open (default `5s`).
+- `LEGION_REQUEST_TIMEOUT`: how long to wait for each reply (default `30s`).
+  It covers every call except the ones meant to run long: the streams behind
+  `legion exec` and `legion events follow`, and the whole-store `legion
+  state backup` and `legion keyring rewrap`. Commands that wait by polling
+  (`legion job wait`, `job logs -f`, `--wait` flags) keep their own
+  `--timeout` and bound each poll by this deadline, so they also fail fast
+  when the manager stops answering. The CLI sends the deadline to the
+  manager as `grpc-timeout`.
+
+Both timeouts take a duration (`45s`, `2m`) or bare seconds, and `0` turns
+the timeout off.
 
 ## Recommended agent workflow
 

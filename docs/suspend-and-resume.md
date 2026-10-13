@@ -180,6 +180,17 @@ A disk suspend of an `exec` or `container` task is a stop that remembers it
 was a suspend. Nothing from process memory survives it (Legion does not use
 CRIU), but the volume does, and the resumed task finds every file it wrote.
 
+A sandbox's writes sit in the guest's page cache until the guest writes them
+back, so both kinds flush the guest first (`sync` through the guest agent,
+for up to 10 seconds). A memory suspend flushes before it pauses the guest,
+so the volume has every earlier write on its own, not only in the captured
+memory. A disk suspend flushes before it kills the VMM, so the resumed
+sandbox finds every file it wrote. A guest whose agent does not answer is
+suspended without the flush, and the node logs `Could not flush the sandbox
+guest's disks`. A disk suspend of such a guest loses the writes it had not
+written back. See
+[Stopping a sandbox](task-runtime-sandbox.md#stopping-a-sandbox).
+
 ## Suspending
 
 ```console
@@ -401,8 +412,13 @@ What differs from Linux:
 - **A `container exec` you run by hand is invisible** to the `exec` signal,
   since it bypasses the worker. Its CPU still counts.
 - **Two local clusters can share a Mac.** Each dev-mode container is named
-  `legion-sbx-<node>-<allocation>`, so one cluster's cleanup never removes
-  another's container.
+  `legion-sbx-<node>-<allocation>` and labeled with its node
+  (`legion.node`). Stale-container cleanup removes only a container labeled
+  as this node's, so one cluster's cleanup never removes another's
+  container.
+- **`container stats` is bounded.** The usage sample kills the call past 5
+  seconds. A wedged `container` service leaves that report without its
+  Apple containers instead of stalling the worker's heartbeat.
 
 The end-to-end test for this loop is
 `cargo test --test apple_container_idle -- --ignored`. It needs the
@@ -513,7 +529,9 @@ node (a corrupt part, a busy TAP device). `suspend.onRestoreFailure` decides:
 A resume also waits at most `suspend.resumeTimeout` (30s by default) to be
 placed on its checkpoint's node (any compatible node, for a published
 checkpoint). Under `cold`, a resume that waits longer
-(the node is down, or full) gives up the checkpoint and boots fresh. With a
+(the node is down, or full) gives up the checkpoint and boots fresh. A local
+checkpoint whose node now runs a different VMM version or CPU settles at once
+instead (see [Where a restore can run](#where-a-restore-can-run)). With a
 [node-local volume](volumes.md#node-local-vs-network) the fresh boot is still
 pinned to that node, so it keeps waiting for it, just no longer for the
 checkpoint. Under `fail`, a resume waits like any pending placement.
@@ -791,7 +809,16 @@ From then on:
   content store is fetched from its URL through the node's ordinary artifact
   fetchers (`s3://` or `file://`), opened with the key the manager sent with
   the restore, verified against its digest, and stored in the content store
-  before the restore starts. The allocation shows
+  before the restore starts. The fetch signs with the restoring node's own
+  `contentStore.auth` (its KV credential, read at fetch time, or its ambient
+  AWS credentials when `auth` is omitted), because the part URL sits under
+  that node's `contentStore.url`. Cluster `artifacts.auth` matchers do not
+  apply to parts. So every node that may restore the instance needs the same
+  `contentStore` url and auth as the node that published it. A node whose
+  `contentStore` points elsewhere has no credential for the part and fails
+  the restore saying so (see
+  [Which credential a reading node uses](artifacts.md#publishing-content)).
+  The allocation shows
   `fetching snapshot` meanwhile. This includes the node that took the
   checkpoint, when its copy was evicted: it fetches the parts back like any
   other node. Parts that are present are pinned to the restoring allocation
@@ -1267,8 +1294,23 @@ the checkpoint needs "6:106:6". A memory snapshot resumes only on the CPU and
 VMM it was taken on; restore an older snapshot, or restart the instance cold
 ```
 
+VMM versions compare by release, not by spelling: `v51.2` (what
+cloud-hypervisor's `--version` prints) and `51.2.0` (what its API reports)
+are the same version, while `51.2.0` and `51.3.0` are not. See
+[the sandbox runtime](task-runtime-sandbox.md#where-a-memory-checkpoint-can-be-restored)
+for the full rule.
+
 For a published snapshot, placement fails only when no eligible node fits,
 and the error names up to three of them with the attribute each one fails on.
+
+A resume from a `local` checkpoint whose node reports a different VMM version
+or CPU does not wait out `resumeTimeout`: the checkpoint exists only on that
+node, so the manager settles the resume within a second, the same way as a
+lost checkpoint. Under `onRestoreFailure = "cold"` the instance boots fresh
+with `cold_boot.reason` naming the attribute. Under `"fail"` it goes back to
+`suspended` with its checkpoint kept and the reason in `detail`. A node that
+has not reported the attribute at all (a fingerprint still arriving) keeps
+the resume waiting as before.
 
 The usual cause is a VMM upgrade on the node. Restore a snapshot taken after
 the upgrade, or stop and start the instance to boot it cold on its current
@@ -2044,7 +2086,8 @@ See [metrics](metrics.md#suspend-and-resume).
 | Instance stuck `pending (resuming)` | The checkpoint's node is down or full, and nothing there can be suspended to make room | Wait, `instance start --cold`, or let `resumeTimeout` boot it cold. To keep room for resumes, see [Capacity for resumes](#capacity-for-resumes) |
 | `legion_make_room_suspends_total{outcome="no_room"}` rising | Resumes wait on nodes whose instances are not eligible to make room (no `suspend` block, not opted in, a more important band, or active under two minutes) | Set `onPressure = true` or an idle policy on the work sharing those nodes, or hold a share with `suspend.reserve` |
 | Placement fails: `none has ... MiB of room for this task's memory checkpoint` | Every eligible node is short on its `snapshots` budget (pinned `local` checkpoints fill it) or on disk (free space plus evictable content is under `minFreeDisk` plus one checkpoint). The message counts each | Raise the budget, free disk, delete old snapshots, or resume or destroy suspended instances. `legion node usage <node>` shows which limit binds |
-| Resume of a `published` checkpoint fails: `fetching part ... from its content store` | The node's copy was evicted after publishing (or it never had one), and the `contentStore` is unreachable from it | Fix the store's reachability or credentials. The checkpoint itself is intact |
+| Resume of a `published` checkpoint fails: `fetching part ... from its content store` | The node's copy was evicted after publishing (or it never had one), and it cannot read the `contentStore`. The fetch uses the restoring node's own `contentStore.auth` (or its ambient AWS credentials when `auth` is omitted), not `artifacts.auth` | Give the node a `contentStore` with the publisher's url and an `auth` that can read the bucket, or fix the store's reachability. The checkpoint itself is intact |
+| Resume fails: `this node has no credential for content store s3://...` | The part was published to a store other than the restoring node's own `contentStore.url` (another region's bucket, a different prefix or endpoint, or no `contentStore` at all), so it was fetched anonymously and refused | Give the node the same `contentStore` url and auth as the publishing node, or constrain the resume to nodes that have it |
 | Submit: `suspend.reserve ... is out of range` or `exceeds the task's resources` | A ratio outside 0 to 1, or an amount larger than the reservation | Follow the hint |
 | `instance start`: `cannot resume: checkpoint ... is lost` | The node holding it was removed, and `onRestoreFailure = "fail"` | `legion instance start <id> --cold` |
 | `instance list` STATE `active (resumed cold)`, `cold_boot` set | A restore failed (lost or incompatible checkpoint, `resumeTimeout`, an error on the node) and `onRestoreFailure = "cold"` booted it fresh. Its running processes are gone, its volume is kept | Read `cold_boot.reason`. Use `onRestoreFailure = "fail"` if a lost session must never look like a resume |
@@ -2072,7 +2115,7 @@ See [metrics](metrics.md#suspend-and-resume).
 | `snapshot.publish_failed`, snapshot `local` with `publish attempt N of 3 failed, retrying in ...` | The upload failed (credentials, bucket, network), and the manager will ask again | Fix the store before the retry. The checkpoint still works from its node |
 | Snapshot stays `local` with `publish failed after 3 attempts: ...` | Every attempt failed | Fix the store, then take a new snapshot or suspend again |
 | `snapshot.restore_failed`: `... is not on this node and was never published` | A restore of a local snapshot reached a node that does not hold it | Use a published snapshot when the restore has to run elsewhere |
-| `snapshot.restore_failed`: `fetching part ... from its content store` | The new node could not fetch a published part (no access to the bucket, a scheme not in `artifacts.fetch.allowedSchemes`) | Give the node read access to the store |
+| `snapshot.restore_failed`: `fetching part ... from its content store` | The new node could not fetch a published part (no access to the bucket with its `contentStore.auth` or ambient credentials, a scheme not in `artifacts.fetch.allowedSchemes`) | Give the node read access to the store through its own `contentStore` |
 | `snapshot.restore_failed` or `snapshot.publish_failed` naming a sealed part, a checkpoint key, or the keyring | The part could not be sealed or opened | See [When a part cannot be opened](#when-a-part-cannot-be-opened) |
 | `snapshot warm`: `is local, not published` | Only published snapshots can be warmed | Publish with `durability = "store"` or `--publish` |
 | Submit: `sets suspend.archive = ... but its checkpoints stay on the node` | `archive` needs a published checkpoint | Set `durability = "store"` |
@@ -2114,6 +2157,14 @@ See [metrics](metrics.md#suspend-and-resume).
   `contentStore.auth.kv` credential or the manager's ambient credentials.
   A manager that cannot reach a bucket can neither resume nor list what is
   archived in it.
+- **A node reads published parts only from its own `contentStore`.** It signs
+  a part fetch with its own `contentStore.auth` only when the part URL is under
+  its own `contentStore.url`, and there is no per-store credential list for
+  reading other stores. Placement does not check which store a node is
+  configured for, so a resume can land on a node pointed at another bucket
+  and fail with `this node has no credential for content store`. Give every
+  node that may restore a checkpoint the publisher's `contentStore`, or
+  constrain the job to those nodes.
 - **`--include-idle` pages can come back short.** A manifest whose instance
   also has a row is listed once, from the row, so a page can hold fewer than
   `--idle-page-size` bucket instances. Page until `nextIdlePageToken` is
@@ -2150,6 +2201,12 @@ See [metrics](metrics.md#suspend-and-resume).
 - **Memory snapshots need a `sandbox` on Firecracker or cloud-hypervisor**,
   with the same VMM version, CPU, and guest size at restore. A gated sandbox
   on Firecracker needs 1.16.1 or later.
+- **A published Firecracker checkpoint moves only between nodes with the
+  same data dir.** Firecracker reopens a restored guest's disks at the
+  device-link paths it captured, under `<data dir>/vmdev/`, so a node with
+  another `LEGION_DATA_DIR` refuses the restore by name. cloud-hypervisor
+  checkpoints have no such limit. See
+  [Where a memory checkpoint can be restored](task-runtime-sandbox.md#where-a-memory-checkpoint-can-be-restored).
 - **A memory checkpoint closes a gated guest's open connections.** On
   Firecracker that includes the running origin of a live snapshot or a fork.
   New connections work at once. See [Gated sandboxes](#gated-sandboxes).

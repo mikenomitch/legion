@@ -151,6 +151,7 @@ fn worker_manager(temp_dir: &TempDir) -> Arc<Mutex<WorkerTaskManager>> {
             ..Default::default()
         },
         Box::new(legion::artifacts::AnonymousCredentials),
+        None,
     );
     Arc::new(Mutex::new(manager))
 }

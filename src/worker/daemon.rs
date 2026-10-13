@@ -227,6 +227,11 @@ pub struct WorkerJoin {
     pub ca_pin: Option<String>,
     /// `--advertise-addr`: the host (or `host:port`) managers dial.
     pub advertise_addr: Option<String>,
+    /// Set for the in-process worker (`legion start manager --run-worker`).
+    /// It shares its process with the manager, so on a shutdown signal it
+    /// stops and returns rather than exiting the process under the
+    /// manager's own drain.
+    pub in_process: bool,
 }
 
 #[instrument(err, skip_all)]
@@ -244,6 +249,7 @@ pub async fn run_worker(
             join_secret: Some(join_token.secret),
             ca_pin: Some(join_token.ca_hash),
             advertise_addr: advertise_addr.map(str::to_string),
+            in_process: false,
         },
         name_override,
     )
@@ -277,6 +283,7 @@ async fn run_worker_with_manager(join: WorkerJoin, name_override: Option<&str>) 
         join_secret,
         ca_pin,
         advertise_addr,
+        in_process,
     } = join;
     let server_port = worker_server_port();
     let bind = crate::worker::plane::bind_address(server_port)?;
@@ -340,10 +347,13 @@ async fn run_worker_with_manager(join: WorkerJoin, name_override: Option<&str>) 
     if let Some(boot_fence) = boot_fence {
         boot_fence.abort();
     }
-    let config = pre_register_res
-        .into_inner()
-        .config
-        .context("No config found")?;
+    let pre_register_reply = pre_register_res.into_inner();
+    // The `iss` this node's tickets carry, from the manager rather than
+    // assumed to be the join-token address (it is one name for the whole
+    // cluster). Heartbeats keep it current.
+    crate::worker::boot_ticket::cluster_issuer()
+        .learn(&pre_register_reply.workload_identity_issuer);
+    let config = pre_register_reply.config.context("No config found")?;
 
     let name = resolve_worker_name(name_override, config.name_prefix.clone())?;
     let state_path = WorkerStateStore::path_for_worker(&name);
@@ -353,6 +363,9 @@ async fn run_worker_with_manager(join: WorkerJoin, name_override: Option<&str>) 
         "Worker state directory (keep it stable across restarts: it is how a \
          restarted worker re-adopts its running tasks)"
     );
+    // Before anything writes into it: each entry's mode is part of the
+    // isolation between allocations (see `prepare_layout`).
+    WorkerStateStore::new(state_path.clone()).prepare_layout()?;
     credentials.persist_to(WorkerStateStore::new(state_path.clone()));
     managers.persist_to(WorkerStateStore::new(state_path.clone()));
     // The node's key is generated (or loaded) here and never leaves this
@@ -471,6 +484,7 @@ async fn run_worker_with_manager(join: WorkerJoin, name_override: Option<&str>) 
                 name.clone(),
                 credentials.clone(),
             )),
+            content_store_target.clone(),
         );
         manager.restore_allocations().unwrap_or_else(|err| {
             warn!(error = ?err, "Failed to restore persisted allocations");
@@ -537,6 +551,7 @@ async fn run_worker_with_manager(join: WorkerJoin, name_override: Option<&str>) 
             &edge_boot_config,
             &manager_addr,
             &config.pool,
+            managers.clone(),
         )?))
     } else {
         None
@@ -598,10 +613,11 @@ async fn run_worker_with_manager(join: WorkerJoin, name_override: Option<&str>) 
             .expect("task manager")
             .volume_fingerprint(),
     );
-    let readiness = task_manager
-        .lock()
-        .expect("task manager")
-        .readiness_checks();
+    // Probed off the lock and off the async runtime: a readiness check can
+    // shell out to a runtime CLI (see `readiness_of`).
+    let plugins = task_manager.lock().expect("task manager").plugin_handles();
+    let readiness =
+        tokio::task::spawn_blocking(move || crate::task_plugins::readiness_of(&plugins)).await?;
     let health_checks = run_health_checks(config.additional_node_checks.clone(), Some(readiness));
 
     // Resolved before `config` is picked apart below (the helper borrows
@@ -849,7 +865,13 @@ async fn run_worker_with_manager(join: WorkerJoin, name_override: Option<&str>) 
             )
         } => {}
         signal = worker_shutdown_signal() => {
-            stop_worker_daemon(shutdown_task_manager, signal, stop_checkpoint_timeout).await;
+            stop_worker_daemon(
+                shutdown_task_manager,
+                signal,
+                stop_checkpoint_timeout,
+                WorkerExit::for_worker(in_process),
+            )
+            .await;
         }
     }
 
@@ -1039,10 +1061,78 @@ async fn worker_shutdown_signal() -> &'static str {
 /// and exit. Workloads keep running, as on any worker stop: a restarted
 /// worker re-adopts them, and restores from these checkpoints only the
 /// sessions whose process died meanwhile.
+/// What a stopping worker does with its tasks and its process.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct WorkerExit {
+    /// Stop every task before returning. Only the in-process worker on
+    /// macOS does: there the cluster is one process in a developer's
+    /// terminal, and its Apple containers (each a VM) would otherwise keep
+    /// running after it stops. Everywhere else tasks outlive the worker and
+    /// the next start re-adopts them.
+    stop_tasks: bool,
+    /// Exit the process once stopped. False for the in-process worker,
+    /// whose manager finishes its own drain and exits.
+    exit_process: bool,
+}
+
+impl WorkerExit {
+    fn for_worker(in_process: bool) -> Self {
+        Self {
+            stop_tasks: in_process && cfg!(target_os = "macos"),
+            exit_process: !in_process,
+        }
+    }
+}
+
+/// Budget for stopping every task at an in-process worker's shutdown. Each
+/// task gets its own `stop.killAfter` inside it, then a hard teardown.
+const SHUTDOWN_TASK_STOP_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Stop every task the worker runs, all at once, each on a blocking thread
+/// ([`crate::worker::task_manager::ShutdownStop::run`]).
+async fn stop_tasks_for_shutdown(task_manager: &Arc<Mutex<WorkerTaskManager>>) {
+    let stops = task_manager
+        .lock()
+        .expect("task manager")
+        .take_tasks_for_shutdown();
+    if stops.is_empty() {
+        return;
+    }
+    info!(
+        tasks = stops.len(),
+        "Stopping this node's tasks before exiting"
+    );
+    let deadline = std::time::Instant::now() + SHUTDOWN_TASK_STOP_TIMEOUT;
+    let handles: Vec<_> = stops
+        .into_iter()
+        .map(|stop| {
+            let allocation_id = stop.allocation_id();
+            (
+                allocation_id,
+                tokio::task::spawn_blocking(move || stop.run(deadline)),
+            )
+        })
+        .collect();
+    // The hard teardown after the deadline has its own CLI deadlines, so
+    // allow it a little past the stop budget.
+    let all = futures::future::join_all(handles.into_iter().map(|(id, handle)| async move {
+        if let Err(err) = handle.await {
+            warn!(allocation_id = id, error = %err, "Task stop at shutdown panicked");
+        }
+    }));
+    if tokio::time::timeout(SHUTDOWN_TASK_STOP_TIMEOUT + Duration::from_secs(30), all)
+        .await
+        .is_err()
+    {
+        warn!("Some tasks did not stop in time; exiting anyway");
+    }
+}
+
 async fn stop_worker_daemon(
     task_manager: Arc<Mutex<WorkerTaskManager>>,
     signal: &'static str,
     timeout: Duration,
+    exit: WorkerExit,
 ) {
     info!(signal, "Worker stopping");
     let deadline = std::time::Instant::now() + timeout;
@@ -1068,7 +1158,13 @@ async fn stop_worker_daemon(
         Ok(_) => {}
         Err(_) => warn!("Stop checkpoints did not finish in time; exiting anyway"),
     }
-    std::process::exit(0);
+    if exit.stop_tasks {
+        stop_tasks_for_shutdown(&task_manager).await;
+    }
+    if exit.exit_process {
+        std::process::exit(0);
+    }
+    info!("In-process worker stopped");
 }
 
 /// The worker type's `exec` block, from the security payload.
@@ -1089,27 +1185,44 @@ fn build_jwks_verifier(
     config: &crate::structs::WorkerEdgeBootConfigFull,
     manager_addr: &str,
     pool: &str,
+    managers: Arc<crate::worker::managers::ManagerEndpoints>,
 ) -> R<crate::worker::boot_ticket::BootTicketVerifier> {
     let refresh = humantime::parse_duration(&config.jwks_refresh)
         .unwrap_or(crate::worker::boot_ticket::DEFAULT_JWKS_REFRESH);
     let skew = humantime::parse_duration(&config.clock_skew)
         .unwrap_or(crate::worker::boot_ticket::DEFAULT_CLOCK_SKEW);
-    // The issuer URL is the manager address the worker already trusts (it is
-    // what its join token pointed at), and the JWKS lives at the well-known
-    // path the manager serves alongside gRPC.
-    let issuer = manager_addr.trim_end_matches('/').to_string();
+    // Tickets carry the cluster's issuer, which the managers report on
+    // pre-registration and every heartbeat; the verifier follows it.
+    let issuer = crate::worker::boot_ticket::cluster_issuer().clone();
+    if issuer.get().is_empty() {
+        warn!(
+            "The manager reported no workload-identity issuer (is workloadIdentity.enabled \
+             false?); boot, session, and exec tickets are refused until one does"
+        );
+    }
     // The JWKS rides the same pinned TLS as every other manager call: keys
-    // an on-path attacker could swap would let it forge tickets.
+    // an on-path attacker could swap would let it forge tickets. Any manager
+    // serves it, so the fetch fails over across the ones this node knows.
     let verifier = crate::worker::plane::manager_verifier(manager_addr)
         .context("ticket verification needs the manager's CA pin to fetch the JWKS over TLS")?;
-    let source = Box::new(crate::worker::boot_ticket::PinnedJwksSource::new(
+    let source = crate::worker::boot_ticket::PinnedJwksSource::new(
         manager_addr,
         verifier,
         Duration::from_secs(5),
-    )?);
+    )?
+    .with_managers(move || {
+        let mut order = vec![managers.active()];
+        order.extend(managers.known());
+        order
+    });
     Ok(crate::worker::boot_ticket::BootTicketVerifier::new(
-        source, issuer, pool, refresh, skew,
-    ))
+        Box::new(source),
+        String::new(),
+        pool,
+        refresh,
+        skew,
+    )
+    .following(issuer))
 }
 
 /// Ratifies claims by calling the manager's `RatifyClaim`, authenticated with
@@ -2249,12 +2362,26 @@ async fn heartbeat_tick(
         debug!(worker = %name, elapsed_ms = start.elapsed().as_millis() as u64, "Heartbeat acknowledged by manager");
         let mut reply = response.into_inner();
         served_interval = reply.next_interval_seconds;
+        // Terminal reports the manager answered but could not record go out
+        // again next beat: a batch task's dependents wait on them.
+        task_manager
+            .lock()
+            .expect("task manager")
+            .requeue_unrecorded_terminations(
+                terminations_for_redrive,
+                &reply.retry_terminated_allocations,
+            );
         crate::worker::direct_exec::apply_revocations(&reply.revoked_exec_sessions);
         crate::worker::direct_exec::apply_exec_keys(&reply.exec_keys_version, &reply.exec_keys);
         // The cluster's manager set, refreshed every beat and persisted when
         // it changes, so failover (and a restart) can reach any manager.
         if let Some(managers) = managers {
             managers.learn(&reply.manager_addresses);
+        }
+        // The cluster's ticket issuer, so a changed `workloadIdentity.issuer`
+        // reaches this node's verifier within a beat.
+        if crate::worker::boot_ticket::cluster_issuer().learn(&reply.workload_identity_issuer) {
+            info!(issuer = %reply.workload_identity_issuer, "Following the cluster's workload-identity issuer");
         }
         // The manager acknowledged this health. Off the stream (or when the
         // manager did not recognize the stream) the next beat starts from a
@@ -3567,12 +3694,11 @@ fn launch_streamed_work(
         }
         let launcher = launcher.clone();
         tokio::spawn(async move {
-            use crate::structs::worker_server::Worker;
             let allocation_id = allocation.allocation_id;
-            let request = tonic::Request::new(crate::structs::PostWorkRequest {
-                allocation: Some(allocation),
-            });
-            if let Err(status) = launcher.post_work(request).await {
+            // `accept_work`, not the `post_work` handler: the stream is
+            // already authenticated, and an in-process request carries no
+            // manager certificate for the worker-plane check to accept.
+            if let Err(status) = launcher.accept_work(allocation).await {
                 // Recorded as the allocation's failure by the launch path;
                 // the heartbeat reports it.
                 debug!(allocation_id, error = %status.message(), "Streamed allocation did not start");
@@ -4162,12 +4288,20 @@ async fn start_node_checks(
     let mut client_clone = client.clone();
 
     loop {
+        // Probed off the lock and off the async runtime: a readiness check
+        // can shell out to a runtime CLI, and a hung one used to hold the
+        // task-manager lock (and with it the heartbeat) for as long as it
+        // hung (see `readiness_of`).
         let checks_data = {
-            let readiness = task_manager
-                .lock()
-                .expect("task manager")
-                .readiness_checks();
-            run_health_checks(additional_node_checks.clone(), Some(readiness))
+            let plugins = task_manager.lock().expect("task manager").plugin_handles();
+            let additional = additional_node_checks.clone();
+            tokio::task::spawn_blocking(move || {
+                run_health_checks(
+                    additional,
+                    Some(crate::task_plugins::readiness_of(&plugins)),
+                )
+            })
+            .await?
         };
         let serialized_health_check_data = serde_json::to_string(&checks_data)?;
         let req = credentials.attach(tonic::Request::new(HealthCheckRequest {
@@ -4370,6 +4504,27 @@ mod tests {
         // exact shape of a manager partition.
         let channel = Channel::from_static("http://127.0.0.1:1").connect_lazy();
         ManagerClient::new(channel)
+    }
+
+    /// Only the in-process worker stays in its process at shutdown, and only
+    /// on macOS does it stop its tasks: a standalone worker exits and leaves
+    /// its tasks for the next start to re-adopt.
+    #[test]
+    fn only_the_in_process_worker_on_macos_stops_its_tasks_at_shutdown() {
+        assert_eq!(
+            WorkerExit::for_worker(false),
+            WorkerExit {
+                stop_tasks: false,
+                exit_process: true,
+            }
+        );
+        assert_eq!(
+            WorkerExit::for_worker(true),
+            WorkerExit {
+                stop_tasks: cfg!(target_os = "macos"),
+                exit_process: false,
+            }
+        );
     }
 
     /// A heartbeat whose `onChange = "update"` file content moved rewrites
@@ -4774,6 +4929,23 @@ mod tests {
         dir: &TempDir,
         node_id: &str,
     ) -> R<(ManagerClient<Channel>, tokio::task::JoinHandle<()>)> {
+        let (client, server, _store) = serve_manager(dir, node_id, "{}").await?;
+        Ok((client, server))
+    }
+
+    /// [`serve_empty_manager`], with the manager's store handed back so a
+    /// test can submit and plan jobs on the node and read the outcome.
+    /// `fingerprint_attrs` is the node's fingerprint (`{}` gives it no
+    /// capacity to plan against).
+    async fn serve_manager(
+        dir: &TempDir,
+        node_id: &str,
+        fingerprint_attrs: &str,
+    ) -> R<(
+        ManagerClient<Channel>,
+        tokio::task::JoinHandle<()>,
+        crate::storage::store::Store,
+    )> {
         let store = crate::storage::store::Store::start_storage(
             &crate::structs::config::ManagerConfigFull {
                 store_path: dir.path().join("store").to_string_lossy().into_owned(),
@@ -4786,7 +4958,7 @@ mod tests {
             status: "active".into(),
             availability: "available".into(),
             config_attrs: "{}".into(),
-            fingerprint_attrs: "{}".into(),
+            fingerprint_attrs: fingerprint_attrs.into(),
             dynamic_attrs: "{}".into(),
             health_checks: "{}".into(),
             last_heartbeat: "2026-01-01 00:00:00 +00:00:00".into(),
@@ -4795,7 +4967,7 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
         let addr = format!("http://127.0.0.1:{}", listener.local_addr()?.port());
         let service = crate::structs::manager_server::ManagerServer::new(
-            crate::manager::server::ManagerDaemonService::new(store),
+            crate::manager::server::ManagerDaemonService::new(store.clone()),
         );
         let server = tokio::spawn(async move {
             let incoming = tokio_stream::wrappers::TcpListenerStream::new(listener);
@@ -4805,7 +4977,241 @@ mod tests {
                 .await;
         });
         let client = ManagerClient::new(Channel::from_shared(addr)?.connect_lazy());
-        Ok((client, server))
+        Ok((client, server, store))
+    }
+
+    /// The pieces `heartbeat_tick` needs besides the task manager, for tests
+    /// that drive several beats against one manager.
+    struct BeatHarness {
+        node_id: String,
+        client: ManagerClient<Channel>,
+        node_identity: Arc<crate::worker::plane::NodeIdentity>,
+        identity_manager: Arc<WorkerIdentityManager>,
+        credentials: Arc<WorkerCredentials>,
+        forwarder: Arc<UpstreamForwarder>,
+        _identity_dir: TempDir,
+    }
+
+    impl BeatHarness {
+        fn new(node_id: &str, client: &ManagerClient<Channel>) -> R<Self> {
+            let credentials = Arc::new(WorkerCredentials::default());
+            let identity_manager =
+                Arc::new(WorkerIdentityManager::new(Arc::new(ManagerTokenIssuer {
+                    client: client.clone(),
+                    node_id: node_id.into(),
+                    credentials: credentials.clone(),
+                })));
+            let identity_dir = tempfile::tempdir()?;
+            let node_identity =
+                crate::worker::plane::NodeIdentity::load(identity_dir.path(), node_id, None, None)?;
+            Ok(BeatHarness {
+                node_id: node_id.into(),
+                client: client.clone(),
+                node_identity,
+                identity_manager,
+                credentials,
+                forwarder: Arc::new(UpstreamForwarder::new()),
+                _identity_dir: identity_dir,
+            })
+        }
+
+        async fn beat(&self, task_manager: &Arc<Mutex<WorkerTaskManager>>) -> R<()> {
+            heartbeat_tick(
+                &self.node_id,
+                "http://127.0.0.1:1",
+                &self.node_identity,
+                &self.client,
+                task_manager,
+                &self.identity_manager,
+                &self.credentials,
+                &self.forwarder,
+                None,
+                None,
+            )
+            .await?;
+            Ok(())
+        }
+    }
+
+    /// Regression (spot check, DAG stuck after its first step): a batch task
+    /// the worker runs to a clean exit is reported over the real heartbeat
+    /// path, the manager records it, and the `success` dependent it held
+    /// back is placed. Shaped like `tests/spot-check/jobs/05-dag.ncl`: exec
+    /// runtime, batch lifecycle, both steps in one group.
+    #[tokio::test]
+    async fn a_batch_exit_reported_by_heartbeat_releases_its_success_dependent() -> R<()> {
+        use crate::manager::scheduler::{PlanMode, Scheduler};
+        use crate::structs::{
+            TaskDependency, TaskDependencyCondition, TaskLifecycle, TaskStatusState,
+        };
+        let temp_dir = TempDir::new()?;
+        let node_id = "dag-node";
+        let fingerprint = json!({
+            "memory_total": "8589934592",
+            "cpus": { "cpu-1": { "frequency": "2400" }, "cpu-2": { "frequency": "2400" } },
+        })
+        .to_string();
+        let (client, server, store) = serve_manager(&temp_dir, node_id, &fingerprint).await?;
+
+        let step = |name: &str| crate::structs::TaskConfig {
+            lifecycle: TaskLifecycle::Batch,
+            group: "pipeline".into(),
+            config: json!({"command": ["true"]}),
+            ..crate::structs::TaskConfig::new(name, "exec")
+        };
+        let job = crate::structs::JobConfig {
+            priority: Default::default(),
+            rollout: None,
+            rollout_by_group: Default::default(),
+            name: "dag".into(),
+            tasks: vec![
+                step("fetch"),
+                crate::structs::TaskConfig {
+                    depends_on: vec![TaskDependency {
+                        task: "fetch".into(),
+                        condition: TaskDependencyCondition::Success,
+                    }],
+                    ..step("validate")
+                },
+            ],
+            version: None,
+        };
+        store.handle_job_submit(
+            &job,
+            &[crate::structs::Submission {
+                path: "dag.ncl".into(),
+                content: "{}".into(),
+                is_primary: true,
+            }],
+        )?;
+        let job_config_id = store.get_job_config("dag")?.id();
+        let placed = Scheduler::new(&store)?.plan_and_apply(&job_config_id, PlanMode::Fresh)?;
+        assert_eq!(placed.allocations.len(), 1, "validate waits for fetch");
+        let fetch = placed.allocations[0].clone();
+
+        let task_manager = Arc::new(Mutex::new(WorkerTaskManager::with_state_store(
+            WorkerStateStore::new(temp_dir.path().join("worker_state.json")),
+        )));
+        task_manager
+            .lock()
+            .expect("task manager")
+            .load_builtin_plugins();
+        let harness = BeatHarness::new(node_id, &client)?;
+
+        // Beat one: the desired set launches `fetch`.
+        harness.beat(&task_manager).await?;
+        // The supervisor's tick, run by hand: notice the exit and apply the
+        // batch lifecycle's policy to it.
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let exit = loop {
+            let exits = task_manager.lock().expect("task manager").poll_task_exits();
+            if let Some(exit) = exits
+                .into_iter()
+                .find(|exit| exit.allocation_id == fetch.id)
+            {
+                break exit;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "fetch never exited on the worker"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        };
+        crate::worker::task_supervisor::handle_exit(&task_manager, exit).await;
+        // Beat two: carries the terminal report.
+        harness.beat(&task_manager).await?;
+
+        let recorded = store
+            .get_allocation_by_id(fetch.id)?
+            .context("fetch allocation is gone")?;
+        assert_eq!(recorded.status, "complete");
+        assert_eq!(
+            store
+                .task_statuses_for_job_config(&job_config_id)?
+                .get(&fetch.task_config_id),
+            Some(&TaskStatusState::Success)
+        );
+        let released =
+            Scheduler::new(&store)?.plan_and_apply(&job_config_id, PlanMode::Reschedule)?;
+        assert!(released.held_tasks.is_empty(), "{:?}", released.held_tasks);
+        assert_eq!(released.allocations.len(), 1, "validate is placed");
+        server.abort();
+        Ok(())
+    }
+
+    /// A terminal report the manager answered but could not record (here:
+    /// it has no row for the allocation, as a replica that has not applied
+    /// the placement yet would not) goes out again on the next beat, and
+    /// stops going out once the worker no longer holds the allocation.
+    #[tokio::test]
+    async fn an_unrecorded_terminal_report_is_sent_again() -> R<()> {
+        let temp_dir = TempDir::new()?;
+        let node_id = "retry-node";
+        let (client, server) = serve_empty_manager(&temp_dir, node_id).await?;
+        let task_manager = Arc::new(Mutex::new(WorkerTaskManager::with_state_store(
+            WorkerStateStore::new(temp_dir.path().join("worker_state.json")),
+        )));
+        let exit = crate::worker::task_manager::TaskExit {
+            allocation_id: 51,
+            task_name: "fetch".into(),
+            exit_code: Some(0),
+            signal: None,
+            oom_killed_at_bytes: None,
+            stderr_tail: None,
+        };
+        {
+            let mut manager = task_manager.lock().expect("task manager");
+            manager.load_builtin_plugins();
+            let allocation = crate::structs::Allocation {
+                id: 51,
+                status: "running".into(),
+                resources: json!({}),
+                node_id: node_id.into(),
+                job_config_id: "job-1".into(),
+                task_config_id: 1,
+                job_id: "dag".into(),
+                instance_id: None,
+                network: None,
+            };
+            let task = crate::structs::TaskConfig {
+                config: json!({"command": ["sleep", "30"]}),
+                lifecycle: crate::structs::TaskLifecycle::Batch,
+                ..crate::structs::TaskConfig::new("fetch", "exec")
+            };
+            manager.run_allocation(&allocation, &task)?;
+            manager.record_termination(51, &exit, true);
+        }
+        let harness = BeatHarness::new(node_id, &client)?;
+
+        // The manager has no row for 51: the report comes back for a retry.
+        // The same reply's empty desired set also stops the allocation.
+        harness.beat(&task_manager).await?;
+        let pending = task_manager
+            .lock()
+            .expect("task manager")
+            .drain_terminations();
+        assert_eq!(
+            pending.iter().map(|r| r.allocation_id).collect::<Vec<_>>(),
+            vec![51],
+            "the unrecorded report is queued again"
+        );
+        task_manager
+            .lock()
+            .expect("task manager")
+            .requeue_terminations(pending);
+
+        // Sent again, refused again, and now the worker no longer holds the
+        // allocation: the report ends with it.
+        harness.beat(&task_manager).await?;
+        let mut manager = task_manager.lock().expect("task manager");
+        assert!(manager.drain_terminations().is_empty());
+        while manager.has_terminating() || manager.has_draining() {
+            manager.reap_draining();
+            manager.reap_terminating();
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        server.abort();
+        Ok(())
     }
 
     /// Regression (audit W1): the daemon skipped the reconcile whenever the
@@ -5422,6 +5828,7 @@ mod tests {
             work_resync: false,
             session_resync: false,
             stop_sessions: Vec::new(),
+            retry_terminated_allocations: Vec::new(),
             net_policies: Vec::new(),
             claim_verdicts: Vec::new(),
             next_interval_seconds: None,
@@ -5443,6 +5850,7 @@ mod tests {
                 }],
             }],
             manager_addresses: Vec::new(),
+            workload_identity_issuer: String::new(),
         };
 
         apply_upstreams(&forwarder, &reply, std::path::Path::new("/tmp")).await;

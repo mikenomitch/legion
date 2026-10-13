@@ -11,7 +11,7 @@ runtime uses, on Linux and on macOS.
 | Runtime | Linux host needs | macOS host needs |
 | --- | --- | --- |
 | `exec` | nothing | nothing |
-| `container` | an OCI runtime: `youki` (default), or `runc` / `crun` | Apple `container` |
+| `container` | an OCI runtime: `runc` 1.2+ (default), or `crun` | Apple `container` |
 | `sandbox` (microVM) | `/dev/kvm`, `cloud-hypervisor` (or `firecracker`), a guest kernel, `e2fsprogs` | Apple `container` (dev mode) |
 | `sandbox` with `hypervisor = "dev"` | an OCI runtime, as for `container` | Apple `container` |
 
@@ -43,51 +43,79 @@ Linux containers run under a low-level OCI runtime. Legion builds the bundle
 (root filesystem plus `config.json`) itself, so the runtime is the only
 dependency. There is no Docker or containerd involved.
 
-### youki (the default)
+### runc (the default)
 
-[youki](https://github.com/youki-dev/youki) publishes static release
-tarballs. Pick the current version from its
-[releases page](https://github.com/youki-dev/youki/releases):
-
-```bash
-VERSION=0.5.3          # see the releases page for the latest
-ARCH=$(uname -m)       # x86_64 or aarch64
-curl -fsSL -o /tmp/youki.tar.gz \
-  "https://github.com/youki-dev/youki/releases/download/v${VERSION}/youki-${VERSION}-${ARCH}-musl.tar.gz"
-tar -xzf /tmp/youki.tar.gz -C /tmp youki
-sudo install -m 0755 /tmp/youki /usr/local/bin/youki
-youki --version
-```
-
-The worker finds `youki` on its `PATH`. If you run the worker under systemd,
-check that `/usr/local/bin` is on the unit's `PATH`, or install the binary to
-`/usr/bin`.
-
-### runc or crun instead
-
-Any OCI-spec runtime works, because they all take the same bundle. Your
-distribution's package is the quickest route:
+Every Linux container runs in its own user namespace by default
+([`security.userNamespace`](task-runtime-container.md#security)), and its
+task directory and volumes are idmapped mounts. That needs **runc 1.2 or
+newer**. Distribution packages can be older (check `runc --version`), and
+the worker refuses a user-namespaced start on an older runc, naming the fix.
+[runc](https://github.com/opencontainers/runc) publishes static release
+binaries. Pick the current version from its
+[releases page](https://github.com/opencontainers/runc/releases):
 
 ```bash
-sudo apt-get install -y runc      # or: crun
+VERSION=1.5.2          # see the releases page for the latest; 1.2.0 at least
+ARCH=$(dpkg --print-architecture 2>/dev/null || uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/')
+curl -fsSL -o /tmp/runc \
+  "https://github.com/opencontainers/runc/releases/download/v${VERSION}/runc.${ARCH}"
+sudo install -m 0755 /tmp/runc /usr/local/sbin/runc
+runc --version
 ```
 
+The worker finds `runc` on its `PATH`. If you run the worker under systemd,
+check that `/usr/local/sbin` is on the unit's `PATH`, or install the binary to
+`/usr/sbin`.
+
+### crun instead
+
+Legion supports one other OCI runtime, [crun](https://github.com/containers/crun).
 Point the worker at it with `LEGION_OCI_RUNTIME`, in the worker's environment
 (for example in its systemd unit):
 
 ```bash
-LEGION_OCI_RUNTIME=runc legion join <token>
+LEGION_OCI_RUNTIME=crun legion join <token>
 ```
+
+crun implements idmapped mounts, so it runs the defaults. Legion's privilege
+floor has been verified on runc only, so check a crun node with a test job
+before you rely on it.
+
+The worker refuses any other runtime. It identifies the runtime by the first
+word of its `--version` output, so a renamed runc binary still works, but
+another OCI runtime fails every container start with:
+
+```text
+OCI runtime `/opt/bin/my-runtime` is not runc or crun (its `--version` reports `my-runtime version 2.0`); Legion runs containers with runc 1.2 or newer (the default) or crun. Install one, and point LEGION_OCI_RUNTIME at it or unset LEGION_OCI_RUNTIME to use runc from PATH
+```
+
+The sandbox runtime's Linux dev mode (`hypervisor = "dev"`) uses the same
+runtime, the same `LEGION_OCI_RUNTIME`, and the same check.
 
 ### Checking it
 
-A node whose runtime answers `--version` publishes a `container: pass`
-readiness check, visible in `legion node info <node>`. Without one, the key is
-absent and container tasks on that node fail at start with:
+A node whose runtime is an installed runc or crun publishes a
+`container: pass` readiness check, visible in `legion node info <node>`.
+Without one, the key is absent and container tasks on that node fail at start
+with:
 
 ```text
-OCI runtime `youki` is not installed on this node (install youki/runc/crun, or set LEGION_OCI_RUNTIME to one that is)
+OCI runtime `runc` is not installed on this node (install runc 1.2+ or crun, or set LEGION_OCI_RUNTIME to one that is)
 ```
+
+`container: pass` does not check runc's version. A runc older than 1.2 still
+passes, and its user-namespaced starts fail with:
+
+```text
+OCI runtime `runc` is runc 1.1.12-0ubuntu3, which predates idmapped mounts; security.userNamespace (on by default) needs them for the task directory and volumes. Install runc 1.2 or newer (the default) or crun, and point LEGION_OCI_RUNTIME at it, or set security.userNamespace = false on the task
+```
+
+The worker's data directory must be traversable by other users all the way
+down (`/var/lib/legion` is, at the default `0755`). A user-namespaced
+container's root is an unprivileged host id, and the runtime reaches the
+container's root filesystem by path as that id. The worker sets the modes of
+the directories it creates itself. A data directory under a `0700` parent
+such as `/root` fails container starts with an error naming that parent.
 
 Container images are pulled by the worker itself, over HTTPS, from the
 registry in the image reference. Workers need outbound access to the

@@ -90,6 +90,17 @@ pub(crate) enum ForwardableLaneWrite {
         #[serde(default)]
         explanation: Option<crate::storage::store::StopExplanation>,
     },
+    /// `Store::remove_failed_allocation` — scheduler lane. A worker's
+    /// failure report (or a pressure eviction that spends the move budget):
+    /// removes the allocation and records the move budget's verdict, and
+    /// the reschedule hold when it defers the replacement. Returns the
+    /// removed allocation and the verdict, when the allocation existed.
+    RemoveFailedAllocation {
+        allocation_id: i64,
+        cause: StopCause,
+        explanation: Option<crate::storage::store::StopExplanation>,
+        failure: crate::storage::store::FailedMove,
+    },
     /// `Store::enqueue_eval_after_delay` — scheduler lane. Returns the
     /// enqueued eval.
     EnqueueEval {
@@ -121,9 +132,17 @@ pub(crate) enum ForwardableLaneWrite {
     RecordVolumeError { volume_id: String, error: String },
     /// `Store::mark_volume_destroyed` — scheduler lane.
     MarkVolumeDestroyed { volume_id: String },
-    /// `Store::complete_allocation` — scheduler lane. Returns the completed
-    /// allocation, when one existed.
+    /// `Store::complete_allocation`'s scheduler-lane half. Returns the
+    /// completed allocation and the task status it decided, when the
+    /// allocation existed; the origin writes that status itself
+    /// (`SetTaskStatus`, status lane).
     CompleteAllocation { allocation_id: i64, success: bool },
+    /// `Store::set_task_status` — status lane. A batch completion's second
+    /// half, and a task failed for good, both from worker reports.
+    SetTaskStatus {
+        task_config_id: i64,
+        status: crate::structs::TaskStatusState,
+    },
     /// `Store::apply_snapshot_report` — scheduler lane. Worker snapshot
     /// reports ride heartbeats, which can land on any manager. Returns the
     /// applied outcome, for the caller's events.
@@ -137,6 +156,13 @@ pub(crate) enum ForwardableLaneWrite {
     BeginSuspend {
         new: crate::storage::store::NewSnapshot,
     },
+    /// `Store::emit_event_on(Lane::Status, ..)` — status lane. A standalone
+    /// event from a manager that leads no lane (a follower in `single`
+    /// topology), such as the `node.pressure` events a worker's heartbeat
+    /// carries.
+    EmitEvent {
+        draft: crate::storage::events::EventDraft,
+    },
 }
 
 impl ForwardableLaneWrite {
@@ -148,10 +174,13 @@ impl ForwardableLaneWrite {
             | ForwardableLaneWrite::NodeHealthChecks { .. }
             | ForwardableLaneWrite::MarkNodeReady { .. }
             | ForwardableLaneWrite::MarkNodeLost { .. }
-            | ForwardableLaneWrite::AllocationHealthSnapshots { .. } => Lane::Status,
+            | ForwardableLaneWrite::AllocationHealthSnapshots { .. }
+            | ForwardableLaneWrite::SetTaskStatus { .. }
+            | ForwardableLaneWrite::EmitEvent { .. } => Lane::Status,
             ForwardableLaneWrite::SyncNodeAvailability { .. }
             | ForwardableLaneWrite::MarkJobFailed { .. } => Lane::Control,
             ForwardableLaneWrite::RemoveAllocationById { .. }
+            | ForwardableLaneWrite::RemoveFailedAllocation { .. }
             | ForwardableLaneWrite::EnqueueEval { .. }
             | ForwardableLaneWrite::SeedKeyedInstances { .. }
             | ForwardableLaneWrite::RecordVolumeMounted { .. }
@@ -176,14 +205,17 @@ impl ForwardableLaneWrite {
             ForwardableLaneWrite::SyncNodeAvailability { .. } => "sync_node_availability",
             ForwardableLaneWrite::MarkJobFailed { .. } => "mark_job_failed",
             ForwardableLaneWrite::RemoveAllocationById { .. } => "remove_allocation_by_id",
+            ForwardableLaneWrite::RemoveFailedAllocation { .. } => "remove_failed_allocation",
             ForwardableLaneWrite::EnqueueEval { .. } => "enqueue_eval",
             ForwardableLaneWrite::SeedKeyedInstances { .. } => "seed_keyed_instances",
             ForwardableLaneWrite::RecordVolumeMounted { .. } => "record_volume_mounted",
             ForwardableLaneWrite::RecordVolumeError { .. } => "record_volume_error",
             ForwardableLaneWrite::MarkVolumeDestroyed { .. } => "mark_volume_destroyed",
             ForwardableLaneWrite::CompleteAllocation { .. } => "complete_allocation",
+            ForwardableLaneWrite::SetTaskStatus { .. } => "set_task_status",
             ForwardableLaneWrite::ApplySnapshotReport { .. } => "apply_snapshot_report",
             ForwardableLaneWrite::BeginSuspend { .. } => "begin_suspend",
+            ForwardableLaneWrite::EmitEvent { .. } => "emit_event",
         }
     }
 }
@@ -250,6 +282,12 @@ pub(crate) fn execute(store: &Store, op: ForwardableLaneWrite) -> ForwardOutcome
             cause,
             explanation,
         } => done(store.remove_allocation_by_id_local(allocation_id, cause, explanation)),
+        ForwardableLaneWrite::RemoveFailedAllocation {
+            allocation_id,
+            cause,
+            explanation,
+            failure,
+        } => done(store.remove_failed_allocation_local(allocation_id, cause, explanation, failure)),
         ForwardableLaneWrite::EnqueueEval {
             kind,
             job_id,
@@ -296,10 +334,15 @@ pub(crate) fn execute(store: &Store, op: ForwardableLaneWrite) -> ForwardOutcome
             allocation_id,
             success,
         } => done(store.complete_allocation_local(allocation_id, success)),
+        ForwardableLaneWrite::SetTaskStatus {
+            task_config_id,
+            status,
+        } => done(store.set_task_status_local(task_config_id, status)),
         ForwardableLaneWrite::ApplySnapshotReport { node_id, report } => {
             done(store.apply_snapshot_report_local(&node_id, &report))
         }
         ForwardableLaneWrite::BeginSuspend { new } => done(store.begin_suspend_local(new)),
+        ForwardableLaneWrite::EmitEvent { draft } => done(store.emit_event_on(Lane::Status, draft)),
     }
 }
 
@@ -338,6 +381,19 @@ mod tests {
                 cause: StopCause::Unknown,
                 explanation: None,
             },
+            ForwardableLaneWrite::RemoveFailedAllocation {
+                allocation_id: 8,
+                cause: StopCause::NodePressure,
+                explanation: None,
+                failure: crate::storage::store::FailedMove {
+                    policy: crate::storage::store::MovePolicy {
+                        move_delay_ms: 30_000,
+                        move_count: Some(3),
+                        move_period_ms: 1_800_000,
+                    },
+                    reason: "boom".into(),
+                },
+            },
             ForwardableLaneWrite::EnqueueEval {
                 kind: "job_reschedule".into(),
                 job_id: Some("job".into()),
@@ -364,6 +420,10 @@ mod tests {
             ForwardableLaneWrite::CompleteAllocation {
                 allocation_id: 9,
                 success: true,
+            },
+            ForwardableLaneWrite::SetTaskStatus {
+                task_config_id: 9,
+                status: crate::structs::TaskStatusState::Success,
             },
             ForwardableLaneWrite::ApplySnapshotReport {
                 node_id: "n1".into(),
@@ -396,6 +456,12 @@ mod tests {
                     suspend_reason: Some("idle".into()),
                     durability: crate::structs::snapshot::SnapshotDurability::Local,
                 },
+            },
+            ForwardableLaneWrite::EmitEvent {
+                draft: crate::storage::events::EventDraft::warn("node.pressure", "evicted")
+                    .node("n1")
+                    .allocation(5)
+                    .meta(serde_json::json!({ "step": "evict-bursting" })),
             },
         ];
         for op in ops {

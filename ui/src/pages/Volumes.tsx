@@ -41,7 +41,11 @@ function VolumesContent() {
 
   const [volumes] = createResource(
     () => tick() + 1,
-    retainOnError(async () => (await managerClient.listVolumes({})).volumes, () => 'volumes'),
+    // Tombstones too: the page filters them client-side ("All", "Destroyed").
+    retainOnError(
+      async () => (await managerClient.listVolumes({ includeDestroyed: true })).volumes,
+      () => 'volumes',
+    ),
   )
   const [drivers] = createResource(
     () => tick() + 1,

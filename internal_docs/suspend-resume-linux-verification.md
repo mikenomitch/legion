@@ -647,7 +647,7 @@ ps -o args= -C firecracker
 - **Pass:** a normal sandbox shows `--no-api --config-file …`. A
   checkpointable one shows `--api-sock <alloc>/.sandbox/vmm.sock --config-file
   …`, and its config JSON (`<alloc>/.sandbox/firecracker.json`) has a fourth
-  drive `identity` whose `path_on_host` is under `allocs/.vmdev/`.
+  drive `identity` whose `path_on_host` is under `<data dir>/vmdev/`.
 
 ### 3b.3 Identity disk inside the guest
 

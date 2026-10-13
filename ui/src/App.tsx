@@ -275,7 +275,7 @@ const Layout = (props: RouteSectionProps) => {
         heading: 'Cluster',
         items: [
           { kind: 'item', label: 'Workers', path: '/nodes', title: 'Workers', copy: 'Worker nodes running your allocations.', icon: 'server' },
-          { kind: 'item', label: 'Managers', path: '/manager', title: 'Managers', copy: 'Manager nodes and their configuration.', icon: 'network' },
+          { kind: 'item', label: 'Managers', path: '/manager', title: 'Managers', copy: 'Every manager in the control plane, its raft role, and whether it is reachable.', icon: 'network' },
           { kind: 'item', label: 'Raft', path: '/raft', title: 'Raft', copy: 'Consensus status, elections, and membership.', icon: 'gitBranch' },
           { kind: 'item', label: 'Events', path: '/events', title: 'Events', copy: 'Live stream of scheduler activity.', icon: 'zap' },
         ],

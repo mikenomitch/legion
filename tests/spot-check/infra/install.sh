@@ -133,10 +133,12 @@ on_mgr1 legion raft status
 for name in "${SC_WORKERS[@]}"; do
     if sc_ssh "$name" "systemctl is-active --quiet legion-worker"; then continue; fi
     sc_log "Joining $name"
-    # Long-lived on purpose: with ACLs on, a worker re-registers with this
-    # same join token every time it restarts, so an expired token strands the
-    # node ("unknown or revoked join token"). See the findings doc.
-    join="$(on_mgr1 legion join-token create --type default --ttl 720h -j | jq -r .data.token)"
+    # A restarted worker re-registers with its persisted node token (P0-8),
+    # so the join token only has to outlive the first registration. It still
+    # goes in a root-only file, not the unit's command line, where any local
+    # user (and every host-mode exec task) could read it from ps.
+    join="$(on_mgr1 legion join-token create --type default --ttl 24h -j | jq -r .data.token)"
+    sc_ssh "$name" "sudo mkdir -p /etc/legion && sudo sh -c 'umask 077 && cat > /etc/legion/join-token'" <<<"$join"
     ip="$(sc_private_ip "$name")"
     sc_ssh "$name" "sudo tee /etc/systemd/system/legion-worker.service >/dev/null" <<UNIT
 [Unit]
@@ -146,13 +148,15 @@ Wants=network-online.target
 
 [Service]
 WorkingDirectory=/var/lib/legion
-ExecStart=/opt/legion/bin/legion start worker $join --name $name
+ExecStart=/opt/legion/bin/legion start worker --token-file /etc/legion/join-token --name $name
 Environment=RUST_LOG=info
 Environment=LEGION_DATA_DIR=/var/lib/legion
-# SPOT-CHECK SHIM: bind and advertise the private IP so managers can dial
-# exec and logs. See src/worker/daemon.rs and worker-plane-auth-plan.md.
+# Bind and advertise the private IP: managers dial the worker plane there
+# (docs/architecture-managers-workers.md, "Ports and who dials whom").
 Environment=LEGION_WORKER_HOST=$ip
 Environment=LEGION_WORKER_ADVERTISE_ADDR=$ip
+# Containers run under runc, Legion's default, found on PATH in
+# /usr/local/bin (cloud-init installs it), so no LEGION_OCI_RUNTIME is set.
 Restart=on-failure
 # Tasks outlive the worker process, and the worker re-adopts them on start.
 KillMode=process

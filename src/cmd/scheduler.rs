@@ -38,7 +38,7 @@ pub fn config() -> Command {
         .subcommand(concurrency_cmd)
 }
 
-#[instrument(err, skip_all)]
+#[instrument(skip_all)]
 pub async fn handle(sub_matches: &ArgMatches) -> R<()> {
     match sub_matches.subcommand() {
         Some(("concurrency", arg_matches)) => {
@@ -48,7 +48,7 @@ pub async fn handle(sub_matches: &ArgMatches) -> R<()> {
     }
 }
 
-#[instrument(err, skip_all)]
+#[instrument(skip_all)]
 async fn get_scheduler_concurrency(format: OutputFormat) -> R<()> {
     let mut client = connect_manager_client().await?;
     let reply = output::resolve(

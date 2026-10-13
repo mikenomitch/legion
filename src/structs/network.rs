@@ -178,13 +178,27 @@ pub fn resolve_network_mode_with(
     }
 }
 
+/// The OS a task's own constraints pin it to (`os = "linux"`), when they do.
+fn constrained_os(task: &crate::structs::TaskConfig) -> Option<String> {
+    crate::constraints::ConstraintSet::new(&task.constraints)
+        .ok()?
+        .equality_bindings()
+        .get("os")
+        .and_then(Value::as_str)
+        .map(str::to_ascii_lowercase)
+}
+
 /// Warnings for tasks that would run gated with nothing allowing their
 /// egress, so an author and an agent see it before the first `403`
 /// (worker-plane-auth plan §6.12). `covered` says whether a stored policy
 /// object could supply the egress chain; the CLI, which cannot see stored
-/// policies, passes `|_| false`. A `container` that leaves the mode unset is
-/// gated on Linux nodes, which is what the warning assumes: on macOS nodes it
-/// runs on host networking and the warning does not apply.
+/// policies, passes `|_| false`.
+///
+/// A `container` that leaves the mode unset is gated only on Linux nodes
+/// ([`resolve_network_mode_with`]); on macOS nodes it runs on host
+/// networking. So the warning follows the task's `os` constraint: pinned to
+/// macOS it is silent, pinned to Linux it says the task is gated, and
+/// unpinned it says the task is gated on Linux nodes.
 pub fn gated_egress_warnings(
     config: &crate::structs::JobConfig,
     covered: impl Fn(&crate::structs::TaskConfig) -> bool,
@@ -200,9 +214,14 @@ pub fn gated_egress_warnings(
             .unwrap_or_default();
         let auto = declared.is_empty() || declared == crate::structs::netpolicy::MODE_AUTO;
         let why = match (task.runtime.as_str(), auto) {
-            ("container", true) => "gated (the default for containers on Linux)",
+            ("container", true) => match constrained_os(task).as_deref() {
+                Some("linux") => "is gated (the default for containers on Linux)",
+                // Any other pinned OS (macOS) resolves `auto` to host.
+                Some(_) => continue,
+                None => "is gated on Linux nodes (the default for containers there)",
+            },
             ("container" | "exec", false) if declared == crate::structs::netpolicy::MODE_GATED => {
-                "gated"
+                "is gated"
             }
             _ => continue,
         };
@@ -210,7 +229,7 @@ pub fn gated_egress_warnings(
             continue;
         }
         warnings.push(format!(
-            "task {:?} is {why} and allows no egress. Outbound connections will be refused \
+            "task {:?} {why} and allows no egress. Outbound connections will be refused \
              with `gated-default`.\nhint: add hosts to network.egress.allow, apply a policy \
              object, or set network.mode = \"host\"",
             task.name
@@ -2090,6 +2109,10 @@ mod tests {
             "name": "web",
             "tasks": [
                 { "name": "default", "runtime": "container", "config": { "image": "nginx" } },
+                { "name": "linux", "runtime": "container", "config": { "image": "nginx" },
+                  "constraints": { "os": "linux" } },
+                { "name": "macos", "runtime": "container", "config": { "image": "nginx" },
+                  "constraints": { "os": "macos" } },
                 { "name": "allowed", "runtime": "container", "config": { "image": "nginx" },
                   "network": { "egress": { "allow": ["api.stripe.com:443"] } } },
                 { "name": "host", "runtime": "container", "config": { "image": "nginx" },
@@ -2101,13 +2124,18 @@ mod tests {
         }))
         .unwrap();
         let warnings = gated_egress_warnings(&job, |_| false);
-        assert_eq!(warnings.len(), 2, "{warnings:?}");
+        // The macOS-pinned container is absent: `auto` is host there.
+        assert_eq!(warnings.len(), 3, "{warnings:?}");
         assert!(warnings[0].starts_with(
-            "task \"default\" is gated (the default for containers on Linux) and allows no egress"
+            "task \"default\" is gated on Linux nodes (the default for containers there) and \
+             allows no egress"
         ));
         assert!(warnings[0].contains("`gated-default`"));
         assert!(warnings[0].contains("\nhint: add hosts to network.egress.allow"));
-        assert!(warnings[1].starts_with("task \"gated-exec\" is gated and allows no egress"));
+        assert!(warnings[1].starts_with(
+            "task \"linux\" is gated (the default for containers on Linux) and allows no egress"
+        ));
+        assert!(warnings[2].starts_with("task \"gated-exec\" is gated and allows no egress"));
         // A stored policy object that covers the task silences it.
         assert!(gated_egress_warnings(&job, |_| true).is_empty());
     }

@@ -27,6 +27,19 @@ async fn main() -> R<()> {
     );
     init_tracing_with_options(enable_o11y, mcp_mode, server_mode)?;
 
+    // Long-running processes keep Rust's default of ignoring SIGPIPE, so a
+    // peer hanging up surfaces as an EPIPE error they can handle. Every other
+    // command is a one-shot CLI whose stdout may be piped into `head`.
+    let long_running = server_mode
+        || mcp_mode
+        || matches!(
+            matches.subcommand_name(),
+            Some("join" | "guest-agent" | "guest-resume")
+        );
+    if !long_running {
+        restore_default_sigpipe();
+    }
+
     match matches.subcommand() {
         Some(("capabilities", sub_matches)) => cmd::capabilities::handle(sub_matches).await?,
         Some(("mcp", sub_matches)) => cmd::mcp::handle(sub_matches).await?,
@@ -66,4 +79,23 @@ async fn main() -> R<()> {
     };
 
     Ok(())
+}
+
+/// Let the kernel end a one-shot CLI quietly when its reader goes away.
+///
+/// Rust ignores SIGPIPE at startup, so `legion raft status | head` turned the
+/// closed pipe into an EPIPE that `println!` panics on. Restoring the default
+/// disposition makes the CLI exit like `cat` or `grep` do: killed by SIGPIPE,
+/// which the shell reports as status 141 (128 + 13). That is the convention
+/// `set -o pipefail` scripts already expect, and it covers every print site
+/// without threading write errors through each command.
+fn restore_default_sigpipe() {
+    #[cfg(unix)]
+    // SAFETY: called once at startup, before this process writes to stdout.
+    // The gRPC connection is unaffected: std and mio write TCP sockets with
+    // MSG_NOSIGNAL (Linux) or SO_NOSIGPIPE (macOS), so a dropped manager
+    // connection is still an error, not a signal.
+    unsafe {
+        libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+    }
 }

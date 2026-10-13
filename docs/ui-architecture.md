@@ -294,7 +294,20 @@ the Access page reports it instead.
   warns when any job reads the key. **+ New** only creates. The KV
   encryption-at-rest strip (`components/KeyringStrip.tsx`, `operator:read`)
   sits at the top. See [KV Store](kv-store.md#in-the-ui).
-- `Manager.tsx`: manager config snapshots. `pages/details/ManagerNodeDetail.tsx`
+- `Manager.tsx`: every manager in the cluster, from `ListManagers`. The
+  roster is the replicated raft membership, so the page lists all members
+  whether the UI points at the leader or a follower, and a manager that is
+  down stays listed. Each row shows the role (`leader`, `follower`,
+  `learner`, or `standalone` outside raft), the advertised address, live
+  reachability from the answering manager (latency, or `unreachable` with
+  the probe error on hover), the member's term and applied index with its
+  lag behind the furthest member, and when its config snapshot was written.
+  A warning names how many members did not answer. Outside raft the table
+  has one row. The manager name links to its config page only when it has
+  a snapshot: a manager writes one when it leads the control lane, so a
+  manager that has never led shows `—`. The page used to list the config
+  table itself, which showed only managers that had led.
+  `pages/details/ManagerNodeDetail.tsx`
   renders the published config as an at-a-glance summary, feature tiles
   (exec, telemetry, ACLs, workload identity, KV encryption, edge boot,
   auto-suspend, adaptive heartbeats), and per-area cards. Unknown keys go
@@ -671,7 +684,8 @@ same rule that a selector never matches a request without that attribute.
   `node:read`).
 - **Logging in.** ACLs are on by default, so a fresh cluster's UI opens on the
   log-in card. Paste the initial management token from
-  `<dataDir>/bootstrap-token` (or `~/.legion/token` on the manager's machine),
+  `<dataDir>/bootstrap-token` (or `~/.legion/tokens/<host>_<port>` on the
+  manager's machine),
   or log in with any configured auth method. The UI does not log in
   automatically on the manager's machine: loopback is exactly where workloads
   live, so being local proves nothing.

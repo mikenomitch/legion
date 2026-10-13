@@ -21,6 +21,35 @@ with every worker protocol version up to their own. They cannot promise to
 satisfy a contract newer than they know about, so a worker upgraded before
 its managers is rejected at registration.
 
+## Restarting a worker in place
+
+A worker restarted in place re-adopts the tasks it left running, so their
+processes keep running through the upgrade (see
+[Running a worker under a service manager](architecture-managers-workers.md#running-a-worker-under-a-service-manager)
+for the settings that make that work). Their network connections do not
+all survive it.
+
+The node's datapath runs inside the worker process. That covers the
+[`connect`](service-discovery.md#connecting-to-services-the-connect-block)
+upstream listeners a task dials, and the ingress listeners, TLS termination
+and [handlers](network-handlers.md) in front of its ports. When the worker
+process exits, every connection passing through them is severed, and new
+dials fail until the restarted worker re-registers and its first heartbeat
+brings back the endpoint feed. A task's own listeners, and connections that
+reach them without passing through the datapath, are unaffected.
+
+So a task that keeps a long-lived connection through the mesh sees it drop
+on every worker restart, even though the task itself never restarted:
+
+- **Reconnect in the app.** Treat a closed or reset upstream connection as
+  retryable, and re-dial with backoff. Most database pools and gRPC channels
+  do this already. An app that opens one connection at startup and never
+  re-dials stays broken until it is restarted or rescheduled, as a web app
+  holding a single database connection through `connect` does.
+- **Drain first when that is not acceptable.** `legion node drain <node>`
+  moves the allocations to other nodes before you restart the worker, and
+  `legion node uncordon <node>` returns the node afterward.
+
 ## Stopping a manager
 
 Restart managers with SIGTERM (or Ctrl-C, which sends SIGINT). That's what

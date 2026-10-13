@@ -34,9 +34,9 @@ pub(crate) const KERNEL_ENV: &str = "LEGION_SANDBOX_KERNEL";
 /// Overrides for the VMM binaries, for nodes that install them off-PATH.
 const CLOUD_HYPERVISOR_BIN_ENV: &str = "LEGION_CLOUD_HYPERVISOR_BIN";
 const FIRECRACKER_BIN_ENV: &str = "LEGION_FIRECRACKER_BIN";
-/// Linux dev mode reuses the container runtime's OCI runtime selection.
-const OCI_RUNTIME_ENV: &str = "LEGION_OCI_RUNTIME";
-const DEFAULT_OCI_RUNTIME: &str = "youki";
+// Linux dev mode reuses the container runtime's OCI runtime selection, so a
+// node's `LEGION_OCI_RUNTIME` (and the default) means the same for both.
+use crate::task_plugins::container::{DEFAULT_OCI_RUNTIME, OCI_RUNTIME_ENV};
 /// Overrides the `mkfs.ext4` binary (some distros keep it out of a
 /// non-root PATH).
 const MKFS_ENV: &str = "LEGION_MKFS_EXT4";
@@ -280,7 +280,7 @@ pub(crate) fn installed_vmms() -> Vec<Backend> {
 
 /// The version a VMM binary reports for `--version`, normalized to bare
 /// `X.Y.Z` (Firecracker prints `Firecracker v1.7.0`, cloud-hypervisor
-/// `cloud-hypervisor v41.0.0`). `None` when the binary cannot be run.
+/// `cloud-hypervisor v51.2`). `None` when the binary cannot be run.
 pub(crate) fn vmm_version(binary: &str) -> Option<String> {
     let output = Command::new(binary).arg("--version").output().ok()?;
     if !output.status.success() {
@@ -289,8 +289,12 @@ pub(crate) fn vmm_version(binary: &str) -> Option<String> {
     parse_vmm_version(&String::from_utf8_lossy(&output.stdout))
 }
 
-/// The first whitespace-separated token that looks like a version, with any
-/// leading `v` dropped.
+/// The first whitespace-separated token that looks like a version, in
+/// canonical form ([`canonical_vmm_version`]). The node fingerprint (from
+/// the `--version` banner) and a checkpoint's `compat.vmm.version` (from
+/// the VMM API) both go through here, so one binary records one string.
+///
+/// [`canonical_vmm_version`]: crate::structs::checkpoint::canonical_vmm_version
 pub(crate) fn parse_vmm_version(text: &str) -> Option<String> {
     text.split_whitespace()
         .map(|token| token.trim_start_matches('v'))
@@ -298,9 +302,9 @@ pub(crate) fn parse_vmm_version(text: &str) -> Option<String> {
             token.chars().next().is_some_and(|ch| ch.is_ascii_digit()) && token.contains('.')
         })
         .map(|token| {
-            token
-                .trim_end_matches(|ch: char| !ch.is_ascii_alphanumeric())
-                .to_string()
+            crate::structs::checkpoint::canonical_vmm_version(
+                token.trim_end_matches(|ch: char| !ch.is_ascii_alphanumeric()),
+            )
         })
 }
 
@@ -701,7 +705,10 @@ pub(crate) fn render_init_script(payload: &GuestPayload) -> String {
     // Loopback up so the workload can talk to itself even with no NIC.
     script.push_str("ip link set lo up 2>/dev/null || ifconfig lo up 2>/dev/null\n\n");
 
-    for mount in &payload.disk_mounts {
+    // (index, quoted path) of every volume init mounts, for the unmount at
+    // shutdown. `legion_vol_<index>=1` records that the mount succeeded.
+    let mut mounted: Vec<(usize, String)> = Vec::new();
+    for (index, mount) in payload.disk_mounts.iter().enumerate() {
         let Some(path) = mount.path.as_deref() else {
             // Attach-only: the workload consumes the raw device.
             continue;
@@ -715,10 +722,12 @@ pub(crate) fn render_init_script(payload: &GuestPayload) -> String {
         script.push_str(&format!(
             "if mount -t {fs}{options} {device} {quoted}; then\n\
              \x20   echo \"legion: mounted volume {device} at {path}\"\n\
+             \x20   legion_vol_{index}=1\n\
              else\n\
              \x20   echo \"legion: FAILED to mount volume {device} at {path}\" >&2\n\
              fi\n\n"
         ));
+        mounted.push((index, quoted));
     }
 
     if payload.guest_agent {
@@ -791,9 +800,36 @@ pub(crate) fn render_init_script(payload: &GuestPayload) -> String {
         .map(|arg| sh_quote(arg))
         .collect::<Vec<_>>()
         .join(" ");
-    script.push_str(&format!("{command}\nstatus=$?\n"));
+    script.push_str(&render_command_supervision(&command));
     script.push_str("echo \"legion: sandbox command exited with status $status\"\n");
     script.push_str("sync\n\n");
+    if !mounted.is_empty() {
+        // Unmount the volume disks before the power goes, so every write has
+        // reached the VMM and each filesystem is clean for the next boot.
+        // Whatever still holds them open (a stray the command left behind,
+        // an exec session, the agent) is killed first: the machine is going
+        // down either way, and `poweroff -f` would not ask them nicely
+        // either.
+        script.push_str(
+            "# Shut down cleanly: the volume disks outlive this boot.\n\
+             kill -9 -1 2>/dev/null\n\
+             legion_umount() {\n\
+             \x20   umount \"$1\" 2>/dev/null && return 0\n\
+             \x20   sleep 1 2>/dev/null\n\
+             \x20   umount \"$1\" 2>/dev/null && return 0\n\
+             \x20   mount -o remount,ro \"$1\" 2>/dev/null && return 0\n\
+             \x20   echo \"legion: could not unmount volume at $1; its data was synced\" >&2\n\
+             }\n",
+        );
+        // Reverse declaration order, so a volume mounted inside another
+        // comes off first.
+        for (index, quoted) in mounted.iter().rev() {
+            script.push_str(&format!(
+                "if [ -n \"$legion_vol_{index}\" ]; then legion_umount {quoted}; fi\n"
+            ));
+        }
+        script.push_str("sync\n\n");
+    }
     // A microVM has no service manager to stop: init must halt the machine so
     // the VMM process exits and the worker sees the task finish.
     script.push_str("poweroff -f 2>/dev/null || halt -f 2>/dev/null || reboot -f 2>/dev/null\n");
@@ -802,6 +838,70 @@ pub(crate) fn render_init_script(payload: &GuestPayload) -> String {
     // cmdline turns that panic into a reboot, which the VMM treats as exit.
     script.push_str("exit $status\n");
     script
+}
+
+/// The signals init answers as a stop request: every `stop.signal` Legion
+/// accepts ([`crate::structs::STOP_SIGNALS`]), without the `SIG` prefix.
+const GUEST_STOP_SIGNALS: [&str; 6] = ["TERM", "INT", "HUP", "QUIT", "USR1", "USR2"];
+
+/// The part of `/legion/init` that runs the sandbox command (already
+/// shell-quoted) and answers a stop request, leaving the command's exit
+/// status in `$status`.
+///
+/// A stop request is a signal to PID 1, which the worker has the guest agent
+/// send with the task's `stop.signal` (see `SandboxTaskPlugin::stop_with`).
+/// Init flushes the guest's page cache at once, so everything written before
+/// the request reaches the disks even if the workload then ignores the
+/// signal and the VMM is killed at the deadline, and passes the signal on to
+/// the command.
+///
+/// The command runs in the background because a shell runs a trap only
+/// between commands: `wait` is the one place it can be interrupted. A
+/// background command would otherwise read `/dev/null`, so the console is
+/// handed through as fd 3 when init has one. The probe for "has one" runs in
+/// a subshell because dash treats a failed redirection on `exec` (or any
+/// builtin) as fatal, and a dead PID 1 panics the kernel. It dups to fd 3,
+/// not onto fd 0, because dash skips a `<&0` as a no-op, and it redirects
+/// nothing else, because opening `/dev/null` would land on a closed fd 0 and
+/// fake the answer. `exec` in the function makes `$!` the command itself,
+/// not a subshell around it.
+///
+/// Split out so a test can run it under a real shell: the rest of init
+/// mounts, kills every process, and powers off.
+pub(crate) fn render_command_supervision(command: &str) -> String {
+    let mut block = String::from(
+        "# A stop request is a signal to PID 1, sent by the guest agent for the worker.\n\
+         legion_child=\n\
+         legion_stop() {\n\
+         \x20   echo \"legion: stop requested (SIG$1); flushing disks and signalling the sandbox command\"\n\
+         \x20   sync\n\
+         \x20   if [ -n \"$legion_child\" ]; then kill -s \"$1\" \"$legion_child\" 2>/dev/null; fi\n\
+         }\n",
+    );
+    for signal in GUEST_STOP_SIGNALS {
+        block.push_str(&format!("trap 'legion_stop {signal}' {signal}\n"));
+    }
+    block.push_str(&format!(
+        "legion_run() {{\n\
+         \x20   exec {command}\n\
+         }}\n\
+         if (true 3<&0); then\n\
+         \x20   exec 3<&0\n\
+         \x20   legion_run <&3 3<&- &\n\
+         else\n\
+         \x20   legion_run &\n\
+         fi\n\
+         legion_child=$!\n\
+         exec 3<&-\n\
+         while :; do\n\
+         \x20   wait \"$legion_child\"\n\
+         \x20   status=$?\n\
+         \x20   # A trapped signal interrupts wait (status over 128) while the command runs on.\n\
+         \x20   kill -0 \"$legion_child\" 2>/dev/null || break\n\
+         done\n\
+         legion_child=\n"
+    ));
+    block
 }
 
 /// Writes `/legion/init` (executable) and `/legion/env` into an extracted
@@ -1220,9 +1320,26 @@ mod tests {
         );
         assert_eq!(
             parse_vmm_version("cloud-hypervisor v41.0.0-dirty\n").as_deref(),
-            Some("41.0.0-dirty")
+            Some("41.0.0")
         );
         assert_eq!(parse_vmm_version("no version here"), None);
+    }
+
+    /// cloud-hypervisor's banner prints `v51.2` while its `vmm.ping` says
+    /// `51.2.0`: both must record the same string, or a node refuses its own
+    /// memory checkpoints.
+    #[test]
+    fn the_banner_and_the_api_record_one_version() {
+        assert_eq!(
+            parse_vmm_version("cloud-hypervisor v51.2\n"),
+            parse_vmm_version("51.2.0")
+        );
+        assert_eq!(parse_vmm_version("51.2.0").as_deref(), Some("51.2.0"));
+        assert_eq!(
+            parse_vmm_version("cloud-hypervisor v51.2-5-gabc1234-dirty\n").as_deref(),
+            Some("51.2.0")
+        );
+        assert_eq!(parse_vmm_version("v1.7.0").as_deref(), Some("1.7.0"));
     }
 
     #[test]
@@ -1579,6 +1696,197 @@ mod tests {
         assert!(script.contains("poweroff -f"));
         assert!(script.contains("sysrq-trigger"));
         assert!(script.contains("exit $status"));
+
+        // The volumes come off before the power goes, innermost (last
+        // declared) first, after whatever holds them open is gone, and only
+        // when init actually mounted them.
+        let at = |needle: &str| {
+            script
+                .find(needle)
+                .unwrap_or_else(|| panic!("{needle:?} in {script}"))
+        };
+        let killed = at("kill -9 -1");
+        let models = at("legion_umount '/models'");
+        let workspace = at("legion_umount '/workspace'");
+        let poweroff = at("poweroff -f");
+        assert!(at("status=$?") < killed);
+        assert!(killed < models && models < workspace && workspace < poweroff);
+        assert!(script.contains("legion_vol_0=1"));
+        assert!(script.contains("if [ -n \"$legion_vol_0\" ]; then legion_umount '/workspace'; fi"));
+    }
+
+    /// A guest with no volumes has nothing to unmount, so its shutdown stays
+    /// what it was: sync, then power off.
+    #[test]
+    fn init_script_without_volumes_skips_the_unmount() {
+        let script = render_init_script(&GuestPayload {
+            command: vec!["true".into()],
+            ..GuestPayload::default()
+        });
+        assert!(!script.contains("kill -9 -1"));
+        assert!(!script.contains("legion_umount"));
+        // Every guest still answers a stop request.
+        assert!(script.contains("trap 'legion_stop TERM' TERM"));
+    }
+
+    /// Init must answer every signal a jobspec's `stop.signal` can name, or a
+    /// stop request with that signal is silently dropped by the kernel (PID 1
+    /// gets only the signals it has a handler for) and the guest is killed at
+    /// the deadline instead.
+    #[test]
+    fn init_traps_every_stop_signal() {
+        let block = render_command_supervision("true");
+        for signal in crate::structs::STOP_SIGNALS {
+            let name = signal.trim_start_matches("SIG");
+            assert!(
+                block.contains(&format!("trap 'legion_stop {name}' {name}\n")),
+                "init does not trap {signal}"
+            );
+        }
+    }
+
+    /// The shells init may run under that this host has: `sh`, plus dash
+    /// and bash by name. Images ship all of these as `/bin/sh` (Debian and
+    /// Ubuntu dash, Fedora bash), and they differ exactly where init's
+    /// supervision is delicate (traps, background jobs, fd redirections).
+    #[cfg(unix)]
+    fn shells() -> Vec<PathBuf> {
+        let mut shells: Vec<PathBuf> = ["sh", "dash", "bash"]
+            .into_iter()
+            .filter_map(find_on_path)
+            .collect();
+        shells.dedup();
+        shells
+    }
+
+    /// How init's stdin looks to the supervision under test.
+    #[cfg(unix)]
+    #[derive(Clone, Copy)]
+    enum InitStdin {
+        Piped,
+        Closed,
+    }
+
+    /// Runs init's command supervision under `shell`, as init would with
+    /// `command`, and returns the shell with its stdout piped.
+    #[cfg(unix)]
+    fn supervise(
+        shell: &Path,
+        dir: &Path,
+        command: &str,
+        stdin: InitStdin,
+    ) -> R<std::process::Child> {
+        use std::os::unix::process::CommandExt as _;
+        let script = dir.join("supervise.sh");
+        std::fs::write(
+            &script,
+            format!(
+                "{}echo \"status=$status\"\n",
+                render_command_supervision(command)
+            ),
+        )?;
+        let mut cmd = Command::new(shell);
+        cmd.arg(&script)
+            .current_dir(dir)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null());
+        if let InitStdin::Closed = stdin {
+            // A kernel that could not open /dev/console starts init this way.
+            // SAFETY: close is async-signal-safe.
+            unsafe {
+                cmd.pre_exec(|| {
+                    libc::close(0);
+                    Ok(())
+                });
+            }
+        }
+        Ok(cmd.spawn()?)
+    }
+
+    /// The stop sequence inside the guest: a signal to init (the shell here)
+    /// reaches the command, init waits for the command to finish its own
+    /// shutdown, and reports the command's status, not the signal's.
+    #[cfg(unix)]
+    #[test]
+    fn init_passes_a_stop_signal_to_the_command_and_waits_for_it() -> R<()> {
+        for shell in shells() {
+            let dir = tempfile::tempdir()?;
+            let command = sh_quote(
+                "trap 'echo command-got-usr1; exit 7' USR1; touch ready; \
+                 while :; do sleep 0.05; done",
+            );
+            let init = supervise(
+                &shell,
+                dir.path(),
+                &format!("sh -c {command}"),
+                InitStdin::Piped,
+            )?;
+            let ready = dir.path().join("ready");
+            let started = std::time::Instant::now();
+            while !ready.exists() {
+                assert!(
+                    started.elapsed() < std::time::Duration::from_secs(10),
+                    "the command never started under {}",
+                    shell.display()
+                );
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            // What the guest agent does for the worker: signal init.
+            let pid = init.id() as libc::pid_t;
+            assert_eq!(unsafe { libc::kill(pid, libc::SIGUSR1) }, 0);
+
+            let output = init.wait_with_output()?;
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let shell = shell.display();
+            assert!(output.status.success(), "{shell}: {stdout}");
+            assert!(
+                stdout.contains("legion: stop requested (SIGUSR1)"),
+                "{shell}: {stdout}"
+            );
+            assert!(stdout.contains("command-got-usr1"), "{shell}: {stdout}");
+            assert!(stdout.ends_with("status=7\n"), "{shell}: {stdout}");
+        }
+        Ok(())
+    }
+
+    /// The command still reads init's stdin (the console), as it did when
+    /// init ran it in the foreground, and its own exit status comes through.
+    #[cfg(unix)]
+    #[test]
+    fn init_hands_the_command_its_stdin_and_status() -> R<()> {
+        use std::io::Write as _;
+        for shell in shells() {
+            let dir = tempfile::tempdir()?;
+            let command = sh_quote("read line; echo got-$line; exit 3");
+            let mut init = supervise(
+                &shell,
+                dir.path(),
+                &format!("sh -c {command}"),
+                InitStdin::Piped,
+            )?;
+            init.stdin.take().expect("stdin").write_all(b"hello\n")?;
+            let output = init.wait_with_output()?;
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            assert_eq!(stdout, "got-hello\nstatus=3\n", "{}", shell.display());
+        }
+        Ok(())
+    }
+
+    /// Init with no stdin at all still runs the command and lives on. A
+    /// failed redirection on `exec` is fatal to dash, and init dying is a
+    /// kernel panic.
+    #[cfg(unix)]
+    #[test]
+    fn init_survives_a_closed_stdin() -> R<()> {
+        for shell in shells() {
+            let dir = tempfile::tempdir()?;
+            let init = supervise(&shell, dir.path(), "sh -c 'exit 4'", InitStdin::Closed)?;
+            let output = init.wait_with_output()?;
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            assert_eq!(stdout, "status=4\n", "{}", shell.display());
+        }
+        Ok(())
     }
 
     /// The init script is generated code that only ever runs inside a guest,

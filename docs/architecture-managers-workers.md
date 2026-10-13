@@ -219,7 +219,18 @@ worker is not tied to the manager in its join token.
   error, including `Unauthenticated` or a not-the-leader rejection, is
   reachable and is not failed away from.
 - Every client the worker holds (heartbeats, health checks, workload
-  identity, artifact credentials, edge-boot ratification) follows the switch.
+  identity, KV templates, artifact credentials, node identity tokens,
+  edge-boot ratification) follows the switch. So does the JWKS fetch that
+  verifies boot and exec tickets: it asks the active manager, not the
+  token's.
+- Trust is per cluster, not per address. The managers share the cluster CA,
+  so every address a manager reports is dialed with the same verifier as the
+  token's manager: the token's CA pin, or the cluster CA bundle once the
+  worker holds one. When the bundle replaces the pin, it replaces it for
+  every manager at once. An address only says where to dial. The manager
+  there must still present a `manager.legion` certificate chained to that CA,
+  and an address no manager of the worker's cluster reported is never
+  trusted.
 - A restarted worker starts from the persisted set: if the token's manager
   does not answer, it tries the others in turn, forever, with backoff.
 
@@ -252,14 +263,54 @@ elsewhere). Two settings decide whether that works under systemd:
   running after unit stopped` for each task, which is expected. Choose
   `control-group` (or `mixed`) instead when you prefer a worker restart to
   restart its tasks too.
+- **The join token in a file.** A token passed as an argument stays in the
+  worker's command line for the life of the process, where any local user
+  can read it with `ps` or `/proc/<pid>/cmdline`, and every restart needs it
+  again. Write it to a root-owned `0600` file and pass `--token-file`. The
+  worker warns when the token arrives on the command line, and when the file
+  is readable by other users. There is no environment variable for the
+  token on purpose: exec tasks inherit the worker's environment.
 
 ```ini
 [Service]
-ExecStart=/usr/local/bin/legion join --name %H lgnjoin_...
+ExecStart=/usr/local/bin/legion join --name %H --token-file /etc/legion/join-token
 Environment=LEGION_DATA_DIR=/var/lib/legion
 KillMode=process
 Restart=always
 ```
+
+```sh
+sudo install -d -m 0700 /etc/legion
+legion join-token create --ttl 720h -j | jq -r .data.token \
+  | sudo install -m 0600 /dev/stdin /etc/legion/join-token
+```
+
+systemd's `LoadCredential=join-token:/etc/legion/join-token` with
+`--token-file ${CREDENTIALS_DIRECTORY}/join-token` works too, and keeps the
+file out of the unit's own filesystem view.
+
+The in-process worker of `legion start manager --run-worker` shares the
+manager's process, so it stops when the manager does and the manager waits
+for it (session checkpoints first) before exiting. On Linux its tasks
+outlive it and the next start re-adopts them, the same as a standalone
+worker. On macOS it stops every task before the process exits, so its Apple
+containers do not keep running after the cluster has gone. The next start
+runs them again under the same allocations. See
+[Stopping a single-process cluster](task-runtime-container.md#stopping-a-single-process-cluster-macos).
+
+A restarted worker re-registers with the node token it persisted, not the
+join token's secret, so revoking the join token after the first
+registration does not strand the node. The worker still reads the join
+token at every start for the manager address and the cluster CA pin it
+carries, so keep the file in place.
+
+Re-adoption keeps a task's processes, not its mesh connections. The node's
+datapath (`connect` upstream listeners, ingress listeners, TLS termination,
+handlers) runs inside the worker process, so a worker restart severs every
+connection in flight through it, and new dials fail until the restarted
+worker's first heartbeat brings back the endpoint feed. Apps should reconnect
+on a dropped upstream connection. See
+[Restarting a worker in place](upgrades.md#restarting-a-worker-in-place).
 
 When a task's tracked process is gone at restart but its children are not
 (a `sh -c` wrapper that exited while its server kept running), the worker
@@ -443,13 +494,19 @@ whatever the heartbeat cadence:
   allocations added or changed (the full payload, exactly what the desired
   set would carry), and the allocations that left with why (their stop
   notices). The worker starts a new allocation as soon as its delta lands,
-  through the same path a push takes, and runs its reconcile at once for a
+  through the same launch path a push takes (the stream was authenticated
+  when the worker opened it, so no per-delta certificate check applies),
+  and runs its reconcile at once for a
   stop or a changed payload. It acks each message it applied.
 - **Full resync.** A worker the manager cannot continue gets its whole
   desired set once, in place of what it holds, then deltas. That happens
   when the position the worker reconnects with is from another manager
   process (a failover, a manager restart, a different manager), is ahead of
-  the manager's, or is older than the messages the manager still holds.
+  the manager's, or is older than the messages the manager still holds. A
+  manager also resyncs every worker streaming from it after it installs a
+  raft snapshot, or when it cannot tell which allocations a committed change
+  touched. Such a failure never fails the change itself, which has already
+  committed.
 - **Replay.** A worker that reconnects to the same manager process with a
   position it still holds gets the messages after it, in order. Nothing is
   lost and nothing is applied twice.

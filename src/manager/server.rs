@@ -21,8 +21,9 @@ use crate::manager::workload_identity::{claims_for_allocation, WorkloadIdentityS
 use crate::storage::errors::StorageError;
 use crate::storage::events::{ArtifactPin, SchedulerEventFilter, SchedulerEventRecord};
 use crate::storage::store::{
-    ArchivedCheckpoint, DestroyInstanceOutcome, JobKvReference, JobSubmitOutcome,
-    JobTemplateVersionRecord, StartInstanceOutcome, StopInstanceOutcome, Store,
+    ArchivedCheckpoint, DestroyInstanceOutcome, FailedMove, FailedRemoval, JobKvReference,
+    JobSubmitOutcome, JobTemplateVersionRecord, MoveVerdict, StartInstanceOutcome,
+    StopInstanceOutcome, Store,
 };
 use crate::structs::acl::{AclAction, AclIdentity, AclResource, AclScope};
 use crate::structs::manager_server::Manager;
@@ -62,29 +63,29 @@ use crate::structs::{
     ListEventsRequest, ListExecKeysReply, ListExecKeysRequest, ListInstancesReply,
     ListInstancesRequest, ListJobActionsReply, ListJobActionsRequest, ListJobSpecHistoryReply,
     ListJobSpecHistoryRequest, ListJobTemplatesReply, ListJobTemplatesRequest, ListJobsReply,
-    ListJobsRequest, ListKvReply, ListKvRequest, ListNodeUsageReply, ListNodeUsageRequest,
-    ListRaftHistoryReply, ListRaftHistoryRequest, ListRolloutEventsReply, ListRolloutEventsRequest,
-    ListRolloutsReply, ListRolloutsRequest, ListSavedStateQueriesReply,
-    ListSavedStateQueriesRequest, ListServiceEdgesReply, ListServiceEdgesRequest,
-    ListServicesReply, ListServicesRequest, ListVolumeDriversReply, ListVolumeDriversRequest,
-    ListVolumesReply, ListVolumesRequest, MintExecTicketReply, MintExecTicketRequest, Node,
-    NodeMsg, PatchKvReply, PatchKvRequest, PlanJobReply, PlanJobRequest, PlannedAllocation,
-    PutKvReply, PutKvRequest, QueryStateStoreReply, QueryStateStoreRequest, RaftHistoryEvent,
-    RaftStatus, RatifyClaimReply, RatifyClaimRequest, ReleaseKvLockReply, ReleaseKvLockRequest,
-    RenderJobTemplateReply, RenderJobTemplateRequest, RenewKvLockReply, RenewKvLockRequest,
-    ReplaceInstanceReply, ReplaceInstanceRequest, ResolveServiceReply, ResolveServiceRequest,
-    RestartWorkerReply, RestartWorkerRequest, RolloutAllocationStatus, RolloutEvent,
-    RolloutGroupStatus, RolloutProgression, RolloutReplacement, RotateMeshCaReply,
-    RotateMeshCaRequest, RunJobReply, RunJobRequest, RunJobTemplateReply, RunJobTemplateRequest,
-    SavedStateQuery, ScaleTaskReply, ScaleTaskRequest, SchedulerEvent, ServiceEdge,
-    ServiceEndpoint, ServiceSummary, SetNodeAvailabilityReply, SetNodeAvailabilityRequest,
-    StartInstanceReply, StartInstanceRequest, StopInstanceReply, StopInstanceRequest, StopJobReply,
-    StopJobRequest, StopNotice, StopRolloutReply, StopRolloutRequest, StreamEventsRequest,
-    Submission, TaskConfig, TaskOnUnhealthyConfig, TaskScaleStatus, UpdateNodeDynamicReply,
-    UpdateNodeDynamicRequest, UpsertJobTemplateReply, UpsertJobTemplateRequest,
-    UpsertSavedStateQueryReply, UpsertSavedStateQueryRequest, UpstreamCredentialValue,
-    WorkerConfig, WorkerPreRegisterReply, WorkerPreRegisterRequest, WorkerRegisterReply,
-    WorkerRegisterRequest,
+    ListJobsRequest, ListKvReply, ListKvRequest, ListManagersReply, ListManagersRequest,
+    ListNodeUsageReply, ListNodeUsageRequest, ListRaftHistoryReply, ListRaftHistoryRequest,
+    ListRolloutEventsReply, ListRolloutEventsRequest, ListRolloutsReply, ListRolloutsRequest,
+    ListSavedStateQueriesReply, ListSavedStateQueriesRequest, ListServiceEdgesReply,
+    ListServiceEdgesRequest, ListServicesReply, ListServicesRequest, ListVolumeDriversReply,
+    ListVolumeDriversRequest, ListVolumesReply, ListVolumesRequest, ManagerMember,
+    MintExecTicketReply, MintExecTicketRequest, Node, NodeMsg, PatchKvReply, PatchKvRequest,
+    PlanJobReply, PlanJobRequest, PlannedAllocation, PutKvReply, PutKvRequest,
+    QueryStateStoreReply, QueryStateStoreRequest, RaftHistoryEvent, RaftStatus, RatifyClaimReply,
+    RatifyClaimRequest, ReleaseKvLockReply, ReleaseKvLockRequest, RenderJobTemplateReply,
+    RenderJobTemplateRequest, RenewKvLockReply, RenewKvLockRequest, ReplaceInstanceReply,
+    ReplaceInstanceRequest, ResolveServiceReply, ResolveServiceRequest, RestartWorkerReply,
+    RestartWorkerRequest, RolloutAllocationStatus, RolloutEvent, RolloutGroupStatus,
+    RolloutProgression, RolloutReplacement, RotateMeshCaReply, RotateMeshCaRequest, RunJobReply,
+    RunJobRequest, RunJobTemplateReply, RunJobTemplateRequest, SavedStateQuery, ScaleTaskReply,
+    ScaleTaskRequest, SchedulerEvent, ServiceEdge, ServiceEndpoint, ServiceSummary,
+    SetNodeAvailabilityReply, SetNodeAvailabilityRequest, StartInstanceReply, StartInstanceRequest,
+    StopInstanceReply, StopInstanceRequest, StopJobReply, StopJobRequest, StopNotice,
+    StopRolloutReply, StopRolloutRequest, StreamEventsRequest, Submission, TaskConfig,
+    TaskOnUnhealthyConfig, TaskScaleStatus, UpdateNodeDynamicReply, UpdateNodeDynamicRequest,
+    UpsertJobTemplateReply, UpsertJobTemplateRequest, UpsertSavedStateQueryReply,
+    UpsertSavedStateQueryRequest, UpstreamCredentialValue, WorkerConfig, WorkerPreRegisterReply,
+    WorkerPreRegisterRequest, WorkerRegisterReply, WorkerRegisterRequest,
 };
 use crate::structs::{
     AllocNetPolicy, DeleteNetPolicyReply, DeleteNetPolicyRequest, FetchNetPolicyReply,
@@ -111,7 +112,7 @@ use crate::structs::{
 use crate::task_plugins::validate_job_config;
 use crate::tracing_util::{o11y_enabled, read_recent_observability};
 
-use time::{Duration as TimeDuration, OffsetDateTime};
+use time::OffsetDateTime;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::transport::Channel;
 use tonic::{Request, Response, Status, Streaming};
@@ -134,6 +135,18 @@ pub use suspend_rpcs::{idle_sweep, settle_stalled_resumes, IdleSweepOutcome, Idl
 
 /// The delegated exec keys as last read, their version, and when.
 type CachedExecKeys = (std::time::Instant, String, Vec<crate::structs::ExecKey>);
+
+/// Status for a failed token signature. A manager still waiting for the
+/// leader's signing key to replicate answers a retryable `Unavailable`
+/// (logged at debug); anything else is an internal error.
+fn signing_error_status(err: anyhow::Error, message: &str) -> Status {
+    if crate::manager::workload_identity::SigningKeyUnavailable::in_chain(&err) {
+        debug!(error = %err, "{message}: no signing key yet");
+        return Status::unavailable(format!("{message}: {err}"));
+    }
+    error!(error = ?err, "{message}");
+    Status::internal(message.to_string())
+}
 
 fn map_store_error(action: &str, err: anyhow::Error) -> Status {
     let status = store_error_status(action, &err);
@@ -578,7 +591,8 @@ fn resolve_scalable_task<'a>(
                 .map(|task| format!("{}/{}", task.group, task.name))
                 .collect();
             Err(Status::invalid_argument(format!(
-                "multiple scalable tasks match in job {} ({}); disambiguate with task_group and task_name",
+                "multiple scalable tasks match in job {} ({}); disambiguate with --group and --task \
+                 (task_group and task_name in the API)",
                 job_id,
                 matches.join(", "),
             )))
@@ -652,6 +666,69 @@ fn map_raft_status(status: crate::storage::persistence::RaftStatus) -> RaftStatu
     }
 }
 
+/// How long `ListManagers` waits for each peer's `GetRaftStatus`. Short
+/// enough that a page poll with one dead manager still returns promptly.
+const MANAGER_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// The raft roster as `ListManagers` reports it, before reachability is
+/// probed: one entry per member of the replicated membership (`members`,
+/// as `(node id, host:port)`), with its role, voter flag, and the lanes it
+/// leads per `status`. Voter-ness follows `RaftStatus.voters` (settled on
+/// every lane) so this page and `legion raft status` never disagree.
+fn raft_roster(
+    status: &crate::storage::persistence::RaftStatus,
+    members: &[(String, String)],
+) -> Vec<ManagerMember> {
+    let mut roster: Vec<ManagerMember> = members
+        .iter()
+        .map(|(node_id, advertise_addr)| {
+            let voter = status.voters.contains(node_id);
+            let leader_lanes: Vec<String> = status
+                .lanes
+                .iter()
+                .filter(|lane| lane.leader_id.as_deref() == Some(node_id.as_str()))
+                .map(|lane| lane.lane.clone())
+                .collect();
+            // The control lane owns membership, joins, and config, so it is
+            // the one that makes a manager "the leader". With no lane detail
+            // (engine still starting) fall back to the headline leader.
+            let leads_control = if status.lanes.is_empty() {
+                status.leader_id.as_deref() == Some(node_id.as_str())
+            } else {
+                leader_lanes.iter().any(|lane| lane == "control")
+            };
+            let role = if leads_control {
+                "leader"
+            } else if voter {
+                "follower"
+            } else {
+                "learner"
+            };
+            let is_self = *node_id == status.node_id;
+            ManagerMember {
+                node_id: node_id.clone(),
+                advertise_addr: advertise_addr.clone(),
+                role: role.to_string(),
+                voter,
+                leader_lanes,
+                is_self,
+                reachable: is_self,
+                term: is_self.then_some(status.term),
+                applied_index: is_self.then_some(status.applied_index),
+                ..Default::default()
+            }
+        })
+        .collect();
+    roster.sort_by(|a, b| a.node_id.cmp(&b.node_id));
+    roster
+}
+
+/// `host:port` of an advertise URL (`http://10.0.0.5:4747` -> `10.0.0.5:4747`).
+fn host_port_of(addr: &str) -> &str {
+    let rest = addr.split_once("://").map_or(addr, |(_, rest)| rest);
+    rest.split('/').next().unwrap_or(rest)
+}
+
 fn map_raft_event(event: crate::storage::persistence::RaftHistoryEvent) -> RaftHistoryEvent {
     RaftHistoryEvent {
         event_id: event.event_id,
@@ -679,9 +756,37 @@ fn map_instance_info(
     // waiting. A volume pin explains one that is UNBOUND and waiting — the two
     // never apply at once, and both answer "why has this not come back". A
     // suspend or restore failure explains the rest.
-    let detail = instance_loss_detail(store, &instance)
+    //
+    // A reschedule backoff explains an unbound instance first: the
+    // replacement exists in intent but nothing places it before the next
+    // attempt, which no other state says.
+    let backoff = (instance.state == InstanceState::Rescheduling)
+        .then(|| {
+            store
+                .reschedule_hold_for_instance(&instance.instance_id)
+                .ok()
+                .flatten()
+        })
+        .flatten();
+    // The current allocation, read once: it names the instance's node, and
+    // the loss diagnostic needs that node's status. The instance row stores
+    // no node of its own, so this is the only source (the spot check found
+    // `nodeId: null` on every active row-backed instance).
+    let allocation = instance
+        .current_alloc_id
+        .and_then(|alloc_id| store.get_allocation_by_id(alloc_id).ok().flatten());
+    let node_id = allocation
+        .as_ref()
+        .map(|allocation| allocation.node_id.clone());
+    let detail = instance_loss_detail(store, &instance, allocation.as_ref())
+        .or_else(|| {
+            backoff
+                .as_ref()
+                .map(|hold| format!("rescheduling: {}; {}", hold.summary(), hold.retry_hint()))
+        })
         .or_else(|| instance_volume_pin_detail(store, &instance))
         .or_else(|| suspend.lifecycle_error.clone());
+    let reschedule_backoff = backoff.as_ref().map(reschedule_backoff_info);
     // The checkpoint's shape, for `instance list`'s CHECKPOINT column. Only
     // suspended or resuming instances have one, so others pay nothing.
     let checkpoint = suspend
@@ -789,9 +894,29 @@ fn map_instance_info(
         manifest_url: suspend.manifest_url,
         durable: true,
         promoted_from: instance.promoted_from,
-        node_id: None,
+        node_id,
         lease_issued_at: None,
         envelope_alloc_id: None,
+        reschedule_backoff,
+    }
+}
+
+/// A reschedule hold's wire shape (`RescheduleBackoff` in
+/// `proto/legion.proto`).
+fn reschedule_backoff_info(
+    hold: &crate::storage::store::RescheduleHold,
+) -> crate::structs::RescheduleBackoff {
+    crate::structs::RescheduleBackoff {
+        task: hold.task_name.clone(),
+        group: hold.group.clone(),
+        instance_id: hold.instance_id.clone().unwrap_or_default(),
+        allocation_id: hold.allocation_id,
+        node_id: hold.node_id.clone(),
+        attempt: hold.attempt,
+        delay_seconds: hold.delay_secs,
+        next_attempt_at: hold.next_attempt_at(),
+        reason: hold.reason.clone(),
+        summary: hold.summary(),
     }
 }
 
@@ -936,10 +1061,13 @@ fn instance_egress_unenforced_detail(store: &Store, instance: &Instance) -> Opti
 /// docs/stateful-workloads.md "Node loss and fencing"). `None` in every
 /// other situation. Lookup failures degrade to no detail — diagnostics must
 /// never fail the read path.
-fn instance_loss_detail(store: &Store, instance: &Instance) -> Option<String> {
+fn instance_loss_detail(
+    store: &Store,
+    instance: &Instance,
+    allocation: Option<&crate::structs::Allocation>,
+) -> Option<String> {
     let alloc_id = instance.current_alloc_id?;
-    let allocation = store.get_allocation_by_id(alloc_id).ok()??;
-    let node = store.get_node(&allocation.node_id).ok()?;
+    let node = store.get_node(&allocation?.node_id).ok()?;
     if node.status != "lost" {
         return None;
     }
@@ -987,7 +1115,10 @@ fn instance_volume_pin_detail(store: &Store, instance: &Instance) -> Option<Stri
         .map(|node| node.status)
         .unwrap_or_else(|_| "unknown".into());
     Some(format!(
-        "volume-pinned: volume {} ({}) is node-local and lives on node {node_id} (status:          {node_status}), so this instance can only be placed there. It waits for that node          rather than starting on empty storage; `legion volume delete --force {}` abandons          the data and frees the instance to place elsewhere",
+        "volume-pinned: volume {} ({}) is node-local and lives on node {node_id} (status: \
+         {node_status}), so this instance can only be placed there. It waits for that node \
+         rather than starting on empty storage; `legion volume delete --force {}` abandons \
+         the data and frees the instance to place elsewhere",
         volume.volume_id, volume.driver, volume.volume_id
     ))
 }
@@ -1553,6 +1684,11 @@ pub struct ManagerDaemonService {
     pub auth: Arc<Authenticator>,
     /// Externally reachable manager address embedded in join tokens.
     pub advertise_addr: String,
+    /// This manager's identity: its raft node id under raft, else the
+    /// listener's `host:port`. Keys its config row and names it in
+    /// `ListManagers`. Empty when unset (tests, embedding), in which case
+    /// `ListManagers` falls back to the advertise address.
+    manager_id: String,
     allocation_failures: Arc<Mutex<AllocationFailureTracker>>,
     /// OIDC issuer state; `None` when `workloadIdentity.enabled` is false
     /// (the default), in which case IssueWorkloadIdentityToken returns
@@ -1652,6 +1788,7 @@ impl ManagerDaemonService {
             store,
             auth,
             advertise_addr: DEF_MANAGER_ADDRESS.to_string(),
+            manager_id: String::new(),
             allocation_failures: Arc::new(Mutex::new(AllocationFailureTracker::default())),
             workload_identity: None,
             // Constructor default is "no debounce" so direct service users
@@ -2475,8 +2612,11 @@ impl ManagerDaemonService {
         }
     }
 
-    /// Service wired with cluster config (artifact admission settings + node
-    /// identity names). `run_manager` validates the config before this.
+    /// Service wired with cluster config. `run_manager` validates the config
+    /// before this. Every setting the service reads from the manager config
+    /// belongs here rather than in a separate builder, so the daemon cannot
+    /// parse a block and forget to hand it over (edge boot once shipped that
+    /// way and refused every ticket on a cluster that had enabled it).
     pub fn with_manager_config(
         store: Store,
         config: &crate::structs::config::ManagerConfigFull,
@@ -2493,6 +2633,7 @@ impl ManagerDaemonService {
         service.exec_tickets = config.exec.tickets.clone();
         service.heartbeat = config.heartbeat.clone();
         service.eval_threads = config.eval_threads.max(1);
+        service.edge_boot = config.edge_boot.clone();
         service
     }
 
@@ -2501,6 +2642,16 @@ impl ManagerDaemonService {
     pub fn with_workload_identity(mut self, state: Option<Arc<WorkloadIdentityState>>) -> Self {
         self.workload_identity = state;
         self
+    }
+
+    /// The cluster issuer nodes check tickets against
+    /// (`HeartbeatReply.workload_identity_issuer`); empty when workload
+    /// identity is off.
+    fn workload_identity_issuer(&self) -> String {
+        self.workload_identity
+            .as_ref()
+            .and_then(|state| state.issuer_url().ok())
+            .unwrap_or_default()
     }
 
     /// Attach the authenticator built from `acl` config (defaults to ACLs
@@ -2516,13 +2667,21 @@ impl ManagerDaemonService {
         self
     }
 
+    /// Sets the identity `ListManagers` reports for this manager outside raft
+    /// mode (the key its config row is stored under).
+    pub fn with_manager_id(mut self, manager_id: impl Into<String>) -> Self {
+        self.manager_id = manager_id.into();
+        self
+    }
+
     /// The usage table heartbeats fill, for the idle sweep the maintenance
     /// loop runs (docs/suspend-and-resume.md, "Idle policy").
     pub fn usage_handle(&self) -> Arc<Mutex<crate::manager::usage::UsageTable>> {
         self.usage.clone()
     }
 
-    /// Attach the cluster's edge-boot settings (docs/edge-boot.md).
+    /// Override the edge-boot settings (docs/edge-boot.md) for a service not
+    /// built by [`Self::with_manager_config`], which already applies them.
     pub fn with_edge_boot(mut self, edge_boot: crate::structs::EdgeBootConfigFull) -> Self {
         self.edge_boot = edge_boot;
         self
@@ -3728,12 +3887,6 @@ pub(crate) fn sweep_missed_kv_changes(store: &Store) -> anyhow::Result<usize> {
     Ok(reconciled)
 }
 
-#[derive(Debug, Clone, Hash, PartialEq, Eq)]
-struct TaskKey {
-    job_config_id: String,
-    task_config_id: i64,
-}
-
 #[derive(Debug, Clone)]
 struct AllocationFailureContext {
     job_id: String,
@@ -3743,10 +3896,12 @@ struct AllocationFailureContext {
     on_unhealthy: TaskOnUnhealthyConfig,
 }
 
+/// Caches each failing allocation's task policy while its report is
+/// handled. The move history itself is replicated (`reschedule_hold`, see
+/// [`Store::remove_failed_allocation`]), so every manager backs off the same.
 #[derive(Debug, Default)]
 struct AllocationFailureTracker {
     allocations: HashMap<i64, AllocationFailureContext>,
-    move_history: HashMap<TaskKey, Vec<OffsetDateTime>>,
 }
 
 #[tonic::async_trait]
@@ -4183,6 +4338,13 @@ impl Manager for ManagerDaemonService {
             .store
             .job_template_provenance(&name)
             .map_err(|e| map_store_error("Error loading job provenance", e))?;
+        job.reschedule_backoffs = self
+            .store
+            .reschedule_holds_for_job(&name)
+            .map_err(|e| map_store_error("Error loading reschedule backoffs", e))?
+            .iter()
+            .map(reschedule_backoff_info)
+            .collect();
 
         let reply = GetJobInfoReply {
             job: Some(job),
@@ -4982,6 +5144,7 @@ impl Manager for ManagerDaemonService {
                 band: victim.band.as_str().to_string(),
                 allocation_id: victim.allocation_id,
                 kill_after_seconds: victim.kill_after_secs,
+                eligible_in_seconds: victim.eligible_in_secs,
             })
             .collect();
 
@@ -6094,10 +6257,13 @@ impl Manager for ManagerDaemonService {
             AclAction::Write,
             &AclScope::job(&instance.job_id),
         )?;
-        if instance.mode != InstanceMode::Keyed {
+        // A slot instance accepts one start: retrying a replacement that is
+        // waiting out its reschedule backoff.
+        if instance.mode != InstanceMode::Keyed && instance.state != InstanceState::Rescheduling {
             return Err(Status::invalid_argument(format!(
                 "instance {} is slot-mode; slot lifecycles are owned by the scheduler via \
-                 count.num, not StartInstance",
+                 count.num, not StartInstance (it only retries a slot instance that is \
+                 rescheduling)",
                 inner.instance_id
             )));
         }
@@ -6177,6 +6343,18 @@ impl Manager for ManagerDaemonService {
                             Some(priority),
                         )?;
                         format!("Started instance {instance_id}")
+                    }
+                    StartInstanceOutcome::BackoffLifted => {
+                        s.enqueue_eval(
+                            "job_reschedule",
+                            Some(&job_id),
+                            Some(&config_id),
+                            None,
+                            Some(priority),
+                        )?;
+                        format!(
+                            "Retrying instance {instance_id} now: lifted its reschedule backoff"
+                        )
                     }
                     StartInstanceOutcome::AlreadyRunning => {
                         format!("Instance {instance_id} already running")
@@ -6779,12 +6957,18 @@ impl Manager for ManagerDaemonService {
                 })
                 .transpose()?,
         };
+        // Tombstones only on request: a reclaimed volume is history, and the
+        // default list answers "what storage exists".
+        let include_destroyed = inner.include_destroyed || filter.state.is_some();
 
         let volumes = self
             .store
             .list_volumes(&filter)
             .map_err(|e| map_store_error("Error listing volumes", e))?
             .into_iter()
+            .filter(|volume| {
+                include_destroyed || volume.state != crate::structs::VolumeState::Destroyed
+            })
             .filter(|volume| match volume.job_id.as_deref() {
                 Some(job_id) => {
                     identity.allows(AclResource::Job, AclAction::Read, &AclScope::job(job_id))
@@ -7068,10 +7252,7 @@ impl Manager for ManagerDaemonService {
 
         let issued = state
             .issue(&claims, identity, std::time::SystemTime::now())
-            .map_err(|e| {
-                error!(error = ?e, "Error signing workload identity token");
-                Status::internal("failed to sign workload identity token")
-            })?;
+            .map_err(|e| signing_error_status(e, "failed to sign workload identity token"))?;
 
         // Lifecycle log only — never the token bytes.
         info!(
@@ -7293,10 +7474,7 @@ impl Manager for ManagerDaemonService {
 
         let issued = state
             .issue_node(&claims, &node_identity, std::time::SystemTime::now())
-            .map_err(|e| {
-                error!(error = ?e, "Error signing node identity token");
-                Status::internal("failed to sign node identity token")
-            })?;
+            .map_err(|e| signing_error_status(e, "failed to sign node identity token"))?;
 
         info!(
             expires_at = issued.expires_at,
@@ -7363,11 +7541,8 @@ impl Manager for ManagerDaemonService {
         ) {
             error!(node_id = %id, error = ?err, "Error handling failed allocations");
         }
-        if let Err(err) =
-            handle_terminated_allocations(&self.store, &id, &req.terminated_allocations)
-        {
-            error!(node_id = %id, error = ?err, "Error handling terminated allocations");
-        }
+        let retry_terminated_allocations =
+            handle_terminated_allocations(&self.store, &id, &req.terminated_allocations);
         if let Err(err) =
             update_allocation_health_snapshots(&self.store, &id, &req.allocation_health)
         {
@@ -7385,7 +7560,12 @@ impl Manager for ManagerDaemonService {
         // Before the desired set is built, so an allocation the worker just
         // evicted for memory pressure is already gone from this reply and is
         // not handed straight back to it.
-        if let Err(err) = handle_pressure_actions(&self.store, &id, &req.pressure_actions) {
+        if let Err(err) = handle_pressure_actions(
+            &self.store,
+            &self.allocation_failures,
+            &id,
+            &req.pressure_actions,
+        ) {
             error!(node_id = %id, error = ?err, "Error handling pressure actions");
         }
 
@@ -7598,10 +7778,12 @@ impl Manager for ManagerDaemonService {
             exec_keys,
             exec_keys_version,
             manager_addresses: self.worker_manager_addresses(),
+            workload_identity_issuer: self.workload_identity_issuer(),
             desired_via_stream: stream.via_stream,
             work_resync: stream.resync,
             session_resync,
             stop_sessions,
+            retry_terminated_allocations,
         };
 
         Ok(Response::new(reply))
@@ -7768,6 +7950,7 @@ impl Manager for ManagerDaemonService {
 
         let reply = WorkerPreRegisterReply {
             config: Some(config),
+            workload_identity_issuer: self.workload_identity_issuer(),
         };
 
         Ok(Response::new(reply))
@@ -8473,6 +8656,126 @@ impl Manager for ManagerDaemonService {
             total_count,
             page: page as u32,
             page_size: page_size as u32,
+        }))
+    }
+
+    /// The cluster's managers from the replicated raft membership, with a
+    /// live reachability probe of each (spot-check P2-12). Unlike
+    /// `GetManagerConfigs`, membership never depends on who has led.
+    #[instrument(skip_all)]
+    async fn list_managers(
+        &self,
+        request: Request<ListManagersRequest>,
+    ) -> Result<Response<ListManagersReply>, Status> {
+        self.check_acl(
+            &request,
+            AclResource::Operator,
+            AclAction::Read,
+            AclScope::none(),
+        )?;
+        let backend = self.store.persistence_status().backend;
+        // Config snapshots are optional decoration: a failure to read them
+        // must not hide the roster.
+        let config_times: HashMap<String, String> = self
+            .store
+            .get_manager_configs()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|config| (config.node_id, config.updated_at))
+            .collect();
+
+        let Some(status) = self.store.raft_status() else {
+            // Outside raft there is exactly one manager: this one.
+            let advertise_addr = host_port_of(&self.advertise_addr).to_string();
+            let node_id = if self.manager_id.is_empty() {
+                advertise_addr.clone()
+            } else {
+                self.manager_id.clone()
+            };
+            let manager = ManagerMember {
+                config_updated_at: config_times.get(&node_id).cloned(),
+                node_id: node_id.clone(),
+                advertise_addr,
+                role: "standalone".to_string(),
+                is_self: true,
+                reachable: true,
+                ..Default::default()
+            };
+            return Ok(Response::new(ListManagersReply {
+                managers: vec![manager],
+                persistence_backend: backend,
+                answered_by: node_id,
+            }));
+        };
+
+        let mut roster = raft_roster(&status, &self.store.raft_members());
+        // Forward the caller's credential so each peer applies the same ACL
+        // check this manager just did (the leader-forward layer does the
+        // same for writes).
+        let credentials: Vec<(&'static str, tonic::metadata::MetadataValue<_>)> =
+            ["authorization", "x-legion-token"]
+                .into_iter()
+                .filter_map(|key| {
+                    request
+                        .metadata()
+                        .get(key)
+                        .map(|value| (key, value.clone()))
+                })
+                .collect();
+        let probes = roster.iter().map(|member| {
+            let channel = (!member.is_self)
+                .then(|| self.store.raft_peer_channel(&member.advertise_addr))
+                .flatten();
+            let skip = member.is_self;
+            let credentials = credentials.clone();
+            async move {
+                if skip {
+                    return None;
+                }
+                let Some(channel) = channel else {
+                    return Some(Err("no channel to this manager's address".to_string()));
+                };
+                let mut call = Request::new(GetRaftStatusRequest {});
+                call.set_timeout(MANAGER_PROBE_TIMEOUT);
+                for (key, value) in credentials {
+                    call.metadata_mut().insert(key, value);
+                }
+                let started = std::time::Instant::now();
+                let result = tokio::time::timeout(
+                    MANAGER_PROBE_TIMEOUT,
+                    crate::structs::manager_client::ManagerClient::new(channel)
+                        .get_raft_status(call),
+                )
+                .await;
+                Some(match result {
+                    Err(_) => Err(format!("timed out after {MANAGER_PROBE_TIMEOUT:?}")),
+                    Ok(Err(status)) => Err(format!("{:?}: {}", status.code(), status.message())),
+                    Ok(Ok(reply)) => Ok((reply.into_inner().status, started.elapsed())),
+                })
+            }
+        });
+        let results = futures::future::join_all(probes).await;
+        for (member, result) in roster.iter_mut().zip(results) {
+            member.config_updated_at = config_times.get(&member.node_id).cloned();
+            match result {
+                None => {}
+                Some(Ok((reported, elapsed))) => {
+                    member.reachable = true;
+                    member.probe_latency_ms = Some(elapsed.as_millis() as u64);
+                    member.term = reported.as_ref().map(|s| s.term);
+                    member.applied_index = reported.as_ref().map(|s| s.applied_index);
+                }
+                Some(Err(error)) => {
+                    debug!(member = %member.node_id, %error, "Manager probe failed");
+                    member.reachable = false;
+                    member.probe_error = Some(error);
+                }
+            }
+        }
+        Ok(Response::new(ListManagersReply {
+            managers: roster,
+            persistence_backend: backend,
+            answered_by: status.node_id,
         }))
     }
 
@@ -11265,24 +11568,25 @@ async fn fetch_allocation_logs(
     Ok(reply.into_inner().streams)
 }
 
-/// Record terminal, non-failure allocation outcomes reported by a worker: the
-/// task's process exited and the task's `restart` policy says that is the end
-/// of it (see docs/task-supervision.md).
-///
-/// Failures do NOT come through here — they arrive as `failed_allocations` and
-/// go through the reschedule/move machinery. This path is the one that makes a
-/// batch task's success real: the allocation row becomes terminal and the
-/// task's status follows the exit code.
 /// Apply what a node's memory pressure response did (docs/resource-
 /// enforcement.md, "Memory pressure"): a `node.pressure` event per action,
 /// and for the eviction steps, the allocation's removal with
 /// `cause = node_pressure` plus an eval so the scheduler replaces it.
+///
+/// `evict-bursting` stops a task for using more than it reserved, so its
+/// replacement goes through the task's `on_unhealthy` move budget like a
+/// failed allocation: it waits `move_delay` (and backs off on repeats) and
+/// counts toward `move_count`. Without that, a task that always outgrows its
+/// reservation was re-placed and evicted again every minute or two forever.
+/// `evict-reserved` stops a task that stayed inside its reservation (the
+/// node was oversubscribed), so it is replaced at once, like a preemption.
 ///
 /// The worker has already stopped the task; this records the fact. Reports
 /// for allocations this node does not hold (already removed, or another
 /// node's) are ignored, which also makes a re-sent report harmless.
 fn handle_pressure_actions(
     store: &Store,
+    failure_tracker: &Arc<Mutex<AllocationFailureTracker>>,
     node_id: &str,
     actions: &[crate::structs::PressureAction],
 ) -> R<()> {
@@ -11327,18 +11631,54 @@ fn handle_pressure_actions(
         store
             .events()
             .node_pressure(node_id, action, existing.instance_id.as_deref());
+        // Read before the row goes: the move budget keys on the task.
+        let move_context = if action.step == "evict-bursting" {
+            failure_tracker
+                .lock()
+                .expect("allocation failure tracker")
+                .context_for_allocation(store, action.allocation_id)?
+        } else {
+            None
+        };
         // The worker's own sentence and hint become the instance's
         // `last_stop`, so the row explains itself without the event.
         let explanation = crate::storage::store::StopExplanation {
             detail: action.detail.clone(),
             hint: action.hint.clone(),
         };
-        let Some(removed) = store.remove_allocation_by_id_explained(
+        if let Some(context) = move_context {
+            // `evict-bursting` spends the move budget: the removal, the
+            // verdict, and the hold commit together.
+            let removal = store.remove_failed_allocation(
+                action.allocation_id,
+                StopCause::NodePressure,
+                Some(explanation),
+                FailedMove {
+                    policy: (&context.on_unhealthy).into(),
+                    reason: action.detail.clone(),
+                },
+            )?;
+            failure_tracker
+                .lock()
+                .expect("allocation failure tracker")
+                .allocations
+                .remove(&action.allocation_id);
+            if let Some(removal) = removal {
+                apply_move_verdict(store, &removal, node_id);
+            }
+            continue;
+        }
+        let removed = store.remove_allocation_by_id_explained(
             action.allocation_id,
             StopCause::NodePressure,
             Some(explanation),
-        )?
-        else {
+        )?;
+        failure_tracker
+            .lock()
+            .expect("allocation failure tracker")
+            .allocations
+            .remove(&action.allocation_id);
+        let Some(removed) = removed else {
             continue;
         };
         let priority = store
@@ -11384,20 +11724,45 @@ fn pressure_instance_id(store: &Store, action: &crate::structs::PressureAction) 
         .and_then(|snapshot| snapshot.instance_id)
 }
 
+/// Record each terminal report and return the allocation ids the worker
+/// must send again (`HeartbeatReply.retry_terminated_allocations`).
+///
+/// A worker reports a terminal exit once, and a batch task's dependents wait
+/// on it, so a report must never be dropped for a reason that can pass: a
+/// write that could not reach the lane leader, or a heartbeat that landed on
+/// a replica that has not applied the placement yet. Both are handed back
+/// for a retry instead of only being logged. A report from a node that does
+/// not own the allocation is dropped for good.
 fn handle_terminated_allocations(
     store: &Store,
     node_id: &str,
     terminated: &[crate::structs::TerminatedAllocation],
-) -> R<()> {
+) -> Vec<i64> {
     let mut freed_capacity = false;
+    let mut retry = Vec::new();
     for report in terminated {
         let allocation_id = report.allocation_id;
-        let Some(existing) = store.get_allocation_by_id(allocation_id)? else {
-            warn!(
-                allocation_id,
-                node_id, "Terminated allocation not found; ignoring report"
-            );
-            continue;
+        let existing = match store.get_allocation_by_id(allocation_id) {
+            Ok(Some(existing)) => existing,
+            Ok(None) => {
+                warn!(
+                    allocation_id,
+                    node_id,
+                    "Terminated allocation not found here; asking the worker to report it again"
+                );
+                retry.push(allocation_id);
+                continue;
+            }
+            Err(error) => {
+                warn!(
+                    allocation_id,
+                    node_id,
+                    error = %format!("{error:#}"),
+                    "Failed to read a terminated allocation; asking the worker to report it again"
+                );
+                retry.push(allocation_id);
+                continue;
+            }
         };
         if existing.node_id != node_id {
             warn!(
@@ -11409,8 +11774,20 @@ fn handle_terminated_allocations(
             continue;
         }
 
-        let Some(allocation) = store.complete_allocation(allocation_id, report.success)? else {
-            continue;
+        let allocation = match store.complete_allocation(allocation_id, report.success) {
+            Ok(Some(allocation)) => allocation,
+            // Gone between the read and the write: nothing left to complete.
+            Ok(None) => continue,
+            Err(error) => {
+                warn!(
+                    allocation_id,
+                    node_id,
+                    error = %format!("{error:#}"),
+                    "Failed to record a terminal allocation report; asking the worker to report it again"
+                );
+                retry.push(allocation_id);
+                continue;
+            }
         };
         freed_capacity = true;
         // Tasks that depend on this one were held until it exited; queue
@@ -11448,7 +11825,7 @@ fn handle_terminated_allocations(
     if freed_capacity {
         store.request_capacity_reconcile_if_waiting();
     }
-    Ok(())
+    retry
 }
 
 fn handle_failed_allocations(
@@ -11482,7 +11859,30 @@ fn handle_failed_allocations(
             continue;
         }
 
-        store.remove_allocation_by_id(allocation_id)?;
+        // The removal, the move budget's verdict, and (when the replacement
+        // is deferred) the hold the planner honors commit together.
+        let removal = store.remove_failed_allocation(
+            allocation_id,
+            StopCause::Unknown,
+            None,
+            FailedMove {
+                policy: (&context.on_unhealthy).into(),
+                reason: failure.reason.clone(),
+            },
+        )?;
+        failure_tracker
+            .lock()
+            .expect("allocation failure tracker")
+            .allocations
+            .remove(&allocation_id);
+        let Some(removal) = removal else {
+            // Already removed: a re-sent report spends nothing.
+            debug!(
+                allocation_id,
+                node_id, "Failed allocation already removed; ignoring the repeat report"
+            );
+            continue;
+        };
         freed_capacity = true;
 
         store.events().allocation_failed(
@@ -11504,56 +11904,13 @@ fn handle_failed_allocations(
                 artifact_states,
             );
         }
-
-        let move_decision = {
-            let mut tracker = failure_tracker.lock().expect("allocation failure tracker");
-            tracker.record_move(&context)?
-        };
-
-        match move_decision {
-            MoveDecision::Reschedule { delay } => {
-                let job_id = context.job_id.clone();
-                let job_config_id = context.job_config_id.clone();
-                let node_id = node_id.to_string();
-                let store = store.clone();
-                schedule_reschedule(store, job_id, job_config_id, node_id, delay);
-            }
-            MoveDecision::JobFailed => {
-                store.mark_job_failed(&context.job_id)?;
-                // The task failed for good: say so in its status, so a
-                // `complete` dependent can run and a `success` one never does.
-                if let Err(error) = store.set_task_status(
-                    context.task_config_id,
-                    crate::structs::TaskStatusState::Failed,
-                ) {
-                    warn!(
-                        allocation_id,
-                        job_id = %context.job_id,
-                        error = %format!("{error:#}"),
-                        "Failed to record the failed task status"
-                    );
-                }
-                warn!(
-                    allocation_id,
-                    job_id = %context.job_id,
-                    reason = %failure.reason,
-                    "Move limit exceeded; marking job failed"
-                );
-            }
-        }
-
-        failure_tracker
-            .lock()
-            .expect("allocation failure tracker")
-            .allocations
-            .remove(&allocation_id);
-
         warn!(
             allocation_id,
             node_id,
             reason = %failure.reason,
-            "Allocation reported failed; reschedule requested"
+            "Allocation reported failed"
         );
+        apply_move_verdict(store, &removal, node_id);
     }
 
     // The removed rows freed node capacity (see
@@ -11646,64 +12003,90 @@ fn update_allocation_health_snapshots(
     store.upsert_allocation_health_snapshots(node_id, snapshots)
 }
 
-enum MoveDecision {
-    Reschedule { delay: Duration },
-    JobFailed,
-}
-
-fn schedule_reschedule(
-    store: Store,
-    job_id: String,
-    job_config_id: String,
-    node_id: String,
-    delay: Duration,
-) {
-    match tokio::runtime::Handle::try_current() {
-        Ok(handle) => {
-            handle.spawn(async move {
-                if delay.as_secs() > 0 {
-                    tokio::time::sleep(delay).await;
-                }
-                if let Err(err) = store.enqueue_eval(
-                    "job_reschedule",
-                    Some(&job_id),
-                    Some(&job_config_id),
-                    Some(&node_id),
-                    None,
-                ) {
-                    error!(
-                        job_id = %job_id,
-                        job_config_id = %job_config_id,
-                        error = ?err,
-                        "Failed to enqueue reschedule after unhealthy allocation"
-                    );
-                }
-            });
+/// Act on the move budget's verdict for a removed failed allocation
+/// ([`Store::remove_failed_allocation`]): announce a deferred replacement and
+/// queue the delayed `job_reschedule` that places it once the hold lapses,
+/// or announce the spent budget and fail the job.
+///
+/// The `job_reschedule` is a replicated delayed eval, so it survives a
+/// manager restart or a leader change, and it names the failed node so the
+/// replacement avoids it. Best effort past the removal: a failed enqueue is
+/// logged, and the next eval of the job places the replacement once the
+/// hold lapses.
+fn apply_move_verdict(store: &Store, removal: &FailedRemoval, node_id: &str) {
+    let allocation = &removal.allocation;
+    match &removal.verdict {
+        MoveVerdict::Deferred(hold) => {
+            store.events().allocation_reschedule_deferred(hold);
+            info!(
+                allocation_id = allocation.id,
+                job_id = %allocation.job_id,
+                task = %hold.task_name,
+                attempt = hold.attempt,
+                delay_secs = hold.delay_secs,
+                next_attempt_at = %hold.next_attempt_at(),
+                "Rescheduling failed allocation after backoff"
+            );
+            if let Err(err) = store.enqueue_eval_after_delay(
+                "job_reschedule",
+                Some(&allocation.job_id),
+                Some(&allocation.job_config_id),
+                Some(node_id),
+                None,
+                Duration::from_secs(hold.delay_secs),
+            ) {
+                error!(
+                    job_id = %allocation.job_id,
+                    job_config_id = %allocation.job_config_id,
+                    error = ?err,
+                    "Failed to enqueue the reschedule of a failed allocation"
+                );
+            }
         }
-        Err(_) => {
-            let delay_for_thread = delay;
-            let job_id = job_id.clone();
-            let job_config_id = job_config_id.clone();
-            let node_id = node_id.clone();
-            std::thread::spawn(move || {
-                if delay_for_thread.as_secs() > 0 {
-                    std::thread::sleep(delay_for_thread);
-                }
-                if let Err(err) = store.enqueue_eval(
-                    "job_reschedule",
-                    Some(&job_id),
-                    Some(&job_config_id),
-                    Some(&node_id),
-                    None,
-                ) {
-                    error!(
-                        job_id = %job_id,
-                        job_config_id = %job_config_id,
-                        error = ?err,
-                        "Failed to enqueue reschedule after unhealthy allocation"
-                    );
-                }
-            });
+        MoveVerdict::Exhausted {
+            task_name,
+            moves,
+            move_count,
+            move_period_secs,
+            reason,
+        } => {
+            store.events().allocation_reschedule_exhausted(
+                allocation,
+                task_name,
+                *moves,
+                *move_count,
+                *move_period_secs,
+                reason,
+            );
+            if let Err(error) = store.mark_job_failed(&allocation.job_id) {
+                error!(
+                    allocation_id = allocation.id,
+                    job_id = %allocation.job_id,
+                    error = %format!("{error:#}"),
+                    "Failed to mark the job failed after its move budget ran out"
+                );
+            }
+            // The task failed for good: say so in its status, so a
+            // `complete` dependent can run and a `success` one never does.
+            if let Err(error) = store.set_task_status(
+                allocation.task_config_id,
+                crate::structs::TaskStatusState::Failed,
+            ) {
+                warn!(
+                    allocation_id = allocation.id,
+                    job_id = %allocation.job_id,
+                    error = %format!("{error:#}"),
+                    "Failed to record the failed task status"
+                );
+            }
+            warn!(
+                allocation_id = allocation.id,
+                job_id = %allocation.job_id,
+                task = %task_name,
+                moves,
+                reason = %reason,
+                "Move limit exceeded; marking job failed"
+            );
         }
     }
 }
@@ -11739,34 +12122,6 @@ impl AllocationFailureTracker {
         self.allocations.insert(allocation_id, context.clone());
         Ok(Some(context))
     }
-
-    fn record_move(&mut self, context: &AllocationFailureContext) -> R<MoveDecision> {
-        let now = OffsetDateTime::now_utc();
-        let key = TaskKey {
-            job_config_id: context.job_config_id.clone(),
-            task_config_id: context.task_config_id,
-        };
-        let history = self.move_history.entry(key).or_default();
-        let window = time_duration(context.on_unhealthy.move_period);
-        history.retain(|time| now - *time <= window);
-
-        if let Some(limit) = context.on_unhealthy.move_count {
-            if history.len() as u32 >= limit {
-                return Ok(MoveDecision::JobFailed);
-            }
-        }
-
-        history.push(now);
-        Ok(MoveDecision::Reschedule {
-            delay: context.on_unhealthy.move_delay,
-        })
-    }
-}
-
-fn time_duration(duration: Duration) -> TimeDuration {
-    let secs = duration.as_secs() as i64;
-    let nanos = duration.subsec_nanos() as i64;
-    TimeDuration::seconds(secs) + TimeDuration::nanoseconds(nanos)
 }
 
 fn build_rollout_group_status(
@@ -12188,6 +12543,12 @@ impl ManagerDaemonService {
                 out.version = issued.expires_at as i64;
                 out.value = issued.token;
             }
+            Err(err)
+                if crate::manager::workload_identity::SigningKeyUnavailable::in_chain(&err) =>
+            {
+                debug!(error = %err, "No signing key yet for an upstream's workload identity token");
+                out.error = err.to_string();
+            }
             Err(err) => {
                 error!(error = ?err, "Error signing workload identity token for an upstream");
                 out.error = "failed to sign workload identity token".to_string();
@@ -12334,7 +12695,7 @@ impl ManagerDaemonService {
                 config.tasks[0].clone()
             } else {
                 return Err(Status::invalid_argument(format!(
-                    "job '{job_id}' has {} tasks; name one with task_name ({})",
+                    "job '{job_id}' has {} tasks; name one with --task (task_name in the API): {}",
                     config.tasks.len(),
                     config
                         .tasks
@@ -13488,6 +13849,64 @@ mod tests {
             content: "{}".into(),
             is_primary: true,
         }
+    }
+
+    // --- IssueBootTicket ---
+
+    /// Regression: the daemon builds its service with `with_manager_config`,
+    /// which once dropped `edgeBoot`, so a cluster that set
+    /// `edgeBoot.enabled = true` refused every ticket with "edge boot is not
+    /// enabled on this manager". A service built from such a config mints a
+    /// session ticket; one built from the default config still refuses.
+    #[tokio::test]
+    async fn a_manager_built_from_an_edge_boot_config_issues_tickets() -> R<()> {
+        let store = setup_store()?;
+        let job: JobConfig = serde_json::from_value(json!({
+            "name": "sessions",
+            "task": {
+                "name": "shell",
+                "runtime": "noop",
+                "resources": { "cpu": 20, "memory": 32 },
+                "stateful": {
+                    "mode": "session",
+                    "envelope": { "resources": { "cpu": 200, "memory": 1024 } },
+                },
+            },
+        }))?;
+        store.handle_job_submit(&job, &[submission()])?;
+        let request = || {
+            Request::new(IssueBootTicketRequest {
+                job: "sessions".into(),
+                task: "shell".into(),
+                pool: "default".into(),
+                scope: "session".into(),
+                ttl: "5m".into(),
+                ..Default::default()
+            })
+        };
+
+        let mut config = ManagerConfigFull::default();
+        config.edge_boot.enabled = true;
+        let manager = ManagerDaemonService::with_manager_config(store.clone(), &config)
+            .with_workload_identity(Some(wi_state(&store)?));
+        let reply = manager.issue_boot_ticket(request()).await?.into_inner();
+        assert!(!reply.ticket.is_empty());
+        assert!(!reply.jti.is_empty());
+
+        let disabled =
+            ManagerDaemonService::with_manager_config(store.clone(), &ManagerConfigFull::default())
+                .with_workload_identity(Some(wi_state(&store)?));
+        let err = disabled
+            .issue_boot_ticket(request())
+            .await
+            .expect_err("edge boot is off by default");
+        assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+        assert!(
+            err.message().contains("edgeBoot.enabled"),
+            "{}",
+            err.message()
+        );
+        Ok(())
     }
 
     // --- IssueWorkloadIdentityToken ---
@@ -16459,6 +16878,468 @@ mod tests {
         Ok(())
     }
 
+    /// The `allocation.reschedule_deferred` events journaled for `job`, as
+    /// parsed metadata, oldest first.
+    fn deferred_events(store: &Store, job: &str) -> R<Vec<Value>> {
+        store
+            .list_scheduler_events(&SchedulerEventFilter {
+                kind: Some("allocation.reschedule_deferred".into()),
+                job_id: Some(job.into()),
+                ..Default::default()
+            })?
+            .into_iter()
+            .map(|event| {
+                assert_eq!(event.level, "warn");
+                Ok(serde_json::from_str(&event.metadata_json)?)
+            })
+            .collect()
+    }
+
+    /// A task that fails on every start must not be re-placed every
+    /// `move_delay` forever (the spot check minted a new allocation per
+    /// replica about once a minute): each move inside `move_period` doubles
+    /// the wait, up to the cap, and the history the doubling counts is the
+    /// replicated hold table, so any manager computes the same backoff.
+    /// Every deferral is announced with what an operator needs.
+    #[test]
+    fn repeated_failures_back_off_and_announce_each_deferral() -> R<()> {
+        let store = setup_store()?;
+        insert_node(&store, "node-a")?;
+        let job = JobConfig {
+            priority: Default::default(),
+            rollout: None,
+            rollout_by_group: Default::default(),
+            name: "flaky".into(),
+            tasks: vec![TaskConfig::new("store", "noop")],
+            version: None,
+        };
+        store.handle_job_submit(&job, &[submission()])?;
+        let job_config_id = store.get_job_config(&job.name)?.id();
+        let task_id = store.get_task_configs_for_job_config(&job_config_id)?[0].0;
+        let tracker = Arc::new(Mutex::new(AllocationFailureTracker::default()));
+
+        let mut failed = Vec::new();
+        for _ in 0..4 {
+            let allocation = store.place_alloc("node-a", task_id)?;
+            handle_failed_allocations(
+                &store,
+                &tracker,
+                "node-a",
+                &[FailedAllocation {
+                    allocation_id: allocation.id,
+                    reason: "artifact staging failed: 404\nsecond line".into(),
+                    artifact_states: None,
+                }],
+            )?;
+            failed.push(allocation.id);
+        }
+
+        let events = deferred_events(&store, "flaky")?;
+        let delays: Vec<u64> = events
+            .iter()
+            .map(|meta| meta["delaySecs"].as_u64().unwrap_or_default())
+            .collect();
+        assert_eq!(delays, vec![30, 60, 120, 240]);
+        let attempts: Vec<u64> = events
+            .iter()
+            .map(|meta| meta["attempt"].as_u64().unwrap_or_default())
+            .collect();
+        assert_eq!(attempts, vec![1, 2, 3, 4]);
+        let last = &events[3];
+        assert_eq!(last["task"], "store");
+        assert_eq!(last["jobConfigId"], job_config_id.as_str());
+        assert_eq!(last["reason"], "artifact staging failed: 404 / second line");
+        let next = time::OffsetDateTime::parse(
+            last["nextAttemptAt"].as_str().unwrap_or_default(),
+            &time::format_description::well_known::Rfc3339,
+        )?;
+        let ahead = next - time::OffsetDateTime::now_utc();
+        assert!(
+            ahead > time::Duration::seconds(200) && ahead <= time::Duration::seconds(241),
+            "next attempt {ahead} from now"
+        );
+        let journaled = store.list_scheduler_events(&SchedulerEventFilter {
+            kind: Some("allocation.reschedule_deferred".into()),
+            ..Default::default()
+        })?;
+        assert_eq!(journaled[3].allocation_id, Some(failed[3]));
+        assert_eq!(journaled[3].node_id.as_deref(), Some("node-a"));
+        assert!(
+            journaled[3]
+                .message
+                .contains("attempt 4 failed (artifact staging failed: 404 / second line)"),
+            "{}",
+            journaled[3].message
+        );
+
+        // The replacement is a replicated delayed eval, not a timer in this
+        // manager's memory.
+        assert!(store.delayed_eval_pending("job_reschedule", &job_config_id)?);
+
+        // Spot check 2026-10-12: the capacity pass (and every other
+        // Reschedule-mode eval) re-placed the task at once, whatever the
+        // backoff said. The planner honors the hold now.
+        store.reconcile_job_config_allocations(&job_config_id)?;
+        assert!(store.allocs_for_job("flaky")?.is_empty());
+        let job_info = store.reschedule_holds_for_job("flaky")?;
+        assert_eq!(job_info.len(), 4);
+        assert_eq!(job_info[0].attempt, 1, "soonest next attempt first");
+
+        // `job run --force-reschedule` (a job_update eval) lifts every hold
+        // and starts the move budget over.
+        Eval {
+            id: "force".into(),
+            status: "pending".into(),
+            kind: "job_update".into(),
+            job_id: "flaky".into(),
+            job_config_id: job_config_id.clone(),
+            node_name: String::new(),
+            priority: 50,
+        }
+        .handle(&store)?;
+        let placed = store.allocs_for_job("flaky")?;
+        assert_eq!(placed.len(), 1, "the forced reschedule places now");
+        assert!(store.reschedule_holds_for_job("flaky")?.is_empty());
+        handle_failed_allocations(
+            &store,
+            &tracker,
+            "node-a",
+            &[FailedAllocation {
+                allocation_id: placed[0].id,
+                reason: "boom".into(),
+                artifact_states: None,
+            }],
+        )?;
+        let events = deferred_events(&store, "flaky")?;
+        assert_eq!(events.len(), 5);
+        assert_eq!(events[4]["attempt"], 1);
+        assert_eq!(events[4]["delaySecs"], 30);
+        Ok(())
+    }
+
+    /// A keyed instance waiting out its backoff says so on `instance get`,
+    /// `instance list` and `job info`, from the replicated hold; it does not
+    /// block a new instance of the same task from placing; and
+    /// StartInstance lifts its hold so it places now.
+    #[test]
+    fn keyed_instance_backoff_is_visible_and_lifted_by_start() -> R<()> {
+        use crate::structs::InstanceState;
+
+        let store = setup_store()?;
+        insert_node(&store, "node-a")?;
+        let manager = ManagerDaemonService::new(store.clone());
+        let job_id = "sandbox-store";
+        let job_config_id = submit_keyed_job(
+            &store,
+            job_id,
+            vec![keyed_task("sandbox", "default", false)],
+        )?;
+        let runtime = tokio::runtime::Runtime::new()?;
+        let create = |id: &str| {
+            runtime
+                .block_on(manager.create_instance(Request::new(CreateInstanceRequest {
+                    job_id: job_id.into(),
+                    group: None,
+                    task: None,
+                    instance_id: Some(id.into()),
+                    idempotency_key: None,
+                    from_snapshot: None,
+                })))
+                .map_err(|err| anyhow!(err))
+        };
+        create("user-a")?;
+        handle_pending_evals(&store, "job_reschedule", job_id)?;
+        let allocation = store.allocs_for_job(job_id)?[0].clone();
+
+        let tracker = Arc::new(Mutex::new(AllocationFailureTracker::default()));
+        handle_failed_allocations(
+            &store,
+            &tracker,
+            "node-a",
+            &[FailedAllocation {
+                allocation_id: allocation.id,
+                reason: "artifact staging failed: 404".into(),
+                artifact_states: None,
+            }],
+        )?;
+        let waiting = store.get_instance("user-a")?.context("instance")?;
+        assert_eq!(waiting.state, InstanceState::Rescheduling);
+        let events = deferred_events(&store, job_id)?;
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0]["instanceId"], "user-a");
+
+        // Every pending eval runs (the delayed reschedule included, as if
+        // its timer fired early): none places user-a while it is held.
+        handle_pending_evals(&store, "job_reschedule", job_id)?;
+        store.reconcile_job_config_allocations(&job_config_id)?;
+        assert!(store.allocs_for_job(job_id)?.is_empty());
+
+        // A new sandbox is not stuck behind the failing one.
+        create("user-b")?;
+        handle_pending_evals(&store, "job_reschedule", job_id)?;
+        let placed = store.allocs_for_job(job_id)?;
+        assert_eq!(placed.len(), 1);
+        assert_eq!(placed[0].instance_id.as_deref(), Some("user-b"));
+
+        // `instance get`: the structured backoff and the sentence.
+        let info = runtime
+            .block_on(manager.get_instance(Request::new(GetInstanceRequest {
+                instance_id: "user-a".into(),
+            })))
+            .map_err(|err| anyhow!(err))?
+            .into_inner()
+            .instance
+            .context("instance info")?;
+        let backoff = info.reschedule_backoff.clone().context("backoff")?;
+        assert_eq!(backoff.attempt, 1);
+        assert_eq!(backoff.delay_seconds, 30);
+        assert_eq!(backoff.allocation_id, allocation.id);
+        assert_eq!(backoff.node_id, "node-a");
+        assert_eq!(backoff.reason, "artifact staging failed: 404");
+        let detail = info.detail.clone().unwrap_or_default();
+        assert!(
+            detail.starts_with(
+                "rescheduling: attempt 1 failed (artifact staging failed: 404); next attempt at "
+            ),
+            "{detail}"
+        );
+        assert!(
+            detail.ends_with("(backoff 30s); `legion instance start user-a` retries now"),
+            "{detail}"
+        );
+
+        // `instance list` carries it too; the placed sibling does not.
+        let listed = runtime
+            .block_on(manager.list_instances(Request::new(ListInstancesRequest {
+                job_id: job_id.into(),
+                ..Default::default()
+            })))
+            .map_err(|err| anyhow!(err))?
+            .into_inner()
+            .instances;
+        let by_id = |id: &str| listed.iter().find(|info| info.instance_id == id).cloned();
+        assert!(by_id("user-a")
+            .context("user-a")?
+            .reschedule_backoff
+            .is_some());
+        assert!(by_id("user-b")
+            .context("user-b")?
+            .reschedule_backoff
+            .is_none());
+
+        // `job info` lists the job's waiting replacements.
+        let job = runtime
+            .block_on(manager.get_job_info(Request::new(GetJobInfoRequest {
+                name: job_id.into(),
+            })))
+            .map_err(|err| anyhow!(err))?
+            .into_inner()
+            .job
+            .context("job")?;
+        assert_eq!(job.reschedule_backoffs.len(), 1);
+        assert_eq!(job.reschedule_backoffs[0].instance_id, "user-a");
+        assert!(job.reschedule_backoffs[0]
+            .summary
+            .starts_with("attempt 1 failed (artifact staging failed: 404)"));
+
+        // StartInstance lifts the hold and places user-a now.
+        let reply = runtime
+            .block_on(manager.start_instance(Request::new(StartInstanceRequest {
+                instance_id: "user-a".into(),
+                ..Default::default()
+            })))
+            .map_err(|err| anyhow!(err))?
+            .into_inner();
+        assert_eq!(
+            reply.message,
+            "Retrying instance user-a now: lifted its reschedule backoff"
+        );
+        handle_pending_evals(&store, "job_reschedule", job_id)?;
+        let rebound = store.get_instance("user-a")?.context("instance")?;
+        assert_eq!(rebound.state, InstanceState::Active);
+        assert!(store.reschedule_hold_for_instance("user-a")?.is_none());
+        // A second start finds nothing to lift.
+        let reply = runtime
+            .block_on(manager.start_instance(Request::new(StartInstanceRequest {
+                instance_id: "user-a".into(),
+                ..Default::default()
+            })))
+            .map_err(|err| anyhow!(err))?
+            .into_inner();
+        assert_eq!(reply.message, "Instance user-a already running");
+        Ok(())
+    }
+
+    /// Spot check 2026-10-12: `instance get -j` and `instance list -j`
+    /// showed `nodeId: null` for every active keyed instance. The node is
+    /// the current allocation's, and unset while there is none.
+    #[test]
+    fn instance_reads_name_the_current_allocations_node() -> R<()> {
+        let store = setup_store()?;
+        insert_node(&store, "node-a")?;
+        let manager = ManagerDaemonService::new(store.clone());
+        let job_id = "sandboxes";
+        submit_keyed_job(
+            &store,
+            job_id,
+            vec![keyed_task("sandbox", "default", false)],
+        )?;
+        let runtime = tokio::runtime::Runtime::new()?;
+        runtime
+            .block_on(manager.create_instance(Request::new(CreateInstanceRequest {
+                job_id: job_id.into(),
+                group: None,
+                task: None,
+                instance_id: Some("user-a".into()),
+                idempotency_key: None,
+                from_snapshot: None,
+            })))
+            .map_err(|err| anyhow!(err))?;
+        let get = || -> R<InstanceInfo> {
+            runtime
+                .block_on(manager.get_instance(Request::new(GetInstanceRequest {
+                    instance_id: "user-a".into(),
+                })))
+                .map_err(|err| anyhow!(err))?
+                .into_inner()
+                .instance
+                .context("instance info")
+        };
+        let list = || -> R<InstanceInfo> {
+            runtime
+                .block_on(manager.list_instances(Request::new(ListInstancesRequest {
+                    job_id: job_id.into(),
+                    ..Default::default()
+                })))
+                .map_err(|err| anyhow!(err))?
+                .into_inner()
+                .instances
+                .into_iter()
+                .find(|info| info.instance_id == "user-a")
+                .context("user-a listed")
+        };
+        // Not placed yet: no allocation, so no node.
+        assert_eq!(get()?.current_alloc_id, None);
+        assert_eq!(get()?.node_id, None);
+
+        // Placed by the reschedule eval, as every keyed instance is.
+        handle_pending_evals(&store, "job_reschedule", job_id)?;
+        let allocation = store.allocs_for_job(job_id)?[0].clone();
+        for info in [get()?, list()?] {
+            assert_eq!(info.current_alloc_id, Some(allocation.id));
+            assert_eq!(info.node_id.as_deref(), Some("node-a"));
+        }
+        Ok(())
+    }
+
+    /// Spot check 2026-10-12: a pressure action reported on a heartbeat
+    /// becomes a `node.pressure` event, and `evict-bursting` spends the
+    /// task's move budget, so a task that always outgrows its reservation is
+    /// not re-placed and evicted again forever.
+    #[test]
+    fn pressure_evictions_emit_events_and_spend_the_move_budget() -> R<()> {
+        let store = setup_store()?;
+        insert_node(&store, "node-a")?;
+        let job = JobConfig {
+            priority: Default::default(),
+            rollout: None,
+            rollout_by_group: Default::default(),
+            name: "mem-hog".into(),
+            tasks: vec![TaskConfig {
+                on_unhealthy: TaskOnUnhealthyConfig {
+                    move_count: Some(1),
+                    move_delay: Duration::from_secs(0),
+                    ..TaskOnUnhealthyConfig::default()
+                },
+                ..TaskConfig::new("hog", "noop")
+            }],
+            version: None,
+        };
+        store.handle_job_submit(&job, &[submission()])?;
+        let job_config_id = store.get_job_config(&job.name)?.id();
+        let task_id = store.get_task_configs_for_job_config(&job_config_id)?[0].0;
+        let tracker = Arc::new(Mutex::new(AllocationFailureTracker::default()));
+        let evict = |allocation_id: i64, step: &str| crate::structs::PressureAction {
+            allocation_id,
+            job_id: "mem-hog".into(),
+            step: step.into(),
+            detail: format!("evicted by {step} on node-a"),
+            ..Default::default()
+        };
+        let pressure_events = |store: &Store| -> R<Vec<_>> {
+            store.list_scheduler_events(&SchedulerEventFilter {
+                kind: Some("node.pressure".into()),
+                ..Default::default()
+            })
+        };
+
+        // First bursting eviction: journaled, removed, replacement queued.
+        let first = store.place_alloc("node-a", task_id)?;
+        handle_pressure_actions(
+            &store,
+            &tracker,
+            "node-a",
+            &[evict(first.id, "evict-bursting")],
+        )?;
+        assert!(store.get_allocation_by_id(first.id)?.is_none());
+        let events = pressure_events(&store)?;
+        assert_eq!(events.len(), 1, "{events:?}");
+        assert_eq!(events[0].allocation_id, Some(first.id));
+        assert!(events[0].metadata_json.contains("\"evict-bursting\""));
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !store
+            .get_evals()?
+            .iter()
+            .any(|eval| eval.kind == "job_reschedule")
+        {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "missing job_reschedule eval"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        // An `evict-reserved` stop is the node's doing, not the task's: it
+        // does not spend the budget (move_count = 1 would fail the job).
+        let reserved = store.place_alloc("node-a", task_id)?;
+        handle_pressure_actions(
+            &store,
+            &tracker,
+            "node-a",
+            &[evict(reserved.id, "evict-reserved")],
+        )?;
+        assert!(store.get_allocation_by_id(reserved.id)?.is_none());
+        assert_ne!(store.get_job("mem-hog")?.status, "failed");
+
+        // The second bursting eviction spends the last move: the job fails
+        // instead of looping.
+        let second = store.place_alloc("node-a", task_id)?;
+        handle_pressure_actions(
+            &store,
+            &tracker,
+            "node-a",
+            &[evict(second.id, "evict-bursting")],
+        )?;
+        assert_eq!(store.get_job("mem-hog")?.status, "failed");
+        assert_eq!(pressure_events(&store)?.len(), 3);
+        assert!(tracker.lock().unwrap().allocations.is_empty());
+        // The spent budget is announced with its reason before `job.failed`.
+        let exhausted = store.list_scheduler_events(&SchedulerEventFilter {
+            kind: Some("allocation.reschedule_exhausted".into()),
+            ..Default::default()
+        })?;
+        assert_eq!(exhausted.len(), 1, "{exhausted:?}");
+        assert_eq!(exhausted[0].level, "error");
+        assert_eq!(exhausted[0].allocation_id, Some(second.id));
+        let meta: Value = serde_json::from_str(&exhausted[0].metadata_json)?;
+        assert_eq!(meta["moves"], 1);
+        assert_eq!(meta["moveCount"], 1);
+        assert_eq!(meta["task"], "hog");
+        assert_eq!(meta["reason"], "evicted by evict-bursting on node-a");
+        assert_eq!(deferred_events(&store, "mem-hog")?.len(), 1);
+        Ok(())
+    }
+
     #[test]
     fn artifact_staging_failures_emit_per_artifact_events() -> R<()> {
         let store = setup_store()?;
@@ -17132,7 +18013,7 @@ mod tests {
         let allocation = store.place_alloc("node-a", task_id)?;
         assert_eq!(build_desired_allocations(&store, "node-a", &[])?.len(), 1);
 
-        handle_terminated_allocations(
+        let retry = handle_terminated_allocations(
             &store,
             "node-a",
             &[crate::structs::TerminatedAllocation {
@@ -17142,13 +18023,14 @@ mod tests {
                 signal: None,
                 message: "exited with status 0".into(),
             }],
-        )?;
+        );
+        assert!(retry.is_empty(), "{retry:?}");
 
         assert!(build_desired_allocations(&store, "node-a", &[])?.is_empty());
         assert!(store.get_allocation_by_id(allocation.id)?.is_some());
 
         // A report from a node that does not own the allocation is ignored.
-        handle_terminated_allocations(
+        let retry = handle_terminated_allocations(
             &store,
             "node-b",
             &[crate::structs::TerminatedAllocation {
@@ -17158,7 +18040,11 @@ mod tests {
                 signal: None,
                 message: "exited with status 1".into(),
             }],
-        )?;
+        );
+        assert!(
+            retry.is_empty(),
+            "a non-owner report is never retried: {retry:?}"
+        );
         assert_eq!(
             store
                 .get_allocation_by_id(allocation.id)?
@@ -17206,7 +18092,7 @@ mod tests {
         assert_eq!(placed.allocations.len(), 1, "api waits for prep");
         assert_eq!(evals_of_kind(&store, "dag-report", "job_reschedule")?, 0);
 
-        handle_terminated_allocations(
+        let retry = handle_terminated_allocations(
             &store,
             "node-a",
             &[crate::structs::TerminatedAllocation {
@@ -17216,8 +18102,34 @@ mod tests {
                 signal: None,
                 message: "exited with status 0".into(),
             }],
-        )?;
+        );
+        assert!(retry.is_empty(), "{retry:?}");
         assert_eq!(evals_of_kind(&store, "dag-report", "job_reschedule")?, 1);
+        Ok(())
+    }
+
+    /// Regression (spot check, DAG stuck after `fetch`): a terminal report
+    /// this manager cannot record is handed back for a retry instead of
+    /// being logged and dropped. The worker sends each report once, so a
+    /// drop left the allocation `placed` and every `success` dependent held
+    /// forever. An allocation this replica has no row for yet (the heartbeat
+    /// beat the placement's replication) is the case a test can stage.
+    #[test]
+    fn an_unrecorded_terminal_report_is_handed_back_for_a_retry() -> R<()> {
+        let store = setup_store()?;
+        insert_node(&store, "node-a")?;
+        let retry = handle_terminated_allocations(
+            &store,
+            "node-a",
+            &[crate::structs::TerminatedAllocation {
+                allocation_id: 998,
+                success: true,
+                exit_code: Some(0),
+                signal: None,
+                message: "exited with status 0".into(),
+            }],
+        );
+        assert_eq!(retry, vec![998]);
         Ok(())
     }
 
@@ -18174,5 +19086,142 @@ mod tests {
             reply.max_session_seconds
         );
         Ok(())
+    }
+
+    fn lane_status(
+        lane: &str,
+        leader: Option<&str>,
+    ) -> crate::storage::persistence::RaftLaneStatus {
+        crate::storage::persistence::RaftLaneStatus {
+            lane: lane.to_string(),
+            role: crate::storage::persistence::PersistenceRole::Standby,
+            leader_id: leader.map(str::to_string),
+            term: 3,
+            commit_index: 10,
+            applied_index: 10,
+            voters: 2,
+            quorum: 2,
+            survives: 0,
+            warning: None,
+        }
+    }
+
+    fn raft_status_for(
+        node_id: &str,
+        voters: &[&str],
+        lanes: Vec<crate::storage::persistence::RaftLaneStatus>,
+    ) -> crate::storage::persistence::RaftStatus {
+        crate::storage::persistence::RaftStatus {
+            enabled: true,
+            backend: "raft".into(),
+            node_id: node_id.into(),
+            cluster_id: "test".into(),
+            role: crate::storage::persistence::PersistenceRole::Standby,
+            leader_id: None,
+            term: 3,
+            commit_index: 10,
+            applied_index: 9,
+            lease_held: false,
+            voters: voters.iter().map(|v| v.to_string()).collect(),
+            learners: Vec::new(),
+            peers: Vec::new(),
+            election_epoch_ms: 0,
+            join_token_ttl_seconds: 0,
+            raft_library: String::new(),
+            lanes,
+        }
+    }
+
+    /// Spot-check P2-12: the roster names every member of the membership,
+    /// not just the one that wrote a config row, with the control-lane
+    /// leader as `leader`, settled voters as `follower`, and anyone else as
+    /// `learner`. Only the answering manager is pre-marked reachable.
+    #[test]
+    fn raft_roster_lists_every_member_with_its_role() {
+        let status = raft_status_for(
+            "mgr-b",
+            &["mgr-a", "mgr-b"],
+            vec![lane_status("control", Some("mgr-a"))],
+        );
+        let members = vec![
+            ("mgr-c".to_string(), "10.0.0.3:4747".to_string()),
+            ("mgr-a".to_string(), "10.0.0.1:4747".to_string()),
+            ("mgr-b".to_string(), "10.0.0.2:4747".to_string()),
+        ];
+        let roster = raft_roster(&status, &members);
+        let summary: Vec<(&str, &str, bool, bool)> = roster
+            .iter()
+            .map(|m| (m.node_id.as_str(), m.role.as_str(), m.voter, m.is_self))
+            .collect();
+        assert_eq!(
+            summary,
+            vec![
+                ("mgr-a", "leader", true, false),
+                ("mgr-b", "follower", true, true),
+                ("mgr-c", "learner", false, false),
+            ]
+        );
+        assert_eq!(roster[0].leader_lanes, vec!["control".to_string()]);
+        assert_eq!(roster[0].advertise_addr, "10.0.0.1:4747");
+        // Self carries its own numbers; peers wait for the probe.
+        assert!(roster[1].reachable);
+        assert_eq!(roster[1].applied_index, Some(9));
+        assert!(!roster[0].reachable && roster[0].term.is_none());
+    }
+
+    /// Under `lanes` topology the lanes a manager leads are listed, and
+    /// only the control lane's leader is `leader`.
+    #[test]
+    fn raft_roster_reports_split_lane_leadership() {
+        let status = raft_status_for(
+            "mgr-a",
+            &["mgr-a", "mgr-b"],
+            vec![
+                lane_status("control", Some("mgr-a")),
+                lane_status("scheduler", Some("mgr-b")),
+                lane_status("status", Some("mgr-a")),
+            ],
+        );
+        let members = vec![
+            ("mgr-a".to_string(), "10.0.0.1:4747".to_string()),
+            ("mgr-b".to_string(), "10.0.0.2:4747".to_string()),
+        ];
+        let roster = raft_roster(&status, &members);
+        assert_eq!(roster[0].role, "leader");
+        assert_eq!(roster[0].leader_lanes, vec!["control", "status"]);
+        assert_eq!(roster[1].role, "follower");
+        assert_eq!(roster[1].leader_lanes, vec!["scheduler"]);
+    }
+
+    /// Outside raft, `ListManagers` reports exactly the answering manager,
+    /// named like its config row and joined to that row's timestamp.
+    #[tokio::test]
+    async fn list_managers_outside_raft_reports_the_one_manager() -> R<()> {
+        let store = setup_store()?;
+        store.upsert_manager_config("0.0.0.0:4747", &ManagerConfigFull::default())?;
+        let manager = ManagerDaemonService::new(store)
+            .with_advertise_addr("http://10.0.0.5:4747")
+            .with_manager_id("0.0.0.0:4747");
+        let reply = manager
+            .list_managers(Request::new(ListManagersRequest {}))
+            .await?
+            .into_inner();
+        assert_eq!(reply.persistence_backend, "local_disk");
+        assert_eq!(reply.answered_by, "0.0.0.0:4747");
+        assert_eq!(reply.managers.len(), 1, "{:?}", reply.managers);
+        let only = &reply.managers[0];
+        assert_eq!(only.node_id, "0.0.0.0:4747");
+        assert_eq!(only.advertise_addr, "10.0.0.5:4747");
+        assert_eq!(only.role, "standalone");
+        assert!(only.is_self && only.reachable && !only.voter);
+        assert!(only.config_updated_at.is_some());
+        Ok(())
+    }
+
+    #[test]
+    fn host_port_of_strips_scheme_and_path() {
+        assert_eq!(host_port_of("http://10.0.0.5:4747"), "10.0.0.5:4747");
+        assert_eq!(host_port_of("https://mgr.example:443/"), "mgr.example:443");
+        assert_eq!(host_port_of("127.0.0.1:4747"), "127.0.0.1:4747");
     }
 }

@@ -68,6 +68,8 @@ impl CliError {
     /// Build a `CliError` from a gRPC [`Status`], attaching a hint and a
     /// retryable classification derived from the status code.
     pub fn from_status(action: &str, status: &Status) -> Self {
+        let client_side = client_side_failure(status);
+        let status = client_side.as_ref().unwrap_or(status);
         let code = status.code();
         let (message_text, server_hint) = crate::cmd::helpers::split_hint(status.message().trim());
         let message = if message_text.is_empty() {
@@ -86,8 +88,8 @@ impl CliError {
         CliError {
             code: legion_code.unwrap_or_else(|| code_name(code).to_string()),
             message,
-            hint: server_hint
-                .map(str::to_string)
+            hint: crate::cmd::helpers::unauthenticated_hint(code)
+                .or_else(|| server_hint.map(str::to_string))
                 .or_else(|| hint_for(code, message_text).map(str::to_string)),
             retryable: is_retryable(code),
         }
@@ -103,6 +105,60 @@ impl CliError {
             retryable: false,
         }
     }
+}
+
+/// The status for a failure the CLI's own channel produced rather than one
+/// the manager returned, restated so an agent can act on it; `None` for
+/// everything else.
+///
+/// - A request that outlived its deadline (`LEGION_REQUEST_TIMEOUT`) comes
+///   out of tonic as `Cancelled: Timeout expired`, which reads as if someone
+///   cancelled it. It is a `DeadlineExceeded`, and retryable.
+/// - A connection that could not be opened is already `Unavailable`, but its
+///   message can be a bare "deadline has elapsed" that says nothing about
+///   the manager. Name the manager and say what to check.
+pub fn client_side_failure(status: &Status) -> Option<Status> {
+    let mut source = std::error::Error::source(status);
+    while let Some(err) = source {
+        if err.is::<tonic::TimeoutExpired>() {
+            return Some(request_deadline_status());
+        }
+        if err.is::<tonic::ConnectError>() {
+            // The status message is only the outermost layer ("tcp connect
+            // error"); the cause ("Connection refused") is further down, and
+            // layers often repeat the one above them.
+            let mut layers: Vec<String> = Vec::new();
+            let mut layer = Some(err);
+            while let Some(inner) = layer {
+                let text = inner.to_string();
+                if layers.last() != Some(&text) {
+                    layers.push(text);
+                }
+                layer = inner.source();
+            }
+            return Some(Status::unavailable(format!(
+                "cannot connect to the manager: {}\nHint: manager unavailable; check LEGION_ADDR \
+                 or start the manager (LEGION_CONNECT_TIMEOUT bounds the attempt)",
+                layers.join(": ")
+            )));
+        }
+        source = err.source();
+    }
+    // The manager enforces the `grpc-timeout` the CLI sends, and can answer
+    // with it a moment before the CLI's own timer fires.
+    if status.code() == Code::Cancelled && status.message() == "Timeout expired" {
+        return Some(request_deadline_status());
+    }
+    None
+}
+
+fn request_deadline_status() -> Status {
+    Status::deadline_exceeded(
+        "the manager did not answer within the request deadline (LEGION_REQUEST_TIMEOUT, \
+         default 30s)\nHint: a manager that accepts connections but never answers usually has \
+         no raft leader; check `legion raft status` against each manager and retry, or raise \
+         LEGION_REQUEST_TIMEOUT for a slow operation",
+    )
 }
 
 /// Returns whether a retry of the same request may plausibly succeed.

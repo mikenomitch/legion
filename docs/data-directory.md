@@ -9,7 +9,7 @@ Set `LEGION_DATA_DIR` to move the whole tree somewhere else:
 
 ```bash
 LEGION_DATA_DIR=/var/lib/legion legion start manager -c manager.ncl
-LEGION_DATA_DIR=/var/lib/legion legion start worker "$TOKEN"
+LEGION_DATA_DIR=/var/lib/legion legion start worker --token-file /etc/legion/join-token
 ```
 
 One variable is enough to run a second, isolated cluster from the same
@@ -25,6 +25,7 @@ up, or start over without deleting your existing data.
 | Worker state, allocation dirs, task logs | `<data dir>/workers/<worker-id>/` | `LEGION_WORKER_STATE_PATH` (state file only) |
 | Worker node certificate and its private key (`node.pem`, `node.key`, `ca.pem`, each mode `0600`) | `identity/` beside the worker state file | moves with `LEGION_WORKER_STATE_PATH` |
 | Identity token backing files | `<data dir>/identity/<alloc-id>/<name>/token` | none |
+| Sandbox device links for memory checkpoints (symlinks only, kept outside the worker-id path so a published checkpoint finds them on another node; see [the sandbox runtime](task-runtime-sandbox.md#launching-a-sandbox-for-memory-checkpoints)) | `<data dir>/vmdev/<key>/` | none |
 | Worker node key, certificate, and cluster CA bundle (`node.key`, `node.pem`, `ca.pem`, mode `0600`) | `<data dir>/workers/<worker-id>/identity/` (beside the state file) | moves with `LEGION_WORKER_STATE_PATH` |
 | Simulator fleet key and certificate | `<data dir>/sim/<name prefix>/identity/` | none |
 | Initial management token (`bootstrap-token`, mode `0600`), written by the manager that mints it | `<data dir>/bootstrap-token` | none |
@@ -36,13 +37,13 @@ An explicit setting always wins over the data dir. If your manager config sets
 `storePath`, that path is used whether or not `LEGION_DATA_DIR` is set. The
 shipped `configs/manager.ncl` leaves `storePath` unset so the variable applies.
 
-The CLI's saved login token (`~/.legion/token`) is per-user, not per-process,
-and does not move. Use `LEGION_TOKEN_FILE` to relocate it. A manager writes
-the initial management token there at first start only when the file does not
-exist yet (see [Auth & ACLs](auth-and-acls.md#where-the-initial-token-goes)),
-so a second cluster started from the same account keeps using the first
-cluster's token until you export the second one's `bootstrap-token` as
-`LEGION_TOKEN`.
+The CLI's saved login tokens (`~/.legion/tokens/<host>_<port>`, one per
+manager address) are per-user, not per-process, and do not move. Use
+`LEGION_TOKEN_FILE` to name one file instead. A manager writes the initial
+management token to the file for its own address at first start (see
+[Auth & ACLs](auth-and-acls.md#where-the-initial-token-goes)), so a second
+cluster started from the same account on other ports gets a file of its own,
+and the CLI picks it up when `LEGION_ADDR` points at that cluster.
 
 ## Running two clusters from one checkout
 

@@ -38,6 +38,27 @@ use std::path::{Path, PathBuf};
 /// exist in their children.
 const REQUIRED_CONTROLLERS: [&str; 3] = ["cpuset", "cpu", "memory"];
 
+/// Child of a slice that processes found sitting in the slice itself are
+/// moved into. cgroup v2's no-internal-processes rule means a cgroup that
+/// holds processes cannot delegate controllers, so one stray process in a
+/// slice would leave every leaf under it without limit files. Not a
+/// `legion-<alloc>` name, so the orphan sweep never touches it.
+const STRAY_LEAF: &str = "stray";
+
+/// A placement the node has no room for right now (every whole core is
+/// taken), as opposed to one it cannot enforce at all. Typed so the worker
+/// plane can answer `RESOURCE_EXHAUSTED` rather than `FAILED_PRECONDITION`.
+#[derive(Debug)]
+pub struct PlacementExhausted(pub String);
+
+impl std::fmt::Display for PlacementExhausted {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for PlacementExhausted {}
+
 /// Per-allocation cgroup leaf name. Matches the container name the runtimes
 /// already use, so `legion-<alloc>` is one identifier across the container
 /// list, the process table, and the cgroup tree.
@@ -194,6 +215,9 @@ pub struct NodeResourceGovernor {
     usable_cores: Vec<u32>,
     /// Cores currently reserved, by allocation.
     reserved: BTreeMap<i64, Vec<u32>>,
+    /// Where the cgroup v2 hierarchy is mounted: [`CGROUP_ROOT`], except in
+    /// tests, which point it at a scratch directory.
+    fs_root: PathBuf,
 }
 
 impl Default for NodeResourceGovernor {
@@ -213,6 +237,7 @@ impl NodeResourceGovernor {
             root: PathBuf::from("legion"),
             usable_cores: Vec::new(),
             reserved: BTreeMap::new(),
+            fs_root: PathBuf::from(CGROUP_ROOT),
         }
     }
 
@@ -229,6 +254,7 @@ impl NodeResourceGovernor {
             root: PathBuf::from(crate::task_plugins::exec_isolation::cgroup_parent()),
             usable_cores: Vec::new(),
             reserved: BTreeMap::new(),
+            fs_root: PathBuf::from(CGROUP_ROOT),
         })
     }
 
@@ -289,6 +315,7 @@ impl NodeResourceGovernor {
             root,
             usable_cores,
             reserved: BTreeMap::new(),
+            fs_root: PathBuf::from(CGROUP_ROOT),
         }
     }
 
@@ -344,17 +371,22 @@ impl NodeResourceGovernor {
         // reserving task starts — otherwise its cores are briefly shared.
         //
         // A failure here rolls the reservation back: a task that could not be
-        // confined must not also strand the cores it never got.
+        // confined must not also strand the cores it never got, nor leave its
+        // half-written leaf behind. Nothing else removes that leaf, because
+        // the instance never receives the assignment that names it.
         let applied = self
             .ensure_hierarchy()
             .and_then(|()| self.write_slice_masks())
             .and_then(|()| {
                 if mode == ResourceEnforcement::WorkerCgroup {
-                    create_task_cgroup(&assignment)?;
+                    create_task_cgroup(&self.fs_root, &assignment)?;
                 }
                 Ok(())
             });
         if let Err(err) = applied {
+            if mode == ResourceEnforcement::WorkerCgroup {
+                remove_task_cgroup(&self.fs_root, &assignment);
+            }
             self.reserved.remove(&allocation_id);
             let _ = self.write_slice_masks();
             return Err(err);
@@ -451,13 +483,58 @@ impl NodeResourceGovernor {
         }
     }
 
+    /// Remove `legion-<alloc>` leaves that no allocation this worker runs
+    /// owns: the residue of a worker that crashed mid-teardown, or of an
+    /// older build that leaked a leaf per failed start. Called once at
+    /// startup, after every persisted allocation is restored.
+    ///
+    /// Only empty cgroups can be removed, so a leaf that still holds a
+    /// process survives the sweep and is reported rather than killed: those
+    /// are processes nothing is tracking, and the operator decides.
+    pub fn sweep_orphan_cgroups(&self, owned: impl Fn(i64) -> bool) {
+        if !self.enabled && !self.labels_only {
+            return;
+        }
+        let mut removed = 0usize;
+        for slice in [Slice::Share, Slice::Reserve] {
+            let Ok(entries) = std::fs::read_dir(self.slice_path(slice)) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let Some(allocation_id) = entry
+                    .file_name()
+                    .to_str()
+                    .and_then(|name| name.strip_prefix("legion-"))
+                    .and_then(|id| id.parse::<i64>().ok())
+                else {
+                    continue;
+                };
+                if owned(allocation_id) || !entry.path().is_dir() {
+                    continue;
+                }
+                match std::fs::remove_dir(entry.path()) {
+                    Ok(()) => removed += 1,
+                    Err(err) => warn!(
+                        path = %entry.path().display(),
+                        error = %err,
+                        "Orphaned task cgroup could not be removed; it may still hold \
+                         processes no allocation tracks"
+                    ),
+                }
+            }
+        }
+        if removed > 0 {
+            info!(removed, "Removed orphaned task cgroups");
+        }
+    }
+
     /// Release an allocation's reservation and remove its cgroup. Idempotent:
     /// releasing an allocation that reserved nothing, or releasing twice, is
     /// a no-op.
     pub fn release(&mut self, allocation_id: i64, assignment: Option<&ResourceAssignment>) {
         if self.labels_only {
             if let Some(assignment) = assignment {
-                remove_task_cgroup(assignment);
+                remove_task_cgroup(&self.fs_root, assignment);
             }
             return;
         }
@@ -466,7 +543,7 @@ impl NodeResourceGovernor {
         }
         let had_reservation = self.reserved.remove(&allocation_id).is_some();
         if let Some(assignment) = assignment {
-            remove_task_cgroup(assignment);
+            remove_task_cgroup(&self.fs_root, assignment);
         }
         if had_reservation {
             // The cores are the share slice's again.
@@ -497,14 +574,15 @@ impl NodeResourceGovernor {
         let count = count as usize;
         let free = self.share_cores();
         if free.len() == count && !free.is_empty() {
-            bail!(
+            return Err(PlacementExhausted(format!(
                 "reserving {count} core(s) for allocation {allocation_id} would leave the share \
                  slice empty, and every unpinned task on this node runs in it; leave at least \
                  one core unreserved, or lower the reservation"
-            );
+            ))
+            .into());
         }
         if free.len() < count {
-            bail!(
+            return Err(PlacementExhausted(format!(
                 "cannot reserve {count} exclusive core(s) for allocation {allocation_id}: this \
                  node has {} free ({}), with {} already reserved ({}) out of {} usable ({})",
                 free.len(),
@@ -513,7 +591,8 @@ impl NodeResourceGovernor {
                 format_cpu_list(&self.reserved_cores()),
                 self.usable_cores.len(),
                 format_cpu_list(&self.usable_cores),
-            );
+            ))
+            .into());
         }
         let assigned: Vec<u32> = free.into_iter().take(count).collect();
         self.reserved.insert(allocation_id, assigned.clone());
@@ -521,9 +600,7 @@ impl NodeResourceGovernor {
     }
 
     fn slice_path(&self, slice: Slice) -> PathBuf {
-        PathBuf::from(CGROUP_ROOT)
-            .join(&self.root)
-            .join(slice.dir_name())
+        self.fs_root.join(&self.root).join(slice.dir_name())
     }
 
     /// Create the hierarchy root and both slices, delegating the controllers
@@ -531,27 +608,48 @@ impl NodeResourceGovernor {
     fn ensure_hierarchy(&self) -> R<()> {
         if self.labels_only {
             // Directories only: no controllers are delegated, no limits.
-            let root = PathBuf::from(CGROUP_ROOT).join(&self.root);
-            let share = root.join(Slice::Share.dir_name());
+            let share = self.slice_path(Slice::Share);
             return std::fs::create_dir_all(&share)
                 .with_context(|| format!("create cgroup {}", share.display()));
         }
         if !self.enabled {
             return Ok(());
         }
-        let root = PathBuf::from(CGROUP_ROOT).join(&self.root);
-        for dir in [
-            root.clone(),
-            root.join(Slice::Share.dir_name()),
-            root.join(Slice::Reserve.dir_name()),
-        ] {
-            std::fs::create_dir_all(&dir)
+        let root = self.fs_root.join(&self.root);
+        let slices = [
+            self.slice_path(Slice::Share),
+            self.slice_path(Slice::Reserve),
+        ];
+        for dir in std::iter::once(&root).chain(&slices) {
+            std::fs::create_dir_all(dir)
                 .with_context(|| format!("create cgroup {}", dir.display()))?;
         }
         // Controllers are delegated top-down: a child can only use what its
-        // parent put in `subtree_control`.
-        enable_controllers(Path::new(CGROUP_ROOT))?;
-        enable_controllers(&root)?;
+        // parent put in `subtree_control`. Every level from the mount down to
+        // the slices must delegate, the slices included, or a leaf gets no
+        // `memory.max`/`cpu.weight`/`cpuset.cpus` file to write.
+        //
+        // The mount and any ancestors between it and `cgroupParent` are the
+        // operator's: best-effort, never evacuated, and a refusal surfaces
+        // below as `cgroupParent` lacking the controller. The cgroups Legion
+        // owns must delegate, and the slices (which only Legion ever puts
+        // anything in) are emptied of stray processes first.
+        let mut ancestor = self.fs_root.clone();
+        let mut ancestors = vec![ancestor.clone()];
+        let depth = self.root.components().count();
+        for component in self.root.components().take(depth.saturating_sub(1)) {
+            ancestor.push(component);
+            ancestors.push(ancestor.clone());
+        }
+        for dir in &ancestors {
+            if let Err(err) = delegate_controllers(dir, false) {
+                debug!(path = %dir.display(), error = %format!("{err:#}"), "Could not delegate cgroup controllers on an ancestor");
+            }
+        }
+        delegate_controllers(&root, false)?;
+        for slice in &slices {
+            delegate_controllers(slice, true)?;
+        }
         // `memory.low` is hierarchical: a leaf's protection is capped by its
         // ancestors' effective protection. "max" on the cgroups Legion owns
         // passes each leaf's own `memory.low` (its reservation) through
@@ -630,21 +728,93 @@ fn fingerprint_usable_cores() -> Vec<u32> {
     Vec::new()
 }
 
-/// Put the controllers the limits need into a cgroup's `subtree_control`.
-/// A controller that is already enabled writes as an error the kernel reports
-/// but that changes nothing, so failures are logged rather than fatal — the
-/// missing-controller case surfaces as the limit write failing, with a path
-/// in the message.
-fn enable_controllers(dir: &Path) -> R<()> {
-    let path = dir.join("cgroup.subtree_control");
-    for controller in REQUIRED_CONTROLLERS {
-        if let Err(err) = std::fs::write(&path, format!("+{controller}")) {
-            debug!(
-                path = %path.display(),
-                controller,
-                error = ?err,
-                "Could not delegate cgroup controller (already enabled is normal)"
-            );
+/// Put the controllers the limits need into a cgroup's `subtree_control`, and
+/// fail, naming the cgroup, if they did not land there. Checking up front
+/// matters: a slice that does not delegate otherwise surfaces much later as
+/// "write .../legion-<alloc>/memory.max: No such file or directory", which
+/// names the leaf rather than the cgroup that is wrong.
+///
+/// With `evacuate`, processes sitting in `dir` itself are first moved into
+/// its [`STRAY_LEAF`] child, since the kernel refuses (`EBUSY`) to delegate
+/// from a cgroup that holds processes. Only for cgroups Legion alone puts
+/// things in: never the mount or the operator's ancestors.
+fn delegate_controllers(dir: &Path, evacuate: bool) -> R<()> {
+    let control = dir.join("cgroup.subtree_control");
+    let missing = missing_controllers(&control);
+    if missing.is_empty() {
+        return Ok(());
+    }
+    if evacuate {
+        evacuate_processes(dir)?;
+    }
+    // One write for them all: the kernel validates the whole list before it
+    // enables anything, and enabling an already-enabled controller is a
+    // no-op, so this either delegates every missing controller or none.
+    let request = missing
+        .iter()
+        .map(|controller| format!("+{controller}"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let written = std::fs::write(&control, &request);
+    let still_missing = missing_controllers(&control);
+    if still_missing.is_empty() {
+        return Ok(());
+    }
+    let cause = match written {
+        Err(err) => format!("writing {request:?} failed: {err}"),
+        Ok(()) => format!("the kernel accepted {request:?} but did not enable them"),
+    };
+    let available = std::fs::read_to_string(dir.join("cgroup.controllers")).unwrap_or_default();
+    let enabled = std::fs::read_to_string(&control).unwrap_or_default();
+    bail!(
+        "cgroup {} does not delegate the {} controller(s) to its children ({cause}); its \
+         cgroup.subtree_control is {:?} and its cgroup.controllers is {:?}. A controller \
+         missing from cgroup.controllers must first be delegated by the parent cgroup",
+        dir.display(),
+        still_missing.join(", "),
+        enabled.trim(),
+        available.trim(),
+    )
+}
+
+/// The [`REQUIRED_CONTROLLERS`] a `cgroup.subtree_control` file does not list.
+/// An unreadable file lists nothing.
+fn missing_controllers(control: &Path) -> Vec<&'static str> {
+    let enabled = std::fs::read_to_string(control).unwrap_or_default();
+    // The kernel lists bare names. Tolerating the `+` of the write format
+    // lets a plain directory stand in for cgroupfs in tests.
+    let enabled: Vec<&str> = enabled
+        .split_whitespace()
+        .map(|name| name.trim_start_matches('+'))
+        .collect();
+    REQUIRED_CONTROLLERS
+        .into_iter()
+        .filter(|controller| !enabled.contains(controller))
+        .collect()
+}
+
+/// Move every process in `dir` itself into its [`STRAY_LEAF`] child. They
+/// stay under `dir`'s cpuset, so nothing escapes the fence; they just stop
+/// blocking delegation. A pid that exited meanwhile is skipped.
+fn evacuate_processes(dir: &Path) -> R<()> {
+    let procs = std::fs::read_to_string(dir.join("cgroup.procs")).unwrap_or_default();
+    let pids: Vec<&str> = procs.split_whitespace().collect();
+    if pids.is_empty() {
+        return Ok(());
+    }
+    let stray = dir.join(STRAY_LEAF);
+    std::fs::create_dir_all(&stray)
+        .with_context(|| format!("create cgroup {}", stray.display()))?;
+    warn!(
+        cgroup = %dir.display(),
+        pids = %pids.join(","),
+        stray = %stray.display(),
+        "A Legion cgroup slice holds processes of its own, which stops it delegating \
+         controllers to task cgroups; moving them into its stray child"
+    );
+    for pid in pids {
+        if let Err(err) = std::fs::write(stray.join("cgroup.procs"), pid) {
+            debug!(pid, error = %err, "Could not move a stray process (it may have exited)");
         }
     }
     Ok(())
@@ -653,8 +823,8 @@ fn enable_controllers(dir: &Path) -> R<()> {
 /// Create one task's cgroup and write its limits — the `WorkerCgroup` path.
 /// `RuntimeApplied` runtimes never reach here: the OCI runtime creates the
 /// cgroup at `cgroupsPath` itself.
-fn create_task_cgroup(assignment: &ResourceAssignment) -> R<()> {
-    let dir = assignment.absolute_cgroup_path();
+fn create_task_cgroup(fs_root: &Path, assignment: &ResourceAssignment) -> R<()> {
+    let dir = fs_root.join(&assignment.cgroup_path);
     std::fs::create_dir_all(&dir).with_context(|| format!("create cgroup {}", dir.display()))?;
 
     if let Some(cores) = assignment.cores.as_ref() {
@@ -682,10 +852,11 @@ fn create_task_cgroup(assignment: &ResourceAssignment) -> R<()> {
 }
 
 /// Remove a task's cgroup. Best-effort: an rmdir that fails because a process
-/// is still leaving is normal during teardown, and the next start of the same
-/// allocation reuses the directory anyway.
-fn remove_task_cgroup(assignment: &ResourceAssignment) {
-    let dir = assignment.absolute_cgroup_path();
+/// is still leaving is normal during teardown, the next start of the same
+/// allocation reuses the directory, and the startup sweep
+/// ([`NodeResourceGovernor::sweep_orphan_cgroups`]) catches the rest.
+fn remove_task_cgroup(fs_root: &Path, assignment: &ResourceAssignment) {
+    let dir = fs_root.join(&assignment.cgroup_path);
     if dir.exists() {
         if let Err(err) = std::fs::remove_dir(&dir) {
             debug!(path = %dir.display(), error = ?err, "Could not remove task cgroup");
@@ -752,6 +923,7 @@ mod tests {
             root: PathBuf::from("legion"),
             usable_cores: cores.to_vec(),
             reserved: BTreeMap::new(),
+            fs_root: PathBuf::from(CGROUP_ROOT),
         }
     }
 
@@ -766,6 +938,7 @@ mod tests {
             root: PathBuf::from("legion"),
             usable_cores: Vec::new(),
             reserved: BTreeMap::new(),
+            fs_root: PathBuf::from(CGROUP_ROOT),
         };
         let task: TaskConfig = serde_json::from_value(serde_json::json!({
             "name": "web", "runtime": "exec",
@@ -1100,6 +1273,185 @@ mod tests {
             )
             .expect_err("that would leave the share slice empty");
         assert!(err.to_string().contains("share slice"), "{err}");
+        // Typed, so the worker plane answers RESOURCE_EXHAUSTED for it.
+        assert!(err.is::<PlacementExhausted>(), "{err:?}");
+    }
+
+    /// A governor whose cgroup mount is a scratch directory. Plain files
+    /// stand in for cgroupfs: they cannot model the kernel creating
+    /// interface files, but they do record every write the governor makes.
+    fn scratch_governor(fs_root: &Path, cores: &[u32]) -> NodeResourceGovernor {
+        NodeResourceGovernor {
+            fs_root: fs_root.to_path_buf(),
+            ..governor(cores)
+        }
+    }
+
+    fn read(path: PathBuf) -> String {
+        std::fs::read_to_string(&path)
+            .unwrap_or_else(|err| panic!("read {}: {err}", path.display()))
+    }
+
+    /// The spot-check P0: the slices themselves must delegate their
+    /// controllers, or a leaf under them gets no `memory.max` to write and
+    /// every governed task fails to start.
+    #[test]
+    fn both_slices_delegate_controllers_to_their_leaves_test() -> R<()> {
+        let fs = tempfile::tempdir()?;
+        let mut governor = scratch_governor(fs.path(), &[0, 1, 2]);
+        let share = governor
+            .assign(
+                923,
+                &task_with(json!({ "memory": 64, "cpu": 500 })),
+                ResourceEnforcement::WorkerCgroup,
+                None,
+            )?
+            .expect("governed");
+        let root = fs.path().join("legion");
+        for dir in [
+            fs.path().to_path_buf(),
+            root.clone(),
+            root.join("share"),
+            root.join("reserve"),
+        ] {
+            assert_eq!(
+                missing_controllers(&dir.join("cgroup.subtree_control")),
+                Vec::<&str>::new(),
+                "{} does not delegate",
+                dir.display()
+            );
+        }
+        let leaf = fs.path().join(&share.cgroup_path);
+        assert_eq!(read(leaf.join("memory.max")), (64u64 << 20).to_string());
+        assert_eq!(
+            read(leaf.join("cpu.weight")),
+            shares_to_weight(share.cpu_weight.expect("cpu declared")).to_string()
+        );
+
+        let reserved = governor
+            .assign(
+                924,
+                &task_with(json!({ "cores": 1 })),
+                ResourceEnforcement::WorkerCgroup,
+                None,
+            )?
+            .expect("governed");
+        assert_eq!(
+            read(fs.path().join(&reserved.cgroup_path).join("cpuset.cpus")),
+            "0"
+        );
+        assert_eq!(read(root.join("reserve/cpuset.cpus")), "0");
+        assert_eq!(read(root.join("share/cpuset.cpus")), "1-2");
+        Ok(())
+    }
+
+    /// A slice holding processes of its own cannot delegate (the kernel's
+    /// no-internal-processes rule), so they are moved into its stray child
+    /// first rather than leaving every task under it unconfined.
+    #[test]
+    fn a_slice_holding_processes_is_emptied_before_it_delegates_test() -> R<()> {
+        let fs = tempfile::tempdir()?;
+        let share = fs.path().join("legion/share");
+        std::fs::create_dir_all(&share)?;
+        std::fs::write(share.join("cgroup.procs"), "4242\n")?;
+        let mut governor = scratch_governor(fs.path(), &[0, 1]);
+        governor.assign(
+            5,
+            &task_with(json!({ "memory": 64 })),
+            ResourceEnforcement::WorkerCgroup,
+            None,
+        )?;
+        assert_eq!(read(share.join("stray/cgroup.procs")), "4242");
+        // The stray child is not a task leaf, so the sweep leaves it alone.
+        governor.sweep_orphan_cgroups(|_| false);
+        assert!(share.join("stray").is_dir());
+        Ok(())
+    }
+
+    /// A slice that will not delegate fails the placement with an error
+    /// naming the slice, not the leaf file that would have been missing, and
+    /// leaves no leaf or reservation behind.
+    #[test]
+    fn a_slice_that_cannot_delegate_names_itself_and_leaks_nothing_test() -> R<()> {
+        let fs = tempfile::tempdir()?;
+        let reserve = fs.path().join("legion/reserve");
+        // A directory where the control file should be: unreadable as a
+        // list and unwritable, like a kernel that refuses the controllers.
+        std::fs::create_dir_all(reserve.join("cgroup.subtree_control"))?;
+        let mut governor = scratch_governor(fs.path(), &[0, 1]);
+        let err = governor
+            .assign(
+                9,
+                &task_with(json!({ "cores": 1 })),
+                ResourceEnforcement::WorkerCgroup,
+                None,
+            )
+            .expect_err("the reserve slice does not delegate");
+        let message = format!("{err:#}");
+        assert!(
+            message.contains(&format!("cgroup {} does not delegate", reserve.display())),
+            "{message}"
+        );
+        assert!(message.contains("cpuset, cpu, memory"), "{message}");
+        assert!(governor.reserved_cores().is_empty());
+        assert!(!reserve.join("legion-9").exists());
+        Ok(())
+    }
+
+    /// A leaf whose limits fail to write is removed again: nothing else
+    /// would, because the instance never receives the assignment naming it.
+    /// The spot check found 467 of these, one per failed start.
+    #[cfg(unix)]
+    #[test]
+    fn a_failed_assign_removes_its_leaf_test() -> R<()> {
+        use std::os::unix::fs::PermissionsExt;
+        let fs = tempfile::tempdir()?;
+        let leaf = fs.path().join("legion/reserve/legion-11");
+        std::fs::create_dir_all(&leaf)?;
+        std::fs::set_permissions(&leaf, std::fs::Permissions::from_mode(0o555))?;
+        if std::fs::write(leaf.join("probe"), "").is_ok() {
+            // Running as root, which ignores the mode: nothing to inject.
+            return Ok(());
+        }
+        let mut governor = scratch_governor(fs.path(), &[0, 1]);
+        let err = governor
+            .assign(
+                11,
+                &task_with(json!({ "cores": 1 })),
+                ResourceEnforcement::WorkerCgroup,
+                None,
+            )
+            .expect_err("the leaf is read-only");
+        assert!(format!("{err:#}").contains("cpuset.cpus"), "{err:#}");
+        assert!(!leaf.exists(), "the half-built leaf was left behind");
+        assert!(governor.reserved_cores().is_empty());
+        assert_eq!(read(fs.path().join("legion/share/cpuset.cpus")), "0-1");
+        Ok(())
+    }
+
+    /// The startup sweep removes empty leaves no allocation owns, and keeps
+    /// owned leaves, populated leaves, and anything that is not a task leaf.
+    #[test]
+    fn the_startup_sweep_removes_only_unowned_empty_leaves_test() -> R<()> {
+        let fs = tempfile::tempdir()?;
+        let share = fs.path().join("legion/share");
+        let reserve = fs.path().join("legion/reserve");
+        for dir in [
+            share.join("legion-1"),
+            share.join("legion-2"),
+            share.join("legion-two"),
+            reserve.join("legion-3"),
+        ] {
+            std::fs::create_dir_all(dir)?;
+        }
+        // Stands in for a cgroup that still holds a process.
+        std::fs::write(reserve.join("legion-3/cgroup.procs"), "77")?;
+        scratch_governor(fs.path(), &[0, 1]).sweep_orphan_cgroups(|id| id == 1);
+        assert!(share.join("legion-1").exists(), "owned");
+        assert!(!share.join("legion-2").exists(), "orphaned and empty");
+        assert!(share.join("legion-two").exists(), "not a task leaf");
+        assert!(reserve.join("legion-3").exists(), "populated");
+        Ok(())
     }
 
     /// The burstable limits land in a real cgroup: `memory.max` is the
@@ -1118,6 +1470,7 @@ mod tests {
             root: PathBuf::from(&root),
             usable_cores: fingerprint_usable_cores(),
             reserved: BTreeMap::new(),
+            fs_root: PathBuf::from(CGROUP_ROOT),
         };
         let assignment = governor
             .assign(

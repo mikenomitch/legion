@@ -1,6 +1,6 @@
 //! OCI image layout → OCI runtime bundle conversion.
 //!
-//! Low-level OCI runtimes (youki, runc, crun) do not pull or run images by
+//! Low-level OCI runtimes (runc, crun) do not pull or run images by
 //! reference; they run a *bundle*: an extracted root filesystem plus a
 //! `config.json` runtime spec. This module turns the on-disk OCI **image**
 //! layout produced by the `oci://` artifact fetcher into that bundle so the
@@ -793,7 +793,14 @@ fn safe_relative(path: &Path) -> Option<PathBuf> {
 
 /// Extracts one image layer over `rootfs`, applying overlayfs whiteouts:
 /// `.wh.<name>` deletes `<name>`, and `.wh..wh..opq` clears the directory's
-/// existing contents (an opaque directory) before later entries land.
+/// existing contents (an opaque directory) before later entries land. An
+/// entry replaces whatever a lower layer left at its path (a directory over a
+/// directory merges), and a hard link may target a file from this layer or a
+/// lower one.
+///
+/// Paths resolve inside the rootfs ([`resolve_in_rootfs`]), so the image's
+/// own absolute symlinks point where they do in the container, and nothing a
+/// layer names can reach a host path through one.
 ///
 /// Each entry keeps what the image recorded for it, the way Docker's
 /// extraction does:
@@ -867,20 +874,17 @@ fn extract_layer_as(
             .unwrap_or_default()
             .to_string();
 
+        // Every path is resolved inside the rootfs, never on the host: an
+        // image's `lib -> /usr/lib` means the container's `/usr/lib`, and a
+        // whiteout or entry under it must land there rather than follow the
+        // link out of the rootfs.
+        let parent = resolve_in_rootfs(rootfs, rel.parent().unwrap_or(Path::new("")))?;
+
         if let Some(whiteout) = file_name.strip_prefix(".wh.") {
-            let parent = rel
-                .parent()
-                .map(|p| rootfs.join(p))
-                .unwrap_or_else(|| rootfs.to_path_buf());
             if whiteout == ".wh..opq" {
                 clear_dir(&parent)?;
             } else {
-                let target = parent.join(whiteout);
-                if target.is_dir() {
-                    let _ = std::fs::remove_dir_all(&target);
-                } else {
-                    let _ = std::fs::remove_file(&target);
-                }
+                remove_existing(&parent.join(whiteout));
             }
             continue;
         }
@@ -893,12 +897,35 @@ fn extract_layer_as(
         } else {
             Vec::new()
         };
-        // `unpack_in` re-validates the path against the rootfs and resolves
-        // hardlink/symlink targets safely, and applies the mode.
-        if !entry.unpack_in(rootfs)? {
-            continue;
+        let target = parent.join(rel.file_name().unwrap_or_default());
+        std::fs::create_dir_all(&parent).with_context(|| format!("create {}", parent.display()))?;
+        let kind = entry.header().entry_type();
+        // A layer replaces what a lower layer left at this path, whatever
+        // kind it was. Only a directory over a directory merges.
+        let keep = kind.is_dir()
+            && std::fs::symlink_metadata(&target).is_ok_and(|meta| meta.file_type().is_dir());
+        if !keep {
+            remove_existing(&target);
         }
-        let target = rootfs.join(&rel);
+        if kind.is_hard_link() {
+            // Not the tar crate's `unpack_in`: it canonicalizes the link's
+            // target through host symlinks, which turns an image's own
+            // absolute symlinks into a missing file or an escape.
+            let source = hard_link_source(rootfs, &rel, entry.link_name()?.as_deref())?;
+            std::fs::hard_link(&source, &target).with_context(|| {
+                format!(
+                    "hard link {} to {}",
+                    rel.display(),
+                    source.strip_prefix(rootfs).unwrap_or(&source).display()
+                )
+            })?;
+        } else {
+            // The parent is resolved and inside the rootfs, so the plain
+            // `unpack` is safe here. It applies the mode.
+            entry
+                .unpack(&target)
+                .with_context(|| format!("unpack {}", rel.display()))?;
+        }
         match (owner, shift) {
             (Some(owner), Some(range)) => {
                 let (Some(uid), Some(gid)) = (
@@ -1059,6 +1086,112 @@ fn apply_xattrs(path: &Path, xattrs: &[(String, Vec<u8>)]) {
     }
 }
 
+/// Resolves `rel` inside `rootfs` the way the container will see it, with
+/// `rootfs` as `/`: each symlink along the way is followed, an absolute
+/// target restarts from the rootfs, and `..` stops at it. Components that do
+/// not exist yet are kept as named, for the caller to create.
+///
+/// This is what lets a layer write through an image's own absolute symlinks
+/// (`lib -> /usr/lib`), and what keeps a whiteout or an entry under such a
+/// link from reaching the host's file of the same name.
+fn resolve_in_rootfs(rootfs: &Path, rel: &Path) -> R<PathBuf> {
+    // The same bound Linux puts on symlinks followed in one lookup.
+    const MAX_LINKS: usize = 40;
+    let mut resolved: Vec<std::ffi::OsString> = Vec::new();
+    let mut pending: std::collections::VecDeque<std::ffi::OsString> = rel
+        .components()
+        .filter_map(|c| match c {
+            Component::Normal(part) => Some(part.to_os_string()),
+            Component::ParentDir => Some("..".into()),
+            _ => None,
+        })
+        .collect();
+    let mut links = 0;
+    while let Some(part) = pending.pop_front() {
+        if part == ".." {
+            resolved.pop();
+            continue;
+        }
+        let mut candidate = rootfs.to_path_buf();
+        candidate.extend(&resolved);
+        candidate.push(&part);
+        let is_link =
+            std::fs::symlink_metadata(&candidate).is_ok_and(|meta| meta.file_type().is_symlink());
+        if !is_link {
+            resolved.push(part);
+            continue;
+        }
+        links += 1;
+        if links > MAX_LINKS {
+            bail!(
+                "too many levels of symbolic links resolving {} in the image",
+                rel.display()
+            );
+        }
+        let link = std::fs::read_link(&candidate)
+            .with_context(|| format!("read link {}", candidate.display()))?;
+        if link.is_absolute() {
+            resolved.clear();
+        }
+        for (index, component) in link
+            .components()
+            .filter_map(|c| match c {
+                Component::Normal(part) => Some(part.to_os_string()),
+                Component::ParentDir => Some("..".into()),
+                _ => None,
+            })
+            .enumerate()
+        {
+            pending.insert(index, component);
+        }
+    }
+    let mut out = rootfs.to_path_buf();
+    out.extend(resolved);
+    Ok(out)
+}
+
+/// Where a hard link entry's target lives: the link name is a path from the
+/// layer's root (as `tar` writes it), resolved inside the rootfs like any
+/// other entry, without following the target itself (a hard link to a
+/// symlink links the symlink). It must already exist, written by this layer
+/// or a lower one.
+fn hard_link_source(rootfs: &Path, rel: &Path, link_name: Option<&Path>) -> R<PathBuf> {
+    let Some(link_rel) = link_name.and_then(safe_relative) else {
+        bail!("hard link {} has no usable target", rel.display());
+    };
+    let parent = resolve_in_rootfs(rootfs, link_rel.parent().unwrap_or(Path::new("")))?;
+    let source = parent.join(link_rel.file_name().unwrap_or_default());
+    match std::fs::symlink_metadata(&source) {
+        Ok(meta) if !meta.is_dir() => Ok(source),
+        Ok(_) => bail!(
+            "hard link {} targets the directory {}",
+            rel.display(),
+            link_rel.display()
+        ),
+        Err(err) => Err(anyhow!(err)).with_context(|| {
+            format!(
+                "hard link {} targets {}, which no earlier entry or layer created",
+                rel.display(),
+                link_rel.display()
+            )
+        }),
+    }
+}
+
+/// Removes whatever sits at `path` without following it: a directory tree,
+/// or a file or symlink. Missing is fine.
+fn remove_existing(path: &Path) {
+    match std::fs::symlink_metadata(path) {
+        Ok(meta) if meta.is_dir() => {
+            let _ = std::fs::remove_dir_all(path);
+        }
+        Ok(_) => {
+            let _ = std::fs::remove_file(path);
+        }
+        Err(_) => {}
+    }
+}
+
 /// Removes the contents of a directory (used for opaque whiteouts) without
 /// removing the directory itself.
 fn clear_dir(dir: &Path) -> R<()> {
@@ -1066,13 +1199,7 @@ fn clear_dir(dir: &Path) -> R<()> {
         return Ok(());
     }
     for entry in std::fs::read_dir(dir)? {
-        let entry = entry?;
-        let path = entry.path();
-        if path.is_dir() && !path.is_symlink() {
-            let _ = std::fs::remove_dir_all(&path);
-        } else {
-            let _ = std::fs::remove_file(&path);
-        }
+        remove_existing(&entry?.path());
     }
     Ok(())
 }
@@ -2642,6 +2769,297 @@ mod tests {
         let data = std::fs::metadata(rootfs.join("var/cache/nginx/data"))?;
         assert_eq!(data.uid(), me);
         assert_eq!(data.mode() & 0o777, 0o640);
+        Ok(())
+    }
+
+    /// One entry of a synthetic layer.
+    enum Item<'a> {
+        Dir(&'a str),
+        File(&'a str, &'a str),
+        Link(&'a str, &'a str),
+        Symlink(&'a str, &'a str),
+    }
+
+    /// Writes a layer tarball of `items`, in order, as `name`.
+    fn layer(dir: &Path, name: &str, items: &[Item<'_>]) -> R<PathBuf> {
+        let blob = dir.join(name);
+        let mut builder = tar::Builder::new(std::fs::File::create(&blob)?);
+        for item in items {
+            let mut header = tar::Header::new_gnu();
+            header.set_mode(0o644);
+            header.set_uid(0);
+            header.set_gid(0);
+            header.set_size(0);
+            match item {
+                Item::Dir(path) => {
+                    header.set_entry_type(tar::EntryType::Directory);
+                    header.set_mode(0o755);
+                    builder.append_data(&mut header, path, std::io::empty())?;
+                }
+                Item::File(path, data) => {
+                    header.set_size(data.len() as u64);
+                    builder.append_data(&mut header, path, data.as_bytes())?;
+                }
+                Item::Link(path, target) => {
+                    header.set_entry_type(tar::EntryType::Link);
+                    builder.append_link(&mut header, path, target)?;
+                }
+                Item::Symlink(path, target) => {
+                    header.set_entry_type(tar::EntryType::Symlink);
+                    builder.append_link(&mut header, path, target)?;
+                }
+            }
+        }
+        builder.finish()?;
+        Ok(blob)
+    }
+
+    /// Extracts `layers` in order into a fresh rootfs, as the worker's user.
+    fn extract_all(dir: &Path, layers: &[PathBuf]) -> R<PathBuf> {
+        let rootfs = dir.join("rootfs");
+        std::fs::create_dir_all(&rootfs)?;
+        for blob in layers {
+            extract_layer_as(blob, &rootfs, running_as_root(), None)?;
+        }
+        Ok(rootfs)
+    }
+
+    fn same_inode(a: &Path, b: &Path) -> R<bool> {
+        use std::os::unix::fs::MetadataExt;
+        Ok(std::fs::symlink_metadata(a)?.ino() == std::fs::symlink_metadata(b)?.ino())
+    }
+
+    /// The shape of tzdata in `python:3.12-alpine`: the zone file in a
+    /// subdirectory, and a top-level alias hard linked to it later in the
+    /// same layer (`Hongkong` -> `Asia/Hong_Kong`), plus a link to a file a
+    /// lower layer wrote.
+    #[test]
+    fn hard_links_resolve_within_the_layer_and_to_lower_layers() -> R<()> {
+        let dir = tempfile::tempdir()?;
+        let base = layer(
+            dir.path(),
+            "base.tar",
+            &[Item::Dir("etc/"), Item::File("etc/os-release", "alpine")],
+        )?;
+        let tz = layer(
+            dir.path(),
+            "tz.tar",
+            &[
+                Item::Dir("usr/share/zoneinfo/"),
+                Item::Dir("usr/share/zoneinfo/Asia/"),
+                Item::File("usr/share/zoneinfo/Asia/Hong_Kong", "HKT"),
+                Item::Link(
+                    "usr/share/zoneinfo/Hongkong",
+                    "usr/share/zoneinfo/Asia/Hong_Kong",
+                ),
+                // Parent directory never named by its own entry.
+                Item::Link("usr/lib/os-release", "etc/os-release"),
+            ],
+        )?;
+        let rootfs = extract_all(dir.path(), &[base, tz])?;
+        let zoneinfo = rootfs.join("usr/share/zoneinfo");
+        assert_eq!(std::fs::read_to_string(zoneinfo.join("Hongkong"))?, "HKT");
+        assert!(same_inode(
+            &zoneinfo.join("Hongkong"),
+            &zoneinfo.join("Asia/Hong_Kong")
+        )?);
+        assert!(same_inode(
+            &rootfs.join("usr/lib/os-release"),
+            &rootfs.join("etc/os-release")
+        )?);
+        Ok(())
+    }
+
+    /// A layer that replaces a lower layer's file with a hard link: the tar
+    /// crate's `hard_link` refuses an existing destination.
+    #[test]
+    fn a_hard_link_replaces_a_lower_layers_file() -> R<()> {
+        let dir = tempfile::tempdir()?;
+        let base = layer(
+            dir.path(),
+            "base.tar",
+            &[
+                Item::File("bin/busybox", "bb"),
+                Item::File("bin/sh", "old shell"),
+            ],
+        )?;
+        let upper = layer(
+            dir.path(),
+            "upper.tar",
+            &[Item::Link("bin/sh", "bin/busybox")],
+        )?;
+        let rootfs = extract_all(dir.path(), &[base, upper])?;
+        assert_eq!(std::fs::read_to_string(rootfs.join("bin/sh"))?, "bb");
+        assert!(same_inode(
+            &rootfs.join("bin/sh"),
+            &rootfs.join("bin/busybox")
+        )?);
+        Ok(())
+    }
+
+    /// A hard link cannot reach forward: its target must already exist, and
+    /// the error says which link and which target instead of a bare
+    /// "No such file or directory while canonicalizing".
+    #[test]
+    fn a_hard_link_to_a_missing_target_names_both_paths() -> R<()> {
+        let dir = tempfile::tempdir()?;
+        let first = layer(
+            dir.path(),
+            "first.tar",
+            &[Item::Link(
+                "usr/share/zoneinfo/Hongkong",
+                "usr/share/zoneinfo/Asia/Hong_Kong",
+            )],
+        )?;
+        let rootfs = dir.path().join("rootfs");
+        std::fs::create_dir_all(&rootfs)?;
+        let err = extract_layer_as(&first, &rootfs, false, None).unwrap_err();
+        let message = format!("{err:#}");
+        assert!(
+            message.contains(
+                "hard link usr/share/zoneinfo/Hongkong targets usr/share/zoneinfo/Asia/Hong_Kong"
+            ),
+            "{message}"
+        );
+        Ok(())
+    }
+
+    /// An image's absolute symlinks mean the container's paths. Entries,
+    /// hard links, and whiteouts under one land inside the rootfs, and none
+    /// of them touches the host path of the same name.
+    #[test]
+    fn absolute_symlinks_resolve_inside_the_rootfs() -> R<()> {
+        let dir = tempfile::tempdir()?;
+        // A host directory the image's absolute symlink names verbatim.
+        let host = dir.path().join("host");
+        std::fs::create_dir_all(&host)?;
+        std::fs::write(host.join("victim"), "host data")?;
+        let host_abs = host.display().to_string();
+
+        let base = layer(
+            dir.path(),
+            "base.tar",
+            &[
+                Item::Dir("usr/lib/"),
+                Item::File("usr/lib/libc.so", "libc"),
+                // merged-usr, the absolute way.
+                Item::Symlink("lib", "/usr/lib"),
+                // A link whose target exists on the host, not in the image.
+                Item::Symlink("etc", &host_abs),
+                // A relative link that climbs past the root.
+                Item::Symlink("usr/up", "../../../../usr/lib"),
+            ],
+        )?;
+        let upper = layer(
+            dir.path(),
+            "upper.tar",
+            &[
+                Item::File("lib/libextra.so", "extra"),
+                Item::Link("lib/libc.so.6", "lib/libc.so"),
+                Item::File("usr/up/via-dotdot", "up"),
+                Item::File("etc/.wh.victim", ""),
+                Item::File("etc/.wh..wh..opq", ""),
+                Item::File("etc/new", "inside"),
+            ],
+        )?;
+        let rootfs = extract_all(dir.path(), &[base, upper])?;
+        assert_eq!(
+            std::fs::read_to_string(rootfs.join("usr/lib/libextra.so"))?,
+            "extra"
+        );
+        assert!(same_inode(
+            &rootfs.join("usr/lib/libc.so.6"),
+            &rootfs.join("usr/lib/libc.so")
+        )?);
+        assert_eq!(
+            std::fs::read_to_string(rootfs.join("usr/lib/via-dotdot"))?,
+            "up"
+        );
+        // The host file survived both whiteouts, and the new file went to
+        // the container's view of that path.
+        assert_eq!(std::fs::read_to_string(host.join("victim"))?, "host data");
+        assert!(!host.join("new").exists());
+        let inside = rootfs.join(host_abs.trim_start_matches('/')).join("new");
+        assert_eq!(std::fs::read_to_string(inside)?, "inside");
+        Ok(())
+    }
+
+    /// Whiteouts and kind changes across layers: a deleted file, an opaque
+    /// directory, a file replacing a directory, and a directory replacing a
+    /// symlink.
+    #[test]
+    fn upper_layers_replace_what_lower_layers_left() -> R<()> {
+        let dir = tempfile::tempdir()?;
+        let base = layer(
+            dir.path(),
+            "base.tar",
+            &[
+                Item::File("etc/gone", "x"),
+                Item::File("etc/kept", "x"),
+                Item::File("opaque/old", "x"),
+                Item::File("was-dir/child", "x"),
+                Item::Symlink("was-link", "etc"),
+            ],
+        )?;
+        let upper = layer(
+            dir.path(),
+            "upper.tar",
+            &[
+                Item::File("etc/.wh.gone", ""),
+                Item::File("opaque/.wh..wh..opq", ""),
+                Item::File("opaque/new", "y"),
+                Item::File("was-dir", "now a file"),
+                Item::Dir("was-link/"),
+                Item::File("was-link/inner", "z"),
+            ],
+        )?;
+        let rootfs = extract_all(dir.path(), &[base, upper])?;
+        assert!(!rootfs.join("etc/gone").exists());
+        assert!(rootfs.join("etc/kept").exists());
+        assert!(!rootfs.join("opaque/old").exists());
+        assert!(rootfs.join("opaque/new").exists());
+        assert_eq!(
+            std::fs::read_to_string(rootfs.join("was-dir"))?,
+            "now a file"
+        );
+        let was_link = std::fs::symlink_metadata(rootfs.join("was-link"))?;
+        assert!(was_link.is_dir(), "the directory replaced the symlink");
+        assert!(!rootfs.join("etc/inner").exists());
+        Ok(())
+    }
+
+    /// The same layers with owners shifted into a user namespace's range
+    /// (root only: shifting chowns). Hard links share the shifted inode.
+    #[test]
+    fn hard_links_extract_with_shifted_owners() -> R<()> {
+        use std::os::unix::fs::MetadataExt;
+        if !running_as_root() {
+            return Ok(());
+        }
+        let dir = tempfile::tempdir()?;
+        let tz = layer(
+            dir.path(),
+            "tz.tar",
+            &[
+                Item::Dir("usr/share/zoneinfo/Asia/"),
+                Item::File("usr/share/zoneinfo/Asia/Hong_Kong", "HKT"),
+                Item::Link(
+                    "usr/share/zoneinfo/Hongkong",
+                    "usr/share/zoneinfo/Asia/Hong_Kong",
+                ),
+            ],
+        )?;
+        let range = crate::task_plugins::userns::IdRange {
+            host_base: 200_000,
+            size: 65_536,
+        };
+        let rootfs = dir.path().join("rootfs");
+        std::fs::create_dir_all(&rootfs)?;
+        extract_layer_as(&tz, &rootfs, true, Some(range))?;
+        let link = std::fs::metadata(rootfs.join("usr/share/zoneinfo/Hongkong"))?;
+        assert_eq!((link.uid(), link.gid()), (200_000, 200_000));
+        let asia = std::fs::metadata(rootfs.join("usr/share/zoneinfo/Asia"))?;
+        assert_eq!(asia.uid(), 200_000);
         Ok(())
     }
 

@@ -1269,7 +1269,7 @@ manager certificates and the one client factory, CSR issuance, and protocol
 reachability probe deferred. This plan's own implementation (PR
 [#32](https://github.com/mikenomitch/legion/pull/32)) was built in parallel
 from the same design, ships all of Phase 1 and Phases 0 and 2 to 8, and
-replaced the first cut when the branches merged (calls entry 45 says which
+replaced the first cut when the branches merged (calls entry 47 says which
 pieces of #17 survived). As merged:
 
 - [x] Bind and advertise (§6.6): `0.0.0.0:4848` by default,
@@ -1505,8 +1505,7 @@ installed, or in the Linux worker container from
 # the datapath guard against real namespaces
 sudo -E cargo test --lib netd -- --ignored --nocapture
 
-# the spot check, once per OCI runtime
-sudo -E LEGION_OCI_RUNTIME=youki cargo test --test host_guard_spot_check -- --ignored --nocapture
+# the spot check, once per OCI runtime (runc and crun; youki was dropped, calls 40)
 sudo -E LEGION_OCI_RUNTIME=runc  cargo test --test host_guard_spot_check -- --ignored --nocapture
 sudo -E LEGION_OCI_RUNTIME=crun  cargo test --test host_guard_spot_check -- --ignored --nocapture
 
@@ -1716,7 +1715,8 @@ decision and not a surprise:
 - In a default Linux container, `id -u` is `0` and the process's host uid is
   inside the allocation's range. `unshare -U` fails under seccomp. A volume
   survives a reschedule to a new range.
-- The spot check passes on youki, runc, and crun.
+- The spot check passes on runc and crun. (youki was dropped after the AWS
+  spot check: it cannot do idmapped mounts. See calls entry 40.)
 
 **Phase 7**
 - A gated `exec` task without a non-root `user` is refused at submit with the

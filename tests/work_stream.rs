@@ -19,7 +19,9 @@
 //!   worker that does not stream keeps the full desired set;
 //! - a leader kill: streams attached to a surviving manager carry on
 //!   without a resync, a worker whose manager died resyncs once on another,
-//!   and no allocation is lost or duplicated.
+//!   and no allocation is lost or duplicated;
+//! - creating or mounting a job-level volume claim re-sends the job's
+//!   allocations, inside a raft apply, without failing it.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::net::SocketAddr;
@@ -28,9 +30,10 @@ use std::time::{Duration, Instant};
 use legion::manager::daemon::resolve_claimed_eval;
 use legion::manager::server::ManagerDaemonService;
 use legion::prelude::{json, Context, R};
-use legion::storage::store::{ClaimScope, EvalBatchLimits, Store};
+use legion::storage::store::{ClaimScope, EvalBatchLimits, Store, VolumeFilter};
+use legion::storage::work_log::{PendingWork, WorkLog};
 use legion::structs::config::{ManagerConfigFull, PersistenceType};
-use legion::structs::job::{JobConfig, StatefulConfig, TaskConfig};
+use legion::structs::job::{JobConfig, StatefulConfig, TaskConfig, VolumeSpec};
 use legion::structs::manager_client::ManagerClient;
 use legion::structs::manager_server::{Manager, ManagerServer};
 use legion::structs::{
@@ -859,6 +862,114 @@ fn a_leader_kill_resyncs_only_the_workers_that_lost_their_manager() -> R<()> {
     }
     for manager in &mut managers {
         manager.kill();
+    }
+    Ok(())
+}
+
+/// A job-level volume claim rides its job's allocation payloads, so creating
+/// or changing one re-sends those allocations to a streaming worker. On a
+/// raft manager that lookup runs inside the state machine's apply, where an
+/// error stops the raft group. The spot-check regression was a lookup by a
+/// column `allocation` does not have, which failed every job submit with a
+/// claim (`no such column: job_id`) once any worker streamed.
+#[test]
+fn a_job_volume_change_reaches_a_streaming_worker_under_raft() -> R<()> {
+    const NODE: &str = "vol-node";
+    const VOLUME_JOB: &str = "web";
+    let dir = tempfile::tempdir()?;
+    let mut config = ManagerConfigFull {
+        store_path: dir
+            .path()
+            .join("store")
+            .to_str()
+            .context("utf-8")?
+            .to_string(),
+        scheduling_policy: "bin_pack".to_string(),
+        scheduler_settings: Some(json!({ "nodes_considered": "100%" })),
+        ..Default::default()
+    };
+    config.persistence.r#type = PersistenceType::Raft;
+    config.persistence.raft.bootstrap = true;
+    config.persistence.raft.node_id = "mgr-volume".to_string();
+    config.persistence.raft.data_dir = dir
+        .path()
+        .join("raft")
+        .to_str()
+        .context("utf-8")?
+        .to_string();
+    let store = Store::start_storage(&config)?;
+    store.insert_node(NodeMsg::from(node(NODE, 4)))?;
+
+    let job = |volumes: Vec<VolumeSpec>| JobConfig {
+        priority: Default::default(),
+        name: VOLUME_JOB.to_string(),
+        tasks: vec![TaskConfig {
+            count: legion::structs::job::TaskCount::new(1),
+            resources: json!({ "memory": 64, "cpu": 10 }),
+            volumes,
+            ..TaskConfig::new("svc", "noop")
+        }],
+        rollout: None,
+        rollout_by_group: Default::default(),
+        version: None,
+    };
+    let submission = [Submission {
+        path: format!("{VOLUME_JOB}.json"),
+        content: "{}".to_string(),
+        is_primary: true,
+    }];
+    let outcome = store.handle_job_submit(&job(Vec::new()), &submission)?;
+    let tasks = store.get_task_configs_for_job_config(outcome.job_config_id())?;
+    let (task_id, _) = *tasks.first().context("the job's task config")?;
+    store.place_alloc(NODE, task_id)?;
+    let placed = allocation_ids(&store, NODE)?;
+    assert_eq!(placed.len(), 1, "the job placed on the node");
+
+    // A worker streams from this manager, so the projection feeds its log.
+    let attached = store.work_log().attach(NODE, 0, 0);
+    assert!(matches!(
+        WorkLog::take_pending(&attached.log),
+        PendingWork::Resync
+    ));
+
+    // Creating the claim: a volume INSERT that names the job.
+    store.handle_job_submit(
+        &job(vec![VolumeSpec {
+            name: "data".into(),
+            driver: Some("local-dir".into()),
+            mode: None,
+            params: None,
+            path: Some("/mnt/data".into()),
+            read_only: None,
+        }]),
+        &submission,
+    )?;
+    match WorkLog::take_pending(&attached.log) {
+        PendingWork::Changed(ids) => assert!(
+            placed.is_subset(&ids),
+            "the job's allocations are re-sent: {ids:?} lacks {placed:?}"
+        ),
+        other => panic!("expected the job's allocations marked changed, got {other:?}"),
+    }
+
+    // A mount report is a volume UPDATE whose record omits the unchanged
+    // `job_id`. It reaches the same allocations through a re-read of the row.
+    let volume_id = store
+        .list_volumes(&VolumeFilter {
+            job_id: Some(VOLUME_JOB.to_string()),
+            ..Default::default()
+        })?
+        .first()
+        .context("the claim row")?
+        .volume_id
+        .clone();
+    store.record_volume_mounted(&volume_id, NODE, "/mnt/data", true, None, &BTreeMap::new())?;
+    match WorkLog::take_pending(&attached.log) {
+        PendingWork::Changed(ids) => assert!(
+            placed.is_subset(&ids),
+            "the mount report re-sends the job's allocations: {ids:?} lacks {placed:?}"
+        ),
+        other => panic!("expected the job's allocations marked changed, got {other:?}"),
     }
     Ok(())
 }

@@ -162,7 +162,15 @@ This sits next to the worker's `worker_state.json`, for example
   can reach this allocation's staged artifacts, injected secrets, or files.
   When an `exec` task sets `user`, the allocation tree is chowned to that
   user at start (symlinks are not followed). The process keeps access to its
-  own directory after dropping privileges, and to no one else's.
+  own directory after dropping privileges, and to no one else's. A Linux
+  container with a user namespace gets traversal of its allocation directory
+  only (`0710`, group = its own id range; see
+  [container security](task-runtime-container.md#security)).
+- The directories above it, the worker state dir and `allocs/`, are
+  traverse-only (`0711`). A task's own user can reach its allocation
+  directory by path, but nothing can list a node's allocations. Every other
+  entry in the state dir guards itself: the state files are `0600`, and
+  `logs/`, `content/`, `volumes/`, and `identity/` are owner-only.
 - It is exposed to the task as the `LEGION_ALLOC_DIR` and `LEGION_TASK_DIR`
   env vars, for runtimes that apply worker-injected env (see the
   [capability matrix](#task-runtime-support)).
@@ -705,6 +713,35 @@ digest before it lands in that worker's own store. Pointing each region's
 workers at their own bucket is how region locality works: Legion does not
 replicate between buckets.
 
+**Which credential a reading node uses.** A published part is read with the
+*reading* node's own `contentStore` credential, never the publisher's, and
+never a cluster `artifacts.auth` matcher (those apply to jobspec artifacts
+when the job is submitted, and published part URLs never pass through
+submission):
+
+- A part URL under the reading node's `contentStore.url` (same bucket, same
+  `endpoint`, under its prefix) is fetched with that node's `contentStore.auth`:
+  the KV credential is read at fetch time, so a rotated credential is picked up
+  on the next fetch, and with no `auth` the node's ambient AWS credentials sign
+  the request. A `file://` store needs no credential.
+- Any other part URL is fetched anonymously, which a private bucket refuses.
+  The error names the store and says the node has no credential for it:
+
+  ```text
+  this node has no credential for content store s3://legion-content-use1/:
+  a restoring node signs part fetches only for URLs under its own
+  contentStore.url (here: s3://legion-content-usw2/), so this fetch was
+  anonymous. Give this node the same contentStore url and auth as the node
+  that published the snapshot: fetching s3://legion-content-use1/sealed/…
+  after 3 attempt(s): … 403 Forbidden
+  ```
+
+So every node that may restore a snapshot needs the same `contentStore` (url
+and auth) as the node that published it. A node reads only its own store, so
+a snapshot published to one region's bucket cannot be restored on a node
+configured for another region's bucket. Constrain the resume to the
+publishing region instead.
+
 A malformed `contentStore` (an unsupported scheme, a bucket-less URL, `auth`
 on a `file://` store) fails manager startup. A worker whose content store is
 disabled logs that it cannot publish and carries on.
@@ -809,7 +846,7 @@ staged OCI layout into the local runtime:
 
 - **macOS (Apple `container`):** the layout is tarred and imported with
   `container image load`, so the subsequent run needs no registry pull.
-- **Linux (youki / any OCI runtime):** the layout is converted to an OCI
+- **Linux (runc or crun):** the layout is converted to an OCI
   runtime bundle (rootfs extraction plus a generated `config.json`) and run
   with `<runtime> run --bundle`. See
   [task-runtime-container.md](task-runtime-container.md#linux-image--bundle).

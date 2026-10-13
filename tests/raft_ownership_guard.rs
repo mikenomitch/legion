@@ -312,6 +312,93 @@ fn job_scheduler_and_status_ops_pass_the_ownership_guard() -> R<()> {
     Ok(())
 }
 
+/// Worker exit reports: a batch task's completion and a task failed for
+/// good. Regression (AWS spot check, DAG stuck after its first step):
+/// `complete_allocation` wrote `task_status` (status lane) from its
+/// scheduler-lane op, the guard refused it, and on a raft cluster no batch
+/// allocation ever left `placed`, so every `success` dependent waited
+/// forever. Drives the whole DAG step: place `fetch`, report its exit,
+/// and plan again, which must release `validate`.
+#[test]
+fn worker_exit_report_ops_pass_the_ownership_guard() -> R<()> {
+    use legion::manager::scheduler::{PlanMode, Scheduler};
+    use legion::structs::job::{TaskDependency, TaskDependencyCondition, TaskLifecycle};
+
+    let dir = tempfile::tempdir()?;
+    let store = raft_store(&dir)?;
+    store.insert_node(NodeMsg::from(test_node("node-a")))?;
+
+    let step = |name: &str| {
+        let mut task = TaskConfig::new(name, "noop");
+        task.lifecycle = TaskLifecycle::Batch;
+        task.group = "pipeline".into();
+        task
+    };
+    let mut validate = step("validate");
+    validate.depends_on = vec![TaskDependency {
+        task: "fetch".into(),
+        condition: TaskDependencyCondition::Success,
+    }];
+    let job = JobConfig {
+        priority: Default::default(),
+        rollout: None,
+        rollout_by_group: Default::default(),
+        name: "guard-dag".into(),
+        tasks: vec![step("fetch"), validate],
+        version: None,
+    };
+    let outcome = store.handle_job_submit(&job, &[submission("guard-dag")])?;
+    let job_config_id = outcome.job_config_id().to_string();
+    let placed = Scheduler::new(&store)?.plan_and_apply(&job_config_id, PlanMode::Fresh)?;
+    assert_eq!(placed.held_tasks, vec!["validate".to_string()]);
+    let fetch = placed
+        .allocations
+        .first()
+        .context("fetch must be placed")?
+        .clone();
+
+    // The batch exit: scheduler-lane row update, status-lane task status,
+    // scheduler-lane dependency eval.
+    let completed = store
+        .complete_allocation(fetch.id, true)?
+        .context("fetch allocation exists")?;
+    assert_eq!(completed.status, "complete");
+    assert_eq!(
+        store
+            .get_allocation_by_id(fetch.id)?
+            .context("completed row is kept")?
+            .status,
+        "complete"
+    );
+    assert_eq!(
+        store
+            .task_statuses_for_job_config(&job_config_id)?
+            .get(&fetch.task_config_id),
+        Some(&TaskStatusState::Success)
+    );
+    // A repeated report (the heartbeat retry) converges.
+    store.complete_allocation(fetch.id, true)?;
+    assert!(store.queue_dependency_progress(&completed)?);
+    let released = Scheduler::new(&store)?.plan_and_apply(&job_config_id, PlanMode::Reschedule)?;
+    assert!(released.held_tasks.is_empty(), "{:?}", released.held_tasks);
+    assert_eq!(released.allocations.len(), 1, "validate is placed");
+
+    // A failing exit, and the failure path's writes: the row removal
+    // (scheduler), the job flip (control), the task status (status).
+    let validate_alloc = released.allocations[0].clone();
+    store.complete_allocation(validate_alloc.id, false)?;
+    assert_eq!(
+        store
+            .task_statuses_for_job_config(&job_config_id)?
+            .get(&validate_alloc.task_config_id),
+        Some(&TaskStatusState::Failed)
+    );
+    store.remove_allocation_by_id(validate_alloc.id)?;
+    store.mark_job_failed("guard-dag")?;
+    store.set_task_status(validate_alloc.task_config_id, TaskStatusState::Failed)?;
+    Ok(())
+}
+
 /// Node lifecycle: ready/lost marks (status + control composites), the
 /// eval-mediated lost-node reschedule tail, drain eviction, new-node
 /// reconcile, removal + orphan sweeps.

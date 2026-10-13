@@ -8,9 +8,13 @@
 //! and writes the secret to two root-only files:
 //!
 //! - `<dataDir>/bootstrap-token`, always;
-//! - the CLI token file (`~/.legion/token`, or `$LEGION_TOKEN_FILE`), only
-//!   when that file does not exist, so the CLI on the same machine works with
-//!   nothing to set up and an operator's existing login is never clobbered.
+//! - the CLI token file for the manager's local address
+//!   (`~/.legion/tokens/<host>_<port>`, or `$LEGION_TOKEN_FILE`), so the CLI
+//!   on the same machine works with nothing to set up. Tokens are keyed by
+//!   address, so a second cluster on another port never shadows this one.
+//!   A file already there is replaced: the mint only happens on a cluster
+//!   with no management token, so whatever it held is from an earlier
+//!   cluster at this address, or a lesser login to this one.
 //!
 //! The secret is never logged; the startup line names the accessor and the
 //! files. See docs/auth-and-acls.md ("Quick start", "Recovery") and
@@ -29,17 +33,20 @@ pub const BOOTSTRAP_TOKEN_FILE: &str = "bootstrap-token";
 pub struct BootstrapTokenPaths {
     /// `<dataDir>/bootstrap-token`, written on every mint.
     pub data_dir_file: PathBuf,
-    /// The CLI token file, written only when it does not exist yet.
+    /// The CLI token file for the manager's local address, written on
+    /// every mint.
     pub cli_file: PathBuf,
 }
 
 impl BootstrapTokenPaths {
     /// The paths for this process: `$LEGION_DATA_DIR/bootstrap-token` (else
-    /// `./.legion/bootstrap-token`) and the CLI token path.
-    pub fn for_this_process() -> Self {
+    /// `./.legion/bootstrap-token`) and the CLI token path for
+    /// `local_address`, the address a CLI on this machine dials
+    /// ([`crate::structs::ServerConfigFull::local_address`]).
+    pub fn for_this_process(local_address: &str) -> Self {
         BootstrapTokenPaths {
             data_dir_file: crate::constants::data_dir().join(BOOTSTRAP_TOKEN_FILE),
-            cli_file: crate::cmd::helpers::cli_token_path(),
+            cli_file: crate::cmd::helpers::cli_token_path(local_address),
         }
     }
 }
@@ -54,8 +61,9 @@ pub enum BootstrapOutcome {
         accessor_id: String,
         /// Files the secret was written to, in order.
         written: Vec<PathBuf>,
-        /// The CLI token file, when it already existed and was left alone.
-        cli_file_kept: Option<PathBuf>,
+        /// The CLI token file, when it already held a token that this mint
+        /// replaced.
+        cli_file_replaced: Option<PathBuf>,
     },
 }
 
@@ -123,24 +131,18 @@ pub fn ensure_initial_management_token(
             paths.data_dir_file.display()
         )
     })?;
-    let mut written = vec![paths.data_dir_file.clone()];
-    let cli_file_kept = if paths.cli_file.exists() {
-        Some(paths.cli_file.clone())
-    } else {
-        if let Some(parent) = paths.cli_file.parent() {
-            if !parent.as_os_str().is_empty() {
-                std::fs::create_dir_all(parent)
-                    .with_context(|| format!("failed to create {}", parent.display()))?;
-            }
+    let cli_file_replaced = paths.cli_file.exists().then(|| paths.cli_file.clone());
+    if let Some(parent) = paths.cli_file.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("failed to create {}", parent.display()))?;
         }
-        write_secret_file(&paths.cli_file, &secret)?;
-        written.push(paths.cli_file.clone());
-        None
-    };
+    }
+    write_secret_file(&paths.cli_file, &secret)?;
     Ok(BootstrapOutcome::Minted {
         accessor_id: info.accessor_id,
-        written,
-        cli_file_kept,
+        written: vec![paths.data_dir_file.clone(), paths.cli_file.clone()],
+        cli_file_replaced,
     })
 }
 
@@ -176,7 +178,7 @@ pub fn log_outcome(outcome: &BootstrapOutcome) {
         BootstrapOutcome::Minted {
             accessor_id,
             written,
-            cli_file_kept,
+            cli_file_replaced,
         } => {
             let files = written
                 .iter()
@@ -189,13 +191,12 @@ pub fn log_outcome(outcome: &BootstrapOutcome) {
                  Secret written to {files} (mode 0600). The CLI on this machine uses it \
                  automatically. Treat it like a root password."
             );
-            if let Some(kept) = cli_file_kept {
-                warn!(
-                    "{} already exists and was left alone, so the CLI on this machine keeps \
-                     using the token in it. To use the new management token: \
-                     export LEGION_TOKEN=\"$(cat {})\"",
-                    kept.display(),
-                    written[0].display()
+            if let Some(replaced) = cli_file_replaced {
+                info!(
+                    "Replaced the token previously stored in {}: this cluster had no \
+                     management token, so it came from an earlier cluster at this address \
+                     or was a lesser login",
+                    replaced.display()
                 );
             }
         }
@@ -259,7 +260,11 @@ mod bootstrap_token_test {
     fn paths(dir: &Path) -> BootstrapTokenPaths {
         BootstrapTokenPaths {
             data_dir_file: dir.join("data").join(BOOTSTRAP_TOKEN_FILE),
-            cli_file: dir.join("home").join(".legion").join("token"),
+            cli_file: dir
+                .join("home")
+                .join(".legion")
+                .join("tokens")
+                .join("127.0.0.1_4747"),
         }
     }
 
@@ -279,7 +284,7 @@ mod bootstrap_token_test {
         let outcome = ensure_initial_management_token(&auth, &store, None, &paths)?;
         let BootstrapOutcome::Minted {
             written,
-            cli_file_kept,
+            cli_file_replaced,
             ..
         } = outcome
         else {
@@ -289,7 +294,7 @@ mod bootstrap_token_test {
             written,
             vec![paths.data_dir_file.clone(), paths.cli_file.clone()]
         );
-        assert_eq!(cli_file_kept, None);
+        assert_eq!(cli_file_replaced, None);
         let secret = std::fs::read_to_string(&paths.data_dir_file)?;
         assert_eq!(secret, std::fs::read_to_string(&paths.cli_file)?);
         assert!(!paths.data_dir_file.with_extension("pending").exists());
@@ -315,28 +320,40 @@ mod bootstrap_token_test {
     }
 
     #[test]
-    fn an_existing_cli_token_file_is_left_alone_test() -> R<()> {
+    fn a_stale_cli_token_for_the_same_address_is_replaced_test() -> R<()> {
+        // The spot-check failure: a token left by an earlier cluster at this
+        // address made the CLI present a secret the new cluster never issued.
         let store = test_store()?;
         let auth = enabled_authenticator();
         let dir = tempfile::tempdir()?;
         let paths = paths(dir.path());
         std::fs::create_dir_all(paths.cli_file.parent().expect("parent"))?;
-        std::fs::write(&paths.cli_file, "someone-elses-token\n")?;
+        std::fs::write(&paths.cli_file, "earlier-clusters-token\n")?;
+        let other_cluster = paths.cli_file.with_file_name("127.0.0.1_4757");
+        std::fs::write(&other_cluster, "other-clusters-token\n")?;
 
         let outcome = ensure_initial_management_token(&auth, &store, None, &paths)?;
         let BootstrapOutcome::Minted {
             written,
-            cli_file_kept,
+            cli_file_replaced,
             ..
         } = outcome
         else {
             panic!("first start should mint");
         };
-        assert_eq!(written, vec![paths.data_dir_file.clone()]);
-        assert_eq!(cli_file_kept, Some(paths.cli_file.clone()));
+        assert_eq!(
+            written,
+            vec![paths.data_dir_file.clone(), paths.cli_file.clone()]
+        );
+        assert_eq!(cli_file_replaced, Some(paths.cli_file.clone()));
         assert_eq!(
             std::fs::read_to_string(&paths.cli_file)?,
-            "someone-elses-token\n"
+            std::fs::read_to_string(&paths.data_dir_file)?
+        );
+        // Another address's token is never touched.
+        assert_eq!(
+            std::fs::read_to_string(&other_cluster)?,
+            "other-clusters-token\n"
         );
         Ok(())
     }

@@ -19,9 +19,8 @@ You need the `legion-bench` AWS profile, OrbStack (or Docker Desktop), Rust,
 and Apple `container` (`brew install container`).
 
 **If the rig is down,** bring it up. The Linux build takes about an hour under
-Rosetta, and the README has the command. Apply `shims.patch` before that build
-while the fixes it stands in for are missing, and build the macOS CLI from the
-same tree for section 10.
+Rosetta, or about four minutes on the EC2 build box (`infra/build-box.sh`);
+the README has both. Build the macOS CLI from the same tree for section 10.
 
 ```fish
 tests/spot-check/infra/up.sh
@@ -140,8 +139,9 @@ legion job scale fullstack --task api --count 4
 
 **Known:** the stock nginx and Postgres images do not run in Legion's Linux
 containers, so this uses rebuilt ones (P0-7). If nothing answers after a
-couple of minutes, check `legion service doctor api`. "health checks
-starting" forever means the P0-3 shim is missing from the binary.
+couple of minutes, check `legion service doctor api`. The test API does
+not reconnect to Postgres, so after a worker restart (which severs mesh
+connections) reschedule it: `legion job run tests/spot-check/jobs/06-fullstack.ncl --force-reschedule`.
 
 ## 6. Sandboxed agents, with the launcher
 
@@ -250,6 +250,18 @@ tests/spot-check/mac/build-local.sh                 # spot-check-web:dev and spo
 env LEGION_DATA_DIR=/tmp/legion-sc legion start manager --run-worker -c tests/spot-check/mac/manager.ncl
 ```
 
+ACLs are on, as on any cluster. At first start the manager writes the
+initial management token to `/tmp/legion-sc/bootstrap-token` and to
+`~/.legion/tokens/127.0.0.1_4747`, the file the CLI reads for this address,
+replacing a token an earlier cluster on 4747 left there. If the CLI still
+says `Unauthenticated` (for example because `LEGION_TOKEN` is already set for
+another cluster), its hint names the token it sent. Point it at this
+cluster's token explicitly:
+
+```fish
+set -x LEGION_TOKEN (cat /tmp/legion-sc/bootstrap-token)
+```
+
 In another tab (with `LEGION_ADDR=http://127.0.0.1:4747`, which mise sets):
 
 ```fish
@@ -342,16 +354,16 @@ legion boot-ticket create sessions --task shell --pool default --scope session -
 ```
 
 **A content store (optional, for 12.6).** The workers have no instance
-profile, so give them a KV credential. Your SSO session credentials expire,
-so re-run the `kv put` when they do. Then uncomment the `contentStore` block
+profile, so give them a KV credential: a 36-hour STS session token, never the
+profile's long-term keys. Re-run the `kv put` when it expires. Then uncomment the `contentStore` block
 in `infra/configs/workers/default.ncl` with the rig's bucket name
 (`legion-spot-check-<account>`), push it as above, and restart the managers
 and workers.
 
 ```fish
-aws configure export-credentials --profile legion-bench --format process \
-  | jq -c '{type: "aws", accessKeyId: .AccessKeyId, secretAccessKey: .SecretAccessKey, sessionToken: .SessionToken, region: "us-east-1"}' \
-  | read -l cred; and legion kv put secrets/content-store $cred
+aws sts get-session-token --duration-seconds 129600 --profile legion-bench \
+  | jq -c '{type: "aws", accessKeyId: .Credentials.AccessKeyId, secretAccessKey: .Credentials.SecretAccessKey, sessionToken: .Credentials.SessionToken, region: "us-east-1"}' \
+  | read -l cred; and legion kv put secrets/content-store $cred -t json
 legion node info sc-wkr-1 | grep content-publish      # advertised once configured
 ```
 
@@ -391,7 +403,7 @@ legion exec --instance ws-1 -- curl -sI https://example.com/           # refused
 legion exec --instance ws-1 -- curl -sI http://example.com/            # 403, Legion-Denied-By: policy
 legion exec --instance ws-1 -- curl -sI http://169.254.169.254/latest/meta-data/   # 403, Legion-Denied-By: host-guard
 legion exec --instance ws-1 -- curl -sI http://<its node's private ip>:4848/       # 403, host-guard
-legion net policy test sandboxes --to https://example.com/             # deny, and which rule
+legion net policy test sandboxes --task ws --to https://example.com/             # deny, and which rule
 tests/spot-check/infra/ssh.sh <its node> "sudo find /var/lib/legion -name net-access.log -exec tail -3 {} +"   # verdicts and deciding rules
 ```
 
@@ -461,7 +473,7 @@ legion job run tests/spot-check/jobs/10-sandbox-store.ncl
 legion instance create sandbox-store --id sbs-1
 legion exec --instance sbs-1 -- sh -c 'echo moved > /tmp/marker'
 legion instance suspend sbs-1 --wait -j                         # durability store
-legion instance get sbs-1 -j | jq -r .data.instance.checkpoint_state   # local, then published
+legion instance get sbs-1 -j | jq -r .data.instance.checkpointState   # local, then published
 legion node cordon <its node>
 legion instance start sbs-1 --wait --timeout 300 -j            # node is the other worker
 legion exec --instance sbs-1 -- cat /tmp/marker                 # moved
@@ -507,8 +519,10 @@ legion instance start ws-1 --wait
 **Good:** the steps run in order: reclaim, then suspend for `ws-1` (it sets
 `suspend.onPressure`), then evict-bursting for the hog, which is far above its
 128 MiB reservation. Nothing inside its reservation is evicted.
-`legion_node_pressure_actions_total` counts each step on the leader's
-`:4749/metrics`. If `ws-1` is on the other node, only the hog's node acts.
+`legion_node_pressure_actions_total` counts each step on the `:4749/metrics`
+of the manager the worker heartbeats to (sum across managers). The hog's
+replacement waits its `on_unhealthy.move_delay` before it is placed again, so
+it is not re-evicted in a tight loop. If `ws-1` is on the other node, only the hog's node acts.
 
 Preemption (stop `sessions` and `mem-hog` first; their room matters):
 
@@ -607,10 +621,10 @@ stop answers `stopped: false`.
 
 ```fish
 for i in (seq 6); legion instance create sessions --task shell >/dev/null; end
-legion instance list sessions -j | jq -r '.data.instances[] | "\(.node_id) \(.instance_id)"' | sort
+legion instance list sessions -j | jq -r '.data.instances[] | "\(.nodeId) \(.instanceId)"' | sort
 tests/spot-check/infra/ssh.sh sc-wkr-1 "pgrep -x -f 'sleep 86399' | sort; sudo find /var/lib/legion -name sessions.db"
 tests/spot-check/infra/ssh.sh sc-wkr-1 sudo systemctl restart legion-worker
-legion instance list sessions -j | jq -r '.data.instances[] | "\(.node_id) \(.instance_id)"' | sort   # the same
+legion instance list sessions -j | jq -r '.data.instances[] | "\(.nodeId) \(.instanceId)"' | sort   # the same
 tests/spot-check/infra/ssh.sh sc-wkr-1 "pgrep -x -f 'sleep 86399' | sort"                           # the same pids
 ```
 
@@ -625,7 +639,7 @@ that node, not NotFound (`smoke.sh sessions-route`, not in the default run).
 
 ```fish
 legion instance destroy ws-1 ; legion instance destroy idle-1
-legion volume list --job sandboxes             # ws-1's volume is gone
+legion volume list --job sandboxes             # ws-1's volume is gone (--all shows it as destroyed)
 legion instance create sandboxes --task ws --id ws-1   # refused: ids are never reused
 legion job stop sandboxes ; legion job stop sessions
 ```

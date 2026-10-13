@@ -230,6 +230,9 @@
   # and serves the OIDC discovery document + JWKS over plain HTTP on the main
   # listener. `issuer` is the externally-published URL relying parties trust
   # (it must be reachable by AWS/GCP/Vault — typically via an HTTPS proxy).
+  # It is one value for the whole cluster: set the same `issuer` on every
+  # manager, or leave it unset for the shared default (docs/workload-identity.md,
+  # "The issuer").
   # `nodeIdentities` declares identities issued to worker nodes rather than
   # tasks — referenced by artifact `auth.nodeIdentity` and cluster
   # artifact-auth matchers.
@@ -358,7 +361,7 @@
   },
   # Auth & ACLs (on by default; see docs/auth-and-acls.md). At first start
   # the manager mints the initial management token itself and writes it to
-  # <dataDir>/bootstrap-token and, when absent, ~/.legion/token (mode 0600),
+  # <dataDir>/bootstrap-token and ~/.legion/tokens/<host>_<port> (mode 0600),
   # so the CLI on this machine works with nothing to set up. Create
   # policies/tokens with `legion acl ...` and introduce workers with
   # `legion join-token create`. `enabled = false` is for throwaway clusters

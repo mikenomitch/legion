@@ -3,7 +3,7 @@
 /* eslint-disable */
 // @ts-nocheck
 
-import { AcquireKvLockReply, AcquireKvLockRequest, AdvanceRolloutReply, AdvanceRolloutRequest, CreateAclTokenReply, CreateAclTokenRequest, CreateExecKeyReply, CreateExecKeyRequest, CreateInstanceReply, CreateInstanceRequest, CreateInstancesReply, CreateInstancesRequest, CreateJoinTokenReply, CreateJoinTokenRequest, CreateSnapshotReply, CreateSnapshotRequest, DeleteAclPolicyReply, DeleteAclPolicyRequest, DeleteAclTokenReply, DeleteAclTokenRequest, DeleteAclUserReply, DeleteAclUserRequest, DeleteExecKeyReply, DeleteExecKeyRequest, DeleteJobTemplateReply, DeleteJobTemplateRequest, DeleteJoinTokenReply, DeleteJoinTokenRequest, DeleteKvReply, DeleteKvRequest, DeleteNetPolicyReply, DeleteNetPolicyRequest, DeleteSavedStateQueryReply, DeleteSavedStateQueryRequest, DeleteSnapshotAliasReply, DeleteSnapshotAliasRequest, DeleteSnapshotReply, DeleteSnapshotRequest, DeleteVolumeReply, DeleteVolumeRequest, DestroyInstanceReply, DestroyInstanceRequest, DestroyJobReply, DestroyJobRequest, ExecClientFrame, ExecServerFrame, FetchNetPolicyReply, FetchNetPolicyRequest, FetchRootKeyReply, FetchRootKeyRequest, ForkInstanceReply, ForkInstanceRequest, GetAclPolicyReply, GetAclPolicyRequest, GetAllocationLogsReply, GetAllocationLogsRequest, GetArtifactCredentialReply, GetArtifactCredentialRequest, GetAuthMethodsReply, GetAuthMethodsRequest, GetHeartbeatCadenceReply, GetHeartbeatCadenceRequest, GetIngressCertificatesReply, GetIngressCertificatesRequest, GetInstanceReply, GetInstanceRequest, GetJobInfoReply, GetJobInfoRequest, GetJobScaleStatusReply, GetJobScaleStatusRequest, GetJobSpecByConfigRequest, GetJobSpecReply, GetJobSpecRequest, GetJobTemplateReply, GetJobTemplateRequest, GetKeyringStatusReply, GetKeyringStatusRequest, GetKvLockReply, GetKvLockRequest, GetKvReply, GetKvRequest, GetLedgerReply, GetLedgerRequest, GetManagerConfigsReply, GetManagerConfigsRequest, GetMeshCaReply, GetMeshCaRequest, GetNetPolicyObjectReply, GetNetPolicyObjectRequest, GetNodeContentReply, GetNodeContentRequest, GetNodeReply, GetNodeRequest, GetNodesReply, GetNodesRequest, GetNodeUsageReply, GetNodeUsageRequest, GetObservabilityReply, GetObservabilityRequest, GetRaftJoinTokenReply, GetRaftJoinTokenRequest, GetRaftStatusReply, GetRaftStatusRequest, GetRolloutReply, GetRolloutRequest, GetRolloutStatusReply, GetRolloutStatusRequest, GetSchedulerConcurrencyReply, GetSchedulerConcurrencyRequest, GetSessionReply, GetSessionRequest, GetSnapshotReply, GetSnapshotRequest, GetStateBackupReply, GetStateBackupRequest, GetStateStoreSchemaReply, GetStateStoreSchemaRequest, GetTaskLogsReply, GetTaskLogsRequest, GetUpstreamCredentialsReply, GetUpstreamCredentialsRequest, GetVolumeReply, GetVolumeRequest, HealthCheckReply, HealthCheckRequest, HeartbeatReply, HeartbeatRequest, IssueBootTicketReply, IssueBootTicketRequest, IssueNodeCertificateReply, IssueNodeCertificateRequest, IssueNodeIdentityTokenReply, IssueNodeIdentityTokenRequest, IssueRaftCommandReply, IssueRaftCommandRequest, IssueWorkloadIdentityTokenReply, IssueWorkloadIdentityTokenRequest, JoinRaftClusterReply, JoinRaftClusterRequest, ListAclPoliciesReply, ListAclPoliciesRequest, ListAclTokensReply, ListAclTokensRequest, ListAclUsersReply, ListAclUsersRequest, ListBootTicketsReply, ListBootTicketsRequest, ListEventsReply, ListEventsRequest, ListExecKeysReply, ListExecKeysRequest, ListInstancesReply, ListInstancesRequest, ListJobActionsReply, ListJobActionsRequest, ListJobSpecHistoryReply, ListJobSpecHistoryRequest, ListJobsReply, ListJobsRequest, ListJobTemplatesReply, ListJobTemplatesRequest, ListJoinTokensReply, ListJoinTokensRequest, ListKvReply, ListKvRequest, ListNetPoliciesReply, ListNetPoliciesRequest, ListNodeUsageReply, ListNodeUsageRequest, ListRaftHistoryReply, ListRaftHistoryRequest, ListRolloutEventsReply, ListRolloutEventsRequest, ListRolloutsReply, ListRolloutsRequest, ListSavedStateQueriesReply, ListSavedStateQueriesRequest, ListServiceEdgesReply, ListServiceEdgesRequest, ListServicesReply, ListServicesRequest, ListSessionNodesReply, ListSessionNodesRequest, ListSnapshotsReply, ListSnapshotsRequest, ListVolumeDriversReply, ListVolumeDriversRequest, ListVolumesReply, ListVolumesRequest, LoginReply, LoginRequest, MintExecTicketReply, MintExecTicketRequest, NodeLivenessDigestReply, NodeLivenessDigestRequest, PatchKvReply, PatchKvRequest, PlanJobReply, PlanJobRequest, PostWorkReply, PostWorkRequest, ProbeReply, ProbeRequest, PromoteInstanceReply, PromoteInstanceRequest, PutKvReply, PutKvRequest, QuerySessionsReply, QuerySessionsRequest, QueryStateStoreReply, QueryStateStoreRequest, RaftLaneReply, RaftLaneRequest, RatifyClaimReply, RatifyClaimRequest, ReleaseKvLockReply, ReleaseKvLockRequest, RenderJobTemplateReply, RenderJobTemplateRequest, RenewKvLockReply, RenewKvLockRequest, ReplaceInstanceReply, ReplaceInstanceRequest, ResetKeyringReply, ResetKeyringRequest, ResolveServiceReply, ResolveServiceRequest, RestartWorkerReply, RestartWorkerRequest, RestoreInstanceReply, RestoreInstanceRequest, RewrapKvReply, RewrapKvRequest, RewrapRootKeyReply, RewrapRootKeyRequest, RotateDataKeyReply, RotateDataKeyRequest, RotateMeshCaReply, RotateMeshCaRequest, RunJobReply, RunJobRequest, RunJobTemplateReply, RunJobTemplateRequest, ScaleTaskReply, ScaleTaskRequest, SchedulerEvent, SetNodeAvailabilityReply, SetNodeAvailabilityRequest, SetSnapshotAliasReply, SetSnapshotAliasRequest, ShowNetPolicyReply, ShowNetPolicyRequest, StartClaimReply, StartClaimRequest, StartInstanceReply, StartInstanceRequest, StartSessionReply, StartSessionRequest, StopInstanceReply, StopInstanceRequest, StopJobReply, StopJobRequest, StopRolloutReply, StopRolloutRequest, StopSessionReply, StopSessionRequest, StopSessionsReply, StopSessionsRequest, StreamEventsRequest, StreamWorkReply, StreamWorkRequest, SuspendInstanceReply, SuspendInstanceRequest, TestNetPolicyReply, TestNetPolicyRequest, TriggerElectionReply, TriggerElectionRequest, UpdateNodeDynamicReply, UpdateNodeDynamicRequest, UpsertAclPolicyReply, UpsertAclPolicyRequest, UpsertAclUserReply, UpsertAclUserRequest, UpsertJobTemplateReply, UpsertJobTemplateRequest, UpsertNetPolicyReply, UpsertNetPolicyRequest, UpsertSavedStateQueryReply, UpsertSavedStateQueryRequest, WarmSnapshotReply, WarmSnapshotRequest, WhoAmIReply, WhoAmIRequest, WorkerPreRegisterReply, WorkerPreRegisterRequest, WorkerRegisterReply, WorkerRegisterRequest } from "./legion_pb.js";
+import { AcquireKvLockReply, AcquireKvLockRequest, AdvanceRolloutReply, AdvanceRolloutRequest, CreateAclTokenReply, CreateAclTokenRequest, CreateExecKeyReply, CreateExecKeyRequest, CreateInstanceReply, CreateInstanceRequest, CreateInstancesReply, CreateInstancesRequest, CreateJoinTokenReply, CreateJoinTokenRequest, CreateSnapshotReply, CreateSnapshotRequest, DeleteAclPolicyReply, DeleteAclPolicyRequest, DeleteAclTokenReply, DeleteAclTokenRequest, DeleteAclUserReply, DeleteAclUserRequest, DeleteExecKeyReply, DeleteExecKeyRequest, DeleteJobTemplateReply, DeleteJobTemplateRequest, DeleteJoinTokenReply, DeleteJoinTokenRequest, DeleteKvReply, DeleteKvRequest, DeleteNetPolicyReply, DeleteNetPolicyRequest, DeleteSavedStateQueryReply, DeleteSavedStateQueryRequest, DeleteSnapshotAliasReply, DeleteSnapshotAliasRequest, DeleteSnapshotReply, DeleteSnapshotRequest, DeleteVolumeReply, DeleteVolumeRequest, DestroyInstanceReply, DestroyInstanceRequest, DestroyJobReply, DestroyJobRequest, ExecClientFrame, ExecServerFrame, FetchNetPolicyReply, FetchNetPolicyRequest, FetchRootKeyReply, FetchRootKeyRequest, ForkInstanceReply, ForkInstanceRequest, GetAclPolicyReply, GetAclPolicyRequest, GetAllocationLogsReply, GetAllocationLogsRequest, GetArtifactCredentialReply, GetArtifactCredentialRequest, GetAuthMethodsReply, GetAuthMethodsRequest, GetHeartbeatCadenceReply, GetHeartbeatCadenceRequest, GetIngressCertificatesReply, GetIngressCertificatesRequest, GetInstanceReply, GetInstanceRequest, GetJobInfoReply, GetJobInfoRequest, GetJobScaleStatusReply, GetJobScaleStatusRequest, GetJobSpecByConfigRequest, GetJobSpecReply, GetJobSpecRequest, GetJobTemplateReply, GetJobTemplateRequest, GetKeyringStatusReply, GetKeyringStatusRequest, GetKvLockReply, GetKvLockRequest, GetKvReply, GetKvRequest, GetLedgerReply, GetLedgerRequest, GetManagerConfigsReply, GetManagerConfigsRequest, GetMeshCaReply, GetMeshCaRequest, GetNetPolicyObjectReply, GetNetPolicyObjectRequest, GetNodeContentReply, GetNodeContentRequest, GetNodeReply, GetNodeRequest, GetNodesReply, GetNodesRequest, GetNodeUsageReply, GetNodeUsageRequest, GetObservabilityReply, GetObservabilityRequest, GetRaftJoinTokenReply, GetRaftJoinTokenRequest, GetRaftStatusReply, GetRaftStatusRequest, GetRolloutReply, GetRolloutRequest, GetRolloutStatusReply, GetRolloutStatusRequest, GetSchedulerConcurrencyReply, GetSchedulerConcurrencyRequest, GetSessionReply, GetSessionRequest, GetSnapshotReply, GetSnapshotRequest, GetStateBackupReply, GetStateBackupRequest, GetStateStoreSchemaReply, GetStateStoreSchemaRequest, GetTaskLogsReply, GetTaskLogsRequest, GetUpstreamCredentialsReply, GetUpstreamCredentialsRequest, GetVolumeReply, GetVolumeRequest, HealthCheckReply, HealthCheckRequest, HeartbeatReply, HeartbeatRequest, IssueBootTicketReply, IssueBootTicketRequest, IssueNodeCertificateReply, IssueNodeCertificateRequest, IssueNodeIdentityTokenReply, IssueNodeIdentityTokenRequest, IssueRaftCommandReply, IssueRaftCommandRequest, IssueWorkloadIdentityTokenReply, IssueWorkloadIdentityTokenRequest, JoinRaftClusterReply, JoinRaftClusterRequest, ListAclPoliciesReply, ListAclPoliciesRequest, ListAclTokensReply, ListAclTokensRequest, ListAclUsersReply, ListAclUsersRequest, ListBootTicketsReply, ListBootTicketsRequest, ListEventsReply, ListEventsRequest, ListExecKeysReply, ListExecKeysRequest, ListInstancesReply, ListInstancesRequest, ListJobActionsReply, ListJobActionsRequest, ListJobSpecHistoryReply, ListJobSpecHistoryRequest, ListJobsReply, ListJobsRequest, ListJobTemplatesReply, ListJobTemplatesRequest, ListJoinTokensReply, ListJoinTokensRequest, ListKvReply, ListKvRequest, ListManagersReply, ListManagersRequest, ListNetPoliciesReply, ListNetPoliciesRequest, ListNodeUsageReply, ListNodeUsageRequest, ListRaftHistoryReply, ListRaftHistoryRequest, ListRolloutEventsReply, ListRolloutEventsRequest, ListRolloutsReply, ListRolloutsRequest, ListSavedStateQueriesReply, ListSavedStateQueriesRequest, ListServiceEdgesReply, ListServiceEdgesRequest, ListServicesReply, ListServicesRequest, ListSessionNodesReply, ListSessionNodesRequest, ListSnapshotsReply, ListSnapshotsRequest, ListVolumeDriversReply, ListVolumeDriversRequest, ListVolumesReply, ListVolumesRequest, LoginReply, LoginRequest, MintExecTicketReply, MintExecTicketRequest, NodeLivenessDigestReply, NodeLivenessDigestRequest, PatchKvReply, PatchKvRequest, PlanJobReply, PlanJobRequest, PostWorkReply, PostWorkRequest, ProbeReply, ProbeRequest, PromoteInstanceReply, PromoteInstanceRequest, PutKvReply, PutKvRequest, QuerySessionsReply, QuerySessionsRequest, QueryStateStoreReply, QueryStateStoreRequest, RaftLaneReply, RaftLaneRequest, RatifyClaimReply, RatifyClaimRequest, ReleaseKvLockReply, ReleaseKvLockRequest, RenderJobTemplateReply, RenderJobTemplateRequest, RenewKvLockReply, RenewKvLockRequest, ReplaceInstanceReply, ReplaceInstanceRequest, ResetKeyringReply, ResetKeyringRequest, ResolveServiceReply, ResolveServiceRequest, RestartWorkerReply, RestartWorkerRequest, RestoreInstanceReply, RestoreInstanceRequest, ResumeSessionReply, ResumeSessionRequest, RewrapKvReply, RewrapKvRequest, RewrapRootKeyReply, RewrapRootKeyRequest, RotateDataKeyReply, RotateDataKeyRequest, RotateMeshCaReply, RotateMeshCaRequest, RunJobReply, RunJobRequest, RunJobTemplateReply, RunJobTemplateRequest, ScaleTaskReply, ScaleTaskRequest, SchedulerEvent, SetNodeAvailabilityReply, SetNodeAvailabilityRequest, SetSnapshotAliasReply, SetSnapshotAliasRequest, ShowNetPolicyReply, ShowNetPolicyRequest, StartClaimReply, StartClaimRequest, StartInstanceReply, StartInstanceRequest, StartSessionReply, StartSessionRequest, StopInstanceReply, StopInstanceRequest, StopJobReply, StopJobRequest, StopRolloutReply, StopRolloutRequest, StopSessionReply, StopSessionRequest, StopSessionsReply, StopSessionsRequest, StreamEventsRequest, StreamWorkReply, StreamWorkRequest, SuspendInstanceReply, SuspendInstanceRequest, SuspendSessionsReply, SuspendSessionsRequest, TestNetPolicyReply, TestNetPolicyRequest, TriggerElectionReply, TriggerElectionRequest, UpdateNodeDynamicReply, UpdateNodeDynamicRequest, UpsertAclPolicyReply, UpsertAclPolicyRequest, UpsertAclUserReply, UpsertAclUserRequest, UpsertJobTemplateReply, UpsertJobTemplateRequest, UpsertNetPolicyReply, UpsertNetPolicyRequest, UpsertSavedStateQueryReply, UpsertSavedStateQueryRequest, WarmSnapshotReply, WarmSnapshotRequest, WhoAmIReply, WhoAmIRequest, WorkerPreRegisterReply, WorkerPreRegisterRequest, WorkerRegisterReply, WorkerRegisterRequest } from "./legion_pb.js";
 import { MethodKind } from "@bufbuild/protobuf";
 
 /**
@@ -622,11 +622,25 @@ export const Manager = {
      * without an idempotency key.
      *
      * A running session (docs/session-mode.md) is live too, and answers the
-     * same no-op.
+     * same no-op. A suspended session resumes on the node its id is tagged
+     * with. A session whose task sets `suspend.durability = "store"` resumes
+     * from its manifest in the workers' content store on another node with
+     * room when that node lost it, dropped its local copy, is full, or does
+     * not answer; the new node claims the next generation and the reply's
+     * message names the node it moved from. A session the manifest says is
+     * running on a silent node moves only once that node is marked down or
+     * lost, or with `force_move` (docs/session-mode.md, "Moving a session").
+     * Nothing is written to raft.
      *
      * Errors:
      * - NotFound: no instance row, archive manifest, or running session has
      *   this id.
+     * - Unavailable: a session's node does not answer (a `local` session lives
+     *   only there), or a `store` session's manifest says it runs on a node
+     *   that did not answer and is not marked down (`running_elsewhere`;
+     *   retry, or pass `force_move`).
+     * - Aborted: a `store` session's resume lost its generation claim to a
+     *   racing resume (`superseded`, naming the winner).
      * - InvalidArgument: the instance is slot-mode (slot lifecycles are owned
      *   by the scheduler via `count.num`, not this API).
      * - FailedPrecondition: the instance is Terminated (destroyed ids are
@@ -2054,12 +2068,49 @@ export const Manager = {
     /**
      * Returns config snapshots stored by manager instances.
      *
+     * A manager writes its snapshot when it starts as, or later becomes, the
+     * control-lane leader, so under raft a manager that has never led has no
+     * snapshot here. For the list of managers in the cluster use
+     * `ListManagers`, which reads the raft membership instead.
+     *
      * @generated from rpc legion.Manager.GetManagerConfigs
      */
     getManagerConfigs: {
       name: "GetManagerConfigs",
       I: GetManagerConfigsRequest,
       O: GetManagerConfigsReply,
+      kind: MethodKind.Unary,
+    },
+    /**
+     * Lists every manager in the cluster with its raft role, advertised
+     * address, and whether the answering manager can reach it. Backs the UI's
+     * Managers page and `legion raft members`.
+     *
+     * The roster comes from the replicated raft membership (voters and
+     * learners), which every manager holds, so any manager, leader or
+     * follower, answers with the full list. Outside raft mode the reply holds
+     * exactly one entry: the answering manager.
+     *
+     * Reachability is probed live from the answering manager: it calls
+     * `GetRaftStatus` on every other member concurrently, forwarding the
+     * caller's credential, with a short per-member timeout. A member that
+     * does not answer is still listed, with `reachable = false` and the
+     * reason in `probe_error`. Because it is the answering manager's view, a
+     * partitioned manager reports its peers unreachable while the rest of the
+     * cluster reports it unreachable.
+     *
+     * Read-only. Costs one `GetRaftStatus` call per other member.
+     *
+     * ACL: operator:read, unscoped (the roster is cluster-wide). Peers enforce
+     * the same rule on the forwarded credential, so a caller denied there sees
+     * `reachable = false` with a `PermissionDenied` `probe_error`.
+     *
+     * @generated from rpc legion.Manager.ListManagers
+     */
+    listManagers: {
+      name: "ListManagers",
+      I: ListManagersRequest,
+      O: ListManagersReply,
       kind: MethodKind.Unary,
     },
     /**
@@ -3220,7 +3271,22 @@ export const Worker = {
      * (the untagged shape) and answers a retry that lands on it from its own
      * table with `deduplicated = true`. A retry that lands on another node
      * (a ring change) starts a second copy there; the managers' duplicate
-     * sweep stops one of the two (docs/session-mode.md, "Duplicates").
+     * sweep stops one of the two (docs/session-mode.md, "Duplicates"). For a
+     * task with `suspend.durability = "store"` the node first creates the
+     * session's manifest in its `contentStore` with a conditional create
+     * (`If-None-Match: *`), so of two nodes that derived the same id only one
+     * starts it; the other answers ALREADY_EXISTS naming the first.
+     *
+     * With `resume_id`, the call resumes an existing session of a `store`
+     * task on this node from its manifest instead of starting a new one
+     * (docs/session-mode.md, "Moving a session"): the session may have run or
+     * slept on another node. A session the manifest says is suspended moves
+     * at once. One it says is running on another node is probed there first
+     * (`GetSession`, 2 seconds, with this call's ticket): if it runs there,
+     * this node claims the next generation and asks that node to stop its
+     * copy (`StopSession`) before launching; if that node does not answer,
+     * the call answers UNAVAILABLE unless `force_move` is set. The reply's
+     * `resumed_from`, `generation`, and `moved_from` say what happened.
      *
      * Caller class: `ticket` (a session ticket: `legion.io/scope = session`,
      * minted with `IssueBootTicket` and `scope = "session"`). Admitted only on
@@ -3232,6 +3298,19 @@ export const Worker = {
      * - ResourceExhausted: the envelope is full, or every launch slot stayed
      *   busy for `edgeBoot.queueTimeout`. Retryable on another node.
      * - PermissionDenied: the ticket failed verification (named check).
+     * - InvalidArgument: `resume_id` is not a session id of the ticket's task.
+     * - NotFound: `resume_id` names a session with no manifest (it ended, or
+     *   was never published).
+     * - AlreadyExists: an idempotent start of a `store` session that another
+     *   node created first. The message ends in `[winner node=<id>
+     *   generation=<g>]`; send the session's requests there.
+     * - Aborted: a resume lost its generation claim to a racing resume
+     *   (`superseded`), naming the winner the same way. Not retryable here.
+     * - Unavailable: the content store could not be reached (no generation
+     *   can be claimed, so nothing started), or a move found the session
+     *   running on a node that did not answer the probe
+     *   (`running_elsewhere`). Retry later, or with `force_move` once that
+     *   node is known to be down.
      * - Internal: the runtime failed to start the session.
      *
      * @generated from rpc legion.Worker.StartSession
@@ -3254,6 +3333,111 @@ export const Worker = {
       name: "StopSession",
       I: StopSessionRequest,
       O: StopSessionReply,
+      kind: MethodKind.Unary,
+    },
+    /**
+     * Suspends sessions on this node (session durability plan §6.6,
+     * docs/session-mode.md "Idle sessions"). A manager calls it to route
+     * `legion instance suspend <session>` to the node the session id's tag
+     * names. For each id the node captures a checkpoint into its content
+     * store (a memory checkpoint for a sandbox launched for checkpoints, else
+     * a disk checkpoint, which of a session holds only its spec), stops the
+     * process, frees the session's share of its envelope, and records the
+     * session as `suspended` in its session log, so it survives a worker
+     * restart. The checkpoint stays on this node, pinned until the task's
+     * `suspend.keepFor` expires, the job stops, or disk pressure
+     * (`content.minFreeDisk`) evicts it. Nothing is written to raft.
+     *
+     * Each id is answered on its own, in `suspended` or `failed`. A session
+     * that is already suspended counts as suspended (the call is
+     * idempotent). A failed capture leaves the session running. The reply
+     * comes once every capture has finished, which for a memory checkpoint
+     * takes as long as writing the guest's memory.
+     *
+     * Only sessions whose task sets a `suspend` block can be suspended; a
+     * promoted session is suspended through its row
+     * (`Manager.SuspendInstance`). With `durability = "store"` the node then
+     * publishes the checkpoint's memory parts, sealed, to its `contentStore`
+     * and writes the session's manifest (`suspended`, at the session's
+     * generation) with a conditional write; the local copy becomes an
+     * evictable cache entry. Such a session can resume on any node with an
+     * envelope for its task. A `store` session on a node without a
+     * `contentStore` fails FailedPrecondition. A manifest naming a newer
+     * generation fails the suspend with Aborted (`superseded`): this copy was
+     * stale and has ended. An unreachable content store keeps the session
+     * suspended here, unpublished, and the node retries the publish; the
+     * entry's `published_url` is empty until it lands.
+     *
+     * Caller class: `manager` (a client certificate from the cluster CA
+     * carrying `legion://manager/<id>`); anything else is refused with
+     * `Unauthenticated`.
+     *
+     * @generated from rpc legion.Worker.SuspendSessions
+     */
+    suspendSessions: {
+      name: "SuspendSessions",
+      I: SuspendSessionsRequest,
+      O: SuspendSessionsReply,
+      kind: MethodKind.Unary,
+    },
+    /**
+     * Resumes a suspended session on this node under the same id (session
+     * durability plan §6.6). A manager calls it to route `legion instance
+     * start <session>` to the node the id's tag names. The node admits the
+     * session into its task's envelope again and restores it from its local
+     * memory checkpoint, or boots it fresh when the checkpoint is a disk one
+     * (it holds only the session's spec) or `cold` is set. The answer comes
+     * once the session's runtime returned. A local session never moves, so
+     * its generation stays 1.
+     *
+     * A `store` session (`suspend.durability = "store"`) claims the next
+     * generation in its manifest before it starts, with a conditional write;
+     * a node whose claim loses answers Aborted naming the winner. With
+     * `job_id` and `task_name` set, the node resumes the session from its
+     * manifest even when it never held it (the manager's fallback when the
+     * tagged node lost the session, evicted its local copy, is full, or does
+     * not answer): it admits the session, claims the next generation on the
+     * manifest it read, leaves a fence marker for the old node, and restores
+     * from the published checkpoint. A manifest naming another node as
+     * running the session refuses FailedPrecondition `running_elsewhere`
+     * unless `force_move` is set; the caller probes that node first.
+     *
+     * A session that is already running answers OK with
+     * `already_running = true`.
+     *
+     * Errors:
+     * - NotFound: the node does not hold the session. The message starts
+     *   with `evicted` when the node evicted its local checkpoint (naming
+     *   when and why; reported for `suspend.keepFor` after the eviction, and
+     *   not retryable: the session is gone), with `wrong_node` when the id's
+     *   node tag names another node, and with `not_found` otherwise.
+     * - ResourceExhausted: the envelope has no room for the session right
+     *   now, or every launch slot stayed busy for `edgeBoot.queueTimeout`.
+     *   Retryable; the session stays suspended with its checkpoint.
+     * - FailedPrecondition: the node holds no envelope for the session's
+     *   task any more (the job stopped or was moved).
+     * - FailedPrecondition `running_elsewhere`: the manifest says another
+     *   node runs the session (the message ends in `[winner node=<id>
+     *   generation=<g>]`). Probe that node; retry with `force_move` only if it
+     *   does not run it or is down.
+     * - Aborted: another suspend, checkpoint, or resume of the session is in
+     *   progress (retryable), or the generation claim lost (`superseded`,
+     *   naming the winner; not retryable here).
+     * - Unavailable: the content store holding the session's manifest could
+     *   not be reached; nothing was claimed or started.
+     * - Internal: the restore failed. The session stays suspended with its
+     *   checkpoint (a `store` session's manifest is handed back as
+     *   `suspended`).
+     *
+     * Caller class: `manager`; anything else is refused with
+     * `Unauthenticated`.
+     *
+     * @generated from rpc legion.Worker.ResumeSession
+     */
+    resumeSession: {
+      name: "ResumeSession",
+      I: ResumeSessionRequest,
+      O: ResumeSessionReply,
       kind: MethodKind.Unary,
     },
   }

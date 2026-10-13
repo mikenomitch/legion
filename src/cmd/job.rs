@@ -475,7 +475,7 @@ pub(crate) async fn wait_for_convergence(
     }
 }
 
-#[instrument(err, skip_all)]
+#[instrument(skip_all)]
 async fn wait_job(arg_matches: &ArgMatches) -> R<()> {
     let format = OutputFormat::from_matches(arg_matches);
     let job_name = arg_matches
@@ -499,7 +499,7 @@ async fn wait_job(arg_matches: &ArgMatches) -> R<()> {
     Ok(())
 }
 
-#[instrument(err, skip_all)]
+#[instrument(skip_all)]
 async fn validate_job(arg_matches: &ArgMatches) -> R<()> {
     let format = OutputFormat::from_matches(arg_matches);
     let path = arg_matches
@@ -615,7 +615,7 @@ fn speculative_start_warnings(config: &JobConfig) -> Vec<String> {
         .collect()
 }
 
-#[instrument(err, skip_all)]
+#[instrument(skip_all)]
 async fn job_schema(arg_matches: &ArgMatches) -> R<()> {
     let format = OutputFormat::from_matches(arg_matches);
     let schema = build_jobspec_schema();
@@ -1138,7 +1138,7 @@ struct RolloutPrint {
     pub incomplete: bool,
 }
 
-#[instrument(err, skip_all)]
+#[instrument(skip_all)]
 async fn job_logs(arg_matches: &ArgMatches) -> R<()> {
     let format = OutputFormat::from_matches(arg_matches);
     let name = arg_matches.get_one::<String>("name").cloned();
@@ -1375,6 +1375,36 @@ mod tests {
     use super::*;
     use crate::structs::JobConfig;
     use tempfile::tempdir;
+
+    #[test]
+    fn job_info_lists_replacements_waiting_out_their_backoff() {
+        assert!(reschedule_backoff_lines(&[]).is_empty());
+        let backoff = |task: &str, instance: &str| crate::structs::RescheduleBackoff {
+            task: task.into(),
+            instance_id: instance.into(),
+            attempt: 4,
+            delay_seconds: 240,
+            summary: "attempt 4 failed (boom); next attempt at 2026-10-12T02:31:05Z (backoff 4m)"
+                .into(),
+            ..Default::default()
+        };
+        let lines = reschedule_backoff_lines(&[backoff("store", "sb-1"), backoff("web", "")]);
+        assert_eq!(
+            lines,
+            vec![
+                "Waiting out reschedule backoff:".to_string(),
+                "  task store (instance sb-1): attempt 4 failed (boom); next attempt at \
+                 2026-10-12T02:31:05Z (backoff 4m)"
+                    .to_string(),
+                "  task web: attempt 4 failed (boom); next attempt at 2026-10-12T02:31:05Z \
+                 (backoff 4m)"
+                    .to_string(),
+                "  `legion job run <spec> --force-reschedule` retries now (`legion instance \
+                 start <id>` for one instance)"
+                    .to_string(),
+            ]
+        );
+    }
 
     #[test]
     fn priority_conflicts_with_asap() {
@@ -1694,7 +1724,7 @@ mod tests {
     }
 }
 
-#[instrument(err, skip_all)]
+#[instrument(skip_all)]
 async fn stop_job(arg_matches: &ArgMatches) -> R<()> {
     let format = OutputFormat::from_matches(arg_matches);
     let mut client = connect_manager_client().await?;
@@ -1728,7 +1758,7 @@ async fn stop_job(arg_matches: &ArgMatches) -> R<()> {
 /// `legion job scale <NAME> [--count N | --reset]` (docs/autoscaling.md):
 /// with `--count`/`--reset` it calls ScaleTask; with neither it prints the
 /// job's scale status (spec vs override vs effective, per task).
-#[instrument(err, skip_all)]
+#[instrument(skip_all)]
 async fn scale_job(arg_matches: &ArgMatches) -> R<()> {
     let format = OutputFormat::from_matches(arg_matches);
     let mut client = connect_manager_client().await?;
@@ -1820,7 +1850,7 @@ async fn scale_job(arg_matches: &ArgMatches) -> R<()> {
     Ok(())
 }
 
-#[instrument(err, skip_all)]
+#[instrument(skip_all)]
 async fn get_job_spec(arg_matches: &ArgMatches) -> R<()> {
     let format = OutputFormat::from_matches(arg_matches);
 
@@ -1855,7 +1885,7 @@ async fn get_job_spec(arg_matches: &ArgMatches) -> R<()> {
     Ok(())
 }
 
-#[instrument(err, skip_all)]
+#[instrument(skip_all)]
 async fn destroy_job(arg_matches: &ArgMatches) -> R<()> {
     let format = OutputFormat::from_matches(arg_matches);
     let mut client = connect_manager_client().await?;
@@ -1890,7 +1920,7 @@ async fn destroy_job(arg_matches: &ArgMatches) -> R<()> {
     Ok(())
 }
 
-#[instrument(err, skip_all)]
+#[instrument(skip_all)]
 async fn plan_job(arg_matches: &ArgMatches) -> R<()> {
     let format = OutputFormat::from_matches(arg_matches);
     let mut client = connect_manager_client().await?;
@@ -2036,8 +2066,18 @@ async fn plan_job(arg_matches: &ArgMatches) -> R<()> {
             }
             for (node_id, victims) in by_node {
                 for victim in victims {
+                    // A victim still inside victimExemptAge: the submit
+                    // waits for it to age, then evicts it.
+                    let wait = if victim.eligible_in_seconds > 0 {
+                        format!(
+                            ", once past victimExemptAge in {}s",
+                            victim.eligible_in_seconds
+                        )
+                    } else {
+                        String::new()
+                    };
                     println!(
-                        "  {node_id}: {}/{} (alloc {}, priority {}) — {}s grace, requeued",
+                        "  {node_id}: {}/{} (alloc {}, priority {}) — {}s grace, requeued{wait}",
                         victim.job_id,
                         victim.task_name,
                         victim.allocation_id,
@@ -2052,7 +2092,7 @@ async fn plan_job(arg_matches: &ArgMatches) -> R<()> {
     Ok(())
 }
 
-#[instrument(err, skip_all)]
+#[instrument(skip_all)]
 async fn run_job(arg_matches: &ArgMatches) -> R<()> {
     let format = OutputFormat::from_matches(arg_matches);
     let mut client = connect_manager_client().await?;
@@ -2112,7 +2152,7 @@ async fn run_job(arg_matches: &ArgMatches) -> R<()> {
     Ok(())
 }
 
-#[instrument(err, skip_all)]
+#[instrument(skip_all)]
 async fn list_jobs(arg_matches: &ArgMatches) -> R<()> {
     let format = OutputFormat::from_matches(arg_matches);
 
@@ -2138,7 +2178,7 @@ async fn list_jobs(arg_matches: &ArgMatches) -> R<()> {
     Ok(())
 }
 
-#[instrument(err, skip_all)]
+#[instrument(skip_all)]
 async fn list_rollouts(arg_matches: &ArgMatches) -> R<()> {
     let format = OutputFormat::from_matches(arg_matches);
     let active_only = arg_matches.get_flag("active");
@@ -2182,7 +2222,7 @@ async fn list_rollouts(arg_matches: &ArgMatches) -> R<()> {
     Ok(())
 }
 
-#[instrument(err, skip_all)]
+#[instrument(skip_all)]
 async fn advance_rollout_cmd(arg_matches: &ArgMatches) -> R<()> {
     let rollout_id = *arg_matches
         .get_one::<i64>("id")
@@ -2254,7 +2294,7 @@ struct RolloutEventPrint {
     message: String,
 }
 
-#[instrument(err, skip_all)]
+#[instrument(skip_all)]
 async fn rollout_status_cmd(arg_matches: &ArgMatches) -> R<()> {
     let rollout_id = *arg_matches
         .get_one::<i64>("id")
@@ -2360,7 +2400,7 @@ async fn rollout_status_cmd(arg_matches: &ArgMatches) -> R<()> {
     Ok(())
 }
 
-#[instrument(err, skip_all)]
+#[instrument(skip_all)]
 async fn rollout_events_cmd(arg_matches: &ArgMatches) -> R<()> {
     let rollout_id = *arg_matches
         .get_one::<i64>("id")
@@ -2402,7 +2442,36 @@ async fn rollout_events_cmd(arg_matches: &ArgMatches) -> R<()> {
     Ok(())
 }
 
-#[instrument(err, skip_all)]
+/// `job info`'s lines for replacements waiting out their reschedule backoff
+/// (`Job.reschedule_backoffs`, docs/jobs-tasks-and-scheduling.md):
+///
+/// ```text
+/// Waiting out reschedule backoff:
+///   task store (instance sb-1): attempt 4 failed (...); next attempt at ... (backoff 4m)
+///   `legion job run <spec> --force-reschedule` retries now
+/// ```
+fn reschedule_backoff_lines(backoffs: &[crate::structs::RescheduleBackoff]) -> Vec<String> {
+    if backoffs.is_empty() {
+        return Vec::new();
+    }
+    let mut lines = vec!["Waiting out reschedule backoff:".to_string()];
+    for backoff in backoffs {
+        let subject = if backoff.instance_id.is_empty() {
+            format!("task {}", backoff.task)
+        } else {
+            format!("task {} (instance {})", backoff.task, backoff.instance_id)
+        };
+        lines.push(format!("  {subject}: {}", backoff.summary));
+    }
+    lines.push(
+        "  `legion job run <spec> --force-reschedule` retries now (`legion instance start <id>` \
+         for one instance)"
+            .to_string(),
+    );
+    lines
+}
+
+#[instrument(skip_all)]
 async fn get_info(arg_matches: &ArgMatches) -> R<()> {
     let format = OutputFormat::from_matches(arg_matches);
 
@@ -2422,8 +2491,12 @@ async fn get_info(arg_matches: &ArgMatches) -> R<()> {
     } else {
         let job = response.into_inner().job.context("no job found")?;
         let blocked = job.blocked.clone();
+        let backoff_lines = reschedule_backoff_lines(&job.reschedule_backoffs);
         let printable_job: JobPrint = job.into();
         print_table(vec![printable_job]);
+        for line in backoff_lines {
+            println!("{line}");
+        }
         // What a blocked job waits for (docs/scheduler-and-eval-loop.md,
         // "Blocked evals"): it places on its own when that capacity appears.
         if let Some(blocked) = blocked {

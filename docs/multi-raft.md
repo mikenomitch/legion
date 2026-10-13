@@ -502,7 +502,8 @@ leader is unreachable from the manager it asked.
 
 **Worker-plane** writes are forwarded per operation, below the RPC layer. A
 manager may receive a heartbeat, health check, allocation-health
-snapshot, failure report, or volume report that it cannot propose, because
+snapshot, failure report, terminal-exit report, or volume report that it
+cannot propose, because
 it does not lead the owning lane. This happens after a failover in `single`
 topology, or during a lane split in `lanes`. The manager sends the operation
 to the lane's leader over the authenticated raft transport
@@ -515,6 +516,19 @@ causes a forwarding loop. A forward that cannot complete returns the
 original typed rejection. During a rolling upgrade from a release without
 this RPC, a forward to an old manager fails cleanly, and the worker falls
 back to the older reject-and-retry behavior.
+
+A report whose writes span lanes goes out as one write per lane, in order.
+A batch task's exit marks its allocation complete on the scheduler lane,
+which also decides the task's status from every replica's row. The status
+lane then records that status, and the dependency eval follows on the
+scheduler lane. If a later write fails, the manager asks the worker to send
+the report again (`HeartbeatReply.retry_terminated_allocations`). The
+earlier writes are idempotent, so the repeat converges. In the `lanes`
+topology the eval can run before the scheduler leader has applied the
+status-lane write. It then keeps holding the dependents, and they wait for
+the job's next evaluation (a resubmit, a node change, any other eval). The
+`single` topology, where every lane rides one group, doesn't have this
+race.
 
 Scheduling is leader-only in the same way. Eval queue state replicates
 everywhere, so a failover resumes the queue. Only the leader's loops act.

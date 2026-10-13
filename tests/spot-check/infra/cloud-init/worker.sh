@@ -12,12 +12,11 @@ apt-get install -y -q curl jq python3 e2fsprogs iptables
 
 mkdir -p /opt/legion/bin /opt/legion/configs /var/lib/legion/kernels
 
-# --- container runtime: youki is Legion's default OCI runtime on Linux.
-tmp="$(mktemp -d)"
-curl -fsSL "https://github.com/youki-dev/youki/releases/download/v@@YOUKI_VERSION@@/youki-@@YOUKI_VERSION@@-x86_64-gnu.tar.gz" |
-    tar -xz -C "$tmp"
-install -m 0755 "$(find "$tmp" -type f -name youki | head -n1)" /usr/local/bin/youki
-rm -rf "$tmp"
+# --- container runtime: runc, Legion's default OCI runtime on Linux. The
+# static release binary, since the default user namespace needs runc 1.2+.
+curl -fsSL -o /usr/local/bin/runc \
+    "https://github.com/opencontainers/runc/releases/download/@@RUNC_VERSION@@/runc.amd64"
+chmod 0755 /usr/local/bin/runc
 
 # --- sandbox runtime: cloud-hypervisor plus an uncompressed guest kernel.
 curl -fsSL -o /usr/local/bin/cloud-hypervisor \

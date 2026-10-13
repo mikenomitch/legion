@@ -1354,6 +1354,33 @@ impl MultiRaftDriver {
         addrs
     }
 
+    /// Every raft member (voters and learners of the control group, which
+    /// every lane's membership mirrors) as `(node id, advertised host:port)`,
+    /// sorted by node id. Backs `ListManagers` (spot-check P2-12): the
+    /// replicated membership is the one roster every manager agrees on,
+    /// whether or not it has ever led. One metrics borrow; no I/O.
+    pub(crate) fn members(&self) -> Vec<(String, String)> {
+        let Some(engine) = self.engine.get() else {
+            return Vec::new();
+        };
+        let Some(metrics) = Self::control_metrics(engine) else {
+            return Vec::new();
+        };
+        let mut members: Vec<(String, String)> = metrics
+            .membership_config
+            .membership()
+            .nodes()
+            .map(|(id, node)| {
+                (
+                    member_name(&metrics, *id),
+                    node_addr_host_port(&node.addr).to_string(),
+                )
+            })
+            .collect();
+        members.sort();
+        members
+    }
+
     /// Send one liveness digest to the status-lane leader (liveness plan
     /// §6.3).
     ///

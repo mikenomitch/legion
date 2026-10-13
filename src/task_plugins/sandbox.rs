@@ -41,9 +41,9 @@ use crate::task_plugins::checkpoint::{
 };
 use crate::task_plugins::microvm::{self, Backend, GuestDiskMount, GuestPayload, TapNet, VmSpec};
 use crate::task_plugins::{
-    configure_task_log_capture, derived_schema, oci_bundle, oci_image, reap_task_process,
-    spawn_pipe, spawn_pty, spawn_task_process, validate_schema, ExecOptions, ExecSession,
-    ExecSupport, MountedVolume, TaskInstance, TaskPlugin,
+    apple_container, configure_task_log_capture, derived_schema, oci_bundle, oci_image,
+    reap_task_process, spawn_pipe, spawn_pty, spawn_task_process, validate_schema, ExecOptions,
+    ExecSession, ExecSupport, MountedVolume, TaskInstance, TaskPlugin,
 };
 use crate::task_plugins::{sandbox_addr, sandbox_checkpoint};
 use crate::volumes::VolumeMode;
@@ -535,25 +535,10 @@ fn sandbox_name(allocation: &Allocation) -> String {
 /// are global to the Mac, and two local clusters both number allocations
 /// from 1, so the name carries the node too: otherwise one cluster's
 /// stale-container cleanup (`container rm --force`) would remove the other's
-/// running sandbox.
+/// running sandbox. The `container` runtime names its containers the same
+/// way ([`apple_container::node_scoped_name`]).
 fn apple_container_name(allocation: &Allocation) -> String {
-    let node: String = allocation
-        .node_id
-        .chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() {
-                c.to_ascii_lowercase()
-            } else {
-                '-'
-            }
-        })
-        .collect();
-    let node = node.trim_matches('-');
-    if node.is_empty() {
-        sandbox_name(allocation)
-    } else {
-        format!("legion-sbx-{node}-{}", allocation.id)
-    }
+    apple_container::node_scoped_name("legion-sbx", allocation)
 }
 
 /// The host-side vsock socket base of a gated sandbox: the VMM multiplexes
@@ -573,6 +558,67 @@ pub fn vsock_socket_base_for(alloc_dir: &Path) -> PathBuf {
 /// boot record, and address lease.
 pub fn sandbox_dir_for(alloc_dir: &Path) -> PathBuf {
     alloc_dir.join(".sandbox")
+}
+
+/// How long the stop request may take to reach the guest's init. Short,
+/// because `stop_with` runs under the worker's task-manager lock, and a
+/// guest that cannot take a one-line exec in this long will not shut itself
+/// down cleanly either.
+const GUEST_STOP_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// How long a hard stop (and a memory capture) waits for the guest to flush
+/// its page cache before the VMM is killed or paused. Bounded for the same
+/// lock, and generous enough for a guest with a lot of dirty data.
+pub(crate) const GUEST_FLUSH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// The argv the guest agent runs to deliver a stop request: `signal` (a
+/// `stop.signal` name, `SIGTERM`) to PID 1, whose trap flushes the disks and
+/// passes it to the command (`microvm::render_command_supervision`). The
+/// name travels as an argument, never inside the script.
+fn guest_stop_command(signal: &str) -> R<Vec<String>> {
+    if crate::task_plugins::stop_signal_number(signal).is_none() {
+        bail!("{signal} is not a stop signal Legion delivers");
+    }
+    Ok(vec![
+        "/bin/sh".into(),
+        "-c".into(),
+        "kill -s \"$1\" 1".into(),
+        "legion-stop".into(),
+        signal.trim_start_matches("SIG").to_string(),
+    ])
+}
+
+/// Asks the guest behind `vsock` to stop, through its agent (see
+/// [`guest_stop_command`]). `Ok` means init has the signal; the VMM exits once
+/// the command has and init has unmounted the volumes and powered off.
+fn request_guest_stop(vsock: &Path, signal: &str, timeout: std::time::Duration) -> R<()> {
+    let command = guest_stop_command(signal)?;
+    let code = crate::task_plugins::vsock_exec::run(vsock, command, timeout)?;
+    anyhow::ensure!(
+        code == 0,
+        "the guest's stop request exited with status {code}"
+    );
+    Ok(())
+}
+
+/// Flushes the page cache of the guest behind `vsock` to its disks (`sync`
+/// in the guest), so a VMM killed or captured next loses nothing already
+/// written. A write is only in the guest's memory until the guest kernel
+/// writes it back (up to about 30s later), and killing the VMM drops it.
+pub(crate) fn flush_guest(vsock: &Path, timeout: std::time::Duration) -> R<()> {
+    let code = crate::task_plugins::vsock_exec::run(vsock, vec!["sync".into()], timeout)?;
+    anyhow::ensure!(code == 0, "`sync` in the guest exited with status {code}");
+    Ok(())
+}
+
+/// Whether the VMM may still be running. A child handle answers exactly; a
+/// bare pid (a worker restart restores no `Child`) is assumed alive, and a
+/// dead one only costs a refused dial.
+fn vmm_may_be_running(instance: &mut TaskInstance) -> bool {
+    match instance.child.as_mut() {
+        Some(child) => matches!(child.try_wait(), Ok(None)),
+        None => instance.pid.is_some(),
+    }
 }
 
 /// The port the guest in `scratch` listens on for the advertised port
@@ -880,20 +926,29 @@ fn reject_block_volumes_in_dev_mode(volumes: &[MountedVolume], backend: &Backend
     Ok(())
 }
 
-/// Best-effort removal of a dev-mode container left behind under this
-/// allocation's name — `run --name` fails outright when the name is taken,
-/// which happens whenever a previous start was not torn down cleanly (worker
-/// crash, or a `--rm` run killed before the runtime could reap it). Mirrors
-/// the container runtime's `remove_stale_container`; the microVM backends need
-/// no equivalent, since their VM dies with the VMM child process. Errors are
-/// ignored: "no such container" is the normal case.
-fn remove_stale_dev_sandbox(backend: &Backend, name: &str) {
-    let (program, args): (String, Vec<&str>) = match backend {
-        Backend::AppleContainer => ("container".to_string(), vec!["rm", "--force", name]),
-        Backend::OciRuntime { binary } => (binary.clone(), vec!["delete", "--force", name]),
-        Backend::CloudHypervisor { .. } | Backend::Firecracker { .. } => return,
-    };
-    let _ = Command::new(program).args(&args).output();
+/// Removal of a dev-mode container left behind under this allocation's name
+/// — `run --name` fails outright when the name is taken, which happens
+/// whenever a previous start was not torn down cleanly (worker crash, or a
+/// `--rm` run killed before the runtime could reap it). Mirrors the container
+/// runtime's `remove_stale_container`; the microVM backends need no
+/// equivalent, since their VM dies with the VMM child process.
+///
+/// On Apple `container` only a container labeled as this node's is removed
+/// ([`apple_container::remove_stale`]); an OCI runtime deletes by name,
+/// ignoring "no such container". A hung CLI fails the start, naming the
+/// command, instead of blocking it.
+fn remove_stale_dev_sandbox(backend: &Backend, name: &str, allocation: &Allocation) -> R<()> {
+    match backend {
+        Backend::AppleContainer => apple_container::remove_stale(name, allocation),
+        Backend::OciRuntime { binary } => {
+            crate::util::output_with_timeout(
+                Command::new(binary).args(["delete", "--force", name]),
+                crate::util::RUNTIME_CLI_TIMEOUT,
+            )?;
+            Ok(())
+        }
+        Backend::CloudHypervisor { .. } | Backend::Firecracker { .. } => Ok(()),
+    }
 }
 
 /// Copies staged file/tree artifacts into the guest filesystem at
@@ -1075,6 +1130,7 @@ fn check_apple_memory_floor(task: &str, config: &SandboxTaskConfig) -> R<()> {
 /// bind-mounted where the microVM path would attach block devices.
 fn build_apple_launch(
     name: &str,
+    labels: &[String],
     config: &SandboxTaskConfig,
     env: &BTreeMap<String, String>,
     volumes: &[MountedVolume],
@@ -1086,6 +1142,7 @@ fn build_apple_launch(
         "--name".to_string(),
         name.to_string(),
     ];
+    args.extend_from_slice(labels);
     // Only forwarded when the jobspec asked for them: the microVM defaults are
     // Legion's, and silently reshaping a dev-mode container is worse than
     // letting the backend pick.
@@ -1455,7 +1512,7 @@ impl SandboxTaskPlugin {
         reject_block_volumes_in_dev_mode(&instance.volumes, backend)?;
         check_apple_memory_floor(&task.name, config)?;
         let name = apple_container_name(allocation);
-        remove_stale_dev_sandbox(backend, &name);
+        remove_stale_dev_sandbox(backend, &name, allocation)?;
         // Named for the usage sampler: `container stats` is how an idle
         // policy sees this sandbox on macOS, where there is no cgroup.
         let scratch = work_root(allocation, instance);
@@ -1476,6 +1533,8 @@ impl SandboxTaskPlugin {
         let mut cmd = Command::new("container");
         cmd.args(build_apple_launch(
             &name,
+            // What stale-container cleanup checks before it removes anything.
+            &apple_container::ownership_labels(allocation),
             config,
             &env,
             &instance.volumes,
@@ -1496,9 +1555,12 @@ impl SandboxTaskPlugin {
         backend: &Backend,
     ) -> R<(Command, oci_bundle::BuiltBundle)> {
         reject_block_volumes_in_dev_mode(&instance.volumes, backend)?;
+        // The same runtimes the container task runs on (runc or crun), with
+        // the same error for a missing or unsupported one.
+        crate::task_plugins::container::probe_oci_runtime(binary)?;
         let scratch = work_root(allocation, instance);
         let name = sandbox_name(allocation);
-        remove_stale_dev_sandbox(backend, &name);
+        remove_stale_dev_sandbox(backend, &name, allocation)?;
         let layout = oci_image::resolve_layout(&config.image, instance, &scratch)?;
 
         let mut env = env.clone();
@@ -2037,25 +2099,53 @@ impl TaskPlugin for SandboxTaskPlugin {
         Ok(())
     }
 
-    /// **No graceful stop.** A sandbox is a guest OS behind a VMM process;
-    /// signalling the VMM terminates the hypervisor, it does not ask the
-    /// workload inside to shut down, and Legion has no in-guest agent to
-    /// relay a notice to. Rather than pretend — signalling the VMM and
-    /// calling the resulting hard stop "graceful" — this runtime declines the
-    /// notice, and the worker tears the allocation down immediately, exactly
-    /// as it did before graceful stop existed.
+    /// A microVM is shut down **from inside**. Signalling the VMM would kill
+    /// the hypervisor with the guest's page cache in it, so writes the
+    /// workload made in the last ~30s would never reach its volume. Instead
+    /// the guest agent signals the guest's init with `ctx.signal`, and init
+    /// flushes the disks, passes the signal to the command, waits for it,
+    /// unmounts the volumes, and powers off. The worker holds the allocation
+    /// (and its volumes) until the VMM exits, or until the deadline, where
+    /// `stop` flushes once more and kills it.
     ///
-    /// The consequence is user-visible and documented in
-    /// `docs/graceful-stop.md`: `stop { signal, killAfter }` has no effect on
-    /// `sandbox` tasks.
+    /// Declined (the worker stops it at once, through `stop`) for the dev
+    /// backends, which run no guest, and when the agent cannot be reached.
     fn stop_with(
         &self,
-        _allocation: &Allocation,
-        _task: &TaskConfig,
-        _instance: &mut TaskInstance,
-        _ctx: &crate::task_plugins::StopContext,
+        allocation: &Allocation,
+        task: &TaskConfig,
+        instance: &mut TaskInstance,
+        ctx: &crate::task_plugins::StopContext,
     ) -> R<bool> {
-        Ok(false)
+        let Ok(backend) = Backend::detect(configured_backend(task).as_deref()) else {
+            return Ok(false);
+        };
+        if !backend.is_microvm() || !vmm_may_be_running(instance) {
+            return Ok(false);
+        }
+        let vsock = vsock_socket_base(&work_root(allocation, instance));
+        match request_guest_stop(&vsock, &ctx.signal, GUEST_STOP_REQUEST_TIMEOUT) {
+            Ok(()) => {
+                info!(
+                    allocation_id = allocation.id,
+                    task_name = %task.name,
+                    signal = %ctx.signal,
+                    grace_secs = ctx.grace.as_secs(),
+                    cause = %ctx.cause,
+                    "Asked the sandbox guest to shut down"
+                );
+                Ok(true)
+            }
+            Err(err) => {
+                warn!(
+                    allocation_id = allocation.id,
+                    task_name = %task.name,
+                    error = %format!("{err:#}"),
+                    "Could not deliver a stop request into the sandbox guest; stopping it hard"
+                );
+                Ok(false)
+            }
+        }
     }
 
     fn stop(
@@ -2075,25 +2165,62 @@ impl TaskPlugin for SandboxTaskPlugin {
         // dev mode on a KVM-capable node, leaving its container running.
         if let Ok(hypervisor) = Backend::detect(configured_backend(task).as_deref()) {
             let name = sandbox_name(allocation);
-            let teardown: Option<(String, Vec<String>)> = match &hypervisor {
+            let teardown: Option<(String, Vec<String>, std::time::Duration)> = match &hypervisor {
                 Backend::AppleContainer => Some((
-                    "container".to_string(),
+                    apple_container::BIN.to_string(),
                     vec!["stop".into(), apple_container_name(allocation)],
+                    apple_container::STOP_TIMEOUT,
                 )),
                 Backend::OciRuntime { binary } => Some((
                     binary.clone(),
                     vec!["delete".into(), "--force".into(), name.clone()],
+                    crate::util::RUNTIME_CLI_TIMEOUT,
                 )),
-                Backend::CloudHypervisor { .. } | Backend::Firecracker { .. } => None,
+                Backend::CloudHypervisor { .. } | Backend::Firecracker { .. } => {
+                    // A VMM still running here is being stopped hard: the
+                    // guest ignored its stop request past the deadline, or
+                    // nothing asked (a restart, a disk suspend, a destroy).
+                    // Flush the guest first, or killing the VMM drops every
+                    // write still in its page cache.
+                    if vmm_may_be_running(instance) {
+                        let vsock = vsock_socket_base(&work_root(allocation, instance));
+                        match flush_guest(&vsock, GUEST_FLUSH_TIMEOUT) {
+                            Ok(()) => info!(
+                                allocation_id = allocation.id,
+                                task_name = %task.name,
+                                "Flushed the sandbox guest's disks before stopping its VMM"
+                            ),
+                            Err(err) => warn!(
+                                allocation_id = allocation.id,
+                                task_name = %task.name,
+                                error = %format!("{err:#}"),
+                                "Could not flush the sandbox guest's disks before stopping its \
+                                 VMM; writes it had not written back are lost"
+                            ),
+                        }
+                    }
+                    None
+                }
             };
-            if let Some((program, args)) = teardown {
+            if let Some((program, args, timeout)) = teardown {
                 info!(
                     allocation_id = allocation.id,
                     task_name = %task.name,
                     backend = hypervisor.label(),
                     "Tearing down dev-mode sandbox by name"
                 );
-                let _ = Command::new(program).args(&args).output();
+                // Bounded: a hung runtime must not hold the worker's
+                // task-manager lock, which teardown can run under.
+                if let Err(err) =
+                    crate::util::output_with_timeout(Command::new(program).args(&args), timeout)
+                {
+                    warn!(
+                        allocation_id = allocation.id,
+                        task_name = %task.name,
+                        error = %err,
+                        "Dev-mode sandbox teardown by name failed"
+                    );
+                }
             }
         }
 
@@ -2718,6 +2845,7 @@ mod tests {
         let config = SandboxTaskConfig::from_value(&json!({"image": "a", "command": ["x"]}))?;
         let args = build_apple_launch(
             "legion-sbx-7",
+            &[],
             &config,
             &BTreeMap::new(),
             &[],
@@ -2962,7 +3090,7 @@ mod tests {
             false,
         )];
         let backend = Backend::OciRuntime {
-            binary: "youki".into(),
+            binary: "runc".into(),
         };
         let err = reject_block_volumes_in_dev_mode(&volumes, &backend)
             .expect_err("block volume in dev mode");
@@ -3017,6 +3145,72 @@ mod tests {
         assert_eq!(path_safe(".."), "_");
         assert_eq!(path_safe(""), "_");
         assert_eq!(path_safe("../../etc"), ".._.._etc");
+    }
+
+    /// The stop request signals the guest's PID 1 with the task's stop
+    /// signal, passed as an argument (never spliced into the script), and
+    /// only a signal Legion delivers.
+    #[test]
+    fn the_stop_request_signals_init_with_the_stop_signal() -> R<()> {
+        assert_eq!(
+            guest_stop_command("SIGUSR1")?,
+            vec!["/bin/sh", "-c", "kill -s \"$1\" 1", "legion-stop", "USR1"]
+        );
+        assert!(guest_stop_command("SIGKILL; reboot").is_err());
+        Ok(())
+    }
+
+    /// The stop sequence, host side: the request travels through the VMM's
+    /// vsock socket to the guest agent, which runs it.
+    #[test]
+    fn the_stop_request_reaches_the_guest_agent() -> R<()> {
+        let scratch = tempfile::tempdir()?;
+        let vsock = vsock_socket_base(scratch.path());
+        let seen = crate::task_plugins::vsock_exec::fake_agent::listen(&vsock, Some(0));
+        request_guest_stop(&vsock, "SIGTERM", GUEST_STOP_REQUEST_TIMEOUT)?;
+        assert_eq!(seen.recv()?, guest_stop_command("SIGTERM")?);
+        Ok(())
+    }
+
+    /// No agent to take the request (a VMM that is gone, or a guest without
+    /// one) fails at once, so the worker falls back to a hard stop instead
+    /// of waiting out the grace window for a guest that was never told.
+    #[test]
+    fn a_stop_request_with_no_agent_fails_fast() {
+        let scratch = tempfile::tempdir().unwrap();
+        let started = std::time::Instant::now();
+        let err = request_guest_stop(
+            &vsock_socket_base(scratch.path()),
+            "SIGTERM",
+            GUEST_STOP_REQUEST_TIMEOUT,
+        )
+        .expect_err("nothing listens");
+        assert!(started.elapsed() < std::time::Duration::from_secs(1));
+        assert!(
+            format!("{err:#}").contains("needs the guest agent"),
+            "{err:#}"
+        );
+    }
+
+    /// The hard stop's flush is `sync` in the guest, and a failed one is
+    /// reported rather than taken as done.
+    #[test]
+    fn the_flush_runs_sync_in_the_guest() -> R<()> {
+        let scratch = tempfile::tempdir()?;
+        let vsock = vsock_socket_base(scratch.path());
+        let seen = crate::task_plugins::vsock_exec::fake_agent::listen(&vsock, Some(0));
+        flush_guest(&vsock, GUEST_FLUSH_TIMEOUT)?;
+        assert_eq!(seen.recv()?, vec!["sync".to_string()]);
+
+        let failing = tempfile::tempdir()?;
+        let vsock = vsock_socket_base(failing.path());
+        let _seen = crate::task_plugins::vsock_exec::fake_agent::listen(&vsock, Some(1));
+        let err = flush_guest(&vsock, GUEST_FLUSH_TIMEOUT).expect_err("sync failed");
+        assert!(
+            format!("{err:#}").contains("exited with status 1"),
+            "{err:#}"
+        );
+        Ok(())
     }
 
     /// Destroy reclaims the allocation's scratch tree and nothing else —
@@ -3176,7 +3370,7 @@ mod tests {
             ),
             models,
         ];
-        let args = build_apple_launch("legion-sbx-7", &config, &env, &volumes, None);
+        let args = build_apple_launch("legion-sbx-7", &[], &config, &env, &volumes, None);
 
         assert_eq!(args[0], "run");
         assert!(args.contains(&"--rm".to_string()));
@@ -3201,7 +3395,7 @@ mod tests {
     fn apple_launch_omits_sizing_flags_when_unset() -> R<()> {
         let config =
             SandboxTaskConfig::from_value(&json!({"image": "alpine", "command": ["true"]}))?;
-        let args = build_apple_launch("legion-sbx-7", &config, &BTreeMap::new(), &[], None);
+        let args = build_apple_launch("legion-sbx-7", &[], &config, &BTreeMap::new(), &[], None);
         assert!(!args.contains(&"--cpus".to_string()));
         assert!(!args.contains(&"--memory".to_string()));
         assert!(!args.contains(&"--volume".to_string()));

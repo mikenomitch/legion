@@ -52,7 +52,62 @@ pub fn open(vsock_socket: &Path, opts: &ExecOptions) -> R<Box<dyn ExecSession>> 
 
 /// [`open`] on an already connected host socket.
 pub fn open_on(stream: UnixStream, opts: &ExecOptions) -> R<Box<dyn ExecSession>> {
-    stream.set_read_timeout(Some(HANDSHAKE_TIMEOUT))?;
+    open_within(stream, opts, HANDSHAKE_TIMEOUT)
+}
+
+/// Runs one short command in the guest behind `vsock_socket` and returns its
+/// exit status, all within `timeout`: the dial, the handshake, and the run.
+/// Its output is discarded.
+///
+/// This is for the worker's own requests on the stop path (a stop signal for
+/// init, a `sync`), which run under the task-manager lock: a wedged guest
+/// costs `timeout`, never a hang.
+pub fn run(vsock_socket: &Path, command: Vec<String>, timeout: Duration) -> R<i32> {
+    let stream = UnixStream::connect(vsock_socket).map_err(|err| {
+        no_agent(&format!(
+            "the VMM's vsock socket {} refused: {err}",
+            vsock_socket.display()
+        ))
+    })?;
+    run_on(stream, command, timeout)
+}
+
+/// [`run`] on an already connected host socket.
+pub fn run_on(stream: UnixStream, command: Vec<String>, timeout: Duration) -> R<i32> {
+    let deadline = std::time::Instant::now() + timeout;
+    let shown = command.join(" ");
+    let mut session = open_within(
+        stream,
+        &ExecOptions::new(command, false),
+        timeout.min(HANDSHAKE_TIMEOUT),
+    )?;
+    session.close_stdin();
+    // Held, not read: these commands print next to nothing, which the pipes
+    // buffer. Dropping the readers would end the session early, since the
+    // demux thread treats a closed stdout as the end.
+    let _output = session.take_output()?;
+    loop {
+        if let Some(code) = session.try_wait()? {
+            return Ok(code);
+        }
+        if std::time::Instant::now() >= deadline {
+            session.kill();
+            bail!(
+                "the guest did not finish `{shown}` within {}ms",
+                timeout.as_millis()
+            );
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+/// [`open_on`] with an explicit bound on the `CONNECT` and hello exchange.
+fn open_within(
+    stream: UnixStream,
+    opts: &ExecOptions,
+    handshake: Duration,
+) -> R<Box<dyn ExecSession>> {
+    stream.set_read_timeout(Some(handshake))?;
     let mut writer = stream.try_clone()?;
     writer.write_all(format!("CONNECT {EXEC_PORT}\n").as_bytes())?;
     // Read the VMM's reply one byte at a time: anything after the newline is
@@ -268,6 +323,60 @@ impl Drop for VsockExecSession {
     }
 }
 
+/// A VMM vsock socket with a scripted guest agent behind it, for tests of
+/// the worker's own requests into a guest ([`run`]). It speaks the real
+/// frames but runs nothing: it reports the argv it was asked to run, then
+/// answers with `exit`, or holds the session open with `None` (a wedged
+/// guest) until the worker hangs up.
+#[cfg(test)]
+pub(crate) mod fake_agent {
+    use super::*;
+    use std::io::BufRead;
+    use std::sync::mpsc::{channel, Receiver};
+
+    /// Serves one session on `vmm`, the VMM's end of a host connection.
+    pub(crate) fn serve(vmm: UnixStream, exit: Option<i32>) -> Receiver<Vec<String>> {
+        let (seen_tx, seen) = channel();
+        std::thread::spawn(move || {
+            let mut reader = std::io::BufReader::new(vmm.try_clone().unwrap());
+            let mut line = String::new();
+            reader.read_line(&mut line).unwrap();
+            assert_eq!(line, format!("CONNECT {EXEC_PORT}\n"));
+            let mut writer = vmm.try_clone().unwrap();
+            writer.write_all(b"OK 1073741824\n").unwrap();
+            let mut raw = vmm.try_clone().unwrap();
+            read_frame(&mut raw).unwrap();
+            write_frame(&mut writer, frame::HELLO, &hello_payload(PROTOCOL_VERSION)).unwrap();
+            let Ok(Some((frame::START, payload))) = read_frame(&mut raw) else {
+                panic!("no start frame");
+            };
+            let start: Start = serde_json::from_slice(&payload).unwrap();
+            let _ = seen_tx.send(start.argv);
+            match exit {
+                Some(code) => {
+                    let payload = legion_guest::exec::exit_payload(code, "");
+                    write_frame(&mut writer, frame::EXIT, &payload).unwrap();
+                }
+                None => while let Ok(Some(_)) = read_frame(&mut raw) {},
+            }
+        });
+        seen
+    }
+
+    /// A VMM socket listening at `path` that serves one session.
+    pub(crate) fn listen(path: &Path, exit: Option<i32>) -> Receiver<Vec<String>> {
+        let listener = std::os::unix::net::UnixListener::bind(path).unwrap();
+        let (seen_tx, seen) = channel();
+        std::thread::spawn(move || {
+            let (vmm, _) = listener.accept().unwrap();
+            if let Ok(argv) = serve(vmm, exit).recv() {
+                let _ = seen_tx.send(argv);
+            }
+        });
+        seen
+    }
+}
+
 #[cfg(test)]
 mod vsock_exec_test {
     use super::*;
@@ -331,6 +440,48 @@ mod vsock_exec_test {
         let (code, text) = drain(&mut session);
         assert_eq!(code, 0);
         assert!(text.contains("50 132"), "{text:?}");
+    }
+
+    /// The worker's own requests (a stop signal, a `sync`) run to an exit
+    /// status, with the argv exactly as given.
+    #[test]
+    fn a_request_runs_to_its_exit_status_test() {
+        let (host, vmm) = UnixStream::pair().unwrap();
+        let seen = fake_agent::serve(vmm, Some(5));
+        let code = run_on(host, vec!["sync".into()], Duration::from_secs(5)).unwrap();
+        assert_eq!(code, 5);
+        assert_eq!(seen.recv().unwrap(), vec!["sync".to_string()]);
+    }
+
+    /// A wedged guest costs the request's timeout, never a hang: the stop
+    /// path runs under the worker's task-manager lock.
+    #[test]
+    fn a_wedged_guest_times_the_request_out_test() {
+        let (host, vmm) = UnixStream::pair().unwrap();
+        let _seen = fake_agent::serve(vmm, None);
+        let started = std::time::Instant::now();
+        let err = run_on(host, vec!["sync".into()], Duration::from_millis(300))
+            .expect_err("a wedged guest never answers");
+        assert!(started.elapsed() < Duration::from_secs(3));
+        assert!(
+            format!("{err:#}").contains("did not finish `sync`"),
+            "{err:#}"
+        );
+    }
+
+    /// A guest that never answers `CONNECT` is bounded by the request's
+    /// timeout too, not the 5s interactive handshake.
+    #[test]
+    fn a_silent_vmm_times_the_request_out_test() {
+        let (host, _vmm) = UnixStream::pair().unwrap();
+        let started = std::time::Instant::now();
+        let err = run_on(host, vec!["sync".into()], Duration::from_millis(200))
+            .expect_err("nothing answers");
+        assert!(started.elapsed() < Duration::from_secs(2));
+        assert!(
+            format!("{err:#}").contains("no reply to CONNECT"),
+            "{err:#}"
+        );
     }
 
     #[test]

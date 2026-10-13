@@ -48,7 +48,10 @@ service Manager {
   // Lists known job spec versions for one job.
   rpc ListJobSpecHistory (ListJobSpecHistoryRequest) returns (ListJobSpecHistoryReply);
 
-  // Returns metadata for one job (status, creation time, etc).
+  // Returns metadata for one job (status, creation time, etc), what a
+  // blocked job waits for (`Job.blocked`), and the replacements of failed
+  // allocations still waiting out their reschedule backoff
+  // (`Job.reschedule_backoffs`).
   rpc GetJobInfo (GetJobInfoRequest) returns (GetJobInfoReply);
 
   // Lists rollouts, optionally filtered by job and active status.
@@ -397,7 +400,10 @@ service Manager {
   //
   // Starting an instance that is already live (pending, active, or
   // rescheduling) succeeds as a no-op, so the call is safe to retry even
-  // without an idempotency key.
+  // without an idempotency key. The one exception is a `rescheduling`
+  // instance whose replacement waits out its task's reschedule backoff
+  // (`InstanceInfo.reschedule_backoff`): the backoff is lifted and the
+  // replacement placed now. A repeat finds no backoff and is the no-op.
   //
   // A running session (docs/session-mode.md) is live too, and answers the
   // same no-op. A suspended session resumes on the node its id is tagged
@@ -419,8 +425,10 @@ service Manager {
   //   retry, or pass `force_move`).
   // - Aborted: a `store` session's resume lost its generation claim to a
   //   racing resume (`superseded`, naming the winner).
-  // - InvalidArgument: the instance is slot-mode (slot lifecycles are owned
-  //   by the scheduler via `count.num`, not this API).
+  // - InvalidArgument: the instance is slot-mode and not `rescheduling` (slot
+  //   lifecycles are owned by the scheduler via `count.num`, not this API;
+  //   lifting a slot instance's reschedule backoff is the one start it
+  //   takes).
   // - FailedPrecondition: the instance is Terminated (destroyed ids are
   //   tombstoned forever — create a NEW id instead), the owning job is
   //   stopped (run the job first; a stopped job schedules nothing), or a
@@ -917,8 +925,10 @@ service Manager {
   // === VOLUMES (see docs/volumes.md) ===
 
   // Lists volumes, optionally filtered by job, node, driver, instance, or
-  // state. Includes `destroyed` tombstones so an operator can still see where
-  // a job's storage went after it was reclaimed.
+  // state. Live volumes only by default: `destroyed` tombstones are left out
+  // unless the request sets `include_destroyed` or filters on
+  // `state = "destroyed"`, so an operator can still see where a job's storage
+  // went after it was reclaimed.
   //
   // A volume is the concrete storage behind an instance's opaque
   // `{driver}/{volume_id}` storage handle: which driver owns it, which node it
@@ -1005,6 +1015,9 @@ service Manager {
   //   task does not declare an identity named `identity_name`.
   // - PermissionDenied: the allocation exists but is not placed on
   //   `node_id` (a worker may only request tokens for its own allocations).
+  // - Unavailable: this manager has no signing key yet. It is a raft
+  //   follower that started before the leader's key replicated to it, and
+  //   adopts the key within seconds. Retry.
   // - Internal: signing failed.
   rpc IssueWorkloadIdentityToken (IssueWorkloadIdentityTokenRequest)
       returns (IssueWorkloadIdentityTokenReply);
@@ -1030,6 +1043,8 @@ service Manager {
   // - NotFound: no node with `node_id` is registered, or no node identity
   //   named `identity_name` is configured.
   // - PermissionDenied: `node_id` does not match the caller's credential.
+  // - Unavailable: this manager has no signing key yet (see
+  //   IssueWorkloadIdentityToken). Retry.
   // - Internal: signing failed.
   rpc IssueNodeIdentityToken (IssueNodeIdentityTokenRequest)
       returns (IssueNodeIdentityTokenReply);
@@ -1507,8 +1522,37 @@ service Manager {
   rpc GetLedger (GetLedgerRequest) returns (GetLedgerReply);
 
   // Returns config snapshots stored by manager instances.
+  //
+  // A manager writes its snapshot when it starts as, or later becomes, the
+  // control-lane leader, so under raft a manager that has never led has no
+  // snapshot here. For the list of managers in the cluster use
+  // `ListManagers`, which reads the raft membership instead.
   rpc GetManagerConfigs (GetManagerConfigsRequest)
     returns (GetManagerConfigsReply);
+
+  // Lists every manager in the cluster with its raft role, advertised
+  // address, and whether the answering manager can reach it. Backs the UI's
+  // Managers page and `legion raft members`.
+  //
+  // The roster comes from the replicated raft membership (voters and
+  // learners), which every manager holds, so any manager, leader or
+  // follower, answers with the full list. Outside raft mode the reply holds
+  // exactly one entry: the answering manager.
+  //
+  // Reachability is probed live from the answering manager: it calls
+  // `GetRaftStatus` on every other member concurrently, forwarding the
+  // caller's credential, with a short per-member timeout. A member that
+  // does not answer is still listed, with `reachable = false` and the
+  // reason in `probe_error`. Because it is the answering manager's view, a
+  // partitioned manager reports its peers unreachable while the rest of the
+  // cluster reports it unreachable.
+  //
+  // Read-only. Costs one `GetRaftStatus` call per other member.
+  //
+  // ACL: operator:read, unscoped (the roster is cluster-wide). Peers enforce
+  // the same rule on the forwarded credential, so a caller denied there sees
+  // `reachable = false` with a `PermissionDenied` `probe_error`.
+  rpc ListManagers (ListManagersRequest) returns (ListManagersReply);
 
   // Returns observability status and recent manager-side logs/traces.
   rpc GetObservability (GetObservabilityRequest)
@@ -1845,8 +1889,8 @@ service Manager {
   // ACLs are on by default (`acl.enabled = true`). When a manager starts with
   // ACLs on and no management token exists, it mints one itself, as a
   // replicated write on the control-lane leader, and writes the secret to
-  // `<dataDir>/bootstrap-token` (and to `~/.legion/token` when that file does
-  // not exist), both mode 0600. There is no open bootstrap endpoint: the
+  // `<dataDir>/bootstrap-token` and to the CLI token file for the manager's
+  // local address (`~/.legion/tokens/<host>_<port>`), both mode 0600. There is no open bootstrap endpoint: the
   // secret never crosses the network. `acl.bootstrapSecretFile` pre-seeds the
   // secret for infrastructure-as-code. Recovery is "delete the management
   // tokens, then restart the manager".
@@ -2146,6 +2190,14 @@ message WorkerPreRegisterReply {
   //
   // Manager sets this on successful responses.
   WorkerConfig config = 1;
+
+  // The cluster's workload-identity issuer, the same value as
+  // `HeartbeatReply.workload_identity_issuer`: delivered here so a node
+  // that verifies tickets (edge boot, direct exec) knows the `iss` to expect
+  // before its first heartbeat.
+  //
+  // Default: empty when workload identity is disabled on this manager.
+  string workload_identity_issuer = 2;
 }
 
 // Request payload for WorkerRegister.
@@ -3000,6 +3052,10 @@ message PlanJobReply {
   // `observe` mode (what enforce mode *would* evict, given that observe
   // commits nothing) — so the preview answers the same question either way.
   //
+  // A victim younger than `preemption.victimExemptAge` is listed with a
+  // non-zero `eligible_in_seconds` when the guard alone keeps the placement
+  // from fitting: the submit waits that long, then evicts it.
+  //
   // This is a plan against a snapshot, not a reservation. The real submit
   // re-plans, so the victims it takes may differ if the cluster moved in
   // between. See docs/preemption-and-eviction.md.
@@ -3043,6 +3099,18 @@ message PlannedPreemption {
   // The victim's `stop.killAfter` in seconds — how long it gets between the
   // stop signal and SIGKILL (docs/graceful-stop.md).
   uint64 kill_after_seconds = 6;
+
+  // Seconds until the victim ages past `preemption.victimExemptAge` and may
+  // be evicted. 0 for a victim a submit would evict right away.
+  //
+  // Non-zero only when the guard is the one thing between the placement and
+  // room: every victim the placement needs is younger than the guard. The
+  // plan then still shows the placement and these victims, because that is
+  // what the submit converges to. The submit itself waits: its eval retries
+  // once the youngest victim is old enough (`eval.blocked` names the wait),
+  // and evicts then. Before this field, the plan failed with "no available
+  // nodes" in that window while the submit went on to preempt.
+  uint64 eligible_in_seconds = 7;
 }
 
 // How candidate construction went for one planned task — the scheduling
@@ -3476,6 +3544,11 @@ message StartInstanceReply {
   // - `"Instance <id> already running"` — no-op on a live
   //  (pending/active/rescheduling) instance, or on a running session
   //  (docs/session-mode.md).
+  // - `"Retrying instance <id> now: lifted its reschedule backoff"` — the
+  //  instance was `rescheduling` and its replacement was waiting out the
+  //  task's reschedule backoff (`InstanceInfo.reschedule_backoff`); the
+  //  backoff is lifted and a placement queued. The move history stays, so
+  //  another failure backs off from where it was.
   // - `"Resuming instance <id> from <snapshot> on <node>"` — a suspended
   //  instance queued to restore from its checkpoint.
   // - `"Started instance <id> cold ..."` — a suspended instance booting
@@ -3924,8 +3997,10 @@ message InstanceInfo {
   // the session's id. Unset for instances that were never sessions.
   optional string promoted_from = 43;
 
-  // The node running a session (`mode = "session"`). Unset for instances
-  // with a row, whose node is their current allocation's.
+  // The node the instance runs on: its current allocation's node for an
+  // instance with a row, or the node running a session (`mode =
+  // "session"`). Unset when the instance has no current allocation
+  // (pending, rescheduling, stopped, suspended, or terminated).
   optional string node_id = 44;
 
   // When the manager that started the session issued it, RFC 3339. Of two
@@ -3935,6 +4010,68 @@ message InstanceInfo {
 
   // The envelope allocation the session runs inside. Sessions only.
   optional int64 envelope_alloc_id = 46;
+
+  // Set while the instance is `rescheduling` because its last allocation
+  // failed and the replacement waits out the task's reschedule backoff
+  // (`on_unhealthy.move_delay`, doubled per consecutive failure, capped at
+  // 30 minutes; docs/jobs-tasks-and-scheduling.md,
+  // "Manager-side move logic"). No eval places the instance before
+  // `next_attempt_at`. `detail` carries the same facts as a sentence, with
+  // how to retry now: StartInstance lifts the backoff of a keyed instance,
+  // and `legion job run <spec> --force-reschedule` lifts every backoff of
+  // the job. Replicated, so every manager reports it. Unset otherwise.
+  optional RescheduleBackoff reschedule_backoff = 47;
+}
+
+// A failed allocation's replacement waiting out its task's reschedule
+// backoff (InstanceInfo.reschedule_backoff, Job.reschedule_backoffs). The
+// manager records it in the same replicated write that removes the failed
+// allocation, and the scheduler leaves the replacement unplaced until
+// `next_attempt_at`, whatever eval runs for the job in the meantime. The
+// `allocation.reschedule_deferred` event announces each one
+// (docs/event-stream.md).
+message RescheduleBackoff {
+  // The task whose replacement is deferred.
+  string task = 1;
+
+  // The task's group.
+  string group = 2;
+
+  // The stateful instance waiting for the replacement. Empty for a
+  // stateless task.
+  string instance_id = 3;
+
+  // The allocation that failed.
+  int64 allocation_id = 4;
+
+  // The node it failed on. The replacement avoids that node when another
+  // has room.
+  string node_id = 5;
+
+  // How many times in a row the instance (or, for a stateless task, the
+  // task) failed, counting this failure: a failure continues the count
+  // while it comes within `move_period` of the previous replacement's
+  // release, so it resets once a replacement survives a whole period. The
+  // backoff is `move_delay` doubled per earlier failure in the count. The
+  // job's failure budget is separate: with `move_count` set, the job fails
+  // when a failure finds `move_count` moves of the task inside
+  // `move_period`.
+  uint32 attempt = 6;
+
+  // The backoff this failure got, in seconds.
+  uint64 delay_seconds = 7;
+
+  // When the replacement may be placed, RFC 3339 (UTC).
+  string next_attempt_at = 8;
+
+  // Why the allocation failed: the worker's reason (or the memory pressure
+  // response's sentence for an `evict-bursting` eviction), on one line and
+  // cut to 400 characters. The `allocation.failed` event has the full text.
+  string reason = 9;
+
+  // The operator-facing sentence: `attempt 4 failed (<reason>); next
+  // attempt at <time> (backoff 4m)`.
+  string summary = 10;
 }
 
 // One served port of an instance (InstanceInfo.endpoints).
@@ -4711,7 +4848,11 @@ message SnapshotRestore {
   // node content store that carries a `url` (a published snapshot) is
   // fetched first, through the worker's artifact fetchers, opened with its
   // key from `part_keys`, verified against its digest, and stored in the
-  // content store. The allocation shows `staging artifacts` meanwhile.
+  // content store. A `url` under the worker's own `contentStore.url` is
+  // fetched with that worker's `contentStore.auth` (or its ambient AWS
+  // credentials). Any other `url` is fetched anonymously, and a refusal says
+  // the worker has no credential for that store. The allocation shows
+  // `staging artifacts` meanwhile.
   string manifest_json = 3;
 
   // The task's `suspend.onResume` argv. After a memory restore the guest
@@ -4827,7 +4968,7 @@ message VolumeInfo {
 }
 
 // Request payload for ListVolumes. Every filter is optional; omitting all of
-// them lists the whole cluster.
+// them lists every live volume in the cluster.
 message ListVolumesRequest {
   // Only volumes owned by this job.
   optional string job_id = 1;
@@ -4842,8 +4983,15 @@ message ListVolumesRequest {
   optional string instance_id = 4;
 
   // Only volumes in this state (`pending`, `created`, `destroying`,
-  // `destroyed`).
+  // `destroyed`). Asking for `destroyed` returns tombstones whatever
+  // `include_destroyed` says.
   optional string state = 5;
+
+  // Also return `destroyed` tombstones: volumes whose storage the driver
+  // already reclaimed, kept as records of where a job's storage went. Off by
+  // default, so a destroyed instance's volume drops out of the list once its
+  // reclaim is confirmed. `legion volume list --all` sets it.
+  bool include_destroyed = 6;
 }
 
 // Reply payload for ListVolumes.
@@ -5055,6 +5203,15 @@ message Job {
   // what its other placements wait for; with nothing live it reads
   // `blocked`. Unset for a job stopped or failed by its lifecycle.
   optional JobBlocked blocked = 7;
+
+  // Replacements of failed allocations still waiting out their reschedule
+  // backoff, soonest next attempt first (docs/jobs-tasks-and-scheduling.md,
+  // "Manager-side move logic"). A job whose only replica waits here reads
+  // `pending`, and nothing places the replica before its `next_attempt_at`;
+  // `legion job run <spec> --force-reschedule` lifts every backoff of the
+  // job and places them now. Set by GetJobInfo only; ListJobs leaves it
+  // empty.
+  repeated RescheduleBackoff reschedule_backoffs = 8;
 }
 
 // What a blocked job waits for.
@@ -6316,6 +6473,34 @@ message HeartbeatReply {
   // every beat until the node's report no longer lists them. Sessions the
   // node does not run are ignored.
   repeated string stop_sessions = 19;
+
+  // Allocation ids from the request's `terminated_allocations` that this
+  // manager could not record, so the worker must send them again on its
+  // next heartbeat. A terminal report is sent once, and a batch task's
+  // dependents wait on it: dropping one leaves the allocation `placed` and
+  // every `success` or `complete` dependent held forever.
+  //
+  // A report is listed when recording it failed (the write could not reach
+  // the lane leader, say) or when this manager has no row for the
+  // allocation yet, which happens when the heartbeat lands on a replica
+  // that has not applied the placement. A report from a node that does not
+  // own the allocation is never listed. The worker stops re-sending once it
+  // no longer holds the allocation, so a report for an allocation that was
+  // removed for good ends with the allocation.
+  //
+  // Default: empty list.
+  repeated int64 retry_terminated_allocations = 20;
+
+  // The cluster's workload-identity issuer: the `iss` every token and
+  // ticket the managers sign carries (docs/workload-identity.md, "Issuer").
+  // A worker checks boot, session, and exec tickets against this value, not
+  // against the manager address in its join token, so a ticket minted on
+  // any manager verifies on any node. Refreshed every beat, so a changed
+  // `workloadIdentity.issuer` reaches every node within one heartbeat.
+  //
+  // Default: empty when workload identity is disabled on the answering
+  // manager; an empty value leaves the worker's expected issuer unchanged.
+  string workload_identity_issuer = 21;
 }
 
 // Why one allocation is being stopped.
@@ -7350,6 +7535,92 @@ message GetManagerConfigsReply {
 
   // Page size used to produce this reply.
   uint32 page_size = 4;
+}
+
+// Request payload for ListManagers. No parameters: the roster is small
+// (raft clusters run 1, 3, or 5 managers) and returned whole.
+message ListManagersRequest {}
+
+// One manager in the cluster, as the answering manager sees it.
+message ManagerMember {
+  // The manager's identity. Under raft this is its raft node id
+  // (`persistence.raft.nodeId`); outside raft it is the manager's listener
+  // `host:port`. Matches `ManagerNodeConfig.node_id` for the manager's
+  // config snapshot.
+  string node_id = 1;
+
+  // The manager's advertised `host:port`: its raft advertise address, which
+  // is also its API listener. Outside raft, the host and port of
+  // `server.advertiseAddr` (or the listener address).
+  string advertise_addr = 2;
+
+  // Raft role, per the answering manager's replicated membership:
+  //
+  // - `leader`: leads the control lane (membership, joins, config).
+  // - `follower`: a settled voter that does not lead the control lane.
+  // - `learner`: a non-voting member, or a joiner whose promotion to voter
+  //   has not settled on every lane yet.
+  // - `standalone`: outside raft mode (local_disk or streaming persistence).
+  //
+  // Under `topology = "lanes"`, check `leader_lanes` for the lanes a
+  // manager leads, which can differ from the control lane during a
+  // leadership change.
+  string role = 3;
+
+  // True when the manager is a settled voter on every active lane (the same
+  // rule as `RaftStatus.voters`). Always false outside raft mode.
+  bool voter = 4;
+
+  // Raft lanes this manager leads, by wire name (`control`, `scheduler`,
+  // `status`). Under the default `single` topology this is `["control"]` for
+  // the leader and empty for everyone else. Empty outside raft mode.
+  repeated string leader_lanes = 5;
+
+  // True for the manager that answered this request.
+  bool is_self = 6;
+
+  // Whether the answering manager reached this manager just now. Always
+  // true for the answering manager itself.
+  bool reachable = 7;
+
+  // Why the probe failed, when `reachable` is false. Examples: a timeout,
+  // `Unavailable` (connection refused), or `PermissionDenied`.
+  optional string probe_error = 8;
+
+  // Round-trip time of the probe in milliseconds, when it succeeded.
+  // Absent for the answering manager itself.
+  optional uint64 probe_latency_ms = 9;
+
+  // The raft term the manager reports for itself, when reachable. A member
+  // on an older term than its peers has missed an election. Absent outside
+  // raft mode.
+  optional uint64 term = 10;
+
+  // The latest log index the manager reports it has applied, when
+  // reachable. Compare across members to see replication lag. Absent
+  // outside raft mode.
+  optional uint64 applied_index = 11;
+
+  // When this manager's config snapshot was last written, if it has one
+  // (`GetManagerConfigs`). Absent for a manager that has never led under
+  // raft. Same format as `ManagerNodeConfig.updated_at`.
+  optional string config_updated_at = 12;
+}
+
+// Reply payload for ListManagers.
+message ListManagersReply {
+  // Every manager, sorted by `node_id`. Outside raft mode, exactly the
+  // answering manager. Under raft, the members of the answering manager's
+  // replicated membership, which is empty only while its raft engine is
+  // still starting.
+  repeated ManagerMember managers = 1;
+
+  // Persistence backend of the answering manager: `raft`, `local_disk`, or
+  // `streaming`.
+  string persistence_backend = 2;
+
+  // `node_id` of the manager that answered.
+  string answered_by = 3;
 }
 
 // Request payload for GetSchedulerConcurrency. No parameters: the controller

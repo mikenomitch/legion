@@ -73,7 +73,7 @@ pub fn config() -> Command {
         .arg(json_flag())
 }
 
-#[instrument(err, skip_all)]
+#[instrument(skip_all)]
 pub async fn handle(matches: &ArgMatches) -> R<()> {
     let mut client = connect_manager_client().await?;
     let request = tonic::Request::new(GetLedgerRequest {});
