@@ -1179,7 +1179,7 @@ pub fn config() -> Command {
 }
 
 /// Handle `legion capabilities`.
-#[instrument(err, skip_all)]
+#[instrument(skip_all)]
 pub async fn handle(matches: &ArgMatches) -> R<()> {
     let format = OutputFormat::from_matches(matches);
     let caps = catalog();

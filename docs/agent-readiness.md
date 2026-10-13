@@ -708,9 +708,11 @@ All client commands and the MCP server read:
 - `LEGION_TLS_CA_CERT`: CA certificate path for `https`/`grpcs` addresses.
 - `LEGION_TOKEN`: ACL token sent as a bearer credential. ACLs are on by
   default, so the CLI and the MCP server need a token for every call. Falls
-  back to the token file, `~/.legion/token` (`$LEGION_TOKEN_FILE` overrides
-  the path), which `legion login` writes and which a manager writes at first
-  start for the user running it. An MCP server started on the manager's own
+  back to the token file for the manager's address,
+  `~/.legion/tokens/<host>_<port>` (`$LEGION_TOKEN_FILE` overrides the path),
+  which `legion login` writes and which a manager writes at first start for
+  the user running it. On `Unauthenticated`, `error.hint` names the file and
+  address the CLI used. An MCP server started on the manager's own
   machine therefore works with nothing set. Elsewhere, give it a scoped token,
   not the management token. A call with no token fails with
   `Unauthenticated` and a hint naming `<dataDir>/bootstrap-token`. On a

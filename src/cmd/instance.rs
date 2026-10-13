@@ -455,7 +455,7 @@ pub fn config() -> Command {
         .subcommand(get_cmd)
 }
 
-#[instrument(err, skip_all)]
+#[instrument(skip_all)]
 pub async fn handle(sub_matches: &ArgMatches) -> R<()> {
     match sub_matches.subcommand() {
         Some(("create", arg_matches)) => create_instance(arg_matches).await,
@@ -472,7 +472,7 @@ pub async fn handle(sub_matches: &ArgMatches) -> R<()> {
     }
 }
 
-#[instrument(err, skip_all)]
+#[instrument(skip_all)]
 async fn create_instance(arg_matches: &ArgMatches) -> R<()> {
     let format = OutputFormat::from_matches(arg_matches);
     let job = arg_matches
@@ -578,7 +578,7 @@ async fn create_instance(arg_matches: &ArgMatches) -> R<()> {
     Ok(())
 }
 
-#[instrument(err, skip_all)]
+#[instrument(skip_all)]
 async fn fork_instance(arg_matches: &ArgMatches) -> R<()> {
     let format = OutputFormat::from_matches(arg_matches);
     let id = arg_matches
@@ -687,7 +687,7 @@ async fn fork_instance(arg_matches: &ArgMatches) -> R<()> {
     Ok(())
 }
 
-#[instrument(err, skip_all)]
+#[instrument(skip_all)]
 async fn promote_instance(arg_matches: &ArgMatches) -> R<()> {
     let format = OutputFormat::from_matches(arg_matches);
     let session = arg_matches
@@ -737,7 +737,7 @@ async fn promote_instance(arg_matches: &ArgMatches) -> R<()> {
     Ok(())
 }
 
-#[instrument(err, skip_all)]
+#[instrument(skip_all)]
 async fn stop_instance(arg_matches: &ArgMatches) -> R<()> {
     let format = OutputFormat::from_matches(arg_matches);
     let id = arg_matches
@@ -768,7 +768,7 @@ async fn stop_instance(arg_matches: &ArgMatches) -> R<()> {
     Ok(())
 }
 
-#[instrument(err, skip_all)]
+#[instrument(skip_all)]
 async fn start_instance(arg_matches: &ArgMatches) -> R<()> {
     let format = OutputFormat::from_matches(arg_matches);
     let id = arg_matches
@@ -863,7 +863,7 @@ async fn start_instance(arg_matches: &ArgMatches) -> R<()> {
     Ok(())
 }
 
-#[instrument(err, skip_all)]
+#[instrument(skip_all)]
 async fn suspend_instance(arg_matches: &ArgMatches) -> R<()> {
     let format = OutputFormat::from_matches(arg_matches);
     let id = arg_matches
@@ -1010,7 +1010,7 @@ async fn wait_for_instance(
     }
 }
 
-#[instrument(err, skip_all)]
+#[instrument(skip_all)]
 async fn destroy_instance(arg_matches: &ArgMatches) -> R<()> {
     let format = OutputFormat::from_matches(arg_matches);
     let id = arg_matches
@@ -1041,7 +1041,7 @@ async fn destroy_instance(arg_matches: &ArgMatches) -> R<()> {
     Ok(())
 }
 
-#[instrument(err, skip_all)]
+#[instrument(skip_all)]
 async fn replace_instance(arg_matches: &ArgMatches) -> R<()> {
     let format = OutputFormat::from_matches(arg_matches);
     let id = arg_matches
@@ -1072,7 +1072,7 @@ async fn replace_instance(arg_matches: &ArgMatches) -> R<()> {
     Ok(())
 }
 
-#[instrument(err, skip_all)]
+#[instrument(skip_all)]
 async fn list_instances(arg_matches: &ArgMatches) -> R<()> {
     let format = OutputFormat::from_matches(arg_matches);
     let job = arg_matches
@@ -1157,7 +1157,7 @@ async fn list_instances(arg_matches: &ArgMatches) -> R<()> {
     Ok(())
 }
 
-#[instrument(err, skip_all)]
+#[instrument(skip_all)]
 async fn get_instance(arg_matches: &ArgMatches) -> R<()> {
     let format = OutputFormat::from_matches(arg_matches);
     let id = arg_matches

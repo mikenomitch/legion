@@ -1887,8 +1887,8 @@ service Manager {
   // ACLs are on by default (`acl.enabled = true`). When a manager starts with
   // ACLs on and no management token exists, it mints one itself, as a
   // replicated write on the control-lane leader, and writes the secret to
-  // `<dataDir>/bootstrap-token` (and to `~/.legion/token` when that file does
-  // not exist), both mode 0600. There is no open bootstrap endpoint: the
+  // `<dataDir>/bootstrap-token` and to the CLI token file for the manager's
+  // local address (`~/.legion/tokens/<host>_<port>`), both mode 0600. There is no open bootstrap endpoint: the
   // secret never crosses the network. `acl.bootstrapSecretFile` pre-seeds the
   // secret for infrastructure-as-code. Recovery is "delete the management
   // tokens, then restart the manager".

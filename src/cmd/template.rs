@@ -234,7 +234,7 @@ struct VariablePrint {
     options: String,
 }
 
-#[instrument(err, skip_all)]
+#[instrument(skip_all)]
 async fn create_template(matches: &ArgMatches) -> R<()> {
     let format = OutputFormat::from_matches(matches);
     let name = required_name(matches);
@@ -299,7 +299,7 @@ async fn create_template(matches: &ArgMatches) -> R<()> {
     Ok(())
 }
 
-#[instrument(err, skip_all)]
+#[instrument(skip_all)]
 async fn list_templates(matches: &ArgMatches) -> R<()> {
     let format = OutputFormat::from_matches(matches);
     let mut client = connect_manager_client().await?;
@@ -335,7 +335,7 @@ async fn list_templates(matches: &ArgMatches) -> R<()> {
     Ok(())
 }
 
-#[instrument(err, skip_all)]
+#[instrument(skip_all)]
 async fn get_template(matches: &ArgMatches) -> R<()> {
     let format = OutputFormat::from_matches(matches);
     let mut client = connect_manager_client().await?;
@@ -407,7 +407,7 @@ async fn get_template(matches: &ArgMatches) -> R<()> {
     Ok(())
 }
 
-#[instrument(err, skip_all)]
+#[instrument(skip_all)]
 async fn render_template(matches: &ArgMatches) -> R<()> {
     let format = OutputFormat::from_matches(matches);
     let variables_json = variables_json_from_matches(matches, format)?;
@@ -438,7 +438,7 @@ async fn render_template(matches: &ArgMatches) -> R<()> {
     Ok(())
 }
 
-#[instrument(err, skip_all)]
+#[instrument(skip_all)]
 async fn run_template(matches: &ArgMatches) -> R<()> {
     let format = OutputFormat::from_matches(matches);
     let variables_json = variables_json_from_matches(matches, format)?;
@@ -488,7 +488,7 @@ async fn run_template(matches: &ArgMatches) -> R<()> {
     Ok(())
 }
 
-#[instrument(err, skip_all)]
+#[instrument(skip_all)]
 async fn delete_template(matches: &ArgMatches) -> R<()> {
     let format = OutputFormat::from_matches(matches);
     let mut client = connect_manager_client().await?;

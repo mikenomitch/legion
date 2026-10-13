@@ -785,7 +785,8 @@ pub fn enforce(
         return Err(Status::unauthenticated(format!(
             "{}:{} requires a token, and no token was provided\n\
              Hint: set LEGION_TOKEN or run `legion login`. On the manager's machine, the \
-             initial management token is in <dataDir>/bootstrap-token and ~/.legion/token",
+             initial management token is in <dataDir>/bootstrap-token and \
+             ~/.legion/tokens/<host>_<port>",
             resource.as_str(),
             action.as_str(),
         )));

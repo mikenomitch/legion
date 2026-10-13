@@ -475,7 +475,7 @@ pub(crate) async fn wait_for_convergence(
     }
 }
 
-#[instrument(err, skip_all)]
+#[instrument(skip_all)]
 async fn wait_job(arg_matches: &ArgMatches) -> R<()> {
     let format = OutputFormat::from_matches(arg_matches);
     let job_name = arg_matches
@@ -499,7 +499,7 @@ async fn wait_job(arg_matches: &ArgMatches) -> R<()> {
     Ok(())
 }
 
-#[instrument(err, skip_all)]
+#[instrument(skip_all)]
 async fn validate_job(arg_matches: &ArgMatches) -> R<()> {
     let format = OutputFormat::from_matches(arg_matches);
     let path = arg_matches
@@ -615,7 +615,7 @@ fn speculative_start_warnings(config: &JobConfig) -> Vec<String> {
         .collect()
 }
 
-#[instrument(err, skip_all)]
+#[instrument(skip_all)]
 async fn job_schema(arg_matches: &ArgMatches) -> R<()> {
     let format = OutputFormat::from_matches(arg_matches);
     let schema = build_jobspec_schema();
@@ -1138,7 +1138,7 @@ struct RolloutPrint {
     pub incomplete: bool,
 }
 
-#[instrument(err, skip_all)]
+#[instrument(skip_all)]
 async fn job_logs(arg_matches: &ArgMatches) -> R<()> {
     let format = OutputFormat::from_matches(arg_matches);
     let name = arg_matches.get_one::<String>("name").cloned();
@@ -1724,7 +1724,7 @@ mod tests {
     }
 }
 
-#[instrument(err, skip_all)]
+#[instrument(skip_all)]
 async fn stop_job(arg_matches: &ArgMatches) -> R<()> {
     let format = OutputFormat::from_matches(arg_matches);
     let mut client = connect_manager_client().await?;
@@ -1758,7 +1758,7 @@ async fn stop_job(arg_matches: &ArgMatches) -> R<()> {
 /// `legion job scale <NAME> [--count N | --reset]` (docs/autoscaling.md):
 /// with `--count`/`--reset` it calls ScaleTask; with neither it prints the
 /// job's scale status (spec vs override vs effective, per task).
-#[instrument(err, skip_all)]
+#[instrument(skip_all)]
 async fn scale_job(arg_matches: &ArgMatches) -> R<()> {
     let format = OutputFormat::from_matches(arg_matches);
     let mut client = connect_manager_client().await?;
@@ -1850,7 +1850,7 @@ async fn scale_job(arg_matches: &ArgMatches) -> R<()> {
     Ok(())
 }
 
-#[instrument(err, skip_all)]
+#[instrument(skip_all)]
 async fn get_job_spec(arg_matches: &ArgMatches) -> R<()> {
     let format = OutputFormat::from_matches(arg_matches);
 
@@ -1885,7 +1885,7 @@ async fn get_job_spec(arg_matches: &ArgMatches) -> R<()> {
     Ok(())
 }
 
-#[instrument(err, skip_all)]
+#[instrument(skip_all)]
 async fn destroy_job(arg_matches: &ArgMatches) -> R<()> {
     let format = OutputFormat::from_matches(arg_matches);
     let mut client = connect_manager_client().await?;
@@ -1920,7 +1920,7 @@ async fn destroy_job(arg_matches: &ArgMatches) -> R<()> {
     Ok(())
 }
 
-#[instrument(err, skip_all)]
+#[instrument(skip_all)]
 async fn plan_job(arg_matches: &ArgMatches) -> R<()> {
     let format = OutputFormat::from_matches(arg_matches);
     let mut client = connect_manager_client().await?;
@@ -2082,7 +2082,7 @@ async fn plan_job(arg_matches: &ArgMatches) -> R<()> {
     Ok(())
 }
 
-#[instrument(err, skip_all)]
+#[instrument(skip_all)]
 async fn run_job(arg_matches: &ArgMatches) -> R<()> {
     let format = OutputFormat::from_matches(arg_matches);
     let mut client = connect_manager_client().await?;
@@ -2142,7 +2142,7 @@ async fn run_job(arg_matches: &ArgMatches) -> R<()> {
     Ok(())
 }
 
-#[instrument(err, skip_all)]
+#[instrument(skip_all)]
 async fn list_jobs(arg_matches: &ArgMatches) -> R<()> {
     let format = OutputFormat::from_matches(arg_matches);
 
@@ -2168,7 +2168,7 @@ async fn list_jobs(arg_matches: &ArgMatches) -> R<()> {
     Ok(())
 }
 
-#[instrument(err, skip_all)]
+#[instrument(skip_all)]
 async fn list_rollouts(arg_matches: &ArgMatches) -> R<()> {
     let format = OutputFormat::from_matches(arg_matches);
     let active_only = arg_matches.get_flag("active");
@@ -2212,7 +2212,7 @@ async fn list_rollouts(arg_matches: &ArgMatches) -> R<()> {
     Ok(())
 }
 
-#[instrument(err, skip_all)]
+#[instrument(skip_all)]
 async fn advance_rollout_cmd(arg_matches: &ArgMatches) -> R<()> {
     let rollout_id = *arg_matches
         .get_one::<i64>("id")
@@ -2284,7 +2284,7 @@ struct RolloutEventPrint {
     message: String,
 }
 
-#[instrument(err, skip_all)]
+#[instrument(skip_all)]
 async fn rollout_status_cmd(arg_matches: &ArgMatches) -> R<()> {
     let rollout_id = *arg_matches
         .get_one::<i64>("id")
@@ -2390,7 +2390,7 @@ async fn rollout_status_cmd(arg_matches: &ArgMatches) -> R<()> {
     Ok(())
 }
 
-#[instrument(err, skip_all)]
+#[instrument(skip_all)]
 async fn rollout_events_cmd(arg_matches: &ArgMatches) -> R<()> {
     let rollout_id = *arg_matches
         .get_one::<i64>("id")
@@ -2461,7 +2461,7 @@ fn reschedule_backoff_lines(backoffs: &[crate::structs::RescheduleBackoff]) -> V
     lines
 }
 
-#[instrument(err, skip_all)]
+#[instrument(skip_all)]
 async fn get_info(arg_matches: &ArgMatches) -> R<()> {
     let format = OutputFormat::from_matches(arg_matches);
 

@@ -131,7 +131,7 @@ pub fn config() -> Command {
         .subcommand(patch_cmd)
 }
 
-#[instrument(err, skip_all)]
+#[instrument(skip_all)]
 pub async fn handle(sub_matches: &ArgMatches) -> R<()> {
     match sub_matches.subcommand() {
         Some(("put", arg_matches)) => {
@@ -234,7 +234,7 @@ struct KvEntryPrint {
     updated_at: String,
 }
 
-#[instrument(err, skip_all)]
+#[instrument(skip_all)]
 async fn put_kv(
     key: &str,
     value: &str,
@@ -266,7 +266,7 @@ async fn put_kv(
     Ok(())
 }
 
-#[instrument(err, skip_all)]
+#[instrument(skip_all)]
 async fn get_kv(key: &str, format: OutputFormat) -> R<()> {
     let mut client = connect_manager_client().await?;
     let request = GetKvRequest {
@@ -305,7 +305,7 @@ fn missing_key_error(key: &str) -> CliError {
     )
 }
 
-#[instrument(err, skip_all)]
+#[instrument(skip_all)]
 async fn list_kv(prefix: &str, include_values: bool, format: OutputFormat) -> R<()> {
     let mut client = connect_manager_client().await?;
     let request = ListKvRequest {
@@ -337,7 +337,7 @@ async fn list_kv(prefix: &str, include_values: bool, format: OutputFormat) -> R<
     Ok(())
 }
 
-#[instrument(err, skip_all)]
+#[instrument(skip_all)]
 async fn delete_kv(
     key: &str,
     expected_version: Option<i64>,
@@ -364,7 +364,7 @@ async fn delete_kv(
     Ok(())
 }
 
-#[instrument(err, skip_all)]
+#[instrument(skip_all)]
 async fn patch_kv(
     key: &str,
     patch: &str,

@@ -121,35 +121,99 @@ fn parse_timeout(var: &str, raw: Option<&str>, default: Duration) -> R<Option<Du
     Ok((!duration.is_zero()).then_some(duration))
 }
 
-/// Path of the CLI token file written by `legion login`.
+/// The manager address the CLI talks to: `LEGION_ADDR`, else
+/// `http://127.0.0.1:4747`.
+pub fn manager_address() -> String {
+    std::env::var("LEGION_ADDR").unwrap_or_else(|_| DEF_MANAGER_ADDRESS.to_owned())
+}
+
+/// A manager address as a token-file name: `host_port`, so
+/// `http://127.0.0.1:4747` is `127.0.0.1_4747`. The scheme is dropped (http
+/// and https on one port are one manager), a missing port is the scheme's
+/// default, and anything outside `[A-Za-z0-9.-]` becomes `_`, so an IPv6
+/// address or a typo can never name a path outside the tokens directory.
+pub fn token_file_key(address: &str) -> String {
+    let host_port = match address.parse::<http::Uri>() {
+        Ok(uri) if uri.host().is_some() => {
+            let host = uri.host().unwrap_or_default().trim_matches(['[', ']']);
+            let port = uri.port_u16().unwrap_or(match uri.scheme_str() {
+                Some("https" | "grpcs") => 443,
+                _ => 80,
+            });
+            format!("{host}_{port}")
+        }
+        _ => address.to_string(),
+    };
+    host_port
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '.' || c == '-' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
+/// Path of the stored CLI token for the manager at `address`: the file
+/// `legion login` writes, and the one a manager's first start writes the
+/// initial management token to.
 ///
-/// Override with `LEGION_TOKEN_FILE`; defaults to `~/.legion/token`.
-pub fn cli_token_path() -> std::path::PathBuf {
+/// Tokens are kept per manager address (`~/.legion/tokens/<host>_<port>`) so
+/// two clusters on one machine never present each other's token.
+/// `LEGION_TOKEN_FILE` names one file for every address instead.
+pub fn cli_token_path(address: &str) -> std::path::PathBuf {
     if let Ok(path) = std::env::var("LEGION_TOKEN_FILE") {
         return std::path::PathBuf::from(path);
     }
     let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
-    std::path::Path::new(&home).join(".legion").join("token")
+    std::path::Path::new(&home)
+        .join(".legion")
+        .join("tokens")
+        .join(token_file_key(address))
 }
 
-/// Resolves the ACL token for outgoing requests: `LEGION_TOKEN` env var
-/// first (CI-friendly), then the `legion login` token file.
-pub fn load_cli_token() -> Option<String> {
+/// Where the token the CLI presents came from, kept so an `Unauthenticated`
+/// reply can say which credential the manager rejected.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum TokenSource {
+    /// The `LEGION_TOKEN` environment variable.
+    Env,
+    /// The stored token file for the manager's address.
+    File(std::path::PathBuf),
+    /// No token: `LEGION_TOKEN` is unset and this file does not exist.
+    Missing(std::path::PathBuf),
+}
+
+/// The manager address and token source of the last client this process
+/// built, for [`presented_token_note`].
+static PRESENTED_TOKEN: std::sync::Mutex<Option<(String, TokenSource)>> =
+    std::sync::Mutex::new(None);
+
+/// Resolves the ACL token for requests to `address`: the `LEGION_TOKEN` env
+/// var first (CI-friendly), then the stored token for that address.
+pub fn load_cli_token(address: &str) -> (Option<String>, TokenSource) {
     if let Ok(token) = std::env::var("LEGION_TOKEN") {
         let token = token.trim().to_string();
         if !token.is_empty() {
-            return Some(token);
+            return (Some(token), TokenSource::Env);
         }
     }
-    std::fs::read_to_string(cli_token_path())
+    let path = cli_token_path(address);
+    match std::fs::read_to_string(&path)
         .ok()
         .map(|raw| raw.trim().to_string())
         .filter(|token| !token.is_empty())
+    {
+        Some(token) => (Some(token), TokenSource::File(path)),
+        None => (None, TokenSource::Missing(path)),
+    }
 }
 
-/// Persists a token for future CLI invocations (0600 on unix).
-pub fn save_cli_token(secret: &str) -> R<std::path::PathBuf> {
-    let path = cli_token_path();
+/// Persists a token for future CLI calls to `address` (0600 on unix).
+pub fn save_cli_token(address: &str, secret: &str) -> R<std::path::PathBuf> {
+    let path = cli_token_path(address);
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("failed to create {}", parent.display()))?;
@@ -165,26 +229,61 @@ pub fn save_cli_token(secret: &str) -> R<std::path::PathBuf> {
     Ok(path)
 }
 
-fn auth_interceptor(request_timeout: Option<Duration>) -> AuthInterceptor {
-    let token = load_cli_token().and_then(|token| {
-        match format!("Bearer {token}").parse::<MetadataValue<Ascii>>() {
-            Ok(value) => Some(value),
-            Err(_) => {
-                warn!("Ignoring LEGION_TOKEN with non-ASCII characters");
-                None
-            }
-        }
-    });
+/// What the CLI presented to the manager, for the hint on an
+/// `Unauthenticated` reply; `None` when no client was built.
+pub fn presented_token_note() -> Option<String> {
+    let presented = PRESENTED_TOKEN.lock().ok()?.clone()?;
+    Some(token_note(&presented.0, &presented.1))
+}
+
+/// The hint for an `Unauthenticated` reply from `address`, naming the
+/// credential the CLI sent: a token from another cluster and a revoked one
+/// look the same from the manager's side.
+fn token_note(address: &str, source: &TokenSource) -> String {
+    match source {
+        TokenSource::Env => format!(
+            "the CLI sent LEGION_TOKEN to {address}, which does not accept it; unset it to use \
+             the stored token, or set it to a token this cluster issued"
+        ),
+        TokenSource::File(path) => format!(
+            "the CLI sent the token stored for {address} in {}, which this manager does not \
+             accept (revoked, expired, or issued by another cluster); run `legion login`, set \
+             LEGION_TOKEN, or on the manager's machine use <dataDir>/bootstrap-token",
+            path.display()
+        ),
+        TokenSource::Missing(path) => format!(
+            "the CLI has no token for {address}: LEGION_TOKEN is unset and {} does not exist; \
+             run `legion login`, set LEGION_TOKEN, or on the manager's machine use \
+             <dataDir>/bootstrap-token",
+            path.display()
+        ),
+    }
+}
+
+fn auth_interceptor(address: &str, request_timeout: Option<Duration>) -> AuthInterceptor {
+    let (token, source) = load_cli_token(address);
+    if let Ok(mut presented) = PRESENTED_TOKEN.lock() {
+        *presented = Some((address.to_string(), source));
+    }
+    let token =
+        token.and_then(
+            |token| match format!("Bearer {token}").parse::<MetadataValue<Ascii>>() {
+                Ok(value) => Some(value),
+                Err(_) => {
+                    warn!("Ignoring an ACL token with non-ASCII characters");
+                    None
+                }
+            },
+        );
     AuthInterceptor {
         token,
         request_timeout,
     }
 }
 
-#[instrument(err, skip_all)]
+#[instrument(skip_all)]
 pub async fn connect_manager_client() -> R<AuthedManagerClient> {
-    let address = std::env::var("LEGION_ADDR").unwrap_or_else(|_| DEF_MANAGER_ADDRESS.to_owned());
-    connect_manager_client_at(&address, ClientTimeouts::from_env()?)
+    connect_manager_client_at(&manager_address(), ClientTimeouts::from_env()?)
 }
 
 /// A client for the manager at `address`. The connection opens on the first
@@ -232,7 +331,7 @@ fn connect_manager_client_at(address: &str, timeouts: ClientTimeouts) -> R<Authe
     let channel = endpoint.connect_lazy();
     Ok(ManagerClient::with_interceptor(
         channel,
-        auth_interceptor(timeouts.request),
+        auth_interceptor(&address, timeouts.request),
     ))
 }
 
@@ -307,6 +406,15 @@ pub fn split_hint(message: &str) -> (&str, Option<&str>) {
     }
 }
 
+/// For an `Unauthenticated` reply, the hint naming the token the CLI sent
+/// (and so which file to fix). It replaces the server's hint: the manager
+/// cannot know which file the token came from.
+pub fn unauthenticated_hint(code: tonic::Code) -> Option<String> {
+    (code == tonic::Code::Unauthenticated)
+        .then(presented_token_note)
+        .flatten()
+}
+
 pub fn friendly_status(action: &str, status: Status) -> anyhow::Error {
     let status = crate::cmd::output::client_side_failure(&status).unwrap_or(status);
     let code_raw = status.code();
@@ -319,7 +427,7 @@ pub fn friendly_status(action: &str, status: Status) -> anyhow::Error {
     } else {
         format!("{action}: {message}")
     };
-    if let Some(hint) = server_hint {
+    if let Some(hint) = unauthenticated_hint(code_raw).or(server_hint.map(str::to_string)) {
         return anyhow!("{description} [code={code}]\nHint: {hint}");
     }
 
@@ -430,6 +538,44 @@ mod tests {
     use crate::structs::ListJobsRequest;
     use std::convert::Infallible;
     use std::task::{Context, Poll};
+
+    #[test]
+    fn token_files_are_keyed_by_manager_address_test() {
+        assert_eq!(token_file_key("http://127.0.0.1:4747"), "127.0.0.1_4747");
+        // http and https on one port are one manager.
+        assert_eq!(token_file_key("https://127.0.0.1:4747"), "127.0.0.1_4747");
+        assert_eq!(
+            token_file_key("http://manager.example.com:4757/"),
+            "manager.example.com_4757"
+        );
+        assert_eq!(
+            token_file_key("https://legion.internal"),
+            "legion.internal_443"
+        );
+        assert_eq!(token_file_key("http://[::1]:4747"), "__1_4747");
+        // Whatever the input, the key stays one path component.
+        let odd = token_file_key("../../etc/passwd");
+        assert!(!odd.contains('/'), "{odd}");
+    }
+
+    #[test]
+    fn the_unauthenticated_hint_names_the_token_file_and_address_test() {
+        let path = std::path::PathBuf::from("/home/me/.legion/tokens/127.0.0.1_4757");
+        let sent = token_note("http://127.0.0.1:4757", &TokenSource::File(path.clone()));
+        assert!(
+            sent.contains("/home/me/.legion/tokens/127.0.0.1_4757"),
+            "{sent}"
+        );
+        assert!(sent.contains("http://127.0.0.1:4757"), "{sent}");
+        assert!(sent.contains("legion login"), "{sent}");
+
+        let missing = token_note("http://127.0.0.1:4757", &TokenSource::Missing(path));
+        assert!(missing.contains("does not exist"), "{missing}");
+        assert!(missing.contains("bootstrap-token"), "{missing}");
+
+        let env = token_note("http://127.0.0.1:4757", &TokenSource::Env);
+        assert!(env.contains("LEGION_TOKEN"), "{env}");
+    }
 
     /// A manager whose handlers never return: the shape of one whose raft
     /// core died, where reads wait on a leader that never comes.

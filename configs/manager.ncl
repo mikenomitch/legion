@@ -361,7 +361,7 @@
   },
   # Auth & ACLs (on by default; see docs/auth-and-acls.md). At first start
   # the manager mints the initial management token itself and writes it to
-  # <dataDir>/bootstrap-token and, when absent, ~/.legion/token (mode 0600),
+  # <dataDir>/bootstrap-token and ~/.legion/tokens/<host>_<port> (mode 0600),
   # so the CLI on this machine works with nothing to set up. Create
   # policies/tokens with `legion acl ...` and introduce workers with
   # `legion join-token create`. `enabled = false` is for throwaway clusters

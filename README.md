@@ -47,8 +47,8 @@ legion start manager --run-worker
 ```
 
 ACLs are on from the first start. The manager mints a management token and
-writes it to `~/.legion/token` (and `.legion/bootstrap-token`), which the CLI
-on this machine reads, so there is nothing to set up. From another machine,
+writes it to `~/.legion/tokens/127.0.0.1_4747` (and `.legion/bootstrap-token`),
+which the CLI on this machine reads, so there is nothing to set up. From another machine,
 export the same secret as `LEGION_TOKEN` (see [Auth & ACLs](docs/auth-and-acls.md)).
 
 In another terminal, write a job. Job specs use [Nickel](https://nickel-lang.org),

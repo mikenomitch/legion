@@ -2,7 +2,7 @@
 //!
 //! Runs the real binary with a config that never mentions `acl`, on an
 //! ephemeral port, with the data dir and CLI token file inside a temp dir so
-//! it never touches a developer's `~/.legion/token`. It checks the plan's
+//! it never touches a developer's `~/.legion/tokens/`. It checks the plan's
 //! acceptance criteria end to end:
 //!
 //! - the manager mints the initial management token at first start and

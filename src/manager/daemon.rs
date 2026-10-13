@@ -335,7 +335,9 @@ pub async fn run_manager_with(
         // mint is a replicated control-lane write, so in raft mode only the
         // control-lane leader does it, now or when it later wins leadership.
         let bootstrap_paths =
-            crate::manager::bootstrap_token::BootstrapTokenPaths::for_this_process();
+            crate::manager::bootstrap_token::BootstrapTokenPaths::for_this_process(
+                &full_config.server.local_address(),
+            );
         let secret_file = full_config.acl.bootstrap_secret_file.clone();
         if is_control_leader {
             let outcome = crate::manager::bootstrap_token::ensure_initial_management_token(

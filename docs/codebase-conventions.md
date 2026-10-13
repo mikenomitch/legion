@@ -30,6 +30,9 @@ This page lists the conventions used across the Legion codebase.
 
 - Prefer `tracing` macros (`info!`, `warn!`, etc.) over `println!` in runtime code.
 - Use `#[instrument]` on significant async or orchestration boundaries.
+- CLI command handlers (`src/cmd/`) use `#[instrument(skip_all)]` without
+  `err`. The binary prints a returned error once, on stderr. An `err` event
+  would print it a second time as a colored tracing line on the console.
 
 ## Serialization and API Surface
 

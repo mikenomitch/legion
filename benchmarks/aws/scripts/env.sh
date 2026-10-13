@@ -488,9 +488,11 @@ wait_for_eval_drain() { # -> settled depth on stdout
 # ACLs are on by default (docs/auth-and-acls.md). The manager that first
 # leads the control lane mints the initial management token into
 # <dataDir>/bootstrap-token; the rig's managers run in /var/lib/legion, so
-# that is /var/lib/legion/.legion/bootstrap-token. Copy it to the ssh user's
-# ~/.legion/token on every control-plane box and on the loadgen, where the
-# CLI and legion-loadgen read it, and export it for local calls.
+# that is /var/lib/legion/.legion/bootstrap-token. The CLI keeps one token
+# file per manager address (~/.legion/tokens/<host>_<port>), so install it
+# under every manager's private address, plus 127.0.0.1_4747 on the
+# control-plane boxes, on each box where the CLI and legion-loadgen run, and
+# export it for local calls.
 rig_install_cli_token() { # rig_install_cli_token
     local token="" ip
     for ip in "${CP_ADDRS[@]}"; do
@@ -502,9 +504,14 @@ rig_install_cli_token() { # rig_install_cli_token
         echo "no manager wrote /var/lib/legion/.legion/bootstrap-token" >&2
         return 1
     }
+    local names="127.0.0.1_4747" cp
+    for cp in "${CP_PRIVATE_IPS[@]}"; do
+        names="$names ${cp}_4747"
+    done
     for ip in "${CP_ADDRS[@]}" "$LOADGEN_ADDR"; do
         printf '%s\n' "$token" |
-            rsh "$ip" "umask 077 && mkdir -p ~/.legion && cat >~/.legion/token"
+            rsh "$ip" "umask 077 && mkdir -p ~/.legion/tokens && t=\$(cat) &&
+                for n in $names; do printf '%s\n' \"\$t\" >~/.legion/tokens/\$n; done"
     done
     LEGION_TOKEN="$token"
     export LEGION_TOKEN

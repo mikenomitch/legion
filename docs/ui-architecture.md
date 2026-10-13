@@ -684,7 +684,8 @@ same rule that a selector never matches a request without that attribute.
   `node:read`).
 - **Logging in.** ACLs are on by default, so a fresh cluster's UI opens on the
   log-in card. Paste the initial management token from
-  `<dataDir>/bootstrap-token` (or `~/.legion/token` on the manager's machine),
+  `<dataDir>/bootstrap-token` (or `~/.legion/tokens/<host>_<port>` on the
+  manager's machine),
   or log in with any configured auth method. The UI does not log in
   automatically on the manager's machine: loopback is exactly where workloads
   live, so being local proves nothing.

@@ -250,6 +250,18 @@ tests/spot-check/mac/build-local.sh                 # spot-check-web:dev and spo
 env LEGION_DATA_DIR=/tmp/legion-sc legion start manager --run-worker -c tests/spot-check/mac/manager.ncl
 ```
 
+ACLs are on, as on any cluster. At first start the manager writes the
+initial management token to `/tmp/legion-sc/bootstrap-token` and to
+`~/.legion/tokens/127.0.0.1_4747`, the file the CLI reads for this address,
+replacing a token an earlier cluster on 4747 left there. If the CLI still
+says `Unauthenticated` (for example because `LEGION_TOKEN` is already set for
+another cluster), its hint names the token it sent. Point it at this
+cluster's token explicitly:
+
+```fish
+set -x LEGION_TOKEN (cat /tmp/legion-sc/bootstrap-token)
+```
+
 In another tab (with `LEGION_ADDR=http://127.0.0.1:4747`, which mise sets):
 
 ```fish

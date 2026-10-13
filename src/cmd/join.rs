@@ -115,7 +115,7 @@ pub fn advertise_addr_arg() -> Arg {
         )
 }
 
-#[instrument(err, skip_all)]
+#[instrument(skip_all)]
 pub async fn handle(arg_matches: &ArgMatches) -> R<()> {
     let token = if arg_matches.get_flag("auto") {
         let ttl = arg_matches
@@ -140,7 +140,7 @@ pub async fn handle(arg_matches: &ArgMatches) -> R<()> {
 
 /// `--auto` convenience: mint a join token through the normal authenticated
 /// API and immediately join with it (requires `node:write` when ACLs are on).
-#[instrument(err, skip_all)]
+#[instrument(skip_all)]
 async fn request_join_token(ttl: &str, worker_type: &str) -> R<String> {
     let mut client = connect_manager_client().await?;
 

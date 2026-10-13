@@ -88,8 +88,8 @@ impl CliError {
         CliError {
             code: legion_code.unwrap_or_else(|| code_name(code).to_string()),
             message,
-            hint: server_hint
-                .map(str::to_string)
+            hint: crate::cmd::helpers::unauthenticated_hint(code)
+                .or_else(|| server_hint.map(str::to_string))
                 .or_else(|| hint_for(code, message_text).map(str::to_string)),
             retryable: is_retryable(code),
         }

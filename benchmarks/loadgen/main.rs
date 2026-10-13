@@ -51,9 +51,10 @@
 //! ```
 //!
 //! Auth and TLS come from the same place the CLI gets them (`LEGION_TOKEN` /
-//! `~/.legion/token`, `LEGION_TLS_CA_CERT`) because it calls the CLI's own
-//! `connect_manager_client()` — one source of truth, so the fast path cannot
-//! drift into talking to the manager differently from the way a user does.
+//! `~/.legion/tokens/<host>_<port>`, `LEGION_TLS_CA_CERT`) because it calls
+//! the CLI's own `connect_manager_client()` — one source of truth, so the
+//! fast path cannot drift into talking to the manager differently from the
+//! way a user does.
 //!
 //! # Modes
 //!

@@ -113,7 +113,7 @@ pub fn config() -> Command {
         .subcommand(list_cmd)
 }
 
-#[instrument(err, skip_all)]
+#[instrument(skip_all)]
 pub async fn handle(sub_matches: &ArgMatches) -> R<()> {
     match sub_matches.subcommand() {
         Some(("create", arg_matches)) => create(arg_matches).await,

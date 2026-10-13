@@ -36,13 +36,13 @@ An explicit setting always wins over the data dir. If your manager config sets
 `storePath`, that path is used whether or not `LEGION_DATA_DIR` is set. The
 shipped `configs/manager.ncl` leaves `storePath` unset so the variable applies.
 
-The CLI's saved login token (`~/.legion/token`) is per-user, not per-process,
-and does not move. Use `LEGION_TOKEN_FILE` to relocate it. A manager writes
-the initial management token there at first start only when the file does not
-exist yet (see [Auth & ACLs](auth-and-acls.md#where-the-initial-token-goes)),
-so a second cluster started from the same account keeps using the first
-cluster's token until you export the second one's `bootstrap-token` as
-`LEGION_TOKEN`.
+The CLI's saved login tokens (`~/.legion/tokens/<host>_<port>`, one per
+manager address) are per-user, not per-process, and do not move. Use
+`LEGION_TOKEN_FILE` to name one file instead. A manager writes the initial
+management token to the file for its own address at first start (see
+[Auth & ACLs](auth-and-acls.md#where-the-initial-token-goes)), so a second
+cluster started from the same account on other ports gets a file of its own,
+and the CLI picks it up when `LEGION_ADDR` points at that cluster.
 
 ## Running two clusters from one checkout
 
