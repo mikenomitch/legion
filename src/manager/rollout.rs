@@ -10,6 +10,7 @@ use serde_json::json;
 use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
 
+use crate::constants::allocation_status_is_terminal;
 use crate::manager::dispatcher::dispatch_allocations;
 use crate::manager::rollout_strategy;
 use crate::manager::scheduler::{PlacementBlocked, PlanMode, Scheduler};
@@ -1553,23 +1554,29 @@ fn retire_old_allocations_for_group(
             continue;
         }
 
-        if matches!(task.lifecycle, TaskLifecycle::Batch) {
-            let Some(kill_after) = plan.config.batch_kill_after else {
-                outcome.blocked = true;
-                continue;
-            };
-
-            let started_at =
-                parse_optional_ts(state.active_step_started_at.as_deref())?.unwrap_or(now);
-            if now - started_at < time::Duration::try_from(kill_after)? {
-                outcome.blocked = true;
-                continue;
+        // The batch retire window: a running old batch allocation is left to
+        // finish until `batchKillAfter` has elapsed in this step (forever when
+        // unset). It only guards work in flight, so it is checked per
+        // allocation below rather than for the whole task.
+        let batch_window_closed = match (&task.lifecycle, plan.config.batch_kill_after) {
+            (TaskLifecycle::Batch, None) => true,
+            (TaskLifecycle::Batch, Some(kill_after)) => {
+                let started_at =
+                    parse_optional_ts(state.active_step_started_at.as_deref())?.unwrap_or(now);
+                now - started_at < time::Duration::try_from(kill_after)?
             }
-        }
+            _ => false,
+        };
 
         let to_remove = (current_old - target_old) as usize;
         let mut old_allocs = task.current_old_allocs.clone();
-        old_allocs.sort_by_key(|alloc| alloc.id);
+        // Finished allocations go first. They run nothing, so retiring one
+        // never cuts work short or costs capacity, and keeping it over a live
+        // one would only shrink what still serves. Before this, a resubmitted
+        // DAG job whose old batch steps had all exited waited on the batch
+        // window forever: every old allocation was finished, none could be
+        // retired, and the new version was never placed.
+        old_allocs.sort_by_key(|alloc| (!allocation_status_is_terminal(&alloc.status), alloc.id));
 
         let sequential = plan
             .sequential_slots
@@ -1615,7 +1622,15 @@ fn retire_old_allocations_for_group(
         // single tick. `remove_allocations` writes the same rows, releases
         // the same instance bindings, bumps the same epochs and stages the
         // same stop notices, in one transaction.
-        let batch: Vec<_> = old_allocs.into_iter().take(to_remove).collect();
+        let mut batch: Vec<_> = old_allocs.into_iter().take(to_remove).collect();
+        if batch_window_closed {
+            let chosen = batch.len();
+            batch.retain(|alloc| allocation_status_is_terminal(&alloc.status));
+            outcome.blocked |= batch.len() < chosen;
+        }
+        if batch.is_empty() {
+            continue;
+        }
         store.remove_allocations(&batch, StopCause::Update)?;
         outcome.removed += batch.len();
         if let Some(indices) = slot_indices.as_ref() {
@@ -2689,6 +2704,224 @@ mod tests {
             .iter()
             .any(|event| event.message == "Manual rollout advance queued"));
 
+        Ok(())
+    }
+
+    /// The spot check's `05-dag.ncl` shape, cut down: two batch steps and a
+    /// service that serves what they built, all in one group.
+    fn dag_job(name: &str, run: &str) -> JobConfig {
+        let after = |task: &str| {
+            vec![crate::structs::TaskDependency {
+                task: task.into(),
+                condition: crate::structs::TaskDependencyCondition::Success,
+            }]
+        };
+        JobConfig {
+            priority: Default::default(),
+            rollout: None,
+            rollout_by_group: Default::default(),
+            name: name.into(),
+            tasks: vec![
+                TaskConfig {
+                    group: "pipeline".into(),
+                    lifecycle: TaskLifecycle::Batch,
+                    config: json!({ "run": run }),
+                    ..TaskConfig::new("fetch", "noop")
+                },
+                TaskConfig {
+                    group: "pipeline".into(),
+                    lifecycle: TaskLifecycle::Batch,
+                    depends_on: after("fetch"),
+                    config: json!({ "run": run }),
+                    ..TaskConfig::new("report", "noop")
+                },
+                TaskConfig {
+                    group: "pipeline".into(),
+                    lifecycle: TaskLifecycle::Service,
+                    depends_on: after("report"),
+                    config: json!({ "run": run }),
+                    ..TaskConfig::new("serve", "noop")
+                },
+            ],
+            version: None,
+        }
+    }
+
+    fn tick(store: &Store, job_id: &str, job_config_id: &str) -> R<String> {
+        handle_rollout_tick(
+            &Eval {
+                id: "e-tick".into(),
+                status: "pending".into(),
+                kind: "rollout_tick".into(),
+                job_id: job_id.into(),
+                job_config_id: job_config_id.into(),
+                node_name: String::new(),
+                priority: 50,
+            },
+            store,
+        )
+    }
+
+    /// The one allocation of `task` on `job_config_id`, if it is placed.
+    fn alloc_of(store: &Store, job_config_id: &str, task: &str) -> R<Option<Allocation>> {
+        let task_id = store
+            .get_task_configs_for_job_config(job_config_id)?
+            .into_iter()
+            .find(|(_, config)| config.name == task)
+            .map(|(id, _)| id)
+            .with_context(|| format!("no task {task}"))?;
+        Ok(store
+            .allocs_for_job_config(job_config_id)?
+            .into_iter()
+            .find(|allocation| allocation.task_config_id == task_id))
+    }
+
+    /// What a worker reports when a task exits 0: the terminal status, and
+    /// the health snapshot the supervisor records for the exit.
+    fn report_exit(store: &Store, allocation: &Allocation) -> R<()> {
+        store.complete_allocation(allocation.id, true)?;
+        store.upsert_allocation_health_snapshots(
+            &allocation.node_id,
+            &[crate::structs::AllocationHealth {
+                allocation_id: allocation.id,
+                healthy: true,
+                status: "exited with status 0".into(),
+                artifact_states: None,
+            }],
+        )?;
+        Ok(())
+    }
+
+    fn create_default_rollout(store: &Store, job: &str, from: &str, to: &str) -> R<Rollout> {
+        store.create_rollout(job, Some(from), to, "pending", None, None, None, None, "{}")
+    }
+
+    /// Regression (spot check, rollout 6 stuck for 10+ minutes on "waiting
+    /// for batch retire window"): resubmitting a DAG job whose old batch
+    /// steps had all finished never progressed. The finished allocations
+    /// still counted as old allocations to retire, and with `batchKillAfter`
+    /// unset the batch retire window refused to retire any batch
+    /// allocation. A finished allocation runs nothing, so it is retired at
+    /// once, and the new version's DAG starts from its roots.
+    #[test]
+    fn rollout_over_finished_batch_steps_retires_them_and_runs_the_new_dag() -> R<()> {
+        let store = setup_store()?;
+        insert_node(&store, "node-a")?;
+        let scheduler = Scheduler::new(&store)?;
+
+        // v1 runs its batch work to the end. Its `serve` is not placed yet:
+        // the resubmit superseded v1 first.
+        let v1 = dag_job("dag-rerun", "1");
+        store.handle_job_submit(&v1, &[submission()])?;
+        let v1_id = store.get_job_config(&v1.name)?.id();
+        let fetch = scheduler.plan_and_apply(&v1_id, PlanMode::Fresh)?;
+        assert_eq!(fetch.allocations.len(), 1, "only fetch is ready");
+        report_exit(&store, &fetch.allocations[0])?;
+        let report = scheduler.plan_and_apply(&v1_id, PlanMode::Reschedule)?;
+        assert_eq!(report.allocations.len(), 1, "report follows fetch");
+        report_exit(&store, &report.allocations[0])?;
+
+        // v2: a new `run`, rolled out with the defaults (destroyFirst, one
+        // step, no batchKillAfter).
+        let v2 = dag_job("dag-rerun", "2");
+        store.handle_job_submit(&v2, &[submission()])?;
+        let v2_id = store.get_job_config(&v2.name)?.id();
+        let rollout = create_default_rollout(&store, &v2.name, &v1_id, &v2_id)?;
+
+        let first = tick(&store, &v2.name, &v2_id)?;
+        assert!(
+            first.contains("retired 2 old allocations"),
+            "finished batch steps retire at once: {first}"
+        );
+        assert!(store.allocs_for_job_config(&v1_id)?.is_empty());
+
+        // The new version starts its DAG from the top: fetch, not report.
+        let second = tick(&store, &v2.name, &v2_id)?;
+        assert!(second.contains("placed 1 replacement"), "{second}");
+        let new_fetch = alloc_of(&store, &v2_id, "fetch")?.context("v2 fetch placed")?;
+        assert!(alloc_of(&store, &v2_id, "report")?.is_none());
+
+        // Each exit releases the next step through the rollout.
+        report_exit(&store, &new_fetch)?;
+        tick(&store, &v2.name, &v2_id)?;
+        let new_report = alloc_of(&store, &v2_id, "report")?.context("v2 report placed")?;
+        report_exit(&store, &new_report)?;
+        // A config under rollout routes its dependents' release through the
+        // rollout (a `rollout_tick`, not a `job_reschedule`), so the tick
+        // must place them: a stuck rollout used to freeze them too.
+        let rollout_ticks = |store: &Store| -> R<usize> {
+            Ok(store
+                .get_evals()?
+                .iter()
+                .filter(|eval| eval.kind == "rollout_tick")
+                .count())
+        };
+        let ticks_before = rollout_ticks(&store)?;
+        assert!(store.queue_dependency_progress(&new_report)?);
+        assert_eq!(rollout_ticks(&store)?, ticks_before + 1);
+        tick(&store, &v2.name, &v2_id)?;
+
+        // The service that depends on the finished batch step is placed.
+        let serve = alloc_of(&store, &v2_id, "serve")?.context("v2 serve placed")?;
+        store.upsert_allocation_health_snapshots(
+            "node-a",
+            &[crate::structs::AllocationHealth {
+                allocation_id: serve.id,
+                healthy: true,
+                status: "healthy".into(),
+                artifact_states: None,
+            }],
+        )?;
+        let advanced = tick(&store, &v2.name, &v2_id)?;
+        assert!(advanced.contains("advanced to step 1"), "{advanced}");
+        let last = tick(&store, &v2.name, &v2_id)?;
+        assert!(last.contains("completed"), "{last}");
+        let rollout = store.get_rollout(rollout.id)?.context("rollout exists")?;
+        assert_eq!(rollout.status, "completed");
+        Ok(())
+    }
+
+    /// The batch retire window still protects batch work that is running:
+    /// a finished old step is retired, a running one is left to finish.
+    #[test]
+    fn rollout_waits_for_running_batch_steps_but_not_finished_ones() -> R<()> {
+        let store = setup_store()?;
+        insert_node(&store, "node-a")?;
+        let scheduler = Scheduler::new(&store)?;
+
+        let v1 = dag_job("dag-midway", "1");
+        store.handle_job_submit(&v1, &[submission()])?;
+        let v1_id = store.get_job_config(&v1.name)?.id();
+        let fetch = scheduler.plan_and_apply(&v1_id, PlanMode::Fresh)?;
+        report_exit(&store, &fetch.allocations[0])?;
+        // `report` is placed and still running when v2 lands.
+        let report = scheduler.plan_and_apply(&v1_id, PlanMode::Reschedule)?;
+        let running_report = report.allocations[0].clone();
+
+        let v2 = dag_job("dag-midway", "2");
+        store.handle_job_submit(&v2, &[submission()])?;
+        let v2_id = store.get_job_config(&v2.name)?.id();
+        create_default_rollout(&store, &v2.name, &v1_id, &v2_id)?;
+
+        let first = tick(&store, &v2.name, &v2_id)?;
+        assert!(first.contains("retired 1 old allocations"), "{first}");
+        let left = store.allocs_for_job_config(&v1_id)?;
+        assert_eq!(
+            left.iter().map(|alloc| alloc.id).collect::<Vec<_>>(),
+            vec![running_report.id],
+            "only the running batch step is left"
+        );
+        let second = tick(&store, &v2.name, &v2_id)?;
+        assert!(
+            second.contains("waiting for batch retire window"),
+            "{second}"
+        );
+
+        // Once it finishes, the rollout retires it and moves on.
+        report_exit(&store, &running_report)?;
+        let third = tick(&store, &v2.name, &v2_id)?;
+        assert!(third.contains("retired 1 old allocations"), "{third}");
+        assert!(store.allocs_for_job_config(&v1_id)?.is_empty());
         Ok(())
     }
 }

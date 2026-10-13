@@ -221,6 +221,18 @@ pub enum ReapOutcome {
     Killed,
 }
 
+/// What a staging thread may do once its fetch returns
+/// ([`WorkerTaskManager::finish_staging`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StagingVerdict {
+    /// Still the allocation's latest staging: start it.
+    Current,
+    /// A re-dispatch with a different payload restaged the allocation.
+    Superseded,
+    /// The allocation was stopped or failed while staging.
+    Gone,
+}
+
 /// A staging job handed to a dedicated thread: everything needed to fetch a
 /// task's artifacts without holding the task-manager lock.
 pub struct StagingJob {
@@ -241,6 +253,9 @@ pub struct StagingJob {
         crate::structs::checkpoint::SnapshotManifest,
         crate::checkpoint_seal::PartKeys,
     )>,
+    /// This staging's entry in [`WorkerTaskManager::staging`]. The thread
+    /// may start the allocation only while it is still the current one.
+    generation: u64,
 }
 
 impl StagingJob {
@@ -643,6 +658,14 @@ pub struct WorkerTaskManager {
     /// [`UnlockedLaunch`]). While listed, the allocation sits in `instances`
     /// as a pid-less placeholder, exactly like one that is staging artifacts.
     launching: HashMap<i64, u64>,
+    /// Allocations whose artifacts a staging thread is fetching, keyed to
+    /// that staging's generation (drawn from `next_launch_generation`). A
+    /// duplicate dispatch of the same payload while listed is ignored, and a
+    /// staging thread whose generation is no longer listed (the allocation
+    /// was stopped, failed, or re-dispatched with a new payload) starts
+    /// nothing: two threads launching one allocation would build its bundle
+    /// in the same directory at once.
+    staging: HashMap<i64, u64>,
     /// Launches stopped or failed while their runtime was still working.
     /// The launch thread tears them down when the runtime call returns, and
     /// the id cannot be launched again until it has.
@@ -785,6 +808,7 @@ impl WorkerTaskManager {
             // constructor runs before the daemon has read that config.
             resources: NodeResourceGovernor::disabled(),
             launching: HashMap::new(),
+            staging: HashMap::new(),
             cancelled_launches: std::collections::HashSet::new(),
             next_launch_generation: 0,
             checkpoints: Default::default(),
@@ -2053,6 +2077,8 @@ impl WorkerTaskManager {
             .allocations
             .get(&allocation_id)
             .is_some_and(crate::task_plugins::allocation_is_gated);
+        // A staging thread still fetching sees this and starts nothing.
+        self.staging.remove(&allocation_id);
         // A launch still inside its runtime call is cancelled rather than
         // destroyed here: its launch thread owns the real instance and tears
         // it down (runtime, volumes, cores) once the call returns.
@@ -2377,6 +2403,8 @@ impl WorkerTaskManager {
         self.terminated.remove(&allocation_id);
         self.restart_history.remove(&allocation_id);
         self.artifact_status.remove(allocation_id);
+        // A staging thread still fetching sees this and starts nothing.
+        self.staging.remove(&allocation_id);
 
         if self.launching.remove(&allocation_id).is_some() {
             // Its runtime is mid-`prepare`/`start` on a launch thread. Tearing
@@ -2768,6 +2796,25 @@ impl WorkerTaskManager {
     /// detect cancellation while they were fetching).
     pub fn is_allocation_active(&self, allocation_id: i64) -> bool {
         self.instances.contains_key(&allocation_id)
+    }
+
+    /// Settle a staging thread's claim to start its allocation: `Current`
+    /// (and no longer staging) when it is still the allocation's latest
+    /// staging, `Superseded` when a re-dispatch started a newer one, and
+    /// `Gone` when the allocation was stopped or failed meanwhile.
+    fn finish_staging(&mut self, allocation_id: i64, generation: u64) -> StagingVerdict {
+        match self.staging.get(&allocation_id) {
+            Some(current) if *current == generation => {
+                self.staging.remove(&allocation_id);
+                if self.instances.contains_key(&allocation_id) {
+                    StagingVerdict::Current
+                } else {
+                    StagingVerdict::Gone
+                }
+            }
+            Some(_) => StagingVerdict::Superseded,
+            None => StagingVerdict::Gone,
+        }
     }
 
     /// Open a live exec session against a local allocation. Resolves the task
@@ -3687,6 +3734,38 @@ impl WorkerTaskManager {
             );
             return Ok(BeginOutcome::InFlight);
         }
+        // The same payload again while its artifacts stage: the heartbeat's
+        // reconcile and a push (or the work stream) each decide to launch
+        // under their own lock, with identity delivery awaited in between,
+        // so both can arrive. Restarting the staging would leave two threads
+        // building one bundle directory, each deleting the other's files.
+        if self.staging.contains_key(&alloc.id)
+            && self.allocations.get(&alloc.id) == Some(&alloc)
+            && self.task_configs.get(&alloc.id) == Some(&task)
+        {
+            debug!(
+                allocation_id = alloc.id,
+                "Allocation already staging; ignoring the duplicate dispatch"
+            );
+            return Ok(BeginOutcome::InFlight);
+        }
+        // The same payload again for an allocation this node already runs:
+        // the work stream re-sends its desired set on a resync, and the
+        // heartbeat's reconcile can race it. Nothing changed, so there is
+        // nothing to update; tearing it down (below) would restart a healthy
+        // task, or kill a VMM mid-restore. A changed payload (a config change
+        // reusing the id, or a different restore) still takes the in-place
+        // update path.
+        if self.instances.contains_key(&alloc.id)
+            && self.allocations.get(&alloc.id) == Some(&alloc)
+            && self.task_configs.get(&alloc.id) == Some(&task)
+        {
+            debug!(
+                allocation_id = alloc.id,
+                "Allocation already running with this payload; ignoring the duplicate dispatch"
+            );
+            return Ok(BeginOutcome::InFlight);
+        }
         // The manager resolved these against the volume table, so they carry
         // concrete ids and the driver attrs from previous mounts. Recorded
         // before any start path so both the direct and post-staging routes
@@ -3849,6 +3928,9 @@ impl WorkerTaskManager {
                 std::time::Duration::from_secs(allocation.self_terminate_after_seconds),
             );
         }
+        self.next_launch_generation += 1;
+        let generation = self.next_launch_generation;
+        self.staging.insert(alloc.id, generation);
 
         Ok(BeginOutcome::Staging(Box::new(StagingJob {
             allocation: alloc,
@@ -3858,6 +3940,7 @@ impl WorkerTaskManager {
             stager: self.stager.clone(),
             board: self.artifact_status.clone(),
             restore_fetch,
+            generation,
         })))
     }
 
@@ -5373,12 +5456,19 @@ fn spawn_provisional_staging_thread(
 
             let started = {
                 let mut guard = manager.lock().expect("task manager");
-                if !guard.is_allocation_active(allocation_id) {
-                    debug!(allocation_id, "Claim removed while staging artifacts");
-                    if job.restore_fetch.is_some() {
-                        guard.release_restore_fetch_pins(allocation_id);
+                match guard.finish_staging(allocation_id, job.generation) {
+                    StagingVerdict::Current => {}
+                    StagingVerdict::Superseded => {
+                        debug!(allocation_id, "Claim re-dispatched while staging artifacts");
+                        return;
                     }
-                    return;
+                    StagingVerdict::Gone => {
+                        debug!(allocation_id, "Claim removed while staging artifacts");
+                        if job.restore_fetch.is_some() {
+                            guard.release_restore_fetch_pins(allocation_id);
+                        }
+                        return;
+                    }
                 }
                 let claim_id = claim_for_thread.as_str();
                 let started = match result.and_then(|staged| {
@@ -5450,14 +5540,26 @@ fn spawn_staging_thread(manager: Arc<Mutex<WorkerTaskManager>>, job: StagingJob)
             const START_FAILED: &str = "start after artifact staging failed: ";
             let launch = {
                 let mut guard = manager.lock().expect("task manager");
-                if !guard.is_allocation_active(allocation_id) {
-                    if job.restore_fetch.is_some() {
-                        guard.release_restore_fetch_pins(allocation_id);
+                match guard.finish_staging(allocation_id, job.generation) {
+                    StagingVerdict::Current => {}
+                    StagingVerdict::Superseded => {
+                        // A re-dispatch with a new payload restaged it; that
+                        // thread starts it (and owns any restore pins).
+                        debug!(
+                            allocation_id,
+                            "Allocation re-dispatched while staging artifacts"
+                        );
+                        return;
                     }
-                    // Stopped while staging; stop_allocation already cleaned
-                    // the directories and status rows.
-                    debug!(allocation_id, "Allocation removed while staging artifacts");
-                    return;
+                    StagingVerdict::Gone => {
+                        if job.restore_fetch.is_some() {
+                            guard.release_restore_fetch_pins(allocation_id);
+                        }
+                        // Stopped while staging; stop_allocation already
+                        // cleaned the directories and status rows.
+                        debug!(allocation_id, "Allocation removed while staging artifacts");
+                        return;
+                    }
                 }
                 let staged = match result {
                     Ok(staged) => staged,
@@ -9329,6 +9431,94 @@ mod tests {
         assert_eq!(entry.status, "staging artifacts");
         let states = entry.artifact_states.as_deref().expect("artifact states");
         assert!(states.contains("\"state\":\"pending\""), "{states}");
+        Ok(())
+    }
+
+    fn staging_payload(allocation_id: i64, command: &str) -> R<TaskAllocation> {
+        let artifacts = vec![ArtifactSpec::from_source("https://example.com/image.tar")];
+        Ok(TaskAllocation {
+            allocation_id,
+            job_id: "job".into(),
+            job_config_id: "job-1".into(),
+            node_id: "node-1".into(),
+            task_config_id: 1,
+            task_name: "web".into(),
+            task_runtime: "exec".into(),
+            task_config: json!({ "command": [command] }).to_string(),
+            task_artifacts: serde_json::to_string(&artifacts)?,
+            ..Default::default()
+        })
+    }
+
+    fn expect_staging(outcome: BeginOutcome) -> Box<StagingJob> {
+        match outcome {
+            BeginOutcome::Staging(job) => job,
+            _ => panic!("expected the allocation to stage"),
+        }
+    }
+
+    /// The spot-check failure: the heartbeat's reconcile and a streamed
+    /// launch both dispatched one artifact-bearing allocation. The second
+    /// dispatch tore down the staging one and restaged it, so two threads
+    /// built the same bundle directory at once and one deleted the zone
+    /// file the other's next hard link needed ("No such file or directory
+    /// while canonicalizing .../zoneinfo/Asia/Hong_Kong"). The duplicate is
+    /// now ignored, and only the one staging thread may start it.
+    #[test]
+    fn a_duplicate_dispatch_while_staging_is_ignored() -> R<()> {
+        let temp_dir = TempDir::new()?;
+        let mut manager = manager_in(&temp_dir);
+        let payload = staging_payload(21, "serve")?;
+
+        let job = expect_staging(manager.begin_task_allocation(&payload)?);
+        assert!(matches!(
+            manager.begin_task_allocation(&payload)?,
+            BeginOutcome::InFlight
+        ));
+        assert_eq!(
+            manager.finish_staging(21, job.generation),
+            StagingVerdict::Current
+        );
+        assert!(manager.is_allocation_active(21));
+        Ok(())
+    }
+
+    /// A re-dispatch with a different payload while staging (an in-place
+    /// update) restages, and the first staging thread stands down instead
+    /// of launching the old payload over the new one.
+    #[test]
+    fn a_changed_redispatch_while_staging_supersedes_the_first_thread() -> R<()> {
+        let temp_dir = TempDir::new()?;
+        let mut manager = manager_in(&temp_dir);
+
+        let first = expect_staging(manager.begin_task_allocation(&staging_payload(22, "v1")?)?);
+        let second = expect_staging(manager.begin_task_allocation(&staging_payload(22, "v2")?)?);
+        assert_eq!(
+            manager.finish_staging(22, first.generation),
+            StagingVerdict::Superseded
+        );
+        assert_eq!(
+            manager.finish_staging(22, second.generation),
+            StagingVerdict::Current
+        );
+        Ok(())
+    }
+
+    /// A stop while staging leaves the staging thread nothing to start.
+    #[test]
+    fn a_stop_while_staging_leaves_the_thread_nothing_to_start() -> R<()> {
+        let temp_dir = TempDir::new()?;
+        let mut manager = manager_in(&temp_dir);
+
+        let job = expect_staging(manager.begin_task_allocation(&staging_payload(23, "serve")?)?);
+        manager.stop_allocation(23)?;
+        assert_eq!(
+            manager.finish_staging(23, job.generation),
+            StagingVerdict::Gone
+        );
+        // And a fresh dispatch afterwards stages again rather than being
+        // mistaken for a duplicate.
+        expect_staging(manager.begin_task_allocation(&staging_payload(23, "serve")?)?);
         Ok(())
     }
 

@@ -19,9 +19,8 @@ You need the `legion-bench` AWS profile, OrbStack (or Docker Desktop), Rust,
 and Apple `container` (`brew install container`).
 
 **If the rig is down,** bring it up. The Linux build takes about an hour under
-Rosetta, and the README has the command. Apply `shims.patch` before that build
-while the fixes it stands in for are missing, and build the macOS CLI from the
-same tree for section 10.
+Rosetta, or about four minutes on the EC2 build box (`infra/build-box.sh`);
+the README has both. Build the macOS CLI from the same tree for section 10.
 
 ```fish
 tests/spot-check/infra/up.sh
@@ -140,8 +139,9 @@ legion job scale fullstack --task api --count 4
 
 **Known:** the stock nginx and Postgres images do not run in Legion's Linux
 containers, so this uses rebuilt ones (P0-7). If nothing answers after a
-couple of minutes, check `legion service doctor api`. "health checks
-starting" forever means the P0-3 shim is missing from the binary.
+couple of minutes, check `legion service doctor api`. The test API does
+not reconnect to Postgres, so after a worker restart (which severs mesh
+connections) reschedule it: `legion job run tests/spot-check/jobs/06-fullstack.ncl --force-reschedule`.
 
 ## 6. Sandboxed agents, with the launcher
 
@@ -342,16 +342,16 @@ legion boot-ticket create sessions --task shell --pool default --scope session -
 ```
 
 **A content store (optional, for 12.6).** The workers have no instance
-profile, so give them a KV credential. Your SSO session credentials expire,
-so re-run the `kv put` when they do. Then uncomment the `contentStore` block
+profile, so give them a KV credential: a 36-hour STS session token, never the
+profile's long-term keys. Re-run the `kv put` when it expires. Then uncomment the `contentStore` block
 in `infra/configs/workers/default.ncl` with the rig's bucket name
 (`legion-spot-check-<account>`), push it as above, and restart the managers
 and workers.
 
 ```fish
-aws configure export-credentials --profile legion-bench --format process \
-  | jq -c '{type: "aws", accessKeyId: .AccessKeyId, secretAccessKey: .SecretAccessKey, sessionToken: .SessionToken, region: "us-east-1"}' \
-  | read -l cred; and legion kv put secrets/content-store $cred
+aws sts get-session-token --duration-seconds 129600 --profile legion-bench \
+  | jq -c '{type: "aws", accessKeyId: .Credentials.AccessKeyId, secretAccessKey: .Credentials.SecretAccessKey, sessionToken: .Credentials.SessionToken, region: "us-east-1"}' \
+  | read -l cred; and legion kv put secrets/content-store $cred -t json
 legion node info sc-wkr-1 | grep content-publish      # advertised once configured
 ```
 

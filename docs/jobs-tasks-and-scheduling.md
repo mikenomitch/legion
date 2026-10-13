@@ -436,26 +436,92 @@ relaunches the task, the checks start over with a fresh boot grace window.
 ### Manager-side move logic
 
 The worker reports failed allocations in its heartbeat (from a failed health
-check, a failed restart, or a bad exit).
-The manager then:
+check, a failed restart, or a bad exit). The memory pressure response's
+`evict-bursting` step goes through the same logic, since the task outgrew
+its reservation. The manager then, in one replicated write:
 
 1. removes the failed allocation row
-2. checks move history per `(job_config_id, task_config_id)`
-3. if `move_count` is exceeded within `move_period`, marks the job failed and
-   the task's status `failed`
-4. otherwise, enqueues a delayed `job_reschedule` after a backoff
+2. counts the task's moves within `move_period`
+3. if that count has reached `move_count`, marks the job failed and the
+   task's status `failed`
+4. otherwise, records a **reschedule hold** and enqueues a delayed
+   `job_reschedule` for when the hold lapses
 
-The backoff starts at `move_delay` (default `30s`) and doubles for each earlier
-move of the same task within `move_period` (default `30m`), up to 30 minutes
-(or `move_delay` itself, if you set it higher). With the defaults, a task that
-fails on every start is re-placed after 30s, 1m, 2m, 4m, 8m, 16m, then every
-30m. `move_count` is unlimited unless you set it, so without it a broken
-service keeps retrying at that slow pace rather than failing the job.
+The backoff starts at `move_delay` (default `30s`) and doubles for each
+consecutive failure, up to 30 minutes (or `move_delay` itself, if you set it
+higher). With the defaults, a task that fails on every start is re-placed
+after 30s, 1m, 2m, 4m, 8m, 16m, then every 30m. A failure continues the run
+while it comes within `move_period` (default `30m`) of the previous
+replacement's release. Once a replacement survives a whole `move_period`,
+the next failure starts over at `move_delay`. Each stateful instance has its
+own run, so one keyed sandbox that keeps failing doesn't slow another's first
+retry. A stateless task has one run for all its replicas.
 
-The move history lives in the memory of the manager that handled the failure
-report. A manager restart or a change of leader starts the backoff over. A
-`job_reschedule` places every missing replica of the job, so one replica's
-eval can also re-place another replica that is still waiting out its delay.
+`move_count` is unlimited unless you set it, so without it a broken service
+keeps retrying at that slow pace rather than failing the job. Set it to fail
+the job instead, and tune the other two to taste:
+
+```nickel
+on_unhealthy = {
+  move_delay = "10s",  # first backoff; doubles per consecutive failure, capped at 30m
+  move_period = "1h",  # how long a replacement must survive to reset the backoff,
+                       # and the window move_count is counted in
+  move_count = 5,      # fail the job on the 6th move inside move_period
+},
+```
+
+The hold is what makes the backoff stick. The scheduler leaves one
+replacement unplaced per active hold, whichever eval runs for the job: the
+capacity pass after other allocations free room, a node joining, or the
+scheduler leader's periodic regeneration. Before holds, any of those placed
+the replacement at once, so a task that could never start got a new
+allocation about once a minute whatever its backoff said. For a stateful
+task the binder skips the held instance, so a new keyed instance of the same
+task still places right away. Holds are replicated, so every manager reports
+them, and the move history they record survives a manager restart or a
+change of leader.
+
+Operators see a deferred replacement in three places:
+
+- an `allocation.reschedule_deferred` event (warn) per deferral, with the
+  task, instance, node, allocation, attempt, backoff, next attempt time, and
+  reason, and an `allocation.reschedule_exhausted` event (error) when the
+  budget runs out, ahead of `job.failed` (see the
+  [event table](event-stream.md));
+- `legion instance get` and `instance list` for a stateful instance, whose
+  state reads `rescheduling` and whose detail says why and until when:
+
+  ```text
+  $ legion instance get sb-1
+  ...
+  detail: rescheduling: attempt 4 failed (artifact staging failed: 404 Not Found);
+  next attempt at 2026-10-12T02:31:05Z (backoff 4m); `legion instance start sb-1`
+  retries now
+  ```
+
+- `legion job info`, which lists every replacement of the job still waiting:
+
+  ```text
+  Waiting out reschedule backoff:
+    task store (instance sb-1): attempt 4 failed (artifact staging failed: 404
+    Not Found); next attempt at 2026-10-12T02:31:05Z (backoff 4m)
+    `legion job run <spec> --force-reschedule` retries now (`legion instance
+    start <id>` for one keyed instance)
+  ```
+
+The same facts are on `InstanceInfo.reschedule_backoff` and
+`Job.reschedule_backoffs` in `--json` output and the API.
+
+To retry before the backoff runs out:
+
+- `legion job run <spec> --force-reschedule` restarts the job (a
+  `job_update` eval), which drops every hold of the job and its move history,
+  then places everything now. Restarting a stopped or failed job with
+  `legion job run` does the same.
+- `legion instance start <id>` lifts one keyed instance's hold and places it
+  now. Its move history stays, so if it fails again the backoff continues
+  from where it was. Slot-mode instances can't be started this way, so use
+  `--force-reschedule` for them.
 
 So failures escalate in order:
 
@@ -503,7 +569,7 @@ The first matching row wins:
 | `running` | At least one allocation of the job is live: placed and not yet terminal. |
 | `failed` | Nothing is live, and a task's last run failed: it spent its restart and move budgets, or exited unsuccessfully under a policy that does not restart it ([task supervision](task-supervision.md)). |
 | `blocked` | Nothing is live, and the job's placement found no room: its eval waits [blocked](scheduler-and-eval-loop.md#blocked-evals) for capacity that could host it, and the job places on its own when that capacity appears. `Job.blocked` says what it waits for. |
-| `pending` | Nothing is live, and a task that wants an allocation hasn't finished. It is waiting to be placed or waiting on a `dependsOn` condition. |
+| `pending` | Nothing is live, and a task that wants an allocation hasn't finished. It is waiting to be placed, waiting out a reschedule backoff (`legion job info` lists those, see [Manager-side move logic](#manager-side-move-logic)), or waiting on a `dependsOn` condition. |
 | `scheduled` | Nothing is live or pending, and a cron task (`schedule`) finished its last run and is waiting for the next. |
 | `complete` | Nothing is live, and every task that wants an allocation finished successfully. |
 | `suspended` | No task wants an allocation, and at least one keyed instance is [suspended](suspend-and-resume.md). |

@@ -8,6 +8,7 @@ backends actually run. Every response names the allocation that served it.
 
 import json
 import os
+import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -38,6 +39,25 @@ def connect_db():
 cache_host, cache_port = os.environ["LEGION_UPSTREAM_CACHE"].split(":")
 cache = redis.Redis(host=cache_host, port=int(cache_port), socket_timeout=2)
 db = connect_db()
+# One connection shared by the request threads, so serialize its use.
+db_lock = threading.Lock()
+
+
+def query(sql, **params):
+    """Run `sql`, reconnecting once if the connection died.
+
+    A worker restart severs in-flight mesh connections (the datapath lives in
+    the worker), so a long-lived connection can go stale under a healthy
+    Postgres.
+    """
+    global db
+    with db_lock:
+        try:
+            return db.run(sql, **params)
+        except (pg8000.exceptions.InterfaceError, BrokenPipeError, OSError) as err:
+            print(f"postgres connection lost ({err}); reconnecting", flush=True)
+            db = connect_db()
+            return db.run(sql, **params)
 
 
 def list_notes():
@@ -47,7 +67,7 @@ def list_notes():
             return json.loads(cached), "hit"
     except redis.RedisError as err:
         print(f"cache unavailable: {err}", flush=True)
-    rows = db.run("SELECT id, body, created_at::text FROM notes ORDER BY id DESC LIMIT 50")
+    rows = query("SELECT id, body, created_at::text FROM notes ORDER BY id DESC LIMIT 50")
     notes = [{"id": r[0], "body": r[1], "at": r[2]} for r in rows]
     try:
         cache.set("notes", json.dumps(notes), ex=10)
@@ -72,7 +92,7 @@ class Handler(BaseHTTPRequestHandler):
         body = json.loads(self.rfile.read(length) or b"{}").get("body", "").strip()
         if not body:
             return self.reply(400, {"error": "body is required"})
-        [[note_id]] = db.run("INSERT INTO notes (body) VALUES (:body) RETURNING id", body=body[:500])
+        [[note_id]] = query("INSERT INTO notes (body) VALUES (:body) RETURNING id", body=body[:500])
         try:
             cache.delete("notes")
         except redis.RedisError:

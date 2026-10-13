@@ -43,7 +43,7 @@ See a full example in `configs/jobs/maximal.ncl`.
 | `onCapacityTimeout` | `rollback \| fail \| completeIncomplete` | `fail` | Action when `capacityBlockTimeout` expires. |
 | `rollbackOnFailure` | `bool` | `false` | If true, `fail` actions trigger rollback. |
 | `onHealthDeadline` | `rollback \| fail \| pause` | `rollback` | Action when `healthyDeadline` expires. |
-| `batchKillAfter` | `duration` | unset | For batch tasks, maximum wait before active old allocations are force-retired during rollout. |
+| `batchKillAfter` | `duration` | unset | For batch tasks, maximum wait before running old allocations are force-retired during rollout. Finished ones are retired at once regardless. |
 | `slots.order` | `parallel \| sequential` | `parallel` | Slot-mode stateful groups only. `sequential` replaces one slot per step, highest ordinal first, each step health-gated. |
 | `slots.updateFrom` | `u32` | unset | Slot-mode stateful groups only. Staged rollout floor: only slots `>= updateFrom` are updated, and lower slots keep their current allocations. Requires `slots.order = "sequential"` and must be `< count.num`. |
 
@@ -256,9 +256,20 @@ Reconcile loop:
 ## Lifecycle-specific behavior
 
 - `service` tasks: standard rollout behavior.
-- `batch` tasks: old batch allocations are not killed by default during rollout. The rollout waits for them to finish.
-- `batchKillAfter`: if set, old batch allocations are force-retired after that elapsed time in-step.
+- `batch` tasks: old batch allocations that are still running are not killed by default during rollout. The rollout waits for them to finish (the batch retire window), and the group's event reads `Group <name> waiting for batch retire window` meanwhile.
+- `batchKillAfter`: if set, running old batch allocations are force-retired after that elapsed time in-step.
+- Finished old allocations (`complete` or `failed`, of any lifecycle) run nothing, so the rollout retires them at once and before any live allocation of the same task. They never wait on the batch retire window.
 - `sidecar` tasks: rollout follows the group progression and updates in lockstep with the group.
+
+### Resubmitting a batch or DAG job
+
+A new version of a batch job runs from the top. Its tasks are new task configs with their own `pending` statuses, so the old version's results never satisfy the new version's `dependsOn`. A resubmit with a changed variable goes like this:
+
+1. The old version's finished steps are retired on the first tick. A step still running holds the group until it exits (or `batchKillAfter` passes).
+2. The rollout places the new version's DAG roots. Each later step is placed when its dependency's exit is reported, through a `rollout_tick` (see [jobs-tasks-and-scheduling.md](jobs-tasks-and-scheduling.md#task-lists-and-dependency-readiness)).
+3. A `service` that depends on a batch step is placed once that step succeeds, and the rollout completes when it is healthy.
+
+Once the new version lands, the old version is superseded: nothing more of it is placed. A service of the old version that was still waiting on its dependencies never starts, and the new version's service replaces it.
 
 ## Scheduler and eval loop integration
 

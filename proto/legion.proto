@@ -48,7 +48,10 @@ service Manager {
   // Lists known job spec versions for one job.
   rpc ListJobSpecHistory (ListJobSpecHistoryRequest) returns (ListJobSpecHistoryReply);
 
-  // Returns metadata for one job (status, creation time, etc).
+  // Returns metadata for one job (status, creation time, etc), what a
+  // blocked job waits for (`Job.blocked`), and the replacements of failed
+  // allocations still waiting out their reschedule backoff
+  // (`Job.reschedule_backoffs`).
   rpc GetJobInfo (GetJobInfoRequest) returns (GetJobInfoReply);
 
   // Lists rollouts, optionally filtered by job and active status.
@@ -397,7 +400,10 @@ service Manager {
   //
   // Starting an instance that is already live (pending, active, or
   // rescheduling) succeeds as a no-op, so the call is safe to retry even
-  // without an idempotency key.
+  // without an idempotency key. The one exception is a `rescheduling`
+  // instance whose replacement waits out its task's reschedule backoff
+  // (`InstanceInfo.reschedule_backoff`): the backoff is lifted and the
+  // replacement placed now. A repeat finds no backoff and is the no-op.
   //
   // A running session (docs/session-mode.md) is live too, and answers the
   // same no-op. A suspended session resumes on the node its id is tagged
@@ -3520,6 +3526,11 @@ message StartInstanceReply {
   // - `"Instance <id> already running"` — no-op on a live
   //  (pending/active/rescheduling) instance, or on a running session
   //  (docs/session-mode.md).
+  // - `"Retrying instance <id> now: lifted its reschedule backoff"` — the
+  //  instance was `rescheduling` and its replacement was waiting out the
+  //  task's reschedule backoff (`InstanceInfo.reschedule_backoff`); the
+  //  backoff is lifted and a placement queued. The move history stays, so
+  //  another failure backs off from where it was.
   // - `"Resuming instance <id> from <snapshot> on <node>"` — a suspended
   //  instance queued to restore from its checkpoint.
   // - `"Started instance <id> cold ..."` — a suspended instance booting
@@ -3979,6 +3990,68 @@ message InstanceInfo {
 
   // The envelope allocation the session runs inside. Sessions only.
   optional int64 envelope_alloc_id = 46;
+
+  // Set while the instance is `rescheduling` because its last allocation
+  // failed and the replacement waits out the task's reschedule backoff
+  // (`on_unhealthy.move_delay`, doubled per consecutive failure, capped at
+  // 30 minutes; docs/jobs-tasks-and-scheduling.md,
+  // "Manager-side move logic"). No eval places the instance before
+  // `next_attempt_at`. `detail` carries the same facts as a sentence, with
+  // how to retry now: StartInstance lifts the backoff of a keyed instance,
+  // and `legion job run <spec> --force-reschedule` lifts every backoff of
+  // the job. Replicated, so every manager reports it. Unset otherwise.
+  optional RescheduleBackoff reschedule_backoff = 47;
+}
+
+// A failed allocation's replacement waiting out its task's reschedule
+// backoff (InstanceInfo.reschedule_backoff, Job.reschedule_backoffs). The
+// manager records it in the same replicated write that removes the failed
+// allocation, and the scheduler leaves the replacement unplaced until
+// `next_attempt_at`, whatever eval runs for the job in the meantime. The
+// `allocation.reschedule_deferred` event announces each one
+// (docs/event-stream.md).
+message RescheduleBackoff {
+  // The task whose replacement is deferred.
+  string task = 1;
+
+  // The task's group.
+  string group = 2;
+
+  // The stateful instance waiting for the replacement. Empty for a
+  // stateless task.
+  string instance_id = 3;
+
+  // The allocation that failed.
+  int64 allocation_id = 4;
+
+  // The node it failed on. The replacement avoids that node when another
+  // has room.
+  string node_id = 5;
+
+  // How many times in a row the instance (or, for a stateless task, the
+  // task) failed, counting this failure: a failure continues the count
+  // while it comes within `move_period` of the previous replacement's
+  // release, so it resets once a replacement survives a whole period. The
+  // backoff is `move_delay` doubled per earlier failure in the count. The
+  // job's failure budget is separate: with `move_count` set, the job fails
+  // when a failure finds `move_count` moves of the task inside
+  // `move_period`.
+  uint32 attempt = 6;
+
+  // The backoff this failure got, in seconds.
+  uint64 delay_seconds = 7;
+
+  // When the replacement may be placed, RFC 3339 (UTC).
+  string next_attempt_at = 8;
+
+  // Why the allocation failed: the worker's reason (or the memory pressure
+  // response's sentence for an `evict-bursting` eviction), on one line and
+  // cut to 400 characters. The `allocation.failed` event has the full text.
+  string reason = 9;
+
+  // The operator-facing sentence: `attempt 4 failed (<reason>); next
+  // attempt at <time> (backoff 4m)`.
+  string summary = 10;
 }
 
 // One served port of an instance (InstanceInfo.endpoints).
@@ -5106,6 +5179,15 @@ message Job {
   // what its other placements wait for; with nothing live it reads
   // `blocked`. Unset for a job stopped or failed by its lifecycle.
   optional JobBlocked blocked = 7;
+
+  // Replacements of failed allocations still waiting out their reschedule
+  // backoff, soonest next attempt first (docs/jobs-tasks-and-scheduling.md,
+  // "Manager-side move logic"). A job whose only replica waits here reads
+  // `pending`, and nothing places the replica before its `next_attempt_at`;
+  // `legion job run <spec> --force-reschedule` lifts every backoff of the
+  // job and places them now. Set by GetJobInfo only; ListJobs leaves it
+  // empty.
+  repeated RescheduleBackoff reschedule_backoffs = 8;
 }
 
 // What a blocked job waits for.

@@ -30,6 +30,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // The table shows the `blocked` status; the block itself is for
         // `-j` output and `job info`.
         .field_attribute("legion.Job.blocked", "#[tabled(skip)]")
+        .field_attribute("legion.Job.reschedule_backoffs", "#[tabled(skip)]")
         .compile_protos(&[proto_file], &["."])
         .unwrap_or_else(|e| panic!("protobuf compile error: {e}"));
 

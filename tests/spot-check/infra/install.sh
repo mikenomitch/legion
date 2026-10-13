@@ -125,16 +125,6 @@ for name in "${SC_MANAGERS[@]:1}"; do
     sc_log "Joining $name to raft"
     raft_token="$(on_mgr1 legion raft join-token | sed -n 's/^token=//p')"
     install_manager "$name" false "joinToken = \"$raft_token\","
-    # SPOT-CHECK WORKAROUND: a joining manager with workloadIdentity on finds
-    # no signing key in its still-empty store, tries to persist one, and exits
-    # ("raft op insert_signing_key must run on the leader"). Join with it off,
-    # then turn it (and edgeBoot, which needs it) back on once raft has
-    # replicated the leader's key.
-    sc_ssh "$name" "sudo sed -i -e '/^  workloadIdentity = /d' -e '/^  edgeBoot = /d' /opt/legion/configs/manager.ncl && sudo systemctl reset-failed legion-manager; sudo systemctl restart legion-manager"
-    wait_ready "$name"
-    sleep 5
-    render_manager "$name" false "joinToken = \"$raft_token\"," | sc_ssh "$name" "sudo tee /opt/legion/configs/manager.ncl >/dev/null"
-    sc_ssh "$name" sudo systemctl restart legion-manager
     wait_ready "$name"
 done
 on_mgr1 legion raft status
@@ -161,8 +151,8 @@ WorkingDirectory=/var/lib/legion
 ExecStart=/opt/legion/bin/legion start worker --token-file /etc/legion/join-token --name $name
 Environment=RUST_LOG=info
 Environment=LEGION_DATA_DIR=/var/lib/legion
-# SPOT-CHECK SHIM: bind and advertise the private IP so managers can dial
-# exec and logs. See src/worker/daemon.rs and worker-plane-auth-plan.md.
+# Bind and advertise the private IP: managers dial the worker plane there
+# (docs/architecture-managers-workers.md, "Ports and who dials whom").
 Environment=LEGION_WORKER_HOST=$ip
 Environment=LEGION_WORKER_ADVERTISE_ADDR=$ip
 # Containers run under runc, Legion's default, found on PATH in

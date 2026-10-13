@@ -28,6 +28,9 @@ mod snapshot_ops;
 mod suspend_ops;
 // The job status GetJobInfo/ListJobs report, derived from the workload.
 mod job_status_ops;
+// Reschedule backoff: the failed-allocation removal op, its holds, and the
+// move history they double as.
+mod reschedule_holds;
 use crate::storage::persistence::{
     build_persistence_driver, PersistenceDriver, PersistenceRole, PersistenceStatus,
     RaftHistoryEvent, RaftStatus,
@@ -37,6 +40,10 @@ use crate::storage::Lane;
 pub use fork_ops::{alias_target_problem, AliasOutcome, ForkCreated};
 pub use job_status_ops::{derive_job_status, JobStatusFacts, TaskStatusFact};
 pub use keyring_ops::{KeyringInit, KeyringReset, RewrapBatch, RewrapRun, RootKeyRewrap};
+pub use reschedule_holds::{
+    move_backoff, summarize_reason, FailedMove, FailedRemoval, MovePolicy, MoveVerdict,
+    RescheduleHold, MOVE_DELAY_MAX,
+};
 pub use session_ops::{PromoteSession, PromotedSession};
 pub use snapshot_ops::{
     DeleteSnapshotOutcome, NewSnapshot, RestoreInstanceOutcome, RestorePin, SnapshotFilter,
@@ -1456,6 +1463,9 @@ pub enum StartInstanceOutcome {
     /// The instance was already live (pending/active/rescheduling); nothing
     /// changed (idempotent no-op).
     AlreadyRunning,
+    /// The instance was `rescheduling` and waiting out its reschedule
+    /// backoff; the hold is lifted, so the next plan places it now.
+    BackoffLifted,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -6795,6 +6805,8 @@ impl Store {
             // A read-side overlay (`Store::overlay_blocked_jobs`), never
             // stored on the job row.
             blocked: None,
+            // Overlaid by GetJobInfo (`Store::reschedule_holds_for_job`).
+            reschedule_backoffs: Vec::new(),
         };
 
         Ok(job)
@@ -9444,6 +9456,7 @@ impl Store {
             [job_id],
         )?;
         tx.execute("DELETE FROM instance WHERE job_id = ?1;", [job_id])?;
+        tx.execute("DELETE FROM reschedule_hold WHERE job_id = ?1;", [job_id])?;
         Self::destroy_job_snapshots_tx(&tx, job_id)?;
         tx.execute("DELETE FROM rollout_event WHERE job_id = ?1;", [job_id])?;
         tx.execute("DELETE FROM rollout WHERE job_id = ?1;", [job_id])?;
@@ -13511,6 +13524,21 @@ impl Store {
         .map(|slot| slot as u32)
         .collect();
 
+        // Slots whose replacement waits out a reschedule backoff: the planner
+        // withheld their placements, so prefer any other free slot (a slot
+        // lost to a node, or a scale-out).
+        let mut held_stmt = tx.prepare_cached(
+            "SELECT instance_id FROM reschedule_hold \
+             WHERE task_config_id = ?1 AND instance_id IS NOT NULL AND not_before_unix > ?2;",
+        )?;
+        let held: HashSet<String> = Self::collect_rows(
+            held_stmt.query_map(params![task_id, Self::now_unix()], |row| row.get(0))?,
+        )?
+        .into_iter()
+        .collect();
+        drop(held_stmt);
+        let not_held = |slot: &u32| !held.contains(&slot_instance_id(&job_id, &group, *slot));
+
         let desired = count.max(0) as u32;
         // Node-local storage makes slot choice matter: an allocation that
         // landed on node-a1 must bind the slot whose data is ON node-a1, not
@@ -13518,7 +13546,7 @@ impl Store {
         // planner's pin and the binder's choice agree even if their orderings
         // diverge — the allocation always meets its own data.
         let pinned_slot = (0..desired)
-            .filter(|slot| !taken.contains(slot))
+            .filter(|slot| !taken.contains(slot) && not_held(slot))
             .find(|slot| {
                 let candidate = slot_instance_id(&job_id, &group, *slot);
                 matches!(
@@ -13528,8 +13556,11 @@ impl Store {
             });
         let slot = pinned_slot
             .or_else(|| {
-                (0..desired).find(|slot| !taken.contains(slot) && !job_taken.contains(slot))
+                (0..desired).find(|slot| {
+                    !taken.contains(slot) && !job_taken.contains(slot) && not_held(slot)
+                })
             })
+            .or_else(|| (0..desired).find(|slot| !taken.contains(slot) && not_held(slot)))
             .or_else(|| (0..desired).find(|slot| !taken.contains(slot)))
             .with_context(|| {
                 format!(
@@ -13645,7 +13676,10 @@ impl Store {
         target_instance: Option<&str>,
     ) -> R<String> {
         // Unbound live instances of this (job, group, task), oldest first.
-        // Ordering by `node_local_pin DESC` first makes an allocation bind the
+        // An instance waiting out a reschedule backoff goes last: the planner
+        // withheld its replacement, so a placement of this task is for some
+        // other instance (a new one, or one lost to a node).
+        // Ordering by `node_local_pin DESC` then makes an allocation bind the
         // instance whose node-local data already lives on the node it landed
         // on; without a pin the ordering is unchanged (oldest wins), so keyed
         // binding without volumes behaves exactly as before. A restoring
@@ -13678,7 +13712,11 @@ impl Store {
                      ELSE snapshot.node_id END FROM snapshot \
                      WHERE snapshot.snapshot_id = instance.restore_from\
                  ), ?5) = ?5) \
-                 ORDER BY (instance.restore_from IS NOT NULL) DESC, (volume.node_id = ?5) DESC, \
+                 ORDER BY EXISTS (SELECT 1 FROM reschedule_hold \
+                     WHERE reschedule_hold.instance_id = instance.instance_id \
+                     AND reschedule_hold.task_config_id = ?4 \
+                     AND reschedule_hold.not_before_unix > ?7) ASC, \
+                 (instance.restore_from IS NOT NULL) DESC, (volume.node_id = ?5) DESC, \
                  COALESCE((SELECT snapshot.node_id = ?5 FROM snapshot \
                      WHERE snapshot.snapshot_id = instance.restore_from), 0) DESC, \
                  instance.created_at ASC, instance.instance_id ASC LIMIT 1;",
@@ -13688,7 +13726,8 @@ impl Store {
                     task_name,
                     task_id,
                     node_id,
-                    target_instance.unwrap_or_default()
+                    target_instance.unwrap_or_default(),
+                    Self::now_unix()
                 ],
                 |row| self.instance_from_row(row),
             )
@@ -15044,11 +15083,33 @@ impl Store {
 
         let mut conn = self.write_connection()?;
         let tx = Self::write_tx(&mut conn)?;
-        tx.execute("DELETE FROM allocation WHERE id = ?;", [allocation_id])?;
-        self.release_instance_bindings_tx(&tx, std::slice::from_ref(&allocation))?;
-        self.bump_job_config_epoch_tx(&tx, &allocation.job_config_id)?;
+        let stopping_event = self.remove_allocation_row_tx(&tx, &allocation, cause, explanation)?;
+        tx.commit()?;
+        self.publish_staged(stopping_event);
+
+        self.cache_remove_allocations(std::slice::from_ref(&allocation))?;
+
+        Ok(Some(allocation))
+    }
+
+    /// The body of a one-allocation removal, inside the caller's
+    /// transaction: delete the row, release its instance binding, bump the
+    /// epoch, record the stop notice and the instance's `last_stop`. Returns
+    /// the staged `allocation.stopping` event for the caller to publish
+    /// after commit. Shared by [`Self::remove_allocation_by_id_explained`]
+    /// and the failed-allocation removal (`reschedule_holds.rs`).
+    fn remove_allocation_row_tx(
+        &self,
+        tx: &Connection,
+        allocation: &Allocation,
+        cause: StopCause,
+        explanation: Option<&StopExplanation>,
+    ) -> R<Option<SchedulerEventRecord>> {
+        tx.execute("DELETE FROM allocation WHERE id = ?;", [allocation.id])?;
+        self.release_instance_bindings_tx(tx, std::slice::from_ref(allocation))?;
+        self.bump_job_config_epoch_tx(tx, &allocation.job_config_id)?;
         let stopping_event =
-            self.record_stop_notices_tx(&tx, std::slice::from_ref(&allocation), cause)?;
+            self.record_stop_notices_tx(tx, std::slice::from_ref(allocation), cause)?;
         if let (Some(explanation), Some(instance_id)) =
             (explanation, allocation.instance_id.as_deref())
         {
@@ -15063,14 +15124,9 @@ impl Store {
                 record.detail = explanation.detail.clone();
             }
             record.hint = explanation.hint.clone();
-            Self::write_instance_last_stop_tx(&tx, instance_id, &record)?;
+            Self::write_instance_last_stop_tx(tx, instance_id, &record)?;
         }
-        tx.commit()?;
-        self.publish_staged(stopping_event);
-
-        self.cache_remove_allocations(std::slice::from_ref(&allocation))?;
-
-        Ok(Some(allocation))
+        Ok(stopping_event)
     }
 
     /// Record a terminal, non-failure outcome for an allocation: its task's
@@ -17175,7 +17231,9 @@ impl Store {
     /// nothing) lives in the RPC handler.
     ///
     /// Starting an already-live (pending/active/rescheduling) instance is a
-    /// no-op (returns [`StartInstanceOutcome::AlreadyRunning`]). Slot-mode
+    /// no-op (returns [`StartInstanceOutcome::AlreadyRunning`]), except a
+    /// `rescheduling` one waiting out its reschedule backoff: its hold is
+    /// lifted ([`StartInstanceOutcome::BackoffLifted`]). Slot-mode
     /// instances and terminated tombstones are rejected with
     /// [`StorageError::InvalidInput`]; the RPC layer pre-checks the
     /// terminated case to surface FailedPrecondition.
@@ -17200,7 +17258,18 @@ impl Store {
             });
         }
         match instance.state {
-            InstanceState::Pending | InstanceState::Active | InstanceState::Rescheduling => {
+            // A replacement waiting out its reschedule backoff is the one
+            // live instance a start changes: the hold is lifted so the next
+            // plan places it now (docs/jobs-tasks-and-scheduling.md,
+            // "Manager-side move logic").
+            InstanceState::Rescheduling => {
+                let conn = self.write_connection()?;
+                if Self::lift_instance_reschedule_hold_tx(&conn, instance_id)? {
+                    return Ok(StartInstanceOutcome::BackoffLifted);
+                }
+                return Ok(StartInstanceOutcome::AlreadyRunning);
+            }
+            InstanceState::Pending | InstanceState::Active => {
                 return Ok(StartInstanceOutcome::AlreadyRunning);
             }
             InstanceState::Terminated => bail!(StorageError::InvalidInput {
@@ -29914,7 +29983,7 @@ mod tests {
     /// left the cluster leaderless). The rows stay applied, the read model
     /// is rebuilt from them, and every streaming worker is resynced.
     #[test]
-    fn a_failed_projection_recovers_instead_of_failing_the_apply() -> R<()> {
+    fn a_failed_projection_recovers_instead_of_failing_test() -> R<()> {
         use crate::storage::work_log::{PendingWork, WorkLog};
 
         let src = setup_store()?;

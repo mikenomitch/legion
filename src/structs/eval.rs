@@ -220,6 +220,18 @@ impl Eval {
         // before any churn and is released for retry. Clearing an unset
         // marker is a no-op (this eval also runs for batch re-schedules).
         store.clear_job_restart_request(&self.job_id)?;
+        // A restart starts the move budget over too: replacements waiting
+        // out a reschedule backoff are placed now (this is what `job run
+        // --force-reschedule` promises), and earlier failures no longer
+        // lengthen the next backoff or count toward `move_count`.
+        let cleared = store.clear_reschedule_holds_for_job(&self.job_id)?;
+        if cleared > 0 {
+            info!(
+                job_id = %self.job_id,
+                cleared,
+                "Cleared reschedule backoff for a job restart"
+            );
+        }
 
         store.remove_allocs_for_job(&self.job_id)?;
         // A restart (a batch schedule's next run, a forced reschedule, a KV

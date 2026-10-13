@@ -219,6 +219,14 @@ const TABLE_OWNERS: &[(&str, Owner)] = &[
     // removal op inserts in the transaction that deletes the row and expires
     // old rows there too. NOT commutative (`INSERT OR REPLACE`).
     ("allocation_history", Owner::Lane(Lane::Scheduler)),
+    // `reschedule_hold` records a failed allocation's deferred replacement
+    // and doubles as the task's move history. Written by the
+    // failed-allocation removal op (`remove_failed_allocation`) in the
+    // transaction that deletes the allocation, read by the planner, cleared
+    // by `job_update` evals and StartInstance, and deleted by job destroy's
+    // scheduler cleanup: all scheduler-lane ops. NOT commutative (rows are
+    // updated and deleted).
+    ("reschedule_hold", Owner::Lane(Lane::Scheduler)),
     // `node_alloc_usage` caches the aggregated allocation usage of a node
     // for the plan-apply capacity recheck, next to a fingerprint of the rows
     // it was derived from (see the migration that creates it). Written by

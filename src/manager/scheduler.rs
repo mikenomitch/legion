@@ -221,6 +221,10 @@ pub struct PlanOutcome {
     /// not met yet (a batch dependency that has not exited). They are placed
     /// by the eval queued when the dependency reaches a terminal state.
     pub held_tasks: Vec<String>,
+    /// Replacements this pass withheld because they wait out a reschedule
+    /// backoff, as `task (count)`. The delayed `job_reschedule` the failure
+    /// queued places them once the backoff lapses.
+    pub backoff_held: Vec<String>,
 }
 
 impl PlanOutcome {
@@ -233,6 +237,7 @@ impl PlanOutcome {
             timings,
             unplaced: Vec::new(),
             held_tasks: Vec::new(),
+            backoff_held: Vec::new(),
         }
     }
 
@@ -254,6 +259,12 @@ impl PlanOutcome {
             parts.push(format!(
                 "waiting on dependencies: {}",
                 self.held_tasks.join(", ")
+            ));
+        }
+        if !self.backoff_held.is_empty() {
+            parts.push(format!(
+                "waiting out reschedule backoff: {}",
+                self.backoff_held.join(", ")
             ));
         }
         parts.join("; ")
@@ -1853,8 +1864,24 @@ impl<'a> Scheduler<'a> {
             }
         }
 
-        let required_counts =
+        let mut required_counts =
             Self::required_counts_for_mode(&tasks, mode.clone(), &snapshot.own_by_node);
+        // Replacements of failed allocations wait out their reschedule
+        // backoff (`Store::remove_failed_allocation`): whatever eval this is
+        // (the failure's own delayed reschedule, a capacity pass, a node
+        // join, regeneration), it leaves one replacement per active hold
+        // unplaced. A `Fresh` plan is a restart, whose `job_update` cleared
+        // the holds, or a new config, which has none.
+        let backoff_held = if matches!(mode, PlanMode::Reschedule) {
+            Self::withhold_backoff_replacements(
+                self.store,
+                job_config_id,
+                &tasks,
+                &mut required_counts,
+            )?
+        } else {
+            Vec::new()
+        };
 
         let build_started = std::time::Instant::now();
         let BuiltPlan {
@@ -1942,6 +1969,7 @@ impl<'a> Scheduler<'a> {
                 timings,
                 unplaced,
                 held_tasks,
+                backoff_held,
             });
         }
 
@@ -2105,6 +2133,7 @@ impl<'a> Scheduler<'a> {
             timings,
             unplaced,
             held_tasks,
+            backoff_held,
         };
         info!(
             %job_config_id,
@@ -2158,6 +2187,40 @@ impl<'a> Scheduler<'a> {
                 (*id, desired.saturating_sub(placed))
             })
             .collect()
+    }
+
+    /// Lower `required_counts` by the replacements waiting out a reschedule
+    /// backoff ([`Store::held_replacements_for_job_config`]), and name the
+    /// tasks that lost any, as `task (count)`, for the eval's outcome line.
+    fn withhold_backoff_replacements(
+        store: &Store,
+        job_config_id: &str,
+        tasks: &[(i64, TaskConfig, u32)],
+        required_counts: &mut HashMap<i64, u32>,
+    ) -> R<Vec<String>> {
+        let held = store.held_replacements_for_job_config(job_config_id)?;
+        let mut withheld = Vec::new();
+        for (task_id, task, _desired) in tasks {
+            let (Some(held), Some(required)) =
+                (held.get(task_id), required_counts.get_mut(task_id))
+            else {
+                continue;
+            };
+            let withhold = (*held).min(*required);
+            if withhold == 0 {
+                continue;
+            }
+            *required -= withhold;
+            withheld.push(format!("{} ({withhold})", task.name));
+        }
+        if !withheld.is_empty() {
+            info!(
+                %job_config_id,
+                withheld = %withheld.join(", "),
+                "Replacements wait out their reschedule backoff"
+            );
+        }
+        Ok(withheld)
     }
 
     fn existing_alloc_counts_by_task_node(

@@ -56,9 +56,8 @@ allow "$mgr_sg" tcp 22 22 "$admin_cidr"
 allow "$mgr_sg" tcp 4747 4749 "$admin_cidr"
 allow "$mgr_sg" tcp 4747 4747 "$mgr_sg"
 allow "$mgr_sg" tcp 4747 4747 "$wkr_sg"
-# Workers: SSH and app ports from the operator. 4848 ONLY from managers: the
-# spot-check shim exposes the worker API, which is unauthenticated until
-# internal_docs/plans/worker-plane-auth-plan.md lands. Task ports (static
+# Workers: SSH and app ports from the operator. 4848 (the worker plane,
+# mutual TLS) only from managers, as defense in depth. Task ports (static
 # 8080-8099 and dynamic 20000-32000) are open between workers for the mesh.
 allow "$wkr_sg" tcp 22 22 "$admin_cidr"
 allow "$wkr_sg" tcp 8080 8099 "$admin_cidr"

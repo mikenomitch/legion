@@ -221,6 +221,34 @@ How to use it:
     - [ ] Explain the missing sidecar: the plan placed `fetch` and
           `progress`, but only `fetch` has an allocation row.
     - [ ] Rerun `05-dag.ncl` on the 3-manager rig to confirm.
+  - [ ] **A resubmitted DAG job's rollout never progresses (2026-10-12
+        rerun).** `05-dag.ncl --var run=<new>` started a rollout that logged
+        `waiting for batch retire window` every 2 s for 10+ minutes.
+    - [x] The root cause: finished old allocations (`complete`/`failed`)
+          still counted as old allocations to retire, and with
+          `batchKillAfter` unset the batch retire window refused to retire
+          any batch allocation, finished or not. Finished ones are now
+          retired at once and first; only running batch steps wait
+          (`retire_old_allocations_for_group`, `src/manager/rollout.rs`;
+          [rollouts.md](../docs/rollouts.md#lifecycle-specific-behavior)).
+          Uncommitted on `fix-rollout-retire`, not yet in a PR.
+    - [x] The old version's `serve` never started. Not a dependency bug:
+          the scheduler places a service that depends on a finished batch
+          step in the same group (`dag_batch_success_allows_service_within_group`),
+          and so does the rollout path now
+          (`rollout_over_finished_batch_steps_retires_them_and_runs_the_new_dag`).
+          While a rollout targets a config, `report`'s exit releases `serve`
+          through a `rollout_tick`, so a rollout stuck on the same retire
+          window froze it. Once the resubmit superseded that version, the
+          scheduler and `queue_dependency_progress` skip it by design, and
+          the new version's `serve` replaces it.
+    - [ ] A config under rollout releases its held dependents through a
+          `rollout_tick`, so a rollout that is paused, waiting for a manual
+          advance, or stuck on anything else freezes the DAG along with it.
+          Decide whether a dependency release should place through the
+          rollout regardless of its step gating
+          (`Store::queue_dependency_progress`).
+    - [ ] Rerun `05-dag.ncl` twice with different `run` values to confirm.
   - [ ] **One manager down strands every worker (P0-5).** Followers fail to
         forward heartbeats in the `single` topology (lane mismatch), and
         workers know one manager.
@@ -298,14 +326,25 @@ How to use it:
         Smoke-test edge-boot speculative dispatch in particular: the
         dispatcher read `protocolVersion` from the wrong attribute map, so
         it had never fired for a real worker before #17.
-  - [ ] **Reschedule backoff is per manager and per eval, not per replica.**
-        The move history behind the backoff (2026-10-12 re-run fixes, in
-        Done) lives in the memory of the manager that handled the failure,
-        so a restart or leader change resets it. And a `job_reschedule`
-        places every missing replica of the job, so one replica's eval
-        re-places another early. A replicated per-task "not before" that
-        the reconcile honors would fix both (`AllocationFailureTracker` in
-        `src/manager/server.rs`).
+  - [ ] **`move_count` is counted per task, even for keyed tasks.** The
+        reschedule backoff runs per instance (2026-10-12 re-run fixes, in
+        Done), but the job-failing budget still counts every move of the
+        task inside `move_period`, so with `move_count` set, a few
+        unrelated sandboxes failing fails the whole keyed job. A per-instance
+        budget that fails (or stops) just the instance is the likely shape
+        (`Store::remove_failed_allocation` in
+        `src/storage/store/reschedule_holds.rs`).
+  - [ ] **A worker-reported failure leaves no `last_stop` on the
+        instance.** The failure path removes the allocation with
+        `StopCause::Unknown`, which records no `last_stop`, so once the
+        reschedule hold lapses the instance row no longer says why its last
+        allocation ended. A `failed` stop cause carrying the reason would
+        close it (`remove_allocation_row_tx`).
+  - [ ] **Scheduler benchmark numbers for the reschedule holds.** The
+        holds add one indexed `reschedule_hold` read per `Reschedule` plan
+        and a subquery to the keyed binder's ordering. AGENTS.md asks for
+        before/after `scheduler_bench` numbers on scheduler changes; they
+        were not taken in the change that added them.
   - [ ] **A failed changeset projection drops that changeset's capacity
         events.** The recovery rebuilds the read model and resyncs work
         streams, but blocked evals waiting on the freed capacity wait for the
@@ -4018,6 +4057,45 @@ Deferred from [operator-ui-gaps-plan.md](plans/operator-ui-gaps-plan.md):
 
 ## Cross-cutting
 
+- [ ] **AWS spot-check re-run (2026-10-12): open papercuts.** Found on the
+      rig, not fixed on `spot-check/fixes-2026-10-12`
+      ([findings](launch-spot-check-findings.md#re-run-2026-10-12)).
+  - [ ] **A worker restart severs in-flight mesh connections.** Re-adopted
+        tasks keep running, but the datapath lives in the worker, so their
+        upstream connections drop and an app without reconnect logic fails
+        until rescheduled. Document it in `docs/upgrades.md`, or keep the
+        datapath alive across a worker restart.
+  - [ ] **One `~/.legion/token` for every cluster.** A second local manager
+        logs "token already exists and was left alone" and the CLI then
+        presents the other cluster's token ("unknown or revoked ACL
+        token"). Key stored tokens by manager address.
+  - [ ] **Stopping the macOS manager leaves its Apple containers running.**
+        SIGTERM to `legion start manager --run-worker` exits without tearing
+        down the containers it started.
+  - [ ] **The CLI panics on a closed pipe.** `legion raft status | head`
+        prints "failed printing to stdout: Broken pipe" and a panic.
+  - [ ] **`job plan` errors where `job run` would preempt.** With the
+        workers full of low-band microVMs, `job plan` for a high-band claim
+        failed "no available nodes", while the run preempted and placed.
+  - [ ] **Instance JSON shows `nodeId: null`** for an active instance with a
+        current allocation.
+  - [ ] **No CLI lists a job's allocations.** `job info` shows none, and
+        there is no `job status`, so finding a failing allocation means
+        `legion state query`.
+  - [ ] **`state query` user errors are `Internal`.** A bad column returns
+        code `Internal` plus an ANSI tracing line on the CLI.
+  - [ ] **`net policy test` names a proto field.** Its error says "name one
+        with task_name" where the flag is `--task`.
+  - [ ] **Node attrs are double-encoded JSON** in `node list --json` and the
+        MCP tool (`configAttrs` and `dynamicAttrs` are strings).
+  - [ ] **Storage tests need a higher fd limit.** Under the default 1024 on a
+        32-core box, about ten `storage::` tests fail "unable to open
+        database file". They pass with `ulimit -n 65536`. Note it in
+        `docs/testing-and-benchmarks.md` or lower the per-test fd use.
+  - [ ] **Re-verify on the rig:** the microVM clean stop (volume writes
+        survive `instance stop`) and image pulls after a leader failover.
+        Both fixes are unit-tested only.
+
 - [ ] **Ship a Nickel contract library for the jobspec.** `legion job schema`
       emits JSON Schema for the *rendered* JSON; an importable
       `legion/jobspec.ncl` a spec could apply as a contract would move whole
@@ -5376,12 +5454,57 @@ Bug fixes, no plan. Uncommitted at the time of writing.
       ([architecture-managers-workers.md](../docs/architecture-managers-workers.md)).
       Volume UPDATEs (mount reports) now reach the work stream as well.
 - [x] **A task that fails on every start was re-placed every 30s forever.**
-      The manager's reschedule delay now doubles per move within
-      `move_period`, capped at 30m
+      The manager's reschedule delay now doubles per consecutive failure,
+      capped at 30m
       ([jobs-tasks-and-scheduling.md](../docs/jobs-tasks-and-scheduling.md#manager-side-move-logic)).
+- [x] **The reschedule backoff was invisible, and other evals ignored it.**
+      On the rig a keyed instance sat `rescheduling` with nothing saying
+      why, while the capacity pass re-placed it about once a minute despite
+      `delay_secs: 1800`. The failure's removal op now records a replicated
+      reschedule hold (`reschedule_hold`, also the move history, so every
+      manager backs off the same), the planner leaves held replacements
+      unplaced in every `Reschedule` plan, and the replacement is a
+      replicated delayed eval instead of a timer in one manager's memory.
+      Operators get an `allocation.reschedule_deferred` event per deferral
+      and `allocation.reschedule_exhausted` when the budget runs out,
+      a `rescheduling:` detail on `instance get/list`, the waiting
+      replacements on `job info` (`InstanceInfo.reschedule_backoff`,
+      `Job.reschedule_backoffs`), and `instance start` lifts one keyed
+      instance's hold (`--force-reschedule` lifts the job's)
+      ([jobs-tasks-and-scheduling.md](../docs/jobs-tasks-and-scheduling.md#manager-side-move-logic),
+      [event-stream.md](../docs/event-stream.md),
+      [calls](calls/launch-spot-check-fixes-plan_calls.md#54-the-reschedule-backoff-is-a-replicated-hold-the-planner-honors-not-a-timer)).
 - [x] **Two seeded saved queries** (`agent:recent-failed-evals`,
       `agent:pending-evals`) named eval columns that do not exist (`kind`,
       `node_name`). Fixed, with a test that runs every seeded query.
+- [x] **One allocation was launched twice, and the two launches deleted
+      each other's rootfs.** The heartbeat's reconcile and the work stream
+      (or a push) each decide to launch under their own lock, with identity
+      delivery awaited in between. A second dispatch of an allocation still
+      staging artifacts tore the staging down and restaged it, the first
+      staging thread launched anyway, and the cancelled launch's teardown
+      removed `allocs/<id>` under the live one. Seen as `python:3.12-alpine`
+      failing with "No such file or directory while canonicalizing
+      .../zoneinfo/Asia/Hong_Kong". A duplicate of the same payload while
+      staging is now ignored, and a staging thread starts its allocation
+      only while its generation is still the current one.
+- [x] **Layer extraction followed host symlinks and refused cross-layer
+      replacements.** It now resolves paths inside the rootfs (an image's
+      `lib -> /usr/lib` works, and a whiteout under an absolute symlink no
+      longer deletes the host file it names), lets a hard link replace a
+      lower layer's file, and lets a file replace a directory
+      ([task-runtime-container.md](../docs/task-runtime-container.md)).
+- [ ] **A count=1 job got repeated second placements after a KV env-change
+      restart** (kv-demo: 1273, 1274 failing on sc-wkr-2 every ~90s while
+      1272 served on sc-wkr-1). Not root-caused from the code. A reschedule
+      plan counts only allocations of its own `job_config_id`, so check
+      whether the failing allocations ran a different config than 1272 and
+      whether `job_config_unwanted_reason` let a superseded config through.
+- [ ] **Layer extraction applies directory modes as it goes.** A layer
+      whose directory is read-only (`0555`) and has entries after it fails
+      for a worker that is not root. Root bypasses the mode, so the Linux
+      worker is unaffected. Deferring directory modes to the end of a layer,
+      as `tar::Archive::unpack` does, would fix it.
 
 ## Architecture audit (2026-10-09)
 

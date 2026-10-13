@@ -90,6 +90,17 @@ pub(crate) enum ForwardableLaneWrite {
         #[serde(default)]
         explanation: Option<crate::storage::store::StopExplanation>,
     },
+    /// `Store::remove_failed_allocation` — scheduler lane. A worker's
+    /// failure report (or a pressure eviction that spends the move budget):
+    /// removes the allocation and records the move budget's verdict, and
+    /// the reschedule hold when it defers the replacement. Returns the
+    /// removed allocation and the verdict, when the allocation existed.
+    RemoveFailedAllocation {
+        allocation_id: i64,
+        cause: StopCause,
+        explanation: Option<crate::storage::store::StopExplanation>,
+        failure: crate::storage::store::FailedMove,
+    },
     /// `Store::enqueue_eval_after_delay` — scheduler lane. Returns the
     /// enqueued eval.
     EnqueueEval {
@@ -169,6 +180,7 @@ impl ForwardableLaneWrite {
             ForwardableLaneWrite::SyncNodeAvailability { .. }
             | ForwardableLaneWrite::MarkJobFailed { .. } => Lane::Control,
             ForwardableLaneWrite::RemoveAllocationById { .. }
+            | ForwardableLaneWrite::RemoveFailedAllocation { .. }
             | ForwardableLaneWrite::EnqueueEval { .. }
             | ForwardableLaneWrite::SeedKeyedInstances { .. }
             | ForwardableLaneWrite::RecordVolumeMounted { .. }
@@ -193,6 +205,7 @@ impl ForwardableLaneWrite {
             ForwardableLaneWrite::SyncNodeAvailability { .. } => "sync_node_availability",
             ForwardableLaneWrite::MarkJobFailed { .. } => "mark_job_failed",
             ForwardableLaneWrite::RemoveAllocationById { .. } => "remove_allocation_by_id",
+            ForwardableLaneWrite::RemoveFailedAllocation { .. } => "remove_failed_allocation",
             ForwardableLaneWrite::EnqueueEval { .. } => "enqueue_eval",
             ForwardableLaneWrite::SeedKeyedInstances { .. } => "seed_keyed_instances",
             ForwardableLaneWrite::RecordVolumeMounted { .. } => "record_volume_mounted",
@@ -269,6 +282,12 @@ pub(crate) fn execute(store: &Store, op: ForwardableLaneWrite) -> ForwardOutcome
             cause,
             explanation,
         } => done(store.remove_allocation_by_id_local(allocation_id, cause, explanation)),
+        ForwardableLaneWrite::RemoveFailedAllocation {
+            allocation_id,
+            cause,
+            explanation,
+            failure,
+        } => done(store.remove_failed_allocation_local(allocation_id, cause, explanation, failure)),
         ForwardableLaneWrite::EnqueueEval {
             kind,
             job_id,
@@ -361,6 +380,19 @@ mod tests {
                 allocation_id: 7,
                 cause: StopCause::Unknown,
                 explanation: None,
+            },
+            ForwardableLaneWrite::RemoveFailedAllocation {
+                allocation_id: 8,
+                cause: StopCause::NodePressure,
+                explanation: None,
+                failure: crate::storage::store::FailedMove {
+                    policy: crate::storage::store::MovePolicy {
+                        move_delay_ms: 30_000,
+                        move_count: Some(3),
+                        move_period_ms: 1_800_000,
+                    },
+                    reason: "boom".into(),
+                },
             },
             ForwardableLaneWrite::EnqueueEval {
                 kind: "job_reschedule".into(),

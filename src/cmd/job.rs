@@ -1377,6 +1377,36 @@ mod tests {
     use tempfile::tempdir;
 
     #[test]
+    fn job_info_lists_replacements_waiting_out_their_backoff() {
+        assert!(reschedule_backoff_lines(&[]).is_empty());
+        let backoff = |task: &str, instance: &str| crate::structs::RescheduleBackoff {
+            task: task.into(),
+            instance_id: instance.into(),
+            attempt: 4,
+            delay_seconds: 240,
+            summary: "attempt 4 failed (boom); next attempt at 2026-10-12T02:31:05Z (backoff 4m)"
+                .into(),
+            ..Default::default()
+        };
+        let lines = reschedule_backoff_lines(&[backoff("store", "sb-1"), backoff("web", "")]);
+        assert_eq!(
+            lines,
+            vec![
+                "Waiting out reschedule backoff:".to_string(),
+                "  task store (instance sb-1): attempt 4 failed (boom); next attempt at \
+                 2026-10-12T02:31:05Z (backoff 4m)"
+                    .to_string(),
+                "  task web: attempt 4 failed (boom); next attempt at 2026-10-12T02:31:05Z \
+                 (backoff 4m)"
+                    .to_string(),
+                "  `legion job run <spec> --force-reschedule` retries now (`legion instance \
+                 start <id>` for one keyed instance)"
+                    .to_string(),
+            ]
+        );
+    }
+
+    #[test]
     fn priority_conflicts_with_asap() {
         let cmd = config();
         let result =
@@ -2402,6 +2432,35 @@ async fn rollout_events_cmd(arg_matches: &ArgMatches) -> R<()> {
     Ok(())
 }
 
+/// `job info`'s lines for replacements waiting out their reschedule backoff
+/// (`Job.reschedule_backoffs`, docs/jobs-tasks-and-scheduling.md):
+///
+/// ```text
+/// Waiting out reschedule backoff:
+///   task store (instance sb-1): attempt 4 failed (...); next attempt at ... (backoff 4m)
+///   `legion job run <spec> --force-reschedule` retries now
+/// ```
+fn reschedule_backoff_lines(backoffs: &[crate::structs::RescheduleBackoff]) -> Vec<String> {
+    if backoffs.is_empty() {
+        return Vec::new();
+    }
+    let mut lines = vec!["Waiting out reschedule backoff:".to_string()];
+    for backoff in backoffs {
+        let subject = if backoff.instance_id.is_empty() {
+            format!("task {}", backoff.task)
+        } else {
+            format!("task {} (instance {})", backoff.task, backoff.instance_id)
+        };
+        lines.push(format!("  {subject}: {}", backoff.summary));
+    }
+    lines.push(
+        "  `legion job run <spec> --force-reschedule` retries now (`legion instance start <id>` \
+         for one keyed instance)"
+            .to_string(),
+    );
+    lines
+}
+
 #[instrument(err, skip_all)]
 async fn get_info(arg_matches: &ArgMatches) -> R<()> {
     let format = OutputFormat::from_matches(arg_matches);
@@ -2422,8 +2481,12 @@ async fn get_info(arg_matches: &ArgMatches) -> R<()> {
     } else {
         let job = response.into_inner().job.context("no job found")?;
         let blocked = job.blocked.clone();
+        let backoff_lines = reschedule_backoff_lines(&job.reschedule_backoffs);
         let printable_job: JobPrint = job.into();
         print_table(vec![printable_job]);
+        for line in backoff_lines {
+            println!("{line}");
+        }
         // What a blocked job waits for (docs/scheduler-and-eval-loop.md,
         // "Blocked evals"): it places on its own when that capacity appears.
         if let Some(blocked) = blocked {

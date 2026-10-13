@@ -72,6 +72,14 @@ A low-level OCI runtime can't fetch an image, so Legion fetches and converts it
      `trusted.*` are skipped, and an attribute the host filesystem refuses is
      skipped with a debug log.
 
+   Paths resolve the way the container sees them, with `rootfs/` as `/`: a
+   layer can write through the image's own absolute symlinks (`lib ->
+   /usr/lib`), and no entry, hard link, or whiteout reaches a host path
+   through one. An entry replaces whatever a lower layer left at its path (a
+   directory over a directory merges), and a hard link may target a file from
+   its own layer or a lower one. A hard link whose target no earlier entry
+   created fails the start with both paths named.
+
    Then generate an OCI runtime `config.json` with:
    - the task `command`/`env` merged over the image config's env (the task
      wins, and `PATH` gets a default if it's missing),

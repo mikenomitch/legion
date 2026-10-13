@@ -519,6 +519,14 @@ Other signals an agent can use to close the loop:
 - `legion job logs <NAME> --json`: captured task stdout/stderr (see below).
 - `legion state query "<SQL>" --json`: inspect `task_status`, `allocation_health`,
   `eval`, and so on (read-only by default).
+- `legion job info <NAME> --json` (`rescheduleBackoffs`) and
+  `legion_instance_get` (`rescheduleBackoff`): replacements of failed
+  allocations waiting out their reschedule backoff, with the attempt, reason,
+  and `nextAttemptAt`. A job that reads `pending` with entries here is not
+  stuck. It retries on its own at that time, or now after `legion job run
+  <spec> --force-reschedule` (or `legion instance start <id>` for one keyed
+  instance). The `allocation.reschedule_deferred` event announces each one
+  ([Manager-side move logic](jobs-tasks-and-scheduling.md#manager-side-move-logic)).
 
 ### The scheduler event stream
 

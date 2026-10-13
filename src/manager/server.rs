@@ -21,8 +21,9 @@ use crate::manager::workload_identity::{claims_for_allocation, WorkloadIdentityS
 use crate::storage::errors::StorageError;
 use crate::storage::events::{ArtifactPin, SchedulerEventFilter, SchedulerEventRecord};
 use crate::storage::store::{
-    ArchivedCheckpoint, DestroyInstanceOutcome, JobKvReference, JobSubmitOutcome,
-    JobTemplateVersionRecord, StartInstanceOutcome, StopInstanceOutcome, Store,
+    ArchivedCheckpoint, DestroyInstanceOutcome, FailedMove, FailedRemoval, JobKvReference,
+    JobSubmitOutcome, JobTemplateVersionRecord, MoveVerdict, StartInstanceOutcome,
+    StopInstanceOutcome, Store,
 };
 use crate::structs::acl::{AclAction, AclIdentity, AclResource, AclScope};
 use crate::structs::manager_server::Manager;
@@ -111,7 +112,7 @@ use crate::structs::{
 use crate::task_plugins::validate_job_config;
 use crate::tracing_util::{o11y_enabled, read_recent_observability};
 
-use time::{Duration as TimeDuration, OffsetDateTime};
+use time::OffsetDateTime;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::transport::Channel;
 use tonic::{Request, Response, Status, Streaming};
@@ -754,9 +755,31 @@ fn map_instance_info(
     // waiting. A volume pin explains one that is UNBOUND and waiting — the two
     // never apply at once, and both answer "why has this not come back". A
     // suspend or restore failure explains the rest.
+    //
+    // A reschedule backoff explains an unbound instance first: the
+    // replacement exists in intent but nothing places it before the next
+    // attempt, which no other state says.
+    let backoff = (instance.state == InstanceState::Rescheduling)
+        .then(|| {
+            store
+                .reschedule_hold_for_instance(&instance.instance_id)
+                .ok()
+                .flatten()
+        })
+        .flatten();
     let detail = instance_loss_detail(store, &instance)
+        .or_else(|| {
+            backoff.as_ref().map(|hold| {
+                format!(
+                    "rescheduling: {}; {}",
+                    hold.summary(),
+                    hold.retry_hint(instance.mode == InstanceMode::Keyed)
+                )
+            })
+        })
         .or_else(|| instance_volume_pin_detail(store, &instance))
         .or_else(|| suspend.lifecycle_error.clone());
+    let reschedule_backoff = backoff.as_ref().map(reschedule_backoff_info);
     // The checkpoint's shape, for `instance list`'s CHECKPOINT column. Only
     // suspended or resuming instances have one, so others pay nothing.
     let checkpoint = suspend
@@ -867,6 +890,26 @@ fn map_instance_info(
         node_id: None,
         lease_issued_at: None,
         envelope_alloc_id: None,
+        reschedule_backoff,
+    }
+}
+
+/// A reschedule hold's wire shape (`RescheduleBackoff` in
+/// `proto/legion.proto`).
+fn reschedule_backoff_info(
+    hold: &crate::storage::store::RescheduleHold,
+) -> crate::structs::RescheduleBackoff {
+    crate::structs::RescheduleBackoff {
+        task: hold.task_name.clone(),
+        group: hold.group.clone(),
+        instance_id: hold.instance_id.clone().unwrap_or_default(),
+        allocation_id: hold.allocation_id,
+        node_id: hold.node_id.clone(),
+        attempt: hold.attempt,
+        delay_seconds: hold.delay_secs,
+        next_attempt_at: hold.next_attempt_at(),
+        reason: hold.reason.clone(),
+        summary: hold.summary(),
     }
 }
 
@@ -1062,7 +1105,10 @@ fn instance_volume_pin_detail(store: &Store, instance: &Instance) -> Option<Stri
         .map(|node| node.status)
         .unwrap_or_else(|_| "unknown".into());
     Some(format!(
-        "volume-pinned: volume {} ({}) is node-local and lives on node {node_id} (status:          {node_status}), so this instance can only be placed there. It waits for that node          rather than starting on empty storage; `legion volume delete --force {}` abandons          the data and frees the instance to place elsewhere",
+        "volume-pinned: volume {} ({}) is node-local and lives on node {node_id} (status: \
+         {node_status}), so this instance can only be placed there. It waits for that node \
+         rather than starting on empty storage; `legion volume delete --force {}` abandons \
+         the data and frees the instance to place elsewhere",
         volume.volume_id, volume.driver, volume.volume_id
     ))
 }
@@ -3831,12 +3877,6 @@ pub(crate) fn sweep_missed_kv_changes(store: &Store) -> anyhow::Result<usize> {
     Ok(reconciled)
 }
 
-#[derive(Debug, Clone, Hash, PartialEq, Eq)]
-struct TaskKey {
-    job_config_id: String,
-    task_config_id: i64,
-}
-
 #[derive(Debug, Clone)]
 struct AllocationFailureContext {
     job_id: String,
@@ -3846,10 +3886,12 @@ struct AllocationFailureContext {
     on_unhealthy: TaskOnUnhealthyConfig,
 }
 
+/// Caches each failing allocation's task policy while its report is
+/// handled. The move history itself is replicated (`reschedule_hold`, see
+/// [`Store::remove_failed_allocation`]), so every manager backs off the same.
 #[derive(Debug, Default)]
 struct AllocationFailureTracker {
     allocations: HashMap<i64, AllocationFailureContext>,
-    move_history: HashMap<TaskKey, Vec<OffsetDateTime>>,
 }
 
 #[tonic::async_trait]
@@ -4286,6 +4328,13 @@ impl Manager for ManagerDaemonService {
             .store
             .job_template_provenance(&name)
             .map_err(|e| map_store_error("Error loading job provenance", e))?;
+        job.reschedule_backoffs = self
+            .store
+            .reschedule_holds_for_job(&name)
+            .map_err(|e| map_store_error("Error loading reschedule backoffs", e))?
+            .iter()
+            .map(reschedule_backoff_info)
+            .collect();
 
         let reply = GetJobInfoReply {
             job: Some(job),
@@ -6280,6 +6329,18 @@ impl Manager for ManagerDaemonService {
                             Some(priority),
                         )?;
                         format!("Started instance {instance_id}")
+                    }
+                    StartInstanceOutcome::BackoffLifted => {
+                        s.enqueue_eval(
+                            "job_reschedule",
+                            Some(&job_id),
+                            Some(&config_id),
+                            None,
+                            Some(priority),
+                        )?;
+                        format!(
+                            "Retrying instance {instance_id} now: lifted its reschedule backoff"
+                        )
                     }
                     StartInstanceOutcome::AlreadyRunning => {
                         format!("Instance {instance_id} already running")
@@ -11571,6 +11632,28 @@ fn handle_pressure_actions(
             detail: action.detail.clone(),
             hint: action.hint.clone(),
         };
+        if let Some(context) = move_context {
+            // `evict-bursting` spends the move budget: the removal, the
+            // verdict, and the hold commit together.
+            let removal = store.remove_failed_allocation(
+                action.allocation_id,
+                StopCause::NodePressure,
+                Some(explanation),
+                FailedMove {
+                    policy: (&context.on_unhealthy).into(),
+                    reason: action.detail.clone(),
+                },
+            )?;
+            failure_tracker
+                .lock()
+                .expect("allocation failure tracker")
+                .allocations
+                .remove(&action.allocation_id);
+            if let Some(removal) = removal {
+                apply_move_verdict(store, &removal, node_id);
+            }
+            continue;
+        }
         let removed = store.remove_allocation_by_id_explained(
             action.allocation_id,
             StopCause::NodePressure,
@@ -11584,54 +11667,6 @@ fn handle_pressure_actions(
         let Some(removed) = removed else {
             continue;
         };
-        if let Some(context) = move_context {
-            let decision = failure_tracker
-                .lock()
-                .expect("allocation failure tracker")
-                .record_move(&context)?;
-            match decision {
-                MoveDecision::Reschedule { delay } => {
-                    info!(
-                        allocation_id = removed.id,
-                        job_id = %removed.job_id,
-                        node_id,
-                        step = %action.step,
-                        delay_secs = delay.as_secs(),
-                        "Allocation removed for node memory pressure; replacement after move delay"
-                    );
-                    schedule_reschedule(
-                        store.clone(),
-                        removed.job_id.clone(),
-                        removed.job_config_id.clone(),
-                        node_id.to_string(),
-                        delay,
-                    );
-                }
-                MoveDecision::JobFailed => {
-                    // Same outcome as a failed allocation that spent the
-                    // budget (handle_failed_allocations).
-                    store.mark_job_failed(&removed.job_id)?;
-                    if let Err(error) = store.set_task_status(
-                        removed.task_config_id,
-                        crate::structs::TaskStatusState::Failed,
-                    ) {
-                        warn!(
-                            allocation_id = removed.id,
-                            job_id = %removed.job_id,
-                            error = %format!("{error:#}"),
-                            "Failed to record the failed task status"
-                        );
-                    }
-                    warn!(
-                        allocation_id = removed.id,
-                        job_id = %removed.job_id,
-                        step = %action.step,
-                        "Move limit exceeded by memory pressure evictions; marking job failed"
-                    );
-                }
-            }
-            continue;
-        }
         let priority = store
             .cached_band_for_job_config(&removed.job_config_id)
             .map(|band| band.eval_priority())
@@ -11810,7 +11845,30 @@ fn handle_failed_allocations(
             continue;
         }
 
-        store.remove_allocation_by_id(allocation_id)?;
+        // The removal, the move budget's verdict, and (when the replacement
+        // is deferred) the hold the planner honors commit together.
+        let removal = store.remove_failed_allocation(
+            allocation_id,
+            StopCause::Unknown,
+            None,
+            FailedMove {
+                policy: (&context.on_unhealthy).into(),
+                reason: failure.reason.clone(),
+            },
+        )?;
+        failure_tracker
+            .lock()
+            .expect("allocation failure tracker")
+            .allocations
+            .remove(&allocation_id);
+        let Some(removal) = removal else {
+            // Already removed: a re-sent report spends nothing.
+            debug!(
+                allocation_id,
+                node_id, "Failed allocation already removed; ignoring the repeat report"
+            );
+            continue;
+        };
         freed_capacity = true;
 
         store.events().allocation_failed(
@@ -11832,62 +11890,13 @@ fn handle_failed_allocations(
                 artifact_states,
             );
         }
-
-        let move_decision = {
-            let mut tracker = failure_tracker.lock().expect("allocation failure tracker");
-            tracker.record_move(&context)?
-        };
-
-        match move_decision {
-            MoveDecision::Reschedule { delay } => {
-                info!(
-                    allocation_id,
-                    job_id = %context.job_id,
-                    delay_secs = delay.as_secs(),
-                    "Rescheduling failed allocation after backoff"
-                );
-                let job_id = context.job_id.clone();
-                let job_config_id = context.job_config_id.clone();
-                let node_id = node_id.to_string();
-                let store = store.clone();
-                schedule_reschedule(store, job_id, job_config_id, node_id, delay);
-            }
-            MoveDecision::JobFailed => {
-                store.mark_job_failed(&context.job_id)?;
-                // The task failed for good: say so in its status, so a
-                // `complete` dependent can run and a `success` one never does.
-                if let Err(error) = store.set_task_status(
-                    context.task_config_id,
-                    crate::structs::TaskStatusState::Failed,
-                ) {
-                    warn!(
-                        allocation_id,
-                        job_id = %context.job_id,
-                        error = %format!("{error:#}"),
-                        "Failed to record the failed task status"
-                    );
-                }
-                warn!(
-                    allocation_id,
-                    job_id = %context.job_id,
-                    reason = %failure.reason,
-                    "Move limit exceeded; marking job failed"
-                );
-            }
-        }
-
-        failure_tracker
-            .lock()
-            .expect("allocation failure tracker")
-            .allocations
-            .remove(&allocation_id);
-
         warn!(
             allocation_id,
             node_id,
             reason = %failure.reason,
-            "Allocation reported failed; reschedule requested"
+            "Allocation reported failed"
         );
+        apply_move_verdict(store, &removal, node_id);
     }
 
     // The removed rows freed node capacity (see
@@ -11980,64 +11989,90 @@ fn update_allocation_health_snapshots(
     store.upsert_allocation_health_snapshots(node_id, snapshots)
 }
 
-enum MoveDecision {
-    Reschedule { delay: Duration },
-    JobFailed,
-}
-
-fn schedule_reschedule(
-    store: Store,
-    job_id: String,
-    job_config_id: String,
-    node_id: String,
-    delay: Duration,
-) {
-    match tokio::runtime::Handle::try_current() {
-        Ok(handle) => {
-            handle.spawn(async move {
-                if delay.as_secs() > 0 {
-                    tokio::time::sleep(delay).await;
-                }
-                if let Err(err) = store.enqueue_eval(
-                    "job_reschedule",
-                    Some(&job_id),
-                    Some(&job_config_id),
-                    Some(&node_id),
-                    None,
-                ) {
-                    error!(
-                        job_id = %job_id,
-                        job_config_id = %job_config_id,
-                        error = ?err,
-                        "Failed to enqueue reschedule after unhealthy allocation"
-                    );
-                }
-            });
+/// Act on the move budget's verdict for a removed failed allocation
+/// ([`Store::remove_failed_allocation`]): announce a deferred replacement and
+/// queue the delayed `job_reschedule` that places it once the hold lapses,
+/// or announce the spent budget and fail the job.
+///
+/// The `job_reschedule` is a replicated delayed eval, so it survives a
+/// manager restart or a leader change, and it names the failed node so the
+/// replacement avoids it. Best effort past the removal: a failed enqueue is
+/// logged, and the next eval of the job places the replacement once the
+/// hold lapses.
+fn apply_move_verdict(store: &Store, removal: &FailedRemoval, node_id: &str) {
+    let allocation = &removal.allocation;
+    match &removal.verdict {
+        MoveVerdict::Deferred(hold) => {
+            store.events().allocation_reschedule_deferred(hold);
+            info!(
+                allocation_id = allocation.id,
+                job_id = %allocation.job_id,
+                task = %hold.task_name,
+                attempt = hold.attempt,
+                delay_secs = hold.delay_secs,
+                next_attempt_at = %hold.next_attempt_at(),
+                "Rescheduling failed allocation after backoff"
+            );
+            if let Err(err) = store.enqueue_eval_after_delay(
+                "job_reschedule",
+                Some(&allocation.job_id),
+                Some(&allocation.job_config_id),
+                Some(node_id),
+                None,
+                Duration::from_secs(hold.delay_secs),
+            ) {
+                error!(
+                    job_id = %allocation.job_id,
+                    job_config_id = %allocation.job_config_id,
+                    error = ?err,
+                    "Failed to enqueue the reschedule of a failed allocation"
+                );
+            }
         }
-        Err(_) => {
-            let delay_for_thread = delay;
-            let job_id = job_id.clone();
-            let job_config_id = job_config_id.clone();
-            let node_id = node_id.clone();
-            std::thread::spawn(move || {
-                if delay_for_thread.as_secs() > 0 {
-                    std::thread::sleep(delay_for_thread);
-                }
-                if let Err(err) = store.enqueue_eval(
-                    "job_reschedule",
-                    Some(&job_id),
-                    Some(&job_config_id),
-                    Some(&node_id),
-                    None,
-                ) {
-                    error!(
-                        job_id = %job_id,
-                        job_config_id = %job_config_id,
-                        error = ?err,
-                        "Failed to enqueue reschedule after unhealthy allocation"
-                    );
-                }
-            });
+        MoveVerdict::Exhausted {
+            task_name,
+            moves,
+            move_count,
+            move_period_secs,
+            reason,
+        } => {
+            store.events().allocation_reschedule_exhausted(
+                allocation,
+                task_name,
+                *moves,
+                *move_count,
+                *move_period_secs,
+                reason,
+            );
+            if let Err(error) = store.mark_job_failed(&allocation.job_id) {
+                error!(
+                    allocation_id = allocation.id,
+                    job_id = %allocation.job_id,
+                    error = %format!("{error:#}"),
+                    "Failed to mark the job failed after its move budget ran out"
+                );
+            }
+            // The task failed for good: say so in its status, so a
+            // `complete` dependent can run and a `success` one never does.
+            if let Err(error) = store.set_task_status(
+                allocation.task_config_id,
+                crate::structs::TaskStatusState::Failed,
+            ) {
+                warn!(
+                    allocation_id = allocation.id,
+                    job_id = %allocation.job_id,
+                    error = %format!("{error:#}"),
+                    "Failed to record the failed task status"
+                );
+            }
+            warn!(
+                allocation_id = allocation.id,
+                job_id = %allocation.job_id,
+                task = %task_name,
+                moves,
+                reason = %reason,
+                "Move limit exceeded; marking job failed"
+            );
         }
     }
 }
@@ -12073,48 +12108,6 @@ impl AllocationFailureTracker {
         self.allocations.insert(allocation_id, context.clone());
         Ok(Some(context))
     }
-
-    fn record_move(&mut self, context: &AllocationFailureContext) -> R<MoveDecision> {
-        let now = OffsetDateTime::now_utc();
-        let key = TaskKey {
-            job_config_id: context.job_config_id.clone(),
-            task_config_id: context.task_config_id,
-        };
-        let history = self.move_history.entry(key).or_default();
-        let window = time_duration(context.on_unhealthy.move_period);
-        history.retain(|time| now - *time <= window);
-
-        if let Some(limit) = context.on_unhealthy.move_count {
-            if history.len() as u32 >= limit {
-                return Ok(MoveDecision::JobFailed);
-            }
-        }
-
-        // A task that keeps failing backs off: each earlier move inside the
-        // window doubles the wait. `move_count` is unlimited by default, so
-        // a constant delay re-placed a task that can never start every
-        // `move_delay` forever, minting a new allocation each time.
-        let delay = move_backoff(context.on_unhealthy.move_delay, history.len());
-        history.push(now);
-        Ok(MoveDecision::Reschedule { delay })
-    }
-}
-
-/// Ceiling on the reschedule backoff, unless `move_delay` itself is longer.
-const MOVE_DELAY_MAX: Duration = Duration::from_secs(30 * 60);
-
-/// The wait before rescheduling a task's failed allocation, given how many
-/// times the task already moved within `move_period`: `base`, doubled per
-/// earlier move, capped at [`MOVE_DELAY_MAX`] (or `base` when it is larger).
-fn move_backoff(base: Duration, earlier_moves: usize) -> Duration {
-    let factor = 1u32 << earlier_moves.min(31);
-    base.saturating_mul(factor).min(MOVE_DELAY_MAX.max(base))
-}
-
-fn time_duration(duration: Duration) -> TimeDuration {
-    let secs = duration.as_secs() as i64;
-    let nanos = duration.subsec_nanos() as i64;
-    TimeDuration::seconds(secs) + TimeDuration::nanoseconds(nanos)
 }
 
 fn build_rollout_group_status(
@@ -16871,45 +16864,295 @@ mod tests {
         Ok(())
     }
 
+    /// The `allocation.reschedule_deferred` events journaled for `job`, as
+    /// parsed metadata, oldest first.
+    fn deferred_events(store: &Store, job: &str) -> R<Vec<Value>> {
+        store
+            .list_scheduler_events(&SchedulerEventFilter {
+                kind: Some("allocation.reschedule_deferred".into()),
+                job_id: Some(job.into()),
+                ..Default::default()
+            })?
+            .into_iter()
+            .map(|event| {
+                assert_eq!(event.level, "warn");
+                Ok(serde_json::from_str(&event.metadata_json)?)
+            })
+            .collect()
+    }
+
     /// A task that fails on every start must not be re-placed every
     /// `move_delay` forever (the spot check minted a new allocation per
     /// replica about once a minute): each move inside `move_period` doubles
-    /// the wait, up to the cap.
+    /// the wait, up to the cap, and the history the doubling counts is the
+    /// replicated hold table, so any manager computes the same backoff.
+    /// Every deferral is announced with what an operator needs.
     #[test]
-    fn repeated_moves_back_off_exponentially() -> R<()> {
-        let context = AllocationFailureContext {
-            job_id: "job".into(),
-            job_config_id: "jc".into(),
-            task_config_id: 1,
-            node_id: "node-a".into(),
-            on_unhealthy: TaskOnUnhealthyConfig::default(),
+    fn repeated_failures_back_off_and_announce_each_deferral() -> R<()> {
+        let store = setup_store()?;
+        insert_node(&store, "node-a")?;
+        let job = JobConfig {
+            priority: Default::default(),
+            rollout: None,
+            rollout_by_group: Default::default(),
+            name: "flaky".into(),
+            tasks: vec![TaskConfig::new("store", "noop")],
+            version: None,
         };
-        let mut tracker = AllocationFailureTracker::default();
-        let delays: Vec<u64> = (0..8)
-            .map(|_| match tracker.record_move(&context)? {
-                MoveDecision::Reschedule { delay } => Ok(delay.as_secs()),
-                MoveDecision::JobFailed => Err(anyhow!("move_count is unlimited by default")),
-            })
-            .collect::<R<_>>()?;
-        assert_eq!(delays, vec![30, 60, 120, 240, 480, 960, 1800, 1800]);
+        store.handle_job_submit(&job, &[submission()])?;
+        let job_config_id = store.get_job_config(&job.name)?.id();
+        let task_id = store.get_task_configs_for_job_config(&job_config_id)?[0].0;
+        let tracker = Arc::new(Mutex::new(AllocationFailureTracker::default()));
 
-        // Another task's history is its own.
-        let other = AllocationFailureContext {
-            task_config_id: 2,
-            ..context.clone()
-        };
-        assert!(matches!(
-            tracker.record_move(&other)?,
-            MoveDecision::Reschedule { delay } if delay == Duration::from_secs(30)
-        ));
+        let mut failed = Vec::new();
+        for _ in 0..4 {
+            let allocation = store.place_alloc("node-a", task_id)?;
+            handle_failed_allocations(
+                &store,
+                &tracker,
+                "node-a",
+                &[FailedAllocation {
+                    allocation_id: allocation.id,
+                    reason: "artifact staging failed: 404\nsecond line".into(),
+                    artifact_states: None,
+                }],
+            )?;
+            failed.push(allocation.id);
+        }
 
-        // A `move_delay` above the cap is honored as is, and zero stays zero.
-        assert_eq!(
-            move_backoff(Duration::from_secs(3600), 3),
-            Duration::from_secs(3600)
+        let events = deferred_events(&store, "flaky")?;
+        let delays: Vec<u64> = events
+            .iter()
+            .map(|meta| meta["delaySecs"].as_u64().unwrap_or_default())
+            .collect();
+        assert_eq!(delays, vec![30, 60, 120, 240]);
+        let attempts: Vec<u64> = events
+            .iter()
+            .map(|meta| meta["attempt"].as_u64().unwrap_or_default())
+            .collect();
+        assert_eq!(attempts, vec![1, 2, 3, 4]);
+        let last = &events[3];
+        assert_eq!(last["task"], "store");
+        assert_eq!(last["jobConfigId"], job_config_id.as_str());
+        assert_eq!(last["reason"], "artifact staging failed: 404 / second line");
+        let next = time::OffsetDateTime::parse(
+            last["nextAttemptAt"].as_str().unwrap_or_default(),
+            &time::format_description::well_known::Rfc3339,
+        )?;
+        let ahead = next - time::OffsetDateTime::now_utc();
+        assert!(
+            ahead > time::Duration::seconds(200) && ahead <= time::Duration::seconds(241),
+            "next attempt {ahead} from now"
         );
-        assert_eq!(move_backoff(Duration::ZERO, 5), Duration::ZERO);
-        assert_eq!(move_backoff(Duration::from_secs(30), 1000), MOVE_DELAY_MAX);
+        let journaled = store.list_scheduler_events(&SchedulerEventFilter {
+            kind: Some("allocation.reschedule_deferred".into()),
+            ..Default::default()
+        })?;
+        assert_eq!(journaled[3].allocation_id, Some(failed[3]));
+        assert_eq!(journaled[3].node_id.as_deref(), Some("node-a"));
+        assert!(
+            journaled[3]
+                .message
+                .contains("attempt 4 failed (artifact staging failed: 404 / second line)"),
+            "{}",
+            journaled[3].message
+        );
+
+        // The replacement is a replicated delayed eval, not a timer in this
+        // manager's memory.
+        assert!(store.delayed_eval_pending("job_reschedule", &job_config_id)?);
+
+        // Spot check 2026-10-12: the capacity pass (and every other
+        // Reschedule-mode eval) re-placed the task at once, whatever the
+        // backoff said. The planner honors the hold now.
+        store.reconcile_job_config_allocations(&job_config_id)?;
+        assert!(store.allocs_for_job("flaky")?.is_empty());
+        let job_info = store.reschedule_holds_for_job("flaky")?;
+        assert_eq!(job_info.len(), 4);
+        assert_eq!(job_info[0].attempt, 1, "soonest next attempt first");
+
+        // `job run --force-reschedule` (a job_update eval) lifts every hold
+        // and starts the move budget over.
+        Eval {
+            id: "force".into(),
+            status: "pending".into(),
+            kind: "job_update".into(),
+            job_id: "flaky".into(),
+            job_config_id: job_config_id.clone(),
+            node_name: String::new(),
+            priority: 50,
+        }
+        .handle(&store)?;
+        let placed = store.allocs_for_job("flaky")?;
+        assert_eq!(placed.len(), 1, "the forced reschedule places now");
+        assert!(store.reschedule_holds_for_job("flaky")?.is_empty());
+        handle_failed_allocations(
+            &store,
+            &tracker,
+            "node-a",
+            &[FailedAllocation {
+                allocation_id: placed[0].id,
+                reason: "boom".into(),
+                artifact_states: None,
+            }],
+        )?;
+        let events = deferred_events(&store, "flaky")?;
+        assert_eq!(events.len(), 5);
+        assert_eq!(events[4]["attempt"], 1);
+        assert_eq!(events[4]["delaySecs"], 30);
+        Ok(())
+    }
+
+    /// A keyed instance waiting out its backoff says so on `instance get`,
+    /// `instance list` and `job info`, from the replicated hold; it does not
+    /// block a new instance of the same task from placing; and
+    /// StartInstance lifts its hold so it places now.
+    #[test]
+    fn keyed_instance_backoff_is_visible_and_lifted_by_start() -> R<()> {
+        use crate::structs::InstanceState;
+
+        let store = setup_store()?;
+        insert_node(&store, "node-a")?;
+        let manager = ManagerDaemonService::new(store.clone());
+        let job_id = "sandbox-store";
+        let job_config_id = submit_keyed_job(
+            &store,
+            job_id,
+            vec![keyed_task("sandbox", "default", false)],
+        )?;
+        let runtime = tokio::runtime::Runtime::new()?;
+        let create = |id: &str| {
+            runtime
+                .block_on(manager.create_instance(Request::new(CreateInstanceRequest {
+                    job_id: job_id.into(),
+                    group: None,
+                    task: None,
+                    instance_id: Some(id.into()),
+                    idempotency_key: None,
+                    from_snapshot: None,
+                })))
+                .map_err(|err| anyhow!(err))
+        };
+        create("user-a")?;
+        handle_pending_evals(&store, "job_reschedule", job_id)?;
+        let allocation = store.allocs_for_job(job_id)?[0].clone();
+
+        let tracker = Arc::new(Mutex::new(AllocationFailureTracker::default()));
+        handle_failed_allocations(
+            &store,
+            &tracker,
+            "node-a",
+            &[FailedAllocation {
+                allocation_id: allocation.id,
+                reason: "artifact staging failed: 404".into(),
+                artifact_states: None,
+            }],
+        )?;
+        let waiting = store.get_instance("user-a")?.context("instance")?;
+        assert_eq!(waiting.state, InstanceState::Rescheduling);
+        let events = deferred_events(&store, job_id)?;
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0]["instanceId"], "user-a");
+
+        // Every pending eval runs (the delayed reschedule included, as if
+        // its timer fired early): none places user-a while it is held.
+        handle_pending_evals(&store, "job_reschedule", job_id)?;
+        store.reconcile_job_config_allocations(&job_config_id)?;
+        assert!(store.allocs_for_job(job_id)?.is_empty());
+
+        // A new sandbox is not stuck behind the failing one.
+        create("user-b")?;
+        handle_pending_evals(&store, "job_reschedule", job_id)?;
+        let placed = store.allocs_for_job(job_id)?;
+        assert_eq!(placed.len(), 1);
+        assert_eq!(placed[0].instance_id.as_deref(), Some("user-b"));
+
+        // `instance get`: the structured backoff and the sentence.
+        let info = runtime
+            .block_on(manager.get_instance(Request::new(GetInstanceRequest {
+                instance_id: "user-a".into(),
+            })))
+            .map_err(|err| anyhow!(err))?
+            .into_inner()
+            .instance
+            .context("instance info")?;
+        let backoff = info.reschedule_backoff.clone().context("backoff")?;
+        assert_eq!(backoff.attempt, 1);
+        assert_eq!(backoff.delay_seconds, 30);
+        assert_eq!(backoff.allocation_id, allocation.id);
+        assert_eq!(backoff.node_id, "node-a");
+        assert_eq!(backoff.reason, "artifact staging failed: 404");
+        let detail = info.detail.clone().unwrap_or_default();
+        assert!(
+            detail.starts_with(
+                "rescheduling: attempt 1 failed (artifact staging failed: 404); next attempt at "
+            ),
+            "{detail}"
+        );
+        assert!(
+            detail.ends_with("(backoff 30s); `legion instance start user-a` retries now"),
+            "{detail}"
+        );
+
+        // `instance list` carries it too; the placed sibling does not.
+        let listed = runtime
+            .block_on(manager.list_instances(Request::new(ListInstancesRequest {
+                job_id: job_id.into(),
+                ..Default::default()
+            })))
+            .map_err(|err| anyhow!(err))?
+            .into_inner()
+            .instances;
+        let by_id = |id: &str| listed.iter().find(|info| info.instance_id == id).cloned();
+        assert!(by_id("user-a")
+            .context("user-a")?
+            .reschedule_backoff
+            .is_some());
+        assert!(by_id("user-b")
+            .context("user-b")?
+            .reschedule_backoff
+            .is_none());
+
+        // `job info` lists the job's waiting replacements.
+        let job = runtime
+            .block_on(manager.get_job_info(Request::new(GetJobInfoRequest {
+                name: job_id.into(),
+            })))
+            .map_err(|err| anyhow!(err))?
+            .into_inner()
+            .job
+            .context("job")?;
+        assert_eq!(job.reschedule_backoffs.len(), 1);
+        assert_eq!(job.reschedule_backoffs[0].instance_id, "user-a");
+        assert!(job.reschedule_backoffs[0]
+            .summary
+            .starts_with("attempt 1 failed (artifact staging failed: 404)"));
+
+        // StartInstance lifts the hold and places user-a now.
+        let reply = runtime
+            .block_on(manager.start_instance(Request::new(StartInstanceRequest {
+                instance_id: "user-a".into(),
+                ..Default::default()
+            })))
+            .map_err(|err| anyhow!(err))?
+            .into_inner();
+        assert_eq!(
+            reply.message,
+            "Retrying instance user-a now: lifted its reschedule backoff"
+        );
+        handle_pending_evals(&store, "job_reschedule", job_id)?;
+        let rebound = store.get_instance("user-a")?.context("instance")?;
+        assert_eq!(rebound.state, InstanceState::Active);
+        assert!(store.reschedule_hold_for_instance("user-a")?.is_none());
+        // A second start finds nothing to lift.
+        let reply = runtime
+            .block_on(manager.start_instance(Request::new(StartInstanceRequest {
+                instance_id: "user-a".into(),
+                ..Default::default()
+            })))
+            .map_err(|err| anyhow!(err))?
+            .into_inner();
+        assert_eq!(reply.message, "Instance user-a already running");
         Ok(())
     }
 
@@ -17004,6 +17247,20 @@ mod tests {
         assert_eq!(store.get_job("mem-hog")?.status, "failed");
         assert_eq!(pressure_events(&store)?.len(), 3);
         assert!(tracker.lock().unwrap().allocations.is_empty());
+        // The spent budget is announced with its reason before `job.failed`.
+        let exhausted = store.list_scheduler_events(&SchedulerEventFilter {
+            kind: Some("allocation.reschedule_exhausted".into()),
+            ..Default::default()
+        })?;
+        assert_eq!(exhausted.len(), 1, "{exhausted:?}");
+        assert_eq!(exhausted[0].level, "error");
+        assert_eq!(exhausted[0].allocation_id, Some(second.id));
+        let meta: Value = serde_json::from_str(&exhausted[0].metadata_json)?;
+        assert_eq!(meta["moves"], 1);
+        assert_eq!(meta["moveCount"], 1);
+        assert_eq!(meta["task"], "hog");
+        assert_eq!(meta["reason"], "evicted by evict-bursting on node-a");
+        assert_eq!(deferred_events(&store, "mem-hog")?.len(), 1);
         Ok(())
     }
 

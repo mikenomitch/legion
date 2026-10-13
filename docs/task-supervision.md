@@ -83,9 +83,19 @@ What happens on an exit:
 | Situation | Outcome |
 | --- | --- |
 | policy wants a restart, budget available | wait `delay`, relaunch in place |
-| policy wants a restart, budget exhausted | allocation fails → manager reschedules it after a backoff that doubles per move (`move_*` budget, see [Manager-side move logic](jobs-tasks-and-scheduling.md#manager-side-move-logic)) → job fails when `move_count` is set and spent |
+| policy wants a restart, budget exhausted | allocation fails → manager reschedules it after a backoff that doubles per consecutive failure, capped at 30 minutes (`move_*` budget, see [Manager-side move logic](jobs-tasks-and-scheduling.md#manager-side-move-logic)) → job fails when `move_count` is set and spent |
 | policy does not want a restart, exit was a success | allocation is complete |
 | policy does not want a restart, exit was not a success | allocation fails, as above |
+
+While a replacement waits out its backoff, nothing places it, whichever eval
+runs for the job. Each deferral emits an `allocation.reschedule_deferred`
+event. `legion instance get` (for a stateful instance) and `legion job info`
+say which attempt failed, why, and when the next one is. `legion job run
+<spec> --force-reschedule` retries every waiting replacement now, and
+`legion instance start <id>` retries one keyed instance. The backoff
+doubles from `move_delay` up to 30 minutes and starts over once a
+replacement survives `move_period`. Raise `move_delay` to back off harder,
+and set `move_count` to fail the job instead of retrying forever.
 
 A process killed by a signal has no exit code and never counts as a success.
 With `policy = "never"`, a `SIGKILL` is a failure.

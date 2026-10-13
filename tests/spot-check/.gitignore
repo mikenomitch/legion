@@ -1,2 +1,2 @@
 # Rig state: SSH key, management token, host list, docker login, OCI archives.
-.state/
+.state

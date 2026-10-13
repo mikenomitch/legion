@@ -12,16 +12,100 @@ multi-node story does not yet.** Several failures only show up once a
 cluster has two workers, a restart, or a leader change, which is exactly
 what a first external user will do.
 
+## Re-run: 2026-10-12
+
+**Branch:** `spot-check/fixes-2026-10-12` (off `main` @ `063cb96`). Same rig,
+plus the section 12 sandbox and session scenarios, the macOS pass, the UI,
+and MCP. Smoke went from 68 to 89 passing checks of 100 on the first fixed
+build. The run found a new layer of bugs under the ones fixed since
+2026-10-11. All of these are fixed on the branch and were re-verified on the
+rig unless marked otherwise. The old `shims.patch` is gone: its one hunk had
+landed, and this run needed no shims at the end.
+
+**P0, fixed**
+
+- **Linux containers never started with the defaults.** youki, the default
+  runtime, refuses the idmapped mounts the default `userNamespace = true`
+  needs. Under runc the shifted container root could not traverse the 0700
+  worker state and allocation directories. runc is now the default, youki
+  is dropped (runc or crun only), and the layout is 0711 / 0710 with the
+  range's gid.
+- **One SQL typo killed raft.** `note_work_changes` queried
+  `allocation.job_id`. It ran inside the raft apply, so the error stopped
+  openraft's core on the leader and left the cluster leaderless for 20
+  minutes. The query is fixed, and post-commit projection errors can no
+  longer fail an apply.
+- **Exec tasks never started with resource enforcement on.** Controllers
+  were never delegated to the `share` and `reserve` slices. Every failure
+  also leaked a leaf cgroup (467 on one node).
+- **DAG steps never advanced.** `complete_allocation` wrote `task_status`
+  from a scheduler-lane op, so the lane ownership guard rejected every batch
+  completion on a raft cluster. Unrecorded terminal reports are now retried.
+- **A joining manager with workload identity crashed at boot.** It tried to
+  persist a signing key into a store that had not replicated yet.
+- **Edge boot was unreachable.** `edgeBoot.enabled` never reached the
+  server, and tickets then failed `InvalidIssuer` because the default issuer
+  was `http://127.0.0.1:4747` and differed per manager. Raft clusters now
+  share one issuer (`https://manager.legion`) that workers learn from the
+  managers.
+- **Every memory resume cold-booted.** The node reported cloud-hypervisor
+  `51.2` and the checkpoint `51.2.0`, compared as strings.
+- **microVM volumes lost recent writes on stop.** The VMM was killed without
+  a guest sync. The guest now shuts down from inside and every kill or pause
+  flushes first. *Unit-tested; not yet re-run on the rig.*
+- **Image pulls failed after a leader failover.** Worker trust was keyed by
+  the join manager's address, so TLS calls to the new active manager had no
+  CA pin. Trust is now per cluster. *Unit-tested; not yet re-run on the rig.*
+
+**P1, fixed**
+
+- Failing tasks were re-placed every 30 seconds forever (about 580
+  allocations in 25 minutes). Moves now back off exponentially up to 30
+  minutes, and pressure evictions spend the same budget.
+- Streamed work starts called the worker's own `PostWork` handler, which
+  refused it, so starts waited for the next heartbeat and logged an ERROR
+  each time.
+- `node.pressure` events raised on a follower were dropped. Events now
+  forward to the leader.
+- Preemption took an older normal-priority victim over young low-priority
+  ones, because of the 60-second victim age guard.
+- The join token sat in the worker's argv, readable by every task. There is
+  now `--token-file`.
+- `legion exec` into an exec task ran in the worker's cgroup, outside the
+  task's limits.
+- macOS: Apple container names were not node-scoped, so two local clusters
+  replaced each other's containers. A hung `container` CLI call wedged the
+  whole single-process cluster. CLI calls now have deadlines.
+- The UI Managers page showed only managers that had led (old P2-12).
+- `legion session nodes` reported live nodes as `down`.
+
+**P2, fixed:** destroyed volumes listed by default, the CLI hanging on a
+leaderless cluster, misleading gating warning on macOS, and leader-only
+ERROR noise on followers.
+
+**Still open:** listed in [TODO.md](TODO.md) under the 2026-10-12 groups.
+The notable ones:
+
+- A worker restart severs in-flight mesh connections, since the datapath
+  lives in the worker. Apps without reconnect logic break until rescheduled.
+- One `~/.legion/token` serves every cluster, so a second local manager
+  silently gets the wrong token.
+- Stopping the macOS manager leaves its Apple containers running.
+- The CLI panics on a closed pipe (`legion ... | head`).
+- `job plan` errors where `job run` would preempt.
+- Instance JSON shows `nodeId: null` for an active instance.
+- Memory restore took 5.9 s on nested virtualization, against the 300 ms
+  bare-metal target. Treat it as a data point.
+
 ## How to read this
 
 - **Severity.** P0 breaks a headline feature on a normal multi-node cluster.
   P1 breaks a common path or loses work. P2 is a papercut, a misleading
   message, or a docs gap.
 - **Status.** *Open* means untouched. *Shimmed* means a not-for-merge patch let
-  testing continue. The patches live in
-  [`tests/spot-check/shims.patch`](../tests/spot-check/shims.patch), each hunk
-  marked `SPOT-CHECK SHIM`. Every root cause below was read in the source,
-  unless the entry says otherwise.
+  testing continue on 2026-10-11 (the patch file is gone now that every shim
+  has a real fix). Every root cause below was read in the source, unless the
+  entry says otherwise.
 
 ## What worked
 

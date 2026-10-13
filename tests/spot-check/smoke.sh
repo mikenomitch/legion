@@ -114,7 +114,10 @@ scenario_kv() {
             bad "file updated but the task restarted"
     else bad "file never updated"; fi
     legion kv put spot-check/greeting bonjour >/dev/null
-    eventually 120 http_has "$url" bonjour && ok "env change restarted the task" || bad "env change never applied"
+    # The restart can land on the other worker (a new allocation), so accept
+    # the answer from either.
+    eventually 120 sh -c "curl -fsS --max-time 5 http://$w1:8083/ | grep -q bonjour || curl -fsS --max-time 5 http://$w2:8083/ | grep -q bonjour" &&
+        ok "env change restarted the task" || bad "env change never applied"
 }
 
 scenario_dag() {

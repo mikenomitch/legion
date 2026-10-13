@@ -1353,3 +1353,111 @@ Aliasing fixes every caller that dials by address in one place, so
 simplicity won. The security property does not change: an address only says
 where to dial, and the manager there must still present a `manager.legion`
 certificate chained to the CA the token pinned.
+
+## 54. The reschedule backoff is a replicated hold the planner honors, not a timer
+
+*Workstream: Scheduling (found on the AWS spot-check re-run, after the
+backoff shipped).*
+
+**The call.** On the rig, `sandbox-store` got a new allocation about every
+minute (1195, 1202, 1212, 1214, 1221) while each failure logged
+`delay_secs: 1800`, and its instance sat `rescheduling` with nothing saying
+why. The backoff only delayed the `job_reschedule` the failure queued. Any
+other `Reschedule` eval for the job placed every missing replica at once: the
+capacity pass that each failure's freed room triggered, a node join, the
+divergent-leadership regeneration. Now the failure's scheduler-lane removal op
+also writes a `reschedule_hold` row (`Store::remove_failed_allocation`), and
+`plan_and_apply` subtracts one replacement per active hold from every
+`Reschedule` plan's required counts. The keyed and slot binders put held
+instances last. The rows are also the move history, so the in-memory
+`AllocationFailureTracker` history is gone, and the replacement is a
+replicated delayed eval instead of a `tokio::sleep`. Operators see it as
+follows:
+
+```text
+detail: rescheduling: attempt 4 failed (artifact staging failed: 404 Not Found);
+next attempt at 2026-10-12T02:31:05Z (backoff 4m); `legion instance start sb-1` retries now
+```
+
+There's also an `allocation.reschedule_deferred` event and
+`Job.reschedule_backoffs` on `job info`.
+
+**Alternatives.**
+- Keep the in-memory tracker, and only add the event and an in-memory
+  "deferred until" for display. The display would read empty on every
+  manager but one, and nothing would stop the early re-placements.
+- Have only the capacity pass and the regeneration skip held jobs. Every
+  other path that places (node join, scale, blocked-eval wake) would still
+  bypass the backoff, and each future path would have to remember to.
+- Put "not before" on the instance row only. It covers stateful tasks and
+  leaves stateless ones, which fail the same way, unprotected.
+
+**Trade-off.** The scheduler-lane removal op got a new forwarded variant
+(`RemoveFailedAllocation`), a new table, and one more indexed read per
+`Reschedule` plan. A stateless task's holds are counts, not identities. While
+a stateless task holds N replacements, its next N missing replicas wait,
+whatever made them go missing (a lost node included). The rows prune lazily,
+on the next failure's removal.
+
+**Why.** Honoring the hold in the planner is the only place that covers
+every path that places, now and later. That's the property the user made a
+condition of keeping the backoff at all. Recording it in the op that removes
+the allocation means no eval can slip in between the removal and the hold.
+Replicating it makes the operator-facing state truthful on every manager and
+makes the backoff survive the restarts and leader changes the rig does
+routinely. Correctness and operator clarity won over a smaller diff.
+
+## 55. The backoff doubles per consecutive failure, per instance, and resets once a replacement survives `move_period`
+
+*Workstream: Scheduling.*
+
+**The call.** `attempt` counts a chain. A failure continues the chain when it
+comes within `move_period` of the previous hold's release (`created_at +
+delay`, so a lifted hold still continues it). The chain is keyed by instance
+for stateful tasks and by task for stateless ones. `move_count`, the
+job-failing budget, still counts every move of the task inside
+`move_period`, as before.
+
+**Alternatives.**
+- Keep doubling per move inside `move_period`, which is what the previous fix
+  did. With the default 30m period, the count of moves in the window drops as
+  the delays grow, so the backoff oscillated
+  (30s, 1m, 2m, 4m, 8m, 16m, 4m, 4m, 4m, 8m, ...) and never reached the
+  documented 30m cap.
+- Key the chain per task for keyed tasks too.
+
+**Trade-off.** The backoff and the budget now count different things, which
+the docs have to explain. A slow failure cadence (a replacement that runs
+29 minutes before failing) keeps doubling.
+
+**Why.** A chain gives the monotone 30s, 1m, ... 30m the docs promise, and
+"survives a whole `move_period`" is a clear reset rule. Keying it per
+instance keeps one broken sandbox from making every other sandbox of the task
+wait 30 minutes on its first failure. That would have turned a backoff meant
+for safety into an outage for a keyed sandbox fleet.
+
+## 56. `--force-reschedule` drops the job's move history, `instance start` keeps it
+
+*Workstream: Scheduling.*
+
+**The call.** A `job_update` eval (`job run --force-reschedule`, restarting a
+stopped or failed job) deletes the job's holds, so it places everything now
+and starts the budget over. `instance start <id>` on a `rescheduling` keyed
+instance only lifts that instance's hold (`not_before_unix = 0`). It answers
+`Retrying instance <id> now: lifted its reschedule backoff`, and another
+failure continues its chain.
+
+**Alternatives.** Have both keep history, or have both reset it. A new
+`legion instance retry` verb was the other option.
+
+**Trade-off.** A job restart forgets that the task was failing. A restarted
+job with `move_count` gets the full budget again.
+
+**Why.** A job restart already means "run it from the top" (task statuses
+reset too), and a restarted failed job must not fail again on its first
+failure because of the old budget. `instance start` is a nudge on one
+instance of a job that may still be broken, so keeping the chain stops a
+script that calls start in a loop from defeating the backoff. Reusing
+`start` instead of a new verb keeps the surface small. Start already meant
+"make this instance run", and for a `rescheduling` instance it used to do
+nothing.

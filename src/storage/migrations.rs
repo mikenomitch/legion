@@ -1957,6 +1957,47 @@ fn migration_list() -> Vec<M<'static>> {
         // row. Appended at the end, since raft changesets bind columns by
         // position. Scheduler lane, like `instance`.
         M::up("ALTER TABLE instance ADD COLUMN promoted_from TEXT;").down(""),
+        // Reschedule backoff holds (docs/jobs-tasks-and-scheduling.md,
+        // "Manager-side move logic"): one row per failed allocation whose
+        // replacement the move budget deferred. `not_before_unix` is when the
+        // replacement may be placed; the scheduler leaves that many
+        // replacements of the task (or that instance) unplaced until then,
+        // so no eval re-places it early. The rows inside `move_period` are
+        // also the task's move history, which is what makes the backoff the
+        // same on every manager and survive a restart. Written by the
+        // failed-allocation removal op in the transaction that deletes the
+        // row, cleared by a job restart and StartInstance, and expired at
+        // `expires_at_unix`. Scheduler lane, like `allocation`.
+        M::up(
+            "CREATE TABLE IF NOT EXISTS reschedule_hold (
+            allocation_id INTEGER PRIMARY KEY,
+            job_id STRING NOT NULL,
+            job_config_id STRING NOT NULL,
+            task_config_id INTEGER NOT NULL,
+            task_name STRING NOT NULL DEFAULT '',
+            group_name STRING NOT NULL DEFAULT '',
+            instance_id STRING,
+            node_id STRING NOT NULL,
+            attempt INTEGER NOT NULL,
+            delay_secs INTEGER NOT NULL,
+            not_before_unix INTEGER NOT NULL,
+            reason TEXT NOT NULL DEFAULT '',
+            created_at_unix INTEGER NOT NULL,
+            expires_at_unix INTEGER NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_reschedule_hold_task
+            ON reschedule_hold(job_config_id, task_config_id, created_at_unix);
+        CREATE INDEX IF NOT EXISTS idx_reschedule_hold_job
+            ON reschedule_hold(job_id, not_before_unix);
+        CREATE INDEX IF NOT EXISTS idx_reschedule_hold_instance
+            ON reschedule_hold(instance_id);",
+        )
+        .down(
+            "DROP INDEX IF EXISTS idx_reschedule_hold_instance;
+        DROP INDEX IF EXISTS idx_reschedule_hold_job;
+        DROP INDEX IF EXISTS idx_reschedule_hold_task;
+        DROP TABLE IF EXISTS reschedule_hold;",
+        ),
     ]
 }
 

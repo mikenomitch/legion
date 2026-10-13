@@ -1120,6 +1120,13 @@ async fn list_instances(arg_matches: &ArgMatches) -> R<()> {
     } else {
         let rows: Vec<InstanceRow> = reply.instances.iter().map(InstanceRow::from).collect();
         print_table(rows);
+        let backoff_notes = backoff_notes(&reply.instances);
+        if !backoff_notes.is_empty() {
+            println!();
+            for note in backoff_notes {
+                println!("{note}");
+            }
+        }
         if !reply.next_idle_page_token.is_empty() {
             println!(
                 "\nmore archived instances: --include-idle --idle-page-token {}",
@@ -1262,12 +1269,21 @@ impl From<&InstanceInfo> for InstanceRow {
             group: instance.group.clone(),
             task: instance.task.clone(),
             mode: instance.mode.clone(),
-            state: match (instance.pending_op.as_deref(), instance.cold_boot.as_ref()) {
-                (Some(op), _) => format!("{} ({op})", instance.state),
+            state: match (
+                instance.pending_op.as_deref(),
+                instance.cold_boot.as_ref(),
+                instance.reschedule_backoff.as_ref(),
+            ) {
+                (Some(op), _, _) => format!("{} ({op})", instance.state),
                 // Loud on purpose: the restore failed, so the workload's
                 // running processes are gone.
-                (None, Some(_)) => format!("{} (resumed cold)", instance.state),
-                (None, None) => instance.state.clone(),
+                (None, Some(_), _) => format!("{} (resumed cold)", instance.state),
+                // Waiting out a reschedule backoff: the note under the table
+                // says why and until when.
+                (None, None, Some(backoff)) => {
+                    format!("{} (backoff, attempt {})", instance.state, backoff.attempt)
+                }
+                (None, None, None) => instance.state.clone(),
             },
             slot: instance
                 .slot_index
@@ -1283,6 +1299,32 @@ impl From<&InstanceInfo> for InstanceRow {
                 .unwrap_or_else(|| "-".into()),
         }
     }
+}
+
+/// `instance list`'s notes under the table, one per instance waiting out a
+/// reschedule backoff: `<id>: rescheduling: attempt 4 failed (...); next
+/// attempt at ... (backoff 4m); ... retries now` (the manager's `detail`).
+fn backoff_notes(instances: &[InstanceInfo]) -> Vec<String> {
+    instances
+        .iter()
+        .filter(|instance| instance.reschedule_backoff.is_some())
+        .map(|instance| match instance.detail.as_deref() {
+            Some(detail) if detail.starts_with("rescheduling:") => {
+                format!("{}: {detail}", instance.instance_id)
+            }
+            // Another diagnostic took `detail` (a lost node); the backoff
+            // still gets its line.
+            _ => format!(
+                "{}: rescheduling: {}",
+                instance.instance_id,
+                instance
+                    .reschedule_backoff
+                    .as_ref()
+                    .map(|backoff| backoff.summary.as_str())
+                    .unwrap_or_default()
+            ),
+        })
+        .collect()
 }
 
 /// `snap-77e0 (memory, local w-03)`, `snap-5b10 (memory, published)`,
@@ -1449,6 +1491,52 @@ fn cold_boot_line(cold: &crate::structs::InstanceColdBoot) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn instance_list_flags_and_explains_a_backoff() {
+        let detail = "rescheduling: attempt 2 failed (boom); next attempt at \
+                      2026-10-12T02:31:05Z (backoff 1m); `legion instance start sb-1` retries now";
+        let waiting = InstanceInfo {
+            instance_id: "sb-1".into(),
+            state: "rescheduling".into(),
+            detail: Some(detail.into()),
+            reschedule_backoff: Some(crate::structs::RescheduleBackoff {
+                attempt: 2,
+                summary: "attempt 2 failed (boom); next attempt at 2026-10-12T02:31:05Z \
+                          (backoff 1m)"
+                    .into(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let running = InstanceInfo {
+            instance_id: "sb-2".into(),
+            state: "active".into(),
+            ..Default::default()
+        };
+        assert_eq!(
+            InstanceRow::from(&waiting).state,
+            "rescheduling (backoff, attempt 2)"
+        );
+        assert_eq!(InstanceRow::from(&running).state, "active");
+        assert_eq!(
+            backoff_notes(&[waiting.clone(), running]),
+            vec![format!("sb-1: {detail}")]
+        );
+        // A lost-node diagnostic in `detail` does not hide the backoff.
+        let gated = InstanceInfo {
+            detail: Some("pending-loss-confirmation: ...".into()),
+            ..waiting
+        };
+        assert_eq!(
+            backoff_notes(&[gated]),
+            vec![
+                "sb-1: rescheduling: attempt 2 failed (boom); next attempt at \
+                 2026-10-12T02:31:05Z (backoff 1m)"
+                    .to_string()
+            ]
+        );
+    }
 
     #[test]
     fn instance_create_command_parses_all_flags() -> R<()> {
