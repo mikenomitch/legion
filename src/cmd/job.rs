@@ -2066,8 +2066,18 @@ async fn plan_job(arg_matches: &ArgMatches) -> R<()> {
             }
             for (node_id, victims) in by_node {
                 for victim in victims {
+                    // A victim still inside victimExemptAge: the submit
+                    // waits for it to age, then evicts it.
+                    let wait = if victim.eligible_in_seconds > 0 {
+                        format!(
+                            ", once past victimExemptAge in {}s",
+                            victim.eligible_in_seconds
+                        )
+                    } else {
+                        String::new()
+                    };
                     println!(
-                        "  {node_id}: {}/{} (alloc {}, priority {}) — {}s grace, requeued",
+                        "  {node_id}: {}/{} (alloc {}, priority {}) — {}s grace, requeued{wait}",
                         victim.job_id,
                         victim.task_name,
                         victim.allocation_id,

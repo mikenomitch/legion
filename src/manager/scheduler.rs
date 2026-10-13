@@ -499,6 +499,21 @@ struct PreemptorContext<'a> {
 struct PreemptionChoice {
     node_id: String,
     victims: Vec<VictimCandidate>,
+    /// True when the victims are only evictable once they age past
+    /// `victimExemptAge`. Only a dry run places on such a choice.
+    deferred: bool,
+}
+
+/// One preemption pass's findings across a placement's candidate nodes
+/// ([`Scheduler::cheapest_preemption`]).
+#[derive(Default)]
+struct PreemptionSearch {
+    /// The cheapest node's victim set, and its cost.
+    best: Option<(PreemptionChoice, (usize, u32))>,
+    /// The cost of every node that could be freed, for the tiebreak.
+    node_scores: HashMap<String, (usize, u32)>,
+    /// Why each node's candidates were rejected.
+    tallies: Vec<preemption::IneligibleTally>,
 }
 
 /// The preemption state of one `build_plan` run.
@@ -523,6 +538,16 @@ struct PreemptionPass {
     /// that emitted events would make repeatedly previewing a job look like
     /// repeatedly nearly-preempting one.
     journal_observed: bool,
+    /// True for a dry run (`job plan`). A preview reports the victims a
+    /// placement will take once they age past `victimExemptAge`, where the
+    /// applying plan has to wait for them instead (see `deferred_wait`).
+    preview: bool,
+    /// Set by the latest preemption attempt when `victimExemptAge` was all
+    /// that kept it from finding room: the seconds until the victims it would
+    /// take age past the guard. An applying plan puts it on the placement's
+    /// [`crate::manager::blocked::PlacementBlocked`], so the eval retries
+    /// then instead of waiting blocked for an unrelated capacity change.
+    deferred_wait: Option<u64>,
     /// Victim metadata by node, loaded lazily for the nodes actually asked
     /// about. `None` until the first preemption attempt in this plan.
     by_node: Option<HashMap<String, Vec<VictimCandidate>>>,
@@ -554,6 +579,7 @@ impl PreemptionPass {
         preemptor_job: &str,
         preemptor_config_id: &str,
         journal_observed: bool,
+        preview: bool,
         settings: &PreemptionSettings,
     ) -> Self {
         Self {
@@ -561,6 +587,8 @@ impl PreemptionPass {
             preemptor_job: preemptor_job.to_string(),
             preemptor_config_id: preemptor_config_id.to_string(),
             journal_observed,
+            preview,
+            deferred_wait: None,
             by_node: None,
             victims: Vec::new(),
             observed: Vec::new(),
@@ -739,6 +767,12 @@ impl PreemptionPass {
             );
         }
         let detail = self.rejected.describe();
+        if let Some(wait) = self.deferred_wait {
+            return format!(
+                "{base}; preemption found no eligible victims yet ({detail}). The victims it \
+                 would take age past victimExemptAge in {wait}s, and placement retries then"
+            );
+        }
         if detail.is_empty() {
             format!(
                 "{base}. Preemption found no eligible victims on any feasible node. \
@@ -2287,6 +2321,7 @@ impl<'a> Scheduler<'a> {
             preemptor.job,
             job_config_id,
             preemptor.journal_observed,
+            !applying,
             &self.preemption,
         );
 
@@ -3450,17 +3485,11 @@ impl<'a> Scheduler<'a> {
                             &plan.task_request,
                         );
                     }
+                    let exempt_age = self.preemption.victim_exempt_age;
                     preemption
                         .victims
-                        .extend(chosen.victims.iter().map(|victim| PlannedPreemption {
-                            allocation_id: victim.allocation_id,
-                            node_id: victim.node_id.clone(),
-                            job_id: victim.job_id.clone(),
-                            job_config_id: victim.job_config_id.clone(),
-                            task_config_id: victim.task_config_id,
-                            task_name: victim.task_name.clone(),
-                            band: victim.band,
-                            kill_after_secs: victim.kill_after_secs,
+                        .extend(chosen.victims.iter().map(|victim| {
+                            victim.planned(Self::victim_wait(&chosen, victim, exempt_age))
                         }));
                     eligible = full_but_allowed
                         .iter()
@@ -3504,6 +3533,13 @@ impl<'a> Scheduler<'a> {
                     task_id,
                     pinned_node,
                     reason.clone(),
+                )
+                // Victims too young to take now are old enough in this
+                // long; one more second covers the timestamps' rounding.
+                .with_retry_after(
+                    preemption
+                        .deferred_wait
+                        .map(|wait| std::time::Duration::from_secs(wait + 1)),
                 );
                 return Self::record_unplaced(
                     partial,
@@ -4254,6 +4290,7 @@ impl<'a> Scheduler<'a> {
         pinned_volume_node: Option<String>,
         pass: &mut PreemptionPass,
     ) -> R<Option<PreemptionChoice>> {
+        pass.deferred_wait = None;
         if !pass.preemptor_band.can_preempt() {
             return Ok(None);
         }
@@ -4297,46 +4334,43 @@ impl<'a> Scheduler<'a> {
         pass.considered += 1;
         pass.load_candidates(self.store, &self.store.resource_policy, &candidates)?;
 
-        let mut best: Option<(PreemptionChoice, (usize, u32))> = None;
-        let mut node_scores: HashMap<String, (usize, u32)> = HashMap::new();
-        for node in &candidates {
-            let Some(free) = resource_ledger.pools.get(node.id.as_str()) else {
-                continue;
-            };
-            let on_node = pass.candidates_on_node(&node.id);
-            let (victims, tally) = choose_victims(
-                ask,
-                free,
-                &on_node,
-                pass.preemptor_band,
-                self.preemption.victim_exempt_age,
-                &pass.taken_by_task,
-            );
+        let exempt_age = self.preemption.victim_exempt_age;
+        let mut found = self.cheapest_preemption(&candidates, ask, resource_ledger, pass, false);
+        let mut young_rejected = false;
+        for tally in std::mem::take(&mut found.tallies) {
+            young_rejected |= tally.too_young > 0;
             pass.record_tally(tally);
-            let Some(victims) = victims else {
-                continue;
-            };
-            // A node that needs no victims would have passed the resource
-            // check and never reached this pass; treat it as free anyway.
-            let cost = preemption_cost(&victims);
-            node_scores.insert(node.id.clone(), cost);
-            let better = best
-                .as_ref()
-                .map(|(_, best_cost)| cost < *best_cost)
-                .unwrap_or(true);
-            if better {
-                best = Some((
-                    PreemptionChoice {
-                        node_id: node.id.clone(),
-                        victims,
-                    },
-                    cost,
-                ));
+        }
+        // `victimExemptAge` was all that stood in the way when the same pass
+        // with the guard lifted finds room. The placement cannot take that
+        // room yet, but it will once the victims age past the guard: a dry
+        // run previews exactly that, and an applying plan records when, so
+        // its eval retries then (the 2026-10-12 spot check: `job plan`
+        // failed seconds after the fill landed, while the submit placed a
+        // minute later).
+        if found.best.is_none() && young_rejected {
+            let lifted = self.cheapest_preemption(&candidates, ask, resource_ledger, pass, true);
+            if let Some((choice, _)) = lifted.best.as_ref() {
+                // Only enforce mode ever takes them, so only it has a time
+                // worth retrying at.
+                if matches!(self.preemption.mode, PreemptionMode::Enforce) {
+                    pass.deferred_wait = choice
+                        .victims
+                        .iter()
+                        .map(|victim| victim.exempt_for_secs(exempt_age))
+                        .max();
+                }
+                found = lifted;
             }
         }
+        let deferred = found
+            .best
+            .as_ref()
+            .is_some_and(|(choice, _)| choice.deferred);
 
-        let Some((mut choice, best_cost)) = best else {
-            // The pass ran and could not help. Worth a metric of its own:
+        let Some((mut choice, best_cost)) = found.best.filter(|_| !deferred || pass.preview) else {
+            // The pass ran and could not help (or, for an applying plan,
+            // cannot help until the victims age). Worth a metric of its own:
             // "preemption is enabled and still not placing this" is a
             // different operational story from "preemption never ran", and
             // only the counter distinguishes them at a glance.
@@ -4345,13 +4379,18 @@ impl<'a> Scheduler<'a> {
                 .inc(&["no_victims"]);
             return Ok(None);
         };
+        let selection_age = if deferred {
+            std::time::Duration::ZERO
+        } else {
+            exempt_age
+        };
 
         // Tiebreak within the cheapest group using the normal policy score,
         // so preemption does not undo the cluster's packing strategy.
         let tied: Vec<&Node> = candidates
             .iter()
             .copied()
-            .filter(|node| node_scores.get(&node.id).copied() == Some(best_cost))
+            .filter(|node| found.node_scores.get(&node.id).copied() == Some(best_cost))
             .collect();
         if tied.len() > 1 {
             let mut ids: Vec<&str> = tied.iter().map(|node| node.id.as_str()).collect();
@@ -4368,13 +4407,14 @@ impl<'a> Scheduler<'a> {
                                 free,
                                 &on_node,
                                 pass.preemptor_band,
-                                self.preemption.victim_exempt_age,
+                                selection_age,
                                 &pass.taken_by_task,
                             );
                             if let Some(victims) = victims {
                                 choice = PreemptionChoice {
                                     node_id: node.id.clone(),
                                     victims,
+                                    deferred,
                                 };
                             }
                         }
@@ -4386,17 +4426,12 @@ impl<'a> Scheduler<'a> {
         if matches!(self.preemption.mode, PreemptionMode::Observe) {
             // Same selection, no commitment. The placement fails exactly as
             // it does with preemption off; the operator gets the evidence.
-            pass.observed
-                .extend(choice.victims.iter().map(|victim| PlannedPreemption {
-                    allocation_id: victim.allocation_id,
-                    node_id: victim.node_id.clone(),
-                    job_id: victim.job_id.clone(),
-                    job_config_id: victim.job_config_id.clone(),
-                    task_config_id: victim.task_config_id,
-                    task_name: victim.task_name.clone(),
-                    band: victim.band,
-                    kill_after_secs: victim.kill_after_secs,
-                }));
+            pass.observed.extend(
+                choice
+                    .victims
+                    .iter()
+                    .map(|victim| victim.planned(Self::victim_wait(&choice, victim, exempt_age))),
+            );
             info!(
                 task = %task_config.name,
                 preemptor_job = %pass.preemptor_job,
@@ -4420,6 +4455,78 @@ impl<'a> Scheduler<'a> {
             return Ok(None);
         }
         Ok(Some(choice))
+    }
+
+    /// Seconds until `victim` may be evicted under `choice`: 0 unless the
+    /// choice is a dry run's deferred one (see [`PreemptionChoice::deferred`]).
+    fn victim_wait(
+        choice: &PreemptionChoice,
+        victim: &VictimCandidate,
+        exempt_age: std::time::Duration,
+    ) -> u64 {
+        if choice.deferred {
+            victim.exempt_for_secs(exempt_age)
+        } else {
+            0
+        }
+    }
+
+    /// One preemption pass over `candidates`: the cheapest node's victim
+    /// set, every node's cost, and each node's rejection tally. `lift_guard`
+    /// runs it as though `victimExemptAge` were zero, which is how a
+    /// placement learns that the guard alone is in its way.
+    fn cheapest_preemption(
+        &self,
+        candidates: &[&Node],
+        ask: &ResourceRequest,
+        resource_ledger: &ResourceLedger,
+        pass: &PreemptionPass,
+        lift_guard: bool,
+    ) -> PreemptionSearch {
+        let exempt_age = if lift_guard {
+            std::time::Duration::ZERO
+        } else {
+            self.preemption.victim_exempt_age
+        };
+        let mut search = PreemptionSearch::default();
+        for node in candidates {
+            let Some(free) = resource_ledger.pools.get(node.id.as_str()) else {
+                continue;
+            };
+            let on_node = pass.candidates_on_node(&node.id);
+            let (victims, tally) = choose_victims(
+                ask,
+                free,
+                &on_node,
+                pass.preemptor_band,
+                exempt_age,
+                &pass.taken_by_task,
+            );
+            search.tallies.push(tally);
+            let Some(victims) = victims else {
+                continue;
+            };
+            // A node that needs no victims would have passed the resource
+            // check and never reached this pass; treat it as free anyway.
+            let cost = preemption_cost(&victims);
+            search.node_scores.insert(node.id.clone(), cost);
+            let better = search
+                .best
+                .as_ref()
+                .map(|(_, best_cost)| cost < *best_cost)
+                .unwrap_or(true);
+            if better {
+                search.best = Some((
+                    PreemptionChoice {
+                        node_id: node.id.clone(),
+                        victims,
+                        deferred: lift_guard,
+                    },
+                    cost,
+                ));
+            }
+        }
+        search
     }
 
     /// The subset of `candidates` one placement may still use: the nodes
@@ -9879,6 +9986,118 @@ mod tests {
             err.to_string().contains("victimExemptAge"),
             "the error names the guard that bound: {err}"
         );
+        Ok(())
+    }
+
+    /// Spot check 2026-10-12: `job plan` for a high-band claim failed "no
+    /// available nodes" seconds after the low-band fill landed, while the
+    /// submit went on to preempt it. The guard alone stood in the way, so
+    /// the preview shows the victims the submit will take, with the wait.
+    #[test]
+    fn a_plan_previews_preemption_that_waits_on_victim_exempt_age() -> R<()> {
+        let store = setup_store()?;
+        small_node(&store, "node-a")?;
+        let scheduler = Scheduler::new(&store)?;
+        let fill = submit_banded(&store, "band-fill", Band::Low, 2, None)?;
+        scheduler.plan_and_apply(&fill, PlanMode::Fresh)?;
+        // Deliberately NOT aged: the fill is seconds old.
+
+        // A not-yet-submitted claim: `job plan`'s new-job path.
+        let claim = JobConfig {
+            priority: Band::High,
+            rollout: None,
+            rollout_by_group: Default::default(),
+            name: "band-claim".into(),
+            tasks: vec![TaskConfig {
+                resources: json!({ "memory": 256 }),
+                ..TaskConfig::new("vm", "noop")
+            }],
+            version: None,
+        };
+        let outcome = scheduler.plan_for_config(&claim, PlanMode::Fresh, None)?;
+        assert_eq!(outcome.allocations.len(), 1, "the preview places the claim");
+        assert_eq!(outcome.preemptions.len(), 1, "by taking one victim");
+        let victim = &outcome.preemptions[0];
+        assert_eq!(victim.job_id, "band-fill");
+        assert!(
+            (1..=60).contains(&victim.eligible_in_secs),
+            "the victim is evictable once past the 60s guard, not now: {}",
+            victim.eligible_in_secs
+        );
+
+        // The submitted claim's preview (`plan_only_with_report`) agrees.
+        let submitted = submit_banded(&store, "band-claim", Band::High, 1, None)?;
+        let (placements, _, preemptions) =
+            scheduler.plan_only_with_report(&submitted, PlanMode::Fresh)?;
+        assert_eq!(placements.len(), 1);
+        assert_eq!(preemptions.len(), 1);
+        assert!(preemptions[0].eligible_in_secs > 0);
+
+        // Old enough, the same preview evicts right away.
+        age_allocations(&store)?;
+        let (_, _, preemptions) = scheduler.plan_only_with_report(&submitted, PlanMode::Fresh)?;
+        assert_eq!(preemptions.len(), 1);
+        assert_eq!(preemptions[0].eligible_in_secs, 0);
+        Ok(())
+    }
+
+    /// The submit side of the same window: nothing evicts early, and the
+    /// blocked placement carries when to retry, since a victim getting older
+    /// is not a capacity event that would wake a blocked eval.
+    #[test]
+    fn a_placement_waiting_on_victim_exempt_age_says_when_to_retry() -> R<()> {
+        let store = setup_store()?;
+        small_node(&store, "node-a")?;
+        let scheduler = Scheduler::new(&store)?;
+        let fill = submit_banded(&store, "band-fill", Band::Low, 2, None)?;
+        scheduler.plan_and_apply(&fill, PlanMode::Fresh)?;
+
+        let claim = submit_banded(&store, "band-claim", Band::High, 1, None)?;
+        let err = scheduler
+            .plan_and_apply(&claim, PlanMode::Fresh)
+            .expect_err("the guard holds for the real placement");
+        let blocked =
+            crate::manager::blocked::PlacementBlocked::in_chain(&err).expect("a blocked placement");
+        let retry = blocked.retry_after.expect("a retry time");
+        assert!(
+            retry > std::time::Duration::from_secs(1)
+                && retry <= std::time::Duration::from_secs(61),
+            "retry once the fill ages past the 60s guard: {retry:?}"
+        );
+        assert!(
+            blocked.message.contains("victimExemptAge in"),
+            "the message says when: {}",
+            blocked.message
+        );
+        assert_eq!(store.allocs_for_node("node-a")?.len(), 2, "nothing evicted");
+
+        // A partial plan carries the same retry on the replica it left.
+        let store = setup_store()?;
+        small_node(&store, "node-a")?;
+        let scheduler = Scheduler::new(&store)?;
+        let fill = submit_banded(&store, "band-fill", Band::Low, 1, None)?;
+        scheduler.plan_and_apply(&fill, PlanMode::Fresh)?;
+        let claim = submit_banded(&store, "band-claim", Band::High, 2, None)?;
+        let outcome = scheduler.plan_and_apply(&claim, PlanMode::Fresh)?;
+        assert_eq!(outcome.allocations.len(), 1, "the free slot is taken");
+        assert!(outcome.evictions.is_empty());
+        assert_eq!(outcome.unplaced.len(), 1);
+        assert!(outcome.unplaced[0].blocked.retry_after.is_some());
+
+        // A guard that is not the only obstacle sets no retry: a peer band
+        // can never be taken, however old.
+        let store = setup_store()?;
+        small_node(&store, "node-a")?;
+        let scheduler = Scheduler::new(&store)?;
+        let peer = submit_banded(&store, "peer", Band::High, 2, None)?;
+        scheduler.plan_and_apply(&peer, PlanMode::Fresh)?;
+        let claim = submit_banded(&store, "band-claim", Band::High, 1, None)?;
+        let err = scheduler
+            .plan_and_apply(&claim, PlanMode::Fresh)
+            .expect_err("a peer is never a victim");
+        let blocked =
+            crate::manager::blocked::PlacementBlocked::in_chain(&err).expect("a blocked placement");
+        assert_eq!(blocked.retry_after, None);
         Ok(())
     }
 

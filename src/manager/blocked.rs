@@ -46,6 +46,12 @@ pub struct PlacementBlocked {
     /// what it asks for, for `job status` and the wake pass.
     pub detail: Value,
     pub message: String,
+    /// When a retry is known to help even with no capacity change: the
+    /// placement could preempt, but only once its victims age past
+    /// `victimExemptAge`. The eval worker requeues the eval after this delay
+    /// instead of blocking it, because nothing would wake a blocked eval
+    /// when an allocation merely gets older.
+    pub retry_after: Option<std::time::Duration>,
 }
 
 impl std::fmt::Display for PlacementBlocked {
@@ -77,7 +83,14 @@ impl PlacementBlocked {
                 "message": message,
             }),
             message,
+            retry_after: None,
         }
+    }
+
+    /// The same block, retried after `retry_after` (see the field).
+    pub fn with_retry_after(mut self, retry_after: Option<std::time::Duration>) -> Self {
+        self.retry_after = retry_after;
+        self
     }
 
     /// Blocked with no task to reason about.
@@ -86,6 +99,7 @@ impl PlacementBlocked {
             key: ESCAPED_KEY.to_string(),
             detail: json!({ "message": message }),
             message,
+            retry_after: None,
         }
     }
 

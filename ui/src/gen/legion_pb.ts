@@ -3736,6 +3736,22 @@ export class PlannedPreemption extends Message<PlannedPreemption> {
    */
   killAfterSeconds = protoInt64.zero;
 
+  /**
+   * Seconds until the victim ages past `preemption.victimExemptAge` and may
+   * be evicted. 0 for a victim a submit would evict right away.
+   *
+   * Non-zero only when the guard is the one thing between the placement and
+   * room: every victim the placement needs is younger than the guard. The
+   * plan then still shows the placement and these victims, because that is
+   * what the submit converges to. The submit itself waits: its eval retries
+   * once the youngest victim is old enough (`eval.blocked` names the wait),
+   * and evicts then. Before this field, the plan failed with "no available
+   * nodes" in that window while the submit went on to preempt.
+   *
+   * @generated from field: uint64 eligible_in_seconds = 7;
+   */
+  eligibleInSeconds = protoInt64.zero;
+
   constructor(data?: PartialMessage<PlannedPreemption>) {
     super();
     proto3.util.initPartial(data, this);
@@ -3750,6 +3766,7 @@ export class PlannedPreemption extends Message<PlannedPreemption> {
     { no: 4, name: "band", kind: "scalar", T: 9 /* ScalarType.STRING */ },
     { no: 5, name: "allocation_id", kind: "scalar", T: 3 /* ScalarType.INT64 */ },
     { no: 6, name: "kill_after_seconds", kind: "scalar", T: 4 /* ScalarType.UINT64 */ },
+    { no: 7, name: "eligible_in_seconds", kind: "scalar", T: 4 /* ScalarType.UINT64 */ },
   ]);
 
   static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): PlannedPreemption {

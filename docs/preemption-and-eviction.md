@@ -117,6 +117,21 @@ aged past the guard, preempt it to come back: two evictions where one does.
 The guard never makes a preemption possible that otherwise isn't. When only
 young work could make room, it stays protected and the placement waits.
 
+The wait is on the clock, not on the cluster. A victim getting older is not a
+capacity change, so nothing would wake a blocked eval for it. When the guard
+is the only thing in the way, the eval retries once the youngest victim it
+needs is old enough, and preempts then. The `eval.blocked` event says when:
+
+```text
+Failed to place task vm: no available nodes matching constraints, permit, or
+resources; preemption found no eligible victims yet (4 below victimExemptAge).
+The victims it would take age past victimExemptAge in 23s, and placement
+retries then
+```
+
+A plan that places some replicas and leaves one waiting this way queues a
+delayed `job_reschedule` for the same moment.
+
 Across nodes, the plan with the fewest victims wins. Ties go to the plan that
 takes the least important work. Remaining ties go to the normal scoring policy,
 so preemption does not undo the cluster's packing strategy. A placement that
@@ -253,6 +268,20 @@ Preemption: would preempt
 In `observe` mode, the same command reports what `enforce` would do and labels
 it that way. When preemption is off, the output says so, instead of showing an
 empty list that looks like "nothing would be displaced".
+
+When the victims are younger than `victimExemptAge` and the guard is all that
+stands in the way, the plan still shows the placement and the victims, with
+how long the submit will wait before taking them:
+
+```console
+Preemption: would preempt
+  node-b: band-fill/vm (alloc 88, priority low) — 30s grace, requeued, once past victimExemptAge in 23s
+```
+
+`job plan -j` carries the same wait as `eligibleInSeconds` on each entry of
+`preemptions` (0 for a victim the submit takes right away). Before this, the
+plan failed with "no available nodes" in that window while the submit went on
+to preempt a minute later.
 
 The plan runs against a snapshot and reserves nothing. The real submit plans
 again, so it may take different victims if the cluster changed in between.

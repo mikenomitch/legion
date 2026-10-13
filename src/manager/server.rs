@@ -5135,6 +5135,7 @@ impl Manager for ManagerDaemonService {
                 band: victim.band.as_str().to_string(),
                 allocation_id: victim.allocation_id,
                 kill_after_seconds: victim.kill_after_secs,
+                eligible_in_seconds: victim.eligible_in_secs,
             })
             .collect();
 

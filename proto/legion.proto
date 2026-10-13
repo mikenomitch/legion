@@ -3050,6 +3050,10 @@ message PlanJobReply {
   // `observe` mode (what enforce mode *would* evict, given that observe
   // commits nothing) — so the preview answers the same question either way.
   //
+  // A victim younger than `preemption.victimExemptAge` is listed with a
+  // non-zero `eligible_in_seconds` when the guard alone keeps the placement
+  // from fitting: the submit waits that long, then evicts it.
+  //
   // This is a plan against a snapshot, not a reservation. The real submit
   // re-plans, so the victims it takes may differ if the cluster moved in
   // between. See docs/preemption-and-eviction.md.
@@ -3093,6 +3097,18 @@ message PlannedPreemption {
   // The victim's `stop.killAfter` in seconds — how long it gets between the
   // stop signal and SIGKILL (docs/graceful-stop.md).
   uint64 kill_after_seconds = 6;
+
+  // Seconds until the victim ages past `preemption.victimExemptAge` and may
+  // be evicted. 0 for a victim a submit would evict right away.
+  //
+  // Non-zero only when the guard is the one thing between the placement and
+  // room: every victim the placement needs is younger than the guard. The
+  // plan then still shows the placement and these victims, because that is
+  // what the submit converges to. The submit itself waits: its eval retries
+  // once the youngest victim is old enough (`eval.blocked` names the wait),
+  // and evicts then. Before this field, the plan failed with "no available
+  // nodes" in that window while the submit went on to preempt.
+  uint64 eligible_in_seconds = 7;
 }
 
 // How candidate construction went for one planned task — the scheduling

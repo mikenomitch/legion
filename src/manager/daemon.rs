@@ -3390,6 +3390,31 @@ pub fn resolve_claimed_eval(store: &Store, worker_id: usize, eval: &Eval) -> Eva
             let blocked = PlacementBlocked::in_chain(&e)
                 .cloned()
                 .expect("matched by the guard");
+            // Preemption that only waits on `victimExemptAge`: the room
+            // exists once the victims age, and no capacity event would wake a
+            // blocked eval for that, so retry on the clock instead.
+            if let Some(delay) = blocked.retry_after {
+                info!(
+                    worker_id,
+                    eval_id = %eval.id,
+                    kind = %eval.kind,
+                    delay_ms = delay.as_millis() as u64,
+                    "Eval waits for preemption victims to age past victimExemptAge: {}",
+                    blocked.message
+                );
+                clear_not_leader_attempts(&eval.id);
+                // `eval.blocked` still, since the job is: its message names
+                // the guard and when placement retries.
+                return EvalCompletion::Released {
+                    delay,
+                    event: Some(drafts::eval_blocked(
+                        eval,
+                        &blocked.key,
+                        &blocked.detail,
+                        &blocked.message,
+                    )),
+                };
+            }
             warn!(
                 worker_id,
                 eval_id = %eval.id,

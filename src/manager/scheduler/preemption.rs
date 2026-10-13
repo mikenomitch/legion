@@ -174,6 +174,12 @@ pub struct PlannedPreemption {
     /// The victim's `stop.killAfter`, so the preview can say how long the
     /// displaced work has to shut down.
     pub kill_after_secs: u64,
+    /// Seconds until the victim ages past `victimExemptAge`. Always 0 for a
+    /// victim a plan commits. Only a dry run (`job plan`) reports more: when
+    /// the guard is all that stands between the placement and room, the
+    /// preview shows the victims the submit will take once they age past it,
+    /// rather than an error the submit would not return.
+    pub eligible_in_secs: u64,
 }
 
 /// An allocation that *could* be a victim, with everything selection needs.
@@ -203,6 +209,32 @@ pub struct VictimCandidate {
     /// evicting it frees nothing and costs a restart.
     pub node_pinned: bool,
     pub kill_after_secs: u64,
+}
+
+impl VictimCandidate {
+    /// Seconds until this allocation ages past `victim_exempt_age`, or 0
+    /// when it already has (or predates allocation timestamps).
+    pub fn exempt_for_secs(&self, victim_exempt_age: std::time::Duration) -> u64 {
+        let exempt_secs = victim_exempt_age.as_secs() as i64;
+        self.age_secs
+            .map(|age| exempt_secs.saturating_sub(age).max(0) as u64)
+            .unwrap_or(0)
+    }
+
+    /// This candidate as a plan's victim, `eligible_in_secs` from now.
+    pub fn planned(&self, eligible_in_secs: u64) -> PlannedPreemption {
+        PlannedPreemption {
+            allocation_id: self.allocation_id,
+            node_id: self.node_id.clone(),
+            job_id: self.job_id.clone(),
+            job_config_id: self.job_config_id.clone(),
+            task_config_id: self.task_config_id,
+            task_name: self.task_name.clone(),
+            band: self.band,
+            kill_after_secs: self.kill_after_secs,
+            eligible_in_secs,
+        }
+    }
 }
 
 /// Why a candidate was not eligible — collected so the "could not place"

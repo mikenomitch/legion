@@ -431,6 +431,7 @@ impl Eval {
             let dispatch_started = Instant::now();
             dispatch_allocations(store, &outcome.allocations)?;
             observe_phase(&self.kind, "dispatch", dispatch_started.elapsed());
+            self.schedule_preemption_retry(store, &outcome)?;
             return Ok(outcome);
         };
 
@@ -507,7 +508,39 @@ impl Eval {
             }
         };
         observe_phase(&self.kind, "dispatch", dispatch_time);
+        self.schedule_preemption_retry(store, &outcome)?;
         Ok(outcome)
+    }
+
+    /// A plan that placed part of the job and left a replica waiting for
+    /// preemption victims to age past `victimExemptAge` queues one delayed
+    /// `job_reschedule` for when they have. Nothing else would retry it: a
+    /// victim getting older is not a capacity event. (A plan that placed
+    /// nothing gets the same retry from the eval worker, which requeues the
+    /// eval itself.)
+    fn schedule_preemption_retry(&self, store: &Store, outcome: &PlanOutcome) -> R<()> {
+        let Some(delay) = outcome
+            .unplaced
+            .iter()
+            .filter_map(|task| task.blocked.retry_after)
+            .min()
+        else {
+            return Ok(());
+        };
+        if self.job_id.trim().is_empty()
+            || store.delayed_eval_pending("job_reschedule", &self.job_config_id)?
+        {
+            return Ok(());
+        }
+        store.enqueue_eval_after_delay(
+            "job_reschedule",
+            Some(&self.job_id),
+            Some(&self.job_config_id),
+            None,
+            None,
+            delay,
+        )?;
+        Ok(())
     }
 
     /// The node a reschedule should avoid: the one the failed allocation ran
