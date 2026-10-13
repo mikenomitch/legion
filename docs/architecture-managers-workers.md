@@ -295,6 +295,14 @@ registration does not strand the node. The worker still reads the join
 token at every start for the manager address and the cluster CA pin it
 carries, so keep the file in place.
 
+Re-adoption keeps a task's processes, not its mesh connections. The node's
+datapath (`connect` upstream listeners, ingress listeners, TLS termination,
+handlers) runs inside the worker process, so a worker restart severs every
+connection in flight through it, and new dials fail until the restarted
+worker's first heartbeat brings back the endpoint feed. Apps should reconnect
+on a dropped upstream connection. See
+[Restarting a worker in place](upgrades.md#restarting-a-worker-in-place).
+
 When a task's tracked process is gone at restart but its children are not
 (a `sh -c` wrapper that exited while its server kept running), the worker
 kills the rest of that task's process group instead of leaving it
