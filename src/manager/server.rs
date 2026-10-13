@@ -591,7 +591,8 @@ fn resolve_scalable_task<'a>(
                 .map(|task| format!("{}/{}", task.group, task.name))
                 .collect();
             Err(Status::invalid_argument(format!(
-                "multiple scalable tasks match in job {} ({}); disambiguate with task_group and task_name",
+                "multiple scalable tasks match in job {} ({}); disambiguate with --group and --task \
+                 (task_group and task_name in the API)",
                 job_id,
                 matches.join(", "),
             )))
@@ -12681,7 +12682,7 @@ impl ManagerDaemonService {
                 config.tasks[0].clone()
             } else {
                 return Err(Status::invalid_argument(format!(
-                    "job '{job_id}' has {} tasks; name one with task_name ({})",
+                    "job '{job_id}' has {} tasks; name one with --task (task_name in the API): {}",
                     config.tasks.len(),
                     config
                         .tasks
