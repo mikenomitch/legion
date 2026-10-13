@@ -1271,7 +1271,9 @@ async fn dispatch_tool(name: &str, args: Value) -> Result<Value, String> {
         }
         "legion_node_list" => {
             let mut client = connect().await?;
-            grpc(client.get_nodes(GetNodesRequest::default())).await
+            grpc(client.get_nodes(GetNodesRequest::default()))
+                .await
+                .map(decode_node_attrs)
         }
         "legion_node_cadence" => {
             let mut client = connect().await?;
@@ -1362,6 +1364,7 @@ async fn dispatch_tool(name: &str, args: Value) -> Result<Value, String> {
                 idempotency_key,
             }))
             .await
+            .map(decode_node_attrs)
         }
         "legion_boot_ticket_create" => {
             let scope = opt_str_arg(&args, "scope").unwrap_or_else(|| "boot".to_string());
@@ -1406,7 +1409,9 @@ async fn dispatch_tool(name: &str, args: Value) -> Result<Value, String> {
         "legion_node_claims" => {
             let id = str_arg(&args, "node_id")?;
             let mut client = connect().await?;
-            grpc(client.get_node(crate::structs::GetNodeRequest { id })).await
+            grpc(client.get_node(crate::structs::GetNodeRequest { id }))
+                .await
+                .map(decode_node_attrs)
         }
         "legion_acl_whoami" => {
             let mut client = connect().await?;
@@ -2316,6 +2321,39 @@ where
     }
 }
 
+/// `NodeMsg` fields that carry JSON as text on the wire.
+const NODE_JSON_FIELDS: [&str; 4] = [
+    "configAttrs",
+    "fingerprintAttrs",
+    "dynamicAttrs",
+    "healthChecks",
+];
+
+/// Decode the JSON-text attribute fields of the node(s) in a reply's `node`
+/// or `nodes`, so an agent reads them as objects, as `legion node list
+/// --json` prints them, instead of a JSON string inside JSON. A field that
+/// does not parse is left as the string it was.
+fn decode_node_attrs(mut reply: Value) -> Value {
+    fn decode(node: &mut Value) {
+        for key in NODE_JSON_FIELDS {
+            let parsed = node
+                .get(key)
+                .and_then(Value::as_str)
+                .and_then(|text| serde_json::from_str::<Value>(text).ok());
+            if let Some(parsed) = parsed {
+                node[key] = parsed;
+            }
+        }
+    }
+    if let Some(node) = reply.get_mut("node").filter(|node| node.is_object()) {
+        decode(node);
+    }
+    if let Some(Value::Array(nodes)) = reply.get_mut("nodes") {
+        nodes.iter_mut().for_each(decode);
+    }
+    reply
+}
+
 fn str_arg(args: &Value, key: &str) -> Result<String, String> {
     args.get(key)
         .and_then(Value::as_str)
@@ -2364,6 +2402,43 @@ fn json_rpc_error(id: Value, code: i64, message: &str) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// AWS spot-check re-run: `legion_node_list` returned `configAttrs` and
+    /// `dynamicAttrs` as JSON strings inside the JSON reply. Both MCP and
+    /// `legion node list --json` must give objects.
+    #[test]
+    fn node_attrs_are_objects_not_json_strings_test() {
+        let node = crate::structs::NodeMsg {
+            id: "w-1".into(),
+            config_attrs: r#"{"workerAddress":"https://10.0.0.5:4848"}"#.into(),
+            fingerprint_attrs: r#"{"memory":1024}"#.into(),
+            dynamic_attrs: r#"{"rack":"r1"}"#.into(),
+            health_checks: "{}".into(),
+            ..Default::default()
+        };
+        let reply = crate::structs::GetNodesReply {
+            nodes: vec![node.clone()],
+            total_count: 1,
+            ..Default::default()
+        };
+        let decoded = decode_node_attrs(serde_json::to_value(reply).expect("serialize"));
+        let listed = &decoded["nodes"][0];
+        assert_eq!(
+            listed["configAttrs"]["workerAddress"],
+            "https://10.0.0.5:4848"
+        );
+        assert_eq!(listed["dynamicAttrs"]["rack"], "r1");
+        assert_eq!(listed["fingerprintAttrs"]["memory"], 1024);
+        assert_eq!(decoded["totalCount"], 1);
+
+        let single = decode_node_attrs(json!({ "node": serde_json::to_value(&node).unwrap() }));
+        assert_eq!(single["node"]["dynamicAttrs"]["rack"], "r1");
+
+        // The CLI's `--json` shape is the same.
+        let cli = serde_json::to_value(crate::structs::Node::from(node)).expect("serialize");
+        assert_eq!(cli["configAttrs"]["workerAddress"], "https://10.0.0.5:4848");
+        assert_eq!(cli["dynamicAttrs"]["rack"], "r1");
+    }
 
     #[test]
     fn config_parses_serve() {
