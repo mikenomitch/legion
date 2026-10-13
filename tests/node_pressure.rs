@@ -312,7 +312,9 @@ async fn a_reported_eviction_removes_the_allocation_with_node_pressure() -> R<()
             ..Default::default()
         })?;
     assert!(
-        deferred.iter().any(|event| event.allocation_id == Some(batch.id)),
+        deferred
+            .iter()
+            .any(|event| event.allocation_id == Some(batch.id)),
         "the deferral is announced: {deferred:?}"
     );
 

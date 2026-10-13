@@ -69,9 +69,16 @@ fn build_target(req: &FetchRequest<'_>) -> R<S3Target> {
         }
     }
 
-    let mut builder = AmazonS3Builder::from_env()
-        .with_bucket_name(bucket)
-        .with_region(region.unwrap_or_else(|| "us-east-1".to_string()));
+    let ambient = matches!(req.credential, Some(Credential::AwsAmbient));
+    let mut builder = AmazonS3Builder::from_env().with_bucket_name(bucket);
+    match region {
+        Some(region) => builder = builder.with_region(region),
+        // The ambient chain keeps the region `from_env` read from
+        // `AWS_REGION`, as the contentStore publisher does, so a node reads
+        // its store in the region it publishes to.
+        None if ambient => {}
+        None => builder = builder.with_region("us-east-1"),
+    }
     if let Some(endpoint) = endpoint {
         let allow_http = endpoint.starts_with("http://");
         builder = builder.with_endpoint(endpoint).with_allow_http(allow_http);
@@ -90,6 +97,8 @@ fn build_target(req: &FetchRequest<'_>) -> R<S3Target> {
                 builder = builder.with_token(token);
             }
         }
+        // `from_env` above already carries the ambient chain: sign with it.
+        Some(Credential::AwsAmbient) => {}
         Some(other) => {
             bail!(
                 "s3 artifacts require an aws credential, got {other:?} for {}",
@@ -228,5 +237,24 @@ mod tests {
         assert!(err.to_string().contains("aws credential"), "{err}");
         // Redacted debug only — no token material in the error.
         assert!(!format!("{err:#}").contains("tok"), "{err:#}");
+    }
+
+    #[test]
+    fn ambient_credential_is_accepted() -> R<()> {
+        let source = "s3://store/content/sealed/abc";
+        let parsed = parse_artifact_source(source)?;
+        let limits = FetchLimits::default();
+        let request = FetchRequest {
+            scheme: &parsed.scheme,
+            url: &parsed.url,
+            redacted_source: source,
+            checksum: None,
+            media_type: None,
+            credential: Some(&Credential::AwsAmbient),
+            limits: &limits,
+        };
+        let target = build_target(&request)?;
+        assert_eq!(target.key.as_ref(), "content/sealed/abc");
+        Ok(())
     }
 }

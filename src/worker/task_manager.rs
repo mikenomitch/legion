@@ -1131,13 +1131,18 @@ impl WorkerTaskManager {
 
     /// Applies the worker's artifact fetch settings and credential source
     /// (called once after pre-registration delivers the worker config).
+    /// `content_store_target` is the worker's `contentStore`, whose
+    /// credential reads published snapshot parts under its URL.
     pub fn configure_artifacts(
         &mut self,
         config: WorkerArtifactFetchConfigFull,
         credentials: Box<dyn CredentialSource>,
+        content_store_target: Option<crate::content_publish::ContentStoreTarget>,
     ) {
         self.stager = Arc::new(
-            ArtifactStager::new(config, credentials).with_content_store(self.content_store.clone()),
+            ArtifactStager::new(config, credentials)
+                .with_content_store(self.content_store.clone())
+                .with_content_store_target(content_store_target),
         );
     }
 
@@ -6444,6 +6449,7 @@ mod tests {
         manager.configure_artifacts(
             crate::structs::WorkerArtifactFetchConfigFull::default(),
             Box::new(crate::artifacts::AnonymousCredentials),
+            None,
         );
         Ok(Arc::new(Mutex::new(manager)))
     }
@@ -10135,6 +10141,7 @@ mod tests {
                 ..Default::default()
             },
             Box::new(crate::artifacts::AnonymousCredentials),
+            None,
         );
         let source = temp_dir.path().join("tool.sh");
         std::fs::write(&source, "#!/bin/sh\nsleep 30\n")?;

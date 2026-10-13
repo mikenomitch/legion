@@ -809,7 +809,16 @@ From then on:
   content store is fetched from its URL through the node's ordinary artifact
   fetchers (`s3://` or `file://`), opened with the key the manager sent with
   the restore, verified against its digest, and stored in the content store
-  before the restore starts. The allocation shows
+  before the restore starts. The fetch signs with the restoring node's own
+  `contentStore.auth` (its KV credential, read at fetch time, or its ambient
+  AWS credentials when `auth` is omitted), because the part URL sits under
+  that node's `contentStore.url`. Cluster `artifacts.auth` matchers do not
+  apply to parts. So every node that may restore the instance needs the same
+  `contentStore` url and auth as the node that published it. A node whose
+  `contentStore` points elsewhere has no credential for the part and fails
+  the restore saying so (see
+  [Which credential a reading node uses](artifacts.md#publishing-content)).
+  The allocation shows
   `fetching snapshot` meanwhile. This includes the node that took the
   checkpoint, when its copy was evicted: it fetches the parts back like any
   other node. Parts that are present are pinned to the restoring allocation
@@ -2077,7 +2086,8 @@ See [metrics](metrics.md#suspend-and-resume).
 | Instance stuck `pending (resuming)` | The checkpoint's node is down or full, and nothing there can be suspended to make room | Wait, `instance start --cold`, or let `resumeTimeout` boot it cold. To keep room for resumes, see [Capacity for resumes](#capacity-for-resumes) |
 | `legion_make_room_suspends_total{outcome="no_room"}` rising | Resumes wait on nodes whose instances are not eligible to make room (no `suspend` block, not opted in, a more important band, or active under two minutes) | Set `onPressure = true` or an idle policy on the work sharing those nodes, or hold a share with `suspend.reserve` |
 | Placement fails: `none has ... MiB of room for this task's memory checkpoint` | Every eligible node is short on its `snapshots` budget (pinned `local` checkpoints fill it) or on disk (free space plus evictable content is under `minFreeDisk` plus one checkpoint). The message counts each | Raise the budget, free disk, delete old snapshots, or resume or destroy suspended instances. `legion node usage <node>` shows which limit binds |
-| Resume of a `published` checkpoint fails: `fetching part ... from its content store` | The node's copy was evicted after publishing (or it never had one), and the `contentStore` is unreachable from it | Fix the store's reachability or credentials. The checkpoint itself is intact |
+| Resume of a `published` checkpoint fails: `fetching part ... from its content store` | The node's copy was evicted after publishing (or it never had one), and it cannot read the `contentStore`. The fetch uses the restoring node's own `contentStore.auth` (or its ambient AWS credentials when `auth` is omitted), not `artifacts.auth` | Give the node a `contentStore` with the publisher's url and an `auth` that can read the bucket, or fix the store's reachability. The checkpoint itself is intact |
+| Resume fails: `this node has no credential for content store s3://...` | The part was published to a store other than the restoring node's own `contentStore.url` (another region's bucket, a different prefix or endpoint, or no `contentStore` at all), so it was fetched anonymously and refused | Give the node the same `contentStore` url and auth as the publishing node, or constrain the resume to nodes that have it |
 | Submit: `suspend.reserve ... is out of range` or `exceeds the task's resources` | A ratio outside 0 to 1, or an amount larger than the reservation | Follow the hint |
 | `instance start`: `cannot resume: checkpoint ... is lost` | The node holding it was removed, and `onRestoreFailure = "fail"` | `legion instance start <id> --cold` |
 | `instance list` STATE `active (resumed cold)`, `cold_boot` set | A restore failed (lost or incompatible checkpoint, `resumeTimeout`, an error on the node) and `onRestoreFailure = "cold"` booted it fresh. Its running processes are gone, its volume is kept | Read `cold_boot.reason`. Use `onRestoreFailure = "fail"` if a lost session must never look like a resume |
@@ -2105,7 +2115,7 @@ See [metrics](metrics.md#suspend-and-resume).
 | `snapshot.publish_failed`, snapshot `local` with `publish attempt N of 3 failed, retrying in ...` | The upload failed (credentials, bucket, network), and the manager will ask again | Fix the store before the retry. The checkpoint still works from its node |
 | Snapshot stays `local` with `publish failed after 3 attempts: ...` | Every attempt failed | Fix the store, then take a new snapshot or suspend again |
 | `snapshot.restore_failed`: `... is not on this node and was never published` | A restore of a local snapshot reached a node that does not hold it | Use a published snapshot when the restore has to run elsewhere |
-| `snapshot.restore_failed`: `fetching part ... from its content store` | The new node could not fetch a published part (no access to the bucket, a scheme not in `artifacts.fetch.allowedSchemes`) | Give the node read access to the store |
+| `snapshot.restore_failed`: `fetching part ... from its content store` | The new node could not fetch a published part (no access to the bucket with its `contentStore.auth` or ambient credentials, a scheme not in `artifacts.fetch.allowedSchemes`) | Give the node read access to the store through its own `contentStore` |
 | `snapshot.restore_failed` or `snapshot.publish_failed` naming a sealed part, a checkpoint key, or the keyring | The part could not be sealed or opened | See [When a part cannot be opened](#when-a-part-cannot-be-opened) |
 | `snapshot warm`: `is local, not published` | Only published snapshots can be warmed | Publish with `durability = "store"` or `--publish` |
 | Submit: `sets suspend.archive = ... but its checkpoints stay on the node` | `archive` needs a published checkpoint | Set `durability = "store"` |
@@ -2147,6 +2157,14 @@ See [metrics](metrics.md#suspend-and-resume).
   `contentStore.auth.kv` credential or the manager's ambient credentials.
   A manager that cannot reach a bucket can neither resume nor list what is
   archived in it.
+- **A node reads published parts only from its own `contentStore`.** It signs
+  a part fetch with its own `contentStore.auth` only when the part URL is under
+  its own `contentStore.url`, and there is no per-store credential list for
+  reading other stores. Placement does not check which store a node is
+  configured for, so a resume can land on a node pointed at another bucket
+  and fail with `this node has no credential for content store`. Give every
+  node that may restore a checkpoint the publisher's `contentStore`, or
+  constrain the job to those nodes.
 - **`--include-idle` pages can come back short.** A manifest whose instance
   also has a row is listed once, from the row, so a page can hold fewer than
   `--idle-page-size` bucket instances. Page until `nextIdlePageToken` is

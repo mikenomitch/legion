@@ -1461,3 +1461,56 @@ script that calls start in a loop from defeating the backoff. Reusing
 `start` instead of a new verb keeps the surface small. Start already meant
 "make this instance run", and for a `rescheduling` instance it used to do
 nothing.
+
+## 57. A restoring node reads published parts with its own `contentStore` credential, and only for URLs under its own `contentStore.url`
+
+*Workstream: Suspend and resume (durable checkpoints).*
+
+**The call.** `ArtifactStager::fetch_sealed_into_store` checks whether a
+part URL is under the node's own `contentStore.url` (same scheme, bucket,
+and `endpoint`, under the prefix at a `/` boundary). If it is, the fetch is
+signed with the node's `contentStore.auth`: the KV credential, read on every
+fetch so a rotated STS credential is picked up the way the publisher picks
+it up, or the ambient AWS chain when `auth` is omitted. The ambient case is
+a new `Credential::AwsAmbient` variant, which the `s3://` fetcher signs with
+instead of `with_skip_signature`. It cannot be written in KV. Any other part
+URL is fetched anonymously, and a failure names the store:
+
+```text
+this node has no credential for content store s3://legion-content-use1/:
+a restoring node signs part fetches only for URLs under its own
+contentStore.url (here: s3://legion-content-usw2/), so this fetch was
+anonymous. Give this node the same contentStore url and auth as the node
+that published the snapshot
+```
+
+**Alternatives.**
+- Apply cluster `artifacts.auth` matchers to part URLs, as the bug report
+  first assumed already happened. The matchers live on the manager and
+  apply at job admission. Part URLs never pass admission, so the manager
+  would have to match them and send the result with every restore and warm
+  (a new field on `SnapshotRestore` and `CheckpointRequest`). That would
+  also let one node read many stores.
+- A worker-side list of read credentials per store (`contentStore.readAuth
+  = [{ match, kv }]`).
+- Sign every part fetch with the ambient chain, not only fetches from the
+  node's own store.
+
+**Trade-off.** A node can read only the store it publishes to. A cluster with
+one bucket per region cannot restore across regions, and placement does not
+yet know which store a node has, so a resume can land on a node pointed at
+another bucket and fail with the message above. Both are open in TODO.md and
+stated in `docs/suspend-and-resume.md` ("Limitations"). The bug report asked
+for an explicit `artifacts.auth` matcher to win over the store credential.
+That is not built, because no matcher ever reached this path.
+
+**Why.** Simplicity. The publisher and the reader use the same block with the
+same credential, so "this node can publish to the store" means "this node can
+restore from it", and the operator configures nothing new. Store identity
+includes the endpoint and the prefix boundary, so the store's credential is
+never sent to another bucket, a sibling prefix, or a different S3-compatible
+endpoint that serves the same bucket name. Matchers sent over the wire would
+add a wire field and a second credential path for one cross-region case
+nobody has asked for yet. A blanket ambient chain would quietly sign
+requests to buckets the operator never named, and on a non-AWS host it can
+stall on instance-metadata lookups before it fails.

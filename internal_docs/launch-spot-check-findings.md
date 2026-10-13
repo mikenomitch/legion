@@ -56,6 +56,12 @@ landed, and this run needed no shims at the end.
 - **Image pulls failed after a leader failover.** Worker trust was keyed by
   the join manager's address, so TLS calls to the new active manager had no
   CA pin. Trust is now per cluster. *Unit-tested; not yet re-run on the rig.*
+- **A `durability = "store"` checkpoint never resumed on another node.**
+  sc-wkr-2 published the parts with its `contentStore.auth.kv` credential,
+  but sc-wkr-1 fetched them through the artifact fetchers unsigned, and S3
+  answered `AccessDenied`. A part under the node's own `contentStore.url` is
+  now read with that store's credential. *Unit-tested; not yet re-run on the
+  rig.*
 
 **P1, fixed**
 

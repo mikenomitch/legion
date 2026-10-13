@@ -21,6 +21,9 @@
 //! the ordinary `s3://` or `file://` artifact fetcher
 //! ([`crate::artifacts::ArtifactStager::fetch_sealed_into_store`]), which
 //! opens the sealed object and verifies the plaintext against the digest.
+//! The fetch is signed with the reading node's own `contentStore` credential
+//! ([`ContentStoreTarget::read_credential`]) when the URL is under its
+//! `contentStore.url` ([`ContentStoreTarget::contains_url`]).
 //!
 //! # Example (what Phase 7b does with a snapshot part)
 //!
@@ -200,6 +203,52 @@ impl ContentStoreTarget {
                 credentials,
             }),
         })
+    }
+
+    /// Whether `url` names an object in this store: the same scheme, bucket
+    /// (or directory root), and `endpoint`, under the store's prefix. A
+    /// restoring node fetches such a URL with [`Self::read_credential`]
+    /// rather than anonymously. A sibling prefix (`content-old/` beside
+    /// `content/`) or another endpoint serving the same bucket name is not
+    /// this store, so the store's credential is never sent there.
+    pub fn contains_url(&self, url: &str) -> bool {
+        let (Ok(store), Ok(url)) = (self.validate(), Url::parse(url.trim())) else {
+            return false;
+        };
+        let endpoint = |url: &Url| {
+            url.query_pairs()
+                .find(|(name, _)| name == "endpoint")
+                .map(|(_, value)| value.into_owned())
+        };
+        let prefix = store.path().trim_end_matches('/');
+        url.scheme() == store.scheme()
+            && url.host_str() == store.host_str()
+            && endpoint(&url) == endpoint(&store)
+            && url
+                .path()
+                .strip_prefix(prefix)
+                .is_some_and(|rest| rest.starts_with('/'))
+    }
+
+    /// The credential an object in this store is read with: the AWS
+    /// credential at `auth.kv` (resolved now, so a rotated credential is
+    /// picked up as the publisher picks it up), the node's ambient chain
+    /// when there is no `auth`, and none for a `file://` store.
+    pub fn read_credential(
+        &self,
+        credentials: &dyn CredentialSource,
+        redacted_source: &str,
+    ) -> R<Option<Credential>> {
+        if self.validate()?.scheme() == "file" {
+            return Ok(None);
+        }
+        match self.auth.as_ref().and_then(|auth| auth.kv.as_deref()) {
+            Some(path) => credentials
+                .kv_credential(path, redacted_source)
+                .with_context(|| format!("contentStore credentials from kv {path}"))
+                .map(Some),
+            None => Ok(Some(Credential::AwsAmbient)),
+        }
     }
 }
 
@@ -642,6 +691,50 @@ mod tests {
 
     fn part_key(digest: &ContentDigest) -> PartKey {
         PartKey::derive(&[5u8; 32], "ck_test", digest).unwrap()
+    }
+
+    #[test]
+    fn contains_url_matches_only_this_store() -> R<()> {
+        let store = target(serde_json::json!({ "url": "s3://bucket/content/" }))?;
+        assert!(store.contains_url("s3://bucket/content/sealed/abc"));
+        assert!(!store.contains_url("s3://bucket/content-old/sealed/abc"));
+        assert!(!store.contains_url("s3://bucket/sealed/abc"));
+        assert!(!store.contains_url("s3://other/content/sealed/abc"));
+        assert!(!store.contains_url("file:///content/sealed/abc"));
+
+        // The whole bucket, and the endpoint is part of the store's identity.
+        let minio = target(serde_json::json!({
+            "url": "s3://bucket?endpoint=http://minio:9000"
+        }))?;
+        assert!(minio.contains_url("s3://bucket/sealed/abc?endpoint=http://minio:9000"));
+        assert!(!minio.contains_url("s3://bucket/sealed/abc"));
+
+        let shared = target(serde_json::json!({ "url": "file:///mnt/store" }))?;
+        assert!(shared.contains_url("file:///mnt/store/sealed/abc"));
+        assert!(!shared.contains_url("file:///mnt/storage/sealed/abc"));
+        Ok(())
+    }
+
+    #[test]
+    fn read_credential_follows_the_store_auth() -> R<()> {
+        let ambient = target(serde_json::json!({ "url": "s3://bucket/content" }))?;
+        assert_eq!(
+            ambient.read_credential(&AnonymousCredentials, "s3://bucket/content/sealed/x")?,
+            Some(Credential::AwsAmbient)
+        );
+        let shared = target(serde_json::json!({ "url": "file:///mnt/store" }))?;
+        assert_eq!(shared.read_credential(&AnonymousCredentials, "x")?, None);
+        // An unreadable KV credential names the contentStore setting.
+        let kv = target(serde_json::json!({
+            "url": "s3://bucket/content",
+            "auth": { "kv": "secrets/content-store" }
+        }))?;
+        let err = kv.read_credential(&AnonymousCredentials, "x").unwrap_err();
+        assert!(
+            format!("{err:#}").contains("contentStore credentials from kv secrets/content-store"),
+            "{err:#}"
+        );
+        Ok(())
     }
 
     #[test]

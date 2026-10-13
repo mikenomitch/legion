@@ -249,6 +249,27 @@ How to use it:
           rollout regardless of its step gating
           (`Store::queue_dependency_progress`).
     - [ ] Rerun `05-dag.ncl` twice with different `run` values to confirm.
+  - [ ] **A `durability = "store"` checkpoint never resumed on another node
+        (2026-10-12 rerun).** The part fetch went through the artifact
+        fetchers with no credential (an unsigned GET), so the private
+        bucket answered 403, though the publisher had used the
+        `contentStore.auth.kv` credential.
+    - [x] A part URL under the restoring node's own `contentStore.url` is
+          now fetched with that node's `contentStore.auth` (KV credential
+          read at fetch time, or the ambient AWS chain via the new
+          `Credential::AwsAmbient`). Any other URL stays anonymous and its
+          failure says the node has no credential for that store
+          (`ArtifactStager::fetch_sealed_into_store`,
+          [artifacts.md](../docs/artifacts.md#publishing-content),
+          [calls #57](calls/launch-spot-check-fixes-plan_calls.md)).
+          Unit-tested, not yet re-run on the rig.
+    - [ ] Rerun the store suspend and cross-node resume on the rig.
+    - [ ] Placement ignores which `contentStore` a node has, so a resume can
+          land on a node pointed at another bucket and fail. Prefer or
+          require nodes whose `contentStore.url` covers the part URLs.
+    - [ ] A node has no way to read a store other than its own (no per-store
+          read credentials, and cluster `artifacts.auth` never reaches part
+          URLs). Decide whether cross-store restores are worth a surface.
   - [ ] **One manager down strands every worker (P0-5).** Followers fail to
         forward heartbeats in the `single` topology (lane mismatch), and
         workers know one manager.

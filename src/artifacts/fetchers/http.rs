@@ -54,7 +54,7 @@ impl ArtifactFetcher for HttpFetcher {
                     request = request.header(name, value);
                 }
             }
-            Some(Credential::Aws { .. }) => {
+            Some(Credential::Aws { .. } | Credential::AwsAmbient) => {
                 bail!(
                     "aws credentials are not valid for {} (use them with s3:// sources)",
                     req.redacted_source

@@ -477,6 +477,7 @@ async fn run_worker_with_manager(join: WorkerJoin, name_override: Option<&str>) 
                 name.clone(),
                 credentials.clone(),
             )),
+            content_store_target.clone(),
         );
         manager.restore_allocations().unwrap_or_else(|err| {
             warn!(error = ?err, "Failed to restore persisted allocations");

@@ -4828,7 +4828,11 @@ message SnapshotRestore {
   // node content store that carries a `url` (a published snapshot) is
   // fetched first, through the worker's artifact fetchers, opened with its
   // key from `part_keys`, verified against its digest, and stored in the
-  // content store. The allocation shows `staging artifacts` meanwhile.
+  // content store. A `url` under the worker's own `contentStore.url` is
+  // fetched with that worker's `contentStore.auth` (or its ambient AWS
+  // credentials). Any other `url` is fetched anonymously, and a refusal says
+  // the worker has no credential for that store. The allocation shows
+  // `staging artifacts` meanwhile.
   string manifest_json = 3;
 
   // The task's `suspend.onResume` argv. After a memory restore the guest
