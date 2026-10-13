@@ -16,7 +16,14 @@
         var a = JSON.parse(localStorage.getItem('legion-appearance') || '{}') || {}
         var root = document.documentElement
         if (a.mode === 'dark' || (a.mode !== 'light' && matchMedia('(prefers-color-scheme: dark)').matches)) root.classList.add('dark')
-        if (typeof a.theme === 'string' && /^[a-z-]+$/.test(a.theme) && a.theme !== 'command-post') root.setAttribute('data-theme', a.theme)
+        var theme = typeof a.theme === 'string' && /^[a-z-]+$/.test(a.theme) ? a.theme : 'command-post'
+        if (theme !== 'command-post') root.setAttribute('data-theme', theme)
+        var colors = ((a.colors || {})[theme] || {})[root.classList.contains('dark') ? 'dark' : 'light'] || {}
+        for (var token in colors) {
+          var hex = colors[token]
+          if (/^[a-z0-9-]+$/.test(token) && /^#[0-9a-f]{6}$/i.test(hex))
+            root.style.setProperty('--c-' + token, [1, 3, 5].map(function (i) { return parseInt(hex.slice(i, i + 2), 16) }).join(' '))
+        }
       } catch (e) {}
     </script>
   </head>

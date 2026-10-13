@@ -3698,7 +3698,7 @@ Deferred from [ui-theme-picker-plan.md](plans/ui-theme-picker-plan.md):
 - [ ] Command Post's light `faint` text is 4.26:1 on surface and 3.94:1 on
       canvas, under the 4.5:1 the other themes meet. Darken it, and its copy in
       `ui/src/appearance/themes.css`, together
-      ([calls entry 5](calls/ui-theme-picker-plan_calls.md#5-contrast-bar-applies-to-new-themes-only))
+      ([calls entry 7](calls/ui-theme-picker-plan_calls.md#7-contrast-bar-applies-to-new-themes-only))
 - [ ] Themes recolor only the neutrals and the accent: status colors and the
       exec terminal (`ExecTerminal.tsx` hard-codes a brass cursor) are the same
       in every theme ([calls entry 2](calls/ui-theme-picker-plan_calls.md))
@@ -4979,9 +4979,10 @@ docs: [task-runtime-plugins.md](../docs/task-runtime-plugins.md)
 
 [docs](../docs/ui-architecture.md)
 
-- [x] Appearance picker: Light/Dark/System mode and five color themes
-      (Command Post, the default, plus Forge, Nord, Sage and Porcelain), saved
-      per browser and applied before first paint
+- [x] Appearance picker: Light/Dark/System mode, six color themes (Command
+      Post, the default, plus Forge, Nord, Sage, Porcelain and Tomorrow Night
+      Bright), and every color settable by hand per theme and mode, saved per
+      browser and applied before first paint
       ([plan](plans/ui-theme-picker-plan.md),
       [calls](calls/ui-theme-picker-plan_calls.md),
       [docs](../docs/ui-architecture.md#appearance))

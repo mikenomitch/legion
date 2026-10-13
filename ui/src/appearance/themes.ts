@@ -16,6 +16,30 @@ export const THEMES: readonly Theme[] = [
   { id: 'nord', name: 'Nord', description: 'Snow-storm greys and frost blue, after the Nord editor palette.' },
   { id: 'sage', name: 'Sage', description: 'Calm greens with a forest accent; dark moss at night.' },
   { id: 'porcelain', name: 'Porcelain', description: 'Cool white and indigo; deep ink blue at night.' },
+  {
+    id: 'tomorrow-night-bright',
+    name: 'Tomorrow Night Bright',
+    description: 'Pure black and bright blue, after the Tomorrow Night Bright editor theme; Tomorrow in light mode.',
+  },
 ]
 
 export const DEFAULT_THEME = THEMES[0].id
+
+/*
+ * The color tokens a theme sets, in the order the picker lists them. Each is
+ * an `--c-<id>` RGB triplet (index.css) that Tailwind maps to a utility name.
+ */
+export const COLOR_TOKENS = [
+  { id: 'canvas', label: 'Page background' },
+  { id: 'surface', label: 'Cards and panels' },
+  { id: 'surface2', label: 'Raised and hover' },
+  { id: 'line', label: 'Borders' },
+  { id: 'line-strong', label: 'Strong borders' },
+  { id: 'ink', label: 'Text' },
+  { id: 'muted', label: 'Secondary text' },
+  { id: 'faint', label: 'Faint text' },
+  { id: 'brass', label: 'Accent and buttons' },
+  { id: 'brass-strong', label: 'Links' },
+] as const
+
+export type ColorToken = (typeof COLOR_TOKENS)[number]['id']

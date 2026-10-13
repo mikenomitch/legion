@@ -36,7 +36,36 @@ in Nord as in Forge, and the terminal cursor stays brass.
 whole feature is two small files plus a dialog. A new theme is one CSS block
 and one line in `themes.ts`.
 
-## 3. Theme blocks match any element, so swatches need no duplicate data
+## 3. Hand-set colors are kept per theme and per mode
+
+**Call.** "Custom values for everything in the picker" became one editable
+row per color token, stored under the theme and mode on screen:
+
+```
+"colors": { "nord": { "dark": { "brass": "#ffcc00" } } }
+```
+
+They are applied as inline `--c-*` properties on `<html>` for that theme and
+mode only. The rows show the value on screen, read back from the computed
+style, so there is no second copy of each theme's values in TypeScript.
+
+**Alternatives.** (a) A single "Custom" theme the viewer builds from scratch,
+separate from the built-ins. (b) One set of overrides applied on top of
+whatever theme is chosen. (c) Also exposing mode, radius, typeface and
+status colors as "everything".
+
+**Trade-off.** A viewer who wants the same accent everywhere has to set it in
+each theme and mode. Theme tiles show the theme's own colors, not the
+hand-set ones.
+
+**Why (simplicity, extensibility).** Starting from a theme and nudging two
+colors is the common case, and a nudge that makes sense on Nord dark rarely
+makes sense on Sage light, so (b) would produce unreadable combinations the
+moment someone switches. Keying by theme means switching away and back loses
+nothing. "Everything" was read as everything the picker controls, which is
+color; layout and typefaces stay non-goals.
+
+## 4. Theme blocks match any element, so swatches need no duplicate data
 
 **Call.** `[data-theme='x']` and `.dark [data-theme='x']` set the tokens on
 whatever element carries the attribute. A swatch is ordinary markup with
@@ -54,7 +83,21 @@ swatch disagree with the page.
 **Why (simplicity).** One source of truth per theme and no build step. A
 comment at both sites names the duplication.
 
-## 4. The old `ui-theme` key is dropped, not migrated
+## 5. Hard-to-read custom colors get a warning, not a block
+
+**Call.** The picker computes contrast for body text, secondary text and links
+on cards, and for button labels, and names any pair under 4.5:1 in a warning
+under the color rows. It still saves the colors.
+
+**Alternatives.** Refuse a color that drops a pair under 4.5:1, or clamp it.
+
+**Trade-off.** Someone can make the UI unreadable for themselves.
+
+**Why (simplicity).** A color input that snaps back is confusing mid-drag,
+and some deliberate looks (a low-contrast night setup) are the viewer's call.
+The choice is per browser and Reset to defaults always recovers it.
+
+## 6. The old `ui-theme` key is dropped, not migrated
 
 **Call.** The store reads only `legion-appearance`. A browser that had pinned
 light or dark through the old toggle starts on System once.
@@ -67,9 +110,9 @@ mode flip back once and has to click sun/moon again.
 **Why.** AGENTS.md: no installed base yet, no compatibility shims. Called out
 in the PR as a break.
 
-## 5. Contrast bar applies to new themes only
+## 7. Contrast bar applies to new themes only
 
-**Call.** The four alternatives meet ink 7:1, muted and faint 4.5:1, links
+**Call.** The five alternatives meet ink 7:1, muted and faint 4.5:1, links
 4.5:1 and button text 4.5:1. Command Post is left exactly as it was, although
 its light faint text measures 4.26:1 on surface and 3.94:1 on canvas.
 
@@ -82,11 +125,12 @@ change.
 **Why.** The request was to add a picker without changing the default look.
 The shortfall is recorded in TODO as its own item.
 
-## 6. One theme defines both modes
+## 8. One theme defines both modes
 
 **Call.** Picking a theme picks its light and dark versions together, and the
 mode control chooses between them. Three of the alternatives were dark-only
-or light-only in the design lab; their other mode was authored for this
+or light-only in the design lab, and Tomorrow Night Bright is a dark editor
+theme borrowing Tomorrow for its light mode; the other mode was authored for this
 picker.
 
 **Alternatives.** GitHub's model: a separate theme choice for light and for

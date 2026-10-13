@@ -156,3 +156,32 @@
   --c-brass: 139 133 255;
   --c-brass-strong: 179 175 255;
 }
+
+/* Tomorrow Night Bright: Tomorrow's white page and blue in light; pure black
+   and Tomorrow Night Bright's blue in dark. */
+[data-theme='tomorrow-night-bright'] {
+  --c-canvas: 247 247 247;
+  --c-surface: 255 255 255;
+  --c-surface2: 239 239 239;
+  --c-line: 224 224 224;
+  --c-line-strong: 198 198 198;
+  --c-ink: 29 31 33;
+  --c-muted: 77 77 76;
+  --c-faint: 102 104 100;
+  --c-brass: 66 113 174;
+  --c-brass-strong: 58 99 150;
+}
+
+.dark[data-theme='tomorrow-night-bright'],
+.dark [data-theme='tomorrow-night-bright'] {
+  --c-canvas: 0 0 0;
+  --c-surface: 20 20 20;
+  --c-surface2: 31 31 31;
+  --c-line: 42 42 42;
+  --c-line-strong: 66 66 66;
+  --c-ink: 234 234 234;
+  --c-muted: 180 180 180;
+  --c-faint: 150 152 150;
+  --c-brass: 122 166 218;
+  --c-brass-strong: 163 195 234;
+}

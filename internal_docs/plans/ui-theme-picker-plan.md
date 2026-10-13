@@ -2,9 +2,9 @@
 
 > **Judgement calls:** [ui-theme-picker-plan_calls.md](../calls/ui-theme-picker-plan_calls.md)
 
-**Status: SHIPPED** (all three phases). Deliberately deferred: per-user themes
-stored on the manager, custom or imported palettes, theming the exec terminal
-and status colors, and typeface or layout options.
+**Status: SHIPPED** (all four phases). Deliberately deferred: per-user themes
+stored on the manager, importing or exporting a palette, theming the exec
+terminal and status colors, and typeface or layout options.
 
 ## Problem
 
@@ -54,17 +54,23 @@ Scenarios the design has to serve:
    changes as she clicks. She reloads and it is still Nord dark, with no flash
    of brass.
 2. Ana clicks the sun/moon button. The mode flips; the theme stays Nord.
-3. Ana clicks Reset to defaults. The UI is Command Post following her OS, and
+3. Ana opens Customize and sets the accent to her team's yellow. Only Nord
+   dark changes; Nord light and the other themes keep their colors. The
+   picker warns her that button labels are now hard to read, and she darkens
+   the page background until the warning clears.
+4. Ana clicks Reset to defaults. The UI is Command Post following her OS, and
    nothing is left in storage.
 
 ## Goals and non-goals
 
-Goals: Light/Dark/System mode; five built-in color themes, Command Post the
-default; instant apply; saved per browser; no flash on reload; every
-alternative theme meets a stated contrast bar in both modes.
+Goals: Light/Dark/System mode; six built-in color themes, Command Post the
+default; every color settable by hand, per theme and mode; instant apply;
+saved per browser; no flash on reload; every built-in alternative meets a
+stated contrast bar in both modes, and hand-set colors that miss it get a
+warning.
 
 Non-goals: changing typefaces, spacing, radii or layout; theming status
-colors; user-defined palettes; syncing the choice across browsers.
+colors; sharing or importing palettes; syncing the choice across browsers.
 
 ## What exists today
 
@@ -81,13 +87,20 @@ The surface:
   **Appearance** entry in ⌘K. Both open a dialog with a Mode control (Light,
   Dark, System) and a grid of theme tiles. Each tile is a swatch painted in
   that theme for the current mode.
-- Storage: `localStorage['legion-appearance'] = {"theme":"nord","mode":"dark"}`.
-  The default (`command-post`, `system`) is never written; Reset removes the
-  key.
-- DOM: `<html class="dark" data-theme="nord">`. No `data-theme` means Command
-  Post.
+- A **Colors** section, collapsed behind Customize, with one row per token:
+  a native color input, a hex field, and a × that returns the token to the
+  theme's value. Rows show the value on screen, read back from `<html>`.
+  Below them, a warning names any of body text, secondary text, links and
+  button labels under 4.5:1.
+- Storage: `localStorage['legion-appearance'] =
+  {"theme":"nord","mode":"dark","colors":{"nord":{"dark":{"brass":"#ffcc00"}}}}`.
+  The default (`command-post`, `system`, no colors) is never written; Reset
+  removes the key.
+- DOM: `<html class="dark" data-theme="nord" style="--c-brass: 255 204 0">`.
+  No `data-theme` means Command Post; hand-set colors for the theme and mode
+  on screen are inline custom properties.
 
-Themes: Command Post, Forge, Nord, Sage, Porcelain. Each is a light and a dark
+Themes: Command Post, Forge, Nord, Sage, Porcelain, Tomorrow Night Bright. Each is a light and a dark
 block of the same ten tokens in `ui/src/appearance/themes.css`. The blocks
 match `[data-theme=…]` on any element, which is what lets a swatch render in
 a theme other than the active one.
@@ -97,7 +110,7 @@ An inline script in `index.html` applies the saved choice before first paint.
 stored value, follows the OS while in System mode, and follows other tabs
 through the `storage` event.
 
-Contrast bar for the four alternatives: ink 7:1 on surface; muted and faint
+Contrast bar for the five alternatives: ink 7:1 on surface; muted and faint
 4.5:1 on surface and canvas; links 4.5:1 on surface; button text (canvas on
 brass) 4.5:1. Command Post's values are unchanged.
 
@@ -105,10 +118,13 @@ brass) 4.5:1. Command Post's values are unchanged.
 
 1. **Store and mode.** `store.ts`, the boot script, System mode, the sun/moon
    wired through the store. Ships alone: the toggle can now return to System.
-2. **Themes.** `themes.ts`, `themes.css`, the four alternatives, checked
+2. **Themes.** `themes.ts`, `themes.css`, the alternatives, checked
    against the contrast bar.
 3. **Picker.** The dialog, the top-bar button, the ⌘K entry, Escape and
    shortcut handling while it is open, docs.
+4. **Hand-set colors.** The Colors section, per-theme-per-mode storage, the
+   boot script applying them, the contrast warning. Also adds Tomorrow Night
+   Bright.
 
 ## Testing
 
@@ -117,6 +133,9 @@ brass) 4.5:1. Command Post's values are unchanged.
   attributes and the stored value, reload, flip with sun/moon, reset, and load
   a page with the app script blocked to prove the boot script alone applies
   the choice. Phone width. No console errors.
+- Hand-set colors: set two by hex and one by the color input, reload, block
+  the app script (boot script alone applies them), flip to light (none apply)
+  and back, clear one with ×, clear all, reset.
 - Contrast computed from `themes.css` for every theme in both modes.
 
 ## Rollout

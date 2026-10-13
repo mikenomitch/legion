@@ -155,7 +155,7 @@ When one is required and what goes in it:
 | [stateful-workloads-and-instance-identity-plan.md](plans/stateful-workloads-and-instance-identity-plan.md) | shipped |
 | [task-runtime-rename-plan.md](plans/task-runtime-rename-plan.md) | shipped |
 | [ui-jump-hints-plan.md](plans/ui-jump-hints-plan.md) | shipped |
-| [ui-theme-picker-plan.md](plans/ui-theme-picker-plan.md) | shipped (appearance picker: Light/Dark/System and five color themes, Command Post the default; server-stored themes and non-color options deferred) |
+| [ui-theme-picker-plan.md](plans/ui-theme-picker-plan.md) | shipped (appearance picker: Light/Dark/System, six color themes with Command Post the default, every color settable per theme and mode; server-stored themes and non-color options deferred) |
 | [operator-ui-gaps-plan.md](plans/operator-ui-gaps-plan.md) | shipped (2026-10-12; public-address auto-detect, a manager reverse proxy, and `GetAllocation` deferred) |
 | [manager-reverse-proxy-plan.md](plans/manager-reverse-proxy-plan.md) | planned (open an allocation's or instance's web UI through the manager when node ports are closed: one-time code for a target-scoped cookie, an L4 tunnel on the worker plane, a new `proxy` ACL resource; subpath first, a host per target in Phase 2, `legion proxy` port-forward in Phase 3; multi-host needs worker-plane-auth Phase 1) |
 | [ui-holistic-polish-plan.md](plans/ui-holistic-polish-plan.md) | shipped (2026-09-02; embedding the UI in the binary deliberately left open) |
