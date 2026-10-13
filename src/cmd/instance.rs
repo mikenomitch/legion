@@ -1242,6 +1242,8 @@ struct InstanceRow {
     slot: String,
     #[tabled(rename = "alloc")]
     current_alloc: String,
+    /// The current allocation's node (or a session's node).
+    node: String,
     storage: String,
     /// Measured memory of the current allocation, MiB.
     #[tabled(rename = "mem MiB")]
@@ -1293,6 +1295,7 @@ impl From<&InstanceInfo> for InstanceRow {
                 .current_alloc_id
                 .map(|id| id.to_string())
                 .unwrap_or_else(|| "-".into()),
+            node: instance.node_id.clone().unwrap_or_else(|| "-".into()),
             storage: instance
                 .storage_handle
                 .clone()
@@ -1680,10 +1683,24 @@ mod tests {
         let row = InstanceRow::from(&info);
         assert_eq!(row.slot, "-");
         assert_eq!(row.current_alloc, "-");
+        assert_eq!(row.node, "-");
         assert_eq!(row.storage, "-");
         assert_eq!(row.memory, "-");
         assert_eq!(row.idle, "-");
         assert_eq!(row.checkpoint, "-");
+
+        let active = InstanceInfo {
+            state: "active".into(),
+            current_alloc_id: Some(7),
+            node_id: Some("w-02".into()),
+            ..info
+        };
+        let row = InstanceRow::from(&active);
+        assert_eq!(row.current_alloc, "7");
+        assert_eq!(
+            row.node, "w-02",
+            "the NODE column names the allocation's node"
+        );
     }
 
     /// The CHECKPOINT column reads like the plan's §6.6 example.

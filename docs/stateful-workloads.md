@@ -656,10 +656,14 @@ legion instance create sandbox-demo --id a --id b --count 3 -j
 legion instance list sandbox-demo -j
 # => { "ok": true, "data": [ { "instanceId": "user-42", "jobId": "sandbox-demo",
 #      "group": "sandboxes", "task": "sandbox", "mode": "keyed",
-#      "state": "active", "currentAllocId": 7,
+#      "state": "active", "currentAllocId": 7, "nodeId": "node-a",
 #      "storageHandle": "local-dir/…", "createdAt": "…", "updatedAt": "…" } ] }
 
 legion instance get user-42 -j
+
+# `nodeId` (and the table's NODE column) is the node of the current
+# allocation, and unset while the instance has none (pending, rescheduling,
+# stopped, suspended, terminated).
 
 # Pause (reversible): stop the allocation, retain row + storage handle
 legion instance stop user-42 -j        # state -> "stopped"

@@ -768,7 +768,17 @@ fn map_instance_info(
                 .flatten()
         })
         .flatten();
-    let detail = instance_loss_detail(store, &instance)
+    // The current allocation, read once: it names the instance's node, and
+    // the loss diagnostic needs that node's status. The instance row stores
+    // no node of its own, so this is the only source (the spot check found
+    // `nodeId: null` on every active row-backed instance).
+    let allocation = instance
+        .current_alloc_id
+        .and_then(|alloc_id| store.get_allocation_by_id(alloc_id).ok().flatten());
+    let node_id = allocation
+        .as_ref()
+        .map(|allocation| allocation.node_id.clone());
+    let detail = instance_loss_detail(store, &instance, allocation.as_ref())
         .or_else(|| {
             backoff.as_ref().map(|hold| {
                 format!(
@@ -888,7 +898,7 @@ fn map_instance_info(
         manifest_url: suspend.manifest_url,
         durable: true,
         promoted_from: instance.promoted_from,
-        node_id: None,
+        node_id,
         lease_issued_at: None,
         envelope_alloc_id: None,
         reschedule_backoff,
@@ -1055,10 +1065,13 @@ fn instance_egress_unenforced_detail(store: &Store, instance: &Instance) -> Opti
 /// docs/stateful-workloads.md "Node loss and fencing"). `None` in every
 /// other situation. Lookup failures degrade to no detail — diagnostics must
 /// never fail the read path.
-fn instance_loss_detail(store: &Store, instance: &Instance) -> Option<String> {
+fn instance_loss_detail(
+    store: &Store,
+    instance: &Instance,
+    allocation: Option<&crate::structs::Allocation>,
+) -> Option<String> {
     let alloc_id = instance.current_alloc_id?;
-    let allocation = store.get_allocation_by_id(alloc_id).ok()??;
-    let node = store.get_node(&allocation.node_id).ok()?;
+    let node = store.get_node(&allocation?.node_id).ok()?;
     if node.status != "lost" {
         return None;
     }
@@ -17155,6 +17168,68 @@ mod tests {
             .map_err(|err| anyhow!(err))?
             .into_inner();
         assert_eq!(reply.message, "Instance user-a already running");
+        Ok(())
+    }
+
+    /// Spot check 2026-10-12: `instance get -j` and `instance list -j`
+    /// showed `nodeId: null` for every active keyed instance. The node is
+    /// the current allocation's, and unset while there is none.
+    #[test]
+    fn instance_reads_name_the_current_allocations_node() -> R<()> {
+        let store = setup_store()?;
+        insert_node(&store, "node-a")?;
+        let manager = ManagerDaemonService::new(store.clone());
+        let job_id = "sandboxes";
+        submit_keyed_job(
+            &store,
+            job_id,
+            vec![keyed_task("sandbox", "default", false)],
+        )?;
+        let runtime = tokio::runtime::Runtime::new()?;
+        runtime
+            .block_on(manager.create_instance(Request::new(CreateInstanceRequest {
+                job_id: job_id.into(),
+                group: None,
+                task: None,
+                instance_id: Some("user-a".into()),
+                idempotency_key: None,
+                from_snapshot: None,
+            })))
+            .map_err(|err| anyhow!(err))?;
+        let get = || -> R<InstanceInfo> {
+            runtime
+                .block_on(manager.get_instance(Request::new(GetInstanceRequest {
+                    instance_id: "user-a".into(),
+                })))
+                .map_err(|err| anyhow!(err))?
+                .into_inner()
+                .instance
+                .context("instance info")
+        };
+        let list = || -> R<InstanceInfo> {
+            runtime
+                .block_on(manager.list_instances(Request::new(ListInstancesRequest {
+                    job_id: job_id.into(),
+                    ..Default::default()
+                })))
+                .map_err(|err| anyhow!(err))?
+                .into_inner()
+                .instances
+                .into_iter()
+                .find(|info| info.instance_id == "user-a")
+                .context("user-a listed")
+        };
+        // Not placed yet: no allocation, so no node.
+        assert_eq!(get()?.current_alloc_id, None);
+        assert_eq!(get()?.node_id, None);
+
+        // Placed by the reschedule eval, as every keyed instance is.
+        handle_pending_evals(&store, "job_reschedule", job_id)?;
+        let allocation = store.allocs_for_job(job_id)?[0].clone();
+        for info in [get()?, list()?] {
+            assert_eq!(info.current_alloc_id, Some(allocation.id));
+            assert_eq!(info.node_id.as_deref(), Some("node-a"));
+        }
         Ok(())
     }
 

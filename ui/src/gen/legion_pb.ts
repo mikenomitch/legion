@@ -6201,8 +6201,10 @@ export class InstanceInfo extends Message<InstanceInfo> {
   promotedFrom?: string;
 
   /**
-   * The node running a session (`mode = "session"`). Unset for instances
-   * with a row, whose node is their current allocation's.
+   * The node the instance runs on: its current allocation's node for an
+   * instance with a row, or the node running a session (`mode =
+   * "session"`). Unset when the instance has no current allocation
+   * (pending, rescheduling, stopped, suspended, or terminated).
    *
    * @generated from field: optional string node_id = 44;
    */

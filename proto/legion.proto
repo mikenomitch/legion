@@ -3995,8 +3995,10 @@ message InstanceInfo {
   // the session's id. Unset for instances that were never sessions.
   optional string promoted_from = 43;
 
-  // The node running a session (`mode = "session"`). Unset for instances
-  // with a row, whose node is their current allocation's.
+  // The node the instance runs on: its current allocation's node for an
+  // instance with a row, or the node running a session (`mode =
+  // "session"`). Unset when the instance has no current allocation
+  // (pending, rescheduling, stopped, suspended, or terminated).
   optional string node_id = 44;
 
   // When the manager that started the session issued it, RFC 3339. Of two
