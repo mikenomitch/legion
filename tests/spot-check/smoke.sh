@@ -202,6 +202,10 @@ scenario_agents() {
     else
         bad "exec into microVM: $(tail -1 <<<"$result")"
     fi
+    # Each run names its own instances, so destroy them or they pile up across
+    # runs and starve later scenarios of room.
+    legion instance destroy "$box" >/dev/null 2>&1
+    legion instance destroy "$vm" >/dev/null 2>&1
 }
 
 scenario_redis() {
@@ -399,7 +403,7 @@ scenario_sandbox_idle() {
     sandbox_setup
     local id="idle-smoke-$(date +%s)" before out mgr t0
     legion instance create sandboxes --task idler --id "$id" >/dev/null || { bad "create $id"; return; }
-    eventually 300 sbx_ok "$id" true || { bad "$id never took an exec session"; return; }
+    eventually 300 sbx_ok "$id" true || { bad "$id never took an exec session"; legion instance destroy "$id" >/dev/null 2>&1; return; }
     eventually 60 sbx_get "$id" >/dev/null
     before="$(sbx_get "$id" | jq -r '.process // empty')"
     # Hands off now: no exec, no traffic. Polling the manager is not activity.
@@ -407,6 +411,7 @@ scenario_sandbox_idle() {
         ok "suspended by the idle policy (reason $(inst "$id" suspendReason))"
     else
         bad "$id still $(inst "$id" state) after 4 minutes quiet (idle since $(inst "$id" idleSince); detail $(inst "$id" detail))"
+        legion instance destroy "$id" >/dev/null 2>&1
         return
     fi
     # The gateway dials the instance's node on its dynamic port, which the rig
