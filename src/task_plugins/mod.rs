@@ -421,6 +421,15 @@ pub struct TaskInstance {
     /// (see [`sandbox_checkpoint`]). `false`, the default, launches exactly
     /// as before checkpoints existed.
     pub checkpoint_launch: bool,
+    /// Node-level directory holding the stable device links a
+    /// memory-checkpointable sandbox hands its VMM (`<data dir>/vmdev`).
+    ///
+    /// Set by worker core. It must not depend on the worker id: a VMM
+    /// reopens a restored guest's disks at the exact paths it captured, so
+    /// a checkpoint restored on another node only finds its links when both
+    /// nodes put them in the same place. `None` (tests, dev runtimes) puts
+    /// them beside the allocation directories.
+    pub device_link_root: Option<PathBuf>,
 }
 
 impl TaskInstance {

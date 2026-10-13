@@ -830,9 +830,11 @@ those exact paths on restore. A restored sandbox is a new allocation with a new
 directory, so a sandbox that may be memory-checkpointed boots differently:
 
 - **Stable device links.** The VMM sees its disks through symlinks under
-  `<worker state>/allocs/.vmdev/<key>/` (`rootfs.img`, `vol0.img`, …,
-  `identity.img`). A restore repoints the links at the new allocation's files
-  before the VMM opens them.
+  `<data dir>/vmdev/<key>/` (`rootfs.img`, `vol0.img`, …, `identity.img`).
+  A restore repoints the links at the new allocation's files before the VMM
+  opens them. The links live in the node's data dir rather than the worker's
+  state dir, because the state dir's path includes the worker id, which
+  differs on every node a published checkpoint can resume on.
 - **An identity disk.** A 1 MiB raw disk is attached after the volumes as
   drive `identity`, read-only. Its guest device is on the kernel cmdline as
   `legion.identity=/dev/vdX`. The host rewrites it on every restore with the
@@ -937,6 +939,19 @@ any node whose attributes match, and that node fetches the memory, VMM state,
 and root disk parts from the content store first. The guest's root disk is
 one of those parts, so a sandbox with no `stateful.storage` moves whole. See
 [Durability](suspend-and-resume.md#durability-surviving-the-node).
+
+The saved state names each disk by its device-link path on the node that
+took the checkpoint. On cloud-hypervisor the restore rewrites its own copy
+of `config.json` to name the restoring node's links, so a published
+checkpoint restores on any node. Firecracker's saved state cannot be
+rewritten, so the restoring node must keep its links at the same paths,
+which means the same data dir (`LEGION_DATA_DIR`) on both nodes. A
+Firecracker restore onto a node with a different data dir is refused before
+the VMM starts, and `onRestoreFailure` decides what happens next:
+
+```text
+checkpoint snap-dfaf943bf48d859c reopens its disks under /var/lib/legion/vmdev/sbx-…, but this node keeps device links under /opt/legion/vmdev/sbx-…: Firecracker restores a guest's disks only at the paths it captured, so the capturing and restoring nodes need the same data directory (LEGION_DATA_DIR)
+```
 
 ## Guest memory under pressure
 

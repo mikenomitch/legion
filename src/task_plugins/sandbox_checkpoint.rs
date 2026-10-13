@@ -16,9 +16,15 @@
 //! those exact paths on restore. A sandbox's disks live under its allocation
 //! directory, and a restore is a *new* allocation with a new directory. So a
 //! checkpointable sandbox never hands the VMM its real disk paths. It hands
-//! it stable symlinks under `<allocs>/.vmdev/<link_key>/` (`rootfs.img`,
+//! it stable symlinks under `<data dir>/vmdev/<link_key>/` (`rootfs.img`,
 //! `vol0.img`, …, `identity.img`), and a restore repoints those links at the
-//! new allocation's files before the VMM opens them. The VMM holds open file
+//! new allocation's files before the VMM opens them. The link root is
+//! node-level and never under the worker's state dir, whose path carries
+//! the worker id: a checkpoint published to the content store resumes on
+//! another node, which must find the links at the same paths. Firecracker's
+//! saved state cannot be edited, so it needs the same data dir on both
+//! nodes; cloud-hypervisor's `config.json` is rewritten to this node's links
+//! on every restore, so it restores anywhere. The VMM holds open file
 //! descriptors from then on, so repointing the links for a later restore (a
 //! fork, say) never disturbs a running guest. Restores that share a link key
 //! are serialized by [`LINK_LOCK`] across the repoint-and-load window.
@@ -140,8 +146,15 @@ impl GuestNetwork {
 pub(crate) struct SandboxCheckpointState {
     /// `firecracker` or `cloud-hypervisor`.
     pub vmm: String,
-    /// The link directory name under `<allocs>/.vmdev/`.
+    /// The link directory name under the node's device-link root.
     pub link_key: String,
+    /// The absolute link directory the VMM was handed
+    /// (`<data dir>/vmdev/<link_key>`): where the saved state names every
+    /// disk. A restore on a node that keeps its links elsewhere rewrites
+    /// cloud-hypervisor's config to its own, and refuses Firecracker by
+    /// name. Absent on checkpoints taken before it was recorded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub link_dir: Option<PathBuf>,
     /// Volume disks attached, in order (`vol0.img`, …).
     pub volume_count: usize,
     pub vcpus: u32,
@@ -274,6 +287,7 @@ pub(crate) fn write_guest_ports_record(scratch: &Path, ports: &[(&str, u16)]) ->
         &SandboxCheckpointState {
             vmm: "firecracker".into(),
             link_key: "sbx-test".into(),
+            link_dir: None,
             volume_count: 0,
             vcpus: 1,
             memory_mib: 128,
@@ -298,6 +312,7 @@ pub(crate) fn write_guest_upstreams_record(scratch: &Path, upstreams: &[(&str, u
         &SandboxCheckpointState {
             vmm: "firecracker".into(),
             link_key: "sbx-test".into(),
+            link_dir: None,
             volume_count: 0,
             vcpus: 1,
             memory_mib: 128,
@@ -418,6 +433,10 @@ impl DeviceLinks {
         self.dir.join(name)
     }
 
+    pub(crate) fn dir(&self) -> &Path {
+        &self.dir
+    }
+
     /// Atomically point link `name` at `target` (create a temp symlink, then
     /// rename over the old one).
     pub(crate) fn point(&self, name: &str, target: &Path) -> R<PathBuf> {
@@ -445,14 +464,21 @@ impl DeviceLinks {
     }
 }
 
-/// Where link directories live: beside the allocation directories, so they
-/// share a filesystem with every disk they point at.
+/// Where link directories live: the node's device-link root
+/// ([`TaskInstance::device_link_root`], `<data dir>/vmdev`), which is the
+/// same on every node with the same data dir. Without one (tests), beside
+/// the allocation directories.
 pub(crate) fn vmdev_root(instance: &TaskInstance, scratch: &Path) -> PathBuf {
     instance
-        .alloc_dir
-        .as_deref()
-        .and_then(Path::parent)
-        .map(|allocs| allocs.join(".vmdev"))
+        .device_link_root
+        .clone()
+        .or_else(|| {
+            instance
+                .alloc_dir
+                .as_deref()
+                .and_then(Path::parent)
+                .map(|allocs| allocs.join(".vmdev"))
+        })
         .unwrap_or_else(|| scratch.join("vmdev"))
 }
 
@@ -543,12 +569,15 @@ pub(crate) fn prepare_checkpoint_launch(
     spec: &mut VmSpec,
     tokens: &GuestTokens,
 ) -> R<SandboxCheckpointState> {
+    let link_key = format!(
+        "sbx-{}",
+        crate::util::random_string(16).to_ascii_lowercase()
+    );
+    let links = DeviceLinks::new(&vmdev_root(instance, scratch), &link_key);
     let state = SandboxCheckpointState {
         vmm: backend.vmm_name().to_string(),
-        link_key: format!(
-            "sbx-{}",
-            crate::util::random_string(16).to_ascii_lowercase()
-        ),
+        link_key,
+        link_dir: Some(links.dir().to_path_buf()),
         volume_count: spec.volume_disks.len(),
         vcpus: spec.vcpus,
         memory_mib: spec.memory_mib,
@@ -571,7 +600,6 @@ pub(crate) fn prepare_checkpoint_launch(
         &boot_identity(allocation, task_name, &spec.name, tokens),
     )?;
 
-    let links = DeviceLinks::new(&vmdev_root(instance, scratch), &state.link_key);
     let _guard = LINK_LOCK
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -1210,18 +1238,20 @@ pub(crate) fn release_restore_tap(taps: &dyn TapHost, scratch: &Path) {
     let _ = std::fs::remove_file(&record);
 }
 
-/// cloud-hypervisor reopens the TAP devices and the vsock socket named in
-/// the snapshot's `config.json`. Rewrite that part, in the restore's own
-/// source directory (where it is a link into the content store, so it is
-/// replaced rather than edited), to name this restore's own TAP (`tap`, a
-/// fork) and its own vsock socket (`vsock`, every gated restore), in one
-/// pass.
+/// cloud-hypervisor reopens the disks, the TAP devices, and the vsock socket
+/// named in the snapshot's `config.json`. Rewrite that part, in the
+/// restore's own source directory (where it is a link into the content
+/// store, so it is replaced rather than edited), to name this node's device
+/// links (`links`: the capturing node may keep them under another data
+/// dir), this restore's own TAP (`tap`, a fork), and its own vsock socket
+/// (`vsock`, every gated restore), in one pass.
 fn retarget_cloud_hypervisor_config(
     source: &CheckpointDir,
+    links: Option<&DeviceLinks>,
     tap: Option<&str>,
     vsock: Option<&Path>,
 ) -> R<()> {
-    if tap.is_none() && vsock.is_none() {
+    if links.is_none() && tap.is_none() && vsock.is_none() {
         return Ok(());
     }
     let path = source.part_path(parts::CH_CONFIG);
@@ -1240,6 +1270,38 @@ fn retarget_cloud_hypervisor_config(
         };
         for net in nets {
             net["tap"] = serde_json::Value::String(own.to_string());
+        }
+    }
+    if let Some(links) = links {
+        let disks = config
+            .get_mut("disks")
+            .and_then(serde_json::Value::as_array_mut)
+            .map(|disks| disks.iter_mut())
+            .into_iter()
+            .flatten();
+        for disk in disks {
+            let Some(saved) = disk.get("path").and_then(serde_json::Value::as_str) else {
+                continue;
+            };
+            let saved = Path::new(saved);
+            // Every disk of a checkpointable launch is a link named
+            // `<link_key>/<name>`: point it at this node's link of that name.
+            let linked = saved.parent().and_then(Path::file_name) == links.dir().file_name();
+            match saved.file_name() {
+                Some(name) if linked => {
+                    let local = links.path(&name.to_string_lossy());
+                    disk["path"] = serde_json::Value::String(local.display().to_string());
+                }
+                // Not one of ours. Name it here, where cloud-hypervisor would
+                // only say "Cannot open disk path".
+                _ if !saved.exists() => bail!(
+                    "restore needs disk {}: the checkpoint's config.json names it outside \
+                     its device links ({}), and it does not exist on this node",
+                    saved.display(),
+                    links.dir().display()
+                ),
+                _ => {}
+            }
         }
     }
     if let Some(socket) = vsock {
@@ -1478,6 +1540,25 @@ pub(crate) fn restore_microvm(
         );
     }
 
+    // The saved state names every disk by its link path on the capturing
+    // node. cloud-hypervisor's config is rewritten to this node's links
+    // below; Firecracker's state cannot be, so it needs the same paths.
+    let links = DeviceLinks::new(&vmdev_root(instance, &target.scratch), &state.link_key);
+    if let (Backend::Firecracker { .. }, Some(saved)) = (target.backend, state.link_dir.as_deref())
+    {
+        if saved != links.dir() {
+            bail!(
+                "checkpoint {} reopens its disks under {}, but this node keeps device links \
+                 under {}: Firecracker restores a guest's disks only at the paths it captured, \
+                 so the capturing and restoring nodes need the same data directory \
+                 (LEGION_DATA_DIR)",
+                manifest.id,
+                saved.display(),
+                links.dir().display()
+            );
+        }
+    }
+
     let scratch = &target.scratch;
     std::fs::create_dir_all(scratch)?;
     crate::util::restrict_dir_to_owner(scratch)?;
@@ -1528,7 +1609,12 @@ pub(crate) fn restore_microvm(
         let _ = std::fs::remove_file(base);
     }
     if matches!(target.backend, Backend::CloudHypervisor { .. }) {
-        retarget_cloud_hypervisor_config(source, moved_to.as_deref(), target.vsock.as_deref())?;
+        retarget_cloud_hypervisor_config(
+            source,
+            Some(&links),
+            moved_to.as_deref(),
+            target.vsock.as_deref(),
+        )?;
     }
     if let Some(device) = moved_to.as_deref().or(state.tap.as_deref()) {
         record_attached_tap(scratch, device)?;
@@ -1538,7 +1624,6 @@ pub(crate) fn restore_microvm(
 
     let socket = scratch.join("vmm.sock");
     let _ = std::fs::remove_file(&socket);
-    let links = DeviceLinks::new(&vmdev_root(instance, scratch), &state.link_key);
     let started = std::time::Instant::now();
 
     let _guard = LINK_LOCK
@@ -1587,6 +1672,7 @@ pub(crate) fn restore_microvm(
     // from it per connection: the first ingress connection after the resume
     // must already reach the port the restored workload holds.
     let next = SandboxCheckpointState {
+        link_dir: Some(links.dir().to_path_buf()),
         tap: moved_to.clone().or_else(|| state.tap.clone()),
         network: Some(state.network()),
         guest_address: identity
@@ -1777,6 +1863,7 @@ mod tests {
         let state = SandboxCheckpointState {
             vmm: "firecracker".into(),
             link_key: "sbx-k".into(),
+            link_dir: None,
             volume_count: 0,
             vcpus: 1,
             memory_mib: 128,
@@ -1819,6 +1906,7 @@ mod tests {
         let state = SandboxCheckpointState {
             vmm: "firecracker".into(),
             link_key: "sbx-k".into(),
+            link_dir: None,
             volume_count: 0,
             vcpus: 2,
             memory_mib: 1024,
@@ -2341,7 +2429,7 @@ mod tests {
         )?;
         let source = CheckpointDir::create(tmp.path().join("restore"))?;
         std::fs::hard_link(&store_blob, source.part_path(parts::CH_CONFIG))?;
-        retarget_cloud_hypervisor_config(&source, Some("lgf0123456789ab"), None)?;
+        retarget_cloud_hypervisor_config(&source, None, Some("lgf0123456789ab"), None)?;
         let rewritten: serde_json::Value =
             serde_json::from_slice(&std::fs::read(source.part_path(parts::CH_CONFIG))?)?;
         assert_eq!(rewritten["net"][0]["tap"], "lgf0123456789ab");
@@ -2371,6 +2459,7 @@ mod tests {
         std::fs::hard_link(&store_blob, source.part_path(parts::CH_CONFIG))?;
         retarget_cloud_hypervisor_config(
             &source,
+            None,
             Some("lgf0123456789ab"),
             Some(Path::new("/allocs/9/.sandbox/vsock.sock")),
         )?;
@@ -2396,6 +2485,7 @@ mod tests {
         let err = retarget_cloud_hypervisor_config(
             &no_vsock,
             None,
+            None,
             Some(Path::new("/allocs/9/.sandbox/vsock.sock")),
         )
         .unwrap_err();
@@ -2419,6 +2509,7 @@ mod tests {
         let state = |network: Option<GuestNetwork>, tap: Option<&str>| SandboxCheckpointState {
             vmm: "firecracker".into(),
             link_key: "sbx-k".into(),
+            link_dir: None,
             volume_count: 0,
             vcpus: 1,
             memory_mib: 256,
@@ -2548,7 +2639,7 @@ mod tests {
     /// Gated plan §6.2 and §9, the device-link trap: fork one gated
     /// Firecracker checkpoint twice. Each restore moves the guest's vsock
     /// onto its own allocation's socket (where its own datapath listens),
-    /// never into the shared `.vmdev/<key>/` directory, so a later fork can
+    /// never into the shared device-link directory, so a later fork can
     /// never redirect another guest's connections. Each waits for its
     /// datapath before resuming, and records `gated` for its next capture.
     #[test]
@@ -2675,6 +2766,7 @@ mod tests {
         let state = SandboxCheckpointState {
             vmm: "cloud-hypervisor".into(),
             link_key: "sbx-gated".into(),
+            link_dir: None,
             volume_count: 0,
             vcpus: 1,
             memory_mib: 256,
@@ -2742,6 +2834,319 @@ mod tests {
             &scratch.join("vsock.sock"),
             Duration::ZERO
         ));
+        Ok(())
+    }
+
+    /// One node of a cross-node restore: its own data dir (so its own
+    /// device-link root) and its own worker id in the allocation path,
+    /// like `<data>/workers/<id>/allocs/<alloc>` (with `workers` shortened
+    /// to `wk`: macOS temp dirs leave little room under the socket limit).
+    fn node_instance(node: &Path, worker: &str, id: i64) -> TaskInstance {
+        TaskInstance {
+            alloc_dir: Some(
+                node.join("wk")
+                    .join(worker)
+                    .join("allocs")
+                    .join(id.to_string()),
+            ),
+            device_link_root: Some(node.join("vmdev")),
+            checkpoint_launch: true,
+            ..TaskInstance::default()
+        }
+    }
+
+    /// A gated sandbox launched for checkpoints on `instance`, minus the VMM.
+    fn launch_on(instance: &TaskInstance, id: i64, backend: &Backend) -> R<(PathBuf, VmSpec)> {
+        let scratch = instance.alloc_dir.clone().unwrap().join(".sandbox");
+        std::fs::create_dir_all(&scratch)?;
+        std::fs::write(scratch.join("rootfs.img"), b"root disk contents")?;
+        let mut spec = VmSpec {
+            name: format!("legion-sbx-{id}"),
+            kernel: PathBuf::from("/var/lib/legion/kernels/vmlinux"),
+            extra_cmdline: None,
+            root_disk: scratch.join("rootfs.img"),
+            volume_disks: Vec::new(),
+            vcpus: 1,
+            memory_mib: 256,
+            tap: None,
+            api_socket: scratch.join("vmm.sock"),
+            vsock: Some(microvm::VsockSpec {
+                socket: crate::task_plugins::vsock_socket_base(&scratch),
+            }),
+            identity_disk: None,
+            balloon: None,
+        };
+        prepare_checkpoint_launch(
+            backend,
+            &alloc(id),
+            "box",
+            instance,
+            &scratch,
+            &mut spec,
+            &GuestTokens::default(),
+        )?;
+        Ok((scratch, spec))
+    }
+
+    fn gated_target<'a>(
+        backend: &'a Backend,
+        allocation: &'a Allocation,
+        scratch: &Path,
+    ) -> RestoreTarget<'a> {
+        RestoreTarget {
+            backend,
+            allocation,
+            task_name: "box",
+            hostname: format!("legion-sbx-{}", allocation.id),
+            vcpus: 1,
+            memory_mib: 256,
+            scratch: scratch.to_path_buf(),
+            tap: None,
+            bridge: None,
+            vsock: Some(crate::task_plugins::vsock_socket_base(scratch)),
+            datapath_wait: Duration::ZERO,
+        }
+    }
+
+    /// The AWS spot check's P0: a `durability = "store"` checkpoint taken on
+    /// one worker resumes on another, whose worker id (and here also data
+    /// dir) differ, so none of the capturing node's paths exist. Every disk
+    /// and socket the saved `config.json` names must resolve on the
+    /// restoring node, into the restoring allocation, before
+    /// cloud-hypervisor opens it (it failed with `Cannot open disk path`).
+    #[test]
+    fn a_cloud_hypervisor_checkpoint_restores_on_another_node() -> R<()> {
+        let tmp = tempfile::tempdir()?;
+        let ch = Backend::CloudHypervisor {
+            binary: "/usr/bin/true".into(),
+        };
+        let origin_node = tmp.path().join("n2");
+        let origin = node_instance(&origin_node, "w2", 7);
+        let (origin_scratch, spec) = launch_on(&origin, 7, &ch)?;
+
+        // What cloud-hypervisor saves: the paths it was launched with.
+        let out = CheckpointDir::create(tmp.path().join("ckpt"))?;
+        std::fs::copy(
+            origin_scratch.join("rootfs.img"),
+            out.part_path(parts::ROOTFS),
+        )?;
+        let identity_disk = spec.identity_disk.clone().unwrap();
+        std::fs::write(
+            out.part_path(parts::CH_CONFIG),
+            serde_json::to_vec(&json!({
+                "payload": { "kernel": spec.kernel, "cmdline": "console=ttyS0" },
+                "disks": [
+                    { "path": spec.root_disk, "id": "_disk0" },
+                    { "path": identity_disk, "readonly": true, "id": IDENTITY_DRIVE_ID },
+                ],
+                "vsock": { "cid": 3, "socket": spec.vsock.as_ref().unwrap().socket, "id": "_vsock0" },
+                "rng": { "src": "/dev/urandom" },
+            }))?,
+        )?;
+        let state = read_boot_record(&origin_scratch).expect("boot record");
+        assert_eq!(
+            state.link_dir.as_deref(),
+            Some(origin_node.join("vmdev").join(&state.link_key).as_path()),
+            "the launch records where the VMM sees its disks"
+        );
+        let memory = MemoryParts {
+            parts: out.seal(&[("rootfs", parts::ROOTFS), ("vm-config", parts::CH_CONFIG)])?,
+            ..MemoryParts::default()
+        };
+        let manifest = manifest_for(&state, memory);
+        // The capturing node is somewhere else entirely.
+        std::fs::remove_dir_all(&origin_node)?;
+
+        let node = tmp.path().join("n1");
+        let mut instance = node_instance(&node, "w1", 91);
+        let alloc_dir = instance.alloc_dir.clone().unwrap();
+        let scratch = alloc_dir.join(".sandbox");
+        std::fs::create_dir_all(&scratch)?;
+        // The datapath already listens where the daemon binds it.
+        let datapath = crate::worker::netd::guest_agent::host_socket_path(
+            &crate::task_plugins::vsock_socket_base_for(&alloc_dir),
+            crate::worker::netd::guest_agent::PROXY_PORT,
+        );
+        std::fs::write(&datapath, b"bound")?;
+        std::fs::write(scratch.join("vmm.sock"), b"stale")?;
+        let vmm = FakeVmm::start_at(scratch.join("vmm.sock"), true, |_| (204, String::new()));
+        let allocation = alloc(91);
+        restore_microvm(
+            &gated_target(&ch, &allocation, &scratch),
+            &mut instance,
+            &manifest,
+            &out,
+            &ResumeIdentity {
+                alloc_id: 91,
+                ..ResumeIdentity::default()
+            },
+            &FakeTaps::default(),
+        )?;
+        let calls: Vec<String> = vmm.drain().into_iter().map(|call| call.path).collect();
+        assert_eq!(calls, vec!["/api/v1/vm.resume"]);
+
+        let config: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(out.part_path(parts::CH_CONFIG))?)?;
+        let disks: Vec<PathBuf> = config["disks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|disk| PathBuf::from(disk["path"].as_str().unwrap()))
+            .collect();
+        let resolved: Vec<PathBuf> = disks
+            .iter()
+            .map(|disk| std::fs::canonicalize(disk).expect("every saved disk resolves"))
+            .collect();
+        let real_scratch = std::fs::canonicalize(&scratch)?;
+        assert_eq!(
+            resolved,
+            vec![
+                real_scratch.join("rootfs.img"),
+                real_scratch.join(IDENTITY_FILE)
+            ],
+            "the restore's own root disk and fresh identity disk: {disks:?}"
+        );
+        assert!(disks
+            .iter()
+            .all(|disk| disk.starts_with(node.join("vmdev").join(&state.link_key))));
+        assert_eq!(
+            crate::task_plugins::checkpoint::read_identity_disk(&disks[1])?.alloc_id,
+            91
+        );
+        let vsock = PathBuf::from(config["vsock"]["socket"].as_str().unwrap());
+        assert_eq!(
+            vsock,
+            crate::task_plugins::vsock_socket_base_for(&alloc_dir),
+            "the vsock base the daemon binds the datapath beside"
+        );
+        assert_eq!(
+            config["payload"]["kernel"], "/var/lib/legion/kernels/vmlinux",
+            "a restore never reloads the kernel, so its path is left alone"
+        );
+        assert_eq!(
+            read_boot_record(&scratch).and_then(|next| next.link_dir),
+            Some(node.join("vmdev").join(&state.link_key)),
+            "a later checkpoint of the restored guest names this node's links"
+        );
+        Ok(())
+    }
+
+    /// A disk in the saved config that is not one of the checkpoint's links
+    /// and does not exist here is named before cloud-hypervisor runs.
+    #[test]
+    fn a_cloud_hypervisor_restore_names_a_disk_it_cannot_resolve() -> R<()> {
+        let tmp = tempfile::tempdir()?;
+        let source = CheckpointDir::create(tmp.path().join("restore"))?;
+        std::fs::write(
+            source.part_path(parts::CH_CONFIG),
+            serde_json::to_vec(&json!({
+                "disks": [
+                    { "path": "/elsewhere/vmdev/sbx-k/rootfs.img" },
+                    { "path": "/elsewhere/allocs/7/.sandbox/scratch.img" },
+                ],
+            }))?,
+        )?;
+        let links = DeviceLinks::new(&tmp.path().join("vmdev"), "sbx-k");
+        let err = retarget_cloud_hypervisor_config(&source, Some(&links), None, None).unwrap_err();
+        assert!(
+            err.to_string()
+                .starts_with("restore needs disk /elsewhere/allocs/7/.sandbox/scratch.img"),
+            "{err}"
+        );
+        Ok(())
+    }
+
+    /// Firecracker's saved state names its disks at the capturing node's link
+    /// paths and cannot be rewritten. Nodes that share a data dir share a
+    /// device-link root whatever their worker ids, so those paths resolve
+    /// into the restoring allocation. Nodes that do not are refused by name
+    /// before a VMM is spawned, so `onRestoreFailure` decides.
+    #[test]
+    fn a_firecracker_checkpoint_restores_on_another_worker_with_the_same_data_dir() -> R<()> {
+        let tmp = tempfile::tempdir()?;
+        let fc = Backend::Firecracker {
+            binary: "/usr/bin/true".into(),
+        };
+        let shared = tmp.path().join("d");
+        let origin = node_instance(&shared, "w2", 7);
+        let (origin_scratch, spec) = launch_on(&origin, 7, &fc)?;
+        let out = CheckpointDir::create(tmp.path().join("ckpt"))?;
+        std::fs::copy(
+            origin_scratch.join("rootfs.img"),
+            out.part_path(parts::ROOTFS),
+        )?;
+        std::fs::write(out.part_path(parts::FC_MEMORY), b"memory")?;
+        std::fs::write(out.part_path(parts::FC_STATE), b"vm-state")?;
+        let state = read_boot_record(&origin_scratch).expect("boot record");
+        let memory = MemoryParts {
+            parts: out.seal(&[
+                ("memory", parts::FC_MEMORY),
+                ("vm-state", parts::FC_STATE),
+                ("rootfs", parts::ROOTFS),
+            ])?,
+            ..MemoryParts::default()
+        };
+        let manifest = manifest_for(&state, memory);
+        let identity = ResumeIdentity {
+            alloc_id: 91,
+            ..ResumeIdentity::default()
+        };
+        let allocation = alloc(91);
+
+        // Another data dir: refused before anything is spawned or linked.
+        let elsewhere = tmp.path().join("e");
+        let mut stranger = node_instance(&elsewhere, "w1", 91);
+        let scratch = stranger.alloc_dir.clone().unwrap().join(".sandbox");
+        let err = restore_microvm(
+            &gated_target(&fc, &allocation, &scratch),
+            &mut stranger,
+            &manifest,
+            &out,
+            &identity,
+            &FakeTaps::default(),
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("Firecracker restores a guest's disks only at the paths it captured"),
+            "{err}"
+        );
+        assert!(stranger.child.is_none());
+        assert!(!elsewhere.join("vmdev").exists());
+
+        // The same data dir, another worker id and allocation.
+        let mut instance = node_instance(&shared, "w1", 91);
+        let scratch = instance.alloc_dir.clone().unwrap().join(".sandbox");
+        std::fs::create_dir_all(&scratch)?;
+        std::fs::write(scratch.join("vmm.sock"), b"stale")?;
+        let vmm = FakeVmm::start_at(scratch.join("vmm.sock"), true, fake_firecracker);
+        restore_microvm(
+            &gated_target(&fc, &allocation, &scratch),
+            &mut instance,
+            &manifest,
+            &out,
+            &identity,
+            &FakeTaps::default(),
+        )?;
+        let load = vmm.drain().into_iter().next().expect("snapshot load");
+        assert_eq!(load.path, "/snapshot/load");
+        assert_eq!(
+            load.body.unwrap()["vsock_override"]["uds_path"],
+            crate::task_plugins::vsock_socket_base(&scratch)
+                .display()
+                .to_string()
+        );
+        // The paths the origin's VMM was launched with (and so its saved
+        // state names) now serve the restoring allocation's files.
+        let scratch = std::fs::canonicalize(&scratch)?;
+        assert_eq!(
+            std::fs::canonicalize(&spec.root_disk)?,
+            scratch.join("rootfs.img")
+        );
+        assert_eq!(
+            std::fs::canonicalize(spec.identity_disk.as_ref().unwrap())?,
+            scratch.join(IDENTITY_FILE)
+        );
         Ok(())
     }
 
@@ -3179,6 +3584,7 @@ mod tests {
         let state = SandboxCheckpointState {
             vmm: "firecracker".into(),
             link_key: "sbx-tap".into(),
+            link_dir: None,
             volume_count: 0,
             vcpus: 1,
             memory_mib: 256,

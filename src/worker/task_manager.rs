@@ -666,6 +666,10 @@ pub struct WorkerTaskManager {
     state_store: WorkerStateStore,
     /// Root of per-allocation directories: `<state dir>/allocs/<alloc_id>/<task>/`.
     alloc_root: PathBuf,
+    /// Where checkpointable sandboxes keep their device links
+    /// ([`TaskInstance::device_link_root`]): `<data dir>/vmdev`, never under
+    /// the worker-id-keyed state dir.
+    device_link_root: PathBuf,
     artifact_status: ArtifactStatusBoard,
     stager: Arc<ArtifactStager>,
     /// The node content store (`None` when disabled or it failed to open).
@@ -829,6 +833,7 @@ impl WorkerTaskManager {
             drain_window: std::time::Duration::ZERO,
             state_store,
             alloc_root,
+            device_link_root: Self::default_device_link_root(),
             artifact_status: ArtifactStatusBoard::new(),
             stager: Arc::new(ArtifactStager::new(
                 WorkerArtifactFetchConfigFull::default(),
@@ -952,6 +957,21 @@ impl WorkerTaskManager {
         // the exec cwd — all of which break if they are relative (a command
         // resolved against a cwd that is itself the task dir). Absolutize
         // once here.
+        if root.is_absolute() {
+            root
+        } else {
+            std::env::current_dir()
+                .map(|cwd| cwd.join(&root))
+                .unwrap_or(root)
+        }
+    }
+
+    /// `<data dir>/vmdev`, absolute. A VMM reopens a restored guest's disks
+    /// at the link paths it captured, so this must be the same on every node
+    /// a checkpoint can move between: the data dir is, the worker id in the
+    /// state dir's path is not.
+    fn default_device_link_root() -> PathBuf {
+        let root = crate::constants::data_dir().join("vmdev");
         if root.is_absolute() {
             root
         } else {
@@ -2104,6 +2124,7 @@ impl WorkerTaskManager {
                 .to_string(),
         );
         instance.alloc_dir = Some(alloc_dir);
+        instance.device_link_root = Some(self.device_link_root.clone());
         instance.task_dir = Some(task_dir);
         Ok(instance)
     }
@@ -4576,6 +4597,7 @@ impl WorkerTaskManager {
                 .extra_env
                 .insert("LEGION_TASK_DIR".into(), task_dir.display().to_string());
             instance.alloc_dir = Some(alloc_dir);
+            instance.device_link_root = Some(self.device_link_root.clone());
             instance.task_dir = Some(task_dir);
             // Re-adopt the CPU/memory assignment this worker handed out
             // before it restarted, so the allocator does not hand a running
@@ -4868,6 +4890,7 @@ impl WorkerTaskManager {
                 .extra_env
                 .insert("LEGION_TASK_DIR".into(), task_dir.display().to_string());
             instance.alloc_dir = Some(alloc_dir);
+            instance.device_link_root = Some(self.device_link_root.clone());
             instance.task_dir = Some(task_dir);
             if let Some(assignment) = process.resource_assignment.as_ref() {
                 self.resources.restore(local_key, assignment);

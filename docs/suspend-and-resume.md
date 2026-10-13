@@ -2201,6 +2201,12 @@ See [metrics](metrics.md#suspend-and-resume).
 - **Memory snapshots need a `sandbox` on Firecracker or cloud-hypervisor**,
   with the same VMM version, CPU, and guest size at restore. A gated sandbox
   on Firecracker needs 1.16.1 or later.
+- **A published Firecracker checkpoint moves only between nodes with the
+  same data dir.** Firecracker reopens a restored guest's disks at the
+  device-link paths it captured, under `<data dir>/vmdev/`, so a node with
+  another `LEGION_DATA_DIR` refuses the restore by name. cloud-hypervisor
+  checkpoints have no such limit. See
+  [Where a memory checkpoint can be restored](task-runtime-sandbox.md#where-a-memory-checkpoint-can-be-restored).
 - **A memory checkpoint closes a gated guest's open connections.** On
   Firecracker that includes the running origin of a live snapshot or a fork.
   New connections work at once. See [Gated sandboxes](#gated-sandboxes).

@@ -263,6 +263,33 @@ How to use it:
           [artifacts.md](../docs/artifacts.md#publishing-content),
           [calls #63](calls/launch-spot-check-fixes-plan_calls.md)).
           Unit-tested, not yet re-run on the rig.
+    - [x] With the fetch fixed, the restore failed in cloud-hypervisor with
+          `Cannot open disk path`: the saved state names each disk by its
+          device link, and links lived under the worker-id-keyed
+          `<data dir>/workers/<id>/allocs/.vmdev/`, which no other node
+          has. Links now live at `<data dir>/vmdev/<key>/`, the launch
+          records the link dir in the checkpoint, and a cloud-hypervisor
+          restore rewrites its `config.json` disks to this node's links
+          ([calls #1, #2](calls/sandbox-snapshots-and-fast-start-plan_calls.md),
+          [docs](../docs/task-runtime-sandbox.md#where-a-memory-checkpoint-can-be-restored)).
+          Unit-tested with fake VMMs, not yet re-run on the rig.
+    - [ ] A published Firecracker checkpoint still cannot move between
+          nodes with different data dirs: its `vm-state` cannot be
+          rewritten and `PUT /snapshot/load` has no drive override. The
+          restore is refused by name. Revisit if Firecracker adds drive
+          overrides, or if placement should prefer matching data dirs.
+    - [ ] The same restore logged `Resuming a restored gated sandbox before
+          its egress proxy socket is bound` (5s wait for
+          `<alloc>/.sandbox/vsock.sock_1080`). The paths the daemon binds
+          and the restore waits for agree, so the cause is unknown. If the
+          allocation was not actually gated, the next item explains it.
+          Check `legion net doctor` and the socket during the rerun.
+    - [ ] Every microVM sandbox has a vsock (for exec), so every checkpoint
+          records `network = gated` and every restore sets
+          `RestoreTarget.vsock`. A non-gated (TAP or loopback-only) sandbox
+          therefore waits the full 5s `DATAPATH_WAIT` and warns on every
+          restore, and the gated-vs-TAP refusal in `check_restorable` never
+          fires. Derive both from the allocation's network mode.
     - [ ] Rerun the store suspend and cross-node resume on the rig.
     - [ ] Placement ignores which `contentStore` a node has, so a resume can
           land on a node pointed at another bucket and fail. Prefer or

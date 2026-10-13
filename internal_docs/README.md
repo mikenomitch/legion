@@ -203,6 +203,7 @@ by project impact. The full template and a worked example:
 - [sandbox-clean-stop_calls.md](calls/sandbox-clean-stop_calls.md)
 - [sandbox-exec-plan_calls.md](calls/sandbox-exec-plan_calls.md)
 - [sandbox-scaling-plan_calls.md](calls/sandbox-scaling-plan_calls.md)
+- [sandbox-snapshots-and-fast-start-plan_calls.md](calls/sandbox-snapshots-and-fast-start-plan_calls.md)
 - [wake-on-request-plan_calls.md](calls/wake-on-request-plan_calls.md)
 - [session-durability-and-routing-plan_calls.md](calls/session-durability-and-routing-plan_calls.md)
 - [gang-scheduling-plan_calls.md](calls/gang-scheduling-plan_calls.md)

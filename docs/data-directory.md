@@ -25,6 +25,7 @@ up, or start over without deleting your existing data.
 | Worker state, allocation dirs, task logs | `<data dir>/workers/<worker-id>/` | `LEGION_WORKER_STATE_PATH` (state file only) |
 | Worker node certificate and its private key (`node.pem`, `node.key`, `ca.pem`, each mode `0600`) | `identity/` beside the worker state file | moves with `LEGION_WORKER_STATE_PATH` |
 | Identity token backing files | `<data dir>/identity/<alloc-id>/<name>/token` | none |
+| Sandbox device links for memory checkpoints (symlinks only, kept outside the worker-id path so a published checkpoint finds them on another node; see [the sandbox runtime](task-runtime-sandbox.md#launching-a-sandbox-for-memory-checkpoints)) | `<data dir>/vmdev/<key>/` | none |
 | Worker node key, certificate, and cluster CA bundle (`node.key`, `node.pem`, `ca.pem`, mode `0600`) | `<data dir>/workers/<worker-id>/identity/` (beside the state file) | moves with `LEGION_WORKER_STATE_PATH` |
 | Simulator fleet key and certificate | `<data dir>/sim/<name prefix>/identity/` | none |
 | Initial management token (`bootstrap-token`, mode `0600`), written by the manager that mints it | `<data dir>/bootstrap-token` | none |
