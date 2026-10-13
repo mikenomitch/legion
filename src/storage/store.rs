@@ -19112,7 +19112,9 @@ impl Store {
         Ok(Some(lock))
     }
 
-    #[instrument(err, skip_all)]
+    // No `err` here: most failures are the caller's SQL, which the RPC layer
+    // logs at debug; it logs the real server errors itself.
+    #[instrument(skip_all)]
     pub fn query_state_store(&self, sql: &str, allow_write: bool) -> R<StateStoreQueryResult> {
         let trimmed = sql.trim();
         if trimmed.is_empty() {
@@ -19125,7 +19127,7 @@ impl Store {
         if !allow_write && !Self::is_read_only_statement(&statement_type) {
             return Err(anyhow::Error::new(StorageError::InvalidInput {
                 message: format!(
-                    "statement type '{statement_type}' is not allowed in read-only mode; pass allow_write to enable mutating queries"
+                    "statement type '{statement_type}' is not allowed in read-only mode; pass --allow-write (allow_write in the API) to enable mutating queries"
                 ),
             }));
         }
@@ -19137,15 +19139,15 @@ impl Store {
                 self.read_connection()?
             };
             let redaction = RedactSecretColumns::install(&conn);
-            let mut stmt = conn.prepare(trimmed)?;
+            let mut stmt = conn.prepare(trimmed).map_err(Self::user_sql_error)?;
             let columns: Vec<String> = stmt
                 .column_names()
                 .iter()
                 .map(|column| (*column).to_string())
                 .collect();
-            let mut rows = stmt.query([])?;
+            let mut rows = stmt.query([]).map_err(Self::user_sql_error)?;
             let mut output_rows = Vec::new();
-            while let Some(row) = rows.next()? {
+            while let Some(row) = rows.next().map_err(Self::user_sql_error)? {
                 let mut map = serde_json::Map::new();
                 for (index, column_name) in columns.iter().enumerate() {
                     let value = match row.get_ref(index)? {
@@ -19215,7 +19217,7 @@ impl Store {
         // Redacted here too, so `INSERT ... SELECT key_pem ...` cannot copy a
         // secret into a table the caller can read.
         let redaction = RedactSecretColumns::install(&conn);
-        let affected_rows = conn.execute(sql, [])? as u64;
+        let affected_rows = conn.execute(sql, []).map_err(Self::user_sql_error)? as u64;
         drop(redaction);
 
         Ok(StateStoreQueryResult {
@@ -19224,6 +19226,28 @@ impl Store {
             rows: Vec::new(),
             affected_rows,
         })
+    }
+
+    /// Classify an error from the caller's own SQL. SQLITE_ERROR (a syntax
+    /// error, an unknown table or column) or a second statement is the
+    /// caller's mistake, so `InvalidInput` with SQLite's own message. From
+    /// Legion's own SQL the same code is a bug, which is why
+    /// [`StorageError::from_rusqlite`] keeps it `Internal` everywhere else.
+    fn user_sql_error(err: rusqlite::Error) -> anyhow::Error {
+        let message = match &err {
+            // A statement that does not compile, with where in the SQL.
+            rusqlite::Error::SqlInputError { .. } => err.to_string(),
+            rusqlite::Error::SqliteFailure(failure, message)
+                if failure.code == rusqlite::ErrorCode::Unknown =>
+            {
+                message.clone().unwrap_or_else(|| err.to_string())
+            }
+            rusqlite::Error::MultipleStatement => {
+                "the SQL holds more than one statement; run one at a time".to_string()
+            }
+            _ => return anyhow::Error::new(err),
+        };
+        anyhow::Error::new(StorageError::InvalidInput { message })
     }
 
     #[instrument(err, skip_all)]
@@ -30906,6 +30930,30 @@ mod tests {
         // Reads are unaffected.
         store.query_state_store("SELECT 1;", false)?;
         store.set_raft_mode(false);
+        Ok(())
+    }
+
+    /// AWS spot-check re-run: a bad column came back `Internal`. The
+    /// caller's SQL mistakes are `InvalidInput` carrying SQLite's message.
+    #[test]
+    fn a_bad_state_query_is_invalid_input_with_the_sqlite_message_test() -> R<()> {
+        let store = setup_store()?;
+        for (sql, needle) in [
+            ("SELECT no_such_column FROM job_config", "no such column"),
+            ("SELECT * FROM no_such_table", "no such table"),
+            ("SELECT FROM job_config", "syntax error"),
+        ] {
+            let err = store
+                .query_state_store(sql, false)
+                .err()
+                .with_context(|| format!("{sql} should fail"))?;
+            let storage = StorageError::from_anyhow(&err);
+            assert!(
+                matches!(storage, Some(StorageError::InvalidInput { .. })),
+                "{sql}: {storage:?}"
+            );
+            assert!(format!("{err:#}").contains(needle), "{sql}: {err:#}");
+        }
         Ok(())
     }
 
