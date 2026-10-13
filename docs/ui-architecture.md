@@ -26,7 +26,9 @@ accent, dark-first with a full light theme) lives in a few central places:
   `--c-brass`, …) mapped into Tailwind color names in
   `ui/tailwind.config.js` (`bg-surface`, `text-muted`, `border-line`,
   `text-brass`, …). Light and dark themes switch by swapping variables on
-  `.dark`. Pages never write `dark:` variants for theme colors.
+  `.dark`, and the color themes in the appearance picker swap the same
+  variables on `data-theme` (see [Appearance](#appearance)). Pages never write
+  `dark:` variants for theme colors.
 - **Primitives**: `ui/src/components/ui.tsx` exports the shared components
   every page builds on: `Icon`, `Badge`/`StatusBadge`/`MonoBadge`,
   `Card`/`SectionCard`/`PageHeader`/`StatCard`, `Tabs`, `Note`,
@@ -44,6 +46,95 @@ accent, dark-first with a full light theme) lives in a few central places:
 - **Favicon and tab title**: `ui/public/favicon.svg` is the brand mark.
   `document.title` reads innermost-first (`web · api · Jobs · Legion`), so
   you can tell open tabs apart by their first word.
+
+## Appearance
+
+The palette icon in the top bar, or **Appearance** in ⌘K, opens the appearance
+picker. It has three controls, and every change applies as you click:
+
+- **Mode**: Light, Dark, or System. System, the default, follows the
+  operating system and switches when it does. The sun/moon button in the top
+  bar flips between Light and Dark and leaves the theme alone.
+- **Theme**: one of six color themes. Each tile previews the theme in the
+  current mode.
+- **Colors**: open **Customize** to set any of the theme's ten colors by
+  hand, with a color picker or a hex value (`#ffcc00` or `ffcc00`). The ×
+  beside a color returns it to the theme's value, and **Use the theme's
+  colors** clears every hand-set color at once. Hand-set colors belong to one
+  theme and one mode: editing Nord in dark mode changes nothing in Nord light
+  or in any other theme, and switching back to Nord dark brings them back.
+
+| Theme | Light | Dark |
+| --- | --- | --- |
+| Command Post (default) | Warm stone, brass accent | Near-black stone, gold accent |
+| Forge | Steel-grey paper, burnt orange | Charcoal, molten orange |
+| Nord | Snow-storm greys, frost blue | Polar-night slate, frost |
+| Sage | Pale green, forest accent | Dark moss, leaf green |
+| Porcelain | Cool white, indigo | Deep ink blue, periwinkle |
+| Tomorrow Night Bright | Tomorrow's white page, blue | Pure black, bright blue |
+
+The colors you can set:
+
+| Color | Used for |
+| --- | --- |
+| Page background | The page behind everything (`--c-canvas`) |
+| Cards and panels | Cards, tables, dialogs (`--c-surface`) |
+| Raised and hover | Table headers, hovered rows, tracks (`--c-surface2`) |
+| Borders | Hairlines and card borders (`--c-line`) |
+| Strong borders | Inputs, scrollbars, emphasized rules (`--c-line-strong`) |
+| Text | Body text and headings (`--c-ink`) |
+| Secondary text | Descriptions and table values (`--c-muted`) |
+| Faint text | Labels, hints, timestamps (`--c-faint`) |
+| Accent and buttons | Primary buttons, focus rings, active tabs (`--c-brass`) |
+| Links | Links and accent-colored text (`--c-brass-strong`) |
+
+Primary buttons draw their label in the page background color, so the page
+background and the accent must contrast. The picker checks body text,
+secondary text and links on cards, and button labels, and warns when any of
+them falls below 4.5:1. It does not stop you from saving a hard-to-read
+combination; **Reset to defaults** always gets you back.
+
+Themes and hand-set colors change colors only. Typefaces, spacing, corner radii, the status
+colors (green, amber, red, blue) and the exec terminal look the same in every
+theme. Every theme but Command Post holds body text to 7:1 contrast and
+secondary text, links and button labels to 4.5:1 in both modes; Command
+Post's values are the original ones, and its lightest secondary text sits
+just under 4.5:1 in light mode.
+
+**Where the choice lives.** The choice is saved in the browser, not on the
+manager, so it follows neither your token nor you to another browser:
+
+```
+localStorage['legion-appearance'] = {
+  "theme": "nord", "mode": "dark",
+  "colors": { "nord": { "dark": { "brass": "#ffcc00" } } }
+}
+<html class="dark" data-theme="nord" style="--c-brass: 255 204 0">
+```
+
+Hand-set colors are applied as inline custom properties on `<html>`, so they
+win over the theme. The defaults (Command Post, System, no hand-set colors)
+are never written, and **Reset to defaults** removes the key, hand-set colors
+included. A stored value this build does not recognise, such as a removed
+theme, an unknown color name or a malformed hex value, is dropped. If site data is blocked,
+the choice still applies until the page is reloaded. Other open tabs follow a
+change.
+
+**No flash on reload.** An inline script in `ui/index.html` reads the key and
+sets the class and attribute before the page paints; `ui/src/appearance/store.ts`
+re-applies and sanitizes the choice once the app loads. The two must agree;
+the store's header comment says so.
+
+**Adding a theme.** Add a light block (`[data-theme='id']`) and a dark block
+(`.dark[data-theme='id'], .dark [data-theme='id']`) of the ten `--c-*`
+tokens to `ui/src/appearance/themes.css`, and an entry to `THEMES` in
+`ui/src/appearance/themes.ts`. The blocks match any element, which is how
+the picker paints each swatch in its own theme. Theme tiles always show the
+theme's own colors, not hand-set ones.
+
+The light/dark toggle before this picker stored its choice under
+`ui-theme`. That key is no longer read, so a browser that had pinned a mode
+starts on System once.
 
 ## Entry Points
 
@@ -76,7 +167,8 @@ Routes in `App.tsx`:
 - anything else renders a not-found card naming the path
 
 A shared layout provides the grouped sidebar nav, a slim topbar
-(breadcrumbs, ⌘K search, the shortcut sheet, theme toggle), and page headers
+(breadcrumbs, ⌘K search, the shortcut sheet, the light/dark toggle, the
+appearance picker), and page headers
 for top-level routes. Detail pages render their own `PageHeader`. The sidebar
 footer shows the current identity (principal and source, or "ACLs off" / "Not
 logged in") with a link to Access. It also shows the manager address with a
@@ -95,7 +187,7 @@ setting or mode to turn on. Press `?` anywhere for a sheet that lists it all.
 
 | Keys | What it does |
 | --- | --- |
-| `⌘K` / `Ctrl+K` | Command palette: recent pages, every page, every row of the index you are on, and actions (theme, shortcuts) |
+| `⌘K` / `Ctrl+K` | Command palette: recent pages, every page, every row of the index you are on, and actions (light/dark, Appearance, shortcuts) |
 | `?` | The keyboard shortcut sheet |
 | `j` / `k`, `↑` / `↓` | Move the selection down/up the current index |
 | `o` / `Enter` | Open the selected row |

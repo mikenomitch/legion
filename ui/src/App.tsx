@@ -5,6 +5,8 @@ import { AclBanner } from './components/AclBanner'
 import { ConnectionGate } from './components/ConnectionGate'
 import { lazyPage } from './components/LazyPage'
 import { ShortcutsHelp } from './components/ShortcutsHelp'
+import { AppearancePanel } from './components/AppearancePanel'
+import { resolvedMode, toggleMode } from './appearance/store'
 import { Button, Dot, Icon, JumpHint, Kbd, PageHeader, RelativeTime, cx, type IconName } from './components/ui'
 import { managerClient } from './grpcClient'
 import { ROUTE_RESOURCE, canRead, isAnonymous } from './utils/acl'
@@ -128,13 +130,6 @@ const decodePathSegment = (value: string) => {
   }
 }
 
-const resolveInitialTheme = (): 'light' | 'dark' => {
-  if (typeof window === 'undefined') return 'dark'
-  const stored = localStorage.getItem('ui-theme')
-  if (stored === 'light' || stored === 'dark') return stored
-  return window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light'
-}
-
 const NAV_COLLAPSED_KEY = 'ui-sidebar-collapsed'
 
 const resolveInitialNavCollapsed = (): boolean =>
@@ -221,8 +216,11 @@ const Layout = (props: RouteSectionProps) => {
   // Collapsing is a desktop affordance. The mobile drawer is already an
   // overlay with room for labels, so it ignores the preference while open.
   const isNavCollapsed = () => navCollapsePref() && !isNavOpen()
-  const [theme, setTheme] = createSignal<'light' | 'dark'>(resolveInitialTheme())
+  const theme = resolvedMode
+  const [appearanceOpen, setAppearanceOpen] = createSignal(false)
   const [shortcutsOpen, setShortcutsOpen] = createSignal(false)
+  // A modal dialog is up: page shortcuts and jump hints stand down.
+  const dialogOpen = () => shortcutsOpen() || appearanceOpen()
   // Waits for the connection probe: firing this before we know the manager is
   // reachable just produces a second failure to ignore.
   // The probe MUST swallow its own failure. GetObservability needs
@@ -350,7 +348,7 @@ const Layout = (props: RouteSectionProps) => {
     () => new Map(navHintLetters().filter((entry) => entry.letter).map((entry) => [entry.letter, entry.path])),
   )
 
-  const toggleTheme = () => setTheme((value) => (value === 'dark' ? 'light' : 'dark'))
+  const toggleTheme = toggleMode
 
   const commandPaletteEntries = createMemo(() => {
     const query = commandPaletteQuery().trim().toLowerCase()
@@ -393,6 +391,16 @@ const Layout = (props: RouteSectionProps) => {
         group: 'Actions',
         run: toggleTheme,
         icon: theme() === 'dark' ? ('sun' as const) : ('moon' as const),
+      },
+      {
+        id: 'action:appearance',
+        label: 'Appearance',
+        description: 'Color theme and light or dark mode',
+        searchText: 'appearance theme palette color colour light dark mode customize',
+        href: '#appearance',
+        group: 'Actions',
+        run: () => setAppearanceOpen(true),
+        icon: 'palette' as const,
       },
       {
         id: 'action:shortcuts',
@@ -548,6 +556,11 @@ const Layout = (props: RouteSectionProps) => {
       setShortcutsOpen(false)
       return
     }
+    if (event.key === 'Escape' && appearanceOpen()) {
+      event.preventDefault()
+      setAppearanceOpen(false)
+      return
+    }
     if (event.key === 'Escape' && isNavOpen()) {
       setIsNavOpen(false)
       return
@@ -567,13 +580,13 @@ const Layout = (props: RouteSectionProps) => {
 
     // `?` opens the cheat sheet, the way it does on GitHub and Linear. It is
     // Shift+/ on most layouts, so match the produced character, not the code.
-    if (event.key === '?' && !event.metaKey && !event.ctrlKey && !event.altKey && !isEditableTarget(event)) {
+    if (event.key === '?' && !appearanceOpen() && !event.metaKey && !event.ctrlKey && !event.altKey && !isEditableTarget(event)) {
       event.preventDefault()
       setShortcutsOpen((value) => !value)
       return
     }
 
-    if (shortcutsOpen()) return
+    if (dialogOpen()) return
 
     if ((event.key.toLowerCase() === 'u') && !event.metaKey && !event.ctrlKey && !event.altKey && !isEditableTarget(event)) {
       // Don't hijack the key while a link/button has focus (keyboard users).
@@ -609,7 +622,7 @@ const Layout = (props: RouteSectionProps) => {
   // key that opens it. Both keydown and keyup carry the modifier flags, so one
   // handler on each covers press and release.
   const syncJumpHints = (event: KeyboardEvent) => {
-    setJumpHintsVisible(hasJumpModifier(event) && !commandPaletteOpen() && !shortcutsOpen())
+    setJumpHintsVisible(hasJumpModifier(event) && !commandPaletteOpen() && !dialogOpen())
   }
 
   // ⌘Tab and friends take focus without ever delivering the keyup, which would
@@ -619,7 +632,7 @@ const Layout = (props: RouteSectionProps) => {
   // Visibility stays a pure function of the modifier, so keeping it held after a
   // jump simply labels the page you landed on.
   const onJumpHintKeydown = (event: KeyboardEvent) => {
-    if (commandPaletteOpen() || shortcutsOpen() || !hasJumpModifier(event) || event.altKey) return
+    if (commandPaletteOpen() || dialogOpen() || !hasJumpModifier(event) || event.altKey) return
 
     // Sidebar items carry Shift because plain ⌘+letter belongs to the browser.
     if (event.shiftKey) {
@@ -656,7 +669,7 @@ const Layout = (props: RouteSectionProps) => {
 
   // ⌘K reveals the hints on its way to opening the palette; drop them once it is.
   createEffect(() => {
-    if (commandPaletteOpen() || shortcutsOpen()) hideJumpHints()
+    if (commandPaletteOpen() || dialogOpen()) hideJumpHints()
   })
 
   createEffect(() => {
@@ -712,12 +725,6 @@ const Layout = (props: RouteSectionProps) => {
       },
     ),
   )
-
-  createEffect(() => {
-    const current = theme()
-    document.documentElement.classList.toggle('dark', current === 'dark')
-    localStorage.setItem('ui-theme', current)
-  })
 
   createEffect(() => {
     localStorage.setItem(NAV_COLLAPSED_KEY, String(navCollapsePref()))
@@ -1033,8 +1040,18 @@ const Layout = (props: RouteSectionProps) => {
             >
               <Icon name={theme() === 'dark' ? 'sun' : 'moon'} size={16} />
             </button>
+            <button
+              type="button"
+              class="rounded-md p-1.5 text-muted transition-colors hover:bg-surface2 hover:text-ink"
+              onClick={() => setAppearanceOpen(true)}
+              aria-label="Appearance"
+              title="Appearance"
+            >
+              <Icon name="palette" size={16} />
+            </button>
           </div>
           <ShortcutsHelp open={shortcutsOpen()} onClose={() => setShortcutsOpen(false)} />
+          <AppearancePanel open={appearanceOpen()} onClose={() => setAppearanceOpen(false)} />
           <Show when={commandPaletteOpen()}>
             <div
               class="fixed inset-0 z-50 flex items-start justify-center bg-black/50 p-4 pt-[12vh] backdrop-blur-[2px]"
