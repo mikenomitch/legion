@@ -51,7 +51,7 @@ backend. The default is `auto`:
 | `auto` (default) | Linux+KVM: `cloud-hypervisor`, else `firecracker`. macOS: Apple `container`. | VM |
 | `cloud-hypervisor` | cloud-hypervisor (Linux + `/dev/kvm`) | microVM |
 | `firecracker` | Firecracker (Linux + `/dev/kvm`) | microVM |
-| `dev` | macOS: Apple `container`. Linux: an OCI runtime (`youki` / `LEGION_OCI_RUNTIME`). | VM on macOS, **namespaces only** on Linux |
+| `dev` | macOS: Apple `container`. Linux: an OCI runtime (`runc`, or `crun` via `LEGION_OCI_RUNTIME`). | VM on macOS, **namespaces only** on Linux |
 
 Legion finds the binaries on `PATH`. Override them with
 `LEGION_CLOUD_HYPERVISOR_BIN` or `LEGION_FIRECRACKER_BIN`. When no monitor is
@@ -103,6 +103,10 @@ without nested virtualization) runs the image through an OCI runtime bundle.
 That isolates with namespaces only, with no VM. Legion never selects it
 automatically. It exists so you can exercise the runtime on machines that
 cannot boot a VM. Do not treat it as a security boundary for untrusted code.
+It runs on the same OCI runtime as the `container` runtime: runc by default,
+or crun through `LEGION_OCI_RUNTIME`. Any other runtime fails the start with
+the error described in [Installing: crun
+instead](installation.md#crun-instead).
 
 The bundle is the one the `container` runtime builds, with its defaults:
 image layers extracted with their owners and modes, Docker's default
@@ -139,7 +143,9 @@ workload is done. The sandbox runtime supplies that layer.
    - The guest serial console is the VMM's stdout. It lands in the
      allocation's `stdout.log` like any other task's output.
    - Killing the child kills the VM. There is no daemon to chase (unlike the
-     container runtime, which must tear down by name).
+     container runtime, which must tear down by name). That is also why the
+     worker stops a microVM from inside rather than by killing it (see
+     [Stopping a sandbox](#stopping-a-sandbox)).
 
 The generated `/legion/init` is plain POSIX shell, so it runs on whatever
 `/bin/sh` the image ships. In order, it:
@@ -153,7 +159,10 @@ The generated `/legion/init` is plain POSIX shell, so it runs on whatever
   gated datapath's relay, and the resume handler for a guest launched for
   memory checkpoints or with identity token files
 - sources `/legion/env` and `cd`s to the working directory
-- runs the command and echoes `legion: sandbox command exited with status N`
+- runs the command and echoes `legion: sandbox command exited with status N`.
+  While it runs, init answers a [stop request](#stopping-a-sandbox).
+- flushes the disks and unmounts the volumes. It first kills whatever still
+  holds them open: strays the command left, exec sessions, and the agent.
 - powers the machine off so the VMM exits
 
 The kernel cmdline carries `panic=1` as a backstop, so even a wedged guest
@@ -325,6 +334,88 @@ Design notes:
 - Task-level `volumes = [...]` claims work too, such as a read-only `host` block
   device shared across sandboxes on a bare-metal node. A claim with no `path`
   is attached as a raw, unmounted guest device.
+
+## Stopping a sandbox
+
+A write inside the guest lands in the guest kernel's page cache first. The
+guest writes it back to the volume disk on its own schedule, and Linux can
+wait about 30 seconds. Killing the VMM before then loses the write, even
+though the workload saw it succeed. So the worker never stops a running
+microVM by killing it.
+
+When an allocation stops (`instance stop`, `instance destroy`, `job stop`, a
+drain, a rollout, a node-pressure eviction), the worker:
+
+1. Asks the guest to stop. The guest agent runs `kill -s <signal> 1` with
+   the task's `stop.signal` (default `SIGTERM`), signalling the guest's init.
+2. Init flushes the guest's disks (`sync`) right away, then passes the signal
+   to the command.
+3. Init waits for the command to exit, kills whatever is left, unmounts the
+   volumes, and powers off.
+4. The worker holds the allocation, and its volumes, until the VMM exits.
+   Only then does it unmount the volume on the host.
+
+If the VMM is still running at `killAfter` (default `30s`), the worker runs
+`sync` in the guest once more, for up to 10 seconds, then kills the VMM.
+
+```nickel
+stop = { signal = "SIGTERM", killAfter = "60s" },
+```
+
+The console (`stdout.log`) shows the stop:
+
+```text
+legion: stop requested (SIGTERM); flushing disks and signalling the sandbox command
+legion: sandbox command exited with status 143
+```
+
+**What is guaranteed:** every write the workload finished before the stop
+request reaches the volume, whether or not the workload handles the signal,
+as long as the guest agent answers. A write made after the request is safe
+if the workload exits within `killAfter`, or if the final flush reaches it.
+
+The same flush covers the paths that end a VMM without asking first:
+
+- **An in-place restart and a disk suspend** stop the VMM directly. The
+  worker runs `sync` in the guest, for up to 10 seconds, before it kills the
+  VMM, so the restarted guest or the volume snapshot has every earlier
+  write.
+- **A memory checkpoint** runs `sync` before it pauses the guest. The capture
+  is consistent without it, because the page cache is in the memory image.
+  The flush also puts every earlier write on the volume itself, which is
+  what a cold boot of the instance sees if the memory is never restored.
+
+When the stop does not go to plan:
+
+- **No guest agent** (an image the agent binary cannot run on, or a guest
+  restored from a checkpoint captured before exec support): the request
+  fails within 3 seconds, and the worker logs `Could not deliver a stop
+  request into the sandbox guest; stopping it hard` and kills the VMM at
+  once. The final flush fails the same way (`Could not flush the sandbox
+  guest's disks before stopping its VMM`), so writes the guest had not
+  written back are lost. Install `legion-guest` beside the worker
+  ([The guest agent](#the-guest-agent)).
+- **A command that ignores the signal** keeps the guest up until
+  `killAfter`. Writes from before the request are already on the volume.
+  Later ones depend on the final flush.
+- **A wedged guest** (a hung kernel, an agent that does not answer) costs at
+  most 3 seconds for the request and 10 for the final flush. Then the VMM is
+  killed, and writes still in the guest's page cache are lost.
+- **A guest restored from a memory checkpoint taken by an older worker**
+  runs an init with no stop handler, so its kernel drops the request. The
+  guest runs until `killAfter`, then gets the final flush and the kill.
+- **`SIGINT` and `SIGQUIT` reach the command ignored.** Init runs the command
+  as a background job, so it can answer the request while the command runs,
+  and a POSIX shell starts background jobs with those two signals ignored. A
+  program that installs its own handler still receives them. A shell script
+  cannot. Use `SIGTERM`, `SIGHUP`, `SIGUSR1`, or `SIGUSR2`.
+- **A volume init cannot unmount**, even after every other process is gone,
+  is remounted read-only. If that fails too, the console shows `legion:
+  could not unmount volume at <path>; its data was synced`, and the next
+  boot replays the filesystem journal.
+
+The dev-mode backends run no guest, so they are torn down at once, with no
+grace period.
 
 ## Config Schema
 
@@ -827,14 +918,17 @@ which you can also use in constraints:
 | Attribute | Example | Meaning |
 | --- | --- | --- |
 | `sandbox.vmm` | `cloud-hypervisor` | The VMM `hypervisor = "auto"` resolves to on this node |
-| `sandbox.vmm.version` | `41.0.0` | Its version |
+| `sandbox.vmm.version` | `51.2.0` | Its version, normalized to `MAJOR.MINOR.PATCH` (cloud-hypervisor's `v51.2` banner reports `51.2.0`) |
 | `sandbox.vmm.<name>.version` | `sandbox.vmm.firecracker.version = 1.7.0` | One per installed VMM |
 | `cpu.vendor` | `GenuineIntel` | CPU vendor (an implementer code such as `0x41` on ARM) |
 | `cpu.model` | `6:106:6` | `family:model:stepping` on x86, `implementer:part:variant:revision` on ARM |
 | `cpu.features` | `3f9a0c21d4e5b6a7` | A digest of the sorted CPU flag list |
 
 A checkpoint records the values it was taken under, and a node must match all
-of them exactly. Restoring into a task whose `vcpus` or `memory_mib` changed is
+of them exactly. VMM versions compare by release: a leading `v`, a missing
+patch number, and a build suffix (`-dirty`, a git describe) are ignored, so
+`v51.2` and `51.2.0` match while `51.2.0` and `51.3.0` do not. A version that
+does not parse as `MAJOR.MINOR[.PATCH]` must match as written. Restoring into a task whose `vcpus` or `memory_mib` changed is
 refused with an error naming both shapes.
 
 A `local` checkpoint restores only on the node that took it. A published one
@@ -871,9 +965,10 @@ memory restore, since the device rides the snapshot.
   has no KVM: the agent's listener and the worker's session run against each
   other over Unix sockets. The KVM checks are listed in the sandbox-exec
   plan.
-- **No signal delivery** into the guest: the agent takes exec sessions, not
-  signals. An env-delivered
-  identity must use `changeMode = "restart"`.
+- **The only signal delivered into the guest is the stop signal**
+  ([Stopping a sandbox](#stopping-a-sandbox)). There is no way to signal the
+  workload for anything else, so an env-delivered identity must use
+  `changeMode = "restart"`.
 - **No virtio-fs.** A microVM sandbox uses block volumes only. A `filesystem`
   volume on a microVM backend fails at start. Filesystem-mode support via
   virtio-fs (a `virtiofsd` per mount) is future work.

@@ -1215,8 +1215,10 @@ impl WorkerTaskManager {
         load_builtin_plugins_into(&mut self.registry);
     }
 
-    pub fn readiness_checks(&self) -> Map<String, Value> {
-        self.registry.readiness_checks()
+    /// The loaded task plugins, to probe readiness with the lock released
+    /// ([`crate::task_plugins::readiness_of`]).
+    pub fn plugin_handles(&self) -> Vec<Arc<crate::task_plugins::LoadedTaskPlugin>> {
+        self.registry.plugin_handles()
     }
 
     /// The allocation ids this node is running, as the **manager** knows
@@ -1893,6 +1895,28 @@ impl WorkerTaskManager {
         self.terminated_reports.extend(reports);
     }
 
+    /// Put back the terminal reports a manager answered but could not record
+    /// (`HeartbeatReply.retry_terminated_allocations`), so the next heartbeat
+    /// sends them again. A report for an allocation this node no longer holds
+    /// is dropped: the manager removed it, and there is nothing left to
+    /// complete. That is also what ends the retries for a report no manager
+    /// will ever accept.
+    pub fn requeue_unrecorded_terminations(
+        &mut self,
+        sent: Vec<TerminatedAllocationReport>,
+        retry: &[i64],
+    ) {
+        if retry.is_empty() {
+            return;
+        }
+        let requeue = sent
+            .into_iter()
+            .filter(|report| retry.contains(&report.allocation_id))
+            .filter(|report| self.has_allocation(report.allocation_id))
+            .collect::<Vec<_>>();
+        self.terminated_reports.extend(requeue);
+    }
+
     /// Failures owed to the manager, addressed by the ids it knows. A
     /// failure on unratified provisional work is dropped for the same reason
     /// a terminal report is: there is nothing for the manager to reschedule,
@@ -1976,9 +2000,15 @@ impl WorkerTaskManager {
         let task_dir = alloc_dir.join(&task.name);
         std::fs::create_dir_all(&task_dir)
             .with_context(|| format!("create task directory {}", task_dir.display()))?;
-        // Owner-only: the alloc dir is the isolation boundary between
-        // allocations sharing a node — other tasks must not be able to reach
-        // this allocation's artifacts, injected secrets, or output.
+        // The alloc dir is the isolation boundary between allocations sharing
+        // a node: other tasks must not be able to reach this allocation's
+        // artifacts, injected secrets, or output. Owner-only here. A runtime
+        // whose process is not the worker's user widens it to exactly that
+        // process (`exec` chowns the tree to its `user`, a user-namespaced
+        // container grants its own id range traversal). The `allocs/` root
+        // above it is traverse-only, so those processes can reach their own
+        // directory, and no one can list the others.
+        crate::util::restrict_dir_to_traverse_only(&self.alloc_root)?;
         crate::util::restrict_dir_to_owner(&alloc_dir)?;
         crate::util::restrict_dir_to_owner(&task_dir)?;
         let mut instance = TaskInstance::default();
@@ -4491,6 +4521,16 @@ impl WorkerTaskManager {
         // One mask write for the whole restored set, after every
         // reservation is back in the allocator's view.
         self.resources.resync_masks();
+        // Every allocation this worker still runs is in `instances` or
+        // finishing its stop now, so any other `legion-<alloc>` leaf is
+        // residue (a crash mid-teardown, a leaked failed start).
+        let instances = &self.instances;
+        self.resources.sweep_orphan_cgroups(|allocation_id| {
+            instances.contains_key(&allocation_id)
+                || resumed_stops
+                    .iter()
+                    .any(|(allocation, ..)| allocation.id == allocation_id)
+        });
         self.persist_state_with(&active);
 
         // After the whole set is persisted, because these persist again as
@@ -5145,7 +5185,7 @@ pub fn launch_task_allocation(
         match guard.begin_task_allocation(allocation) {
             Ok(outcome) => outcome,
             Err(err) => {
-                guard.record_failure(allocation.allocation_id, err.to_string());
+                guard.record_failure(allocation.allocation_id, format!("{err:#}"));
                 return Err(err);
             }
         }
@@ -8168,7 +8208,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn alloc_and_task_dirs_are_owner_only() -> R<()> {
+    fn alloc_and_task_dirs_are_owner_only_under_a_traverse_only_root() -> R<()> {
         use std::os::unix::fs::PermissionsExt;
 
         let temp_dir = TempDir::new()?;
@@ -8182,8 +8222,10 @@ mod tests {
 
         // The alloc dir is the isolation boundary between tasks on the node:
         // anything looser than 0700 exposes artifacts/secrets/output to
-        // every other local process.
-        let alloc_dir = temp_dir.path().join("allocs").join("5");
+        // every other local process. (Only a runtime whose process is not
+        // the worker's user widens it, to that process alone.)
+        let alloc_root = temp_dir.path().join("allocs");
+        let alloc_dir = alloc_root.join("5");
         for dir in [alloc_dir.clone(), alloc_dir.join("exec-task")] {
             let mode = std::fs::metadata(&dir)?.permissions().mode() & 0o777;
             assert_eq!(
@@ -8193,6 +8235,11 @@ mod tests {
                 dir.display()
             );
         }
+        // The root above them is traverse-only: a user-namespaced container
+        // root or an exec task's `user` must reach its own alloc dir by
+        // path, but nobody may list the allocations on the node.
+        let mode = std::fs::metadata(&alloc_root)?.permissions().mode() & 0o777;
+        assert_eq!(mode, 0o711, "allocs/ must be traverse-only, got {mode:o}");
         Ok(())
     }
 

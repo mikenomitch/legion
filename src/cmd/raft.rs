@@ -13,6 +13,14 @@ pub fn config() -> Command {
                 .arg(json_flag()),
         )
         .subcommand(
+            Command::new("members")
+                .about(
+                    "List every manager with its role, address, and whether the \
+                     answering manager can reach it",
+                )
+                .arg(json_flag()),
+        )
+        .subcommand(
             Command::new("history")
                 .about("Show recent raft events")
                 .arg(
@@ -124,6 +132,24 @@ pub async fn handle(sub_matches: &ArgMatches) -> R<()> {
                         lane.applied_index
                     );
                 }
+            }
+        }
+        Some(("members", args)) => {
+            let format = OutputFormat::from_matches(args);
+            let reply = output::resolve(
+                format,
+                "failed to list managers",
+                client
+                    .list_managers(crate::structs::ListManagersRequest {})
+                    .await,
+            )?
+            .into_inner();
+            if format.is_json() {
+                output::print_success(&reply);
+                return Ok(());
+            }
+            for line in member_lines(&reply) {
+                println!("{line}");
             }
         }
         Some(("history", args)) => {
@@ -256,6 +282,41 @@ fn quorum_lines(status: &crate::structs::RaftStatus) -> Vec<String> {
         .collect()
 }
 
+/// The `legion raft members` table: one row per manager, the answering
+/// manager marked with `*`, and the probe error for an unreachable one.
+fn member_lines(reply: &crate::structs::ListManagersReply) -> Vec<String> {
+    let mut lines = vec![format!(
+        "{:<2}{:<24} {:<10} {:<24} {:<11} {:>6} {:>10}",
+        "", "NODE", "ROLE", "ADDRESS", "REACHABLE", "TERM", "APPLIED"
+    )];
+    for member in &reply.managers {
+        let marker = if member.is_self { "*" } else { "" };
+        let reachable = if member.is_self {
+            "self".to_string()
+        } else if member.reachable {
+            format!("yes {}ms", member.probe_latency_ms.unwrap_or(0))
+        } else {
+            "no".to_string()
+        };
+        let number = |value: Option<u64>| value.map_or("-".to_string(), |v| v.to_string());
+        let mut line = format!(
+            "{:<2}{:<24} {:<10} {:<24} {:<11} {:>6} {:>10}",
+            marker,
+            member.node_id,
+            member.role,
+            member.advertise_addr,
+            reachable,
+            number(member.term),
+            number(member.applied_index),
+        );
+        if let Some(error) = &member.probe_error {
+            line.push_str(&format!("  ({error})"));
+        }
+        lines.push(line);
+    }
+    lines
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -296,6 +357,45 @@ mod tests {
             raft_library: "openraft-0.9".to_string(),
             lanes,
         }
+    }
+
+    /// Every member gets a row, the answering one starred, and an
+    /// unreachable one carries its probe error.
+    #[test]
+    fn member_lines_mark_self_and_unreachable_members() {
+        use crate::structs::{ListManagersReply, ManagerMember};
+        let reply = ListManagersReply {
+            managers: vec![
+                ManagerMember {
+                    node_id: "mgr-a".into(),
+                    advertise_addr: "10.0.0.1:4747".into(),
+                    role: "leader".into(),
+                    voter: true,
+                    is_self: true,
+                    reachable: true,
+                    term: Some(4),
+                    applied_index: Some(120),
+                    ..Default::default()
+                },
+                ManagerMember {
+                    node_id: "mgr-b".into(),
+                    advertise_addr: "10.0.0.2:4747".into(),
+                    role: "follower".into(),
+                    voter: true,
+                    reachable: false,
+                    probe_error: Some("Unavailable: connection refused".into()),
+                    ..Default::default()
+                },
+            ],
+            persistence_backend: "raft".into(),
+            answered_by: "mgr-a".into(),
+        };
+        let lines = member_lines(&reply);
+        assert_eq!(lines.len(), 3, "header plus one row per member");
+        assert!(lines[1].starts_with("* mgr-a"), "{}", lines[1]);
+        assert!(lines[1].contains("leader") && lines[1].contains("self"));
+        assert!(lines[2].contains("follower") && lines[2].contains(" no "));
+        assert!(lines[2].ends_with("(Unavailable: connection refused)"));
     }
 
     /// `single` topology: one unprefixed quorum line, healthy 3-voter shape.

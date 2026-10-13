@@ -202,6 +202,15 @@ impl WorkLog {
         }
     }
 
+    /// Queue a full resync for every node with a log: the projection could
+    /// not tell which allocations a committed changeset touched.
+    pub fn resync_all(&self) {
+        for log in self.lock_nodes().values() {
+            log.lock().resync = true;
+            log.wake.notify_one();
+        }
+    }
+
     /// Mark allocations changed by a committed changeset. Called by the
     /// store's projection on every replica; a node nobody streams for has
     /// no log here and costs nothing.

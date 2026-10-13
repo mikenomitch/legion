@@ -234,6 +234,29 @@ fn connect(path: &Path) -> R<Connection> {
                 .with_context(|| format!("create {}", parent.display()))?;
         }
     }
+    // Rows embed task env, which may hold credentials: owner-only, like the
+    // state file, and from the first byte. SQLite creates its `-wal` and
+    // `-shm` files with the database file's mode, so the file has to be
+    // 0600 before SQLite opens it. A chmod afterwards would leave the WAL,
+    // which holds the same rows, at the umask. The sidecars are re-asserted
+    // for logs created before this ordering.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+        std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .mode(0o600)
+            .open(path)
+            .with_context(|| format!("create session log {}", path.display()))?;
+        for suffix in ["", "-wal", "-shm"] {
+            let file = PathBuf::from(format!("{}{suffix}", path.display()));
+            if file.exists() {
+                std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600))
+                    .with_context(|| format!("restrict {} to owner-only", file.display()))?;
+            }
+        }
+    }
     let conn =
         Connection::open(path).with_context(|| format!("open session log {}", path.display()))?;
     // WAL: a commit appends to the log and fsyncs once; readers never block
@@ -247,13 +270,6 @@ fn connect(path: &Path) -> R<Connection> {
             row TEXT NOT NULL
         )",
     )?;
-    // Rows embed task env, which may hold credentials: owner-only, like the
-    // state file.
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
-    }
     Ok(conn)
 }
 
@@ -509,6 +525,26 @@ mod session_log_test {
             vec!["old", "tie-a", "tie-b", "new"],
             "oldest suspend first, ties by id, nothing that frees no bytes"
         );
+    }
+
+    /// The worker state dir is traverse-only, so the log and its WAL (which
+    /// holds the same rows, task env included) must each be owner-only.
+    #[cfg(unix)]
+    #[test]
+    fn the_log_and_its_wal_are_owner_only_test() -> R<()> {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("sessions.db");
+        let log = SessionLog::open(&path)?;
+        log.put(session("a", SessionLogState::Running));
+        assert!(log.sync(Duration::from_secs(5)));
+        let wal = dir.path().join("sessions.db-wal");
+        assert!(wal.exists(), "WAL mode keeps a -wal file while open");
+        for file in [path, wal] {
+            let mode = std::fs::metadata(&file)?.permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "{} must be owner-only", file.display());
+        }
+        Ok(())
     }
 
     #[test]

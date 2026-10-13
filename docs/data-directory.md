@@ -9,7 +9,7 @@ Set `LEGION_DATA_DIR` to move the whole tree somewhere else:
 
 ```bash
 LEGION_DATA_DIR=/var/lib/legion legion start manager -c manager.ncl
-LEGION_DATA_DIR=/var/lib/legion legion start worker "$TOKEN"
+LEGION_DATA_DIR=/var/lib/legion legion start worker --token-file /etc/legion/join-token
 ```
 
 One variable is enough to run a second, isolated cluster from the same

@@ -90,7 +90,8 @@ An allocation on a candidate node is a possible victim only if all of these
 hold:
 
 - Its job's band is strictly below the preemptor's.
-- It is older than `preemption.victimExemptAge` (default `60s`).
+- It is older than `preemption.victimExemptAge` (default `60s`). The one
+  exception is described in [Which of them are taken](#which-of-them-are-taken).
 - It does not hold node-local storage (see
   [Stateful workloads](#stateful-workloads)).
 - Evicting it would not take its task below its `disruption.minAvailable`
@@ -106,6 +107,15 @@ out not to need.
 
 Size matching means Legion won't kill a 32 GiB allocation to free 1 GiB when a
 right-sized victim exists.
+
+The age guard never pushes a placement up the band ladder. Suppose the only
+old-enough victims on a node are in a more important band than younger work
+that would also make room, such as a `normal` service next to a `low` job
+placed 30 seconds ago. Then the younger, lower-band work is taken instead.
+Otherwise the displaced `normal` job would requeue and, once the `low` work
+aged past the guard, preempt it to come back: two evictions where one does.
+The guard never makes a preemption possible that otherwise isn't. When only
+young work could make room, it stays protected and the placement waits.
 
 Across nodes, the plan with the fewest victims wins. Ties go to the plan that
 takes the least important work. Remaining ties go to the normal scoring policy,
@@ -217,7 +227,9 @@ pool whose jobs each hold hours of un-checkpointed state.
 `victimExemptAge` is a cheap guard against thrashing. Without it, one plan
 could undo the placement a previous plan made seconds earlier, and the
 follow-up eval could undo that. An allocation with no recorded placement time
-(written before this feature existed) counts as old enough.
+(written before this feature existed) counts as old enough. The guard yields
+when honoring it would mean evicting a more important band instead (see
+[Which of them are taken](#which-of-them-are-taken)).
 
 A misspelled `mode` is a startup error. Legion does not fall back to
 `enforce`, because a typo should not evict work you meant to protect.

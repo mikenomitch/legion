@@ -233,7 +233,8 @@ fn tool_defs() -> Vec<ToolDef> {
                     "node_id": { "type": "string", "description": "Filter by the node the volume lives on." },
                     "driver": { "type": "string", "description": "Filter by volume driver (local-dir, host, nfs, tmpfs, ...)." },
                     "instance_id": { "type": "string", "description": "Filter by owning stateful instance." },
-                    "state": { "type": "string", "description": "Filter by state: pending, created, destroying, destroyed." }
+                    "state": { "type": "string", "description": "Filter by state: pending, created, destroying, destroyed." },
+                    "include_destroyed": { "type": "boolean", "description": "Also return destroyed tombstones (reclaimed storage). Default false; filtering on state=destroyed returns them regardless." }
                 },
                 "additionalProperties": false
             }),
@@ -426,6 +427,12 @@ fn tool_defs() -> Vec<ToolDef> {
                 "required": ["node_id"],
                 "additionalProperties": false
             }),
+            mutates: false,
+        },
+        ToolDef {
+            name: "legion_manager_list",
+            description: "List every manager in the control plane from the replicated raft membership: node_id, role (leader|follower|learner, or standalone outside raft), advertiseAddr, voter, and whether the answering manager reached it just now (reachable, probeError, probeLatencyMs), plus each reachable member's term and appliedIndex. Any manager answers with the full list. Use it to find the leader, spot a manager that is down or partitioned (reachable=false), or one lagging on appliedIndex (docs/raft-operations.md).",
+            input_schema: empty_schema,
             mutates: false,
         },
         ToolDef {
@@ -1322,6 +1329,10 @@ async fn dispatch_tool(name: &str, args: Value) -> Result<Value, String> {
             grpc(client.rotate_data_key(crate::structs::RotateDataKeyRequest { idempotency_key }))
                 .await
         }
+        "legion_manager_list" => {
+            let mut client = connect().await?;
+            grpc(client.list_managers(crate::structs::ListManagersRequest {})).await
+        }
         "legion_scheduler_concurrency" => {
             let mut client = connect().await?;
             grpc(
@@ -1581,13 +1592,19 @@ async fn dispatch_tool(name: &str, args: Value) -> Result<Value, String> {
         }
         "legion_volume_list" => {
             let mut client = connect().await?;
-            grpc(client.list_volumes(ListVolumesRequest {
-                job_id: opt_str_arg(&args, "job_id"),
-                node_id: opt_str_arg(&args, "node_id"),
-                driver: opt_str_arg(&args, "driver"),
-                instance_id: opt_str_arg(&args, "instance_id"),
-                state: opt_str_arg(&args, "state"),
-            }))
+            grpc(
+                client.list_volumes(ListVolumesRequest {
+                    job_id: opt_str_arg(&args, "job_id"),
+                    node_id: opt_str_arg(&args, "node_id"),
+                    driver: opt_str_arg(&args, "driver"),
+                    instance_id: opt_str_arg(&args, "instance_id"),
+                    state: opt_str_arg(&args, "state"),
+                    include_destroyed: args
+                        .get("include_destroyed")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false),
+                }),
+            )
             .await
         }
         "legion_volume_get" => {

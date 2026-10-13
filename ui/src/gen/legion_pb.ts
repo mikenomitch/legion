@@ -5144,6 +5144,21 @@ export class StartInstanceRequest extends Message<StartInstanceRequest> {
    */
   cold = false;
 
+  /**
+   * Sessions with `suspend.durability = "store"` only
+   * (docs/session-mode.md, "Moving a session"): move the session to
+   * another node even though the node holding it has not been marked down
+   * or lost. By default a running session whose node does not answer moves
+   * only once the managers mark that node down or lost; until then the
+   * call answers UNAVAILABLE naming the node, because the session may still
+   * be running there. A suspended session moves without it. A forced move
+   * of a running session leaves two copies until the old one is fenced.
+   * Ignored for keyed instances. Default false.
+   *
+   * @generated from field: bool force_move = 4;
+   */
+  forceMove = false;
+
   constructor(data?: PartialMessage<StartInstanceRequest>) {
     super();
     proto3.util.initPartial(data, this);
@@ -5155,6 +5170,7 @@ export class StartInstanceRequest extends Message<StartInstanceRequest> {
     { no: 1, name: "instance_id", kind: "scalar", T: 9 /* ScalarType.STRING */ },
     { no: 2, name: "idempotency_key", kind: "scalar", T: 9 /* ScalarType.STRING */, opt: true },
     { no: 3, name: "cold", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
+    { no: 4, name: "force_move", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
   ]);
 
   static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): StartInstanceRequest {
@@ -6436,7 +6452,6 @@ export class InstanceColdBoot extends Message<InstanceColdBoot> {
 }
 
 /**
- * Request payload for ListInstances.
  * Request for `Manager.ListSessionNodes`.
  *
  * @generated from message legion.ListSessionNodesRequest
@@ -6657,6 +6672,8 @@ export class ListSessionNodesReply extends Message<ListSessionNodesReply> {
 }
 
 /**
+ * Request payload for ListInstances.
+ *
  * @generated from message legion.ListInstancesRequest
  */
 export class ListInstancesRequest extends Message<ListInstancesRequest> {
@@ -8531,6 +8548,71 @@ export class CheckpointPartKey extends Message<CheckpointPartKey> {
 }
 
 /**
+ * A session sealing key (session durability plan §6.6,
+ * docs/session-mode.md "Idle sessions"). An unpromoted session with
+ * `suspend.durability = "store"` publishes its checkpoint parts with no
+ * manager on the path, so the node cannot ask for a part key per digest
+ * the way a keyed snapshot's publish does. Instead every envelope payload
+ * of a job whose session task sets `durability = "store"` carries one key
+ * per checkpoint key in the cluster keyring, derived for that job:
+ * HKDF-SHA256 of the checkpoint key with the job name as context. A node
+ * derives each part's key from it exactly as the manager derives a keyed
+ * part's key from the checkpoint key itself, so parts are still sealed per
+ * digest, and any node holding an envelope of the job can open the
+ * session checkpoints of that job and no other. Workers never see the
+ * checkpoint key. The generated Rust type redacts `key` from Debug output
+ * and never serializes it, so it never reaches the worker's state file or
+ * session log.
+ *
+ * @generated from message legion.SessionSealKey
+ */
+export class SessionSealKey extends Message<SessionSealKey> {
+  /**
+   * `<checkpoint key id>/session/<job>`: recorded as the `keyId` of every
+   * part sealed under it, so a node opening the part finds the key again
+   * after the keyring rotates.
+   *
+   * @generated from field: string key_id = 1;
+   */
+  keyId = "";
+
+  /**
+   * 32 bytes. Never logged and never written to disk.
+   *
+   * @generated from field: bytes key = 2;
+   */
+  key = new Uint8Array(0);
+
+  constructor(data?: PartialMessage<SessionSealKey>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.SessionSealKey";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "key_id", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 2, name: "key", kind: "scalar", T: 12 /* ScalarType.BYTES */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): SessionSealKey {
+    return new SessionSealKey().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): SessionSealKey {
+    return new SessionSealKey().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): SessionSealKey {
+    return new SessionSealKey().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: SessionSealKey | PlainMessage<SessionSealKey> | undefined, b: SessionSealKey | PlainMessage<SessionSealKey> | undefined): boolean {
+    return proto3.util.equals(SessionSealKey, a, b);
+  }
+}
+
+/**
  * The outcome of one piece of checkpoint work, reported by a worker in
  * `HeartbeatRequest.snapshot_reports` (the worker-to-manager half of the
  * checkpoint channel).
@@ -9038,6 +9120,16 @@ export class ListVolumesRequest extends Message<ListVolumesRequest> {
    */
   state?: string;
 
+  /**
+   * Also return `destroyed` tombstones: volumes whose storage the driver
+   * already reclaimed, kept as records of where a job's storage went. Off by
+   * default, so a destroyed instance's volume drops out of the list once its
+   * reclaim is confirmed. `legion volume list --all` sets it.
+   *
+   * @generated from field: bool include_destroyed = 6;
+   */
+  includeDestroyed = false;
+
   constructor(data?: PartialMessage<ListVolumesRequest>) {
     super();
     proto3.util.initPartial(data, this);
@@ -9051,6 +9143,7 @@ export class ListVolumesRequest extends Message<ListVolumesRequest> {
     { no: 3, name: "driver", kind: "scalar", T: 9 /* ScalarType.STRING */, opt: true },
     { no: 4, name: "instance_id", kind: "scalar", T: 9 /* ScalarType.STRING */, opt: true },
     { no: 5, name: "state", kind: "scalar", T: 9 /* ScalarType.STRING */, opt: true },
+    { no: 6, name: "include_destroyed", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
   ]);
 
   static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): ListVolumesRequest {
@@ -11446,10 +11539,12 @@ export class SessionStatus extends Message<SessionStatus> {
   envelopeAllocationId = protoInt64.zero;
 
   /**
-   * `starting` (admitted, not running yet), `running`, `suspended`
-   * (checkpointed on its node, nothing running, not using envelope room),
-   * or `evicted` (a local-only checkpoint that is gone; reported for
-   * `suspend.keepFor` so the answer is `evicted`, not `not found`).
+   * `starting` (admitted, not running yet), `running`, or `suspended`
+   * (checkpointed on its node, nothing running, not using envelope room;
+   * `Worker.ResumeSession` or `legion instance start` brings it back). A
+   * session whose local checkpoint was evicted is not reported at all: for
+   * `suspend.keepFor` after the eviction its node answers a request for it
+   * with NotFound starting `evicted`, naming when and why.
    *
    * @generated from field: string state = 6;
    */
@@ -11496,6 +11591,16 @@ export class SessionStatus extends Message<SessionStatus> {
    */
   ticketJti = "";
 
+  /**
+   * The checkpoint the session holds, when it has one: the one a
+   * suspended session resumes from, or a running session's latest
+   * periodic (`suspend.checkpointEvery`) or worker-stop checkpoint. Absent
+   * for a running session that was never checkpointed.
+   *
+   * @generated from field: legion.SessionCheckpointInfo checkpoint = 12;
+   */
+  checkpoint?: SessionCheckpointInfo;
+
   constructor(data?: PartialMessage<SessionStatus>) {
     super();
     proto3.util.initPartial(data, this);
@@ -11515,6 +11620,7 @@ export class SessionStatus extends Message<SessionStatus> {
     { no: 9, name: "generation", kind: "scalar", T: 4 /* ScalarType.UINT64 */ },
     { no: 10, name: "origin", kind: "scalar", T: 9 /* ScalarType.STRING */ },
     { no: 11, name: "ticket_jti", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 12, name: "checkpoint", kind: "message", T: SessionCheckpointInfo },
   ]);
 
   static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): SessionStatus {
@@ -11531,6 +11637,95 @@ export class SessionStatus extends Message<SessionStatus> {
 
   static equals(a: SessionStatus | PlainMessage<SessionStatus> | undefined, b: SessionStatus | PlainMessage<SessionStatus> | undefined): boolean {
     return proto3.util.equals(SessionStatus, a, b);
+  }
+}
+
+/**
+ * A session's checkpoint, as its node reports it in `SessionStatus`.
+ *
+ * @generated from message legion.SessionCheckpointInfo
+ */
+export class SessionCheckpointInfo extends Message<SessionCheckpointInfo> {
+  /**
+   * `local` (the checkpoint lives only on this node) or `store` (the task
+   * sets `suspend.durability = "store"`, and the checkpoint is published to
+   * the node's `contentStore`).
+   *
+   * @generated from field: string durability = 1;
+   */
+  durability = "";
+
+  /**
+   * The checkpoint's snapshot id (`snap-...`).
+   *
+   * @generated from field: string snapshot_id = 2;
+   */
+  snapshotId = "";
+
+  /**
+   * `memory` or `disk` (a disk checkpoint of a session holds only its
+   * spec, so a resume boots it fresh under the same id).
+   *
+   * @generated from field: string kind = 3;
+   */
+  kind = "";
+
+  /**
+   * Bytes the checkpoint's memory parts hold.
+   *
+   * @generated from field: uint64 bytes = 4;
+   */
+  bytes = protoInt64.zero;
+
+  /**
+   * When it was taken, RFC 3339.
+   *
+   * @generated from field: string taken_at = 5;
+   */
+  takenAt = "";
+
+  /**
+   * With `durability = "store"`, the URL of the session manifest that
+   * names the published checkpoint
+   * (`<contentStore.url>/sessions/<job>/<id-prefix>/<id>.json`), once the
+   * publish finished. Empty while the publish is pending (the content store
+   * is unreachable, or the node has no sealing key yet; the node retries)
+   * and for a `local` checkpoint.
+   *
+   * @generated from field: string published_url = 6;
+   */
+  publishedUrl = "";
+
+  constructor(data?: PartialMessage<SessionCheckpointInfo>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.SessionCheckpointInfo";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "durability", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 2, name: "snapshot_id", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 3, name: "kind", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 4, name: "bytes", kind: "scalar", T: 4 /* ScalarType.UINT64 */ },
+    { no: 5, name: "taken_at", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 6, name: "published_url", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): SessionCheckpointInfo {
+    return new SessionCheckpointInfo().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): SessionCheckpointInfo {
+    return new SessionCheckpointInfo().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): SessionCheckpointInfo {
+    return new SessionCheckpointInfo().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: SessionCheckpointInfo | PlainMessage<SessionCheckpointInfo> | undefined, b: SessionCheckpointInfo | PlainMessage<SessionCheckpointInfo> | undefined): boolean {
+    return proto3.util.equals(SessionCheckpointInfo, a, b);
   }
 }
 
@@ -16425,6 +16620,257 @@ export class GetManagerConfigsReply extends Message<GetManagerConfigsReply> {
 
   static equals(a: GetManagerConfigsReply | PlainMessage<GetManagerConfigsReply> | undefined, b: GetManagerConfigsReply | PlainMessage<GetManagerConfigsReply> | undefined): boolean {
     return proto3.util.equals(GetManagerConfigsReply, a, b);
+  }
+}
+
+/**
+ * Request payload for ListManagers. No parameters: the roster is small
+ * (raft clusters run 1, 3, or 5 managers) and returned whole.
+ *
+ * @generated from message legion.ListManagersRequest
+ */
+export class ListManagersRequest extends Message<ListManagersRequest> {
+  constructor(data?: PartialMessage<ListManagersRequest>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.ListManagersRequest";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): ListManagersRequest {
+    return new ListManagersRequest().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): ListManagersRequest {
+    return new ListManagersRequest().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): ListManagersRequest {
+    return new ListManagersRequest().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: ListManagersRequest | PlainMessage<ListManagersRequest> | undefined, b: ListManagersRequest | PlainMessage<ListManagersRequest> | undefined): boolean {
+    return proto3.util.equals(ListManagersRequest, a, b);
+  }
+}
+
+/**
+ * One manager in the cluster, as the answering manager sees it.
+ *
+ * @generated from message legion.ManagerMember
+ */
+export class ManagerMember extends Message<ManagerMember> {
+  /**
+   * The manager's identity. Under raft this is its raft node id
+   * (`persistence.raft.nodeId`); outside raft it is the manager's listener
+   * `host:port`. Matches `ManagerNodeConfig.node_id` for the manager's
+   * config snapshot.
+   *
+   * @generated from field: string node_id = 1;
+   */
+  nodeId = "";
+
+  /**
+   * The manager's advertised `host:port`: its raft advertise address, which
+   * is also its API listener. Outside raft, the host and port of
+   * `server.advertiseAddr` (or the listener address).
+   *
+   * @generated from field: string advertise_addr = 2;
+   */
+  advertiseAddr = "";
+
+  /**
+   * Raft role, per the answering manager's replicated membership:
+   *
+   * - `leader`: leads the control lane (membership, joins, config).
+   * - `follower`: a settled voter that does not lead the control lane.
+   * - `learner`: a non-voting member, or a joiner whose promotion to voter
+   *   has not settled on every lane yet.
+   * - `standalone`: outside raft mode (local_disk or streaming persistence).
+   *
+   * Under `topology = "lanes"`, check `leader_lanes` for the lanes a
+   * manager leads, which can differ from the control lane during a
+   * leadership change.
+   *
+   * @generated from field: string role = 3;
+   */
+  role = "";
+
+  /**
+   * True when the manager is a settled voter on every active lane (the same
+   * rule as `RaftStatus.voters`). Always false outside raft mode.
+   *
+   * @generated from field: bool voter = 4;
+   */
+  voter = false;
+
+  /**
+   * Raft lanes this manager leads, by wire name (`control`, `scheduler`,
+   * `status`). Under the default `single` topology this is `["control"]` for
+   * the leader and empty for everyone else. Empty outside raft mode.
+   *
+   * @generated from field: repeated string leader_lanes = 5;
+   */
+  leaderLanes: string[] = [];
+
+  /**
+   * True for the manager that answered this request.
+   *
+   * @generated from field: bool is_self = 6;
+   */
+  isSelf = false;
+
+  /**
+   * Whether the answering manager reached this manager just now. Always
+   * true for the answering manager itself.
+   *
+   * @generated from field: bool reachable = 7;
+   */
+  reachable = false;
+
+  /**
+   * Why the probe failed, when `reachable` is false. Examples: a timeout,
+   * `Unavailable` (connection refused), or `PermissionDenied`.
+   *
+   * @generated from field: optional string probe_error = 8;
+   */
+  probeError?: string;
+
+  /**
+   * Round-trip time of the probe in milliseconds, when it succeeded.
+   * Absent for the answering manager itself.
+   *
+   * @generated from field: optional uint64 probe_latency_ms = 9;
+   */
+  probeLatencyMs?: bigint;
+
+  /**
+   * The raft term the manager reports for itself, when reachable. A member
+   * on an older term than its peers has missed an election. Absent outside
+   * raft mode.
+   *
+   * @generated from field: optional uint64 term = 10;
+   */
+  term?: bigint;
+
+  /**
+   * The latest log index the manager reports it has applied, when
+   * reachable. Compare across members to see replication lag. Absent
+   * outside raft mode.
+   *
+   * @generated from field: optional uint64 applied_index = 11;
+   */
+  appliedIndex?: bigint;
+
+  /**
+   * When this manager's config snapshot was last written, if it has one
+   * (`GetManagerConfigs`). Absent for a manager that has never led under
+   * raft. Same format as `ManagerNodeConfig.updated_at`.
+   *
+   * @generated from field: optional string config_updated_at = 12;
+   */
+  configUpdatedAt?: string;
+
+  constructor(data?: PartialMessage<ManagerMember>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.ManagerMember";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "node_id", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 2, name: "advertise_addr", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 3, name: "role", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 4, name: "voter", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
+    { no: 5, name: "leader_lanes", kind: "scalar", T: 9 /* ScalarType.STRING */, repeated: true },
+    { no: 6, name: "is_self", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
+    { no: 7, name: "reachable", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
+    { no: 8, name: "probe_error", kind: "scalar", T: 9 /* ScalarType.STRING */, opt: true },
+    { no: 9, name: "probe_latency_ms", kind: "scalar", T: 4 /* ScalarType.UINT64 */, opt: true },
+    { no: 10, name: "term", kind: "scalar", T: 4 /* ScalarType.UINT64 */, opt: true },
+    { no: 11, name: "applied_index", kind: "scalar", T: 4 /* ScalarType.UINT64 */, opt: true },
+    { no: 12, name: "config_updated_at", kind: "scalar", T: 9 /* ScalarType.STRING */, opt: true },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): ManagerMember {
+    return new ManagerMember().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): ManagerMember {
+    return new ManagerMember().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): ManagerMember {
+    return new ManagerMember().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: ManagerMember | PlainMessage<ManagerMember> | undefined, b: ManagerMember | PlainMessage<ManagerMember> | undefined): boolean {
+    return proto3.util.equals(ManagerMember, a, b);
+  }
+}
+
+/**
+ * Reply payload for ListManagers.
+ *
+ * @generated from message legion.ListManagersReply
+ */
+export class ListManagersReply extends Message<ListManagersReply> {
+  /**
+   * Every manager, sorted by `node_id`. Outside raft mode, exactly the
+   * answering manager. Under raft, the members of the answering manager's
+   * replicated membership, which is empty only while its raft engine is
+   * still starting.
+   *
+   * @generated from field: repeated legion.ManagerMember managers = 1;
+   */
+  managers: ManagerMember[] = [];
+
+  /**
+   * Persistence backend of the answering manager: `raft`, `local_disk`, or
+   * `streaming`.
+   *
+   * @generated from field: string persistence_backend = 2;
+   */
+  persistenceBackend = "";
+
+  /**
+   * `node_id` of the manager that answered.
+   *
+   * @generated from field: string answered_by = 3;
+   */
+  answeredBy = "";
+
+  constructor(data?: PartialMessage<ListManagersReply>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.ListManagersReply";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "managers", kind: "message", T: ManagerMember, repeated: true },
+    { no: 2, name: "persistence_backend", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 3, name: "answered_by", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): ListManagersReply {
+    return new ListManagersReply().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): ListManagersReply {
+    return new ListManagersReply().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): ListManagersReply {
+    return new ListManagersReply().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: ListManagersReply | PlainMessage<ListManagersReply> | undefined, b: ListManagersReply | PlainMessage<ListManagersReply> | undefined): boolean {
+    return proto3.util.equals(ListManagersReply, a, b);
   }
 }
 
@@ -22181,6 +22627,42 @@ export class StartSessionRequest extends Message<StartSessionRequest> {
    */
   wait?: boolean;
 
+  /**
+   * Resume this existing session on the receiving node instead of starting
+   * a new one (session durability plan §6.6, docs/session-mode.md "Moving a
+   * session"). Only a session whose task sets `suspend.durability =
+   * "store"` can resume on a node other than the one holding it: the node
+   * reads its manifest at the path its id and the ticket's job give, claims
+   * the next generation with a conditional write, and restores it under the
+   * same id, fetching its checkpoint parts from the content store. A
+   * session this node holds suspended resumes from its own checkpoint
+   * (claiming the next generation as well); one already running here
+   * answers `deduplicated = true`. `idempotency_key` is ignored.
+   *
+   * The reply's `node_id` is where the session now runs. Its id keeps the
+   * node tag it was minted with, which is stale after a move: a picker
+   * should cache `session id -> node` from this reply and prefer it over
+   * the tag.
+   *
+   * @generated from field: string resume_id = 6;
+   */
+  resumeId = "";
+
+  /**
+   * With `resume_id`, move a session the manifest says is running on
+   * another node without first reaching that node. By default the node
+   * probes the old node (`Worker.GetSession` with the caller's ticket, 2 s)
+   * and, when it answers that the session runs there, asks it to stop its
+   * copy (`Worker.StopSession`) before moving; when the probe fails it
+   * refuses with UNAVAILABLE naming the old node. Set this only when
+   * `ListSessionNodes` shows that node down or lost: a forced move of a
+   * session that is still running leaves two copies until the old one is
+   * fenced (docs/session-mode.md, "No split brain").
+   *
+   * @generated from field: bool force_move = 7;
+   */
+  forceMove = false;
+
   constructor(data?: PartialMessage<StartSessionRequest>) {
     super();
     proto3.util.initPartial(data, this);
@@ -22194,6 +22676,8 @@ export class StartSessionRequest extends Message<StartSessionRequest> {
     { no: 3, name: "task_name", kind: "scalar", T: 9 /* ScalarType.STRING */ },
     { no: 4, name: "idempotency_key", kind: "scalar", T: 9 /* ScalarType.STRING */ },
     { no: 5, name: "wait", kind: "scalar", T: 8 /* ScalarType.BOOL */, opt: true },
+    { no: 6, name: "resume_id", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 7, name: "force_move", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
   ]);
 
   static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): StartSessionRequest {
@@ -22242,11 +22726,38 @@ export class StartSessionReply extends Message<StartSessionReply> {
   state = "";
 
   /**
-   * True when an idempotent retry found the session already running here.
+   * True when an idempotent retry found the session already running here,
+   * or a `resume_id` found it running here.
    *
    * @generated from field: bool deduplicated = 4;
    */
   deduplicated = false;
+
+  /**
+   * With `resume_id`: `local` (restored from this node's own copy of the
+   * checkpoint), `store` (its parts fetched from the content store), or
+   * `cold` (a disk checkpoint, which of a session holds only its spec, so
+   * it booted fresh under the same id). Empty for a new session.
+   *
+   * @generated from field: string resumed_from = 5;
+   */
+  resumedFrom = "";
+
+  /**
+   * The session's generation after this call: 1 for a new session, the
+   * generation the resume claimed otherwise.
+   *
+   * @generated from field: uint64 generation = 6;
+   */
+  generation = protoInt64.zero;
+
+  /**
+   * With `resume_id`, the node the session ran on before, when it moved
+   * here. Empty otherwise.
+   *
+   * @generated from field: string moved_from = 7;
+   */
+  movedFrom = "";
 
   constructor(data?: PartialMessage<StartSessionReply>) {
     super();
@@ -22260,6 +22771,9 @@ export class StartSessionReply extends Message<StartSessionReply> {
     { no: 2, name: "node_id", kind: "scalar", T: 9 /* ScalarType.STRING */ },
     { no: 3, name: "state", kind: "scalar", T: 9 /* ScalarType.STRING */ },
     { no: 4, name: "deduplicated", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
+    { no: 5, name: "resumed_from", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 6, name: "generation", kind: "scalar", T: 4 /* ScalarType.UINT64 */ },
+    { no: 7, name: "moved_from", kind: "scalar", T: 9 /* ScalarType.STRING */ },
   ]);
 
   static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): StartSessionReply {
@@ -22562,6 +23076,431 @@ export class StopSessionsReply extends Message<StopSessionsReply> {
 
   static equals(a: StopSessionsReply | PlainMessage<StopSessionsReply> | undefined, b: StopSessionsReply | PlainMessage<StopSessionsReply> | undefined): boolean {
     return proto3.util.equals(StopSessionsReply, a, b);
+  }
+}
+
+/**
+ * Request payload for Worker.SuspendSessions.
+ *
+ * @generated from message legion.SuspendSessionsRequest
+ */
+export class SuspendSessionsRequest extends Message<SuspendSessionsRequest> {
+  /**
+   * The sessions to suspend. Ids the node does not hold are answered in
+   * `failed`.
+   *
+   * @generated from field: repeated string session_ids = 1;
+   */
+  sessionIds: string[] = [];
+
+  /**
+   * Why, for the node's log: `manual` (`legion instance suspend`) or
+   * another short word.
+   *
+   * @generated from field: string reason = 2;
+   */
+  reason = "";
+
+  constructor(data?: PartialMessage<SuspendSessionsRequest>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.SuspendSessionsRequest";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "session_ids", kind: "scalar", T: 9 /* ScalarType.STRING */, repeated: true },
+    { no: 2, name: "reason", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): SuspendSessionsRequest {
+    return new SuspendSessionsRequest().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): SuspendSessionsRequest {
+    return new SuspendSessionsRequest().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): SuspendSessionsRequest {
+    return new SuspendSessionsRequest().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: SuspendSessionsRequest | PlainMessage<SuspendSessionsRequest> | undefined, b: SuspendSessionsRequest | PlainMessage<SuspendSessionsRequest> | undefined): boolean {
+    return proto3.util.equals(SuspendSessionsRequest, a, b);
+  }
+}
+
+/**
+ * Reply payload for Worker.SuspendSessions.
+ *
+ * @generated from message legion.SuspendSessionsReply
+ */
+export class SuspendSessionsReply extends Message<SuspendSessionsReply> {
+  /**
+   * The sessions now suspended on this node, including any that already
+   * were.
+   *
+   * @generated from field: repeated legion.SuspendedSession suspended = 1;
+   */
+  suspended: SuspendedSession[] = [];
+
+  /**
+   * The sessions that were not suspended, each with why. A session whose
+   * capture failed keeps running.
+   *
+   * @generated from field: repeated legion.SessionSleepFailure failed = 2;
+   */
+  failed: SessionSleepFailure[] = [];
+
+  constructor(data?: PartialMessage<SuspendSessionsReply>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.SuspendSessionsReply";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "suspended", kind: "message", T: SuspendedSession, repeated: true },
+    { no: 2, name: "failed", kind: "message", T: SessionSleepFailure, repeated: true },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): SuspendSessionsReply {
+    return new SuspendSessionsReply().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): SuspendSessionsReply {
+    return new SuspendSessionsReply().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): SuspendSessionsReply {
+    return new SuspendSessionsReply().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: SuspendSessionsReply | PlainMessage<SuspendSessionsReply> | undefined, b: SuspendSessionsReply | PlainMessage<SuspendSessionsReply> | undefined): boolean {
+    return proto3.util.equals(SuspendSessionsReply, a, b);
+  }
+}
+
+/**
+ * One session a node suspended.
+ *
+ * @generated from message legion.SuspendedSession
+ */
+export class SuspendedSession extends Message<SuspendedSession> {
+  /**
+   * The session id.
+   *
+   * @generated from field: string session_id = 1;
+   */
+  sessionId = "";
+
+  /**
+   * The checkpoint's snapshot id (`snap-...`), local to the node: its parts
+   * are pinned in the node content store and never published.
+   *
+   * @generated from field: string snapshot_id = 2;
+   */
+  snapshotId = "";
+
+  /**
+   * `memory` (the guest's memory, restored on resume) or `disk` (nothing
+   * but the session's spec: a resume boots it fresh under the same id).
+   *
+   * @generated from field: string kind = 3;
+   */
+  kind = "";
+
+  /**
+   * Bytes the checkpoint holds in the node content store.
+   *
+   * @generated from field: uint64 bytes = 4;
+   */
+  bytes = protoInt64.zero;
+
+  /**
+   * True when the session was already suspended before this call.
+   *
+   * @generated from field: bool already_suspended = 5;
+   */
+  alreadySuspended = false;
+
+  /**
+   * `local` or `store` (the task's `suspend.durability`).
+   *
+   * @generated from field: string durability = 6;
+   */
+  durability = "";
+
+  /**
+   * With `durability = "store"`: the session manifest's URL once the
+   * checkpoint is published. Empty when the content store could not be
+   * reached: the suspend still succeeded on this node, the parts stay
+   * pinned here, and the node retries the publish until it lands.
+   *
+   * @generated from field: string published_url = 7;
+   */
+  publishedUrl = "";
+
+  constructor(data?: PartialMessage<SuspendedSession>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.SuspendedSession";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "session_id", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 2, name: "snapshot_id", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 3, name: "kind", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 4, name: "bytes", kind: "scalar", T: 4 /* ScalarType.UINT64 */ },
+    { no: 5, name: "already_suspended", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
+    { no: 6, name: "durability", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 7, name: "published_url", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): SuspendedSession {
+    return new SuspendedSession().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): SuspendedSession {
+    return new SuspendedSession().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): SuspendedSession {
+    return new SuspendedSession().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: SuspendedSession | PlainMessage<SuspendedSession> | undefined, b: SuspendedSession | PlainMessage<SuspendedSession> | undefined): boolean {
+    return proto3.util.equals(SuspendedSession, a, b);
+  }
+}
+
+/**
+ * Why a node did not suspend one session.
+ *
+ * @generated from message legion.SessionSleepFailure
+ */
+export class SessionSleepFailure extends Message<SessionSleepFailure> {
+  /**
+   * The session id.
+   *
+   * @generated from field: string session_id = 1;
+   */
+  sessionId = "";
+
+  /**
+   * The gRPC code the failure would carry on its own: `NOT_FOUND`,
+   * `FAILED_PRECONDITION`, `ABORTED`, or `INTERNAL`.
+   *
+   * @generated from field: string code = 2;
+   */
+  code = "";
+
+  /**
+   * What went wrong. A NOT_FOUND message starts with `not_found`,
+   * `evicted`, or `wrong_node`, as `GetSession` answers.
+   *
+   * @generated from field: string message = 3;
+   */
+  message = "";
+
+  constructor(data?: PartialMessage<SessionSleepFailure>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.SessionSleepFailure";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "session_id", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 2, name: "code", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 3, name: "message", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): SessionSleepFailure {
+    return new SessionSleepFailure().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): SessionSleepFailure {
+    return new SessionSleepFailure().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): SessionSleepFailure {
+    return new SessionSleepFailure().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: SessionSleepFailure | PlainMessage<SessionSleepFailure> | undefined, b: SessionSleepFailure | PlainMessage<SessionSleepFailure> | undefined): boolean {
+    return proto3.util.equals(SessionSleepFailure, a, b);
+  }
+}
+
+/**
+ * Request payload for Worker.ResumeSession.
+ *
+ * @generated from message legion.ResumeSessionRequest
+ */
+export class ResumeSessionRequest extends Message<ResumeSessionRequest> {
+  /**
+   * The suspended session to resume.
+   *
+   * @generated from field: string session_id = 1;
+   */
+  sessionId = "";
+
+  /**
+   * Discard the checkpoint and boot the session fresh under the same id.
+   *
+   * @generated from field: bool cold = 2;
+   */
+  cold = false;
+
+  /**
+   * The session's job and task. Required only to resume a `store` session
+   * this node does not hold (a move): its manifest lives at
+   * `<contentStore.url>/sessions/<job>/<id-prefix>/<id>.json`, and the node
+   * admits it into its envelope for that task. Ignored for a session the
+   * node holds.
+   *
+   * @generated from field: string job_id = 3;
+   */
+  jobId = "";
+
+  /**
+   * @generated from field: string task_name = 4;
+   */
+  taskName = "";
+
+  /**
+   * Move a session the manifest says is running on another node without
+   * that node's agreement. A manager sets it only after its own probe of
+   * that node failed and the node is marked down or lost (or the caller
+   * passed `StartInstanceRequest.force_move`). Without it, a manifest
+   * naming another node as running answers FAILED_PRECONDITION starting
+   * `running_elsewhere`, naming the node and generation, so the manager can
+   * probe that node first.
+   *
+   * @generated from field: bool force_move = 5;
+   */
+  forceMove = false;
+
+  constructor(data?: PartialMessage<ResumeSessionRequest>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.ResumeSessionRequest";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "session_id", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 2, name: "cold", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
+    { no: 3, name: "job_id", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 4, name: "task_name", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 5, name: "force_move", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): ResumeSessionRequest {
+    return new ResumeSessionRequest().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): ResumeSessionRequest {
+    return new ResumeSessionRequest().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): ResumeSessionRequest {
+    return new ResumeSessionRequest().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: ResumeSessionRequest | PlainMessage<ResumeSessionRequest> | undefined, b: ResumeSessionRequest | PlainMessage<ResumeSessionRequest> | undefined): boolean {
+    return proto3.util.equals(ResumeSessionRequest, a, b);
+  }
+}
+
+/**
+ * Reply payload for Worker.ResumeSession.
+ *
+ * @generated from message legion.ResumeSessionReply
+ */
+export class ResumeSessionReply extends Message<ResumeSessionReply> {
+  /**
+   * The session as it stands after the resume: `running`, or `starting`
+   * when its runtime is still coming up.
+   *
+   * @generated from field: legion.SessionStatus session = 1;
+   */
+  session?: SessionStatus;
+
+  /**
+   * This node's id.
+   *
+   * @generated from field: string node_id = 2;
+   */
+  nodeId = "";
+
+  /**
+   * `local` (restored from the node's memory checkpoint), `store` (a
+   * memory checkpoint whose parts were fetched from the content store: a
+   * move, or a local copy the node had evicted), or `cold` (booted fresh: a
+   * disk checkpoint, or `cold` was asked). Empty when the session was
+   * already running.
+   *
+   * @generated from field: string resumed_from = 3;
+   */
+  resumedFrom = "";
+
+  /**
+   * True when the session was running already and nothing was done.
+   *
+   * @generated from field: bool already_running = 4;
+   */
+  alreadyRunning = false;
+
+  /**
+   * The session's generation after the resume. A `local` session never
+   * moves, so its generation stays 1; every resume of a `store` session
+   * claims one more.
+   *
+   * @generated from field: uint64 generation = 5;
+   */
+  generation = protoInt64.zero;
+
+  /**
+   * The node the session ran on before this resume, when it moved here.
+   * Empty when it resumed on its own node.
+   *
+   * @generated from field: string moved_from = 6;
+   */
+  movedFrom = "";
+
+  constructor(data?: PartialMessage<ResumeSessionReply>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.ResumeSessionReply";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "session", kind: "message", T: SessionStatus },
+    { no: 2, name: "node_id", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 3, name: "resumed_from", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 4, name: "already_running", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
+    { no: 5, name: "generation", kind: "scalar", T: 4 /* ScalarType.UINT64 */ },
+    { no: 6, name: "moved_from", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): ResumeSessionReply {
+    return new ResumeSessionReply().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): ResumeSessionReply {
+    return new ResumeSessionReply().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): ResumeSessionReply {
+    return new ResumeSessionReply().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: ResumeSessionReply | PlainMessage<ResumeSessionReply> | undefined, b: ResumeSessionReply | PlainMessage<ResumeSessionReply> | undefined): boolean {
+    return proto3.util.equals(ResumeSessionReply, a, b);
   }
 }
 
@@ -24904,6 +25843,20 @@ export class TaskAllocation extends Message<TaskAllocation> {
    */
   sessionTaskConfigId = protoInt64.zero;
 
+  /**
+   * On an envelope allocation whose session task sets
+   * `suspend.durability = "store"` only: the job's session sealing keys,
+   * the current one first (see `SessionSealKey`). The node seals the
+   * checkpoint parts its sessions publish with the first, and opens parts
+   * sealed under any of them. Empty on every other allocation, and when the
+   * manager's keyring has no checkpoint key (the keyring is off or locked);
+   * a `store` session whose memory checkpoint has parts to seal then stays
+   * suspended on its node unpublished until the keys arrive.
+   *
+   * @generated from field: repeated legion.SessionSealKey session_seal_keys = 31;
+   */
+  sessionSealKeys: SessionSealKey[] = [];
+
   constructor(data?: PartialMessage<TaskAllocation>) {
     super();
     proto3.util.initPartial(data, this);
@@ -24942,6 +25895,7 @@ export class TaskAllocation extends Message<TaskAllocation> {
     { no: 28, name: "promoted_from_session", kind: "scalar", T: 9 /* ScalarType.STRING */ },
     { no: 29, name: "session_task_spec", kind: "scalar", T: 9 /* ScalarType.STRING */ },
     { no: 30, name: "session_task_config_id", kind: "scalar", T: 3 /* ScalarType.INT64 */ },
+    { no: 31, name: "session_seal_keys", kind: "message", T: SessionSealKey, repeated: true },
   ]);
 
   static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): TaskAllocation {

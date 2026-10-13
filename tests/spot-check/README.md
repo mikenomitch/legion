@@ -15,7 +15,7 @@ benchmark (that is [`benchmarks/aws/`](../../benchmarks/aws/README.md)).
 | Box | Type | Pricing | Runs |
 | --- | --- | --- | --- |
 | `sc-mgr-1..3` | t3.small | on-demand | Legion managers, one raft group, ACLs on |
-| `sc-wkr-1..2` | m7i.large | spot, nested virtualization | Legion workers: youki, cloud-hypervisor, a 20 GB EBS data disk at `/data` |
+| `sc-wkr-1..2` | m7i.large | spot, nested virtualization | Legion workers: runc, cloud-hypervisor, a 20 GB EBS data disk at `/data` |
 
 About $0.20/hour while up (about $4.60/day): instances, 160 GB of gp3, and
 five public IPv4 addresses. Workers use

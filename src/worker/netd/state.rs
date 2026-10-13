@@ -83,12 +83,25 @@ impl NetdStateStore {
         }
         let text = serde_json::to_string(state)?;
         let tmp = self.path.with_extension("json.tmp");
-        std::fs::write(&tmp, text.as_bytes())?;
+        // Created 0600, not chmodded after the write: the worker state dir
+        // is traverse-only, so a file at the umask is readable by path for
+        // as long as it exists.
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create(true).truncate(true);
         #[cfg(unix)]
         {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))?;
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
         }
+        let mut file = options.open(&tmp)?;
+        #[cfg(unix)]
+        {
+            // A leftover temp file keeps its old mode through `open`.
+            use std::os::unix::fs::PermissionsExt;
+            file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+        }
+        std::io::Write::write_all(&mut file, text.as_bytes())?;
+        drop(file);
         std::fs::rename(&tmp, &self.path)?;
         Ok(())
     }

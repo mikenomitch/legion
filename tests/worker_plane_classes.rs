@@ -38,7 +38,7 @@ use legion::structs::worker_client::WorkerClient;
 use legion::structs::worker_server::WorkerServer;
 use legion::structs::{
     exec_client_frame, ExecClientFrame, ExecStart, GetTaskLogsRequest, PostWorkRequest,
-    RestartWorkerRequest, StartClaimRequest,
+    RestartWorkerRequest, StartClaimRequest, TaskAllocation,
 };
 use legion::worker::server::WorkerDaemonService;
 use legion::worker::state::WorkerStateStore;
@@ -133,15 +133,9 @@ fn manager_identity(ca_pem: &str, ca_key: &str) -> R<Arc<SwappableIdentity>> {
     Ok(identity)
 }
 
-async fn serve_worker(dir: &tempfile::TempDir) -> R<Cluster> {
-    let (ca_pem, ca_key) = generate_ca()?;
-    let roots = SwappableRoots::from_pem(&ca_pem)?;
-    let config = server_config(
-        node_identity(&ca_pem, &ca_key, "node-1")?,
-        Some(ClusterClientVerifier::new(roots.clone())),
-        false,
-    )?;
-    let service = WorkerDaemonService {
+/// The real worker service for `node-1`, with its state under `dir`.
+fn worker_service(dir: &tempfile::TempDir) -> WorkerDaemonService {
+    WorkerDaemonService {
         node_id: "node-1".into(),
         task_manager: Arc::new(Mutex::new(WorkerTaskManager::with_state_store(
             WorkerStateStore::new(dir.path().join("worker_state.json")),
@@ -151,7 +145,18 @@ async fn serve_worker(dir: &tempfile::TempDir) -> R<Cluster> {
         direct_exec: None,
         launch_pool: Default::default(),
         node_identity: None,
-    };
+    }
+}
+
+async fn serve_worker(dir: &tempfile::TempDir) -> R<Cluster> {
+    let (ca_pem, ca_key) = generate_ca()?;
+    let roots = SwappableRoots::from_pem(&ca_pem)?;
+    let config = server_config(
+        node_identity(&ca_pem, &ca_key, "node-1")?,
+        Some(ClusterClientVerifier::new(roots.clone())),
+        false,
+    )?;
+    let service = worker_service(dir);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
     let address = format!("https://127.0.0.1:{}", listener.local_addr()?.port());
     tokio::spawn(async move {
@@ -341,6 +346,52 @@ async fn classes_match_the_handlers() -> R<()> {
             );
         }
     }
+    Ok(())
+}
+
+/// Work delivered over `Manager.StreamWork` starts through `accept_work`,
+/// not the `PostWork` handler. The stream is authenticated when the worker
+/// opens it, and a request built in-process has no peer certificate, so the
+/// handler refuses it as a ticket caller. The streamed launch used to go
+/// through the handler: every streamed allocation logged
+/// `PostWork is a manager-only worker RPC` at ERROR and waited for the next
+/// heartbeat's reconcile to start it.
+#[tokio::test(flavor = "multi_thread")]
+async fn streamed_work_starts_without_the_plane_check() -> R<()> {
+    use legion::structs::worker_server::Worker;
+    let dir = tempfile::tempdir()?;
+    let service = worker_service(&dir);
+    let allocation = TaskAllocation {
+        allocation_id: 42,
+        job_id: "web".into(),
+        job_config_id: "jc-1".into(),
+        node_id: "node-1".into(),
+        task_config_id: 1,
+        task_name: "web".into(),
+        // `exec`, not `noop`: the noop runtime is a dylib that test builds
+        // skip.
+        task_runtime: "exec".into(),
+        task_config: r#"{"command":["sleep","30"]}"#.into(),
+        task_resources: r#"{"memory":64}"#.into(),
+        ..Default::default()
+    };
+
+    // The handler still refuses an in-process request: it has no certificate.
+    let status = service
+        .post_work(tonic::Request::new(PostWorkRequest {
+            allocation: Some(allocation.clone()),
+        }))
+        .await
+        .expect_err("no manager certificate");
+    assert_eq!(status.code(), Code::Unauthenticated);
+    assert!(!service.task_manager.lock().unwrap().has_allocation(42));
+
+    // The streamed path starts the same allocation.
+    service.accept_work(allocation).await?;
+    let mut task_manager = service.task_manager.lock().unwrap();
+    assert!(task_manager.has_allocation(42));
+    // An empty desired set stops the sleep.
+    task_manager.reconcile_allocations(&[]);
     Ok(())
 }
 

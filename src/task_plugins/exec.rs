@@ -200,6 +200,20 @@ impl ExecTaskConfig {
     }
 }
 
+/// The cgroup an exec task's process was spawned into, as an absolute path:
+/// the explicit `config.cgroup` when the job named one, else the leaf worker
+/// core created for the allocation (the same precedence `start` applies).
+/// `None` when the task runs in the worker's own cgroup.
+fn task_cgroup_dir(explicit: Option<&str>, instance: &TaskInstance) -> Option<std::path::PathBuf> {
+    let relative = explicit.map(std::path::PathBuf::from).or_else(|| {
+        instance
+            .resource_assignment
+            .as_ref()
+            .map(|assignment| assignment.cgroup_path.clone())
+    })?;
+    Some(std::path::Path::new(crate::task_plugins::exec_isolation::CGROUP_ROOT).join(relative))
+}
+
 #[derive(Clone, Debug, Default)]
 struct ExecLinuxOptions {
     landlock: Option<LandlockOptions>,
@@ -393,10 +407,24 @@ impl TaskPlugin for ExecTaskPlugin {
                 .or_else(|| instance.task_dir.clone());
         }
 
+        // Join the cgroup the task runs in, so the session (an exec or an
+        // action) counts against the task's memory/CPU limits and is reaped
+        // with it by `cgroup.kill`. Left in the worker's cgroup it escaped
+        // both, and its usage was billed to the worker.
+        if cfg!(target_os = "linux") {
+            let explicit = config.linux_options()?.cgroup;
+            opts.cgroup = task_cgroup_dir(explicit.as_deref(), instance);
+        }
+
         info!(
             allocation_id = allocation.id,
             task_name = %task.name,
             tty = opts.tty,
+            cgroup = %opts
+                .cgroup
+                .as_ref()
+                .map(|dir| dir.display().to_string())
+                .unwrap_or_default(),
             "Opening exec session for exec task"
         );
 
@@ -1204,6 +1232,36 @@ mod tests {
         assert_eq!(named.cgroup.as_deref(), Some("workloads/demo"));
         assert_eq!(named.managed_cgroup, None);
         Ok(())
+    }
+
+    /// Exec sessions and actions join the cgroup the task was spawned into,
+    /// with the same precedence `start` applies, so `legion exec` cannot
+    /// escape the task's limits by running in the worker's cgroup (the
+    /// spot check saw `0::/system.slice/legion-worker.service`).
+    #[test]
+    fn exec_sessions_join_the_cgroup_the_task_runs_in_test() {
+        let governed = TaskInstance {
+            resource_assignment: Some(crate::task_plugins::ResourceAssignment {
+                slice: crate::task_plugins::Slice::Share,
+                cgroup_path: std::path::PathBuf::from("legion/share/legion-978"),
+                cores: None,
+                cpu_weight: None,
+                memory_limit_bytes: Some(64 * 1024 * 1024),
+                memory_low_bytes: None,
+            }),
+            ..TaskInstance::default()
+        };
+        assert_eq!(
+            task_cgroup_dir(None, &governed),
+            Some(std::path::PathBuf::from(
+                "/sys/fs/cgroup/legion/share/legion-978"
+            ))
+        );
+        assert_eq!(
+            task_cgroup_dir(Some("workloads/demo"), &governed),
+            Some(std::path::PathBuf::from("/sys/fs/cgroup/workloads/demo"))
+        );
+        assert_eq!(task_cgroup_dir(None, &TaskInstance::default()), None);
     }
 
     /// End-to-end Linux: an exec task's declared `memory` becomes a real

@@ -45,12 +45,12 @@ pub const AGENT_SAVED_QUERIES: &[(&str, &str)] = &[
     ),
     (
         "agent:recent-failed-evals",
-        "SELECT id AS eval_id, kind, status, job_id, job_config_id, node_name, priority \
+        "SELECT id AS eval_id, type AS kind, status, job_id, job_config_id, node_id, priority \
          FROM eval WHERE status = 'failed' ORDER BY id DESC LIMIT 50;",
     ),
     (
         "agent:pending-evals",
-        "SELECT id AS eval_id, kind, status, job_id, priority FROM eval \
+        "SELECT id AS eval_id, type AS kind, status, job_id, priority FROM eval \
          WHERE status IN ('pending','in_flight','blocked') ORDER BY priority DESC, id ASC;",
     ),
 ];
@@ -327,4 +327,29 @@ async fn show_schema(format: OutputFormat) -> R<()> {
         .collect();
     print_table(rows);
     Ok(())
+}
+
+#[cfg(test)]
+mod state_test {
+    use super::*;
+    use crate::storage::store::Store;
+    use crate::structs::config::ManagerConfigFull;
+
+    /// The seeded queries are SQL against the live schema, so a renamed or
+    /// misremembered column only shows up when an agent runs one. Run them
+    /// all against a fresh store.
+    #[test]
+    fn every_agent_saved_query_runs_against_the_schema() -> R<()> {
+        let dir = tempfile::tempdir()?;
+        let store = Store::start_storage(&ManagerConfigFull {
+            store_path: dir.path().to_str().context("store path")?.to_string(),
+            ..Default::default()
+        })?;
+        for (name, sql) in AGENT_SAVED_QUERIES {
+            store
+                .query_state_store(sql, false)
+                .with_context(|| format!("saved query {name} failed"))?;
+        }
+        Ok(())
+    }
 }

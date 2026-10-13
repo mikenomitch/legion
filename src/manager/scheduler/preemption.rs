@@ -385,6 +385,55 @@ pub fn select_victims(
     Some(victims)
 }
 
+/// One node's victim set for one placement: [`eligible_victims`] then
+/// [`select_victims`], with one exception to `victimExemptAge`.
+///
+/// The age guard must not push a placement *up* the band ladder. When the
+/// only old-enough set takes work in a more important band (`normal`) while
+/// younger work in a lower band (`low`) would also make room, the young
+/// lower-band set wins. Otherwise the guard turns one eviction into two: the
+/// displaced `normal` job requeues and, once the `low` work ages past the
+/// guard, preempts it to come back (the 2026-10-12 spot check:
+/// `band-claim (high)` took `hello-container (normal)`, which then took
+/// `band-fill (low)`). The guard never *enables* a preemption: when no
+/// old-enough set fits, the young work stays protected and the placement
+/// fails as before.
+///
+/// The second pass runs only when the guard rejected something and the first
+/// pass found victims, so the common path costs nothing extra.
+pub fn choose_victims(
+    ask: &ResourceRequest,
+    free: &ResourcePool,
+    candidates: &[VictimCandidate],
+    preemptor: Band,
+    victim_exempt_age: std::time::Duration,
+    already_taken: &HashMap<i64, u32>,
+) -> (Option<Vec<VictimCandidate>>, IneligibleTally) {
+    let (eligible, tally) =
+        eligible_victims(candidates, preemptor, victim_exempt_age, already_taken);
+    let chosen = select_victims(ask, free, &eligible);
+    let highest_band =
+        |victims: &[VictimCandidate]| victims.iter().map(|victim| victim.band.rank()).max();
+    let Some(highest) = chosen.as_deref().and_then(highest_band) else {
+        return (chosen, tally);
+    };
+    if tally.too_young == 0 {
+        return (chosen, tally);
+    }
+    let (with_young, _) = eligible_victims(
+        candidates,
+        preemptor,
+        std::time::Duration::ZERO,
+        already_taken,
+    );
+    match select_victims(ask, free, &with_young) {
+        Some(lower) if highest_band(&lower).is_some_and(|rank| rank < highest) => {
+            (Some(lower), tally)
+        }
+        _ => (chosen, tally),
+    }
+}
+
 /// How badly a victim's size mismatches the ask, over the amount-typed
 /// resources the ask actually names.
 ///
@@ -542,6 +591,62 @@ mod preemption_test {
         assert_eq!(eligible.len(), 1);
         assert_eq!(eligible[0].allocation_id, 2);
         assert_eq!(tally.same_or_higher_band, 1, "a peer is never a victim");
+    }
+
+    #[test]
+    fn the_age_guard_never_pushes_a_placement_up_the_band_ladder() {
+        let mut young_low = candidate(1, Band::Low, 250.0, 3072.0);
+        young_low.age_secs = Some(30);
+        let old_normal = candidate(2, Band::Normal, 250.0, 128.0);
+        let ask = request(250.0, 3072.0);
+        // Either victim alone makes room.
+        let free = pool(1000.0, 2944.0);
+        let (victims, tally) = choose_victims(
+            &ask,
+            &free,
+            &[young_low.clone(), old_normal.clone()],
+            Band::High,
+            DEFAULT_VICTIM_EXEMPT_AGE,
+            &HashMap::new(),
+        );
+        let victims = victims.expect("preemption frees enough");
+        assert_eq!(
+            victims.iter().map(|v| v.allocation_id).collect::<Vec<_>>(),
+            vec![1],
+            "the young low-band allocation goes instead of the normal one"
+        );
+        assert_eq!(tally.too_young, 1);
+
+        // The guard still holds when the young work is the only way in.
+        let (victims, _) = choose_victims(
+            &ask,
+            &pool(1000.0, 0.0),
+            &[young_low.clone(), old_normal.clone()],
+            Band::High,
+            DEFAULT_VICTIM_EXEMPT_AGE,
+            &HashMap::new(),
+        );
+        assert!(victims.is_none(), "old_normal alone cannot make room");
+
+        // And young work in the SAME band as the old set gains nothing.
+        let mut young_normal = candidate(3, Band::Normal, 250.0, 3072.0);
+        young_normal.age_secs = Some(30);
+        let (victims, _) = choose_victims(
+            &ask,
+            &free,
+            &[young_normal, old_normal],
+            Band::High,
+            DEFAULT_VICTIM_EXEMPT_AGE,
+            &HashMap::new(),
+        );
+        assert_eq!(
+            victims
+                .expect("fits")
+                .iter()
+                .map(|v| v.allocation_id)
+                .collect::<Vec<_>>(),
+            vec![2]
+        );
     }
 
     #[test]

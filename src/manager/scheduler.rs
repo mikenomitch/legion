@@ -30,7 +30,7 @@ pub use policy::{
     load_policy, SchedulerWeights, SchedulingContext, SchedulingPolicy,
     DEF_SCHEDULER_LOCALITY_WEIGHT,
 };
-use preemption::{eligible_victims, preemption_cost, select_victims, VictimCandidate};
+use preemption::{choose_victims, preemption_cost, VictimCandidate};
 pub use preemption::{
     PlannedPreemption, PreemptionMode, PreemptionSettings, DEFAULT_VICTIM_EXEMPT_AGE,
 };
@@ -4241,14 +4241,16 @@ impl<'a> Scheduler<'a> {
                 continue;
             };
             let on_node = pass.candidates_on_node(&node.id);
-            let (eligible, tally) = eligible_victims(
+            let (victims, tally) = choose_victims(
+                ask,
+                free,
                 &on_node,
                 pass.preemptor_band,
                 self.preemption.victim_exempt_age,
                 &pass.taken_by_task,
             );
             pass.record_tally(tally);
-            let Some(victims) = select_victims(ask, free, &eligible) else {
+            let Some(victims) = victims else {
                 continue;
             };
             // A node that needs no victims would have passed the resource
@@ -4298,13 +4300,15 @@ impl<'a> Scheduler<'a> {
                     if let Some(node) = tied.iter().find(|node| node.id == *first) {
                         if let Some(free) = resource_ledger.pools.get(node.id.as_str()) {
                             let on_node = pass.candidates_on_node(&node.id);
-                            let (eligible, _) = eligible_victims(
+                            let (victims, _) = choose_victims(
+                                ask,
+                                free,
                                 &on_node,
                                 pass.preemptor_band,
                                 self.preemption.victim_exempt_age,
                                 &pass.taken_by_task,
                             );
-                            if let Some(victims) = select_victims(ask, free, &eligible) {
+                            if let Some(victims) = victims {
                                 choice = PreemptionChoice {
                                     node_id: node.id.clone(),
                                     victims,
@@ -9812,6 +9816,54 @@ mod tests {
             err.to_string().contains("victimExemptAge"),
             "the error names the guard that bound: {err}"
         );
+        Ok(())
+    }
+
+    /// Spot check 2026-10-12: `band-claim (high)` preempted
+    /// `hello-container (normal)` while `band-fill (low)` sat on the same
+    /// node, because the low-band microVMs were younger than
+    /// `victimExemptAge`. hello-container then preempted band-fill to come
+    /// back: two evictions where one would do. The guard must not push a
+    /// placement up the band ladder.
+    #[test]
+    fn a_young_lower_band_victim_is_taken_before_an_older_higher_band_one() -> R<()> {
+        let store = setup_store()?;
+        small_node(&store, "node-a")?;
+        let scheduler = Scheduler::new(&store)?;
+        let submit = |name: &str, band: Band, memory: u64| -> R<String> {
+            let job = JobConfig {
+                priority: band,
+                rollout: None,
+                rollout_by_group: Default::default(),
+                name: name.into(),
+                tasks: vec![TaskConfig {
+                    resources: json!({ "memory": memory }),
+                    ..TaskConfig::new("worker", "noop")
+                }],
+                version: None,
+            };
+            store.handle_job_submit(&job, &[dummy_submission()])?;
+            Ok(store.get_job_config(name)?.id())
+        };
+
+        // A small, long-running normal service, then a fresh low-band fill.
+        // 512 MiB node: 64 + 256 placed leaves 192 free, so evicting EITHER
+        // one makes room for the 256 MiB claim.
+        let hello = submit("hello-container", Band::Normal, 64)?;
+        scheduler.plan_and_apply(&hello, PlanMode::Fresh)?;
+        age_allocations(&store)?;
+        let fill = submit("band-fill", Band::Low, 256)?;
+        scheduler.plan_and_apply(&fill, PlanMode::Fresh)?;
+
+        let claim = submit("band-claim", Band::High, 256)?;
+        let outcome = scheduler.plan_and_apply(&claim, PlanMode::Fresh)?;
+        assert_eq!(outcome.allocations.len(), 1, "the claim places");
+        assert_eq!(outcome.evictions.len(), 1);
+        assert_eq!(
+            outcome.evictions[0].job_id, "band-fill",
+            "the low-band work goes, not the normal-band service"
+        );
+        assert_eq!(outcome.evictions[0].band, "low");
         Ok(())
     }
 

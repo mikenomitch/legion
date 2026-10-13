@@ -33,6 +33,11 @@ pub struct ExecOptions {
     pub cwd: Option<std::path::PathBuf>,
     /// Extra environment for the exec'd process.
     pub env: BTreeMap<String, String>,
+    /// A cgroup v2 directory (absolute) the process joins before it runs the
+    /// command, so a session into a governed host-process task runs under
+    /// that task's memory/CPU limits rather than in the worker's cgroup.
+    /// `None` leaves the process where the worker is.
+    pub cgroup: Option<std::path::PathBuf>,
 }
 
 impl ExecOptions {
@@ -43,9 +48,20 @@ impl ExecOptions {
             winsize: (80, 24),
             cwd: None,
             env: BTreeMap::new(),
+            cgroup: None,
         }
     }
 }
+
+/// The `sh -c` script a PTY session joins its cgroup with: `$0` is the
+/// cgroup's `cgroup.procs`, `$@` the command. The shell writes its own pid,
+/// then `exec`s the command under that same pid, so the command never runs
+/// outside the cgroup. A failed join exits 126 with the shell's error on the
+/// terminal rather than running the command unconfined.
+///
+/// A shell and not a `pre_exec` hook because `portable-pty` exposes none; the
+/// pipe path, built on `std::process::Command`, uses the hook directly.
+const PTY_CGROUP_JOIN: &str = "echo $$ > \"$0\" || exit 126; exec \"$@\"";
 
 /// The output streams of a session. `stderr` is `None` for PTY sessions,
 /// where the terminal merges both onto the master.
@@ -101,8 +117,22 @@ pub fn spawn_pty(opts: &ExecOptions) -> R<Box<dyn ExecSession>> {
         })
         .context("failed to open pty")?;
 
-    let mut builder = CommandBuilder::new(program);
-    builder.args(args);
+    let mut builder = match &opts.cgroup {
+        Some(cgroup) => {
+            let mut builder = CommandBuilder::new("/bin/sh");
+            builder.arg("-c");
+            builder.arg(PTY_CGROUP_JOIN);
+            builder.arg(cgroup.join("cgroup.procs"));
+            builder.arg(program);
+            builder.args(args);
+            builder
+        }
+        None => {
+            let mut builder = CommandBuilder::new(program);
+            builder.args(args);
+            builder
+        }
+    };
     apply_common(&mut builder, opts);
 
     let child = pair
@@ -147,8 +177,28 @@ pub fn spawn_pipe(opts: &ExecOptions) -> R<Box<dyn ExecSession>> {
     cmd.stdin(Stdio::piped());
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::piped());
+    #[cfg(unix)]
+    if let Some(cgroup) = &opts.cgroup {
+        use std::os::unix::process::CommandExt;
+        let procs = cgroup.join("cgroup.procs");
+        // SAFETY: the closure only writes a pid to a file, the same work
+        // `join_assignment_cgroup` does in its hook. In the child, before
+        // exec, so the command never runs outside the cgroup.
+        unsafe {
+            cmd.pre_exec(move || {
+                std::fs::write(&procs, std::process::id().to_string())
+                    .map_err(std::io::Error::other)
+            });
+        }
+    }
 
-    let mut child = cmd.spawn().context("failed to spawn exec command")?;
+    let mut child = cmd.spawn().with_context(|| match &opts.cgroup {
+        Some(cgroup) => format!(
+            "failed to spawn exec command in cgroup {}",
+            cgroup.display()
+        ),
+        None => "failed to spawn exec command".to_string(),
+    })?;
     let stdout = child.stdout.take();
     let stderr = child.stderr.take();
     let stdin = child.stdin.take();
@@ -303,6 +353,60 @@ mod tests {
         ))?;
         let _ = session.take_output()?;
         assert_eq!(session.wait()?, 7);
+        Ok(())
+    }
+
+    /// A session given a cgroup writes the pid that runs the command into
+    /// its `cgroup.procs` (a plain directory stands in for cgroupfs), before
+    /// the command runs: `echo $$` prints the pid that was written.
+    #[cfg(unix)]
+    #[test]
+    fn sessions_join_their_cgroup_before_the_command_runs_test() -> R<()> {
+        for tty in [false, true] {
+            let cgroup = tempfile::tempdir()?;
+            let mut opts = ExecOptions::new(
+                vec!["/bin/sh".into(), "-c".into(), "echo pid=$$".into()],
+                tty,
+            );
+            opts.cgroup = Some(cgroup.path().to_path_buf());
+            let mut session = if tty {
+                spawn_pty(&opts)?
+            } else {
+                spawn_pipe(&opts)?
+            };
+            let mut out = session.take_output()?;
+            let mut buf = Vec::new();
+            // PTY read returns EIO on some platforms at EOF.
+            let _ = out.stdout.read_to_end(&mut buf);
+            assert_eq!(session.wait()?, 0, "tty={tty}");
+            let printed = String::from_utf8_lossy(&buf);
+            let joined = std::fs::read_to_string(cgroup.path().join("cgroup.procs"))?;
+            assert!(
+                printed.contains(&format!("pid={}", joined.trim())),
+                "tty={tty}: the command ran as pid {printed:?}, but {joined:?} joined"
+            );
+        }
+        Ok(())
+    }
+
+    /// A join that fails does not run the command unconfined.
+    #[cfg(unix)]
+    #[test]
+    fn a_session_whose_cgroup_join_fails_does_not_run_test() -> R<()> {
+        let missing = std::path::PathBuf::from("/nonexistent/legion-cgroup");
+        let mut pipe = ExecOptions::new(vec!["/bin/echo".into(), "ran".into()], false);
+        pipe.cgroup = Some(missing.clone());
+        let err = spawn_pipe(&pipe).err().expect("the pre-exec join fails");
+        assert!(format!("{err:#}").contains("legion-cgroup"), "{err:#}");
+
+        let mut tty = ExecOptions::new(vec!["/bin/echo".into(), "ran".into()], true);
+        tty.cgroup = Some(missing);
+        let mut session = spawn_pty(&tty)?;
+        let mut out = session.take_output()?;
+        let mut buf = Vec::new();
+        let _ = out.stdout.read_to_end(&mut buf);
+        assert_eq!(session.wait()?, 126);
+        assert!(!String::from_utf8_lossy(&buf).contains("ran\r\n"));
         Ok(())
     }
 

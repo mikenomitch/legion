@@ -410,7 +410,7 @@ add:
 The full index lives at **[docs/README.md](docs/README.md)**. Good places to
 start:
 
-- **Installing:** [Legion and its runtimes](docs/installation.md) (youki,
+- **Installing:** [Legion and its runtimes](docs/installation.md) (runc,
   cloud-hypervisor, a guest kernel, Apple `container`)
 - **Concepts:** [Managers and Workers](docs/architecture-managers-workers.md) ·
   [Jobs, Tasks, and Scheduling](docs/jobs-tasks-and-scheduling.md) ·

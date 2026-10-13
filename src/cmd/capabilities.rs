@@ -1116,6 +1116,17 @@ pub fn catalog() -> Vec<Capability> {
             read_only_safe: true,
         },
         Capability {
+            name: "raft.members",
+            cli: "legion raft members",
+            grpc: Some("Manager/ListManagers"),
+            summary: "Every manager in the cluster from the replicated raft membership: role \
+                 (leader/follower/learner, or standalone outside raft), advertised address, \
+                 and whether the answering manager can reach it, with each reachable \
+                 member's term and applied index. Any manager answers with the full list.",
+            mutates: false,
+            read_only_safe: true,
+        },
+        Capability {
             name: "raft.history",
             cli: "legion raft history [--limit <N>]",
             grpc: Some("Manager/ListRaftHistory"),

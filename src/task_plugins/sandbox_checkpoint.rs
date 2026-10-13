@@ -605,14 +605,17 @@ pub(crate) fn release_links(instance: &TaskInstance, scratch: &Path) {
     }
 }
 
-/// The VMM version as the API reports it, normalized like the fingerprint's.
+/// The VMM version as the API reports it, in the canonical form the node
+/// fingerprint also records (cloud-hypervisor's `vmm.ping` says `51.2.0`
+/// where its `--version` banner says `v51.2`; both record `51.2.0`).
 fn api_version(backend: &Backend, socket: &Path) -> R<String> {
     let raw = match backend {
         Backend::Firecracker { .. } => FirecrackerApi::new(socket).version()?,
         Backend::CloudHypervisor { .. } => CloudHypervisorApi::new(socket).version()?,
         other => bail!("{} has no checkpoint API", other.label()),
     };
-    Ok(microvm::parse_vmm_version(&raw).unwrap_or(raw))
+    Ok(microvm::parse_vmm_version(&raw)
+        .unwrap_or_else(|| crate::structs::checkpoint::canonical_vmm_version(&raw)))
 }
 
 /// Capture a running microVM into `out`.
@@ -661,6 +664,22 @@ pub(crate) fn checkpoint_microvm(
         ) {
             bail!("{refusal}");
         }
+    }
+
+    // Flush the guest before the pause. The capture is consistent without
+    // it (the page cache rides the memory image), but the volume is also
+    // what a cold boot of this instance will see, should the memory never
+    // be restored. Best effort: a guest that cannot sync is still captured.
+    let vsock = crate::task_plugins::vsock_socket_base(scratch);
+    if let Err(err) = crate::task_plugins::sandbox::flush_guest(
+        &vsock,
+        crate::task_plugins::sandbox::GUEST_FLUSH_TIMEOUT,
+    ) {
+        warn!(
+            allocation_id = allocation.id,
+            error = %format!("{err:#}"),
+            "Could not flush the sandbox guest's disks before its memory checkpoint"
+        );
     }
 
     let started = std::time::Instant::now();

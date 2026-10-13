@@ -180,6 +180,17 @@ A disk suspend of an `exec` or `container` task is a stop that remembers it
 was a suspend. Nothing from process memory survives it (Legion does not use
 CRIU), but the volume does, and the resumed task finds every file it wrote.
 
+A sandbox's writes sit in the guest's page cache until the guest writes them
+back, so both kinds flush the guest first (`sync` through the guest agent,
+for up to 10 seconds). A memory suspend flushes before it pauses the guest,
+so the volume has every earlier write on its own, not only in the captured
+memory. A disk suspend flushes before it kills the VMM, so the resumed
+sandbox finds every file it wrote. A guest whose agent does not answer is
+suspended without the flush, and the node logs `Could not flush the sandbox
+guest's disks`. A disk suspend of such a guest loses the writes it had not
+written back. See
+[Stopping a sandbox](task-runtime-sandbox.md#stopping-a-sandbox).
+
 ## Suspending
 
 ```console
@@ -401,8 +412,13 @@ What differs from Linux:
 - **A `container exec` you run by hand is invisible** to the `exec` signal,
   since it bypasses the worker. Its CPU still counts.
 - **Two local clusters can share a Mac.** Each dev-mode container is named
-  `legion-sbx-<node>-<allocation>`, so one cluster's cleanup never removes
-  another's container.
+  `legion-sbx-<node>-<allocation>` and labeled with its node
+  (`legion.node`). Stale-container cleanup removes only a container labeled
+  as this node's, so one cluster's cleanup never removes another's
+  container.
+- **`container stats` is bounded.** The usage sample kills the call past 5
+  seconds. A wedged `container` service leaves that report without its
+  Apple containers instead of stalling the worker's heartbeat.
 
 The end-to-end test for this loop is
 `cargo test --test apple_container_idle -- --ignored`. It needs the
@@ -513,7 +529,9 @@ node (a corrupt part, a busy TAP device). `suspend.onRestoreFailure` decides:
 A resume also waits at most `suspend.resumeTimeout` (30s by default) to be
 placed on its checkpoint's node (any compatible node, for a published
 checkpoint). Under `cold`, a resume that waits longer
-(the node is down, or full) gives up the checkpoint and boots fresh. With a
+(the node is down, or full) gives up the checkpoint and boots fresh. A local
+checkpoint whose node now runs a different VMM version or CPU settles at once
+instead (see [Where a restore can run](#where-a-restore-can-run)). With a
 [node-local volume](volumes.md#node-local-vs-network) the fresh boot is still
 pinned to that node, so it keeps waiting for it, just no longer for the
 checkpoint. Under `fail`, a resume waits like any pending placement.
@@ -1267,8 +1285,23 @@ the checkpoint needs "6:106:6". A memory snapshot resumes only on the CPU and
 VMM it was taken on; restore an older snapshot, or restart the instance cold
 ```
 
+VMM versions compare by release, not by spelling: `v51.2` (what
+cloud-hypervisor's `--version` prints) and `51.2.0` (what its API reports)
+are the same version, while `51.2.0` and `51.3.0` are not. See
+[the sandbox runtime](task-runtime-sandbox.md#where-a-memory-checkpoint-can-be-restored)
+for the full rule.
+
 For a published snapshot, placement fails only when no eligible node fits,
 and the error names up to three of them with the attribute each one fails on.
+
+A resume from a `local` checkpoint whose node reports a different VMM version
+or CPU does not wait out `resumeTimeout`: the checkpoint exists only on that
+node, so the manager settles the resume within a second, the same way as a
+lost checkpoint. Under `onRestoreFailure = "cold"` the instance boots fresh
+with `cold_boot.reason` naming the attribute. Under `"fail"` it goes back to
+`suspended` with its checkpoint kept and the reason in `detail`. A node that
+has not reported the attribute at all (a fingerprint still arriving) keeps
+the resume waiting as before.
 
 The usual cause is a VMM upgrade on the node. Restore a snapshot taken after
 the upgrade, or stop and start the instance to boot it cold on its current

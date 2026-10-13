@@ -84,7 +84,7 @@ done
 ami="$(aws ssm get-parameter --name /aws/service/canonical/ubuntu/server/24.04/stable/current/amd64/hvm/ebs-gp3/ami-id \
     --query Parameter.Value --output text)"
 render() {
-    sed -e "s/@@YOUKI_VERSION@@/$SC_YOUKI_VERSION/g" -e "s/@@CH_VERSION@@/$SC_CH_VERSION/g" \
+    sed -e "s/@@RUNC_VERSION@@/$SC_RUNC_VERSION/g" -e "s/@@CH_VERSION@@/$SC_CH_VERSION/g" \
         -e "s/@@KERNEL_RELEASE@@/$SC_KERNEL_RELEASE/g" "$1" >"$2"
 }
 render "$SC_DIR/infra/cloud-init/manager.sh" "$SC_STATE/manager-user-data.sh"
@@ -123,7 +123,9 @@ aws ec2 wait instance-running --instance-ids $(sc_hosts | awk '{ print $4 }')
 sc_log "Waiting for first-boot setup (cloud-init) on every box"
 for name in "${SC_MANAGERS[@]}" "${SC_WORKERS[@]}"; do
     until sc_ssh "$name" true 2>/dev/null; do sleep 5; done
-    sc_ssh "$name" 'cloud-init status --wait >/dev/null; cloud-init status' | sed "s/^/$name: /"
+    # `cloud-init status` exits 2 on "degraded done" (a recoverable error,
+    # such as a slow metadata service at boot), which is not a failed setup.
+    sc_ssh "$name" 'cloud-init status --wait >/dev/null; cloud-init status || [ $? -eq 2 ]' | sed "s/^/$name: /"
 done
 
 sc_hosts | tee "$SC_STATE/hosts"

@@ -1308,3 +1308,48 @@ port, and listen on 5432 inside.
 collides with a second Postgres on the node and is not the port the service
 and health check use; on macOS, `to` would publish the host port to 5432 while
 Postgres listens on the assigned one. Without `to`, one command works on both.
+
+## 53. A worker's manager trust is shared per cluster by aliasing every reported address to the token's verifier
+
+*Workstream: Manager availability (found on the AWS spot check, after entry 7
+shipped).*
+
+**The call.** After a leader failover a worker's active manager was one its
+token never named. Heartbeats kept working (the failover connector fell back
+to the token's verifier), but every call that dials a manager by address
+failed:
+
+```text
+artifact staging failed: ... credentials from kv secrets/ecr-pull: connect to manager for
+artifact credential: no cluster CA pin for the manager at http://172.31.80.241:4747; ...
+```
+
+The registry in `src/worker/plane.rs` stays keyed by address, but every
+address of a cluster now maps to the *same* `PinnedManagerVerifier`.
+`trust_cluster_managers(seed, addrs)` adds the addresses a manager reported
+(and the persisted `managers.json` set) under the token's verifier, from
+`ManagerEndpoints::new` and `learn`, before the known set changes. The
+connector's seed fallback is gone, and the bundle swap now moves the whole
+cluster at once because the verifier is shared. The JWKS source resolves the
+active manager per fetch instead of dialing the token's address forever.
+
+**Alternatives.**
+- One process-wide trust used for any address.
+- Have `ManagerEndpoints` own the verifier, and route every caller through
+  it instead of through an address lookup.
+
+**Trade-off.** A manager address the cluster never reported is still
+refused, even though the CA check alone would make it safe to dial. A worker
+can reach a new manager by address only after a reply has reported it, which
+happens on registration and every heartbeat.
+
+**Why.** Process-wide trust breaks processes that hold several clusters (the
+simulator and the tests run workers for several side by side), and it would
+drop the defense-in-depth rule that the worker dials only addresses its
+cluster vouched for. Routing every caller through `ManagerEndpoints` would
+mean changing each call site's signature (artifact credentials, the JWKS,
+`connect_manager_with_retry`, the simulator) for no change in behavior.
+Aliasing fixes every caller that dials by address in one place, so
+simplicity won. The security property does not change: an address only says
+where to dial, and the manager there must still present a `manager.legion`
+certificate chained to the CA the token pinned.

@@ -7,7 +7,7 @@
 //! published on an in-process broadcast channel that backs the `StreamEvents`
 //! gRPC stream. See `Store::emit_event`.
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
 use std::time::Duration;
@@ -55,7 +55,10 @@ pub struct SchedulerEventRecord {
 ///         .eval("7"),
 /// );
 /// ```
-#[derive(Debug, Clone)]
+///
+/// Serializable because a manager that leads no raft lane forwards its
+/// standalone events to a lane leader (`ForwardableLaneWrite::EmitEvent`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EventDraft {
     pub kind: String,
     pub level: String,

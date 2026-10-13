@@ -71,7 +71,13 @@ mode, the cache is updated from the committed changeset of each write, not by
 the write's own code:
 
 - **`raft`**: each manager projects the cache from the changeset it applies
-  (see [Persistence Modes](#persistence-modes)).
+  (see [Persistence Modes](#persistence-modes)). The projection runs after
+  the changeset commits. If it fails, the manager logs `Failed to project a
+  committed changeset's side effects`, re-sends every streaming worker its
+  full desired set, and leaves the cache to the scrub below. It keeps
+  applying the log. A projection error doesn't stop the manager's raft
+  group. The scrub doesn't cover task configs, so a cached task list the
+  failed projection skipped stays stale until the manager restarts.
 - **`local_disk` and `streaming`**: each mutation runs with a SQLite session
   attached to the cache's tables (`node`, `node_health`, `allocation`,
   `task_config`, `allocation_epoch_partition`). When the mutation returns, the

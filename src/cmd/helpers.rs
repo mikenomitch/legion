@@ -1,5 +1,6 @@
 use crate::prelude::*;
 use crate::structs::manager_client::ManagerClient;
+use std::time::Duration;
 use tabled::settings::Style;
 use tabled::{Table, Tabled};
 use tonic::metadata::{Ascii, MetadataValue};
@@ -28,10 +29,12 @@ where
 pub type AuthedManagerClient = ManagerClient<InterceptedService<Channel, AuthInterceptor>>;
 
 /// Attaches `authorization: Bearer <token>` to outgoing requests when a
-/// token is available (no-op otherwise, matching ACL-disabled clusters).
+/// token is available (no-op otherwise, matching ACL-disabled clusters),
+/// and gives each bounded request its deadline.
 #[derive(Clone)]
 pub struct AuthInterceptor {
     token: Option<MetadataValue<Ascii>>,
+    request_timeout: Option<Duration>,
 }
 
 impl Interceptor for AuthInterceptor {
@@ -41,8 +44,81 @@ impl Interceptor for AuthInterceptor {
                 .metadata_mut()
                 .insert("authorization", token.clone());
         }
+        if let Some(timeout) = self.request_timeout {
+            let unbounded = request
+                .extensions()
+                .get::<tonic::GrpcMethod>()
+                .is_some_and(|method| UNBOUNDED_METHODS.contains(&method.method()));
+            // `set_timeout` sends `grpc-timeout`: the channel enforces it
+            // locally, and the manager learns the caller's deadline too.
+            if !unbounded && request.metadata().get("grpc-timeout").is_none() {
+                request.set_timeout(timeout);
+            }
+        }
         Ok(request)
     }
+}
+
+/// Default for `LEGION_CONNECT_TIMEOUT`.
+const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Default for `LEGION_REQUEST_TIMEOUT`: far above any ordinary call, short
+/// enough that a manager that accepts connections but never answers (one
+/// with no raft leader, say) fails the command instead of hanging it.
+const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Manager RPCs that carry no request deadline. Streams stay open as long as
+/// the caller wants (`legion exec`, `legion events follow`), and the
+/// whole-store operations take time that grows with the cluster (`legion
+/// state backup`, `legion keyring rewrap`). Commands that wait by polling
+/// (`job logs -f`, `job wait`, `--wait`) are not here: each poll is a short
+/// call that should fail fast like any other.
+const UNBOUNDED_METHODS: &[&str] = &[
+    "ExecAllocation",
+    "StreamEvents",
+    "GetStateBackup",
+    "RewrapKv",
+];
+
+/// How long the CLI waits on a manager, from `LEGION_CONNECT_TIMEOUT` and
+/// `LEGION_REQUEST_TIMEOUT`. `None` waits forever (the variable set to `0`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ClientTimeouts {
+    /// Bound on opening the TCP (and TLS) connection.
+    pub connect: Option<Duration>,
+    /// Bound on each request outside [`UNBOUNDED_METHODS`], from send to
+    /// the reply's headers (all of a unary call).
+    pub request: Option<Duration>,
+}
+
+impl ClientTimeouts {
+    pub fn from_env() -> R<Self> {
+        Self::parse(
+            std::env::var("LEGION_CONNECT_TIMEOUT").ok().as_deref(),
+            std::env::var("LEGION_REQUEST_TIMEOUT").ok().as_deref(),
+        )
+    }
+
+    fn parse(connect: Option<&str>, request: Option<&str>) -> R<Self> {
+        Ok(ClientTimeouts {
+            connect: parse_timeout("LEGION_CONNECT_TIMEOUT", connect, DEFAULT_CONNECT_TIMEOUT)?,
+            request: parse_timeout("LEGION_REQUEST_TIMEOUT", request, DEFAULT_REQUEST_TIMEOUT)?,
+        })
+    }
+}
+
+/// A timeout variable: a duration (`30s`, `2m`), bare seconds (`30`), or
+/// `0` for none. Unset or blank takes `default`.
+fn parse_timeout(var: &str, raw: Option<&str>, default: Duration) -> R<Option<Duration>> {
+    let Some(raw) = raw.map(str::trim).filter(|raw| !raw.is_empty()) else {
+        return Ok(Some(default));
+    };
+    let duration = match raw.parse::<u64>() {
+        Ok(secs) => Duration::from_secs(secs),
+        Err(_) => humantime::parse_duration(raw)
+            .with_context(|| format!("invalid {var} {raw:?}: expected a duration like 30s"))?,
+    };
+    Ok((!duration.is_zero()).then_some(duration))
 }
 
 /// Path of the CLI token file written by `legion login`.
@@ -89,7 +165,7 @@ pub fn save_cli_token(secret: &str) -> R<std::path::PathBuf> {
     Ok(path)
 }
 
-fn auth_interceptor() -> AuthInterceptor {
+fn auth_interceptor(request_timeout: Option<Duration>) -> AuthInterceptor {
     let token = load_cli_token().and_then(|token| {
         match format!("Bearer {token}").parse::<MetadataValue<Ascii>>() {
             Ok(value) => Some(value),
@@ -99,16 +175,32 @@ fn auth_interceptor() -> AuthInterceptor {
             }
         }
     });
-    AuthInterceptor { token }
+    AuthInterceptor {
+        token,
+        request_timeout,
+    }
 }
 
 #[instrument(err, skip_all)]
 pub async fn connect_manager_client() -> R<AuthedManagerClient> {
     let address = std::env::var("LEGION_ADDR").unwrap_or_else(|_| DEF_MANAGER_ADDRESS.to_owned());
+    connect_manager_client_at(&address, ClientTimeouts::from_env()?)
+}
 
-    let endpoint = Endpoint::from_shared(address.clone())
+/// A client for the manager at `address`. The connection opens on the first
+/// call, so a manager that cannot be reached fails that call with
+/// `Unavailable`, which the `--json` envelope reports like any other error.
+fn connect_manager_client_at(address: &str, timeouts: ClientTimeouts) -> R<AuthedManagerClient> {
+    let address = address.to_owned();
+    let mut endpoint = Endpoint::from_shared(address.clone())
         .with_context(|| format!("invalid manager address: {address}"))?
-        .connect_timeout(std::time::Duration::from_secs(5));
+        // Notice a manager that vanished under a long stream (`exec`,
+        // `events follow`), which has no request deadline to do it.
+        .http2_keep_alive_interval(Duration::from_secs(30))
+        .keep_alive_timeout(Duration::from_secs(10));
+    if let Some(connect) = timeouts.connect {
+        endpoint = endpoint.connect_timeout(connect);
+    }
 
     let scheme = endpoint.uri().scheme_str().map(str::to_owned);
     let host = endpoint.uri().host().map(str::to_owned);
@@ -137,12 +229,11 @@ pub async fn connect_manager_client() -> R<AuthedManagerClient> {
         endpoint
     };
 
-    let channel = endpoint
-        .connect()
-        .await
-        .with_context(|| format!("failed to connect to manager at {address}"))?;
-
-    Ok(ManagerClient::with_interceptor(channel, auth_interceptor()))
+    let channel = endpoint.connect_lazy();
+    Ok(ManagerClient::with_interceptor(
+        channel,
+        auth_interceptor(timeouts.request),
+    ))
 }
 
 /// A client for one worker's plane (port 4848), for the commands that talk
@@ -217,6 +308,7 @@ pub fn split_hint(message: &str) -> (&str, Option<&str>) {
 }
 
 pub fn friendly_status(action: &str, status: Status) -> anyhow::Error {
+    let status = crate::cmd::output::client_side_failure(&status).unwrap_or(status);
     let code_raw = status.code();
     // The stable name (`FailedPrecondition`), the same `code` the JSON
     // envelope carries — tonic's `Display` for a code is a prose sentence.
@@ -328,5 +420,174 @@ pub mod usage_display {
                 ("1830".to_string(), "0.25".to_string(), "2m41s".to_string())
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::cmd::output::CliError;
+    use crate::structs::ListJobsRequest;
+    use std::convert::Infallible;
+    use std::task::{Context, Poll};
+
+    /// A manager whose handlers never return: the shape of one whose raft
+    /// core died, where reads wait on a leader that never comes.
+    #[derive(Clone)]
+    struct NeverAnswers;
+
+    impl tonic::server::NamedService for NeverAnswers {
+        const NAME: &'static str = "legion.Manager";
+    }
+
+    impl tower::Service<http::Request<tonic::body::BoxBody>> for NeverAnswers {
+        type Response = http::Response<tonic::body::BoxBody>;
+        type Error = Infallible;
+        type Future = std::future::Pending<Result<Self::Response, Infallible>>;
+
+        fn poll_ready(&mut self, _: &mut Context<'_>) -> Poll<Result<(), Infallible>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn call(&mut self, _: http::Request<tonic::body::BoxBody>) -> Self::Future {
+            std::future::pending()
+        }
+    }
+
+    async fn serve_never_answers() -> R<String> {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let addr = listener.local_addr()?;
+        tokio::spawn(
+            tonic::transport::Server::builder()
+                .add_service(NeverAnswers)
+                .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener)),
+        );
+        Ok(format!("http://{addr}"))
+    }
+
+    fn short(request: Duration) -> ClientTimeouts {
+        ClientTimeouts {
+            connect: Some(Duration::from_secs(2)),
+            request: Some(request),
+        }
+    }
+
+    /// Spot-check P2: `legion job list` against a leaderless cluster hung
+    /// forever. It must fail at the request deadline with a retryable
+    /// `DeadlineExceeded` in the envelope.
+    #[tokio::test]
+    async fn a_manager_that_never_answers_is_a_retryable_deadline_test() -> R<()> {
+        let address = serve_never_answers().await?;
+        let mut client = connect_manager_client_at(&address, short(Duration::from_millis(300)))?;
+        let status = tokio::time::timeout(
+            Duration::from_secs(10),
+            client.list_jobs(ListJobsRequest::default()),
+        )
+        .await
+        .expect("the request deadline never fired")
+        .expect_err("a handler that never returns cannot succeed");
+
+        let err = CliError::from_status("failed to list jobs", &status);
+        assert_eq!(err.code, "DeadlineExceeded", "{err:?}");
+        assert!(err.retryable);
+        assert!(err.message.contains("LEGION_REQUEST_TIMEOUT"), "{err:?}");
+        assert!(
+            err.hint
+                .as_deref()
+                .is_some_and(|hint| hint.contains("raft")),
+            "{err:?}"
+        );
+
+        let human = friendly_status("failed to list jobs", status).to_string();
+        assert!(human.contains("[code=DeadlineExceeded]"), "{human}");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn an_unreachable_manager_is_a_retryable_unavailable_test() -> R<()> {
+        // Bind, then drop, to get a port nothing listens on.
+        let port = std::net::TcpListener::bind("127.0.0.1:0")?
+            .local_addr()?
+            .port();
+        let mut client = connect_manager_client_at(
+            &format!("http://127.0.0.1:{port}"),
+            short(Duration::from_secs(5)),
+        )?;
+        let status = client
+            .list_jobs(ListJobsRequest::default())
+            .await
+            .expect_err("nothing listens there");
+        let err = CliError::from_status("failed to list jobs", &status);
+        assert_eq!(err.code, "Unavailable", "{err:?}");
+        assert!(err.retryable);
+        assert!(
+            err.message.contains("cannot connect to the manager"),
+            "{err:?}"
+        );
+        assert!(
+            err.hint
+                .as_deref()
+                .is_some_and(|hint| hint.contains("LEGION_ADDR")),
+            "{err:?}"
+        );
+        Ok(())
+    }
+
+    fn intercept(method: &'static str, timeout: Option<Duration>) -> tonic::Request<()> {
+        let mut request = tonic::Request::new(());
+        request
+            .extensions_mut()
+            .insert(tonic::GrpcMethod::new("legion.Manager", method));
+        let mut interceptor = AuthInterceptor {
+            token: None,
+            request_timeout: timeout,
+        };
+        interceptor
+            .call(request)
+            .expect("the interceptor never refuses")
+    }
+
+    #[test]
+    fn streams_and_whole_store_calls_carry_no_deadline_test() {
+        let timeout = Some(Duration::from_secs(30));
+        assert!(intercept("ListJobs", timeout)
+            .metadata()
+            .get("grpc-timeout")
+            .is_some());
+        for method in UNBOUNDED_METHODS {
+            assert!(
+                intercept(method, timeout)
+                    .metadata()
+                    .get("grpc-timeout")
+                    .is_none(),
+                "{method} must not carry a deadline"
+            );
+        }
+        assert!(intercept("ListJobs", None)
+            .metadata()
+            .get("grpc-timeout")
+            .is_none());
+    }
+
+    #[test]
+    fn timeout_variables_parse_test() -> R<()> {
+        let defaults = ClientTimeouts::parse(None, Some("  "))?;
+        assert_eq!(defaults.connect, Some(DEFAULT_CONNECT_TIMEOUT));
+        assert_eq!(defaults.request, Some(DEFAULT_REQUEST_TIMEOUT));
+
+        let set = ClientTimeouts::parse(Some("2s"), Some("90"))?;
+        assert_eq!(set.connect, Some(Duration::from_secs(2)));
+        assert_eq!(set.request, Some(Duration::from_secs(90)));
+
+        let off = ClientTimeouts::parse(Some("0"), Some("0s"))?;
+        assert_eq!(off.connect, None);
+        assert_eq!(off.request, None);
+
+        let err = ClientTimeouts::parse(None, Some("soon")).expect_err("not a duration");
+        assert!(
+            format!("{err:#}").contains("LEGION_REQUEST_TIMEOUT"),
+            "{err:#}"
+        );
+        Ok(())
     }
 }

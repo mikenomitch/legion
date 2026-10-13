@@ -1,6 +1,6 @@
 //! OCI image layout → OCI runtime bundle conversion.
 //!
-//! Low-level OCI runtimes (youki, runc, crun) do not pull or run images by
+//! Low-level OCI runtimes (runc, crun) do not pull or run images by
 //! reference; they run a *bundle*: an extracted root filesystem plus a
 //! `config.json` runtime spec. This module turns the on-disk OCI **image**
 //! layout produced by the `oci://` artifact fetcher into that bundle so the

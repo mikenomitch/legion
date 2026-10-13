@@ -496,9 +496,17 @@ pub fn route_source_ip(manager_addr: &str) -> R<std::net::IpAddr> {
 /// the manager refuses or is unreachable.
 pub const ISSUE_RETRY: Duration = Duration::from_secs(2);
 
-/// How this process's workers verify the managers they dial, per manager
-/// address (worker-plane-auth plan §6.8). One process can hold several:
-/// tests run workers for several clusters side by side.
+/// How this process's workers verify the managers they dial, keyed by
+/// manager address (worker-plane-auth plan §6.8).
+///
+/// Trust is cluster-scoped: every address of one cluster maps to the SAME
+/// verifier, because the managers share the cluster CA. The join token's
+/// manager is recorded first ([`trust_manager`]). Every other manager of
+/// that cluster joins it through [`trust_cluster_managers`] as the worker
+/// learns it, so moving the token's pin to the bundle
+/// ([`trust_manager_bundle`]) moves the whole cluster at once. Keying by
+/// address (rather than one process-wide trust) is what lets one process
+/// hold several clusters: tests run workers for several side by side.
 fn manager_trusts(
 ) -> &'static Mutex<std::collections::HashMap<String, Arc<crate::cluster_tls::PinnedManagerVerifier>>>
 {
@@ -528,7 +536,43 @@ pub fn trust_manager(
         .clone())
 }
 
-/// The verifier for `manager_addr`, when this process has joined it.
+/// Extends the trust recorded for `trusted_addr` (the join token's manager)
+/// to every manager address in `addrs`. A worker that fails over to another
+/// manager of the same cluster can then reach it from every call site that
+/// dials by address: artifact credentials, node identity tokens, the JWKS.
+///
+/// Only call this with addresses the cluster itself vouched for: the set a
+/// manager reported over a connection verified against this same trust
+/// (`HeartbeatReply.manager_addresses`), or the set a previous worker process
+/// persisted from those replies. Either way the address only says where to
+/// dial. The manager there must still present a certificate for
+/// `manager.legion` chained to the cluster CA the token pinned, so adding an
+/// address never widens what is trusted.
+///
+/// A no-op when `trusted_addr` has no recorded trust. An address already
+/// trusted (for this cluster or another one in the same process) keeps its
+/// verifier: one cluster's report never re-points another's address.
+pub fn trust_cluster_managers(trusted_addr: &str, addrs: &[String]) {
+    let Some(verifier) = manager_verifier(trusted_addr) else {
+        return;
+    };
+    let mut trusts = manager_trusts().lock().unwrap_or_else(|p| p.into_inner());
+    for addr in addrs {
+        let Ok(key) = crate::cluster_tls::host_port(addr) else {
+            continue;
+        };
+        let existing = trusts.entry(key).or_insert_with(|| verifier.clone());
+        if !Arc::ptr_eq(existing, &verifier) {
+            debug!(
+                manager = %addr,
+                "Manager address is already trusted for another cluster; keeping that trust"
+            );
+        }
+    }
+}
+
+/// The verifier for `manager_addr`, when this process has joined its
+/// cluster: the token's manager, or one [`trust_cluster_managers`] added.
 pub fn manager_verifier(
     manager_addr: &str,
 ) -> Option<Arc<crate::cluster_tls::PinnedManagerVerifier>> {
@@ -543,8 +587,10 @@ pub fn manager_verifier(
 /// A connected gRPC channel to a manager this process has joined: TLS to
 /// `manager_addr`'s host and port, naming `manager.legion`, verified against
 /// the join token's CA pin (or the bundle once the worker holds one). The
-/// address's scheme is ignored. There is no plaintext path: a process that
-/// has not recorded a pin for this manager cannot reach it.
+/// address's scheme is ignored. Any manager of a cluster this process joined
+/// works, not just the token's ([`trust_cluster_managers`]). There is no
+/// plaintext path: a process that has not recorded a pin for this manager's
+/// cluster cannot reach it.
 pub async fn manager_channel(manager_addr: &str) -> R<tonic::transport::Channel> {
     let verifier = manager_verifier(manager_addr).ok_or_else(|| {
         anyhow!(
@@ -562,7 +608,8 @@ pub async fn manager_channel(manager_addr: &str) -> R<tonic::transport::Channel>
 }
 
 /// Moves `manager_addr`'s verifier from the join token's pin to the cluster
-/// CA bundle this worker now holds, which follows CA rotations.
+/// CA bundle this worker now holds, which follows CA rotations. Every manager
+/// of the cluster shares the verifier, so they all move together.
 pub fn trust_manager_bundle(manager_addr: &str, roots: Arc<SwappableRoots>) {
     if let Some(verifier) = manager_verifier(manager_addr) {
         verifier.set_trust(crate::cluster_tls::ManagerTrust::Bundle(roots));
@@ -617,6 +664,78 @@ mod plane_test {
             advertise_address("http://127.0.0.1:4747", 4848, None)?,
             "https://127.0.0.1:4848"
         );
+        Ok(())
+    }
+
+    // The trust registry is process-global and tests run in parallel, so
+    // each trust test uses addresses no other test touches (TEST-NET ranges).
+
+    /// After a failover the worker talks to a manager its token never named.
+    /// The pin recorded for the token's manager covers it once the cluster
+    /// reports it, and moving to the bundle moves every manager at once.
+    #[test]
+    fn a_verifier_recorded_for_one_manager_covers_the_clusters_others_test() -> R<()> {
+        let (ca_pem, _) = crate::manager::mesh_ca::generate_ca()?;
+        let pin = crate::cluster_tls::ca_pin_pem(&ca_pem)?;
+        let seed = "http://192.0.2.11:4747";
+        let other = "http://192.0.2.12:4747";
+        let recorded = trust_manager(seed, &pin)?;
+        assert!(manager_verifier(other).is_none());
+
+        trust_cluster_managers(seed, &[other.to_string(), "192.0.2.13:4747".to_string()]);
+        let learned = manager_verifier(other).expect("the cluster's manager is trusted");
+        assert!(Arc::ptr_eq(&recorded, &learned), "one verifier per cluster");
+        // The scheme is ignored: host and port are the key.
+        assert!(manager_verifier("https://192.0.2.13:4747").is_some());
+
+        // The bundle replaces the pin for every manager of the cluster, no
+        // matter which address it arrived through.
+        trust_manager_bundle(other, SwappableRoots::from_pem(&ca_pem)?);
+        assert!(matches!(
+            recorded.trust(),
+            crate::cluster_tls::ManagerTrust::Bundle(_)
+        ));
+        Ok(())
+    }
+
+    /// A process that joined no cluster trusts no manager, and a cluster
+    /// report cannot conjure trust from nothing.
+    #[tokio::test]
+    async fn an_unrelated_address_is_never_trusted_test() -> R<()> {
+        let stranger = "http://198.51.100.21:4747";
+        assert!(manager_verifier(stranger).is_none());
+        let err = manager_channel(stranger)
+            .await
+            .expect_err("no pin, no channel");
+        assert!(format!("{err:#}").contains("no cluster CA pin"), "{err:#}");
+
+        // Extending from an address with no recorded trust is a no-op.
+        trust_cluster_managers("http://198.51.100.22:4747", &[stranger.to_string()]);
+        assert!(manager_verifier(stranger).is_none());
+        Ok(())
+    }
+
+    /// One cluster's report never re-points an address another cluster in
+    /// the same process already trusts.
+    #[test]
+    fn a_cluster_report_keeps_another_clusters_trust_test() -> R<()> {
+        let (ca_a, _) = crate::manager::mesh_ca::generate_ca()?;
+        let (ca_b, _) = crate::manager::mesh_ca::generate_ca()?;
+        let a = trust_manager(
+            "http://203.0.113.31:4747",
+            &crate::cluster_tls::ca_pin_pem(&ca_a)?,
+        )?;
+        let b = trust_manager(
+            "http://203.0.113.32:4747",
+            &crate::cluster_tls::ca_pin_pem(&ca_b)?,
+        )?;
+        trust_cluster_managers(
+            "http://203.0.113.31:4747",
+            &["http://203.0.113.32:4747".to_string()],
+        );
+        let kept = manager_verifier("http://203.0.113.32:4747").expect("still trusted");
+        assert!(Arc::ptr_eq(&kept, &b));
+        assert!(!Arc::ptr_eq(&kept, &a));
         Ok(())
     }
 

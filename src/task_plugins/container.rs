@@ -1,9 +1,9 @@
 use crate::prelude::*;
 use crate::structs::{Allocation, TaskConfig};
 use crate::task_plugins::{
-    configure_task_log_capture, derived_schema, oci_bundle, oci_image, reap_task_process,
-    spawn_pipe, spawn_pty, spawn_task_process, ExecOptions, ExecSession, ExecSupport, TaskInstance,
-    TaskPlugin,
+    apple_container, configure_task_log_capture, derived_schema, oci_bundle, oci_image,
+    reap_task_process, spawn_pipe, spawn_pty, spawn_task_process, ExecOptions, ExecSession,
+    ExecSupport, TaskInstance, TaskPlugin,
 };
 use schemars::JsonSchema;
 use serde::Deserialize;
@@ -248,14 +248,115 @@ pub(crate) fn container_security(config: &Value) -> ContainerSecurity {
         .unwrap_or_default()
 }
 
-/// Env override selecting the Linux OCI runtime binary. Defaults to `youki`;
-/// any OCI-spec runtime (e.g. `runc`, `crun`) works since they share the
-/// bundle interface.
-const OCI_RUNTIME_ENV: &str = "LEGION_OCI_RUNTIME";
-const DEFAULT_OCI_RUNTIME: &str = "youki";
+/// Env override selecting the Linux OCI runtime binary, shared with the
+/// sandbox runtime's dev mode. It must name runc or crun (see
+/// [`SUPPORTED_OCI_RUNTIMES`]).
+pub(crate) const OCI_RUNTIME_ENV: &str = "LEGION_OCI_RUNTIME";
+/// `runc`, the reference runtime. The default privilege floor
+/// (`security.userNamespace`) needs idmapped mounts, which runc has from 1.2
+/// (see [`idmapped_mount_gap`]).
+pub(crate) const DEFAULT_OCI_RUNTIME: &str = "runc";
+/// The OCI runtimes Legion runs containers with, by the name their
+/// `--version` banner opens with. Both take the bundle Legion builds, share
+/// runc's CLI (`run`, `exec`, `kill`, `delete`, `state`), and apply idmapped
+/// mounts.
+const SUPPORTED_OCI_RUNTIMES: [&str; 2] = ["runc", "crun"];
+/// The first runc release that applies OCI mount `uidMappings`. Older ones
+/// ignore the field and bind the task directory un-mapped, where container
+/// root cannot use it.
+const RUNC_IDMAPPED_MOUNTS_SINCE: (u32, u32) = (1, 2);
+
+/// The runtime a `--version` banner names: its first word (`runc version
+/// 1.2.0` → `runc`). Identifying by banner rather than file name keeps a
+/// renamed or wrapped runc (`/usr/bin/runc.amd64`) recognizable.
+fn oci_runtime_banner_name(version_output: &str) -> &str {
+    version_output.split_whitespace().next().unwrap_or("")
+}
+
+/// Why this binary is not an OCI runtime Legion runs, or `None` when its
+/// `--version` banner (`version_output`) names runc or crun.
+///
+/// Anything else is refused rather than tried. Every other runtime Legion has
+/// met differs somewhere that breaks a task late and confusingly: youki
+/// rejects idmapped mounts, which the default `security.userNamespace = true`
+/// needs, and parses `exec` arguments differently. A refusal at preflight
+/// names the fix before any image work, and keeps the node from advertising
+/// `container: pass`.
+fn unsupported_oci_runtime(binary: &str, version_output: &str) -> Option<String> {
+    let name = oci_runtime_banner_name(version_output);
+    if SUPPORTED_OCI_RUNTIMES.contains(&name) {
+        return None;
+    }
+    let reported = match version_output.lines().next().map(str::trim) {
+        Some(line) if !line.is_empty() => format!("its `--version` reports `{line}`"),
+        _ => "its `--version` printed nothing".to_string(),
+    };
+    Some(format!(
+        "OCI runtime `{binary}` is not runc or crun ({reported}); Legion runs containers with \
+         runc {}.{} or newer (the default) or crun. Install one, and point {OCI_RUNTIME_ENV} at \
+         it or unset {OCI_RUNTIME_ENV} to use runc from PATH",
+        RUNC_IDMAPPED_MOUNTS_SINCE.0, RUNC_IDMAPPED_MOUNTS_SINCE.1
+    ))
+}
+
+/// Confirms `binary` is an installed runc or crun, with an error the operator
+/// can act on. Shared by the container runtime's preflight and the sandbox
+/// runtime's Linux dev mode, which run the same bundles. Returns what
+/// `--version` printed.
+pub(crate) fn probe_oci_runtime(binary: &str) -> R<String> {
+    let output = match crate::util::output_with_timeout(
+        Command::new(binary).arg("--version"),
+        crate::util::RUNTIME_CLI_TIMEOUT,
+    ) {
+        Err(err) if is_not_found(&err) => bail!(
+            "OCI runtime `{binary}` is not installed on this node \
+             (install runc 1.2+ or crun, or set {OCI_RUNTIME_ENV} to one that is)"
+        ),
+        Err(err) => bail!("failed to probe OCI runtime `{binary}`: {err}"),
+        // Only the banner matters: a runtime that prints it is present, even
+        // if it reports a non-zero status for unrelated reasons.
+        Ok(output) => String::from_utf8_lossy(&output.stdout).into_owned(),
+    };
+    if let Some(refusal) = unsupported_oci_runtime(binary, &output) {
+        bail!(refusal);
+    }
+    Ok(output)
+}
+
+/// Why this runc or crun cannot run a user-namespaced container, or `None`
+/// when it can (or Legion cannot tell). `version_output` is what
+/// `<binary> --version` printed.
+///
+/// runc before 1.2 ignores mount `uidMappings`, so every start under the
+/// default `security.userNamespace = true` would get a task directory
+/// container root cannot open. crun is let through without a version check,
+/// as is a runc banner Legion cannot parse: the runtime's own error is the
+/// best evidence then.
+fn idmapped_mount_gap(binary: &str, version_output: &str) -> Option<String> {
+    if oci_runtime_banner_name(version_output) != "runc" {
+        return None;
+    }
+    let version = version_output
+        .lines()
+        .next()
+        .and_then(|line| line.split_whitespace().nth(2))?;
+    let mut parts = version.split(['.', '-', '+']);
+    let major: u32 = parts.next()?.parse().ok()?;
+    let minor: u32 = parts.next()?.parse().ok()?;
+    if (major, minor) >= RUNC_IDMAPPED_MOUNTS_SINCE {
+        return None;
+    }
+    Some(format!(
+        "OCI runtime `{binary}` is runc {version}, which predates idmapped mounts; \
+         security.userNamespace (on by default) needs them for the task directory and volumes. \
+         Install runc {}.{} or newer (the default) or crun, and point {OCI_RUNTIME_ENV} at it, \
+         or set security.userNamespace = false on the task",
+        RUNC_IDMAPPED_MOUNTS_SINCE.0, RUNC_IDMAPPED_MOUNTS_SINCE.1
+    ))
+}
 
 /// Apple's container CLI (macOS). Installed via `brew install container`.
-const APPLE_CONTAINER_BIN: &str = "container";
+const APPLE_CONTAINER_BIN: &str = apple_container::BIN;
 
 /// The container runtime for this node, chosen by OS.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -263,14 +364,14 @@ enum ContainerRuntime {
     /// macOS: Apple's `container` toolchain — a high-level runtime that pulls
     /// and runs images by reference (docker-compatible surface).
     AppleContainer,
-    /// Linux: a low-level OCI runtime (youki by default) run against a bundle
+    /// Linux: a low-level OCI runtime (runc by default) run against a bundle
     /// Legion builds from the image's OCI layout. The runtime itself neither
     /// pulls nor understands image references.
     Oci { binary: String },
 }
 
 impl ContainerRuntime {
-    /// macOS uses Apple `container`; Linux uses an OCI runtime (youki, or
+    /// macOS uses Apple `container`; Linux uses an OCI runtime (runc, or
     /// `LEGION_OCI_RUNTIME`). Other operating systems are unsupported.
     fn detect() -> R<Self> {
         if cfg!(target_os = "macos") {
@@ -288,7 +389,7 @@ impl ContainerRuntime {
     }
 
     /// Whether this runtime can exec into a running container. Both dialects
-    /// do: Apple's `container exec`, and `<runtime> exec` on youki/runc/crun.
+    /// do: Apple's `container exec`, and `<runtime> exec` on runc/crun.
     /// Reported from runtime detection alone — no probe of the binary (an
     /// exotic OCI runtime without `exec` fails at session open with its own
     /// error; see the plan's Q1).
@@ -306,11 +407,14 @@ impl ContainerRuntime {
             Self::AppleContainer => {
                 // One call covers both: a missing CLI errors as NotFound, and a
                 // stopped daemon exits non-zero.
-                let status = Command::new(APPLE_CONTAINER_BIN)
-                    .args(["system", "status"])
-                    .output();
+                // A hung service surfaces as the timeout error, naming the
+                // command, instead of stalling the start.
+                let status = crate::util::output_with_timeout(
+                    Command::new(APPLE_CONTAINER_BIN).args(["system", "status"]),
+                    crate::util::RUNTIME_CLI_TIMEOUT,
+                );
                 match status {
-                    Err(err) if err.kind() == std::io::ErrorKind::NotFound => bail!(
+                    Err(err) if is_not_found(&err) => bail!(
                         "the Apple `container` runtime is not installed on this node \
                          (install it with `brew install container`)"
                     ),
@@ -323,19 +427,35 @@ impl ContainerRuntime {
                     Ok(_) => Ok(()),
                 }
             }
-            Self::Oci { binary } => match Command::new(binary).arg("--version").output() {
-                Err(err) if err.kind() == std::io::ErrorKind::NotFound => bail!(
-                    "OCI runtime `{binary}` is not installed on this node \
-                     (install youki/runc/crun, or set {OCI_RUNTIME_ENV} to one that is)"
-                ),
-                Err(err) => bail!("failed to probe OCI runtime `{binary}`: {err}"),
-                // A runtime that answers `--version` at all is present; some
-                // report a non-zero status for unrelated reasons, which is not
-                // worth failing the allocation over.
-                Ok(_) => Ok(()),
-            },
+            // runc or crun, installed: anything else is refused here
+            // ([`unsupported_oci_runtime`]).
+            Self::Oci { binary } => probe_oci_runtime(binary).map(|_| ()),
         }
     }
+
+    /// Fails a user-namespaced start, before any image work, on a runtime
+    /// that cannot apply idmapped mounts (see [`idmapped_mount_gap`]). A
+    /// no-op for Apple `container`, which ignores `security`.
+    fn check_idmapped_mounts(&self) -> R<()> {
+        let Self::Oci { binary } = self else {
+            return Ok(());
+        };
+        let version = Command::new(binary)
+            .arg("--version")
+            .output()
+            .map(|output| String::from_utf8_lossy(&output.stdout).into_owned())
+            .unwrap_or_default();
+        match idmapped_mount_gap(binary, &version) {
+            Some(gap) => bail!(gap),
+            None => Ok(()),
+        }
+    }
+}
+
+/// Whether a runtime CLI call failed because the binary is not installed.
+fn is_not_found(err: &anyhow::Error) -> bool {
+    err.downcast_ref::<std::io::Error>()
+        .is_some_and(|err| err.kind() == std::io::ErrorKind::NotFound)
 }
 
 /// Fails a macOS start whose VM would be under Apple `container`'s floor,
@@ -373,9 +493,21 @@ fn check_node_capabilities(
     oci_bundle::check_capabilities_allowed(task, &config.capabilities()?, allowlist)
 }
 
-/// Deterministic per-allocation container name / OCI container id.
-fn container_name(allocation: &Allocation) -> String {
-    format!("legion-{}", allocation.id)
+/// Deterministic per-allocation container name / OCI container id. Every
+/// call that addresses the container by name (launch, stale cleanup, signal,
+/// exec, stop) goes through this, so they cannot disagree.
+///
+/// On macOS the name carries the node, `legion-<node>-<alloc>`: Apple
+/// container names are global to the Mac, and two local clusters (or one
+/// reset with `rm -rf .legion`) both number allocations from 1. A bare
+/// `legion-<alloc>` let one cluster's launch replace the other's running
+/// container. Linux keeps `legion-<alloc>`, which is also the cgroup leaf
+/// name (`src/worker/resources.rs`) and the guest hostname.
+fn container_name(oci_runtime: &ContainerRuntime, allocation: &Allocation) -> String {
+    match oci_runtime {
+        ContainerRuntime::AppleContainer => apple_container::node_scoped_name("legion", allocation),
+        ContainerRuntime::Oci { .. } => format!("legion-{}", allocation.id),
+    }
 }
 
 /// Where the allocation's host task directory is mounted inside the
@@ -513,12 +645,14 @@ fn build_apple_launch(
         "run".to_string(),
         "--rm".to_string(),
         "--name".to_string(),
-        container_name(allocation),
+        container_name(&ContainerRuntime::AppleContainer, allocation),
         // The task's stdout/stderr are captured as its logs; Apple's image
         // fetch progress would otherwise be interleaved into stderr.log.
         "--progress".to_string(),
         "none".to_string(),
     ];
+    // What stale-container cleanup checks before it removes anything.
+    args.extend(apple_container::ownership_labels(allocation));
 
     // Declared resources become the guest VM's size. Apple `container` boots a
     // VM per container, so an unsized guest gets the runtime default (1 GiB /
@@ -590,8 +724,8 @@ fn build_apple_launch(
 /// Builds the argv that delivers `signal` to the container's init process.
 ///
 /// ```text
-/// Apple:                 container kill --signal SIGHUP legion-<alloc>
-/// OCI (youki/runc/crun): <runtime> kill legion-<alloc> SIGHUP
+/// Apple:                 container kill --signal SIGHUP legion-<node>-<alloc>
+/// OCI (runc/crun):       <runtime> kill legion-<alloc> SIGHUP
 /// ```
 ///
 /// The signal *name* is passed through rather than a number, so each runtime
@@ -604,7 +738,7 @@ fn build_signal_command(
     signal: &str,
 ) -> R<Vec<String>> {
     let signal = crate::signals::canonical_signal_name(signal)?;
-    let name = container_name(allocation);
+    let name = container_name(oci_runtime, allocation);
     Ok(match oci_runtime {
         ContainerRuntime::AppleContainer => vec![
             APPLE_CONTAINER_BIN.to_string(),
@@ -619,17 +753,28 @@ fn build_signal_command(
     })
 }
 
-/// Best-effort removal of a container left behind under this allocation's
-/// name. `run --name` fails outright when the name is taken, which happens
-/// whenever a previous start was not torn down cleanly (worker crash, or a
-/// `--rm` run killed before the runtime could reap it). Errors are ignored:
-/// "no such container" is the normal case.
-fn remove_stale_container(oci_runtime: &ContainerRuntime, name: &str) {
-    let (program, args): (&str, Vec<&str>) = match oci_runtime {
-        ContainerRuntime::AppleContainer => (APPLE_CONTAINER_BIN, vec!["rm", "--force", name]),
-        ContainerRuntime::Oci { binary } => (binary.as_str(), vec!["delete", "--force", name]),
-    };
-    let _ = Command::new(program).args(&args).output();
+/// Removes a container left behind under this allocation's name. `run
+/// --name` fails outright when the name is taken, which happens whenever a
+/// previous start was not torn down cleanly (worker crash, or a `--rm` run
+/// killed before the runtime could reap it).
+///
+/// On macOS only a container labeled as this node's is removed (see
+/// [`apple_container::remove_stale`]). An OCI runtime has no labels, so it
+/// deletes by name as before, ignoring "no such container". Either way a
+/// hung CLI fails the start with an error naming the command instead of
+/// blocking it.
+fn remove_stale_container(oci_runtime: &ContainerRuntime, allocation: &Allocation) -> R<()> {
+    let name = container_name(oci_runtime, allocation);
+    match oci_runtime {
+        ContainerRuntime::AppleContainer => apple_container::remove_stale(&name, allocation),
+        ContainerRuntime::Oci { binary } => {
+            crate::util::output_with_timeout(
+                Command::new(binary).args(["delete", "--force", &name]),
+                crate::util::RUNTIME_CLI_TIMEOUT,
+            )?;
+            Ok(())
+        }
+    }
 }
 
 /// Builds the argv that execs `command` inside the allocation's container.
@@ -637,18 +782,19 @@ fn remove_stale_container(oci_runtime: &ContainerRuntime, name: &str) {
 /// The two dialects differ deliberately:
 ///
 /// ```text
-/// Apple:                container exec [--tty --interactive] legion-<alloc> CMD…
-/// OCI (youki/runc/crun): <runtime> exec [--tty] [--env K=V]… legion-<alloc> -- CMD…
+/// Apple:           container exec [--tty --interactive] legion-<node>-<alloc> CMD…
+/// OCI (runc/crun): <runtime> exec [--tty] [--env K=V]… legion-<alloc> CMD…
 /// ```
 ///
 /// - **`--interactive` is Apple-only.** The OCI runtimes have no such flag;
 ///   stdin wiring is implicit when `exec` runs in the foreground, which is
 ///   how Legion runs it (under the PTY `spawn_pty` allocates, or with piped
 ///   stdio from `spawn_pipe`).
-/// - **`--` before the command on the OCI path**, so a remote argv beginning
-///   with `-` cannot be eaten by the runtime's flag parser. Asymmetric on
-///   purpose: Apple's parser reads `--` as the target executable — the same
-///   quirk [`build_apple_launch`] documents.
+/// - **No `--` before the command.** runc (and crun, which copies runc's
+///   CLI) stops parsing flags at the container id, so a command beginning
+///   with `-` is already safe, and a `--` would itself become the executable
+///   (`exec: "--": executable file not found in $PATH`). Apple's parser has
+///   the same quirk ([`build_apple_launch`] documents it).
 /// - **Caller env** (`ExecOptions.env`, e.g. the operator's `TERM`) becomes
 ///   repeated `--env K=V` flags on the OCI path; setting it on the runtime
 ///   CLI's own process would not reach the container. The Apple path ignores
@@ -659,12 +805,12 @@ fn remove_stale_container(oci_runtime: &ContainerRuntime, name: &str) {
 /// user — replacing only argv, and exits with the process's own status.
 fn build_exec_command(
     oci_runtime: &ContainerRuntime,
-    allocation_id: i64,
+    allocation: &Allocation,
     tty: bool,
     command: &[String],
     env: &std::collections::BTreeMap<String, String>,
 ) -> Vec<String> {
-    let name = format!("legion-{allocation_id}");
+    let name = container_name(oci_runtime, allocation);
     match oci_runtime {
         ContainerRuntime::AppleContainer => {
             let mut argv = vec![APPLE_CONTAINER_BIN.to_string(), "exec".to_string()];
@@ -687,7 +833,6 @@ fn build_exec_command(
                 argv.push(format!("{key}={value}"));
             }
             argv.push(name);
-            argv.push("--".to_string());
             argv.extend(command.iter().cloned());
             argv
         }
@@ -877,14 +1022,15 @@ impl TaskPlugin for ContainerTaskPlugin {
         let oci_runtime = ContainerRuntime::detect()?;
         let argv = build_signal_command(&oci_runtime, allocation, signal)?;
         let (program, args) = argv.split_first().expect("signal argv is never empty");
-        let output = Command::new(program)
-            .args(args)
-            .output()
-            .with_context(|| format!("failed to run `{program}` to signal the container"))?;
+        let output = crate::util::output_with_timeout(
+            Command::new(program).args(args),
+            crate::util::RUNTIME_CLI_TIMEOUT,
+        )
+        .context("failed to signal the container")?;
         if !output.status.success() {
             bail!(
                 "{program} could not deliver {signal} to container {}: {}",
-                container_name(allocation),
+                container_name(&oci_runtime, allocation),
                 String::from_utf8_lossy(&output.stderr).trim()
             );
         }
@@ -924,13 +1070,8 @@ impl TaskPlugin for ContainerTaskPlugin {
         // Delegate to the runtime's `exec` subcommand against the running
         // container. The command runs inside the container's namespaces, so
         // it is genuinely sandboxed exec (unlike the exec runtime).
-        opts.command = build_exec_command(
-            &oci_runtime,
-            allocation.id,
-            opts.tty,
-            &opts.command,
-            &opts.env,
-        );
+        opts.command =
+            build_exec_command(&oci_runtime, allocation, opts.tty, &opts.command, &opts.env);
 
         info!(
             allocation_id = allocation.id,
@@ -1018,6 +1159,9 @@ impl TaskPlugin for ContainerTaskPlugin {
             &oci_bundle::CapabilityAllowlist::from_env(),
         )?;
         oci_runtime.preflight()?;
+        if config.security.user_namespace {
+            oci_runtime.check_idmapped_mounts()?;
+        }
         if oci_runtime == ContainerRuntime::AppleContainer && config.adjusts_linux_process() {
             info!(
                 allocation_id = allocation.id,
@@ -1054,7 +1198,7 @@ impl TaskPlugin for ContainerTaskPlugin {
 
         // A container still holding this allocation's name would make `run`
         // fail; restarts and worker crashes both leave one behind.
-        remove_stale_container(&oci_runtime, &container_name(allocation));
+        remove_stale_container(&oci_runtime, allocation)?;
 
         // The uid/gid the Linux container runs as, to hand it its logs.
         let mut log_owner: Option<(u32, u32)> = None;
@@ -1112,7 +1256,12 @@ impl TaskPlugin for ContainerTaskPlugin {
                         .alloc_dir
                         .clone()
                         .unwrap_or_else(|| scratch.clone());
-                    Some(crate::task_plugins::userns::claim(&alloc_dir)?)
+                    let range = crate::task_plugins::userns::claim(&alloc_dir)?;
+                    // The runtime resolves the bundle's rootfs as container
+                    // root, which must be able to enter the (otherwise
+                    // owner-only) allocation directory to reach it.
+                    crate::task_plugins::userns::grant_traversal(&alloc_dir, range)?;
+                    Some(range)
                 } else {
                     None
                 };
@@ -1128,7 +1277,7 @@ impl TaskPlugin for ContainerTaskPlugin {
                     &config.command,
                     &merged_env,
                     &oci_bundle::BundleContext {
-                        hostname: &container_name(allocation),
+                        hostname: &container_name(&oci_runtime, allocation),
                         volumes: &instance.volumes,
                         task_dir: instance.task_dir.as_deref(),
                         assignment: instance.resource_assignment.as_ref(),
@@ -1139,6 +1288,9 @@ impl TaskPlugin for ContainerTaskPlugin {
                         policy: &policy,
                     },
                 )?;
+                if let Some(range) = id_map {
+                    crate::task_plugins::userns::check_traversable(&bundle.join("rootfs"), range)?;
+                }
                 log_owner = Some((built.uid, built.gid));
                 // Recorded now, while the layout is still on disk: teardown
                 // needs it (`destroy` removes the scratch tree) and it is the
@@ -1163,7 +1315,7 @@ impl TaskPlugin for ContainerTaskPlugin {
                 cmd.arg("run")
                     .arg("--bundle")
                     .arg(&bundle)
-                    .arg(container_name(allocation));
+                    .arg(container_name(&oci_runtime, allocation));
                 cmd
             }
         };
@@ -1200,14 +1352,14 @@ impl TaskPlugin for ContainerTaskPlugin {
         let Ok(oci_runtime) = ContainerRuntime::detect() else {
             return Ok(false);
         };
-        let name = container_name(allocation);
+        let name = container_name(&oci_runtime, allocation);
         // `ctx.signal` is the worker's resolved ladder, which cannot know
         // about the image: when the jobspec declared no `stop` block, docker's
         // chain says the image's own STOPSIGNAL wins before SIGTERM.
         let signal = container_stop_signal(task, instance);
         let grace_secs = ctx.grace.as_secs().max(1).to_string();
         let (program, args): (&str, Vec<String>) = match &oci_runtime {
-            // `runc`/`youki`-style `kill` signals the container init and
+            // `runc`/`crun` `kill` signals the container init and
             // returns immediately, which is exactly the contract here — the
             // worker's reaper owns the deadline.
             ContainerRuntime::Oci { binary } => (
@@ -1280,14 +1432,20 @@ impl TaskPlugin for ContainerTaskPlugin {
         // explicitly by name first. Best-effort: an already-exited `--rm` /
         // deleted container is gone, which is success.
         if let Ok(oci_runtime) = ContainerRuntime::detect() {
-            let name = container_name(allocation);
-            let (program, args): (&str, Vec<&str>) = match &oci_runtime {
+            let name = container_name(&oci_runtime, allocation);
+            let (program, args, timeout): (&str, Vec<&str>, _) = match &oci_runtime {
                 // `stop` signals the container's init and waits, so the
                 // workload gets a chance to shut down; `--rm` then reaps it.
-                ContainerRuntime::AppleContainer => (APPLE_CONTAINER_BIN, vec!["stop", &name]),
-                ContainerRuntime::Oci { binary } => {
-                    (binary.as_str(), vec!["delete", "--force", &name])
-                }
+                ContainerRuntime::AppleContainer => (
+                    APPLE_CONTAINER_BIN,
+                    vec!["stop", &name],
+                    apple_container::STOP_TIMEOUT,
+                ),
+                ContainerRuntime::Oci { binary } => (
+                    binary.as_str(),
+                    vec!["delete", "--force", &name],
+                    crate::util::RUNTIME_CLI_TIMEOUT,
+                ),
             };
             info!(
                 allocation_id = allocation.id,
@@ -1295,7 +1453,19 @@ impl TaskPlugin for ContainerTaskPlugin {
                 oci_runtime = program,
                 "Tearing down container by name"
             );
-            let _ = Command::new(program).args(&args).output();
+            // Bounded: `stop` runs under the worker's task-manager lock
+            // (destroy on reconcile), and a hung runtime must not hold it.
+            // The reap below kills the launching CLI either way.
+            if let Err(err) =
+                crate::util::output_with_timeout(Command::new(program).args(&args), timeout)
+            {
+                warn!(
+                    allocation_id = allocation.id,
+                    task_name = %task.name,
+                    error = %err,
+                    "Container teardown by name failed"
+                );
+            }
         }
 
         reap_task_process(allocation.id, &task.name, instance, "container");
@@ -1528,6 +1698,51 @@ mod tests {
         Ok(())
     }
 
+    /// The finding this guards: two local clusters both had an allocation 5,
+    /// and the second cluster's `legion-5` replaced the first's. The name now
+    /// carries the node, and the labels let stale cleanup prove ownership
+    /// before it force-removes anything.
+    #[test]
+    fn apple_launch_names_and_labels_the_container_by_node() -> R<()> {
+        let config = ContainerTaskConfig::from_value(&json!({
+            "image": "alpine",
+            "command": ["echo", "ok"]
+        }))?;
+        let args = build_apple_launch(
+            &alloc_with_id(5),
+            &task_with(json!({}), None),
+            &config,
+            &config.env,
+            &[],
+            None,
+            &config.image,
+        );
+        let name_idx = args.iter().position(|a| a == "--name").expect("name flag");
+        assert_eq!(args[name_idx + 1], "legion-node-1-5");
+        assert!(args
+            .windows(2)
+            .any(|pair| pair == ["--label", "legion.node=node-1"]));
+        assert!(args
+            .windows(2)
+            .any(|pair| pair == ["--label", "legion.allocation=5"]));
+
+        // Every other call addresses the same name.
+        let allocation = alloc_with_id(5);
+        let apple = ContainerRuntime::AppleContainer;
+        assert_eq!(container_name(&apple, &allocation), "legion-node-1-5");
+        assert!(build_signal_command(&apple, &allocation, "hup")?.contains(&args[name_idx + 1]));
+        assert!(
+            build_exec_command(&apple, &allocation, false, &[], &Default::default())
+                .contains(&args[name_idx + 1])
+        );
+        // Linux keeps `legion-<alloc>`, shared with the cgroup leaf name.
+        let oci = ContainerRuntime::Oci {
+            binary: "runc".into(),
+        };
+        assert_eq!(container_name(&oci, &allocation), "legion-5");
+        Ok(())
+    }
+
     #[test]
     fn apple_launch_maps_declared_resources() -> R<()> {
         let config = ContainerTaskConfig::from_value(&json!({
@@ -1724,7 +1939,7 @@ mod tests {
     fn apple_container_stop_kills_running_container() -> R<()> {
         let plugin = ContainerTaskPlugin;
         let allocation = alloc_with_id(9002);
-        let name = container_name(&allocation);
+        let name = container_name(&ContainerRuntime::detect()?, &allocation);
         let task = container_task("stoptest", json!(["/bin/sleep", "120"]));
 
         let tmp = tempfile::tempdir()?;
@@ -1758,14 +1973,14 @@ mod tests {
 
     /// End-to-end Linux run via an OCI runtime: pull alpine through the shared
     /// fetcher, build a bundle, run it, and assert stdout/stderr log capture.
-    /// Point `LEGION_OCI_RUNTIME` at an installed runtime (`runc`/`crun`/
-    /// `youki`). Override the image with `LEGION_OCI_TEST_IMAGE`.
+    /// Point `LEGION_OCI_RUNTIME` at an installed runtime (`runc`/`crun`).
+    /// Override the image with `LEGION_OCI_TEST_IMAGE`.
     ///
     /// Run with:
     /// `LEGION_OCI_RUNTIME=runc cargo test --lib oci_runtime_runs_container \
     ///   -- --ignored --nocapture`
     #[test]
-    #[ignore = "requires an OCI runtime (youki/runc/crun) + network"]
+    #[ignore = "requires an OCI runtime (runc/crun) + network"]
     fn oci_runtime_runs_container_and_captures_logs() -> R<()> {
         let plugin = ContainerTaskPlugin;
         let allocation = alloc_with_id(9003);
@@ -1853,6 +2068,17 @@ mod tests {
         Ok(())
     }
 
+    /// A stand-in for the worker's `allocs/` root: traverse-only, as
+    /// `WorkerStateStore::prepare_layout` makes it. A bare temp dir is
+    /// `0700`, which a user-namespaced container root cannot pass through
+    /// to reach its bundle.
+    #[cfg(target_os = "linux")]
+    fn allocs_root() -> R<tempfile::TempDir> {
+        let allocs = tempfile::tempdir()?;
+        crate::util::restrict_dir_to_traverse_only(allocs.path())?;
+        Ok(allocs)
+    }
+
     /// Runs one container to completion with `command` and returns its
     /// stdout. `alloc_dir` is the allocation's private directory (its user
     /// namespace slot lives there).
@@ -1894,9 +2120,9 @@ mod tests {
     /// ```
     #[cfg(target_os = "linux")]
     #[test]
-    #[ignore = "requires root, an OCI runtime (youki/runc/crun) + network"]
+    #[ignore = "requires root, an OCI runtime (runc/crun) + network"]
     fn oci_runtime_security_floor_holds_test() -> R<()> {
-        let allocs = tempfile::tempdir()?;
+        let allocs = allocs_root()?;
         let alloc_dir = allocs.path().join("9501");
         let stdout = run_to_completion(
             9501,
@@ -1932,10 +2158,10 @@ mod tests {
     /// idmapped mounts (Linux 5.12+).
     #[cfg(target_os = "linux")]
     #[test]
-    #[ignore = "requires root, an OCI runtime (youki/runc/crun) + network"]
+    #[ignore = "requires root, an OCI runtime (runc/crun) + network"]
     fn oci_runtime_security_volume_survives_a_new_range_test() -> R<()> {
         use std::os::unix::fs::MetadataExt;
-        let allocs = tempfile::tempdir()?;
+        let allocs = allocs_root()?;
         let data = tempfile::tempdir()?;
         let volume = crate::task_plugins::MountedVolume {
             name: "data".into(),
@@ -2004,7 +2230,7 @@ mod tests {
     /// ```
     #[cfg(target_os = "linux")]
     #[test]
-    #[ignore = "requires root, an OCI runtime (youki/runc/crun) + network"]
+    #[ignore = "requires root, an OCI runtime (runc/crun) + network"]
     fn container_start_latency_host_vs_gated_benchmark() -> R<()> {
         use crate::worker::netd::netns;
         const RUNS: usize = 20;
@@ -2079,12 +2305,12 @@ mod tests {
     /// tears it down via `<runtime> delete --force` (killing the foreground
     /// `run` alone leaves the container init reparented and alive).
     #[test]
-    #[ignore = "requires an OCI runtime (youki/runc/crun) + network"]
+    #[ignore = "requires an OCI runtime (runc/crun) + network"]
     fn oci_runtime_stop_kills_running_container() -> R<()> {
         let binary = std::env::var(OCI_RUNTIME_ENV).unwrap_or_else(|_| DEFAULT_OCI_RUNTIME.into());
         let plugin = ContainerTaskPlugin;
         let allocation = alloc_with_id(9004);
-        let name = container_name(&allocation);
+        let name = container_name(&ContainerRuntime::detect()?, &allocation);
         let task = container_task("stoptest", json!(["/bin/sleep", "60"]));
 
         let tmp = tempfile::tempdir()?;
@@ -2112,51 +2338,107 @@ mod tests {
         Ok(())
     }
 
-    /// The OCI dialect: `--tty` but never `--interactive` (runc/crun/youki
-    /// have no such flag), caller env as repeated `--env`, and a `--`
-    /// separator so a command starting with `-` reaches the container instead
-    /// of the runtime's flag parser.
+    /// The OCI dialect: `--tty` but never `--interactive` (runc/crun have no
+    /// such flag), caller env as repeated `--env`, and the command
+    /// straight after the container id. runc stops parsing flags there, so
+    /// a command starting with `-` reaches the container, and a `--` would
+    /// itself be run (spot check: `exec: "--": executable file not found`).
     #[test]
     fn oci_exec_argv_uses_the_runtime_dialect() {
-        let oci_runtime = ContainerRuntime::Oci {
-            binary: "runc".into(),
-        };
         let env = std::collections::BTreeMap::from([("TERM".to_string(), "xterm".to_string())]);
-        let argv = build_exec_command(
-            &oci_runtime,
-            42,
-            true,
-            &["-l".to_string(), "--color".to_string()],
-            &env,
-        );
-        assert_eq!(
-            argv,
-            vec![
-                "runc",
-                "exec",
-                "--tty",
-                "--env",
-                "TERM=xterm",
-                "legion-42",
-                "--",
-                "-l",
-                "--color",
-            ]
-        );
-        assert!(
-            !argv.contains(&"--interactive".to_string()),
-            "OCI runtimes have no --interactive: {argv:?}"
-        );
+        for binary in ["runc", "/usr/local/sbin/runc", "crun"] {
+            let oci_runtime = ContainerRuntime::Oci {
+                binary: binary.into(),
+            };
+            let argv = build_exec_command(
+                &oci_runtime,
+                &alloc_with_id(42),
+                true,
+                &["-l".to_string(), "--color".to_string()],
+                &env,
+            );
+            assert_eq!(
+                argv,
+                vec![
+                    binary,
+                    "exec",
+                    "--tty",
+                    "--env",
+                    "TERM=xterm",
+                    "legion-42",
+                    "-l",
+                    "--color",
+                ]
+            );
+            assert!(
+                !argv.contains(&"--interactive".to_string()),
+                "OCI runtimes have no --interactive: {argv:?}"
+            );
 
-        // Non-tty one-shot: no --tty, everything else unchanged.
-        let argv = build_exec_command(
-            &oci_runtime,
-            42,
-            false,
-            &["/bin/true".to_string()],
-            &Default::default(),
-        );
-        assert_eq!(argv, vec!["runc", "exec", "legion-42", "--", "/bin/true"]);
+            // Non-tty one-shot: no --tty, everything else unchanged.
+            let argv = build_exec_command(
+                &oci_runtime,
+                &alloc_with_id(42),
+                false,
+                &["/bin/true".to_string()],
+                &Default::default(),
+            );
+            assert_eq!(argv, vec![binary, "exec", "legion-42", "/bin/true"]);
+        }
+    }
+
+    /// The default privilege floor needs idmapped mounts: runc before 1.2
+    /// is refused before any image work, naming the fix.
+    #[test]
+    fn runtimes_without_idmapped_mounts_are_named_test() {
+        let old = "runc version 1.1.12-0ubuntu3\ncommit: \nspec: 1.0.2-dev\n";
+        let gap = idmapped_mount_gap("runc", old).expect("runc 1.1 predates them");
+        assert!(gap.contains("1.1.12"), "{gap}");
+        assert!(gap.contains("security.userNamespace"), "{gap}");
+        assert!(gap.contains(OCI_RUNTIME_ENV), "{gap}");
+        // Identified by banner, so a renamed runc is still checked.
+        assert!(idmapped_mount_gap("/usr/bin/runc.amd64", old).is_some());
+
+        for ok in [
+            "runc version 1.2.0\ncommit: v1.2.0\nspec: 1.2.0\n",
+            "runc version 1.5.2\n",
+            "runc version 2.0.0-rc.1\n",
+        ] {
+            assert_eq!(idmapped_mount_gap("runc", ok), None, "{ok}");
+        }
+        // crun, and a runc banner Legion cannot read, get the benefit of the
+        // doubt.
+        assert_eq!(idmapped_mount_gap("crun", "crun version 1.14.1\n"), None);
+        assert_eq!(idmapped_mount_gap("runc", "runc\n"), None);
+        assert_eq!(DEFAULT_OCI_RUNTIME, "runc");
+    }
+
+    /// Legion runs runc and crun only, identified by their `--version`
+    /// banner. Anything else (youki, an empty banner) is refused with a
+    /// message naming both and the env var that selects them.
+    #[test]
+    fn only_runc_and_crun_are_supported_test() {
+        for banner in [
+            "runc version 1.2.0\ncommit: v1.2.0\nspec: 1.2.0\n",
+            "runc version 1.1.12-0ubuntu3\n",
+            "crun version 1.14.1\ncommit: abc\nrundir: /run/crun\nspec: 1.0.0\n",
+        ] {
+            assert_eq!(
+                unsupported_oci_runtime("/usr/bin/x", banner),
+                None,
+                "{banner}"
+            );
+        }
+
+        let youki = unsupported_oci_runtime("/usr/local/bin/youki", "youki version 0.7.0\n")
+            .expect("youki is not supported");
+        assert!(youki.contains("youki version 0.7.0"), "{youki}");
+        assert!(youki.contains("runc 1.2"), "{youki}");
+        assert!(youki.contains("crun"), "{youki}");
+        assert!(youki.contains(OCI_RUNTIME_ENV), "{youki}");
+
+        let silent = unsupported_oci_runtime("my-runtime", "").expect("unidentified");
+        assert!(silent.contains("printed nothing"), "{silent}");
     }
 
     /// The Apple arm keeps its own dialect: `--interactive` alongside
@@ -2167,7 +2449,7 @@ mod tests {
         let env = std::collections::BTreeMap::from([("TERM".to_string(), "xterm".to_string())]);
         let argv = build_exec_command(
             &ContainerRuntime::AppleContainer,
-            7,
+            &alloc(),
             true,
             &["/bin/sh".to_string()],
             &env,
@@ -2179,7 +2461,7 @@ mod tests {
                 "exec",
                 "--tty",
                 "--interactive",
-                "legion-7",
+                "legion-node-1-7",
                 "/bin/sh",
             ]
         );
@@ -2193,7 +2475,7 @@ mod tests {
     fn exec_support_is_reported_for_every_detected_runtime() {
         assert!(ContainerRuntime::AppleContainer.supports_exec());
         assert!(ContainerRuntime::Oci {
-            binary: "youki".into()
+            binary: "runc".into()
         }
         .supports_exec());
 
@@ -2391,7 +2673,7 @@ mod tests {
                 "kill",
                 "--signal",
                 "SIGHUP",
-                "legion-11"
+                "legion-node-1-11"
             ]
         );
         assert_eq!(
@@ -2454,12 +2736,12 @@ mod tests {
     /// End-to-end Linux graceful stop: a container that traps its declared
     /// signal exits inside the window, and `delete --force` finds it gone.
     #[test]
-    #[ignore = "requires an OCI runtime (youki/runc/crun) + network"]
+    #[ignore = "requires an OCI runtime (runc/crun) + network"]
     fn oci_runtime_stop_lets_a_trapping_container_drain() -> R<()> {
         let binary = std::env::var(OCI_RUNTIME_ENV).unwrap_or_else(|_| DEFAULT_OCI_RUNTIME.into());
         let plugin = ContainerTaskPlugin;
         let allocation = alloc_with_id(9007);
-        let name = container_name(&allocation);
+        let name = container_name(&ContainerRuntime::detect()?, &allocation);
         let mut task = container_task(
             "draintest",
             json!([
@@ -2508,12 +2790,12 @@ mod tests {
     /// The other half: a container that ignores the signal is force-killed at
     /// the deadline rather than hanging the stop forever.
     #[test]
-    #[ignore = "requires an OCI runtime (youki/runc/crun) + network"]
+    #[ignore = "requires an OCI runtime (runc/crun) + network"]
     fn oci_runtime_stop_force_kills_at_the_deadline() -> R<()> {
         let binary = std::env::var(OCI_RUNTIME_ENV).unwrap_or_else(|_| DEFAULT_OCI_RUNTIME.into());
         let plugin = ContainerTaskPlugin;
         let allocation = alloc_with_id(9008);
-        let name = container_name(&allocation);
+        let name = container_name(&ContainerRuntime::detect()?, &allocation);
         let mut task = container_task(
             "ignoretest",
             json!(["/bin/sh", "-c", "trap '' TERM; while :; do sleep 0.2; done"]),
@@ -2560,7 +2842,7 @@ mod tests {
     /// propagates. Run with:
     /// `LEGION_OCI_RUNTIME=runc cargo test --lib oci_runtime_exec -- --ignored`
     #[test]
-    #[ignore = "requires an OCI runtime (youki/runc/crun) + network"]
+    #[ignore = "requires an OCI runtime (runc/crun) + network"]
     fn oci_runtime_exec_runs_inside_the_container() -> R<()> {
         use std::io::Read;
 
@@ -2604,7 +2886,7 @@ mod tests {
 
     /// End-to-end Linux interactive exec: a shell round-trip through a PTY.
     #[test]
-    #[ignore = "requires an OCI runtime (youki/runc/crun) + network"]
+    #[ignore = "requires an OCI runtime (runc/crun) + network"]
     fn oci_runtime_exec_supports_a_tty_session() -> R<()> {
         use std::io::Read;
 
@@ -2771,7 +3053,7 @@ mod tests {
     ///
     /// `LEGION_OCI_RUNTIME=runc cargo test --lib oci_runtime_runs_stock_nginx -- --ignored`
     #[test]
-    #[ignore = "requires an OCI runtime (youki/runc/crun), root, and the nginx image"]
+    #[ignore = "requires an OCI runtime (runc/crun), root, and the nginx image"]
     fn oci_runtime_runs_stock_nginx() -> R<()> {
         use std::io::{Read as _, Write as _};
         let plugin = ContainerTaskPlugin;
@@ -2855,7 +3137,7 @@ mod tests {
     ///
     /// `LEGION_OCI_RUNTIME=runc cargo test --lib oci_runtime_runs_the_postgres_entrypoint -- --ignored`
     #[test]
-    #[ignore = "requires an OCI runtime (youki/runc/crun), root, and the postgres image"]
+    #[ignore = "requires an OCI runtime (runc/crun), root, and the postgres image"]
     fn oci_runtime_runs_the_postgres_entrypoint() -> R<()> {
         let plugin = ContainerTaskPlugin;
         let allocation = alloc_with_id(9013);
@@ -2916,7 +3198,7 @@ mod tests {
     ///
     /// `LEGION_OCI_RUNTIME=runc cargo test --lib oci_runtime_lets_a_non_root_image -- --ignored`
     #[test]
-    #[ignore = "requires an OCI runtime (youki/runc/crun), root, and the exporter image"]
+    #[ignore = "requires an OCI runtime (runc/crun), root, and the exporter image"]
     fn oci_runtime_lets_a_non_root_image_reopen_its_stdio() -> R<()> {
         let plugin = ContainerTaskPlugin;
         let allocation = alloc_with_id(9014);
@@ -2948,7 +3230,7 @@ mod tests {
     /// restarting the container — the property that makes KV re-render and
     /// identity rotation work at all.
     #[test]
-    #[ignore = "requires an OCI runtime (youki/runc/crun) + network"]
+    #[ignore = "requires an OCI runtime (runc/crun) + network"]
     fn oci_runtime_sees_task_dir_files_and_their_rewrites() -> R<()> {
         use std::io::Read;
 
@@ -3080,7 +3362,7 @@ mod tests {
     #[test]
     fn the_node_allowlist_gates_linux_container_starts() -> R<()> {
         let linux = ContainerRuntime::Oci {
-            binary: "youki".into(),
+            binary: "runc".into(),
         };
         let with = |security: Value| {
             ContainerTaskConfig::from_value(&json!({
@@ -3161,7 +3443,7 @@ mod tests {
         // a Mac), and Linux starts are unaffected.
         assert!(ContainerTaskPlugin.check_resources(&small)?.is_empty());
         let linux = ContainerRuntime::Oci {
-            binary: "youki".into(),
+            binary: "runc".into(),
         };
         check_apple_memory_floor(&linux, &small)?;
 

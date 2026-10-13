@@ -443,7 +443,19 @@ The manager then:
 2. checks move history per `(job_config_id, task_config_id)`
 3. if `move_count` is exceeded within `move_period`, marks the job failed and
    the task's status `failed`
-4. otherwise, enqueues a delayed `job_reschedule` after `move_delay`
+4. otherwise, enqueues a delayed `job_reschedule` after a backoff
+
+The backoff starts at `move_delay` (default `30s`) and doubles for each earlier
+move of the same task within `move_period` (default `30m`), up to 30 minutes
+(or `move_delay` itself, if you set it higher). With the defaults, a task that
+fails on every start is re-placed after 30s, 1m, 2m, 4m, 8m, 16m, then every
+30m. `move_count` is unlimited unless you set it, so without it a broken
+service keeps retrying at that slow pace rather than failing the job.
+
+The move history lives in the memory of the manager that handled the failure
+report. A manager restart or a change of leader starts the backoff over. A
+`job_reschedule` places every missing replica of the job, so one replica's
+eval can also re-place another replica that is still waiting out its delay.
 
 So failures escalate in order:
 

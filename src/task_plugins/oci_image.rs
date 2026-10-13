@@ -135,12 +135,14 @@ pub(crate) fn apple_load_image(oci_layout: &Path, reference: &str) -> R<()> {
         .context("archive OCI layout")?;
     builder.finish().context("finish OCI layout archive")?;
 
-    let output = Command::new("container")
-        .args(["image", "load", "--input"])
-        .arg(&archive_path)
-        .output()
-        .context("spawn container image load")?;
+    let output = crate::util::output_with_timeout(
+        Command::new(crate::task_plugins::apple_container::BIN)
+            .args(["image", "load", "--input"])
+            .arg(&archive_path),
+        crate::task_plugins::apple_container::IMAGE_LOAD_TIMEOUT,
+    );
     let _ = std::fs::remove_file(&archive_path);
+    let output = output.context("container image load")?;
     if !output.status.success() {
         bail!(
             "container image load failed for {reference}: {}",

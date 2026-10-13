@@ -1135,15 +1135,30 @@ impl Store {
     /// `suspend.resumeTimeout` to be placed on the checkpoint's node, boots
     /// cold under `onRestoreFailure = "cold"`. Under `"fail"`, a lost
     /// checkpoint puts the instance back to `suspended`, and a resume that is
-    /// only waiting keeps waiting. Cheap when nothing is resuming: one
-    /// indexed read, no write.
+    /// only waiting keeps waiting.
+    ///
+    /// A local checkpoint whose node reports a VMM or CPU its `compat` block
+    /// refuses settles at once, like a lost one: it lives only on that node,
+    /// so waiting out `resumeTimeout` cannot help. Cheap when nothing is
+    /// resuming: one indexed read, no write.
     #[instrument(err, skip_all)]
     pub fn settle_stalled_resumes(&self, now_unix: i64) -> R<Vec<AbandonedResume>> {
-        let candidates: Vec<(String, String, String, String, Option<i64>, String)> = {
+        type Candidate = (
+            String,
+            String,
+            String,
+            String,
+            Option<i64>,
+            String,
+            Option<String>,
+            String,
+        );
+        let candidates: Vec<Candidate> = {
             let conn = self.read_connection()?;
             let mut stmt = conn.prepare(
                 "SELECT instance.instance_id, instance.job_id, instance.task_name, \
-                 instance.restore_from, instance.resume_requested_at, snapshot.state \
+                 instance.restore_from, instance.resume_requested_at, snapshot.state, \
+                 snapshot.node_id, snapshot.manifest_json \
                  FROM instance INNER JOIN snapshot ON snapshot.snapshot_id = instance.restore_from \
                  WHERE instance.pending_op = 'resume' AND instance.current_alloc_id IS NULL;",
             )?;
@@ -1155,12 +1170,24 @@ impl Store {
                     row.get(3)?,
                     row.get(4)?,
                     row.get(5)?,
+                    row.get(6)?,
+                    row.get(7)?,
                 ))
             })?;
             Self::collect_rows(rows)?
         };
         let mut abandoned = Vec::new();
-        for (instance_id, job_id, task_name, snapshot_id, requested_at, state) in candidates {
+        for (
+            instance_id,
+            job_id,
+            task_name,
+            snapshot_id,
+            requested_at,
+            state,
+            node_id,
+            manifest_json,
+        ) in candidates
+        {
             let settings = self.suspend_settings_for(&job_id, &task_name);
             let state_parsed = state.parse::<SnapshotState>().ok();
             let lost = !state_parsed.is_some_and(|state| state.is_restorable());
@@ -1168,11 +1195,20 @@ impl Store {
             let waited = now_unix - requested_at.unwrap_or(now_unix);
             let timed_out = waited >= settings.resume_timeout.as_secs() as i64;
             let cold = settings.on_restore_failure == OnRestoreFailure::Cold;
-            if !(lost || (timed_out && cold)) {
+            // A published checkpoint can still find another node, so only a
+            // local one is refused for good by its node's fingerprint.
+            let incompatible = (!lost && !published)
+                .then(|| {
+                    self.local_checkpoint_refusal(&snapshot_id, node_id.as_deref(), &manifest_json)
+                })
+                .flatten();
+            if !(lost || incompatible.is_some() || (timed_out && cold)) {
                 continue;
             }
             let reason = if lost {
                 format!("checkpoint {snapshot_id} is {state} (its node is gone)")
+            } else if let Some(refusal) = incompatible {
+                refusal
             } else if published {
                 format!(
                     "the resume could not be placed on any node compatible with checkpoint \
@@ -1205,6 +1241,34 @@ impl Store {
             }
         }
         Ok(abandoned)
+    }
+
+    /// Why a local checkpoint can never resume on its node: the node
+    /// reports a VMM version or CPU that differs from what the checkpoint's
+    /// `compat` block needs. The scheduler refuses the same placement
+    /// (`check_restore_compat`), so without this the resume would retry
+    /// every eval until `resumeTimeout`. Only a reported, different value
+    /// counts: a missing attribute (a fingerprint still arriving), a missing
+    /// node, or an unreadable manifest leave the resume waiting as before.
+    fn local_checkpoint_refusal(
+        &self,
+        snapshot_id: &str,
+        node_id: Option<&str>,
+        manifest_json: &str,
+    ) -> Option<String> {
+        let node_id = node_id?;
+        let manifest =
+            crate::structs::checkpoint::SnapshotManifest::from_json(manifest_json).ok()?;
+        if manifest.compat.is_empty() {
+            return None;
+        }
+        let node = self.get_node(node_id).ok()?;
+        let attrs = node.fingerprint_attrs.as_object()?;
+        let mismatch = crate::structs::checkpoint::compat_matches(&manifest, attrs).err()?;
+        mismatch.found.as_ref()?;
+        Some(format!(
+            "checkpoint {snapshot_id}'s node {node_id} cannot resume it: {mismatch}"
+        ))
     }
 
     fn abandon_resume_apply(

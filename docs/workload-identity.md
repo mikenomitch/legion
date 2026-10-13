@@ -234,9 +234,37 @@ balancers. Some guidelines:
 - **Vault / internal services** can point at the manager directly
   (`oidc_discovery_url` plus a CA bundle, or plain HTTP inside a trusted
   network).
-- If `issuer` is unset, it defaults to the manager's own
-  `http://<host>:<port>`. That's fine for local development but not for
+- If `issuer` is unset, Legion picks a default (see
+  [The issuer](#the-issuer)). That's fine inside the cluster but not for
   federation.
+
+### The issuer
+
+A cluster has exactly one issuer. Managers share the signing keys, so a token
+or ticket any manager mints must carry the same `iss`. Nodes check it on boot,
+session, and exec tickets, and managers check it (and the `aud` of
+[control-plane tokens](#control-plane-identity)) on tokens their peers
+minted.
+
+- **Explicit:** set `workloadIdentity.issuer` to the **same** URL on every
+  manager. Legion can't check that the managers agree. A manager with a
+  different value mints tokens the rest of the cluster refuses.
+- **Default, `raft` or `streaming`:** `https://manager.legion`, the name every
+  manager already answers to under the cluster CA. It is the same on every
+  manager by construction, whatever each one's address. It is a name, not a
+  URL anyone outside the cluster can fetch, so federation still needs an
+  explicit issuer.
+- **Default, a single `localDisk` manager:** its advertised address,
+  `server.advertiseAddr` when set, else `http://<host>:<port>` (`https` with
+  `server.tls`), with a wildcard bind (`0.0.0.0`) read as `127.0.0.1`.
+
+Nodes don't derive the issuer from their join token. The manager reports it
+when a node pre-registers and on every heartbeat
+(`HeartbeatReply.workload_identity_issuer`), so changing it reaches every node
+within one heartbeat. Nodes fetch the JWKS from the managers they know, in
+failover order, over TLS pinned to the cluster CA, not from the issuer URL.
+Changing the issuer invalidates every outstanding token and ticket, because
+their `iss` no longer matches.
 
 ### Signing-key persistence and restart semantics
 
@@ -286,6 +314,21 @@ replicated `signing_key` table, so a follower's JWKS and signer pick up keys
 the primary rotated in. A follower lags by at most the check interval
 (`max(rotationAge / 10, 1m)`). With the default local-disk persistence there
 is a single manager, and it is always primary.
+
+Only the control-lane leader generates the first signing key. A manager that
+starts without a key in its replica, such as a follower joining before the
+leader's key has replicated or any member of a fully restarted cluster
+before an election, starts **keyless** rather than failing. It logs `No
+workload-identity signing key has replicated to this manager yet`, and it
+rechecks the store every 5 seconds until it holds a key. Meanwhile:
+
+- `IssueWorkloadIdentityToken` and `IssueNodeIdentityToken` return
+  `UNAVAILABLE` with a "retry shortly" message. Token refreshes retry with
+  backoff. A task start that hits it fails like any other issuance error.
+- The JWKS route answers `503 Service Unavailable` with `Retry-After: 5`
+  instead of an empty key set. The discovery document is still served.
+- A keyless manager that wins leadership with no key in the store generates
+  one within 5 seconds.
 
 ## How tokens reach the task
 
@@ -567,7 +610,7 @@ and per-allocation backing directory.
    ```nickel
    workloadIdentity = {
      enabled = true,
-     # optional; defaults to http://127.0.0.1:4747 for local testing
+     # optional; a single local manager defaults to its own address
      # issuer = "https://manager.example.com:4747",
    },
    ```

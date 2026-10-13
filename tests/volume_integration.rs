@@ -435,6 +435,70 @@ fn force_delete_tombstones_without_driver_confirmation() -> R<()> {
     Ok(())
 }
 
+/// `legion volume list` answers "what storage exists": a destroyed volume
+/// drops out once its reclaim is confirmed (spot check 2026-10-12, RUNBOOK
+/// 12.12), and `--all` / `--state destroyed` still show the tombstone.
+#[tokio::test(flavor = "multi_thread")]
+async fn list_volumes_hides_destroyed_tombstones_unless_asked() -> R<()> {
+    use legion::manager::server::ManagerDaemonService;
+    use legion::structs::manager_server::Manager;
+    use legion::structs::ListVolumesRequest;
+
+    let mut cluster = Cluster::new()?;
+    cluster.add_node(NODE_A)?;
+    cluster.submit(stateful_job("db", 2, "local-dir", None))?;
+    let volumes = cluster.volumes()?;
+    assert_eq!(volumes.len(), 2);
+    let gone = &volumes[0].volume_id;
+    cluster.store.delete_volume(gone, true)?;
+
+    let service = ManagerDaemonService::new(cluster.store.clone());
+    let list = |request: ListVolumesRequest| {
+        let service = &service;
+        async move {
+            let reply = service
+                .list_volumes(tonic::Request::new(request))
+                .await
+                .map_err(|status| anyhow::anyhow!("{status}"))?
+                .into_inner();
+            R::Ok(
+                reply
+                    .volumes
+                    .into_iter()
+                    .map(|volume| volume.volume_id)
+                    .collect::<Vec<_>>(),
+            )
+        }
+    };
+
+    let default = list(ListVolumesRequest {
+        job_id: Some("db".into()),
+        ..Default::default()
+    })
+    .await?;
+    assert_eq!(default.len(), 1);
+    assert!(
+        !default.contains(gone),
+        "the tombstone is hidden by default"
+    );
+
+    let all = list(ListVolumesRequest {
+        job_id: Some("db".into()),
+        include_destroyed: true,
+        ..Default::default()
+    })
+    .await?;
+    assert_eq!(all.len(), 2);
+
+    let destroyed = list(ListVolumesRequest {
+        state: Some("destroyed".into()),
+        ..Default::default()
+    })
+    .await?;
+    assert_eq!(destroyed, vec![gone.clone()]);
+    Ok(())
+}
+
 #[test]
 fn task_volume_claims_are_shared_and_outlive_instance_churn() -> R<()> {
     let mut cluster = Cluster::new()?;

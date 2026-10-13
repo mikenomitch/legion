@@ -917,8 +917,10 @@ service Manager {
   // === VOLUMES (see docs/volumes.md) ===
 
   // Lists volumes, optionally filtered by job, node, driver, instance, or
-  // state. Includes `destroyed` tombstones so an operator can still see where
-  // a job's storage went after it was reclaimed.
+  // state. Live volumes only by default: `destroyed` tombstones are left out
+  // unless the request sets `include_destroyed` or filters on
+  // `state = "destroyed"`, so an operator can still see where a job's storage
+  // went after it was reclaimed.
   //
   // A volume is the concrete storage behind an instance's opaque
   // `{driver}/{volume_id}` storage handle: which driver owns it, which node it
@@ -1005,6 +1007,9 @@ service Manager {
   //   task does not declare an identity named `identity_name`.
   // - PermissionDenied: the allocation exists but is not placed on
   //   `node_id` (a worker may only request tokens for its own allocations).
+  // - Unavailable: this manager has no signing key yet. It is a raft
+  //   follower that started before the leader's key replicated to it, and
+  //   adopts the key within seconds. Retry.
   // - Internal: signing failed.
   rpc IssueWorkloadIdentityToken (IssueWorkloadIdentityTokenRequest)
       returns (IssueWorkloadIdentityTokenReply);
@@ -1030,6 +1035,8 @@ service Manager {
   // - NotFound: no node with `node_id` is registered, or no node identity
   //   named `identity_name` is configured.
   // - PermissionDenied: `node_id` does not match the caller's credential.
+  // - Unavailable: this manager has no signing key yet (see
+  //   IssueWorkloadIdentityToken). Retry.
   // - Internal: signing failed.
   rpc IssueNodeIdentityToken (IssueNodeIdentityTokenRequest)
       returns (IssueNodeIdentityTokenReply);
@@ -1507,8 +1514,37 @@ service Manager {
   rpc GetLedger (GetLedgerRequest) returns (GetLedgerReply);
 
   // Returns config snapshots stored by manager instances.
+  //
+  // A manager writes its snapshot when it starts as, or later becomes, the
+  // control-lane leader, so under raft a manager that has never led has no
+  // snapshot here. For the list of managers in the cluster use
+  // `ListManagers`, which reads the raft membership instead.
   rpc GetManagerConfigs (GetManagerConfigsRequest)
     returns (GetManagerConfigsReply);
+
+  // Lists every manager in the cluster with its raft role, advertised
+  // address, and whether the answering manager can reach it. Backs the UI's
+  // Managers page and `legion raft members`.
+  //
+  // The roster comes from the replicated raft membership (voters and
+  // learners), which every manager holds, so any manager, leader or
+  // follower, answers with the full list. Outside raft mode the reply holds
+  // exactly one entry: the answering manager.
+  //
+  // Reachability is probed live from the answering manager: it calls
+  // `GetRaftStatus` on every other member concurrently, forwarding the
+  // caller's credential, with a short per-member timeout. A member that
+  // does not answer is still listed, with `reachable = false` and the
+  // reason in `probe_error`. Because it is the answering manager's view, a
+  // partitioned manager reports its peers unreachable while the rest of the
+  // cluster reports it unreachable.
+  //
+  // Read-only. Costs one `GetRaftStatus` call per other member.
+  //
+  // ACL: operator:read, unscoped (the roster is cluster-wide). Peers enforce
+  // the same rule on the forwarded credential, so a caller denied there sees
+  // `reachable = false` with a `PermissionDenied` `probe_error`.
+  rpc ListManagers (ListManagersRequest) returns (ListManagersReply);
 
   // Returns observability status and recent manager-side logs/traces.
   rpc GetObservability (GetObservabilityRequest)
@@ -2146,6 +2182,14 @@ message WorkerPreRegisterReply {
   //
   // Manager sets this on successful responses.
   WorkerConfig config = 1;
+
+  // The cluster's workload-identity issuer, the same value as
+  // `HeartbeatReply.workload_identity_issuer`: delivered here so a node
+  // that verifies tickets (edge boot, direct exec) knows the `iss` to expect
+  // before its first heartbeat.
+  //
+  // Default: empty when workload identity is disabled on this manager.
+  string workload_identity_issuer = 2;
 }
 
 // Request payload for WorkerRegister.
@@ -4827,7 +4871,7 @@ message VolumeInfo {
 }
 
 // Request payload for ListVolumes. Every filter is optional; omitting all of
-// them lists the whole cluster.
+// them lists every live volume in the cluster.
 message ListVolumesRequest {
   // Only volumes owned by this job.
   optional string job_id = 1;
@@ -4842,8 +4886,15 @@ message ListVolumesRequest {
   optional string instance_id = 4;
 
   // Only volumes in this state (`pending`, `created`, `destroying`,
-  // `destroyed`).
+  // `destroyed`). Asking for `destroyed` returns tombstones whatever
+  // `include_destroyed` says.
   optional string state = 5;
+
+  // Also return `destroyed` tombstones: volumes whose storage the driver
+  // already reclaimed, kept as records of where a job's storage went. Off by
+  // default, so a destroyed instance's volume drops out of the list once its
+  // reclaim is confirmed. `legion volume list --all` sets it.
+  bool include_destroyed = 6;
 }
 
 // Reply payload for ListVolumes.
@@ -6316,6 +6367,34 @@ message HeartbeatReply {
   // every beat until the node's report no longer lists them. Sessions the
   // node does not run are ignored.
   repeated string stop_sessions = 19;
+
+  // Allocation ids from the request's `terminated_allocations` that this
+  // manager could not record, so the worker must send them again on its
+  // next heartbeat. A terminal report is sent once, and a batch task's
+  // dependents wait on it: dropping one leaves the allocation `placed` and
+  // every `success` or `complete` dependent held forever.
+  //
+  // A report is listed when recording it failed (the write could not reach
+  // the lane leader, say) or when this manager has no row for the
+  // allocation yet, which happens when the heartbeat lands on a replica
+  // that has not applied the placement. A report from a node that does not
+  // own the allocation is never listed. The worker stops re-sending once it
+  // no longer holds the allocation, so a report for an allocation that was
+  // removed for good ends with the allocation.
+  //
+  // Default: empty list.
+  repeated int64 retry_terminated_allocations = 20;
+
+  // The cluster's workload-identity issuer: the `iss` every token and
+  // ticket the managers sign carries (docs/workload-identity.md, "Issuer").
+  // A worker checks boot, session, and exec tickets against this value, not
+  // against the manager address in its join token, so a ticket minted on
+  // any manager verifies on any node. Refreshed every beat, so a changed
+  // `workloadIdentity.issuer` reaches every node within one heartbeat.
+  //
+  // Default: empty when workload identity is disabled on the answering
+  // manager; an empty value leaves the worker's expected issuer unchanged.
+  string workload_identity_issuer = 21;
 }
 
 // Why one allocation is being stopped.
@@ -7350,6 +7429,92 @@ message GetManagerConfigsReply {
 
   // Page size used to produce this reply.
   uint32 page_size = 4;
+}
+
+// Request payload for ListManagers. No parameters: the roster is small
+// (raft clusters run 1, 3, or 5 managers) and returned whole.
+message ListManagersRequest {}
+
+// One manager in the cluster, as the answering manager sees it.
+message ManagerMember {
+  // The manager's identity. Under raft this is its raft node id
+  // (`persistence.raft.nodeId`); outside raft it is the manager's listener
+  // `host:port`. Matches `ManagerNodeConfig.node_id` for the manager's
+  // config snapshot.
+  string node_id = 1;
+
+  // The manager's advertised `host:port`: its raft advertise address, which
+  // is also its API listener. Outside raft, the host and port of
+  // `server.advertiseAddr` (or the listener address).
+  string advertise_addr = 2;
+
+  // Raft role, per the answering manager's replicated membership:
+  //
+  // - `leader`: leads the control lane (membership, joins, config).
+  // - `follower`: a settled voter that does not lead the control lane.
+  // - `learner`: a non-voting member, or a joiner whose promotion to voter
+  //   has not settled on every lane yet.
+  // - `standalone`: outside raft mode (local_disk or streaming persistence).
+  //
+  // Under `topology = "lanes"`, check `leader_lanes` for the lanes a
+  // manager leads, which can differ from the control lane during a
+  // leadership change.
+  string role = 3;
+
+  // True when the manager is a settled voter on every active lane (the same
+  // rule as `RaftStatus.voters`). Always false outside raft mode.
+  bool voter = 4;
+
+  // Raft lanes this manager leads, by wire name (`control`, `scheduler`,
+  // `status`). Under the default `single` topology this is `["control"]` for
+  // the leader and empty for everyone else. Empty outside raft mode.
+  repeated string leader_lanes = 5;
+
+  // True for the manager that answered this request.
+  bool is_self = 6;
+
+  // Whether the answering manager reached this manager just now. Always
+  // true for the answering manager itself.
+  bool reachable = 7;
+
+  // Why the probe failed, when `reachable` is false. Examples: a timeout,
+  // `Unavailable` (connection refused), or `PermissionDenied`.
+  optional string probe_error = 8;
+
+  // Round-trip time of the probe in milliseconds, when it succeeded.
+  // Absent for the answering manager itself.
+  optional uint64 probe_latency_ms = 9;
+
+  // The raft term the manager reports for itself, when reachable. A member
+  // on an older term than its peers has missed an election. Absent outside
+  // raft mode.
+  optional uint64 term = 10;
+
+  // The latest log index the manager reports it has applied, when
+  // reachable. Compare across members to see replication lag. Absent
+  // outside raft mode.
+  optional uint64 applied_index = 11;
+
+  // When this manager's config snapshot was last written, if it has one
+  // (`GetManagerConfigs`). Absent for a manager that has never led under
+  // raft. Same format as `ManagerNodeConfig.updated_at`.
+  optional string config_updated_at = 12;
+}
+
+// Reply payload for ListManagers.
+message ListManagersReply {
+  // Every manager, sorted by `node_id`. Outside raft mode, exactly the
+  // answering manager. Under raft, the members of the answering manager's
+  // replicated membership, which is empty only while its raft engine is
+  // still starting.
+  repeated ManagerMember managers = 1;
+
+  // Persistence backend of the answering manager: `raft`, `local_disk`, or
+  // `streaming`.
+  string persistence_backend = 2;
+
+  // `node_id` of the manager that answered.
+  string answered_by = 3;
 }
 
 // Request payload for GetSchedulerConcurrency. No parameters: the controller

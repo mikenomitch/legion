@@ -41,10 +41,15 @@ pub fn config() -> Command {
 
     let worker_cmd = Command::new("worker")
         .about("Start a worker node")
-        .arg(
-            Arg::new("token")
-                .value_name("TOKEN")
-                .help("Join token for the worker")
+        .arg(Arg::new("token").value_name("TOKEN").help(
+            "Join token for the worker. Visible to every local user in the process \
+             list; prefer --token-file",
+        ))
+        .arg(crate::cmd::join::token_file_arg())
+        // Exactly one of the two, and the usage error names both.
+        .group(
+            clap::ArgGroup::new("join-token")
+                .args(["token", "token-file"])
                 .required(true),
         )
         .arg(
@@ -158,18 +163,17 @@ pub fn config() -> Command {
 pub async fn handle(sub_matches: &ArgMatches) -> R<()> {
     match sub_matches.subcommand() {
         Some(("worker", arg_matches)) => {
-            let token = arg_matches
-                .get_one::<String>("token")
-                .context("Must provide token")?;
+            let token = crate::cmd::join::join_token_from(arg_matches)?
+                .context("Must provide a token or --token-file")?;
             if let Some(count) = arg_matches.get_one::<usize>("simulate") {
                 let opts = simulate_options(*count, arg_matches)?;
-                return run_simulated_workers(token, opts).await;
+                return run_simulated_workers(&token, opts).await;
             }
             let name = arg_matches.get_one::<String>("name").map(String::as_str);
             let advertise = arg_matches
                 .get_one::<String>("advertise-addr")
                 .map(String::as_str);
-            run_worker(token, name, advertise).await
+            run_worker(&token, name, advertise).await
         }
         Some(("gateway", arg_matches)) => {
             let listen = arg_matches

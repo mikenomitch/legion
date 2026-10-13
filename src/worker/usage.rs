@@ -159,11 +159,16 @@ pub fn parse_apple_container_stats(json: &str) -> HashMap<String, AppleContainer
 ///
 /// One call for all containers, never one per name: `container stats`
 /// fails the whole call when any named container is not running.
+///
+/// Bounded by [`STATS_TIMEOUT`](crate::task_plugins::apple_container::STATS_TIMEOUT):
+/// this runs on the heartbeat, and a wedged `container` service once hung
+/// it indefinitely. A timed-out call is an unmeasured report, like any other
+/// failure here.
 pub fn read_apple_container_stats() -> HashMap<String, AppleContainerStats> {
-    let output = std::process::Command::new("container")
-        .args(["stats", "--format", "json", "--no-stream"])
-        .stdin(std::process::Stdio::null())
-        .output();
+    let output = crate::task_plugins::apple_container::run(
+        &["stats", "--format", "json", "--no-stream"],
+        crate::task_plugins::apple_container::STATS_TIMEOUT,
+    );
     match output {
         Ok(output) if output.status.success() => {
             parse_apple_container_stats(&String::from_utf8_lossy(&output.stdout))
@@ -176,7 +181,9 @@ pub fn read_apple_container_stats() -> HashMap<String, AppleContainerStats> {
             HashMap::new()
         }
         Err(err) => {
-            tracing::debug!(error = %err, "container CLI unavailable; Apple container sandboxes go unmeasured");
+            // Only called with Apple containers running, so the CLI exists:
+            // this is a hung or broken `container` service.
+            tracing::warn!(error = %err, "container stats failed; Apple container sandboxes go unmeasured this report");
             HashMap::new()
         }
     }

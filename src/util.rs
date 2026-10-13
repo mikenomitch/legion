@@ -22,15 +22,34 @@ pub fn random_string(length: usize) -> String {
 /// task output. Task runtimes that drop to a dedicated `user` hand the
 /// allocation tree over via chown so the boundary holds for them too.
 pub fn restrict_dir_to_owner(dir: &std::path::Path) -> crate::util::R<()> {
+    set_dir_mode(dir, 0o700, "owner-only")
+}
+
+/// Let any user pass through `dir`, but only its owner list or change it
+/// (`0o711`; no-op off Unix).
+///
+/// For the worker directories *above* the per-allocation ones (the worker
+/// state dir and `allocs/`). A user-namespaced container's root (a shifted
+/// host id) and an `exec` task's dedicated `user` both have to traverse them
+/// to reach their own allocation directory, which keeps its own, tighter
+/// guard. This is Docker's `userns-remap` layout (`/var/lib/docker` is
+/// `0711`). Without listing, nothing below is discoverable, so everything
+/// under such a directory must still guard itself: state files are `0600`,
+/// and every other subdirectory is owner-only.
+pub fn restrict_dir_to_traverse_only(dir: &std::path::Path) -> crate::util::R<()> {
+    set_dir_mode(dir, 0o711, "traverse-only")
+}
+
+fn set_dir_mode(dir: &std::path::Path, mode: u32, what: &str) -> crate::util::R<()> {
     #[cfg(unix)]
     {
         use anyhow::Context;
         use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
-            .with_context(|| format!("failed to restrict {} to owner-only", dir.display()))?;
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(mode))
+            .with_context(|| format!("failed to restrict {} to {what}", dir.display()))?;
     }
     #[cfg(not(unix))]
-    let _ = dir;
+    let _ = (dir, mode, what);
     Ok(())
 }
 
@@ -107,6 +126,124 @@ pub fn now_unix_ms() -> i64 {
     (time::OffsetDateTime::now_utc().unix_timestamp_nanos() / 1_000_000) as i64
 }
 
+/// The bound on a runtime CLI call that only queries or nudges state
+/// (`container inspect`, `rm --force`, `kill`, `system status`, `runc
+/// delete`). These answer in well under a second when the runtime is healthy.
+pub const RUNTIME_CLI_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// `cmd` as an operator would type it, for errors and logs.
+pub fn describe_command(cmd: &std::process::Command) -> String {
+    std::iter::once(cmd.get_program())
+        .chain(cmd.get_args())
+        .map(|part| part.to_string_lossy().into_owned())
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// [`std::process::Command::output`] with a deadline.
+///
+/// A runtime CLI can hang forever: Apple's `container rm --force` once sat
+/// for 40 minutes on a container another `container run` owned, and every
+/// caller waiting on it (a launch, a heartbeat's `container stats`, a
+/// teardown under the task-manager lock) hung with it. Past `timeout` the
+/// child's whole process group is killed and the error names the command, so
+/// the caller fails with something an operator can act on.
+///
+/// stdin is closed. The child gets its own process group so a helper it
+/// forked dies with it, rather than holding the output pipes open after the
+/// kill. Output is read on helper threads, so a chatty child cannot fill a
+/// pipe and deadlock against the wait.
+pub fn output_with_timeout(
+    cmd: &mut std::process::Command,
+    timeout: std::time::Duration,
+) -> R<std::process::Output> {
+    use anyhow::Context;
+    use std::io::Read;
+    use std::process::Stdio;
+
+    let described = describe_command(cmd);
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        cmd.process_group(0);
+    }
+    let mut child = cmd
+        .spawn()
+        .with_context(|| format!("failed to run `{described}`"))?;
+
+    // Each reader sends its stream once it hits EOF. A channel rather than
+    // a join, so the wait for them can be bounded too.
+    let (tx, rx) = std::sync::mpsc::channel::<(bool, Vec<u8>)>();
+    fn read_into<S: Read + Send + 'static>(
+        stream: Option<S>,
+        is_stdout: bool,
+        tx: std::sync::mpsc::Sender<(bool, Vec<u8>)>,
+    ) {
+        std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            if let Some(mut stream) = stream {
+                let _ = stream.read_to_end(&mut buf);
+            }
+            let _ = tx.send((is_stdout, buf));
+        });
+    }
+    read_into(child.stdout.take(), true, tx.clone());
+    read_into(child.stderr.take(), false, tx);
+
+    let deadline = std::time::Instant::now() + timeout;
+    let timed_out = |child: &mut std::process::Child| {
+        #[cfg(unix)]
+        {
+            // The group id is the child's pid (`process_group(0)`).
+            // SAFETY: plain syscall on a pid we spawned and have not reaped.
+            unsafe { libc::killpg(child.id() as libc::pid_t, libc::SIGKILL) };
+        }
+        let _ = child.kill();
+        let _ = child.wait();
+        anyhow::anyhow!(
+            "`{described}` did not finish within {}s and was killed",
+            timeout.as_secs()
+        )
+    };
+    let status = loop {
+        if let Some(status) = child
+            .try_wait()
+            .with_context(|| format!("failed to wait on `{described}`"))?
+        {
+            break status;
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err(timed_out(&mut child));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    };
+
+    // The child exited, but something it spawned may still hold the pipes.
+    let mut stdout = Vec::new();
+    let mut stderr = Vec::new();
+    for _ in 0..2 {
+        let remaining = deadline
+            .saturating_duration_since(std::time::Instant::now())
+            .max(std::time::Duration::from_millis(100));
+        match rx.recv_timeout(remaining) {
+            Ok((true, buf)) => stdout = buf,
+            Ok((false, buf)) => stderr = buf,
+            Err(_) => anyhow::bail!(
+                "`{described}` exited ({status}) but its output stayed open past {}s",
+                timeout.as_secs()
+            ),
+        }
+    }
+    Ok(std::process::Output {
+        status,
+        stdout,
+        stderr,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -148,6 +285,48 @@ mod tests {
             default_plugin_root(Some(&bin), &missing_checkout),
             bin.join("plugins")
         );
+    }
+
+    #[test]
+    fn output_with_timeout_returns_output_like_command_output_test() {
+        let output = output_with_timeout(
+            std::process::Command::new("sh").args(["-c", "echo out; echo err >&2; exit 3"]),
+            std::time::Duration::from_secs(10),
+        )
+        .expect("ran");
+        assert_eq!(output.status.code(), Some(3));
+        assert_eq!(output.stdout, b"out\n");
+        assert_eq!(output.stderr, b"err\n");
+    }
+
+    /// The hang this exists for: a CLI that never returns. The error names
+    /// the command, and the child is gone when it returns.
+    #[test]
+    fn output_with_timeout_kills_a_hung_child_and_names_it_test() {
+        let started = std::time::Instant::now();
+        let err = output_with_timeout(
+            std::process::Command::new("sleep").arg("30"),
+            std::time::Duration::from_millis(200),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+        assert!(err.contains("`sleep 30`"), "{err}");
+        assert!(err.contains("did not finish"), "{err}");
+    }
+
+    /// A child that forks a helper holding stdout open: killing the group
+    /// takes the helper too, so the call still returns on time.
+    #[test]
+    fn output_with_timeout_kills_the_childs_helpers_test() {
+        let started = std::time::Instant::now();
+        let err = output_with_timeout(
+            std::process::Command::new("sh").args(["-c", "sleep 30 & sleep 30"]),
+            std::time::Duration::from_millis(200),
+        )
+        .unwrap_err();
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+        assert!(err.to_string().contains("did not finish"), "{err}");
     }
 
     #[test]

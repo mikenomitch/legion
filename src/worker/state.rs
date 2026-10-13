@@ -87,6 +87,14 @@ pub struct PersistedStop {
     pub kill_deadline_unix: Option<u64>,
 }
 
+/// Directories beside the state file that hold node data no task may reach
+/// by path (`<state dir>/<name>`): captured logs, the content store, volume
+/// data, and the node's key. Each is owner-only, because the state dir
+/// itself is traverse-only.
+const STATE_PRIVATE_SUBDIRS: [&str; 4] = ["logs", "content", "volumes", "identity"];
+/// The per-allocation directories (`<state dir>/allocs/`), traverse-only.
+const STATE_ALLOCS_SUBDIR: &str = "allocs";
+
 #[derive(Debug, Clone)]
 pub struct WorkerStateStore {
     path: PathBuf,
@@ -160,18 +168,42 @@ impl WorkerStateStore {
     }
 
     pub fn save(&self, allocations: &[PersistedAllocation]) -> R<()> {
-        if let Some(parent) = self.path.parent() {
-            ensure_dir(parent)?;
-            // The state file embeds each task's full env — including any
-            // env-delivered workload-identity token — so keep it owner-only.
-            // The directory guard denies traversal to the file regardless of
-            // its own mode; the atomic 0600 write below is defense in depth.
-            if !parent.as_os_str().is_empty() {
-                crate::util::restrict_dir_to_owner(parent)?;
-            }
-        }
+        self.ensure_state_dir()?;
+        // The state file embeds each task's full env, including any
+        // env-delivered workload-identity token. The state dir is
+        // traverse-only (see `prepare_layout`), so the file's own 0600 mode,
+        // set atomically by the write, is what keeps it private.
         let contents = serde_json::to_string_pretty(allocations)?;
         write_owner_only(&self.path, contents.as_bytes(), true)?;
+        Ok(())
+    }
+
+    /// Lay out the worker state directory with each entry's guard, before
+    /// anything is written into it. Called once at worker start.
+    ///
+    /// The state dir and `allocs/` are traverse-only (`0711`): a
+    /// user-namespaced container's root is a shifted host id, and an `exec`
+    /// task's `user` is not the worker's, yet both must reach their own
+    /// allocation directory by path (runc resolves the bundle's `rootfs` as
+    /// container root). The allocation directory below is the real boundary
+    /// (owner-only, or `0710` to the allocation's own id range; see
+    /// `userns::grant_traversal`). Every other entry guards itself: the
+    /// state files are written `0600`, and the directories here are created
+    /// owner-only up front, so a later `create_dir_all` beneath one never
+    /// leaves it at the umask.
+    pub fn prepare_layout(&self) -> R<()> {
+        self.ensure_state_dir()?;
+        let Some(dir) = self.dir() else {
+            return Ok(());
+        };
+        for private in STATE_PRIVATE_SUBDIRS {
+            let path = dir.join(private);
+            ensure_dir(&path)?;
+            crate::util::restrict_dir_to_owner(&path)?;
+        }
+        let allocs = dir.join(STATE_ALLOCS_SUBDIR);
+        ensure_dir(&allocs)?;
+        crate::util::restrict_dir_to_traverse_only(&allocs)?;
         Ok(())
     }
 
@@ -224,7 +256,7 @@ impl WorkerStateStore {
     }
 
     /// File holding this node's manager-issued node token, beside the state
-    /// file. Mode 0600 in a directory restricted to the worker's user.
+    /// file. Mode 0600: the state dir itself is traverse-only.
     pub fn node_token_path(&self) -> PathBuf {
         self.path.with_file_name("node_token")
     }
@@ -233,7 +265,7 @@ impl WorkerStateStore {
     /// instead of its join token, which may have expired or been revoked
     /// (docs/auth-and-acls.md). Fsynced: losing it costs a rejoin.
     pub fn save_node_token(&self, token: &str) -> R<()> {
-        self.ensure_private_dir()?;
+        self.ensure_state_dir()?;
         write_owner_only(&self.node_token_path(), token.as_bytes(), true)
     }
 
@@ -262,7 +294,7 @@ impl WorkerStateStore {
     /// Persist the manager set so a restarted worker can reach the cluster
     /// even when the manager its join token names is down.
     pub fn save_known_managers(&self, addresses: &[String]) -> R<()> {
-        self.ensure_private_dir()?;
+        self.ensure_state_dir()?;
         let contents = serde_json::to_vec_pretty(addresses)?;
         write_owner_only(&self.known_managers_path(), &contents, false)
     }
@@ -276,12 +308,19 @@ impl WorkerStateStore {
             .unwrap_or_default()
     }
 
-    fn ensure_private_dir(&self) -> R<()> {
-        if let Some(parent) = self.path.parent() {
-            if !parent.as_os_str().is_empty() {
-                ensure_dir(parent)?;
-                crate::util::restrict_dir_to_owner(parent)?;
-            }
+    /// The directory holding the state file, when it has one.
+    fn dir(&self) -> Option<&Path> {
+        self.path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+    }
+
+    /// Create the state dir and re-assert its traverse-only mode (see
+    /// [`Self::prepare_layout`]) before writing a file into it.
+    fn ensure_state_dir(&self) -> R<()> {
+        if let Some(dir) = self.dir() {
+            ensure_dir(dir)?;
+            crate::util::restrict_dir_to_traverse_only(dir)?;
         }
         Ok(())
     }
@@ -499,6 +538,45 @@ mod tests {
         // harmless.)
         assert!(!kill_orphaned_task_group(1), "never signal every process");
         assert!(!kill_orphaned_task_group(0));
+        Ok(())
+    }
+
+    /// A user-namespaced container's root must be able to traverse the state
+    /// dir to its own allocation (spot check: runc's `remount-propagation`
+    /// of the bundle rootfs failed with EACCES under a 0700 state dir), and
+    /// that must not expose anything else: state files stay 0600 and every
+    /// other subdirectory owner-only.
+    #[cfg(unix)]
+    #[test]
+    fn state_layout_is_traverse_only_with_private_entries() -> R<()> {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = |path: &Path| -> R<u32> { Ok(fs::metadata(path)?.permissions().mode() & 0o777) };
+        let temp_dir = TempDir::new()?;
+        let dir = temp_dir.path().join("w1");
+        let store = WorkerStateStore::new(dir.join("worker_state.json"));
+        store.prepare_layout()?;
+        store.save(&[])?;
+        store.save_node_token("lgntok_secret")?;
+
+        assert_eq!(mode(&dir)?, 0o711, "the state dir is traverse-only");
+        assert_eq!(
+            mode(&dir.join("allocs"))?,
+            0o711,
+            "allocs/ is traverse-only"
+        );
+        for private in STATE_PRIVATE_SUBDIRS {
+            assert_eq!(mode(&dir.join(private))?, 0o700, "{private}/ is owner-only");
+        }
+        for file in [store.path().to_path_buf(), store.node_token_path()] {
+            assert_eq!(mode(&file)?, 0o600, "{} is owner-only", file.display());
+        }
+
+        // A dir left wider (or narrower) by an older worker is corrected.
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o755))?;
+        fs::set_permissions(dir.join("content"), fs::Permissions::from_mode(0o755))?;
+        store.prepare_layout()?;
+        assert_eq!(mode(&dir)?, 0o711);
+        assert_eq!(mode(&dir.join("content"))?, 0o700);
         Ok(())
     }
 

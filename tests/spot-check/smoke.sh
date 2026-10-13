@@ -50,7 +50,7 @@ eventually() {
 # fails the pipeline. `has` reads all of its input instead.
 has() { grep -c -- "$1" >/dev/null; }
 http_has() { curl -fsS --max-time 5 "$1" | has "$2"; }
-alloc_of() { legion instance get "$1" -j 2>/dev/null | jq -r '.data.instance.current_alloc_id // empty'; }
+alloc_of() { legion instance get "$1" -j 2>/dev/null | jq -r '.data.instance.currentAllocId // empty'; }
 first_alloc() { # job task -> newest running allocation id of that task
     legion state query "select id from allocation where job_config_id like '$1-%' and task_config_id in (select id from task_config where name = '$2') order by id desc limit 1" -j 2>/dev/null |
         jq -r '.data[0].id // .data.rows[0].id // empty'
@@ -228,7 +228,7 @@ SBX_ID="sbx-smoke-$(date +%s)"
 ECHO_KEY="sc-key-$RANDOM$RANDOM"
 sandboxes_submitted=""
 
-# A field of `instance get -j` (snake_case InstanceInfo), or nothing.
+# A field of `instance get -j` (camelCase InstanceInfo), or nothing.
 inst() { legion instance get "$1" -j 2>/dev/null | jq -r ".data.instance.$2 // empty"; }
 state_is() { [ "$(inst "$1" state)" = "$2" ]; }
 # Run a command in an instance's guest; succeed only if it exited 0.
@@ -345,7 +345,7 @@ scenario_sandbox_net() {
     url="$(sbx_url "$SBX_ID")"
     [ -n "$url" ] && eventually 60 http_has "$url" '"process"' && ok "ingress: $url answers (datapath, vsock into the guest)" ||
         bad "ingress: no answer at ${url:-<no http endpoint in instance get>}"
-    grep -qi deny <<<"$(legion net policy test sandboxes --to https://example.com/ 2>&1)" && ok "net policy test explains the deny" ||
+    grep -qi deny <<<"$(legion net policy test sandboxes --task ws --to https://example.com/ 2>&1)" && ok "net policy test explains the deny" ||
         bad "net policy test did not say deny for example.com"
 }
 
@@ -362,7 +362,7 @@ scenario_sandbox_suspend() {
         bad "suspend: $(tail -3 <<<"$out" | tr '\n' ' ')"
         return
     fi
-    [ "$(inst "$SBX_ID" suspend_reason)" = manual ] && ok "suspend_reason manual" || bad "suspend_reason: $(inst "$SBX_ID" suspend_reason)"
+    [ "$(inst "$SBX_ID" suspendReason)" = manual ] && ok "suspend reason manual" || bad "suspend reason: $(inst "$SBX_ID" suspendReason)"
     out="$(legion instance start "$SBX_ID" --wait -j 2>&1)"
     if [ "$(jq -r '.data.coldBoot // empty' <<<"$out" 2>/dev/null)" = "" ] && [ "$(jq -r '.data.restoreMs // empty' <<<"$out" 2>/dev/null)" != "" ]; then
         ok "resumed from memory in $(jq -r .data.restoreMs <<<"$out") ms"
@@ -401,15 +401,18 @@ scenario_sandbox_idle() {
     before="$(sbx_get "$id" | jq -r '.process // empty')"
     # Hands off now: no exec, no traffic. Polling the manager is not activity.
     if eventually 240 state_is "$id" suspended; then
-        ok "suspended by the idle policy (reason $(inst "$id" suspend_reason))"
+        ok "suspended by the idle policy (reason $(inst "$id" suspendReason))"
     else
-        bad "$id still $(inst "$id" state) after 4 minutes quiet (idle since $(inst "$id" idle_since); detail $(inst "$id" detail))"
+        bad "$id still $(inst "$id" state) after 4 minutes quiet (idle since $(inst "$id" idleSince); detail $(inst "$id" detail))"
         return
     fi
     # The gateway dials the instance's node on its dynamic port, which the rig
     # opens between workers, so run it on a worker.
     mgr="$(priv_of "$(name_of_ip "$leader_ip")")"
-    sc_ssh sc-wkr-2 "pkill -f '[l]egion start gateway'; nohup env LEGION_ADDR=http://$mgr:4747 LEGION_TOKEN=$LEGION_TOKEN legion start gateway --listen 127.0.0.1:4780 >/tmp/sc-gateway.log 2>&1 </dev/null &"
+    # Two calls: `pkill -f` would match the remote shell's own command line,
+    # which also contains the gateway command, and kill it before nohup runs.
+    sc_ssh sc-wkr-2 "pkill -f '[l]egion start gateway'"
+    sc_ssh sc-wkr-2 "nohup env LEGION_ADDR=http://$mgr:4747 LEGION_TOKEN=$LEGION_TOKEN legion start gateway --listen 127.0.0.1:4780 >/tmp/sc-gateway.log 2>&1 </dev/null &"
     sleep 3
     t0=$SECONDS
     out="$(sc_ssh sc-wkr-2 "curl -s --max-time 90 -H 'Legion-Instance: $id' http://127.0.0.1:4780/")"
@@ -438,13 +441,13 @@ scenario_sandbox_store() {
     out="$(legion instance suspend "$id" --wait -j 2>&1)"
     [ "$(jq -r '.data.durability // empty' <<<"$out" 2>/dev/null)" = store ] && ok "suspended with durability store" ||
         { bad "suspend: $(tail -3 <<<"$out" | tr '\n' ' ')"; return; }
-    if eventually 300 sh -c "[ \"\$(legion instance get $id -j 2>/dev/null | jq -r .data.instance.checkpoint_state)\" = published ]"; then
+    if eventually 300 sh -c "[ \"\$(legion instance get $id -j 2>/dev/null | jq -r .data.instance.checkpointState)\" = published ]"; then
         ok "checkpoint published to the content store"
     else
-        bad "checkpoint still $(inst "$id" checkpoint_state): $(inst "$id" detail)"
+        bad "checkpoint still $(inst "$id" checkpointState): $(inst "$id" detail)"
         return
     fi
-    node="$(inst "$id" checkpoint_node_id)"
+    node="$(inst "$id" checkpointNodeId)"
     legion node cordon "$node" >/dev/null
     out="$(legion instance start "$id" --wait --timeout 300 -j 2>&1)"
     new="$(jq -r '.data.node // empty' <<<"$out" 2>/dev/null)"
@@ -482,7 +485,7 @@ scenario_sessions() {
         bad "list: $listed sessions, complete $(jq -r .data.complete <<<"$out")"
     # PR #36 Phase 3: a session minted by a router or a node carries its
     # node's tag. Ids derived from an idempotency key carry none.
-    tags="$(jq -r '.data.instances[] | select(.mode == "session") | "\(.node_id) \((.instance_id | capture("-(?<t>[a-z2-7]{8})[.]").t?) // "untagged")"' <<<"$out" | grep -v untagged | sort -u)"
+    tags="$(jq -r '.data.instances[] | select(.mode == "session") | "\(.nodeId) \((.instanceId | capture("-(?<t>[a-z2-7]{8})[.]").t?) // "untagged")"' <<<"$out" | grep -v untagged | sort -u)"
     if [ -z "$tags" ]; then
         skip "session ids carry no node tag (PR #36 Phase 3 not on this branch)"
     elif [ "$(awk '{print $1}' <<<"$tags" | sort | uniq -d | wc -l)" -eq 0 ]; then
@@ -493,7 +496,7 @@ scenario_sessions() {
     out="$(legion instance create sessions --task vm -j 2>/dev/null)"
     local vm
     vm="$(jq -r '.data.instanceIds[0] // empty' <<<"$out")"
-    [ -n "$vm" ] && eventually 180 state_is "$vm" running && ok "microVM session $vm running" ||
+    [ -n "$vm" ] && eventually 180 state_is "$vm" active && ok "microVM session $vm active" ||
         bad "microVM session: ${vm:-not started} $(inst "$vm" state) $(jq -c .error <<<"$out" 2>/dev/null)"
     local named="promoted-$(date +%s)"
     out="$(legion instance promote "$id" --id "$named" -j 2>&1)"
@@ -513,17 +516,17 @@ scenario_sessions_restart() {
     local i node ids before after pids_before pids_after missing=0 id
     for i in 1 2 3 4 5 6; do legion instance create sessions --task shell >/dev/null 2>&1; done
     node="$(legion instance list sessions -j 2>/dev/null |
-        jq -r '[.data.instances[] | select(.mode == "session" and (.instance_id | startswith("shell-")))] | group_by(.node_id) | max_by(length) | .[0].node_id // empty')"
+        jq -r '[.data.instances[] | select(.mode == "session" and (.instanceId | startswith("shell-")))] | group_by(.nodeId) | max_by(length) | .[0].nodeId // empty')"
     [ -n "$node" ] || { bad "no shell sessions running"; return; }
     ids="$(legion instance list sessions -j 2>/dev/null |
-        jq -r --arg n "$node" '.data.instances[] | select(.mode == "session" and .node_id == $n and (.instance_id | startswith("shell-"))) | .instance_id' | sort)"
+        jq -r --arg n "$node" '.data.instances[] | select(.mode == "session" and .nodeId == $n and (.instanceId | startswith("shell-"))) | .instanceId' | sort)"
     pids_before="$(sc_ssh "$node" "pgrep -x -f 'sleep 86399' | sort")"
     sc_ssh "$node" "sudo find /var/lib/legion -name sessions.db" | has sessions.db && ok "$node keeps a sessions.db" ||
         skip "no sessions.db on $node (PR #36 Phase 2 not on this branch)"
     sc_ssh "$node" sudo systemctl restart legion-worker
     sleep 10
     if eventually 180 sh -c "legion instance list sessions -j 2>/dev/null | jq -e .data.complete >/dev/null"; then
-        after="$(legion instance list sessions -j 2>/dev/null | jq -r '.data.instances[].instance_id' | sort)"
+        after="$(legion instance list sessions -j 2>/dev/null | jq -r '.data.instances[].instanceId' | sort)"
         for id in $ids; do grep -qx "$id" <<<"$after" || missing=$((missing + 1)); done
         [ "$missing" -eq 0 ] && ok "all $(wc -w <<<"$ids") sessions on $node listed again after the restart" ||
             bad "$missing of $(wc -w <<<"$ids") sessions on $node gone after the worker restart"
@@ -639,7 +642,7 @@ scenario_sandbox_pressure() {
         bad "no evict-bursting node.pressure event for mem-hog in 5 minutes"
     fi
     if events_has node.pressure suspend --instance "$SBX_ID"; then
-        ok "$SBX_ID suspended by the pressure response before any eviction (reason $(inst "$SBX_ID" suspend_reason))"
+        ok "$SBX_ID suspended by the pressure response before any eviction (reason $(inst "$SBX_ID" suspendReason))"
     else
         skip "$SBX_ID was not suspended (its node may not have been the one short of memory)"
     fi
@@ -678,6 +681,10 @@ scenario_sandbox_destroy() {
     legion instance destroy "$SBX_ID" >/dev/null && ok "destroyed $SBX_ID" || bad "destroy $SBX_ID"
     eventually 120 sh -c "! legion volume list --job sandboxes -j 2>/dev/null | grep -q $SBX_ID" && ok "its volume is reclaimed" ||
         bad "the volume of $SBX_ID is still listed"
+    # The default list hides tombstones; --all keeps the record of where it went.
+    legion volume list --job sandboxes --all -j 2>/dev/null | jq -e --arg id "$SBX_ID" \
+        '.data[] | select(.instanceId == $id and .state == "destroyed")' >/dev/null &&
+        ok "--all still shows its destroyed tombstone" || bad "no destroyed tombstone for $SBX_ID under --all"
     legion instance create sandboxes --task ws --id "$SBX_ID" >/dev/null 2>&1 && bad "a destroyed id was created again" ||
         ok "a destroyed id cannot be created again"
 }

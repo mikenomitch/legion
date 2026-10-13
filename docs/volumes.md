@@ -328,6 +328,10 @@ instance ──────────────────────> pen
   re-sends the request to the owning worker on every heartbeat until a driver
   confirms. A worker that dies mid-destroy retries. Nothing leaks and nothing
   is deleted twice.
+- **A destroyed volume leaves a tombstone.** Once the driver confirms, the row
+  stays as `destroyed` with no node, so you can still see where a job's
+  storage went. `legion volume list` hides tombstones by default. Use `--all`
+  or `--state destroyed` to see them.
 
 Retention uses the same settings as other stateful workloads:
 `retainOnScaleIn` and `retainOnStop`, both defaulting to Retain. See
@@ -336,10 +340,14 @@ Retention uses the same settings as other stateful workloads:
 ## Operating volumes
 
 ```bash
-# Everything, or filtered
+# Every live volume, or filtered
 legion volume list
 legion volume list --job db --state created
 legion volume list --node node-a1 --driver local-dir
+
+# Include destroyed tombstones (or ask for only those)
+legion volume list --job db --all
+legion volume list --state destroyed
 
 # One volume: driver, params, metadata, node pin, last driver error
 legion volume get 9f2c8a1b…
@@ -533,6 +541,7 @@ legion instance create sandbox --id user-42     # mint the key + its volume
 legion instance stop  sandbox-user-42           # pause: allocation stops, volume retained
 legion instance start sandbox-user-42           # resume: same key, same volume, any valid node
 legion instance destroy sandbox-user-42         # tombstone the key; reaper reclaims the volume
+legion volume list --job sandbox                # its volume is gone once the driver confirms
 ```
 
 Stop and start act as suspend and resume for stateful sandboxes. The storage

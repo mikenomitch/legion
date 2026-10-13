@@ -110,6 +110,97 @@ pub fn claim(alloc_dir: &Path) -> R<IdRange> {
     Ok(IdRange::for_slot(slot))
 }
 
+/// Lets this allocation's container root, and only it, traverse the
+/// allocation directory: group = the range's base gid (container gid 0),
+/// mode `0710`. Docker's `userns-remap` guards its per-range root the same
+/// way.
+///
+/// The OCI runtime resolves the bundle's `rootfs` path *as container root*
+/// (runc's `remount-propagation` of the rootfs runs inside the user
+/// namespace), so container root needs search permission on every directory
+/// above it. The worker owns that whole chain: the state dir and `allocs/`
+/// are traverse-only, and this is the one directory that holds the
+/// allocation's private files. Other allocations' roots are other gids, so
+/// they still cannot enter. The task directory inside stays owner-only: it
+/// reaches the container as an idmapped mount, which the runtime opens with
+/// the worker's privilege.
+///
+/// Re-run at every start, because the worker resets the directory to
+/// owner-only before a start (an in-place restart may turn the user
+/// namespace off).
+pub fn grant_traversal(alloc_dir: &Path, range: IdRange) -> R<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::os::unix::fs::chown(alloc_dir, None, Some(range.host_base)).with_context(|| {
+            format!(
+                "hand {} to the allocation's user namespace group {}",
+                alloc_dir.display(),
+                range.host_base
+            )
+        })?;
+        std::fs::set_permissions(alloc_dir, std::fs::Permissions::from_mode(0o710))
+            .with_context(|| format!("restrict {} to 0710", alloc_dir.display()))?;
+    }
+    #[cfg(not(unix))]
+    let _ = (alloc_dir, range);
+    Ok(())
+}
+
+/// Fails, naming the directory and the fix, when this range's container root
+/// cannot search every directory above `path`.
+///
+/// The worker sets the modes of the directories it creates
+/// ([`grant_traversal`], `WorkerStateStore::prepare_layout`), but not of the
+/// ones above its data directory. A data directory under `/root` (`0700`)
+/// would otherwise surface as the runtime's bare `permission denied` from
+/// deep inside its rootfs setup.
+pub fn check_traversable(path: &Path, range: IdRange) -> R<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let mut chain: Vec<&Path> = path.ancestors().skip(1).collect();
+        chain.reverse();
+        for dir in chain {
+            let Ok(meta) = std::fs::metadata(dir) else {
+                continue;
+            };
+            let mode = meta.mode();
+            if !may_search(mode, meta.uid(), meta.gid(), range.host_base) {
+                bail!(
+                    "{dir} (mode {mode:o}) does not let the container's user namespace root \
+                     (host uid {uid}) through, so the OCI runtime cannot reach the bundle under \
+                     it. Make it traversable (`chmod o+x {dir}`), move the worker's data \
+                     directory ({env}) somewhere that is, or set security.userNamespace = false \
+                     on the task",
+                    dir = dir.display(),
+                    mode = mode & 0o7777,
+                    uid = range.host_base,
+                    env = crate::constants::DATA_DIR_ENV,
+                );
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = (path, range);
+    Ok(())
+}
+
+/// Whether a process whose uid and gid are both `id` (container root of a
+/// range, which has no supplementary groups) may search a directory with
+/// this `mode`, `owner`, and `group`. The kernel checks one class only: the
+/// owner bits for the owner, else the group bits for the group, else other.
+fn may_search(mode: u32, owner: u32, group: u32, id: u32) -> bool {
+    let bit = if owner == id {
+        0o100
+    } else if group == id {
+        0o010
+    } else {
+        0o001
+    };
+    mode & bit != 0
+}
+
 /// An exclusive `flock`, released on drop.
 struct FileLock<'a>(&'a std::fs::File);
 
@@ -153,6 +244,60 @@ mod userns_test {
         assert_eq!(first.shift(65_536), None, "outside the container's ids");
         let last = IdRange::for_slot(ID_POOL_SLOTS - 1);
         assert!(u64::from(last.host_base) + u64::from(last.size) < u64::from(u32::MAX));
+    }
+
+    /// The layout the worker builds lets a range's root through to its own
+    /// allocation and nowhere else (spot check: runc failed every userns
+    /// start with EACCES under the old owner-only chain).
+    #[test]
+    fn only_the_allocation_s_own_root_may_search_its_dir_test() {
+        let own = IdRange::for_slot(0).host_base;
+        let other = IdRange::for_slot(1).host_base;
+        // State dir and allocs/: traverse-only, owned by the worker (root).
+        assert!(may_search(0o711, 0, 0, own));
+        // The old owner-only chain.
+        assert!(!may_search(0o700, 0, 0, own));
+        // The allocation dir after `grant_traversal`: 0710, group = range.
+        assert!(may_search(0o710, 0, own, own));
+        assert!(
+            !may_search(0o710, 0, own, other),
+            "another allocation's root"
+        );
+        // The owner class wins even when it denies and other would allow.
+        assert!(!may_search(0o011, own, 0, own));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn check_traversable_names_the_blocking_dir_test() -> R<()> {
+        use std::os::unix::fs::PermissionsExt;
+        // A range whose root is this test's own uid, so the temp dir's
+        // ancestors (owned by this user or world-searchable) pass and only
+        // the directory under test decides.
+        let me = IdRange {
+            // SAFETY: geteuid has no preconditions and cannot fail.
+            host_base: unsafe { libc::geteuid() },
+            size: ID_RANGE_SIZE,
+        };
+        let root = tempfile::tempdir()?;
+        let blocking = root.path().join("blocking");
+        let rootfs = blocking.join("bundle").join("rootfs");
+        std::fs::create_dir_all(&rootfs)?;
+        check_traversable(&rootfs, me)?;
+
+        std::fs::set_permissions(&blocking, std::fs::Permissions::from_mode(0o600))?;
+        let err = check_traversable(&rootfs, me).expect_err("no search bit");
+        std::fs::set_permissions(&blocking, std::fs::Permissions::from_mode(0o700))?;
+        let message = err.to_string();
+        assert!(
+            message.contains(&blocking.display().to_string()),
+            "{message}"
+        );
+        assert!(
+            message.contains("security.userNamespace = false"),
+            "{message}"
+        );
+        Ok(())
     }
 
     #[test]

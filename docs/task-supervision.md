@@ -83,7 +83,7 @@ What happens on an exit:
 | Situation | Outcome |
 | --- | --- |
 | policy wants a restart, budget available | wait `delay`, relaunch in place |
-| policy wants a restart, budget exhausted | allocation fails → manager reschedules it (`move_*` budget) → job fails when that is spent too |
+| policy wants a restart, budget exhausted | allocation fails → manager reschedules it after a backoff that doubles per move (`move_*` budget, see [Manager-side move logic](jobs-tasks-and-scheduling.md#manager-side-move-logic)) → job fails when `move_count` is set and spent |
 | policy does not want a restart, exit was a success | allocation is complete |
 | policy does not want a restart, exit was not a success | allocation fails, as above |
 
@@ -137,6 +137,15 @@ Know two things before you upgrade:
   opt in) report their batch tasks as complete at start. Earlier releases
   assumed this for every runtime. The worker now says so in the allocation's
   status message.
+
+The worker reports the exit on its next heartbeat, and keeps reporting it
+until a manager records it. That heartbeat can land on any manager. When the
+manager can't record the exit yet (it hasn't applied the placement, or the
+write can't reach the raft leader), it asks the worker to send the report
+again on the next beat. A report from a node that doesn't own the allocation
+is ignored. The worker stops re-sending once it no longer holds the
+allocation. If a `success` dependent stays held after its dependency exited,
+look in the manager logs for `asking the worker to report it again`.
 
 A completed allocation keeps its row and its slot, and Legion never dispatches
 it to a worker again. It no longer counts against the node's resources or

@@ -29,7 +29,8 @@ use legion::structs::config::{ManagerConfigFull, PersistenceType};
 use legion::structs::manager_client::ManagerClient;
 use legion::structs::manager_server::ManagerServer;
 use legion::structs::{
-    IssueRaftCommandRequest, NodeMsg, SetNodeAvailabilityRequest, WorkerRegisterRequest,
+    IssueRaftCommandRequest, ListManagersRequest, NodeMsg, SetNodeAvailabilityRequest,
+    WorkerRegisterRequest,
 };
 
 /// One test at a time: each brings up a 3-node cluster, and two at once on
@@ -291,6 +292,135 @@ fn a_follower_forwards_a_lost_nodes_recovery_in_single_topology() -> R<()> {
     Ok(())
 }
 
+/// AWS spot check, DAG stuck after its first step: a batch task's exit
+/// reported to a FOLLOWER completes the allocation and the task. Both lanes'
+/// halves (`complete_allocation` on the scheduler lane, `set_task_status`
+/// on the status lane) forward to the leader.
+#[test]
+fn a_follower_forwards_a_batch_completion_in_single_topology() -> R<()> {
+    use legion::structs::job::{JobConfig, TaskConfig, TaskLifecycle};
+    use legion::structs::{Submission, TaskStatusState};
+
+    let _serial = cluster_gate();
+    let dir = tempfile::tempdir()?;
+    let nodes = start_cluster(dir.path())?;
+    let leader = leader_index(&nodes);
+    let follower = (leader + 1) % nodes.len();
+    let store = nodes[leader].store();
+
+    store.insert_node(worker_node("wkr-1"))?;
+    let mut fetch = TaskConfig::new("fetch", "noop");
+    fetch.lifecycle = TaskLifecycle::Batch;
+    let job = JobConfig {
+        priority: Default::default(),
+        rollout: None,
+        rollout_by_group: Default::default(),
+        name: "dag".into(),
+        tasks: vec![fetch],
+        version: None,
+    };
+    let outcome = store.handle_job_submit(
+        &job,
+        &[Submission {
+            path: "dag.ncl".into(),
+            content: "{}".into(),
+            is_primary: true,
+        }],
+    )?;
+    let job_config_id = outcome.job_config_id().to_string();
+    let (task_id, _) = *store
+        .get_task_configs_for_job_config(&job_config_id)?
+        .first()
+        .context("fetch task config")?;
+    let allocation = store.place_alloc("wkr-1", task_id)?;
+    wait_for(
+        Duration::from_secs(30),
+        "the placement replicates to the follower",
+        || {
+            nodes[follower]
+                .store()
+                .get_allocation_by_id(allocation.id)
+                .is_ok_and(|found| found.is_some())
+        },
+    );
+
+    nodes[follower]
+        .store()
+        .complete_allocation(allocation.id, true)
+        .context("a follower must forward both halves of a batch completion")?;
+    wait_for(
+        Duration::from_secs(30),
+        "every manager sees the allocation complete and the task succeeded",
+        || {
+            nodes.iter().all(|node| {
+                let complete = node
+                    .store()
+                    .get_allocation_by_id(allocation.id)
+                    .ok()
+                    .flatten()
+                    .is_some_and(|row| row.status == "complete");
+                let success = node
+                    .store()
+                    .task_statuses_for_job_config(&job_config_id)
+                    .is_ok_and(|statuses| {
+                        statuses.get(&task_id) == Some(&TaskStatusState::Success)
+                    });
+                complete && success
+            })
+        },
+    );
+    Ok(())
+}
+
+/// Spot check 2026-10-12: a worker's pressure actions ride its heartbeat to
+/// whichever manager it dials, and the `node.pressure` event that manager
+/// emits is a standalone event. A follower leads no lane in `single`
+/// topology, so the event used to be dropped there ("Failed replicating
+/// scheduler event") and `legion events list --kind node.pressure` stayed
+/// empty on every manager. The follower now forwards it to the leader.
+#[test]
+fn a_follower_journals_the_events_it_emits() -> R<()> {
+    let _serial = cluster_gate();
+    let dir = tempfile::tempdir()?;
+    let nodes = start_cluster(dir.path())?;
+    let leader = leader_index(&nodes);
+    let follower = (leader + 1) % nodes.len();
+
+    let action = legion::structs::PressureAction {
+        allocation_id: 1041,
+        job_id: "mem-hog".into(),
+        step: "evict-bursting".into(),
+        detail: "evicted by evict-bursting on wkr-1".into(),
+        ..Default::default()
+    };
+    nodes[follower]
+        .store()
+        .events()
+        .node_pressure("wkr-1", &action, None);
+
+    let filter = legion::storage::events::SchedulerEventFilter {
+        kind: Some("node.pressure".into()),
+        ..Default::default()
+    };
+    wait_for(
+        Duration::from_secs(30),
+        "every manager journals the follower's node.pressure event",
+        || {
+            nodes.iter().all(|node| {
+                node.store()
+                    .list_scheduler_events(&filter)
+                    .is_ok_and(|events| {
+                        events.iter().any(|event| {
+                            event.allocation_id == Some(1041)
+                                && event.node_id.as_deref() == Some("wkr-1")
+                        })
+                    })
+            })
+        },
+    );
+    Ok(())
+}
+
 /// P2-5 and P0-5: every manager accepts worker registration and client
 /// writes (a follower forwards them to the leader), and the reply tells the
 /// worker every manager it can fail over to.
@@ -466,5 +596,69 @@ fn a_restarted_follower_does_not_depose_the_leader() -> R<()> {
         dump(&nodes)
     );
     assert_eq!(nodes[follower].term(), term, "{}", dump(&nodes));
+    Ok(())
+}
+
+/// P2-12: the Managers page listed only managers that had led, because it
+/// read the leader-written config table. `ListManagers` reads the raft
+/// membership, so a follower answers with all three managers and their
+/// roles, and a stopped manager stays listed, marked unreachable.
+#[test]
+fn any_manager_lists_every_member_with_its_role() -> R<()> {
+    let _serial = cluster_gate();
+    let dir = tempfile::tempdir()?;
+    let mut nodes = start_cluster(dir.path())?;
+    let leader = leader_index(&nodes);
+    let follower = (leader + 1) % nodes.len();
+    let other = (leader + 2) % nodes.len();
+    let rt = tokio::runtime::Runtime::new()?;
+    let list = |addr: String| {
+        rt.block_on(async move {
+            let mut client = ManagerClient::connect(addr).await?;
+            let reply = client.list_managers(ListManagersRequest {}).await?;
+            Ok::<_, anyhow::Error>(reply.into_inner())
+        })
+    };
+
+    let reply = list(nodes[follower].addr())?;
+    assert_eq!(reply.persistence_backend, "raft");
+    assert_eq!(reply.answered_by, nodes[follower].name);
+    let names: Vec<&str> = reply.managers.iter().map(|m| m.node_id.as_str()).collect();
+    assert_eq!(names, vec!["mgr-a", "mgr-b", "mgr-c"], "{reply:?}");
+    let leaders: Vec<&str> = reply
+        .managers
+        .iter()
+        .filter(|m| m.role == "leader")
+        .map(|m| m.node_id.as_str())
+        .collect();
+    assert_eq!(leaders, vec![nodes[leader].name], "{reply:?}");
+    for member in &reply.managers {
+        let node = nodes
+            .iter()
+            .find(|node| node.name == member.node_id)
+            .expect("listed member is a cluster node");
+        assert_eq!(member.advertise_addr, format!("127.0.0.1:{}", node.port));
+        assert!(member.voter, "{member:?}");
+        assert_eq!(member.is_self, member.node_id == nodes[follower].name);
+        assert!(member.reachable, "every manager is up: {member:?}");
+        assert!(member.term.is_some() && member.applied_index.is_some());
+        if member.role != "leader" {
+            assert_eq!(member.role, "follower", "{member:?}");
+        }
+    }
+
+    // Stop the other follower: membership is unchanged, so it stays listed.
+    let stopped = nodes[other].name;
+    nodes[other].kill();
+    let reply = list(nodes[follower].addr())?;
+    assert_eq!(reply.managers.len(), 3, "{reply:?}");
+    let down = reply
+        .managers
+        .iter()
+        .find(|m| m.node_id == stopped)
+        .expect("a stopped manager is still a member");
+    assert!(!down.reachable, "{down:?}");
+    assert!(down.probe_error.is_some(), "{down:?}");
+    assert!(down.term.is_none(), "{down:?}");
     Ok(())
 }

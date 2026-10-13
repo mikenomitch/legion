@@ -8,7 +8,7 @@ also an open invitation to argue in review. Entries 1, 2, 4, 6, 7, 10, 13,
 14, and 16 were added on 2026-10-11 when the plan took on local workload
 isolation and folded in the sandbox-exec plan's amendments, which also
 extended entry 12. Entry 16 reverses the plan's earlier call to keep a
-plaintext path for one release. Entries 45 to 47 were added when this
+plaintext path for one release. Entries 47 to 49 were added when this
 branch merged `main`, which had shipped a first cut of Phase 1 in #17; they
 rank below the design calls because neither side changes what the plan
 promises a user.
@@ -953,7 +953,120 @@ and host, in `container_start_latency_host_vs_gated_benchmark` and the
 `oci_runtime_security_*` tests; youki and crun were not available here.
 **Portability won.**
 
-## 40. Any runtime plugin but `noop` is host-level
+## 40. Linux containers run on runc (default) or crun, and any other runtime is refused at start
+
+Made after the AWS spot check (Ubuntu 24.04, youki 0.7.0, runc 1.5.2), and
+revised the same day. youki, then the documented default, rejects every mount
+that carries `uidMappings` (`idmapped mounts are not supported
+destination="/legion/task"`), so the default runtime plus the default
+`security.userNamespace = true` (entry 10) failed every container start. The
+first cut made `runc` the default and refused a user-namespaced start on youki
+by binary name. The revision drops youki altogether.
+
+**The call.** Legion supports exactly two OCI runtimes: `runc` 1.2 or newer
+(the default) and `crun` (through `LEGION_OCI_RUNTIME`). The sandbox
+runtime's Linux dev mode shares the constant, the env var, and the check.
+The worker identifies the runtime by the first word of its `--version`
+banner, and refuses anything else at preflight, before any image work, on
+every start:
+
+```text
+OCI runtime `/usr/local/bin/youki` is not runc or crun (its `--version` reports `youki version 0.7.0`); Legion runs containers with runc 1.2 or newer (the default) or crun. Install one, and point LEGION_OCI_RUNTIME at it or unset LEGION_OCI_RUNTIME to use runc from PATH
+```
+
+runc before 1.2 ignores mount `uidMappings` and binds the task directory
+un-mapped, so a user-namespaced start on it still fails with its own error:
+
+```text
+OCI runtime `runc` is runc 1.1.12-0ubuntu3, which predates idmapped mounts; security.userNamespace (on by default) needs them for the task directory and volumes. Install runc 1.2 or newer (the default) or crun, and point LEGION_OCI_RUNTIME at it, or set security.userNamespace = false on the task
+```
+
+With youki gone, the exec dialect has one OCI form,
+`<runtime> exec [--tty] [--env K=V]… legion-<alloc> CMD…`
+([container-runtime-exec-and-signals calls](container-runtime-exec-and-signals-plan_calls.md),
+entry 21).
+
+**Alternatives.**
+- (a) Keep youki for `userNamespace = false` tasks, refusing only its
+  user-namespaced starts (the first cut). That kept a youki-only exec argv
+  (`--` before the command, since its clap parser reads flags after the
+  container id) and a capability a youki node advertised but its default
+  task could not use.
+- (b) Keep youki and chown the task directory and volumes to the range at
+  start, so no idmapped mount is needed. Entry 38 already rejected that,
+  because every later worker write would need re-chowning.
+- (c) Keep youki and turn the user namespace off when the runtime is youki.
+- (d) Drop youki but let any other runtime through on trust, refusing only
+  what Legion knows is broken (the first cut's rule for unknown names).
+- (e) Identify the runtime by binary file name rather than `--version`
+  banner.
+
+**Trade-off.** An operator who prefers youki, or wants to try gVisor's
+`runsc` or another OCI runtime, cannot without a code change. Distribution
+`runc` packages can predate 1.2, so the install doc points at runc's static
+release binary. crun is allowed on trust: Legion's privilege floor has been
+verified on runc only (entry 39). The banner check costs one `--version`
+call per start, which the preflight already made.
+
+**Why.** youki offers nothing over runc or crun that Legion uses, cannot do
+the idmapped mounts the default floor needs, and needed its own exec argv.
+(a) keeps a second dialect and a node that advertises `container: pass` for
+tasks it cannot run. (c) would silently drop the floor entry 10 made the
+default, which is worse than failing. (d) lets the next runtime with a
+different CLI or missing mount feature fail late and cryptically, the exact
+failure the spot check found. Refusing at preflight also withholds the
+`container: pass` readiness check, so the node stops advertising a
+capability it cannot deliver. (e) misses a renamed or wrapped runc
+(`/usr/bin/runc.amd64`), while every runc and crun build opens its banner
+with its own name. AGENTS.md lets a supported surface break when it gives a
+cleaner one. **Simplicity won: two runtimes that share one CLI and both run
+the default floor.**
+
+## 41. The state dir and `allocs/` are traverse-only, and the allocation dir is `0710` to its own range
+
+Made after the AWS spot check. With a user namespace, runc resolves the
+bundle's `rootfs` path as container root (host uid `1048576`+), which could
+not search the worker state dir (`0700`, re-applied on every state save) or
+`allocs/<id>/` (`0700`). Every start failed with `remount-propagation
+dst=…/rootfs, flags=MS_PRIVATE: permission denied`. Now:
+
+| Path | Mode |
+| --- | --- |
+| `workers/<node>/`, `allocs/` | `0711` (anyone may pass, no one may list) |
+| `allocs/<id>/` with a user namespace | `0710`, group = the range's base gid |
+| `allocs/<id>/` otherwise, `allocs/<id>/<task>/` | `0700` |
+| state files, `sessions.db` and its WAL, `netd_state.json` | `0600` from creation |
+| `logs/`, `content/`, `volumes/`, `identity/` | `0700`, created at worker start |
+
+A start also checks that the range's root can search every directory above
+the rootfs, and fails naming the one that blocks it (a data dir under
+`/root`, say).
+
+**Alternatives.**
+- (a) `o+x` on every ancestor of the bundle, as the spot check's shim did.
+  That opens each allocation's directory to every local user and every
+  other allocation's root.
+- (b) Keep the state dir `0700` and move bundles to a separate tree (for
+  example `/run/legion/bundles/<id>`), the way containerd keeps its bundles
+  outside its state.
+- (c) POSIX ACLs granting each range's gid search on the chain.
+
+**Trade-off.** The state dir stops being the guard for what is inside it.
+Every entry has to guard itself, so a future file written at the umask into
+the state dir is readable by path. That is why `sessions.db` (whose WAL
+inherited the umask) and `netd_state.json` (chmodded after writing) now
+create their files `0600`. Allocation ids are small integers, so a local
+user can probe which ones exist, but cannot enter any of them.
+
+**Why.** It is Docker's `userns-remap` layout (`/var/lib/docker` `0711`,
+the per-range root `0710 root:<remap gid>`), which keeps the per-allocation
+boundary exact: only the allocation's own root can enter. (b) splits one
+allocation's files across two trees, with two cleanup paths and two
+restart stories. (c) needs filesystem ACL support the worker cannot assume.
+It also lets an `exec` task with a `user` reach its chowned allocation tree
+by path, which the `0700` state dir blocked. **Simplicity won.**
+
+## 42. Any runtime plugin but `noop` is host-level
 
 Made while implementing Phase 7. The plan's table classifies `exec`,
 `container`, and `sandbox`. Runtimes also load as plugins
@@ -977,7 +1090,7 @@ has never seen is the wrong default. A plugin-declared isolation flag can
 come later without changing this rule for built-ins. **The safe default
 won.**
 
-## 41. A `dev` sandbox is host-level on every OS
+## 43. A `dev` sandbox is host-level on every OS
 
 Made while implementing Phase 7. The plan says `hypervisor = "dev"` is
 host-level "on Linux", where it is an OCI bundle. On macOS it is an Apple
@@ -994,7 +1107,7 @@ token, which has every grant.
 allocation. Dev mode is for development, where the management token is the
 norm. **A check that fails at submit, by name, won.**
 
-## 42. The host grant gates spec submission, not scale or instances
+## 44. The host grant gates spec submission, not scale or instances
 
 Made while implementing Phase 7. `RunJob` and `RunJobTemplate` check `host`.
 `ScaleTask`, `CreateInstance(s)`, `StartInstance`, and `StopJob` do not: they
@@ -1010,7 +1123,7 @@ Gating scale would make every operator who resizes jobs a host administrator,
 the same over-broad grant the plan avoided for bands. **The narrow grant
 won.**
 
-## 43. The probe runs once per registration and lands in the node's dynamic attributes
+## 45. The probe runs once per registration and lands in the node's dynamic attributes
 
 Made while implementing Phase 8. The manager that accepts a registration
 waits for the worker plane to come up, probes it (retrying at 2, 5, 10, and
@@ -1030,7 +1143,7 @@ covers. Periodic probes from every manager are N×M connections for a fact the
 next exec call reports anyway. Dynamic attributes already flow to the CLI, the
 UI, and `node list -j`. **The smallest thing that answers the question won.**
 
-## 44. `WORKER_UNREACHABLE` rides a status metadata key
+## 46. `WORKER_UNREACHABLE` rides a status metadata key
 
 Made while implementing Phase 8. A gRPC status carries a code from a fixed
 set. The manager returns `Unavailable` with the metadata key
@@ -1048,7 +1161,7 @@ details type means a new dependency on every client. A metadata key is one
 line on each side and extends to the next server-named code. **Simplicity
 won.**
 
-## 45. The merge keeps this branch's worker plane over #17's first cut
+## 47. The merge keeps this branch's worker plane over #17's first cut
 
 `main` shipped a first cut of Phase 1 in
 [#17](https://github.com/mikenomitch/legion/pull/17) while this branch built
@@ -1066,7 +1179,7 @@ ports #17's other work onto them.
 | 15 | `ExecTask` admits only managers | The `ticket` class ships with direct exec (sandbox-exec plan) |
 | 20 | Channels keyed by (node name, address) | Same idea: keyed by (CA, address, name); the log fetch's per-request map now keys by name too |
 | 21 | Sim fleet verified through `workerPlaneName` | One fleet certificate, `<prefix>.fleet.legion` (entry 21) |
-| 22 | No probe; the failing call explains itself | `Worker/Probe` and `WORKER_UNREACHABLE` (entries 43, 44) |
+| 22 | No probe; the failing call explains itself | `Worker/Probe` and `WORKER_UNREACHABLE` (entries 45, 46) |
 | 23 | Listener waits for its certificate | Same (entry 24) |
 | 24 | Manager mints its certificate on first dial | Same |
 | 25 | One `--advertise-addr`, through a process-wide flag | One `--advertise-addr`, passed as a parameter (entry 26) |
@@ -1092,7 +1205,7 @@ factories and two listener paths would be the drift AGENTS.md rules out, and
 porting nine phases onto #17's API is more code, and more risk, than porting
 #17's few non-plane changes onto this one. **Simplicity won.**
 
-## 46. Worker failover dials through one TLS connector, not a balanced channel
+## 48. Worker failover dials through one TLS connector, not a balanced channel
 
 `main`'s manager failover (`src/worker/managers.rs`) kept a balanced tonic
 channel and swapped its endpoints on failover, all plaintext. Phase 4 needs
@@ -1114,7 +1227,7 @@ pin check is a custom verifier. One connector holds the pin logic in one
 place, and every client cloned from the channel follows a failover.
 **Simplicity won, and the security rule stays in one function.**
 
-## 47. `legion-loadgen` needs `--join-token` for its embedded fleet
+## 49. `legion-loadgen` needs `--join-token` for its embedded fleet
 
 The instances-mode load generator embeds a simulated fleet. That fleet now
 pins the cluster CA like any worker, and only a join token carries the pin,

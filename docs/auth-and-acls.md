@@ -390,6 +390,23 @@ legion join-token create --type default --ttl 24h
 legion join lgnjoin_...
 ```
 
+Pasting the token is fine for a first try. For a worker that keeps running,
+pass it in a file instead: a token on the command line stays in the
+process's argv, which any local user can read with `ps` or
+`/proc/<pid>/cmdline`, and the worker warns about it.
+
+```bash
+legion join-token create --type default --ttl 24h -j | jq -r .data.token \
+  | sudo install -m 0600 /dev/stdin /etc/legion/join-token
+legion join --token-file /etc/legion/join-token
+```
+
+`legion start worker --token-file <PATH>` takes the same flag. There is no
+environment variable for the token, because exec tasks inherit the worker's
+environment. See
+[Running a worker under a service manager](architecture-managers-workers.md#running-a-worker-under-a-service-manager)
+for a systemd unit.
+
 The join token bundles the manager address, the worker type, and a random
 secret, so the worker needs no other configuration. The manager stores only
 a hash of the secret. List and revoke join tokens with

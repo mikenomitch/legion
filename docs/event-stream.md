@@ -204,6 +204,11 @@ See `proto/legion.proto` for the authoritative message documentation.
   ([`src/storage/store.rs`](../src/storage/store.rs)).
 - Emission is **best-effort**. Scheduling work never fails because an event
   could not be recorded. Errors are logged and swallowed.
+- Every manager can emit. Events raised while handling a worker's heartbeat
+  (`node.pressure`, `net.denied`) come from whichever
+  manager that worker dials. A manager that leads no raft lane, such as a
+  follower in the default `single` topology, forwards the event to the
+  status-lane leader, so it lands in the shared journal like any other.
 - When a `StreamEvents` subscriber falls behind the broadcast buffer, Legion
   backfills it from the journal using its last-sent event ID. Slow consumers
   fall back to catch-up reads instead of dropping events.

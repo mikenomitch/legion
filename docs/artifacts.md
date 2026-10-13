@@ -162,7 +162,15 @@ This sits next to the worker's `worker_state.json`, for example
   can reach this allocation's staged artifacts, injected secrets, or files.
   When an `exec` task sets `user`, the allocation tree is chowned to that
   user at start (symlinks are not followed). The process keeps access to its
-  own directory after dropping privileges, and to no one else's.
+  own directory after dropping privileges, and to no one else's. A Linux
+  container with a user namespace gets traversal of its allocation directory
+  only (`0710`, group = its own id range; see
+  [container security](task-runtime-container.md#security)).
+- The directories above it, the worker state dir and `allocs/`, are
+  traverse-only (`0711`). A task's own user can reach its allocation
+  directory by path, but nothing can list a node's allocations. Every other
+  entry in the state dir guards itself: the state files are `0600`, and
+  `logs/`, `content/`, `volumes/`, and `identity/` are owner-only.
 - It is exposed to the task as the `LEGION_ALLOC_DIR` and `LEGION_TASK_DIR`
   env vars, for runtimes that apply worker-injected env (see the
   [capability matrix](#task-runtime-support)).
@@ -809,7 +817,7 @@ staged OCI layout into the local runtime:
 
 - **macOS (Apple `container`):** the layout is tarred and imported with
   `container image load`, so the subsequent run needs no registry pull.
-- **Linux (youki / any OCI runtime):** the layout is converted to an OCI
+- **Linux (runc or crun):** the layout is converted to an OCI
   runtime bundle (rootfs extraction plus a generated `config.json`) and run
   with `<runtime> run --bundle`. See
   [task-runtime-container.md](task-runtime-container.md#linux-image--bundle).

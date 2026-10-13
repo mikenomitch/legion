@@ -5,7 +5,6 @@ use crate::manager::server::ManagerDaemonService;
 use crate::manager::workload_identity::WorkloadIdentityState;
 use crate::prelude::*;
 use crate::storage::events::drafts;
-use crate::storage::persistence::PersistenceRole;
 use crate::storage::store::{ClaimScope, EvalBatchLimits, EvalCompletion, Store};
 use crate::structs::{
     manager_server::ManagerServer, Eval, JobConfig, KvValueType, ManagerConfig, NodeMsg,
@@ -45,6 +44,15 @@ const ERROR_BACKOFF_MAX: Duration = Duration::from_secs(30);
 // (eval workers, node status checker). Bounds the takeover delay after a
 // leadership change to "a few seconds" (plan JC-15).
 const LEADER_POLL_INTERVAL: Duration = Duration::from_secs(1);
+
+/// How often a manager without a workload-identity signing key re-checks the
+/// store (follower) or tries to generate one (leader). See
+/// `start_workload_identity_rotation`.
+const KEYLESS_SIGNING_KEY_RETRY: Duration = Duration::from_secs(5);
+
+/// How often the control-lane leader prunes expired ACL and join tokens.
+/// A manager also prunes as soon as it acquires control-lane leadership.
+const CREDENTIAL_PRUNE_INTERVAL: Duration = Duration::from_secs(60 * 60);
 
 /// How long a keyed mutation's idempotency record is kept. Retries within
 /// this window are deduplicated; after it, the same key runs again. A day
@@ -152,8 +160,15 @@ pub async fn run_manager_with(
         crate::manager::concurrency::AdaptiveConcurrencySettings::from_scheduler_settings(
             full_config.scheduler_settings.as_ref(),
         )?;
-    let manager_node_id = format!("{}:{}", full_config.server.host, full_config.server.port);
     let store = Store::start_storage(&full_config)?;
+    // This manager's identity for its config row and its liveness digests.
+    // Under raft it is the raft node id, the one name that is unique across
+    // the cluster and matches the membership `ListManagers` reports; the
+    // listener's `host:port` is usually `0.0.0.0:4747` on every manager, so
+    // keying by it made all managers share one row (spot-check P2-12).
+    let manager_node_id = store
+        .raft_node_id()
+        .unwrap_or_else(|| format!("{}:{}", full_config.server.host, full_config.server.port));
     let store_for_api = store.clone();
     // A restore is an explicit operator action with the operator present:
     // fail fast, naming the missing root key, rather than serve a cluster
@@ -266,21 +281,10 @@ pub async fn run_manager_with(
     // before the authenticator so the control-plane identity method can verify
     // `legion` tokens against the same in-process issuer.
     let workload_identity_state = if full_config.workload_identity.enabled {
-        // When the issuer URL is unset, fall back to this manager's own
-        // listener. Match the scheme to the listener: with server TLS on it
-        // speaks only HTTPS, so an http:// issuer would make `iss`/`jwks_uri`
-        // point at an endpoint the manager won't answer. Operators should still
-        // set an externally-reachable HTTPS issuer for real federation.
-        let scheme = if full_config.server.tls.enabled {
-            "https"
-        } else {
-            "http"
-        };
-        let default_issuer = format!(
-            "{scheme}://{}:{}",
-            resolve_manager_host(&full_config.server.host),
-            full_config.server.port
-        );
+        // When the issuer URL is unset, every manager of the cluster must
+        // still agree on one (see `default_issuer`). Operators should set an
+        // externally-reachable HTTPS issuer for real federation.
+        let default_issuer = crate::manager::workload_identity::default_issuer(&full_config);
         let state = WorkloadIdentityState::initialize(
             &store,
             &full_config.workload_identity,
@@ -378,18 +382,27 @@ pub async fn run_manager_with(
             }
         });
         // Keep credential tables tidy: expired tokens are already rejected at
-        // authentication time, pruning just removes the rows.
+        // authentication time, pruning just removes the rows. The delete is a
+        // replicated control-lane write, so only the control-lane leader
+        // prunes: at startup or on acquiring leadership, then hourly.
         let prune_store = store.clone();
         tokio::spawn(async move {
+            let mut last_prune: Option<std::time::Instant> = None;
             loop {
-                match prune_store.prune_expired_credentials() {
-                    Ok((acl_tokens, join_tokens)) if acl_tokens + join_tokens > 0 => {
-                        info!(acl_tokens, join_tokens, "Pruned expired credentials");
+                if !prune_store.is_raft_leader(crate::storage::Lane::Control) {
+                    // Forget the schedule so a later leadership win prunes at once.
+                    last_prune = None;
+                } else if last_prune.is_none_or(|at| at.elapsed() >= CREDENTIAL_PRUNE_INTERVAL) {
+                    last_prune = Some(std::time::Instant::now());
+                    match prune_store.prune_expired_credentials() {
+                        Ok((acl_tokens, join_tokens)) if acl_tokens + join_tokens > 0 => {
+                            info!(acl_tokens, join_tokens, "Pruned expired credentials");
+                        }
+                        Ok(_) => {}
+                        Err(err) => warn!(error = ?err, "Failed pruning expired credentials"),
                     }
-                    Ok(_) => {}
-                    Err(err) => warn!(error = ?err, "Failed pruning expired credentials"),
                 }
-                tokio::time::sleep(Duration::from_secs(60 * 60)).await;
+                tokio::time::sleep(LEADER_POLL_INTERVAL).await;
             }
         });
     } else {
@@ -537,7 +550,8 @@ pub async fn run_manager_with(
         .with_workload_identity(workload_identity_state.clone())
         .with_kv_debounce(Duration::from_millis(full_config.kv_debounce_ms))
         .with_authenticator(authenticator)
-        .with_advertise_addr(full_config.server.advertised_address());
+        .with_advertise_addr(full_config.server.advertised_address())
+        .with_manager_id(manager_node_id.clone());
 
     let addr: std::net::SocketAddr =
         format!("{}:{}", full_config.server.host, full_config.server.port).parse()?;
@@ -1061,7 +1075,10 @@ async fn start_workload_identity_rotation(
         "Beginning workload identity key rotation loop"
     );
     loop {
-        if store.persistence_role() == PersistenceRole::Primary {
+        // Signing keys are control-lane rows, so "primary" here means the
+        // control-lane leader (the streaming primary, or any local-disk
+        // manager, outside raft mode).
+        if store.is_raft_leader(crate::storage::Lane::Control) {
             match state.rotation_tick(&store, std::time::SystemTime::now()) {
                 Ok(true) => info!("Workload identity signing key rotated"),
                 Ok(false) => debug!("Workload identity rotation not due"),
@@ -1076,7 +1093,16 @@ async fn start_workload_identity_rotation(
                 Err(err) => warn!(error = ?err, "Failed to refresh signing keys on standby"),
             }
         }
-        tokio::time::sleep(interval).await;
+        // A keyless manager (a follower that started before the leader's key
+        // replicated, or a new leader that must generate one) retries fast:
+        // the rotation interval can be hours, and it serves no tokens or
+        // JWKS until it holds a key.
+        let delay = if state.has_active_key() {
+            interval
+        } else {
+            KEYLESS_SIGNING_KEY_RETRY
+        };
+        tokio::time::sleep(delay).await;
     }
 }
 

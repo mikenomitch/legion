@@ -391,7 +391,7 @@ legion exec --instance ws-1 -- curl -sI https://example.com/           # refused
 legion exec --instance ws-1 -- curl -sI http://example.com/            # 403, Legion-Denied-By: policy
 legion exec --instance ws-1 -- curl -sI http://169.254.169.254/latest/meta-data/   # 403, Legion-Denied-By: host-guard
 legion exec --instance ws-1 -- curl -sI http://<its node's private ip>:4848/       # 403, host-guard
-legion net policy test sandboxes --to https://example.com/             # deny, and which rule
+legion net policy test sandboxes --task ws --to https://example.com/             # deny, and which rule
 tests/spot-check/infra/ssh.sh <its node> "sudo find /var/lib/legion -name net-access.log -exec tail -3 {} +"   # verdicts and deciding rules
 ```
 
@@ -461,7 +461,7 @@ legion job run tests/spot-check/jobs/10-sandbox-store.ncl
 legion instance create sandbox-store --id sbs-1
 legion exec --instance sbs-1 -- sh -c 'echo moved > /tmp/marker'
 legion instance suspend sbs-1 --wait -j                         # durability store
-legion instance get sbs-1 -j | jq -r .data.instance.checkpoint_state   # local, then published
+legion instance get sbs-1 -j | jq -r .data.instance.checkpointState   # local, then published
 legion node cordon <its node>
 legion instance start sbs-1 --wait --timeout 300 -j            # node is the other worker
 legion exec --instance sbs-1 -- cat /tmp/marker                 # moved
@@ -507,8 +507,10 @@ legion instance start ws-1 --wait
 **Good:** the steps run in order: reclaim, then suspend for `ws-1` (it sets
 `suspend.onPressure`), then evict-bursting for the hog, which is far above its
 128 MiB reservation. Nothing inside its reservation is evicted.
-`legion_node_pressure_actions_total` counts each step on the leader's
-`:4749/metrics`. If `ws-1` is on the other node, only the hog's node acts.
+`legion_node_pressure_actions_total` counts each step on the `:4749/metrics`
+of the manager the worker heartbeats to (sum across managers). The hog's
+replacement waits its `on_unhealthy.move_delay` before it is placed again, so
+it is not re-evicted in a tight loop. If `ws-1` is on the other node, only the hog's node acts.
 
 Preemption (stop `sessions` and `mem-hog` first; their room matters):
 
@@ -607,10 +609,10 @@ stop answers `stopped: false`.
 
 ```fish
 for i in (seq 6); legion instance create sessions --task shell >/dev/null; end
-legion instance list sessions -j | jq -r '.data.instances[] | "\(.node_id) \(.instance_id)"' | sort
+legion instance list sessions -j | jq -r '.data.instances[] | "\(.nodeId) \(.instanceId)"' | sort
 tests/spot-check/infra/ssh.sh sc-wkr-1 "pgrep -x -f 'sleep 86399' | sort; sudo find /var/lib/legion -name sessions.db"
 tests/spot-check/infra/ssh.sh sc-wkr-1 sudo systemctl restart legion-worker
-legion instance list sessions -j | jq -r '.data.instances[] | "\(.node_id) \(.instance_id)"' | sort   # the same
+legion instance list sessions -j | jq -r '.data.instances[] | "\(.nodeId) \(.instanceId)"' | sort   # the same
 tests/spot-check/infra/ssh.sh sc-wkr-1 "pgrep -x -f 'sleep 86399' | sort"                           # the same pids
 ```
 
@@ -625,7 +627,7 @@ that node, not NotFound (`smoke.sh sessions-route`, not in the default run).
 
 ```fish
 legion instance destroy ws-1 ; legion instance destroy idle-1
-legion volume list --job sandboxes             # ws-1's volume is gone
+legion volume list --job sandboxes             # ws-1's volume is gone (--all shows it as destroyed)
 legion instance create sandboxes --task ws --id ws-1   # refused: ids are never reused
 legion job stop sandboxes ; legion job stop sessions
 ```

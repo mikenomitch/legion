@@ -1050,26 +1050,7 @@ pub async fn session_nodes(
                 .as_ref()
                 .and_then(crate::manager::worker_plane::worker_address)
                 .unwrap_or_default();
-            let reason = match &node {
-                None => "lost",
-                Some(node) if node.status == "lost" => "lost",
-                Some(node) if node.status != "ready" => "down",
-                Some(node) if node.availability == "draining" || node.availability == "drained" => {
-                    "draining"
-                }
-                Some(node) if node.availability != "available" => "ineligible",
-                Some(_) if address.is_empty() => "no-address",
-                Some(node)
-                    if !crate::structs::snapshot::node_advertises(
-                        node,
-                        crate::structs::session::EDGE_SESSIONS_CAPABILITY,
-                    ) =>
-                {
-                    "no-edge-sessions"
-                }
-                Some(_) if weight == 0 => "full",
-                Some(_) => "",
-            };
+            let reason = session_node_reason(node.as_ref(), &address, weight);
             crate::structs::SessionNode {
                 tag: crate::structs::node_tag(&envelope.node_id),
                 node_id: envelope.node_id,
@@ -1084,6 +1065,38 @@ pub async fn session_nodes(
         .collect();
     nodes.sort_by(|a, b| a.node_id.cmp(&b.node_id));
     Ok(nodes)
+}
+
+/// Why a node holding an envelope does not accept edge session starts, or
+/// `""` when it does (`SessionNode.reason`).
+fn session_node_reason(
+    node: Option<&crate::structs::Node>,
+    address: &str,
+    weight: u32,
+) -> &'static str {
+    match node {
+        None => "lost",
+        Some(node) if node.status == "lost" => "lost",
+        // A registered, heartbeating node is `active` (`ready` is what the
+        // node-ready eval writes, and the next beat turns it `active`).
+        // Matching only `ready` once reported every live node as down.
+        Some(node) if node.status != "active" && node.status != "ready" => "down",
+        Some(node) if node.availability == "draining" || node.availability == "drained" => {
+            "draining"
+        }
+        Some(node) if node.availability != "available" => "ineligible",
+        Some(_) if address.is_empty() => "no-address",
+        Some(node)
+            if !crate::structs::snapshot::node_advertises(
+                node,
+                crate::structs::session::EDGE_SESSIONS_CAPABILITY,
+            ) =>
+        {
+            "no-edge-sessions"
+        }
+        Some(_) if weight == 0 => "full",
+        Some(_) => "",
+    }
 }
 
 /// How many sessions needing `needs` fit in `room`. A resource the session
@@ -1514,5 +1527,60 @@ mod sessions_test {
         let tight = BTreeMap::from([("cpu".to_string(), 499.0)]);
         assert_eq!(fits(&tight, &needs), 0);
         assert_eq!(fits(&room, &BTreeMap::new()), u32::MAX);
+    }
+
+    /// Regression (spot check): `ListSessionNodes` compared the node's status
+    /// to `ready`, but a registered, heartbeating node is `active`, so every
+    /// live node with an envelope read `accepting: false, reason: "down"`.
+    #[test]
+    fn a_live_node_that_advertises_edge_sessions_accepts_test() {
+        let node = |status: &str, availability: &str, caps: &[&str]| crate::structs::Node {
+            id: "node-1".into(),
+            status: status.into(),
+            pool: "default".into(),
+            availability: availability.into(),
+            last_heartbeat: String::new(),
+            heartbeat_source: String::new(),
+            config_attrs: serde_json::json!({}),
+            fingerprint_attrs: serde_json::json!({}),
+            dynamic_attrs: serde_json::json!({ "capabilities": caps }),
+            health_checks: serde_json::json!({}),
+        };
+        let edge = ["sessions", "edge-sessions"];
+        let addr = "10.0.0.1:4849";
+
+        assert_eq!(
+            session_node_reason(Some(&node("active", "available", &edge)), addr, 4),
+            ""
+        );
+        assert_eq!(
+            session_node_reason(Some(&node("ready", "available", &edge)), addr, 4),
+            ""
+        );
+        assert_eq!(
+            session_node_reason(Some(&node("lost", "available", &edge)), addr, 4),
+            "lost"
+        );
+        assert_eq!(session_node_reason(None, addr, 4), "lost");
+        assert_eq!(
+            session_node_reason(Some(&node("initializing", "available", &edge)), addr, 4),
+            "down"
+        );
+        assert_eq!(
+            session_node_reason(Some(&node("active", "draining", &edge)), addr, 4),
+            "draining"
+        );
+        assert_eq!(
+            session_node_reason(Some(&node("active", "available", &["sessions"])), addr, 4),
+            "no-edge-sessions"
+        );
+        assert_eq!(
+            session_node_reason(Some(&node("active", "available", &edge)), "", 4),
+            "no-address"
+        );
+        assert_eq!(
+            session_node_reason(Some(&node("active", "available", &edge)), addr, 0),
+            "full"
+        );
     }
 }

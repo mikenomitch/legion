@@ -275,6 +275,15 @@ impl Issuer {
     /// This is what keeps tokens held by third parties verifiable across
     /// manager restarts — the JWKS keeps publishing the same public keys and
     /// the same private key keeps signing.
+    ///
+    /// Only a manager that may write the control lane (the raft control-lane
+    /// leader, the streaming primary, or any local-disk manager) generates a
+    /// key. Any other manager (a raft follower joining before the key has
+    /// replicated to it, or every member of a fully restarted cluster before
+    /// an election) starts **keyless** instead of failing startup: issuance
+    /// returns [`SigningKeyUnavailable`] and the JWKS route answers 503 until
+    /// the rotation loop adopts the leader's key from the replicated store,
+    /// or generates one if this manager later wins leadership.
     pub fn load_or_generate(
         store: &Store,
         issuer_url: impl Into<String>,
@@ -306,34 +315,60 @@ impl Issuer {
         sub_template: Option<String>,
         now: SystemTime,
     ) -> R<Self> {
-        let mut keys = Vec::new();
-        for record in store.list_signing_keys()? {
-            if record.state == KeyState::Expired.as_str() {
-                continue;
-            }
-            keys.push(SigningKey::from_record(&record)?);
-        }
-
-        if !keys.iter().any(|k| k.state == KeyState::Active) {
-            let key = SigningKey::generate(unix_secs(now)?)?;
-            store.insert_signing_key(&key.to_record())?;
-            info!(kid = %key.kid, "Generated and persisted initial workload-identity signing key");
-            keys.insert(0, key);
-        } else {
-            debug!(
-                keys = keys.len(),
-                "Restored workload-identity signing keys from store"
-            );
-        }
-
-        Ok(Self {
+        let mut issuer = Self {
             issuer_url: issuer_url.into(),
             jwks_path: jwks_path.into(),
             default_ttl,
             max_token_ttl,
             sub_template,
-            keys,
-        })
+            keys: load_signing_keys(store)?,
+        };
+        if issuer.has_active_key() {
+            debug!(
+                keys = issuer.keys.len(),
+                "Restored workload-identity signing keys from store"
+            );
+        } else if store.is_raft_leader(crate::storage::Lane::Control) {
+            match issuer.ensure_active_key(store, now) {
+                Ok(_) => {}
+                // Leadership moved between the check and the proposal. Not
+                // fatal: start keyless like any follower and adopt the new
+                // leader's key once it replicates.
+                Err(err) if crate::storage::raft::driver::NotRaftLeader::in_chain(&err) => {
+                    info!(
+                        "Lost raft leadership before persisting the first workload-identity \
+                         signing key; starting keyless until the leader's key replicates"
+                    );
+                }
+                Err(err) => return Err(err),
+            }
+        } else {
+            info!(
+                "No workload-identity signing key has replicated to this manager yet; \
+                 starting keyless until the leader's key replicates"
+            );
+        }
+        Ok(issuer)
+    }
+
+    /// Whether this issuer holds an active signing key. A follower that
+    /// started before the leader's key replicated does not, yet.
+    pub fn has_active_key(&self) -> bool {
+        self.keys.iter().any(|k| k.state == KeyState::Active)
+    }
+
+    /// Generate and persist an active signing key when this issuer has none.
+    /// Returns true when it generated one. This is a replicated control-lane
+    /// write, so only the control-lane leader may call it.
+    pub fn ensure_active_key(&mut self, store: &Store, now: SystemTime) -> R<bool> {
+        if self.has_active_key() {
+            return Ok(false);
+        }
+        let key = SigningKey::generate(unix_secs(now)?)?;
+        store.insert_signing_key(&key.to_record())?;
+        info!(kid = %key.kid, "Generated and persisted initial workload-identity signing key");
+        self.keys.insert(0, key);
+        Ok(true)
     }
 
     pub fn issuer_url(&self) -> &str {
@@ -344,7 +379,7 @@ impl Issuer {
         self.keys
             .iter()
             .find(|k| k.state == KeyState::Active)
-            .context("issuer has no active signing key")
+            .ok_or_else(|| anyhow::Error::new(SigningKeyUnavailable))
     }
 
     /// Find a key by id among the non-expired keys (for verification).
@@ -709,13 +744,7 @@ impl Issuer {
     /// simply adopts whatever the primary persisted. Returns true if the set
     /// changed.
     pub fn reload_keys(&mut self, store: &Store) -> R<bool> {
-        let mut keys = Vec::new();
-        for record in store.list_signing_keys()? {
-            if record.state == KeyState::Expired.as_str() {
-                continue;
-            }
-            keys.push(SigningKey::from_record(&record)?);
-        }
+        let keys = load_signing_keys(store)?;
         if keys.is_empty() {
             // Nothing (non-expired) persisted yet; keep the current set rather
             // than blanking a live JWKS.
@@ -727,6 +756,78 @@ impl Issuer {
         let changed = before != after;
         self.keys = keys;
         Ok(changed)
+    }
+}
+
+/// Every non-expired signing key in the (replicated) store.
+fn load_signing_keys(store: &Store) -> R<Vec<SigningKey>> {
+    let mut keys = Vec::new();
+    for record in store.list_signing_keys()? {
+        if record.state == KeyState::Expired.as_str() {
+            continue;
+        }
+        keys.push(SigningKey::from_record(&record)?);
+    }
+    Ok(keys)
+}
+
+/// This manager has no active signing key yet. It is a raft follower, or a
+/// member of a fully restarted cluster, that started before the leader's key
+/// replicated to it. The condition is transient (the rotation loop adopts
+/// the key within seconds of it replicating), so callers map it to a
+/// retryable `Unavailable` rather than an internal error.
+#[derive(Debug, Clone, Copy)]
+pub struct SigningKeyUnavailable;
+
+impl std::fmt::Display for SigningKeyUnavailable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(
+            "this manager has no workload-identity signing key yet (waiting for the \
+             leader's key to replicate); retry shortly",
+        )
+    }
+}
+
+impl std::error::Error for SigningKeyUnavailable {}
+
+impl SigningKeyUnavailable {
+    /// Whether `err`, or anything it wraps, is this error.
+    pub fn in_chain(err: &anyhow::Error) -> bool {
+        err.chain()
+            .any(|cause| cause.downcast_ref::<SigningKeyUnavailable>().is_some())
+    }
+}
+
+/// The issuer URL used when `workloadIdentity.issuer` is unset.
+///
+/// It has to be ONE value for the whole cluster: managers share the signing
+/// keys, every node checks a ticket's `iss`, and a manager checks the `aud`
+/// and `iss` of the control-plane tokens its peers minted. A default built
+/// from each manager's own address gave every manager a different issuer, so
+/// a ticket minted on one manager failed on a node that joined through
+/// another.
+///
+/// - A topology with more than one manager (`raft`, and `streaming` with its
+///   standbys) uses `https://manager.legion`, the name every manager already
+///   answers to under the cluster CA. It is the same on every manager by
+///   construction, so nothing has to be replicated or agreed on at boot. It
+///   is a name rather than a fetchable URL: nodes fetch the JWKS from the
+///   managers they know, and relying parties outside the cluster need an
+///   explicit `workloadIdentity.issuer` anyway.
+/// - A single `localDisk` manager uses its advertised address
+///   (`server.advertiseAddr`, else `scheme://host:port` with a wildcard bind
+///   read as loopback), so the discovery document is reachable where the
+///   manager actually is.
+pub fn default_issuer(config: &crate::structs::ManagerConfigFull) -> String {
+    match config.persistence.r#type {
+        crate::structs::PersistenceType::Raft | crate::structs::PersistenceType::Streaming => {
+            format!("https://{}", crate::cluster_tls::MANAGER_SERVER_NAME)
+        }
+        crate::structs::PersistenceType::LocalDisk => config
+            .server
+            .advertised_address()
+            .trim_end_matches('/')
+            .to_string(),
     }
 }
 
@@ -883,8 +984,22 @@ impl WorkloadIdentityState {
         Ok(self.read_issuer()?.discovery_document())
     }
 
+    /// The JWKS document. Fails with [`SigningKeyUnavailable`] while this
+    /// manager holds no keys at all, so the HTTP route answers 503 instead
+    /// of publishing an empty key set a relying party might cache.
     pub fn jwks(&self) -> R<Value> {
-        Ok(self.read_issuer()?.jwks())
+        let issuer = self.read_issuer()?;
+        if issuer.keys.is_empty() {
+            return Err(SigningKeyUnavailable.into());
+        }
+        Ok(issuer.jwks())
+    }
+
+    /// Whether this manager holds an active signing key yet.
+    pub fn has_active_key(&self) -> bool {
+        self.read_issuer()
+            .map(|issuer| issuer.has_active_key())
+            .unwrap_or(false)
     }
 
     /// How long a token minted now for `identity` lives: its own `ttl` or
@@ -984,7 +1099,15 @@ impl WorkloadIdentityState {
     /// One pass of the rotation state machine, persisting every transition:
     /// rotate when the active key is older than `rotationAge`, then expire
     /// retiring keys past their overlap window. Returns true when a rotation
-    /// happened. Driven by the background loop in `crate::manager::daemon`.
+    /// happened. Driven by the background loop in `crate::manager::daemon`,
+    /// on the control-lane leader only.
+    ///
+    /// The pass starts by reloading the key set from the store. A manager
+    /// that just won leadership holds whatever it last reloaded as a
+    /// follower, and rotating from a stale set would leave the previous
+    /// leader's newest key `active` beside the new one. A leader that still
+    /// has no active key after the reload (it started keyless and the store
+    /// has none) generates the first one here.
     pub fn rotation_tick(&self, store: &Store, now: SystemTime) -> R<bool> {
         let rotation_age = self.config.parsed_rotation_age();
         // Overlap window: a retiring key stays published for one further
@@ -994,6 +1117,8 @@ impl WorkloadIdentityState {
         let overlap = rotation_age.max(self.config.parsed_default_ttl());
 
         let mut issuer = self.write_issuer()?;
+        issuer.reload_keys(store)?;
+        issuer.ensure_active_key(store, now)?;
         let now_secs = now
             .duration_since(UNIX_EPOCH)
             .context("system clock before Unix epoch")?
@@ -1888,6 +2013,158 @@ mod tests {
         Ok(())
     }
 
+    // --- keyless start on a manager that may not write (raft follower) ---
+
+    /// A store that may not write the control lane, like a raft follower: a
+    /// streaming standby whose lease loop can never acquire (no bucket), so
+    /// `is_raft_leader` stays false and every replicated write is refused.
+    fn non_leader_store() -> R<Store> {
+        let dir = tempfile::tempdir()?.keep();
+        let mut config = crate::structs::ManagerConfigFull {
+            store_path: dir
+                .to_str()
+                .context("error parsing store path")?
+                .to_string(),
+            ..Default::default()
+        };
+        config.persistence.r#type = crate::structs::PersistenceType::Streaming;
+        config.persistence.streaming.lease.provider =
+            crate::structs::StreamingLeaseProvider::ObjectStorage;
+        let store = Store::start_storage(&config)?;
+        assert!(!store.is_raft_leader(crate::storage::Lane::Control));
+        Ok(store)
+    }
+
+    fn wi_config() -> WorkloadIdentityConfigFull {
+        WorkloadIdentityConfigFull {
+            enabled: true,
+            issuer: Some("https://manager.example.com:4747".into()),
+            ..Default::default()
+        }
+    }
+
+    /// The live-cluster crash: a joining follower used to propose
+    /// `insert_signing_key` at startup and die on the not-leader rejection.
+    /// It must start keyless instead, without writing.
+    #[test]
+    fn non_leader_initializes_keyless_without_writing() -> R<()> {
+        let store = non_leader_store()?;
+        let state = WorkloadIdentityState::initialize(
+            &store,
+            &wi_config(),
+            "http://127.0.0.1:4747",
+            now(),
+        )?;
+
+        assert!(!state.has_active_key());
+        assert!(store.list_signing_keys()?.is_empty());
+
+        // Issuance and the JWKS fail with the typed, retryable error rather
+        // than panicking or publishing an empty key set.
+        let err = state.issue(&claims(), &aws_identity(), now()).unwrap_err();
+        assert!(SigningKeyUnavailable::in_chain(&err), "{err:#}");
+        let err = state.jwks().unwrap_err();
+        assert!(SigningKeyUnavailable::in_chain(&err), "{err:#}");
+        // Discovery does not depend on keys and keeps serving.
+        assert!(state.discovery_document()?["jwks_uri"].is_string());
+        // A reload with nothing replicated yet changes nothing.
+        assert!(!state.reload_from_store(&store)?);
+        assert!(!state.has_active_key());
+        Ok(())
+    }
+
+    /// A keyless follower adopts the leader's key once it replicates, and
+    /// then verifies tokens the leader signed.
+    #[test]
+    fn keyless_follower_adopts_the_leaders_key_on_reload() -> R<()> {
+        let follower_store = non_leader_store()?;
+        let follower = WorkloadIdentityState::initialize(
+            &follower_store,
+            &wi_config(),
+            "http://127.0.0.1:4747",
+            now(),
+        )?;
+        assert!(!follower.has_active_key());
+
+        // The leader's store, holding the key it generated. The follower's
+        // replica reaching this state is modeled by reloading from it.
+        let leader_store = claims_test_store()?;
+        let leader = WorkloadIdentityState::initialize(
+            &leader_store,
+            &wi_config(),
+            "http://127.0.0.1:4747",
+            now(),
+        )?;
+        let token = leader.issue(&claims(), &aws_identity(), now())?;
+
+        assert!(follower.reload_from_store(&leader_store)?);
+        assert!(follower.has_active_key());
+        follower.verify(&token.token, "sts.amazonaws.com")?;
+        assert_eq!(
+            follower.issue(&claims(), &aws_identity(), now())?.kid,
+            token.kid
+        );
+        let jwks = follower.jwks()?;
+        assert_eq!(jwks["keys"][0]["kid"], json!(token.kid));
+        Ok(())
+    }
+
+    /// A manager that started keyless and later wins leadership, with no key
+    /// in the store (a fresh cluster whose first leader changed before any
+    /// key was written), generates the first key on its next rotation tick.
+    #[test]
+    fn keyless_manager_that_becomes_leader_generates_a_key() -> R<()> {
+        let state = WorkloadIdentityState::initialize(
+            &non_leader_store()?,
+            &wi_config(),
+            "http://127.0.0.1:4747",
+            now(),
+        )?;
+        assert!(!state.has_active_key());
+
+        // Now leading (rotation ticks run on the leader against its store).
+        let store = claims_test_store()?;
+        assert!(!state.rotation_tick(&store, now())?);
+        assert!(state.has_active_key());
+        let records = store.list_signing_keys()?;
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].state, "active");
+        state.issue(&claims(), &aws_identity(), now())?;
+
+        // The next tick neither generates a second key nor rotates.
+        assert!(!state.rotation_tick(&store, now())?);
+        assert_eq!(store.list_signing_keys()?.len(), 1);
+        Ok(())
+    }
+
+    /// A follower that wins leadership rotates from the store's key set, not
+    /// the stale set it last reloaded: otherwise the previous leader's newest
+    /// key would stay `active` beside the new one.
+    #[test]
+    fn new_leader_rotates_from_the_stores_current_keys() -> R<()> {
+        let store = claims_test_store()?;
+        let config = WorkloadIdentityConfigFull {
+            rotation_age: "24h".into(),
+            ..wi_config()
+        };
+        let old_leader =
+            WorkloadIdentityState::initialize(&store, &config, "http://127.0.0.1:4747", now())?;
+        let follower =
+            WorkloadIdentityState::initialize(&store, &config, "http://127.0.0.1:4747", now())?;
+
+        // The old leader rotates; the follower has not reloaded since.
+        let later = now() + Duration::from_secs(25 * 3600);
+        assert!(old_leader.rotation_tick(&store, later)?);
+
+        // The follower becomes leader. Its first tick must see the rotated
+        // key (fresh, so nothing is due) instead of rotating its stale one.
+        assert!(!follower.rotation_tick(&store, later)?);
+        let records = store.list_signing_keys()?;
+        assert_eq!(records.len(), 2);
+        assert_eq!(records.iter().filter(|r| r.state == "active").count(), 1);
+        Ok(())
+    }
+
     #[test]
     fn control_plane_identity_is_issued_with_issuer_audience() -> R<()> {
         let iss = issuer();
@@ -1931,6 +2208,38 @@ mod tests {
         assert_eq!(decoded["legion.io/scope"], json!("node"));
         assert_eq!(decoded["legion.io/node"], json!("node-7"));
         Ok(())
+    }
+
+    /// Regression (AWS spot check): the default issuer was built from
+    /// `server.host`, so a `0.0.0.0` bind published `http://127.0.0.1:4747`
+    /// and `server.advertiseAddr` was ignored.
+    #[test]
+    fn the_default_issuer_honors_advertise_addr_test() {
+        let mut config = crate::structs::ManagerConfigFull::default();
+        config.server.host = "0.0.0.0".into();
+        config.server.port = 4747;
+        assert_eq!(default_issuer(&config), "http://127.0.0.1:4747");
+        config.server.advertise_addr = Some("http://10.0.1.5:4747/".into());
+        assert_eq!(default_issuer(&config), "http://10.0.1.5:4747");
+    }
+
+    /// Every manager of a multi-manager cluster defaults to the same issuer,
+    /// whatever its own address, so a ticket or token one manager mints
+    /// carries the `iss` every node and peer expects.
+    #[test]
+    fn every_manager_of_a_cluster_defaults_to_one_issuer_test() {
+        use crate::structs::PersistenceType;
+        for topology in [PersistenceType::Raft, PersistenceType::Streaming] {
+            let manager = |ip: &str| {
+                let mut config = crate::structs::ManagerConfigFull::default();
+                config.persistence.r#type = topology.clone();
+                config.server.host = "0.0.0.0".into();
+                config.server.advertise_addr = Some(format!("http://{ip}:4747"));
+                default_issuer(&config)
+            };
+            assert_eq!(manager("172.31.93.106"), manager("172.31.88.20"));
+            assert_eq!(manager("172.31.93.106"), "https://manager.legion");
+        }
     }
 
     #[test]
