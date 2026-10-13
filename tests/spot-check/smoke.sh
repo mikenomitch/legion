@@ -613,7 +613,7 @@ scenario_sessions_edge() {
     out="$(edge stop "$sid" --node "$a1" --ticket "$ticket")"
     [ "$(jq -r '.data.stopped // empty' <<<"$out" 2>/dev/null)" = true ] && ok "session stop ended it" || bad "session stop: $(tr '\n' ' ' <<<"$out")"
     out="$(edge stop "$sid" --node "$a1" --ticket "$ticket")"
-    [ "$(jq -r '.data.stopped // empty' <<<"$out" 2>/dev/null)" = false ] && ok "a repeated stop answers stopped=false" ||
+    [ "$(jq -r '.data.stopped | tostring' <<<"$out" 2>/dev/null)" = false ] && ok "a repeated stop answers stopped=false" ||
         bad "repeat stop: $(tr '\n' ' ' <<<"$out")"
     legion instance stop "$(jq -r '.data.sessionId // empty' <<<"$a" 2>/dev/null)" >/dev/null 2>&1
 }
