@@ -1272,7 +1272,52 @@ it now prints `[code=FailedPrecondition]`, and one `hint_for(code, message)`
 serves both formats. `Unavailable` distinguishes a transport failure (the
 manager is unreachable) from a manager answer (a worker or leader behind it).
 
-## 51. Linux `command` still replaces `ENTRYPOINT`; examples name the entrypoint instead
+## 51. Stored CLI tokens are keyed by manager address, and a first start replaces the file for its address
+
+*Workstream: CLI and diagnostics (2026-10-12 re-run).*
+
+**The call.** The CLI token file moved from one `~/.legion/token` to
+`~/.legion/tokens/<host>_<port>`, named from `LEGION_ADDR` with the scheme
+dropped. `legion login`, `legion logout`, the CLI's lookup and the manager's
+first-start write all use that one name. The manager writes under its
+*local* address (`server.host`/`server.port`, `0.0.0.0` as `127.0.0.1`),
+not `advertiseAddr`, and it now replaces a file already there instead of
+leaving it alone. An `Unauthenticated` reply's hint names the file (or
+`LEGION_TOKEN`) and the address the CLI used:
+
+```text
+Hint: the CLI sent the token stored for http://127.0.0.1:4757 in
+/home/me/.legion/tokens/127.0.0.1_4757, which this manager does not accept ...
+```
+
+**Alternatives.**
+- Keep one file and warn louder. The second cluster's operator still gets
+  the wrong token, which is the bug.
+- Key by cluster name, as the federation plan's contexts would
+  (`~/.legion/tokens/<name>`). The CLI does not know a cluster's name before
+  its first call, so that needs contexts first.
+- Fall back to the old `~/.legion/token` when no per-address file exists.
+  AGENTS.md says no compatibility shims, and a fallback reintroduces the
+  cross-cluster leak for any address without its own file.
+- Keep "leave an existing file alone" for the per-address file. A cluster
+  rebuilt on the same port (the common dev loop) would then present the dead
+  cluster's token, the same bug one level down.
+
+**Trade-off.** A raft cluster reached through several managers needs a file
+per address (`legion login` against each, or `LEGION_TOKEN`). The rig's
+`rig_install_cli_token` now writes one per control-plane address. Two
+clusters that take turns on one address replace each other's file, and the
+older one's CLI then fails `Unauthenticated` with a hint naming the file to
+fix. A manager behind `advertiseAddr` is reached from its own machine by its
+listen address, which is what the name uses.
+
+**Why.** Simplicity: the name comes from what the CLI already knows, so there
+is nothing new to configure, and two local clusters on different ports just
+work. The mint only runs on a cluster with no management token, so a file it
+replaces held a token that cluster would reject anyway (or a lesser login to
+it). Documented in [auth-and-acls.md](../../docs/auth-and-acls.md#where-the-initial-token-goes).
+
+## 52. Linux `command` still replaces `ENTRYPOINT`; examples name the entrypoint instead
 
 *Workstream: Linux containers.*
 
@@ -1291,7 +1336,7 @@ on Linux, with Postgres refusing to run as root.
 `command` optional: a user-facing surface change that needs its own plan, not
 a fix folded into a capability change.
 
-## 52. `postgres.ncl` drops `to = 5432` and listens on the assigned port
+## 53. `postgres.ncl` drops `to = 5432` and listens on the assigned port
 
 *Workstream: Linux containers.*
 
@@ -1309,7 +1354,7 @@ collides with a second Postgres on the node and is not the port the service
 and health check use; on macOS, `to` would publish the host port to 5432 while
 Postgres listens on the assigned one. Without `to`, one command works on both.
 
-## 53. A worker's manager trust is shared per cluster by aliasing every reported address to the token's verifier
+## 54. A worker's manager trust is shared per cluster by aliasing every reported address to the token's verifier
 
 *Workstream: Manager availability (found on the AWS spot check, after entry 7
 shipped).*
@@ -1354,7 +1399,7 @@ simplicity won. The security property does not change: an address only says
 where to dial, and the manager there must still present a `manager.legion`
 certificate chained to the CA the token pinned.
 
-## 54. The reschedule backoff is a replicated hold the planner honors, not a timer
+## 55. The reschedule backoff is a replicated hold the planner honors, not a timer
 
 *Workstream: Scheduling (found on the AWS spot-check re-run, after the
 backoff shipped).*
@@ -1407,7 +1452,7 @@ Replicating it makes the operator-facing state truthful on every manager and
 makes the backoff survive the restarts and leader changes the rig does
 routinely. Correctness and operator clarity won over a smaller diff.
 
-## 55. The backoff doubles per consecutive failure, per instance, and resets once a replacement survives `move_period`
+## 56. The backoff doubles per consecutive failure, per instance, and resets once a replacement survives `move_period`
 
 *Workstream: Scheduling.*
 
@@ -1436,7 +1481,7 @@ instance keeps one broken sandbox from making every other sandbox of the task
 wait 30 minutes on its first failure. That would have turned a backoff meant
 for safety into an outage for a keyed sandbox fleet.
 
-## 56. `--force-reschedule` drops the job's move history, `instance start` keeps it
+## 57. `--force-reschedule` drops the job's move history, `instance start` keeps it
 
 *Workstream: Scheduling.*
 
@@ -1462,7 +1507,106 @@ script that calls start in a loop from defeating the backoff. Reusing
 "make this instance run", and for a `rescheduling` instance it used to do
 nothing.
 
-## 57. A restoring node reads published parts with its own `contentStore` credential, and only for URLs under its own `contentStore.url`
+## 58. A one-shot CLI command dies by SIGPIPE (status 141) on a closed pipe
+
+*Workstream: CLI and diagnostics (2026-10-12 re-run).*
+
+**The call.** `legion raft status | head` panicked with "failed printing to
+stdout: Broken pipe". `main` now restores the default SIGPIPE disposition
+for every command except the long-running ones (`start`, `join`, `mcp`,
+`guest-agent`, `guest-resume`), so the CLI ends the way `cat` and `grep` do:
+killed by the signal, which the shell reports as 141.
+
+**Alternatives.** Handle `EPIPE` in the output layer and exit 0. Every
+`println!` in `src/cmd` (hundreds of them, plus `print_table`) would have to
+become a fallible write, or the panic would have to be caught and
+classified.
+
+**Trade-off.** Under `set -o pipefail`, `legion job list | head -1` reports
+141 instead of 0, exactly as `cat file | head -1` does. Servers keep ignoring
+SIGPIPE, so a dropped peer stays an error they handle.
+
+**Why.** Simplicity: one call at startup covers every print site, present
+and future, and 141 is the convention pipeline scripts already know.
+
+## 59. CLI handlers drop `#[instrument(err)]` across `src/cmd`, not only on `state query`
+
+*Workstream: CLI and diagnostics (2026-10-12 re-run).*
+
+**The call.** The ANSI `ERROR legion::cmd::state: error: …` line the re-run
+saw came from `#[instrument(err, skip_all)]` on the command handler, and it
+went to stdout on top of the `Error: …` line `main` prints on stderr. Every
+human-mode error of every command printed twice. All 74 CLI handlers now use
+`#[instrument(skip_all)]`, and docs/codebase-conventions.md says why.
+
+**Alternatives.** Fix only `state.rs` (the reported command), or raise the
+console filter for `legion::cmd` in one-shot mode, which would also hide
+the `warn!` lines commands print on purpose.
+
+**Trade-off.** A command's error no longer reaches `./logs/events.log` as a
+JSON event. It still reaches the user, once, on stderr.
+
+**Why.** The double print is the same bug everywhere, and one convention is
+easier to keep than a list of exceptions.
+
+## 60. User SQL errors are `InvalidArgument` only on the `state query` path
+
+*Workstream: CLI and diagnostics (2026-10-12 re-run).*
+
+**The call.** In `query_state_store`, a statement that does not compile
+(`SqlInputError`), any other `SQLITE_ERROR`, and a second statement map to
+`StorageError::InvalidInput` with SQLite's message (`no such column: x in
+SELECT x FROM job at offset 7`), so the RPC answers `InvalidArgument`. The
+store function also stops logging its errors at ERROR.
+
+**Alternatives.** Classify `SQLITE_ERROR` as `InvalidInput` in
+`StorageError::from_rusqlite` for every caller.
+
+**Trade-off.** A second classifier next to the shared one.
+
+**Why.** From Legion's own SQL, `SQLITE_ERROR` is a bug. The re-run's
+`allocation.job_id` lookup was exactly that, and it must stay `Internal`
+and logged at ERROR. Only raw user SQL makes it the caller's mistake.
+
+## 61. Server disambiguation errors name the CLI flag first, the API field second
+
+*Workstream: CLI and diagnostics (2026-10-12 re-run).*
+
+**The call.** "name one with task_name" now reads `name one with --task
+(task_name in the API): ws, idler`, and the same for `job scale` (`--group`
+and `--task`), session task selection, and `state query`'s `--allow-write`.
+
+**Alternatives.** Have the CLI pre-check (it would need the job's task list
+first, an extra RPC per call), or rewrite server messages in the CLI by
+string matching.
+
+**Trade-off.** API, MCP and UI callers see a CLI flag before the field they
+set. The MCP tools' argument is `task` too, so the flag name still reads
+right there.
+
+**Why.** Simplicity: the CLI is the surface people and agents use most, the
+server already puts CLI fixes in its hints ("use --disk"), and keeping the
+field name in parentheses leaves API callers a clear path.
+
+## 62. MCP decodes node attributes in the tool layer; the proto keeps JSON text
+
+*Workstream: CLI and diagnostics (2026-10-12 re-run).*
+
+**The call.** `legion_node_list`, `legion_node_claims` and `legion_node_drain`
+decode `configAttrs`, `fingerprintAttrs`, `dynamicAttrs` and `healthChecks`
+from JSON text into objects before returning. `legion node list --json`
+already decoded them (through `Node::from`), and a test now pins both shapes.
+
+**Alternatives.** Change the `NodeMsg` fields to `google.protobuf.Struct` or
+a typed message, a wire change for every client including the UI.
+
+**Trade-off.** The gRPC `NodeMsg` still carries strings, so a raw gRPC caller
+decodes them itself, as the proto comments say.
+
+**Why.** The papercut was the agent surface. Fixing it where the JSON is
+built keeps the wire format and the UI untouched.
+
+## 63. A restoring node reads published parts with its own `contentStore` credential, and only for URLs under its own `contentStore.url`
 
 *Workstream: Suspend and resume (durable checkpoints).*
 

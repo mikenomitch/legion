@@ -261,7 +261,7 @@ How to use it:
           failure says the node has no credential for that store
           (`ArtifactStager::fetch_sealed_into_store`,
           [artifacts.md](../docs/artifacts.md#publishing-content),
-          [calls #57](calls/launch-spot-check-fixes-plan_calls.md)).
+          [calls #63](calls/launch-spot-check-fixes-plan_calls.md)).
           Unit-tested, not yet re-run on the rig.
     - [ ] Rerun the store suspend and cross-node resume on the rig.
     - [ ] Placement ignores which `contentStore` a node has, so a resume can
@@ -4081,20 +4081,26 @@ Deferred from [operator-ui-gaps-plan.md](plans/operator-ui-gaps-plan.md):
 - [ ] **AWS spot-check re-run (2026-10-12): open papercuts.** Found on the
       rig, not fixed on `spot-check/fixes-2026-10-12`
       ([findings](launch-spot-check-findings.md#re-run-2026-10-12)).
-  - [ ] **A worker restart severs in-flight mesh connections.** Re-adopted
+  - [ ] **Keep the mesh datapath alive across a worker restart.** Re-adopted
         tasks keep running, but the datapath lives in the worker, so their
         upstream connections drop and an app without reconnect logic fails
-        until rescheduled. Document it in `docs/upgrades.md`, or keep the
-        datapath alive across a worker restart.
-  - [ ] **One `~/.legion/token` for every cluster.** A second local manager
-        logs "token already exists and was left alone" and the CLI then
-        presents the other cluster's token ("unknown or revoked ACL
-        token"). Key stored tokens by manager address.
+        until rescheduled. Documented now
+        ([upgrades.md](../docs/upgrades.md#restarting-a-worker-in-place)).
+        Running the listeners in a process that outlives the worker would
+        remove the limitation.
   - [ ] **Stopping the macOS manager leaves its Apple containers running.**
         SIGTERM to `legion start manager --run-worker` exits without tearing
         down the containers it started.
-  - [ ] **The CLI panics on a closed pipe.** `legion raft status | head`
-        prints "failed printing to stdout: Broken pipe" and a panic.
+  - [ ] **The CLI writes its tracing to stdout and logs into the working
+        directory.** One-shot commands print `info`/`warn` events in the
+        pretty ANSI format on stdout, where they mix with `--json` output,
+        and every command creates `./logs` and `./traces` wherever it runs
+        (`src/tracing_util.rs`, `init_tracing_with_options`). Found while
+        fixing the double-printed command errors.
+  - [ ] **`state query` runs only the first of several statements.** The
+        read path prepares the SQL once, so `SELECT 1; SELECT 2` silently
+        returns the first result and ignores the rest. Refuse a trailing
+        statement instead (`src/storage/store.rs`, `query_state_store`).
   - [ ] **`job plan` errors where `job run` would preempt.** With the
         workers full of low-band microVMs, `job plan` for a high-band claim
         failed "no available nodes", while the run preempted and placed.
@@ -4103,19 +4109,15 @@ Deferred from [operator-ui-gaps-plan.md](plans/operator-ui-gaps-plan.md):
   - [ ] **No CLI lists a job's allocations.** `job info` shows none, and
         there is no `job status`, so finding a failing allocation means
         `legion state query`.
-  - [ ] **`state query` user errors are `Internal`.** A bad column returns
-        code `Internal` plus an ANSI tracing line on the CLI.
-  - [ ] **`net policy test` names a proto field.** Its error says "name one
-        with task_name" where the flag is `--task`.
-  - [ ] **Node attrs are double-encoded JSON** in `node list --json` and the
-        MCP tool (`configAttrs` and `dynamicAttrs` are strings).
   - [ ] **Storage tests need a higher fd limit.** Under the default 1024 on a
         32-core box, about ten `storage::` tests fail "unable to open
         database file". They pass with `ulimit -n 65536`. Note it in
         `docs/testing-and-benchmarks.md` or lower the per-test fd use.
   - [ ] **Re-verify on the rig:** the microVM clean stop (volume writes
         survive `instance stop`) and image pulls after a leader failover.
-        Both fixes are unit-tested only.
+        Both fixes are unit-tested only. Also two local managers on
+        different ports, each with its own `~/.legion/tokens/` file, and
+        `rig_install_cli_token`'s per-address files on a 3-manager rig.
 
 - [ ] **Ship a Nickel contract library for the jobspec.** `legion job schema`
       emits JSON Schema for the *rendered* JSON; an importable
@@ -5494,7 +5496,7 @@ Bug fixes, no plan. Uncommitted at the time of writing.
       instance's hold (`--force-reschedule` lifts the job's)
       ([jobs-tasks-and-scheduling.md](../docs/jobs-tasks-and-scheduling.md#manager-side-move-logic),
       [event-stream.md](../docs/event-stream.md),
-      [calls](calls/launch-spot-check-fixes-plan_calls.md#54-the-reschedule-backoff-is-a-replicated-hold-the-planner-honors-not-a-timer)).
+      [calls](calls/launch-spot-check-fixes-plan_calls.md#55-the-reschedule-backoff-is-a-replicated-hold-the-planner-honors-not-a-timer)).
 - [x] **Two seeded saved queries** (`agent:recent-failed-evals`,
       `agent:pending-evals`) named eval columns that do not exist (`kind`,
       `node_name`). Fixed, with a test that runs every seeded query.
@@ -5515,6 +5517,43 @@ Bug fixes, no plan. Uncommitted at the time of writing.
       longer deletes the host file it names), lets a hard link replace a
       lower layer's file, and lets a file replace a directory
       ([task-runtime-container.md](../docs/task-runtime-container.md)).
+- [x] **One `~/.legion/token` served every cluster.** A second local manager
+      left the file alone and the CLI presented the other cluster's token.
+      Stored tokens are now keyed by manager address
+      (`~/.legion/tokens/<host>_<port>`) for `legion login`, `logout`, the
+      CLI lookup and the manager's first-start write, which replaces a stale
+      file for its own address. An `Unauthenticated` hint names the file and
+      address the CLI used
+      ([auth-and-acls.md](../docs/auth-and-acls.md#where-the-initial-token-goes),
+      [calls](calls/launch-spot-check-fixes-plan_calls.md#51-stored-cli-tokens-are-keyed-by-manager-address-and-a-first-start-replaces-the-file-for-its-address)).
+- [x] **The CLI panicked on a closed pipe.** One-shot commands restore the
+      default SIGPIPE disposition and end with status 141 like `cat`
+      (`tests/cli_closed_pipe.rs`,
+      [calls](calls/launch-spot-check-fixes-plan_calls.md#58-a-one-shot-cli-command-dies-by-sigpipe-status-141-on-a-closed-pipe)).
+- [x] **`state query` user errors were `Internal`, with an ANSI tracing
+      line.** SQL that does not compile or names a missing column or table
+      is `InvalidArgument` with SQLite's message. CLI handlers no longer
+      carry `#[instrument(err)]`, which printed every command error a
+      second time on stdout
+      ([codebase-conventions.md](../docs/codebase-conventions.md#tracing-and-diagnostics),
+      [calls](calls/launch-spot-check-fixes-plan_calls.md#59-cli-handlers-drop-instrumenterr-across-srccmd-not-only-on-state-query)).
+- [x] **Server errors named proto fields.** `net policy test`, session task
+      selection, `job scale` and `state query` now name the CLI flag
+      (`--task`, `--group`, `--allow-write`) with the API field in
+      parentheses.
+- [x] **Node attrs were JSON strings in the MCP tools.** `legion_node_list`,
+      `legion_node_claims` and `legion_node_drain` return `configAttrs`,
+      `fingerprintAttrs`, `dynamicAttrs` and `healthChecks` as objects, like
+      `legion node list --json`
+      ([calls](calls/launch-spot-check-fixes-plan_calls.md#62-mcp-decodes-node-attributes-in-the-tool-layer-the-proto-keeps-json-text)).
+- [x] **A worker restart's effect on mesh connections was undocumented.**
+      [upgrades.md](../docs/upgrades.md#restarting-a-worker-in-place) and
+      [architecture-managers-workers.md](../docs/architecture-managers-workers.md#running-a-worker-under-a-service-manager)
+      now say re-adopted tasks keep running but lose in-flight datapath
+      connections, so apps should reconnect. Keeping the datapath alive
+      stays open.
+- [x] **The macOS spot-check config said "no ACLs".** The comment and
+      RUNBOOK section 10 now say where the token is.
 - [ ] **A count=1 job got repeated second placements after a KV env-change
       restart** (kv-demo: 1273, 1274 failing on sc-wkr-2 every ~90s while
       1272 served on sc-wkr-1). Not root-caused from the code. A reschedule

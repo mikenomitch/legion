@@ -87,17 +87,18 @@ landed, and this run needed no shims at the end.
 
 **P2, fixed:** destroyed volumes listed by default, the CLI hanging on a
 leaderless cluster, misleading gating warning on macOS, and leader-only
-ERROR noise on followers.
+ERROR noise on followers. Later: one `~/.legion/token` for every cluster
+(now one per manager address), the CLI panicking on a closed pipe,
+`state query` user errors coming back `Internal`, server errors naming proto
+fields instead of CLI flags, and node attributes as JSON strings in MCP.
 
 **Still open:** listed in [TODO.md](TODO.md) under the 2026-10-12 groups.
 The notable ones:
 
 - A worker restart severs in-flight mesh connections, since the datapath
   lives in the worker. Apps without reconnect logic break until rescheduled.
-- One `~/.legion/token` serves every cluster, so a second local manager
-  silently gets the wrong token.
+  Documented in `docs/upgrades.md` now.
 - Stopping the macOS manager leaves its Apple containers running.
-- The CLI panics on a closed pipe (`legion ... | head`).
 - `job plan` errors where `job run` would preempt.
 - Instance JSON shows `nodeId: null` for an active instance.
 - Memory restore took 5.9 s on nested virtualization, against the 300 ms
