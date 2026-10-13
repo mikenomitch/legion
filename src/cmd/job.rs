@@ -1400,7 +1400,7 @@ mod tests {
                  (backoff 4m)"
                     .to_string(),
                 "  `legion job run <spec> --force-reschedule` retries now (`legion instance \
-                 start <id>` for one keyed instance)"
+                 start <id>` for one instance)"
                     .to_string(),
             ]
         );
@@ -2465,7 +2465,7 @@ fn reschedule_backoff_lines(backoffs: &[crate::structs::RescheduleBackoff]) -> V
     }
     lines.push(
         "  `legion job run <spec> --force-reschedule` retries now (`legion instance start <id>` \
-         for one keyed instance)"
+         for one instance)"
             .to_string(),
     );
     lines

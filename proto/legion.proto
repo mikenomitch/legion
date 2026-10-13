@@ -425,8 +425,10 @@ service Manager {
   //   retry, or pass `force_move`).
   // - Aborted: a `store` session's resume lost its generation claim to a
   //   racing resume (`superseded`, naming the winner).
-  // - InvalidArgument: the instance is slot-mode (slot lifecycles are owned
-  //   by the scheduler via `count.num`, not this API).
+  // - InvalidArgument: the instance is slot-mode and not `rescheduling` (slot
+  //   lifecycles are owned by the scheduler via `count.num`, not this API;
+  //   lifting a slot instance's reschedule backoff is the one start it
+  //   takes).
   // - FailedPrecondition: the instance is Terminated (destroyed ids are
   //   tombstoned forever — create a NEW id instead), the owning job is
   //   stopped (run the job first; a stopped job schedules nothing), or a

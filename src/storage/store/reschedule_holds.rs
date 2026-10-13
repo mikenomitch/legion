@@ -27,8 +27,8 @@
 //!   change.
 //! - **It can be lifted.** A `job_update` eval (`job run --force-reschedule`,
 //!   restarting a stopped or failed job) deletes the job's holds and with
-//!   them its move history; StartInstance lifts one keyed instance's hold
-//!   and keeps the history.
+//!   them its move history; StartInstance lifts one instance's hold (keyed
+//!   or slot) and keeps the history.
 
 use super::*;
 
@@ -166,12 +166,10 @@ impl RescheduleHold {
     }
 
     /// How an operator retries before the backoff runs out.
-    pub fn retry_hint(&self, keyed: bool) -> String {
-        match (keyed, self.instance_id.as_deref()) {
-            (true, Some(instance_id)) => {
-                format!("`legion instance start {instance_id}` retries now")
-            }
-            _ => "`legion job run <spec> --force-reschedule` retries now".to_string(),
+    pub fn retry_hint(&self) -> String {
+        match self.instance_id.as_deref() {
+            Some(instance_id) => format!("`legion instance start {instance_id}` retries now"),
+            None => "`legion job run <spec> --force-reschedule` retries now".to_string(),
         }
     }
 }

@@ -92,7 +92,7 @@ runs for the job. Each deferral emits an `allocation.reschedule_deferred`
 event. `legion instance get` (for a stateful instance) and `legion job info`
 say which attempt failed, why, and when the next one is. `legion job run
 <spec> --force-reschedule` retries every waiting replacement now, and
-`legion instance start <id>` retries one keyed instance. The backoff
+`legion instance start <id>` retries one stateful instance. The backoff
 doubles from `move_delay` up to 30 minutes and starts over once a
 replacement survives `move_period`. Raise `move_delay` to back off harder,
 and set `move_count` to fail the job instead of retrying forever.

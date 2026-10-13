@@ -319,6 +319,13 @@ sc-wkr-1, which is unavailable ... use legion volume delete --force <id>`.
 That node was healthy, so the advice tells a user to delete data they
 haven't lost.
 
+*Update, 2026-10-12.* A reschedule now avoids the failed node and falls back
+to it, and the message only says "unavailable" for a node the scheduler sees
+as lost or unavailable. The rig then showed the last case: a slot instance
+pinned to its volume's node was refused there as "healthy but has no room"
+on a node 12% reserved, because the disk check charged its 2G volume again.
+Fixed (TODO.md, Done).
+
 ### P1-4. Gated containers race their network namespace
 
 *Open, intermittent.* An allocation failed with `gated network namespace

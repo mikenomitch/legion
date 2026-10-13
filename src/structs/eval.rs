@@ -1590,6 +1590,327 @@ mod tests {
         Ok(())
     }
 
+    /// A failed-allocation reschedule as the manager runs it: the removal
+    /// spends the move budget and leaves a hold, and the delayed eval names
+    /// the failed node.
+    struct FailedReschedule<'a> {
+        store: &'a Store,
+        job: String,
+        job_config_id: String,
+        seq: u32,
+    }
+
+    impl<'a> FailedReschedule<'a> {
+        fn submit(store: &'a Store, job_config: &JobConfig) -> R<Self> {
+            store.handle_job_submit(
+                job_config,
+                &[Submission {
+                    path: "job.ncl".into(),
+                    content: "job".into(),
+                    is_primary: true,
+                }],
+            )?;
+            let job_config_id = store.get_job_config(&job_config.name)?.id();
+            let mut this = Self {
+                store,
+                job: job_config.name.clone(),
+                job_config_id,
+                seq: 0,
+            };
+            this.eval("job_submit", "")?;
+            Ok(this)
+        }
+
+        fn eval(&mut self, kind: &str, node_name: &str) -> R<String> {
+            self.seq += 1;
+            Eval {
+                id: format!("{kind}-{}", self.seq),
+                status: "pending".into(),
+                kind: kind.into(),
+                job_id: self.job.clone(),
+                job_config_id: self.job_config_id.clone(),
+                node_name: node_name.into(),
+                priority: 50,
+            }
+            .handle(self.store)
+        }
+
+        /// Fail one allocation the way a worker report does, with a 30s
+        /// backoff, and return the node it failed on.
+        fn fail(&self, allocation: &crate::structs::Allocation) -> R<String> {
+            let removal = self
+                .store
+                .remove_failed_allocation(
+                    allocation.id,
+                    crate::structs::stop::StopCause::Unknown,
+                    None,
+                    crate::storage::store::FailedMove {
+                        policy: crate::storage::store::MovePolicy {
+                            move_delay_ms: 30_000,
+                            move_count: None,
+                            move_period_ms: 3_600_000,
+                        },
+                        reason: "exit status 1".into(),
+                    },
+                )?
+                .context("allocation removed")?;
+            assert!(matches!(
+                removal.verdict,
+                crate::storage::store::MoveVerdict::Deferred(_)
+            ));
+            Ok(allocation.node_id.clone())
+        }
+
+        /// The backoff runs out (the delayed eval's moment).
+        fn expire_holds(&self) -> R<()> {
+            self.store.write_connection()?.execute(
+                "UPDATE reschedule_hold SET not_before_unix = 0 WHERE job_id = ?1;",
+                [&self.job],
+            )?;
+            Ok(())
+        }
+
+        fn allocations(&self) -> R<Vec<crate::structs::Allocation>> {
+            self.store.allocs_for_job(&self.job)
+        }
+    }
+
+    fn pinned_slot_job(name: &str) -> JobConfig {
+        use crate::structs::{InstanceMode, StatefulConfig, StatefulStorageConfig};
+        JobConfig {
+            priority: Default::default(),
+            rollout: None,
+            rollout_by_group: Default::default(),
+            name: name.into(),
+            tasks: vec![TaskConfig {
+                group: "db".into(),
+                resources: json!({ "memory": 512 }),
+                stateful: Some(StatefulConfig {
+                    mode: InstanceMode::Slot,
+                    require_id: false,
+                    initial_instances: None,
+                    on_lost: None,
+                    storage: Some(StatefulStorageConfig {
+                        driver: Some("local-dir".into()),
+                        mode: None,
+                        params: Some(json!({ "size": "2G" })),
+                        path: "/var/lib/postgresql/data".into(),
+                        retain_on_scale_in: None,
+                        retain_on_stop: None,
+                    }),
+                    envelope: None,
+                    promote: None,
+                    fence_after: None,
+                }),
+                ..TaskConfig::new("postgres", "service")
+            }],
+            version: None,
+        }
+    }
+
+    /// Fill `node_id` so nothing else fits on it.
+    fn fill_node(store: &Store, node_id: &str) -> R<()> {
+        let filler = JobConfig {
+            priority: Default::default(),
+            rollout: None,
+            rollout_by_group: Default::default(),
+            name: format!("filler-{node_id}"),
+            tasks: vec![TaskConfig {
+                resources: json!({ "memory": 8000 }),
+                constraints: json!({ "node_id": node_id }),
+                ..TaskConfig::new("fill", "service")
+            }],
+            version: None,
+        };
+        let placed = FailedReschedule::submit(store, &filler)?.allocations()?;
+        assert_eq!(placed.len(), 1);
+        assert_eq!(placed[0].node_id, node_id);
+        Ok(())
+    }
+
+    /// Place the spot check's `postgres` (slot mode, local-dir storage) on
+    /// node-a, have the worker report its volume mounted there, and add
+    /// node-b. Returns the harness and the instance's allocation.
+    /// `make_node` reporting `free_gib` of free disk, which the disk-fit
+    /// check reads.
+    fn make_node_with_disk(id: &str, free_gib: u64) -> Node {
+        let mut node = make_node(id, "east");
+        node.fingerprint_attrs["disk_available_space"] = json!((free_gib << 30).to_string());
+        node
+    }
+
+    /// The spot check's `postgres` (slot mode, local-dir storage, `size =
+    /// "2G"`) placed on node-a, its volume reported mounted there, and
+    /// node-b added. Afterwards node-a's free disk drops to 1 GiB, under the
+    /// declared size, as the rig's worker's did: the volume already exists
+    /// there, so that must not keep the instance off its node. Returns the
+    /// harness and the instance's allocation.
+    fn pinned_postgres(store: &Store) -> R<(FailedReschedule<'_>, crate::structs::Allocation)> {
+        store.insert_node(NodeMsg::from(make_node_with_disk("node-a", 50)))?;
+        let db = FailedReschedule::submit(store, &pinned_slot_job("fullstack"))?;
+        let allocation = db.allocations()?.pop().context("postgres placed")?;
+        assert_eq!(allocation.node_id, "node-a");
+        let handle = store
+            .get_instance("fullstack-db-0")?
+            .and_then(|instance| instance.storage_handle)
+            .context("slot instance has storage")?;
+        let volume_id = handle.split_once('/').context("driver/volume handle")?.1;
+        store.record_volume_mounted(
+            volume_id,
+            "node-a",
+            "/var/lib/legion/volumes/v",
+            true,
+            None,
+            &Default::default(),
+        )?;
+        store.insert_node(NodeMsg::from(make_node_with_disk("node-a", 1)))?;
+        store.insert_node(NodeMsg::from(make_node_with_disk("node-b", 50)))?;
+        Ok((db, allocation))
+    }
+
+    /// Spot check 2026-10-12 (P0): a slot instance whose local-dir volume
+    /// lives on node-a fails there. Its replacement waits out the backoff,
+    /// then goes back to node-a, the only node holding its data, whether or
+    /// not another node has room.
+    #[test]
+    fn a_failed_pinned_slot_instance_returns_to_its_node_after_the_backoff() -> R<()> {
+        for other_node_full in [false, true] {
+            let store = setup_store()?;
+            let (mut db, allocation) = pinned_postgres(&store)?;
+            if other_node_full {
+                fill_node(&store, "node-b")?;
+            }
+            let failed_on = db.fail(&allocation)?;
+
+            // Inside the backoff nothing is placed, by any eval.
+            db.eval("job_reschedule", &failed_on)?;
+            db.eval("job_reschedule", "")?;
+            assert!(db.allocations()?.is_empty(), "the replacement waits");
+            let waiting = store.get_instance("fullstack-db-0")?.context("instance")?;
+            assert_eq!(waiting.state, crate::structs::InstanceState::Rescheduling);
+
+            // The delayed reschedule names node-a, and node-a is still the
+            // only place the replacement may go.
+            db.expire_holds()?;
+            let outcome = db.eval("job_reschedule", &failed_on)?;
+            let placed = db.allocations()?;
+            assert_eq!(
+                placed.len(),
+                1,
+                "{outcome} (other node full: {other_node_full})"
+            );
+            assert_eq!(placed[0].node_id, "node-a");
+            assert_eq!(placed[0].instance_id.as_deref(), Some("fullstack-db-0"));
+        }
+        Ok(())
+    }
+
+    /// `job run --force-reschedule` (a `job_update` eval) places a pinned
+    /// slot instance inside its backoff, on its node.
+    #[test]
+    fn force_reschedule_places_a_pinned_slot_instance_inside_its_backoff() -> R<()> {
+        let store = setup_store()?;
+        let (mut db, allocation) = pinned_postgres(&store)?;
+        db.fail(&allocation)?;
+        db.eval("job_update", "")?;
+        let placed = db.allocations()?;
+        assert_eq!(placed.len(), 1);
+        assert_eq!(placed[0].node_id, "node-a");
+        assert!(store
+            .reschedule_hold_for_instance("fullstack-db-0")?
+            .is_none());
+        Ok(())
+    }
+
+    /// When the pinned node is not a candidate at all, the error names it
+    /// and says why, instead of blaming capacity on the other node (the
+    /// rig's first message: "no available nodes … Preemption did not run").
+    #[test]
+    fn a_pinned_instance_whose_node_is_not_schedulable_says_so() -> R<()> {
+        let store = setup_store()?;
+        let (mut db, allocation) = pinned_postgres(&store)?;
+        fill_node(&store, "node-b")?;
+        let failed_on = db.fail(&allocation)?;
+        store.set_node_availability("node-a", "drained")?;
+        db.expire_holds()?;
+        let error = db
+            .eval("job_reschedule", &failed_on)
+            .expect_err("node-a is drained and node-b is full");
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("holds node-local storage on node node-a, which is cordoned"),
+            "{message}"
+        );
+        assert!(!message.contains("Preemption did not run"), "{message}");
+        Ok(())
+    }
+
+    /// `legion instance start` on a slot instance waiting out its backoff
+    /// lifts the hold, and the reschedule it queues places the instance on
+    /// its node. Any other start of a slot instance is still refused.
+    #[test]
+    fn instance_start_retries_a_pinned_slot_instance_inside_its_backoff() -> R<()> {
+        use crate::storage::store::StartInstanceOutcome;
+        let store = setup_store()?;
+        let (mut db, allocation) = pinned_postgres(&store)?;
+        let refused = store
+            .start_keyed_instance("fullstack-db-0")
+            .expect_err("an active slot instance is not started");
+        assert!(format!("{refused:#}").contains("slot-mode"), "{refused:#}");
+
+        db.fail(&allocation)?;
+        db.eval("job_reschedule", "")?;
+        assert!(db.allocations()?.is_empty(), "held");
+        assert!(matches!(
+            store.start_keyed_instance("fullstack-db-0")?,
+            StartInstanceOutcome::BackoffLifted
+        ));
+        db.eval("job_reschedule", "")?;
+        let placed = db.allocations()?;
+        assert_eq!(placed.len(), 1);
+        assert_eq!(placed[0].node_id, "node-a");
+        Ok(())
+    }
+
+    /// A stateless task is not pinned: its replacement prefers another
+    /// node, and falls back to the failed one only when nothing else fits.
+    #[test]
+    fn a_failed_stateless_task_prefers_another_node() -> R<()> {
+        let job = |name: &str| JobConfig {
+            priority: Default::default(),
+            rollout: None,
+            rollout_by_group: Default::default(),
+            name: name.into(),
+            tasks: vec![TaskConfig {
+                resources: json!({ "memory": 512 }),
+                ..TaskConfig::new("api", "service")
+            }],
+            version: None,
+        };
+        for other_node_full in [false, true] {
+            let store = setup_store()?;
+            store.insert_node(NodeMsg::from(make_node("node-a", "east")))?;
+            let mut api = FailedReschedule::submit(&store, &job("api"))?;
+            let allocation = api.allocations()?.pop().context("api placed")?;
+            assert_eq!(allocation.node_id, "node-a");
+            store.insert_node(NodeMsg::from(make_node("node-b", "east")))?;
+            if other_node_full {
+                fill_node(&store, "node-b")?;
+            }
+            let failed_on = api.fail(&allocation)?;
+            api.expire_holds()?;
+            api.eval("job_reschedule", &failed_on)?;
+            let placed = api.allocations()?;
+            assert_eq!(placed.len(), 1);
+            let expected = if other_node_full { "node-a" } else { "node-b" };
+            assert_eq!(
+                placed[0].node_id, expected,
+                "other node full: {other_node_full}"
+            );
+        }
+        Ok(())
+    }
+
     #[test]
     fn job_submit_update_reconciles_allocations() -> R<()> {
         let store = setup_store()?;

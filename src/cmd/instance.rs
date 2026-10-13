@@ -8,7 +8,8 @@
 //!
 //! `list`/`get` also show slot-mode instances for inspection; `create`,
 //! `stop`, `start`, and `destroy` only apply to keyed mode (slot lifecycles
-//! are owned by the scheduler via `count.num`).
+//! are owned by the scheduler via `count.num`), except that `start` retries
+//! a `rescheduling` slot instance by lifting its reschedule backoff.
 //!
 //! On a session task (`stateful.mode = "session"`, docs/session-mode.md),
 //! `create` without `--id` starts an unnamed session that has no row,

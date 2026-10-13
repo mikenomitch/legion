@@ -202,6 +202,11 @@ In filesystem mode, `size` is not a quota, because a directory has no
 enforcement. The scheduler does use it for placement: it checks that a node's
 free disk can hold a task's node-local volumes before placing there. Network
 drivers like `nfs` are exempt, since their bytes live on the storage server.
+An instance going back to the node that already holds its volume (a
+replacement after a failure, a rollout's new version) is not charged its
+`size` again, since that volume adds nothing to the node's disk. A node whose
+free disk has dropped under the declared size can still take its own
+instances back.
 `mode` sets the directory permissions.
 
 In **block mode**, the driver serves a sparse disk image at

@@ -682,7 +682,7 @@ pub mod drafts {
     /// doubled per consecutive failure, capped at 30 minutes).
     /// Nothing re-places the task before `nextAttemptAt` unless an operator
     /// lifts the hold (`job run --force-reschedule`, or `instance start` for
-    /// a keyed instance). See docs/jobs-tasks-and-scheduling.md.
+    /// one stateful instance). See docs/jobs-tasks-and-scheduling.md.
     pub fn allocation_reschedule_deferred(
         hold: &crate::storage::store::RescheduleHold,
     ) -> EventDraft {

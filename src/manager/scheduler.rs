@@ -3514,20 +3514,44 @@ impl<'a> Scheduler<'a> {
                 // blocks the eval under the task's class (or the node a
                 // restore is pinned to) until capacity that could help
                 // appears (docs/scheduler-and-eval-loop.md, "Blocked evals").
-                let reason = match port_conflict {
-                    Some(port) => format!(
+                let next_pin = if hard_restore_pins > 0 || floating_restores.is_empty() {
+                    pins.front()
+                } else {
+                    None
+                };
+                let reason = match (port_conflict, next_pin) {
+                    (Some(port), _) => format!(
                         "Failed to place task {}: static port {port} is already in use on every \
                          node it is allowed on that has room for it. A static port fits one \
                          allocation per node: add nodes, lower the count, or use a dynamic port",
                         task_config.name
                     ),
-                    None => preemption.no_placement_error(task_config),
+                    // The placement can only go to its pinned node, and that
+                    // node is not a candidate at all (left out of this pass,
+                    // unschedulable, or no longer matching the task). That is
+                    // the whole story: the other nodes being full, and
+                    // preemption having nothing to look at there, are not.
+                    // The generic message hid this on the spot check.
+                    (None, Some((instance_id, node_id)))
+                        if !candidates.iter().any(|node| node.id == *node_id) =>
+                    {
+                        format!(
+                            "Failed to place task {}: instance {instance_id} holds node-local \
+                             storage on node {node_id}, {}",
+                            task_config.name,
+                            self.pinned_node_unusable_reason(
+                                node_id,
+                                node_lookup,
+                                &candidates,
+                                &static_ports,
+                                port_ledger,
+                                allocations_by_node,
+                            )
+                        )
+                    }
+                    (None, _) => preemption.no_placement_error(task_config),
                 };
-                let pinned_node = if hard_restore_pins > 0 || floating_restores.is_empty() {
-                    pins.front().map(|(_, node_id)| node_id.as_str())
-                } else {
-                    None
-                };
+                let pinned_node = next_pin.map(|(_, node_id)| node_id.as_str());
                 let blocked = crate::manager::blocked::PlacementBlocked::for_task(
                     task_config,
                     task_id,
@@ -3559,10 +3583,26 @@ impl<'a> Scheduler<'a> {
             // plan already put there) cannot hold the task's node-local
             // volumes. Nodes that don't report disk are not excluded — missing
             // data is not evidence of a full disk.
+            //
+            // An instance going back to the node that already holds its
+            // volume provisions nothing there, so its storage `size` is not
+            // charged on that node: the bytes are already in the node's used
+            // space. Charging them again stranded a failed slot instance whose
+            // node had less free disk than its declared size (spot check
+            // 2026-10-12: "healthy but has no room" on a 12%-reserved node).
+            // With no restore ahead of it, the next placement takes the front
+            // volume pin.
+            let provisioned_on = (hard_restore_pins == 0 && floating_restores.is_empty())
+                .then(|| pins.front().map(|(_, node_id)| node_id.as_str()))
+                .flatten();
             let eligible: Vec<&Node> = eligible
                 .into_iter()
                 .filter(|node| {
-                    let wanted = task_local_volume_bytes(node, task_config);
+                    let wanted = task_local_volume_bytes(
+                        node,
+                        task_config,
+                        provisioned_on == Some(node.id.as_str()),
+                    );
                     if wanted == 0 {
                         return true;
                     }
@@ -3596,6 +3636,9 @@ impl<'a> Scheduler<'a> {
             // A pinned instance is not a preference: placing it elsewhere would
             // silently start the workload on empty storage, so failing the eval
             // with a diagnostic is the correct outcome.
+            // Whether the pin this placement takes is a volume pin (its
+            // storage already exists on that node), for the disk ledger.
+            let takes_volume_pin = provisioned_on.is_some();
             let (pin, floating) = if hard_restore_pins > 0 {
                 hard_restore_pins -= 1;
                 (pins.pop_front(), None)
@@ -3728,34 +3771,14 @@ impl<'a> Scheduler<'a> {
                         // advice; a healthy node that is full, port-blocked,
                         // or excluded from this pass must never prompt anyone
                         // to delete data they have not lost.
-                        let why = if node_lookup.get(node_id.as_str()).is_none() {
-                            self.pinned_node_absent_reason(node_id)
-                        } else if !candidates.iter().any(|node| node.id == *node_id) {
-                            "which is healthy but no longer satisfies the task's constraints, \
-                             permit, or volume drivers. Its data is intact; restore the node's \
-                             attributes to place it there again"
-                                .to_string()
-                        } else if let Some(port) = (!static_ports.is_empty())
-                            .then(|| {
-                                port_ledger.conflict(
-                                    node_id.as_str(),
-                                    &static_ports,
-                                    allocations_by_node,
-                                )
-                            })
-                            .flatten()
-                        {
-                            format!(
-                                "which is healthy but has static port {port} in use by another \
-                                 allocation. Its data is intact; it is placed there once the \
-                                 port is free"
-                            )
-                        } else {
-                            "which is healthy but has no room for it right now (CPU, memory, \
-                             disk, or a `distinct` rule). Its data is intact; it is placed \
-                             there once the node has room"
-                                .to_string()
-                        };
+                        let why = self.pinned_node_unusable_reason(
+                            node_id,
+                            node_lookup,
+                            &candidates,
+                            &static_ports,
+                            port_ledger,
+                            allocations_by_node,
+                        );
                         let reason = format!(
                             "Failed to place task {}: instance {instance_id} holds \
                              node-local storage on node {node_id}, {why}",
@@ -3901,7 +3924,9 @@ impl<'a> Scheduler<'a> {
             }
             let placed_node = node_lookup.get(node_id.as_str());
             if let Some(node) = placed_node {
-                let wanted = task_local_volume_bytes(node, task_config);
+                let storage_provisioned =
+                    takes_volume_pin && pin.as_ref().is_some_and(|(_, pinned)| *pinned == node_id);
+                let wanted = task_local_volume_bytes(node, task_config, storage_provisioned);
                 if wanted > 0 {
                     *planned_local_bytes.entry(node_id.clone()).or_default() += wanted;
                 }
@@ -3957,12 +3982,54 @@ impl<'a> Scheduler<'a> {
         }
     }
 
+    /// Why a pinned instance's node cannot take it in this pass, worded as
+    /// the tail of "holds node-local storage on node X, …". Only a node that
+    /// is really gone gets the "abandon the data" advice: a healthy node that
+    /// is full, port-blocked, or left out of this pass must never prompt
+    /// anyone to delete data they have not lost.
+    fn pinned_node_unusable_reason(
+        &self,
+        node_id: &str,
+        node_lookup: &AvailableNodes,
+        candidates: &[&Node],
+        static_ports: &[u16],
+        port_ledger: &mut PortLedger,
+        allocations_by_node: &SharedNodeAllocations,
+    ) -> String {
+        if node_lookup.get(node_id).is_none() {
+            return self.pinned_node_absent_reason(node_id);
+        }
+        if !candidates.iter().any(|node| node.id == node_id) {
+            return "which is healthy but no longer satisfies the task's constraints, permit, \
+                    or volume drivers. Its data is intact; restore the node's attributes to \
+                    place it there again"
+                .to_string();
+        }
+        if !static_ports.is_empty() {
+            if let Some(port) = port_ledger.conflict(node_id, static_ports, allocations_by_node) {
+                return format!(
+                    "which is healthy but has static port {port} in use by another allocation. \
+                     Its data is intact; it is placed there once the port is free"
+                );
+            }
+        }
+        "which is healthy but has no room for it right now (CPU, memory, disk, or a `distinct` \
+         rule). Its data is intact; it is placed there once the node has room"
+            .to_string()
+    }
+
     /// Why a stateful instance's pinned node is not in this plan's node set
     /// at all, worded as the tail of "holds node-local storage on node X, …".
     /// Only a node that is lost or gone is called unavailable, and only then
     /// does the message mention abandoning the data.
     fn pinned_node_absent_reason(&self, node_id: &str) -> String {
-        match self.store.get_node(node_id) {
+        // The read model is what placement sees; the stored row is the
+        // fallback for a node it does not hold.
+        let node = match self.store.cached_node(node_id) {
+            Ok(Some(node)) => Ok(Node::clone(&node)),
+            _ => self.store.get_node(node_id),
+        };
+        match node {
             Ok(node) if node.status == "lost" || node.availability == "unavailable" => {
                 "which is unavailable. Waiting for that node to return; use `legion volume \
                  delete --force <id>` to abandon the data if it never will"
@@ -5568,12 +5635,27 @@ fn filter_restore_compat<'b>(
 /// not advertise fall back to the built-in set's locality. `tmpfs` is
 /// node-local but RAM-backed, so it is excluded from *disk* accounting too.
 /// Declarations without a parseable `size` contribute nothing — this is
-/// placement sanity, not quota enforcement.
-fn task_local_volume_bytes(node: &Node, task_config: &TaskConfig) -> u64 {
+/// placement sanity, not quota enforcement. `storage_provisioned` leaves out
+/// the instance storage (`stateful.storage`): the placement returns an
+/// instance to the node that already holds its volume, so it adds nothing.
+fn task_local_volume_bytes(
+    node: &Node,
+    task_config: &TaskConfig,
+    storage_provisioned: bool,
+) -> u64 {
     let advertised = node.fingerprint_attrs.get("volumeDrivers");
+    // Instance storage comes first in the declarations.
+    let skip = usize::from(
+        storage_provisioned
+            && task_config
+                .stateful
+                .as_ref()
+                .is_some_and(|stateful| stateful.storage.is_some()),
+    );
     task_config
         .volume_size_declarations()
         .into_iter()
+        .skip(skip)
         .filter_map(|(driver, size)| {
             let size = size?;
             if driver == "tmpfs" {

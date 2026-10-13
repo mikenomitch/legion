@@ -506,7 +506,7 @@ Operators see a deferred replacement in three places:
     task store (instance sb-1): attempt 4 failed (artifact staging failed: 404
     Not Found); next attempt at 2026-10-12T02:31:05Z (backoff 4m)
     `legion job run <spec> --force-reschedule` retries now (`legion instance
-    start <id>` for one keyed instance)
+    start <id>` for one instance)
   ```
 
 The same facts are on `InstanceInfo.reschedule_backoff` and
@@ -518,10 +518,11 @@ To retry before the backoff runs out:
   `job_update` eval), which drops every hold of the job and its move history,
   then places everything now. Restarting a stopped or failed job with
   `legion job run` does the same.
-- `legion instance start <id>` lifts one keyed instance's hold and places it
-  now. Its move history stays, so if it fails again the backoff continues
-  from where it was. Slot-mode instances can't be started this way, so use
-  `--force-reschedule` for them.
+- `legion instance start <id>` lifts one stateful instance's hold, keyed or
+  slot-mode, and places it now. Its move history stays, so if it fails again
+  the backoff continues from where it was. For a slot-mode instance this
+  retry is the only thing `instance start` does: its lifecycle otherwise
+  follows `count.num`.
 
 So failures escalate in order:
 

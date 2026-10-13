@@ -2924,4 +2924,164 @@ mod tests {
         assert!(store.allocs_for_job_config(&v1_id)?.is_empty());
         Ok(())
     }
+
+    fn pinned_db_job(command: &str) -> JobConfig {
+        use crate::structs::{InstanceMode, StatefulConfig, StatefulStorageConfig};
+        JobConfig {
+            priority: Default::default(),
+            rollout: None,
+            rollout_by_group: Default::default(),
+            name: "fullstack".into(),
+            tasks: vec![TaskConfig {
+                group: "db".into(),
+                resources: json!({ "memory": 512 }),
+                config: json!({ "command": command }),
+                stateful: Some(StatefulConfig {
+                    mode: InstanceMode::Slot,
+                    require_id: false,
+                    initial_instances: None,
+                    on_lost: None,
+                    storage: Some(StatefulStorageConfig {
+                        driver: Some("local-dir".into()),
+                        mode: None,
+                        params: Some(json!({ "size": "2G" })),
+                        path: "/var/lib/postgresql/data".into(),
+                        retain_on_scale_in: None,
+                        retain_on_stop: None,
+                    }),
+                    envelope: None,
+                    promote: None,
+                    fence_after: None,
+                }),
+                ..TaskConfig::new("postgres", "noop")
+            }],
+            version: None,
+        }
+    }
+
+    fn fail_allocation(store: &Store, allocation: &Allocation) -> R<()> {
+        store
+            .remove_failed_allocation(
+                allocation.id,
+                StopCause::Unknown,
+                None,
+                crate::storage::store::FailedMove {
+                    policy: crate::storage::store::MovePolicy {
+                        move_delay_ms: 30_000,
+                        move_count: None,
+                        move_period_ms: 3_600_000,
+                    },
+                    reason: "exit status 1".into(),
+                },
+            )?
+            .context("removed")?;
+        Ok(())
+    }
+
+    /// `insert_node` reporting `free_gib` of free disk to the disk-fit check.
+    fn insert_node_with_disk(store: &Store, id: &str, free_gib: u64) -> R<()> {
+        insert_node(store, id)?;
+        let mut node = NodeMsg::from(store.get_node(id)?);
+        let mut fingerprint: serde_json::Value = serde_json::from_str(&node.fingerprint_attrs)?;
+        fingerprint["disk_available_space"] = json!((free_gib << 30).to_string());
+        node.fingerprint_attrs = fingerprint.to_string();
+        store.insert_node(node)?;
+        Ok(())
+    }
+
+    /// Spot check 2026-10-12, rollout 8 of `fullstack`: the slot instance
+    /// `fullstack-db-0` (local-dir storage, `size = "2G"`) failed on the node
+    /// holding its volume, whose free disk had since dropped under 2 GiB.
+    /// Every tick said "healthy but has no room for it right now" on a node
+    /// 12% reserved: the disk check charged the volume's size again although
+    /// it already exists there. The replacement waits out its backoff, then
+    /// goes back to its node, whether the instance failed before the rollout
+    /// or during it, and whether or not the other node has room.
+    #[test]
+    fn rollout_returns_a_failed_pinned_slot_instance_to_its_node() -> R<()> {
+        for fail_before_rollout in [true, false] {
+            for node_b_full in [false, true] {
+                let case =
+                    format!("fail before rollout {fail_before_rollout}, node-b full {node_b_full}");
+                let store = setup_store()?;
+                insert_node_with_disk(&store, "node-a", 50)?;
+                let scheduler = Scheduler::new(&store)?;
+                let v1 = pinned_db_job("v1");
+                store.handle_job_submit(&v1, &[submission()])?;
+                let v1_id = store.get_job_config("fullstack")?.id();
+                let placed = scheduler.plan_and_apply(&v1_id, PlanMode::Fresh)?;
+                let v1_alloc = placed.allocations[0].clone();
+                let handle = store
+                    .get_instance("fullstack-db-0")?
+                    .and_then(|instance| instance.storage_handle)
+                    .context("storage")?;
+                store.record_volume_mounted(
+                    handle.split_once('/').context("handle")?.1,
+                    "node-a",
+                    "/v",
+                    true,
+                    None,
+                    &Default::default(),
+                )?;
+                insert_node_with_disk(&store, "node-a", 1)?;
+                insert_node_with_disk(&store, "node-b", 50)?;
+                if node_b_full {
+                    let filler = JobConfig {
+                        priority: Default::default(),
+                        rollout: None,
+                        rollout_by_group: Default::default(),
+                        name: "filler".into(),
+                        tasks: vec![TaskConfig {
+                            resources: json!({ "memory": 7800 }),
+                            ..TaskConfig::new("fill", "noop")
+                        }],
+                        version: None,
+                    };
+                    store.handle_job_submit(&filler, &[submission()])?;
+                    let filler_id = store.get_job_config("filler")?.id();
+                    let filled = scheduler.plan_and_apply(&filler_id, PlanMode::Fresh)?;
+                    assert_eq!(filled.allocations[0].node_id, "node-b");
+                }
+                if fail_before_rollout {
+                    fail_allocation(&store, &v1_alloc)?;
+                }
+                let v2 = pinned_db_job("v2");
+                store.handle_job_submit(&v2, &[submission()])?;
+                let v2_id = store.get_job_config("fullstack")?.id();
+                create_default_rollout(&store, "fullstack", &v1_id, &v2_id)?;
+                let mut log = Vec::new();
+                if !fail_before_rollout {
+                    // The rollout replaces v1 on node-a, then v2 fails there.
+                    for _ in 0..3 {
+                        log.push(tick(&store, "fullstack", &v2_id)?);
+                        if !store.allocs_for_job_config(&v2_id)?.is_empty() {
+                            break;
+                        }
+                    }
+                    let v2_alloc = store
+                        .allocs_for_job_config(&v2_id)?
+                        .pop()
+                        .with_context(|| format!("{case}: {log:?}"))?;
+                    assert_eq!(v2_alloc.node_id, "node-a", "{case}");
+                    fail_allocation(&store, &v2_alloc)?;
+                    // Inside the backoff the tick waits instead of placing.
+                    let waiting = tick(&store, "fullstack", &v2_id)?;
+                    assert!(
+                        waiting.contains("waiting for placement capacity"),
+                        "{case}: {waiting}"
+                    );
+                    assert!(store.allocs_for_job_config(&v2_id)?.is_empty(), "{case}");
+                }
+                store
+                    .write_connection()?
+                    .execute("UPDATE reschedule_hold SET not_before_unix = 0;", [])?;
+                log.push(tick(&store, "fullstack", &v2_id)?);
+                let placed = store.allocs_for_job_config(&v2_id)?;
+                assert_eq!(placed.len(), 1, "{case}: {log:#?}");
+                assert_eq!(placed[0].node_id, "node-a", "{case}");
+                assert_eq!(placed[0].instance_id.as_deref(), Some("fullstack-db-0"));
+            }
+        }
+        Ok(())
+    }
 }

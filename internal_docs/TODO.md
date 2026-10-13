@@ -392,7 +392,24 @@ How to use it:
         holds add one indexed `reschedule_hold` read per `Reschedule` plan
         and a subquery to the keyed binder's ordering. AGENTS.md asks for
         before/after `scheduler_bench` numbers on scheduler changes; they
-        were not taken in the change that added them.
+        were not taken in the change that added them. (The pinned-storage
+        disk exemption that followed was measured: `scheduler_speed` and
+        `restore` unchanged within noise.)
+  - [ ] **The disk-fit check may read the wrong disk.** The kitchen-sink
+        fingerprint writes `disk_available_space` once per disk it lists, so
+        the node reports whichever disk came last (`/boot/efi` on some
+        hosts), not the one holding the worker's volumes
+        (`src/worker/node_check/node_checkers/kitchen_sink.rs`). It may be
+        why the rig's sc-wkr-1 failed the check for a 2G volume while 12%
+        reserved (unconfirmed: a full root disk would do the same). Report
+        the free space of the disk holding the state dir instead.
+  - [ ] **A rollout's replacement skips the previous version's backoff.**
+        A hold is keyed by job config, so when an instance fails on the old
+        version and a rollout then places the new one, the new version's
+        plan does not see the hold and places at once
+        (`Store::held_replacements_for_job_config`). Harmless for a fixed
+        config, but a crash-looping task gets one undelayed retry per
+        rollout.
   - [ ] **A failed changeset projection drops that changeset's capacity
         events.** The recovery rebuilds the read model and resyncs work
         streams, but blocked evals waiting on the freed capacity wait for the
@@ -5539,6 +5556,23 @@ Bug fixes, no plan. Uncommitted at the time of writing.
       ([jobs-tasks-and-scheduling.md](../docs/jobs-tasks-and-scheduling.md#manager-side-move-logic),
       [event-stream.md](../docs/event-stream.md),
       [calls](calls/launch-spot-check-fixes-plan_calls.md#55-the-reschedule-backoff-is-a-replicated-hold-the-planner-honors-not-a-timer)).
+      [calls](calls/launch-spot-check-fixes-plan_calls.md#54-the-reschedule-backoff-is-a-replicated-hold-the-planner-honors-not-a-timer)).
+- [x] **A failed slot instance could never go back to its node (rig
+      P0, P1-3's last case).** `fullstack-db-0` (local-dir, `size = "2G"`)
+      failed on sc-wkr-1 and every rollout tick said "healthy but has no
+      room" on a node 12% reserved: the disk-fit check charged the volume's
+      `size` again on the node that already holds it, and that node's free
+      disk read under 2 GiB. An instance returning to its volume's node is
+      no longer charged its storage. The pinned-node message also replaces
+      the generic "no available nodes … preemption did not run" when the
+      pinned node is not a candidate at all, and reads the scheduler's own
+      view of the node. `instance start` now retries a `rescheduling`
+      slot instance too. Covered for the reschedule eval (after the
+      backoff, other node free or full), `--force-reschedule`, `instance
+      start`, and rollouts (failure before or during the rollout)
+      ([volumes.md](../docs/volumes.md),
+      [jobs-tasks-and-scheduling.md](../docs/jobs-tasks-and-scheduling.md#manager-side-move-logic),
+      [calls](calls/launch-spot-check-fixes-plan_calls.md) 57 to 59).
 - [x] **Two seeded saved queries** (`agent:recent-failed-evals`,
       `agent:pending-evals`) named eval columns that do not exist (`kind`,
       `node_name`). Fixed, with a test that runs every seeded query.

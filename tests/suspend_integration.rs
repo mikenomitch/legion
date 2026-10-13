@@ -1421,8 +1421,17 @@ async fn an_instance_records_its_last_stop_and_its_checkpoint_support() -> R<()>
         Some("node_pressure")
     );
 
-    // A later stop replaces it with the generic sentence for its cause.
+    // A later stop replaces it with the generic sentence for its cause. The
+    // eviction spent the task's move budget, so the replacement waits out a
+    // reschedule backoff: retry it now, as an operator would, so there is a
+    // running allocation to stop.
+    let retried = cluster.start(false).await?;
+    assert!(retried.message.contains("lifted"), "{}", retried.message);
     cluster.reschedule()?;
+    assert!(
+        cluster.info().await?.checkpoint_support.is_some(),
+        "the replacement is running"
+    );
     cluster
         .svc
         .stop_instance(Request::new(StopInstanceRequest {

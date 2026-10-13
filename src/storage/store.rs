@@ -17233,8 +17233,9 @@ impl Store {
     /// Starting an already-live (pending/active/rescheduling) instance is a
     /// no-op (returns [`StartInstanceOutcome::AlreadyRunning`]), except a
     /// `rescheduling` one waiting out its reschedule backoff: its hold is
-    /// lifted ([`StartInstanceOutcome::BackoffLifted`]). Slot-mode
-    /// instances and terminated tombstones are rejected with
+    /// lifted ([`StartInstanceOutcome::BackoffLifted`]). That lift is the
+    /// one start a slot-mode instance accepts; any other start of a slot
+    /// instance, and of a terminated tombstone, is rejected with
     /// [`StorageError::InvalidInput`]; the RPC layer pre-checks the
     /// terminated case to surface FailedPrecondition.
     #[instrument(err, skip_all)]
@@ -17249,7 +17250,10 @@ impl Store {
         let instance = self
             .get_instance(instance_id)?
             .ok_or_else(|| StorageError::not_found("instance", instance_id))?;
-        if instance.mode != InstanceMode::Keyed {
+        // A slot instance's lifecycle belongs to `count.num`, but retrying
+        // its replacement now is the same lift as for a keyed one, and the
+        // alternative (`job run --force-reschedule`) restarts the whole job.
+        if instance.mode != InstanceMode::Keyed && instance.state != InstanceState::Rescheduling {
             bail!(StorageError::InvalidInput {
                 message: format!(
                     "instance {instance_id} is slot-mode; slot instances are managed by the \

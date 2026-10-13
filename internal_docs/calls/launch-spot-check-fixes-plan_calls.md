@@ -1747,3 +1747,77 @@ same read the loss diagnostic already paid.
 **Why.** The allocation is the source of truth for where an instance runs. A
 second copy would need every placement path to update it, and the spot check
 shows what happens when one copy is set on only some paths. Simplicity.
+## 67. An instance returning to its volume's node is not charged its storage `size` there
+
+*Workstream: Scheduling. Found on the rig after the reschedule holds.*
+
+**The call.** The disk-fit check skips a task's `stateful.storage` size on
+one node only: the node the next placement's volume pin names, when that
+pin is a volume pin (no restore ahead of it). Every other node, and every
+fresh instance, is still charged the full declared size. The rig's
+`fullstack-db-0` sat behind "healthy but has no room for it right now" on a
+node 12% reserved, because its node's free disk read under the 2G it
+declared, although the volume was already there.
+
+**Alternatives.** Keep charging the size (right only for a first
+provision). Charge the volume's measured usage instead (the manager has no
+such number). Exempt every `Reschedule` plan (wrong for an instance moving
+to a new node, where a fresh volume is created).
+
+**Trade-off.** If a node lost a volume's directory out of band, its instance
+goes back without a disk check, and the driver re-creates the directory at
+mount. The store still says the volume lives there, so that is also what the
+pin already assumes.
+
+**Why.** Correctness and simplicity. The bytes are already in the node's
+used space, so charging them again double-counts them, and the pin means no
+other node can take the instance. One `Option` compare in the existing
+filter, no new state. Stated in [volumes.md](../../docs/volumes.md).
+
+## 68. `instance start` retries a `rescheduling` slot instance, and does nothing else for slot instances
+
+*Workstream: Scheduling.*
+
+**The call.** StartInstance on a slot-mode instance in `rescheduling` lifts
+its reschedule hold, exactly as for a keyed instance (entry 56), and the
+reply is `Retrying instance <id> now: lifted its reschedule backoff`. Any
+other start of a slot instance is still `InvalidArgument`, now naming the
+one case it accepts. The `rescheduling:` detail suggests `instance start
+<id>` for any stateful instance.
+
+**Alternatives.** Keep slot instances refused, so `job run
+--force-reschedule` is the only retry (it restarts every task of the job:
+on the rig, the frontend, API, and cache along with the database). Add a
+`legion instance retry` verb.
+
+**Trade-off.** `start` means less for a slot instance than for a keyed one.
+A slot instance's lifecycle still belongs to `count.num`.
+
+**Why.** Ease. Retrying one database replica should not restart the rest of
+the stack, and the verb the hint already printed for keyed instances is the
+one an operator reaches for. Stated in
+[jobs-tasks-and-scheduling.md](../../docs/jobs-tasks-and-scheduling.md#manager-side-move-logic)
+and [stateful-workloads.md](../../docs/stateful-workloads.md).
+
+## 69. A pinned placement whose node is not a candidate says so, not "no available nodes"
+
+*Workstream: Scheduling.*
+
+**The call.** When nothing fits and the next placement is pinned to a node
+that is not among the task's candidates (left out of the pass, unschedulable
+in the scheduler's read model, or no longer matching the task), the error is
+the pinned-node sentence (`instance <id> holds node-local storage on node
+<node>, which is …`) instead of `no available nodes matching constraints …
+Preemption did not run: no node this task is allowed on had any allocation
+to consider`. Why the node is absent is read from the read model first, the
+stored row second.
+
+**Alternatives.** Keep the generic message, which is accurate about the
+other nodes and silent about the only one that matters.
+
+**Trade-off.** The preemption detail is dropped in that case. Preemption
+could not have helped: it only looks at the pinned node.
+
+**Why.** Ease. On the rig the generic message pointed at capacity on the
+wrong node. The read model is what placement uses, so the reason matches
+what the scheduler saw even when the stored row disagrees (spot-check P0-6).

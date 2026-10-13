@@ -780,13 +780,9 @@ fn map_instance_info(
         .map(|allocation| allocation.node_id.clone());
     let detail = instance_loss_detail(store, &instance, allocation.as_ref())
         .or_else(|| {
-            backoff.as_ref().map(|hold| {
-                format!(
-                    "rescheduling: {}; {}",
-                    hold.summary(),
-                    hold.retry_hint(instance.mode == InstanceMode::Keyed)
-                )
-            })
+            backoff
+                .as_ref()
+                .map(|hold| format!("rescheduling: {}; {}", hold.summary(), hold.retry_hint()))
         })
         .or_else(|| instance_volume_pin_detail(store, &instance))
         .or_else(|| suspend.lifecycle_error.clone());
@@ -6261,10 +6257,13 @@ impl Manager for ManagerDaemonService {
             AclAction::Write,
             &AclScope::job(&instance.job_id),
         )?;
-        if instance.mode != InstanceMode::Keyed {
+        // A slot instance accepts one start: retrying a replacement that is
+        // waiting out its reschedule backoff.
+        if instance.mode != InstanceMode::Keyed && instance.state != InstanceState::Rescheduling {
             return Err(Status::invalid_argument(format!(
                 "instance {} is slot-mode; slot lifecycles are owned by the scheduler via \
-                 count.num, not StartInstance",
+                 count.num, not StartInstance (it only retries a slot instance that is \
+                 rescheduling)",
                 inner.instance_id
             )));
         }

@@ -685,7 +685,9 @@ fails instead of guessing.
 ### Stopping and starting
 
 `stop` and `start` work in keyed mode only. (In slot mode, the scheduler
-manages the lifecycle through `count.num`.) They let you pause a keyed
+manages the lifecycle through `count.num`. The one exception: `start` on a
+slot instance that is `rescheduling` lifts its reschedule backoff and places
+it now.) They let you pause a keyed
 instance and resume it later, unlike `destroy`, which is permanent:
 
 | | `stop` | `destroy` |
