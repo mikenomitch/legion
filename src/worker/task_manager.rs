@@ -764,6 +764,10 @@ pub struct WorkerTaskManager {
     /// This node's advisory view of its own free capacity, so it cannot
     /// double-admit itself into oversubscription across concurrent claims.
     ledger: LocalLedger,
+    /// How many unratified edge claims this node admits at once
+    /// (`edgeBoot.maxProvisionalPerNode`, adapted to ratify latency). Every
+    /// exit of an unratified claim frees its slot here.
+    claim_window: Arc<crate::worker::claim_window::ClaimWindow>,
     /// The node's CPU/memory accounting and cgroup hierarchy (see
     /// `src/worker/resources.rs`). Disabled unless the worker was started
     /// with `resourceEnforcement.enabled`, in which case it governs every
@@ -933,6 +937,9 @@ impl WorkerTaskManager {
             volume_specs: HashMap::new(),
             claims: ClaimTable::new(),
             ledger: LocalLedger::default(),
+            // Replaced by the daemon from the worker's `edgeBoot` block
+            // (`configure_claim_window`).
+            claim_window: Arc::new(crate::worker::claim_window::ClaimWindow::default()),
             // Configured explicitly by the daemon from the worker config
             // (`configure_resource_enforcement`), never inferred here: this
             // constructor runs before the daemon has read that config.
@@ -3404,6 +3411,21 @@ impl WorkerTaskManager {
         self.ledger = ledger;
     }
 
+    /// Install the node's claim window, built from its `edgeBoot` block.
+    /// Called once at worker startup, before any edge start can arrive.
+    pub fn configure_claim_window(
+        &mut self,
+        window: Arc<crate::worker::claim_window::ClaimWindow>,
+    ) {
+        self.claim_window = window;
+    }
+
+    /// The claim window `Worker.StartClaim` reserves room in before it
+    /// admits anything.
+    pub fn claim_window(&self) -> Arc<crate::worker::claim_window::ClaimWindow> {
+        self.claim_window.clone()
+    }
+
     /// Snapshot of the node's live claims, for `legion node claims` and the
     /// heartbeat report.
     pub fn claims_snapshot(&self) -> Vec<ClaimRecord> {
@@ -3546,6 +3568,9 @@ impl WorkerTaskManager {
         }
 
         self.ledger.release_hold(claim_id);
+        // The verdict's feedback, if any, was fed in by whoever delivered
+        // it; this only makes sure the slot is free.
+        self.claim_window.release(claim_id);
         // A promoted session stays inside its envelope, whose allocation
         // already holds the room it uses.
         if !claim.is_session() {
@@ -3588,6 +3613,9 @@ impl WorkerTaskManager {
         }
         let claim = self.claims.remove(claim_id)?;
         self.ledger.release_hold(claim_id);
+        // The one exit every kill takes, so a window slot cannot leak here
+        // and shut the node to edge starts.
+        self.claim_window.release(claim_id);
         self.orphaned_sessions.remove(claim_id);
         if claim.is_session() && !claim.is_ratified() {
             self.queue_manifest_delete(&claim);
@@ -3639,6 +3667,12 @@ impl WorkerTaskManager {
         let expired = self.claims.expired(now);
         let mut killed = Vec::with_capacity(expired.len());
         for claim in expired {
+            // A lease that ran out is the strongest sign ratification is
+            // behind: it shrinks the window before the kill frees the slot.
+            self.claim_window.settle(
+                &claim.claim_id,
+                crate::worker::claim_window::Feedback::Failed,
+            );
             if let Some(claim) = self.kill_claim(&claim.claim_id, "ratification lease expired") {
                 killed.push(claim);
             }

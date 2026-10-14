@@ -391,11 +391,10 @@ pub struct LocalLedger {
     capacity: HashMap<String, f64>,
     /// Committed usage, keyed by worker-local allocation key.
     committed: HashMap<i64, HashMap<String, f64>>,
-    /// Provisional holds, keyed by claim id.
+    /// Provisional holds, keyed by claim id. How many edge claims may be
+    /// unratified at once is the claim window's job
+    /// ([`crate::worker::claim_window`]), not the ledger's.
     holds: HashMap<String, HashMap<String, f64>>,
-    /// Cap on concurrent provisional claims (`edgeBoot.maxProvisionalPerNode`
-    /// on the manager, mirrored onto the dispatch). 0 = unlimited.
-    max_provisional: usize,
 }
 
 impl LocalLedger {
@@ -428,12 +427,7 @@ impl LocalLedger {
             capacity,
             committed: HashMap::new(),
             holds: HashMap::new(),
-            max_provisional: 0,
         }
-    }
-
-    pub fn set_max_provisional(&mut self, max: usize) {
-        self.max_provisional = max;
     }
 
     fn amounts(value: &Value) -> HashMap<String, f64> {
@@ -484,16 +478,9 @@ impl LocalLedger {
         self.committed.remove(&local_key);
     }
 
-    /// Try to hold `resources` for `claim_id`. Fails — without holding
-    /// anything — when the node genuinely has no room, or when the
-    /// provisional cap is already reached.
+    /// Try to hold `resources` for `claim_id`. Fails, without holding
+    /// anything, when the node genuinely has no room.
     pub fn admit(&mut self, claim_id: &str, resources: &Value) -> R<()> {
-        if self.max_provisional > 0 && self.holds.len() >= self.max_provisional {
-            bail!(
-                "node is already holding {} provisional claims (edgeBoot.maxProvisionalPerNode)",
-                self.holds.len()
-            );
-        }
         let request = Self::amounts(resources);
         for (name, amount) in &request {
             if *amount > self.free(name) {
@@ -738,16 +725,6 @@ mod claims_test {
         ledger.admit("clm_a", &json!({}))?;
         ledger.admit("clm_b", &json!({}))?;
         assert!(ledger.admit("clm_c", &json!({})).is_err());
-        Ok(())
-    }
-
-    #[test]
-    fn the_provisional_cap_is_enforced_before_resources() -> R<()> {
-        let mut ledger = LocalLedger::new(&json!({}), &json!({}), None);
-        ledger.set_max_provisional(1);
-        ledger.admit("clm_a", &json!({}))?;
-        let err = ledger.admit("clm_b", &json!({})).expect_err("capped");
-        assert!(err.to_string().contains("maxProvisionalPerNode"), "{err}");
         Ok(())
     }
 }

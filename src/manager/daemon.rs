@@ -3712,7 +3712,13 @@ async fn load_initial_data(store: &Store, config: &ManagerConfig) -> R<()> {
         // which is the default and the thing an operator has to opt out of.
         let edge_boot = match wcp.edge_boot.as_ref() {
             None => String::new(),
-            Some(block) => serde_json::to_string(&block.with_defaults())?,
+            Some(block) => {
+                let resolved = block.with_defaults();
+                resolved
+                    .validate()
+                    .with_context(|| format!("invalid worker config {path_str}"))?;
+                serde_json::to_string(&resolved)?
+            }
         };
 
         // Security blocks (`hostGuard`, ...) ride as one JSON payload. They

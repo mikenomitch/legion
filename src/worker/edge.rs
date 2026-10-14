@@ -16,6 +16,7 @@
 use crate::prelude::*;
 use crate::structs::edge_boot::{ClaimStage, Gate, OnRefused, RefusalReason};
 use crate::structs::{ProvisionalAllocation, ProvisionalClaimReport, TaskAllocation};
+use crate::worker::claim_window::Feedback;
 use crate::worker::claims::ClaimRecord;
 use crate::worker::task_manager::{launch_provisional_allocation, WorkerTaskManager};
 use std::collections::HashMap;
@@ -75,11 +76,18 @@ pub fn record_from_payload(
 /// `slot` is the launch slot the caller took from the node's
 /// [`crate::worker::launch_pool::LaunchPool`] before admitting; the launch
 /// thread holds it until the runtime call returns. `None` only in tests.
+///
+/// `window` is the room an edge start reserved in the node's
+/// [`crate::worker::claim_window::ClaimWindow`], with the claim's lease. An
+/// admitted claim holds it until its verdict; a refused one gives it back.
+/// `None` for manager-originated claims and sessions, which the window does
+/// not count.
 pub fn admit_and_launch(
     task_manager: &Arc<Mutex<WorkerTaskManager>>,
     payload: &TaskAllocation,
     provisional: &ProvisionalAllocation,
     slot: Option<crate::worker::launch_pool::LaunchSlot>,
+    window: Option<(crate::worker::claim_window::Reservation, Duration)>,
 ) -> R<ClaimRecord> {
     let resources: Value = if payload.task_resources.trim().is_empty() {
         serde_json::json!({})
@@ -101,11 +109,17 @@ pub fn admit_and_launch(
     let session = record.is_session();
     let admitted = {
         let mut guard = task_manager.lock().expect("task manager");
-        if session {
+        let admitted = if session {
             guard.admit_session(record)?
         } else {
             guard.admit_claim(record)?
+        };
+        // Bound under the task manager lock, so the claim's own exit (which
+        // frees the slot under the same lock) cannot run first.
+        if let Some((reservation, lease)) = window {
+            reservation.bind(&admitted.claim_id, lease);
         }
+        admitted
     };
 
     // The payload's allocation id is 0 on the wire; the node runs the work
@@ -227,7 +241,7 @@ pub fn start_edge_session(
     // gate opens, so two nodes that derived the same id cannot both run it
     // (session durability plan §6.7, row 3).
     crate::worker::task_manager::session_store::claim_new_store_session(task_manager, &payload)?;
-    admit_and_launch(task_manager, &payload, &provisional, Some(slot))?;
+    admit_and_launch(task_manager, &payload, &provisional, Some(slot), None)?;
     crate::manager::telemetry::worker_metrics()
         .edge_session_starts_total
         .inc();
@@ -358,15 +372,23 @@ const RUNNING_WAIT_BACKSTOP: Duration = Duration::from_millis(50);
 
 /// Apply a ratification verdict pushed by the manager (or fetched by the
 /// node) to a live claim.
+///
+/// `feedback` is what the outcome says about the control plane, for the
+/// node's claim window: [`Feedback::Verdict`] when a manager answered,
+/// [`Feedback::Failed`] when the ratify call failed or ran out of lease.
 pub fn apply_verdict(
     task_manager: &Arc<Mutex<WorkerTaskManager>>,
     claim_id: &str,
     confirmed: Option<&TaskAllocation>,
     reason: RefusalReason,
     detail: &str,
+    feedback: Feedback,
 ) {
     let metrics = crate::manager::telemetry::worker_metrics();
     let mut guard = task_manager.lock().expect("task manager");
+    // Before the ratify or kill below frees the slot, so the window learns
+    // how long this claim waited.
+    guard.claim_window().settle(claim_id, feedback);
     let mut start_health_monitor = None;
     match confirmed {
         Some(payload) => match guard.ratify_claim(claim_id, payload) {

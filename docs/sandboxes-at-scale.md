@@ -103,7 +103,10 @@ sandboxes or ten thousand, where the full set it replaced was 180 KB up and
 For the lowest start latency, [edge boot](edge-boot.md) starts a sandbox on
 a node before the placement commits, from a signed boot ticket, and
 ratifies it in one write (a ticket that names a sandbox that does not exist
-yet creates it in that same write).
+yet creates it in that same write). When ratification falls behind, edge
+nodes refuse new starts with a retryable `OVERLOADED` before booting them,
+rather than booting work that would die at its lease
+([Overload](edge-boot.md#overload)).
 
 ## When capacity runs out
 

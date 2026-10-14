@@ -560,6 +560,16 @@ async fn run_worker_with_manager(join: WorkerJoin, name_override: Option<&str>) 
                 crate::structs::WorkerEdgeBootConfigFull::default()
             })
         };
+    // The claim window bounds the unratified edge claims this node holds
+    // (`edgeBoot.maxProvisionalPerNode`) and sheds edge starts when
+    // ratification falls behind (docs/edge-boot.md, "Overload"). Installed
+    // before the worker server starts, so no start can see the default.
+    task_manager
+        .lock()
+        .expect("task manager")
+        .configure_claim_window(Arc::new(
+            crate::worker::claim_window::ClaimWindow::from_config(&edge_boot_config),
+        ));
     // Direct exec: this node admits exec tickets on `Worker.ExecTask` only
     // when its worker config says `exec = { direct = true }`.
     let exec_direct = worker_exec_config(&config.security).direct;
@@ -2498,6 +2508,7 @@ async fn heartbeat_tick(
                 committed,
                 crate::structs::edge_boot::RefusalReason::from_wire(verdict.reason),
                 &verdict.detail,
+                crate::worker::claim_window::Feedback::Verdict,
             );
         }
         // The lease is the backstop for every failure the reply path cannot

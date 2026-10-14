@@ -843,6 +843,20 @@ that has never taken a provisional start.
   It makes started-but-unconfirmed capacity visible. A value that does not
   return to zero means claims are leaking.
 
+The node's claim window ([edge-boot.md](edge-boot.md#overload)) adds two:
+
+- **`legion_worker_claim_window`** (gauge): how many unratified edge claims
+  the node admits at once right now. It sits at
+  `edgeBoot.maxProvisionalPerNode` while ratifications come back within
+  `edgeBoot.overloadThreshold` of their lease. A value below it means the
+  node has seen slow ratifications and is shedding.
+- **`legion_worker_claim_overload_refusals_total`** (counter): edge starts
+  refused `OVERLOADED` because the window stayed full for
+  `edgeBoot.queueTimeout`. Each one held nothing and spent no ticket. A
+  rising rate with the window below its ceiling means the managers are
+  behind on ratification. Look at `legion_provisional_ratify_seconds` and
+  the scheduler lane before raising `maxProvisionalPerNode`.
+
 Session starts on the node ([session-mode.md](session-mode.md)) add two:
 
 - **`legion_worker_launch_refusals_total`** (counter): provisional starts

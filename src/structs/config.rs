@@ -799,8 +799,12 @@ impl LivenessConfigFull {
 /// can start work on a capability. Turning it on grows a compromised node's
 /// blast radius from "runs what it was given" to "runs anything a live ticket
 /// names", which is why it is never on by accident.
+///
+/// Unknown fields are refused, so a setting that moved to the worker type's
+/// `edgeBoot` block (`maxProvisionalPerNode`) fails the manager at startup
+/// instead of being silently ignored.
 #[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct EdgeBootConfig {
     /// Master switch for boot tickets and edge-initiated starts. Default
     /// false. Manager-side speculative dispatch (a job's own
@@ -816,9 +820,6 @@ pub struct EdgeBootConfig {
     /// dangerous.
     #[serde(default)]
     pub max_ticket_ttl: Option<String>,
-    /// Cap on concurrent unratified claims per node. Default 32.
-    #[serde(default)]
-    pub max_provisional_per_node: Option<u32>,
 }
 
 /// Resolved [`EdgeBootConfig`].
@@ -828,7 +829,6 @@ pub struct EdgeBootConfigFull {
     pub enabled: bool,
     pub default_ticket_ttl: String,
     pub max_ticket_ttl: String,
-    pub max_provisional_per_node: u32,
 }
 
 impl Default for EdgeBootConfigFull {
@@ -837,7 +837,6 @@ impl Default for EdgeBootConfigFull {
             enabled: false,
             default_ticket_ttl: DEF_BOOT_TICKET_TTL.into(),
             max_ticket_ttl: DEF_BOOT_TICKET_MAX_TTL.into(),
-            max_provisional_per_node: DEF_MAX_PROVISIONAL_PER_NODE,
         }
     }
 }
@@ -855,9 +854,6 @@ impl EdgeBootConfig {
                 .max_ticket_ttl
                 .clone()
                 .unwrap_or(defaults.max_ticket_ttl),
-            max_provisional_per_node: self
-                .max_provisional_per_node
-                .unwrap_or(defaults.max_provisional_per_node),
         }
     }
 }
@@ -868,7 +864,6 @@ impl From<EdgeBootConfigFull> for EdgeBootConfig {
             enabled: Some(val.enabled),
             default_ticket_ttl: Some(val.default_ticket_ttl),
             max_ticket_ttl: Some(val.max_ticket_ttl),
-            max_provisional_per_node: Some(val.max_provisional_per_node),
         }
     }
 }
@@ -877,11 +872,23 @@ impl From<EdgeBootConfigFull> for EdgeBootConfig {
 pub const DEF_BOOT_TICKET_TTL: &str = "5m";
 /// Hard cap on boot-ticket lifetime.
 pub const DEF_BOOT_TICKET_MAX_TTL: &str = "1h";
-/// Default cap on concurrent unratified claims per node.
+/// Default `edgeBoot.maxProvisionalPerNode`: the most unratified edge claims
+/// a node holds at once. At a healthy ratify latency of tens of
+/// milliseconds this admits hundreds of starts a second per node; it binds
+/// only when ratification slows.
 pub const DEF_MAX_PROVISIONAL_PER_NODE: u32 = 32;
+/// Default `edgeBoot.overloadThreshold`: a ratification slower than 30% of
+/// its claim's lease is a sign the managers are falling behind.
+///
+/// Why not half: a node only notices at the threshold, and when offered load
+/// is `r` times what the managers can ratify, the claims it admitted up to
+/// that moment wait about `r × threshold`. At 0.3 a sudden 3x overload still
+/// ratifies them inside the lease, where 0.5 only covers 2x. Healthy ratify
+/// latency is tens of milliseconds, far below 30% of any lease.
+pub const DEF_OVERLOAD_THRESHOLD: f64 = 0.3;
 
 /// Worker-side edge boot settings (docs/edge-boot.md).
-#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct WorkerEdgeBootConfig {
     /// Whether this node serves `Worker.StartClaim` — that is, whether it
@@ -913,6 +920,19 @@ pub struct WorkerEdgeBootConfig {
     /// "checkpoint"`. Default `60s`.
     #[serde(default)]
     pub stop_checkpoint_timeout: Option<String>,
+    /// The most unratified edge claims (`Worker.StartClaim`) this node holds
+    /// at once, and the ceiling of its adaptive claim window. Default 32;
+    /// at least 1. A start that finds the window full waits up to
+    /// `queueTimeout`, then is refused `OVERLOADED` (retryable) before it
+    /// boots.
+    #[serde(default)]
+    pub max_provisional_per_node: Option<u32>,
+    /// A ratification slower than this fraction of its claim's
+    /// `speculativeStart.ratifyTimeout` halves the claim window, and timely ones
+    /// grow it back. Default `0.3`. `0` turns adaptation off, leaving
+    /// `maxProvisionalPerNode` as a static cap. At most `1`.
+    #[serde(default)]
+    pub overload_threshold: Option<f64>,
 }
 
 /// Default `edgeBoot.queueTimeout`.
@@ -921,7 +941,7 @@ pub const DEF_LAUNCH_QUEUE_TIMEOUT: &str = "1s";
 pub const DEF_STOP_CHECKPOINT_TIMEOUT: &str = "60s";
 
 /// Resolved [`WorkerEdgeBootConfig`].
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 #[serde(rename_all = "camelCase", default)]
 pub struct WorkerEdgeBootConfigFull {
     pub accept_claims: bool,
@@ -931,6 +951,8 @@ pub struct WorkerEdgeBootConfigFull {
     pub launch_concurrency: u32,
     pub queue_timeout: String,
     pub stop_checkpoint_timeout: String,
+    pub max_provisional_per_node: u32,
+    pub overload_threshold: f64,
 }
 
 impl Default for WorkerEdgeBootConfigFull {
@@ -942,11 +964,35 @@ impl Default for WorkerEdgeBootConfigFull {
             launch_concurrency: 0,
             queue_timeout: DEF_LAUNCH_QUEUE_TIMEOUT.into(),
             stop_checkpoint_timeout: DEF_STOP_CHECKPOINT_TIMEOUT.into(),
+            max_provisional_per_node: DEF_MAX_PROVISIONAL_PER_NODE,
+            overload_threshold: DEF_OVERLOAD_THRESHOLD,
         }
     }
 }
 
 impl WorkerEdgeBootConfigFull {
+    /// Reject values a node cannot run with, so a bad worker config stops
+    /// the manager at startup instead of misbehaving on every node of the
+    /// type.
+    pub fn validate(&self) -> R<()> {
+        if self.max_provisional_per_node == 0 {
+            bail!(
+                "edgeBoot.maxProvisionalPerNode must be at least 1; it is the most unratified \
+                 edge claims a node holds at once"
+            );
+        }
+        if !(0.0..=1.0).contains(&self.overload_threshold) {
+            bail!(
+                "edgeBoot.overloadThreshold must be between 0 and 1 (a fraction of each \
+                 claim's ratifyTimeout; 0 turns the adaptive window off), got {}",
+                self.overload_threshold
+            );
+        }
+        humantime::parse_duration(&self.queue_timeout)
+            .with_context(|| format!("invalid edgeBoot.queueTimeout {:?}", self.queue_timeout))?;
+        Ok(())
+    }
+
     /// The launch pool size this node runs with: the configured value, or
     /// twice its cores.
     pub fn resolved_launch_concurrency(&self) -> usize {
@@ -974,6 +1020,12 @@ impl WorkerEdgeBootConfig {
                 .stop_checkpoint_timeout
                 .clone()
                 .unwrap_or(defaults.stop_checkpoint_timeout),
+            max_provisional_per_node: self
+                .max_provisional_per_node
+                .unwrap_or(defaults.max_provisional_per_node),
+            overload_threshold: self
+                .overload_threshold
+                .unwrap_or(defaults.overload_threshold),
         }
     }
 }
@@ -3406,13 +3458,15 @@ mod tests {
         assert!(!manager.enabled);
         assert_eq!(manager.default_ticket_ttl, DEF_BOOT_TICKET_TTL);
         assert_eq!(manager.max_ticket_ttl, DEF_BOOT_TICKET_MAX_TTL);
-        assert_eq!(
-            manager.max_provisional_per_node,
-            DEF_MAX_PROVISIONAL_PER_NODE
-        );
 
         let worker = WorkerEdgeBootConfigFull::default();
         assert!(!worker.accept_claims);
+        assert_eq!(
+            worker.max_provisional_per_node,
+            DEF_MAX_PROVISIONAL_PER_NODE
+        );
+        assert_eq!(worker.overload_threshold, DEF_OVERLOAD_THRESHOLD);
+        assert!(worker.validate().is_ok());
 
         // An absent block resolves to the same thing as an empty one.
         assert_eq!(EdgeBootConfig::default().with_defaults(), manager);
@@ -3425,16 +3479,26 @@ mod tests {
             enabled: Some(true),
             default_ticket_ttl: Some("30s".into()),
             max_ticket_ttl: Some("10m".into()),
-            max_provisional_per_node: Some(4),
         }
         .with_defaults();
         assert!(full.enabled);
-        assert_eq!(full.max_provisional_per_node, 4);
+        assert_eq!(full.max_ticket_ttl, "10m");
         // `ManagerConfigFull -> ManagerConfig` is what `GetManagerConfigs`
         // serves, so a setting that vanished there would be invisible to an
         // operator checking what the cluster actually thinks it is running.
         let round_tripped: EdgeBootConfig = full.clone().into();
         assert_eq!(round_tripped.with_defaults(), full);
+    }
+
+    #[test]
+    fn the_per_node_claim_cap_is_refused_on_the_manager_test() {
+        // It moved to the worker type's `edgeBoot` block. Ignoring it here
+        // would leave an operator believing a cap is in force.
+        let err = serde_json::from_str::<EdgeBootConfig>(
+            r#"{"enabled":true,"maxProvisionalPerNode":32}"#,
+        )
+        .expect_err("moved field");
+        assert!(err.to_string().contains("maxProvisionalPerNode"), "{err}");
     }
 
     #[test]
@@ -3445,7 +3509,37 @@ mod tests {
         assert!(parsed.accept_claims);
         assert_eq!(parsed.jwks_refresh, "1m");
         assert_eq!(parsed.clock_skew, "5s");
+        // Fields the block leaves out take their defaults on the node.
+        assert_eq!(
+            parsed.max_provisional_per_node,
+            DEF_MAX_PROVISIONAL_PER_NODE
+        );
+        assert_eq!(parsed.overload_threshold, DEF_OVERLOAD_THRESHOLD);
         Ok(())
+    }
+
+    #[test]
+    fn a_worker_edge_boot_block_rejects_a_window_a_node_cannot_run_test() {
+        let resolved = |block: WorkerEdgeBootConfig| block.with_defaults().validate();
+        let err = resolved(WorkerEdgeBootConfig {
+            max_provisional_per_node: Some(0),
+            ..Default::default()
+        })
+        .expect_err("zero cap");
+        assert!(err.to_string().contains("at least 1"), "{err}");
+        let err = resolved(WorkerEdgeBootConfig {
+            overload_threshold: Some(1.5),
+            ..Default::default()
+        })
+        .expect_err("over 1");
+        assert!(err.to_string().contains("between 0 and 1"), "{err}");
+        // 0 is the documented way to keep a static cap.
+        assert!(resolved(WorkerEdgeBootConfig {
+            overload_threshold: Some(0.0),
+            max_provisional_per_node: Some(8),
+            ..Default::default()
+        })
+        .is_ok());
     }
 
     #[test]

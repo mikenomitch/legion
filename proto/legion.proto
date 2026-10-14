@@ -9423,6 +9423,17 @@ service Worker {
   // Rejected with FailedPrecondition unless the worker was configured with
   // `edgeBoot.acceptClaims: true`.
   //
+  // Rejected with ResourceExhausted, carrying the stable error code
+  // `OVERLOADED` in the `legion-error-code` response metadata, when the
+  // node's claim window stayed full for `edgeBoot.queueTimeout`
+  // (docs/edge-boot.md, "Overload"). The window bounds the unratified edge
+  // claims a node holds (`edgeBoot.maxProvisionalPerNode`) and halves when
+  // ratifications come back later than `edgeBoot.overloadThreshold` of their
+  // lease. Such a refusal happens before admission: nothing is held, booted,
+  // or spent, so a retry may present the same ticket. Retry with backoff.
+  // A message that says recent ratifications were slow means the managers
+  // are behind, which other nodes of the pool share.
+  //
   // Caller class: `ticket`. Callers are authorized by the boot ticket
   // alone; no client certificate is needed and one that is presented is
   // ignored. Callers dial `https://` and verify the node's certificate

@@ -2082,6 +2082,14 @@ pub struct WorkerMetrics {
     /// `legion_worker_launch_refusals_total` — starts refused because every
     /// launch slot stayed busy for `edgeBoot.queueTimeout`.
     pub launch_pool_refusals_total: Arc<Counter>,
+    /// `legion_worker_claim_overload_refusals_total` — edge starts refused
+    /// `OVERLOADED` because the claim window stayed full for
+    /// `edgeBoot.queueTimeout` (docs/edge-boot.md, "Overload").
+    pub claim_overload_refusals_total: Arc<Counter>,
+    /// `legion_worker_claim_window` — how many unratified edge claims this
+    /// node admits at once right now: `edgeBoot.maxProvisionalPerNode`
+    /// while ratification keeps up, less while it does not.
+    pub claim_window: Arc<Gauge>,
     /// `legion_worker_edge_session_starts_total` — sessions started on this
     /// node from a session ticket (`Worker.StartSession`).
     pub edge_session_starts_total: Arc<Counter>,
@@ -2218,6 +2226,22 @@ impl WorkerMetrics {
                 labels: &[],
             },
             cell: CounterCell::default(),
+        });
+        let claim_overload_refusals_total = Arc::new(Counter {
+            meta: FamilyMeta {
+                name: "legion_worker_claim_overload_refusals_total",
+                help: "Edge starts (Worker.StartClaim) refused OVERLOADED before admission because the node's window of unratified edge claims stayed full for edgeBoot.queueTimeout. Retryable; a rising rate with legion_worker_claim_window below edgeBoot.maxProvisionalPerNode means ratification is behind.",
+                labels: &[],
+            },
+            cell: CounterCell::default(),
+        });
+        let claim_window = Arc::new(Gauge {
+            meta: FamilyMeta {
+                name: "legion_worker_claim_window",
+                help: "Unratified edge claims this node admits at once right now: edgeBoot.maxProvisionalPerNode while ratifications come back within edgeBoot.overloadThreshold of their lease, halved for each slow patch and grown back one slot per window of timely verdicts.",
+                labels: &[],
+            },
+            cell: GaugeCell::default(),
         });
 
         let edge_session_starts_total = Arc::new(Counter {
@@ -2373,6 +2397,8 @@ impl WorkerMetrics {
             Arc::clone(&heartbeat_duration_seconds) as Arc<dyn RenderMetric>,
             Arc::clone(&heartbeats_total) as Arc<dyn RenderMetric>,
             Arc::clone(&launch_pool_refusals_total) as Arc<dyn RenderMetric>,
+            Arc::clone(&claim_overload_refusals_total) as Arc<dyn RenderMetric>,
+            Arc::clone(&claim_window) as Arc<dyn RenderMetric>,
             Arc::clone(&edge_session_starts_total) as Arc<dyn RenderMetric>,
             Arc::clone(&session_checkpoints_skipped_total) as Arc<dyn RenderMetric>,
             Arc::clone(&session_evictions_total) as Arc<dyn RenderMetric>,
@@ -2403,6 +2429,8 @@ impl WorkerMetrics {
             provisional_ratify_seconds,
             provisional_active,
             launch_pool_refusals_total,
+            claim_overload_refusals_total,
+            claim_window,
             edge_session_starts_total,
             session_checkpoints_skipped_total,
             session_evictions_total,

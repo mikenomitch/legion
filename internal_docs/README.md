@@ -105,6 +105,7 @@ When one is required and what goes in it:
 | [durability-and-ops-execution-plan.md](plans/durability-and-ops-execution-plan.md) | executed (workstreams A/B/C/D + adversarial verification, 2026-07-28); lanes topology opt-in |
 | [egress-credential-injection-plan.md](plans/egress-credential-injection-plan.md) | in execution (Phase 1 shipped: KV-backed header credentials on external `https://` upstreams, injected by the node so the workload never holds them; identity/webhook providers and audit events planned; sandbox guests cannot reach upstreams yet) |
 | [edge-boot-plan.md](plans/edge-boot-plan.md) | shipped (phases 1–4); phase 0 measurement not run, phase 5 backlog |
+| [edge-admission-control-plan.md](plans/edge-admission-control-plan.md) | in execution (Phase 1 built: the per-node claim window that sheds edge starts `OVERLOADED` before boot when ratification is slow, and enforces `maxProvisionalPerNode`. Manager-side speculation shedding and deadline-aware ratification planned) |
 | [gang-scheduling-plan.md](plans/gang-scheduling-plan.md) | planned |
 | [gated-sandbox-checkpoints-plan.md](plans/gated-sandbox-checkpoints-plan.md) | in execution (Phases 1 to 5 built: gated memory checkpoints, default deny, the static guest agent, gated idle signals, Legion-addressed TAPs, ingress into gated and TAP sandboxes, and upstreams in gated sandboxes; Phase 0, the real-VMM gate, is pending, so the gated-by-default flip is held) |
 | [host-convergence-plan.md](plans/host-convergence-plan.md) | planned |
@@ -201,6 +202,7 @@ by project impact. The full template and a worked example:
 - [container-task-kind-macos_calls.md](calls/container-task-kind-macos_calls.md)
 - [data-dir-env-plan_calls.md](calls/data-dir-env-plan_calls.md)
 - [edge-boot-plan_calls.md](calls/edge-boot-plan_calls.md)
+- [edge-admission-control-plan_calls.md](calls/edge-admission-control-plan_calls.md)
 - [egress-credential-injection-plan_calls.md](calls/egress-credential-injection-plan_calls.md)
 - [elastic-session-envelopes-plan_calls.md](calls/elastic-session-envelopes-plan_calls.md)
 - [exec-and-actions-plan_calls.md](calls/exec-and-actions-plan_calls.md)

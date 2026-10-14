@@ -1178,15 +1178,21 @@ How to use it:
 - [ ] Edge boot follow-ups — the feature shipped (phases 1–4;
       [plan](plans/edge-boot-plan.md) · [docs](../docs/edge-boot.md) ·
       [calls](calls/edge-boot-plan_calls.md)); these are what it left open.
-  - [ ] **`edgeBoot.maxProvisionalPerNode` is parsed but enforced nowhere.**
-        The manager config accepts it and docs/edge-boot.md shows it, but the
-        value never leaves `ManagerConfigFull`: nothing mirrors it onto a
-        dispatch or heartbeat, so `LocalLedger::set_max_provisional`
-        (`src/worker/claims.rs`) has no production caller and a node's cap is
-        always 0 (unlimited). Wire it to the worker (a heartbeat-reply or
-        dispatch field) or drop the knob and its docs. Found in the
-        2026-10-12 AWS spot check's config audit, alongside `edgeBoot` never
-        reaching the manager service at all (fixed).
+  - [ ] **The node's resource ledger is never configured in production.**
+        `WorkerTaskManager::configure_ledger` has only test callers, so
+        `LocalLedger` runs with no capacity and admits every edge claim:
+        verification step 7 in [edge-boot.md](../docs/edge-boot.md) checks
+        against infinite room. Committed allocations are not recorded in it
+        either (only ratified claims are, and never released). Configure it
+        from the node's declared resources and track every allocation's
+        start and stop, or drop the step. The claim window now bounds how
+        many edge claims a node admits
+        ([plan](plans/edge-admission-control-plan.md) §5.3).
+  - [ ] **A sub-second `ratifyTimeout` truncates the wire lease.** Admission
+        accepts `"500ms"`, but `StartClaim` and speculative dispatch put
+        `now + ratify_timeout.as_secs()` on the wire, so the node's lease
+        deadline is the admission second and the next lease sweep kills the
+        claim. Carry milliseconds, or reject leases under a second at submit.
   - [ ] **Phase 0's measurement matrix was never run.** The start-path
         breakdown (submit → eval claim → plan → apply → dispatch → prepare →
         boot → first byte) in both persistence modes, cold and warm image,
@@ -1257,19 +1263,21 @@ How to use it:
           held (it will not fully, since bigger batches commit slower).
           Measure 16 / 64 / 128 and pick the default, or a separate
           ratification cap, from data. Record the call.
-    - [ ] **Backpressure before lease expiry.** Unratified work is killed at
-          `ratifyTimeout` (default 5s, `DEFAULT_RATIFY_TIMEOUT` in
-          `src/structs/edge_boot.rs`). If ratify latency climbs past that,
-          booted sandboxes die and get retried, adding load at the worst
-          time, and nothing stops nodes admitting new edge starts meanwhile.
-          Refuse early instead: a typed, retryable `overloaded` refusal,
-          from the manager when ratify queue latency passes a fraction of the
-          lease, or from nodes tracking their own recent ratify latency. It
-          must reach `legion sandbox start` as `retryable: true`, with a
-          metric for overload refusals and a failure-mode section in
-          [edge-boot.md](../docs/edge-boot.md). Test that new claims are
-          refused before boot above the threshold, in-flight claims are not
-          killed early, and admission resumes when latency drops.
+    - [ ] **Managers stop speculating when their apply is slow** (edge
+          admission control [plan](plans/edge-admission-control-plan.md)
+          Phase 2). The node's claim window sheds edge starts only. A
+          manager-originated speculative claim whose plan apply outlives its
+          lease still dies on the node, and its committed allocation boots
+          again later. `dispatch_speculative` should skip speculation while
+          recent apply latency passes a fraction of the task's lease.
+    - [ ] **Ratifications carry their deadline** (edge admission control
+          [plan](plans/edge-admission-control-plan.md) Phase 3). The
+          `RatifyClaim` handler is synchronous, so a ratification its node
+          already killed at the lease is still committed when the manager
+          reaches it. That binds the instance to a dead claim, and the
+          router's retry gets `instance_claimed` until reconcile clears it.
+          Put the claim's remaining lease on `RatifyClaimRequest` and refuse
+          `expired` without committing.
     - [ ] Plan-commit cost growing with fleet size caps ratification the
           same way it caps scheduling. Fix it once, under "Make plan-commit
           cost flat in fleet size" in Scheduling & placement, and make the
@@ -5351,6 +5359,24 @@ docs: [task-runtime-plugins.md](../docs/task-runtime-plugins.md)
       is one entry and a refused ratification leaves the ticket unspent
       ([sandbox-scaling calls](calls/sandbox-scaling-plan_calls.md) #31,
       [docs](../docs/edge-boot.md)).
+- [x] **Edge starts shed before boot when ratification is behind** (edge
+      admission control Phase 1). Each edge node keeps an AIMD window over
+      its unratified edge claims, capped by `edgeBoot.maxProvisionalPerNode`
+      (moved to the worker type config and now enforced) and halved when
+      verdicts come back later than `edgeBoot.overloadThreshold` of the
+      lease. A start that finds it full waits `queueTimeout`, then is
+      refused `OVERLOADED` (retryable) before admission, so nothing boots,
+      nothing is held, and the ticket stays unspent. In-flight claims are
+      never touched, and the window grows back on timely verdicts
+      ([plan](plans/edge-admission-control-plan.md) ·
+      [docs](../docs/edge-boot.md#overload) ·
+      [calls](calls/edge-admission-control-plan_calls.md)). Phases 2 and 3
+      are open above, under Scheduling & placement.
+  - [x] `edgeBoot.maxProvisionalPerNode` is enforced on every edge node.
+  - [x] Backpressure before lease expiry: the typed `OVERLOADED` refusal,
+        `legion_worker_claim_window` and
+        `legion_worker_claim_overload_refusals_total`, and the failure-mode
+        section in edge-boot.md.
 - [x] **Sandbox scaling Phases 0–3** (2026-10-12,
       [#27](https://github.com/mikenomitch/legion/pull/27)):
       [plan](plans/sandbox-scaling-plan.md) §14 ·

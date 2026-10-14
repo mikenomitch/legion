@@ -2,6 +2,7 @@ pub mod artifact_credentials;
 pub mod balance;
 pub mod boot_ticket;
 pub mod checkpoints;
+pub mod claim_window;
 pub mod claims;
 pub mod content_report;
 pub mod daemon;
