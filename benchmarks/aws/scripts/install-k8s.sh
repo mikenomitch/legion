@@ -97,12 +97,14 @@ rsh "$LOADGEN_ADDR" "
     cat >>/opt/bench/observability/prometheus.yml <<SCRAPE
 
   - job_name: kube-scheduler
+    scrape_interval: 15s  # see legion-managers in prometheus.yml.tpl
     scheme: https
     tls_config: { insecure_skip_verify: true }
     authorization: { credentials: $TOKEN }
     static_configs:
       - targets: ['${CP_PRIVATE_IPS[0]}:10259', '${CP_PRIVATE_IPS[1]}:10259', '${CP_PRIVATE_IPS[2]}:10259']
   - job_name: kube-apiserver
+    scrape_interval: 15s  # see legion-managers in prometheus.yml.tpl
     scheme: https
     tls_config: { insecure_skip_verify: true }
     authorization: { credentials: $TOKEN }
