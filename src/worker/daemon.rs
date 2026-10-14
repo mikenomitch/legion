@@ -593,6 +593,8 @@ async fn run_worker_with_manager(join: WorkerJoin, name_override: Option<&str>) 
             ratifier: Arc::new(ManagerClaimRatifier {
                 client: client.clone(),
                 credentials: credentials.clone(),
+                managers: managers.clone(),
+                leader: tokio::sync::Mutex::new(None),
             }),
         })),
         _ => None,
@@ -1256,9 +1258,22 @@ fn build_jwks_verifier(
 
 /// Ratifies claims by calling the manager's `RatifyClaim`, authenticated with
 /// this node's own credentials.
+///
+/// Only the raft leader ratifies: a follower refuses with "not the raft
+/// leader" rather than forwarding, and every refused ratification kills a
+/// sandbox that already booted. So a refusal moves on to the other managers
+/// this node knows, and the one that answered is kept for the next claim.
 struct ManagerClaimRatifier {
     client: ManagerClient<Channel>,
     credentials: Arc<WorkerCredentials>,
+    managers: Arc<crate::worker::managers::ManagerEndpoints>,
+    /// The manager that last ratified, while it keeps doing so.
+    leader: tokio::sync::Mutex<Option<(String, ManagerClient<Channel>)>>,
+}
+
+fn is_not_leader(status: &tonic::Status) -> bool {
+    status.code() == tonic::Code::FailedPrecondition
+        && status.message().contains("not the raft leader")
 }
 
 #[tonic::async_trait]
@@ -1267,9 +1282,39 @@ impl crate::worker::server::ClaimRatifier for ManagerClaimRatifier {
         &self,
         request: crate::structs::RatifyClaimRequest,
     ) -> R<crate::structs::RatifyClaimReply> {
-        let mut client = self.client.clone();
-        let request = self.credentials.attach(tonic::Request::new(request));
-        Ok(client.ratify_claim(request).await?.into_inner())
+        let cached = self.leader.lock().await.clone();
+        let (first_addr, mut first) =
+            cached.unwrap_or_else(|| (String::new(), self.client.clone()));
+        let attempt = self
+            .credentials
+            .attach(tonic::Request::new(request.clone()));
+        let status = match first.ratify_claim(attempt).await {
+            Ok(reply) => return Ok(reply.into_inner()),
+            Err(status) if is_not_leader(&status) => status,
+            Err(status) => return Err(status.into()),
+        };
+        *self.leader.lock().await = None;
+        for addr in self.managers.known() {
+            if addr == first_addr {
+                continue;
+            }
+            let Ok(channel) = crate::worker::plane::manager_channel(&addr).await else {
+                continue;
+            };
+            let mut client = ManagerClient::new(channel);
+            let attempt = self
+                .credentials
+                .attach(tonic::Request::new(request.clone()));
+            match client.ratify_claim(attempt).await {
+                Ok(reply) => {
+                    *self.leader.lock().await = Some((addr, client));
+                    return Ok(reply.into_inner());
+                }
+                Err(status) if is_not_leader(&status) => continue,
+                Err(status) => return Err(status.into()),
+            }
+        }
+        Err(status.into())
     }
 }
 
