@@ -1169,6 +1169,30 @@ How to use it:
       placements per plan entry (sandbox placements average 1.09 plans per
       entry, one eval each), a cheaper capture (each write executes twice,
       once to capture and once to apply), or a pipelined lane.
+      **Profiled (2026-10-13):** the largest piece of the capture was one
+      statement, the keyed bind inside the plan apply, which scanned every
+      instance of the job and rebuilt a temporary B-tree of every
+      allocation of the config on every placement. It now reads live keyed
+      rows from two indexes
+      ([plan](plans/scheduler-lane-entry-cost-plan.md) Phase 1 ·
+      [calls](calls/scheduler-lane-entry-cost-plan_calls.md) ·
+      [docs](../docs/sandboxes-at-scale.md#limits-to-know-about)). Still
+      open, each designed in that plan:
+  - [ ] **Pipeline the lane** (plan §6.2): capture entry N+1 over an
+        overlay of the in-flight entries while N commits, with a
+        capture-term check at apply. Gated on auditing which capture bodies
+        read the read pool or the read model, which do not see an
+        in-flight entry (`stop_keyed_instance_apply` reads its instance
+        through `get_instance`), and on a three-voter measurement.
+  - [ ] **One fsync per entry, not two** (plan §6.3): the state DB runs
+        `synchronous = FULL` in raft mode only to keep the applied marker
+        ahead of the log's purge horizon. `NORMAL` plus a startup restore
+        from the local snapshot would drop one fsync per entry. Needs a
+        Linux fsync measurement and a power-cut test.
+  - [ ] **A keyed bind still visits every live instance of the task**
+        (plan §11), two index lookups each, so a task with tens of
+        thousands of running instances pays milliseconds per placement.
+        Parked instances are free.
 - [ ] **Fused top-k candidate scoring.** Ranked candidate lists materialize a
       scored vector per placement; the one-candidate path (`plan_candidates:
       0`) uses the fused argmax loop that does not. A fused top-k loop would
