@@ -156,8 +156,16 @@ workload is done. The sandbox runtime supplies that layer.
    launched for memory checkpoints (see [Checkpoints](#checkpoints)) or boots
    with a balloon (see [Guest memory under pressure](#guest-memory-under-pressure)),
    in which case it gets `--api-sock` instead. Both are single-process VMMs, so:
-   - The guest serial console is the VMM's stdout. It lands in the
-     allocation's `stdout.log` like any other task's output.
+   - The guest console is the VMM's stdout, and lands in the allocation's
+     `stdout.log` like any other task's output. On cloud-hypervisor it is a
+     virtio-console (`hvc0`), which carries output in batches through a
+     queue. On Firecracker, which has no virtio-console, it is the serial
+     port, and the guest boots `quiet` (see [How fast a sandbox
+     boots](#how-fast-a-sandbox-boots)).
+   - cloud-hypervisor is told every disk is raw (`image_type=raw`). Left to
+     probe the format, it refuses guest writes to a probed raw disk's first
+     sector, the root mount's superblock write fails, and the guest panics
+     and reboots before it can mount.
    - Killing the child kills the VM. There is no daemon to chase (unlike the
      container runtime, which must tear down by name). That is also why the
      worker stops a microVM from inside rather than by killing it (see
@@ -189,6 +197,58 @@ reuses its root disk, writes from the previous boot included, unless the
 image, command, env, working dir, volume mounts, artifacts, or guest agent
 binary changed. The fingerprint hashes env values, since they can be
 secrets. The values are never logged or stored.
+
+### How fast a sandbox boots
+
+A sandbox is `running` once its guest's agent accepts exec over vsock, not
+when its VMM process starts: init starts the agent's listener just before the
+task's command, so a caller that waits for `running` can run code in the
+guest at once. For a [session](session-mode.md) this is what
+`StartSession` with `wait` and `instance get` report. A guest whose agent
+never listens (an image the static `legion-guest` cannot run on) is reported
+running after 10 seconds anyway, with a warning in the worker log.
+
+Every start logs where its time went, one line per start, and observes
+each stage in `legion_task_start_stage_seconds{runtime,stage}`
+([metrics](metrics.md)):
+
+```text
+Task allocation started allocation_id=-4131 task_name="vm" task_runtime="sandbox" total_ms=176
+  stages: image=8ms root_disk=11ms vmm_spawn=9ms start=31ms ready=143ms register=0ms
+```
+
+Measured on AWS (a c8i.xlarge with nested virtualization, cloud-hypervisor
+v51.2 and its reference kernel, Alpine, 1 vCPU and 128 MiB), from the
+worker receiving a session start to the guest taking exec:
+
+| Stage | Time | What it is |
+| --- | --- | --- |
+| `image` | 8 ms pinned, 12 to 60 ms by tag | The image's layout from the node cache. A tag is resolved against its registry on every start (one round trip on a kept-alive connection); a digest needs none |
+| `root_disk` | 10 ms on XFS, 60 to 80 ms on ext4 | A reflink (or, on ext4, a sparse copy) of the [cached base](#the-root-disk-cache), plus the sandbox's own files |
+| `vmm_spawn` | about 10 ms | The VMM process |
+| `ready` | about 140 ms | The guest kernel, init, and the agent's listener |
+
+For the fastest starts:
+
+- **Pin images by digest** (`image@sha256:...`), which skips the registry
+  round trip, or turn on `artifacts.containerImageDesugar` with
+  `resolve = "pin"`, which resolves the tag once at submit.
+- **Put the worker's state directory on a reflink filesystem** (XFS created
+  with `-m reflink=1`, the default in current `mkfs.xfs`, or btrfs). A
+  root disk is then a reflink of its base, in about a millisecond, instead
+  of a copy of every allocated block.
+- **Keep the guest kernel small.** cloud-hypervisor copies the kernel into
+  guest memory on every boot, and a kernel with fewer drivers boots and
+  probes faster. The 48 MB reference kernel is generous.
+- **Expect metal to be faster than the numbers above.** Nested
+  virtualization makes every VM exit costlier.
+
+**The console has a cost.** Every write to an emulated serial port is a VM
+exit. A default kernel prints about 300 lines while it boots, which cost
+about 700 ms of a nested-virtualization guest's boot on the serial port.
+That is why cloud-hypervisor guests use virtio-console and Firecracker
+guests boot `quiet`. A workload that writes to its console heavily pays the
+same per-write cost on Firecracker, so send bulk output to a file instead.
 
 ### The root disk cache
 
@@ -539,7 +599,7 @@ Optional:
 | `rootfs_headroom_mib` | `256` | Writable space added to the ephemeral root disk beyond the image contents. |
 | `hypervisor` | `auto` | `auto`, `cloud-hypervisor`, `firecracker`, `dev`. |
 | `kernel` | `LEGION_SANDBOX_KERNEL`, then `/var/lib/legion/kernels/vmlinux` | Uncompressed guest kernel. `${artifact.<name>}` works here. |
-| `kernel_args` | none | Appended to Legion's kernel cmdline. |
+| `kernel_args` | none | Appended to Legion's kernel cmdline, after Legion's own arguments, so a later setting wins: `loglevel=7` gives a Firecracker guest its full boot log back. |
 | `network` | `{ mode: 'none' }` | `{ mode: 'tap', bridge: 'br0' }` gives the guest a NIC on a TAP device Legion creates per instance on that host bridge, with an address leased from the bridge's pool. See [Networking](#networking). |
 
 Persistent state is not part of the runtime config. Declare

@@ -18,13 +18,15 @@ on a 4-vCPU manager, and every instance is a row that every manager keeps.
 For a platform that starts a sandbox per agent task or per tool call, most
 of those units are thrown away within minutes and never need to survive a
 node failure, so they pay for durability they do not use. A session skips
-the log entirely. Measured on the same 4-vCPU host, with one manager and 16
-test nodes in one process and the runtime's own boot left out, the control
-plane started about 970 sessions a second with 64 in flight, and about 380
-a second one at a time at 2.5 ms each, with no replicated write for any of
-them. Start capacity comes from the nodes' envelopes and from whichever
-manager routes the start, so it grows with the fleet rather than with the
-log.
+the log entirely. Measured on AWS with four 4-vCPU workers and one 2-vCPU
+manager, sessions started about 1,300 a second through that manager when
+each one was a host process. As microVMs, 160 were booted and ready for exec
+in 2.3 seconds, the cluster sustained 40 boots a second with none refused,
+and one boot took 180 to 230 ms from the create to a guest that runs code
+([Sandboxes at scale](sandboxes-at-scale.md#measured-on-aws)). None of it
+writes to the replicated store. Start capacity comes from the nodes'
+envelopes and from whichever manager routes the start, so it grows with the
+fleet rather than with the log.
 
 > Related: [stateful workloads](stateful-workloads.md) (the `slot` and
 > `keyed` modes this builds on), [sandboxes at scale](sandboxes-at-scale.md)
@@ -85,8 +87,9 @@ the allocation is the reservation.
 **A create goes straight to a node.** `CreateInstance` without an
 `instance_id` on a session task does not touch the store. The manager's
 session router reads which nodes hold an envelope for the task and how much
-of each is in use, picks the node with the most room left, and sends the
-start to that node directly over the worker's `PostWork` RPC. The node
+of each is in use, picks one by the task's `stateful.placement` ([Picking a
+node](#picking-a-node)), and sends the start to that node directly over the
+worker's `PostWork` RPC. The node
 admits the session against its envelope's free room (never against the
 node's general free capacity, which the envelope already holds) and starts
 it. A node whose envelope turned out to be full refuses, and the router
@@ -108,8 +111,11 @@ released, so one node's starts overlap. At most `edgeBoot.launchConcurrency`
 launches run at once (default twice the node's cores); a start that waits
 longer than `edgeBoot.queueTimeout` (default `1s`) for a launch slot is
 refused with `RESOURCE_EXHAUSTED`, which is retryable, and the router or
-picker tries the next node. A session start never rewrites the worker's
-state file.
+picker tries the next node. A sandbox session holds its slot until its
+guest takes exec, which is also when it reports `running`
+([How fast a sandbox boots](task-runtime-sandbox.md#how-fast-a-sandbox-boots)),
+so the setting also bounds how many guests boot on the node at once.
+Neither a session's start nor its stop rewrites the worker's state file.
 
 **Nodes report what they run.** Each worker reports its sessions on its
 heartbeats, as deltas against an epoch, with a full report every 30
@@ -132,7 +138,39 @@ at random, so managers reading the same view do not all send their next
 start to one node. The router caches its view of envelope room for one
 second, and when it expires one start reads it again while the others
 keep routing on the old view. The node stays authoritative: an over-count
-costs a retry on the next node, never an over-full envelope.
+costs a retry on the next node, never an over-full envelope. Because the
+view does not see stops until a refresh, a view that says every envelope is
+full is not the last word: the start still asks the node it thinks least
+full, once, and is refused only if that node refuses too.
+
+## Picking a node
+
+`stateful.placement` chooses how a manager's router picks the node for each
+start. Edge starts are picked by the caller ([Starting at the
+edge](#starting-at-the-edge)), so it does not apply to them.
+
+| `placement` | Picks | A pick costs | Use it for |
+| --- | --- | --- | --- |
+| `"spread"` (default) | The node with the most room left, counting the router's own starts in flight; ties at random | One read of every node holding an envelope for the task | The evenest spread, on fleets up to about a thousand nodes |
+| `"fast"` | The roomier of two nodes sampled at random from those with room | The same on any fleet size | Very large fleets, and many managers routing one task |
+
+Measured in the router (one core, half the fleet half full):
+
+| Nodes with an envelope | `spread` | `fast` |
+| --- | --- | --- |
+| 100 | 4 µs a pick | 0.2 µs |
+| 1,000 | 31 µs (about 32,000 picks a second) | 0.2 µs |
+| 10,000 | 330 µs (about 3,000 a second) | 0.2 µs |
+| 100,000 | 5.2 ms (about 190 a second) | 0.5 µs |
+
+A pick runs under the router's lock, so on a fleet of ten thousand nodes
+`spread` alone caps a manager's starts at about 3,000 a second, and `fast`
+does not. `fast` spreads less evenly: of two samples, both may land on
+fuller nodes. Two managers routing one task rarely pick the same node with
+it, where `spread`'s pick depends only on the shared view. Either way the
+node decides: a pick that turns out full costs a retry, and `fast` falls
+back to `spread`'s full read when its samples find no room, which happens
+only near a full fleet.
 
 ## When to use it
 
@@ -183,6 +221,7 @@ stateful = {
     constraints = [{ key = "rack", operator = "=", value = "r1" }],
   },
   promote = { onName = true },
+  placement = "spread",
 },
 resources = { cpu = 500, memory = 512 },
 ```
@@ -193,6 +232,7 @@ resources = { cpu = 500, memory = 512 },
 | `stateful.envelope.resources` | required | What each node keeps for this task's sessions. Must set `cpu` and `memory`, and every amount the session's own `resources` declares. Sessions are admitted against exactly these keys |
 | `stateful.envelope.constraints` | none | Extra placement constraints for the envelopes, added to the task's own `constraints` |
 | `stateful.promote.onName` | `true` | Whether a caller-chosen id is accepted: `instance create --id` (a keyed instance from birth) and `instance promote --id` (a rename). With `false`, a create always starts an unnamed session and a promotion keeps the session's id |
+| `stateful.placement` | `"spread"` | How a manager's router picks the node a session starts on: `"spread"` (the most room left) or `"fast"` (the roomier of two random nodes with room). See [Picking a node](#picking-a-node) |
 | `stateful.fenceAfter` | `"2m"` | Session tasks with `suspend.durability = "store"` only. A node that reaches neither a manager nor its content store for this long suspends its running sessions of the task on its own disk, so a copy cut off from the cluster stops serving before a moved copy can start ([No split brain](#no-split-brain)). At least 10 seconds |
 | `resources` | | One session's size, in the envelope's units |
 

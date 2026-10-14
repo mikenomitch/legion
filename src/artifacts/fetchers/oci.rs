@@ -376,38 +376,101 @@ fn tag_resolution_key(reference: &Reference, auth: &RegistryAuth) -> String {
 
 /// A tag's current digest for a pull that asked at `requested_at`.
 ///
-/// Concurrent starts of one image queue on [`ImagePullClaim`], and each
-/// used to send its own `HEAD` once its turn came, so a burst of N starts
-/// paid N registry round trips one after another. A resolution *sent*
-/// after this pull asked is at least as fresh as the answer this pull would
-/// get by asking itself, so it is reused: a burst of any size pays about
-/// two round trips (the first pull's, and the first waiter's). A pull with
-/// no such answer asks the registry.
+/// A resolution *sent* after this pull asked is at least as fresh as the
+/// answer this pull would get by asking itself, so it is reused, finished or
+/// still in flight. One request is in flight per key: a burst of N starts
+/// pays about two round trips (the first pull's, and one for the pulls that
+/// arrived while it was out), never N. A pull with no such answer asks the
+/// registry.
 fn resolve_tag_shared(
     key: &str,
     requested_at: std::time::Instant,
     resolve: impl FnOnce() -> R<String>,
 ) -> R<String> {
-    if let Some((digest, sent_at)) = TAG_RESOLUTIONS
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .get(key)
-    {
-        if *sent_at >= requested_at {
-            return Ok(digest.clone());
+    let mut resolve = Some(resolve);
+    loop {
+        if let Some((digest, sent_at)) = TAG_RESOLUTIONS
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .get(key)
+        {
+            if *sent_at >= requested_at {
+                return Ok(digest.clone());
+            }
         }
+        // One resolution in flight per key. A pull that finds one waits for
+        // it, and uses its answer when it was sent after the pull asked;
+        // otherwise it goes round again and sends (or waits for) a newer one.
+        let (flight, owner) = {
+            let mut flights = TAG_FLIGHTS.lock().unwrap_or_else(|p| p.into_inner());
+            match flights.get(key) {
+                Some(flight) => (flight.clone(), false),
+                None => {
+                    let flight = std::sync::Arc::new(TagFlight {
+                        sent_at: std::time::Instant::now(),
+                        answer: std::sync::Mutex::new(None),
+                        done: std::sync::Condvar::new(),
+                    });
+                    flights.insert(key.to_string(), flight.clone());
+                    (flight, true)
+                }
+            }
+        };
+        if owner {
+            let resolve = resolve.take().expect("a pull owns at most one flight");
+            let answer = resolve();
+            if let Ok(digest) = answer.as_ref() {
+                let mut resolutions = TAG_RESOLUTIONS.lock().unwrap_or_else(|p| p.into_inner());
+                resolutions.retain(|_, (_, at)| {
+                    flight.sent_at.duration_since(*at) < TAG_RESOLUTION_MEMORY
+                });
+                // Keep the newest answer if another flight with this key
+                // finished first.
+                let newer = resolutions
+                    .get(key)
+                    .is_some_and(|(_, at)| *at > flight.sent_at);
+                if !newer {
+                    resolutions.insert(key.to_string(), (digest.clone(), flight.sent_at));
+                }
+            }
+            *flight.answer.lock().unwrap_or_else(|p| p.into_inner()) = Some(
+                answer
+                    .as_ref()
+                    .map(String::clone)
+                    .map_err(|err| format!("{err:#}")),
+            );
+            TAG_FLIGHTS
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .remove(key);
+            flight.done.notify_all();
+            return answer;
+        }
+        let mut answer = flight.answer.lock().unwrap_or_else(|p| p.into_inner());
+        while answer.is_none() {
+            answer = flight.done.wait(answer).unwrap_or_else(|p| p.into_inner());
+        }
+        if flight.sent_at >= requested_at {
+            return answer
+                .clone()
+                .expect("checked above")
+                .map_err(|err| anyhow!(err));
+        }
+        // Sent before this pull asked: too old to answer it. Ask again.
     }
-    let sent_at = std::time::Instant::now();
-    let digest = resolve()?;
-    let mut resolutions = TAG_RESOLUTIONS.lock().unwrap_or_else(|p| p.into_inner());
-    resolutions.retain(|_, (_, at)| sent_at.duration_since(*at) < TAG_RESOLUTION_MEMORY);
-    // Keep the newest answer if another pull with this key raced this one.
-    let newer = resolutions.get(key).is_some_and(|(_, at)| *at > sent_at);
-    if !newer {
-        resolutions.insert(key.to_string(), (digest.clone(), sent_at));
-    }
-    Ok(digest)
 }
+
+/// A tag resolution in flight ([`resolve_tag_shared`]).
+struct TagFlight {
+    sent_at: std::time::Instant,
+    answer: std::sync::Mutex<Option<Result<String, String>>>,
+    done: std::sync::Condvar,
+}
+
+/// Tag resolutions in flight, by the same key as [`TAG_RESOLUTIONS`].
+static TAG_FLIGHTS: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<String, std::sync::Arc<TagFlight>>>,
+> = std::sync::LazyLock::new(Default::default);
 
 /// Image blobs (manifests, configs, layers) in the node content store
 /// (`artifacts` class), by digest. Every blob of an image is immutable and
@@ -449,6 +512,30 @@ impl ImageBlobCache<'_> {
         }
         let _ = std::fs::remove_file(dest);
         std::fs::hard_link(&entry.path, dest).is_ok() || std::fs::copy(&entry.path, dest).is_ok()
+    }
+
+    /// The platform manifest of the image `top_digest` names, when it and
+    /// every blob it lists are already in the store: an image this node can
+    /// lay out with no registry request. `None` when anything is missing.
+    fn whole_image(&self, top_digest: &str) -> Option<(Vec<u8>, String)> {
+        let top = self.read(top_digest)?;
+        let (raw, digest) = match serde_json::from_slice::<OciManifest>(&top).ok()? {
+            OciManifest::Image(_) => (top, top_digest.to_string()),
+            OciManifest::ImageIndex(index) => {
+                let digest = linux_platform_resolver(&index.manifests)?;
+                (self.read(&digest)?, digest)
+            }
+        };
+        let manifest: OciImageManifest = serde_json::from_slice(&raw).ok()?;
+        let whole = std::iter::once(&manifest.config)
+            .chain(manifest.layers.iter())
+            .all(|descriptor| {
+                ContentDigest::parse(&descriptor.digest)
+                    .ok()
+                    .and_then(|digest| self.store.contains(&digest).ok())
+                    .unwrap_or(false)
+            });
+        whole.then_some((raw, digest))
     }
 
     /// Keeps bytes fetched from the registry, verified against `digest`.
@@ -626,14 +713,10 @@ impl OciFetcher {
         let store = sink.content_store().cloned();
         let cache = store.as_deref().map(|store| ImageBlobCache { store });
         let requested_at = std::time::Instant::now();
-        let _claim = cache
-            .as_ref()
-            .map(|_| ImagePullClaim::claim(&reference.whole()));
 
         // The digest the reference names: given, or (with a cache to serve
-        // it from) a tag's current digest, shared with the pull this one
-        // queued behind when that one asked the registry after this one
-        // arrived.
+        // it from) a tag's current digest, shared with any pull of the same
+        // tag whose request went out after this one arrived.
         let top_digest = match (reference.digest(), cache.as_ref()) {
             (Some(digest), _) => Some(digest.to_string()),
             (None, Some(cache)) => Some(resolve_tag_shared(
@@ -643,15 +726,32 @@ impl OciFetcher {
             )?),
             (None, None) => None,
         };
-        let (raw_manifest, manifest_digest, manifest_cached) = self.platform_manifest(
-            req,
-            runtime,
-            client,
-            reference,
-            auth,
-            top_digest.as_deref(),
-            cache.as_ref(),
-        )?;
+        // An image already whole on the node (every start but its first)
+        // is laid out with no claim: a burst of starts of one image used to
+        // assemble their layouts one at a time behind the claim, which on a
+        // 96-vCPU node cost the thousandth start of a burst over 5 s. Only a
+        // pull with something to download takes the claim, so concurrent
+        // starts still never download the same blob twice.
+        let whole = match (cache.as_ref(), top_digest.as_deref()) {
+            (Some(cache), Some(digest)) => cache.whole_image(digest),
+            _ => None,
+        };
+        let _claim = match (&whole, cache.as_ref()) {
+            (None, Some(_)) => Some(ImagePullClaim::claim(&reference.whole())),
+            _ => None,
+        };
+        let (raw_manifest, manifest_digest, manifest_cached) = match whole {
+            Some((raw, digest)) => (raw, digest, true),
+            None => self.platform_manifest(
+                req,
+                runtime,
+                client,
+                reference,
+                auth,
+                top_digest.as_deref(),
+                cache.as_ref(),
+            )?,
+        };
         let manifest: OciImageManifest = serde_json::from_slice(&raw_manifest)
             .with_context(|| format!("parse image manifest for {}", req.redacted_source))?;
 
@@ -804,6 +904,44 @@ fn sanitize_title(title: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A burst of pulls of one tag sends one resolution. A pull that asked
+    /// after that request went out never takes its answer: it gets a newer
+    /// one.
+    #[test]
+    fn concurrent_pulls_of_a_tag_share_one_resolution_test() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+        let key = format!("test-single-flight-{}", std::process::id());
+        let sent = Arc::new(AtomicUsize::new(0));
+        let asked = std::time::Instant::now();
+        let threads: Vec<_> = (0..16)
+            .map(|_| {
+                let (key, sent) = (key.clone(), sent.clone());
+                std::thread::spawn(move || {
+                    resolve_tag_shared(&key, asked, || {
+                        sent.fetch_add(1, Ordering::SeqCst);
+                        std::thread::sleep(std::time::Duration::from_millis(50));
+                        Ok("sha256:aaaa".to_string())
+                    })
+                })
+            })
+            .collect();
+        for thread in threads {
+            assert_eq!(thread.join().unwrap().unwrap(), "sha256:aaaa");
+        }
+        assert_eq!(sent.load(Ordering::SeqCst), 1, "one request for the burst");
+
+        // A pull that asks after that answer was sent resolves again.
+        let later = std::time::Instant::now();
+        let digest = resolve_tag_shared(&key, later, || {
+            sent.fetch_add(1, Ordering::SeqCst);
+            Ok("sha256:bbbb".to_string())
+        })
+        .unwrap();
+        assert_eq!(digest, "sha256:bbbb");
+        assert_eq!(sent.load(Ordering::SeqCst), 2);
+    }
 
     /// Shared registry clients are keyed by credential: one job's token
     /// cache never serves another's pull.
