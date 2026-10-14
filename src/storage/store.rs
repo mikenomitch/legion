@@ -4874,10 +4874,11 @@ impl Store {
     /// This is the whole of ratification (docs/edge-boot.md): a plan
     /// submission whose placement list has length one and whose instance is
     /// named. It goes through `apply_plan_submission_apply` like every other
-    /// plan — the same epoch compare-and-set, the same constraint
-    /// re-validation on the fresh node row, the same
-    /// `assign_stateful_instance_tx` — so "someone else already owns this
-    /// sandbox" is the existing conflict, not a new consistency mechanism.
+    /// plan — the same constraint and capacity re-validation on the fresh
+    /// node row, the same `assign_stateful_instance_tx` — so "someone else
+    /// already owns this sandbox" is the existing conflict, not a new
+    /// consistency mechanism. It skips the epoch compare-and-set, since it
+    /// never planned against a snapshot, so pass `expected_versions` empty.
     pub fn submit_and_apply_plan_for_instance(
         &self,
         job_config_id: &str,
@@ -5546,31 +5547,6 @@ impl Store {
             ))
         };
 
-        // The job-config epoch is a hard, all-or-nothing check: it is what
-        // serializes two plans for the SAME job config, and candidate lists
-        // must not weaken it.
-        let job_scope_key = Self::scope_vector_key("job_config", &submission.job_config_id);
-        let expected_job_epoch = submission
-            .expected_versions
-            .get(&job_scope_key)
-            .copied()
-            .unwrap_or_default();
-        let latest_job_epoch = self.scope_epoch_tx(tx, "job_config", &submission.job_config_id)?;
-        if latest_job_epoch != expected_job_epoch {
-            let reason = format!(
-                "plan epoch for job config {} is stale; expected {}, latest {}",
-                submission.job_config_id, expected_job_epoch, latest_job_epoch
-            );
-            return reject(tx, reason, None);
-        }
-
-        // A stop or a newer config does not bump this config's epoch, so the
-        // check above cannot see either. Re-check here, inside the write
-        // transaction, that the plan is still for something the job wants.
-        if let Some(reason) = Self::job_config_unwanted_reason_on(tx, &submission.job_config_id)? {
-            return reject(tx, format!("{PLAN_NOT_WANTED_PREFIX}{reason}"), None);
-        }
-
         let (placements_json, plan_mode, evictions_json, target_instance): (
             String,
             String,
@@ -5584,12 +5560,51 @@ impl Store {
             .query_row([submission.id], |row| {
                 Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
             })?;
-        let placements = Self::parse_plan_submission_placements(&placements_json)?;
-        let evictions: Vec<PlanEviction> = serde_json::from_str(&evictions_json)?;
         // Only a ratification sets this, and it always carries exactly one
         // placement (docs/edge-boot.md): "bind this sandbox on this node, or
         // tell me who beat me to it".
         let target_instance = target_instance.filter(|id| !id.is_empty());
+        // A ratification compares no epochs, job-config or node. It never
+        // planned against a snapshot, so a moved epoch says nothing about
+        // it. Its one candidate is re-validated against committed rows in
+        // the walk below, and `assign_keyed_instance_tx` reads who owns the
+        // sandbox in this same transaction. With the epochs as fences,
+        // every concurrent ratification of one job after the first was
+        // refused as stale (edge-ratify-throughput plan §6.1). It still
+        // bumps the epochs when it binds, so scheduler plans stay fenced
+        // against it.
+        let compare_epochs = target_instance.is_none();
+
+        // The job-config epoch is a hard, all-or-nothing check: it is what
+        // serializes two plans for the SAME job config, and candidate lists
+        // must not weaken it.
+        if compare_epochs {
+            let job_scope_key = Self::scope_vector_key("job_config", &submission.job_config_id);
+            let expected_job_epoch = submission
+                .expected_versions
+                .get(&job_scope_key)
+                .copied()
+                .unwrap_or_default();
+            let latest_job_epoch =
+                self.scope_epoch_tx(tx, "job_config", &submission.job_config_id)?;
+            if latest_job_epoch != expected_job_epoch {
+                let reason = format!(
+                    "plan epoch for job config {} is stale; expected {}, latest {}",
+                    submission.job_config_id, expected_job_epoch, latest_job_epoch
+                );
+                return reject(tx, reason, None);
+            }
+        }
+
+        // A stop or a newer config does not bump this config's epoch, so the
+        // check above cannot see either. Re-check here, inside the write
+        // transaction, that the plan is still for something the job wants.
+        if let Some(reason) = Self::job_config_unwanted_reason_on(tx, &submission.job_config_id)? {
+            return reject(tx, format!("{PLAN_NOT_WANTED_PREFIX}{reason}"), None);
+        }
+
+        let placements = Self::parse_plan_submission_placements(&placements_json)?;
+        let evictions: Vec<PlanEviction> = serde_json::from_str(&evictions_json)?;
 
         // ---- Preemption: victims leave before the placements they paid for
         // arrive, inside this same transaction.
@@ -5748,12 +5763,8 @@ impl Store {
             // fenced separately, by the job-config epoch above, which
             // stays hard and all-or-nothing.
             //
-            // The one exception is a ratification (`target_instance`,
-            // docs/edge-boot.md): there a moved epoch may mean somebody
-            // already owns this sandbox, which no capacity recheck can
-            // disprove, so the epoch stays a hard gate and pass 2 never
-            // runs.
-            let revalidation_allowed = target_instance.is_none();
+            // A ratification (`compare_epochs` false) skips the epoch
+            // compare and goes straight to those checks.
             let mut bound = false;
             let mut first_skip_reason: Option<String> = None;
             let mut first_stale_reason: Option<String> = None;
@@ -5770,26 +5781,26 @@ impl Store {
                 attempt_index += 1;
                 let node_id = &placement.candidates[rank];
                 if !revalidated {
-                    let node_scope_key = Self::scope_vector_key("node", node_id);
-                    let expected_epoch = submission
-                        .expected_versions
-                        .get(&node_scope_key)
-                        .copied()
-                        .unwrap_or_default();
-                    let latest_epoch = match pre_eviction_node_epochs.get(node_id) {
-                        Some(epoch) => *epoch,
-                        None => self.scope_epoch_tx(tx, "node", node_id)?,
-                    };
-                    if latest_epoch != expected_epoch {
-                        if first_stale_reason.is_none() {
-                            first_stale_reason = Some(format!(
-                                "node {node_id} epoch moved (expected {expected_epoch}, latest {latest_epoch})"
-                            ));
-                        }
-                        if revalidation_allowed {
+                    if compare_epochs {
+                        let node_scope_key = Self::scope_vector_key("node", node_id);
+                        let expected_epoch = submission
+                            .expected_versions
+                            .get(&node_scope_key)
+                            .copied()
+                            .unwrap_or_default();
+                        let latest_epoch = match pre_eviction_node_epochs.get(node_id) {
+                            Some(epoch) => *epoch,
+                            None => self.scope_epoch_tx(tx, "node", node_id)?,
+                        };
+                        if latest_epoch != expected_epoch {
+                            if first_stale_reason.is_none() {
+                                first_stale_reason = Some(format!(
+                                    "node {node_id} epoch moved (expected {expected_epoch}, latest {latest_epoch})"
+                                ));
+                            }
                             attempts.push((rank, true));
+                            continue;
                         }
-                        continue;
                     }
                     // Replicas of one task prefer distinct nodes *when they
                     // fall back*: without this, every replica's tail
@@ -5802,9 +5813,7 @@ impl Store {
                     // fits, and `distinct` remains the constraint for
                     // callers who need the guarantee.
                     if rank > 0 && plan_binds.contains(&(task_id, node_id.clone())) {
-                        if revalidation_allowed {
-                            attempts.push((rank, true));
-                        }
+                        attempts.push((rank, true));
                         continue;
                     }
                 }
@@ -5973,8 +5982,8 @@ impl Store {
                 // Name the real cause. With pass 2 in play, every
                 // candidate has been re-derived against committed state,
                 // so a rejection means no candidate *fits* — capacity, a
-                // constraint, a cordon, a port. Only a ratification (which
-                // skips pass 2) can still be rejected for staleness alone.
+                // constraint, a cordon, a port. A ratification compares no
+                // epochs, so it is never rejected for staleness.
                 let cause = first_skip_reason
                     .or(first_stale_reason)
                     .unwrap_or_else(|| "no candidates listed".to_string());
@@ -16409,6 +16418,23 @@ impl Store {
             })
             .optional()?;
         Ok(instance)
+    }
+
+    /// Whether an instance row exists (live, stopped, or a tombstone), read
+    /// through the write connection. Only meaningful inside an op body,
+    /// where it sees rows that this op and its group-commit batch-mates
+    /// wrote but have not committed yet.
+    pub(crate) fn instance_exists_in_op(&self, instance_id: &str) -> R<bool> {
+        let conn = self.write_connection()?;
+        let exists = conn
+            .query_row(
+                "SELECT 1 FROM instance WHERE instance_id = ?1;",
+                [instance_id],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some();
+        Ok(exists)
     }
 
     #[instrument(err, skip_all)]

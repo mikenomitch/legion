@@ -11386,8 +11386,13 @@ impl Manager for ManagerDaemonService {
             instance_id: &req.instance_id,
             gate: crate::structs::edge_boot::Gate::from_wire(req.gate),
         };
-        let verdict = crate::manager::edge_boot::ratify(&self.store, &claim, spend, started)
-            .map_err(|e| Status::internal(format!("ratification failed: {e:#}")))?;
+        // The ratification waits on a group-commit entry. Waiting on a
+        // runtime worker thread would cap a burst at the thread count, so
+        // entries could never fill, and would stall heartbeats meanwhile.
+        let verdict = run_blocking_admission(|| {
+            crate::manager::edge_boot::ratify(&self.store, &claim, spend, started)
+        })
+        .map_err(|e| Status::internal(format!("ratification failed: {e:#}")))?;
 
         let job_id = self
             .store
@@ -11960,8 +11965,9 @@ fn template_eval_status(err: anyhow::Error) -> Status {
 }
 
 /// Runs blocking admission work (artifact pin resolution can reach
-/// registries, and a job submit is a chain of quorum writes) without
-/// stalling the async runtime where possible.
+/// registries, a ratification waits on a group commit, and a job submit is
+/// a chain of quorum writes) without stalling the async runtime where
+/// possible.
 /// `block_in_place` needs the multi-thread runtime; current-thread callers
 /// (tests) run inline.
 fn run_blocking_admission<T>(work: impl FnOnce() -> T) -> T {

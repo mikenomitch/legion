@@ -413,3 +413,149 @@ fn a_ratified_sandbox_can_be_rescheduled_like_any_other_allocation() -> R<()> {
     assert_eq!(instance.current_alloc_id, Some(second));
     Ok(())
 }
+
+/// Ratify every `(node, instance)` pair at once, one thread each, released
+/// together so they queue into the same group commit.
+fn ratify_concurrently(
+    store: &std::sync::Arc<Store>,
+    job_config_id: &str,
+    claims: Vec<(String, String)>,
+) -> R<Vec<Verdict>> {
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(claims.len()));
+    let handles = claims
+        .into_iter()
+        .enumerate()
+        .map(|(index, (node_id, instance_id))| {
+            let store = store.clone();
+            let barrier = barrier.clone();
+            let job_config_id = job_config_id.to_string();
+            std::thread::spawn(move || -> R<Verdict> {
+                let claim_id = format!("clm_{index}");
+                barrier.wait();
+                ratify(
+                    &store,
+                    &claim(&node_id, &claim_id, &job_config_id, &instance_id),
+                )
+            })
+        })
+        .collect::<Vec<_>>();
+    handles
+        .into_iter()
+        .map(|handle| handle.join().expect("ratify thread"))
+        .collect()
+}
+
+fn refusal_reasons(verdicts: &[Verdict]) -> Vec<RefusalReason> {
+    verdicts
+        .iter()
+        .filter_map(|verdict| match verdict {
+            Verdict::Refused { reason, .. } => Some(*reason),
+            Verdict::Confirmed { .. } => None,
+        })
+        .collect()
+}
+
+/// Edge starts of one sandbox job from many nodes at once must not refuse
+/// each other. Each binds its own instance on its own node, which the apply
+/// re-validates against committed rows. A ratification used to also demand
+/// an unchanged job-config epoch, so all but one of a burst were refused as
+/// `internal` and their nodes killed sandboxes they had already booted
+/// (edge-ratify-throughput plan §6.1).
+#[test]
+fn concurrent_ratifications_for_one_job_all_confirm() -> R<()> {
+    let store = std::sync::Arc::new(setup_store()?);
+    let nodes = 16;
+    for index in 0..nodes {
+        store.insert_node(node(&format!("node-{index}")))?;
+    }
+    let job_config_id = submit(&store)?;
+    let claims = (0..nodes)
+        .map(|index| (format!("node-{index}"), format!("user-{index}")))
+        .collect();
+    let verdicts = ratify_concurrently(&store, &job_config_id, claims)?;
+    assert_eq!(
+        refusal_reasons(&verdicts),
+        Vec::<RefusalReason>::new(),
+        "every claim fits, so none may be refused: {verdicts:?}"
+    );
+    assert_eq!(store.get_allocs()?.len(), nodes);
+    for index in 0..nodes {
+        let instance = store
+            .get_instance(&format!("user-{index}"))?
+            .context("created by its ratification")?;
+        assert!(instance.current_alloc_id.is_some(), "user-{index} is bound");
+    }
+    Ok(())
+}
+
+/// A dense node starting many sandboxes at once gets exactly as many as it
+/// has room for. Without the epoch fence, capacity is what stops the burst:
+/// the apply rebuilds the node's free pool from committed rows for every
+/// ratification, so the ninth sandbox on an eight-slot node is refused as
+/// `no_capacity`, never admitted.
+#[test]
+fn concurrent_ratifications_on_one_node_confirm_up_to_its_capacity() -> R<()> {
+    let store = std::sync::Arc::new(setup_store()?);
+    // The fixture fingerprints no memory or CPU totals, so slots come from
+    // `maxAllocations`, which the apply enforces like any other dimension.
+    let mut dense = node("node-a");
+    let mut attrs: serde_json::Value = serde_json::from_str(&dense.config_attrs)?;
+    attrs["maxAllocations"] = json!(8);
+    dense.config_attrs = attrs.to_string();
+    store.insert_node(dense)?;
+    let job_config_id = submit(&store)?;
+    let claims = (0..24)
+        .map(|index| ("node-a".to_string(), format!("user-{index}")))
+        .collect();
+    let verdicts = ratify_concurrently(&store, &job_config_id, claims)?;
+    let confirmed = verdicts
+        .iter()
+        .filter(|verdict| matches!(verdict, Verdict::Confirmed { .. }))
+        .count();
+    assert_eq!(confirmed, 8, "{verdicts:?}");
+    assert!(
+        refusal_reasons(&verdicts)
+            .iter()
+            .all(|reason| *reason == RefusalReason::NoCapacity),
+        "a full node refuses for capacity, not contention: {verdicts:?}"
+    );
+    assert_eq!(store.get_allocs()?.len(), 8);
+    Ok(())
+}
+
+/// Two nodes holding the same ticket both boot the same never-existed
+/// sandbox and race to create it. Exactly one owns it, and every loser is
+/// told `instance_claimed` (final), not `internal`: whether the id exists is
+/// decided inside the entry, where a batch-mate's create is visible.
+#[test]
+fn nodes_racing_to_create_one_sandbox_leave_exactly_one_owner() -> R<()> {
+    let store = std::sync::Arc::new(setup_store()?);
+    store.insert_node(node("node-a"))?;
+    store.insert_node(node("node-b"))?;
+    let job_config_id = submit(&store)?;
+    let claims = (0..8)
+        .map(|index| {
+            let node_id = if index % 2 == 0 { "node-a" } else { "node-b" };
+            (node_id.to_string(), "user-new".to_string())
+        })
+        .collect();
+    let verdicts = ratify_concurrently(&store, &job_config_id, claims)?;
+    let winners = verdicts
+        .iter()
+        .filter(|verdict| matches!(verdict, Verdict::Confirmed { .. }))
+        .count();
+    assert_eq!(winners, 1, "{verdicts:?}");
+    assert!(
+        refusal_reasons(&verdicts)
+            .iter()
+            .all(|reason| *reason == RefusalReason::InstanceClaimed),
+        "a lost race is final: {verdicts:?}"
+    );
+    let owned = store
+        .get_allocs()?
+        .iter()
+        .filter(|allocation| allocation.instance_id.as_deref() == Some("user-new"))
+        .count();
+    assert_eq!(owned, 1);
+    Ok(())
+}

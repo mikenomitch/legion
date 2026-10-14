@@ -2013,9 +2013,12 @@ service Manager {
   // with its node token. The manager turns the claim into an ordinary plan
   // submission with a single placement on the calling node and applies it
   // through the same transaction every other placement goes through, with
-  // the same epoch compare-and-set, the same constraint re-validation, and
-  // the same at-most-one-live-allocation instance binding. A refusal here is
-  // that apply failing; there is no second code path for correctness.
+  // the same constraint and capacity re-validation against committed rows
+  // and the same at-most-one-live-allocation instance binding. It skips the
+  // plan epoch compare-and-set, because it never planned against a
+  // snapshot, so concurrent ratifications of one job do not refuse each
+  // other. A refusal here is that apply failing. There is no second code
+  // path for correctness.
   //
   // The reply is the verdict: `confirmed` carries the manager-minted
   // allocation id (the worker opens the network and the work becomes a normal
