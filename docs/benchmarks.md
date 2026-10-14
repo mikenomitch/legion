@@ -208,6 +208,32 @@ on `web_fleet`:
   cadence is worth up to about 18% of Legion's throughput at 10k, far less
   than the gap to either competitor.
 
+**Legion with `RunJob` off the async runtime.** The tables above measure
+`main`. The same release moves `RunJob`'s raft writes off the manager's
+async worker threads (`block_in_place`), so a burst of submits no longer
+leaves evaluations and heartbeats waiting for a thread. Rerun on the same
+rig, one run per cell:
+
+| Workload           | Fleet / density | `main`  | With the change |
+| ------------------ | --------------- | ------- | --------------- |
+| `web_fleet`        | 1,000 nodes     | 680     | **1,261**       |
+| `web_fleet`        | 2,000 nodes     | 640     | **1,067**       |
+| `web_fleet`        | 5,000 nodes     | 1,175   | 968             |
+| `web_fleet`        | 10,000 nodes    | 635     | **945**         |
+| `dense_fleet`, 5k  | 5 per node      | 2,350   | **3,102**       |
+| `dense_fleet`, 5k  | 10 per node     | 2,025   | **2,777**       |
+| `dense_fleet`, 5k  | 20 per node     | 2,466   | 2,330           |
+| `dense_fleet`, 5k  | 40 per node     | 2,139   | **2,373**       |
+
+Allocations/sec. Jobs now enter at 270-690/sec instead of 110-180, and the
+plan coalescer folds about 16 submits into each commit instead of about 1.
+The `web_fleet` 5k cell is the exception: it placed 968/sec against two
+`main` runs of 1,175 and 1,151, even though its p99 fell from 25s to 17.5s.
+We have not yet found why. A single submit also waits longer, about
+140-225ms instead of 40-125ms in local runs, because it now queues in the
+coalescer's batch. The comparison tables and multiples above use the
+`main` numbers.
+
 **Submitting through the CLI.** As a control in the earlier run, we also
 ran `web_fleet` at 5k nodes with every system submitting one CLI process
 per job. That caps all three at the load generator's process-spawn rate,
