@@ -3,7 +3,6 @@ use crate::structs::{Allocation, TaskConfig};
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::{Path, PathBuf};
-use sysinfo::{Pid, System};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -487,6 +486,7 @@ fn linux_process_start_time(pid: u32) -> Option<u64> {
 
 #[cfg(not(target_os = "linux"))]
 fn sysinfo_process_start_time(pid: u32) -> Option<u64> {
+    use sysinfo::{Pid, System};
     let pid = Pid::from_u32(pid);
     let mut system = System::new();
     system.refresh_processes_specifics(
@@ -511,6 +511,7 @@ fn ensure_dir(path: &Path) -> R<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sysinfo::{Pid, System};
 
     /// The /proc reading agrees with `sysinfo`, so a start time recorded
     /// before the switch still identifies its process.

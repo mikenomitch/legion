@@ -10443,8 +10443,16 @@ mod tests {
         )?;
         assert_eq!(fenced, vec![1]);
         // The fenced pid is the old process's child no longer; `manager`
-        // still owns its `Child`, so reap it here to drop the zombie.
-        manager.poll_task_exits();
+        // still owns its `Child`, so reap it here to drop the zombie. A
+        // SIGKILL lands asynchronously, so give it a moment.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            manager.poll_task_exits();
+            if !pid_is_running(pids[0]) || std::time::Instant::now() >= deadline {
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
         assert!(!pid_is_running(pids[0]), "expired stateful task is killed");
         assert!(pid_is_running(pids[1]), "long window keeps running");
         assert!(pid_is_running(pids[2]), "stateless task keeps running");

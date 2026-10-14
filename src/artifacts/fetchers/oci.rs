@@ -128,7 +128,9 @@ fn oci_client(protocol: ClientProtocol, for_image: bool, auth: &RegistryAuth) ->
     /// Bounds the cache for a node whose jobs use many credentials; clients
     /// past it are built per call, as before.
     const MAX_CLIENTS: usize = 64;
-    static CLIENTS: OnceLock<Mutex<HashMap<(bool, bool, [u8; 32]), Client>>> = OnceLock::new();
+    /// (plain http, platform selection, credential fingerprint).
+    type ClientKey = (bool, bool, [u8; 32]);
+    static CLIENTS: OnceLock<Mutex<HashMap<ClientKey, Client>>> = OnceLock::new();
 
     let key = (
         protocol == ClientProtocol::Http,
