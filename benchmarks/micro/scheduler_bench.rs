@@ -750,13 +750,16 @@ fn eval_cycle_cell(store: &Store, cell: &str) {
         let started = std::time::Instant::now();
         let completion = resolve_claimed_eval(store, 0, eval);
         handle_us += started.elapsed().as_micros();
+        // A first submit whose plan places everything settles inside that
+        // plan's entry (`arm_eval_settle`), so `Settled` is the usual answer.
         assert!(
             matches!(
                 completion,
-                EvalCompletion::Finished {
-                    succeeded: true,
-                    ..
-                }
+                EvalCompletion::Settled
+                    | EvalCompletion::Finished {
+                        succeeded: true,
+                        ..
+                    }
             ),
             "eval failed: {completion:?}"
         );
@@ -1284,7 +1287,11 @@ fn setup_keyed_population(store: &Store, resident: usize) -> anyhow::Result<Stri
                 Some(&format!("live-{idx}")),
             )?;
         }
-        let outcome = Scheduler::new(store)?.plan_and_apply(&job_config_id, PlanMode::Fresh)?;
+        // Reschedule, as a create's `job_reschedule` eval plans: only the
+        // instances with no allocation yet. A `Fresh` plan wants one
+        // placement per live instance and fails once some are bound.
+        let outcome =
+            Scheduler::new(store)?.plan_and_apply(&job_config_id, PlanMode::Reschedule)?;
         anyhow::ensure!(
             outcome.allocations.len() == chunk,
             "placed {} of {chunk} keyed instances",
@@ -1329,7 +1336,7 @@ fn keyed_bind_benchmark(c: &mut Criterion) {
                     |()| {
                         let scheduler = Scheduler::new(&store).expect("scheduler");
                         let outcome = scheduler
-                            .plan_and_apply(&job_config_id, PlanMode::Fresh)
+                            .plan_and_apply(&job_config_id, PlanMode::Reschedule)
                             .expect("plan");
                         assert_eq!(outcome.allocations.len(), 1);
                         timings.borrow_mut().push(outcome.timings.clone());

@@ -2,7 +2,7 @@
 
 Calls made while executing
 [`plans/scheduler-lane-entry-cost-plan.md`](../plans/scheduler-lane-entry-cost-plan.md).
-Entries are ranked by project impact, highest first; the number is the rank.
+Entries are ranked by project impact, highest first. The number is the rank.
 
 ## 1. Phase 1 cuts the keyed bind's scan, not the lane's structure
 
@@ -21,7 +21,7 @@ still grows with the task's *live* instances. A platform with tens of
 thousands of running sandboxes in one task still pays for them on every
 placement (entry 3).
 
-**Why (performance, measured; simplicity).** The profile said where the
+**Why (performance, measured, then simplicity).** The profile said where the
 time was. Under the lifecycle load, the bind's one statement was about half
 of the pipeline thread's wall time and two thirds of all capture time, and
 it grew with every instance of the job, parked ones included. Pipelining
