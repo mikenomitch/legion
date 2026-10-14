@@ -2834,9 +2834,12 @@ Plans: [task-runtime-plugins](../docs/task-runtime-plugins.md).
     - [ ] cloud-hypervisor forks get their TAP through a rewritten
           `config.json`. If a cloud-hypervisor version restores net devices
           from `state.json` instead, switch to `net_fds` on restore.
-    - [ ] cloud-hypervisor forks share no memory pages (it copies memory on
-          restore). Try `memory_restore_mode=ondemand` once lazy memory
-          (Phase 8) lands.
+    - [ ] cloud-hypervisor forks share no memory pages. Lazy memory restore
+          now uses `memory_restore_mode=ondemand`, but that copies each page
+          into each guest's own RAM (`UFFDIO_COPY`), so forks still share
+          nothing. Sharing needs `memory_restore_mode=copyonwrite`, which is
+          on cloud-hypervisor `main` and not in a release as of v53
+          ([lazy memory plan](plans/lazy-memory-restore-plan.md) Phase 4).
     - [ ] Guest addresses are copied into forks: a static IP collides on the
           bridge. Now stated up front in the fork docs and the agent
           sandboxes guide. Reassign addresses in the resume handler (DHCP
@@ -3163,6 +3166,40 @@ Plans: [task-runtime-plugins](../docs/task-runtime-plugins.md).
           renumbered.
   - [ ] Phase 8: fast paths, each needing its own review (wake on connect,
         `hint` idle signal, UFFD lazy memory, diff snapshots). Deferred.
+    - [x] Lazy memory restore, Phase 1, in flight in the "lazy memory
+          restore" PR: restores trust the content store's digest instead of
+          rehashing every part, cloud-hypervisor v52+ restores on demand
+          (`memory_restore_mode=ondemand`), Firecracker `eager` reads the
+          memory file ahead, the first resume after a cloud-hypervisor
+          `--restore` waits for the restore instead of failing at 10 s, and
+          `config.memory_restore = "lazy" | "eager"` (default `lazy`).
+          [plan](plans/lazy-memory-restore-plan.md) ·
+          [calls](calls/lazy-memory-restore-plan_calls.md) ·
+          [docs](../docs/task-runtime-sandbox.md#how-memory-comes-back)
+    - [ ] Run the lazy memory KVM checks
+          ([plan §9](plans/lazy-memory-restore-plan.md#9-testing-plan)):
+          `restore_ms` at 1, 4, and 8 GiB on both VMMs and cloud-hypervisor
+          v51 to v53, lazy against eager, a touch-all workload after the
+          resume, and the no-userfaultfd fallback. Nothing in Phase 1 ran on
+          a real VMM.
+    - [ ] Lazy memory Phase 2: start a published restore while its memory
+          streams from the bucket (sealed parts open per 1 MiB chunk, so a
+          page server can range-read them). Today every part is fetched
+          whole before the restore starts.
+    - [ ] Lazy memory Phase 3: record each guest's post-resume working set
+          and prefetch it on the next restore (REAP), the fix for the
+          post-resume fault cost of lazy restore.
+    - [ ] Nothing rescans node content store blobs now that a restore no
+          longer rehashes snapshot parts. Decide whether a background scrub
+          belongs in the store ([plan](plans/lazy-memory-restore-plan.md)
+          open question 2).
+    - [ ] Content store hashing runs in software on aarch64 workers:
+          Legion builds `sha2` without its `asm` feature, which is what
+          turns on the ARMv8 SHA-256 instructions there (about 2 CPU-seconds
+          per GiB, measured). Every capture, import, and fetch check pays
+          it. `ring`'s SHA-256, already a dependency, uses the hardware on
+          both aarch64 and x86_64 and would remove it without a new crate
+          ([plan §1](plans/lazy-memory-restore-plan.md#1-problem-statement)).
 - [ ] Split a task runtime's implementation into parts — isolation vs. runner vs.
       artifact consumption? (idea, needs a plan). The container-runtime plan's
       `resource_enforcement()` interface carves off the first slice of this —
@@ -3180,7 +3217,11 @@ Plans: [task-runtime-plugins](../docs/task-runtime-plugins.md).
       restores (a resume, fork, or `RestoreInstance` start; they record their
       outcome on the checkpoint channel from inside the locked start, see
       `begin_task_allocation` and `spawn_staging_thread` in
-      `src/worker/task_manager.rs`). `heartbeat_tick`
+      `src/worker/task_manager.rs`). A memory restore no longer rehashes
+      every part under the lock, and a lazy one (the default) holds it for
+      about the same time at any guest size, but an `eager` one still holds
+      it for the whole memory read
+      ([lazy memory plan](plans/lazy-memory-restore-plan.md)). `heartbeat_tick`
       also locks a std mutex from async code. Teardown needs a "tearing down"
       state so starts still wait behind stops. [calls #11](calls/architecture-audit-2026-10-09_calls.md).
       The node-check readiness probe (`container system status`) moved off

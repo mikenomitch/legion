@@ -133,6 +133,15 @@ struct SandboxTaskConfig {
     #[serde(default)]
     network: Option<SandboxNetworkConfig>,
 
+    /// How a memory checkpoint's guest RAM comes back on a restore (a
+    /// resume, a snapshot restore, a fork, a create from a snapshot):
+    /// `lazy` (default) resumes the guest before its memory is read and
+    /// loads each page on first touch, `eager` reads all of it first.
+    /// cloud-hypervisor needs v52 or later and a userfaultfd for `lazy`, and
+    /// restores eagerly without them.
+    #[serde(default)]
+    memory_restore: Option<String>,
+
     /// Additional plugin-specific fields reserved for forward compatibility.
     #[serde(default, flatten)]
     #[schemars(skip)]
@@ -383,6 +392,16 @@ impl SandboxTaskConfig {
                 bail!("sandbox task memory_mib must be at least {MIN_MEMORY_MIB}");
             }
         }
+        if let Some(raw) = self.memory_restore.as_deref() {
+            if sandbox_checkpoint::MemoryRestore::parse(raw).is_none() {
+                bail!(
+                    "sandbox task memory_restore must be `lazy` or `eager`, got `{raw}`\nHint: \
+                     `lazy` (the default) resumes a restored guest before its memory is read, and \
+                     `eager` reads all of it first (docs/task-runtime-sandbox.md, \"How memory \
+                     comes back\")"
+                );
+            }
+        }
         if let Some(network) = self.network.as_ref() {
             if let Some(tap) = network.tap.as_ref() {
                 let was = tap.as_str().unwrap_or_default();
@@ -443,6 +462,14 @@ impl SandboxTaskConfig {
     fn rootfs_headroom_mib(&self) -> u32 {
         self.rootfs_headroom_mib
             .unwrap_or(DEFAULT_ROOTFS_HEADROOM_MIB)
+    }
+
+    /// `memory_restore`, already checked by [`Self::validate`].
+    fn memory_restore(&self) -> sandbox_checkpoint::MemoryRestore {
+        self.memory_restore
+            .as_deref()
+            .and_then(sandbox_checkpoint::MemoryRestore::parse)
+            .unwrap_or_default()
     }
 
     /// The bridge the guest's NIC joins, or `None` for a guest with no NIC.
@@ -2476,6 +2503,8 @@ impl TaskPlugin for SandboxTaskPlugin {
             vcpus: config.vcpus(),
             memory_mib: config.memory_mib(),
             scratch: work_root(allocation, instance),
+            memory_restore: config.memory_restore(),
+            userfaultfd: sandbox_checkpoint::userfaultfd_available(),
             tap: config
                 .tap_for(identity.instance_id.as_deref(), allocation.id)
                 .map(|tap| tap.device),
@@ -2920,6 +2949,10 @@ mod tests {
                 "unknown network mode",
                 json!({"image": "a", "command": ["x"], "network": {"mode": "bridge"}}),
             ),
+            (
+                "unknown memory restore",
+                json!({"image": "a", "command": ["x"], "memory_restore": "fast"}),
+            ),
         ] {
             // The schema alone lets all of these through — that is the bug this
             // guards, so assert it rather than assuming it.
@@ -2933,6 +2966,29 @@ mod tests {
         SandboxTaskPlugin
             .validate_config(&json!({"image": "alpine", "command": ["true"]}))
             .expect("a valid sandbox config still passes");
+    }
+
+    #[test]
+    fn memory_restore_defaults_to_lazy_and_takes_eager() {
+        let parsed = |config: Value| SandboxTaskConfig::from_value(&config).unwrap();
+        assert_eq!(
+            parsed(json!({"image": "a", "command": ["x"]})).memory_restore(),
+            sandbox_checkpoint::MemoryRestore::Lazy
+        );
+        assert_eq!(
+            parsed(json!({"image": "a", "command": ["x"], "memory_restore": "eager"}))
+                .memory_restore(),
+            sandbox_checkpoint::MemoryRestore::Eager
+        );
+        let err = SandboxTaskConfig::from_value(
+            &json!({"image": "a", "command": ["x"], "memory_restore": "fast"}),
+        )
+        .expect_err("an unknown mode");
+        assert!(
+            err.to_string()
+                .contains("memory_restore must be `lazy` or `eager`, got `fast`"),
+            "{err}"
+        );
     }
 
     #[test]

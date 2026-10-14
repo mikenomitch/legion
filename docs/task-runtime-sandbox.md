@@ -627,6 +627,7 @@ Optional:
 | `kernel` | `LEGION_SANDBOX_KERNEL`, then `/var/lib/legion/kernels/vmlinux` | Uncompressed guest kernel. `${artifact.<name>}` works here. |
 | `kernel_args` | none | Appended to Legion's kernel cmdline, after Legion's own arguments, so a later setting wins: `loglevel=7` gives a Firecracker guest its full boot log back. |
 | `network` | `{ mode: 'none' }` | `{ mode: 'tap', bridge: 'br0' }` gives the guest a NIC on a TAP device Legion creates per instance on that host bridge, with an address leased from the bridge's pool. See [Networking](#networking). |
+| `memory_restore` | `lazy` | How a memory checkpoint's guest RAM comes back on a restore: `lazy` runs the guest first and loads each page on first touch, `eager` reads all of it first. See [How memory comes back](#how-memory-comes-back). |
 
 Persistent state is not part of the runtime config. Declare
 `stateful.storage` (or `volumes[]`) on the task with `mode = "block"`. See
@@ -1071,13 +1072,97 @@ restored VMM joins the allocation's cgroup like a booted one. The restored
 guest keeps its memory, open files, and processes.
 
 Each part of a memory checkpoint is recorded with a `sha256` digest and size.
-Restore checks every part's size before launching the VMM.
+The node content store checks the digest when a part comes in (a capture,
+or a fetch of a published part), and keeps the part read-only. Restore
+checks that every part is present at its recorded size before launching the
+VMM, and does not rehash it, so a restore never reads the whole checkpoint
+before the guest starts. A part that is missing or truncated fails the
+restore by name.
 
 A suspend (`legion instance suspend`) captures the same way, without copying
 the instance volume: the volume stays in place on the node, which is what the
 resume restores onto. The guest stays paused from the capture until the
 worker has stored its memory in the node content store, and only then is the
 VMM killed. If storing fails, the guest is resumed and keeps running.
+
+### How memory comes back
+
+A restore can bring the guest's RAM back before the guest runs, or let the
+guest run first and load each page the first time it is touched. The first
+makes a restore take longer the more memory the guest has. The second makes
+a restore take about the same time at any size, and moves the cost to the
+guest's first touches of its memory after it resumes. `config.memory_restore`
+picks per task, and applies to every restore of it: a resume, a snapshot
+restore, a fork, and a create from a snapshot.
+
+```nickel
+config = {
+  image = "ghcr.io/acme/search:1.4",
+  command = ["/srv/search"],
+  # This workload touches most of its memory right after it wakes.
+  memory_restore = "eager",
+},
+```
+
+| | `lazy` (default) | `eager` |
+| --- | --- | --- |
+| Firecracker | The guest runs once its device state is loaded. Firecracker maps the memory file copy-on-write, and the kernel loads each page from it on first touch. | The node reads the memory file through the page cache first, then restores the same way, so the guest's first touches are cache hits rather than disk reads. |
+| cloud-hypervisor v52 and later | `memory_restore_mode=ondemand`: the guest runs once its device state is loaded, and cloud-hypervisor loads each page on first touch. From v53 it also fills in the rest in the background, so memory is fully loaded seconds after the resume. | cloud-hypervisor copies the whole memory file into the guest before it runs. |
+| cloud-hypervisor before v52 | Restores like `eager`, and logs why. | Copies the whole memory file first. |
+
+`lazy` is the default because a sandbox woken by a request usually touches
+a small part of its memory before it answers. Choose `eager` for a workload
+that touches most of its memory right after it wakes (a large heap, an
+in-memory index): on demand, each of those first touches waits for a page,
+and one by one they add up to more than reading everything at once. On
+cloud-hypervisor v53 the background fill shortens that window.
+
+**When `lazy` is not possible.** cloud-hypervisor's on-demand restore needs
+v52 or later and a userfaultfd: the VMM opens `/dev/userfaultfd` (Linux 6.1
+and later, governed by the device's permissions) or calls `userfaultfd(2)`
+(needs `CAP_SYS_PTRACE`, which a worker running as root has, or
+`vm.unprivileged_userfaultfd = 1`). The node checks both before each
+restore. When either is missing it restores eagerly instead of failing, and
+logs the reason:
+
+```text
+INFO Restoring sandbox memory eagerly: lazy restore is not available here allocation_id=412 snapshot_id=snap-5b10e2c7a9d04f31 reason="cloud-hypervisor 51.2.0 restores memory only by copying it (on-demand restore needs v52.0 or later)"
+```
+
+Every restore's log line names the mode it used and how long it took
+(`memory_restore=lazy restore_ms=…`), and `instance get` shows the restore
+time.
+
+**What a lazily restored guest depends on.** Until its memory is loaded, the
+guest reads it from the checkpoint's memory file on the node. Firecracker
+holds the file for the VM's whole life, through a hard link in the
+allocation's directory (in both modes). cloud-hypervisor holds it open
+until its background fill finishes (v53) or until the VM exits (v52). Those
+bytes stay on disk while held, even after the node content store evicts the
+part, so the store's `snapshots` budget undercounts them for that time. If
+the node cannot read the file after the resume (a disk error), the VMM
+cannot load the page and exits, and the allocation fails like any crashed
+task. On cloud-hypervisor with Linux 6.6 or later, the guest instead sees a
+memory error on the pages that could not be loaded, which usually crashes
+it.
+
+**Memory use.** A cloud-hypervisor guest restored by copying has all of its
+memory resident at once. One restored on demand starts with almost none and
+grows as it touches pages (v52), or fills up over the next seconds (v53).
+Firecracker keeps the pages the guest only reads in the page cache, shared
+between forks of one checkpoint on the node.
+
+**Checkpoints right after a lazy restore.** cloud-hypervisor v53 refuses to
+snapshot a guest whose memory is still loading. A suspend, snapshot, or fork
+in the seconds after a lazy restore waits for the background fill to finish
+(up to a minute) with the guest paused, then captures as usual. Past a
+minute it fails with `cloud-hypervisor was still loading the guest's memory
+from its last restore`, and the guest is resumed. v52 has no background
+fill and does not refuse, so a capture there never waits.
+
+The copy restore runs inside cloud-hypervisor after its API socket is up,
+so the node waits up to five minutes for its first resume, rather than the
+ten seconds it gives other VMM calls.
 
 ### Identity after a restore
 
@@ -1196,6 +1281,16 @@ memory restore, since the device rides the snapshot.
   argument and the guest boots with an unconfigured `eth0` (the console
   shows no `IP-Config` line). A restored guest is re-addressed by the resume
   handler either way.
+- **A lazy restore moves the cost of loading memory after the resume.** A
+  guest that touches most of its memory right away runs slower until it is
+  loaded, page by page. Set `memory_restore = "eager"` for such a workload
+  ([How memory comes back](#how-memory-comes-back)). Legion does not yet
+  prefetch the pages a guest used last time, and a published checkpoint's
+  parts are still fetched whole before any restore starts.
+- **A restore trusts the node content store.** Parts are checked against
+  their digest when they enter the store, not again at restore, so a part
+  changed on the node's disk at the same size restores as is. The store
+  keeps parts read-only.
 - **Memory checkpoints of a gated sandbox need Firecracker 1.16.1 or later**
   (or cloud-hypervisor). On an older Firecracker, a memory suspend, snapshot,
   or fork is refused before capture with the node's version and the fix.

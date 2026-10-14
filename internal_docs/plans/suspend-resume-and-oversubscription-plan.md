@@ -1320,6 +1320,10 @@ in parallel.
 
 **Phase 8: fast paths, each its own review.** Wake on connect (§6.10), the
 `hint` idle signal, lazy memory (old plan Part II.2, UFFD), diff snapshots.
+Lazy memory has its own plan now,
+[lazy-memory-restore-plan.md](lazy-memory-restore-plan.md), whose Phase 1
+(restores without a rehash, cloud-hypervisor on-demand restore,
+`config.memory_restore`) is built.
 
 Phases 1–2 are the general-purpose product, 3–5 are the agent core, and 6–8
 are reach.
