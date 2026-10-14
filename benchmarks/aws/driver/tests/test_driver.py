@@ -21,6 +21,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", "workloads"))
 
 from driver import (  # noqa: E402
+    follower_lag_summary,
     K8sAdapter,
     LegionAdapter,
     NomadAdapter,
@@ -527,3 +528,15 @@ class NativeSubmitterWiring(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class FollowerLagSummaryTest(unittest.TestCase):
+    def test_empty_is_none(self):
+        self.assertIsNone(follower_lag_summary([]))
+        self.assertIsNone(follower_lag_summary(None))
+
+    def test_percentiles(self):
+        summary = follower_lag_summary([5, 1, 3, 2, 4])
+        self.assertEqual(summary["samples"], 5)
+        self.assertEqual(summary["p50_ms"], 3.0)
+        self.assertEqual(summary["max_ms"], 5.0)

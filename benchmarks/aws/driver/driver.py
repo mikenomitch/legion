@@ -115,6 +115,23 @@ def percentile(sorted_values, fraction):
     return float(sorted_values[idx])
 
 
+def follower_lag_summary(lags_ms):
+    """p50/p99/max of the gap between a placement's server-side timestamp and
+    the moment the follower counted it. A follower that falls behind does
+    not lose events, it stamps them late, which reads as a slower system and
+    trips nothing else (cross_check compares only final counts). Clocks are
+    two chrony-synced hosts, so treat anything under ~50ms as zero."""
+    if not lags_ms:
+        return None
+    ordered = sorted(lags_ms)
+    return {
+        "samples": len(ordered),
+        "p50_ms": percentile(ordered, 0.50),
+        "p99_ms": percentile(ordered, 0.99),
+        "max_ms": float(ordered[-1]),
+    }
+
+
 def submission_rate_series(submits, bucket_secs=60.0):
     """Jobs submitted per bucket from the first submit, in order.
 
@@ -699,6 +716,7 @@ class NomadAdapter:
         index, _ = self._get("/v1/jobs?prefix=bench-")
         start = {"index": int(index or 0) + 1}
         seen = set()
+        self.follower_lag_ms = []
 
         def stream_once():
             url = f"{self.server_addr}/v1/event/stream?topic=Allocation&index={start['index']}"
@@ -722,6 +740,13 @@ class NomadAdapter:
                         if alloc_id and alloc_id not in seen and allocation.get("NodeID"):
                             seen.add(alloc_id)
                             recorder.record_placement(allocation.get("JobID", "?"), 1)
+                            # CreateTime is stamped when the plan that placed
+                            # it commits; the gap to now is this thread's lag.
+                            created_ns = allocation.get("CreateTime") or 0
+                            if created_ns:
+                                self.follower_lag_ms.append(
+                                    max(0, int(time.time() * 1000) - created_ns // 1_000_000)
+                                )
 
         def pump():
             # Resume from the last index on any disconnect. The first Nomad
@@ -1285,6 +1310,20 @@ def cmd_run(args):
     # retry. Non-zero means the control plane shed or failed requests under
     # this load — a result in its own right, reported next to the numbers.
     metrics["submit_retries"] = getattr(adapter, "submit_retries", 0)
+    # Nomad only: its follower decodes every allocation event in Python, the
+    # one counting path not handed to a compiled client (Legion's is `legion
+    # events follow`, K8s's is kubectl). A p99 in seconds means the counter,
+    # not Nomad, set this cell's pace.
+    lag = follower_lag_summary(getattr(adapter, "follower_lag_ms", None))
+    if lag is not None:
+        metrics["follower_lag"] = lag
+        if lag["p99_ms"] > 1000:
+            print(
+                f"WARNING: the placement follower ran {lag['p99_ms']:.0f}ms behind the "
+                "server at p99, so this cell's throughput and latency are partly the "
+                "driver's. Read them as a floor.",
+                file=sys.stderr,
+            )
     if counters_before is not None:
         metrics["cross_check"] = cross_check_counts(
             counters_before, adapter.snapshot_counters, recorder.placed_total()
