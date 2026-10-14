@@ -169,7 +169,7 @@ disk. Both are out of CPU on one control-plane box:
 | Allocations per node | Allocations | Legion       | Nomad 2.0.5 | Kubernetes 1.36.5 |
 | -------------------- | ----------- | ------------ | ----------- | ----------------- |
 | 5                    | 25,000      | pending  | 78          | 69                |
-| 10                   | 50,000      | pending | 78    | 46                |
+| 10                   | 50,000      | pending | 83          | 46                |
 | 20                   | 100,000     | pending | pending    | 25                |
 | 40                   | 200,000     | pending | pending    | 30, then failed   |
 
