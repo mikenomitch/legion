@@ -4345,6 +4345,11 @@ impl WorkerTaskManager {
             });
             if adoptable {
                 self.ratify_claim(&claim_id, allocation)?;
+                // Delivered by the manager, so the manager lists it already:
+                // no settle window (see `RATIFIED_SETTLE`).
+                if let Some(local) = self.claims.get(&claim_id).map(|claim| claim.local_key) {
+                    self.ratified_unseen.remove(&local);
+                }
                 info!(
                     allocation_id = allocation.allocation_id,
                     session_id = %allocation.promoted_from_session,
