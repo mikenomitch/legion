@@ -437,6 +437,56 @@ pub fn pid_is_running(pid: u32) -> bool {
 /// or enough churn the same pid belongs to something else, which starts at a
 /// different time.
 pub fn process_start_time(pid: u32) -> Option<u64> {
+    #[cfg(target_os = "linux")]
+    {
+        linux_process_start_time(pid)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        sysinfo_process_start_time(pid)
+    }
+}
+
+/// [`process_start_time`] from `/proc/<pid>/stat` alone. `sysinfo` asked for
+/// one pid still lists all of `/proc` and every process's threads to find
+/// it, so on a node running a few hundred microVMs each call cost
+/// milliseconds of the worker's CPU, and it runs per session start and per
+/// stopping allocation on every state write. Same formula as `sysinfo`
+/// (boot time plus start ticks over `CLK_TCK`, whole seconds), so a start
+/// time recorded by either compares equal.
+#[cfg(target_os = "linux")]
+fn linux_process_start_time(pid: u32) -> Option<u64> {
+    use std::sync::OnceLock;
+    static BOOT_TIME: OnceLock<Option<u64>> = OnceLock::new();
+    static CLOCK_TICKS: OnceLock<u64> = OnceLock::new();
+    let boot_time = (*BOOT_TIME.get_or_init(|| {
+        std::fs::read_to_string("/proc/stat")
+            .ok()?
+            .lines()
+            .find_map(|line| line.strip_prefix("btime "))?
+            .trim()
+            .parse()
+            .ok()
+    }))?;
+    // SAFETY: sysconf reads a constant.
+    let ticks_per_second =
+        *CLOCK_TICKS.get_or_init(|| (unsafe { libc::sysconf(libc::_SC_CLK_TCK) }).max(1) as u64);
+
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    // `pid (comm) state ppid ...`: comm may hold spaces and parentheses, so
+    // the fields are counted from the last `)`.
+    let mut fields = stat[stat.rfind(')')? + 1..].split_whitespace();
+    let state = fields.next()?;
+    if state == "Z" || state == "X" {
+        return None;
+    }
+    // Field 22 overall (`starttime`), 19 after the state.
+    let started_ticks: u64 = fields.nth(18)?.parse().ok()?;
+    Some(boot_time + started_ticks / ticks_per_second)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn sysinfo_process_start_time(pid: u32) -> Option<u64> {
     let pid = Pid::from_u32(pid);
     let mut system = System::new();
     system.refresh_processes_specifics(
@@ -461,6 +511,26 @@ fn ensure_dir(path: &Path) -> R<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The /proc reading agrees with `sysinfo`, so a start time recorded
+    /// before the switch still identifies its process.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn proc_stat_start_time_matches_sysinfo_test() {
+        let pid = std::process::id();
+        let mut system = System::new();
+        system.refresh_processes(
+            sysinfo::ProcessesToUpdate::Some(&[Pid::from_u32(pid)]),
+            true,
+        );
+        let expected = system
+            .process(Pid::from_u32(pid))
+            .map(|process| process.start_time());
+        assert!(expected.is_some());
+        assert_eq!(linux_process_start_time(pid), expected);
+        // No such process.
+        assert_eq!(linux_process_start_time(u32::MAX - 7), None);
+    }
     use std::process::Command;
     use std::thread;
     use std::time::Duration;

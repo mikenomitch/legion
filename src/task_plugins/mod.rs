@@ -360,11 +360,21 @@ pub(crate) fn reap_task_process(
             allocation_id,
             task_name, runtime, pid, "Stopping task process by pid"
         );
-        let pid = sysinfo::Pid::from_u32(pid);
-        let mut system = sysinfo::System::new();
-        system.refresh_processes(sysinfo::ProcessesToUpdate::Some(&[pid]), true);
-        if let Some(process) = system.process(pid) {
-            process.kill();
+        // SIGKILL directly, not through `sysinfo`, which lists all of /proc
+        // to find one pid.
+        #[cfg(unix)]
+        // SAFETY: a plain kill(2) on a pid this allocation owned.
+        unsafe {
+            libc::kill(pid as libc::pid_t, libc::SIGKILL);
+        }
+        #[cfg(not(unix))]
+        {
+            let pid = sysinfo::Pid::from_u32(pid);
+            let mut system = sysinfo::System::new();
+            system.refresh_processes(sysinfo::ProcessesToUpdate::Some(&[pid]), true);
+            if let Some(process) = system.process(pid) {
+                process.kill();
+            }
         }
     }
 }
