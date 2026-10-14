@@ -258,6 +258,42 @@ impl ShutdownStop {
     }
 }
 
+/// A session stop taken out of the terminating set to be destroyed without
+/// the task-manager lock ([`WorkerTaskManager::take_reapable`]).
+pub struct Reap {
+    allocation_id: i64,
+    entry: TerminatingAllocation,
+    plugin: Arc<crate::task_plugins::LoadedTaskPlugin>,
+    /// Where to remove the task's cgroup leaf from, once its process is gone.
+    cgroup_root: Option<PathBuf>,
+}
+
+impl Reap {
+    /// The hard stop and the runtime's own teardown. Shells out and removes
+    /// files, so it runs with no lock held.
+    pub fn destroy(&mut self) {
+        let entry = &mut self.entry;
+        if let Err(err) =
+            self.plugin
+                .task_plugin()
+                .destroy(&entry.allocation, &entry.task, &mut entry.instance)
+        {
+            warn!(
+                allocation_id = self.allocation_id,
+                task_name = %entry.task.name,
+                error = ?err,
+                "Failed to destroy allocation instance"
+            );
+        }
+        if let (Some(root), Some(assignment)) = (
+            &self.cgroup_root,
+            entry.instance.resource_assignment.as_ref(),
+        ) {
+            crate::worker::resources::remove_task_cgroup(root, assignment);
+        }
+    }
+}
+
 /// Why [`WorkerTaskManager::reap_terminating`] finished an allocation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReapOutcome {
@@ -532,13 +568,22 @@ pub struct UnlockedLaunch {
     /// When the runtime calls returned, so the wait for the lock and the
     /// registration after it are timed as the `register` stage.
     runtime_returned: Option<std::time::Instant>,
+    /// The task's cgroup leaf, created first thing in [`Self::run`] so the
+    /// task never starts outside its limits.
+    pending_cgroup: Option<crate::worker::resources::PendingCgroup>,
 }
 
 impl UnlockedLaunch {
-    /// The slow half: mount, consume artifacts, `prepare`, `start`. Called
-    /// with no lock held.
+    /// The slow half: the cgroup leaf, mount, consume artifacts, `prepare`,
+    /// `start`. Called with no lock held.
     fn run(&mut self) -> R<()> {
-        let result = self.run_stages();
+        let result = match self.pending_cgroup.as_ref().map(|leaf| leaf.create()) {
+            Some(Err(err)) => Err(err.context(format!(
+                "failed to place task {} within this node's resource limits",
+                self.task.name
+            ))),
+            _ => self.run_stages(),
+        };
         self.runtime_returned = Some(std::time::Instant::now());
         result
     }
@@ -641,9 +686,27 @@ impl UnlockedLaunch {
     }
 }
 
+/// The end of a start that touches the disk and the log: the log sinks'
+/// manifests and the start's stage line. Done once the task-manager lock is
+/// released. Under a node's churn these were most of the lock's hold time
+/// per start, waiting on the same disk as every guest's boot.
+pub(crate) struct AfterStart {
+    sinks: Arc<Vec<Box<dyn LogSink>>>,
+    resource: LogResource,
+    timings: StartTimings,
+}
+
+impl AfterStart {
+    fn run(mut self, task: &TaskConfig) {
+        notify_sinks_started(&self.sinks, &self.resource);
+        self.timings
+            .finish(self.resource.allocation_id, &task.name, &task.runtime);
+    }
+}
+
 /// How [`WorkerTaskManager::finish_unlocked_launch`] settled a launch.
 enum LaunchFinish {
-    Started(Box<(Allocation, TaskConfig)>),
+    Started(Box<(Allocation, TaskConfig, AfterStart)>),
     /// The runtime failed; the failure is already recorded.
     Failed(String),
     /// Stopped or failed while the runtime worked; the caller must tear it
@@ -743,7 +806,7 @@ pub struct WorkerTaskManager {
     /// Publishing to the worker's `contentStore` (`None` when unconfigured
     /// or the node has no content store).
     content_publishing: Option<Arc<crate::content_publish::ContentPublishing>>,
-    log_sinks: Vec<Box<dyn LogSink>>,
+    log_sinks: Arc<Vec<Box<dyn LogSink>>>,
     /// Volume drivers plus the mounts held for each allocation. Mounting
     /// happens here, between `prepare_instance` and `start`, so a task can never
     /// start before its storage is real (see docs/volumes.md).
@@ -786,6 +849,10 @@ pub struct WorkerTaskManager {
     /// The launch thread tears them down when the runtime call returns, and
     /// the id cannot be launched again until it has.
     cancelled_launches: std::collections::HashSet<i64>,
+    /// Session stops the supervisor took out of `terminating` to destroy
+    /// without the lock ([`Self::take_reapable`]). Each still counts as
+    /// stopping until [`Self::finish_reap`] releases it.
+    reaping: std::collections::HashSet<i64>,
     next_launch_generation: u64,
     /// The checkpoint channel's worker state: snapshot work in flight and
     /// done, reports owed to the manager, and allocations starting from a
@@ -916,7 +983,7 @@ impl WorkerTaskManager {
             )),
             content_store: None,
             content_publishing: None,
-            log_sinks: default_sinks(),
+            log_sinks: Arc::new(default_sinks()),
             volumes: Arc::new(WorkerVolumeManager::new(
                 String::new(),
                 crate::volumes::VolumeRuntimeConfig {
@@ -936,6 +1003,7 @@ impl WorkerTaskManager {
             launching: HashMap::new(),
             staging: HashMap::new(),
             cancelled_launches: std::collections::HashSet::new(),
+            reaping: std::collections::HashSet::new(),
             next_launch_generation: 0,
             checkpoints: Default::default(),
             orphaned_sessions: HashMap::new(),
@@ -975,17 +1043,7 @@ impl WorkerTaskManager {
     /// Notify every log sink that an allocation has started (writes manifests,
     /// etc.). Failures are logged, never fatal to task startup.
     fn notify_log_sinks_started(&self, allocation: &Allocation, task: &TaskConfig) {
-        let resource = self.log_resource(allocation, task);
-        for sink in &self.log_sinks {
-            if let Err(err) = sink.on_start(&resource) {
-                warn!(
-                    allocation_id = allocation.id,
-                    sink = sink.name(),
-                    error = ?err,
-                    "Log sink on_start failed"
-                );
-            }
-        }
+        notify_sinks_started(&self.log_sinks, &self.log_resource(allocation, task));
     }
 
     /// Run rotation/retention (and any other sink upkeep) across all active
@@ -996,7 +1054,7 @@ impl WorkerTaskManager {
                 continue;
             };
             let resource = self.log_resource(allocation, task);
-            for sink in &self.log_sinks {
+            for sink in self.log_sinks.iter() {
                 if let Err(err) = sink.maintain(&resource) {
                     warn!(
                         allocation_id = *allocation_id,
@@ -2154,6 +2212,12 @@ impl WorkerTaskManager {
     fn cleanup_alloc_dir(&self, allocation_id: i64) {
         let dir = self.alloc_dir(allocation_id);
         if dir.exists() {
+            // A sandbox's directory holds its root disk. Removing it under
+            // this lock waited on the same disk as every booting guest, so it
+            // is renamed aside (one metadata update) and removed later.
+            if remove_dir_later(&self.alloc_root, &dir) {
+                return;
+            }
             if let Err(err) = std::fs::remove_dir_all(&dir) {
                 warn!(
                     allocation_id,
@@ -2483,6 +2547,7 @@ impl WorkerTaskManager {
                     && !self.terminating.contains_key(&local)
                     && !self.draining.contains_key(&local)
                     && !self.cancelled_launches.contains(&local)
+                    && !self.reaping.contains(&local)
                     && !self.pressure_evicted.contains(&local)
             })
             .cloned()
@@ -2934,8 +2999,23 @@ impl WorkerTaskManager {
     ///
     /// Returns what happened to each, newest ids last, for logging and tests.
     pub fn reap_terminating(&mut self) -> Vec<(i64, ReapOutcome)> {
+        self.take_reapable(false).0
+    }
+
+    /// [`Self::reap_terminating`], except that with `defer_sessions` a
+    /// session's stop is not destroyed here: it comes back as a [`Reap`] for
+    /// the caller to [`Reap::destroy`] without the lock and hand to
+    /// [`Self::finish_reap`]. A sandbox's `destroy` kills its VMM and
+    /// removes its root disk, and a node stopping hundreds of sessions a
+    /// second spent most of its lock time there, holding back every start.
+    ///
+    /// Only sessions qualify: their local keys are never reused, so nothing
+    /// can launch under the id while it is reaped. A keyed allocation can be
+    /// re-dispatched in place under its id, so it keeps the locked path.
+    pub fn take_reapable(&mut self, defer_sessions: bool) -> (Vec<(i64, ReapOutcome)>, Vec<Reap>) {
+        let mut deferred = Vec::new();
         if self.terminating.is_empty() {
-            return Vec::new();
+            return (Vec::new(), deferred);
         }
         let now = std::time::Instant::now();
         let mut ready: Vec<(i64, ReapOutcome)> = Vec::new();
@@ -2969,6 +3049,18 @@ impl WorkerTaskManager {
             // `destroy` is the hard stop either way. After a clean exit it is
             // pure teardown (image scratch, cgroup, container row); after a
             // timeout it is also the SIGKILL.
+            if defer_sessions && *allocation_id < 0 && entry.remove_dirs {
+                if let Some(plugin) = self.registry.plugin_handle(&entry.task.runtime) {
+                    self.reaping.insert(*allocation_id);
+                    deferred.push(Reap {
+                        allocation_id: *allocation_id,
+                        entry,
+                        plugin,
+                        cgroup_root: self.resources.leaf_remover(),
+                    });
+                    continue;
+                }
+            }
             let allocation = entry.allocation.clone();
             let task = entry.task.clone();
             let remove_dirs = entry.remove_dirs;
@@ -2980,7 +3072,19 @@ impl WorkerTaskManager {
                 remove_dirs,
             );
         }
-        ready
+        (ready, deferred)
+    }
+
+    /// Release a [`Reap`] once its `destroy` ran: volumes, cores, cgroup
+    /// and directories, in [`Self::finish_teardown`]'s order.
+    pub fn finish_reap(&mut self, reap: Reap) {
+        self.reaping.remove(&reap.allocation_id);
+        let assignment = reap.entry.instance.resource_assignment.clone();
+        self.finish_teardown(
+            reap.allocation_id,
+            reap.entry.remove_dirs,
+            assignment.as_ref(),
+        );
     }
 
     /// Whether a terminating instance's process is still running. Reaps the
@@ -3009,7 +3113,7 @@ impl WorkerTaskManager {
     /// holds new launches while this is true (see
     /// [`Self::reconcile_allocations`]).
     pub fn has_terminating(&self) -> bool {
-        !self.terminating.is_empty()
+        !self.terminating.is_empty() || !self.reaping.is_empty()
     }
 
     /// Allocation ids currently draining, for tests and diagnostics.
@@ -3428,6 +3532,7 @@ impl WorkerTaskManager {
             && !self.terminating.contains_key(&local)
             && !self.draining.contains_key(&local)
             && !self.cancelled_launches.contains(&local)
+            && !self.reaping.contains(&local)
             && !self.pressure_evicted.contains(&local)
             && !self
                 .claims
@@ -4035,7 +4140,10 @@ impl WorkerTaskManager {
         // A duplicate dispatch (heartbeat and push racing) of an allocation
         // whose launch is still in its runtime call. Launching it again would
         // start it twice; tearing the first one down would waste the work.
-        if self.launching.contains_key(&alloc.id) || self.cancelled_launches.contains(&alloc.id) {
+        if self.launching.contains_key(&alloc.id)
+            || self.cancelled_launches.contains(&alloc.id)
+            || self.reaping.contains(&alloc.id)
+        {
             debug!(
                 allocation_id = alloc.id,
                 "Allocation launch already in flight; ignoring the duplicate dispatch"
@@ -4407,14 +4515,15 @@ impl WorkerTaskManager {
             .registry
             .plugin_handle(&task.runtime)
             .context("Task plugin not loaded")?;
-        // Resource placement stays under the lock: the allocator and slice
-        // masks are this struct's, and it is quick (a cgroup mkdir and a few
-        // small writes). A task must never observe its limits arriving after
-        // it started, so it happens before `prepare`.
+        // The allocator's bookkeeping stays under the lock: the core
+        // reservations and slice masks are this struct's. The task's cgroup
+        // leaf is created by the launch, first thing and without the lock
+        // (`UnlockedLaunch::run`), so a task still never observes its limits
+        // arriving after it started.
         let runtime = plugin.task_plugin();
-        instance.resource_assignment = self
+        let (assignment, pending_cgroup) = self
             .resources
-            .assign(
+            .assign_deferred(
                 allocation.id,
                 task,
                 runtime.resource_enforcement(),
@@ -4426,6 +4535,7 @@ impl WorkerTaskManager {
                     task.name
                 )
             })?;
+        instance.resource_assignment = assignment;
         let log_dir = crate::worker::logs::claim_allocation_log_dir(
             self.state_store.allocation_log_dir(allocation.id),
             &crate::worker::logs::LogDirOwner::for_allocation(allocation, &task.name),
@@ -4475,6 +4585,7 @@ impl WorkerTaskManager {
                 .unwrap_or_default(),
             pid_start_time: None,
             runtime_returned: None,
+            pending_cgroup,
         })
     }
 
@@ -4519,8 +4630,8 @@ impl WorkerTaskManager {
             return LaunchFinish::Failed(reason);
         }
         self.set_allocation_health(allocation_id, false, "starting");
-        self.notify_log_sinks_started(&allocation, &task);
         self.persist_state_unless_provisional(allocation_id);
+        let mut timings = StartTimings::default();
         if let Some(instance) = self.instances.get_mut(&allocation_id) {
             if let Some(returned) = runtime_returned {
                 instance.start_timings.record(
@@ -4529,10 +4640,13 @@ impl WorkerTaskManager {
                     returned.elapsed(),
                 );
             }
-            instance
-                .start_timings
-                .finish(allocation_id, &task.name, &task.runtime);
+            timings = std::mem::take(&mut instance.start_timings);
         }
+        let after = AfterStart {
+            sinks: self.log_sinks.clone(),
+            resource: self.log_resource(&allocation, &task),
+            timings,
+        };
         // See `start_registered_allocation`: a batch task on a runtime that
         // tracks no process reports its completion at start.
         if !plugin.task_plugin().supervises_process()
@@ -4540,7 +4654,7 @@ impl WorkerTaskManager {
         {
             self.record_unsupervised_completion(allocation_id, &task.runtime);
         }
-        LaunchFinish::Started(Box::new((allocation, task)))
+        LaunchFinish::Started(Box::new((allocation, task, after)))
     }
 
     /// Finish tearing down a cancelled launch, after its runtime instance
@@ -5608,6 +5722,79 @@ pub fn fence_persisted_allocations(
     Ok(fenced)
 }
 
+/// Where removed allocation directories wait for [`remove_dir_later`]'s
+/// janitor, inside the allocation root so the rename stays on one
+/// filesystem.
+const REMOVING_DIR: &str = ".removing";
+
+/// Rename `dir` into `alloc_root`'s removal area and queue it for a
+/// background thread to delete. False when the rename failed, and the
+/// caller removes it in place.
+fn remove_dir_later(alloc_root: &std::path::Path, dir: &std::path::Path) -> bool {
+    static JANITOR: std::sync::OnceLock<std::sync::mpsc::Sender<PathBuf>> =
+        std::sync::OnceLock::new();
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let removing = alloc_root.join(REMOVING_DIR);
+    let janitor = JANITOR.get_or_init(|| {
+        let (tx, rx) = std::sync::mpsc::channel::<PathBuf>();
+        // Whatever a previous worker left mid-removal goes first.
+        if let Ok(entries) = std::fs::read_dir(&removing) {
+            for entry in entries.flatten() {
+                let _ = tx.send(entry.path());
+            }
+        }
+        let spawned = std::thread::Builder::new()
+            .name("alloc-dir-janitor".into())
+            .spawn(move || {
+                for path in rx {
+                    if let Err(err) = std::fs::remove_dir_all(&path) {
+                        warn!(dir = %path.display(), error = ?err, "Failed to remove allocation directory");
+                    }
+                }
+            });
+        if let Err(err) = spawned {
+            warn!(error = ?err, "Failed to start the allocation directory janitor");
+        }
+        tx
+    });
+    if std::fs::create_dir_all(&removing).is_err() {
+        return false;
+    }
+    // The pid keeps a restarted worker's names clear of its predecessor's.
+    let name = format!(
+        "{}-{}-{}",
+        dir.file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("dir"),
+        std::process::id(),
+        SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    );
+    let target = removing.join(name);
+    if std::fs::rename(dir, &target).is_err() {
+        return false;
+    }
+    if janitor.send(target.clone()).is_err() {
+        // The janitor never started: remove it here after all.
+        let _ = std::fs::remove_dir_all(&target);
+    }
+    true
+}
+
+/// Tell every log sink an allocation started. Failures are logged, never
+/// fatal to the start.
+fn notify_sinks_started(sinks: &[Box<dyn LogSink>], resource: &LogResource) {
+    for sink in sinks {
+        if let Err(err) = sink.on_start(resource) {
+            warn!(
+                allocation_id = resource.allocation_id,
+                sink = sink.name(),
+                error = ?err,
+                "Log sink on_start failed"
+            );
+        }
+    }
+}
+
 /// Split a finished child's status into `(exit_code, signal)`. Unix reports a
 /// signal death as `code: None`, which is exactly the distinction the restart
 /// policy and the operator both want to see.
@@ -5680,7 +5867,11 @@ pub fn complete_unlocked_launch(
         .expect("task manager")
         .finish_unlocked_launch(launch, result, failure_prefix);
     match finish {
-        LaunchFinish::Started(started) => Ok(Some(*started)),
+        LaunchFinish::Started(started) => {
+            let (allocation, task, after) = *started;
+            after.run(&task);
+            Ok(Some((allocation, task)))
+        }
         LaunchFinish::Failed(reason) => Err(anyhow!(reason)),
         LaunchFinish::Cancelled(mut launch) => {
             let allocation_id = launch.allocation.id;
@@ -8925,6 +9116,48 @@ mod tests {
         let state_store = WorkerStateStore::new(PathBuf::from(".test-relative/worker_state.json"));
         let manager = WorkerTaskManager::with_state_store(state_store);
         assert!(manager.alloc_root.is_absolute());
+    }
+
+    /// A session's stop is handed back for a destroy without the lock, and
+    /// it counts as stopping (holding launches back, refusing a relaunch of
+    /// its id) until `finish_reap` releases it. A keyed allocation is still
+    /// reaped in place.
+    #[test]
+    fn a_session_stop_is_destroyed_without_the_lock_test() -> R<()> {
+        let temp_dir = TempDir::new()?;
+        let mut manager = manager_in(&temp_dir);
+        let task = TaskConfig {
+            config: json!({"command": ["true"]}),
+            ..TaskConfig::new("exec-task", "exec")
+        };
+        let mut session = alloc();
+        session.id = -7;
+        manager.run_allocation(&session, &task)?;
+        manager.run_allocation(&alloc(), &task)?;
+        let session_dir = temp_dir.path().join("allocs").join("-7");
+        assert!(session_dir.is_dir());
+
+        let _ = manager.reconcile_allocations(&[]);
+        let (reaped, mut deferred) = loop {
+            let (reaped, deferred) = manager.take_reapable(true);
+            if reaped.len() == 2 {
+                break (reaped, deferred);
+            }
+            assert!(deferred.is_empty(), "a session is deferred with the rest of its pass");
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        };
+        assert_eq!(reaped, vec![(-7, ReapOutcome::Exited), (5, ReapOutcome::Exited)]);
+        assert_eq!(deferred.len(), 1, "only the session is deferred");
+        assert!(manager.terminating_ids().is_empty());
+        assert!(manager.has_terminating(), "a reaping session still counts as stopping");
+        assert!(session_dir.exists(), "its teardown waits for the destroy");
+
+        let mut reap = deferred.pop().expect("the session");
+        reap.destroy();
+        manager.finish_reap(reap);
+        assert!(!manager.has_terminating());
+        assert!(!session_dir.exists(), "its directory goes once it is released");
+        Ok(())
     }
 
     #[test]
