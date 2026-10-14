@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # One measured run: clear the job's sessions, start COUNT sessions with the
 # loadgen, wait for the guests, and merge the loadgen's summary with every
-# worker's boot timeline (boot-times.py) into .state/results/NAME.json.
+# worker's boot timeline (boot-times.py) into .state/results/NAME.json. A
+# guest counts as up when its agent first accepts exec (vsockwatch.py).
 #
 #   benchmarks/aws/sandbox-boot/run.sh NAME JOB TASK [loadgen args...]
 #   benchmarks/aws/sandbox-boot/run.sh base-burst40 bench-vm vm --count 40 --concurrency 8 --wait running
@@ -19,20 +20,29 @@ mkdir -p "$out_dir"
 
 "$SB_DIR/clear.sh" "$job" >/dev/null
 since="$(sb_ssh "${SB_WORKERS[0]}" "date -u '+%Y-%m-%d %H:%M:%S'")"
+for worker in "${SB_WORKERS[@]}"; do
+    sb_scp_to "$worker" "$SB_DIR/boot-times.py" /tmp/boot-times.py
+    sb_scp_to "$worker" "$SB_DIR/vsockwatch.py" /tmp/vsockwatch.py
+    # A pidfile, not pkill -f: the remote shell's own command line names the
+    # script, so a pattern would match (and kill) it.
+    sb_ssh "$worker" "sudo kill \$(cat /tmp/vsockwatch.pid 2>/dev/null) 2>/dev/null; sudo rm -f /tmp/vsockwatch.json;
+        sudo sh -c 'nohup python3 /tmp/vsockwatch.py --out /tmp/vsockwatch.json >/dev/null 2>&1 & echo \$! > /tmp/vsockwatch.pid'"
+done
+sleep 1
 summary="$("$SB_DIR/lg.sh" --mode sessions --job "$job" --task "$task" "$@")"
 started="$(jq '.started' <<<"$summary")"
-for worker in "${SB_WORKERS[@]}"; do sb_scp_to "$worker" "$SB_DIR/boot-times.py" /tmp/boot-times.py; done
 deadline=$(($(date +%s) + ${SB_SETTLE:-90}))
 while :; do
     rows="[]"
     for worker in "${SB_WORKERS[@]}"; do
-        node_rows="$(sb_ssh "$worker" "sudo python3 /tmp/boot-times.py --since '$since' --json" | jq --arg n "$worker" '[.rows[] | . + {node: $n}]')"
+        node_rows="$(sb_ssh "$worker" "sudo python3 /tmp/boot-times.py --since '$since' --up /tmp/vsockwatch.json --json" | jq --arg n "$worker" '[.rows[] | . + {node: $n}]')"
         rows="$(jq -s 'add' <(echo "$rows") <(echo "$node_rows"))"
     done
     [ "$(jq length <<<"$rows")" -ge "$started" ] && break
     [ "$(date +%s)" -ge "$deadline" ] && { echo "timelines cover $(jq length <<<"$rows") of $started sessions" >&2; break; }
     sleep 3
 done
+for worker in "${SB_WORKERS[@]}"; do sb_ssh "$worker" "sudo kill \$(cat /tmp/vsockwatch.pid)" || true; done
 
 jq -n --arg name "$name" --argjson loadgen "$summary" --argjson rows "$rows" '
   def pct(p): sort | if length == 0 then null else .[((length - 1) * p | round)] end;
