@@ -1444,7 +1444,9 @@ fn now_secs() -> i64 {
         .unwrap_or(0)
 }
 
-fn free_bytes(path: &Path) -> Option<u64> {
+/// Bytes available to unprivileged users on the filesystem holding `path`,
+/// as `minFreeDisk` measures them. `None` when the platform cannot say.
+pub fn free_bytes(path: &Path) -> Option<u64> {
     statvfs(path).map(|(_, free)| free)
 }
 

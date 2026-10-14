@@ -121,21 +121,35 @@ pub fn admit_and_launch(
 
     let claim_id = admitted.claim_id.clone();
     let manager = task_manager.clone();
-    // The launch ends by starting the claim's health monitor, a tokio task,
-    // so the thread runs inside the caller's runtime (an RPC handler's).
-    let runtime = crate::worker::task_manager::current_runtime();
-    std::thread::Builder::new()
-        .name(format!("provisional-launch-{claim_id}"))
-        .spawn(move || {
-            let _runtime = crate::worker::task_manager::enter_runtime(runtime.as_ref());
+    let launch = {
+        let claim_id = claim_id.clone();
+        move || {
             let _slot = slot;
             if let Err(err) =
                 launch_provisional_allocation(&manager, &launch_payload, &claim_id, gate)
             {
                 warn!(claim_id, error = ?err, "Provisional launch failed");
             }
-        })
-        .context("failed to spawn provisional launch thread")?;
+        }
+    };
+    // The launch ends by starting the claim's health monitor, a tokio task,
+    // so it runs inside the caller's runtime (an RPC handler's), on one of
+    // its pooled blocking threads. Not a new OS thread per start: each one
+    // maps and unmaps its stack, which takes the worker's memory map lock
+    // for writing, and at hundreds of starts a second that stalled every
+    // page fault and spawn in the worker. The launch pool bounds how many
+    // run at once.
+    match crate::worker::task_manager::current_runtime() {
+        Some(runtime) => {
+            runtime.spawn_blocking(launch);
+        }
+        None => {
+            std::thread::Builder::new()
+                .name(format!("provisional-launch-{claim_id}"))
+                .spawn(launch)
+                .context("failed to spawn provisional launch thread")?;
+        }
+    }
 
     Ok(admitted)
 }
@@ -297,13 +311,26 @@ pub async fn wait_until_running(
     timeout: Duration,
 ) -> R<bool> {
     let deadline = Instant::now() + timeout;
-    let mut pause = Duration::from_millis(2);
+    let claim_id = crate::structs::session::session_claim_id(session_id);
+    // Unregisters the waker however the wait ends, a dropped request
+    // included.
+    struct Registered<'a>(&'a Arc<Mutex<WorkerTaskManager>>, &'a str);
+    impl Drop for Registered<'_> {
+        fn drop(&mut self) {
+            if let Ok(mut guard) = self.0.lock() {
+                guard.release_stage_waiter(self.1);
+            }
+        }
+    }
+    let _registered = Registered(task_manager, &claim_id);
     loop {
-        let state = task_manager
-            .lock()
-            .expect("task manager")
-            .session_status(session_id)
-            .map(|status| status.state);
+        // Checked and registered under one lock: a stage change after the
+        // check leaves a permit on the waker, so it cannot be missed.
+        let (state, waiter) = {
+            let mut guard = task_manager.lock().expect("task manager");
+            let state = guard.session_state(session_id);
+            (state, guard.stage_waiter(&claim_id))
+        };
         match state.as_deref() {
             Some("running") => return Ok(true),
             Some(_) => {}
@@ -311,13 +338,23 @@ pub async fn wait_until_running(
                 bail!("session {session_id} ended before it started running; see the node's log")
             }
         }
-        if Instant::now() >= deadline {
+        let now = Instant::now();
+        if now >= deadline {
             return Ok(false);
         }
-        tokio::time::sleep(pause).await;
-        pause = (pause * 2).min(Duration::from_millis(50));
+        // Woken by the claim's next stage change or its end. The backstop
+        // covers the paths that settle a session without either.
+        let _ = tokio::time::timeout(
+            (deadline - now).min(RUNNING_WAIT_BACKSTOP),
+            waiter.notified(),
+        )
+        .await;
     }
 }
+
+/// The longest [`wait_until_running`] sleeps without being woken before it
+/// looks again.
+const RUNNING_WAIT_BACKSTOP: Duration = Duration::from_millis(50);
 
 /// Apply a ratification verdict pushed by the manager (or fetched by the
 /// node) to a live claim.

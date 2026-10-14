@@ -177,11 +177,19 @@ The worker finds `cloud-hypervisor` on its `PATH`, or at
 `PATH`, or `LEGION_FIRECRACKER_BIN`); `auto` falls back to it when
 cloud-hypervisor is absent.
 
-Install the filesystem tools the root-disk build uses:
+Install the filesystem tools the root-disk build uses. The worker formats
+root disks with `mkfs.ext4` and writes each sandbox's own files into its disk
+with `debugfs`. Both ship in e2fsprogs:
 
 ```bash
-sudo apt-get install -y e2fsprogs       # mkfs.ext4; or set LEGION_MKFS_EXT4
+sudo apt-get install -y e2fsprogs       # mkfs.ext4 and debugfs; or set LEGION_MKFS_EXT4
+# Alpine splits debugfs out: apk add e2fsprogs e2fsprogs-extra
 ```
+
+The worker keeps each image's built root disk in a node-wide cache, so only
+the first sandbox of an image on a node pays for the build. A data dir on a
+filesystem with reflinks (XFS, btrfs) makes every later start's copy of it
+near-instant. See [the root disk cache](task-runtime-sandbox.md#the-root-disk-cache).
 
 ### 3. Install a guest kernel
 

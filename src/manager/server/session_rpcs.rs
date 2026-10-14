@@ -324,14 +324,16 @@ impl ManagerDaemonService {
     }
 
     /// Resume a `store` session from its manifest on any node with room
-    /// (docs/session-mode.md, "Moving a session"). `None` when the id is no
-    /// `store` session's.
+    /// (docs/session-mode.md, "Moving a session"), other than `skip` (a node
+    /// that already refused it for room). `None` when the id is no `store`
+    /// session's.
     async fn resume_store_instance(
         &self,
         identity: &AclIdentity,
         session_id: &str,
         cold: bool,
         force_move: bool,
+        skip: Option<&str>,
     ) -> Result<Option<StartInstanceReply>, Status> {
         let Some((job_id, task)) = self.store_session_task(identity, session_id)? else {
             return Ok(None);
@@ -343,6 +345,7 @@ impl ManagerDaemonService {
             session_id,
             cold,
             force_move,
+            skip,
         )
         .await?
         {
@@ -398,7 +401,7 @@ impl ManagerDaemonService {
             Ok(Some(found)) => found,
             Ok(None) => {
                 return self
-                    .resume_store_instance(identity, session_id, cold, force_move)
+                    .resume_store_instance(identity, session_id, cold, force_move, None)
                     .await
             }
             Err(status)
@@ -410,7 +413,7 @@ impl ManagerDaemonService {
                 // Evicted, or its node does not answer: a `store` session
                 // lives on in the content store.
                 return match self
-                    .resume_store_instance(identity, session_id, cold, force_move)
+                    .resume_store_instance(identity, session_id, cold, force_move, None)
                     .await?
                 {
                     Some(reply) => Ok(Some(reply)),
@@ -436,13 +439,23 @@ impl ManagerDaemonService {
                 .await;
         if let Err(status) = resumed.as_ref() {
             // Full, or its local copy went meanwhile: a `store` session
-            // resumes from its manifest elsewhere.
-            if matches!(
-                status.code(),
-                tonic::Code::ResourceExhausted | tonic::Code::NotFound
-            ) {
+            // resumes from its manifest elsewhere. A node full for this
+            // session is full for the router too, and is not tried again.
+            let full = status.code() == tonic::Code::ResourceExhausted;
+            if full {
+                if let Some(status) = found.status.as_ref() {
+                    sessions::note_full(
+                        &self.store,
+                        &status.job_id,
+                        &status.task_name,
+                        &found.node_id,
+                    );
+                }
+            }
+            if full || status.code() == tonic::Code::NotFound {
+                let skip = full.then_some(found.node_id.as_str());
                 if let Some(reply) = self
-                    .resume_store_instance(identity, session_id, cold, force_move)
+                    .resume_store_instance(identity, session_id, cold, force_move, skip)
                     .await?
                 {
                     return Ok(Some(reply));

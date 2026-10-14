@@ -2951,6 +2951,7 @@ mod tests {
                     }),
                     envelope: None,
                     promote: None,
+                    placement: None,
                     fence_after: None,
                 }),
                 ..TaskConfig::new("postgres", "noop")

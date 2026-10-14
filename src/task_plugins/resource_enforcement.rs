@@ -131,10 +131,24 @@ pub const CGROUP_ROOT: &str = crate::task_plugins::exec_isolation::CGROUP_ROOT;
 /// Spawn a command into its worker-assigned cgroup — the `WorkerCgroup`
 /// adoption path.
 ///
-/// The join happens in a `pre_exec` hook, so the process is inside the cgroup
-/// before it execs and there is no window in which it runs outside its
+/// The command is rewritten to run through `/bin/sh`, which writes its own
+/// pid into the cgroup's `cgroup.procs` and then `exec`s the command under
+/// that same pid. The process is inside the cgroup before the command runs a
+/// single instruction, so there is no window in which it runs outside its
 /// limits. The cgroup itself was created and sized by worker core; this only
-/// writes the pid into `cgroup.procs`.
+/// joins it.
+///
+/// A shell, and not a `pre_exec` hook, because a `pre_exec` hook makes the
+/// standard library spawn with `fork`, which copies the worker's page tables
+/// and contends on its memory map with every other thread: on a 96-vCPU
+/// node booting microVMs at full rate a VMM's spawn took over a second. With
+/// no hook the spawn is a `posix_spawn` (`CLONE_VM | CLONE_VFORK`), which
+/// copies nothing. A shell that cannot join fails before the command runs,
+/// and the start fails with it.
+///
+/// It rewrites `cmd`, keeping its program, arguments, environment, and
+/// working directory, so call it before anything that sets the command's
+/// stdio.
 ///
 /// A no-op when the instance carries no assignment (enforcement off, a
 /// non-Linux worker, or an `Unsupported` runtime), so a plugin can call it
@@ -144,22 +158,28 @@ pub fn join_assignment_cgroup(
     cmd: &mut std::process::Command,
     instance: &crate::task_plugins::TaskInstance,
 ) -> R<()> {
-    use std::os::unix::process::CommandExt;
-
     let Some(assignment) = instance.resource_assignment.as_ref() else {
         return Ok(());
     };
     let procs = assignment.absolute_cgroup_path().join("cgroup.procs");
-    // SAFETY: the closure only writes a pid to a file; it allocates a String
-    // but performs no other async-signal-unsafe work beyond what the standard
-    // library's own pre_exec examples do.
-    unsafe {
-        cmd.pre_exec(move || {
-            std::fs::write(&procs, std::process::id().to_string())
-                .map_err(std::io::Error::other)?;
-            Ok(())
-        });
+    let mut shim = std::process::Command::new("/bin/sh");
+    // `$0` is the cgroup.procs path and `"$@"` the command, so neither is
+    // ever parsed by the shell.
+    shim.arg("-c")
+        .arg(r#"echo $$ > "$0" && exec "$@""#)
+        .arg(&procs)
+        .arg(cmd.get_program())
+        .args(cmd.get_args());
+    for (key, value) in cmd.get_envs() {
+        match value {
+            Some(value) => shim.env(key, value),
+            None => shim.env_remove(key),
+        };
     }
+    if let Some(dir) = cmd.get_current_dir() {
+        shim.current_dir(dir);
+    }
+    *cmd = shim;
     Ok(())
 }
 
@@ -174,6 +194,58 @@ pub fn join_assignment_cgroup(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The cgroup join keeps the command's program, arguments, environment,
+    /// and working directory, behind a shell that joins and then `exec`s it.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_cgroup_join_wraps_the_command_in_a_joining_shell_test() {
+        let mut cmd = std::process::Command::new("/usr/local/bin/cloud-hypervisor");
+        cmd.args(["--kernel", "/k", "--cmdline", "a b"])
+            .env("RUST_LOG", "warn")
+            .env_remove("SECRET")
+            .current_dir("/tmp");
+        let instance = crate::task_plugins::TaskInstance {
+            resource_assignment: Some(ResourceAssignment {
+                slice: Slice::Share,
+                cgroup_path: PathBuf::from("legion/share/legion-7"),
+                cores: None,
+                cpu_weight: None,
+                memory_limit_bytes: None,
+                memory_low_bytes: None,
+            }),
+            ..Default::default()
+        };
+        join_assignment_cgroup(&mut cmd, &instance).unwrap();
+        assert_eq!(cmd.get_program(), "/bin/sh");
+        let args: Vec<_> = cmd
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(args[0], "-c");
+        assert_eq!(args[1], r#"echo $$ > "$0" && exec "$@""#);
+        assert!(
+            args[2].ends_with("legion/share/legion-7/cgroup.procs"),
+            "{args:?}"
+        );
+        assert_eq!(
+            &args[3..],
+            [
+                "/usr/local/bin/cloud-hypervisor",
+                "--kernel",
+                "/k",
+                "--cmdline",
+                "a b"
+            ]
+        );
+        let envs: Vec<_> = cmd.get_envs().collect();
+        assert!(envs.contains(&(
+            std::ffi::OsStr::new("RUST_LOG"),
+            Some(std::ffi::OsStr::new("warn"))
+        )));
+        assert!(envs.contains(&(std::ffi::OsStr::new("SECRET"), None)));
+        assert_eq!(cmd.get_current_dir(), Some(std::path::Path::new("/tmp")));
+    }
 
     #[test]
     fn assignments_round_trip_through_the_persisted_record() -> R<()> {

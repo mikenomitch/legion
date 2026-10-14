@@ -9699,6 +9699,59 @@ impl Store {
             .ok_or_else(|| StorageError::not_found("job config", id).into())
     }
 
+    /// A job's status and latest config, as [`Self::get_job`] and
+    /// [`Self::get_job_config`] read them, for a path that runs per request
+    /// (an instance or session create): one indexed read of the two rows,
+    /// and the task configs from the read model's shared cache, not a parse
+    /// of every task's JSON columns. Errors `not_found` for a missing job or
+    /// a job with no config, as those two do.
+    pub fn job_status_and_latest_config(&self, name: &str) -> R<(String, JobConfig)> {
+        let row = {
+            let conn = self.read_connection()?;
+            let mut stmt = conn.prepare_cached(
+                "SELECT j.status, jc.id, jc.name, jc.meta, jc.version, jc.priority
+                 FROM job j
+                 LEFT JOIN job_config jc ON jc.id = (
+                     SELECT latest.id FROM job_config latest
+                     WHERE latest.name = j.name
+                     ORDER BY latest.version DESC LIMIT 1
+                 )
+                 WHERE j.name = ?1;",
+            )?;
+            stmt.query_row([name], |row| {
+                let status: String = row.get(0)?;
+                let config_id: Option<String> = row.get(1)?;
+                let Some(config_id) = config_id else {
+                    return Ok((status, None));
+                };
+                let meta: Value = row.get(3)?;
+                let (rollout, rollout_by_group) = Self::rollout_meta_from_value(meta)?;
+                let config = JobConfig {
+                    name: row.get(2)?,
+                    tasks: Vec::new(),
+                    priority: Band::from_stored(&row.get::<_, String>(5)?),
+                    rollout,
+                    rollout_by_group,
+                    version: Some(row.get(4)?),
+                };
+                Ok((status, Some((config_id, config))))
+            })
+            .optional()?
+        };
+        let Some((status, config)) = row else {
+            return Err(StorageError::not_found("job", name).into());
+        };
+        let Some((config_id, config)) = config else {
+            return Err(StorageError::not_found("job config", name).into());
+        };
+        let tasks = self
+            .shared_task_configs_for_job_config(&config_id)?
+            .iter()
+            .map(|(_, task)| task.clone())
+            .collect();
+        Ok((status, JobConfig { tasks, ..config }))
+    }
+
     /// The owning job id for a job config id, if the config exists.
     #[instrument(err, skip_all)]
     pub fn job_id_for_job_config(&self, job_config_id: &str) -> R<Option<String>> {
@@ -27718,6 +27771,7 @@ mod tests {
                 }),
                 envelope: None,
                 promote: None,
+                placement: None,
                 fence_after: None,
             }),
             ..TaskConfig::new(name, "noop")
@@ -28152,6 +28206,7 @@ mod tests {
                 }),
                 envelope: None,
                 promote: None,
+                placement: None,
                 fence_after: None,
             }),
             ..TaskConfig::new("db", "noop")
@@ -28314,6 +28369,7 @@ mod tests {
                 }),
                 envelope: None,
                 promote: None,
+                placement: None,
                 fence_after: None,
             }),
             ..TaskConfig::new("db", "noop")
@@ -28396,6 +28452,7 @@ mod tests {
                 }),
                 envelope: None,
                 promote: None,
+                placement: None,
                 fence_after: None,
             }),
             ..TaskConfig::new("drop-db", "noop")
@@ -28472,6 +28529,7 @@ mod tests {
                 }),
                 envelope: None,
                 promote: None,
+                placement: None,
                 fence_after: None,
             }),
             ..TaskConfig::new(name, "noop")

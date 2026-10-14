@@ -24,6 +24,7 @@ mod microvm;
 mod oci_bundle;
 mod oci_image;
 pub mod resource_enforcement;
+pub mod rootfs_cache;
 mod sandbox;
 pub(crate) mod sandbox_addr;
 mod sandbox_checkpoint;
@@ -108,19 +109,15 @@ pub fn spawn_task_process(cmd: &mut Command) -> R<Child> {
     {
         use std::os::unix::process::CommandExt;
 
-        // Run task processes in their own session so they survive worker restarts
-        // and to keep worker signal handling independent from task signal handling.
-        unsafe {
-            cmd.pre_exec(|| {
-                unsafe extern "C" {
-                    fn setsid() -> i32;
-                }
-                if setsid() == -1 {
-                    return Err(std::io::Error::last_os_error());
-                }
-                Ok(())
-            });
-        }
+        // Run task processes in their own process group so they survive
+        // worker restarts and keep worker signal handling independent from
+        // task signal handling: a terminal's signals reach its foreground
+        // group, which is the worker's, and stopping a task signals its
+        // group. A process group rather than a session (`setsid`), because
+        // `posix_spawn` sets one natively while a session needs a `pre_exec`
+        // hook, which makes the spawn a `fork` of the whole worker (see
+        // `join_assignment_cgroup`).
+        cmd.process_group(0);
     }
 
     cmd.spawn().context("Failed to spawn task process")
@@ -290,8 +287,8 @@ pub(crate) fn signal_task_process(
 
     #[cfg(unix)]
     {
-        // Tasks are spawned into their own session (`setsid` in
-        // `spawn_task_process`), so signalling the process GROUP reaches a
+        // Tasks are spawned into their own process group
+        // (`spawn_task_process`), so signalling the process GROUP reaches a
         // shell-wrapped task's children too — the common case where the
         // tracked pid is `sh -c` and the real workload is its child. A
         // negative pid is the POSIX spelling for "the group".
@@ -344,8 +341,8 @@ pub(crate) fn reap_task_process(
         .or(instance.pid)
     {
         // Every runtime that reaps here spawned its task with
-        // `spawn_task_process`, which makes the task a group leader
-        // (`setsid`). ESRCH (no such group) is fine: the group is gone, or
+        // `spawn_task_process`, which makes the task a group leader.
+        // ESRCH (no such group) is fine: the group is gone, or
         // this pid never led one, and the per-pid kill below still runs.
         let _ = unsafe { libc::kill(-(pid as i32), libc::SIGKILL) };
     }
@@ -359,11 +356,21 @@ pub(crate) fn reap_task_process(
             allocation_id,
             task_name, runtime, pid, "Stopping task process by pid"
         );
-        let pid = sysinfo::Pid::from_u32(pid);
-        let mut system = sysinfo::System::new();
-        system.refresh_processes(sysinfo::ProcessesToUpdate::Some(&[pid]), true);
-        if let Some(process) = system.process(pid) {
-            process.kill();
+        // SIGKILL directly, not through `sysinfo`, which lists all of /proc
+        // to find one pid.
+        #[cfg(unix)]
+        // SAFETY: a plain kill(2) on a pid this allocation owned.
+        unsafe {
+            libc::kill(pid as libc::pid_t, libc::SIGKILL);
+        }
+        #[cfg(not(unix))]
+        {
+            let pid = sysinfo::Pid::from_u32(pid);
+            let mut system = sysinfo::System::new();
+            system.refresh_processes(sysinfo::ProcessesToUpdate::Some(&[pid]), true);
+            if let Some(process) = system.process(pid) {
+                process.kill();
+            }
         }
     }
 }
@@ -430,6 +437,10 @@ pub struct TaskInstance {
     /// nodes put them in the same place. `None` (tests, dev runtimes) puts
     /// them beside the allocation directories.
     pub device_link_root: Option<PathBuf>,
+    /// The stages this start has been through, for the start log line and
+    /// `legion_task_start_stage_seconds` (`crate::worker::start_timing`).
+    /// Runtimes record their own sub-stages of `start` here.
+    pub start_timings: crate::worker::start_timing::StartTimings,
 }
 
 impl TaskInstance {
@@ -848,6 +859,25 @@ pub trait TaskPlugin: Send + Sync {
         instance: &mut TaskInstance,
     ) -> R<()> {
         let _ = (staged, instance);
+        Ok(())
+    }
+
+    /// Wait, after [`Self::start`], until the started workload can take
+    /// work, for up to `timeout`. A session reports `running` only after
+    /// this returns (docs/session-mode.md), so a caller that waits for
+    /// `running` can use the session at once. Most runtimes are ready when
+    /// their process is, so the default returns at once; the sandbox runtime
+    /// waits for its guest's agent. An error is logged and the session runs
+    /// anyway: a guest that never becomes ready is the workload's problem to
+    /// report, not a reason to kill it.
+    fn wait_ready(
+        &self,
+        allocation: &Allocation,
+        task: &TaskConfig,
+        instance: &TaskInstance,
+        timeout: std::time::Duration,
+    ) -> R<()> {
+        let _ = (allocation, task, instance, timeout);
         Ok(())
     }
 
@@ -2397,8 +2427,12 @@ mod tests {
     }
 
     #[cfg(target_os = "linux")]
+    /// A task leads its own process group, so stopping it can signal the
+    /// group, and the worker's own group (which a terminal signals) does not
+    /// include it. It stays in the worker's session: a new session needs a
+    /// `pre_exec` hook, which would make the spawn a `fork`.
     #[test]
-    fn spawned_task_process_runs_in_own_session() -> R<()> {
+    fn spawned_task_process_leads_its_own_process_group() -> R<()> {
         let mut cmd = std::process::Command::new("sleep");
         cmd.arg("1");
         let mut child = spawn_task_process(&mut cmd)?;
@@ -2421,7 +2455,9 @@ mod tests {
             .context("invalid session in /proc stat")?;
 
         assert_eq!(pgrp, child.id());
-        assert_eq!(session, child.id());
+        // SAFETY: getsid(0) reads this process's session id.
+        let worker_session = unsafe { libc::getsid(0) } as u32;
+        assert_eq!(session, worker_session);
 
         let _ = child.kill();
         let _ = child.wait();
@@ -2560,6 +2596,7 @@ mod tests {
                 storage: None,
                 envelope: None,
                 promote: None,
+                placement: None,
                 fence_after: None,
             }),
             config: json!({"command": ["true"]}),
@@ -2682,6 +2719,7 @@ mod tests {
                     storage: None,
                     envelope: None,
                     promote: None,
+                    placement: None,
                     fence_after: None,
                 }),
                 config: json!({"command": ["true"]}),

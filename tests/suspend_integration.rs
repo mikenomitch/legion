@@ -295,6 +295,7 @@ fn job(runtime: &str, suspend: Option<SuspendConfig>) -> JobConfig {
             }),
             envelope: None,
             promote: None,
+            placement: None,
             fence_after: None,
         }),
         suspend,

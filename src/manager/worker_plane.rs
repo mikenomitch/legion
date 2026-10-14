@@ -36,10 +36,17 @@ use crate::storage::store::Store;
 use crate::structs::worker_client::WorkerClient;
 use crate::structs::Node;
 use std::collections::HashMap;
-use std::sync::{Mutex, OnceLock, RwLock};
-use std::time::Instant;
+use std::sync::{Arc, Mutex, OnceLock, RwLock, Weak};
+use std::time::{Duration, Instant};
 use tonic::transport::Channel;
 use tonic::Status;
+
+/// How long a dial reuses the cluster CA's pin and this manager's material
+/// for it before reading the CA row again. A session start dials a worker
+/// per call; reading and parsing the CA twice per call was a fifth of the
+/// manager's share of a start. A rotated CA is picked up within this long,
+/// and the rotation's bundle still trusts the previous CA meanwhile.
+const CURRENT_CA_TTL: Duration = Duration::from_secs(1);
 
 /// The worker protocol version that serves the mTLS worker plane and
 /// advertises a reachable `https://` address. Managers dial nothing older.
@@ -141,6 +148,19 @@ pub struct WorkerPlane {
     manager_id: RwLock<String>,
     materials: Mutex<HashMap<String, Arc<ManagerMaterials>>>,
     channels: Mutex<HashMap<(String, String, String), WorkerClient<Channel>>>,
+    /// Per store (several clusters share a test process), the CA pin and
+    /// material a dial uses, read at most every [`CURRENT_CA_TTL`].
+    current: Mutex<HashMap<usize, CurrentCa>>,
+}
+
+/// One store's CA pin and this manager's material for it, as last read.
+struct CurrentCa {
+    /// The store it was read from: a dropped store's address can be reused
+    /// by the next one, which must not inherit this entry.
+    store: Weak<crate::storage::session_index::SessionIndex>,
+    read_at: Instant,
+    pin: String,
+    materials: Arc<ManagerMaterials>,
 }
 
 impl WorkerPlane {
@@ -153,6 +173,7 @@ impl WorkerPlane {
             manager_id: RwLock::new("local".into()),
             materials: Mutex::new(HashMap::new()),
             channels: Mutex::new(HashMap::new()),
+            current: Mutex::new(HashMap::new()),
         })
     }
 
@@ -162,6 +183,10 @@ impl WorkerPlane {
         *self.manager_id.write().unwrap_or_else(|p| p.into_inner()) = id.to_string();
         // Re-mint under the new name on next use.
         self.materials
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clear();
+        self.current
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .clear();
@@ -181,6 +206,11 @@ impl WorkerPlane {
     /// without proposing anything: its callers retry until the leader's CA
     /// replicates, and a doomed proposal would log an ERROR per attempt.
     pub fn materials(&self, store: &Store) -> R<Arc<ManagerMaterials>> {
+        Ok(self.materials_with_pin(store)?.1)
+    }
+
+    /// [`Self::materials`], with the pin of the CA they were minted from.
+    fn materials_with_pin(&self, store: &Store) -> R<(String, Arc<ManagerMaterials>)> {
         let ca = match store.mesh_ca()? {
             Some(ca) => ca,
             None if !store.is_raft_leader(crate::storage::Lane::Control) => {
@@ -207,7 +237,7 @@ impl WorkerPlane {
             if stale {
                 self.mint_into(&materials, &ca)?;
             }
-            return Ok(materials);
+            return Ok((pin, materials));
         }
         let materials = Arc::new(ManagerMaterials {
             client_identity: SwappableIdentity::new(),
@@ -219,8 +249,44 @@ impl WorkerPlane {
         self.materials
             .lock()
             .unwrap_or_else(|p| p.into_inner())
-            .insert(pin, materials.clone());
-        Ok(materials)
+            .insert(pin.clone(), materials.clone());
+        Ok((pin, materials))
+    }
+
+    /// The CA pin and material a dial uses, read from the store at most
+    /// every [`CURRENT_CA_TTL`].
+    fn current_ca(&self, store: &Store) -> R<(String, Arc<ManagerMaterials>)> {
+        let index = store.sessions();
+        let key = Arc::as_ptr(index) as usize;
+        if let Some(current) = self
+            .current
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .get(&key)
+            .filter(|current| {
+                current.read_at.elapsed() < CURRENT_CA_TTL
+                    && current
+                        .store
+                        .upgrade()
+                        .is_some_and(|live| Arc::ptr_eq(&live, index))
+            })
+        {
+            return Ok((current.pin.clone(), current.materials.clone()));
+        }
+        let (pin, materials) = self.materials_with_pin(store)?;
+        self.current
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .insert(
+                key,
+                CurrentCa {
+                    store: Arc::downgrade(index),
+                    read_at: Instant::now(),
+                    pin: pin.clone(),
+                    materials: materials.clone(),
+                },
+            );
+        Ok((pin, materials))
     }
 
     fn mint_into(
@@ -272,18 +338,12 @@ impl WorkerPlane {
         store: &Store,
         target: &WorkerTarget,
     ) -> Result<WorkerClient<Channel>, Status> {
-        let materials = self.materials(store).map_err(|err| {
+        let (pin, materials) = self.current_ca(store).map_err(|err| {
             error!(error = ?err, "Cluster TLS material unavailable");
             Status::unavailable(format!(
                 "this manager has no cluster certificate to dial workers with: {err:#}"
             ))
         })?;
-        let pin = store
-            .mesh_ca()
-            .ok()
-            .flatten()
-            .and_then(|ca| ca.pin().ok())
-            .unwrap_or_default();
         let key = (pin, target.address.clone(), target.server_name.clone());
         if let Some(client) = self
             .channels

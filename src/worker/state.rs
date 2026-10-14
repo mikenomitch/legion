@@ -3,7 +3,6 @@ use crate::structs::{Allocation, TaskConfig};
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::{Path, PathBuf};
-use sysinfo::{Pid, System};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -142,6 +141,16 @@ impl WorkerStateStore {
             .parent()
             .map(|parent| parent.join("content"))
             .unwrap_or_else(|| PathBuf::from("content"))
+    }
+
+    /// Root of the sandbox root disk cache (`<state-dir>/rootfs-cache`). It
+    /// must share a filesystem with the allocation dirs, which sit beside
+    /// it, so a sandbox's disk can be a reflink of its cached base.
+    pub fn rootfs_cache_dir(&self) -> PathBuf {
+        self.path
+            .parent()
+            .map(|parent| parent.join("rootfs-cache"))
+            .unwrap_or_else(|| PathBuf::from("rootfs-cache"))
     }
 
     /// The node's session log (`<state-dir>/sessions.db`, session
@@ -377,8 +386,8 @@ fn write_owner_only(path: &Path, contents: &[u8], sync: bool) -> R<()> {
 /// SIGKILL what is left of a restored task's process group when the
 /// tracked process itself is gone. Returns whether anything was signalled.
 ///
-/// Every task is spawned as its own session and process-group leader
-/// (`setsid` in `spawn_task_process`), so `pid` is also the group id. When
+/// Every task is spawned as its own process-group leader
+/// (`spawn_task_process`), so `pid` is also the group id. When
 /// the leader dies while the worker is down — a `sh -c` wrapper killed by a
 /// service manager, say — its children keep the group alive: still running,
 /// still holding the task's ports and volumes, and no longer in any record
@@ -427,6 +436,57 @@ pub fn pid_is_running(pid: u32) -> bool {
 /// or enough churn the same pid belongs to something else, which starts at a
 /// different time.
 pub fn process_start_time(pid: u32) -> Option<u64> {
+    #[cfg(target_os = "linux")]
+    {
+        linux_process_start_time(pid)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        sysinfo_process_start_time(pid)
+    }
+}
+
+/// [`process_start_time`] from `/proc/<pid>/stat` alone. `sysinfo` asked for
+/// one pid still lists all of `/proc` and every process's threads to find
+/// it, so on a node running a few hundred microVMs each call cost
+/// milliseconds of the worker's CPU, and it runs per session start and per
+/// stopping allocation on every state write. Same formula as `sysinfo`
+/// (boot time plus start ticks over `CLK_TCK`, whole seconds), so a start
+/// time recorded by either compares equal.
+#[cfg(target_os = "linux")]
+fn linux_process_start_time(pid: u32) -> Option<u64> {
+    use std::sync::OnceLock;
+    static BOOT_TIME: OnceLock<Option<u64>> = OnceLock::new();
+    static CLOCK_TICKS: OnceLock<u64> = OnceLock::new();
+    let boot_time = (*BOOT_TIME.get_or_init(|| {
+        std::fs::read_to_string("/proc/stat")
+            .ok()?
+            .lines()
+            .find_map(|line| line.strip_prefix("btime "))?
+            .trim()
+            .parse()
+            .ok()
+    }))?;
+    // SAFETY: sysconf reads a constant.
+    let ticks_per_second =
+        *CLOCK_TICKS.get_or_init(|| (unsafe { libc::sysconf(libc::_SC_CLK_TCK) }).max(1) as u64);
+
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    // `pid (comm) state ppid ...`: comm may hold spaces and parentheses, so
+    // the fields are counted from the last `)`.
+    let mut fields = stat[stat.rfind(')')? + 1..].split_whitespace();
+    let state = fields.next()?;
+    if state == "Z" || state == "X" {
+        return None;
+    }
+    // Field 22 overall (`starttime`), 19 after the state.
+    let started_ticks: u64 = fields.nth(18)?.parse().ok()?;
+    Some(boot_time + started_ticks / ticks_per_second)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn sysinfo_process_start_time(pid: u32) -> Option<u64> {
+    use sysinfo::{Pid, System};
     let pid = Pid::from_u32(pid);
     let mut system = System::new();
     system.refresh_processes_specifics(
@@ -451,6 +511,27 @@ fn ensure_dir(path: &Path) -> R<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sysinfo::{Pid, System};
+
+    /// The /proc reading agrees with `sysinfo`, so a start time recorded
+    /// before the switch still identifies its process.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn proc_stat_start_time_matches_sysinfo_test() {
+        let pid = std::process::id();
+        let mut system = System::new();
+        system.refresh_processes(
+            sysinfo::ProcessesToUpdate::Some(&[Pid::from_u32(pid)]),
+            true,
+        );
+        let expected = system
+            .process(Pid::from_u32(pid))
+            .map(|process| process.start_time());
+        assert!(expected.is_some());
+        assert_eq!(linux_process_start_time(pid), expected);
+        // No such process.
+        assert_eq!(linux_process_start_time(u32::MAX - 7), None);
+    }
     use std::process::Command;
     use std::thread;
     use std::time::Duration;
@@ -623,6 +704,91 @@ mod tests {
             process.kill();
         }
 
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod persist_cost_probe {
+    // TEMPORARY measurement, removed before commit.
+    use super::*;
+    use crate::structs::{Allocation, TaskConfig};
+
+    #[test]
+    #[ignore]
+    fn persist_cost_by_allocation_count() -> R<()> {
+        let temp = tempfile::TempDir::new()?;
+        let store = WorkerStateStore::new(temp.path().join("worker_state.json"));
+        let mut env = serde_json::Map::new();
+        for i in 0..12 {
+            env.insert(
+                format!("APP_SETTING_{i}"),
+                serde_json::json!(format!("value-{i}-{}", "x".repeat(24))),
+            );
+        }
+        let task = TaskConfig {
+            config: serde_json::json!({
+                "image": "ghcr.io/acme/agent-base:2026-10",
+                "command": ["/usr/local/bin/harness", "--listen", "0.0.0.0:8080"],
+                "env": env,
+                "vcpus": 2,
+                "memoryMib": 1024,
+            }),
+            ..TaskConfig::new("box", "sandbox")
+        };
+        for n in [10usize, 100, 1000, 5000] {
+            let records: Vec<PersistedAllocation> = (0..n)
+                .map(|i| PersistedAllocation {
+                    allocation: Allocation {
+                        id: i as i64,
+                        status: "running".into(),
+                        resources: serde_json::json!({"cpu": 1000, "memory": 1024}),
+                        node_id: "node-1".into(),
+                        job_config_id: "job-1-config-abcdef".into(),
+                        task_config_id: 1,
+                        job_id: "sandboxes".into(),
+                        instance_id: Some(format!("inst-{i:012}")),
+                        network: None,
+                    },
+                    task: task.clone(),
+                    pid: Some(std::process::id()),
+                    pid_start_time: Some(1_700_000_000),
+                    self_terminate_after_secs: None,
+                    volumes: Vec::new(),
+                    external_id: None,
+                    in_envelope: false,
+                    resource_assignment: None,
+                    stopping: None,
+                })
+                .collect();
+            let bytes = serde_json::to_string_pretty(&records)?.len();
+            let rounds = if n >= 5000 { 5 } else { 20 };
+            let started = std::time::Instant::now();
+            for _ in 0..rounds {
+                store.save(&records)?;
+            }
+            let per = started.elapsed() / rounds;
+            let started = std::time::Instant::now();
+            for _ in 0..rounds {
+                let _ = serde_json::to_string_pretty(&records)?;
+            }
+            let ser = started.elapsed() / rounds;
+            let started = std::time::Instant::now();
+            for _ in 0..rounds {
+                for r in &records {
+                    let _ = process_start_time(r.pid.unwrap());
+                }
+            }
+            let proc_reads = started.elapsed() / rounds;
+            let started = std::time::Instant::now();
+            for _ in 0..rounds {
+                let _ = records.clone();
+            }
+            let clones = started.elapsed() / rounds;
+            eprintln!(
+                "n={n} bytes={bytes} save={per:?} serialize={ser:?} start_time_reads={proc_reads:?} clone={clones:?}"
+            );
+        }
         Ok(())
     }
 }

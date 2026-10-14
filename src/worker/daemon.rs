@@ -389,6 +389,7 @@ async fn run_worker_with_manager(join: WorkerJoin, name_override: Option<&str>) 
     // Access logs sit next to each allocation's own logs.
     let logs_base_dir = WorkerStateStore::new(state_path.clone()).logs_base_dir();
     let content_dir = WorkerStateStore::new(state_path.clone()).content_dir();
+    let rootfs_cache_dir = WorkerStateStore::new(state_path.clone()).rootfs_cache_dir();
     let task_manager = Arc::new(Mutex::new(WorkerTaskManager::with_state_store(
         WorkerStateStore::new(state_path),
     )));
@@ -416,6 +417,24 @@ async fn run_worker_with_manager(join: WorkerJoin, name_override: Option<&str>) 
         &advertised,
     );
     let content_store = open_content_store(&content_dir, content_config);
+    // Sandbox base root disks (docs/task-runtime-sandbox.md, "The root disk
+    // cache"). Only a Linux node boots microVMs, so only one keeps them. It
+    // honors the content store's free-disk floor.
+    if cfg!(target_os = "linux") {
+        let min_free = content_store
+            .as_ref()
+            .map(|store| store.config().min_free_disk)
+            .or_else(|| {
+                crate::structs::parse_byte_size(crate::content_store::DEF_CONTENT_MIN_FREE_DISK)
+                    .ok()
+            })
+            .unwrap_or(0);
+        tokio::task::spawn_blocking(move || {
+            crate::task_plugins::rootfs_cache::init(&rootfs_cache_dir, min_free)
+        })
+        .await
+        .ok();
+    }
     let content_publishing = build_content_publishing(
         content_store.clone(),
         content_store_target.as_ref(),
@@ -2486,6 +2505,20 @@ async fn heartbeat_tick(
             .expect("task manager")
             .alloc_root()
             .to_path_buf();
+        // Gated namespaces first: the egress proxy, the resolver, and the
+        // upstream listeners of a gated allocation bind *inside* its
+        // namespace, so binding them before it exists fails and leaves the
+        // task with no network until the next beat (and its health at
+        // `net_capture_unavailable` on that beat). Also before the reconcile
+        // below starts anything, so a task never runs without its namespace.
+        {
+            // The guard is never held across the await: take the set
+            // out, reconcile, put it back.
+            let mut gated =
+                std::mem::take(&mut *GATED_ALLOCATIONS.lock().unwrap_or_else(|p| p.into_inner()));
+            apply_net_capture(&reply.desired_allocations, &mut gated).await;
+            *GATED_ALLOCATIONS.lock().unwrap_or_else(|p| p.into_inner()) = gated;
+        }
         apply_upstreams(forwarder, &reply, &alloc_root).await;
         // Config-file templates, rendered from the same feed; written before
         // any launch below so a task starts with its files in place.
@@ -2647,17 +2680,8 @@ async fn heartbeat_tick(
             })
             .collect();
 
-        // Gated namespaces exist before anything starts (and the
-        // datapath listeners inside them are bound by apply_upstreams,
-        // which ran above on this same reply).
-        {
-            // The guard is never held across the await: take the set
-            // out, reconcile, put it back.
-            let mut gated =
-                std::mem::take(&mut *GATED_ALLOCATIONS.lock().unwrap_or_else(|p| p.into_inner()));
-            apply_net_capture(&desired, &mut gated).await;
-            *GATED_ALLOCATIONS.lock().unwrap_or_else(|p| p.into_inner()) = gated;
-        }
+        // Gated namespaces already exist (created above, ahead of the
+        // datapath listeners bound inside them).
         let new_allocations = {
             let mut manager = task_manager.lock().expect("task manager");
             manager.set_stop_causes(stop_causes);

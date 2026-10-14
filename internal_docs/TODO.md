@@ -479,8 +479,9 @@ How to use it:
         them at about two every 30s).
   - [ ] **`batch_task_outcome_tx` compares against the spec `count`**, not a
         `job scale` override.
-  - [ ] **Image pulls**: the extracted rootfs is not cached (every new
-        allocation re-extracts), ORAS layers are not cached, a hung pull
+  - [ ] **Image pulls**: the `container` runtime's extracted rootfs is not
+        cached (every new allocation re-extracts. Sandbox root disks are, in
+        the rootfs base cache below), ORAS layers are not cached, a hung pull
         blocks other starts of the same image (oci-client has no read
         timeout), and oci-client's bundled webpki roots cannot pull through
         a TLS-intercepting proxy (`rustls-tls-native-roots` would). On
@@ -556,6 +557,7 @@ How to use it:
 
 | PR | What it lands | Notes |
 | --- | --- | --- |
+| [#43](https://github.com/mikenomitch/legion/pull/43) | Sandbox boot throughput: cloud-hypervisor boots once (raw disks, `hvc0`), `running` on guest readiness, `stateful.placement`, the base root disk cache, the session router and worker start/stop paths off the lock, per-stage start timings, and the real-KVM sandbox-boot rig | [plan](plans/sandbox-boot-throughput-plan.md) · [calls](calls/sandbox-boot-throughput-plan_calls.md) · [results](../benchmarks/aws/sandbox-boot/RESULTS.md); stacks three of the fifteen `perf/*` branches |
 | [#36](https://github.com/mikenomitch/legion/pull/36) | Session durability, routing, and edge starts, Phases 1–4 (concurrent node starts, `sessions.db` re-adopt, node tag in session ids and tag routing, session tickets, `Worker.StartSession`, `ListSessionNodes`, `legion session`), the session UI pass, and the sandbox spot-check and bottleneck-measurement plans. Phase 5 in progress | [plan](plans/session-durability-and-routing-plan.md) · [calls](calls/session-durability-and-routing-plan_calls.md) |
 | [#30](https://github.com/mikenomitch/legion/pull/30) | Sandbox scaling Phases 4–6: untombstoned 130-bit minted ids, `suspend.archive`, `stateful.mode = "session"` and `legion instance promote` | [plan](plans/sandbox-scaling-plan.md) §16 · [calls](calls/sandbox-scaling-plan_calls.md); sessions ship without idle sessions, identity, or a session log (calls #18) |
 | [#7](https://github.com/mikenomitch/legion/pull/7) | Read model follows SQLite in every mode: shadow check, `local_disk` changeset projection, outside-write guard, timed scrub | Bench needs a quiet-machine rerun; [plan](plans/read-model-coherence-plan.md) |
@@ -1929,6 +1931,99 @@ How to use it:
 
 Plans: [task-runtime-plugins](../docs/task-runtime-plugins.md).
 
+- [ ] **Sandbox boot throughput, what is still open**
+      ([plan](plans/sandbox-boot-throughput-plan.md) ·
+      [calls](calls/sandbox-boot-throughput-plan_calls.md) ·
+      [results](../benchmarks/aws/sandbox-boot/RESULTS.md)):
+  - [ ] **A node boots about 50 sandboxes a second at most, whatever its
+        size** (plan phase 4, calls 13). A 96-vCPU c5.metal booted 1,000 at
+        48 a second with its CPUs about 90% idle: starts waited in
+        `register` (the task-manager lock, up to 1.8 s) and `vmm_spawn` (up
+        to 2.6 s). Kernel samples still show page-table copying
+        (`copy_present_ptes`) on launch threads after the `posix_spawn`
+        change, unexplained. Next: a metal run with a frame-pointer build and
+        lock hold-time instrumentation. Suspects are per-start cgroup
+        creation and removal under the lock, the supervisor's per-tick work
+        over every instance, and memory-map lock contention in the worker.
+  - [ ] **Firecracker and TAP sandboxes are not measured.** The rig ran
+        cloud-hypervisor guests with no NIC. A TAP guest's start adds `ip`
+        calls that take the kernel's `rtnl` lock, which Modal found to
+        dominate their tail at high start rates. The Firecracker run (the
+        same sequential, burst, and sustained cases, about an hour and $1)
+        decides whether `auto` should prefer it for sandboxes that need
+        neither cross-data-dir restores nor a boot log (calls 14,
+        [docs](../docs/task-runtime-sandbox.md#choosing-a-vmm)).
+  - [ ] **`perf/lazy-memory-restore` is unmeasured** (pushed, 7e93ebb8).
+        On-demand memory restore needs cloud-hypervisor v52+. The rig ran
+        v51.2. Its restore matrix (1, 4, 8 GiB, lazy vs eager, v51 to v53 and
+        Firecracker, suspend and fork right after a lazy resume) is the next
+        run, on a box with 32 GiB or more.
+  - [ ] **Parallel branches not stacked** (calls 1), each still an
+        uncommitted diff in its worktree unless noted: `sandbox-warm-pool`
+        and `edge-prewarm` (warming, against the pre-warm stance until the
+        cold path is measured: it now is, at 180 to 230 ms),
+        `elastic-session-envelopes` (envelopes that grow with use),
+        `edge-admission-backpressure`, `edge-ratify-throughput`,
+        `chunked-checkpoints`, `checkpoints-on-stream`, `multi-eval-plans`,
+        `scheduler-lane-entry-cost`, `flat-commit-cost`, and
+        `web-fleet-throughput`. Each needs its own measured case.
+  - [ ] **A memory-snapshot start for sessions** (E2B's 80 ms shape):
+        restore a session from a per-node template snapshot instead of
+        booting. Opt-in, filled by real starts, and falling back to a boot,
+        per the pre-warm stance.
+  - [ ] **Kernel size.** cloud-hypervisor copies the 48 MB reference kernel
+        into guest memory per boot (`payload_loader`, about 6% of a busy
+        node's CPU). Document, or ship, a minimal guest kernel config.
+
+- [ ] **Task start critical path, deferred phases** (found while measuring
+      the node's start path. [plan](plans/task-start-critical-path-plan.md)
+      phases 4 and 5, [calls 4](calls/task-start-critical-path-plan_calls.md)):
+  - [ ] Start reports wait for a heartbeat. A health transition (first
+        `healthy`, a failure) reaches the manager on the next beat, about 1 s
+        at the default 2 s cadence and up to 21 s on a large fleet's adaptive
+        cadence. Rollouts and service discovery wait on it. Carry it on a
+        worker-to-manager `StreamWork` report frame rather than waking the
+        heartbeat per start.
+  - [ ] A streamed gated placement gets its datapath a beat late. It starts
+        as soon as its delta lands (`daemon::launch_streamed_work`), but its
+        listeners, network policy, upstream endpoints, and credentials all
+        come from the next heartbeat (`heartbeat_tick` → `apply_upstreams`,
+        `apply_net_policies`). [task-runtime-sandbox.md](../docs/task-runtime-sandbox.md#gated-networking)
+        says the host end is bound before boot, which holds only on the
+        heartbeat path. Binding listeners from the mirror alone is not enough,
+        because the policy is what lets traffic through: carry the policy
+        assignment on the delta.
+- [ ] **A `net_capture_unavailable` health sticks on a task without checks.**
+      `heartbeat_tick` sets it when a gated allocation's capture is not ready,
+      and nothing sets health back when capture recovers: only the health
+      monitor writes healthy, and a task without checks is written healthy
+      once, at start. The namespace-ordering fix removed the common trigger
+      (the first beat binding before the namespace existed), but a transient
+      bind failure still leaves the task reported unhealthy.
+- [ ] **A failed `boot` check at start counts at once.** The first check runs
+      the moment the task starts (`tokio::time::interval`'s first tick), and
+      `boot_grace_time` only applies to `health` checks, so a `boot` check with
+      `unhealthy_after_count = 1` (as in `configs/jobs/maximal.ncl`) marks the
+      task unhealthy before it could have bound its port
+      (`src/worker/task_health.rs`, the failure branch of the monitor loop).
+      Give boot checks a grace, or start their cadence one `every` late now
+      that startup probes catch the early pass.
+- [ ] **The worker state file is rewritten whole on every start.**
+      `persist_state` serializes every allocation (pretty JSON with full task
+      configs), reads `/proc` for each pid, and fsyncs, under the task-manager
+      lock, on each start, stop, and restart (`finish_unlocked_launch` →
+      `persist_state_unless_provisional`). The cost grows with the node's
+      allocation count, so a burst of starts on a dense node is quadratic.
+      Sessions use `sessions.db` and skip it. Group-commit it off the lock, or
+      keep a record per allocation. `legion_task_start_stage_seconds{stage="register"}`
+      shows when it matters.
+- [ ] **TAP sandboxes shell out to `ip` on the start path.** A fresh TAP is
+      `ip tuntap add`, `ip link set master`, `ip link set up`, and the `boot`
+      gate adds a `set down` and a `set up` (`sandbox_checkpoint::HostTaps`,
+      `sandbox::set_tap_link`). Each is a fork and exec. The ioctls
+      (`TUNSETIFF`/`TUNSETPERSIST`, `SIOCBRADDIF`, `SIOCSIFFLAGS`) would do,
+      and the code already uses two of them. Worth it if the `network` stage
+      shows up on a real KVM node.
 - [x] **Task process supervision** — the worker reaps task children, applies a
       new `restart` policy (`always | onFailure | never`, `delay`,
       `successExitCodes`) sharing one budget with health-check restarts, and
@@ -1979,6 +2074,28 @@ Plans: [task-runtime-plugins](../docs/task-runtime-plugins.md).
       guest (calls entry 16). Flip it to an error in the next release, and drop
       `memory_mib` from the schema after that
       ([docs](../docs/task-runtime-sandbox.md#guest-size)).
+- [ ] **Sandbox base root disk cache.** One base root disk per image per
+      node, cloned per sandbox, with the sandbox's own files written into
+      the clone by debugfs: plan
+      [rootfs-base-cache-plan.md](plans/rootfs-base-cache-plan.md) ·
+      [calls](calls/rootfs-base-cache-plan_calls.md) ·
+      [docs](../docs/task-runtime-sandbox.md#the-root-disk-cache).
+  - [x] Phase 1 (in flight): the cache, per-sandbox files by debugfs on
+        every start (which also stops host writes through an image's
+        symlinks), `rootfs_cache::ensure_image_base` for prefetchers, and
+        queued pulls sharing a tag `HEAD`.
+  - [x] Verify on real KVM: cloned disks boot on cloud-hypervisor, at about
+        10 ms a clone on XFS and 60 to 80 ms on ext4, through thousands of
+        session starts on the sandbox-boot rig
+        ([results](../benchmarks/aws/sandbox-boot/RESULTS.md)).
+  - [ ] Verify on Firecracker, and checkpoint and restore a cloned disk.
+  - [ ] Phase 2: sandboxes with file, tree, or layer artifacts still build
+        their disk in full on every start (calls entry 5), including a kernel
+        shipped as an artifact.
+  - [ ] Phase 3: the `container` runtime still extracts every image per
+        allocation (overlayfs over a node-wide lower dir).
+  - [ ] Phase 4: show the cache in `legion node content`, and count hits and
+        misses.
 - [ ] **Linux container port mapping / private network namespaces.** Containers
       keep host networking; assigned ports reach them without mapping, but
       there is no isolation. Named non-goal of the container-runtime plan —
@@ -2104,8 +2221,15 @@ Plans: [task-runtime-plugins](../docs/task-runtime-plugins.md).
         [calls](calls/sandbox-scaling-plan_calls.md) #58).
   - [ ] **Router locality.** The router ranks by free room only; plan §6.4
         also preferred nodes whose content store holds the image
-        ([calls](calls/sandbox-scaling-plan_calls.md) #27). Matters once
-        sessions restore (idle sessions, above).
+        ([calls](calls/sandbox-scaling-plan_calls.md) #27). Investigated
+        2026-10-13 and deferred. Checkpoint locality has nothing to prefer:
+        only one node ever holds a `store` session's parts, and a resume
+        already asks it first (`locate_session`). Image locality is a small
+        win in one regime (simulated cold starts 37% to 25% with 10 images
+        and a cache holding 5), mostly fixed by sizing
+        `content.budgets.artifacts`, and a large weight makes warm nodes
+        warmer. Revisit once checkpoint chunks are shared across
+        generations and evicted parts stay as unpinned cache.
   - [ ] **`legion_sessions_envelope_free{job}`.** Plan §15 promised an
         envelope free-room gauge; only start and stop counters exist.
   - [ ] **Ended sessions are remembered per manager.** A retried stop that
@@ -3108,6 +3232,35 @@ Plans: [stateful-workloads](plans/stateful-workloads-and-instance-identity-plan.
         its derived-id fan-out (plan §8 item 4). Needs the loadgen session
         mode in the bottleneck plan's gaps
         (`benchmarks/aws/README.md`, "Bottleneck measurements").
+  - [x] The start hot path, measured and cut (PR_LINK): the router holds a
+        start's room from the pick (no herding of concurrent creates), breaks
+        ties at random (no herding across managers), refreshes its view
+        single-flight, reads the job in one query with cached task configs,
+        and dials workers from the read model's node row and a CA read at
+        most once a second. On the node, a session's process start time
+        (for its `sessions.db` row) is read off the task-manager lock, a
+        session that stages artifacts boots off the lock, an edge start's
+        `wait` is woken by its claim instead of polling, and a resume
+        refused for room on the session's own node marks it full and skips
+        it. Measured with
+        `session_start_cost_breakdown_measure`
+        ([plan §6.5](plans/session-durability-and-routing-plan.md#65-everything-else-between-here-and-tens-of-thousands-a-second),
+        calls 40 to 47).
+  - [ ] A session's start still does its filesystem work under the
+        task-manager lock: the allocation, task, and log directories
+        (`prepare_instance`, `claim_allocation_log_dir`) and the log sink's
+        start (`notify_log_sinks_started`), about half a millisecond a start
+        on a loaded macOS host, and a session stop rewrites and fsyncs the
+        worker state file (`signal_and_terminate`). Each one holds up every
+        other start, stop, and heartbeat on the node. Sampled with
+        `/usr/bin/sample` on a worker under `legion-loadgen --mode
+        sessions`.
+  - [ ] A session resuming from a checkpoint still boots under the
+        task-manager lock: the restore records its outcome on the
+        checkpoint channel from inside the locked start, so several resumes
+        on one node run one at a time and hold up its heartbeat
+        ([calls](calls/session-durability-and-routing-plan_calls.md) #45,
+        `begin_task_allocation_gated` in `src/worker/task_manager.rs`).
   - [x] Phase 5a: sessions sleep on their own node with `durability =
         "local"`: `suspend.keepFor`, idle suspend, `Worker.SuspendSessions`
         / `Worker.ResumeSession` routed by tag from `instance suspend` /
@@ -4691,6 +4844,41 @@ docs: [scheduler-and-eval-loop.md](../docs/scheduler-and-eval-loop.md), [jobs-ta
 docs: [task-runtime-plugins.md](../docs/task-runtime-plugins.md)
 
 - [x] A framework for task-runtime plugins
+- [x] **Sandbox sessions boot in about 200 ms, and a cluster boots them at
+      the sum of its nodes' rate** (2026-10-14). Measured on AWS, four
+      4-vCPU workers: one boot from 2.9 s to 0.23 s, a burst of 160 from
+      1.6 to 69 guests a second, and 40 a second sustained with none
+      refused. cloud-hypervisor disks are declared raw (every boot had
+      panicked and rebooted) and its console is `hvc0`. A sandbox session
+      is `running` once its guest takes exec. `stateful.placement` (`spread`
+      | `fast`). The router asks the least full node when its view says
+      full. Shared registry clients and one tag resolution per burst. A
+      session's stop sends its guest request off the lock and writes no
+      state file. `/proc` start times. `posix_spawn` for VMMs. Pooled launch
+      threads. O(changes) session-index heartbeats. Stacked with the base
+      root disk cache, the router fixes, and per-stage start timings, and
+      the `legion-loadgen --mode sessions` rig in
+      `benchmarks/aws/sandbox-boot/` , 
+      [plan](plans/sandbox-boot-throughput-plan.md) ·
+      [calls](calls/sandbox-boot-throughput-plan_calls.md) ·
+      [docs](../docs/sandboxes-at-scale.md#measured-on-aws) ·
+      [boot](../docs/task-runtime-sandbox.md#how-fast-a-sandbox-boots) ·
+      [placement](../docs/session-mode.md#picking-a-node)
+- [x] **Startup probing for health checks** (2026-10-13). A `tcp` or `http`
+      check that has not passed since its task (re)started is also probed
+      between `every` ticks (100 ms doubling to 1 s), and only a pass counts,
+      so a task turns healthy within about a second of its port opening
+      instead of a whole `every` (10 s by default) later. Failure semantics
+      are unchanged, [plan](plans/task-start-critical-path-plan.md) ·
+      [calls](calls/task-start-critical-path-plan_calls.md) ·
+      [docs](../docs/jobs-tasks-and-scheduling.md#startup-probing)
+- [x] **Gated namespaces exist before the listeners inside them** (2026-10-13).
+      `heartbeat_tick` created a gated container's namespace after it tried
+      to bind its proxy, resolver, and upstream listeners inside it, so the
+      task started with no network and its next beat reported
+      `net_capture_unavailable`. The namespaces are now created first , 
+      [plan](plans/task-start-critical-path-plan.md) §3. Needs Linux to
+      exercise. Compile-checked only.
 - [x] **microVM sandboxes stop cleanly, so volume writes survive a stop**
       (P0 from the 2026-10-12 AWS spot check). The guest agent signals init
       with `stop.signal`, init flushes, forwards it, unmounts the volumes,
@@ -5264,6 +5452,14 @@ docs: [task-runtime-plugins.md](../docs/task-runtime-plugins.md)
 - [x] OTLP trace export for Legion's own spans ([src/otel.rs](../src/otel.rs))
 - [x] Event stream: scheduler events as history and live tail (`ListEvents`,
       `StreamEvents`, CLI, UI)
+- [x] **Task start stage timings** (2026-10-13) , 
+      `legion_task_start_stage_seconds{runtime,stage}` on the worker
+      (`staging`, `volumes`, `prepare`, `start`/`restore`, `register`,
+      `total`, `health`, and the sandbox's `network`, `image`, `root_disk`,
+      `vmm_config`, `vmm_spawn`), plus one `Task allocation started` log line
+      per start with the breakdown, [plan](plans/task-start-critical-path-plan.md) ·
+      [calls](calls/task-start-critical-path-plan_calls.md) ·
+      [docs](../docs/metrics.md). Not yet run on a KVM node.
 - [x] Simulated fleets feed the `legion_worker_*` families (2026-08-02) —
       the sim fleet starts the shared worker telemetry listener (via
       `daemon::start_worker_telemetry`, so the real and simulated paths

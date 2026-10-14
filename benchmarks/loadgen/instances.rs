@@ -538,6 +538,7 @@ async fn session(
             instance_id: instance_id.clone(),
             idempotency_key: None,
             cold: false,
+            force_move: false,
         }))
         .await
         .context("StartInstance")?;

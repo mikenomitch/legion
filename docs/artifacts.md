@@ -851,12 +851,12 @@ staged OCI layout into the local runtime:
   with `<runtime> run --bundle`. See
   [task-runtime-container.md](task-runtime-container.md#linux-image--bundle).
 
-The flag defaults to **off** until the
-[node content store](#the-node-content-store) caches images. It caches only
-single files today, so Legion-managed pulls download the image again for
-every allocation. That
-would be a step backward for runtimes that cache images themselves. With the
-flag off, container behavior is unchanged.
+The flag defaults to **off**. On Linux it does not change how often an image
+is downloaded: with it on or off, the worker pulls through the
+[node content store](#the-node-content-store), so a node downloads each
+layer once and a tag costs one `HEAD` request per start (Apple `container`
+pulls for itself when the flag is off). What the flag adds is the artifact
+pipeline's auth matchers, digest pinning, and status rows.
 
 ## Fetcher plugins
 

@@ -200,6 +200,7 @@ fn workspace_job(
             }),
             envelope: None,
             promote: None,
+            placement: None,
             fence_after: None,
         }),
         snapshots,

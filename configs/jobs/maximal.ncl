@@ -867,6 +867,12 @@
                 promote = {
                     onName = true,
                 },
+                # How a manager's session router picks the node a session
+                # starts on (docs/session-mode.md, "Picking a node").
+                # "spread" (the default): the node with the most room left.
+                # "fast": the roomier of two random nodes with room, the same
+                # cost on any fleet size, for a less even spread.
+                placement = "spread",
                 # How long a node may reach neither a manager nor its
                 # contentStore before it suspends this task's running
                 # sessions on its own disk, so a copy cut off from the

@@ -69,6 +69,13 @@ const CHECKPOINT_PUBLISH_BUCKETS: &[f64] = &[
     0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0, 120.0, 300.0, 600.0,
 ];
 
+/// Bucket bounds (seconds) for the stages of a task start on a worker
+/// (`legion_task_start_stage_seconds`): a cgroup write or a state-file write
+/// takes a millisecond, a root-disk build or an image pull a minute.
+const START_STAGE_BUCKETS: &[f64] = &[
+    0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0, 120.0,
+];
+
 /// Bucket bounds (bytes) for checkpoint sizes: 1 MiB to 64 GiB.
 const CHECKPOINT_BYTES_BUCKETS: &[f64] = &[
     1_048_576.0,
@@ -2108,6 +2115,9 @@ pub struct WorkerMetrics {
     pub net_handler_total: Arc<CounterVec>,
     /// `legion_net_handler_seconds` — wall-clock of one `authz` webhook call.
     pub net_handler_seconds: Arc<Histogram>,
+    /// `legion_task_start_stage_seconds{runtime,stage}` — wall-clock of each
+    /// stage of a task start on this node (`crate::worker::start_timing`).
+    pub task_start_stage_seconds: Arc<HistogramVec>,
     families: Vec<Arc<dyn RenderMetric>>,
 }
 
@@ -2329,6 +2339,15 @@ impl WorkerMetrics {
             },
             cell: HistogramCell::new(DURATION_BUCKETS),
         });
+        let task_start_stage_seconds = Arc::new(HistogramVec {
+            meta: FamilyMeta {
+                name: "legion_task_start_stage_seconds",
+                help: "Wall-clock of each stage of a task start on this node, by runtime and stage (staging|volumes|prepare|start|register|total|health, plus a runtime's own sub-stages of start, such as sandbox's network|image|root_disk|vmm_config|vmm_spawn).",
+                labels: &["runtime", "stage"],
+            },
+            bounds: START_STAGE_BUCKETS,
+            series: Series::new(),
+        });
 
         let families: Vec<Arc<dyn RenderMetric>> = vec![
             Arc::clone(&allocation_failures_reported_total) as Arc<dyn RenderMetric>,
@@ -2356,6 +2375,7 @@ impl WorkerMetrics {
             Arc::clone(&simulated_nodes) as Arc<dyn RenderMetric>,
             Arc::clone(&simulated_nodes_target) as Arc<dyn RenderMetric>,
             Arc::clone(&simulated_registrations_total) as Arc<dyn RenderMetric>,
+            Arc::clone(&task_start_stage_seconds) as Arc<dyn RenderMetric>,
         ];
 
         WorkerMetrics {
@@ -2384,6 +2404,7 @@ impl WorkerMetrics {
             net_bytes_total,
             net_handler_total,
             net_handler_seconds,
+            task_start_stage_seconds,
             families,
         }
     }

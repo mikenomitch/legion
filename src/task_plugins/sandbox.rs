@@ -45,8 +45,9 @@ use crate::task_plugins::{
     reap_task_process, spawn_pipe, spawn_pty, spawn_task_process, validate_schema, ExecOptions,
     ExecSession, ExecSupport, MountedVolume, TaskInstance, TaskPlugin,
 };
-use crate::task_plugins::{sandbox_addr, sandbox_checkpoint};
+use crate::task_plugins::{rootfs_cache, sandbox_addr, sandbox_checkpoint};
 use crate::volumes::VolumeMode;
+use crate::worker::start_timing::stage as start_stage;
 use schemars::JsonSchema;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
@@ -56,7 +57,7 @@ use std::process::Command;
 
 const DEFAULT_VCPUS: u32 = 1;
 const DEFAULT_MEMORY_MIB: u32 = 512;
-const DEFAULT_ROOTFS_HEADROOM_MIB: u32 = 256;
+pub(crate) const DEFAULT_ROOTFS_HEADROOM_MIB: u32 = 256;
 /// Guest RAM below this cannot boot a Linux kernel with any userspace.
 const MIN_MEMORY_MIB: u32 = 64;
 
@@ -561,9 +562,8 @@ pub fn sandbox_dir_for(alloc_dir: &Path) -> PathBuf {
 }
 
 /// How long the stop request may take to reach the guest's init. Short,
-/// because `stop_with` runs under the worker's task-manager lock, and a
-/// guest that cannot take a one-line exec in this long will not shut itself
-/// down cleanly either.
+/// because a guest that cannot take a one-line exec in this long will not
+/// shut itself down cleanly either.
 const GUEST_STOP_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
 
 /// How long a hard stop (and a memory capture) waits for the guest to flush
@@ -1234,6 +1234,7 @@ impl SandboxTaskPlugin {
             );
         }
         std::fs::create_dir_all(&scratch)?;
+        let network_started = std::time::Instant::now();
         // The guest's NIC: this instance's own TAP on its bridge (created,
         // and recorded so destroy deletes it), and an address leased from
         // the bridge's pool (docs/task-runtime-sandbox.md, "Addressing").
@@ -1261,6 +1262,14 @@ impl SandboxTaskPlugin {
         if let Some(tap) = tap.as_ref() {
             sandbox_checkpoint::record_attached_tap(&scratch, &tap.device)?;
         }
+        if lease.is_some() {
+            instance.start_timings.record(
+                &task.runtime,
+                start_stage::NETWORK,
+                network_started.elapsed(),
+            );
+        }
+        let image_started = std::time::Instant::now();
         let kernel = microvm::resolve_kernel(config.kernel.as_deref())?;
         let layout = oci_image::resolve_layout(&config.image, instance, &scratch)?;
 
@@ -1284,6 +1293,10 @@ impl SandboxTaskPlugin {
         let stamp_path = scratch.join("rootfs.stamp");
 
         let image_config = oci_bundle::read_image_config(&layout)?;
+        instance
+            .start_timings
+            .record(&task.runtime, start_stage::IMAGE, image_started.elapsed());
+        let root_disk_started = std::time::Instant::now();
         let mut guest_env = oci_bundle::merge_env_map(&image_config.env, env);
         guest_env.extend(instance.volume_env());
         if let Some(lease) = lease.as_ref() {
@@ -1348,14 +1361,8 @@ impl SandboxTaskPlugin {
                 "Reusing sandbox root disk from the previous start"
             );
         } else {
-            info!(
-                allocation_id = allocation.id,
-                task_name = %task.name,
-                image = %config.image,
-                "Building sandbox root disk"
-            );
-            let image = oci_bundle::materialize_rootfs(&layout, &rootfs_dir)?;
-            if let Some(user) = image.user.as_deref() {
+            let started = std::time::Instant::now();
+            if let Some(user) = image_config.user.as_deref() {
                 // In a microVM the isolation boundary is the VM, so the payload
                 // runs as root in the guest; say so rather than silently
                 // ignoring the image's declared user.
@@ -1365,28 +1372,90 @@ impl SandboxTaskPlugin {
                     "sandbox runs the guest payload as root; image user is not applied"
                 );
             }
-            let mapped = install_artifacts(&rootfs_dir, &staged)?;
-            if !mapped.is_empty() {
-                payload.command = rewrite_artifact_paths(&payload.command, &mapped);
-                for (host, guest) in &mapped {
-                    for value in payload.env.values_mut() {
-                        if value.contains(host.as_str()) {
-                            *value = value.replace(host.as_str(), guest);
+            // A stale stamp must not vouch for a half-built disk.
+            let _ = std::fs::remove_file(&stamp_path);
+            let base = rootfs_cache::ImageBase {
+                layout: layout.clone(),
+                guest_binary: payload
+                    .guest_binary
+                    .clone()
+                    .context("the guest binary is resolved above")?,
+                headroom_mib: u64::from(config.rootfs_headroom_mib()),
+            };
+            // The disk is the image's base (shared by every sandbox of the
+            // image on this node, so cached) plus this sandbox's own files.
+            // Artifacts are copied into the sandbox's own disk, so a sandbox
+            // with any, like every sandbox on a node with the cache off,
+            // builds its disk alone.
+            let copies_artifacts = staged.iter().any(|artifact| {
+                artifact.name.is_some() && !matches!(artifact.payload, StagedPayload::Image { .. })
+            });
+            let cache = (!copies_artifacts).then(rootfs_cache::node_cache).flatten();
+            let outcome = if let Some(cache) = cache {
+                // A clone of (or the source of) the shared base: its own
+                // files are written into it after.
+                let inputs = base.inputs(&image_config);
+                let (facts, outcome) =
+                    cache.materialize(Arc::new(base), &inputs, &root_disk, &rootfs_dir)?;
+                let files = microvm::guest_payload_files(&payload, &name, &facts);
+                microvm::inject_guest_payload(&root_disk, &files, &scratch.join("payload"))?;
+                outcome
+            } else {
+                // Built for this sandbox only: its own files go into the
+                // tree, and one mkfs makes the disk, as with no cache.
+                let built = (|| {
+                    use rootfs_cache::BaseBuilder;
+                    let facts = base.tree(&rootfs_dir)?;
+                    let mapped = install_artifacts(&rootfs_dir, &staged)?;
+                    if !mapped.is_empty() {
+                        payload.command = rewrite_artifact_paths(&payload.command, &mapped);
+                        for (host, guest) in &mapped {
+                            for value in payload.env.values_mut() {
+                                if value.contains(host.as_str()) {
+                                    *value = value.replace(host.as_str(), guest);
+                                }
+                            }
                         }
                     }
-                }
+                    let files = microvm::guest_payload_files(&payload, &name, &facts);
+                    microvm::write_guest_payload_into_tree(&rootfs_dir, &files)?;
+                    base.format(&rootfs_dir, &root_disk)
+                })();
+                // The extracted tree has served its purpose; the disk image is
+                // the artifact from here on, and keeping both doubles the
+                // footprint.
+                let _ = std::fs::remove_dir_all(&rootfs_dir);
+                built?;
+                rootfs_cache::Outcome::Built(rootfs_cache::Fill::Skipped(if copies_artifacts {
+                    "the sandbox copies artifacts into its root disk"
+                } else {
+                    "the cache is off"
+                }))
+            };
+            // The disk carries this sandbox's env, which can hold secrets.
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&root_disk, std::fs::Permissions::from_mode(0o600))
+                    .with_context(|| format!("chmod {}", root_disk.display()))?;
             }
-            microvm::install_guest_payload(&rootfs_dir, &payload, &name)?;
-
-            let used = microvm::dir_size_bytes(&rootfs_dir)?;
-            let size = microvm::rootfs_image_bytes(used, config.rootfs_headroom_mib() as u64);
-            microvm::create_ext4_image(&root_disk, size, Some(&rootfs_dir), "legion-root")?;
             std::fs::write(&stamp_path, &stamp)
                 .with_context(|| format!("write {}", stamp_path.display()))?;
-            // The extracted tree has served its purpose; the disk image is the
-            // artifact from here on, and keeping both doubles the footprint.
-            let _ = std::fs::remove_dir_all(&rootfs_dir);
+            info!(
+                allocation_id = allocation.id,
+                task_name = %task.name,
+                image = %config.image,
+                root_disk = %outcome,
+                elapsed_ms = started.elapsed().as_millis() as u64,
+                "Sandbox root disk ready"
+            );
         }
+        instance.start_timings.record(
+            &task.runtime,
+            start_stage::ROOT_DISK,
+            root_disk_started.elapsed(),
+        );
+        let vmm_config_started = std::time::Instant::now();
 
         let mut spec = VmSpec {
             name: name.clone(),
@@ -1495,6 +1564,11 @@ impl SandboxTaskPlugin {
         // is what puts guest RAM under `memory.max` and makes it measurable.
         // A no-op when the worker governs nothing.
         crate::task_plugins::join_assignment_cgroup(&mut cmd, instance)?;
+        instance.start_timings.record(
+            &task.runtime,
+            start_stage::VMM_CONFIG,
+            vmm_config_started.elapsed(),
+        );
         Ok(cmd)
     }
 
@@ -2088,15 +2162,63 @@ impl TaskPlugin for SandboxTaskPlugin {
         if let Some((uid, gid)) = log_owner {
             oci_bundle::hand_task_logs_to(instance.log_dir.as_deref(), uid, gid);
         }
+        let spawn_started = std::time::Instant::now();
         let child = spawn_task_process(&mut cmd).with_context(|| {
             format!(
                 "Failed to spawn sandbox task {} for allocation {}",
                 task.name, allocation.id
             )
         })?;
+        instance.start_timings.record(
+            &task.runtime,
+            start_stage::VMM_SPAWN,
+            spawn_started.elapsed(),
+        );
         instance.pid = Some(child.id());
         instance.child = Some(child);
         Ok(())
+    }
+
+    /// A microVM is ready once its guest agent accepts exec over vsock: the
+    /// generated init starts the agent's listener just before the task's
+    /// command, so this is the moment a caller can run code in the guest.
+    /// Dev backends (Apple `container`, a Linux OCI runtime) are ready when
+    /// started.
+    fn wait_ready(
+        &self,
+        allocation: &Allocation,
+        task: &TaskConfig,
+        instance: &TaskInstance,
+        timeout: std::time::Duration,
+    ) -> R<()> {
+        let config = SandboxTaskConfig::from_value(&task.config)?;
+        if !Backend::detect(config.hypervisor.as_deref())?.is_microvm() {
+            return Ok(());
+        }
+        let socket = vsock_socket_base(&work_root(allocation, instance));
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            if crate::task_plugins::vsock_exec::agent_listening(
+                &socket,
+                std::time::Duration::from_millis(100),
+            ) {
+                return Ok(());
+            }
+            if instance
+                .pid
+                .is_some_and(|pid| !crate::signals::pid_alive(pid))
+            {
+                bail!("the VMM exited before its guest's agent was listening");
+            }
+            if std::time::Instant::now() >= deadline {
+                bail!(
+                    "the guest's agent did not accept exec within {}s (is the static \
+                     legion-guest installed beside the worker?)",
+                    timeout.as_secs()
+                );
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
     }
 
     /// A microVM is shut down **from inside**. Signalling the VMM would kill
@@ -2124,28 +2246,56 @@ impl TaskPlugin for SandboxTaskPlugin {
             return Ok(false);
         }
         let vsock = vsock_socket_base(&work_root(allocation, instance));
-        match request_guest_stop(&vsock, &ctx.signal, GUEST_STOP_REQUEST_TIMEOUT) {
-            Ok(()) => {
-                info!(
-                    allocation_id = allocation.id,
-                    task_name = %task.name,
-                    signal = %ctx.signal,
-                    grace_secs = ctx.grace.as_secs(),
-                    cause = %ctx.cause,
-                    "Asked the sandbox guest to shut down"
-                );
-                Ok(true)
-            }
+        // The request is an exec round trip into the guest, which takes tens
+        // of milliseconds on a busy node, and this runs under the worker's
+        // task-manager lock: every other start, stop, and heartbeat on the
+        // node waited on it. It goes out on its own thread instead, and the
+        // worker waits for the VMM to exit as for any graceful stop. A
+        // request the guest cannot take stops the VMM hard from that thread,
+        // as `stop` would (whose flush such a guest could not take either).
+        let (allocation_id, task_name) = (allocation.id, task.name.clone());
+        let (signal, grace, cause) = (ctx.signal.clone(), ctx.grace, ctx.cause.to_string());
+        let pid = instance.pid;
+        let request = move || match request_guest_stop(&vsock, &signal, GUEST_STOP_REQUEST_TIMEOUT)
+        {
+            Ok(()) => info!(
+                allocation_id,
+                task_name = %task_name,
+                signal = %signal,
+                grace_secs = grace.as_secs(),
+                cause = %cause,
+                "Asked the sandbox guest to shut down"
+            ),
             Err(err) => {
                 warn!(
-                    allocation_id = allocation.id,
-                    task_name = %task.name,
+                    allocation_id,
+                    task_name = %task_name,
                     error = %format!("{err:#}"),
-                    "Could not deliver a stop request into the sandbox guest; stopping it hard"
+                    "Could not deliver a stop request into the sandbox guest; stopping \
+                     it hard"
                 );
-                Ok(false)
+                if let Some(pid) = pid.filter(|pid| crate::signals::pid_alive(*pid)) {
+                    // SAFETY: a plain kill(2) of this allocation's VMM.
+                    unsafe {
+                        libc::kill(pid as libc::pid_t, libc::SIGKILL);
+                    }
+                }
+            }
+        };
+        // A pooled blocking thread where there is a runtime, for the same
+        // reason as a session's launch (`admit_and_launch`).
+        match tokio::runtime::Handle::try_current() {
+            Ok(runtime) => {
+                runtime.spawn_blocking(request);
+            }
+            Err(_) => {
+                std::thread::Builder::new()
+                    .name(format!("sandbox-stop-{allocation_id}"))
+                    .spawn(request)
+                    .context("spawn the sandbox stop request")?;
             }
         }
+        Ok(true)
     }
 
     fn stop(
@@ -3621,9 +3771,9 @@ mod tests {
         let root_disk = scratch.join("rootfs.img");
 
         assert!(root_disk.is_file(), "root disk built");
-        assert!(args.contains(&format!("path={}", root_disk.display())));
+        assert!(args.contains(&format!("path={},image_type=raw", root_disk.display())));
         assert!(
-            args.contains(&format!("path={}", volume_img.display())),
+            args.contains(&format!("path={},image_type=raw", volume_img.display())),
             "the volume's disk image is attached as a virtio-blk device"
         );
         assert!(args

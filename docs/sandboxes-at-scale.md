@@ -157,6 +157,84 @@ nodes, not by the lane: one manager on the same host started about 970
 sessions a second across 16 nodes, with no replicated write
 ([Session mode](session-mode.md)).
 
+## Measured on AWS
+
+How fast Legion boots [session](session-mode.md) sandboxes on real KVM,
+measured with the rig in
+[`benchmarks/aws/sandbox-boot/`](../benchmarks/aws/sandbox-boot/README.md),
+whose [results file](../benchmarks/aws/sandbox-boot/RESULTS.md) has every
+run. The sandbox is Alpine on cloud-hypervisor v51.2, 1 vCPU and 128 MiB,
+with no NIC. Workers are c8i instances with nested virtualization unless
+stated, one 2-vCPU manager routes, and "ready" means the guest's agent takes
+exec: the moment a caller can run code in it.
+
+| | Result |
+| --- | --- |
+| One boot, create to ready | 179 ms p50 with the image pinned by digest and worker state on XFS. 229 ms by tag. 212 ms on bare metal |
+| Burst, four 4-vCPU workers | 160 sandboxes ready in 2.33 s (69 a second), p99 0.74 s |
+| Sustained, four 4-vCPU workers | 40 boots a second with none refused (p99 0.45 s). About 56 a second at the ceiling |
+| Sustained, one 16-vCPU worker | 40 a second with none refused. About 48 at the ceiling, with the CPU 92% busy |
+| Host-process sessions through one 2-vCPU manager | about 1,300 starts a second on four workers, bound by the workers |
+| Manager memory per running session | about 1.2 KB, so 1.2 GB per million |
+| Memory per idle guest on the node | about 70 MiB of the 128 MiB it was given |
+
+Against `origin/main` before this work, on the same four workers: one boot
+went from 2.9 s to 0.23 s, the burst of 160 from 98 s to 2.3 s (1.6 to 69
+guests a second), and a sustained 20 a second from 69% refused to none.
+
+**What bounds a node.** On small and mid-size nodes the CPU does: about 3
+boots a second per vCPU under nested virtualization, about half of it guest
+boot and a quarter the host kernel handling VM exits, which bare metal
+mostly removes. A large node is bound by the worker instead: a 96-vCPU bare
+metal node booted about 50 a second while its CPUs sat about 90% idle,
+because starts waited on the worker's own state lock and on process spawns.
+That ceiling, about 50 boots a second per node whatever its size, is the
+known limit to raise next ([Limits](#limits-to-know-about)).
+
+**What bounds a cluster.** Starts at the edge (`Worker.StartSession`) reach a
+node with no manager on the path, so a cluster's boot rate is the sum of its
+nodes'. Starts routed by managers are also bound by the router: a pick costs
+31 µs with `stateful.placement = "spread"` on 1,000 nodes and 330 µs on
+10,000, or a fraction of a microsecond with `"fast"` at any size, and one
+manager routed 36,000 starts a second in process (on a laptop, to fake
+nodes).
+
+### Projections
+
+These multiply the per-node numbers above. They are estimates, not
+measurements of clusters that large.
+
+| Fleet | Sustained boots a second | Sandboxes running at once (128 MiB each) |
+| --- | --- | --- |
+| 100 nodes of 16 vCPU, 32 GiB | about 4,800 | about 19,000 by envelope, about 35,000 by measured memory |
+| 1,000 nodes of 16 vCPU, 32 GiB | about 48,000 | about 190,000 to 350,000 |
+| 1,000 bare-metal nodes of 96 vCPU, 192 GiB | about 50,000 today (the per-node ceiling). About 290,000 if the CPU becomes the limit | about 1.2 to 2.1 million |
+
+At 48,000 boots a second, a million sandboxes start in about 21 seconds, and
+the managers holding a million running sessions keep about 1.2 GB each in
+their session index. A thousand nodes heartbeating every 2 seconds cost a
+manager about 4 ms of CPU a second.
+
+### Compared with other systems
+
+Each figure is the system's own, under its own conditions (hardware, image,
+kernel, and what "started" means differ), so read them as orders of
+magnitude, not a benchmark.
+
+| System | Start latency | Start rate |
+| --- | --- | --- |
+| Legion (this page) | 0.18 to 0.23 s from create to a microVM taking exec | about 48 a second per 16-vCPU node. A cluster's rate is the sum of its nodes |
+| Firecracker, as quoted | about 125 ms from VMM launch to guest user space | up to 150 microVMs a second per host ([summary](https://northflank.com/blog/what-is-aws-firecracker)) |
+| Modal sandboxes (v2, 2026) | under 0.5 s median, request to user code | 1 million in under a minute, on "many tens of thousands" of nodes ([article](https://youmind.com/landing/x-viral-articles/scaling-1-million-concurrent-sandboxes)) |
+| E2B | about 80 ms to load a sandbox from a memory snapshot ([docs](https://e2b.dev/docs/template/how-it-works)) | |
+| Kubernetes | upstream SLO: p99 under 5 s from pod creation to containers started, image pulls excluded ([EKS](https://docs.aws.amazon.com/eks/latest/best-practices/kubernetes_upstream_slos.html)) | |
+| Nomad (C1M, 2016) | | 1 million containers scheduled in 267 s on 5,000 hosts, 99% running at 370 s ([HashiCorp](https://hashicorp.com/c1m)) |
+
+Legion's starts go to a node with no write to the replicated store and no
+scheduler on the path, the shape Modal's v2 describes, and they boot fresh:
+the numbers above use no memory snapshot or warm pool, which is where E2B's
+80 ms comes from.
+
 ## Measuring it on your hardware
 
 `legion-loadgen --mode instances` drives sandbox lifecycles at an open-loop
@@ -184,6 +262,11 @@ runtime's own boot or restore time for the end-to-end figure.
 
 ## Limits to know about
 
+- **A node boots about 50 sandboxes a second at most, whatever its size.**
+  Small and mid-size nodes reach their CPU first. On a 96-vCPU bare-metal
+  node, starts wait on the worker's state lock and on process spawns while
+  the CPUs idle, so add nodes rather than cores to raise a cluster's boot
+  rate ([Measured on AWS](#measured-on-aws)).
 - **Every keyed sandbox is a row.** A named one leaves a tombstone after
   destroy for the life of its job; a server-minted one leaves no row
   ([Id rules](stateful-workloads.md#id-rules)). A pending instance row is

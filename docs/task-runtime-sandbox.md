@@ -66,6 +66,32 @@ rollouts, and every worker loads this runtime even if it never runs a sandbox.
 Reporting "no hypervisor here" would fail deploys on unrelated nodes. Instead, a
 task that cannot boot on its node fails at start with an actionable error.
 
+### Choosing a VMM
+
+`auto` prefers cloud-hypervisor because more of the sandbox runtime works
+the same way on it, not because it has been measured to boot faster. Both
+VMMs run the same image, root disk, guest agent, and kernel arguments, and
+every feature on this page works on both. They differ here:
+
+| | cloud-hypervisor | Firecracker |
+| --- | --- | --- |
+| Console | virtio-console (`hvc0`). The guest keeps its full boot log at no measurable cost | Serial only. Guests boot `quiet`, and every console write is a VM exit ([why that matters](#how-fast-a-sandbox-boots)) |
+| Restoring a published checkpoint | On any node. The restore repoints the disks at this node's paths | Only on a node with the same data directory (`LEGION_DATA_DIR`). [Details](#where-a-memory-checkpoint-can-be-restored) |
+| Live snapshot or fork of a gated sandbox | The running origin keeps its open connections | The running origin's open connections close too ([details](suspend-and-resume.md#gated-sandboxes)) |
+| Version floors | None beyond a working install | 1.16.1 or later for memory checkpoints of a gated sandbox, 1.12 or later for a fork's TAP device |
+| Device model | Larger: more virtio devices, and hotplug | Minimal, built for multi-tenant serverless. Legion works around its lack of hotplug by reserving devices at boot |
+| Boot rate measured on Legion | Yes, [below](#how-fast-a-sandbox-boots) and in [Sandboxes at scale](sandboxes-at-scale.md#measured-on-aws) | No |
+
+Pick Firecracker when its smaller device model is worth more to you than
+moving checkpoints between nodes with different data directories. Set
+`hypervisor = "firecracker"` on the task, or `LEGION_SANDBOX_HYPERVISOR` on
+the worker. Legion starts Firecracker directly, not under its
+[`jailer`](https://github.com/firecracker-microvm/firecracker/blob/main/docs/jailer.md).
+The VMM keeps Firecracker's built-in seccomp filters, and runs in the
+allocation's cgroup when [resource enforcement](resource-enforcement.md#sandbox-tasks)
+is on, but it gets none of the jailer's chroot, namespaces, or privilege
+drop.
+
 ### macOS (dev mode)
 
 cloud-hypervisor and Firecracker run only on Linux with KVM. On macOS the
@@ -125,23 +151,47 @@ workload is done. The sandbox runtime supplies that layer.
    artifact pipeline when `artifacts.containerImageDesugar` is on. Otherwise it
    reuses a layout pulled by an earlier start of this allocation, or pulls
    anonymously through the `oci://` fetcher it shares with `container`
-   (`src/task_plugins/oci_image.rs`).
-2. **Build the root disk.** Extract the layers (with the same code as the
-   container runtime's bundle path), copy in staged artifacts, and write the
-   generated `/legion/init` and `/legion/env`. Then format a raw ext4 image with
-   `mkfs.ext4 -d`. This builds a filesystem image straight from a directory, so
-   it needs no loop device, no mount, and no root.
-3. **Attach the volumes.** The worker mounts the task's block-mode volumes
+   (`src/task_plugins/oci_image.rs`). Either way the layers come from the
+   node's [image cache](task-runtime-container.md#image-cache), so only the
+   first start of an image on a node downloads them.
+2. **Get the image's base root disk.** The base is the image's layers plus
+   Legion's guest binary, formatted as a raw ext4 image with `mkfs.ext4 -d`,
+   which builds a filesystem straight from a directory with no loop device,
+   no mount, and no root. Every sandbox of the image on the node shares it, so
+   the node builds it once and keeps it in its
+   [root disk cache](#the-root-disk-cache). The sandbox gets its own copy: a
+   reflink where the filesystem supports one, a sparse copy elsewhere. A
+   sandbox with file, tree, or layer artifacts builds its disk in full
+   instead, with the artifacts copied in.
+3. **Write the sandbox's own files** into its copy: the generated
+   `/legion/init` and `/legion/env`, `/etc/hostname`, and the guest's
+   `/etc/resolv.conf` when it has its own resolvers. `debugfs` writes them
+   inside the disk's filesystem, so it needs no mount either. A disk built
+   for one sandbox alone (one with artifacts, or any with the cache off)
+   gets them in its tree before formatting instead. Either way each file
+   replaces what the image had at its path, so an image's symlinks never
+   redirect a write onto the host. These files hold the allocation's
+   identity and its env, which can carry secrets, so they never go into the
+   shared base.
+4. **Attach the volumes.** The worker mounts the task's block-mode volumes
    before `start` ([volumes](volumes.md)). Each one's device or disk image
    becomes an extra virtio-blk device after the root disk, in declaration
    order: `/dev/vdb`, `/dev/vdc`, ….
-4. **Boot.** cloud-hypervisor gets argv, plus an `--api-socket`. Firecracker
+5. **Boot.** cloud-hypervisor gets argv, plus an `--api-socket`. Firecracker
    gets a `--config-file` JSON config and `--no-api`, unless the allocation is
    launched for memory checkpoints (see [Checkpoints](#checkpoints)) or boots
    with a balloon (see [Guest memory under pressure](#guest-memory-under-pressure)),
    in which case it gets `--api-sock` instead. Both are single-process VMMs, so:
-   - The guest serial console is the VMM's stdout. It lands in the
-     allocation's `stdout.log` like any other task's output.
+   - The guest console is the VMM's stdout, and lands in the allocation's
+     `stdout.log` like any other task's output. On cloud-hypervisor it is a
+     virtio-console (`hvc0`), which carries output in batches through a
+     queue. On Firecracker, which has no virtio-console, it is the serial
+     port, and the guest boots `quiet` (see [How fast a sandbox
+     boots](#how-fast-a-sandbox-boots)).
+   - cloud-hypervisor is told every disk is raw (`image_type=raw`). Left to
+     probe the format, it refuses guest writes to a probed raw disk's first
+     sector, the root mount's superblock write fails, and the guest panics
+     and reboots before it can mount.
    - Killing the child kills the VM. There is no daemon to chase (unlike the
      container runtime, which must tear down by name). That is also why the
      worker stops a microVM from inside rather than by killing it (see
@@ -168,11 +218,151 @@ The generated `/legion/init` is plain POSIX shell, so it runs on whatever
 The kernel cmdline carries `panic=1` as a backstop, so even a wedged guest
 terminates instead of hanging the allocation.
 
-**Rebuilds are fingerprinted.** Legion rebuilds the root disk only when the
+**Restarts reuse the disk.** An in-place restart of the same allocation
+reuses its root disk, writes from the previous boot included, unless the
 image, command, env, working dir, volume mounts, artifacts, or guest agent
-binary change. Without this, a crash-looping sandbox would re-extract and
-re-format a multi-hundred-MiB image on every restart. The fingerprint hashes
-env values, since they can be secrets. The values are never logged or stored.
+binary changed. The fingerprint hashes env values, since they can be
+secrets. The values are never logged or stored.
+
+### How fast a sandbox boots
+
+A sandbox is `running` once its guest's agent accepts exec over vsock, not
+when its VMM process starts: init starts the agent's listener just before the
+task's command, so a caller that waits for `running` can run code in the
+guest at once. For a [session](session-mode.md) this is what
+`StartSession` with `wait` and `instance get` report. A guest whose agent
+never listens (an image the static `legion-guest` cannot run on) is reported
+running after 10 seconds anyway, with a warning in the worker log.
+
+Every start logs where its time went, one line per start, and observes
+each stage in `legion_task_start_stage_seconds{runtime,stage}`
+([metrics](metrics.md)):
+
+```text
+Task allocation started allocation_id=-4131 task_name="vm" task_runtime="sandbox" total_ms=176
+  stages: image=8ms root_disk=11ms vmm_spawn=9ms start=31ms ready=143ms register=0ms
+```
+
+Measured on AWS (a c8i.xlarge with nested virtualization, cloud-hypervisor
+v51.2 and its reference kernel, Alpine, 1 vCPU and 128 MiB), from the
+worker receiving a session start to the guest taking exec:
+
+| Stage | Time | What it is |
+| --- | --- | --- |
+| `image` | 8 ms pinned, 12 to 60 ms by tag | The image's layout from the node cache. A tag is resolved against its registry on every start (one round trip on a kept-alive connection). A digest needs none |
+| `root_disk` | 10 ms on XFS, 60 to 80 ms on ext4 | A reflink (or, on ext4, a sparse copy) of the [cached base](#the-root-disk-cache), plus the sandbox's own files |
+| `vmm_spawn` | about 10 ms | The VMM process |
+| `ready` | about 140 ms | The guest kernel, init, and the agent's listener |
+
+For the fastest starts:
+
+- **Pin images by digest** (`image@sha256:...`), which skips the registry
+  round trip, or turn on `artifacts.containerImageDesugar` with
+  `resolve = "pin"`, which resolves the tag once at submit.
+- **Put the worker's state directory on a reflink filesystem** (XFS created
+  with `-m reflink=1`, the default in current `mkfs.xfs`, or btrfs). A
+  root disk is then a reflink of its base, in about a millisecond, instead
+  of a copy of every allocated block.
+- **Keep the guest kernel small.** cloud-hypervisor copies the kernel into
+  guest memory on every boot, and a kernel with fewer drivers boots and
+  probes faster. The 48 MB reference kernel is generous.
+- **Expect metal to be faster than the numbers above.** Nested
+  virtualization makes every VM exit costlier.
+
+**The console has a cost.** Every write to an emulated serial port is a VM
+exit. A default kernel prints about 300 lines while it boots, which cost
+about 700 ms of a nested-virtualization guest's boot on the serial port.
+That is why cloud-hypervisor guests use virtio-console and Firecracker
+guests boot `quiet`. A workload that writes to its console heavily pays the
+same per-write cost on Firecracker, so send bulk output to a file instead.
+
+### The root disk cache
+
+Building a root disk means extracting every image layer and formatting the
+result. That is the largest part of a cold sandbox start, and it grows with
+the image. Measured on one Linux host (2 vCPUs, btrfs), it took 2.5 s for
+`python:3.12-slim` and 28 s for a 1.6 GB `rust:1.90-bookworm` image. Every
+sandbox of an image carries the same image bytes, so the worker builds them
+once per node and keeps the result: the image's **base root disk**.
+
+Each start then copies the base and writes the sandbox's own files into the
+copy (step 3 above):
+
+| Start | What it costs | python:3.12-slim | rust:1.90-bookworm |
+| --- | --- | --- | --- |
+| First sandbox of an image on the node | the full build, as with no cache | 2.5 s | 28 s |
+| Later sandboxes, reflink filesystem (XFS, btrfs) | a reflink and the sandbox's own files | 0.05 s | 0.08 s |
+| Later sandboxes, other filesystems (ext4) | a sparse copy and the sandbox's own files | 0.23 s | 2.8 s |
+
+These numbers come from timing the same steps with e2fsprogs on that host,
+so treat them as a guide and measure your own images.
+
+How it behaves:
+
+- **It fills on demand.** Nothing has to be pushed or pre-built. The first
+  start of an image builds its disk exactly as it would without the cache,
+  so a miss is no slower. On a reflink filesystem the cache then keeps a
+  reflink of that disk, which costs nothing. Elsewhere it formats the image
+  a second time on a background thread, after the start has its disk.
+- **A burst builds once.** Starts of an image that arrive while its base is
+  being built wait for that build and then copy it, instead of each
+  extracting and formatting the same image at the same time.
+- **A base is shared only when nothing in it differs.** A base is keyed by
+  the image's layer digests, the guest binary, and the task's
+  `rootfs_headroom_mib`. A new guest binary, or a task with different
+  headroom, gets its own base.
+- **Nothing per sandbox is in a base.** Env (which can hold secrets),
+  hostname, instance id, and the generated init are written into each
+  sandbox's own copy, after it is made. A base is read-only, and a copy
+  shares nothing with it that a write can reach.
+- **It is bounded.** The cache keeps at most its budget, counting the blocks
+  each base actually uses, and evicts the least recently used base first. A
+  base larger than the whole budget is never kept, and none is kept while the
+  disk is below the content store's `minFreeDisk`. Evicting a base never
+  touches a running sandbox, whose disk is its own copy.
+
+The budget is set per worker with `LEGION_SANDBOX_ROOTFS_CACHE`:
+
+| Value | Meaning |
+| --- | --- |
+| unset (default) | 10% of the filesystem holding the worker's state dir, clamped to 1 GiB to 20 GiB |
+| a size, such as `40GiB` | that many bytes |
+| a share, such as `15%` | that share of the filesystem |
+| `off` or `0` | no cache: every start builds its disk |
+
+The cache lives at `<worker state dir>/rootfs-cache/`, beside the allocation
+dirs, so a copy can be a reflink. Put the data dir on XFS (`reflink=1`, the
+default since xfsprogs 5.1) or btrfs to get near-instant copies. On ext4 the
+copy is a byte copy of the blocks the base uses: still much cheaper than a
+build, but it scales with the image. The worker logs where each disk came
+from:
+
+```text
+Sandbox root disk ready allocation_id=88213 image=python:3.12-slim root_disk=cached base (reflink) elapsed_ms=48
+```
+
+Limitations:
+
+- **A sandbox with file, tree, or layer artifacts builds its disk in full**
+  on every start, because the artifacts are copied into its own disk. That
+  includes a guest kernel shipped as an artifact. Install the kernel on the
+  node (`LEGION_SANDBOX_KERNEL`, or `/var/lib/legion/kernels/vmlinux`) to
+  keep such sandboxes on the cache.
+- **Only microVM backends use it.** Apple `container` on macOS and Linux
+  dev mode do not build root disks. The `container` runtime still extracts
+  each image per allocation.
+- **The cache is node-local.** A new node, or one that evicted the base,
+  builds on its first start of the image.
+
+**Every step is timed.** The worker records each step of a sandbox start in
+`legion_task_start_stage_seconds{runtime="sandbox",stage}`: `network` (the TAP
+and the address lease), `image` (the kernel and the image's layout),
+`root_disk` (the fingerprint, then a reuse or a build), `vmm_config`, and
+`vmm_spawn`, inside the worker's own `staging`, `prepare`, `start`,
+`register`, and `total`. The guest's boot falls inside `health`, which ends at
+the first passing check. Each start also logs one `Task allocation started`
+line with the same breakdown. See [metrics.md](metrics.md) for the stage
+table.
 
 ### The guest agent
 
@@ -435,7 +625,7 @@ Optional:
 | `rootfs_headroom_mib` | `256` | Writable space added to the ephemeral root disk beyond the image contents. |
 | `hypervisor` | `auto` | `auto`, `cloud-hypervisor`, `firecracker`, `dev`. |
 | `kernel` | `LEGION_SANDBOX_KERNEL`, then `/var/lib/legion/kernels/vmlinux` | Uncompressed guest kernel. `${artifact.<name>}` works here. |
-| `kernel_args` | none | Appended to Legion's kernel cmdline. |
+| `kernel_args` | none | Appended to Legion's kernel cmdline, after Legion's own arguments, so a later setting wins: `loglevel=7` gives a Firecracker guest its full boot log back. |
 | `network` | `{ mode: 'none' }` | `{ mode: 'tap', bridge: 'br0' }` gives the guest a NIC on a TAP device Legion creates per instance on that host bridge, with an address leased from the bridge's pool. See [Networking](#networking). |
 
 Persistent state is not part of the runtime config. Declare
@@ -980,6 +1170,11 @@ memory restore, since the device rides the snapshot.
   has no KVM: the agent's listener and the worker's session run against each
   other over Unix sockets. The KVM checks are listed in the sandbox-exec
   plan.
+- **Boot times and rates are measured on cloud-hypervisor only.** Every
+  number on this page and in [Sandboxes at scale](sandboxes-at-scale.md)
+  comes from cloud-hypervisor guests with no NIC. Firecracker boots the
+  same guest, but its boot rate on Legion has not been measured, so don't
+  pick it, or rule it out, for speed. See [Choosing a VMM](#choosing-a-vmm).
 - **The only signal delivered into the guest is the stop signal**
   ([Stopping a sandbox](#stopping-a-sandbox)). There is no way to signal the
   workload for anything else, so an env-delivered identity must use

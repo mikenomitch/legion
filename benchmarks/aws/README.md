@@ -260,6 +260,14 @@ measures a scheduler holding 3,000 corpses while reporting itself as a
 right count, all active and available, all named from this fleet's
 slices — and refuses to run otherwise, printing what it actually saw.
 
+## Sandbox-boot rig (real KVM)
+
+[`sandbox-boot/`](sandbox-boot/README.md) is a separate, smaller rig for
+session sandboxes on real KVM: spot c8i workers with nested virtualization
+running cloud-hypervisor microVMs, `legion-loadgen --mode sessions`, and a
+host-side timeline of every guest. Its last campaign is in
+[`sandbox-boot/RESULTS.md`](sandbox-boot/RESULTS.md).
+
 ## Sandbox-scaling campaign (cheap, standalone)
 
 `scripts/run-sandbox-campaign.sh` measures the sandbox path: keyed-instance
@@ -378,7 +386,7 @@ the absolute values.
 | 3 | StreamWork delivery | `work_stream` measurement | none |
 | 4 | Heartbeat load | `heartbeat_scale_benchmark`, `--simulate` | none, or one sim host |
 | 5 | ListInstances and session listing | `instance_scale_measure`, the density cell; session listing is a TODO | none, or one sim host |
-| 6 | Session starts per node (launch pool) | `session_start_latency_measure`; a real-node probe is a TODO | none, or one worker |
+| 6 | Session starts per node (launch pool) | `session_start_latency_measure`, `session_start_cost_breakdown_measure`; a real-node probe is a TODO | none, or one worker |
 | 7 | sessions.db group commit | TODO | one worker |
 | 8 | Session ticket verification cache | TODO | one worker |
 | 9 | Manager routing by node tag | a timed `instance get` loop, tagged vs untagged | two workers |

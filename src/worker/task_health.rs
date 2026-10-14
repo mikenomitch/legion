@@ -12,6 +12,36 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, watch};
 
+/// The first startup probe's delay: how soon after a (re)start a check that
+/// has not passed yet is tried again, ahead of its `every` cadence.
+const STARTUP_PROBE_FIRST: Duration = Duration::from_millis(100);
+/// The longest gap between startup probes. The delay doubles from
+/// [`STARTUP_PROBE_FIRST`] up to this (or to the check's `every`, if that is
+/// shorter).
+const STARTUP_PROBE_MAX: Duration = Duration::from_secs(1);
+/// A startup probe's own timeout, so a probe never holds up the check's
+/// `every` cadence for long. A probe that times out is simply not a pass;
+/// the cadence check still runs with the check's full `timeout`.
+const STARTUP_PROBE_TIMEOUT: Duration = Duration::from_secs(1);
+
+/// Whether a check is probed at startup (docs/jobs-tasks-and-scheduling.md,
+/// "Startup probing").
+///
+/// Only network checks are: a TCP connect or an HTTP GET is cheap and
+/// side-effect free, so trying it a few extra times while the workload boots
+/// costs nothing. An `exec` check runs an arbitrary host command whose cost
+/// Legion cannot know, so it keeps its configured cadence. A readiness check
+/// never changes the allocation's health, so passing it early gains nothing.
+fn probes_at_startup(check: &TaskCheck) -> bool {
+    matches!(check.kind, TaskCheckKind::Http | TaskCheckKind::Tcp)
+        && !matches!(check.check_type, TaskCheckType::Readiness)
+}
+
+/// The delay before the next startup probe, after one at `current` failed.
+fn next_probe_delay(current: Duration, every: Duration) -> Duration {
+    (current * 2).min(STARTUP_PROBE_MAX).min(every)
+}
+
 #[derive(Debug)]
 pub struct HealthMonitorHandle {
     shutdown: watch::Sender<bool>,
@@ -134,14 +164,36 @@ async fn run_health_monitor(
         .collect();
 
     let (result_tx, mut result_rx) = mpsc::channel::<CheckResult>(32);
+    // Bumped each time the task (re)starts under this monitor, so every check
+    // goes back to startup probing (see `probes_at_startup`).
+    let (restarts_tx, restarts_rx) = watch::channel(0u64);
 
     for runtime in checks.clone() {
         let mut shutdown_rx = shutdown_rx.clone();
+        let mut restarts_rx = restarts_rx.clone();
         let boot_ready = Arc::clone(&boot_ready);
         let result_tx = result_tx.clone();
         tokio::spawn(async move {
+            let probes = probes_at_startup(&runtime.check);
+            let first_probe = STARTUP_PROBE_FIRST.min(runtime.check.every);
+            let probe_runtime = {
+                let mut probe = runtime.clone();
+                probe.check.timeout = probe.check.timeout.min(STARTUP_PROBE_TIMEOUT);
+                probe
+            };
+            // Until the check first passes after a (re)start, it is also
+            // tried between its `every` ticks, on a short backoff. Only a
+            // pass is reported: a failed probe is not counted, so failures
+            // are still counted on the configured cadence exactly as before.
+            let mut probe = probes.then_some(first_probe);
             let mut interval = tokio::time::interval(runtime.check.every);
             loop {
+                let probe_due = async {
+                    match probe {
+                        Some(delay) => tokio::time::sleep(delay).await,
+                        None => std::future::pending().await,
+                    }
+                };
                 tokio::select! {
                     _ = interval.tick() => {
                         if matches!(runtime.check.check_type, TaskCheckType::Health)
@@ -149,9 +201,33 @@ async fn run_health_monitor(
                             continue;
                         }
                         let result = run_check(&runtime).await;
+                        if result.ok {
+                            probe = None;
+                        }
                         if result_tx.send(result).await.is_err() {
                             break;
                         }
+                    }
+                    _ = probe_due => {
+                        if matches!(runtime.check.check_type, TaskCheckType::Health)
+                            && !boot_ready.load(Ordering::SeqCst) {
+                            continue;
+                        }
+                        let result = run_check(&probe_runtime).await;
+                        if result.ok {
+                            probe = None;
+                            if result_tx.send(result).await.is_err() {
+                                break;
+                            }
+                        } else {
+                            probe = probe.map(|delay| next_probe_delay(delay, runtime.check.every));
+                        }
+                    }
+                    changed = restarts_rx.changed() => {
+                        if changed.is_err() {
+                            break;
+                        }
+                        probe = probes.then_some(first_probe);
                     }
                     _ = shutdown_rx.changed() => {
                         if *shutdown_rx.borrow() {
@@ -164,6 +240,9 @@ async fn run_health_monitor(
     }
 
     let mut start_time = Instant::now();
+    // The first time this (re)start turned healthy has been observed as the
+    // `health` start stage.
+    let mut health_observed = false;
     let mut state: HashMap<String, CheckState> = checks
         .into_iter()
         .map(|runtime| {
@@ -199,6 +278,13 @@ async fn run_health_monitor(
                     .process_exit(allocation.id)
                     .is_some();
                 if process_down {
+                    if !process_was_down {
+                        // Re-arm startup probing now, so the relaunched
+                        // process is seen passing as soon as it does, not
+                        // at the next `every` tick. Probes fail (uncounted)
+                        // until the supervisor relaunches it.
+                        restarts_tx.send_modify(|generation| *generation += 1);
+                    }
                     process_was_down = true;
                     continue;
                 }
@@ -216,6 +302,9 @@ async fn run_health_monitor(
                         boot_ready.store(false, Ordering::SeqCst);
                     }
                     start_time = Instant::now();
+                    // Not timed: this result is the first sign of the
+                    // relaunch, so there is no start to measure from.
+                    health_observed = true;
                 }
                 let Some(check_state) = state.get_mut(&result.name) else {
                     continue;
@@ -246,6 +335,14 @@ async fn run_health_monitor(
                     };
                     guard.set_allocation_health(allocation.id, result.ok, status);
                 }
+                if result.ok && !health_observed {
+                    health_observed = true;
+                    crate::worker::start_timing::observe(
+                        &task.runtime,
+                        crate::worker::start_timing::stage::HEALTH,
+                        start_time.elapsed(),
+                    );
+                }
 
                 if matches!(result.check_type, TaskCheckType::Boot) && result.ok {
                     if let Some(entry) = boot_status.get_mut(&result.name) {
@@ -266,6 +363,7 @@ async fn run_health_monitor(
                     track_failure(&mut check_state.failures, now, &check_state.runtime);
                     if check_state.failures.len() as u32 >= check_state.runtime.check.unhealthy_after_count {
                         let reason = result.error.clone().unwrap_or_else(|| "unknown error".into());
+                        let before = start_time;
                         if let Err(err) = handle_unhealthy(
                             &manager,
                             &allocation,
@@ -281,6 +379,11 @@ async fn run_health_monitor(
                                 error = ?err,
                                 "Failed handling unhealthy allocation"
                             );
+                        }
+                        if start_time != before {
+                            // Restarted in place: a fresh start, probed again.
+                            health_observed = false;
+                            restarts_tx.send_modify(|generation| *generation += 1);
                         }
                         if manager
                             .lock()

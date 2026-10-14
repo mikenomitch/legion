@@ -7,11 +7,14 @@
 //! - [`VmSpec`] + [`cloud_hypervisor_args`] / [`firecracker_config`] — the
 //!   launch surface for each VMM. Both are single-process VMMs, so the guest
 //!   dies with the child Legion spawns (no daemon to chase, unlike containers).
-//! - [`GuestPayload`] + [`install_guest_payload`] — the generated `/legion/init`
+//! - [`GuestPayload`] + [`guest_payload_files`] — the generated `/legion/init`
 //!   that becomes PID 1 in the guest: mounts the pseudo filesystems and the
 //!   attached volume disks, exports the task env, runs the command, then powers
-//!   the VM off.
-//! - ext4 disk-image helpers — the ephemeral root disk, rebuilt from the image.
+//!   the VM off. [`install_guest_base`] puts the node-wide part (the guest
+//!   binary) into an image tree, and [`inject_guest_payload`] writes the
+//!   per-sandbox files into a built disk.
+//! - ext4 disk-image helpers — the ephemeral root disk, built from the image
+//!   (and shared per image through `rootfs_cache`).
 //!   Persistent disks are NOT built here: those are block-mode volumes served
 //!   by a volume driver (see docs/volumes.md), and this module only attaches
 //!   what the worker already mounted.
@@ -441,17 +444,33 @@ pub(crate) struct TapNet {
     pub mac: Option<String>,
 }
 
-/// Legion's guest kernel cmdline: serial console (so guest output lands in the
+/// Legion's guest kernel cmdline: the console (so guest output lands in the
 /// allocation's captured stdout), reboot-on-panic (so a wedged guest exits the
 /// VMM instead of hanging), the root disk, and our generated init.
+///
+/// The console is where boot time goes. Every byte written to an emulated
+/// 16550 serial port is a VM exit, which is costly under nested
+/// virtualization: a default kernel's ~300 boot lines cost about 700 ms of a
+/// 4-vCPU c8i guest's boot, more than the rest of the boot together.
+///
+/// - cloud-hypervisor boots on virtio-console (`hvc0`), which batches output
+///   through a virtqueue. The kernel keeps its full boot log, and messages
+///   from before the console driver loads are replayed when it registers.
+/// - Firecracker has only the serial port, so its guests boot `quiet`:
+///   warnings, errors, and panics still print. A task that wants the full
+///   log sets `kernel_args = "loglevel=7"`, which overrides it.
 ///
 /// Firecracker has no PCI bus and no i8042 controller, so it needs the extra
 /// probe suppressions; cloud-hypervisor does not.
 pub(crate) fn kernel_cmdline(spec: &VmSpec, firecracker: bool) -> String {
-    let mut cmdline = String::from("console=ttyS0 reboot=k panic=1");
-    if firecracker {
-        cmdline.push_str(" pci=off i8042.noaux i8042.nomux i8042.nopnp i8042.dumbkbd");
-    }
+    let mut cmdline = if firecracker {
+        String::from(
+            "console=ttyS0 quiet reboot=k panic=1 pci=off i8042.noaux i8042.nomux i8042.nopnp \
+             i8042.dumbkbd",
+        )
+    } else {
+        String::from("console=hvc0 reboot=k panic=1")
+    };
     cmdline.push_str(&format!(
         " root={GUEST_ROOT_DEVICE} rw init={GUEST_INIT_PATH}"
     ));
@@ -470,9 +489,18 @@ pub(crate) fn kernel_cmdline(spec: &VmSpec, firecracker: bool) -> String {
     cmdline
 }
 
-/// `cloud-hypervisor` argv. `--serial tty --console off` puts the guest serial
-/// console on the VMM's stdout, which the worker captures into the
-/// allocation's `stdout.log`.
+/// `cloud-hypervisor` argv. `--serial off --console tty` puts the guest's
+/// virtio-console (`hvc0`, see [`kernel_cmdline`]) on the VMM's stdout, which
+/// the worker captures into the allocation's `stdout.log`.
+///
+/// Every disk is declared `image_type=raw`. Every disk Legion attaches is
+/// raw (an ext4 image, a raw volume, or the identity disk), and without the
+/// declaration cloud-hypervisor probes the format and then refuses guest
+/// writes to sector 0 of the probed image, so a guest cannot rewrite it into
+/// another format. ext4 writes its superblock through block 0 at mount, so
+/// the root mount failed with an I/O error, the kernel panicked, and the
+/// guest rebooted after `panic=1`'s one second: every boot paid about 1.5 s
+/// for it.
 pub(crate) fn cloud_hypervisor_args(spec: &VmSpec) -> Vec<String> {
     let mut args = vec![
         "--kernel".to_string(),
@@ -480,10 +508,10 @@ pub(crate) fn cloud_hypervisor_args(spec: &VmSpec) -> Vec<String> {
         "--cmdline".to_string(),
         kernel_cmdline(spec, false),
         "--disk".to_string(),
-        format!("path={}", spec.root_disk.display()),
+        format!("path={},image_type=raw", spec.root_disk.display()),
     ];
     for disk in &spec.volume_disks {
-        let mut arg = format!("path={}", disk.path.display());
+        let mut arg = format!("path={},image_type=raw", disk.path.display());
         if disk.read_only {
             arg.push_str(",readonly=on");
         }
@@ -491,7 +519,7 @@ pub(crate) fn cloud_hypervisor_args(spec: &VmSpec) -> Vec<String> {
     }
     if let Some(identity) = spec.identity_disk.as_ref() {
         args.push(format!(
-            "path={},readonly=on,id={}",
+            "path={},image_type=raw,readonly=on,id={}",
             identity.display(),
             crate::task_plugins::IDENTITY_DRIVE_ID
         ));
@@ -501,9 +529,9 @@ pub(crate) fn cloud_hypervisor_args(spec: &VmSpec) -> Vec<String> {
     args.push("--memory".to_string());
     args.push(format!("size={}M", spec.memory_mib));
     args.push("--serial".to_string());
-    args.push("tty".to_string());
-    args.push("--console".to_string());
     args.push("off".to_string());
+    args.push("--console".to_string());
+    args.push("tty".to_string());
     args.push("--api-socket".to_string());
     args.push(spec.api_socket.display().to_string());
     if let Some(balloon) = spec.balloon.as_ref() {
@@ -904,72 +932,334 @@ pub(crate) fn render_command_supervision(command: &str) -> String {
     block
 }
 
-/// Writes `/legion/init` (executable) and `/legion/env` into an extracted
-/// rootfs, plus `/etc/hostname` for guest legibility.
-pub(crate) fn install_guest_payload(
-    rootfs: &Path,
+/// What the per-sandbox files depend on in a base root disk, read from the
+/// extracted tree when the base is built and kept beside it, so a sandbox
+/// cloned from a cached base never has to look inside the disk.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct BaseFacts {
+    /// The image's `/etc` is a real directory, so `/etc/hostname` and
+    /// `/etc/resolv.conf` can be written into it. An image whose `/etc` is a
+    /// symlink keeps its own files.
+    pub etc_dir: bool,
+    /// The image ships `/etc/resolv.conf` (a file or a symlink), which a
+    /// guest with its own resolvers replaces.
+    pub resolv_conf: bool,
+}
+
+/// Claims `/legion` in an extracted image tree and copies the guest binary
+/// in. This is the part of Legion's guest files that is the same for every
+/// sandbox on the node, so it can live in a shared base root disk. Nothing
+/// per sandbox (init, env, hostname) is written here: see
+/// [`inject_guest_payload`].
+///
+/// `/legion` is Legion's namespace in the guest, so whatever the image put
+/// there is removed without being followed. Writing through an image's own
+/// `/legion -> /etc` symlink would land on the host. The image's
+/// `/etc/hostname` goes too, since every sandbox writes its own.
+pub(crate) fn install_guest_base(tree: &Path, binary: &GuestBinary) -> R<BaseFacts> {
+    let legion_dir = tree.join("legion");
+    remove_entry(&legion_dir)?;
+    std::fs::create_dir(&legion_dir).with_context(|| format!("create {}", legion_dir.display()))?;
+    set_mode(&legion_dir, 0o755)?;
+    install_guest_agent(tree, binary)?;
+
+    let etc = tree.join("etc");
+    let etc_dir = match std::fs::symlink_metadata(&etc) {
+        Ok(meta) => meta.is_dir(),
+        Err(_) => {
+            std::fs::create_dir(&etc).with_context(|| format!("create {}", etc.display()))?;
+            set_mode(&etc, 0o755)?;
+            true
+        }
+    };
+    let mut facts = BaseFacts {
+        etc_dir,
+        resolv_conf: false,
+    };
+    if etc_dir {
+        remove_entry(&etc.join("hostname"))?;
+        facts.resolv_conf = std::fs::symlink_metadata(etc.join("resolv.conf")).is_ok();
+    }
+    Ok(facts)
+}
+
+/// Removes whatever is at `path` (file, symlink, or directory) without
+/// following a symlink. A missing path is not an error.
+fn remove_entry(path: &Path) -> R<()> {
+    let Ok(meta) = std::fs::symlink_metadata(path) else {
+        return Ok(());
+    };
+    if meta.is_dir() {
+        std::fs::remove_dir_all(path)
+    } else {
+        std::fs::remove_file(path)
+    }
+    .with_context(|| format!("remove {}", path.display()))
+}
+
+fn set_mode(path: &Path, mode: u32) -> R<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))
+            .with_context(|| format!("chmod {}", path.display()))?;
+    }
+    #[cfg(not(unix))]
+    let _ = (path, mode);
+    Ok(())
+}
+
+/// One per-sandbox file, written into a root disk after the disk is built.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct GuestFile {
+    /// Guest directory. The base guarantees it exists.
+    pub dir: &'static str,
+    pub name: &'static str,
+    pub contents: Vec<u8>,
+    pub mode: u32,
+    /// The base may already hold a file (or symlink) of this name. It is
+    /// removed first, never written through.
+    pub replace: bool,
+}
+
+/// The resolver file of a gated guest: names resolve through the agent's
+/// relay to the node datapath.
+const RELAY_RESOLV_CONF: &str = "# Generated by Legion: the guest agent relays DNS to the node datapath.\nnameserver 127.0.0.1\noptions ndots:1\n";
+
+/// The files that make a root disk *this* sandbox's: `/legion/init`,
+/// `/legion/env`, `/legion/cwd`, `/etc/hostname`, and `/etc/resolv.conf`
+/// when the guest has its own resolvers. They carry the allocation's
+/// identity and its env, which can hold secrets, so they go into each
+/// sandbox's own disk and never into a shared base.
+pub(crate) fn guest_payload_files(
     payload: &GuestPayload,
     hostname: &str,
-) -> R<()> {
-    let legion_dir = rootfs.join("legion");
-    std::fs::create_dir_all(&legion_dir)
-        .with_context(|| format!("create {}", legion_dir.display()))?;
-
-    let init_path = legion_dir.join("init");
-    std::fs::write(&init_path, render_init_script(payload))
-        .with_context(|| format!("write {}", init_path.display()))?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&init_path, std::fs::Permissions::from_mode(0o755))
-            .with_context(|| format!("chmod {}", init_path.display()))?;
-    }
-
-    let env_path = legion_dir.join("env");
-    std::fs::write(&env_path, render_env_file(&payload.env))
-        .with_context(|| format!("write {}", env_path.display()))?;
+    facts: &BaseFacts,
+) -> Vec<GuestFile> {
+    let mut files = vec![
+        GuestFile {
+            dir: "/legion",
+            name: "init",
+            contents: render_init_script(payload).into_bytes(),
+            mode: 0o755,
+            replace: false,
+        },
+        GuestFile {
+            dir: "/legion",
+            name: "env",
+            contents: render_env_file(&payload.env).into_bytes(),
+            // The env file can carry KV-injected secrets and identity tokens.
+            mode: 0o600,
+            replace: false,
+        },
+    ];
     // Where exec sessions start: the command's working directory.
     if let Some(cwd) = payload.cwd.as_deref().filter(|cwd| !cwd.is_empty()) {
-        let cwd_path = legion_dir.join("cwd");
-        std::fs::write(&cwd_path, cwd).with_context(|| format!("write {}", cwd_path.display()))?;
+        files.push(GuestFile {
+            dir: "/legion",
+            name: "cwd",
+            contents: cwd.as_bytes().to_vec(),
+            mode: 0o644,
+            replace: false,
+        });
     }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        // The env file can carry KV-injected secrets and identity tokens.
-        std::fs::set_permissions(&env_path, std::fs::Permissions::from_mode(0o600))
-            .with_context(|| format!("chmod {}", env_path.display()))?;
+    if !facts.etc_dir {
+        return files;
     }
+    files.push(GuestFile {
+        dir: "/etc",
+        name: "hostname",
+        contents: format!("{hostname}\n").into_bytes(),
+        mode: 0o644,
+        replace: false,
+    });
+    // A gated guest resolves through the agent's relay, and a TAP guest
+    // through its bridge's resolvers. The image's file may be a symlink
+    // (systemd-resolved), so it is replaced rather than written through. A
+    // guest with neither keeps the image's own file.
+    let resolv = if payload.relay {
+        Some(RELAY_RESOLV_CONF.to_string())
+    } else if !payload.resolvers.is_empty() {
+        Some(legion_guest::netconf::resolv_conf(&payload.resolvers))
+    } else {
+        None
+    };
+    if let Some(resolv) = resolv {
+        files.push(GuestFile {
+            dir: "/etc",
+            name: "resolv.conf",
+            contents: resolv.into_bytes(),
+            mode: 0o644,
+            replace: facts.resolv_conf,
+        });
+    }
+    files
+}
 
-    let etc = rootfs.join("etc");
-    if std::fs::create_dir_all(&etc).is_ok() {
-        let _ = std::fs::write(etc.join("hostname"), format!("{hostname}\n"));
-        if payload.relay {
-            // Names resolve through the agent's relay to the node resolver.
-            let _ = std::fs::write(
-                etc.join("resolv.conf"),
-                "# Generated by Legion: the guest agent relays DNS to the node datapath.\nnameserver 127.0.0.1\noptions ndots:1\n",
-            );
-        } else if !payload.resolvers.is_empty() {
-            // A TAP guest resolves through its bridge's resolvers. The
-            // image's file may be a symlink (systemd-resolved), so it is
-            // replaced rather than written through.
-            let path = etc.join("resolv.conf");
-            let _ = std::fs::remove_file(&path);
-            let _ = std::fs::write(
-                &path,
-                legion_guest::netconf::resolv_conf(&payload.resolvers),
+/// Locates `debugfs`, which writes the per-sandbox files into a root disk:
+/// beside `mkfs.ext4` first (e2fsprogs ships both), then `PATH` and the
+/// well-known sbin locations.
+pub(crate) fn debugfs_binary() -> R<PathBuf> {
+    let beside_mkfs = mkfs_binary()
+        .ok()
+        .map(|mkfs| mkfs.with_file_name("debugfs"))
+        .filter(|path| path.is_file());
+    beside_mkfs
+        .or_else(|| find_on_path("debugfs"))
+        .or_else(|| {
+            ["/sbin/debugfs", "/usr/sbin/debugfs"]
+                .iter()
+                .map(PathBuf::from)
+                .find(|path| path.is_file())
+        })
+        .context("debugfs not found: install e2fsprogs (e2fsprogs-extra on Alpine)")
+}
+
+/// Quotes one argument of a debugfs command. debugfs splits on whitespace
+/// and reads `"..."` as one argument, with `""` for a literal quote. A line
+/// break cannot be expressed at all.
+fn debugfs_quote(arg: &str) -> R<String> {
+    if arg.contains(['\n', '\r', '\0']) {
+        bail!("{arg:?} cannot be passed to debugfs: it contains a line break");
+    }
+    Ok(format!("\"{}\"", arg.replace('"', "\"\"")))
+}
+
+/// The debugfs command script that writes `files`, staged on the host at
+/// `staged` (same order), into a disk.
+fn debugfs_script(files: &[GuestFile], staged: &[PathBuf]) -> R<String> {
+    let mut script = String::new();
+    let mut cwd = "";
+    for (file, host) in files.iter().zip(staged) {
+        // `write` names the new file relative to debugfs's cwd, so each
+        // file is written from inside its directory.
+        if file.dir != cwd {
+            script.push_str(&format!("cd {}\n", debugfs_quote(file.dir)?));
+            cwd = file.dir;
+        }
+        let name = debugfs_quote(file.name)?;
+        if file.replace {
+            script.push_str(&format!("rm {name}\n"));
+        }
+        let host = host
+            .to_str()
+            .with_context(|| format!("{} is not valid UTF-8", host.display()))?;
+        script.push_str(&format!("write {} {name}\n", debugfs_quote(host)?));
+    }
+    Ok(script)
+}
+
+/// Writes the per-sandbox files into the ext4 root disk at `disk` with
+/// `debugfs -w`: no mount, no loop device, and no root, like the build.
+///
+/// Every write happens inside the disk's own filesystem, so an image's
+/// symlinks resolve within the image and can never redirect a write onto
+/// the host. Each file keeps the mode it is staged with and is owned by
+/// root. The files are staged under `work` (owner-only) and removed after.
+///
+/// debugfs reports a failed command on stderr and still exits 0, so any
+/// stderr line other than its version banner fails the call.
+pub(crate) fn inject_guest_payload(disk: &Path, files: &[GuestFile], work: &Path) -> R<()> {
+    let _ = std::fs::remove_dir_all(work);
+    std::fs::create_dir_all(work).with_context(|| format!("create {}", work.display()))?;
+    set_mode(work, 0o700)?;
+    let result = (|| {
+        let mut staged = Vec::with_capacity(files.len());
+        for (index, file) in files.iter().enumerate() {
+            let path = work.join(format!("{index}-{}", file.name));
+            std::fs::write(&path, &file.contents)
+                .with_context(|| format!("write {}", path.display()))?;
+            set_mode(&path, file.mode)?;
+            staged.push(path);
+        }
+        let script_path = work.join("debugfs.cmds");
+        std::fs::write(&script_path, debugfs_script(files, &staged)?)
+            .with_context(|| format!("write {}", script_path.display()))?;
+        let debugfs = debugfs_binary()?;
+        let output = Command::new(&debugfs)
+            .arg("-w")
+            .arg("-f")
+            .arg(&script_path)
+            .arg(disk)
+            .output()
+            .with_context(|| format!("spawn {}", debugfs.display()))?;
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let errors: Vec<&str> = stderr
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty() && !line.starts_with("debugfs "))
+            .collect();
+        if !output.status.success() || !errors.is_empty() {
+            bail!(
+                "write the sandbox's init and env files into its root disk {}: {}",
+                disk.display(),
+                if errors.is_empty() {
+                    format!("debugfs exited with {}", output.status)
+                } else {
+                    errors.join("; ")
+                }
             );
         }
-    }
-    if payload.guest_agent || payload.resume_watch {
-        let binary = match payload.guest_binary.clone() {
-            Some(binary) => binary,
-            None => guest_binary()?,
-        };
-        install_guest_agent(rootfs, &binary)?;
+        Ok(())
+    })();
+    let _ = std::fs::remove_dir_all(work);
+    result
+}
+
+/// Writes the per-sandbox files into an extracted tree before it is
+/// formatted, for a disk built for one sandbox alone (one that no other
+/// sandbox will clone). Same files and modes as [`inject_guest_payload`],
+/// without a debugfs pass.
+///
+/// [`install_guest_base`] made `/legion` a real directory and reported
+/// whether `/etc` is one, and only those two get files. Each file replaces
+/// whatever was at its path without following it, so an image's symlink
+/// cannot redirect the write onto the host.
+pub(crate) fn write_guest_payload_into_tree(tree: &Path, files: &[GuestFile]) -> R<()> {
+    use std::io::Write as _;
+    for file in files {
+        let dir = tree.join(file.dir.trim_start_matches('/'));
+        if !std::fs::symlink_metadata(&dir).is_ok_and(|meta| meta.is_dir()) {
+            bail!(
+                "{} in the sandbox's root filesystem is not a directory",
+                file.dir
+            );
+        }
+        let path = dir.join(file.name);
+        remove_entry(&path)?;
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(file.mode);
+        }
+        options
+            .open(&path)
+            .and_then(|mut out| out.write_all(&file.contents))
+            .with_context(|| format!("write {}", path.display()))?;
+        set_mode(&path, file.mode)?;
     }
     Ok(())
+}
+
+/// Room left free in every root disk for the per-sandbox files written into
+/// it after it is formatted ([`inject_guest_payload`]), so they never eat
+/// into the task's `rootfs_headroom_mib`.
+const PAYLOAD_SLACK_BYTES: u64 = MIB;
+
+/// Formats `tree` into a root disk image at `image`: the tree's contents,
+/// ext4 metadata, the per-sandbox files' slack, and `headroom_mib` of
+/// writable space for the workload.
+pub(crate) fn format_root_disk(tree: &Path, image: &Path, headroom_mib: u64) -> R<()> {
+    let used = dir_size_bytes(tree)?.saturating_add(PAYLOAD_SLACK_BYTES);
+    create_ext4_image(
+        image,
+        rootfs_image_bytes(used, headroom_mib),
+        Some(tree),
+        "legion-root",
+    )
 }
 
 /// The binary a guest runs as `/legion/legion`: its guest agent and resume
@@ -987,7 +1277,7 @@ pub(crate) struct GuestBinary {
 }
 
 impl GuestBinary {
-    fn at(path: PathBuf, is_static: bool) -> R<Self> {
+    pub(crate) fn at(path: PathBuf, is_static: bool) -> R<Self> {
         let metadata =
             std::fs::metadata(&path).with_context(|| format!("reading {}", path.display()))?;
         let modified = metadata
@@ -1245,10 +1535,10 @@ mod tests {
 
         let args = cloud_hypervisor_args(&spec);
         let disk_at = args.iter().position(|a| a == "--disk").expect("--disk");
-        assert_eq!(args[disk_at + 2], "path=/v/disk.img");
+        assert_eq!(args[disk_at + 2], "path=/v/disk.img,image_type=raw");
         assert_eq!(
             args[disk_at + 3],
-            "path=/links/identity.img,readonly=on,id=identity"
+            "path=/links/identity.img,image_type=raw,readonly=on,id=identity"
         );
 
         let drives = firecracker_config(&spec)["drives"].clone();
@@ -1347,7 +1637,12 @@ mod tests {
         let cmdline = kernel_cmdline(&spec(), false);
         assert!(cmdline.contains("root=/dev/vda rw"));
         assert!(cmdline.contains("init=/legion/init"));
-        assert!(cmdline.contains("console=ttyS0"));
+        // cloud-hypervisor's console is virtio (fast, full boot log);
+        // Firecracker has only serial, so it boots quiet.
+        assert!(cmdline.contains("console=hvc0"));
+        assert!(!cmdline.contains("quiet"));
+        let firecracker = kernel_cmdline(&spec(), true);
+        assert!(firecracker.contains("console=ttyS0 quiet"));
         // Panic must reboot, or a wedged guest would hang the allocation.
         assert!(cmdline.contains("panic=1"));
         // PCI suppression is a Firecracker-only need; it would break
@@ -1362,10 +1657,15 @@ mod tests {
         spec.extra_cmdline = Some("  quiet loglevel=1 ".into());
         let cmdline = kernel_cmdline(&spec, false);
         assert!(cmdline.ends_with("quiet loglevel=1"));
+        // The task's args come after Legion's, so `loglevel=7` brings back
+        // a Firecracker guest's full boot log (the last loglevel wins).
+        spec.extra_cmdline = Some("loglevel=7".into());
+        let cmdline = kernel_cmdline(&spec, true);
+        assert!(cmdline.find("quiet") < cmdline.find("loglevel=7"));
     }
 
     #[test]
-    fn cloud_hypervisor_args_carry_disks_cpus_memory_and_serial() {
+    fn cloud_hypervisor_args_carry_disks_cpus_memory_and_console() {
         let mut spec = spec();
         spec.volume_disks = vec![
             VmDisk {
@@ -1384,19 +1684,33 @@ mod tests {
         let args = cloud_hypervisor_args(&spec);
 
         let disk_at = args.iter().position(|a| a == "--disk").expect("--disk");
-        assert_eq!(args[disk_at + 1], "path=/allocs/7/.sandbox/rootfs.img");
+        // Every disk is declared raw, or cloud-hypervisor refuses guest
+        // writes to its sector 0 and the root mount fails.
+        assert_eq!(
+            args[disk_at + 1],
+            "path=/allocs/7/.sandbox/rootfs.img,image_type=raw"
+        );
         // Volume disks follow in attach order: /dev/vdb, then /dev/vdc.
-        assert_eq!(args[disk_at + 2], "path=/volumes/local-dir/9f2c/disk.img");
+        assert_eq!(
+            args[disk_at + 2],
+            "path=/volumes/local-dir/9f2c/disk.img,image_type=raw"
+        );
         // A read-only volume must be read-only at the VMM, not just in-guest.
         assert_eq!(
             args[disk_at + 3],
-            "path=/dev/mapper/legion-models,readonly=on"
+            "path=/dev/mapper/legion-models,image_type=raw,readonly=on"
         );
         assert!(args.contains(&"boot=2".to_string()));
         assert!(args.contains(&"size=512M".to_string()));
-        // Guest console on the VMM's stdout is what makes log capture work.
+        // The guest's virtio-console on the VMM's stdout is what makes log
+        // capture work; the serial port is off.
+        let console_at = args
+            .iter()
+            .position(|a| a == "--console")
+            .expect("--console");
+        assert_eq!(args[console_at + 1], "tty");
         let serial_at = args.iter().position(|a| a == "--serial").expect("--serial");
-        assert_eq!(args[serial_at + 1], "tty");
+        assert_eq!(args[serial_at + 1], "off");
         assert!(args.contains(&"tap=tap0,mac=02:00:00:00:00:01".to_string()));
 
         // A gated sandbox gets its vsock device on both VMMs, always as
@@ -1532,16 +1846,7 @@ mod tests {
 
         // What lands in the guest is the chosen binary.
         let rootfs = tempfile::tempdir()?;
-        install_guest_payload(
-            rootfs.path(),
-            &GuestPayload {
-                command: vec!["/bin/sh".into()],
-                guest_agent: true,
-                guest_binary: Some(beside),
-                ..GuestPayload::default()
-            },
-            "legion-sbx-3",
-        )?;
+        install_guest_base(rootfs.path(), &beside)?;
         assert_eq!(
             std::fs::read(rootfs.path().join("legion/legion"))?,
             b"static guest"
@@ -2005,96 +2310,289 @@ mod tests {
         Ok(())
     }
 
+    fn file<'a>(files: &'a [GuestFile], dir: &str, name: &str) -> Option<&'a GuestFile> {
+        files
+            .iter()
+            .find(|file| file.dir == dir && file.name == name)
+    }
+
     #[test]
-    fn install_guest_payload_writes_init_and_env() -> R<()> {
-        let rootfs = tempfile::tempdir()?;
+    fn the_payload_files_carry_init_env_and_hostname() {
         let payload = GuestPayload {
             command: vec!["/bin/true".into()],
             env: BTreeMap::from([("A".to_string(), "1".to_string())]),
             ..GuestPayload::default()
         };
-        install_guest_payload(rootfs.path(), &payload, "legion-sbx-3")?;
+        let facts = BaseFacts {
+            etc_dir: true,
+            resolv_conf: true,
+        };
+        let files = guest_payload_files(&payload, "legion-sbx-3", &facts);
 
-        let init = std::fs::read_to_string(rootfs.path().join("legion/init"))?;
-        assert!(init.contains("/bin/true"));
-        assert!(std::fs::read_to_string(rootfs.path().join("legion/env"))?.contains("export A='1'"));
+        let init = file(&files, "/legion", "init").expect("init");
+        assert!(String::from_utf8_lossy(&init.contents).contains("/bin/true"));
+        assert_eq!(init.mode, 0o755, "init must be executable");
+        let env = file(&files, "/legion", "env").expect("env");
+        assert!(String::from_utf8_lossy(&env.contents).contains("export A='1'"));
+        // Env can carry secrets; it must not be world-readable.
+        assert_eq!(env.mode, 0o600, "env must be owner-only");
         assert_eq!(
-            std::fs::read_to_string(rootfs.path().join("etc/hostname"))?.trim(),
-            "legion-sbx-3"
+            file(&files, "/etc", "hostname").expect("hostname").contents,
+            b"legion-sbx-3\n"
         );
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let mode = std::fs::metadata(rootfs.path().join("legion/init"))?
-                .permissions()
-                .mode()
-                & 0o777;
-            assert_eq!(mode, 0o755, "init must be executable, got {mode:o}");
-            // Env can carry secrets; it must not be world-readable.
-            let env_mode = std::fs::metadata(rootfs.path().join("legion/env"))?
-                .permissions()
-                .mode()
-                & 0o777;
-            assert_eq!(env_mode, 0o600, "env must be owner-only, got {env_mode:o}");
-        }
-        Ok(())
+        // No cwd, no resolvers, no relay: neither file is written, and the
+        // image keeps its own resolv.conf.
+        assert!(file(&files, "/legion", "cwd").is_none());
+        assert!(file(&files, "/etc", "resolv.conf").is_none());
+
+        // An image whose /etc is a symlink keeps its own /etc files.
+        let files = guest_payload_files(&payload, "legion-sbx-3", &BaseFacts::default());
+        assert!(files.iter().all(|file| file.dir == "/legion"), "{files:?}");
     }
 
     /// Gated plan §6.7: a TAP guest resolves through its bridge's
-    /// resolvers, replacing the image's file even when it is a symlink. A
-    /// guest with no resolvers keeps the image's own.
+    /// resolvers, replacing the image's file even when it is a symlink, and
+    /// a gated guest through the agent. A guest with neither keeps the
+    /// image's own.
     #[test]
-    fn a_tap_guest_gets_its_bridge_resolvers() -> R<()> {
-        let rootfs = tempfile::tempdir()?;
-        std::fs::create_dir_all(rootfs.path().join("etc"))?;
-        #[cfg(unix)]
-        std::os::unix::fs::symlink(
-            "/run/systemd/resolve/stub-resolv.conf",
-            rootfs.path().join("etc/resolv.conf"),
-        )?;
-        // A TAP guest runs the agent for exec, with no relay: its names
-        // still resolve through its bridge, not the agent.
-        let agent = rootfs.path().join("agent-binary");
-        std::fs::write(&agent, b"#!/bin/sh\n")?;
-        let payload = GuestPayload {
+    fn a_tap_or_gated_guest_replaces_the_images_resolv_conf() -> R<()> {
+        let tap = GuestPayload {
             command: vec!["/bin/true".into()],
             resolvers: vec!["10.88.0.1".parse()?, "1.1.1.1".parse()?],
             guest_agent: true,
             relay: false,
-            guest_binary: Some(GuestBinary::at(agent, true)?),
             cwd: Some("/workspace".into()),
             ..GuestPayload::default()
         };
-        install_guest_payload(rootfs.path(), &payload, "legion-sbx-3")?;
-        let resolv = std::fs::read_to_string(rootfs.path().join("etc/resolv.conf"))?;
+        let facts = BaseFacts {
+            etc_dir: true,
+            resolv_conf: true,
+        };
+        let files = guest_payload_files(&tap, "legion-sbx-3", &facts);
+        let resolv = file(&files, "/etc", "resolv.conf").expect("resolv.conf");
         assert!(
-            resolv.contains("nameserver 10.88.0.1\nnameserver 1.1.1.1\n"),
-            "{resolv}"
+            String::from_utf8_lossy(&resolv.contents)
+                .contains("nameserver 10.88.0.1\nnameserver 1.1.1.1\n"),
+            "{resolv:?}"
+        );
+        assert!(
+            resolv.replace,
+            "the image's file is removed, not written through"
         );
         // Exec sessions start where the command does.
         assert_eq!(
-            std::fs::read_to_string(rootfs.path().join("legion/cwd"))?,
-            "/workspace"
+            file(&files, "/legion", "cwd").expect("cwd").contents,
+            b"/workspace"
         );
 
-        let untouched = tempfile::tempdir()?;
-        std::fs::create_dir_all(untouched.path().join("etc"))?;
-        std::fs::write(
-            untouched.path().join("etc/resolv.conf"),
-            "nameserver 9.9.9.9\n",
+        let gated = GuestPayload {
+            command: vec!["/bin/true".into()],
+            relay: true,
+            ..GuestPayload::default()
+        };
+        let no_image_file = BaseFacts {
+            etc_dir: true,
+            resolv_conf: false,
+        };
+        let files = guest_payload_files(&gated, "legion-sbx-4", &no_image_file);
+        let resolv = file(&files, "/etc", "resolv.conf").expect("resolv.conf");
+        assert!(String::from_utf8_lossy(&resolv.contents).contains("nameserver 127.0.0.1"));
+        assert!(!resolv.replace, "nothing to remove when the image has none");
+        Ok(())
+    }
+
+    /// The base claims `/legion` and drops `/etc/hostname` without following
+    /// the image's symlinks out of the tree.
+    #[cfg(unix)]
+    #[test]
+    fn the_base_claims_legion_without_following_image_symlinks() -> R<()> {
+        let work = tempfile::tempdir()?;
+        let tree = work.path().join("tree");
+        let outside = work.path().join("host-etc");
+        std::fs::create_dir_all(tree.join("etc"))?;
+        std::fs::create_dir_all(&outside)?;
+        std::fs::write(outside.join("passwd"), b"host file")?;
+        // An image that points /legion and /etc/hostname at host paths.
+        std::os::unix::fs::symlink(&outside, tree.join("legion"))?;
+        std::os::unix::fs::symlink(outside.join("passwd"), tree.join("etc/hostname"))?;
+        std::os::unix::fs::symlink(
+            "/run/systemd/resolve/stub-resolv.conf",
+            tree.join("etc/resolv.conf"),
         )?;
-        install_guest_payload(
-            untouched.path(),
-            &GuestPayload {
-                command: vec!["/bin/true".into()],
-                ..GuestPayload::default()
-            },
-            "legion-sbx-4",
-        )?;
+        let agent = work.path().join("legion-guest");
+        std::fs::write(&agent, b"static guest")?;
+
+        let facts = install_guest_base(&tree, &GuestBinary::at(agent, true)?)?;
         assert_eq!(
-            std::fs::read_to_string(untouched.path().join("etc/resolv.conf"))?,
-            "nameserver 9.9.9.9\n"
+            facts,
+            BaseFacts {
+                etc_dir: true,
+                resolv_conf: true
+            }
         );
+        assert!(std::fs::symlink_metadata(tree.join("legion"))?.is_dir());
+        assert_eq!(std::fs::read(tree.join("legion/legion"))?, b"static guest");
+        assert!(std::fs::symlink_metadata(tree.join("etc/hostname")).is_err());
+        // The host side is untouched.
+        assert_eq!(std::fs::read(outside.join("passwd"))?, b"host file");
+        assert!(!outside.join("legion").exists());
+
+        // An image with no /etc gets one; one whose /etc is a symlink is left
+        // alone and says so.
+        let bare = work.path().join("bare");
+        std::fs::create_dir_all(&bare)?;
+        let agent = work.path().join("legion-guest");
+        assert!(install_guest_base(&bare, &GuestBinary::at(agent.clone(), true)?)?.etc_dir);
+        let linked = work.path().join("linked");
+        std::fs::create_dir_all(&linked)?;
+        std::os::unix::fs::symlink(&outside, linked.join("etc"))?;
+        assert!(!install_guest_base(&linked, &GuestBinary::at(agent, true)?)?.etc_dir);
+        Ok(())
+    }
+
+    /// A disk built for one sandbox gets its files in the tree, replacing
+    /// the image's symlinks rather than writing through them.
+    #[cfg(unix)]
+    #[test]
+    fn the_payload_written_into_a_tree_never_follows_image_symlinks() -> R<()> {
+        use std::os::unix::fs::PermissionsExt;
+        let work = tempfile::tempdir()?;
+        let tree = work.path().join("tree");
+        std::fs::create_dir_all(tree.join("etc"))?;
+        let host_file = work.path().join("host-resolv.conf");
+        std::fs::write(&host_file, b"host resolver\n")?;
+        std::os::unix::fs::symlink(&host_file, tree.join("etc/resolv.conf"))?;
+        let agent = work.path().join("legion-guest");
+        std::fs::write(&agent, b"static guest")?;
+        let facts = install_guest_base(&tree, &GuestBinary::at(agent, true)?)?;
+
+        let payload = GuestPayload {
+            command: vec!["/bin/true".into()],
+            env: BTreeMap::from([("A".to_string(), "1".to_string())]),
+            relay: true,
+            ..GuestPayload::default()
+        };
+        write_guest_payload_into_tree(&tree, &guest_payload_files(&payload, "sbx-1", &facts))?;
+
+        assert_eq!(std::fs::read(&host_file)?, b"host resolver\n");
+        let resolv = tree.join("etc/resolv.conf");
+        assert!(!std::fs::symlink_metadata(&resolv)?.file_type().is_symlink());
+        assert!(std::fs::read_to_string(&resolv)?.contains("nameserver 127.0.0.1"));
+        assert_eq!(std::fs::read(tree.join("etc/hostname"))?, b"sbx-1\n");
+        let mode = |path: &str| -> R<u32> {
+            Ok(std::fs::metadata(tree.join(path))?.permissions().mode() & 0o777)
+        };
+        assert_eq!(mode("legion/env")?, 0o600);
+        assert_eq!(mode("legion/init")?, 0o755);
+        Ok(())
+    }
+
+    #[test]
+    fn debugfs_scripts_quote_names_and_refuse_line_breaks() -> R<()> {
+        let files = vec![
+            GuestFile {
+                dir: "/legion",
+                name: "init",
+                contents: Vec::new(),
+                mode: 0o755,
+                replace: false,
+            },
+            GuestFile {
+                dir: "/etc",
+                name: "resolv.conf",
+                contents: Vec::new(),
+                mode: 0o644,
+                replace: true,
+            },
+        ];
+        let staged = vec![
+            PathBuf::from("/state dir/\"quoted\"/0-init"),
+            PathBuf::from("/state dir/1-resolv.conf"),
+        ];
+        assert_eq!(
+            debugfs_script(&files, &staged)?,
+            "cd \"/legion\"\n\
+             write \"/state dir/\"\"quoted\"\"/0-init\" \"init\"\n\
+             cd \"/etc\"\n\
+             rm \"resolv.conf\"\n\
+             write \"/state dir/1-resolv.conf\" \"resolv.conf\"\n"
+        );
+        let err = debugfs_script(&files[..1], &[PathBuf::from("/a\nb")]).unwrap_err();
+        assert!(err.to_string().contains("line break"), "{err}");
+        Ok(())
+    }
+
+    /// Reads a file out of an ext4 image with debugfs (no mount, no root).
+    fn debugfs_cat(image: &Path, path: &str) -> R<Vec<u8>> {
+        let output = Command::new(debugfs_binary()?)
+            .arg("-R")
+            .arg(format!("cat {path}"))
+            .arg(image)
+            .output()?;
+        Ok(output.stdout)
+    }
+
+    /// The `stat` debugfs prints for one guest path.
+    fn debugfs_stat(image: &Path, path: &str) -> R<String> {
+        let output = Command::new(debugfs_binary()?)
+            .arg("-R")
+            .arg(format!("stat {path}"))
+            .arg(image)
+            .output()?;
+        Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+    }
+
+    /// The real thing: format a base, then write one sandbox's files into
+    /// it with debugfs and read them back.
+    #[cfg(unix)]
+    #[test]
+    fn the_payload_is_written_into_a_formatted_disk() -> R<()> {
+        if mkfs_binary().is_err() || debugfs_binary().is_err() {
+            return Ok(()); // e2fsprogs not installed on this machine.
+        }
+        let work = tempfile::tempdir()?;
+        let tree = work.path().join("tree");
+        std::fs::create_dir_all(tree.join("etc"))?;
+        std::fs::write(tree.join("etc/hostname"), b"image-host\n")?;
+        std::os::unix::fs::symlink(
+            "/run/systemd/resolve/stub-resolv.conf",
+            tree.join("etc/resolv.conf"),
+        )?;
+        let agent = work.path().join("legion-guest");
+        std::fs::write(&agent, b"static guest")?;
+        let facts = install_guest_base(&tree, &GuestBinary::at(agent, true)?)?;
+        let disk = work.path().join("rootfs.img");
+        format_root_disk(&tree, &disk, 8)?;
+
+        let payload = GuestPayload {
+            command: vec!["/bin/true".into()],
+            env: BTreeMap::from([("SECRET".to_string(), "s3cr3t".to_string())]),
+            relay: true,
+            cwd: Some("/work dir".into()),
+            ..GuestPayload::default()
+        };
+        let files = guest_payload_files(&payload, "legion-sbx-9", &facts);
+        let staging = work.path().join("payload stage");
+        inject_guest_payload(&disk, &files, &staging)?;
+        assert!(!staging.exists(), "the staged copies are removed");
+
+        assert!(String::from_utf8_lossy(&debugfs_cat(&disk, "/legion/env")?).contains("s3cr3t"));
+        assert_eq!(debugfs_cat(&disk, "/legion/cwd")?, b"/work dir");
+        assert_eq!(debugfs_cat(&disk, "/etc/hostname")?, b"legion-sbx-9\n");
+        assert!(
+            String::from_utf8_lossy(&debugfs_cat(&disk, "/etc/resolv.conf")?)
+                .contains("nameserver 127.0.0.1")
+        );
+        assert_eq!(debugfs_cat(&disk, "/legion/legion")?, b"static guest");
+        let env = debugfs_stat(&disk, "/legion/env")?;
+        assert!(env.contains("Mode:  0600"), "{env}");
+        assert!(env.contains("User:     0   Group:     0"), "{env}");
+        assert!(debugfs_stat(&disk, "/legion/init")?.contains("Mode:  0755"));
+
+        // A second write of the same files fails loudly: debugfs exits 0,
+        // so the stderr check is what catches it.
+        let err = inject_guest_payload(&disk, &files[..1], &staging).unwrap_err();
+        assert!(err.to_string().contains("already exists"), "{err:#}");
         Ok(())
     }
 

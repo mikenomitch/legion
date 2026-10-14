@@ -289,7 +289,10 @@ pub async fn connect_manager_client() -> R<AuthedManagerClient> {
 /// A client for the manager at `address`. The connection opens on the first
 /// call, so a manager that cannot be reached fails that call with
 /// `Unavailable`, which the `--json` envelope reports like any other error.
-fn connect_manager_client_at(address: &str, timeouts: ClientTimeouts) -> R<AuthedManagerClient> {
+pub fn connect_manager_client_at(
+    address: &str,
+    timeouts: ClientTimeouts,
+) -> R<AuthedManagerClient> {
     let address = address.to_owned();
     let mut endpoint = Endpoint::from_shared(address.clone())
         .with_context(|| format!("invalid manager address: {address}"))?

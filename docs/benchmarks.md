@@ -25,6 +25,11 @@ the comparison fair.
 - **Fast recovery.** When a quarter of a 5,000-node fleet died at once,
   Legion replaced every orphaned allocation in 27 seconds, against 111 for
   Nomad. At 10,000 nodes it replaced 6,258 allocations in under 50 seconds.
+- **MicroVM sandboxes ready in about 200 ms.** Session sandboxes on real KVM
+  went from create to a guest that takes exec in 180 to 230 ms, and four
+  4-vCPU workers booted 160 in 2.3 seconds, with no write to the replicated
+  store. That rig and its projections are in [Sandboxes at
+  scale](sandboxes-at-scale.md#measured-on-aws), not on this page.
 
 ## The rig
 

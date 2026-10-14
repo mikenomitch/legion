@@ -68,6 +68,7 @@ fn keyed_job(pool: Option<&str>) -> JobConfig {
                 storage: None,
                 envelope: None,
                 promote: None,
+                placement: None,
                 fence_after: None,
             }),
             ..TaskConfig::new(TASK, "noop")

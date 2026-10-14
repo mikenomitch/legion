@@ -489,17 +489,16 @@ struct TemplateRunRecord {
 // `Status` is a large error type, but these helpers mirror the gRPC handlers
 // that call them (which return `Result<_, Status>` throughout this file).
 fn keyed_job_config(store: &Store, job_id: &str) -> Result<JobConfig, Status> {
-    let job = store
-        .get_job(job_id)
+    // One read for both rows: a session create runs this per start.
+    let (status, config) = store
+        .job_status_and_latest_config(job_id)
         .map_err(|e| map_store_error("Error loading job", e))?;
-    if job.status == "stopped" {
+    if status == "stopped" {
         return Err(Status::failed_precondition(format!(
             "job {job_id} is stopped; run it before creating instances"
         )));
     }
-    store
-        .get_job_config(job_id)
-        .map_err(|e| map_store_error("Error loading job config", e))
+    Ok(config)
 }
 
 /// Resolve the single keyed-mode stateful task an instance-create request
@@ -14216,6 +14215,7 @@ mod tests {
                 storage: None,
                 envelope: None,
                 promote: None,
+                placement: None,
                 fence_after: None,
             }),
             ..aws_identity_task("db")
@@ -14485,6 +14485,7 @@ mod tests {
                 }),
                 envelope: None,
                 promote: None,
+                placement: None,
                 fence_after: None,
             }),
             ..TaskConfig::new("db", "noop")
@@ -18492,6 +18493,7 @@ mod tests {
                 }),
                 envelope: None,
                 promote: None,
+                placement: None,
                 fence_after: None,
             }),
             ..TaskConfig::new(name, "noop")

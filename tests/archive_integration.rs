@@ -294,6 +294,7 @@ fn job(archive: &str, on_restore_failure: Option<&str>) -> JobConfig {
             storage: None,
             envelope: None,
             promote: None,
+            placement: None,
             fence_after: None,
         }),
         suspend: Some(SuspendConfig {

@@ -253,6 +253,7 @@ fn task(runtime: &str, storage: bool) -> TaskConfig {
             }),
             envelope: None,
             promote: None,
+            placement: None,
             fence_after: None,
         }),
         ..TaskConfig::new(TASK, runtime)

@@ -839,6 +839,46 @@ Session starts on the node ([session-mode.md](session-mode.md)) add two:
   node started from a session ticket (`Worker.StartSession`), not counting
   deduplicated retries.
 
+Every task start on the node adds one histogram:
+
+- **`legion_task_start_stage_seconds{runtime,stage}`** (histogram): wall-clock
+  time of each stage of a task start, from the moment the node has the work
+  to the moment the workload is healthy. It is the place to look when starts
+  are slow, because it says which stage is slow. Buckets run from 1 ms to
+  2 minutes.
+
+  | `stage` | What it times | Recorded for |
+  | --- | --- | --- |
+  | `staging` | Artifact staging, including a restore's snapshot fetch, on its own thread | Tasks with artifacts (every container image when `containerImageDesugar` is on) |
+  | `volumes` | Volume mounts, including a restore's volume rollback | Tasks with volumes |
+  | `prepare` | Artifact consumption and the runtime's `prepare` | Every start |
+  | `start` | The runtime's `start`. The process or VMM is spawned when it returns | Every start that is not a restore |
+  | `restore` | A restore from a checkpoint, in place of `start` | Restores |
+  | `register` | From `start` returning to the start being recorded: the wait for the worker's task lock, and the state-file write | Every start |
+  | `total` | From the node having the work to the start being recorded. Every stage above falls inside it | Every start |
+  | `health` | From the start being recorded to the first passing check | Tasks with `boot` or `health` checks |
+
+  The sandbox runtime also reports its own sub-stages of `start`, in order:
+  `network` (the guest's TAP device and address lease, TAP sandboxes only),
+  `image` (the kernel and the image's OCI layout and config), `root_disk`
+  (the root disk's fingerprint, then a reuse or a build), `vmm_config` (a
+  checkpoint launch's device links and identity disk, the balloon, and the
+  VMM's config), and `vmm_spawn` (spawning the VMM). The guest boots after
+  `vmm_spawn`, so the guest's own boot falls inside `health`.
+
+  Stages nest, so don't sum them across `stage`. A restart in place (a
+  failed health check under `onUnhealthy`) is timed as a start of its own,
+  with `start`, `register`, and `total`. For a claim held at the `stage` gate
+  ([edge-boot.md](edge-boot.md)), `total` includes the wait for its
+  ratification. The worker also logs one `Task allocation started` line per
+  start with the same breakdown in milliseconds, for a single slow start:
+
+  ```text
+  INFO Task allocation started allocation_id=4312 task_name=box task_runtime=sandbox
+    total_ms=2611 stages="staging=1204ms prepare=1ms image=2ms root_disk=1380ms
+    vmm_config=1ms vmm_spawn=3ms start=1389ms register=2ms"
+  ```
+
 #### Simulated fleets
 
 `legion start worker --simulate N`

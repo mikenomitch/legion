@@ -670,8 +670,17 @@ async fn unnamed_sessions_start_with_no_raft_entry_until_the_envelopes_fill_test
     );
     assert!(cluster.store().list_instances(&cluster.job)?.is_empty());
 
+    // The router's view now says every envelope is full. It still asks the
+    // least full node once (the view may be behind on stops), and the
+    // node's own admission, faked here, refuses.
+    cluster.node("n1").lock().full = true;
+    cluster.node("n2").lock().full = true;
     let full = cluster.create(None).await.expect_err("no room left");
     assert_eq!(full.code(), Code::ResourceExhausted, "{full:?}");
+    assert!(
+        full.message().contains("no node accepted"),
+        "the refusal is the node's: {full:?}"
+    );
     assert_eq!(cluster.raft_entries(), before);
     Ok(())
 }
@@ -1284,6 +1293,169 @@ async fn session_start_latency_measure() -> R<()> {
     );
     println!("raft entries +{}", cluster.raft_entries() - before);
     assert_eq!(cluster.raft_entries(), before);
+    Ok(())
+}
+
+/// Where the control plane's share of a routed session start goes: each
+/// step of `CreateInstance` on a session task timed on its own, then the
+/// router and the whole call, against fake nodes on loopback mTLS. The
+/// steps are the job lookup, the worker client (node row and cluster CA),
+/// building the start payload, the `PostWork` round trip, and the router's
+/// pick and record. Prints the median and mean of each. Run with
+/// `cargo test --release --test session_integration -- --ignored --nocapture
+/// session_start_cost_breakdown_measure`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "measurement; prints numbers"]
+async fn session_start_cost_breakdown_measure() -> R<()> {
+    use prost::Message;
+    use std::time::{Duration, Instant};
+    const ROUNDS: usize = 2_000;
+    let names: Vec<String> = (0..16).map(|index| format!("n{index:02}")).collect();
+    let names: Vec<&str> = names.iter().map(String::as_str).collect();
+    // 380 sessions per envelope: room for every start below.
+    let cluster = Cluster::with_sizes(
+        "agents-breakdown",
+        &names,
+        json!({ "cpu": 1900, "memory": 60000 }),
+        json!({ "cpu": 5, "memory": 128 }),
+    )
+    .await?;
+    let store = cluster.store();
+    let report = |label: &str, mut samples: Vec<Duration>| {
+        samples.sort();
+        let mean = samples.iter().sum::<Duration>() / samples.len() as u32;
+        println!(
+            "{label:<44} p50 {:>7.1} us  mean {:>7.1} us",
+            samples[samples.len() / 2].as_secs_f64() * 1e6,
+            mean.as_secs_f64() * 1e6
+        );
+    };
+    let time = |label: &str, step: &mut dyn FnMut()| {
+        for _ in 0..50 {
+            step();
+        }
+        let samples = (0..ROUNDS)
+            .map(|_| {
+                let at = Instant::now();
+                step();
+                at.elapsed()
+            })
+            .collect();
+        report(label, samples);
+    };
+
+    let job = cluster.job.clone();
+    time("job and its latest config", &mut || {
+        store.job_status_and_latest_config(&job).expect("job");
+    });
+    let plane = legion::manager::worker_plane::WorkerPlane::global();
+    time("worker client (node row, CA, channel)", &mut || {
+        let node = store.cached_node("n03").expect("read model").expect("node");
+        let target = legion::manager::worker_plane::WorkerTarget::for_node(&node).expect("target");
+        plane.client_for(store, &target).expect("client");
+    });
+    let (_, config) = store.job_status_and_latest_config(&job)?;
+    let task = config
+        .tasks
+        .iter()
+        .find(|task| task.name == TASK)
+        .cloned()
+        .context("session task")?;
+    let build = |session_id: &str| {
+        let identity = legion::structs::Instance {
+            instance_id: session_id.to_string(),
+            job_id: config.name.clone(),
+            group: task.group.clone(),
+            task_name: task.name.clone(),
+            mode: legion::structs::InstanceMode::Session,
+            state: legion::structs::InstanceState::Pending,
+            slot_index: None,
+            current_alloc_id: None,
+            storage_handle: None,
+            created_at: String::new(),
+            updated_at: String::new(),
+            restore_from: None,
+            identity_epoch: 0,
+            named: false,
+            promoted_from: None,
+        };
+        let allocation = legion::structs::Allocation {
+            id: 0,
+            status: "provisional".into(),
+            resources: task.resources.clone(),
+            node_id: "n03".to_string(),
+            job_config_id: config.id(),
+            task_config_id: 1,
+            job_id: config.name.clone(),
+            instance_id: Some(session_id.to_string()),
+            network: None,
+        };
+        legion::manager::dispatcher::build_task_allocation_with(
+            &task,
+            &allocation,
+            Some(&identity),
+            &[],
+            Some(legion::structs::ProvisionalAllocation {
+                claim_id: legion::structs::session::session_claim_id(session_id),
+                gate: legion::structs::edge_boot::Gate::Serve.to_wire(),
+                instance_id: session_id.to_string(),
+                origin: "manager".into(),
+                on_refused: "stop".into(),
+                session: Some(legion::structs::SessionStart {
+                    lease_issued_at_unix_ms: 1,
+                }),
+                ..Default::default()
+            }),
+        )
+        .expect("payload")
+    };
+    time("mint an id and build the start payload", &mut || {
+        build(&legion::structs::mint_session_id(TASK, "n03"));
+    });
+    let payload = build(&legion::structs::mint_session_id(TASK, "n03"));
+    println!(
+        "{:<44} {} bytes",
+        "start payload on the wire",
+        payload.encoded_len()
+    );
+
+    let node = store.cached_node("n03")?.context("node")?;
+    let target = legion::manager::worker_plane::WorkerTarget::for_node(&node)
+        .map_err(|status| anyhow::anyhow!("{status}"))?;
+    let mut client = plane.client_for(store, &target)?;
+    let mut samples = Vec::with_capacity(ROUNDS);
+    for round in 0..ROUNDS + 50 {
+        let mut start = payload.clone();
+        if let Some(provisional) = start.provisional.as_mut() {
+            provisional.instance_id = legion::structs::mint_session_id(TASK, "n03");
+        }
+        let at = Instant::now();
+        client
+            .post_work(PostWorkRequest {
+                allocation: Some(start),
+            })
+            .await?;
+        if round >= 50 {
+            samples.push(at.elapsed());
+        }
+    }
+    report("PostWork round trip (fake node)", samples);
+
+    let mut samples = Vec::with_capacity(ROUNDS);
+    for _ in 0..ROUNDS {
+        let at = Instant::now();
+        legion::manager::sessions::start(store, &config, &task, None).await?;
+        samples.push(at.elapsed());
+    }
+    report("router start (pick, send, record)", samples);
+
+    let mut samples = Vec::with_capacity(ROUNDS);
+    for _ in 0..ROUNDS {
+        let at = Instant::now();
+        cluster.create(None).await?;
+        samples.push(at.elapsed());
+    }
+    report("CreateInstance on a session task", samples);
     Ok(())
 }
 
