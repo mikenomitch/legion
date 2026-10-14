@@ -1677,6 +1677,10 @@ struct KvDebounceState {
     flush_scheduled: bool,
 }
 
+/// The trust bundle's pins and when they were read (see
+/// `ManagerDaemonService::cluster_ca_pins`).
+type CachedCaPins = (Vec<String>, std::time::Instant);
+
 #[derive(Debug)]
 pub struct ManagerDaemonService {
     pub store: Store,
@@ -1730,7 +1734,7 @@ pub struct ManagerDaemonService {
     /// The trust bundle's pins, for `HeartbeatReply.cluster_ca_pins`,
     /// re-read at most every few seconds: they change only when the CA does,
     /// and the heartbeat path must not ask the CA provider per beat.
-    ca_pin_cache: Arc<Mutex<Option<(Vec<String>, std::time::Instant)>>>,
+    ca_pin_cache: Arc<Mutex<Option<CachedCaPins>>>,
     /// Heartbeat cadence settings (`heartbeat`, docs/heartbeat-cadence-and-scale.md).
     /// Read by the cadence report; the served interval itself comes from the
     /// status checker's ladder through the liveness table.

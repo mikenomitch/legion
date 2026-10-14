@@ -117,7 +117,7 @@ pub fn test_provider(candidate: &Candidate) -> Vec<ProviderCheck> {
                         signer
                             .sign(csr, spec)
                             .map(|(leaf, _)| format!("{leaf}{chain}"))
-                            .map_err(|err| CaError::Internal(err))
+                            .map_err(CaError::Internal)
                     });
                     (view, signer)
                 }),
