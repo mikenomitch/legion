@@ -112,7 +112,36 @@ fn linux_platform_resolver(manifests: &[ImageIndexEntry]) -> Option<String> {
 /// ORAS artifacts (`mediaType`) are not container rootfs and keep the host
 /// platform default, since a platform-indexed ORAS artifact is meant for the
 /// machine fetching it.
-fn oci_client(protocol: ClientProtocol, for_image: bool) -> Client {
+///
+/// Clients are shared, one per protocol, platform selection, and credential,
+/// and driven by one runtime ([`blocking_runtime`]). A client built per call
+/// loaded the host's CA bundle, opened new TLS connections, and asked the
+/// registry for a new bearer token every time, so resolving a tag cost a
+/// token request and a `HEAD`, each behind its own handshake, on every
+/// sandbox start. A shared one keeps its connections and its token cache.
+/// The credential is part of the key because the client caches tokens by
+/// registry and repository, not by who asked: a token minted for one job's
+/// credential must never serve another job's pull.
+fn oci_client(protocol: ClientProtocol, for_image: bool, auth: &RegistryAuth) -> Client {
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+    /// Bounds the cache for a node whose jobs use many credentials; clients
+    /// past it are built per call, as before.
+    const MAX_CLIENTS: usize = 64;
+    static CLIENTS: OnceLock<Mutex<HashMap<(bool, bool, [u8; 32]), Client>>> = OnceLock::new();
+
+    let key = (
+        protocol == ClientProtocol::Http,
+        for_image,
+        credential_fingerprint(auth),
+    );
+    let mut clients = CLIENTS
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    if let Some(client) = clients.get(&key) {
+        return client.clone();
+    }
     let mut config = ClientConfig {
         protocol,
         connect_timeout: Some(std::time::Duration::from_secs(30)),
@@ -121,14 +150,53 @@ fn oci_client(protocol: ClientProtocol, for_image: bool) -> Client {
     if for_image {
         config.platform_resolver = Some(Box::new(linux_platform_resolver));
     }
-    Client::new(config)
+    let client = Client::new(config);
+    if clients.len() < MAX_CLIENTS {
+        clients.insert(key, client.clone());
+    }
+    client
 }
 
-fn blocking_runtime() -> R<tokio::runtime::Runtime> {
-    tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .context("build oci fetch runtime")
+/// A digest of a registry credential, for the keys of [`oci_client`]'s
+/// clients and of shared tag resolutions. The credential itself is never
+/// kept beyond the client that uses it.
+fn credential_fingerprint(auth: &RegistryAuth) -> [u8; 32] {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    match auth {
+        RegistryAuth::Anonymous => hasher.update(b"anonymous"),
+        RegistryAuth::Basic(username, password) => {
+            hasher.update(b"basic\0");
+            hasher.update(username.as_bytes());
+            hasher.update(b"\0");
+            hasher.update(password.as_bytes());
+        }
+        RegistryAuth::Bearer(token) => {
+            hasher.update(b"bearer\0");
+            hasher.update(token.as_bytes());
+        }
+    }
+    hasher.finalize().into()
+}
+
+/// The runtime every OCI fetch on the node runs on. Shared, so the shared
+/// clients' pooled connections (which live on the runtime that opened them)
+/// outlive one fetch. Multi-threaded, so staging threads can `block_on` it
+/// at once.
+fn blocking_runtime() -> R<&'static tokio::runtime::Runtime> {
+    static RUNTIME: std::sync::OnceLock<Result<tokio::runtime::Runtime, String>> =
+        std::sync::OnceLock::new();
+    RUNTIME
+        .get_or_init(|| {
+            tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
+                .thread_name("oci-fetch")
+                .enable_all()
+                .build()
+                .map_err(|err| err.to_string())
+        })
+        .as_ref()
+        .map_err(|err| anyhow!("build oci fetch runtime: {err}"))
 }
 
 /// Checks descriptor sizes against the artifact size budget before any blob
@@ -199,7 +267,7 @@ impl ArtifactFetcher for OciFetcher {
         // Pinning HEADs the reference itself, so no platform is selected: a
         // multi-platform tag pins to its index digest, which is what the
         // per-node fetch then resolves a platform manifest out of.
-        let client = oci_client(protocol.clone(), false);
+        let client = oci_client(protocol.clone(), false, &auth);
         let runtime = blocking_runtime()?;
         let digest = runtime
             .block_on(client.fetch_manifest_digest(&reference, &auth))
@@ -219,7 +287,7 @@ impl ArtifactFetcher for OciFetcher {
     fn fetch(&self, req: &FetchRequest<'_>, sink: &mut ArtifactSink) -> R<FetchedArtifact> {
         let (reference, protocol) = parse_reference(req)?;
         let auth = registry_auth(req)?;
-        let client = oci_client(protocol, req.media_type.is_none());
+        let client = oci_client(protocol, req.media_type.is_none(), &auth);
         let runtime = blocking_runtime()?;
 
         match req.media_type {
@@ -231,7 +299,7 @@ impl ArtifactFetcher for OciFetcher {
                 self.fetch_oras_layers(
                     req,
                     sink,
-                    &runtime,
+                    runtime,
                     &client,
                     &reference,
                     manifest,
@@ -239,7 +307,7 @@ impl ArtifactFetcher for OciFetcher {
                     media_type,
                 )
             }
-            None => self.fetch_image_layout(req, sink, &runtime, &client, &reference, &auth),
+            None => self.fetch_image_layout(req, sink, runtime, &client, &reference, &auth),
         }
     }
 }
@@ -299,22 +367,11 @@ const TAG_RESOLUTION_MEMORY: std::time::Duration = std::time::Duration::from_sec
 /// the same credential. A pull never reuses an answer the registry gave to
 /// someone else's credential.
 fn tag_resolution_key(reference: &Reference, auth: &RegistryAuth) -> String {
-    use sha2::Digest as _;
-    let mut hasher = sha2::Sha256::new();
-    match auth {
-        RegistryAuth::Anonymous => hasher.update(b"anonymous"),
-        RegistryAuth::Basic(user, password) => {
-            hasher.update(b"basic\0");
-            hasher.update(user.as_bytes());
-            hasher.update(b"\0");
-            hasher.update(password.as_bytes());
-        }
-        RegistryAuth::Bearer(token) => {
-            hasher.update(b"bearer\0");
-            hasher.update(token.as_bytes());
-        }
-    }
-    format!("{}\0{:x}", reference.whole(), hasher.finalize())
+    let fingerprint: String = credential_fingerprint(auth)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    format!("{}\0{fingerprint}", reference.whole())
 }
 
 /// A tag's current digest for a pull that asked at `requested_at`.
@@ -747,6 +804,22 @@ fn sanitize_title(title: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Shared registry clients are keyed by credential: one job's token
+    /// cache never serves another's pull.
+    #[test]
+    fn registry_clients_are_never_shared_across_credentials_test() {
+        let basic = |user: &str, password: &str| {
+            credential_fingerprint(&RegistryAuth::Basic(user.into(), password.into()))
+        };
+        assert_eq!(basic("ci", "s3cret"), basic("ci", "s3cret"));
+        assert_ne!(basic("ci", "s3cret"), basic("ci", "other"));
+        assert_ne!(basic("ci", "s3cret"), basic("cis", "3cret"));
+        assert_ne!(
+            credential_fingerprint(&RegistryAuth::Anonymous),
+            credential_fingerprint(&RegistryAuth::Bearer("anonymous".into()))
+        );
+    }
     use crate::artifacts::fetcher::FetchLimits;
     use crate::structs::parse_artifact_source;
 
