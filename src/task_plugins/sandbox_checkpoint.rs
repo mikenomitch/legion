@@ -809,8 +809,12 @@ pub(crate) fn checkpoint_microvm(
 
 /// How long a cloud-hypervisor capture waits for an on-demand restore to
 /// finish loading the guest's memory. v53 fills it in the background within
-/// seconds of the resume, and refuses `vm.snapshot` until it has.
-const CH_RESTORING_WAIT: Duration = Duration::from_secs(60);
+/// seconds of the resume, and refuses `vm.snapshot` until it has. Short on
+/// purpose: a capture holds the worker's task-manager lock and keeps its
+/// guest paused, so one taken too soon after a restore fails fast with a
+/// clear error rather than stalling every start, stop, and heartbeat on the
+/// node.
+const CH_RESTORING_WAIT: Duration = Duration::from_secs(2);
 
 /// What cloud-hypervisor v53 answers `vm.snapshot` with while an on-demand
 /// restore is still loading memory (`VmError::VmRestoring`).
@@ -828,7 +832,7 @@ fn snapshot_cloud_hypervisor(api: &CloudHypervisorApi, dir: &Path, wait: Duratio
                 if std::time::Instant::now() >= deadline {
                     return Err(err.context(format!(
                         "cloud-hypervisor was still loading the guest's memory from its last \
-                         restore after {}s",
+                         restore after {}s; take the checkpoint again in a few seconds",
                         wait.as_secs()
                     )));
                 }

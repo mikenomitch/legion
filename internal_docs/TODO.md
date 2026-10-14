@@ -3455,12 +3455,13 @@ Plans: [stateful-workloads](plans/stateful-workloads-and-instance-identity-plan.
         other start, stop, and heartbeat on the node. Sampled with
         `/usr/bin/sample` on a worker under `legion-loadgen --mode
         sessions`.
-  - [ ] A session resuming from a checkpoint still boots under the
-        task-manager lock: the restore records its outcome on the
-        checkpoint channel from inside the locked start, so several resumes
-        on one node run one at a time and hold up its heartbeat
-        ([calls](calls/session-durability-and-routing-plan_calls.md) #45,
-        `begin_task_allocation_gated` in `src/worker/task_manager.rs`).
+  - [x] A session or instance resuming from a checkpoint boots off the
+        task-manager lock, like any other start, and the launch's finish
+        records the outcome on the checkpoint channel. Several resumes on a
+        node now run side by side, and a cloud-hypervisor that hangs
+        mid-restore holds one launch slot, not the node
+        ([calls](calls/lazy-memory-restore-plan_calls.md) #7,
+        `UnlockedLaunch` in `src/worker/task_manager.rs`).
   - [x] Phase 5a: sessions sleep on their own node with `durability =
         "local"`: `suspend.keepFor`, idle suspend, `Worker.SuspendSessions`
         / `Worker.ResumeSession` routed by tag from `instance suspend` /

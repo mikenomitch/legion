@@ -1170,15 +1170,20 @@ between forks of one checkpoint on the node.
 
 **Checkpoints right after a lazy restore.** cloud-hypervisor v53 refuses to
 snapshot a guest whose memory is still loading. A suspend, snapshot, or fork
-in the seconds after a lazy restore waits for the background fill to finish
-(up to a minute) with the guest paused, then captures as usual. Past a
-minute it fails with `cloud-hypervisor was still loading the guest's memory
-from its last restore`, and the guest is resumed. v52 has no background
-fill and does not refuse, so a capture there never waits.
+in the seconds after a lazy restore waits up to 2 s for the background fill
+to finish, with the guest paused. A capture holds up the rest of the node
+while it runs, so the wait is short. Past it the capture fails with
+`cloud-hypervisor was still loading the guest's memory from its last
+restore after 2s; take the checkpoint again in a few seconds`, and the guest
+is resumed. An idle suspend tries again on its next sweep. v52 has no
+background fill and does not refuse, so a capture there never waits.
 
 The copy restore runs inside cloud-hypervisor after its API socket is up,
 so the node waits up to five minutes for its first resume, rather than the
-ten seconds it gives other VMM calls.
+ten seconds it gives other VMM calls. A restore runs like any other start,
+without the worker's task-manager lock, so the node's other starts, stops,
+and heartbeats go on meanwhile. A cloud-hypervisor that hangs mid-restore
+holds only that sandbox's launch slot until the five minutes are up.
 
 ### Identity after a restore
 

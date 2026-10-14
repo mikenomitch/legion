@@ -571,6 +571,14 @@ pub struct UnlockedLaunch {
     /// The task's cgroup leaf, created first thing in [`Self::run`] so the
     /// task never starts outside its limits.
     pending_cgroup: Option<crate::worker::resources::PendingCgroup>,
+    /// The snapshot this launch starts from instead of booting, and the
+    /// node content store holding its parts. A restore can wait minutes on
+    /// the VMM (an eager copy of a large guest's memory), so it runs here,
+    /// with the lock released, like any other start.
+    restore: Option<crate::structs::SnapshotRestore>,
+    content_store: Option<Arc<ContentStore>>,
+    /// When the restore began, for its record on the checkpoint channel.
+    restore_started: Option<std::time::Instant>,
 }
 
 impl UnlockedLaunch {
@@ -595,6 +603,17 @@ impl UnlockedLaunch {
         // directory because its volume was still being mounted.
         if !self.volume_specs.is_empty() {
             let started = std::time::Instant::now();
+            // A restore rolls the instance volume back before anything
+            // mounts it, so the task never sees the state it is being
+            // rolled back from.
+            if let Some(restore) = &self.restore {
+                restore_snapshot_volumes(
+                    &self.volumes,
+                    &self.allocation,
+                    restore,
+                    &self.volume_specs,
+                )?;
+            }
             self.volumes.unmount_for_allocation(self.allocation.id);
             let volume_instance =
                 crate::worker::volumes::instance_ref_from_task(&self.allocation, &self.task);
@@ -635,17 +654,37 @@ impl UnlockedLaunch {
             start_stage::PREPARE,
             prepare_started.elapsed(),
         );
-        info!(
-            allocation_id = self.allocation.id,
-            task_name = %self.task.name,
-            "Starting task allocation"
-        );
         let start_started = std::time::Instant::now();
-        let started = plugin.start(&self.allocation, &self.task, &mut self.instance);
-        self.instance
-            .start_timings
-            .record(&runtime, start_stage::START, start_started.elapsed());
-        started?;
+        if let Some(restore) = self.restore.clone() {
+            self.restore_started = Some(start_started);
+            let restored = WorkerTaskManager::restore_from_snapshot(
+                plugin,
+                self.content_store.as_deref(),
+                &self.allocation,
+                &self.task,
+                &mut self.instance,
+                &restore,
+            );
+            self.instance.start_timings.record(
+                &runtime,
+                start_stage::RESTORE,
+                start_started.elapsed(),
+            );
+            restored?;
+        } else {
+            info!(
+                allocation_id = self.allocation.id,
+                task_name = %self.task.name,
+                "Starting task allocation"
+            );
+            let started = plugin.start(&self.allocation, &self.task, &mut self.instance);
+            self.instance.start_timings.record(
+                &runtime,
+                start_stage::START,
+                start_started.elapsed(),
+            );
+            started?;
+        }
         if self.claim_id.is_some() {
             // A session's row in the session log pins its process by pid and
             // start time, so a restarted worker re-adopts the right process.
@@ -4415,10 +4454,11 @@ impl WorkerTaskManager {
         // keep the locked path: their failures settle the claim (see
         // `launch_provisional_allocation`) rather than reaching the manager
         // as a failed allocation, which `record_failure` would do.
-        // A restore keeps the locked path too: it runs inside the locked
-        // start, which records its outcome on the checkpoint channel.
+        // A restore launches off the lock as well, once its parts are on the
+        // node (`restore_fetch` stages them first): a VMM restoring a large
+        // guest can take minutes, and the finish records its outcome on the
+        // checkpoint channel.
         let provisional = self.claims.by_local_key(alloc.id).is_some();
-        let restoring = self.checkpoints.restores.contains_key(&alloc.id);
         // A session launches off the lock too (session durability plan
         // §6.1): a node runs its sessions' starts side by side, and a slow
         // sandbox boot holds up no other start, stop, or heartbeat. Its
@@ -4429,7 +4469,10 @@ impl WorkerTaskManager {
             .filter(|claim| claim.is_session() && !claim.is_ratified())
             .map(|claim| claim.claim_id.clone());
         if let Some(claim_id) = session_claim {
-            if task.artifacts.is_empty() && !restoring && matches!(gate, Gate::Serve | Gate::Boot) {
+            if task.artifacts.is_empty()
+                && restore_fetch.is_none()
+                && matches!(gate, Gate::Serve | Gate::Boot)
+            {
                 self.registry
                     .load_plugin(&task.runtime, true)
                     .with_context(|| format!("Failed to load task plugin {}", task.runtime))?;
@@ -4440,7 +4483,8 @@ impl WorkerTaskManager {
                 return Ok(BeginOutcome::Launching(Box::new(launch)));
             }
         }
-        if task.artifacts.is_empty() && gate == Gate::Off && !provisional && !restoring {
+        if task.artifacts.is_empty() && gate == Gate::Off && !provisional && restore_fetch.is_none()
+        {
             self.registry
                 .load_plugin(&task.runtime, true)
                 .with_context(|| format!("Failed to load task plugin {}", task.runtime))?;
@@ -4780,6 +4824,9 @@ impl WorkerTaskManager {
             pid_start_time: None,
             runtime_returned: None,
             pending_cgroup,
+            restore: self.checkpoints.restores.get(&allocation.id).cloned(),
+            content_store: self.content_store.clone(),
+            restore_started: None,
         })
     }
 
@@ -4793,7 +4840,33 @@ impl WorkerTaskManager {
         failure_prefix: &str,
     ) -> LaunchFinish {
         let allocation_id = launch.allocation.id;
-        if self.launching.get(&allocation_id) != Some(&launch.generation) {
+        // A restore's outcome goes on the checkpoint channel, so the resume
+        // that asked for it follows `onRestoreFailure`. One stopped while it
+        // restored did not restore.
+        let cancelled = self.launching.get(&allocation_id) != Some(&launch.generation);
+        if let Some(started) = launch.restore_started {
+            if self.checkpoints.has_pending_restore(allocation_id) {
+                match (&result, cancelled) {
+                    (Ok(()), false) => {
+                        self.checkpoints
+                            .record_restore(allocation_id, true, String::new(), started)
+                    }
+                    (Err(err), _) => self.checkpoints.record_restore(
+                        allocation_id,
+                        false,
+                        format!("{err:#}"),
+                        started,
+                    ),
+                    (Ok(()), true) => self.checkpoints.record_restore(
+                        allocation_id,
+                        false,
+                        "stopped while it restored".to_string(),
+                        started,
+                    ),
+                }
+            }
+        }
+        if cancelled {
             return LaunchFinish::Cancelled(Box::new(launch));
         }
         self.launching.remove(&allocation_id);
@@ -4869,65 +4942,12 @@ impl WorkerTaskManager {
         let Some(restore) = self.checkpoints.restores.get(&allocation.id).cloned() else {
             return Ok(());
         };
-        let manifest =
-            crate::structs::checkpoint::SnapshotManifest::from_json(&restore.manifest_json)
-                .with_context(|| {
-                    format!(
-                        "snapshot {} has an unreadable manifest",
-                        restore.snapshot_id
-                    )
-                })?;
         let specs = self
             .volume_specs
             .get(&allocation.id)
             .cloned()
             .unwrap_or_default();
-        if restore.fork {
-            return self.clone_allocation_volumes(allocation, &restore, &manifest, &specs);
-        }
-        for snapshot in &manifest.volumes {
-            let mount = specs
-                .iter()
-                .find(|mount| mount.volume_id == snapshot.volume_id)
-                .with_context(|| {
-                    format!(
-                        "snapshot {} holds volume {}, which this allocation does not mount; the \
-                         instance's storage changed since the snapshot was taken",
-                        restore.snapshot_id, snapshot.volume_id
-                    )
-                })?;
-            self.volumes.restore_volume(allocation, mount, snapshot)?;
-        }
-        Ok(())
-    }
-
-    /// Phase 6: give an allocation restoring into a NEW instance (a fork, or
-    /// a create from a snapshot) its own copy of each snapshotted instance
-    /// volume, with the driver's `clone` op. The snapshot holds the origin's
-    /// volumes in mount order, which is also this allocation's order: the
-    /// two run the same task.
-    fn clone_allocation_volumes(
-        &self,
-        allocation: &Allocation,
-        restore: &crate::structs::SnapshotRestore,
-        manifest: &crate::structs::checkpoint::SnapshotManifest,
-        specs: &[crate::structs::VolumeMount],
-    ) -> R<()> {
-        let instance_volumes: Vec<&crate::structs::VolumeMount> =
-            specs.iter().filter(|mount| mount.instance_volume).collect();
-        if instance_volumes.len() != manifest.volumes.len() {
-            bail!(
-                "snapshot {} holds {} instance volume(s), but this allocation mounts {}; the \
-                 task's storage changed since the snapshot was taken",
-                restore.snapshot_id,
-                manifest.volumes.len(),
-                instance_volumes.len()
-            );
-        }
-        for (mount, snapshot) in instance_volumes.into_iter().zip(&manifest.volumes) {
-            self.volumes.clone_volume(allocation, mount, snapshot)?;
-        }
-        Ok(())
+        restore_snapshot_volumes(&self.volumes, allocation, &restore, &specs)
     }
 
     /// Start a prepared instance from a snapshot instead of booting it.
@@ -5974,6 +5994,58 @@ fn remove_dir_later(alloc_root: &std::path::Path, dir: &std::path::Path) -> bool
     true
 }
 
+/// Roll an allocation's instance volumes back to the snapshot it restores
+/// from, with the driver's `restore` op, before they mount. A fork, or a
+/// create from a snapshot, restores into a NEW instance instead: it gets its
+/// own copy of each snapshotted instance volume, with the driver's `clone`
+/// op. The snapshot holds the origin's volumes in mount order, which is also
+/// this allocation's order: the two run the same task.
+fn restore_snapshot_volumes(
+    volumes: &WorkerVolumeManager,
+    allocation: &Allocation,
+    restore: &crate::structs::SnapshotRestore,
+    specs: &[VolumeMount],
+) -> R<()> {
+    let manifest = crate::structs::checkpoint::SnapshotManifest::from_json(&restore.manifest_json)
+        .with_context(|| {
+            format!(
+                "snapshot {} has an unreadable manifest",
+                restore.snapshot_id
+            )
+        })?;
+    if restore.fork {
+        let instance_volumes: Vec<&VolumeMount> =
+            specs.iter().filter(|mount| mount.instance_volume).collect();
+        if instance_volumes.len() != manifest.volumes.len() {
+            bail!(
+                "snapshot {} holds {} instance volume(s), but this allocation mounts {}; the \
+                 task's storage changed since the snapshot was taken",
+                restore.snapshot_id,
+                manifest.volumes.len(),
+                instance_volumes.len()
+            );
+        }
+        for (mount, snapshot) in instance_volumes.into_iter().zip(&manifest.volumes) {
+            volumes.clone_volume(allocation, mount, snapshot)?;
+        }
+        return Ok(());
+    }
+    for snapshot in &manifest.volumes {
+        let mount = specs
+            .iter()
+            .find(|mount| mount.volume_id == snapshot.volume_id)
+            .with_context(|| {
+                format!(
+                    "snapshot {} holds volume {}, which this allocation does not mount; the \
+                     instance's storage changed since the snapshot was taken",
+                    restore.snapshot_id, snapshot.volume_id
+                )
+            })?;
+        volumes.restore_volume(allocation, mount, snapshot)?;
+    }
+    Ok(())
+}
+
 /// Tell every log sink an allocation started. Failures are logged, never
 /// fatal to the start.
 fn notify_sinks_started(sinks: &[Box<dyn LogSink>], resource: &LogResource) {
@@ -6236,20 +6308,31 @@ fn spawn_provisional_staging_thread(
                 // does (session durability plan §6.1): starting its runtime
                 // here, under the lock, serialized every other start, stop,
                 // and heartbeat on the node behind this one's boot. A
-                // restore keeps the locked start, which records its outcome
-                // on the checkpoint channel.
+                // restore boots off the lock too, from the parts this
+                // thread fetched: the finish records its outcome on the
+                // checkpoint channel.
                 let session = guard
                     .claims
                     .by_local_key(allocation_id)
                     .is_some_and(|claim| claim.is_session() && !claim.is_ratified());
-                let restoring = guard.checkpoints.restores.contains_key(&allocation_id);
-                if session && !restoring && matches!(gate, Gate::Serve | Gate::Boot) {
+                if session && matches!(gate, Gate::Serve | Gate::Boot) {
                     let launch = result.and_then(|staged| {
                         guard.begin_staged_launch(&job.allocation, &job.task, staged)
                     });
                     let mut launch = match launch {
                         Ok(launch) => launch,
                         Err(err) => {
+                            if guard.checkpoints.has_pending_restore(allocation_id) {
+                                guard.checkpoints.record_restore(
+                                    allocation_id,
+                                    false,
+                                    format!("{err:#}"),
+                                    std::time::Instant::now(),
+                                );
+                            }
+                            if job.restore_fetch.is_some() {
+                                guard.release_restore_fetch_pins(allocation_id);
+                            }
                             guard.kill_claim(
                                 claim_id,
                                 &format!("provisional staging failed: {err:#}"),
@@ -6260,7 +6343,16 @@ fn spawn_provisional_staging_thread(
                     launch.gate = gate;
                     launch.claim_id = Some(claim_id.to_string());
                     drop(guard);
-                    match complete_unlocked_launch(&manager, launch, "") {
+                    let finished = complete_unlocked_launch(&manager, launch, "");
+                    // The restore (if any) ran in the launch, so the fetched
+                    // parts no longer need their pins.
+                    if job.restore_fetch.is_some() {
+                        manager
+                            .lock()
+                            .expect("task manager")
+                            .release_restore_fetch_pins(allocation_id);
+                    }
+                    match finished {
                         Ok(Some((alloc, task))) => {
                             manager
                                 .lock()
@@ -6404,11 +6496,10 @@ fn spawn_staging_thread(manager: Arc<Mutex<WorkerTaskManager>>, job: StagingJob)
                 };
                 // Only the ordinary gate reaches this thread (provisional
                 // starts stage on their own), but a gated job keeps the
-                // locked path rather than silently skipping its gate. So
-                // does a restore: it runs inside the locked start, which
+                // locked path rather than silently skipping its gate. A
+                // restore takes the unlocked launch below, whose finish
                 // records its outcome on the checkpoint channel.
-                let restoring = guard.checkpoints.restores.contains_key(&allocation_id);
-                if job.gate != Gate::Off || restoring {
+                if job.gate != Gate::Off {
                     let started =
                         guard.start_staged_allocation(&job.allocation, &job.task, staged, job.gate);
                     // The restore (if any) ran inside the start above, so
@@ -6438,9 +6529,14 @@ fn spawn_staging_thread(manager: Arc<Mutex<WorkerTaskManager>>, job: StagingJob)
                 }
             };
             // The runtime calls run here, with the lock released.
-            if let Ok(Some((allocation, task))) =
-                complete_unlocked_launch(&manager, launch, START_FAILED)
-            {
+            let finished = complete_unlocked_launch(&manager, launch, START_FAILED);
+            if job.restore_fetch.is_some() {
+                manager
+                    .lock()
+                    .expect("task manager")
+                    .release_restore_fetch_pins(allocation_id);
+            }
+            if let Ok(Some((allocation, task))) = finished {
                 spawn_health_monitor(manager, allocation, task);
             }
         });
@@ -6788,7 +6884,19 @@ mod tests {
             }),
             ..volume_payload(42)
         };
-        manager.lock().unwrap().begin_task_allocation(&restore)?;
+        // A restore launches like any other start: the volume rollback and
+        // the runtime's restore run with the task-manager lock released, so
+        // a slow or hung VMM never holds up the rest of the node.
+        let outcome = manager.lock().unwrap().begin_task_allocation(&restore)?;
+        let BeginOutcome::Launching(launch) = outcome else {
+            panic!("a restore must launch off the task-manager lock");
+        };
+        assert_eq!(
+            std::fs::read(volume_dir.join("marker"))?,
+            b"after",
+            "nothing is rolled back under the lock"
+        );
+        complete_unlocked_launch(&manager, *launch, "")?;
         assert_eq!(std::fs::read(volume_dir.join("marker"))?, b"before");
         assert!(!volume_dir.join("new-file").exists());
         assert!(manager.lock().unwrap().is_allocation_active(42));
@@ -6902,7 +7010,7 @@ mod tests {
                 }),
                 ..volume_payload_for(allocation_id, volume_id)
             };
-            manager.lock().unwrap().begin_task_allocation(&payload)?;
+            launch_task_allocation(&manager, &payload)?;
             assert!(manager.lock().unwrap().is_allocation_active(allocation_id));
             let dir = mount_of(allocation_id);
             assert_ne!(dir, origin_dir, "a fork never shares the origin's volume");
@@ -7002,7 +7110,7 @@ mod tests {
             }),
             ..volume_payload(52)
         };
-        manager.lock().unwrap().begin_task_allocation(&resume)?;
+        launch_task_allocation(&manager, &resume)?;
         assert!(manager.lock().unwrap().is_allocation_active(52));
         assert_eq!(
             std::fs::read(volume_dir.join("marker"))?,
@@ -9490,20 +9598,32 @@ mod tests {
             if reaped.len() == 2 {
                 break (reaped, deferred);
             }
-            assert!(deferred.is_empty(), "a session is deferred with the rest of its pass");
+            assert!(
+                deferred.is_empty(),
+                "a session is deferred with the rest of its pass"
+            );
             std::thread::sleep(std::time::Duration::from_millis(10));
         };
-        assert_eq!(reaped, vec![(-7, ReapOutcome::Exited), (5, ReapOutcome::Exited)]);
+        assert_eq!(
+            reaped,
+            vec![(-7, ReapOutcome::Exited), (5, ReapOutcome::Exited)]
+        );
         assert_eq!(deferred.len(), 1, "only the session is deferred");
         assert!(manager.terminating_ids().is_empty());
-        assert!(manager.has_terminating(), "a reaping session still counts as stopping");
+        assert!(
+            manager.has_terminating(),
+            "a reaping session still counts as stopping"
+        );
         assert!(session_dir.exists(), "its teardown waits for the destroy");
 
         let mut reap = deferred.pop().expect("the session");
         reap.destroy();
         manager.finish_reap(reap);
         assert!(!manager.has_terminating());
-        assert!(!session_dir.exists(), "its directory goes once it is released");
+        assert!(
+            !session_dir.exists(),
+            "its directory goes once it is released"
+        );
         Ok(())
     }
 

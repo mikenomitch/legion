@@ -145,9 +145,14 @@ instead of the 10 s control timeout.
 
 - **Alternatives.** (a) Keep 10 s. (b) Poll `vm.info` until the VM
   reports it is paused and restored, then resume with the short timeout.
-- **Trade-off.** A wedged cloud-hypervisor now holds a restore (and the
-  task-manager lock) for up to five minutes before it is reaped, instead of
-  ten seconds.
+- **Trade-off.** A wedged cloud-hypervisor now holds its restore, and one
+  launch slot, for up to five minutes before it is reaped, instead of ten
+  seconds. As first ported, it also held the worker's task-manager lock that
+  long, so one hung restore could stall every start, stop, and heartbeat on
+  its node for five minutes, long enough for the managers to mark the node
+  lost. That was not acceptable, so restores now launch off the lock like
+  every other start (`UnlockedLaunch` in `src/worker/task_manager.rs`), and
+  the finish records the outcome on the checkpoint channel.
 - **Why.** cloud-hypervisor serves its API socket before the restore
   finishes and queues the resume behind it, so the 10 s timeout failed every
   copy restore longer than that: about 3 GiB on the disk in
@@ -157,24 +162,26 @@ instead of the 10 s control timeout.
   adds a polling loop to wait for the same thing. Lazy restores, the
   default, return in well under a second either way.
 
-## 8. A capture during cloud-hypervisor's background fill waits for it, paused
+## 8. A capture during cloud-hypervisor's background fill waits 2 s, then fails
 
 cloud-hypervisor v53 refuses `vm.snapshot` while an on-demand restore is
-still loading memory. Legion's capture retries for up to 60 s with the VM
-paused.
+still loading memory. Legion's capture retries for up to 2 s with the VM
+paused, then fails with a message that says to take it again.
 
 - **Alternatives.** (a) Fail the capture and let the caller retry (an idle
   suspend comes back on the next sweep, a user re-runs `snapshot create`).
   (b) Wait before pausing, by probing until the refusal stops.
-- **Trade-off.** A live snapshot or fork taken in the seconds after a lazy
-  resume pauses the guest for the rest of the fill, not the usual sub-second
-  capture. A wedged fill holds the capture for a minute.
-- **Why.** Forking right after a wake is exactly what an agent platform
-  does, and (a) turns the new default into a failed fork. cloud-hypervisor
+- **Trade-off.** A fork or snapshot taken in the first seconds after a lazy
+  resume can fail and need taking again, where a longer wait would have
+  succeeded.
+- **Why.** A capture runs under the worker's task-manager lock, so every
+  second it waits stalls every start, stop, and heartbeat on the node. The
+  first port waited up to 60 s, which a wedged fill would have turned into
+  a minute-long node stall. A short wait covers the common case of a fill
+  that is nearly done, and the failure says to try again. cloud-hypervisor
   reports "restoring" only as a refusal of the snapshot itself, so (b)
-  would mean sending snapshots to an unpaused VM to see how they fail, and
-  the fill finishes at the same moment either way. Most captures here are
-  suspends of an idle guest, where pausing early costs nothing.
+  would mean sending snapshots to an unpaused VM to see how they fail.
+  Moving captures off the lock is the real fix and is open in `TODO.md`.
 
 ## 9. Phase 1 uses each VMM's own mechanism, with no Legion page-fault handler
 
