@@ -1211,9 +1211,13 @@ How to use it:
         Today every non-node-local driver downgrades the gate to `stage`.
   - [ ] Island mode: bounded survival of unratified work across a
         control-plane outage, with its own consistency argument (plan phase 5).
-  - [ ] Ticket pre-distribution and bulk minting for warm fleets, and
-        ratification batching for a node starting many claims per second
-        (plan phase 5).
+  - [ ] Ticket pre-distribution and bulk minting for warm fleets (plan
+        phase 5). Per-node ratification batching was evaluated and deferred:
+        once ratifications stopped refusing each other, one node's claims
+        already share group-commit entries, and RPC batching would not
+        shrink the entry
+        ([ratify throughput plan](plans/edge-ratify-throughput-plan.md) §8,
+        [calls #4](calls/edge-ratify-throughput-plan_calls.md)).
   - [ ] A pre-warm push for the worker spec cache. A node today caches a task
         config once it has been dispatched an allocation of it, so an edge pool
         must run at least one allocation of a job before a ticket for it can be
@@ -1236,27 +1240,35 @@ How to use it:
   - [ ] **Ratification throughput at scale.** An edge start boots without a
         manager, but every start still needs one durable ratification
         (`ratify_claim` in `src/manager/server.rs` → `edge_boot::ratify`),
-        and that caps sustained sandboxes/sec. Nothing here is measured for
-        edge boot yet. The estimates come from the 2026-10-10 AWS scheduler
-        runs (3 × 4-vCPU managers), where the plan-commit lane took 9.2 /
-        13.5 / 23.3 ms per commit at 5k / 20k / 50k nodes. Do the load test
-        first so every later change has a before/after number. Broader than
-        the phase-5 "ratification batching" item above, which is per node.
-    - [ ] **Ratification load test (do first).** A `legion-loadgen` mode that
-          mints prefix tickets and drives `RatifyClaim` at a fixed open-loop
-          rate (reuse `--rate`) against `--simulate` nodes. Report ratify
-          p50/p99, confirmed vs refused by reason, coalescer batch size and
-          commit time on the lanes involved, and the rate where p99 crosses
-          `ratifyTimeout`. Numbers go in `benchmarks/scheduler/README.md`.
-    - [ ] **Let ratifications fill commit batches.** Ratifications go through
-          `submit_and_apply_plan_for_instance` → the plan coalescer, capped by
-          `plan_apply_batch_max` (default 16, clamped 1..=128). Evals fill
-          ~1.75 per batch, but ratifications arrive from thousands of nodes at
-          once, so 16 may be the cap: ~1,700 / 1,200 / 700 per sec at 5k / 20k
-          / 50k nodes, against ~14,000 / 9,500 / 5,500 at 128 if commit cost
-          held (it will not fully, since bigger batches commit slower).
-          Measure 16 / 64 / 128 and pick the default, or a separate
-          ratification cap, from data. Record the call.
+        and that caps sustained sandboxes/sec. Phase 1 of the
+        [ratify throughput plan](plans/edge-ratify-throughput-plan.md)
+        measured it in-process and removed the false conflicts that made
+        concurrent ratifications refuse each other (Done, below). What is
+        left needs a real cluster.
+    - [ ] **Networked ratification load test.** A `legion-loadgen --mode
+          ratify` that mints prefix tickets and drives `RatifyClaim` at a
+          fixed open-loop rate (reuse `--rate`) from `--simulate` nodes, each
+          with its own node token, against a 3-voter raft cluster on the AWS
+          rig. Report the rate where p99 crosses `ratifyTimeout`. Needs the
+          simulated fleet to expose per-node credentials. The in-process
+          harness (`tests/ratify_throughput_measure.rs`) is the ceiling it
+          should approach ([plan](plans/edge-ratify-throughput-plan.md)
+          Phase 3).
+    - [ ] **Profile the per-ratification apply.** With the false conflicts
+          gone, the confirmed rate is flat from 64 to 256 callers while
+          entries grow from about 20 to about 60 claims, so the bound is the
+          serialized work each ratification does inside the entry (about
+          2 ms of manager CPU per claim on an M5 laptop). Find where it goes
+          before touching the cap or batching
+          ([plan](plans/edge-ratify-throughput-plan.md) §8, §11).
+    - [ ] The worker never retries a refused ratification, `internal`
+          included: `drive_claim` applies every refused verdict as a kill.
+          The refusal table in [edge-boot.md](../docs/edge-boot.md) used
+          to say `internal` is retried inside the lease, and now says it is
+          not. After the ratify throughput work, `internal` means a store
+          error or an election rather than a false conflict, so this is
+          rare. Add the retry together with the `overloaded` refusal
+          below, which needs the same loop.
     - [ ] **Backpressure before lease expiry.** Unratified work is killed at
           `ratifyTimeout` (default 5s, `DEFAULT_RATIFY_TIMEOUT` in
           `src/structs/edge_boot.rs`). If ratify latency climbs past that,
@@ -5324,6 +5336,26 @@ docs: [task-runtime-plugins.md](../docs/task-runtime-plugins.md)
       is one entry and a refused ratification leaves the ticket unspent
       ([sandbox-scaling calls](calls/sandbox-scaling-plan_calls.md) #31,
       [docs](../docs/edge-boot.md)).
+- [x] **Ratifications stop refusing each other** (edge ratify throughput
+      Phase 1, 2026-10-14): [plan](plans/edge-ratify-throughput-plan.md) ·
+      [calls](calls/edge-ratify-throughput-plan_calls.md) ·
+      [docs](../docs/edge-boot.md#ratification-under-load). The networked
+      load test and the retry gap are open above.
+  - [x] Ratification load harness, in-process through the real `RatifyClaim`
+        handler with real tickets, local and single-voter raft
+        (`tests/ratify_throughput_measure.rs`, before/after numbers in the
+        plan §8 and [edge-boot.md](../docs/edge-boot.md#ratification-under-load)).
+  - [x] Ratifications fill commit batches. They already shared the instance
+        group commit (cap 64), not the plan coalescer, so
+        `plan_apply_batch_max` never applied. What kept entries from
+        filling was the job-config and node epoch fences, which refused all
+        but one ratification of a job per entry as `internal`, and the
+        handler blocking the async runtime, which held a burst to the
+        worker-thread count. A ratification is now fenced by committed
+        state inside its entry, and runs off the runtime.
+  - [x] A start for a never-existed id decides the create inside the entry,
+        so two nodes racing to create one sandbox leave one owner and a
+        loser refused `instance_claimed`, not `internal`.
 - [x] **Sandbox scaling Phases 0–3** (2026-10-12,
       [#27](https://github.com/mikenomitch/legion/pull/27)):
       [plan](plans/sandbox-scaling-plan.md) §14 ·

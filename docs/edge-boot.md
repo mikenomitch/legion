@@ -31,6 +31,7 @@ changes nothing behaves as it did before, including its wire payloads.
 - [What is never speculative](#what-is-never-speculative)
 - [What the gate does and does not stop](#what-the-gate-does-and-does-not-stop)
 - [Boot tickets](#boot-tickets)
+- [Ratification under load](#ratification-under-load)
 - [The kill path](#the-kill-path)
 - [Enabling it](#enabling-it)
 - [Observability](#observability)
@@ -428,6 +429,85 @@ back the round trip the ticket exists to avoid. In practice, keep at least
 one allocation of the job running in each edge pool, which a warm sandbox
 fleet does anyway. There is no dedicated pre-warm push.
 
+## Ratification under load
+
+Every edge start still costs the manager one ratification, so the rate at
+which one manager confirms ratifications is the ceiling on sustained edge
+starts.
+
+**What a ratification checks.** Everything is read from committed rows
+inside the ratification's own write, so nothing it checks can go stale
+between the check and the commit:
+
+- the ticket has a redemption left (the spend is in the same write)
+- the named sandbox is not owned by another allocation of this job config,
+  and is not stopped, suspended, or destroyed
+- the node is still available and still satisfies the task's constraints
+  and permit
+- the node still has room, from its free capacity rebuilt from the
+  allocations committed on it (`reservedResources` and `maxAllocations`
+  included)
+- static ports, and `distinct` constraints
+
+A ratification does **not** compare the version numbers ("epochs") that
+the scheduler's own plans use to detect that they planned against stale
+state. A ratification never planned against a snapshot, so there is
+nothing for them to detect. Starts of one sandbox job from many nodes,
+and many starts from one node, therefore do not refuse each other. They
+share writes instead: ratifications that arrive together commit as one
+scheduler-lane entry, each in its own savepoint, up to 64 per entry
+([sandboxes at scale](sandboxes-at-scale.md)).
+
+**Throughput.** Measured with the real `RatifyClaim` handler in-process
+(ticket re-verification, spend, create, bind, event, committed payload):
+one job config, 2,000 claims per cell, every claim a new sandbox, a
+4-thread manager runtime, and a fixed number of concurrent callers. The
+`raft` store is a single-voter cluster. These numbers come from an Apple
+M5 laptop (10 cores, 32 GB) shared with other build jobs, so read them as
+relative, not as a sizing figure.
+
+| Store | Claims from | Callers | Confirmed/s | p50 ms | p99 ms | Claims per entry |
+| --- | --- | ---: | ---: | ---: | ---: | ---: |
+| local | 256 nodes | 1 | 320 | 2.1 | 21 | 1.0 |
+| local | 256 nodes | 64 | 442 | 140 | 285 | 18 |
+| local | 256 nodes | 256 | 461 | 536 | 1,013 | 56 |
+| local | one node | 256 | 415 | 542 | 986 | 54 |
+| raft | 256 nodes | 1 | 174 | 4.8 | 30 | 1.0 |
+| raft | 256 nodes | 64 | 357 | 187 | 361 | 29 |
+| raft | 256 nodes | 256 | 381 | 587 | 1,161 | 61 |
+| raft | one node | 256 | 372 | 686 | 1,117 | 61 |
+
+Every claim confirmed in every cell. Two things follow from the table:
+
+- Entries fill as callers grow, but the confirmed rate barely moves past
+  64 callers. The bound is the work each ratification does inside the
+  entry, which runs one ratification after another, not the number of
+  entries. More callers past that point only add queueing to the verdict
+  latency.
+- Claims from one node confirm at about the same rate as claims spread
+  over 256 nodes, so a dense node does not need its own batching.
+
+These are ceilings for the manager's commit path. They do not include the
+network, HTTP/2, or a follower round trip in a multi-voter raft cluster,
+and one manager's whole scheduler lane is shared with placements, creates,
+and every other instance write. To reproduce them, run the ignored test
+`tests/ratify_throughput_measure.rs`:
+
+```console
+$ cargo test --release --test ratify_throughput_measure -- --ignored --nocapture
+```
+
+`LEGION_RATIFY_CLAIMS`, `LEGION_RATIFY_CONCURRENCY` (a comma list),
+`LEGION_RATIFY_BACKENDS` (`local`, `raft`), and `LEGION_RATIFY_WORKERS`
+change the cells.
+
+**What happens past the ceiling.** Ratifications queue for the scheduler
+lane, and verdict latency (`legion_provisional_ratify_seconds`) climbs.
+A claim with no verdict by its `ratifyTimeout` is killed and its start is
+refused as `expired`. Nodes do not slow their own admission when
+ratification latency climbs. Watch the p99 of
+`legion_provisional_ratify_seconds` against `ratifyTimeout`.
+
 ## The kill path
 
 Every failure ends the same way: the node kills the work.
@@ -449,16 +529,20 @@ duplicate running.
 
 ### Refusal reasons
 
-| Reason | Meaning | Retried inside the lease? |
-| --- | --- | --- |
-| `instance_claimed` | another allocation already owns this instance id | no (a lost race is final) |
-| `no_capacity` | the node no longer fits the placement, as re-validated on the fresh node row | no |
-| `ineligible` | constraints/permit fail, or the node is cordoned, draining, or lost | no |
-| `expired` | the lease ran out before a verdict arrived | no |
-| `ticket_invalid` | bad signature, wrong audience, wrong pool, expired, or a spent `jti` | no |
-| `unknown_target` | the job config, task, or instance does not exist | no |
-| `disabled` | edge boot is off on this manager | no |
-| `internal` | a store error or an election in progress | yes |
+The node kills the work on every refusal. No reason is retried inside the
+lease, so a start refused as `internal` (a store error or an election
+during the ratification) is lost, and the caller starts it again.
+
+| Reason | Meaning |
+| --- | --- |
+| `instance_claimed` | another allocation already owns this instance id (a lost race is final) |
+| `no_capacity` | the node no longer fits the placement, as re-validated on the fresh node row |
+| `ineligible` | constraints/permit fail, or the node is cordoned, draining, or lost |
+| `expired` | the lease ran out before a verdict arrived |
+| `ticket_invalid` | bad signature, wrong audience, wrong pool, expired, or a spent `jti` |
+| `unknown_target` | the job config, task, or instance does not exist |
+| `disabled` | edge boot is off on this manager |
+| `internal` | a store error or an election in progress |
 
 A worker that sees a reason it does not recognize kills the work, so version
 skew fails closed.

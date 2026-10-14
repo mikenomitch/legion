@@ -4,12 +4,13 @@
 //! **Ratification is not a new consistency mechanism.** It is the existing
 //! plan apply with the node already chosen: a plan submission with one
 //! placement and one named instance, applied through
-//! `apply_plan_submission_apply` with its epoch compare-and-set, its
-//! constraint re-validation on the fresh node row, and — critically — its
-//! `assign_stateful_instance_tx` call. If another allocation already owns
-//! `user-42`, that apply fails exactly the way it fails today, and *that
-//! failure is the refusal*. No new invariant, no second code path for
-//! correctness, and no weakening of the at-most-one guarantee.
+//! `apply_plan_submission_apply` with its constraint and capacity
+//! re-validation on the fresh node row and — critically — its
+//! `assign_stateful_instance_tx` call. It skips the epoch compare-and-set,
+//! because it never planned against a snapshot. If another allocation
+//! already owns `user-42`, that apply fails exactly the way it fails today,
+//! and *that failure is the refusal*. No new invariant, no second code path
+//! for correctness, and no weakening of the at-most-one guarantee.
 //!
 //! Two starts racing for the same instance therefore resolve the same way two
 //! concurrent plans resolve today: the store serializes them, the first binds,
@@ -25,6 +26,7 @@ use crate::structs::edge_boot::{
 };
 use crate::structs::{EdgeBootConfigFull, TaskConfig};
 use serde_json::{json, Map};
+use std::collections::BTreeMap;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 /// A ratification verdict.
@@ -130,12 +132,9 @@ pub fn ratify(
         Some((job_id.clone(), task.group.clone(), task.name.clone()))
     };
 
-    // Sampled immediately before the submit, exactly as the scheduler does:
-    // the apply refuses the plan if any of these epochs moved, which is what
-    // makes two ratifications for one instance serialize instead of
-    // double-binding.
-    let expected_versions =
-        store.allocation_version_vector_for_candidates(claim.job_config_id, &[claim.node_id])?;
+    // No version vector: the apply compares no epochs for a ratification.
+    // The instance bind, inside the entry, is what makes two ratifications
+    // for one instance serialize instead of double-binding.
     let placements = vec![(claim.node_id.to_string(), task_config_id)];
 
     let job_config_id = claim.job_config_id.to_string();
@@ -158,13 +157,20 @@ pub fn ratify(
                 }
             }
             if let Some((job_id, group, task_name)) = &create {
-                s.create_keyed_instance(job_id, group, task_name, Some(&instance_id))?;
+                // Checked again inside the entry: a batch-mate may have
+                // created this id first, and only the write connection sees
+                // its uncommitted row. Then the bind below decides, and a
+                // lost race is refused as `instance_claimed`, not as a
+                // failed create.
+                if !s.instance_exists_in_op(&instance_id)? {
+                    s.create_keyed_instance(job_id, group, task_name, Some(&instance_id))?;
+                }
             }
             let (_, outcome) = s.submit_and_apply_plan_for_instance(
                 &job_config_id,
                 "reschedule",
                 &placements,
-                &expected_versions,
+                &BTreeMap::new(),
                 &[],
                 &instance_id,
             )?;
@@ -228,12 +234,6 @@ fn classify(reason: &str) -> RefusalReason {
         || lowered.contains("cordoned, draining, or lost")
     {
         RefusalReason::Ineligible
-    } else if lowered.contains("is stale") {
-        // The epoch compare-and-set lost to a competing plan. For a claim
-        // racing on one instance this is the same fact as "someone else got
-        // there first", but the node may still be able to win a retry inside
-        // its lease, so it is reported as retryable.
-        RefusalReason::Internal
     } else {
         RefusalReason::Internal
     }
