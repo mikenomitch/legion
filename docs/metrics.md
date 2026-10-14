@@ -112,8 +112,9 @@ neighbor rules a cause in or out, and which knob to turn), see
   - `fallback`: applied, but at least one placement bound a lower-ranked
     candidate because of a race.
   - `rejected`: no candidate still fits. Causes are capacity, a late
-    constraint or cordon, or (for an edge-boot ratification only) an epoch
-    conflict.
+    constraint or cordon, or a job-config epoch conflict between two
+    scheduler plans. An edge-boot ratification never compares epochs, so
+    it is never rejected for a conflict.
 
   The outcomes are mutually exclusive. See
   [late-binding-plan-apply.md](late-binding-plan-apply.md).

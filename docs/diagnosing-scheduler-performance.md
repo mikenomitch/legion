@@ -231,7 +231,7 @@ Each reason has a different remedy, so classify before you act:
 
 | Reason | Cause | Remedy |
 | --- | --- | --- |
-| `node_epoch_moved` | A concurrent apply took the node and the placement couldn't be revalidated onto it. Only an edge-boot ratification (`target_instance`) rejects on epoch alone. | Rare. If you see many of these, look at `speculativeStart` jobs instead of `evalThreads`. |
+| `node_epoch_moved` | A concurrent apply took the node and the placement couldn't be revalidated onto it. | Rare, since pass 2 revalidates a moved node. Edge-boot ratifications never compare epochs, so they never produce this. |
 | `job_epoch_stale` | Two plans raced on one job config | Reduce concurrency. Job-config epochs are a strict all-or-nothing fence. |
 | `node_unavailable` | Cordoned, draining, or lost since the plan snapshot | This is fleet churn. Reducing `evalThreads` won't help. Find what is cordoning or losing nodes. |
 | `capacity_shrank` | A worker re-registered with smaller totals | Check worker configs and re-registrations. |
