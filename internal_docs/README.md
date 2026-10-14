@@ -183,6 +183,7 @@ When one is required and what goes in it:
 | [session-ui-plan.md](plans/session-ui-plan.md) | shipped (UI only: sessions and envelopes on the job, instance, allocation, node, and task pages, Promote and End, and bounded fetching, polling, and rendering for very large session counts; `ListInstances` paging, counts, and node/envelope filters deferred to the API) |
 | [elastic-session-envelopes-plan.md](plans/elastic-session-envelopes-plan.md) | in execution: Phase 1 built (`stateful.envelope.max` and `shrinkAfter`: each node grows and shrinks its session envelope between a floor and a ceiling, one scheduler-lane entry per resize, a shrink capped on the node first); preemptible elastic room and a fleet resize budget planned |
 | [shared-alloc-dir-proposal.md](plans/shared-alloc-dir-proposal.md) | proposal |
+| [swappable-seams-plan.md](plans/swappable-seams-plan.md) | shipped (2026-10-14: one attachment type for the datapath, one listener and dialer, the typed worker ↔ `netd` boundary, one object-storage layer, DNS on hickory-proto, the egress proxy on hyper, and the VIP and mesh-TLS fixes; the `legion netd` process split, a `NetdInput` wire encoding, GCS/Azure, and a `Vmm` trait deferred) |
 | [data-dir-env-plan.md](plans/data-dir-env-plan.md) | shipped (`LEGION_DATA_DIR`; no config-file field, by design) |
 
 ## Judgement calls
@@ -219,6 +220,7 @@ by project impact. The full template and a worked example:
 - [rootfs-base-cache-plan_calls.md](calls/rootfs-base-cache-plan_calls.md)
 - [sandbox-boot-throughput-plan_calls.md](calls/sandbox-boot-throughput-plan_calls.md)
 - [sandbox-clean-stop_calls.md](calls/sandbox-clean-stop_calls.md)
+- [swappable-seams-plan_calls.md](calls/swappable-seams-plan_calls.md)
 - [sandbox-exec-plan_calls.md](calls/sandbox-exec-plan_calls.md)
 - [sandbox-scaling-plan_calls.md](calls/sandbox-scaling-plan_calls.md)
 - [sandbox-snapshots-and-fast-start-plan_calls.md](calls/sandbox-snapshots-and-fast-start-plan_calls.md)

@@ -3370,6 +3370,17 @@ Plans: [task-runtime-plugins](../docs/task-runtime-plugins.md).
       or reclaim. [calls #12](calls/architecture-audit-2026-10-09_calls.md).
 - [ ] **Worker graceful shutdown.** The manager now handles SIGTERM (audit M3),
       the worker does not.
+- [ ] **The sandbox VMM is a closed enum matched about 76 times, and some
+      matches guess.** Several `match`es in
+      `src/task_plugins/sandbox_checkpoint.rs` (pause, resume, snapshot,
+      around lines 716-733 and 1719) send anything that is not Firecracker
+      to cloud-hypervisor's API, so a third VMM would compile and then call
+      the wrong one; and the VMM name aliases (`"fc"`, `"ch"`, ...) are
+      parsed in four places that disagree (`microvm.rs`,
+      `sandbox_checkpoint.rs`, `structs/network.rs`,
+      `manager/server/suspend_rpcs.rs`). Make the matches exhaustive and
+      parse names once now; a `Vmm` trait when QEMU or libvirt is scheduled
+      ([swappable seams plan](plans/swappable-seams-plan.md) §1).
 
 ## Rollouts
 
@@ -3616,6 +3627,12 @@ has open:
 - [ ] `legion net doctor` citing live-traffic evidence: it walks policy →
       mode → datapath status (M6) but does not yet pull the task's edges
       from the service graph (M8) into its verdict.
+- [ ] **A watchable catalog for outside load balancers and meshes.**
+      `ResolveService` is unary and `StreamEvents` carries no health
+      transitions, so an external proxy (Envoy, nginx, a Consul sync,
+      external-dns) has to poll. A `WatchService` stream, or health events on
+      `StreamEvents`, would let it follow the catalog; xDS stays out of scope
+      ([swappable seams plan](plans/swappable-seams-plan.md) §1).
 
 ## Networking
 
@@ -3816,6 +3833,23 @@ Phases 1 and 2 shipped (see Done, KV & secrets).
 - [ ] Credentials on policy objects (one key for every sandbox on a pool),
       with `UpsertNetPolicy` enforcing `kv:read` as it does for `certFrom`
       (plan §11).
+- [ ] **`ForwarderContext` is still one large type behind `Netd`.** The
+      worker now reaches the datapath only through `netd::Netd`
+      (`NetdInput` / `NetdWants` / `NetdReport`), but inside it one context
+      still holds policy, credentials, KV certificates, mesh TLS, the authz
+      cache, ledgers, and both host guards. Split it when the process split
+      lands ([swappable seams calls #2](calls/swappable-seams-plan_calls.md)).
+- [ ] **A wire encoding for `NetdInput`**, the remaining design work of the
+      `legion netd` process split (service-mesh calls 17). Secret-bearing
+      variants (credentials, KV certificates, the mesh key) must never be
+      written to `netd_state.json`, which holds only `DesiredNetwork` and
+      policy bodies.
+- [ ] **Gated namespaces of allocations that died during a worker restart
+      are never removed.** `Netd::restore` only knows the allocations that
+      survived, so it cannot tear down the others' namespaces under
+      `/var/run/netns`. Sweep `legion-*` namespaces with no desired
+      allocation on the first acknowledged heartbeat
+      ([swappable seams calls #10](calls/swappable-seams-plan_calls.md)).
 
 Datapath performance: [datapath-performance-plan.md](plans/datapath-performance-plan.md)
 · calls: [datapath-performance-plan_calls.md](calls/datapath-performance-plan_calls.md).
@@ -6331,3 +6365,30 @@ Found on the live AWS rig (3 raft managers, 2 workers). Bug fixes, so no plan.
       in `src/manager/scheduler.rs` builds `task_running` from the candidate
       nodes' rows, not the fleet, so `disruption.minAvailable` can bind
       tighter than documented when a task runs on nodes outside the pass.
+
+## Swappable seams (2026-10-14)
+
+[plan](plans/swappable-seams-plan.md) · [calls](calls/swappable-seams-plan_calls.md) · docs: [codebase-conventions.md](../docs/codebase-conventions.md#datapath-conventions), [network-handlers.md](../docs/network-handlers.md)
+
+- [x] **One attachment type for the datapath.** `netd::attach::Attachment`
+      (host, gated namespace, gated sandbox over vsock, TAP guest) is decided
+      once per allocation and carried by every listener spec; "fails closed"
+      comes from it, not from which socket path was set.
+- [x] **One listener and one dialer.** `netd::listen` (`ListenAddr`,
+      `spawn_accept_loop`, `dial_tcp`) replaces four copies of accept-loop
+      plumbing and five hard-coded dials.
+- [x] **A typed worker ↔ datapath boundary.** `netd::Netd` with
+      `NetdInput`, `NetdWants`, and `NetdReport`; spec building, status,
+      namespace capture, persistence and restore moved out of `daemon.rs`.
+      The process split itself stays open (Networking, above).
+- [x] **DNS on `hickory-proto`**, with truncated answers refetched over TCP
+      for TCP clients and `SERVFAIL` instead of a silent `1.1.1.1` fallback
+      when `resolv.conf` names no nameserver.
+- [x] **The egress proxy's HTTP on hyper.** Every request on a connection is
+      judged; a request pipelined behind an allowed one used to be spliced
+      through unchecked.
+- [x] **Mesh upstreams work.** The worker dropped the endpoint feed's
+      `mesh_tls` flag, so connect upstreams dialed mesh-TLS endpoints in
+      plaintext and were refused at the handshake (since mesh M7).
+- [x] **VIP blocks follow the node's OS.** Placement asked the manager's own
+      OS, so a macOS manager gave its Linux nodes no VIP blocks.
