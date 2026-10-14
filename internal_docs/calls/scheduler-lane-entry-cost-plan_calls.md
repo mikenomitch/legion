@@ -107,3 +107,39 @@ composite cannot serve.
 cost is index maintenance that is small next to the scan it removes. A
 switch would keep a second query path alive for nothing a user would
 choose (`AGENTS.md`: no dual code paths for the old form).
+
+## 6. The index change is a new migration, not an edit of an old one
+
+**Call.** Add the two indexes and drop `idx_allocation_instance_id` in a
+migration appended to `migration_list()`.
+
+**Alternative.** Legion has no installed base (`AGENTS.md`), so edit the
+migrations that create `instance` and `allocation` in place and add no
+migration at all.
+
+**Trade-off.** One more entry in a long migration list, and a startup
+index build on an existing store.
+
+**Why (simplicity).** The schema exists only as the replay of that list.
+`schema_version()` is its length, raft peers advertise it, and
+`table_shapes_at` rebuilds an older peer's schema by replaying a prefix of
+it. Editing an old migration would change what an old version number
+means, and `allocation` is rebuilt by later migrations that recreate
+`idx_allocation_instance_id`, so an edit far back would be undone anyway.
+Appending is how every other schema change in the file is made.
+
+## 7. The lane profiler stays out of the tree
+
+**Call.** The branch's WIP lane profiler (`src/storage/raft/lane_profile.rs`
+and its hooks in the capture, the driver, the log store, and the state
+machine) is dropped. Only the bind fix, its tests, and the `keyed_bind`
+bench ship.
+
+**Alternative.** Ship it behind an env var, so the next lane profile does
+not start from scratch.
+
+**Trade-off.** The next person who profiles the lane rebuilds the timers.
+
+**Why (simplicity).** It was marked "drop before PR" and put timing calls
+on the raft hot path. `legion_raft_*` metrics and the `keyed_bind` bench
+cover what this change needs to keep measuring.

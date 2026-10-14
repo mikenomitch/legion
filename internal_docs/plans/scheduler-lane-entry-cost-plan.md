@@ -306,4 +306,29 @@ cost grows with the task's live instances, not its parked ones.
 
 ### 14.1 Method
 
-PENDING
+`cargo bench --bench scheduler_bench -- keyed_bind --warm-up-time 1
+--measurement-time 3`, two alternating rounds of `origin/main` and this
+change, on one shared 10-core laptop (load average 6 to 8 from other
+builds), 2026-10-14. The store in the bench is plain SQLite, so `apply` is
+one execution of the plan's transaction. Under raft the capture runs that
+body and the apply runs its changeset, and the bind sits in the capture.
+
+### 14.2 `keyed_bind`
+
+One new keyed placement against `resident` placed instances and as many
+stopped ones (criterion median, then the `apply` phase mean):
+
+| resident | base | this change | base apply | this change apply |
+| --- | --- | --- | --- | --- |
+| 1,000 | 4.03 / 4.24 ms | 3.55 / 3.64 ms | 1,699 / 1,791 µs | 1,011 / 1,035 µs |
+| 5,000 | 10.06 / 10.65 ms | 7.70 / 8.05 ms | 4,392 / 4,725 µs | 1,937 / 2,069 µs |
+
+The apply phase, which is the serial lane time this change targets, drops
+by about 40% at 1,000 resident and 55% at 5,000. It still roughly doubles
+from 1,000 to 5,000 resident, because the bind still visits every *live*
+instance (§11). The rest of the plan (`tasks`, `build`) grows with the
+live population too and is untouched here.
+
+The bench's first version planned its fill in `Fresh` mode, which asks for
+one placement per live instance and fails once some are bound. It now
+plans in `Reschedule` mode, as a create's `job_reschedule` eval does.
