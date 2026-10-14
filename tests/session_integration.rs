@@ -670,8 +670,17 @@ async fn unnamed_sessions_start_with_no_raft_entry_until_the_envelopes_fill_test
     );
     assert!(cluster.store().list_instances(&cluster.job)?.is_empty());
 
+    // The router's view now says every envelope is full. It still asks the
+    // least full node once (the view may be behind on stops), and the
+    // node's own admission, faked here, refuses.
+    cluster.node("n1").lock().full = true;
+    cluster.node("n2").lock().full = true;
     let full = cluster.create(None).await.expect_err("no room left");
     assert_eq!(full.code(), Code::ResourceExhausted, "{full:?}");
+    assert!(
+        full.message().contains("no node accepted"),
+        "the refusal is the node's: {full:?}"
+    );
     assert_eq!(cluster.raft_entries(), before);
     Ok(())
 }

@@ -1030,7 +1030,17 @@ fn reserve(
     let picked = match placement {
         SessionPlacement::Spread => best_node(view, &state.in_flight, needs, tried, rng),
         SessionPlacement::Fast => two_choices(view, &state.in_flight, needs, tried, rng),
-    };
+    }
+    // The view is up to a refresh old and does not see stops, while the
+    // node is authoritative. When the view says every envelope is full, a
+    // first attempt still asks the node it thinks least full, so a view
+    // behind on stops costs one round trip, not a refusal.
+    .or_else(|| {
+        tried
+            .is_empty()
+            .then(|| least_full(view, &state.in_flight, needs))
+            .flatten()
+    });
     let node_id = picked.ok_or(NoRoom {
         envelopes: view.envelopes.len(),
     })?;
@@ -1077,6 +1087,36 @@ fn room_left(
         }
     }
     Some(left)
+}
+
+/// The envelope the view thinks has the most room once `needs` is added,
+/// even when that is less than nothing: the one node worth asking when the
+/// view finds none with room.
+fn least_full(
+    view: &RoomView,
+    in_flight: &HashMap<String, BTreeMap<String, f64>>,
+    needs: &BTreeMap<String, f64>,
+) -> Option<String> {
+    let left = |envelope: &Envelope| -> f64 {
+        let used = view.used.get(&envelope.node_id);
+        let pending = in_flight.get(&envelope.node_id);
+        needs
+            .iter()
+            .filter_map(|(name, need)| {
+                let room = *envelope.room.get(name)?;
+                let taken = used.and_then(|used| used.get(name)).copied().unwrap_or(0.0)
+                    + pending
+                        .and_then(|pending| pending.get(name))
+                        .copied()
+                        .unwrap_or(0.0);
+                (room > 0.0).then(|| (room - taken - need) / room)
+            })
+            .fold(f64::INFINITY, f64::min)
+    };
+    view.envelopes
+        .iter()
+        .max_by(|a, b| left(a).total_cmp(&left(b)))
+        .map(|envelope| envelope.node_id.clone())
 }
 
 /// `stateful.placement = "spread"`: the node with the most room left; a tie
@@ -1928,13 +1968,28 @@ mod sessions_test {
             SessionPlacement::Spread,
         )
         .expect("room");
+        // Two starts in flight fill the envelope by the view. A first
+        // attempt still asks the least full node, which is authoritative
+        // (the view may be behind on stops)...
+        let asked = reserve(
+            &store,
+            "agents",
+            "workspace",
+            &needs,
+            &[],
+            SessionPlacement::Spread,
+        )
+        .expect("the least full node is asked");
+        assert_eq!(asked.node_id, "n1");
+        drop(asked);
+        // ...and a retry, which has asked it, finds no room.
         assert_eq!(
             reserve(
                 &store,
                 "agents",
                 "workspace",
                 &needs,
-                &[],
+                &["n1".to_string()],
                 SessionPlacement::Spread
             )
             .err(),
