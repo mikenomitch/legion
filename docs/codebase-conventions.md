@@ -52,6 +52,32 @@ This page lists the conventions used across the Legion codebase.
 - Dynamic plugin paths follow `plugins/<kind>/<name>/target/release/lib<name>.<ext>`.
 - Built-in implementations can coexist with dynamic plugins of the same category.
 
+## Datapath Conventions
+
+The node datapath (connect upstreams, VIPs and per-allocation resolvers, the
+gated egress proxy, ingress listeners) lives in `src/worker/netd/` and
+`src/worker/forwarder.rs`.
+
+- The worker talks to the datapath only through `netd::Netd`: it sends
+  `NetdInput`s (the desired set, endpoint feed, and policy assignments from an
+  acknowledged heartbeat, plus the answers to fetches), asks `wants()` what to
+  fetch from the manager, and drains a `NetdReport` (denials, service-graph
+  samples, per-allocation status) for the next heartbeat. Nothing outside
+  `netd` holds the forwarder or its context.
+- How an allocation is attached — host loopback, a gated namespace, a gated
+  sandbox guest over vsock, or a TAP-wired guest — is one
+  `netd::attach::Attachment`, decided once per allocation and carried by every
+  listener spec. It says where a listener binds and whether it fails closed.
+  A new capture mode is a variant plus its arms in `Attachment::listen` and
+  `Attachment::task_dial`.
+- Listeners bind a `netd::listen::ListenAddr` (TCP, optionally inside a
+  namespace, or a VMM's vsock host socket) and run one accept loop,
+  `spawn_accept_loop`. Outbound TCP from the datapath goes through
+  `netd::listen::dial_tcp`.
+- Protocols come from libraries where one fits: hyper for HTTP, hickory-proto
+  for DNS messages, rustls for TLS. PROXY protocol v2, SOCKS5, and the VMM's
+  vsock `CONNECT` handshake are small and written by hand.
+
 ## State and Persistence
 
 - Cluster manager state is SQLite-backed and migration-managed.

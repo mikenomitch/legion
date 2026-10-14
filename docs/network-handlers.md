@@ -533,9 +533,11 @@ memory, so never in its memory checkpoints, forks, or published snapshots.
 
 ## Name-is-config: `<key>.svc.legion`
 
-On Linux, every allocation that declares upstreams gets its own loopback /24
-at placement (`127.42.<b>`, unique per node). All of 127/8 is loopback on
-Linux with no configuration. In that block:
+On a Linux node, every allocation that declares upstreams gets its own
+loopback /24 at placement (`127.42.<b>`, unique per node). All of 127/8 is
+loopback on Linux with no configuration. Placement goes by the node's `os`
+fingerprint, so a manager on macOS assigns blocks to its Linux nodes and none
+to its macOS ones. In that block:
 
 - **`.1` is the allocation's resolver**, exported as `LEGION_DNS`. It answers
   `<key>.svc.legion` (and bare `<key>`, through the `svc.legion` search
@@ -575,6 +577,16 @@ allocation's resolver; on a host whose `resolv.conf` names systemd-resolved's
 agent's relay as its resolver (`nameserver 127.0.0.1` in the guest's
 `resolv.conf`), and the agent also listens on each upstream's VIP in the
 guest, so `<key>.svc.legion` works there too (see "Sandboxes").
+
+**Forwarding.** The host's resolvers are the `nameserver` lines of the
+node's `/etc/resolv.conf`, read when the worker starts. A forwarded query
+goes to them over UDP, first answer wins. When a client asked over TCP and
+the answer came back truncated, the resolver asks the same nameserver again
+over TCP and returns the full answer. A UDP client gets the truncated answer
+and asks again over TCP itself; the resolver serves TCP on the same address.
+A node whose `resolv.conf` names no nameserver answers every name outside
+`svc.legion` with `SERVFAIL` at once, and the worker logs a warning when it
+starts. No query goes to a public resolver the operator did not name.
 
 **macOS** configures only `127.0.0.1` on `lo0`, so no VIP block is assigned
 there. Upstreams keep their loopback ports and env vars, and there is no
@@ -911,7 +923,10 @@ The proxy supports three protocols:
 
 - HTTP `CONNECT`, for TLS and other opaque traffic, checked by host and port.
 - Absolute-URI plain HTTP, also checked by the request head and forwarded in
-  origin form, one request per connection.
+  origin form on an upstream connection of its own. A client may keep its
+  connection to the proxy open or pipeline requests on it: each request is
+  checked on its own, so a request behind an allowed one is never let
+  through unchecked.
 - SOCKS5 `CONNECT`, with domain-name targets checked by name.
 
 Nothing is added to traffic through the proxy. In particular, a
