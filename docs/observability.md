@@ -20,6 +20,23 @@ configure the `tracing_subscriber` stack:
 Old files are pruned at startup: Legion keeps 7 days of `./logs` and 3 days of
 `./traces`.
 
+**A server never waits on its log readers.** On `legion start manager` and
+`legion start worker`, console lines go to an in-memory buffer of up to
+128,000 lines, and one background thread writes them to stdout. When the
+reader falls behind (journald or a container runtime under load) and the
+buffer fills, new lines are dropped. Legion does not count or report the
+dropped lines. The JSON file log under `./logs` works the same way, with its
+own buffer.
+
+The console used to be a blocking write. On a c5.metal worker starting a
+burst of 1,200 sandboxes, journald fell behind, and every thread that
+logged waited on stdout, heartbeats included. The worker sent no heartbeat
+for about 57 seconds and was marked lost, and the burst fell to 8 starts a
+second. With the buffer, the same burst ran at 293 starts a second and the
+worker stayed up. Under backpressure a server keeps its heartbeats and
+loses log lines instead. Neither the console nor the file log guarantees
+every line. Short CLI commands still write to the console directly.
+
 ## OTLP Trace Export (OpenTelemetry)
 
 Legion can export its own control-plane spans over **OTLP/HTTP** to any
