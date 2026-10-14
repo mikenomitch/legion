@@ -4,7 +4,7 @@ Measured with this rig ([README](README.md)) on `origin/main` (89229706)
 and on `perf/sandbox-scale`. The public write-up, with projections and the
 comparison with other systems, is in
 [`docs/sandboxes-at-scale.md`](../../../docs/sandboxes-at-scale.md#measured-on-aws).
-Total AWS cost for the campaign, builds included: about $7.70.
+Total AWS cost for the campaign, builds and CI runs included: about $8.10.
 
 **Setup.** One manager (c8i.large, 2 vCPU). Workers are c8i.xlarge (4 vCPU,
 8 GiB) with nested virtualization unless stated otherwise. cloud-hypervisor
