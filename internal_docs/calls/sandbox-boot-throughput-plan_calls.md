@@ -1,7 +1,7 @@
 # Judgement calls: sandbox boot throughput
 
 > Plan: [`plans/sandbox-boot-throughput-plan.md`](../plans/sandbox-boot-throughput-plan.md).
-> Entries are ranked by project impact, most impactful first; the number is
+> Entries are ranked by project impact, most impactful first. The number is
 > the rank.
 
 ## 1. One stacked change, and most of the parallel branches stay out
@@ -38,7 +38,7 @@ which the rig did not run, so its gain was not measured.
 ## 2. A sandbox session is `running` once its guest takes exec
 
 **Call.** A session launch waits, after the runtime's `start`, for
-`TaskPlugin::wait_ready`; the sandbox runtime implements it as its guest
+`TaskPlugin::wait_ready`. The sandbox runtime implements it as its guest
 agent accepting `CONNECT 1100` on the VMM's vsock socket. Only then does the
 claim reach `Serving`. The wait holds the launch slot, and gives up after 10
 seconds with a warning, reporting the session running anyway.
@@ -82,7 +82,7 @@ pay the per-byte exit on Firecracker.
 
 **Why (performance).** The serial console cost about 700 ms of a 4-vCPU
 nested guest's boot. `hvc0` costs the same as `quiet` (about 120 ms to init
-by hand) and keeps the log on CH, where most debugging happens; (a) would
+by hand) and keeps the log on CH, where most debugging happens. (a) would
 throw it away for nothing.
 
 ## 4. Every cloud-hypervisor disk is declared `image_type=raw`
@@ -98,7 +98,7 @@ config and can still hit the refusal. No installed base, so it is accepted
 and stated in the rollout note.
 
 **Why (performance, and correctness).** Without it CH probes the format and
-refuses guest writes to sector 0 of a probed raw image; ext4's mount writes
+refuses guest writes to sector 0 of a probed raw image. Ext4's mount writes
 the superblock through block 0, so every boot failed its root mount,
 panicked, and rebooted a second later. This alone took a boot from 2.8 s to
 0.95 s. Every disk Legion attaches is raw, so declaring it costs nothing.
@@ -106,7 +106,7 @@ panicked, and rebooted a second later. This alone took a boot from 2.8 s to
 ## 5. `stateful.placement` offers `spread` (default) and `fast`, and no more
 
 **Call.** One field on session tasks. `spread` is the existing most-room
-pick with in-flight reservations and random ties; `fast` is power of two
+pick with in-flight reservations and random ties. `fast` is power of two
 choices with a full-read fallback when its samples find no room.
 
 ```nickel
@@ -122,17 +122,17 @@ pick under the router's lock.
 
 **Why (performance at scale won over simplicity).** Measured, a `spread`
 pick is 31 µs on 1,000 nodes, 330 µs on 10,000, and 5.2 ms on 100,000,
-capping a manager at about 3,000 and 190 starts a second; `fast` is under a
+capping a manager at about 3,000 and 190 starts a second. `fast` is under a
 microsecond at every size. Mike asked for the choice between fastest and
 best. `spread` stays the default because it balances better on the fleets
 most clusters run. `bin_pack` (b) refused hundreds of starts per thousand
-under stale views in the simulation; locality (c) was judged
+under stale views in the simulation. Locality (c) was judged
 regime-specific.
 
 ## 6. A view that says every envelope is full asks the least full node once
 
 **Call.** When the router's view finds no room, a first attempt still sends
-the start to the node the view thinks least full; only that node's refusal
+the start to the node the view thinks least full. Only that node's refusal
 refuses the create.
 
 **Alternatives.** (a) Subtract a stop from the view when this manager
@@ -144,7 +144,7 @@ issues it. (b) Refuse on the view, as before.
 sees stops only on refresh, so at about 86% utilization it called the fleet
 full while nodes had room: 95 of 1,200 sustained starts were refused that
 way. (a) only covers stops this manager made, not edge stops or another
-manager's; asking the authoritative node covers all of them in one place.
+manager's. Asking the authoritative node covers all of them in one place.
 
 ## 7. VMMs spawn with `posix_spawn`: a process group, and a shell that joins the cgroup
 
@@ -203,7 +203,7 @@ asked.
 
 ## 10. A session's stop sends the guest's stop request off the lock, and writes no state file
 
-**Call.** The sandbox's guest stop request runs on a pooled thread; a
+**Call.** The sandbox's guest stop request runs on a pooled thread. A
 request the guest cannot take kills the VMM from there. An ended unratified
 claim never rewrites the worker's state file, on its stop or its teardown.
 

@@ -6,7 +6,7 @@
 nodes, is open in [`TODO.md`](../TODO.md). The public record is
 [`docs/sandboxes-at-scale.md`](../../docs/sandboxes-at-scale.md#measured-on-aws),
 [`docs/task-runtime-sandbox.md`](../../docs/task-runtime-sandbox.md#how-fast-a-sandbox-boots),
-and [`docs/session-mode.md`](../../docs/session-mode.md#picking-a-node); the
+and [`docs/session-mode.md`](../../docs/session-mode.md#picking-a-node). The
 measured runs are in
 [`benchmarks/aws/sandbox-boot/RESULTS.md`](../../benchmarks/aws/sandbox-boot/RESULTS.md).
 
@@ -34,7 +34,7 @@ The control plane was not the reason. Each start paid for work that had
 nothing to do with scheduling:
 
 - **Every cloud-hypervisor guest panicked on its first boot.** CH probes a
-  raw disk's format and then refuses guest writes to its sector 0; ext4's
+  raw disk's format and then refuses guest writes to its sector 0. Ext4's
   superblock write at mount failed, the kernel panicked, and `panic=1`
   rebooted it a second later.
 - **The serial console** cost about 700 ms of every boot under nested
@@ -45,13 +45,13 @@ nothing to do with scheduling:
   once the node answered.
 - **The worker serialized under churn**: a session's stop held the global
   task-manager lock through a round trip into the guest and two state-file
-  writes; a process start time read scanned all of `/proc`; each launch
+  writes. A process start time read scanned all of `/proc`. Each launch
   forked the worker and created a thread.
 
 ## Prior art
 
 - **Modal sandboxes v2** (2026): schedulers pick a worker from cached state
-  and call it directly; workers are the source of truth; no data store on the
+  and call it directly. Workers are the source of truth. No data store on the
   create path. Median under 0.5 s to user code, a million in under a minute.
   Legion's session mode is the same shape. The lesson taken here is theirs
   too: once the control plane is out of the way, the tail is per-node
@@ -60,7 +60,7 @@ nothing to do with scheduling:
   second per host, with a minimal kernel and no serial chatter: the console
   and kernel matter as much as the VMM.
 - **E2B** starts from memory snapshots (about 80 ms). Legion's numbers here
-  are cold boots; snapshot starts are a separate, opt-in layer (see the
+  are cold boots. Snapshot starts are a separate, opt-in layer (see the
   pre-warm stance below).
 - **Kubernetes** gives pod startup an SLO of p99 5 s, image pulls excluded,
   and Kata containers add a VM boot to that.
@@ -92,9 +92,9 @@ Goals:
 Non-goals:
 
 - Warm pools, memory-snapshot starts, and pre-warm pushes. Per the project's
-  stance, warming is an optimization layered on a good cold path; this plan
+  stance, warming is an optimization layered on a good cold path. This plan
   makes the cold path good and measures it alone.
-- A guest kernel of Legion's own. The kernel's size is the operator's; the
+- A guest kernel of Legion's own. The kernel's size is the operator's. The
   public doc says what it costs.
 - Any change to keyed instances' raft path.
 
@@ -121,20 +121,20 @@ stateful = {
 Everything else changes defaults and behavior, not surface:
 
 - A sandbox session reports `running` once its guest's agent takes exec.
-- cloud-hypervisor guests boot on `hvc0` with every disk declared raw;
+- cloud-hypervisor guests boot on `hvc0` with every disk declared raw.
   Firecracker guests boot `quiet` (`kernel_args = "loglevel=7"` restores the
   log).
-- Each start logs its stages; `legion_task_start_stage_seconds` gains a
+- Each start logs its stages. `legion_task_start_stage_seconds` gains a
   `ready` stage.
 - Sandbox root disks come from a per-node base cache
   ([`rootfs-base-cache-plan.md`](rootfs-base-cache-plan.md)).
 
 ## Phases
 
-1. **The boot itself** (shipped): raw disks and the console; `running` on
-   readiness; per-stage timings.
-2. **The start path** (shipped): the base root disk cache; shared registry
-   clients and one tag resolution per burst; the router's reservation,
+1. **The boot itself** (shipped): raw disks and the console. `running` on
+   readiness. Per-stage timings.
+2. **The start path** (shipped): the base root disk cache. Shared registry
+   clients and one tag resolution per burst. The router's reservation,
    random ties, least-full fallback, and `placement`.
 3. **The worker under churn** (shipped): stops off the lock and out of the
    state file, `/proc` start times, `posix_spawn` for VMMs, pooled launch
@@ -159,5 +159,5 @@ Everything else changes defaults and behavior, not surface:
 No installed base, so no migration. A cloud-hypervisor checkpoint taken
 before the disk change saved its disks without `image_type`, so a guest
 restored from one can still hit the sector-0 refusal on its next superblock
-write; take new checkpoints after upgrading. Tasks become process-group
+write. Take new checkpoints after upgrading. Tasks become process-group
 leaders rather than session leaders. The PR description lists both.

@@ -3771,9 +3771,9 @@ mod tests {
         let root_disk = scratch.join("rootfs.img");
 
         assert!(root_disk.is_file(), "root disk built");
-        assert!(args.contains(&format!("path={}", root_disk.display())));
+        assert!(args.contains(&format!("path={},image_type=raw", root_disk.display())));
         assert!(
-            args.contains(&format!("path={}", volume_img.display())),
+            args.contains(&format!("path={},image_type=raw", volume_img.display())),
             "the volume's disk image is attached as a virtio-blk device"
         );
         assert!(args

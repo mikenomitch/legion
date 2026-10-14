@@ -2427,8 +2427,12 @@ mod tests {
     }
 
     #[cfg(target_os = "linux")]
+    /// A task leads its own process group, so stopping it can signal the
+    /// group, and the worker's own group (which a terminal signals) does not
+    /// include it. It stays in the worker's session: a new session needs a
+    /// `pre_exec` hook, which would make the spawn a `fork`.
     #[test]
-    fn spawned_task_process_runs_in_own_session() -> R<()> {
+    fn spawned_task_process_leads_its_own_process_group() -> R<()> {
         let mut cmd = std::process::Command::new("sleep");
         cmd.arg("1");
         let mut child = spawn_task_process(&mut cmd)?;
@@ -2451,7 +2455,9 @@ mod tests {
             .context("invalid session in /proc stat")?;
 
         assert_eq!(pgrp, child.id());
-        assert_eq!(session, child.id());
+        // SAFETY: getsid(0) reads this process's session id.
+        let worker_session = unsafe { libc::getsid(0) } as u32;
+        assert_eq!(session, worker_session);
 
         let _ = child.kill();
         let _ = child.wait();

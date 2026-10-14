@@ -151,7 +151,7 @@ edge](#starting-at-the-edge)), so it does not apply to them.
 
 | `placement` | Picks | A pick costs | Use it for |
 | --- | --- | --- | --- |
-| `"spread"` (default) | The node with the most room left, counting the router's own starts in flight; ties at random | One read of every node holding an envelope for the task | The evenest spread, on fleets up to about a thousand nodes |
+| `"spread"` (default) | The node with the most room left, counting the router's own starts in flight. Ties at random | One read of every node holding an envelope for the task | The evenest spread, on fleets up to about a thousand nodes |
 | `"fast"` | The roomier of two nodes sampled at random from those with room | The same on any fleet size | Very large fleets, and many managers routing one task |
 
 Measured in the router (one core, half the fleet half full):

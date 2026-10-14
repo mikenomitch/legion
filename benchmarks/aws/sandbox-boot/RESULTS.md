@@ -54,7 +54,7 @@ Worker log `Task allocation started`, sequential starts on a c8i.xlarge:
 | `image` | 110 ms | 8 ms (digest), 12 to 60 ms (tag) | A tag is resolved per start: now one round trip on a kept-alive connection |
 | `root_disk` | 80 ms (extract and `mkfs`) | 10 ms XFS, 60 to 80 ms ext4 | A reflink (or sparse copy) of the node's base disk plus `debugfs` |
 | `vmm_spawn` | 10 ms | 10 ms | |
-| guest to ready | about 2.7 s | about 140 ms | Every boot panicked, slept 1 s, and rebooted; the serial console cost about 0.7 s more |
+| guest to ready | about 2.7 s | about 140 ms | Every boot panicked, slept 1 s, and rebooted. The serial console cost about 0.7 s more |
 
 ## Control plane
 

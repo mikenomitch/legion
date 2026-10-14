@@ -170,10 +170,10 @@ exec: the moment a caller can run code in it.
 
 | | Result |
 | --- | --- |
-| One boot, create to ready | 179 ms p50 with the image pinned by digest and worker state on XFS; 229 ms by tag; 212 ms on bare metal |
+| One boot, create to ready | 179 ms p50 with the image pinned by digest and worker state on XFS. 229 ms by tag. 212 ms on bare metal |
 | Burst, four 4-vCPU workers | 160 sandboxes ready in 2.33 s (69 a second), p99 0.74 s |
-| Sustained, four 4-vCPU workers | 40 boots a second with none refused (p99 0.45 s); about 56 a second at the ceiling |
-| Sustained, one 16-vCPU worker | 40 a second with none refused; about 48 at the ceiling, with the CPU 92% busy |
+| Sustained, four 4-vCPU workers | 40 boots a second with none refused (p99 0.45 s). About 56 a second at the ceiling |
+| Sustained, one 16-vCPU worker | 40 a second with none refused. About 48 at the ceiling, with the CPU 92% busy |
 | Host-process sessions through one 2-vCPU manager | about 1,300 starts a second on four workers, bound by the workers |
 | Manager memory per running session | about 1.2 KB, so 1.2 GB per million |
 | Memory per idle guest on the node | about 70 MiB of the 128 MiB it was given |
@@ -208,7 +208,7 @@ measurements of clusters that large.
 | --- | --- | --- |
 | 100 nodes of 16 vCPU, 32 GiB | about 4,800 | about 19,000 by envelope, about 35,000 by measured memory |
 | 1,000 nodes of 16 vCPU, 32 GiB | about 48,000 | about 190,000 to 350,000 |
-| 1,000 bare-metal nodes of 96 vCPU, 192 GiB | about 50,000 today (the per-node ceiling); about 290,000 if the CPU becomes the limit | about 1.2 to 2.1 million |
+| 1,000 bare-metal nodes of 96 vCPU, 192 GiB | about 50,000 today (the per-node ceiling). About 290,000 if the CPU becomes the limit | about 1.2 to 2.1 million |
 
 At 48,000 boots a second, a million sandboxes start in about 21 seconds, and
 the managers holding a million running sessions keep about 1.2 GB each in
@@ -223,7 +223,7 @@ magnitude, not a benchmark.
 
 | System | Start latency | Start rate |
 | --- | --- | --- |
-| Legion (this page) | 0.18 to 0.23 s from create to a microVM taking exec | about 48 a second per 16-vCPU node; a cluster's rate is the sum of its nodes |
+| Legion (this page) | 0.18 to 0.23 s from create to a microVM taking exec | about 48 a second per 16-vCPU node. A cluster's rate is the sum of its nodes |
 | Firecracker, as quoted | about 125 ms from VMM launch to guest user space | up to 150 microVMs a second per host ([summary](https://northflank.com/blog/what-is-aws-firecracker)) |
 | Modal sandboxes (v2, 2026) | under 0.5 s median, request to user code | 1 million in under a minute, on "many tens of thousands" of nodes ([article](https://youmind.com/landing/x-viral-articles/scaling-1-million-concurrent-sandboxes)) |
 | E2B | about 80 ms to load a sandbox from a memory snapshot ([docs](https://e2b.dev/docs/template/how-it-works)) | |

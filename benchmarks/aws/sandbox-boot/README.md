@@ -75,4 +75,4 @@ The benchmark jobs in `jobs/`:
 | `sessions-vm-pinned.ncl` | The same image pinned by digest, so no tag is resolved per start |
 | `sessions-vm-quiet.ncl` | `kernel_args = "quiet"`, from investigating the serial console's cost |
 | `sessions-vm-big.ncl` | A 24 GiB envelope that fits only `sbx-big-1` |
-| `sessions-exec.ncl`, `sessions-exec-fast.ncl` | Host processes (`exec`), to measure the control plane without a VMM; the second with `stateful.placement = "fast"` |
+| `sessions-exec.ncl`, `sessions-exec-fast.ncl` | Host processes (`exec`), to measure the control plane without a VMM. The second with `stateful.placement = "fast"` |

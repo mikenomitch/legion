@@ -371,9 +371,9 @@ legion-loadgen --mode sessions --manager http://10.0.1.5:4747 \
 ```
 
 `--wait running` times each start to `running`, which for a sandbox is its
-guest taking exec; the default, `accepted`, times it to the node's admit.
+guest taking exec. The default, `accepted`, times it to the node's admit.
 `--hold-ms` stops each session that long after it started, so a run at a
-steady rate holds a steady number of sessions; `--stop-at-end` stops what is
+steady rate holds a steady number of sessions. `--stop-at-end` stops what is
 left. The JSON summary has the counts by outcome, the achieved rate, p50 to
 max latency, completions per second, and refusals grouped by reason.
 

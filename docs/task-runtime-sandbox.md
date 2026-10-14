@@ -223,7 +223,7 @@ worker receiving a session start to the guest taking exec:
 
 | Stage | Time | What it is |
 | --- | --- | --- |
-| `image` | 8 ms pinned, 12 to 60 ms by tag | The image's layout from the node cache. A tag is resolved against its registry on every start (one round trip on a kept-alive connection); a digest needs none |
+| `image` | 8 ms pinned, 12 to 60 ms by tag | The image's layout from the node cache. A tag is resolved against its registry on every start (one round trip on a kept-alive connection). A digest needs none |
 | `root_disk` | 10 ms on XFS, 60 to 80 ms on ext4 | A reflink (or, on ext4, a sparse copy) of the [cached base](#the-root-disk-cache), plus the sandbox's own files |
 | `vmm_spawn` | about 10 ms | The VMM process |
 | `ready` | about 140 ms | The guest kernel, init, and the agent's listener |
