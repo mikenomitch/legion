@@ -557,7 +557,7 @@ How to use it:
 
 | PR | What it lands | Notes |
 | --- | --- | --- |
-| [#45](https://github.com/mikenomitch/legion/pull/45) | The remaining `perf/*` branches stacked on main: lazy memory restore, chunked checkpoints on the work stream, elastic session envelopes, edge admission control, ratification without epoch fences, the keyed bind index and fused eval settles, and the worker lock fixes. Plus what the AWS rig found: non-blocking server console logs, `speculativeStart` on the dispatch, followers answering ratifications with not-leader, the settle window for a just-ratified claim, and an edge start's own instance identity | [results](../benchmarks/aws/sandbox-boot/RESULTS.md) · [sandbox boot calls](calls/sandbox-boot-throughput-plan_calls.md) · [ratify calls](calls/edge-ratify-throughput-plan_calls.md). The 5 s restore wait and the stale ratifier cache are open below |
+| [#45](https://github.com/mikenomitch/legion/pull/45) | The remaining `perf/*` branches stacked on main: lazy memory restore, chunked checkpoints on the work stream, elastic session envelopes, edge admission control, ratification without epoch fences, the keyed bind index and fused eval settles, and the worker lock fixes. Plus what the AWS rig found: non-blocking server console logs, `speculativeStart` on the dispatch, followers answering ratifications with not-leader, the settle window for a just-ratified claim, and an edge start's own instance identity | [results](../benchmarks/aws/sandbox-boot/RESULTS.md) · [sandbox boot calls](calls/sandbox-boot-throughput-plan_calls.md) · [ratify calls](calls/edge-ratify-throughput-plan_calls.md). The 5 s restore wait is open below |
 | [#36](https://github.com/mikenomitch/legion/pull/36) | Session durability, routing, and edge starts, Phases 1–4 (concurrent node starts, `sessions.db` re-adopt, node tag in session ids and tag routing, session tickets, `Worker.StartSession`, `ListSessionNodes`, `legion session`), the session UI pass, and the sandbox spot-check and bottleneck-measurement plans. Phase 5 in progress | [plan](plans/session-durability-and-routing-plan.md) · [calls](calls/session-durability-and-routing-plan_calls.md) |
 | [#30](https://github.com/mikenomitch/legion/pull/30) | Sandbox scaling Phases 4–6: untombstoned 130-bit minted ids, `suspend.archive`, `stateful.mode = "session"` and `legion instance promote` | [plan](plans/sandbox-scaling-plan.md) §16 · [calls](calls/sandbox-scaling-plan_calls.md); sessions ship without idle sessions, identity, or a session log (calls #18) |
 | [#7](https://github.com/mikenomitch/legion/pull/7) | Read model follows SQLite in every mode: shadow check, `local_disk` changeset projection, outside-write guard, timed scrub | Bench needs a quiet-machine rerun; [plan](plans/read-model-coherence-plan.md) |
@@ -1258,13 +1258,6 @@ How to use it:
         existing `leader_forward` layer proxies it, and keep the node's
         leader cache for the one-hop path
         ([calls #2](calls/edge-ratify-throughput-plan_calls.md)).
-  - [ ] **The ratifier never drops a manager that stops answering.** It
-        clears its cached manager only on a not-leader answer. If that
-        manager goes away (a transport error), every later ratification on
-        the node fails `internal` with `ratification call failed` until it
-        comes back or the worker restarts. Treat a transport error like
-        not-leader: clear the cache and try the others. Listed under Known
-        limitations in [edge-boot.md](../docs/edge-boot.md#known-limitations).
   - [ ] A pre-warm push for the worker spec cache. A node today caches a task
         config once it has been dispatched an allocation of it, so an edge pool
         must run at least one allocation of a job before a ticket for it can be

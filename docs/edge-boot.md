@@ -535,12 +535,16 @@ that manager may be a follower.
   and does not judge the claim. It answers `FailedPrecondition` with `this
   manager is not the raft leader…`, writes nothing, and leaves the ticket
   unspent.
-- **The node asks the leader.** On that answer, the node tries the other
-  managers it knows, in order, and keeps sending ratifications to the first
-  one that ratifies until that one also answers not-leader. The retries
-  count against the claim's `ratifyTimeout`. If every manager answers
-  not-leader, as during an election, the node kills the claim, and the
-  start is refused `internal` with `ratification call failed`.
+- **The node asks the leader.** On that answer, or when the call never
+  reached the manager (`Unavailable`), the node tries the other managers it
+  knows, in order, and keeps sending ratifications to the first one that
+  ratifies. It drops that one when it answers not-leader or stops
+  answering. A call that timed out is not retried elsewhere, because the
+  leader may have ratified it already and a second ratification would be
+  refused. The retries count against the claim's `ratifyTimeout`. If every
+  manager answers not-leader, as during an election, the node kills the
+  claim, and the start is refused `internal` with `ratification call
+  failed`.
 - **A just-ratified claim survives a stale desired set.** A node stops work
   that its heartbeat's desired set does not list (see [The kill
   path](#the-kill-path)). A follower that has not applied a ratification
@@ -855,10 +859,9 @@ Upgrade managers in the usual order ([`docs/upgrades.md`](upgrades.md)).
   every manager was given the same `workloadIdentity.issuer`. A manager with
   a different value mints tickets that nodes refuse with `InvalidIssuer`,
   and nodes follow whichever manager answered their latest heartbeat.
-- **A node sticks with the manager that last ratified.** It moves on only
-  when that manager answers not-leader. If that manager stops answering at
-  all, the node's ratifications fail with `ratification call failed` until
-  it answers again or the worker restarts.
+- **A ratification that timed out is not retried on another manager.** The
+  leader may have ratified it, so the node kills the claim instead
+  (`ratification call failed`), and the caller starts it again.
 - **No island mode.** An unratified start that cannot reach a manager dies
   when its lease expires. Edge boot does not keep work running through a long
   control-plane outage.

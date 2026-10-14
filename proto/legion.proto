@@ -2031,6 +2031,11 @@ service Manager {
   // allocation id (the worker opens the network and the work becomes a normal
   // allocation), `refused` carries a machine-readable reason the worker kills
   // the work with.
+  //
+  // Only the raft leader ratifies. A follower answers `FAILED_PRECONDITION`
+  // ("this manager is not the raft leader…") instead of a verdict. It wrote
+  // nothing and the ticket is unspent, so the caller sends the same request
+  // to the leader.
   rpc RatifyClaim (RatifyClaimRequest) returns (RatifyClaimReply);
 }
 
@@ -10683,8 +10688,8 @@ message TaskAllocation {
   // `speculativeStart` block. A node caches each task config it is
   // dispatched and redeems boot tickets against that cache
   // (docs/edge-boot.md, "The spec cache"), and the task's own mode caps how
-  // far an edge start may get, so without this a node read every task as
-  // `off` and refused every edge start of it.
+  // far an edge start may get: a node that receives it empty treats the task
+  // as `off` and refuses its edge starts.
   string task_speculative_start = 33;
 }
 

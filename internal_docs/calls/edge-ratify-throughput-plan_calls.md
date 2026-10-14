@@ -94,10 +94,12 @@ general, which entry 4 declined.
 it, but a CLI or a third-party ratifier gets `FailedPrecondition` and must
 find the leader itself (open in `TODO.md`). The first ratification after a
 leader change pays one wasted round trip per manager tried, inside the
-claim's lease. The cached manager is dropped only on a not-leader answer,
-so one that stops answering at all fails every later ratification on that
-node until it comes back or the worker restarts. The public doc lists that
-as a known limitation, and it should be fixed in the ratifier.
+claim's lease. A call that timed out is not retried on another manager,
+because the leader may have ratified it and a second ratification would be
+refused and kill the winner. That claim dies, and its caller starts it
+again. Only a not-leader answer or a call that never connected
+(`Unavailable`) moves on, and any unreachable answer drops the cached
+manager.
 
 **Why (performance, then simplicity).** A forwarded ratification runs
 twice. The follower's handler verifies the ticket and tries the write

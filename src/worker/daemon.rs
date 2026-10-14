@@ -1288,10 +1288,22 @@ impl crate::worker::server::ClaimRatifier for ManagerClaimRatifier {
         let attempt = self
             .credentials
             .attach(tonic::Request::new(request.clone()));
+        // Another manager is asked only when this one certainly did nothing:
+        // it is not the leader, or the call never reached it. After a
+        // timeout the leader may have ratified already, and a second
+        // ratification would be refused and kill a sandbox that won.
         let status = match first.ratify_claim(attempt).await {
             Ok(reply) => return Ok(reply.into_inner()),
-            Err(status) if is_not_leader(&status) => status,
-            Err(status) => return Err(status.into()),
+            Err(status) if is_not_leader(&status) || status.code() == tonic::Code::Unavailable => {
+                status
+            }
+            Err(status) => {
+                if crate::worker::managers::is_unreachable(&status) {
+                    // Do not keep sending claims to a manager that went away.
+                    *self.leader.lock().await = None;
+                }
+                return Err(status.into());
+            }
         };
         *self.leader.lock().await = None;
         for addr in self.managers.known() {
@@ -1310,7 +1322,11 @@ impl crate::worker::server::ClaimRatifier for ManagerClaimRatifier {
                     *self.leader.lock().await = Some((addr, client));
                     return Ok(reply.into_inner());
                 }
-                Err(status) if is_not_leader(&status) => continue,
+                Err(status)
+                    if is_not_leader(&status) || status.code() == tonic::Code::Unavailable =>
+                {
+                    continue
+                }
                 Err(status) => return Err(status.into()),
             }
         }
