@@ -37,13 +37,60 @@ from the host's stamps, not from the client.
 | --- | --- | --- | --- | --- |
 | c8i.xlarge, 4 vCPU, nested | about 17 | about 10/s | about 14/s | CPU (guest boot and KVM exits) |
 | c8i.4xlarge, 16 vCPU, nested | 54 | 40/s | about 48/s | CPU, 92% busy: 53% guest, 26% host kernel |
-| c5.metal, 96 vCPU, bare metal | 48 (1,000 in 20.7 s) | under 100/s offered | about 47/s | Contention in the worker: the host was about 90% idle |
+| c5.metal, 96 vCPU, bare metal | 246 (state on EBS), 317 to 342 (state in RAM) | 150/s (EBS), 200/s (RAM) | about 175/s (EBS), 205 to 245/s (RAM) | Root disks: EBS IOPS, or the per-sandbox clone and file write |
 
-On metal a single boot takes 0.21 s (create to ready, p50), but the node
-does not turn its 96 cores into more boots: starts wait on the worker's
-task-manager lock (`register` up to 1.8 s) and on process spawns (`vmm_spawn`
-up to 2.6 s) while the CPUs idle. That per-node ceiling of about 50
-boots a second is the first thing to fix next (internal_docs/TODO.md).
+The c5.metal row is the second metal campaign below. The first, on an
+earlier build of this branch, measured about 48 a second with the CPUs about
+90% idle, with starts waiting on the worker's task-manager lock and on
+process spawns.
+
+## Bare metal, second campaign (2026-10-14)
+
+One c5.metal worker (96 vCPU, 192 GiB, us-east-1f, spot), the manager on a
+c8i.large, and the loadgen on the worker itself (no c8i.xlarge capacity in
+the AZ). `jobs/sessions-vm-metal.ncl`, edge starts (`--via edge`), 2 s
+sessions for the sustained runs, `edgeBoot.launchConcurrency = 384`. "EBS"
+is worker state on XFS in a loop file on the gp3 root volume (6,000 IOPS,
+`xfs.sh`). "RAM" is the same XFS image copied to tmpfs, standing in for
+local NVMe.
+
+Current `main` (PR #43) and with the worker lock fixes, state in RAM:
+
+| | `main` | lock fixes |
+| --- | --- | --- |
+| One boot, p50 | 187 ms | 193 ms |
+| Burst of 1,200 (concurrency 384) | 317/s, p99 1.94 s | 342/s, p99 1.51 s |
+| 200/s offered | 198/s, none refused | 181/s, none refused |
+| 300/s offered | 207/s, 591 refused | 204/s, 912 refused |
+| 400/s offered | 180/s, 2,266 refused | 163/s, 2,807 refused |
+
+`main` with state on EBS: a burst of 1,200 at 246/s, 150/s sustained with
+none refused, about 175/s at the ceiling.
+
+What the profiles showed:
+
+- **The task-manager lock was busy 60 to 80% of the time** under 250/s with
+  churn. Most of it was cgroup work (`assign` rewrote the share slice's
+  `cpuset.cpus` on every start, which makes the kernel update every cpuset
+  under it, and created the leaf under the lock) and the supervisor
+  destroying stopped VMMs under the lock. The lock fixes cut it to about
+  20%. They tightened the burst but did not raise the sustained ceiling, so
+  the lock was not what bound it.
+- **On EBS, the node runs out of IOPS.** The gp3 volume ran 6,500 to 6,900
+  writes a second and the loop device was 99% busy: `debugfs` (which writes
+  each sandbox's files into its root disk and fsyncs on close), the guests'
+  own writes, and XFS reflink and inode GC. `debugfs` was in D state in
+  most samples.
+- **In RAM, starts wait in the root disk step:** `root_disk` p50 1.3 s at
+  300/s offered, against 3 ms alone. Off-CPU, the worker waits on `debugfs`,
+  and `debugfs` waits on writeback, XFS buffer locks, and inode locks:
+  every clone shares extents with one base file, so their copy-on-write
+  allocations meet in the same locks. Running `debugfs` without fsync
+  (`eatmydata`) did not raise the ceiling. A quarter of the CPU stayed idle.
+- **Ruled out:** the client's HTTP/2 connection (two loadgens on two
+  connections got the same total), tokio's blocking pool (raising it from
+  512 to 8,192 threads changed nothing), and cgroup migration
+  (`favordynmods` removed the shim's waits but slowed guest boots).
 
 ## One boot, by stage
 

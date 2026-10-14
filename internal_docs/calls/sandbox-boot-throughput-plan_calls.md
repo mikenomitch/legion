@@ -252,23 +252,31 @@ worker's largest CPU cost, and it ran per start and per stopping allocation
 on every state write. Removing it raised a 4-node cluster's sustained
 ceiling from about 46 to 56 boots a second.
 
-## 13. The per-node ceiling on large nodes is accepted for now
+## 13. Keep the lock fixes, and stop at the root disk ceiling
 
-**Call.** Ship with a 96-vCPU node booting about 50 a second while its CPUs
-are about 90% idle, stated as a limit in the public doc.
+**Call.** First shipped with a 96-vCPU node measured at about 50 boots a
+second. A second metal campaign with a frame-pointer build and per-call-site
+lock timing measured the merged build at 150 to 200 a second sustained.
+It then moved the cgroup work and session teardown off the worker's lock,
+which cut the lock's busy time from 60 to 80% to about 20%. The node stops
+at its root disks: EBS IOPS, or XFS locks shared by every clone of an
+image's base file. This work stops there, with the limit in the public doc.
 
-**Alternatives.** Keep profiling on metal until it moves.
+**Alternatives.** (a) Drop the lock fixes, since they did not raise the
+sustained ceiling. (b) Keep going until the root disk step moves, for
+example with a per-sandbox payload disk instead of `debugfs` writes into the
+clone.
 
-**Trade-off.** Large nodes do not turn their cores into boots. The public
-doc tells operators to add nodes rather than cores.
+**Trade-off.** A large node still idles a quarter of its CPU at its
+ceiling. The lock fixes add a deferred-reap path (`take_reapable`,
+`finish_reap`) and a deferred cgroup leaf (`PendingCgroup`) to keep correct.
 
-**Why.** The budget ($10 for the campaign) was close to spent, and release
-binaries without frame pointers could not attribute the remaining waits.
-Evidence so far: `register` (the task-manager lock) up to 1.8 s and
-`vmm_spawn` up to 2.6 s under a 1,000-start burst, with kernel samples in
-page-table copying and memory-map lock contention. The next step is a metal
-run with a frame-pointer build and lock hold-time instrumentation
-(`TODO.md`).
+**Why.** The lock fixes are sound on their own: the lock gates every start,
+stop, and heartbeat on a node, a burst's p99 dropped from 1.9 s to 1.5 s,
+and the next bottleneck past the root disk would hit the lock again. (b) is
+a change to how a guest gets its files, which touches checkpoints and both
+VMMs, and deserves its own plan rather than a rushed end to this one. The
+measurements, and what they ruled out, are in `RESULTS.md`.
 
 ## 14. `auto` keeps preferring cloud-hypervisor, and every number is cloud-hypervisor's
 

@@ -188,6 +188,7 @@ exec: the moment a caller can run code in it.
 | Burst, four 4-vCPU workers | 160 sandboxes ready in 2.33 s (69 a second), p99 0.74 s |
 | Sustained, four 4-vCPU workers | 40 boots a second with none refused (p99 0.45 s). About 56 a second at the ceiling |
 | Sustained, one 16-vCPU worker | 40 a second with none refused. About 48 at the ceiling, with the CPU 92% busy |
+| One 96-vCPU bare-metal worker (c5.metal) | A burst of 1,200 at 250 to 340 a second. 150 to 200 a second sustained with none refused, about 175 to 245 at the ceiling. The low figures are with worker state on EBS, the high ones on fast local storage |
 | Host-process sessions through one 2-vCPU manager | about 1,300 starts a second on four workers, bound by the workers |
 | Manager memory per running session | about 1.2 KB, so 1.2 GB per million |
 | Memory per idle guest on the node | about 70 MiB of the 128 MiB it was given |
@@ -199,11 +200,15 @@ guests a second), and a sustained 20 a second from 69% refused to none.
 **What bounds a node.** On small and mid-size nodes the CPU does: about 3
 boots a second per vCPU under nested virtualization, about half of it guest
 boot and a quarter the host kernel handling VM exits, which bare metal
-mostly removes. A large node is bound by the worker instead: a 96-vCPU bare
-metal node booted about 50 a second while its CPUs sat about 90% idle,
-because starts waited on the worker's own state lock and on process spawns.
-That ceiling, about 50 boots a second per node whatever its size, is the
-known limit to raise next ([Limits](#limits-to-know-about)).
+mostly removes. A large node is bound by its disk instead. Each sandbox gets
+its own root disk: a reflink clone of the image's base disk on the node,
+with the sandbox's own files written into it. With worker state on EBS
+(gp3 at 6,000 IOPS), a 96-vCPU node runs out of IOPS at about 175 boots a
+second, between those writes and the guests' own. On fast local storage it
+reaches about 200 to 245 a second with a quarter of its CPU idle, and starts
+wait in that root disk step: about 1.3 s at the median under 300 offered a
+second, against 3 ms for a start on its own
+([Limits](#limits-to-know-about)).
 
 **What bounds a cluster.** Starts at the edge (`Worker.StartSession`) reach a
 node with no manager on the path, so a cluster's boot rate is the sum of its
@@ -222,12 +227,16 @@ measurements of clusters that large.
 | --- | --- | --- |
 | 100 nodes of 16 vCPU, 32 GiB | about 4,800 | about 19,000 by envelope, about 35,000 by measured memory |
 | 1,000 nodes of 16 vCPU, 32 GiB | about 48,000 | about 190,000 to 350,000 |
-| 1,000 bare-metal nodes of 96 vCPU, 192 GiB | about 50,000 today (the per-node ceiling). About 290,000 if the CPU becomes the limit | about 1.2 to 2.1 million |
+| 100 bare-metal nodes of 96 vCPU, 192 GiB | about 15,000 on EBS, about 20,000 on local storage | about 120,000 by envelope |
+| 1,000 bare-metal nodes of 96 vCPU, 192 GiB | about 150,000 on EBS, about 200,000 on local storage | about 1.2 to 2.1 million |
 
-At 48,000 boots a second, a million sandboxes start in about 21 seconds, and
-the managers holding a million running sessions keep about 1.2 GB each in
-their session index. A thousand nodes heartbeating every 2 seconds cost a
-manager about 4 ms of CPU a second.
+At 150,000 to 200,000 boots a second, a million sandboxes start in 5 to 7
+seconds, and the managers holding a million running sessions keep about
+1.2 GB each in their session index. A thousand nodes heartbeating every 2
+seconds cost a manager about 4 ms of CPU a second, and folding in the
+sessions they start and stop costs about 2 µs each. At that rate, starts
+must come in at the edge or through several managers: one manager's router
+did 36,000 a second in process.
 
 ### Compared with other systems
 
@@ -237,7 +246,7 @@ magnitude, not a benchmark.
 
 | System | Start latency | Start rate |
 | --- | --- | --- |
-| Legion (this page) | 0.18 to 0.23 s from create to a microVM taking exec | about 48 a second per 16-vCPU node. A cluster's rate is the sum of its nodes |
+| Legion (this page) | 0.18 to 0.23 s from create to a microVM taking exec | 150 to 200 a second sustained per 96-vCPU node, about 40 per 16-vCPU node. A cluster's rate is the sum of its nodes |
 | Firecracker, as quoted | about 125 ms from VMM launch to guest user space | up to 150 microVMs a second per host ([summary](https://northflank.com/blog/what-is-aws-firecracker)) |
 | Modal sandboxes (v2, 2026) | under 0.5 s median, request to user code | 1 million in under a minute, on "many tens of thousands" of nodes ([article](https://youmind.com/landing/x-viral-articles/scaling-1-million-concurrent-sandboxes)) |
 | E2B | about 80 ms to load a sandbox from a memory snapshot ([docs](https://e2b.dev/docs/template/how-it-works)) | |
@@ -276,11 +285,13 @@ runtime's own boot or restore time for the end-to-end figure.
 
 ## Limits to know about
 
-- **A node boots about 50 sandboxes a second at most, whatever its size.**
-  Small and mid-size nodes reach their CPU first. On a 96-vCPU bare-metal
-  node, starts wait on the worker's state lock and on process spawns while
-  the CPUs idle, so add nodes rather than cores to raise a cluster's boot
-  rate ([Measured on AWS](#measured-on-aws)).
+- **A large node's boot rate is bound by its root disks, not its CPUs.**
+  Small and mid-size nodes reach their CPU first. A 96-vCPU node sustains
+  about 150 boots a second with worker state on EBS, where it runs out of
+  IOPS, and about 200 on fast local storage, where starts wait on cloning
+  the image's shared base disk and writing each sandbox's files into its
+  clone. Put the worker's state directory on local NVMe, and add nodes
+  rather than cores past that ([Measured on AWS](#measured-on-aws)).
 - **Every keyed sandbox is a row.** A named one leaves a tombstone after
   destroy for the life of its job; a server-minted one leaves no row
   ([Id rules](stateful-workloads.md#id-rules)). A pending instance row is

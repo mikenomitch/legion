@@ -2,8 +2,8 @@
 
 > **Judgement calls:** [`calls/sandbox-boot-throughput-plan_calls.md`](../calls/sandbox-boot-throughput-plan_calls.md)
 
-**Status: SHIPPED** (phases 1 to 3). Phase 4, the per-node ceiling on large
-nodes, is open in [`TODO.md`](../TODO.md). The public record is
+**Status: SHIPPED** (phases 1 to 3, and phase 4's lock fixes). The root
+disk ceiling on large nodes is open in [`TODO.md`](../TODO.md). The public record is
 [`docs/sandboxes-at-scale.md`](../../docs/sandboxes-at-scale.md#measured-on-aws),
 [`docs/task-runtime-sandbox.md`](../../docs/task-runtime-sandbox.md#how-fast-a-sandbox-boots),
 and [`docs/session-mode.md`](../../docs/session-mode.md#picking-a-node). The
@@ -139,9 +139,12 @@ Everything else changes defaults and behavior, not surface:
 3. **The worker under churn** (shipped): stops off the lock and out of the
    state file, `/proc` start times, `posix_spawn` for VMMs, pooled launch
    threads, O(changes) heartbeats in the session index.
-4. **The per-node ceiling on large nodes** (open): a 96-vCPU node boots
-   about 50 a second with its CPUs mostly idle. Needs profiling on metal
-   with symbols (lock hold times, spawn contention).
+4. **The per-node ceiling on large nodes** (partly shipped). Profiled on
+   metal with symbols: the worker's lock is off the critical path (cgroup
+   work and session teardown moved off it), and a 96-vCPU node sustains
+   150 to 200 boots a second. What bounds it now is the per-sandbox root
+   disk (EBS IOPS, or XFS locks shared by every clone of a base), open in
+   `TODO.md`.
 
 ## Testing
 

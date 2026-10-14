@@ -557,7 +557,6 @@ How to use it:
 
 | PR | What it lands | Notes |
 | --- | --- | --- |
-| [#43](https://github.com/mikenomitch/legion/pull/43) | Sandbox boot throughput: cloud-hypervisor boots once (raw disks, `hvc0`), `running` on guest readiness, `stateful.placement`, the base root disk cache, the session router and worker start/stop paths off the lock, per-stage start timings, and the real-KVM sandbox-boot rig | [plan](plans/sandbox-boot-throughput-plan.md) · [calls](calls/sandbox-boot-throughput-plan_calls.md) · [results](../benchmarks/aws/sandbox-boot/RESULTS.md); stacks three of the fifteen `perf/*` branches |
 | [#36](https://github.com/mikenomitch/legion/pull/36) | Session durability, routing, and edge starts, Phases 1–4 (concurrent node starts, `sessions.db` re-adopt, node tag in session ids and tag routing, session tickets, `Worker.StartSession`, `ListSessionNodes`, `legion session`), the session UI pass, and the sandbox spot-check and bottleneck-measurement plans. Phase 5 in progress | [plan](plans/session-durability-and-routing-plan.md) · [calls](calls/session-durability-and-routing-plan_calls.md) |
 | [#30](https://github.com/mikenomitch/legion/pull/30) | Sandbox scaling Phases 4–6: untombstoned 130-bit minted ids, `suspend.archive`, `stateful.mode = "session"` and `legion instance promote` | [plan](plans/sandbox-scaling-plan.md) §16 · [calls](calls/sandbox-scaling-plan_calls.md); sessions ship without idle sessions, identity, or a session log (calls #18) |
 | [#7](https://github.com/mikenomitch/legion/pull/7) | Read model follows SQLite in every mode: shadow check, `local_disk` changeset projection, outside-write guard, timed scrub | Bench needs a quiet-machine rerun; [plan](plans/read-model-coherence-plan.md) |
@@ -2051,16 +2050,31 @@ Plans: [task-runtime-plugins](../docs/task-runtime-plugins.md).
       ([plan](plans/sandbox-boot-throughput-plan.md) ·
       [calls](calls/sandbox-boot-throughput-plan_calls.md) ·
       [results](../benchmarks/aws/sandbox-boot/RESULTS.md)):
-  - [ ] **A node boots about 50 sandboxes a second at most, whatever its
-        size** (plan phase 4, calls 13). A 96-vCPU c5.metal booted 1,000 at
-        48 a second with its CPUs about 90% idle: starts waited in
-        `register` (the task-manager lock, up to 1.8 s) and `vmm_spawn` (up
-        to 2.6 s). Kernel samples still show page-table copying
-        (`copy_present_ptes`) on launch threads after the `posix_spawn`
-        change, unexplained. Next: a metal run with a frame-pointer build and
-        lock hold-time instrumentation. Suspects are per-start cgroup
-        creation and removal under the lock, the supervisor's per-tick work
-        over every instance, and memory-map lock contention in the worker.
+  - [x] **The worker's lock under churn** (plan phase 4, calls 13). A
+        frame-pointer build with per-call-site lock timing on a c5.metal
+        found the task-manager lock busy 60 to 80% of the time at 250
+        starts a second: `assign` rewrote the share slice's `cpuset.cpus`
+        and created the cgroup leaf under the lock, and the supervisor
+        destroyed stopped VMMs under it. The leaf is now created in the
+        unlocked launch, the slices are set up once, a session's reap runs
+        its destroy and cgroup removal off the lock, a removed allocation
+        directory is renamed aside and deleted by a janitor thread, and a
+        start's log-sink manifest and stage line are written after the
+        lock is released. The lock is busy about 20% of the time at the
+        same rate ([results](../benchmarks/aws/sandbox-boot/RESULTS.md#bare-metal-second-campaign-2026-10-14)).
+  - [ ] **A large node is bound by its root disks** (plan phase 4, calls
+        13). A 96-vCPU node sustains about 150 boots a second with worker
+        state on EBS (out of IOPS) and about 200 on RAM-backed XFS, where
+        `root_disk` reaches 1.3 s at the median under 300 offered a second
+        (3 ms alone), with a quarter of the CPU idle. Each start reflinks
+        the image's one base file and has `debugfs` write the sandbox's
+        files into the clone, and the clones' copy-on-write allocations
+        meet in XFS's buffer and inode locks. Dropping `debugfs`'s fsync did
+        not move the ceiling. Next: write the per-sandbox files without
+        touching shared extents (for example a small per-sandbox payload
+        disk, or a preallocated payload file written in place), or spread
+        clones over several copies of the base, then measure again. Also
+        measure on a node type with local NVMe.
   - [ ] **Firecracker and TAP sandboxes are not measured.** The rig ran
         cloud-hypervisor guests with no NIC. A TAP guest's start adds `ip`
         calls that take the kernel's `rtnl` lock, which Modal found to
