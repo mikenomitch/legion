@@ -3071,7 +3071,13 @@ async fn fetch_net_policies(
             Ok(response) => {
                 let body = response.into_inner().effective_json;
                 match serde_json::from_str::<crate::structs::netpolicy::EffectivePolicy>(&body) {
-                    Ok(policy) => netd.send(NetdInput::PolicyBody { hash, policy }).await,
+                    Ok(policy) => {
+                        netd.send(NetdInput::PolicyBody {
+                            hash,
+                            policy: Box::new(policy),
+                        })
+                        .await
+                    }
                     Err(err) => {
                         warn!(hash = %hash, error = ?err, "Invalid network policy body from manager");
                     }

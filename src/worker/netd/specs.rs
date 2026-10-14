@@ -136,7 +136,7 @@ pub fn proxy_specs(desired: &[TaskAllocation], alloc_root: &Path) -> Vec<ProxySp
         .filter_map(|allocation| {
             let network = network_of(allocation)?;
             let attachment = Attachment::of(allocation, &network, alloc_root);
-            attachment.is_gated().then(|| ProxySpec {
+            attachment.is_gated().then_some(ProxySpec {
                 allocation_id: allocation.allocation_id,
                 attachment,
                 listen: None,

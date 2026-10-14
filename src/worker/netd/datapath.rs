@@ -72,7 +72,7 @@ pub enum NetdInput {
     /// A policy body fetched by hash ([`NetdWants::policy_bodies`]).
     PolicyBody {
         hash: String,
-        policy: EffectivePolicy,
+        policy: Box<EffectivePolicy>,
     },
     /// The node's mesh certificate, issued or re-issued.
     MeshIdentity(MeshIdentity),
@@ -167,7 +167,7 @@ impl Netd {
                 let Some(cache) = context.cache() else {
                     return;
                 };
-                match cache.insert_body(&hash, policy) {
+                match cache.insert_body(&hash, *policy) {
                     Ok(()) => debug!(hash = %hash, "Fetched network policy body"),
                     Err(err) => warn!(hash = %hash, error = ?err, "Rejected network policy body"),
                 }
@@ -759,7 +759,7 @@ mod tests {
         };
         netd.send(NetdInput::PolicyBody {
             hash: "abc".into(),
-            policy,
+            policy: Box::new(policy),
         })
         .await;
         assert!(netd.wants().policy_bodies.is_empty());
