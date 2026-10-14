@@ -2,8 +2,9 @@
 
 > **Judgement calls:** [`calls/datapath-performance-plan_calls.md`](../calls/datapath-performance-plan_calls.md)
 
-> **Status: SHIPPED.** Phases 1–4, plus the per-byte metric fix found while
-> measuring (§6.4). Results are in §12.
+> **Status: SHIPPED** in [#42](https://github.com/mikenomitch/legion/pull/42).
+> Phases 1–4, plus the per-byte metric fix found while measuring (§6.4).
+> Results are in §12.
 > Deferred, by name: kTLS for mesh hops (§6.6), multiplexed node-to-node
 > tunnels for L4 mesh traffic (§6.7), and the `legion netd` process split,
 > which stays with the [service-mesh plan](service-mesh-plan.md).
