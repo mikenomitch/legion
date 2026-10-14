@@ -25,8 +25,10 @@
 //!   control plane's share of a cold boot; the simulated node "boots" in
 //!   `--ready-after`).
 //! - `suspend`: `SuspendInstance` sent → `instance.suspended`. The capture
-//!   request and its report each ride a heartbeat, so this includes up to
-//!   two heartbeat intervals by design.
+//!   request is pushed on the node's work stream and its report goes out on
+//!   an immediate heartbeat, so this is two round trips plus the commits,
+//!   whatever the heartbeat cadence (the simulated capture itself is
+//!   instant).
 //! - `resume_dispatch`: `StartInstance` sent → the node holds the restore
 //!   payload.
 //! - `resume`: `StartInstance` sent → `instance.resumed`.

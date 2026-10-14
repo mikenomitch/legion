@@ -1201,13 +1201,20 @@ service Manager {
   //   restart), a `last_seq` ahead of the manager's, or a `last_seq` older
   //   than the messages the manager still keeps. It also follows a heartbeat
   //   whose digest disagreed with the manager's (`HeartbeatReply.work_resync`).
+  // - **Checkpoint work.** A snapshot of the node entering a state that is
+  //   work for it (a capture, a delete, a publish), or a warm queued for it,
+  //   is pushed in `checkpoint_requests` on the next message, so the node
+  //   starts it one round trip after it commits instead of at its next
+  //   heartbeat. Each piece of work is pushed once per stream; a new stream
+  //   gets every piece still outstanding.
   //
   // A worker that reconnects with the same `epoch` and a `last_seq` the
   // manager still holds gets the messages after it replayed, then live
-  // deltas: nothing is lost and nothing is applied twice. Acked messages
-  // are pruned. The log is held in the manager's memory only: the
-  // committed allocation rows are the durable record, so a new manager
-  // process resyncs instead of replaying.
+  // deltas: nothing is lost and nothing is applied twice. A replayed message
+  // carries its allocation changes only, never its `checkpoint_requests`.
+  // Acked messages are pruned. The log is held in the manager's memory
+  // only: the committed allocation rows are the durable record, so a new
+  // manager process resyncs instead of replaying.
   //
   // Any manager serves the stream, leader or follower, from its own
   // replica of the store.
@@ -4652,15 +4659,20 @@ message WarmSnapshotReply {
   bool deduplicated = 6;
 }
 
-// Work a manager asks a worker to do on a snapshot, delivered in
-// `HeartbeatReply.checkpoint_requests`.
+// Work a manager asks a worker to do on a snapshot, pushed on the worker's
+// `StreamWork` stream (`StreamWorkReply.checkpoint_requests`) the moment it
+// becomes outstanding, and re-sent in `HeartbeatReply.checkpoint_requests`.
 //
-// This is the manager-to-worker half of the checkpoint channel. The manager
+// This is the manager-to-worker half of the checkpoint channel. The push
+// makes the worker start promptly; the heartbeat is the record. The manager
 // re-sends every request on every heartbeat until the worker's matching
-// `SnapshotReport` has been applied, so a worker that restarts, or a report
-// lost to a failed heartbeat, simply retries. Workers deduplicate by
-// `snapshot_id` and `op`: a request for work already done re-sends the
-// recorded report instead of redoing it.
+// `SnapshotReport` has been applied, so a worker that restarts, a push lost
+// with its stream, or a report lost to a failed heartbeat, simply retries.
+// Workers deduplicate by `snapshot_id` and `op`: a request for work already
+// done re-sends the recorded report instead of redoing it. A worker forgets
+// finished work only when a heartbeat reply leaves it out after a heartbeat
+// that carried its report, so an older reply racing a newer push cannot
+// make it redo the work.
 //
 // The manager only sends requests to a worker that advertised the
 // `checkpoint` capability at registration.
@@ -4730,6 +4742,32 @@ message CheckpointRequest {
   // worker writes it verbatim as the archive manifest's `envelope`, beside
   // the published checkpoint manifest, and does not interpret it.
   string manifest_envelope = 11;
+
+  // `publish`: the snapshot's job's chunk key. A published part is stored
+  // as fixed-size chunks plus a sealed index (docs/suspend-and-resume.md,
+  // "How published parts are stored"), and the worker derives each chunk's
+  // key from this one, scoped to its current dedup window, so a chunk the
+  // job already uploaded in the window is not uploaded again. Unset for
+  // every other op, and when the manager could not derive it (the reason is
+  // in `part_key_error`, and the publish fails).
+  CheckpointChunkKey chunk_key = 12;
+}
+
+// A job's chunk key (docs/suspend-and-resume.md, "Published checkpoint
+// encryption"): HKDF-SHA256 of the job's session sealing key with the
+// context `chunks`, so the manager (for a keyed snapshot's publish) and a
+// session's node (with no manager on the path) derive the same key, and
+// checkpoints of one job share chunks whichever path published them. A
+// worker holding it can name and seal chunks of that job only. It cannot
+// open any part index, whose key comes from the part key. The generated
+// Rust type redacts `key` from Debug output and never serializes it.
+message CheckpointChunkKey {
+  // `<checkpoint key id>/session/<job>/chunks`. Informational: chunk keys
+  // are recorded in each part's sealed index, so a reader never needs it.
+  string key_id = 1;
+
+  // 32 bytes. Never logged and never written to disk.
+  bytes key = 2;
 }
 
 // The key for one published checkpoint part. A worker receives it with the
@@ -5672,6 +5710,14 @@ message HeartbeatRequest {
   // whenever the manager re-sends the request it answers, and restored on a
   // failed heartbeat like every other report on this request.
   //
+  // A worker does not hold a fresh outcome for its next scheduled beat: it
+  // sends a heartbeat at once, so a suspend, resume, fork, publish, or warm
+  // settles one round trip after the node finishes it. A delete's
+  // confirmation is the exception (nothing waits on it), and rides the next
+  // scheduled beat. The out-of-band beat is an ordinary heartbeat, carrying
+  // everything else the worker has to report, so the manager sees the
+  // outcome and the node's other changes in the order they happened.
+  //
   // Default: empty list.
   repeated SnapshotReport snapshot_reports = 13;
   // Content locality: what this node's content store holds, for the manager's location index
@@ -5924,6 +5970,24 @@ message StreamWorkReply {
   // The digest of the worker's desired set after applying this message, in
   // the `WorkStreamState.digest` form.
   string digest = 6;
+
+  // Checkpoint work for the node that became outstanding since the last
+  // message: the same `CheckpointRequest`s the heartbeat reply carries, part
+  // keys included, pushed the moment the snapshot row (or queued warm)
+  // committed. The worker starts each one at once, deduplicated against
+  // work it already has in flight or finished, exactly as it does for a
+  // request that arrives on a heartbeat.
+  //
+  // A hint, not the record. Each request is pushed once per stream (a new
+  // stream gets every one still outstanding), never replayed, and does not
+  // count toward `digest`. The heartbeat reply still carries the node's
+  // whole checkpoint work on every beat, and that full set is what tells
+  // the worker the manager is done with a piece of work. So a lost message,
+  // or a worker that ignores this field, waits for its next heartbeat
+  // instead of losing anything. Only sent to workers that advertised the
+  // `checkpoint` capability. A message may carry only this field, with no
+  // `upserts` or `stops`; it still takes the next `seq`.
+  repeated CheckpointRequest checkpoint_requests = 7;
 }
 
 // One finished (or refused-after-verification) direct exec session.
@@ -6384,6 +6448,11 @@ message HeartbeatReply {
   // every heartbeat until the worker's `SnapshotReport` for it has been
   // applied. Sent only to workers that advertised the `checkpoint`
   // capability at registration.
+  //
+  // Always the node's whole outstanding set, streaming worker or not: a
+  // streaming worker got each request pushed on `StreamWork` when it became
+  // outstanding, and this list is how it learns which finished work the
+  // manager has applied (it is no longer listed).
   //
   // Default: empty list. Costs one indexed lookup per heartbeat.
   repeated CheckpointRequest checkpoint_requests = 9;

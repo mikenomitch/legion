@@ -10,6 +10,11 @@
 //! outcome rides the same reports (`op = restore`). Suspend reuses all of
 //! it: a `purpose = suspend` row with `then = stop` (see `suspend_rpcs`).
 //!
+//! Neither half waits for the cadence (checkpoints-on-stream plan): a node
+//! that streams its work gets each request pushed on `StreamWork` when its
+//! row commits (`work_stream`), and a worker sends a heartbeat as soon as it
+//! has a fresh report. The heartbeat's full set stays the record.
+//!
 //! Phase 7b adds two ops. A `local` row with `durability = store` is publish
 //! work for its node until the node reports (`op = publish`), which moves it
 //! to `published`. A queued warm (WarmSnapshot, held in memory in
@@ -850,6 +855,11 @@ impl ManagerDaemonService {
                 }
             )));
         }
+        // The queue is memory on this manager, not a row the projection
+        // sees: push the warms to the picked nodes that stream from here.
+        self.store
+            .work_log()
+            .note_checkpoint_work(plan.nodes.iter().map(String::as_str));
         info!(
             snapshot_id = %snapshot.snapshot_id,
             nodes = plan.nodes.len(),
@@ -1380,8 +1390,9 @@ fn enqueue_job_placement(store: &Store, job_id: &str) {
 }
 
 /// Checkpoint work for one node: a request per `capturing` or `deleting`
-/// snapshot it holds, re-sent every heartbeat until the node reports. Only
-/// sent to workers that advertised the `checkpoint` capability. Never fails
+/// snapshot it holds, re-sent every heartbeat until the node reports, and
+/// pushed on the node's work stream when it becomes outstanding. Only sent
+/// to workers that advertised the `checkpoint` capability. Never fails
 /// the heartbeat.
 pub(super) fn build_checkpoint_requests(store: &Store, node_id: &str) -> Vec<CheckpointRequest> {
     let work = match store.snapshot_work_for_node(node_id) {
@@ -1424,8 +1435,25 @@ pub(super) fn build_checkpoint_requests(store: &Store, node_id: &str) -> Vec<Che
         .map(|snapshot| match snapshot.state {
             // A `store` snapshot that is captured but not yet published.
             SnapshotState::Local => {
-                let (part_keys, part_key_error) =
+                let (part_keys, mut part_key_error) =
                     checkpoint_part_keys(store, &snapshot.manifest_json, PartKeyUse::Publish);
+                // Every part is published as chunks keyed from the job's
+                // chunk key (docs/suspend-and-resume.md, "How published parts
+                // are stored"). A missing key fails the publish on the
+                // worker with this reason, like a missing part key.
+                let chunk_key = match store.keyring().checkpoint_chunk_key(&snapshot.job_id) {
+                    Ok(key) => Some(key.to_proto()),
+                    Err(err) => {
+                        let err = format!("{err:#}");
+                        if !part_key_error.contains(&err) {
+                            if !part_key_error.is_empty() {
+                                part_key_error.push_str("; ");
+                            }
+                            part_key_error.push_str(&err);
+                        }
+                        None
+                    }
+                };
                 let (manifest_object, manifest_envelope) =
                     archive_request(store, &snapshot).unwrap_or_default();
                 CheckpointRequest {
@@ -1440,6 +1468,7 @@ pub(super) fn build_checkpoint_requests(store: &Store, node_id: &str) -> Vec<Che
                     part_key_error,
                     manifest_object,
                     manifest_envelope,
+                    chunk_key,
                 }
             }
             SnapshotState::Capturing => CheckpointRequest {

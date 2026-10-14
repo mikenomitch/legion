@@ -26,9 +26,20 @@
 //! whose last message came from another epoch (a failover, a restart, a
 //! different manager) cannot be replayed to and gets a full resync, which
 //! is today's full desired set sent once.
+//!
+//! **Checkpoint work** rides the same messages as a push, not as part of
+//! the sequenced set (checkpoints-on-stream plan): the projection marks a
+//! node whose snapshot rows changed ([`WorkLog::note_checkpoint_work`]),
+//! the materializer reads the node's outstanding checkpoint work, and the
+//! log hands back only the requests this stream has not been pushed yet
+//! ([`WorkLog::unpushed_checkpoints`]). Pushes are never replayed and never
+//! count toward the digest: the heartbeat reply's full set is still the
+//! record, so a lost push costs a heartbeat interval, nothing more.
 
-use crate::structs::{StopNotice, StreamWorkReply, TaskAllocation, WorkStreamState};
-use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
+use crate::structs::{
+    CheckpointRequest, StopNotice, StreamWorkReply, TaskAllocation, WorkStreamState,
+};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex};
 
 /// Sent messages a node may leave unacknowledged before a reconnect has to
@@ -107,6 +118,12 @@ struct NodeState {
     digest: WorkDigest,
     /// Sent, not yet acknowledged, oldest first.
     unacked: VecDeque<StreamWorkReply>,
+    /// The node's checkpoint work may have changed since it was last read.
+    checkpoints_dirty: bool,
+    /// `(snapshot_id, op)` of every checkpoint request pushed on the
+    /// current stream that was still outstanding when last read. Cleared
+    /// when a stream attaches, so a new stream gets everything outstanding.
+    pushed: HashSet<(String, String)>,
 }
 
 /// One node's log and the wake its stream waits on.
@@ -233,6 +250,55 @@ impl WorkLog {
         }
     }
 
+    /// Mark the checkpoint work of `nodes` as changed: a committed snapshot
+    /// row on them moved, or a warm was queued for them. Called by the
+    /// store's projection on every replica (and by WarmSnapshot, whose queue
+    /// is memory on this manager); a node nobody streams for costs nothing.
+    pub fn note_checkpoint_work<'a>(&self, nodes: impl IntoIterator<Item = &'a str>) {
+        let logs = self.lock_nodes();
+        if logs.is_empty() {
+            return;
+        }
+        for node in nodes {
+            if let Some(log) = logs.get(node) {
+                log.lock().checkpoints_dirty = true;
+                log.wake.notify_one();
+            }
+        }
+    }
+
+    /// Take the node's checkpoint-changed mark: whether the next message
+    /// must read its checkpoint work.
+    pub fn take_checkpoint_work(log: &NodeWorkLog) -> bool {
+        std::mem::take(&mut log.lock().checkpoints_dirty)
+    }
+
+    /// From the node's whole outstanding checkpoint work, the requests this
+    /// stream has not been pushed yet. Remembers the outstanding set, so a
+    /// piece of work is pushed once while it stays outstanding and again
+    /// only if it leaves and comes back (a publish that failed and was
+    /// retried).
+    pub fn unpushed_checkpoints(
+        log: &NodeWorkLog,
+        outstanding: Vec<CheckpointRequest>,
+    ) -> Vec<CheckpointRequest> {
+        let mut state = log.lock();
+        let keys: HashSet<(String, String)> = outstanding
+            .iter()
+            .map(|request| (request.snapshot_id.clone(), request.op.clone()))
+            .collect();
+        let fresh = outstanding
+            .into_iter()
+            .filter(|request| {
+                !state
+                    .pushed
+                    .contains(&(request.snapshot_id.clone(), request.op.clone()))
+            })
+            .collect();
+        state.pushed = keys;
+        fresh
+    }
+
     /// Whether a stream for `node_id` is attached to this manager. The
     /// dispatcher skips the best-effort `PostWork` push for such a node:
     /// the stream delivers the placement within a round trip.
@@ -257,6 +323,10 @@ impl WorkLog {
         let replay = {
             let mut state = log.lock();
             state.session = session;
+            // The new stream has been pushed nothing yet: read the node's
+            // outstanding checkpoint work for its first message.
+            state.pushed.clear();
+            state.checkpoints_dirty = true;
             let resumable = last_epoch == self.epoch
                 && last_seq <= state.seq
                 && (last_seq == state.seq
@@ -344,14 +414,18 @@ impl WorkLog {
     }
 
     /// Record and number a materialized message: a full set when `resync`,
-    /// otherwise upserts and stops. Returns the message to send, or `None`
-    /// when it would carry nothing.
+    /// otherwise upserts and stops, plus any checkpoint requests to push.
+    /// Returns the message to send, or `None` when it would carry nothing.
+    /// The copy kept for replay leaves the checkpoint requests out: a push
+    /// is only worth sending while it is fresh, and the heartbeat re-sends
+    /// whatever is still outstanding.
     pub fn commit_message(
         &self,
         log: &NodeWorkLog,
         resync: bool,
         upserts: Vec<TaskAllocation>,
         stops: Vec<StopNotice>,
+        checkpoint_requests: Vec<CheckpointRequest>,
     ) -> Option<StreamWorkReply> {
         let mut state = log.lock();
         if resync {
@@ -361,7 +435,7 @@ impl WorkLog {
                 .collect();
             state.digest = WorkDigest::of(state.held.keys().copied());
         } else {
-            if upserts.is_empty() && stops.is_empty() {
+            if upserts.is_empty() && stops.is_empty() && checkpoint_requests.is_empty() {
                 return None;
             }
             for allocation in &upserts {
@@ -380,19 +454,21 @@ impl WorkLog {
             }
         }
         state.seq += 1;
-        let message = StreamWorkReply {
+        let mut message = StreamWorkReply {
             epoch: self.epoch,
             seq: state.seq,
             resync,
             upserts,
             stops: if resync { Vec::new() } else { stops },
             digest: state.digest.render(),
+            checkpoint_requests: Vec::new(),
         };
         state.unacked.push_back(message.clone());
         if state.unacked.len() > MAX_UNACKED {
             // Too far behind to replay: the next reconnect resyncs.
             state.unacked.pop_front();
         }
+        message.checkpoint_requests = checkpoint_requests;
         Some(message)
     }
 
@@ -480,7 +556,13 @@ mod work_log_test {
             PendingWork::Resync
         ));
         let first = log
-            .commit_message(&attached.log, true, vec![payload(1)], Vec::new())
+            .commit_message(
+                &attached.log,
+                true,
+                vec![payload(1)],
+                Vec::new(),
+                Vec::new(),
+            )
             .expect("resync is always sent");
         assert_eq!((first.seq, first.resync), (1, true));
 
@@ -490,7 +572,13 @@ mod work_log_test {
         };
         assert_eq!(changed.into_iter().collect::<Vec<_>>(), vec![2]);
         let second = log
-            .commit_message(&attached.log, false, vec![payload(2)], Vec::new())
+            .commit_message(
+                &attached.log,
+                false,
+                vec![payload(2)],
+                Vec::new(),
+                Vec::new(),
+            )
             .expect("an upsert");
         assert_eq!(second.seq, 2);
         assert_eq!(second.digest, WorkDigest::of([1, 2]).render());
@@ -504,11 +592,12 @@ mod work_log_test {
                     cause: "stopped".into(),
                     ..Default::default()
                 }],
+                Vec::new(),
             )
             .expect("a stop");
         assert_eq!(third.digest, WorkDigest::of([2]).render());
         assert!(log
-            .commit_message(&attached.log, false, Vec::new(), Vec::new())
+            .commit_message(&attached.log, false, Vec::new(), Vec::new(), Vec::new())
             .is_none());
     }
 
@@ -517,9 +606,27 @@ mod work_log_test {
         let log = WorkLog::new();
         let attached = log.attach("n1", 0, 0);
         let _ = WorkLog::take_pending(&attached.log);
-        log.commit_message(&attached.log, true, vec![payload(1)], Vec::new());
-        log.commit_message(&attached.log, false, vec![payload(2)], Vec::new());
-        log.commit_message(&attached.log, false, vec![payload(3)], Vec::new());
+        log.commit_message(
+            &attached.log,
+            true,
+            vec![payload(1)],
+            Vec::new(),
+            Vec::new(),
+        );
+        log.commit_message(
+            &attached.log,
+            false,
+            vec![payload(2)],
+            Vec::new(),
+            Vec::new(),
+        );
+        log.commit_message(
+            &attached.log,
+            false,
+            vec![payload(3)],
+            Vec::new(),
+            Vec::new(),
+        );
         log.ack(&attached.log, log.epoch(), 1);
         log.detach("n1", attached.session);
         assert!(!log.streaming("n1"));
@@ -542,7 +649,13 @@ mod work_log_test {
         let attached = log.attach("n1", 0, 0);
         let _ = WorkLog::take_pending(&attached.log);
         for id in 1..=3 {
-            log.commit_message(&attached.log, id == 1, vec![payload(id)], Vec::new());
+            log.commit_message(
+                &attached.log,
+                id == 1,
+                vec![payload(id)],
+                Vec::new(),
+                Vec::new(),
+            );
         }
         log.ack(&attached.log, log.epoch(), 3);
         // Another epoch.
@@ -559,7 +672,7 @@ mod work_log_test {
             PendingWork::Resync
         ));
         // Behind what was pruned: messages 1..=3 were acked and dropped.
-        log.commit_message(&ahead.log, false, vec![payload(4)], Vec::new());
+        log.commit_message(&ahead.log, false, vec![payload(4)], Vec::new(), Vec::new());
         log.ack(&ahead.log, log.epoch(), 4);
         let behind = log.attach("n1", log.epoch(), 1);
         assert!(matches!(
@@ -573,7 +686,13 @@ mod work_log_test {
         let log = WorkLog::new();
         let attached = log.attach("n1", 0, 0);
         let _ = WorkLog::take_pending(&attached.log);
-        log.commit_message(&attached.log, true, vec![payload(1)], Vec::new());
+        log.commit_message(
+            &attached.log,
+            true,
+            vec![payload(1)],
+            Vec::new(),
+            Vec::new(),
+        );
         let agree = WorkStreamState {
             epoch: log.epoch(),
             seq: 1,
@@ -587,7 +706,13 @@ mod work_log_test {
             }
         );
         // Behind: a message is in flight, so a different digest is expected.
-        log.commit_message(&attached.log, false, vec![payload(2)], Vec::new());
+        log.commit_message(
+            &attached.log,
+            false,
+            vec![payload(2)],
+            Vec::new(),
+            Vec::new(),
+        );
         assert!(!log.check_heartbeat("n1", &agree).resync);
         // Caught up but wrong.
         let drifted = WorkStreamState {
@@ -608,5 +733,82 @@ mod work_log_test {
         assert!(!log.check_heartbeat("n1", &stale).via_stream);
         log.detach("n1", attached.session);
         assert!(!log.check_heartbeat("n1", &agree).via_stream);
+    }
+
+    fn request(snapshot_id: &str, op: &str) -> CheckpointRequest {
+        CheckpointRequest {
+            snapshot_id: snapshot_id.into(),
+            op: op.into(),
+            ..Default::default()
+        }
+    }
+
+    fn keys(requests: &[CheckpointRequest]) -> Vec<(String, String)> {
+        requests
+            .iter()
+            .map(|request| (request.snapshot_id.clone(), request.op.clone()))
+            .collect()
+    }
+
+    #[test]
+    fn checkpoint_work_is_pushed_once_per_stream_and_never_replayed() {
+        let log = WorkLog::new();
+        let attached = log.attach("n1", 0, 0);
+        assert!(
+            WorkLog::take_checkpoint_work(&attached.log),
+            "a new stream reads the node's outstanding checkpoint work"
+        );
+        let _ = WorkLog::take_pending(&attached.log);
+        let opening = WorkLog::unpushed_checkpoints(&attached.log, vec![request("s1", "capture")]);
+        let first = log
+            .commit_message(&attached.log, true, Vec::new(), Vec::new(), opening)
+            .expect("resync");
+        assert_eq!(
+            keys(&first.checkpoint_requests),
+            keys(&[request("s1", "capture")])
+        );
+
+        // Only a node a stream is attached for is marked.
+        log.note_checkpoint_work(["n2", "n1"]);
+        assert!(WorkLog::take_checkpoint_work(&attached.log));
+        assert!(!WorkLog::take_checkpoint_work(&attached.log));
+        // Still outstanding: not pushed again. New work is.
+        let fresh = WorkLog::unpushed_checkpoints(
+            &attached.log,
+            vec![request("s1", "capture"), request("s2", "delete")],
+        );
+        assert_eq!(keys(&fresh), keys(&[request("s2", "delete")]));
+        let pushed = log
+            .commit_message(&attached.log, false, Vec::new(), Vec::new(), fresh)
+            .expect("a checkpoint-only message is still sent");
+        assert_eq!(pushed.seq, 2, "it takes the next position");
+        assert!(pushed.upserts.is_empty() && pushed.stops.is_empty());
+        assert_eq!(pushed.digest, first.digest, "pushes do not move the digest");
+        // Work that left and came back (a retried publish) is pushed again.
+        assert!(WorkLog::unpushed_checkpoints(&attached.log, Vec::new()).is_empty());
+        assert_eq!(
+            keys(&WorkLog::unpushed_checkpoints(
+                &attached.log,
+                vec![request("s2", "delete")]
+            )),
+            keys(&[request("s2", "delete")])
+        );
+
+        // A reconnect in the same epoch replays the message without its push,
+        // and the new stream gets everything still outstanding afresh.
+        log.ack(&attached.log, log.epoch(), 1);
+        log.detach("n1", attached.session);
+        let again = log.attach("n1", log.epoch(), 1);
+        assert_eq!(again.replay.len(), 1);
+        assert_eq!(again.replay[0].seq, 2);
+        assert!(again.replay[0].checkpoint_requests.is_empty());
+        assert!(WorkLog::take_checkpoint_work(&again.log));
+        assert_eq!(
+            keys(&WorkLog::unpushed_checkpoints(
+                &again.log,
+                vec![request("s1", "capture")]
+            )),
+            keys(&[request("s1", "capture")])
+        );
     }
 }

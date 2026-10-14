@@ -15,12 +15,17 @@
 //! `work_resync` and sends a full resync on the stream; a manager that does
 //! not recognize the stream (another epoch, no stream attached) answers with
 //! the full desired set, which the heartbeat reconciles as it always did.
+//!
+//! A message can also push checkpoint work (`checkpoint_requests`). That is
+//! not part of the mirror: it is handed to the caller to start at once, and
+//! the heartbeat's full checkpoint set stays the record.
 
 use crate::prelude::*;
 use crate::storage::work_log::WorkDigest;
 use crate::structs::{
-    manager_client::ManagerClient, stream_work_request, StopNotice, StreamWorkAck, StreamWorkOpen,
-    StreamWorkReply, StreamWorkRequest, TaskAllocation, WorkStreamState,
+    manager_client::ManagerClient, stream_work_request, CheckpointRequest, StopNotice,
+    StreamWorkAck, StreamWorkOpen, StreamWorkReply, StreamWorkRequest, TaskAllocation,
+    WorkStreamState,
 };
 use std::collections::BTreeMap;
 use std::time::Duration;
@@ -58,6 +63,10 @@ pub struct Applied {
     /// heartbeat's reconcile has work to do now rather than at its next
     /// beat.
     pub reconcile: bool,
+    /// Checkpoint work the message pushed, to start now. Passed on even
+    /// from a message the mirror ignored: a push is the manager's current
+    /// view whatever its position, and the worker deduplicates it.
+    pub checkpoint_requests: Vec<CheckpointRequest>,
 }
 
 impl WorkMirror {
@@ -68,6 +77,7 @@ impl WorkMirror {
         let mut applied = Applied {
             resync: message.resync,
             reconcile: message.resync,
+            checkpoint_requests: message.checkpoint_requests.clone(),
             ..Default::default()
         };
         if message.resync {
@@ -263,6 +273,7 @@ mod work_stream_test {
                 })
                 .collect(),
             digest: String::new(),
+            checkpoint_requests: Vec::new(),
         }
     }
 

@@ -1635,12 +1635,22 @@ fn build_content_publishing(
             disabled; this node will not publish content");
         return None;
     };
-    match target.publisher(credentials) {
-        Ok(publisher) => {
-            info!(url = %target.url, "Content publishing enabled");
-            Some(Arc::new(crate::content_publish::ContentPublishing::new(
-                store, publisher,
-            )))
+    match target
+        .publisher(credentials)
+        .and_then(|publisher| Ok((publisher, target.chunk_settings()?)))
+    {
+        Ok((publisher, settings)) => {
+            info!(
+                url = %target.url,
+                chunk_size = settings.chunk_size,
+                dedup_window_secs = settings.dedup_window.as_secs(),
+                "Content publishing enabled"
+            );
+            Some(Arc::new(
+                crate::content_publish::ContentPublishing::with_settings(
+                    store, publisher, settings,
+                ),
+            ))
         }
         Err(err) => {
             warn!(error = ?err, "Invalid contentStore config; this node will not publish content");
@@ -2573,6 +2583,12 @@ async fn heartbeat_tick(
         {
             let fresh = {
                 let mut manager = task_manager.lock().expect("task manager");
+                // The manager applied (or ignored) the reports this beat
+                // carried before it built the reply, so finished work this
+                // reply leaves out can be forgotten now.
+                manager
+                    .checkpoints_mut()
+                    .mark_delivered(&snapshot_reports_for_redrive);
                 manager
                     .checkpoints_mut()
                     .reconcile_restores(&reply.desired_allocations);
@@ -3689,20 +3705,49 @@ static HEALTH_REPORTED: std::sync::LazyLock<Mutex<HashMap<i64, AllocationHealth>
 
 /// Wakes the heartbeat loop before its interval: a `StreamWork` message
 /// arrived, and its new allocations should start (and its stops land) now
-/// rather than at the next beat.
+/// rather than at the next beat; or a checkpoint report is waiting.
 static HEARTBEAT_WAKE: std::sync::LazyLock<tokio::sync::Notify> =
     std::sync::LazyLock::new(tokio::sync::Notify::new);
 
-/// Act on one applied work-stream message: start the allocations it added,
-/// and wake the heartbeat's reconcile when it stopped or changed anything.
-/// A resync's additions go through the reconcile too, which knows what a
-/// restarted worker restored and what it must not start twice.
+/// Send a heartbeat now instead of at the next interval: a fresh checkpoint
+/// report is queued (`worker/checkpoints.rs`), and a suspend, resume, or
+/// fork should not wait out the cadence to settle. Wakes already pending
+/// fold into one beat.
+pub(crate) fn wake_heartbeat() {
+    HEARTBEAT_WAKE.notify_one();
+}
+
+/// Act on one applied work-stream message: start the checkpoint work it
+/// pushed and the allocations it added, and wake the heartbeat's reconcile
+/// when it stopped or changed anything. A resync's additions go through the
+/// reconcile too, which knows what a restarted worker restored and what it
+/// must not start twice.
 fn launch_streamed_work(
     launcher: &Arc<WorkerDaemonService>,
     applied: crate::worker::work_stream::Applied,
 ) {
     if applied.reconcile {
         HEARTBEAT_WAKE.notify_one();
+    }
+    // Checkpoint work starts the moment it is pushed, deduplicated against
+    // what this node already has in flight or finished, exactly as when a
+    // heartbeat delivers it (docs/suspend-and-resume.md, "How it works").
+    if !applied.checkpoint_requests.is_empty() {
+        let fresh = launcher
+            .task_manager
+            .lock()
+            .map(|mut manager| {
+                manager
+                    .checkpoints_mut()
+                    .accept_pushed(&applied.checkpoint_requests)
+            })
+            .unwrap_or_default();
+        for request in fresh {
+            let task_manager = launcher.task_manager.clone();
+            tokio::task::spawn_blocking(move || {
+                crate::worker::checkpoints::run_request(&task_manager, &request);
+            });
+        }
     }
     if applied.resync {
         return;

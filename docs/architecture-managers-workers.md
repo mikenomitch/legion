@@ -519,6 +519,15 @@ whatever the heartbeat cadence:
   its own replica. A leader failover disturbs only the streams attached to
   the manager that died: their workers reconnect and resync once; workers
   streaming from a surviving manager keep their position.
+- **Checkpoint work.** When a snapshot row of the node commits in a state
+  that is work for it (a capture for a suspend, fork, or snapshot, a
+  publish, a reclaim), or a warm is queued for it, the next message pushes
+  that `CheckpointRequest`, and the worker starts it at once. A push is a
+  hint, not the record: it goes out once per stream, is never replayed, and
+  does not count toward the digest. The heartbeat reply still lists the
+  node's outstanding checkpoint work on every beat, so a lost push costs one
+  heartbeat interval, and a new stream is pushed everything still
+  outstanding. See [How it works](suspend-and-resume.md#how-it-works).
 
 A worker on the stream sends a heartbeat of a few dozen bytes and gets a
 reply of a few bytes, however many allocations it runs; the manager builds
@@ -527,6 +536,15 @@ no desired set for it. Measured on a 300-allocation node: 42-byte request,
 102,670 bytes, and 26 ms for the full set (debug build). The connect and
 network-policy feeds still ride the reply, computed from the payloads the
 stream sent, and only when a task on the node declares one.
+
+The worker also sends a heartbeat early, without waiting for its interval,
+when it has something the manager is waiting on: after a stream message that
+stopped or changed an allocation (so the reconcile runs now), and when a
+checkpoint report is ready (a finished capture, restore, publish, or warm),
+so a suspend, resume, or fork settles one round trip after the node finishes
+it. An early beat is an ordinary heartbeat. It carries everything else the
+worker has to report, and wakes that arrive while one is in flight fold
+into the next.
 
 While its stream is down (the manager restarted, the network blipped), a
 worker reports no position, and the manager answers with today's full

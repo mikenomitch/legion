@@ -260,10 +260,22 @@ impl Cluster {
         assert_eq!(key.digest, digest());
         assert!(key.key_id.starts_with("ck_"), "{}", key.key_id);
         assert_eq!(key.key.len(), 32);
-        // The request can be logged without leaking the key.
+        // And the job's chunk key, which every chunk's key derives from.
+        let chunks = asked[0].chunk_key.clone().expect("a chunk key");
+        assert_eq!(chunks.key.len(), 32);
+        assert!(
+            chunks
+                .key_id
+                .starts_with(&format!("{}/session/", key.key_id))
+                && chunks.key_id.ends_with("/chunks"),
+            "{}",
+            chunks.key_id
+        );
+        // The request can be logged without leaking either key.
         let shown = format!("{:?}", asked[0]);
         assert!(shown.contains("redacted"), "{shown}");
         assert!(!shown.contains(&format!("{:?}", key.key)), "{shown}");
+        assert!(!shown.contains(&format!("{:?}", chunks.key)), "{shown}");
         self.heartbeat(NODE_A, vec![publish_ok(snapshot_id, &key.key_id)])
             .await?;
         Ok(key)

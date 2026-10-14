@@ -406,10 +406,11 @@ pub fn publish_checkpoint_parts(
         "this worker has no contentStore configured (or its node content store is disabled), \
          so it cannot publish session checkpoints",
     )?;
+    let chunks = keys.chunk_key()?;
     for part in &mut snapshot.memory {
         let digest = crate::content_store::ContentDigest::parse(&part.digest)?;
         let key = keys.seal_key(&digest)?;
-        let published = publishing.publish(&key).with_context(|| {
+        let published = publishing.publish(&key, &chunks).with_context(|| {
             format!(
                 "publishing part {} of session checkpoint {}",
                 part.role, checkpoint.snapshot_id

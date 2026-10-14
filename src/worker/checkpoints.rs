@@ -1,15 +1,20 @@
 //! The worker half of the checkpoint channel (suspend plan §6.5;
 //! docs/suspend-and-resume.md).
 //!
-//! The manager re-sends a [`CheckpointRequest`] on every heartbeat until it
-//! has applied this worker's [`SnapshotReport`] for it. So the worker keeps:
+//! The manager pushes a [`CheckpointRequest`] on the work stream when it
+//! becomes outstanding, and re-sends it on every heartbeat until it has
+//! applied this worker's [`SnapshotReport`] for it. So the worker keeps:
 //!
 //! - **in flight**: work started and not finished. A re-sent request for it
 //!   is ignored.
 //! - **done**: the last report per `(snapshot, op)`. A re-sent request for
 //!   finished work re-queues that report instead of redoing the work, which
 //!   covers a report lost to a failed heartbeat or applied on a manager that
-//!   could not forward it. Entries are dropped once the manager stops asking.
+//!   could not forward it. Entries are dropped once a heartbeat reply stops
+//!   asking, and only after a heartbeat carried the report: a reply built
+//!   before a push can arrive after the pushed work finished, and must not
+//!   make the node forget (and later redo) work the manager has not heard
+//!   about.
 //! - **restores**: the restore payload of each allocation started from a
 //!   snapshot, and its outcome once known, re-sent while the manager keeps
 //!   attaching the payload.
@@ -19,6 +24,11 @@
 //!   the manager drops the allocation from the desired set, which is how it
 //!   says the suspend is applied (or that the instance moved on and the
 //!   checkpoint is being reclaimed).
+//!
+//! A fresh report wakes the heartbeat loop, so it reaches the manager one
+//! round trip after the work finishes instead of at the next beat
+//! (checkpoints-on-stream plan). A delete's confirmation does not: nothing
+//! waits on it, so it rides the next scheduled beat. Re-sends never wake.
 //!
 //! The work itself (capture, delete, publish, warm) runs on a blocking
 //! thread and holds the task-manager lock only for the runtime's own
@@ -50,7 +60,7 @@ use crate::worker::task_manager::WorkerTaskManager;
 #[derive(Default)]
 pub struct CheckpointState {
     in_flight: HashSet<(String, String)>,
-    done: HashMap<(String, String), SnapshotReport>,
+    done: HashMap<(String, String), Finished>,
     outbox: Vec<SnapshotReport>,
     /// Allocation id -> the snapshot it starts from.
     pub(crate) restores: HashMap<i64, SnapshotRestore>,
@@ -61,20 +71,64 @@ pub struct CheckpointState {
     local_suspensions: HashMap<i64, SnapshotReport>,
 }
 
+/// Finished work and its report.
+struct Finished {
+    report: SnapshotReport,
+    /// A heartbeat the manager answered carried the report. Until then, a
+    /// reply that does not list the request says nothing about whether the
+    /// manager applied it.
+    delivered: bool,
+}
+
 fn key(snapshot_id: &str, op: &str) -> (String, String) {
     (snapshot_id.to_string(), op.to_string())
+}
+
+/// Tell the heartbeat loop a fresh report is waiting, unless nothing waits
+/// on it (a delete's confirmation).
+fn report_ready(report: &SnapshotReport) {
+    if report.op != "delete" {
+        crate::worker::daemon::wake_heartbeat();
+    }
 }
 
 impl CheckpointState {
     /// Sort this heartbeat's requests into new work (returned, and marked in
     /// flight) and re-sends of finished work (their reports re-queued), and
-    /// forget finished work the manager no longer asks about.
+    /// forget finished work the manager no longer asks about once a
+    /// heartbeat has carried its report.
     pub fn accept(&mut self, requests: &[CheckpointRequest]) -> Vec<CheckpointRequest> {
         let asked: HashSet<(String, String)> = requests
             .iter()
             .map(|request| key(&request.snapshot_id, &request.op))
             .collect();
-        self.done.retain(|key, _| asked.contains(key));
+        self.done
+            .retain(|key, finished| asked.contains(key) || !finished.delivered);
+        self.start(requests)
+    }
+
+    /// Requests pushed on the work stream when they became outstanding. New
+    /// work starts at once, exactly as from a heartbeat. A push is not the
+    /// node's whole set, so unlike [`Self::accept`] it never forgets
+    /// anything.
+    pub fn accept_pushed(&mut self, requests: &[CheckpointRequest]) -> Vec<CheckpointRequest> {
+        self.start(requests)
+    }
+
+    /// The heartbeat that carried `reports` was answered: the manager has
+    /// seen them, so a reply that no longer lists their requests means it is
+    /// done with them.
+    pub fn mark_delivered(&mut self, reports: &[SnapshotReport]) {
+        for report in reports {
+            if let Some(finished) = self.done.get_mut(&key(&report.snapshot_id, &report.op)) {
+                finished.delivered = true;
+            }
+        }
+    }
+
+    /// The new work among `requests` (returned, and marked in flight).
+    /// Finished work has its report re-queued instead.
+    fn start(&mut self, requests: &[CheckpointRequest]) -> Vec<CheckpointRequest> {
         let mut fresh = Vec::new();
         for request in requests {
             let key = key(&request.snapshot_id, &request.op);
@@ -93,8 +147,8 @@ impl CheckpointState {
             {
                 continue;
             }
-            if let Some(report) = self.done.get(&key) {
-                self.outbox.push(report.clone());
+            if let Some(finished) = self.done.get(&key) {
+                self.outbox.push(finished.report.clone());
                 continue;
             }
             self.in_flight.insert(key);
@@ -107,7 +161,16 @@ impl CheckpointState {
     pub fn finish(&mut self, report: SnapshotReport) {
         let key = key(&report.snapshot_id, &report.op);
         self.in_flight.remove(&key);
-        self.done.insert(key, report.clone());
+        report_ready(&report);
+        self.done.insert(
+            key,
+            Finished {
+                report: report.clone(),
+                delivered: false,
+            },
+        );
+        // The caller holds the task-manager lock the heartbeat drains under,
+        // so the beat the wake starts finds this report queued.
         self.outbox.push(report);
     }
 
@@ -148,6 +211,7 @@ impl CheckpointState {
             pause_ms: 0,
             manifest_url: String::new(),
         };
+        report_ready(&report);
         self.restore_outcomes.insert(allocation_id, report.clone());
         self.outbox.push(report);
     }
@@ -171,6 +235,7 @@ impl CheckpointState {
 
     /// Record a local suspension's report and queue it.
     pub fn record_local_suspension(&mut self, report: SnapshotReport) {
+        report_ready(&report);
         self.local_suspensions
             .insert(report.allocation_id, report.clone());
         self.outbox.push(report);
@@ -858,6 +923,16 @@ fn publish(
     }
     let keys =
         crate::checkpoint_seal::PartKeys::from_proto(&request.part_keys, &request.part_key_error);
+    let chunks = if manifest.memory.is_empty() {
+        None
+    } else {
+        Some(chunk_key(request).with_context(|| {
+            format!(
+                "publishing snapshot {} needs its job's chunk key",
+                manifest.id
+            )
+        })?)
+    };
     let mut uploaded = 0u64;
     for part in &mut manifest.memory {
         let digest = ContentDigest::parse(&part.digest)?;
@@ -867,10 +942,13 @@ fn publish(
                 part.role, manifest.id
             )
         })?;
+        let chunks = chunks
+            .as_ref()
+            .expect("a chunk key for a manifest with parts");
         let mut attempt = 0;
         let published = loop {
             attempt += 1;
-            match publishing.publish(key) {
+            match publishing.publish(key, chunks) {
                 Ok(published) => break published,
                 Err(err) if attempt < PUBLISH_ATTEMPTS => {
                     warn!(
@@ -890,13 +968,29 @@ fn publish(
                 }
             }
         };
-        if published.uploaded {
-            uploaded += published.bytes;
-        }
+        uploaded += published.uploaded_bytes;
         part.url = Some(published.url);
         part.key_id = Some(published.key_id);
     }
     Ok((manifest, uploaded))
+}
+
+/// The job chunk key a publish request carries, or why the manager sent
+/// none.
+fn chunk_key(request: &CheckpointRequest) -> R<crate::checkpoint_seal::ChunkKey> {
+    match request.chunk_key.as_ref() {
+        Some(wire) => crate::checkpoint_seal::ChunkKey::from_proto(wire),
+        None if !request.part_key_error.trim().is_empty() => {
+            bail!(
+                "the manager sent no chunk key: {}",
+                request.part_key_error.trim()
+            )
+        }
+        None => bail!(
+            "the manager sent no chunk key (a manager older than this worker sends none; \
+             upgrade the managers first)"
+        ),
+    }
 }
 
 /// Pre-fetch a published snapshot's parts into the node content store
@@ -1206,14 +1300,73 @@ mod tests {
         // Still running: a re-send starts nothing.
         assert!(state.accept(&[request("snap-a", "capture")]).is_empty());
         state.finish(report("snap-a", "capture"));
-        assert_eq!(state.drain().len(), 1);
+        let sent = state.drain();
+        assert_eq!(sent.len(), 1);
+        state.mark_delivered(&sent);
         // The report was lost or not applied: the manager asks again, and
         // the recorded report goes out again without a second capture.
         assert!(state.accept(&[request("snap-a", "capture")]).is_empty());
         assert_eq!(state.drain(), vec![report("snap-a", "capture")]);
-        // The manager stopped asking: forgotten.
+        // The manager stopped asking after a beat carried it: forgotten.
         assert!(state.accept(&[]).is_empty());
         assert_eq!(state.accept(&[request("snap-a", "capture")]).len(), 1);
+    }
+
+    /// A pushed request starts at once and is deduplicated like one from a
+    /// heartbeat, but a push never makes the node forget anything.
+    #[test]
+    fn a_pushed_request_starts_at_once_and_forgets_nothing() {
+        let mut state = CheckpointState::default();
+        state.finish(report("snap-old", "delete"));
+        let sent = state.drain();
+        state.mark_delivered(&sent);
+        assert_eq!(
+            state.accept_pushed(&[request("snap-a", "capture")]).len(),
+            1
+        );
+        // A push names new work, not the whole set: the delivered delete it
+        // left out is still remembered, and a push of it re-sends its report.
+        assert!(state
+            .accept_pushed(&[request("snap-old", "delete")])
+            .is_empty());
+        assert_eq!(state.drain(), vec![report("snap-old", "delete")]);
+        // The heartbeat re-sends the capture while it runs: nothing new
+        // starts, from either path.
+        assert!(state.accept(&[request("snap-a", "capture")]).is_empty());
+        assert!(state
+            .accept_pushed(&[request("snap-a", "capture")])
+            .is_empty());
+        state.finish(report("snap-a", "capture"));
+        state.drain();
+        assert!(state
+            .accept_pushed(&[request("snap-a", "capture")])
+            .is_empty());
+        assert_eq!(state.drain(), vec![report("snap-a", "capture")]);
+    }
+
+    /// The race a push opens: a heartbeat reply built before the push
+    /// arrives after the pushed work finished. Its set does not list the
+    /// work, but the manager has not heard about it either, so the node must
+    /// keep the report, and re-send it rather than redo the work if the
+    /// manager asks again (the report was lost).
+    #[test]
+    fn an_older_reply_does_not_forget_pushed_work_it_never_saw() {
+        let mut state = CheckpointState::default();
+        assert_eq!(
+            state.accept_pushed(&[request("snap-a", "capture")]).len(),
+            1
+        );
+        state.finish(report("snap-a", "capture"));
+        // The reply built before the snapshot existed.
+        assert!(state.accept(&[]).is_empty());
+        let lost = state.drain();
+        assert_eq!(lost, vec![report("snap-a", "capture")]);
+        // That beat failed to apply it; the manager asks again.
+        assert!(
+            state.accept(&[request("snap-a", "capture")]).is_empty(),
+            "re-sent, not captured twice"
+        );
+        assert_eq!(state.drain(), vec![report("snap-a", "capture")]);
     }
 
     #[test]

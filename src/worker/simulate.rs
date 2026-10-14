@@ -72,8 +72,10 @@ pub struct SimulateOptions {
     /// Fake the checkpoint capability: advertise `checkpoint`, fingerprint
     /// as a Firecracker sandbox host, answer every `capture` and `delete`
     /// request with a successful report, and report each restore payload as
-    /// restored once the allocation is ready. Lets a load generator drive
-    /// suspend, resume, and fork through the manager with no runtime.
+    /// restored once the allocation is ready. Requests pushed on the work
+    /// stream are answered on arrival, and a fresh report wakes the node's
+    /// heartbeat, as on a real worker. Lets a load generator drive suspend,
+    /// resume, and fork through the manager with no runtime.
     pub checkpoints: bool,
     /// Called for every allocation a node learns about, the first time it
     /// does. A load generator embedding the fleet uses it to time delivery.
@@ -340,6 +342,9 @@ struct SimNode {
     allocations: Mutex<HashMap<i64, SimAlloc>>,
     /// Checkpoint reports owed to the manager (`checkpoints` mode).
     reports: Mutex<SimReports>,
+    /// Wakes the node's heartbeat loop before its interval: a checkpoint
+    /// report is waiting, as a real worker's `daemon::wake_heartbeat` does.
+    wake: tokio::sync::Notify,
     /// The desired set as `StreamWork` delivered it (`work_stream` mode).
     mirror: crate::worker::work_stream::SharedMirror,
     /// Allocations whose health the manager has acknowledged, so a
@@ -398,16 +403,19 @@ fn payload_instance_id(allocation: &TaskAllocation) -> String {
 }
 
 /// A node's checkpoint channel state (`checkpoints` mode). The manager
-/// re-sends a request until its report is applied, so a node answers each
-/// `(snapshot, op)` once and re-sends the recorded report while the manager
-/// keeps asking — the same dedupe contract a real worker keeps.
+/// pushes a request on the stream and re-sends it every heartbeat until its
+/// report is applied, so a node answers each `(snapshot, op)` once and
+/// re-sends the recorded report while the manager keeps asking: the same
+/// dedupe contract a real worker keeps (`worker/checkpoints.rs`), including
+/// forgetting an answer only after a heartbeat carried it.
 #[derive(Debug, Default)]
 struct SimReports {
     /// Reports for the next heartbeat.
     pending: Vec<SnapshotReport>,
     /// Every report this node has made, by `(snapshot_id, op)`, for the
-    /// requests the manager still sends.
-    answered: HashMap<(String, String), SnapshotReport>,
+    /// requests the manager still sends, and whether a heartbeat the
+    /// manager answered carried it.
+    answered: HashMap<(String, String), (SnapshotReport, bool)>,
 }
 
 impl SimNode {
@@ -492,28 +500,57 @@ impl SimNode {
     }
 
     /// Answer the manager's checkpoint requests. New work is "done" at once;
-    /// work answered before re-sends its recorded report. Answers for
-    /// requests the manager stopped sending are forgotten.
-    fn answer_checkpoint_requests(&self, requests: &[CheckpointRequest]) {
-        let allocations = self.allocations.lock().expect("sim allocations lock");
+    /// work answered before re-sends its recorded report. With `whole_set`
+    /// (a heartbeat reply's list), answers the manager stopped asking for
+    /// are forgotten once a heartbeat carried them; a stream push is not the
+    /// whole set and forgets nothing. Wakes the heartbeat when anything was
+    /// newly answered, as a real worker's finished work does (a delete's
+    /// confirmation excepted).
+    fn answer_checkpoint_requests(&self, requests: &[CheckpointRequest], whole_set: bool) {
+        let fresh = {
+            let allocations = self.allocations.lock().expect("sim allocations lock");
+            let mut reports = self.reports.lock().expect("sim reports lock");
+            if whole_set {
+                let asked: HashSet<(String, String)> = requests
+                    .iter()
+                    .map(|request| (request.snapshot_id.clone(), request.op.clone()))
+                    .collect();
+                reports
+                    .answered
+                    .retain(|key, (_, delivered)| asked.contains(key) || !*delivered);
+            }
+            let mut fresh = false;
+            for request in requests {
+                let key = (request.snapshot_id.clone(), request.op.clone());
+                let report = match reports.answered.get(&key) {
+                    Some((recorded, _)) => recorded.clone(),
+                    None => {
+                        let report =
+                            sim_checkpoint_report(request, allocations.get(&request.allocation_id));
+                        reports.answered.insert(key, (report.clone(), false));
+                        fresh |= report.op != "delete";
+                        report
+                    }
+                };
+                reports.pending.push(report);
+            }
+            fresh
+        };
+        if fresh {
+            self.wake.notify_one();
+        }
+    }
+
+    /// A heartbeat the manager answered carried `sent`.
+    fn mark_reports_delivered(&self, sent: &[SnapshotReport]) {
         let mut reports = self.reports.lock().expect("sim reports lock");
-        let asked: HashSet<(String, String)> = requests
-            .iter()
-            .map(|request| (request.snapshot_id.clone(), request.op.clone()))
-            .collect();
-        reports.answered.retain(|key, _| asked.contains(key));
-        for request in requests {
-            let key = (request.snapshot_id.clone(), request.op.clone());
-            let report = match reports.answered.get(&key) {
-                Some(recorded) => recorded.clone(),
-                None => {
-                    let report =
-                        sim_checkpoint_report(request, allocations.get(&request.allocation_id));
-                    reports.answered.insert(key, report.clone());
-                    report
-                }
-            };
-            reports.pending.push(report);
+        for report in sent {
+            if let Some((_, delivered)) = reports
+                .answered
+                .get_mut(&(report.snapshot_id.clone(), report.op.clone()))
+            {
+                *delivered = true;
+            }
         }
     }
 }
@@ -999,6 +1036,7 @@ pub async fn launch_simulated_fleet(
                     registered: AtomicBool::new(false),
                     allocations: Mutex::new(HashMap::new()),
                     reports: Mutex::new(SimReports::default()),
+                    wake: tokio::sync::Notify::new(),
                     mirror: Default::default(),
                     health_reported: Mutex::new(HashSet::new()),
                     reported_acked: AtomicUsize::new(0),
@@ -1194,7 +1232,7 @@ async fn run_sim_node(
             move |request| attach_node.credentials.attach(request),
             node.name.clone(),
             node.mirror.clone(),
-            move |_applied| {
+            move |applied| {
                 let desired = applied_node
                     .mirror
                     .lock()
@@ -1202,6 +1240,23 @@ async fn run_sim_node(
                     .desired();
                 let adopted = applied_node.reconcile_allocations(&desired);
                 applied_fleet.observe(&applied_node, &adopted, SimDelivery::Stream);
+                if !applied_fleet.checkpoints {
+                    return;
+                }
+                // Pushed checkpoint work is "done" at once and wakes the
+                // heartbeat, as a real worker's finished work does.
+                if !applied.checkpoint_requests.is_empty() {
+                    applied_node.answer_checkpoint_requests(&applied.checkpoint_requests, false);
+                }
+                // A restore is reported once the allocation is "ready": wake
+                // the heartbeat then, as a real worker's finished restore does.
+                if adopted.iter().any(|payload| payload.restore.is_some()) {
+                    let node = applied_node.clone();
+                    tokio::spawn(async move {
+                        tokio::time::sleep(ready_after).await;
+                        node.wake.notify_one();
+                    });
+                }
             },
         ));
     }
@@ -1218,6 +1273,10 @@ async fn run_sim_node(
         .max(1);
     let mut backoff = SIM_RETRY_MIN;
     let mut tick: u64 = 0;
+    // Whether this beat is the scheduled one, not one a checkpoint report
+    // woke early. Only scheduled beats count toward the health-check
+    // cadence, which a real worker runs on its own timer.
+    let mut scheduled = true;
     loop {
         // Timed and classified exactly as the real worker's loop does it
         // (`daemon::run_heartbeat_loop`), so a campaign reads one set of
@@ -1237,31 +1296,36 @@ async fn run_sim_node(
             Ok(served) => {
                 fleet.heartbeats_ok.fetch_add(1, Ordering::Relaxed);
                 backoff = SIM_RETRY_MIN;
-                if tick.is_multiple_of(ticks_per_health_check) {
-                    // Best-effort like the real worker's check loop: a
-                    // failure logs and waits for the next round.
-                    let req = node.credentials.attach(Request::new(HealthCheckRequest {
-                        id: node.name.clone(),
-                        health_checks: health_checks_json(),
-                    }));
-                    if let Err(status) = client.clone().health_check(req).await {
-                        debug!(node = %node.name, code = %status.code(), "Sim health check failed");
+                if scheduled {
+                    if tick.is_multiple_of(ticks_per_health_check) {
+                        // Best-effort like the real worker's check loop: a
+                        // failure logs and waits for the next round.
+                        let req = node.credentials.attach(Request::new(HealthCheckRequest {
+                            id: node.name.clone(),
+                            health_checks: health_checks_json(),
+                        }));
+                        if let Err(status) = client.clone().health_check(req).await {
+                            debug!(node = %node.name, code = %status.code(), "Sim health check failed");
+                        }
                     }
+                    tick += 1;
                 }
-                tick += 1;
-                match crate::worker::daemon::adopt_served_interval(
+                let sleep = match crate::worker::daemon::adopt_served_interval(
                     heartbeat_interval,
                     configured_interval,
                     served,
                 ) {
                     Some(next) => {
                         heartbeat_interval = next;
-                        tokio::time::sleep(crate::worker::daemon::rephase_sleep(next)).await;
+                        crate::worker::daemon::rephase_sleep(next)
                     }
-                    None => {
-                        tokio::time::sleep(jittered_heartbeat_interval(heartbeat_interval)).await;
-                    }
-                }
+                    None => jittered_heartbeat_interval(heartbeat_interval),
+                };
+                // Or until a checkpoint report is waiting.
+                scheduled = tokio::select! {
+                    _ = tokio::time::sleep(sleep) => true,
+                    _ = node.wake.notified() => false,
+                };
             }
             Err(status) if status.code() == tonic::Code::Unauthenticated => {
                 warn!(node = %node.name, "Sim heartbeat unauthenticated; re-registering");
@@ -1441,7 +1505,8 @@ async fn heartbeat_sim_node(
         fleet.observe(node, &adopted, SimDelivery::Heartbeat);
     }
     if fleet.checkpoints {
-        node.answer_checkpoint_requests(&reply.checkpoint_requests);
+        node.mark_reports_delivered(&snapshot_reports);
+        node.answer_checkpoint_requests(&reply.checkpoint_requests, true);
     }
     Ok(reply.next_interval_seconds)
 }
@@ -1621,19 +1686,29 @@ mod tests {
             purpose: "suspend".into(),
             ..Default::default()
         };
-        node.answer_checkpoint_requests(std::slice::from_ref(&capture));
+        // Pushed on the stream: answered at once, and the heartbeat woken.
+        node.answer_checkpoint_requests(std::slice::from_ref(&capture), false);
         let first = std::mem::take(&mut node.reports.lock().unwrap().pending);
         assert_eq!(first.len(), 1);
         assert!(first[0].ok);
         let manifest: Value = serde_json::from_str(&first[0].manifest_json).unwrap();
         assert_eq!(manifest["originInstance"], json!("user-7"));
         assert_eq!(manifest["kind"], json!("memory"));
-        // Asked again (the report has not been applied yet): the same report.
-        node.answer_checkpoint_requests(std::slice::from_ref(&capture));
+        let woken = futures::FutureExt::now_or_never(node.wake.notified());
+        assert!(woken.is_some(), "a fresh report wakes the heartbeat");
+        // A heartbeat reply built before the push does not list it: the
+        // answer is kept until a heartbeat has carried it.
+        node.answer_checkpoint_requests(&[], true);
+        assert_eq!(node.reports.lock().unwrap().answered.len(), 1);
+        node.mark_reports_delivered(&first);
+        // Asked again (the report has not been applied yet): the same report,
+        // and no wake for a re-send.
+        node.answer_checkpoint_requests(std::slice::from_ref(&capture), true);
         let again = std::mem::take(&mut node.reports.lock().unwrap().pending);
         assert_eq!(again[0].manifest_json, first[0].manifest_json);
-        // No longer asked: forgotten.
-        node.answer_checkpoint_requests(&[]);
+        assert!(futures::FutureExt::now_or_never(node.wake.notified()).is_none());
+        // No longer asked after a beat carried it: forgotten.
+        node.answer_checkpoint_requests(&[], true);
         assert!(node.reports.lock().unwrap().answered.is_empty());
     }
 
@@ -1666,6 +1741,7 @@ mod tests {
             registered: AtomicBool::new(false),
             allocations: Mutex::new(HashMap::new()),
             reports: Mutex::new(SimReports::default()),
+            wake: tokio::sync::Notify::new(),
             mirror: Default::default(),
             health_reported: Mutex::new(HashSet::new()),
             reported_acked: AtomicUsize::new(0),

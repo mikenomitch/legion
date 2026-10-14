@@ -6882,6 +6882,13 @@ mod tests {
     /// The checkpoint key the tests' "manager" derives part keys from.
     const TEST_CHECKPOINT_KEY: [u8; 32] = [42; 32];
 
+    /// The chunk key the manager attaches to a publish.
+    fn test_chunk_key() -> crate::structs::CheckpointChunkKey {
+        crate::checkpoint_seal::ChunkKey::derive(&TEST_CHECKPOINT_KEY, "ck_test", "j")
+            .unwrap()
+            .to_proto()
+    }
+
     /// What the manager attaches to a publish, warm, or restore: one key per
     /// memory part of `manifest`.
     fn part_keys_for(manifest: &Value) -> Vec<crate::structs::CheckpointPartKey> {
@@ -6968,6 +6975,7 @@ mod tests {
             purpose: "suspend".into(),
             manifest_json: captured.to_string(),
             part_keys: part_keys_for(&captured),
+            chunk_key: Some(test_chunk_key()),
             ..Default::default()
         };
         node_a
@@ -6984,18 +6992,18 @@ mod tests {
         let url = published.memory[0].url.clone().expect("part url");
         assert!(url.starts_with("file://"), "{url}");
         assert_eq!(published.memory[0].key_id.as_deref(), Some("ck_test"));
-        let key = crate::checkpoint_seal::PartKey::derive(
-            &TEST_CHECKPOINT_KEY,
-            "ck_test",
-            &entry.digest,
-        )?;
-        let object = shared.path().join("sealed").join(key.object_name());
-        let sealed = std::fs::read(&object)?;
-        assert_eq!(&sealed[..8], crate::checkpoint_seal::SEAL_MAGIC);
-        assert!(
-            !sealed.windows(18).any(|w| w == b"guest memory page "),
-            "the bucket never holds the guest's plaintext"
-        );
+        // The URL names the part's sealed index; the chunks sit beside it,
+        // and every object is sealed.
+        let index = url::Url::parse(&url)?.to_file_path().expect("a file URL");
+        assert_eq!(index.parent(), Some(shared.path().join("sealed").as_path()));
+        for object in std::fs::read_dir(shared.path().join("sealed"))? {
+            let sealed = std::fs::read(object?.path())?;
+            assert_eq!(&sealed[..8], crate::checkpoint_seal::SEAL_MAGIC);
+            assert!(
+                !sealed.windows(18).any(|w| w == b"guest memory page "),
+                "the bucket never holds the guest's plaintext"
+            );
+        }
         assert!(!shared.path().join("sha256").exists());
 
         // B restores from the published manifest, with the keys the manager
@@ -7070,6 +7078,7 @@ mod tests {
             purpose: "suspend".into(),
             manifest_json: captured.to_string(),
             part_keys: part_keys_for(&captured),
+            chunk_key: Some(test_chunk_key()),
             ..Default::default()
         };
         node.lock()
@@ -7179,7 +7188,9 @@ mod tests {
             "ck_test",
             &entry.digest,
         )?;
-        let published = publishing.publish(&key)?;
+        let chunks =
+            crate::checkpoint_seal::ChunkKey::derive(&TEST_CHECKPOINT_KEY, "ck_test", "j")?;
+        let published = publishing.publish(&key, &chunks)?;
         Ok(json!({
             "id": id, "jobId": "j", "task": "t", "originAllocId": 1,
             "runtime": "sandbox", "kind": "memory", "createdAt": "2026-10-10T00:00:00Z",
@@ -7276,20 +7287,24 @@ mod tests {
         // The wrong key also names the wrong object, which is not there.
         assert!(error.contains("fetching part memory"), "{error}");
 
-        let key =
-            crate::checkpoint_seal::PartKey::derive(&TEST_CHECKPOINT_KEY, "ck_test", &digest)?;
-        let object = shared.path().join("sealed").join(key.object_name());
+        // Tamper with one of the part's chunks (any sealed object but the
+        // index the manifest names). It fails at once, not after retries
+        // (checkpoint_chunks tests cover that it is never fetched again).
+        let index = url::Url::parse(manifest["memory"][0]["url"].as_str().unwrap())?
+            .to_file_path()
+            .expect("a file URL");
+        let object = std::fs::read_dir(shared.path().join("sealed"))?
+            .map(|entry| entry.unwrap().path())
+            .find(|path| path != &index)
+            .expect("a chunk beside the index");
         let mut sealed = std::fs::read(&object)?;
         sealed[100] ^= 0x40;
         std::fs::write(&object, &sealed)?;
         let error = warm_with(&manifest, part_keys_for(&manifest), "")?;
+        assert!(error.contains("opening chunk"), "{error}");
         assert!(
             error.contains("failed authentication at chunk 0"),
             "{error}"
-        );
-        assert!(
-            error.contains("after 1 attempt"),
-            "a tampered part is not downloaded again: {error}"
         );
 
         // A manifest published before checkpoint encryption: a URL to a

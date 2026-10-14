@@ -113,6 +113,7 @@ When one is required and what goes in it:
 | [job-status-plan.md](plans/job-status-plan.md) | shipped (per-replica outcomes and status-change events deferred) |
 | [job-templates-plan.md](plans/job-templates-plan.md) | in execution |
 | [job-updated-at-plan.md](plans/job-updated-at-plan.md) | shipped (detail-page header + node column label deferred) |
+| [chunked-checkpoint-publish-plan.md](plans/chunked-checkpoint-publish-plan.md) | in execution (Phase 1 built: published parts as sealed, deduplicated chunks per job and dedup window, zero chunks skipped. Fetching only missing chunks, dirty-page hashing, and a real-S3 run are deferred) |
 | [checkpoint-encryption-plan.md](plans/checkpoint-encryption-plan.md) | shipped (2026-10-11: published checkpoint parts sealed under per-part keys from the keyring's checkpoint key, with manual checkpoint-key rotation, parallel sealing, and streaming decrypt deferred) |
 | [kv-encryption-plan.md](plans/kv-encryption-plan.md) | shipped (all four phases, 2026-09-21: KV values encrypted at rest by default, replicated keyring with the root key outside the store, `file`/`env`/`exec` providers, rotation + rewrap, join-time root key delivery; rendered task-config copies deliberately left for a follow-up plan) |
 | [kv-reactive-task-updates-plan.md](plans/kv-reactive-task-updates-plan.md) | shipped |
@@ -170,6 +171,7 @@ When one is required and what goes in it:
 | [sandbox-scaling-plan.md](plans/sandbox-scaling-plan.md) | in execution: Phases 0–6 shipped (measurement, group commit and write trimming, `StreamWork` delivery, blocked evals, untombstoned minted ids, archived idle keyed instances, and the `session` instance mode with running sessions as node-owned soft state and promotion); session suspend, identity, and the session log deferred; Phase 7's wake on request is built under wake-on-request-plan (keyed and archived instances); Phases 8+ planned (snapshot-clone density, a sub-VM seam, cells past a measured trigger) |
 | [session-durability-and-routing-plan.md](plans/session-durability-and-routing-plan.md) | in execution in #36 (Phases 1–5 built; real-S3, sandbox-memory and edge-move runs open) (builds on session mode: concurrent starts on each node, sessions that survive a worker restart, the start node in the session id, edge starts picked by a load balancer outside Legion with no manager on the path, sessions that sleep on their node, and `store` sessions that move between nodes without split brain; a batched raft session directory deferred behind a trigger) |
 | [wake-on-request-plan.md](plans/wake-on-request-plan.md) | in execution: Phase 1 shipped (`suspend.wake`, `legion start gateway` that resumes a suspended keyed instance on a request and holds it until the instance serves, `CONNECT` for any declared port, a wake webhook, wake fields on `GetInstance`); gateway metrics, waking sessions, and node-local wake on connect planned |
+| [checkpoints-on-stream-plan.md](plans/checkpoints-on-stream-plan.md) | shipped Phase 1 (checkpoint requests pushed on `StreamWork`, reports on an early heartbeat, so suspend and resume no longer wait on the cadence). A report path that skips the heartbeat is deferred until early beats show up as load |
 | [sandbox-exec-plan.md](plans/sandbox-exec-plan.md) | in execution: Phases 1 to 3 built and Phase 0 measured on one host; KVM and rig verification open (exec into Linux microVMs over the guest agent's vsock, and direct exec with worker-verified tickets as a third caller class on the worker-plane-auth listener; implemented together with worker-plane-auth, which it amends in §9) |
 | [rootfs-base-cache-plan.md](plans/rootfs-base-cache-plan.md) | in execution: Phase 1 built and booted on real KVM (cloud-hypervisor) in the sandbox-boot campaign (one base root disk per image per node, cloned per sandbox, per-sandbox files by debugfs, `ensure_image_base` for prefetchers, one tag resolution per burst); artifacts on the cached path, the `container` runtime, visibility, and Firecracker planned |
 | [sandbox-boot-throughput-plan.md](plans/sandbox-boot-throughput-plan.md) | shipped, phases 1–3 (raw disks and `hvc0` on cloud-hypervisor, `running` on guest readiness, `stateful.placement`, the worker's start and stop paths off the lock, measured on AWS: 0.23 s a boot, 69 a second from four 4-vCPU nodes); phase 4, the ~50/s per-node ceiling on large nodes, open |
@@ -213,6 +215,7 @@ by project impact. The full template and a worked example:
 - [sandbox-scaling-plan_calls.md](calls/sandbox-scaling-plan_calls.md)
 - [sandbox-snapshots-and-fast-start-plan_calls.md](calls/sandbox-snapshots-and-fast-start-plan_calls.md)
 - [wake-on-request-plan_calls.md](calls/wake-on-request-plan_calls.md)
+- [checkpoints-on-stream-plan_calls.md](calls/checkpoints-on-stream-plan_calls.md)
 - [session-durability-and-routing-plan_calls.md](calls/session-durability-and-routing-plan_calls.md)
 - [gang-scheduling-plan_calls.md](calls/gang-scheduling-plan_calls.md)
 - [heartbeat-cadence-at-scale-plan_calls.md](calls/heartbeat-cadence-at-scale-plan_calls.md)
@@ -228,6 +231,7 @@ by project impact. The full template and a worked example:
 - [operator-ui-gaps-plan_calls.md](calls/operator-ui-gaps-plan_calls.md)
 - [ui-holistic-polish-plan_calls.md](calls/ui-holistic-polish-plan_calls.md)
 - [ui-task-and-template-redesign-plan_calls.md](calls/ui-task-and-template-redesign-plan_calls.md)
+- [chunked-checkpoint-publish-plan_calls.md](calls/chunked-checkpoint-publish-plan_calls.md)
 - [checkpoint-encryption-plan_calls.md](calls/checkpoint-encryption-plan_calls.md)
 - [kv-encryption-plan_calls.md](calls/kv-encryption-plan_calls.md)
 - [kv-reactive-task-updates-plan_calls.md](calls/kv-reactive-task-updates-plan_calls.md)

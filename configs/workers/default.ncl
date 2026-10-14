@@ -58,11 +58,14 @@
     },
     # Where this worker publishes content (docs/artifacts.md, "Publishing
     # content"). Absent by default: the node publishes nothing. Every part
-    # is sealed (AES-256-GCM) with a key the manager sends, and lands at
-    # <url>/sealed/<name>, so the bucket never holds plaintext and
-    # publishing is idempotent. Any worker that can read the URL and is sent
-    # the key fetches it back through the ordinary s3:// or file:// artifact
-    # fetcher, opened and verified by digest. Point each
+    # is cut into chunks, and each distinct non-zero chunk is sealed
+    # (AES-256-GCM) and lands once at <url>/sealed/<name>, beside a sealed
+    # index per part, so the bucket never holds plaintext and a repeat
+    # checkpoint uploads only what changed (docs/suspend-and-resume.md, "How
+    # published parts are stored"). Any worker that can read the URL and is
+    # sent the part's key fetches it back, opened and verified by digest.
+    # Expire sealed/ with a bucket lifecycle rule older than your
+    # longest-lived checkpoint plus dedupWindow. Point each
     # region's workers at their own bucket for region locality. A worker
     # with a contentStore publishes durable checkpoints
     # (suspend.durability = "store", `legion snapshot create --publish`) and
@@ -74,6 +77,13 @@
     #     # variables, then the instance profile). Or read an AWS credential
     #     # object from KV, the same shape artifact auth.kv takes:
     #     # auth = { kv = "legion/content-store" },
+    #     # The size parts are cut into: 64KiB to 16MiB, a multiple of 4KiB.
+    #     # Smaller uploads fewer unchanged bytes per change, and makes more
+    #     # objects and requests.
+    #     # chunkSize = "1MiB",
+    #     # How long chunks are shared between publishes. A chunk is reused
+    #     # only in the window it was uploaded in. At least 1m.
+    #     # dedupWindow = "24h",
     # },
     # Sessions (docs/session-mode.md, "No split brain"). Only acts on
     # sessions whose task sets suspend.durability = "store", which need a
