@@ -17,7 +17,7 @@ the comparison fair.
   a 250,000-allocation burst on a 50,000-node fleet.
 - **Many times Nomad and Kubernetes on the same rig.** With all three
   systems' stores on the same local NVMe, Legion placed 3.5-7.5x the
-  allocations/sec of Nomad and Kubernetes at 1k-2k nodes and 20-35x at
+  allocations/sec of Nomad and Kubernetes at 1k-2k nodes and 22-35x at
   5k-10k. Both competitors are CPU-bound on one control-plane box from 5k
   nodes up, not disk-bound.
 - **Millisecond latency below saturation.** Submitted at a steady rate,
@@ -126,6 +126,12 @@ submits through its own API. Legion is built from `main` at `89229706`.
 | 2,000  | **640**   | 102     | 85                |
 | 5,000  | **1,175** | 49     | 52                |
 | 10,000 | **635**   | 27          | 18                |
+
+Each number is one run, so the multiple depends on which fleet size you
+quote: Legion leads by 3.5-7.5x at 1k-2k nodes and 22-35x at 5k-10k. Its
+peak at 5k is not a single outlier. The fixed-heartbeat ablation below
+reran that cell at 1,134/sec, and the earlier build also peaked at 5k
+(905/sec, against 738 at 10k).
 
 The Kubernetes 10k cell reached the driver's 42-minute cap with 92% of its
 50,000 pods placed, so its number is the rate over that window. Nomad
