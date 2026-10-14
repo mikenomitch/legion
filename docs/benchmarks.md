@@ -173,6 +173,13 @@ disk. Both are out of CPU on one control-plane box:
 | 20                   | 100,000     | **2,466**    | 77          | 25                |
 | 40                   | 200,000     | **2,139**    | 81          | 30, then failed   |
 
+Legion placed 99% of each burst within 8 seconds at 25,000 allocations
+and within 70 seconds at 200,000. Nomad holds a flat 77-83/sec across the
+whole sweep, the rate its CPU-bound leader commits plans at. At 10 and 40
+allocations per node its event stream came a few events short of the
+200,000-allocation total, and Nomad's own count shows every allocation
+placed.
+
 At 40 allocations per node, Kubernetes placed about 12,000 Pods at
 30/sec over six minutes. Then the API server on the box running the
 scheduler stopped completing new TLS handshakes in time, and the driver's
