@@ -189,9 +189,10 @@ is ordinary task config, set like any other.
   through a hardlink to one: Firecracker's mapping is private, both
   cloud-hypervisor modes only read, and the `config.json` rewrite replaces
   the file rather than editing it.
-- Published parts are sealed in independent 1 MiB AES-256-GCM chunks
-  (`src/checkpoint_seal.rs`), so chunk *i* can be fetched and opened on its
-  own. Phase 2 relies on that.
+- Published parts are a sealed index of separately sealed chunks, 1 MiB by
+  default (`src/checkpoint_chunks.rs`,
+  [chunked checkpoint publish](chunked-checkpoint-publish-plan.md)), so
+  chunk *i* can be fetched and opened on its own. Phase 2 relies on that.
 
 ## 6. Design
 
@@ -306,9 +307,9 @@ are fetched.
 
 **Phase 2: start a published restore while its memory streams in.** Today
 `fetch_published_parts` downloads every part before the start. Serve the
-memory part to the VMM from a page source that reads ranges of the sealed
-object (1 MiB chunks open independently), with a background fill behind
-it: Firecracker's `Uffd` backend with a Legion page server in its own
+memory part to the VMM from a page source that fetches the chunks the
+part's index lists as the guest faults on them, with a background fill
+behind it: Firecracker's `Uffd` backend with a Legion page server in its own
 process, and cloud-hypervisor's socket page source
 (`SocketUffdMemorySource`, v53) or its offload daemon. This couples a
 running guest to the bucket until the fill completes, so it needs its own

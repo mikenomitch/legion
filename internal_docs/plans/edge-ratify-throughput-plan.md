@@ -110,7 +110,8 @@ that runs in parallel on the manager's cores, not the serialized commit
 **Non-goals**
 
 - Admission control and an `overloaded` refusal before lease expiry. That
-  is separate work (TODO "Backpressure before lease expiry").
+  is separate work, built under the
+  [edge admission control plan](edge-admission-control-plan.md).
 - Per-entry raft cost (changeset capture, pipelining) and plan-commit cost
   that grows with fleet size. Those are their own TODO items and dominate
   the numbers here once the false conflicts are gone.

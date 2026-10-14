@@ -508,9 +508,11 @@ change the cells.
 **What happens past the ceiling.** Ratifications queue for the scheduler
 lane, and verdict latency (`legion_provisional_ratify_seconds`) climbs.
 A claim with no verdict by its `ratifyTimeout` is killed and its start is
-refused as `expired`. Nodes do not slow their own admission when
-ratification latency climbs. Watch the p99 of
-`legion_provisional_ratify_seconds` against `ratifyTimeout`.
+refused as `expired`. Edge nodes shrink their claim window when their
+verdicts come back slowly and refuse new starts `OVERLOADED` before boot
+(see [Overload](#overload)), so only claims admitted before the slowdown
+run into the lease. Watch the p99 of `legion_provisional_ratify_seconds`
+against `ratifyTimeout`.
 
 ## The kill path
 

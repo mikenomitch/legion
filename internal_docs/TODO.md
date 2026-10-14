@@ -3231,9 +3231,10 @@ Plans: [task-runtime-plugins](../docs/task-runtime-plugins.md).
           yes, add a one-time copy retry gated on the VMM exiting before the
           resume ([calls #4](calls/lazy-memory-restore-plan_calls.md)).
     - [ ] Lazy memory Phase 2: start a published restore while its memory
-          streams from the bucket (sealed parts open per 1 MiB chunk, so a
-          page server can range-read them). Today every part is fetched
-          whole before the restore starts.
+          streams from the bucket (each part is an index of separately
+          sealed chunks since chunked publish, so a page server can fetch
+          the chunk a fault needs). Today every part is fetched whole
+          before the restore starts.
     - [ ] Lazy memory Phase 3: record each guest's post-resume working set
           and prefetch it on the next restore (REAP), the fix for the
           post-resume fault cost of lazy restore.
