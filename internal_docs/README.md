@@ -122,6 +122,7 @@ When one is required and what goes in it:
 | [preemption-and-eviction-plan.md](plans/preemption-and-eviction-plan.md) | shipped (graceful stop, six priority bands, plan-atomic preemption) |
 | [multi-cluster-federation-plan.md](plans/multi-cluster-federation-plan.md) | planned |
 | [multi-raft-persistence-plan.md](plans/multi-raft-persistence-plan.md) | planned |
+| [multi-eval-plans-plan.md](plans/multi-eval-plans-plan.md) | in execution (phases 1–2 shipped 2026-10-13: one running eval per job folds a one-job burst into one plan per handler cycle, and the fused settle is armed in every placing handler whose plan is its last write. Phase 3, settling evals a running plan already covered, is deferred) |
 | [namespaces-plan.md](plans/namespaces-plan.md) | planned (namespace object + namespace-scoped ACLs; quota/pools and namespaced KV deferred) |
 | [read-model-coherence-plan.md](plans/read-model-coherence-plan.md) | in execution (all five phases built; raft shadow check deferred) |
 | [service-mesh-plan.md](plans/service-mesh-plan.md) | **authoritative for the mesh**; shipped M1–M10 (policy, HTTP mode, name-is-config, gated, ingress, handlers, mTLS, graph, sandbox vsock, templates) with two named deferrals — unifies the SD §8 follow-on with the handlers plan |
@@ -166,7 +167,7 @@ When one is required and what goes in it:
 | [suspend-resume-and-oversubscription-plan.md](plans/suspend-resume-and-oversubscription-plan.md) | in execution (Phases 1-7 shipped, Phase 8 deferred, KVM checks pending) |
 | [suspend-resume-and-oversubscription-plan.md](plans/suspend-resume-and-oversubscription-plan.md) | in execution (Phases 1-3 and 7a shipped, KVM checks pending) |
 | [sandbox-scaling-plan.md](plans/sandbox-scaling-plan.md) | in execution: Phases 0–6 shipped (measurement, group commit and write trimming, `StreamWork` delivery, blocked evals, untombstoned minted ids, archived idle keyed instances, and the `session` instance mode with running sessions as node-owned soft state and promotion); session suspend, identity, and the session log deferred; Phase 7's wake on request is built under wake-on-request-plan (keyed and archived instances); Phases 8+ planned (snapshot-clone density, a sub-VM seam, cells past a measured trigger) |
-| [scheduler-lane-entry-cost-plan.md](plans/scheduler-lane-entry-cost-plan.md) | in execution: Phase 1 shipped (keyed placements bind their instance from two indexes instead of scanning the task's whole population, the largest piece of serial lane time in the profile); the pipelined lane (Phase 2) and one fsync per entry (Phase 3) designed, not built |
+| [scheduler-lane-entry-cost-plan.md](plans/scheduler-lane-entry-cost-plan.md) | in execution: Phase 1 shipped (keyed placements bind their instance from two indexes instead of scanning the task's whole population, the largest piece of serial lane time in the profile), with the pipelined lane (Phase 2) and one fsync per entry (Phase 3) designed, not built |
 | [session-durability-and-routing-plan.md](plans/session-durability-and-routing-plan.md) | in execution in #36 (Phases 1–5 built; real-S3, sandbox-memory and edge-move runs open) (builds on session mode: concurrent starts on each node, sessions that survive a worker restart, the start node in the session id, edge starts picked by a load balancer outside Legion with no manager on the path, sessions that sleep on their node, and `store` sessions that move between nodes without split brain; a batched raft session directory deferred behind a trigger) |
 | [wake-on-request-plan.md](plans/wake-on-request-plan.md) | in execution: Phase 1 shipped (`suspend.wake`, `legion start gateway` that resumes a suspended keyed instance on a request and holds it until the instance serves, `CONNECT` for any declared port, a wake webhook, wake fields on `GetInstance`); gateway metrics, waking sessions, and node-local wake on connect planned |
 | [sandbox-exec-plan.md](plans/sandbox-exec-plan.md) | in execution: Phases 1 to 3 built and Phase 0 measured on one host; KVM and rig verification open (exec into Linux microVMs over the guest agent's vsock, and direct exec with worker-verified tickets as a third caller class on the worker-plane-auth listener; implemented together with worker-plane-auth, which it amends in §9) |
@@ -240,6 +241,7 @@ by project impact. The full template and a worked example:
 - [manager-workload-identity-plan_calls.md](calls/manager-workload-identity-plan_calls.md)
 - [multi-cluster-federation-plan_calls.md](calls/multi-cluster-federation-plan_calls.md)
 - [multi-raft-persistence-plan_calls.md](calls/multi-raft-persistence-plan_calls.md)
+- [multi-eval-plans-plan_calls.md](calls/multi-eval-plans-plan_calls.md)
 - [namespaces-plan_calls.md](calls/namespaces-plan_calls.md)
 - [network-handlers-plan_calls.md](calls/network-handlers-plan_calls.md)
 - [service-mesh-plan_calls.md](calls/service-mesh-plan_calls.md)

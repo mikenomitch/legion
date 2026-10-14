@@ -1056,6 +1056,19 @@ fn armed_eval_settle() -> Option<FusedEvalSettle> {
     })
 }
 
+/// Take back an [`arm_eval_settle`]: the plan about to apply leaves work
+/// unplaced, so the handler may write again after it (a second pass with
+/// an avoided node allowed, or a delayed retry for preemption victims that
+/// have not aged). The eval then settles in its own write, after them, as
+/// an unarmed handler's does. A no-op outside a settle scope.
+pub fn disarm_eval_settle() {
+    EVAL_SETTLE_SCOPE.with(|scope| {
+        if let Some(scope) = scope.borrow_mut().as_mut() {
+            scope.armed = false;
+        }
+    });
+}
+
 /// Record that the current handler's eval is settled.
 fn mark_eval_settled() {
     EVAL_SETTLE_SCOPE.with(|scope| {
@@ -17632,20 +17645,23 @@ impl Store {
     /// The terminal writes for handled evals, then the release of their
     /// claims. Each completion also deletes the duplicates its claim
     /// subsumed. Nothing is proposed when every completion is already
-    /// written and subsumed nothing.
+    /// written.
     fn write_eval_completions(&self, completions: Vec<(String, EvalCompletion)>) -> R<()> {
         if completions.is_empty() {
             return Ok(());
         }
         let ids: Vec<String> = completions.iter().map(|(id, _)| id.clone()).collect();
+        // A settled eval's plan already deleted its row and the duplicates
+        // its claim subsumed (`FusedEvalSettle::subsumed`, read from the
+        // same claim), so it needs nothing here. Proposing the deletes again
+        // would be an empty changeset that still queues a capture on the
+        // scheduler lane.
         let writes: Vec<(String, EvalCompletion, Vec<String>)> = completions
             .into_iter()
+            .filter(|(_, completion)| !matches!(completion, EvalCompletion::Settled))
             .map(|(id, completion)| {
                 let subsumed = self.subsumed_by_claim(&id);
                 (id, completion, subsumed)
-            })
-            .filter(|(_, completion, subsumed)| {
-                !matches!(completion, EvalCompletion::Settled) || !subsumed.is_empty()
             })
             .collect();
         if !writes.is_empty() {

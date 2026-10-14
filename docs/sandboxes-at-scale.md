@@ -302,5 +302,5 @@ runtime's own boot or restore time for the end-to-end figure.
   Suspended, stopped, and destroyed instances are not looked at, so parking
   idle sandboxes keeps placements fast however many there are. A task with
   tens of thousands of running instances adds milliseconds of lane time to
-  each placement; splitting them across tasks (one per tenant, say) keeps
+  each placement. Splitting them across tasks (one per tenant, say) keeps
   each placement's share small.
