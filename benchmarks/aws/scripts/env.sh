@@ -518,9 +518,23 @@ rig_install_cli_token() { # rig_install_cli_token
 }
 
 rsh() { # rsh <ip> <command...>
-    local ip="$1"
+    local ip="$1" attempt rc=0
     shift
-    ssh "${SSH_OPTS[@]}" "$ip" "$@"
+    # Exit 255 is ssh's own failure (connect, banner, auth), not the remote
+    # command's. A control-plane box coming off a 4/4-core overload timed
+    # out the banner exchange twice on 2026-10-14 and each one ended a whole
+    # campaign at its first `wipe`, so ssh-level failures get two retries.
+    # A piped or redirected stdin may already be partly consumed, so those
+    # calls are never replayed.
+    for attempt in 1 2 3; do
+        if ssh "${SSH_OPTS[@]}" "$ip" "$@"; then return 0; else rc=$?; fi
+        [ "$rc" -eq 255 ] || return "$rc"
+        { [ -p /dev/stdin ] || [ -f /dev/stdin ]; } && return "$rc"
+        [ "$attempt" -lt 3 ] || break
+        echo "ssh to $ip failed (exit 255), retrying in $((attempt * 10))s" >&2
+        sleep $((attempt * 10))
+    done
+    return "$rc"
 }
 
 rcp() { # rcp <local-path> <ip>:<remote-path>
