@@ -1657,10 +1657,11 @@ pub(crate) fn restore_microvm(
         }
         other => bail!("{} cannot restore a memory checkpoint", other.label()),
     };
-    crate::task_plugins::configure_task_log_capture(&mut cmd, instance)?;
     // A restored VMM is governed exactly like a booted one: guest RAM under
-    // the allocation's `memory.max`.
+    // the allocation's `memory.max`. The join rewrites the command, so it
+    // comes before anything that configures the command's stdio.
     crate::task_plugins::join_assignment_cgroup(&mut cmd, instance)?;
+    crate::task_plugins::configure_task_log_capture(&mut cmd, instance)?;
     let child = crate::task_plugins::spawn_task_process(&mut cmd)
         .context("failed to spawn the VMM for a restore")?;
     instance.pid = Some(child.id());

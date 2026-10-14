@@ -109,19 +109,15 @@ pub fn spawn_task_process(cmd: &mut Command) -> R<Child> {
     {
         use std::os::unix::process::CommandExt;
 
-        // Run task processes in their own session so they survive worker restarts
-        // and to keep worker signal handling independent from task signal handling.
-        unsafe {
-            cmd.pre_exec(|| {
-                unsafe extern "C" {
-                    fn setsid() -> i32;
-                }
-                if setsid() == -1 {
-                    return Err(std::io::Error::last_os_error());
-                }
-                Ok(())
-            });
-        }
+        // Run task processes in their own process group so they survive
+        // worker restarts and keep worker signal handling independent from
+        // task signal handling: a terminal's signals reach its foreground
+        // group, which is the worker's, and stopping a task signals its
+        // group. A process group rather than a session (`setsid`), because
+        // `posix_spawn` sets one natively while a session needs a `pre_exec`
+        // hook, which makes the spawn a `fork` of the whole worker (see
+        // `join_assignment_cgroup`).
+        cmd.process_group(0);
     }
 
     cmd.spawn().context("Failed to spawn task process")
@@ -291,8 +287,8 @@ pub(crate) fn signal_task_process(
 
     #[cfg(unix)]
     {
-        // Tasks are spawned into their own session (`setsid` in
-        // `spawn_task_process`), so signalling the process GROUP reaches a
+        // Tasks are spawned into their own process group
+        // (`spawn_task_process`), so signalling the process GROUP reaches a
         // shell-wrapped task's children too — the common case where the
         // tracked pid is `sh -c` and the real workload is its child. A
         // negative pid is the POSIX spelling for "the group".
@@ -345,8 +341,8 @@ pub(crate) fn reap_task_process(
         .or(instance.pid)
     {
         // Every runtime that reaps here spawned its task with
-        // `spawn_task_process`, which makes the task a group leader
-        // (`setsid`). ESRCH (no such group) is fine: the group is gone, or
+        // `spawn_task_process`, which makes the task a group leader.
+        // ESRCH (no such group) is fine: the group is gone, or
         // this pid never led one, and the per-pid kill below still runs.
         let _ = unsafe { libc::kill(-(pid as i32), libc::SIGKILL) };
     }

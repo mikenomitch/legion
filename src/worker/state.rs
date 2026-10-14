@@ -387,8 +387,8 @@ fn write_owner_only(path: &Path, contents: &[u8], sync: bool) -> R<()> {
 /// SIGKILL what is left of a restored task's process group when the
 /// tracked process itself is gone. Returns whether anything was signalled.
 ///
-/// Every task is spawned as its own session and process-group leader
-/// (`setsid` in `spawn_task_process`), so `pid` is also the group id. When
+/// Every task is spawned as its own process-group leader
+/// (`spawn_task_process`), so `pid` is also the group id. When
 /// the leader dies while the worker is down — a `sh -c` wrapper killed by a
 /// service manager, say — its children keep the group alive: still running,
 /// still holding the task's ports and volumes, and no longer in any record

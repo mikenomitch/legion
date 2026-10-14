@@ -5540,7 +5540,7 @@ fn persisted_process_identity(record: &PersistedAllocation, pid: u32) -> Persist
 /// window has run out, for a worker process that has not reached its manager
 /// yet. Returns the fenced allocation ids.
 ///
-/// Tasks outlive the worker (`setsid`), but the in-process watchdog only
+/// Tasks outlive the worker (their own process groups), but the in-process watchdog only
 /// starts after registration. A worker restarted during a partition would
 /// otherwise wait in its connect loop, or crash-loop on a failed
 /// pre-registration, while its restored stateful tasks ran unfenced
