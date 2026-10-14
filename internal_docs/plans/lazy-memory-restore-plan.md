@@ -347,7 +347,11 @@ share no memory pages" TODO.
   worker in a default container falls back to the copy restore instead of
   failing.
 
-**Phase 1, on KVM (not run yet):**
+**Phase 1, on KVM (not run yet).** Numbers from these runs go in two
+places: the §1 table here, and the "Restore time" paragraph of
+docs/task-runtime-sandbox.md, "How memory comes back", which is the one
+public place that states restore times.
+
 - `restore_ms` for 1, 4, and 8 GiB guests, `lazy` and `eager`, on
   Firecracker and cloud-hypervisor v51, v52, and v53, from a warm and a
   dropped page cache (`echo 3 > /proc/sys/vm/drop_caches`).

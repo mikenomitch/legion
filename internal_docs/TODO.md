@@ -3181,7 +3181,12 @@ Plans: [task-runtime-plugins](../docs/task-runtime-plugins.md).
           `restore_ms` at 1, 4, and 8 GiB on both VMMs and cloud-hypervisor
           v51 to v53, lazy against eager, a touch-all workload after the
           resume, and the no-userfaultfd fallback. Nothing in Phase 1 ran on
-          a real VMM.
+          a real VMM. Put the measured numbers in the "Restore time"
+          paragraph of
+          [How memory comes back](../docs/task-runtime-sandbox.md#how-memory-comes-back).
+          If an on-demand restore fails where the userfaultfd probe said
+          yes, add a one-time copy retry gated on the VMM exiting before the
+          resume ([calls #4](calls/lazy-memory-restore-plan_calls.md)).
     - [ ] Lazy memory Phase 2: start a published restore while its memory
           streams from the bucket (sealed parts open per 1 MiB chunk, so a
           page server can range-read them). Today every part is fetched

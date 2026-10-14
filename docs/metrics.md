@@ -393,8 +393,9 @@ sum across them. See [suspend-and-resume.md](suspend-and-resume.md#metrics).
   paused plus storing its memory. Buckets run from 25 ms to 60 s.
 - **`legion_instance_resume_seconds{kind}`** (histogram): how long each
   successful resume's restore took on its node, by `kind`. Placement time is
-  not included. The memory target is under 300 ms for a 1 GiB guest on local
-  NVMe.
+  not included. What a memory restore waits for depends on its
+  `memory_restore` mode (see
+  [How memory comes back](task-runtime-sandbox.md#how-memory-comes-back)).
 - **`legion_instance_suspends_total{reason}`** (counter): suspends applied,
   by `reason`: `manual` (SuspendInstance), `idle` (a task's idle policy),
   `pressure` (a node's `suspend` pressure step), or `make_room` (to make room

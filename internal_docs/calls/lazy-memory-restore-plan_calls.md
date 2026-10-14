@@ -83,7 +83,32 @@ INFO Restoring sandbox memory eagerly: lazy restore is not available here ... re
   default-on preference strand checkpoints on nodes that can still restore
   them (simplicity).
 
-## 4. Firecracker `eager` reads the memory file through the page cache first
+## 4. A failed on-demand restore is not retried with a copy (port onto #43)
+
+The fallback in entry 3 is decided before the VMM launches, from the
+checkpoint's VMM version and the userfaultfd probe. If cloud-hypervisor
+still refuses an on-demand restore after that, the restore fails and
+`onRestoreFailure` applies, as for any failed restore.
+
+- **Alternatives.** Reap the VMM and relaunch once with the copy restore,
+  logging the first error.
+- **Trade-off.** A node where the probe says yes but cloud-hypervisor
+  cannot restore on demand (a wrapper or a seccomp profile stricter than
+  the worker's, a kernel without the userfaultfd features it needs) loses
+  the restore, and by default boots the instance cold, until the operator
+  sets `memory_restore = "eager"` or fixes the node.
+- **Why.** A retry is only safe when the guest never ran, and the restore
+  cannot always tell: a `vm.resume` that times out may have resumed the
+  guest, which could then have written to its root disk and volumes before
+  the second launch rewinds its memory over them. cloud-hypervisor
+  documents the cases where `ondemand` fails (no userfaultfd, `prefault`,
+  VFIO, vDPA, vfio-user, and vhost-user devices), and Legion's sandboxes
+  hit only the first, which the probe covers. The KVM checks (plan §9)
+  include the no-userfaultfd fallback. If they turn up a failure the probe
+  misses, a retry gated on "the VMM exited before the resume was sent" is
+  the follow-up (simplicity over a speculative recovery path).
+
+## 5. Firecracker `eager` reads the memory file through the page cache first
 
 - **Alternatives.** (a) Ignore `eager` on Firecracker and document that it
   always restores lazily. (b) Use Firecracker's `Uffd` backend with a
@@ -98,7 +123,7 @@ INFO Restoring sandbox memory eagerly: lazy restore is not available here ... re
   process for the eager case only. (a) would make the knob a no-op on half
   the VMMs without telling anyone.
 
-## 5. The node probes for a userfaultfd itself, and takes the VMM version from the checkpoint
+## 6. The node probes for a userfaultfd itself, and takes the VMM version from the checkpoint
 
 - **Alternatives.** (a) Advertise lazy-restore support as a node attribute
   at registration. (b) Run `cloud-hypervisor --version` on every restore.
@@ -113,7 +138,7 @@ INFO Restoring sandbox memory eagerly: lazy restore is not available here ... re
   the recorded version is this node's, without spawning a process (b). No
   node attribute, because nothing should place on it (entry 3).
 
-## 6. The first resume after a cloud-hypervisor `--restore` waits up to five minutes
+## 7. The first resume after a cloud-hypervisor `--restore` waits up to five minutes
 
 `CloudHypervisorApi::resume_restored` uses the 300 s snapshot timeout
 instead of the 10 s control timeout.
@@ -132,7 +157,7 @@ instead of the 10 s control timeout.
   adds a polling loop to wait for the same thing. Lazy restores, the
   default, return in well under a second either way.
 
-## 7. A capture during cloud-hypervisor's background fill waits for it, paused
+## 8. A capture during cloud-hypervisor's background fill waits for it, paused
 
 cloud-hypervisor v53 refuses `vm.snapshot` while an on-demand restore is
 still loading memory. Legion's capture retries for up to 60 s with the VM
@@ -151,7 +176,7 @@ paused.
   the fill finishes at the same moment either way. Most captures here are
   suspends of an idle guest, where pausing early costs nothing.
 
-## 8. Phase 1 uses each VMM's own mechanism, with no Legion page-fault handler
+## 9. Phase 1 uses each VMM's own mechanism, with no Legion page-fault handler
 
 - **Alternatives.** The old plan's `legion-uffd-handler`: Firecracker's
   `Uffd` backend, with a Legion process serving pages from the content

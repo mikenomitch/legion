@@ -1089,9 +1089,9 @@ VMM killed. If storing fails, the guest is resumed and keeps running.
 
 A restore can bring the guest's RAM back before the guest runs, or let the
 guest run first and load each page the first time it is touched. The first
-makes a restore take longer the more memory the guest has. The second makes
-a restore take about the same time at any size, and moves the cost to the
-guest's first touches of its memory after it resumes. `config.memory_restore`
+makes a restore take longer the more memory the guest has. The second keeps
+the time before the guest runs from growing with its memory, and moves the
+cost to the guest's first touches of its memory after it resumes. `config.memory_restore`
 picks per task, and applies to every restore of it: a resume, a snapshot
 restore, a fork, and a create from a snapshot.
 
@@ -1109,6 +1109,11 @@ config = {
 | Firecracker | The guest runs once its device state is loaded. Firecracker maps the memory file copy-on-write, and the kernel loads each page from it on first touch. | The node reads the memory file through the page cache first, then restores the same way, so the guest's first touches are cache hits rather than disk reads. |
 | cloud-hypervisor v52 and later | `memory_restore_mode=ondemand`: the guest runs once its device state is loaded, and cloud-hypervisor loads each page on first touch. From v53 it also fills in the rest in the background, so memory is fully loaded seconds after the resume. | cloud-hypervisor copies the whole memory file into the guest before it runs. |
 | cloud-hypervisor before v52 | Restores like `eager`, and logs why. | Copies the whole memory file first. |
+
+Firecracker uses its `File` memory backend in both modes, which is how it
+always restored, so `lazy` changes nothing there. Legion does not use
+Firecracker's `Uffd` backend. On cloud-hypervisor, `memory_restore` is what
+changes the `--restore` argument.
 
 `lazy` is the default because a sandbox woken by a request usually touches
 a small part of its memory before it answers. Choose `eager` for a workload
@@ -1129,9 +1134,20 @@ logs the reason:
 INFO Restoring sandbox memory eagerly: lazy restore is not available here allocation_id=412 snapshot_id=snap-5b10e2c7a9d04f31 reason="cloud-hypervisor 51.2.0 restores memory only by copying it (on-demand restore needs v52.0 or later)"
 ```
 
-Every restore's log line names the mode it used and how long it took
-(`memory_restore=lazy restore_ms=…`), and `instance get` shows the restore
-time.
+**Restore time.** Every restore logs the mode it used and how long the VMM
+took, from its launch to the guest running:
+
+```text
+INFO Restored sandbox from memory checkpoint allocation_id=413 snapshot_id=snap-5b10e2c7a9d04f31 vmm=cloud-hypervisor memory_restore=lazy restore_ms=…
+```
+
+The whole restore, including linking the checkpoint's parts and cloning the
+root disk, is the `restore` stage of `legion_task_start_stage_seconds`, and
+a resume's is also `legion_instance_resume_seconds{kind="memory"}` (see
+[metrics](metrics.md)). `instance get` shows the last restore time. A lazy
+restore's `restore_ms` leaves out the time the guest later spends loading
+pages, so judge a workload by its time to first response after the resume,
+not by `restore_ms` alone.
 
 **What a lazily restored guest depends on.** Until its memory is loaded, the
 guest reads it from the checkpoint's memory file on the node. Firecracker

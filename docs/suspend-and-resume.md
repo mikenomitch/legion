@@ -480,8 +480,9 @@ emits `instance.resumed` with the restore time, which `instance get` shows as
 the last restore. The spent checkpoint is then reclaimed from the node.
 
 A memory resume loads the guest's device state and lets it run. By default
-its memory then loads as the guest touches it, so a resume on the node that
-holds the checkpoint takes about the same time at any guest size. A task
+(on Firecracker, and on cloud-hypervisor v52 and later) its memory then loads
+as the guest touches it, so on the node that holds the checkpoint the time
+before the guest runs does not grow with its memory. A task
 whose workload touches most of its memory right after it wakes can load all
 of it first instead (`memory_restore = "eager"`, see
 [How memory comes back](task-runtime-sandbox.md#how-memory-comes-back)). A
