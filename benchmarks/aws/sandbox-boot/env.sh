@@ -29,7 +29,11 @@ SB_WORKER_TYPE="${SB_WORKER_TYPE:-c8i.xlarge}"
 SB_LOAD_TYPE="${SB_LOAD_TYPE:-c8i.xlarge}"
 SB_BUILD_TYPE="${SB_BUILD_TYPE:-c8i.8xlarge}"
 
-# Box names, overridable per run: SB_WORKERS="sbx-wkr-1 sbx-wkr-2".
+SB_STATE="${SB_STATE:-$SB_DIR/.state}"
+# Box names, overridable per run (SB_WORKERS="sbx-wkr-1 sbx-wkr-2") or for the
+# rig's current shape in .state/topology (the same three variables).
+# shellcheck disable=SC1091
+[ -f "$SB_STATE/topology" ] && source "$SB_STATE/topology"
 read -r -a SB_MANAGERS <<<"${SB_MANAGERS:-sbx-mgr-1}"
 read -r -a SB_WORKERS <<<"${SB_WORKERS:-sbx-wkr-1}"
 read -r -a SB_LOADERS <<<"${SB_LOADERS:-}"

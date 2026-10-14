@@ -60,23 +60,32 @@ launch() { # name type disk_gb user_data [extra market options]
     local name="$1" type="$2" disk="$3" data="$4" market="${5:-one-time}"
     grep -qx "$name" <<<"$existing" && return 0
     local options="MarketType=spot,SpotOptions={SpotInstanceType=one-time,InstanceInterruptionBehavior=terminate}"
-    if [ "$market" = "persistent" ]; then
+    market_args=(--instance-market-options "$options")
+    if [ "$market" = "on-demand" ]; then
+        # Managers hold the cluster's raft state, which a spot reclaim takes
+        # with it; workers and load boxes are disposable.
+        market_args=()
+    elif [ "$market" = "persistent" ]; then
         # A persistent request with `stop` lets the build box be stopped
         # between builds and keep its cargo cache on EBS.
         options="MarketType=spot,SpotOptions={SpotInstanceType=persistent,InstanceInterruptionBehavior=stop}"
+        market_args=(--instance-market-options "$options")
     fi
-    sb_log "Launching $name ($type, spot, nested virtualization)"
+    # Bare metal has KVM natively; every other c8i box gets it nested.
+    cpu_args=(--cpu-options 'NestedVirtualization=enabled')
+    case "$type" in *.metal*) cpu_args=() ;; esac
+    sb_log "Launching $name ($type, ${market})"
     aws ec2 run-instances --image-id "$ami" --instance-type "$type" --key-name "$SB_PROJECT" \
         --subnet-id "$subnet" --security-group-ids "$sg" --associate-public-ip-address \
-        --instance-market-options "$options" \
-        --cpu-options 'NestedVirtualization=enabled' \
+        ${market_args[@]+"${market_args[@]}"} \
+        ${cpu_args[@]+"${cpu_args[@]}"} \
         --block-device-mappings "DeviceName=/dev/sda1,Ebs={VolumeSize=$disk,VolumeType=gp3,Throughput=250,Iops=6000}" \
         --user-data "file://$data" \
         --tag-specifications "$(printf "$tags" instance "$name")" "$(printf "$tags" volume "$name")" \
         --query 'Instances[0].InstanceId' --output text
 }
 
-for name in "${SB_MANAGERS[@]}"; do launch "$name" "$SB_MANAGER_TYPE" 20 "$SB_STATE/node-user-data.sh"; done
+for name in "${SB_MANAGERS[@]}"; do launch "$name" "$SB_MANAGER_TYPE" 20 "$SB_STATE/node-user-data.sh" on-demand; done
 for name in "${SB_WORKERS[@]}"; do launch "$name" "$SB_WORKER_TYPE" 40 "$SB_STATE/node-user-data.sh"; done
 for name in ${SB_LOADERS[@]+"${SB_LOADERS[@]}"}; do launch "$name" "$SB_LOAD_TYPE" 20 "$SB_STATE/node-user-data.sh"; done
 if [ -n "$with_build" ]; then
