@@ -171,7 +171,7 @@ disk. Both are out of CPU on one control-plane box:
 | 5                    | 25,000      | pending  | 78          | 69                |
 | 10                   | 50,000      | pending | 83          | 46                |
 | 20                   | 100,000     | pending | 77          | 25                |
-| 40                   | 200,000     | pending | pending    | 30, then failed   |
+| 40                   | 200,000     | pending | 81          | 30, then failed   |
 
 At 40 allocations per node, Kubernetes placed about 12,000 Pods at
 30/sec over six minutes. Then the API server on the box running the
