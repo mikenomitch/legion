@@ -93,6 +93,17 @@ reaches it **one network round trip after it commits**, whatever the
 heartbeat interval ([Delivery](architecture-managers-workers.md#delivery)).
 A placement does not wait for a push to land or for the next heartbeat.
 
+Suspend, resume, and fork do not wait for the heartbeat either. The
+manager pushes a checkpoint request on the same stream the moment its row
+commits, and the node reports the outcome on a heartbeat it sends as soon
+as the work finishes
+([How it works](suspend-and-resume.md#how-it-works)). The control plane's
+share of a suspend is two round trips and two commits, and of a resume one
+placement and one round trip, on top of the checkpoint or restore itself.
+With 50 simulated nodes on one laptop at 50 lifecycles a second, that is a
+suspend p50 of 10 ms and a resume p50 of 15 ms, against 3.5 s and 2 s when
+both rode the heartbeat.
+
 Dense nodes stay cheap. A node's heartbeat carries its stream position and
 a digest instead of its allocation list, and the reply carries no desired
 set: a steady beat is a few dozen bytes each way whether the node runs ten
@@ -276,10 +287,11 @@ runtime's own boot or restore time for the end-to-end figure.
   slim row, or to none for a server-minted id
   ([Archiving idle instances](suspend-and-resume.md#archiving-idle-instances)),
   and a [session](session-mode.md) has no row while it runs.
-- **Suspend and resume wait on heartbeats.** Checkpoint requests and their
-  reports still ride the heartbeat, so a suspend or resume takes one to two
-  heartbeat intervals of control-plane time on top of the checkpoint itself
-  (2 to 3 seconds at the default 2 s cadence). Placements do not.
+- **A node whose work stream is down waits for its heartbeat.** Its
+  checkpoint requests arrive on its next heartbeat instead of at once, so a
+  suspend there takes up to one heartbeat interval longer, as a placement
+  does while the stream reconnects. Each finished capture, restore,
+  publish, or warm also costs its node one early heartbeat.
 - **Edge boot's speculative dispatch still uses `PostWork` pushes,** not the
   stream, and its verdict arrives on the `RatifyClaim` reply.
 - **Per-sandbox lifecycle events go to the replicated event journal**, which

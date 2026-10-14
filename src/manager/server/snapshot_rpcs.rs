@@ -10,6 +10,11 @@
 //! outcome rides the same reports (`op = restore`). Suspend reuses all of
 //! it: a `purpose = suspend` row with `then = stop` (see `suspend_rpcs`).
 //!
+//! Neither half waits for the cadence (checkpoints-on-stream plan): a node
+//! that streams its work gets each request pushed on `StreamWork` when its
+//! row commits (`work_stream`), and a worker sends a heartbeat as soon as it
+//! has a fresh report. The heartbeat's full set stays the record.
+//!
 //! Phase 7b adds two ops. A `local` row with `durability = store` is publish
 //! work for its node until the node reports (`op = publish`), which moves it
 //! to `published`. A queued warm (WarmSnapshot, held in memory in
@@ -850,6 +855,11 @@ impl ManagerDaemonService {
                 }
             )));
         }
+        // The queue is memory on this manager, not a row the projection
+        // sees: push the warms to the picked nodes that stream from here.
+        self.store
+            .work_log()
+            .note_checkpoint_work(plan.nodes.iter().map(String::as_str));
         info!(
             snapshot_id = %snapshot.snapshot_id,
             nodes = plan.nodes.len(),
@@ -1380,8 +1390,9 @@ fn enqueue_job_placement(store: &Store, job_id: &str) {
 }
 
 /// Checkpoint work for one node: a request per `capturing` or `deleting`
-/// snapshot it holds, re-sent every heartbeat until the node reports. Only
-/// sent to workers that advertised the `checkpoint` capability. Never fails
+/// snapshot it holds, re-sent every heartbeat until the node reports, and
+/// pushed on the node's work stream when it becomes outstanding. Only sent
+/// to workers that advertised the `checkpoint` capability. Never fails
 /// the heartbeat.
 pub(super) fn build_checkpoint_requests(store: &Store, node_id: &str) -> Vec<CheckpointRequest> {
     let work = match store.snapshot_work_for_node(node_id) {

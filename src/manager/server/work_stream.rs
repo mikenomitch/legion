@@ -7,7 +7,9 @@
 //! turns its pending work into messages: it reads the changed allocations
 //! from the store when a message is sent, builds each payload with the same
 //! [`super::desired_payload`] the heartbeat and the push use, and streams
-//! the result.
+//! the result. A message also pushes the node's checkpoint work that became
+//! outstanding since the last one (checkpoints-on-stream plan), built by the
+//! same `build_checkpoint_requests` the heartbeat reply uses.
 
 use super::*;
 use crate::storage::work_log::{NodeWorkLog, PendingWork, WorkLog};
@@ -27,12 +29,13 @@ pub(super) fn next_work_message(
     log: &NodeWorkLog,
     node_id: &str,
 ) -> R<Option<StreamWorkReply>> {
-    match WorkLog::take_pending(log) {
-        PendingWork::Nothing => Ok(None),
-        PendingWork::Resync => {
-            let desired = build_desired_allocations(store, node_id, &[])?;
-            Ok(work_log.commit_message(log, true, desired, Vec::new()))
-        }
+    let (resync, upserts, stops) = match WorkLog::take_pending(log) {
+        PendingWork::Nothing => (false, Vec::new(), Vec::new()),
+        PendingWork::Resync => (
+            true,
+            build_desired_allocations(store, node_id, &[])?,
+            Vec::new(),
+        ),
         PendingWork::Changed(ids) => {
             let mut task_cache = DesiredTaskCache::default();
             let mut upserts = Vec::new();
@@ -87,9 +90,24 @@ pub(super) fn next_work_message(
                     })
                     .collect()
             };
-            Ok(work_log.commit_message(log, false, upserts, stops))
+            (false, upserts, stops)
         }
-    }
+    };
+    // Checkpoint work the node has not been pushed yet (checkpoints-on-stream
+    // plan), read only when the projection saw the node's snapshot rows
+    // move, a warm was queued, or the stream is new. Taken after the
+    // allocation half, so a failed read above leaves the mark for the
+    // retry. The same builder as the heartbeat reply, so the same requests
+    // and part keys; it never fails.
+    let checkpoints = if WorkLog::take_checkpoint_work(log) {
+        WorkLog::unpushed_checkpoints(
+            log,
+            snapshot_rpcs::build_checkpoint_requests(store, node_id),
+        )
+    } else {
+        Vec::new()
+    };
+    Ok(work_log.commit_message(log, resync, upserts, stops, checkpoints))
 }
 
 impl ManagerDaemonService {

@@ -200,15 +200,21 @@ $ legion instance suspend <instance> [--checkpoint memory|disk] [--wait] [--time
 1. The manager records a `purpose = suspend` snapshot in state `capturing` and
    marks the instance `suspending`. The call returns here (`--wait` keeps
    going).
-2. On its next heartbeat, the instance's node captures the allocation and
+2. The request reaches the instance's node over its work stream, one round
+   trip after the record commits, and the node captures the allocation and
    then stops it. For a memory checkpoint the guest stays paused from the
    capture until the VMM is killed, so it never runs past the captured
    instant. The node only stops the task once the checkpoint is safely in
    its content store.
-3. When the node reports, one transaction deletes the allocation (freeing
-   its reservation), marks the snapshot `local`, and sets the instance
-   `suspended` with `checkpoint_id`. `instance.suspended` and
-   `allocation.removed` with `cause = suspended` are emitted.
+3. The node reports at once, on a heartbeat it sends early. One transaction
+   deletes the allocation (freeing its reservation), marks the snapshot
+   `local`, and sets the instance `suspended` with `checkpoint_id`.
+   `instance.suspended` and `allocation.removed` with `cause = suspended` are
+   emitted.
+
+So a suspend takes the capture itself plus about two round trips and two
+commits, whatever the heartbeat interval. A node whose stream is down gets
+the request on its next heartbeat instead (see [How it works](#how-it-works)).
 
 **A suspend never stops a workload it failed to capture.** If the capture
 fails, the guest is resumed, the instance stays `active`, its allocation keeps
@@ -272,9 +278,9 @@ signal, so it tracks when each allocation went quiet and reports that
 row, so it runs a sweep every 15 seconds over those reports, in memory, and
 starts a suspend for each instance quiet past `after`. From there it is an
 ordinary suspend: the capture, the stop, the freed reservation. Counting the
-report interval, the sweep, and the next heartbeat, an idle instance is
-suspended within `after` plus about 30 seconds. The sweep interval is the
-manager's `suspend.idleSweep`.
+report interval and the sweep, an idle instance is suspended within `after`
+plus about 25 seconds. The sweep interval is the manager's
+`suspend.idleSweep`.
 
 `instance get` shows the window while it runs:
 
@@ -780,11 +786,13 @@ contentStore = { url = "s3://legion-content-usw2/" },
 1. The suspend runs exactly as with `local`: the instance becomes
    `suspended`, and its reservation is freed, as soon as the checkpoint is
    written on the node. Capacity never waits on an upload.
-2. On its next heartbeat the node cuts each part of the checkpoint into
-   chunks, seals them with keys derived from what the manager sends it, and
-   uploads the chunks its content store does not hold yet, then a sealed
-   index per part (see [How published parts are
-   stored](#how-published-parts-are-stored) and [Security](#security)). While the upload runs the snapshot is `local`, and
+2. The publish request reaches the node over its work stream as soon as the
+   suspend commits. The node cuts each part of the checkpoint into chunks,
+   seals them with keys derived from what the manager sends it, and uploads
+   the chunks its content store does not hold yet, then a sealed index per
+   part (see [How published parts are
+   stored](#how-published-parts-are-stored) and [Security](#security)).
+   While the upload runs the snapshot is `local`, and
    a resume in that window is pinned to the node like any local checkpoint.
 3. When the upload finishes the snapshot moves to `published`, its manifest
    records each part's URL (its index) and the key it is sealed under, and
@@ -979,7 +987,9 @@ Skipped (incompatible): w-09: cpu.model is "6:143:8", the checkpoint needs "6:10
 
 Every available node that matches the constraints (node attributes, matched
 like a jobspec `constraint` block) and passes the checkpoint's `compat` gets a
-`warm` request on its next heartbeat, with the keys for the snapshot's parts.
+`warm` request, with the keys for the snapshot's parts: at once over its work
+stream when the node streams from the manager that accepted the call, and on
+its next heartbeat to that manager otherwise.
 It fetches and opens the parts it lacks into its node content store and reports `snapshot.warmed` (or `snapshot.warm_failed`
 with the reason). The location index then advertises the parts, so placement
 prefers those nodes.
@@ -989,7 +999,7 @@ cache entries (LRU and the content store's idle TTL can evict them), and
 warming a node that already holds the parts or already has a warm queued does
 nothing. Only a `published` snapshot can be warmed. Queued warms live in the
 memory of the manager that accepted the call, so a manager restart before the
-nodes heartbeat drops them, and you warm again.
+nodes pick them up drops them, and you warm again.
 
 `snapshot warm` needs `snapshot:read` on the snapshot's job. It is gated like
 a mutating call in the MCP server (`--allow-write`), because it starts
@@ -1287,9 +1297,12 @@ $ legion snapshot create <instance> [--memory|--disk] [--name NAME] [--publish] 
 ```
 
 `create` returns as soon as the manager has recorded the snapshot, in state
-`capturing`. The instance's node takes it on its next heartbeat (within the
-heartbeat interval, 2 seconds by default) and reports back. `--wait` blocks
-until it is `local` or `failed` and exits non-zero on failure.
+`capturing`. The instance's node gets the request over its work stream one
+round trip later, takes it, and reports back on an early heartbeat as soon
+as the capture finishes. A node whose stream is down takes it on its next
+heartbeat instead (within the heartbeat interval, 2 seconds by default).
+`--wait` blocks until it is `local` or `failed` and exits non-zero on
+failure.
 
 `--publish` gives the snapshot `durability = "store"`: once captured, the node
 publishes it to its `contentStore` and it becomes `published` (see
@@ -1317,7 +1330,7 @@ is `capturing` fails with `AlreadyExists`.
 | `local` | Captured. The bytes live on `node`. |
 | `published` | Captured and uploaded to the capturing node's `contentStore`. Any compatible node restores it, and it survives losing `node`. |
 | `failed` | The node could not capture it. `error` says why. The task kept running. |
-| `deleting` | Deleted, or expired. The node reclaims the bytes on its next heartbeat. |
+| `deleting` | Deleted, or expired. The node is asked to reclaim the bytes at once (on its next heartbeat if its work stream is down), and the row goes when it confirms. |
 | `lost` | Its node was removed from the cluster, and the bytes went with it. |
 
 ## Restoring
@@ -1903,16 +1916,25 @@ JSON). Deleting a snapshot removes its names.
 ## How it works
 
 The manager owns each snapshot's state machine. The node that holds the bytes
-does the work. They talk over the heartbeat:
+does the work. Requests travel on the node's work stream, and the heartbeat
+keeps the record:
 
-- Every heartbeat reply carries a `CheckpointRequest` for each snapshot of
-  that node in `capturing` (`op = capture`) or `deleting` (`op = delete`).
-  The manager re-sends it until it has applied the node's answer.
-- The worker runs each request once and answers with a `SnapshotReport` on its
-  next heartbeat. When it sees a request again for work it already finished,
-  it re-sends the same report instead of redoing the work. That makes a lost
-  heartbeat, a worker restart, or a report that landed on a manager that
-  could not apply it a retry rather than an outage.
+- A snapshot of the node entering `capturing` (`op = capture`) or `deleting`
+  (`op = delete`) is pushed to the node as a `CheckpointRequest` on its
+  `StreamWork` stream (see
+  [Delivery](architecture-managers-workers.md#delivery)) as soon as its row
+  commits, so the node starts one round trip later.
+- Every heartbeat reply also carries a `CheckpointRequest` for each such
+  snapshot, and the manager re-sends it until it has applied the node's
+  answer. A push lost with its stream, or one a node never got because its
+  stream was down, costs a heartbeat interval, not the work.
+- The worker runs each request once and answers with a `SnapshotReport` on a
+  heartbeat it sends at once instead of waiting for its next scheduled one.
+  When it sees a request again for work it already finished, it re-sends the
+  same report instead of redoing the work. That makes a lost heartbeat, a
+  worker restart, or a report that landed on a manager that could not apply
+  it a retry rather than an outage. A delete's confirmation is the one
+  report that waits for the scheduled beat, since nothing waits on it.
 - An allocation that restores from a snapshot carries the snapshot's manifest
   in its dispatch payload (`TaskAllocation.restore`). The worker reports the
   restore's outcome the same way, and the manager clears the payload once it
@@ -1927,11 +1949,22 @@ does the work. They talk over the heartbeat:
   the checkpoint `local`, and enqueues their placement.
 - A `local` snapshot with `durability = "store"` is publish work for its
   node (`op = publish`) until the node reports the upload. A queued warm is
-  `op = warm` work for its node until the node reports the fetch.
+  `op = warm` work for its node until the node reports the fetch. Both are
+  pushed the same way.
 
 The manager sends checkpoint work only to workers that advertised the
 `checkpoint` capability when they registered. A request for an instance on an
 older worker fails with `FailedPrecondition` naming the worker's version.
+
+**What the early heartbeat costs.** Each capture, restore, publish, or warm a
+node finishes sends one extra heartbeat, so a full suspend and resume adds
+two beats to the node's cadence. Reports that finish together share a beat.
+The extra rate is bounded by how fast the cluster can suspend and resume at
+all, which the scheduler lane limits (see
+[Limits to know about](sandboxes-at-scale.md#limits-to-know-about)), so it
+stays small next to a fleet's scheduled beats. A publish retried after a
+failure, at the time its row names, is not pushed: the node picks it up on
+its next heartbeat.
 
 On the node, a memory capture writes the VMM's memory and state files into the
 content store's staging directory, then moves each one into the store's
@@ -2273,7 +2306,8 @@ See [metrics](metrics.md#suspend-and-resume).
 - **Warms and the location index are held by one manager.** In a
   multi-manager cluster, nodes that heartbeat a different manager than the
   one that accepted `snapshot warm`, or that scheduled the placement, are
-  invisible to it until they heartbeat it.
+  invisible to it until they heartbeat it, and a warm is pushed only to
+  nodes that stream from it.
 - **Rollback is in place and keyed-only.** `snapshot restore` rolls back only
   the instance a snapshot was taken from. To start a new instance from it,
   use `instance create --from-snapshot`. Slot instances can be snapshotted

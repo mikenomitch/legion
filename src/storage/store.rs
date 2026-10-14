@@ -11333,6 +11333,11 @@ impl Store {
         let mut changed_instances: HashSet<String> = HashSet::new();
         let mut changed_volume_jobs: HashSet<String> = HashSet::new();
         let mut changed_volume_ids: HashSet<String> = HashSet::new();
+        // Nodes whose snapshot rows moved, so their streams push the
+        // checkpoint work that is now outstanding (checkpoints-on-stream
+        // plan), and the snapshots whose update record did not name a node.
+        let mut checkpoint_nodes: HashSet<String> = HashSet::new();
+        let mut checkpoint_reread_ids: HashSet<String> = HashSet::new();
         let mut event_ids: Vec<i64> = Vec::new();
         let mut evals_made_claimable = 0usize;
         // Changes that may have made room, for the blocked-eval wake pass
@@ -11585,6 +11590,41 @@ impl Store {
                         }
                     }
                 }
+                "snapshot" => {
+                    // A snapshot row inserted or moved can be new work for
+                    // its node (a capture, a delete, a publish). A deleted
+                    // row is finished work, so it pushes nothing.
+                    if self.work_log.has_nodes() && action != Action::SQLITE_DELETE {
+                        let node_idx =
+                            self.changeset_column_index(&mut column_cache, "snapshot", "node_id")?;
+                        match item
+                            .new_value(node_idx)
+                            .ok()
+                            .and_then(|value| value.as_str().ok().map(str::to_owned))
+                        {
+                            Some(node_id) => {
+                                checkpoint_nodes.insert(node_id);
+                            }
+                            // An UPDATE record omits unchanged columns:
+                            // re-read the node by the key after the scan.
+                            None if action == Action::SQLITE_UPDATE => {
+                                let id_idx = self.changeset_column_index(
+                                    &mut column_cache,
+                                    "snapshot",
+                                    "snapshot_id",
+                                )?;
+                                if let Some(id) = item
+                                    .old_value(id_idx)
+                                    .ok()
+                                    .and_then(|value| value.as_str().ok().map(str::to_owned))
+                                {
+                                    checkpoint_reread_ids.insert(id);
+                                }
+                            }
+                            None => {}
+                        }
+                    }
+                }
                 "task_config" => {
                     let jc_idx = self.changeset_column_index(
                         &mut column_cache,
@@ -11787,6 +11827,7 @@ impl Store {
             &changed_volume_jobs,
             &changed_volume_ids,
         );
+        self.note_checkpoint_changes(checkpoint_nodes, checkpoint_reread_ids);
 
         if read_model_only {
             return Ok(());
@@ -11885,6 +11926,31 @@ impl Store {
                 self.work_log.resync_all();
             }
         }
+    }
+
+    /// Tell the work delivery log which nodes' snapshot rows moved, so their
+    /// streams push the checkpoint work now outstanding
+    /// (checkpoints-on-stream plan). `reread` names snapshots whose update
+    /// record did not carry the node. Never fails, for the reason
+    /// [`Self::note_work_changes`] gives: a row it cannot re-read is skipped,
+    /// and its node gets the work on its next heartbeat instead.
+    fn note_checkpoint_changes(&self, mut nodes: HashSet<String>, reread: HashSet<String>) {
+        if nodes.is_empty() && reread.is_empty() {
+            return;
+        }
+        for snapshot_id in reread {
+            match self.get_snapshot(&snapshot_id) {
+                Ok(Some(snapshot)) => nodes.extend(snapshot.node_id),
+                Ok(None) => {}
+                Err(err) => debug!(
+                    snapshot_id = %snapshot_id,
+                    error = ?err,
+                    "Could not re-read a snapshot row for the work stream, so its node waits a heartbeat"
+                ),
+            }
+        }
+        self.work_log
+            .note_checkpoint_work(nodes.iter().map(String::as_str));
     }
 
     /// The `(node, allocation)` pairs [`Self::note_work_changes`] feeds to

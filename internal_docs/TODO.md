@@ -2226,13 +2226,10 @@ Plans: [task-runtime-plugins](../docs/task-runtime-plugins.md).
         (loadgen session mode, sessions in `--simulate`, a fixed-delay fake
         launch, sessions.db and ticket-cache benches, a real-runtime
         restore loop).
-  - [ ] **Suspend and resume still wait on heartbeats.** Checkpoint
-        requests and reports ride the heartbeat, so a suspend takes ~3 s and
-        a resume ~2 s at p50 on the default 2 s cadence, while placements
-        land in one round trip. Put checkpoint requests on the `StreamWork`
-        stream and reports on a prompt path; Phases 5 and 7's resume and
-        wake targets assume it
-        ([plan §14.6](plans/sandbox-scaling-plan.md#146-what-the-results-change-in-later-phases)).
+  - [ ] **Retried publishes are not pushed.** A failed publish becomes work
+        again when its `publish_retry_at` passes, with no row change, so the
+        node picks it up on its next heartbeat rather than over the stream
+        ([calls](calls/checkpoints-on-stream-plan_calls.md) #7).
   - [ ] **Edge-boot provisional deltas on the stream.** Speculative dispatch
         still pushes with `PostWork` and the verdict arrives on the
         `RatifyClaim` reply
@@ -5414,6 +5411,16 @@ docs: [task-runtime-plugins.md](../docs/task-runtime-plugins.md)
         catalog entry. An unnamed session's start and stop write no raft
         entry; a promotion writes one
         ([docs](../docs/session-mode.md)).
+- [x] **Suspend and resume no longer wait on heartbeats** (2026-10-13):
+      [plan](plans/checkpoints-on-stream-plan.md) ·
+      [calls](calls/checkpoints-on-stream-plan_calls.md) ·
+      [docs](../docs/suspend-and-resume.md#how-it-works). Checkpoint
+      requests are pushed on `StreamWork` when their row commits, and a
+      worker reports a finished capture, restore, publish, or warm on an
+      early heartbeat. The heartbeat stays the record. Replaces the
+      "suspend and resume still wait on heartbeats" item (sandbox-scaling
+      plan §14.6). A report path that skips the heartbeat is deferred until
+      early beats show up as load (plan §8).
 
 ## Persistence
 
