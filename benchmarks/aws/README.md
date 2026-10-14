@@ -260,6 +260,14 @@ measures a scheduler holding 3,000 corpses while reporting itself as a
 right count, all active and available, all named from this fleet's
 slices — and refuses to run otherwise, printing what it actually saw.
 
+## Sandbox-boot rig (real KVM)
+
+[`sandbox-boot/`](sandbox-boot/README.md) is a separate, smaller rig for
+session sandboxes on real KVM: spot c8i workers with nested virtualization
+running cloud-hypervisor microVMs, `legion-loadgen --mode sessions`, and a
+host-side timeline of every guest. Its last campaign is in
+[`sandbox-boot/RESULTS.md`](sandbox-boot/RESULTS.md).
+
 ## Sandbox-scaling campaign (cheap, standalone)
 
 `scripts/run-sandbox-campaign.sh` measures the sandbox path: keyed-instance

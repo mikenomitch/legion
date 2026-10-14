@@ -355,6 +355,42 @@ re-register the same nodes), and `--sim-profiles` (the node shape).
 Use isolated ports for a local manager: never the defaults another cluster
 on the machine may be using.
 
+### Session starts on real nodes (`--mode sessions`)
+
+`legion-loadgen --mode sessions` starts unnamed [sessions](session-mode.md)
+of an existing session job on real nodes, at an open-loop `--rate` or as fast
+as `--concurrency` allows, through a manager's router (`--via manager`, the
+default, spread over every comma-separated `--manager`) or straight at the
+nodes with a session ticket (`--via edge --ticket "$T"`, nodes from
+`ListSessionNodes`):
+
+```bash
+legion-loadgen --mode sessions --manager http://10.0.1.5:4747 \
+    --job agents --task workspace --wait running \
+    --count 1200 --rate 40 --concurrency 512 --hold-ms 2000
+```
+
+`--wait running` times each start to `running`, which for a sandbox is its
+guest taking exec; the default, `accepted`, times it to the node's admit.
+`--hold-ms` stops each session that long after it started, so a run at a
+steady rate holds a steady number of sessions; `--stop-at-end` stops what is
+left. The JSON summary has the counts by outcome, the achieved rate, p50 to
+max latency, completions per second, and refusals grouped by reason.
+
+`benchmarks/aws/sandbox-boot/` runs it against a small spot cluster of KVM
+workers, and adds each guest's own timeline, stamped on the host when its
+agent first takes exec ([results](../benchmarks/aws/sandbox-boot/RESULTS.md),
+[write-up](sandboxes-at-scale.md#measured-on-aws)). Two in-process
+measurements cover the control plane without nodes:
+`tests/session_index_scale_measure.rs` (a manager's memory per session and
+heartbeat cost at up to a million sessions) and the router's
+`pick_cost_measure` (one pick per `stateful.placement` and fleet size):
+
+```bash
+cargo test --release --test session_index_scale_measure -- --ignored --nocapture
+cargo test --release --lib -- pick_cost_measure --ignored --nocapture
+```
+
 ### Control-plane write and delivery tests
 
 These run in the ordinary `cargo test` suite and guard the numbers the

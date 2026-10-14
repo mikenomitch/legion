@@ -1930,6 +1930,46 @@ How to use it:
 
 Plans: [task-runtime-plugins](../docs/task-runtime-plugins.md).
 
+- [ ] **Sandbox boot throughput, what is still open**
+      ([plan](plans/sandbox-boot-throughput-plan.md) ·
+      [calls](calls/sandbox-boot-throughput-plan_calls.md) ·
+      [results](../benchmarks/aws/sandbox-boot/RESULTS.md)):
+  - [ ] **A node boots about 50 sandboxes a second at most, whatever its
+        size** (plan phase 4, calls 13). A 96-vCPU c5.metal booted 1,000 at
+        48 a second with its CPUs about 90% idle: starts waited in
+        `register` (the task-manager lock, up to 1.8 s) and `vmm_spawn` (up
+        to 2.6 s). Kernel samples still show page-table copying
+        (`copy_present_ptes`) on launch threads after the `posix_spawn`
+        change, unexplained. Next: a metal run with a frame-pointer build and
+        lock hold-time instrumentation; suspects are per-start cgroup
+        creation and removal under the lock, the supervisor's per-tick work
+        over every instance, and memory-map lock contention in the worker.
+  - [ ] **Firecracker and TAP sandboxes are not measured.** The rig ran
+        cloud-hypervisor guests with no NIC. A TAP guest's start adds `ip`
+        calls that take the kernel's `rtnl` lock, which Modal found to
+        dominate their tail at high start rates.
+  - [ ] **`perf/lazy-memory-restore` is unmeasured** (pushed, 7e93ebb8).
+        On-demand memory restore needs cloud-hypervisor v52+; the rig ran
+        v51.2. Its restore matrix (1, 4, 8 GiB, lazy vs eager, v51 to v53 and
+        Firecracker, suspend and fork right after a lazy resume) is the next
+        run, on a box with 32 GiB or more.
+  - [ ] **Parallel branches not stacked** (calls 1), each still an
+        uncommitted diff in its worktree unless noted: `sandbox-warm-pool`
+        and `edge-prewarm` (warming, against the pre-warm stance until the
+        cold path is measured: it now is, at 180 to 230 ms),
+        `elastic-session-envelopes` (envelopes that grow with use),
+        `edge-admission-backpressure`, `edge-ratify-throughput`,
+        `chunked-checkpoints`, `checkpoints-on-stream`, `multi-eval-plans`,
+        `scheduler-lane-entry-cost`, `flat-commit-cost`, and
+        `web-fleet-throughput`. Each needs its own measured case.
+  - [ ] **A memory-snapshot start for sessions** (E2B's 80 ms shape):
+        restore a session from a per-node template snapshot instead of
+        booting. Opt-in, filled by real starts, and falling back to a boot,
+        per the pre-warm stance.
+  - [ ] **Kernel size.** cloud-hypervisor copies the 48 MB reference kernel
+        into guest memory per boot (`payload_loader`, about 6% of a busy
+        node's CPU). Document, or ship, a minimal guest kernel config.
+
 - [ ] **Task start critical path, deferred phases** (found while measuring
       the node's start path; [plan](plans/task-start-critical-path-plan.md)
       phases 4 and 5, [calls 4](calls/task-start-critical-path-plan_calls.md)):
@@ -2039,8 +2079,11 @@ Plans: [task-runtime-plugins](../docs/task-runtime-plugins.md).
         every start (which also stops host writes through an image's
         symlinks), `rootfs_cache::ensure_image_base` for prefetchers, and
         queued pulls sharing a tag `HEAD`.
-  - [ ] Verify on real KVM: boot a cloned disk on cloud-hypervisor and
-        Firecracker, and checkpoint and restore one.
+  - [x] Verify on real KVM: cloned disks boot on cloud-hypervisor, at about
+        10 ms a clone on XFS and 60 to 80 ms on ext4, through thousands of
+        session starts on the sandbox-boot rig
+        ([results](../benchmarks/aws/sandbox-boot/RESULTS.md)).
+  - [ ] Verify on Firecracker, and checkpoint and restore a cloned disk.
   - [ ] Phase 2: sandboxes with file, tree, or layer artifacts still build
         their disk in full on every start (calls entry 5), including a kernel
         shipped as an artifact.
@@ -4796,6 +4839,26 @@ docs: [scheduler-and-eval-loop.md](../docs/scheduler-and-eval-loop.md), [jobs-ta
 docs: [task-runtime-plugins.md](../docs/task-runtime-plugins.md)
 
 - [x] A framework for task-runtime plugins
+- [x] **Sandbox sessions boot in about 200 ms, and a cluster boots them at
+      the sum of its nodes' rate** (2026-10-14). Measured on AWS, four
+      4-vCPU workers: one boot from 2.9 s to 0.23 s, a burst of 160 from
+      1.6 to 69 guests a second, and 40 a second sustained with none
+      refused. cloud-hypervisor disks are declared raw (every boot had
+      panicked and rebooted) and its console is `hvc0`; a sandbox session
+      is `running` once its guest takes exec; `stateful.placement` (`spread`
+      | `fast`); the router asks the least full node when its view says
+      full; shared registry clients and one tag resolution per burst; a
+      session's stop sends its guest request off the lock and writes no
+      state file; `/proc` start times; `posix_spawn` for VMMs; pooled launch
+      threads; O(changes) session-index heartbeats. Stacked with the base
+      root disk cache, the router fixes, and per-stage start timings, and
+      the `legion-loadgen --mode sessions` rig in
+      `benchmarks/aws/sandbox-boot/` —
+      [plan](plans/sandbox-boot-throughput-plan.md) ·
+      [calls](calls/sandbox-boot-throughput-plan_calls.md) ·
+      [docs](../docs/sandboxes-at-scale.md#measured-on-aws) ·
+      [boot](../docs/task-runtime-sandbox.md#how-fast-a-sandbox-boots) ·
+      [placement](../docs/session-mode.md#picking-a-node)
 - [x] **Startup probing for health checks** (2026-10-13). A `tcp` or `http`
       check that has not passed since its task (re)started is also probed
       between `every` ticks (100 ms doubling to 1 s), and only a pass counts,
