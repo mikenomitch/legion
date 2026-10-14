@@ -270,7 +270,40 @@ page-table copying and memory-map lock contention. The next step is a metal
 run with a frame-pointer build and lock hold-time instrumentation
 (`TODO.md`).
 
-## 14. Guests are timed from the host, by their agent's vsock listener
+## 14. `auto` keeps preferring cloud-hypervisor, and every number is cloud-hypervisor's
+
+**Call.** The campaign measured `hypervisor = "auto"`, which picks
+cloud-hypervisor on Linux with KVM, and left that default alone. The public
+doc now says why the default holds and that Firecracker's boot rate is
+unmeasured:
+
+```text
+Choosing a VMM
+`auto` prefers cloud-hypervisor because more of the sandbox runtime works the
+same way on it, not because it has been measured to boot faster.
+```
+
+**Alternatives.** (a) Flip `auto` to Firecracker for sandboxes that need
+neither cross-data-dir checkpoint restores nor a boot log, on the strength
+of its published numbers (about 125 ms to user space, 150 microVMs a second
+per host) and its smaller device model. (b) Measure Firecracker in this
+campaign as well.
+
+**Trade-off.** Sandboxes get the larger device model by default, and
+Legion runs Firecracker without its `jailer`, so the security argument for
+Firecracker is weaker in Legion than in Lambda. Any speed difference between
+the two VMMs on Legion is unknown.
+
+**Why (simplicity).** The default had no recorded rationale, but the
+differences that are known all favor cloud-hypervisor for a general
+default: virtio-console keeps the boot log at no cost, a published
+checkpoint restores on any node, and gated live snapshots keep the origin's
+connections. (a) would trade those for an unmeasured speed gain. (b) did
+not fit the budget once the per-node ceiling run on metal was done. The
+measurement is open in `TODO.md`, and it decides whether (a) is worth
+revisiting.
+
+## 15. Guests are timed from the host, by their agent's vsock listener
 
 **Call.** The rig counts a guest up when a host connection to its vsock
 socket gets `OK` for `CONNECT 1100`, stamped on the host's clock.
@@ -287,7 +320,7 @@ baseline look like 1 s instead of 2.9 s. (b) measured the worker's log sink,
 which flushes late under load. The vsock probe is what a caller waiting to
 exec experiences.
 
-## 15. The session index's heartbeat costs O(stops), not O(sessions)
+## 16. The session index's heartbeat costs O(stops), not O(sessions)
 
 **Call.** `ingest` checks pending duplicate stops against the node's own
 map, instead of cloning every session id of the node into a set on every

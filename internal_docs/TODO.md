@@ -1948,7 +1948,11 @@ Plans: [task-runtime-plugins](../docs/task-runtime-plugins.md).
   - [ ] **Firecracker and TAP sandboxes are not measured.** The rig ran
         cloud-hypervisor guests with no NIC. A TAP guest's start adds `ip`
         calls that take the kernel's `rtnl` lock, which Modal found to
-        dominate their tail at high start rates.
+        dominate their tail at high start rates. The Firecracker run (the
+        same sequential, burst, and sustained cases, about an hour and $1)
+        decides whether `auto` should prefer it for sandboxes that need
+        neither cross-data-dir restores nor a boot log (calls 14,
+        [docs](../docs/task-runtime-sandbox.md#choosing-a-vmm)).
   - [ ] **`perf/lazy-memory-restore` is unmeasured** (pushed, 7e93ebb8).
         On-demand memory restore needs cloud-hypervisor v52+. The rig ran
         v51.2. Its restore matrix (1, 4, 8 GiB, lazy vs eager, v51 to v53 and

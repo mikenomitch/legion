@@ -66,6 +66,32 @@ rollouts, and every worker loads this runtime even if it never runs a sandbox.
 Reporting "no hypervisor here" would fail deploys on unrelated nodes. Instead, a
 task that cannot boot on its node fails at start with an actionable error.
 
+### Choosing a VMM
+
+`auto` prefers cloud-hypervisor because more of the sandbox runtime works
+the same way on it, not because it has been measured to boot faster. Both
+VMMs run the same image, root disk, guest agent, and kernel arguments, and
+every feature on this page works on both. They differ here:
+
+| | cloud-hypervisor | Firecracker |
+| --- | --- | --- |
+| Console | virtio-console (`hvc0`). The guest keeps its full boot log at no measurable cost | Serial only. Guests boot `quiet`, and every console write is a VM exit ([why that matters](#how-fast-a-sandbox-boots)) |
+| Restoring a published checkpoint | On any node. The restore repoints the disks at this node's paths | Only on a node with the same data directory (`LEGION_DATA_DIR`). [Details](#where-a-memory-checkpoint-can-be-restored) |
+| Live snapshot or fork of a gated sandbox | The running origin keeps its open connections | The running origin's open connections close too ([details](suspend-and-resume.md#gated-sandboxes)) |
+| Version floors | None beyond a working install | 1.16.1 or later for memory checkpoints of a gated sandbox, 1.12 or later for a fork's TAP device |
+| Device model | Larger: more virtio devices, and hotplug | Minimal, built for multi-tenant serverless. Legion works around its lack of hotplug by reserving devices at boot |
+| Boot rate measured on Legion | Yes, [below](#how-fast-a-sandbox-boots) and in [Sandboxes at scale](sandboxes-at-scale.md#measured-on-aws) | No |
+
+Pick Firecracker when its smaller device model is worth more to you than
+moving checkpoints between nodes with different data directories. Set
+`hypervisor = "firecracker"` on the task, or `LEGION_SANDBOX_HYPERVISOR` on
+the worker. Legion starts Firecracker directly, not under its
+[`jailer`](https://github.com/firecracker-microvm/firecracker/blob/main/docs/jailer.md).
+The VMM keeps Firecracker's built-in seccomp filters, and runs in the
+allocation's cgroup when [resource enforcement](resource-enforcement.md#sandbox-tasks)
+is on, but it gets none of the jailer's chroot, namespaces, or privilege
+drop.
+
 ### macOS (dev mode)
 
 cloud-hypervisor and Firecracker run only on Linux with KVM. On macOS the
@@ -1144,6 +1170,11 @@ memory restore, since the device rides the snapshot.
   has no KVM: the agent's listener and the worker's session run against each
   other over Unix sockets. The KVM checks are listed in the sandbox-exec
   plan.
+- **Boot times and rates are measured on cloud-hypervisor only.** Every
+  number on this page and in [Sandboxes at scale](sandboxes-at-scale.md)
+  comes from cloud-hypervisor guests with no NIC. Firecracker boots the
+  same guest, but its boot rate on Legion has not been measured, so don't
+  pick it, or rule it out, for speed. See [Choosing a VMM](#choosing-a-vmm).
 - **The only signal delivered into the guest is the stop signal**
   ([Stopping a sandbox](#stopping-a-sandbox)). There is no way to signal the
   workload for anything else, so an env-delivered identity must use
