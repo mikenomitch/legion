@@ -35,6 +35,7 @@ use crate::worker::netd::metrics as net_metrics;
 use crate::worker::netd::netns;
 use crate::worker::netd::policy::ingress_connect_verdict;
 use crate::worker::netd::proxyproto::{self, tlv, Prefixed};
+use crate::worker::netd::splice::{self as flow, SpliceStream};
 use crate::worker::netd::tls::{self as net_tls, PeerIdentity};
 use crate::worker::netd::vsock;
 
@@ -202,6 +203,15 @@ impl AsyncWrite for TaskStream {
         match self.get_mut() {
             TaskStream::Tcp(stream) => Pin::new(stream).poll_shutdown(cx),
             TaskStream::Vsock(stream) => Pin::new(stream).poll_shutdown(cx),
+        }
+    }
+}
+
+impl crate::worker::netd::splice::SpliceStream for TaskStream {
+    fn socket(&self) -> Option<crate::worker::netd::splice::Socket<'_>> {
+        match self {
+            TaskStream::Tcp(stream) => SpliceStream::socket(stream),
+            TaskStream::Vsock(stream) => SpliceStream::socket(stream),
         }
     }
 }
@@ -556,7 +566,7 @@ async fn serve_accepted<S>(
     block: Option<(String, Option<String>)>,
     policy: Option<Arc<crate::structs::netpolicy::EffectivePolicy>>,
 ) where
-    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    S: SpliceStream + Send + 'static,
 {
     let allocation_id = shared.spec.allocation_id;
     // Counted as open (and its bytes as activity) for the idle policy's
@@ -670,12 +680,11 @@ async fn serve_accepted<S>(
                     }
                 }
                 net_metrics::connection("ingress", PROTOCOL_TCP, "allow");
-                match tokio::io::copy_bidirectional(&mut client, &mut proxy).await {
-                    Ok((in_bytes, out_bytes)) => {
-                        net_metrics::bytes("ingress", in_bytes);
-                        net_metrics::bytes("egress", out_bytes);
-                    }
-                    Err(err) => debug!(error = ?err, "Ingress hand-off ended with an error"),
+                let transfer = flow::bidirectional(&mut client, &mut proxy).await;
+                net_metrics::bytes("ingress", transfer.sent);
+                net_metrics::bytes("egress", transfer.received);
+                if let Some(err) = transfer.error {
+                    debug!(error = ?err, "Ingress hand-off ended with an error");
                 }
                 return;
             }
@@ -710,12 +719,11 @@ async fn serve_accepted<S>(
         }
     };
     net_metrics::connection("ingress", PROTOCOL_TCP, "allow");
-    match tokio::io::copy_bidirectional(&mut client, &mut task).await {
-        Ok((in_bytes, out_bytes)) => {
-            net_metrics::bytes("ingress", in_bytes);
-            net_metrics::bytes("egress", out_bytes);
-        }
-        Err(err) => debug!(error = ?err, "Ingress connection ended with an error"),
+    let transfer = flow::bidirectional(&mut client, &mut task).await;
+    net_metrics::bytes("ingress", transfer.sent);
+    net_metrics::bytes("egress", transfer.received);
+    if let Some(err) = transfer.error {
+        debug!(error = ?err, "Ingress connection ended with an error");
     }
 }
 

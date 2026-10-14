@@ -167,6 +167,19 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for TrackedStream<S> {
     }
 }
 
+impl<S: super::splice::SpliceStream> super::splice::SpliceStream for TrackedStream<S> {
+    fn socket(&self) -> Option<super::splice::Socket<'_>> {
+        self.inner.socket()
+    }
+
+    fn spliced(&self, bytes: usize) {
+        if bytes > 0 {
+            self.slot.touch();
+        }
+        self.inner.spliced(bytes);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

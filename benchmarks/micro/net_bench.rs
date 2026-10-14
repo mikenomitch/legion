@@ -106,12 +106,14 @@ async fn http_backend(delay: Duration) -> String {
         while let Ok((stream, _)) = listener.accept().await {
             let _ = stream.set_nodelay(true);
             tokio::spawn(async move {
-                let service = hyper::service::service_fn(move |_req: Request<hyper::body::Incoming>| async move {
-                    if !delay.is_zero() {
-                        tokio::time::sleep(delay).await;
-                    }
-                    Ok::<_, Infallible>(Response::new(Full::new(Bytes::from_static(b"ok"))))
-                });
+                let service = hyper::service::service_fn(
+                    move |_req: Request<hyper::body::Incoming>| async move {
+                        if !delay.is_zero() {
+                            tokio::time::sleep(delay).await;
+                        }
+                        Ok::<_, Infallible>(Response::new(Full::new(Bytes::from_static(b"ok"))))
+                    },
+                );
                 let _ = hyper::server::conn::http1::Builder::new()
                     .serve_connection(TokioIo::new(stream), service)
                     .await;

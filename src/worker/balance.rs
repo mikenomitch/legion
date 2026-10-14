@@ -37,6 +37,7 @@ use crate::structs::normalize_balance;
 
 use rand::Rng;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::{Duration, Instant};
 
 /// Strategy used when an upstream names none. Re-exported from the config
 /// types so the datapath and the validator can never drift apart.
@@ -73,6 +74,23 @@ pub trait Balancer: std::fmt::Debug + Send + Sync {
     /// through this listener, for load-aware strategies; strategies that do not
     /// care simply ignore it.
     fn pick(&self, endpoints: &[Endpoint], inflight: &HashMap<String, usize>) -> Option<usize>;
+
+    /// Learn from one dial or request through `addr`. The datapath reports
+    /// every outcome it sees; strategies that do not learn ignore it.
+    fn observe(&self, _addr: &str, _outcome: Outcome) {}
+}
+
+/// What the datapath saw on one endpoint, reported through
+/// [`Balancer::observe`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Outcome {
+    /// The endpoint answered. On L4 this is the time to connect, and then
+    /// the time from the first request byte to the first reply byte. In
+    /// HTTP mode it is the time to the response head.
+    Latency(Duration),
+    /// The dial failed or timed out, the connection reset before a reply,
+    /// or (HTTP mode) the endpoint answered 5xx.
+    Failure,
 }
 
 /// One registry row: a canonical strategy name (already normalized) and the
@@ -87,7 +105,8 @@ type BalancerRow = (&'static str, fn() -> Arc<dyn Balancer>);
 /// from it, so a name and an implementation cannot get out of sync: there is
 /// only one list.
 const BALANCERS: &[BalancerRow] = &[
-    ("round_robin", default_balancer),
+    ("least_latency", default_balancer),
+    ("round_robin", || Arc::new(RoundRobin::default())),
     ("random", || Arc::new(Random)),
     ("least_conn", || Arc::new(LeastConn::default())),
     ("local_first", || Arc::new(LocalFirst::default())),
@@ -135,7 +154,130 @@ pub fn balancer(name: &str) -> R<Arc<dyn Balancer>> {
 /// a strategy this build does not have: falling back beats dropping the
 /// upstream, and the caller cannot handle an error usefully anyway.
 pub fn default_balancer() -> Arc<dyn Balancer> {
-    Arc::new(RoundRobin::default())
+    Arc::new(LeastLatency::default())
+}
+
+/// How fast an idle latency estimate fades. Upward moves are immediate (a
+/// slow reply raises the estimate at once); downward ones follow this time
+/// constant, so one fast reply does not erase a run of slow ones.
+const LATENCY_DECAY: Duration = Duration::from_secs(10);
+
+/// What a failure costs in the estimate. Large enough that a failing
+/// endpoint loses every pairing with a healthy one, and it decays like any
+/// other sample, so the endpoint is retried once it has cooled down.
+const FAILURE_PENALTY: Duration = Duration::from_secs(1);
+
+/// The estimate given to endpoints before anything is known about any of
+/// them. Only the ratio between endpoints matters, so the value is nominal.
+const NOMINAL_LATENCY: Duration = Duration::from_millis(1);
+
+/// Latency-aware: power of two choices over a peak-EWMA latency estimate,
+/// weighted by in-flight load (Finagle's and Linkerd's balancer).
+///
+/// Each pick samples two endpoints at random and takes the one with the
+/// lower `latency × (in-flight + 1)`. Sampling two instead of scanning all
+/// keeps a slow endpoint from being starved forever and keeps concurrent
+/// picks from herding onto one "best" endpoint. An endpoint with no samples
+/// yet starts at the mean of the others, so a new backend gets a fair
+/// share instead of a flood.
+///
+/// Estimates decay toward zero while an endpoint is not picked, so one that
+/// was slow or failing is tried again after a few multiples of
+/// [`LATENCY_DECAY`].
+#[derive(Debug, Default)]
+struct LeastLatency {
+    estimates: Mutex<HashMap<String, PeakEwma>>,
+}
+
+/// One endpoint's latency estimate in nanoseconds, as of `at`.
+#[derive(Debug, Clone, Copy)]
+struct PeakEwma {
+    nanos: f64,
+    at: Instant,
+}
+
+impl PeakEwma {
+    /// The estimate at `now`, decayed for the time since the last sample.
+    fn at(&self, now: Instant) -> f64 {
+        self.nanos * decay_weight(now.saturating_duration_since(self.at))
+    }
+}
+
+fn decay_weight(elapsed: Duration) -> f64 {
+    (-elapsed.as_secs_f64() / LATENCY_DECAY.as_secs_f64()).exp()
+}
+
+impl Balancer for LeastLatency {
+    fn name(&self) -> &'static str {
+        "least_latency"
+    }
+
+    fn pick(&self, endpoints: &[Endpoint], inflight: &HashMap<String, usize>) -> Option<usize> {
+        match endpoints.len() {
+            0 => return None,
+            1 => return Some(0),
+            _ => {}
+        }
+        let mut rng = rand::thread_rng();
+        let first = rng.gen_range(0..endpoints.len());
+        // A second, distinct endpoint: an offset in 1..len from the first.
+        let second = (first + rng.gen_range(1..endpoints.len())) % endpoints.len();
+
+        let now = Instant::now();
+        let mut estimates = self.estimates.lock().unwrap_or_else(|p| p.into_inner());
+        // Endpoints come and go with dynamic ports; keep the map bounded by
+        // what this listener can still dial.
+        if estimates.len() > endpoints.len() * 2 + 16 {
+            estimates.retain(|addr, _| endpoints.iter().any(|e| e.addr == *addr));
+        }
+        let known: Vec<f64> = endpoints
+            .iter()
+            .filter_map(|e| estimates.get(&e.addr).map(|s| s.at(now)))
+            .collect();
+        let fallback = if known.is_empty() {
+            NOMINAL_LATENCY.as_nanos() as f64
+        } else {
+            known.iter().sum::<f64>() / known.len() as f64
+        };
+        let cost = |index: usize| {
+            let endpoint = &endpoints[index];
+            let latency = estimates
+                .get(&endpoint.addr)
+                .map_or(fallback, |s| s.at(now))
+                // An estimate decayed to nothing still has to count load.
+                .max(1.0);
+            let load = inflight.get(&endpoint.addr).copied().unwrap_or(0);
+            latency * (load + 1) as f64
+        };
+        // `first` and `second` are in random order, so ties break randomly.
+        Some(if cost(second) < cost(first) {
+            second
+        } else {
+            first
+        })
+    }
+
+    fn observe(&self, addr: &str, outcome: Outcome) {
+        let now = Instant::now();
+        let sample = match outcome {
+            Outcome::Latency(latency) => latency.as_nanos() as f64,
+            Outcome::Failure => FAILURE_PENALTY.as_nanos() as f64,
+        };
+        let mut estimates = self.estimates.lock().unwrap_or_else(|p| p.into_inner());
+        let estimate = estimates.entry(addr.to_string()).or_insert(PeakEwma {
+            nanos: sample,
+            at: now,
+        });
+        let current = estimate.at(now);
+        estimate.nanos = if sample > current {
+            // Peak: a slow reply counts in full, immediately.
+            sample
+        } else {
+            let weight = decay_weight(now.saturating_duration_since(estimate.at));
+            current * weight + sample * (1.0 - weight)
+        };
+        estimate.at = now;
+    }
 }
 
 /// Even spread: hand out endpoints in order, wrapping around. The cursor is
@@ -408,6 +550,87 @@ mod tests {
         for _ in 0..5 {
             assert_eq!(balancer.pick(&endpoints, &inflight), Some(1));
         }
+        Ok(())
+    }
+
+    #[test]
+    fn least_latency_sheds_traffic_from_a_slow_endpoint() -> R<()> {
+        let balancer = balancer("least_latency")?;
+        let endpoints = vec![
+            endpoint("10.0.0.1:80"),
+            endpoint("10.0.0.2:80"),
+            endpoint("10.0.0.3:80"),
+        ];
+        balancer.observe("10.0.0.1:80", Outcome::Latency(Duration::from_millis(1)));
+        balancer.observe("10.0.0.2:80", Outcome::Latency(Duration::from_millis(1)));
+        balancer.observe("10.0.0.3:80", Outcome::Latency(Duration::from_millis(50)));
+        let inflight = HashMap::new();
+        let slow = (0..300)
+            .filter(|_| balancer.pick(&endpoints, &inflight) == Some(2))
+            .count();
+        // Every pairing that includes the slow endpoint goes to the other
+        // one, so it is never picked while the others stay fast.
+        assert_eq!(slow, 0, "the slow endpoint kept getting picks");
+        Ok(())
+    }
+
+    #[test]
+    fn least_latency_counts_load() -> R<()> {
+        let balancer = balancer("least_latency")?;
+        let endpoints = endpoints();
+        for endpoint in &endpoints {
+            balancer.observe(&endpoint.addr, Outcome::Latency(Duration::from_millis(1)));
+        }
+        // Equal latency, one endpoint busy: the idle one wins every pairing.
+        let busy: HashMap<String, usize> = [("10.0.0.1:80".to_string(), 4)].into();
+        for _ in 0..20 {
+            assert_eq!(balancer.pick(&endpoints, &busy), Some(1));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn least_latency_penalizes_failures_and_estimates_rise_at_once() {
+        let strategy = LeastLatency::default();
+        strategy.observe("a", Outcome::Latency(Duration::from_millis(1)));
+        strategy.observe("a", Outcome::Latency(Duration::from_millis(40)));
+        let now = Instant::now();
+        let after_peak = strategy.estimates.lock().unwrap()["a"].at(now);
+        assert!(
+            after_peak >= 39e6,
+            "a slow reply must count in full: {after_peak}"
+        );
+        strategy.observe("b", Outcome::Failure);
+        let failed = strategy.estimates.lock().unwrap()["b"].at(now);
+        assert!(failed >= 0.99e9, "a failure costs the penalty: {failed}");
+    }
+
+    #[test]
+    fn decay_brings_an_old_estimate_back_toward_zero() {
+        let then = Instant::now();
+        let estimate = PeakEwma {
+            nanos: 1e9,
+            at: then,
+        };
+        let later = then + LATENCY_DECAY * 5;
+        assert!(estimate.at(later) < 1e9 * 0.01, "{}", estimate.at(later));
+    }
+
+    #[test]
+    fn least_latency_handles_one_endpoint_and_a_cold_start() -> R<()> {
+        let balancer = balancer("least_latency")?;
+        assert_eq!(
+            balancer.pick(&[endpoint("10.0.0.1:80")], &HashMap::new()),
+            Some(0)
+        );
+        // Nothing observed yet: every endpoint ties, and ties break
+        // randomly, so both are reached.
+        let endpoints = endpoints();
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..200 {
+            seen.insert(balancer.pick(&endpoints, &HashMap::new()).expect("pick"));
+        }
+        assert_eq!(seen.len(), 2);
         Ok(())
     }
 
