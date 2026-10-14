@@ -130,6 +130,7 @@ When one is required and what goes in it:
 | [read-model-coherence-plan.md](plans/read-model-coherence-plan.md) | in execution (all five phases built; raft shadow check deferred) |
 | [service-mesh-plan.md](plans/service-mesh-plan.md) | **authoritative for the mesh**; shipped M1–M10 (policy, HTTP mode, name-is-config, gated, ingress, handlers, mTLS, graph, sandbox vsock, templates) with two named deferrals — unifies the SD §8 follow-on with the handlers plan |
 | [network-handlers-plan.md](plans/network-handlers-plan.md) | shipped as phases of service-mesh-plan (policy objects, `gated` mode, handlers); the `legion netd` process split is the deferred piece |
+| [datapath-performance-plan.md](plans/datapath-performance-plan.md) | shipped: HTTP-mode pooling, `splice(2)` for L4 on Linux, `least_latency` as the default strategy, `net_bench`; kTLS and multiplexed mesh tunnels deferred |
 | [nickel-config-language-plan.md](plans/nickel-config-language-plan.md) | shipped (2026-08-03; jsonnet removed, no compat shim) |
 | [scheduler-performance-plan.md](plans/scheduler-performance-plan.md) | in execution |
 | [scheduler-architecture-review-plan.md](plans/scheduler-architecture-review-plan.md) | proposals accepted; D1/D4/D5/D6 graduated into the two plans below, D8's local slice into the heartbeat plan |
@@ -207,6 +208,7 @@ by project impact. The full template and a worked example:
 - [container-runtime-exec-and-signals-plan_calls.md](calls/container-runtime-exec-and-signals-plan_calls.md)
 - [container-task-kind-macos_calls.md](calls/container-task-kind-macos_calls.md)
 - [data-dir-env-plan_calls.md](calls/data-dir-env-plan_calls.md)
+- [datapath-performance-plan_calls.md](calls/datapath-performance-plan_calls.md)
 - [edge-admission-control-plan_calls.md](calls/edge-admission-control-plan_calls.md)
 - [edge-boot-plan_calls.md](calls/edge-boot-plan_calls.md)
 - [edge-ratify-throughput-plan_calls.md](calls/edge-ratify-throughput-plan_calls.md)

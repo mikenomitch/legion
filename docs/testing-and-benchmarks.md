@@ -52,6 +52,7 @@ Benchmark targets:
 
 - `benchmarks/micro/scheduler_bench.rs` (Criterion)
 - `benchmarks/micro/eval_critical_path_bench.rs` (Criterion)
+- `benchmarks/micro/net_bench.rs` (Criterion)
 - `tests/scheduler_benchmark_slo.rs` (scenario runner + SLO gate, CI)
 - `tests/scheduler_scale_benchmark.rs` (scenario × persistence-backend
   matrix, manual)
@@ -136,6 +137,33 @@ What they measure:
     to 10k nodes at fixed fill. That is a regression.
 - `eval_critical_path_bench`: end-to-end enqueue -> claim -> apply -> complete
   latency under 1/4/8 concurrent eval workers (write-lock contention).
+- `net_bench`: what the node's connect datapath costs compared to dialing a
+  backend directly. Each group runs the real `UpstreamForwarder` against
+  loopback backends and has a `direct` row next to the forwarder row, so a
+  run is self-comparing on any machine. Compare the gap, not absolute
+  numbers. There is no NIC, no network round trip, and no TLS in any of it.
+  - `l4_rr`: 100-byte request and reply on one kept-open connection.
+  - `l4_conn_rr`: a new connection per request. The backend closes after
+    replying, so client ports do not pile up in `TIME_WAIT`.
+  - `l4_throughput`: one 64 MiB one-way transfer per iteration. On Linux the
+    forwarder splices; on macOS it copies, so this group is only meaningful
+    on the platform you care about.
+  - `http_rr`: HTTP/1.1 requests on one kept-open client connection through
+    HTTP mode, which shows whether upstream connections are reused.
+  - `slow_endpoint`: three backends, one 2 ms slower, once per balancing
+    strategy, in HTTP mode and over L4 with a connection per request. A
+    strategy that avoids the slow backend lands near the fast backends'
+    latency. One that spreads evenly pays a third of the delay on average.
+  - `balancer_pick`: one pick across 16 endpoints, per strategy.
+
+  ```console
+  $ cargo bench --bench net_bench
+  $ cargo bench --bench net_bench -- slow_endpoint
+  ```
+
+  Datapath changes in `src/worker/forwarder.rs`, `src/worker/netd/`, or
+  `src/worker/balance.rs` should report before/after numbers from this
+  target. Run it on Linux for anything that touches the copy path.
 - `plan_contention`: N concurrent single-allocation submits against one
   pool, processed by real eval workers. It measures conflict rejections,
   requeues, fallback binds, dropped evals, and time until everything is

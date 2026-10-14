@@ -276,8 +276,8 @@ impl<S: crate::worker::netd::splice::SpliceStream> crate::worker::netd::splice::
         self.inner.socket()
     }
 
-    fn spliced(&self, bytes: usize) {
-        self.inner.spliced(bytes);
+    fn activity(&self) -> Option<crate::worker::netd::splice::SpliceActivity> {
+        self.inner.activity()
     }
 }
 

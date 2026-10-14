@@ -173,11 +173,14 @@ its response body has been read and the upstream kept it alive.
 
 `netd::splice::bidirectional` replaces `copy_bidirectional` in the
 forwarder, ingress, the gated egress proxy, and the gateway. On Linux, when
-both ends are plain TCP or Unix sockets, bytes move socket → pipe → socket
-with `splice(2)` and never enter the process. Everything else (TLS, a stream
-with buffered bytes, macOS) takes the copy path. A probe at first use turns
-splice off on kernels that refuse it. Pipe creation failing (out of
-descriptors) falls back to the copy for that flow.
+both ends are plain TCP or Unix sockets, each direction starts as a plain
+`read`/`write` copy and switches to `splice(2)` (socket → pipe → socket)
+the first time a read fills its 16 KiB buffer, so bulk transfers never
+enter the process and small request/reply traffic keeps the cheaper
+syscalls. Everything else (TLS, a stream with buffered bytes, macOS) takes
+tokio's copy. A probe at first use keeps every flow on the copy on kernels
+that refuse splice. Pipe creation failing (out of descriptors) keeps that
+direction copying.
 
 ### 6.4 Hot-path copies
 

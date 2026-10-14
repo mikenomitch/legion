@@ -357,8 +357,9 @@ async fn fetch_endpoints(
 /// Pick one endpoint uniformly at random.
 ///
 /// Random rather than "the first" so repeated script invocations spread load
-/// the same way the node-local forwarder's default `round_robin` strategy
-/// does — `--one` is meant to be called in a loop.
+/// across endpoints rather than piling onto one — `--one` is meant to be
+/// called in a loop. (A one-shot CLI call has no latency history, so the
+/// forwarder's `least_latency` default does not apply here.)
 fn pick_one(endpoints: &[ServiceEndpoint]) -> Option<&ServiceEndpoint> {
     endpoints.choose(&mut rand::thread_rng())
 }

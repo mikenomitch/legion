@@ -10430,7 +10430,7 @@ message TaskAllocation {
   // this allocation, matching the `AllocNetwork` shape. Workers use it to
   // inject `LEGION_PORT_*` / `LEGION_ADDR_*` environment variables into the
   // task, and — when the task declares upstreams — the `upstreams` array
-  // (`[{"service":"db","localPort":20003,"balance":"round_robin"}]`) carries
+  // (`[{"service":"db","localPort":20003,"balance":"least_latency"}]`) carries
   // the loopback ports the node-local forwarders listen on, surfaced to the
   // task as `LEGION_UPSTREAM_*`.
   //
@@ -10447,7 +10447,8 @@ message TaskAllocation {
   // per-node port space. The worker starts one loopback TCP forwarder per
   // upstream and load-balances new connections across that service's healthy
   // endpoints, which the manager refreshes every heartbeat in
-  // `HeartbeatReply.upstream_endpoints`.
+  // `HeartbeatReply.upstream_endpoints`. An upstream that names no `balance`
+  // uses `least_latency` (docs/service-discovery.md, "Balancing strategies").
   //
   // Empty string (not `{}`) when the task declares no upstreams, so jobs that
   // do not use connect stay byte-identical on the wire.

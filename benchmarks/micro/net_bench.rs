@@ -11,7 +11,9 @@
 //! - `l4_rr`: one kept-open connection, 100-byte request, 100-byte reply.
 //! - `l4_conn_rr`: a new connection per request; the backend closes after
 //!   replying, so client ports never pile up in TIME_WAIT.
-//! - `l4_throughput`: one 64 MiB one-way transfer per iteration.
+//! - `l4_throughput`: one 64 MiB one-way transfer per iteration, then
+//!   `l4_cpu`: CPU-seconds per GiB moved, printed (not a Criterion group),
+//!   because CPU time per byte survives a busy host and wall clock doesn't.
 //! - `http_rr`: HTTP/1.1 GETs on one kept-open client connection, through
 //!   HTTP mode (`connect.upstreams[].http`).
 //! - `slow_endpoint`: three backends, one of them 2 ms slower. Mean
@@ -179,6 +181,50 @@ async fn round_trip(stream: &mut TcpStream) {
     stream.read_exact(&mut buf).await.unwrap();
 }
 
+/// A bare tokio proxy (accept, dial, `copy_bidirectional`) in front of
+/// `port`: the floor for any userspace hop, to tell the forwarder's own
+/// costs from the harness's.
+async fn plain_proxy(port: u16) -> u16 {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let local = listener.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        while let Ok((mut client, _)) = listener.accept().await {
+            tokio::spawn(async move {
+                let mut upstream = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+                let _ = tokio::io::copy_bidirectional(&mut client, &mut upstream).await;
+            });
+        }
+    });
+    local
+}
+
+/// One [`BULK_BYTES`] one-way transfer on a new connection, acknowledged
+/// by the backend once every byte has arrived.
+async fn bulk_transfer(port: u16) {
+    let mut stream = connect(port).await;
+    let chunk = vec![0xFFu8; 256 * 1024];
+    let mut sent = 0u64;
+    while sent < BULK_BYTES {
+        stream.write_all(&chunk).await.unwrap();
+        sent += chunk.len() as u64;
+    }
+    stream.shutdown().await.unwrap();
+    let mut ack = [0u8; 1];
+    stream.read_exact(&mut ack).await.unwrap();
+}
+
+/// User plus system CPU time this process has used, in seconds.
+fn cpu_seconds() -> f64 {
+    // SAFETY: getrusage fills the zeroed struct it is handed.
+    let usage = unsafe {
+        let mut usage: libc::rusage = std::mem::zeroed();
+        libc::getrusage(libc::RUSAGE_SELF, &mut usage);
+        usage
+    };
+    let seconds = |t: libc::timeval| t.tv_sec as f64 + t.tv_usec as f64 / 1e6;
+    seconds(usage.ru_utime) + seconds(usage.ru_stime)
+}
+
 async fn conn_round_trip(port: u16) {
     let mut stream = connect(port).await;
     round_trip(&mut stream).await;
@@ -217,7 +263,12 @@ fn l4(c: &mut Criterion) {
         let direct: u16 = backend.rsplit(':').next().unwrap().parse().unwrap();
         (direct, port)
     });
-    let targets = [("direct", direct), ("forwarder", via)];
+    let plain = rt.block_on(plain_proxy(direct));
+    let targets = [
+        ("direct", direct),
+        ("plain_proxy", plain),
+        ("forwarder", via),
+    ];
 
     let mut group = c.benchmark_group("l4_rr");
     group.measurement_time(Duration::from_secs(4));
@@ -233,24 +284,34 @@ fn l4(c: &mut Criterion) {
     group.throughput(Throughput::Bytes(BULK_BYTES));
     group.sample_size(10);
     for (name, port) in targets {
-        group.bench_function(name, |b| {
-            b.iter(|| {
-                rt.block_on(async {
-                    let mut stream = connect(port).await;
-                    let chunk = vec![0xFFu8; 256 * 1024];
-                    let mut sent = 0u64;
-                    while sent < BULK_BYTES {
-                        stream.write_all(&chunk).await.unwrap();
-                        sent += chunk.len() as u64;
-                    }
-                    stream.shutdown().await.unwrap();
-                    let mut ack = [0u8; 1];
-                    stream.read_exact(&mut ack).await.unwrap();
-                })
-            });
-        });
+        group.bench_function(name, |b| b.iter(|| rt.block_on(bulk_transfer(port))));
     }
     group.finish();
+
+    // Wall-clock throughput through extra threads mostly measures the
+    // scheduler on a busy host. CPU time per byte is what the copy path
+    // actually costs, and holds up under contention. The process runs the
+    // client and the backend too, so the forwarder's own cost is the gap
+    // between the two rows.
+    let rounds = 16;
+    let gib = (rounds as f64 * BULK_BYTES as f64) / (1u64 << 30) as f64;
+    let mut direct_cost = 0.0;
+    for (name, port) in targets {
+        let started = cpu_seconds();
+        for _ in 0..rounds {
+            rt.block_on(bulk_transfer(port));
+        }
+        let per_gib = (cpu_seconds() - started) / gib;
+        if name == "direct" {
+            direct_cost = per_gib;
+            println!("l4_cpu/{name:<20} {per_gib:.3} CPU-s/GiB");
+        } else {
+            println!(
+                "l4_cpu/{name:<20} {per_gib:.3} CPU-s/GiB ({:.3} for the hop)",
+                per_gib - direct_cost
+            );
+        }
+    }
 
     let (direct, via) = rt.block_on(async {
         let backend = reply_and_close_backend(Duration::ZERO).await;

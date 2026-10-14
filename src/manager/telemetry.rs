@@ -403,10 +403,10 @@ impl CounterVec {
     /// per item would be pure overhead.
     pub fn inc_by(&self, labels: &[&str], count: u64) {
         debug_assert_eq!(labels.len(), self.meta.labels.len());
-        let cell = self.series.cell(labels, CounterCell::default);
-        for _ in 0..count {
-            cell.inc();
-        }
+        // One atomic add, however large `count` is: the datapath reports a
+        // whole flow's bytes here, and a loop of single increments cost one
+        // atomic per byte.
+        self.series.cell(labels, CounterCell::default).add(count);
     }
 
     /// Current value of a series (0 when it does not exist). Test/inspection
@@ -3033,6 +3033,25 @@ fn with_lane_detail(reason: String, status: &crate::storage::persistence::RaftSt
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Regression: `inc_by` was a loop of single increments, so the
+    /// datapath's per-flow byte count cost one atomic per byte (a 64 MiB
+    /// flow spun 67 million times on a worker thread when it closed). A
+    /// count this large would not finish under the old loop.
+    #[test]
+    fn inc_by_adds_a_large_count_in_one_step() {
+        let counter = CounterVec {
+            meta: FamilyMeta {
+                name: "legion_test_bytes_total",
+                help: "test",
+                labels: &["direction"],
+            },
+            series: Series::new(),
+        };
+        counter.inc_by(&["egress"], 1 << 40);
+        counter.inc_by(&["egress"], 2);
+        assert_eq!(counter.get(&["egress"]), (1 << 40) + 2);
+    }
 
     /// Adversarial regression (readyz vs. partial lane leadership): a lane
     /// with NO leader must fail readiness even while the aggregate

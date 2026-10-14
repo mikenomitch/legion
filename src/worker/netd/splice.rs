@@ -3,12 +3,15 @@
 //! Every L4 path in the datapath ends the same way: two connections, bytes
 //! copied both ways until both sides close. [`bidirectional`] is that copy.
 //!
-//! - **On Linux, when both ends are plain sockets**, the bytes move with
-//!   `splice(2)` through a pipe and never enter this process's memory. This
-//!   is the network-handlers plan's §7.12 "the L4 path is `splice`, not a
-//!   userspace copy". It covers TCP and Unix sockets (a sandbox's vsock
-//!   relay), and only when nothing has to see the bytes: a TLS stream, or a
-//!   stream with bytes already read off it, takes the copy path.
+//! - **On Linux, when both ends are plain sockets**, each direction starts
+//!   as a plain copy and switches to `splice(2)` once a read fills the copy
+//!   buffer, so bulk transfers move through a pipe and never enter this
+//!   process's memory, while small request/reply traffic keeps the cheaper
+//!   `read`/`write`. This is the network-handlers plan's §7.12 "the L4 path
+//!   is `splice`, not a userspace copy". It covers TCP and Unix sockets (a
+//!   sandbox's vsock relay), and only when nothing has to see the bytes: a
+//!   TLS stream, or a stream with bytes already read off it, takes the
+//!   copy path.
 //! - **Everywhere else**, tokio's `copy_bidirectional`, as before.
 //!
 //! Either way the copy also measures the time from the first request byte
@@ -21,12 +24,16 @@
 use std::io;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::{TcpStream, UnixStream};
+
+/// Told how many bytes each kernel splice moved through a stream. Owned
+/// rather than borrowed from the stream, so a flow's future stays `Send`.
+pub type SpliceActivity = Arc<dyn Fn(usize) + Send + Sync>;
 
 /// A connection the datapath can copy. The default says "not a raw socket",
 /// which always takes the portable copy.
@@ -37,9 +44,11 @@ pub trait SpliceStream: AsyncRead + AsyncWrite + Unpin {
         None
     }
 
-    /// Bytes moved through this stream by the kernel, which a wrapper that
-    /// counts activity would otherwise never see.
-    fn spliced(&self, _bytes: usize) {}
+    /// A hook for bytes the kernel moves through this stream, which a
+    /// wrapper that counts activity would otherwise never see.
+    fn activity(&self) -> Option<SpliceActivity> {
+        None
+    }
 }
 
 /// A plain socket [`bidirectional`] can splice.
@@ -89,22 +98,19 @@ where
     let clock = ReplyClock::default();
     #[cfg(target_os = "linux")]
     if let (Some(a), Some(b)) = (client.socket(), upstream.socket()) {
-        if linux::available() {
-            if let Some(pipes) = linux::Pipes::new() {
-                let counts = linux::Counts::default();
-                let result = linux::bidirectional(a, b, pipes, &clock, &counts, |n| {
-                    client.spliced(n);
-                    upstream.spliced(n);
-                })
-                .await;
-                return Transfer {
-                    sent: counts.sent.load(Ordering::Relaxed),
-                    received: counts.received.load(Ordering::Relaxed),
-                    first_reply: clock.first_reply(),
-                    error: result.err(),
-                };
-            }
-        }
+        let counts = linux::Counts::default();
+        let hooks: Vec<SpliceActivity> = [client.activity(), upstream.activity()]
+            .into_iter()
+            .flatten()
+            .collect();
+        let moved = move |n: usize| hooks.iter().for_each(|hook| hook(n));
+        let result = linux::bidirectional(a, b, &clock, &counts, moved).await;
+        return Transfer {
+            sent: counts.sent.load(Ordering::Relaxed),
+            received: counts.received.load(Ordering::Relaxed),
+            first_reply: clock.first_reply(),
+            error: result.err(),
+        };
     }
 
     let mut a = Timed {
@@ -158,15 +164,13 @@ impl ReplyClock {
     }
 
     fn upstream_bytes(&self) {
-        match self.state.swap(CLOCK_SETTLED, Ordering::AcqRel) {
-            CLOCK_RUNNING => {
-                if let Some(origin) = self.origin.get() {
-                    let nanos = origin.elapsed().as_nanos().min(u64::MAX as u128) as u64;
-                    self.reply_nanos.store(nanos.max(1), Ordering::Relaxed);
-                }
+        // Anything but a running clock means the upstream spoke first: no
+        // request to time.
+        if self.state.swap(CLOCK_SETTLED, Ordering::AcqRel) == CLOCK_RUNNING {
+            if let Some(origin) = self.origin.get() {
+                let nanos = origin.elapsed().as_nanos().min(u64::MAX as u128) as u64;
+                self.reply_nanos.store(nanos.max(1), Ordering::Relaxed);
             }
-            // The upstream spoke first: no request to time.
-            _ => {}
         }
     }
 
@@ -240,15 +244,21 @@ mod linux {
     use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::OnceLock;
-    use tokio::io::Interest;
+
+    /// Each direction starts by copying through a buffer this size. A read
+    /// that fills it means a bulk transfer is under way, and the direction
+    /// switches to `splice` (HAProxy's "splice-auto"). Small request/reply
+    /// traffic never pays for a pipe: for a few hundred bytes, two
+    /// `splice` calls cost more than a `read` and a `write`.
+    const COPY_BUF: usize = 16 * 1024;
 
     /// The most one `splice` call moves: the pipe's default capacity.
     const CHUNK: usize = 64 * 1024;
 
     /// Whether this kernel splices sockets at all, probed once. A sandboxed
-    /// kernel (gVisor, some seccomp profiles) may refuse it; the copy path
-    /// then serves every flow.
-    pub fn available() -> bool {
+    /// kernel (gVisor, some seccomp profiles) may refuse it; every flow then
+    /// stays on the copy.
+    fn available() -> bool {
         static AVAILABLE: OnceLock<bool> = OnceLock::new();
         *AVAILABLE.get_or_init(|| {
             let works = probe();
@@ -270,19 +280,7 @@ mod linux {
         if (&left).write_all(b"x").is_err() {
             return false;
         }
-        // SAFETY: valid fds owned above; null offsets are allowed for
-        // sockets and pipes.
-        let moved = unsafe {
-            libc::splice(
-                right.as_raw_fd(),
-                std::ptr::null_mut(),
-                pipe.write.as_raw_fd(),
-                std::ptr::null_mut(),
-                1,
-                libc::SPLICE_F_NONBLOCK,
-            )
-        };
-        moved == 1
+        splice(right.as_raw_fd(), pipe.write.as_raw_fd(), 1).is_ok_and(|moved| moved == 1)
     }
 
     struct Pipe {
@@ -307,22 +305,6 @@ mod linux {
         }
     }
 
-    /// One pipe per direction. Creating them can fail (out of descriptors);
-    /// the caller then copies instead.
-    pub struct Pipes {
-        to_upstream: Pipe,
-        to_client: Pipe,
-    }
-
-    impl Pipes {
-        pub fn new() -> Option<Pipes> {
-            Some(Pipes {
-                to_upstream: Pipe::new()?,
-                to_client: Pipe::new()?,
-            })
-        }
-    }
-
     #[derive(Default)]
     pub struct Counts {
         pub sent: AtomicU64,
@@ -337,22 +319,95 @@ mod linux {
             }
         }
 
-        async fn ready(&self, interest: Interest) -> io::Result<()> {
+        async fn readable(&self) -> io::Result<()> {
             match self {
-                Socket::Tcp(s) => s.ready(interest).await.map(drop),
-                Socket::Unix(s) => s.ready(interest).await.map(drop),
+                Socket::Tcp(s) => s.readable().await,
+                Socket::Unix(s) => s.readable().await,
+            }
+        }
+
+        async fn writable(&self) -> io::Result<()> {
+            match self {
+                Socket::Tcp(s) => s.writable().await,
+                Socket::Unix(s) => s.writable().await,
+            }
+        }
+
+        fn try_read(&self, buf: &mut [u8]) -> io::Result<usize> {
+            match self {
+                Socket::Tcp(s) => s.try_read(buf),
+                Socket::Unix(s) => s.try_read(buf),
+            }
+        }
+
+        fn try_write(&self, buf: &[u8]) -> io::Result<usize> {
+            match self {
+                Socket::Tcp(s) => s.try_write(buf),
+                Socket::Unix(s) => s.try_write(buf),
             }
         }
 
         fn try_io<R>(
             &self,
-            interest: Interest,
+            interest: tokio::io::Interest,
             f: impl FnOnce() -> io::Result<R>,
         ) -> io::Result<R> {
             match self {
                 Socket::Tcp(s) => s.try_io(interest, f),
                 Socket::Unix(s) => s.try_io(interest, f),
             }
+        }
+
+        /// Read what is there, waiting for at least one byte or EOF.
+        async fn read(&self, buf: &mut [u8]) -> io::Result<usize> {
+            loop {
+                self.readable().await?;
+                match self.try_read(buf) {
+                    Err(err) if err.kind() == io::ErrorKind::WouldBlock => continue,
+                    result => return result,
+                }
+            }
+        }
+
+        async fn write_all(&self, mut buf: &[u8]) -> io::Result<()> {
+            while !buf.is_empty() {
+                self.writable().await?;
+                match self.try_write(buf) {
+                    Ok(0) => return Err(io::ErrorKind::WriteZero.into()),
+                    Ok(n) => buf = &buf[n..],
+                    Err(err) if err.kind() == io::ErrorKind::WouldBlock => continue,
+                    Err(err) => return Err(err),
+                }
+            }
+            Ok(())
+        }
+
+        /// `splice` from this socket into `pipe`, waiting for readiness.
+        async fn splice_into(&self, pipe: &Pipe) -> io::Result<usize> {
+            loop {
+                self.readable().await?;
+                match self.try_io(tokio::io::Interest::READABLE, || {
+                    splice(self.fd(), pipe.write.as_raw_fd(), CHUNK)
+                }) {
+                    Err(err) if err.kind() == io::ErrorKind::WouldBlock => continue,
+                    result => return result,
+                }
+            }
+        }
+
+        /// `splice` exactly `len` bytes out of `pipe` into this socket.
+        async fn splice_from(&self, pipe: &Pipe, mut len: usize) -> io::Result<()> {
+            while len > 0 {
+                self.writable().await?;
+                match self.try_io(tokio::io::Interest::WRITABLE, || {
+                    splice(pipe.read.as_raw_fd(), self.fd(), len)
+                }) {
+                    Ok(n) => len -= n,
+                    Err(err) if err.kind() == io::ErrorKind::WouldBlock => continue,
+                    Err(err) => return Err(err),
+                }
+            }
+            Ok(())
         }
 
         fn shutdown_write(&self) {
@@ -365,6 +420,9 @@ mod linux {
         }
     }
 
+    /// One `splice(2)` call. Splicing into a socket whose peer is gone
+    /// raises SIGPIPE like `write(2)` does; Rust binaries (and tokio's own
+    /// writes) rely on the runtime ignoring it, so this sees `EPIPE`.
     fn splice(from: RawFd, to: RawFd, len: usize) -> io::Result<usize> {
         // SAFETY: both fds are open for the duration of the call (borrowed
         // from live sockets and pipes); null offsets are required for them.
@@ -385,81 +443,74 @@ mod linux {
         }
     }
 
-    /// One direction: socket → pipe → socket until EOF, then half-close.
-    /// The pipe is drained after every fill, so a would-block can only come
-    /// from the socket, never the pipe, and the readiness bookkeeping stays
-    /// honest.
+    /// How one direction is moving bytes right now.
+    enum Mode {
+        Copy(Vec<u8>),
+        Splice(Pipe),
+    }
+
+    /// One direction until EOF, then half-close. Copies until a read fills
+    /// the buffer, then splices socket → pipe → socket for the rest of the
+    /// flow. The pipe is drained after every fill, so a would-block can only
+    /// come from a socket, never the pipe, and the readiness bookkeeping
+    /// stays honest. A pipe that cannot be created (out of descriptors)
+    /// leaves the direction copying.
     async fn one_way(
         from: Socket<'_>,
         to: Socket<'_>,
-        pipe: &Pipe,
         total: &AtomicU64,
-        first: &dyn Fn(),
-        moved: &dyn Fn(usize),
+        first: &(dyn Fn() + Sync),
+        moved: &(dyn Fn(usize) + Sync),
     ) -> io::Result<()> {
+        let mut mode = Mode::Copy(vec![0u8; COPY_BUF]);
+        let mut may_splice = available();
         loop {
-            let filled = loop {
-                from.ready(Interest::READABLE).await?;
-                match from.try_io(Interest::READABLE, || {
-                    splice(from.fd(), pipe.write.as_raw_fd(), CHUNK)
-                }) {
-                    Ok(n) => break n,
-                    Err(err) if err.kind() == io::ErrorKind::WouldBlock => continue,
-                    Err(err) => return Err(err),
-                }
+            let n = match &mut mode {
+                Mode::Copy(buf) => from.read(buf).await?,
+                Mode::Splice(pipe) => from.splice_into(pipe).await?,
             };
-            if filled == 0 {
+            if n == 0 {
                 to.shutdown_write();
                 return Ok(());
             }
             if total.load(Ordering::Relaxed) == 0 {
                 first();
             }
-            let mut left = filled;
-            while left > 0 {
-                to.ready(Interest::WRITABLE).await?;
-                match to.try_io(Interest::WRITABLE, || {
-                    splice(pipe.read.as_raw_fd(), to.fd(), left)
-                }) {
-                    Ok(n) => left -= n,
-                    Err(err) if err.kind() == io::ErrorKind::WouldBlock => continue,
-                    Err(err) => return Err(err),
+            match &mode {
+                Mode::Copy(buf) => to.write_all(&buf[..n]).await?,
+                Mode::Splice(pipe) => to.splice_from(pipe, n).await?,
+            }
+            total.fetch_add(n as u64, Ordering::Relaxed);
+            moved(n);
+            if may_splice && n == COPY_BUF && matches!(mode, Mode::Copy(_)) {
+                match Pipe::new() {
+                    Some(pipe) => mode = Mode::Splice(pipe),
+                    None => may_splice = false,
                 }
             }
-            total.fetch_add(filled as u64, Ordering::Relaxed);
-            moved(filled);
         }
     }
 
     pub async fn bidirectional(
         client: Socket<'_>,
         upstream: Socket<'_>,
-        pipes: Pipes,
         clock: &ReplyClock,
         counts: &Counts,
-        moved: impl Fn(usize),
+        moved: impl Fn(usize) + Sync,
     ) -> io::Result<()> {
         let request_started = || clock.client_bytes();
         let reply_started = || clock.upstream_bytes();
         tokio::try_join!(
-            one_way(
-                client,
-                upstream,
-                &pipes.to_upstream,
-                &counts.sent,
-                &request_started,
-                &moved,
-            ),
-            one_way(
-                upstream,
-                client,
-                &pipes.to_client,
-                &counts.received,
-                &reply_started,
-                &moved,
-            ),
+            one_way(client, upstream, &counts.sent, &request_started, &moved),
+            one_way(upstream, client, &counts.received, &reply_started, &moved),
         )
         .map(drop)
+    }
+
+    /// Whether this kernel splices, for the tests.
+    #[cfg(test)]
+    pub fn splices() -> bool {
+        available()
     }
 }
 
@@ -597,6 +648,6 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn this_kernel_splices_sockets() {
-        assert!(linux::available());
+        assert!(linux::splices());
     }
 }

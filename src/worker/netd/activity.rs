@@ -172,11 +172,17 @@ impl<S: super::splice::SpliceStream> super::splice::SpliceStream for TrackedStre
         self.inner.socket()
     }
 
-    fn spliced(&self, bytes: usize) {
-        if bytes > 0 {
-            self.slot.touch();
-        }
-        self.inner.spliced(bytes);
+    fn activity(&self) -> Option<super::splice::SpliceActivity> {
+        let slot = self.slot.clone();
+        let inner = self.inner.activity();
+        Some(Arc::new(move |bytes| {
+            if bytes > 0 {
+                slot.touch();
+            }
+            if let Some(inner) = &inner {
+                inner(bytes);
+            }
+        }))
     }
 }
 
