@@ -99,11 +99,11 @@ impl Attachment {
         }
     }
 
-    /// Whether the allocation's upstream VIPs are bound on the node. A
+    /// Whether the allocation's upstream VIPs are bound on the node. A gated
     /// sandbox guest serves its VIPs itself (its agent relays them), so the
     /// node binds none for it.
     pub fn serves_vips(&self) -> bool {
-        matches!(self, Attachment::Host | Attachment::Netns { .. })
+        !matches!(self, Attachment::GuestVsock { .. })
     }
 
     /// Whether every port the allocation advertises is fronted by an ingress
@@ -300,5 +300,15 @@ mod tests {
         }
         .fronts_every_port());
         assert!(!Attachment::Netns { path: "/n".into() }.fronts_every_port());
+        // Only a gated guest serves its own VIPs (its agent relays them).
+        assert!(!Attachment::GuestVsock {
+            scratch: "/s".into()
+        }
+        .serves_vips());
+        assert!(Attachment::GuestTap {
+            scratch: "/s".into()
+        }
+        .serves_vips());
+        assert!(Attachment::Host.serves_vips());
     }
 }

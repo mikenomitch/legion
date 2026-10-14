@@ -116,12 +116,13 @@ forward proxy, and refusing it would make pip and npm slower for nothing.
 
 ---
 
-## 5. Policy assignments land with the desired set, before templates and fetches
+## 5. Policy assignments land with the desired set, before the listeners bind
 
-**Call.** `NetdInput::Desired` applies the listeners, the endpoint feed, the
-attribution identities, and the policy assignments together. Before, the
-heartbeat applied assignments later in the tick, after templates and live KV
-files were written.
+**Call.** `NetdInput::Desired` applies the attribution identities and the
+policy assignments first, then the namespaces, the listeners, and the
+endpoint feed. Before, the heartbeat bound the listeners first and applied
+assignments later in the tick, after templates and live KV files were
+written.
 
 **Alternatives.** Keep assignments a separate input sent where the old code
 applied them.

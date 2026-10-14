@@ -390,7 +390,18 @@ impl Netd {
 
     async fn apply_desired(&self, input: DesiredNetwork) {
         let desired = &input.desired;
-        // Gated namespaces first: the egress proxy, the resolver, and the
+        let context = self.forwarder.context();
+        // Policy first: attribution for every allocation and the hash each
+        // runs under, so a listener bound below judges by it from its first
+        // connection. Bodies not cached yet are in `wants()`; until one
+        // arrives a gated allocation stays closed.
+        if let Some(cache) = context.cache() {
+            cache.set_identities(crate::worker::netd::policy::identities_from_desired(
+                desired,
+            ));
+            cache.apply_assignments(&input.net_policies);
+        }
+        // Gated namespaces next: the egress proxy, the resolver, and the
         // upstream listeners of a gated allocation bind *inside* its
         // namespace, so binding them before it exists fails and leaves the
         // task with no network until the next beat.
@@ -407,7 +418,6 @@ impl Netd {
         if let Some(ingress) = forwarder.ingress() {
             ingress.sync(&specs::ingress_specs(desired, root)).await;
         }
-        let context = forwarder.context();
         let mut mesh_wanted = false;
         for update in &input.upstream_endpoints {
             let endpoints = specs::dialable_endpoints(update);
@@ -436,15 +446,6 @@ impl Netd {
                     .unwrap_or(false)
         });
         context.set_mesh_wanted(mesh_wanted);
-        // Policy: attribution for every allocation, and the hash each runs
-        // under. Bodies not cached yet are in `wants()`; until one arrives a
-        // gated allocation stays closed.
-        if let Some(cache) = context.cache() {
-            cache.set_identities(crate::worker::netd::policy::identities_from_desired(
-                desired,
-            ));
-            cache.apply_assignments(&input.net_policies);
-        }
         *self.last.lock().unwrap_or_else(|p| p.into_inner()) = input;
     }
 
