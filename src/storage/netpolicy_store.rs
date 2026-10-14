@@ -172,8 +172,11 @@ impl Store {
     }
 }
 
-/// The cluster CA (`net_mesh_ca`), PEM-encoded. It signs node, fleet, and
-/// manager certificates (`crate::manager::mesh_ca`).
+/// The built-in cluster CA (`net_mesh_ca`), PEM-encoded. Under the default
+/// `builtin` provider it signs node, fleet, and manager certificates
+/// (`crate::manager::mesh_ca`). Nothing reads it except that provider
+/// (`crate::manager::cluster_ca::builtin`): every other reader goes through
+/// `Store::cluster_ca`, which knows which provider is active.
 #[derive(Debug, Clone)]
 pub struct MeshCa {
     /// The CA that signs now.
@@ -370,6 +373,100 @@ impl Store {
                 ],
             )?;
             Ok(next.clone())
+        })
+    }
+}
+
+/// The cluster CA as the control-lane leader's provider sees it
+/// (`cluster_ca_record`; docs/cluster-ca.md, "Every manager must agree").
+/// Pins only: what every other manager compares its own provider's view
+/// with.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClusterCaRecord {
+    /// `builtin` | `file` | `exec`.
+    pub provider: String,
+    /// The pin join tokens carry: the trust-bundle certificate the signing
+    /// CA chains to.
+    pub anchor_pin: String,
+    /// Every certificate in the trust bundle, anchor first.
+    pub bundle_pins: Vec<String>,
+    /// The manager that wrote it (its certificate id: the raft `nodeId`, or
+    /// `local`).
+    pub recorded_by: String,
+    /// RFC 3339.
+    pub recorded_at: String,
+}
+
+impl ClusterCaRecord {
+    /// Whether two records describe the same CA (ignoring who wrote them
+    /// and when).
+    pub fn same_ca(&self, other: &ClusterCaRecord) -> bool {
+        self.provider == other.provider
+            && self.anchor_pin == other.anchor_pin
+            && self.bundle_pins == other.bundle_pins
+    }
+}
+
+impl Store {
+    /// The leader's recorded view of the cluster CA, if any manager has
+    /// written one.
+    pub fn cluster_ca_record(&self) -> R<Option<ClusterCaRecord>> {
+        let conn = self.read_connection()?;
+        let row = conn
+            .query_row(
+                "SELECT provider, anchor_pin, bundle_pins, recorded_by, recorded_at
+                 FROM cluster_ca_record WHERE id = 1;",
+                [],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, String>(4)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let Some((provider, anchor_pin, bundle_pins, recorded_by, recorded_at)) = row else {
+            return Ok(None);
+        };
+        Ok(Some(ClusterCaRecord {
+            provider,
+            anchor_pin,
+            bundle_pins: serde_json::from_str(&bundle_pins)
+                .context("cluster_ca_record.bundle_pins is not a JSON array")?,
+            recorded_by,
+            recorded_at,
+        }))
+    }
+
+    /// Replace the recorded view of the cluster CA (a replicated
+    /// control-lane write; only the control-lane leader calls it).
+    #[instrument(err, skip_all, fields(provider = %record.provider))]
+    pub fn record_cluster_ca(&self, record: &ClusterCaRecord) -> R<()> {
+        let record = record.clone();
+        self.replicated(Lane::Control, "record_cluster_ca", move |s| {
+            let conn = s.write_connection()?;
+            conn.execute(
+                "INSERT INTO cluster_ca_record
+                    (id, provider, anchor_pin, bundle_pins, recorded_by, recorded_at)
+                 VALUES (1, ?1, ?2, ?3, ?4, ?5)
+                 ON CONFLICT(id) DO UPDATE SET
+                    provider = excluded.provider,
+                    anchor_pin = excluded.anchor_pin,
+                    bundle_pins = excluded.bundle_pins,
+                    recorded_by = excluded.recorded_by,
+                    recorded_at = excluded.recorded_at;",
+                params![
+                    record.provider,
+                    record.anchor_pin,
+                    serde_json::to_string(&record.bundle_pins)?,
+                    record.recorded_by,
+                    record.recorded_at
+                ],
+            )?;
+            Ok(())
         })
     }
 }

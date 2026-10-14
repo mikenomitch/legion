@@ -173,6 +173,9 @@ const TABLE_OWNERS: &[(&str, Owner)] = &[
     ("net_policy", Owner::Lane(Lane::Control)),
     ("net_policy_meta", Owner::Lane(Lane::Control)),
     ("net_mesh_ca", Owner::Lane(Lane::Control)),
+    // The leader's view of the cluster CA (docs/cluster-ca.md): written
+    // when the control-lane leader's provider reports a new CA.
+    ("cluster_ca_record", Owner::Lane(Lane::Control)),
     ("acl_token", Owner::Lane(Lane::Control)),
     ("acl_user", Owner::Lane(Lane::Control)),
     ("join_token", Owner::Lane(Lane::Control)),

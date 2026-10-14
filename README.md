@@ -406,7 +406,7 @@ start:
   [Serving TLS Certificates from KV](docs/guides/tls-certificates.md)
 - **Platform services:** [Service Discovery](docs/service-discovery.md) ·
   [Network Handlers](docs/network-handlers.md) · [KV Store](docs/kv-store.md) ·
-  [Exec & Actions](docs/exec-and-actions.md)
+  [Exec & Actions](docs/exec-and-actions.md) · [The Cluster CA](docs/cluster-ca.md)
 - **Operating a cluster:** [Running Raft](docs/raft-operations.md) ·
   [Upgrades](docs/upgrades.md) · [Data Directory](docs/data-directory.md) ·
   [Logging](docs/logging.md) ·

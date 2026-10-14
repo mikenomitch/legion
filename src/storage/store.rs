@@ -1417,6 +1417,10 @@ pub struct Store {
     // or written goes through it, and it is loaded from the replicated
     // `keyring_key` table at start and on every change to that table.
     keyring: Keyring,
+    // The cluster CA provider (docs/cluster-ca.md), built from `clusterCa`:
+    // which CA signs node, fleet, and manager certificates. Every reader of
+    // the trust bundle, the pin, or the chain goes through it.
+    cluster_ca: crate::manager::cluster_ca::ClusterCa,
 }
 
 /// Column list every `kv_entry` read uses, in the order
@@ -1989,6 +1993,7 @@ impl Store {
         // here, with the field named, rather than on the first KV write.
         config.encryption.validate()?;
         let keyring = Keyring::from_config(&config.encryption, &config.store_path)?;
+        let cluster_ca = crate::manager::cluster_ca::ClusterCa::from_config(&config.cluster_ca)?;
 
         let write_conn = Store::create_write_conn(&db_path, raft_enabled)?;
         let _migrations = Store::create_initial_tables(&Arc::clone(&write_conn))?;
@@ -2067,6 +2072,7 @@ impl Store {
             read_model_scrub_queue: Arc::new(std::sync::Mutex::new(Vec::new())),
             external_write_baseline: Arc::new(std::sync::Mutex::new(None)),
             keyring,
+            cluster_ca,
         };
         store.liveness.configure(config.liveness.settings());
 
@@ -8600,6 +8606,11 @@ impl Store {
     /// The session index (see [`crate::storage::session_index`]).
     pub fn sessions(&self) -> &Arc<crate::storage::session_index::SessionIndex> {
         &self.sessions
+    }
+
+    /// The cluster CA provider (docs/cluster-ca.md).
+    pub fn cluster_ca(&self) -> &crate::manager::cluster_ca::ClusterCa {
+        &self.cluster_ca
     }
 
     /// Ask every other manager for its session index's answer to `request`

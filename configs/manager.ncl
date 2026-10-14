@@ -207,6 +207,24 @@
   #   # are re-encrypted under the new key in the background afterwards.
   #   dataKeyRotationAge = "720h",
   # },
+  # The cluster CA (docs/cluster-ca.md): what signs node, fleet, and manager
+  # certificates and what every join token pins. Omit the block for the
+  # built-in CA, generated on first use and kept in the replicated store.
+  # Every manager in a cluster needs the same block (and the same files).
+  # clusterCa = {
+  #   provider = "builtin",                      # "builtin" | "file" | "exec"
+  #   # file: an intermediate from your PKI; the key never enters the store.
+  #   # certPath = "/etc/legion/ca/cluster-ca.pem",   # signing CA, then intermediates
+  #   # keyPath = "/etc/legion/ca/cluster-ca.key",    # PKCS#8 ("BEGIN PRIVATE KEY")
+  #   # bundlePath = "/etc/legion/ca/trust.pem",      # default: the signing CA itself
+  #   # exec: an external signer over JSON on stdin/stdout
+  #   # (plugins/cluster_ca/vault-pki/legion-ca-vault for Vault PKI).
+  #   # command = ["legion-ca-vault", "--mount", "pki_legion", "--role", "legion"],
+  #   # timeout = "10s",                         # per call
+  #   # refreshInterval = "1m",                  # how often the trust bundle is re-read
+  # },
+  # Test a provider before using it: `legion net ca provider test -- <command…>`
+  # or `legion net ca provider test --cert-path … --key-path …`.
   # Cluster-level artifact settings (docs/artifacts.md). Everything here is
   # optional; the values below match the built-in defaults.
   artifacts = {

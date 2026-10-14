@@ -2,7 +2,18 @@
 
 > **Judgement calls:** [`calls/cluster-ca-provider-plan_calls.md`](../calls/cluster-ca-provider-plan_calls.md)
 
-**Status: PLANNED** (2026-10-14).
+**Status: SHIPPED** (all three phases, 2026-10-14, branch
+`seams/ca-provider`). Public page: [`docs/cluster-ca.md`](../../docs/cluster-ca.md).
+What was built differs from the text below in small ways, each recorded in
+the calls doc: an `exec` signer that has never answered blocks only the very
+first call and refuses the rest at once (entry 12); returned chains stop at
+the first trust-bundle certificate, so a root a CA appends is not carried by
+every leaf; and the in-process worker waits up to 30 seconds for an `exec`
+CA's pin at start. Deliberately deferred, each an open item in
+`internal_docs/TODO.md`: switching a running cluster between providers
+without re-joining workers (entry 13), per-manager agreement records (§11),
+the upstream-authority mode (§11), a native Vault client, and exercising the
+reference Vault helper against a live Vault in CI.
 
 This plan reverses one non-goal of the
 [worker-plane-auth plan](worker-plane-auth-plan.md) ("External or pluggable

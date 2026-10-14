@@ -2633,7 +2633,7 @@ async fn heartbeat_tick(
             &mut client_clone,
             credentials,
             manager_addr,
-            &reply.cluster_ca_pin,
+            &reply.cluster_ca_pins,
         )
         .await;
         // KV-held ingress certificates and upstream credentials, for the
@@ -3022,9 +3022,10 @@ async fn apply_templates(task_manager: &Arc<Mutex<WorkerTaskManager>>, reply: &H
 }
 
 /// Keep the node certificate current: re-issued after a third of its
-/// lifetime, or at once when the manager names a signing CA the node's
-/// bundle lacks (a CA rotation). The same identity serves the worker plane
-/// listener (hot-swapped, no restart) and the mesh. Fail-static: a failed
+/// lifetime, or at once when the manager's trust bundle differs from the
+/// node's (a CA rotation, or a CA added to or removed from the bundle). The
+/// same identity serves the worker plane listener (hot-swapped, no restart)
+/// and the mesh. Fail-static: a failed
 /// issuance keeps the certificate the node has, and a node without one
 /// refuses mesh flows rather than sending them in the clear.
 async fn refresh_node_identity(
@@ -3033,9 +3034,9 @@ async fn refresh_node_identity(
     client: &mut ManagerClient<Channel>,
     credentials: &Arc<WorkerCredentials>,
     manager_addr: &str,
-    manager_ca_pin: &str,
+    manager_ca_pins: &[String],
 ) {
-    if !node_identity.needs_refresh(Some(manager_ca_pin)) {
+    if !node_identity.needs_refresh(Some(manager_ca_pins)) {
         return;
     }
     match node_identity.issue(client, credentials, manager_addr).await {

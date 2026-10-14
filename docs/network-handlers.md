@@ -749,13 +749,17 @@ ingress = {
 first DNS SAN, or else its CN. `identity` rules and `requireIdentity` match
 against that string.
 
-**The mesh (`certFrom = "legion"`).** The manager keeps one cluster **mesh
-CA**, created on first use and replicated with the control lane. Every
+**The mesh (`certFrom = "legion"`).** The mesh uses the **cluster CA**. By
+default that is a CA the manager creates on first use and replicates with the
+control lane; it can instead be an intermediate from your own PKI or an
+external signer such as Vault PKI ([The Cluster CA](cluster-ca.md)). Every
 worker node holds a short-lived **node certificate** from it: the worker
 generates its own key, sends a CSR (`IssueNodeCertificate`, authorized by its
-node token) right after registration, and the manager signs it with the SANs
-`<node>.node.legion` and `legion://node/<node id>`, valid for 24 hours. The
-worker refreshes it after 8. The same certificate serves the node's worker
+node token) right after registration, and the manager has it signed with the
+SANs `<node>.node.legion` and `legion://node/<node id>`, valid for 24 hours.
+The manager picks those names itself and checks what an external CA returns
+before handing it out. The worker refreshes it after 8 hours, or within one
+heartbeat when the cluster's trust bundle changes. The same certificate serves the node's worker
 plane ([auth-and-acls.md](auth-and-acls.md#the-worker-plane)), and the key
 and certificate persist under `<state-dir>/identity/` (mode `0600`) so a
 restarted node has its mesh identity before it reaches a manager. The
@@ -771,9 +775,12 @@ private key never leaves the node. Then:
   `authz`.
 - A plain client that dials the port directly is refused at the handshake.
   A non-Legion client that must reach the port has two options: present a
-  certificate from the mesh CA (`legion net ca show` prints the CA, but
-  Legion does not issue certificates for outside clients), or go through a
-  Legion task.
+  certificate from the cluster CA (`legion net ca show` prints its trust
+  bundle, but Legion does not issue certificates for outside clients), or go
+  through a Legion task. With a `file` or `exec` CA, remember that anything
+  your PKI signs under that CA with a `legion://` URI SAN is a node or a
+  manager to every peer: keep that intermediate (or Vault role) for Legion
+  alone.
 - Workloads never hold certificates. The node attributes identity, which
   keeps a per-user sandbox's identity out of the sandbox.
 
@@ -782,12 +789,15 @@ The mesh CA is the cluster CA, the same one behind the worker plane
 certificate is its node certificate: the worker generates the key and the
 manager signs a CSR.
 
-`legion net ca show` prints the CA trust bundle (never a key), its pin, and
-where a rotation stands. `legion net ca rotate` rotates it in two steps that
-break no mesh connection: the new CA, cross-signed by the old one, signs at
-once, and the old one stays in every trust bundle for one certificate
-lifetime (24 hours). Every node re-issues on its next heartbeat. Peers never
-fall back to plaintext ([Rotating the cluster
+`legion net ca show` prints the CA trust bundle (never a key), its pin, which
+provider supplies it, and where a rotation stands. `legion net ca rotate`
+rotates the built-in CA in two steps that break no mesh connection: the new
+CA, cross-signed by the old one, signs at once, and the old one stays in
+every trust bundle for one certificate lifetime (24 hours). Every node
+re-issues on its next heartbeat. A `file` or `exec` CA rotates outside
+Legion with the same add-switch-remove steps
+([The Cluster CA](cluster-ca.md#rotation)). Peers never fall back to
+plaintext ([Rotating the cluster
 CA](auth-and-acls.md#rotating-the-cluster-ca)).
 
 ### Certificates from KV

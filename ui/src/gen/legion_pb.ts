@@ -523,6 +523,18 @@ export class WorkerPreRegisterReply extends Message<WorkerPreRegisterReply> {
    */
   config?: WorkerConfig;
 
+  /**
+   * The cluster's workload-identity issuer, the same value as
+   * `HeartbeatReply.workload_identity_issuer`: delivered here so a node
+   * that verifies tickets (edge boot, direct exec) knows the `iss` to expect
+   * before its first heartbeat.
+   *
+   * Default: empty when workload identity is disabled on this manager.
+   *
+   * @generated from field: string workload_identity_issuer = 2;
+   */
+  workloadIdentityIssuer = "";
+
   constructor(data?: PartialMessage<WorkerPreRegisterReply>) {
     super();
     proto3.util.initPartial(data, this);
@@ -532,6 +544,7 @@ export class WorkerPreRegisterReply extends Message<WorkerPreRegisterReply> {
   static readonly typeName = "legion.WorkerPreRegisterReply";
   static readonly fields: FieldList = proto3.util.newFieldList(() => [
     { no: 1, name: "config", kind: "message", T: WorkerConfig },
+    { no: 2, name: "workload_identity_issuer", kind: "scalar", T: 9 /* ScalarType.STRING */ },
   ]);
 
   static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): WorkerPreRegisterReply {
@@ -3619,6 +3632,10 @@ export class PlanJobReply extends Message<PlanJobReply> {
    * `observe` mode (what enforce mode *would* evict, given that observe
    * commits nothing) — so the preview answers the same question either way.
    *
+   * A victim younger than `preemption.victimExemptAge` is listed with a
+   * non-zero `eligible_in_seconds` when the guard alone keeps the placement
+   * from fitting: the submit waits that long, then evicts it.
+   *
    * This is a plan against a snapshot, not a reservation. The real submit
    * re-plans, so the victims it takes may differ if the cluster moved in
    * between. See docs/preemption-and-eviction.md.
@@ -5222,6 +5239,11 @@ export class StartInstanceReply extends Message<StartInstanceReply> {
    * - `"Instance <id> already running"` — no-op on a live
    *  (pending/active/rescheduling) instance, or on a running session
    *  (docs/session-mode.md).
+   * - `"Retrying instance <id> now: lifted its reschedule backoff"` — the
+   *  instance was `rescheduling` and its replacement was waiting out the
+   *  task's reschedule backoff (`InstanceInfo.reschedule_backoff`); the
+   *  backoff is lifted and a placement queued. The move history stays, so
+   *  another failure backs off from where it was.
    * - `"Resuming instance <id> from <snapshot> on <node>"` — a suspended
    *  instance queued to restore from its checkpoint.
    * - `"Started instance <id> cold ..."` — a suspended instance booting
@@ -6226,6 +6248,21 @@ export class InstanceInfo extends Message<InstanceInfo> {
    */
   envelopeAllocId?: bigint;
 
+  /**
+   * Set while the instance is `rescheduling` because its last allocation
+   * failed and the replacement waits out the task's reschedule backoff
+   * (`on_unhealthy.move_delay`, doubled per consecutive failure, capped at
+   * 30 minutes; docs/jobs-tasks-and-scheduling.md,
+   * "Manager-side move logic"). No eval places the instance before
+   * `next_attempt_at`. `detail` carries the same facts as a sentence, with
+   * how to retry now: StartInstance lifts the backoff of a keyed instance,
+   * and `legion job run <spec> --force-reschedule` lifts every backoff of
+   * the job. Replicated, so every manager reports it. Unset otherwise.
+   *
+   * @generated from field: optional legion.RescheduleBackoff reschedule_backoff = 47;
+   */
+  rescheduleBackoff?: RescheduleBackoff;
+
   constructor(data?: PartialMessage<InstanceInfo>) {
     super();
     proto3.util.initPartial(data, this);
@@ -6280,6 +6317,7 @@ export class InstanceInfo extends Message<InstanceInfo> {
     { no: 44, name: "node_id", kind: "scalar", T: 9 /* ScalarType.STRING */, opt: true },
     { no: 45, name: "lease_issued_at", kind: "scalar", T: 9 /* ScalarType.STRING */, opt: true },
     { no: 46, name: "envelope_alloc_id", kind: "scalar", T: 3 /* ScalarType.INT64 */, opt: true },
+    { no: 47, name: "reschedule_backoff", kind: "message", T: RescheduleBackoff, opt: true },
   ]);
 
   static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): InstanceInfo {
@@ -6296,6 +6334,137 @@ export class InstanceInfo extends Message<InstanceInfo> {
 
   static equals(a: InstanceInfo | PlainMessage<InstanceInfo> | undefined, b: InstanceInfo | PlainMessage<InstanceInfo> | undefined): boolean {
     return proto3.util.equals(InstanceInfo, a, b);
+  }
+}
+
+/**
+ * A failed allocation's replacement waiting out its task's reschedule
+ * backoff (InstanceInfo.reschedule_backoff, Job.reschedule_backoffs). The
+ * manager records it in the same replicated write that removes the failed
+ * allocation, and the scheduler leaves the replacement unplaced until
+ * `next_attempt_at`, whatever eval runs for the job in the meantime. The
+ * `allocation.reschedule_deferred` event announces each one
+ * (docs/event-stream.md).
+ *
+ * @generated from message legion.RescheduleBackoff
+ */
+export class RescheduleBackoff extends Message<RescheduleBackoff> {
+  /**
+   * The task whose replacement is deferred.
+   *
+   * @generated from field: string task = 1;
+   */
+  task = "";
+
+  /**
+   * The task's group.
+   *
+   * @generated from field: string group = 2;
+   */
+  group = "";
+
+  /**
+   * The stateful instance waiting for the replacement. Empty for a
+   * stateless task.
+   *
+   * @generated from field: string instance_id = 3;
+   */
+  instanceId = "";
+
+  /**
+   * The allocation that failed.
+   *
+   * @generated from field: int64 allocation_id = 4;
+   */
+  allocationId = protoInt64.zero;
+
+  /**
+   * The node it failed on. The replacement avoids that node when another
+   * has room.
+   *
+   * @generated from field: string node_id = 5;
+   */
+  nodeId = "";
+
+  /**
+   * How many times in a row the instance (or, for a stateless task, the
+   * task) failed, counting this failure: a failure continues the count
+   * while it comes within `move_period` of the previous replacement's
+   * release, so it resets once a replacement survives a whole period. The
+   * backoff is `move_delay` doubled per earlier failure in the count. The
+   * job's failure budget is separate: with `move_count` set, the job fails
+   * when a failure finds `move_count` moves of the task inside
+   * `move_period`.
+   *
+   * @generated from field: uint32 attempt = 6;
+   */
+  attempt = 0;
+
+  /**
+   * The backoff this failure got, in seconds.
+   *
+   * @generated from field: uint64 delay_seconds = 7;
+   */
+  delaySeconds = protoInt64.zero;
+
+  /**
+   * When the replacement may be placed, RFC 3339 (UTC).
+   *
+   * @generated from field: string next_attempt_at = 8;
+   */
+  nextAttemptAt = "";
+
+  /**
+   * Why the allocation failed: the worker's reason (or the memory pressure
+   * response's sentence for an `evict-bursting` eviction), on one line and
+   * cut to 400 characters. The `allocation.failed` event has the full text.
+   *
+   * @generated from field: string reason = 9;
+   */
+  reason = "";
+
+  /**
+   * The operator-facing sentence: `attempt 4 failed (<reason>); next
+   * attempt at <time> (backoff 4m)`.
+   *
+   * @generated from field: string summary = 10;
+   */
+  summary = "";
+
+  constructor(data?: PartialMessage<RescheduleBackoff>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.RescheduleBackoff";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "task", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 2, name: "group", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 3, name: "instance_id", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 4, name: "allocation_id", kind: "scalar", T: 3 /* ScalarType.INT64 */ },
+    { no: 5, name: "node_id", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 6, name: "attempt", kind: "scalar", T: 13 /* ScalarType.UINT32 */ },
+    { no: 7, name: "delay_seconds", kind: "scalar", T: 4 /* ScalarType.UINT64 */ },
+    { no: 8, name: "next_attempt_at", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 9, name: "reason", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 10, name: "summary", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): RescheduleBackoff {
+    return new RescheduleBackoff().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): RescheduleBackoff {
+    return new RescheduleBackoff().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): RescheduleBackoff {
+    return new RescheduleBackoff().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: RescheduleBackoff | PlainMessage<RescheduleBackoff> | undefined, b: RescheduleBackoff | PlainMessage<RescheduleBackoff> | undefined): boolean {
+    return proto3.util.equals(RescheduleBackoff, a, b);
   }
 }
 
@@ -8340,15 +8509,20 @@ export class WarmSnapshotReply extends Message<WarmSnapshotReply> {
 }
 
 /**
- * Work a manager asks a worker to do on a snapshot, delivered in
- * `HeartbeatReply.checkpoint_requests`.
+ * Work a manager asks a worker to do on a snapshot, pushed on the worker's
+ * `StreamWork` stream (`StreamWorkReply.checkpoint_requests`) the moment it
+ * becomes outstanding, and re-sent in `HeartbeatReply.checkpoint_requests`.
  *
- * This is the manager-to-worker half of the checkpoint channel. The manager
+ * This is the manager-to-worker half of the checkpoint channel. The push
+ * makes the worker start promptly; the heartbeat is the record. The manager
  * re-sends every request on every heartbeat until the worker's matching
- * `SnapshotReport` has been applied, so a worker that restarts, or a report
- * lost to a failed heartbeat, simply retries. Workers deduplicate by
- * `snapshot_id` and `op`: a request for work already done re-sends the
- * recorded report instead of redoing it.
+ * `SnapshotReport` has been applied, so a worker that restarts, a push lost
+ * with its stream, or a report lost to a failed heartbeat, simply retries.
+ * Workers deduplicate by `snapshot_id` and `op`: a request for work already
+ * done re-sends the recorded report instead of redoing it. A worker forgets
+ * finished work only when a heartbeat reply leaves it out after a heartbeat
+ * that carried its report, so an older reply racing a newer push cannot
+ * make it redo the work.
  *
  * The manager only sends requests to a worker that advertised the
  * `checkpoint` capability at registration.
@@ -8466,6 +8640,19 @@ export class CheckpointRequest extends Message<CheckpointRequest> {
    */
   manifestEnvelope = "";
 
+  /**
+   * `publish`: the snapshot's job's chunk key. A published part is stored
+   * as fixed-size chunks plus a sealed index (docs/suspend-and-resume.md,
+   * "How published parts are stored"), and the worker derives each chunk's
+   * key from this one, scoped to its current dedup window, so a chunk the
+   * job already uploaded in the window is not uploaded again. Unset for
+   * every other op, and when the manager could not derive it (the reason is
+   * in `part_key_error`, and the publish fails).
+   *
+   * @generated from field: legion.CheckpointChunkKey chunk_key = 12;
+   */
+  chunkKey?: CheckpointChunkKey;
+
   constructor(data?: PartialMessage<CheckpointRequest>) {
     super();
     proto3.util.initPartial(data, this);
@@ -8485,6 +8672,7 @@ export class CheckpointRequest extends Message<CheckpointRequest> {
     { no: 9, name: "part_key_error", kind: "scalar", T: 9 /* ScalarType.STRING */ },
     { no: 10, name: "manifest_object", kind: "scalar", T: 9 /* ScalarType.STRING */ },
     { no: 11, name: "manifest_envelope", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 12, name: "chunk_key", kind: "message", T: CheckpointChunkKey },
   ]);
 
   static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): CheckpointRequest {
@@ -8501,6 +8689,63 @@ export class CheckpointRequest extends Message<CheckpointRequest> {
 
   static equals(a: CheckpointRequest | PlainMessage<CheckpointRequest> | undefined, b: CheckpointRequest | PlainMessage<CheckpointRequest> | undefined): boolean {
     return proto3.util.equals(CheckpointRequest, a, b);
+  }
+}
+
+/**
+ * A job's chunk key (docs/suspend-and-resume.md, "Published checkpoint
+ * encryption"): HKDF-SHA256 of the job's session sealing key with the
+ * context `chunks`, so the manager (for a keyed snapshot's publish) and a
+ * session's node (with no manager on the path) derive the same key, and
+ * checkpoints of one job share chunks whichever path published them. A
+ * worker holding it can name and seal chunks of that job only. It cannot
+ * open any part index, whose key comes from the part key. The generated
+ * Rust type redacts `key` from Debug output and never serializes it.
+ *
+ * @generated from message legion.CheckpointChunkKey
+ */
+export class CheckpointChunkKey extends Message<CheckpointChunkKey> {
+  /**
+   * `<checkpoint key id>/session/<job>/chunks`. Informational: chunk keys
+   * are recorded in each part's sealed index, so a reader never needs it.
+   *
+   * @generated from field: string key_id = 1;
+   */
+  keyId = "";
+
+  /**
+   * 32 bytes. Never logged and never written to disk.
+   *
+   * @generated from field: bytes key = 2;
+   */
+  key = new Uint8Array(0);
+
+  constructor(data?: PartialMessage<CheckpointChunkKey>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.CheckpointChunkKey";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "key_id", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 2, name: "key", kind: "scalar", T: 12 /* ScalarType.BYTES */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): CheckpointChunkKey {
+    return new CheckpointChunkKey().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): CheckpointChunkKey {
+    return new CheckpointChunkKey().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): CheckpointChunkKey {
+    return new CheckpointChunkKey().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: CheckpointChunkKey | PlainMessage<CheckpointChunkKey> | undefined, b: CheckpointChunkKey | PlainMessage<CheckpointChunkKey> | undefined): boolean {
+    return proto3.util.equals(CheckpointChunkKey, a, b);
   }
 }
 
@@ -8806,7 +9051,11 @@ export class SnapshotRestore extends Message<SnapshotRestore> {
    * node content store that carries a `url` (a published snapshot) is
    * fetched first, through the worker's artifact fetchers, opened with its
    * key from `part_keys`, verified against its digest, and stored in the
-   * content store. The allocation shows `staging artifacts` meanwhile.
+   * content store. A `url` under the worker's own `contentStore.url` is
+   * fetched with that worker's `contentStore.auth` (or its ambient AWS
+   * credentials). Any other `url` is fetched anonymously, and a refusal says
+   * the worker has no credential for that store. The allocation shows
+   * `staging artifacts` meanwhile.
    *
    * @generated from field: string manifest_json = 3;
    */
@@ -9098,7 +9347,7 @@ export class VolumeInfo extends Message<VolumeInfo> {
 
 /**
  * Request payload for ListVolumes. Every filter is optional; omitting all of
- * them lists the whole cluster.
+ * them lists every live volume in the cluster.
  *
  * @generated from message legion.ListVolumesRequest
  */
@@ -9133,7 +9382,8 @@ export class ListVolumesRequest extends Message<ListVolumesRequest> {
 
   /**
    * Only volumes in this state (`pending`, `created`, `destroying`,
-   * `destroyed`).
+   * `destroyed`). Asking for `destroyed` returns tombstones whatever
+   * `include_destroyed` says.
    *
    * @generated from field: optional string state = 5;
    */
@@ -9828,6 +10078,19 @@ export class Job extends Message<Job> {
    */
   blocked?: JobBlocked;
 
+  /**
+   * Replacements of failed allocations still waiting out their reschedule
+   * backoff, soonest next attempt first (docs/jobs-tasks-and-scheduling.md,
+   * "Manager-side move logic"). A job whose only replica waits here reads
+   * `pending`, and nothing places the replica before its `next_attempt_at`;
+   * `legion job run <spec> --force-reschedule` lifts every backoff of the
+   * job and places them now. Set by GetJobInfo only; ListJobs leaves it
+   * empty.
+   *
+   * @generated from field: repeated legion.RescheduleBackoff reschedule_backoffs = 8;
+   */
+  rescheduleBackoffs: RescheduleBackoff[] = [];
+
   constructor(data?: PartialMessage<Job>) {
     super();
     proto3.util.initPartial(data, this);
@@ -9843,6 +10106,7 @@ export class Job extends Message<Job> {
     { no: 5, name: "updated_at", kind: "scalar", T: 3 /* ScalarType.INT64 */ },
     { no: 6, name: "priority", kind: "scalar", T: 9 /* ScalarType.STRING */ },
     { no: 7, name: "blocked", kind: "message", T: JobBlocked, opt: true },
+    { no: 8, name: "reschedule_backoffs", kind: "message", T: RescheduleBackoff, repeated: true },
   ]);
 
   static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): Job {
@@ -10297,40 +10561,48 @@ export class GetMeshCaRequest extends Message<GetMeshCaRequest> {
  */
 export class GetMeshCaReply extends Message<GetMeshCaReply> {
   /**
-   * The signing CA certificate, PEM; empty when none exists yet.
+   * The CA certificate that signs leaves, PEM; empty when none exists yet
+   * or the provider could not supply one (see `problem`). For `file` and
+   * `exec` this is often an intermediate under the organization's root.
    *
    * @generated from field: string cert_pem = 1;
    */
   certPem = "";
 
   /**
-   * When the signing CA was created (RFC 3339); empty when none exists.
+   * When the signing CA was created (`builtin`), or its `notBefore` (other
+   * providers), RFC 3339; empty when none exists.
    *
    * @generated from field: string created_at = 2;
    */
   createdAt = "";
 
   /**
-   * Every CA a holder should trust, PEM: the signing CA, then the previous
-   * CA while a rotation's overlap lasts. Clients that verify node or
-   * manager certificates (`legion sandbox start --node`, direct exec) use
-   * this, not `cert_pem`.
+   * Every CA a holder should trust, PEM, the anchor (the CA `pin` names)
+   * first. `builtin`: the signing CA, then the previous CA while a
+   * rotation's overlap lasts. `file`: `clusterCa.bundlePath`, or the
+   * signing CA itself when unset. `exec`: what the provider's `describe`
+   * reports. Clients that verify node or manager certificates
+   * (`legion sandbox start --node`, direct exec) use this, not `cert_pem`.
    *
    * @generated from field: string bundle_pem = 3;
    */
   bundlePem = "";
 
   /**
-   * The signing CA's pin (`sha256:<hex of its DER>`), as join tokens carry
-   * it in `caHash`.
+   * The pin (`sha256:<hex of its DER>`) of the trust-bundle CA the signing
+   * CA chains to — the signing CA itself for `builtin` — as join tokens
+   * carry it in `caHash`.
    *
    * @generated from field: string pin = 4;
    */
   pin = "";
 
   /**
-   * Where a rotation stands: `stable` (one CA) or `overlap` (the new CA
-   * signs and the previous one is still trusted until `overlap_until`).
+   * Where a built-in rotation stands: `stable` (one CA) or `overlap` (the
+   * new CA signs and the previous one is still trusted until
+   * `overlap_until`). Always `stable` for `file` and `exec`, which rotate
+   * outside Legion.
    *
    * @generated from field: string phase = 5;
    */
@@ -10351,6 +10623,46 @@ export class GetMeshCaReply extends Message<GetMeshCaReply> {
    */
   previousCertPem = "";
 
+  /**
+   * Which provider supplies the CA on the answering manager: `builtin`,
+   * `file`, or `exec` (`clusterCa.provider`, docs/cluster-ca.md). Set even
+   * when no CA exists yet.
+   *
+   * @generated from field: string provider = 8;
+   */
+  provider = "";
+
+  /**
+   * Where the provider's CA comes from, for display: the certificate (and
+   * bundle) paths for `file`, the command for `exec`; empty for `builtin`.
+   *
+   * @generated from field: string provider_location = 9;
+   */
+  providerLocation = "";
+
+  /**
+   * The certificates a leaf carries after itself, PEM: the intermediates
+   * between a leaf and the anchor, or (`builtin`, during a rotation's
+   * overlap) the new CA cross-signed by the previous one. Empty when the
+   * signing CA is itself in the trust bundle.
+   *
+   * @generated from field: string chain_pem = 10;
+   */
+  chainPem = "";
+
+  /**
+   * Why this manager will not sign right now, or what is degraded; empty
+   * when the CA is healthy. Examples: the provider's command failed (with
+   * its stderr), the CA files changed and cannot be used (the previous CA
+   * keeps signing), or this manager's CA and the one the control-lane
+   * leader recorded do not trust each other (both pins and the recording
+   * manager are named). While it names a disagreement, the manager signs
+   * no certificates and mints no join tokens.
+   *
+   * @generated from field: string problem = 11;
+   */
+  problem = "";
+
   constructor(data?: PartialMessage<GetMeshCaReply>) {
     super();
     proto3.util.initPartial(data, this);
@@ -10366,6 +10678,10 @@ export class GetMeshCaReply extends Message<GetMeshCaReply> {
     { no: 5, name: "phase", kind: "scalar", T: 9 /* ScalarType.STRING */ },
     { no: 6, name: "overlap_until", kind: "scalar", T: 9 /* ScalarType.STRING */ },
     { no: 7, name: "previous_cert_pem", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 8, name: "provider", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 9, name: "provider_location", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 10, name: "chain_pem", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 11, name: "problem", kind: "scalar", T: 9 /* ScalarType.STRING */ },
   ]);
 
   static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): GetMeshCaReply {
@@ -10419,7 +10735,7 @@ export class RotateMeshCaRequest extends Message<RotateMeshCaRequest> {
 }
 
 /**
- * Reply payload for RotateMeshCa.
+ * Reply payload for RotateMeshCa (built-in provider only).
  *
  * @generated from message legion.RotateMeshCaReply
  */
@@ -10557,18 +10873,22 @@ export class IssueNodeCertificateReply extends Message<IssueNodeCertificateReply
   /**
    * The node certificate chain, PEM, leaf first. SANs: `<node>.node.legion`
    * and `legion://node/<node id>` (or the fleet names for a fleet
-   * certificate). During a CA rotation's overlap the chain also carries the
-   * new CA cross-signed by the previous one.
+   * certificate). After the leaf come the intermediates between it and the
+   * trust bundle (a `file`/`exec` provider's signing CA when it is not
+   * itself in the bundle), or, during a built-in rotation's overlap, the new
+   * CA cross-signed by the previous one.
    *
    * @generated from field: string cert_pem = 1;
    */
   certPem = "";
 
   /**
-   * The cluster CA trust bundle, PEM: the signing CA, plus the previous CA
-   * while a rotation's overlap lasts. What a node verifies managers and
-   * peers against. A worker joining with a token checks that this bundle
-   * contains the token's pinned CA before trusting it.
+   * The cluster CA trust bundle, PEM, anchor first: the built-in signing
+   * CA plus the previous CA while a rotation's overlap lasts, or what a
+   * `file`/`exec` provider trusts (docs/cluster-ca.md). What a node
+   * verifies managers and peers against. A worker joining with a token
+   * checks that this bundle contains the token's pinned CA before trusting
+   * it.
    *
    * @generated from field: string ca_pem = 3;
    */
@@ -11297,6 +11617,14 @@ export class HeartbeatRequest extends Message<HeartbeatRequest> {
    * whenever the manager re-sends the request it answers, and restored on a
    * failed heartbeat like every other report on this request.
    *
+   * A worker does not hold a fresh outcome for its next scheduled beat: it
+   * sends a heartbeat at once, so a suspend, resume, fork, publish, or warm
+   * settles one round trip after the node finishes it. A delete's
+   * confirmation is the exception (nothing waits on it), and rides the next
+   * scheduled beat. The out-of-band beat is an ordinary heartbeat, carrying
+   * everything else the worker has to report, so the manager sees the
+   * outcome and the node's other changes in the order they happened.
+   *
    * Default: empty list.
    *
    * @generated from field: repeated legion.SnapshotReport snapshot_reports = 13;
@@ -11391,6 +11719,27 @@ export class HeartbeatRequest extends Message<HeartbeatRequest> {
    */
   sessionReport?: SessionReport;
 
+  /**
+   * Resizes this node asks for its elastic envelopes (docs/session-mode.md,
+   * "Elastic envelopes"): at most one per envelope, re-sent on every
+   * heartbeat until a reply's `HeartbeatReply.envelope_resizes` answers it.
+   * The node decides, because only it knows what its sessions hold at every
+   * instant: it grows an envelope when its sessions fill more than 90% of
+   * it, and shrinks one after they used less than half of it for
+   * `stateful.envelope.shrinkAfter`. Before it asks to shrink, the node caps
+   * its own admission at the smaller size, so no session can be running
+   * over the envelope when the shrink commits.
+   *
+   * The manager applies each as one scheduler-lane write (forwarded to the
+   * lane leader when it does not lead). Repeating a request that already
+   * applied is answered `applied` and writes nothing.
+   *
+   * Default: empty list. Fixed envelopes never send one.
+   *
+   * @generated from field: repeated legion.EnvelopeResize envelope_resizes = 20;
+   */
+  envelopeResizes: EnvelopeResize[] = [];
+
   constructor(data?: PartialMessage<HeartbeatRequest>) {
     super();
     proto3.util.initPartial(data, this);
@@ -11418,6 +11767,7 @@ export class HeartbeatRequest extends Message<HeartbeatRequest> {
     { no: 17, name: "exec_sessions", kind: "message", T: ExecSessionRef, repeated: true },
     { no: 18, name: "exec_keys_version", kind: "scalar", T: 9 /* ScalarType.STRING */ },
     { no: 19, name: "session_report", kind: "message", T: SessionReport, opt: true },
+    { no: 20, name: "envelope_resizes", kind: "message", T: EnvelopeResize, repeated: true },
   ]);
 
   static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): HeartbeatRequest {
@@ -11434,6 +11784,149 @@ export class HeartbeatRequest extends Message<HeartbeatRequest> {
 
   static equals(a: HeartbeatRequest | PlainMessage<HeartbeatRequest> | undefined, b: HeartbeatRequest | PlainMessage<HeartbeatRequest> | undefined): boolean {
     return proto3.util.equals(HeartbeatRequest, a, b);
+  }
+}
+
+/**
+ * One envelope resize a node asks for. See
+ * `HeartbeatRequest.envelope_resizes`.
+ *
+ * @generated from message legion.EnvelopeResize
+ */
+export class EnvelopeResize extends Message<EnvelopeResize> {
+  /**
+   * The envelope's allocation id, as its payload named it.
+   *
+   * @generated from field: int64 allocation_id = 1;
+   */
+  allocationId = protoInt64.zero;
+
+  /**
+   * The size the node believes is committed, as a JSON `resources` object
+   * (`{"cpu":6000,"memory":6144}`). The resize is a compare-and-set on it:
+   * when the row holds something else, the answer is `stale`.
+   *
+   * @generated from field: string from = 2;
+   */
+  from = "";
+
+  /**
+   * The size the node asks for, with the same keys. Every key is at or
+   * above `from` (a grow) or at or below it (a shrink), and every key stays
+   * within the session task's `envelope.resources` and `envelope.max`.
+   *
+   * @generated from field: string to = 3;
+   */
+  to = "";
+
+  constructor(data?: PartialMessage<EnvelopeResize>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.EnvelopeResize";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "allocation_id", kind: "scalar", T: 3 /* ScalarType.INT64 */ },
+    { no: 2, name: "from", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 3, name: "to", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): EnvelopeResize {
+    return new EnvelopeResize().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): EnvelopeResize {
+    return new EnvelopeResize().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): EnvelopeResize {
+    return new EnvelopeResize().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: EnvelopeResize | PlainMessage<EnvelopeResize> | undefined, b: EnvelopeResize | PlainMessage<EnvelopeResize> | undefined): boolean {
+    return proto3.util.equals(EnvelopeResize, a, b);
+  }
+}
+
+/**
+ * The manager's answer to one `EnvelopeResize`. See
+ * `HeartbeatReply.envelope_resizes`.
+ *
+ * @generated from message legion.EnvelopeResizeResult
+ */
+export class EnvelopeResizeResult extends Message<EnvelopeResizeResult> {
+  /**
+   * The envelope's allocation id, as the request named it.
+   *
+   * @generated from field: int64 allocation_id = 1;
+   */
+  allocationId = protoInt64.zero;
+
+  /**
+   * What happened:
+   *
+   * - `applied`: the row now holds `to` (or already did).
+   * - `partial`: a grow that did not fully fit the node; the row holds
+   *   `size`, between `from` and `to`.
+   * - `refused`: a grow with no room on the node, or on a node that is not
+   *   `available` (draining or ineligible). Nothing was written; `size` is
+   *   unchanged.
+   * - `stale`: the row did not hold `from`; nothing was written, and `size`
+   *   is what it holds.
+   * - `gone`: the allocation is not a live envelope on this node.
+   * - `invalid`: `to` is outside the envelope's bounds or does not size its
+   *   keys.
+   * - `error`: the write failed (for example, no raft leader); the node
+   *   asks again on its next heartbeat.
+   *
+   * @generated from field: string outcome = 2;
+   */
+  outcome = "";
+
+  /**
+   * The committed size after this answer, as a JSON `resources` object.
+   * Empty for `gone`, `invalid`, and `error`.
+   *
+   * @generated from field: string size = 3;
+   */
+  size = "";
+
+  /**
+   * Why, for `refused`, `stale`, `gone`, `invalid`, and `error`.
+   *
+   * @generated from field: string message = 4;
+   */
+  message = "";
+
+  constructor(data?: PartialMessage<EnvelopeResizeResult>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.EnvelopeResizeResult";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "allocation_id", kind: "scalar", T: 3 /* ScalarType.INT64 */ },
+    { no: 2, name: "outcome", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 3, name: "size", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 4, name: "message", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): EnvelopeResizeResult {
+    return new EnvelopeResizeResult().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): EnvelopeResizeResult {
+    return new EnvelopeResizeResult().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): EnvelopeResizeResult {
+    return new EnvelopeResizeResult().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: EnvelopeResizeResult | PlainMessage<EnvelopeResizeResult> | undefined, b: EnvelopeResizeResult | PlainMessage<EnvelopeResizeResult> | undefined): boolean {
+    return proto3.util.equals(EnvelopeResizeResult, a, b);
   }
 }
 
@@ -12031,6 +12524,28 @@ export class StreamWorkReply extends Message<StreamWorkReply> {
    */
   digest = "";
 
+  /**
+   * Checkpoint work for the node that became outstanding since the last
+   * message: the same `CheckpointRequest`s the heartbeat reply carries, part
+   * keys included, pushed the moment the snapshot row (or queued warm)
+   * committed. The worker starts each one at once, deduplicated against
+   * work it already has in flight or finished, exactly as it does for a
+   * request that arrives on a heartbeat.
+   *
+   * A hint, not the record. Each request is pushed once per stream (a new
+   * stream gets every one still outstanding), never replayed, and does not
+   * count toward `digest`. The heartbeat reply still carries the node's
+   * whole checkpoint work on every beat, and that full set is what tells
+   * the worker the manager is done with a piece of work. So a lost message,
+   * or a worker that ignores this field, waits for its next heartbeat
+   * instead of losing anything. Only sent to workers that advertised the
+   * `checkpoint` capability. A message may carry only this field, with no
+   * `upserts` or `stops`; it still takes the next `seq`.
+   *
+   * @generated from field: repeated legion.CheckpointRequest checkpoint_requests = 7;
+   */
+  checkpointRequests: CheckpointRequest[] = [];
+
   constructor(data?: PartialMessage<StreamWorkReply>) {
     super();
     proto3.util.initPartial(data, this);
@@ -12045,6 +12560,7 @@ export class StreamWorkReply extends Message<StreamWorkReply> {
     { no: 4, name: "upserts", kind: "message", T: TaskAllocation, repeated: true },
     { no: 5, name: "stops", kind: "message", T: StopNotice, repeated: true },
     { no: 6, name: "digest", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 7, name: "checkpoint_requests", kind: "message", T: CheckpointRequest, repeated: true },
   ]);
 
   static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): StreamWorkReply {
@@ -13285,6 +13801,11 @@ export class HeartbeatReply extends Message<HeartbeatReply> {
    * applied. Sent only to workers that advertised the `checkpoint`
    * capability at registration.
    *
+   * Always the node's whole outstanding set, streaming worker or not: a
+   * streaming worker got each request pushed on `StreamWork` when it became
+   * outstanding, and this list is how it learns which finished work the
+   * manager has applied (it is no longer listed).
+   *
    * Default: empty list. Costs one indexed lookup per heartbeat.
    *
    * @generated from field: repeated legion.CheckpointRequest checkpoint_requests = 9;
@@ -13360,17 +13881,6 @@ export class HeartbeatReply extends Message<HeartbeatReply> {
   managerAddresses: string[] = [];
 
   /**
-   * The pin (`sha256:<hex>`) of the cluster CA the managers sign with now.
-   * A worker whose CA bundle does not contain it re-issues its node
-   * certificate at once instead of waiting for its refresh timer: that is
-   * how a `legion net ca rotate` reaches every node within one heartbeat.
-   * Empty when no cluster CA exists yet.
-   *
-   * @generated from field: string cluster_ca_pin = 14;
-   */
-  clusterCaPin = "";
-
-  /**
    * The direct exec sessions from `HeartbeatRequest.exec_sessions` whose
    * minting credential no longer holds: the token was deleted or expired,
    * or its policies no longer grant the session. The worker kills each
@@ -13422,6 +13932,71 @@ export class HeartbeatReply extends Message<HeartbeatReply> {
    */
   stopSessions: string[] = [];
 
+  /**
+   * Allocation ids from the request's `terminated_allocations` that this
+   * manager could not record, so the worker must send them again on its
+   * next heartbeat. A terminal report is sent once, and a batch task's
+   * dependents wait on it: dropping one leaves the allocation `placed` and
+   * every `success` or `complete` dependent held forever.
+   *
+   * A report is listed when recording it failed (the write could not reach
+   * the lane leader, say) or when this manager has no row for the
+   * allocation yet, which happens when the heartbeat lands on a replica
+   * that has not applied the placement. A report from a node that does not
+   * own the allocation is never listed. The worker stops re-sending once it
+   * no longer holds the allocation, so a report for an allocation that was
+   * removed for good ends with the allocation.
+   *
+   * Default: empty list.
+   *
+   * @generated from field: repeated int64 retry_terminated_allocations = 20;
+   */
+  retryTerminatedAllocations: bigint[] = [];
+
+  /**
+   * The cluster's workload-identity issuer: the `iss` every token and
+   * ticket the managers sign carries (docs/workload-identity.md, "Issuer").
+   * A worker checks boot, session, and exec tickets against this value, not
+   * against the manager address in its join token, so a ticket minted on
+   * any manager verifies on any node. Refreshed every beat, so a changed
+   * `workloadIdentity.issuer` reaches every node within one heartbeat.
+   *
+   * Default: empty when workload identity is disabled on the answering
+   * manager; an empty value leaves the worker's expected issuer unchanged.
+   *
+   * @generated from field: string workload_identity_issuer = 21;
+   */
+  workloadIdentityIssuer = "";
+
+  /**
+   * Answers to this heartbeat's `HeartbeatRequest.envelope_resizes`, one
+   * per request, in request order (docs/session-mode.md, "Elastic
+   * envelopes"). A node lifts its shrink cap, adopts the committed `size`,
+   * or backs off growing from these. The resized allocation also reaches
+   * the node as a changed payload (`TaskAllocation.envelope_resources`).
+   *
+   * Default: empty list.
+   *
+   * @generated from field: repeated legion.EnvelopeResizeResult envelope_resizes = 22;
+   */
+  envelopeResizes: EnvelopeResizeResult[] = [];
+
+  /**
+   * The pins (`sha256:<hex>`) of every CA in the cluster's trust bundle as
+   * the answering manager sees it, the anchor (the CA the signing CA chains
+   * to) first. A worker whose held bundle has a different first pin, or a
+   * different set of pins, re-issues its node certificate at once instead
+   * of waiting for its refresh timer, and the reply carries the new bundle:
+   * that is how a `legion net ca rotate`, or a CA added to or removed from
+   * a `file`/`exec` provider's bundle, reaches every node within one
+   * heartbeat (docs/cluster-ca.md#rotation). Empty when no cluster CA
+   * exists yet or the manager cannot vouch for one (its provider failed, or
+   * it disagrees with the cluster); a worker then keeps what it holds.
+   *
+   * @generated from field: repeated string cluster_ca_pins = 23;
+   */
+  clusterCaPins: string[] = [];
+
   constructor(data?: PartialMessage<HeartbeatReply>) {
     super();
     proto3.util.initPartial(data, this);
@@ -13443,12 +14018,15 @@ export class HeartbeatReply extends Message<HeartbeatReply> {
     { no: 11, name: "desired_via_stream", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
     { no: 12, name: "work_resync", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
     { no: 13, name: "manager_addresses", kind: "scalar", T: 9 /* ScalarType.STRING */, repeated: true },
-    { no: 14, name: "cluster_ca_pin", kind: "scalar", T: 9 /* ScalarType.STRING */ },
     { no: 15, name: "revoked_exec_sessions", kind: "message", T: RevokedExecSession, repeated: true },
     { no: 16, name: "exec_keys", kind: "message", T: ExecKey, repeated: true },
     { no: 17, name: "exec_keys_version", kind: "scalar", T: 9 /* ScalarType.STRING */ },
     { no: 18, name: "session_resync", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
     { no: 19, name: "stop_sessions", kind: "scalar", T: 9 /* ScalarType.STRING */, repeated: true },
+    { no: 20, name: "retry_terminated_allocations", kind: "scalar", T: 3 /* ScalarType.INT64 */, repeated: true },
+    { no: 21, name: "workload_identity_issuer", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 22, name: "envelope_resizes", kind: "message", T: EnvelopeResizeResult, repeated: true },
+    { no: 23, name: "cluster_ca_pins", kind: "scalar", T: 9 /* ScalarType.STRING */, repeated: true },
   ]);
 
   static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): HeartbeatReply {
@@ -25550,7 +26128,7 @@ export class TaskAllocation extends Message<TaskAllocation> {
    * this allocation, matching the `AllocNetwork` shape. Workers use it to
    * inject `LEGION_PORT_*` / `LEGION_ADDR_*` environment variables into the
    * task, and — when the task declares upstreams — the `upstreams` array
-   * (`[{"service":"db","localPort":20003,"balance":"round_robin"}]`) carries
+   * (`[{"service":"db","localPort":20003,"balance":"least_latency"}]`) carries
    * the loopback ports the node-local forwarders listen on, surfaced to the
    * task as `LEGION_UPSTREAM_*`.
    *
@@ -25571,7 +26149,8 @@ export class TaskAllocation extends Message<TaskAllocation> {
    * per-node port space. The worker starts one loopback TCP forwarder per
    * upstream and load-balances new connections across that service's healthy
    * endpoints, which the manager refreshes every heartbeat in
-   * `HeartbeatReply.upstream_endpoints`.
+   * `HeartbeatReply.upstream_endpoints`. An upstream that names no `balance`
+   * uses `least_latency` (docs/service-discovery.md, "Balancing strategies").
    *
    * Empty string (not `{}`) when the task declares no upstreams, so jobs that
    * do not use connect stay byte-identical on the wire.
@@ -25876,6 +26455,35 @@ export class TaskAllocation extends Message<TaskAllocation> {
    */
   sessionSealKeys: SessionSealKey[] = [];
 
+  /**
+   * On an envelope allocation only: the envelope's committed size, as the
+   * JSON `resources` object on its allocation row, such as
+   * `{"cpu":12000,"memory":12288}` (docs/session-mode.md, "Elastic
+   * envelopes"). A fixed envelope always carries its
+   * `stateful.envelope.resources`. An elastic one carries whatever the node
+   * last grew or shrank it to, between `envelope.resources` and
+   * `envelope.max`. The node admits sessions against this size, not against
+   * `task_resources` (the floor). A changed size is re-sent like any changed
+   * payload: on the work stream, or in the next desired set. Empty on every
+   * other allocation, and the node then falls back to `task_resources`.
+   *
+   * @generated from field: string envelope_resources = 32;
+   */
+  envelopeResources = "";
+
+  /**
+   * JSON `SpeculativeStartConfig` as the task declared it (`mode`,
+   * `ratifyTimeout`, `onRefused`). Empty when the task declares no
+   * `speculativeStart` block. A node caches each task config it is
+   * dispatched and redeems boot tickets against that cache
+   * (docs/edge-boot.md, "The spec cache"), and the task's own mode caps how
+   * far an edge start may get: a node that receives it empty treats the task
+   * as `off` and refuses its edge starts.
+   *
+   * @generated from field: string task_speculative_start = 33;
+   */
+  taskSpeculativeStart = "";
+
   constructor(data?: PartialMessage<TaskAllocation>) {
     super();
     proto3.util.initPartial(data, this);
@@ -25915,6 +26523,8 @@ export class TaskAllocation extends Message<TaskAllocation> {
     { no: 29, name: "session_task_spec", kind: "scalar", T: 9 /* ScalarType.STRING */ },
     { no: 30, name: "session_task_config_id", kind: "scalar", T: 3 /* ScalarType.INT64 */ },
     { no: 31, name: "session_seal_keys", kind: "message", T: SessionSealKey, repeated: true },
+    { no: 32, name: "envelope_resources", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 33, name: "task_speculative_start", kind: "scalar", T: 9 /* ScalarType.STRING */ },
   ]);
 
   static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): TaskAllocation {

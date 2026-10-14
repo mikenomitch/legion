@@ -161,6 +161,13 @@ pub async fn run_manager_with(
             full_config.scheduler_settings.as_ref(),
         )?;
     let store = Store::start_storage(&full_config)?;
+    // The cluster CA provider (docs/cluster-ca.md): `file` reads and
+    // self-tests its CA now and stops the start when it is unusable; `exec`
+    // warms its trust bundle in the background.
+    store
+        .cluster_ca()
+        .start()
+        .context("the cluster CA (clusterCa) cannot be used")?;
     // This manager's identity for its config row and its liveness digests.
     // Under raft it is the raft node id, the one name that is unique across
     // the cluster and matches the membership `ListManagers` reports; the
@@ -446,8 +453,18 @@ pub async fn run_manager_with(
     crate::manager::worker_plane::WorkerPlane::global().set_manager_id(&manager_cert_id);
     // The in-process worker pins the cluster CA like any joining worker.
     let local_worker_ca_pin = if run_worker {
-        match store.ensure_mesh_ca().and_then(|ca| ca.pin()) {
-            Ok(pin) => Some(pin),
+        // An `exec` CA may still be answering its first describe: wait for
+        // it rather than start the worker without a pin.
+        let pin_store = store.clone();
+        let ensured = tokio::task::spawn_blocking(move || {
+            pin_store
+                .cluster_ca()
+                .ensure_waiting(&pin_store, Duration::from_secs(30))
+        })
+        .await
+        .map_err(|err| anyhow!("cluster CA task failed: {err}"))?;
+        match ensured {
+            Ok(view) => Some(view.pin),
             Err(err) => {
                 warn!(error = ?err, "Cluster CA unavailable for the in-process worker's pin");
                 None
@@ -1349,8 +1366,8 @@ fn load_operator_tls(tls: &TlsConfigFull) -> R<Option<Arc<rustls::sign::Certifie
 
 /// The certificate a manager presents to workers on its API port
 /// (`manager.legion`, worker-plane-auth plan §6.8), kept current: minted
-/// from the cluster CA as soon as one exists, re-minted before it expires,
-/// and re-issued under the new CA after a rotation. Polls every few seconds
+/// through the cluster CA provider as soon as a CA exists, re-minted before
+/// it expires, and re-issued under the new CA after a rotation. Polls every few seconds
 /// until the CA exists (a follower waits for the leader to create it), then
 /// every minute.
 pub fn keep_manager_server_cert(
@@ -1396,11 +1413,15 @@ pub fn manager_incoming(
 ) -> R<tokio_stream::wrappers::ReceiverStream<std::io::Result<crate::cluster_tls::MaybeTlsStream>>>
 {
     let cluster = crate::cluster_tls::SwappableIdentity::new();
-    // Mint now when the CA exists, so the first worker connection does not
-    // race the refresher.
-    if let Ok(materials) = crate::manager::worker_plane::WorkerPlane::global().materials(store) {
-        if let Some(key) = materials.server_identity.current() {
-            cluster.set(key);
+    // Mint now when the CA exists and signs in-process, so the first worker
+    // connection does not race the refresher. An out-of-process signer
+    // (`exec`) is left to the refresher, which runs off the async runtime.
+    if store.cluster_ca().signs_locally() {
+        if let Ok(materials) = crate::manager::worker_plane::WorkerPlane::global().materials(store)
+        {
+            if let Some(key) = materials.server_identity.current() {
+                cluster.set(key);
+            }
         }
     }
     keep_manager_server_cert(store.clone(), cluster.clone());

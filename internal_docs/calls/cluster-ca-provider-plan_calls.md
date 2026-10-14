@@ -155,9 +155,11 @@ or its set of pins differs. Field 14 is reserved; the new field is 22.
 reach workers on their 8-hour refresh. (b) Keep `cluster_ca_pin` beside
 the new list.
 
-**Trade-off.** A wire break in a worker-facing message (workers and
-managers must upgrade together, which AGENTS.md accepts), and four lines
-changed in `src/worker/daemon.rs`. Each built-in rotation now causes a
+**Trade-off.** A break in a worker-facing message: across versions the
+field the other side reads is empty, so during a rolling upgrade a CA change
+reaches older nodes only on their 8-hour timer (buf's WIRE check passes,
+because field 14 is reserved). Plus a few lines changed in
+`src/worker/daemon.rs`. Each built-in rotation now causes a
 second, harmless re-issue per node when its overlap ends (the old CA left
 the bundle).
 
@@ -293,10 +295,15 @@ built-in path exercises the code the others depend on in every test.
 
 **Call.** After the first call, a stale `describe` keeps serving while a
 background thread refreshes it; a failed refresh keeps the last good
-answer. `sign` runs synchronously (in `spawn_blocking` for
-`IssueNodeCertificate`). A manager's own re-mint through `exec` runs in the
-background while the current certificates keep serving; `builtin`/`file`
-re-mint inline as before.
+answer. Before the first answer, only the very first call in the process
+waits (a manager makes that call in the background at start); every later
+call gets `Unavailable` at once and triggers a background retry at most
+every 5 seconds, so a signer that is down at boot never parks heartbeat or
+dial paths behind it. The in-process worker (`--run-worker`) is the one
+exception: it waits up to 30 seconds for its pin. `sign` runs synchronously
+(in `spawn_blocking` for `IssueNodeCertificate`). A manager's own re-mint
+through `exec` runs in the background while the current certificates keep
+serving; `builtin`/`file` re-mint inline as before.
 
 **Alternative.** Refresh `describe` synchronously when stale, or on a
 fixed timer thread per manager.

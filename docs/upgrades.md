@@ -243,6 +243,23 @@ never sends such a worker suspend work or a resume's restore payload.
   so allocation ids are never reused afterwards. The rebuild copies every
   row and runs in the migration, before the manager serves requests.
 
+## Cluster CA under skew
+
+Heartbeat replies name the cluster CA's whole trust bundle
+(`HeartbeatReply.cluster_ca_pins`, which replaced the single
+`cluster_ca_pin`; see [The Cluster CA](cluster-ca.md#how-workers-learn)).
+Between a worker and a manager on either side of that change, the field the
+other side reads is empty, which a worker treats as "no news": it keeps its
+certificate and re-issues on its own 8-hour timer instead of within one
+heartbeat of a CA change. Nothing breaks, but finish the rollout before you
+rotate the cluster CA, or a CA change reaches the older nodes only on that
+timer.
+
+Every manager in a raft cluster needs the same `clusterCa` block. A manager
+upgraded with a different one (or without one, while the others use `file`
+or `exec`) refuses to sign and says why in `legion net ca show`
+([Every manager must agree](cluster-ca.md#every-manager-must-agree)).
+
 ## Durable checkpoints under skew
 
 Publishing (`suspend.durability = "store"`, `snapshot create --publish`) is
