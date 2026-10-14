@@ -78,6 +78,21 @@ gated egress proxy, ingress listeners) lives in `src/worker/netd/` and
   for DNS messages, rustls for TLS. PROXY protocol v2, SOCKS5, and the VMM's
   vsock `CONNECT` handshake are small and written by hand.
 
+## Object Storage Conventions
+
+- Every object store is opened through `src/storage/objects/`: `StoreUrl`
+  parses `s3://` and `file://` URLs and owns the key layout under them,
+  `resolve_principal_with` is the one AWS credential chain, and `open` /
+  `open_s3` return `Arc<dyn ObjectStore>`. No other module builds an S3
+  client or matches a store URL's scheme.
+- What differs between consumers is an `OpenOptions` field (conditional
+  puts, the region default, whether the process's other `AWS_*` settings
+  apply, whether an ambiguous ambient environment falls through), never a
+  second code path.
+- A new backend (`gs://`, `az://`) is an `object_store` Cargo feature, a
+  `Scheme` arm, a `Backend` variant built in `open`, and an
+  `ObjectCredential` variant.
+
 ## State and Persistence
 
 - Cluster manager state is SQLite-backed and migration-managed.
