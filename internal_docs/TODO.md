@@ -4270,6 +4270,20 @@ Plan: [auth-acl-plan.md](plans/auth-acl-plan.md) · docs: [auth-and-acls.md](../
 - [ ] **`prune_expired_boot_tickets` is never called outside tests.**
 - [ ] **The ACL credential pruner runs only with ACLs enabled and isn't gated
       to the raft leader.**
+- [ ] **Switch a running cluster's CA provider without re-joining workers**
+      (cross-sign during an overlap, as the builtin rotation does).
+      [cluster-CA calls #13](calls/cluster-ca-provider-plan_calls.md)
+- [ ] **CA agreement is checked against the control-lane leader's record
+      only.** Two followers that each agree with the leader but not with each
+      other go unnoticed; record and compare every manager's view
+      ([cluster-CA plan §11](plans/cluster-ca-provider-plan.md)).
+- [ ] Exercise `plugins/cluster_ca/vault-pki/legion-ca-vault` against a live
+      Vault in CI (today it runs against a fake `vault` CLI).
+- [ ] An upstream-authority mode (a locally held intermediate from Vault or
+      AWS Private CA), or native Vault/AWS PCA providers, if `exec` signing
+      latency shows at scale ([cluster-CA plan §11](plans/cluster-ca-provider-plan.md)).
+- [ ] `legion keyring provider test` has no capability-catalog entry
+      ([cluster-CA calls #14](calls/cluster-ca-provider-plan_calls.md)).
 
 ## Observability
 
@@ -6390,5 +6404,14 @@ Found on the live AWS rig (3 raft managers, 2 workers). Bug fixes, so no plan.
 - [x] **Mesh upstreams work.** The worker dropped the endpoint feed's
       `mesh_tls` flag, so connect upstreams dialed mesh-TLS endpoints in
       plaintext and were refused at the handshake (since mesh M7).
+- [x] **Pluggable cluster CA providers.** `clusterCa.provider` = `builtin`
+      (the default) | `file` (an operator intermediate on disk) | `exec` (an
+      external signer, with a Vault PKI helper in `plugins/cluster_ca/`);
+      Legion-chosen names verified on every non-builtin certificate; manager
+      certificates from CSRs; heartbeat bundle pins; a leader-recorded
+      agreement check; `legion net ca provider test`.
+      [plan](plans/cluster-ca-provider-plan.md) ·
+      [calls](calls/cluster-ca-provider-plan_calls.md) ·
+      [docs](../docs/cluster-ca.md)
 - [x] **VIP blocks follow the node's OS.** Placement asked the manager's own
       OS, so a macOS manager gave its Linux nodes no VIP blocks.
