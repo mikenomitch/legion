@@ -47,6 +47,22 @@ The shape of the rig (which workers and load boxes exist) lives in
 SB_WORKERS="sbx-wkr-1 sbx-wkr-2" SB_LOADERS="sbx-lg-1" ./up.sh
 ```
 
+`race.sh` checks ratification rather than speed. `install.sh` already turns
+edge boot on. Run it with three managers, so that followers see
+ratifications:
+
+```bash
+SB_MANAGERS="sbx-mgr-1 sbx-mgr-2 sbx-mgr-3" SB_WORKERS="sbx-wkr-1 sbx-wkr-2 sbx-wkr-3" ./up.sh
+./race.sh 200 20      # 200 instance ids, 20 at a time
+```
+
+It runs `jobs/race-exec.ncl` until every worker holds one allocation of it
+(a node redeems tickets only for a config it has run), mints one prefix
+ticket, and starts every instance id on every worker at the same moment.
+It prints how many ids had exactly one ratified start, more than one, or
+none, the most common refusals, and how many of the raced processes each
+worker still runs. Expect one winner per id and one process per id.
+
 ## What a run measures
 
 `run.sh` clears the job's sessions, runs `legion-loadgen --mode sessions`
@@ -76,3 +92,6 @@ The benchmark jobs in `jobs/`:
 | `sessions-vm-quiet.ncl` | `kernel_args = "quiet"`, from investigating the serial console's cost |
 | `sessions-vm-big.ncl` | A 24 GiB envelope that fits only `sbx-big-1` |
 | `sessions-exec.ncl`, `sessions-exec-fast.ncl` | Host processes (`exec`), to measure the control plane without a VMM. The second with `stateful.placement = "fast"` |
+| `sessions-vm-metal.ncl` | The reference sandbox in a 150 GiB envelope, for a c5.metal worker |
+| `restore-vm-lazy.ncl`, `restore-vm-eager.ncl` | A keyed 2 GiB sandbox that fills 900 MiB, for timing a memory suspend and resume with `memory_restore = "lazy"` or `"eager"` |
+| `race-exec.ncl` | A keyed host process with `speculativeStart.mode = "serve"`, for `race.sh` |

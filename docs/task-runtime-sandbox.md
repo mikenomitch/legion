@@ -1149,6 +1149,19 @@ restore's `restore_ms` leaves out the time the guest later spends loading
 pages, so judge a workload by its time to first response after the resume,
 not by `restore_ms` alone.
 
+Measured on AWS with cloud-hypervisor v53.0: a 2 GiB guest that had filled
+900 MiB, from a 2.4 GB checkpoint, logged `restore_ms` of about 5,040 with
+`lazy` and with `eager` alike. A resume took 5.0 seconds end to end. The
+suspend before it took 22 to 24 seconds, with the guest paused for 0.6 to
+2.7 seconds of that. Most of the 5 seconds is not the VMM. Before it
+resumes a restored guest, the node waits up to 5 seconds for the datapath's
+egress proxy socket. Every sandbox checkpoint records gated networking,
+because every guest has a vsock, so a guest that is not gated never gets
+that socket and its restore waits the full 5 seconds. That wait currently
+dominates a restore and hides the difference between `lazy` and `eager`.
+The node also logs `Resuming a restored gated sandbox before its egress
+proxy socket is bound` for such a guest, though it was never gated.
+
 **What a lazily restored guest depends on.** Until its memory is loaded, the
 guest reads it from the checkpoint's memory file on the node. Firecracker
 holds the file for the VM's whole life, through a hard link in the

@@ -92,6 +92,83 @@ What the profiles showed:
   512 to 8,192 threads changed nothing), and cgroup migration
   (`favordynmods` removed the shim's waits but slowed guest boots).
 
+## Ratification on three managers (2026-10-14)
+
+Three raft managers (one c8i.large and two c7i.large) and three workers (one
+c5.metal and two m6i.large), all in us-east-1f. The job is
+`jobs/race-exec.ncl`: a keyed host process on the `exec` runtime with
+`speculativeStart = { mode = "serve" }`. `race.sh` mints one prefix ticket
+and, for every instance id, fires one `legion sandbox start` at each of the
+three workers at the same moment, 20 ids at a time. It then counts the
+starts that ratified per id and the processes still running per worker.
+
+| Ids | One ratified start | More than one | None | Refusals |
+| ---: | ---: | ---: | ---: | --- |
+| 60 | 60 | 0 | 0 | two `instance_claimed` per id |
+| 200 | 200 | 0 | 0 | two `instance_claimed` per id |
+| 300, leader stopped 30 s in | 300 | 0 | 0 | two `instance_claimed` per id |
+
+- In the 300-id run, the raft leader was stopped 30 seconds in and a new
+  leader was elected (term 17). The run ended with exactly 300 processes
+  across the workers, one per instance id, checked by reading each
+  process's `LEGION_INSTANCE_ID`. All 300 were still running 80 seconds
+  later.
+- No losing start's process survived in any run: 1,120 losers across 560
+  ids, none alive.
+
+The race found four bugs, each fixed before the runs above:
+
+- **Every ticket was refused.** The dispatch payload left out the task's
+  `speculativeStart` block, so every node's spec cache read every task as
+  `off`: `task box does not permit speculative starts`. The in-process
+  tests fill the cache by hand, so they never caught it.
+- **Most edge starts were refused after boot.** A follower answered
+  `RatifyClaim` with an `internal` refusal, and the node killed the claim.
+  A follower now answers not-leader, and the node retries the leader.
+- **Confirmed winners were stopped.** A heartbeat answered by a follower
+  that had not applied the ratification yet, or computed just before it,
+  omitted the claim, and the worker stopped it: 378 ratified claims on one
+  worker, with cause `unknown`. A ratified claim now stays exempt from the
+  stop sweep until a desired set lists it, or for 30 seconds.
+- **Workloads had the wrong identity.** An edge start's env came from the
+  cached task config, whose `LEGION_INSTANCE_ID` named the instance of
+  whatever allocation filled the cache.
+
+The public write-up is in
+[`docs/edge-boot.md`](../../../docs/edge-boot.md#ratification-on-a-raft-cluster).
+
+## Console logging under a burst (2026-10-14)
+
+On the c5.metal worker, a burst of 1,200 sandbox starts made journald fall
+behind. Console log writes were blocking, so every thread that logged
+waited on stdout, heartbeats included. The worker sent no heartbeat for
+about 57 seconds and was marked lost, and the burst fell to 8 starts a
+second. With the console behind a lossy non-blocking writer, the same burst
+ran at 293 starts a second and the worker was never marked lost
+([`docs/observability.md`](../../../docs/observability.md#logging-and-tracing-setup)).
+
+## Memory restore (2026-10-14)
+
+cloud-hypervisor v53.0, `jobs/restore-vm-lazy.ncl` and
+`jobs/restore-vm-eager.ncl`: a keyed sandbox with 2 vCPUs and 2 GiB
+whose command fills 900 MiB of `/dev/shm` with random data. Its memory
+checkpoint is 2.4 GB.
+
+| | This branch | `main`'s worker |
+| --- | --- | --- |
+| Suspend | 22 to 24 s, guest paused 0.6 to 2.7 s | |
+| `restore_ms`, `lazy` | about 5,040 | |
+| `restore_ms`, `eager` | about 5,040 | |
+| Resume, end to end | 5.0 s | 15.6 s |
+
+`lazy` and `eager` measure the same because a 5 second wait dominates both.
+Before it resumes a restored guest, the node waits up to `DATAPATH_WAIT`
+(5 s) for the datapath's egress proxy socket. Every sandbox checkpoint
+records gated networking, since every guest has a vsock, so a guest that is
+not gated never gets the socket and waits the full 5 seconds. That is
+pre-existing on `main`, and until it is fixed this rig cannot tell lazy
+from eager.
+
 ## One boot, by stage
 
 Worker log `Task allocation started`, sequential starts on a c8i.xlarge:
