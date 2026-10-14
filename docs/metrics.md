@@ -453,6 +453,17 @@ across them. See [session-mode.md](session-mode.md).
   later copy of a session id running on two nodes).
 - **`legion_session_promotions_total`** (counter): running sessions promoted
   to keyed instances, one scheduler-lane raft entry each.
+- **`legion_envelope_resizes_total{direction, outcome}`** (counter): elastic
+  envelope resizes nodes asked this manager for
+  ([elastic envelopes](session-mode.md#elastic-envelopes)), by `direction`
+  (`grow` or `shrink`) and `outcome`: `applied`, `partial` (a grow that took
+  only the room the node had left), `refused` (a grow on a node with no free
+  room, or one that is draining or ineligible), `stale` (the node's view of
+  the size was out of date), `gone`, `invalid`, or `error` (the write did
+  not land; the node asks again). `applied` and `partial` are one
+  scheduler-lane raft entry each, and the rest write nothing. A steady
+  `refused` rate means envelopes want room their nodes do not have: add
+  nodes, or lower `stateful.envelope.max`.
 
 Two more are counted on the worker that holds the sessions, on its own
 listener ([Worker](#worker)):
@@ -834,6 +845,20 @@ that has never taken a provisional start.
 - **`legion_provisional_active`** (gauge): unratified claims held right now.
   It makes started-but-unconfirmed capacity visible. A value that does not
   return to zero means claims are leaking.
+
+The node's claim window ([edge-boot.md](edge-boot.md#overload)) adds two:
+
+- **`legion_worker_claim_window`** (gauge): how many unratified edge claims
+  the node admits at once right now. It sits at
+  `edgeBoot.maxProvisionalPerNode` while ratifications come back within
+  `edgeBoot.overloadThreshold` of their lease. A value below it means the
+  node has seen slow ratifications and is shedding.
+- **`legion_worker_claim_overload_refusals_total`** (counter): edge starts
+  refused `OVERLOADED` because the window stayed full for
+  `edgeBoot.queueTimeout`. Each one held nothing and spent no ticket. A
+  rising rate with the window below its ceiling means the managers are
+  behind on ratification. Look at `legion_provisional_ratify_seconds` and
+  the scheduler lane before raising `maxProvisionalPerNode`.
 
 Session starts on the node ([session-mode.md](session-mode.md)) add two:
 

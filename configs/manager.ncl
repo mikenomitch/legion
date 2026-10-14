@@ -45,8 +45,8 @@
   #   # Hard cap. Revocation is by TTL only, so this is the real bound on
   #   # how long a leaked ticket is dangerous.
   #   maxTicketTtl = "1h",
-  #   # Cap on concurrent unratified claims per node.
-  #   maxProvisionalPerNode = 32,
+  #   # The per-node cap on unratified edge claims is a worker setting
+  #   # (`edgeBoot.maxProvisionalPerNode` in the worker type's config).
   # },
   # Automatic suspend (docs/suspend-and-resume.md, "Idle policy"). The idle
   # sweep reads the usage reports workers send every 10s and suspends

@@ -7594,6 +7594,24 @@ impl Manager for ManagerDaemonService {
             error!(node_id = %id, error = ?err, "Error handling pressure actions");
         }
 
+        // Elastic envelope resizes the node asked for (docs/session-mode.md,
+        // "Elastic envelopes"). Before the desired set is built, so a reply
+        // served from the leader's replica already carries the new size.
+        // Rare (a node asks only when its sessions cross a threshold), and
+        // each is a scheduler-lane write, so they run off the async worker.
+        let envelope_resizes = if req.envelope_resizes.is_empty() {
+            Vec::new()
+        } else {
+            let store = self.store.clone();
+            let node_id = id.clone();
+            let requests = req.envelope_resizes.clone();
+            tokio::task::spawn_blocking(move || {
+                crate::manager::sessions::apply_envelope_resizes(&store, &node_id, &requests)
+            })
+            .await
+            .map_err(|e| Status::internal(format!("envelope resize task failed: {e}")))?
+        };
+
         // A worker that receives its work over `StreamWork` gets no desired
         // set here: it holds it already, and the heartbeat carries only a
         // digest of it (sandbox-scaling plan §6.13). Its connect and policy
@@ -7809,6 +7827,7 @@ impl Manager for ManagerDaemonService {
             session_resync,
             stop_sessions,
             retry_terminated_allocations,
+            envelope_resizes,
         };
 
         Ok(Response::new(reply))

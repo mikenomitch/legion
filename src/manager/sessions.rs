@@ -859,6 +859,9 @@ pub fn group_of(config: &JobConfig, task_name: &str) -> String {
 #[derive(Debug, Clone)]
 struct Envelope {
     node_id: String,
+    /// The envelope's allocation id: the newest wins when a job update
+    /// briefly leaves two on a node, as it does in the node's admission.
+    allocation_id: i64,
     room: BTreeMap<String, f64>,
 }
 
@@ -939,12 +942,20 @@ fn placed_envelopes(store: &Store, job_id: &str, task_name: &str) -> R<Vec<Envel
         if !serves {
             continue;
         }
-        // During a job update a node can briefly hold two; either is the
-        // same room.
+        // During a job update a node can briefly hold two. The node admits
+        // against the newest, and an elastic envelope's size is its own, so
+        // the newest is the room.
+        if envelopes
+            .get(&allocation.node_id)
+            .is_some_and(|held| held.allocation_id > allocation.id)
+        {
+            continue;
+        }
         envelopes.insert(
             allocation.node_id.clone(),
             Envelope {
                 node_id: allocation.node_id.clone(),
+                allocation_id: allocation.id,
                 room: resource_amounts(&allocation.resources),
             },
         );
@@ -1461,9 +1472,9 @@ pub async fn start(
         Err(NoRoom { envelopes }) => {
             metrics.session_starts_total.inc(&["no_room"]);
             return Err(Status::resource_exhausted(format!(
-                "every envelope for {job_id}/{} is full ({envelopes} nodes); sessions free room \
-                 as they end, or raise stateful.envelope.resources",
+                "every envelope for {job_id}/{} is full ({envelopes} nodes); {}",
                 task.name,
+                full_hint(task),
             )));
         }
     };
@@ -1580,10 +1591,23 @@ pub async fn start(
     }
     metrics.session_starts_total.inc(&["refused"]);
     Err(Status::resource_exhausted(format!(
-        "no node accepted the session ({}); retry once sessions end, or raise \
-         stateful.envelope.resources",
-        refusals.join("; ")
+        "no node accepted the session ({}); {}",
+        refusals.join("; "),
+        full_hint(task),
     )))
+}
+
+/// What to do about full envelopes. An elastic envelope below its ceiling
+/// grows on its node's next heartbeat once its sessions fill it
+/// (docs/session-mode.md, "Elastic envelopes"), so a retry a few seconds
+/// later can land.
+fn full_hint(task: &TaskConfig) -> &'static str {
+    if crate::structs::session::elastic_bounds(task).is_some() {
+        "envelopes below stateful.envelope.max grow within a heartbeat as their nodes report \
+         the load, so retry in a few seconds, or raise stateful.envelope.max"
+    } else {
+        "retry once sessions end, or raise stateful.envelope.resources"
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1692,6 +1716,101 @@ fn worker_client(
     Ok((client, target))
 }
 
+/// Apply the elastic envelope resizes a node's heartbeat asked for
+/// (`HeartbeatRequest.envelope_resizes`, docs/session-mode.md, "Elastic
+/// envelopes"), one scheduler-lane write each, and answer each in request
+/// order. Never fails the heartbeat: a write that could not land answers
+/// `error`, and the node asks again on its next beat.
+pub fn apply_envelope_resizes(
+    store: &Store,
+    node_id: &str,
+    requests: &[crate::structs::EnvelopeResize],
+) -> Vec<crate::structs::EnvelopeResizeResult> {
+    let metrics = crate::manager::telemetry::metrics();
+    requests
+        .iter()
+        .map(|request| {
+            let parse = |raw: &str| {
+                serde_json::from_str::<Value>(raw)
+                    .ok()
+                    .map(|value| resource_amounts(&value))
+                    .filter(|amounts| !amounts.is_empty())
+            };
+            let (from, to) = (parse(&request.from), parse(&request.to));
+            let direction = match (&from, &to) {
+                (Some(from), Some(to))
+                    if to
+                        .iter()
+                        .any(|(key, amount)| from.get(key).is_some_and(|was| amount < was)) =>
+                {
+                    "shrink"
+                }
+                _ => "grow",
+            };
+            let outcome = match (from, to) {
+                (Some(from), Some(to)) => store
+                    .resize_envelope(
+                        node_id,
+                        &crate::storage::store::EnvelopeResizeRequest {
+                            allocation_id: request.allocation_id,
+                            from,
+                            to,
+                        },
+                    )
+                    .unwrap_or_else(|err| {
+                        warn!(
+                            node_id,
+                            allocation_id = request.allocation_id,
+                            error = ?err,
+                            "Envelope resize failed; the node will ask again"
+                        );
+                        crate::storage::store::EnvelopeResizeOutcome {
+                            outcome: "error".into(),
+                            size: None,
+                            message: format!("{err:#}"),
+                        }
+                    }),
+                _ => crate::storage::store::EnvelopeResizeOutcome {
+                    outcome: "invalid".into(),
+                    size: None,
+                    message: "from and to must be JSON resources objects of amounts".into(),
+                },
+            };
+            metrics
+                .envelope_resizes_total
+                .inc(&[direction, outcome.outcome.as_str()]);
+            match outcome.outcome.as_str() {
+                "applied" | "partial" => info!(
+                    node_id,
+                    allocation_id = request.allocation_id,
+                    direction,
+                    outcome = %outcome.outcome,
+                    "Envelope resized"
+                ),
+                "error" => {}
+                _ => debug!(
+                    node_id,
+                    allocation_id = request.allocation_id,
+                    direction,
+                    outcome = %outcome.outcome,
+                    message = %outcome.message,
+                    "Envelope resize not applied"
+                ),
+            }
+            crate::structs::EnvelopeResizeResult {
+                allocation_id: request.allocation_id,
+                size: outcome
+                    .size
+                    .as_ref()
+                    .map(|size| crate::structs::session::amounts_json(size).to_string())
+                    .unwrap_or_default(),
+                outcome: outcome.outcome,
+                message: outcome.message,
+            }
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod sessions_test {
     use super::*;
@@ -1793,6 +1912,7 @@ mod sessions_test {
     fn the_router_ranks_by_room_left_and_skips_full_nodes_test() {
         let envelope = |node: &str| Envelope {
             node_id: node.into(),
+            allocation_id: 1,
             room: [("cpu".to_string(), 2000.0), ("memory".to_string(), 2048.0)]
                 .into_iter()
                 .collect(),
@@ -1845,6 +1965,7 @@ mod sessions_test {
             |cpu: f64| -> BTreeMap<String, f64> { BTreeMap::from([("cpu".to_string(), cpu)]) };
         let envelope = |node: &str| Envelope {
             node_id: node.into(),
+            allocation_id: 1,
             room: room(1000.0),
         };
         let needs = room(100.0);
@@ -1912,6 +2033,7 @@ mod sessions_test {
                 envelopes: (0..nodes)
                     .map(|n| Envelope {
                         node_id: format!("node-{n:06}"),
+                        allocation_id: 1,
                         room: room(3200.0, 6144.0),
                     })
                     .collect(),
@@ -1950,6 +2072,7 @@ mod sessions_test {
                 .iter()
                 .map(|node| Envelope {
                     node_id: node.to_string(),
+                    allocation_id: 1,
                     room: room.clone(),
                 })
                 .collect(),
@@ -1988,6 +2111,7 @@ mod sessions_test {
                     read_at: Instant::now(),
                     envelopes: vec![Envelope {
                         node_id: "n1".into(),
+                        allocation_id: 1,
                         room: room.clone(),
                     }],
                     used: HashMap::new(),

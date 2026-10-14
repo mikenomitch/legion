@@ -201,8 +201,16 @@
     #     launchConcurrency = 0,
     #     # How long a start waits for a launch slot before the node refuses
     #     # it with RESOURCE_EXHAUSTED (retryable), so the picker tries the
-    #     # next node.
+    #     # next node. An edge start also waits up to this long for room in
+    #     # the claim window below before it is refused OVERLOADED.
     #     queueTimeout = "1s",
+    #     # The most unratified edge claims this node holds at once, and the
+    #     # ceiling of its claim window (docs/edge-boot.md, "Overload").
+    #     maxProvisionalPerNode = 32,
+    #     # A ratification slower than this fraction of its claim's
+    #     # ratifyTimeout halves the claim window, and timely ones grow it back.
+    #     # 0 keeps maxProvisionalPerNode as a static cap.
+    #     overloadThreshold = 0.3,
     #     # How long a gracefully stopping worker spends checkpointing
     #     # sessions whose task sets suspend.onWorkerStop = "checkpoint".
     #     stopCheckpointTimeout = "60s",

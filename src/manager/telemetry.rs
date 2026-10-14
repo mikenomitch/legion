@@ -842,6 +842,9 @@ pub struct Metrics {
     pub session_stops_total: Arc<CounterVec>,
     /// `legion_session_promotions_total` (docs/metrics.md, "Sessions")
     pub session_promotions_total: Arc<Counter>,
+    /// `legion_envelope_resizes_total{direction, outcome}` (docs/metrics.md,
+    /// "Sessions"; elastic-session-envelopes plan §6.3)
+    pub envelope_resizes_total: Arc<CounterVec>,
     /// `legion_allocations`
     pub allocations: Arc<Gauge>,
     /// `legion_store_write_lock_wait_seconds`
@@ -1306,6 +1309,14 @@ impl Metrics {
                 name: "legion_session_stops_total",
                 help: "Sessions this manager ended on their nodes, by reason (stop|destroy|duplicate).",
                 labels: &["reason"],
+            },
+            series: Series::new(),
+        });
+        let envelope_resizes_total = Arc::new(CounterVec {
+            meta: FamilyMeta {
+                name: "legion_envelope_resizes_total",
+                help: "Elastic envelope resizes nodes asked this manager for, by direction (grow|shrink) and outcome (applied|partial|refused|stale|gone|invalid|error). Applied and partial resizes are one scheduler-lane write each; the rest write nothing.",
+                labels: &["direction", "outcome"],
             },
             series: Series::new(),
         });
@@ -1829,6 +1840,7 @@ impl Metrics {
             Arc::clone(&session_starts_total) as Arc<dyn RenderMetric>,
             Arc::clone(&session_stops_total) as Arc<dyn RenderMetric>,
             Arc::clone(&session_promotions_total) as Arc<dyn RenderMetric>,
+            Arc::clone(&envelope_resizes_total) as Arc<dyn RenderMetric>,
             Arc::clone(&eval_conflict_requeues_total) as Arc<dyn RenderMetric>,
             Arc::clone(&evals_blocked) as Arc<dyn RenderMetric>,
             Arc::clone(&evals_unblocked_total) as Arc<dyn RenderMetric>,
@@ -1933,6 +1945,7 @@ impl Metrics {
             checkpoint_publish_total,
             instance_archived_total,
             session_starts_total,
+            envelope_resizes_total,
             session_stops_total,
             session_promotions_total,
             allocations,
@@ -2069,6 +2082,14 @@ pub struct WorkerMetrics {
     /// `legion_worker_launch_refusals_total` — starts refused because every
     /// launch slot stayed busy for `edgeBoot.queueTimeout`.
     pub launch_pool_refusals_total: Arc<Counter>,
+    /// `legion_worker_claim_overload_refusals_total` — edge starts refused
+    /// `OVERLOADED` because the claim window stayed full for
+    /// `edgeBoot.queueTimeout` (docs/edge-boot.md, "Overload").
+    pub claim_overload_refusals_total: Arc<Counter>,
+    /// `legion_worker_claim_window` — how many unratified edge claims this
+    /// node admits at once right now: `edgeBoot.maxProvisionalPerNode`
+    /// while ratification keeps up, less while it does not.
+    pub claim_window: Arc<Gauge>,
     /// `legion_worker_edge_session_starts_total` — sessions started on this
     /// node from a session ticket (`Worker.StartSession`).
     pub edge_session_starts_total: Arc<Counter>,
@@ -2205,6 +2226,22 @@ impl WorkerMetrics {
                 labels: &[],
             },
             cell: CounterCell::default(),
+        });
+        let claim_overload_refusals_total = Arc::new(Counter {
+            meta: FamilyMeta {
+                name: "legion_worker_claim_overload_refusals_total",
+                help: "Edge starts (Worker.StartClaim) refused OVERLOADED before admission because the node's window of unratified edge claims stayed full for edgeBoot.queueTimeout. Retryable; a rising rate with legion_worker_claim_window below edgeBoot.maxProvisionalPerNode means ratification is behind.",
+                labels: &[],
+            },
+            cell: CounterCell::default(),
+        });
+        let claim_window = Arc::new(Gauge {
+            meta: FamilyMeta {
+                name: "legion_worker_claim_window",
+                help: "Unratified edge claims this node admits at once right now: edgeBoot.maxProvisionalPerNode while ratifications come back within edgeBoot.overloadThreshold of their lease, halved for each slow patch and grown back one slot per window of timely verdicts.",
+                labels: &[],
+            },
+            cell: GaugeCell::default(),
         });
 
         let edge_session_starts_total = Arc::new(Counter {
@@ -2360,6 +2397,8 @@ impl WorkerMetrics {
             Arc::clone(&heartbeat_duration_seconds) as Arc<dyn RenderMetric>,
             Arc::clone(&heartbeats_total) as Arc<dyn RenderMetric>,
             Arc::clone(&launch_pool_refusals_total) as Arc<dyn RenderMetric>,
+            Arc::clone(&claim_overload_refusals_total) as Arc<dyn RenderMetric>,
+            Arc::clone(&claim_window) as Arc<dyn RenderMetric>,
             Arc::clone(&edge_session_starts_total) as Arc<dyn RenderMetric>,
             Arc::clone(&session_checkpoints_skipped_total) as Arc<dyn RenderMetric>,
             Arc::clone(&session_evictions_total) as Arc<dyn RenderMetric>,
@@ -2390,6 +2429,8 @@ impl WorkerMetrics {
             provisional_ratify_seconds,
             provisional_active,
             launch_pool_refusals_total,
+            claim_overload_refusals_total,
+            claim_window,
             edge_session_starts_total,
             session_checkpoints_skipped_total,
             session_evictions_total,
