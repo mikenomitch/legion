@@ -1130,9 +1130,17 @@ pub fn resume_identity(
 }
 
 /// Materialize a memory manifest's parts from the content store into
-/// `dir`, under the file names the runtime recorded. Each part is verified
-/// (rehashed) first, then hardlinked, or copied when a hardlink is not
-/// possible.
+/// `dir`, under the file names the runtime recorded: hardlinked, or copied
+/// when a hardlink is not possible.
+///
+/// Each part is checked for presence at its recorded size, not rehashed.
+/// The store hashed every blob on its way in (a capture's import, a
+/// fetch's digest check) and commits by rename into a read-only file, the
+/// same trust OCI layers get when an image is placed from the store.
+/// Rehashing here read every byte of guest memory and the root disk before
+/// the guest could start, under the task-manager lock, which made a resume
+/// scale with guest size even where the VMM restores lazily
+/// (`internal_docs/plans/lazy-memory-restore-plan.md`).
 pub fn materialize_parts(
     store: Option<&ContentStore>,
     manifest: &SnapshotManifest,
@@ -1148,9 +1156,9 @@ pub fn materialize_parts(
     )?;
     for part in &manifest.memory {
         let digest = ContentDigest::parse(&part.digest)?;
-        let entry = store.verify(&digest).with_context(|| {
+        let entry = store.get(&digest)?.with_context(|| {
             format!(
-                "snapshot {} part {} ({}) is missing or corrupt in this node's content store",
+                "snapshot {} part {} ({}) is missing or truncated in this node's content store",
                 manifest.id, part.role, part.digest
             )
         })?;
@@ -1293,5 +1301,96 @@ mod tests {
         }]);
         assert!(state.drain().is_empty());
         assert!(!state.has_pending_restore(9));
+    }
+
+    /// A restore links each memory part out of the node content store after
+    /// checking that it is there at its recorded size. It trusts the digest
+    /// the store checked when the bytes came in, rather than reading every
+    /// byte of guest memory again before the guest can start, so bytes
+    /// changed behind the store's back (same size) are not caught here. A
+    /// truncated blob still is, and is dropped from the store.
+    #[test]
+    fn a_restore_links_parts_at_their_size_and_trusts_the_stored_digest() -> R<()> {
+        use crate::content_store::{ContentBudgets, ContentEntry, ContentStoreConfig};
+        use crate::structs::checkpoint::MemoryPart;
+        const MIB: u64 = 1024 * 1024;
+        let dir = tempfile::tempdir()?;
+        let store = ContentStore::open(
+            dir.path().join("content"),
+            ContentStoreConfig {
+                budgets: ContentBudgets {
+                    artifacts: 8 * MIB,
+                    snapshots: 8 * MIB,
+                },
+                ttl: None,
+                min_free_disk: MIB,
+            },
+        )?;
+        let memory = store.put_bytes(
+            ContentClass::Snapshots,
+            &vec![7u8; 64 * 1024],
+            PutOptions::default(),
+        )?;
+        let state = store.put_bytes(ContentClass::Snapshots, b"{}", PutOptions::default())?;
+        let part = |role: &str, entry: &ContentEntry| MemoryPart {
+            role: role.into(),
+            file: role.into(),
+            digest: entry.digest.as_str().to_string(),
+            size: entry.size,
+            url: None,
+            key_id: None,
+        };
+        let manifest = SnapshotManifest {
+            api_version: MANIFEST_API_VERSION,
+            id: "snap-1".into(),
+            job_id: "job".into(),
+            task: "box".into(),
+            origin_instance: None,
+            origin_alloc_id: 1,
+            runtime: "sandbox".into(),
+            kind: SnapshotKind::Memory,
+            created_at: "2026-10-13T00:00:00Z".into(),
+            volumes: Vec::new(),
+            memory: vec![part("memory", &memory), part("vm-state", &state)],
+            compat: Default::default(),
+            runtime_state: Value::Null,
+        };
+
+        // Same size, different bytes: the store's commit-time digest stands.
+        set_mode(&memory.path, 0o644)?;
+        std::fs::write(&memory.path, vec![8u8; 64 * 1024])?;
+        let restored = materialize_parts(Some(&store), &manifest, dir.path().join("r1"))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            assert_eq!(
+                std::fs::metadata(restored.part_path("memory"))?.ino(),
+                std::fs::metadata(&memory.path)?.ino(),
+                "the part is a hard link to the stored blob, not a copy"
+            );
+        }
+
+        // A truncated blob is refused by name and dropped from the store.
+        std::fs::write(&memory.path, vec![8u8; 1024])?;
+        let err = materialize_parts(Some(&store), &manifest, dir.path().join("r2"))
+            .expect_err("a truncated part cannot restore");
+        let message = format!("{err:#}");
+        assert!(
+            message.contains("part memory") && message.contains("truncated"),
+            "{message}"
+        );
+        assert!(!store.contains(&memory.digest)?);
+        Ok(())
+    }
+
+    fn set_mode(path: &std::path::Path, mode: u32) -> R<()> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))?;
+        }
+        #[cfg(not(unix))]
+        let _ = (path, mode);
+        Ok(())
     }
 }

@@ -987,6 +987,13 @@
                 # An ${artifact.<name>} reference works here too.
                 kernel = "/var/lib/legion/kernels/vmlinux",
                 kernel_args = "quiet",
+                # How a memory checkpoint's guest RAM comes back on a resume,
+                # snapshot restore, fork, or create from a snapshot. "lazy"
+                # (default) runs the guest first and loads each page on first
+                # touch (cloud-hypervisor needs v52+ and a userfaultfd, else it
+                # copies). "eager" reads all of it before the guest runs, for
+                # a workload that touches most of its memory right away.
+                memory_restore = "lazy",
                 # The guest's own network, for a sandbox that is not gated.
                 # This task is gated (the task-level `network` below), and
                 # submit refuses a gated sandbox with a `config.network`: a
