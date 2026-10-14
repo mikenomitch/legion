@@ -21,6 +21,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", "workloads"))
 
 from driver import (  # noqa: E402
+    server_reports_complete,
     follower_lag_summary,
     K8sAdapter,
     LegionAdapter,
@@ -548,3 +549,16 @@ class ParseLegionEventCamelCaseTest(unittest.TestCase):
             "kind": "allocation.placed", "jobId": "bench-api-1",
             "metadataJson": json.dumps({"count": 6})}})
         self.assertEqual(parse_legion_event(line), {"job": "bench-api-1", "count": 6})
+
+
+class ServerReportsCompleteTest(unittest.TestCase):
+    def test_server_count_covers_expected(self):
+        self.assertTrue(server_reports_complete(
+            {"allocations": 10.0}, lambda: {"allocations": 110.0}, 100))
+
+    def test_short_or_unavailable(self):
+        self.assertFalse(server_reports_complete(
+            {"allocations": 10.0}, lambda: {"allocations": 100.0}, 100))
+        self.assertFalse(server_reports_complete(None, lambda: {"allocations": 1e9}, 100))
+        self.assertFalse(server_reports_complete(
+            {"allocations": 0.0}, lambda: {"error": "down"}, 100))

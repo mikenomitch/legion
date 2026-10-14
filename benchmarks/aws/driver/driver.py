@@ -1260,6 +1260,15 @@ def cmd_run(args):
             args.stall_timeout_secs > 0
             and time.monotonic() - last_progress > args.stall_timeout_secs
         ):
+            if server_reports_complete(counters_before, adapter.snapshot_counters, expected_total):
+                outcome = "complete_by_server"
+                print(
+                    f"follower stalled at {placed}/{expected_total}, but the system's own "
+                    f"count shows every allocation placed: the follower missed "
+                    f"{expected_total - placed} event(s). Cell complete, shortfall recorded.",
+                    file=sys.stderr,
+                )
+                break
             outcome = "stalled"
             print(
                 f"STALLED: no placement for {args.stall_timeout_secs}s at "
@@ -1297,6 +1306,12 @@ def cmd_run(args):
     # is a scheduler result; one that hit the cap is a rig result; and
     # they are indistinguishable from `complete: false` alone.
     metrics["outcome"] = outcome
+    if outcome == "complete_by_server":
+        # Throughput and latency still come from the events the follower
+        # saw, so they undercount by the shortfall rather than inventing
+        # timestamps for events it never received.
+        metrics["complete"] = True
+        metrics["follower_shortfall"] = expected_total - recorder.placed_total()
     metrics["settle_timeout_secs"] = round(settle_timeout, 1)
     # Which submission path produced this cell. Load-bearing for the fairness
     # rule at the top of this file: `native` is Legion-only, so a `native`
@@ -1345,6 +1360,20 @@ def cmd_run(args):
             )
     print(json.dumps(metrics, indent=2))
     return 0 if metrics["complete"] else 1
+
+
+def server_reports_complete(before, snapshot, expected_total):
+    """True when the system's own allocation count says every expected
+    allocation exists, whatever the follower saw. Asked only once the
+    follower stalls: a follower that dropped a handful of events otherwise
+    holds the cell for the stall timeout and reports a system that placed
+    everything as one that stopped converging (Nomad, 2026-10-14: 50,046
+    of 50,060 seen, all 50,060 placed, and the rest of the sweep skipped)."""
+    if not before or before.get("allocations") is None:
+        return False
+    after = snapshot()
+    allocations = after.get("allocations")
+    return allocations is not None and allocations - before["allocations"] >= expected_total
 
 
 def cross_check_counts(before, snapshot, follower_placed, settle_secs=6.0, poll_secs=1.0):
