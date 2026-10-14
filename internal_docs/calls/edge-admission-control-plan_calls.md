@@ -208,3 +208,24 @@ work that dies at its lease. The least-full fallback lives in the manager's
 session router, and sessions are never ratified. (b) would hold a slot,
 which sessions on the same node need, while a claim waits on managers that
 are behind.
+
+## 11. A sub-second `ratifyTimeout` is refused at submit, not carried in milliseconds
+
+**Call.** `speculativeStart.ratifyTimeout` must be at least `1s`:
+
+```text
+Error: speculativeStart.ratifyTimeout 500ms is shorter than 1s, the shortest lease a node can hold
+```
+
+**Alternatives.** Carry the lease deadline in milliseconds on
+`ProvisionalAllocation`, so a sub-second lease works.
+
+**Trade-off.** A job cannot ask for a lease under a second. Nothing in the
+repo or the docs used one, and ratification through a raft commit rarely
+fits in one anyway.
+
+**Why (simplicity).** The deadline is a unix timestamp in whole seconds on
+the wire, so `"500ms"` reached the node as "now" and the next lease sweep
+killed every claim. This work found it. Refusing it is one check
+at submit, where carrying milliseconds is a wire change on a field every
+node and both ratify paths read.

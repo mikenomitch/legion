@@ -126,11 +126,11 @@ an unratified workload can do to the outside world.
 }
 ```
 
-**Defaults.** `mode = "off"`, `ratifyTimeout = "5s"` (capped at `2m`),
+**Defaults.** `mode = "off"`, `ratifyTimeout = "5s"` (at least `1s`, capped at `2m`),
 `onRefused = "kill"`. Leaving out the block means `off` and costs nothing.
 
 The block is validated at **submit**, not at dispatch. An unrecognized `mode`
-or `onRefused`, or a `ratifyTimeout` of zero or over the cap, fails
+or `onRefused`, or a `ratifyTimeout` under a second or over the cap, fails
 `legion job run` with the reason. If a typo were silently read as `off`, you
 would only notice it later as a latency regression.
 

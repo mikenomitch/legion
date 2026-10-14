@@ -1188,11 +1188,6 @@ How to use it:
         start and stop, or drop the step. The claim window now bounds how
         many edge claims a node admits
         ([plan](plans/edge-admission-control-plan.md) §5.3).
-  - [ ] **A sub-second `ratifyTimeout` truncates the wire lease.** Admission
-        accepts `"500ms"`, but `StartClaim` and speculative dispatch put
-        `now + ratify_timeout.as_secs()` on the wire, so the node's lease
-        deadline is the admission second and the next lease sweep kills the
-        claim. Carry milliseconds, or reject leases under a second at submit.
   - [ ] **Phase 0's measurement matrix was never run.** The start-path
         breakdown (submit → eval claim → plan → apply → dispatch → prepare →
         boot → first byte) in both persistence modes, cold and warm image,
@@ -5373,6 +5368,9 @@ docs: [task-runtime-plugins.md](../docs/task-runtime-plugins.md)
       [calls](calls/edge-admission-control-plan_calls.md)). Phases 2 and 3
       are open above, under Scheduling & placement.
   - [x] `edgeBoot.maxProvisionalPerNode` is enforced on every edge node.
+  - [x] A `ratifyTimeout` under a second is refused at submit. The lease
+        travels in whole seconds, so `"500ms"` reached the node already
+        expired and the next lease sweep killed the claim.
   - [x] Backpressure before lease expiry: the typed `OVERLOADED` refusal,
         `legion_worker_claim_window` and
         `legion_worker_claim_overload_refusals_total`, and the failure-mode
