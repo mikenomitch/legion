@@ -450,6 +450,17 @@ across them. See [session-mode.md](session-mode.md).
   later copy of a session id running on two nodes).
 - **`legion_session_promotions_total`** (counter): running sessions promoted
   to keyed instances, one scheduler-lane raft entry each.
+- **`legion_envelope_resizes_total{direction, outcome}`** (counter): elastic
+  envelope resizes nodes asked this manager for
+  ([elastic envelopes](session-mode.md#elastic-envelopes)), by `direction`
+  (`grow` or `shrink`) and `outcome`: `applied`, `partial` (a grow that took
+  only the room the node had left), `refused` (a grow on a node with no free
+  room, or one that is draining or ineligible), `stale` (the node's view of
+  the size was out of date), `gone`, `invalid`, or `error` (the write did
+  not land; the node asks again). `applied` and `partial` are one
+  scheduler-lane raft entry each, and the rest write nothing. A steady
+  `refused` rate means envelopes want room their nodes do not have: add
+  nodes, or lower `stateful.envelope.max`.
 
 Two more are counted on the worker that holds the sessions, on its own
 listener ([Worker](#worker)):

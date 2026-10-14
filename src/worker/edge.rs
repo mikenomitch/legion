@@ -512,6 +512,7 @@ mod worker_edge_test {
             session_task_spec: String::new(),
             session_task_config_id: 0,
             session_seal_keys: Vec::new(),
+            envelope_resources: String::new(),
             task_lifecycle: String::new(),
             task_restart: String::new(),
         }

@@ -28,6 +28,12 @@
 //! Unnamed sessions are started by a manager's session router straight onto
 //! a node with envelope room, and live in that node's memory and the
 //! managers' session index, never in the store.
+//!
+//! An envelope with `envelope.max` is **elastic** (elastic-session-envelopes
+//! plan): its allocation starts at `envelope.resources`, and its node grows
+//! and shrinks it between the two ([`ElasticBounds`],
+//! `src/worker/envelope_elastic.rs`), each resize an in-place update of the
+//! allocation row (`src/storage/store/envelope_ops.rs`).
 
 use crate::prelude::*;
 use crate::structs::{InstanceMode, JobConfig, TaskConfig, TaskCount};
@@ -72,6 +78,82 @@ pub struct SessionEnvelopeConfig {
     /// task's `constraints`, added to the session task's own.
     #[serde(default = "empty_object")]
     pub constraints: Value,
+    /// The ceiling of an elastic envelope (elastic-session-envelopes plan
+    /// §6.1): the envelope starts at `resources`, its floor, and each node
+    /// grows its own envelope up to this as its sessions fill it, then gives
+    /// room back after `shrink_after`. Sizes exactly the keys `resources`
+    /// sizes, each at or above the floor. Absent (or equal to `resources`):
+    /// a fixed envelope.
+    #[serde(default, skip_serializing_if = "Value::is_null")]
+    pub max: Value,
+    /// How long an elastic envelope's sessions must use less than half of
+    /// it before the node shrinks it. Default [`DEFAULT_SHRINK_AFTER`], at
+    /// least [`MIN_SHRINK_AFTER`]. Only with `max`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shrink_after: Option<String>,
+}
+
+/// Default `stateful.envelope.shrinkAfter`.
+pub const DEFAULT_SHRINK_AFTER: std::time::Duration = std::time::Duration::from_secs(600);
+
+/// Shortest `stateful.envelope.shrinkAfter`. Every shrink is a raft entry,
+/// and a shorter wait shrinks and regrows an envelope on ordinary churn.
+pub const MIN_SHRINK_AFTER: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// An elastic envelope's bounds, read from its session task
+/// (`stateful.envelope`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct ElasticBounds {
+    /// `envelope.resources`: what the envelope always holds.
+    pub floor: BTreeMap<String, f64>,
+    /// `envelope.max`: what it may grow to. Same keys as `floor`.
+    pub max: BTreeMap<String, f64>,
+    /// `envelope.shrinkAfter`.
+    pub shrink_after: std::time::Duration,
+}
+
+impl ElasticBounds {
+    /// Whether `size` sizes exactly the bounded keys, each within its bounds.
+    pub fn admits(&self, size: &BTreeMap<String, f64>) -> bool {
+        size.len() == self.floor.len()
+            && self.floor.iter().all(|(key, floor)| {
+                size.get(key).is_some_and(|amount| {
+                    *amount >= *floor && *amount <= self.max.get(key).copied().unwrap_or(*floor)
+                })
+            })
+    }
+}
+
+/// The bounds of a session task's elastic envelope. `None` for a fixed
+/// envelope (no `max`, or `max` equal to `resources`), for a task that is
+/// not a session task, and for bounds `validate_session_task` would refuse.
+pub fn elastic_bounds(task: &TaskConfig) -> Option<ElasticBounds> {
+    let envelope = task.stateful.as_ref()?.envelope.as_ref()?;
+    if envelope.max.is_null() {
+        return None;
+    }
+    let floor = resource_amounts(&envelope.resources);
+    let max = resource_amounts(&envelope.max);
+    let keys_match = floor.len() == max.len() && floor.keys().all(|key| max.contains_key(key));
+    if !keys_match
+        || floor
+            .iter()
+            .any(|(key, amount)| max.get(key).is_some_and(|ceiling| ceiling < amount))
+        || floor == max
+    {
+        return None;
+    }
+    let shrink_after = envelope
+        .shrink_after
+        .as_deref()
+        .and_then(|raw| humantime::parse_duration(raw.trim()).ok())
+        .unwrap_or(DEFAULT_SHRINK_AFTER)
+        .max(MIN_SHRINK_AFTER);
+    Some(ElasticBounds {
+        floor,
+        max,
+        shrink_after,
+    })
 }
 
 /// How a manager's session router picks the node a session starts on
@@ -365,6 +447,25 @@ pub fn resource_amounts(resources: &Value) -> BTreeMap<String, f64> {
         .unwrap_or_default()
 }
 
+/// Resource amounts as a `resources` object, whole amounts written as
+/// integers (`{"cpu":6000,"memory":6144}`), the shape a jobspec declares and
+/// an envelope's allocation row stores.
+pub fn amounts_json(amounts: &BTreeMap<String, f64>) -> Value {
+    Value::Object(
+        amounts
+            .iter()
+            .map(|(key, amount)| {
+                let value = if amount.fract() == 0.0 && amount.abs() < 9.0e15 {
+                    json!(*amount as i64)
+                } else {
+                    json!(amount)
+                };
+                (key.clone(), value)
+            })
+            .collect(),
+    )
+}
+
 /// Submit-time checks for a (normalized) session task. Called from
 /// `TaskConfig::validate_stateful` for every stateful task; a task that is
 /// not a session task passes.
@@ -437,6 +538,7 @@ pub fn validate_session_task(task: &TaskConfig) -> R<()> {
             );
         }
     }
+    validate_elastic_envelope(name, envelope, &room)?;
     if let Some(resources) = task.resources.as_object() {
         for (key, value) in resources {
             if key == crate::resources::MEMORY_MAX_KEY {
@@ -518,6 +620,80 @@ pub fn validate_session_task(task: &TaskConfig) -> R<()> {
     Ok(())
 }
 
+/// Submit-time checks for `envelope.max` and `envelope.shrinkAfter`
+/// (elastic-session-envelopes plan §6.1). `floor` is `envelope.resources`.
+fn validate_elastic_envelope(
+    name: &str,
+    envelope: &SessionEnvelopeConfig,
+    floor: &BTreeMap<String, f64>,
+) -> R<()> {
+    if envelope.max.is_null() {
+        if envelope.shrink_after.is_some() {
+            bail!(
+                "task {name} sets stateful.envelope.shrinkAfter without envelope.max. A fixed \
+                 envelope never shrinks\nHint: set envelope.max to let each node grow and shrink \
+                 its envelope, or remove shrinkAfter"
+            );
+        }
+        return Ok(());
+    }
+    let Some(max) = envelope.max.as_object() else {
+        bail!(
+            "task {name}: stateful.envelope.max must be an object of amounts, like \
+             envelope.resources\nHint: max = {{ cpu = 30000, memory = 61440 }}"
+        );
+    };
+    let floor_keys = floor.keys().cloned().collect::<Vec<_>>().join(", ");
+    for (key, value) in max {
+        let key = if key == "cpus" { "cpu" } else { key.as_str() };
+        if value.as_f64().is_none() {
+            bail!(
+                "task {name}: stateful.envelope.max.{key} = {value} is not an amount. An \
+                 envelope grows by amount\nHint: set max.{key} to a number"
+            );
+        }
+        if !floor.contains_key(key) {
+            bail!(
+                "task {name}: stateful.envelope.max must size exactly the keys \
+                 envelope.resources sizes ({floor_keys}), and it sizes {key}\nHint: remove \
+                 max.{key}, or add resources.{key} as its floor"
+            );
+        }
+    }
+    let ceiling = resource_amounts(&envelope.max);
+    for (key, amount) in floor {
+        match ceiling.get(key) {
+            None => bail!(
+                "task {name}: stateful.envelope.max must size exactly the keys \
+                 envelope.resources sizes ({floor_keys}), and it does not size {key}\nHint: set \
+                 max.{key}, at or above resources.{key}"
+            ),
+            Some(max) if max < amount => bail!(
+                "task {name}: stateful.envelope.max.{key} = {max} is below the floor \
+                 envelope.resources.{key} = {amount}\nHint: raise max.{key}, or lower \
+                 resources.{key}"
+            ),
+            Some(_) => {}
+        }
+    }
+    if let Some(raw) = envelope.shrink_after.as_deref() {
+        let after = humantime::parse_duration(raw.trim()).map_err(|err| {
+            anyhow!(
+                "task {name}: stateful.envelope.shrinkAfter {raw:?} is not a duration \
+                 ({err})\nHint: use a duration such as \"10m\" (the default)"
+            )
+        })?;
+        if after < MIN_SHRINK_AFTER {
+            bail!(
+                "task {name}: stateful.envelope.shrinkAfter {raw:?} is shorter than 1m. Every \
+                 shrink is a raft entry, and a shorter wait shrinks and regrows an envelope on \
+                 ordinary churn\nHint: use a duration such as \"10m\" (the default)"
+            );
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod session_test {
     use super::*;
@@ -536,6 +712,7 @@ mod session_test {
             envelope: Some(SessionEnvelopeConfig {
                 resources: json!({ "cpu": 30000, "memory": 61440 }),
                 constraints: json!([{ "key": "rack", "operator": "=", "value": "r1" }]),
+                ..Default::default()
             }),
             promote: None,
             placement: None,
@@ -685,6 +862,7 @@ mod session_test {
         task.stateful.as_mut().unwrap().envelope = Some(SessionEnvelopeConfig {
             resources: json!({ "memory": 61440 }),
             constraints: json!({}),
+            ..Default::default()
         });
         let err = validate_session_task(&task).expect_err("no cpu");
         assert!(err.to_string().contains("does not set cpu"), "{err}");
@@ -709,6 +887,90 @@ mod session_test {
         task.suspend = Some(serde_json::from_value(json!({ "reserve": 0.5 }))?);
         let err = validate_session_task(&task).expect_err("reserve");
         assert!(err.to_string().contains("envelope is the"), "{err}");
+        Ok(())
+    }
+
+    /// Elastic-session-envelopes plan §6.1: `max` and `shrinkAfter`.
+    #[test]
+    fn an_elastic_envelope_sizes_the_floor_keys_within_bounds_test() -> R<()> {
+        let mut config = job(vec![session_task()]);
+        normalize_session_tasks(&mut config)?;
+        let base = config.tasks[0].clone();
+        assert_eq!(elastic_bounds(&base), None, "no max: fixed");
+        let with = |max: Value, shrink_after: Option<&str>| {
+            let mut task = base.clone();
+            let envelope = task.stateful.as_mut().unwrap().envelope.as_mut().unwrap();
+            envelope.max = max;
+            envelope.shrink_after = shrink_after.map(str::to_string);
+            task
+        };
+
+        let task = with(json!({ "cpu": 60000, "memory": 122880 }), None);
+        validate_session_task(&task)?;
+        let bounds = elastic_bounds(&task).expect("elastic");
+        assert_eq!(bounds.shrink_after, DEFAULT_SHRINK_AFTER);
+        assert_eq!(bounds.floor["cpu"], 30000.0);
+        assert_eq!(bounds.max["memory"], 122880.0);
+        assert!(bounds.admits(&resource_amounts(&json!({ "cpu": 45000, "memory": 61440 }))));
+        assert!(!bounds.admits(&resource_amounts(&json!({ "cpu": 70000, "memory": 61440 }))));
+        assert!(!bounds.admits(&resource_amounts(&json!({ "cpu": 45000 }))));
+
+        // `max` equal to the floor is a fixed envelope.
+        let task = with(json!({ "cpu": 30000, "memory": 61440 }), None);
+        validate_session_task(&task)?;
+        assert_eq!(elastic_bounds(&task), None);
+
+        let task = with(json!({ "cpu": 60000, "memory": 122880 }), Some("30m"));
+        validate_session_task(&task)?;
+        assert_eq!(
+            elastic_bounds(&task).unwrap().shrink_after,
+            std::time::Duration::from_secs(1800)
+        );
+
+        for (max, shrink_after, needle) in [
+            (json!({ "cpu": 60000 }), None, "does not size memory"),
+            (
+                json!({ "cpu": 60000, "memory": 122880, "disk": 10 }),
+                None,
+                "it sizes disk",
+            ),
+            (
+                json!({ "cpu": 20000, "memory": 122880 }),
+                None,
+                "below the floor",
+            ),
+            (json!({ "cpu": "lots", "memory": 1 }), None, "not an amount"),
+            (json!(7), None, "must be an object"),
+            (
+                json!({ "cpu": 60000, "memory": 122880 }),
+                Some("30s"),
+                "shorter than 1m",
+            ),
+            (
+                json!({ "cpu": 60000, "memory": 122880 }),
+                Some("soon"),
+                "not a duration",
+            ),
+            (Value::Null, Some("10m"), "without envelope.max"),
+        ] {
+            let err = validate_session_task(&with(max.clone(), shrink_after))
+                .expect_err(&format!("{max} {shrink_after:?}"));
+            assert!(err.to_string().contains(needle), "{needle}: {err}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn a_fixed_envelope_spec_serializes_as_before_test() -> R<()> {
+        let envelope = SessionEnvelopeConfig {
+            resources: json!({ "cpu": 1 }),
+            constraints: json!({}),
+            ..Default::default()
+        };
+        assert_eq!(
+            serde_json::to_value(&envelope)?,
+            json!({ "resources": { "cpu": 1 }, "constraints": {} })
+        );
         Ok(())
     }
 

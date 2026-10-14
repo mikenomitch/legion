@@ -680,6 +680,14 @@ pub fn build_task_allocation_with(
         session_task_spec: String::new(),
         session_task_config_id: 0,
         session_seal_keys: Vec::new(),
+        // An envelope's size is its row's, which an elastic envelope's node
+        // grows and shrinks (docs/session-mode.md, "Elastic envelopes");
+        // `task_resources` stays the declared floor.
+        envelope_resources: if crate::structs::session::envelope_serves(task).is_some() {
+            allocation.resources.to_string()
+        } else {
+            String::new()
+        },
     })
 }
 

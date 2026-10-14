@@ -842,6 +842,9 @@ pub struct Metrics {
     pub session_stops_total: Arc<CounterVec>,
     /// `legion_session_promotions_total` (docs/metrics.md, "Sessions")
     pub session_promotions_total: Arc<Counter>,
+    /// `legion_envelope_resizes_total{direction, outcome}` (docs/metrics.md,
+    /// "Sessions"; elastic-session-envelopes plan §6.3)
+    pub envelope_resizes_total: Arc<CounterVec>,
     /// `legion_allocations`
     pub allocations: Arc<Gauge>,
     /// `legion_store_write_lock_wait_seconds`
@@ -1306,6 +1309,14 @@ impl Metrics {
                 name: "legion_session_stops_total",
                 help: "Sessions this manager ended on their nodes, by reason (stop|destroy|duplicate).",
                 labels: &["reason"],
+            },
+            series: Series::new(),
+        });
+        let envelope_resizes_total = Arc::new(CounterVec {
+            meta: FamilyMeta {
+                name: "legion_envelope_resizes_total",
+                help: "Elastic envelope resizes nodes asked this manager for, by direction (grow|shrink) and outcome (applied|partial|refused|stale|gone|invalid|error). Applied and partial resizes are one scheduler-lane write each; the rest write nothing.",
+                labels: &["direction", "outcome"],
             },
             series: Series::new(),
         });
@@ -1829,6 +1840,7 @@ impl Metrics {
             Arc::clone(&session_starts_total) as Arc<dyn RenderMetric>,
             Arc::clone(&session_stops_total) as Arc<dyn RenderMetric>,
             Arc::clone(&session_promotions_total) as Arc<dyn RenderMetric>,
+            Arc::clone(&envelope_resizes_total) as Arc<dyn RenderMetric>,
             Arc::clone(&eval_conflict_requeues_total) as Arc<dyn RenderMetric>,
             Arc::clone(&evals_blocked) as Arc<dyn RenderMetric>,
             Arc::clone(&evals_unblocked_total) as Arc<dyn RenderMetric>,
@@ -1933,6 +1945,7 @@ impl Metrics {
             checkpoint_publish_total,
             instance_archived_total,
             session_starts_total,
+            envelope_resizes_total,
             session_stops_total,
             session_promotions_total,
             allocations,

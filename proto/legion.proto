@@ -5734,6 +5734,71 @@ message HeartbeatRequest {
   // worker also sends a full report every 30 beats, as a backstop. Absent
   // from workers without the `sessions` capability.
   optional SessionReport session_report = 19;
+
+  // Resizes this node asks for its elastic envelopes (docs/session-mode.md,
+  // "Elastic envelopes"): at most one per envelope, re-sent on every
+  // heartbeat until a reply's `HeartbeatReply.envelope_resizes` answers it.
+  // The node decides, because only it knows what its sessions hold at every
+  // instant: it grows an envelope when its sessions fill more than 90% of
+  // it, and shrinks one after they used less than half of it for
+  // `stateful.envelope.shrinkAfter`. Before it asks to shrink, the node caps
+  // its own admission at the smaller size, so no session can be running
+  // over the envelope when the shrink commits.
+  //
+  // The manager applies each as one scheduler-lane write (forwarded to the
+  // lane leader when it does not lead). Repeating a request that already
+  // applied is answered `applied` and writes nothing.
+  //
+  // Default: empty list. Fixed envelopes never send one.
+  repeated EnvelopeResize envelope_resizes = 20;
+}
+
+// One envelope resize a node asks for. See
+// `HeartbeatRequest.envelope_resizes`.
+message EnvelopeResize {
+  // The envelope's allocation id, as its payload named it.
+  int64 allocation_id = 1;
+
+  // The size the node believes is committed, as a JSON `resources` object
+  // (`{"cpu":6000,"memory":6144}`). The resize is a compare-and-set on it:
+  // when the row holds something else, the answer is `stale`.
+  string from = 2;
+
+  // The size the node asks for, with the same keys. Every key is at or
+  // above `from` (a grow) or at or below it (a shrink), and every key stays
+  // within the session task's `envelope.resources` and `envelope.max`.
+  string to = 3;
+}
+
+// The manager's answer to one `EnvelopeResize`. See
+// `HeartbeatReply.envelope_resizes`.
+message EnvelopeResizeResult {
+  // The envelope's allocation id, as the request named it.
+  int64 allocation_id = 1;
+
+  // What happened:
+  //
+  // - `applied`: the row now holds `to` (or already did).
+  // - `partial`: a grow that did not fully fit the node; the row holds
+  //   `size`, between `from` and `to`.
+  // - `refused`: a grow with no room on the node, or on a node that is not
+  //   `available` (draining or ineligible). Nothing was written; `size` is
+  //   unchanged.
+  // - `stale`: the row did not hold `from`; nothing was written, and `size`
+  //   is what it holds.
+  // - `gone`: the allocation is not a live envelope on this node.
+  // - `invalid`: `to` is outside the envelope's bounds or does not size its
+  //   keys.
+  // - `error`: the write failed (for example, no raft leader); the node
+  //   asks again on its next heartbeat.
+  string outcome = 2;
+
+  // The committed size after this answer, as a JSON `resources` object.
+  // Empty for `gone`, `invalid`, and `error`.
+  string size = 3;
+
+  // Why, for `refused`, `stale`, `gone`, `invalid`, and `error`.
+  string message = 4;
 }
 
 // One heartbeat's session report. See `HeartbeatRequest.session_report`.
@@ -6501,6 +6566,15 @@ message HeartbeatReply {
   // Default: empty when workload identity is disabled on the answering
   // manager; an empty value leaves the worker's expected issuer unchanged.
   string workload_identity_issuer = 21;
+
+  // Answers to this heartbeat's `HeartbeatRequest.envelope_resizes`, one
+  // per request, in request order (docs/session-mode.md, "Elastic
+  // envelopes"). A node lifts its shrink cap, adopts the committed `size`,
+  // or backs off growing from these. The resized allocation also reaches
+  // the node as a changed payload (`TaskAllocation.envelope_resources`).
+  //
+  // Default: empty list.
+  repeated EnvelopeResizeResult envelope_resizes = 22;
 }
 
 // Why one allocation is being stopped.
@@ -10508,6 +10582,18 @@ message TaskAllocation {
   // a `store` session whose memory checkpoint has parts to seal then stays
   // suspended on its node unpublished until the keys arrive.
   repeated SessionSealKey session_seal_keys = 31;
+
+  // On an envelope allocation only: the envelope's committed size, as the
+  // JSON `resources` object on its allocation row, such as
+  // `{"cpu":12000,"memory":12288}` (docs/session-mode.md, "Elastic
+  // envelopes"). A fixed envelope always carries its
+  // `stateful.envelope.resources`. An elastic one carries whatever the node
+  // last grew or shrank it to, between `envelope.resources` and
+  // `envelope.max`. The node admits sessions against this size, not against
+  // `task_resources` (the floor). A changed size is re-sent like any changed
+  // payload: on the work stream, or in the next desired set. Empty on every
+  // other allocation, and the node then falls back to `task_resources`.
+  string envelope_resources = 32;
 }
 
 // Request payload for PostWork.

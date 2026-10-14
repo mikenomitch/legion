@@ -2308,6 +2308,24 @@ Plans: [task-runtime-plugins](../docs/task-runtime-plugins.md).
   - [ ] **Batch session creates.** `CreateInstance` with `count` is refused
         on a session task ([calls](calls/sandbox-scaling-plan_calls.md)
         #57).
+  - [ ] **Elastic envelopes: preemptible elastic room.** An envelope that
+        grew holds the extra room until its sessions use less than half of
+        it for `shrinkAfter`; a higher-priority placement can only preempt
+        the whole envelope, not its grown part
+        ([plan](plans/elastic-session-envelopes-plan.md) Phase 2,
+        [calls](calls/elastic-session-envelopes-plan_calls.md) #5).
+  - [ ] **Elastic envelopes: a job update starts each new envelope at its
+        floor.** The node grows it on its next heartbeat, but sessions can
+        hold more than the new envelope until then, and a placement in that
+        window can overcommit the node. Carry the old envelope's size into
+        its replacement
+        ([calls](calls/elastic-session-envelopes-plan_calls.md) #6).
+  - [ ] **Elastic envelopes on a real fleet.** Phase 1 is tested on fake
+        nodes against a single-voter raft store and in a simulated diurnal
+        day of the node controller. Not run on real workers, through a
+        follower's forwarded write on a multi-manager cluster, or in a
+        fleet-wide burst where every node grows in the same heartbeat
+        ([plan](plans/elastic-session-envelopes-plan.md) Phase 3).
   - [ ] **Phase 5's 10^6 acceptance run, and archive in the op-count
         test.** Archiving was tested at 20 instances
         (`tests/archive_integration.rs`, local store); plan §13's 10^6
@@ -4712,6 +4730,15 @@ Deferred from [operator-ui-gaps-plan.md](plans/operator-ui-gaps-plan.md):
 
 docs: [scheduler-and-eval-loop.md](../docs/scheduler-and-eval-loop.md), [jobs-tasks-and-scheduling.md](../docs/jobs-tasks-and-scheduling.md)
 
+- [x] **Elastic session envelopes, Phase 1.** `stateful.envelope.max` and
+      `shrinkAfter`: each node grows its session envelope toward the
+      ceiling as its sessions fill it and shrinks it after they drain, one
+      scheduler-lane entry per resize on the envelope's own allocation row,
+      taking only free room, with the node capping its own admission
+      before a shrink. A fixed envelope stays the default
+      ([plan](plans/elastic-session-envelopes-plan.md),
+      [calls](calls/elastic-session-envelopes-plan_calls.md),
+      [docs](../docs/session-mode.md#elastic-envelopes)).
 - [x] **The planner's node universe truncated to one slice at rig scale —
       root-caused and fixed** (2026-09-21,
       [findings](aws-phase5-findings.md#open-in-priority-order),

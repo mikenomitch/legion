@@ -856,6 +856,10 @@ pub struct WorkerTaskManager {
     /// duplicate): their manifest belongs to the winner and is not deleted
     /// when the stop settles.
     keep_manifest: std::collections::HashSet<String>,
+    /// Each envelope's committed size and, for an elastic envelope, its
+    /// resize controller, by the envelope's local key (elastic-session-
+    /// envelopes plan §6.2). Admission reads the room from here.
+    envelope_sizes: HashMap<i64, crate::worker::envelope_elastic::EnvelopeSize>,
 }
 
 /// A session task's spec, as its envelope's payload carried it.
@@ -957,6 +961,7 @@ impl WorkerTaskManager {
             session_live_published: HashMap::new(),
             pending_manifest_deletes: Vec::new(),
             keep_manifest: std::collections::HashSet::new(),
+            envelope_sizes: HashMap::new(),
         }
     }
 
@@ -2283,6 +2288,7 @@ impl WorkerTaskManager {
         self.task_configs.remove(&allocation_id);
         self.allocation_health.remove(&allocation_id);
         self.self_fence_windows.remove(&allocation_id);
+        self.envelope_sizes.remove(&allocation_id);
         self.terminated.remove(&allocation_id);
         self.terminating.remove(&allocation_id);
         self.restart_history.remove(&allocation_id);
@@ -2420,6 +2426,17 @@ impl WorkerTaskManager {
                 )
             })
             .collect();
+        // An envelope that grew or shrank keeps its allocation id: its new
+        // size arrives here as a changed payload, never as a new launch.
+        let now = std::time::Instant::now();
+        for allocation in allocations {
+            if allocation.task_runtime == crate::structs::session::ENVELOPE_RUNTIME {
+                let local = self.local_key(allocation.allocation_id);
+                self.observe_envelope_size(local, allocation, now);
+            }
+        }
+        self.envelope_sizes
+            .retain(|local, _| desired_ids.contains(local) || self.instances.contains_key(local));
         // An eviction is settled once the manager stops asking for the
         // allocation; until then it must not be relaunched.
         self.pressure_evicted
@@ -2567,6 +2584,7 @@ impl WorkerTaskManager {
         let instance = self.instances.remove(&allocation_id);
         self.allocation_health.remove(&allocation_id);
         self.self_fence_windows.remove(&allocation_id);
+        self.envelope_sizes.remove(&allocation_id);
         self.terminated.remove(&allocation_id);
         self.restart_history.remove(&allocation_id);
         self.artifact_status.remove(allocation_id);
@@ -3704,14 +3722,20 @@ impl WorkerTaskManager {
     /// registered claim; the caller launches it with
     /// [`launch_provisional_allocation`].
     pub fn admit_session(&mut self, record: ClaimRecord) -> R<ClaimRecord> {
-        let Some((_, envelope)) = self.envelope_for(&record.job_id, &record.task_name) else {
+        let Some((local, envelope)) = self.envelope_for(&record.job_id, &record.task_name) else {
             return Err(SessionRefusal::NoEnvelope {
                 job_id: record.job_id.clone(),
                 task_name: record.task_name.clone(),
             }
             .into());
         };
-        let room = crate::structs::session::resource_amounts(&envelope.resources);
+        // The committed size, capped by a shrink in flight; the declared
+        // floor until the first payload with a size arrives.
+        let room = self
+            .envelope_sizes
+            .get(&local)
+            .map(|size| size.room())
+            .unwrap_or_else(|| crate::structs::session::resource_amounts(&envelope.resources));
         let needs = crate::structs::session::resource_amounts(&record.resources);
         // Running totals, not a scan of every session (plan §6.1). They
         // still count a promoted session that stopped until the heartbeat
@@ -3726,6 +3750,139 @@ impl WorkerTaskManager {
             }
         }
         self.claims.insert(record)
+    }
+
+    /// Record the size an envelope's payload carries
+    /// (`TaskAllocation.envelope_resources`, or the declared floor when the
+    /// manager sent none). An envelope with a resize in flight, or answered
+    /// within the trust window, keeps its own record
+    /// ([`crate::worker::envelope_elastic::EnvelopeSize::observe_payload`]).
+    fn observe_envelope_size(
+        &mut self,
+        local: i64,
+        payload: &TaskAllocation,
+        now: std::time::Instant,
+    ) {
+        let raw = if payload.envelope_resources.trim().is_empty() {
+            payload.task_resources.as_str()
+        } else {
+            payload.envelope_resources.as_str()
+        };
+        let size = serde_json::from_str::<Value>(raw)
+            .map(|value| crate::structs::session::resource_amounts(&value))
+            .unwrap_or_default();
+        if size.is_empty() {
+            return;
+        }
+        match self.envelope_sizes.entry(local) {
+            std::collections::hash_map::Entry::Occupied(mut entry) => {
+                entry.get_mut().observe_payload(size, now)
+            }
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert(crate::worker::envelope_elastic::EnvelopeSize::new(size));
+            }
+        }
+    }
+
+    /// This heartbeat's resizes for this node's elastic envelopes
+    /// (`HeartbeatRequest.envelope_resizes`, elastic-session-envelopes plan
+    /// §6.2): at most one per envelope, a resize in flight asked again.
+    ///
+    /// Only the envelope admission uses for each session task is resized
+    /// (the newest, when a job update briefly leaves two), and it is sized
+    /// from its task's active sessions alone. Runs under the same lock as
+    /// [`Self::admit_session`], so a shrink's admission cap is in place
+    /// before the next session can be admitted.
+    pub fn envelope_resize_requests(
+        &mut self,
+        now: std::time::Instant,
+    ) -> Vec<crate::structs::EnvelopeResize> {
+        let tasks: std::collections::BTreeSet<(String, String)> = self
+            .envelope_sizes
+            .keys()
+            .filter_map(|local| {
+                let serves =
+                    crate::structs::session::envelope_serves(self.task_configs.get(local)?)?;
+                let job_id = &self.allocations.get(local)?.job_id;
+                Some((job_id.clone(), serves.to_string()))
+            })
+            .collect();
+        let mut requests = Vec::new();
+        for (job_id, task_name) in tasks {
+            let Some((local, _)) = self.envelope_for(&job_id, &task_name) else {
+                continue;
+            };
+            let Some(spec) = self.session_specs.get(&local) else {
+                continue;
+            };
+            let Some(bounds) = crate::structs::session::elastic_bounds(&spec.task) else {
+                continue;
+            };
+            let session = crate::structs::session::resource_amounts(&spec.task.resources);
+            let used: std::collections::BTreeMap<String, f64> = self
+                .claims
+                .session_usage(&job_id, &task_name)
+                .into_iter()
+                .collect();
+            let Some(size) = self.envelope_sizes.get_mut(&local) else {
+                continue;
+            };
+            if let Some(resize) = size.tick(&bounds, &used, &session, now) {
+                debug!(
+                    allocation_id = local,
+                    job_id = %job_id,
+                    direction = resize.direction.as_str(),
+                    "Asking the manager to resize an envelope"
+                );
+                requests.push(crate::structs::EnvelopeResize {
+                    // Envelopes are placed by the scheduler, never booted
+                    // provisionally, so the local key is the allocation id.
+                    allocation_id: local,
+                    from: crate::structs::session::amounts_json(&resize.from).to_string(),
+                    to: crate::structs::session::amounts_json(&resize.to).to_string(),
+                });
+            }
+        }
+        requests
+    }
+
+    /// The manager's answers to this heartbeat's resizes
+    /// (`HeartbeatReply.envelope_resizes`).
+    pub fn apply_envelope_resize_results(
+        &mut self,
+        results: &[crate::structs::EnvelopeResizeResult],
+        now: std::time::Instant,
+    ) {
+        for result in results {
+            let Some(size) = self.envelope_sizes.get_mut(&result.allocation_id) else {
+                continue;
+            };
+            let committed = serde_json::from_str::<Value>(&result.size)
+                .ok()
+                .map(|value| crate::structs::session::resource_amounts(&value))
+                .filter(|amounts| !amounts.is_empty());
+            match result.outcome.as_str() {
+                "applied" | "partial" => info!(
+                    allocation_id = result.allocation_id,
+                    outcome = %result.outcome,
+                    size = %result.size,
+                    "Envelope resized"
+                ),
+                "error" | "refused" => debug!(
+                    allocation_id = result.allocation_id,
+                    outcome = %result.outcome,
+                    message = %result.message,
+                    "Envelope resize not applied"
+                ),
+                _ => warn!(
+                    allocation_id = result.allocation_id,
+                    outcome = %result.outcome,
+                    message = %result.message,
+                    "Envelope resize not applied"
+                ),
+            }
+            size.answer(&result.outcome, committed, now);
+        }
     }
 
     /// Forget promoted sessions whose allocation has stopped, so their
@@ -4031,6 +4188,9 @@ impl WorkerTaskManager {
                     "Envelope carries an unreadable session task spec; edge starts refused"
                 ),
             }
+        }
+        if crate::structs::session::envelope_serves(&task).is_some() {
+            self.observe_envelope_size(alloc.id, allocation, std::time::Instant::now());
         }
         // A duplicate dispatch (heartbeat and push racing) of an allocation
         // whose launch is still in its runtime call. Launching it again would
@@ -6298,6 +6458,7 @@ mod tests {
             session_task_spec: String::new(),
             session_task_config_id: 0,
             session_seal_keys: Vec::new(),
+            envelope_resources: String::new(),
             task_lifecycle: String::new(),
             task_restart: String::new(),
         }
@@ -7992,6 +8153,143 @@ mod tests {
         );
         start_session(&mut manager, "workspace-c")?;
         manager.stop_sessions(&["workspace-b".into(), "workspace-c".into()], "stop");
+        Ok(())
+    }
+
+    /// An envelope whose session task sets `envelope.max`: floor 1000 MHz /
+    /// 512 MiB (two sessions), ceiling 4000 / 2048 (eight).
+    fn elastic_envelope_payload(allocation_id: i64) -> R<TaskAllocation> {
+        let mut envelope = envelope_payload(allocation_id);
+        envelope.session_task_spec = serde_json::to_string(&TaskConfig {
+            name: "workspace".into(),
+            runtime: "exec".into(),
+            resources: json!({ "cpu": 500, "memory": 256 }),
+            stateful: Some(serde_json::from_value(json!({
+                "mode": "keyed",
+                "envelope": {
+                    "resources": { "cpu": 1000, "memory": 512 },
+                    "max": { "cpu": 4000, "memory": 2048 },
+                },
+            }))?),
+            ..Default::default()
+        })?;
+        envelope.session_task_config_id = 7;
+        envelope.envelope_resources = json!({ "cpu": 1000, "memory": 512 }).to_string();
+        Ok(envelope)
+    }
+
+    fn resize_result(
+        allocation_id: i64,
+        outcome: &str,
+        size: Value,
+    ) -> crate::structs::EnvelopeResizeResult {
+        crate::structs::EnvelopeResizeResult {
+            allocation_id,
+            outcome: outcome.into(),
+            size: size.to_string(),
+            message: String::new(),
+        }
+    }
+
+    /// Elastic-session-envelopes plan §6.2 to §6.4: a full elastic envelope
+    /// asks to grow, admits against the committed size once the answer
+    /// lands, ignores a lagging payload, and caps admission at a shrink's
+    /// target until the shrink is answered.
+    #[test]
+    fn an_elastic_envelope_grows_when_full_and_caps_admission_while_shrinking_test() -> R<()> {
+        let temp_dir = TempDir::new()?;
+        let mut manager = manager_in(&temp_dir);
+        let now = std::time::Instant::now();
+        manager.begin_task_allocation(&elastic_envelope_payload(100)?)?;
+        assert!(manager.envelope_resize_requests(now).is_empty(), "empty");
+
+        start_session(&mut manager, "workspace-a")?;
+        start_session(&mut manager, "workspace-b")?;
+        let grow = manager.envelope_resize_requests(now);
+        assert_eq!(grow.len(), 1, "{grow:?}");
+        assert_eq!(grow[0].allocation_id, 100);
+        assert_eq!(grow[0].from, r#"{"cpu":1000,"memory":512}"#);
+        // Two sessions at 75%, and room for a third.
+        assert_eq!(grow[0].to, r#"{"cpu":1500,"memory":768}"#);
+        // Asked again, unchanged, until answered; nothing is admitted on
+        // room that is not committed.
+        assert_eq!(manager.envelope_resize_requests(now), grow);
+        manager
+            .admit_session(session_record("workspace-c"))
+            .expect_err("not grown yet");
+
+        manager.apply_envelope_resize_results(
+            &[resize_result(
+                100,
+                "applied",
+                json!({ "cpu": 1500, "memory": 768 }),
+            )],
+            now,
+        );
+        start_session(&mut manager, "workspace-c")?;
+        // A desired set built before the grow committed says 1000: the
+        // node's own record wins inside the trust window.
+        manager.reconcile_allocations(&[elastic_envelope_payload(100)?]);
+        manager
+            .admit_session(session_record("workspace-d"))
+            .expect_err("three fill 1500");
+
+        // Two end; one 500 MHz session in 1500 is a third full. After
+        // shrinkAfter (10m by default) the node asks to shrink to the floor
+        // and caps its own admission there before the answer.
+        manager.stop_sessions(&["workspace-a".into(), "workspace-b".into()], "stop");
+        assert!(manager.envelope_resize_requests(now).is_empty());
+        let due = now + Duration::from_secs(601);
+        let shrink = manager.envelope_resize_requests(due);
+        assert_eq!(shrink.len(), 1, "{shrink:?}");
+        assert_eq!(shrink[0].to, r#"{"cpu":1000,"memory":512}"#);
+        start_session(&mut manager, "workspace-d")?;
+        manager
+            .admit_session(session_record("workspace-e"))
+            .expect_err("capped at the shrink's target");
+        // A failed write keeps the cap; the answer settles it.
+        manager.apply_envelope_resize_results(&[resize_result(100, "error", json!(null))], due);
+        manager
+            .admit_session(session_record("workspace-e"))
+            .expect_err("still capped");
+        assert_eq!(manager.envelope_resize_requests(due), shrink);
+        manager.apply_envelope_resize_results(
+            &[resize_result(
+                100,
+                "applied",
+                json!({ "cpu": 1000, "memory": 512 }),
+            )],
+            due,
+        );
+        // The session admitted under the cap fills the floor again, so the
+        // next heartbeat asks to grow back.
+        let regrow = manager.envelope_resize_requests(due);
+        assert_eq!(regrow.len(), 1, "{regrow:?}");
+        assert_eq!(regrow[0].from, r#"{"cpu":1000,"memory":512}"#);
+        assert_eq!(regrow[0].to, r#"{"cpu":1500,"memory":768}"#);
+        manager.stop_sessions(&["workspace-c".into(), "workspace-d".into()], "stop");
+        Ok(())
+    }
+
+    /// A fixed envelope never asks to resize, however full.
+    #[test]
+    fn a_fixed_envelope_never_asks_to_resize_test() -> R<()> {
+        let temp_dir = TempDir::new()?;
+        let mut manager = manager_in(&temp_dir);
+        let mut envelope = envelope_payload(100);
+        envelope.session_task_spec = serde_json::to_string(&TaskConfig {
+            name: "workspace".into(),
+            runtime: "exec".into(),
+            resources: json!({ "cpu": 500, "memory": 256 }),
+            ..Default::default()
+        })?;
+        manager.begin_task_allocation(&envelope)?;
+        start_session(&mut manager, "workspace-a")?;
+        start_session(&mut manager, "workspace-b")?;
+        assert!(manager
+            .envelope_resize_requests(std::time::Instant::now())
+            .is_empty());
+        manager.stop_sessions(&["workspace-a".into(), "workspace-b".into()], "stop");
         Ok(())
     }
 

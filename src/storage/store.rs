@@ -24,6 +24,9 @@ mod eval_claims;
 mod fork_ops;
 mod group_commit;
 mod session_ops;
+// Elastic session envelopes: a node's in-place envelope resize.
+mod envelope_ops;
+pub use envelope_ops::{EnvelopeResizeOutcome, EnvelopeResizeRequest};
 mod snapshot_ops;
 mod suspend_ops;
 // The job status GetJobInfo/ListJobs report, derived from the workload.
@@ -11339,6 +11342,11 @@ impl Store {
         // (`store/blocked_evals.rs`): `(node, register | node | ready)`;
         // allocations leaving a node are added from the delta below.
         let mut capacity_nodes: Vec<(String, &'static str)> = Vec::new();
+        // Allocations whose `resources` an in-place UPDATE lowered: an
+        // elastic envelope's shrink, or a suspend dropping an instance to its
+        // reserve. Room freed without a row leaving the node, so their nodes
+        // become capacity events once the rows are read back.
+        let mut alloc_shrunk_ids: Vec<i64> = Vec::new();
         // A replicated keyring change (a rotation, a rewrap of the root
         // key, a reset): this replica must unwrap the new rows before it can
         // read values written under them.
@@ -11523,6 +11531,29 @@ impl Store {
                                 .old_value(id_idx)
                                 .ok()
                                 .and_then(|value| value.as_i64().ok());
+                            let resources_idx = self.changeset_column_index(
+                                &mut column_cache,
+                                "allocation",
+                                "resources",
+                            )?;
+                            let amounts = |value: Option<rusqlite::types::ValueRef<'_>>| {
+                                value
+                                    .and_then(|value| value.as_str().ok())
+                                    .and_then(|raw| serde_json::from_str::<Value>(raw).ok())
+                                    .map(|value| crate::structs::session::resource_amounts(&value))
+                            };
+                            if let (Some(id), Some(old), Some(new)) = (
+                                id,
+                                amounts(item.old_value(resources_idx).ok()),
+                                amounts(item.new_value(resources_idx).ok()),
+                            ) {
+                                let lowered = old.iter().any(|(key, was)| {
+                                    new.get(key).is_none_or(|amount| amount < was)
+                                });
+                                if lowered {
+                                    alloc_shrunk_ids.push(id);
+                                }
+                            }
                             match id {
                                 Some(id) => {
                                     alloc_delta.upserts.insert(id);
@@ -11775,6 +11806,11 @@ impl Store {
                 .iter()
                 .map(|(_, node)| (node.clone(), "freed")),
         );
+        for id in alloc_shrunk_ids {
+            if let Some(allocation) = self.get_allocation_by_id(id)? {
+                capacity_nodes.push((allocation.node_id, "freed"));
+            }
+        }
         self.note_capacity_events(capacity_nodes);
 
         // Tell the work delivery log which allocations moved, on every

@@ -2285,6 +2285,14 @@ async fn heartbeat_tick(
                 .unwrap_or_else(|p| p.into_inner())
                 .prepare(current)
         };
+        // Elastic envelopes this node wants grown or shrunk
+        // (docs/session-mode.md, "Elastic envelopes"). A resize stays in
+        // flight until a reply answers it, so a failed heartbeat needs no
+        // restore: the next one asks again.
+        let envelope_resizes = task_manager
+            .lock()
+            .expect("task manager")
+            .envelope_resize_requests(std::time::Instant::now());
         let exec_audit = crate::worker::direct_exec::take_audit();
         // On the stream, the heartbeat stops listing what the node runs: it
         // reports its stream position and a digest of its desired set, and
@@ -2312,6 +2320,7 @@ async fn heartbeat_tick(
                 .as_ref()
                 .map(|pending| pending.report.clone()),
             session_report: Some(session_report.report.clone()),
+            envelope_resizes,
             usage,
             pressure_actions,
             net_denials,
@@ -2390,6 +2399,14 @@ async fn heartbeat_tick(
                 terminations_for_redrive,
                 &reply.retry_terminated_allocations,
             );
+        // Before the reconcile below reads this reply's desired set: an
+        // answer is newer than any payload a lagging replica built.
+        if !reply.envelope_resizes.is_empty() {
+            task_manager
+                .lock()
+                .expect("task manager")
+                .apply_envelope_resize_results(&reply.envelope_resizes, std::time::Instant::now());
+        }
         crate::worker::direct_exec::apply_revocations(&reply.revoked_exec_sessions);
         crate::worker::direct_exec::apply_exec_keys(&reply.exec_keys_version, &reply.exec_keys);
         // The cluster's manager set, refreshed every beat and persisted when
@@ -5875,6 +5892,7 @@ mod tests {
             }],
             manager_addresses: Vec::new(),
             workload_identity_issuer: String::new(),
+            envelope_resizes: Vec::new(),
         };
 
         apply_upstreams(&forwarder, &reply, std::path::Path::new("/tmp")).await;

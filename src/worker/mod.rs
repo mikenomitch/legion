@@ -7,6 +7,7 @@ pub mod content_report;
 pub mod daemon;
 pub mod direct_exec;
 pub mod edge;
+pub mod envelope_elastic;
 pub mod exec;
 pub mod forwarder;
 pub mod identity;
