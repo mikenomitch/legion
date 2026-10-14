@@ -1912,6 +1912,46 @@ impl Drop for RedactSecretColumns<'_> {
     }
 }
 
+/// The keyed binding query: the oldest unbound live keyed instance of a
+/// (job, group, task) for one task config, with the node-local and restore
+/// preferences described in `Store::assign_keyed_instance_tx`. Parameters:
+/// `?1` job, `?2` group, `?3` task, `?4` task config id, `?5` node id, `?6`
+/// target instance (or `''`), `?7` now (unix seconds).
+const KEYED_BIND_SQL: &str = "SELECT instance.instance_id, instance.job_id, instance.group_name, \
+                 instance.task_name, instance.mode, instance.state, instance.slot_index, \
+                 instance.current_alloc_id, instance.storage_handle, instance.created_at, \
+                 instance.updated_at, instance.restore_from, instance.identity_epoch, \
+                 instance.named, instance.promoted_from \
+                 FROM instance \
+                 LEFT JOIN volume ON volume.instance_id = instance.instance_id \
+                 AND volume.node_local = 1 AND volume.state IN ('pending', 'created') \
+                 AND instance.storage_handle = volume.driver || '/' || volume.volume_id \
+                 WHERE instance.job_id = ?1 AND instance.group_name = ?2 \
+                 AND instance.task_name = ?3 \
+                 AND instance.mode = 'keyed' \
+                 AND instance.state NOT IN ('terminated', 'stopped', 'suspended') \
+                 AND instance.instance_id IS NOT NULL \
+                 AND NOT EXISTS (\
+                     SELECT 1 FROM allocation \
+                     WHERE allocation.instance_id = instance.instance_id \
+                     AND allocation.task_config_id = ?4\
+                 ) \
+                 AND COALESCE(instance.pending_op, '') != 'fork' \
+                 AND (?6 = '' OR instance.instance_id = ?6) \
+                 AND (instance.restore_from IS NULL OR COALESCE((\
+                     SELECT CASE WHEN snapshot.state = 'published' THEN ?5 \
+                     ELSE snapshot.node_id END FROM snapshot \
+                     WHERE snapshot.snapshot_id = instance.restore_from\
+                 ), ?5) = ?5) \
+                 ORDER BY EXISTS (SELECT 1 FROM reschedule_hold \
+                     WHERE reschedule_hold.instance_id = instance.instance_id \
+                     AND reschedule_hold.task_config_id = ?4 \
+                     AND reschedule_hold.not_before_unix > ?7) ASC, \
+                 (instance.restore_from IS NOT NULL) DESC, (volume.node_id = ?5) DESC, \
+                 COALESCE((SELECT snapshot.node_id = ?5 FROM snapshot \
+                     WHERE snapshot.snapshot_id = instance.restore_from), 0) DESC, \
+                 instance.created_at ASC, instance.instance_id ASC LIMIT 1;";
+
 impl Store {
     #[instrument(err, skip_all)]
     pub fn start_storage(config: &ManagerConfigFull) -> R<Store> {
@@ -13739,40 +13779,29 @@ impl Store {
         // instance binds only on its snapshot's node while the snapshot is
         // `local`. A `published` snapshot binds anywhere, preferring the node
         // that captured it (which still holds the parts).
+        //
+        // This runs once per keyed placement, inside the plan apply, so it is
+        // serial scheduler-lane time, and it must not grow with the task's
+        // suspended or retired population. Two things keep it lean
+        // (migration `idx_instance_keyed_live`):
+        //
+        // - The `mode`/`state` terms match the partial index
+        //   `idx_instance_keyed_live` word for word, so only live keyed rows
+        //   are visited. Suspended, stopped, and terminated rows, most of a
+        //   large sandbox population, are never read. SQLite uses a partial
+        //   index only when the query's WHERE implies the index's, so editing
+        //   either term can silently fall back to scanning every instance of
+        //   the job (`keyed_bind_query_uses_the_live_partial_index` guards it).
+        // - "Unbound for this config" is a correlated `NOT EXISTS` probe of
+        //   `idx_allocation_instance_config`, answered from the two indexes
+        //   alone, so a bound row costs two index lookups and no table read.
+        //   The `NOT IN (SELECT ...)` it replaces built an ephemeral B-tree of
+        //   every allocation of the config on every placement. The explicit
+        //   `instance_id IS NOT NULL` keeps the forms equivalent: `NOT IN`
+        //   never matched a NULL id, and `NOT EXISTS` alone would.
         let instance: Option<Instance> = tx
+            .prepare_cached(KEYED_BIND_SQL)?
             .query_row(
-                "SELECT instance.instance_id, instance.job_id, instance.group_name, \
-                 instance.task_name, instance.mode, instance.state, instance.slot_index, \
-                 instance.current_alloc_id, instance.storage_handle, instance.created_at, \
-                 instance.updated_at, instance.restore_from, instance.identity_epoch, \
-                 instance.named, instance.promoted_from \
-                 FROM instance \
-                 LEFT JOIN volume ON volume.instance_id = instance.instance_id \
-                 AND volume.node_local = 1 AND volume.state IN ('pending', 'created') \
-                 AND instance.storage_handle = volume.driver || '/' || volume.volume_id \
-                 WHERE instance.job_id = ?1 AND instance.group_name = ?2 \
-                 AND instance.task_name = ?3 \
-                 AND instance.mode = 'keyed' \
-                 AND instance.state NOT IN ('terminated', 'stopped', 'suspended') \
-                 AND COALESCE(instance.pending_op, '') != 'fork' \
-                 AND instance.instance_id NOT IN (\
-                     SELECT instance_id FROM allocation \
-                     WHERE task_config_id = ?4 AND instance_id IS NOT NULL\
-                 ) \
-                 AND (?6 = '' OR instance.instance_id = ?6) \
-                 AND (instance.restore_from IS NULL OR COALESCE((\
-                     SELECT CASE WHEN snapshot.state = 'published' THEN ?5 \
-                     ELSE snapshot.node_id END FROM snapshot \
-                     WHERE snapshot.snapshot_id = instance.restore_from\
-                 ), ?5) = ?5) \
-                 ORDER BY EXISTS (SELECT 1 FROM reschedule_hold \
-                     WHERE reschedule_hold.instance_id = instance.instance_id \
-                     AND reschedule_hold.task_config_id = ?4 \
-                     AND reschedule_hold.not_before_unix > ?7) ASC, \
-                 (instance.restore_from IS NOT NULL) DESC, (volume.node_id = ?5) DESC, \
-                 COALESCE((SELECT snapshot.node_id = ?5 FROM snapshot \
-                     WHERE snapshot.snapshot_id = instance.restore_from), 0) DESC, \
-                 instance.created_at ASC, instance.instance_id ASC LIMIT 1;",
                 params![
                     job_id,
                     group,
@@ -28577,6 +28606,93 @@ mod tests {
             err.to_string().contains("CreateInstance"),
             "error should point at the management API: {err}"
         );
+        Ok(())
+    }
+
+    /// The keyed binding runs once per keyed placement inside the plan
+    /// apply, which is serial scheduler-lane time. Its plan must walk only
+    /// the live keyed rows of the task (the partial index) and answer
+    /// "already bound to this config?" from an index alone. A query edit
+    /// that breaks the partial index's WHERE implication falls back to
+    /// scanning every instance of the job, suspended ones included, and
+    /// this is the test that notices.
+    #[test]
+    fn keyed_bind_query_uses_the_live_partial_index() -> R<()> {
+        let store = setup_store()?;
+        let conn = store.read_connection()?;
+        let mut stmt = conn.prepare(&format!("EXPLAIN QUERY PLAN {KEYED_BIND_SQL}"))?;
+        let details: Vec<String> = stmt
+            .query_map(
+                params!["job", "default", "task", 1i64, "node-a", "", 0i64],
+                |row| row.get::<_, String>(3),
+            )?
+            .collect::<Result<_, _>>()?;
+        let plan = details.join("\n");
+        assert!(
+            plan.contains("USING INDEX idx_instance_keyed_live"),
+            "binding must search the live keyed partial index:\n{plan}"
+        );
+        assert!(
+            plan.contains("USING COVERING INDEX idx_allocation_instance_config"),
+            "the bound-to-this-config probe must be index-only:\n{plan}"
+        );
+        assert!(
+            !plan.contains("LIST SUBQUERY"),
+            "no materialized list of every allocation of the config:\n{plan}"
+        );
+        Ok(())
+    }
+
+    /// Binding semantics the index-driven query keeps: suspended and
+    /// stopped instances are never bound, an instance bound under an older
+    /// config of the task is unbound for a newer one (a create-first
+    /// rollout), and among plain candidates the oldest wins.
+    #[test]
+    fn keyed_binding_skips_parked_instances_and_rebinds_across_configs() -> R<()> {
+        let store = setup_store()?;
+        store.insert_node(make_node_msg("node-a", "active"))?;
+        let job_id = "keyed-bind";
+        submit_job(&store, job_id, vec![stateful_keyed_task("sandbox", false)])?;
+        let old_task = task_id_for(&store, "sandbox", job_id)?;
+
+        for (id, created_at) in [
+            ("c-newest", "2026-01-03T00:00:00Z"),
+            ("b-parked", "2026-01-02T00:00:00Z"),
+            ("a-oldest", "2026-01-01T00:00:00Z"),
+        ] {
+            store.create_keyed_instance(job_id, "default", "sandbox", Some(id))?;
+            // Fixed stamps, so "oldest first" does not depend on the clock.
+            store.write_connection()?.execute(
+                "UPDATE instance SET created_at = ?1 WHERE instance_id = ?2;",
+                params![created_at, id],
+            )?;
+        }
+        store.stop_keyed_instance("b-parked")?;
+
+        let first = store.place_alloc("node-a", old_task)?;
+        assert_eq!(first.instance_id.as_deref(), Some("a-oldest"));
+        let second = store.place_alloc("node-a", old_task)?;
+        assert_eq!(
+            second.instance_id.as_deref(),
+            Some("c-newest"),
+            "a stopped instance is never bound"
+        );
+        assert!(
+            store.place_alloc("node-a", old_task).is_err(),
+            "both live instances are bound under this config"
+        );
+
+        // A new config of the same task: every live instance is unbound for
+        // it, so its placements bind them again, oldest first, while the old
+        // config's allocations still exist.
+        let new_config = submit_job(&store, job_id, vec![stateful_keyed_task("sandbox", false)])?;
+        let new_task = task_id_for_config(&store, "sandbox", &new_config)?;
+        assert_ne!(new_task, old_task);
+        let rebound = store.place_alloc("node-a", new_task)?;
+        assert_eq!(rebound.instance_id.as_deref(), Some("a-oldest"));
+        let rebound = store.place_alloc("node-a", new_task)?;
+        assert_eq!(rebound.instance_id.as_deref(), Some("c-newest"));
+        assert!(store.place_alloc("node-a", new_task).is_err());
         Ok(())
     }
 

@@ -1998,6 +1998,30 @@ fn migration_list() -> Vec<M<'static>> {
         DROP INDEX IF EXISTS idx_reschedule_hold_task;
         DROP TABLE IF EXISTS reschedule_hold;",
         ),
+        // Keyed binding off the scan (docs/sandboxes-at-scale.md, "What a
+        // placement costs"): every keyed placement binds the oldest unbound
+        // live instance of its task inside the plan apply, which is serial
+        // scheduler-lane time. It scanned every instance of the job (live,
+        // suspended, and retired alike) and built a temporary B-tree of every
+        // allocation of the config, so a placement cost grew with the task's
+        // whole population. The partial index holds live keyed rows only,
+        // and the allocation index answers "bound to this config?" without a
+        // table read; it replaces `idx_allocation_instance_id`, whose
+        // lookups it still serves as a prefix. Indexes only: no table
+        // changes shape, so a raft changeset is unaffected.
+        M::up(
+            "CREATE INDEX IF NOT EXISTS idx_instance_keyed_live
+            ON instance(job_id, group_name, task_name, instance_id)
+            WHERE mode = 'keyed' AND state NOT IN ('terminated', 'stopped', 'suspended');
+        CREATE INDEX IF NOT EXISTS idx_allocation_instance_config
+            ON allocation(instance_id, task_config_id);
+        DROP INDEX IF EXISTS idx_allocation_instance_id;",
+        )
+        .down(
+            "CREATE INDEX IF NOT EXISTS idx_allocation_instance_id ON allocation(instance_id);
+        DROP INDEX IF EXISTS idx_allocation_instance_config;
+        DROP INDEX IF EXISTS idx_instance_keyed_live;",
+        ),
     ]
 }
 
