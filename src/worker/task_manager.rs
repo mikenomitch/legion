@@ -294,6 +294,11 @@ impl Reap {
     }
 }
 
+/// How long a ratified claim is kept from the stop sweep while no desired set
+/// lists it yet. Raft followers apply within milliseconds when healthy. This
+/// covers a leader election, after which every manager has the entry.
+const RATIFIED_SETTLE: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// Why [`WorkerTaskManager::reap_terminating`] finished an allocation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReapOutcome {
@@ -892,6 +897,9 @@ pub struct WorkerTaskManager {
     /// The launch thread tears them down when the runtime call returns, and
     /// the id cannot be launched again until it has.
     cancelled_launches: std::collections::HashSet<i64>,
+    /// Claims ratified that no desired set has listed yet, by local key, with
+    /// when they were ratified (see [`Self::reconcile_allocations`]).
+    ratified_unseen: HashMap<i64, std::time::Instant>,
     /// Session stops the supervisor took out of `terminating` to destroy
     /// without the lock ([`Self::take_reapable`]). Each still counts as
     /// stopping until [`Self::finish_reap`] releases it.
@@ -1053,6 +1061,7 @@ impl WorkerTaskManager {
             launching: HashMap::new(),
             staging: HashMap::new(),
             cancelled_launches: std::collections::HashSet::new(),
+            ratified_unseen: HashMap::new(),
             reaping: std::collections::HashSet::new(),
             next_launch_generation: 0,
             checkpoints: Default::default(),
@@ -2558,11 +2567,22 @@ impl WorkerTaskManager {
         // first heartbeat. When the lease expires the claim is killed by
         // `sweep_expired_claims`, which is the same outcome one tick later
         // with no new reaper.
-        let protected = self
+        let mut protected = self
             .claims
             .unratified_local_keys()
             .into_iter()
             .collect::<std::collections::HashSet<_>>();
+        // A claim ratified a moment ago is missing from a desired set built
+        // before its ratification was visible: the reply to a heartbeat sent
+        // to a raft follower that has not applied it yet, or one the leader
+        // computed just before. Reading that absence as "stop" killed
+        // confirmed sandboxes on a three-manager cluster. So it stays
+        // protected until a desired set lists it, or for
+        // `RATIFIED_SETTLE`, after which an absence is a decision again.
+        self.ratified_unseen.retain(|local, at| {
+            !desired_ids.contains(local) && now.duration_since(*at) < RATIFIED_SETTLE
+        });
+        protected.extend(self.ratified_unseen.keys().copied());
         // A restore replaces an instance's allocation in one manager
         // transaction. Allocation ids are never reused (AUTOINCREMENT), so
         // the replacement normally has a new id; a store migrated from a
@@ -3673,6 +3693,8 @@ impl WorkerTaskManager {
         let allocation_id = final_payload.allocation_id;
 
         let local_key = claim.local_key;
+        self.ratified_unseen
+            .insert(local_key, std::time::Instant::now());
         // Adopt the committed payload before doing anything with it. The
         // payload the node booted (or staged) with could not name assigned
         // ports, the bound instance, or resolved volume mounts — those are
@@ -7921,6 +7943,37 @@ mod tests {
         assert_eq!(manager.allocations_snapshot(), vec![8123]);
         assert!(manager.unratified_claims().is_empty());
         assert_eq!(manager.local_key(8123), admitted.local_key);
+        Ok(())
+    }
+
+    /// A desired set built before a ratification was visible (a raft
+    /// follower's, or one computed just before) omits the claim it just
+    /// confirmed. That absence is not a stop: the claim stays until a desired
+    /// set has listed it, and only a later absence stops it.
+    #[test]
+    fn a_just_ratified_claim_survives_a_desired_set_that_predates_it() -> R<()> {
+        let temp_dir = TempDir::new()?;
+        let mut manager = manager_in(&temp_dir);
+        let admitted = manager.admit_claim(claim_record("clm_a", "user-42", Gate::Boot))?;
+        manager
+            .begin_task_allocation_gated(&provisional_payload(admitted.local_key), Gate::Boot)?;
+        let mut committed = provisional_payload(admitted.local_key);
+        committed.allocation_id = 8123;
+        manager.ratify_claim("clm_a", &committed)?;
+
+        manager.reconcile_allocations(&[]);
+        assert!(
+            manager.is_allocation_active(admitted.local_key),
+            "a stale desired set must not stop a claim it has never listed"
+        );
+        manager.reconcile_allocations(std::slice::from_ref(&committed));
+        assert!(manager.is_allocation_active(admitted.local_key));
+        manager.reconcile_allocations(&[]);
+        assert!(
+            !manager.terminating_ids().is_empty()
+                || !manager.is_allocation_active(admitted.local_key),
+            "once listed, an absence stops it"
+        );
         Ok(())
     }
 
