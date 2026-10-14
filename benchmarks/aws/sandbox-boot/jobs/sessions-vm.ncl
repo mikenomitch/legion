@@ -10,7 +10,9 @@
     runtime = "sandbox",
     config = {
       image = "public.ecr.aws/docker/library/alpine:3.20",
-      command = ["/bin/sh", "-c", "echo up; exec sleep 86400"],
+      # The guest's wall clock (kvm-clock, synced with the host at boot) and
+      # uptime when the command starts, for boot-times.py.
+      command = ["/bin/sh", "-c", "echo \"legion-bench-up $(date +%s.%N) $(cut -d' ' -f1 /proc/uptime)\"; exec sleep 86400"],
       vcpus = 1,
       hypervisor = "cloud-hypervisor",
     },
