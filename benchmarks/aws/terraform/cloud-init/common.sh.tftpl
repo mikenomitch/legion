@@ -47,16 +47,25 @@ UNIT
 systemctl daemon-reload
 systemctl enable --now node_exporter
 
-# Directories the campaign scripts install into.
-mkdir -p /opt/legion/bin /opt/legion/configs /var/lib/legion
+# Directories the campaign scripts install into, plus the store
+# directory of every system under test: Legion's, Nomad's data_dir, and
+# kubeadm's stacked etcd.
+STORE_DIRS="/var/lib/legion /var/lib/nomad /var/lib/etcd"
+mkdir -p /opt/legion/bin /opt/legion/configs $${STORE_DIRS}
 
-# Put the store on local NVMe when the instance type has any. Every raft
-# commit fsyncs, and on gp3 that fsync — not the scheduler — caps
-# control-plane throughput: the same code and topology measured ~86
-# heartbeats/sec on gp3 against ~2000/sec on NVMe
+# Put every system's store on local NVMe when the instance type has any.
+# Every raft or etcd commit fsyncs, and on gp3 that fsync — not the
+# scheduler — caps control-plane throughput: the same code and topology
+# measured ~86 heartbeats/sec on gp3 against ~2000/sec on NVMe
 # (experiments/heartbeat-commit-probe.sh, 2026-08-03). Instances without
 # instance storage (the spot workers, the loadgen) simply skip this and
-# keep using the EBS root, which is fine — neither runs a raft store.
+# keep using the EBS root, which is fine — neither runs a store.
+#
+# All three systems, not just Legion. Until 2026-10-14 only
+# /var/lib/legion was mounted here, so Nomad's raft log and etcd's WAL sat
+# on the gp3 root while Legion's sat on NVMe, and every cross-system cell
+# compared disks as much as schedulers (calls entry 18). Bind mounts keep
+# each system's stock path, so no config has to name the NVMe.
 #
 # Identified by model string rather than device name: the NVMe numbering
 # is not stable across instance types, and on Nitro the EBS root is also
@@ -68,11 +77,21 @@ if [ -n "$${INSTANCE_STORE}" ]; then
   # xfsprogs is not, and this must not add a package dependency to a
   # first-boot script whose failure aborts the whole cloud-init run.
   mkfs.ext4 -F -q "$${INSTANCE_STORE}"
-  mount -o noatime "$${INSTANCE_STORE}" /var/lib/legion
+  mkdir -p /mnt/store
+  mount -o noatime "$${INSTANCE_STORE}" /mnt/store
+  # A bind mount survives the `rm -rf /var/lib/<system>` in
+  # wipe-control-plane.sh: rm empties it and fails only on the mountpoint
+  # itself, so the next install lands on NVMe again.
+  for dir in $${STORE_DIRS}; do
+    mkdir -p "/mnt/store$${dir}"
+    mount --bind "/mnt/store$${dir}" "$${dir}"
+  done
+  # etcd refuses a data dir any wider than 0700.
+  chmod 700 /var/lib/etcd
   # Deliberately NOT added to /etc/fstab. The volume is ephemeral and
   # comes back blank (and unformatted) after any stop/start, so an fstab
   # entry would fail the next boot rather than help it. The rig recreates
   # instances instead of stopping them.
-  echo "instance store $${INSTANCE_STORE} mounted at /var/lib/legion" \
+  echo "instance store $${INSTANCE_STORE} mounted at /mnt/store, bound to $${STORE_DIRS}" \
     >/var/log/legion-instance-store.log
 fi

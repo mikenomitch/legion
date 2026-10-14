@@ -107,7 +107,7 @@ rsh "$LOADGEN_ADDR" "
     tls_config: { insecure_skip_verify: true }
     authorization: { credentials: $TOKEN }
     static_configs:
-      - targets: ['${CP_PRIVATE_IPS[0]}:6443']
+      - targets: ['${CP_PRIVATE_IPS[0]}:6443', '${CP_PRIVATE_IPS[1]}:6443', '${CP_PRIVATE_IPS[2]}:6443']
 SCRAPE
     curl -fsS -X POST http://localhost:9090/-/reload ||
         echo 'WARNING: Prometheus rejected the K8s scrape config; this campaign will lack scheduler phase metrics' >&2

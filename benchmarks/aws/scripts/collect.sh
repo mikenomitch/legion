@@ -165,6 +165,12 @@ snapshot liveness_tracked_nodes 'legion_liveness_tracked_nodes'
 snapshot liveness_loss_suppressed 'sum by (reason) (rate(legion_liveness_loss_suppressed_total[1m]))'
 snapshot grpc_p99 'histogram_quantile(0.99, sum by (method, le) (rate(legion_grpc_request_duration_seconds_bucket[1m])))'
 snapshot cpu 'sum by (instance_name, role) (rate(node_cpu_seconds_total{mode!="idle"}[1m]))'
+# `cpu` counts every non-idle mode, so a box waiting on its disk reads as
+# a box out of CPU. Both competitor leaders read 4.00/4 cores in the
+# 2026-10-10 cells and nothing archived could say which it was. The mode
+# split (iowait vs user/system) and the disk's busy fraction answer it.
+snapshot cpu_by_mode 'sum by (instance_name, role, mode) (rate(node_cpu_seconds_total{role="control-plane", mode!="idle"}[1m]))'
+snapshot disk_busy 'max by (instance_name, device) (rate(node_disk_io_time_seconds_total{role="control-plane"}[1m]))'
 # Memory is a first-class result alongside CPU — "what does the control
 # plane cost at 1k vs 10k nodes" needs both, and every cell is archived
 # at a known node count, so the scale steps are the load axis.
@@ -224,6 +230,23 @@ jq -n \
 
 snapshot nomad_plan 'rate(nomad_nomad_plan_apply_count[1m])'
 snapshot k8s_sched 'histogram_quantile(0.99, sum by (extension_point, le) (rate(scheduler_framework_extension_point_duration_seconds_bucket[1m])))'
+# The competitors' commit path, the counterpart of Legion's raft_* and
+# coalesce_* snapshots: etcd round trips as the apiserver sees them, the
+# apiserver's own flow-control throttling, and Nomad's raft commit time.
+snapshot k8s_etcd_p99 'histogram_quantile(0.99, sum by (operation, le) (rate(etcd_request_duration_seconds_bucket[1m])))'
+snapshot k8s_apf_rejected 'sum by (priority_level, reason) (rate(apiserver_flowcontrol_rejected_requests_total[1m]))'
+snapshot k8s_apf_wait_p99 'histogram_quantile(0.99, sum by (priority_level, le) (rate(apiserver_flowcontrol_request_wait_duration_seconds_bucket[1m])))'
+snapshot k8s_sched_attempts 'sum by (result) (rate(scheduler_schedule_attempts_total[1m]))'
+# Heartbeat load each control plane actually absorbed, so a throughput
+# number can be read against it: Legion's beats/s (the `heartbeats`
+# snapshot above), Nomad's Node.UpdateStatus calls, and K8s node-lease
+# renewals plus node status patches. Defaults differ on purpose (adaptive
+# ~2,500/s, Nomad ~50/s, K8s one lease per node per 10s); this records
+# what each paid rather than what each was configured for.
+snapshot nomad_heartbeats 'sum(rate(nomad_nomad_client_update_status_count[1m]))'
+snapshot k8s_heartbeats 'sum by (resource) (rate(apiserver_request_total{resource=~"leases|nodes", verb=~"update|patch"}[1m]))'
+snapshot nomad_raft_commit 'nomad_raft_commitTime{quantile="0.99"}'
+snapshot nomad_plan_submit 'nomad_nomad_plan_submit{quantile="0.99"}'
 
 # Fairness record: exactly what ran, where, at what version, with what
 # config. This file is what makes the numbers defensible.
