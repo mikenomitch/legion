@@ -2,9 +2,10 @@
 
 > **Judgement calls:** [`calls/datapath-performance-plan_calls.md`](../calls/datapath-performance-plan_calls.md)
 
-> **Status: IN EXECUTION.** Phases 1–4 are implemented on this branch.
-> Deferred, by name: kTLS for mesh hops (§6.5), multiplexed node-to-node
-> tunnels for L4 mesh traffic (§6.6), and the `legion netd` process split,
+> **Status: SHIPPED.** Phases 1–4, plus the per-byte metric fix found while
+> measuring (§6.4). Results are in §12.
+> Deferred, by name: kTLS for mesh hops (§6.6), multiplexed node-to-node
+> tunnels for L4 mesh traffic (§6.7), and the `legion netd` process split,
 > which stays with the [service-mesh plan](service-mesh-plan.md).
 
 This plan follows the network-handlers plan's §7.12 performance invariants
@@ -47,6 +48,17 @@ Smaller costs on the same path: every connection copied the endpoint list
 and the in-flight map, `least_conn` saw nothing in HTTP mode because HTTP
 mode never counted in-flight requests, and the §7.12 benchmarks did not
 exist, so none of this was measured or guarded.
+
+**Found while measuring, and the largest cost of all:** `CounterVec::inc_by`
+added its count as a loop of single atomic increments. The datapath reports
+each flow's bytes through it when the flow closes
+(`legion_net_bytes_total`), so a flow cost one atomic add per byte it
+carried. A 64 MiB transfer spun 67 million times on a worker thread at
+close. In `net_bench` that held the forwarder to about 0.1 GiB/s at about
+50 CPU-seconds per GiB, against 2–2.5 GiB/s and 1 CPU-second for a bare
+tokio proxy in the same harness, and it starved other connections on the
+same worker while it ran. Every L4 flow through the forwarder, ingress, and
+the gated egress proxy paid it.
 
 ## 2. Prior art
 
@@ -104,7 +116,7 @@ Tensorlake write-up. We reject eBPF connect-time rewriting for now (§6.6).
 - The §7.12 benchmarks, as Criterion groups.
 
 **Non-goals**
-- kTLS (§6.5), HTTP/2 between nodes, multiplexed L4 tunnels (§6.6).
+- kTLS (§6.6), HTTP/2 between nodes, multiplexed L4 tunnels (§6.7).
 - The `legion netd` process split.
 - A cluster-wide load view. Balancing stays per listener.
 
@@ -182,13 +194,18 @@ tokio's copy. A probe at first use keeps every flow on the copy on kernels
 that refuse splice. Pipe creation failing (out of descriptors) keeps that
 direction copying.
 
-### 6.4 Hot-path copies
+### 6.4 The per-byte metric
+
+`inc_by` becomes one atomic add. A regression test adds 2^40 in one call,
+which would not finish under the old loop.
+
+### 6.5 Hot-path copies
 
 The endpoint list is stored as `Arc<Vec<Endpoint>>`. The first pick reads it
 in place, and only a failover copies it. Picks read the in-flight map under
 its lock instead of cloning it.
 
-### 6.5 Deferred: kTLS for mesh hops
+### 6.6 Deferred: kTLS for mesh hops
 
 kTLS would let mesh hops splice too. It needs a new dependency (or a
 hand-rolled handler for TLS 1.3 control records on the receive side),
@@ -196,7 +213,7 @@ the kernel `tls` module, and a probe with a fallback. The measured gain
 elsewhere is about 20% of bulk throughput, and it does nothing for
 connection setup, which pooling addresses. Deferred.
 
-### 6.6 Deferred: multiplexed L4 tunnels, connect-time rewriting
+### 6.7 Deferred: multiplexed L4 tunnels, connect-time rewriting
 
 L4 mesh connections still pay a TLS handshake each. ztunnel avoids it with
 HBONE, a pooled HTTP/2 tunnel per node pair. That is a wire-format change
@@ -217,7 +234,7 @@ per-connection accounting and policy; not now.
    `l4_throughput`, `http_rr`, `slow_endpoint`, `balancer_pick`.
 2. **`least_latency` and outcome reporting.** Default flip, HTTP-mode
    in-flight counting.
-3. **Splice and hot-path copies.**
+3. **Splice, the per-byte metric, and hot-path copies.**
 4. **HTTP-mode pooling.**
 
 Each ships alone. Phase 1 lands first so every later phase has a before and
@@ -247,3 +264,23 @@ set `balance = "round_robin"`. Nothing else changes on the wire.
 - `l4_throughput` through the forwarder improves on Linux.
 - `slow_endpoint` under `least_latency` approaches the fast backends'
   latency.
+
+## 12. Results
+
+`net_bench` on Linux (loopback, an OrbStack VM on a shared and busy host),
+base `89229706` against this change, two interleaved A/B rounds:
+
+| | Before | After |
+|---|---|---|
+| L4 bulk throughput through the forwarder | 80–83 MiB/s | 4.1–4.9 GiB/s |
+| Forwarder CPU per GiB, minus direct | 49–51 s | 0.09–0.11 s |
+| A bare tokio proxy in the same harness | 2.0 GiB/s, 0.27–0.37 s | same |
+| Mean latency, one of three backends 2 ms slower (HTTP / L4) | 1.86 / 1.83–1.91 ms | 62–73 / 98–114 µs |
+| `l4_rr`, `l4_conn_rr` | | unchanged within noise |
+
+Most of the throughput gain is the metric fix. `splice` is what puts the
+forwarder ahead of a bare userspace proxy, at about a third of its CPU per
+byte. On loopback, `http_rr` is too noisy to quote (its own `direct` row
+swung between 28 and 106µs across runs), and pooling's real win, a TCP and
+mTLS handshake saved per request on a real network, is invisible there.
+

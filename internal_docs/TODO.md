@@ -3825,11 +3825,11 @@ Datapath performance). Deferred, by name:
       termination) splice too. Needs a dependency or a hand-rolled TLS 1.3
       control-record handler, the kernel `tls` module, and a probe with a
       fallback; about 20% of bulk throughput by Tensorlake's numbers
-      (plan §6.5, [calls #3](calls/datapath-performance-plan_calls.md)).
+      (plan §6.6, [calls #3](calls/datapath-performance-plan_calls.md)).
 - [ ] **Multiplexed node-to-node tunnels for L4 mesh traffic.** Each L4
       connection to a mesh endpoint still pays its own mTLS handshake;
       ztunnel avoids that with pooled HTTP/2 CONNECT (HBONE) tunnels. A
-      wire-format change for the mesh, so it needs its own plan (plan §6.6).
+      wire-format change for the mesh, so it needs its own plan (plan §6.7).
 - [ ] **HTTP/2 between nodes in HTTP mode**, so one pooled connection
       carries concurrent requests (Linkerd's transparent upgrade). Pooling
       today reuses HTTP/1.1 connections one request at a time.
@@ -5545,6 +5545,10 @@ docs: [task-runtime-plugins.md](../docs/task-runtime-plugins.md)
       ingress, the gated egress proxy, and the gateway (copy first, splice
       once a read fills the buffer), with a kernel probe and a copy fallback.
 - [x] No per-connection copies of the endpoint list or in-flight map.
+- [x] `CounterVec::inc_by` is one atomic add. It looped single increments,
+      so `legion_net_bytes_total` cost every L4 flow one atomic per byte at
+      close (about 0.1 GiB/s and 50 CPU-s/GiB through the forwarder in
+      `net_bench`).
 - [x] `benchmarks/micro/net_bench.rs` (network-handlers plan §7.12).
 
 ## Stateful workloads & volumes

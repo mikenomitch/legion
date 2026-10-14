@@ -146,8 +146,14 @@ What they measure:
   - `l4_conn_rr`: a new connection per request. The backend closes after
     replying, so client ports do not pile up in `TIME_WAIT`.
   - `l4_throughput`: one 64 MiB one-way transfer per iteration. On Linux the
-    forwarder splices; on macOS it copies, so this group is only meaningful
-    on the platform you care about.
+    forwarder splices bulk transfers; on macOS it copies, so this group is
+    only meaningful on the platform you care about. A `plain_proxy` row (a
+    bare tokio accept-dial-copy proxy) sits between `direct` and
+    `forwarder` as the floor for any userspace hop in the same harness.
+    After the group, `l4_cpu` lines print CPU-seconds per GiB moved for
+    each row. On a busy or virtualized host, wall-clock throughput through
+    extra threads mostly measures the scheduler; CPU per byte holds up
+    better, and the forwarder's own cost is its gap to `direct`.
   - `http_rr`: HTTP/1.1 requests on one kept-open client connection through
     HTTP mode, which shows whether upstream connections are reused.
   - `slow_endpoint`: three backends, one 2 ms slower, once per balancing
