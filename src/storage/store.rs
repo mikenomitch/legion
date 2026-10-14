@@ -28685,7 +28685,12 @@ mod tests {
         // A new config of the same task: every live instance is unbound for
         // it, so its placements bind them again, oldest first, while the old
         // config's allocations still exist.
-        let new_config = submit_job(&store, job_id, vec![stateful_keyed_task("sandbox", false)])?;
+        // (An identical resubmit is `Unchanged`, so the new config differs.)
+        let updated = TaskConfig {
+            resources: json!({ "memory": 64 }),
+            ..stateful_keyed_task("sandbox", false)
+        };
+        let new_config = submit_job(&store, job_id, vec![updated])?;
         let new_task = task_id_for_config(&store, "sandbox", &new_config)?;
         assert_ne!(new_task, old_task);
         let rebound = store.place_alloc("node-a", new_task)?;
