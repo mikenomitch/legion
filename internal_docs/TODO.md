@@ -1930,6 +1930,55 @@ How to use it:
 
 Plans: [task-runtime-plugins](../docs/task-runtime-plugins.md).
 
+- [ ] **Task start critical path, deferred phases** (found while measuring
+      the node's start path; [plan](plans/task-start-critical-path-plan.md)
+      phases 4 and 5, [calls 4](calls/task-start-critical-path-plan_calls.md)):
+  - [ ] Start reports wait for a heartbeat. A health transition (first
+        `healthy`, a failure) reaches the manager on the next beat, about 1 s
+        at the default 2 s cadence and up to 21 s on a large fleet's adaptive
+        cadence. Rollouts and service discovery wait on it. Carry it on a
+        worker-to-manager `StreamWork` report frame rather than waking the
+        heartbeat per start.
+  - [ ] A streamed gated placement gets its datapath a beat late. It starts
+        as soon as its delta lands (`daemon::launch_streamed_work`), but its
+        listeners, network policy, upstream endpoints, and credentials all
+        come from the next heartbeat (`heartbeat_tick` → `apply_upstreams`,
+        `apply_net_policies`). [task-runtime-sandbox.md](../docs/task-runtime-sandbox.md#gated-networking)
+        says the host end is bound before boot, which holds only on the
+        heartbeat path. Binding listeners from the mirror alone is not enough,
+        because the policy is what lets traffic through: carry the policy
+        assignment on the delta.
+- [ ] **A `net_capture_unavailable` health sticks on a task without checks.**
+      `heartbeat_tick` sets it when a gated allocation's capture is not ready,
+      and nothing sets health back when capture recovers: only the health
+      monitor writes healthy, and a task without checks is written healthy
+      once, at start. The namespace-ordering fix removed the common trigger
+      (the first beat binding before the namespace existed), but a transient
+      bind failure still leaves the task reported unhealthy.
+- [ ] **A failed `boot` check at start counts at once.** The first check runs
+      the moment the task starts (`tokio::time::interval`'s first tick), and
+      `boot_grace_time` only applies to `health` checks, so a `boot` check with
+      `unhealthy_after_count = 1` (as in `configs/jobs/maximal.ncl`) marks the
+      task unhealthy before it could have bound its port
+      (`src/worker/task_health.rs`, the failure branch of the monitor loop).
+      Give boot checks a grace, or start their cadence one `every` late now
+      that startup probes catch the early pass.
+- [ ] **The worker state file is rewritten whole on every start.**
+      `persist_state` serializes every allocation (pretty JSON with full task
+      configs), reads `/proc` for each pid, and fsyncs, under the task-manager
+      lock, on each start, stop, and restart (`finish_unlocked_launch` →
+      `persist_state_unless_provisional`). The cost grows with the node's
+      allocation count, so a burst of starts on a dense node is quadratic.
+      Sessions use `sessions.db` and skip it. Group-commit it off the lock, or
+      keep a record per allocation. `legion_task_start_stage_seconds{stage="register"}`
+      shows when it matters.
+- [ ] **TAP sandboxes shell out to `ip` on the start path.** A fresh TAP is
+      `ip tuntap add`, `ip link set master`, `ip link set up`, and the `boot`
+      gate adds a `set down` and a `set up` (`sandbox_checkpoint::HostTaps`,
+      `sandbox::set_tap_link`). Each is a fork and exec. The ioctls
+      (`TUNSETIFF`/`TUNSETPERSIST`, `SIOCBRADDIF`, `SIOCSIFFLAGS`) would do,
+      and the code already uses two of them. Worth it if the `network` stage
+      shows up on a real KVM node.
 - [x] **Task process supervision** — the worker reaps task children, applies a
       new `restart` policy (`always | onFailure | never`, `delay`,
       `successExitCodes`) sharing one budget with health-check restarts, and
@@ -4747,6 +4796,21 @@ docs: [scheduler-and-eval-loop.md](../docs/scheduler-and-eval-loop.md), [jobs-ta
 docs: [task-runtime-plugins.md](../docs/task-runtime-plugins.md)
 
 - [x] A framework for task-runtime plugins
+- [x] **Startup probing for health checks** (2026-10-13). A `tcp` or `http`
+      check that has not passed since its task (re)started is also probed
+      between `every` ticks (100 ms doubling to 1 s), and only a pass counts,
+      so a task turns healthy within about a second of its port opening
+      instead of a whole `every` (10 s by default) later. Failure semantics
+      are unchanged — [plan](plans/task-start-critical-path-plan.md) ·
+      [calls](calls/task-start-critical-path-plan_calls.md) ·
+      [docs](../docs/jobs-tasks-and-scheduling.md#startup-probing)
+- [x] **Gated namespaces exist before the listeners inside them** (2026-10-13).
+      `heartbeat_tick` created a gated container's namespace after it tried
+      to bind its proxy, resolver, and upstream listeners inside it, so the
+      task started with no network and its next beat reported
+      `net_capture_unavailable`. The namespaces are now created first —
+      [plan](plans/task-start-critical-path-plan.md) §3. Needs Linux to
+      exercise; compile-checked only.
 - [x] **microVM sandboxes stop cleanly, so volume writes survive a stop**
       (P0 from the 2026-10-12 AWS spot check). The guest agent signals init
       with `stop.signal`, init flushes, forwards it, unmounts the volumes,
@@ -5320,6 +5384,14 @@ docs: [task-runtime-plugins.md](../docs/task-runtime-plugins.md)
 - [x] OTLP trace export for Legion's own spans ([src/otel.rs](../src/otel.rs))
 - [x] Event stream: scheduler events as history and live tail (`ListEvents`,
       `StreamEvents`, CLI, UI)
+- [x] **Task start stage timings** (2026-10-13) —
+      `legion_task_start_stage_seconds{runtime,stage}` on the worker
+      (`staging`, `volumes`, `prepare`, `start`/`restore`, `register`,
+      `total`, `health`, and the sandbox's `network`, `image`, `root_disk`,
+      `vmm_config`, `vmm_spawn`), plus one `Task allocation started` log line
+      per start with the breakdown — [plan](plans/task-start-critical-path-plan.md) ·
+      [calls](calls/task-start-critical-path-plan_calls.md) ·
+      [docs](../docs/metrics.md). Not yet run on a KVM node.
 - [x] Simulated fleets feed the `legion_worker_*` families (2026-08-02) —
       the sim fleet starts the shared worker telemetry listener (via
       `daemon::start_worker_telemetry`, so the real and simulated paths

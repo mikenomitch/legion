@@ -14,6 +14,7 @@ use crate::worker::claims::{ClaimRecord, ClaimTable, LocalLedger};
 use crate::worker::log_sink::{default_sinks, LogResource, LogSink};
 use crate::worker::logs::{read_allocation_logs, CapturedStream};
 use crate::worker::resources::NodeResourceGovernor;
+use crate::worker::start_timing::{stage as start_stage, StartTimings};
 use crate::worker::state::{
     pid_is_running, process_start_time, PersistedAllocation, PersistedStop, WorkerStateStore,
 };
@@ -528,16 +529,27 @@ pub struct UnlockedLaunch {
     /// When a session's process started, read by [`Self::run`] for its row
     /// in the session log.
     pid_start_time: Option<u64>,
+    /// When the runtime calls returned, so the wait for the lock and the
+    /// registration after it are timed as the `register` stage.
+    runtime_returned: Option<std::time::Instant>,
 }
 
 impl UnlockedLaunch {
     /// The slow half: mount, consume artifacts, `prepare`, `start`. Called
     /// with no lock held.
     fn run(&mut self) -> R<()> {
+        let result = self.run_stages();
+        self.runtime_returned = Some(std::time::Instant::now());
+        result
+    }
+
+    fn run_stages(&mut self) -> R<()> {
         let plugin = self.plugin.task_plugin();
+        let runtime = self.task.runtime.clone();
         // Storage first: a task must never observe a missing or empty data
         // directory because its volume was still being mounted.
         if !self.volume_specs.is_empty() {
+            let started = std::time::Instant::now();
             self.volumes.unmount_for_allocation(self.allocation.id);
             let volume_instance =
                 crate::worker::volumes::instance_ref_from_task(&self.allocation, &self.task);
@@ -547,7 +559,11 @@ impl UnlockedLaunch {
                 &self.volume_specs,
             )?;
             apply_mounted_volumes(&mut self.instance, &self.task, &mounted);
+            self.instance
+                .start_timings
+                .record(&runtime, start_stage::VOLUMES, started.elapsed());
         }
+        let prepare_started = std::time::Instant::now();
         let staged = self.instance.staged_artifacts.clone();
         for artifact in &staged {
             plugin
@@ -569,12 +585,22 @@ impl UnlockedLaunch {
         if self.gate == Gate::Boot {
             plugin.set_network_gate(&self.allocation, &self.task, &mut self.instance, false)?;
         }
+        self.instance.start_timings.record(
+            &runtime,
+            start_stage::PREPARE,
+            prepare_started.elapsed(),
+        );
         info!(
             allocation_id = self.allocation.id,
             task_name = %self.task.name,
             "Starting task allocation"
         );
-        plugin.start(&self.allocation, &self.task, &mut self.instance)?;
+        let start_started = std::time::Instant::now();
+        let started = plugin.start(&self.allocation, &self.task, &mut self.instance);
+        self.instance
+            .start_timings
+            .record(&runtime, start_stage::START, start_started.elapsed());
+        started?;
         if self.claim_id.is_some() {
             // A session's row in the session log pins its process by pid and
             // start time, so a restarted worker re-adopts the right process.
@@ -586,6 +612,7 @@ impl UnlockedLaunch {
             // its process exists (a microVM boots for a few hundred ms after its
             // VMM spawns). Waiting here also keeps the launch slot until then, so
             // `edgeBoot.launchConcurrency` bounds the boots a node runs at once.
+            let ready_started = std::time::Instant::now();
             if let Err(err) = plugin.wait_ready(
                 &self.allocation,
                 &self.task,
@@ -599,6 +626,11 @@ impl UnlockedLaunch {
                     "Session started but did not report ready; running it anyway"
                 );
             }
+            self.instance.start_timings.record(
+                &runtime,
+                start_stage::READY,
+                ready_started.elapsed(),
+            );
         }
         Ok(())
     }
@@ -2171,7 +2203,25 @@ impl WorkerTaskManager {
         instance.alloc_dir = Some(alloc_dir);
         instance.device_link_root = Some(self.device_link_root.clone());
         instance.task_dir = Some(task_dir);
+        // The node has the work from here on: every stage of its start is
+        // timed against this instant.
+        instance.start_timings = StartTimings::begin();
         Ok(instance)
+    }
+
+    /// Record a stage of an allocation's start that ran away from its
+    /// instance (artifact staging, on its own thread).
+    fn record_start_stage(
+        &mut self,
+        allocation_id: i64,
+        runtime: &str,
+        stage: &'static str,
+        elapsed: std::time::Duration,
+    ) {
+        match self.instances.get_mut(&allocation_id) {
+            Some(instance) => instance.start_timings.record(runtime, stage, elapsed),
+            None => crate::worker::start_timing::observe(runtime, stage, elapsed),
+        }
     }
 
     pub fn record_failure(&mut self, allocation_id: i64, reason: impl Into<String>) {
@@ -3097,6 +3147,7 @@ impl WorkerTaskManager {
         allocation: &Allocation,
         task: &TaskConfig,
     ) -> R<()> {
+        let volumes_started = std::time::Instant::now();
         // A restore rolls the instance volume back before anything mounts
         // it, so the task never sees the state it is being rolled back from.
         self.restore_allocation_volumes(allocation)?;
@@ -3106,6 +3157,7 @@ impl WorkerTaskManager {
         // fails the allocation, which is the honest outcome — the manager
         // reschedules and the operator sees the driver's error.
         self.mount_allocation_volumes(allocation, task)?;
+        let volumes_elapsed = volumes_started.elapsed();
 
         // Resource placement next, and before `prepare()`: a task must never
         // observe its CPU/memory limits arriving after it started. Runtimes
@@ -3144,6 +3196,16 @@ impl WorkerTaskManager {
             .context("Task instance missing")?;
         instance.log_dir = Some(log_dir);
         instance.resource_assignment = assignment;
+        if self
+            .volume_specs
+            .get(&allocation.id)
+            .is_some_and(|specs| !specs.is_empty())
+        {
+            instance
+                .start_timings
+                .record(&task.runtime, start_stage::VOLUMES, volumes_elapsed);
+        }
+        let prepare_started = std::time::Instant::now();
         // Launch ready for memory checkpoints when the task asks for them
         // and the runtime can take them here (a sandbox on a real VMM).
         instance.checkpoint_launch = crate::structs::snapshot::memory_checkpoint_ask(task)
@@ -3170,6 +3232,11 @@ impl WorkerTaskManager {
             "Preparing task allocation"
         );
         plugin.prepare(allocation, task, instance)?;
+        instance.start_timings.record(
+            &task.runtime,
+            start_stage::PREPARE,
+            prepare_started.elapsed(),
+        );
 
         self.allocations.insert(allocation.id, allocation.clone());
         self.task_configs.insert(allocation.id, task.clone());
@@ -3220,6 +3287,7 @@ impl WorkerTaskManager {
             self.stderr_marks.insert(allocation.id, stderr_len(log_dir));
         }
 
+        let runtime_started = std::time::Instant::now();
         if let Some(restore) = self.checkpoints.restores.get(&allocation.id).cloned() {
             let started = std::time::Instant::now();
             let restored = Self::restore_from_snapshot(
@@ -3232,6 +3300,11 @@ impl WorkerTaskManager {
             );
             match restored {
                 Ok(()) => {
+                    instance.start_timings.record(
+                        &task.runtime,
+                        start_stage::RESTORE,
+                        started.elapsed(),
+                    );
                     self.checkpoints
                         .record_restore(allocation.id, true, String::new(), started)
                 }
@@ -3248,8 +3321,15 @@ impl WorkerTaskManager {
                 task_name = %task.name,
                 "Starting task allocation"
             );
-            plugin.start(allocation, task, instance)?;
+            let started = plugin.start(allocation, task, instance);
+            instance.start_timings.record(
+                &task.runtime,
+                start_stage::START,
+                runtime_started.elapsed(),
+            );
+            started?;
         }
+        let runtime_returned = std::time::Instant::now();
 
         let supervised = plugin.supervises_process();
 
@@ -3258,6 +3338,16 @@ impl WorkerTaskManager {
         self.set_allocation_health(allocation.id, false, "starting");
         self.notify_log_sinks_started(allocation, task);
         self.persist_state_unless_provisional(allocation.id);
+        if let Some(instance) = self.instances.get_mut(&allocation.id) {
+            instance.start_timings.record(
+                &task.runtime,
+                start_stage::REGISTER,
+                runtime_returned.elapsed(),
+            );
+            instance
+                .start_timings
+                .finish(allocation.id, &task.name, &task.runtime);
+        }
 
         // A batch task on a runtime that tracks no process can never report
         // an exit, and the manager is now waiting for one before it will call
@@ -4348,6 +4438,7 @@ impl WorkerTaskManager {
                 .cloned()
                 .unwrap_or_default(),
             pid_start_time: None,
+            runtime_returned: None,
         })
     }
 
@@ -4371,6 +4462,7 @@ impl WorkerTaskManager {
             instance,
             plugin,
             pid_start_time,
+            runtime_returned,
             ..
         } = launch;
         if let (Some(pid), Some(started)) = (instance.pid, pid_start_time) {
@@ -4393,6 +4485,18 @@ impl WorkerTaskManager {
         self.set_allocation_health(allocation_id, false, "starting");
         self.notify_log_sinks_started(&allocation, &task);
         self.persist_state_unless_provisional(allocation_id);
+        if let Some(instance) = self.instances.get_mut(&allocation_id) {
+            if let Some(returned) = runtime_returned {
+                instance.start_timings.record(
+                    &task.runtime,
+                    start_stage::REGISTER,
+                    returned.elapsed(),
+                );
+            }
+            instance
+                .start_timings
+                .finish(allocation_id, &task.name, &task.runtime);
+        }
         // See `start_registered_allocation`: a batch task on a runtime that
         // tracks no process reports its completion at start.
         if !plugin.task_plugin().supervises_process()
@@ -4583,12 +4687,32 @@ impl WorkerTaskManager {
         if let Some(log_dir) = instance.log_dir.as_deref() {
             self.stderr_marks.insert(allocation_id, stderr_len(log_dir));
         }
-        plugin.start(allocation, task, instance)?;
+        // A restart is a start of its own, timed and logged as one.
+        instance.start_timings = StartTimings::begin();
+        let runtime = task.runtime.clone();
+        let task_name = task.name.clone();
+        let start_started = std::time::Instant::now();
+        let started = plugin.start(allocation, task, instance);
+        instance
+            .start_timings
+            .record(&runtime, start_stage::START, start_started.elapsed());
+        started?;
+        let runtime_returned = std::time::Instant::now();
         // A relaunched process is a live process again: drop the terminal flag
         // so the supervisor resumes watching this allocation.
         self.terminated.remove(&allocation_id);
         self.set_allocation_health(allocation_id, false, "restarting");
         self.persist_state();
+        if let Some(instance) = self.instances.get_mut(&allocation_id) {
+            instance.start_timings.record(
+                &runtime,
+                start_stage::REGISTER,
+                runtime_returned.elapsed(),
+            );
+            instance
+                .start_timings
+                .finish(allocation_id, &task_name, &runtime);
+        }
         Ok(())
     }
 
@@ -5654,14 +5778,21 @@ fn spawn_provisional_staging_thread(
         .name(format!("provisional-staging-{allocation_id}"))
         .spawn(move || {
             let manager = manager_for_thread;
+            let staging_started = std::time::Instant::now();
             let result = job.stage();
+            let staging_elapsed = staging_started.elapsed();
             // See `spawn_staging_thread`: the health monitor is a tokio task.
             let _runtime = enter_runtime(runtime.as_ref());
 
             let started = {
                 let mut guard = manager.lock().expect("task manager");
                 match guard.finish_staging(allocation_id, job.generation) {
-                    StagingVerdict::Current => {}
+                    StagingVerdict::Current => guard.record_start_stage(
+                        allocation_id,
+                        &job.task.runtime,
+                        start_stage::STAGING,
+                        staging_elapsed,
+                    ),
                     StagingVerdict::Superseded => {
                         debug!(allocation_id, "Claim re-dispatched while staging artifacts");
                         return;
@@ -5783,7 +5914,9 @@ fn spawn_staging_thread(manager: Arc<Mutex<WorkerTaskManager>>, job: StagingJob)
         .name(format!("artifact-staging-{allocation_id}"))
         .spawn(move || {
             let manager = manager_for_thread;
+            let staging_started = std::time::Instant::now();
             let result = job.stage();
+            let staging_elapsed = staging_started.elapsed();
             // Staging is plain blocking work. What follows is not: the start
             // hands the allocation to its health monitor, a tokio task.
             let _runtime = enter_runtime(runtime.as_ref());
@@ -5792,7 +5925,12 @@ fn spawn_staging_thread(manager: Arc<Mutex<WorkerTaskManager>>, job: StagingJob)
             let launch = {
                 let mut guard = manager.lock().expect("task manager");
                 match guard.finish_staging(allocation_id, job.generation) {
-                    StagingVerdict::Current => {}
+                    StagingVerdict::Current => guard.record_start_stage(
+                        allocation_id,
+                        &job.task.runtime,
+                        start_stage::STAGING,
+                        staging_elapsed,
+                    ),
                     StagingVerdict::Superseded => {
                         // A re-dispatch with a new payload restaged it; that
                         // thread starts it (and owns any restore pins).
@@ -7641,7 +7779,12 @@ mod tests {
             thread::sleep(Duration::from_millis(10));
         }
         let mut guard = manager.lock().expect("task manager");
-        assert!(guard.launching.is_empty(), "the launch settled");
+        // The session's own launch settled. (The envelope's, begun above and
+        // never completed by this test, stays registered.)
+        assert!(
+            !guard.launching.contains_key(&admitted.local_key),
+            "the launch settled"
+        );
         let instance = &guard.instances[&admitted.local_key];
         assert!(instance.pid.is_some(), "the session's process runs");
         assert!(
@@ -10854,6 +10997,74 @@ mod tests {
             "{}",
             failure.reason
         );
+        Ok(())
+    }
+
+    /// Startup probing: a check that has not passed yet is retried between
+    /// its `every` ticks, so a task whose port opens a moment after it starts
+    /// turns healthy then, not a whole `every` (10s by default) later. The
+    /// probes' failures are not counted: past the boot grace, with
+    /// `unhealthyAfterCount = 1`, a counted probe failure would fail it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_check_turns_healthy_when_the_port_opens_not_at_its_next_tick() -> R<()> {
+        let temp_dir = TempDir::new()?;
+        let manager = Arc::new(Mutex::new(manager_in(&temp_dir)));
+        let port = std::net::TcpListener::bind("127.0.0.1:0")?
+            .local_addr()?
+            .port();
+        let mut task = TaskConfig {
+            config: json!({ "command": ["sleep", "30"] }),
+            checks: vec![TaskCheck {
+                check_type: TaskCheckType::Health,
+                name: Some("port".into()),
+                kind: TaskCheckKind::Tcp,
+                command: None,
+                path: None,
+                port: Some(crate::structs::network::CheckPort::Number(port)),
+                every: Duration::from_secs(30),
+                timeout: Duration::from_secs(20),
+                unhealthy_after_count: 1,
+                boot_grace_time: Some(Duration::from_millis(500)),
+                unhealthy_after_count_timespan: None,
+            }],
+            ..TaskConfig::new("late-listener", "exec")
+        };
+        task.on_unhealthy.restart_count = 0;
+        let payload =
+            crate::manager::dispatcher::build_task_allocation(&task, &alloc(), None, &[])?;
+        let allocation_id = payload.allocation_id;
+        let launcher = manager.clone();
+        tokio::task::spawn_blocking(move || launch_task_allocation(&launcher, &payload)).await??;
+
+        // The port opens well past the boot grace, so the probes that ran
+        // before it all failed, uncounted.
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        let opened = std::time::Instant::now();
+        let _listener = std::net::TcpListener::bind(("127.0.0.1", port))?;
+        let deadline = opened + Duration::from_secs(5);
+        loop {
+            let health = manager
+                .lock()
+                .unwrap()
+                .allocation_health_snapshot()
+                .into_iter()
+                .find(|health| health.allocation_id == allocation_id);
+            if health.as_ref().is_some_and(|health| health.healthy) {
+                break;
+            }
+            assert!(
+                manager.lock().unwrap().drain_failures().is_empty(),
+                "a failed startup probe was counted against the task"
+            );
+            assert!(
+                std::time::Instant::now() < deadline,
+                "never turned healthy after its port opened: {health:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        // Probes back off to at most a second apart, far inside `every`.
+        assert!(opened.elapsed() < Duration::from_secs(3));
+        manager.lock().unwrap().stop_allocation(allocation_id)?;
         Ok(())
     }
 

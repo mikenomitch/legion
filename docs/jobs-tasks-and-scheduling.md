@@ -433,6 +433,33 @@ against a dead process can only fail, and the exit is the real cause, so the
 supervisor's verdict is the one the allocation reports. After the supervisor
 relaunches the task, the checks start over with a fresh boot grace window.
 
+#### Startup probing
+
+A check runs once when the task starts and then every `every` (10s by
+default). On that cadence alone, a task whose port opens half a second after
+it starts would fail its first check and report healthy only on the next one,
+10 seconds later. Until a check first passes after a start or a restart, the
+worker also probes it between ticks, 100ms after the start and then on a
+doubling backoff capped at one second (or at `every`, if that is shorter).
+The first passing probe counts as a passing check, so the allocation turns
+healthy within about a second of its port opening.
+
+- A failed probe is never counted. Failures count only on the `every`
+  cadence, exactly as without probing, so `unhealthy_after_count`,
+  `boot_grace_time`, and `unhealthy_after_count_timespan` mean what they
+  did.
+- A probe gives up after 1 second, or after the check's `timeout` if that is
+  shorter. An endpoint slower than that still passes, on the cadence check
+  with the full `timeout`.
+- Only `tcp` and `http` checks are probed. An `exec` check runs a host
+  command whose cost Legion can't know, so it keeps its cadence. A readiness
+  check never changes the allocation's health, so it isn't probed either.
+- A `health` check waits for the `boot` checks, probes included.
+- Once a check passes, probing stops until the task restarts.
+
+`legion_task_start_stage_seconds{stage="health"}` ([metrics.md](metrics.md))
+records how long each start took to its first passing check.
+
 ### Manager-side move logic
 
 The worker reports failed allocations in its heartbeat (from a failed health

@@ -268,6 +268,16 @@ Limitations:
 - **The cache is node-local.** A new node, or one that evicted the base,
   builds on its first start of the image.
 
+**Every step is timed.** The worker records each step of a sandbox start in
+`legion_task_start_stage_seconds{runtime="sandbox",stage}`: `network` (the TAP
+and the address lease), `image` (the kernel and the image's layout),
+`root_disk` (the fingerprint, then a reuse or a build), `vmm_config`, and
+`vmm_spawn`, inside the worker's own `staging`, `prepare`, `start`,
+`register`, and `total`. The guest's boot falls inside `health`, which ends at
+the first passing check. Each start also logs one `Task allocation started`
+line with the same breakdown. See [metrics.md](metrics.md) for the stage
+table.
+
 ### The guest agent
 
 Every microVM runs a small Legion program next to the workload, copied into

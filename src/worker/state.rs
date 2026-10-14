@@ -636,3 +636,88 @@ mod tests {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod persist_cost_probe {
+    // TEMPORARY measurement, removed before commit.
+    use super::*;
+    use crate::structs::{Allocation, TaskConfig};
+
+    #[test]
+    #[ignore]
+    fn persist_cost_by_allocation_count() -> R<()> {
+        let temp = tempfile::TempDir::new()?;
+        let store = WorkerStateStore::new(temp.path().join("worker_state.json"));
+        let mut env = serde_json::Map::new();
+        for i in 0..12 {
+            env.insert(
+                format!("APP_SETTING_{i}"),
+                serde_json::json!(format!("value-{i}-{}", "x".repeat(24))),
+            );
+        }
+        let task = TaskConfig {
+            config: serde_json::json!({
+                "image": "ghcr.io/acme/agent-base:2026-10",
+                "command": ["/usr/local/bin/harness", "--listen", "0.0.0.0:8080"],
+                "env": env,
+                "vcpus": 2,
+                "memoryMib": 1024,
+            }),
+            ..TaskConfig::new("box", "sandbox")
+        };
+        for n in [10usize, 100, 1000, 5000] {
+            let records: Vec<PersistedAllocation> = (0..n)
+                .map(|i| PersistedAllocation {
+                    allocation: Allocation {
+                        id: i as i64,
+                        status: "running".into(),
+                        resources: serde_json::json!({"cpu": 1000, "memory": 1024}),
+                        node_id: "node-1".into(),
+                        job_config_id: "job-1-config-abcdef".into(),
+                        task_config_id: 1,
+                        job_id: "sandboxes".into(),
+                        instance_id: Some(format!("inst-{i:012}")),
+                        network: None,
+                    },
+                    task: task.clone(),
+                    pid: Some(std::process::id()),
+                    pid_start_time: Some(1_700_000_000),
+                    self_terminate_after_secs: None,
+                    volumes: Vec::new(),
+                    external_id: None,
+                    in_envelope: false,
+                    resource_assignment: None,
+                    stopping: None,
+                })
+                .collect();
+            let bytes = serde_json::to_string_pretty(&records)?.len();
+            let rounds = if n >= 5000 { 5 } else { 20 };
+            let started = std::time::Instant::now();
+            for _ in 0..rounds {
+                store.save(&records)?;
+            }
+            let per = started.elapsed() / rounds;
+            let started = std::time::Instant::now();
+            for _ in 0..rounds {
+                let _ = serde_json::to_string_pretty(&records)?;
+            }
+            let ser = started.elapsed() / rounds;
+            let started = std::time::Instant::now();
+            for _ in 0..rounds {
+                for r in &records {
+                    let _ = process_start_time(r.pid.unwrap());
+                }
+            }
+            let proc_reads = started.elapsed() / rounds;
+            let started = std::time::Instant::now();
+            for _ in 0..rounds {
+                let _ = records.clone();
+            }
+            let clones = started.elapsed() / rounds;
+            eprintln!(
+                "n={n} bytes={bytes} save={per:?} serialize={ser:?} start_time_reads={proc_reads:?} clone={clones:?}"
+            );
+        }
+        Ok(())
+    }
+}

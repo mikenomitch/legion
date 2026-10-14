@@ -431,6 +431,10 @@ pub struct TaskInstance {
     /// nodes put them in the same place. `None` (tests, dev runtimes) puts
     /// them beside the allocation directories.
     pub device_link_root: Option<PathBuf>,
+    /// The stages this start has been through, for the start log line and
+    /// `legion_task_start_stage_seconds` (`crate::worker::start_timing`).
+    /// Runtimes record their own sub-stages of `start` here.
+    pub start_timings: crate::worker::start_timing::StartTimings,
 }
 
 impl TaskInstance {

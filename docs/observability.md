@@ -75,6 +75,16 @@ The system records operational health in these places:
 
 The UI rollout and node views read from these.
 
+### Slow task starts
+
+When a start is slow, the worker says where the time went. Each start logs one
+`Task allocation started` line with the time each stage took (artifact
+staging, volume mounts, `prepare`, the runtime's `start` and its own steps,
+registration), and the worker's opt-in `/metrics` listener exports the same
+stages as `legion_task_start_stage_seconds{runtime,stage}`, plus `health`, the
+time to the first passing check. See [metrics.md](metrics.md) for the stage
+table.
+
 ## What Exists in the UI
 
 - Node health summaries inferred from health check payloads.

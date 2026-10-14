@@ -2505,6 +2505,20 @@ async fn heartbeat_tick(
             .expect("task manager")
             .alloc_root()
             .to_path_buf();
+        // Gated namespaces first: the egress proxy, the resolver, and the
+        // upstream listeners of a gated allocation bind *inside* its
+        // namespace, so binding them before it exists fails and leaves the
+        // task with no network until the next beat (and its health at
+        // `net_capture_unavailable` on that beat). Also before the reconcile
+        // below starts anything, so a task never runs without its namespace.
+        {
+            // The guard is never held across the await: take the set
+            // out, reconcile, put it back.
+            let mut gated =
+                std::mem::take(&mut *GATED_ALLOCATIONS.lock().unwrap_or_else(|p| p.into_inner()));
+            apply_net_capture(&reply.desired_allocations, &mut gated).await;
+            *GATED_ALLOCATIONS.lock().unwrap_or_else(|p| p.into_inner()) = gated;
+        }
         apply_upstreams(forwarder, &reply, &alloc_root).await;
         // Config-file templates, rendered from the same feed; written before
         // any launch below so a task starts with its files in place.
@@ -2666,17 +2680,8 @@ async fn heartbeat_tick(
             })
             .collect();
 
-        // Gated namespaces exist before anything starts (and the
-        // datapath listeners inside them are bound by apply_upstreams,
-        // which ran above on this same reply).
-        {
-            // The guard is never held across the await: take the set
-            // out, reconcile, put it back.
-            let mut gated =
-                std::mem::take(&mut *GATED_ALLOCATIONS.lock().unwrap_or_else(|p| p.into_inner()));
-            apply_net_capture(&desired, &mut gated).await;
-            *GATED_ALLOCATIONS.lock().unwrap_or_else(|p| p.into_inner()) = gated;
-        }
+        // Gated namespaces already exist (created above, ahead of the
+        // datapath listeners bound inside them).
         let new_allocations = {
             let mut manager = task_manager.lock().expect("task manager");
             manager.set_stop_causes(stop_causes);

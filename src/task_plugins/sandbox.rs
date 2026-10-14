@@ -47,6 +47,7 @@ use crate::task_plugins::{
 };
 use crate::task_plugins::{rootfs_cache, sandbox_addr, sandbox_checkpoint};
 use crate::volumes::VolumeMode;
+use crate::worker::start_timing::stage as start_stage;
 use schemars::JsonSchema;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
@@ -1234,6 +1235,7 @@ impl SandboxTaskPlugin {
             );
         }
         std::fs::create_dir_all(&scratch)?;
+        let network_started = std::time::Instant::now();
         // The guest's NIC: this instance's own TAP on its bridge (created,
         // and recorded so destroy deletes it), and an address leased from
         // the bridge's pool (docs/task-runtime-sandbox.md, "Addressing").
@@ -1261,6 +1263,14 @@ impl SandboxTaskPlugin {
         if let Some(tap) = tap.as_ref() {
             sandbox_checkpoint::record_attached_tap(&scratch, &tap.device)?;
         }
+        if lease.is_some() {
+            instance.start_timings.record(
+                &task.runtime,
+                start_stage::NETWORK,
+                network_started.elapsed(),
+            );
+        }
+        let image_started = std::time::Instant::now();
         let kernel = microvm::resolve_kernel(config.kernel.as_deref())?;
         let layout = oci_image::resolve_layout(&config.image, instance, &scratch)?;
 
@@ -1284,6 +1294,10 @@ impl SandboxTaskPlugin {
         let stamp_path = scratch.join("rootfs.stamp");
 
         let image_config = oci_bundle::read_image_config(&layout)?;
+        instance
+            .start_timings
+            .record(&task.runtime, start_stage::IMAGE, image_started.elapsed());
+        let root_disk_started = std::time::Instant::now();
         let mut guest_env = oci_bundle::merge_env_map(&image_config.env, env);
         guest_env.extend(instance.volume_env());
         if let Some(lease) = lease.as_ref() {
@@ -1437,6 +1451,12 @@ impl SandboxTaskPlugin {
                 "Sandbox root disk ready"
             );
         }
+        instance.start_timings.record(
+            &task.runtime,
+            start_stage::ROOT_DISK,
+            root_disk_started.elapsed(),
+        );
+        let vmm_config_started = std::time::Instant::now();
 
         let mut spec = VmSpec {
             name: name.clone(),
@@ -1545,6 +1565,11 @@ impl SandboxTaskPlugin {
         // is what puts guest RAM under `memory.max` and makes it measurable.
         // A no-op when the worker governs nothing.
         crate::task_plugins::join_assignment_cgroup(&mut cmd, instance)?;
+        instance.start_timings.record(
+            &task.runtime,
+            start_stage::VMM_CONFIG,
+            vmm_config_started.elapsed(),
+        );
         Ok(cmd)
     }
 
@@ -2138,12 +2163,18 @@ impl TaskPlugin for SandboxTaskPlugin {
         if let Some((uid, gid)) = log_owner {
             oci_bundle::hand_task_logs_to(instance.log_dir.as_deref(), uid, gid);
         }
+        let spawn_started = std::time::Instant::now();
         let child = spawn_task_process(&mut cmd).with_context(|| {
             format!(
                 "Failed to spawn sandbox task {} for allocation {}",
                 task.name, allocation.id
             )
         })?;
+        instance.start_timings.record(
+            &task.runtime,
+            start_stage::VMM_SPAWN,
+            spawn_started.elapsed(),
+        );
         instance.pid = Some(child.id());
         instance.child = Some(child);
         Ok(())

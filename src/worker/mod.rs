@@ -24,6 +24,7 @@ pub mod server;
 pub mod session_log;
 pub mod session_report;
 pub mod simulate;
+pub mod start_timing;
 pub mod state;
 pub mod task_health;
 pub mod task_manager;
