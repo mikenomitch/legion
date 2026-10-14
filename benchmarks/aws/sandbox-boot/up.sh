@@ -86,7 +86,7 @@ launch() { # name type disk_gb user_data [extra market options]
 }
 
 for name in "${SB_MANAGERS[@]}"; do launch "$name" "$SB_MANAGER_TYPE" 20 "$SB_STATE/node-user-data.sh" on-demand; done
-for name in "${SB_WORKERS[@]}"; do launch "$name" "$SB_WORKER_TYPE" 40 "$SB_STATE/node-user-data.sh"; done
+for name in "${SB_WORKERS[@]}"; do launch "$name" "$SB_WORKER_TYPE" "${SB_WORKER_DISK_GB:-40}" "$SB_STATE/node-user-data.sh"; done
 for name in ${SB_LOADERS[@]+"${SB_LOADERS[@]}"}; do launch "$name" "$SB_LOAD_TYPE" 20 "$SB_STATE/node-user-data.sh"; done
 if [ -n "$with_build" ]; then
     launch sbx-build "$SB_BUILD_TYPE" 80 "$SB_DIR/cloud-init/build.sh" persistent

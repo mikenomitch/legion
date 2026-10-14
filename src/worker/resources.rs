@@ -33,6 +33,7 @@ use crate::structs::TaskConfig;
 use crate::task_plugins::{ResourceAssignment, ResourceEnforcement, Slice, CGROUP_ROOT};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 /// cgroup v2 controllers the parents must delegate for the limits below to
 /// exist in their children.
@@ -218,6 +219,31 @@ pub struct NodeResourceGovernor {
     /// Where the cgroup v2 hierarchy is mounted: [`CGROUP_ROOT`], except in
     /// tests, which point it at a scratch directory.
     fs_root: PathBuf,
+    /// Whether the slices exist and delegate their controllers. Set by the
+    /// first assignment, and cleared when a leaf cannot be created, so the
+    /// next one rebuilds the hierarchy. Shared with [`PendingCgroup`], which
+    /// creates leaves without the task-manager lock.
+    hierarchy_ready: Arc<AtomicBool>,
+}
+
+/// A task's cgroup leaf, to create before the task starts but without the
+/// task-manager lock ([`NodeResourceGovernor::assign_deferred`]). Every
+/// cgroup mkdir, rmdir and process move on a node takes the kernel's one
+/// cgroup mutex, so under churn a create waits milliseconds, and it used to
+/// make every other start, stop and heartbeat wait with it.
+pub struct PendingCgroup {
+    fs_root: PathBuf,
+    assignment: ResourceAssignment,
+    hierarchy_ready: Arc<AtomicBool>,
+}
+
+impl PendingCgroup {
+    pub fn create(&self) -> R<()> {
+        create_task_cgroup(&self.fs_root, &self.assignment).inspect_err(|_| {
+            remove_task_cgroup(&self.fs_root, &self.assignment);
+            self.hierarchy_ready.store(false, Ordering::Relaxed);
+        })
+    }
 }
 
 impl Default for NodeResourceGovernor {
@@ -238,6 +264,7 @@ impl NodeResourceGovernor {
             usable_cores: Vec::new(),
             reserved: BTreeMap::new(),
             fs_root: PathBuf::from(CGROUP_ROOT),
+            hierarchy_ready: Arc::default(),
         }
     }
 
@@ -255,6 +282,7 @@ impl NodeResourceGovernor {
             usable_cores: Vec::new(),
             reserved: BTreeMap::new(),
             fs_root: PathBuf::from(CGROUP_ROOT),
+            hierarchy_ready: Arc::default(),
         })
     }
 
@@ -316,6 +344,7 @@ impl NodeResourceGovernor {
             usable_cores,
             reserved: BTreeMap::new(),
             fs_root: PathBuf::from(CGROUP_ROOT),
+            hierarchy_ready: Arc::default(),
         }
     }
 
@@ -360,38 +389,72 @@ impl NodeResourceGovernor {
         mode: ResourceEnforcement,
         memory_override: Option<u64>,
     ) -> R<Option<ResourceAssignment>> {
+        let (assignment, pending) =
+            self.assign_deferred(allocation_id, task, mode, memory_override)?;
+        // A failure rolls the reservation back: a task that could not be
+        // confined must not also strand the cores it never got. Nothing else
+        // removes its half-written leaf (`create` does), because the
+        // instance never receives the assignment that names it.
+        if let Some(Err(err)) = pending.as_ref().map(PendingCgroup::create) {
+            self.reserved.remove(&allocation_id);
+            let _ = self.write_slice_masks();
+            return Err(err);
+        }
+        Ok(assignment)
+    }
+
+    /// [`Self::assign`] without creating the task's leaf: the caller runs
+    /// the returned [`PendingCgroup`] before the task starts, with no lock
+    /// held. When that fails, the allocation's teardown (`release`) returns
+    /// the reservation.
+    pub fn assign_deferred(
+        &mut self,
+        allocation_id: i64,
+        task: &TaskConfig,
+        mode: ResourceEnforcement,
+        memory_override: Option<u64>,
+    ) -> R<(Option<ResourceAssignment>, Option<PendingCgroup>)> {
+        let had_reservation = self.reserved.contains_key(&allocation_id);
         let Some(mut assignment) = self.plan(allocation_id, task, mode)? else {
-            return Ok(None);
+            return Ok((None, None));
         };
         if memory_override.is_some() {
             assignment.memory_limit_bytes = memory_override;
         }
         // The parents must exist (and delegate their controllers) before any
         // leaf can carry a limit, and the share mask must shrink before the
-        // reserving task starts — otherwise its cores are briefly shared.
-        //
-        // A failure here rolls the reservation back: a task that could not be
-        // confined must not also strand the cores it never got, nor leave its
-        // half-written leaf behind. Nothing else removes that leaf, because
-        // the instance never receives the assignment that names it.
-        let applied = self
-            .ensure_hierarchy()
-            .and_then(|()| self.write_slice_masks())
-            .and_then(|()| {
-                if mode == ResourceEnforcement::WorkerCgroup {
-                    create_task_cgroup(&self.fs_root, &assignment)?;
-                }
-                Ok(())
-            });
+        // reserving task starts, or its cores are briefly shared. Both are
+        // done once, and the masks again only when a reservation changes:
+        // rewriting the share slice's `cpuset.cpus` makes the kernel update
+        // every cpuset under it, one per running task.
+        let masks_changed = had_reservation || assignment.cores.is_some();
+        let applied = if !self.hierarchy_ready.load(Ordering::Relaxed) {
+            self.ensure_hierarchy()
+                .and_then(|()| self.write_slice_masks())
+                .inspect(|()| self.hierarchy_ready.store(true, Ordering::Relaxed))
+        } else if masks_changed {
+            self.write_slice_masks()
+        } else {
+            Ok(())
+        };
         if let Err(err) = applied {
-            if mode == ResourceEnforcement::WorkerCgroup {
-                remove_task_cgroup(&self.fs_root, &assignment);
-            }
             self.reserved.remove(&allocation_id);
             let _ = self.write_slice_masks();
             return Err(err);
         }
-        Ok(Some(assignment))
+        let pending = (mode == ResourceEnforcement::WorkerCgroup).then(|| PendingCgroup {
+            fs_root: self.fs_root.clone(),
+            assignment: assignment.clone(),
+            hierarchy_ready: self.hierarchy_ready.clone(),
+        });
+        Ok((Some(assignment), pending))
+    }
+
+    /// Remove a finished task's cgroup leaf without the task-manager lock,
+    /// ahead of [`Self::release`], which then finds it gone. `None` when this
+    /// node creates no leaves.
+    pub fn leaf_remover(&self) -> Option<PathBuf> {
+        (self.enabled || self.labels_only).then(|| self.fs_root.clone())
     }
 
     /// The bookkeeping half of [`Self::assign`]: decide what this allocation
@@ -855,7 +918,7 @@ fn create_task_cgroup(fs_root: &Path, assignment: &ResourceAssignment) -> R<()> 
 /// is still leaving is normal during teardown, the next start of the same
 /// allocation reuses the directory, and the startup sweep
 /// ([`NodeResourceGovernor::sweep_orphan_cgroups`]) catches the rest.
-fn remove_task_cgroup(fs_root: &Path, assignment: &ResourceAssignment) {
+pub(crate) fn remove_task_cgroup(fs_root: &Path, assignment: &ResourceAssignment) {
     let dir = fs_root.join(&assignment.cgroup_path);
     if dir.exists() {
         if let Err(err) = std::fs::remove_dir(&dir) {
@@ -924,6 +987,7 @@ mod tests {
             usable_cores: cores.to_vec(),
             reserved: BTreeMap::new(),
             fs_root: PathBuf::from(CGROUP_ROOT),
+            hierarchy_ready: Arc::default(),
         }
     }
 
@@ -939,6 +1003,7 @@ mod tests {
             usable_cores: Vec::new(),
             reserved: BTreeMap::new(),
             fs_root: PathBuf::from(CGROUP_ROOT),
+            hierarchy_ready: Arc::default(),
         };
         let task: TaskConfig = serde_json::from_value(serde_json::json!({
             "name": "web", "runtime": "exec",
@@ -1345,6 +1410,51 @@ mod tests {
         Ok(())
     }
 
+    /// A start's cgroup work under the task-manager lock is bookkeeping: the
+    /// leaf waits for `create` (run without the lock), the hierarchy is
+    /// built once, and the share mask is rewritten only when a reservation
+    /// changes it, since the kernel walks every cpuset under the slice on
+    /// each write.
+    #[test]
+    fn a_deferred_assignment_leaves_the_kernel_work_to_the_launch_test() -> R<()> {
+        let fs = tempfile::tempdir()?;
+        let mut governor = scratch_governor(fs.path(), &[0, 1, 2]);
+        let share_mask = fs.path().join("legion/share/cpuset.cpus");
+        let (first, pending) = governor.assign_deferred(
+            31,
+            &task_with(json!({ "memory": 64 })),
+            ResourceEnforcement::WorkerCgroup,
+            None,
+        )?;
+        let first = first.expect("governed");
+        let leaf = fs.path().join(&first.cgroup_path);
+        assert!(!leaf.exists(), "the leaf waits for the launch");
+        pending.expect("a leaf to create").create()?;
+        assert_eq!(read(leaf.join("memory.max")), (64u64 << 20).to_string());
+        assert_eq!(read(share_mask.clone()), "0-2");
+
+        // An unreserved start leaves the masks alone.
+        std::fs::write(&share_mask, "untouched")?;
+        let (_, pending) = governor.assign_deferred(
+            32,
+            &task_with(json!({ "memory": 64 })),
+            ResourceEnforcement::WorkerCgroup,
+            None,
+        )?;
+        pending.expect("a leaf to create").create()?;
+        assert_eq!(read(share_mask.clone()), "untouched");
+
+        // A reservation rewrites them, before its task can start.
+        governor.assign_deferred(
+            33,
+            &task_with(json!({ "cores": 1 })),
+            ResourceEnforcement::WorkerCgroup,
+            None,
+        )?;
+        assert_eq!(read(share_mask.clone()), "1-2");
+        Ok(())
+    }
+
     /// A slice holding processes of its own cannot delegate (the kernel's
     /// no-internal-processes rule), so they are moved into its stray child
     /// first rather than leaving every task under it unconfined.
@@ -1471,6 +1581,7 @@ mod tests {
             usable_cores: fingerprint_usable_cores(),
             reserved: BTreeMap::new(),
             fs_root: PathBuf::from(CGROUP_ROOT),
+            hierarchy_ready: Arc::default(),
         };
         let assignment = governor
             .assign(
