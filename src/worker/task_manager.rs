@@ -6649,6 +6649,14 @@ fn task_from_allocation(allocation: &TaskAllocation) -> R<(Allocation, TaskConfi
             .map_err(|err: String| anyhow!(err))
             .context("Invalid task lifecycle")?
     };
+    let speculative_start = if allocation.task_speculative_start.trim().is_empty() {
+        None
+    } else {
+        Some(
+            serde_json::from_str(&allocation.task_speculative_start)
+                .context("Invalid task speculativeStart JSON")?,
+        )
+    };
     let restart = if allocation.task_restart.trim().is_empty() {
         None
     } else {
@@ -6677,6 +6685,7 @@ fn task_from_allocation(allocation: &TaskAllocation) -> R<(Allocation, TaskConfi
         snapshots,
         lifecycle,
         restart,
+        speculative_start,
         ..TaskConfig::new(&allocation.task_name, &allocation.task_runtime)
     };
     let alloc = Allocation {
@@ -6782,6 +6791,7 @@ mod tests {
             envelope_resources: String::new(),
             task_lifecycle: String::new(),
             task_restart: String::new(),
+            task_speculative_start: String::new(),
         }
     }
 
@@ -11239,6 +11249,36 @@ mod tests {
             process.kill();
         }
 
+        Ok(())
+    }
+
+    /// A node redeems boot tickets against the task config it was
+    /// dispatched (docs/edge-boot.md, "The spec cache"), and the task's own
+    /// `speculativeStart.mode` caps an edge start. Before the block rode the
+    /// payload, a node read every task as `off` and refused every edge start.
+    #[test]
+    fn dispatch_payload_carries_speculative_start() -> R<()> {
+        let task = TaskConfig {
+            config: json!({ "command": ["true"] }),
+            speculative_start: Some(crate::structs::edge_boot::SpeculativeStartConfig {
+                mode: Some("serve".into()),
+                ratify_timeout: Some("10s".into()),
+                on_refused: None,
+            }),
+            ..TaskConfig::new("box", "exec")
+        };
+        let wire = crate::manager::dispatcher::build_task_allocation(&task, &alloc(), None, &[])?;
+        let (_, parsed) = task_from_allocation(&wire)?;
+        assert_eq!(
+            crate::manager::dispatcher::resolved_speculative_start(&parsed)?.mode,
+            Gate::Serve
+        );
+        let plain = TaskConfig::new("plain", "exec");
+        let wire = crate::manager::dispatcher::build_task_allocation(&plain, &alloc(), None, &[])?;
+        assert_eq!(
+            wire.task_speculative_start, "",
+            "undeclared stays off the wire"
+        );
         Ok(())
     }
 

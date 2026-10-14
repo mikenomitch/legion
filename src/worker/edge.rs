@@ -537,6 +537,7 @@ mod worker_edge_test {
             envelope_resources: String::new(),
             task_lifecycle: String::new(),
             task_restart: String::new(),
+            task_speculative_start: String::new(),
         }
     }
 

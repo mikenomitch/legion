@@ -10677,6 +10677,15 @@ message TaskAllocation {
   // payload: on the work stream, or in the next desired set. Empty on every
   // other allocation, and the node then falls back to `task_resources`.
   string envelope_resources = 32;
+
+  // JSON `SpeculativeStartConfig` as the task declared it (`mode`,
+  // `ratifyTimeout`, `onRefused`). Empty when the task declares no
+  // `speculativeStart` block. A node caches each task config it is
+  // dispatched and redeems boot tickets against that cache
+  // (docs/edge-boot.md, "The spec cache"), and the task's own mode caps how
+  // far an edge start may get, so without this a node read every task as
+  // `off` and refused every edge start of it.
+  string task_speculative_start = 33;
 }
 
 // Request payload for PostWork.

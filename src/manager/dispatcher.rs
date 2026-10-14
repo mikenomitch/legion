@@ -640,6 +640,14 @@ pub fn build_task_allocation_with(
         Some(restart) => serde_json::to_string(restart).context("Failed to serialize restart")?,
         None => String::new(),
     };
+    // The node redeems boot tickets against the task config it was
+    // dispatched, and the task's own mode caps an edge start's gate.
+    let task_speculative_start = match task.speculative_start.as_ref() {
+        Some(block) => {
+            serde_json::to_string(block).context("Failed to serialize speculativeStart")?
+        }
+        None => String::new(),
+    };
     Ok(TaskAllocation {
         allocation_id: allocation.id,
         job_id: allocation.job_id.clone(),
@@ -677,6 +685,7 @@ pub fn build_task_allocation_with(
             .unwrap_or_default(),
         task_lifecycle: task.lifecycle.to_string(),
         task_restart,
+        task_speculative_start,
         session_task_spec: String::new(),
         session_task_config_id: 0,
         session_seal_keys: Vec::new(),
