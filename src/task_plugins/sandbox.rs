@@ -562,9 +562,8 @@ pub fn sandbox_dir_for(alloc_dir: &Path) -> PathBuf {
 }
 
 /// How long the stop request may take to reach the guest's init. Short,
-/// because `stop_with` runs under the worker's task-manager lock, and a
-/// guest that cannot take a one-line exec in this long will not shut itself
-/// down cleanly either.
+/// because a guest that cannot take a one-line exec in this long will not
+/// shut itself down cleanly either.
 const GUEST_STOP_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
 
 /// How long a hard stop (and a memory capture) waits for the guest to flush
@@ -2247,28 +2246,47 @@ impl TaskPlugin for SandboxTaskPlugin {
             return Ok(false);
         }
         let vsock = vsock_socket_base(&work_root(allocation, instance));
-        match request_guest_stop(&vsock, &ctx.signal, GUEST_STOP_REQUEST_TIMEOUT) {
-            Ok(()) => {
-                info!(
-                    allocation_id = allocation.id,
-                    task_name = %task.name,
-                    signal = %ctx.signal,
-                    grace_secs = ctx.grace.as_secs(),
-                    cause = %ctx.cause,
-                    "Asked the sandbox guest to shut down"
-                );
-                Ok(true)
-            }
-            Err(err) => {
-                warn!(
-                    allocation_id = allocation.id,
-                    task_name = %task.name,
-                    error = %format!("{err:#}"),
-                    "Could not deliver a stop request into the sandbox guest; stopping it hard"
-                );
-                Ok(false)
-            }
-        }
+        // The request is an exec round trip into the guest, which takes tens
+        // of milliseconds on a busy node, and this runs under the worker's
+        // task-manager lock: every other start, stop, and heartbeat on the
+        // node waited on it. It goes out on its own thread instead, and the
+        // worker waits for the VMM to exit as for any graceful stop. A
+        // request the guest cannot take stops the VMM hard from that thread,
+        // as `stop` would (whose flush such a guest could not take either).
+        let (allocation_id, task_name) = (allocation.id, task.name.clone());
+        let (signal, grace, cause) = (ctx.signal.clone(), ctx.grace, ctx.cause.to_string());
+        let pid = instance.pid;
+        std::thread::Builder::new()
+            .name(format!("sandbox-stop-{allocation_id}"))
+            .spawn(
+                move || match request_guest_stop(&vsock, &signal, GUEST_STOP_REQUEST_TIMEOUT) {
+                    Ok(()) => info!(
+                        allocation_id,
+                        task_name = %task_name,
+                        signal = %signal,
+                        grace_secs = grace.as_secs(),
+                        cause = %cause,
+                        "Asked the sandbox guest to shut down"
+                    ),
+                    Err(err) => {
+                        warn!(
+                            allocation_id,
+                            task_name = %task_name,
+                            error = %format!("{err:#}"),
+                            "Could not deliver a stop request into the sandbox guest; stopping \
+                             it hard"
+                        );
+                        if let Some(pid) = pid.filter(|pid| crate::signals::pid_alive(*pid)) {
+                            // SAFETY: a plain kill(2) of this allocation's VMM.
+                            unsafe {
+                                libc::kill(pid as libc::pid_t, libc::SIGKILL);
+                            }
+                        }
+                    }
+                },
+            )
+            .context("spawn the sandbox stop request")?;
+        Ok(true)
     }
 
     fn stop(
