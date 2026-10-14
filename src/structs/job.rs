@@ -1059,6 +1059,13 @@ pub struct StatefulConfig {
     /// (`stateful.promote`). Absent = the defaults.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub promote: Option<crate::structs::session::SessionPromoteConfig>,
+    /// Session mode only: how a manager's session router picks the node a
+    /// session starts on (`stateful.placement`): `"spread"` (the default,
+    /// the node with the most room left) or `"fast"` (the roomier of two
+    /// random nodes with room, constant cost at any fleet size). See
+    /// docs/session-mode.md, "Picking a node".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub placement: Option<crate::structs::session::SessionPlacement>,
     /// Session tasks with `suspend.durability = "store"` only (session
     /// durability plan §6.7, mechanism 4): how long a node that has reached
     /// neither a manager nor its content store keeps the task's sessions
@@ -4220,6 +4227,7 @@ mod tests {
                     }),
                     envelope: None,
                     promote: None,
+                    placement: None,
                     fence_after: None,
                 }),
                 ..TaskConfig::new("sandbox", "container")
@@ -4247,6 +4255,7 @@ mod tests {
                 storage: None,
                 envelope: None,
                 promote: None,
+                placement: None,
                 fence_after: None,
             }),
             ..TaskConfig::new("db", "exec")
@@ -4269,6 +4278,7 @@ mod tests {
                 storage: None,
                 envelope: None,
                 promote: None,
+                placement: None,
                 fence_after: None,
             }),
             ..TaskConfig::new("db", "exec")
@@ -4291,6 +4301,7 @@ mod tests {
                 storage: None,
                 envelope: None,
                 promote: None,
+                placement: None,
                 fence_after: None,
             }),
             ..TaskConfig::new("db", "exec")
@@ -4320,6 +4331,7 @@ mod tests {
                     }),
                     envelope: None,
                     promote: None,
+                    placement: None,
                     fence_after: None,
                 }),
                 ..TaskConfig::new("db", "exec")
@@ -4346,6 +4358,7 @@ mod tests {
                 storage: None,
                 envelope: None,
                 promote: None,
+                placement: None,
                 fence_after: None,
             }),
             ..TaskConfig::new("sandbox", "container")
@@ -4371,6 +4384,7 @@ mod tests {
                     storage: None,
                     envelope: None,
                     promote: None,
+                    placement: None,
                     fence_after: None,
                 }),
                 ..TaskConfig::new("sandbox", "container")
@@ -4495,6 +4509,7 @@ mod tests {
                 storage: None,
                 envelope: None,
                 promote: None,
+                placement: None,
                 fence_after: None,
             }),
             ..TaskConfig::new("db", "exec")
@@ -4514,6 +4529,7 @@ mod tests {
                 storage: None,
                 envelope: None,
                 promote: None,
+                placement: None,
                 fence_after: None,
             }),
             ..TaskConfig::new("db", "exec")

@@ -422,6 +422,7 @@ impl WorkerTaskManager {
     /// schedule. Called when it ends or is promoted.
     pub(crate) fn forget_session_extras(&mut self, session_id: &str) {
         self.session_payloads.remove(session_id);
+        self.session_pid_starts.remove(session_id);
         self.session_checkpoint_due.remove(session_id);
         self.session_captures.remove(session_id);
         self.session_live_published.remove(session_id);

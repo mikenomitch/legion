@@ -1678,6 +1678,7 @@ mod tests {
                 storage: None,
                 envelope: None,
                 promote: None,
+                placement: None,
                 fence_after: None,
             }),
             ..TaskConfig::new("db", "noop")

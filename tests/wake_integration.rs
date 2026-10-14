@@ -164,6 +164,7 @@ fn job() -> JobConfig {
             }),
             envelope: None,
             promote: None,
+            placement: None,
             fence_after: None,
         }),
         network: Some(NetworkConfig {

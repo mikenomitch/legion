@@ -525,6 +525,9 @@ pub struct UnlockedLaunch {
     plugin: Arc<crate::task_plugins::LoadedTaskPlugin>,
     volumes: Arc<WorkerVolumeManager>,
     volume_specs: Vec<VolumeMount>,
+    /// When a session's process started, read by [`Self::run`] for its row
+    /// in the session log.
+    pid_start_time: Option<u64>,
 }
 
 impl UnlockedLaunch {
@@ -572,11 +575,17 @@ impl UnlockedLaunch {
             "Starting task allocation"
         );
         plugin.start(&self.allocation, &self.task, &mut self.instance)?;
-        // A session is `running` once its workload can take work, not once
-        // its process exists (a microVM boots for a few hundred ms after its
-        // VMM spawns). Waiting here also keeps the launch slot until then, so
-        // `edgeBoot.launchConcurrency` bounds the boots a node runs at once.
         if self.claim_id.is_some() {
+            // A session's row in the session log pins its process by pid and
+            // start time, so a restarted worker re-adopts the right process.
+            // Read here, off the lock: a process-table read per start under the
+            // task-manager lock held up every other start, stop, and heartbeat
+            // on the node (about a millisecond a start on macOS).
+            self.pid_start_time = self.instance.pid.and_then(process_start_time);
+            // A session is `running` once its workload can take work, not once
+            // its process exists (a microVM boots for a few hundred ms after its
+            // VMM spawns). Waiting here also keeps the launch slot until then, so
+            // `edgeBoot.launchConcurrency` bounds the boots a node runs at once.
             if let Err(err) = plugin.wait_ready(
                 &self.allocation,
                 &self.task,
@@ -753,6 +762,11 @@ pub struct WorkerTaskManager {
     /// Sessions whose envelope is gone from this node, by claim id, with
     /// when that was first seen. Ended after [`SESSION_ORPHAN_GRACE`].
     orphaned_sessions: HashMap<String, std::time::Instant>,
+    /// Wakers for edge starts waiting on their session to run, by claim id
+    /// ([`crate::worker::edge::wait_until_running`]). A claim's stage change
+    /// or end wakes its waiter, so a start's reply follows its boot at once
+    /// instead of at the next poll.
+    stage_waiters: HashMap<String, Arc<tokio::sync::Notify>>,
     /// The node's session log (`sessions.db`), opened on first use. `None`
     /// until then, and for good if it cannot be opened (sessions then run
     /// without surviving a worker restart, and a warning says so).
@@ -768,6 +782,10 @@ pub struct WorkerTaskManager {
     /// The launch payload of each running session, by session id, so a
     /// suspend records what its resume relaunches.
     session_payloads: HashMap<String, TaskAllocation>,
+    /// Each running session's pid and when that process started, by session
+    /// id, read off the lock as its launch finished (see
+    /// [`UnlockedLaunch::run`]), for its row in the session log.
+    session_pid_starts: HashMap<String, (u32, u64)>,
     /// The latest live checkpoint of each running session (periodic or
     /// worker-stop), by session id. Its parts stay pinned until it is
     /// replaced, the session suspends or ends.
@@ -889,11 +907,13 @@ impl WorkerTaskManager {
             next_launch_generation: 0,
             checkpoints: Default::default(),
             orphaned_sessions: HashMap::new(),
+            stage_waiters: HashMap::new(),
             session_log: None,
             session_log_unavailable: false,
             idle_sessions: HashMap::new(),
             session_specs: HashMap::new(),
             session_payloads: HashMap::new(),
+            session_pid_starts: HashMap::new(),
             session_checkpoints: HashMap::new(),
             session_captures: Default::default(),
             resuming_sessions: HashMap::new(),
@@ -3441,6 +3461,9 @@ impl WorkerTaskManager {
     /// because the common refusal is "someone else owns this id" and a loser
     /// lingering is what the at-most-one invariant forbids.
     pub fn kill_claim(&mut self, claim_id: &str, reason: &str) -> Option<ClaimRecord> {
+        if let Some(waiter) = self.stage_waiters.remove(claim_id) {
+            waiter.notify_one();
+        }
         let claim = self.claims.remove(claim_id)?;
         self.ledger.release_hold(claim_id);
         self.orphaned_sessions.remove(claim_id);
@@ -3505,6 +3528,22 @@ impl WorkerTaskManager {
     /// the `StartClaim` stream.
     pub fn set_claim_stage(&mut self, claim_id: &str, stage: ClaimStage) {
         self.claims.set_stage(claim_id, stage);
+        if let Some(waiter) = self.stage_waiters.get(claim_id) {
+            waiter.notify_one();
+        }
+    }
+
+    /// The waker a claim's next stage change or end fires, registered for
+    /// the caller to await. Release it with [`Self::release_stage_waiter`].
+    pub fn stage_waiter(&mut self, claim_id: &str) -> Arc<tokio::sync::Notify> {
+        self.stage_waiters
+            .entry(claim_id.to_string())
+            .or_default()
+            .clone()
+    }
+
+    pub fn release_stage_waiter(&mut self, claim_id: &str) {
+        self.stage_waiters.remove(claim_id);
     }
 
     /// Whether this node already holds a live claim for an instance.
@@ -4308,6 +4347,7 @@ impl WorkerTaskManager {
                 .get(&allocation.id)
                 .cloned()
                 .unwrap_or_default(),
+            pid_start_time: None,
         })
     }
 
@@ -4330,8 +4370,18 @@ impl WorkerTaskManager {
             task,
             instance,
             plugin,
+            pid_start_time,
             ..
         } = launch;
+        if let (Some(pid), Some(started)) = (instance.pid, pid_start_time) {
+            if let Some(session_id) = self
+                .claims
+                .by_local_key(allocation_id)
+                .map(|claim| claim.instance_id.clone())
+            {
+                self.session_pid_starts.insert(session_id, (pid, started));
+            }
+        }
         // Replaces the placeholder. On failure too: `record_failure` tears
         // down through the real instance (its mounts, cores, any process).
         self.instances.insert(allocation_id, instance);
@@ -5012,11 +5062,20 @@ impl WorkerTaskManager {
                 let task = self.task_configs.get(&local_key)?;
                 let instance = self.instances.get(&local_key)?;
                 let pid = instance.pid;
+                // Read off the lock when the launch finished, when it is
+                // this process's; anything else is read now.
+                let pid_start_time = pid.and_then(|pid| {
+                    self.session_pid_starts
+                        .get(&claim.instance_id)
+                        .filter(|(known, _)| *known == pid)
+                        .map(|(_, started)| *started)
+                        .or_else(|| process_start_time(pid))
+                });
                 Some(PersistedAllocation {
                     allocation: allocation.clone(),
                     task: task.clone(),
                     pid,
-                    pid_start_time: pid.and_then(process_start_time),
+                    pid_start_time,
                     resource_assignment: instance.resource_assignment.clone(),
                     self_terminate_after_secs: None,
                     volumes: Vec::new(),
@@ -5616,6 +5675,53 @@ fn spawn_provisional_staging_thread(
                     }
                 }
                 let claim_id = claim_for_thread.as_str();
+                // A session boots off the lock, as one without artifacts
+                // does (session durability plan §6.1): starting its runtime
+                // here, under the lock, serialized every other start, stop,
+                // and heartbeat on the node behind this one's boot. A
+                // restore keeps the locked start, which records its outcome
+                // on the checkpoint channel.
+                let session = guard
+                    .claims
+                    .by_local_key(allocation_id)
+                    .is_some_and(|claim| claim.is_session() && !claim.is_ratified());
+                let restoring = guard.checkpoints.restores.contains_key(&allocation_id);
+                if session && !restoring && matches!(gate, Gate::Serve | Gate::Boot) {
+                    let launch = result.and_then(|staged| {
+                        guard.begin_staged_launch(&job.allocation, &job.task, staged)
+                    });
+                    let mut launch = match launch {
+                        Ok(launch) => launch,
+                        Err(err) => {
+                            guard.kill_claim(
+                                claim_id,
+                                &format!("provisional staging failed: {err:#}"),
+                            );
+                            return;
+                        }
+                    };
+                    launch.gate = gate;
+                    launch.claim_id = Some(claim_id.to_string());
+                    drop(guard);
+                    match complete_unlocked_launch(&manager, launch, "") {
+                        Ok(Some((alloc, task))) => {
+                            manager
+                                .lock()
+                                .expect("task manager")
+                                .set_claim_stage(claim_id, stage_for(gate));
+                            spawn_health_monitor(manager, alloc, task);
+                        }
+                        // Stopped while it started: the stop ended the claim.
+                        Ok(None) => {}
+                        Err(err) => {
+                            manager.lock().expect("task manager").kill_claim(
+                                claim_id,
+                                &format!("provisional start failed: {err:#}"),
+                            );
+                        }
+                    }
+                    return;
+                }
                 let started = match result.and_then(|staged| {
                     guard.start_staged_allocation(&job.allocation, &job.task, staged, gate)
                 }) {
@@ -7415,6 +7521,134 @@ mod tests {
         for claim in &claims {
             guard.kill_claim(&claim.claim_id, "test over");
         }
+        Ok(())
+    }
+
+    /// An edge start waiting for its session to run is woken by the claim's
+    /// stage change or end, not by a poll. A change that lands before the
+    /// waiter sleeps leaves a permit, so it is never missed.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_running_wait_wakes_on_the_stage_change_test() -> R<()> {
+        use futures::FutureExt;
+        let temp_dir = TempDir::new()?;
+        let manager = Arc::new(Mutex::new(manager_in(&temp_dir)));
+        manager
+            .lock()
+            .expect("task manager")
+            .begin_task_allocation(&envelope_payload(100))?;
+        let admitted = manager
+            .lock()
+            .expect("task manager")
+            .admit_session(session_record("workspace-wait"))?;
+
+        let waiter = manager
+            .lock()
+            .expect("task manager")
+            .stage_waiter(&admitted.claim_id);
+        assert!(
+            waiter.notified().now_or_never().is_none(),
+            "nothing changed"
+        );
+        manager
+            .lock()
+            .expect("task manager")
+            .set_claim_stage(&admitted.claim_id, ClaimStage::Serving);
+        assert!(
+            waiter.notified().now_or_never().is_some(),
+            "the stage change left a permit"
+        );
+        manager
+            .lock()
+            .expect("task manager")
+            .release_stage_waiter(&admitted.claim_id);
+
+        // The wait itself: running once the stage says so, and nothing left
+        // registered after.
+        manager
+            .lock()
+            .expect("task manager")
+            .set_claim_stage(&admitted.claim_id, ClaimStage::Claimed);
+        let wait = {
+            let manager = manager.clone();
+            tokio::spawn(async move {
+                crate::worker::edge::wait_until_running(
+                    &manager,
+                    "workspace-wait",
+                    Duration::from_secs(10),
+                )
+                .await
+            })
+        };
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        manager
+            .lock()
+            .expect("task manager")
+            .set_claim_stage(&admitted.claim_id, ClaimStage::Serving);
+        assert!(wait.await??, "the session runs");
+        let mut guard = manager.lock().expect("task manager");
+        assert!(guard.stage_waiters.is_empty());
+
+        // A claim that ends wakes its waiter too.
+        let waiter = guard.stage_waiter(&admitted.claim_id);
+        guard.kill_claim(&admitted.claim_id, "test over");
+        assert!(waiter.notified().now_or_never().is_some());
+        assert!(guard.stage_waiters.is_empty());
+        Ok(())
+    }
+
+    /// A session that stages artifacts boots through the same unlocked
+    /// launch as one without: the staging thread registers it under the lock
+    /// and runs the runtime's `prepare` and `start` without it, so one
+    /// session's boot holds up no other start, stop, or heartbeat.
+    #[test]
+    fn a_session_with_artifacts_boots_off_the_lock_test() -> R<()> {
+        let temp_dir = TempDir::new()?;
+        let manager = Arc::new(Mutex::new(manager_in(&temp_dir)));
+        manager
+            .lock()
+            .expect("task manager")
+            .begin_task_allocation(&envelope_payload(100))?;
+        let source_dir = TempDir::new()?;
+        let source = source_dir.path().join("tool.bin");
+        std::fs::write(&source, "tool bytes")?;
+        let mut artifact = ArtifactSpec::from_source(format!("file://{}", source.display()));
+        artifact.name = Some("tool".into());
+        artifact.unpack = crate::structs::ArtifactUnpack::File;
+
+        let admitted = manager
+            .lock()
+            .expect("task manager")
+            .admit_session(session_record("workspace-staged"))?;
+        let mut payload = provisional_payload(admitted.local_key);
+        payload.task_resources = admitted.resources.to_string();
+        payload.task_artifacts = serde_json::to_string(&[artifact])?;
+        launch_provisional_allocation(&manager, &payload, &admitted.claim_id, Gate::Serve)?;
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let serving = manager
+                .lock()
+                .expect("task manager")
+                .session_status("workspace-staged")
+                .is_some_and(|status| status.state == "running");
+            if serving {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the staged session never started"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+        let mut guard = manager.lock().expect("task manager");
+        assert!(guard.launching.is_empty(), "the launch settled");
+        let instance = &guard.instances[&admitted.local_key];
+        assert!(instance.pid.is_some(), "the session's process runs");
+        assert!(
+            instance.extra_env.contains_key("LEGION_ARTIFACT_TOOL"),
+            "the staged artifact reached the launch"
+        );
+        guard.kill_claim(&admitted.claim_id, "test over");
         Ok(())
     }
 

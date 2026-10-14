@@ -1323,6 +1323,7 @@ mod tests {
                 }),
                 envelope: None,
                 promote: None,
+                placement: None,
                 fence_after: None,
             }),
             ..TaskConfig::new("db", "service")
@@ -1410,6 +1411,7 @@ mod tests {
                 }),
                 envelope: None,
                 promote: None,
+                placement: None,
                 fence_after: None,
             }),
             ..TaskConfig::new("sandbox", "service")
@@ -1700,6 +1702,7 @@ mod tests {
                     }),
                     envelope: None,
                     promote: None,
+                    placement: None,
                     fence_after: None,
                 }),
                 ..TaskConfig::new("postgres", "service")

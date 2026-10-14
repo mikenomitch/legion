@@ -8,11 +8,11 @@
 //! index with its peers' (`RaftTransport.QuerySessions`).
 
 use crate::prelude::*;
-use crate::storage::session_index::{session_amounts, Usage};
+use crate::storage::session_index::Usage;
 use crate::storage::store::Store;
 use crate::structs::edge_boot::Gate;
 use crate::structs::session::{
-    envelope_serves, resource_amounts, session_claim_id, ENVELOPE_RUNTIME,
+    envelope_serves, resource_amounts, session_claim_id, SessionPlacement, ENVELOPE_RUNTIME,
 };
 use crate::structs::{
     Allocation, IndexedSession, InstanceInfo, JobConfig, ProvisionalAllocation, QuerySessionsReply,
@@ -633,6 +633,9 @@ fn node_is_down(store: &Store, node_id: &str) -> bool {
 /// there, the answer is that it runs; not there, the move goes ahead; no
 /// answer, it goes ahead only when that node is marked down (or lost) or the
 /// caller passed `force_move`, and otherwise answers UNAVAILABLE.
+///
+/// `skip` is a node that already refused the resume for room (the session's
+/// own node, asked first), so no attempt is spent on it again.
 pub async fn resume_store_session(
     store: &Store,
     job_id: &str,
@@ -640,20 +643,34 @@ pub async fn resume_store_session(
     session_id: &str,
     cold: bool,
     force_move: bool,
+    skip: Option<&str>,
 ) -> Result<StoreResume, Status> {
-    let view = room_view(store, job_id, &task.name).await?;
+    refresh_room(store, job_id, &task.name).await?;
     let needs = resource_amounts(&task.resources);
-    let candidates = rank(&view, &needs);
-    if candidates.is_empty() {
-        return Err(Status::resource_exhausted(format!(
-            "no envelope for {job_id}/{} has room to resume session {session_id} ({} nodes); \
-             its checkpoint stays in the content store, retry once sessions end",
-            task.name,
-            view.envelopes.len()
-        )));
-    }
+    let placement = crate::structs::session::placement(task);
+    let mut tried: Vec<String> = skip.map(str::to_string).into_iter().collect();
+    let mut first = match reserve(store, job_id, &task.name, &needs, &tried, placement) {
+        Ok(reservation) => Some(reservation),
+        Err(NoRoom { envelopes }) => {
+            return Err(Status::resource_exhausted(format!(
+                "no envelope for {job_id}/{} has room to resume session {session_id} \
+                 ({envelopes} nodes); its checkpoint stays in the content store, retry once \
+                 sessions end",
+                task.name,
+            )));
+        }
+    };
     let mut refusals = Vec::new();
-    for node_id in candidates.into_iter().take(ROUTER_ATTEMPTS) {
+    for _ in 0..ROUTER_ATTEMPTS {
+        let reservation = match first.take() {
+            Some(reservation) => reservation,
+            None => match reserve(store, job_id, &task.name, &needs, &tried, placement) {
+                Ok(reservation) => reservation,
+                Err(_) => break,
+            },
+        };
+        let node_id = reservation.node_id.clone();
+        tried.push(node_id.clone());
         let mut force = force_move;
         for _ in 0..2 {
             let answer = resume_on_node(
@@ -667,10 +684,13 @@ pub async fn resume_store_session(
             .await;
             let status = match answer {
                 Ok(reply) => {
+                    if !reply.already_running {
+                        reservation.settle(Settle::Started(needs));
+                    }
                     return Ok(StoreResume::Resumed {
                         node_id,
                         reply: Box::new(reply),
-                    })
+                    });
                 }
                 Err(status) => status,
             };
@@ -688,7 +708,7 @@ pub async fn resume_store_session(
                             status.code(),
                             tonic::Code::ResourceExhausted | tonic::Code::FailedPrecondition
                         ) {
-                            note_in_view(store, job_id, &task.name, &node_id, NoteUse::Full);
+                            note_full(store, job_id, &task.name, &node_id);
                         }
                         refusals.push(format!("{node_id}: {}", status.message()));
                         break;
@@ -850,11 +870,31 @@ struct RoomView {
     used: HashMap<String, BTreeMap<String, f64>>,
 }
 
+/// The router's state for one session task: its cached view, and the
+/// starts it has sent and not yet heard back from.
+#[derive(Debug, Default)]
+struct RoomState {
+    view: Option<RoomView>,
+    /// A refresh is reading the view again. Other starts keep using the
+    /// stale one meanwhile, so an expiry costs one read, not one per start
+    /// in flight.
+    refreshing: bool,
+    /// What each node's unanswered starts hold. Counted when a start picks
+    /// its node, so concurrent creates spread across nodes instead of all
+    /// taking the one that had the most room. Kept apart from `view`, so a
+    /// refresh does not drop it.
+    in_flight: HashMap<String, BTreeMap<String, f64>>,
+}
+
 type RoomKey = (usize, String, String);
 
-fn room_cache() -> &'static Mutex<HashMap<RoomKey, RoomView>> {
-    static CACHE: OnceLock<Mutex<HashMap<RoomKey, RoomView>>> = OnceLock::new();
+fn room_cache() -> &'static Mutex<HashMap<RoomKey, RoomState>> {
+    static CACHE: OnceLock<Mutex<HashMap<RoomKey, RoomState>>> = OnceLock::new();
     CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn lock_room_cache() -> std::sync::MutexGuard<'static, HashMap<RoomKey, RoomState>> {
+    room_cache().lock().unwrap_or_else(|p| p.into_inner())
 }
 
 /// Keyed by the store's identity too, so two clusters in one process (the
@@ -912,16 +952,31 @@ fn placed_envelopes(store: &Store, job_id: &str, task_name: &str) -> R<Vec<Envel
     Ok(envelopes.into_values().collect())
 }
 
-async fn room_view(store: &Store, job_id: &str, task_name: &str) -> Result<RoomView, Status> {
+/// Make sure the router holds a view of a task's envelopes, reading it
+/// again once it is older than [`ROUTER_VIEW_TTL`]. Single-flight: while one
+/// start reads, the others pick from the stale view instead of each reading
+/// the store and asking every peer at the same moment.
+async fn refresh_room(store: &Store, job_id: &str, task_name: &str) -> Result<(), Status> {
     let key = room_key(store, job_id, task_name);
-    if let Some(view) = room_cache()
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .get(&key)
-        .filter(|view| view.read_at.elapsed() < ROUTER_VIEW_TTL)
     {
-        return Ok(view.clone());
+        let mut cache = lock_room_cache();
+        let state = cache.entry(key.clone()).or_default();
+        match &state.view {
+            Some(view) if view.read_at.elapsed() < ROUTER_VIEW_TTL => return Ok(()),
+            Some(_) if state.refreshing => return Ok(()),
+            _ => state.refreshing = true,
+        }
     }
+    // Clears `refreshing` however this ends, a cancelled start included.
+    struct Refreshing(RoomKey);
+    impl Drop for Refreshing {
+        fn drop(&mut self) {
+            if let Some(state) = lock_room_cache().get_mut(&self.0) {
+                state.refreshing = false;
+            }
+        }
+    }
+    let _refreshing = Refreshing(key.clone());
     let envelopes = placed_envelopes(store, job_id, task_name)
         .map_err(|err| Status::internal(format!("failed to read envelopes: {err:#}")))?;
     let usage = query(
@@ -943,68 +998,256 @@ async fn room_view(store: &Store, job_id: &str, task_name: &str) -> Result<RoomV
             .map(|(node_id, usage)| (node_id, usage.amounts))
             .collect(),
     };
-    room_cache()
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .insert(key, view.clone());
-    Ok(view)
+    lock_room_cache().entry(key).or_default().view = Some(view);
+    Ok(())
 }
 
-/// Adjust the cached view after a start or a refusal, so the next create
-/// within the TTL does not pick the same full node.
-fn note_in_view(store: &Store, job_id: &str, task_name: &str, node_id: &str, used: NoteUse) {
+/// Why [`reserve`] found no node.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct NoRoom {
+    /// How many nodes hold an envelope for the task.
+    envelopes: usize,
+}
+
+/// Pick a node with room for `needs`, skipping `tried`, by the task's
+/// `stateful.placement`, and count the start against it until it is
+/// answered.
+fn reserve(
+    store: &Store,
+    job_id: &str,
+    task_name: &str,
+    needs: &BTreeMap<String, f64>,
+    tried: &[String],
+    placement: SessionPlacement,
+) -> Result<Reservation, NoRoom> {
     let key = room_key(store, job_id, task_name);
-    let mut cache = room_cache().lock().unwrap_or_else(|p| p.into_inner());
-    let Some(view) = cache.get_mut(&key) else {
-        return;
+    let mut cache = lock_room_cache();
+    let state = cache.entry(key.clone()).or_default();
+    let Some(view) = state.view.as_ref() else {
+        return Err(NoRoom { envelopes: 0 });
     };
-    match used {
-        NoteUse::Started(amounts) => {
-            let entry = view.used.entry(node_id.to_string()).or_default();
-            for (name, amount) in amounts {
-                *entry.entry(name).or_insert(0.0) += amount;
+    let rng = &mut rand::thread_rng();
+    let picked = match placement {
+        SessionPlacement::Spread => best_node(view, &state.in_flight, needs, tried, rng),
+        SessionPlacement::Fast => two_choices(view, &state.in_flight, needs, tried, rng),
+    };
+    let node_id = picked.ok_or(NoRoom {
+        envelopes: view.envelopes.len(),
+    })?;
+    add_amounts(
+        state.in_flight.entry(node_id.clone()).or_default(),
+        needs,
+        1.0,
+    );
+    Ok(Reservation {
+        key,
+        node_id,
+        needs: needs.clone(),
+        settled: false,
+    })
+}
+
+/// How much of `envelope` would be left once a session of `needs` is added:
+/// the smallest fraction of any sized resource, counting the view's use and
+/// the router's unanswered starts. `None` when the session does not fit.
+fn room_left(
+    view: &RoomView,
+    in_flight: &HashMap<String, BTreeMap<String, f64>>,
+    envelope: &Envelope,
+    needs: &BTreeMap<String, f64>,
+) -> Option<f64> {
+    let used = view.used.get(&envelope.node_id);
+    let pending = in_flight.get(&envelope.node_id);
+    let mut left = f64::INFINITY;
+    for (name, need) in needs {
+        let Some(room) = envelope.room.get(name) else {
+            continue;
+        };
+        let taken = used.and_then(|used| used.get(name)).copied().unwrap_or(0.0)
+            + pending
+                .and_then(|pending| pending.get(name))
+                .copied()
+                .unwrap_or(0.0);
+        let free = room - taken - need;
+        if free < -1e-9 {
+            return None;
+        }
+        if *room > 0.0 {
+            left = left.min(free / room);
+        }
+    }
+    Some(left)
+}
+
+/// `stateful.placement = "spread"`: the node with the most room left; a tie
+/// goes to a random one of the tied nodes, so managers that read the same
+/// view do not all pick the same node.
+fn best_node(
+    view: &RoomView,
+    in_flight: &HashMap<String, BTreeMap<String, f64>>,
+    needs: &BTreeMap<String, f64>,
+    tried: &[String],
+    rng: &mut impl rand::Rng,
+) -> Option<String> {
+    let mut best: Option<(f64, &str)> = None;
+    let mut ties = 0u32;
+    for envelope in &view.envelopes {
+        if tried.contains(&envelope.node_id) {
+            continue;
+        }
+        let Some(left) = room_left(view, in_flight, envelope, needs) else {
+            continue;
+        };
+        match best {
+            Some((most, _)) if left < most - 1e-12 => {}
+            // Reservoir sampling over the ties: each of k tied nodes ends
+            // up picked with probability 1/k, in one pass.
+            Some((most, _)) if left <= most + 1e-12 => {
+                ties += 1;
+                if rng.gen_range(0..ties) == 0 {
+                    best = Some((most, &envelope.node_id));
+                }
+            }
+            _ => {
+                best = Some((left, &envelope.node_id));
+                ties = 1;
             }
         }
-        NoteUse::Full => {
-            if let Some(envelope) = view.envelopes.iter().find(|e| e.node_id == node_id) {
-                view.used.insert(node_id.to_string(), envelope.room.clone());
+    }
+    best.map(|(_, node_id)| node_id.to_string())
+}
+
+/// How many random envelopes `fast` placement reads looking for two with
+/// room before it falls back to reading them all.
+const FAST_SAMPLES: usize = 8;
+
+/// `stateful.placement = "fast"`: power of two choices. Of two envelopes
+/// sampled at random among those with room, the one with more left. Reads
+/// at most [`FAST_SAMPLES`] envelopes whatever the fleet's size, and falls
+/// back to [`best_node`] when they turn up nothing, which happens only when
+/// most of the fleet is full or already tried.
+fn two_choices(
+    view: &RoomView,
+    in_flight: &HashMap<String, BTreeMap<String, f64>>,
+    needs: &BTreeMap<String, f64>,
+    tried: &[String],
+    rng: &mut impl rand::Rng,
+) -> Option<String> {
+    if view.envelopes.is_empty() {
+        return None;
+    }
+    let mut best: Option<(f64, &str)> = None;
+    let mut fitting = 0;
+    for _ in 0..FAST_SAMPLES {
+        let envelope = &view.envelopes[rng.gen_range(0..view.envelopes.len())];
+        if tried.contains(&envelope.node_id) {
+            continue;
+        }
+        let Some(left) = room_left(view, in_flight, envelope, needs) else {
+            continue;
+        };
+        if best.is_none_or(|(most, _)| left > most) {
+            best = Some((left, &envelope.node_id));
+        }
+        fitting += 1;
+        if fitting == 2 {
+            break;
+        }
+    }
+    match best {
+        Some((_, node_id)) => Some(node_id.to_string()),
+        None => best_node(view, in_flight, needs, tried, rng),
+    }
+}
+
+fn add_amounts(totals: &mut BTreeMap<String, f64>, amounts: &BTreeMap<String, f64>, sign: f64) {
+    for (name, amount) in amounts {
+        *totals.entry(name.clone()).or_insert(0.0) += sign * amount;
+    }
+}
+
+/// One start's hold on a node's room, from [`reserve`] until the node
+/// answers. Dropped unsettled (the start failed, or its caller went away),
+/// it only gives the room back.
+struct Reservation {
+    key: RoomKey,
+    node_id: String,
+    needs: BTreeMap<String, f64>,
+    settled: bool,
+}
+
+/// What a node's answer to a start says about its room.
+enum Settle {
+    /// It took the session: count it until a refresh reads it back.
+    Started(BTreeMap<String, f64>),
+    /// It refused for room: count the node as full until the next refresh.
+    Full,
+    /// Anything else: give the room back.
+    Released,
+}
+
+impl Reservation {
+    fn settle(mut self, outcome: Settle) {
+        self.settled = true;
+        let mut cache = lock_room_cache();
+        let Some(state) = cache.get_mut(&self.key) else {
+            return;
+        };
+        release(state, &self.node_id, &self.needs);
+        let Some(view) = state.view.as_mut() else {
+            return;
+        };
+        match outcome {
+            Settle::Started(amounts) => {
+                add_amounts(
+                    view.used.entry(self.node_id.clone()).or_default(),
+                    &amounts,
+                    1.0,
+                );
             }
+            Settle::Full => {
+                if let Some(envelope) = view.envelopes.iter().find(|e| e.node_id == self.node_id) {
+                    view.used
+                        .insert(self.node_id.clone(), envelope.room.clone());
+                }
+            }
+            Settle::Released => {}
         }
     }
 }
 
-enum NoteUse {
-    Started(BTreeMap<String, f64>),
-    Full,
+impl Drop for Reservation {
+    fn drop(&mut self) {
+        if self.settled {
+            return;
+        }
+        if let Some(state) = lock_room_cache().get_mut(&self.key) {
+            release(state, &self.node_id, &self.needs);
+        }
+    }
 }
 
-/// Nodes with room for `needs`, most room first: by the smallest fraction of
-/// any sized resource left after the session is added.
-fn rank(view: &RoomView, needs: &BTreeMap<String, f64>) -> Vec<String> {
-    let mut ranked: Vec<(f64, String)> = view
-        .envelopes
-        .iter()
-        .filter_map(|envelope| {
-            let used = view.used.get(&envelope.node_id);
-            let mut left = f64::INFINITY;
-            for (name, need) in needs {
-                let Some(room) = envelope.room.get(name) else {
-                    continue;
-                };
-                let taken = used.and_then(|used| used.get(name)).copied().unwrap_or(0.0);
-                let free = room - taken - need;
-                if free < -1e-9 {
-                    return None;
-                }
-                if *room > 0.0 {
-                    left = left.min(free / room);
-                }
-            }
-            Some((left, envelope.node_id.clone()))
-        })
-        .collect();
-    ranked.sort_by(|a, b| b.0.total_cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
-    ranked.into_iter().map(|(_, node_id)| node_id).collect()
+fn release(state: &mut RoomState, node_id: &str, needs: &BTreeMap<String, f64>) {
+    if let Some(pending) = state.in_flight.get_mut(node_id) {
+        add_amounts(pending, needs, -1.0);
+        if pending.values().all(|amount| amount.abs() < 1e-9) {
+            state.in_flight.remove(node_id);
+        }
+    }
+}
+
+/// Count `node_id` as full in the router's view of a task until the next
+/// refresh: it refused a session for room outside [`start`] (a resume on
+/// the session's own node).
+pub fn note_full(store: &Store, job_id: &str, task_name: &str, node_id: &str) {
+    let key = room_key(store, job_id, task_name);
+    let mut cache = lock_room_cache();
+    let Some(view) = cache.get_mut(&key).and_then(|state| state.view.as_mut()) else {
+        return;
+    };
+    if let Some(envelope) = view.envelopes.iter().find(|e| e.node_id == node_id) {
+        view.used.insert(node_id.to_string(), envelope.room.clone());
+    }
 }
 
 /// Every node holding an envelope for a session task, for an edge picker
@@ -1161,27 +1404,29 @@ pub async fn start(
             });
         }
     }
-    let view = room_view(store, job_id, &task.name).await?;
-    if view.envelopes.is_empty() {
-        metrics.session_starts_total.inc(&["no_envelope"]);
-        return Err(Status::failed_precondition(format!(
-            "no node runs an envelope for {job_id}/{} yet; the scheduler places one on every \
-             eligible node that reports the `sessions` capability (see `legion job status \
-             {job_id}`)",
-            task.name
-        )));
-    }
+    refresh_room(store, job_id, &task.name).await?;
     let needs = resource_amounts(&task.resources);
-    let candidates = rank(&view, &needs);
-    if candidates.is_empty() {
-        metrics.session_starts_total.inc(&["no_room"]);
-        return Err(Status::resource_exhausted(format!(
-            "every envelope for {job_id}/{} is full ({} nodes); sessions free room as they \
-             end, or raise stateful.envelope.resources",
-            task.name,
-            view.envelopes.len()
-        )));
-    }
+    let placement = crate::structs::session::placement(task);
+    let mut first = match reserve(store, job_id, &task.name, &needs, &[], placement) {
+        Ok(reservation) => Some(reservation),
+        Err(NoRoom { envelopes: 0 }) => {
+            metrics.session_starts_total.inc(&["no_envelope"]);
+            return Err(Status::failed_precondition(format!(
+                "no node runs an envelope for {job_id}/{} yet; the scheduler places one on \
+                 every eligible node that reports the `sessions` capability (see `legion job \
+                 status {job_id}`)",
+                task.name
+            )));
+        }
+        Err(NoRoom { envelopes }) => {
+            metrics.session_starts_total.inc(&["no_room"]);
+            return Err(Status::resource_exhausted(format!(
+                "every envelope for {job_id}/{} is full ({envelopes} nodes); sessions free room \
+                 as they end, or raise stateful.envelope.resources",
+                task.name,
+            )));
+        }
+    };
     let task_config_id = store
         .shared_task_configs_for_job_config(&config.id())
         .map_err(|err| Status::internal(format!("failed to read task configs: {err:#}")))?
@@ -1199,7 +1444,17 @@ pub async fn start(
         .map(|band| band.as_str().to_string())
         .unwrap_or_default();
     let mut refusals = Vec::new();
-    for node_id in candidates.into_iter().take(ROUTER_ATTEMPTS) {
+    let mut tried: Vec<String> = Vec::new();
+    while tried.len() < ROUTER_ATTEMPTS {
+        let reservation = match first.take() {
+            Some(reservation) => reservation,
+            None => match reserve(store, job_id, &task.name, &needs, &tried, placement) {
+                Ok(reservation) => reservation,
+                Err(_) => break,
+            },
+        };
+        let node_id = reservation.node_id.clone();
+        tried.push(node_id.clone());
         let issued_at = now_unix_ms();
         let minted;
         let session_id = match derived_id {
@@ -1235,14 +1490,8 @@ pub async fn start(
                 };
                 store
                     .sessions()
-                    .record_start(&node_id, status.clone(), Instant::now());
-                note_in_view(
-                    store,
-                    job_id,
-                    &task.name,
-                    &node_id,
-                    NoteUse::Started(session_amounts(&status)),
-                );
+                    .record_start(&node_id, status, Instant::now());
+                reservation.settle(Settle::Started(needs.clone()));
                 metrics.session_starts_total.inc(&["started"]);
                 debug!(session_id, node_id = %node_id, "Session started");
                 return Ok(StartedSession {
@@ -1269,12 +1518,16 @@ pub async fn start(
                         });
                     }
                 }
-                if matches!(
-                    status.code(),
-                    tonic::Code::ResourceExhausted | tonic::Code::FailedPrecondition
-                ) {
-                    note_in_view(store, job_id, &task.name, &node_id, NoteUse::Full);
-                }
+                reservation.settle(
+                    if matches!(
+                        status.code(),
+                        tonic::Code::ResourceExhausted | tonic::Code::FailedPrecondition
+                    ) {
+                        Settle::Full
+                    } else {
+                        Settle::Released
+                    },
+                );
                 debug!(
                     session_id,
                     node_id = %node_id,
@@ -1384,9 +1637,16 @@ fn worker_client(
     ),
     Status,
 > {
-    let node = store
-        .get_node(node_id)
-        .map_err(|_| Status::not_found(format!("node {node_id} not found")))?;
+    // The read model's row, as dispatch reads it: a start must not pay a
+    // store read and a parse of the node's attributes to learn its address.
+    let node = match store.cached_node(node_id).ok().flatten() {
+        Some(node) => node,
+        None => std::sync::Arc::new(
+            store
+                .get_node(node_id)
+                .map_err(|_| Status::not_found(format!("node {node_id} not found")))?,
+        ),
+    };
     let target = crate::manager::worker_plane::WorkerTarget::for_node(&node)?;
     let client = crate::manager::worker_plane::WorkerPlane::global().client_for(store, &target)?;
     Ok((client, target))
@@ -1513,10 +1773,195 @@ mod sessions_test {
             .collect(),
         };
         let needs = used(500.0, 512.0);
+        let none = HashMap::new();
+        let mut rng = rand::thread_rng();
+        let pick = |in_flight: &HashMap<String, BTreeMap<String, f64>>,
+                    tried: &[String],
+                    rng: &mut rand::rngs::ThreadRng| {
+            best_node(&view, in_flight, &needs, tried, rng)
+        };
+        assert_eq!(pick(&none, &[], &mut rng).as_deref(), Some("idle"));
         assert_eq!(
-            rank(&view, &needs),
-            vec!["idle".to_string(), "busy".to_string()]
+            pick(&none, &["idle".to_string()], &mut rng).as_deref(),
+            Some("busy")
         );
+        assert_eq!(
+            pick(&none, &["idle".to_string(), "busy".to_string()], &mut rng),
+            None,
+            "a full node is never picked"
+        );
+        // Starts in flight count: with 1,500 of idle's 2,000 MHz held by
+        // unanswered starts, busy has more room left.
+        let in_flight = HashMap::from([("idle".to_string(), used(1500.0, 512.0))]);
+        assert_eq!(pick(&in_flight, &[], &mut rng).as_deref(), Some("busy"));
+    }
+
+    /// `fast` placement never picks a full or tried node, takes the roomier
+    /// of its two samples, and falls back to a full read when its samples
+    /// find nothing.
+    #[test]
+    fn fast_placement_picks_the_roomier_of_two_nodes_with_room_test() {
+        let room =
+            |cpu: f64| -> BTreeMap<String, f64> { BTreeMap::from([("cpu".to_string(), cpu)]) };
+        let envelope = |node: &str| Envelope {
+            node_id: node.into(),
+            room: room(1000.0),
+        };
+        let needs = room(100.0);
+        let none = HashMap::new();
+        let mut rng = rand::thread_rng();
+
+        // One node with room among many full ones: the samples rarely find
+        // it, and the fallback read does.
+        let mut envelopes: Vec<Envelope> =
+            (0..64).map(|n| envelope(&format!("full-{n}"))).collect();
+        envelopes.push(envelope("open"));
+        let mut used: HashMap<String, BTreeMap<String, f64>> = (0..64)
+            .map(|n| (format!("full-{n}"), room(1000.0)))
+            .collect();
+        let view = RoomView {
+            read_at: Instant::now(),
+            envelopes,
+            used: used.clone(),
+        };
+        for _ in 0..50 {
+            assert_eq!(
+                two_choices(&view, &none, &needs, &[], &mut rng).as_deref(),
+                Some("open")
+            );
+        }
+        assert_eq!(
+            two_choices(&view, &none, &needs, &["open".to_string()], &mut rng),
+            None,
+            "a full or tried node is never picked"
+        );
+
+        // Two nodes with room: it takes the roomier one whenever it sampled
+        // both (samples are with replacement, so three picks in four), so
+        // the emptier node takes about 300 of 400.
+        used.clear();
+        used.insert("a".into(), room(800.0));
+        let view = RoomView {
+            read_at: Instant::now(),
+            envelopes: vec![envelope("a"), envelope("b")],
+            used,
+        };
+        let picks: Vec<String> = (0..400)
+            .filter_map(|_| two_choices(&view, &none, &needs, &[], &mut rng))
+            .collect();
+        let to_b = picks.iter().filter(|node| *node == "b").count();
+        assert!(to_b > 250, "b, the emptier node, took {to_b} of 400 picks");
+    }
+
+    /// Nodes with the same room left are picked at random, so managers that
+    /// read the same view do not all send their next start to one node.
+    #[test]
+    fn the_router_breaks_ties_at_random_test() {
+        let room: BTreeMap<String, f64> = BTreeMap::from([("cpu".to_string(), 2000.0)]);
+        let view = RoomView {
+            read_at: Instant::now(),
+            envelopes: ["a", "b", "c", "d"]
+                .iter()
+                .map(|node| Envelope {
+                    node_id: node.to_string(),
+                    room: room.clone(),
+                })
+                .collect(),
+            used: HashMap::new(),
+        };
+        let needs = BTreeMap::from([("cpu".to_string(), 500.0)]);
+        let mut rng = rand::thread_rng();
+        let mut picked: HashMap<String, usize> = HashMap::new();
+        for _ in 0..4_000 {
+            let node = best_node(&view, &HashMap::new(), &needs, &[], &mut rng).unwrap();
+            *picked.entry(node).or_default() += 1;
+        }
+        assert_eq!(picked.len(), 4, "every tied node is picked: {picked:?}");
+        assert!(
+            picked.values().all(|count| *count > 700),
+            "ties are spread evenly: {picked:?}"
+        );
+    }
+
+    /// A start's room is held from the pick until the node answers, and
+    /// given back if the start is dropped unanswered, so a cancelled create
+    /// never leaks room.
+    #[test]
+    fn a_reservation_holds_room_until_settled_or_dropped_test() -> R<()> {
+        let dir = tempfile::tempdir()?;
+        let store = Store::start_storage(&crate::structs::config::ManagerConfigFull {
+            store_path: dir.path().join("store").to_str().unwrap_or_default().into(),
+            ..Default::default()
+        })?;
+        let key = room_key(&store, "agents", "workspace");
+        let room = BTreeMap::from([("cpu".to_string(), 1000.0)]);
+        lock_room_cache().insert(
+            key.clone(),
+            RoomState {
+                view: Some(RoomView {
+                    read_at: Instant::now(),
+                    envelopes: vec![Envelope {
+                        node_id: "n1".into(),
+                        room: room.clone(),
+                    }],
+                    used: HashMap::new(),
+                }),
+                ..Default::default()
+            },
+        );
+        let needs = BTreeMap::from([("cpu".to_string(), 500.0)]);
+        let first = reserve(
+            &store,
+            "agents",
+            "workspace",
+            &needs,
+            &[],
+            SessionPlacement::Spread,
+        )
+        .expect("room");
+        let second = reserve(
+            &store,
+            "agents",
+            "workspace",
+            &needs,
+            &[],
+            SessionPlacement::Spread,
+        )
+        .expect("room");
+        assert_eq!(
+            reserve(
+                &store,
+                "agents",
+                "workspace",
+                &needs,
+                &[],
+                SessionPlacement::Spread
+            )
+            .err(),
+            Some(NoRoom { envelopes: 1 }),
+            "two starts in flight fill the envelope"
+        );
+        drop(second);
+        let third = reserve(
+            &store,
+            "agents",
+            "workspace",
+            &needs,
+            &[],
+            SessionPlacement::Spread,
+        )
+        .expect("room given back");
+        first.settle(Settle::Started(needs.clone()));
+        third.settle(Settle::Released);
+        let cache = lock_room_cache();
+        let state = &cache[&key];
+        assert!(state.in_flight.is_empty(), "{:?}", state.in_flight);
+        assert_eq!(
+            state.view.as_ref().map(|view| view.used["n1"]["cpu"]),
+            Some(500.0),
+            "a started session counts until the next refresh"
+        );
+        Ok(())
     }
 
     #[test]

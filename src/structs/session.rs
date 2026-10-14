@@ -74,6 +74,27 @@ pub struct SessionEnvelopeConfig {
     pub constraints: Value,
 }
 
+/// How a manager's session router picks the node a session starts on
+/// (`stateful.placement`). The node stays authoritative either way: a pick
+/// that turns out full costs a retry on the next node, never an over-full
+/// envelope.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionPlacement {
+    /// The node with the most room left, counting the router's own starts
+    /// still in flight, with ties broken at random. Spreads sessions as
+    /// evenly as the router's view allows. Each pick reads every node that
+    /// holds an envelope for the task.
+    #[default]
+    Spread,
+    /// Power of two choices: the roomier of two nodes sampled at random from
+    /// the ones with room. A pick costs the same on ten nodes or ten
+    /// thousand, and managers sharing a fleet rarely pick the same node, for
+    /// a less even spread. Falls back to `spread` when the samples find no
+    /// room, which happens only near a full fleet.
+    Fast,
+}
+
 /// When a session becomes a keyed instance (`stateful.promote`).
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -146,6 +167,14 @@ pub fn fence_after(task: &TaskConfig) -> std::time::Duration {
         .and_then(|raw| humantime::parse_duration(raw.trim()).ok())
         .filter(|after| !after.is_zero())
         .unwrap_or(DEFAULT_FENCE_AFTER)
+}
+
+/// How a session task's router picks nodes (`stateful.placement`).
+pub fn placement(task: &TaskConfig) -> SessionPlacement {
+    task.stateful
+        .as_ref()
+        .and_then(|stateful| stateful.placement)
+        .unwrap_or_default()
 }
 
 /// Whether a session task accepts caller-chosen ids (`promote.onName`).
@@ -245,6 +274,14 @@ pub fn normalize_session_tasks(config: &mut JobConfig) -> R<()> {
                     bail!(
                         "task {} sets stateful.promote, which only a session task has\nHint: set \
                          stateful.mode = \"session\", or remove promote",
+                        task.name
+                    );
+                }
+                if stateful.placement.is_some() {
+                    bail!(
+                        "task {} sets stateful.placement, which only a session task has: it picks \
+                         the node a session starts on\nHint: set stateful.mode = \"session\", or \
+                         remove placement (the scheduler places every other task)",
                         task.name
                     );
                 }
@@ -501,6 +538,7 @@ mod session_test {
                 constraints: json!([{ "key": "rack", "operator": "=", "value": "r1" }]),
             }),
             promote: None,
+            placement: None,
             fence_after: None,
         });
         task
@@ -593,6 +631,33 @@ mod session_test {
             err.to_string().contains("without stateful.envelope"),
             "{err}"
         );
+    }
+
+    #[test]
+    fn placement_is_a_session_task_field_test() -> R<()> {
+        let mut task = session_task();
+        task.stateful.as_mut().unwrap().placement = Some(SessionPlacement::Fast);
+        let mut config = job(vec![task]);
+        normalize_session_tasks(&mut config)?;
+        assert_eq!(placement(&config.tasks[0]), SessionPlacement::Fast);
+        assert_eq!(placement(&session_task()), SessionPlacement::Spread);
+
+        let mut task = session_task();
+        let stateful = task.stateful.as_mut().unwrap();
+        stateful.mode = InstanceMode::Keyed;
+        stateful.envelope = None;
+        stateful.placement = Some(SessionPlacement::Spread);
+        let err = normalize_session_tasks(&mut job(vec![task])).expect_err("keyed");
+        assert!(err.to_string().contains("sets stateful.placement"), "{err}");
+
+        let parsed: crate::structs::StatefulConfig =
+            serde_json::from_value(json!({ "mode": "session", "placement": "fast" }))?;
+        assert_eq!(parsed.placement, Some(SessionPlacement::Fast));
+        assert!(serde_json::from_value::<crate::structs::StatefulConfig>(
+            json!({ "mode": "session", "placement": "bin_pack" })
+        )
+        .is_err());
+        Ok(())
     }
 
     #[test]

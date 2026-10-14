@@ -1123,6 +1123,7 @@ mod tests {
                 storage: None,
                 envelope: None,
                 promote: None,
+                placement: None,
                 fence_after: None,
             }),
             ..TaskConfig::new("db", "exec")
@@ -1152,6 +1153,7 @@ mod tests {
                 storage: None,
                 envelope: None,
                 promote: None,
+                placement: None,
                 fence_after: None,
             }),
             ..TaskConfig::new("db", "exec")
@@ -1348,6 +1350,7 @@ mod tests {
                 }),
                 envelope: None,
                 promote: None,
+                placement: None,
                 fence_after: None,
             }),
             ..TaskConfig::new("workspace", "exec")
@@ -1379,6 +1382,7 @@ mod tests {
                 }),
                 envelope: None,
                 promote: None,
+                placement: None,
                 fence_after: None,
             }),
             ..TaskConfig::new("workspace", "exec")

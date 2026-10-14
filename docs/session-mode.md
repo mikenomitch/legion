@@ -121,12 +121,18 @@ A manager answering for a session it does not index asks its peers over the
 raft transport and merges their answers, preferring whichever manager heard
 from a node most recently.
 
-**The router counts its own starts.** For about 30 seconds after a start,
-until the node's next report lists it, the router counts the session from
-its own record, so back-to-back creates do not all land on the same node.
-The router caches its view of envelope room for one second. The node stays
-authoritative: an over-count costs a retry on the next node, never an
-over-full envelope.
+**The router counts its own starts.** A start holds its share of the
+chosen node's room in the router's view from the moment the router picks
+the node, before the node answers, so creates in flight at once spread
+across nodes instead of all taking the one with the most room. A node
+that accepts keeps the share: for about 30 seconds, until the node's next
+report lists the session, the router counts it from its own record. A
+node that refuses gives it back. Nodes with the same room left are picked
+at random, so managers reading the same view do not all send their next
+start to one node. The router caches its view of envelope room for one
+second, and when it expires one start reads it again while the others
+keep routing on the old view. The node stays authoritative: an over-count
+costs a retry on the next node, never an over-full envelope.
 
 ## When to use it
 
@@ -415,8 +421,8 @@ nodes instead, with no manager on the path and nothing written anywhere:
    JWKS, its expiry, and its pool), builds the start from the session
    task's spec, which its envelope carries, admits it against the
    envelope, and launches. By default the reply waits up to 30 seconds
-   for the session to be running; `--no-wait` (`wait = false`) answers
-   once admitted. A refusal (`RESOURCE_EXHAUSTED`: the envelope is full or
+   for the session to be running, and answers as soon as it is.
+   `--no-wait` (`wait = false`) answers once admitted. A refusal (`RESOURCE_EXHAUSTED`: the envelope is full or
    every launch slot is busy) is retryable on the next node.
 
 4. Route every later request for the session by its id, never by hashing

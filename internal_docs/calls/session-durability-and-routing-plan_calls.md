@@ -846,3 +846,158 @@ filesystem (local disks; NFS needs lock support).
 
 **Why (simplicity).** mtime is too coarse to order two writes in one
 second, and a content hash is what S3 hands back as an ETag anyway.
+
+## 40. The router holds a start's room from the pick, not from the node's answer
+
+**Call.** A routed start adds its session's resources to the chosen
+node's in-flight total, in the router's cached view, before it sends
+`PostWork`. Accepted, the hold becomes the router's record of the start.
+Refused for room, the node counts as full until the next refresh. Any
+other answer, or a create whose caller goes away, gives it back (a drop
+guard). The in-flight totals are kept apart from the cached view, so a
+refresh does not lose them.
+
+**Alternatives.** (a) Count the start only once the node accepts, as
+before: every create in flight at once read the same view and picked the
+same node, which then refused the overflow and cost those creates a retry.
+(b) Power-of-two-choices or a placement knob
+(`stateful.placement = fast | spread | bin_pack`), which belongs with
+router scoring and is not added here.
+
+**Trade-off.** A start that never gets an answer holds its room until its
+5-second call deadline gives it back. A refresh that lands between a
+node's acceptance and the router's record can count that one session
+twice for up to a second, which costs at most a retry.
+
+**Why (performance).** The refused overflow was a whole extra round trip
+for those starts, and the node it piled onto ran fuller than its peers
+under exactly the concurrent load sessions exist for.
+
+## 41. Ties between equally roomy envelopes go to a random node
+
+**Call.** The router still picks the node with the most room left, and
+breaks ties uniformly at random (one pass, reservoir sampling) instead
+of by node id.
+
+**Alternatives.** (a) Node-id order, as before: every manager reading the
+same view picked the same node on a tie, so managers herded on an empty
+fleet. (b) A per-manager seeded order, deterministic per manager but just
+as good at splitting managers.
+
+**Trade-off.** Placement on a tie is not reproducible across runs, so a
+test cannot assert which of several equal nodes a start lands on.
+
+**Why (performance).** A simulation of three managers at 95% utilization
+(the locality-routing investigation) showed most cross-manager refusals
+come from deterministic ties. Breaking them at random removes most of
+that with no knob, and most-room stays the better policy for one manager.
+
+## 42. One start re-reads an expired room view, and the rest route on the old one
+
+**Call.** When the router's one-second view expires, the first start to
+notice reads the envelopes and asks the peers again. Starts that arrive
+while it reads route on the stale view rather than each doing the same
+read.
+
+**Alternatives.** (a) Every start that sees the expired view refreshes,
+as before: with 64 starts in flight, an expiry ran 64 envelope reads and
+64 peer fan-outs at once. (b) Make the others wait for the one refresh,
+which adds the refresh's latency to every start in flight.
+
+**Trade-off.** A start can route on a view up to one refresh older than
+the TTL says. The node is authoritative, so this costs at most a refusal
+and a retry.
+
+**Why (performance).** The stampede put a refresh's full cost into the
+tail of every start in flight once a second.
+
+## 43. A worker dial reads the cluster CA at most once a second per store
+
+**Call.** The worker plane keeps the CA's pin and this manager's
+certificates for it for one second per store, instead of reading the CA
+row and parsing its PEM twice per call to a worker.
+
+**Alternatives.** (a) Read the CA once per call, not twice: still a store
+read per session start. (b) Invalidate on a CA rotation's write: exact,
+but it couples the store's write path to the worker plane for a saving
+the TTL already gets.
+
+**Trade-off.** A rotated CA is picked up by dials up to a second late.
+The rotation's bundle trusts the previous CA during the overlap, so those
+dials still succeed.
+
+**Why (performance).** On the measured start path these reads were about
+a fifth of the manager's share of a start.
+
+## 44. An edge start's wait is woken by its claim, with a 50 ms backstop
+
+**Call.** `StartSession` with `wait` registers a waker for its claim, and
+the node fires it when the claim changes stage or ends. The wait still
+looks again at least every 50 ms.
+
+**Alternatives.** (a) Poll with backoff, as before (2, 4, 8, ... up to
+50 ms between looks): a session that came up just after a look was
+answered up to 50 ms late, about a third of a 150 ms VM boot. (b) Wake
+every waiter on any change (one `Notify` for the node), which wakes every
+waiting start for every other start's progress.
+
+**Trade-off.** One small map entry per waiting start. Paths that end a
+session without going through a claim's stage change or `kill_claim`
+fall back to the backstop.
+
+**Why (performance).** The reply now follows the boot, so an edge start's
+latency is the boot's, not the boot rounded up to the next poll.
+
+## 45. A session that stages artifacts boots off the lock, and one that restores still does not
+
+**Call.** A session whose task declares artifacts now launches through
+the same unlocked path as one without: the staging thread registers it
+under the task-manager lock and runs the runtime's `prepare` and `start`
+with the lock released. A session resuming from a checkpoint keeps the
+locked start.
+
+**Alternatives.** (a) Move the restore off the lock too, which needs the
+restore's outcome recorded on the checkpoint channel from outside the
+locked start.
+
+**Trade-off.** A node resuming several sessions at once still restores
+them one at a time, and holds up its other starts, stops, and heartbeats
+while it does.
+
+**Why (performance).** The artifact path was a plain omission with a fix
+that reuses existing machinery (`begin_staged_launch`). The restore path
+is a larger change that belongs with the restore work, and is listed in
+`TODO.md`.
+
+## 46. A session start does not teach the node's boot-ticket spec cache
+
+**Call.** `PostWork` skips `remember_specs` for a session start.
+
+**Alternatives.** (a) Keep feeding the cache from every payload: a parse
+of the whole task config per start, under the cache's lock.
+
+**Trade-off.** None found: boot tickets need `speculativeStart`, which a
+session task refuses, so no boot ticket can name a session task, and the
+envelope already carries the session task's spec (entry 24).
+
+**Why (performance).** It was the only repeated parse of the payload on
+the node's admission path.
+
+## 47. The routed start keeps sending the full payload
+
+**Call.** The manager still builds and sends a session's whole
+`TaskAllocation`. The node does not resolve a spec reference from its
+envelope instead.
+
+**Alternatives.** (a) Send only the job, task, id, and lease, and have the
+node build the payload from the spec its envelope carries, as an edge
+start does.
+
+**Trade-off.** The manager builds a payload per start: about 40 µs, and
+about 560 bytes on the wire for a small task.
+
+**Why (simplicity).** Measured, the payload was a few percent of a
+start's cost, below the job lookup, the CA reads, and the round trip
+itself. A reference would be a wire-format change, and it would make a
+manager-routed start depend on the node holding the envelope's current
+spec, for a saving inside the noise.

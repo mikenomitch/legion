@@ -187,6 +187,7 @@ fn stateful_job(name: &str, count: u32, driver: &str, params: Option<Value>) -> 
                 }),
                 envelope: None,
                 promote: None,
+                placement: None,
                 fence_after: None,
             }),
             ..TaskConfig::new("db", "exec")

@@ -2104,8 +2104,15 @@ Plans: [task-runtime-plugins](../docs/task-runtime-plugins.md).
         [calls](calls/sandbox-scaling-plan_calls.md) #58).
   - [ ] **Router locality.** The router ranks by free room only; plan §6.4
         also preferred nodes whose content store holds the image
-        ([calls](calls/sandbox-scaling-plan_calls.md) #27). Matters once
-        sessions restore (idle sessions, above).
+        ([calls](calls/sandbox-scaling-plan_calls.md) #27). Investigated
+        2026-10-13 and deferred. Checkpoint locality has nothing to prefer:
+        only one node ever holds a `store` session's parts, and a resume
+        already asks it first (`locate_session`). Image locality is a small
+        win in one regime (simulated cold starts 37% to 25% with 10 images
+        and a cache holding 5), mostly fixed by sizing
+        `content.budgets.artifacts`, and a large weight makes warm nodes
+        warmer. Revisit once checkpoint chunks are shared across
+        generations and evicted parts stay as unpinned cache.
   - [ ] **`legion_sessions_envelope_free{job}`.** Plan §15 promised an
         envelope free-room gauge; only start and stop counters exist.
   - [ ] **Ended sessions are remembered per manager.** A retried stop that
@@ -3108,6 +3115,35 @@ Plans: [stateful-workloads](plans/stateful-workloads-and-instance-identity-plan.
         its derived-id fan-out (plan §8 item 4). Needs the loadgen session
         mode in the bottleneck plan's gaps
         (`benchmarks/aws/README.md`, "Bottleneck measurements").
+  - [x] The start hot path, measured and cut (PR_LINK): the router holds a
+        start's room from the pick (no herding of concurrent creates), breaks
+        ties at random (no herding across managers), refreshes its view
+        single-flight, reads the job in one query with cached task configs,
+        and dials workers from the read model's node row and a CA read at
+        most once a second. On the node, a session's process start time
+        (for its `sessions.db` row) is read off the task-manager lock, a
+        session that stages artifacts boots off the lock, an edge start's
+        `wait` is woken by its claim instead of polling, and a resume
+        refused for room on the session's own node marks it full and skips
+        it. Measured with
+        `session_start_cost_breakdown_measure`
+        ([plan §6.5](plans/session-durability-and-routing-plan.md#65-everything-else-between-here-and-tens-of-thousands-a-second),
+        calls 40 to 47).
+  - [ ] A session's start still does its filesystem work under the
+        task-manager lock: the allocation, task, and log directories
+        (`prepare_instance`, `claim_allocation_log_dir`) and the log sink's
+        start (`notify_log_sinks_started`), about half a millisecond a start
+        on a loaded macOS host, and a session stop rewrites and fsyncs the
+        worker state file (`signal_and_terminate`). Each one holds up every
+        other start, stop, and heartbeat on the node. Sampled with
+        `/usr/bin/sample` on a worker under `legion-loadgen --mode
+        sessions`.
+  - [ ] A session resuming from a checkpoint still boots under the
+        task-manager lock: the restore records its outcome on the
+        checkpoint channel from inside the locked start, so several resumes
+        on one node run one at a time and hold up its heartbeat
+        ([calls](calls/session-durability-and-routing-plan_calls.md) #45,
+        `begin_task_allocation_gated` in `src/worker/task_manager.rs`).
   - [x] Phase 5a: sessions sleep on their own node with `durability =
         "local"`: `suspend.keepFor`, idle suspend, `Worker.SuspendSessions`
         / `Worker.ResumeSession` routed by tag from `instance suspend` /

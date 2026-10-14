@@ -377,6 +377,15 @@ sandbox-scaling work bought:
   --nocapture`) measures bytes per instance and snapshot row, the store
   image at 10^5 (or `LEGION_MEASURE_INSTANCES`) instances, and full-set
   heartbeat bytes per dense node.
+- `tests/session_integration.rs` has two ignored session measurements,
+  against 16 fake nodes on loopback mTLS with no raft entry per start.
+  `session_start_latency_measure` times routed starts one at a time and 64
+  in flight. `session_start_cost_breakdown_measure` times each step of a
+  routed start on its own (the job lookup, the worker client, the start
+  payload, the `PostWork` round trip, the router, and the whole
+  `CreateInstance`) and prints the median and mean of each. Run them in a
+  release build:
+  `cargo test --release --test session_integration -- --ignored --nocapture session_start`.
 
 ## Plugin-Related Test Notes
 

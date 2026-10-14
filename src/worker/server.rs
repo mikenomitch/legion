@@ -164,8 +164,15 @@ impl WorkerDaemonService {
         mut allocation: TaskAllocation,
     ) -> Result<PostWorkReply, Status> {
         // Every payload this node is handed teaches it a job config it may
-        // later be asked to start from a boot ticket (docs/edge-boot.md).
-        if let Some(edge_boot) = self.edge_boot.as_ref() {
+        // later be asked to start from a boot ticket (docs/edge-boot.md). A
+        // session start teaches nothing: its task's envelope already carried
+        // the spec, and a boot ticket never names a session task, so parsing
+        // the payload again per start was pure cost.
+        let session_start = allocation
+            .provisional
+            .as_ref()
+            .is_some_and(|provisional| provisional.session.is_some());
+        if let Some(edge_boot) = self.edge_boot.as_ref().filter(|_| !session_start) {
             edge::remember_specs(&edge_boot.spec_cache, std::slice::from_ref(&allocation));
         }
 

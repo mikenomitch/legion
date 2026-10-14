@@ -297,13 +297,26 @@ pub async fn wait_until_running(
     timeout: Duration,
 ) -> R<bool> {
     let deadline = Instant::now() + timeout;
-    let mut pause = Duration::from_millis(2);
+    let claim_id = crate::structs::session::session_claim_id(session_id);
+    // Unregisters the waker however the wait ends, a dropped request
+    // included.
+    struct Registered<'a>(&'a Arc<Mutex<WorkerTaskManager>>, &'a str);
+    impl Drop for Registered<'_> {
+        fn drop(&mut self) {
+            if let Ok(mut guard) = self.0.lock() {
+                guard.release_stage_waiter(self.1);
+            }
+        }
+    }
+    let _registered = Registered(task_manager, &claim_id);
     loop {
-        let state = task_manager
-            .lock()
-            .expect("task manager")
-            .session_status(session_id)
-            .map(|status| status.state);
+        // Checked and registered under one lock: a stage change after the
+        // check leaves a permit on the waker, so it cannot be missed.
+        let (state, waiter) = {
+            let mut guard = task_manager.lock().expect("task manager");
+            let state = guard.session_status(session_id).map(|status| status.state);
+            (state, guard.stage_waiter(&claim_id))
+        };
         match state.as_deref() {
             Some("running") => return Ok(true),
             Some(_) => {}
@@ -311,13 +324,23 @@ pub async fn wait_until_running(
                 bail!("session {session_id} ended before it started running; see the node's log")
             }
         }
-        if Instant::now() >= deadline {
+        let now = Instant::now();
+        if now >= deadline {
             return Ok(false);
         }
-        tokio::time::sleep(pause).await;
-        pause = (pause * 2).min(Duration::from_millis(50));
+        // Woken by the claim's next stage change or its end. The backstop
+        // covers the paths that settle a session without either.
+        let _ = tokio::time::timeout(
+            (deadline - now).min(RUNNING_WAIT_BACKSTOP),
+            waiter.notified(),
+        )
+        .await;
     }
 }
+
+/// The longest [`wait_until_running`] sleeps without being woken before it
+/// looks again.
+const RUNNING_WAIT_BACKSTOP: Duration = Duration::from_millis(50);
 
 /// Apply a ratification verdict pushed by the manager (or fetched by the
 /// node) to a live claim.
