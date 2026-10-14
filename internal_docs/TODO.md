@@ -2985,14 +2985,23 @@ Plans: [task-runtime-plugins](../docs/task-runtime-plugins.md).
           manifest's `keyId` names them. Shares its reference count with
           published-part GC below
           ([calls 8](calls/checkpoint-encryption-plan_calls.md#8-manual-checkpoint-key-rotation-is-deferred-with-keyid-in-the-manifest-now)).
-    - [ ] Seal chunks of one large part in parallel. Sealing is one core per
-          part today, which is faster than any S3 upload but would matter on
-          a fast `file://` mount
-          ([calls 6](calls/checkpoint-encryption-plan_calls.md#6-publishing-hashes-while-it-seals-with-ring-replacing-the-separate-verify-pass)).
-    - [ ] Decrypt published parts as they stream in, instead of downloading
-          the ciphertext and opening it in place, to save a disk pass on
-          large fetches
-          ([calls 7](calls/checkpoint-encryption-plan_calls.md#7-fetch-opens-the-object-in-place-instead-of-streaming-through-the-fetcher)).
+    - [ ] A restore fetches every non-zero chunk of a part it lacks, even
+          when the node holds an earlier checkpoint of the same session or
+          another sandbox of the image. Keep a node-local chunk index and
+          copy held chunks instead, and keep released checkpoint parts as
+          evictable cache rather than deleting them at once
+          (`release_owner_pins`), so a session moving back to a node fetches
+          only what changed
+          ([chunked publish plan Phase 2](plans/chunked-checkpoint-publish-plan.md#8-implementation-phases),
+          [calls 8](calls/chunked-checkpoint-publish-plan_calls.md#8-a-restore-still-fetches-every-non-zero-chunk)).
+    - [ ] A publish rehashes the whole part even when one page changed. On
+          Firecracker, use the dirty bitmap to reuse clean chunks' digests
+          ([chunked publish plan Phase 3](plans/chunked-checkpoint-publish-plan.md#8-implementation-phases)).
+    - [ ] Measure chunked publish and fetch against a real MinIO and S3
+          bucket, and memory dirtiness on real Firecracker and
+          cloud-hypervisor guests. The chunk numbers so far come from a QEMU
+          TCG guest and the `file://` store
+          ([calls 4](calls/chunked-checkpoint-publish-plan_calls.md#4-the-default-chunk-size-is-1-mib)).
     - [ ] Measure sealed publish and fetch against a real MinIO in the Phase
           7b Linux checks (above), next to the plaintext numbers.
     - [ ] Hash the node content store with `ring` (imports, `verify`,
@@ -3002,7 +3011,10 @@ Plans: [task-runtime-plugins](../docs/task-runtime-plugins.md).
           ([calls 6](calls/checkpoint-encryption-plan_calls.md#6-publishing-hashes-while-it-seals-with-ring-replacing-the-separate-verify-pass)).
     - [ ] Garbage-collect published parts: Legion never deletes from the
           content store (call 62). A reference-counted sweep, or document a
-          lifecycle-rule recipe per provider. Spent spread-fork checkpoints
+          lifecycle-rule recipe per provider. Chunked publishing makes an
+          age rule of "longest-lived checkpoint plus `dedupWindow`" safe
+          ([calls 2](calls/chunked-checkpoint-publish-plan_calls.md#2-chunks-dedupe-per-job-and-per-dedup-window-not-cluster-wide)),
+          so a sweep is now about cost, not safety. Spent spread-fork checkpoints
           add to this: their node copy is reclaimed
           ([call 83](calls/suspend-resume-and-oversubscription-plan_calls.md)),
           their published parts are not.
@@ -5263,6 +5275,21 @@ docs: [task-runtime-plugins.md](../docs/task-runtime-plugins.md)
       open in place on fetch. Plaintext leftovers, tampering, wrong keys,
       and missing or locked keys each fail by name. Open follow-ups are under
       the suspend item in Task runtimes.
+- [x] **Published checkpoints are chunked and deduplicated**: every part is
+      cut into fixed-size chunks (`contentStore.chunkSize`, 1 MiB), each
+      distinct non-zero chunk is sealed and uploaded once per job and dedup
+      window (`contentStore.dedupWindow`, 24h), and a sealed index per part
+      lists them. Zero chunks are never stored, a repeat checkpoint uploads
+      only changed chunks, and sandboxes of one job share their image's
+      chunks. Chunks seal and open 16 at a time and never land ciphertext
+      on disk, which closes the encryption plan's parallel-sealing and
+      streaming-decrypt follow-ups. Measured on a QEMU guest (512 MiB
+      memory, 605 MiB root disk): 1,117 MiB per checkpoint before, 131 MiB
+      after an active minute and 38 MiB after an idle one
+      ([plan](plans/chunked-checkpoint-publish-plan.md) ·
+      [calls](calls/chunked-checkpoint-publish-plan_calls.md) ·
+      [docs](../docs/suspend-and-resume.md#how-published-parts-are-stored)).
+      Open follow-ups are under the suspend item in Task runtimes.
 
 ## Service discovery (v1)
 

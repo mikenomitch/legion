@@ -858,6 +858,16 @@ fn publish(
     }
     let keys =
         crate::checkpoint_seal::PartKeys::from_proto(&request.part_keys, &request.part_key_error);
+    let chunks = if manifest.memory.is_empty() {
+        None
+    } else {
+        Some(chunk_key(request).with_context(|| {
+            format!(
+                "publishing snapshot {} needs its job's chunk key",
+                manifest.id
+            )
+        })?)
+    };
     let mut uploaded = 0u64;
     for part in &mut manifest.memory {
         let digest = ContentDigest::parse(&part.digest)?;
@@ -867,10 +877,13 @@ fn publish(
                 part.role, manifest.id
             )
         })?;
+        let chunks = chunks
+            .as_ref()
+            .expect("a chunk key for a manifest with parts");
         let mut attempt = 0;
         let published = loop {
             attempt += 1;
-            match publishing.publish(key) {
+            match publishing.publish(key, chunks) {
                 Ok(published) => break published,
                 Err(err) if attempt < PUBLISH_ATTEMPTS => {
                     warn!(
@@ -890,13 +903,29 @@ fn publish(
                 }
             }
         };
-        if published.uploaded {
-            uploaded += published.bytes;
-        }
+        uploaded += published.uploaded_bytes;
         part.url = Some(published.url);
         part.key_id = Some(published.key_id);
     }
     Ok((manifest, uploaded))
+}
+
+/// The job chunk key a publish request carries, or why the manager sent
+/// none.
+fn chunk_key(request: &CheckpointRequest) -> R<crate::checkpoint_seal::ChunkKey> {
+    match request.chunk_key.as_ref() {
+        Some(wire) => crate::checkpoint_seal::ChunkKey::from_proto(wire),
+        None if !request.part_key_error.trim().is_empty() => {
+            bail!(
+                "the manager sent no chunk key: {}",
+                request.part_key_error.trim()
+            )
+        }
+        None => bail!(
+            "the manager sent no chunk key (a manager older than this worker sends none; \
+             upgrade the managers first)"
+        ),
+    }
 }
 
 /// Pre-fetch a published snapshot's parts into the node content store

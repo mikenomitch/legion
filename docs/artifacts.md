@@ -690,26 +690,35 @@ published part is sealed (encrypted) first. Configure it per worker type with
     # environment variables, then the instance profile). Or read an AWS
     # credential object from KV, the same shape artifact `auth.kv` takes:
     auth = { kv = "legion/content-store" },
+    # Optional. The size published parts are cut into, and how long chunks
+    # are shared between publishes (see "How published parts are stored").
+    chunkSize = "1MiB",
+    dedupWindow = "24h",
   },
 }
 ```
 
-Published content lands at `<url>/sealed/<name>`, encrypted with
-AES-256-GCM under a key the manager derives for that part from the cluster's
-checkpoint key (see
+Published content is cut into chunks (`chunkSize`, 1 MiB by default), and
+each distinct, non-zero chunk lands once at `<url>/sealed/<name>`, beside a
+sealed index per part that lists them. Every object is encrypted with
+AES-256-GCM under keys derived from the cluster's checkpoint key (see
 [published checkpoint encryption](suspend-and-resume.md#published-checkpoint-encryption)).
-The key and the name are both a keyed function of the content's digest, so
-publishing is idempotent: publishing bytes the destination already holds
-uploads nothing. The worker hashes the bytes as it seals them, so corrupt
-bytes are never published, and it records the published URL per digest in
-its store's index. Sealing and S3 uploads both stream (1 MiB chunks, 16 MiB
-upload parts), so a multi-gigabyte file never sits in memory. There is no
-plaintext mode.
+A chunk's key and name are a keyed function of its digest, its job, and
+the current dedup window (`dedupWindow`, 24 hours by default), so
+publishing is idempotent and incremental: chunks the destination already
+holds in the window are not uploaded again, and zero chunks never are (see
+[How published parts are stored](suspend-and-resume.md#how-published-parts-are-stored)).
+The worker hashes the bytes as it reads them, so corrupt bytes are never
+published, and it records the published URL per digest in its store's
+index. Chunks upload 16 at a time, so a multi-gigabyte part never sits in
+memory. There is no plaintext mode. A `chunkSize` outside 64 KiB to
+16 MiB, or not a multiple of 4 KiB, and a `dedupWindow` under a minute, fail
+manager startup like any malformed `contentStore`.
 
-Reads never use the publisher. Any worker fetches published content with the
-ordinary `s3://` or `file://` fetcher, opens it in place with the key the
-manager sent along with the work, and checks the plaintext against the
-digest before it lands in that worker's own store. Pointing each region's
+Reads never use the publisher. Any worker reads a part's index from its
+`s3://` or `file://` URL, opens it with the key the manager sent along with
+the work, fetches and opens the chunks it lists, and checks the reassembled
+plaintext against the digest before it lands in that worker's own store. Pointing each region's
 workers at their own bucket is how region locality works: Legion does not
 replicate between buckets.
 
@@ -732,8 +741,8 @@ submission):
   a restoring node signs part fetches only for URLs under its own
   contentStore.url (here: s3://legion-content-usw2/), so this fetch was
   anonymous. Give this node the same contentStore url and auth as the node
-  that published the snapshot: fetching s3://legion-content-use1/sealed/…
-  after 3 attempt(s): … 403 Forbidden
+  that published the snapshot: fetching s3://legion-content-use1/sealed/…:
+  fetching part index … after 3 attempt(s): … 403 Forbidden
   ```
 
 So every node that may restore a snapshot needs the same `contentStore` (url
@@ -749,8 +758,8 @@ disabled logs that it cannot publish and carries on.
 **What publishes today: durable checkpoints.** A suspend with
 `suspend.durability = "store"`, and `legion snapshot create --publish`, have
 the capturing worker publish each memory part of the checkpoint here once it
-is captured. Another node then restores it by fetching the parts through its
-ordinary fetchers, verified by digest, into its own content store (see
+is captured. Another node then restores it by fetching each part's index and
+chunks, verified by digest, into its own content store (see
 [suspend and resume](suspend-and-resume.md#durability-surviving-the-node)).
 A worker with a usable `contentStore` advertises the `content-publish`
 capability when it registers, and `instance suspend` with `durability =
@@ -760,8 +769,11 @@ content store, so `content.enabled = false` turns publishing off too.
 Published parts hold guest memory, secrets included, so they are only ever
 stored sealed. Restricting the bucket to your workers is still good practice,
 since object sizes are visible to anyone who can list it. Legion never
-deletes from the store, because one object can belong to more than one
-snapshot. Expire objects with bucket lifecycle rules.
+deletes from the store, because one chunk can belong to many checkpoints.
+Expire objects under `sealed/` with a bucket lifecycle rule older than your
+longest-lived checkpoint plus `dedupWindow`: a publish reuses only chunks
+uploaded in its own window, so that rule never removes a chunk a live
+checkpoint needs.
 
 **Warming.** `legion snapshot warm <snapshot> --constraint key=value` asks
 matching nodes to fetch a published snapshot's parts into their stores ahead

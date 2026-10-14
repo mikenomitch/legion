@@ -743,6 +743,14 @@ its `url` and sealing `keyId`).
   node derives each part's key from it. Any node with an envelope of the
   job can open the job's session checkpoints, and no other job's. The key
   is never written to disk or logged.
+- **Chunks.** Each part is published as chunks, and the node derives the
+  job's chunk key from the same session sealing key, so a periodic
+  checkpoint uploads only the chunks the session changed since the last
+  one, and sessions of one job share their image's chunks with each other
+  and with the job's snapshots ([How published parts are
+  stored](suspend-and-resume.md#how-published-parts-are-stored)). A bucket
+  lifecycle rule on `sealed/` must be older than the longest-lived
+  checkpoint plus the workers' `contentStore.dedupWindow`.
 - **Status.** `SessionStatus.checkpoint` (in `instance get`) reports the
   session's checkpoint: its `durability`, snapshot id, kind, size, when it
   was taken, and, once published, `publishedUrl`, the manifest's URL.

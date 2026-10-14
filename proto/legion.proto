@@ -4727,6 +4727,32 @@ message CheckpointRequest {
   // worker writes it verbatim as the archive manifest's `envelope`, beside
   // the published checkpoint manifest, and does not interpret it.
   string manifest_envelope = 11;
+
+  // `publish`: the snapshot's job's chunk key. A published part is stored
+  // as fixed-size chunks plus a sealed index (docs/suspend-and-resume.md,
+  // "How published parts are stored"), and the worker derives each chunk's
+  // key from this one, scoped to its current dedup window, so a chunk the
+  // job already uploaded in the window is not uploaded again. Unset for
+  // every other op, and when the manager could not derive it (the reason is
+  // in `part_key_error`, and the publish fails).
+  CheckpointChunkKey chunk_key = 12;
+}
+
+// A job's chunk key (docs/suspend-and-resume.md, "Published checkpoint
+// encryption"): HKDF-SHA256 of the job's session sealing key with the
+// context `chunks`, so the manager (for a keyed snapshot's publish) and a
+// session's node (with no manager on the path) derive the same key, and
+// checkpoints of one job share chunks whichever path published them. A
+// worker holding it can name and seal chunks of that job only. It cannot
+// open any part index, whose key comes from the part key. The generated
+// Rust type redacts `key` from Debug output and never serializes it.
+message CheckpointChunkKey {
+  // `<checkpoint key id>/session/<job>/chunks`. Informational: chunk keys
+  // are recorded in each part's sealed index, so a reader never needs it.
+  string key_id = 1;
+
+  // 32 bytes. Never logged and never written to disk.
+  bytes key = 2;
 }
 
 // The key for one published checkpoint part. A worker receives it with the

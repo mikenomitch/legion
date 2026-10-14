@@ -416,8 +416,9 @@ sum across them. See [suspend-and-resume.md](suspend-and-resume.md#metrics).
   suspend reports 0, because its volume stays in place uncopied.
 - **`legion_checkpoint_publish_bytes{kind}`** (histogram): bytes a node
   uploaded to its `contentStore` to publish one checkpoint
-  (`durability = "store"`). 0 when the store already held every part, since
-  parts are keyed by digest.
+  (`durability = "store"`): only the chunks the store did not hold yet, so
+  a repeat checkpoint reports what changed. 0 when the store already held
+  every chunk ([How published parts are stored](suspend-and-resume.md#how-published-parts-are-stored)).
 - **`legion_checkpoint_publish_seconds{kind}`** (histogram): how long each
   successful publish took on its node, from 50 ms to 10 minutes.
 - **`legion_checkpoint_publish_total{outcome}`** (counter): publishes

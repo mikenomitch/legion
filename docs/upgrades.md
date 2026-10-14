@@ -249,6 +249,14 @@ anything is captured.
   `published_at` columns it does not read, and it reads a `published`
   snapshot's state as unknown. Resume, or stop, instances with published
   checkpoints first.
+- **Chunked parts and whole-object parts do not mix.** Workers from the
+  release that publishes parts as chunks ([How published parts are
+  stored](suspend-and-resume.md#how-published-parts-are-stored)) cannot open
+  a part an older worker published as one object, and older workers cannot
+  open a chunked part. Both fail the fetch with `failed authentication`, and
+  `onRestoreFailure` decides what happens. Upgrade every worker that shares
+  a `contentStore` together, and resume published instances on the node
+  that took them (which needs no fetch) or let them boot cold.
 - **A VMM upgrade strands published memory checkpoints too.** A published
   checkpoint resumes on any node with the VMM version and CPU it was taken
   on, so upgrading the whole fleet's VMM leaves it nowhere to run. Upgrade a

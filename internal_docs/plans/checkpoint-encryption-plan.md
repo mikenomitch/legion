@@ -11,7 +11,10 @@ entry 6): the sealer hashes with `ring` and writes whole chunks. Deliberately
 deferred, each an open item in [`TODO.md`](../TODO.md): rotating the
 checkpoint key by hand, parallel sealing inside one part, a streaming decrypt
 that never lands ciphertext on disk, and moving the rest of the content
-store's hashing to `ring`.
+store's hashing to `ring`. Parallel sealing and the streaming decrypt later shipped with
+[chunked-checkpoint-publish-plan.md](chunked-checkpoint-publish-plan.md),
+which also replaced this plan's one-object-per-part layout (§6.2) with
+chunks and a sealed index.
 
 Every memory checkpoint Legion publishes is the guest's whole RAM, so it holds
 every secret and token the workload had loaded. Today a publish uploads it to

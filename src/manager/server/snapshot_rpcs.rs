@@ -1424,8 +1424,25 @@ pub(super) fn build_checkpoint_requests(store: &Store, node_id: &str) -> Vec<Che
         .map(|snapshot| match snapshot.state {
             // A `store` snapshot that is captured but not yet published.
             SnapshotState::Local => {
-                let (part_keys, part_key_error) =
+                let (part_keys, mut part_key_error) =
                     checkpoint_part_keys(store, &snapshot.manifest_json, PartKeyUse::Publish);
+                // Every part is published as chunks keyed from the job's
+                // chunk key (docs/suspend-and-resume.md, "How published parts
+                // are stored"). A missing key fails the publish on the
+                // worker with this reason, like a missing part key.
+                let chunk_key = match store.keyring().checkpoint_chunk_key(&snapshot.job_id) {
+                    Ok(key) => Some(key.to_proto()),
+                    Err(err) => {
+                        let err = format!("{err:#}");
+                        if !part_key_error.contains(&err) {
+                            if !part_key_error.is_empty() {
+                                part_key_error.push_str("; ");
+                            }
+                            part_key_error.push_str(&err);
+                        }
+                        None
+                    }
+                };
                 let (manifest_object, manifest_envelope) =
                     archive_request(store, &snapshot).unwrap_or_default();
                 CheckpointRequest {
@@ -1440,6 +1457,7 @@ pub(super) fn build_checkpoint_requests(store: &Store, node_id: &str) -> Vec<Che
                     part_key_error,
                     manifest_object,
                     manifest_envelope,
+                    chunk_key,
                 }
             }
             SnapshotState::Capturing => CheckpointRequest {

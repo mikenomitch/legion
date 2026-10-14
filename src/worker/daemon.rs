@@ -1635,12 +1635,22 @@ fn build_content_publishing(
             disabled; this node will not publish content");
         return None;
     };
-    match target.publisher(credentials) {
-        Ok(publisher) => {
-            info!(url = %target.url, "Content publishing enabled");
-            Some(Arc::new(crate::content_publish::ContentPublishing::new(
-                store, publisher,
-            )))
+    match target
+        .publisher(credentials)
+        .and_then(|publisher| Ok((publisher, target.chunk_settings()?)))
+    {
+        Ok((publisher, settings)) => {
+            info!(
+                url = %target.url,
+                chunk_size = settings.chunk_size,
+                dedup_window_secs = settings.dedup_window.as_secs(),
+                "Content publishing enabled"
+            );
+            Some(Arc::new(
+                crate::content_publish::ContentPublishing::with_settings(
+                    store, publisher, settings,
+                ),
+            ))
         }
         Err(err) => {
             warn!(error = ?err, "Invalid contentStore config; this node will not publish content");

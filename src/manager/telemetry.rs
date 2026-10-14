@@ -1262,7 +1262,7 @@ impl Metrics {
         let checkpoint_publish_bytes = Arc::new(HistogramVec {
             meta: FamilyMeta {
                 name: "legion_checkpoint_publish_bytes",
-                help: "Bytes a node uploaded to its contentStore to publish one checkpoint (durability = \"store\"), by kind (memory|disk). 0 when the store already held every part.",
+                help: "Bytes a node uploaded to its contentStore to publish one checkpoint (durability = \"store\"), by kind (memory|disk): only the chunks the store did not hold yet. 0 when it held every one.",
                 labels: &["kind"],
             },
             series: Series::new(),
