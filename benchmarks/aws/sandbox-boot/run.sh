@@ -19,6 +19,9 @@ out_dir="$SB_STATE/results"
 mkdir -p "$out_dir"
 
 "$SB_DIR/clear.sh" "$job" >/dev/null
+# Nodes tear stopped sessions down in the background; a run that starts
+# during that measures the teardown too.
+sleep "${SB_CLEAR_SETTLE:-8}"
 since="$(sb_ssh "${SB_WORKERS[0]}" "date -u '+%Y-%m-%d %H:%M:%S'")"
 for worker in "${SB_WORKERS[@]}"; do
     sb_scp_to "$worker" "$SB_DIR/boot-times.py" /tmp/boot-times.py

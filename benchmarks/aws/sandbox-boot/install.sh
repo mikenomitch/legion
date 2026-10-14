@@ -27,7 +27,7 @@ restart)
 wipe)
     for name in "${SB_WORKERS[@]}"; do
         # Sessions outlive the worker (KillMode=process), so the VMMs go too.
-        sb_ssh "$name" "sudo systemctl stop legion-worker 2>/dev/null; sudo pkill -9 cloud-hypervisor; sudo pkill -9 -f 'sleep 86' ; sudo rm -rf /var/lib/legion/state* /var/lib/legion/worker* /var/lib/legion/data /var/lib/legion/content /var/lib/legion/vmdev /var/lib/legion/sandbox-* /etc/legion/join-token; true" &
+        sb_ssh "$name" "sudo systemctl stop legion-worker 2>/dev/null; sudo pkill -9 cloud-hyperviso; sudo pkill -9 -f 'sleep 86' ; sudo rm -rf /var/lib/legion/state* /var/lib/legion/worker* /var/lib/legion/data /var/lib/legion/content /var/lib/legion/vmdev /var/lib/legion/sandbox-* /etc/legion/join-token; true" &
     done
     for name in "${SB_MANAGERS[@]}"; do
         sb_ssh "$name" "sudo systemctl stop legion-manager 2>/dev/null; sudo rm -rf /var/lib/legion/raft /var/lib/legion/store* /var/lib/legion/bootstrap-token; true" &
