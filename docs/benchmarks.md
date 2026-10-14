@@ -131,7 +131,9 @@ Each number is one run, so the multiple depends on which fleet size you
 quote: Legion leads by 3.5-7.5x at 1k-2k nodes and 22-35x at 5k-10k. Its
 peak at 5k is not a single outlier. A repeat of that cell placed
 1,151/sec, the fixed-heartbeat ablation below placed 1,134/sec, and the
-earlier build also peaked at 5k (905/sec, against 738 at 10k).
+earlier build also peaked at 5k (905/sec, against 738 at 10k). Repeats of
+the competitors' 5k cells placed 53 (Nomad, against 49 at the 5-second
+scrape) and 49.8 (Kubernetes, against 52.2).
 
 Nomad's 1k-5k cells are a rerun with Prometheus scraping every 15 seconds.
 At 5 seconds the scrape cost its leader enough CPU to read 188, 102, and
