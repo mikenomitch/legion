@@ -622,8 +622,7 @@ How to use it:
       736 / 322 / ~85 before. Eval `queue_wait` is now ~0.3 ms, so the
       blocking-pool contention is gone. Public numbers in
       [docs/benchmarks.md](../docs/benchmarks.md).
-- [x] **`RunJob` no longer parks tokio workers (local; AWS retest
-      pending).** The submit is a chain of quorum writes, and `RunJob` ran
+- [x] **`RunJob` no longer parks tokio workers.** The submit is a chain of quorum writes, and `RunJob` ran
       it inline on a runtime worker, the same mistake the heartbeat offload
       fixed. With 128 submits in flight on a 4-vCPU leader, every worker sat
       in a commit, so each eval worker's `spawn_blocking` await waited for a
@@ -638,8 +637,17 @@ How to use it:
       Eval handle time now matches the plan phase, the `job_submit`
       coalescer batches ~16 instead of ~1.1, and `RunJob` latency rises
       (40-125 → 140-225 ms) because submits now queue in the coalescer
-      instead of in front of the runtime. Rerun `web_fleet` on AWS to
-      confirm.
+      instead of in front of the runtime. On the AWS rig (2026-10-14, PR
+      #40) `web_fleet` went 680 → 1,261 alloc/s at 1k nodes, 640 → 1,067 at
+      2k, 635 → 945 at 10k, and 1,175 → 968 at 5k (see the open item
+      below).
+- [ ] **`web_fleet` at 5k nodes got slower with the `RunJob` offload**
+      (1,175 and 1,151 → 968 alloc/s on AWS, one run), even as its p99
+      improved (25s → 17.5s) and every other fleet size got 49-85% faster.
+      Submits now arrive 3-4x faster, and heartbeat freshness dipped during
+      the bursts (0.20 average at 1k). Find out whether faster admission
+      changes the plan coalescer's batching at 5k or crowds the heartbeat
+      path, before tuning anything.
 - [ ] **Other mutating handlers still commit on a runtime worker.**
       `StopJob`, `DestroyJob`, the KV writes, and most other mutating RPCs
       call the store inline like `RunJob` did. None of them is hot in a
@@ -653,11 +661,6 @@ How to use it:
       runs where heartbeats averaged 90 ms. The delay that matters is the
       ticker task's own wake. Measure from the tick's deadline instead
       (`src/manager/telemetry.rs`, `start_runtime_probe`).
-- [ ] **The AWS driver no longer parses `legion events follow -j`.** Event
-      JSON keys went camelCase (`jobId`, `metadataJson`), and
-      `parse_legion_event` in `benchmarks/aws/driver/driver.py` still reads
-      `job_id` / `metadata_json`, so a cell on a current build counts 0
-      placements and stalls. Accept both spellings, and add a fixture.
 - [ ] **The rig's plan phase is ~25x the micro-bench.** On AWS
       `legion_eval_phase_seconds{phase="plan"}` averages 26 ms per
       `job_submit` eval at 20k nodes and 45 ms at 50k, against ~1 ms for
@@ -1912,12 +1915,6 @@ How to use it:
   - [ ] The plugins' own `Cargo.lock` files drifted while plugin builds
         were broken (`plugins/tasks/noop` gains `legion-guest`, `imbl`,
         `archery` on a fresh build). Refresh and commit them.
-  - [ ] `RunJob` runs ~7 quorum writes inline on a tokio worker, so a
-        submit burst starves evals and heartbeats of runtime threads.
-        Branch `perf/web-fleet-throughput` moves it under
-        `block_in_place` (about 1.5-2x `web_fleet` locally). `StopJob`,
-        `DestroyJob`, and KV writes still commit inline. A labeled AWS
-        re-test is in PR #40's notes.
   - [ ] Legion B (streaming) campaign, and the 20k validation burst.
   - [ ] Nomad cannot run `mixed_heterogeneous`: nodesim has no node meta.
         Patch nodesim to accept a `meta` map (small, upstreamable) if the
