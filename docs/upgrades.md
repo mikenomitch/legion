@@ -50,6 +50,12 @@ on every worker restart, even though the task itself never restarted:
   moves the allocations to other nodes before you restart the worker, and
   `legion node uncordon <node>` returns the node afterward.
 
+A worker keeps some state as JSON files in its state directory, and some of
+them hold API messages as written by the binary that saved them. A newer
+binary cannot yet read such a file when a field was added to the message
+since, and it fails naming the field, for example `missing field
+envelopeResources` reading `netd_state.json`. This is a known gap.
+
 ## Stopping a manager
 
 Restart managers with SIGTERM (or Ctrl-C, which sends SIGINT). That's what
@@ -181,6 +187,12 @@ runs ungated.
 The other direction fails closed on its own. `RatifyClaim` is a new RPC, so
 an old manager rejects it and the worker kills the claim when its lease
 expires. The result is a wasted boot, never a duplicate.
+
+`TaskAllocation.task_speculative_start` carries a task's `speculativeStart`
+block into the node's spec cache. While either side predates it, a node
+reads every cached task as `off` and refuses its boot tickets with `task
+<name> does not permit speculative starts`. That also fails closed, and it
+ends once both sides are upgraded and the node is dispatched the task again.
 
 Neither the `boot` ACL resource nor the `edgeBoot` config blocks need a
 coordinated upgrade. Both are off by default, and a manager that does not

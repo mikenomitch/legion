@@ -61,7 +61,87 @@ reader to "fix" it back. Option (c) leaves a dense node starting several
 sandboxes a second refusing all but one per entry, which is the per-node
 case the TODO asked about.
 
-## 2. Correct the refusal table instead of adding the worker retry
+## 2. A node finds the raft leader itself, and followers do not forward `RatifyClaim`
+
+**Call.** Only the raft leader ratifies. A follower answers `RatifyClaim`
+with `FailedPrecondition` ("this manager is not the raft leader"), writes
+nothing, and leaves the ticket unspent. It no longer returns an `internal`
+refusal verdict. The node's ratifier then tries the other managers it
+knows, in order, and keeps the one that ratified for the next claim, until
+that one answers not-leader too.
+
+```text
+# before, three managers: a ratification that reached a follower
+admitted
+booted
+refused: ... this manager is not the raft leader; retry on its leader ...
+Error: sandbox start refused (internal): ...
+
+# after
+admitted
+booted
+ratified
+```
+
+**Alternatives.** (a) Let the follower forward. The existing
+`leader_forward` layer already proxies a rejected unary Manager write to the
+leader and replays the caller's bearer credential, so `RatifyClaim` would
+only need to fail with the typed not-leader status that carries
+`x-legion-raft-leader`. (b) Have the node retry `internal` refusals in
+general, which entry 4 declined.
+
+**Trade-off.** Every caller of `RatifyClaim` needs the retry. The node has
+it, but a CLI or a third-party ratifier gets `FailedPrecondition` and must
+find the leader itself (open in `TODO.md`). The first ratification after a
+leader change pays one wasted round trip per manager tried, inside the
+claim's lease. The cached manager is dropped only on a not-leader answer,
+so one that stops answering at all fails every later ratification on that
+node until it comes back or the worker restarts. The public doc lists that
+as a known limitation, and it should be fixed in the ratifier.
+
+**Why (performance, then simplicity).** A forwarded ratification runs
+twice. The follower's handler verifies the ticket and tries the write
+before the layer sees the rejection, then the whole request is replayed on
+the leader. On a path whose point is latency, a node that remembers the
+leader sends each ratification one hop, to the manager that commits it.
+The retry is safe because the follower wrote nothing and the ticket is
+still unspent, so the same request can go to the next manager. The node
+already holds the manager list it heartbeats with, so the retry needs no
+new setting. Before this, with three managers, most edge starts were
+refused and killed after boot. Option (a) can still be added on top for
+other callers without changing the node.
+
+## 3. A just-ratified claim is kept from the stop sweep for up to 30 seconds
+
+**Call.** When a claim ratifies, the worker records it. Until a desired set
+lists it, or for 30 seconds (`RATIFIED_SETTLE` in
+`src/worker/task_manager.rs`), whichever comes first, the claim is
+protected from the sweep that stops work a desired set leaves out. After
+that, an absence means stop again.
+
+**Alternatives.** (a) Stamp each desired set with the raft index it was
+read at, and have the worker ignore a set older than the ratification's
+commit index. (b) Send every heartbeat to the leader, so no desired set
+comes from a lagging replica. (c) Reuse the unratified claim's protection,
+which lasts for the claim's lease.
+
+**Trade-off.** A claim the managers want gone right after its ratification,
+such as an instance stopped within the window, can run up to 30 seconds
+longer than it should. The window is a guess at how long an election takes,
+not a fact the worker can check.
+
+**Why (correctness, then simplicity).** A heartbeat answered by a follower
+that had not applied the ratification yet, or by a leader that built the
+set just before it, omitted the confirmed claim, and the worker stopped it:
+378 ratified claims on one worker, with cause `unknown`. Option (a) is
+exact, but it changes the heartbeat and `RatifyClaim` wire shapes to close
+a window that is milliseconds long on a healthy cluster. Option (b) puts
+every heartbeat on one manager. Option (c) is 5 seconds by default, shorter
+than an election. With the window, the 300-id race survived a leader stop
+with every winner still running 80 seconds later
+([RESULTS](../../benchmarks/aws/sandbox-boot/RESULTS.md#ratification-on-three-managers-2026-10-14)).
+
+## 4. Correct the refusal table instead of adding the worker retry
 
 **Call.** The public refusal table in `docs/edge-boot.md` said `internal`
 is retried inside the lease. The worker never did that (`drive_claim`
@@ -88,7 +168,11 @@ spent, and the `overloaded` refusal needs the same loop. Building it twice,
 or building it inside a throughput port, is the wrong place. The doc must
 not promise behavior the node does not have.
 
-## 3. Measure in-process, through the real handler, before building a networked load generator
+Entry 2's retry is a different thing. A not-leader answer is not a
+verdict, and nothing was written, so sending the same request to another
+manager is routing, not a second try at a refused claim.
+
+## 5. Measure in-process, through the real handler, before building a networked load generator
 
 **Call.** The first harness (`tests/ratify_throughput_measure.rs`) drives
 the real `RatifyClaim` handler in-process with real tickets, on local
@@ -111,7 +195,7 @@ false conflicts within one run. A networked mode needs the simulated fleet
 to expose per-node credentials, which is a change to `legion start worker
 --simulate` worth making when there is an AWS cell to run it in.
 
-## 4. Defer per-node ratification batching
+## 6. Defer per-node ratification batching
 
 **Call.** No batch `RatifyClaims` RPC and no worker-side coalescing window
 in this phase.
@@ -136,7 +220,7 @@ latency, on a path whose whole point is latency. If the AWS numbers show
 manager CPU rather than the scheduler lane as the bound, this is the first
 lever to pull.
 
-## 5. No new knob for the group-commit cap
+## 7. No new knob for the group-commit cap
 
 **Call.** Ratifications keep sharing the instance group commit's cap of 64
 (`GROUP_COMMIT_BATCH_MAX`). No separate ratification cap, and
@@ -154,7 +238,7 @@ from 64 callers (442 and 461 per second on local SQLite while entries grow
 from 18 to 56), so a bigger cap would lengthen each entry without raising
 the rate. A knob nobody needs to turn is one more thing to explain.
 
-## 6. The port implemented Phase 1 from the plan
+## 8. The port implemented Phase 1 from the plan
 
 **Call.** The source branch (`perf/edge-ratify-throughput`, uncommitted
 on base 89229706) carried this plan, the docs, the harness, and the
@@ -175,7 +259,7 @@ compare, an in-entry existence check, and `block_in_place`), each piece is
 covered by a regression test, and the before/after numbers in §8 come
 from the same harness.
 
-## 7. The dense-node test counts slots with `maxAllocations`
+## 9. The dense-node test counts slots with `maxAllocations`
 
 **Call.** `concurrent_ratifications_on_one_node_confirm_up_to_its_capacity`
 gives its node `maxAllocations: 8`. The source version relied on "8 cores

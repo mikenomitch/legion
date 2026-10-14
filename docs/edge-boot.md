@@ -32,6 +32,7 @@ changes nothing behaves as it did before, including its wire payloads.
 - [What the gate does and does not stop](#what-the-gate-does-and-does-not-stop)
 - [Boot tickets](#boot-tickets)
 - [Ratification under load](#ratification-under-load)
+- [Ratification on a raft cluster](#ratification-on-a-raft-cluster)
 - [The kill path](#the-kill-path)
 - [Overload](#overload)
 - [Enabling it](#enabling-it)
@@ -433,6 +434,16 @@ back the round trip the ticket exists to avoid. In practice, keep at least
 one allocation of the job running in each edge pool, which a warm sandbox
 fleet does anyway. There is no dedicated pre-warm push.
 
+The cached config includes the task's `speculativeStart` block, which rides
+the dispatch payload, so the task's own mode caps the gate (step 4 above)
+on every node.
+
+The cached config does not carry the start's identity. Its env names the
+instance of the allocation it was cached from, so an edge start removes
+`LEGION_INSTANCE_ID`, `LEGION_INSTANCE_MODE`, and `LEGION_INSTANCE_SLOT`
+from it and sets the claim's own: the instance id the start names, with
+mode `keyed`.
+
 ## Ratification under load
 
 Every edge start still costs the manager one ratification, so the rate at
@@ -514,6 +525,44 @@ verdicts come back slowly and refuse new starts `OVERLOADED` before boot
 run into the lease. Watch the p99 of `legion_provisional_ratify_seconds`
 against `ratifyTimeout`.
 
+## Ratification on a raft cluster
+
+Under `persistence.type = "raft"`, only the raft leader commits a
+ratification. A node sends its ratifications to one manager at a time, and
+that manager may be a follower.
+
+- **A follower answers "not the leader".** It does not forward the call
+  and does not judge the claim. It answers `FailedPrecondition` with `this
+  manager is not the raft leader…`, writes nothing, and leaves the ticket
+  unspent.
+- **The node asks the leader.** On that answer, the node tries the other
+  managers it knows, in order, and keeps sending ratifications to the first
+  one that ratifies until that one also answers not-leader. The retries
+  count against the claim's `ratifyTimeout`. If every manager answers
+  not-leader, as during an election, the node kills the claim, and the
+  start is refused `internal` with `ratification call failed`.
+- **A just-ratified claim survives a stale desired set.** A node stops work
+  that its heartbeat's desired set does not list (see [The kill
+  path](#the-kill-path)). A follower that has not applied a ratification
+  yet, or a leader that built the set just before it, leaves out a claim it
+  just confirmed. So a ratified claim stays exempt from that sweep until a
+  desired set lists it, or for 30 seconds, whichever comes first. After
+  that, an absence means stop again. The cost is that a claim the managers
+  want gone right after its ratification can run up to 30 seconds longer.
+
+**Tested on three managers.** On AWS, three raft managers and three workers
+raced edge starts of the same keyed instance, a host process on the `exec`
+runtime. For each instance id, every worker started it at the same moment
+with `legion sandbox start`. In runs of 60, 200, and 300 ids, every id had
+exactly one ratified start, and the other two were refused
+`instance_claimed`. In the 300-id run the raft leader was stopped 30
+seconds in, and a new leader was elected. The run ended with exactly 300
+processes running, one per instance id, each with its own
+`LEGION_INSTANCE_ID`, and all were still running 80 seconds later. No
+losing start's process survived in any run: all 1,120 losers across 560
+ids were killed. The setup and the script are in
+[RESULTS.md](../benchmarks/aws/sandbox-boot/RESULTS.md#ratification-on-three-managers-2026-10-14).
+
 ## The kill path
 
 Every failure ends the same way: the node kills the work.
@@ -530,14 +579,19 @@ The last row matters because the worker already stops anything the manager
 does not list. Provisional work is **exempt from that sweep for the length of
 its lease**. The manager cannot list work it has not recorded yet, so a
 missing entry is not a decision. After the lease, the existing reconcile code
-stops it. So a bug in this feature makes the sandbox die. It never leaves a
-duplicate running.
+stops it. A claim that was just ratified stays exempt until a desired set
+lists it, or for 30 seconds (see [Ratification on a raft
+cluster](#ratification-on-a-raft-cluster)). So a bug in this feature makes
+the sandbox die. It never leaves a duplicate running.
 
 ### Refusal reasons
 
 The node kills the work on every refusal. No reason is retried inside the
-lease, so a start refused as `internal` (a store error or an election
-during the ratification) is lost, and the caller starts it again.
+lease, so a start refused as `internal` (a store error, or an election that
+left no manager to answer as leader) is lost, and the caller starts it
+again. A follower's not-leader answer is not a refusal: the node asks the
+other managers instead (see [Ratification on a raft
+cluster](#ratification-on-a-raft-cluster)).
 
 | Reason | Meaning |
 | --- | --- |
@@ -548,7 +602,7 @@ during the ratification) is lost, and the caller starts it again.
 | `ticket_invalid` | bad signature, wrong audience, wrong pool, expired, or a spent `jti` |
 | `unknown_target` | the job config, task, or instance does not exist |
 | `disabled` | edge boot is off on this manager |
-| `internal` | a store error or an election in progress |
+| `internal` | a store error, a failed ratify call, or no manager answered as raft leader |
 
 A worker that sees a reason it does not recognize kills the work, so version
 skew fails closed.
@@ -783,6 +837,16 @@ the dispatcher falls back to post-commit dispatch for that node.
 `RatifyClaim` is a new RPC, so an old manager rejects it and workers fall
 back to their lease, which means they kill the work. Skew fails closed.
 
+`TaskAllocation.task_speculative_start` carries a task's `speculativeStart`
+block to the node's spec cache. A manager that does not send it, or a worker
+that does not read it, leaves every cached task at `off`. The node then
+refuses each ticket for it, which also fails closed:
+
+```text
+task box does not permit speculative starts (speculativeStart.mode is `off`,
+or was downgraded by an invariant)
+```
+
 Upgrade managers in the usual order ([`docs/upgrades.md`](upgrades.md)).
 
 ## Known limitations
@@ -791,6 +855,10 @@ Upgrade managers in the usual order ([`docs/upgrades.md`](upgrades.md)).
   every manager was given the same `workloadIdentity.issuer`. A manager with
   a different value mints tickets that nodes refuse with `InvalidIssuer`,
   and nodes follow whichever manager answered their latest heartbeat.
+- **A node sticks with the manager that last ratified.** It moves on only
+  when that manager answers not-leader. If that manager stops answering at
+  all, the node's ratifications fail with `ratification call failed` until
+  it answers again or the worker restarts.
 - **No island mode.** An unratified start that cannot reach a manager dies
   when its lease expires. Edge boot does not keep work running through a long
   control-plane outage.
