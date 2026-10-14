@@ -224,7 +224,7 @@ expand to the destination directory.
 | `https://` / `http://` | Streaming download (no whole-body buffering), basic/bearer/headers credentials, redirect limit (5), Content-Length checked against the size cap before streaming. Plain `http` is **not** in the default scheme allowlist. |
 | `file://` | Copies a local file or directory tree. For dev workflows and artifacts pre-provisioned on the node. |
 | `git` | `git::https://github.com/acme/repo?ref=v1.2.0` (go-getter style) or `git://…`. Shallow clone (depth 1). `ref=` takes a branch, tag, or full 40-hex commit SHA (full SHAs are fetched as exact objects). The `.git` directory is stripped, so tasks get a clean worktree. Credentials are injected through `GIT_CONFIG_*` environment variables (an `http.extraHeader` Authorization header), never argv. `resolve()` uses `git ls-remote` to pin refs to commit SHAs. |
-| `s3://` | Backed by `object_store`. Works with any S3-compatible endpoint (AWS, MinIO, R2, GCS interop). Region and endpoint come from the credential object or from query params (`s3://bucket/key?endpoint=https://minio.internal:9000&region=auto`). Query params win. Anonymous fetches skip request signing (public buckets). |
+| `s3://` | Backed by `object_store`. Works with any S3-compatible endpoint (AWS, MinIO, R2, GCS interop). Region and endpoint come from the credential object or from query params (`s3://bucket/key?endpoint=https://minio.internal:9000&region=auto`). Query params win. With neither naming a region, the bucket is addressed in `us-east-1`, whatever the worker's `AWS_REGION` says, so a jobspec artifact resolves the same on every node. Anonymous fetches skip request signing (public buckets). A KV credential signs exactly as written: the worker's own `AWS_*` key variables (an `AWS_SESSION_TOKEN` included) never mix into it. The worker's other `AWS_*` store settings (`AWS_ENDPOINT`, `AWS_ALLOW_HTTP`, server-side encryption, proxy options) do apply. |
 | `oci://` | Built on the `oci-client` crate. Anonymous, basic, or bearer registry auth. Tags resolve to manifest digests for pinning. Without `mediaType`, the image is written to disk as an **OCI layout**, which is what image-consuming runtimes pass to their OCI runtime. It is staged under `.oci/<name>/` unless `dest` is set. With `mediaType`, only matching ORAS layers are pulled. Each is named by its `org.opencontainers.image.title` annotation (sanitized to a basename, with the digest hex as fallback). Blob sizes are checked against the size cap before any blob downloads. `?protocol=http` enables plain-HTTP registries for dev and test. |
 
 Additional schemes can be served by [fetcher plugins](#fetcher-plugins).
@@ -687,8 +687,9 @@ published part is sealed (encrypted) first. Configure it per worker type with
     # Takes the same ?region= and ?endpoint= query parameters as s3 artifacts.
     url = "s3://legion-content-usw2/",
     # Optional. Omit it to use the node's ambient AWS credentials (the AWS_*
-    # environment variables, then the instance profile). Or read an AWS
-    # credential object from KV, the same shape artifact `auth.kv` takes:
+    # key variables, web identity, an ECS task role, then the instance
+    # profile). Or read an AWS credential object from KV, the same shape
+    # artifact `auth.kv` takes:
     auth = { kv = "legion/content-store" },
     # Optional. The size published parts are cut into, and how long chunks
     # are shared between publishes (see "How published parts are stored").
@@ -697,6 +698,39 @@ published part is sealed (encrypted) first. Configure it per worker type with
   },
 }
 ```
+
+**Ambient credentials.** With no `auth`, every client of the store (the
+publisher, [session manifests](session-mode.md), a restoring node's fetches,
+and the manager's [archive](suspend-and-resume.md#archiving-idle-instances) reads)
+signs as the node, resolved in the order
+[streaming persistence](persistence-streaming.md#credentials) uses: the
+`AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` (+ `AWS_SESSION_TOKEN`)
+variables, then web identity (`AWS_WEB_IDENTITY_TOKEN_FILE` +
+`AWS_ROLE_ARN`, which EKS IRSA injects), then an ECS task role
+(`AWS_CONTAINER_CREDENTIALS_RELATIVE_URI`), then the instance profile. A
+configuration that would quietly fall through to the instance profile, a
+different and usually broader principal, fails the operation instead and
+says why: half a key pair, one of the two web-identity variables without the
+other, or EKS Pod Identity (`AWS_CONTAINER_CREDENTIALS_FULL_URI`), which is
+not supported:
+
+```text
+AWS_WEB_IDENTITY_TOKEN_FILE is set but AWS_ROLE_ARN is not; web identity needs
+both, and without them object storage would fall back to instance metadata
+```
+
+**Region.** An `s3://` store's region is the URL's `?region=`, then the KV
+credential's `region`, then the node's `AWS_REGION` (or `AWS_DEFAULT_REGION`),
+then `us-east-1`. Publishing and reading resolve it the same way, so a part is
+read in the region it was published to. The node's other `AWS_*` store
+settings (`AWS_ENDPOINT`, `AWS_ALLOW_HTTP`, server-side encryption, proxy
+options) apply too. A KV credential's keys are used as written: the node's
+own `AWS_*` key variables never mix into them.
+
+A `file://` store is written through `object_store`'s local filesystem: each
+object is written beside its final name as `<name>#<n>` and renamed into
+place, so a reader never sees a partial object. An interrupted write can
+leave a `#<n>` file behind. It is never read or listed as an object.
 
 Published content is cut into chunks (`chunkSize`, 1 MiB by default), and
 each distinct, non-zero chunk lands once at `<url>/sealed/<name>`, beside a
@@ -953,6 +987,12 @@ Remember the allowlists. Add a custom scheme to the cluster's
 - **`contentStore.auth.nodeIdentity` is rejected.** S3 uploads need an AWS
   credential, and node identity tokens are not exchanged for one. Use
   `auth.kv` or the node's ambient credentials.
+- **EKS Pod Identity, `~/.aws/credentials` profiles and SSO are not
+  ambient sources.** `object_store`'s AWS chain stops at the four sources
+  above. Pod Identity is refused rather than downgraded to the node's
+  instance role. On EKS use IRSA, or `auth.kv`.
+- **`s3://` is the only object-store backend.** There is no GCS-native or
+  Azure path; S3-compatible endpoints (R2, MinIO, GCS interop) work.
 - **Checksums verify single-file payloads** (and, for OCI, the manifest
   digest). Declaring a `checksum` on a source that produces a tree (git,
   `file://` directories) is a staging error, not a silent skip.

@@ -7396,10 +7396,13 @@ mod tests {
             },
         )?);
         manager.configure_content_store(Some(store.clone()));
-        manager.configure_content_publishing(shared.map(|shared| {
+        let publisher = shared
+            .map(crate::content_publish::StorePublisher::local)
+            .transpose()?;
+        manager.configure_content_publishing(publisher.map(|publisher| {
             Arc::new(crate::content_publish::ContentPublishing::new(
                 store.clone(),
-                Arc::new(crate::content_publish::FileContentPublisher::new(shared)),
+                Arc::new(publisher),
             ))
         }));
         manager.configure_artifacts(

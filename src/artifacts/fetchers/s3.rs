@@ -2,19 +2,20 @@
 //! endpoint (AWS, MinIO, R2, GCS interop). Region/endpoint come from the
 //! credential object or query params
 //! (`s3://bucket/key?endpoint=https://minio.internal:9000&region=auto`),
-//! query params winning.
+//! query params winning. The store is opened through the object-storage
+//! layer ([`crate::storage::objects`]), like every other object store.
 
 use std::io::Write;
 
 use futures::StreamExt;
-use object_store::aws::AmazonS3Builder;
 use object_store::{path::Path as ObjectPath, ObjectStore};
 
-use crate::artifacts::fetcher::{
-    ArtifactFetcher, Credential, FetchRequest, FetchedArtifact, FetchedPayload,
-};
+use crate::artifacts::fetcher::{ArtifactFetcher, FetchRequest, FetchedArtifact, FetchedPayload};
 use crate::artifacts::stage::ArtifactSink;
 use crate::prelude::*;
+use crate::storage::objects::{
+    self, ObjectCredential, OpenOptions, RegionDefault, StoreUrl, FALLBACK_REGION,
+};
 
 #[derive(Debug, Default)]
 pub struct S3Fetcher;
@@ -26,7 +27,7 @@ impl S3Fetcher {
 }
 
 struct S3Target {
-    store: object_store::aws::AmazonS3,
+    store: Arc<dyn ObjectStore>,
     key: ObjectPath,
     file_name: String,
 }
@@ -40,81 +41,48 @@ impl std::fmt::Debug for S3Target {
 }
 
 fn build_target(req: &FetchRequest<'_>) -> R<S3Target> {
-    let bucket = req
-        .url
-        .host_str()
-        .with_context(|| format!("{} has no bucket host", req.redacted_source))?;
-    let key = req.url.path().trim_start_matches('/');
-    if key.is_empty() {
+    if req.url.host_str().unwrap_or_default().is_empty() {
+        bail!("{} has no bucket host", req.redacted_source);
+    }
+    let url = StoreUrl::from_url(req.url.clone())
+        .with_context(|| format!("invalid s3 source {}", req.redacted_source))?;
+    let key = url.key("")?;
+    if key.as_ref().is_empty() {
         bail!("{} has no object key", req.redacted_source);
     }
 
-    let mut region: Option<String> = None;
-    let mut endpoint: Option<String> = None;
-    if let Some(Credential::Aws {
-        region: cred_region,
-        endpoint: cred_endpoint,
-        ..
-    }) = req.credential
-    {
-        region = cred_region.clone();
-        endpoint = cred_endpoint.clone();
-    }
-    // Query params win over credential-provided values.
-    for (name, value) in req.url.query_pairs() {
-        match name.as_ref() {
-            "region" => region = Some(value.into_owned()),
-            "endpoint" => endpoint = Some(value.into_owned()),
-            _ => {}
-        }
-    }
-
-    let ambient = matches!(req.credential, Some(Credential::AwsAmbient));
-    let mut builder = AmazonS3Builder::from_env().with_bucket_name(bucket);
-    match region {
-        Some(region) => builder = builder.with_region(region),
-        // The ambient chain keeps the region `from_env` read from
-        // `AWS_REGION`, as the contentStore publisher does, so a node reads
-        // its store in the region it publishes to.
-        None if ambient => {}
-        None => builder = builder.with_region("us-east-1"),
-    }
-    if let Some(endpoint) = endpoint {
-        let allow_http = endpoint.starts_with("http://");
-        builder = builder.with_endpoint(endpoint).with_allow_http(allow_http);
-    }
-    match req.credential {
-        Some(Credential::Aws {
-            access_key_id,
-            secret_access_key,
-            session_token,
-            ..
-        }) => {
-            builder = builder
-                .with_access_key_id(access_key_id)
-                .with_secret_access_key(secret_access_key);
-            if let Some(token) = session_token {
-                builder = builder.with_token(token);
-            }
-        }
-        // `from_env` above already carries the ambient chain: sign with it.
-        Some(Credential::AwsAmbient) => {}
-        Some(other) => {
-            bail!(
-                "s3 artifacts require an aws credential, got {other:?} for {}",
-                req.redacted_source
-            );
-        }
+    let credential = match req.credential {
+        Some(credential) => ObjectCredential::from_artifact(
+            credential,
+            &format!("s3 artifact {}", req.redacted_source),
+        )?,
         // Anonymous: public buckets are read without signing.
-        None => {
-            builder = builder.with_skip_signature(true);
-        }
-    }
+        None => ObjectCredential::Anonymous,
+    };
+    let options = OpenOptions {
+        // The ambient chain keeps the node's environment region, as the
+        // contentStore publisher does, so a node reads its store in the
+        // region it publishes to. A jobspec artifact (a KV credential, or
+        // none) resolves the same on every node.
+        region_default: match credential {
+            ObjectCredential::Ambient => RegionDefault::Environment,
+            _ => RegionDefault::Fixed(FALLBACK_REGION),
+        },
+        ..OpenOptions::default()
+    };
 
-    let file_name = key.rsplit('/').next().unwrap_or("object").to_string();
+    let file_name = req
+        .url
+        .path()
+        .trim_start_matches('/')
+        .rsplit('/')
+        .next()
+        .unwrap_or("object")
+        .to_string();
     Ok(S3Target {
-        store: builder.build().context("build s3 client")?,
-        key: ObjectPath::from(key),
+        store: objects::open(&url, &credential, &options)
+            .with_context(|| format!("build s3 client for {}", req.redacted_source))?,
+        key,
         file_name,
     })
 }
@@ -166,7 +134,7 @@ impl ArtifactFetcher for S3Fetcher {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::artifacts::fetcher::FetchLimits;
+    use crate::artifacts::fetcher::{Credential, FetchLimits};
     use crate::structs::parse_artifact_source;
 
     #[test]
