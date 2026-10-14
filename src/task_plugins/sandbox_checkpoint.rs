@@ -1486,8 +1486,8 @@ pub(crate) fn plan_memory_restore(
         return honored;
     }
     let version = vmm_version.unwrap_or("unknown");
-    let fallback = if !crate::structs::fork::parse_vmm_semver(version)
-        .is_some_and(|parsed| parsed >= CLOUD_HYPERVISOR_ONDEMAND_MIN)
+    let fallback = if crate::structs::fork::parse_vmm_semver(version)
+        .is_none_or(|parsed| parsed < CLOUD_HYPERVISOR_ONDEMAND_MIN)
     {
         let (major, minor, _) = CLOUD_HYPERVISOR_ONDEMAND_MIN;
         format!(
