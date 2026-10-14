@@ -31,6 +31,7 @@ use crate::structs::netpolicy::{ConnectFacts, Verdict, PROTOCOL_TCP, TLS_MUTUAL,
 use crate::worker::forwarder::ForwarderContext;
 use crate::worker::netd::handlers::{self, HopFacts, HopOutcome};
 use crate::worker::netd::http::{self, HttpSettings};
+use crate::worker::netd::listen::{dial_tcp, spawn_accept_loop, ListenAddr, Stream};
 use crate::worker::netd::metrics as net_metrics;
 use crate::worker::netd::netns;
 use crate::worker::netd::policy::ingress_connect_verdict;
@@ -41,15 +42,11 @@ use crate::worker::netd::vsock;
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
-use std::pin::Pin;
 use std::sync::OnceLock;
-use std::task::Poll;
 use std::time::Duration;
-use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, ReadBuf};
-use tokio::net::{TcpListener, TcpStream, UnixStream};
+use tokio::io::AsyncWriteExt;
+use tokio::net::TcpStream;
 use tokio::task::JoinHandle;
-
-const ACCEPT_ERROR_BACKOFF: Duration = Duration::from_millis(100);
 
 /// How long a TCP dial to a task may take.
 const TASK_DIAL_TIMEOUT: Duration = Duration::from_secs(2);
@@ -137,16 +134,15 @@ impl TaskTarget {
             }
             TaskDial::Bridge { .. } => {
                 let addr = self.tcp_addr()?;
-                let stream = tokio::time::timeout(TASK_DIAL_TIMEOUT, TcpStream::connect(addr))
+                let stream = dial_tcp(addr, TASK_DIAL_TIMEOUT)
                     .await
-                    .map_err(|_| anyhow!("dial {addr} timed out"))?
                     .with_context(|| format!("connect {addr}"))?;
                 let _ = stream.set_nodelay(true);
                 Ok(TaskStream::Tcp(stream))
             }
             TaskDial::Vsock { scratch } => {
                 let base = crate::task_plugins::vsock_socket_base(scratch);
-                Ok(TaskStream::Vsock(
+                Ok(TaskStream::Unix(
                     vsock::dial(&base, u32::from(self.port())).await?,
                 ))
             }
@@ -156,65 +152,7 @@ impl TaskTarget {
 
 /// A connection to the task: TCP (loopback, a namespace, a bridge), or a
 /// vsock stream through a sandbox's VMM.
-pub enum TaskStream {
-    Tcp(TcpStream),
-    Vsock(UnixStream),
-}
-
-impl AsyncRead for TaskStream {
-    fn poll_read(
-        self: Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-        buf: &mut ReadBuf<'_>,
-    ) -> Poll<std::io::Result<()>> {
-        match self.get_mut() {
-            TaskStream::Tcp(stream) => Pin::new(stream).poll_read(cx, buf),
-            TaskStream::Vsock(stream) => Pin::new(stream).poll_read(cx, buf),
-        }
-    }
-}
-
-impl AsyncWrite for TaskStream {
-    fn poll_write(
-        self: Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-        buf: &[u8],
-    ) -> Poll<std::io::Result<usize>> {
-        match self.get_mut() {
-            TaskStream::Tcp(stream) => Pin::new(stream).poll_write(cx, buf),
-            TaskStream::Vsock(stream) => Pin::new(stream).poll_write(cx, buf),
-        }
-    }
-
-    fn poll_flush(
-        self: Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-    ) -> Poll<std::io::Result<()>> {
-        match self.get_mut() {
-            TaskStream::Tcp(stream) => Pin::new(stream).poll_flush(cx),
-            TaskStream::Vsock(stream) => Pin::new(stream).poll_flush(cx),
-        }
-    }
-
-    fn poll_shutdown(
-        self: Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-    ) -> Poll<std::io::Result<()>> {
-        match self.get_mut() {
-            TaskStream::Tcp(stream) => Pin::new(stream).poll_shutdown(cx),
-            TaskStream::Vsock(stream) => Pin::new(stream).poll_shutdown(cx),
-        }
-    }
-}
-
-impl crate::worker::netd::splice::SpliceStream for TaskStream {
-    fn socket(&self) -> Option<crate::worker::netd::splice::Socket<'_>> {
-        match self {
-            TaskStream::Tcp(stream) => SpliceStream::socket(stream),
-            TaskStream::Vsock(stream) => SpliceStream::socket(stream),
-        }
-    }
-}
+pub type TaskStream = Stream;
 
 /// One advertised port the datapath fronts.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -358,12 +296,12 @@ impl IngressListeners {
     }
 
     async fn start(&self, spec: IngressSpec) {
-        let addr = SocketAddr::new(
+        let listen = ListenAddr::host(SocketAddr::new(
             spec.bind.unwrap_or(IpAddr::V4(Ipv4Addr::UNSPECIFIED)),
             spec.host_port,
-        );
+        ));
         let key = (spec.allocation_id, spec.label.clone());
-        match netns::bind_tcp(None, addr).await {
+        match listen.bind().await {
             Ok(listener) => {
                 debug!(
                     allocation_id = spec.allocation_id,
@@ -378,7 +316,15 @@ impl IngressListeners {
                     context: self.context.clone(),
                     http: OnceLock::new(),
                 });
-                let task = tokio::spawn(run(listener, shared));
+                let task = spawn_accept_loop(listener, "ingress", move |client, peer| {
+                    let shared = shared.clone();
+                    async move {
+                        // Ingress listens on TCP in the host namespace only.
+                        if let (Stream::Tcp(client), Some(peer)) = (client, peer) {
+                            handle(client, peer, shared).await;
+                        }
+                    }
+                });
                 lock(&self.listeners).insert(
                     key,
                     Listener {
@@ -425,23 +371,6 @@ impl Drop for IngressListeners {
 
 fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(|p| p.into_inner())
-}
-
-async fn run(listener: TcpListener, shared: Arc<Shared>) {
-    loop {
-        let (client, peer) = match listener.accept().await {
-            Ok(accepted) => accepted,
-            Err(err) => {
-                debug!(error = ?err, "Ingress accept failed");
-                tokio::time::sleep(ACCEPT_ERROR_BACKOFF).await;
-                continue;
-            }
-        };
-        let shared = shared.clone();
-        tokio::spawn(async move {
-            handle(client, peer, shared).await;
-        });
-    }
 }
 
 /// How long a TLS handshake may take before the connection is dropped.
@@ -734,6 +663,7 @@ mod tests {
     use crate::structs::AllocNetPolicy;
     use crate::worker::netd::{Denials, NetPolicyCache};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::{TcpListener, UnixStream};
 
     async fn free_port() -> u16 {
         TcpListener::bind("127.0.0.1:0")

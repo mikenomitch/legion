@@ -1586,11 +1586,9 @@ async fn open(
             .await
             .map_err(AttemptError::Connect)?
     } else {
-        match tokio::time::timeout(DIAL_TIMEOUT, TcpStream::connect(addr)).await {
-            Ok(Ok(stream)) => stream,
-            Ok(Err(err)) => return Err(AttemptError::Connect(err.to_string())),
-            Err(_) => return Err(AttemptError::Connect("dial timed out".into())),
-        }
+        crate::worker::netd::listen::dial_tcp(addr, DIAL_TIMEOUT)
+            .await
+            .map_err(|err| AttemptError::Connect(err.to_string()))?
     };
     let _ = stream.set_nodelay(true);
 
@@ -2161,8 +2159,7 @@ mod integration {
                 credentials: Vec::new(),
                 vip: None,
                 canonical_port: None,
-                netns: None,
-                vsock: None,
+                attachment: crate::worker::netd::attach::Attachment::Host,
             }])
             .await;
         assert_eq!(forwarder.active().len(), 1, "listener bound");
@@ -2258,8 +2255,7 @@ mod integration {
                 credentials,
                 vip: None,
                 canonical_port: None,
-                netns: None,
-                vsock: None,
+                attachment: crate::worker::netd::attach::Attachment::Host,
             }])
             .await;
         let send = "GET /v1/models HTTP/1.1\r\nHost: x\r\nAuthorization: placeholder\r\nX-Api-Key: dummy\r\nx-api-key: dummy-2\r\n\r\n";
@@ -2376,6 +2372,7 @@ mod integration {
         let forwarder = UpstreamForwarder::new();
         let context = forwarder.context();
         let dir = tempfile::tempdir().unwrap();
+        // The guest's scratch dir: its VMM's socket for local port 20010.
         let path = dir.path().join("vsock.sock_20010");
         let credentials: Vec<UpstreamCredential> = serde_json::from_value(serde_json::json!([
             { "header": "authorization", "prefix": "Bearer ", "from": { "identity": "api" } },
@@ -2393,8 +2390,9 @@ mod integration {
                 credentials,
                 vip: None,
                 canonical_port: None,
-                netns: None,
-                vsock: Some(path.clone()),
+                attachment: crate::worker::netd::attach::Attachment::GuestVsock {
+                    scratch: dir.path().to_path_buf(),
+                },
             }])
             .await;
         context.set_credential(
@@ -2447,8 +2445,7 @@ mod integration {
                 credentials: Vec::new(),
                 vip: None,
                 canonical_port: None,
-                netns: None,
-                vsock: None,
+                attachment: crate::worker::netd::attach::Attachment::Host,
             }])
             .await;
         let (status, _, body) =

@@ -26,8 +26,10 @@
 use crate::prelude::*;
 use crate::structs::netpolicy::{ConnectFacts, RequestFacts, Verdict, PROTOCOL_HTTP, PROTOCOL_TCP};
 use crate::worker::forwarder::ForwarderContext;
+use crate::worker::netd::attach::Attachment;
 use crate::worker::netd::guard::{self, GuardRefusal};
 use crate::worker::netd::handlers::{self, HopFacts, HopOutcome, ProxyTarget};
+use crate::worker::netd::listen::{dial_tcp, spawn_accept_loop, ListenAddr};
 use crate::worker::netd::metrics as net_metrics;
 use crate::worker::netd::netns;
 use crate::worker::netd::policy::{egress_connect_verdict, gated_egress_connect_verdict};
@@ -35,10 +37,9 @@ use crate::worker::netd::proxyproto::Prefixed;
 use crate::worker::netd::splice::SpliceStream;
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-use std::path::PathBuf;
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream};
+use tokio::net::TcpStream;
 use tokio::task::JoinHandle;
 
 /// Where the proxy listens inside every gated namespace.
@@ -53,21 +54,29 @@ const MAX_HEAD: usize = 16 * 1024;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProxySpec {
     pub allocation_id: i64,
-    /// The namespace to bind inside; `None` binds in the host namespace
-    /// (tests, and cooperative mode on hosts without namespaces).
-    pub netns: Option<PathBuf>,
+    /// How the allocation is attached: the proxy binds `127.0.0.1:1080`
+    /// inside its namespace, or on a gated sandbox's vsock host socket for
+    /// port 1080. A gated attachment fails closed while policy is pending or
+    /// the edge-boot gate is shut; [`Attachment::Host`] binds in the host
+    /// namespace (tests, and cooperative mode on hosts without namespaces).
+    pub attachment: Attachment,
     /// Bind here instead of `127.0.0.1:1080` (tests).
     pub listen: Option<SocketAddr>,
-    /// A gated *sandbox*: listen on this Unix socket — the host end of the
-    /// guest's vsock port 1080 — instead of a TCP port.
-    pub unix: Option<PathBuf>,
 }
 
 impl ProxySpec {
     /// A gated listener fails closed while policy is pending or the boot
-    /// gate is shut: one inside a namespace, or the host end of a vsock.
+    /// gate is shut.
     pub fn gated(&self) -> bool {
-        self.netns.is_some() || self.unix.is_some()
+        self.attachment.is_gated()
+    }
+
+    /// Where the proxy binds.
+    pub fn listen_addr(&self) -> ListenAddr {
+        let addr = self
+            .listen
+            .unwrap_or_else(|| SocketAddr::new(IpAddr::V4(PROXY_ADDR), PROXY_PORT));
+        self.attachment.listen(addr.ip(), addr.port())
     }
 }
 
@@ -144,23 +153,29 @@ impl EgressProxies {
     }
 
     async fn start(&self, spec: ProxySpec) {
-        if let Some(path) = spec.unix.clone() {
-            self.start_unix(spec, path).await;
-            return;
-        }
-        let addr = spec
-            .listen
-            .unwrap_or_else(|| SocketAddr::new(IpAddr::V4(PROXY_ADDR), PROXY_PORT));
-        match netns::bind_tcp(spec.netns.clone(), addr).await {
+        let listen = spec.listen_addr();
+        match listen.bind().await {
             Ok(listener) => {
-                let bound = listener.local_addr().ok();
-                debug!(allocation_id = spec.allocation_id, addr = ?bound, "Started egress proxy");
+                let bound = listener.local_addr();
+                debug!(allocation_id = spec.allocation_id, listen = %listen, "Started egress proxy");
                 let shared = Arc::new(Proxy {
                     allocation_id: spec.allocation_id,
                     gated: spec.gated(),
                     context: self.context.clone(),
                 });
-                let task = tokio::spawn(run(listener, shared));
+                let task = spawn_accept_loop(listener, "egress proxy", move |client, peer| {
+                    // Counted as open (and its bytes as activity, as they
+                    // move) for the idle policy's `connections` and
+                    // `network` signals, until it closes: a quiet model call
+                    // through the proxy keeps the task awake when it asks
+                    // for `connections`. A gated sandbox's egress is the one
+                    // datapath traffic an idle policy can see for it.
+                    let client = shared
+                        .context
+                        .activity()
+                        .track(shared.allocation_id, client);
+                    handle(client, peer, shared.clone())
+                });
                 lock(&self.listeners).insert(
                     spec.allocation_id,
                     Listener {
@@ -173,54 +188,9 @@ impl EgressProxies {
             Err(err) => {
                 warn!(
                     allocation_id = spec.allocation_id,
+                    listen = %listen,
                     error = ?err,
                     "Failed to bind egress proxy; retrying on the next heartbeat"
-                );
-                lock(&self.listeners).insert(
-                    spec.allocation_id,
-                    Listener {
-                        spec,
-                        task: None,
-                        addr: None,
-                    },
-                );
-            }
-        }
-    }
-}
-
-impl EgressProxies {
-    /// The host end of a gated sandbox's vsock: a Unix socket the VMM
-    /// connects guest-initiated streams to.
-    async fn start_unix(&self, spec: ProxySpec, path: PathBuf) {
-        if let Some(parent) = path.parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
-        let _ = std::fs::remove_file(&path);
-        match tokio::net::UnixListener::bind(&path) {
-            Ok(listener) => {
-                debug!(allocation_id = spec.allocation_id, path = %path.display(), "Started egress proxy on vsock host socket");
-                let shared = Arc::new(Proxy {
-                    allocation_id: spec.allocation_id,
-                    gated: true,
-                    context: self.context.clone(),
-                });
-                let task = tokio::spawn(run_unix(listener, shared));
-                lock(&self.listeners).insert(
-                    spec.allocation_id,
-                    Listener {
-                        spec,
-                        task: Some(task),
-                        addr: None,
-                    },
-                );
-            }
-            Err(err) => {
-                warn!(
-                    allocation_id = spec.allocation_id,
-                    path = %path.display(),
-                    error = ?err,
-                    "Failed to bind egress proxy socket; retrying on the next heartbeat"
                 );
                 lock(&self.listeners).insert(
                     spec.allocation_id,
@@ -255,48 +225,6 @@ struct Proxy {
     /// edge-boot gate is shut.
     gated: bool,
     context: Arc<ForwarderContext>,
-}
-
-async fn run(listener: TcpListener, proxy: Arc<Proxy>) {
-    loop {
-        let (client, peer) = match listener.accept().await {
-            Ok(accepted) => accepted,
-            Err(err) => {
-                debug!(error = ?err, "Egress proxy accept failed");
-                tokio::time::sleep(Duration::from_millis(100)).await;
-                continue;
-            }
-        };
-        // Counted as open (and its bytes as activity, as they move) for the
-        // idle policy's `connections` and `network` signals, until it
-        // closes: a quiet model call through the proxy keeps the task
-        // awake when it asks for `connections`.
-        let client = proxy.context.activity().track(proxy.allocation_id, client);
-        let proxy = proxy.clone();
-        tokio::spawn(async move {
-            handle(client, Some(peer), proxy).await;
-        });
-    }
-}
-
-async fn run_unix(listener: tokio::net::UnixListener, proxy: Arc<Proxy>) {
-    loop {
-        let (client, _) = match listener.accept().await {
-            Ok(accepted) => accepted,
-            Err(err) => {
-                debug!(error = ?err, "Egress proxy accept failed");
-                tokio::time::sleep(Duration::from_millis(100)).await;
-                continue;
-            }
-        };
-        // The same tracking as `run`: a gated sandbox's egress is the one
-        // datapath traffic an idle policy can see for it.
-        let client = proxy.context.activity().track(proxy.allocation_id, client);
-        let proxy = proxy.clone();
-        tokio::spawn(async move {
-            handle(client, None, proxy).await;
-        });
-    }
 }
 
 /// An HTTP request head as policy sees it: method, path, lower-cased headers.
@@ -446,10 +374,7 @@ async fn dial(addrs: &[SocketAddr]) -> Option<TcpStream> {
     if addrs.is_empty() {
         return None;
     }
-    match tokio::time::timeout(DIAL_TIMEOUT, TcpStream::connect(addrs)).await {
-        Ok(Ok(stream)) => Some(stream),
-        _ => None,
-    }
+    dial_tcp(addrs, DIAL_TIMEOUT).await.ok()
 }
 
 /// The external hops on the allocation's effective egress chain.
@@ -1068,6 +993,7 @@ mod tests {
     use crate::structs::netpolicy::{merge_policies, InlinePolicy, NetPolicyObject};
     use crate::structs::AllocNetPolicy;
     use crate::worker::netd::{Denials, NetPolicyCache};
+    use tokio::net::TcpListener;
 
     async fn origin() -> u16 {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1141,9 +1067,8 @@ mod tests {
         proxies
             .sync(&[ProxySpec {
                 allocation_id: 5,
-                netns: None,
+                attachment: Attachment::Host,
                 listen: Some("127.0.0.1:0".parse().unwrap()),
-                unix: None,
             }])
             .await;
         let addr = proxies.address(5).expect("proxy bound");
@@ -1298,9 +1223,8 @@ mod tests {
         proxies
             .sync(&[ProxySpec {
                 allocation_id: 5,
-                netns: None,
+                attachment: Attachment::Host,
                 listen: Some("127.0.0.1:0".parse().unwrap()),
-                unix: None,
             }])
             .await;
         let addr = proxies.address(5).expect("proxy bound");
@@ -1469,18 +1393,19 @@ mod tests {
                 .with_host_guard(guard_opening(&[origin_port])),
         );
         let proxies = EgressProxies::new(context);
+        let spec = ProxySpec {
+            allocation_id: 9,
+            attachment: Attachment::GuestVsock {
+                scratch: dir.path().to_path_buf(),
+            },
+            listen: None,
+        };
         let socket = crate::worker::netd::guest_agent::host_socket_path(
             &dir.path().join("vsock.sock"),
             crate::worker::netd::guest_agent::PROXY_PORT,
         );
-        proxies
-            .sync(&[ProxySpec {
-                allocation_id: 9,
-                netns: None,
-                listen: None,
-                unix: Some(socket.clone()),
-            }])
-            .await;
+        assert_eq!(spec.listen_addr(), ListenAddr::Unix(socket.clone()));
+        proxies.sync(&[spec]).await;
         assert!(proxies.is_running(9));
         assert!(
             proxies.address(9).is_none(),
@@ -1549,17 +1474,23 @@ mod tests {
 
     /// A gated sandbox's proxy on its own allocation's vsock socket.
     fn vsock_spec(root: &std::path::Path, allocation_id: i64) -> ProxySpec {
-        let base =
-            crate::task_plugins::vsock_socket_base_for(&root.join(allocation_id.to_string()));
         ProxySpec {
             allocation_id,
-            netns: None,
+            attachment: Attachment::GuestVsock {
+                scratch: crate::task_plugins::sandbox_dir_for(
+                    &root.join(allocation_id.to_string()),
+                ),
+            },
             listen: None,
-            unix: Some(crate::worker::netd::guest_agent::host_socket_path(
-                &base,
-                crate::worker::netd::guest_agent::PROXY_PORT,
-            )),
         }
+    }
+
+    /// The vsock host socket a spec's proxy listens on.
+    fn socket_of(spec: &ProxySpec) -> std::path::PathBuf {
+        spec.listen_addr()
+            .unix_path()
+            .expect("a vsock spec listens on a socket")
+            .to_path_buf()
     }
 
     async fn get_via(socket: &std::path::Path, origin_port: u16, path: &str) -> String {
@@ -1593,14 +1524,14 @@ mod tests {
         let proxies = EgressProxies::new(context);
         let before = vsock_spec(dir.path(), 7);
         proxies.sync(std::slice::from_ref(&before)).await;
-        let response = get_via(before.unix.as_deref().unwrap(), origin_port, "/poll").await;
+        let response = get_via(&socket_of(&before), origin_port, "/poll").await;
         assert!(response.contains("200 OK"), "{response}");
 
         // Suspended: allocation 7 leaves the node. Resumed as 8.
         let after = vsock_spec(dir.path(), 8);
         proxies.sync(std::slice::from_ref(&after)).await;
         assert!(!proxies.is_running(7));
-        let response = get_via(after.unix.as_deref().unwrap(), origin_port, "/poll").await;
+        let response = get_via(&socket_of(&after), origin_port, "/poll").await;
         assert!(response.starts_with("HTTP/1.1 403"), "{response}");
         let drained = denials.drain();
         assert!(!drained.is_empty());
@@ -1632,7 +1563,7 @@ mod tests {
         proxies.sync(&specs).await;
         let forks = &specs[1..];
         for fork in forks {
-            let socket = fork.unix.as_deref().unwrap();
+            let socket = &socket_of(&fork);
             let response = get_via(socket, origin_port, "/ok/work").await;
             assert!(response.contains("200 OK"), "{response}");
             let response = get_via(socket, origin_port, "/secret").await;
@@ -1654,7 +1585,7 @@ mod tests {
         proxies.sync(forks).await;
         assert!(!proxies.is_running(7));
         for fork in forks {
-            let response = get_via(fork.unix.as_deref().unwrap(), origin_port, "/ok/after").await;
+            let response = get_via(&socket_of(&fork), origin_port, "/ok/after").await;
             assert!(response.contains("200 OK"), "{response}");
         }
         assert!(context
@@ -1706,7 +1637,7 @@ mod tests {
         };
         assert_eq!(open(ledger), 0);
 
-        let mut stream = tokio::net::UnixStream::connect(spec.unix.as_deref().unwrap())
+        let mut stream = tokio::net::UnixStream::connect(&socket_of(&spec))
             .await
             .unwrap();
         stream
@@ -1795,7 +1726,7 @@ mod tests {
         let (shut, opened) = (vsock_spec(dir.path(), 7), vsock_spec(dir.path(), 8));
         proxies.sync(&[shut.clone(), opened.clone()]).await;
 
-        let response = get_via(shut.unix.as_deref().unwrap(), origin_port, "/anything").await;
+        let response = get_via(&socket_of(&shut), origin_port, "/anything").await;
         assert!(response.starts_with("HTTP/1.1 403"), "{response}");
         assert!(
             response
@@ -1811,7 +1742,7 @@ mod tests {
             "{drained:?}"
         );
 
-        let response = get_via(opened.unix.as_deref().unwrap(), origin_port, "/anything").await;
+        let response = get_via(&socket_of(&opened), origin_port, "/anything").await;
         assert!(response.contains("200 OK"), "{response}");
     }
 

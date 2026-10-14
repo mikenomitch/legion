@@ -26,13 +26,15 @@ use crate::prelude::*;
 use crate::structs::netpolicy::{ConnectFacts, Verdict};
 use crate::structs::SVC_ZONE;
 use crate::worker::forwarder::ForwarderContext;
+use crate::worker::netd::attach::Attachment;
+use crate::worker::netd::listen::{spawn_accept_loop, ListenAddr};
 use crate::worker::netd::metrics as net_metrics;
 use crate::worker::netd::policy::{egress_connect_verdict, gated_egress_connect_verdict};
 
 use std::collections::BTreeMap;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::time::Duration;
-use tokio::net::{TcpListener, UdpSocket};
+use tokio::net::UdpSocket;
 use tokio::task::JoinHandle;
 
 /// TTL on local answers. Short: a VIP never changes for a running
@@ -49,18 +51,32 @@ pub const DNS_PORT: u16 = 53;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DnsSpec {
     pub allocation_id: i64,
-    /// `127.42.b.1`, the address a namespace or host resolver binds. `None`
-    /// for a gated sandbox without a VIP block, which serves only on
-    /// [`Self::unix`] and never binds an address.
+    /// `127.42.b.1` (or the gated default), the address the resolver binds
+    /// in the host namespace or the allocation's namespace. `None` for a
+    /// gated sandbox without a VIP block, which serves only on its vsock
+    /// host socket.
     pub resolver: Option<Ipv4Addr>,
     /// `<key>` → (VIP, canonical port).
     pub names: BTreeMap<String, (Ipv4Addr, u16)>,
-    /// The gated namespace to bind inside, if any.
-    pub netns: Option<std::path::PathBuf>,
-    /// A gated *sandbox*: serve DNS-over-TCP framing on this Unix socket —
-    /// the host end of the guest's vsock port 53 — instead of binding the
-    /// resolver address (the guest agent relays UDP queries to it).
-    pub unix: Option<std::path::PathBuf>,
+    /// How the allocation is attached. A gated sandbox's resolver serves
+    /// DNS-over-TCP framing on the host end of the guest's vsock port 53
+    /// (the guest agent relays UDP queries to it) instead of binding the
+    /// resolver address.
+    pub attachment: Attachment,
+}
+
+impl DnsSpec {
+    /// Where the resolver binds, when it can bind anywhere.
+    pub fn listen(&self) -> Option<ListenAddr> {
+        match (&self.attachment, self.resolver) {
+            (Attachment::GuestVsock { .. }, _) => Some(
+                self.attachment
+                    .listen(IpAddr::V4(Ipv4Addr::LOCALHOST), DNS_PORT),
+            ),
+            (_, Some(resolver)) => Some(self.attachment.listen(IpAddr::V4(resolver), DNS_PORT)),
+            (_, None) => None,
+        }
+    }
 }
 
 struct Server {
@@ -173,59 +189,19 @@ impl NetDns {
     }
 
     async fn start(&self, spec: DnsSpec) {
-        if let Some(path) = spec.unix.clone() {
-            if let Some(parent) = path.parent() {
-                let _ = std::fs::create_dir_all(parent);
-            }
-            let _ = std::fs::remove_file(&path);
-            match tokio::net::UnixListener::bind(&path) {
-                Ok(listener) => {
-                    debug!(allocation_id = spec.allocation_id, path = %path.display(), "Started allocation resolver on vsock host socket");
-                    let shared = Arc::new(Resolver {
-                        spec: spec.clone(),
-                        context: self.context.clone(),
-                        forwarders: self.forwarders.clone(),
-                    });
-                    let task = tokio::spawn(run_unix(listener, shared));
-                    lock(&self.servers).insert(
-                        spec.allocation_id,
-                        Server {
-                            spec,
-                            udp: None,
-                            tcp: Some(task),
-                            bind_warned: false,
-                        },
-                    );
-                }
-                Err(err) => {
-                    warn!(allocation_id = spec.allocation_id, path = %path.display(), error = ?err, "Failed to bind resolver socket; retrying on the next heartbeat");
-                    lock(&self.servers).insert(
-                        spec.allocation_id,
-                        Server {
-                            spec,
-                            udp: None,
-                            tcp: None,
-                            bind_warned: true,
-                        },
-                    );
-                }
-            }
-            return;
-        }
-        let Some(resolver) = spec.resolver else {
+        let Some(listen) = spec.listen() else {
             // Nothing to bind: a spec with neither an address nor a socket
             // is never produced, but a resolver that cannot exist must not
             // count as running.
             return;
         };
-        let addr = SocketAddr::new(IpAddr::V4(resolver), DNS_PORT);
-        let udp = crate::worker::netd::netns::bind_udp(spec.netns.clone(), addr).await;
-        let tcp = crate::worker::netd::netns::bind_tcp(spec.netns.clone(), addr).await;
+        let udp = listen.bind_udp().await;
+        let tcp = listen.bind().await;
         match (udp, tcp) {
             (Ok(udp), Ok(tcp)) => {
                 debug!(
                     allocation_id = spec.allocation_id,
-                    resolver = %addr,
+                    listen = %listen,
                     names = spec.names.len(),
                     "Started allocation resolver"
                 );
@@ -234,13 +210,15 @@ impl NetDns {
                     context: self.context.clone(),
                     forwarders: self.forwarders.clone(),
                 });
-                let udp_task = tokio::spawn(run_udp(udp, shared.clone()));
-                let tcp_task = tokio::spawn(run_tcp(tcp, shared));
+                let udp_task = udp.map(|udp| tokio::spawn(run_udp(udp, shared.clone())));
+                let tcp_task = spawn_accept_loop(tcp, "resolver", move |stream, _| {
+                    serve_stream(stream, shared.clone())
+                });
                 lock(&self.servers).insert(
                     spec.allocation_id,
                     Server {
                         spec,
-                        udp: Some(udp_task),
+                        udp: udp_task,
                         tcp: Some(tcp_task),
                         bind_warned: false,
                     },
@@ -249,8 +227,8 @@ impl NetDns {
             (udp, tcp) => {
                 let err = udp
                     .err()
-                    .map(|e| e.to_string())
-                    .or_else(|| tcp.err().map(|e| e.to_string()))
+                    .map(|e| format!("{e:#}"))
+                    .or_else(|| tcp.err().map(|e| format!("{e:#}")))
                     .unwrap_or_default();
                 let mut servers = lock(&self.servers);
                 let warned = servers
@@ -259,7 +237,7 @@ impl NetDns {
                 if !warned {
                     warn!(
                         allocation_id = spec.allocation_id,
-                        resolver = %addr,
+                        listen = %listen,
                         error = %err,
                         "Failed to bind allocation resolver (port 53 needs CAP_NET_BIND_SERVICE); retrying on the next heartbeat"
                     );
@@ -321,36 +299,6 @@ async fn run_udp(socket: UdpSocket, resolver: Arc<Resolver>) {
                 let _ = socket.send_to(&response, peer).await;
             }
         });
-    }
-}
-
-async fn run_tcp(listener: TcpListener, resolver: Arc<Resolver>) {
-    loop {
-        let (stream, _) = match listener.accept().await {
-            Ok(accepted) => accepted,
-            Err(err) => {
-                debug!(error = ?err, "Resolver accept failed");
-                tokio::time::sleep(Duration::from_millis(100)).await;
-                continue;
-            }
-        };
-        let resolver = resolver.clone();
-        tokio::spawn(serve_stream(stream, resolver));
-    }
-}
-
-async fn run_unix(listener: tokio::net::UnixListener, resolver: Arc<Resolver>) {
-    loop {
-        let (stream, _) = match listener.accept().await {
-            Ok(accepted) => accepted,
-            Err(err) => {
-                debug!(error = ?err, "Resolver accept failed");
-                tokio::time::sleep(Duration::from_millis(100)).await;
-                continue;
-            }
-        };
-        let resolver = resolver.clone();
-        tokio::spawn(serve_stream(stream, resolver));
     }
 }
 
@@ -567,7 +515,7 @@ async fn answer(resolver: &Arc<Resolver>, query: &[u8]) -> Option<Vec<u8>> {
     // nothing allows is NXDOMAIN in one round trip (`gated-default`).
     let allocation_id = resolver.spec.allocation_id;
     let policy = resolver.context.policy_for(allocation_id);
-    let gated = resolver.spec.netns.is_some() || resolver.spec.unix.is_some();
+    let gated = resolver.spec.attachment.is_gated();
     let chain = policy.as_ref().and_then(|p| p.egress.as_ref());
     let judge = match chain {
         Some(chain) => !chain.uses_cidr(),
@@ -738,8 +686,7 @@ mod tests {
                 names: [("db".to_string(), (Ipv4Addr::new(127, 42, 9, 2), 5432))]
                     .into_iter()
                     .collect(),
-                netns: None,
-                unix: None,
+                attachment: Attachment::Host,
             },
             context,
             forwarders: vec![stub_addr],
@@ -816,7 +763,7 @@ mod tests {
         }]);
         cache.insert_body(&hash, empty).unwrap();
         let context = Arc::new(ForwarderContext::new(cache, denials.clone()));
-        let resolver = |unix: Option<std::path::PathBuf>| {
+        let resolver = |attachment: Attachment| {
             Arc::new(Resolver {
                 spec: DnsSpec {
                     allocation_id: 3,
@@ -824,15 +771,16 @@ mod tests {
                     names: [("db".to_string(), (Ipv4Addr::new(127, 42, 9, 2), 5432))]
                         .into_iter()
                         .collect(),
-                    netns: None,
-                    unix,
+                    attachment,
                 },
                 context: context.clone(),
                 forwarders: vec![stub_addr],
             })
         };
 
-        let gated = resolver(Some("/allocs/3/.sandbox/vsock.sock_53".into()));
+        let gated = resolver(Attachment::GuestVsock {
+            scratch: "/allocs/3/.sandbox".into(),
+        });
         let r = answer(&gated, &query("pypi.org", TYPE_A)).await.unwrap();
         assert_eq!(r[3] & 0x0F, RCODE_NXDOMAIN);
         let drained = denials.drain();
@@ -851,7 +799,7 @@ mod tests {
             "the zone still resolves"
         );
 
-        let cooperative = resolver(None);
+        let cooperative = resolver(Attachment::Host);
         let r = answer(&cooperative, &query("pypi.org", TYPE_A))
             .await
             .unwrap();

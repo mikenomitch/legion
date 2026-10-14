@@ -21,22 +21,21 @@
 
 use crate::prelude::*;
 use crate::structs::netpolicy::EffectivePolicy;
-use crate::structs::{AllocNetPolicy, TaskAllocation, UpstreamEndpoints};
+use crate::worker::netd::datapath::DesiredNetwork;
 use serde::{Deserialize, Serialize};
 
 use std::path::{Path, PathBuf};
 
-/// What a heartbeat reply handed the datapath, minus everything that is
-/// not the datapath's (stop notices, volume reclaim, cadence).
+/// What the datapath was last told ([`DesiredNetwork`], the boundary type the
+/// worker sends it), plus the policy bodies it fetched for it. Everything a
+/// heartbeat reply carries that is not the datapath's (stop notices, volume
+/// reclaim, cadence) never reaches here.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct NetdState {
-    #[serde(default)]
-    pub desired: Vec<TaskAllocation>,
-    #[serde(default)]
-    pub upstream_endpoints: Vec<UpstreamEndpoints>,
-    #[serde(default)]
-    pub net_policies: Vec<AllocNetPolicy>,
+    /// The desired set, endpoint feed, and policy assignments.
+    #[serde(flatten)]
+    pub network: DesiredNetwork,
     /// Policy bodies by hash, so no fetch is needed to restore.
     #[serde(default)]
     pub policy_bodies: Vec<(String, EffectivePolicy)>,
@@ -44,7 +43,7 @@ pub struct NetdState {
 
 impl NetdState {
     pub fn is_empty(&self) -> bool {
-        self.desired.is_empty()
+        self.network.desired.is_empty()
     }
 }
 
@@ -114,6 +113,7 @@ impl NetdStateStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::structs::{AllocNetPolicy, TaskAllocation, UpstreamEndpoints};
 
     #[test]
     fn round_trips_and_tolerates_absence() -> R<()> {
@@ -121,28 +121,41 @@ mod tests {
         let store = NetdStateStore::beside(&dir.path().join("worker_state.json"));
         assert!(store.load()?.is_empty());
         let state = NetdState {
-            desired: vec![TaskAllocation {
-                allocation_id: 7,
-                job_id: "web".into(),
-                task_name: "server".into(),
-                network: "{\"mode\":\"gated\"}".into(),
-                ..Default::default()
-            }],
-            upstream_endpoints: vec![UpstreamEndpoints {
-                allocation_id: 7,
-                service: "db".into(),
-                endpoints: Vec::new(),
-                for_handler: false,
-            }],
-            net_policies: vec![AllocNetPolicy {
-                allocation_id: 7,
-                policy_hash: "abc".into(),
-            }],
+            network: DesiredNetwork {
+                desired: vec![TaskAllocation {
+                    allocation_id: 7,
+                    job_id: "web".into(),
+                    task_name: "server".into(),
+                    network: "{\"mode\":\"gated\"}".into(),
+                    ..Default::default()
+                }],
+                upstream_endpoints: vec![UpstreamEndpoints {
+                    allocation_id: 7,
+                    service: "db".into(),
+                    endpoints: Vec::new(),
+                    for_handler: false,
+                }],
+                net_policies: vec![AllocNetPolicy {
+                    allocation_id: 7,
+                    policy_hash: "abc".into(),
+                }],
+            },
             policy_bodies: vec![("abc".into(), EffectivePolicy::default())],
         };
         store.save(&state)?;
         assert_eq!(store.path(), dir.path().join("netd_state.json"));
         assert_eq!(store.load()?, state);
+        // The file keeps its flat shape: the boundary type's fields sit
+        // next to the bodies.
+        let raw: Value = serde_json::from_str(&std::fs::read_to_string(store.path())?)?;
+        for key in [
+            "desired",
+            "upstreamEndpoints",
+            "netPolicies",
+            "policyBodies",
+        ] {
+            assert!(raw.get(key).is_some(), "{key} missing from {raw}");
+        }
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
