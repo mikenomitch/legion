@@ -314,7 +314,7 @@ pub async fn wait_until_running(
         // check leaves a permit on the waker, so it cannot be missed.
         let (state, waiter) = {
             let mut guard = task_manager.lock().expect("task manager");
-            let state = guard.session_status(session_id).map(|status| status.state);
+            let state = guard.session_state(session_id);
             (state, guard.stage_waiter(&claim_id))
         };
         match state.as_deref() {

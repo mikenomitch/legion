@@ -3829,6 +3829,28 @@ impl WorkerTaskManager {
         statuses
     }
 
+    /// A session's `state`, as [`Self::session_status`] reports it, without
+    /// building the rest of the status: that reads the node's envelope, a
+    /// scan of every allocation on the node, and an edge start waiting for
+    /// its session to run asks this every time its claim moves.
+    pub fn session_state(&self, session_id: &str) -> Option<String> {
+        if let Some(idle) = self.idle_sessions.get(session_id) {
+            return (idle.state == crate::worker::session_log::SessionLogState::Suspended)
+                .then(|| idle.state.as_str().to_string());
+        }
+        let claim = self.claims.by_instance(session_id)?;
+        if !claim.is_session() || claim.is_ratified() {
+            return None;
+        }
+        Some(
+            match claim.stage {
+                ClaimStage::Serving | ClaimStage::Booted => "running",
+                _ => "starting",
+            }
+            .to_string(),
+        )
+    }
+
     /// One session on this node, running or idle, for `Worker.GetSession`.
     /// Promoted sessions are allocations and are not sessions any more.
     /// An evicted session is `None`: the node answers it `evicted` instead
