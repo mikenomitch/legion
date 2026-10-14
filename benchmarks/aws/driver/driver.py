@@ -334,11 +334,15 @@ def parse_legion_event(line):
     data = envelope.get("data") or {}
     if not envelope.get("ok") or data.get("kind") != "allocation.placed":
         return None
-    job = data.get("job_id")
+    # The event serializes camelCase now (`jobId`, `metadataJson`); it was
+    # snake_case when this parser was written. Reading only the old names
+    # counted zero placements on 2026-10-14 while the manager placed every
+    # one, so accept both rather than pin to either.
+    job = data.get("jobId", data.get("job_id"))
     if job is None:
         return None
     try:
-        metadata = json.loads(data.get("metadata_json") or "{}")
+        metadata = json.loads(data.get("metadataJson") or data.get("metadata_json") or "{}")
     except json.JSONDecodeError:
         metadata = {}
     return {"job": job, "count": int(metadata.get("count", 1))}

@@ -540,3 +540,11 @@ class FollowerLagSummaryTest(unittest.TestCase):
         self.assertEqual(summary["samples"], 5)
         self.assertEqual(summary["p50_ms"], 3.0)
         self.assertEqual(summary["max_ms"], 5.0)
+
+
+class ParseLegionEventCamelCaseTest(unittest.TestCase):
+    def test_camel_case_envelope(self):
+        line = json.dumps({"ok": True, "data": {
+            "kind": "allocation.placed", "jobId": "bench-api-1",
+            "metadataJson": json.dumps({"count": 6})}})
+        self.assertEqual(parse_legion_event(line), {"job": "bench-api-1", "count": 6})
