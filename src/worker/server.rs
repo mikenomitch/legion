@@ -498,6 +498,25 @@ impl Worker for WorkerDaemonService {
             return Ok(Response::new(Box::pin(ReceiverStream::new(rx))));
         }
 
+        // The claim's own identity for the workload's env: the cached task
+        // config carries whichever instance it was last dispatched for.
+        let identity = crate::structs::Instance {
+            instance_id: req.instance_id.clone(),
+            job_id: claims.job.clone(),
+            group: task.group.clone(),
+            task_name: task.name.clone(),
+            mode: crate::structs::InstanceMode::Keyed,
+            state: crate::structs::InstanceState::Pending,
+            slot_index: None,
+            current_alloc_id: None,
+            storage_handle: None,
+            created_at: String::new(),
+            updated_at: String::new(),
+            restore_from: None,
+            identity_epoch: 0,
+            named: true,
+            promoted_from: None,
+        };
         let payload = crate::manager::dispatcher::build_task_allocation_with(
             &task,
             &crate::structs::Allocation {
@@ -511,7 +530,7 @@ impl Worker for WorkerDaemonService {
                 instance_id: Some(req.instance_id.clone()),
                 network: None,
             },
-            None,
+            Some(&identity),
             &[],
             Some(crate::structs::ProvisionalAllocation {
                 claim_id: claim_id.clone(),

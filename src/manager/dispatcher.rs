@@ -764,6 +764,16 @@ fn inject_provisional_env(config: &mut Value, claim_id: &str, instance: Option<&
         "LEGION_CLAIM_ID".to_string(),
         Value::String(claim_id.to_string()),
     );
+    // A node builds an edge start from a task config it cached off another
+    // allocation's dispatch, whose env names that allocation's instance. The
+    // claim's own identity replaces it, and none is left behind without one.
+    for key in [
+        "LEGION_INSTANCE_ID",
+        "LEGION_INSTANCE_MODE",
+        "LEGION_INSTANCE_SLOT",
+    ] {
+        env.remove(key);
+    }
     if let Some(instance) = instance {
         env.insert(
             "LEGION_INSTANCE_ID".to_string(),
@@ -1112,6 +1122,45 @@ mod tests {
         assert_eq!(env["LEGION_INSTANCE_ID"], json!("job-default-1"));
         assert_eq!(env["LEGION_ALLOC_ID"], json!("42"));
         assert_eq!(env["USER_VAR"], json!("kept"));
+        Ok(())
+    }
+
+    /// An edge start is built from a task config the node cached off another
+    /// allocation's dispatch, so its env already names that allocation's
+    /// instance. The claim's own identity must replace it.
+    #[test]
+    fn a_provisional_start_drops_a_cached_instance_identity() -> R<()> {
+        let cached = TaskConfig {
+            config: json!({
+                "command": ["true"],
+                "env": { "LEGION_INSTANCE_ID": "someone-else", "LEGION_INSTANCE_MODE": "keyed" }
+            }),
+            ..TaskConfig::new("box", "exec")
+        };
+        let provisional = || ProvisionalAllocation {
+            claim_id: "clm_a".into(),
+            ..Default::default()
+        };
+        let built = build_task_allocation_with(
+            &cached,
+            &allocation(Some("r-1")),
+            None,
+            &[],
+            Some(provisional()),
+        )?;
+        let env = env_from(&built);
+        assert!(!env.contains_key("LEGION_INSTANCE_ID"));
+        assert_eq!(env["LEGION_CLAIM_ID"], json!("clm_a"));
+        let mut instance = slot_instance();
+        instance.instance_id = "r-1".into();
+        let built = build_task_allocation_with(
+            &cached,
+            &allocation(Some("r-1")),
+            Some(&instance),
+            &[],
+            Some(provisional()),
+        )?;
+        assert_eq!(env_from(&built)["LEGION_INSTANCE_ID"], json!("r-1"));
         Ok(())
     }
 
