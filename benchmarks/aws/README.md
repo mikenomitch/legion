@@ -855,6 +855,16 @@ and tear it down when the campaign is over.
 - **Same hardware, serially.** One control-plane trio hosts every
   system in turn; instance types pinned; `wipe-control-plane.sh`
   between campaigns.
+- **Same disk.** Every system's store sits on the control plane's local
+  NVMe: cloud-init bind-mounts it onto `/var/lib/legion`,
+  `/var/lib/nomad`, and `/var/lib/etcd`. Before 2026-10-14 only Legion's
+  was there and the competitors' raft log and WAL sat on gp3 (calls entry
+  5). Rerun on NVMe, neither competitor got meaningfully faster: both are
+  CPU-bound on their leader box, which `cpu_by_mode` and `disk_busy` in
+  every cell now show directly.
+- **The measurement does not tax the measured.** Control-plane scrapes run
+  at 15s, not 5s: Nomad's leader exposes ~49,000 samples at 4,000 jobs
+  and took 1.25s to encode each scrape (calls entry 12).
 - **Each ecosystem's own simulator.** Legion `--simulate`
   (docs/worker-simulation.md), nomad-nodesim, KWOK — every system's
   fake nodes speak that system's real node protocol, shaped from the
@@ -874,7 +884,7 @@ and tear it down when the campaign is over.
   Nomad and K8s use the driver's `http_submit_all`: one process, one
   keep-alive HTTP connection per worker thread, `POST /v1/jobs` and
   `POST .../deployments`, at the same concurrency. This is the
-  cross-system default since 2026-10-09 (calls entry 5). Before then only
+  cross-system default since 2026-10-09 (calls entry 6). Before then only
   Legion had a native path and a comparison had to force all three onto
   the CLI loop, which capped every system at the loadgen box's
   process-spawn rate and made the table a tie by construction.
@@ -961,12 +971,25 @@ and tear it down when the campaign is over.
 - K8s runs with its API client QPS raised (scheduler and
   controller-manager) but stock eviction timers, so its storm cell is
   capped at 30 minutes and reported as a replaced fraction. See
-  `configs/k8s/kubeadm-config.yaml.tpl` and calls entry 6.
+  `configs/k8s/kubeadm-config.yaml.tpl` and calls entry 7. Its etcd quota
+  is raised to 8 GiB so the largest `dense_fleet` cells cannot end on a
+  NOSPACE alarm (calls entry 13), and each KWOK slice talks to a different
+  apiserver rather than all to cp-0 (calls entry 8).
+- K8s campaigns before 2026-10-14 have no scheduler or apiserver metrics.
+  Prometheus mounted `prometheus.yml` as a single file, which pins its
+  inode, so the scrape jobs `install-k8s.sh` appends never loaded. It now
+  mounts the directory.
+- Nomad's leader serves a heartbeat after nearly every client RPC (Nomad
+  2.0.5's client wakes its heartbeat loop on each successful RPC), so it
+  handled ~2,500-3,300 `Node.UpdateStatus` calls/sec at 2k-5k nodes where
+  its 50/sec TTL target suggests ~50. That is Nomad's real client inside
+  nodesim, so it stays in, and every cell archives the rate as
+  `nomad_heartbeats` (calls entry 9).
 - Competitor watches reconnect when the server ends them (the K8s
   apiserver closes watchers that fall behind in a burst). Binds in the
   gap are stamped late, which biases that system's latency upward, so
   every cell records `watch_restarts`. Check it before quoting a K8s or
-  Nomad latency. See calls entry 8.
+  Nomad latency. See calls entry 11.
 - Nomad's down nodes stay in its node table until GC, so its fleet gate
   counts *ready* nodes; a restarted nodesim fleet registers new node IDs.
 - Batch workloads translate to K8s Deployments (not Jobs) so all three

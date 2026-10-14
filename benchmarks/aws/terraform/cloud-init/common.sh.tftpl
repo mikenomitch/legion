@@ -64,7 +64,7 @@ mkdir -p /opt/legion/bin /opt/legion/configs $${STORE_DIRS}
 # All three systems, not just Legion. Until 2026-10-14 only
 # /var/lib/legion was mounted here, so Nomad's raft log and etcd's WAL sat
 # on the gp3 root while Legion's sat on NVMe, and every cross-system cell
-# compared disks as much as schedulers (calls entry 18). Bind mounts keep
+# compared disks as much as schedulers (calls entry 5). Bind mounts keep
 # each system's stock path, so no config has to name the NVMe.
 #
 # Identified by model string rather than device name: the NVMe numbering

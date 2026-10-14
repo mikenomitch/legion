@@ -1438,7 +1438,7 @@ How to use it:
         with only HTTPS and credentials — no SSH, no repo, no terraform
         state — can check on an unattended campaign and tell "stalled"
         from "quiet". README "Watching from somewhere else" and "Keeping
-        results after the rig is gone"; calls entries 15 and 19-21.
+        results after the rig is gone"; calls entries 21 and 25-27.
   - [x] Bootstrap the operator box the campaign is driven from
         (`scripts/bootstrap-operator-box.sh`, `scripts/phase1.sh`; calls
         entries 22-23). One command takes an AWS key to a running
@@ -1833,7 +1833,7 @@ How to use it:
         control-plane box. Deliberately not done mid-campaign: it changes
         the binary under test and invalidates the fairness record for
         every cell already collected. Do it before the phase-2 campaign.
-        See calls entry 24 and the Metrics section of the plan.
+        See calls entry 30 and the Metrics section of the plan.
   - [x] Rebuild the Nomad and K8s paths for the cross-system campaign
         (2026-10-09, branch `bench/aws-comparison-refresh`): Nomad 2.0.5
         + nodesim `702a0d9` with one process per node profile (the old
@@ -1842,7 +1842,7 @@ How to use it:
         node offers), K8s 1.36.5 + KWOK 0.8.0 run out of cluster as one
         controller per instance slice, native HTTP submitters for both,
         and an apiserver watch replacing `kubectl get --watch`. Plan
-        § Cross-system campaign; calls entries 5-8.
+        § Cross-system campaign; calls entries 6, 7, 10, and 11.
   - [ ] Run the cross-system matrix (plan § Cross-system campaign): rows
         1-6 on all three systems, then analysis + `REPORT.md`.
   - [ ] Legion B (streaming) campaign, and the 20k validation burst.
