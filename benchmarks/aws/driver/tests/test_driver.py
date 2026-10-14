@@ -21,6 +21,8 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", "workloads"))
 
 from driver import (  # noqa: E402
+    server_reports_complete,
+    follower_lag_summary,
     K8sAdapter,
     LegionAdapter,
     NomadAdapter,
@@ -527,3 +529,36 @@ class NativeSubmitterWiring(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class FollowerLagSummaryTest(unittest.TestCase):
+    def test_empty_is_none(self):
+        self.assertIsNone(follower_lag_summary([]))
+        self.assertIsNone(follower_lag_summary(None))
+
+    def test_percentiles(self):
+        summary = follower_lag_summary([5, 1, 3, 2, 4])
+        self.assertEqual(summary["samples"], 5)
+        self.assertEqual(summary["p50_ms"], 3.0)
+        self.assertEqual(summary["max_ms"], 5.0)
+
+
+class ParseLegionEventCamelCaseTest(unittest.TestCase):
+    def test_camel_case_envelope(self):
+        line = json.dumps({"ok": True, "data": {
+            "kind": "allocation.placed", "jobId": "bench-api-1",
+            "metadataJson": json.dumps({"count": 6})}})
+        self.assertEqual(parse_legion_event(line), {"job": "bench-api-1", "count": 6})
+
+
+class ServerReportsCompleteTest(unittest.TestCase):
+    def test_server_count_covers_expected(self):
+        self.assertTrue(server_reports_complete(
+            {"allocations": 10.0}, lambda: {"allocations": 110.0}, 100))
+
+    def test_short_or_unavailable(self):
+        self.assertFalse(server_reports_complete(
+            {"allocations": 10.0}, lambda: {"allocations": 100.0}, 100))
+        self.assertFalse(server_reports_complete(None, lambda: {"allocations": 1e9}, 100))
+        self.assertFalse(server_reports_complete(
+            {"allocations": 0.0}, lambda: {"error": "down"}, 100))

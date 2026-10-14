@@ -622,6 +622,45 @@ How to use it:
       736 / 322 / ~85 before. Eval `queue_wait` is now ~0.3 ms, so the
       blocking-pool contention is gone. Public numbers in
       [docs/benchmarks.md](../docs/benchmarks.md).
+- [x] **`RunJob` no longer parks tokio workers.** The submit is a chain of quorum writes, and `RunJob` ran
+      it inline on a runtime worker, the same mistake the heartbeat offload
+      fixed. With 128 submits in flight on a 4-vCPU leader, every worker sat
+      in a commit, so each eval worker's `spawn_blocking` await waited for a
+      thread to resume on. The archived 2026-10-10 cells show it as eval
+      handle time outside every phase: 14 ms at 1k nodes, 16 ms at 5k, and
+      60-78 ms at 10k while submits were in flight, against a 12-22 ms plan.
+      Heartbeat p99 rose from ~2 ms to 145-900 ms in the same windows. Now
+      `RunJob` and `RunJobTemplate` run the submit under `block_in_place`
+      (`run_blocking_admission`). On a local 3-voter `lanes` cluster with 4
+      runtime workers per manager, alternating builds: 1k nodes 514 / 478 /
+      661 → 1,159 / 964 / 1,160 alloc/s, 5k nodes 714 / 503 → 860 / 1,049.
+      Eval handle time now matches the plan phase, the `job_submit`
+      coalescer batches ~16 instead of ~1.1, and `RunJob` latency rises
+      (40-125 → 140-225 ms) because submits now queue in the coalescer
+      instead of in front of the runtime. On the AWS rig (2026-10-14, PR
+      #40) `web_fleet` went 680 → 1,261 alloc/s at 1k nodes, 640 → 1,067 at
+      2k, 635 → 945 at 10k, and 1,175 → 968 at 5k (see the open item
+      below).
+- [ ] **`web_fleet` at 5k nodes got slower with the `RunJob` offload**
+      (1,175 and 1,151 → 968 alloc/s on AWS, one run), even as its p99
+      improved (25s → 17.5s) and every other fleet size got 49-85% faster.
+      Submits now arrive 3-4x faster, and heartbeat freshness dipped during
+      the bursts (0.20 average at 1k). Find out whether faster admission
+      changes the plan coalescer's batching at 5k or crowds the heartbeat
+      path, before tuning anything.
+- [ ] **Other mutating handlers still commit on a runtime worker.**
+      `StopJob`, `DestroyJob`, the KV writes, and most other mutating RPCs
+      call the store inline like `RunJob` did. None of them is hot in a
+      benchmark today, but a burst of any of them starves the eval loop and
+      heartbeats the same way. Move them behind `run_blocking_admission`
+      or `spawn_blocking` as they show up.
+- [ ] **`legion_runtime_spawn_delay_seconds` can't see the starvation it
+      exists for.** The probe spawns its task from a task already running on
+      a worker, so the probe lands in that worker's LIFO slot and is polled
+      as soon as the spawner yields. It read under 50 µs throughout local
+      runs where heartbeats averaged 90 ms. The delay that matters is the
+      ticker task's own wake. Measure from the tick's deadline instead
+      (`src/manager/telemetry.rs`, `start_runtime_probe`).
 - [ ] **The rig's plan phase is ~25x the micro-bench.** On AWS
       `legion_eval_phase_seconds{phase="plan"}` averages 26 ms per
       `job_submit` eval at 20k nodes and 45 ms at 50k, against ~1 ms for
@@ -1438,10 +1477,10 @@ How to use it:
         with only HTTPS and credentials — no SSH, no repo, no terraform
         state — can check on an unattended campaign and tell "stalled"
         from "quiet". README "Watching from somewhere else" and "Keeping
-        results after the rig is gone"; calls entries 15 and 19-21.
+        results after the rig is gone"; calls entries 21 and 25-27.
   - [x] Bootstrap the operator box the campaign is driven from
         (`scripts/bootstrap-operator-box.sh`, `scripts/phase1.sh`; calls
-        entries 22-23). One command takes an AWS key to a running
+        entries 28-29). One command takes an AWS key to a running
         phase 1: builds an Ubuntu x86_64 box outside the rig's terraform
         (it *runs* that terraform, and must outlive `teardown.sh`, which
         destroys the state), gives it an Elastic IP so `admin_cidr` stays
@@ -1833,7 +1872,7 @@ How to use it:
         control-plane box. Deliberately not done mid-campaign: it changes
         the binary under test and invalidates the fairness record for
         every cell already collected. Do it before the phase-2 campaign.
-        See calls entry 24 and the Metrics section of the plan.
+        See calls entry 30 and the Metrics section of the plan.
   - [x] Rebuild the Nomad and K8s paths for the cross-system campaign
         (2026-10-09, branch `bench/aws-comparison-refresh`): Nomad 2.0.5
         + nodesim `702a0d9` with one process per node profile (the old
@@ -1842,9 +1881,40 @@ How to use it:
         node offers), K8s 1.36.5 + KWOK 0.8.0 run out of cluster as one
         controller per instance slice, native HTTP submitters for both,
         and an apiserver watch replacing `kubectl get --watch`. Plan
-        § Cross-system campaign; calls entries 5-8.
-  - [ ] Run the cross-system matrix (plan § Cross-system campaign): rows
-        1-6 on all three systems, then analysis + `REPORT.md`.
+        § Cross-system campaign; calls entries 6, 7, 10, and 11.
+  - [x] Rerun the comparison with every system's store on the same NVMe
+        (2026-10-14, PR #40). Only Legion's had been on it; Nomad's raft
+        log and etcd sat on gp3. Neither competitor got faster. Both are
+        CPU-bound on one control-plane box from 5k nodes up. Ran
+        `web_fleet` 1k-10k and the storm drill at 5k on all three, the
+        `dense_fleet` sweep and `batch_burst` at 5k, and two ablations (K8s
+        on one apiserver, Legion on fixed 2s heartbeats). Also fixed: K8s
+        metrics never scraped (single-file Prometheus mount), the driver's
+        Legion parser counting zero (camelCase events), plugin and
+        `legion-loadgen` builds on main, and a 5s scrape costing Nomad's
+        leader a quarter of a core. [docs/benchmarks.md](../docs/benchmarks.md),
+        calls entries 5, 8, 9, and 12-14.
+  - [ ] Run the rest of the cross-system matrix (plan § Cross-system
+        campaign): the CLI control row (row 5) on the NVMe rig, the 10k
+        storm on all three, memory per cell (row 6) in the report, and
+        `REPORT.md`.
+  - [ ] Nomad's placement follower decodes every allocation event in
+        Python and missed 14-34 events in the 50k-allocation cells. The
+        driver now completes the cell on Nomad's own count, but its
+        throughput undercounts by the shortfall. A compiled follower, or
+        Nomad's own count as the primary source, would close it.
+  - [ ] K8s at 200,000 pods: the apiserver on the box running the
+        scheduler stopped completing TLS handshakes and the driver's watch
+        could not reconnect, so the 40-per-node `dense_fleet` cell has no
+        full result. Point the driver at a different apiserver than the
+        scheduler's leader, then rerun that cell.
+  - [ ] Legion's fixed-2s-heartbeat ablation at 5k served well under the
+        2,500 heartbeats/sec a 2s cadence implies (freshness 0.46), so
+        that row understates the cost. Find out why the simulated fleet
+        did not settle onto 2s with `adaptive = false`.
+  - [ ] The plugins' own `Cargo.lock` files drifted while plugin builds
+        were broken (`plugins/tasks/noop` gains `legion-guest`, `imbl`,
+        `archery` on a fresh build). Refresh and commit them.
   - [ ] Legion B (streaming) campaign, and the 20k validation burst.
   - [ ] Nomad cannot run `mixed_heterogeneous`: nodesim has no node meta.
         Patch nodesim to accept a `meta` map (small, upstreamable) if the

@@ -26,6 +26,17 @@ apiVersion: kubeadm.k8s.io/v1beta4
 kind: ClusterConfiguration
 kubernetesVersion: "${K8S_VERSION}"
 controlPlaneEndpoint: "${CP0_IP}:6443"
+# NON-DEFAULT (documented): etcd's backend quota raised from 2 GiB to
+# 8 GiB, the ceiling etcd's own docs suggest. A capacity limit, not a
+# speed knob: the dense_fleet sweep holds up to 200,000 pods plus their
+# events between compactions, and at the default quota etcd raises a
+# NOSPACE alarm and turns read-only partway through the cell, which ends
+# it as "failed" rather than measuring the scheduler.
+etcd:
+  local:
+    extraArgs:
+      - name: quota-backend-bytes
+        value: "8589934592"
 scheduler:
   extraArgs:
     - name: bind-address

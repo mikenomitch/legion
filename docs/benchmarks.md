@@ -15,16 +15,20 @@ the comparison fair.
 - **Placement throughput stays high from 1,000 to 20,000 nodes.** Legion
   placed 829 allocations/sec at 1k nodes and 553/sec at 20k, and completed
   a 250,000-allocation burst on a 50,000-node fleet.
-- **Several times Nomad and Kubernetes on the same rig.** At 1k-2k nodes
-  Legion placed 4.5-10x the allocations/sec of Nomad and Kubernetes. At 5k
-  nodes it placed 17x Kubernetes, and Nomad's leader failed partway
-  through the burst.
+- **Many times Nomad and Kubernetes on the same rig.** With all three
+  systems' stores on the same local NVMe, Legion placed 7-13x the
+  allocations/sec of Nomad and Kubernetes at 1k-2k nodes and 18-52x at
+  5k-10k. These multiples use the current release, with `RunJob` off the
+  async runtime (see [below](#compared-with-nomad-and-kubernetes)). Both
+  competitors are CPU-bound on one control-plane box from 5k nodes up, not
+  disk-bound.
 - **Millisecond latency below saturation.** Submitted at a steady rate,
   allocations land in about 20ms at the median and under 300ms at p99,
   even on a 20,000-node fleet.
-- **Fast recovery.** When a quarter of a 5,000-node fleet died at once,
-  Legion replaced every orphaned allocation in 27 seconds, against 111 for
-  Nomad. At 10,000 nodes it replaced 6,258 allocations in under 50 seconds.
+- **Fast recovery.** When a quarter of a 5,000-node fleet died with about
+  6,000 allocations on it, Legion replaced every one in 37 seconds, against
+  80 for Nomad. Kubernetes, on its default eviction timers, had replaced
+  under 12% after 30 minutes.
 - **MicroVM sandboxes ready in about 200 ms.** Session sandboxes on real KVM
   went from create to a guest that takes exec in 180 to 230 ms, and four
   4-vCPU workers booted 160 in 2.3 seconds, with no write to the replicated
@@ -44,11 +48,16 @@ the comparison fair.
   the control plane does the same work it would for real machines.
 - **Load generator:** one `m7i.4xlarge` submitting through each system's
   native API with pooled connections.
+- **Storage:** every system's store (Legion's raft log, Nomad's raft log,
+  and etcd) sits on the control plane's local NVMe.
 - **Versions:** Nomad 2.0.5, Kubernetes 1.36.5 with KWOK 0.8.0, and Legion
   at the commit recorded in each cell's archive. All three run their
-  default configuration, including heartbeat cadence (Legion's
-  [adaptive cadence](heartbeat-cadence-and-scale.md) and Nomad's own
-  rate-based scaling).
+  default heartbeat behavior (Legion's
+  [adaptive cadence](heartbeat-cadence-and-scale.md), Nomad's rate-scaled
+  TTL, and Kubernetes' 10-second node leases). Legion runs the `lanes`
+  [raft topology](multi-raft.md), which is opt-in and recommended at this
+  fleet size. Kubernetes runs with a few documented changes, listed under
+  [Methodology](#methodology).
 
 The workloads are the scheduler scenarios in
 [`benchmarks/scheduler/scenarios/`](../benchmarks/scheduler/scenarios/):
@@ -61,6 +70,12 @@ The workloads are the scheduler scenarios in
   saturate the scheduler rather than the submitter.
 
 ## Throughput as the fleet grows
+
+These Legion-only cells ran on 2026-10-10 at commit `01d75511`, before the
+cross-system rerun below, and are the only runs at 20k and 50k nodes. The
+rerun's Legion numbers at 1k-10k come from a later `main` and differ by up
+to 20% in either direction, which is about the single-run noise of these
+cells.
 
 Each cell submits the whole workload at once and measures placed
 allocations per second over the steady window, after a 30-second warmup.
@@ -101,55 +116,131 @@ thing to make flat.
 
 ## Compared with Nomad and Kubernetes
 
-Same rig, same workload, each system on its own simulator and submitting
-through its own API. The Nomad and Kubernetes cells come from a comparison
-run against an earlier Legion build, which is shown too so you can see how
-much of the gap is the recent scaling work.
+Same rig, same workload, measured on 2026-10-14 with every system's store
+on the same local NVMe. Each system runs on its own node simulator and
+submits through its own API. Legion is built from `main` at `89229706`.
 
 **`web_fleet`, allocations/sec:**
 
-| Nodes  | Legion (current) | Legion (comparison build) | Nomad 2.0.5    | Kubernetes 1.36.5 |
-| ------ | ---------------- | ------------------------- | -------------- | ----------------- |
-| 1,000  | **829**          | 733                       | 122 (182)      | 117 (100)         |
-| 2,000  | **789**          | 669                       | 110 (97)       | 78 (80)           |
-| 5,000  | **905**          | 736                       | failed         | 53 (45)           |
-| 10,000 | **738**          | 322                       | not run        | not measured      |
+| Nodes  | Legion    | Nomad 2.0.5 | Kubernetes 1.36.5 |
+| ------ | --------- | ----------- | ----------------- |
+| 1,000  | **680**   | 186         | 96                |
+| 2,000  | **640**   | 114         | 85                |
+| 5,000  | **1,175** | 53          | 52                |
+| 10,000 | **635**   | 27          | 18                |
 
-Numbers in parentheses are a second run of the same cell. At 5k nodes the
-Nomad leader lost leadership partway through the burst and rejected
-submissions with `leadership lost while committing log`, so that cell has
-no number. The Kubernetes 10k cell was invalid for a rig reason, not a
-Kubernetes one: about 15,600 pods from the previous cell survived cleanup,
-and the new cell's submissions collided with their names.
+Each number is one run, so the multiple depends on which fleet size you
+quote: in this table, measured before the `RunJob` change described below,
+Legion leads by 3.5-7.5x at 1k-2k nodes and 22-35x at 5k-10k. Its
+peak at 5k is not a single outlier. A repeat of that cell placed
+1,151/sec, the fixed-heartbeat ablation below placed 1,134/sec, and the
+earlier build also peaked at 5k (905/sec, against 738 at 10k). Repeats of
+the competitors' 5k cells placed 53 (Nomad, against 49 at the 5-second
+scrape) and 49.8 (Kubernetes, against 52.2).
 
-**`batch_burst` at 5,000 nodes:**
+Nomad's 1k-5k cells are a rerun with Prometheus scraping every 15 seconds.
+At 5 seconds the scrape cost its leader enough CPU to read 188, 102, and
+49 allocations/sec.
 
-| System                    | Allocations/sec | p50: time to place half the burst | p99: time to place 99% of the burst |
-| ------------------------- | --------------- | --------------------------------- | ----------------------------------- |
-| Legion (current)          | **1,879**       | 6.2s        | 8.0s        |
-| Legion (comparison build) | 1,463           | 8.4s        | 11.2s       |
-| Nomad 2.0.5               | 83              | -           | 312s        |
-| Kubernetes 1.36.5         | 66              | -           | 364s        |
+The Kubernetes 10k cell reached the driver's 42-minute cap with 92% of its
+50,000 pods placed, so its number is the rate over that window. Nomad
+rejected some submissions with a 5xx at 5k and 10k nodes, while its leader
+briefly lost leadership (`leadership lost while committing log`), and the
+driver retried them. Every retry counts against Nomad's latency, not its
+allocation count.
+
+**Why the competitors run at these rates.** An earlier run of this
+comparison kept Nomad's raft log and etcd on network storage (gp3) while
+Legion's was on local NVMe. Moving them to NVMe changed neither system's
+throughput beyond run-to-run noise, because neither is waiting on its
+disk. Both are out of CPU on one control-plane box:
+
+- **Nomad's leader** runs at 3.2-3.3 of its 4 cores from 5k nodes up, with
+  disk wait near zero. Part of that is heartbeats. Nomad 2.0.5's client
+  sends a heartbeat after nearly every successful RPC, so the leader served
+  2,500-3,300 heartbeats/sec at 2k-5k nodes, far more than its 50/sec TTL
+  target suggests. That is Nomad's own client code running inside the
+  simulator, so we measured it as shipped.
+- **Kubernetes** is limited by kube-scheduler's one-Pod-at-a-time cycle.
+  At 5k nodes the controllers create Pods at about 150/sec, but the
+  scheduler binds 40-70/sec while 10,000-15,000 Pods wait in its queue. A
+  scheduling attempt averages 31ms, and the largest share is PreScore,
+  mostly the default `PodTopologySpread` constraints. The box running the
+  scheduler, controller manager, an API server, and an etcd member sits at
+  3.4-3.5 of 4 cores.
 
 **`dense_fleet` at 5,000 nodes, by allocations per node:**
 
-| Allocations per node | Allocations | Legion (current) | Legion (comparison build) | Nomad 2.0.5 | Kubernetes 1.36.5 |
-| -------------------- | ----------- | ---------------- | ------------------------- | ----------- | ----------------- |
-| 5                    | 25,000      | **3,166**        | 2,401                     | 76          | 76                |
-| 10                   | 50,000      | **2,879**        | 2,049                     | 87          | 56                |
-| 20                   | 100,000     | **3,235**        | 1,801                     | 83          | failed            |
-| 40                   | 200,000     | **2,797**        | 1,049                     | 88          | not run           |
+| Allocations per node | Allocations | Legion       | Nomad 2.0.5 | Kubernetes 1.36.5 |
+| -------------------- | ----------- | ------------ | ----------- | ----------------- |
+| 5                    | 25,000      | **2,350**    | 78          | 69                |
+| 10                   | 50,000      | **2,025**    | 83          | 46                |
+| 20                   | 100,000     | **2,466**    | 77          | 25                |
+| 40                   | 200,000     | **2,139**    | 81          | 30, then failed   |
 
-Allocations/sec. Legion's time to place 99% of each burst ran from 6.5s
-at 25,000 allocations to 54s at 200,000. The 10 and 20 cells' event-stream
-counts ran 1.4% and 1.7% above the manager's own allocation gauge, which
-the driver flags. The previous cell's cleanup was still running, which
-would lower the gauge, but read those two cells as about 2% uncertain.
+Legion placed 99% of each burst within 8 seconds at 25,000 allocations
+and within 70 seconds at 200,000. Nomad holds a flat 77-83/sec across the
+whole sweep, the rate its CPU-bound leader commits plans at. At 40
+allocations per node the driver saw 200,000 of Nomad's 200,050 placement
+events, and Nomad's own count shows every allocation placed.
 
-**Submitting through the CLI.** As a control, we also ran `web_fleet` at
-5k nodes with every system submitting one CLI process per job. That caps
-all three at the load generator's process-spawn rate, and the order holds:
-Legion 311 allocations/sec, Nomad 59, Kubernetes 53.
+At 40 allocations per node, Kubernetes placed about 12,000 Pods at
+30/sec over six minutes. Then the API server on the box running the
+scheduler stopped completing new TLS handshakes in time, and the driver's
+Pod watch could not reconnect. The cell has no full result.
+
+**`batch_burst` at 5,000 nodes:**
+
+| System            | Allocations/sec | p99: time to place 99% of the burst |
+| ----------------- | --------------- | ----------------------------------- |
+| Legion            | **1,248**       | 11.4s                               |
+| Nomad 2.0.5       | 77              | 331s                                |
+| Kubernetes 1.36.5 | 61              | 405s                                |
+
+**What two changes are worth.** We ran two of the setup choices both ways
+on `web_fleet`:
+
+- **Kubernetes with every simulated node talking to one API server.** In
+  production an HA control plane's API servers sit behind a load balancer.
+  The rig spreads the simulated nodes across all three. With all of them
+  on one, Kubernetes placed 43.7 Pods/sec at 5k nodes, against 52.2 with
+  the spread.
+- **Legion with fixed 2-second heartbeats** instead of adaptive cadence:
+  1,134 allocations/sec at 5k nodes (adaptive: 1,175) and 519 at 10k
+  (adaptive: 635), while serving about 2,700 heartbeats/sec at 10k. Adaptive
+  cadence is worth up to about 18% of Legion's throughput at 10k, far less
+  than the gap to either competitor.
+
+**Legion with `RunJob` off the async runtime.** The tables above measure
+`main`. The same release moves `RunJob`'s raft writes off the manager's
+async worker threads (`block_in_place`), so a burst of submits no longer
+leaves evaluations and heartbeats waiting for a thread. Rerun on the same
+rig, one run per cell:
+
+| Workload           | Fleet / density | `main`  | With the change |
+| ------------------ | --------------- | ------- | --------------- |
+| `web_fleet`        | 1,000 nodes     | 680     | **1,261**       |
+| `web_fleet`        | 2,000 nodes     | 640     | **1,067**       |
+| `web_fleet`        | 5,000 nodes     | 1,175   | 968             |
+| `web_fleet`        | 10,000 nodes    | 635     | **945**         |
+| `dense_fleet`, 5k  | 5 per node      | 2,350   | **3,102**       |
+| `dense_fleet`, 5k  | 10 per node     | 2,025   | **2,777**       |
+| `dense_fleet`, 5k  | 20 per node     | 2,466   | 2,330           |
+| `dense_fleet`, 5k  | 40 per node     | 2,139   | **2,373**       |
+
+Allocations/sec. Jobs now enter at 270-690/sec instead of 110-180, and the
+plan coalescer folds about 16 submits into each commit instead of about 1.
+The `web_fleet` 5k cell is the exception: it placed 968/sec against two
+`main` runs of 1,175 and 1,151, even though its p99 fell from 25s to 17.5s.
+We have not yet found why. A single submit also waits longer, about
+140-225ms instead of 40-125ms in local runs, because it now queues in the
+coalescer's batch. The comparison tables above were measured before this change. The
+multiples in the Highlights use the build with it.
+
+**Submitting through the CLI.** As a control in the earlier run, we also
+ran `web_fleet` at 5k nodes with every system submitting one CLI process
+per job. That caps all three at the load generator's process-spawn rate,
+and the order held: Legion 311 allocations/sec, Nomad 59, Kubernetes 53.
 
 ## Why Legion is faster than Kubernetes
 
@@ -176,12 +267,13 @@ time.
    out to every component watching that resource. Past 10,000 nodes,
    committing is most of Legion's plan time too, but a batch shares that
    cost where Kubernetes pays it per object.
-3. **No client rate limits in the hot path.** Kubernetes control-plane
-   components throttle their own calls to the API server. By default
-   kube-scheduler allows 50 requests/sec and kube-controller-manager 20.
-   That alone puts a ceiling near the 50 to 120 allocations/sec we
-   measured for Kubernetes at every fleet size. Legion's scheduler writes
-   to its own store and has no equivalent throttle.
+3. **No per-object scheduling cycle.** kube-scheduler runs its filter and
+   score plugins once per Pod, one Pod at a time, and its API clients are
+   rate-limited by default (50 requests/sec for the scheduler, 20 for the
+   controller manager). The rig raises those limits to 1,000, so they are
+   not what caps Kubernetes here: the scheduling cycle is, at about 31ms
+   per Pod on 5,000 nodes. Legion plans a whole job per evaluation and
+   writes to its own store with no client throttle.
 4. **Planning runs in parallel against cheap snapshots.** Legion's eval
    workers each plan against an in-memory snapshot of the cluster built on
    persistent data structures, so taking one is cheap and never blocks
@@ -207,7 +299,8 @@ time.
    [Adaptive cadence](heartbeat-cadence-and-scale.md) stretches each
    node's check-in interval so the control plane handles about 2,500
    check-ins/sec at any fleet size. Each Kubernetes node renews a Lease
-   object every 10 seconds, and those etcd writes grow with the node count.
+   object every 10 seconds, and those etcd writes grow with the node count:
+   about 600/sec at 5,000 nodes on the rig.
 8. **Recovery starts sooner by default.** This one is policy rather than
    architecture. Legion re-places the work from lost nodes as soon as they
    are declared lost. Kubernetes waits 300 seconds before evicting Pods
@@ -248,22 +341,22 @@ workload is resident, and times how long it takes to place every orphaned
 allocation somewhere else.
 
 **All three systems at 5,000 nodes.** The drill kills a quarter of the
-fleet, with one allocation per node resident.
+fleet with 5 allocations per node resident, about 6,000 to replace.
 
-| System            | Allocations replaced | First replacement after | All replaced after |
-| ----------------- | -------------------- | ----------------------- | ------------------ |
-| Legion            | 1,267                | 20.8s                   | **27.1s**          |
-| Nomad 2.0.5       | 1,270                | 13.2s                   | 110.7s             |
-| Kubernetes 1.36.5 | 146 of 1,251 in 30m  | 343s                    | not within 30m     |
+| System            | Allocations replaced  | First replacement after | All replaced after |
+| ----------------- | --------------------- | ----------------------- | ------------------ |
+| Legion            | 6,173                 | 20.9s                   | **36.5s**          |
+| Nomad 2.0.5       | 6,106                 | 10.9s                   | 80.3s (95.1s in a second run) |
+| Kubernetes 1.36.5 | 697 of 6,248 in 30m   | 345s                    | not within 30m     |
 
-Nomad notices the loss sooner, and Legion finishes the replacement about 4x
-faster. Kubernetes behaves as its defaults say it should. It waits 300
-seconds before evicting from a NotReady node, then evicts at 0.1 nodes/sec,
-so it had replaced 146 allocations when the drill's 30-minute watch ended.
-At that rate the full replacement would take about 3.5 hours. Both
-settings are tunable, and we ran the defaults.
+Nomad notices the loss sooner, and Legion finishes the replacement about
+2x faster. Kubernetes behaves as its defaults say it should. It waits 300
+seconds before evicting from a NotReady node, then evicts at 0.1
+nodes/sec, so it had replaced 697 allocations when the drill's 30-minute
+watch ended. Both settings are tunable, and we ran the defaults.
 
-**Legion at larger fleets:**
+**Legion at larger fleets** (2026-10-10, one allocation per node
+resident):
 
 | Fleet  | Allocations replaced | First replacement after | All replaced after |
 | ------ | -------------------- | ----------------------- | ------------------ |
@@ -280,6 +373,12 @@ allocations/sec.
 - **Same hardware, one system at a time.** Every system runs on the same
   three control-plane boxes in turn, and the boxes are wiped between
   campaigns.
+- **Same disk.** Every system's store sits on the boxes' local NVMe. Each
+  cell records CPU time by mode and disk busy time, so it shows whether a
+  system was waiting on its disk or out of CPU.
+- **The measurement does not tax the measured.** Prometheus scrapes each
+  control plane every 15 seconds. At 5 seconds, scraping Nomad's leader
+  (about 49,000 samples at 4,000 jobs) cost it a quarter of a core.
 - **Simulated nodes, real protocols.** Each system's fleet is its own
   ecosystem's simulator, shaped from the same node profiles. This tests
   the control plane, which is the point, and not task runtimes.
@@ -287,17 +386,25 @@ allocations/sec.
   and Nomad and Kubernetes through pooled HTTP. Each cell records whether
   the submitter, rather than the system, set the rate, and the CLI control
   row above removes the submitter from the comparison entirely.
-- **Counts are cross-checked.** The driver counts placements from the event
-  stream and compares that with the manager's own allocation gauge, and
-  flags disagreements.
-- **Default configuration.** Every non-default setting is commented in the
-  rig's configs and archived with the cell, along with versions, the binary
-  hash, and instance types.
+- **Counts are cross-checked.** The driver counts placements from each
+  system's event stream and compares that with the system's own allocation
+  count, and flags disagreements. When the stream falls a few events short
+  but the system's count shows every allocation placed, the cell completes
+  and records the shortfall.
+- **Default configuration, with documented exceptions.** Kubernetes runs
+  with its scheduler's and controller manager's API rate limits raised to
+  1,000/sec, 50 sync workers for ReplicaSets and Deployments, and an 8 GiB
+  etcd quota, and its simulated nodes spread across the three API servers.
+  Nomad's per-client connection caps are lifted because about 1,250
+  simulated clients share each worker's IP. Every non-default setting is
+  commented in the rig's configs and archived with the cell, along with
+  versions, the binary hash, and instance types.
 
 What these numbers do not cover:
 
 - **One run per cell.** Repeated cells moved by up to half for Nomad
-  and 15% for Kubernetes, so treat small differences as noise.
+  and 15-20% for Kubernetes and Legion, so treat small differences as
+  noise.
 - **Simulated nodes.** No containers start, so these are scheduling and
   control-plane numbers, not end-to-end deploy times.
 - **One region, one network.** The control plane and the fleet share a VPC.

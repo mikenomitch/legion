@@ -10,7 +10,14 @@ translator asked Nomad for a `mock` driver no node offers (it is
 `mock_driver`), and nodesim ran with no node classes, so every
 class-constrained job was infeasible. See
 [§ Cross-system campaign](#cross-system-campaign-2026-10) and calls
-entries 5-8.
+entries 6, 7, 10, and 11.
+
+2026-10-14: the campaign was rerun with every system's store on the same
+local NVMe, after it turned out only Legion's had been (Nomad's raft log
+and etcd were on gp3). Neither competitor got faster. Both are CPU-bound
+on one control-plane box from 5k nodes up. Results are in
+[`docs/benchmarks.md`](../../docs/benchmarks.md), and the setup changes
+are calls entries 5, 8, 9, and 12-14.
 
 History: phase 0 shipped
 ([worker-simulation-plan.md](worker-simulation-plan.md), 2026-07-30).
@@ -288,6 +295,11 @@ KWOK 0.8.0, Legion at the campaign's git revision. All pinned in
   column would measure a client-side rate limiter. Eviction and
   toleration timers stay stock, which is why row 4 for K8s is capped at
   30 minutes and reported as a replaced fraction.
+- K8s: etcd's backend quota raised to 8 GiB so the largest
+  `dense_fleet` cells cannot end on a NOSPACE alarm, and each KWOK slice
+  talks to a different apiserver (calls entries 8 and 13).
+- All three: every store on the control plane's local NVMe, and
+  control-plane scrapes at 15s (calls entries 5 and 12).
 - Scheduler algorithms stay at each system's default (Legion's, Nomad
   binpack, K8s LeastAllocated scoring) and are named in the report.
 

@@ -33,6 +33,10 @@
   evalThreads = ${EVAL_THREADS},
   schedulingPolicy = "bin_pack",
   defaultPriority = 50,
+  # Empty unless LEGION_HEARTBEAT_FIXED=1 (install-legion-a.sh): no
+  # heartbeat block means adaptive cadence, the default every comparative
+  # cell runs.
+  ${HEARTBEAT_LINE}
   artifacts = {},
 
   # Scraped by the loadgen Prometheus: the per-phase scheduler histogram

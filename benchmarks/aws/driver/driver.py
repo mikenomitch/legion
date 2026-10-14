@@ -115,6 +115,23 @@ def percentile(sorted_values, fraction):
     return float(sorted_values[idx])
 
 
+def follower_lag_summary(lags_ms):
+    """p50/p99/max of the gap between a placement's server-side timestamp and
+    the moment the follower counted it. A follower that falls behind does
+    not lose events, it stamps them late, which reads as a slower system and
+    trips nothing else (cross_check compares only final counts). Clocks are
+    two chrony-synced hosts, so treat anything under ~50ms as zero."""
+    if not lags_ms:
+        return None
+    ordered = sorted(lags_ms)
+    return {
+        "samples": len(ordered),
+        "p50_ms": percentile(ordered, 0.50),
+        "p99_ms": percentile(ordered, 0.99),
+        "max_ms": float(ordered[-1]),
+    }
+
+
 def submission_rate_series(submits, bucket_secs=60.0):
     """Jobs submitted per bucket from the first submit, in order.
 
@@ -317,11 +334,15 @@ def parse_legion_event(line):
     data = envelope.get("data") or {}
     if not envelope.get("ok") or data.get("kind") != "allocation.placed":
         return None
-    job = data.get("job_id")
+    # The event serializes camelCase now (`jobId`, `metadataJson`); it was
+    # snake_case when this parser was written. Reading only the old names
+    # counted zero placements on 2026-10-14 while the manager placed every
+    # one, so accept both rather than pin to either.
+    job = data.get("jobId", data.get("job_id"))
     if job is None:
         return None
     try:
-        metadata = json.loads(data.get("metadata_json") or "{}")
+        metadata = json.loads(data.get("metadataJson") or data.get("metadata_json") or "{}")
     except json.JSONDecodeError:
         metadata = {}
     return {"job": job, "count": int(metadata.get("count", 1))}
@@ -699,6 +720,7 @@ class NomadAdapter:
         index, _ = self._get("/v1/jobs?prefix=bench-")
         start = {"index": int(index or 0) + 1}
         seen = set()
+        self.follower_lag_ms = []
 
         def stream_once():
             url = f"{self.server_addr}/v1/event/stream?topic=Allocation&index={start['index']}"
@@ -722,6 +744,13 @@ class NomadAdapter:
                         if alloc_id and alloc_id not in seen and allocation.get("NodeID"):
                             seen.add(alloc_id)
                             recorder.record_placement(allocation.get("JobID", "?"), 1)
+                            # CreateTime is stamped when the plan that placed
+                            # it commits; the gap to now is this thread's lag.
+                            created_ns = allocation.get("CreateTime") or 0
+                            if created_ns:
+                                self.follower_lag_ms.append(
+                                    max(0, int(time.time() * 1000) - created_ns // 1_000_000)
+                                )
 
         def pump():
             # Resume from the last index on any disconnect. The first Nomad
@@ -1231,6 +1260,15 @@ def cmd_run(args):
             args.stall_timeout_secs > 0
             and time.monotonic() - last_progress > args.stall_timeout_secs
         ):
+            if server_reports_complete(counters_before, adapter.snapshot_counters, expected_total):
+                outcome = "complete_by_server"
+                print(
+                    f"follower stalled at {placed}/{expected_total}, but the system's own "
+                    f"count shows every allocation placed: the follower missed "
+                    f"{expected_total - placed} event(s). Cell complete, shortfall recorded.",
+                    file=sys.stderr,
+                )
+                break
             outcome = "stalled"
             print(
                 f"STALLED: no placement for {args.stall_timeout_secs}s at "
@@ -1268,6 +1306,12 @@ def cmd_run(args):
     # is a scheduler result; one that hit the cap is a rig result; and
     # they are indistinguishable from `complete: false` alone.
     metrics["outcome"] = outcome
+    if outcome == "complete_by_server":
+        # Throughput and latency still come from the events the follower
+        # saw, so they undercount by the shortfall rather than inventing
+        # timestamps for events it never received.
+        metrics["complete"] = True
+        metrics["follower_shortfall"] = expected_total - recorder.placed_total()
     metrics["settle_timeout_secs"] = round(settle_timeout, 1)
     # Which submission path produced this cell. Load-bearing for the fairness
     # rule at the top of this file: `native` is Legion-only, so a `native`
@@ -1285,6 +1329,20 @@ def cmd_run(args):
     # retry. Non-zero means the control plane shed or failed requests under
     # this load — a result in its own right, reported next to the numbers.
     metrics["submit_retries"] = getattr(adapter, "submit_retries", 0)
+    # Nomad only: its follower decodes every allocation event in Python, the
+    # one counting path not handed to a compiled client (Legion's is `legion
+    # events follow`, K8s's is kubectl). A p99 in seconds means the counter,
+    # not Nomad, set this cell's pace.
+    lag = follower_lag_summary(getattr(adapter, "follower_lag_ms", None))
+    if lag is not None:
+        metrics["follower_lag"] = lag
+        if lag["p99_ms"] > 1000:
+            print(
+                f"WARNING: the placement follower ran {lag['p99_ms']:.0f}ms behind the "
+                "server at p99, so this cell's throughput and latency are partly the "
+                "driver's. Read them as a floor.",
+                file=sys.stderr,
+            )
     if counters_before is not None:
         metrics["cross_check"] = cross_check_counts(
             counters_before, adapter.snapshot_counters, recorder.placed_total()
@@ -1302,6 +1360,20 @@ def cmd_run(args):
             )
     print(json.dumps(metrics, indent=2))
     return 0 if metrics["complete"] else 1
+
+
+def server_reports_complete(before, snapshot, expected_total):
+    """True when the system's own allocation count says every expected
+    allocation exists, whatever the follower saw. Asked only once the
+    follower stalls: a follower that dropped a handful of events otherwise
+    holds the cell for the stall timeout and reports a system that placed
+    everything as one that stopped converging (Nomad, 2026-10-14: 50,046
+    of 50,060 seen, all 50,060 placed, and the rest of the sweep skipped)."""
+    if not before or before.get("allocations") is None:
+        return False
+    after = snapshot()
+    allocations = after.get("allocations")
+    return allocations is not None and allocations - before["allocations"] >= expected_total
 
 
 def cross_check_counts(before, snapshot, follower_placed, settle_secs=6.0, poll_secs=1.0):

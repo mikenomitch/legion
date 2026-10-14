@@ -30,7 +30,10 @@ include = [
 # The example plugins under `plugins/` are separate crates built by build.rs
 # with their own lockfiles, so they stay out of it.
 [workspace]
-members = [".", "guest"]
+# Not ".": the root package is a member of its own workspace anyway, and
+# listing it makes every path under the root an explicit member, which
+# overrides `exclude` and breaks every plugin build.
+members = ["guest"]
 exclude = ["plugins"]
 
 [dependencies]

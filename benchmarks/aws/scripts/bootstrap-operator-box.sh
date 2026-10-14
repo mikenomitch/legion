@@ -673,13 +673,34 @@ cmd_push() {
     #                      it orphans the whole rig — teardown.sh would
     #                      have nothing to destroy.
     #   .terraform*        provider plugins and the lock from `init`
-    rsync -az --delete \
+    #
+    # A git worktree's .git is a FILE pointing at the main checkout's path
+    # on this machine. Copied over, `git rev-parse HEAD` in
+    # build-and-upload.sh fails on the box, after the 30-minute build. So a
+    # worktree keeps the box's own .git and ships HEAD as a bundle instead.
+    # A plain string, not an array: bash 3.2 and `set -u` (see PHASE1_ARGS).
+    local git_exclude=""
+    [ -f "$REPO_ROOT/.git" ] && git_exclude="--exclude=/.git"
+    # shellcheck disable=SC2086 # git_exclude is one flag or nothing
+    rsync -az --delete $git_exclude \
         --exclude 'target/' --exclude 'node_modules/' --exclude '__pycache__/' \
         --exclude '.terraform/' --exclude '.terraform.lock.hcl' \
         --exclude 'terraform.tfvars' --exclude 'terraform.tfstate*' \
         --exclude 'benchmarks/aws/results/' --exclude 'benchmarks/aws/.operator-box.json' \
         -e "ssh -i $(state_get .key_path) -o StrictHostKeyChecking=accept-new -o IdentitiesOnly=yes" \
         "$REPO_ROOT/" "ubuntu@$ip:legion/"
+    if [ -n "$git_exclude" ]; then
+        local bundle
+        bundle=$(mktemp -t legion-head.XXXXXX)
+        git -C "$REPO_ROOT" bundle create "$bundle" HEAD 2>/dev/null
+        ssh_ "cat > /tmp/legion-head.bundle" <"$bundle"
+        rm -f "$bundle"
+        # A mixed reset moves HEAD and the index and leaves the synced
+        # files alone, so uncommitted edits still read as `-dirty`.
+        ssh_ "cd ~/legion && { [ -d .git ] || { rm -f .git && git init -q; }; } &&
+            git fetch -q /tmp/legion-head.bundle HEAD && git reset -q FETCH_HEAD &&
+            rm -f /tmp/legion-head.bundle"
+    fi
     log "synced"
 }
 
