@@ -144,6 +144,16 @@ impl WorkerStateStore {
             .unwrap_or_else(|| PathBuf::from("content"))
     }
 
+    /// Root of the sandbox root disk cache (`<state-dir>/rootfs-cache`). It
+    /// must share a filesystem with the allocation dirs, which sit beside
+    /// it, so a sandbox's disk can be a reflink of its cached base.
+    pub fn rootfs_cache_dir(&self) -> PathBuf {
+        self.path
+            .parent()
+            .map(|parent| parent.join("rootfs-cache"))
+            .unwrap_or_else(|| PathBuf::from("rootfs-cache"))
+    }
+
     /// The node's session log (`<state-dir>/sessions.db`, session
     /// durability plan §6.2).
     pub fn sessions_db_path(&self) -> PathBuf {

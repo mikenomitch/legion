@@ -45,7 +45,7 @@ use crate::task_plugins::{
     reap_task_process, spawn_pipe, spawn_pty, spawn_task_process, validate_schema, ExecOptions,
     ExecSession, ExecSupport, MountedVolume, TaskInstance, TaskPlugin,
 };
-use crate::task_plugins::{sandbox_addr, sandbox_checkpoint};
+use crate::task_plugins::{rootfs_cache, sandbox_addr, sandbox_checkpoint};
 use crate::volumes::VolumeMode;
 use schemars::JsonSchema;
 use serde::Deserialize;
@@ -56,7 +56,7 @@ use std::process::Command;
 
 const DEFAULT_VCPUS: u32 = 1;
 const DEFAULT_MEMORY_MIB: u32 = 512;
-const DEFAULT_ROOTFS_HEADROOM_MIB: u32 = 256;
+pub(crate) const DEFAULT_ROOTFS_HEADROOM_MIB: u32 = 256;
 /// Guest RAM below this cannot boot a Linux kernel with any userspace.
 const MIN_MEMORY_MIB: u32 = 64;
 
@@ -1348,14 +1348,8 @@ impl SandboxTaskPlugin {
                 "Reusing sandbox root disk from the previous start"
             );
         } else {
-            info!(
-                allocation_id = allocation.id,
-                task_name = %task.name,
-                image = %config.image,
-                "Building sandbox root disk"
-            );
-            let image = oci_bundle::materialize_rootfs(&layout, &rootfs_dir)?;
-            if let Some(user) = image.user.as_deref() {
+            let started = std::time::Instant::now();
+            if let Some(user) = image_config.user.as_deref() {
                 // In a microVM the isolation boundary is the VM, so the payload
                 // runs as root in the guest; say so rather than silently
                 // ignoring the image's declared user.
@@ -1365,27 +1359,83 @@ impl SandboxTaskPlugin {
                     "sandbox runs the guest payload as root; image user is not applied"
                 );
             }
-            let mapped = install_artifacts(&rootfs_dir, &staged)?;
-            if !mapped.is_empty() {
-                payload.command = rewrite_artifact_paths(&payload.command, &mapped);
-                for (host, guest) in &mapped {
-                    for value in payload.env.values_mut() {
-                        if value.contains(host.as_str()) {
-                            *value = value.replace(host.as_str(), guest);
+            // A stale stamp must not vouch for a half-built disk.
+            let _ = std::fs::remove_file(&stamp_path);
+            let base = rootfs_cache::ImageBase {
+                layout: layout.clone(),
+                guest_binary: payload
+                    .guest_binary
+                    .clone()
+                    .context("the guest binary is resolved above")?,
+                headroom_mib: u64::from(config.rootfs_headroom_mib()),
+            };
+            // The disk is the image's base (shared by every sandbox of the
+            // image on this node, so cached) plus this sandbox's own files.
+            // Artifacts are copied into the sandbox's own disk, so a sandbox
+            // with any, like every sandbox on a node with the cache off,
+            // builds its disk alone.
+            let copies_artifacts = staged.iter().any(|artifact| {
+                artifact.name.is_some() && !matches!(artifact.payload, StagedPayload::Image { .. })
+            });
+            let cache = (!copies_artifacts).then(rootfs_cache::node_cache).flatten();
+            let outcome = if let Some(cache) = cache {
+                // A clone of (or the source of) the shared base: its own
+                // files are written into it after.
+                let inputs = base.inputs(&image_config);
+                let (facts, outcome) =
+                    cache.materialize(Arc::new(base), &inputs, &root_disk, &rootfs_dir)?;
+                let files = microvm::guest_payload_files(&payload, &name, &facts);
+                microvm::inject_guest_payload(&root_disk, &files, &scratch.join("payload"))?;
+                outcome
+            } else {
+                // Built for this sandbox only: its own files go into the
+                // tree, and one mkfs makes the disk, as with no cache.
+                let built = (|| {
+                    use rootfs_cache::BaseBuilder;
+                    let facts = base.tree(&rootfs_dir)?;
+                    let mapped = install_artifacts(&rootfs_dir, &staged)?;
+                    if !mapped.is_empty() {
+                        payload.command = rewrite_artifact_paths(&payload.command, &mapped);
+                        for (host, guest) in &mapped {
+                            for value in payload.env.values_mut() {
+                                if value.contains(host.as_str()) {
+                                    *value = value.replace(host.as_str(), guest);
+                                }
+                            }
                         }
                     }
-                }
+                    let files = microvm::guest_payload_files(&payload, &name, &facts);
+                    microvm::write_guest_payload_into_tree(&rootfs_dir, &files)?;
+                    base.format(&rootfs_dir, &root_disk)
+                })();
+                // The extracted tree has served its purpose; the disk image is
+                // the artifact from here on, and keeping both doubles the
+                // footprint.
+                let _ = std::fs::remove_dir_all(&rootfs_dir);
+                built?;
+                rootfs_cache::Outcome::Built(rootfs_cache::Fill::Skipped(if copies_artifacts {
+                    "the sandbox copies artifacts into its root disk"
+                } else {
+                    "the cache is off"
+                }))
+            };
+            // The disk carries this sandbox's env, which can hold secrets.
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&root_disk, std::fs::Permissions::from_mode(0o600))
+                    .with_context(|| format!("chmod {}", root_disk.display()))?;
             }
-            microvm::install_guest_payload(&rootfs_dir, &payload, &name)?;
-
-            let used = microvm::dir_size_bytes(&rootfs_dir)?;
-            let size = microvm::rootfs_image_bytes(used, config.rootfs_headroom_mib() as u64);
-            microvm::create_ext4_image(&root_disk, size, Some(&rootfs_dir), "legion-root")?;
             std::fs::write(&stamp_path, &stamp)
                 .with_context(|| format!("write {}", stamp_path.display()))?;
-            // The extracted tree has served its purpose; the disk image is the
-            // artifact from here on, and keeping both doubles the footprint.
-            let _ = std::fs::remove_dir_all(&rootfs_dir);
+            info!(
+                allocation_id = allocation.id,
+                task_name = %task.name,
+                image = %config.image,
+                root_disk = %outcome,
+                elapsed_ms = started.elapsed().as_millis() as u64,
+                "Sandbox root disk ready"
+            );
         }
 
         let mut spec = VmSpec {

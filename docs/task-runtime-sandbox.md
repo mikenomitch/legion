@@ -125,17 +125,33 @@ workload is done. The sandbox runtime supplies that layer.
    artifact pipeline when `artifacts.containerImageDesugar` is on. Otherwise it
    reuses a layout pulled by an earlier start of this allocation, or pulls
    anonymously through the `oci://` fetcher it shares with `container`
-   (`src/task_plugins/oci_image.rs`).
-2. **Build the root disk.** Extract the layers (with the same code as the
-   container runtime's bundle path), copy in staged artifacts, and write the
-   generated `/legion/init` and `/legion/env`. Then format a raw ext4 image with
-   `mkfs.ext4 -d`. This builds a filesystem image straight from a directory, so
-   it needs no loop device, no mount, and no root.
-3. **Attach the volumes.** The worker mounts the task's block-mode volumes
+   (`src/task_plugins/oci_image.rs`). Either way the layers come from the
+   node's [image cache](task-runtime-container.md#image-cache), so only the
+   first start of an image on a node downloads them.
+2. **Get the image's base root disk.** The base is the image's layers plus
+   Legion's guest binary, formatted as a raw ext4 image with `mkfs.ext4 -d`,
+   which builds a filesystem straight from a directory with no loop device,
+   no mount, and no root. Every sandbox of the image on the node shares it, so
+   the node builds it once and keeps it in its
+   [root disk cache](#the-root-disk-cache). The sandbox gets its own copy: a
+   reflink where the filesystem supports one, a sparse copy elsewhere. A
+   sandbox with file, tree, or layer artifacts builds its disk in full
+   instead, with the artifacts copied in.
+3. **Write the sandbox's own files** into its copy: the generated
+   `/legion/init` and `/legion/env`, `/etc/hostname`, and the guest's
+   `/etc/resolv.conf` when it has its own resolvers. `debugfs` writes them
+   inside the disk's filesystem, so it needs no mount either. A disk built
+   for one sandbox alone (one with artifacts, or any with the cache off)
+   gets them in its tree before formatting instead. Either way each file
+   replaces what the image had at its path, so an image's symlinks never
+   redirect a write onto the host. These files hold the allocation's
+   identity and its env, which can carry secrets, so they never go into the
+   shared base.
+4. **Attach the volumes.** The worker mounts the task's block-mode volumes
    before `start` ([volumes](volumes.md)). Each one's device or disk image
    becomes an extra virtio-blk device after the root disk, in declaration
    order: `/dev/vdb`, `/dev/vdc`, ….
-4. **Boot.** cloud-hypervisor gets argv, plus an `--api-socket`. Firecracker
+5. **Boot.** cloud-hypervisor gets argv, plus an `--api-socket`. Firecracker
    gets a `--config-file` JSON config and `--no-api`, unless the allocation is
    launched for memory checkpoints (see [Checkpoints](#checkpoints)) or boots
    with a balloon (see [Guest memory under pressure](#guest-memory-under-pressure)),
@@ -168,11 +184,89 @@ The generated `/legion/init` is plain POSIX shell, so it runs on whatever
 The kernel cmdline carries `panic=1` as a backstop, so even a wedged guest
 terminates instead of hanging the allocation.
 
-**Rebuilds are fingerprinted.** Legion rebuilds the root disk only when the
+**Restarts reuse the disk.** An in-place restart of the same allocation
+reuses its root disk, writes from the previous boot included, unless the
 image, command, env, working dir, volume mounts, artifacts, or guest agent
-binary change. Without this, a crash-looping sandbox would re-extract and
-re-format a multi-hundred-MiB image on every restart. The fingerprint hashes
-env values, since they can be secrets. The values are never logged or stored.
+binary changed. The fingerprint hashes env values, since they can be
+secrets. The values are never logged or stored.
+
+### The root disk cache
+
+Building a root disk means extracting every image layer and formatting the
+result. That is the largest part of a cold sandbox start, and it grows with
+the image. Measured on one Linux host (2 vCPUs, btrfs), it took 2.5 s for
+`python:3.12-slim` and 28 s for a 1.6 GB `rust:1.90-bookworm` image. Every
+sandbox of an image carries the same image bytes, so the worker builds them
+once per node and keeps the result: the image's **base root disk**.
+
+Each start then copies the base and writes the sandbox's own files into the
+copy (step 3 above):
+
+| Start | What it costs | python:3.12-slim | rust:1.90-bookworm |
+| --- | --- | --- | --- |
+| First sandbox of an image on the node | the full build, as with no cache | 2.5 s | 28 s |
+| Later sandboxes, reflink filesystem (XFS, btrfs) | a reflink and the sandbox's own files | 0.05 s | 0.08 s |
+| Later sandboxes, other filesystems (ext4) | a sparse copy and the sandbox's own files | 0.23 s | 2.8 s |
+
+These numbers come from timing the same steps with e2fsprogs on that host,
+so treat them as a guide and measure your own images.
+
+How it behaves:
+
+- **It fills on demand.** Nothing has to be pushed or pre-built. The first
+  start of an image builds its disk exactly as it would without the cache,
+  so a miss is no slower. On a reflink filesystem the cache then keeps a
+  reflink of that disk, which costs nothing. Elsewhere it formats the image
+  a second time on a background thread, after the start has its disk.
+- **A burst builds once.** Starts of an image that arrive while its base is
+  being built wait for that build and then copy it, instead of each
+  extracting and formatting the same image at the same time.
+- **A base is shared only when nothing in it differs.** A base is keyed by
+  the image's layer digests, the guest binary, and the task's
+  `rootfs_headroom_mib`. A new guest binary, or a task with different
+  headroom, gets its own base.
+- **Nothing per sandbox is in a base.** Env (which can hold secrets),
+  hostname, instance id, and the generated init are written into each
+  sandbox's own copy, after it is made. A base is read-only, and a copy
+  shares nothing with it that a write can reach.
+- **It is bounded.** The cache keeps at most its budget, counting the blocks
+  each base actually uses, and evicts the least recently used base first. A
+  base larger than the whole budget is never kept, and none is kept while the
+  disk is below the content store's `minFreeDisk`. Evicting a base never
+  touches a running sandbox, whose disk is its own copy.
+
+The budget is set per worker with `LEGION_SANDBOX_ROOTFS_CACHE`:
+
+| Value | Meaning |
+| --- | --- |
+| unset (default) | 10% of the filesystem holding the worker's state dir, clamped to 1 GiB to 20 GiB |
+| a size, such as `40GiB` | that many bytes |
+| a share, such as `15%` | that share of the filesystem |
+| `off` or `0` | no cache: every start builds its disk |
+
+The cache lives at `<worker state dir>/rootfs-cache/`, beside the allocation
+dirs, so a copy can be a reflink. Put the data dir on XFS (`reflink=1`, the
+default since xfsprogs 5.1) or btrfs to get near-instant copies. On ext4 the
+copy is a byte copy of the blocks the base uses: still much cheaper than a
+build, but it scales with the image. The worker logs where each disk came
+from:
+
+```text
+Sandbox root disk ready allocation_id=88213 image=python:3.12-slim root_disk=cached base (reflink) elapsed_ms=48
+```
+
+Limitations:
+
+- **A sandbox with file, tree, or layer artifacts builds its disk in full**
+  on every start, because the artifacts are copied into its own disk. That
+  includes a guest kernel shipped as an artifact. Install the kernel on the
+  node (`LEGION_SANDBOX_KERNEL`, or `/var/lib/legion/kernels/vmlinux`) to
+  keep such sandboxes on the cache.
+- **Only microVM backends use it.** Apple `container` on macOS and Linux
+  dev mode do not build root disks. The `container` runtime still extracts
+  each image per allocation.
+- **The cache is node-local.** A new node, or one that evicted the base,
+  builds on its first start of the image.
 
 ### The guest agent
 

@@ -580,6 +580,28 @@ pub(crate) struct ImageConfig {
     layers: Vec<PathBuf>,
 }
 
+impl ImageConfig {
+    /// The image's layer digests (`sha256:<hex>`), bottom layer first: what
+    /// an extracted root filesystem is a function of.
+    pub(crate) fn layer_digests(&self) -> Vec<String> {
+        self.layers
+            .iter()
+            .map(|blob| {
+                let algorithm = blob
+                    .parent()
+                    .and_then(Path::file_name)
+                    .map(|name| name.to_string_lossy().into_owned())
+                    .unwrap_or_default();
+                let hex = blob
+                    .file_name()
+                    .map(|name| name.to_string_lossy().into_owned())
+                    .unwrap_or_default();
+                format!("{algorithm}:{hex}")
+            })
+            .collect()
+    }
+}
+
 /// Materializes an image's root filesystem at `rootfs` by extracting every
 /// layer in order, returning the image config so callers can honor its env,
 /// working dir, and user. Shared by the bundle path (container kind) and the

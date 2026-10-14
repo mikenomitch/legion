@@ -57,6 +57,13 @@ pub fn clone_file(src: &Path, dst: &Path) -> R<CopyMethod> {
     clone_file_with(src, dst, true)
 }
 
+/// Reflink `src` to `dst` (which must not exist), and only that: `false`
+/// when the filesystem cannot clone, with nothing left at `dst`. For a
+/// caller that has a cheaper fallback than a byte copy.
+pub fn reflink_file(src: &Path, dst: &Path) -> bool {
+    try_reflink(src, dst)
+}
+
 /// [`clone_file`] with the reflink attempt switchable, so tests can exercise
 /// the sparse path on a filesystem that would otherwise reflink.
 pub(crate) fn clone_file_with(src: &Path, dst: &Path, allow_reflink: bool) -> R<CopyMethod> {

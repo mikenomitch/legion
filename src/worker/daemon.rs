@@ -389,6 +389,7 @@ async fn run_worker_with_manager(join: WorkerJoin, name_override: Option<&str>) 
     // Access logs sit next to each allocation's own logs.
     let logs_base_dir = WorkerStateStore::new(state_path.clone()).logs_base_dir();
     let content_dir = WorkerStateStore::new(state_path.clone()).content_dir();
+    let rootfs_cache_dir = WorkerStateStore::new(state_path.clone()).rootfs_cache_dir();
     let task_manager = Arc::new(Mutex::new(WorkerTaskManager::with_state_store(
         WorkerStateStore::new(state_path),
     )));
@@ -416,6 +417,24 @@ async fn run_worker_with_manager(join: WorkerJoin, name_override: Option<&str>) 
         &advertised,
     );
     let content_store = open_content_store(&content_dir, content_config);
+    // Sandbox base root disks (docs/task-runtime-sandbox.md, "The root disk
+    // cache"). Only a Linux node boots microVMs, so only one keeps them. It
+    // honors the content store's free-disk floor.
+    if cfg!(target_os = "linux") {
+        let min_free = content_store
+            .as_ref()
+            .map(|store| store.config().min_free_disk)
+            .or_else(|| {
+                crate::structs::parse_byte_size(crate::content_store::DEF_CONTENT_MIN_FREE_DISK)
+                    .ok()
+            })
+            .unwrap_or(0);
+        tokio::task::spawn_blocking(move || {
+            crate::task_plugins::rootfs_cache::init(&rootfs_cache_dir, min_free)
+        })
+        .await
+        .ok();
+    }
     let content_publishing = build_content_publishing(
         content_store.clone(),
         content_store_target.as_ref(),

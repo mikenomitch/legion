@@ -284,6 +284,74 @@ impl Drop for ImagePullClaim {
     }
 }
 
+/// Tag resolutions this node finished, by reference and credential: the
+/// manifest digest and when the request to the registry was sent.
+static TAG_RESOLUTIONS: std::sync::Mutex<
+    std::collections::BTreeMap<String, (String, std::time::Instant)>,
+> = std::sync::Mutex::new(std::collections::BTreeMap::new());
+
+/// How long a finished resolution is remembered. Only pulls that were
+/// already waiting when it was sent can use it, so this bounds memory, not
+/// staleness.
+const TAG_RESOLUTION_MEMORY: std::time::Duration = std::time::Duration::from_secs(600);
+
+/// Which tag resolutions a pull may share: the same reference, asked with
+/// the same credential. A pull never reuses an answer the registry gave to
+/// someone else's credential.
+fn tag_resolution_key(reference: &Reference, auth: &RegistryAuth) -> String {
+    use sha2::Digest as _;
+    let mut hasher = sha2::Sha256::new();
+    match auth {
+        RegistryAuth::Anonymous => hasher.update(b"anonymous"),
+        RegistryAuth::Basic(user, password) => {
+            hasher.update(b"basic\0");
+            hasher.update(user.as_bytes());
+            hasher.update(b"\0");
+            hasher.update(password.as_bytes());
+        }
+        RegistryAuth::Bearer(token) => {
+            hasher.update(b"bearer\0");
+            hasher.update(token.as_bytes());
+        }
+    }
+    format!("{}\0{:x}", reference.whole(), hasher.finalize())
+}
+
+/// A tag's current digest for a pull that asked at `requested_at`.
+///
+/// Concurrent starts of one image queue on [`ImagePullClaim`], and each
+/// used to send its own `HEAD` once its turn came, so a burst of N starts
+/// paid N registry round trips one after another. A resolution *sent*
+/// after this pull asked is at least as fresh as the answer this pull would
+/// get by asking itself, so it is reused: a burst of any size pays about
+/// two round trips (the first pull's, and the first waiter's). A pull with
+/// no such answer asks the registry.
+fn resolve_tag_shared(
+    key: &str,
+    requested_at: std::time::Instant,
+    resolve: impl FnOnce() -> R<String>,
+) -> R<String> {
+    if let Some((digest, sent_at)) = TAG_RESOLUTIONS
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .get(key)
+    {
+        if *sent_at >= requested_at {
+            return Ok(digest.clone());
+        }
+    }
+    let sent_at = std::time::Instant::now();
+    let digest = resolve()?;
+    let mut resolutions = TAG_RESOLUTIONS.lock().unwrap_or_else(|p| p.into_inner());
+    resolutions.retain(|_, (_, at)| sent_at.duration_since(*at) < TAG_RESOLUTION_MEMORY);
+    // Keep the newest answer if another pull with this key raced this one.
+    let newer = resolutions.get(key).is_some_and(|(_, at)| *at > sent_at);
+    if !newer {
+        resolutions.insert(key.to_string(), (digest.clone(), sent_at));
+    }
+    Ok(digest)
+}
+
 /// Image blobs (manifests, configs, layers) in the node content store
 /// (`artifacts` class), by digest. Every blob of an image is immutable and
 /// named by its digest, so a blob the store holds is the blob the registry
@@ -500,17 +568,22 @@ impl OciFetcher {
     ) -> R<FetchedArtifact> {
         let store = sink.content_store().cloned();
         let cache = store.as_deref().map(|store| ImageBlobCache { store });
+        let requested_at = std::time::Instant::now();
         let _claim = cache
             .as_ref()
             .map(|_| ImagePullClaim::claim(&reference.whole()));
 
         // The digest the reference names: given, or (with a cache to serve
-        // it from) a tag's current digest.
+        // it from) a tag's current digest, shared with the pull this one
+        // queued behind when that one asked the registry after this one
+        // arrived.
         let top_digest = match (reference.digest(), cache.as_ref()) {
             (Some(digest), _) => Some(digest.to_string()),
-            (None, Some(cache)) => {
-                Some(cache.resolve_tag(runtime, client, reference, auth, req.redacted_source)?)
-            }
+            (None, Some(cache)) => Some(resolve_tag_shared(
+                &tag_resolution_key(reference, auth),
+                requested_at,
+                || cache.resolve_tag(runtime, client, reference, auth, req.redacted_source),
+            )?),
             (None, None) => None,
         };
         let (raw_manifest, manifest_digest, manifest_cached) = self.platform_manifest(
@@ -718,6 +791,60 @@ mod tests {
         let (reference, protocol) = parse_reference(&request(&parsed, &limits, local))?;
         assert_eq!(reference.registry(), "localhost:5000");
         assert_eq!(protocol, ClientProtocol::Http);
+        Ok(())
+    }
+
+    /// A pull that queued behind another reuses the tag digest that pull
+    /// asked for after it arrived, and a pull that arrives later asks again.
+    #[test]
+    fn queued_pulls_share_a_tag_resolution_sent_after_they_arrived() -> R<()> {
+        let reference: Reference = "registry.test/shared/img:v1".parse()?;
+        let key = tag_resolution_key(&reference, &RegistryAuth::Anonymous);
+        let asked = std::sync::atomic::AtomicUsize::new(0);
+        let resolve = |digest: &'static str| {
+            let asked = &asked;
+            move || {
+                asked.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(digest.to_string())
+            }
+        };
+
+        // Two pulls arrive; the first asks the registry once its turn
+        // comes, which is after the second arrived.
+        let first_arrived = std::time::Instant::now();
+        let second_arrived = std::time::Instant::now();
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        assert_eq!(
+            resolve_tag_shared(&key, first_arrived, resolve("sha256:a"))?,
+            "sha256:a"
+        );
+        assert_eq!(
+            resolve_tag_shared(&key, second_arrived, resolve("sha256:b"))?,
+            "sha256:a"
+        );
+        assert_eq!(asked.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+        // A pull that arrives after that answer was sent asks again, and
+        // sees the tag move.
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        let later = std::time::Instant::now();
+        assert_eq!(
+            resolve_tag_shared(&key, later, resolve("sha256:b"))?,
+            "sha256:b"
+        );
+        assert_eq!(asked.load(std::sync::atomic::Ordering::SeqCst), 2);
+
+        // Another credential never shares an answer.
+        let other = tag_resolution_key(
+            &reference,
+            &RegistryAuth::Basic("user".into(), "secret".into()),
+        );
+        assert_ne!(key, other);
+        assert_eq!(
+            resolve_tag_shared(&other, later, resolve("sha256:c"))?,
+            "sha256:c"
+        );
+        assert_eq!(asked.load(std::sync::atomic::Ordering::SeqCst), 3);
         Ok(())
     }
 

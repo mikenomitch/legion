@@ -479,8 +479,9 @@ How to use it:
         them at about two every 30s).
   - [ ] **`batch_task_outcome_tx` compares against the spec `count`**, not a
         `job scale` override.
-  - [ ] **Image pulls**: the extracted rootfs is not cached (every new
-        allocation re-extracts), ORAS layers are not cached, a hung pull
+  - [ ] **Image pulls**: the `container` runtime's extracted rootfs is not
+        cached (every new allocation re-extracts; sandbox root disks are, in
+        the rootfs base cache below), ORAS layers are not cached, a hung pull
         blocks other starts of the same image (oci-client has no read
         timeout), and oci-client's bundled webpki roots cannot pull through
         a TLS-intercepting proxy (`rustls-tls-native-roots` would). On
@@ -1979,6 +1980,25 @@ Plans: [task-runtime-plugins](../docs/task-runtime-plugins.md).
       guest (calls entry 16). Flip it to an error in the next release, and drop
       `memory_mib` from the schema after that
       ([docs](../docs/task-runtime-sandbox.md#guest-size)).
+- [ ] **Sandbox base root disk cache.** One base root disk per image per
+      node, cloned per sandbox, with the sandbox's own files written into
+      the clone by debugfs: plan
+      [rootfs-base-cache-plan.md](plans/rootfs-base-cache-plan.md) ·
+      [calls](calls/rootfs-base-cache-plan_calls.md) ·
+      [docs](../docs/task-runtime-sandbox.md#the-root-disk-cache).
+  - [x] Phase 1 (in flight): the cache, per-sandbox files by debugfs on
+        every start (which also stops host writes through an image's
+        symlinks), `rootfs_cache::ensure_image_base` for prefetchers, and
+        queued pulls sharing a tag `HEAD`.
+  - [ ] Verify on real KVM: boot a cloned disk on cloud-hypervisor and
+        Firecracker, and checkpoint and restore one.
+  - [ ] Phase 2: sandboxes with file, tree, or layer artifacts still build
+        their disk in full on every start (calls entry 5), including a kernel
+        shipped as an artifact.
+  - [ ] Phase 3: the `container` runtime still extracts every image per
+        allocation (overlayfs over a node-wide lower dir).
+  - [ ] Phase 4: show the cache in `legion node content`, and count hits and
+        misses.
 - [ ] **Linux container port mapping / private network namespaces.** Containers
       keep host networking; assigned ports reach them without mapping, but
       there is no isolation. Named non-goal of the container-runtime plan —
