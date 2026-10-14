@@ -441,17 +441,33 @@ pub(crate) struct TapNet {
     pub mac: Option<String>,
 }
 
-/// Legion's guest kernel cmdline: serial console (so guest output lands in the
+/// Legion's guest kernel cmdline: the console (so guest output lands in the
 /// allocation's captured stdout), reboot-on-panic (so a wedged guest exits the
 /// VMM instead of hanging), the root disk, and our generated init.
+///
+/// The console is where boot time goes. Every byte written to an emulated
+/// 16550 serial port is a VM exit, which is costly under nested
+/// virtualization: a default kernel's ~300 boot lines cost about 700 ms of a
+/// 4-vCPU c8i guest's boot, more than the rest of the boot together.
+///
+/// - cloud-hypervisor boots on virtio-console (`hvc0`), which batches output
+///   through a virtqueue. The kernel keeps its full boot log, and messages
+///   from before the console driver loads are replayed when it registers.
+/// - Firecracker has only the serial port, so its guests boot `quiet`:
+///   warnings, errors, and panics still print. A task that wants the full
+///   log sets `kernel_args = "loglevel=7"`, which overrides it.
 ///
 /// Firecracker has no PCI bus and no i8042 controller, so it needs the extra
 /// probe suppressions; cloud-hypervisor does not.
 pub(crate) fn kernel_cmdline(spec: &VmSpec, firecracker: bool) -> String {
-    let mut cmdline = String::from("console=ttyS0 reboot=k panic=1");
-    if firecracker {
-        cmdline.push_str(" pci=off i8042.noaux i8042.nomux i8042.nopnp i8042.dumbkbd");
-    }
+    let mut cmdline = if firecracker {
+        String::from(
+            "console=ttyS0 quiet reboot=k panic=1 pci=off i8042.noaux i8042.nomux i8042.nopnp \
+             i8042.dumbkbd",
+        )
+    } else {
+        String::from("console=hvc0 reboot=k panic=1")
+    };
     cmdline.push_str(&format!(
         " root={GUEST_ROOT_DEVICE} rw init={GUEST_INIT_PATH}"
     ));
@@ -470,9 +486,18 @@ pub(crate) fn kernel_cmdline(spec: &VmSpec, firecracker: bool) -> String {
     cmdline
 }
 
-/// `cloud-hypervisor` argv. `--serial tty --console off` puts the guest serial
-/// console on the VMM's stdout, which the worker captures into the
-/// allocation's `stdout.log`.
+/// `cloud-hypervisor` argv. `--serial off --console tty` puts the guest's
+/// virtio-console (`hvc0`, see [`kernel_cmdline`]) on the VMM's stdout, which
+/// the worker captures into the allocation's `stdout.log`.
+///
+/// Every disk is declared `image_type=raw`. Every disk Legion attaches is
+/// raw (an ext4 image, a raw volume, or the identity disk), and without the
+/// declaration cloud-hypervisor probes the format and then refuses guest
+/// writes to sector 0 of the probed image, so a guest cannot rewrite it into
+/// another format. ext4 writes its superblock through block 0 at mount, so
+/// the root mount failed with an I/O error, the kernel panicked, and the
+/// guest rebooted after `panic=1`'s one second: every boot paid about 1.5 s
+/// for it.
 pub(crate) fn cloud_hypervisor_args(spec: &VmSpec) -> Vec<String> {
     let mut args = vec![
         "--kernel".to_string(),
@@ -480,10 +505,10 @@ pub(crate) fn cloud_hypervisor_args(spec: &VmSpec) -> Vec<String> {
         "--cmdline".to_string(),
         kernel_cmdline(spec, false),
         "--disk".to_string(),
-        format!("path={}", spec.root_disk.display()),
+        format!("path={},image_type=raw", spec.root_disk.display()),
     ];
     for disk in &spec.volume_disks {
-        let mut arg = format!("path={}", disk.path.display());
+        let mut arg = format!("path={},image_type=raw", disk.path.display());
         if disk.read_only {
             arg.push_str(",readonly=on");
         }
@@ -491,7 +516,7 @@ pub(crate) fn cloud_hypervisor_args(spec: &VmSpec) -> Vec<String> {
     }
     if let Some(identity) = spec.identity_disk.as_ref() {
         args.push(format!(
-            "path={},readonly=on,id={}",
+            "path={},image_type=raw,readonly=on,id={}",
             identity.display(),
             crate::task_plugins::IDENTITY_DRIVE_ID
         ));
@@ -501,9 +526,9 @@ pub(crate) fn cloud_hypervisor_args(spec: &VmSpec) -> Vec<String> {
     args.push("--memory".to_string());
     args.push(format!("size={}M", spec.memory_mib));
     args.push("--serial".to_string());
-    args.push("tty".to_string());
-    args.push("--console".to_string());
     args.push("off".to_string());
+    args.push("--console".to_string());
+    args.push("tty".to_string());
     args.push("--api-socket".to_string());
     args.push(spec.api_socket.display().to_string());
     if let Some(balloon) = spec.balloon.as_ref() {
@@ -1245,10 +1270,10 @@ mod tests {
 
         let args = cloud_hypervisor_args(&spec);
         let disk_at = args.iter().position(|a| a == "--disk").expect("--disk");
-        assert_eq!(args[disk_at + 2], "path=/v/disk.img");
+        assert_eq!(args[disk_at + 2], "path=/v/disk.img,image_type=raw");
         assert_eq!(
             args[disk_at + 3],
-            "path=/links/identity.img,readonly=on,id=identity"
+            "path=/links/identity.img,image_type=raw,readonly=on,id=identity"
         );
 
         let drives = firecracker_config(&spec)["drives"].clone();
@@ -1347,7 +1372,12 @@ mod tests {
         let cmdline = kernel_cmdline(&spec(), false);
         assert!(cmdline.contains("root=/dev/vda rw"));
         assert!(cmdline.contains("init=/legion/init"));
-        assert!(cmdline.contains("console=ttyS0"));
+        // cloud-hypervisor's console is virtio (fast, full boot log);
+        // Firecracker has only serial, so it boots quiet.
+        assert!(cmdline.contains("console=hvc0"));
+        assert!(!cmdline.contains("quiet"));
+        let firecracker = kernel_cmdline(&spec(), true);
+        assert!(firecracker.contains("console=ttyS0 quiet"));
         // Panic must reboot, or a wedged guest would hang the allocation.
         assert!(cmdline.contains("panic=1"));
         // PCI suppression is a Firecracker-only need; it would break
@@ -1362,10 +1392,15 @@ mod tests {
         spec.extra_cmdline = Some("  quiet loglevel=1 ".into());
         let cmdline = kernel_cmdline(&spec, false);
         assert!(cmdline.ends_with("quiet loglevel=1"));
+        // The task's args come after Legion's, so `loglevel=7` brings back
+        // a Firecracker guest's full boot log (the last loglevel wins).
+        spec.extra_cmdline = Some("loglevel=7".into());
+        let cmdline = kernel_cmdline(&spec, true);
+        assert!(cmdline.find("quiet") < cmdline.find("loglevel=7"));
     }
 
     #[test]
-    fn cloud_hypervisor_args_carry_disks_cpus_memory_and_serial() {
+    fn cloud_hypervisor_args_carry_disks_cpus_memory_and_console() {
         let mut spec = spec();
         spec.volume_disks = vec![
             VmDisk {
@@ -1384,19 +1419,33 @@ mod tests {
         let args = cloud_hypervisor_args(&spec);
 
         let disk_at = args.iter().position(|a| a == "--disk").expect("--disk");
-        assert_eq!(args[disk_at + 1], "path=/allocs/7/.sandbox/rootfs.img");
+        // Every disk is declared raw, or cloud-hypervisor refuses guest
+        // writes to its sector 0 and the root mount fails.
+        assert_eq!(
+            args[disk_at + 1],
+            "path=/allocs/7/.sandbox/rootfs.img,image_type=raw"
+        );
         // Volume disks follow in attach order: /dev/vdb, then /dev/vdc.
-        assert_eq!(args[disk_at + 2], "path=/volumes/local-dir/9f2c/disk.img");
+        assert_eq!(
+            args[disk_at + 2],
+            "path=/volumes/local-dir/9f2c/disk.img,image_type=raw"
+        );
         // A read-only volume must be read-only at the VMM, not just in-guest.
         assert_eq!(
             args[disk_at + 3],
-            "path=/dev/mapper/legion-models,readonly=on"
+            "path=/dev/mapper/legion-models,image_type=raw,readonly=on"
         );
         assert!(args.contains(&"boot=2".to_string()));
         assert!(args.contains(&"size=512M".to_string()));
-        // Guest console on the VMM's stdout is what makes log capture work.
+        // The guest's virtio-console on the VMM's stdout is what makes log
+        // capture work; the serial port is off.
+        let console_at = args
+            .iter()
+            .position(|a| a == "--console")
+            .expect("--console");
+        assert_eq!(args[console_at + 1], "tty");
         let serial_at = args.iter().position(|a| a == "--serial").expect("--serial");
-        assert_eq!(args[serial_at + 1], "tty");
+        assert_eq!(args[serial_at + 1], "off");
         assert!(args.contains(&"tap=tap0,mac=02:00:00:00:00:01".to_string()));
 
         // A gated sandbox gets its vsock device on both VMMs, always as
