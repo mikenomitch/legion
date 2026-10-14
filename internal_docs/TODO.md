@@ -557,6 +557,7 @@ How to use it:
 
 | PR | What it lands | Notes |
 | --- | --- | --- |
+| [#45](https://github.com/mikenomitch/legion/pull/45) | The remaining `perf/*` branches stacked on main: lazy memory restore, chunked checkpoints on the work stream, elastic session envelopes, edge admission control, ratification without epoch fences, the keyed bind index and fused eval settles, and the worker lock fixes. Plus what the AWS rig found: non-blocking server console logs, `speculativeStart` on the dispatch, followers answering ratifications with not-leader, the settle window for a just-ratified claim, and an edge start's own instance identity | [results](../benchmarks/aws/sandbox-boot/RESULTS.md) · [sandbox boot calls](calls/sandbox-boot-throughput-plan_calls.md) · [ratify calls](calls/edge-ratify-throughput-plan_calls.md). The 5 s restore wait and the stale ratifier cache are open below |
 | [#36](https://github.com/mikenomitch/legion/pull/36) | Session durability, routing, and edge starts, Phases 1–4 (concurrent node starts, `sessions.db` re-adopt, node tag in session ids and tag routing, session tickets, `Worker.StartSession`, `ListSessionNodes`, `legion session`), the session UI pass, and the sandbox spot-check and bottleneck-measurement plans. Phase 5 in progress | [plan](plans/session-durability-and-routing-plan.md) · [calls](calls/session-durability-and-routing-plan_calls.md) |
 | [#30](https://github.com/mikenomitch/legion/pull/30) | Sandbox scaling Phases 4–6: untombstoned 130-bit minted ids, `suspend.archive`, `stateful.mode = "session"` and `legion instance promote` | [plan](plans/sandbox-scaling-plan.md) §16 · [calls](calls/sandbox-scaling-plan_calls.md); sessions ship without idle sessions, identity, or a session log (calls #18) |
 | [#7](https://github.com/mikenomitch/legion/pull/7) | Read model follows SQLite in every mode: shadow check, `local_disk` changeset projection, outside-write guard, timed scrub | Bench needs a quiet-machine rerun; [plan](plans/read-model-coherence-plan.md) |
@@ -1247,7 +1248,23 @@ How to use it:
         already share group-commit entries, and RPC batching would not
         shrink the entry
         ([ratify throughput plan](plans/edge-ratify-throughput-plan.md) §8,
-        [calls #4](calls/edge-ratify-throughput-plan_calls.md)).
+        [calls #6](calls/edge-ratify-throughput-plan_calls.md)).
+  - [ ] **Forward `RatifyClaim` on the manager side.** A follower answers a
+        ratification with `FailedPrecondition` ("not the raft leader"), and
+        only the worker's ratifier (`ManagerClaimRatifier` in
+        `src/worker/daemon.rs`) knows to try the other managers. A CLI or
+        third-party caller has to find the leader itself. Fail with the
+        typed not-leader status that carries `x-legion-raft-leader`, so the
+        existing `leader_forward` layer proxies it, and keep the node's
+        leader cache for the one-hop path
+        ([calls #2](calls/edge-ratify-throughput-plan_calls.md)).
+  - [ ] **The ratifier never drops a manager that stops answering.** It
+        clears its cached manager only on a not-leader answer. If that
+        manager goes away (a transport error), every later ratification on
+        the node fails `internal` with `ratification call failed` until it
+        comes back or the worker restarts. Treat a transport error like
+        not-leader: clear the cache and try the others. Listed under Known
+        limitations in [edge-boot.md](../docs/edge-boot.md#known-limitations).
   - [ ] A pre-warm push for the worker spec cache. A node today caches a task
         config once it has been dispatched an allocation of it, so an edge pool
         must run at least one allocation of a job before a ticket for it can be
@@ -2050,7 +2067,7 @@ Plans: [task-runtime-plugins](../docs/task-runtime-plugins.md).
       ([plan](plans/sandbox-boot-throughput-plan.md) ·
       [calls](calls/sandbox-boot-throughput-plan_calls.md) ·
       [results](../benchmarks/aws/sandbox-boot/RESULTS.md)):
-  - [x] **The worker's lock under churn** (plan phase 4, calls 13). A
+  - [x] **The worker's lock under churn** (plan phase 4, calls 14). A
         frame-pointer build with per-call-site lock timing on a c5.metal
         found the task-manager lock busy 60 to 80% of the time at 250
         starts a second: `assign` rewrote the share slice's `cpuset.cpus`
@@ -2081,13 +2098,27 @@ Plans: [task-runtime-plugins](../docs/task-runtime-plugins.md).
         dominate their tail at high start rates. The Firecracker run (the
         same sequential, burst, and sustained cases, about an hour and $1)
         decides whether `auto` should prefer it for sandboxes that need
-        neither cross-data-dir restores nor a boot log (calls 14,
+        neither cross-data-dir restores nor a boot log (calls 15,
         [docs](../docs/task-runtime-sandbox.md#choosing-a-vmm)).
   - [ ] **`perf/lazy-memory-restore` is unmeasured** (pushed, 7e93ebb8).
         On-demand memory restore needs cloud-hypervisor v52+. The rig ran
         v51.2. Its restore matrix (1, 4, 8 GiB, lazy vs eager, v51 to v53 and
         Firecracker, suspend and fork right after a lazy resume) is the next
         run, on a box with 32 GiB or more.
+  - [ ] **Every sandbox restore waits 5 s for an egress proxy socket**, and
+        that hides lazy against eager. Before it resumes a restored guest,
+        the node waits up to `DATAPATH_WAIT` (5 s, `sandbox_checkpoint.rs`)
+        for the datapath's proxy socket. Every guest has a vsock, so every
+        checkpoint records gated networking, and a guest that is not gated
+        never gets the socket. On main already. Measured on
+        cloud-hypervisor v53.0 with a 2.4 GB checkpoint (2 GiB guest, 900
+        MiB touched, `jobs/restore-vm-{lazy,eager}.ncl`): `restore_ms`
+        about 5,040 for both modes, a 5.0 s resume end to end against
+        15.6 s on main's worker
+        ([results](../benchmarks/aws/sandbox-boot/RESULTS.md#memory-restore-2026-10-14)).
+        Same root cause as the "non-gated sandbox waits the full 5s" item
+        under the spot-check rerun above. Derive the wait from the
+        allocation's network mode, then rerun the lazy and eager cells.
   - [ ] **Parallel branches not stacked** (calls 1), each still an
         uncommitted diff in its worktree unless noted: `sandbox-warm-pool`
         and `edge-prewarm` (warming, against the pre-warm stance until the
@@ -3796,6 +3827,14 @@ Phases 1 and 2 shipped (see Done, KV & secrets).
 
 Plans: [persistence-plan.md](plans/persistence-plan.md), [multi-raft-persistence-plan.md](plans/multi-raft-persistence-plan.md), [manager-workload-identity-plan.md](plans/manager-workload-identity-plan.md) · docs: [state-store.md](../docs/state-store.md), [raft-operations.md](../docs/raft-operations.md), [persistence-streaming.md](../docs/persistence-streaming.md)
 
+- [ ] **A newer binary cannot read an older binary's persisted proto JSON.**
+      Proto structs derive serde with no field defaults (`build.rs`), so a
+      field added to a message makes every file written before it fail to
+      parse. Seen on the AWS rig as `missing field envelopeResources`
+      reading `netd_state.json` after a worker upgrade. Any on-disk file
+      that stores a proto struct as JSON has the same problem. Add a
+      container-level `#[serde(default)]` for proto messages, and a test that
+      parses a fixture written without a newer field.
 - [ ] **A manager with no raft leader holds a read instead of failing it.**
       In the AWS spot check, with the leader's raft core dead, `legion job
       list` hung with no reply. The CLI now gives up at its 30s request
@@ -4186,6 +4225,11 @@ Plan: [auth-acl-plan.md](plans/auth-acl-plan.md) · docs: [auth-and-acls.md](../
 docs: [observability.md](../docs/observability.md), [logging.md](../docs/logging.md), [event-stream.md](../docs/event-stream.md)
 
 - [ ] A trace viewer in the UI (make it dev-only at first)
+- [ ] **Count the console lines a server drops.** Server console logs go
+      through a lossy non-blocking writer (Done, below), and a line dropped
+      under backpressure leaves no trace. Expose `tracing-appender`'s
+      dropped-line count as a metric, or log a summary line when lines were
+      dropped ([calls #3](calls/sandbox-boot-throughput-plan_calls.md)).
 - [x] Metrics endpoint and health probes — Prometheus `/metrics`, `/healthz`,
       `/readyz` ([docs/metrics.md](../docs/metrics.md), [#137](https://github.com/mikenomitch/legion/pull/137)).
 - [x] Worker-side `/metrics` + OTLP metrics push (2026-07-30): opt-in
@@ -5523,6 +5567,30 @@ docs: [task-runtime-plugins.md](../docs/task-runtime-plugins.md)
   - [x] A start for a never-existed id decides the create inside the entry,
         so two nodes racing to create one sandbox leave one owner and a
         loser refused `instance_claimed`, not `internal`.
+- [x] **Edge starts hold up on a three-manager raft cluster** (2026-10-14,
+      [#45](https://github.com/mikenomitch/legion/pull/45)). `race.sh`
+      started each of 60, 200, and 300 instance ids on three workers at
+      once. Every id had exactly one ratified start, and no loser's process
+      survived, including a run with the raft leader stopped 30 s in
+      ([results](../benchmarks/aws/sandbox-boot/RESULTS.md#ratification-on-three-managers-2026-10-14) ·
+      [docs](../docs/edge-boot.md#ratification-on-a-raft-cluster) ·
+      [calls](calls/edge-ratify-throughput-plan_calls.md) #2, #3). It found
+      and fixed:
+  - [x] The dispatch carries `speculativeStart`
+        (`TaskAllocation.task_speculative_start`). Before, every node's spec
+        cache read every task as `off` and refused every boot ticket. This
+        was on main, and in-process tests missed it because they fill the
+        cache by hand ([docs](../docs/edge-boot.md#the-spec-cache)).
+  - [x] A follower answers `RatifyClaim` with not-leader instead of an
+        `internal` refusal, writing nothing, and the node retries the other
+        managers it knows and keeps the one that ratified. Before, most edge
+        starts on three managers were killed after boot.
+  - [x] A just-ratified claim is kept from the stop sweep until a desired
+        set lists it, or for 30 s (`RATIFIED_SETTLE`). Before, a desired set
+        from a lagging follower stopped 378 confirmed claims on one worker.
+  - [x] An edge start sets its own `LEGION_INSTANCE_ID` and drops the
+        identity keys the cached task config carried from another
+        allocation.
 - [x] **Edge starts shed before boot when ratification is behind** (edge
       admission control Phase 1). Each edge node keeps an AIMD window over
       its unratified edge claims, capped by `edgeBoot.maxProvisionalPerNode`
@@ -5750,6 +5818,17 @@ docs: [task-runtime-plugins.md](../docs/task-runtime-plugins.md)
       ([docs](../docs/testing-and-benchmarks.md))
 - [x] Task log capture, tailing, rotation, and external shipping (including OTLP)
 - [x] OTLP trace export for Legion's own spans ([src/otel.rs](../src/otel.rs))
+- [x] **Server console logs never block** (2026-10-14,
+      [#45](https://github.com/mikenomitch/legion/pull/45)). Managers and
+      workers write the console through a lossy non-blocking writer, so a
+      slow journald drops lines instead of stalling every thread that logs.
+      Found on a c5.metal: a 1,200-start burst blocked heartbeats for about
+      57 s, the worker was marked lost, and the burst fell to 8 starts/s.
+      After, 293/s and no lost node
+      ([docs](../docs/observability.md#logging-and-tracing-setup) ·
+      [calls](calls/sandbox-boot-throughput-plan_calls.md) #3 ·
+      [results](../benchmarks/aws/sandbox-boot/RESULTS.md#console-logging-under-a-burst-2026-10-14)).
+      Dropped lines are not counted yet (open item under Observability).
 - [x] Event stream: scheduler events as history and live tail (`ListEvents`,
       `StreamEvents`, CLI, UI)
 - [x] **Task start stage timings** (2026-10-13) , 
