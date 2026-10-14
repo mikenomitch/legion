@@ -9,27 +9,35 @@
 //! asking without any packet marking — and can answer `<key>.svc.legion`
 //! with *that* allocation's VIP.
 //!
-//! Anything else is forwarded to the host's resolvers over UDP, after the
-//! allocation's egress policy has judged the name: a host the policy would
-//! deny at connect time is `NXDOMAIN` here, one round trip instead of a
-//! hanging connect, and recorded as a denial exactly like a refused dial.
-//! Names are never judged when the chain matches on CIDRs (the address is
-//! what the rule needs, and it is not known yet) — resolution proceeds and
-//! the connect-time check decides.
+//! Anything else is forwarded to the host's resolvers (the `nameserver`
+//! lines of `/etc/resolv.conf`) over UDP, after the allocation's egress
+//! policy has judged the name: a host the policy would deny at connect time
+//! is `NXDOMAIN` here, one round trip instead of a hanging connect, and
+//! recorded as a denial exactly like a refused dial. Names are never judged
+//! when the chain matches on CIDRs (the address is what the rule needs, and
+//! it is not known yet) — resolution proceeds and the connect-time check
+//! decides. A client that asked over TCP gets a truncated UDP answer fetched
+//! again over TCP. A node whose `resolv.conf` names no resolver answers
+//! `SERVFAIL`: nothing is sent to a resolver the operator did not name.
 //!
-//! Wire handling is deliberately minimal: A / AAAA / SRV questions for the
-//! zone are answered locally, everything else is proxied byte-for-byte. No
-//! caching, no recursion, no DNSSEC — the host resolver does all of that.
-//! Linux only, because only Linux routes all of 127/8 to loopback.
+//! Messages are parsed and built with `hickory-proto`. A / AAAA / SRV
+//! questions for the zone are answered locally, everything else is proxied
+//! byte-for-byte. No caching, no recursion, no DNSSEC — the host resolver
+//! does all of that. Linux only, because only Linux routes all of 127/8 to
+//! loopback.
 
 use crate::prelude::*;
 use crate::structs::netpolicy::{ConnectFacts, Verdict};
 use crate::structs::SVC_ZONE;
 use crate::worker::forwarder::ForwarderContext;
 use crate::worker::netd::attach::Attachment;
-use crate::worker::netd::listen::{spawn_accept_loop, ListenAddr};
+use crate::worker::netd::listen::{spawn_accept_loop, ListenAddr, Stream};
+
 use crate::worker::netd::metrics as net_metrics;
 use crate::worker::netd::policy::{egress_connect_verdict, gated_egress_connect_verdict};
+use hickory_proto::op::{Message, MessageType, Query, ResponseCode};
+use hickory_proto::rr::rdata::{A, SRV};
+use hickory_proto::rr::{DNSClass, Name, RData, Record, RecordType};
 
 use std::collections::BTreeMap;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -93,6 +101,18 @@ impl Server {
     }
 }
 
+/// The `nameserver` lines of a `resolv.conf`. A host resolver on loopback
+/// (systemd-resolved) is fine: the allocation's own resolver is on a
+/// different 127 address, and queries are forwarded from the host namespace.
+pub fn forwarders_in(resolv_conf: &str) -> Vec<SocketAddr> {
+    resolv_conf
+        .lines()
+        .filter_map(|line| line.trim().strip_prefix("nameserver"))
+        .filter_map(|rest| rest.trim().parse::<IpAddr>().ok())
+        .map(|ip| SocketAddr::new(ip, 53))
+        .collect()
+}
+
 /// The node's per-allocation resolvers, reconciled from heartbeat replies
 /// like the upstream forwarder's listeners.
 pub struct NetDns {
@@ -112,27 +132,20 @@ impl NetDns {
         }
     }
 
-    /// The host's resolvers from `/etc/resolv.conf`, or a public one when it
-    /// names none.
+    /// The host's resolvers, from `/etc/resolv.conf`. Empty when it names
+    /// none: external names then get `SERVFAIL`, and no query goes to a
+    /// resolver the operator did not name.
     pub fn host_forwarders() -> Vec<SocketAddr> {
-        let mut out = Vec::new();
-        if let Ok(text) = std::fs::read_to_string("/etc/resolv.conf") {
-            for line in text.lines() {
-                let line = line.trim();
-                if let Some(rest) = line.strip_prefix("nameserver") {
-                    if let Ok(ip) = rest.trim().parse::<IpAddr>() {
-                        // A host resolver on loopback (systemd-resolved) is
-                        // fine: the allocation's own resolver is on a
-                        // different 127 address.
-                        out.push(SocketAddr::new(ip, 53));
-                    }
-                }
-            }
+        let forwarders = std::fs::read_to_string("/etc/resolv.conf")
+            .map(|text| forwarders_in(&text))
+            .unwrap_or_default();
+        if forwarders.is_empty() {
+            warn!(
+                "/etc/resolv.conf names no nameserver; allocation resolvers will answer \
+                 SERVFAIL for every name outside svc.legion"
+            );
         }
-        if out.is_empty() {
-            out.push(SocketAddr::new(IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)), 53));
-        }
-        out
+        forwarders
     }
 
     /// Reconcile resolvers against the desired set.
@@ -295,7 +308,7 @@ async fn run_udp(socket: UdpSocket, resolver: Arc<Resolver>) {
         let resolver = resolver.clone();
         let socket = socket.clone();
         tokio::spawn(async move {
-            if let Some(response) = answer(&resolver, &query).await {
+            if let Some(response) = answer(&resolver, &query, false).await {
                 let _ = socket.send_to(&response, peer).await;
             }
         });
@@ -303,12 +316,13 @@ async fn run_udp(socket: UdpSocket, resolver: Arc<Resolver>) {
 }
 
 /// One DNS-over-TCP exchange (RFC 1035 §4.2.2 framing: two-byte length
-/// prefix), on a TCP or a vsock-backed stream.
-async fn serve_stream<S>(mut stream: S, resolver: Arc<Resolver>)
-where
-    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
-{
+/// prefix), on a TCP or a vsock-backed stream. A query that arrived over TCP
+/// was asked over TCP, so a truncated upstream answer is fetched again in
+/// full; one on a guest's vsock socket is a UDP query the guest agent
+/// relayed, so it gets what a UDP client would.
+async fn serve_stream(mut stream: Stream, resolver: Arc<Resolver>) {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let over_tcp = matches!(stream, Stream::Tcp(_));
     let mut len_buf = [0u8; 2];
     if stream.read_exact(&mut len_buf).await.is_err() {
         return;
@@ -318,134 +332,75 @@ where
     if stream.read_exact(&mut query).await.is_err() {
         return;
     }
-    if let Some(response) = answer(&resolver, &query).await {
+    if let Some(response) = answer(&resolver, &query, over_tcp).await {
+        let Ok(response_len) = u16::try_from(response.len()) else {
+            return;
+        };
         let mut framed = Vec::with_capacity(response.len() + 2);
-        framed.extend_from_slice(&(response.len() as u16).to_be_bytes());
+        framed.extend_from_slice(&response_len.to_be_bytes());
         framed.extend_from_slice(&response);
         let _ = stream.write_all(&framed).await;
     }
 }
 
 // ---------------------------------------------------------------------------
-// Wire format
+// Wire format (hickory-proto)
 // ---------------------------------------------------------------------------
 
-const TYPE_A: u16 = 1;
-const TYPE_AAAA: u16 = 28;
-const TYPE_SRV: u16 = 33;
-const TYPE_ANY: u16 = 255;
-const CLASS_IN: u16 = 1;
-const RCODE_NXDOMAIN: u8 = 3;
-
-/// The one question in a query.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Question {
-    pub name: String,
-    pub qtype: u16,
-    pub qclass: u16,
-    /// Byte length of the question section (for echoing it).
-    pub end: usize,
+/// The one question in a query, parsed.
+struct Asked {
+    message: Message,
+    query: Query,
+    /// The question name, lower-cased, without the trailing dot.
+    name: String,
 }
 
-/// Parse the header and first question of a DNS message.
-pub fn parse_question(message: &[u8]) -> Option<(u16, Question)> {
-    if message.len() < 12 {
+/// Parse a query and its first question. `None` for anything that is not a
+/// well-formed query with a question: no answer is better than a wrong one.
+fn parse_query(bytes: &[u8]) -> Option<Asked> {
+    let message = Message::from_vec(bytes).ok()?;
+    if message.message_type() != MessageType::Query {
         return None;
     }
-    let id = u16::from_be_bytes([message[0], message[1]]);
-    let qdcount = u16::from_be_bytes([message[4], message[5]]);
-    if qdcount == 0 {
-        return None;
-    }
-    let (name, mut offset) = read_name(message, 12, 0)?;
-    if offset + 4 > message.len() {
-        return None;
-    }
-    let qtype = u16::from_be_bytes([message[offset], message[offset + 1]]);
-    let qclass = u16::from_be_bytes([message[offset + 2], message[offset + 3]]);
-    offset += 4;
-    Some((
-        id,
-        Question {
-            name,
-            qtype,
-            qclass,
-            end: offset,
-        },
-    ))
-}
-
-/// Read a (possibly compressed) name; returns the name and the offset after
-/// it in the *uncompressed* stream position.
-fn read_name(message: &[u8], mut offset: usize, depth: u8) -> Option<(String, usize)> {
-    if depth > 8 {
-        return None;
-    }
-    let mut labels: Vec<String> = Vec::new();
-    loop {
-        let len = *message.get(offset)? as usize;
-        if len == 0 {
-            offset += 1;
-            break;
-        }
-        if len & 0xC0 == 0xC0 {
-            let pointer = ((len & 0x3F) << 8) | *message.get(offset + 1)? as usize;
-            let (rest, _) = read_name(message, pointer, depth + 1)?;
-            if !rest.is_empty() {
-                labels.push(rest);
-            }
-            offset += 2;
-            return Some((labels.join("."), offset));
-        }
-        offset += 1;
-        let label = message.get(offset..offset + len)?;
-        labels.push(String::from_utf8_lossy(label).to_ascii_lowercase());
-        offset += len;
-    }
-    Some((labels.join("."), offset))
-}
-
-fn encode_name(name: &str, out: &mut Vec<u8>) {
-    for label in name
+    let query = message.queries().first()?.clone();
+    let name = query
+        .name()
+        .to_ascii()
         .trim_end_matches('.')
-        .split('.')
-        .filter(|l| !l.is_empty())
-    {
-        let bytes = label.as_bytes();
-        out.push(bytes.len().min(63) as u8);
-        out.extend_from_slice(&bytes[..bytes.len().min(63)]);
-    }
-    out.push(0);
+        .to_ascii_lowercase();
+    Some(Asked {
+        message,
+        query,
+        name,
+    })
 }
 
-/// Build a response: the query's header (id, RD echoed, QR/AA set), the
-/// question echoed, and `answers` as (type, rdata) records for the question
-/// name (a compression pointer to offset 12).
-pub fn build_response(
-    query: &[u8],
-    question: &Question,
-    rcode: u8,
-    answers: &[(u16, Vec<u8>)],
-) -> Vec<u8> {
-    let mut out = Vec::with_capacity(query.len() + 64);
-    out.extend_from_slice(&query[0..2]);
-    let rd = query[2] & 0x01;
-    out.push(0x80 | 0x04 | rd); // QR, AA, RD
-    out.push(0x80 | (rcode & 0x0F)); // RA
-    out.extend_from_slice(&1u16.to_be_bytes()); // QDCOUNT
-    out.extend_from_slice(&(answers.len() as u16).to_be_bytes()); // ANCOUNT
-    out.extend_from_slice(&0u16.to_be_bytes()); // NSCOUNT
-    out.extend_from_slice(&0u16.to_be_bytes()); // ARCOUNT
-    out.extend_from_slice(&query[12..question.end]);
-    for (rtype, rdata) in answers {
-        out.extend_from_slice(&[0xC0, 0x0C]);
-        out.extend_from_slice(&rtype.to_be_bytes());
-        out.extend_from_slice(&CLASS_IN.to_be_bytes());
-        out.extend_from_slice(&LOCAL_TTL.to_be_bytes());
-        out.extend_from_slice(&(rdata.len() as u16).to_be_bytes());
-        out.extend_from_slice(rdata);
+/// A response to `asked`: its id, opcode and RD echoed, AA and RA set, the
+/// question echoed, and `answers` for the question name.
+fn respond(asked: &Asked, code: ResponseCode, answers: Vec<RData>) -> Option<Vec<u8>> {
+    let mut response = Message::new();
+    response
+        .set_id(asked.message.id())
+        .set_message_type(MessageType::Response)
+        .set_op_code(asked.message.op_code())
+        .set_authoritative(true)
+        .set_recursion_desired(asked.message.recursion_desired())
+        .set_recursion_available(true)
+        .set_response_code(code)
+        .add_query(asked.query.clone());
+    for rdata in answers {
+        response.add_answer(Record::from_rdata(
+            asked.query.name().clone(),
+            LOCAL_TTL,
+            rdata,
+        ));
     }
-    out
+    response.to_vec().ok()
+}
+
+/// Whether a response says it was truncated (`TC`).
+fn truncated(response: &[u8]) -> bool {
+    Message::from_vec(response).is_ok_and(|message| message.truncated())
 }
 
 /// Strip the zone from a name in it: `db.svc.legion` → `db`, bare `db` →
@@ -470,43 +425,36 @@ fn zone_key(name: &str) -> Option<String> {
     None
 }
 
-/// Answer one query for one allocation.
-async fn answer(resolver: &Arc<Resolver>, query: &[u8]) -> Option<Vec<u8>> {
-    let (_, question) = parse_question(query)?;
-    if question.qclass != CLASS_IN {
-        return Some(build_response(query, &question, RCODE_NXDOMAIN, &[]));
+/// Answer one query for one allocation. `over_stream` says the client asked
+/// over TCP, so an upstream answer truncated over UDP is fetched again over
+/// TCP instead of being handed back for the client to retry.
+async fn answer(resolver: &Arc<Resolver>, query: &[u8], over_stream: bool) -> Option<Vec<u8>> {
+    let asked = parse_query(query)?;
+    if asked.query.query_class() != DNSClass::IN {
+        return respond(&asked, ResponseCode::NXDomain, Vec::new());
     }
 
     // Local zone.
-    if let Some(key) = zone_key(&question.name) {
-        return Some(match resolver.spec.names.get(&key) {
+    if let Some(key) = zone_key(&asked.name) {
+        return match resolver.spec.names.get(&key) {
             Some((vip, port)) => {
                 net_metrics::connection("egress", "dns", "allow");
-                let mut answers = Vec::new();
-                match question.qtype {
-                    TYPE_A | TYPE_ANY => answers.push((TYPE_A, vip.octets().to_vec())),
-                    TYPE_SRV => {
-                        let mut rdata = Vec::new();
-                        rdata.extend_from_slice(&0u16.to_be_bytes()); // priority
-                        rdata.extend_from_slice(&0u16.to_be_bytes()); // weight
-                        rdata.extend_from_slice(&port.to_be_bytes());
-                        encode_name(&format!("{key}.{SVC_ZONE}"), &mut rdata);
-                        answers.push((TYPE_SRV, rdata));
+                let answers = match asked.query.query_type() {
+                    RecordType::A | RecordType::ANY => vec![RData::A(A(*vip))],
+                    RecordType::SRV => {
+                        let target = Name::from_ascii(format!("{key}.{SVC_ZONE}.")).ok()?;
+                        vec![RData::SRV(SRV::new(0, 0, *port, target))]
                     }
                     // AAAA: the zone is v4-only; NOERROR with no data tells
                     // a dual-stack resolver to use the A record.
-                    TYPE_AAAA => {}
-                    _ => {}
-                }
-                build_response(query, &question, 0, &answers)
+                    _ => Vec::new(),
+                };
+                respond(&asked, ResponseCode::NoError, answers)
             }
-            None if question.name.ends_with(SVC_ZONE) || !question.name.contains('.') => {
-                // In the zone (or a bare label) but not one of this
-                // allocation's upstreams.
-                build_response(query, &question, RCODE_NXDOMAIN, &[])
-            }
-            None => build_response(query, &question, RCODE_NXDOMAIN, &[]),
-        });
+            // In the zone (or a bare label) but not one of this
+            // allocation's upstreams.
+            None => respond(&asked, ResponseCode::NXDomain, Vec::new()),
+        };
     }
 
     // External: policy at resolution time, then forward. A gated
@@ -523,7 +471,7 @@ async fn answer(resolver: &Arc<Resolver>, query: &[u8]) -> Option<Vec<u8>> {
     };
     if judge {
         let facts = ConnectFacts {
-            host: Some(question.name.trim_end_matches('.')),
+            host: Some(&asked.name),
             ip: None,
             port: 0,
             identity: None,
@@ -539,21 +487,30 @@ async fn answer(resolver: &Arc<Resolver>, query: &[u8]) -> Option<Vec<u8>> {
                 resolver.spec.allocation_id,
                 "egress",
                 "dns",
-                question.name.trim_end_matches('.'),
+                &asked.name,
                 &source,
                 reason.as_deref(),
                 "",
                 "",
             );
-            return Some(build_response(query, &question, RCODE_NXDOMAIN, &[]));
+            return respond(&asked, ResponseCode::NXDomain, Vec::new());
         }
     }
     net_metrics::connection("egress", "dns", "allow");
-    forward(resolver, query).await
+    if resolver.forwarders.is_empty() {
+        // The node names no resolver (`/etc/resolv.conf` has no
+        // `nameserver`): say so at once rather than leave the client to
+        // time out. Nothing is sent to a resolver the operator did not name.
+        return respond(&asked, ResponseCode::ServFail, Vec::new());
+    }
+    forward(resolver, query, over_stream).await
 }
 
-/// Proxy a query to the host resolvers, first answer wins.
-async fn forward(resolver: &Arc<Resolver>, query: &[u8]) -> Option<Vec<u8>> {
+/// Proxy a query to the host resolvers over UDP, first answer wins. An
+/// answer truncated over UDP goes back to a UDP client as it is (the client
+/// asks again over TCP, which this resolver serves too); for a client that
+/// asked over TCP, it is fetched again from the same resolver over TCP.
+async fn forward(resolver: &Arc<Resolver>, query: &[u8], over_stream: bool) -> Option<Vec<u8>> {
     for upstream in &resolver.forwarders {
         let bind: SocketAddr = if upstream.is_ipv4() {
             "0.0.0.0:0".parse().ok()?
@@ -567,10 +524,17 @@ async fn forward(resolver: &Arc<Resolver>, query: &[u8]) -> Option<Vec<u8>> {
             continue;
         }
         let mut buf = vec![0u8; MAX_UDP];
-        match tokio::time::timeout(FORWARD_TIMEOUT, socket.recv_from(&mut buf)).await {
-            Ok(Ok((len, _))) => return Some(buf[..len].to_vec()),
+        let response = match tokio::time::timeout(FORWARD_TIMEOUT, socket.recv_from(&mut buf)).await
+        {
+            Ok(Ok((len, _))) => buf[..len].to_vec(),
             _ => continue,
+        };
+        if over_stream && truncated(&response) {
+            if let Some(full) = forward_tcp(*upstream, query).await {
+                return Some(full);
+            }
         }
+        return Some(response);
     }
     debug!(
         allocation_id = resolver.spec.allocation_id,
@@ -579,33 +543,99 @@ async fn forward(resolver: &Arc<Resolver>, query: &[u8]) -> Option<Vec<u8>> {
     None
 }
 
+/// One DNS-over-TCP exchange with a host resolver.
+async fn forward_tcp(upstream: SocketAddr, query: &[u8]) -> Option<Vec<u8>> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let exchange = async {
+        let mut stream = crate::worker::netd::listen::dial_tcp(upstream, FORWARD_TIMEOUT)
+            .await
+            .ok()?;
+        let mut framed = Vec::with_capacity(query.len() + 2);
+        framed.extend_from_slice(&u16::try_from(query.len()).ok()?.to_be_bytes());
+        framed.extend_from_slice(query);
+        stream.write_all(&framed).await.ok()?;
+        let mut len = [0u8; 2];
+        stream.read_exact(&mut len).await.ok()?;
+        let mut response = vec![0u8; usize::from(u16::from_be_bytes(len))];
+        stream.read_exact(&mut response).await.ok()?;
+        Some(response)
+    };
+    tokio::time::timeout(FORWARD_TIMEOUT, exchange)
+        .await
+        .ok()
+        .flatten()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn query(name: &str, qtype: u16) -> Vec<u8> {
-        let mut out = vec![0x12, 0x34, 0x01, 0x00, 0, 1, 0, 0, 0, 0, 0, 0];
-        encode_name(name, &mut out);
-        out.extend_from_slice(&qtype.to_be_bytes());
-        out.extend_from_slice(&CLASS_IN.to_be_bytes());
-        out
+    const TYPE_A: RecordType = RecordType::A;
+    const TYPE_SRV: RecordType = RecordType::SRV;
+    const RCODE_NXDOMAIN: u8 = 3;
+    const RCODE_SERVFAIL: u8 = 2;
+
+    fn query(name: &str, qtype: RecordType) -> Vec<u8> {
+        let mut message = Message::new();
+        message
+            .set_id(0x1234)
+            .set_message_type(MessageType::Query)
+            .set_recursion_desired(true)
+            .add_query(Query::query(Name::from_ascii(name).unwrap(), qtype));
+        message.to_vec().unwrap()
+    }
+
+    /// A stub "host resolver" on UDP that answers every query with
+    /// `answer`, truncated (`TC`, no records) when `truncate` is set.
+    async fn stub_resolver(answer: Ipv4Addr, truncate: bool) -> SocketAddr {
+        let stub = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let stub_addr = stub.local_addr().unwrap();
+        tokio::spawn(async move {
+            let mut buf = vec![0u8; 512];
+            loop {
+                let Ok((len, peer)) = stub.recv_from(&mut buf).await else {
+                    break;
+                };
+                let Some(asked) = parse_query(&buf[..len]) else {
+                    continue;
+                };
+                let response = if truncate {
+                    let mut message = Message::from_vec(
+                        &respond(&asked, ResponseCode::NoError, Vec::new()).unwrap(),
+                    )
+                    .unwrap();
+                    message.set_truncated(true);
+                    message.to_vec().unwrap()
+                } else {
+                    respond(&asked, ResponseCode::NoError, vec![RData::A(A(answer))]).unwrap()
+                };
+                let _ = stub.send_to(&response, peer).await;
+            }
+        });
+        stub_addr
     }
 
     #[test]
     fn parses_and_answers_the_zone() {
-        let q = query("db.svc.legion", TYPE_A);
-        let (id, question) = parse_question(&q).unwrap();
-        assert_eq!(id, 0x1234);
-        assert_eq!(question.name, "db.svc.legion");
-        assert_eq!(zone_key(&question.name).as_deref(), Some("db"));
+        let q = query("DB.svc.legion.", TYPE_A);
+        let asked = parse_query(&q).unwrap();
+        assert_eq!(asked.message.id(), 0x1234);
+        assert_eq!(asked.name, "db.svc.legion", "lower-cased, no trailing dot");
+        assert_eq!(zone_key(&asked.name).as_deref(), Some("db"));
         assert_eq!(zone_key("db").as_deref(), Some("db"));
         assert_eq!(zone_key("_db._tcp.svc.legion").as_deref(), Some("db"));
         assert_eq!(zone_key("api.github.com"), None);
         assert_eq!(zone_key("a.b.svc.legion"), None);
 
-        let response = build_response(&q, &question, 0, &[(TYPE_A, vec![127, 42, 7, 2])]);
+        let response = respond(
+            &asked,
+            ResponseCode::NoError,
+            vec![RData::A(A(Ipv4Addr::new(127, 42, 7, 2)))],
+        )
+        .unwrap();
         assert_eq!(&response[0..2], &[0x12, 0x34]);
         assert_eq!(response[2] & 0x80, 0x80, "QR set");
+        assert_eq!(response[2] & 0x01, 0x01, "RD echoed");
         assert_eq!(response[3] & 0x0F, 0, "NOERROR");
         assert_eq!(
             u16::from_be_bytes([response[6], response[7]]),
@@ -614,25 +644,24 @@ mod tests {
         );
         assert_eq!(&response[response.len() - 4..], &[127, 42, 7, 2]);
 
-        let nx = build_response(&q, &question, RCODE_NXDOMAIN, &[]);
+        let nx = respond(&asked, ResponseCode::NXDomain, Vec::new()).unwrap();
         assert_eq!(nx[3] & 0x0F, RCODE_NXDOMAIN);
+        // Garbage and responses are not queries.
+        assert!(parse_query(&[0x12, 0x34]).is_none());
+        assert!(parse_query(&nx).is_none());
     }
 
     #[test]
-    fn reads_compressed_names() {
-        // "svc.legion" at 12, then a name "db" + pointer to 12.
-        let mut msg = vec![0u8; 12];
-        encode_name("svc.legion", &mut msg);
-        let pointer_at = msg.len();
-        msg.extend_from_slice(&[2, b'd', b'b', 0xC0, 12]);
-        let (name, end) = read_name(&msg, pointer_at, 0).unwrap();
-        assert_eq!(name, "db.svc.legion");
-        assert_eq!(end, msg.len());
-    }
-
-    #[test]
-    fn host_forwarders_never_empty() {
-        assert!(!NetDns::host_forwarders().is_empty());
+    fn forwarders_come_only_from_the_nameserver_lines() {
+        assert_eq!(
+            forwarders_in("# comment\nsearch example.com\nnameserver 127.0.0.53\nnameserver ::1\n"),
+            vec![
+                "127.0.0.53:53".parse::<SocketAddr>().unwrap(),
+                "[::1]:53".parse::<SocketAddr>().unwrap(),
+            ]
+        );
+        // No public resolver is invented for a file that names none.
+        assert!(forwarders_in("search example.com\n").is_empty());
     }
 
     #[tokio::test]
@@ -644,21 +673,7 @@ mod tests {
             return;
         }
         // A stub "host resolver" that answers every query with 9.9.9.9.
-        let stub = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        let stub_addr = stub.local_addr().unwrap();
-        tokio::spawn(async move {
-            let mut buf = vec![0u8; 512];
-            loop {
-                let Ok((len, peer)) = stub.recv_from(&mut buf).await else {
-                    break;
-                };
-                let q = buf[..len].to_vec();
-                if let Some((_, question)) = parse_question(&q) {
-                    let response = build_response(&q, &question, 0, &[(TYPE_A, vec![9, 9, 9, 9])]);
-                    let _ = stub.send_to(&response, peer).await;
-                }
-            }
-        });
+        let stub_addr = stub_resolver(Ipv4Addr::new(9, 9, 9, 9), false).await;
 
         let cache = Arc::new(NetPolicyCache::new());
         let denials = Arc::new(Denials::new());
@@ -693,13 +708,15 @@ mod tests {
         });
 
         // Zone name → VIP, SRV carries the canonical port, unknown → NXDOMAIN.
-        let r = answer(&resolver, &query("db.svc.legion", TYPE_A))
+        let r = answer(&resolver, &query("db.svc.legion", TYPE_A), false)
             .await
             .unwrap();
         assert_eq!(&r[r.len() - 4..], &[127, 42, 9, 2]);
-        let r = answer(&resolver, &query("db", TYPE_SRV)).await.unwrap();
+        let r = answer(&resolver, &query("db", TYPE_SRV), false)
+            .await
+            .unwrap();
         assert!(r.windows(2).any(|w| w == 5432u16.to_be_bytes()));
-        let r = answer(&resolver, &query("nope.svc.legion", TYPE_A))
+        let r = answer(&resolver, &query("nope.svc.legion", TYPE_A), false)
             .await
             .unwrap();
         assert_eq!(r[3] & 0x0F, RCODE_NXDOMAIN);
@@ -707,15 +724,15 @@ mod tests {
         // External: allowed names forward (9.9.9.9 from the stub), a
         // port-constrained allow still resolves (port unknown at DNS time),
         // and a name the policy would deny is NXDOMAIN plus a denial.
-        let r = answer(&resolver, &query("allowed.example", TYPE_A))
+        let r = answer(&resolver, &query("allowed.example", TYPE_A), false)
             .await
             .unwrap();
         assert_eq!(&r[r.len() - 4..], &[9, 9, 9, 9]);
-        let r = answer(&resolver, &query("api.github.com", TYPE_A))
+        let r = answer(&resolver, &query("api.github.com", TYPE_A), false)
             .await
             .unwrap();
         assert_eq!(&r[r.len() - 4..], &[9, 9, 9, 9]);
-        let r = answer(&resolver, &query("evil.example", TYPE_A))
+        let r = answer(&resolver, &query("evil.example", TYPE_A), false)
             .await
             .unwrap();
         assert_eq!(r[3] & 0x0F, RCODE_NXDOMAIN);
@@ -737,21 +754,7 @@ mod tests {
         use crate::structs::netpolicy::{merge_policies, InlinePolicy};
         use crate::structs::AllocNetPolicy;
         use crate::worker::netd::{Denials, NetPolicyCache};
-        let stub = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        let stub_addr = stub.local_addr().unwrap();
-        tokio::spawn(async move {
-            let mut buf = vec![0u8; 512];
-            loop {
-                let Ok((len, peer)) = stub.recv_from(&mut buf).await else {
-                    break;
-                };
-                let q = buf[..len].to_vec();
-                if let Some((_, question)) = parse_question(&q) {
-                    let response = build_response(&q, &question, 0, &[(TYPE_A, vec![9, 9, 9, 9])]);
-                    let _ = stub.send_to(&response, peer).await;
-                }
-            }
-        });
+        let stub_addr = stub_resolver(Ipv4Addr::new(9, 9, 9, 9), false).await;
         let cache = Arc::new(NetPolicyCache::new());
         let denials = Arc::new(Denials::new());
         // Known and empty: the manager names the empty policy's hash.
@@ -781,7 +784,9 @@ mod tests {
         let gated = resolver(Attachment::GuestVsock {
             scratch: "/allocs/3/.sandbox".into(),
         });
-        let r = answer(&gated, &query("pypi.org", TYPE_A)).await.unwrap();
+        let r = answer(&gated, &query("pypi.org", TYPE_A), false)
+            .await
+            .unwrap();
         assert_eq!(r[3] & 0x0F, RCODE_NXDOMAIN);
         let drained = denials.drain();
         assert!(
@@ -790,7 +795,7 @@ mod tests {
                 .any(|d| d.destination == "pypi.org" && d.source == "gated-default"),
             "{drained:?}"
         );
-        let r = answer(&gated, &query("db.svc.legion", TYPE_A))
+        let r = answer(&gated, &query("db.svc.legion", TYPE_A), false)
             .await
             .unwrap();
         assert_eq!(
@@ -800,9 +805,82 @@ mod tests {
         );
 
         let cooperative = resolver(Attachment::Host);
-        let r = answer(&cooperative, &query("pypi.org", TYPE_A))
+        let r = answer(&cooperative, &query("pypi.org", TYPE_A), false)
             .await
             .unwrap();
         assert_eq!(&r[r.len() - 4..], &[9, 9, 9, 9]);
+    }
+
+    fn plain_resolver(forwarders: Vec<SocketAddr>) -> Arc<Resolver> {
+        use crate::worker::netd::{Denials, NetPolicyCache};
+        Arc::new(Resolver {
+            spec: DnsSpec {
+                allocation_id: 4,
+                resolver: None,
+                names: BTreeMap::new(),
+                attachment: Attachment::Host,
+            },
+            context: Arc::new(ForwarderContext::new(
+                Arc::new(NetPolicyCache::new()),
+                Arc::new(Denials::new()),
+            )),
+            forwarders,
+        })
+    }
+
+    /// A node that names no resolver answers outside names `SERVFAIL` at
+    /// once, and asks nobody it was not told about.
+    #[tokio::test]
+    async fn no_host_resolver_is_servfail_not_a_public_one_test() {
+        let resolver = plain_resolver(Vec::new());
+        let r = answer(&resolver, &query("pypi.org", TYPE_A), false)
+            .await
+            .unwrap();
+        assert_eq!(r[3] & 0x0F, RCODE_SERVFAIL);
+    }
+
+    /// A truncated UDP answer goes back as it is to a UDP client (it asks
+    /// again over TCP), and is fetched again over TCP for a TCP client.
+    #[tokio::test]
+    async fn a_truncated_answer_is_refetched_over_tcp_for_a_tcp_client_test() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        // One resolver address serving a truncated UDP answer and the full
+        // answer over TCP, as a real resolver does for a large response.
+        let udp_addr = stub_resolver(Ipv4Addr::new(9, 9, 9, 9), true).await;
+        let tcp = tokio::net::TcpListener::bind(udp_addr).await.unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = tcp.accept().await {
+                let mut len = [0u8; 2];
+                if stream.read_exact(&mut len).await.is_err() {
+                    continue;
+                }
+                let mut q = vec![0u8; usize::from(u16::from_be_bytes(len))];
+                if stream.read_exact(&mut q).await.is_err() {
+                    continue;
+                }
+                let asked = parse_query(&q).unwrap();
+                let full = respond(
+                    &asked,
+                    ResponseCode::NoError,
+                    vec![RData::A(A(Ipv4Addr::new(8, 8, 4, 4)))],
+                )
+                .unwrap();
+                let mut framed = (full.len() as u16).to_be_bytes().to_vec();
+                framed.extend_from_slice(&full);
+                let _ = stream.write_all(&framed).await;
+            }
+        });
+        let resolver = plain_resolver(vec![udp_addr]);
+
+        let over_udp = answer(&resolver, &query("big.example", TYPE_A), false)
+            .await
+            .unwrap();
+        assert!(truncated(&over_udp), "a UDP client gets the TC answer");
+
+        let over_tcp = answer(&resolver, &query("big.example", TYPE_A), true)
+            .await
+            .unwrap();
+        assert!(!truncated(&over_tcp));
+        assert_eq!(&over_tcp[over_tcp.len() - 4..], &[8, 8, 4, 4]);
     }
 }
