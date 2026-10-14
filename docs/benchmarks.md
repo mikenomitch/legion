@@ -184,7 +184,7 @@ Pod watch could not reconnect. The cell has no full result.
 | ----------------- | --------------- | ----------------------------------- |
 | Legion            | pending      | pending                           |
 | Nomad 2.0.5       | 77              | 331s                                |
-| Kubernetes 1.36.5 | pending          | pendingP99                           |
+| Kubernetes 1.36.5 | pending          | pending                           |
 
 **What two changes are worth.** We ran two of the setup choices both ways
 on `web_fleet`:
