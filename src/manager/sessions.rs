@@ -1893,6 +1893,52 @@ mod sessions_test {
         assert!(to_b > 250, "b, the emptier node, took {to_b} of 400 picks");
     }
 
+    /// What one pick costs the router at each placement and fleet size: the
+    /// work done under the router's lock per session start.
+    ///
+    /// `cargo test --release --lib -- pick_cost_measure --ignored --nocapture`
+    #[test]
+    #[ignore = "measurement; prints numbers"]
+    fn pick_cost_measure() {
+        let room = |cpu: f64, memory: f64| -> BTreeMap<String, f64> {
+            BTreeMap::from([("cpu".to_string(), cpu), ("memory".to_string(), memory)])
+        };
+        let needs = room(60.0, 128.0);
+        let none = HashMap::new();
+        let mut rng = rand::thread_rng();
+        for nodes in [100usize, 1_000, 10_000, 100_000] {
+            let view = RoomView {
+                read_at: Instant::now(),
+                envelopes: (0..nodes)
+                    .map(|n| Envelope {
+                        node_id: format!("node-{n:06}"),
+                        room: room(3200.0, 6144.0),
+                    })
+                    .collect(),
+                // Half the fleet half full, so ranking has work to do.
+                used: (0..nodes)
+                    .step_by(2)
+                    .map(|n| (format!("node-{n:06}"), room(1600.0, 3072.0)))
+                    .collect(),
+            };
+            let picks = (2_000_000 / nodes).clamp(50, 200_000);
+            let time = |pick: &mut dyn FnMut() -> Option<String>| {
+                let started = Instant::now();
+                for _ in 0..picks {
+                    std::hint::black_box(pick());
+                }
+                started.elapsed().as_secs_f64() * 1e6 / picks as f64
+            };
+            let spread = time(&mut || best_node(&view, &none, &needs, &[], &mut rng));
+            let fast = time(&mut || two_choices(&view, &none, &needs, &[], &mut rng));
+            println!(
+                "{nodes:>7} nodes: spread {spread:>9.2} us/pick ({:>9.0}/s), fast {fast:>6.2} us/pick ({:>9.0}/s)",
+                1e6 / spread,
+                1e6 / fast
+            );
+        }
+    }
+
     /// Nodes with the same room left are picked at random, so managers that
     /// read the same view do not all send their next start to one node.
     #[test]
