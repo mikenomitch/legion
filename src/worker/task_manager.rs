@@ -490,6 +490,11 @@ pub(crate) fn checkpoint_info(
 /// job stop ends its sessions after this.
 pub const SESSION_ORPHAN_GRACE: std::time::Duration = std::time::Duration::from_secs(30);
 
+/// How long a session launch waits for its workload to be ready
+/// ([`crate::task_plugins::TaskPlugin::wait_ready`]) before reporting it
+/// running anyway.
+const SESSION_READY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
 /// A launch whose slow half (volume mounts, the runtime's `prepare` and
 /// `start`, which for some runtimes pulls an image) runs with the
 /// task-manager lock released.
@@ -566,7 +571,27 @@ impl UnlockedLaunch {
             task_name = %self.task.name,
             "Starting task allocation"
         );
-        plugin.start(&self.allocation, &self.task, &mut self.instance)
+        plugin.start(&self.allocation, &self.task, &mut self.instance)?;
+        // A session is `running` once its workload can take work, not once
+        // its process exists (a microVM boots for a few hundred ms after its
+        // VMM spawns). Waiting here also keeps the launch slot until then, so
+        // `edgeBoot.launchConcurrency` bounds the boots a node runs at once.
+        if self.claim_id.is_some() {
+            if let Err(err) = plugin.wait_ready(
+                &self.allocation,
+                &self.task,
+                &self.instance,
+                SESSION_READY_TIMEOUT,
+            ) {
+                warn!(
+                    allocation_id = self.allocation.id,
+                    task_name = %self.task.name,
+                    error = %err,
+                    "Session started but did not report ready; running it anyway"
+                );
+            }
+        }
+        Ok(())
     }
 
     /// The claim this launch belongs to, for a session launch.

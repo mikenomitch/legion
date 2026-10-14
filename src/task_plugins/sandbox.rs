@@ -2099,6 +2099,48 @@ impl TaskPlugin for SandboxTaskPlugin {
         Ok(())
     }
 
+    /// A microVM is ready once its guest agent accepts exec over vsock: the
+    /// generated init starts the agent's listener just before the task's
+    /// command, so this is the moment a caller can run code in the guest.
+    /// Dev backends (Apple `container`, a Linux OCI runtime) are ready when
+    /// started.
+    fn wait_ready(
+        &self,
+        allocation: &Allocation,
+        task: &TaskConfig,
+        instance: &TaskInstance,
+        timeout: std::time::Duration,
+    ) -> R<()> {
+        let config = SandboxTaskConfig::from_value(&task.config)?;
+        if !Backend::detect(config.hypervisor.as_deref())?.is_microvm() {
+            return Ok(());
+        }
+        let socket = vsock_socket_base(&work_root(allocation, instance));
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            if crate::task_plugins::vsock_exec::agent_listening(
+                &socket,
+                std::time::Duration::from_millis(100),
+            ) {
+                return Ok(());
+            }
+            if instance
+                .pid
+                .is_some_and(|pid| !crate::signals::pid_alive(pid))
+            {
+                bail!("the VMM exited before its guest's agent was listening");
+            }
+            if std::time::Instant::now() >= deadline {
+                bail!(
+                    "the guest's agent did not accept exec within {}s (is the static \
+                     legion-guest installed beside the worker?)",
+                    timeout.as_secs()
+                );
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
+
     /// A microVM is shut down **from inside**. Signalling the VMM would kill
     /// the hypervisor with the guest's page cache in it, so writes the
     /// workload made in the last ~30s would never reach its volume. Instead

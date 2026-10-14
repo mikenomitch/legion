@@ -50,6 +50,31 @@ pub fn open(vsock_socket: &Path, opts: &ExecOptions) -> R<Box<dyn ExecSession>> 
     open_on(stream, opts)
 }
 
+/// Whether the guest agent behind `vsock_socket` accepts exec connections
+/// right now: the VMM's socket answers `CONNECT 1100` with `OK`, which it
+/// does only once the agent listens. The connection is closed before any
+/// frame, which the agent treats as a session that never started.
+pub fn agent_listening(vsock_socket: &Path, timeout: Duration) -> bool {
+    let Ok(stream) = UnixStream::connect(vsock_socket) else {
+        return false;
+    };
+    if stream.set_read_timeout(Some(timeout)).is_err() {
+        return false;
+    }
+    let Ok(mut writer) = stream.try_clone() else {
+        return false;
+    };
+    if writer
+        .write_all(format!("CONNECT {EXEC_PORT}\n").as_bytes())
+        .is_err()
+    {
+        return false;
+    }
+    let mut reply = [0u8; 3];
+    let mut reader = stream;
+    reader.read_exact(&mut reply).is_ok() && &reply == b"OK "
+}
+
 /// [`open`] on an already connected host socket.
 pub fn open_on(stream: UnixStream, opts: &ExecOptions) -> R<Box<dyn ExecSession>> {
     open_within(stream, opts, HANDSHAKE_TIMEOUT)
@@ -381,6 +406,39 @@ pub(crate) mod fake_agent {
 mod vsock_exec_test {
     use super::*;
     use std::io::BufRead;
+
+    /// A VMM socket at `path` that answers one `CONNECT` with `reply`.
+    fn answering(path: &Path, reply: &'static str) {
+        let listener = std::os::unix::net::UnixListener::bind(path).unwrap();
+        std::thread::spawn(move || {
+            let (vmm, _) = listener.accept().unwrap();
+            let mut line = String::new();
+            std::io::BufReader::new(vmm.try_clone().unwrap())
+                .read_line(&mut line)
+                .unwrap();
+            assert_eq!(line, "CONNECT 1100\n");
+            let _ = (&vmm).write_all(reply.as_bytes());
+        });
+    }
+
+    #[test]
+    fn the_agent_is_listening_once_the_vmm_answers_ok_test() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("vsock.sock");
+        // No VMM socket yet: the VMM has not created it.
+        assert!(!agent_listening(&socket, Duration::from_millis(50)));
+        answering(&socket, "OK 1073741824\n");
+        assert!(agent_listening(&socket, Duration::from_secs(1)));
+    }
+
+    #[test]
+    fn a_vmm_that_refuses_the_connect_is_not_ready_test() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("vsock.sock");
+        // A guest with no listener yet: the VMM closes the connection.
+        answering(&socket, "");
+        assert!(!agent_listening(&socket, Duration::from_secs(1)));
+    }
 
     /// A VMM's host socket in miniature: answers `CONNECT 1100` with `OK`
     /// and hands the rest of the stream to the guest agent's real session

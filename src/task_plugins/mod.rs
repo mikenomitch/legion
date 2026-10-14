@@ -851,6 +851,25 @@ pub trait TaskPlugin: Send + Sync {
         Ok(())
     }
 
+    /// Wait, after [`Self::start`], until the started workload can take
+    /// work, for up to `timeout`. A session reports `running` only after
+    /// this returns (docs/session-mode.md), so a caller that waits for
+    /// `running` can use the session at once. Most runtimes are ready when
+    /// their process is, so the default returns at once; the sandbox runtime
+    /// waits for its guest's agent. An error is logged and the session runs
+    /// anyway: a guest that never becomes ready is the workload's problem to
+    /// report, not a reason to kill it.
+    fn wait_ready(
+        &self,
+        allocation: &Allocation,
+        task: &TaskConfig,
+        instance: &TaskInstance,
+        timeout: std::time::Duration,
+    ) -> R<()> {
+        let _ = (allocation, task, instance, timeout);
+        Ok(())
+    }
+
     /// What this runtime supports for exec / actions. Defaults to none, so a
     /// runtime that has not opted in fails fast and honestly (S4 in the plan).
     fn exec_support(&self) -> ExecSupport {
