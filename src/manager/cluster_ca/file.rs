@@ -155,12 +155,16 @@ impl FileCa {
         }
         match self.load(stamps.clone()) {
             Ok(loaded) => {
-                info!(
-                    cert_path = %self.cert_path.display(),
-                    anchor = %crate::cluster_tls::short_pin(&loaded.view.pin),
-                    bundle = loaded.view.bundle_pins.len(),
-                    "Loaded the cluster CA from files"
-                );
+                // A reload is news; the first load is logged by `start`, so
+                // the conformance harness's JSON on stdout stays clean.
+                if state.loaded.is_some() {
+                    info!(
+                        cert_path = %self.cert_path.display(),
+                        anchor = %crate::cluster_tls::short_pin(&loaded.view.pin),
+                        bundle = loaded.view.bundle_pins.len(),
+                        "Reloaded the cluster CA from changed files"
+                    );
+                }
                 super::count_call(CLUSTER_CA_FILE, "load", "ok");
                 let result = (loaded.view.clone(), loaded.signer.clone());
                 state.loaded = Some(loaded);
@@ -278,7 +282,13 @@ impl ClusterCaProvider for FileCa {
     }
 
     fn start(&self) -> R<()> {
-        self.current(true).map_err(|err| anyhow!("{err}"))?;
+        let (view, _) = self.current(true).map_err(|err| anyhow!("{err}"))?;
+        info!(
+            cert_path = %self.cert_path.display(),
+            anchor = %crate::cluster_tls::short_pin(&view.pin),
+            bundle = view.bundle_pins.len(),
+            "Loaded the cluster CA from files"
+        );
         Ok(())
     }
 }
