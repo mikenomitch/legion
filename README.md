@@ -57,8 +57,8 @@ still be happy with at fifty thousand nodes.
 
 Legion is considerably faster than other schedulers.
 
-On the same AWS hardware and disks, Legion placed work about 3.5X to 7.5X
-faster than K8s and Nomad at 1,000-2,000 nodes, and about 22X to 35X faster
+On the same AWS hardware and disks, Legion placed work about 7X to 13X
+faster than K8s and Nomad at 1,000-2,000 nodes, and about 18X to 52X faster
 at 5,000-10,000 nodes (see our [benchmarks](docs/benchmarks.md) for
 details).
 

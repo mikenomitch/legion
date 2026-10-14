@@ -16,10 +16,12 @@ the comparison fair.
   placed 829 allocations/sec at 1k nodes and 553/sec at 20k, and completed
   a 250,000-allocation burst on a 50,000-node fleet.
 - **Many times Nomad and Kubernetes on the same rig.** With all three
-  systems' stores on the same local NVMe, Legion placed 3.5-7.5x the
-  allocations/sec of Nomad and Kubernetes at 1k-2k nodes and 22-35x at
-  5k-10k. Both competitors are CPU-bound on one control-plane box from 5k
-  nodes up, not disk-bound.
+  systems' stores on the same local NVMe, Legion placed 7-13x the
+  allocations/sec of Nomad and Kubernetes at 1k-2k nodes and 18-52x at
+  5k-10k. These multiples use the current release, with `RunJob` off the
+  async runtime (see [below](#compared-with-nomad-and-kubernetes)). Both
+  competitors are CPU-bound on one control-plane box from 5k nodes up, not
+  disk-bound.
 - **Millisecond latency below saturation.** Submitted at a steady rate,
   allocations land in about 20ms at the median and under 300ms at p99,
   even on a 20,000-node fleet.
@@ -128,7 +130,8 @@ submits through its own API. Legion is built from `main` at `89229706`.
 | 10,000 | **635**   | 27          | 18                |
 
 Each number is one run, so the multiple depends on which fleet size you
-quote: Legion leads by 3.5-7.5x at 1k-2k nodes and 22-35x at 5k-10k. Its
+quote: in this table, measured before the `RunJob` change described below,
+Legion leads by 3.5-7.5x at 1k-2k nodes and 22-35x at 5k-10k. Its
 peak at 5k is not a single outlier. A repeat of that cell placed
 1,151/sec, the fixed-heartbeat ablation below placed 1,134/sec, and the
 earlier build also peaked at 5k (905/sec, against 738 at 10k). Repeats of
@@ -231,8 +234,8 @@ The `web_fleet` 5k cell is the exception: it placed 968/sec against two
 `main` runs of 1,175 and 1,151, even though its p99 fell from 25s to 17.5s.
 We have not yet found why. A single submit also waits longer, about
 140-225ms instead of 40-125ms in local runs, because it now queues in the
-coalescer's batch. The comparison tables and multiples above use the
-`main` numbers.
+coalescer's batch. The comparison tables above were measured before this change. The
+multiples in the Highlights use the build with it.
 
 **Submitting through the CLI.** As a control in the earlier run, we also
 ran `web_fleet` at 5k nodes with every system submitting one CLI process
