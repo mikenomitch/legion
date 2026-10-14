@@ -2755,7 +2755,9 @@ impl WorkerTaskManager {
                     remove_dirs,
                 },
             );
-            self.persist_state();
+            if self.persists(allocation_id) {
+                self.persist_state();
+            }
             return;
         }
 
@@ -2865,7 +2867,19 @@ impl WorkerTaskManager {
             self.volume_specs.remove(&allocation_id);
             self.cleanup_alloc_dir(allocation_id);
         }
-        self.persist_state();
+        if self.persists(allocation_id) {
+            self.persist_state();
+        }
+    }
+
+    /// Whether `allocation_id` is ever written to the worker's state file.
+    /// A claim runs under a negative local key, and one that ended
+    /// unratified (an unnamed session, an edge start that was refused) never
+    /// is: it is not in the file, so its stop and teardown leave the file as
+    /// it was. Rewriting it there cost two state writes, each with every
+    /// allocation and an fsync, under this lock, per session stop.
+    fn persists(&self, allocation_id: i64) -> bool {
+        allocation_id >= 0 || self.claims.by_local_key(allocation_id).is_some()
     }
 
     /// Hand over every task this worker is running or still stopping, for
@@ -5376,6 +5390,11 @@ impl WorkerTaskManager {
             let Some(pid) = instance.pid else {
                 continue;
             };
+            // An ended unratified claim was never written, and a restarted
+            // worker has nothing of it to finish (see `persists`).
+            if !self.persists(allocation_id) {
+                continue;
+            }
             records.push(PersistedAllocation {
                 allocation: allocation.clone(),
                 task: task.clone(),
@@ -7593,9 +7612,10 @@ mod tests {
 
     /// Session durability plan §6.1: a session's runtime calls run with the
     /// task-manager lock released, so a node's session starts overlap, and
-    /// a session start never rewrites the worker's state file.
+    /// neither a session's start nor its stop rewrites the worker's state
+    /// file.
     #[test]
-    fn session_starts_launch_off_the_lock_and_skip_the_state_file_test() -> R<()> {
+    fn sessions_launch_off_the_lock_and_skip_the_state_file_test() -> R<()> {
         let temp_dir = TempDir::new()?;
         let manager = Arc::new(Mutex::new(manager_in(&temp_dir)));
         manager
@@ -7655,10 +7675,18 @@ mod tests {
             before,
             "a session start must not rewrite the worker state file"
         );
-        let mut guard = manager.lock().expect("task manager");
-        for claim in &claims {
-            guard.kill_claim(&claim.claim_id, "test over");
+        // Ending them does not rewrite it either: a session was never in it.
+        {
+            let mut guard = manager.lock().expect("task manager");
+            for claim in &claims {
+                guard.kill_claim(&claim.claim_id, "test over");
+            }
         }
+        assert_eq!(
+            std::fs::read(&state_file).ok(),
+            before,
+            "a session stop must not rewrite the worker state file"
+        );
         Ok(())
     }
 
