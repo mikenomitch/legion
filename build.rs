@@ -80,7 +80,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             cmd.env("LEGION_SKIP_PLUGIN_BUILD", "1");
                             cmd.env("CARGO_TARGET_DIR", plugin_target_dir);
                             cmd.current_dir(path);
-                            cmd.spawn().unwrap().wait().unwrap();
+                            // A failed plugin build used to vanish here, and the
+                            // first sign was a deploy with no plugin dylibs.
+                            let status = cmd.spawn().unwrap().wait().unwrap();
+                            if !status.success() {
+                                println!(
+                                    "cargo:warning=plugin {} failed to build ({status})",
+                                    entry.path().display()
+                                );
+                            }
                         }
                     }
                 }),
