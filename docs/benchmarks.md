@@ -129,9 +129,9 @@ submits through its own API. Legion is built from `main` at `89229706`.
 
 Each number is one run, so the multiple depends on which fleet size you
 quote: Legion leads by 3.5-7.5x at 1k-2k nodes and 22-35x at 5k-10k. Its
-peak at 5k is not a single outlier. The fixed-heartbeat ablation below
-reran that cell at 1,134/sec, and the earlier build also peaked at 5k
-(905/sec, against 738 at 10k).
+peak at 5k is not a single outlier. A repeat of that cell placed
+1,151/sec, the fixed-heartbeat ablation below placed 1,134/sec, and the
+earlier build also peaked at 5k (905/sec, against 738 at 10k).
 
 Nomad's 1k-5k cells are a rerun with Prometheus scraping every 15 seconds.
 At 5 seconds the scrape cost its leader enough CPU to read 188, 102, and
@@ -171,7 +171,7 @@ disk. Both are out of CPU on one control-plane box:
 | 5                    | 25,000      | **2,350**    | 78          | 69                |
 | 10                   | 50,000      | **2,025**    | 83          | 46                |
 | 20                   | 100,000     | **2,466**    | 77          | 25                |
-| 40                   | 200,000     | pending | 81          | 30, then failed   |
+| 40                   | 200,000     | **2,139**    | 81          | 30, then failed   |
 
 At 40 allocations per node, Kubernetes placed about 12,000 Pods at
 30/sec over six minutes. Then the API server on the box running the
@@ -182,7 +182,7 @@ Pod watch could not reconnect. The cell has no full result.
 
 | System            | Allocations/sec | p99: time to place 99% of the burst |
 | ----------------- | --------------- | ----------------------------------- |
-| Legion            | pending      | pending                           |
+| Legion            | **1,248**       | 11.4s                               |
 | Nomad 2.0.5       | 77              | 331s                                |
 | Kubernetes 1.36.5 | 61              | 405s                                |
 
