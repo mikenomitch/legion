@@ -236,7 +236,11 @@ See [adaptive-scheduler-concurrency.md](adaptive-scheduler-concurrency.md).
   claimed eval, from handing it to the blocking pool to its outcome.
   Throughput is roughly `evalThreads` divided by this. The difference from
   the plan's `total` is everything an eval does outside `plan_and_apply`,
-  which `legion_eval_phase_seconds` breaks down.
+  which `legion_eval_phase_seconds` breaks down. Handle time well above the
+  sum of the phases means the eval worker waited for a tokio worker to
+  resume on after its handler finished: blocking gRPC handlers are holding
+  the runtime (see
+  [Diagnosing a manager throughput ceiling](#diagnosing-a-manager-throughput-ceiling)).
 - **`legion_eval_phase_seconds{kind, phase}`** (histogram): where one eval's
   handler time goes.
   - `queue_wait`: the wait for a blocking-pool thread, recorded for every

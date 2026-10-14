@@ -2341,6 +2341,65 @@ impl ManagerDaemonService {
         })
     }
 
+    /// `RunJob` after its ACL gate: the idempotency check, the submit, and
+    /// the idempotency record. Blocking, so the handler runs it through
+    /// [`run_blocking_admission`].
+    fn run_job_blocking(
+        &self,
+        identity: &AclIdentity,
+        inner: RunJobRequest,
+    ) -> Result<Response<RunJobReply>, Status> {
+        let js = inner.parsed_jobspec;
+        let subs = inner.submissions;
+        let priority = inner.priority;
+        let idempotency_key =
+            scoped_idempotency_key(identity, "run_job", inner.idempotency_key.as_deref());
+
+        if let Some(message) = self
+            .store
+            .idempotency_lookup(&idempotency_key)
+            .map_err(|e| map_store_error("Error checking idempotency", e))?
+        {
+            return Ok(Response::new(RunJobReply {
+                message,
+                deduplicated: true,
+            }));
+        }
+
+        let submitted =
+            self.submit_rendered_job(identity, &js, subs, priority, inner.force_reschedule, None)?;
+
+        let message = submitted.message_with_warnings();
+        // The lookup above only catches a duplicate that arrived after the
+        // first one recorded. Two submits carrying the same key CONCURRENTLY
+        // both miss it, and the record is `INSERT OR IGNORE` — so the loser
+        // learns it lost here, and must say so. Reporting `deduplicated:
+        // false` to both would tell a retrying agent it created two
+        // submissions when the key exists precisely to promise it did not.
+        // (Submitting the same spec twice is itself harmless — the second
+        // resolves to `Unchanged` — so the loser is corrected, not failed.)
+        let first = self
+            .store
+            .idempotency_record(&idempotency_key, "run_job", &message)
+            .map_err(|e| map_store_error("Error recording idempotency", e))?;
+        let (message, deduplicated) = if first {
+            (message, false)
+        } else {
+            // The winner's recorded response is the authoritative one, and
+            // is what a later retry of this key would be handed.
+            let recorded = self
+                .store
+                .idempotency_lookup(&idempotency_key)
+                .map_err(|e| map_store_error("Error checking idempotency", e))?;
+            (recorded.unwrap_or(message), true)
+        };
+
+        Ok(Response::new(RunJobReply {
+            message,
+            deduplicated,
+        }))
+    }
+
     /// The node OS a task's `auto` is explained against when no placement is
     /// in hand (`net policy show` and `test`): Linux when any node in the
     /// cluster runs Linux, which is where an unset container mode is gated
@@ -3919,55 +3978,16 @@ impl Manager for ManagerDaemonService {
             AclScope::any(),
         )?;
         let inner = request.into_inner();
-        let js = inner.parsed_jobspec;
-        let subs = inner.submissions;
-        let priority = inner.priority;
-        let idempotency_key =
-            scoped_idempotency_key(&identity, "run_job", inner.idempotency_key.as_deref());
-
-        if let Some(message) = self
-            .store
-            .idempotency_lookup(&idempotency_key)
-            .map_err(|e| map_store_error("Error checking idempotency", e))?
-        {
-            return Ok(Response::new(RunJobReply {
-                message,
-                deduplicated: true,
-            }));
-        }
-
-        let submitted =
-            self.submit_rendered_job(&identity, &js, subs, priority, inner.force_reschedule, None)?;
-
-        let message = submitted.message_with_warnings();
-        // The lookup above only catches a duplicate that arrived after the
-        // first one recorded. Two submits carrying the same key CONCURRENTLY
-        // both miss it, and the record is `INSERT OR IGNORE` — so the loser
-        // learns it lost here, and must say so. Reporting `deduplicated:
-        // false` to both would tell a retrying agent it created two
-        // submissions when the key exists precisely to promise it did not.
-        // (Submitting the same spec twice is itself harmless — the second
-        // resolves to `Unchanged` — so the loser is corrected, not failed.)
-        let first = self
-            .store
-            .idempotency_record(&idempotency_key, "run_job", &message)
-            .map_err(|e| map_store_error("Error recording idempotency", e))?;
-        let (message, deduplicated) = if first {
-            (message, false)
-        } else {
-            // The winner's recorded response is the authoritative one, and
-            // is what a later retry of this key would be handed.
-            let recorded = self
-                .store
-                .idempotency_lookup(&idempotency_key)
-                .map_err(|e| map_store_error("Error checking idempotency", e))?;
-            (recorded.unwrap_or(message), true)
-        };
-
-        Ok(Response::new(RunJobReply {
-            message,
-            deduplicated,
-        }))
+        // Off the runtime, like `heartbeat`. `run_job_blocking` is
+        // synchronous and a submit is a chain of quorum writes (the job
+        // config, its status clears, KV references, the eval enqueue, the
+        // idempotency record), so run inline it parks a tokio worker for the
+        // whole chain.
+        // A burst of submits then holds every worker, and each eval worker's
+        // `spawn_blocking` await waits behind them for a thread to resume
+        // on: measured on the AWS rig as 14-78ms per eval outside every
+        // instrumented phase, about as long again as the plan itself.
+        run_blocking_admission(|| self.run_job_blocking(&identity, inner))
     }
 
     #[instrument(skip_all)]
@@ -4277,33 +4297,39 @@ impl Manager for ManagerDaemonService {
             version: template.version,
         };
 
-        let submitted = self.submit_rendered_job(
-            &identity,
-            &rendered,
-            subs,
-            priority,
-            inner.force_reschedule,
-            Some(&provenance),
-        )?;
-        info!(
-            template = %template.name,
-            version = template.version,
-            job = %submitted.job_name,
-            "job submitted from template"
-        );
+        // Off the runtime for the same reason as `run_job`: the submit and
+        // the idempotency record are blocking quorum writes.
+        let submitted = run_blocking_admission(|| {
+            let submitted = self.submit_rendered_job(
+                &identity,
+                &rendered,
+                subs,
+                priority,
+                inner.force_reschedule,
+                Some(&provenance),
+            )?;
+            info!(
+                template = %template.name,
+                version = template.version,
+                job = %submitted.job_name,
+                "job submitted from template"
+            );
 
-        let record = TemplateRunRecord {
-            message: submitted.message_with_warnings(),
-            job_name: submitted.job_name.clone(),
-            job_config_id: submitted.job_config_id.clone(),
-        };
-        self.store
-            .idempotency_record(
-                &idempotency_key,
-                "run_job_template",
-                &serde_json::to_string(&record).unwrap_or_else(|_| submitted.message.to_string()),
-            )
-            .map_err(|e| map_store_error("Error recording idempotency", e))?;
+            let record = TemplateRunRecord {
+                message: submitted.message_with_warnings(),
+                job_name: submitted.job_name.clone(),
+                job_config_id: submitted.job_config_id.clone(),
+            };
+            self.store
+                .idempotency_record(
+                    &idempotency_key,
+                    "run_job_template",
+                    &serde_json::to_string(&record)
+                        .unwrap_or_else(|_| submitted.message.to_string()),
+                )
+                .map_err(|e| map_store_error("Error recording idempotency", e))?;
+            Ok::<_, Status>(submitted)
+        })?;
 
         Ok(Response::new(RunJobTemplateReply {
             message: submitted.message.into(),
@@ -11934,7 +11960,8 @@ fn template_eval_status(err: anyhow::Error) -> Status {
 }
 
 /// Runs blocking admission work (artifact pin resolution can reach
-/// registries) without stalling the async runtime where possible.
+/// registries, and a job submit is a chain of quorum writes) without
+/// stalling the async runtime where possible.
 /// `block_in_place` needs the multi-thread runtime; current-thread callers
 /// (tests) run inline.
 fn run_blocking_admission<T>(work: impl FnOnce() -> T) -> T {
@@ -18131,6 +18158,57 @@ mod tests {
             }],
         );
         assert_eq!(retry, vec![998]);
+        Ok(())
+    }
+
+    /// Blocking admission work must not hold a runtime worker. With ONE
+    /// worker, a task spawned while the work runs is still polled: inline,
+    /// the only worker would sit in the `recv_timeout` and the task would
+    /// never run. This is what keeps a burst of `RunJob`s from starving the
+    /// eval workers and heartbeats that share the runtime.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn blocking_admission_work_leaves_the_runtime_worker_free() {
+        let polled = tokio::spawn(async {
+            run_blocking_admission(|| {
+                let (tx, rx) = std::sync::mpsc::channel();
+                tokio::spawn(async move {
+                    let _ = tx.send(());
+                });
+                rx.recv_timeout(Duration::from_secs(5)).is_ok()
+            })
+        })
+        .await
+        .expect("blocking task");
+        assert!(
+            polled,
+            "a task spawned during blocking admission work never ran"
+        );
+    }
+
+    /// `RunJob` on the multi-thread runtime, where its submit runs under
+    /// `block_in_place` rather than inline as on the test runtime.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn run_job_submits_on_the_multi_thread_runtime() -> R<()> {
+        let store = setup_store()?;
+        let manager = ManagerDaemonService::new(store.clone());
+        insert_node(&store, "node-a")?;
+        let reply = manager
+            .run_job(Request::new(RunJobRequest {
+                parsed_jobspec: json!({
+                    "name": "off-runtime",
+                    "task": { "runtime": "exec", "config": { "command": ["true"] } }
+                })
+                .to_string(),
+                submissions: vec![submission()],
+                priority: None,
+                force_reschedule: false,
+                idempotency_key: Some("off-runtime-1".into()),
+            }))
+            .await?
+            .into_inner();
+        assert!(!reply.deduplicated);
+        assert_eq!(store.get_job_config("off-runtime")?.name, "off-runtime");
+        assert_eq!(evals_of_kind(&store, "off-runtime", "job_submit")?, 1);
         Ok(())
     }
 

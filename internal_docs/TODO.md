@@ -622,6 +622,42 @@ How to use it:
       736 / 322 / ~85 before. Eval `queue_wait` is now ~0.3 ms, so the
       blocking-pool contention is gone. Public numbers in
       [docs/benchmarks.md](../docs/benchmarks.md).
+- [x] **`RunJob` no longer parks tokio workers (local; AWS retest
+      pending).** The submit is a chain of quorum writes, and `RunJob` ran
+      it inline on a runtime worker, the same mistake the heartbeat offload
+      fixed. With 128 submits in flight on a 4-vCPU leader, every worker sat
+      in a commit, so each eval worker's `spawn_blocking` await waited for a
+      thread to resume on. The archived 2026-10-10 cells show it as eval
+      handle time outside every phase: 14 ms at 1k nodes, 16 ms at 5k, and
+      60-78 ms at 10k while submits were in flight, against a 12-22 ms plan.
+      Heartbeat p99 rose from ~2 ms to 145-900 ms in the same windows. Now
+      `RunJob` and `RunJobTemplate` run the submit under `block_in_place`
+      (`run_blocking_admission`). On a local 3-voter `lanes` cluster with 4
+      runtime workers per manager, alternating builds: 1k nodes 514 / 478 /
+      661 → 1,159 / 964 / 1,160 alloc/s, 5k nodes 714 / 503 → 860 / 1,049.
+      Eval handle time now matches the plan phase, the `job_submit`
+      coalescer batches ~16 instead of ~1.1, and `RunJob` latency rises
+      (40-125 → 140-225 ms) because submits now queue in the coalescer
+      instead of in front of the runtime. Rerun `web_fleet` on AWS to
+      confirm.
+- [ ] **Other mutating handlers still commit on a runtime worker.**
+      `StopJob`, `DestroyJob`, the KV writes, and most other mutating RPCs
+      call the store inline like `RunJob` did. None of them is hot in a
+      benchmark today, but a burst of any of them starves the eval loop and
+      heartbeats the same way. Move them behind `run_blocking_admission`
+      or `spawn_blocking` as they show up.
+- [ ] **`legion_runtime_spawn_delay_seconds` can't see the starvation it
+      exists for.** The probe spawns its task from a task already running on
+      a worker, so the probe lands in that worker's LIFO slot and is polled
+      as soon as the spawner yields. It read under 50 µs throughout local
+      runs where heartbeats averaged 90 ms. The delay that matters is the
+      ticker task's own wake. Measure from the tick's deadline instead
+      (`src/manager/telemetry.rs`, `start_runtime_probe`).
+- [ ] **The AWS driver no longer parses `legion events follow -j`.** Event
+      JSON keys went camelCase (`jobId`, `metadataJson`), and
+      `parse_legion_event` in `benchmarks/aws/driver/driver.py` still reads
+      `job_id` / `metadata_json`, so a cell on a current build counts 0
+      placements and stalls. Accept both spellings, and add a fixture.
 - [ ] **The rig's plan phase is ~25x the micro-bench.** On AWS
       `legion_eval_phase_seconds{phase="plan"}` averages 26 ms per
       `job_submit` eval at 20k nodes and 45 ms at 50k, against ~1 ms for
