@@ -349,15 +349,15 @@ impl SessionIndex {
                 }
             }
         }
-        // Stops stand until the node stops listing the session.
-        let listed: HashSet<String> = inner
-            .nodes
-            .get(node_id)
-            .map(|node| node.sessions.keys().cloned().collect())
-            .unwrap_or_default();
-        let stop = match inner.stops.get_mut(node_id) {
+        // Stops stand until the node stops listing the session. Checked per
+        // stop against the node's own map: every heartbeat of every node
+        // lands here under the write lock, and almost none carry a stop, so
+        // this must cost O(stops), not O(sessions on the node).
+        let Inner { nodes, stops, .. } = &mut *inner;
+        let stop = match stops.get_mut(node_id) {
             Some(stops) => {
-                stops.retain(|id| listed.contains(id));
+                let listed = nodes.get(node_id).map(|node| &node.sessions);
+                stops.retain(|id| listed.is_some_and(|sessions| sessions.contains_key(id)));
                 let mut stop: Vec<String> = stops.iter().cloned().collect();
                 stop.sort();
                 stop
