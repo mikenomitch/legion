@@ -168,9 +168,9 @@ disk. Both are out of CPU on one control-plane box:
 
 | Allocations per node | Allocations | Legion       | Nomad 2.0.5 | Kubernetes 1.36.5 |
 | -------------------- | ----------- | ------------ | ----------- | ----------------- |
-| 5                    | 25,000      | pending  | 78          | 69                |
-| 10                   | 50,000      | pending | 83          | 46                |
-| 20                   | 100,000     | pending | 77          | 25                |
+| 5                    | 25,000      | **2,350**    | 78          | 69                |
+| 10                   | 50,000      | **2,025**    | 83          | 46                |
+| 20                   | 100,000     | **2,466**    | 77          | 25                |
 | 40                   | 200,000     | pending | 81          | 30, then failed   |
 
 At 40 allocations per node, Kubernetes placed about 12,000 Pods at
@@ -184,7 +184,7 @@ Pod watch could not reconnect. The cell has no full result.
 | ----------------- | --------------- | ----------------------------------- |
 | Legion            | pending      | pending                           |
 | Nomad 2.0.5       | 77              | 331s                                |
-| Kubernetes 1.36.5 | pending          | pending                           |
+| Kubernetes 1.36.5 | 61              | 405s                                |
 
 **What two changes are worth.** We ran two of the setup choices both ways
 on `web_fleet`:
