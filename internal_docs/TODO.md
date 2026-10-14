@@ -4132,9 +4132,15 @@ Deferred from [operator-ui-gaps-plan.md](plans/operator-ui-gaps-plan.md):
         ([upgrades.md](../docs/upgrades.md#restarting-a-worker-in-place)).
         Running the listeners in a process that outlives the worker would
         remove the limitation.
-  - [ ] **Stopping the macOS manager leaves its Apple containers running.**
-        SIGTERM to `legion start manager --run-worker` exits without tearing
-        down the containers it started.
+  - [ ] **Orphaned Apple containers are never reaped.** A container labeled
+        `legion.node=<this node>` whose allocation no longer exists (left by
+        a crash, or by a stop from before the macOS shutdown fix) keeps
+        running and holds its published ports, so a new allocation of the
+        same job cannot bind them and its start fails. The start path only
+        removes a stale container for its own allocation id. Sweep this
+        node's labeled containers at worker start against the allocations it
+        restores. Apple `container stop` and `container kill` can both hang
+        on such a container; `container system stop` / `start` clears it.
   - [ ] **The CLI writes its tracing to stdout and logs into the working
         directory.** One-shot commands print `info`/`warn` events in the
         pretty ANSI format on stdout, where they mix with `--json` output,
@@ -5663,7 +5669,13 @@ Bug fixes, no plan. Uncommitted at the time of writing.
       manager's drain
       ([task-runtime-container.md](../docs/task-runtime-container.md#stopping-a-single-process-cluster-macos),
       [calls](calls/launch-spot-check-fixes-plan_calls.md#65-the-macos-in-process-worker-stops-its-tasks-on-a-clean-shutdown-and-the-next-start-runs-them-again)).
-      *Unit-tested; not yet re-run on a Mac.*
+      A run on a Mac found two follow-ups, now fixed: the hard teardown ran a
+      second `container stop`, which queued behind the first and outlasted
+      the budget (it is `container kill --signal SIGKILL` once the grace
+      window is spent), and the draining manager kept its node checker and
+      eval loop running, so it marked its own worker lost and removed the
+      allocations the next start should run (the loops stop when the drain
+      starts).
 
 ## Architecture audit (2026-10-09)
 

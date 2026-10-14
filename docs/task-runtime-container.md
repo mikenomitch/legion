@@ -510,8 +510,12 @@ running after the cluster stopped only holds memory for work nothing manages.
 On the signal, the in-process worker first checkpoints sessions that ask for
 it (`suspend.onWorkerStop`), then stops every task at once the way a
 `job stop` would: the task's `stop.signal`, its `stop.killAfter` to exit,
-then `container stop` by name. The whole step is capped at 30 seconds. The
-manager waits for it before it exits. A second signal exits at once.
+then `container kill --signal SIGKILL` by name for anything still running.
+(A second `container stop` would queue behind the first and could outlast the
+budget.) The whole step is capped at 30 seconds. The manager stops its own
+scheduling loops as soon as it starts draining, so it never marks its
+in-process worker lost or reschedules the tasks being stopped. It waits for
+the worker before it exits. A second signal exits at once.
 
 The worker keeps its record of the stopped tasks, and the manager still wants
 them. The next `legion start manager --run-worker` finds their processes gone

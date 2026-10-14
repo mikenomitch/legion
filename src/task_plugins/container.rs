@@ -844,6 +844,59 @@ fn build_exec_command(
 /// layout (which `destroy` may already have removed).
 const IMAGE_STOP_SIGNAL_KEY: &str = "imageStopSignal";
 
+/// Set on an Apple container's instance once `stop_with` has started its own
+/// `container stop`, so the hard teardown that follows the grace window
+/// kills instead of starting a second `container stop`. A second stop queues
+/// behind the first and can outlast a shutdown's budget.
+const APPLE_STOP_SIGNALLED_KEY: &str = "appleStopSignalled";
+
+fn mark_instance_state(instance: &mut TaskInstance, key: &str, value: Value) {
+    match instance.state.as_object_mut() {
+        Some(state) => {
+            state.insert(key.into(), value);
+        }
+        None => instance.state = json!({ key: value }),
+    }
+}
+
+/// The command that tears a container down by name after its launching CLI
+/// is stopped, and how long it may take.
+///
+/// - Apple, after `stop_with` already ran `container stop` (`signalled`):
+///   `container kill --signal SIGKILL`. The workload had its grace window,
+///   and a second `container stop` queues behind the first.
+/// - Apple otherwise: `container stop`, so the workload gets a chance to
+///   shut down; `--rm` then reaps it.
+/// - OCI runtimes: `<runtime> delete --force`.
+fn teardown_command(
+    oci_runtime: &ContainerRuntime,
+    name: &str,
+    signalled: bool,
+) -> (String, Vec<String>, std::time::Duration) {
+    match oci_runtime {
+        ContainerRuntime::AppleContainer if signalled => (
+            APPLE_CONTAINER_BIN.to_string(),
+            vec![
+                "kill".into(),
+                "--signal".into(),
+                "SIGKILL".into(),
+                name.into(),
+            ],
+            crate::util::RUNTIME_CLI_TIMEOUT,
+        ),
+        ContainerRuntime::AppleContainer => (
+            APPLE_CONTAINER_BIN.to_string(),
+            vec!["stop".into(), name.into()],
+            apple_container::STOP_TIMEOUT,
+        ),
+        ContainerRuntime::Oci { binary } => (
+            binary.clone(),
+            vec!["delete".into(), "--force".into(), name.into()],
+            crate::util::RUNTIME_CLI_TIMEOUT,
+        ),
+    }
+}
+
 /// The signal to deliver when stopping this container, docker's default
 /// chain: the jobspec's `stop.signal`, else the image config's `StopSignal`,
 /// else `SIGTERM`.
@@ -1296,13 +1349,7 @@ impl TaskPlugin for ContainerTaskPlugin {
                 // needs it (`destroy` removes the scratch tree) and it is the
                 // middle layer of the stop-signal default chain.
                 if let Some(signal) = built.stop_signal {
-                    let signal = Value::String(signal);
-                    match instance.state.as_object_mut() {
-                        Some(state) => {
-                            state.insert(IMAGE_STOP_SIGNAL_KEY.into(), signal);
-                        }
-                        None => instance.state = json!({ IMAGE_STOP_SIGNAL_KEY: signal }),
-                    }
+                    mark_instance_state(instance, IMAGE_STOP_SIGNAL_KEY, Value::String(signal));
                 }
 
                 info!(
@@ -1407,7 +1454,12 @@ impl TaskPlugin for ContainerTaskPlugin {
             .stderr(std::process::Stdio::null())
             .spawn()
         {
-            Ok(_child) => Ok(true),
+            Ok(_child) => {
+                if matches!(oci_runtime, ContainerRuntime::AppleContainer) {
+                    mark_instance_state(instance, APPLE_STOP_SIGNALLED_KEY, Value::Bool(true));
+                }
+                Ok(true)
+            }
             Err(err) => {
                 warn!(
                     allocation_id = allocation.id,
@@ -1433,31 +1485,24 @@ impl TaskPlugin for ContainerTaskPlugin {
         // deleted container is gone, which is success.
         if let Ok(oci_runtime) = ContainerRuntime::detect() {
             let name = container_name(&oci_runtime, allocation);
-            let (program, args, timeout): (&str, Vec<&str>, _) = match &oci_runtime {
-                // `stop` signals the container's init and waits, so the
-                // workload gets a chance to shut down; `--rm` then reaps it.
-                ContainerRuntime::AppleContainer => (
-                    APPLE_CONTAINER_BIN,
-                    vec!["stop", &name],
-                    apple_container::STOP_TIMEOUT,
-                ),
-                ContainerRuntime::Oci { binary } => (
-                    binary.as_str(),
-                    vec!["delete", "--force", &name],
-                    crate::util::RUNTIME_CLI_TIMEOUT,
-                ),
-            };
+            let signalled = instance
+                .state
+                .get(APPLE_STOP_SIGNALLED_KEY)
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            let (program, args, timeout) = teardown_command(&oci_runtime, &name, signalled);
+            let args: Vec<&str> = args.iter().map(String::as_str).collect();
             info!(
                 allocation_id = allocation.id,
                 task_name = %task.name,
-                oci_runtime = program,
+                oci_runtime = program.as_str(),
                 "Tearing down container by name"
             );
             // Bounded: `stop` runs under the worker's task-manager lock
             // (destroy on reconcile), and a hung runtime must not hold it.
             // The reap below kills the launching CLI either way.
             if let Err(err) =
-                crate::util::output_with_timeout(Command::new(program).args(&args), timeout)
+                crate::util::output_with_timeout(Command::new(&program).args(&args), timeout)
             {
                 warn!(
                     allocation_id = allocation.id,
@@ -2444,6 +2489,41 @@ mod tests {
     /// The Apple arm keeps its own dialect: `--interactive` alongside
     /// `--tty`, no `--` separator (the parser would read it as the target
     /// executable), and caller env is not forwarded.
+    #[test]
+    fn a_signalled_apple_container_is_killed_not_stopped_twice() {
+        let apple = ContainerRuntime::AppleContainer;
+        let (program, args, timeout) = teardown_command(&apple, "legion-n1-7", true);
+        assert_eq!(program, APPLE_CONTAINER_BIN);
+        assert_eq!(args, vec!["kill", "--signal", "SIGKILL", "legion-n1-7"]);
+        assert_eq!(timeout, crate::util::RUNTIME_CLI_TIMEOUT);
+
+        let (_, args, timeout) = teardown_command(&apple, "legion-n1-7", false);
+        assert_eq!(args, vec!["stop", "legion-n1-7"]);
+        assert_eq!(timeout, apple_container::STOP_TIMEOUT);
+
+        let runc = ContainerRuntime::Oci {
+            binary: "runc".into(),
+        };
+        let (program, args, _) = teardown_command(&runc, "legion-7", true);
+        assert_eq!(program, "runc");
+        assert_eq!(args, vec!["delete", "--force", "legion-7"]);
+    }
+
+    #[test]
+    fn instance_state_marks_merge_into_existing_state() {
+        let mut instance = TaskInstance {
+            state: json!({ IMAGE_STOP_SIGNAL_KEY: "SIGQUIT" }),
+            ..Default::default()
+        };
+        mark_instance_state(&mut instance, APPLE_STOP_SIGNALLED_KEY, Value::Bool(true));
+        assert_eq!(instance.state[IMAGE_STOP_SIGNAL_KEY], "SIGQUIT");
+        assert_eq!(instance.state[APPLE_STOP_SIGNALLED_KEY], true);
+
+        let mut fresh = TaskInstance::default();
+        mark_instance_state(&mut fresh, APPLE_STOP_SIGNALLED_KEY, Value::Bool(true));
+        assert_eq!(fresh.state[APPLE_STOP_SIGNALLED_KEY], true);
+    }
+
     #[test]
     fn apple_exec_argv_is_unchanged() {
         let env = std::collections::BTreeMap::from([("TERM".to_string(), "xterm".to_string())]);

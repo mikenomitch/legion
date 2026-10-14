@@ -799,6 +799,11 @@ pub async fn run_manager_with(
     // signal skips the rest.
     info!(signal, "Manager shutdown requested; draining");
     let _ = stop_serving_tx.send(());
+    // Stop the leader loops first. A draining manager must not keep acting
+    // on the cluster: its node checker would otherwise mark the in-process
+    // worker lost while that worker stops its tasks, and the eval loop would
+    // reschedule (remove) every allocation the next start should run again.
+    background.abort();
     tokio::select! {
         drained = tokio::time::timeout(SHUTDOWN_DRAIN_TIMEOUT, &mut start_server_fut) => {
             if drained.is_err() {

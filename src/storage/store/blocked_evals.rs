@@ -416,6 +416,15 @@ impl Store {
             self.replicated(Lane::Scheduler, "unblock_evals", move |s| {
                 s.unblock_evals_apply(wakes)
             })?;
+            // Wake a parked eval worker per eval made claimable. The raft
+            // projection does this for committed changesets, but a local
+            // store has no projection, and without it the workers sleep out
+            // their park (up to five minutes) with ready work in the queue:
+            // a fresh `--run-worker` cluster sat idle after its node joined.
+            // An extra wake in raft mode is harmless (the worker re-checks).
+            for _ in 0..woken.len() {
+                self.eval_notify.notify_one();
+            }
             let now = OffsetDateTime::now_utc();
             let metrics = crate::manager::telemetry::metrics();
             for (eval, node_id, cause) in &woken {
