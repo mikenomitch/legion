@@ -11446,6 +11446,15 @@ impl Manager for ManagerDaemonService {
                     allocation: payload,
                 }))
             }
+            // Only the raft leader ratifies, and a follower does not forward
+            // it. Answered as an error rather than a verdict, so the node
+            // asks the leader instead of killing a claim no manager judged.
+            // Nothing was written: the ticket is still unspent.
+            crate::manager::edge_boot::Verdict::Refused { detail, .. }
+                if detail.contains("not the raft leader") =>
+            {
+                Err(Status::failed_precondition(detail))
+            }
             crate::manager::edge_boot::Verdict::Refused { reason, detail } => {
                 tracing::Span::current().record("verdict", "refused");
                 self.store.events().provisional_refused(
