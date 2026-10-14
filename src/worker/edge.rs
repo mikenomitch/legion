@@ -121,21 +121,35 @@ pub fn admit_and_launch(
 
     let claim_id = admitted.claim_id.clone();
     let manager = task_manager.clone();
-    // The launch ends by starting the claim's health monitor, a tokio task,
-    // so the thread runs inside the caller's runtime (an RPC handler's).
-    let runtime = crate::worker::task_manager::current_runtime();
-    std::thread::Builder::new()
-        .name(format!("provisional-launch-{claim_id}"))
-        .spawn(move || {
-            let _runtime = crate::worker::task_manager::enter_runtime(runtime.as_ref());
+    let launch = {
+        let claim_id = claim_id.clone();
+        move || {
             let _slot = slot;
             if let Err(err) =
                 launch_provisional_allocation(&manager, &launch_payload, &claim_id, gate)
             {
                 warn!(claim_id, error = ?err, "Provisional launch failed");
             }
-        })
-        .context("failed to spawn provisional launch thread")?;
+        }
+    };
+    // The launch ends by starting the claim's health monitor, a tokio task,
+    // so it runs inside the caller's runtime (an RPC handler's), on one of
+    // its pooled blocking threads. Not a new OS thread per start: each one
+    // maps and unmaps its stack, which takes the worker's memory map lock
+    // for writing, and at hundreds of starts a second that stalled every
+    // page fault and spawn in the worker. The launch pool bounds how many
+    // run at once.
+    match crate::worker::task_manager::current_runtime() {
+        Some(runtime) => {
+            runtime.spawn_blocking(launch);
+        }
+        None => {
+            std::thread::Builder::new()
+                .name(format!("provisional-launch-{claim_id}"))
+                .spawn(launch)
+                .context("failed to spawn provisional launch thread")?;
+        }
+    }
 
     Ok(admitted)
 }

@@ -2256,36 +2256,45 @@ impl TaskPlugin for SandboxTaskPlugin {
         let (allocation_id, task_name) = (allocation.id, task.name.clone());
         let (signal, grace, cause) = (ctx.signal.clone(), ctx.grace, ctx.cause.to_string());
         let pid = instance.pid;
-        std::thread::Builder::new()
-            .name(format!("sandbox-stop-{allocation_id}"))
-            .spawn(
-                move || match request_guest_stop(&vsock, &signal, GUEST_STOP_REQUEST_TIMEOUT) {
-                    Ok(()) => info!(
-                        allocation_id,
-                        task_name = %task_name,
-                        signal = %signal,
-                        grace_secs = grace.as_secs(),
-                        cause = %cause,
-                        "Asked the sandbox guest to shut down"
-                    ),
-                    Err(err) => {
-                        warn!(
-                            allocation_id,
-                            task_name = %task_name,
-                            error = %format!("{err:#}"),
-                            "Could not deliver a stop request into the sandbox guest; stopping \
-                             it hard"
-                        );
-                        if let Some(pid) = pid.filter(|pid| crate::signals::pid_alive(*pid)) {
-                            // SAFETY: a plain kill(2) of this allocation's VMM.
-                            unsafe {
-                                libc::kill(pid as libc::pid_t, libc::SIGKILL);
-                            }
-                        }
+        let request = move || match request_guest_stop(&vsock, &signal, GUEST_STOP_REQUEST_TIMEOUT)
+        {
+            Ok(()) => info!(
+                allocation_id,
+                task_name = %task_name,
+                signal = %signal,
+                grace_secs = grace.as_secs(),
+                cause = %cause,
+                "Asked the sandbox guest to shut down"
+            ),
+            Err(err) => {
+                warn!(
+                    allocation_id,
+                    task_name = %task_name,
+                    error = %format!("{err:#}"),
+                    "Could not deliver a stop request into the sandbox guest; stopping \
+                     it hard"
+                );
+                if let Some(pid) = pid.filter(|pid| crate::signals::pid_alive(*pid)) {
+                    // SAFETY: a plain kill(2) of this allocation's VMM.
+                    unsafe {
+                        libc::kill(pid as libc::pid_t, libc::SIGKILL);
                     }
-                },
-            )
-            .context("spawn the sandbox stop request")?;
+                }
+            }
+        };
+        // A pooled blocking thread where there is a runtime, for the same
+        // reason as a session's launch (`admit_and_launch`).
+        match tokio::runtime::Handle::try_current() {
+            Ok(runtime) => {
+                runtime.spawn_blocking(request);
+            }
+            Err(_) => {
+                std::thread::Builder::new()
+                    .name(format!("sandbox-stop-{allocation_id}"))
+                    .spawn(request)
+                    .context("spawn the sandbox stop request")?;
+            }
+        }
         Ok(true)
     }
 
