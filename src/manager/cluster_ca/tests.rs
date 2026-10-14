@@ -682,7 +682,10 @@ fn a_manager_that_disagrees_with_the_leaders_record_refuses_test() -> R<()> {
     let store = store_with(file_config(&cert, &key, None))?;
     let ca = store.cluster_ca().clone();
     let view = ca.ensure(&store)?;
-    // Leading, this manager recorded its own view.
+    // Ensuring the CA (a request path) writes nothing; the background pass
+    // records a leader's view.
+    assert!(store.cluster_ca_record()?.is_none());
+    ca.record(&store);
     let recorded = store.cluster_ca_record()?.context("recorded")?;
     assert_eq!(recorded.anchor_pin, view.pin);
     assert_eq!(recorded.provider, "file");
@@ -691,12 +694,19 @@ fn a_manager_that_disagrees_with_the_leaders_record_refuses_test() -> R<()> {
     let stranger = pki_other()?;
     let theirs = ca_pin_pem(&stranger.inter_pem)?;
     store.record_cluster_ca(&record("file", &theirs, &[&theirs]))?;
-    let err = ca.agree_as(&store, &view, false).unwrap_err();
+    let err = ca.agree_as(&store, &view, false, false).unwrap_err();
     assert!(err.contains("recorded by manager mgr-1"), "{err}");
     assert!(err.contains("do not trust each other"), "{err}");
 
-    // A leader's own view replaces the record instead.
-    ca.agree_as(&store, &view, true)
+    // A leader's request path agrees with itself and leaves the record...
+    ca.agree_as(&store, &view, true, false)
+        .map_err(|err| anyhow!(err))?;
+    assert_eq!(
+        store.cluster_ca_record()?.context("recorded")?.anchor_pin,
+        theirs
+    );
+    // ...and its background pass replaces the record with its own view.
+    ca.agree_as(&store, &view, true, true)
         .map_err(|err| anyhow!(err))?;
     assert_eq!(
         store.cluster_ca_record()?.context("recorded")?.anchor_pin,
@@ -706,7 +716,9 @@ fn a_manager_that_disagrees_with_the_leaders_record_refuses_test() -> R<()> {
     // A built-in manager in that cluster refuses too.
     let builtin = ClusterCa::from_config(&ClusterCaConfigFull::default())?;
     let builtin_view = builtin::view_of(&store.ensure_mesh_ca()?)?;
-    let err = builtin.agree_as(&store, &builtin_view, false).unwrap_err();
+    let err = builtin
+        .agree_as(&store, &builtin_view, false, false)
+        .unwrap_err();
     assert!(err.contains("built-in cluster CA"), "{err}");
     Ok(())
 }

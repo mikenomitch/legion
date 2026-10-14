@@ -266,8 +266,12 @@ the same `clusterCa` block as the others (docs/cluster-ca.md#every-manager-must-
 
 Because the leader's view is the record, a misconfigured leader makes the
 correctly configured managers report the problem. Their error names the
-leader: that is the manager to fix. A cluster that has never had a CA view
-recorded (a fresh cluster before its leader has looked) is not checked.
+leader: that is the manager to fix. The leader writes the record in the
+background, when it starts and then every minute (and at once after a
+rotation), never on a request; so for up to a minute after a new leader takes
+over, its followers check against the previous leader's record. A cluster that
+has never had a CA view recorded (a fresh cluster before its leader's first
+pass) is not checked.
 
 ## Rotation
 

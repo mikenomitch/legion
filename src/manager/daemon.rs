@@ -1378,6 +1378,10 @@ pub fn keep_manager_server_cert(
         loop {
             let store_for_mint = store.clone();
             let minted = tokio::task::spawn_blocking(move || {
+                // On the control-lane leader, keep the cluster's CA record
+                // current here, off every request path (docs/cluster-ca.md,
+                // "Every manager must agree").
+                store_for_mint.cluster_ca().record(&store_for_mint);
                 crate::manager::worker_plane::WorkerPlane::global().materials(&store_for_mint)
             })
             .await;

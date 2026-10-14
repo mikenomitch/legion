@@ -524,14 +524,29 @@ impl ClusterCa {
     pub fn rotate(&self, store: &Store) -> Result<CaView, CaError> {
         let view = self.inner.provider.rotate(store)?;
         // A rotation is a view change on the leader: record it now rather
-        // than on the next read.
-        let _ = self.agree(store, &view);
+        // than on the next background pass.
+        self.record(store);
         Ok(view)
     }
 
+    /// On the control-lane leader, make the cluster's record follow this
+    /// manager's view (docs/cluster-ca.md, "Every manager must agree"). A
+    /// replicated write when the record is missing or stale, so it runs off
+    /// the request path: the manager's certificate refresher calls it at
+    /// start and every minute, and a rotation calls it once. A follower, or
+    /// a CA that does not exist yet, does nothing.
+    pub fn record(&self, store: &Store) {
+        if !store.is_raft_leader(crate::storage::Lane::Control) {
+            return;
+        }
+        if let Ok(Some(view)) = self.inner.provider.view(store) {
+            let _ = self.agree_as(store, &view, true, true);
+        }
+    }
+
     /// Check `view` against the cluster's record, caching the verdict for
-    /// a few seconds. On the control-lane leader the record follows this
-    /// manager's view instead.
+    /// a few seconds. Read-only: on the control-lane leader this manager's
+    /// view is the cluster's, and [`Self::record`] writes it down.
     fn agree(&self, store: &Store, view: &CaView) -> Result<(), CaError> {
         let fingerprint = view.fingerprint();
         {
@@ -547,7 +562,7 @@ impl ClusterCa {
             }
         }
         let leader = store.is_raft_leader(crate::storage::Lane::Control);
-        let outcome = self.agree_as(store, view, leader);
+        let outcome = self.agree_as(store, view, leader, false);
         *self
             .inner
             .agreement
@@ -560,12 +575,15 @@ impl ClusterCa {
         outcome.map_err(CaError::FailedPrecondition)
     }
 
-    /// [`Self::agree`] without the cache, with leadership given.
+    /// [`Self::agree`] without the cache, with leadership given. A leader
+    /// agrees with itself, and writes its view as the cluster's record when
+    /// `may_record` is set and the record differs ([`Self::record`]).
     pub(crate) fn agree_as(
         &self,
         store: &Store,
         view: &CaView,
         leader: bool,
+        may_record: bool,
     ) -> Result<(), String> {
         let manager_id = crate::manager::worker_plane::WorkerPlane::global().manager_id();
         let mine = view.record(&manager_id);
@@ -577,9 +595,10 @@ impl ClusterCa {
             }
         };
         if leader {
-            if !recorded
-                .as_ref()
-                .is_some_and(|record| record.same_ca(&mine))
+            if may_record
+                && !recorded
+                    .as_ref()
+                    .is_some_and(|record| record.same_ca(&mine))
             {
                 match store.record_cluster_ca(&mine) {
                     Ok(()) => info!(
