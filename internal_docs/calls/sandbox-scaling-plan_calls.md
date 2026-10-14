@@ -721,7 +721,7 @@ entry. Today only `job_reschedule` without a scheduled batch follow-up
 arms it, which is the placement path every keyed create and resume takes.
 (2026-10-13: `job_submit`, `job_update`, and `job_scale` arm it too, and a
 partial plan never settles. See
-[multi-eval-plans calls](multi-eval-plans-plan_calls.md) #3 and #4.)
+[multi-eval-plans calls](multi-eval-plans-plan_calls.md) #4 and #5.)
 
 **Alternatives.**
 - (a) A deferred settle piggybacked on the next write the scheduler lane

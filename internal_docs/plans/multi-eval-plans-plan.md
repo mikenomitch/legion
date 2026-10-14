@@ -2,12 +2,15 @@
 
 > **Judgement calls:** [`calls/multi-eval-plans-plan_calls.md`](../calls/multi-eval-plans-plan_calls.md)
 
-**Status: IN EXECUTION** (written 2026-10-13). Phases 1 and 2 shipped
-together: one running eval per job, and the fused settle in every placing
-handler whose plan is its last write. Phase 3 (settle the evals a running
-plan already covered, without a handler of their own) is planned and
-deferred until a measurement says the no-op evals it removes are worth
-their entries. Results are in [§12](#12-results).
+**Status: IN EXECUTION** (written 2026-10-13, revised 2026-10-14 at
+merge). Phase 2 shipped: the fused settle in every placing handler whose
+plan is its last write, a partial plan that never settles its eval, and no
+second settle write for an eval its plan settled (§6.4, §6.5). Phase 1, one
+running eval per job, was built and measured and then left out of the
+merge: on one host it removed every rejected plan in a same-instant burst
+but changed neither the burst's wall time nor anything at a 2 ms or wider
+arrival gap (§12). It waits for a lane-bound measurement on the rig. Phase
+3 is deferred behind Phase 1.
 
 ## 1. Problem
 
@@ -142,7 +145,10 @@ changes. Agents see the same instance and eval APIs, only faster.
 
 ## 6. Design
 
-### 6.1 One running eval per job
+### 6.1 One running eval per job (built, not merged)
+
+§6.1 to §6.3 and §6.6 describe Phase 1 as it was built. It is not in the
+tree. §12 says why.
 
 A claim skips every eval whose job has a claimed eval still running on
 this manager. The filter is in the claim's SQL (`job_id NOT IN busy`), so a
@@ -223,16 +229,17 @@ into the one it took.
 
 ## 7. Config, metrics, persistence
 
-- `schedulerSettings.one_eval_per_job` (bool, default `true`), read per
-  claim. Documented in `docs/scheduler-and-eval-loop.md` and
-  `configs/manager.ncl`.
-- `legion_eval_subsumed_total` (counter), in `docs/metrics.md`.
-- No proto, jobspec, or persistence change. Claims stay leader memory.
+- What shipped (Phase 2) adds no setting, metric, proto, jobspec, or
+  persistence change.
+- Phase 1 as built added `schedulerSettings.one_eval_per_job` (bool,
+  default `true`) and `legion_eval_subsumed_total`. Neither shipped.
 
 ## 8. Phases
 
-1. **One running eval per job** (§6.1 to §6.4). Shipped.
-2. **The fused settle in every placing handler** (§6.5). Shipped.
+1. **One running eval per job** (§6.1 to §6.3). Built, measured, and left
+   out (§12). The code is in the `perf/multi-eval-plans` worktree.
+2. **The fused settle in every placing handler, and no second settle**
+   (§6.4, §6.5). Shipped.
 3. **Settle covered evals inside the running plan** (deferred). An eval
    that queued before a running plan read the job's state is already
    satisfied by that plan, yet today it waits, is claimed, plans nothing,
@@ -245,17 +252,18 @@ into the one it took.
 
 ## 9. Testing
 
-- **Unit** (`src/storage/store/eval_claims.rs`): a busy job is skipped while
-  other jobs are claimed, a parked worker does not see a busy job's evals as
-  ready, and the next claim after the handler returns subsumes the whole
-  burst. A blocked eval keeps its job busy until released, one batch may
-  take several evals of a free job, and the setting off restores parallel
-  claims.
-- **Integration, burst** (`tests/eval_burst_one_job.rs`): a 48-create burst
-  for one job, paced 2 ms apart, pumped by four real eval workers on a
-  bootstrapped raft store. Asserts every instance placed, zero rejected
-  plans, and fewer plan entries than placements. Its `#[ignore]`d A/B runs
-  the burst with the setting off and on at three arrival gaps.
+- **Unit** (`src/storage/store/eval_claims.rs`, Phase 1 only, not
+  merged): a busy job is skipped while other jobs are claimed, a parked
+  worker does not see a busy job's evals as ready, and the next claim after
+  the handler returns subsumes the whole burst. A blocked eval keeps its
+  job busy until released, one batch may take several evals of a free job,
+  and the setting off restores parallel claims.
+- **Integration, burst** (`tests/eval_burst_one_job.rs`, Phase 1 only, not
+  merged): a create burst for one job pumped by four real eval workers on a
+  bootstrapped raft store, with an `#[ignore]`d A/B of the setting off and
+  on at three arrival gaps. Its fixture had room for only 40 sandboxes (one
+  2,000 MHz core at 50 MHz each), so its first runs measured blocked evals,
+  not batching. §12 uses the corrected fixture.
 - **Integration, entries** (`tests/raft_job_eval_ops.rs`): exact entries
   for a submit's, an update's, and a no-op reschedule's eval, on both
   topologies.
@@ -267,10 +275,9 @@ into the one it took.
 
 ## 10. Rollout
 
-Default on. A new cluster wants it, and nothing about it is visible except
-fewer rejected plans and fewer entries. The setting is the escape hatch.
-No upgrade step: claims are memory, so a mixed-version manager set changes
-nothing on disk.
+Phase 2 is unconditional and has no surface. A job's events read
+`settled with its plan` for an eval that settled in its plan's entry, as a
+`job_reschedule` already did. No upgrade step: nothing on disk changes.
 
 ## 11. Open questions
 
@@ -285,4 +292,35 @@ nothing on disk.
 
 ## 12. Results
 
-Pending: filled in from the runs in the testing plan.
+All on one shared 10-core laptop (load average 6 to 10 from other builds),
+release builds, 2026-10-14.
+
+**Phase 2, entries per eval** (`tests/raft_job_eval_ops.rs`, both
+topologies). A first submit's eval and a restart's eval each lose their
+`complete_evals` entry: 3 → 2 and 4 → 3. A no-op reschedule is unchanged
+at 1. In the single-threaded `plan_fleet_scaling/eval_cycle` bench at
+1,000 nodes (no raft), the job-submit settle drops from 59 and 69 µs to 13
+and 12 µs. Handle time is unchanged within noise.
+
+**Phase 1, one-job burst** (`tests/eval_burst_one_job.rs` with the fixture
+fixed, 200 creates, four eval workers, single-voter raft):
+
+| Arrival gap | Setting | Plan entries | Rejected plans | All entries | Wall |
+| --- | --- | --- | --- | --- | --- |
+| 0 ms | off | 84 | 15 | 233 | 268 ms |
+| 0 ms | on | 72 | 0 | 216 | 267 ms |
+| 2 ms | off | 202 | 3 | 404 | 737 ms |
+| 2 ms | on | 199 | 0 | 400 | 742 ms |
+| 5 ms | off | 200 | 0 | 401 | 1,429 ms |
+| 5 ms | on | 200 | 0 | 401 | 1,419 ms |
+
+A local plan applies in well under 2 ms, so at any real arrival gap each
+create already gets its own plan and there is nothing to fold. Only the
+same-instant burst batches, and there it saves 7% of entries and no wall
+time. The case the plan is about is the lane-bound one, where an entry
+costs about 6 ms on the rig and plans really do pile up. This host cannot
+show it. Phase 1 adds claim-side state, a second release point, a wake
+path, a setting, and an exception to queue order. That is not worth
+carrying on a gain nobody has measured, so it waits for the rig's
+`ladder` cells, run with the worktree's build against this one
+([calls](../calls/multi-eval-plans-plan_calls.md) #1).

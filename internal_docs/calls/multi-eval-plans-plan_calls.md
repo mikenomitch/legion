@@ -4,7 +4,34 @@ Plan: [`plans/multi-eval-plans-plan.md`](../plans/multi-eval-plans-plan.md).
 Entries are ranked by project impact, highest first. An entry's number is
 its rank.
 
-## 1. A job's evals are serialized at the claim, and the existing subsumption does the batching
+## 1. One running eval per job is left out of the merge
+
+**Call.** Ship Phase 2 (the fused settle in submit, update, and scale-out,
+the partial-plan disarm, and no second settle write) and leave Phase 1 (one
+running eval per job, entries 2, 3, 6, 7, and 8) out of the tree. Phase 1
+stays in the `perf/multi-eval-plans` worktree for a rig run.
+
+**Alternatives.**
+- (a) Merge Phase 1 as built, on by default with
+  `schedulerSettings.one_eval_per_job` as the switch.
+- (b) Merge Phase 1 without the switch.
+
+**Trade-off.** A same-instant burst for one job still races at the epoch
+fence: 15 of 200 plans rejected in the local A/B, each costing its eval a
+backoff and a replan. One job's burst can still hold every eval worker.
+
+**Why (simplicity, until performance is shown).** The local A/B
+([plan §12](../plans/multi-eval-plans-plan.md#12-results)) found no wall
+time gained at any arrival gap, and no change at all at 2 ms or wider,
+because a local plan applies in under 2 ms and creates never pile up. Phase
+1 changes claim order, adds in-memory busy state that every release path
+must keep balanced, a second release point, a wake path, and a setting
+whose only purpose is comparison. That is a lot of scheduler surface to
+carry on an argued, unmeasured gain. The argument (a lane-bound leader at
+about 6 ms per entry) may well hold on the rig, and the build is ready to
+measure there.
+
+## 2. A job's evals are serialized at the claim, and the existing subsumption does the batching
 
 **Call.** While one of a job's evals runs on this manager, a claim skips the
 job's other evals (`schedulerSettings.one_eval_per_job`, default on). The
@@ -33,7 +60,7 @@ schedulerSettings = { one_eval_per_job = true }   # the default
 busy job waits one handler's duration while lower-priority evals of other
 jobs run. Exclusivity is per manager, so during a leadership change two
 managers can still race at the epoch fence, as before. A rollout's old and
-new configs, which are different epochs, now serialize too (entry 5).
+new configs, which are different epochs, now serialize too (entry 6).
 
 **Why (performance, then simplicity).** Two plans for one job config can
 never both commit: the job-config epoch is "a hard, all-or-nothing check"
@@ -48,7 +75,7 @@ Nomad eval-broker contract, and the running plan is the batching window, so
 batches grow exactly with load. It also fixes a fairness bug for free: one
 job's burst can no longer occupy every eval worker.
 
-## 2. A job is free again when its handler returns, except after a block
+## 3. A job is free again when its handler returns, except after a block
 
 **Call.** `resolve_claimed_eval` frees the job as soon as the handler
 returns, not when the worker's whole batch settles. An eval whose
@@ -72,7 +99,7 @@ blocked. The other outcomes have no such ordering hazard: a settled eval's
 write already landed, and a released or finished one does not touch the
 job's state.
 
-## 3. A plan that leaves work unplaced never settles its eval
+## 4. A plan that leaves work unplaced never settles its eval
 
 **Call.** The planner calls `disarm_eval_settle` before applying a partial
 plan, so the eval settles in its own write after whatever the handler does
@@ -89,11 +116,11 @@ remainder with that node allowed, and a plan waiting on preemption victims
 queues a delayed retry. If the plan had already deleted the eval and the
 manager died before those writes, nothing would run the eval again and the
 remainder would wait for an unrelated capacity event. That gap already
-existed in `job_reschedule`. Arming three more handlers (entry 4) without
+existed in `job_reschedule`. Arming three more handlers (entry 5) without
 closing it would have widened it. Partial plans happen at the edge of
 capacity, where one entry is not what limits anything.
 
-## 4. Submit, update, and scale-out settle with their plans, but a resubmit and a scale-in do not
+## 5. Submit, update, and scale-out settle with their plans, but a resubmit and a scale-in do not
 
 **Call.** `job_submit` arms the fused settle for a job's first config,
 `job_update` always (its removals precede its plan), and `job_scale` when it
@@ -114,7 +141,7 @@ per job, not per sandbox, so they do not move the keyed lifecycle ceiling.
 They are armed because the change is a guarded one-liner each, measured
 exactly by `tests/raft_job_eval_ops.rs`.
 
-## 5. Exclusivity is keyed by job, not by job config
+## 6. Exclusivity is keyed by job, not by job config
 
 **Call.** The busy key is the eval's job id.
 
@@ -131,7 +158,7 @@ unit Nomad and `client-go` serialize on, and the unit a reader expects.
 Eval kinds without a job (node passes, the capacity pass) are not
 serialized at all.
 
-## 6. No wait window, and no cap on placements per plan
+## 7. No wait window, and no cap on placements per plan
 
 **Call.** A claim takes what is queued now. A plan carries every instance
 that queued during the previous handler cycle, with no cap.
@@ -149,7 +176,7 @@ keyed placements that do not exist today, while `CreateInstances` and job
 submits already place whole batches in one plan. Revisit if a measured burst
 makes one entry large enough to stall the lane.
 
-## 7. Evals a running plan already covered still run their own handler
+## 8. Evals a running plan already covered still run their own handler
 
 **Call.** An eval queued after its job's eval was claimed but before that
 handler read the job's state is satisfied by the running plan, yet it still
@@ -170,7 +197,7 @@ a new ordering invariant on the plan path. The burst A/B in the plan reports
 how many handlers placed nothing, which is the number that would justify
 it.
 
-## 8. A settled eval is not written again by its batch's settle
+## 9. A settled eval is not written again by its batch's settle
 
 **Call.** `write_eval_completions` skips `EvalCompletion::Settled` outright.
 It used to propose a second write for a settled eval whose claim subsumed

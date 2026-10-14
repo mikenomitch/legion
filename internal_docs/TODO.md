@@ -1169,12 +1169,12 @@ How to use it:
       placements per plan entry (sandbox placements average 1.09 plans per
       entry, one eval each), a cheaper capture (each write executes twice,
       once to capture and once to apply), or a pipelined lane.
-      **More placements per plan entry shipped (2026-10-13):** a job's evals
-      no longer run in parallel, so a burst for one job folds into one plan
-      per handler cycle instead of racing at the job-config epoch fence
-      ([plan](plans/multi-eval-plans-plan.md) ·
-      [calls](calls/multi-eval-plans-plan_calls.md) · results in plan §12).
-      The other two levers, and the lane itself, are still open.
+      **More placements per plan entry, tried (2026-10-14):** one running
+      eval per job folds a one-job burst into fewer plans, but on one host
+      it changed no burst's wall time, so it is not merged
+      ([plan](plans/multi-eval-plans-plan.md) §12 ·
+      [calls](calls/multi-eval-plans-plan_calls.md) #1). What did ship is
+      one fewer entry for submit, update, and scale-out evals.
       **Profiled (2026-10-13):** the largest piece of the capture was one
       statement, the keyed bind inside the plan apply, which scanned every
       instance of the job and rebuilt a temporary B-tree of every
@@ -2271,20 +2271,20 @@ Plans: [task-runtime-plugins](../docs/task-runtime-plugins.md).
         events.** Only registration, node changes, readiness, and freed
         allocations wake today
         ([calls](calls/sandbox-scaling-plan_calls.md) #42).
-  - [ ] **Settle evals a running plan already covered.** With one running
-        eval per job, an eval queued after its job's eval was claimed but
-        before that plan read the job's state still runs its own handler,
-        places nothing, and settles in an entry of its own. A high-water
-        mark of the eval queue read before the plan's capacity read would
-        let the plan's fused settle delete it. Deferred until the burst A/B
-        says the no-op handlers are worth an ordering invariant on the plan
-        path ([plan](plans/multi-eval-plans-plan.md) Phase 3,
-        [calls](calls/multi-eval-plans-plan_calls.md) #7).
+  - [ ] **Measure one running eval per job where the lane is the
+        limit.** Built in the `perf/multi-eval-plans` worktree and left out:
+        locally a plan applies in under 2 ms, so a burst at any real arrival
+        gap never piles up and there is nothing to fold. Run the rig's
+        keyed `ladder` cells with that build against this one, and merge it
+        only on a measured gain. Phase 3 (settling evals a running plan
+        already covered) waits behind it
+        ([plan](plans/multi-eval-plans-plan.md) §12,
+        [calls](calls/multi-eval-plans-plan_calls.md) #1 and #8).
   - [ ] **A resubmit and a scale-in still settle in a separate entry.** The
         fused settle is armed in `job_submit` only for a job's first config
         and in `job_scale` only for a scale-out, because their trailing
         writes (the previous config's removal, the capacity pass) follow the
-        plan ([calls](calls/multi-eval-plans-plan_calls.md) #4).
+        plan ([calls](calls/multi-eval-plans-plan_calls.md) #5).
   - [ ] **Rollout ticks and node-scoped passes do not block.** They keep the
         old terminal outcome when nothing fits
         ([calls](calls/sandbox-scaling-plan_calls.md) #41).
@@ -4752,20 +4752,16 @@ Deferred from [operator-ui-gaps-plan.md](plans/operator-ui-gaps-plan.md):
 
 docs: [scheduler-and-eval-loop.md](../docs/scheduler-and-eval-loop.md), [jobs-tasks-and-scheduling.md](../docs/jobs-tasks-and-scheduling.md)
 
-- [x] **More placements per plan entry** (2026-10-13,
-      [plan](plans/multi-eval-plans-plan.md) ·
+- [x] **Submit, update, and scale-out evals settle with their plans**
+      (2026-10-14, [plan](plans/multi-eval-plans-plan.md) Phase 2 ·
       [calls](calls/multi-eval-plans-plan_calls.md) ·
-      [docs](../docs/scheduler-and-eval-loop.md#one-running-eval-per-job)).
-      While one of a job's evals runs, a claim skips the job's others, and
-      the next claim folds them into one plan, so a burst of creates for one
-      job no longer races at the job-config epoch fence
-      (`schedulerSettings.one_eval_per_job`, default on, and
-      `legion_eval_subsumed_total`). The fused settle is armed in
-      `job_submit` (first config), `job_update`, and `job_scale` (scale-out)
-      too, and a partial plan no longer settles its eval, which closes a
-      lost-follow-up window `job_reschedule` had. A settled eval is no
-      longer written a second time by its batch's settle.
-      `tests/eval_burst_one_job.rs`, `tests/raft_job_eval_ops.rs`.
+      [docs](../docs/scheduler-and-eval-loop.md)). The fused settle is
+      armed in `job_submit` (first config), `job_update`, and `job_scale`
+      (scale-out), so each costs one entry fewer
+      (`tests/raft_job_eval_ops.rs`). A partial plan no longer settles its
+      eval, which closes a lost-follow-up window `job_reschedule` had, and
+      a settled eval is no longer written a second time by its batch's
+      settle.
 - [x] **The planner's node universe truncated to one slice at rig scale —
       root-caused and fixed** (2026-09-21,
       [findings](aws-phase5-findings.md#open-in-priority-order),
