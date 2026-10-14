@@ -1441,7 +1441,7 @@ How to use it:
         results after the rig is gone"; calls entries 21 and 25-27.
   - [x] Bootstrap the operator box the campaign is driven from
         (`scripts/bootstrap-operator-box.sh`, `scripts/phase1.sh`; calls
-        entries 22-23). One command takes an AWS key to a running
+        entries 28-29). One command takes an AWS key to a running
         phase 1: builds an Ubuntu x86_64 box outside the rig's terraform
         (it *runs* that terraform, and must outlive `teardown.sh`, which
         destroys the state), gives it an Elastic IP so `admin_cidr` stays
@@ -1843,8 +1843,45 @@ How to use it:
         controller per instance slice, native HTTP submitters for both,
         and an apiserver watch replacing `kubectl get --watch`. Plan
         § Cross-system campaign; calls entries 6, 7, 10, and 11.
-  - [ ] Run the cross-system matrix (plan § Cross-system campaign): rows
-        1-6 on all three systems, then analysis + `REPORT.md`.
+  - [x] Rerun the comparison with every system's store on the same NVMe
+        (2026-10-14, PR #40). Only Legion's had been on it; Nomad's raft
+        log and etcd sat on gp3. Neither competitor got faster. Both are
+        CPU-bound on one control-plane box from 5k nodes up. Ran
+        `web_fleet` 1k-10k and the storm drill at 5k on all three, the
+        `dense_fleet` sweep and `batch_burst` at 5k, and two ablations (K8s
+        on one apiserver, Legion on fixed 2s heartbeats). Also fixed: K8s
+        metrics never scraped (single-file Prometheus mount), the driver's
+        Legion parser counting zero (camelCase events), plugin and
+        `legion-loadgen` builds on main, and a 5s scrape costing Nomad's
+        leader a quarter of a core. [docs/benchmarks.md](../docs/benchmarks.md),
+        calls entries 5, 8, 9, and 12-14.
+  - [ ] Run the rest of the cross-system matrix (plan § Cross-system
+        campaign): the CLI control row (row 5) on the NVMe rig, the 10k
+        storm on all three, memory per cell (row 6) in the report, and
+        `REPORT.md`.
+  - [ ] Nomad's placement follower decodes every allocation event in
+        Python and missed 14-34 events in the 50k-allocation cells. The
+        driver now completes the cell on Nomad's own count, but its
+        throughput undercounts by the shortfall. A compiled follower, or
+        Nomad's own count as the primary source, would close it.
+  - [ ] K8s at 200,000 pods: the apiserver on the box running the
+        scheduler stopped completing TLS handshakes and the driver's watch
+        could not reconnect, so the 40-per-node `dense_fleet` cell has no
+        full result. Point the driver at a different apiserver than the
+        scheduler's leader, then rerun that cell.
+  - [ ] Legion's fixed-2s-heartbeat ablation at 5k served well under the
+        2,500 heartbeats/sec a 2s cadence implies (freshness 0.46), so
+        that row understates the cost. Find out why the simulated fleet
+        did not settle onto 2s with `adaptive = false`.
+  - [ ] The plugins' own `Cargo.lock` files drifted while plugin builds
+        were broken (`plugins/tasks/noop` gains `legion-guest`, `imbl`,
+        `archery` on a fresh build). Refresh and commit them.
+  - [ ] `RunJob` runs ~7 quorum writes inline on a tokio worker, so a
+        submit burst starves evals and heartbeats of runtime threads.
+        Branch `perf/web-fleet-throughput` moves it under
+        `block_in_place` (about 1.5-2x `web_fleet` locally). `StopJob`,
+        `DestroyJob`, and KV writes still commit inline. A labeled AWS
+        re-test is in PR #40's notes.
   - [ ] Legion B (streaming) campaign, and the 20k validation burst.
   - [ ] Nomad cannot run `mixed_heterogeneous`: nodesim has no node meta.
         Patch nodesim to accept a `meta` map (small, upstreamable) if the
