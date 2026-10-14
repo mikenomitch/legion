@@ -39,14 +39,27 @@ Each worker loop:
    rejection returns the row to `pending` after a delay. The permit is
    released, and asked for again at the next batch.
 
-**An eval can settle with its own plan.** A `job_reschedule` whose plan is
-its last write (no scheduled batch task needs a follow-up) carries its
-settle into that plan's apply: the applied plan deletes the eval row,
-deletes the duplicates its claim subsumed, and records `eval.completed` in
-the same entry. The worker then has nothing to write for it. On an idle
-cluster this makes a placement one scheduler-lane entry (the plan) instead
-of three (claim, plan, settle). A plan that is rejected or places nothing
-leaves the eval to the ordinary settle.
+**An eval can settle with its own plan.** An eval whose plan is its last
+write carries its settle into that plan's apply: the applied plan deletes
+the eval row, deletes the duplicates its claim subsumed, and records
+`eval.completed` in the same entry. The worker then has nothing to write for
+it. On an idle cluster this makes a placement one scheduler-lane entry (the
+plan) instead of three (claim, plan, settle). These handlers settle with
+their plan:
+
+- `job_reschedule`, the placement path of every keyed create and resume.
+- `job_submit` for a job's first config. A resubmit removes the previous
+  config's allocations after its plan, so it settles on its own.
+- `job_update`, whose removals and resets all happen before its plan.
+- `job_scale` when it scales out. A scale-in queues a capacity pass after
+  its plan.
+
+None of them settles with its plan when a scheduled batch task needs a
+follow-up queued after it. A plan that is rejected, places nothing, or
+leaves replicas unplaced also leaves the eval to the ordinary settle: after
+a partial plan the handler may still plan the rest with an avoided node
+allowed, or queue a retry for preemption victims that are too young, and
+the eval must stay queued until those writes land.
 
 **Why claims are memory.** A claim used to be a replicated write
 (`pending → in_flight`). The only thing it bought was recovery: a new

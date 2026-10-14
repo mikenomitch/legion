@@ -750,13 +750,16 @@ fn eval_cycle_cell(store: &Store, cell: &str) {
         let started = std::time::Instant::now();
         let completion = resolve_claimed_eval(store, 0, eval);
         handle_us += started.elapsed().as_micros();
+        // A first submit whose plan places everything settles inside that
+        // plan's entry (`arm_eval_settle`), so `Settled` is the usual answer.
         assert!(
             matches!(
                 completion,
-                EvalCompletion::Finished {
-                    succeeded: true,
-                    ..
-                }
+                EvalCompletion::Settled
+                    | EvalCompletion::Finished {
+                        succeeded: true,
+                        ..
+                    }
             ),
             "eval failed: {completion:?}"
         );
@@ -1241,6 +1244,117 @@ fn snapshot_budget_benchmark(c: &mut Criterion) {
     group.finish();
 }
 
+// ---------------------------------------------------------------------------
+// Keyed binding (scheduler-lane entry cost)
+// ---------------------------------------------------------------------------
+//
+// The cost of placing ONE new keyed instance of a task that already has
+// `resident` placed instances and as many parked (stopped) ones, which is a
+// sandbox platform's steady state. Every keyed placement binds the oldest
+// unbound live instance inside the plan apply, so this is serial
+// scheduler-lane time, and the `apply` phase mean printed after each cell
+// is the number to watch: it should stay flat as the population grows.
+
+const KEYED_BIND_RESIDENT: &[usize] = &[1_000, 5_000];
+const KEYED_BIND_NODES: usize = 200;
+/// Instances placed per `plan_and_apply` while filling.
+const KEYED_BIND_FILL_CHUNK: usize = 500;
+
+fn setup_keyed_population(store: &Store, resident: usize) -> anyhow::Result<String> {
+    insert_uniform_nodes(store, KEYED_BIND_NODES)?;
+    let job = JobConfig {
+        priority: Default::default(),
+        name: "bench-keyed".into(),
+        tasks: vec![TaskConfig {
+            stateful: Some(serde_json::from_value(json!({ "mode": "keyed" }))?),
+            ..TaskConfig::new("workspace", "noop")
+        }],
+        rollout: None,
+        rollout_by_group: Default::default(),
+        version: None,
+    };
+    let job_config_id = submit_jobs(store, std::slice::from_ref(&job))?
+        .pop()
+        .expect("one id");
+    let mut created = 0;
+    while created < resident {
+        let chunk = KEYED_BIND_FILL_CHUNK.min(resident - created);
+        for idx in created..created + chunk {
+            store.create_keyed_instance(
+                "bench-keyed",
+                "default",
+                "workspace",
+                Some(&format!("live-{idx}")),
+            )?;
+        }
+        // Reschedule, as a create's `job_reschedule` eval plans: only the
+        // instances with no allocation yet. A `Fresh` plan wants one
+        // placement per live instance and fails once some are bound.
+        let outcome =
+            Scheduler::new(store)?.plan_and_apply(&job_config_id, PlanMode::Reschedule)?;
+        anyhow::ensure!(
+            outcome.allocations.len() == chunk,
+            "placed {} of {chunk} keyed instances",
+            outcome.allocations.len()
+        );
+        created += chunk;
+    }
+    for idx in 0..resident {
+        let id = format!("parked-{idx}");
+        store.create_keyed_instance("bench-keyed", "default", "workspace", Some(&id))?;
+        store.stop_keyed_instance(&id)?;
+    }
+    Ok(job_config_id)
+}
+
+fn keyed_bind_benchmark(c: &mut Criterion) {
+    let mut group = c.benchmark_group("keyed_bind");
+    group.warm_up_time(Duration::from_millis(500));
+    group.measurement_time(Duration::from_secs(5));
+    group.sample_size(20);
+
+    for &resident in KEYED_BIND_RESIDENT {
+        let (store, _dir) = setup_store("bin_pack").expect("store");
+        let job_config_id = setup_keyed_population(&store, resident).expect("population");
+        let mut next = 0usize;
+        let timings: RefCell<Vec<PlanTimings>> = RefCell::new(Vec::new());
+        group.bench_function(
+            BenchmarkId::new("plan_and_apply", format!("resident_{resident}")),
+            |b| {
+                b.iter_batched(
+                    || {
+                        next += 1;
+                        store
+                            .create_keyed_instance(
+                                "bench-keyed",
+                                "default",
+                                "workspace",
+                                Some(&format!("new-{next}")),
+                            )
+                            .expect("instance");
+                    },
+                    |()| {
+                        let scheduler = Scheduler::new(&store).expect("scheduler");
+                        let outcome = scheduler
+                            .plan_and_apply(&job_config_id, PlanMode::Reschedule)
+                            .expect("plan");
+                        assert_eq!(outcome.allocations.len(), 1);
+                        timings.borrow_mut().push(outcome.timings.clone());
+                        outcome
+                    },
+                    criterion::BatchSize::PerIteration,
+                );
+            },
+        );
+        print_phase_means(
+            &format!("keyed_bind/plan_and_apply/resident_{resident}"),
+            &timings.borrow(),
+        );
+    }
+
+    group.finish();
+}
+
 /// Mean per-phase microseconds over every plan a cell measured, in the
 /// order the phases run.
 fn print_phase_means(cell: &str, samples: &[PlanTimings]) {
@@ -1276,6 +1390,7 @@ criterion_group!(
     plan_fleet_scaling_benchmark,
     locality_benchmark,
     restore_benchmark,
-    snapshot_budget_benchmark
+    snapshot_budget_benchmark,
+    keyed_bind_benchmark
 );
 criterion_main!(benches);

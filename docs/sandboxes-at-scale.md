@@ -310,3 +310,12 @@ runtime's own boot or restore time for the end-to-end figure.
   not lanes, so they do not raise the ceiling. Measure your own hardware
   with the tools [above](#measuring-it-on-your-hardware). Unnamed
   [sessions](session-mode.md) do not use the lane to start or stop.
+- **A keyed placement costs more as its task's live instances grow.** The
+  placement binds the oldest unbound instance of the task in the same lane
+  entry, and to find it the manager looks at every *live* instance of that
+  task (pending, active, or rescheduling), two index lookups each.
+  Suspended, stopped, and destroyed instances are not looked at, so parking
+  idle sandboxes keeps placements fast however many there are. A task with
+  tens of thousands of running instances adds milliseconds of lane time to
+  each placement. Splitting them across tasks (one per tenant, say) keeps
+  each placement's share small.

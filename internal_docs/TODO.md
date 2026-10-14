@@ -1169,6 +1169,36 @@ How to use it:
       placements per plan entry (sandbox placements average 1.09 plans per
       entry, one eval each), a cheaper capture (each write executes twice,
       once to capture and once to apply), or a pipelined lane.
+      **More placements per plan entry, tried (2026-10-14):** one running
+      eval per job folds a one-job burst into fewer plans, but on one host
+      it changed no burst's wall time, so it is not merged
+      ([plan](plans/multi-eval-plans-plan.md) §12 ·
+      [calls](calls/multi-eval-plans-plan_calls.md) #1). What did ship is
+      one fewer entry for submit, update, and scale-out evals.
+      **Profiled (2026-10-13):** the largest piece of the capture was one
+      statement, the keyed bind inside the plan apply, which scanned every
+      instance of the job and rebuilt a temporary B-tree of every
+      allocation of the config on every placement. It now reads live keyed
+      rows from two indexes
+      ([plan](plans/scheduler-lane-entry-cost-plan.md) Phase 1 ·
+      [calls](calls/scheduler-lane-entry-cost-plan_calls.md) ·
+      [docs](../docs/sandboxes-at-scale.md#limits-to-know-about)). Still
+      open, each designed in that plan:
+  - [ ] **Pipeline the lane** (plan §6.2): capture entry N+1 over an
+        overlay of the in-flight entries while N commits, with a
+        capture-term check at apply. Gated on auditing which capture bodies
+        read the read pool or the read model, which do not see an
+        in-flight entry (`stop_keyed_instance_apply` reads its instance
+        through `get_instance`), and on a three-voter measurement.
+  - [ ] **One fsync per entry, not two** (plan §6.3): the state DB runs
+        `synchronous = FULL` in raft mode only to keep the applied marker
+        ahead of the log's purge horizon. `NORMAL` plus a startup restore
+        from the local snapshot would drop one fsync per entry. Needs a
+        Linux fsync measurement and a power-cut test.
+  - [ ] **A keyed bind still visits every live instance of the task**
+        (plan §11), two index lookups each, so a task with tens of
+        thousands of running instances pays milliseconds per placement.
+        Parked instances are free.
 - [ ] **Fused top-k candidate scoring.** Ranked candidate lists materialize a
       scored vector per placement; the one-candidate path (`plan_candidates:
       0`) uses the fused argmax loop that does not. A fused top-k loop would
@@ -2254,10 +2284,20 @@ Plans: [task-runtime-plugins](../docs/task-runtime-plugins.md).
         events.** Only registration, node changes, readiness, and freed
         allocations wake today
         ([calls](calls/sandbox-scaling-plan_calls.md) #42).
-  - [ ] **Arm the fused settle in more handlers.** Only `job_reschedule`
-        without a batch follow-up settles inside its plan; `job_submit`,
-        `job_update`, and `job_scale` still settle in a separate entry
-        ([calls](calls/sandbox-scaling-plan_calls.md) #23).
+  - [ ] **Measure one running eval per job where the lane is the
+        limit.** Built in the `perf/multi-eval-plans` worktree and left out:
+        locally a plan applies in under 2 ms, so a burst at any real arrival
+        gap never piles up and there is nothing to fold. Run the rig's
+        keyed `ladder` cells with that build against this one, and merge it
+        only on a measured gain. Phase 3 (settling evals a running plan
+        already covered) waits behind it
+        ([plan](plans/multi-eval-plans-plan.md) §12,
+        [calls](calls/multi-eval-plans-plan_calls.md) #1 and #8).
+  - [ ] **A resubmit and a scale-in still settle in a separate entry.** The
+        fused settle is armed in `job_submit` only for a job's first config
+        and in `job_scale` only for a scale-out, because their trailing
+        writes (the previous config's removal, the capacity pass) follow the
+        plan ([calls](calls/multi-eval-plans-plan_calls.md) #5).
   - [ ] **Rollout ticks and node-scoped passes do not block.** They keep the
         old terminal outcome when nothing fits
         ([calls](calls/sandbox-scaling-plan_calls.md) #41).
@@ -4811,6 +4851,16 @@ docs: [scheduler-and-eval-loop.md](../docs/scheduler-and-eval-loop.md), [jobs-ta
       ([plan](plans/elastic-session-envelopes-plan.md),
       [calls](calls/elastic-session-envelopes-plan_calls.md),
       [docs](../docs/session-mode.md#elastic-envelopes)).
+- [x] **Submit, update, and scale-out evals settle with their plans**
+      (2026-10-14, [plan](plans/multi-eval-plans-plan.md) Phase 2 ·
+      [calls](calls/multi-eval-plans-plan_calls.md) ·
+      [docs](../docs/scheduler-and-eval-loop.md)). The fused settle is
+      armed in `job_submit` (first config), `job_update`, and `job_scale`
+      (scale-out), so each costs one entry fewer
+      (`tests/raft_job_eval_ops.rs`). A partial plan no longer settles its
+      eval, which closes a lost-follow-up window `job_reschedule` had, and
+      a settled eval is no longer written a second time by its batch's
+      settle.
 - [x] **The planner's node universe truncated to one slice at rig scale —
       root-caused and fixed** (2026-09-21,
       [findings](aws-phase5-findings.md#open-in-priority-order),
