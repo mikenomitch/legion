@@ -27,7 +27,8 @@ use crate::prelude::*;
 /// Pause, resume, and drive updates are near-instant.
 const CONTROL_TIMEOUT: Duration = Duration::from_secs(10);
 /// Writing or loading guest memory scales with its size and the disk.
-/// Generous, because a timeout mid-snapshot leaves a paused guest.
+/// Generous, because a timeout mid-snapshot leaves a paused guest, and a
+/// timeout mid-restore throws away a restore that was still going to work.
 const SNAPSHOT_TIMEOUT: Duration = Duration::from_secs(300);
 
 /// One HTTP response from a VMM.
@@ -376,6 +377,16 @@ impl CloudHypervisorApi {
 
     pub(crate) fn resume(&self) -> R<()> {
         self.call("PUT", "vm.resume", None, CONTROL_TIMEOUT)
+            .map(|_| ())
+    }
+
+    /// The first resume of a VMM launched with `--restore`. cloud-hypervisor
+    /// serves its API socket before the restore finishes, and the resume
+    /// waits behind it, so it gets the snapshot timeout: an eager restore
+    /// copies the whole memory file first, which on a slow disk outlasts
+    /// [`CONTROL_TIMEOUT`] for a guest of a few GiB.
+    pub(crate) fn resume_restored(&self) -> R<()> {
+        self.call("PUT", "vm.resume", None, SNAPSHOT_TIMEOUT)
             .map(|_| ())
     }
 

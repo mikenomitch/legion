@@ -479,8 +479,14 @@ The node restores instead of booting, reports the outcome, and the manager
 emits `instance.resumed` with the restore time, which `instance get` shows as
 the last restore. The spent checkpoint is then reclaimed from the node.
 
-A memory resume is the cost of loading the guest's memory: the target is
-under 300 ms for a 1 GiB guest on local NVMe. A disk resume is a cold boot.
+A memory resume loads the guest's device state and lets it run. By default
+(on Firecracker, and on cloud-hypervisor v52 and later) its memory then loads
+as the guest touches it, so on the node that holds the checkpoint the time
+before the guest runs does not grow with its memory. A task
+whose workload touches most of its memory right after it wakes can load all
+of it first instead (`memory_restore = "eager"`, see
+[How memory comes back](task-runtime-sandbox.md#how-memory-comes-back)). A
+disk resume is a cold boot.
 
 `--cold` discards the checkpoint and boots fresh on the retained storage. It
 is the escape hatch when a checkpoint cannot be restored.
@@ -1710,8 +1716,10 @@ start well under 20 GiB of real memory and grow as they diverge.
 Legion still charges each fork its full reservation. Sharing decays as forks
 diverge, and placement must not depend on a number that changes under it. The
 saving shows up as headroom that [oversubscription](resource-enforcement.md)
-and the memory pressure response can use. cloud-hypervisor copies the memory
-file into each guest at restore, so its forks share nothing.
+and the memory pressure response can use. cloud-hypervisor loads its own
+copy of the memory into each guest, all at once or on demand
+([How memory comes back](task-runtime-sandbox.md#how-memory-comes-back)), so
+its forks share nothing.
 
 ### Networking for forks
 
@@ -1856,8 +1864,11 @@ older worker fails with `FailedPrecondition` naming the worker's version.
 On the node, a memory capture writes the VMM's memory and state files into the
 content store's staging directory, then moves each one into the store's
 `snapshots` class, pinned to the snapshot id and verified against the digest
-the capture recorded. A restore re-verifies each part (rehashing it) and
-hardlinks it into the new allocation. A `local` snapshot's pinned parts are
+the capture recorded. A restore checks that each part is present at its
+recorded size and hardlinks it into the new allocation. It does not rehash
+the part: the store checked the digest when the bytes came in and keeps
+them read-only, and rehashing would read all of the guest's memory before
+it could start. A `local` snapshot's pinned parts are
 never evicted, and they count toward `content.budgets.snapshots`. A capture
 that would go over the budget fails with an error naming it. Once a
 snapshot is published, the node drops its pins and the parts become
@@ -2192,6 +2203,13 @@ See [metrics](metrics.md#suspend-and-resume).
 - **Each fork is charged its full reservation**, even though forks of one
   memory checkpoint share pages on Firecracker. cloud-hypervisor forks share
   no pages.
+- **A published checkpoint is fetched whole before it restores.** A resume
+  on a node that holds the parts runs the guest before its memory is read,
+  but a node that must fetch them downloads every part first. Warm the node
+  ahead of time (`snapshot warm`) to keep that off the resume.
+- **A lazily resumed guest pays for its memory as it touches it.** See
+  [How memory comes back](task-runtime-sandbox.md#how-memory-comes-back) for
+  when to set `memory_restore = "eager"`.
 - **A fork's TAP needs Firecracker 1.12 or later** for a memory fork of a
   TAP-wired sandbox. A disk fork of a TAP-wired sandbox is refused, since it
   would boot on the origin's TAP.
