@@ -109,6 +109,9 @@ The manager's `persistence.type` decides how its state survives a manager failur
 - With ACLs enabled: JWKS refresh and expired-credential pruning loops.
 - Optional in-process worker (`--run-worker`). When ACLs are enforced, the
   manager issues its own join token for it.
+- `--no-acl` turns ACLs off for that run, overriding `acl.enabled`. It is for
+  throwaway local clusters only. See
+  [docs/auth-and-acls.md](auth-and-acls.md#turning-acls-off).
 
 Operator TLS is off by default. Turn it on with `server.tls { enabled,
 certPath, keyPath }` in the manager config. It covers the gRPC listener and

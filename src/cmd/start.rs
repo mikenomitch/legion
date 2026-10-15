@@ -22,6 +22,16 @@ pub fn config() -> Command {
                 .help("Run a worker node alongside the manager"),
         )
         .arg(
+            Arg::new("no-acl")
+                .long("no-acl")
+                .action(ArgAction::SetTrue)
+                .help(
+                    "Disable ACLs for this run, overriding acl.enabled in the config. For \
+                     throwaway/local clusters only: any caller, including any task, can then \
+                     control the cluster",
+                ),
+        )
+        .arg(
             Arg::new("restore-from")
                 .long("restore-from")
                 .value_name("BACKUP")
@@ -195,7 +205,11 @@ pub async fn handle(sub_matches: &ArgMatches) -> R<()> {
         }
         Some(("manager", arg_matches)) => {
             let run_worker = arg_matches.get_flag("run-worker");
-            let config = load_config(arg_matches.get_one::<String>("config"))?;
+            let mut config = load_config(arg_matches.get_one::<String>("config"))?;
+            if arg_matches.get_flag("no-acl") {
+                disable_acl(&mut config);
+                warn!("--no-acl: ACLs are disabled for this run, whatever the config says");
+            }
             // Restore runs BEFORE the store (and any raft engine) starts:
             // the backup becomes the initial state the engine adopts (plan
             // §A5; docs/upgrades.md "Backup and restore").
@@ -231,6 +245,12 @@ fn load_config(config_path: Option<&String>) -> R<ManagerConfig> {
         Some(path) => parse_config(path),
         None => Ok(serde_json::from_str("{}")?),
     }
+}
+
+/// Applies `--no-acl` on top of the loaded config (file or defaults), so the
+/// flag wins over `acl.enabled` without the user writing a config file.
+fn disable_acl(config: &mut ManagerConfig) {
+    config.acl.get_or_insert_with(Default::default).enabled = Some(false);
 }
 
 #[instrument(skip_all)]
@@ -299,6 +319,15 @@ mod tests {
             full.worker_config_path.is_empty(),
             "no worker config directory unless one is configured"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn no_acl_flag_turns_acls_off_over_the_defaults() -> R<()> {
+        let mut config = load_config(None)?;
+        assert!(config.with_defaults().acl.enabled, "ACLs default on");
+        disable_acl(&mut config);
+        assert!(!config.with_defaults().acl.enabled);
         Ok(())
     }
 
