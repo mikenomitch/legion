@@ -111,11 +111,12 @@ pub struct MemoryPart {
     /// Logical size in bytes (a sparse part may use fewer on disk).
     pub size: u64,
     /// Where the part was published (`durability = "store"`), for example
-    /// `s3://bucket/prefix/sealed/<name>`. The object is sealed
-    /// ([`crate::checkpoint_seal`]): any node that can read the URL and is
-    /// sent the part's key restores it through its ordinary artifact
-    /// fetcher, opened and verified against `digest`. Unset while the
-    /// snapshot is only on its node.
+    /// `s3://bucket/prefix/sealed/<name>`. The object is the part's sealed
+    /// index ([`crate::checkpoint_chunks`]), which lists the chunks beside
+    /// it: any node that can read the store and is sent the part's key
+    /// fetches the index and the chunks, opens each, and verifies the
+    /// reassembled part against `digest`. Unset while the snapshot is only
+    /// on its node.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub url: Option<String>,
     /// The checkpoint key (`ck_…`) the published object is sealed under.
@@ -347,6 +348,16 @@ impl fmt::Debug for crate::structs::CheckpointPartKey {
 impl fmt::Debug for crate::structs::SessionSealKey {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("SessionSealKey")
+            .field("key_id", &self.key_id)
+            .field("key", &format_args!("<{} bytes redacted>", self.key.len()))
+            .finish()
+    }
+}
+
+/// Never prints the key bytes (build.rs turns off the generated Debug).
+impl fmt::Debug for crate::structs::CheckpointChunkKey {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("CheckpointChunkKey")
             .field("key_id", &self.key_id)
             .field("key", &format_args!("<{} bytes redacted>", self.key.len()))
             .finish()

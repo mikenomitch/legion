@@ -374,6 +374,8 @@ struct Cluster {
     sizes: (serde_json::Value, serde_json::Value),
     /// The session task's `suspend` block, when it has one.
     suspend: Option<serde_json::Value>,
+    /// `stateful.envelope.max`, for an elastic envelope.
+    envelope_max: Option<serde_json::Value>,
     nodes: BTreeMap<String, FakeNode>,
     _dir: tempfile::TempDir,
 }
@@ -397,7 +399,18 @@ impl Cluster {
         envelope: serde_json::Value,
         session: serde_json::Value,
     ) -> R<Self> {
-        Self::build(job, nodes, envelope, session, None).await
+        Self::build(job, nodes, envelope, session, None, None).await
+    }
+
+    /// An elastic envelope: `envelope` is its floor and `max` its ceiling.
+    async fn elastic(
+        job: &str,
+        nodes: &[&str],
+        envelope: serde_json::Value,
+        max: serde_json::Value,
+        session: serde_json::Value,
+    ) -> R<Self> {
+        Self::build(job, nodes, envelope, session, None, Some(max)).await
     }
 
     /// [`Cluster::new`] with a `suspend` block on the session task.
@@ -408,6 +421,7 @@ impl Cluster {
             json!({ "cpu": 2000, "memory": 2048 }),
             json!({ "cpu": 500, "memory": 512 }),
             Some(suspend),
+            None,
         )
         .await
     }
@@ -418,6 +432,7 @@ impl Cluster {
         envelope: serde_json::Value,
         session: serde_json::Value,
         suspend: Option<serde_json::Value>,
+        envelope_max: Option<serde_json::Value>,
     ) -> R<Self> {
         let dir = tempfile::tempdir()?;
         let mut config = ManagerConfigFull {
@@ -437,6 +452,7 @@ impl Cluster {
             job: job.to_string(),
             sizes: (envelope, session),
             suspend,
+            envelope_max,
             nodes: BTreeMap::new(),
             _dir: dir,
         };
@@ -522,6 +538,9 @@ impl Cluster {
         });
         if let Some(suspend) = &self.suspend {
             task["suspend"] = suspend.clone();
+        }
+        if let Some(max) = &self.envelope_max {
+            task["stateful"]["envelope"]["max"] = max.clone();
         }
         let config: JobConfig = serde_json::from_value(json!({
             "name": self.job,
@@ -1606,5 +1625,297 @@ async fn a_store_session_running_elsewhere_moves_only_when_its_node_is_down_test
         "{moved:?}"
     );
     assert!(moved.message.contains("generation 3"), "{moved:?}");
+    Ok(())
+}
+
+// ---------------------------------------------------------------------
+// Elastic envelopes (elastic-session-envelopes plan §6.3;
+// docs/session-mode.md, "Elastic envelopes")
+// ---------------------------------------------------------------------
+
+impl Cluster {
+    /// A heartbeat from `node_id` carrying one envelope resize, and the
+    /// manager's answer to it.
+    async fn resize(
+        &self,
+        node_id: &str,
+        allocation_id: i64,
+        from: serde_json::Value,
+        to: serde_json::Value,
+    ) -> R<legion::structs::EnvelopeResizeResult> {
+        let reply = self
+            .svc
+            .heartbeat(Request::new(HeartbeatRequest {
+                id: node_id.into(),
+                envelope_resizes: vec![legion::structs::EnvelopeResize {
+                    allocation_id,
+                    from: from.to_string(),
+                    to: to.to_string(),
+                }],
+                ..Default::default()
+            }))
+            .await?
+            .into_inner();
+        assert_eq!(reply.envelope_resizes.len(), 1, "{reply:?}");
+        Ok(reply.envelope_resizes[0].clone())
+    }
+
+    /// The envelope's allocation on `node_id`: its id and its resources.
+    fn envelope_row(&self, node_id: &str) -> R<(i64, serde_json::Value)> {
+        let allocation = self
+            .store()
+            .allocs_for_job(&self.job)?
+            .into_iter()
+            .find(|allocation| allocation.node_id == node_id)
+            .context("an envelope on the node")?;
+        Ok((allocation.id, allocation.resources))
+    }
+
+    /// Submit a plain one-allocation job and run its eval the way the
+    /// daemon's eval worker does, so a placement that finds no room blocks.
+    fn run_filler(&self, name: &str, resources: serde_json::Value) -> R<()> {
+        let config: JobConfig = serde_json::from_value(json!({
+            "name": name,
+            "task": { "name": "work", "runtime": "noop", "resources": resources },
+        }))?;
+        tokio::task::block_in_place(|| -> R<()> {
+            self.store().handle_job_submit(
+                &config,
+                &[Submission {
+                    path: format!("{name}.json"),
+                    content: "{}".to_string(),
+                    is_primary: true,
+                }],
+            )?;
+            let config_id = self.store().get_job_config(name)?.id();
+            self.store().enqueue_eval(
+                "job_reschedule",
+                Some(name),
+                Some(&config_id),
+                None,
+                None,
+            )?;
+            self.run_eval_worker()
+        })
+    }
+
+    fn run_eval_worker(&self) -> R<()> {
+        use legion::storage::store::{ClaimScope, EvalBatchLimits};
+        let limits = EvalBatchLimits {
+            max: 16,
+            workers: 1,
+        };
+        let store = self.store();
+        let mut batch = store.claim_evals(limits, ClaimScope::Any)?;
+        while !batch.is_empty() {
+            let completions = batch
+                .iter()
+                .map(|eval| {
+                    (
+                        eval.id.clone(),
+                        legion::manager::daemon::resolve_claimed_eval(store, 0, eval),
+                    )
+                })
+                .collect();
+            batch = store.complete_evals_and_claim_next(completions, limits, ClaimScope::Any)?;
+        }
+        Ok(())
+    }
+}
+
+/// A node grows its elastic envelope in one scheduler-lane entry and the
+/// router uses the new room at once; a retried request writes nothing; a
+/// stale or out-of-bounds request is refused without a write; a grow takes
+/// only the room the node has left (`partial`), and none when there is none
+/// (`refused`, no entry); a shrink frees room and wakes work blocked on the
+/// node.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_elastic_envelope_resizes_through_the_heartbeat_test() -> R<()> {
+    // The fake node has 2,000 MHz and 64 GiB. Floor 1,000 MHz (four
+    // sessions), ceiling the whole node.
+    let cluster = Cluster::elastic(
+        "agents-elastic",
+        &["n1"],
+        json!({ "cpu": 1000, "memory": 1024 }),
+        json!({ "cpu": 2000, "memory": 4096 }),
+        json!({ "cpu": 250, "memory": 256 }),
+    )
+    .await?;
+    let (envelope, floor) = cluster.envelope_row("n1")?;
+    assert_eq!(floor, json!({ "cpu": 1000, "memory": 1024 }));
+    cluster.report("n1").await?;
+    let before = cluster.raft_entries();
+    cluster.report("n1").await?;
+    assert_eq!(
+        cluster.raft_entries(),
+        before,
+        "a plain beat writes nothing"
+    );
+
+    // Grow: one entry, on the row, and in the node's payload.
+    let grown = json!({ "cpu": 1500, "memory": 1536 });
+    let answer = cluster
+        .resize("n1", envelope, floor.clone(), grown.clone())
+        .await?;
+    assert_eq!(answer.outcome, "applied", "{answer:?}");
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&answer.size)?,
+        grown
+    );
+    assert_eq!(
+        cluster.raft_entries(),
+        before + 1,
+        "one scheduler-lane entry"
+    );
+    assert_eq!(cluster.envelope_row("n1")?.1, grown);
+    let tasks = cluster
+        .store()
+        .shared_task_configs_for_job_config(&cluster.store().get_job_config(&cluster.job)?.id())?;
+    let envelope_task = &tasks
+        .iter()
+        .find(|(_, task)| task.name == "workspace-envelope")
+        .context("the envelope task")?
+        .1;
+    let payload = legion::manager::dispatcher::build_task_allocation(
+        envelope_task,
+        &cluster
+            .store()
+            .get_allocation_by_id(envelope)?
+            .context("the envelope row")?,
+        None,
+        &[],
+    )?;
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&payload.envelope_resources)?,
+        grown,
+        "the node is sent the committed size"
+    );
+
+    // The router's view (here `ListSessionNodes`, read from the same rows)
+    // weighs the grown room: six sessions, not four.
+    let session_task = &tasks
+        .iter()
+        .find(|(_, task)| task.name == "workspace")
+        .context("the session task")?
+        .1;
+    let nodes =
+        legion::manager::sessions::session_nodes(cluster.store(), &cluster.job, session_task)
+            .await
+            .map_err(|status| anyhow::anyhow!("{status}"))?;
+    assert_eq!(nodes[0].weight, 6, "{nodes:?}");
+
+    // The node admits against the grown room: six sessions, not four. Once
+    // its admission (faked here) refuses, the router's refusal says an
+    // elastic envelope grows, rather than to raise its floor.
+    for _ in 0..6 {
+        cluster.create(None).await?;
+    }
+    assert_eq!(cluster.running()["n1"], 6);
+    cluster.node("n1").lock().full = true;
+    let full = cluster.create(None).await.expect_err("six fill 1,500 MHz");
+    assert_eq!(full.code(), Code::ResourceExhausted);
+    assert!(
+        full.message().contains("grow within a heartbeat"),
+        "{full:?}"
+    );
+    cluster.node("n1").lock().full = false;
+
+    // The same request again (its answer was lost): applied, no entry. A
+    // request from a size the row no longer holds, one past the ceiling,
+    // and one for an allocation that is not there: answered, nothing
+    // written.
+    let entries = cluster.raft_entries();
+    let again = cluster
+        .resize("n1", envelope, floor.clone(), grown.clone())
+        .await?;
+    assert_eq!(again.outcome, "applied");
+    let stale = cluster
+        .resize(
+            "n1",
+            envelope,
+            floor.clone(),
+            json!({ "cpu": 2000, "memory": 2048 }),
+        )
+        .await?;
+    assert_eq!(stale.outcome, "stale");
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&stale.size)?,
+        grown
+    );
+    let invalid = cluster
+        .resize(
+            "n1",
+            envelope,
+            grown.clone(),
+            json!({ "cpu": 3000, "memory": 2048 }),
+        )
+        .await?;
+    assert_eq!(invalid.outcome, "invalid", "{invalid:?}");
+    let gone = cluster
+        .resize("n1", 999_999, grown.clone(), grown.clone())
+        .await?;
+    assert_eq!(gone.outcome, "gone");
+    assert_eq!(cluster.raft_entries(), entries);
+
+    // Other work takes 400 MHz. A grow to the whole node takes only what
+    // is left (1,600 MHz), and then nothing more fits.
+    cluster.run_filler("filler-a", json!({ "cpu": 400, "memory": 512 }))?;
+    let partial = cluster
+        .resize(
+            "n1",
+            envelope,
+            grown.clone(),
+            json!({ "cpu": 2000, "memory": 4096 }),
+        )
+        .await?;
+    assert_eq!(partial.outcome, "partial", "{partial:?}");
+    let most = json!({ "cpu": 1600, "memory": 4096 });
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&partial.size)?,
+        most
+    );
+    let entries = cluster.raft_entries();
+    let refused = cluster
+        .resize(
+            "n1",
+            envelope,
+            most.clone(),
+            json!({ "cpu": 2000, "memory": 4096 }),
+        )
+        .await?;
+    assert_eq!(refused.outcome, "refused", "{refused:?}");
+    assert_eq!(
+        cluster.raft_entries(),
+        entries,
+        "a refused grow writes nothing"
+    );
+
+    // A job that needs 100 MHz now blocks on the node. Shrinking the
+    // envelope back to its sessions' 1,500 MHz frees the room, and the
+    // shrink alone wakes the blocked eval.
+    cluster.store().wake_blocked_evals()?;
+    cluster.run_filler("filler-b", json!({ "cpu": 100, "memory": 512 }))?;
+    assert_eq!(cluster.store().blocked_evals()?.len(), 1, "no room for B");
+    assert_eq!(cluster.store().wake_blocked_evals()?, 0);
+    let shrunk = cluster
+        .resize("n1", envelope, most.clone(), grown.clone())
+        .await?;
+    assert_eq!(shrunk.outcome, "applied", "{shrunk:?}");
+    assert_eq!(cluster.envelope_row("n1")?.1, grown);
+    assert_eq!(
+        cluster.store().wake_blocked_evals()?,
+        1,
+        "the shrink woke B"
+    );
+    tokio::task::block_in_place(|| cluster.run_eval_worker())?;
+    assert!(cluster.store().blocked_evals()?.is_empty());
+    assert!(
+        cluster
+            .store()
+            .allocs_for_job("filler-b")?
+            .iter()
+            .any(|allocation| allocation.node_id == "n1"),
+        "B placed in the room the shrink gave back"
+    );
     Ok(())
 }

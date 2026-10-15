@@ -722,10 +722,17 @@ impl ContentStore {
         class: ContentClass,
         opts: PutOptions,
     ) -> R<ContentEntry> {
-        let hashed = ContentDigest::of_file(&tmp).and_then(|digest| {
-            let size = fs::metadata(&tmp)?.len();
-            Ok((digest, size))
-        });
+        // Restores check a blob's size, not its hash, so the bytes must be on
+        // disk before the rename commits them. Otherwise a power loss can leave
+        // a right-sized blob of zeros that passes `blob_intact`.
+        let hashed = fs::File::open(&tmp)
+            .and_then(|file| file.sync_all())
+            .map_err(anyhow::Error::from)
+            .and_then(|()| ContentDigest::of_file(&tmp))
+            .and_then(|digest| {
+                let size = fs::metadata(&tmp)?.len();
+                Ok((digest, size))
+            });
         match hashed {
             Ok((digest, size)) => self.commit(tmp, digest, size, class, opts),
             Err(err) => {

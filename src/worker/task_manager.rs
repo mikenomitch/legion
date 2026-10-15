@@ -258,6 +258,47 @@ impl ShutdownStop {
     }
 }
 
+/// A session stop taken out of the terminating set to be destroyed without
+/// the task-manager lock ([`WorkerTaskManager::take_reapable`]).
+pub struct Reap {
+    allocation_id: i64,
+    entry: TerminatingAllocation,
+    plugin: Arc<crate::task_plugins::LoadedTaskPlugin>,
+    /// Where to remove the task's cgroup leaf from, once its process is gone.
+    cgroup_root: Option<PathBuf>,
+}
+
+impl Reap {
+    /// The hard stop and the runtime's own teardown. Shells out and removes
+    /// files, so it runs with no lock held.
+    pub fn destroy(&mut self) {
+        let entry = &mut self.entry;
+        if let Err(err) =
+            self.plugin
+                .task_plugin()
+                .destroy(&entry.allocation, &entry.task, &mut entry.instance)
+        {
+            warn!(
+                allocation_id = self.allocation_id,
+                task_name = %entry.task.name,
+                error = ?err,
+                "Failed to destroy allocation instance"
+            );
+        }
+        if let (Some(root), Some(assignment)) = (
+            &self.cgroup_root,
+            entry.instance.resource_assignment.as_ref(),
+        ) {
+            crate::worker::resources::remove_task_cgroup(root, assignment);
+        }
+    }
+}
+
+/// How long a ratified claim is kept from the stop sweep while no desired set
+/// lists it yet. Raft followers apply within milliseconds when healthy. This
+/// covers a leader election, after which every manager has the entry.
+const RATIFIED_SETTLE: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// Why [`WorkerTaskManager::reap_terminating`] finished an allocation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReapOutcome {
@@ -532,13 +573,30 @@ pub struct UnlockedLaunch {
     /// When the runtime calls returned, so the wait for the lock and the
     /// registration after it are timed as the `register` stage.
     runtime_returned: Option<std::time::Instant>,
+    /// The task's cgroup leaf, created first thing in [`Self::run`] so the
+    /// task never starts outside its limits.
+    pending_cgroup: Option<crate::worker::resources::PendingCgroup>,
+    /// The snapshot this launch starts from instead of booting, and the
+    /// node content store holding its parts. A restore can wait minutes on
+    /// the VMM (an eager copy of a large guest's memory), so it runs here,
+    /// with the lock released, like any other start.
+    restore: Option<crate::structs::SnapshotRestore>,
+    content_store: Option<Arc<ContentStore>>,
+    /// When the restore began, for its record on the checkpoint channel.
+    restore_started: Option<std::time::Instant>,
 }
 
 impl UnlockedLaunch {
-    /// The slow half: mount, consume artifacts, `prepare`, `start`. Called
-    /// with no lock held.
+    /// The slow half: the cgroup leaf, mount, consume artifacts, `prepare`,
+    /// `start`. Called with no lock held.
     fn run(&mut self) -> R<()> {
-        let result = self.run_stages();
+        let result = match self.pending_cgroup.as_ref().map(|leaf| leaf.create()) {
+            Some(Err(err)) => Err(err.context(format!(
+                "failed to place task {} within this node's resource limits",
+                self.task.name
+            ))),
+            _ => self.run_stages(),
+        };
         self.runtime_returned = Some(std::time::Instant::now());
         result
     }
@@ -550,6 +608,17 @@ impl UnlockedLaunch {
         // directory because its volume was still being mounted.
         if !self.volume_specs.is_empty() {
             let started = std::time::Instant::now();
+            // A restore rolls the instance volume back before anything
+            // mounts it, so the task never sees the state it is being
+            // rolled back from.
+            if let Some(restore) = &self.restore {
+                restore_snapshot_volumes(
+                    &self.volumes,
+                    &self.allocation,
+                    restore,
+                    &self.volume_specs,
+                )?;
+            }
             self.volumes.unmount_for_allocation(self.allocation.id);
             let volume_instance =
                 crate::worker::volumes::instance_ref_from_task(&self.allocation, &self.task);
@@ -590,17 +659,37 @@ impl UnlockedLaunch {
             start_stage::PREPARE,
             prepare_started.elapsed(),
         );
-        info!(
-            allocation_id = self.allocation.id,
-            task_name = %self.task.name,
-            "Starting task allocation"
-        );
         let start_started = std::time::Instant::now();
-        let started = plugin.start(&self.allocation, &self.task, &mut self.instance);
-        self.instance
-            .start_timings
-            .record(&runtime, start_stage::START, start_started.elapsed());
-        started?;
+        if let Some(restore) = self.restore.clone() {
+            self.restore_started = Some(start_started);
+            let restored = WorkerTaskManager::restore_from_snapshot(
+                plugin,
+                self.content_store.as_deref(),
+                &self.allocation,
+                &self.task,
+                &mut self.instance,
+                &restore,
+            );
+            self.instance.start_timings.record(
+                &runtime,
+                start_stage::RESTORE,
+                start_started.elapsed(),
+            );
+            restored?;
+        } else {
+            info!(
+                allocation_id = self.allocation.id,
+                task_name = %self.task.name,
+                "Starting task allocation"
+            );
+            let started = plugin.start(&self.allocation, &self.task, &mut self.instance);
+            self.instance.start_timings.record(
+                &runtime,
+                start_stage::START,
+                start_started.elapsed(),
+            );
+            started?;
+        }
         if self.claim_id.is_some() {
             // A session's row in the session log pins its process by pid and
             // start time, so a restarted worker re-adopts the right process.
@@ -641,9 +730,27 @@ impl UnlockedLaunch {
     }
 }
 
+/// The end of a start that touches the disk and the log: the log sinks'
+/// manifests and the start's stage line. Done once the task-manager lock is
+/// released. Under a node's churn these were most of the lock's hold time
+/// per start, waiting on the same disk as every guest's boot.
+pub(crate) struct AfterStart {
+    sinks: Arc<Vec<Box<dyn LogSink>>>,
+    resource: LogResource,
+    timings: StartTimings,
+}
+
+impl AfterStart {
+    fn run(mut self, task: &TaskConfig) {
+        notify_sinks_started(&self.sinks, &self.resource);
+        self.timings
+            .finish(self.resource.allocation_id, &task.name, &task.runtime);
+    }
+}
+
 /// How [`WorkerTaskManager::finish_unlocked_launch`] settled a launch.
 enum LaunchFinish {
-    Started(Box<(Allocation, TaskConfig)>),
+    Started(Box<(Allocation, TaskConfig, AfterStart)>),
     /// The runtime failed; the failure is already recorded.
     Failed(String),
     /// Stopped or failed while the runtime worked; the caller must tear it
@@ -743,7 +850,7 @@ pub struct WorkerTaskManager {
     /// Publishing to the worker's `contentStore` (`None` when unconfigured
     /// or the node has no content store).
     content_publishing: Option<Arc<crate::content_publish::ContentPublishing>>,
-    log_sinks: Vec<Box<dyn LogSink>>,
+    log_sinks: Arc<Vec<Box<dyn LogSink>>>,
     /// Volume drivers plus the mounts held for each allocation. Mounting
     /// happens here, between `prepare_instance` and `start`, so a task can never
     /// start before its storage is real (see docs/volumes.md).
@@ -764,6 +871,10 @@ pub struct WorkerTaskManager {
     /// This node's advisory view of its own free capacity, so it cannot
     /// double-admit itself into oversubscription across concurrent claims.
     ledger: LocalLedger,
+    /// How many unratified edge claims this node admits at once
+    /// (`edgeBoot.maxProvisionalPerNode`, adapted to ratify latency). Every
+    /// exit of an unratified claim frees its slot here.
+    claim_window: Arc<crate::worker::claim_window::ClaimWindow>,
     /// The node's CPU/memory accounting and cgroup hierarchy (see
     /// `src/worker/resources.rs`). Disabled unless the worker was started
     /// with `resourceEnforcement.enabled`, in which case it governs every
@@ -786,6 +897,13 @@ pub struct WorkerTaskManager {
     /// The launch thread tears them down when the runtime call returns, and
     /// the id cannot be launched again until it has.
     cancelled_launches: std::collections::HashSet<i64>,
+    /// Claims ratified that no desired set has listed yet, by local key, with
+    /// when they were ratified (see [`Self::reconcile_allocations`]).
+    ratified_unseen: HashMap<i64, std::time::Instant>,
+    /// Session stops the supervisor took out of `terminating` to destroy
+    /// without the lock ([`Self::take_reapable`]). Each still counts as
+    /// stopping until [`Self::finish_reap`] releases it.
+    reaping: std::collections::HashSet<i64>,
     next_launch_generation: u64,
     /// The checkpoint channel's worker state: snapshot work in flight and
     /// done, reports owed to the manager, and allocations starting from a
@@ -856,6 +974,10 @@ pub struct WorkerTaskManager {
     /// duplicate): their manifest belongs to the winner and is not deleted
     /// when the stop settles.
     keep_manifest: std::collections::HashSet<String>,
+    /// Each envelope's committed size and, for an elastic envelope, its
+    /// resize controller, by the envelope's local key (elastic-session-
+    /// envelopes plan §6.2). Admission reads the room from here.
+    envelope_sizes: HashMap<i64, crate::worker::envelope_elastic::EnvelopeSize>,
 }
 
 /// A session task's spec, as its envelope's payload carried it.
@@ -916,7 +1038,7 @@ impl WorkerTaskManager {
             )),
             content_store: None,
             content_publishing: None,
-            log_sinks: default_sinks(),
+            log_sinks: Arc::new(default_sinks()),
             volumes: Arc::new(WorkerVolumeManager::new(
                 String::new(),
                 crate::volumes::VolumeRuntimeConfig {
@@ -929,6 +1051,9 @@ impl WorkerTaskManager {
             volume_specs: HashMap::new(),
             claims: ClaimTable::new(),
             ledger: LocalLedger::default(),
+            // Replaced by the daemon from the worker's `edgeBoot` block
+            // (`configure_claim_window`).
+            claim_window: Arc::new(crate::worker::claim_window::ClaimWindow::default()),
             // Configured explicitly by the daemon from the worker config
             // (`configure_resource_enforcement`), never inferred here: this
             // constructor runs before the daemon has read that config.
@@ -936,6 +1061,8 @@ impl WorkerTaskManager {
             launching: HashMap::new(),
             staging: HashMap::new(),
             cancelled_launches: std::collections::HashSet::new(),
+            ratified_unseen: HashMap::new(),
+            reaping: std::collections::HashSet::new(),
             next_launch_generation: 0,
             checkpoints: Default::default(),
             orphaned_sessions: HashMap::new(),
@@ -957,6 +1084,7 @@ impl WorkerTaskManager {
             session_live_published: HashMap::new(),
             pending_manifest_deletes: Vec::new(),
             keep_manifest: std::collections::HashSet::new(),
+            envelope_sizes: HashMap::new(),
         }
     }
 
@@ -975,17 +1103,7 @@ impl WorkerTaskManager {
     /// Notify every log sink that an allocation has started (writes manifests,
     /// etc.). Failures are logged, never fatal to task startup.
     fn notify_log_sinks_started(&self, allocation: &Allocation, task: &TaskConfig) {
-        let resource = self.log_resource(allocation, task);
-        for sink in &self.log_sinks {
-            if let Err(err) = sink.on_start(&resource) {
-                warn!(
-                    allocation_id = allocation.id,
-                    sink = sink.name(),
-                    error = ?err,
-                    "Log sink on_start failed"
-                );
-            }
-        }
+        notify_sinks_started(&self.log_sinks, &self.log_resource(allocation, task));
     }
 
     /// Run rotation/retention (and any other sink upkeep) across all active
@@ -996,7 +1114,7 @@ impl WorkerTaskManager {
                 continue;
             };
             let resource = self.log_resource(allocation, task);
-            for sink in &self.log_sinks {
+            for sink in self.log_sinks.iter() {
                 if let Err(err) = sink.maintain(&resource) {
                     warn!(
                         allocation_id = *allocation_id,
@@ -2154,6 +2272,12 @@ impl WorkerTaskManager {
     fn cleanup_alloc_dir(&self, allocation_id: i64) {
         let dir = self.alloc_dir(allocation_id);
         if dir.exists() {
+            // A sandbox's directory holds its root disk. Removing it under
+            // this lock waited on the same disk as every booting guest, so it
+            // is renamed aside (one metadata update) and removed later.
+            if remove_dir_later(&self.alloc_root, &dir) {
+                return;
+            }
             if let Err(err) = std::fs::remove_dir_all(&dir) {
                 warn!(
                     allocation_id,
@@ -2283,6 +2407,7 @@ impl WorkerTaskManager {
         self.task_configs.remove(&allocation_id);
         self.allocation_health.remove(&allocation_id);
         self.self_fence_windows.remove(&allocation_id);
+        self.envelope_sizes.remove(&allocation_id);
         self.terminated.remove(&allocation_id);
         self.terminating.remove(&allocation_id);
         self.restart_history.remove(&allocation_id);
@@ -2420,6 +2545,17 @@ impl WorkerTaskManager {
                 )
             })
             .collect();
+        // An envelope that grew or shrank keeps its allocation id: its new
+        // size arrives here as a changed payload, never as a new launch.
+        let now = std::time::Instant::now();
+        for allocation in allocations {
+            if allocation.task_runtime == crate::structs::session::ENVELOPE_RUNTIME {
+                let local = self.local_key(allocation.allocation_id);
+                self.observe_envelope_size(local, allocation, now);
+            }
+        }
+        self.envelope_sizes
+            .retain(|local, _| desired_ids.contains(local) || self.instances.contains_key(local));
         // An eviction is settled once the manager stops asking for the
         // allocation; until then it must not be relaunched.
         self.pressure_evicted
@@ -2431,11 +2567,22 @@ impl WorkerTaskManager {
         // first heartbeat. When the lease expires the claim is killed by
         // `sweep_expired_claims`, which is the same outcome one tick later
         // with no new reaper.
-        let protected = self
+        let mut protected = self
             .claims
             .unratified_local_keys()
             .into_iter()
             .collect::<std::collections::HashSet<_>>();
+        // A claim ratified a moment ago is missing from a desired set built
+        // before its ratification was visible: the reply to a heartbeat sent
+        // to a raft follower that has not applied it yet, or one the leader
+        // computed just before. Reading that absence as "stop" killed
+        // confirmed sandboxes on a three-manager cluster. So it stays
+        // protected until a desired set lists it, or for
+        // `RATIFIED_SETTLE`, after which an absence is a decision again.
+        self.ratified_unseen.retain(|local, at| {
+            !desired_ids.contains(local) && now.duration_since(*at) < RATIFIED_SETTLE
+        });
+        protected.extend(self.ratified_unseen.keys().copied());
         // A restore replaces an instance's allocation in one manager
         // transaction. Allocation ids are never reused (AUTOINCREMENT), so
         // the replacement normally has a new id; a store migrated from a
@@ -2483,6 +2630,7 @@ impl WorkerTaskManager {
                     && !self.terminating.contains_key(&local)
                     && !self.draining.contains_key(&local)
                     && !self.cancelled_launches.contains(&local)
+                    && !self.reaping.contains(&local)
                     && !self.pressure_evicted.contains(&local)
             })
             .cloned()
@@ -2567,6 +2715,7 @@ impl WorkerTaskManager {
         let instance = self.instances.remove(&allocation_id);
         self.allocation_health.remove(&allocation_id);
         self.self_fence_windows.remove(&allocation_id);
+        self.envelope_sizes.remove(&allocation_id);
         self.terminated.remove(&allocation_id);
         self.restart_history.remove(&allocation_id);
         self.artifact_status.remove(allocation_id);
@@ -2934,8 +3083,23 @@ impl WorkerTaskManager {
     ///
     /// Returns what happened to each, newest ids last, for logging and tests.
     pub fn reap_terminating(&mut self) -> Vec<(i64, ReapOutcome)> {
+        self.take_reapable(false).0
+    }
+
+    /// [`Self::reap_terminating`], except that with `defer_sessions` a
+    /// session's stop is not destroyed here: it comes back as a [`Reap`] for
+    /// the caller to [`Reap::destroy`] without the lock and hand to
+    /// [`Self::finish_reap`]. A sandbox's `destroy` kills its VMM and
+    /// removes its root disk, and a node stopping hundreds of sessions a
+    /// second spent most of its lock time there, holding back every start.
+    ///
+    /// Only sessions qualify: their local keys are never reused, so nothing
+    /// can launch under the id while it is reaped. A keyed allocation can be
+    /// re-dispatched in place under its id, so it keeps the locked path.
+    pub fn take_reapable(&mut self, defer_sessions: bool) -> (Vec<(i64, ReapOutcome)>, Vec<Reap>) {
+        let mut deferred = Vec::new();
         if self.terminating.is_empty() {
-            return Vec::new();
+            return (Vec::new(), deferred);
         }
         let now = std::time::Instant::now();
         let mut ready: Vec<(i64, ReapOutcome)> = Vec::new();
@@ -2969,6 +3133,18 @@ impl WorkerTaskManager {
             // `destroy` is the hard stop either way. After a clean exit it is
             // pure teardown (image scratch, cgroup, container row); after a
             // timeout it is also the SIGKILL.
+            if defer_sessions && *allocation_id < 0 && entry.remove_dirs {
+                if let Some(plugin) = self.registry.plugin_handle(&entry.task.runtime) {
+                    self.reaping.insert(*allocation_id);
+                    deferred.push(Reap {
+                        allocation_id: *allocation_id,
+                        entry,
+                        plugin,
+                        cgroup_root: self.resources.leaf_remover(),
+                    });
+                    continue;
+                }
+            }
             let allocation = entry.allocation.clone();
             let task = entry.task.clone();
             let remove_dirs = entry.remove_dirs;
@@ -2980,7 +3156,19 @@ impl WorkerTaskManager {
                 remove_dirs,
             );
         }
-        ready
+        (ready, deferred)
+    }
+
+    /// Release a [`Reap`] once its `destroy` ran: volumes, cores, cgroup
+    /// and directories, in [`Self::finish_teardown`]'s order.
+    pub fn finish_reap(&mut self, reap: Reap) {
+        self.reaping.remove(&reap.allocation_id);
+        let assignment = reap.entry.instance.resource_assignment.clone();
+        self.finish_teardown(
+            reap.allocation_id,
+            reap.entry.remove_dirs,
+            assignment.as_ref(),
+        );
     }
 
     /// Whether a terminating instance's process is still running. Reaps the
@@ -3009,7 +3197,7 @@ impl WorkerTaskManager {
     /// holds new launches while this is true (see
     /// [`Self::reconcile_allocations`]).
     pub fn has_terminating(&self) -> bool {
-        !self.terminating.is_empty()
+        !self.terminating.is_empty() || !self.reaping.is_empty()
     }
 
     /// Allocation ids currently draining, for tests and diagnostics.
@@ -3386,6 +3574,21 @@ impl WorkerTaskManager {
         self.ledger = ledger;
     }
 
+    /// Install the node's claim window, built from its `edgeBoot` block.
+    /// Called once at worker startup, before any edge start can arrive.
+    pub fn configure_claim_window(
+        &mut self,
+        window: Arc<crate::worker::claim_window::ClaimWindow>,
+    ) {
+        self.claim_window = window;
+    }
+
+    /// The claim window `Worker.StartClaim` reserves room in before it
+    /// admits anything.
+    pub fn claim_window(&self) -> Arc<crate::worker::claim_window::ClaimWindow> {
+        self.claim_window.clone()
+    }
+
     /// Snapshot of the node's live claims, for `legion node claims` and the
     /// heartbeat report.
     pub fn claims_snapshot(&self) -> Vec<ClaimRecord> {
@@ -3428,6 +3631,7 @@ impl WorkerTaskManager {
             && !self.terminating.contains_key(&local)
             && !self.draining.contains_key(&local)
             && !self.cancelled_launches.contains(&local)
+            && !self.reaping.contains(&local)
             && !self.pressure_evicted.contains(&local)
             && !self
                 .claims
@@ -3489,6 +3693,8 @@ impl WorkerTaskManager {
         let allocation_id = final_payload.allocation_id;
 
         let local_key = claim.local_key;
+        self.ratified_unseen
+            .insert(local_key, std::time::Instant::now());
         // Adopt the committed payload before doing anything with it. The
         // payload the node booted (or staged) with could not name assigned
         // ports, the bound instance, or resolved volume mounts — those are
@@ -3528,6 +3734,9 @@ impl WorkerTaskManager {
         }
 
         self.ledger.release_hold(claim_id);
+        // The verdict's feedback, if any, was fed in by whoever delivered
+        // it; this only makes sure the slot is free.
+        self.claim_window.release(claim_id);
         // A promoted session stays inside its envelope, whose allocation
         // already holds the room it uses.
         if !claim.is_session() {
@@ -3570,6 +3779,9 @@ impl WorkerTaskManager {
         }
         let claim = self.claims.remove(claim_id)?;
         self.ledger.release_hold(claim_id);
+        // The one exit every kill takes, so a window slot cannot leak here
+        // and shut the node to edge starts.
+        self.claim_window.release(claim_id);
         self.orphaned_sessions.remove(claim_id);
         if claim.is_session() && !claim.is_ratified() {
             self.queue_manifest_delete(&claim);
@@ -3621,6 +3833,12 @@ impl WorkerTaskManager {
         let expired = self.claims.expired(now);
         let mut killed = Vec::with_capacity(expired.len());
         for claim in expired {
+            // A lease that ran out is the strongest sign ratification is
+            // behind: it shrinks the window before the kill frees the slot.
+            self.claim_window.settle(
+                &claim.claim_id,
+                crate::worker::claim_window::Feedback::Failed,
+            );
             if let Some(claim) = self.kill_claim(&claim.claim_id, "ratification lease expired") {
                 killed.push(claim);
             }
@@ -3704,14 +3922,20 @@ impl WorkerTaskManager {
     /// registered claim; the caller launches it with
     /// [`launch_provisional_allocation`].
     pub fn admit_session(&mut self, record: ClaimRecord) -> R<ClaimRecord> {
-        let Some((_, envelope)) = self.envelope_for(&record.job_id, &record.task_name) else {
+        let Some((local, envelope)) = self.envelope_for(&record.job_id, &record.task_name) else {
             return Err(SessionRefusal::NoEnvelope {
                 job_id: record.job_id.clone(),
                 task_name: record.task_name.clone(),
             }
             .into());
         };
-        let room = crate::structs::session::resource_amounts(&envelope.resources);
+        // The committed size, capped by a shrink in flight; the declared
+        // floor until the first payload with a size arrives.
+        let room = self
+            .envelope_sizes
+            .get(&local)
+            .map(|size| size.room())
+            .unwrap_or_else(|| crate::structs::session::resource_amounts(&envelope.resources));
         let needs = crate::structs::session::resource_amounts(&record.resources);
         // Running totals, not a scan of every session (plan §6.1). They
         // still count a promoted session that stopped until the heartbeat
@@ -3726,6 +3950,139 @@ impl WorkerTaskManager {
             }
         }
         self.claims.insert(record)
+    }
+
+    /// Record the size an envelope's payload carries
+    /// (`TaskAllocation.envelope_resources`, or the declared floor when the
+    /// manager sent none). An envelope with a resize in flight, or answered
+    /// within the trust window, keeps its own record
+    /// ([`crate::worker::envelope_elastic::EnvelopeSize::observe_payload`]).
+    fn observe_envelope_size(
+        &mut self,
+        local: i64,
+        payload: &TaskAllocation,
+        now: std::time::Instant,
+    ) {
+        let raw = if payload.envelope_resources.trim().is_empty() {
+            payload.task_resources.as_str()
+        } else {
+            payload.envelope_resources.as_str()
+        };
+        let size = serde_json::from_str::<Value>(raw)
+            .map(|value| crate::structs::session::resource_amounts(&value))
+            .unwrap_or_default();
+        if size.is_empty() {
+            return;
+        }
+        match self.envelope_sizes.entry(local) {
+            std::collections::hash_map::Entry::Occupied(mut entry) => {
+                entry.get_mut().observe_payload(size, now)
+            }
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert(crate::worker::envelope_elastic::EnvelopeSize::new(size));
+            }
+        }
+    }
+
+    /// This heartbeat's resizes for this node's elastic envelopes
+    /// (`HeartbeatRequest.envelope_resizes`, elastic-session-envelopes plan
+    /// §6.2): at most one per envelope, a resize in flight asked again.
+    ///
+    /// Only the envelope admission uses for each session task is resized
+    /// (the newest, when a job update briefly leaves two), and it is sized
+    /// from its task's active sessions alone. Runs under the same lock as
+    /// [`Self::admit_session`], so a shrink's admission cap is in place
+    /// before the next session can be admitted.
+    pub fn envelope_resize_requests(
+        &mut self,
+        now: std::time::Instant,
+    ) -> Vec<crate::structs::EnvelopeResize> {
+        let tasks: std::collections::BTreeSet<(String, String)> = self
+            .envelope_sizes
+            .keys()
+            .filter_map(|local| {
+                let serves =
+                    crate::structs::session::envelope_serves(self.task_configs.get(local)?)?;
+                let job_id = &self.allocations.get(local)?.job_id;
+                Some((job_id.clone(), serves.to_string()))
+            })
+            .collect();
+        let mut requests = Vec::new();
+        for (job_id, task_name) in tasks {
+            let Some((local, _)) = self.envelope_for(&job_id, &task_name) else {
+                continue;
+            };
+            let Some(spec) = self.session_specs.get(&local) else {
+                continue;
+            };
+            let Some(bounds) = crate::structs::session::elastic_bounds(&spec.task) else {
+                continue;
+            };
+            let session = crate::structs::session::resource_amounts(&spec.task.resources);
+            let used: std::collections::BTreeMap<String, f64> = self
+                .claims
+                .session_usage(&job_id, &task_name)
+                .into_iter()
+                .collect();
+            let Some(size) = self.envelope_sizes.get_mut(&local) else {
+                continue;
+            };
+            if let Some(resize) = size.tick(&bounds, &used, &session, now) {
+                debug!(
+                    allocation_id = local,
+                    job_id = %job_id,
+                    direction = resize.direction.as_str(),
+                    "Asking the manager to resize an envelope"
+                );
+                requests.push(crate::structs::EnvelopeResize {
+                    // Envelopes are placed by the scheduler, never booted
+                    // provisionally, so the local key is the allocation id.
+                    allocation_id: local,
+                    from: crate::structs::session::amounts_json(&resize.from).to_string(),
+                    to: crate::structs::session::amounts_json(&resize.to).to_string(),
+                });
+            }
+        }
+        requests
+    }
+
+    /// The manager's answers to this heartbeat's resizes
+    /// (`HeartbeatReply.envelope_resizes`).
+    pub fn apply_envelope_resize_results(
+        &mut self,
+        results: &[crate::structs::EnvelopeResizeResult],
+        now: std::time::Instant,
+    ) {
+        for result in results {
+            let Some(size) = self.envelope_sizes.get_mut(&result.allocation_id) else {
+                continue;
+            };
+            let committed = serde_json::from_str::<Value>(&result.size)
+                .ok()
+                .map(|value| crate::structs::session::resource_amounts(&value))
+                .filter(|amounts| !amounts.is_empty());
+            match result.outcome.as_str() {
+                "applied" | "partial" => info!(
+                    allocation_id = result.allocation_id,
+                    outcome = %result.outcome,
+                    size = %result.size,
+                    "Envelope resized"
+                ),
+                "error" | "refused" => debug!(
+                    allocation_id = result.allocation_id,
+                    outcome = %result.outcome,
+                    message = %result.message,
+                    "Envelope resize not applied"
+                ),
+                _ => warn!(
+                    allocation_id = result.allocation_id,
+                    outcome = %result.outcome,
+                    message = %result.message,
+                    "Envelope resize not applied"
+                ),
+            }
+            size.answer(&result.outcome, committed, now);
+        }
     }
 
     /// Forget promoted sessions whose allocation has stopped, so their
@@ -3988,6 +4345,11 @@ impl WorkerTaskManager {
             });
             if adoptable {
                 self.ratify_claim(&claim_id, allocation)?;
+                // Delivered by the manager, so the manager lists it already:
+                // no settle window (see `RATIFIED_SETTLE`).
+                if let Some(local) = self.claims.get(&claim_id).map(|claim| claim.local_key) {
+                    self.ratified_unseen.remove(&local);
+                }
                 info!(
                     allocation_id = allocation.allocation_id,
                     session_id = %allocation.promoted_from_session,
@@ -4032,10 +4394,16 @@ impl WorkerTaskManager {
                 ),
             }
         }
+        if crate::structs::session::envelope_serves(&task).is_some() {
+            self.observe_envelope_size(alloc.id, allocation, std::time::Instant::now());
+        }
         // A duplicate dispatch (heartbeat and push racing) of an allocation
         // whose launch is still in its runtime call. Launching it again would
         // start it twice; tearing the first one down would waste the work.
-        if self.launching.contains_key(&alloc.id) || self.cancelled_launches.contains(&alloc.id) {
+        if self.launching.contains_key(&alloc.id)
+            || self.cancelled_launches.contains(&alloc.id)
+            || self.reaping.contains(&alloc.id)
+        {
             debug!(
                 allocation_id = alloc.id,
                 "Allocation launch already in flight; ignoring the duplicate dispatch"
@@ -4113,10 +4481,11 @@ impl WorkerTaskManager {
         // keep the locked path: their failures settle the claim (see
         // `launch_provisional_allocation`) rather than reaching the manager
         // as a failed allocation, which `record_failure` would do.
-        // A restore keeps the locked path too: it runs inside the locked
-        // start, which records its outcome on the checkpoint channel.
+        // A restore launches off the lock as well, once its parts are on the
+        // node (`restore_fetch` stages them first): a VMM restoring a large
+        // guest can take minutes, and the finish records its outcome on the
+        // checkpoint channel.
         let provisional = self.claims.by_local_key(alloc.id).is_some();
-        let restoring = self.checkpoints.restores.contains_key(&alloc.id);
         // A session launches off the lock too (session durability plan
         // §6.1): a node runs its sessions' starts side by side, and a slow
         // sandbox boot holds up no other start, stop, or heartbeat. Its
@@ -4127,7 +4496,10 @@ impl WorkerTaskManager {
             .filter(|claim| claim.is_session() && !claim.is_ratified())
             .map(|claim| claim.claim_id.clone());
         if let Some(claim_id) = session_claim {
-            if task.artifacts.is_empty() && !restoring && matches!(gate, Gate::Serve | Gate::Boot) {
+            if task.artifacts.is_empty()
+                && restore_fetch.is_none()
+                && matches!(gate, Gate::Serve | Gate::Boot)
+            {
                 self.registry
                     .load_plugin(&task.runtime, true)
                     .with_context(|| format!("Failed to load task plugin {}", task.runtime))?;
@@ -4138,7 +4510,8 @@ impl WorkerTaskManager {
                 return Ok(BeginOutcome::Launching(Box::new(launch)));
             }
         }
-        if task.artifacts.is_empty() && gate == Gate::Off && !provisional && !restoring {
+        if task.artifacts.is_empty() && gate == Gate::Off && !provisional && restore_fetch.is_none()
+        {
             self.registry
                 .load_plugin(&task.runtime, true)
                 .with_context(|| format!("Failed to load task plugin {}", task.runtime))?;
@@ -4407,14 +4780,15 @@ impl WorkerTaskManager {
             .registry
             .plugin_handle(&task.runtime)
             .context("Task plugin not loaded")?;
-        // Resource placement stays under the lock: the allocator and slice
-        // masks are this struct's, and it is quick (a cgroup mkdir and a few
-        // small writes). A task must never observe its limits arriving after
-        // it started, so it happens before `prepare`.
+        // The allocator's bookkeeping stays under the lock: the core
+        // reservations and slice masks are this struct's. The task's cgroup
+        // leaf is created by the launch, first thing and without the lock
+        // (`UnlockedLaunch::run`), so a task still never observes its limits
+        // arriving after it started.
         let runtime = plugin.task_plugin();
-        instance.resource_assignment = self
+        let (assignment, pending_cgroup) = self
             .resources
-            .assign(
+            .assign_deferred(
                 allocation.id,
                 task,
                 runtime.resource_enforcement(),
@@ -4426,6 +4800,7 @@ impl WorkerTaskManager {
                     task.name
                 )
             })?;
+        instance.resource_assignment = assignment;
         let log_dir = crate::worker::logs::claim_allocation_log_dir(
             self.state_store.allocation_log_dir(allocation.id),
             &crate::worker::logs::LogDirOwner::for_allocation(allocation, &task.name),
@@ -4475,6 +4850,10 @@ impl WorkerTaskManager {
                 .unwrap_or_default(),
             pid_start_time: None,
             runtime_returned: None,
+            pending_cgroup,
+            restore: self.checkpoints.restores.get(&allocation.id).cloned(),
+            content_store: self.content_store.clone(),
+            restore_started: None,
         })
     }
 
@@ -4488,7 +4867,33 @@ impl WorkerTaskManager {
         failure_prefix: &str,
     ) -> LaunchFinish {
         let allocation_id = launch.allocation.id;
-        if self.launching.get(&allocation_id) != Some(&launch.generation) {
+        // A restore's outcome goes on the checkpoint channel, so the resume
+        // that asked for it follows `onRestoreFailure`. One stopped while it
+        // restored did not restore.
+        let cancelled = self.launching.get(&allocation_id) != Some(&launch.generation);
+        if let Some(started) = launch.restore_started {
+            if self.checkpoints.has_pending_restore(allocation_id) {
+                match (&result, cancelled) {
+                    (Ok(()), false) => {
+                        self.checkpoints
+                            .record_restore(allocation_id, true, String::new(), started)
+                    }
+                    (Err(err), _) => self.checkpoints.record_restore(
+                        allocation_id,
+                        false,
+                        format!("{err:#}"),
+                        started,
+                    ),
+                    (Ok(()), true) => self.checkpoints.record_restore(
+                        allocation_id,
+                        false,
+                        "stopped while it restored".to_string(),
+                        started,
+                    ),
+                }
+            }
+        }
+        if cancelled {
             return LaunchFinish::Cancelled(Box::new(launch));
         }
         self.launching.remove(&allocation_id);
@@ -4519,8 +4924,8 @@ impl WorkerTaskManager {
             return LaunchFinish::Failed(reason);
         }
         self.set_allocation_health(allocation_id, false, "starting");
-        self.notify_log_sinks_started(&allocation, &task);
         self.persist_state_unless_provisional(allocation_id);
+        let mut timings = StartTimings::default();
         if let Some(instance) = self.instances.get_mut(&allocation_id) {
             if let Some(returned) = runtime_returned {
                 instance.start_timings.record(
@@ -4529,10 +4934,13 @@ impl WorkerTaskManager {
                     returned.elapsed(),
                 );
             }
-            instance
-                .start_timings
-                .finish(allocation_id, &task.name, &task.runtime);
+            timings = std::mem::take(&mut instance.start_timings);
         }
+        let after = AfterStart {
+            sinks: self.log_sinks.clone(),
+            resource: self.log_resource(&allocation, &task),
+            timings,
+        };
         // See `start_registered_allocation`: a batch task on a runtime that
         // tracks no process reports its completion at start.
         if !plugin.task_plugin().supervises_process()
@@ -4540,7 +4948,7 @@ impl WorkerTaskManager {
         {
             self.record_unsupervised_completion(allocation_id, &task.runtime);
         }
-        LaunchFinish::Started(Box::new((allocation, task)))
+        LaunchFinish::Started(Box::new((allocation, task, after)))
     }
 
     /// Finish tearing down a cancelled launch, after its runtime instance
@@ -4561,65 +4969,12 @@ impl WorkerTaskManager {
         let Some(restore) = self.checkpoints.restores.get(&allocation.id).cloned() else {
             return Ok(());
         };
-        let manifest =
-            crate::structs::checkpoint::SnapshotManifest::from_json(&restore.manifest_json)
-                .with_context(|| {
-                    format!(
-                        "snapshot {} has an unreadable manifest",
-                        restore.snapshot_id
-                    )
-                })?;
         let specs = self
             .volume_specs
             .get(&allocation.id)
             .cloned()
             .unwrap_or_default();
-        if restore.fork {
-            return self.clone_allocation_volumes(allocation, &restore, &manifest, &specs);
-        }
-        for snapshot in &manifest.volumes {
-            let mount = specs
-                .iter()
-                .find(|mount| mount.volume_id == snapshot.volume_id)
-                .with_context(|| {
-                    format!(
-                        "snapshot {} holds volume {}, which this allocation does not mount; the \
-                         instance's storage changed since the snapshot was taken",
-                        restore.snapshot_id, snapshot.volume_id
-                    )
-                })?;
-            self.volumes.restore_volume(allocation, mount, snapshot)?;
-        }
-        Ok(())
-    }
-
-    /// Phase 6: give an allocation restoring into a NEW instance (a fork, or
-    /// a create from a snapshot) its own copy of each snapshotted instance
-    /// volume, with the driver's `clone` op. The snapshot holds the origin's
-    /// volumes in mount order, which is also this allocation's order: the
-    /// two run the same task.
-    fn clone_allocation_volumes(
-        &self,
-        allocation: &Allocation,
-        restore: &crate::structs::SnapshotRestore,
-        manifest: &crate::structs::checkpoint::SnapshotManifest,
-        specs: &[crate::structs::VolumeMount],
-    ) -> R<()> {
-        let instance_volumes: Vec<&crate::structs::VolumeMount> =
-            specs.iter().filter(|mount| mount.instance_volume).collect();
-        if instance_volumes.len() != manifest.volumes.len() {
-            bail!(
-                "snapshot {} holds {} instance volume(s), but this allocation mounts {}; the \
-                 task's storage changed since the snapshot was taken",
-                restore.snapshot_id,
-                manifest.volumes.len(),
-                instance_volumes.len()
-            );
-        }
-        for (mount, snapshot) in instance_volumes.into_iter().zip(&manifest.volumes) {
-            self.volumes.clone_volume(allocation, mount, snapshot)?;
-        }
-        Ok(())
+        restore_snapshot_volumes(&self.volumes, allocation, &restore, &specs)
     }
 
     /// Start a prepared instance from a snapshot instead of booting it.
@@ -5608,6 +5963,131 @@ pub fn fence_persisted_allocations(
     Ok(fenced)
 }
 
+/// Where removed allocation directories wait for [`remove_dir_later`]'s
+/// janitor, inside the allocation root so the rename stays on one
+/// filesystem.
+const REMOVING_DIR: &str = ".removing";
+
+/// Rename `dir` into `alloc_root`'s removal area and queue it for a
+/// background thread to delete. False when the rename failed, and the
+/// caller removes it in place.
+fn remove_dir_later(alloc_root: &std::path::Path, dir: &std::path::Path) -> bool {
+    static JANITOR: std::sync::OnceLock<std::sync::mpsc::Sender<PathBuf>> =
+        std::sync::OnceLock::new();
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let removing = alloc_root.join(REMOVING_DIR);
+    let janitor = JANITOR.get_or_init(|| {
+        let (tx, rx) = std::sync::mpsc::channel::<PathBuf>();
+        // Whatever a previous worker left mid-removal goes first.
+        if let Ok(entries) = std::fs::read_dir(&removing) {
+            for entry in entries.flatten() {
+                let _ = tx.send(entry.path());
+            }
+        }
+        let spawned = std::thread::Builder::new()
+            .name("alloc-dir-janitor".into())
+            .spawn(move || {
+                for path in rx {
+                    if let Err(err) = std::fs::remove_dir_all(&path) {
+                        warn!(dir = %path.display(), error = ?err, "Failed to remove allocation directory");
+                    }
+                }
+            });
+        if let Err(err) = spawned {
+            warn!(error = ?err, "Failed to start the allocation directory janitor");
+        }
+        tx
+    });
+    if std::fs::create_dir_all(&removing).is_err() {
+        return false;
+    }
+    // The pid keeps a restarted worker's names clear of its predecessor's.
+    let name = format!(
+        "{}-{}-{}",
+        dir.file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("dir"),
+        std::process::id(),
+        SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    );
+    let target = removing.join(name);
+    if std::fs::rename(dir, &target).is_err() {
+        return false;
+    }
+    if janitor.send(target.clone()).is_err() {
+        // The janitor never started: remove it here after all.
+        let _ = std::fs::remove_dir_all(&target);
+    }
+    true
+}
+
+/// Roll an allocation's instance volumes back to the snapshot it restores
+/// from, with the driver's `restore` op, before they mount. A fork, or a
+/// create from a snapshot, restores into a NEW instance instead: it gets its
+/// own copy of each snapshotted instance volume, with the driver's `clone`
+/// op. The snapshot holds the origin's volumes in mount order, which is also
+/// this allocation's order: the two run the same task.
+fn restore_snapshot_volumes(
+    volumes: &WorkerVolumeManager,
+    allocation: &Allocation,
+    restore: &crate::structs::SnapshotRestore,
+    specs: &[VolumeMount],
+) -> R<()> {
+    let manifest = crate::structs::checkpoint::SnapshotManifest::from_json(&restore.manifest_json)
+        .with_context(|| {
+            format!(
+                "snapshot {} has an unreadable manifest",
+                restore.snapshot_id
+            )
+        })?;
+    if restore.fork {
+        let instance_volumes: Vec<&VolumeMount> =
+            specs.iter().filter(|mount| mount.instance_volume).collect();
+        if instance_volumes.len() != manifest.volumes.len() {
+            bail!(
+                "snapshot {} holds {} instance volume(s), but this allocation mounts {}; the \
+                 task's storage changed since the snapshot was taken",
+                restore.snapshot_id,
+                manifest.volumes.len(),
+                instance_volumes.len()
+            );
+        }
+        for (mount, snapshot) in instance_volumes.into_iter().zip(&manifest.volumes) {
+            volumes.clone_volume(allocation, mount, snapshot)?;
+        }
+        return Ok(());
+    }
+    for snapshot in &manifest.volumes {
+        let mount = specs
+            .iter()
+            .find(|mount| mount.volume_id == snapshot.volume_id)
+            .with_context(|| {
+                format!(
+                    "snapshot {} holds volume {}, which this allocation does not mount; the \
+                     instance's storage changed since the snapshot was taken",
+                    restore.snapshot_id, snapshot.volume_id
+                )
+            })?;
+        volumes.restore_volume(allocation, mount, snapshot)?;
+    }
+    Ok(())
+}
+
+/// Tell every log sink an allocation started. Failures are logged, never
+/// fatal to the start.
+fn notify_sinks_started(sinks: &[Box<dyn LogSink>], resource: &LogResource) {
+    for sink in sinks {
+        if let Err(err) = sink.on_start(resource) {
+            warn!(
+                allocation_id = resource.allocation_id,
+                sink = sink.name(),
+                error = ?err,
+                "Log sink on_start failed"
+            );
+        }
+    }
+}
+
 /// Split a finished child's status into `(exit_code, signal)`. Unix reports a
 /// signal death as `code: None`, which is exactly the distinction the restart
 /// policy and the operator both want to see.
@@ -5680,7 +6160,11 @@ pub fn complete_unlocked_launch(
         .expect("task manager")
         .finish_unlocked_launch(launch, result, failure_prefix);
     match finish {
-        LaunchFinish::Started(started) => Ok(Some(*started)),
+        LaunchFinish::Started(started) => {
+            let (allocation, task, after) = *started;
+            after.run(&task);
+            Ok(Some((allocation, task)))
+        }
         LaunchFinish::Failed(reason) => Err(anyhow!(reason)),
         LaunchFinish::Cancelled(mut launch) => {
             let allocation_id = launch.allocation.id;
@@ -5851,20 +6335,31 @@ fn spawn_provisional_staging_thread(
                 // does (session durability plan §6.1): starting its runtime
                 // here, under the lock, serialized every other start, stop,
                 // and heartbeat on the node behind this one's boot. A
-                // restore keeps the locked start, which records its outcome
-                // on the checkpoint channel.
+                // restore boots off the lock too, from the parts this
+                // thread fetched: the finish records its outcome on the
+                // checkpoint channel.
                 let session = guard
                     .claims
                     .by_local_key(allocation_id)
                     .is_some_and(|claim| claim.is_session() && !claim.is_ratified());
-                let restoring = guard.checkpoints.restores.contains_key(&allocation_id);
-                if session && !restoring && matches!(gate, Gate::Serve | Gate::Boot) {
+                if session && matches!(gate, Gate::Serve | Gate::Boot) {
                     let launch = result.and_then(|staged| {
                         guard.begin_staged_launch(&job.allocation, &job.task, staged)
                     });
                     let mut launch = match launch {
                         Ok(launch) => launch,
                         Err(err) => {
+                            if guard.checkpoints.has_pending_restore(allocation_id) {
+                                guard.checkpoints.record_restore(
+                                    allocation_id,
+                                    false,
+                                    format!("{err:#}"),
+                                    std::time::Instant::now(),
+                                );
+                            }
+                            if job.restore_fetch.is_some() {
+                                guard.release_restore_fetch_pins(allocation_id);
+                            }
                             guard.kill_claim(
                                 claim_id,
                                 &format!("provisional staging failed: {err:#}"),
@@ -5875,7 +6370,16 @@ fn spawn_provisional_staging_thread(
                     launch.gate = gate;
                     launch.claim_id = Some(claim_id.to_string());
                     drop(guard);
-                    match complete_unlocked_launch(&manager, launch, "") {
+                    let finished = complete_unlocked_launch(&manager, launch, "");
+                    // The restore (if any) ran in the launch, so the fetched
+                    // parts no longer need their pins.
+                    if job.restore_fetch.is_some() {
+                        manager
+                            .lock()
+                            .expect("task manager")
+                            .release_restore_fetch_pins(allocation_id);
+                    }
+                    match finished {
                         Ok(Some((alloc, task))) => {
                             manager
                                 .lock()
@@ -6019,11 +6523,10 @@ fn spawn_staging_thread(manager: Arc<Mutex<WorkerTaskManager>>, job: StagingJob)
                 };
                 // Only the ordinary gate reaches this thread (provisional
                 // starts stage on their own), but a gated job keeps the
-                // locked path rather than silently skipping its gate. So
-                // does a restore: it runs inside the locked start, which
+                // locked path rather than silently skipping its gate. A
+                // restore takes the unlocked launch below, whose finish
                 // records its outcome on the checkpoint channel.
-                let restoring = guard.checkpoints.restores.contains_key(&allocation_id);
-                if job.gate != Gate::Off || restoring {
+                if job.gate != Gate::Off {
                     let started =
                         guard.start_staged_allocation(&job.allocation, &job.task, staged, job.gate);
                     // The restore (if any) ran inside the start above, so
@@ -6053,9 +6556,14 @@ fn spawn_staging_thread(manager: Arc<Mutex<WorkerTaskManager>>, job: StagingJob)
                 }
             };
             // The runtime calls run here, with the lock released.
-            if let Ok(Some((allocation, task))) =
-                complete_unlocked_launch(&manager, launch, START_FAILED)
-            {
+            let finished = complete_unlocked_launch(&manager, launch, START_FAILED);
+            if job.restore_fetch.is_some() {
+                manager
+                    .lock()
+                    .expect("task manager")
+                    .release_restore_fetch_pins(allocation_id);
+            }
+            if let Ok(Some((allocation, task))) = finished {
                 spawn_health_monitor(manager, allocation, task);
             }
         });
@@ -6168,6 +6676,14 @@ fn task_from_allocation(allocation: &TaskAllocation) -> R<(Allocation, TaskConfi
             .map_err(|err: String| anyhow!(err))
             .context("Invalid task lifecycle")?
     };
+    let speculative_start = if allocation.task_speculative_start.trim().is_empty() {
+        None
+    } else {
+        Some(
+            serde_json::from_str(&allocation.task_speculative_start)
+                .context("Invalid task speculativeStart JSON")?,
+        )
+    };
     let restart = if allocation.task_restart.trim().is_empty() {
         None
     } else {
@@ -6196,6 +6712,7 @@ fn task_from_allocation(allocation: &TaskAllocation) -> R<(Allocation, TaskConfi
         snapshots,
         lifecycle,
         restart,
+        speculative_start,
         ..TaskConfig::new(&allocation.task_name, &allocation.task_runtime)
     };
     let alloc = Allocation {
@@ -6298,8 +6815,10 @@ mod tests {
             session_task_spec: String::new(),
             session_task_config_id: 0,
             session_seal_keys: Vec::new(),
+            envelope_resources: String::new(),
             task_lifecycle: String::new(),
             task_restart: String::new(),
+            task_speculative_start: String::new(),
         }
     }
 
@@ -6402,7 +6921,19 @@ mod tests {
             }),
             ..volume_payload(42)
         };
-        manager.lock().unwrap().begin_task_allocation(&restore)?;
+        // A restore launches like any other start: the volume rollback and
+        // the runtime's restore run with the task-manager lock released, so
+        // a slow or hung VMM never holds up the rest of the node.
+        let outcome = manager.lock().unwrap().begin_task_allocation(&restore)?;
+        let BeginOutcome::Launching(launch) = outcome else {
+            panic!("a restore must launch off the task-manager lock");
+        };
+        assert_eq!(
+            std::fs::read(volume_dir.join("marker"))?,
+            b"after",
+            "nothing is rolled back under the lock"
+        );
+        complete_unlocked_launch(&manager, *launch, "")?;
         assert_eq!(std::fs::read(volume_dir.join("marker"))?, b"before");
         assert!(!volume_dir.join("new-file").exists());
         assert!(manager.lock().unwrap().is_allocation_active(42));
@@ -6516,7 +7047,7 @@ mod tests {
                 }),
                 ..volume_payload_for(allocation_id, volume_id)
             };
-            manager.lock().unwrap().begin_task_allocation(&payload)?;
+            launch_task_allocation(&manager, &payload)?;
             assert!(manager.lock().unwrap().is_allocation_active(allocation_id));
             let dir = mount_of(allocation_id);
             assert_ne!(dir, origin_dir, "a fork never shares the origin's volume");
@@ -6616,7 +7147,7 @@ mod tests {
             }),
             ..volume_payload(52)
         };
-        manager.lock().unwrap().begin_task_allocation(&resume)?;
+        launch_task_allocation(&manager, &resume)?;
         assert!(manager.lock().unwrap().is_allocation_active(52));
         assert_eq!(
             std::fs::read(volume_dir.join("marker"))?,
@@ -6882,6 +7413,13 @@ mod tests {
     /// The checkpoint key the tests' "manager" derives part keys from.
     const TEST_CHECKPOINT_KEY: [u8; 32] = [42; 32];
 
+    /// The chunk key the manager attaches to a publish.
+    fn test_chunk_key() -> crate::structs::CheckpointChunkKey {
+        crate::checkpoint_seal::ChunkKey::derive(&TEST_CHECKPOINT_KEY, "ck_test", "j")
+            .unwrap()
+            .to_proto()
+    }
+
     /// What the manager attaches to a publish, warm, or restore: one key per
     /// memory part of `manifest`.
     fn part_keys_for(manifest: &Value) -> Vec<crate::structs::CheckpointPartKey> {
@@ -6968,6 +7506,7 @@ mod tests {
             purpose: "suspend".into(),
             manifest_json: captured.to_string(),
             part_keys: part_keys_for(&captured),
+            chunk_key: Some(test_chunk_key()),
             ..Default::default()
         };
         node_a
@@ -6984,18 +7523,18 @@ mod tests {
         let url = published.memory[0].url.clone().expect("part url");
         assert!(url.starts_with("file://"), "{url}");
         assert_eq!(published.memory[0].key_id.as_deref(), Some("ck_test"));
-        let key = crate::checkpoint_seal::PartKey::derive(
-            &TEST_CHECKPOINT_KEY,
-            "ck_test",
-            &entry.digest,
-        )?;
-        let object = shared.path().join("sealed").join(key.object_name());
-        let sealed = std::fs::read(&object)?;
-        assert_eq!(&sealed[..8], crate::checkpoint_seal::SEAL_MAGIC);
-        assert!(
-            !sealed.windows(18).any(|w| w == b"guest memory page "),
-            "the bucket never holds the guest's plaintext"
-        );
+        // The URL names the part's sealed index; the chunks sit beside it,
+        // and every object is sealed.
+        let index = url::Url::parse(&url)?.to_file_path().expect("a file URL");
+        assert_eq!(index.parent(), Some(shared.path().join("sealed").as_path()));
+        for object in std::fs::read_dir(shared.path().join("sealed"))? {
+            let sealed = std::fs::read(object?.path())?;
+            assert_eq!(&sealed[..8], crate::checkpoint_seal::SEAL_MAGIC);
+            assert!(
+                !sealed.windows(18).any(|w| w == b"guest memory page "),
+                "the bucket never holds the guest's plaintext"
+            );
+        }
         assert!(!shared.path().join("sha256").exists());
 
         // B restores from the published manifest, with the keys the manager
@@ -7070,6 +7609,7 @@ mod tests {
             purpose: "suspend".into(),
             manifest_json: captured.to_string(),
             part_keys: part_keys_for(&captured),
+            chunk_key: Some(test_chunk_key()),
             ..Default::default()
         };
         node.lock()
@@ -7179,7 +7719,9 @@ mod tests {
             "ck_test",
             &entry.digest,
         )?;
-        let published = publishing.publish(&key)?;
+        let chunks =
+            crate::checkpoint_seal::ChunkKey::derive(&TEST_CHECKPOINT_KEY, "ck_test", "j")?;
+        let published = publishing.publish(&key, &chunks)?;
         Ok(json!({
             "id": id, "jobId": "j", "task": "t", "originAllocId": 1,
             "runtime": "sandbox", "kind": "memory", "createdAt": "2026-10-10T00:00:00Z",
@@ -7276,20 +7818,24 @@ mod tests {
         // The wrong key also names the wrong object, which is not there.
         assert!(error.contains("fetching part memory"), "{error}");
 
-        let key =
-            crate::checkpoint_seal::PartKey::derive(&TEST_CHECKPOINT_KEY, "ck_test", &digest)?;
-        let object = shared.path().join("sealed").join(key.object_name());
+        // Tamper with one of the part's chunks (any sealed object but the
+        // index the manifest names). It fails at once, not after retries
+        // (checkpoint_chunks tests cover that it is never fetched again).
+        let index = url::Url::parse(manifest["memory"][0]["url"].as_str().unwrap())?
+            .to_file_path()
+            .expect("a file URL");
+        let object = std::fs::read_dir(shared.path().join("sealed"))?
+            .map(|entry| entry.unwrap().path())
+            .find(|path| path != &index)
+            .expect("a chunk beside the index");
         let mut sealed = std::fs::read(&object)?;
         sealed[100] ^= 0x40;
         std::fs::write(&object, &sealed)?;
         let error = warm_with(&manifest, part_keys_for(&manifest), "")?;
+        assert!(error.contains("opening chunk"), "{error}");
         assert!(
             error.contains("failed authentication at chunk 0"),
             "{error}"
-        );
-        assert!(
-            error.contains("after 1 attempt"),
-            "a tampered part is not downloaded again: {error}"
         );
 
         // A manifest published before checkpoint encryption: a URL to a
@@ -7402,6 +7948,37 @@ mod tests {
         assert_eq!(manager.allocations_snapshot(), vec![8123]);
         assert!(manager.unratified_claims().is_empty());
         assert_eq!(manager.local_key(8123), admitted.local_key);
+        Ok(())
+    }
+
+    /// A desired set built before a ratification was visible (a raft
+    /// follower's, or one computed just before) omits the claim it just
+    /// confirmed. That absence is not a stop: the claim stays until a desired
+    /// set has listed it, and only a later absence stops it.
+    #[test]
+    fn a_just_ratified_claim_survives_a_desired_set_that_predates_it() -> R<()> {
+        let temp_dir = TempDir::new()?;
+        let mut manager = manager_in(&temp_dir);
+        let admitted = manager.admit_claim(claim_record("clm_a", "user-42", Gate::Boot))?;
+        manager
+            .begin_task_allocation_gated(&provisional_payload(admitted.local_key), Gate::Boot)?;
+        let mut committed = provisional_payload(admitted.local_key);
+        committed.allocation_id = 8123;
+        manager.ratify_claim("clm_a", &committed)?;
+
+        manager.reconcile_allocations(&[]);
+        assert!(
+            manager.is_allocation_active(admitted.local_key),
+            "a stale desired set must not stop a claim it has never listed"
+        );
+        manager.reconcile_allocations(std::slice::from_ref(&committed));
+        assert!(manager.is_allocation_active(admitted.local_key));
+        manager.reconcile_allocations(&[]);
+        assert!(
+            !manager.terminating_ids().is_empty()
+                || !manager.is_allocation_active(admitted.local_key),
+            "once listed, an absence stops it"
+        );
         Ok(())
     }
 
@@ -7992,6 +8569,143 @@ mod tests {
         );
         start_session(&mut manager, "workspace-c")?;
         manager.stop_sessions(&["workspace-b".into(), "workspace-c".into()], "stop");
+        Ok(())
+    }
+
+    /// An envelope whose session task sets `envelope.max`: floor 1000 MHz /
+    /// 512 MiB (two sessions), ceiling 4000 / 2048 (eight).
+    fn elastic_envelope_payload(allocation_id: i64) -> R<TaskAllocation> {
+        let mut envelope = envelope_payload(allocation_id);
+        envelope.session_task_spec = serde_json::to_string(&TaskConfig {
+            name: "workspace".into(),
+            runtime: "exec".into(),
+            resources: json!({ "cpu": 500, "memory": 256 }),
+            stateful: Some(serde_json::from_value(json!({
+                "mode": "keyed",
+                "envelope": {
+                    "resources": { "cpu": 1000, "memory": 512 },
+                    "max": { "cpu": 4000, "memory": 2048 },
+                },
+            }))?),
+            ..Default::default()
+        })?;
+        envelope.session_task_config_id = 7;
+        envelope.envelope_resources = json!({ "cpu": 1000, "memory": 512 }).to_string();
+        Ok(envelope)
+    }
+
+    fn resize_result(
+        allocation_id: i64,
+        outcome: &str,
+        size: Value,
+    ) -> crate::structs::EnvelopeResizeResult {
+        crate::structs::EnvelopeResizeResult {
+            allocation_id,
+            outcome: outcome.into(),
+            size: size.to_string(),
+            message: String::new(),
+        }
+    }
+
+    /// Elastic-session-envelopes plan §6.2 to §6.4: a full elastic envelope
+    /// asks to grow, admits against the committed size once the answer
+    /// lands, ignores a lagging payload, and caps admission at a shrink's
+    /// target until the shrink is answered.
+    #[test]
+    fn an_elastic_envelope_grows_when_full_and_caps_admission_while_shrinking_test() -> R<()> {
+        let temp_dir = TempDir::new()?;
+        let mut manager = manager_in(&temp_dir);
+        let now = std::time::Instant::now();
+        manager.begin_task_allocation(&elastic_envelope_payload(100)?)?;
+        assert!(manager.envelope_resize_requests(now).is_empty(), "empty");
+
+        start_session(&mut manager, "workspace-a")?;
+        start_session(&mut manager, "workspace-b")?;
+        let grow = manager.envelope_resize_requests(now);
+        assert_eq!(grow.len(), 1, "{grow:?}");
+        assert_eq!(grow[0].allocation_id, 100);
+        assert_eq!(grow[0].from, r#"{"cpu":1000,"memory":512}"#);
+        // Two sessions at 75%, and room for a third.
+        assert_eq!(grow[0].to, r#"{"cpu":1500,"memory":768}"#);
+        // Asked again, unchanged, until answered; nothing is admitted on
+        // room that is not committed.
+        assert_eq!(manager.envelope_resize_requests(now), grow);
+        manager
+            .admit_session(session_record("workspace-c"))
+            .expect_err("not grown yet");
+
+        manager.apply_envelope_resize_results(
+            &[resize_result(
+                100,
+                "applied",
+                json!({ "cpu": 1500, "memory": 768 }),
+            )],
+            now,
+        );
+        start_session(&mut manager, "workspace-c")?;
+        // A desired set built before the grow committed says 1000: the
+        // node's own record wins inside the trust window.
+        manager.reconcile_allocations(&[elastic_envelope_payload(100)?]);
+        manager
+            .admit_session(session_record("workspace-d"))
+            .expect_err("three fill 1500");
+
+        // Two end; one 500 MHz session in 1500 is a third full. After
+        // shrinkAfter (10m by default) the node asks to shrink to the floor
+        // and caps its own admission there before the answer.
+        manager.stop_sessions(&["workspace-a".into(), "workspace-b".into()], "stop");
+        assert!(manager.envelope_resize_requests(now).is_empty());
+        let due = now + Duration::from_secs(601);
+        let shrink = manager.envelope_resize_requests(due);
+        assert_eq!(shrink.len(), 1, "{shrink:?}");
+        assert_eq!(shrink[0].to, r#"{"cpu":1000,"memory":512}"#);
+        start_session(&mut manager, "workspace-d")?;
+        manager
+            .admit_session(session_record("workspace-e"))
+            .expect_err("capped at the shrink's target");
+        // A failed write keeps the cap; the answer settles it.
+        manager.apply_envelope_resize_results(&[resize_result(100, "error", json!(null))], due);
+        manager
+            .admit_session(session_record("workspace-e"))
+            .expect_err("still capped");
+        assert_eq!(manager.envelope_resize_requests(due), shrink);
+        manager.apply_envelope_resize_results(
+            &[resize_result(
+                100,
+                "applied",
+                json!({ "cpu": 1000, "memory": 512 }),
+            )],
+            due,
+        );
+        // The session admitted under the cap fills the floor again, so the
+        // next heartbeat asks to grow back.
+        let regrow = manager.envelope_resize_requests(due);
+        assert_eq!(regrow.len(), 1, "{regrow:?}");
+        assert_eq!(regrow[0].from, r#"{"cpu":1000,"memory":512}"#);
+        assert_eq!(regrow[0].to, r#"{"cpu":1500,"memory":768}"#);
+        manager.stop_sessions(&["workspace-c".into(), "workspace-d".into()], "stop");
+        Ok(())
+    }
+
+    /// A fixed envelope never asks to resize, however full.
+    #[test]
+    fn a_fixed_envelope_never_asks_to_resize_test() -> R<()> {
+        let temp_dir = TempDir::new()?;
+        let mut manager = manager_in(&temp_dir);
+        let mut envelope = envelope_payload(100);
+        envelope.session_task_spec = serde_json::to_string(&TaskConfig {
+            name: "workspace".into(),
+            runtime: "exec".into(),
+            resources: json!({ "cpu": 500, "memory": 256 }),
+            ..Default::default()
+        })?;
+        manager.begin_task_allocation(&envelope)?;
+        start_session(&mut manager, "workspace-a")?;
+        start_session(&mut manager, "workspace-b")?;
+        assert!(manager
+            .envelope_resize_requests(std::time::Instant::now())
+            .is_empty());
+        manager.stop_sessions(&["workspace-a".into(), "workspace-b".into()], "stop");
         Ok(())
     }
 
@@ -8925,6 +9639,60 @@ mod tests {
         let state_store = WorkerStateStore::new(PathBuf::from(".test-relative/worker_state.json"));
         let manager = WorkerTaskManager::with_state_store(state_store);
         assert!(manager.alloc_root.is_absolute());
+    }
+
+    /// A session's stop is handed back for a destroy without the lock, and
+    /// it counts as stopping (holding launches back, refusing a relaunch of
+    /// its id) until `finish_reap` releases it. A keyed allocation is still
+    /// reaped in place.
+    #[test]
+    fn a_session_stop_is_destroyed_without_the_lock_test() -> R<()> {
+        let temp_dir = TempDir::new()?;
+        let mut manager = manager_in(&temp_dir);
+        let task = TaskConfig {
+            config: json!({"command": ["true"]}),
+            ..TaskConfig::new("exec-task", "exec")
+        };
+        let mut session = alloc();
+        session.id = -7;
+        manager.run_allocation(&session, &task)?;
+        manager.run_allocation(&alloc(), &task)?;
+        let session_dir = temp_dir.path().join("allocs").join("-7");
+        assert!(session_dir.is_dir());
+
+        let _ = manager.reconcile_allocations(&[]);
+        let (reaped, mut deferred) = loop {
+            let (reaped, deferred) = manager.take_reapable(true);
+            if reaped.len() == 2 {
+                break (reaped, deferred);
+            }
+            assert!(
+                deferred.is_empty(),
+                "a session is deferred with the rest of its pass"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        };
+        assert_eq!(
+            reaped,
+            vec![(-7, ReapOutcome::Exited), (5, ReapOutcome::Exited)]
+        );
+        assert_eq!(deferred.len(), 1, "only the session is deferred");
+        assert!(manager.terminating_ids().is_empty());
+        assert!(
+            manager.has_terminating(),
+            "a reaping session still counts as stopping"
+        );
+        assert!(session_dir.exists(), "its teardown waits for the destroy");
+
+        let mut reap = deferred.pop().expect("the session");
+        reap.destroy();
+        manager.finish_reap(reap);
+        assert!(!manager.has_terminating());
+        assert!(
+            !session_dir.exists(),
+            "its directory goes once it is released"
+        );
+        Ok(())
     }
 
     #[test]
@@ -10539,6 +11307,36 @@ mod tests {
             process.kill();
         }
 
+        Ok(())
+    }
+
+    /// A node redeems boot tickets against the task config it was
+    /// dispatched (docs/edge-boot.md, "The spec cache"), and the task's own
+    /// `speculativeStart.mode` caps an edge start. Before the block rode the
+    /// payload, a node read every task as `off` and refused every edge start.
+    #[test]
+    fn dispatch_payload_carries_speculative_start() -> R<()> {
+        let task = TaskConfig {
+            config: json!({ "command": ["true"] }),
+            speculative_start: Some(crate::structs::edge_boot::SpeculativeStartConfig {
+                mode: Some("serve".into()),
+                ratify_timeout: Some("10s".into()),
+                on_refused: None,
+            }),
+            ..TaskConfig::new("box", "exec")
+        };
+        let wire = crate::manager::dispatcher::build_task_allocation(&task, &alloc(), None, &[])?;
+        let (_, parsed) = task_from_allocation(&wire)?;
+        assert_eq!(
+            crate::manager::dispatcher::resolved_speculative_start(&parsed)?.mode,
+            Gate::Serve
+        );
+        let plain = TaskConfig::new("plain", "exec");
+        let wire = crate::manager::dispatcher::build_task_allocation(&plain, &alloc(), None, &[])?;
+        assert_eq!(
+            wire.task_speculative_start, "",
+            "undeclared stays off the wire"
+        );
         Ok(())
     }
 

@@ -640,6 +640,14 @@ pub fn build_task_allocation_with(
         Some(restart) => serde_json::to_string(restart).context("Failed to serialize restart")?,
         None => String::new(),
     };
+    // The node redeems boot tickets against the task config it was
+    // dispatched, and the task's own mode caps an edge start's gate.
+    let task_speculative_start = match task.speculative_start.as_ref() {
+        Some(block) => {
+            serde_json::to_string(block).context("Failed to serialize speculativeStart")?
+        }
+        None => String::new(),
+    };
     Ok(TaskAllocation {
         allocation_id: allocation.id,
         job_id: allocation.job_id.clone(),
@@ -677,9 +685,18 @@ pub fn build_task_allocation_with(
             .unwrap_or_default(),
         task_lifecycle: task.lifecycle.to_string(),
         task_restart,
+        task_speculative_start,
         session_task_spec: String::new(),
         session_task_config_id: 0,
         session_seal_keys: Vec::new(),
+        // An envelope's size is its row's, which an elastic envelope's node
+        // grows and shrinks (docs/session-mode.md, "Elastic envelopes");
+        // `task_resources` stays the declared floor.
+        envelope_resources: if crate::structs::session::envelope_serves(task).is_some() {
+            allocation.resources.to_string()
+        } else {
+            String::new()
+        },
     })
 }
 
@@ -747,6 +764,16 @@ fn inject_provisional_env(config: &mut Value, claim_id: &str, instance: Option<&
         "LEGION_CLAIM_ID".to_string(),
         Value::String(claim_id.to_string()),
     );
+    // A node builds an edge start from a task config it cached off another
+    // allocation's dispatch, whose env names that allocation's instance. The
+    // claim's own identity replaces it, and none is left behind without one.
+    for key in [
+        "LEGION_INSTANCE_ID",
+        "LEGION_INSTANCE_MODE",
+        "LEGION_INSTANCE_SLOT",
+    ] {
+        env.remove(key);
+    }
     if let Some(instance) = instance {
         env.insert(
             "LEGION_INSTANCE_ID".to_string(),
@@ -1095,6 +1122,45 @@ mod tests {
         assert_eq!(env["LEGION_INSTANCE_ID"], json!("job-default-1"));
         assert_eq!(env["LEGION_ALLOC_ID"], json!("42"));
         assert_eq!(env["USER_VAR"], json!("kept"));
+        Ok(())
+    }
+
+    /// An edge start is built from a task config the node cached off another
+    /// allocation's dispatch, so its env already names that allocation's
+    /// instance. The claim's own identity must replace it.
+    #[test]
+    fn a_provisional_start_drops_a_cached_instance_identity() -> R<()> {
+        let cached = TaskConfig {
+            config: json!({
+                "command": ["true"],
+                "env": { "LEGION_INSTANCE_ID": "someone-else", "LEGION_INSTANCE_MODE": "keyed" }
+            }),
+            ..TaskConfig::new("box", "exec")
+        };
+        let provisional = || ProvisionalAllocation {
+            claim_id: "clm_a".into(),
+            ..Default::default()
+        };
+        let built = build_task_allocation_with(
+            &cached,
+            &allocation(Some("r-1")),
+            None,
+            &[],
+            Some(provisional()),
+        )?;
+        let env = env_from(&built);
+        assert!(!env.contains_key("LEGION_INSTANCE_ID"));
+        assert_eq!(env["LEGION_CLAIM_ID"], json!("clm_a"));
+        let mut instance = slot_instance();
+        instance.instance_id = "r-1".into();
+        let built = build_task_allocation_with(
+            &cached,
+            &allocation(Some("r-1")),
+            Some(&instance),
+            &[],
+            Some(provisional()),
+        )?;
+        assert_eq!(env_from(&built)["LEGION_INSTANCE_ID"], json!("r-1"));
         Ok(())
     }
 

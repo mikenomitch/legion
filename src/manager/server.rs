@@ -7594,6 +7594,24 @@ impl Manager for ManagerDaemonService {
             error!(node_id = %id, error = ?err, "Error handling pressure actions");
         }
 
+        // Elastic envelope resizes the node asked for (docs/session-mode.md,
+        // "Elastic envelopes"). Before the desired set is built, so a reply
+        // served from the leader's replica already carries the new size.
+        // Rare (a node asks only when its sessions cross a threshold), and
+        // each is a scheduler-lane write, so they run off the async worker.
+        let envelope_resizes = if req.envelope_resizes.is_empty() {
+            Vec::new()
+        } else {
+            let store = self.store.clone();
+            let node_id = id.clone();
+            let requests = req.envelope_resizes.clone();
+            tokio::task::spawn_blocking(move || {
+                crate::manager::sessions::apply_envelope_resizes(&store, &node_id, &requests)
+            })
+            .await
+            .map_err(|e| Status::internal(format!("envelope resize task failed: {e}")))?
+        };
+
         // A worker that receives its work over `StreamWork` gets no desired
         // set here: it holds it already, and the heartbeat carries only a
         // digest of it (sandbox-scaling plan §6.13). Its connect and policy
@@ -7809,6 +7827,7 @@ impl Manager for ManagerDaemonService {
             session_resync,
             stop_sessions,
             retry_terminated_allocations,
+            envelope_resizes,
         };
 
         Ok(Response::new(reply))
@@ -11386,8 +11405,13 @@ impl Manager for ManagerDaemonService {
             instance_id: &req.instance_id,
             gate: crate::structs::edge_boot::Gate::from_wire(req.gate),
         };
-        let verdict = crate::manager::edge_boot::ratify(&self.store, &claim, spend, started)
-            .map_err(|e| Status::internal(format!("ratification failed: {e:#}")))?;
+        // The ratification waits on a group-commit entry. Waiting on a
+        // runtime worker thread would cap a burst at the thread count, so
+        // entries could never fill, and would stall heartbeats meanwhile.
+        let verdict = run_blocking_admission(|| {
+            crate::manager::edge_boot::ratify(&self.store, &claim, spend, started)
+        })
+        .map_err(|e| Status::internal(format!("ratification failed: {e:#}")))?;
 
         let job_id = self
             .store
@@ -11421,6 +11445,15 @@ impl Manager for ManagerDaemonService {
                     detail: String::new(),
                     allocation: payload,
                 }))
+            }
+            // Only the raft leader ratifies, and a follower does not forward
+            // it. Answered as an error rather than a verdict, so the node
+            // asks the leader instead of killing a claim no manager judged.
+            // Nothing was written: the ticket is still unspent.
+            crate::manager::edge_boot::Verdict::Refused { detail, .. }
+                if detail.contains("not the raft leader") =>
+            {
+                Err(Status::failed_precondition(detail))
             }
             crate::manager::edge_boot::Verdict::Refused { reason, detail } => {
                 tracing::Span::current().record("verdict", "refused");
@@ -11960,8 +11993,9 @@ fn template_eval_status(err: anyhow::Error) -> Status {
 }
 
 /// Runs blocking admission work (artifact pin resolution can reach
-/// registries, and a job submit is a chain of quorum writes) without
-/// stalling the async runtime where possible.
+/// registries, a ratification waits on a group commit, and a job submit is
+/// a chain of quorum writes) without stalling the async runtime where
+/// possible.
 /// `block_in_place` needs the multi-thread runtime; current-thread callers
 /// (tests) run inline.
 fn run_blocking_admission<T>(work: impl FnOnce() -> T) -> T {

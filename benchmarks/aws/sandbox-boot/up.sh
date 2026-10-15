@@ -71,9 +71,10 @@ launch() { # name type disk_gb user_data [extra market options]
         options="MarketType=spot,SpotOptions={SpotInstanceType=persistent,InstanceInterruptionBehavior=stop}"
         market_args=(--instance-market-options "$options")
     fi
-    # Bare metal has KVM natively; every other c8i box gets it nested.
-    cpu_args=(--cpu-options 'NestedVirtualization=enabled')
-    case "$type" in *.metal*) cpu_args=() ;; esac
+    # c8i boxes get KVM nested. Bare metal has it natively, and other
+    # families (managers, or workers that run no microVMs) go without.
+    cpu_args=()
+    case "$type" in c8i.*) [[ "$type" == *.metal* ]] || cpu_args=(--cpu-options 'NestedVirtualization=enabled') ;; esac
     sb_log "Launching $name ($type, ${market})"
     aws ec2 run-instances --image-id "$ami" --instance-type "$type" --key-name "$SB_PROJECT" \
         --subnet-id "$subnet" --security-group-ids "$sg" --associate-public-ip-address \
@@ -86,7 +87,7 @@ launch() { # name type disk_gb user_data [extra market options]
 }
 
 for name in "${SB_MANAGERS[@]}"; do launch "$name" "$SB_MANAGER_TYPE" 20 "$SB_STATE/node-user-data.sh" on-demand; done
-for name in "${SB_WORKERS[@]}"; do launch "$name" "$SB_WORKER_TYPE" 40 "$SB_STATE/node-user-data.sh"; done
+for name in "${SB_WORKERS[@]}"; do launch "$name" "$SB_WORKER_TYPE" "${SB_WORKER_DISK_GB:-40}" "$SB_STATE/node-user-data.sh"; done
 for name in ${SB_LOADERS[@]+"${SB_LOADERS[@]}"}; do launch "$name" "$SB_LOAD_TYPE" 20 "$SB_STATE/node-user-data.sh"; done
 if [ -n "$with_build" ]; then
     launch sbx-build "$SB_BUILD_TYPE" 80 "$SB_DIR/cloud-init/build.sh" persistent

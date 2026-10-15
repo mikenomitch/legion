@@ -182,6 +182,12 @@ change.
 
 ## 7. Fetch opens the object in place instead of streaming through the fetcher
 
+> **Superseded** by
+> [chunked-checkpoint-publish calls 7](chunked-checkpoint-publish-plan_calls.md#7-chunks-transfer-16-at-a-time-on-a-private-four-thread-runtime-per-part):
+> a part is now fetched as chunks, each opened in memory, and
+> `open_file_in_place` is gone. The entry stays as the record of the
+> original call.
+
 **Call.** The fetcher downloads the ciphertext to its scratch file as it
 always did, then `open_file_in_place` decrypts each chunk and writes it back
 behind the read position and truncates. The content store import then hashes

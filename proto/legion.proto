@@ -1201,13 +1201,20 @@ service Manager {
   //   restart), a `last_seq` ahead of the manager's, or a `last_seq` older
   //   than the messages the manager still keeps. It also follows a heartbeat
   //   whose digest disagreed with the manager's (`HeartbeatReply.work_resync`).
+  // - **Checkpoint work.** A snapshot of the node entering a state that is
+  //   work for it (a capture, a delete, a publish), or a warm queued for it,
+  //   is pushed in `checkpoint_requests` on the next message, so the node
+  //   starts it one round trip after it commits instead of at its next
+  //   heartbeat. Each piece of work is pushed once per stream; a new stream
+  //   gets every piece still outstanding.
   //
   // A worker that reconnects with the same `epoch` and a `last_seq` the
   // manager still holds gets the messages after it replayed, then live
-  // deltas: nothing is lost and nothing is applied twice. Acked messages
-  // are pruned. The log is held in the manager's memory only: the
-  // committed allocation rows are the durable record, so a new manager
-  // process resyncs instead of replaying.
+  // deltas: nothing is lost and nothing is applied twice. A replayed message
+  // carries its allocation changes only, never its `checkpoint_requests`.
+  // Acked messages are pruned. The log is held in the manager's memory
+  // only: the committed allocation rows are the durable record, so a new
+  // manager process resyncs instead of replaying.
   //
   // Any manager serves the stream, leader or follower, from its own
   // replica of the store.
@@ -2013,14 +2020,22 @@ service Manager {
   // with its node token. The manager turns the claim into an ordinary plan
   // submission with a single placement on the calling node and applies it
   // through the same transaction every other placement goes through, with
-  // the same epoch compare-and-set, the same constraint re-validation, and
-  // the same at-most-one-live-allocation instance binding. A refusal here is
-  // that apply failing; there is no second code path for correctness.
+  // the same constraint and capacity re-validation against committed rows
+  // and the same at-most-one-live-allocation instance binding. It skips the
+  // plan epoch compare-and-set, because it never planned against a
+  // snapshot, so concurrent ratifications of one job do not refuse each
+  // other. A refusal here is that apply failing. There is no second code
+  // path for correctness.
   //
   // The reply is the verdict: `confirmed` carries the manager-minted
   // allocation id (the worker opens the network and the work becomes a normal
   // allocation), `refused` carries a machine-readable reason the worker kills
   // the work with.
+  //
+  // Only the raft leader ratifies. A follower answers `FAILED_PRECONDITION`
+  // ("this manager is not the raft leader…") instead of a verdict. It wrote
+  // nothing and the ticket is unspent, so the caller sends the same request
+  // to the leader.
   rpc RatifyClaim (RatifyClaimRequest) returns (RatifyClaimReply);
 }
 
@@ -4649,15 +4664,20 @@ message WarmSnapshotReply {
   bool deduplicated = 6;
 }
 
-// Work a manager asks a worker to do on a snapshot, delivered in
-// `HeartbeatReply.checkpoint_requests`.
+// Work a manager asks a worker to do on a snapshot, pushed on the worker's
+// `StreamWork` stream (`StreamWorkReply.checkpoint_requests`) the moment it
+// becomes outstanding, and re-sent in `HeartbeatReply.checkpoint_requests`.
 //
-// This is the manager-to-worker half of the checkpoint channel. The manager
+// This is the manager-to-worker half of the checkpoint channel. The push
+// makes the worker start promptly; the heartbeat is the record. The manager
 // re-sends every request on every heartbeat until the worker's matching
-// `SnapshotReport` has been applied, so a worker that restarts, or a report
-// lost to a failed heartbeat, simply retries. Workers deduplicate by
-// `snapshot_id` and `op`: a request for work already done re-sends the
-// recorded report instead of redoing it.
+// `SnapshotReport` has been applied, so a worker that restarts, a push lost
+// with its stream, or a report lost to a failed heartbeat, simply retries.
+// Workers deduplicate by `snapshot_id` and `op`: a request for work already
+// done re-sends the recorded report instead of redoing it. A worker forgets
+// finished work only when a heartbeat reply leaves it out after a heartbeat
+// that carried its report, so an older reply racing a newer push cannot
+// make it redo the work.
 //
 // The manager only sends requests to a worker that advertised the
 // `checkpoint` capability at registration.
@@ -4727,6 +4747,32 @@ message CheckpointRequest {
   // worker writes it verbatim as the archive manifest's `envelope`, beside
   // the published checkpoint manifest, and does not interpret it.
   string manifest_envelope = 11;
+
+  // `publish`: the snapshot's job's chunk key. A published part is stored
+  // as fixed-size chunks plus a sealed index (docs/suspend-and-resume.md,
+  // "How published parts are stored"), and the worker derives each chunk's
+  // key from this one, scoped to its current dedup window, so a chunk the
+  // job already uploaded in the window is not uploaded again. Unset for
+  // every other op, and when the manager could not derive it (the reason is
+  // in `part_key_error`, and the publish fails).
+  CheckpointChunkKey chunk_key = 12;
+}
+
+// A job's chunk key (docs/suspend-and-resume.md, "Published checkpoint
+// encryption"): HKDF-SHA256 of the job's session sealing key with the
+// context `chunks`, so the manager (for a keyed snapshot's publish) and a
+// session's node (with no manager on the path) derive the same key, and
+// checkpoints of one job share chunks whichever path published them. A
+// worker holding it can name and seal chunks of that job only. It cannot
+// open any part index, whose key comes from the part key. The generated
+// Rust type redacts `key` from Debug output and never serializes it.
+message CheckpointChunkKey {
+  // `<checkpoint key id>/session/<job>/chunks`. Informational: chunk keys
+  // are recorded in each part's sealed index, so a reader never needs it.
+  string key_id = 1;
+
+  // 32 bytes. Never logged and never written to disk.
+  bytes key = 2;
 }
 
 // The key for one published checkpoint part. A worker receives it with the
@@ -5669,6 +5715,14 @@ message HeartbeatRequest {
   // whenever the manager re-sends the request it answers, and restored on a
   // failed heartbeat like every other report on this request.
   //
+  // A worker does not hold a fresh outcome for its next scheduled beat: it
+  // sends a heartbeat at once, so a suspend, resume, fork, publish, or warm
+  // settles one round trip after the node finishes it. A delete's
+  // confirmation is the exception (nothing waits on it), and rides the next
+  // scheduled beat. The out-of-band beat is an ordinary heartbeat, carrying
+  // everything else the worker has to report, so the manager sees the
+  // outcome and the node's other changes in the order they happened.
+  //
   // Default: empty list.
   repeated SnapshotReport snapshot_reports = 13;
   // Content locality: what this node's content store holds, for the manager's location index
@@ -5734,6 +5788,71 @@ message HeartbeatRequest {
   // worker also sends a full report every 30 beats, as a backstop. Absent
   // from workers without the `sessions` capability.
   optional SessionReport session_report = 19;
+
+  // Resizes this node asks for its elastic envelopes (docs/session-mode.md,
+  // "Elastic envelopes"): at most one per envelope, re-sent on every
+  // heartbeat until a reply's `HeartbeatReply.envelope_resizes` answers it.
+  // The node decides, because only it knows what its sessions hold at every
+  // instant: it grows an envelope when its sessions fill more than 90% of
+  // it, and shrinks one after they used less than half of it for
+  // `stateful.envelope.shrinkAfter`. Before it asks to shrink, the node caps
+  // its own admission at the smaller size, so no session can be running
+  // over the envelope when the shrink commits.
+  //
+  // The manager applies each as one scheduler-lane write (forwarded to the
+  // lane leader when it does not lead). Repeating a request that already
+  // applied is answered `applied` and writes nothing.
+  //
+  // Default: empty list. Fixed envelopes never send one.
+  repeated EnvelopeResize envelope_resizes = 20;
+}
+
+// One envelope resize a node asks for. See
+// `HeartbeatRequest.envelope_resizes`.
+message EnvelopeResize {
+  // The envelope's allocation id, as its payload named it.
+  int64 allocation_id = 1;
+
+  // The size the node believes is committed, as a JSON `resources` object
+  // (`{"cpu":6000,"memory":6144}`). The resize is a compare-and-set on it:
+  // when the row holds something else, the answer is `stale`.
+  string from = 2;
+
+  // The size the node asks for, with the same keys. Every key is at or
+  // above `from` (a grow) or at or below it (a shrink), and every key stays
+  // within the session task's `envelope.resources` and `envelope.max`.
+  string to = 3;
+}
+
+// The manager's answer to one `EnvelopeResize`. See
+// `HeartbeatReply.envelope_resizes`.
+message EnvelopeResizeResult {
+  // The envelope's allocation id, as the request named it.
+  int64 allocation_id = 1;
+
+  // What happened:
+  //
+  // - `applied`: the row now holds `to` (or already did).
+  // - `partial`: a grow that did not fully fit the node; the row holds
+  //   `size`, between `from` and `to`.
+  // - `refused`: a grow with no room on the node, or on a node that is not
+  //   `available` (draining or ineligible). Nothing was written; `size` is
+  //   unchanged.
+  // - `stale`: the row did not hold `from`; nothing was written, and `size`
+  //   is what it holds.
+  // - `gone`: the allocation is not a live envelope on this node.
+  // - `invalid`: `to` is outside the envelope's bounds or does not size its
+  //   keys.
+  // - `error`: the write failed (for example, no raft leader); the node
+  //   asks again on its next heartbeat.
+  string outcome = 2;
+
+  // The committed size after this answer, as a JSON `resources` object.
+  // Empty for `gone`, `invalid`, and `error`.
+  string size = 3;
+
+  // Why, for `refused`, `stale`, `gone`, `invalid`, and `error`.
+  string message = 4;
 }
 
 // One heartbeat's session report. See `HeartbeatRequest.session_report`.
@@ -5921,6 +6040,24 @@ message StreamWorkReply {
   // The digest of the worker's desired set after applying this message, in
   // the `WorkStreamState.digest` form.
   string digest = 6;
+
+  // Checkpoint work for the node that became outstanding since the last
+  // message: the same `CheckpointRequest`s the heartbeat reply carries, part
+  // keys included, pushed the moment the snapshot row (or queued warm)
+  // committed. The worker starts each one at once, deduplicated against
+  // work it already has in flight or finished, exactly as it does for a
+  // request that arrives on a heartbeat.
+  //
+  // A hint, not the record. Each request is pushed once per stream (a new
+  // stream gets every one still outstanding), never replayed, and does not
+  // count toward `digest`. The heartbeat reply still carries the node's
+  // whole checkpoint work on every beat, and that full set is what tells
+  // the worker the manager is done with a piece of work. So a lost message,
+  // or a worker that ignores this field, waits for its next heartbeat
+  // instead of losing anything. Only sent to workers that advertised the
+  // `checkpoint` capability. A message may carry only this field, with no
+  // `upserts` or `stops`; it still takes the next `seq`.
+  repeated CheckpointRequest checkpoint_requests = 7;
 }
 
 // One finished (or refused-after-verification) direct exec session.
@@ -6382,6 +6519,11 @@ message HeartbeatReply {
   // applied. Sent only to workers that advertised the `checkpoint`
   // capability at registration.
   //
+  // Always the node's whole outstanding set, streaming worker or not: a
+  // streaming worker got each request pushed on `StreamWork` when it became
+  // outstanding, and this list is how it learns which finished work the
+  // manager has applied (it is no longer listed).
+  //
   // Default: empty list. Costs one indexed lookup per heartbeat.
   repeated CheckpointRequest checkpoint_requests = 9;
   // Content locality: true when this manager could not apply the heartbeat's
@@ -6501,6 +6643,15 @@ message HeartbeatReply {
   // Default: empty when workload identity is disabled on the answering
   // manager; an empty value leaves the worker's expected issuer unchanged.
   string workload_identity_issuer = 21;
+
+  // Answers to this heartbeat's `HeartbeatRequest.envelope_resizes`, one
+  // per request, in request order (docs/session-mode.md, "Elastic
+  // envelopes"). A node lifts its shrink cap, adopts the committed `size`,
+  // or backs off growing from these. The resized allocation also reaches
+  // the node as a changed payload (`TaskAllocation.envelope_resources`).
+  //
+  // Default: empty list.
+  repeated EnvelopeResizeResult envelope_resizes = 22;
 }
 
 // Why one allocation is being stopped.
@@ -9349,6 +9500,17 @@ service Worker {
   // Rejected with FailedPrecondition unless the worker was configured with
   // `edgeBoot.acceptClaims: true`.
   //
+  // Rejected with ResourceExhausted, carrying the stable error code
+  // `OVERLOADED` in the `legion-error-code` response metadata, when the
+  // node's claim window stayed full for `edgeBoot.queueTimeout`
+  // (docs/edge-boot.md, "Overload"). The window bounds the unratified edge
+  // claims a node holds (`edgeBoot.maxProvisionalPerNode`) and halves when
+  // ratifications come back later than `edgeBoot.overloadThreshold` of their
+  // lease. Such a refusal happens before admission: nothing is held, booted,
+  // or spent, so a retry may present the same ticket. Retry with backoff.
+  // A message that says recent ratifications were slow means the managers
+  // are behind, which other nodes of the pool share.
+  //
   // Caller class: `ticket`. Callers are authorized by the boot ticket
   // alone; no client certificate is needed and one that is presented is
   // ignored. Callers dial `https://` and verify the node's certificate
@@ -10508,6 +10670,27 @@ message TaskAllocation {
   // a `store` session whose memory checkpoint has parts to seal then stays
   // suspended on its node unpublished until the keys arrive.
   repeated SessionSealKey session_seal_keys = 31;
+
+  // On an envelope allocation only: the envelope's committed size, as the
+  // JSON `resources` object on its allocation row, such as
+  // `{"cpu":12000,"memory":12288}` (docs/session-mode.md, "Elastic
+  // envelopes"). A fixed envelope always carries its
+  // `stateful.envelope.resources`. An elastic one carries whatever the node
+  // last grew or shrank it to, between `envelope.resources` and
+  // `envelope.max`. The node admits sessions against this size, not against
+  // `task_resources` (the floor). A changed size is re-sent like any changed
+  // payload: on the work stream, or in the next desired set. Empty on every
+  // other allocation, and the node then falls back to `task_resources`.
+  string envelope_resources = 32;
+
+  // JSON `SpeculativeStartConfig` as the task declared it (`mode`,
+  // `ratifyTimeout`, `onRefused`). Empty when the task declares no
+  // `speculativeStart` block. A node caches each task config it is
+  // dispatched and redeems boot tickets against that cache
+  // (docs/edge-boot.md, "The spec cache"), and the task's own mode caps how
+  // far an edge start may get: a node that receives it empty treats the task
+  // as `off` and refuses its edge starts.
+  string task_speculative_start = 33;
 }
 
 // Request payload for PostWork.

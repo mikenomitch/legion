@@ -27,6 +27,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // payloads: never logged, never in the state file or session log.
         .skip_debug("legion.SessionSealKey")
         .field_attribute("legion.SessionSealKey.key", "#[serde(skip)]")
+        // And for a job's chunk key, which rides on publish requests.
+        .skip_debug("legion.CheckpointChunkKey")
+        .field_attribute("legion.CheckpointChunkKey.key", "#[serde(skip)]")
         // The table shows the `blocked` status; the block itself is for
         // `-j` output and `job info`.
         .field_attribute("legion.Job.blocked", "#[tabled(skip)]")

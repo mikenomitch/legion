@@ -42,7 +42,19 @@ beat marks a node dead.
 The interval decides liveness, not delivery. A worker receives its work over
 `Manager.StreamWork` ([Delivery](architecture-managers-workers.md#delivery)):
 a placement reaches it one round trip after it commits, so stretching the
-interval to relieve the manager no longer delays new work.
+interval to relieve the manager no longer delays new work. The same holds
+for suspend, resume, and fork: checkpoint requests are pushed on the stream,
+and a worker reports a finished capture, restore, publish, or warm on a
+heartbeat it sends early
+([How it works](suspend-and-resume.md#how-it-works)).
+
+Those early beats sit outside the cadence, and adaptive cadence does not
+count them. They cost a beat per finished piece of checkpoint work, two per
+suspend and resume, so they add the cluster's checkpoint rate to `N / I`. That rate
+is bounded by the scheduler lane, which on the reference host completes
+about 50 suspend-and-resume lifecycles a second: about 100 early beats a
+second at the ceiling, small next to the scheduled beats of a fleet large
+enough to need adaptive cadence.
 
 The beat's size does not grow with what the node runs either. A worker on
 the stream reports its stream position, a digest of the allocation ids it

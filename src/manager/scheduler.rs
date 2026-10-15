@@ -1949,6 +1949,11 @@ impl<'a> Scheduler<'a> {
             );
         }
         if !unplaced.is_empty() {
+            // A partial plan is not its eval's last write: the handler may
+            // plan the rest with an avoided node allowed, or queue a retry
+            // for preemption victims still too young. So it must not settle
+            // the eval (`arm_eval_settle`); the eval settles after those.
+            crate::storage::store::disarm_eval_settle();
             // Freed capacity (an allocation finishing or removed, a job
             // stopping) now queues a capacity pass that retries this job.
             self.store.note_capacity_waiters();

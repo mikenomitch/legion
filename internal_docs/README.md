@@ -104,7 +104,9 @@ When one is required and what goes in it:
 | [exec-and-actions-plan.md](plans/exec-and-actions-plan.md) | shipped (all five phases) |
 | [durability-and-ops-execution-plan.md](plans/durability-and-ops-execution-plan.md) | executed (workstreams A/B/C/D + adversarial verification, 2026-07-28); lanes topology opt-in |
 | [egress-credential-injection-plan.md](plans/egress-credential-injection-plan.md) | in execution (Phase 1 shipped: KV-backed header credentials on external `https://` upstreams, injected by the node so the workload never holds them; identity/webhook providers and audit events planned; sandbox guests cannot reach upstreams yet) |
+| [edge-admission-control-plan.md](plans/edge-admission-control-plan.md) | in execution (Phase 1 built: the per-node claim window that sheds edge starts `OVERLOADED` before boot when ratification is slow, and enforces `maxProvisionalPerNode`. Manager-side speculation shedding and deadline-aware ratification planned) |
 | [edge-boot-plan.md](plans/edge-boot-plan.md) | shipped (phases 1–4); phase 0 measurement not run, phase 5 backlog |
+| [edge-ratify-throughput-plan.md](plans/edge-ratify-throughput-plan.md) | in execution (Phase 1 shipped 2026-10-14: in-process ratify load harness, ratifications fenced by committed state instead of epochs, create decided inside the entry, ratify off the async runtime. Per-node RPC batching deferred on data, networked load test planned) |
 | [gang-scheduling-plan.md](plans/gang-scheduling-plan.md) | planned |
 | [gated-sandbox-checkpoints-plan.md](plans/gated-sandbox-checkpoints-plan.md) | in execution (Phases 1 to 5 built: gated memory checkpoints, default deny, the static guest agent, gated idle signals, Legion-addressed TAPs, ingress into gated and TAP sandboxes, and upstreams in gated sandboxes; Phase 0, the real-VMM gate, is pending, so the gated-by-default flip is held) |
 | [host-convergence-plan.md](plans/host-convergence-plan.md) | planned |
@@ -112,6 +114,7 @@ When one is required and what goes in it:
 | [job-status-plan.md](plans/job-status-plan.md) | shipped (per-replica outcomes and status-change events deferred) |
 | [job-templates-plan.md](plans/job-templates-plan.md) | in execution |
 | [job-updated-at-plan.md](plans/job-updated-at-plan.md) | shipped (detail-page header + node column label deferred) |
+| [chunked-checkpoint-publish-plan.md](plans/chunked-checkpoint-publish-plan.md) | in execution (Phase 1 built: published parts as sealed, deduplicated chunks per job and dedup window, zero chunks skipped. Fetching only missing chunks, dirty-page hashing, and a real-S3 run are deferred) |
 | [checkpoint-encryption-plan.md](plans/checkpoint-encryption-plan.md) | shipped (2026-10-11: published checkpoint parts sealed under per-part keys from the keyring's checkpoint key, with manual checkpoint-key rotation, parallel sealing, and streaming decrypt deferred) |
 | [kv-encryption-plan.md](plans/kv-encryption-plan.md) | shipped (all four phases, 2026-09-21: KV values encrypted at rest by default, replicated keyring with the root key outside the store, `file`/`env`/`exec` providers, rotation + rewrap, join-time root key delivery; rendered task-config copies deliberately left for a follow-up plan) |
 | [kv-reactive-task-updates-plan.md](plans/kv-reactive-task-updates-plan.md) | shipped |
@@ -122,6 +125,7 @@ When one is required and what goes in it:
 | [preemption-and-eviction-plan.md](plans/preemption-and-eviction-plan.md) | shipped (graceful stop, six priority bands, plan-atomic preemption) |
 | [multi-cluster-federation-plan.md](plans/multi-cluster-federation-plan.md) | planned |
 | [multi-raft-persistence-plan.md](plans/multi-raft-persistence-plan.md) | planned |
+| [multi-eval-plans-plan.md](plans/multi-eval-plans-plan.md) | in execution: Phase 2 shipped (the fused settle in every placing handler whose plan is its last write, and no second settle write). Phase 1, one running eval per job, was built and measured and left out until a lane-bound rig run shows a gain. Phase 3 deferred behind it |
 | [namespaces-plan.md](plans/namespaces-plan.md) | planned (namespace object + namespace-scoped ACLs; quota/pools and namespaced KV deferred) |
 | [read-model-coherence-plan.md](plans/read-model-coherence-plan.md) | in execution (all five phases built; raft shadow check deferred) |
 | [service-mesh-plan.md](plans/service-mesh-plan.md) | **authoritative for the mesh**; shipped M1–M10 (policy, HTTP mode, name-is-config, gated, ingress, handlers, mTLS, graph, sandbox vsock, templates) with two named deferrals — unifies the SD §8 follow-on with the handlers plan |
@@ -165,14 +169,18 @@ When one is required and what goes in it:
 | [sandbox-snapshots-and-fast-start-plan.md](plans/sandbox-snapshots-and-fast-start-plan.md) | superseded in part by suspend-resume-and-oversubscription (§0 convergence shipped; mechanics still the reference) |
 | [suspend-resume-and-oversubscription-plan.md](plans/suspend-resume-and-oversubscription-plan.md) | in execution (Phases 1-7 shipped, Phase 8 deferred, KVM checks pending) |
 | [suspend-resume-and-oversubscription-plan.md](plans/suspend-resume-and-oversubscription-plan.md) | in execution (Phases 1-3 and 7a shipped, KVM checks pending) |
+| [lazy-memory-restore-plan.md](plans/lazy-memory-restore-plan.md) | in execution: Phase 1 built (restores trust the content store's digest instead of rehashing every part, cloud-hypervisor v52+ restores on demand, `config.memory_restore = "lazy" \| "eager"` with `lazy` the default). KVM measurement open. Streaming a published restore, working-set prefetch, and cloud-hypervisor `copyonwrite` planned (executes the suspend plan's Phase 8 lazy memory item) |
 | [sandbox-scaling-plan.md](plans/sandbox-scaling-plan.md) | in execution: Phases 0–6 shipped (measurement, group commit and write trimming, `StreamWork` delivery, blocked evals, untombstoned minted ids, archived idle keyed instances, and the `session` instance mode with running sessions as node-owned soft state and promotion); session suspend, identity, and the session log deferred; Phase 7's wake on request is built under wake-on-request-plan (keyed and archived instances); Phases 8+ planned (snapshot-clone density, a sub-VM seam, cells past a measured trigger) |
+| [scheduler-lane-entry-cost-plan.md](plans/scheduler-lane-entry-cost-plan.md) | in execution: Phase 1 shipped (keyed placements bind their instance from two indexes instead of scanning the task's whole population, the largest piece of serial lane time in the profile), with the pipelined lane (Phase 2) and one fsync per entry (Phase 3) designed, not built |
 | [session-durability-and-routing-plan.md](plans/session-durability-and-routing-plan.md) | in execution in #36 (Phases 1–5 built; real-S3, sandbox-memory and edge-move runs open) (builds on session mode: concurrent starts on each node, sessions that survive a worker restart, the start node in the session id, edge starts picked by a load balancer outside Legion with no manager on the path, sessions that sleep on their node, and `store` sessions that move between nodes without split brain; a batched raft session directory deferred behind a trigger) |
 | [wake-on-request-plan.md](plans/wake-on-request-plan.md) | in execution: Phase 1 shipped (`suspend.wake`, `legion start gateway` that resumes a suspended keyed instance on a request and holds it until the instance serves, `CONNECT` for any declared port, a wake webhook, wake fields on `GetInstance`); gateway metrics, waking sessions, and node-local wake on connect planned |
+| [checkpoints-on-stream-plan.md](plans/checkpoints-on-stream-plan.md) | shipped Phase 1 (checkpoint requests pushed on `StreamWork`, reports on an early heartbeat, so suspend and resume no longer wait on the cadence). A report path that skips the heartbeat is deferred until early beats show up as load |
 | [sandbox-exec-plan.md](plans/sandbox-exec-plan.md) | in execution: Phases 1 to 3 built and Phase 0 measured on one host; KVM and rig verification open (exec into Linux microVMs over the guest agent's vsock, and direct exec with worker-verified tickets as a third caller class on the worker-plane-auth listener; implemented together with worker-plane-auth, which it amends in §9) |
 | [rootfs-base-cache-plan.md](plans/rootfs-base-cache-plan.md) | in execution: Phase 1 built and booted on real KVM (cloud-hypervisor) in the sandbox-boot campaign (one base root disk per image per node, cloned per sandbox, per-sandbox files by debugfs, `ensure_image_base` for prefetchers, one tag resolution per burst); artifacts on the cached path, the `container` runtime, visibility, and Firecracker planned |
-| [sandbox-boot-throughput-plan.md](plans/sandbox-boot-throughput-plan.md) | shipped, phases 1–3 (raw disks and `hvc0` on cloud-hypervisor, `running` on guest readiness, `stateful.placement`, the worker's start and stop paths off the lock, measured on AWS: 0.23 s a boot, 69 a second from four 4-vCPU nodes); phase 4, the ~50/s per-node ceiling on large nodes, open |
+| [sandbox-boot-throughput-plan.md](plans/sandbox-boot-throughput-plan.md) | shipped, phases 1–3 (raw disks and `hvc0` on cloud-hypervisor, `running` on guest readiness, `stateful.placement`, the worker's start and stop paths off the lock, measured on AWS: 0.23 s a boot, 69 a second from four 4-vCPU nodes); phase 4's lock fixes (a 96-vCPU node at 150 to 200 boots a second sustained); the root disk ceiling on large nodes, open |
 | [suspend-resume-ui-plan.md](plans/suspend-resume-ui-plan.md) | shipped (UI-1 to UI-6, with the §7.3 server reads: ListNodeUsage, GetNodeContent, last_stop, checkpoint_support) |
 | [session-ui-plan.md](plans/session-ui-plan.md) | shipped (UI only: sessions and envelopes on the job, instance, allocation, node, and task pages, Promote and End, and bounded fetching, polling, and rendering for very large session counts; `ListInstances` paging, counts, and node/envelope filters deferred to the API) |
+| [elastic-session-envelopes-plan.md](plans/elastic-session-envelopes-plan.md) | in execution: Phase 1 built (`stateful.envelope.max` and `shrinkAfter`: each node grows and shrinks its session envelope between a floor and a ceiling, one scheduler-lane entry per resize, a shrink capped on the node first); preemptible elastic room and a fleet resize budget planned |
 | [shared-alloc-dir-proposal.md](plans/shared-alloc-dir-proposal.md) | proposal |
 | [data-dir-env-plan.md](plans/data-dir-env-plan.md) | shipped (`LEGION_DATA_DIR`; no config-file field, by design) |
 
@@ -199,8 +207,11 @@ by project impact. The full template and a worked example:
 - [container-runtime-exec-and-signals-plan_calls.md](calls/container-runtime-exec-and-signals-plan_calls.md)
 - [container-task-kind-macos_calls.md](calls/container-task-kind-macos_calls.md)
 - [data-dir-env-plan_calls.md](calls/data-dir-env-plan_calls.md)
+- [edge-admission-control-plan_calls.md](calls/edge-admission-control-plan_calls.md)
 - [edge-boot-plan_calls.md](calls/edge-boot-plan_calls.md)
+- [edge-ratify-throughput-plan_calls.md](calls/edge-ratify-throughput-plan_calls.md)
 - [egress-credential-injection-plan_calls.md](calls/egress-credential-injection-plan_calls.md)
+- [elastic-session-envelopes-plan_calls.md](calls/elastic-session-envelopes-plan_calls.md)
 - [exec-and-actions-plan_calls.md](calls/exec-and-actions-plan_calls.md)
 - [gated-sandbox-checkpoints-plan_calls.md](calls/gated-sandbox-checkpoints-plan_calls.md)
 - [rootfs-base-cache-plan_calls.md](calls/rootfs-base-cache-plan_calls.md)
@@ -209,7 +220,9 @@ by project impact. The full template and a worked example:
 - [sandbox-exec-plan_calls.md](calls/sandbox-exec-plan_calls.md)
 - [sandbox-scaling-plan_calls.md](calls/sandbox-scaling-plan_calls.md)
 - [sandbox-snapshots-and-fast-start-plan_calls.md](calls/sandbox-snapshots-and-fast-start-plan_calls.md)
+- [scheduler-lane-entry-cost-plan_calls.md](calls/scheduler-lane-entry-cost-plan_calls.md)
 - [wake-on-request-plan_calls.md](calls/wake-on-request-plan_calls.md)
+- [checkpoints-on-stream-plan_calls.md](calls/checkpoints-on-stream-plan_calls.md)
 - [session-durability-and-routing-plan_calls.md](calls/session-durability-and-routing-plan_calls.md)
 - [gang-scheduling-plan_calls.md](calls/gang-scheduling-plan_calls.md)
 - [heartbeat-cadence-at-scale-plan_calls.md](calls/heartbeat-cadence-at-scale-plan_calls.md)
@@ -225,12 +238,14 @@ by project impact. The full template and a worked example:
 - [operator-ui-gaps-plan_calls.md](calls/operator-ui-gaps-plan_calls.md)
 - [ui-holistic-polish-plan_calls.md](calls/ui-holistic-polish-plan_calls.md)
 - [ui-task-and-template-redesign-plan_calls.md](calls/ui-task-and-template-redesign-plan_calls.md)
+- [chunked-checkpoint-publish-plan_calls.md](calls/chunked-checkpoint-publish-plan_calls.md)
 - [checkpoint-encryption-plan_calls.md](calls/checkpoint-encryption-plan_calls.md)
 - [kv-encryption-plan_calls.md](calls/kv-encryption-plan_calls.md)
 - [kv-reactive-task-updates-plan_calls.md](calls/kv-reactive-task-updates-plan_calls.md)
 - [kv-cert-delivery-plan_calls.md](calls/kv-cert-delivery-plan_calls.md)
 - [join-token-file-and-cli-timeouts_calls.md](calls/join-token-file-and-cli-timeouts_calls.md)
 - [launch-spot-check-fixes-plan_calls.md](calls/launch-spot-check-fixes-plan_calls.md)
+- [lazy-memory-restore-plan_calls.md](calls/lazy-memory-restore-plan_calls.md)
 - [liveness-off-the-raft-path-plan_calls.md](calls/liveness-off-the-raft-path-plan_calls.md)
 - [manager-contention-instrumentation_calls.md](calls/manager-contention-instrumentation_calls.md)
 - [managers-page-raft-members_calls.md](calls/managers-page-raft-members_calls.md)
@@ -238,6 +253,7 @@ by project impact. The full template and a worked example:
 - [manager-workload-identity-plan_calls.md](calls/manager-workload-identity-plan_calls.md)
 - [multi-cluster-federation-plan_calls.md](calls/multi-cluster-federation-plan_calls.md)
 - [multi-raft-persistence-plan_calls.md](calls/multi-raft-persistence-plan_calls.md)
+- [multi-eval-plans-plan_calls.md](calls/multi-eval-plans-plan_calls.md)
 - [namespaces-plan_calls.md](calls/namespaces-plan_calls.md)
 - [network-handlers-plan_calls.md](calls/network-handlers-plan_calls.md)
 - [service-mesh-plan_calls.md](calls/service-mesh-plan_calls.md)

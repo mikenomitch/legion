@@ -52,14 +52,17 @@ manager-level `schedulerSettings`.
   constraint changes, shrunken node totals, and static-port collisions
   that happen between snapshot and apply each cost a rank instead of
   rejecting the plan.
-- **Ratifications keep the hard epoch check.** A plan carrying a
+- **Ratifications skip the epochs entirely.** A plan carrying a
   `target_instance` ([edge boot](edge-boot.md)) asks the applier to bind
-  this sandbox on this node or report who got there first. A moved epoch
-  there may mean another plan already owns the sandbox. No capacity
-  recheck can rule that out, so pass 2 does not run for it.
-- **The job-config epoch stays a hard check.** Two plans for the same job
-  config still serialize all-or-nothing. Candidate lists never weaken
-  that.
+  this sandbox on this node or report who got there first. It was never
+  planned against a snapshot, so it has no epochs to compare. Its one
+  candidate goes straight to the checks pass 2 runs, and whether another
+  allocation already owns the sandbox is read from committed rows by the
+  instance bind in the same transaction. Ratifications still bump the
+  epochs they touch, so scheduler plans stay fenced against them.
+- **The job-config epoch stays a hard check.** Two scheduler plans for the
+  same job config still serialize all-or-nothing. Candidate lists never
+  weaken that.
 - **Races resolve themselves.** Applies are serialized (locally, and by log
   order under raft), and each walk runs against committed state. Racer 1
   binds the shared first choice. Racer 2 sees its epoch moved and tries its

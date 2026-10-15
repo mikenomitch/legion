@@ -175,6 +175,12 @@ impl Eval {
         }
         observe_phase(&self.kind, "prepare", prepare_started.elapsed());
 
+        // A first submit's plan is its last write unless a batch follow-up
+        // is queued after it; a resubmit removes the previous config's
+        // allocations after its plan, so it settles in its own write.
+        if previous_config_id.is_none() && self.batch_follow_up_delay(store)?.is_none() {
+            crate::storage::store::arm_eval_settle();
+        }
         let outcome = self.schedule_job_allocations(store, PlanMode::Fresh)?;
         if !outcome.deltas.is_empty() {
             info!(?outcome.deltas, "Job submit allocation deltas");
@@ -240,6 +246,11 @@ impl Eval {
         // step of a DAG would start at once again.
         store.reset_task_statuses(&self.job_config_id)?;
         observe_phase(&self.kind, "prepare", prepare_started.elapsed());
+        // Everything above wrote before the plan; the plan is the last write
+        // unless a batch follow-up is queued after it.
+        if self.batch_follow_up_delay(store)?.is_none() {
+            crate::storage::store::arm_eval_settle();
+        }
         let outcome = match self.schedule_job_allocations(store, PlanMode::Fresh) {
             Ok(outcome) => outcome,
             // The job's allocations are already gone. A transient failure
@@ -400,6 +411,11 @@ impl Eval {
         let prepare_started = Instant::now();
         let retired = store.retire_surplus_allocations(&self.job_config_id)?;
         observe_phase(&self.kind, "prepare", prepare_started.elapsed());
+        // A scale-in queues a capacity pass after its plan; a scale-out's
+        // plan is its last write.
+        if retired.is_empty() {
+            crate::storage::store::arm_eval_settle();
+        }
         let outcome = self.schedule_job_allocations(store, PlanMode::Reschedule)?;
         if !outcome.deltas.is_empty() {
             info!(?outcome.deltas, "Job scale allocation deltas");

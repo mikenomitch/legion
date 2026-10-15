@@ -731,7 +731,11 @@ pub(crate) fn checkpoint_microvm(
                 vec![("memory", parts::FC_MEMORY), ("vm-state", parts::FC_STATE)]
             }
             _ => {
-                CloudHypervisorApi::new(&socket).snapshot(out.path())?;
+                snapshot_cloud_hypervisor(
+                    &CloudHypervisorApi::new(&socket),
+                    out.path(),
+                    CH_RESTORING_WAIT,
+                )?;
                 vec![
                     ("memory", parts::CH_MEMORY),
                     ("vm-state", parts::CH_STATE),
@@ -801,6 +805,42 @@ pub(crate) fn checkpoint_microvm(
         "Checkpointed sandbox memory"
     );
     Ok(memory)
+}
+
+/// How long a cloud-hypervisor capture waits for an on-demand restore to
+/// finish loading the guest's memory. v53 fills it in the background within
+/// seconds of the resume, and refuses `vm.snapshot` until it has. Short on
+/// purpose: a capture holds the worker's task-manager lock and keeps its
+/// guest paused, so one taken too soon after a restore fails fast with a
+/// clear error rather than stalling every start, stop, and heartbeat on the
+/// node.
+const CH_RESTORING_WAIT: Duration = Duration::from_secs(2);
+
+/// What cloud-hypervisor v53 answers `vm.snapshot` with while an on-demand
+/// restore is still loading memory (`VmError::VmRestoring`).
+const CH_RESTORING_ERROR: &str = "on-demand memory restore is still in progress";
+
+/// `vm.snapshot` into `dir`, retried while cloud-hypervisor is still loading
+/// the memory of a guest it restored on demand (v53 refuses until its
+/// background fill is done; v52 snapshots right away). The VM stays paused
+/// while it waits, which only happens in the seconds after a lazy restore.
+fn snapshot_cloud_hypervisor(api: &CloudHypervisorApi, dir: &Path, wait: Duration) -> R<()> {
+    let deadline = std::time::Instant::now() + wait;
+    loop {
+        match api.snapshot(dir) {
+            Err(err) if format!("{err:#}").contains(CH_RESTORING_ERROR) => {
+                if std::time::Instant::now() >= deadline {
+                    return Err(err.context(format!(
+                        "cloud-hypervisor was still loading the guest's memory from its last \
+                         restore after {}s; take the checkpoint again in a few seconds",
+                        wait.as_secs()
+                    )));
+                }
+                std::thread::sleep(Duration::from_millis(200));
+            }
+            other => return other,
+        }
+    }
 }
 
 /// Resume a guest that [`checkpoint_microvm`] left paused
@@ -1343,6 +1383,161 @@ pub(crate) fn wait_for_datapath(base: &Path, timeout: Duration) -> bool {
     }
 }
 
+/// How a restored guest's memory comes back (`config.memory_restore`; see
+/// docs/task-runtime-sandbox.md, "Capture and restore", and
+/// `internal_docs/plans/lazy-memory-restore-plan.md`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum MemoryRestore {
+    /// The guest runs as soon as its device state is loaded, and each page
+    /// of its memory is read from the checkpoint on first touch.
+    #[default]
+    Lazy,
+    /// Every byte of the memory checkpoint is read before the guest runs.
+    Eager,
+}
+
+impl MemoryRestore {
+    pub(crate) fn parse(raw: &str) -> Option<Self> {
+        match raw {
+            "lazy" => Some(MemoryRestore::Lazy),
+            "eager" => Some(MemoryRestore::Eager),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            MemoryRestore::Lazy => "lazy",
+            MemoryRestore::Eager => "eager",
+        }
+    }
+}
+
+/// The oldest cloud-hypervisor with `memory_restore_mode=ondemand` on
+/// `--restore` (v52.0, cloud-hypervisor PR #7800). v53.0 added a background
+/// prefault behind it, so the rest of the memory streams in after the guest
+/// resumes (PR #8150).
+pub(crate) const CLOUD_HYPERVISOR_ONDEMAND_MIN: (u32, u32, u32) = (52, 0, 0);
+
+/// Whether this process can create a userfaultfd, which a cloud-hypervisor
+/// it spawns needs for an on-demand restore. cloud-hypervisor tries
+/// `/dev/userfaultfd` (Linux 6.1+, governed by the device's permissions)
+/// and then the `userfaultfd(2)` syscall (needs `CAP_SYS_PTRACE` unless
+/// `vm.unprivileged_userfaultfd = 1`), and refuses the restore when both
+/// fail. This mirrors that order without registering anything. The VMM
+/// runs with the worker's credentials, so the answer carries over.
+pub(crate) fn userfaultfd_available() -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        if std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open("/dev/userfaultfd")
+            .is_ok()
+        {
+            return true;
+        }
+        // SAFETY: userfaultfd(2) takes only flags and returns a new fd or -1.
+        let fd =
+            unsafe { libc::syscall(libc::SYS_userfaultfd, libc::O_CLOEXEC | libc::O_NONBLOCK) };
+        if fd < 0 {
+            return false;
+        }
+        // SAFETY: `fd` is the descriptor the syscall just returned, owned here.
+        unsafe { libc::close(fd as libc::c_int) };
+        true
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        false
+    }
+}
+
+/// How one restore loads guest memory, decided from the task's ask, the
+/// VMM, and what this node can do.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct MemoryRestorePlan {
+    /// What the restore does.
+    pub mode: MemoryRestore,
+    /// Why `mode` differs from what the task asked for, when it does.
+    pub fallback: Option<String>,
+}
+
+/// Decide how a restore loads guest memory.
+///
+/// - Firecracker maps the memory file `MAP_PRIVATE` either way, so its
+///   pages load on first touch. `eager` additionally reads the file through
+///   the page cache first, so those touches never wait on the disk.
+/// - cloud-hypervisor copies the whole file into guest RAM before the guest
+///   can resume, unless it restores on demand, which needs v52 or later and
+///   a userfaultfd. A lazy ask that this node cannot honor falls back to the
+///   copy, and says why.
+pub(crate) fn plan_memory_restore(
+    backend: &Backend,
+    requested: MemoryRestore,
+    vmm_version: Option<&str>,
+    userfaultfd: bool,
+) -> MemoryRestorePlan {
+    let honored = MemoryRestorePlan {
+        mode: requested,
+        fallback: None,
+    };
+    if requested == MemoryRestore::Eager || !matches!(backend, Backend::CloudHypervisor { .. }) {
+        return honored;
+    }
+    let version = vmm_version.unwrap_or("unknown");
+    let fallback = if crate::structs::fork::parse_vmm_semver(version)
+        .is_none_or(|parsed| parsed < CLOUD_HYPERVISOR_ONDEMAND_MIN)
+    {
+        let (major, minor, _) = CLOUD_HYPERVISOR_ONDEMAND_MIN;
+        format!(
+            "cloud-hypervisor {version} restores memory only by copying it (on-demand restore \
+             needs v{major}.{minor} or later)"
+        )
+    } else if !userfaultfd {
+        "this node cannot create a userfaultfd (open /dev/userfaultfd or the userfaultfd \
+         syscall), which an on-demand cloud-hypervisor restore needs"
+            .to_string()
+    } else {
+        return honored;
+    };
+    MemoryRestorePlan {
+        mode: MemoryRestore::Eager,
+        fallback: Some(fallback),
+    }
+}
+
+/// The `--restore` argument for a cloud-hypervisor restore from `dir`.
+pub(crate) fn cloud_hypervisor_restore_arg(dir: &Path, mode: MemoryRestore) -> String {
+    let source = format!("source_url={}", crate::task_plugins::vmm_api::file_url(dir));
+    match mode {
+        MemoryRestore::Lazy => format!("{source},memory_restore_mode=ondemand"),
+        // `copy` is cloud-hypervisor's default; leaving it unset keeps the
+        // argument valid on releases that predate the option.
+        MemoryRestore::Eager => source,
+    }
+}
+
+/// Read a Firecracker memory file through the page cache before the guest
+/// runs, so its first touches of each page are cache hits. Returns the bytes
+/// read.
+fn warm_page_cache(path: &Path) -> R<u64> {
+    use std::io::Read;
+    let mut file = std::fs::File::open(path)
+        .with_context(|| format!("failed to open {} to read it ahead", path.display()))?;
+    let mut buf = vec![0u8; 1 << 20];
+    let mut total = 0u64;
+    loop {
+        let read = file
+            .read(&mut buf)
+            .with_context(|| format!("failed to read {} ahead", path.display()))?;
+        if read == 0 {
+            return Ok(total);
+        }
+        total += read as u64;
+    }
+}
+
 /// What [`restore_microvm`] needs about the task, resolved by the caller.
 pub(crate) struct RestoreTarget<'a> {
     pub backend: &'a Backend,
@@ -1352,6 +1547,12 @@ pub(crate) struct RestoreTarget<'a> {
     pub vcpus: u32,
     pub memory_mib: u32,
     pub scratch: PathBuf,
+    /// How the task asked for its memory to come back
+    /// (`config.memory_restore`).
+    pub memory_restore: MemoryRestore,
+    /// Whether this node can create a userfaultfd
+    /// ([`userfaultfd_available`]; tests set it).
+    pub userfaultfd: bool,
     /// The TAP device the task's current config attaches, if any. Restore
     /// uses the destination's config, never the manifest's, and refuses when
     /// the two disagree. For an auto TAP this is the instance's own device.
@@ -1626,6 +1827,32 @@ pub(crate) fn restore_microvm(
     let _ = std::fs::remove_file(&socket);
     let started = std::time::Instant::now();
 
+    // A checkpoint restores only on a node running the VMM version it was
+    // captured on (placement checks `compat`), so its recorded version is
+    // this node's.
+    let memory_plan = plan_memory_restore(
+        target.backend,
+        target.memory_restore,
+        manifest.compat.vmm.as_ref().map(|vmm| vmm.version.as_str()),
+        target.userfaultfd,
+    );
+    if let Some(reason) = memory_plan.fallback.as_deref() {
+        info!(
+            allocation_id = target.allocation.id,
+            snapshot_id = %manifest.id,
+            reason,
+            "Restoring sandbox memory eagerly: lazy restore is not available here"
+        );
+    }
+    // Before the link lock, which every restore on the node takes. The
+    // hard link the VMM maps below shares this file's page cache (the copy
+    // made when a hard link is impossible would not).
+    if matches!(target.backend, Backend::Firecracker { .. })
+        && memory_plan.mode == MemoryRestore::Eager
+    {
+        warm_page_cache(&source.part_path(parts::FC_MEMORY))?;
+    }
+
     let _guard = LINK_LOCK
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -1646,13 +1873,9 @@ pub(crate) fn restore_microvm(
         }
         Backend::CloudHypervisor { binary } => {
             let mut cmd = Command::new(binary);
-            cmd.arg("--api-socket")
-                .arg(&socket)
-                .arg("--restore")
-                .arg(format!(
-                    "source_url={}",
-                    crate::task_plugins::vmm_api::file_url(source.path())
-                ));
+            cmd.arg("--api-socket").arg(&socket).arg("--restore").arg(
+                cloud_hypervisor_restore_arg(source.path(), memory_plan.mode),
+            );
             cmd
         }
         other => bail!("{} cannot restore a memory checkpoint", other.label()),
@@ -1716,11 +1939,13 @@ pub(crate) fn restore_microvm(
                 await_datapath(target);
                 api.resume()
             }
-            // `--restore` loaded the state at launch, paused.
+            // `--restore` loads the state at launch, paused. Its API socket
+            // is up before the restore finishes, and the resume queues
+            // behind it, so the resume waits out an eager copy too.
             _ => {
                 write_boot_record(scratch, &next)?;
                 await_datapath(target);
-                CloudHypervisorApi::new(&socket).resume()
+                CloudHypervisorApi::new(&socket).resume_restored()
             }
         }
     })();
@@ -1737,6 +1962,7 @@ pub(crate) fn restore_microvm(
         allocation_id = target.allocation.id,
         snapshot_id = %manifest.id,
         vmm = %next.vmm,
+        memory_restore = memory_plan.mode.as_str(),
         restore_ms = started.elapsed().as_millis() as u64,
         "Restored sandbox from memory checkpoint"
     );
@@ -1936,6 +2162,8 @@ mod tests {
             bridge: None,
             vsock: None,
             datapath_wait: DATAPATH_WAIT,
+            memory_restore: MemoryRestore::Lazy,
+            userfaultfd: false,
         };
         let manifest = manifest_for(&state, MemoryParts::default());
 
@@ -2093,6 +2321,8 @@ mod tests {
             bridge: None,
             vsock: None,
             datapath_wait: DATAPATH_WAIT,
+            memory_restore: MemoryRestore::Lazy,
+            userfaultfd: false,
         };
         restore_microvm(
             &target,
@@ -2235,6 +2465,8 @@ mod tests {
                 bridge: None,
                 vsock: None,
                 datapath_wait: DATAPATH_WAIT,
+                memory_restore: MemoryRestore::Lazy,
+                userfaultfd: false,
             };
             // A fork asks for no previous address, so it never gets the
             // origin's.
@@ -2532,6 +2764,8 @@ mod tests {
             bridge: bridge.map(str::to_string),
             vsock: gated.then(|| PathBuf::from("/allocs/9/.sandbox/vsock.sock")),
             datapath_wait: DATAPATH_WAIT,
+            memory_restore: MemoryRestore::Lazy,
+            userfaultfd: false,
         };
         let gated = manifest_for(
             &state(Some(GuestNetwork::Gated), None),
@@ -2708,6 +2942,8 @@ mod tests {
                 bridge: None,
                 vsock: Some(scratch.join("vsock.sock")),
                 datapath_wait: DATAPATH_WAIT,
+                memory_restore: MemoryRestore::Lazy,
+                userfaultfd: false,
             };
             let mut restored = TaskInstance {
                 alloc_dir: Some(tmp.path().join(format!("allocs/{id}"))),
@@ -2799,6 +3035,8 @@ mod tests {
             bridge: None,
             vsock: Some(scratch.join("vsock.sock")),
             datapath_wait: Duration::from_millis(100),
+            memory_restore: MemoryRestore::Lazy,
+            userfaultfd: false,
         };
         let mut instance = TaskInstance {
             alloc_dir: Some(tmp.path().join("allocs/8")),
@@ -2906,6 +3144,8 @@ mod tests {
             bridge: None,
             vsock: Some(crate::task_plugins::vsock_socket_base(scratch)),
             datapath_wait: Duration::ZERO,
+            memory_restore: MemoryRestore::Lazy,
+            userfaultfd: false,
         }
     }
 
@@ -3029,6 +3269,239 @@ mod tests {
             Some(node.join("vmdev").join(&state.link_key)),
             "a later checkpoint of the restored guest names this node's links"
         );
+        Ok(())
+    }
+
+    /// Lazy is the default ask. Firecracker honors either ask (it maps the
+    /// memory file either way). cloud-hypervisor restores on demand only on
+    /// v52 or later with a userfaultfd, and otherwise falls back to its copy
+    /// restore with a reason.
+    #[test]
+    fn memory_restore_plans_follow_the_vmm_and_the_node() {
+        assert_eq!(MemoryRestore::default(), MemoryRestore::Lazy);
+        assert_eq!(MemoryRestore::parse("eager"), Some(MemoryRestore::Eager));
+        assert_eq!(MemoryRestore::parse("Lazy"), None);
+        let fc = Backend::Firecracker {
+            binary: "firecracker".into(),
+        };
+        let ch = Backend::CloudHypervisor {
+            binary: "cloud-hypervisor".into(),
+        };
+        let honored = |mode| MemoryRestorePlan {
+            mode,
+            fallback: None,
+        };
+        for ask in [MemoryRestore::Lazy, MemoryRestore::Eager] {
+            assert_eq!(
+                plan_memory_restore(&fc, ask, Some("1.7.0"), false),
+                honored(ask)
+            );
+        }
+        assert_eq!(
+            plan_memory_restore(&ch, MemoryRestore::Lazy, Some("52.0.0"), true),
+            honored(MemoryRestore::Lazy)
+        );
+        assert_eq!(
+            plan_memory_restore(&ch, MemoryRestore::Eager, Some("53.0.0"), true),
+            honored(MemoryRestore::Eager)
+        );
+        let fallback = |version, userfaultfd| {
+            let plan = plan_memory_restore(&ch, MemoryRestore::Lazy, version, userfaultfd);
+            assert_eq!(plan.mode, MemoryRestore::Eager);
+            plan.fallback.expect("a fallback says why")
+        };
+        assert!(fallback(Some("51.2.0"), true).contains("needs v52.0 or later"));
+        assert!(fallback(None, true).contains("cloud-hypervisor unknown"));
+        assert!(fallback(Some("53.0.0"), false).contains("userfaultfd"));
+
+        let dir = Path::new("/c/restore");
+        assert_eq!(
+            cloud_hypervisor_restore_arg(dir, MemoryRestore::Lazy),
+            "source_url=file:///c/restore,memory_restore_mode=ondemand"
+        );
+        assert_eq!(
+            cloud_hypervisor_restore_arg(dir, MemoryRestore::Eager),
+            "source_url=file:///c/restore"
+        );
+    }
+
+    /// The `--restore` argument a real restore launches cloud-hypervisor
+    /// with: on demand where the version and the node allow it, the copy
+    /// restore otherwise.
+    #[test]
+    fn cloud_hypervisor_restores_memory_on_demand_where_it_can() -> R<()> {
+        let tmp = tempfile::tempdir()?;
+        // A stand-in VMM that records its argv. The fake API answers for it.
+        let binary = tmp.path().join("cloud-hypervisor");
+        std::fs::write(&binary, "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$0.argv\"\n")?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755))?;
+        }
+        let argv_path = tmp.path().join("cloud-hypervisor.argv");
+        let ch = Backend::CloudHypervisor {
+            binary: binary.display().to_string(),
+        };
+        let cases = [
+            ("52.0.0", MemoryRestore::Lazy, true, true),
+            ("53.0.0", MemoryRestore::Eager, true, false),
+            ("51.2.0", MemoryRestore::Lazy, true, false),
+            ("53.0.0", MemoryRestore::Lazy, false, false),
+        ];
+        for (round, (version, ask, userfaultfd, on_demand)) in cases.into_iter().enumerate() {
+            let id = 50 + round as i64;
+            let node = tmp.path().join(format!("n{round}"));
+            let (origin_scratch, spec) = launch_on(&node_instance(&node, "w1", id), id, &ch)?;
+            let out = CheckpointDir::create(tmp.path().join(format!("ckpt{round}")))?;
+            std::fs::copy(
+                origin_scratch.join("rootfs.img"),
+                out.part_path(parts::ROOTFS),
+            )?;
+            std::fs::write(
+                out.part_path(parts::CH_CONFIG),
+                serde_json::to_vec(&json!({
+                    "disks": [{ "path": spec.root_disk, "id": "_disk0" }],
+                    "vsock": { "cid": 3, "socket": spec.vsock.as_ref().unwrap().socket, "id": "_vsock0" },
+                }))?,
+            )?;
+            let state = read_boot_record(&origin_scratch).expect("boot record");
+            let mut memory = MemoryParts {
+                parts: out.seal(&[("rootfs", parts::ROOTFS), ("vm-config", parts::CH_CONFIG)])?,
+                ..MemoryParts::default()
+            };
+            memory.compat.vmm = Some(VmmCompat {
+                kind: "cloud-hypervisor".into(),
+                version: version.into(),
+            });
+            let manifest = manifest_for(&state, memory);
+
+            let restore_id = id + 100;
+            let mut instance = node_instance(&node, "w1", restore_id);
+            let alloc_dir = instance.alloc_dir.clone().unwrap();
+            let scratch = alloc_dir.join(".sandbox");
+            std::fs::create_dir_all(&scratch)?;
+            std::fs::write(
+                crate::worker::netd::guest_agent::host_socket_path(
+                    &crate::task_plugins::vsock_socket_base_for(&alloc_dir),
+                    crate::worker::netd::guest_agent::PROXY_PORT,
+                ),
+                b"bound",
+            )?;
+            std::fs::write(scratch.join("vmm.sock"), b"stale")?;
+            let _ = std::fs::remove_file(&argv_path);
+            let vmm = FakeVmm::start_at(scratch.join("vmm.sock"), true, |_| (204, String::new()));
+            let allocation = alloc(restore_id);
+            let mut target = gated_target(&ch, &allocation, &scratch);
+            target.memory_restore = ask;
+            target.userfaultfd = userfaultfd;
+            restore_microvm(
+                &target,
+                &mut instance,
+                &manifest,
+                &out,
+                &ResumeIdentity {
+                    alloc_id: restore_id,
+                    ..ResumeIdentity::default()
+                },
+                &FakeTaps::default(),
+            )?;
+            let calls: Vec<String> = vmm.drain().into_iter().map(|call| call.path).collect();
+            assert_eq!(calls, vec!["/api/v1/vm.resume"]);
+
+            // The stand-in may still be writing its argv.
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            let argv = loop {
+                match std::fs::read_to_string(&argv_path) {
+                    Ok(argv) if argv.ends_with('\n') => break argv,
+                    _ if std::time::Instant::now() >= deadline => {
+                        panic!("the stand-in VMM never recorded its argv")
+                    }
+                    _ => std::thread::sleep(Duration::from_millis(10)),
+                }
+            };
+            let restore = argv
+                .lines()
+                .skip_while(|arg| *arg != "--restore")
+                .nth(1)
+                .expect("a --restore argument");
+            let expected = if on_demand {
+                MemoryRestore::Lazy
+            } else {
+                MemoryRestore::Eager
+            };
+            assert_eq!(
+                restore,
+                cloud_hypervisor_restore_arg(out.path(), expected),
+                "cloud-hypervisor {version}, asked {ask:?}, userfaultfd {userfaultfd}"
+            );
+        }
+        Ok(())
+    }
+
+    /// cloud-hypervisor v53 refuses `vm.snapshot` until an on-demand
+    /// restore's background fill is done. A capture in that window waits it
+    /// out instead of failing, and still fails, by name, past the wait.
+    #[test]
+    fn a_capture_right_after_a_lazy_restore_waits_for_cloud_hypervisor() -> R<()> {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+        let restoring = (
+            500,
+            "[\"Error from API\",\"VM on-demand memory restore is still in progress\"]".to_string(),
+        );
+        let refusals = Arc::new(AtomicUsize::new(2));
+        let left = refusals.clone();
+        let vmm = FakeVmm::start(move |_| {
+            if left
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+                .is_ok()
+            {
+                restoring.clone()
+            } else {
+                (204, String::new())
+            }
+        });
+        let api = CloudHypervisorApi::new(&vmm.socket);
+        snapshot_cloud_hypervisor(&api, Path::new("/c/out"), Duration::from_secs(10))?;
+        assert_eq!(vmm.drain().len(), 3, "two refusals, then the snapshot");
+
+        let vmm = FakeVmm::start(|_| {
+            (
+                500,
+                "[\"VM on-demand memory restore is still in progress\"]".to_string(),
+            )
+        });
+        let err = snapshot_cloud_hypervisor(
+            &CloudHypervisorApi::new(&vmm.socket),
+            Path::new("/c/out"),
+            Duration::ZERO,
+        )
+        .expect_err("still restoring past the wait");
+        assert!(
+            format!("{err:#}").contains("still loading the guest's memory"),
+            "{err:#}"
+        );
+
+        // Any other failure is returned at once.
+        let vmm = FakeVmm::start(|_| (500, "[\"VM is not paused\"]".to_string()));
+        snapshot_cloud_hypervisor(
+            &CloudHypervisorApi::new(&vmm.socket),
+            Path::new("/c/out"),
+            Duration::from_secs(10),
+        )
+        .expect_err("not a restoring refusal");
+        assert_eq!(vmm.drain().len(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn an_eager_firecracker_restore_reads_the_memory_file_ahead() -> R<()> {
+        let tmp = tempfile::tempdir()?;
+        let memory = tmp.path().join("memory");
+        std::fs::write(&memory, vec![3u8; (1 << 20) + 17])?;
+        assert_eq!(warm_page_cache(&memory)?, (1 << 20) + 17);
+        assert!(warm_page_cache(&tmp.path().join("missing")).is_err());
         Ok(())
     }
 
@@ -3616,6 +4089,8 @@ mod tests {
             bridge: None,
             vsock: None,
             datapath_wait: DATAPATH_WAIT,
+            memory_restore: MemoryRestore::Lazy,
+            userfaultfd: false,
         };
         let mut instance = TaskInstance {
             alloc_dir: Some(dir.path().join("allocs/8")),

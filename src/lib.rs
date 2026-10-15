@@ -9,6 +9,7 @@
 
 pub mod artifacts;
 pub mod certs;
+pub mod checkpoint_chunks;
 pub mod checkpoint_seal;
 pub mod cluster_tls;
 pub mod cmd;

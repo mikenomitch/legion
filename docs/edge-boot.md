@@ -31,7 +31,10 @@ changes nothing behaves as it did before, including its wire payloads.
 - [What is never speculative](#what-is-never-speculative)
 - [What the gate does and does not stop](#what-the-gate-does-and-does-not-stop)
 - [Boot tickets](#boot-tickets)
+- [Ratification under load](#ratification-under-load)
+- [Ratification on a raft cluster](#ratification-on-a-raft-cluster)
 - [The kill path](#the-kill-path)
+- [Overload](#overload)
 - [Enabling it](#enabling-it)
 - [Observability](#observability)
 - [Version skew](#version-skew)
@@ -125,11 +128,11 @@ an unratified workload can do to the outside world.
 }
 ```
 
-**Defaults.** `mode = "off"`, `ratifyTimeout = "5s"` (capped at `2m`),
+**Defaults.** `mode = "off"`, `ratifyTimeout = "5s"` (at least `1s`, capped at `2m`),
 `onRefused = "kill"`. Leaving out the block means `off` and costs nothing.
 
 The block is validated at **submit**, not at dispatch. An unrecognized `mode`
-or `onRefused`, or a `ratifyTimeout` of zero or over the cap, fails
+or `onRefused`, or a `ratifyTimeout` under a second or over the cap, fails
 `legion job run` with the reason. If a typo were silently read as `off`, you
 would only notice it later as a latency regression.
 
@@ -326,6 +329,9 @@ holding or booting anything.
 5. `jti` against a local single-use set
 6. the local claim table (one live claim per instance id per node)
 7. the local resource ledger (the node must have room)
+8. room in the node's claim window, which bounds its unratified edge claims
+   and sheds starts when ratification falls behind (see
+   [Overload](#overload))
 
 ### Replay and revocation
 
@@ -428,6 +434,139 @@ back the round trip the ticket exists to avoid. In practice, keep at least
 one allocation of the job running in each edge pool, which a warm sandbox
 fleet does anyway. There is no dedicated pre-warm push.
 
+The cached config includes the task's `speculativeStart` block, which rides
+the dispatch payload, so the task's own mode caps the gate (step 4 above)
+on every node.
+
+The cached config does not carry the start's identity. Its env names the
+instance of the allocation it was cached from, so an edge start removes
+`LEGION_INSTANCE_ID`, `LEGION_INSTANCE_MODE`, and `LEGION_INSTANCE_SLOT`
+from it and sets the claim's own: the instance id the start names, with
+mode `keyed`.
+
+## Ratification under load
+
+Every edge start still costs the manager one ratification, so the rate at
+which one manager confirms ratifications is the ceiling on sustained edge
+starts.
+
+**What a ratification checks.** Everything is read from committed rows
+inside the ratification's own write, so nothing it checks can go stale
+between the check and the commit:
+
+- the ticket has a redemption left (the spend is in the same write)
+- the named sandbox is not owned by another allocation of this job config,
+  and is not stopped, suspended, or destroyed
+- the node is still available and still satisfies the task's constraints
+  and permit
+- the node still has room, from its free capacity rebuilt from the
+  allocations committed on it (`reservedResources` and `maxAllocations`
+  included)
+- static ports, and `distinct` constraints
+
+A ratification does **not** compare the version numbers ("epochs") that
+the scheduler's own plans use to detect that they planned against stale
+state. A ratification never planned against a snapshot, so there is
+nothing for them to detect. Starts of one sandbox job from many nodes,
+and many starts from one node, therefore do not refuse each other. They
+share writes instead: ratifications that arrive together commit as one
+scheduler-lane entry, each in its own savepoint, up to 64 per entry
+([sandboxes at scale](sandboxes-at-scale.md)).
+
+**Throughput.** Measured with the real `RatifyClaim` handler in-process
+(ticket re-verification, spend, create, bind, event, committed payload):
+one job config, 2,000 claims per cell, every claim a new sandbox, a
+4-thread manager runtime, and a fixed number of concurrent callers. The
+`raft` store is a single-voter cluster. These numbers come from an Apple
+M5 laptop (10 cores, 32 GB) shared with other build jobs, so read them as
+relative, not as a sizing figure.
+
+| Store | Claims from | Callers | Confirmed/s | p50 ms | p99 ms | Claims per entry |
+| --- | --- | ---: | ---: | ---: | ---: | ---: |
+| local | 256 nodes | 1 | 320 | 2.1 | 21 | 1.0 |
+| local | 256 nodes | 64 | 442 | 140 | 285 | 18 |
+| local | 256 nodes | 256 | 461 | 536 | 1,013 | 56 |
+| local | one node | 256 | 415 | 542 | 986 | 54 |
+| raft | 256 nodes | 1 | 174 | 4.8 | 30 | 1.0 |
+| raft | 256 nodes | 64 | 357 | 187 | 361 | 29 |
+| raft | 256 nodes | 256 | 381 | 587 | 1,161 | 61 |
+| raft | one node | 256 | 372 | 686 | 1,117 | 61 |
+
+Every claim confirmed in every cell. Two things follow from the table:
+
+- Entries fill as callers grow, but the confirmed rate barely moves past
+  64 callers. The bound is the work each ratification does inside the
+  entry, which runs one ratification after another, not the number of
+  entries. More callers past that point only add queueing to the verdict
+  latency.
+- Claims from one node confirm at about the same rate as claims spread
+  over 256 nodes, so a dense node does not need its own batching.
+
+These are ceilings for the manager's commit path. They do not include the
+network, HTTP/2, or a follower round trip in a multi-voter raft cluster,
+and one manager's whole scheduler lane is shared with placements, creates,
+and every other instance write. To reproduce them, run the ignored test
+`tests/ratify_throughput_measure.rs`:
+
+```console
+$ cargo test --release --test ratify_throughput_measure -- --ignored --nocapture
+```
+
+`LEGION_RATIFY_CLAIMS`, `LEGION_RATIFY_CONCURRENCY` (a comma list),
+`LEGION_RATIFY_BACKENDS` (`local`, `raft`), and `LEGION_RATIFY_WORKERS`
+change the cells.
+
+**What happens past the ceiling.** Ratifications queue for the scheduler
+lane, and verdict latency (`legion_provisional_ratify_seconds`) climbs.
+A claim with no verdict by its `ratifyTimeout` is killed and its start is
+refused as `expired`. Edge nodes shrink their claim window when their
+verdicts come back slowly and refuse new starts `OVERLOADED` before boot
+(see [Overload](#overload)), so only claims admitted before the slowdown
+run into the lease. Watch the p99 of `legion_provisional_ratify_seconds`
+against `ratifyTimeout`.
+
+## Ratification on a raft cluster
+
+Under `persistence.type = "raft"`, only the raft leader commits a
+ratification. A node sends its ratifications to one manager at a time, and
+that manager may be a follower.
+
+- **A follower answers "not the leader".** It does not forward the call
+  and does not judge the claim. It answers `FailedPrecondition` with `this
+  manager is not the raft leader…`, writes nothing, and leaves the ticket
+  unspent.
+- **The node asks the leader.** On that answer, or when the call never
+  reached the manager (`Unavailable`), the node tries the other managers it
+  knows, in order, and keeps sending ratifications to the first one that
+  ratifies. It drops that one when it answers not-leader or stops
+  answering. A call that timed out is not retried elsewhere, because the
+  leader may have ratified it already and a second ratification would be
+  refused. The retries count against the claim's `ratifyTimeout`. If every
+  manager answers not-leader, as during an election, the node kills the
+  claim, and the start is refused `internal` with `ratification call
+  failed`.
+- **A just-ratified claim survives a stale desired set.** A node stops work
+  that its heartbeat's desired set does not list (see [The kill
+  path](#the-kill-path)). A follower that has not applied a ratification
+  yet, or a leader that built the set just before it, leaves out a claim it
+  just confirmed. So a ratified claim stays exempt from that sweep until a
+  desired set lists it, or for 30 seconds, whichever comes first. After
+  that, an absence means stop again. The cost is that a claim the managers
+  want gone right after its ratification can run up to 30 seconds longer.
+
+**Tested on three managers.** On AWS, three raft managers and three workers
+raced edge starts of the same keyed instance, a host process on the `exec`
+runtime. For each instance id, every worker started it at the same moment
+with `legion sandbox start`. In runs of 60, 200, and 300 ids, every id had
+exactly one ratified start, and the other two were refused
+`instance_claimed`. In the 300-id run the raft leader was stopped 30
+seconds in, and a new leader was elected. The run ended with exactly 300
+processes running, one per instance id, each with its own
+`LEGION_INSTANCE_ID`, and all were still running 80 seconds later. No
+losing start's process survived in any run: all 1,120 losers across 560
+ids were killed. The setup and the script are in
+[RESULTS.md](../benchmarks/aws/sandbox-boot/RESULTS.md#ratification-on-three-managers-2026-10-14).
+
 ## The kill path
 
 Every failure ends the same way: the node kills the work.
@@ -444,24 +583,131 @@ The last row matters because the worker already stops anything the manager
 does not list. Provisional work is **exempt from that sweep for the length of
 its lease**. The manager cannot list work it has not recorded yet, so a
 missing entry is not a decision. After the lease, the existing reconcile code
-stops it. So a bug in this feature makes the sandbox die. It never leaves a
-duplicate running.
+stops it. A claim that was just ratified stays exempt until a desired set
+lists it, or for 30 seconds (see [Ratification on a raft
+cluster](#ratification-on-a-raft-cluster)). So a bug in this feature makes
+the sandbox die. It never leaves a duplicate running.
 
 ### Refusal reasons
 
-| Reason | Meaning | Retried inside the lease? |
-| --- | --- | --- |
-| `instance_claimed` | another allocation already owns this instance id | no (a lost race is final) |
-| `no_capacity` | the node no longer fits the placement, as re-validated on the fresh node row | no |
-| `ineligible` | constraints/permit fail, or the node is cordoned, draining, or lost | no |
-| `expired` | the lease ran out before a verdict arrived | no |
-| `ticket_invalid` | bad signature, wrong audience, wrong pool, expired, or a spent `jti` | no |
-| `unknown_target` | the job config, task, or instance does not exist | no |
-| `disabled` | edge boot is off on this manager | no |
-| `internal` | a store error or an election in progress | yes |
+The node kills the work on every refusal. No reason is retried inside the
+lease, so a start refused as `internal` (a store error, or an election that
+left no manager to answer as leader) is lost, and the caller starts it
+again. A follower's not-leader answer is not a refusal: the node asks the
+other managers instead (see [Ratification on a raft
+cluster](#ratification-on-a-raft-cluster)).
+
+| Reason | Meaning |
+| --- | --- |
+| `instance_claimed` | another allocation already owns this instance id (a lost race is final) |
+| `no_capacity` | the node no longer fits the placement, as re-validated on the fresh node row |
+| `ineligible` | constraints/permit fail, or the node is cordoned, draining, or lost |
+| `expired` | the lease ran out before a verdict arrived |
+| `ticket_invalid` | bad signature, wrong audience, wrong pool, expired, or a spent `jti` |
+| `unknown_target` | the job config, task, or instance does not exist |
+| `disabled` | edge boot is off on this manager |
+| `internal` | a store error, a failed ratify call, or no manager answered as raft leader |
 
 A worker that sees a reason it does not recognize kills the work, so version
 skew fails closed.
+
+## Overload
+
+An edge start boots while its ratification is in flight. If no verdict
+arrives within `ratifyTimeout`, the node kills the work. That is the right
+answer for one start, but under load it compounds. When the managers fall
+behind, ratify latency climbs past the lease, and every start the node admits
+boots, waits out its lease, and dies. The router retries it, which adds load
+exactly when the managers have none to spare. Throughput of starts that
+actually ratify drops toward zero while the nodes stay busy booting work that
+is already doomed.
+
+So a node sheds edge starts early instead: before it admits them, boots them,
+or spends their tickets.
+
+### The claim window
+
+Each node holds at most a **window** of unratified edge claims. A start that
+finds the window full waits up to `edgeBoot.queueTimeout` for a claim to
+settle. If none does, the node refuses it with a retryable `OVERLOADED`.
+
+The window adapts to how fast the node's own ratifications come back, the
+way TCP adapts to a congested link:
+
+- It starts at, and never exceeds, `edgeBoot.maxProvisionalPerNode`
+  (default 32).
+- A verdict that arrives within `edgeBoot.overloadThreshold` of its claim's
+  lease (default `0.3`, so 1.5s of a 5s lease) is timely. Each timely
+  verdict grows the window by `1 / window`, about one slot per window of
+  verdicts.
+- A verdict that arrives later, a ratify call that fails, or a lease that
+  runs out halves the window, never below one. A claim still waiting past
+  its threshold counts as late as soon as the node next decides on a start,
+  so shedding begins within the threshold rather than a lease later.
+- Claims that were already in flight when the window was cut do not cut it
+  again. They belong to the slow patch the node already reacted to.
+
+A window of one still admits a start whenever nothing is in flight, so every
+node keeps probing. When verdicts come back fast again, the window grows back
+on its own. Nothing else has to reset it.
+
+**Claims already admitted are never touched.** The window only decides what
+is admitted next. A slow claim runs until its verdict or its lease, exactly
+as before.
+
+At a healthy ratify latency of tens of milliseconds, a window of 32 admits
+hundreds of starts a second on one node, more than a node can boot. A burst
+larger than the window waits for ratifications to drain, typically for a
+few milliseconds. The window binds only when ratification slows.
+
+### What the caller sees
+
+The refusal comes back before the stream opens, as `RESOURCE_EXHAUSTED`
+tagged with the stable code `OVERLOADED`:
+
+```console
+$ legion sandbox start agent-sandboxes --id user-42 --node https://10.0.1.7:4848 \
+    --ticket "$TICKET" -j
+{
+  "ok": false,
+  "error": {
+    "code": "OVERLOADED",
+    "message": "Failed to start sandbox on the edge node: node is overloaded: recent ratifications were slow, so it holds at most 2 unratified edge claims (edgeBoot.maxProvisionalPerNode is 32), and all 2 stayed unratified for 1s",
+    "hint": "the managers are behind on ratification, so retry with backoff (other nodes share the same managers)",
+    "retryable": true
+  }
+}
+```
+
+- **Nothing was spent.** The ticket is still redeemable, so the retry can
+  present the same one.
+- **Back off before you retry.** A window below `maxProvisionalPerNode`
+  means the managers are behind, and every node in the pool shares them.
+  Retrying at once on another node mostly moves the refusal there.
+- **A full window at its ceiling is different.** The message then names
+  `maxProvisionalPerNode` instead. Ratification is keeping up, but this
+  node already holds as many unratified claims as it allows, so another
+  node may take the start at once.
+- `--dry-run` reports when the window is full, without waiting or holding
+  anything.
+
+### What it does not cover
+
+- **Only edge claims count.** A manager-originated speculative dispatch was
+  placed by the scheduler, which already checked the node's capacity, and
+  it is neither counted nor refused. A session is never ratified, so the
+  window never sees it. Sessions and claims both still wait for a launch
+  slot (`launchConcurrency`, `queueTimeout`), which bounds the runtime work
+  in flight.
+- **Each node learns alone.** A node judges ratification by its own
+  verdicts. A node that takes few starts learns slowly, and a cluster of N
+  edge nodes keeps at least N claims in flight, one probe each.
+- **A start can wait twice.** It waits up to `queueTimeout` for room in the
+  window and then up to `queueTimeout` for a launch slot.
+- **The managers do not shed.** A ratification that reaches a busy manager
+  is still processed in order, even after the node gave up on it. The
+  window keeps that rare by keeping ratify latency under the threshold, not
+  by dropping work at the manager.
 
 ## Enabling it
 
@@ -473,7 +719,6 @@ skew fails closed.
     enabled = true,            # default false
     defaultTicketTtl = "5m",
     maxTicketTtl = "1h",
-    maxProvisionalPerNode = 32,
   },
   workloadIdentity = { enabled = true },  # boot tickets are signed by this issuer
 }
@@ -511,6 +756,8 @@ not just what it was given.
     launchConcurrency = 0,  # 0: twice the node's cores
     queueTimeout = "1s",
     stopCheckpointTimeout = "60s",
+    maxProvisionalPerNode = 32,  # unratified edge claims held at once
+    overloadThreshold = 0.3,     # fraction of ratifyTimeout, 0 is a static cap
   },
 }
 ```
@@ -529,6 +776,15 @@ once; a start that waits `queueTimeout` for a slot is refused with
 `acceptClaims` is on. `stopCheckpointTimeout` bounds how long a stopping
 worker spends checkpointing sessions whose task sets
 `suspend.onWorkerStop = "checkpoint"`.
+
+`maxProvisionalPerNode` and `overloadThreshold` shape the node's claim
+window (see [Overload](#overload)). `maxProvisionalPerNode` must be at least
+1. `overloadThreshold` is a fraction of each claim's `ratifyTimeout`, from 0
+to 1, and `0` turns adaptation off, leaving `maxProvisionalPerNode` as a
+static cap. The manager rejects a worker config with values outside those
+ranges at startup. Size `maxProvisionalPerNode` to the unratified work you
+are willing to see killed at once if the managers become unreachable: every
+unratified claim is a booted workload that dies at its lease.
 
 ## Observability
 
@@ -552,6 +808,15 @@ the `jti` does.
 - `legion_provisional_ratify_seconds`: time from admission to verdict
 - `legion_provisional_active`: unratified claims held right now, so you can
   see capacity that is started but not yet confirmed
+- `legion_worker_claim_window`: the node's claim window right now. Below
+  `maxProvisionalPerNode` means the node has seen slow ratifications
+- `legion_worker_claim_overload_refusals_total`: edge starts refused
+  `OVERLOADED`
+
+A node logs `Ratification is slow, shrinking the edge claim window` at
+`info` when it cuts the window, at most once per slow patch, and `Edge claim
+window is back at its ceiling` when it has fully recovered. Individual
+refusals log at `debug` only, because under overload there are many.
 
 **CLI:**
 
@@ -576,6 +841,16 @@ the dispatcher falls back to post-commit dispatch for that node.
 `RatifyClaim` is a new RPC, so an old manager rejects it and workers fall
 back to their lease, which means they kill the work. Skew fails closed.
 
+`TaskAllocation.task_speculative_start` carries a task's `speculativeStart`
+block to the node's spec cache. A manager that does not send it, or a worker
+that does not read it, leaves every cached task at `off`. The node then
+refuses each ticket for it, which also fails closed:
+
+```text
+task box does not permit speculative starts (speculativeStart.mode is `off`,
+or was downgraded by an invariant)
+```
+
 Upgrade managers in the usual order ([`docs/upgrades.md`](upgrades.md)).
 
 ## Known limitations
@@ -584,6 +859,9 @@ Upgrade managers in the usual order ([`docs/upgrades.md`](upgrades.md)).
   every manager was given the same `workloadIdentity.issuer`. A manager with
   a different value mints tickets that nodes refuse with `InvalidIssuer`,
   and nodes follow whichever manager answered their latest heartbeat.
+- **A ratification that timed out is not retried on another manager.** The
+  leader may have ratified it, so the node kills the claim instead
+  (`ratification call failed`), and the caller starts it again.
 - **No island mode.** An unratified start that cannot reach a manager dies
   when its lease expires. Edge boot does not keep work running through a long
   control-plane outage.

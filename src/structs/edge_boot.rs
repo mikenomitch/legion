@@ -233,8 +233,14 @@ impl SpeculativeStartConfig {
             Some(raw) => {
                 let parsed = humantime::parse_duration(raw.trim())
                     .with_context(|| format!("invalid speculativeStart.ratifyTimeout {raw:?}"))?;
-                if parsed.is_zero() {
-                    bail!("speculativeStart.ratifyTimeout must be greater than zero");
+                // The lease travels as a unix deadline in whole seconds, so a
+                // sub-second lease would land on the node already expired.
+                if parsed < Duration::from_secs(1) {
+                    bail!(
+                        "speculativeStart.ratifyTimeout {} is shorter than 1s, the shortest \
+                         lease a node can hold",
+                        humantime::format_duration(parsed)
+                    );
                 }
                 if parsed > MAX_RATIFY_TIMEOUT {
                     bail!(
@@ -648,6 +654,13 @@ mod edge_boot_test {
             ..Default::default()
         };
         assert!(zero.resolve().is_err());
+
+        let sub_second = SpeculativeStartConfig {
+            ratify_timeout: Some("500ms".into()),
+            ..Default::default()
+        };
+        let err = sub_second.resolve().expect_err("sub-second lease");
+        assert!(err.to_string().contains("shorter than 1s"), "{err}");
 
         let ok = SpeculativeStartConfig {
             mode: Some("serve".into()),

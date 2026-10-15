@@ -163,6 +163,13 @@ pub(crate) enum ForwardableLaneWrite {
     EmitEvent {
         draft: crate::storage::events::EventDraft,
     },
+    /// `Store::resize_envelope` — scheduler lane. A node's elastic envelope
+    /// resize, from its heartbeat, which can land on any manager. Returns
+    /// the outcome.
+    ResizeEnvelope {
+        node_id: String,
+        request: crate::storage::store::EnvelopeResizeRequest,
+    },
 }
 
 impl ForwardableLaneWrite {
@@ -188,7 +195,8 @@ impl ForwardableLaneWrite {
             | ForwardableLaneWrite::MarkVolumeDestroyed { .. }
             | ForwardableLaneWrite::CompleteAllocation { .. }
             | ForwardableLaneWrite::ApplySnapshotReport { .. }
-            | ForwardableLaneWrite::BeginSuspend { .. } => Lane::Scheduler,
+            | ForwardableLaneWrite::BeginSuspend { .. }
+            | ForwardableLaneWrite::ResizeEnvelope { .. } => Lane::Scheduler,
         }
     }
 
@@ -216,6 +224,7 @@ impl ForwardableLaneWrite {
             ForwardableLaneWrite::ApplySnapshotReport { .. } => "apply_snapshot_report",
             ForwardableLaneWrite::BeginSuspend { .. } => "begin_suspend",
             ForwardableLaneWrite::EmitEvent { .. } => "emit_event",
+            ForwardableLaneWrite::ResizeEnvelope { .. } => "resize_envelope",
         }
     }
 }
@@ -343,6 +352,9 @@ pub(crate) fn execute(store: &Store, op: ForwardableLaneWrite) -> ForwardOutcome
         }
         ForwardableLaneWrite::BeginSuspend { new } => done(store.begin_suspend_local(new)),
         ForwardableLaneWrite::EmitEvent { draft } => done(store.emit_event_on(Lane::Status, draft)),
+        ForwardableLaneWrite::ResizeEnvelope { node_id, request } => {
+            done(store.resize_envelope_local(&node_id, &request))
+        }
     }
 }
 
@@ -462,6 +474,14 @@ mod tests {
                     .node("n1")
                     .allocation(5)
                     .meta(serde_json::json!({ "step": "evict-bursting" })),
+            },
+            ForwardableLaneWrite::ResizeEnvelope {
+                node_id: "n1".into(),
+                request: crate::storage::store::EnvelopeResizeRequest {
+                    allocation_id: 6,
+                    from: [("cpu".to_string(), 1000.0)].into(),
+                    to: [("cpu".to_string(), 1500.0)].into(),
+                },
             },
         ];
         for op in ops {

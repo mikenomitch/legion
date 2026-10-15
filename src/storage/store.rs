@@ -24,6 +24,9 @@ mod eval_claims;
 mod fork_ops;
 mod group_commit;
 mod session_ops;
+// Elastic session envelopes: a node's in-place envelope resize.
+mod envelope_ops;
+pub use envelope_ops::{EnvelopeResizeOutcome, EnvelopeResizeRequest};
 mod snapshot_ops;
 mod suspend_ops;
 // The job status GetJobInfo/ListJobs report, derived from the workload.
@@ -1056,6 +1059,19 @@ fn armed_eval_settle() -> Option<FusedEvalSettle> {
     })
 }
 
+/// Take back an [`arm_eval_settle`]: the plan about to apply leaves work
+/// unplaced, so the handler may write again after it (a second pass with
+/// an avoided node allowed, or a delayed retry for preemption victims that
+/// have not aged). The eval then settles in its own write, after them, as
+/// an unarmed handler's does. A no-op outside a settle scope.
+pub fn disarm_eval_settle() {
+    EVAL_SETTLE_SCOPE.with(|scope| {
+        if let Some(scope) = scope.borrow_mut().as_mut() {
+            scope.armed = false;
+        }
+    });
+}
+
 /// Record that the current handler's eval is settled.
 fn mark_eval_settled() {
     EVAL_SETTLE_SCOPE.with(|scope| {
@@ -1911,6 +1927,46 @@ impl Drop for RedactSecretColumns<'_> {
         );
     }
 }
+
+/// The keyed binding query: the oldest unbound live keyed instance of a
+/// (job, group, task) for one task config, with the node-local and restore
+/// preferences described in `Store::assign_keyed_instance_tx`. Parameters:
+/// `?1` job, `?2` group, `?3` task, `?4` task config id, `?5` node id, `?6`
+/// target instance (or `''`), `?7` now (unix seconds).
+const KEYED_BIND_SQL: &str = "SELECT instance.instance_id, instance.job_id, instance.group_name, \
+                 instance.task_name, instance.mode, instance.state, instance.slot_index, \
+                 instance.current_alloc_id, instance.storage_handle, instance.created_at, \
+                 instance.updated_at, instance.restore_from, instance.identity_epoch, \
+                 instance.named, instance.promoted_from \
+                 FROM instance \
+                 LEFT JOIN volume ON volume.instance_id = instance.instance_id \
+                 AND volume.node_local = 1 AND volume.state IN ('pending', 'created') \
+                 AND instance.storage_handle = volume.driver || '/' || volume.volume_id \
+                 WHERE instance.job_id = ?1 AND instance.group_name = ?2 \
+                 AND instance.task_name = ?3 \
+                 AND instance.mode = 'keyed' \
+                 AND instance.state NOT IN ('terminated', 'stopped', 'suspended') \
+                 AND instance.instance_id IS NOT NULL \
+                 AND NOT EXISTS (\
+                     SELECT 1 FROM allocation \
+                     WHERE allocation.instance_id = instance.instance_id \
+                     AND allocation.task_config_id = ?4\
+                 ) \
+                 AND COALESCE(instance.pending_op, '') != 'fork' \
+                 AND (?6 = '' OR instance.instance_id = ?6) \
+                 AND (instance.restore_from IS NULL OR COALESCE((\
+                     SELECT CASE WHEN snapshot.state = 'published' THEN ?5 \
+                     ELSE snapshot.node_id END FROM snapshot \
+                     WHERE snapshot.snapshot_id = instance.restore_from\
+                 ), ?5) = ?5) \
+                 ORDER BY EXISTS (SELECT 1 FROM reschedule_hold \
+                     WHERE reschedule_hold.instance_id = instance.instance_id \
+                     AND reschedule_hold.task_config_id = ?4 \
+                     AND reschedule_hold.not_before_unix > ?7) ASC, \
+                 (instance.restore_from IS NOT NULL) DESC, (volume.node_id = ?5) DESC, \
+                 COALESCE((SELECT snapshot.node_id = ?5 FROM snapshot \
+                     WHERE snapshot.snapshot_id = instance.restore_from), 0) DESC, \
+                 instance.created_at ASC, instance.instance_id ASC LIMIT 1;";
 
 impl Store {
     #[instrument(err, skip_all)]
@@ -4874,10 +4930,11 @@ impl Store {
     /// This is the whole of ratification (docs/edge-boot.md): a plan
     /// submission whose placement list has length one and whose instance is
     /// named. It goes through `apply_plan_submission_apply` like every other
-    /// plan — the same epoch compare-and-set, the same constraint
-    /// re-validation on the fresh node row, the same
-    /// `assign_stateful_instance_tx` — so "someone else already owns this
-    /// sandbox" is the existing conflict, not a new consistency mechanism.
+    /// plan — the same constraint and capacity re-validation on the fresh
+    /// node row, the same `assign_stateful_instance_tx` — so "someone else
+    /// already owns this sandbox" is the existing conflict, not a new
+    /// consistency mechanism. It skips the epoch compare-and-set, since it
+    /// never planned against a snapshot, so pass `expected_versions` empty.
     pub fn submit_and_apply_plan_for_instance(
         &self,
         job_config_id: &str,
@@ -5546,31 +5603,6 @@ impl Store {
             ))
         };
 
-        // The job-config epoch is a hard, all-or-nothing check: it is what
-        // serializes two plans for the SAME job config, and candidate lists
-        // must not weaken it.
-        let job_scope_key = Self::scope_vector_key("job_config", &submission.job_config_id);
-        let expected_job_epoch = submission
-            .expected_versions
-            .get(&job_scope_key)
-            .copied()
-            .unwrap_or_default();
-        let latest_job_epoch = self.scope_epoch_tx(tx, "job_config", &submission.job_config_id)?;
-        if latest_job_epoch != expected_job_epoch {
-            let reason = format!(
-                "plan epoch for job config {} is stale; expected {}, latest {}",
-                submission.job_config_id, expected_job_epoch, latest_job_epoch
-            );
-            return reject(tx, reason, None);
-        }
-
-        // A stop or a newer config does not bump this config's epoch, so the
-        // check above cannot see either. Re-check here, inside the write
-        // transaction, that the plan is still for something the job wants.
-        if let Some(reason) = Self::job_config_unwanted_reason_on(tx, &submission.job_config_id)? {
-            return reject(tx, format!("{PLAN_NOT_WANTED_PREFIX}{reason}"), None);
-        }
-
         let (placements_json, plan_mode, evictions_json, target_instance): (
             String,
             String,
@@ -5584,12 +5616,51 @@ impl Store {
             .query_row([submission.id], |row| {
                 Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
             })?;
-        let placements = Self::parse_plan_submission_placements(&placements_json)?;
-        let evictions: Vec<PlanEviction> = serde_json::from_str(&evictions_json)?;
         // Only a ratification sets this, and it always carries exactly one
         // placement (docs/edge-boot.md): "bind this sandbox on this node, or
         // tell me who beat me to it".
         let target_instance = target_instance.filter(|id| !id.is_empty());
+        // A ratification compares no epochs, job-config or node. It never
+        // planned against a snapshot, so a moved epoch says nothing about
+        // it. Its one candidate is re-validated against committed rows in
+        // the walk below, and `assign_keyed_instance_tx` reads who owns the
+        // sandbox in this same transaction. With the epochs as fences,
+        // every concurrent ratification of one job after the first was
+        // refused as stale (edge-ratify-throughput plan §6.1). It still
+        // bumps the epochs when it binds, so scheduler plans stay fenced
+        // against it.
+        let compare_epochs = target_instance.is_none();
+
+        // The job-config epoch is a hard, all-or-nothing check: it is what
+        // serializes two plans for the SAME job config, and candidate lists
+        // must not weaken it.
+        if compare_epochs {
+            let job_scope_key = Self::scope_vector_key("job_config", &submission.job_config_id);
+            let expected_job_epoch = submission
+                .expected_versions
+                .get(&job_scope_key)
+                .copied()
+                .unwrap_or_default();
+            let latest_job_epoch =
+                self.scope_epoch_tx(tx, "job_config", &submission.job_config_id)?;
+            if latest_job_epoch != expected_job_epoch {
+                let reason = format!(
+                    "plan epoch for job config {} is stale; expected {}, latest {}",
+                    submission.job_config_id, expected_job_epoch, latest_job_epoch
+                );
+                return reject(tx, reason, None);
+            }
+        }
+
+        // A stop or a newer config does not bump this config's epoch, so the
+        // check above cannot see either. Re-check here, inside the write
+        // transaction, that the plan is still for something the job wants.
+        if let Some(reason) = Self::job_config_unwanted_reason_on(tx, &submission.job_config_id)? {
+            return reject(tx, format!("{PLAN_NOT_WANTED_PREFIX}{reason}"), None);
+        }
+
+        let placements = Self::parse_plan_submission_placements(&placements_json)?;
+        let evictions: Vec<PlanEviction> = serde_json::from_str(&evictions_json)?;
 
         // ---- Preemption: victims leave before the placements they paid for
         // arrive, inside this same transaction.
@@ -5748,12 +5819,8 @@ impl Store {
             // fenced separately, by the job-config epoch above, which
             // stays hard and all-or-nothing.
             //
-            // The one exception is a ratification (`target_instance`,
-            // docs/edge-boot.md): there a moved epoch may mean somebody
-            // already owns this sandbox, which no capacity recheck can
-            // disprove, so the epoch stays a hard gate and pass 2 never
-            // runs.
-            let revalidation_allowed = target_instance.is_none();
+            // A ratification (`compare_epochs` false) skips the epoch
+            // compare and goes straight to those checks.
             let mut bound = false;
             let mut first_skip_reason: Option<String> = None;
             let mut first_stale_reason: Option<String> = None;
@@ -5770,26 +5837,26 @@ impl Store {
                 attempt_index += 1;
                 let node_id = &placement.candidates[rank];
                 if !revalidated {
-                    let node_scope_key = Self::scope_vector_key("node", node_id);
-                    let expected_epoch = submission
-                        .expected_versions
-                        .get(&node_scope_key)
-                        .copied()
-                        .unwrap_or_default();
-                    let latest_epoch = match pre_eviction_node_epochs.get(node_id) {
-                        Some(epoch) => *epoch,
-                        None => self.scope_epoch_tx(tx, "node", node_id)?,
-                    };
-                    if latest_epoch != expected_epoch {
-                        if first_stale_reason.is_none() {
-                            first_stale_reason = Some(format!(
-                                "node {node_id} epoch moved (expected {expected_epoch}, latest {latest_epoch})"
-                            ));
-                        }
-                        if revalidation_allowed {
+                    if compare_epochs {
+                        let node_scope_key = Self::scope_vector_key("node", node_id);
+                        let expected_epoch = submission
+                            .expected_versions
+                            .get(&node_scope_key)
+                            .copied()
+                            .unwrap_or_default();
+                        let latest_epoch = match pre_eviction_node_epochs.get(node_id) {
+                            Some(epoch) => *epoch,
+                            None => self.scope_epoch_tx(tx, "node", node_id)?,
+                        };
+                        if latest_epoch != expected_epoch {
+                            if first_stale_reason.is_none() {
+                                first_stale_reason = Some(format!(
+                                    "node {node_id} epoch moved (expected {expected_epoch}, latest {latest_epoch})"
+                                ));
+                            }
                             attempts.push((rank, true));
+                            continue;
                         }
-                        continue;
                     }
                     // Replicas of one task prefer distinct nodes *when they
                     // fall back*: without this, every replica's tail
@@ -5802,9 +5869,7 @@ impl Store {
                     // fits, and `distinct` remains the constraint for
                     // callers who need the guarantee.
                     if rank > 0 && plan_binds.contains(&(task_id, node_id.clone())) {
-                        if revalidation_allowed {
-                            attempts.push((rank, true));
-                        }
+                        attempts.push((rank, true));
                         continue;
                     }
                 }
@@ -5973,8 +6038,8 @@ impl Store {
                 // Name the real cause. With pass 2 in play, every
                 // candidate has been re-derived against committed state,
                 // so a rejection means no candidate *fits* — capacity, a
-                // constraint, a cordon, a port. Only a ratification (which
-                // skips pass 2) can still be rejected for staleness alone.
+                // constraint, a cordon, a port. A ratification compares no
+                // epochs, so it is never rejected for staleness.
                 let cause = first_skip_reason
                     .or(first_stale_reason)
                     .unwrap_or_else(|| "no candidates listed".to_string());
@@ -11333,12 +11398,22 @@ impl Store {
         let mut changed_instances: HashSet<String> = HashSet::new();
         let mut changed_volume_jobs: HashSet<String> = HashSet::new();
         let mut changed_volume_ids: HashSet<String> = HashSet::new();
+        // Nodes whose snapshot rows moved, so their streams push the
+        // checkpoint work that is now outstanding (checkpoints-on-stream
+        // plan), and the snapshots whose update record did not name a node.
+        let mut checkpoint_nodes: HashSet<String> = HashSet::new();
+        let mut checkpoint_reread_ids: HashSet<String> = HashSet::new();
         let mut event_ids: Vec<i64> = Vec::new();
         let mut evals_made_claimable = 0usize;
         // Changes that may have made room, for the blocked-eval wake pass
         // (`store/blocked_evals.rs`): `(node, register | node | ready)`;
         // allocations leaving a node are added from the delta below.
         let mut capacity_nodes: Vec<(String, &'static str)> = Vec::new();
+        // Allocations whose `resources` an in-place UPDATE lowered: an
+        // elastic envelope's shrink, or a suspend dropping an instance to its
+        // reserve. Room freed without a row leaving the node, so their nodes
+        // become capacity events once the rows are read back.
+        let mut alloc_shrunk_ids: Vec<i64> = Vec::new();
         // A replicated keyring change (a rotation, a rewrap of the root
         // key, a reset): this replica must unwrap the new rows before it can
         // read values written under them.
@@ -11523,6 +11598,29 @@ impl Store {
                                 .old_value(id_idx)
                                 .ok()
                                 .and_then(|value| value.as_i64().ok());
+                            let resources_idx = self.changeset_column_index(
+                                &mut column_cache,
+                                "allocation",
+                                "resources",
+                            )?;
+                            let amounts = |value: Option<rusqlite::types::ValueRef<'_>>| {
+                                value
+                                    .and_then(|value| value.as_str().ok())
+                                    .and_then(|raw| serde_json::from_str::<Value>(raw).ok())
+                                    .map(|value| crate::structs::session::resource_amounts(&value))
+                            };
+                            if let (Some(id), Some(old), Some(new)) = (
+                                id,
+                                amounts(item.old_value(resources_idx).ok()),
+                                amounts(item.new_value(resources_idx).ok()),
+                            ) {
+                                let lowered = old.iter().any(|(key, was)| {
+                                    new.get(key).is_none_or(|amount| amount < was)
+                                });
+                                if lowered {
+                                    alloc_shrunk_ids.push(id);
+                                }
+                            }
                             match id {
                                 Some(id) => {
                                     alloc_delta.upserts.insert(id);
@@ -11582,6 +11680,41 @@ impl Store {
                             if let Some(id) = value_of("volume_id", &mut column_cache)? {
                                 changed_volume_ids.insert(id);
                             }
+                        }
+                    }
+                }
+                "snapshot" => {
+                    // A snapshot row inserted or moved can be new work for
+                    // its node (a capture, a delete, a publish). A deleted
+                    // row is finished work, so it pushes nothing.
+                    if self.work_log.has_nodes() && action != Action::SQLITE_DELETE {
+                        let node_idx =
+                            self.changeset_column_index(&mut column_cache, "snapshot", "node_id")?;
+                        match item
+                            .new_value(node_idx)
+                            .ok()
+                            .and_then(|value| value.as_str().ok().map(str::to_owned))
+                        {
+                            Some(node_id) => {
+                                checkpoint_nodes.insert(node_id);
+                            }
+                            // An UPDATE record omits unchanged columns:
+                            // re-read the node by the key after the scan.
+                            None if action == Action::SQLITE_UPDATE => {
+                                let id_idx = self.changeset_column_index(
+                                    &mut column_cache,
+                                    "snapshot",
+                                    "snapshot_id",
+                                )?;
+                                if let Some(id) = item
+                                    .old_value(id_idx)
+                                    .ok()
+                                    .and_then(|value| value.as_str().ok().map(str::to_owned))
+                                {
+                                    checkpoint_reread_ids.insert(id);
+                                }
+                            }
+                            None => {}
                         }
                     }
                 }
@@ -11775,6 +11908,11 @@ impl Store {
                 .iter()
                 .map(|(_, node)| (node.clone(), "freed")),
         );
+        for id in alloc_shrunk_ids {
+            if let Some(allocation) = self.get_allocation_by_id(id)? {
+                capacity_nodes.push((allocation.node_id, "freed"));
+            }
+        }
         self.note_capacity_events(capacity_nodes);
 
         // Tell the work delivery log which allocations moved, on every
@@ -11787,6 +11925,7 @@ impl Store {
             &changed_volume_jobs,
             &changed_volume_ids,
         );
+        self.note_checkpoint_changes(checkpoint_nodes, checkpoint_reread_ids);
 
         if read_model_only {
             return Ok(());
@@ -11885,6 +12024,31 @@ impl Store {
                 self.work_log.resync_all();
             }
         }
+    }
+
+    /// Tell the work delivery log which nodes' snapshot rows moved, so their
+    /// streams push the checkpoint work now outstanding
+    /// (checkpoints-on-stream plan). `reread` names snapshots whose update
+    /// record did not carry the node. Never fails, for the reason
+    /// [`Self::note_work_changes`] gives: a row it cannot re-read is skipped,
+    /// and its node gets the work on its next heartbeat instead.
+    fn note_checkpoint_changes(&self, mut nodes: HashSet<String>, reread: HashSet<String>) {
+        if nodes.is_empty() && reread.is_empty() {
+            return;
+        }
+        for snapshot_id in reread {
+            match self.get_snapshot(&snapshot_id) {
+                Ok(Some(snapshot)) => nodes.extend(snapshot.node_id),
+                Ok(None) => {}
+                Err(err) => debug!(
+                    snapshot_id = %snapshot_id,
+                    error = ?err,
+                    "Could not re-read a snapshot row for the work stream, so its node waits a heartbeat"
+                ),
+            }
+        }
+        self.work_log
+            .note_checkpoint_work(nodes.iter().map(String::as_str));
     }
 
     /// The `(node, allocation)` pairs [`Self::note_work_changes`] feeds to
@@ -13739,40 +13903,29 @@ impl Store {
         // instance binds only on its snapshot's node while the snapshot is
         // `local`. A `published` snapshot binds anywhere, preferring the node
         // that captured it (which still holds the parts).
+        //
+        // This runs once per keyed placement, inside the plan apply, so it is
+        // serial scheduler-lane time, and it must not grow with the task's
+        // suspended or retired population. Two things keep it lean
+        // (migration `idx_instance_keyed_live`):
+        //
+        // - The `mode`/`state` terms match the partial index
+        //   `idx_instance_keyed_live` word for word, so only live keyed rows
+        //   are visited. Suspended, stopped, and terminated rows, most of a
+        //   large sandbox population, are never read. SQLite uses a partial
+        //   index only when the query's WHERE implies the index's, so editing
+        //   either term can silently fall back to scanning every instance of
+        //   the job (`keyed_bind_query_uses_the_live_partial_index` guards it).
+        // - "Unbound for this config" is a correlated `NOT EXISTS` probe of
+        //   `idx_allocation_instance_config`, answered from the two indexes
+        //   alone, so a bound row costs two index lookups and no table read.
+        //   The `NOT IN (SELECT ...)` it replaces built an ephemeral B-tree of
+        //   every allocation of the config on every placement. The explicit
+        //   `instance_id IS NOT NULL` keeps the forms equivalent: `NOT IN`
+        //   never matched a NULL id, and `NOT EXISTS` alone would.
         let instance: Option<Instance> = tx
+            .prepare_cached(KEYED_BIND_SQL)?
             .query_row(
-                "SELECT instance.instance_id, instance.job_id, instance.group_name, \
-                 instance.task_name, instance.mode, instance.state, instance.slot_index, \
-                 instance.current_alloc_id, instance.storage_handle, instance.created_at, \
-                 instance.updated_at, instance.restore_from, instance.identity_epoch, \
-                 instance.named, instance.promoted_from \
-                 FROM instance \
-                 LEFT JOIN volume ON volume.instance_id = instance.instance_id \
-                 AND volume.node_local = 1 AND volume.state IN ('pending', 'created') \
-                 AND instance.storage_handle = volume.driver || '/' || volume.volume_id \
-                 WHERE instance.job_id = ?1 AND instance.group_name = ?2 \
-                 AND instance.task_name = ?3 \
-                 AND instance.mode = 'keyed' \
-                 AND instance.state NOT IN ('terminated', 'stopped', 'suspended') \
-                 AND COALESCE(instance.pending_op, '') != 'fork' \
-                 AND instance.instance_id NOT IN (\
-                     SELECT instance_id FROM allocation \
-                     WHERE task_config_id = ?4 AND instance_id IS NOT NULL\
-                 ) \
-                 AND (?6 = '' OR instance.instance_id = ?6) \
-                 AND (instance.restore_from IS NULL OR COALESCE((\
-                     SELECT CASE WHEN snapshot.state = 'published' THEN ?5 \
-                     ELSE snapshot.node_id END FROM snapshot \
-                     WHERE snapshot.snapshot_id = instance.restore_from\
-                 ), ?5) = ?5) \
-                 ORDER BY EXISTS (SELECT 1 FROM reschedule_hold \
-                     WHERE reschedule_hold.instance_id = instance.instance_id \
-                     AND reschedule_hold.task_config_id = ?4 \
-                     AND reschedule_hold.not_before_unix > ?7) ASC, \
-                 (instance.restore_from IS NOT NULL) DESC, (volume.node_id = ?5) DESC, \
-                 COALESCE((SELECT snapshot.node_id = ?5 FROM snapshot \
-                     WHERE snapshot.snapshot_id = instance.restore_from), 0) DESC, \
-                 instance.created_at ASC, instance.instance_id ASC LIMIT 1;",
                 params![
                     job_id,
                     group,
@@ -16411,6 +16564,23 @@ impl Store {
         Ok(instance)
     }
 
+    /// Whether an instance row exists (live, stopped, or a tombstone), read
+    /// through the write connection. Only meaningful inside an op body,
+    /// where it sees rows that this op and its group-commit batch-mates
+    /// wrote but have not committed yet.
+    pub(crate) fn instance_exists_in_op(&self, instance_id: &str) -> R<bool> {
+        let conn = self.write_connection()?;
+        let exists = conn
+            .query_row(
+                "SELECT 1 FROM instance WHERE instance_id = ?1;",
+                [instance_id],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some();
+        Ok(exists)
+    }
+
     #[instrument(err, skip_all)]
     pub fn list_instances(&self, job_id: &str) -> R<Vec<Instance>> {
         let conn = self.read_connection()?;
@@ -17603,20 +17773,23 @@ impl Store {
     /// The terminal writes for handled evals, then the release of their
     /// claims. Each completion also deletes the duplicates its claim
     /// subsumed. Nothing is proposed when every completion is already
-    /// written and subsumed nothing.
+    /// written.
     fn write_eval_completions(&self, completions: Vec<(String, EvalCompletion)>) -> R<()> {
         if completions.is_empty() {
             return Ok(());
         }
         let ids: Vec<String> = completions.iter().map(|(id, _)| id.clone()).collect();
+        // A settled eval's plan already deleted its row and the duplicates
+        // its claim subsumed (`FusedEvalSettle::subsumed`, read from the
+        // same claim), so it needs nothing here. Proposing the deletes again
+        // would be an empty changeset that still queues a capture on the
+        // scheduler lane.
         let writes: Vec<(String, EvalCompletion, Vec<String>)> = completions
             .into_iter()
+            .filter(|(_, completion)| !matches!(completion, EvalCompletion::Settled))
             .map(|(id, completion)| {
                 let subsumed = self.subsumed_by_claim(&id);
                 (id, completion, subsumed)
-            })
-            .filter(|(_, completion, subsumed)| {
-                !matches!(completion, EvalCompletion::Settled) || !subsumed.is_empty()
             })
             .collect();
         if !writes.is_empty() {
@@ -28577,6 +28750,98 @@ mod tests {
             err.to_string().contains("CreateInstance"),
             "error should point at the management API: {err}"
         );
+        Ok(())
+    }
+
+    /// The keyed binding runs once per keyed placement inside the plan
+    /// apply, which is serial scheduler-lane time. Its plan must walk only
+    /// the live keyed rows of the task (the partial index) and answer
+    /// "already bound to this config?" from an index alone. A query edit
+    /// that breaks the partial index's WHERE implication falls back to
+    /// scanning every instance of the job, suspended ones included, and
+    /// this is the test that notices.
+    #[test]
+    fn keyed_bind_query_uses_the_live_partial_index() -> R<()> {
+        let store = setup_store()?;
+        let conn = store.read_connection()?;
+        let mut stmt = conn.prepare(&format!("EXPLAIN QUERY PLAN {KEYED_BIND_SQL}"))?;
+        let details: Vec<String> = stmt
+            .query_map(
+                params!["job", "default", "task", 1i64, "node-a", "", 0i64],
+                |row| row.get::<_, String>(3),
+            )?
+            .collect::<Result<_, _>>()?;
+        let plan = details.join("\n");
+        assert!(
+            plan.contains("USING INDEX idx_instance_keyed_live"),
+            "binding must search the live keyed partial index:\n{plan}"
+        );
+        assert!(
+            plan.contains("USING COVERING INDEX idx_allocation_instance_config"),
+            "the bound-to-this-config probe must be index-only:\n{plan}"
+        );
+        assert!(
+            !plan.contains("LIST SUBQUERY"),
+            "no materialized list of every allocation of the config:\n{plan}"
+        );
+        Ok(())
+    }
+
+    /// Binding semantics the index-driven query keeps: suspended and
+    /// stopped instances are never bound, an instance bound under an older
+    /// config of the task is unbound for a newer one (a create-first
+    /// rollout), and among plain candidates the oldest wins.
+    #[test]
+    fn keyed_binding_skips_parked_instances_and_rebinds_across_configs() -> R<()> {
+        let store = setup_store()?;
+        store.insert_node(make_node_msg("node-a", "active"))?;
+        let job_id = "keyed-bind";
+        submit_job(&store, job_id, vec![stateful_keyed_task("sandbox", false)])?;
+        let old_task = task_id_for(&store, "sandbox", job_id)?;
+
+        for (id, created_at) in [
+            ("c-newest", "2026-01-03T00:00:00Z"),
+            ("b-parked", "2026-01-02T00:00:00Z"),
+            ("a-oldest", "2026-01-01T00:00:00Z"),
+        ] {
+            store.create_keyed_instance(job_id, "default", "sandbox", Some(id))?;
+            // Fixed stamps, so "oldest first" does not depend on the clock.
+            store.write_connection()?.execute(
+                "UPDATE instance SET created_at = ?1 WHERE instance_id = ?2;",
+                params![created_at, id],
+            )?;
+        }
+        store.stop_keyed_instance("b-parked")?;
+
+        let first = store.place_alloc("node-a", old_task)?;
+        assert_eq!(first.instance_id.as_deref(), Some("a-oldest"));
+        let second = store.place_alloc("node-a", old_task)?;
+        assert_eq!(
+            second.instance_id.as_deref(),
+            Some("c-newest"),
+            "a stopped instance is never bound"
+        );
+        assert!(
+            store.place_alloc("node-a", old_task).is_err(),
+            "both live instances are bound under this config"
+        );
+
+        // A new config of the same task: every live instance is unbound for
+        // it, so its placements bind them again, oldest first, while the old
+        // config's allocations still exist.
+        // (An identical resubmit is `Unchanged`, so the new config differs.)
+        let updated = TaskConfig {
+            resources: json!({ "memory": 64 }),
+            ..stateful_keyed_task("sandbox", false)
+        };
+        let new_config = submit_job(&store, job_id, vec![updated])?;
+        let new_task = task_id_for_config(&store, "sandbox", &new_config)?;
+        assert_ne!(new_task, old_task);
+        let rebound = store.place_alloc("node-a", new_task)?;
+        assert_eq!(rebound.instance_id.as_deref(), Some("a-oldest"));
+        let rebound = store.place_alloc("node-a", new_task)?;
+        assert_eq!(rebound.instance_id.as_deref(), Some("c-newest"));
+        assert!(store.place_alloc("node-a", new_task).is_err());
         Ok(())
     }
 

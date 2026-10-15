@@ -28,5 +28,5 @@ net.ipv4.ip_local_port_range = 10000 65000
 EOF
 sysctl --system >/dev/null
 
-ls -l /dev/kvm
+ls -l /dev/kvm || echo "no /dev/kvm: this box runs no microVMs"
 echo "sandbox-boot node bootstrap done"

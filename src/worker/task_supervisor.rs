@@ -12,7 +12,7 @@
 
 use crate::prelude::*;
 use crate::structs::{RestartPolicy, TaskConfig};
-use crate::worker::task_manager::{TaskExit, WorkerTaskManager};
+use crate::worker::task_manager::{Reap, TaskExit, WorkerTaskManager};
 use std::time::Duration;
 
 /// How often the supervisor polls tracked task processes. A second is well
@@ -68,19 +68,50 @@ pub fn decide(task: &TaskConfig, exit: &TaskExit, budget_available: bool) -> Exi
 pub async fn start_task_supervisor(task_manager: Arc<Mutex<WorkerTaskManager>>) -> R<()> {
     loop {
         tokio::time::sleep(SUPERVISOR_TICK).await;
-        let exits = {
+        let (exits, reaps) = {
             let mut manager = task_manager.lock().expect("task manager");
             // Reap first: an allocation that just exited inside its grace
             // window is not a supervised exit to restart, and clearing it
             // here is what releases the node for allocations the reconcile
             // is holding back.
             manager.reap_draining();
-            manager.reap_terminating();
-            manager.poll_task_exits()
+            let (_, reaps) = manager.take_reapable(true);
+            (manager.poll_task_exits(), reaps)
         };
+        reap_unlocked(&task_manager, reaps).await;
         for exit in exits {
             handle_exit(&task_manager, exit).await;
         }
+    }
+}
+
+/// Destroy session stops with the lock released, all at once on the
+/// blocking pool, then release them under one lock.
+async fn reap_unlocked(task_manager: &Arc<Mutex<WorkerTaskManager>>, reaps: Vec<Reap>) {
+    if reaps.is_empty() {
+        return;
+    }
+    let destroys: Vec<_> = reaps
+        .into_iter()
+        .map(|mut reap| {
+            tokio::task::spawn_blocking(move || {
+                reap.destroy();
+                reap
+            })
+        })
+        .collect();
+    let mut destroyed = Vec::with_capacity(destroys.len());
+    for destroy in destroys {
+        match destroy.await {
+            Ok(reap) => destroyed.push(reap),
+            // A panicking destroy leaves its id in the reaping set, so it
+            // stays stopping rather than being released under a live VMM.
+            Err(err) => error!(error = ?err, "Session teardown panicked"),
+        }
+    }
+    let mut manager = task_manager.lock().expect("task manager");
+    for reap in destroyed {
+        manager.finish_reap(reap);
     }
 }
 

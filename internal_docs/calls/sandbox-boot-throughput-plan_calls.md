@@ -65,7 +65,34 @@ lock on the paths that start under it. Holding the slot bounds how many
 guests boot at once on a node, which is what cut a burst's p99 from 2.3 s
 to 1.0 s on four nodes at the same throughput.
 
-## 3. cloud-hypervisor guests boot on virtio-console, Firecracker guests boot `quiet`
+## 3. A server's console log drops lines rather than block
+
+**Call.** `legion start manager` and `legion start worker` write their
+console log through `tracing-appender`'s non-blocking writer in its default
+lossy mode: a buffer of 128,000 lines that one thread drains to stdout.
+When the reader falls behind and the buffer fills, new lines are dropped.
+The JSON file log under `./logs` already worked this way. Short CLI
+commands and `mcp serve` are unchanged.
+
+**Alternatives.** (a) The same writer with `lossy(false)`, which blocks the
+logging thread once the buffer is full. (b) Keep the blocking write, and
+tell operators to log less (`RUST_LOG=warn`) or raise journald's rate
+limits. (c) No console log on servers, only the file log.
+
+**Trade-off.** Under backpressure, lines are lost without a trace: nothing
+counts them, and `journalctl` shows a gap. An operator reading the console
+during the very burst that caused trouble sees the least of it.
+
+**Why (performance, then simplicity).** A log line is never worth a
+heartbeat. On a c5.metal worker bursting 1,200 sandbox starts, journald fell
+behind, every thread that logged blocked on stdout, the worker sent no
+heartbeat for about 57 seconds and was marked lost, and the burst fell to 8
+starts a second. With the lossy writer it ran at 293 a second, and the
+worker stayed up. Option (a) only delays the same stall until the buffer
+fills. Option (b) leaves every server one slow reader away from it. Option
+(c) breaks `journalctl -u legion-worker`, the first place an operator looks.
+
+## 4. cloud-hypervisor guests boot on virtio-console, Firecracker guests boot `quiet`
 
 **Call.** CH gets `--serial off --console tty` and `console=hvc0`.
 Firecracker, which has no virtio-console, keeps `ttyS0` and adds `quiet`. A
@@ -85,7 +112,7 @@ nested guest's boot. `hvc0` costs the same as `quiet` (about 120 ms to init
 by hand) and keeps the log on CH, where most debugging happens. (a) would
 throw it away for nothing.
 
-## 4. Every cloud-hypervisor disk is declared `image_type=raw`
+## 5. Every cloud-hypervisor disk is declared `image_type=raw`
 
 **Call.** The root disk, the volumes, and the identity disk all pass
 `image_type=raw`.
@@ -103,7 +130,7 @@ the superblock through block 0, so every boot failed its root mount,
 panicked, and rebooted a second later. This alone took a boot from 2.8 s to
 0.95 s. Every disk Legion attaches is raw, so declaring it costs nothing.
 
-## 5. `stateful.placement` offers `spread` (default) and `fast`, and no more
+## 6. `stateful.placement` offers `spread` (default) and `fast`, and no more
 
 **Call.** One field on session tasks. `spread` is the existing most-room
 pick with in-flight reservations and random ties. `fast` is power of two
@@ -129,7 +156,7 @@ most clusters run. `bin_pack` (b) refused hundreds of starts per thousand
 under stale views in the simulation. Locality (c) was judged
 regime-specific.
 
-## 6. A view that says every envelope is full asks the least full node once
+## 7. A view that says every envelope is full asks the least full node once
 
 **Call.** When the router's view finds no room, a first attempt still sends
 the start to the node the view thinks least full. Only that node's refusal
@@ -146,7 +173,7 @@ full while nodes had room: 95 of 1,200 sustained starts were refused that
 way. (a) only covers stops this manager made, not edge stops or another
 manager's. Asking the authoritative node covers all of them in one place.
 
-## 7. VMMs spawn with `posix_spawn`: a process group, and a shell that joins the cgroup
+## 8. VMMs spawn with `posix_spawn`: a process group, and a shell that joins the cgroup
 
 **Call.** `spawn_task_process` uses `process_group(0)` instead of a
 `setsid()` hook, and `join_assignment_cgroup` rewrites the command into
@@ -168,7 +195,7 @@ VMM run, and charge memory, outside its cgroup for a moment, which the
 enforcement contract forbids. The shim keeps the contract: the VMM's first
 instruction runs inside its cgroup.
 
-## 8. Registry clients are shared per credential
+## 9. Registry clients are shared per credential
 
 **Call.** The OCI fetcher keeps one client per protocol, platform selection,
 and credential fingerprint (up to 64), driven by one runtime.
@@ -183,7 +210,7 @@ TLS handshake, on every start: 80 to 130 ms of every start by tag. (a) would
 let one job's bearer token, which the client caches by repository rather
 than by caller, serve another job's pull.
 
-## 9. A tag is resolved once per burst, and an image already on the node needs no claim
+## 10. A tag is resolved once per burst, and an image already on the node needs no claim
 
 **Call.** Tag resolution is single-flight per key: a pull uses an answer
 sent after it arrived, finished or in flight, and otherwise sends (or waits
@@ -201,7 +228,7 @@ assembled their layouts one at a time: the thousandth start of a burst on a
 start could run a digest older than the registry's answer at the time it
 asked.
 
-## 10. A session's stop sends the guest's stop request off the lock, and writes no state file
+## 11. A session's stop sends the guest's stop request off the lock, and writes no state file
 
 **Call.** The sandbox's guest stop request runs on a pooled thread. A
 request the guest cannot take kills the VMM from there. An ended unratified
@@ -221,7 +248,7 @@ starts waiting hundreds of milliseconds to register. Sessions are never in
 the state file, so writing it for them bought nothing. (a) is a rewrite of
 the stop machinery for the same effect.
 
-## 11. Launches and stop requests run on the runtime's blocking pool
+## 12. Launches and stop requests run on the runtime's blocking pool
 
 **Call.** `admit_and_launch` and the stop request use `spawn_blocking` when a
 runtime is present, a plain thread otherwise.
@@ -233,10 +260,10 @@ the worker's other blocking work. The launch pool bounds them.
 
 **Why (simplicity).** A new thread per start maps and unmaps a stack under
 the worker's memory-map lock. The runtime already keeps a pool. On metal
-this did not raise the ceiling (entry 13), but it removes a per-start cost
+this did not raise the ceiling (entry 14), but it removes a per-start cost
 with no new machinery.
 
-## 12. A process's start time is read from `/proc/<pid>/stat`
+## 13. A process's start time is read from `/proc/<pid>/stat`
 
 **Call.** On Linux, `process_start_time` parses `/proc/<pid>/stat` and the
 boot time, with `sysinfo`'s formula, so recorded values compare equal.
@@ -252,25 +279,33 @@ worker's largest CPU cost, and it ran per start and per stopping allocation
 on every state write. Removing it raised a 4-node cluster's sustained
 ceiling from about 46 to 56 boots a second.
 
-## 13. The per-node ceiling on large nodes is accepted for now
+## 14. Keep the lock fixes, and stop at the root disk ceiling
 
-**Call.** Ship with a 96-vCPU node booting about 50 a second while its CPUs
-are about 90% idle, stated as a limit in the public doc.
+**Call.** First shipped with a 96-vCPU node measured at about 50 boots a
+second. A second metal campaign with a frame-pointer build and per-call-site
+lock timing measured the merged build at 150 to 200 a second sustained.
+It then moved the cgroup work and session teardown off the worker's lock,
+which cut the lock's busy time from 60 to 80% to about 20%. The node stops
+at its root disks: EBS IOPS, or XFS locks shared by every clone of an
+image's base file. This work stops there, with the limit in the public doc.
 
-**Alternatives.** Keep profiling on metal until it moves.
+**Alternatives.** (a) Drop the lock fixes, since they did not raise the
+sustained ceiling. (b) Keep going until the root disk step moves, for
+example with a per-sandbox payload disk instead of `debugfs` writes into the
+clone.
 
-**Trade-off.** Large nodes do not turn their cores into boots. The public
-doc tells operators to add nodes rather than cores.
+**Trade-off.** A large node still idles a quarter of its CPU at its
+ceiling. The lock fixes add a deferred-reap path (`take_reapable`,
+`finish_reap`) and a deferred cgroup leaf (`PendingCgroup`) to keep correct.
 
-**Why.** The budget ($10 for the campaign) was close to spent, and release
-binaries without frame pointers could not attribute the remaining waits.
-Evidence so far: `register` (the task-manager lock) up to 1.8 s and
-`vmm_spawn` up to 2.6 s under a 1,000-start burst, with kernel samples in
-page-table copying and memory-map lock contention. The next step is a metal
-run with a frame-pointer build and lock hold-time instrumentation
-(`TODO.md`).
+**Why.** The lock fixes are sound on their own: the lock gates every start,
+stop, and heartbeat on a node, a burst's p99 dropped from 1.9 s to 1.5 s,
+and the next bottleneck past the root disk would hit the lock again. (b) is
+a change to how a guest gets its files, which touches checkpoints and both
+VMMs, and deserves its own plan rather than a rushed end to this one. The
+measurements, and what they ruled out, are in `RESULTS.md`.
 
-## 14. `auto` keeps preferring cloud-hypervisor, and every number is cloud-hypervisor's
+## 15. `auto` keeps preferring cloud-hypervisor, and every number is cloud-hypervisor's
 
 **Call.** The campaign measured `hypervisor = "auto"`, which picks
 cloud-hypervisor on Linux with KVM, and left that default alone. The public
@@ -303,7 +338,7 @@ not fit the budget once the per-node ceiling run on metal was done. The
 measurement is open in `TODO.md`, and it decides whether (a) is worth
 revisiting.
 
-## 15. Guests are timed from the host, by their agent's vsock listener
+## 16. Guests are timed from the host, by their agent's vsock listener
 
 **Call.** The rig counts a guest up when a host connection to its vsock
 socket gets `OK` for `CONNECT 1100`, stamped on the host's clock.
@@ -320,7 +355,7 @@ baseline look like 1 s instead of 2.9 s. (b) measured the worker's log sink,
 which flushes late under load. The vsock probe is what a caller waiting to
 exec experiences.
 
-## 16. The session index's heartbeat costs O(stops), not O(sessions)
+## 17. The session index's heartbeat costs O(stops), not O(sessions)
 
 **Call.** `ingest` checks pending duplicate stops against the node's own
 map, instead of cloning every session id of the node into a set on every

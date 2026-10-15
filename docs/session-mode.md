@@ -79,7 +79,9 @@ capacity each node keeps for its sessions. When the job is submitted,
 Legion generates a second task, `<task>-envelope`, on the built-in
 `envelope` runtime: one allocation per eligible node
 (`count = { num = 1, per = "id" }`), sized by `envelope.resources`, and
-constrained to workers that advertise the `sessions` capability. The
+constrained to workers that advertise the `sessions` capability. An
+[elastic envelope](#elastic-envelopes) starts at that size and each node
+grows and shrinks its own as its sessions need. The
 scheduler places envelopes like any allocation, so preemption, bin
 packing, and `legion node usage` count the room sessions use. An envelope runs nothing:
 the allocation is the reservation.
@@ -202,7 +204,7 @@ it.
 | Suspend and resume | Yes, with a published or local checkpoint | On its node with `durability = "local"`; on any node with an envelope with `durability = "store"` ([Idle sessions](#idle-sessions)) |
 | Fork, snapshot | Yes | No. Promote first |
 | Events | The replicated journal | None per session. `instance.promoted` is journaled, and counters cover starts and stops |
-| Capacity | Reserved per instance at placement | Reserved per node as envelopes, whether or not sessions fill them |
+| Capacity | Reserved per instance at placement | Reserved per node as envelopes, whether or not sessions fill them. An [elastic envelope](#elastic-envelopes) follows its sessions between a floor and a ceiling |
 | Control-plane writes | About 8 raft entries per full lifecycle, about 3 under load | 0 for an unnamed session; 1 to promote |
 
 **What stays the same.** ACLs (a session belongs to its job and
@@ -231,6 +233,8 @@ resources = { cpu = 500, memory = 512 },
 | `stateful.mode` | | `"session"` |
 | `stateful.envelope.resources` | required | What each node keeps for this task's sessions. Must set `cpu` and `memory`, and every amount the session's own `resources` declares. Sessions are admitted against exactly these keys |
 | `stateful.envelope.constraints` | none | Extra placement constraints for the envelopes, added to the task's own `constraints` |
+| `stateful.envelope.max` | none (fixed) | The ceiling of an [elastic envelope](#elastic-envelopes): each node grows its envelope from `envelope.resources` up to this as its sessions fill it, and gives room back after they drain. Sizes exactly the keys `envelope.resources` sizes, each at or above it |
+| `stateful.envelope.shrinkAfter` | `"10m"` | Elastic envelopes only. How long a node's sessions must use less than half of its envelope before the node shrinks it. At least `1m` |
 | `stateful.promote.onName` | `true` | Whether a caller-chosen id is accepted: `instance create --id` (a keyed instance from birth) and `instance promote --id` (a rename). With `false`, a create always starts an unnamed session and a promotion keeps the session's id |
 | `stateful.placement` | `"spread"` | How a manager's router picks the node a session starts on: `"spread"` (the most room left) or `"fast"` (the roomier of two random nodes with room). See [Picking a node](#picking-a-node) |
 | `stateful.fenceAfter` | `"2m"` | Session tasks with `suspend.durability = "store"` only. A node that reaches neither a manager nor its content store for this long suspends its running sessions of the task on its own disk, so a copy cut off from the cluster stops serving before a moved copy can start ([No split brain](#no-split-brain)). At least 10 seconds |
@@ -242,6 +246,10 @@ resources = { cpu = 500, memory = 512 },
   `envelope`, and `promote` on any other mode.
 - A session that does not fit its envelope, or that declares a resource the
   envelope does not size.
+- An `envelope.max` that does not size exactly the keys
+  `envelope.resources` sizes, or sets one below it, and an
+  `envelope.shrinkAfter` without `envelope.max`, shorter than `1m`, or not
+  a duration.
 - `requireId`, `initialInstances`, `stateful.storage`, and `volumes`.
 - Ports, a `service`, `connect` upstreams, a network policy, or gated
   networking. The node's datapath serves allocations, and an unnamed
@@ -283,11 +291,12 @@ starts an unnamed session. The reply carries `mode = "session"`,
 | Error | Meaning |
 | --- | --- |
 | `FAILED_PRECONDITION` "no node runs an envelope" | The envelopes have not been placed yet. Check `legion job status <JOB>`: are there eligible workers with the `sessions` capability? |
-| `RESOURCE_EXHAUSTED` "every envelope ... is full" | No envelope has room. Retryable once sessions end; raise `envelope.resources` or add nodes |
+| `RESOURCE_EXHAUSTED` "every envelope ... is full" | No envelope has room. Retryable once sessions end; raise `envelope.resources` or add nodes. When the envelopes are [elastic](#elastic-envelopes), the message says so: they grow within a heartbeat, so retry in a few seconds |
 | `RESOURCE_EXHAUSTED` "no node accepted the session" | The three nodes tried all refused, with each node's reason |
 
 A create that finds no room is refused rather than queued, so size
-envelopes for the peak you want to absorb.
+envelopes for the peak you want to absorb, or make them
+[elastic](#elastic-envelopes).
 
 ## Listing sessions
 
@@ -743,6 +752,14 @@ its `url` and sealing `keyId`).
   node derives each part's key from it. Any node with an envelope of the
   job can open the job's session checkpoints, and no other job's. The key
   is never written to disk or logged.
+- **Chunks.** Each part is published as chunks, and the node derives the
+  job's chunk key from the same session sealing key, so a periodic
+  checkpoint uploads only the chunks the session changed since the last
+  one, and sessions of one job share their image's chunks with each other
+  and with the job's snapshots ([How published parts are
+  stored](suspend-and-resume.md#how-published-parts-are-stored)). A bucket
+  lifecycle rule on `sealed/` must be older than the longest-lived
+  checkpoint plus the workers' `contentStore.dedupWindow`.
 - **Status.** `SessionStatus.checkpoint` (in `instance get`) reports the
   session's checkpoint: its `durability`, snapshot id, kind, size, when it
   was taken, and, once published, `publishedUrl`, the manifest's URL.
@@ -838,11 +855,86 @@ lower node id, and the other node is asked to end its copy:
 This is converge-to-one, not at-most-one. A session that needs at most one
 copy at every instant should be promoted (or created with `--id`).
 
+## Elastic envelopes
+
+A fixed envelope makes you pick one size for the whole day. Sized for the
+peak, it holds room all night that keyed sandboxes, services, and batch
+work on the same nodes cannot use. Sized for the average, it refuses the
+peak while the node has room nobody is using. Set `envelope.max` and each
+node sizes its own envelope between the two:
+
+```nickel
+stateful = {
+  mode = "session",
+  envelope = {
+    resources = { cpu = 6000, memory = 6144 },     # the floor: always held
+    max = { cpu = 30000, memory = 30720 },          # the ceiling
+    shrinkAfter = "10m",                            # the default
+  },
+},
+resources = { cpu = 500, memory = 512 },            # one session
+```
+
+**How a node sizes it.** At each heartbeat the node compares what its
+running sessions hold with its envelope's size, per resource:
+
+- **It grows** when its sessions fill more than 90% of the envelope, or one
+  more session would not fit, to the size they would fill to 75%, with room
+  for one more session, up to `max`.
+- **It shrinks** when its sessions have used less than half of the envelope
+  for `shrinkAfter`, to the same 75% size, down to `resources`.
+
+Only running sessions count. A suspended session holds no room, so an
+envelope can shrink while its sessions sleep, and a resume into a shrunk
+envelope is answered `RESOURCE_EXHAUSTED` (retryable) and grows it.
+
+**Every resize goes through the scheduler's records.** The node asks on
+its heartbeat, and the manager rewrites the envelope's allocation in one
+scheduler-lane raft entry. Plan apply, preemption, bin packing, `legion
+node usage`, and `legion session nodes` all read that allocation, so they
+show the size the node admits against. A grow takes only the node's free
+room: when the node has less free than the grow wants, the envelope takes
+what is there, and when it has none the grow is refused, writes nothing,
+and the node waits 30 seconds before asking again. A grow never preempts
+other work. A shrink frees room the way an allocation ending does, so work
+blocked on the node is woken to place again.
+
+**A shrink never strands a session.** Before the node asks to shrink, it
+caps its own admission at the smaller size, and keeps the cap until the
+manager answers. Sessions started at the edge in the meantime are admitted
+against the cap, so when the shrink commits, the node's sessions fit it.
+
+**What it costs.**
+
+- **Burst room.** A fixed envelope at its ceiling absorbs a burst at once.
+  An elastic one absorbs bursts up to its free room (about a quarter of its
+  size after a resize) and grows within one heartbeat (2 seconds on fleets
+  up to 2,500 nodes) for the rest. Starts in between are refused with a
+  retryable `RESOURCE_EXHAUSTED` whose message says the envelopes are
+  growing. Size the floor for the burst you must absorb instantly, at any
+  hour.
+- **Control-plane writes.** One raft entry per resize. With the defaults,
+  under a load that swings 4 to 1 over a day, a node resizes its envelope
+  about 26 times a day, so 1,000 nodes add about 26,000 entries a day, or
+  0.3 a second. A refused grow writes nothing. Lengthen `shrinkAfter` for
+  fewer resizes and more held room.
+- **Room held for others.** Room an envelope grows into is held until its
+  sessions drain for `shrinkAfter`, even when a higher-priority job wants
+  it. Preemption can still evict the whole envelope, as for any
+  allocation, but it cannot take back only the grown part.
+
+A fixed envelope (no `max`, or `max` equal to `resources`) never resizes
+and behaves exactly as before. `legion_envelope_resizes_total{direction,
+outcome}` counts resizes on the managers ([metrics](metrics.md#sessions)).
+
 ## Capacity planning
 
 - Burst headroom is the envelopes' free room. Envelope capacity is reserved
   whether sessions use it or not, and counts against node capacity like any
-  allocation.
+  allocation. An [elastic envelope](#elastic-envelopes) reserves its floor
+  and grows toward its ceiling with its sessions.
+- Watch `legion_envelope_resizes_total{outcome="refused"}`: a steady rate
+  means elastic envelopes want room their nodes do not have.
 - A larger envelope admits more sessions per node but leaves less room for
   other jobs. Several session tasks can share a node, each with its own
   envelope.
@@ -921,3 +1013,20 @@ on it and no session is sent to it. See [upgrades](upgrades.md).
 - **A worker restart ends only the sessions whose process died** while it
   was down, unless `suspend.onWorkerStop = "checkpoint"` or
   `checkpointEvery` left a checkpoint to restore them from.
+- **Elastic envelopes resize no faster than heartbeats.** A burst larger
+  than an envelope's free room waits one heartbeat for a grow, and the
+  growth thresholds (90%, 75%, 50%) are fixed. The grown part of an
+  envelope is not preemptible on its own: a higher-priority job waits for
+  `shrinkAfter`, or preempts the whole envelope.
+- **A job update places each new elastic envelope at its floor.** The node
+  grows the new envelope on its next heartbeat, once the old one is gone.
+  Until then the node's running sessions can hold more than their envelope,
+  and work the scheduler places on the node in that window can leave it
+  overcommitted until sessions end. A fixed envelope has a shorter version
+  of the same window, between the old envelope stopping and the new one
+  being placed.
+- **A worker restart forgets an elastic envelope's shrink in flight.** The
+  restarted worker admits against the size its next desired set carries. If
+  that desired set comes from a manager whose replica has not yet applied a
+  shrink committed just before the restart, the node can admit past the
+  shrunk size until its next desired set, which is one heartbeat.

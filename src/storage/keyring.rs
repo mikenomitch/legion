@@ -1001,6 +1001,28 @@ impl Keyring {
         key_id: Option<&str>,
         digest: &crate::content_store::ContentDigest,
     ) -> R<crate::checkpoint_seal::PartKey> {
+        self.with_checkpoint_key(key_id, |key, key_id| {
+            crate::checkpoint_seal::PartKey::derive(key, key_id, digest)
+        })
+    }
+
+    /// Job `job_id`'s chunk key under the current checkpoint key, which a
+    /// worker publishing one of the job's snapshots derives every chunk's
+    /// key from ([`crate::checkpoint_seal::ChunkKey`]). Never logs key
+    /// material.
+    pub fn checkpoint_chunk_key(&self, job_id: &str) -> R<crate::checkpoint_seal::ChunkKey> {
+        self.with_checkpoint_key(None, |key, key_id| {
+            crate::checkpoint_seal::ChunkKey::derive(key, key_id, job_id)
+        })
+    }
+
+    /// Run `derive` with the checkpoint key `key_id` names (`None`: the
+    /// current one) and its id, or fail naming why it is unavailable.
+    fn with_checkpoint_key<T>(
+        &self,
+        key_id: Option<&str>,
+        derive: impl FnOnce(&[u8], &str) -> R<T>,
+    ) -> R<T> {
         let state = self.read();
         let row = match key_id {
             Some(id) => state
@@ -1047,7 +1069,7 @@ impl Keyring {
                 ),
             }));
         };
-        crate::checkpoint_seal::PartKey::derive(&loaded.key, &row.key_id, digest)
+        derive(&loaded.key, &row.key_id)
     }
 
     /// A job's session sealing keys (session durability plan §6.6): one per

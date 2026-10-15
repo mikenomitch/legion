@@ -1,38 +1,41 @@
 //! Publishing node content to a shared store (suspend plan §6.8, amendment 1;
-//! internal_docs/plans/checkpoint-encryption-plan.md).
+//! internal_docs/plans/checkpoint-encryption-plan.md;
+//! internal_docs/plans/chunked-checkpoint-publish-plan.md).
 //!
 //! The artifact fetchers are read-only and stay that way. Publishing is the
-//! one write path: a worker with a `contentStore` block in its config seals a
-//! digest from its node content store ([`crate::content_store`]) and pushes
-//! it to that store, at a name derived from the part's key:
+//! one write path: a worker with a `contentStore` block in its config cuts a
+//! digest from its node content store ([`crate::content_store`]) into
+//! chunks, seals each one, and pushes the chunks it has not pushed before,
+//! then a sealed index that lists them ([`crate::checkpoint_chunks`]):
 //!
 //! ```text
-//! <contentStore.url>/sealed/<object name>
+//! <contentStore.url>/sealed/<index or chunk name>
 //! ```
 //!
-//! Every published part is sealed ([`crate::checkpoint_seal`]); there is no
-//! plaintext mode. The key, and so the name, is a keyed function of the
-//! plaintext digest, so publishing is still idempotent: publishing bytes the
-//! store already holds uploads nothing. Every published digest's URL is
-//! recorded in the node content store's index, so a caller (Phase 7b's
-//! snapshot manifests) can name where each part lives.
+//! Every published object is sealed ([`crate::checkpoint_seal`]); there is
+//! no plaintext mode. Chunk keys, and so chunk names, are keyed functions of
+//! the chunk's plaintext digest, scoped to the job and the dedup window, so
+//! publishing is idempotent and incremental: a chunk the store already
+//! holds is not uploaded again, and a part already published in the window
+//! uploads nothing. Every published digest's index URL is recorded in the
+//! node content store's index, so a caller can name where each part lives.
 //!
-//! Reads never come through here. Any worker restores published content with
-//! the ordinary `s3://` or `file://` artifact fetcher
-//! ([`crate::artifacts::ArtifactStager::fetch_sealed_into_store`]), which
-//! opens the sealed object and verifies the plaintext against the digest.
-//! The fetch is signed with the reading node's own `contentStore` credential
+//! Reads never come through the publisher. Any worker restores published
+//! content through [`crate::artifacts::ArtifactStager::fetch_sealed_into_store`],
+//! which reads the index and the chunks from the store the URL names, opens
+//! them, and verifies the reassembled part against its digest. Those reads
+//! are signed with the reading node's own `contentStore` credential
 //! ([`ContentStoreTarget::read_credential`]) when the URL is under its
 //! `contentStore.url` ([`ContentStoreTarget::contains_url`]).
 //!
-//! # Example (what Phase 7b does with a snapshot part)
+//! # Example (what a snapshot publish does with a part)
 //!
 //! ```no_run
 //! # use legion::content_publish::*;
-//! # use legion::checkpoint_seal::PartKey;
-//! # fn demo(publisher: &ContentPublishing, key: &PartKey) -> legion::prelude::R<()> {
-//! // `key` came from the manager with the publish request.
-//! let published = publisher.publish(key)?;
+//! # use legion::checkpoint_seal::{ChunkKey, PartKey};
+//! # fn demo(publisher: &ContentPublishing, key: &PartKey, chunks: &ChunkKey) -> legion::prelude::R<()> {
+//! // `key` and `chunks` came from the manager with the publish request.
+//! let published = publisher.publish(key, chunks)?;
 //! // Record `published.url` and `key.key_id()` in the snapshot manifest.
 //! # let _ = published; Ok(()) }
 //! ```
@@ -42,18 +45,20 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use object_store::aws::AmazonS3Builder;
-use object_store::{path::Path as ObjectPath, ObjectStore, WriteMultipart};
+use object_store::local::LocalFileSystem;
+use object_store::prefix::PrefixStore;
+use object_store::{path::Path as ObjectPath, ObjectStore};
 use serde::{Deserialize, Serialize};
 use url::Url;
 
 use crate::artifacts::{Credential, CredentialSource};
-use crate::checkpoint_seal::{sealed_len, PartKey, SealingReader, OBJECT_PREFIX};
+use crate::checkpoint_chunks::{
+    ChunkSettings, KnownChunks, CHUNK_ALIGN, DEF_CHUNK_SIZE, DEF_DEDUP_WINDOW, MAX_CHUNK_SIZE,
+    MIN_CHUNK_SIZE, MIN_DEDUP_WINDOW,
+};
+use crate::checkpoint_seal::{ChunkKey, PartKey, OBJECT_PREFIX};
 use crate::content_store::{ContentDigest, ContentStore};
 use crate::prelude::*;
-
-/// Multipart part size for S3 uploads. Snapshot memory files run to
-/// gigabytes, so uploads stream in parts rather than buffering the file.
-const S3_PART_BYTES: usize = 16 * 1024 * 1024;
 
 /// What one publish did.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -65,8 +70,10 @@ pub struct PublishedContent {
     pub key_id: String,
     /// The part's plaintext size.
     pub bytes: u64,
-    /// False when the store already held the object and nothing was sent.
-    pub uploaded: bool,
+    /// Plaintext bytes of the chunks this publish uploaded: 0 when the
+    /// store already held the part, and only the changed chunks when it
+    /// held an earlier checkpoint of the same guest.
+    pub uploaded_bytes: u64,
 }
 
 /// The bytes being published do not hash to the digest they were published
@@ -89,18 +96,16 @@ impl std::fmt::Display for PublishSourceMismatch {
 
 impl std::error::Error for PublishSourceMismatch {}
 
-/// A destination that accepts sealed parts. Implementations must be
-/// idempotent: publishing an object the destination already holds succeeds
-/// without rewriting it.
+/// A destination that accepts sealed objects.
 pub trait ContentPublisher: Send + Sync {
     /// The URL a sealed object named `object_name` is (or would be)
     /// published at. Pure: no I/O.
     fn url_for(&self, object_name: &str) -> String;
 
-    /// Seal the bytes at `path`, which must hash to `key.digest()`, and
-    /// upload them. Fails with [`PublishSourceMismatch`] (and publishes
-    /// nothing) when they do not. Blocking: call from a blocking thread.
-    fn publish_sealed(&self, key: &PartKey, path: &Path) -> R<PublishedContent>;
+    /// The store's sealed objects (`<url>/sealed/`), as an object store
+    /// rooted there. Chunks and part indexes are written and read through
+    /// it ([`crate::checkpoint_chunks`]).
+    fn sealed_objects(&self) -> R<Arc<dyn ObjectStore>>;
 
     /// Write a small document (an archive manifest) at `object_name`,
     /// relative to the store's root rather than under the sealed-object
@@ -136,9 +141,59 @@ pub struct ContentStoreTarget {
     pub url: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auth: Option<ContentStoreAuth>,
+    /// The size published parts are cut into (`"1MiB"` when unset): each
+    /// distinct non-zero chunk is one object, so a repeat checkpoint
+    /// uploads only the chunks that changed (docs/suspend-and-resume.md,
+    /// "How published parts are stored"). 64 KiB to 16 MiB, a multiple of
+    /// 4 KiB.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chunk_size: Option<String>,
+    /// How long chunks are shared between publishes (`"24h"` when unset).
+    /// A chunk is reused only by publishes in the window it was uploaded
+    /// in, so a bucket lifecycle rule that expires `sealed/` objects older
+    /// than the longest-lived checkpoint plus this window never removes a
+    /// chunk a checkpoint still needs. At least 1m.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dedup_window: Option<String>,
 }
 
 impl ContentStoreTarget {
+    /// `chunkSize` and `dedupWindow`, parsed and checked.
+    pub fn chunk_settings(&self) -> R<ChunkSettings> {
+        let chunk_size = match self.chunk_size.as_deref() {
+            None => DEF_CHUNK_SIZE,
+            Some(raw) => {
+                let bytes = crate::structs::config::parse_byte_size(raw)
+                    .with_context(|| format!("contentStore.chunkSize {raw:?}"))?;
+                if !(u64::from(MIN_CHUNK_SIZE)..=u64::from(MAX_CHUNK_SIZE)).contains(&bytes)
+                    || bytes % u64::from(CHUNK_ALIGN) != 0
+                {
+                    bail!(
+                        "contentStore.chunkSize {raw:?} must be 64KiB to 16MiB and a multiple of \
+                         4KiB (the default is 1MiB)"
+                    );
+                }
+                bytes as u32
+            }
+        };
+        let dedup_window = match self.dedup_window.as_deref() {
+            None => DEF_DEDUP_WINDOW,
+            Some(raw) => {
+                let window = humantime::parse_duration(raw.trim()).with_context(|| {
+                    format!("contentStore.dedupWindow {raw:?} is not a duration")
+                })?;
+                if window < MIN_DEDUP_WINDOW {
+                    bail!("contentStore.dedupWindow must be at least 1m, got {raw:?}");
+                }
+                window
+            }
+        };
+        Ok(ChunkSettings {
+            chunk_size,
+            dedup_window,
+        })
+    }
+
     /// Admission-time validation, run when the manager loads the worker
     /// config so a typo fails at startup instead of at the first publish.
     pub fn validate(&self) -> R<Url> {
@@ -165,6 +220,7 @@ impl ContentStoreTarget {
         if url.query().is_some_and(|q| !q.is_empty()) && url.scheme() == "file" {
             bail!("contentStore.url {:?}: file URLs take no query", self.url);
         }
+        self.chunk_settings()?;
         if let Some(auth) = &self.auth {
             if auth.node_identity.is_some() {
                 bail!(
@@ -293,55 +349,15 @@ impl ContentPublisher for FileContentPublisher {
             .unwrap_or_else(|_| format!("file://{}", path.display()))
     }
 
-    fn publish_sealed(&self, key: &PartKey, path: &Path) -> R<PublishedContent> {
-        let size = fs::metadata(path)
-            .with_context(|| format!("stat {}", path.display()))?
-            .len();
-        let name = key.object_name();
-        let dest = self.path_for(&name);
-        let published = |uploaded| PublishedContent {
-            digest: key.digest().clone(),
-            url: self.url_for(&name),
-            key_id: key.key_id().to_string(),
-            bytes: size,
-            uploaded,
-        };
-        // Same name and size: already published. An object tampered with in
-        // place still fails the reader's authentication.
-        if fs::metadata(&dest).is_ok_and(|meta| meta.len() == sealed_len(size)) {
-            return Ok(published(false));
-        }
-        let dir = dest.parent().expect("object path has a parent");
-        fs::create_dir_all(dir).with_context(|| format!("create {}", dir.display()))?;
-        // Write beside the destination and rename, so a reader never sees a
-        // partial object under the final name.
-        let tmp = dir.join(format!(".{name}.{}.tmp", std::process::id()));
-        let sealed = (|| {
-            let source =
-                fs::File::open(path).with_context(|| format!("open {}", path.display()))?;
-            let mut reader = SealingReader::new(key, source, size)?;
-            let mut out =
-                fs::File::create(&tmp).with_context(|| format!("create {}", tmp.display()))?;
-            reader
-                .write_all_to(&mut out)
-                .with_context(|| format!("seal {} to {}", path.display(), tmp.display()))?;
-            // The sealer hashed the plaintext it read: these are exactly the
-            // bytes the digest names, or nothing is published.
-            let actual = reader.finish()?;
-            if &actual != key.digest() {
-                return Err(anyhow::Error::new(PublishSourceMismatch {
-                    expected: key.digest().clone(),
-                    actual,
-                }));
-            }
-            Ok(())
-        })();
-        if let Err(err) = sealed {
-            let _ = fs::remove_file(&tmp);
-            return Err(err);
-        }
-        fs::rename(&tmp, &dest).with_context(|| format!("publish to {}", dest.display()))?;
-        Ok(published(true))
+    fn sealed_objects(&self) -> R<Arc<dyn ObjectStore>> {
+        let dir = self.root.join(OBJECT_PREFIX);
+        fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
+        // object_store writes beside the destination and renames, so a
+        // reader never sees a partial object under its final name.
+        Ok(Arc::new(
+            LocalFileSystem::new_with_prefix(&dir)
+                .with_context(|| format!("open {} as a content store", dir.display()))?,
+        ))
     }
 
     fn put_document(&self, object_name: &str, bytes: &[u8]) -> R<String> {
@@ -501,6 +517,53 @@ pub fn document_url(root: &Url, object_name: &str) -> String {
     }
 }
 
+/// The sealed-object directory a published object's URL is in, as an object
+/// store rooted there, and the object's name in it: what a reading node
+/// fetches a part's index and chunks through
+/// ([`crate::checkpoint_chunks::fetch_part`]). `credential` signs `s3://`
+/// reads: the node's own `contentStore` credential
+/// ([`ContentStoreTarget::read_credential`], `AwsAmbient` for the ambient
+/// chain), or `None` to read anonymously.
+pub fn sealed_objects_for_url(
+    url: &str,
+    credential: Option<Credential>,
+) -> R<(Arc<dyn ObjectStore>, String)> {
+    let parsed = Url::parse(url.trim()).with_context(|| format!("invalid part URL {url:?}"))?;
+    match parsed.scheme() {
+        "file" => {
+            let path = parsed
+                .to_file_path()
+                .map_err(|_| anyhow!("part URL {url:?} is not an absolute file path"))?;
+            let name = path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .with_context(|| format!("part URL {url:?} names no object"))?
+                .to_string();
+            let dir = path.parent().context("part URL has no directory")?;
+            let objects = LocalFileSystem::new_with_prefix(dir)
+                .with_context(|| format!("open {} as a content store", dir.display()))?;
+            Ok((Arc::new(objects), name))
+        }
+        "s3" => {
+            let key = parsed.path().trim_start_matches('/');
+            let (dir, name) = key
+                .rsplit_once('/')
+                .with_context(|| format!("part URL {url:?} names no object under a prefix"))?;
+            let client = match credential {
+                None => s3_builder(&parsed, None)?.with_skip_signature(true),
+                Some(Credential::AwsAmbient) => s3_builder(&parsed, None)?,
+                Some(credential) => s3_builder(&parsed, Some(credential))?,
+            }
+            .build()
+            .context("build s3 client for contentStore")?;
+            Ok((Arc::new(PrefixStore::new(client, dir)), name.to_string()))
+        }
+        other => bail!(
+            "part URL scheme {other:?} is not supported; parts live in s3:// or file:// stores"
+        ),
+    }
+}
+
 impl ContentPublisher for S3ContentPublisher {
     fn url_for(&self, object_name: &str) -> String {
         let mut url = self.url.clone();
@@ -508,78 +571,12 @@ impl ContentPublisher for S3ContentPublisher {
         url.to_string()
     }
 
-    fn publish_sealed(&self, key: &PartKey, path: &Path) -> R<PublishedContent> {
-        let size = fs::metadata(path)
-            .with_context(|| format!("stat {}", path.display()))?
-            .len();
-        let client = self.client()?;
-        let name = key.object_name();
-        let object = ObjectPath::from(self.key_for(&name));
-        let url = self.url_for(&name);
-        // Publishing is blocking by contract (like fetchers); object_store is
-        // async, so run it on a private current-thread runtime.
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .context("build content publish runtime")?;
-        let uploaded = runtime.block_on(async {
-            match client.head(&object).await {
-                Ok(meta) if meta.size as u64 == sealed_len(size) => return Ok(false),
-                Ok(_) | Err(object_store::Error::NotFound { .. }) => {}
-                Err(err) => return Err(anyhow!(err).context(format!("head {url}"))),
-            }
-            let source =
-                fs::File::open(path).with_context(|| format!("open {}", path.display()))?;
-            let mut reader = SealingReader::new(key, source, size)?;
-            let upload = client
-                .put_multipart(&object)
-                .await
-                .with_context(|| format!("start upload to {url}"))?;
-            let mut writer = WriteMultipart::new_with_chunk_size(upload, S3_PART_BYTES);
-            let streamed: R<()> = async {
-                while let Some(sealed) = reader
-                    .next_sealed()
-                    .with_context(|| format!("seal {}", path.display()))?
-                {
-                    // Bound in-flight parts so a multi-GiB file never buffers.
-                    writer
-                        .wait_for_capacity(4)
-                        .await
-                        .with_context(|| format!("upload to {url}"))?;
-                    writer.write(sealed);
-                }
-                Ok(())
-            }
-            .await;
-            // The sealer hashed the plaintext it read: complete the upload
-            // only when those are exactly the bytes the digest names.
-            let verified = streamed.and_then(|()| {
-                let actual = reader.finish()?;
-                if &actual != key.digest() {
-                    return Err(anyhow::Error::new(PublishSourceMismatch {
-                        expected: key.digest().clone(),
-                        actual,
-                    }));
-                }
-                Ok(())
-            });
-            if let Err(err) = verified {
-                let _ = writer.abort().await;
-                return Err(err);
-            }
-            writer
-                .finish()
-                .await
-                .with_context(|| format!("complete upload to {url}"))?;
-            Ok::<bool, anyhow::Error>(true)
-        })?;
-        Ok(PublishedContent {
-            digest: key.digest().clone(),
-            url,
-            key_id: key.key_id().to_string(),
-            bytes: size,
-            uploaded,
-        })
+    fn sealed_objects(&self) -> R<Arc<dyn ObjectStore>> {
+        let prefix = self.key_for("");
+        Ok(Arc::new(PrefixStore::new(
+            self.client()?,
+            prefix.trim_end_matches('/'),
+        )))
     }
 
     fn put_document(&self, object_name: &str, bytes: &[u8]) -> R<String> {
@@ -605,17 +602,37 @@ impl ContentPublisher for S3ContentPublisher {
 pub struct ContentPublishing {
     store: Arc<ContentStore>,
     publisher: Arc<dyn ContentPublisher>,
+    settings: ChunkSettings,
+    /// Chunk names this node has uploaded or found in the store during the
+    /// current dedup window, shared by every publish.
+    known: KnownChunks,
 }
 
 impl std::fmt::Debug for ContentPublishing {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("ContentPublishing").finish_non_exhaustive()
+        f.debug_struct("ContentPublishing")
+            .field("settings", &self.settings)
+            .finish_non_exhaustive()
     }
 }
 
 impl ContentPublishing {
+    /// Publishing with the default chunk size and dedup window.
     pub fn new(store: Arc<ContentStore>, publisher: Arc<dyn ContentPublisher>) -> Self {
-        Self { store, publisher }
+        Self::with_settings(store, publisher, ChunkSettings::default())
+    }
+
+    pub fn with_settings(
+        store: Arc<ContentStore>,
+        publisher: Arc<dyn ContentPublisher>,
+        settings: ChunkSettings,
+    ) -> Self {
+        Self {
+            store,
+            publisher,
+            settings,
+            known: KnownChunks::default(),
+        }
     }
 
     /// Write a document beside the published content (see
@@ -628,31 +645,50 @@ impl ContentPublishing {
         &self.store
     }
 
-    /// Seal and publish the part `key` names, which the node content store
-    /// must hold, and record its URL. Idempotent: a part already recorded as
-    /// published at this URL, or already present at the destination,
-    /// uploads nothing. The sealer hashes the bytes as it reads them, so a
-    /// corrupt local blob is never published: it is dropped from the store
-    /// instead.
-    #[instrument(skip(self, key), fields(digest = %key.digest(), key_id = %key.key_id()))]
-    pub fn publish(&self, key: &PartKey) -> R<PublishedContent> {
+    pub fn settings(&self) -> ChunkSettings {
+        self.settings
+    }
+
+    /// Publish the part `key` names, which the node content store must
+    /// hold, as sealed chunks keyed from `chunks` (the job's chunk key) in
+    /// the current dedup window, and record its URL (its index's). Chunks
+    /// the store already holds in this window are not uploaded again, zero
+    /// chunks are never uploaded, and a part already recorded as published
+    /// in this window, or whose index is already in the store, uploads
+    /// nothing. The bytes are hashed as they are read, so a corrupt local
+    /// blob is never published: it is dropped from the store instead.
+    #[instrument(skip(self, key, chunks), fields(digest = %key.digest(), key_id = %key.key_id()))]
+    pub fn publish(&self, key: &PartKey, chunks: &ChunkKey) -> R<PublishedContent> {
         let digest = key.digest();
         let entry = self
             .store
             .get(digest)?
             .with_context(|| format!("content {digest} is not in the node store"))?;
-        let url = self.publisher.url_for(&key.object_name());
+        let (window_secs, window) = self.settings.window_now();
+        let scope = chunks.scope(window_secs, window)?;
+        let index_name = key.index_object_name(&scope, self.settings.chunk_size);
+        let url = self.publisher.url_for(&index_name);
+        let published = |uploaded_bytes| PublishedContent {
+            digest: digest.clone(),
+            url: url.clone(),
+            key_id: key.key_id().to_string(),
+            bytes: entry.size,
+            uploaded_bytes,
+        };
         if self.store.published_url(digest)?.as_deref() == Some(url.as_str()) {
-            return Ok(PublishedContent {
-                digest: digest.clone(),
-                url,
-                key_id: key.key_id().to_string(),
-                bytes: entry.size,
-                uploaded: false,
-            });
+            return Ok(published(0));
         }
-        let published = match self.publisher.publish_sealed(key, &entry.path) {
-            Ok(published) => published,
+        let started = std::time::Instant::now();
+        let outcome = match crate::checkpoint_chunks::publish_part(
+            self.publisher.sealed_objects()?,
+            &entry.path,
+            key,
+            &scope,
+            &index_name,
+            self.settings,
+            &self.known,
+        ) {
+            Ok(outcome) => outcome,
             Err(err) if err.downcast_ref::<PublishSourceMismatch>().is_some() => {
                 // Rehash to drop the corrupt blob from the store, so the
                 // next capture or fetch replaces it.
@@ -663,14 +699,20 @@ impl ContentPublishing {
             }
             Err(err) => return Err(err),
         };
-        self.store.record_published(digest, &published.url)?;
+        self.store.record_published(digest, &url)?;
         info!(
-            url = %published.url,
-            bytes = published.bytes,
-            uploaded = published.uploaded,
+            url = %url,
+            bytes = entry.size,
+            uploaded_bytes = outcome.uploaded_bytes,
+            uploaded_chunks = outcome.uploaded_chunks,
+            reused_chunks = outcome.reused_chunks,
+            zero_chunks = outcome.zero_chunks,
+            already_published = outcome.already_published,
+            scope = scope.label(),
+            duration_ms = started.elapsed().as_millis() as u64,
             "Published sealed content"
         );
-        Ok(published)
+        Ok(published(outcome.uploaded_bytes))
     }
 
     /// Where a digest was published from this node, if it was.
@@ -737,17 +779,25 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn file_publisher_seals_is_idempotent_and_opens_by_key() -> R<()> {
-        let dir = tempfile::tempdir()?;
-        let store = Arc::new(ContentStore::open(
-            dir.path().join("content"),
+    fn chunk_key() -> ChunkKey {
+        ChunkKey::derive(&[5u8; 32], "ck_test", "job").unwrap()
+    }
+
+    fn open_store(dir: &Path) -> R<Arc<ContentStore>> {
+        Ok(Arc::new(ContentStore::open(
+            dir.join("content"),
             ContentStoreConfig {
                 min_free_disk: 0,
                 ..Default::default()
             },
-        )?);
-        let bytes = b"snapshot part bytes with a SECRET_TOKEN=abc123 ".repeat(1000);
+        )?))
+    }
+
+    #[test]
+    fn file_publisher_writes_sealed_chunks_and_an_index_and_is_idempotent() -> R<()> {
+        let dir = tempfile::tempdir()?;
+        let store = open_store(dir.path())?;
+        let bytes = b"snapshot part bytes with a SECRET_TOKEN=abc123 ".repeat(50_000);
         let entry = store.put_bytes(ContentClass::Snapshots, &bytes, PutOptions::default())?;
         let key = part_key(&entry.digest);
 
@@ -755,29 +805,40 @@ mod tests {
         let target = target(serde_json::json!({
             "url": Url::from_directory_path(&shared).unwrap().to_string(),
         }))?;
-        let publishing = ContentPublishing::new(
+        let publishing = ContentPublishing::with_settings(
             store.clone(),
             target.publisher(Arc::new(AnonymousCredentials))?,
+            target.chunk_settings()?,
         );
 
-        let first = publishing.publish(&key)?;
-        assert!(first.uploaded);
+        let first = publishing.publish(&key, &chunk_key())?;
+        assert_eq!(first.uploaded_bytes, bytes.len() as u64);
         assert_eq!(first.bytes, bytes.len() as u64);
         assert_eq!(first.key_id, "ck_test");
-        let on_disk = shared.join("sealed").join(key.object_name());
-        let sealed = fs::read(&on_disk)?;
-        assert_eq!(sealed.len() as u64, sealed_len(bytes.len() as u64));
-        assert!(
-            !sealed.windows(19).any(|w| w == b"SECRET_TOKEN=abc123"),
-            "the published object holds no plaintext"
+        // The URL names the index, beside the chunks, and nothing in the
+        // store holds plaintext or is named by a plaintext digest.
+        let index = Url::parse(&first.url)?.to_file_path().unwrap();
+        assert_eq!(index.parent(), Some(shared.join("sealed").as_path()));
+        let objects: Vec<_> = fs::read_dir(shared.join("sealed"))?.collect::<Result<_, _>>()?;
+        assert_eq!(
+            objects.len(),
+            bytes
+                .len()
+                .div_ceil(crate::checkpoint_chunks::DEF_CHUNK_SIZE as usize)
+                + 1,
+            "one object per chunk, and the index"
         );
+        for object in &objects {
+            let sealed = fs::read(object.path())?;
+            assert_eq!(&sealed[..8], crate::checkpoint_seal::SEAL_MAGIC);
+            assert!(
+                !sealed.windows(19).any(|w| w == b"SECRET_TOKEN=abc123"),
+                "the published object holds no plaintext"
+            );
+        }
         assert!(
             !shared.join("sha256").exists(),
             "nothing is published under the plaintext digest"
-        );
-        assert_eq!(
-            first.url,
-            Url::from_file_path(&on_disk).unwrap().to_string()
         );
         assert_eq!(
             publishing.published_url(&entry.digest)?,
@@ -785,47 +846,206 @@ mod tests {
         );
 
         // Second publish: recorded, so nothing moves.
-        let second = publishing.publish(&key)?;
-        assert!(!second.uploaded);
+        let second = publishing.publish(&key, &chunk_key())?;
+        assert_eq!(second.uploaded_bytes, 0);
         assert_eq!(second.url, first.url);
 
-        // A fresh node (no record) publishing the same bytes finds them
-        // already at the destination: the same key seals the same object.
-        let other = FileContentPublisher::new(&shared);
-        let third = other.publish_sealed(&key, &entry.path)?;
-        assert!(!third.uploaded);
+        // A fresh node (no record) publishing the same bytes finds the
+        // index already in the store: same key, same window, same objects.
+        let other_dir = tempfile::tempdir()?;
+        let other_store = open_store(other_dir.path())?;
+        other_store.put_bytes(ContentClass::Snapshots, &bytes, PutOptions::default())?;
+        let other =
+            ContentPublishing::new(other_store, Arc::new(FileContentPublisher::new(&shared)));
+        let third = other.publish(&key, &chunk_key())?;
+        assert_eq!(third.uploaded_bytes, 0);
         assert_eq!(third.url, first.url);
+        assert_eq!(fs::read_dir(shared.join("sealed"))?.count(), objects.len());
 
-        // The object opens with the key back to the exact bytes.
-        let copy = dir.path().join("fetched");
-        fs::copy(&on_disk, &copy)?;
-        crate::checkpoint_seal::open_file_in_place(&key, &copy)?;
-        assert_eq!(fs::read(&copy)?, bytes);
+        // Any node reads it back to the exact bytes through the URL.
+        let (objects, name) = sealed_objects_for_url(&first.url, None)?;
+        let fetched = dir.path().join("fetched");
+        crate::checkpoint_chunks::fetch_part(
+            objects,
+            &name,
+            &key,
+            &fetched,
+            crate::checkpoint_chunks::FetchLimits {
+                max_bytes: None,
+                deadline: None,
+                attempts: 1,
+            },
+        )?;
+        assert_eq!(fs::read(&fetched)?, bytes);
         Ok(())
     }
 
     #[test]
-    fn file_publisher_refuses_bytes_that_do_not_match_the_digest() -> R<()> {
+    fn publishing_refuses_bytes_that_do_not_match_the_digest() -> R<()> {
         let dir = tempfile::tempdir()?;
-        let src = dir.path().join("part");
-        fs::write(&src, b"actual bytes")?;
-        let claimed = ContentDigest::of_bytes(b"other bytes");
-        let key = part_key(&claimed);
-        let publisher = FileContentPublisher::new(dir.path().join("shared"));
-        let err = publisher.publish_sealed(&key, &src).unwrap_err();
+        let store = open_store(dir.path())?;
+        let entry = store.put_bytes(
+            ContentClass::Snapshots,
+            b"actual bytes",
+            PutOptions::default(),
+        )?;
+        // Corrupt the blob behind the store's back.
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&entry.path, fs::Permissions::from_mode(0o644))?;
+        fs::write(&entry.path, b"rotted bytes")?;
+        let key = part_key(&entry.digest);
+        let shared = dir.path().join("shared");
+        let publishing =
+            ContentPublishing::new(store.clone(), Arc::new(FileContentPublisher::new(&shared)));
+        let err = publishing.publish(&key, &chunk_key()).unwrap_err();
+        assert!(format!("{err:#}").contains("corrupt"), "{err:#}");
+        // No index was written, so nothing names the bad bytes, and the
+        // corrupt blob left the store.
+        let names: Vec<_> = fs::read_dir(shared.join("sealed"))?
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        assert!(names.len() <= 1, "at most the one chunk: {names:?}");
+        assert!(store.get(&entry.digest)?.is_none());
+        Ok(())
+    }
+
+    /// Publish and fetch through a real S3-compatible store: a first
+    /// publish, a repeat with a few chunks changed, a fetch on a "node" with
+    /// nothing, and an anonymous read the private bucket refuses. Run
+    /// against a MinIO with `LEGION_TEST_S3_URL` (for example
+    /// `s3://legion-test?endpoint=http://127.0.0.1:9000&region=us-east-1`)
+    /// and the bucket's keys in `AWS_ACCESS_KEY_ID` and
+    /// `AWS_SECRET_ACCESS_KEY`: `cargo test --lib
+    /// s3_publish_and_fetch_round_trip -- --ignored --nocapture`.
+    /// `LEGION_TEST_S3_MIB` sets the part size (default 64).
+    #[test]
+    #[ignore]
+    fn s3_publish_and_fetch_round_trip() -> R<()> {
+        let url = std::env::var("LEGION_TEST_S3_URL").context("set LEGION_TEST_S3_URL")?;
+        let mib: usize = std::env::var("LEGION_TEST_S3_MIB")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(64);
+        let target = target(serde_json::json!({ "url": url }))?;
+        let chunk = crate::checkpoint_chunks::DEF_CHUNK_SIZE as usize;
+        // A quarter zero, the rest distinct per chunk.
+        let mut bytes = vec![0u8; mib * chunk];
+        for (i, piece) in bytes.chunks_mut(chunk).enumerate().skip(mib / 4) {
+            for (j, byte) in piece.iter_mut().enumerate() {
+                *byte = (i.wrapping_mul(2654435761) ^ j.wrapping_mul(40503) ^ (j >> 9)) as u8 | 1;
+            }
+        }
+        let nonzero = (mib - mib / 4) * chunk;
+        let publish = |bytes: &[u8]| -> R<(PublishedContent, PartKey, f64)> {
+            let dir = tempfile::tempdir()?;
+            let store = open_store(dir.path())?;
+            let entry = store.put_bytes(ContentClass::Snapshots, bytes, PutOptions::default())?;
+            let key = part_key(&entry.digest);
+            let publishing =
+                ContentPublishing::new(store, target.publisher(Arc::new(AnonymousCredentials))?);
+            let started = std::time::Instant::now();
+            let published = publishing.publish(&key, &chunk_key())?;
+            Ok((published, key, started.elapsed().as_secs_f64()))
+        };
+        let (first, key, first_secs) = publish(&bytes)?;
+        // A fresh store prefix holds none of it; a rerun of the test finds
+        // the index already there and uploads nothing.
         assert!(
-            err.downcast_ref::<PublishSourceMismatch>().is_some(),
-            "{err:#}"
+            first.uploaded_bytes == nonzero as u64 || first.uploaded_bytes == 0,
+            "{}",
+            first.uploaded_bytes
         );
-        assert!(format!("{err:#}").contains("hash to"), "{err:#}");
-        assert!(!dir
-            .path()
-            .join("shared/sealed")
-            .join(key.object_name())
-            .exists());
-        // No temp file is left behind either.
-        let leftovers: Vec<_> = fs::read_dir(dir.path().join("shared/sealed"))?.collect();
-        assert!(leftovers.is_empty(), "{leftovers:?}");
+        let mut changed = bytes.clone();
+        for i in [mib / 2, mib / 2 + 1, mib - 1] {
+            changed[i * chunk + 7] ^= 0x55;
+        }
+        let (second, second_key, second_secs) = publish(&changed)?;
+        assert!(
+            second.uploaded_bytes <= 3 * chunk as u64,
+            "{}",
+            second.uploaded_bytes
+        );
+
+        let fetch_dir = tempfile::tempdir()?;
+        let fetched_path = fetch_dir.path().join("part");
+        let started = std::time::Instant::now();
+        let (objects, name) = sealed_objects_for_url(&second.url, Some(Credential::AwsAmbient))?;
+        let fetched = crate::checkpoint_chunks::fetch_part(
+            objects,
+            &name,
+            &second_key,
+            &fetched_path,
+            crate::checkpoint_chunks::FetchLimits {
+                max_bytes: None,
+                deadline: None,
+                attempts: 3,
+            },
+        )?;
+        let fetch_secs = started.elapsed().as_secs_f64();
+        assert!(fs::read(&fetched_path)? == changed);
+        assert_eq!(fetched.fetched_bytes, nonzero as u64);
+
+        let (anonymous, name) = sealed_objects_for_url(&first.url, None)?;
+        let err = crate::checkpoint_chunks::fetch_part(
+            anonymous,
+            &name,
+            &key,
+            &fetch_dir.path().join("anonymous"),
+            crate::checkpoint_chunks::FetchLimits {
+                max_bytes: None,
+                deadline: None,
+                attempts: 1,
+            },
+        )
+        .unwrap_err();
+        println!("anonymous read refused: {err:#}");
+        println!(
+            "s3_publish_and_fetch_round_trip: {mib} MiB part ({} MiB non-zero): first publish \
+             uploaded {:.1} MiB in {first_secs:.2}s, repeat with 3 chunks changed uploaded \
+             {:.1} MiB in {second_secs:.2}s, fetch of {:.1} MiB in {fetch_secs:.2}s",
+            nonzero >> 20,
+            first.uploaded_bytes as f64 / (1 << 20) as f64,
+            second.uploaded_bytes as f64 / (1 << 20) as f64,
+            fetched.fetched_bytes as f64 / (1 << 20) as f64,
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn chunk_settings_default_and_validate() -> R<()> {
+        let plain = target(serde_json::json!({ "url": "s3://b" }))?;
+        assert_eq!(plain.chunk_settings()?, ChunkSettings::default());
+        let tuned = target(serde_json::json!({
+            "url": "s3://b", "chunkSize": "4MiB", "dedupWindow": "6h",
+        }))?;
+        let settings = tuned.chunk_settings()?;
+        assert_eq!(settings.chunk_size, 4 * 1024 * 1024);
+        assert_eq!(settings.dedup_window.as_secs(), 6 * 3600);
+        for (raw, needle) in [
+            (
+                serde_json::json!({ "url": "s3://b", "chunkSize": "32KiB" }),
+                "64KiB to 16MiB",
+            ),
+            (
+                serde_json::json!({ "url": "s3://b", "chunkSize": "1000000" }),
+                "multiple of",
+            ),
+            (
+                serde_json::json!({ "url": "s3://b", "chunkSize": "big" }),
+                "chunkSize",
+            ),
+            (
+                serde_json::json!({ "url": "s3://b", "dedupWindow": "10s" }),
+                "at least 1m",
+            ),
+            (
+                serde_json::json!({ "url": "s3://b", "dedupWindow": "soon" }),
+                "not a duration",
+            ),
+        ] {
+            let err = target(raw)?.validate().unwrap_err();
+            assert!(format!("{err:#}").contains(needle), "{err:#}");
+        }
         Ok(())
     }
 
@@ -888,9 +1108,9 @@ mod tests {
             let publishing =
                 ContentPublishing::new(store.clone(), Arc::new(FileContentPublisher::new(&shared)));
             let started = std::time::Instant::now();
-            let published = publishing.publish(&key)?;
+            let published = publishing.publish(&key, &chunk_key())?;
             let secs = started.elapsed().as_secs_f64();
-            assert!(published.uploaded);
+            assert_eq!(published.uploaded_bytes, published.bytes);
             runs.push(secs);
             fs::remove_dir_all(&shared)?;
         }

@@ -42,10 +42,23 @@ pub fn init_tracing_with_options(
 ) -> R<()> {
     O11Y_ENABLED.store(enable_o11y, Ordering::Relaxed);
 
+    let mut console_guard = None;
     let stdout_log = if console_to_stderr {
         tracing_subscriber::fmt::layer()
             .pretty()
             .with_writer(std::io::stderr)
+            .boxed()
+    } else if server_mode {
+        // A server's console is read by journald or a container runtime,
+        // which falls behind under load. A blocking write then stalled every
+        // thread that logged, heartbeats included, until the reader caught
+        // up: a worker bursting 1,200 sandbox starts went a minute without a
+        // heartbeat and was marked lost. A full buffer drops lines instead.
+        let (writer, guard) = tracing_appender::non_blocking(std::io::stdout());
+        console_guard = Some(guard);
+        tracing_subscriber::fmt::layer()
+            .pretty()
+            .with_writer(writer)
             .boxed()
     } else {
         tracing_subscriber::fmt::layer().pretty().boxed()
@@ -110,6 +123,13 @@ pub fn init_tracing_with_options(
         .lock()
         .expect("appender guard lock")
         .push(log_guard);
+    if let Some(guard) = console_guard {
+        APPENDER_GUARDS
+            .get_or_init(|| Mutex::new(Vec::new()))
+            .lock()
+            .expect("appender guard lock")
+            .push(guard);
+    }
     if let Some(trace_guard) = trace_guard_opt {
         APPENDER_GUARDS
             .get_or_init(|| Mutex::new(Vec::new()))

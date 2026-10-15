@@ -21,7 +21,11 @@
 //!   without a resync, a worker whose manager died resyncs once on another,
 //!   and no allocation is lost or duplicated;
 //! - creating or mounting a job-level volume claim re-sends the job's
-//!   allocations, inside a raft apply, without failing it.
+//!   allocations, inside a raft apply, without failing it;
+//! - checkpoint work (a suspend's capture, the reclaim after a resume) is
+//!   pushed within a round trip with no heartbeat, never replayed, re-pushed
+//!   to a new stream while outstanding, and still listed by the heartbeat
+//!   until its report lands.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::net::SocketAddr;
@@ -36,9 +40,12 @@ use legion::structs::config::{ManagerConfigFull, PersistenceType};
 use legion::structs::job::{JobConfig, StatefulConfig, TaskConfig, VolumeSpec};
 use legion::structs::manager_client::ManagerClient;
 use legion::structs::manager_server::{Manager, ManagerServer};
+use legion::structs::suspend::SuspendConfig;
 use legion::structs::{
-    stream_work_request, AllocationHealth, HeartbeatRequest, InstanceMode, Node, NodeMsg,
-    StreamWorkAck, StreamWorkOpen, StreamWorkReply, StreamWorkRequest, Submission, WhoAmIRequest,
+    stream_work_request, AllocationHealth, CreateInstanceRequest, GetInstanceRequest,
+    HeartbeatReply, HeartbeatRequest, InstanceMode, Node, NodeMsg, SnapshotReport,
+    StartInstanceRequest, StreamWorkAck, StreamWorkOpen, StreamWorkReply, StreamWorkRequest,
+    Submission, SuspendInstanceRequest, WhoAmIRequest,
 };
 use legion::worker::work_stream::WorkMirror;
 use prost::Message;
@@ -972,5 +979,321 @@ fn a_job_volume_change_reaches_a_streaming_worker_under_raft() -> R<()> {
         ),
         other => panic!("expected the job's allocations marked changed, got {other:?}"),
     }
+    Ok(())
+}
+
+/// A node that takes memory checkpoints of sandboxes (the shape
+/// `raft_lifecycle_ops.rs` uses).
+fn checkpoint_node(id: &str) -> Node {
+    Node {
+        id: id.to_string(),
+        pool: "default".into(),
+        status: "ready".into(),
+        availability: "available".into(),
+        last_heartbeat: "2023-01-01T00:00:00Z".into(),
+        heartbeat_source: String::new(),
+        config_attrs: json!({
+            "node_id": id,
+            "maxAllocations": 16,
+            "resources": { "memory": 65536, "cpu": 40000 },
+        }),
+        fingerprint_attrs: json!({
+            "arch": "x86_64",
+            "memory_total": "68719476736",
+            "disk_total_space": "214748364800",
+            "disk_available_space": "107374182400",
+            "cpus": { "cpu-1": { "frequency": 2000.0 } },
+            "cpu.vendor": "GenuineIntel",
+            "cpu.model": "6:106:6",
+            "cpu.features": "3f9a0c21",
+            "sandbox.vmm": "firecracker",
+            "sandbox.vmm.version": "1.12.0",
+        }),
+        dynamic_attrs: json!({ "buildVersion": "0.9.0", "capabilities": ["checkpoint"] }),
+        health_checks: json!({}),
+    }
+}
+
+fn checkpoint_report(snapshot_id: &str, op: &str, allocation_id: i64) -> SnapshotReport {
+    SnapshotReport {
+        snapshot_id: snapshot_id.into(),
+        op: op.into(),
+        ok: true,
+        manifest_json: if op == "capture" {
+            json!({
+                "apiVersion": 1,
+                "id": snapshot_id,
+                "jobId": JOB,
+                "task": TASK,
+                "originAllocId": allocation_id,
+                "runtime": "sandbox",
+                "kind": "memory",
+                "createdAt": "2026-10-10T00:00:00Z",
+            })
+            .to_string()
+        } else {
+            String::new()
+        },
+        allocation_id,
+        ..Default::default()
+    }
+}
+
+/// The next message that pushes checkpoint work, acking everything read.
+fn next_push(
+    probe: &Probe,
+    rt: &tokio::runtime::Runtime,
+    what: &str,
+) -> (Instant, StreamWorkReply) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < deadline {
+        if let Some((arrived, message)) = probe.next(Duration::from_millis(100)) {
+            probe.ack(rt, message.epoch, message.seq);
+            if !message.checkpoint_requests.is_empty() {
+                return (arrived, message);
+            }
+        }
+    }
+    panic!("no checkpoint push: {what}");
+}
+
+/// Checkpoint work rides the stream (checkpoints-on-stream plan). On a raft
+/// manager, where the projection that notices the snapshot rows runs inside
+/// the state machine's apply:
+///
+/// - a suspend's capture request reaches the streaming worker within a
+///   round trip of `SuspendInstance`, with no heartbeat anywhere;
+/// - a dropped stream replays the message without its push, and the new
+///   stream is pushed the work still outstanding;
+/// - the heartbeat reply still lists it, as the record, until the report is
+///   applied;
+/// - the reclaim that follows a resume is pushed too.
+#[test]
+fn checkpoint_work_reaches_a_streaming_worker_without_a_heartbeat() -> R<()> {
+    const NODE: &str = "ckpt-node";
+    let dir = tempfile::tempdir()?;
+    let mut config = ManagerConfigFull {
+        store_path: dir
+            .path()
+            .join("store")
+            .to_str()
+            .context("utf-8")?
+            .to_string(),
+        scheduling_policy: "bin_pack".to_string(),
+        scheduler_settings: Some(json!({ "nodes_considered": "100%" })),
+        ..Default::default()
+    };
+    config.persistence.r#type = PersistenceType::Raft;
+    config.persistence.raft.bootstrap = true;
+    config.persistence.raft.node_id = "mgr-ckpt".to_string();
+    config.persistence.raft.data_dir = dir
+        .path()
+        .join("raft")
+        .to_str()
+        .context("utf-8")?
+        .to_string();
+    let store = Store::start_storage(&config)?;
+    store.insert_node(NodeMsg::from(checkpoint_node(NODE)))?;
+    store.handle_job_submit(
+        &JobConfig {
+            priority: Default::default(),
+            name: JOB.to_string(),
+            tasks: vec![TaskConfig {
+                config: json!({ "image": "alpine", "command": ["sleep", "60"] }),
+                resources: json!({ "memory": 512, "cpu": 500 }),
+                stateful: Some(StatefulConfig {
+                    mode: InstanceMode::Keyed,
+                    require_id: false,
+                    initial_instances: None,
+                    on_lost: None,
+                    storage: None,
+                    envelope: None,
+                    promote: None,
+                    placement: None,
+                    fence_after: None,
+                }),
+                suspend: Some(SuspendConfig {
+                    checkpoint: Some("memory".into()),
+                    ..Default::default()
+                }),
+                ..TaskConfig::new(TASK, "sandbox")
+            }],
+            rollout: None,
+            rollout_by_group: Default::default(),
+            version: None,
+        },
+        &[Submission {
+            path: format!("{JOB}.json"),
+            content: "{}".to_string(),
+            is_primary: true,
+        }],
+    )?;
+    run_eval_worker(&store)?;
+    let (rt, addr) = serve(&store)?;
+    let client = rt.block_on(ManagerClient::connect(format!("http://{addr}")))?;
+    let beat = |request: HeartbeatRequest| -> R<HeartbeatReply> {
+        Ok(rt
+            .block_on(client.clone().heartbeat(HeartbeatRequest {
+                id: NODE.into(),
+                ..request
+            }))?
+            .into_inner())
+    };
+
+    let probe = Probe::open_with(&rt, client.clone(), NODE, (0, 0), false)?;
+    let opening = probe.expect("the opening resync");
+    assert!(opening.checkpoint_requests.is_empty(), "no work yet");
+    probe.ack(&rt, opening.epoch, opening.seq);
+
+    // One running sandbox.
+    let instance_id = rt
+        .block_on(client.clone().create_instance(CreateInstanceRequest {
+            job_id: JOB.into(),
+            ..Default::default()
+        }))?
+        .into_inner()
+        .instance_id;
+    run_eval_worker(&store)?;
+    let placed = probe.expect("the placement");
+    probe.ack(&rt, placed.epoch, placed.seq);
+    let allocation_id = placed.upserts.first().context("the upsert")?.allocation_id;
+    beat(HeartbeatRequest {
+        allocation_ids: vec![allocation_id],
+        allocation_health: vec![AllocationHealth {
+            allocation_id,
+            healthy: true,
+            status: "running".into(),
+            artifact_states: None,
+        }],
+        ..Default::default()
+    })?;
+
+    // Suspend. Nothing heartbeats from here until the report.
+    let sent = Instant::now();
+    let suspend = rt
+        .block_on(client.clone().suspend_instance(SuspendInstanceRequest {
+            instance_id: instance_id.clone(),
+            checkpoint: None,
+            idempotency_key: None,
+        }))?
+        .into_inner();
+    let (arrived, pushed) = probe
+        .next(Duration::from_secs(10))
+        .context("the capture push")?;
+    // The health beat above changed the allocation's row, so the same
+    // message may re-send the allocation the node already holds. It never
+    // adds or stops anything.
+    assert!(
+        pushed.stops.is_empty()
+            && pushed
+                .upserts
+                .iter()
+                .all(|upsert| upsert.allocation_id == allocation_id),
+        "{pushed:#?}"
+    );
+    assert_eq!(
+        pushed.digest, placed.digest,
+        "a push does not move the digest"
+    );
+    let [capture] = pushed.checkpoint_requests.as_slice() else {
+        panic!("one capture pushed: {:?}", pushed.checkpoint_requests);
+    };
+    assert_eq!(capture.op, "capture");
+    assert_eq!(capture.snapshot_id, suspend.snapshot_id);
+    assert_eq!(capture.allocation_id, allocation_id);
+    assert_eq!(capture.then, "stop");
+    let latency = arrived.saturating_duration_since(sent);
+    println!(
+        "work_stream_measure {}",
+        json!({
+            "measure": "suspend_to_capture_push",
+            "latency_us": latency.as_micros() as u64,
+        })
+    );
+    assert!(
+        latency < Duration::from_secs(2),
+        "the capture request took {latency:?}, a heartbeat interval or more"
+    );
+
+    // The stream drops before the worker acks the push. The reconnect
+    // replays the message without its push, then pushes the capture
+    // afresh because it is still outstanding.
+    probe.close();
+    let work_log = store.work_log();
+    wait_for(Duration::from_secs(5), "the stream detaches", || {
+        !work_log.streaming(NODE)
+    });
+    let probe = Probe::open_with(&rt, client.clone(), NODE, (placed.epoch, placed.seq), false)?;
+    let replayed = probe.expect("the replayed message");
+    assert_eq!(replayed.seq, pushed.seq);
+    assert!(!replayed.resync);
+    assert!(
+        replayed.checkpoint_requests.is_empty(),
+        "a push is never replayed"
+    );
+    probe.ack(&rt, replayed.epoch, replayed.seq);
+    let (_, again) = next_push(&probe, &rt, "the outstanding capture, on the new stream");
+    assert_eq!(again.checkpoint_requests.len(), 1);
+    assert_eq!(
+        again.checkpoint_requests[0].snapshot_id,
+        suspend.snapshot_id
+    );
+
+    // The heartbeat is still the record: it lists the capture until the
+    // report lands, and not after.
+    let unreported = beat(HeartbeatRequest::default())?;
+    assert_eq!(unreported.checkpoint_requests.len(), 1);
+    let reported = beat(HeartbeatRequest {
+        snapshot_reports: vec![checkpoint_report(
+            &suspend.snapshot_id,
+            "capture",
+            allocation_id,
+        )],
+        ..Default::default()
+    })?;
+    assert!(reported.checkpoint_requests.is_empty());
+    let info = rt
+        .block_on(client.clone().get_instance(GetInstanceRequest {
+            instance_id: instance_id.clone(),
+        }))?
+        .into_inner()
+        .instance
+        .context("instance")?;
+    assert_eq!(info.state, "suspended");
+
+    // Resume, then report the restore: the suspend checkpoint is reclaimed,
+    // and the delete is pushed as soon as its row commits.
+    rt.block_on(client.clone().start_instance(StartInstanceRequest {
+        instance_id: instance_id.clone(),
+        idempotency_key: None,
+        cold: false,
+        force_move: false,
+    }))?;
+    run_eval_worker(&store)?;
+    let resumed = loop {
+        let message = probe.expect("the resumed allocation");
+        probe.ack(&rt, message.epoch, message.seq);
+        if let Some(allocation) = message
+            .upserts
+            .iter()
+            .find(|allocation| allocation.restore.is_some())
+        {
+            break allocation.allocation_id;
+        }
+    };
+    beat(HeartbeatRequest {
+        snapshot_reports: vec![checkpoint_report(&suspend.snapshot_id, "restore", resumed)],
+        ..Default::default()
+    })?;
+    let (_, reclaim) = next_push(&probe, &rt, "the reclaim of the suspend checkpoint");
+    assert!(
+        reclaim
+            .checkpoint_requests
+            .iter()
+            .any(|request| request.op == "delete" && request.snapshot_id == suspend.snapshot_id),
+        "{:?}",
+        reclaim.checkpoint_requests
+    );
+    probe.close();
     Ok(())
 }

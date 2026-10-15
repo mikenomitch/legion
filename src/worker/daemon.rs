@@ -560,6 +560,16 @@ async fn run_worker_with_manager(join: WorkerJoin, name_override: Option<&str>) 
                 crate::structs::WorkerEdgeBootConfigFull::default()
             })
         };
+    // The claim window bounds the unratified edge claims this node holds
+    // (`edgeBoot.maxProvisionalPerNode`) and sheds edge starts when
+    // ratification falls behind (docs/edge-boot.md, "Overload"). Installed
+    // before the worker server starts, so no start can see the default.
+    task_manager
+        .lock()
+        .expect("task manager")
+        .configure_claim_window(Arc::new(
+            crate::worker::claim_window::ClaimWindow::from_config(&edge_boot_config),
+        ));
     // Direct exec: this node admits exec tickets on `Worker.ExecTask` only
     // when its worker config says `exec = { direct = true }`.
     let exec_direct = worker_exec_config(&config.security).direct;
@@ -583,6 +593,8 @@ async fn run_worker_with_manager(join: WorkerJoin, name_override: Option<&str>) 
             ratifier: Arc::new(ManagerClaimRatifier {
                 client: client.clone(),
                 credentials: credentials.clone(),
+                managers: managers.clone(),
+                leader: tokio::sync::Mutex::new(None),
             }),
         })),
         _ => None,
@@ -1246,9 +1258,22 @@ fn build_jwks_verifier(
 
 /// Ratifies claims by calling the manager's `RatifyClaim`, authenticated with
 /// this node's own credentials.
+///
+/// Only the raft leader ratifies: a follower refuses with "not the raft
+/// leader" rather than forwarding, and every refused ratification kills a
+/// sandbox that already booted. So a refusal moves on to the other managers
+/// this node knows, and the one that answered is kept for the next claim.
 struct ManagerClaimRatifier {
     client: ManagerClient<Channel>,
     credentials: Arc<WorkerCredentials>,
+    managers: Arc<crate::worker::managers::ManagerEndpoints>,
+    /// The manager that last ratified, while it keeps doing so.
+    leader: tokio::sync::Mutex<Option<(String, ManagerClient<Channel>)>>,
+}
+
+fn is_not_leader(status: &tonic::Status) -> bool {
+    status.code() == tonic::Code::FailedPrecondition
+        && status.message().contains("not the raft leader")
 }
 
 #[tonic::async_trait]
@@ -1257,9 +1282,55 @@ impl crate::worker::server::ClaimRatifier for ManagerClaimRatifier {
         &self,
         request: crate::structs::RatifyClaimRequest,
     ) -> R<crate::structs::RatifyClaimReply> {
-        let mut client = self.client.clone();
-        let request = self.credentials.attach(tonic::Request::new(request));
-        Ok(client.ratify_claim(request).await?.into_inner())
+        let cached = self.leader.lock().await.clone();
+        let (first_addr, mut first) =
+            cached.unwrap_or_else(|| (String::new(), self.client.clone()));
+        let attempt = self
+            .credentials
+            .attach(tonic::Request::new(request.clone()));
+        // Another manager is asked only when this one certainly did nothing:
+        // it is not the leader, or the call never reached it. After a
+        // timeout the leader may have ratified already, and a second
+        // ratification would be refused and kill a sandbox that won.
+        let status = match first.ratify_claim(attempt).await {
+            Ok(reply) => return Ok(reply.into_inner()),
+            Err(status) if is_not_leader(&status) || status.code() == tonic::Code::Unavailable => {
+                status
+            }
+            Err(status) => {
+                if crate::worker::managers::is_unreachable(&status) {
+                    // Do not keep sending claims to a manager that went away.
+                    *self.leader.lock().await = None;
+                }
+                return Err(status.into());
+            }
+        };
+        *self.leader.lock().await = None;
+        for addr in self.managers.known() {
+            if addr == first_addr {
+                continue;
+            }
+            let Ok(channel) = crate::worker::plane::manager_channel(&addr).await else {
+                continue;
+            };
+            let mut client = ManagerClient::new(channel);
+            let attempt = self
+                .credentials
+                .attach(tonic::Request::new(request.clone()));
+            match client.ratify_claim(attempt).await {
+                Ok(reply) => {
+                    *self.leader.lock().await = Some((addr, client));
+                    return Ok(reply.into_inner());
+                }
+                Err(status)
+                    if is_not_leader(&status) || status.code() == tonic::Code::Unavailable =>
+                {
+                    continue
+                }
+                Err(status) => return Err(status.into()),
+            }
+        }
+        Err(status.into())
     }
 }
 
@@ -1635,12 +1706,22 @@ fn build_content_publishing(
             disabled; this node will not publish content");
         return None;
     };
-    match target.publisher(credentials) {
-        Ok(publisher) => {
-            info!(url = %target.url, "Content publishing enabled");
-            Some(Arc::new(crate::content_publish::ContentPublishing::new(
-                store, publisher,
-            )))
+    match target
+        .publisher(credentials)
+        .and_then(|publisher| Ok((publisher, target.chunk_settings()?)))
+    {
+        Ok((publisher, settings)) => {
+            info!(
+                url = %target.url,
+                chunk_size = settings.chunk_size,
+                dedup_window_secs = settings.dedup_window.as_secs(),
+                "Content publishing enabled"
+            );
+            Some(Arc::new(
+                crate::content_publish::ContentPublishing::with_settings(
+                    store, publisher, settings,
+                ),
+            ))
         }
         Err(err) => {
             warn!(error = ?err, "Invalid contentStore config; this node will not publish content");
@@ -2285,6 +2366,14 @@ async fn heartbeat_tick(
                 .unwrap_or_else(|p| p.into_inner())
                 .prepare(current)
         };
+        // Elastic envelopes this node wants grown or shrunk
+        // (docs/session-mode.md, "Elastic envelopes"). A resize stays in
+        // flight until a reply answers it, so a failed heartbeat needs no
+        // restore: the next one asks again.
+        let envelope_resizes = task_manager
+            .lock()
+            .expect("task manager")
+            .envelope_resize_requests(std::time::Instant::now());
         let exec_audit = crate::worker::direct_exec::take_audit();
         // On the stream, the heartbeat stops listing what the node runs: it
         // reports its stream position and a digest of its desired set, and
@@ -2312,6 +2401,7 @@ async fn heartbeat_tick(
                 .as_ref()
                 .map(|pending| pending.report.clone()),
             session_report: Some(session_report.report.clone()),
+            envelope_resizes,
             usage,
             pressure_actions,
             net_denials,
@@ -2390,6 +2480,14 @@ async fn heartbeat_tick(
                 terminations_for_redrive,
                 &reply.retry_terminated_allocations,
             );
+        // Before the reconcile below reads this reply's desired set: an
+        // answer is newer than any payload a lagging replica built.
+        if !reply.envelope_resizes.is_empty() {
+            task_manager
+                .lock()
+                .expect("task manager")
+                .apply_envelope_resize_results(&reply.envelope_resizes, std::time::Instant::now());
+        }
         crate::worker::direct_exec::apply_revocations(&reply.revoked_exec_sessions);
         crate::worker::direct_exec::apply_exec_keys(&reply.exec_keys_version, &reply.exec_keys);
         // The cluster's manager set, refreshed every beat and persisted when
@@ -2481,6 +2579,7 @@ async fn heartbeat_tick(
                 committed,
                 crate::structs::edge_boot::RefusalReason::from_wire(verdict.reason),
                 &verdict.detail,
+                crate::worker::claim_window::Feedback::Verdict,
             );
         }
         // The lease is the backstop for every failure the reply path cannot
@@ -2573,6 +2672,12 @@ async fn heartbeat_tick(
         {
             let fresh = {
                 let mut manager = task_manager.lock().expect("task manager");
+                // The manager applied (or ignored) the reports this beat
+                // carried before it built the reply, so finished work this
+                // reply leaves out can be forgotten now.
+                manager
+                    .checkpoints_mut()
+                    .mark_delivered(&snapshot_reports_for_redrive);
                 manager
                     .checkpoints_mut()
                     .reconcile_restores(&reply.desired_allocations);
@@ -3689,20 +3794,49 @@ static HEALTH_REPORTED: std::sync::LazyLock<Mutex<HashMap<i64, AllocationHealth>
 
 /// Wakes the heartbeat loop before its interval: a `StreamWork` message
 /// arrived, and its new allocations should start (and its stops land) now
-/// rather than at the next beat.
+/// rather than at the next beat; or a checkpoint report is waiting.
 static HEARTBEAT_WAKE: std::sync::LazyLock<tokio::sync::Notify> =
     std::sync::LazyLock::new(tokio::sync::Notify::new);
 
-/// Act on one applied work-stream message: start the allocations it added,
-/// and wake the heartbeat's reconcile when it stopped or changed anything.
-/// A resync's additions go through the reconcile too, which knows what a
-/// restarted worker restored and what it must not start twice.
+/// Send a heartbeat now instead of at the next interval: a fresh checkpoint
+/// report is queued (`worker/checkpoints.rs`), and a suspend, resume, or
+/// fork should not wait out the cadence to settle. Wakes already pending
+/// fold into one beat.
+pub(crate) fn wake_heartbeat() {
+    HEARTBEAT_WAKE.notify_one();
+}
+
+/// Act on one applied work-stream message: start the checkpoint work it
+/// pushed and the allocations it added, and wake the heartbeat's reconcile
+/// when it stopped or changed anything. A resync's additions go through the
+/// reconcile too, which knows what a restarted worker restored and what it
+/// must not start twice.
 fn launch_streamed_work(
     launcher: &Arc<WorkerDaemonService>,
     applied: crate::worker::work_stream::Applied,
 ) {
     if applied.reconcile {
         HEARTBEAT_WAKE.notify_one();
+    }
+    // Checkpoint work starts the moment it is pushed, deduplicated against
+    // what this node already has in flight or finished, exactly as when a
+    // heartbeat delivers it (docs/suspend-and-resume.md, "How it works").
+    if !applied.checkpoint_requests.is_empty() {
+        let fresh = launcher
+            .task_manager
+            .lock()
+            .map(|mut manager| {
+                manager
+                    .checkpoints_mut()
+                    .accept_pushed(&applied.checkpoint_requests)
+            })
+            .unwrap_or_default();
+        for request in fresh {
+            let task_manager = launcher.task_manager.clone();
+            tokio::task::spawn_blocking(move || {
+                crate::worker::checkpoints::run_request(&task_manager, &request);
+            });
+        }
     }
     if applied.resync {
         return;
@@ -5875,6 +6009,7 @@ mod tests {
             }],
             manager_addresses: Vec::new(),
             workload_identity_issuer: String::new(),
+            envelope_resizes: Vec::new(),
         };
 
         apply_upstreams(&forwarder, &reply, std::path::Path::new("/tmp")).await;

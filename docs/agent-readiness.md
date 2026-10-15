@@ -173,7 +173,10 @@ mirrors the gRPC status code (`NotFound`, `Unavailable`, `InvalidArgument`, …)
 except where the server names a more specific one: `WORKER_UNREACHABLE`
 (retryable) when a manager can't dial the worker running the target of an
 exec, logs, or restart call. Its hint points at `legion node info <node>`,
-which shows the manager's reachability probe for that node.
+which shows the manager's reachability probe for that node. `OVERLOADED`
+(retryable) comes from `legion sandbox start` when the edge node is shedding
+starts because ratification is behind. Back off before retrying, as
+[edge-boot.md](edge-boot.md#overload) describes.
 `retryable` tells the agent whether retrying the same request may succeed. It is
 true for `Unavailable`, `DeadlineExceeded`, `Aborted`, and `ResourceExhausted`.
 Commands exit non-zero on failure.

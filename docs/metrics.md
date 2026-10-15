@@ -112,8 +112,9 @@ neighbor rules a cause in or out, and which knob to turn), see
   - `fallback`: applied, but at least one placement bound a lower-ranked
     candidate because of a race.
   - `rejected`: no candidate still fits. Causes are capacity, a late
-    constraint or cordon, or (for an edge-boot ratification only) an epoch
-    conflict.
+    constraint or cordon, or a job-config epoch conflict between two
+    scheduler plans. An edge-boot ratification never compares epochs, so
+    it is never rejected for a conflict.
 
   The outcomes are mutually exclusive. See
   [late-binding-plan-apply.md](late-binding-plan-apply.md).
@@ -393,8 +394,9 @@ sum across them. See [suspend-and-resume.md](suspend-and-resume.md#metrics).
   paused plus storing its memory. Buckets run from 25 ms to 60 s.
 - **`legion_instance_resume_seconds{kind}`** (histogram): how long each
   successful resume's restore took on its node, by `kind`. Placement time is
-  not included. The memory target is under 300 ms for a 1 GiB guest on local
-  NVMe.
+  not included. What a memory restore waits for depends on its
+  `memory_restore` mode (see
+  [How memory comes back](task-runtime-sandbox.md#how-memory-comes-back)).
 - **`legion_instance_suspends_total{reason}`** (counter): suspends applied,
   by `reason`: `manual` (SuspendInstance), `idle` (a task's idle policy),
   `pressure` (a node's `suspend` pressure step), or `make_room` (to make room
@@ -416,8 +418,9 @@ sum across them. See [suspend-and-resume.md](suspend-and-resume.md#metrics).
   suspend reports 0, because its volume stays in place uncopied.
 - **`legion_checkpoint_publish_bytes{kind}`** (histogram): bytes a node
   uploaded to its `contentStore` to publish one checkpoint
-  (`durability = "store"`). 0 when the store already held every part, since
-  parts are keyed by digest.
+  (`durability = "store"`): only the chunks the store did not hold yet, so
+  a repeat checkpoint reports what changed. 0 when the store already held
+  every chunk ([How published parts are stored](suspend-and-resume.md#how-published-parts-are-stored)).
 - **`legion_checkpoint_publish_seconds{kind}`** (histogram): how long each
   successful publish took on its node, from 50 ms to 10 minutes.
 - **`legion_checkpoint_publish_total{outcome}`** (counter): publishes
@@ -450,6 +453,17 @@ across them. See [session-mode.md](session-mode.md).
   later copy of a session id running on two nodes).
 - **`legion_session_promotions_total`** (counter): running sessions promoted
   to keyed instances, one scheduler-lane raft entry each.
+- **`legion_envelope_resizes_total{direction, outcome}`** (counter): elastic
+  envelope resizes nodes asked this manager for
+  ([elastic envelopes](session-mode.md#elastic-envelopes)), by `direction`
+  (`grow` or `shrink`) and `outcome`: `applied`, `partial` (a grow that took
+  only the room the node had left), `refused` (a grow on a node with no free
+  room, or one that is draining or ineligible), `stale` (the node's view of
+  the size was out of date), `gone`, `invalid`, or `error` (the write did
+  not land; the node asks again). `applied` and `partial` are one
+  scheduler-lane raft entry each, and the rest write nothing. A steady
+  `refused` rate means envelopes want room their nodes do not have: add
+  nodes, or lower `stateful.envelope.max`.
 
 Two more are counted on the worker that holds the sessions, on its own
 listener ([Worker](#worker)):
@@ -831,6 +845,20 @@ that has never taken a provisional start.
 - **`legion_provisional_active`** (gauge): unratified claims held right now.
   It makes started-but-unconfirmed capacity visible. A value that does not
   return to zero means claims are leaking.
+
+The node's claim window ([edge-boot.md](edge-boot.md#overload)) adds two:
+
+- **`legion_worker_claim_window`** (gauge): how many unratified edge claims
+  the node admits at once right now. It sits at
+  `edgeBoot.maxProvisionalPerNode` while ratifications come back within
+  `edgeBoot.overloadThreshold` of their lease. A value below it means the
+  node has seen slow ratifications and is shedding.
+- **`legion_worker_claim_overload_refusals_total`** (counter): edge starts
+  refused `OVERLOADED` because the window stayed full for
+  `edgeBoot.queueTimeout`. Each one held nothing and spent no ticket. A
+  rising rate with the window below its ceiling means the managers are
+  behind on ratification. Look at `legion_provisional_ratify_seconds` and
+  the scheduler lane before raising `maxProvisionalPerNode`.
 
 Session starts on the node ([session-mode.md](session-mode.md)) add two:
 

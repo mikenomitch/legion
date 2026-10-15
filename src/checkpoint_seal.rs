@@ -24,6 +24,29 @@
 //! the bucket, but nobody without the checkpoint key can derive the key or
 //! the name from a guessed plaintext. Workers never see the checkpoint key.
 //!
+//! A published part is stored as chunks plus an index
+//! ([`crate::checkpoint_chunks`]), and two more keys hang off the tree:
+//!
+//! ```text
+//! checkpoint key ck_…
+//!   │ HKDF(info = job)             (the session sealing key, below)
+//!   ▼
+//! job key ─ HKDF("chunks") ─▶ chunk key    sent with a publish, or derived
+//!   │                           │          by a session's node
+//!   │                           │ HKDF(info = "<window secs>/<window>")
+//!   │                           ▼
+//!   │                         chunk scope ─ HKDF(chunk digest) ─▶ chunk part key
+//!   ▼
+//! part key ─ HKDF(part ‖ scope, chunk size) ─▶ index name
+//!          └ HKDF(index name)               ─▶ index key
+//! ```
+//!
+//! Chunk keys are keyed convergent too, scoped to one job and one dedup
+//! window, so a repeat checkpoint (and every sandbox of the job) reuses the
+//! chunks already uploaded in the window. The index lists each chunk's
+//! digest and key and is sealed under a key only the part key derives, so a
+//! restoring node needs nothing beyond the part key it already receives.
+//!
 //! # Object format
 //!
 //! ```text
@@ -39,10 +62,7 @@
 //! names. An empty part is one empty, last chunk.
 
 use std::collections::HashMap;
-use std::fs;
 use std::io::{self, Read};
-use std::os::unix::fs::FileExt;
-use std::path::Path;
 
 use ring::aead::{Aad, LessSafeKey, Nonce, UnboundKey, AES_256_GCM};
 use ring::hkdf::{Salt, HKDF_SHA256};
@@ -74,6 +94,9 @@ pub const CHECKPOINT_KEY_ALGORITHM: &str = "hkdf-sha256";
 
 const PART_KEY_SALT: &[u8] = b"legion-checkpoint-part-v1";
 const PART_SUBKEY_SALT: &[u8] = b"legion-checkpoint-part-subkeys-v1";
+const CHUNK_KEY_SALT: &[u8] = b"legion-checkpoint-chunks-v1";
+const CHUNK_SCOPE_SALT: &[u8] = b"legion-checkpoint-chunk-scope-v1";
+const INDEX_SALT: &[u8] = b"legion-checkpoint-index-v1";
 const AEAD_INFO: &[u8] = b"aes-256-gcm-stream";
 const NAME_INFO: &[u8] = b"object-name";
 
@@ -166,9 +189,63 @@ impl PartKey {
     /// The object's name in the content store: 64 hex characters derived
     /// from the key, so it reveals nothing about the plaintext digest.
     pub fn object_name(&self) -> String {
-        hex(hkdf(PART_SUBKEY_SALT, self.secret.as_ref(), NAME_INFO)
-            .expect("hkdf of a fixed-size key")
+        hex(&self.object_id())
+    }
+
+    /// [`Self::object_name`] as raw bytes.
+    pub fn object_id(&self) -> [u8; KEY_BYTES] {
+        *hkdf(PART_SUBKEY_SALT, self.secret.as_ref(), NAME_INFO).expect("hkdf of a fixed-size key")
+    }
+
+    /// A chunk key read back from a part index
+    /// ([`crate::checkpoint_chunks`]): the key bytes the publisher recorded
+    /// for the chunk whose plaintext hashes to `digest`.
+    pub fn from_secret(key_id: &str, digest: ContentDigest, secret: &[u8]) -> R<Self> {
+        if secret.len() != KEY_BYTES {
+            bail!(
+                "the key for chunk {digest} is {} bytes, expected {KEY_BYTES}",
+                secret.len()
+            );
+        }
+        let mut bytes = Zeroizing::new([0u8; KEY_BYTES]);
+        bytes.copy_from_slice(secret);
+        Ok(Self {
+            key_id: key_id.to_string(),
+            digest,
+            secret: bytes,
+        })
+    }
+
+    /// The raw key, for recording a chunk key inside a sealed part index.
+    pub(crate) fn secret(&self) -> &[u8; KEY_BYTES] {
+        &self.secret
+    }
+
+    /// The name of this part's index object when its chunks are keyed in
+    /// `scope` and cut at `chunk_size` bytes ([`crate::checkpoint_chunks`]).
+    /// The index lists those chunk keys, so its bytes differ per scope and
+    /// chunk size, and so must its name and key: each index key seals
+    /// exactly one plaintext.
+    pub fn index_object_name(&self, scope: &ChunkScope, chunk_size: u32) -> String {
+        let mut ikm = Zeroizing::new([0u8; 2 * KEY_BYTES]);
+        ikm[..KEY_BYTES].copy_from_slice(self.secret.as_ref());
+        ikm[KEY_BYTES..].copy_from_slice(scope.secret.as_ref());
+        let info = format!("index-name:{chunk_size}");
+        hex(hkdf(INDEX_SALT, ikm.as_ref(), info.as_bytes())
+            .expect("hkdf of fixed-size keys")
             .as_ref())
+    }
+
+    /// The key the index object named `object_name` is sealed under. A
+    /// reader derives it from the part key and the name in the part's URL,
+    /// so the manifest needs no field beyond `url` and `keyId`.
+    pub fn index_key(&self, object_name: &str) -> R<PartKey> {
+        let info = format!("index-key:{object_name}");
+        Ok(PartKey {
+            key_id: self.key_id.clone(),
+            digest: self.digest.clone(),
+            secret: hkdf(INDEX_SALT, self.secret.as_ref(), info.as_bytes())?,
+        })
     }
 
     fn aead_key(&self) -> R<LessSafeKey> {
@@ -355,6 +432,17 @@ impl SessionSealKeys {
         (keys, errors.join("; "))
     }
 
+    /// The job's chunk key, derived from the current session sealing key:
+    /// the same key the manager derives for the job's keyed snapshots, so
+    /// session and snapshot checkpoints of one job share chunks.
+    pub fn chunk_key(&self) -> R<ChunkKey> {
+        let (key_id, secret) = self.keys.first().context(
+            "this node holds no session sealing key for the job (its envelope payload carried \
+             none: the manager's keyring has no checkpoint key, or is locked)",
+        )?;
+        ChunkKey::from_job_secret(key_id, secret.as_ref())
+    }
+
     /// Back to the wire shape.
     pub fn to_proto(&self) -> Vec<crate::structs::SessionSealKey> {
         self.keys
@@ -365,6 +453,182 @@ impl SessionSealKeys {
             })
             .collect()
     }
+}
+
+/// A job's chunk key: what a publishing node derives the key of every chunk
+/// of the job's checkpoints from ([`crate::checkpoint_chunks`]). It is one
+/// HKDF step below the job's session sealing key, which is one below the
+/// checkpoint key, so the manager (for a keyed snapshot) and a session's
+/// node (with no manager on the path) derive the same one. A node holding
+/// it can name and seal chunks of that job, and nothing else: it cannot
+/// open another checkpoint's index, whose key comes from the part key.
+/// Its `Debug` never shows the key.
+#[derive(Clone)]
+pub struct ChunkKey {
+    key_id: String,
+    secret: Zeroizing<[u8; KEY_BYTES]>,
+}
+
+impl std::fmt::Debug for ChunkKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ChunkKey")
+            .field("key_id", &self.key_id)
+            .finish_non_exhaustive()
+    }
+}
+
+impl ChunkKey {
+    /// Derive job `job_id`'s chunk key from checkpoint key
+    /// `checkpoint_key_id` (the manager side).
+    pub fn derive(checkpoint_key: &[u8], checkpoint_key_id: &str, job_id: &str) -> R<Self> {
+        let session = derive_session_seal_key(checkpoint_key, checkpoint_key_id, job_id)?;
+        Self::from_job_secret(&session.key_id, &session.key)
+    }
+
+    /// From a job's session sealing key (`<ck>/session/<job>`).
+    fn from_job_secret(session_key_id: &str, secret: &[u8]) -> R<Self> {
+        Ok(Self {
+            key_id: format!("{session_key_id}/chunks"),
+            secret: hkdf(CHUNK_KEY_SALT, secret, b"chunks")?,
+        })
+    }
+
+    /// A chunk key received from the manager with a publish.
+    pub fn from_proto(wire: &crate::structs::CheckpointChunkKey) -> R<Self> {
+        if wire.key.len() != KEY_BYTES || wire.key_id.is_empty() {
+            bail!(
+                "the chunk key {:?} is {} bytes, expected {KEY_BYTES}",
+                wire.key_id,
+                wire.key.len()
+            );
+        }
+        let mut secret = Zeroizing::new([0u8; KEY_BYTES]);
+        secret.copy_from_slice(&wire.key);
+        Ok(Self {
+            key_id: wire.key_id.clone(),
+            secret,
+        })
+    }
+
+    pub fn to_proto(&self) -> crate::structs::CheckpointChunkKey {
+        crate::structs::CheckpointChunkKey {
+            key_id: self.key_id.clone(),
+            key: self.secret.to_vec(),
+        }
+    }
+
+    pub fn key_id(&self) -> &str {
+        &self.key_id
+    }
+
+    /// The scope chunks are keyed in during dedup window `window` of
+    /// `window_secs` seconds. Chunks dedupe only inside one scope, so no
+    /// chunk is reused by a publish more than one window after it was
+    /// uploaded (docs/suspend-and-resume.md, "How published parts are
+    /// stored").
+    pub fn scope(&self, window_secs: u64, window: u64) -> R<ChunkScope> {
+        let info = format!("{window_secs}/{window}");
+        Ok(ChunkScope {
+            label: format!("{}@{info}", self.key_id),
+            secret: hkdf(CHUNK_SCOPE_SALT, self.secret.as_ref(), info.as_bytes())?,
+        })
+    }
+}
+
+/// The keys of one dedup window of one job's chunks. Its `Debug` never shows
+/// the key.
+pub struct ChunkScope {
+    /// `<chunk key id>@<window secs>/<window>`, for logs.
+    label: String,
+    secret: Zeroizing<[u8; KEY_BYTES]>,
+}
+
+impl std::fmt::Debug for ChunkScope {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ChunkScope")
+            .field("label", &self.label)
+            .finish_non_exhaustive()
+    }
+}
+
+impl ChunkScope {
+    pub fn label(&self) -> &str {
+        &self.label
+    }
+
+    /// The key of the chunk whose plaintext hashes to `digest`: a keyed
+    /// convergent key, like a part key one level down, so the same chunk
+    /// in the same scope seals to the same object.
+    pub fn chunk_key(&self, digest: &ContentDigest) -> R<PartKey> {
+        PartKey::derive(self.secret.as_ref(), "chunk", digest)
+    }
+}
+
+/// Seal `plaintext` (a chunk or a part index, at most a few MiB) under `key`
+/// in memory.
+pub fn seal_bytes(key: &PartKey, plaintext: &[u8]) -> R<Vec<u8>> {
+    let mut reader = SealingReader::new(key, plaintext, plaintext.len() as u64)?;
+    let mut out = Vec::with_capacity(sealed_len(plaintext.len() as u64) as usize);
+    reader.write_all_to(&mut out)?;
+    Ok(out)
+}
+
+/// Open a sealed object held in memory. The caller checks the plaintext
+/// against its digest.
+pub fn open_bytes(key: &PartKey, sealed: &[u8]) -> R<Vec<u8>> {
+    let actual = sealed.len() as u64;
+    let have = sealed.len().min(HEADER_BYTES);
+    let (head, chunk, plaintext_len, chunks) = parse_header(&sealed[..have], actual)?;
+    let key = key.aead_key()?;
+    let mut out = Vec::with_capacity(plaintext_len as usize);
+    let mut buf = Zeroizing::new(Vec::with_capacity(chunk as usize + TAG_BYTES));
+    let mut read_at = HEADER_BYTES;
+    for index in 0..chunks {
+        let len = chunk_len(plaintext_len, chunk, index) + TAG_BYTES;
+        buf.clear();
+        buf.extend_from_slice(&sealed[read_at..read_at + len]);
+        let plain = key
+            .open_in_place(nonce(index, index + 1 == chunks), Aad::from(head), &mut buf)
+            .map_err(|_| SealError::Authentication { chunk: index })?;
+        out.extend_from_slice(plain);
+        read_at += len;
+    }
+    Ok(out)
+}
+
+/// Check a sealed object's header against its total size `actual`. Returns
+/// the header, the chunk size, the plaintext length, and the chunk count.
+fn parse_header(head: &[u8], actual: u64) -> R<([u8; HEADER_BYTES], u64, u64, u64)> {
+    let have = head.len();
+    if have < SEAL_MAGIC.len() || &head[..SEAL_MAGIC.len()] != SEAL_MAGIC {
+        return Err(SealError::NotSealed.into());
+    }
+    if have < HEADER_BYTES {
+        return Err(SealError::Truncated {
+            expected: HEADER_BYTES as u64,
+            actual,
+        }
+        .into());
+    }
+    let head: [u8; HEADER_BYTES] = head[..HEADER_BYTES].try_into().expect("header bytes");
+    let chunk = u32::from_be_bytes(head[8..12].try_into().expect("4 bytes"));
+    if chunk == 0 || chunk > MAX_CHUNK_BYTES {
+        return Err(SealError::Unsupported(format!("chunk size {chunk}")).into());
+    }
+    let plaintext_len = u64::from_be_bytes(head[12..20].try_into().expect("8 bytes"));
+    let chunk = u64::from(chunk);
+    let chunks = chunk_count(plaintext_len, chunk);
+    let expected = (HEADER_BYTES as u64)
+        .checked_add(plaintext_len)
+        .and_then(|n| n.checked_add(chunks * TAG_BYTES as u64));
+    if expected != Some(actual) {
+        return Err(SealError::Truncated {
+            expected: expected.unwrap_or(u64::MAX),
+            actual,
+        }
+        .into());
+    }
+    Ok((head, chunk, plaintext_len, chunks))
 }
 
 /// Why a sealed object could not be opened. Each one names what happened,
@@ -572,75 +836,10 @@ impl<S: Read> Read for SealingReader<S> {
     }
 }
 
-/// Open the sealed object at `path` in place: each chunk is decrypted and
-/// written back over the ciphertext behind the read position, then the file
-/// is truncated to the plaintext. Needs no disk beyond the object itself and
-/// one chunk of memory. Returns the plaintext length.
-///
-/// The caller still checks the plaintext against its digest (the content
-/// store import does). On any error the file holds garbage and must be
-/// removed.
-pub fn open_file_in_place(key: &PartKey, path: &Path) -> R<u64> {
-    let file = fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open(path)
-        .with_context(|| format!("open {} to decrypt", path.display()))?;
-    let actual = file.metadata()?.len();
-    let mut head = [0u8; HEADER_BYTES];
-    let have = (actual as usize).min(HEADER_BYTES);
-    file.read_exact_at(&mut head[..have], 0)?;
-    if have < SEAL_MAGIC.len() || &head[..SEAL_MAGIC.len()] != SEAL_MAGIC {
-        return Err(SealError::NotSealed.into());
-    }
-    if have < HEADER_BYTES {
-        return Err(SealError::Truncated {
-            expected: HEADER_BYTES as u64,
-            actual,
-        }
-        .into());
-    }
-    let chunk = u32::from_be_bytes(head[8..12].try_into().expect("4 bytes"));
-    if chunk == 0 || chunk > MAX_CHUNK_BYTES {
-        return Err(SealError::Unsupported(format!("chunk size {chunk}")).into());
-    }
-    let plaintext_len = u64::from_be_bytes(head[12..20].try_into().expect("8 bytes"));
-    let chunk = u64::from(chunk);
-    let chunks = chunk_count(plaintext_len, chunk);
-    let expected = (HEADER_BYTES as u64)
-        .checked_add(plaintext_len)
-        .and_then(|n| n.checked_add(chunks * TAG_BYTES as u64));
-    if expected != Some(actual) {
-        return Err(SealError::Truncated {
-            expected: expected.unwrap_or(u64::MAX),
-            actual,
-        }
-        .into());
-    }
-    let key = key.aead_key()?;
-    let mut buf = Zeroizing::new(vec![0u8; chunk as usize + TAG_BYTES]);
-    let mut read_at = HEADER_BYTES as u64;
-    let mut write_at = 0u64;
-    for index in 0..chunks {
-        let len = chunk_len(plaintext_len, chunk, index);
-        let sealed = &mut buf[..len + TAG_BYTES];
-        file.read_exact_at(sealed, read_at)?;
-        let plain = key
-            .open_in_place(nonce(index, index + 1 == chunks), Aad::from(head), sealed)
-            .map_err(|_| SealError::Authentication { chunk: index })?;
-        // Always behind the read position (the header and each tag are
-        // dropped), so no unread ciphertext is overwritten.
-        file.write_all_at(plain, write_at)?;
-        read_at += (len + TAG_BYTES) as u64;
-        write_at += len as u64;
-    }
-    file.set_len(plaintext_len)?;
-    Ok(plaintext_len)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
 
     fn checkpoint_key(byte: u8) -> [u8; KEY_BYTES] {
         [byte; KEY_BYTES]
@@ -664,13 +863,7 @@ mod tests {
     }
 
     fn open(key: &PartKey, sealed: &[u8]) -> R<Vec<u8>> {
-        let dir = tempfile::tempdir()?;
-        let path = dir.path().join("part");
-        fs::write(&path, sealed)?;
-        let len = open_file_in_place(key, &path)?;
-        let plain = fs::read(&path)?;
-        assert_eq!(plain.len() as u64, len);
-        Ok(plain)
+        open_bytes(key, sealed)
     }
 
     fn pattern(len: usize) -> Vec<u8> {
@@ -863,8 +1056,9 @@ mod tests {
         assert_eq!(written, sealed_len(len));
         assert_eq!(reader.finish()?, digest);
         assert_eq!(fs::metadata(&sealed_path)?.len(), sealed_len(len));
-        assert_eq!(open_file_in_place(&key, &sealed_path)?, len);
-        assert_eq!(ContentDigest::of_file(&sealed_path)?, digest);
+        let plain = open_bytes(&key, &fs::read(&sealed_path)?)?;
+        assert_eq!(plain.len() as u64, len);
+        assert_eq!(ContentDigest::of_bytes(&plain), digest);
         Ok(())
     }
 

@@ -859,6 +859,19 @@
                     # Extra placement constraints for the envelopes, on top
                     # of the task's own `constraints`. Optional.
                     constraints = { node_class = "sandbox" },
+                    # An elastic envelope (docs/session-mode.md, "Elastic
+                    # envelopes"): `resources` above becomes the floor each
+                    # node always holds, and each node grows its envelope up
+                    # to this ceiling as its sessions fill it (when they fill
+                    # more than 90%), through the scheduler, taking only free
+                    # room. Must size exactly the keys `resources` sizes,
+                    # each at or above it. Optional; without it (or equal to
+                    # `resources`) the envelope is fixed.
+                    max = { cpu = 16000, memory = 16384 },
+                    # How long a node's sessions must use less than half of
+                    # its envelope before the node gives the room back.
+                    # Default "10m", at least "1m". Only with `max`.
+                    shrinkAfter = "10m",
                 },
                 # Whether a caller-chosen id is accepted (`instance create
                 # --id`, a keyed instance from birth; `instance promote
@@ -993,6 +1006,13 @@
                 # An ${artifact.<name>} reference works here too.
                 kernel = "/var/lib/legion/kernels/vmlinux",
                 kernel_args = "quiet",
+                # How a memory checkpoint's guest RAM comes back on a resume,
+                # snapshot restore, fork, or create from a snapshot. "lazy"
+                # (default) runs the guest first and loads each page on first
+                # touch (cloud-hypervisor needs v52+ and a userfaultfd, else it
+                # copies). "eager" reads all of it before the guest runs, for
+                # a workload that touches most of its memory right away.
+                memory_restore = "lazy",
                 # The guest's own network, for a sandbox that is not gated.
                 # This task is gated (the task-level `network` below), and
                 # submit refuses a gated sandbox with a `config.network`: a

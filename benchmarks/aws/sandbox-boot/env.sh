@@ -38,7 +38,7 @@ read -r -a SB_MANAGERS <<<"${SB_MANAGERS:-sbx-mgr-1}"
 read -r -a SB_WORKERS <<<"${SB_WORKERS:-sbx-wkr-1}"
 read -r -a SB_LOADERS <<<"${SB_LOADERS:-}"
 
-SB_CH_VERSION="v51.2"
+SB_CH_VERSION="${SB_CH_VERSION:-v51.2}"
 SB_KERNEL_RELEASE="ch-release-v6.16.9-20261001"
 
 SB_ACCOUNT="$(aws sts get-caller-identity --query Account --output text)"

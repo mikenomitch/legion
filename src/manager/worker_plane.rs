@@ -380,6 +380,11 @@ pub const ERROR_CODE_METADATA: &str = "legion-error-code";
 /// The error code for "a manager could not reach this worker".
 pub const WORKER_UNREACHABLE: &str = "WORKER_UNREACHABLE";
 
+/// The error code for "this node is shedding edge starts": its window of
+/// unratified edge claims stayed full (docs/edge-boot.md, "Overload").
+/// Carried on a retryable `RESOURCE_EXHAUSTED`.
+pub const OVERLOADED: &str = "OVERLOADED";
+
 /// The node attribute (in its dynamic attributes) a probe's outcome lands
 /// in.
 pub const WORKER_PLANE_ATTR: &str = "workerPlane";

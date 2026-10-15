@@ -557,7 +557,7 @@ How to use it:
 
 | PR | What it lands | Notes |
 | --- | --- | --- |
-| [#43](https://github.com/mikenomitch/legion/pull/43) | Sandbox boot throughput: cloud-hypervisor boots once (raw disks, `hvc0`), `running` on guest readiness, `stateful.placement`, the base root disk cache, the session router and worker start/stop paths off the lock, per-stage start timings, and the real-KVM sandbox-boot rig | [plan](plans/sandbox-boot-throughput-plan.md) · [calls](calls/sandbox-boot-throughput-plan_calls.md) · [results](../benchmarks/aws/sandbox-boot/RESULTS.md); stacks three of the fifteen `perf/*` branches |
+| [#45](https://github.com/mikenomitch/legion/pull/45) | The remaining `perf/*` branches stacked on main: lazy memory restore, chunked checkpoints on the work stream, elastic session envelopes, edge admission control, ratification without epoch fences, the keyed bind index and fused eval settles, and the worker lock fixes. Plus what the AWS rig found: non-blocking server console logs, `speculativeStart` on the dispatch, followers answering ratifications with not-leader, the settle window for a just-ratified claim, and an edge start's own instance identity | [results](../benchmarks/aws/sandbox-boot/RESULTS.md) · [sandbox boot calls](calls/sandbox-boot-throughput-plan_calls.md) · [ratify calls](calls/edge-ratify-throughput-plan_calls.md). The 5 s restore wait is open below |
 | [#36](https://github.com/mikenomitch/legion/pull/36) | Session durability, routing, and edge starts, Phases 1–4 (concurrent node starts, `sessions.db` re-adopt, node tag in session ids and tag routing, session tickets, `Worker.StartSession`, `ListSessionNodes`, `legion session`), the session UI pass, and the sandbox spot-check and bottleneck-measurement plans. Phase 5 in progress | [plan](plans/session-durability-and-routing-plan.md) · [calls](calls/session-durability-and-routing-plan_calls.md) |
 | [#30](https://github.com/mikenomitch/legion/pull/30) | Sandbox scaling Phases 4–6: untombstoned 130-bit minted ids, `suspend.archive`, `stateful.mode = "session"` and `legion instance promote` | [plan](plans/sandbox-scaling-plan.md) §16 · [calls](calls/sandbox-scaling-plan_calls.md); sessions ship without idle sessions, identity, or a session log (calls #18) |
 | [#7](https://github.com/mikenomitch/legion/pull/7) | Read model follows SQLite in every mode: shadow check, `local_disk` changeset projection, outside-write guard, timed scrub | Bench needs a quiet-machine rerun; [plan](plans/read-model-coherence-plan.md) |
@@ -1169,6 +1169,36 @@ How to use it:
       placements per plan entry (sandbox placements average 1.09 plans per
       entry, one eval each), a cheaper capture (each write executes twice,
       once to capture and once to apply), or a pipelined lane.
+      **More placements per plan entry, tried (2026-10-14):** one running
+      eval per job folds a one-job burst into fewer plans, but on one host
+      it changed no burst's wall time, so it is not merged
+      ([plan](plans/multi-eval-plans-plan.md) §12 ·
+      [calls](calls/multi-eval-plans-plan_calls.md) #1). What did ship is
+      one fewer entry for submit, update, and scale-out evals.
+      **Profiled (2026-10-13):** the largest piece of the capture was one
+      statement, the keyed bind inside the plan apply, which scanned every
+      instance of the job and rebuilt a temporary B-tree of every
+      allocation of the config on every placement. It now reads live keyed
+      rows from two indexes
+      ([plan](plans/scheduler-lane-entry-cost-plan.md) Phase 1 ·
+      [calls](calls/scheduler-lane-entry-cost-plan_calls.md) ·
+      [docs](../docs/sandboxes-at-scale.md#limits-to-know-about)). Still
+      open, each designed in that plan:
+  - [ ] **Pipeline the lane** (plan §6.2): capture entry N+1 over an
+        overlay of the in-flight entries while N commits, with a
+        capture-term check at apply. Gated on auditing which capture bodies
+        read the read pool or the read model, which do not see an
+        in-flight entry (`stop_keyed_instance_apply` reads its instance
+        through `get_instance`), and on a three-voter measurement.
+  - [ ] **One fsync per entry, not two** (plan §6.3): the state DB runs
+        `synchronous = FULL` in raft mode only to keep the applied marker
+        ahead of the log's purge horizon. `NORMAL` plus a startup restore
+        from the local snapshot would drop one fsync per entry. Needs a
+        Linux fsync measurement and a power-cut test.
+  - [ ] **A keyed bind still visits every live instance of the task**
+        (plan §11), two index lookups each, so a task with tens of
+        thousands of running instances pays milliseconds per placement.
+        Parked instances are free.
 - [ ] **Fused top-k candidate scoring.** Ranked candidate lists materialize a
       scored vector per placement; the one-candidate path (`plan_candidates:
       0`) uses the fused argmax loop that does not. A fused top-k loop would
@@ -1178,15 +1208,16 @@ How to use it:
 - [ ] Edge boot follow-ups — the feature shipped (phases 1–4;
       [plan](plans/edge-boot-plan.md) · [docs](../docs/edge-boot.md) ·
       [calls](calls/edge-boot-plan_calls.md)); these are what it left open.
-  - [ ] **`edgeBoot.maxProvisionalPerNode` is parsed but enforced nowhere.**
-        The manager config accepts it and docs/edge-boot.md shows it, but the
-        value never leaves `ManagerConfigFull`: nothing mirrors it onto a
-        dispatch or heartbeat, so `LocalLedger::set_max_provisional`
-        (`src/worker/claims.rs`) has no production caller and a node's cap is
-        always 0 (unlimited). Wire it to the worker (a heartbeat-reply or
-        dispatch field) or drop the knob and its docs. Found in the
-        2026-10-12 AWS spot check's config audit, alongside `edgeBoot` never
-        reaching the manager service at all (fixed).
+  - [ ] **The node's resource ledger is never configured in production.**
+        `WorkerTaskManager::configure_ledger` has only test callers, so
+        `LocalLedger` runs with no capacity and admits every edge claim:
+        verification step 7 in [edge-boot.md](../docs/edge-boot.md) checks
+        against infinite room. Committed allocations are not recorded in it
+        either (only ratified claims are, and never released). Configure it
+        from the node's declared resources and track every allocation's
+        start and stop, or drop the step. The claim window now bounds how
+        many edge claims a node admits
+        ([plan](plans/edge-admission-control-plan.md) §5.3).
   - [ ] **Phase 0's measurement matrix was never run.** The start-path
         breakdown (submit → eval claim → plan → apply → dispatch → prepare →
         boot → first byte) in both persistence modes, cold and warm image,
@@ -1211,9 +1242,22 @@ How to use it:
         Today every non-node-local driver downgrades the gate to `stage`.
   - [ ] Island mode: bounded survival of unratified work across a
         control-plane outage, with its own consistency argument (plan phase 5).
-  - [ ] Ticket pre-distribution and bulk minting for warm fleets, and
-        ratification batching for a node starting many claims per second
-        (plan phase 5).
+  - [ ] Ticket pre-distribution and bulk minting for warm fleets (plan
+        phase 5). Per-node ratification batching was evaluated and deferred:
+        once ratifications stopped refusing each other, one node's claims
+        already share group-commit entries, and RPC batching would not
+        shrink the entry
+        ([ratify throughput plan](plans/edge-ratify-throughput-plan.md) §8,
+        [calls #6](calls/edge-ratify-throughput-plan_calls.md)).
+  - [ ] **Forward `RatifyClaim` on the manager side.** A follower answers a
+        ratification with `FailedPrecondition` ("not the raft leader"), and
+        only the worker's ratifier (`ManagerClaimRatifier` in
+        `src/worker/daemon.rs`) knows to try the other managers. A CLI or
+        third-party caller has to find the leader itself. Fail with the
+        typed not-leader status that carries `x-legion-raft-leader`, so the
+        existing `leader_forward` layer proxies it, and keep the node's
+        leader cache for the one-hop path
+        ([calls #2](calls/edge-ratify-throughput-plan_calls.md)).
   - [ ] A pre-warm push for the worker spec cache. A node today caches a task
         config once it has been dispatched an allocation of it, so an edge pool
         must run at least one allocation of a job before a ticket for it can be
@@ -1236,40 +1280,51 @@ How to use it:
   - [ ] **Ratification throughput at scale.** An edge start boots without a
         manager, but every start still needs one durable ratification
         (`ratify_claim` in `src/manager/server.rs` → `edge_boot::ratify`),
-        and that caps sustained sandboxes/sec. Nothing here is measured for
-        edge boot yet. The estimates come from the 2026-10-10 AWS scheduler
-        runs (3 × 4-vCPU managers), where the plan-commit lane took 9.2 /
-        13.5 / 23.3 ms per commit at 5k / 20k / 50k nodes. Do the load test
-        first so every later change has a before/after number. Broader than
-        the phase-5 "ratification batching" item above, which is per node.
-    - [ ] **Ratification load test (do first).** A `legion-loadgen` mode that
-          mints prefix tickets and drives `RatifyClaim` at a fixed open-loop
-          rate (reuse `--rate`) against `--simulate` nodes. Report ratify
-          p50/p99, confirmed vs refused by reason, coalescer batch size and
-          commit time on the lanes involved, and the rate where p99 crosses
-          `ratifyTimeout`. Numbers go in `benchmarks/scheduler/README.md`.
-    - [ ] **Let ratifications fill commit batches.** Ratifications go through
-          `submit_and_apply_plan_for_instance` → the plan coalescer, capped by
-          `plan_apply_batch_max` (default 16, clamped 1..=128). Evals fill
-          ~1.75 per batch, but ratifications arrive from thousands of nodes at
-          once, so 16 may be the cap: ~1,700 / 1,200 / 700 per sec at 5k / 20k
-          / 50k nodes, against ~14,000 / 9,500 / 5,500 at 128 if commit cost
-          held (it will not fully, since bigger batches commit slower).
-          Measure 16 / 64 / 128 and pick the default, or a separate
-          ratification cap, from data. Record the call.
-    - [ ] **Backpressure before lease expiry.** Unratified work is killed at
-          `ratifyTimeout` (default 5s, `DEFAULT_RATIFY_TIMEOUT` in
-          `src/structs/edge_boot.rs`). If ratify latency climbs past that,
-          booted sandboxes die and get retried, adding load at the worst
-          time, and nothing stops nodes admitting new edge starts meanwhile.
-          Refuse early instead: a typed, retryable `overloaded` refusal,
-          from the manager when ratify queue latency passes a fraction of the
-          lease, or from nodes tracking their own recent ratify latency. It
-          must reach `legion sandbox start` as `retryable: true`, with a
-          metric for overload refusals and a failure-mode section in
-          [edge-boot.md](../docs/edge-boot.md). Test that new claims are
-          refused before boot above the threshold, in-flight claims are not
-          killed early, and admission resumes when latency drops.
+        and that caps sustained sandboxes/sec. Phase 1 of the
+        [ratify throughput plan](plans/edge-ratify-throughput-plan.md)
+        measured it in-process and removed the false conflicts that made
+        concurrent ratifications refuse each other (Done, below). What is
+        left needs a real cluster.
+    - [ ] **Networked ratification load test.** A `legion-loadgen --mode
+          ratify` that mints prefix tickets and drives `RatifyClaim` at a
+          fixed open-loop rate (reuse `--rate`) from `--simulate` nodes, each
+          with its own node token, against a 3-voter raft cluster on the AWS
+          rig. Report the rate where p99 crosses `ratifyTimeout`. Needs the
+          simulated fleet to expose per-node credentials. The in-process
+          harness (`tests/ratify_throughput_measure.rs`) is the ceiling it
+          should approach ([plan](plans/edge-ratify-throughput-plan.md)
+          Phase 3).
+    - [ ] **Profile the per-ratification apply.** With the false conflicts
+          gone, the confirmed rate is flat from 64 to 256 callers while
+          entries grow from about 20 to about 60 claims, so the bound is the
+          serialized work each ratification does inside the entry (about
+          2 ms of manager CPU per claim on an M5 laptop). Find where it goes
+          before touching the cap or batching
+          ([plan](plans/edge-ratify-throughput-plan.md) §8, §11).
+    - [ ] The worker never retries a refused ratification, `internal`
+          included: `drive_claim` applies every refused verdict as a kill.
+          The refusal table in [edge-boot.md](../docs/edge-boot.md) used
+          to say `internal` is retried inside the lease, and now says it is
+          not. After the ratify throughput work, `internal` means a store
+          error or an election rather than a false conflict, so this is
+          rare. The `OVERLOADED` shed from edge admission control refuses
+          before boot, so it did not need this loop. Add the retry if
+          `internal` refusals turn out not to be rare.
+    - [ ] **Managers stop speculating when their apply is slow** (edge
+          admission control [plan](plans/edge-admission-control-plan.md)
+          Phase 2). The node's claim window sheds edge starts only. A
+          manager-originated speculative claim whose plan apply outlives its
+          lease still dies on the node, and its committed allocation boots
+          again later. `dispatch_speculative` should skip speculation while
+          recent apply latency passes a fraction of the task's lease.
+    - [ ] **Ratifications carry their deadline** (edge admission control
+          [plan](plans/edge-admission-control-plan.md) Phase 3). The
+          `RatifyClaim` handler is synchronous, so a ratification its node
+          already killed at the lease is still committed when the manager
+          reaches it. That binds the instance to a dead claim, and the
+          router's retry gets `instance_claimed` until reconcile clears it.
+          Put the claim's remaining lease on `RatifyClaimRequest` and refuse
+          `expired` without committing.
     - [ ] Plan-commit cost growing with fleet size caps ratification the
           same way it caps scheduling. Fix it once, under "Make plan-commit
           cost flat in fleet size" in Scheduling & placement, and make the
@@ -2005,29 +2060,58 @@ Plans: [task-runtime-plugins](../docs/task-runtime-plugins.md).
       ([plan](plans/sandbox-boot-throughput-plan.md) ·
       [calls](calls/sandbox-boot-throughput-plan_calls.md) ·
       [results](../benchmarks/aws/sandbox-boot/RESULTS.md)):
-  - [ ] **A node boots about 50 sandboxes a second at most, whatever its
-        size** (plan phase 4, calls 13). A 96-vCPU c5.metal booted 1,000 at
-        48 a second with its CPUs about 90% idle: starts waited in
-        `register` (the task-manager lock, up to 1.8 s) and `vmm_spawn` (up
-        to 2.6 s). Kernel samples still show page-table copying
-        (`copy_present_ptes`) on launch threads after the `posix_spawn`
-        change, unexplained. Next: a metal run with a frame-pointer build and
-        lock hold-time instrumentation. Suspects are per-start cgroup
-        creation and removal under the lock, the supervisor's per-tick work
-        over every instance, and memory-map lock contention in the worker.
+  - [x] **The worker's lock under churn** (plan phase 4, calls 14). A
+        frame-pointer build with per-call-site lock timing on a c5.metal
+        found the task-manager lock busy 60 to 80% of the time at 250
+        starts a second: `assign` rewrote the share slice's `cpuset.cpus`
+        and created the cgroup leaf under the lock, and the supervisor
+        destroyed stopped VMMs under it. The leaf is now created in the
+        unlocked launch, the slices are set up once, a session's reap runs
+        its destroy and cgroup removal off the lock, a removed allocation
+        directory is renamed aside and deleted by a janitor thread, and a
+        start's log-sink manifest and stage line are written after the
+        lock is released. The lock is busy about 20% of the time at the
+        same rate ([results](../benchmarks/aws/sandbox-boot/RESULTS.md#bare-metal-second-campaign-2026-10-14)).
+  - [ ] **A large node is bound by its root disks** (plan phase 4, calls
+        13). A 96-vCPU node sustains about 150 boots a second with worker
+        state on EBS (out of IOPS) and about 200 on RAM-backed XFS, where
+        `root_disk` reaches 1.3 s at the median under 300 offered a second
+        (3 ms alone), with a quarter of the CPU idle. Each start reflinks
+        the image's one base file and has `debugfs` write the sandbox's
+        files into the clone, and the clones' copy-on-write allocations
+        meet in XFS's buffer and inode locks. Dropping `debugfs`'s fsync did
+        not move the ceiling. Next: write the per-sandbox files without
+        touching shared extents (for example a small per-sandbox payload
+        disk, or a preallocated payload file written in place), or spread
+        clones over several copies of the base, then measure again. Also
+        measure on a node type with local NVMe.
   - [ ] **Firecracker and TAP sandboxes are not measured.** The rig ran
         cloud-hypervisor guests with no NIC. A TAP guest's start adds `ip`
         calls that take the kernel's `rtnl` lock, which Modal found to
         dominate their tail at high start rates. The Firecracker run (the
         same sequential, burst, and sustained cases, about an hour and $1)
         decides whether `auto` should prefer it for sandboxes that need
-        neither cross-data-dir restores nor a boot log (calls 14,
+        neither cross-data-dir restores nor a boot log (calls 15,
         [docs](../docs/task-runtime-sandbox.md#choosing-a-vmm)).
   - [ ] **`perf/lazy-memory-restore` is unmeasured** (pushed, 7e93ebb8).
         On-demand memory restore needs cloud-hypervisor v52+. The rig ran
         v51.2. Its restore matrix (1, 4, 8 GiB, lazy vs eager, v51 to v53 and
         Firecracker, suspend and fork right after a lazy resume) is the next
         run, on a box with 32 GiB or more.
+  - [ ] **Every sandbox restore waits 5 s for an egress proxy socket**, and
+        that hides lazy against eager. Before it resumes a restored guest,
+        the node waits up to `DATAPATH_WAIT` (5 s, `sandbox_checkpoint.rs`)
+        for the datapath's proxy socket. Every guest has a vsock, so every
+        checkpoint records gated networking, and a guest that is not gated
+        never gets the socket. On main already. Measured on
+        cloud-hypervisor v53.0 with a 2.4 GB checkpoint (2 GiB guest, 900
+        MiB touched, `jobs/restore-vm-{lazy,eager}.ncl`): `restore_ms`
+        about 5,040 for both modes, a 5.0 s resume end to end against
+        15.6 s on main's worker
+        ([results](../benchmarks/aws/sandbox-boot/RESULTS.md#memory-restore-2026-10-14)).
+        Same root cause as the "non-gated sandbox waits the full 5s" item
+        under the spot-check rerun above. Derive the wait from the
+        allocation's network mode, then rerun the lazy and eager cells.
   - [ ] **Parallel branches not stacked** (calls 1), each still an
         uncommitted diff in its worktree unless noted: `sandbox-warm-pool`
         and `edge-prewarm` (warming, against the pre-warm stance until the
@@ -2226,13 +2310,10 @@ Plans: [task-runtime-plugins](../docs/task-runtime-plugins.md).
         (loadgen session mode, sessions in `--simulate`, a fixed-delay fake
         launch, sessions.db and ticket-cache benches, a real-runtime
         restore loop).
-  - [ ] **Suspend and resume still wait on heartbeats.** Checkpoint
-        requests and reports ride the heartbeat, so a suspend takes ~3 s and
-        a resume ~2 s at p50 on the default 2 s cadence, while placements
-        land in one round trip. Put checkpoint requests on the `StreamWork`
-        stream and reports on a prompt path; Phases 5 and 7's resume and
-        wake targets assume it
-        ([plan §14.6](plans/sandbox-scaling-plan.md#146-what-the-results-change-in-later-phases)).
+  - [ ] **Retried publishes are not pushed.** A failed publish becomes work
+        again when its `publish_retry_at` passes, with no row change, so the
+        node picks it up on its next heartbeat rather than over the stream
+        ([calls](calls/checkpoints-on-stream-plan_calls.md) #7).
   - [ ] **Edge-boot provisional deltas on the stream.** Speculative dispatch
         still pushes with `PostWork` and the verdict arrives on the
         `RatifyClaim` reply
@@ -2241,10 +2322,20 @@ Plans: [task-runtime-plugins](../docs/task-runtime-plugins.md).
         events.** Only registration, node changes, readiness, and freed
         allocations wake today
         ([calls](calls/sandbox-scaling-plan_calls.md) #42).
-  - [ ] **Arm the fused settle in more handlers.** Only `job_reschedule`
-        without a batch follow-up settles inside its plan; `job_submit`,
-        `job_update`, and `job_scale` still settle in a separate entry
-        ([calls](calls/sandbox-scaling-plan_calls.md) #23).
+  - [ ] **Measure one running eval per job where the lane is the
+        limit.** Built in the `perf/multi-eval-plans` worktree and left out:
+        locally a plan applies in under 2 ms, so a burst at any real arrival
+        gap never piles up and there is nothing to fold. Run the rig's
+        keyed `ladder` cells with that build against this one, and merge it
+        only on a measured gain. Phase 3 (settling evals a running plan
+        already covered) waits behind it
+        ([plan](plans/multi-eval-plans-plan.md) §12,
+        [calls](calls/multi-eval-plans-plan_calls.md) #1 and #8).
+  - [ ] **A resubmit and a scale-in still settle in a separate entry.** The
+        fused settle is armed in `job_submit` only for a job's first config
+        and in `job_scale` only for a scale-out, because their trailing
+        writes (the previous config's removal, the capacity pass) follow the
+        plan ([calls](calls/multi-eval-plans-plan_calls.md) #5).
   - [ ] **Rollout ticks and node-scoped passes do not block.** They keep the
         old terminal outcome when nothing fits
         ([calls](calls/sandbox-scaling-plan_calls.md) #41).
@@ -2308,6 +2399,24 @@ Plans: [task-runtime-plugins](../docs/task-runtime-plugins.md).
   - [ ] **Batch session creates.** `CreateInstance` with `count` is refused
         on a session task ([calls](calls/sandbox-scaling-plan_calls.md)
         #57).
+  - [ ] **Elastic envelopes: preemptible elastic room.** An envelope that
+        grew holds the extra room until its sessions use less than half of
+        it for `shrinkAfter`; a higher-priority placement can only preempt
+        the whole envelope, not its grown part
+        ([plan](plans/elastic-session-envelopes-plan.md) Phase 2,
+        [calls](calls/elastic-session-envelopes-plan_calls.md) #5).
+  - [ ] **Elastic envelopes: a job update starts each new envelope at its
+        floor.** The node grows it on its next heartbeat, but sessions can
+        hold more than the new envelope until then, and a placement in that
+        window can overcommit the node. Carry the old envelope's size into
+        its replacement
+        ([calls](calls/elastic-session-envelopes-plan_calls.md) #6).
+  - [ ] **Elastic envelopes on a real fleet.** Phase 1 is tested on fake
+        nodes against a single-voter raft store and in a simulated diurnal
+        day of the node controller. Not run on real workers, through a
+        follower's forwarded write on a multi-manager cluster, or in a
+        fleet-wide burst where every node grows in the same heartbeat
+        ([plan](plans/elastic-session-envelopes-plan.md) Phase 3).
   - [ ] **Phase 5's 10^6 acceptance run, and archive in the op-count
         test.** Archiving was tested at 20 instances
         (`tests/archive_integration.rs`, local store); plan §13's 10^6
@@ -2834,9 +2943,12 @@ Plans: [task-runtime-plugins](../docs/task-runtime-plugins.md).
     - [ ] cloud-hypervisor forks get their TAP through a rewritten
           `config.json`. If a cloud-hypervisor version restores net devices
           from `state.json` instead, switch to `net_fds` on restore.
-    - [ ] cloud-hypervisor forks share no memory pages (it copies memory on
-          restore). Try `memory_restore_mode=ondemand` once lazy memory
-          (Phase 8) lands.
+    - [ ] cloud-hypervisor forks share no memory pages. Lazy memory restore
+          now uses `memory_restore_mode=ondemand`, but that copies each page
+          into each guest's own RAM (`UFFDIO_COPY`), so forks still share
+          nothing. Sharing needs `memory_restore_mode=copyonwrite`, which is
+          on cloud-hypervisor `main` and not in a release as of v53
+          ([lazy memory plan](plans/lazy-memory-restore-plan.md) Phase 4).
     - [ ] Guest addresses are copied into forks: a static IP collides on the
           bridge. Now stated up front in the fork docs and the agent
           sandboxes guide. Reassign addresses in the resume handler (DHCP
@@ -2985,14 +3097,23 @@ Plans: [task-runtime-plugins](../docs/task-runtime-plugins.md).
           manifest's `keyId` names them. Shares its reference count with
           published-part GC below
           ([calls 8](calls/checkpoint-encryption-plan_calls.md#8-manual-checkpoint-key-rotation-is-deferred-with-keyid-in-the-manifest-now)).
-    - [ ] Seal chunks of one large part in parallel. Sealing is one core per
-          part today, which is faster than any S3 upload but would matter on
-          a fast `file://` mount
-          ([calls 6](calls/checkpoint-encryption-plan_calls.md#6-publishing-hashes-while-it-seals-with-ring-replacing-the-separate-verify-pass)).
-    - [ ] Decrypt published parts as they stream in, instead of downloading
-          the ciphertext and opening it in place, to save a disk pass on
-          large fetches
-          ([calls 7](calls/checkpoint-encryption-plan_calls.md#7-fetch-opens-the-object-in-place-instead-of-streaming-through-the-fetcher)).
+    - [ ] A restore fetches every non-zero chunk of a part it lacks, even
+          when the node holds an earlier checkpoint of the same session or
+          another sandbox of the image. Keep a node-local chunk index and
+          copy held chunks instead, and keep released checkpoint parts as
+          evictable cache rather than deleting them at once
+          (`release_owner_pins`), so a session moving back to a node fetches
+          only what changed
+          ([chunked publish plan Phase 2](plans/chunked-checkpoint-publish-plan.md#8-implementation-phases),
+          [calls 8](calls/chunked-checkpoint-publish-plan_calls.md#8-a-restore-still-fetches-every-non-zero-chunk)).
+    - [ ] A publish rehashes the whole part even when one page changed. On
+          Firecracker, use the dirty bitmap to reuse clean chunks' digests
+          ([chunked publish plan Phase 3](plans/chunked-checkpoint-publish-plan.md#8-implementation-phases)).
+    - [ ] Measure chunked publish and fetch against a real MinIO and S3
+          bucket, and memory dirtiness on real Firecracker and
+          cloud-hypervisor guests. The chunk numbers so far come from a QEMU
+          TCG guest and the `file://` store
+          ([calls 4](calls/chunked-checkpoint-publish-plan_calls.md#4-the-default-chunk-size-is-1-mib)).
     - [ ] Measure sealed publish and fetch against a real MinIO in the Phase
           7b Linux checks (above), next to the plaintext numbers.
     - [ ] Hash the node content store with `ring` (imports, `verify`,
@@ -3002,7 +3123,10 @@ Plans: [task-runtime-plugins](../docs/task-runtime-plugins.md).
           ([calls 6](calls/checkpoint-encryption-plan_calls.md#6-publishing-hashes-while-it-seals-with-ring-replacing-the-separate-verify-pass)).
     - [ ] Garbage-collect published parts: Legion never deletes from the
           content store (call 62). A reference-counted sweep, or document a
-          lifecycle-rule recipe per provider. Spent spread-fork checkpoints
+          lifecycle-rule recipe per provider. Chunked publishing makes an
+          age rule of "longest-lived checkpoint plus `dedupWindow`" safe
+          ([calls 2](calls/chunked-checkpoint-publish-plan_calls.md#2-chunks-dedupe-per-job-and-per-dedup-window-not-cluster-wide)),
+          so a sweep is now about cost, not safety. Spent spread-fork checkpoints
           add to this: their node copy is reclaimed
           ([call 83](calls/suspend-resume-and-oversubscription-plan_calls.md)),
           their published parts are not.
@@ -3163,6 +3287,46 @@ Plans: [task-runtime-plugins](../docs/task-runtime-plugins.md).
           renumbered.
   - [ ] Phase 8: fast paths, each needing its own review (wake on connect,
         `hint` idle signal, UFFD lazy memory, diff snapshots). Deferred.
+    - [x] Lazy memory restore, Phase 1, in flight in the "lazy memory
+          restore" PR: restores trust the content store's digest instead of
+          rehashing every part, cloud-hypervisor v52+ restores on demand
+          (`memory_restore_mode=ondemand`), Firecracker `eager` reads the
+          memory file ahead, the first resume after a cloud-hypervisor
+          `--restore` waits for the restore instead of failing at 10 s, and
+          `config.memory_restore = "lazy" | "eager"` (default `lazy`).
+          [plan](plans/lazy-memory-restore-plan.md) ·
+          [calls](calls/lazy-memory-restore-plan_calls.md) ·
+          [docs](../docs/task-runtime-sandbox.md#how-memory-comes-back)
+    - [ ] Run the lazy memory KVM checks
+          ([plan §9](plans/lazy-memory-restore-plan.md#9-testing-plan)):
+          `restore_ms` at 1, 4, and 8 GiB on both VMMs and cloud-hypervisor
+          v51 to v53, lazy against eager, a touch-all workload after the
+          resume, and the no-userfaultfd fallback. Nothing in Phase 1 ran on
+          a real VMM. Put the measured numbers in the "Restore time"
+          paragraph of
+          [How memory comes back](../docs/task-runtime-sandbox.md#how-memory-comes-back).
+          If an on-demand restore fails where the userfaultfd probe said
+          yes, add a one-time copy retry gated on the VMM exiting before the
+          resume ([calls #4](calls/lazy-memory-restore-plan_calls.md)).
+    - [ ] Lazy memory Phase 2: start a published restore while its memory
+          streams from the bucket (each part is an index of separately
+          sealed chunks since chunked publish, so a page server can fetch
+          the chunk a fault needs). Today every part is fetched whole
+          before the restore starts.
+    - [ ] Lazy memory Phase 3: record each guest's post-resume working set
+          and prefetch it on the next restore (REAP), the fix for the
+          post-resume fault cost of lazy restore.
+    - [ ] Nothing rescans node content store blobs now that a restore no
+          longer rehashes snapshot parts. Decide whether a background scrub
+          belongs in the store ([plan](plans/lazy-memory-restore-plan.md)
+          open question 2).
+    - [ ] Content store hashing runs in software on aarch64 workers:
+          Legion builds `sha2` without its `asm` feature, which is what
+          turns on the ARMv8 SHA-256 instructions there (about 2 CPU-seconds
+          per GiB, measured). Every capture, import, and fetch check pays
+          it. `ring`'s SHA-256, already a dependency, uses the hardware on
+          both aarch64 and x86_64 and would remove it without a new crate
+          ([plan §1](plans/lazy-memory-restore-plan.md#1-problem-statement)).
 - [ ] Split a task runtime's implementation into parts — isolation vs. runner vs.
       artifact consumption? (idea, needs a plan). The container-runtime plan's
       `resource_enforcement()` interface carves off the first slice of this —
@@ -3180,7 +3344,11 @@ Plans: [task-runtime-plugins](../docs/task-runtime-plugins.md).
       restores (a resume, fork, or `RestoreInstance` start; they record their
       outcome on the checkpoint channel from inside the locked start, see
       `begin_task_allocation` and `spawn_staging_thread` in
-      `src/worker/task_manager.rs`). `heartbeat_tick`
+      `src/worker/task_manager.rs`). A memory restore no longer rehashes
+      every part under the lock, and a lazy one (the default) holds it for
+      about the same time at any guest size, but an `eager` one still holds
+      it for the whole memory read
+      ([lazy memory plan](plans/lazy-memory-restore-plan.md)). `heartbeat_tick`
       also locks a std mutex from async code. Teardown needs a "tearing down"
       state so starts still wait behind stops. [calls #11](calls/architecture-audit-2026-10-09_calls.md).
       The node-check readiness probe (`container system status`) moved off
@@ -3325,12 +3493,13 @@ Plans: [stateful-workloads](plans/stateful-workloads-and-instance-identity-plan.
         other start, stop, and heartbeat on the node. Sampled with
         `/usr/bin/sample` on a worker under `legion-loadgen --mode
         sessions`.
-  - [ ] A session resuming from a checkpoint still boots under the
-        task-manager lock: the restore records its outcome on the
-        checkpoint channel from inside the locked start, so several resumes
-        on one node run one at a time and hold up its heartbeat
-        ([calls](calls/session-durability-and-routing-plan_calls.md) #45,
-        `begin_task_allocation_gated` in `src/worker/task_manager.rs`).
+  - [x] A session or instance resuming from a checkpoint boots off the
+        task-manager lock, like any other start, and the launch's finish
+        records the outcome on the checkpoint channel. Several resumes on a
+        node now run side by side, and a cloud-hypervisor that hangs
+        mid-restore holds one launch slot, not the node
+        ([calls](calls/lazy-memory-restore-plan_calls.md) #7,
+        `UnlockedLaunch` in `src/worker/task_manager.rs`).
   - [x] Phase 5a: sessions sleep on their own node with `durability =
         "local"`: `suspend.keepFor`, idle suspend, `Worker.SuspendSessions`
         / `Worker.ResumeSession` routed by tag from `instance suspend` /
@@ -3651,6 +3820,14 @@ Phases 1 and 2 shipped (see Done, KV & secrets).
 
 Plans: [persistence-plan.md](plans/persistence-plan.md), [multi-raft-persistence-plan.md](plans/multi-raft-persistence-plan.md), [manager-workload-identity-plan.md](plans/manager-workload-identity-plan.md) · docs: [state-store.md](../docs/state-store.md), [raft-operations.md](../docs/raft-operations.md), [persistence-streaming.md](../docs/persistence-streaming.md)
 
+- [ ] **A newer binary cannot read an older binary's persisted proto JSON.**
+      Proto structs derive serde with no field defaults (`build.rs`), so a
+      field added to a message makes every file written before it fail to
+      parse. Seen on the AWS rig as `missing field envelopeResources`
+      reading `netd_state.json` after a worker upgrade. Any on-disk file
+      that stores a proto struct as JSON has the same problem. Add a
+      container-level `#[serde(default)]` for proto messages, and a test that
+      parses a fixture written without a newer field.
 - [ ] **A manager with no raft leader holds a read instead of failing it.**
       In the AWS spot check, with the leader's raft core dead, `legion job
       list` hung with no reply. The CLI now gives up at its 30s request
@@ -4041,6 +4218,11 @@ Plan: [auth-acl-plan.md](plans/auth-acl-plan.md) · docs: [auth-and-acls.md](../
 docs: [observability.md](../docs/observability.md), [logging.md](../docs/logging.md), [event-stream.md](../docs/event-stream.md)
 
 - [ ] A trace viewer in the UI (make it dev-only at first)
+- [ ] **Count the console lines a server drops.** Server console logs go
+      through a lossy non-blocking writer (Done, below), and a line dropped
+      under backpressure leaves no trace. Expose `tracing-appender`'s
+      dropped-line count as a metric, or log a summary line when lines were
+      dropped ([calls #3](calls/sandbox-boot-throughput-plan_calls.md)).
 - [x] Metrics endpoint and health probes — Prometheus `/metrics`, `/healthz`,
       `/readyz` ([docs/metrics.md](../docs/metrics.md), [#137](https://github.com/mikenomitch/legion/pull/137)).
 - [x] Worker-side `/metrics` + OTLP metrics push (2026-07-30): opt-in
@@ -4712,6 +4894,25 @@ Deferred from [operator-ui-gaps-plan.md](plans/operator-ui-gaps-plan.md):
 
 docs: [scheduler-and-eval-loop.md](../docs/scheduler-and-eval-loop.md), [jobs-tasks-and-scheduling.md](../docs/jobs-tasks-and-scheduling.md)
 
+- [x] **Elastic session envelopes, Phase 1.** `stateful.envelope.max` and
+      `shrinkAfter`: each node grows its session envelope toward the
+      ceiling as its sessions fill it and shrinks it after they drain, one
+      scheduler-lane entry per resize on the envelope's own allocation row,
+      taking only free room, with the node capping its own admission
+      before a shrink. A fixed envelope stays the default
+      ([plan](plans/elastic-session-envelopes-plan.md),
+      [calls](calls/elastic-session-envelopes-plan_calls.md),
+      [docs](../docs/session-mode.md#elastic-envelopes)).
+- [x] **Submit, update, and scale-out evals settle with their plans**
+      (2026-10-14, [plan](plans/multi-eval-plans-plan.md) Phase 2 ·
+      [calls](calls/multi-eval-plans-plan_calls.md) ·
+      [docs](../docs/scheduler-and-eval-loop.md)). The fused settle is
+      armed in `job_submit` (first config), `job_update`, and `job_scale`
+      (scale-out), so each costs one entry fewer
+      (`tests/raft_job_eval_ops.rs`). A partial plan no longer settles its
+      eval, which closes a lost-follow-up window `job_reschedule` had, and
+      a settled eval is no longer written a second time by its batch's
+      settle.
 - [x] **The planner's node universe truncated to one slice at rig scale —
       root-caused and fixed** (2026-09-21,
       [findings](aws-phase5-findings.md#open-in-priority-order),
@@ -5263,6 +5464,21 @@ docs: [task-runtime-plugins.md](../docs/task-runtime-plugins.md)
       open in place on fetch. Plaintext leftovers, tampering, wrong keys,
       and missing or locked keys each fail by name. Open follow-ups are under
       the suspend item in Task runtimes.
+- [x] **Published checkpoints are chunked and deduplicated**: every part is
+      cut into fixed-size chunks (`contentStore.chunkSize`, 1 MiB), each
+      distinct non-zero chunk is sealed and uploaded once per job and dedup
+      window (`contentStore.dedupWindow`, 24h), and a sealed index per part
+      lists them. Zero chunks are never stored, a repeat checkpoint uploads
+      only changed chunks, and sandboxes of one job share their image's
+      chunks. Chunks seal and open 16 at a time and never land ciphertext
+      on disk, which closes the encryption plan's parallel-sealing and
+      streaming-decrypt follow-ups. Measured on a QEMU guest (512 MiB
+      memory, 605 MiB root disk): 1,117 MiB per checkpoint before, 131 MiB
+      after an active minute and 38 MiB after an idle one
+      ([plan](plans/chunked-checkpoint-publish-plan.md) ·
+      [calls](calls/chunked-checkpoint-publish-plan_calls.md) ·
+      [docs](../docs/suspend-and-resume.md#how-published-parts-are-stored)).
+      Open follow-ups are under the suspend item in Task runtimes.
 
 ## Service discovery (v1)
 
@@ -5324,6 +5540,71 @@ docs: [task-runtime-plugins.md](../docs/task-runtime-plugins.md)
       is one entry and a refused ratification leaves the ticket unspent
       ([sandbox-scaling calls](calls/sandbox-scaling-plan_calls.md) #31,
       [docs](../docs/edge-boot.md)).
+- [x] **Ratifications stop refusing each other** (edge ratify throughput
+      Phase 1, 2026-10-14): [plan](plans/edge-ratify-throughput-plan.md) ·
+      [calls](calls/edge-ratify-throughput-plan_calls.md) ·
+      [docs](../docs/edge-boot.md#ratification-under-load). The networked
+      load test and the retry gap are open above.
+  - [x] Ratification load harness, in-process through the real `RatifyClaim`
+        handler with real tickets, local and single-voter raft
+        (`tests/ratify_throughput_measure.rs`, before/after numbers in the
+        plan §8 and [edge-boot.md](../docs/edge-boot.md#ratification-under-load)).
+  - [x] Ratifications fill commit batches. They already shared the instance
+        group commit (cap 64), not the plan coalescer, so
+        `plan_apply_batch_max` never applied. What kept entries from
+        filling was the job-config and node epoch fences, which refused all
+        but one ratification of a job per entry as `internal`, and the
+        handler blocking the async runtime, which held a burst to the
+        worker-thread count. A ratification is now fenced by committed
+        state inside its entry, and runs off the runtime.
+  - [x] A start for a never-existed id decides the create inside the entry,
+        so two nodes racing to create one sandbox leave one owner and a
+        loser refused `instance_claimed`, not `internal`.
+- [x] **Edge starts hold up on a three-manager raft cluster** (2026-10-14,
+      [#45](https://github.com/mikenomitch/legion/pull/45)). `race.sh`
+      started each of 60, 200, and 300 instance ids on three workers at
+      once. Every id had exactly one ratified start, and no loser's process
+      survived, including a run with the raft leader stopped 30 s in
+      ([results](../benchmarks/aws/sandbox-boot/RESULTS.md#ratification-on-three-managers-2026-10-14) ·
+      [docs](../docs/edge-boot.md#ratification-on-a-raft-cluster) ·
+      [calls](calls/edge-ratify-throughput-plan_calls.md) #2, #3). It found
+      and fixed:
+  - [x] The dispatch carries `speculativeStart`
+        (`TaskAllocation.task_speculative_start`). Before, every node's spec
+        cache read every task as `off` and refused every boot ticket. This
+        was on main, and in-process tests missed it because they fill the
+        cache by hand ([docs](../docs/edge-boot.md#the-spec-cache)).
+  - [x] A follower answers `RatifyClaim` with not-leader instead of an
+        `internal` refusal, writing nothing, and the node retries the other
+        managers it knows and keeps the one that ratified. Before, most edge
+        starts on three managers were killed after boot.
+  - [x] A just-ratified claim is kept from the stop sweep until a desired
+        set lists it, or for 30 s (`RATIFIED_SETTLE`). Before, a desired set
+        from a lagging follower stopped 378 confirmed claims on one worker.
+  - [x] An edge start sets its own `LEGION_INSTANCE_ID` and drops the
+        identity keys the cached task config carried from another
+        allocation.
+- [x] **Edge starts shed before boot when ratification is behind** (edge
+      admission control Phase 1). Each edge node keeps an AIMD window over
+      its unratified edge claims, capped by `edgeBoot.maxProvisionalPerNode`
+      (moved to the worker type config and now enforced) and halved when
+      verdicts come back later than `edgeBoot.overloadThreshold` of the
+      lease. A start that finds it full waits `queueTimeout`, then is
+      refused `OVERLOADED` (retryable) before admission, so nothing boots,
+      nothing is held, and the ticket stays unspent. In-flight claims are
+      never touched, and the window grows back on timely verdicts
+      ([plan](plans/edge-admission-control-plan.md) ·
+      [docs](../docs/edge-boot.md#overload) ·
+      [calls](calls/edge-admission-control-plan_calls.md)). Phases 2 and 3
+      are open above, under Scheduling & placement.
+  - [x] `edgeBoot.maxProvisionalPerNode` is enforced on every edge node.
+  - [x] A `ratifyTimeout` under a second is refused at submit. The lease
+        travels in whole seconds, so `"500ms"` reached the node already
+        expired and the next lease sweep killed the claim.
+  - [x] Backpressure before lease expiry: the typed `OVERLOADED` refusal,
+        `legion_worker_claim_window` and
+        `legion_worker_claim_overload_refusals_total`, and the failure-mode
+        section in edge-boot.md.
 - [x] **Sandbox scaling Phases 0–3** (2026-10-12,
       [#27](https://github.com/mikenomitch/legion/pull/27)):
       [plan](plans/sandbox-scaling-plan.md) §14 ·
@@ -5387,6 +5668,16 @@ docs: [task-runtime-plugins.md](../docs/task-runtime-plugins.md)
         catalog entry. An unnamed session's start and stop write no raft
         entry; a promotion writes one
         ([docs](../docs/session-mode.md)).
+- [x] **Suspend and resume no longer wait on heartbeats** (2026-10-13):
+      [plan](plans/checkpoints-on-stream-plan.md) ·
+      [calls](calls/checkpoints-on-stream-plan_calls.md) ·
+      [docs](../docs/suspend-and-resume.md#how-it-works). Checkpoint
+      requests are pushed on `StreamWork` when their row commits, and a
+      worker reports a finished capture, restore, publish, or warm on an
+      early heartbeat. The heartbeat stays the record. Replaces the
+      "suspend and resume still wait on heartbeats" item (sandbox-scaling
+      plan §14.6). A report path that skips the heartbeat is deferred until
+      early beats show up as load (plan §8).
 
 ## Persistence
 
@@ -5520,6 +5811,17 @@ docs: [task-runtime-plugins.md](../docs/task-runtime-plugins.md)
       ([docs](../docs/testing-and-benchmarks.md))
 - [x] Task log capture, tailing, rotation, and external shipping (including OTLP)
 - [x] OTLP trace export for Legion's own spans ([src/otel.rs](../src/otel.rs))
+- [x] **Server console logs never block** (2026-10-14,
+      [#45](https://github.com/mikenomitch/legion/pull/45)). Managers and
+      workers write the console through a lossy non-blocking writer, so a
+      slow journald drops lines instead of stalling every thread that logs.
+      Found on a c5.metal: a 1,200-start burst blocked heartbeats for about
+      57 s, the worker was marked lost, and the burst fell to 8 starts/s.
+      After, 293/s and no lost node
+      ([docs](../docs/observability.md#logging-and-tracing-setup) ·
+      [calls](calls/sandbox-boot-throughput-plan_calls.md) #3 ·
+      [results](../benchmarks/aws/sandbox-boot/RESULTS.md#console-logging-under-a-burst-2026-10-14)).
+      Dropped lines are not counted yet (open item under Observability).
 - [x] Event stream: scheduler events as history and live tail (`ListEvents`,
       `StreamEvents`, CLI, UI)
 - [x] **Task start stage timings** (2026-10-13) , 

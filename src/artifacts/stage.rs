@@ -412,22 +412,23 @@ pub struct ArtifactStager {
     /// This worker's `contentStore`, when it has one. Published snapshot
     /// parts under its URL are fetched with its credential.
     content_store_target: Option<ContentStoreTarget>,
+    /// Opens the store a published part's URL is in
+    /// ([`crate::content_publish::sealed_objects_for_url`]; a stand-in in
+    /// tests).
+    sealed_stores: SealedStores,
     /// Digests being fetched right now, so concurrent allocations wanting
     /// the same artifact share one download (single-flight).
     inflight: Mutex<HashSet<ContentDigest>>,
     inflight_done: Condvar,
 }
 
-/// Where a store fetch's credential comes from.
-#[derive(Clone, Copy)]
-enum FetchAuth<'a> {
-    /// The artifact spec's own (admission-resolved) `auth`.
-    Spec,
-    /// A published part under this node's `contentStore`: its credential.
-    ContentStore(&'a ContentStoreTarget),
-    /// A published part outside this node's `contentStore`: anonymous.
-    NoContentStore,
-}
+/// Opens the sealed-object store a published part's URL is in, signing with
+/// the credential given (`None` reads anonymously), and names the object.
+type SealedStores = Box<
+    dyn Fn(&str, Option<Credential>) -> R<(Arc<dyn object_store::ObjectStore>, String)>
+        + Send
+        + Sync,
+>;
 
 /// Schemes whose fetchers produce a single file named by
 /// [`cached_file_name`], so a store hit can be staged exactly as a fetch
@@ -462,6 +463,7 @@ impl ArtifactStager {
             credentials,
             content: None,
             content_store_target: None,
+            sealed_stores: Box::new(crate::content_publish::sealed_objects_for_url),
             inflight: Mutex::new(HashSet::new()),
             inflight_done: Condvar::new(),
         }
@@ -891,16 +893,20 @@ impl ArtifactStager {
                 .as_deref()
                 .context("fetching into the content store needs a checksum")?,
         )?;
-        self.fetch_digest_into_store(spec, &digest, None, FetchAuth::Spec, class, opts)
+        self.fetch_digest_into_store(spec, &digest, class, opts)
     }
 
-    /// [`ArtifactStager::fetch_into_store`] for a sealed checkpoint part
-    /// ([`crate::checkpoint_seal`]): the object at `url` is downloaded, opened
-    /// in place with `key`, and the plaintext checked against `key.digest()`
-    /// before it is stored. Tampering, truncation, a wrong key, and a
-    /// plaintext leftover each fail with a named
-    /// [`crate::checkpoint_seal::SealError`] and are retried like any failed
-    /// download.
+    /// Fetch a published checkpoint part into the node content store: the
+    /// sealed index at `url` is opened with `key` (the part key), then every
+    /// stored chunk it lists is fetched, opened, and verified, several at a
+    /// time, into a sparse file whose zero chunks stay holes
+    /// ([`crate::checkpoint_chunks::fetch_part`]). The reassembled part is
+    /// checked against `key.digest()` before it is stored. Tampering, a
+    /// wrong key, a plaintext leftover, and a chunk deleted from the store
+    /// each fail by name and at once. Other failures retry only the chunks
+    /// that failed, up to `artifacts.fetch.attempts` times. The same
+    /// allowed schemes, parallelism limit, size cap, deadline, and
+    /// single-flight as artifact fetches apply.
     ///
     /// A part is published by the node that captured it, with that node's
     /// `contentStore` credential, so it is read the same way: a URL under
@@ -909,6 +915,10 @@ impl ArtifactStager {
     /// Any other URL is fetched anonymously (cluster `artifacts.auth`
     /// matchers apply to jobspec artifacts at admission and never see part
     /// URLs), and a failure says this node has no credential for that store.
+    ///
+    /// A digest the store already holds is not fetched again (its pin, when
+    /// `opts` names one, is still applied). Blocking: call from a blocking
+    /// thread.
     pub fn fetch_sealed_into_store(
         &self,
         url: &str,
@@ -916,18 +926,84 @@ impl ArtifactStager {
         class: ContentClass,
         opts: PutOptions,
     ) -> R<FetchedIntoStore> {
-        let auth = match &self.content_store_target {
-            Some(target) if target.contains_url(url) => FetchAuth::ContentStore(target),
-            _ => FetchAuth::NoContentStore,
+        let store = self
+            .content
+            .as_deref()
+            .context("this worker has no node content store (content.enabled = false)")?;
+        let parsed = parse_artifact_source(url)?;
+        let redacted = ArtifactSpec::from_source(url).redacted_source();
+        if !self
+            .config
+            .allowed_schemes
+            .iter()
+            .any(|allowed| allowed == &parsed.scheme)
+        {
+            bail!(
+                "scheme {} is not allowed by this worker's artifacts.fetch.allowedSchemes, so it \
+                 cannot fetch {redacted}",
+                parsed.scheme
+            );
+        }
+        let digest = key.digest();
+        let _flight = self.claim_flight(digest);
+        // Pin and check presence in one step, as for artifacts: a published
+        // part is an unpinned cache entry that can be evicted in between.
+        let present = match opts.pin.as_ref() {
+            Some(owner) => store.pin_if_present(digest, owner)?,
+            None => store.contains(digest)?,
         };
-        self.fetch_digest_into_store(
-            &ArtifactSpec::from_source(url),
-            key.digest(),
-            Some(key),
-            auth,
-            class,
-            opts,
-        )
+        if present {
+            if let Some(entry) = store.get(digest)? {
+                return Ok(FetchedIntoStore {
+                    entry,
+                    fetched_bytes: 0,
+                });
+            }
+        }
+        let ours = match &self.content_store_target {
+            Some(target) if target.contains_url(url) => Some(target),
+            _ => None,
+        };
+        let credential = match ours {
+            Some(target) => target.read_credential(self.credentials.as_ref(), &redacted)?,
+            None => None,
+        };
+        let limits = crate::checkpoint_chunks::FetchLimits {
+            max_bytes: Some(self.config.max_artifact_size_bytes),
+            deadline: Some(
+                Instant::now() + std::time::Duration::from_secs(self.config.timeout_secs),
+            ),
+            attempts: self.config.attempts.max(1),
+        };
+        // Assemble beside the blobs, so the import below is a rename.
+        let scratch = store.staging_path("fetch")?;
+        let fetched = (|| {
+            let (objects, index_name) = (self.sealed_stores)(url, credential)?;
+            let _permit = self.semaphore.acquire();
+            crate::checkpoint_chunks::fetch_part(objects, &index_name, key, &scratch, limits)
+        })();
+        let fetched = match fetched {
+            Ok(fetched) => fetched,
+            Err(err) => {
+                let _ = fs::remove_file(&scratch);
+                let err = err.context(format!("fetching {redacted}"));
+                // A seal error means the bytes arrived, so access was not
+                // the problem and the hint would mislead.
+                let downloaded = err.chain().any(|cause| {
+                    cause.is::<crate::checkpoint_seal::SealError>()
+                        || cause.is::<crate::checkpoint_chunks::MissingChunk>()
+                });
+                if ours.is_none() && parsed.scheme != "file" && !downloaded {
+                    return Err(err.context(self.no_content_store_hint(&redacted)));
+                }
+                return Err(err);
+            }
+        };
+        let entry = store.import_file(class, &scratch, opts.expect(digest.clone()))?;
+        Ok(FetchedIntoStore {
+            entry,
+            fetched_bytes: fetched.fetched_bytes,
+        })
     }
 
     /// Why an anonymous part fetch from `redacted` (a store other than this
@@ -952,8 +1028,6 @@ impl ArtifactStager {
         &self,
         spec: &ArtifactSpec,
         digest: &ContentDigest,
-        sealed: Option<&crate::checkpoint_seal::PartKey>,
-        auth: FetchAuth<'_>,
         class: ContentClass,
         opts: PutOptions,
     ) -> R<FetchedIntoStore> {
@@ -996,13 +1070,7 @@ impl ArtifactStager {
             .lock()
             .expect("fetcher registry")
             .fetcher(&parsed.scheme)?;
-        let credential = match auth {
-            FetchAuth::Spec => self.resolve_credential(spec, &redacted)?,
-            FetchAuth::ContentStore(target) => {
-                target.read_credential(self.credentials.as_ref(), &redacted)?
-            }
-            FetchAuth::NoContentStore => None,
-        };
+        let credential = self.resolve_credential(spec, &redacted)?;
         let deadline = Instant::now() + std::time::Duration::from_secs(self.config.timeout_secs);
         let limits = FetchLimits {
             max_bytes: self.config.max_artifact_size_bytes,
@@ -1041,13 +1109,6 @@ impl ArtifactStager {
                 let FetchedPayload::File { path, .. } = fetched.payload else {
                     bail!("{redacted} is not a single file");
                 };
-                // The ciphertext was downloaded unchecked (the manifest names
-                // the plaintext digest): open it in place, then the import
-                // below checks the plaintext against the digest.
-                if let Some(key) = sealed {
-                    crate::checkpoint_seal::open_file_in_place(key, &path)
-                        .with_context(|| format!("opening sealed part {redacted}"))?;
-                }
                 let entry = store.import_file(class, &path, opts.clone().expect(digest.clone()))?;
                 Ok(FetchedIntoStore {
                     fetched_bytes: entry.size,
@@ -1064,35 +1125,13 @@ impl ArtifactStager {
                         error = %format!("{err:#}"),
                         "Content store fetch attempt failed"
                     );
-                    // A wrong key, tampered bytes, or a plaintext leftover
-                    // fails the same way on every attempt: do not download
-                    // a multi-GiB part again to learn that.
-                    let permanent = err.chain().any(|cause| {
-                        cause
-                            .downcast_ref::<crate::checkpoint_seal::SealError>()
-                            .is_some_and(|seal| {
-                                !matches!(seal, crate::checkpoint_seal::SealError::Truncated { .. })
-                            })
-                    });
                     last_err = Some(err);
-                    if permanent {
-                        break;
-                    }
                 }
             }
         }
-        let err = last_err
+        Err(last_err
             .unwrap_or_else(|| anyhow!("fetch failed before any attempt ran"))
-            .context(format!("fetching {redacted} after {tried} attempt(s)"));
-        // A seal error means the bytes arrived, so access was not the
-        // problem and the hint would mislead.
-        let downloaded = err
-            .chain()
-            .any(|cause| cause.is::<crate::checkpoint_seal::SealError>());
-        if matches!(auth, FetchAuth::NoContentStore) && parsed.scheme != "file" && !downloaded {
-            return Err(err.context(self.no_content_store_hint(&redacted)));
-        }
-        Err(err)
+            .context(format!("fetching {redacted} after {tried} attempt(s)")))
     }
 
     fn resolve_credential(&self, spec: &ArtifactSpec, redacted: &str) -> R<Option<Credential>> {
@@ -2509,38 +2548,43 @@ mod tests {
 
     // ---- published snapshot parts: which credential reads them ----------
 
-    /// An `s3://` stand-in: records the credential each fetch carried,
-    /// refuses unsigned requests like a private bucket, and serves signed
-    /// ones from the sealed objects a `FileContentPublisher` wrote.
+    /// An `s3://` stand-in: records the credential each open carried,
+    /// refuses unsigned reads like a private bucket, and serves signed ones
+    /// from the sealed objects a `file://` publish wrote.
     struct PrivateBucket {
         sealed_root: PathBuf,
         seen: Mutex<Vec<Option<Credential>>>,
     }
 
+    impl PrivateBucket {
+        fn open(
+            &self,
+            url: &str,
+            credential: Option<Credential>,
+        ) -> R<(Arc<dyn object_store::ObjectStore>, String)> {
+            let unsigned = credential.is_none();
+            self.seen.lock().unwrap().push(credential);
+            if unsigned {
+                bail!("get {url}: AccessDenied (403 Forbidden)");
+            }
+            let name = url.rsplit('/').next().unwrap_or_default().to_string();
+            let objects = object_store::local::LocalFileSystem::new_with_prefix(
+                self.sealed_root.join("sealed"),
+            )?;
+            Ok((Arc::new(objects), name))
+        }
+    }
+
+    /// Jobspec artifacts go through the fetcher registry: record what they
+    /// were signed with, and serve nothing.
     impl crate::artifacts::fetcher::ArtifactFetcher for PrivateBucket {
         fn schemes(&self) -> &'static [&'static str] {
             &["s3"]
         }
 
-        fn fetch(&self, req: &FetchRequest<'_>, sink: &mut ArtifactSink) -> R<FetchedArtifact> {
+        fn fetch(&self, req: &FetchRequest<'_>, _sink: &mut ArtifactSink) -> R<FetchedArtifact> {
             self.seen.lock().unwrap().push(req.credential.cloned());
-            if req.credential.is_none() {
-                bail!("get {}: AccessDenied (403 Forbidden)", req.redacted_source);
-            }
-            let name = req.url.path().rsplit('/').next().unwrap_or_default();
-            let path = self.sealed_root.join("sealed").join(name);
-            let url = url::Url::from_file_path(&path).expect("absolute path");
-            let source = url.to_string();
-            crate::artifacts::fetchers::FileFetcher::new().fetch(
-                &FetchRequest {
-                    scheme: "file",
-                    url: &url,
-                    redacted_source: &source,
-                    credential: None,
-                    ..*req
-                },
-                sink,
-            )
+            bail!("get {}: NoSuchKey", req.redacted_source)
         }
     }
 
@@ -2575,20 +2619,33 @@ mod tests {
     }
 
     fn part_rig(target: Option<&str>, kv: Option<&str>) -> R<PartRig> {
-        use crate::content_publish::{ContentPublisher, ContentStoreAuth, FileContentPublisher};
+        use crate::content_publish::{ContentPublishing, ContentStoreAuth, FileContentPublisher};
         let state = tempdir()?;
         let shared = tempdir()?;
-        let plaintext = state.path().join("memory.bin");
-        fs::write(&plaintext, b"guest memory")?;
-        let digest = ContentDigest::of_bytes(b"guest memory");
-        let key = crate::checkpoint_seal::PartKey::derive(&[7; 32], "ck_test", &digest)?;
-        FileContentPublisher::new(shared.path()).publish_sealed(&key, &plaintext)?;
+        let publisher = tempdir()?;
+        let publisher_store = store_in(publisher.path());
+        let entry = publisher_store.put_bytes(
+            ContentClass::Snapshots,
+            b"guest memory",
+            PutOptions::default(),
+        )?;
+        let key = crate::checkpoint_seal::PartKey::derive(&[7; 32], "ck_test", &entry.digest)?;
+        let chunks = crate::checkpoint_seal::ChunkKey::derive(&[7; 32], "ck_test", "job")?;
+        let published = ContentPublishing::new(
+            publisher_store,
+            Arc::new(FileContentPublisher::new(shared.path())),
+        )
+        .publish(&key, &chunks)?;
+        let object = published
+            .url
+            .rsplit('/')
+            .next()
+            .expect("an object name")
+            .to_string();
         let bucket = Arc::new(PrivateBucket {
             sealed_root: shared.path().to_path_buf(),
             seen: Mutex::new(Vec::new()),
         });
-        let mut registry = FetcherRegistry::new();
-        registry.register(bucket.clone());
         let credentials = RecordingCredentials::default();
         let mut stager = ArtifactStager::new(
             WorkerArtifactFetchConfigFull {
@@ -2605,15 +2662,21 @@ mod tests {
                 kv: Some(kv.to_string()),
                 node_identity: None,
             }),
+            ..Default::default()
         }));
+        let mut registry = FetcherRegistry::new();
+        registry.register(bucket.clone());
         stager.registry = Mutex::new(registry);
+        let opener = bucket.clone();
+        stager.sealed_stores =
+            Box::new(move |url: &str, credential: Option<Credential>| opener.open(url, credential));
         Ok(PartRig {
             stager,
             bucket,
             credentials,
-            object: key.object_name(),
+            object,
             key,
-            _dirs: vec![state, shared],
+            _dirs: vec![state, shared, publisher],
         })
     }
 
