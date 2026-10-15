@@ -3,7 +3,7 @@
 **A workload orchestrator that is easy, fast, and extensible.**
 
 > [!NOTE]
-> Legion is an experimental personal project. Expect bugs, breaking changes,
+> Legion is an experimental personal project written largely by agents. Expect bugs, breaking changes,
 > and known security issues. See [Status](#status) before you use it.
 
 Legion runs containers, microVM sandboxes, and plain binaries across a fleet
@@ -316,16 +316,16 @@ A few from [`configs/jobs/`](configs/jobs/):
 ## Status
 
 Legion is a personal project, made for fun, and largely an experiment with
-agent-driven development. Most testing has been done by agents, with human
+agentic development. Most testing has been done by agents, with human
 spot checks. Expect bugs, and don't run it in production.
 
 Don't expect stability either. APIs and the job spec may change without
 notice.
 
 With recent LLM progress, I've been shipping "foundational" pieces of the
-orchestrator quickly (sometimes without reading the code) and then coming
+orchestrator quickly (often without reading the code) and then coming
 back to iterate on them (or rip them out) after the fact. This is fun and
-allows me to get to the end experience quicker, but means pieces of the
+allows me to get to the end-experience quicker, but means pieces of the
 orchestrator are of differing quality.
 
 For instance, the core scheduler has gotten a decent amount of testing and
