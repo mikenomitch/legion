@@ -88,7 +88,15 @@ A secret shorter than 24 characters fails the start, naming the setting.
 ### Turning ACLs off
 
 `acl = { enabled = false }` is an explicit choice for a throwaway cluster.
-Every caller then has full access, including any workload that can reach the
+For a quick local cluster without a config file, pass `--no-acl` instead:
+
+```bash
+legion start manager --run-worker --no-acl
+```
+
+The flag overrides `acl.enabled` for that run, with or without `-c`. It
+applies only to the manager it is passed to, so in a multi-manager cluster
+use the config setting on every manager instead. Every caller then has full access, including any workload that can reach the
 manager: a task on the manager's own host reaches it on loopback, and in a
 multi-host cluster every task can reach the address workers use. The manager
 logs a warning at every start, the UI shows a banner, and `legion acl whoami`

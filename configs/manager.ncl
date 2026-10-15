@@ -366,6 +366,7 @@
   # policies/tokens with `legion acl ...` and introduce workers with
   # `legion join-token create`. `enabled = false` is for throwaway clusters
   # only: every caller, including any task, then controls the cluster.
+  # `legion start manager --no-acl` does the same without editing this file.
   acl = {
     enabled = true,
     # bootstrapSecretFile = "/etc/legion/bootstrap-secret",  # IaC pre-seed (>= 24 chars), read at first start

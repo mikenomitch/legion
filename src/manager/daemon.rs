@@ -409,9 +409,9 @@ pub async fn run_manager_with(
         });
     } else {
         warn!(
-            "ACLs are disabled (acl.enabled = false): every API caller, including any \
-             workload that can reach this manager, has full control of the cluster. \
-             Remove acl.enabled = false to turn them back on"
+            "ACLs are disabled (acl.enabled = false or --no-acl): every API caller, \
+             including any workload that can reach this manager, has full control of the \
+             cluster. Remove acl.enabled = false and --no-acl to turn them back on"
         );
     }
 
