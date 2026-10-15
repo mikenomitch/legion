@@ -167,6 +167,9 @@ What they measure:
   $ cargo bench --bench net_bench -- slow_endpoint
   ```
 
+  Reference numbers from this target, and what they mean for a deployment,
+  are in [What the datapath costs](network-handlers.md#what-the-datapath-costs).
+
   Datapath changes in `src/worker/forwarder.rs`, `src/worker/netd/`, or
   `src/worker/balance.rs` should report before/after numbers from this
   target. Run it on Linux for anything that touches the copy path.

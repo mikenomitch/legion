@@ -201,6 +201,11 @@ over a peak-EWMA latency estimate. What it measures depends on the mode:
   far one.
 - **HTTP mode.** The time to each response's head.
 
+In a benchmark with three backends, one of them deliberately slow, strategies
+that spread evenly averaged 1.8–1.9 ms per request and `least_latency`
+averaged 62–114 µs, close to the fast backends alone
+([What the datapath costs](network-handlers.md#what-the-datapath-costs)).
+
 A slow answer raises an endpoint's estimate at once. Estimates fall back with
 a 10-second time constant, so one fast answer doesn't erase a run of slow
 ones, and an endpoint that was avoided is tried again once it cools down. A
