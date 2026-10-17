@@ -507,18 +507,22 @@ was written and tested against.
 ## 19. `dial_tcp` sets no socket options
 
 **Call.** `netd::listen::dial_tcp` is connect-with-timeout and nothing else.
-Callers keep the options they set before (`set_nodelay` on HTTP-mode and
-ingress dials, nothing on L4 splices).
+Callers set their own options: since the datapath performance work
+([#42](https://github.com/mikenomitch/legion/pull/42)), endpoint, external
+and HTTP-mode dials set `TCP_NODELAY` right after `dial_tcp` returns, as
+ingress dials always did; a `proxy` hand-off, the egress proxy's origins and
+the DNS forwarder's TCP refetch set nothing.
 
 **Alternatives.** Set `TCP_NODELAY` on every datapath dial in one place.
 
-**Trade-off.** The seam does less than it could.
+**Trade-off.** The seam does less than it could, and a new dial site has to
+remember the option.
 
-**Why (scope).** A behavior change on every spliced connection belongs with
-the datapath performance work in flight
-([#42](https://github.com/mikenomitch/legion/pull/42)), not in a refactor.
-The seam is where such a change, or a future capture mode's `SO_MARK`, will
-go.
+**Why (scope).** Moving the option into the seam changes the dials #42 chose
+to leave alone, which is that work's call to make, not a refactor's (this
+branch was rebased onto #42 after it merged and kept its call sites as they
+were). The seam is where such a change, or a future capture mode's
+`SO_MARK`, will go.
 
 ---
 
