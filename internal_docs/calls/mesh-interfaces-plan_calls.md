@@ -245,12 +245,14 @@ uniform.
 
 ---
 
-## 8. The mesh is a switch on the service; TLS lives on ports; chains carry only policy
+## 8. The mesh is a switch on the service, off by default; TLS lives on ports; chains carry only policy
 
 **Call.** `service.mesh = true` replaces
 `ingress.tls = { mode = "mutual", certFrom = "legion", clientCa = "legion" }`.
 Non-mesh TLS moves to `network.ports[].tls`, and an external upstream's trust
-bundle to the upstream's `ca`. `tls` is removed from chains.
+bundle to the upstream's `ca`. `tls` is removed from chains. `mesh` defaults
+to `false`. That was an open question in the plan's first draft, and the
+owner ratified the lean.
 
 ```nickel
 # before
@@ -261,19 +263,26 @@ service = { port = "http", mesh = true },
 
 **Alternatives.** (a) Keep TLS on chains, with a `tls = "mesh"` shorthand.
 That is the smallest change. (b) A task-level `network.mesh` switch that
-covers every port.
+covers every port. (c) Mesh on by default, since AGENTS.md asks for the
+default that is right for a new cluster.
 
 **Trade-off.** A policy object can no longer push certificate material onto
 the tasks it matches, which `certFrom = { kv }` on a policy object does
 today. A platform team that did that has to move certificates into the jobs.
-A policy object can still impose `mesh = true`.
+A policy object can still impose `mesh = true`. Off by default means
+service-to-service traffic is plaintext unless someone turns the mesh on, or
+an operator imposes it with a policy object.
 
 **Why (simplicity).** A chain is policy: what may pass. TLS is how the port
 is served, and it belongs with the port, as Gateway API puts
 `BackendTLSPolicy` on the backend rather than the route. With (a), TLS
 modes would still mean different things on ingress and egress. (b) is too
 coarse: a task can serve a public `https` port and a mesh service port at
-once.
+once. (c) loses because a mesh port refuses every client from outside
+Legion: default-on would break anything that reaches a service directly (a
+load balancer, a developer's `curl`) the day it was deployed. Revisit for
+services nothing outside Legion calls, once `net_bench` has the handshake
+cost.
 
 ---
 
@@ -420,7 +429,9 @@ required for an external destination.
 ```
 
 **Alternatives.** (a) Keep the two shapes. (b) A `svc://db` scheme. (c)
-Require `db.svc.legion` for catalog targets (open question 8).
+Require `db.svc.legion` for catalog targets. This was an open question in
+the plan's first draft. The owner ratified the rule, with `.svc.legion`
+accepted but never required.
 
 **Trade-off.** The rule misreads a dotless intranet host (`http://wiki`),
 which must be written with its port. It also needs a clear submit error when
@@ -429,7 +440,8 @@ a bare name is not a valid service name.
 **Why (simplicity).** The jobspec reads like the URL the task dials, the
 scheme carries the protocol (entry 6), and there is one validation path
 instead of a matrix. Nomad's upstream is one shape. (b) invents a scheme no
-client understands, and (c) is the honest alternative, kept open.
+client understands. (c) is unambiguous, but makes every spec longer to save
+the rare dotless external host a port number.
 
 ---
 
@@ -481,38 +493,54 @@ eBPF programs come back, the same name can point at either.
 
 ---
 
-## 17. Seven knobs and kinds are removed rather than reshaped
+## 17. Six knobs and kinds are removed rather than reshaped
+
+*Revised after review.* The first draft also removed `retries.on`,
+`retries.methods`, and the `least_conn` balancer. The owner kept retries as
+they are. `least_conn` was kept after a closer read of the code showed it
+has a job `least_latency` does not do (below).
 
 **Call.** The plan removes the `log` handler, chain-level `onError`,
-`proxy.node`, `http.outlier`, `retries.on` and `retries.methods`, the
-`random` and `least_conn` balancers, and the reserved `bridge`/`cni/*`
-modes (plan §6.0).
+`proxy.node`, `http.outlier`, the `random` balancer, and the reserved
+`bridge`/`cni/*` modes (plan §6.0). `round_robin` and `least_conn`'s
+tie-break start each listener's cursor at a random offset.
 
 ```nickel
 # before
-http = { retries = { attempts = 2, on = ["5xx", "reset"], methods = ["GET"] },
-         outlier = { consecutive5xx = 5, ejectFor = "30s" } },
-balance = "least_conn",
+http = { outlier = { consecutive5xx = 5, ejectFor = "30s" } },
+balance = "random",
 # after
-http = { retries = { attempts = 2 } },   # ejection is always on in HTTP mode
-balance = "least_latency",               # the default; least_conn's behavior is inside it
+http = {},                  # ejection is always on in HTTP mode, with those numbers
+balance = "round_robin",    # now starts at a random offset per listener
 ```
 
-**Alternatives.** Keep every knob and reshape only the confusing ones.
+**Alternatives.** (a) Keep every knob and reshape only the confusing ones.
+(b) The first draft's longer list.
 
-**Trade-off.** A user who tuned ejection, retried on `reset` or
-`retriable-4xx`, retried a non-idempotent method, or relied on `least_conn`'s
-exact tie-breaking loses that. Each is one registry row or field to bring
-back, and a concrete request for one is the evidence to do so (open
-question 11).
+**Trade-off.** A user who tuned ejection, or who relied on `random`'s
+per-pick independence, loses that. Each is one registry row or field to
+bring back, and a concrete request for one is the evidence to do so (open
+question 9).
 
-**Why (simplicity).** Each removal either duplicates something that stays
-(`log` is `accessLog`, `node` is `service` + `local`, `least_conn` is inside
-`least_latency`, outlier ejection overlaps `least_latency`'s failure
-penalty) or does not work today (chain `onError`), or is a reserved name for
-a feature that does not exist. The owner's ask was a mesh without the
-kitchen sink. Removing these is cheaper now, with no installed base, than at
-any later point.
+**Why (simplicity).** Each removal duplicates something that stays (`log`
+is `accessLog`, `node` is `service` + `local`, outlier ejection overlaps
+`least_latency`'s failure penalty, and `random` exists only to avoid every
+new `round_robin` listener starting at endpoint 0, which a random start
+offset fixes in `round_robin` itself), doesn't work today (chain
+`onError`), or reserves a name for a feature that doesn't exist.
+
+The first draft argued that `least_latency` covers `least_conn` because it
+weighs in-flight load. That is only half true. `least_latency` scores
+`latency × (in-flight + 1)` over two random endpoints, so it deliberately
+sends more connections to nearby, fast endpoints (the public doc says so).
+`least_conn` scans every endpoint and keeps connection counts even
+regardless of distance. For long-lived connections (database pools, gRPC
+channels, websockets), where an endpoint's share of connections is its
+share of load for hours, even counts are the point. `round_robin` can't do
+it either, because it ignores which connections have closed. So
+`least_conn` stays. Retries stay at the owner's call: `on` and `methods`
+are how a user opts into retrying `reset` or a non-idempotent method, which
+is rare but not wrong.
 
 ---
 

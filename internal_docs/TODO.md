@@ -3864,8 +3864,8 @@ mesh's surface. Phase 0 first, then S1. After S1 every track is independent.
       `accessLog`), chain-level `onError`, and `proxy.node`.
 - [ ] S2: upstreams as one `to` whose scheme is the protocol (an HTTP chain
       no longer parses `tcp` upstreams as HTTP), one dialable address per
-      upstream, VIP-only binding on Linux. Removes `http.outlier`,
-      `retries.on`/`methods`, and the `random` and `least_conn` balancers.
+      upstream, VIP-only binding on Linux. Removes `http.outlier` and the
+      `random` balancer (`round_robin` starts at a random offset instead).
 - [ ] S3 + S4: `service.mesh = true` and TLS on `network.ports[].tls`
       instead of chain `tls`; `service.allow` as the one caller list,
       enforced at the receiving node on mesh services. Removes

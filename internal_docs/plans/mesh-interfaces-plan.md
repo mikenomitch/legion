@@ -67,7 +67,7 @@ dispatcher.
 | **S3** | The mesh is a switch on the service. TLS lives on ports, not in policy chains | `ingress.tls = { mode = "mutual", certFrom = "legion", clientCa = "legion" }` | `service = { port = "http", mesh = true }`; `ports = [{ …, tls = { cert = { kv = … } } }]` |
 | **S4** | One list of who may call a service | `service.allow` (job ids, endpoint feed only), `tls.requireIdentity` (identity globs), `ingress.rules[].when.identity` | `service.allow`, one identity grammar, enforced in the feed and, with the mesh, at the receiving node |
 | **S5** | One grammar for where material comes from, and one fetch | `certFrom`, `credentials[].from`, `certPath`/`keyPath`, `clientCa`, `caPath`; three worker-plane fetch RPCs | `{ kv = … }`, `{ identity = … }`, `{ file = … }` everywhere; `FetchDatapathMaterial`; a `MaterialProvider` trait |
-| **S6** | What goes away | — | the `log` handler, chain-level `onError`, `http.outlier`, `retries.on` and `retries.methods`, the `random` and `least_conn` balancers, the reserved `bridge`/`cni/*` modes (§6.0) |
+| **S6** | What goes away | — | the `log` handler, chain-level `onError`, `proxy.node`, `http.outlier`, the `random` balancer, the reserved `bridge`/`cni/*` modes (§6.0) |
 
 **The datapath tiers (A, B).** Where the work runs:
 
@@ -105,7 +105,7 @@ removals ride the track that rewrites the code they live in.
 | Places that decide "is this HTTP" | 4 | 1 (the upstream's scheme) |
 | Chain fields | 8 | 6 (`tls` and `onError` move out) |
 | Built-in handler kinds | 4 | 3, plus `plugin` |
-| Balancers | 5 | 3 |
+| Balancers | 5 | 4 |
 | Datapath plugin tiers in the proposal | 4 (A–D) | 2 (A, B) |
 
 ---
@@ -480,7 +480,7 @@ covers them.
   attributed workload identity.
 - **New secret providers themselves** (Vault, cloud secret managers). S5
   makes each one implementation. Each is its own TODO item.
-- **The mesh on by default.** Open question 9.
+- **The mesh on by default.** It stays off (calls entry 8).
 - **Kernel code from anyone.** No job author or operator eBPF programs in
   this plan (§6.F, calls entries 2 and 20).
 - **TLS interception.** It stays rejected. External upstreams remain the
@@ -547,8 +547,7 @@ already rewrites the code it lives in (calls entry 17).
 | `service`, `localPort` on upstreams | One `to`; `port` pins | `{ to = "db" }`, `{ to = "cache", port = 6379 }` | S2 |
 | `LEGION_UPSTREAM_VIP_<K>` | It names the same listener as `LEGION_UPSTREAM_<K>` | `LEGION_UPSTREAM_<K>` | S2 |
 | `http.outlier` | `least_latency` already counts a 5xx as a 1-second answer and sheds the endpoint. Ejection becomes fixed behavior in HTTP mode for every balancer: 5 consecutive 5xx, 30 s out, today's defaults | nothing to write | S2 |
-| `http.retries.on`, `http.retries.methods` | The defaults (connect failure and 5xx, idempotent methods only) are what almost everyone wants, and retrying a `POST` is rarely safe | `retries = { attempts, budget }` | S2 |
-| `random` and `least_conn` balancers | `least_latency` (the default) is a power-of-two-choices pick weighted by latency × (in-flight + 1). That covers least-connections, and the random pair avoids synchronized cursors the way `random` does | `least_latency`, `round_robin`, `local_first` | S2 |
+| `random` balancer | It exists so that many clients don't send their first connections to the same endpoint. That happens with `round_robin` because every new listener's cursor starts at 0 ([balance.rs](../../src/worker/balance.rs)). Starting each listener's cursor at a random offset fixes `round_robin` itself, and then `random` adds nothing (calls entry 17) | `round_robin` | S2 |
 | `tls.mode` on chains (`off`/`server`/`mutual`/`passthrough`/`originate`), `certFrom`, `certPath`/`keyPath`, `clientCa`, `caPath`, `requireIdentity` | The mesh is one switch, and TLS moves onto ports and upstreams (S3). Callers move to `service.allow` (S4) | `service.mesh`, `ports[].tls`, upstream `ca`, `service.allow` | S3, S4 |
 | Reserved `network.mode` values `bridge` and `cni/<name>` | Reserving a name for a plugin that does not exist is surface without a feature ([netpolicy.rs:903](../../src/structs/netpolicy.rs)) | The unknown-mode error lists the valid modes | S3 |
 | `FetchNetPolicy`, `GetIngressCertificates`, `GetUpstreamCredentials` | One fetch, keyed by kind (S5) | `FetchDatapathMaterial` | S5 |
@@ -703,8 +702,8 @@ connect = {
 - **Catalog or external.** A host that is a bare service name (no dot, no
   port) or ends in `.svc.legion` is a catalog service. Anything else is
   external. A dotless external host is written with its port
-  (`http://wiki:80`). Open question 8 is whether to require `.svc.legion`
-  instead.
+  (`http://wiki:80`). `db.svc.legion` is accepted but never required
+  (calls entry 14).
 - **Catalog services take `tcp` or `http`.** They are reached over the mesh
   when the service is on it (S3), so `tls://` and `https://` name external
   destinations only:
@@ -716,7 +715,7 @@ connect = {
   (service.mesh = true).
   ```
 - **The fields that remain:** `to`, `name`, `port`, `balance`, `http`
-  (`timeout`, `retries = { attempts, budget }`, `split`), `handlers`,
+  (`timeout`, `retries`, `split`), `handlers`,
   `credentials`, and `ca` (an external TLS upstream's trust bundle, as an S5
   source). `AllocUpstream.service` becomes `key`.
 
@@ -776,9 +775,10 @@ declared protocol is HTTP or its pipeline has a stage later than `connect`
   the loopback port is the address and the variables say so.
 
 **Balancing and HTTP traffic management** keep `balance` (now
-`least_latency`, `round_robin`, or `local_first`), `timeout`,
-`retries = { attempts, budget }`, and `split`. Outlier ejection is fixed
-behavior in HTTP mode for every balancer (§6.0).
+`least_latency`, `round_robin`, `least_conn`, or `local_first`), `timeout`,
+`retries` (all of today's fields), and `split`. `round_robin` and
+`least_conn`'s tie-break start each listener's cursor at a random offset.
+Outlier ejection is fixed behavior in HTTP mode for every balancer (§6.0).
 
 ### 6.S3 The mesh is a switch on the service; TLS lives on ports
 
@@ -888,7 +888,7 @@ pub enum Source {
 Each field allows the kinds that make sense for it. An identity token is not
 a certificate, so `tls.cert = { identity = … }` is a submit error, and
 credentials take no `file`, so a node's disk is never a secret store (open
-question 10).
+question 8).
 
 **One fetch.** `FetchDatapathMaterial` replaces `FetchNetPolicy`,
 `GetIngressCertificates`, and `GetUpstreamCredentials`:
@@ -1303,7 +1303,7 @@ surface or a moving part:
 | Per-path handler dispatch, with the phase-0 gap patched | Calls entry 3 |
 | Protocol detection on upstreams (Linkerd's model) | Calls entry 6 |
 | An HTTP chain forcing HTTP parsing on every upstream (today's rule) | Calls entry 6 |
-| A `svc://db` scheme, or requiring `db.svc.legion`, for catalog upstreams | Calls entry 14; the second is open question 8 |
+| A `svc://db` scheme, or requiring `db.svc.legion`, for catalog upstreams | Calls entry 14 |
 | `tls = "mesh"` shorthand on chains instead of `service.mesh` | Calls entry 8 |
 | Dropping `service.allow` for ingress identity rules | Calls entry 7 |
 | One RPC per material kind, with a provider added per RPC | Calls entry 10 |
@@ -1328,9 +1328,9 @@ surface or a moving part:
   it is set on macOS, when the node has no VIP block, or when `port` is
   pinned. The rename rides a store migration
   ([storage/migrations.rs](../../src/storage/migrations.rs)).
-- `UpstreamHttpConfig` loses `outlier`. `RetryConfig` loses `on` and
-  `methods`.
-- `BALANCERS` loses `random` and `least_conn`.
+- `UpstreamHttpConfig` loses `outlier`. `RetryConfig` is unchanged.
+- `BALANCERS` loses `random`. `RoundRobin` and `LeastConn` seed their cursor
+  at a random offset.
 - `env_pairs` and the template address share one function.
 
 **S3**
@@ -1393,7 +1393,7 @@ else is independent.
 | Phase | Ships | Value on its own |
 | --- | --- | --- |
 | **S1** | Keyed handler variants, the `Handler` trait, `HANDLERS`, one compiled `Pipeline` on every path, stage checks at submit, and placement in `show`/`doctor` (`netd` and `external` until A and B add theirs). Removes `log`, chain `onError`, and `proxy.node` | One place to add a handler. Misplaced fields fail at evaluation. The phase-0 class of bug cannot recur |
-| **S2** | One `to`, the scheme as the protocol, fail-closed HTTP chains over `tcp` upstreams, one address per upstream, VIP-only binding on Linux. Removes `outlier`, `retries.on`/`methods`, `random`, and `least_conn` | Scenario 6. The env var and the template agree. No dynamic-range port per upstream on Linux |
+| **S2** | One `to`, the scheme as the protocol, fail-closed HTTP chains over `tcp` upstreams, one address per upstream, VIP-only binding on Linux. Removes `outlier` and `random` | Scenario 6. The env var and the template agree. No dynamic-range port per upstream on Linux |
 | **S3 + S4** | `service.mesh`, `ports[].tls`, upstream `ca`, and chains without `tls`; `service.allow` with one grammar, compiled to the first ingress rule on mesh services, plus the `service doctor` notice. Removes the reserved modes. One phase, because both reshape the receiving side and S4 replaces the `requireIdentity` that S3 removes | Scenario 5. The mesh is one switch, and callers are one list |
 | **S5** | `Source`, `FetchDatapathMaterial`, `MaterialProvider`, and `tls.clients.ca = { kv }` | Closes the KV client-CA TODO. A new secret store is one provider |
 
@@ -1434,6 +1434,8 @@ else is independent.
     host rule, and denied with the documented reason when the first rule
     needs a path.
   - HTTP-mode outlier ejection still happens with no `outlier` block.
+  - Many fresh `round_robin` listeners over one endpoint list spread their
+    first picks across the endpoints instead of all starting at index 0.
 - **S3 + S4.**
   - Equivalence: `mesh = true` produces the same listener, catalog flag, and
     consumer behavior that the three-field form did.
@@ -1485,8 +1487,7 @@ form.
   `port`. On Linux, `LEGION_UPSTREAM_<K>` changes value to the VIP address,
   `LEGION_UPSTREAM_HOST_<K>` becomes an address instead of a name, and
   `LEGION_UPSTREAM_VIP_<K>` is removed. An HTTP chain no longer parses `tcp`
-  upstreams as HTTP. `outlier`, `retries.on`, `retries.methods`, `random`,
-  and `least_conn` are removed.
+  upstreams as HTTP. `outlier` and the `random` balancer are removed.
 - **TLS moves out of chains.** `ingress.tls` and `egress.tls` are removed,
   in favor of `service.mesh`, `ports[].tls`, and the upstream's `ca`. A
   policy object can no longer set certificate material. It can impose
@@ -1529,26 +1530,14 @@ form.
    mode is a cgroup-hook boundary.
 7. **Job-author plugins in B1 or B2?** Lean: B2, after per-job scoping and
    the limits have run in production on policy-applied plugins.
-8. **Catalog names in `to`: a rule, or `.svc.legion` required?** The rule
-   (a bare, portless name is a catalog service) reads well and misreads a
-   dotless intranet host, which must then carry its port. Requiring
-   `db.svc.legion` spells out exactly what the task dials, at the cost of
-   longer specs. Lean: the rule, with `.svc.legion` also accepted, and a
-   submit error when a bare name is not a valid service name.
-9. **Should the mesh be on by default?** AGENTS.md says to pick the default
-   that is right for a new cluster. A mesh port refuses every non-Legion
-   client, so default-on would break anything that reaches a service from
-   outside Legion. Lean: off in this plan. Once S3 ships, measure the
-   handshake cost in `net_bench` and revisit for services that nothing
-   outside Legion calls.
-10. **May credentials come from a `file` on the node?** Lean: no.
-    Credentials stay cluster-held (`kv`, `identity`), so a node's disk never
-    becomes a secret store, and every credential's access is checked at
-    submit against `kv:read`.
-11. **Is fixed outlier ejection right for every service?** Five consecutive
-    5xx for 30 s is today's default. Lean: yes. A service that needs
-    different numbers is evidence for bringing back one knob, not the
-    block.
+8. **May credentials come from a `file` on the node?** Lean: no.
+   Credentials stay cluster-held (`kv`, `identity`), so a node's disk never
+   becomes a secret store, and every credential's access is checked at
+   submit against `kv:read`.
+9. **Is fixed outlier ejection right for every service?** Five consecutive
+   5xx for 30 s is today's default. Lean: yes. A service that needs
+   different numbers is evidence for bringing back one knob, not the
+   block.
 
 ## 12. Acceptance (per phase)
 
