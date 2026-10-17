@@ -80,6 +80,7 @@ impl TestNode {
             .build()
             .expect("node runtime");
         let store = self.store().clone();
+        let transport_tls = store.raft_transport_tls().expect("raft engine started");
         let addr: SocketAddr = format!("127.0.0.1:{}", self.port).parse().unwrap();
         let name = self.name;
         rt.spawn(async move {
@@ -87,7 +88,9 @@ impl TestNode {
             socket.set_reuseaddr(true).expect("reuseaddr");
             socket.bind(addr).expect("bind manager port");
             let listener = socket.listen(64).expect("listen");
-            let incoming = tokio_stream::wrappers::TcpListenerStream::new(listener);
+            let incoming = transport_tls
+                .incoming(listener)
+                .expect("raft transport listener");
             let manager = ManagerServer::new(ManagerDaemonService::new(store.clone()));
             if let Err(err) = tonic::transport::Server::builder()
                 .layer(LeaderForwardLayer::new(store.clone()))

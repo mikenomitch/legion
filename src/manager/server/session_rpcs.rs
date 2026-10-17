@@ -128,6 +128,7 @@ impl ManagerDaemonService {
             identity,
             "create_instance",
             request.idempotency_key.as_deref(),
+            &request,
         );
         let derived_id = (!scoped.is_empty()).then(|| {
             crate::structs::session::derived_session_id(&task.name, &config.name, &scoped)
@@ -688,6 +689,7 @@ impl ManagerDaemonService {
             &identity,
             "promote_instance",
             inner.idempotency_key.as_deref(),
+            &inner,
         );
         if let Some(recorded) = self
             .store

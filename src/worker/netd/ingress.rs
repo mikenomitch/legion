@@ -438,11 +438,23 @@ async fn handle(mut client: TcpStream, peer: SocketAddr, shared: Arc<Shared>) {
                 return;
             }
         };
+    // A `legion://node/` URI makes a peer a node, trusted to name the
+    // workload it forwards for, only on a chain verified against the
+    // cluster's CA. An operator's `clientCa` may issue whatever URIs its
+    // clients ask for, so there it is just that client's identity.
+    let cluster_verified = tls.client_ca.as_deref() == Some("legion")
+        || (tls.cert_from_mesh() && tls.cert_kv_path().is_none());
     let peer_identity = stream
         .get_ref()
         .1
         .peer_certificates()
-        .and_then(net_tls::peer_identity);
+        .and_then(net_tls::peer_identity)
+        .map(|identity| match identity {
+            PeerIdentity::Node(node) if !cluster_verified => {
+                PeerIdentity::Other(format!("legion://node/{node}"))
+            }
+            other => other,
+        });
     let (identity, leftover) = match peer_identity {
         // A node peer names the workload it forwards for in a PROXY v2
         // header — trusted because the peer proved it is a node.

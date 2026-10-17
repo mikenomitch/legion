@@ -53,6 +53,219 @@ fn set_dir_mode(dir: &std::path::Path, mode: u32, what: &str) -> crate::util::R<
     Ok(())
 }
 
+/// Write a secret to `path`, readable by its owner only from the moment it
+/// exists (`0600` at creation; a pre-existing file is tightened before the
+/// write), then fsync. Creating it at the umask and tightening afterwards
+/// left a window in which another local user could open it and keep reading.
+pub fn write_private_file(path: &Path, content: &[u8]) -> R<()> {
+    use anyhow::Context;
+    use std::io::Write;
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options
+        .open(path)
+        .with_context(|| format!("failed to write {}", path.display()))?;
+    #[cfg(unix)]
+    {
+        // `mode` applies only on creation; tighten a pre-existing file too.
+        use std::os::unix::fs::PermissionsExt;
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))
+            .with_context(|| format!("failed to chmod {}", path.display()))?;
+    }
+    file.write_all(content)
+        .with_context(|| format!("failed to write {}", path.display()))?;
+    file.sync_all().ok();
+    Ok(())
+}
+
+/// `create_dir_all`, with any directory it creates owner-only (`0700`).
+pub fn create_private_dir_all(dir: &Path) -> R<()> {
+    use anyhow::Context;
+    let mut builder = std::fs::DirBuilder::new();
+    builder.recursive(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        builder.mode(0o700);
+    }
+    builder
+        .create(dir)
+        .with_context(|| format!("failed to create {}", dir.display()))
+}
+
+/// Write `content` to `root/relative` the way a reader should see it (temp
+/// file at `mode`, fsync, rename), never following a symlink at any step.
+///
+/// For files the root worker writes into a directory a task can also write
+/// (its task directory): templates, identity tokens, and KV files, which are
+/// rewritten while the task runs. Each directory below `root` is opened with
+/// `O_NOFOLLOW` and created when missing, the temp file is created with
+/// `O_EXCL | O_NOFOLLOW`, and the rename stays inside the opened directory,
+/// so whatever the task has put in its own directory, the write lands below
+/// `root` or fails. `relative` must be relative and free of `..`. Only the
+/// permission bits of `mode` apply: a root-owned setuid or setgid file in a
+/// directory the task's user can reach would be a way to root.
+pub fn write_file_beneath(root: &Path, relative: &Path, content: &[u8], mode: u32) -> R<()> {
+    use anyhow::{bail, Context};
+    use std::path::Component;
+    let mut parts = Vec::new();
+    for component in relative.components() {
+        match component {
+            Component::Normal(part) => parts.push(part),
+            Component::CurDir => {}
+            _ => bail!(
+                "{} is not a plain relative path below {}",
+                relative.display(),
+                root.display()
+            ),
+        }
+    }
+    let Some(file_name) = parts.pop() else {
+        bail!("{} names no file", relative.display());
+    };
+    #[cfg(unix)]
+    {
+        beneath::write(root, &parts, file_name, content, mode)
+            .with_context(|| format!("write {} below {}", relative.display(), root.display()))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (file_name, mode);
+        let path = root.join(relative);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(&path, content).with_context(|| format!("write {}", path.display()))
+    }
+}
+
+#[cfg(unix)]
+mod beneath {
+    use std::ffi::{CString, OsStr};
+    use std::io::Write;
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    use std::os::unix::ffi::OsStrExt;
+    use std::path::Path;
+
+    fn cstr(name: &OsStr) -> std::io::Result<CString> {
+        CString::new(name.as_bytes())
+            .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "NUL in path"))
+    }
+
+    fn open_dir_at(dir: libc::c_int, name: &CString) -> std::io::Result<OwnedFd> {
+        let flags = libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC;
+        // SAFETY: `name` is a valid C string and `dir` an open descriptor.
+        let fd = unsafe { libc::openat(dir, name.as_ptr(), flags) };
+        if fd < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        // SAFETY: `fd` was just returned by openat and is owned here.
+        Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+    }
+
+    /// The directory `name` in `dir`, made (`0755`) when missing, never
+    /// followed when it is a link.
+    fn open_or_make_dir_at(dir: &OwnedFd, name: &CString) -> std::io::Result<OwnedFd> {
+        match open_dir_at(dir.as_raw_fd(), name) {
+            Err(err) if err.raw_os_error() == Some(libc::ENOENT) => {
+                // SAFETY: valid C string and descriptor.
+                let made = unsafe { libc::mkdirat(dir.as_raw_fd(), name.as_ptr(), 0o755) };
+                if made < 0 {
+                    let err = std::io::Error::last_os_error();
+                    if err.raw_os_error() != Some(libc::EEXIST) {
+                        return Err(err);
+                    }
+                }
+                open_dir_at(dir.as_raw_fd(), name)
+            }
+            other => other,
+        }
+    }
+
+    pub(super) fn write(
+        root: &Path,
+        parents: &[&OsStr],
+        file_name: &OsStr,
+        content: &[u8],
+        mode: u32,
+    ) -> std::io::Result<()> {
+        // `root` itself may sit in a directory the task owns (an `exec`
+        // task's user owns its allocation directory), so its last component
+        // is not followed either. It may not exist yet (a runtime's delivery
+        // subdirectory, written before the task starts): then it is made in
+        // its parent, which must.
+        let mut dir = match open_dir_at(libc::AT_FDCWD, &cstr(root.as_os_str())?) {
+            Err(err) if err.raw_os_error() == Some(libc::ENOENT) => {
+                let (Some(parent), Some(name)) = (root.parent(), root.file_name()) else {
+                    return Err(err);
+                };
+                let parent = open_dir_at(libc::AT_FDCWD, &cstr(parent.as_os_str())?)?;
+                open_or_make_dir_at(&parent, &cstr(name)?)?
+            }
+            other => other?,
+        };
+        for part in parents {
+            dir = open_or_make_dir_at(&dir, &cstr(part)?)?;
+        }
+        let tmp_name = cstr(OsStr::new(&format!(
+            ".{}.legion-tmp-{}",
+            file_name.to_string_lossy(),
+            super::random_string(8)
+        )))?;
+        let final_name = cstr(file_name)?;
+        let flags =
+            libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC;
+        // SAFETY: valid C string and descriptor; the mode is passed as the
+        // variadic argument openat expects with O_CREAT.
+        let fd = unsafe {
+            libc::openat(
+                dir.as_raw_fd(),
+                tmp_name.as_ptr(),
+                flags,
+                (mode & 0o777) as libc::c_uint,
+            )
+        };
+        if fd < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        // SAFETY: `fd` was just returned by openat and is owned here.
+        let mut file = unsafe { std::fs::File::from_raw_fd(fd) };
+        let written = (|| {
+            // The umask applied at create; set the exact mode before any
+            // reader can see the file under its final name.
+            // SAFETY: `file` holds an open descriptor.
+            if unsafe { libc::fchmod(file.as_raw_fd(), (mode & 0o777) as libc::mode_t) } < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            file.write_all(content)?;
+            file.sync_all()?;
+            // SAFETY: valid C strings and descriptors; both names are in `dir`.
+            let renamed = unsafe {
+                libc::renameat(
+                    dir.as_raw_fd(),
+                    tmp_name.as_ptr(),
+                    dir.as_raw_fd(),
+                    final_name.as_ptr(),
+                )
+            };
+            if renamed < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        })();
+        if written.is_err() {
+            // SAFETY: valid C string and descriptor.
+            unsafe { libc::unlinkat(dir.as_raw_fd(), tmp_name.as_ptr(), 0) };
+        }
+        written
+    }
+}
+
 /// First match for `name` on `PATH`. A name containing a path separator is
 /// treated as an explicit path and only checked for existence.
 ///
@@ -247,6 +460,57 @@ pub fn output_with_timeout(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Writes land below the root, creating directories on the way, and a
+    /// link the task left in its directory is never followed: a linked
+    /// directory fails the write, and a linked file name is replaced, not
+    /// written through.
+    #[cfg(unix)]
+    #[test]
+    fn write_file_beneath_never_follows_links_test() -> R<()> {
+        use std::os::unix::fs::PermissionsExt;
+        let scratch = tempfile::tempdir()?;
+        let root = scratch.path().join("task");
+        let outside = scratch.path().join("outside");
+        std::fs::create_dir_all(&root)?;
+        std::fs::create_dir_all(&outside)?;
+
+        write_file_beneath(&root, Path::new("secrets/nested/token"), b"one", 0o600)?;
+        let written = root.join("secrets/nested/token");
+        assert_eq!(std::fs::read(&written)?, b"one");
+        assert_eq!(
+            std::fs::metadata(&written)?.permissions().mode() & 0o777,
+            0o600
+        );
+        write_file_beneath(&root, Path::new("tool"), b"#!/bin/sh\n", 0o4755)?;
+        assert_eq!(
+            std::fs::metadata(root.join("tool"))?.permissions().mode() & 0o7777,
+            0o755,
+            "no setuid bit"
+        );
+
+        std::os::unix::fs::symlink(&outside, root.join("linked"))?;
+        assert!(write_file_beneath(&root, Path::new("linked/token"), b"two", 0o600).is_err());
+        assert!(!outside.join("token").exists());
+
+        std::fs::write(outside.join("target"), b"untouched")?;
+        std::os::unix::fs::symlink(outside.join("target"), root.join("file"))?;
+        write_file_beneath(&root, Path::new("file"), b"three", 0o644)?;
+        assert_eq!(std::fs::read(outside.join("target"))?, b"untouched");
+        assert!(!std::fs::symlink_metadata(root.join("file"))?
+            .file_type()
+            .is_symlink());
+
+        // A missing root is made inside its existing parent.
+        write_file_beneath(&root.join("identity"), Path::new("token"), b"six", 0o600)?;
+        assert_eq!(std::fs::read(root.join("identity/token"))?, b"six");
+
+        let linked_root = scratch.path().join("linked-root");
+        std::os::unix::fs::symlink(&outside, &linked_root)?;
+        assert!(write_file_beneath(&linked_root, Path::new("token"), b"four", 0o600).is_err());
+        assert!(write_file_beneath(&root, Path::new("../escape"), b"five", 0o600).is_err());
+        Ok(())
+    }
 
     #[test]
     fn plugin_root_prefers_a_bundle_next_to_the_binary_test() {

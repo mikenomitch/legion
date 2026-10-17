@@ -154,6 +154,7 @@ When one is required and what goes in it:
 | [scheduler-diagnosis-tooling-plan.md](plans/scheduler-diagnosis-tooling-plan.md) | planned (`legion scheduler diagnose` + the metric gaps that blocked the 2026-08-04 diagnosis) |
 | [scheduler-plan-snapshot-plan.md](plans/scheduler-plan-snapshot-plan.md) | shipped |
 | [scheduling-index-plan.md](plans/scheduling-index-plan.md) | shipped (phases 0–3; group-path + backlog deferred) |
+| [security-gap-closure-plan.md](plans/security-gap-closure-plan.md) | shipped (2026-10-17): the README's and TODO's known security gaps plus an audit's findings — KV reads through jobspecs, root-worker path escapes, node credentials leaving the node, forged identities, plaintext raft; direct exec revocation push, fleet certificates, and git/OCI fetch judging deferred |
 | [service-discovery-final-plan.md](plans/service-discovery-final-plan.md) | v1 shipped; §8 mesh follow-on superseded by service-mesh-plan.md |
 | [service-discovery-plan.md](plans/service-discovery-plan.md) | superseded (rationale + full mesh design) |
 | [service-discovery-mesh-and-config.md](plans/service-discovery-mesh-and-config.md) | superseded (cookbook + mesh extensions) |
@@ -222,6 +223,7 @@ by project impact. The full template and a worked example:
 - [rootfs-base-cache-plan_calls.md](calls/rootfs-base-cache-plan_calls.md)
 - [sandbox-boot-throughput-plan_calls.md](calls/sandbox-boot-throughput-plan_calls.md)
 - [sandbox-clean-stop_calls.md](calls/sandbox-clean-stop_calls.md)
+- [security-gap-closure-plan_calls.md](calls/security-gap-closure-plan_calls.md)
 - [swappable-seams-plan_calls.md](calls/swappable-seams-plan_calls.md)
 - [sandbox-exec-plan_calls.md](calls/sandbox-exec-plan_calls.md)
 - [sandbox-scaling-plan_calls.md](calls/sandbox-scaling-plan_calls.md)

@@ -102,13 +102,16 @@ fn serve_transport(
     port: u16,
 ) -> tokio::task::JoinHandle<()> {
     let service = store.raft_transport_server();
+    let transport_tls = store.raft_transport_tls().expect("raft engine started");
     let addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
     let handle = rt.spawn(async move {
         let socket = tokio::net::TcpSocket::new_v4().expect("socket");
         socket.set_reuseaddr(true).expect("reuseaddr");
         socket.bind(addr).expect("bind transport port");
         let listener = socket.listen(64).expect("listen");
-        let incoming = tokio_stream::wrappers::TcpListenerStream::new(listener);
+        let incoming = transport_tls
+            .incoming(listener)
+            .expect("raft transport listener");
         if let Err(err) = tonic::transport::Server::builder()
             .add_service(service)
             .serve_with_incoming(incoming)

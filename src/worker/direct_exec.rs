@@ -137,6 +137,15 @@ impl ExecTicketVerifier {
                 claims.exp
             );
         }
+        // A delegated key bounds `exp - iat`; without this an `iat` set in
+        // the future stretched a ticket's life past the key's `max_ttl`.
+        if claims.iat > now_unix + skew {
+            bail!(
+                "the ticket was issued at {}, after this node's clock ({now_unix}, skew {skew}s); \
+                 mint a new one",
+                claims.iat
+            );
+        }
         if let Some(not_before) = not_before {
             if now_unix + skew < not_before {
                 bail!(
@@ -677,6 +686,15 @@ mod direct_exec_test {
             .verify(&sign(&pair, "agents-a", 60, 3600, now), now)
             .unwrap_err();
         assert!(format!("{err:#}").contains("max_session"), "{err:#}");
+        // Issued a year from now, inside the key's window from that time: it
+        // would otherwise be valid for a year plus the window.
+        let err = verifier
+            .verify(&sign(&pair, "agents-a", 60, 600, now + 365 * 86_400), now)
+            .unwrap_err();
+        assert!(
+            format!("{err:#}").contains("after this node's clock"),
+            "{err:#}"
+        );
 
         // Another key's signature under this kid is a forgery.
         let (other, _) = delegated("agents-*");

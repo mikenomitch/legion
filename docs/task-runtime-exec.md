@@ -42,7 +42,15 @@ Required:
 
 Optional:
 
-- `env`: map of string env vars.
+- `env`: map of string env vars. The task does **not** inherit the
+  worker's environment, which may hold a `LEGION_TOKEN` or cloud
+  credentials. It starts from `PATH` (a standard one when the worker has
+  none), `LANG`, `LANGUAGE`, `TZ`, and every `LC_*` from the worker, plus
+  `HOME`, `USER`, `LOGNAME`, and `SHELL` for the user it runs as (the
+  worker's own without a `user`). Legion's allocation env and this map are
+  layered on top. A variable the task needs from the host (`http_proxy`,
+  `SSL_CERT_FILE`) goes in `env`. An exec session into the task starts from
+  the same allowlist.
 - `cwd`: working directory. Defaults to the allocation's private task
   directory when unset (see Artifacts Support below).
 - `user` (unix): run as the given user (resolved to uid/gid). At start, the

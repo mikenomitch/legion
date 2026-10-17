@@ -137,13 +137,30 @@ pub struct PreparedIdentity {
 /// A runtime's file-delivery mapping: the root a jobspec's paths are declared
 /// against (`/legion/task`) and the host directory it is mounted from.
 ///
-/// `None` everywhere it appears means the runtime's filesystem *is* the
-/// host's — the `exec` runtime — where a declared absolute path is already
-/// the real path and nothing is translated.
+/// An `in_task_root` of `None` means the runtime's filesystem *is* the
+/// host's (the `exec` runtime): a declared absolute path is already the real
+/// path, and a relative one is below `host_task_dir`, the task directory.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FileDeliveryBase {
-    pub in_task_root: &'static str,
+    pub in_task_root: Option<&'static str>,
     pub host_task_dir: PathBuf,
+}
+
+/// Where a token file goes: below a task directory the task can write (so
+/// it is written without following links, [`crate::util::write_file_beneath`]),
+/// or a path the task cannot touch.
+enum TokenFile {
+    Beneath { root: PathBuf, relative: PathBuf },
+    Path(PathBuf),
+}
+
+impl TokenFile {
+    fn host_path(&self) -> PathBuf {
+        match self {
+            TokenFile::Beneath { root, relative } => root.join(relative),
+            TokenFile::Path(path) => path.clone(),
+        }
+    }
 }
 
 /// Owns token delivery and the per-allocation refresh loops on a worker.
@@ -238,19 +255,20 @@ impl WorkerIdentityManager {
                         // (env-delivered identities on such a runtime back
                         // onto the worker's own directory — use file delivery
                         // if the workload needs to re-read the token).
-                        let in_task = match delivery_base.as_ref() {
+                        let in_task = match delivery_base
+                            .as_ref()
+                            .and_then(|b| Some((b.in_task_root?, b)))
+                        {
                             None => Some(backing.to_string_lossy().to_string()),
-                            Some(base) => {
-                                backing
-                                    .strip_prefix(&base.host_task_dir)
-                                    .ok()
-                                    .map(|relative| {
-                                        PathBuf::from(base.in_task_root)
-                                            .join(relative)
-                                            .to_string_lossy()
-                                            .to_string()
-                                    })
-                            }
+                            Some((in_task_root, base)) => backing
+                                .strip_prefix(&base.host_task_dir)
+                                .ok()
+                                .map(|relative| {
+                                    PathBuf::from(in_task_root)
+                                        .join(relative)
+                                        .to_string_lossy()
+                                        .to_string()
+                                }),
                         };
                         if let Some(path) = in_task {
                             env_injections.push((format!("{env_key}_FILE"), path));
@@ -456,20 +474,44 @@ fn backing_file_path(
     alloc_id: i64,
     delivery_base: Option<&FileDeliveryBase>,
 ) -> Option<PathBuf> {
+    backing_file(identity, alloc_id, delivery_base).map(|file| file.host_path())
+}
+
+fn backing_file(
+    identity: &WorkloadIdentity,
+    alloc_id: i64,
+    delivery_base: Option<&FileDeliveryBase>,
+) -> Option<TokenFile> {
     if let Some(file) = identity.file.as_ref().filter(|f| !f.path.trim().is_empty()) {
+        let declared = file.path.trim();
         let Some(base) = delivery_base else {
-            return Some(PathBuf::from(&file.path));
+            return Some(TokenFile::Path(PathBuf::from(declared)));
         };
         // A runtime that mounts its task dir declares destinations against
         // the mount point, so the host path is the task dir plus whatever
         // the jobspec put under it. Re-resolved here rather than trusted
         // from admission — the same two-layer stance identity *naming*
         // already takes — so a malformed spec cannot write outside the tree.
-        return match crate::task_plugins::resolve_task_dir_destination(
-            base.in_task_root,
-            &file.path,
-        ) {
-            Ok(relative) => Some(base.host_task_dir.join(relative)),
+        // On the host's own filesystem an absolute path is the real one, and
+        // a relative path is below the task directory, not the worker's cwd.
+        let resolved = match base.in_task_root {
+            None if Path::new(declared).is_absolute() => {
+                return Some(TokenFile::Path(PathBuf::from(declared)))
+            }
+            None if Path::new(declared)
+                .components()
+                .any(|c| matches!(c, std::path::Component::ParentDir)) =>
+            {
+                Err(format!("{declared:?} climbs out of the task directory"))
+            }
+            None => Ok(PathBuf::from(declared)),
+            Some(root) => crate::task_plugins::resolve_task_dir_destination(root, declared),
+        };
+        return match resolved {
+            Ok(relative) => Some(TokenFile::Beneath {
+                root: base.host_task_dir.clone(),
+                relative,
+            }),
             Err(err) => {
                 warn!(
                     identity = %identity.name,
@@ -481,7 +523,10 @@ fn backing_file_path(
         };
     }
     if identity.delivers_env() {
-        return Some(fallback_token_path(alloc_id, &identity.name));
+        return Some(TokenFile::Path(fallback_token_path(
+            alloc_id,
+            &identity.name,
+        )));
     }
     None
 }
@@ -554,7 +599,7 @@ fn write_identity_files(
     token: &str,
     delivery_base: Option<&FileDeliveryBase>,
 ) -> R<()> {
-    let Some(path) = backing_file_path(identity, alloc_id, delivery_base) else {
+    let Some(file) = backing_file(identity, alloc_id, delivery_base) else {
         return Ok(());
     };
     let mode = identity
@@ -564,7 +609,13 @@ fn write_identity_files(
         .map(crate::structs::workload_identity::parse_file_mode)
         .transpose()?
         .unwrap_or(DEFAULT_TOKEN_FILE_MODE);
-    write_token_file(&path, token, mode)
+    match file {
+        // Refreshed while the task runs, in a directory it can write.
+        TokenFile::Beneath { root, relative } => {
+            crate::util::write_file_beneath(&root, &relative, token.as_bytes(), mode)
+        }
+        TokenFile::Path(path) => write_token_file(&path, token, mode),
+    }
 }
 
 /// Atomically write a token file (temp file + rename, the `src/certs.rs`

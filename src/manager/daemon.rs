@@ -62,6 +62,10 @@ pub const IDEMPOTENCY_KEY_TTL: Duration = Duration::from_secs(24 * 60 * 60);
 /// How often the control-lane leader prunes idempotency records older than
 /// `IDEMPOTENCY_KEY_TTL`, so records live between 24 and 25 hours.
 const IDEMPOTENCY_PRUNE_INTERVAL: Duration = Duration::from_secs(60 * 60);
+
+/// How often the scheduler-lane leader drops expired boot tickets. A ticket
+/// lives minutes; the rows only need to stay bounded.
+const BOOT_TICKET_PRUNE_INTERVAL: Duration = Duration::from_secs(60 * 60);
 // Base delay before re-running an eval whose handler hit a foreign-lane
 // NotRaftLeader rejection (divergent lane leadership) — long enough for the
 // engine's JC-40 lane-convergence loop (or an election) to move leadership,
@@ -390,30 +394,6 @@ pub async fn run_manager_with(
                 refresh_authenticator.refresh_auth_methods().await;
             }
         });
-        // Keep credential tables tidy: expired tokens are already rejected at
-        // authentication time, pruning just removes the rows. The delete is a
-        // replicated control-lane write, so only the control-lane leader
-        // prunes: at startup or on acquiring leadership, then hourly.
-        let prune_store = store.clone();
-        tokio::spawn(async move {
-            let mut last_prune: Option<std::time::Instant> = None;
-            loop {
-                if !prune_store.is_raft_leader(crate::storage::Lane::Control) {
-                    // Forget the schedule so a later leadership win prunes at once.
-                    last_prune = None;
-                } else if last_prune.is_none_or(|at| at.elapsed() >= CREDENTIAL_PRUNE_INTERVAL) {
-                    last_prune = Some(std::time::Instant::now());
-                    match prune_store.prune_expired_credentials() {
-                        Ok((acl_tokens, join_tokens)) if acl_tokens + join_tokens > 0 => {
-                            info!(acl_tokens, join_tokens, "Pruned expired credentials");
-                        }
-                        Ok(_) => {}
-                        Err(err) => warn!(error = ?err, "Failed pruning expired credentials"),
-                    }
-                }
-                tokio::time::sleep(LEADER_POLL_INTERVAL).await;
-            }
-        });
     } else {
         warn!(
             "ACLs are disabled (acl.enabled = false or --no-acl): every API caller, \
@@ -438,6 +418,51 @@ pub async fn run_manager_with(
                 Ok(0) => {}
                 Ok(pruned) => info!(pruned, "Pruned expired idempotency records"),
                 Err(err) => warn!(error = ?err, "Failed pruning idempotency records"),
+            }
+        }
+    });
+
+    // Keep credential tables tidy: expired tokens are already rejected at
+    // authentication time, pruning just removes the rows. With ACLs on or
+    // off, since join tokens are minted either way. The delete is a
+    // replicated control-lane write, so only the control-lane leader
+    // prunes: at startup or on acquiring leadership, then hourly.
+    let prune_store = store.clone();
+    tokio::spawn(async move {
+        let mut last_prune: Option<std::time::Instant> = None;
+        loop {
+            if !prune_store.is_raft_leader(crate::storage::Lane::Control) {
+                // Forget the schedule so a later leadership win prunes at once.
+                last_prune = None;
+            } else if last_prune.is_none_or(|at| at.elapsed() >= CREDENTIAL_PRUNE_INTERVAL) {
+                last_prune = Some(std::time::Instant::now());
+                match prune_store.prune_expired_credentials() {
+                    Ok((acl_tokens, join_tokens)) if acl_tokens + join_tokens > 0 => {
+                        info!(acl_tokens, join_tokens, "Pruned expired credentials");
+                    }
+                    Ok(_) => {}
+                    Err(err) => warn!(error = ?err, "Failed pruning expired credentials"),
+                }
+            }
+            tokio::time::sleep(LEADER_POLL_INTERVAL).await;
+        }
+    });
+
+    // Expired boot tickets can never be redeemed, but their rows were kept
+    // forever (docs/edge-boot.md). Scheduler-lane leader only: the delete is
+    // a replicated write on that lane.
+    let boot_ticket_store = store.clone();
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(BOOT_TICKET_PRUNE_INTERVAL).await;
+            if !boot_ticket_store.is_raft_leader(crate::storage::Lane::Scheduler) {
+                continue;
+            }
+            let now = OffsetDateTime::now_utc().unix_timestamp();
+            match boot_ticket_store.prune_expired_boot_tickets(now) {
+                Ok(0) => {}
+                Ok(pruned) => info!(pruned, "Pruned expired boot tickets"),
+                Err(err) => warn!(error = ?err, "Failed pruning expired boot tickets"),
             }
         }
     });
@@ -1431,7 +1456,11 @@ pub fn manager_incoming(
     keep_manager_server_cert(store.clone(), cluster.clone());
     let tls_only = operator.is_some();
     let config = crate::cluster_tls::server_config(
-        Arc::new(crate::cluster_tls::ManagerServerCerts { cluster, operator }),
+        Arc::new(crate::cluster_tls::ManagerServerCerts {
+            cluster,
+            operator,
+            raft: store.raft_transport_tls().map(|tls| tls.server_key()),
+        }),
         None,
         true,
     )?;

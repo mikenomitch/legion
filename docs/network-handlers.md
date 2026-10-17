@@ -747,7 +747,10 @@ ingress = {
 `mutual`), the advertised port terminates TLS with your certificate. A
 `mutual` peer's identity is its certificate's first URI SAN, or else its
 first DNS SAN, or else its CN. `identity` rules and `requireIdentity` match
-against that string.
+against that string. A `legion://node/<id>` URI from your own `clientCa` is
+just that string too: only a chain verified against the cluster CA makes a
+peer a Legion node, trusted to name the workload it forwards for (below), so
+a CA that issues whatever URIs its clients ask for cannot mint one.
 
 **The mesh (`certFrom = "legion"`).** The mesh uses the **cluster CA**. By
 default that is a CA the manager creates on first use and replicates with the
@@ -1267,9 +1270,12 @@ in `allow` is refused for the same reason.
   below covers it on Linux nodes that can run it.
 - A root `exec` task in `gated` mode can `setns` back into the host
   namespace.
-- The guard judges destinations, not the node's own outbound traffic:
-  artifact fetches, `authz` webhooks, and the worker's own calls to the
-  manager are not judged.
+- The guard judges what allocations reach, and the artifact fetches a job
+  points the worker at: `http(s)` artifact sources and their redirects are
+  judged and pinned, and an `s3://` `endpoint` is judged
+  ([Artifacts](artifacts.md#what-the-host-guard-checks)). Git and OCI
+  artifact fetches, `authz` webhooks (the operator's), and the worker's own
+  calls to the manager are not judged.
 
 ### The host guard in the kernel
 
@@ -1667,6 +1673,8 @@ Naming a KV key in a job needs `kv:read` on it, because the datapath hands
 the value out: `certFrom = { kv }` on an ingress chain
 ([Certificates from KV](#certificates-from-kv)) and
 `connect.upstreams[].credentials` ([Credential injection](#credential-injection)).
+The same rule covers every other place a job names a key
+([KV references in a job](auth-and-acls.md#kv-references-in-a-job)).
 `GetIngressCertificates` and `GetUpstreamCredentials` are worker-plane, and a
 node only receives values that allocations placed on it declare.
 

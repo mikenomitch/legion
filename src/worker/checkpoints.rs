@@ -636,7 +636,7 @@ fn ingest_memory_parts(context: &CaptureContext, owner: &PinOwner, snapshot_id: 
         store
             .import_file(
                 ContentClass::Snapshots,
-                &dir.part_path(&part.file),
+                &dir.manifest_part_path(&part.file)?,
                 PutOptions::default()
                     .expect(ContentDigest::parse(&part.digest)?)
                     .pin(owner.clone())
@@ -1256,7 +1256,7 @@ pub fn materialize_parts(
                 manifest.id, part.role, part.digest
             )
         })?;
-        let dest = dir.part_path(&part.file);
+        let dest = dir.manifest_part_path(&part.file)?;
         let _ = std::fs::remove_file(&dest);
         if std::fs::hard_link(&entry.path, &dest).is_err() {
             crate::volumes::copy::clone_file(&entry.path, &dest)?;
