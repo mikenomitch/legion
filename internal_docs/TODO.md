@@ -3843,11 +3843,36 @@ Deliberately not in the plan (see its §5): TLS interception / MITM — external
 upstreams are the body-visible route; rate limits and quotas; a cluster-edge
 load balancer.
 
-Proposed, not yet planned:
-[egress-plugins-proposal.md](plans/egress-plugins-proposal.md) · calls:
-[egress-plugins-proposal_calls.md](calls/egress-plugins-proposal_calls.md).
-Two independent tracks; each phase would graduate into its own plan.
+Planned, nothing built:
+[mesh-interfaces-plan.md](plans/mesh-interfaces-plan.md) · calls:
+[mesh-interfaces-plan_calls.md](calls/mesh-interfaces-plan_calls.md). It
+merges the egress-plugins proposal from
+[#49](https://github.com/mikenomitch/legion/pull/49) with a review of the
+mesh's surface. Phase 0 first, then S1. After S1 every track is independent.
 
+- [ ] **Phase 0 (bugs).** `dlp` and `log` handlers declared on a chain
+      (inline or on a policy object) pass validation and never run:
+      `HttpSettings` only gets the upstream's own handlers
+      ([forwarder.rs:1119](../src/worker/forwarder.rs)), and ingress gets
+      none ([netd/http.rs:359](../src/worker/netd/http.rs)). A chain's
+      `onError` is printed by `net policy show` but never read by the
+      datapath, which treats a hop without its own as `deny`. Found by
+      reading the code. Confirm with tests, then fix (plan §8).
+- [ ] S1: keyed handler variants on one `Handler` trait and `HANDLERS`
+      registry, one compiled pipeline on every path, stage checks at submit,
+      placement in `show`/`doctor`. Removes the `log` handler (use
+      `accessLog`), chain-level `onError`, and `proxy.node`.
+- [ ] S2: upstreams as one `to` whose scheme is the protocol (an HTTP chain
+      no longer parses `tcp` upstreams as HTTP), one dialable address per
+      upstream, VIP-only binding on Linux. Removes `http.outlier`,
+      `retries.on`/`methods`, and the `random` and `least_conn` balancers.
+- [ ] S3 + S4: `service.mesh = true` and TLS on `network.ports[].tls`
+      instead of chain `tls`; `service.allow` as the one caller list,
+      enforced at the receiving node on mesh services. Removes
+      `requireIdentity` and the reserved `bridge`/`cni/*` modes.
+- [ ] S5: one `{ kv | identity | file }` source grammar,
+      `FetchDatapathMaterial` in place of three worker-plane RPCs, and a
+      manager-side `MaterialProvider` trait.
 - [ ] Track A: kernel classifier. Policy compiled to eBPF maps on each
       allocation's cgroup leaf: allowed L4 flows that nothing reads skip the
       proxy, host-mode egress chains become enforced, gated capture becomes
@@ -3855,11 +3880,22 @@ Two independent tracks; each phase would graduate into its own plan.
       `nftables` host guard moves to eBPF. A0 (probe + `net_bench` numbers)
       comes first.
 - [ ] Track B: WASM plugins on the proxy-wasm ABI at the connect, request,
-      body, response, and done stages, with plugin objects and keyed handler
-      variants (`{ authz = { … } }`). This is phase 8 above, reshaped.
-- [ ] Operator eBPF connect programs with an SDK (proposal C), only on demand.
+      body, response, and done stages, with plugin objects. This is phase 8
+      above, reshaped. Needs S1.
+
+Cut from that plan to on-demand (plan §6.F, calls entry 20). Do each only
+when someone brings a need the plan does not cover:
+
+- [ ] Operator eBPF connect programs with an SDK and `net plugin build`.
 - [ ] File-descriptor hand-off for node-local `proxy` targets, and `authz` to
-      a sidecar port (proposal D).
+      a sidecar port.
+- [ ] Kernel balancing for plain L4 upstreams (VIP rewritten at `connect()`).
+- [ ] `tc` enforcement for TAP-wired sandboxes.
+- [ ] One template engine. The manager renders `{{ kv }}` into env and
+      files, and the worker renders `connect.templates` from the endpoint
+      feed, with different functions and change policies. Merging them is a
+      real simplification but reshapes KV injection, so it is outside the
+      mesh plan (its §4 non-goals).
 
 Still unplanned, and not covered by the plan:
 
@@ -3871,7 +3907,9 @@ Still unplanned, and not covered by the plan:
       in front of one allocation; a cluster edge is separate work
 - [ ] `clientCa = { kv = "<path>" }` for `mutual` ingress, so a private client
       CA can live in KV like the server certificate. Not in
-      [kv-cert-delivery-plan.md](plans/kv-cert-delivery-plan.md).
+      [kv-cert-delivery-plan.md](plans/kv-cert-delivery-plan.md). Planned as
+      `tls.clients.ca = { kv }` in
+      [mesh-interfaces-plan.md](plans/mesh-interfaces-plan.md) S5.
 - [ ] A built-in ACME client (answering HTTP-01 from the ingress datapath).
       Only worth it once the cluster edge above exists. Until then, the
       renewer job in `configs/jobs/cert-renewer.ncl` covers it.
