@@ -415,6 +415,10 @@ fn streaming_open_options(conditional_put: bool) -> OpenOptions {
         // object_store's own default, never to AWS_REGION.
         region_default: RegionDefault::Fixed(objects::FALLBACK_REGION),
         aws_env_settings: false,
+        // An ambiguous environment fails the boot instead of signing the
+        // cluster's backups as the node's instance role
+        // (manager-workload-identity calls #5).
+        ambient_fallthrough: false,
     }
 }
 

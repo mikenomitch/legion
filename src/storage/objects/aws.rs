@@ -138,14 +138,46 @@ pub fn resolve_principal(
     credential: &ObjectCredential,
     env: &dyn Fn(&str) -> Option<String>,
 ) -> R<Principal> {
+    resolve_principal_with(credential, env, false)
+}
+
+/// [`resolve_principal`], with `fallthrough` choosing what an ambiguous
+/// ambient environment does ([`OpenOptions::ambient_fallthrough`]): refuse
+/// (`false`), or warn once and continue down the chain to the next provider
+/// `object_store` would use, ending at instance metadata (`true`). Half a key
+/// pair is refused either way, as `object_store` refuses it.
+pub fn resolve_principal_with(
+    credential: &ObjectCredential,
+    env: &dyn Fn(&str) -> Option<String>,
+    fallthrough: bool,
+) -> R<Principal> {
     match credential {
         ObjectCredential::Anonymous => Ok(Principal::Anonymous),
         ObjectCredential::Aws(aws) => {
             validate_key_pair(&aws.keys, &aws.origin)?;
             Ok(Principal::Explicit(aws.keys.clone()))
         }
-        ObjectCredential::Ambient => resolve_ambient(env),
+        ObjectCredential::Ambient => resolve_ambient(env, fallthrough),
     }
+}
+
+/// Refuse an ambiguous ambient environment, or (with `fallthrough`) warn
+/// about it once per process and let the chain continue.
+fn ambiguous(problem: String, fallthrough: bool) -> R<()> {
+    if !fallthrough {
+        bail!("{problem}");
+    }
+    static WARNED: std::sync::OnceLock<Mutex<std::collections::HashSet<String>>> =
+        std::sync::OnceLock::new();
+    let first = WARNED
+        .get_or_init(|| Mutex::new(std::collections::HashSet::new()))
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .insert(problem.clone());
+    if first {
+        warn!(problem = %problem, "Object storage continues down the AWS credential chain");
+    }
+    Ok(())
 }
 
 /// [`resolve_principal`] against the real process environment — the same one
@@ -166,7 +198,7 @@ pub fn environment_region(env: &dyn Fn(&str) -> Option<String>) -> Option<String
     nonempty(ENV_REGION).or_else(|| nonempty(ENV_DEFAULT_REGION))
 }
 
-fn resolve_ambient(env: &dyn Fn(&str) -> Option<String>) -> R<Principal> {
+fn resolve_ambient(env: &dyn Fn(&str) -> Option<String>, fallthrough: bool) -> R<Principal> {
     let nonempty = |name: &str| env(name).filter(|value| !value.trim().is_empty());
 
     let id = nonempty(ENV_ACCESS_KEY_ID);
@@ -191,14 +223,22 @@ fn resolve_ambient(env: &dyn Fn(&str) -> Option<String>) -> R<Principal> {
                 token_file,
             })
         }
-        (Some(_), None) => bail!(
-            "{ENV_WEB_IDENTITY_TOKEN_FILE} is set but {ENV_ROLE_ARN} is not; web identity \
-             needs both, and without them object storage would fall back to instance metadata"
-        ),
-        (None, Some(_)) => bail!(
-            "{ENV_ROLE_ARN} is set but {ENV_WEB_IDENTITY_TOKEN_FILE} is not; web identity \
-             needs both, and without them object storage would fall back to instance metadata"
-        ),
+        (Some(_), None) => ambiguous(
+            format!(
+                "{ENV_WEB_IDENTITY_TOKEN_FILE} is set but {ENV_ROLE_ARN} is not; web identity \
+                 needs both, and without them object storage would fall back to instance \
+                 metadata"
+            ),
+            fallthrough,
+        )?,
+        (None, Some(_)) => ambiguous(
+            format!(
+                "{ENV_ROLE_ARN} is set but {ENV_WEB_IDENTITY_TOKEN_FILE} is not; web identity \
+                 needs both, and without them object storage would fall back to instance \
+                 metadata"
+            ),
+            fallthrough,
+        )?,
         (None, None) => {}
     }
 
@@ -207,12 +247,15 @@ fn resolve_ambient(env: &dyn Fn(&str) -> Option<String>) -> R<Principal> {
     }
 
     if nonempty(ENV_CONTAINER_FULL_URI).is_some() {
-        bail!(
-            "{ENV_CONTAINER_FULL_URI} is set (EKS Pod Identity), which Legion's object-storage \
-             client does not support: it would fall back to the node's instance role. Use IRSA \
-             ({ENV_WEB_IDENTITY_TOKEN_FILE} + {ENV_ROLE_ARN}) or explicit keys \
-             (persistence.streaming.credentials, contentStore.auth.kv)"
-        );
+        ambiguous(
+            format!(
+                "{ENV_CONTAINER_FULL_URI} is set (EKS Pod Identity), which Legion's \
+                 object-storage client does not support: it would fall back to the node's \
+                 instance role. Use IRSA ({ENV_WEB_IDENTITY_TOKEN_FILE} + {ENV_ROLE_ARN}) or \
+                 explicit keys (persistence.streaming.credentials, contentStore.auth.kv)"
+            ),
+            fallthrough,
+        )?;
     }
 
     Ok(Principal::InstanceMetadata)
@@ -593,6 +636,47 @@ mod aws_test {
         )]);
         let err = resolve_principal(&ObjectCredential::Ambient, &env).unwrap_err();
         assert!(err.to_string().contains("EKS Pod Identity"), "{err}");
+    }
+
+    /// A node's own stores keep `from_env`'s behavior: an ambiguous
+    /// environment continues down the chain (warning once) instead of
+    /// failing, while streaming persistence's strict resolution refuses it.
+    /// Half a key pair is refused either way.
+    #[test]
+    fn an_ambiguous_environment_falls_through_only_when_asked_test() {
+        let ambient = ObjectCredential::Ambient;
+        for vars in [
+            vec![(ENV_ROLE_ARN, "arn:aws:iam::1:role/r")],
+            vec![(ENV_WEB_IDENTITY_TOKEN_FILE, "/var/run/token")],
+            vec![(
+                ENV_CONTAINER_FULL_URI,
+                "http://169.254.170.23/v1/credentials",
+            )],
+        ] {
+            let env = env_of(&vars);
+            assert!(
+                resolve_principal_with(&ambient, &env, false).is_err(),
+                "{vars:?}"
+            );
+            assert_eq!(
+                resolve_principal_with(&ambient, &env, true).unwrap(),
+                Principal::InstanceMetadata,
+                "{vars:?}"
+            );
+        }
+        // A half web identity with an ECS role behind it lands on the role,
+        // as object_store's own chain would.
+        let env = env_of(&[
+            (ENV_ROLE_ARN, "arn:aws:iam::1:role/r"),
+            (ENV_CONTAINER_RELATIVE_URI, "/v2/credentials/x"),
+        ]);
+        assert!(matches!(
+            resolve_principal_with(&ambient, &env, true).unwrap(),
+            Principal::ContainerRole { .. }
+        ));
+        let half_pair = env_of(&[(ENV_ACCESS_KEY_ID, "AKIA")]);
+        assert!(resolve_principal_with(&ambient, &half_pair, true).is_err());
+        assert!(OpenOptions::default().ambient_fallthrough);
     }
 
     #[test]

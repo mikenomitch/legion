@@ -707,17 +707,20 @@ signs as the node, resolved in the order
 `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` (+ `AWS_SESSION_TOKEN`)
 variables, then web identity (`AWS_WEB_IDENTITY_TOKEN_FILE` +
 `AWS_ROLE_ARN`, which EKS IRSA injects), then an ECS task role
-(`AWS_CONTAINER_CREDENTIALS_RELATIVE_URI`), then the instance profile. A
-configuration that would quietly fall through to the instance profile, a
-different and usually broader principal, fails the operation instead and
-says why: half a key pair, one of the two web-identity variables without the
-other, or EKS Pod Identity (`AWS_CONTAINER_CREDENTIALS_FULL_URI`), which is
-not supported:
+(`AWS_CONTAINER_CREDENTIALS_RELATIVE_URI`), then the instance profile. Half
+a key pair fails the operation. A configuration that is ambiguous — one of
+the two web-identity variables without the other, or EKS Pod Identity
+(`AWS_CONTAINER_CREDENTIALS_FULL_URI`), which is not supported — continues
+down the chain, usually to the instance profile, and the process logs a
+warning once that names the variable:
 
 ```text
-AWS_WEB_IDENTITY_TOKEN_FILE is set but AWS_ROLE_ARN is not; web identity needs
-both, and without them object storage would fall back to instance metadata
+WARN Object storage continues down the AWS credential chain problem="AWS_WEB_IDENTITY_TOKEN_FILE is set but AWS_ROLE_ARN is not; web identity needs both, and without them object storage would fall back to instance metadata"
 ```
+
+Streaming persistence refuses the same configurations instead
+([Credentials](persistence-streaming.md#credentials)), so a backup never signs
+as a broader principal than the one configured.
 
 **Region.** An `s3://` store's region is the URL's `?region=`, then the KV
 credential's `region`, then the node's `AWS_REGION` (or `AWS_DEFAULT_REGION`),
@@ -989,8 +992,8 @@ Remember the allowlists. Add a custom scheme to the cluster's
   `auth.kv` or the node's ambient credentials.
 - **EKS Pod Identity, `~/.aws/credentials` profiles and SSO are not
   ambient sources.** `object_store`'s AWS chain stops at the four sources
-  above. Pod Identity is refused rather than downgraded to the node's
-  instance role. On EKS use IRSA, or `auth.kv`.
+  above. With Pod Identity set, a `contentStore` signs as the node's
+  instance role (with a warning); on EKS use IRSA, or `auth.kv`.
 - **`s3://` is the only object-store backend.** There is no GCS-native or
   Azure path; S3-compatible endpoints (R2, MinIO, GCS interop) work.
 - **Checksums verify single-file payloads** (and, for OCI, the manifest

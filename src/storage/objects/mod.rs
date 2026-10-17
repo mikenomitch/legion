@@ -423,16 +423,27 @@ pub struct OpenOptions {
     /// never come from here. Streaming persistence turns it off: its config
     /// describes its stores completely.
     pub aws_env_settings: bool,
+    /// When the ambient environment is ambiguous — one web-identity variable
+    /// without the other, or EKS Pod Identity, which `object_store` cannot
+    /// use — sign as the next provider in the chain (in the end, the
+    /// instance-metadata role) and warn once, the way
+    /// `AmazonS3Builder::from_env` always has, instead of refusing. A node's
+    /// own stores, artifact fetches, and the manager's archive reads keep
+    /// that behavior; streaming persistence turns it off and refuses, so a
+    /// backup never silently signs as a broader principal.
+    pub ambient_fallthrough: bool,
 }
 
 impl Default for OpenOptions {
     /// A node's own store: no conditional puts, the environment's region and
-    /// settings.
+    /// settings, and an ambiguous ambient environment falling through the
+    /// chain with a warning.
     fn default() -> Self {
         OpenOptions {
             conditional_put: false,
             region_default: RegionDefault::Environment,
             aws_env_settings: true,
+            ambient_fallthrough: true,
         }
     }
 }
@@ -470,7 +481,8 @@ pub fn open_s3(
     credential: &ObjectCredential,
     options: &OpenOptions,
 ) -> R<Arc<dyn ObjectStore>> {
-    let principal = aws::resolve_from_process_env(credential)?;
+    let principal =
+        aws::resolve_principal_with(credential, &aws::process_env, options.ambient_fallthrough)?;
     let decided = aws::plan(
         location,
         credential,

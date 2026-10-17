@@ -165,8 +165,11 @@ is unchanged.
 One URL parser, one `open(url, credential, options)` returning
 `Arc<dyn ObjectStore>`, one credential resolver; content publish, the S3
 artifact fetcher, session manifests, the manager archive, and streaming
-persistence all go through it. Details and the behavior each consumer kept
-are in the calls doc.
+persistence all go through it. `OpenOptions` names what legitimately differs
+between consumers (conditional puts, the region default, whether the
+process's other `AWS_*` settings apply, and whether an ambiguous ambient
+environment falls through or is refused). The behavior each consumer kept,
+and the three bugs the unification fixed, are calls entries 3 and 6–8.
 
 ### 5.5 Protocols
 

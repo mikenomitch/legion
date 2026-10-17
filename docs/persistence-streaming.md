@@ -114,9 +114,10 @@ is configured wins:
 
 This is the order every object store in Legion resolves ambient
 credentials in: a worker's [`contentStore`](artifacts.md#publishing-content)
-and the manager's archive reads use sources 2 to 5 the same way, with the same
-refusals. Two things are specific to streaming persistence: the `credentials`
-block, and that its stores are described entirely by its own config. The
+and the manager's archive reads use sources 2 to 5 the same way. Three things
+are specific to streaming persistence: the `credentials` block, the refusals
+above (a `contentStore` warns and continues down the chain instead), and that
+its stores are described entirely by its own config. The
 bucket, region and endpoint come from `replicaUrl` and
 `lease.objectStorage`, and the environment's other `AWS_*` store settings
 (`AWS_REGION`, `AWS_ENDPOINT`, `AWS_ALLOW_HTTP`) are not read.

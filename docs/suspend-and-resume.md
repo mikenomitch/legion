@@ -1129,9 +1129,10 @@ applies) is reached with that credential. Any other is reached with the
 manager's ambient credentials, resolved in the same order a worker's are
 (the `AWS_*` key variables, web identity, an ECS task role, then the
 instance profile; see
-[Publishing content](artifacts.md#publishing-content)), and a configuration
-that would fall through to the instance profile by accident fails the read
-instead.
+[Publishing content](artifacts.md#publishing-content)). An ambiguous
+configuration (one web-identity variable without the other, or EKS Pod
+Identity) continues down the chain to the instance profile with a warning,
+as a worker's does.
 
 ## Identity after a resume
 

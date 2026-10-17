@@ -3849,7 +3849,7 @@ Phases 1 and 2 shipped (see Done, KV & secrets).
       survived, so it cannot tear down the others' namespaces under
       `/var/run/netns`. Sweep `legion-*` namespaces with no desired
       allocation on the first acknowledged heartbeat
-      ([swappable seams calls #10](calls/swappable-seams-plan_calls.md)).
+      ([swappable seams calls #20](calls/swappable-seams-plan_calls.md)).
 
 Datapath performance: [datapath-performance-plan.md](plans/datapath-performance-plan.md)
 · calls: [datapath-performance-plan_calls.md](calls/datapath-performance-plan_calls.md).
@@ -4129,6 +4129,23 @@ Plans: [persistence-plan.md](plans/persistence-plan.md), [multi-raft-persistence
       per lane. Revisit on an openraft upgrade. [calls #16](calls/architecture-audit-2026-10-09_calls.md).
 - [ ] **The exec-ws and telemetry listeners only log a bind failure.** The
       gRPC listener now ends the process (audit M2). These two don't.
+- [ ] **Object storage: native GCS and Azure.** Every store opens through
+      `src/storage/objects/`; a backend is an `object_store` Cargo feature, a
+      `Scheme` arm, a `Backend` variant, and an `ObjectCredential` variant.
+      None was added (S3-compatible endpoints, GCS interop included, work).
+- [ ] **A worker resolves its object-store principal on first use, not at
+      boot.** Streaming persistence resolves and logs its principal when the
+      manager starts; a worker's `contentStore` finds a broken environment
+      only at its first publish or restore.
+- [ ] **Decide whether a `contentStore` should refuse an ambiguous AWS
+      environment** (one web-identity variable without the other, EKS Pod
+      Identity) as streaming persistence does. Today it continues down the
+      chain to the instance role with a warning, which is what it always did
+      ([swappable seams calls #3](calls/swappable-seams-plan_calls.md)).
+- [ ] Measure `file://` publish throughput through `LocalFileSystem`'s
+      multipart upload against the old direct write
+      (`content_publish::tests::publish_throughput`;
+      [swappable seams calls #17](calls/swappable-seams-plan_calls.md)).
 
 ## Job types
 
@@ -6404,6 +6421,16 @@ Found on the live AWS rig (3 raft managers, 2 workers). Bug fixes, so no plan.
 - [x] **Mesh upstreams work.** The worker dropped the endpoint feed's
       `mesh_tls` flag, so connect upstreams dialed mesh-TLS endpoints in
       plaintext and were refused at the handshake (since mesh M7).
+- [x] **One object-storage layer.** `src/storage/objects/` parses every
+      store URL, resolves every principal through one chain, and opens every
+      store as `Arc<dyn ObjectStore>`; the `contentStore` publisher, session
+      manifests, the `s3://` fetcher, the manager's archive, and streaming
+      persistence use it instead of three S3 builders. It fixed three bugs
+      on the way: restore reads signed in a different region than the
+      publish, the archive matched a manifest to a sibling prefix's
+      credential, and a KV credential could be signed with the node's own
+      `AWS_SESSION_TOKEN` ([calls](calls/swappable-seams-plan_calls.md)
+      #3, #6–#8, #10–#12, #15–#17).
 - [x] **Pluggable cluster CA providers.** `clusterCa.provider` = `builtin`
       (the default) | `file` (an operator intermediate on disk) | `exec` (an
       external signer, with a Vault PKI helper in `plugins/cluster_ca/`);
