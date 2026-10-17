@@ -2511,8 +2511,14 @@ impl TaskPlugin for SandboxTaskPlugin {
             bridge: config.tap_bridge(),
             // Every restore moves the guest's vsock onto this allocation's
             // own socket: exec dials it, and on a gated guest the datapath
-            // already listens there.
+            // already listens beside it.
             vsock: Some(vsock_socket_base(&work_root(allocation, instance))),
+            // Only a gated allocation's datapath binds an egress proxy there;
+            // waiting on any other would cost the full wait every restore.
+            gated: allocation
+                .network
+                .as_ref()
+                .is_some_and(crate::structs::AllocNetwork::is_gated),
             datapath_wait: sandbox_checkpoint::DATAPATH_WAIT,
         };
         let scratch = target.scratch.clone();

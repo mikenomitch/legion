@@ -327,6 +327,29 @@ impl Netd {
         });
     }
 
+    /// Bind a gated sandbox's egress proxy before its launch, for the
+    /// delivery routes that start a task without a heartbeat: a `PostWork`
+    /// push and a `StreamWork` delta (`WorkerDaemonService::accept_work`).
+    /// A heartbeat's [`NetdInput::Desired`] binds its own deliveries before
+    /// the reconcile starts them. Without this, a restored guest would wait
+    /// the full `DATAPATH_WAIT` (5 s) for a socket only the next heartbeat
+    /// binds.
+    ///
+    /// The spec is the one [`specs::proxy_specs`] builds, so the next
+    /// desired set's sync keeps the listener as its own. Until that desired
+    /// set lands the policy, the proxy fails closed. `None` for anything but
+    /// a gated sandbox (a gated container or exec task gets its namespace,
+    /// and the proxy inside it, from the heartbeat). Otherwise whether the
+    /// proxy is serving: a bind that fails is logged, and the restore then
+    /// resumes fail-closed.
+    pub async fn bind_launch(&self, allocation: &TaskAllocation) -> Option<bool> {
+        let spec = specs::proxy_specs(std::slice::from_ref(allocation), &self.alloc_root)
+            .pop()
+            .filter(|spec| spec.attachment.guest_vsock().is_some())?;
+        let proxies = self.forwarder.proxies()?;
+        Some(proxies.ensure(spec).await)
+    }
+
     /// Replay the persisted inputs for the allocations in `live` (the ones
     /// that survived the restart): listeners, VIPs, resolvers, egress
     /// proxies, ingress ports, identities and policy bodies come back from
@@ -617,6 +640,22 @@ mod tests {
         )
     }
 
+    /// [`netd`] with egress proxies attached.
+    fn netd_with_proxies(root: &std::path::Path) -> Netd {
+        let context = Arc::new(ForwarderContext::new(
+            Arc::new(NetPolicyCache::new()),
+            Arc::new(Denials::new()),
+        ));
+        Netd::new(
+            Arc::new(
+                UpstreamForwarder::with_context(context.clone()).with_proxies(Arc::new(
+                    crate::worker::netd::proxy::EgressProxies::new(context),
+                )),
+            ),
+            root.to_path_buf(),
+        )
+    }
+
     async fn free_port() -> u16 {
         let socket = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         socket.local_addr().unwrap().port()
@@ -837,6 +876,61 @@ mod tests {
         assert!(tokio::net::TcpStream::connect(("127.0.0.1", local_port))
             .await
             .is_ok());
+        Ok(())
+    }
+
+    /// A gated sandbox delivered without a heartbeat (a `StreamWork` delta
+    /// or a `PostWork` push, both through `accept_work`) has its egress
+    /// proxy bound by the launch path, and nothing else does. The next
+    /// desired set's sync keeps the launch path's listener, and the next
+    /// launch rebinds it if a failed start removed its socket. The restore
+    /// that then finds the socket is in `sandbox_checkpoint`'s tests.
+    #[tokio::test]
+    async fn a_gated_sandbox_delivered_without_a_heartbeat_binds_its_proxy() -> R<()> {
+        use std::os::unix::fs::MetadataExt;
+        let root = TempDir::new()?;
+        let netd = netd_with_proxies(root.path());
+        let allocation = |allocation_id: i64, runtime: &str, mode: &str| TaskAllocation {
+            allocation_id,
+            task_name: "box".into(),
+            task_runtime: runtime.into(),
+            task_config: json!({ "image": "a" }).to_string(),
+            network: json!({ "mode": mode }).to_string(),
+            ..Default::default()
+        };
+        let gated = allocation(9, "sandbox", "gated");
+        assert_eq!(netd.bind_launch(&gated).await, Some(true));
+        assert_eq!(
+            netd.bind_launch(&allocation(8, "sandbox", "host")).await,
+            None
+        );
+        assert_eq!(
+            netd.bind_launch(&allocation(7, "container", "gated")).await,
+            None,
+            "a gated container's proxy binds inside its namespace, on the heartbeat"
+        );
+
+        let socket = crate::worker::netd::attach::guest_socket(
+            &crate::task_plugins::sandbox_dir_for(&root.path().join("9")),
+            crate::worker::netd::proxy::PROXY_PORT,
+        );
+        let bound = std::fs::metadata(&socket)?.ino();
+        netd.send(NetdInput::Desired(DesiredNetwork {
+            desired: vec![gated.clone()],
+            ..Default::default()
+        }))
+        .await;
+        assert_eq!(
+            std::fs::metadata(&socket)?.ino(),
+            bound,
+            "the heartbeat keeps the launch path's listener"
+        );
+        std::fs::remove_file(&socket)?;
+        assert_eq!(netd.bind_launch(&gated).await, Some(true));
+        assert!(
+            socket.exists(),
+            "the next launch binds a removed socket again"
+        );
         Ok(())
     }
 }

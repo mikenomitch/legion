@@ -1149,18 +1149,22 @@ restore's `restore_ms` leaves out the time the guest later spends loading
 pages, so judge a workload by its time to first response after the resume,
 not by `restore_ms` alone.
 
-Measured on AWS with cloud-hypervisor v53.0: a 2 GiB guest that had filled
-900 MiB, from a 2.4 GB checkpoint, logged `restore_ms` of about 5,040 with
-`lazy` and with `eager` alike. A resume took 5.0 seconds end to end. The
-suspend before it took 22 to 24 seconds, with the guest paused for 0.6 to
-2.7 seconds of that. Most of the 5 seconds is not the VMM. Before it
-resumes a restored guest, the node waits up to 5 seconds for the datapath's
-egress proxy socket. Every sandbox checkpoint records gated networking,
-because every guest has a vsock, so a guest that is not gated never gets
-that socket and its restore waits the full 5 seconds. That wait currently
-dominates a restore and hides the difference between `lazy` and `eager`.
-The node also logs `Resuming a restored gated sandbox before its egress
-proxy socket is bound` for such a guest, though it was never gated.
+A restore waits for the node datapath only when the sandbox is gated. A
+gated guest's restore waits up to 5 seconds for its egress proxy socket
+(see [Suspend and resume](suspend-and-resume.md)), and the node binds that
+socket before it launches the restore, whether the start arrived on a
+heartbeat, a push, or the work stream, so the wait normally returns at once.
+A sandbox that is not gated still has a vsock for exec, but no egress
+proxy, and its restore does not wait at all.
+
+An earlier measurement on AWS with cloud-hypervisor v53.0 logged
+`restore_ms` of about 5,040 with `lazy` and with `eager` alike, for a 2 GiB
+guest that had filled 900 MiB, from a 2.4 GB checkpoint. Almost all of
+that was a 5-second wait for an egress proxy socket that the sandbox, which
+was not gated, never got. Restores no longer wait in that case, so those
+numbers do not describe a restore today, and restore times without the wait
+have not been measured yet. In the same run, a suspend took 22 to 24
+seconds, with the guest paused for 0.6 to 2.7 seconds of that.
 
 **What a lazily restored guest depends on.** Until its memory is loaded, the
 guest reads it from the checkpoint's memory file on the node. Firecracker
