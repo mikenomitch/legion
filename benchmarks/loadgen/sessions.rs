@@ -120,7 +120,7 @@ pub async fn run(opts: SessionsOptions) -> Result<Value> {
     let mut managers: Vec<AuthedManagerClient> = Vec::new();
     for _ in 0..opts.connections.max(1) {
         for address in &opts.managers {
-            managers.push(connect_manager_client_at(address, timeouts.clone())?);
+            managers.push(connect_manager_client_at(address, timeouts)?);
         }
     }
     let managers = Arc::new(managers);

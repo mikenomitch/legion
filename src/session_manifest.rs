@@ -46,9 +46,9 @@ use std::time::Instant;
 
 use object_store::{path::Path as ObjectPath, ObjectStore, PutMode, PutOptions, UpdateVersion};
 use serde::{Deserialize, Serialize};
-use url::Url;
 
 use crate::prelude::*;
+use crate::storage::objects::StoreUrl;
 use crate::worker::session_log::SessionCheckpoint;
 
 /// The manifest format this build writes and reads.
@@ -369,10 +369,7 @@ impl ManifestBackend for FileManifestBackend {
     }
 
     fn url_for(&self, object: &str) -> String {
-        let path = self.path(object);
-        Url::from_file_path(&path)
-            .map(|url| url.to_string())
-            .unwrap_or_else(|_| format!("file://{}", path.display()))
+        crate::storage::objects::local_url(&self.path(object))
     }
 }
 
@@ -380,45 +377,38 @@ impl ManifestBackend for FileManifestBackend {
 // object stores (s3://, and the in-memory store the tests use)
 // ---------------------------------------------------------------------------
 
-/// Manifests in an `object_store` store. For S3 the client must be built
-/// with `S3ConditionalPut::ETagMatch`, which makes `PutMode::Create` send
-/// `If-None-Match: *` and `PutMode::Update` send `If-Match: <etag>`.
+/// Manifests in an `object_store` store. For S3 the client must be opened
+/// with conditional puts ([`crate::storage::objects::OpenOptions`]), which
+/// make `PutMode::Create` send `If-None-Match: *` and `PutMode::Update` send
+/// `If-Match: <etag>`.
 pub struct ObjectStoreManifestBackend {
     /// Builds the client per call, so rotated credentials are picked up.
     client: Box<dyn Fn() -> R<Arc<dyn ObjectStore>> + Send + Sync>,
-    /// The key prefix under the bucket (`s3://bucket/<prefix>`).
-    prefix: String,
-    /// The store's root URL, for `url_for`.
-    root: Url,
+    /// The store's root (`s3://bucket/<prefix>`): object keys and URLs.
+    root: StoreUrl,
 }
 
 impl std::fmt::Debug for ObjectStoreManifestBackend {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ObjectStoreManifestBackend")
-            .field("root", &self.root.as_str())
+            .field("root", &self.root.url().as_str())
             .finish_non_exhaustive()
     }
 }
 
 impl ObjectStoreManifestBackend {
     pub fn new(
-        root: Url,
+        root: StoreUrl,
         client: impl Fn() -> R<Arc<dyn ObjectStore>> + Send + Sync + 'static,
     ) -> Self {
-        let prefix = root.path().trim_matches('/').to_string();
         Self {
             client: Box::new(client),
-            prefix,
             root,
         }
     }
 
-    fn key(&self, object: &str) -> ObjectPath {
-        if self.prefix.is_empty() {
-            ObjectPath::from(object)
-        } else {
-            ObjectPath::from(format!("{}/{object}", self.prefix))
-        }
+    fn key(&self, object: &str) -> R<ObjectPath> {
+        self.root.key(object)
     }
 
     fn run<T>(&self, fut: impl std::future::Future<Output = T>) -> R<T> {
@@ -433,7 +423,7 @@ impl ObjectStoreManifestBackend {
 
     fn conditional(&self, object: &str, bytes: &[u8], mode: PutMode) -> Result<String, CasError> {
         let client = (self.client)()?;
-        let key = self.key(object);
+        let key = self.key(object)?;
         let payload = bytes.to_vec();
         let outcome = self.run(async move {
             client
@@ -462,7 +452,7 @@ impl ObjectStoreManifestBackend {
 impl ManifestBackend for ObjectStoreManifestBackend {
     fn get(&self, object: &str) -> R<Option<Versioned>> {
         let client = (self.client)()?;
-        let key = self.key(object);
+        let key = self.key(object)?;
         let url = self.url_for(object);
         self.run(async move {
             match client.get(&key).await {
@@ -500,7 +490,7 @@ impl ManifestBackend for ObjectStoreManifestBackend {
 
     fn put(&self, object: &str, bytes: &[u8]) -> R<()> {
         let client = (self.client)()?;
-        let key = self.key(object);
+        let key = self.key(object)?;
         let payload = bytes.to_vec();
         let url = self.url_for(object);
         self.run(async move {
@@ -515,12 +505,8 @@ impl ManifestBackend for ObjectStoreManifestBackend {
     fn list(&self, prefix: &str) -> R<Vec<String>> {
         use futures::TryStreamExt;
         let client = (self.client)()?;
-        let key = self.key(prefix.trim_end_matches('/'));
-        let strip = if self.prefix.is_empty() {
-            String::new()
-        } else {
-            format!("{}/", self.prefix)
-        };
+        let key = self.key(prefix.trim_end_matches('/'))?;
+        let root = self.root.clone();
         self.run(async move {
             let metas: Vec<object_store::ObjectMeta> = client
                 .list(Some(&key))
@@ -529,10 +515,7 @@ impl ManifestBackend for ObjectStoreManifestBackend {
                 .context("list session fence markers")?;
             let mut names: Vec<String> = metas
                 .into_iter()
-                .map(|meta| {
-                    let full = meta.location.to_string();
-                    full.strip_prefix(&strip).unwrap_or(&full).to_string()
-                })
+                .map(|meta| root.name_of(&meta.location))
                 .collect();
             names.sort();
             Ok(names)
@@ -541,7 +524,7 @@ impl ManifestBackend for ObjectStoreManifestBackend {
 
     fn delete(&self, object: &str) -> R<()> {
         let client = (self.client)()?;
-        let key = self.key(object);
+        let key = self.key(object)?;
         let url = self.url_for(object);
         self.run(async move {
             match client.delete(&key).await {
@@ -552,7 +535,7 @@ impl ManifestBackend for ObjectStoreManifestBackend {
     }
 
     fn url_for(&self, object: &str) -> String {
-        crate::content_publish::document_url(&self.root, object)
+        self.root.object_url(object)
     }
 }
 
@@ -1051,34 +1034,22 @@ impl SessionManifests {
     }
 }
 
-/// Build the manifest backend for a worker's `contentStore`.
+/// Build the manifest backend for a worker's `contentStore`. A `file://`
+/// store keeps the `flock` backend: `object_store`'s local filesystem cannot
+/// replace an object only if it is unchanged (`PutMode::Update`), which every
+/// claim needs.
 pub fn backend_for(
     target: &crate::content_publish::ContentStoreTarget,
     credentials: Arc<dyn crate::artifacts::CredentialSource>,
 ) -> R<Arc<dyn ManifestBackend>> {
-    let url = target.validate()?;
-    Ok(match url.scheme() {
-        "file" => Arc::new(FileManifestBackend::new(
-            url.to_file_path().expect("validated"),
-        )),
-        _ => {
-            let kv = target.auth.as_ref().and_then(|auth| auth.kv.clone());
-            let client_url = url.clone();
-            Arc::new(ObjectStoreManifestBackend::new(url, move || {
-                let credential = match kv.as_deref() {
-                    Some(path) => Some(
-                        credentials
-                            .kv_credential(path, client_url.as_str())
-                            .with_context(|| format!("contentStore credentials from kv {path}"))?,
-                    ),
-                    None => None,
-                };
-                let client =
-                    crate::content_publish::s3_client_conditional(&client_url, credential)?;
-                Ok(Arc::new(client) as Arc<dyn ObjectStore>)
-            }))
-        }
-    })
+    let root = target.validate()?;
+    if let Some(dir) = root.local_root() {
+        return Ok(Arc::new(FileManifestBackend::new(dir)));
+    }
+    let target = target.clone();
+    Ok(Arc::new(ObjectStoreManifestBackend::new(root, move || {
+        target.open(credentials.as_ref(), true)
+    })))
 }
 
 /// Whether a node that last reached a manager `since_manager` ago and its
@@ -1316,7 +1287,7 @@ mod session_manifest_test {
     fn object_store_backend_honours_the_same_preconditions_test() -> R<()> {
         let memory: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
         let backend: Arc<dyn ManifestBackend> = Arc::new(ObjectStoreManifestBackend::new(
-            Url::parse("s3://bucket/prefix")?,
+            StoreUrl::parse("s3://bucket/prefix")?,
             move || Ok(memory.clone()),
         ));
         let a = SessionManifests::new(backend.clone(), "node-a", "");

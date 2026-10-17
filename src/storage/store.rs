@@ -1417,6 +1417,10 @@ pub struct Store {
     // or written goes through it, and it is loaded from the replicated
     // `keyring_key` table at start and on every change to that table.
     keyring: Keyring,
+    // The cluster CA provider (docs/cluster-ca.md), built from `clusterCa`:
+    // which CA signs node, fleet, and manager certificates. Every reader of
+    // the trust bundle, the pin, or the chain goes through it.
+    cluster_ca: crate::manager::cluster_ca::ClusterCa,
 }
 
 /// Column list every `kv_entry` read uses, in the order
@@ -1989,6 +1993,7 @@ impl Store {
         // here, with the field named, rather than on the first KV write.
         config.encryption.validate()?;
         let keyring = Keyring::from_config(&config.encryption, &config.store_path)?;
+        let cluster_ca = crate::manager::cluster_ca::ClusterCa::from_config(&config.cluster_ca)?;
 
         let write_conn = Store::create_write_conn(&db_path, raft_enabled)?;
         let _migrations = Store::create_initial_tables(&Arc::clone(&write_conn))?;
@@ -2067,6 +2072,7 @@ impl Store {
             read_model_scrub_queue: Arc::new(std::sync::Mutex::new(Vec::new())),
             external_write_baseline: Arc::new(std::sync::Mutex::new(None)),
             keyring,
+            cluster_ca,
         };
         store.liveness.configure(config.liveness.settings());
 
@@ -8602,6 +8608,11 @@ impl Store {
         &self.sessions
     }
 
+    /// The cluster CA provider (docs/cluster-ca.md).
+    pub fn cluster_ca(&self) -> &crate::manager::cluster_ca::ClusterCa {
+        &self.cluster_ca
+    }
+
     /// Ask every other manager for its session index's answer to `request`
     /// (`RaftTransport.QuerySessions`, docs/session-mode.md). Empty outside
     /// raft mode, where this manager hears every heartbeat. A member that
@@ -13421,6 +13432,20 @@ impl Store {
         Ok(Some(mode))
     }
 
+    /// A node's `os` fingerprint, read on the placement path.
+    fn node_os(&self, tx: &Connection, node_id: &str) -> R<Option<String>> {
+        let attrs: Option<Value> = tx
+            .prepare_cached("SELECT fingerprint_attrs FROM node WHERE id = ?;")?
+            .query_row([node_id], |row| row.get(0))
+            .optional()?;
+        Ok(attrs.and_then(|attrs| {
+            attrs
+                .get(crate::structs::network::ATTR_NODE_OS)
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        }))
+    }
+
     /// A task's runtime, read on the placement path.
     fn task_runtime(&self, tx: &Connection, task_id: i64) -> R<Option<String>> {
         Ok(tx
@@ -13518,8 +13543,9 @@ impl Store {
         // routes 127/8; a block that cannot be assigned is not a placement
         // failure — the loopback ports still work — so this is best effort.
         let (vip_block, service_ports) = if has_upstreams
-            && crate::structs::platform_supports_vip_blocks()
-        {
+            && crate::structs::network::node_supports_vip_blocks(
+                self.node_os(tx, node_id)?.as_deref(),
+            ) {
             let block = crate::structs::next_vip_block(&used_blocks).ok();
             if block.is_none() {
                 warn!(node_id = %node_id, "No free VIP block; upstreams get loopback ports only");
@@ -31374,6 +31400,40 @@ mod tests {
                 .map(|upstream| upstream.balance.as_str()),
             Some(crate::structs::DEFAULT_BALANCE)
         );
+        Ok(())
+    }
+
+    /// A VIP block (name-is-config) follows the node the allocation lands
+    /// on, not the OS of the manager placing it: a Linux node gets one, a
+    /// macOS node and a node that reported no `os` do not, whatever this
+    /// process runs on.
+    #[test]
+    fn vip_blocks_follow_the_nodes_os_not_the_managers_test() -> R<()> {
+        let store = setup_store()?;
+        let node = |id: &str, os: Option<&str>| {
+            let mut node = make_node_msg(id, "ready");
+            if let Some(os) = os {
+                node.fingerprint_attrs = json!({ "os": os }).to_string();
+            }
+            node
+        };
+        store.insert_node(node("linux-node", Some("linux")))?;
+        store.insert_node(node("mac-node", Some("macos")))?;
+        store.insert_node(node("bare-node", None))?;
+        let task = connect_task("api", json!([{ "service": "db" }]));
+        submit_service_job(&store, "svc-vip-os", vec![task])?;
+        let task_id = task_id_for(&store, "api", "svc-vip-os")?;
+
+        let vip_block = |node_id: &str| -> R<Option<String>> {
+            Ok(store
+                .place_alloc(node_id, task_id)?
+                .network
+                .context("an allocation with upstreams has a network")?
+                .vip_block)
+        };
+        assert!(vip_block("linux-node")?.is_some());
+        assert_eq!(vip_block("mac-node")?, None);
+        assert_eq!(vip_block("bare-node")?, None);
         Ok(())
     }
 

@@ -39,8 +39,10 @@ use crate::structs::netpolicy::{ConnectFacts, Verdict, PROTOCOL_TCP};
 use crate::structs::{parse_upstream_target, UpstreamTarget, UPSTREAM_LOOPBACK_ADDR};
 use crate::structs::{UpstreamCredential, UpstreamHttpConfig};
 use crate::worker::balance::{balancer, default_balancer, Balancer, Endpoint, Outcome};
+use crate::worker::netd::attach::Attachment;
 use crate::worker::netd::handlers::{self, HopFacts, HopOutcome, ProxyTarget};
 use crate::worker::netd::http::HttpSettings;
+use crate::worker::netd::listen::{self, dial_tcp, spawn_accept_loop, ListenAddr};
 use crate::worker::netd::policy::{egress_connect_verdict, AllocIdentity};
 use crate::worker::netd::splice::{self as flow, SpliceStream};
 use crate::worker::netd::tls::MeshIdentity;
@@ -52,7 +54,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{OnceLock, RwLock};
 use std::time::{Duration, Instant};
 use tokio::io::AsyncWriteExt;
-use tokio::net::{TcpListener, TcpStream, UnixListener};
+use tokio::net::TcpStream;
 use tokio::task::JoinHandle;
 
 /// How long a single upstream dial may take before the forwarder gives up on
@@ -64,10 +66,6 @@ const DIAL_TIMEOUT: Duration = Duration::from_secs(2);
 /// Bounded so a service whose endpoints are all dead fails fast instead of
 /// walking the whole list.
 const MAX_DIAL_ATTEMPTS: usize = 3;
-
-/// Pause after a failed `accept()` so a persistent failure (descriptor
-/// exhaustion, most likely) cannot spin the accept loop hot.
-const ACCEPT_ERROR_BACKOFF: Duration = Duration::from_millis(100);
 
 /// Identifies one forwarder listener: an allocation and the upstream service
 /// it dials. A task may declare many upstreams; each gets its own listener.
@@ -99,21 +97,37 @@ pub struct UpstreamSpec {
     /// same listener state. `None` on platforms without 127/8 routing.
     pub vip: Option<String>,
     pub canonical_port: Option<u16>,
-    /// The gated namespace to bind inside (`network.mode = "gated"`); `None`
-    /// binds in the host namespace. A gated listener fails closed while its
-    /// policy is pending or its edge-boot gate is shut.
-    pub netns: Option<PathBuf>,
-    /// A gated sandbox's listener: the VMM's vsock host socket for
-    /// `local_port` (`<alloc>/.sandbox/vsock.sock_<local_port>`), which the
-    /// guest agent relays this upstream to, bound instead of a loopback
-    /// port. Gated like a namespace. The VIP is the guest's to serve, so
-    /// none is bound on the node.
-    pub vsock: Option<PathBuf>,
+    /// How the allocation is attached to the datapath: where the listener
+    /// binds (the node's loopback, inside a gated namespace, or a gated
+    /// sandbox's vsock host socket for `local_port`, which the guest agent
+    /// relays this upstream to) and whether it fails closed while policy is
+    /// pending or the edge-boot gate is shut. A sandbox guest serves its own
+    /// VIPs, so none is bound on the node for one.
+    pub attachment: Attachment,
 }
 
 impl UpstreamSpec {
     fn key(&self) -> UpstreamKey {
         (self.allocation_id, self.service.clone())
+    }
+
+    /// Where the upstream's loopback listener binds.
+    pub fn listen(&self) -> ListenAddr {
+        let loopback = UPSTREAM_LOOPBACK_ADDR
+            .parse()
+            .expect("the upstream loopback address parses");
+        self.attachment.listen(loopback, self.local_port)
+    }
+
+    /// Where its VIP listener binds, when it has one the node serves.
+    fn vip_listen(&self) -> Option<ListenAddr> {
+        let (Some(vip), Some(port)) = (self.vip.as_deref(), self.canonical_port) else {
+            return None;
+        };
+        if !self.attachment.serves_vips() || !crate::structs::platform_supports_vip_blocks() {
+            return None;
+        }
+        Some(self.attachment.listen(vip.parse().ok()?, port))
     }
 }
 
@@ -1069,7 +1083,7 @@ impl UpstreamShared {
             handlers: spec.handlers.clone(),
             credentials: spec.credentials.clone(),
             http: OnceLock::new(),
-            gated: spec.netns.is_some() || spec.vsock.is_some(),
+            gated: spec.attachment.is_gated(),
         }
     }
 
@@ -1357,33 +1371,17 @@ impl UpstreamForwarder {
 
     async fn start_listener(&self, spec: UpstreamSpec, shared: Arc<UpstreamShared>) {
         let key = spec.key();
-        let addr: SocketAddr = format!("{UPSTREAM_LOOPBACK_ADDR}:{}", spec.local_port)
-            .parse()
-            .expect("loopback socket address");
-        let bound = match spec.vsock.as_deref() {
-            Some(path) => bind_vsock_host_socket(path).map(|socket| {
-                debug!(
-                    allocation_id = spec.allocation_id,
-                    service = %spec.service,
-                    path = %path.display(),
-                    balance = %shared.balancer.name(),
-                    "Started upstream forwarder listener on vsock host socket"
-                );
-                tokio::spawn(run_unix_listener(socket, shared.clone()))
-            }),
-            None => crate::worker::netd::netns::bind_tcp(spec.netns.clone(), addr)
-                .await
-                .map(|socket| {
-                    debug!(
-                        allocation_id = spec.allocation_id,
-                        service = %spec.service,
-                        local_port = spec.local_port,
-                        balance = %shared.balancer.name(),
-                        "Started upstream forwarder listener"
-                    );
-                    tokio::spawn(run_listener(socket, shared.clone()))
-                }),
-        };
+        let listen = spec.listen();
+        let bound = listen.bind().await.map(|socket| {
+            debug!(
+                allocation_id = spec.allocation_id,
+                service = %spec.service,
+                listen = %listen,
+                balance = %shared.balancer.name(),
+                "Started upstream forwarder listener"
+            );
+            spawn_upstream_accept_loop(socket, &shared)
+        });
         match bound {
             Ok(task) => {
                 let vip_task = bind_vip(&spec, &shared).await;
@@ -1437,48 +1435,26 @@ impl UpstreamForwarder {
     }
 }
 
-/// Bind a gated sandbox's vsock host socket, replacing a stale one a
-/// previous listener (or worker) left behind. The VMM connects the guest's
-/// streams for that port here.
-fn bind_vsock_host_socket(path: &std::path::Path) -> R<UnixListener> {
-    if let Some(parent) = path.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-    let _ = std::fs::remove_file(path);
-    UnixListener::bind(path).with_context(|| format!("bind {}", path.display()))
-}
-
 /// Bind the upstream's VIP listener (`<vip>:<canonical port>`), when it has
-/// one and the platform routes 127/8. Shares the listener state, so policy,
-/// endpoints, and HTTP mode are identical whichever address the task dials.
+/// one the node serves. Shares the listener state, so policy, endpoints, and
+/// HTTP mode are identical whichever address the task dials.
 async fn bind_vip(spec: &UpstreamSpec, shared: &Arc<UpstreamShared>) -> Option<JoinHandle<()>> {
-    let (Some(vip), Some(port)) = (spec.vip.as_deref(), spec.canonical_port) else {
-        return None;
-    };
-    if !crate::structs::platform_supports_vip_blocks() {
-        return None;
-    }
-    let addr: SocketAddr = match format!("{vip}:{port}").parse() {
-        Ok(addr) => addr,
-        Err(_) => return None,
-    };
-    match crate::worker::netd::netns::bind_tcp(spec.netns.clone(), addr).await {
+    let listen = spec.vip_listen()?;
+    match listen.bind().await {
         Ok(socket) => {
             debug!(
                 allocation_id = spec.allocation_id,
                 upstream = %spec.service,
-                vip = %vip,
-                port,
+                listen = %listen,
                 "Started upstream VIP listener"
             );
-            Some(tokio::spawn(run_listener(socket, shared.clone())))
+            Some(spawn_upstream_accept_loop(socket, shared))
         }
         Err(err) => {
             debug!(
                 allocation_id = spec.allocation_id,
                 upstream = %spec.service,
-                vip = %vip,
-                port,
+                listen = %listen,
                 error = ?err,
                 "Failed to bind upstream VIP listener; the loopback port still serves"
             );
@@ -1513,46 +1489,24 @@ fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
-/// Accept loop for one upstream listener. Runs until aborted by `sync` (or by
-/// the forwarder being dropped); every accepted connection is forwarded on its
-/// own task so a slow dial never blocks the next client.
-#[instrument(skip_all, fields(allocation_id = shared.allocation_id, service = %shared.service))]
-async fn run_listener(socket: TcpListener, shared: Arc<UpstreamShared>) {
-    loop {
-        let (client, peer) = match socket.accept().await {
-            Ok(accepted) => accepted,
-            Err(err) => {
-                debug!(error = ?err, "Upstream forwarder accept failed");
-                tokio::time::sleep(ACCEPT_ERROR_BACKOFF).await;
-                continue;
-            }
-        };
-        let shared = shared.clone();
-        tokio::spawn(async move {
-            forward_connection(client, Some(peer), shared).await;
-        });
-    }
-}
-
-/// [`run_listener`] for a gated sandbox's vsock host socket. A stream from
-/// the VMM carries no peer address; the socket it arrived on is the
-/// attribution.
-#[instrument(skip_all, fields(allocation_id = shared.allocation_id, service = %shared.service))]
-async fn run_unix_listener(socket: UnixListener, shared: Arc<UpstreamShared>) {
-    loop {
-        let client = match socket.accept().await {
-            Ok((client, _)) => client,
-            Err(err) => {
-                debug!(error = ?err, "Upstream forwarder accept failed");
-                tokio::time::sleep(ACCEPT_ERROR_BACKOFF).await;
-                continue;
-            }
-        };
-        let shared = shared.clone();
-        tokio::spawn(async move {
-            forward_connection(client, None, shared).await;
-        });
-    }
+/// Accept loop for one upstream listener (its loopback port, its VIP, or a
+/// gated sandbox's vsock host socket). Runs until aborted by `sync` (or by
+/// the forwarder being dropped); every accepted connection is forwarded on
+/// its own task so a slow dial never blocks the next client.
+fn spawn_upstream_accept_loop(
+    socket: listen::Listener,
+    shared: &Arc<UpstreamShared>,
+) -> JoinHandle<()> {
+    let _span = tracing::debug_span!(
+        "upstream_listener",
+        allocation_id = shared.allocation_id,
+        service = %shared.service
+    )
+    .entered();
+    let shared = shared.clone();
+    spawn_accept_loop(socket, "upstream", move |client, peer| {
+        forward_connection(client, peer, shared.clone())
+    })
 }
 
 /// Forward one client connection.
@@ -1668,33 +1622,21 @@ where
         let _inflight_guard = InflightGuard::acquire(&shared, &endpoint.addr);
 
         let dialed = Instant::now();
-        let upstream =
-            match tokio::time::timeout(DIAL_TIMEOUT, TcpStream::connect(&endpoint.addr)).await {
-                Ok(Ok(upstream)) => upstream,
-                Ok(Err(err)) => {
-                    debug!(
-                        allocation_id = shared.allocation_id,
-                        service = %shared.service,
-                        endpoint = %endpoint.addr,
-                        error = ?err,
-                        "Upstream dial failed; trying the next endpoint"
-                    );
-                    shared.balancer.observe(&endpoint.addr, Outcome::Failure);
-                    remaining = Some(without(candidates, index));
-                    continue;
-                }
-                Err(_) => {
-                    debug!(
-                        allocation_id = shared.allocation_id,
-                        service = %shared.service,
-                        endpoint = %endpoint.addr,
-                        "Upstream dial timed out; trying the next endpoint"
-                    );
-                    shared.balancer.observe(&endpoint.addr, Outcome::Failure);
-                    remaining = Some(without(candidates, index));
-                    continue;
-                }
-            };
+        let upstream = match dial_tcp(&endpoint.addr, DIAL_TIMEOUT).await {
+            Ok(upstream) => upstream,
+            Err(err) => {
+                debug!(
+                    allocation_id = shared.allocation_id,
+                    service = %shared.service,
+                    endpoint = %endpoint.addr,
+                    error = %err,
+                    "Upstream dial failed; trying the next endpoint"
+                );
+                shared.balancer.observe(&endpoint.addr, Outcome::Failure);
+                remaining = Some(without(candidates, index));
+                continue;
+            }
+        };
         shared
             .balancer
             .observe(&endpoint.addr, Outcome::Latency(dialed.elapsed()));
@@ -1850,9 +1792,8 @@ async fn forward_external<C>(
         }
     }
     let _inflight_guard = InflightGuard::acquire(&shared, &destination);
-    let upstream = match tokio::time::timeout(DIAL_TIMEOUT, TcpStream::connect(&allowed[..])).await
-    {
-        Ok(Ok(upstream)) => {
+    let upstream = match dial_tcp(&allowed[..], DIAL_TIMEOUT).await {
+        Ok(upstream) => {
             shared.context.edges().record_connection(
                 shared.allocation_id,
                 &shared.service,
@@ -1861,24 +1802,13 @@ async fn forward_external<C>(
             );
             upstream
         }
-        Ok(Err(err)) => {
+        Err(err) => {
             debug!(
                 allocation_id = shared.allocation_id,
                 upstream = %shared.service,
                 destination = %destination,
-                error = ?err,
+                error = %err,
                 "External upstream dial failed"
-            );
-            net_metrics::connection("egress", PROTOCOL_TCP, "error");
-            let _ = client.shutdown().await;
-            return;
-        }
-        Err(_) => {
-            debug!(
-                allocation_id = shared.allocation_id,
-                upstream = %shared.service,
-                destination = %destination,
-                "External upstream dial timed out"
             );
             net_metrics::connection("egress", PROTOCOL_TCP, "error");
             let _ = client.shutdown().await;
@@ -2259,6 +2189,7 @@ impl Drop for InflightGuard {
 mod tests {
     use super::*;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
 
     /// Every wait in these tests is bounded by this and polls at
     /// [`POLL_INTERVAL`]; nothing sleeps for a fixed duration.
@@ -2277,8 +2208,7 @@ mod tests {
             credentials: Vec::new(),
             vip: None,
             canonical_port: None,
-            netns: None,
-            vsock: None,
+            attachment: Attachment::Host,
         }
     }
 
@@ -2499,8 +2429,14 @@ mod tests {
         use tokio::net::UnixStream;
 
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join(".sandbox").join("vsock.sock_20003");
-        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let scratch = dir.path().join(".sandbox");
+        let mut vsock = spec(free_port().await, "round_robin");
+        vsock.attachment = Attachment::GuestVsock {
+            scratch: scratch.clone(),
+        };
+        let path = scratch.join(format!("vsock.sock_{}", vsock.local_port));
+        assert_eq!(vsock.listen(), ListenAddr::Unix(path.clone()));
+        std::fs::create_dir_all(&scratch).unwrap();
         std::fs::write(&path, b"stale").unwrap();
         let live = spawn_echo("a").await;
         let cache = Arc::new(crate::worker::netd::NetPolicyCache::new());
@@ -2509,8 +2445,6 @@ mod tests {
             Arc::new(Denials::new()),
         ));
         let forwarder = UpstreamForwarder::with_context(context);
-        let mut vsock = spec(free_port().await, "round_robin");
-        vsock.vsock = Some(path.clone());
         forwarder.sync(std::slice::from_ref(&vsock)).await;
         assert_eq!(forwarder.active(), vec![vsock.clone()]);
         forwarder.set_endpoints(7, "db", vec![endpoint(&live)]);

@@ -124,11 +124,9 @@ pub async fn dial_guarded(
             ),
             GuardRefusal::Unresolved(reason) => reason,
         })?;
-    match tokio::time::timeout(timeout, tokio::net::TcpStream::connect(&addrs[..])).await {
-        Ok(Ok(stream)) => Ok(stream),
-        Ok(Err(err)) => Err(err.to_string()),
-        Err(_) => Err("dial timed out".to_string()),
-    }
+    crate::worker::netd::listen::dial_tcp(&addrs[..], timeout)
+        .await
+        .map_err(|err| err.to_string())
 }
 
 /// `host:port` text for an address list, for denial records.

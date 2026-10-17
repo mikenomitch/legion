@@ -1677,6 +1677,10 @@ struct KvDebounceState {
     flush_scheduled: bool,
 }
 
+/// The trust bundle's pins and when they were read (see
+/// `ManagerDaemonService::cluster_ca_pins`).
+type CachedCaPins = (Vec<String>, std::time::Instant);
+
 #[derive(Debug)]
 pub struct ManagerDaemonService {
     pub store: Store,
@@ -1727,10 +1731,10 @@ pub struct ManagerDaemonService {
     /// row lands. A failover shows nothing until the next heartbeat, which is
     /// at most one interval of incompleteness and never a wrong answer.
     provisional_claims: Arc<Mutex<HashMap<String, Vec<crate::structs::ProvisionalClaimReport>>>>,
-    /// The signing CA's pin, for `HeartbeatReply.cluster_ca_pin`, re-read at
-    /// most every few seconds: it changes only on a CA rotation, and the
-    /// heartbeat path must not pay a store read per beat for it.
-    ca_pin_cache: Arc<Mutex<Option<(String, std::time::Instant)>>>,
+    /// The trust bundle's pins, for `HeartbeatReply.cluster_ca_pins`,
+    /// re-read at most every few seconds: they change only when the CA does,
+    /// and the heartbeat path must not ask the CA provider per beat.
+    ca_pin_cache: Arc<Mutex<Option<CachedCaPins>>>,
     /// Heartbeat cadence settings (`heartbeat`, docs/heartbeat-cadence-and-scale.md).
     /// Read by the cadence report; the served interval itself comes from the
     /// status checker's ladder through the liveness table.
@@ -1817,8 +1821,6 @@ impl ManagerDaemonService {
         }
     }
 
-    /// The signing cluster CA's pin, cached for a few seconds (see
-    /// `ca_pin_cache`). Empty when no CA exists yet.
     /// The delegated exec keys for a heartbeat that asked with `version`:
     /// `(keys, current version)`, with no keys when the worker already holds
     /// the current set. Cached for a second, so a fleet of direct-exec
@@ -1853,23 +1855,28 @@ impl ManagerDaemonService {
         }
     }
 
-    fn cluster_ca_pin(&self) -> String {
+    /// The pins of every CA in the trust bundle, the anchor first, cached
+    /// for a few seconds (see `ca_pin_cache`). Empty when no CA exists yet
+    /// or this manager cannot vouch for one (its provider failed, or it
+    /// disagrees with the cluster), which a worker reads as "no news".
+    fn cluster_ca_pins(&self) -> Vec<String> {
         const TTL: Duration = Duration::from_secs(5);
         let mut cache = self.ca_pin_cache.lock().unwrap_or_else(|p| p.into_inner());
-        if let Some((pin, read_at)) = cache.as_ref() {
+        if let Some((pins, read_at)) = cache.as_ref() {
             if read_at.elapsed() < TTL {
-                return pin.clone();
+                return pins.clone();
             }
         }
-        let pin = self
+        let pins = self
             .store
-            .mesh_ca()
+            .cluster_ca()
+            .current(&self.store)
             .ok()
             .flatten()
-            .and_then(|ca| ca.pin().ok())
+            .map(|view| view.bundle_pins)
             .unwrap_or_default();
-        *cache = Some((pin.clone(), std::time::Instant::now()));
-        pin
+        *cache = Some((pins.clone(), std::time::Instant::now()));
+        pins
     }
 
     /// Overrides how often long-lived streams re-check their credential.
@@ -7298,47 +7305,47 @@ impl Manager for ManagerDaemonService {
         request: Request<GetMeshCaRequest>,
     ) -> Result<Response<GetMeshCaReply>, Status> {
         self.check_acl(&request, AclResource::Net, AclAction::Read, AclScope::any())?;
-        let ca = self
-            .store
-            .mesh_ca()
-            .map_err(|e| map_store_error("Error reading the mesh CA", e))?;
-        Ok(Response::new(match ca {
-            Some(ca) => {
-                let phase = ca.phase(time::OffsetDateTime::now_utc());
-                let (phase_name, overlap_until) = match phase {
-                    crate::storage::netpolicy_store::CaRotationPhase::Stable => {
-                        ("stable", String::new())
-                    }
-                    crate::storage::netpolicy_store::CaRotationPhase::Overlap { until } => (
-                        "overlap",
-                        until
-                            .format(&time::format_description::well_known::Rfc3339)
-                            .unwrap_or_default(),
-                    ),
-                };
-                GetMeshCaReply {
-                    bundle_pem: ca.bundle_pem(),
-                    pin: ca.pin().unwrap_or_default(),
-                    phase: phase_name.to_string(),
-                    previous_cert_pem: if overlap_until.is_empty() {
-                        String::new()
-                    } else {
-                        ca.previous_cert_pem.clone().unwrap_or_default()
-                    },
-                    overlap_until,
-                    cert_pem: ca.cert_pem,
-                    created_at: ca.created_at,
+        let store = self.store.clone();
+        // `status` may run the provider (`file` stats its files, `exec` may
+        // wait on its first `describe`): keep it off the async runtime.
+        let status = tokio::task::spawn_blocking(move || store.cluster_ca().status(&store))
+            .await
+            .map_err(|e| Status::internal(format!("cluster CA status task failed: {e}")))?;
+        let mut reply = GetMeshCaReply {
+            provider: status.provider.to_string(),
+            provider_location: status.location.clone(),
+            problem: status.problem.clone().unwrap_or_default(),
+            ..Default::default()
+        };
+        if let Some(view) = status.view {
+            let (phase_name, overlap_until) = match view.phase {
+                crate::storage::netpolicy_store::CaRotationPhase::Stable => {
+                    ("stable", String::new())
                 }
-            }
-            None => GetMeshCaReply::default(),
-        }))
+                crate::storage::netpolicy_store::CaRotationPhase::Overlap { until } => (
+                    "overlap",
+                    until
+                        .format(&time::format_description::well_known::Rfc3339)
+                        .unwrap_or_default(),
+                ),
+            };
+            reply.bundle_pem = view.bundle_pem;
+            reply.pin = view.pin;
+            reply.phase = phase_name.to_string();
+            reply.previous_cert_pem = view.previous_cert_pem.unwrap_or_default();
+            reply.overlap_until = overlap_until;
+            reply.cert_pem = view.signing_cert_pem;
+            reply.created_at = view.created_at;
+            reply.chain_pem = view.chain_pem;
+        }
+        Ok(Response::new(reply))
     }
 
     async fn rotate_mesh_ca(
         &self,
         request: Request<RotateMeshCaRequest>,
     ) -> Result<Response<RotateMeshCaReply>, Status> {
-        // The mesh CA signs every node's certificate, so rotating it is a
+        // The cluster CA signs every node's certificate, so rotating it is a
         // cluster-wide write. `AclScope::none()` carries no pool, so only an
         // unscoped `net:write` rule matches; `any()` (list gating) would let a
         // pool-scoped net admin rotate trust for every pool.
@@ -7348,11 +7355,19 @@ impl Manager for ManagerDaemonService {
             AclAction::Write,
             AclScope::none(),
         )?;
+        // Only the built-in CA rotates here; `file` and `exec` refuse with
+        // the procedure for their provider (docs/cluster-ca.md#rotation).
         let ca = self
             .store
-            .rotate_mesh_ca()
-            .map_err(|e| map_store_error("Error rotating the mesh CA", e))?;
-        let overlap_until = match ca.phase(time::OffsetDateTime::now_utc()) {
+            .cluster_ca()
+            .rotate(&self.store)
+            .map_err(|e| match e {
+                crate::manager::cluster_ca::CaError::Internal(err) => {
+                    map_store_error("Error rotating the cluster CA", err)
+                }
+                other => other.to_status(),
+            })?;
+        let overlap_until = match ca.phase {
             crate::storage::netpolicy_store::CaRotationPhase::Overlap { until } => until
                 .format(&time::format_description::well_known::Rfc3339)
                 .unwrap_or_default(),
@@ -7365,9 +7380,9 @@ impl Manager for ManagerDaemonService {
              until the overlap ends, and nodes re-issue on their next heartbeat"
         );
         Ok(Response::new(RotateMeshCaReply {
-            pin: ca.pin().unwrap_or_default(),
+            pin: ca.pin,
             overlap_until,
-            cert_pem: ca.cert_pem,
+            cert_pem: ca.signing_cert_pem,
             created_at: ca.created_at,
         }))
     }
@@ -7428,19 +7443,27 @@ impl Manager for ManagerDaemonService {
             }
             crate::manager::mesh_ca::CsrSubject::Fleet(req.fleet.clone())
         };
-        let ca = self
-            .store
-            .ensure_mesh_ca()
-            .map_err(|e| map_store_error("Error creating the cluster CA", e))?;
-        let (cert_pem, expires_at) =
-            crate::manager::mesh_ca::sign_csr(&ca.cert_pem, &ca.key_pem, &req.csr_pem, &subject)
-                .map_err(|e| {
-                    Status::invalid_argument(format!("invalid certificate signing request: {e:#}"))
-                })?;
+        // Signed through the cluster CA provider (docs/cluster-ca.md): the
+        // built-in CA, an operator's CA on disk, or an external signer whose
+        // answer is verified against the subject before it is handed out.
+        let store = self.store.clone();
+        let csr_pem = req.csr_pem.clone();
+        let issued = tokio::task::spawn_blocking(move || {
+            store.cluster_ca().sign_csr(&store, &csr_pem, &subject)
+        })
+        .await
+        .map_err(|e| Status::internal(format!("certificate signing task failed: {e}")))?
+        .map_err(|e| match e {
+            crate::manager::cluster_ca::CaError::Internal(err) => {
+                map_store_error("Error signing the node certificate", err)
+            }
+            other => other.to_status(),
+        })?;
+        let expires_at = issued.expires_at;
         info!(node_id = %req.node_id, fleet = %req.fleet, expires_at, "Issued node certificate");
         Ok(Response::new(IssueNodeCertificateReply {
-            cert_pem: format!("{cert_pem}{}", ca.chain_suffix()),
-            ca_pem: ca.bundle_pem(),
+            cert_pem: issued.chain(),
+            ca_pem: issued.bundle_pem,
             expires_at,
         }))
     }
@@ -7816,7 +7839,7 @@ impl Manager for ManagerDaemonService {
             next_interval_seconds,
             checkpoint_requests,
             content_resync,
-            cluster_ca_pin: self.cluster_ca_pin(),
+            cluster_ca_pins: self.cluster_ca_pins(),
             revoked_exec_sessions,
             exec_keys,
             exec_keys_version,

@@ -557,13 +557,7 @@ How to use it:
 
 | PR | What it lands | Notes |
 | --- | --- | --- |
-| [#45](https://github.com/mikenomitch/legion/pull/45) | The remaining `perf/*` branches stacked on main: lazy memory restore, chunked checkpoints on the work stream, elastic session envelopes, edge admission control, ratification without epoch fences, the keyed bind index and fused eval settles, and the worker lock fixes. Plus what the AWS rig found: non-blocking server console logs, `speculativeStart` on the dispatch, followers answering ratifications with not-leader, the settle window for a just-ratified claim, and an edge start's own instance identity | [results](../benchmarks/aws/sandbox-boot/RESULTS.md) · [sandbox boot calls](calls/sandbox-boot-throughput-plan_calls.md) · [ratify calls](calls/edge-ratify-throughput-plan_calls.md). The 5 s restore wait is open below |
-| [#42](https://github.com/mikenomitch/legion/pull/42) | Datapath performance: `least_latency` as the default strategy, HTTP-mode connection pooling, `splice(2)` for bulk L4 on Linux, the per-byte `legion_net_bytes_total` fix, `net_bench` | [plan](plans/datapath-performance-plan.md) · [calls](calls/datapath-performance-plan_calls.md); kTLS and multiplexed mesh tunnels deferred |
-| [#36](https://github.com/mikenomitch/legion/pull/36) | Session durability, routing, and edge starts, Phases 1–4 (concurrent node starts, `sessions.db` re-adopt, node tag in session ids and tag routing, session tickets, `Worker.StartSession`, `ListSessionNodes`, `legion session`), the session UI pass, and the sandbox spot-check and bottleneck-measurement plans. Phase 5 in progress | [plan](plans/session-durability-and-routing-plan.md) · [calls](calls/session-durability-and-routing-plan_calls.md) |
-| [#30](https://github.com/mikenomitch/legion/pull/30) | Sandbox scaling Phases 4–6: untombstoned 130-bit minted ids, `suspend.archive`, `stateful.mode = "session"` and `legion instance promote` | [plan](plans/sandbox-scaling-plan.md) §16 · [calls](calls/sandbox-scaling-plan_calls.md); sessions ship without idle sessions, identity, or a session log (calls #18) |
-| [#7](https://github.com/mikenomitch/legion/pull/7) | Read model follows SQLite in every mode: shadow check, `local_disk` changeset projection, outside-write guard, timed scrub | Bench needs a quiet-machine rerun; [plan](plans/read-model-coherence-plan.md) |
-| [#6](https://github.com/mikenomitch/legion/pull/6) | Fixes from the 2026-10-09 architecture audit | [audit](architecture-audit-2026-10-09.md); scheduler bench numbers pending |
-| [#4](https://github.com/mikenomitch/legion/pull/4) | Rename crate to `legion-rs`, crates.io metadata, `cargo install` docs | Not published yet; follow-ups under Templates, registry & packaging |
+| [#44](https://github.com/mikenomitch/legion/pull/44) | Swappable seams: one `Attachment` type for how an allocation reaches the datapath, a typed worker ↔ netd boundary (`Netd`, `NetdInput`/`NetdWants`/`NetdReport`), one listener and dialer, one object-storage layer, pluggable cluster CA providers (`builtin`/`file`/`exec`), DNS on hickory-proto and the egress proxy on hyper, plus the mesh-upstream, VIP-by-node-OS and pipelined-request fixes | [plan](plans/swappable-seams-plan.md) · [calls](calls/swappable-seams-plan_calls.md) · [CA plan](plans/cluster-ca-provider-plan.md); the `legion netd` process split and the rest deferred below |
 | [#162](https://github.com/mikenomitch/legion/pull/162) | Lanes hardening: worker-write forwarding, split-tolerant submits, adversarial fixes | Plan §8 + calls doc in [durability-and-ops-execution-plan.md](plans/durability-and-ops-execution-plan.md) |
 | [#143](https://github.com/mikenomitch/legion/pull/143) | Note the node-level builtin resource override gap | Docs only; the fix itself is a todo below |
 | [#84](https://github.com/mikenomitch/legion/pull/84) | Instrument DB hot paths, batch task-status updates | Old; rebase or close |
@@ -3370,6 +3364,17 @@ Plans: [task-runtime-plugins](../docs/task-runtime-plugins.md).
       or reclaim. [calls #12](calls/architecture-audit-2026-10-09_calls.md).
 - [ ] **Worker graceful shutdown.** The manager now handles SIGTERM (audit M3),
       the worker does not.
+- [ ] **The sandbox VMM is a closed enum matched about 76 times, and some
+      matches guess.** Several `match`es in
+      `src/task_plugins/sandbox_checkpoint.rs` (pause, resume, snapshot,
+      around lines 716-733 and 1719) send anything that is not Firecracker
+      to cloud-hypervisor's API, so a third VMM would compile and then call
+      the wrong one; and the VMM name aliases (`"fc"`, `"ch"`, ...) are
+      parsed in four places that disagree (`microvm.rs`,
+      `sandbox_checkpoint.rs`, `structs/network.rs`,
+      `manager/server/suspend_rpcs.rs`). Make the matches exhaustive and
+      parse names once now; a `Vmm` trait when QEMU or libvirt is scheduled
+      ([swappable seams plan](plans/swappable-seams-plan.md) §1).
 
 ## Rollouts
 
@@ -3616,6 +3621,12 @@ has open:
 - [ ] `legion net doctor` citing live-traffic evidence: it walks policy →
       mode → datapath status (M6) but does not yet pull the task's edges
       from the service graph (M8) into its verdict.
+- [ ] **A watchable catalog for outside load balancers and meshes.**
+      `ResolveService` is unary and `StreamEvents` carries no health
+      transitions, so an external proxy (Envoy, nginx, a Consul sync,
+      external-dns) has to poll. A `WatchService` stream, or health events on
+      `StreamEvents`, would let it follow the catalog; xDS stays out of scope
+      ([swappable seams plan](plans/swappable-seams-plan.md) §1).
 
 ## Networking
 
@@ -3816,6 +3827,23 @@ Phases 1 and 2 shipped (see Done, KV & secrets).
 - [ ] Credentials on policy objects (one key for every sandbox on a pool),
       with `UpsertNetPolicy` enforcing `kv:read` as it does for `certFrom`
       (plan §11).
+- [ ] **`ForwarderContext` is still one large type behind `Netd`.** The
+      worker now reaches the datapath only through `netd::Netd`
+      (`NetdInput` / `NetdWants` / `NetdReport`), but inside it one context
+      still holds policy, credentials, KV certificates, mesh TLS, the authz
+      cache, ledgers, and both host guards. Split it when the process split
+      lands ([swappable seams calls #2](calls/swappable-seams-plan_calls.md)).
+- [ ] **A wire encoding for `NetdInput`**, the remaining design work of the
+      `legion netd` process split (service-mesh calls 17). Secret-bearing
+      variants (credentials, KV certificates, the mesh key) must never be
+      written to `netd_state.json`, which holds only `DesiredNetwork` and
+      policy bodies.
+- [ ] **Gated namespaces of allocations that died during a worker restart
+      are never removed.** `Netd::restore` only knows the allocations that
+      survived, so it cannot tear down the others' namespaces under
+      `/var/run/netns`. Sweep `legion-*` namespaces with no desired
+      allocation on the first acknowledged heartbeat
+      ([swappable seams calls #20](calls/swappable-seams-plan_calls.md)).
 
 Datapath performance: [datapath-performance-plan.md](plans/datapath-performance-plan.md)
 · calls: [datapath-performance-plan_calls.md](calls/datapath-performance-plan_calls.md).
@@ -4095,6 +4123,23 @@ Plans: [persistence-plan.md](plans/persistence-plan.md), [multi-raft-persistence
       per lane. Revisit on an openraft upgrade. [calls #16](calls/architecture-audit-2026-10-09_calls.md).
 - [ ] **The exec-ws and telemetry listeners only log a bind failure.** The
       gRPC listener now ends the process (audit M2). These two don't.
+- [ ] **Object storage: native GCS and Azure.** Every store opens through
+      `src/storage/objects/`; a backend is an `object_store` Cargo feature, a
+      `Scheme` arm, a `Backend` variant, and an `ObjectCredential` variant.
+      None was added (S3-compatible endpoints, GCS interop included, work).
+- [ ] **A worker resolves its object-store principal on first use, not at
+      boot.** Streaming persistence resolves and logs its principal when the
+      manager starts; a worker's `contentStore` finds a broken environment
+      only at its first publish or restore.
+- [ ] **Decide whether a `contentStore` should refuse an ambiguous AWS
+      environment** (one web-identity variable without the other, EKS Pod
+      Identity) as streaming persistence does. Today it continues down the
+      chain to the instance role with a warning, which is what it always did
+      ([swappable seams calls #3](calls/swappable-seams-plan_calls.md)).
+- [ ] Measure `file://` publish throughput through `LocalFileSystem`'s
+      multipart upload against the old direct write
+      (`content_publish::tests::publish_throughput`;
+      [swappable seams calls #17](calls/swappable-seams-plan_calls.md)).
 
 ## Job types
 
@@ -4236,6 +4281,20 @@ Plan: [auth-acl-plan.md](plans/auth-acl-plan.md) · docs: [auth-and-acls.md](../
 - [ ] **`prune_expired_boot_tickets` is never called outside tests.**
 - [ ] **The ACL credential pruner runs only with ACLs enabled and isn't gated
       to the raft leader.**
+- [ ] **Switch a running cluster's CA provider without re-joining workers**
+      (cross-sign during an overlap, as the builtin rotation does).
+      [cluster-CA calls #13](calls/cluster-ca-provider-plan_calls.md)
+- [ ] **CA agreement is checked against the control-lane leader's record
+      only.** Two followers that each agree with the leader but not with each
+      other go unnoticed; record and compare every manager's view
+      ([cluster-CA plan §11](plans/cluster-ca-provider-plan.md)).
+- [ ] Exercise `plugins/cluster_ca/vault-pki/legion-ca-vault` against a live
+      Vault in CI (today it runs against a fake `vault` CLI).
+- [ ] An upstream-authority mode (a locally held intermediate from Vault or
+      AWS Private CA), or native Vault/AWS PCA providers, if `exec` signing
+      latency shows at scale ([cluster-CA plan §11](plans/cluster-ca-provider-plan.md)).
+- [ ] `legion keyring provider test` has no capability-catalog entry
+      ([cluster-CA calls #14](calls/cluster-ca-provider-plan_calls.md)).
 
 ## Observability
 
@@ -6331,3 +6390,49 @@ Found on the live AWS rig (3 raft managers, 2 workers). Bug fixes, so no plan.
       in `src/manager/scheduler.rs` builds `task_running` from the candidate
       nodes' rows, not the fleet, so `disruption.minAvailable` can bind
       tighter than documented when a task runs on nodes outside the pass.
+
+## Swappable seams (2026-10-14)
+
+[plan](plans/swappable-seams-plan.md) · [calls](calls/swappable-seams-plan_calls.md) · docs: [codebase-conventions.md](../docs/codebase-conventions.md#datapath-conventions), [network-handlers.md](../docs/network-handlers.md)
+
+- [x] **One attachment type for the datapath.** `netd::attach::Attachment`
+      (host, gated namespace, gated sandbox over vsock, TAP guest) is decided
+      once per allocation and carried by every listener spec; "fails closed"
+      comes from it, not from which socket path was set.
+- [x] **One listener and one dialer.** `netd::listen` (`ListenAddr`,
+      `spawn_accept_loop`, `dial_tcp`) replaces four copies of accept-loop
+      plumbing and five hard-coded dials.
+- [x] **A typed worker ↔ datapath boundary.** `netd::Netd` with
+      `NetdInput`, `NetdWants`, and `NetdReport`; spec building, status,
+      namespace capture, persistence and restore moved out of `daemon.rs`.
+      The process split itself stays open (Networking, above).
+- [x] **DNS on `hickory-proto`**, with truncated answers refetched over TCP
+      for TCP clients and `SERVFAIL` instead of a silent `1.1.1.1` fallback
+      when `resolv.conf` names no nameserver.
+- [x] **The egress proxy's HTTP on hyper.** Every request on a connection is
+      judged; a request pipelined behind an allowed one used to be spliced
+      through unchecked.
+- [x] **Mesh upstreams work.** The worker dropped the endpoint feed's
+      `mesh_tls` flag, so connect upstreams dialed mesh-TLS endpoints in
+      plaintext and were refused at the handshake (since mesh M7).
+- [x] **One object-storage layer.** `src/storage/objects/` parses every
+      store URL, resolves every principal through one chain, and opens every
+      store as `Arc<dyn ObjectStore>`; the `contentStore` publisher, session
+      manifests, the `s3://` fetcher, the manager's archive, and streaming
+      persistence use it instead of three S3 builders. It fixed three bugs
+      on the way: restore reads signed in a different region than the
+      publish, the archive matched a manifest to a sibling prefix's
+      credential, and a KV credential could be signed with the node's own
+      `AWS_SESSION_TOKEN` ([calls](calls/swappable-seams-plan_calls.md)
+      #3, #6–#8, #10–#12, #15–#17).
+- [x] **Pluggable cluster CA providers.** `clusterCa.provider` = `builtin`
+      (the default) | `file` (an operator intermediate on disk) | `exec` (an
+      external signer, with a Vault PKI helper in `plugins/cluster_ca/`);
+      Legion-chosen names verified on every non-builtin certificate; manager
+      certificates from CSRs; heartbeat bundle pins; a leader-recorded
+      agreement check; `legion net ca provider test`.
+      [plan](plans/cluster-ca-provider-plan.md) ·
+      [calls](calls/cluster-ca-provider-plan_calls.md) ·
+      [docs](../docs/cluster-ca.md)
+- [x] **VIP blocks follow the node's OS.** Placement asked the manager's own
+      OS, so a macOS manager gave its Linux nodes no VIP blocks.

@@ -89,6 +89,9 @@ rustls-pemfile = "2"
 webpki-roots = "1"
 # Reads the SANs off a verified mesh peer certificate (docs/network-handlers.md).
 x509-parser = "0.16"
+# DNS messages for the per-allocation resolvers (src/worker/netd/dns.rs):
+# parsing and building only; the resolvers forward to the host's own.
+hickory-proto = { version = "0.25.2", default-features = false, features = ["std"] }
 tonic-web = "0.12.3"
 tower-http = { version = "0.5.2", features = ["cors"] }
 tower = "0.4"

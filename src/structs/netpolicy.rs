@@ -56,9 +56,10 @@ pub const ON_ERROR_DENY: &str = "deny";
 pub const ON_ERROR_ALLOW: &str = "allow";
 pub const ON_ERRORS: &[&str] = &[ON_ERROR_DENY, ON_ERROR_ALLOW];
 
-/// Handler kinds config validation accepts. The datapath's registry
-/// (`crate::worker::netd::handlers::HANDLERS`) asserts it serves exactly this
-/// list, so the two cannot drift.
+/// Handler kinds config validation accepts. The datapath dispatches on
+/// these names: `authz` and `proxy` in `crate::worker::netd::handlers`, `dlp`
+/// and `log` in `crate::worker::netd::http`. A new kind is a name here plus
+/// its arm there.
 pub const HANDLER_AUTHZ: &str = "authz";
 pub const HANDLER_PROXY: &str = "proxy";
 pub const HANDLER_LOG: &str = "log";

@@ -285,9 +285,13 @@ impl NodeIdentity {
     }
 
     /// Whether to ask for a new certificate: none held, a third of its
-    /// life gone, under an hour left, or the manager names a signing CA the
-    /// held bundle lacks (a rotation).
-    pub fn needs_refresh(&self, manager_ca_pin: Option<&str>) -> bool {
+    /// life gone, under an hour left, or the manager's trust bundle differs
+    /// from the held one (`HeartbeatReply.cluster_ca_pins`, anchor first): a
+    /// different anchor means the CA that signs changed (a rotation), and a
+    /// different set means a CA was added to or removed from the bundle
+    /// (docs/cluster-ca.md#rotation). Either way the reply to the re-issue
+    /// carries the new bundle.
+    pub fn needs_refresh(&self, manager_ca_pins: Option<&[String]>) -> bool {
         let issued = self.issued.lock().unwrap_or_else(|p| p.into_inner());
         let Some(issued) = issued.as_ref() else {
             return true;
@@ -298,10 +302,8 @@ impl NodeIdentity {
         {
             return true;
         }
-        match manager_ca_pin.filter(|pin| !pin.is_empty()) {
-            Some(pin) => {
-                !crate::cluster_tls::bundle_contains_pin(&issued.ca_pem, pin).unwrap_or(false)
-            }
+        match manager_ca_pins.filter(|pins| !pins.is_empty()) {
+            Some(pins) => !bundle_matches(&issued.ca_pem, pins),
             None => false,
         }
     }
@@ -616,6 +618,18 @@ pub fn trust_manager_bundle(manager_addr: &str, roots: Arc<SwappableRoots>) {
     }
 }
 
+/// Whether a held bundle is the one the manager reports: the same anchor
+/// (first certificate) and the same set of CAs.
+fn bundle_matches(held_pem: &str, manager_pins: &[String]) -> bool {
+    let held = crate::cluster_tls::bundle_pins(held_pem);
+    if held.first() != manager_pins.first() {
+        return false;
+    }
+    let held: std::collections::BTreeSet<&String> = held.iter().collect();
+    let manager: std::collections::BTreeSet<&String> = manager_pins.iter().collect();
+    held == manager
+}
+
 #[cfg(test)]
 mod plane_test {
     use super::*;
@@ -797,7 +811,44 @@ mod plane_test {
         assert!(!foreign.has_certificate());
 
         // A manager naming a CA the bundle lacks asks for a refresh.
-        assert!(reloaded.needs_refresh(Some(&other_pin)));
+        assert!(reloaded.needs_refresh(Some(&[other_pin.clone()])));
+        Ok(())
+    }
+
+    /// The heartbeat names the manager's whole trust bundle, anchor first.
+    /// A worker re-issues when the anchor moved (the signing CA changed)
+    /// or a CA was added or removed, and not when nothing changed.
+    #[test]
+    fn a_bundle_change_or_a_new_anchor_asks_for_a_refresh_test() -> R<()> {
+        let (ca_a, ca_a_key) = crate::manager::mesh_ca::generate_ca()?;
+        let (ca_b, _) = crate::manager::mesh_ca::generate_ca()?;
+        let pin_a = crate::cluster_tls::ca_pin_pem(&ca_a)?;
+        let pin_b = crate::cluster_tls::ca_pin_pem(&ca_b)?;
+        let dir = tempfile::tempdir()?;
+        let identity = NodeIdentity::load(dir.path(), "node-1", None, None)?;
+        let csr = crate::manager::mesh_ca::csr_for_key(&identity.key_pem, "node-1")?;
+        let (cert_pem, expires) = crate::manager::mesh_ca::sign_csr(
+            &ca_a,
+            &ca_a_key,
+            &csr,
+            &crate::manager::mesh_ca::CsrSubject::Node("node-1".into()),
+        )?;
+        identity.install(&cert_pem, &ca_a, expires)?;
+
+        // Unchanged: no refresh.
+        assert!(!identity.needs_refresh(Some(&[pin_a.clone()])));
+        // A CA added to the bundle: refresh, to learn it before it signs.
+        assert!(identity.needs_refresh(Some(&[pin_a.clone(), pin_b.clone()])));
+        // The anchor moved to a CA the bundle already holds: refresh, so
+        // the leaf comes from the new CA before the old one is dropped.
+        identity.install(&cert_pem, &format!("{ca_a}{ca_b}"), expires)?;
+        assert!(!identity.needs_refresh(Some(&[pin_a.clone(), pin_b.clone()])));
+        assert!(identity.needs_refresh(Some(&[pin_b.clone(), pin_a.clone()])));
+        // A CA removed from the bundle: refresh, to stop trusting it.
+        assert!(identity.needs_refresh(Some(&[pin_a.clone()])));
+        // No news from the manager: nothing to compare.
+        assert!(!identity.needs_refresh(Some(&[])));
+        assert!(!identity.needs_refresh(None));
         Ok(())
     }
 }

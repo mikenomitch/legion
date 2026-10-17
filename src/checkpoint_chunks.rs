@@ -168,12 +168,8 @@ fn digest_of(digest: &[u8; 32]) -> ContentDigest {
 /// Whether every byte is zero. Sixteen bytes at a time: this runs over
 /// every published byte.
 fn is_zero(bytes: &[u8]) -> bool {
-    let words = bytes.chunks_exact(16);
-    let tail = words.remainder();
-    words
-        .map(|word| u128::from_ne_bytes(word.try_into().expect("16 bytes")))
-        .all(|word| word == 0)
-        && tail.iter().all(|byte| *byte == 0)
+    let (words, tail) = bytes.as_chunks::<16>();
+    words.iter().all(|word| u128::from_ne_bytes(*word) == 0) && tail.iter().all(|byte| *byte == 0)
 }
 
 fn sha256(bytes: &[u8]) -> [u8; 32] {
@@ -257,8 +253,11 @@ impl PartIndex {
                 bytes.len()
             );
         }
+        // The length check above leaves no remainder.
         let entries = bytes[INDEX_HEADER_BYTES..]
-            .chunks_exact(ENTRY_BYTES)
+            .as_chunks::<ENTRY_BYTES>()
+            .0
+            .iter()
             .map(|raw| match raw[0] {
                 0 => Ok(Entry::Zero),
                 1 => {

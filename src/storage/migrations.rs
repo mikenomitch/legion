@@ -2022,6 +2022,23 @@ fn migration_list() -> Vec<M<'static>> {
         DROP INDEX IF EXISTS idx_allocation_instance_config;
         DROP INDEX IF EXISTS idx_instance_keyed_live;",
         ),
+        // The cluster CA as the control-lane leader sees it
+        // (docs/cluster-ca.md, "Every manager must agree"): the provider
+        // kind, the anchor pin, and the trust bundle's pins. Public values
+        // only, never a key. Every other manager compares its own provider's
+        // view with this row and refuses to sign when the two would not
+        // trust each other. Control lane, like `net_mesh_ca`.
+        M::up(
+            "CREATE TABLE IF NOT EXISTS cluster_ca_record (
+            id INTEGER PRIMARY KEY CHECK (id = 1),
+            provider TEXT NOT NULL,
+            anchor_pin TEXT NOT NULL,
+            bundle_pins TEXT NOT NULL,
+            recorded_by TEXT NOT NULL,
+            recorded_at TEXT NOT NULL
+        );",
+        )
+        .down("DROP TABLE IF EXISTS cluster_ca_record;"),
     ]
 }
 

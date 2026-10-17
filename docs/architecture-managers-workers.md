@@ -406,6 +406,8 @@ listener and no setting that turns one on.
 - **Server identity.** The worker presents its node certificate,
   `<node>.node.legion` and `legion://node/<id>`, signed by the cluster CA
   from a CSR. The worker generated the key; the manager chose the names.
+  Which CA signs is the managers' `clusterCa` provider
+  ([The Cluster CA](cluster-ca.md)).
 - **Client identity.** Client certificates are requested but not required,
   because edge routers and direct-exec clients authenticate with tickets.
   A certificate that is presented must chain to the cluster CA, or the
@@ -433,9 +435,12 @@ listener and no setting that turns one on.
   ```
 
 - **Manager certificates.** Each manager mints its own client certificate
-  (`legion://manager/<id>`, where the id is the raft `nodeId`, or `local`)
-  from the CA key it already holds through the store, and re-mints it every 8
-  hours. Nothing is distributed.
+  (`legion://manager/<id>`, where the id is the raft `nodeId`, or `local`):
+  it generates the key and has a CSR signed by the cluster CA provider (the
+  built-in CA in the store by default, or a `file`/`exec` CA,
+  [The Cluster CA](cluster-ca.md)), and re-mints at a third of the
+  certificate's lifetime (8 hours for the built-in CA). No key is
+  distributed.
 - **The manager verifies the worker it dials.** Every manager-to-worker call
   (dispatch, exec, actions, logs, restart) dials the node's advertised
   address with the cluster CA as the only root and checks the server

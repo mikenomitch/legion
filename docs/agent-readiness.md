@@ -88,8 +88,8 @@ Even with `--allow-write`, `legion_state_query` stays read-only.
 | `legion_net_doctor` | no | Walk a task's network from policy to datapath and report where it breaks: the resolved policy, whether the mode enforces it, and, per allocation, whether the node's datapath is ready, enforcing the current policy, or fail-closed. Returns ok/warn/fail with fix hints. |
 | `legion_net_handler_test` | no | Probe an external handler the way the datapath would use it. An authz webhook must answer `{verdict}` to a sample facts payload. A proxy must accept a PROXY v2 header. Sends one synthetic request and never touches the cluster. |
 | `legion_service_edges` | no | The service graph: who calls whom through the datapath, with request rate, errors, denials, latency and bytes per (caller, service) over the window. Also lists declared-but-silent upstreams and whether each caller is on the service's allow list. |
-| `legion_net_ca_show` | no | The mesh CA certificate (PEM, never the key) that non-Legion clients trust to reach a mesh-TLS port. |
-| `legion_net_ca_rotate` | **yes** | Replace the mesh CA. Every node re-issues its certificate on its next heartbeat, and peers on different CAs refuse each other until then. |
+| `legion_net_ca_show` | no | The cluster CA as the answering manager sees it ([cluster-ca.md](cluster-ca.md)): the provider (`builtin`, `file`, `exec`) and where it comes from, the trust bundle (PEM, never a key) that non-Legion clients trust to reach a mesh-TLS port, the pin join tokens carry, the rotation phase, and `problem` when this manager will not sign (an unusable provider, or a CA that disagrees with the cluster's). |
+| `legion_net_ca_rotate` | **yes** | Rotate the built-in cluster CA in two steps: the new CA, cross-signed by the old one, signs at once and the old one stays trusted for 24 hours, so no connection breaks. Every node re-issues within one heartbeat. A `file` or `exec` CA rotates outside Legion: this returns `FailedPrecondition` with the procedure. |
 | `legion_net_policy_apply` | **yes** | Create or replace a network policy object. `dry_run` validates and lists affected allocations without writing. |
 | `legion_acl_whoami` | no | ACL status + caller identity (diagnose PermissionDenied). |
 | `legion_events` | no | List scheduler events. Poll with `after_id` to tail. `instance_id` narrows to one stateful instance (its own events plus its allocations'), `allocation_id` to one allocation. |
@@ -400,6 +400,22 @@ on every restore and fork. A platform agent reads it from `legion instance
 get <id> -j` (`guest_address`, `guest_bridge`), and the harness inside the
 guest reads `LEGION_GUEST_ADDR`. A fork never shares its origin's address. See
 [Addressing](task-runtime-sandbox.md#addressing).
+
+## 4c. Checking the cluster CA
+
+`legion net ca show -j` (MCP `legion_net_ca_show`, gRPC `GetMeshCa`)
+reports which provider supplies the cluster CA (`provider`,
+`providerLocation`) and, in `problem`, anything that stops the answering
+manager from signing: an unusable `file` CA, an `exec` signer that does not
+answer, or a CA that disagrees with the cluster's. An empty `problem` on
+every manager is the healthy state ([The Cluster CA](cluster-ca.md)).
+
+`legion net ca provider test -j -- <command…>` (or `--cert-path`/`--key-path`
+for `file` material) conformance-tests a provider locally and returns every
+check in the standard envelope (`data.checks[]` with `name`, `passed`,
+`detail`, plus the `config` line to paste on success). It is catalogued
+`mutates: false` but not `readOnlySafe`: it runs a local command, and an
+`exec` signer really issues the test certificates.
 
 ## 5. Idempotency keys
 

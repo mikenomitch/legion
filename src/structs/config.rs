@@ -140,6 +140,11 @@ pub struct ManagerConfig {
     /// Omitting it sweeps for idle instances every 15s.
     #[serde(default)]
     pub suspend: Option<SuspendManagerConfig>,
+    /// Where the cluster CA's signing key lives (docs/cluster-ca.md).
+    /// Omitting it uses the `builtin` CA: generated on first use and stored
+    /// in the replicated state store.
+    #[serde(default)]
+    pub cluster_ca: Option<ClusterCaConfig>,
 }
 
 /// Default `suspend.idleSweep`.
@@ -212,6 +217,199 @@ impl SuspendManagerConfig {
                 .unwrap_or_else(|| DEF_IDLE_SWEEP.to_string()),
             make_room: self.make_room.unwrap_or(true),
         }
+    }
+}
+
+/// `clusterCa.provider` values.
+pub const CLUSTER_CA_BUILTIN: &str = "builtin";
+pub const CLUSTER_CA_FILE: &str = "file";
+pub const CLUSTER_CA_EXEC: &str = "exec";
+/// Default timeout for one `exec` cluster CA provider call.
+pub const DEF_CLUSTER_CA_EXEC_TIMEOUT: &str = "10s";
+/// Default interval at which an `exec` provider's trust bundle is re-read.
+pub const DEF_CLUSTER_CA_REFRESH_INTERVAL: &str = "1m";
+
+/// The cluster CA provider (docs/cluster-ca.md): where the key that signs
+/// node, fleet, and manager certificates lives.
+///
+/// Omitting the block is the recommended configuration for most clusters:
+/// the `builtin` CA, generated on first use and stored in the replicated
+/// state store. The block exists for organizations whose certificates must
+/// chain to their own PKI.
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ClusterCaConfig {
+    /// `builtin` (default) | `file` | `exec`.
+    #[serde(default)]
+    pub provider: Option<String>,
+    /// `file` only, required: the signing CA certificate, PEM, optionally
+    /// followed by the intermediates that chain it to the trust bundle.
+    #[serde(default)]
+    pub cert_path: Option<String>,
+    /// `file` only, required: the signing CA's private key, PKCS#8 PEM
+    /// (`BEGIN PRIVATE KEY`).
+    #[serde(default)]
+    pub key_path: Option<String>,
+    /// `file` only: the CA certificates every holder trusts, PEM. Default:
+    /// the signing CA certificate itself.
+    #[serde(default)]
+    pub bundle_path: Option<String>,
+    /// `exec` only, required: the signer command (argv). See
+    /// docs/cluster-ca.md for the JSON contract and `plugins/cluster_ca/`
+    /// for the reference Vault PKI helper.
+    #[serde(default)]
+    pub command: Option<Vec<String>>,
+    /// `exec` only: how long one provider call may take. Default `10s`.
+    #[serde(default)]
+    pub timeout: Option<String>,
+    /// `exec` only: how often the trust bundle is re-read (`describe`).
+    /// Default `1m`.
+    #[serde(default)]
+    pub refresh_interval: Option<String>,
+}
+
+/// Resolved [`ClusterCaConfig`].
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ClusterCaConfigFull {
+    pub provider: String,
+    pub cert_path: String,
+    pub key_path: String,
+    /// Empty means "the signing CA certificate itself".
+    pub bundle_path: String,
+    pub command: Vec<String>,
+    pub timeout: String,
+    pub refresh_interval: String,
+}
+
+impl Default for ClusterCaConfigFull {
+    fn default() -> Self {
+        ClusterCaConfigFull {
+            provider: CLUSTER_CA_BUILTIN.into(),
+            cert_path: String::new(),
+            key_path: String::new(),
+            bundle_path: String::new(),
+            command: Vec::new(),
+            timeout: DEF_CLUSTER_CA_EXEC_TIMEOUT.into(),
+            refresh_interval: DEF_CLUSTER_CA_REFRESH_INTERVAL.into(),
+        }
+    }
+}
+
+impl ClusterCaConfig {
+    pub fn with_defaults(&self) -> ClusterCaConfigFull {
+        let defaults = ClusterCaConfigFull::default();
+        let text = |value: &Option<String>| {
+            value
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string)
+        };
+        ClusterCaConfigFull {
+            provider: text(&self.provider)
+                .map(|provider| provider.to_ascii_lowercase())
+                .unwrap_or(defaults.provider),
+            cert_path: text(&self.cert_path).unwrap_or_default(),
+            key_path: text(&self.key_path).unwrap_or_default(),
+            bundle_path: text(&self.bundle_path).unwrap_or_default(),
+            command: self.command.clone().unwrap_or_default(),
+            timeout: text(&self.timeout).unwrap_or(defaults.timeout),
+            refresh_interval: text(&self.refresh_interval).unwrap_or(defaults.refresh_interval),
+        }
+    }
+}
+
+impl From<ClusterCaConfigFull> for ClusterCaConfig {
+    fn from(val: ClusterCaConfigFull) -> Self {
+        let some = |value: String| (!value.is_empty()).then_some(value);
+        ClusterCaConfig {
+            provider: Some(val.provider),
+            cert_path: some(val.cert_path),
+            key_path: some(val.key_path),
+            bundle_path: some(val.bundle_path),
+            command: (!val.command.is_empty()).then_some(val.command),
+            timeout: Some(val.timeout),
+            refresh_interval: Some(val.refresh_interval),
+        }
+    }
+}
+
+impl ClusterCaConfigFull {
+    /// Reject combinations that cannot work, naming the field: at startup,
+    /// not on the first certificate.
+    pub fn validate(&self) -> R<()> {
+        let unused = |field: &str, set: bool| -> R<()> {
+            if set {
+                bail!(
+                    "clusterCa.{field} is set, but clusterCa.provider is \"{}\", which does \
+                     not use it (docs/cluster-ca.md)",
+                    self.provider
+                );
+            }
+            Ok(())
+        };
+        let file_fields =
+            !self.cert_path.is_empty() || !self.key_path.is_empty() || !self.bundle_path.is_empty();
+        match self.provider.as_str() {
+            CLUSTER_CA_BUILTIN => {
+                unused("certPath/keyPath/bundlePath", file_fields)?;
+                unused("command", !self.command.is_empty())?;
+            }
+            CLUSTER_CA_FILE => {
+                if self.cert_path.is_empty() || self.key_path.is_empty() {
+                    bail!(
+                        "clusterCa.provider = \"file\" needs `certPath` (the signing CA \
+                         certificate) and `keyPath` (its PKCS#8 key); see docs/cluster-ca.md"
+                    );
+                }
+                unused("command", !self.command.is_empty())?;
+            }
+            CLUSTER_CA_EXEC => {
+                if self.command.is_empty() {
+                    bail!(
+                        "clusterCa.provider = \"exec\" needs `command = [\"…\"]` (the signer \
+                         to run; see docs/cluster-ca.md and plugins/cluster_ca/)"
+                    );
+                }
+                unused("certPath/keyPath/bundlePath", file_fields)?;
+                humantime::parse_duration(&self.timeout).with_context(|| {
+                    format!(
+                        "clusterCa.timeout `{}` is not a duration (e.g. \"10s\")",
+                        self.timeout
+                    )
+                })?;
+                let refresh =
+                    humantime::parse_duration(&self.refresh_interval).with_context(|| {
+                        format!(
+                            "clusterCa.refreshInterval `{}` is not a duration (e.g. \"1m\")",
+                            self.refresh_interval
+                        )
+                    })?;
+                if refresh < Duration::from_secs(1) {
+                    bail!(
+                        "clusterCa.refreshInterval `{}` is shorter than 1s",
+                        self.refresh_interval
+                    );
+                }
+            }
+            other => bail!(
+                "clusterCa.provider `{other}` is not one of \"builtin\", \"file\", \"exec\" \
+                 (docs/cluster-ca.md)"
+            ),
+        }
+        Ok(())
+    }
+
+    /// `timeout` as a duration (validated at startup; 10s if unparseable).
+    pub fn timeout_duration(&self) -> Duration {
+        humantime::parse_duration(&self.timeout).unwrap_or(Duration::from_secs(10))
+    }
+
+    /// `refreshInterval` as a duration (validated at startup; 1m if
+    /// unparseable).
+    pub fn refresh_duration(&self) -> Duration {
+        humantime::parse_duration(&self.refresh_interval).unwrap_or(Duration::from_secs(60))
     }
 }
 
@@ -1939,6 +2137,8 @@ pub struct ManagerConfigFull {
     pub encryption: EncryptionConfigFull,
     #[serde(default)]
     pub suspend: SuspendManagerConfigFull,
+    #[serde(default)]
+    pub cluster_ca: ClusterCaConfigFull,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -2145,6 +2345,7 @@ impl From<ManagerConfigFull> for ManagerConfig {
                 idle_sweep: Some(val.suspend.idle_sweep),
                 make_room: Some(val.suspend.make_room),
             }),
+            cluster_ca: Some(val.cluster_ca.into()),
         }
     }
 }
@@ -2233,6 +2434,11 @@ impl ManagerConfig {
                 .as_ref()
                 .map(SuspendManagerConfig::with_defaults)
                 .unwrap_or_default(),
+            cluster_ca: self
+                .cluster_ca
+                .as_ref()
+                .map(ClusterCaConfig::with_defaults)
+                .unwrap_or_default(),
         }
     }
 }
@@ -2263,6 +2469,7 @@ impl Default for ManagerConfigFull {
             liveness: LivenessConfigFull::default(),
             encryption: EncryptionConfigFull::default(),
             suspend: SuspendManagerConfigFull::default(),
+            cluster_ca: ClusterCaConfigFull::default(),
         }
     }
 }

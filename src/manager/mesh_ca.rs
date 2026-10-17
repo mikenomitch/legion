@@ -3,17 +3,18 @@
 //! (docs/auth-and-acls.md, "The worker plane"; docs/network-handlers.md,
 //! "mTLS").
 //!
-//! One CA per cluster, generated on first use and replicated with the
-//! control lane (`net_mesh_ca`). Every manager holds the CA key through the
-//! store, so every manager can sign; nothing is distributed. It signs:
+//! With the default `builtin` provider: one CA per cluster, generated on
+//! first use and replicated with the control lane (`net_mesh_ca`). Every
+//! manager holds the CA key through the store, so every manager can sign;
+//! nothing is distributed. It signs:
 //!
 //! - **node** certificates, from a CSR the worker sends: the worker keeps its
 //!   private key, and the manager chooses the SANs, ignoring whatever the
 //!   CSR asks for. One per worker, valid 24 hours, refreshed after 8;
 //! - **fleet** certificates for the simulator, which serves a whole
 //!   simulated fleet from one listener;
-//! - **manager** certificates, minted by each manager for itself from the
-//!   CA key it already holds: a client certificate it presents to workers
+//! - **manager** certificates, minted by each manager for itself from a
+//!   key and CSR it generates: a client certificate it presents to workers
 //!   and a server certificate it presents to workers on port 4747.
 //!
 //! The role is in the SANs (`crate::cluster_tls`), checked on every
@@ -24,6 +25,13 @@
 //! Rotation (`legion net ca rotate`) cross-signs the new CA with the old one
 //! and switches signing at once; both CAs stay in the trust bundle for one
 //! node-certificate lifetime (calls entry 20).
+//!
+//! This module is the *built-in* signer. Which CA actually signs is chosen
+//! by the manager's `clusterCa` provider (`crate::manager::cluster_ca`):
+//! `builtin` uses the replicated row above, `file` signs with these same
+//! functions under an operator-provided CA, and `exec` hands the request to
+//! an external signer. Every provider is given the same [`LeafSpec`]: the
+//! names come from the authenticated caller, never from the CSR.
 
 use crate::cluster_tls::{
     FLEET_URI_PREFIX, MANAGER_SERVER_NAME, MANAGER_URI_PREFIX, NODE_URI_PREFIX,
@@ -116,17 +124,6 @@ fn ca_name(suffix: &str) -> DistinguishedName {
     dn
 }
 
-/// The CA as an rcgen issuer: its parameters re-signed with its own key.
-/// The subject and key are what leaves chain to, so this signs exactly as
-/// the stored certificate would.
-fn issuer(ca_cert_pem: &str, ca_key_pem: &str) -> R<(rcgen::Certificate, KeyPair)> {
-    let ca_key = KeyPair::from_pem(ca_key_pem).context("cluster CA key")?;
-    let ca_cert = CertificateParams::from_ca_cert_pem(ca_cert_pem)
-        .context("cluster CA certificate")?
-        .self_signed(&ca_key)?;
-    Ok((ca_cert, ca_key))
-}
-
 /// The new CA's certificate signed by the previous CA, so a holder that
 /// still trusts only the previous CA verifies chains the new CA signs
 /// (`leaf, cross`), while a holder that trusts the new CA ignores it.
@@ -138,35 +135,8 @@ pub fn cross_sign(
 ) -> R<String> {
     let new_key = KeyPair::from_pem(new_ca_key_pem).context("new CA key")?;
     let params = CertificateParams::from_ca_cert_pem(new_ca_cert_pem).context("new CA")?;
-    let (old_cert, old_key) = issuer(old_ca_cert_pem, old_ca_key_pem)?;
-    Ok(params.signed_by(&new_key, &old_cert, &old_key)?.pem())
-}
-
-fn leaf_params(
-    common_name: &str,
-    sans: Vec<SanType>,
-    server: bool,
-    client: bool,
-) -> R<(CertificateParams, i64)> {
-    let mut dn = DistinguishedName::new();
-    dn.push(DnType::CommonName, common_name.to_string());
-    let mut params = CertificateParams::default();
-    params.distinguished_name = dn;
-    params.subject_alt_names = sans;
-    let now = time::OffsetDateTime::now_utc();
-    params.not_before = now - NOT_BEFORE_SKEW;
-    let not_after = now + time::Duration::try_from(NODE_CERT_TTL)?;
-    params.not_after = not_after;
-    params.key_usages = vec![KeyUsagePurpose::DigitalSignature];
-    let mut usages = Vec::new();
-    if server {
-        usages.push(ExtendedKeyUsagePurpose::ServerAuth);
-    }
-    if client {
-        usages.push(ExtendedKeyUsagePurpose::ClientAuth);
-    }
-    params.extended_key_usages = usages;
-    Ok((params, not_after.unix_timestamp()))
+    let old = CaSigner::from_pem(old_ca_cert_pem, old_ca_key_pem)?;
+    Ok(params.signed_by(&new_key, &old.issuer, &old.key)?.pem())
 }
 
 /// What a CSR is signed as. The manager picks this from the caller's
@@ -177,41 +147,6 @@ pub enum CsrSubject {
     Node(String),
     /// A simulated fleet: `<fleet>.fleet.legion`, `legion://fleet/<name>`.
     Fleet(String),
-}
-
-/// Signs a CSR with the CA: (certificate PEM, expiry as Unix seconds).
-///
-/// Only the CSR's public key is used. The SANs, extensions, and subject it
-/// requests are ignored, so a worker can't ask for `manager.legion` or
-/// another node's name (plan §6.4).
-pub fn sign_csr(
-    ca_cert_pem: &str,
-    ca_key_pem: &str,
-    csr_pem: &str,
-    subject: &CsrSubject,
-) -> R<(String, i64)> {
-    let csr = CertificateSigningRequestParams::from_pem(csr_pem)
-        .map_err(|err| anyhow!("invalid certificate signing request: {err}"))?;
-    let (common_name, sans) = match subject {
-        CsrSubject::Node(node_id) => (
-            node_id.clone(),
-            vec![
-                SanType::DnsName(Ia5String::try_from(node_dns_name(node_id))?),
-                SanType::URI(Ia5String::try_from(node_uri(node_id))?),
-            ],
-        ),
-        CsrSubject::Fleet(fleet) => (
-            format!("fleet {fleet}"),
-            vec![
-                SanType::DnsName(Ia5String::try_from(fleet_dns_name(fleet))?),
-                SanType::URI(Ia5String::try_from(fleet_uri(fleet))?),
-            ],
-        ),
-    };
-    let (params, expires) = leaf_params(&common_name, sans, true, true)?;
-    let (ca_cert, ca_key) = issuer(ca_cert_pem, ca_key_pem)?;
-    let cert = params.signed_by(&csr.public_key, &ca_cert, &ca_key)?;
-    Ok((cert.pem(), expires))
 }
 
 /// Which manager certificate to mint.
@@ -225,32 +160,243 @@ pub enum ManagerCertKind {
     Server,
 }
 
+/// The four kinds of leaf Legion issues. An `exec` provider receives it as
+/// the request's `role`, so a helper can map roles to separate CA roles.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LeafRole {
+    Node,
+    Fleet,
+    ManagerServer,
+    ManagerClient,
+}
+
+impl LeafRole {
+    /// The wire name: `node`, `fleet`, `manager_server`, `manager_client`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            LeafRole::Node => "node",
+            LeafRole::Fleet => "fleet",
+            LeafRole::ManagerServer => "manager_server",
+            LeafRole::ManagerClient => "manager_client",
+        }
+    }
+}
+
+/// Everything a leaf certificate is issued as: Legion's decision, made from
+/// the caller's authenticated identity. Every provider signs exactly this,
+/// and what a non-builtin provider returns is checked against it
+/// (`crate::manager::cluster_ca::verify`). The CSR contributes only its
+/// public key.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LeafSpec {
+    pub role: LeafRole,
+    /// Hostname-shaped, so an external CA's role can restrict it to
+    /// `*.legion` (cluster-ca-provider calls entry 9). Never used for
+    /// verification: roles come from URI SANs.
+    pub common_name: String,
+    /// Exactly these DNS SANs, no more.
+    pub dns_names: Vec<String>,
+    /// Exactly these URI SANs, no more.
+    pub uris: Vec<String>,
+    pub server_auth: bool,
+    pub client_auth: bool,
+    /// The lifetime asked for.
+    pub ttl: Duration,
+}
+
+impl LeafSpec {
+    /// A node or fleet certificate: server and client auth, 24 hours.
+    pub fn for_subject(subject: &CsrSubject) -> LeafSpec {
+        match subject {
+            CsrSubject::Node(node_id) => LeafSpec {
+                role: LeafRole::Node,
+                common_name: node_dns_name(node_id),
+                dns_names: vec![node_dns_name(node_id)],
+                uris: vec![node_uri(node_id)],
+                server_auth: true,
+                client_auth: true,
+                ttl: NODE_CERT_TTL,
+            },
+            CsrSubject::Fleet(fleet) => LeafSpec {
+                role: LeafRole::Fleet,
+                common_name: fleet_dns_name(fleet),
+                dns_names: vec![fleet_dns_name(fleet)],
+                uris: vec![fleet_uri(fleet)],
+                server_auth: true,
+                client_auth: true,
+                ttl: NODE_CERT_TTL,
+            },
+        }
+    }
+
+    /// A manager's own certificate: `legion://manager/<id>`, plus
+    /// `manager.legion` for the server certificate.
+    pub fn for_manager(manager_id: &str, kind: ManagerCertKind) -> LeafSpec {
+        match kind {
+            ManagerCertKind::Server => LeafSpec {
+                role: LeafRole::ManagerServer,
+                common_name: MANAGER_SERVER_NAME.to_string(),
+                dns_names: vec![MANAGER_SERVER_NAME.to_string()],
+                uris: vec![manager_uri(manager_id)],
+                server_auth: true,
+                client_auth: false,
+                ttl: NODE_CERT_TTL,
+            },
+            ManagerCertKind::Client => LeafSpec {
+                role: LeafRole::ManagerClient,
+                common_name: format!("{}.manager.legion", dns_label(manager_id)),
+                dns_names: Vec::new(),
+                uris: vec![manager_uri(manager_id)],
+                server_auth: false,
+                client_auth: true,
+                ttl: NODE_CERT_TTL,
+            },
+        }
+    }
+
+    /// The extended key usages asked for, by their wire names
+    /// (`server_auth`, `client_auth`).
+    pub fn usages(&self) -> Vec<&'static str> {
+        let mut usages = Vec::new();
+        if self.server_auth {
+            usages.push("server_auth");
+        }
+        if self.client_auth {
+            usages.push("client_auth");
+        }
+        usages
+    }
+
+    fn params(&self) -> R<(CertificateParams, i64)> {
+        let mut dn = DistinguishedName::new();
+        dn.push(DnType::CommonName, self.common_name.clone());
+        let mut params = CertificateParams::default();
+        params.distinguished_name = dn;
+        let mut sans = Vec::new();
+        for dns in &self.dns_names {
+            sans.push(SanType::DnsName(Ia5String::try_from(dns.clone())?));
+        }
+        for uri in &self.uris {
+            sans.push(SanType::URI(Ia5String::try_from(uri.clone())?));
+        }
+        params.subject_alt_names = sans;
+        let now = time::OffsetDateTime::now_utc();
+        params.not_before = now - NOT_BEFORE_SKEW;
+        let not_after = now + time::Duration::try_from(self.ttl)?;
+        params.not_after = not_after;
+        params.key_usages = vec![KeyUsagePurpose::DigitalSignature];
+        let mut usages = Vec::new();
+        if self.server_auth {
+            usages.push(ExtendedKeyUsagePurpose::ServerAuth);
+        }
+        if self.client_auth {
+            usages.push(ExtendedKeyUsagePurpose::ClientAuth);
+        }
+        params.extended_key_usages = usages;
+        Ok((params, not_after.unix_timestamp()))
+    }
+}
+
+/// A CA certificate and its key, parsed once, that signs leaves locally:
+/// the built-in CA, or an operator's CA under the `file` provider.
+pub struct CaSigner {
+    issuer: rcgen::Certificate,
+    key: KeyPair,
+}
+
+impl CaSigner {
+    /// Parses a CA certificate (the first certificate in `ca_cert_pem`) and
+    /// its private key. The key must be PKCS#8 (`BEGIN PRIVATE KEY`):
+    /// ECDSA P-256/P-384, Ed25519, or RSA.
+    pub fn from_pem(ca_cert_pem: &str, ca_key_pem: &str) -> R<CaSigner> {
+        let key = parse_ca_key(ca_key_pem)?;
+        let first = crate::cluster_tls::certs_from_pem(ca_cert_pem)
+            .context("cluster CA certificate")?
+            .into_iter()
+            .next()
+            .ok_or_else(|| anyhow!("the cluster CA certificate PEM holds no certificate"))?;
+        // The CA as an rcgen issuer: its parameters re-signed with its own
+        // key. The subject and key are what leaves chain to, so this signs
+        // exactly as the stored certificate would.
+        let issuer = CertificateParams::from_ca_cert_der(&first)
+            .context("cluster CA certificate")?
+            .self_signed(&key)?;
+        Ok(CaSigner { issuer, key })
+    }
+
+    /// Signs `csr_pem` as `spec`: (leaf certificate PEM, expiry as Unix
+    /// seconds). Only the CSR's public key is used.
+    pub fn sign(&self, csr_pem: &str, spec: &LeafSpec) -> R<(String, i64)> {
+        let csr = CertificateSigningRequestParams::from_pem(csr_pem)
+            .map_err(|err| anyhow!("invalid certificate signing request: {err}"))?;
+        let (params, expires) = spec.params()?;
+        let cert = params.signed_by(&csr.public_key, &self.issuer, &self.key)?;
+        Ok((cert.pem(), expires))
+    }
+}
+
+/// The CA key as an rcgen key pair. rcgen (on `ring`) reads PKCS#8 only, so
+/// a SEC1 or PKCS#1 key gets the conversion command instead of a parse
+/// error.
+fn parse_ca_key(ca_key_pem: &str) -> R<KeyPair> {
+    use rustls_pki_types::PrivateKeyDer;
+    let key = crate::cluster_tls::key_from_pem(ca_key_pem).context("cluster CA key")?;
+    match key {
+        PrivateKeyDer::Pkcs8(der) => KeyPair::try_from(der.secret_pkcs8_der())
+            .map_err(|err| anyhow!("cluster CA key: unsupported PKCS#8 key ({err})")),
+        PrivateKeyDer::Sec1(_) | PrivateKeyDer::Pkcs1(_) => bail!(
+            "cluster CA key is not PKCS#8 (it is a `BEGIN EC PRIVATE KEY` or `BEGIN RSA PRIVATE \
+             KEY` file); convert it with `openssl pkcs8 -topk8 -nocrypt -in ca.key -out \
+             ca-pkcs8.key`"
+        ),
+        _ => bail!("cluster CA key: unsupported private key format"),
+    }
+}
+
+/// Signs `csr_pem` as `spec` with the given CA: (certificate PEM, expiry as
+/// Unix seconds).
+pub fn sign_leaf(
+    ca_cert_pem: &str,
+    ca_key_pem: &str,
+    csr_pem: &str,
+    spec: &LeafSpec,
+) -> R<(String, i64)> {
+    CaSigner::from_pem(ca_cert_pem, ca_key_pem)?.sign(csr_pem, spec)
+}
+
+/// Signs a CSR with the CA: (certificate PEM, expiry as Unix seconds).
+///
+/// Only the CSR's public key is used. The SANs, extensions, and subject it
+/// requests are ignored, so a worker can't ask for `manager.legion` or
+/// another node's name (plan §6.4).
+pub fn sign_csr(
+    ca_cert_pem: &str,
+    ca_key_pem: &str,
+    csr_pem: &str,
+    subject: &CsrSubject,
+) -> R<(String, i64)> {
+    sign_leaf(
+        ca_cert_pem,
+        ca_key_pem,
+        csr_pem,
+        &LeafSpec::for_subject(subject),
+    )
+}
+
 /// A certificate a manager mints for itself: (certificate PEM, private key
 /// PEM, expiry as Unix seconds). The key is generated in the manager process
-/// and never leaves it.
+/// and never leaves it; the CA signs a CSR for it, the same way every
+/// provider does (`crate::manager::cluster_ca`).
 pub fn issue_manager_cert(
     ca_cert_pem: &str,
     ca_key_pem: &str,
     manager_id: &str,
     kind: ManagerCertKind,
 ) -> R<(String, String, i64)> {
-    let mut sans = vec![SanType::URI(Ia5String::try_from(manager_uri(manager_id))?)];
-    if kind == ManagerCertKind::Server {
-        sans.insert(
-            0,
-            SanType::DnsName(Ia5String::try_from(MANAGER_SERVER_NAME.to_string())?),
-        );
-    }
-    let (params, expires) = leaf_params(
-        &format!("manager {manager_id}"),
-        sans,
-        kind == ManagerCertKind::Server,
-        kind == ManagerCertKind::Client,
-    )?;
-    let key = KeyPair::generate()?;
-    let (ca_cert, ca_key) = issuer(ca_cert_pem, ca_key_pem)?;
-    let cert = params.signed_by(&key, &ca_cert, &ca_key)?;
-    Ok((cert.pem(), key.serialize_pem(), expires))
+    let spec = LeafSpec::for_manager(manager_id, kind);
+    let (key_pem, csr_pem) = generate_csr(&spec.common_name)?;
+    let (cert_pem, expires) = sign_leaf(ca_cert_pem, ca_key_pem, &csr_pem, &spec)?;
+    Ok((cert_pem, key_pem, expires))
 }
 
 /// A fresh key pair and a CSR for it: (key PEM, CSR PEM). The CSR's subject

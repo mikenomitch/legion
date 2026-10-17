@@ -3935,7 +3935,7 @@ mod tests {
     /// ```
     fn gated_boot(hypervisor: &str) -> R<()> {
         use crate::structs::netpolicy::{merge_policies, InlinePolicy, NetPolicyObject};
-        use crate::worker::netd::{guest_agent, Denials, NetPolicyCache};
+        use crate::worker::netd::{Denials, NetPolicyCache};
 
         if std::env::var_os(microvm::GUEST_BINARY_ENV).is_none() {
             bail!(
@@ -3982,10 +3982,10 @@ mod tests {
         };
         let scratch = work_root(&allocation, &instance);
         std::fs::create_dir_all(&scratch)?;
-        let base = vsock_socket_base(&scratch);
 
         // The node datapath for this one allocation: its policy, the egress
-        // proxy on `<base>_1080`, and the resolver on `<base>_53`.
+        // proxy on `<scratch>/vsock.sock_1080`, and the resolver on
+        // `<scratch>/vsock.sock_53`.
         let mut object: NetPolicyObject = serde_json::from_value(json!({
             "name": "phase0", "enforcement": "require",
             "egress": { "protocol": "http", "allow": [format!("{allowed}/**")] },
@@ -4013,20 +4013,19 @@ mod tests {
             proxies
                 .sync(&[crate::worker::netd::proxy::ProxySpec {
                     allocation_id: allocation.id,
-                    netns: None,
+                    attachment: crate::worker::netd::attach::Attachment::GuestVsock {
+                        scratch: scratch.clone(),
+                    },
                     listen: None,
-                    unix: Some(guest_agent::host_socket_path(
-                        &base,
-                        guest_agent::PROXY_PORT,
-                    )),
                 }])
                 .await;
             dns.sync(&[crate::worker::netd::dns::DnsSpec {
                 allocation_id: allocation.id,
                 resolver: None,
                 names: BTreeMap::new(),
-                netns: None,
-                unix: Some(guest_agent::host_socket_path(&base, guest_agent::DNS_PORT)),
+                attachment: crate::worker::netd::attach::Attachment::GuestVsock {
+                    scratch: scratch.clone(),
+                },
             }])
             .await;
         });

@@ -779,6 +779,14 @@ root key is per-manager state ([kv-encryption.md](kv-encryption.md)).
   key provider calls (`describe` | `wrap` | `unwrap`) by outcome (`ok` |
   `error`). These never happen on a KV read or write path. A rising `error`
   series with an `exec` provider points to a KMS problem.
+- **`legion_cluster_ca_provider_calls_total{provider,op,outcome}`**
+  (counter): cluster CA provider calls ([The Cluster CA](cluster-ca.md)) by
+  provider (`builtin` | `file` | `exec`), operation (`load` for `file`,
+  `describe` for `exec`, `sign`), and outcome (`ok` | `error` | `refused`).
+  `refused` counts certificates a provider returned that Legion would not
+  hand out (wrong names, wrong key, too long, not chaining to the bundle):
+  alert on it. A rising `error` series with `exec` points to the external
+  CA or its helper.
 
 ### Worker
 

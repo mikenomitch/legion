@@ -1,0 +1,81 @@
+#!/bin/sh
+# Legion `exec` cluster CA provider backed by HashiCorp Vault PKI
+# (docs/cluster-ca.md, plugins/cluster_ca/README.md).
+#
+#   clusterCa = { provider = "exec",
+#     command = ["/usr/local/bin/legion-ca-vault", "--mount", "pki_legion", "--role", "legion"] }
+#
+# Reads one JSON request on stdin, prints one JSON reply on stdout:
+#
+#   {"op":"describe"} -> {"bundle_pem":"…","chain_pem":"…"}
+#   {"op":"sign",…}   -> {"cert_pem":"…"}
+#
+# Needs the `vault` CLI (VAULT_ADDR and a token, e.g. VAULT_TOKEN or a
+# token helper, in the manager's environment) and `jq`. The token needs:
+#
+#   path "pki_legion/sign/legion" { capabilities = ["create", "update"] }
+#   path "pki_legion/issuer/*"    { capabilities = ["read"] }
+#   path "pki_legion/issuers"     { capabilities = ["list"] }
+#
+# The trust bundle is every issuer in the mount (so "create a new issuer,
+# make it the default, delete the old one a day later" is a rotation that
+# breaks nothing), or the file given with --bundle-file. Certificates are
+# signed by the mount's default issuer with the names Legion asks for; the
+# role must ignore the CSR's own names (use_csr_sans=false,
+# use_csr_common_name=false). Legion verifies every certificate it gets.
+#
+# Test before use:  legion net ca provider test -- legion-ca-vault --mount pki_legion --role legion
+set -eu
+
+MOUNT=""
+ROLE=""
+BUNDLE_FILE=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --mount) MOUNT="$2"; shift 2 ;;
+    --role) ROLE="$2"; shift 2 ;;
+    --bundle-file) BUNDLE_FILE="$2"; shift 2 ;;
+    *) echo "legion-ca-vault: unknown argument $1" >&2; exit 2 ;;
+  esac
+done
+[ -n "$MOUNT" ] || { echo "legion-ca-vault: --mount is required" >&2; exit 2; }
+[ -n "$ROLE" ] || { echo "legion-ca-vault: --role is required" >&2; exit 2; }
+command -v jq >/dev/null || { echo "legion-ca-vault: jq is required" >&2; exit 2; }
+
+req=$(cat)
+op=$(printf '%s' "$req" | jq -r '.op // empty')
+
+case "$op" in
+  describe)
+    # The signing chain: the default issuer, then its parents.
+    chain=$(vault read -format=json "$MOUNT/issuer/default" \
+      | jq -r '[.data.certificate] + (.data.ca_chain // []) | map(rtrimstr("\n")) | join("\n")')
+    if [ -n "$BUNDLE_FILE" ]; then
+      bundle=$(cat "$BUNDLE_FILE")
+    else
+      bundle=""
+      for id in $(vault list -format=json "$MOUNT/issuers" | jq -r '.[]'); do
+        cert=$(vault read -field=certificate "$MOUNT/issuer/$id")
+        bundle="$bundle$cert
+"
+      done
+    fi
+    jq -n --arg bundle "$bundle" --arg chain "$chain" '{bundle_pem: $bundle, chain_pem: $chain}'
+    ;;
+  sign)
+    csr=$(printf '%s' "$req" | jq -r '.csr_pem')
+    cn=$(printf '%s' "$req" | jq -r '.common_name')
+    dns=$(printf '%s' "$req" | jq -r '.dns_sans | join(",")')
+    uris=$(printf '%s' "$req" | jq -r '.uri_sans | join(",")')
+    ttl=$(printf '%s' "$req" | jq -r '.ttl_seconds')
+    set -- csr=- common_name="$cn" ttl="${ttl}s" exclude_cn_from_sans=true format=pem
+    [ -n "$dns" ] && set -- "$@" alt_names="$dns"
+    [ -n "$uris" ] && set -- "$@" uri_sans="$uris"
+    printf '%s' "$csr" | vault write -format=json "$MOUNT/sign/$ROLE" "$@" \
+      | jq '{cert_pem: ([.data.certificate] + (.data.ca_chain // []) | map(rtrimstr("\n")) | join("\n"))}'
+    ;;
+  *)
+    echo "legion-ca-vault: unknown op '$op'" >&2
+    exit 2
+    ;;
+esac
