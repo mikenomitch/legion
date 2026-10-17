@@ -14,9 +14,10 @@
 //!   When the gang sets `placementTimeout`, `deadline` is `since` plus it.
 //! - **Ended** by any eval of the config that succeeds (a plan that leaves
 //!   a gang short fails its eval, so success means the quorum placed or
-//!   nothing was missing; [`Store::delete_job_blocked_evals_tx`]), a job
-//!   stop or restart (`job_stop`, `job_update`), a destroy, or the timeout
-//!   itself.
+//!   nothing was missing; an elastic gang's plan that reaches the quorum but
+//!   leaves members above it unplaced succeeds too;
+//!   [`Store::delete_job_blocked_evals_tx`]), a job stop or restart
+//!   (`job_stop`, `job_update`), a destroy, or the timeout itself.
 //! - **Enforced** by the scheduler-lane leader: its blocked-eval waker
 //!   wakes the blocked eval of a gang past its deadline
 //!   ([`Store::wake_timed_out_gangs`]), and the eval worker, finding the

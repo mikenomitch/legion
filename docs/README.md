@@ -95,7 +95,8 @@ Plans, roadmaps, to-do lists, and development notes live in
   the scheduler displaces lower-band work, and how to preview or prevent it.
 - [Gang Scheduling](gang-scheduling.md): `gang` on a task places its replicas
   all together or not at all. A gang that does not fit waits, holding
-  nothing, and `job plan` reports whether it would fit right now.
+  nothing (bounded by `placementTimeout`), a lost member restarts the whole
+  gang (`onMemberLoss`), and `job plan` reports whether it would fit now.
 - [Edge Boot](edge-boot.md): starting work before the placement is durable.
   Covers gate levels, boot tickets, ratification, and the kill path.
 

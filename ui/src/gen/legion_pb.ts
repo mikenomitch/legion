@@ -3806,6 +3806,35 @@ export class GangReport extends Message<GangReport> {
    */
   reason = "";
 
+  /**
+   * The gang's `placementTimeout` in seconds: how long it may wait, short of
+   * its quorum, before its job is failed. 0 when it waits indefinitely (the
+   * default).
+   *
+   * @generated from field: uint64 placement_timeout_seconds = 10;
+   */
+  placementTimeoutSeconds = protoInt64.zero;
+
+  /**
+   * `JobBlocked.gang` only: when this wait began, as Unix seconds — the first
+   * time the gang blocked short of its quorum, kept across every later
+   * re-plan that blocked again. A successful plan, a stop, or a restart ends
+   * the wait. 0 in a dry run.
+   *
+   * @generated from field: int64 waiting_since = 11;
+   */
+  waitingSince = protoInt64.zero;
+
+  /**
+   * `JobBlocked.gang` only: when the wait times out (`waiting_since` plus
+   * `placement_timeout_seconds`), as Unix seconds. If the gang is still short
+   * then, its job is failed and every allocation of it stops. 0 when the gang
+   * has no placement timeout, and in a dry run.
+   *
+   * @generated from field: int64 deadline = 12;
+   */
+  deadline = protoInt64.zero;
+
   constructor(data?: PartialMessage<GangReport>) {
     super();
     proto3.util.initPartial(data, this);
@@ -3823,6 +3852,9 @@ export class GangReport extends Message<GangReport> {
     { no: 7, name: "eligible_nodes", kind: "scalar", T: 13 /* ScalarType.UINT32 */ },
     { no: 8, name: "nodes", kind: "scalar", T: 13 /* ScalarType.UINT32 */ },
     { no: 9, name: "reason", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 10, name: "placement_timeout_seconds", kind: "scalar", T: 4 /* ScalarType.UINT64 */ },
+    { no: 11, name: "waiting_since", kind: "scalar", T: 3 /* ScalarType.INT64 */ },
+    { no: 12, name: "deadline", kind: "scalar", T: 3 /* ScalarType.INT64 */ },
   ]);
 
   static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): GangReport {

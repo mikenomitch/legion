@@ -37,6 +37,8 @@ mod reschedule_holds;
 // Gang waits: when a gang started waiting for its quorum, and its
 // `placementTimeout`.
 mod gang_waits;
+// Gang member losses: what a lost member does to the rest of its gang.
+mod gang_losses;
 use crate::storage::persistence::{
     build_persistence_driver, PersistenceDriver, PersistenceRole, PersistenceStatus,
     RaftHistoryEvent, RaftStatus,
@@ -44,6 +46,7 @@ use crate::storage::persistence::{
 use crate::storage::raft::{capture, ReplicatedOp, ReplicationHandle};
 use crate::storage::Lane;
 pub use fork_ops::{alias_target_problem, AliasOutcome, ForkCreated};
+pub use gang_losses::GangLoss;
 pub use gang_waits::GangWait;
 pub use job_status_ops::{derive_job_status, JobStatusFacts, TaskStatusFact};
 pub use keyring_ops::{KeyringInit, KeyringReset, RewrapBatch, RewrapRun, RootKeyRewrap};
@@ -7818,6 +7821,8 @@ impl Store {
 
         let evicted = removable.len();
         let affected_job_configs = self.remove_allocations(&removable, StopCause::Drain)?;
+        let affected_job_configs =
+            self.gang_members_lost_on_node(&removable, StopCause::Drain, affected_job_configs);
         let reconciled = self.reconcile_job_configs_or_requeue(affected_job_configs);
 
         self.events().node_drained(node_id, evicted, held);
@@ -16444,6 +16449,8 @@ impl Store {
         }
 
         let affected_job_configs = self.remove_allocations(&removable, StopCause::NodeLost)?;
+        let affected_job_configs =
+            self.gang_members_lost_on_node(&removable, StopCause::NodeLost, affected_job_configs);
         self.reconcile_job_configs_or_requeue(affected_job_configs)
     }
 

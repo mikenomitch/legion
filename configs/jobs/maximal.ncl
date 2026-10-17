@@ -1203,7 +1203,26 @@
             # Not combinable with count.per or keyed stateful tasks, and the
             # group's rollout must replace it in one step (see
             # rolloutByGroup.trainer above).
-            gang = { min = 3 },
+            gang = {
+                min = 3,
+                # How long the gang may wait for its quorum before the job
+                # fails (stopping any members already running). Counted from
+                # the first time the gang came up short, not per retry.
+                # Unset: wait indefinitely. At least 1s.
+                placementTimeout = "30m",
+                # What a lost member (failed, node lost, drained, evicted)
+                # does to the rest when it leaves fewer than `min` running:
+                #   "restart" (default) stops the survivors and places the
+                #             whole gang again, together, once their stop
+                #             grace has passed;
+                #   "replace" keeps the survivors and places the missing
+                #             members together once they fit;
+                #   "fail"    fails the job and stops every member.
+                # A loss that leaves the quorum running is always replaced
+                # alone. Restarts after a failure spend on_unhealthy's move
+                # budget; once it is spent the job fails.
+                onMemberLoss = "restart",
+            },
             config = {
                 command = ["sleep", "3600"],
             },

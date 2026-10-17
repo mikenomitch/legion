@@ -4,10 +4,11 @@ Decisions made for
 [`plans/gang-scheduling-plan.md`](../plans/gang-scheduling-plan.md): first
 while writing it, then while executing Phase 1 (2026-10-17), when blocked
 evals and partial placement had already shipped for every job (see the plan's
-"Revision: 2026-10-17"). **Entries are ranked by project impact, highest
-first — the number is the rank.** Execution-time calls are inserted at their
-rank and marked *(Phase 1)*; superseded entries keep their text, are marked
-SUPERSEDED, and sit at the bottom.
+"Revision: 2026-10-17"), then for the placement timeout and member-loss
+policy (the plan's "Revision 2"). **Entries are ranked by project impact,
+highest first — the number is the rank.** Execution-time calls are inserted
+at their rank and marked *(Phase 1)* or *(Revision 2)*; superseded entries
+keep their text, are marked SUPERSEDED, and sit at the bottom.
 
 ## 1. A waiting gang holds nothing — defer the whole plan, commit zero
 
@@ -56,7 +57,7 @@ class's aggregate free capacity could fit the gang's shortfall.
 
 **Trade-off.** A blocked gang is woken by *any* capacity on its class — one
 freed replica's worth for a gang that needs eight — and re-plans in full each
-time (read-only, and over the whole eligible list, call 12). On a large,
+time (read-only, and over the whole eligible list, call 16). On a large,
 churning cluster with many waiting gangs that is wasted planning and a
 block/unblock entry pair per wake. Accepted, documented as a limitation, and
 open in `TODO.md` as "gang-aware wake"; (b) is the fix when a measurement
@@ -68,7 +69,7 @@ story already proven. (a) would have been a second, worse implementation of
 the same lifecycle (time-polled rather than event-woken). It also delivers the
 plan's Phase 2 allocation-removal wake for free, and it is what the
 sandbox-scaling plan (its calls entry 13) built the queue to be reused for.
-Supersedes call 17.
+Supersedes call 23.
 
 ## 3. A gang that doesn't fit is *blocked*, not *failed* — and "no matching node" blocks too
 
@@ -100,9 +101,79 @@ flips on timing is exactly what this plan removes.
 **Why (simplicity/ease).** "Submit and it runs when there's room" is the
 mental model every queue-shaped system (Slurm, K8s pending pods, Kueue)
 converges on. It also finally gives Legion the blocked-eval lifecycle Nomad
-has and Legion's eval loop visibly lacks — scoped narrowly (see call 18, now moot).
+has and Legion's eval loop visibly lacks — scoped narrowly (see call 24, now moot).
 
-## 4. The gang unit is a task's `count.num` replicas, and a gang shortfall defers the *whole* plan
+## 4. A broken gang restarts whole by default (`onMemberLoss = "restart"`) *(Revision 2)*
+
+**Call.** When a member loss leaves a gang below its quorum, the default is
+to stop the survivors (stop cause `gang`, with their normal graceful stop)
+and place the whole gang again as one unit. Keeping the survivors and topping
+up together (`replace`, the only behavior Phase 1 shipped) and failing the
+job (`fail`) are opt-in:
+
+```nickel
+gang = { min = 6, onMemberLoss = "restart" },   # default; or "replace" | "fail"
+```
+
+```text
+Gang worker of job trainer lost allocation 812 on node gpu-07 (node_lost): 7 run, below its quorum of 8; restarting the whole gang (7 stopped)
+```
+
+**Alternatives.** (a) `replace` as the default: Phase 1's behavior, and
+LeaderWorkerSet `None`, Volcano `RestartPod`, Nomad. (b) `fail` as the
+default: JobSet with no `failurePolicy`, Slurm on node failure, the MPI
+Operator. (c) Volcano's default `SyncJob`, which ignores the loss. (d) One
+fixed behavior and no knob.
+
+**Trade-off.** Every break throws away the survivors' in-process state and
+pays a full re-placement, possibly onto other nodes, even for a workload that
+could have taken a member back. It changes Phase 1's behavior: survivors used
+to keep running. A crash-looping member restarts the gang until the move
+budget (call 10) fails the job.
+
+**Why (ease: the default restores the contract without a human).** The
+frameworks that need a gang (PyTorch DDP, MPI, JAX) cannot carry on when a
+member vanishes; the survivors block in a collective until the framework's
+timeout, holding their capacity. So `replace` as the default turns "gang
+broken" into "gang idle until a top-up fits", which is the hoarding shape the
+feature exists to prevent. `restart` gets back to "these replicas run
+together" with nobody involved, while `fail` needs an operator. LeaderWorkerSet, the
+closest analogue for long-running groups, made the same choice
+(`RecreateGroupOnPodRestart`). (c) lost because a lost member that is never
+replaced leaves a job silently short forever, and (d) because batch
+pipelines (`fail`) and elastic services (`replace`) both have a real claim to
+a different answer.
+
+## 5. The policy applies only when a loss breaks the quorum, and only to losses the manager sees *(Revision 2)*
+
+**Call.** A loss that leaves at least `min` members running is replaced
+alone, whatever `onMemberLoss` says (the event reports `action: replace`), so
+an elastic gang keeps running. A *loss* is a member failing (the worker gives
+up restarting it, or `on_unhealthy` moves it), its node being lost or
+drained, or a memory-pressure eviction. A worker restarting a process in
+place under the task's `restart` policy is not a loss, and neither is a stop,
+a scale-in, a rollout replacement, preemption, or a batch member exiting
+successfully.
+
+**Alternatives.** (a) Apply the policy to every loss, including one above the
+quorum (JobSet's `failurePolicy` fires on any child failure). (b) Count local
+restarts too: workers report each in-place restart, and the manager restarts
+the gang.
+
+**Trade-off.** A gang with `min` below `count` cannot ask to restart on
+*every* membership change (a framework with a static world size must use `gang
+= true`). A member restarted in place rejoins a gang whose framework may not
+take it back; the public doc tells such jobs to set `restart = { policy =
+"never" }`, so a crash becomes a member failure.
+
+**Why (consistency with the number the user wrote, then simplicity).** `min`
+already means "the gang can run with this many": torchrun's "membership
+changes are free" and Kubernetes' quorum-gated replacement. Restarting above
+the quorum would contradict it. (b) needs a new worker-to-manager report per
+process restart and a meaning for "restarting member", and the jobspec
+already has a way to turn local restarts into failures.
+
+## 6. The gang unit is a task's `count.num` replicas, and a gang shortfall defers the *whole* plan
 
 **Call.** `gang` is a task-level field; membership is that task's replica
 set. When any gang task in a planning pass cannot reach membership, the
@@ -140,7 +211,7 @@ sentence where "a short gang places nothing, but its siblings do" is a
 special case users have to learn. The cost is unchanged and documented: other
 tasks of the job wait with the gang.
 
-## 5. Preemption never takes a gang below its quorum *(Phase 1)*
+## 7. Preemption never takes a gang below its quorum *(Phase 1)*
 
 **Call.** A gang's quorum is a disruption floor for victim selection,
 combined with `disruption.minAvailable` by taking the stricter. A `gang =
@@ -175,7 +246,44 @@ column read and no new machinery, and it fails safe. (b) is a real victim
 selection redesign (gang membership in the victim index, cost model, partial
 eviction fallback) that belongs to the preemption plan.
 
-## 6. `gang.min` ships with the contract, and above the quorum the rest trickle in *(Phase 1)*
+## 8. Starting together is the workload's job: no start barrier, no rank or world-size variables *(Revision 2)*
+
+**Call.** A gang places together, and each member starts as soon as its
+worker receives it. Legion provides fate-sharing (a broken gang restarts
+whole, call 4) and the identity and discovery it already had:
+`LEGION_ALLOC_ID`, `LEGION_INSTANCE_SLOT` for a slot-mode stateful gang, and
+service discovery. The rendezvous belongs to the framework (torchrun, NCCL's
+`init_process_group`, MPI, `jax.distributed`). Rank and world-size variables
+(`LEGION_GANG_RANK`, `LEGION_GANG_SIZE`), a coordinator address, and a
+readiness timeout are not built.
+
+**Alternatives.** (a) A start barrier: workers stage each member (image,
+artifacts) and hold exec until the manager says every member is staged.
+Slurm's `srun` and the MPI Operator's wait-for-workers launcher come closest.
+(b) Ship rank and world-size variables in this PR. (c) A peer-status API, so
+members can watch each other.
+
+**Trade-off.** Members start seconds or minutes apart, so a framework's
+rendezvous timeout has to cover image-pull skew. A stateless gang has no rank
+variable: users pass the world size in `env` (it is the count) and take a rank
+from the rendezvous, or use a slot-mode stateful gang. A member that is placed
+but hangs before it runs stalls the others at their rendezvous until its start
+fails.
+
+**Why (simplicity, and the prior art agrees).** This came up in review: "do
+we need to start them at the same time, or does the application handle it?
+If the latter, do we need to surface the status of the others?" None of the
+surveyed gang schedulers synchronize start (coscheduling, Volcano, Kueue,
+YuniKorn, Ray placement groups). The sync point is in the framework's
+rendezvous because only the workload knows when it is ready, for example
+when its weights are loaded. A barrier would wait on the wrong signal and add
+a staged-but-held state to the worker lifecycle. (c) is unnecessary with
+fate-sharing: survivors need not watch peers when Legion restarts them. (b)
+is the real gap, but `replace` needs a replacement to inherit the missing
+member's rank, so ranks need storing per allocation. That is a design of its
+own, open in `TODO.md`.
+
+## 9. `gang.min` ships with the contract, and above the quorum the rest trickle in *(Phase 1)*
 
 **Call.** The Phase 2 quorum came forward into Phase 1. The check is the same
 one with a different number: a plan defers when `running + placed < min`.
@@ -200,7 +308,33 @@ would have meant shipping the check twice. Elastic training is the most common
 gang shape after fixed MPI, and `min` is what Volcano, coscheduling, and Kueue
 all converged on.
 
-## 7. Updating a gang restarts it — `job_update` keeps remove-then-plan, blue-green is a documented pattern, not the default
+## 10. Restarts spend the existing move budget; infrastructure losses are free; no `maxRestarts` *(Revision 2)*
+
+**Call.** A restart (or replacement) caused by a member *failing* spends that
+task's `on_unhealthy` move budget (`moveCount` per `movePeriod`), and its
+re-placement waits out the failed member's move backoff (doubling from
+`moveDelay`), which holds the whole gang (call 19). When the budget
+runs out the job fails, survivors included, whatever the policy. Node loss,
+drain, and memory-pressure evictions spend nothing.
+
+**Alternatives.** (a) A gang-level `maxRestarts` / `backoffLimit` (JobSet,
+Volcano `maxRetry`, LWS `maxGroupRestarts`). (b) Charge every loss, node
+failures included.
+
+**Trade-off.** One budget means a gang cannot allow more restarts than its
+members are allowed moves. The budget counts per task, not per gang
+restart, so a restart caused by one member's failure costs one move, the same
+as replacing a lone member would.
+
+**Why (simplicity, then fairness to the workload).** Legion already has one
+bounded-retry mechanism with a backoff, a hold the planner honors, and an
+exhaustion verdict that fails the job; a second counter would need its own
+period, its own state, and a precedence rule against the first. Not charging
+the infrastructure is the refinement the prior art converged on (JobSet's
+`…AndIgnoreMaxRestarts` for `DisruptionTarget`, torchrun's "membership changes
+do not count as retries"): a gang should not fail because nodes did.
+
+## 11. Updating a gang restarts it — `job_update` keeps remove-then-plan, blue-green is a documented pattern, not the default
 
 **Call.** For gang jobs, the update path keeps its existing
 remove-allocations-then-plan order (`src/structs/eval.rs:170-171`); what
@@ -228,7 +362,7 @@ default that never needs 2× capacity is the one an operator can reason
 about. Call 1's zero-commit defer is what makes remove-then-plan safe to
 keep — the failure mode it used to have is gone.
 
-## 8. `gang` is its own bool-or-object field, not an extension of `count`
+## 12. `gang` is its own bool-or-object field, not an extension of `count`
 
 **Call.**
 
@@ -255,7 +389,7 @@ without contortions. `gang: true` also reads as exactly what it is; the
 k8s/Volcano/Ray world made "gang" the recognized term, and discoverability
 beats taxonomy.
 
-## 9. A gang may not share a multi-task group *(Phase 1)*
+## 13. A gang may not share a multi-task group *(Phase 1)*
 
 **Call.** `gang` on a task that shares its `group` with any other task is
 rejected at submit. The plan's version ("gang on a sidecar is rejected; the
@@ -282,7 +416,7 @@ is the failure mode validation exists to prevent, and the error surfaces a
 co-location rule many users do not know they are subject to. Gang-of-groups
 has no user asking for it.
 
-## 10. Rollout step modes on a gang group are rejected at submit
+## 14. Rollout step modes on a gang group are rejected at submit
 
 **Call.** `percentSteps`/`countSteps`/`percentEachStep`/`countEachStep` and
 `slots.order: sequential` on a gang task's group fail validation:
@@ -326,7 +460,7 @@ Remove the step mode for this group (for example `rolloutByGroup.worker = {
 percentSteps = [100] }`) or remove `gang`
 ```
 
-## 11. `job plan` reports a gang that would wait as a successful reply, not an error *(Phase 1)*
+## 15. `job plan` reports a gang that would wait as a successful reply, not an error *(Phase 1)*
 
 **Call.** A dry run whose gang cannot reach its quorum succeeds: no
 allocations, `gangReports[i].wouldPlace: false` with `placeable`, `min`,
@@ -348,7 +482,7 @@ and would hide that the submit is safe. The S4 scenario (an agent decides to
 submit, resize, or escalate) needs the structured answer. Making plain jobs'
 dry runs succeed too would change an existing contract for no gang reason.
 
-## 12. Gang tasks are excluded from scheduling-index truncation
+## 16. Gang tasks are excluded from scheduling-index truncation
 
 **Call.** Gang tasks join `count.per`, `distinct`, volume-pinned, and
 multi-task-group tasks on the no-truncation list
@@ -371,7 +505,7 @@ blocked job — a correctness bug wearing a performance optimization. The
 plan's bench gate (no regression for gang-free workloads) keeps this cost
 strictly inside the feature that pays for it.
 
-## 13. `placementTimeout` defaults to unset — a blocked gang waits forever
+## 17. `placementTimeout` defaults to unset — a blocked gang waits forever
 
 **Call.** Absent `placementTimeout`, a blocked gang waits indefinitely,
 loudly (status, events, gauge). The timeout is opt-in, and its only action
@@ -393,15 +527,50 @@ already understand (Slurm, pending pods), and it makes the default
 consistent with the design's core invariant: waiting is free, so the
 platform never gives up on your behalf — you tell it when to.
 
-**Phase 1: `placementTimeout` is not built at all.** The field is rejected as
-unknown. A blocked eval's `blocked_at` resets on every wake and re-block, so
-"blocked since" for a timeout needs a durable start that survives those
-cycles, plus a timer wake (blocked evals only wake on capacity) and a decided
-meaning for "fail the job". Wait-forever was already the default, so shipping
-without the opt-in bound changes no default; an agent can read
-`blocked.since` and stop the job meanwhile. Open in `TODO.md`.
+**Phase 1: not built. Revision 2: built as called.** Phase 1 rejected the
+field. Revision 2 built it with the default and action above, and two
+execution-time choices:
 
-## 14. A reschedule backoff on one member holds the whole gang top-up *(Phase 1)*
+- **The clock starts at the gang's first block** and is kept, in a
+  scheduler-lane `gang_wait` row per job config, across every wake and
+  re-block. A blocked eval's own `blocked_at` resets on each cycle, and a
+  per-attempt timer (coscheduling's) would never fire for a gang that is
+  woken often. YuniKorn's clock starts at the first placeholder, so a gang
+  that never places anything never times out; this one does.
+- **Expiry fails the job, and the failed job stays down.** The job is marked
+  `failed` before its allocations stop (cause `gang`), so no racing plan can
+  place it again, and a failed gang job places nothing until `legion job run`.
+  YuniKorn's `Soft` fallback (place what fits) was rejected: it is the
+  hoarding gang exists to prevent.
+
+```text
+Gang worker did not reach its quorum within placementTimeout 30m (waited 30m 1s); the job is failed and places nothing until `legion job run` restarts it. Last attempt: ...
+```
+
+## 18. A node-loss restart re-places after the survivors' stop grace — a delay, not a knob *(Revision 2)*
+
+**Call.** When node loss, drain, or an eviction restarts a gang, the node
+pass does not re-plan the job inline. It queues a `job_reschedule` delayed by
+the task's `stop.killAfter` (default 30s), so the new members place only
+after the old ones have had their whole grace to exit. A restart caused by a
+member failing waits for the longer of that grace and the failed member's
+move backoff (the plan said only the backoff; a `moveDelay` shorter than
+`killAfter` would have re-placed beside the dying survivors).
+
+**Alternatives.** (a) Re-plan immediately, as for any lost allocation. (b) A
+knob (JobSet added `BlockingRecreate` to wait for terminations).
+
+**Trade-off.** Every infrastructure-driven restart costs up to `killAfter` of
+extra downtime, even when the survivors exited at once. A short `killAfter`
+makes restarts fast; the integration test sets `1s`.
+
+**Why (correctness, learned from JobSet).** New members that start beside old
+ones still shutting down connect to dying peers, or find the old rank-0 port
+still bound. JobSet shipped exactly that bug before `BlockingRecreate`. The
+grace window is already the upper bound on "still shutting down", so
+waiting it out needs no new field and no worker round trip.
+
+## 19. A reschedule backoff on one member holds the whole gang top-up *(Phase 1)*
 
 **Call.** When any missing member of a gang waits out a reschedule backoff
 (`reschedule_hold`), the planner withholds the *whole* top-up, not just that
@@ -422,7 +591,7 @@ forbids — and if the held member then does not fit, the gang is stuck short
 with capacity spent. Holding the whole top-up keeps "missing members place
 together" true without the check having to reason about backoffs.
 
-## 15. Changing `gang` is a scheduling change *(Phase 1)*
+## 20. Changing `gang` is a scheduling change *(Phase 1)*
 
 **Call.** `task_schedule_equivalent` now compares `gang`, so paths that move
 allocations to a new config in place (a KV-triggered re-render, failover
@@ -441,7 +610,33 @@ of 8 that gains `gang`: carrying the 6 across leaves exactly the hoarding
 shape the user just asked to forbid. Ordinary resubmits go through a rollout
 either way, so the cost lands only on the in-place paths.
 
-## 16. No gang-specific events; one gauge *(Phase 1)*
+## 21. The loss decision is one scheduler-lane op, forwarded to the leader *(Revision 2)*
+
+**Call.** Every loss path (failure report, memory-pressure eviction, node
+loss, drain) calls `Store::gang_member_lost` after the lost row is removed and
+before anything queues its replacement. The decision (count the survivors,
+pick the action, stop them for a restart) is one replicated scheduler-lane op
+(`gang_member_lost`), forwarded to the lane leader from a follower
+(`ForwardableLaneWrite::GangMemberLost`). A cached read of the task config
+returns early for every non-gang task.
+
+**Alternatives.** (a) Decide in each caller from its local replica and
+replicate only the removals. (b) Fold the decision into the existing removal
+op (`remove_failed_allocation`) so a loss is one entry, not two.
+
+**Trade-off.** A gang loss costs a second raft entry after the removal, and
+a `fail` costs a third (mark failed, then stop). Between the removal and the
+decision a plan could, in principle, run; that plan sees the gang short of
+its quorum and places nothing, so the window is harmless.
+
+**Why (correctness on a cluster, then scope).** Worker reports land on
+whichever manager the worker dials, and a follower's replica can lag: (a)
+could count survivors that are already gone and pick `replace` for a broken
+gang. The leader holds the authoritative copy. (b) would thread gang policy
+through four removal ops with different shapes; one op shared by all of them
+keeps the policy in one place, and non-gang tasks pay one cache read.
+
+## 22. No gang-specific events; one gauge *(Phase 1)*
 
 **Call.** The plan's `job.gang_blocked`, `job.gang_placed`, and
 `job.gang_timeout` events are not built. `eval.blocked` already fires when the
@@ -461,7 +656,14 @@ only on a reason change as the plan's `job.gang_blocked` would have.
 in the same transactions, are journal noise and two more kinds to document;
 the gauge is the one signal the existing instruments cannot give.
 
-## 17. Wake-up is `node_join` + a 2-minute-capped backoff; removal-driven wake waits for Phase 2 — SUPERSEDED by call 2
+**Revision 2: two gang events after all.** `job.gang_member_lost` and
+`job.gang_timeout` are built, because unlike the dropped three they record
+decisions no existing event restates: which member was lost, what the gang
+did about it (`replace`, `restart`, `fail`), and a timeout that failed a job.
+`legion_gang_outcomes_total{outcome}` counts them. The Phase 1 reasoning still
+holds for "blocked" and "placed", which stay `eval.*` events.
+
+## 23. Wake-up is `node_join` + a 2-minute-capped backoff; removal-driven wake waits for Phase 2 — SUPERSEDED by call 2
 
 > **SUPERSEDED (Phase 1).** Blocked evals with event-driven, keyed wake on
 > every capacity event shipped before this was built; see call 2. Kept as
@@ -492,7 +694,7 @@ surface area, and doing it under Phase 1's deadline risks the part of the
 plan that matters most (the contract). A capped poll is dumb, bounded, and
 obviously correct — the right v1 shape for a wake optimization.
 
-## 18. Blocked-eval semantics are gang-opt-in for v1 — every other job keeps terminal failure — SUPERSEDED (moot)
+## 24. Blocked-eval semantics are gang-opt-in for v1 — every other job keeps terminal failure — SUPERSEDED (moot)
 
 > **SUPERSEDED (Phase 1).** Blocked semantics shipped for every job through
 > the sandbox-scaling plan before gang execution, so there is no gang-only

@@ -11143,7 +11143,10 @@ mod tests {
                 "trainer",
                 Band::Normal,
                 3,
-                Some(crate::structs::GangConfig { min: Some(2) }),
+                Some(crate::structs::GangConfig {
+                    min: Some(2),
+                    ..Default::default()
+                }),
             ),
         )?;
         let scheduler = Scheduler::new(&store)?;
@@ -11169,7 +11172,10 @@ mod tests {
                 "trainer",
                 Band::Normal,
                 3,
-                Some(crate::structs::GangConfig { min: Some(2) }),
+                Some(crate::structs::GangConfig {
+                    min: Some(2),
+                    ..Default::default()
+                }),
             ),
         )?;
         let error = Scheduler::new(&store)?
@@ -11331,7 +11337,10 @@ mod tests {
                 "trainer",
                 Band::Low,
                 2,
-                Some(crate::structs::GangConfig { min: Some(1) }),
+                Some(crate::structs::GangConfig {
+                    min: Some(1),
+                    ..Default::default()
+                }),
             ),
         )?;
         scheduler.plan_and_apply(&gang, PlanMode::Fresh)?;

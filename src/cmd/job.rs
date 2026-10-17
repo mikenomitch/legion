@@ -722,7 +722,7 @@ pub(crate) fn build_jobspec_schema() -> Value {
                         }
                     },
                     "gang": {
-                        "description": "All-or-nothing placement for this task's replicas. `true`: every replica places in one plan or none does, and a gang that does not fit places nothing (nor do the job's other tasks in that pass), holds no capacity, and waits blocked until a node that could help has room. `{ min: N }` places once N replicas fit together and adds the rest as room appears. Not combinable with count.per or keyed stateful tasks; the task must have its group to itself, and that group's rollout must replace it in one step. See docs/gang-scheduling.md.",
+                        "description": "All-or-nothing placement for this task's replicas. `true`: every replica places in one plan or none does, and a gang that does not fit places nothing (nor do the job's other tasks in that pass), holds no capacity, and waits blocked until a node that could help has room. `{ min: N }` places once N replicas fit together and adds the rest as room appears; `placementTimeout` bounds the wait and `onMemberLoss` says what a lost member does to the rest. Not combinable with count.per or keyed stateful tasks; the task must have its group to itself, and that group's rollout must replace it in one step. See docs/gang-scheduling.md.",
                         "oneOf": [
                             { "type": "boolean" },
                             {
@@ -733,6 +733,15 @@ pub(crate) fn build_jobspec_schema() -> Value {
                                         "type": "integer",
                                         "minimum": 1,
                                         "description": "Quorum: replicas that must place together, 1..=count. Default: the whole count."
+                                    },
+                                    "placementTimeout": {
+                                        "type": ["string", "integer"],
+                                        "description": "How long the gang may wait for its quorum before its job fails (any members already running stop), as a duration (`\"30m\"`) or seconds. Counted from the first time the gang came up short. At least 1s. Default: unset, wait indefinitely."
+                                    },
+                                    "onMemberLoss": {
+                                        "type": "string",
+                                        "enum": ["restart", "replace", "fail"],
+                                        "description": "What a lost member does to the rest when it leaves fewer than the quorum running. `restart` (default): stop the survivors and place the whole gang again once their stop grace has passed. `replace`: keep the survivors and place the missing members together once they fit. `fail`: fail the job and stop every member. A loss that leaves the quorum running is replaced alone. Restarts after a failure spend on_unhealthy's move budget; once it is spent the job fails."
                                     }
                                 }
                             }
@@ -2089,6 +2098,14 @@ async fn plan_job(arg_matches: &ArgMatches) -> R<()> {
                 if !report.reason.is_empty() && !report.would_place {
                     println!("    {}", report.reason);
                 }
+                if report.placement_timeout_seconds > 0 && !report.would_place {
+                    println!(
+                        "    The job fails if the gang is still short after its placementTimeout ({})",
+                        humantime::format_duration(std::time::Duration::from_secs(
+                            report.placement_timeout_seconds
+                        ))
+                    );
+                }
             }
         }
         // Who this submit would displace. Printed last and unmissably,
@@ -2572,20 +2589,30 @@ async fn get_info(arg_matches: &ArgMatches) -> R<()> {
             match blocked.gang.as_ref() {
                 // A gang waits for its whole quorum, not for one placement
                 // (docs/gang-scheduling.md).
-                Some(gang) => println!(
-                    "Blocked on {} since {}: gang {} is short {} replica(s) of {} each \
-                     ({} running, {} more fit, needs {} together)",
-                    blocked.key,
-                    since,
-                    blocked.task,
-                    gang.min
-                        .saturating_sub(gang.running)
-                        .saturating_sub(gang.placeable),
-                    per_placement,
-                    gang.running,
-                    gang.placeable,
-                    gang.min
-                ),
+                Some(gang) => {
+                    println!(
+                        "Blocked on {} since {}: gang {} is short {} replica(s) of {} each \
+                         ({} running, {} more fit, needs {} together)",
+                        blocked.key,
+                        since,
+                        blocked.task,
+                        gang.min
+                            .saturating_sub(gang.running)
+                            .saturating_sub(gang.placeable),
+                        per_placement,
+                        gang.running,
+                        gang.placeable,
+                        gang.min
+                    );
+                    if let Some(deadline) = chrono::DateTime::from_timestamp(gang.deadline, 0)
+                        .filter(|_| gang.deadline > 0)
+                    {
+                        println!(
+                            "  Fails at {} if still short (placementTimeout)",
+                            deadline.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+                        );
+                    }
+                }
                 None => println!(
                     "Blocked on {} since {}: task {} needs {} per placement",
                     blocked.key, since, blocked.task, per_placement

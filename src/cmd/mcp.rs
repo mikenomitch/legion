@@ -131,7 +131,7 @@ fn tool_defs() -> Vec<ToolDef> {
         },
         ToolDef {
             name: "legion_job_info",
-            description: "Inspect a single job's current state. A job whose placement found no room has status `blocked` and a `blocked` block naming the key it waits on, the task, and its per-placement shortfall; it places on its own when capacity appears. For a gang task, `blocked.gang` says how many replicas fit at the last attempt (`placeable`, `running`) against the quorum it must place together (`min`) (docs/gang-scheduling.md).",
+            description: "Inspect a single job's current state. A job whose placement found no room has status `blocked` and a `blocked` block naming the key it waits on, the task, and its per-placement shortfall; it places on its own when capacity appears. For a gang task, `blocked.gang` says how many replicas fit at the last attempt (`placeable`, `running`) against the quorum it must place together (`min`), and `deadline` (Unix seconds, 0 for none) when its `placementTimeout` fails the job if it is still short. A gang job with status `failed` (timed out, or failed by its `onMemberLoss`) places nothing until it is run again (docs/gang-scheduling.md).",
             input_schema: name_arg_schema,
             mutates: false,
         },

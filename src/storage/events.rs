@@ -1023,6 +1023,63 @@ pub mod drafts {
             }))
     }
 
+    /// `job.gang_member_lost` — a gang member was lost (it failed, its node
+    /// was lost or drained, or memory pressure evicted it) and what that did
+    /// to the gang: replaced alone, the whole gang restarted, or the job
+    /// failed (docs/gang-scheduling.md, "When a member is lost").
+    pub fn job_gang_member_lost(
+        lost: &Allocation,
+        cause: StopCause,
+        loss: &crate::storage::store::GangLoss,
+    ) -> EventDraft {
+        use crate::structs::MemberLossPolicy;
+        let state = if loss.running >= loss.min {
+            format!(
+                "{} run, at or above its quorum of {}",
+                loss.running, loss.min
+            )
+        } else {
+            format!("{} run, below its quorum of {}", loss.running, loss.min)
+        };
+        let action = match loss.action {
+            MemberLossPolicy::Replace if loss.running >= loss.min => {
+                "replacing the lost member".to_string()
+            }
+            MemberLossPolicy::Replace => {
+                "keeping the survivors and placing the missing members together".to_string()
+            }
+            MemberLossPolicy::Restart => {
+                format!("restarting the whole gang ({} stopped)", loss.stopped)
+            }
+            MemberLossPolicy::Fail => {
+                format!("failing the job ({} allocation(s) stopped)", loss.stopped)
+            }
+        };
+        let cause = if cause.is_known() {
+            cause.as_str()
+        } else {
+            "failed"
+        };
+        let message = format!(
+            "Gang {} of job {} lost allocation {} on node {} ({cause}): {state}; {action}",
+            loss.task_name, loss.job_id, lost.id, lost.node_id,
+        );
+        let draft = if loss.action == MemberLossPolicy::Replace {
+            EventDraft::info("job.gang_member_lost", message)
+        } else {
+            EventDraft::warn("job.gang_member_lost", message)
+        };
+        draft.job(&loss.job_id).node(&lost.node_id).meta(json!({
+            "task": loss.task_name,
+            "allocationId": lost.id,
+            "cause": cause,
+            "action": loss.action.as_str(),
+            "running": loss.running,
+            "min": loss.min,
+            "stopped": loss.stopped,
+        }))
+    }
+
     /// `job.destroyed` — a job and its records were removed.
     pub fn job_destroyed(job_id: &str) -> EventDraft {
         EventDraft::info("job.destroyed", format!("Job {job_id} destroyed")).job(job_id)
@@ -2334,6 +2391,15 @@ impl EventRecorder<'_> {
 
     pub fn job_failed(self, job_id: &str) {
         self.emit(drafts::job_failed(job_id));
+    }
+
+    pub fn job_gang_member_lost(
+        self,
+        lost: &Allocation,
+        cause: StopCause,
+        loss: &crate::storage::store::GangLoss,
+    ) {
+        self.emit(drafts::job_gang_member_lost(lost, cause, loss));
     }
 
     pub fn job_gang_timeout(

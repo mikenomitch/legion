@@ -1356,20 +1356,31 @@ How to use it:
   - [ ] Revisit fair share only with real multi-tenant demand. Bands +
         per-namespace band caps (the `bands` ACL selector) are the 80/20;
         hierarchical queues stay a non-goal.
-- [ ] **Gang scheduling, after Phase 1.** Phase 1 (the contract, `min`,
-      the quorum preemption floor, `job plan` gang reports) is in Done below;
+- [ ] **Gang scheduling, what is left.** Phase 1 (the contract, `min`,
+      the quorum preemption floor, `job plan` gang reports) and Revision 2
+      (`placementTimeout`, `onMemberLoss`) are in Done below;
       [plan](plans/gang-scheduling-plan.md) (IN EXECUTION) ·
       [calls](calls/gang-scheduling-plan_calls.md) ·
-      [docs](../docs/gang-scheduling.md). Open, in the plan's order:
-  - [ ] `gang.placementTimeout` (Phase 2): stop waiting and fail the job.
-        Needs a "waiting since" that survives wake/re-block cycles (a
-        blocked eval's `blocked_at` resets on every block), a timer wake
-        (blocked evals only wake on capacity), and a decided meaning for a
-        failed job. Rejected as an unknown field today
-        ([calls](calls/gang-scheduling-plan_calls.md) 13).
-  - [ ] `gang.recovery: 'gang'` (Phase 3): a member failure or loss stops
-        the survivors and re-places the whole gang as one wave, consuming one
-        move-budget unit. Today members fail and top up one at a time.
+      [docs](../docs/gang-scheduling.md). Open:
+  - [ ] **Rank and world size for members.** A stateless gang member gets
+        only `LEGION_ALLOC_ID`, so a framework's rendezvous has to assign
+        ranks itself and take the world size from `env`. Add
+        `LEGION_GANG_RANK` / `LEGION_GANG_SIZE` (and a coordinator address,
+        rank 0's, that does not wait for health checks). Ranks need storing
+        per allocation so a `replace` top-up hands the missing rank to the
+        replacement ([plan](plans/gang-scheduling-plan.md#revision-2-placement-timeout-and-member-loss-2026-10-17),
+        [calls](calls/gang-scheduling-plan_calls.md) 8).
+  - [ ] **Readiness timeout** (Kueue's `waitForPodsReady`). A member that
+        is placed but hangs before it runs (an image pull that never ends)
+        holds the others at their rendezvous until its start fails.
+        `placementTimeout` covers placement only.
+  - [ ] **In-place gang restart** (JobSet `InPlaceRestart`): restart every
+        member's process on its current node instead of a full re-placement.
+  - [ ] **Local restarts as gang losses.** A worker restarting a crashed
+        member in place under `restart` is invisible to the manager, so the
+        gang keeps running beside it. Today the doc says to set `restart = {
+        policy = "never" }`; a worker report would let `onMemberLoss` apply
+        ([calls](calls/gang-scheduling-plan_calls.md) 5).
   - [ ] Phase 4: an integration test that makes the `createFirst` blue-green
         gang update a supported path, and the autoscaler consuming a blocked
         gang's shortfall as scale-up demand.
@@ -1382,7 +1393,7 @@ How to use it:
         below its quorum, so a `gang = true` job in a preemptible band is not
         preemptible at all. Whole-gang victim selection (take every member,
         cost it as one victim) belongs to the preemption plan
-        ([calls](calls/gang-scheduling-plan_calls.md) 5).
+        ([calls](calls/gang-scheduling-plan_calls.md) 7).
   - [ ] **Reservation / backfill for starving gangs.** A waiting gang holds
         nothing, so small jobs can keep taking freed capacity before a large
         gang sees enough at once. Watch `legion_gang_blocked_jobs` first;
@@ -5020,6 +5031,24 @@ docs: [scheduler-and-eval-loop.md](../docs/scheduler-and-eval-loop.md), [jobs-ta
   - [x] `PlanJobReply.gang_reports` (a deferred gang is a successful dry
         run), `JobBlocked.gang`, `job plan` / `job info` / UI / MCP
         rendering, `legion_gang_blocked_jobs`.
+- [x] **Gang scheduling, Revision 2: placement timeout and member loss**
+      (2026-10-17, [plan](plans/gang-scheduling-plan.md#revision-2-placement-timeout-and-member-loss-2026-10-17) ·
+      [calls](calls/gang-scheduling-plan_calls.md) 4, 5, 8, 10, 17, 18, 21 ·
+      [docs](../docs/gang-scheduling.md#placement-timeout)).
+  - [x] `gang.placementTimeout`: a scheduler-lane `gang_wait` clock from
+        the gang's first block, a leader timer that wakes the blocked eval
+        past its deadline, and a job failed (survivors stopped with the new
+        `gang` stop cause) when the quorum still does not fit. A failed gang
+        job places nothing until `job run`. `job.gang_timeout`;
+        `GangReport.placement_timeout_seconds` / `waiting_since` /
+        `deadline`.
+  - [x] `gang.onMemberLoss = restart (default) | replace | fail`, applied
+        when a failure, node loss, drain, or memory-pressure eviction leaves
+        fewer than `min` running. Restarts wait out the survivors' stop
+        grace (and a failed member's backoff); failure-driven ones spend the
+        move budget, and an exhausted budget fails the job. One forwarded
+        scheduler-lane op (`gang_member_lost`); `job.gang_member_lost`;
+        `legion_gang_outcomes_total`.
 - [x] **Elastic session envelopes, Phase 1.** `stateful.envelope.max` and
       `shrinkAfter`: each node grows its session envelope toward the
       ceiling as its sessions fill it and shrinks it after they drain, one

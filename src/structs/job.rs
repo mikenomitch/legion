@@ -1474,11 +1474,13 @@ fn parse_percent(raw: &str) -> Option<f64> {
 /// its quorum.
 ///
 /// `placementTimeout` bounds the wait: a gang still short of its quorum that
-/// long after it first blocked fails its job.
+/// long after it first blocked fails its job. `onMemberLoss` decides what a
+/// lost member does to the rest when the loss leaves fewer than `min`
+/// running ([`MemberLossPolicy`]).
 ///
 /// Spelled `true`, `false` (no gang), or `{ min = N, placementTimeout =
-/// "30m" }`. It serializes back to the short form when nothing but the
-/// defaults is set, like [`TaskCount`].
+/// "30m", onMemberLoss = "fail" }`. It serializes back to the short form when
+/// nothing but the defaults is set, like [`TaskCount`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct GangConfig {
     /// Replicas that must run together. `None` = the task's whole count.
@@ -1486,6 +1488,39 @@ pub struct GangConfig {
     /// How long the gang may wait, short of its quorum, before its job is
     /// failed. `None` = wait indefinitely.
     pub placement_timeout: Option<Duration>,
+    /// What a member loss that breaks the quorum does to the survivors.
+    pub on_member_loss: MemberLossPolicy,
+}
+
+/// What happens to a gang's other members when one is lost — it failed, its
+/// node was lost or drained, or memory pressure evicted it — and fewer than
+/// the gang's quorum still run (docs/gang-scheduling.md, "When a member is
+/// lost"). A loss that leaves the quorum running is replaced alone,
+/// whatever the policy.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[serde(rename_all = "camelCase")]
+pub enum MemberLossPolicy {
+    /// Stop the survivors and place the whole gang again, as one unit. A
+    /// restart caused by a member failing spends the task's move budget
+    /// (`on_unhealthy.moveCount`); node loss and drain spend nothing.
+    #[default]
+    Restart,
+    /// Keep the survivors, and place the missing members together once they
+    /// fit.
+    Replace,
+    /// Fail the job and stop every allocation of it. It places nothing until
+    /// `legion job run` restarts it.
+    Fail,
+}
+
+impl MemberLossPolicy {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            MemberLossPolicy::Restart => "restart",
+            MemberLossPolicy::Replace => "replace",
+            MemberLossPolicy::Fail => "fail",
+        }
+    }
 }
 
 impl GangConfig {
@@ -1549,10 +1584,20 @@ impl GangConfig {
                                     .map_err(|err| format!("gang.placementTimeout: {err}"))?,
                             );
                         }
+                        "onMemberLoss" => {
+                            gang.on_member_loss =
+                                serde_json::from_value(value.clone()).map_err(|_| {
+                                    format!(
+                                        "gang.onMemberLoss must be one of \"restart\", \
+                                         \"replace\", \"fail\", got {value}"
+                                    )
+                                })?;
+                        }
                         other => {
                             return Err(format!(
                                 "unknown field `{other}` in gang, expected one of `min`, \
-                                 `placementTimeout` (see docs/gang-scheduling.md)"
+                                 `placementTimeout`, `onMemberLoss` (see \
+                                 docs/gang-scheduling.md)"
                             ))
                         }
                     }
@@ -1575,7 +1620,7 @@ impl Serialize for GangConfig {
         if *self == GangConfig::default() {
             return serializer.serialize_bool(true);
         }
-        let mut state = serializer.serialize_struct("GangConfig", 2)?;
+        let mut state = serializer.serialize_struct("GangConfig", 3)?;
         if let Some(min) = self.min {
             state.serialize_field("min", &min)?;
         }
@@ -1584,6 +1629,9 @@ impl Serialize for GangConfig {
                 "placementTimeout",
                 &humantime::format_duration(timeout).to_string(),
             )?;
+        }
+        if self.on_member_loss != MemberLossPolicy::default() {
+            state.serialize_field("onMemberLoss", &self.on_member_loss)?;
         }
         state.end()
     }
@@ -4905,12 +4953,24 @@ mod tests {
     #[test]
     fn gang_parses_as_a_flag_or_a_quorum_and_round_trips() -> R<()> {
         let all = gang_task(serde_json::json!(true))?;
-        assert_eq!(all.gang, Some(GangConfig { min: None }));
+        assert_eq!(
+            all.gang,
+            Some(GangConfig {
+                min: None,
+                ..Default::default()
+            })
+        );
         assert_eq!(all.gang.map(|gang| gang.quorum(8)), Some(8));
         assert_eq!(serde_json::to_value(&all)?["gang"], serde_json::json!(true));
 
         let quorum = gang_task(serde_json::json!({ "min": 6 }))?;
-        assert_eq!(quorum.gang, Some(GangConfig { min: Some(6) }));
+        assert_eq!(
+            quorum.gang,
+            Some(GangConfig {
+                min: Some(6),
+                ..Default::default()
+            })
+        );
         assert_eq!(
             serde_json::to_value(&quorum)?["gang"],
             serde_json::json!({ "min": 6 })
@@ -4951,6 +5011,43 @@ mod tests {
     }
 
     #[test]
+    fn gang_on_member_loss_parses_and_round_trips() -> R<()> {
+        let default = gang_task(serde_json::json!({ "min": 2 }))?;
+        assert_eq!(
+            default.gang.as_ref().map(|gang| gang.on_member_loss),
+            Some(MemberLossPolicy::Restart)
+        );
+        // The default is not written back.
+        assert_eq!(
+            serde_json::to_value(&default)?["gang"],
+            serde_json::json!({ "min": 2 })
+        );
+        for (policy, name) in [
+            (MemberLossPolicy::Replace, "replace"),
+            (MemberLossPolicy::Fail, "fail"),
+        ] {
+            let task = gang_task(serde_json::json!({ "onMemberLoss": name }))?;
+            assert_eq!(
+                task.gang.as_ref().map(|gang| gang.on_member_loss),
+                Some(policy)
+            );
+            let stored = serde_json::to_value(&task)?["gang"].clone();
+            assert_eq!(stored, serde_json::json!({ "onMemberLoss": name }));
+            let reparsed: TaskConfig = serde_json::from_value(serde_json::to_value(&task)?)?;
+            assert_eq!(reparsed.gang, task.gang);
+        }
+        let error = gang_task(serde_json::json!({ "onMemberLoss": "ignore" }))
+            .expect_err("an unknown policy is rejected");
+        assert!(
+            error
+                .to_string()
+                .contains("gang.onMemberLoss must be one of"),
+            "{error}"
+        );
+        Ok(())
+    }
+
+    #[test]
     fn gang_rejects_fields_it_does_not_have() {
         let error = gang_task(serde_json::json!({ "minimum": 3 }))
             .expect_err("an unknown field is rejected, not ignored");
@@ -4971,7 +5068,10 @@ mod tests {
 
     #[test]
     fn the_quorum_follows_a_scaled_count_down() {
-        let gang = GangConfig { min: Some(6) };
+        let gang = GangConfig {
+            min: Some(6),
+            ..Default::default()
+        };
         assert_eq!(gang.quorum(8), 6);
         assert_eq!(gang.quorum(4), 4, "a scale-in below min lowers the quorum");
         assert_eq!(GangConfig::default().quorum(10), 10);
@@ -4981,7 +5081,10 @@ mod tests {
     fn gang_validation_rejects_what_has_no_fixed_membership() -> R<()> {
         let mut task = TaskConfig {
             count: TaskCount::new(8),
-            gang: Some(GangConfig { min: Some(9) }),
+            gang: Some(GangConfig {
+                min: Some(9),
+                ..Default::default()
+            }),
             ..TaskConfig::new("trainer", "noop")
         };
         let error = task.validate_gang().expect_err("min above count");
@@ -4991,9 +5094,15 @@ mod tests {
                 .contains("must be between 1 and the task's count (8)"),
             "{error}"
         );
-        task.gang = Some(GangConfig { min: Some(0) });
+        task.gang = Some(GangConfig {
+            min: Some(0),
+            ..Default::default()
+        });
         assert!(task.validate_gang().is_err(), "min of zero");
-        task.gang = Some(GangConfig { min: Some(8) });
+        task.gang = Some(GangConfig {
+            min: Some(8),
+            ..Default::default()
+        });
         task.validate_gang()?;
 
         let per = TaskConfig {

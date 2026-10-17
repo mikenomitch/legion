@@ -54,7 +54,7 @@ Even with `--allow-write`, `legion_state_query` stays read-only.
 | --- | --- | --- |
 | `legion_capabilities` | no | List the operation catalog. |
 | `legion_job_list` | no | List jobs, optionally only those in one `status`. The reply's `statusCounts` gives per-status totals. |
-| `legion_job_info` | no | Inspect one job. A job whose placement found no room reports `status: blocked` with a `blocked` block: the key it waits on, the task, its per-placement shortfall, and the scheduler's message. It places on its own when capacity appears, so an agent should wait or add capacity, not resubmit ([Blocked evals](scheduler-and-eval-loop.md#blocked-evals)). For a [gang](gang-scheduling.md), `blocked.gang` says how many replicas fit (`placeable`, `running`) against the quorum it must place together (`min`). |
+| `legion_job_info` | no | Inspect one job. A job whose placement found no room reports `status: blocked` with a `blocked` block: the key it waits on, the task, its per-placement shortfall, and the scheduler's message. It places on its own when capacity appears, so an agent should wait or add capacity, not resubmit ([Blocked evals](scheduler-and-eval-loop.md#blocked-evals)). For a [gang](gang-scheduling.md), `blocked.gang` says how many replicas fit (`placeable`, `running`) against the quorum it must place together (`min`), and, when it sets `placementTimeout`, when it gives up (`deadline`, Unix seconds): wait until then, or add capacity. A gang job past its deadline, or one whose `onMemberLoss` failed it, reports `status: failed` and places nothing until `legion job run`. |
 | `legion_job_spec` | no | Fetch a job's source submissions. |
 | `legion_job_schema` | no | JSON Schema for jobspecs + task runtimes. |
 | `legion_job_validate` | no | Validate a rendered jobspec (JSON). |
@@ -771,7 +771,8 @@ the timeout off.
      now (`wouldPlace`), and if not how far it got (`placeable` of `min`,
      `eligibleNodes` of `nodes`) and why. `wouldPlace: false` is not an error:
      the reply succeeds with no allocations, and a submit would wait, blocked
-     and holding nothing, until the gang fits
+     and holding nothing, until the gang fits, or until its
+     `placementTimeoutSeconds` runs out and the job fails
      ([gang-scheduling.md](gang-scheduling.md)).
 
    `preemptionMode` tells you whether that list is empty because nothing would

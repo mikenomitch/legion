@@ -11780,7 +11780,13 @@ fn handle_pressure_actions(
                 .allocations
                 .remove(&action.allocation_id);
             if let Some(removal) = removal {
-                apply_move_verdict(store, &removal, node_id);
+                let gang = gang_member_lost(
+                    store,
+                    &removal.allocation,
+                    StopCause::NodePressure,
+                    matches!(removal.verdict, MoveVerdict::Exhausted { .. }),
+                );
+                apply_move_verdict(store, &removal, node_id, gang.as_ref());
             }
             continue;
         }
@@ -11797,16 +11803,34 @@ fn handle_pressure_actions(
         let Some(removed) = removed else {
             continue;
         };
+        // A gang decides first, so no replacement races the decision: a
+        // restart re-places after its survivors' stop grace, and a failed
+        // gang job places nothing.
+        let gang = gang_member_lost(store, &removed, StopCause::NodePressure, false);
+        if gang
+            .as_ref()
+            .is_some_and(|loss| loss.action == crate::structs::MemberLossPolicy::Fail)
+        {
+            continue;
+        }
         let priority = store
             .cached_band_for_job_config(&removed.job_config_id)
             .map(|band| band.eval_priority())
             .unwrap_or(store.default_eval_priority);
-        store.enqueue_eval(
+        let grace = gang
+            .as_ref()
+            .filter(|loss| {
+                loss.action == crate::structs::MemberLossPolicy::Restart && loss.stopped > 0
+            })
+            .map(|loss| Duration::from_secs(loss.grace_secs))
+            .unwrap_or_default();
+        store.enqueue_eval_after_delay(
             "job_reschedule",
             Some(&removed.job_id),
             Some(&removed.job_config_id),
             Some(node_id),
             Some(priority),
+            grace,
         )?;
         info!(
             allocation_id = removed.id,
@@ -12026,7 +12050,15 @@ fn handle_failed_allocations(
             reason = %failure.reason,
             "Allocation reported failed"
         );
-        apply_move_verdict(store, &removal, node_id);
+        // A gang member: the gang's policy runs before the verdict queues
+        // the replacement (docs/gang-scheduling.md, "When a member is lost").
+        let gang = gang_member_lost(
+            store,
+            &removal.allocation,
+            StopCause::Unknown,
+            matches!(removal.verdict, MoveVerdict::Exhausted { .. }),
+        );
+        apply_move_verdict(store, &removal, node_id, gang.as_ref());
     }
 
     // The removed rows freed node capacity (see
@@ -12121,17 +12153,46 @@ fn update_allocation_health_snapshots(
     store.upsert_allocation_health_snapshots(node_id, snapshots)
 }
 
+/// Apply a lost member's gang policy ([`Store::gang_member_lost`]). A
+/// decision that cannot be made is logged, and the member is then replaced
+/// like any task's: the report it came from is already acted on.
+fn gang_member_lost(
+    store: &Store,
+    lost: &crate::structs::Allocation,
+    cause: StopCause,
+    exhausted: bool,
+) -> Option<crate::storage::store::GangLoss> {
+    match store.gang_member_lost(lost, cause, exhausted) {
+        Ok(loss) => loss,
+        Err(err) => {
+            warn!(
+                allocation_id = lost.id,
+                job_id = %lost.job_id,
+                error = %format!("{err:#}"),
+                "Gang member-loss policy failed; replacing the member"
+            );
+            None
+        }
+    }
+}
+
 /// Act on the move budget's verdict for a removed failed allocation
 /// ([`Store::remove_failed_allocation`]): announce a deferred replacement and
 /// queue the delayed `job_reschedule` that places it once the hold lapses,
-/// or announce the spent budget and fail the job.
+/// or announce the spent budget and fail the job. A gang that restarted
+/// (`gang`) re-places no sooner than its survivors' stop grace, either.
 ///
 /// The `job_reschedule` is a replicated delayed eval, so it survives a
 /// manager restart or a leader change, and it names the failed node so the
 /// replacement avoids it. Best effort past the removal: a failed enqueue is
 /// logged, and the next eval of the job places the replacement once the
 /// hold lapses.
-fn apply_move_verdict(store: &Store, removal: &FailedRemoval, node_id: &str) {
+fn apply_move_verdict(
+    store: &Store,
+    removal: &FailedRemoval,
+    node_id: &str,
+    gang: Option<&crate::storage::store::GangLoss>,
+) {
     let allocation = &removal.allocation;
     match &removal.verdict {
         MoveVerdict::Deferred(hold) => {
@@ -12145,13 +12206,20 @@ fn apply_move_verdict(store: &Store, removal: &FailedRemoval, node_id: &str) {
                 next_attempt_at = %hold.next_attempt_at(),
                 "Rescheduling failed allocation after backoff"
             );
+            // A restarted gang's new members must not start beside old ones
+            // still inside their stop grace.
+            let grace = gang
+                .filter(|loss| {
+                    loss.action == crate::structs::MemberLossPolicy::Restart && loss.stopped > 0
+                })
+                .map_or(0, |loss| loss.grace_secs);
             if let Err(err) = store.enqueue_eval_after_delay(
                 "job_reschedule",
                 Some(&allocation.job_id),
                 Some(&allocation.job_config_id),
                 Some(node_id),
                 None,
-                Duration::from_secs(hold.delay_secs),
+                Duration::from_secs(hold.delay_secs.max(grace)),
             ) {
                 error!(
                     job_id = %allocation.job_id,
@@ -12176,13 +12244,19 @@ fn apply_move_verdict(store: &Store, removal: &FailedRemoval, node_id: &str) {
                 *move_period_secs,
                 reason,
             );
-            if let Err(error) = store.mark_job_failed(&allocation.job_id) {
-                error!(
-                    allocation_id = allocation.id,
-                    job_id = %allocation.job_id,
-                    error = %format!("{error:#}"),
-                    "Failed to mark the job failed after its move budget ran out"
-                );
+            // A gang already failed its job and stopped every member
+            // (`Store::gang_member_lost`).
+            let gang_failed =
+                gang.is_some_and(|loss| loss.action == crate::structs::MemberLossPolicy::Fail);
+            if !gang_failed {
+                if let Err(error) = store.mark_job_failed(&allocation.job_id) {
+                    error!(
+                        allocation_id = allocation.id,
+                        job_id = %allocation.job_id,
+                        error = %format!("{error:#}"),
+                        "Failed to mark the job failed after its move budget ran out"
+                    );
+                }
             }
             // The task failed for good: say so in its status, so a
             // `complete` dependent can run and a `success` one never does.

@@ -189,7 +189,11 @@ fn maximal_job_spec_parse() {
         .expect("maximal must declare the gang task");
     assert_eq!(
         trainer.gang,
-        Some(legion::structs::GangConfig { min: Some(3) })
+        Some(legion::structs::GangConfig {
+            min: Some(3),
+            placement_timeout: Some(std::time::Duration::from_secs(30 * 60)),
+            on_member_loss: legion::structs::MemberLossPolicy::Restart,
+        })
     );
     let scratch = config
         .tasks

@@ -831,7 +831,11 @@ for a task:
 - the cluster has no schedulable node at all;
 - a [gang](gang-scheduling.md) task cannot reach its quorum. The plan then
   places nothing, and the eval blocks under the key of the gang's first
-  missing replica, with the gang's report in its detail.
+  missing replica, with the gang's report in its detail. A gang that sets
+  `placementTimeout` is also woken by the clock: the scheduler-lane leader
+  wakes its blocked eval (cause `timeout`) once the deadline passes, and if
+  the quorum still does not fit, the eval fails the job instead of blocking
+  again ([Placement timeout](gang-scheduling.md#placement-timeout)).
 
 One placement waits on the clock instead of blocking: preemption that could
 make room, but only once its victims age past `preemption.victimExemptAge`.

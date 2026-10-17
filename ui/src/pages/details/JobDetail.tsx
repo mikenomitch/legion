@@ -16,7 +16,7 @@ import { managerClient } from '../../grpcClient'
 import { nodePublicAddress } from '../../utils/services'
 import { allows, jobScope } from '../../utils/acl'
 import { allocationHealthLabel, fetchAllocationRuntime, fetchTaskStatusByName, parseAllocNetwork } from '../../utils/allocations'
-import { formatDate, pluralize } from '../../utils/format'
+import { formatDate, formatDateTime, pluralize } from '../../utils/format'
 import { buildTaskInstancesByName, buildTaskInstancesFromStatuses, extractJobSpecFromReply, topoSortTaskNames, type TaskInstanceSummary } from '../../utils/jobspec'
 import { INDEX_POLL_INTERVAL_MS, retainOnError, usePoll } from '../../utils/polling'
 import { stableList } from '../../utils/instances'
@@ -518,6 +518,10 @@ function JobDetailContent() {
                             <span class="font-semibold">Gang</span>: {gang().running} running, {gang().placeable} more
                             fit, and it places only once {gang().min} run together ({gang().eligibleNodes} of{' '}
                             {gang().nodes} nodes accept the task).
+                            <Show when={gang().deadline > 0n}>
+                              {' '}If it is still short at {formatDateTime(Number(gang().deadline))} (its
+                              placementTimeout), the job fails.
+                            </Show>
                           </div>
                         )}
                       </Show>

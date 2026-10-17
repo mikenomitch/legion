@@ -11,10 +11,14 @@ use legion::manager::daemon::resolve_claimed_eval;
 use legion::manager::server::ManagerDaemonService;
 use legion::prelude::{json, Context, R};
 use legion::storage::store::{ClaimScope, EvalBatchLimits, Store};
+use legion::storage::store::{FailedMove, MovePolicy, MoveVerdict};
 use legion::structs::config::ManagerConfigFull;
-use legion::structs::job::{GangConfig, JobConfig, TaskConfig, TaskCount};
+use legion::structs::job::{GangConfig, JobConfig, MemberLossPolicy, TaskConfig, TaskCount};
 use legion::structs::manager_server::Manager;
-use legion::structs::{GetJobInfoRequest, Node, NodeMsg, PlanJobRequest, Submission};
+use legion::structs::{
+    GetJobInfoRequest, Node, NodeMsg, PlanJobRequest, StopCause, StopConfig, Submission,
+};
+use std::time::Duration;
 use tonic::Request;
 
 const LIMITS: EvalBatchLimits = EvalBatchLimits {
@@ -263,18 +267,53 @@ fn a_waiting_gang_holds_nothing_and_takes_freed_capacity_whole() -> R<()> {
     Ok(())
 }
 
-/// S3: a node dies under a running gang on a full cluster. The top-up waits
-/// (blocked, survivors still running), and capacity arriving places it.
+fn gang_on_loss(policy: MemberLossPolicy) -> Option<GangConfig> {
+    Some(GangConfig {
+        on_member_loss: policy,
+        ..GangConfig::default()
+    })
+}
+
+/// A gang job whose members stop within a second, so a restart's re-place
+/// (which waits out the survivors' stop grace) is quick to observe.
+fn quick_stop(mut job: JobConfig) -> JobConfig {
+    job.tasks[0].stop = Some(StopConfig {
+        kill_after: Duration::from_secs(1),
+        ..StopConfig::default()
+    });
+    job
+}
+
+fn lose_node(cluster: &Cluster, node: &str) -> R<()> {
+    let store = cluster.store();
+    store.mark_node_lost(node)?;
+    store.reschedule_allocations_for_lost_node(node)
+}
+
+fn gang_events(cluster: &Cluster) -> R<Vec<serde_json::Value>> {
+    Ok(cluster
+        .store()
+        .list_scheduler_events(&legion::storage::events::SchedulerEventFilter {
+            kind: Some("job.gang_member_lost".into()),
+            ..Default::default()
+        })?
+        .into_iter()
+        .map(|event| serde_json::from_str(&event.metadata_json))
+        .collect::<Result<_, _>>()?)
+}
+
+/// S3 with `onMemberLoss = "replace"`: a node dies under a running gang on a
+/// full cluster. The top-up waits (blocked, survivors still running), and
+/// capacity arriving places it.
 #[test]
 fn a_lost_member_tops_up_when_room_appears() -> R<()> {
     let cluster = Cluster::new(&["n-1", "n-2", "n-3"])?;
-    cluster.submit(&job("trainer", 3, gang()))?;
+    cluster.submit(&job("trainer", 3, gang_on_loss(MemberLossPolicy::Replace)))?;
     cluster.settle()?;
     assert_eq!(cluster.running("trainer")?, 3);
 
+    lose_node(&cluster, "n-3")?;
     let store = cluster.store();
-    store.mark_node_lost("n-3")?;
-    store.reschedule_allocations_for_lost_node("n-3")?;
     // The lost-node reconcile queued its retry for later; run it now.
     let config_id = store.get_job_config("trainer")?.id();
     store.enqueue_eval(
@@ -406,5 +445,212 @@ fn a_gang_past_its_placement_timeout_fails_its_job() -> R<()> {
         .enqueue_eval("job_update", Some("trainer"), Some(&config_id), None, None)?;
     cluster.settle()?;
     assert_eq!(cluster.running("trainer")?, 2);
+    Ok(())
+}
+
+/// An elastic gang that reaches its quorum has stopped waiting, even while
+/// the members above its quorum still wait for room: its placement timeout
+/// no longer applies, and the timer leaves it alone.
+#[test]
+fn a_gang_at_its_quorum_is_not_timed_out() -> R<()> {
+    let cluster = Cluster::new(&["n-1"])?;
+    let elastic = Some(GangConfig {
+        min: Some(2),
+        placement_timeout: Some(Duration::from_secs(1)),
+        ..GangConfig::default()
+    });
+    cluster.submit(&job("trainer", 3, elastic))?;
+    cluster.settle()?;
+    let config_id = cluster.store().get_job_config("trainer")?.id();
+    assert!(
+        cluster.store().gang_wait(&config_id)?.is_some(),
+        "short: waiting"
+    );
+
+    cluster.join("n-2")?;
+    cluster.settle()?;
+    // The plan placed the quorum and left the third member unplaced, for the
+    // capacity pass: a partial placement, so the eval succeeded.
+    assert_eq!(cluster.running("trainer")?, 2, "the quorum placed");
+    assert!(cluster.store().blocked_evals()?.is_empty());
+    assert!(
+        cluster.store().gang_wait(&config_id)?.is_none(),
+        "the wait ended"
+    );
+
+    std::thread::sleep(Duration::from_millis(2100));
+    assert_eq!(cluster.store().wake_timed_out_gangs()?, 0);
+    cluster.settle()?;
+    assert_eq!(cluster.running("trainer")?, 2);
+    assert_ne!(cluster.job_info("trainer")?.status, "failed");
+    Ok(())
+}
+
+/// The default `onMemberLoss = "restart"`: a node dies under a gang that
+/// cannot run without it. The survivors stop (stop cause `gang`), and once
+/// their stop grace has passed the whole gang is placed again, together.
+#[test]
+fn a_broken_gang_restarts_whole_by_default() -> R<()> {
+    let cluster = Cluster::new(&["n-1", "n-2", "n-3", "n-4"])?;
+    cluster.submit(&quick_stop(job("trainer", 3, gang())))?;
+    cluster.settle()?;
+    assert_eq!(cluster.running("trainer")?, 3);
+    let lost_node = cluster
+        .store()
+        .allocs_for_job("trainer")?
+        .first()
+        .map(|allocation| allocation.node_id.clone())
+        .context("a member")?;
+
+    lose_node(&cluster, &lost_node)?;
+    assert_eq!(
+        cluster.running("trainer")?,
+        0,
+        "the survivors stop with the lost member"
+    );
+    let events = gang_events(&cluster)?;
+    assert_eq!(events.len(), 1, "{events:?}");
+    assert_eq!(events[0]["action"], "restart");
+    assert_eq!(events[0]["running"], 2);
+    assert_eq!(events[0]["stopped"], 2);
+    assert_eq!(events[0]["cause"], "node_lost");
+
+    // Not before the survivors' stop grace: nothing re-places yet.
+    cluster.settle()?;
+    assert_eq!(cluster.running("trainer")?, 0);
+    std::thread::sleep(Duration::from_millis(1100));
+    cluster.settle()?;
+    assert_eq!(
+        cluster.running("trainer")?,
+        3,
+        "the whole gang placed again"
+    );
+    assert!(cluster
+        .store()
+        .allocs_for_job("trainer")?
+        .iter()
+        .all(|allocation| allocation.node_id != lost_node));
+    Ok(())
+}
+
+/// An elastic gang (`min` below `count`) that still runs its quorum after a
+/// loss is not broken: the member is replaced alone and nothing restarts.
+#[test]
+fn a_loss_above_the_quorum_replaces_the_member_alone() -> R<()> {
+    let cluster = Cluster::new(&["n-1", "n-2", "n-3", "n-4"])?;
+    let elastic = Some(GangConfig {
+        min: Some(2),
+        ..GangConfig::default()
+    });
+    cluster.submit(&job("trainer", 3, elastic))?;
+    cluster.settle()?;
+    let lost_node = cluster.store().allocs_for_job("trainer")?[0]
+        .node_id
+        .clone();
+    lose_node(&cluster, &lost_node)?;
+    cluster.settle()?;
+    assert_eq!(cluster.running("trainer")?, 3, "replaced inline");
+    let events = gang_events(&cluster)?;
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0]["action"], "replace");
+    assert_eq!(events[0]["stopped"], 0);
+    Ok(())
+}
+
+/// `onMemberLoss = "fail"`: a lost member fails the job and stops every
+/// allocation of it, and the failed gang job places nothing until restarted.
+#[test]
+fn on_member_loss_fail_fails_the_job() -> R<()> {
+    let cluster = Cluster::new(&["n-1", "n-2", "n-3", "n-4"])?;
+    cluster.submit(&job("trainer", 3, gang_on_loss(MemberLossPolicy::Fail)))?;
+    cluster.settle()?;
+    let lost_node = cluster.store().allocs_for_job("trainer")?[0]
+        .node_id
+        .clone();
+    lose_node(&cluster, &lost_node)?;
+    cluster.settle()?;
+    assert_eq!(cluster.running("trainer")?, 0);
+    assert_eq!(cluster.job_info("trainer")?.status, "failed");
+    assert_eq!(gang_events(&cluster)?[0]["action"], "fail");
+    cluster.join("n-5")?;
+    cluster.settle()?;
+    assert_eq!(
+        cluster.running("trainer")?,
+        0,
+        "a failed gang job stays down"
+    );
+    Ok(())
+}
+
+/// A member that fails (a worker's report) restarts the gang too, and the
+/// failed member's move backoff holds the whole gang's re-placement. Once the
+/// task's move budget is spent, the next failure fails the job with every
+/// member stopped, whatever the policy.
+#[test]
+fn failure_driven_restarts_spend_the_move_budget() -> R<()> {
+    let cluster = Cluster::new(&["n-1", "n-2", "n-3"])?;
+    cluster.submit(&job("trainer", 3, gang()))?;
+    cluster.settle()?;
+    assert_eq!(cluster.running("trainer")?, 3);
+    let store = cluster.store();
+    // What the manager does with a worker's failure report.
+    let fail_a_member = || -> R<MoveVerdict> {
+        let member = store.allocs_for_job("trainer")?[0].clone();
+        let removal = store
+            .remove_failed_allocation(
+                member.id,
+                StopCause::Unknown,
+                None,
+                FailedMove {
+                    policy: MovePolicy {
+                        move_delay_ms: 1_000,
+                        move_count: Some(1),
+                        move_period_ms: 3_600_000,
+                    },
+                    reason: "exit status 1".into(),
+                },
+            )?
+            .context("removed")?;
+        let exhausted = matches!(removal.verdict, MoveVerdict::Exhausted { .. });
+        store.gang_member_lost(&removal.allocation, StopCause::Unknown, exhausted)?;
+        Ok(removal.verdict)
+    };
+    let reschedule = || -> R<()> {
+        let config_id = store.get_job_config("trainer")?.id();
+        store.enqueue_eval(
+            "job_reschedule",
+            Some("trainer"),
+            Some(&config_id),
+            None,
+            None,
+        )?;
+        cluster.settle()?;
+        Ok(())
+    };
+
+    assert!(matches!(fail_a_member()?, MoveVerdict::Deferred(_)));
+    assert_eq!(cluster.running("trainer")?, 0, "the gang restarts");
+    reschedule()?;
+    assert_eq!(
+        cluster.running("trainer")?,
+        0,
+        "the failed member's backoff holds the whole gang"
+    );
+    std::thread::sleep(Duration::from_millis(1_100));
+    reschedule()?;
+    assert_eq!(
+        cluster.running("trainer")?,
+        3,
+        "placed whole after the backoff"
+    );
+
+    assert!(matches!(fail_a_member()?, MoveVerdict::Exhausted { .. }));
+    assert_eq!(cluster.running("trainer")?, 0);
+    assert_eq!(cluster.job_info("trainer")?.status, "failed");
+    let actions: Vec<_> = gang_events(&cluster)?
+        .iter()
+        .map(|event| event["action"].as_str().unwrap_or_default().to_string())
+        .collect();
+    assert_eq!(actions, ["restart", "fail"]);
     Ok(())
 }

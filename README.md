@@ -113,8 +113,9 @@ sandboxes.
 - **Any kind of workload.** Long-running services, batch jobs, sidecars, and
   [stateful workloads](docs/stateful-workloads.md) with stable identity and
   [volumes](docs/volumes.md). Distributed jobs set
-  [`gang`](docs/gang-scheduling.md) so their replicas start all at once or
-  wait, holding nothing, until they can.
+  [`gang`](docs/gang-scheduling.md) so their replicas place all at once or
+  wait, holding nothing, until they can, and restart together when one is
+  lost.
 - **A built-in DAG system.** Tasks declare `dependsOn` to form a
   [dependency graph](docs/jobs-tasks-and-scheduling.md), gated on another
   task starting, completing, or succeeding. Dependencies can span groups
