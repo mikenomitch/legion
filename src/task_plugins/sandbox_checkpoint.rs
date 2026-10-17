@@ -1363,9 +1363,10 @@ fn retarget_cloud_hypervisor_config(
 pub(crate) const DATAPATH_WAIT: Duration = Duration::from_secs(5);
 
 /// Wait up to `timeout` for the egress proxy's socket beside a gated guest's
-/// vsock base (`<base>_1080`). The heartbeat that delivered the restore
-/// binds it before reconcile starts the restore, so this is normally
-/// immediate. False when it never appeared.
+/// vsock base (`<base>_1080`). Every delivery route binds it before the
+/// launch starts the restore: the heartbeat before its reconcile, and a
+/// push or work-stream delivery in `WorkerDaemonService::accept_work`. So
+/// this is normally immediate. False when it never appeared.
 pub(crate) fn wait_for_datapath(base: &Path, timeout: Duration) -> bool {
     let proxy = crate::worker::netd::guest_agent::host_socket_path(
         base,
@@ -1560,10 +1561,17 @@ pub(crate) struct RestoreTarget<'a> {
     /// The bridge an auto TAP joins (`config.network.bridge`). A restore
     /// that has to recreate the device attaches it here.
     pub bridge: Option<String>,
-    /// The restoring allocation's own vsock socket base, when it is gated
-    /// (`<alloc>/.sandbox/vsock.sock`). Every gated restore moves the guest
-    /// onto it, and a gated checkpoint restores only into a gated task.
+    /// The restoring allocation's own vsock socket base
+    /// (`<alloc>/.sandbox/vsock.sock`). Every microVM restore moves the guest
+    /// onto it, because exec dials it, and a gated checkpoint restores only
+    /// into a task that has one.
     pub vsock: Option<PathBuf>,
+    /// Whether the restoring allocation's network mode is `gated`. Only then
+    /// does the datapath bind an egress proxy beside [`Self::vsock`], so only
+    /// then does the restore wait for it. A sandbox that is not gated still
+    /// has a vsock for exec, and waiting on it would cost the full
+    /// [`DATAPATH_WAIT`] on every restore.
+    pub gated: bool,
     /// How long to wait for the datapath's socket before resuming a gated
     /// guest fail-closed ([`DATAPATH_WAIT`]; tests shorten it).
     pub datapath_wait: Duration,
@@ -1704,7 +1712,7 @@ pub(crate) fn check_restorable(
 /// reset) and the node reports the unbound socket on its next heartbeat,
 /// which is better than turning a transient bind error into a cold boot.
 fn await_datapath(target: &RestoreTarget<'_>) {
-    let Some(base) = target.vsock.as_deref() else {
+    let Some(base) = target.vsock.as_deref().filter(|_| target.gated) else {
         return;
     };
     if !wait_for_datapath(base, target.datapath_wait) {
@@ -2161,6 +2169,7 @@ mod tests {
             tap: None,
             bridge: None,
             vsock: None,
+            gated: false,
             datapath_wait: DATAPATH_WAIT,
             memory_restore: MemoryRestore::Lazy,
             userfaultfd: false,
@@ -2320,6 +2329,7 @@ mod tests {
             tap: None,
             bridge: None,
             vsock: None,
+            gated: false,
             datapath_wait: DATAPATH_WAIT,
             memory_restore: MemoryRestore::Lazy,
             userfaultfd: false,
@@ -2464,6 +2474,7 @@ mod tests {
                 tap: Some("tap0".into()),
                 bridge: None,
                 vsock: None,
+                gated: false,
                 datapath_wait: DATAPATH_WAIT,
                 memory_restore: MemoryRestore::Lazy,
                 userfaultfd: false,
@@ -2763,6 +2774,7 @@ mod tests {
             tap: tap.map(str::to_string),
             bridge: bridge.map(str::to_string),
             vsock: gated.then(|| PathBuf::from("/allocs/9/.sandbox/vsock.sock")),
+            gated: gated,
             datapath_wait: DATAPATH_WAIT,
             memory_restore: MemoryRestore::Lazy,
             userfaultfd: false,
@@ -2941,6 +2953,7 @@ mod tests {
                 tap: None,
                 bridge: None,
                 vsock: Some(scratch.join("vsock.sock")),
+                gated: true,
                 datapath_wait: DATAPATH_WAIT,
                 memory_restore: MemoryRestore::Lazy,
                 userfaultfd: false,
@@ -3034,6 +3047,7 @@ mod tests {
             tap: None,
             bridge: None,
             vsock: Some(scratch.join("vsock.sock")),
+            gated: true,
             datapath_wait: Duration::from_millis(100),
             memory_restore: MemoryRestore::Lazy,
             userfaultfd: false,
@@ -3073,6 +3087,178 @@ mod tests {
             &scratch.join("vsock.sock"),
             Duration::ZERO
         ));
+        Ok(())
+    }
+
+    /// A gated restore delivered without a heartbeat (a work-stream delta or
+    /// a push) does not wait out `DATAPATH_WAIT`: the launch path binds the
+    /// egress proxy first (`Netd::bind_launch`), on exactly the
+    /// socket the restore waits for, and the guest resumes at once. Before,
+    /// only the heartbeat bound it, so every such restore waited 5 s.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_gated_restore_delivered_without_a_heartbeat_does_not_wait() -> R<()> {
+        let tmp = tempfile::tempdir()?;
+        let alloc_root = tmp.path().join("allocs");
+        let context = std::sync::Arc::new(crate::worker::forwarder::ForwarderContext::new(
+            std::sync::Arc::new(crate::worker::netd::NetPolicyCache::new()),
+            std::sync::Arc::new(crate::worker::netd::Denials::new()),
+        ));
+        let netd = crate::worker::netd::Netd::new(
+            std::sync::Arc::new(
+                crate::worker::forwarder::UpstreamForwarder::with_context(context.clone())
+                    .with_proxies(std::sync::Arc::new(
+                        crate::worker::netd::proxy::EgressProxies::new(context),
+                    )),
+            ),
+            alloc_root.clone(),
+        );
+        let delivered = crate::structs::TaskAllocation {
+            allocation_id: 8,
+            task_name: "box".into(),
+            task_runtime: "sandbox".into(),
+            network: json!({ "mode": "gated" }).to_string(),
+            ..Default::default()
+        };
+        assert_eq!(netd.bind_launch(&delivered).await, Some(true));
+
+        let ch = Backend::CloudHypervisor {
+            binary: "/usr/bin/true".into(),
+        };
+        let out = CheckpointDir::create(tmp.path().join("ckpt"))?;
+        std::fs::write(out.part_path(parts::ROOTFS), b"root")?;
+        std::fs::write(
+            out.part_path(parts::CH_CONFIG),
+            serde_json::to_vec(
+                &json!({ "vsock": { "cid": 3, "socket": "/allocs/7/.sandbox/vsock.sock" } }),
+            )?,
+        )?;
+        let state = SandboxCheckpointState {
+            vmm: "cloud-hypervisor".into(),
+            link_key: "sbx-gated".into(),
+            link_dir: None,
+            volume_count: 0,
+            vcpus: 1,
+            memory_mib: 256,
+            tap: None,
+            network: Some(GuestNetwork::Gated),
+            guest_address: None,
+            guest_ports: BTreeMap::new(),
+            guest_upstreams: BTreeMap::new(),
+        };
+        let memory = MemoryParts {
+            parts: out.seal(&[("rootfs", parts::ROOTFS), ("vm-config", parts::CH_CONFIG)])?,
+            ..MemoryParts::default()
+        };
+        let manifest = manifest_for(&state, memory);
+        let scratch = alloc_root.join("8/.sandbox");
+        std::fs::write(scratch.join("vmm.sock"), b"stale")?;
+        let vmm = FakeVmm::start_at(scratch.join("vmm.sock"), true, |_| (204, String::new()));
+        let started = tokio::task::spawn_blocking(move || -> R<Duration> {
+            let allocation = alloc(8);
+            let target = RestoreTarget {
+                datapath_wait: DATAPATH_WAIT,
+                ..gated_target(&ch, &allocation, &scratch)
+            };
+            let mut instance = TaskInstance {
+                alloc_dir: Some(scratch.parent().unwrap().to_path_buf()),
+                ..TaskInstance::default()
+            };
+            let started = std::time::Instant::now();
+            restore_microvm(
+                &target,
+                &mut instance,
+                &manifest,
+                &out,
+                &ResumeIdentity {
+                    alloc_id: 8,
+                    ..ResumeIdentity::default()
+                },
+                &FakeTaps::default(),
+            )?;
+            Ok(started.elapsed())
+        })
+        .await??;
+        assert!(
+            started < Duration::from_secs(2),
+            "the proxy was bound before the restore, so no wait: {started:?}"
+        );
+        let calls: Vec<String> = vmm.drain().into_iter().map(|call| call.path).collect();
+        assert_eq!(calls, vec!["/api/v1/vm.resume"]);
+        Ok(())
+    }
+
+    /// A sandbox that is not gated still has a vsock (exec dials it), but
+    /// no datapath binds an egress proxy beside it. Its restore resumes at
+    /// once instead of waiting out the full `DATAPATH_WAIT` on every resume.
+    #[test]
+    fn a_restore_that_is_not_gated_does_not_wait_for_the_datapath() -> R<()> {
+        let tmp = tempfile::tempdir()?;
+        let ch = Backend::CloudHypervisor {
+            binary: "/usr/bin/true".into(),
+        };
+        let out = CheckpointDir::create(tmp.path().join("ckpt"))?;
+        std::fs::write(out.part_path(parts::ROOTFS), b"root")?;
+        std::fs::write(
+            out.part_path(parts::CH_CONFIG),
+            serde_json::to_vec(
+                &json!({ "vsock": { "cid": 3, "socket": "/allocs/7/.sandbox/vsock.sock" } }),
+            )?,
+        )?;
+        let state = SandboxCheckpointState {
+            vmm: "cloud-hypervisor".into(),
+            link_key: "sbx-ungated".into(),
+            link_dir: None,
+            volume_count: 0,
+            vcpus: 1,
+            memory_mib: 256,
+            tap: None,
+            network: Some(GuestNetwork::Gated),
+            guest_address: None,
+            guest_ports: BTreeMap::new(),
+            guest_upstreams: BTreeMap::new(),
+        };
+        let memory = MemoryParts {
+            parts: out.seal(&[("rootfs", parts::ROOTFS), ("vm-config", parts::CH_CONFIG)])?,
+            ..MemoryParts::default()
+        };
+        let manifest = manifest_for(&state, memory);
+        let scratch = tmp.path().join("allocs/8/.sandbox");
+        std::fs::create_dir_all(&scratch)?;
+        std::fs::write(scratch.join("vmm.sock"), b"stale")?;
+        let vmm = FakeVmm::start_at(scratch.join("vmm.sock"), true, |_| (204, String::new()));
+        let allocation = alloc(8);
+        let target = RestoreTarget {
+            gated: false,
+            datapath_wait: DATAPATH_WAIT,
+            ..gated_target(&ch, &allocation, &scratch)
+        };
+        let mut instance = TaskInstance {
+            alloc_dir: Some(tmp.path().join("allocs/8")),
+            ..TaskInstance::default()
+        };
+        let started = std::time::Instant::now();
+        restore_microvm(
+            &target,
+            &mut instance,
+            &manifest,
+            &out,
+            &ResumeIdentity {
+                alloc_id: 8,
+                ..ResumeIdentity::default()
+            },
+            &FakeTaps::default(),
+        )?;
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "no wait for a proxy nothing binds: {:?}",
+            started.elapsed()
+        );
+        assert!(!wait_for_datapath(
+            &scratch.join("vsock.sock"),
+            Duration::ZERO
+        ));
+        let calls: Vec<String> = vmm.drain().into_iter().map(|call| call.path).collect();
+        assert_eq!(calls, vec!["/api/v1/vm.resume"]);
         Ok(())
     }
 
@@ -3143,6 +3329,7 @@ mod tests {
             tap: None,
             bridge: None,
             vsock: Some(crate::task_plugins::vsock_socket_base(scratch)),
+            gated: true,
             datapath_wait: Duration::ZERO,
             memory_restore: MemoryRestore::Lazy,
             userfaultfd: false,
@@ -4088,6 +4275,7 @@ mod tests {
             tap: Some("tap7".into()),
             bridge: None,
             vsock: None,
+            gated: false,
             datapath_wait: DATAPATH_WAIT,
             memory_restore: MemoryRestore::Lazy,
             userfaultfd: false,
