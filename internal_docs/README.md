@@ -132,6 +132,7 @@ When one is required and what goes in it:
 | [service-mesh-plan.md](plans/service-mesh-plan.md) | **authoritative for the mesh**; shipped M1–M10 (policy, HTTP mode, name-is-config, gated, ingress, handlers, mTLS, graph, sandbox vsock, templates) with two named deferrals — unifies the SD §8 follow-on with the handlers plan |
 | [network-handlers-plan.md](plans/network-handlers-plan.md) | shipped as phases of service-mesh-plan (policy objects, `gated` mode, handlers); the `legion netd` process split is the deferred piece |
 | [datapath-performance-plan.md](plans/datapath-performance-plan.md) | shipped: HTTP-mode pooling, `splice(2)` for bulk L4 on Linux, `least_latency` as the default strategy, the per-byte `legion_net_bytes_total` fix, `net_bench`; kTLS and multiplexed mesh tunnels deferred |
+| [egress-plugins-proposal.md](plans/egress-plugins-proposal.md) | proposal (nothing built): a kernel classifier that compiles policy to eBPF maps so allowed L4 flows skip the proxy and host-mode policy is enforced (A), in-process WASM plugins on the proxy-wasm ABI (B, the handlers plan's phase 8 reshaped), operator eBPF programs (C, last), fd hand-off for external handlers (D), and keyed handler variants plus plugin objects (E); recommends A + B + E |
 | [nickel-config-language-plan.md](plans/nickel-config-language-plan.md) | shipped (2026-08-03; jsonnet removed, no compat shim) |
 | [scheduler-performance-plan.md](plans/scheduler-performance-plan.md) | in execution |
 | [scheduler-architecture-review-plan.md](plans/scheduler-architecture-review-plan.md) | proposals accepted; D1/D4/D5/D6 graduated into the two plans below, D8's local slice into the heartbeat plan |
@@ -216,6 +217,7 @@ by project impact. The full template and a worked example:
 - [edge-boot-plan_calls.md](calls/edge-boot-plan_calls.md)
 - [edge-ratify-throughput-plan_calls.md](calls/edge-ratify-throughput-plan_calls.md)
 - [egress-credential-injection-plan_calls.md](calls/egress-credential-injection-plan_calls.md)
+- [egress-plugins-proposal_calls.md](calls/egress-plugins-proposal_calls.md)
 - [elastic-session-envelopes-plan_calls.md](calls/elastic-session-envelopes-plan_calls.md)
 - [exec-and-actions-plan_calls.md](calls/exec-and-actions-plan_calls.md)
 - [gated-sandbox-checkpoints-plan_calls.md](calls/gated-sandbox-checkpoints-plan_calls.md)

@@ -3788,6 +3788,24 @@ Deliberately not in the plan (see its §5): TLS interception / MITM — external
 upstreams are the body-visible route; rate limits and quotas; a cluster-edge
 load balancer.
 
+Proposed, not yet planned:
+[egress-plugins-proposal.md](plans/egress-plugins-proposal.md) · calls:
+[egress-plugins-proposal_calls.md](calls/egress-plugins-proposal_calls.md).
+Two independent tracks; each phase would graduate into its own plan.
+
+- [ ] Track A: kernel classifier. Policy compiled to eBPF maps on each
+      allocation's cgroup leaf: allowed L4 flows that nothing reads skip the
+      proxy, host-mode egress chains become enforced, gated capture becomes
+      transparent (supersedes phase 7's TUN capture on capable nodes), and the
+      `nftables` host guard moves to eBPF. A0 (probe + `net_bench` numbers)
+      comes first.
+- [ ] Track B: WASM plugins on the proxy-wasm ABI at the connect, request,
+      body, response, and done stages, with plugin objects and keyed handler
+      variants (`{ authz = { … } }`). This is phase 8 above, reshaped.
+- [ ] Operator eBPF connect programs with an SDK (proposal C), only on demand.
+- [ ] File-descriptor hand-off for node-local `proxy` targets, and `authz` to
+      a sidecar port (proposal D).
+
 Still unplanned, and not covered by the plan:
 
 - [ ] Overlay network. Unix-domain-socket transport is on the table.
