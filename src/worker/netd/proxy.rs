@@ -93,6 +93,23 @@ struct Listener {
     addr: Option<SocketAddr>,
 }
 
+impl Listener {
+    fn running(&self) -> bool {
+        self.task.as_ref().is_some_and(|t| !t.is_finished())
+    }
+
+    /// Running, and for a vsock host socket still at its path. A failed
+    /// start removes the allocation's directory, socket and all, and a
+    /// listener on an unlinked path serves nothing.
+    fn serving(&self) -> bool {
+        self.running()
+            && match self.spec.listen_addr() {
+                ListenAddr::Unix(path) => path.exists(),
+                ListenAddr::Tcp { .. } => true,
+            }
+    }
+}
+
 /// The node's egress proxies, one per gated allocation, reconciled from the
 /// desired set like every other datapath listener.
 pub struct EgressProxies {
@@ -128,7 +145,7 @@ impl EgressProxies {
             });
             for (id, spec) in wanted {
                 match listeners.get(&id) {
-                    Some(listener) if listener.task.as_ref().is_some_and(|t| !t.is_finished()) => {}
+                    Some(listener) if listener.running() => {}
                     _ => pending.push(spec),
                 }
             }
@@ -139,6 +156,44 @@ impl EgressProxies {
         }
         for spec in pending {
             self.start(spec).await;
+        }
+    }
+
+    /// Bind one allocation's proxy now, ahead of the next [`Self::sync`],
+    /// unless it already serves exactly this spec, at its socket path. True
+    /// when it is serving afterward.
+    ///
+    /// The launch path calls this for a gated sandbox that arrived by push
+    /// or the work stream, which starts the task before any heartbeat binds
+    /// its datapath: a restored guest resumes only once this socket exists.
+    /// The next `sync` keeps the listener when its desired set carries the
+    /// same spec, and stops it otherwise, so the heartbeat stays the owner.
+    /// Unlike `sync`, it rebinds a listener whose socket file is gone: the
+    /// start it precedes is about to wait on that file. `sync` leaves such
+    /// a listener alone, so it never recreates the directory of an
+    /// allocation the node already tore down.
+    pub async fn ensure(&self, spec: ProxySpec) -> bool {
+        let allocation_id = spec.allocation_id;
+        let serving = {
+            let listeners = lock(&self.listeners);
+            listeners
+                .get(&allocation_id)
+                .is_some_and(|listener| listener.spec == spec && listener.serving())
+        };
+        if !serving {
+            self.start(spec).await;
+        }
+        self.is_running(allocation_id)
+    }
+
+    /// Record an allocation's listener, stopping any it replaces. A `sync`
+    /// and an [`Self::ensure`] can both start the same allocation, and a
+    /// replaced listener must not keep serving a socket path it no longer
+    /// owns.
+    fn install(&self, listener: Listener) {
+        let replaced = lock(&self.listeners).insert(listener.spec.allocation_id, listener);
+        if let Some(task) = replaced.and_then(|mut old| old.task.take()) {
+            task.abort();
         }
     }
 
@@ -183,14 +238,11 @@ impl EgressProxies {
                         .track(shared.allocation_id, client);
                     handle(client, peer, shared.clone())
                 });
-                lock(&self.listeners).insert(
-                    spec.allocation_id,
-                    Listener {
-                        spec,
-                        task: Some(task),
-                        addr: bound,
-                    },
-                );
+                self.install(Listener {
+                    spec,
+                    task: Some(task),
+                    addr: bound,
+                });
             }
             Err(err) => {
                 warn!(
@@ -199,14 +251,11 @@ impl EgressProxies {
                     error = ?err,
                     "Failed to bind egress proxy; retrying on the next heartbeat"
                 );
-                lock(&self.listeners).insert(
-                    spec.allocation_id,
-                    Listener {
-                        spec,
-                        task: None,
-                        addr: None,
-                    },
-                );
+                self.install(Listener {
+                    spec,
+                    task: None,
+                    addr: None,
+                });
             }
         }
     }

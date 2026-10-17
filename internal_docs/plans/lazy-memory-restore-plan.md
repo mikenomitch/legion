@@ -6,7 +6,7 @@
 trust the node content store's digest instead of rehashing every part,
 cloud-hypervisor restores memory on demand where it can, and
 `config.memory_restore = "lazy" | "eager"` picks per task (default `lazy`).
-Not verified on KVM yet (§9). Deliberately deferred and named: starting a
+Not measured on KVM without the datapath wait yet (§9). Deliberately deferred and named: starting a
 published restore while its memory still streams from the bucket (Phase 2),
 working-set prefetch (Phase 3), and page sharing between cloud-hypervisor
 forks (Phase 4, waits on a cloud-hypervisor release).
@@ -364,6 +364,26 @@ public place that states restore times.
 - `vm.unprivileged_userfaultfd = 0` with the worker as a non-root user:
   the fallback log, and a working copy restore.
 - Heartbeat gaps on the restoring node during an 8 GiB resume.
+
+**First KVM run (2026-10-14), blocked by a datapath wait.** cloud-hypervisor
+v53.0 on a c5.metal, a 2 GiB guest with 900 MiB touched, a 2.4 GB
+checkpoint (`benchmarks/aws/sandbox-boot/jobs/restore-vm-{lazy,eager}.ncl`):
+`restore_ms` about 5,040 for both modes, a 5.0 s resume end to end against
+15.6 s on main's worker. Nearly all of it was `DATAPATH_WAIT`, the 5 s a
+restore waited for an egress proxy socket. Two causes, both fixed in code
+and unit-tested (2026-10-15,
+[calls](../calls/gated-restore-datapath-wait_calls.md)):
+
+- The restore waited whenever the guest had a vsock, and every microVM has
+  one for exec. The rig's sandboxes are not gated, so nothing ever bound
+  the socket. The wait now keys off the allocation's network mode.
+- A gated restore delivered by push or the work stream launched before any
+  heartbeat bound the socket. `accept_work` now binds it first.
+
+The lazy against eager cells, the time to first read back the 900 MiB
+after a resume (`time cat /dev/shm/fill > /dev/null` over exec), and the
+v51.2 comparison are not rerun yet. The rerun needs AWS credentials and SSH
+from wherever it runs.
 
 ## 10. Rollout
 

@@ -1474,21 +1474,26 @@ moves the guest onto the **restoring allocation's own** socket:
 - cloud-hypervisor gets the socket rewritten in the restore's own copy of
   the snapshot's `config.json`, the same rewrite a fork's TAP uses.
 
-The datapath has already bound that allocation's listeners by the time the
-restore starts, and it judges every connection by the listener it arrived
-on. So the restored guest's traffic is attributed to the new allocation and
-judged by the policy in force **now**: a `require` policy applied while the
+The datapath judges every connection by the listener it arrived on. So the
+restored guest's traffic is attributed to the new allocation and judged by
+the policy in force **now**: a `require` policy applied while the
 instance was suspended applies to its first connection after the resume. A
 fork is its own allocation with its own socket, so its traffic, denials, and
 service-graph edges are its own, and forks cannot collide on the network
 because there is no guest address to collide on.
 
 Before resuming the guest, the restore waits up to 5 seconds for the egress
-proxy socket (`vsock.sock_1080`). It is normally there already. If it never
-appears, the guest resumes anyway with no working door (each connection is
-reset), the allocation reports `net_capture_unavailable`, and `legion net
-doctor` names the unbound socket. A transient bind error never turns a
-resume into a cold boot.
+proxy socket (`vsock.sock_1080`). It is normally there already: the node
+binds it before it launches the restore, whether the start arrived on a
+heartbeat, a `PostWork` push, or the work stream. A start that arrived
+outside a heartbeat also triggers one right away, which brings the
+allocation's policy, resolver, and upstream listeners. Until that policy
+lands, the proxy resets each connection. If the socket never appears, the
+guest resumes anyway with no working door (each connection is reset), the
+allocation reports `net_capture_unavailable`, and `legion net doctor` names
+the unbound socket. A transient bind error never turns a resume into a cold
+boot. A sandbox that is not gated has no egress proxy, and its restore does
+not wait.
 
 **Advertised ports keep working.** The restoring allocation's ingress
 listeners dial the restored guest through its new socket (see
