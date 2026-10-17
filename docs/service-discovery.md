@@ -175,7 +175,8 @@ gets three independent listeners on three distinct ports.
 
 | `balance` | Behavior |
 | --- | --- |
-| `round_robin` *(default)* | Hand out endpoints in order, wrapping around. Even spread, no state to warm up. |
+| `least_latency` *(default)* | Latency-aware. Each pick compares two random endpoints and takes the one with the lower latency × (in-flight + 1). A slow-but-alive backend sheds traffic within a few requests, and gets it back once it recovers. |
+| `round_robin` | Hand out endpoints in order, wrapping around. Even spread, no state to warm up. |
 | `random` | Uniform random pick. Best when many clients share one backend set, since there are no cursors to fall into sync. |
 | `least_conn` | Fewest in-flight connections wins, and ties break round-robin. For long-lived or uneven connections. |
 | `local_first` | Round-robin over the endpoints on the same node as the caller. Widens to every endpoint when none is local, so a caller never waits for a local backend that is not there. |
@@ -184,10 +185,44 @@ Names are normalized before lookup (trimmed, lowercased, `-` mapped to `_`),
 so `Least-Conn` and `least_conn` are the same strategy. An unknown name is
 rejected at submit, and the error lists the valid ones.
 
-`least_conn` counts are per listener: one allocation's view of one upstream on
-one node. A connection counts from the moment its dial starts until it closes.
-There is no cluster-wide load view, and round-robin cursors are per listener
-too.
+All state is per listener: one allocation's view of one upstream on one
+node. There is no cluster-wide load view. A connection (or, in HTTP mode, a
+request) counts as in flight from the moment its dial starts until it closes.
+
+#### How `least_latency` learns
+
+`least_latency` is the balancer Linkerd and Finagle use: power of two choices
+over a peak-EWMA latency estimate. What it measures depends on the mode:
+
+- **L4 (the default).** The time to connect, then the time from the first
+  byte the task sends to the first byte the endpoint answers. Nothing is
+  parsed. A protocol where the server speaks first (a database greeting, SMTP)
+  only gives the connect time, which still tells a nearby endpoint from a
+  far one.
+- **HTTP mode.** The time to each response's head.
+
+In a benchmark with three backends, one of them deliberately slow, strategies
+that spread evenly averaged 1.8–1.9 ms per request and `least_latency`
+averaged 62–114 µs, close to the fast backends alone
+([What the datapath costs](network-handlers.md#what-the-datapath-costs)).
+
+A slow answer raises an endpoint's estimate at once. Estimates fall back with
+a 10-second time constant, so one fast answer doesn't erase a run of slow
+ones, and an endpoint that was avoided is tried again once it cools down. A
+failed dial, a failed mesh handshake, or (HTTP mode) a 5xx counts as a
+1-second answer. An endpoint with no samples yet starts at the average of the
+others, so a new backend gets a fair share rather than a flood.
+
+Two consequences to know about:
+
+- **It favors nearby endpoints.** An endpoint on the caller's node connects
+  faster than one across the network, so it takes more of the traffic until
+  its load evens out the difference. Use `round_robin` when you want an even
+  spread regardless of distance.
+- **Long-lived connections learn slowly on L4.** A connection is measured
+  when it opens. A pool of long-lived database connections is balanced by
+  connect time and load, not by query latency. HTTP mode measures every
+  request.
 
 #### Adding a strategy
 
@@ -196,7 +231,9 @@ in one file:
 
 1. Implement `Balancer` in [`src/worker/balance.rs`](../src/worker/balance.rs)
    (`name()` plus `pick(&[Endpoint], &HashMap<String, usize>) -> Option<usize>`,
-   where the map is in-flight connections per endpoint address).
+   where the map is in-flight connections per endpoint address). A strategy
+   that learns from outcomes also implements `observe(addr, Outcome)`, which
+   the datapath calls with every latency sample and failure it sees.
 2. Add one row to the `BALANCERS` table in the same file:
    `("first_healthy", || Arc::new(FirstHealthy))`.
 
@@ -220,8 +257,10 @@ needs no proto change and no migration.
    because the manager skips the catalog work entirely.
 4. **Per connection.** The worker asks the strategy for an endpoint and dials
    it with a 2s timeout. On refusal or timeout it drops that candidate and
-   picks again, up to 3 endpoints. Then it splices the two sockets together
-   (`copy_bidirectional`).
+   picks again, up to 3 endpoints. Then it splices the two sockets together.
+   On Linux the bytes move with `splice(2)` and never leave the kernel.
+   Elsewhere, and whenever TLS is involved, they are copied in user space
+   ([Network Handlers](network-handlers.md#what-the-datapath-does-today)).
 5. **No endpoints.** The connection is accepted and closed immediately. A
    scaled-to-zero, all-unhealthy, or intention-denied upstream looks like a
    fast close to the client, rather than a hang.
@@ -475,7 +514,8 @@ cargo run -- service doctor web       # names the failing layer
 [`configs/jobs/connect-demo.ncl`](../configs/jobs/connect-demo.ncl) runs
 two `web` backends plus a `client` task that curls `$LEGION_UPSTREAM_WEB` in a
 loop. Each backend serves its own allocation id, so the balancing is visible in
-the client's logs:
+the client's logs. The demo sets `balance = "round_robin"` so the client
+visibly alternates:
 
 ```bash
 cargo run -- job run configs/jobs/connect-demo.ncl

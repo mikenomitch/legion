@@ -558,6 +558,7 @@ How to use it:
 | PR | What it lands | Notes |
 | --- | --- | --- |
 | [#45](https://github.com/mikenomitch/legion/pull/45) | The remaining `perf/*` branches stacked on main: lazy memory restore, chunked checkpoints on the work stream, elastic session envelopes, edge admission control, ratification without epoch fences, the keyed bind index and fused eval settles, and the worker lock fixes. Plus what the AWS rig found: non-blocking server console logs, `speculativeStart` on the dispatch, followers answering ratifications with not-leader, the settle window for a just-ratified claim, and an edge start's own instance identity | [results](../benchmarks/aws/sandbox-boot/RESULTS.md) · [sandbox boot calls](calls/sandbox-boot-throughput-plan_calls.md) · [ratify calls](calls/edge-ratify-throughput-plan_calls.md). The 5 s restore wait is open below |
+| [#42](https://github.com/mikenomitch/legion/pull/42) | Datapath performance: `least_latency` as the default strategy, HTTP-mode connection pooling, `splice(2)` for bulk L4 on Linux, the per-byte `legion_net_bytes_total` fix, `net_bench` | [plan](plans/datapath-performance-plan.md) · [calls](calls/datapath-performance-plan_calls.md); kTLS and multiplexed mesh tunnels deferred |
 | [#36](https://github.com/mikenomitch/legion/pull/36) | Session durability, routing, and edge starts, Phases 1–4 (concurrent node starts, `sessions.db` re-adopt, node tag in session ids and tag routing, session tickets, `Worker.StartSession`, `ListSessionNodes`, `legion session`), the session UI pass, and the sandbox spot-check and bottleneck-measurement plans. Phase 5 in progress | [plan](plans/session-durability-and-routing-plan.md) · [calls](calls/session-durability-and-routing-plan_calls.md) |
 | [#30](https://github.com/mikenomitch/legion/pull/30) | Sandbox scaling Phases 4–6: untombstoned 130-bit minted ids, `suspend.archive`, `stateful.mode = "session"` and `legion instance promote` | [plan](plans/sandbox-scaling-plan.md) §16 · [calls](calls/sandbox-scaling-plan_calls.md); sessions ship without idle sessions, identity, or a session log (calls #18) |
 | [#7](https://github.com/mikenomitch/legion/pull/7) | Read model follows SQLite in every mode: shadow check, `local_disk` changeset projection, outside-write guard, timed scrub | Bench needs a quiet-machine rerun; [plan](plans/read-model-coherence-plan.md) |
@@ -3816,6 +3817,29 @@ Phases 1 and 2 shipped (see Done, KV & secrets).
       with `UpsertNetPolicy` enforcing `kv:read` as it does for `certFrom`
       (plan §11).
 
+Datapath performance: [datapath-performance-plan.md](plans/datapath-performance-plan.md)
+· calls: [datapath-performance-plan_calls.md](calls/datapath-performance-plan_calls.md).
+Pooling, `splice`, `least_latency`, and the benchmarks shipped (see Done,
+Datapath performance). Deferred, by name:
+
+- [ ] **kTLS for mesh hops**, so TLS flows (mesh hops, ingress TLS
+      termination) splice too. Needs a dependency or a hand-rolled TLS 1.3
+      control-record handler, the kernel `tls` module, and a probe with a
+      fallback; about 20% of bulk throughput by Tensorlake's numbers
+      (plan §6.6, [calls #3](calls/datapath-performance-plan_calls.md)).
+- [ ] **Multiplexed node-to-node tunnels for L4 mesh traffic.** Each L4
+      connection to a mesh endpoint still pays its own mTLS handshake;
+      ztunnel avoids that with pooled HTTP/2 CONNECT (HBONE) tunnels. A
+      wire-format change for the mesh, so it needs its own plan (plan §6.7).
+- [ ] **HTTP/2 between nodes in HTTP mode**, so one pooled connection
+      carries concurrent requests (Linkerd's transparent upgrade). Pooling
+      today reuses HTTP/1.1 connections one request at a time.
+- [ ] **Pipe-page limits on very busy nodes.** Each direction that switches
+      to splice holds a pipe. Past `/proc/sys/fs/pipe-user-pages-soft`, Linux
+      creates small pipes and splice moves less per call. Measure on a node
+      with tens of thousands of concurrent bulk flows
+      ([calls #6](calls/datapath-performance-plan_calls.md)).
+
 ## Persistence & cluster operations
 
 Plans: [persistence-plan.md](plans/persistence-plan.md), [multi-raft-persistence-plan.md](plans/multi-raft-persistence-plan.md), [manager-workload-identity-plan.md](plans/manager-workload-identity-plan.md) · docs: [state-store.md](../docs/state-store.md), [raft-operations.md](../docs/raft-operations.md), [persistence-streaming.md](../docs/persistence-streaming.md)
@@ -5504,6 +5528,29 @@ docs: [task-runtime-plugins.md](../docs/task-runtime-plugins.md)
       Note `service list -j` / `resolve -j` now emit the standard `{ok, data}`
       envelope instead of a bare array (`jq '.[0]'` -> `jq '.data[0]'`, or use
       `--one`, which needs no `jq`).
+
+## Datapath performance
+
+[plan](plans/datapath-performance-plan.md) · [calls](calls/datapath-performance-plan_calls.md)
+· docs: [service-discovery.md](../docs/service-discovery.md#balancing-strategies),
+[network-handlers.md](../docs/network-handlers.md#connection-pooling),
+[testing-and-benchmarks.md](../docs/testing-and-benchmarks.md)
+
+- [x] `least_latency` balancing (P2C over a peak-EWMA latency estimate,
+      weighted by load), now the default. L4 learns from connect time and
+      time to first reply; HTTP mode from each response head.
+- [x] HTTP-mode connection pooling per listener (service endpoints, external
+      targets, mesh endpoints, the task behind ingress), with a safe retry
+      for stale connections. HTTP mode now counts in-flight requests.
+- [x] `splice(2)` for bulk L4 directions on Linux in the forwarder,
+      ingress, the gated egress proxy, and the gateway (copy first, splice
+      once a read fills the buffer), with a kernel probe and a copy fallback.
+- [x] No per-connection copies of the endpoint list or in-flight map.
+- [x] `CounterVec::inc_by` is one atomic add. It looped single increments,
+      so `legion_net_bytes_total` cost every L4 flow one atomic per byte at
+      close (about 0.1 GiB/s and 50 CPU-s/GiB through the forwarder in
+      `net_bench`).
+- [x] `benchmarks/micro/net_bench.rs` (network-handlers plan §7.12).
 
 ## Stateful workloads & volumes
 

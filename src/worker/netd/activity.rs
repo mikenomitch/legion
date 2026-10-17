@@ -167,6 +167,25 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for TrackedStream<S> {
     }
 }
 
+impl<S: super::splice::SpliceStream> super::splice::SpliceStream for TrackedStream<S> {
+    fn socket(&self) -> Option<super::splice::Socket<'_>> {
+        self.inner.socket()
+    }
+
+    fn activity(&self) -> Option<super::splice::SpliceActivity> {
+        let slot = self.slot.clone();
+        let inner = self.inner.activity();
+        Some(Arc::new(move |bytes| {
+            if bytes > 0 {
+                slot.touch();
+            }
+            if let Some(inner) = &inner {
+                inner(bytes);
+            }
+        }))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

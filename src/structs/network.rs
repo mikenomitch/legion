@@ -14,8 +14,10 @@ pub const DYNAMIC_PORT_MAX: u16 = 32000;
 /// identical on macOS and Linux — no netns, no bridge, no platform branches.
 pub const UPSTREAM_LOOPBACK_ADDR: &str = "127.0.0.1";
 
-/// Strategy used when an upstream does not name one.
-pub const DEFAULT_BALANCE: &str = "round_robin";
+/// Strategy used when an upstream does not name one. Latency-aware, so a
+/// slow-but-alive backend sheds traffic instead of taking its full share
+/// (docs/service-discovery.md, "Balancing strategies").
+pub const DEFAULT_BALANCE: &str = "least_latency";
 
 /// The DNS zone a task's upstreams are reachable under: `<key>.svc.legion`.
 pub const SVC_ZONE: &str = "svc.legion";

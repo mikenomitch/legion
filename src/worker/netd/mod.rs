@@ -1,8 +1,9 @@
 //! `netd` — the node datapath's policy and telemetry half.
 //!
 //! The bytes still move through [`crate::worker::forwarder`] (and, from the
-//! ingress phase on, its ingress twin); this module is what those listeners
-//! consult before they dial, and what they report to afterwards:
+//! ingress phase on, its ingress twin), copied by [`splice::bidirectional`];
+//! this module is what those listeners consult before they dial, and what
+//! they report to afterwards:
 //!
 //! - [`policy::NetPolicyCache`] — the merged policy per allocation, keyed by
 //!   the content hash the heartbeat reply named, fetched once per hash and
@@ -32,6 +33,7 @@ pub mod netns;
 pub mod policy;
 pub mod proxy;
 pub mod proxyproto;
+pub mod splice;
 pub mod state;
 pub mod tls;
 pub mod vsock;

@@ -183,6 +183,11 @@ name = "eval_critical_path_bench"
 path = "benchmarks/micro/eval_critical_path_bench.rs"
 harness = false
 
+[[bench]]
+name = "net_bench"
+path = "benchmarks/micro/net_bench.rs"
+harness = false
+
 # The AWS rig's native job submitter. Not part of the product: it exists
 # because the rig's per-job `legion job run` process spawn ceilinged at ~36-103
 # jobs/sec and was being reported as Legion's throughput. It links against this

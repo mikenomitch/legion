@@ -22,9 +22,11 @@
 //!    header is dropped from what the task sent and set to the secret the
 //!    node holds. A header with no value yet fails the request with a local
 //!    `503` instead of sending it unauthenticated.
-//! 5. **The dial.** One upstream connection per request (no pooling yet),
-//!    TLS originated for `https://`/`tls://` targets, the `Host` header
-//!    rewritten to an external target's host so the origin accepts it.
+//! 5. **The dial.** An idle pooled upstream connection when the listener has
+//!    one ([`ConnPool`]), else a new one: TLS originated for
+//!    `https://`/`tls://` targets, mesh mTLS plus a PROXY v2 header for mesh
+//!    endpoints. The `Host` header is rewritten to an external target's host
+//!    so the origin accepts it.
 //!
 //! Everything here is bounded: body buffering has a cap, retries have a
 //! budget, requests have a deadline. Per-request logging stays at `debug`.
@@ -35,7 +37,7 @@ use crate::structs::netpolicy::{
     HANDLER_LOG, PROTOCOL_HTTP,
 };
 use crate::structs::{UpstreamCredential, UpstreamHttpConfig, UpstreamTarget};
-use crate::worker::balance::{Balancer, Endpoint};
+use crate::worker::balance::{Balancer, Endpoint, Outcome};
 use crate::worker::forwarder::ForwarderContext;
 use crate::worker::netd::handlers::{self, HopFacts, HopOutcome, ProxyTarget};
 use crate::worker::netd::metrics as net_metrics;
@@ -47,7 +49,7 @@ use hyper::{Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
 use std::net::SocketAddr;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -60,6 +62,12 @@ const DEFAULT_DLP_MAX_BYTES: u64 = 1024 * 1024;
 const BUDGET_WINDOW: Duration = Duration::from_secs(60);
 /// Idempotent methods retried by default.
 const IDEMPOTENT: &[&str] = &["GET", "HEAD", "OPTIONS", "PUT", "DELETE", "TRACE"];
+/// How long an idle pooled upstream connection is kept. Shorter than the
+/// keep-alive timeout of most servers, so the pool rarely hands out a
+/// connection the server is about to close.
+const POOL_IDLE: Duration = Duration::from_secs(30);
+/// Idle connections kept per destination; more are closed when released.
+const POOL_MAX_IDLE: usize = 32;
 
 /// Hop-by-hop headers that must not be forwarded.
 const HOP_BY_HOP: &[&str] = &[
@@ -187,8 +195,10 @@ pub struct HttpSettings {
     pub task: Option<crate::worker::netd::ingress::TaskTarget>,
     pub context: Arc<ForwarderContext>,
     pub balancer: Arc<dyn Balancer>,
-    pub endpoints: Arc<Mutex<Vec<Endpoint>>>,
+    pub endpoints: Arc<Mutex<Arc<Vec<Endpoint>>>>,
     pub inflight: Arc<Mutex<HashMap<String, usize>>>,
+    /// Idle upstream connections, reused across requests.
+    pool: Arc<ConnPool>,
     /// Where the allocation's access log lives (`<logs>/<alloc>/net-access.log`).
     pub log_dir: Option<PathBuf>,
     timeout: Option<Duration>,
@@ -230,7 +240,7 @@ impl HttpSettings {
         handlers: &[HandlerConfig],
         context: Arc<ForwarderContext>,
         balancer: Arc<dyn Balancer>,
-        endpoints: Arc<Mutex<Vec<Endpoint>>>,
+        endpoints: Arc<Mutex<Arc<Vec<Endpoint>>>>,
         inflight: Arc<Mutex<HashMap<String, usize>>>,
         log_dir: Option<PathBuf>,
     ) -> Self {
@@ -301,6 +311,7 @@ impl HttpSettings {
             balancer,
             endpoints,
             inflight,
+            pool: Arc::new(ConnPool::default()),
             log_dir,
             timeout,
             retry,
@@ -364,7 +375,7 @@ impl HttpSettings {
             &[],
             context,
             crate::worker::balance::default_balancer(),
-            Arc::new(Mutex::new(Vec::new())),
+            Arc::new(Mutex::new(Arc::new(Vec::new()))),
             Arc::new(Mutex::new(HashMap::new())),
             log_dir,
         );
@@ -375,11 +386,7 @@ impl HttpSettings {
 
     /// Endpoints that are not currently ejected.
     fn healthy_endpoints(&self) -> Vec<Endpoint> {
-        let endpoints = self
-            .endpoints
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .clone();
+        let endpoints = Vec::clone(&self.endpoints.lock().unwrap_or_else(|p| p.into_inner()));
         if self.outlier_threshold.is_none() {
             return endpoints;
         }
@@ -436,11 +443,6 @@ impl HttpSettings {
         if candidates.is_empty() {
             return None;
         }
-        let inflight = self
-            .inflight
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .clone();
         let pool: Vec<Endpoint> = if self.split.is_empty() {
             candidates.to_vec()
         } else {
@@ -473,8 +475,156 @@ impl HttpSettings {
                 bucket
             }
         };
-        let index = self.balancer.pick(&pool, &inflight)?;
+        let index = {
+            let inflight = self.inflight.lock().unwrap_or_else(|p| p.into_inner());
+            self.balancer.pick(&pool, &inflight)?
+        };
         pool.get(index).cloned()
+    }
+
+    /// Count one request in flight to `addr` until the guard drops, so
+    /// load-aware strategies see HTTP-mode load too.
+    fn in_flight(self: &Arc<Self>, addr: &str) -> InFlight {
+        *self
+            .inflight
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .entry(addr.to_string())
+            .or_insert(0) += 1;
+        InFlight {
+            settings: self.clone(),
+            addr: addr.to_string(),
+        }
+    }
+}
+
+struct InFlight {
+    settings: Arc<HttpSettings>,
+    addr: String,
+}
+
+impl Drop for InFlight {
+    fn drop(&mut self) {
+        let mut inflight = self
+            .settings
+            .inflight
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        if let Some(count) = inflight.get_mut(&self.addr) {
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                inflight.remove(&self.addr);
+            }
+        }
+    }
+}
+
+/// How a pooled connection was opened. Connections are only reused for the
+/// same kind of dial to the same place.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum PoolKey {
+    /// Plain TCP to an endpoint or an external `http://` target.
+    Plain(String),
+    /// TLS originated to an external `https://` target.
+    Tls(String),
+    /// Mesh mTLS to an endpoint, with this listener's workload named in the
+    /// PROXY v2 header sent when the connection opened.
+    Mesh(String),
+    /// The task behind an ingress listener.
+    Task,
+}
+
+type Sender = hyper::client::conn::http1::SendRequest<OutBody>;
+
+/// Idle upstream connections of one HTTP-mode listener.
+///
+/// A listener belongs to one allocation, so a pool is never shared between
+/// workloads: a mesh connection's PROXY v2 header, sent once when it opened,
+/// names the right workload for every request it later carries.
+///
+/// A connection comes back once its response body has been read and the
+/// upstream kept it alive, and leaves after [`POOL_IDLE`] or when the
+/// upstream closes it. A reaper task closes idle connections on a listener
+/// that has gone quiet, and exits once nothing is idle.
+#[derive(Default)]
+struct ConnPool {
+    idle: Mutex<HashMap<PoolKey, Vec<IdleConn>>>,
+    reaping: AtomicBool,
+}
+
+struct IdleConn {
+    sender: Sender,
+    since: Instant,
+}
+
+impl ConnPool {
+    /// The most recently released live connection for `key`. Newest first
+    /// keeps the fewest connections warm when traffic drops.
+    fn checkout(&self, key: &PoolKey) -> Option<Sender> {
+        let mut idle = self.idle.lock().unwrap_or_else(|p| p.into_inner());
+        let list = idle.get_mut(key)?;
+        while let Some(conn) = list.pop() {
+            if conn.since.elapsed() < POOL_IDLE && conn.sender.is_ready() {
+                return Some(conn.sender);
+            }
+        }
+        None
+    }
+
+    fn checkin(self: &Arc<Self>, key: PoolKey, sender: Sender) {
+        if !sender.is_ready() {
+            return;
+        }
+        {
+            let mut idle = self.idle.lock().unwrap_or_else(|p| p.into_inner());
+            let list = idle.entry(key).or_default();
+            if list.len() >= POOL_MAX_IDLE {
+                return;
+            }
+            list.push(IdleConn {
+                sender,
+                since: Instant::now(),
+            });
+        }
+        if !self.reaping.swap(true, Ordering::AcqRel) {
+            let pool = Arc::downgrade(self);
+            tokio::spawn(async move {
+                loop {
+                    tokio::time::sleep(POOL_IDLE / 2).await;
+                    let Some(pool) = pool.upgrade() else {
+                        return;
+                    };
+                    if pool.reap() == 0 {
+                        pool.reaping.store(false, Ordering::Release);
+                        // A connection released between the sweep and the
+                        // flag store would otherwise wait for the next one.
+                        if pool.reap() == 0 || pool.reaping.swap(true, Ordering::AcqRel) {
+                            return;
+                        }
+                    }
+                }
+            });
+        }
+    }
+
+    /// Close expired and dead idle connections; returns how many remain.
+    fn reap(&self) -> usize {
+        let mut idle = self.idle.lock().unwrap_or_else(|p| p.into_inner());
+        idle.retain(|_, list| {
+            list.retain(|conn| conn.since.elapsed() < POOL_IDLE && !conn.sender.is_closed());
+            !list.is_empty()
+        });
+        idle.values().map(Vec::len).sum()
+    }
+
+    #[cfg(test)]
+    fn idle_count(&self) -> usize {
+        self.idle
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .values()
+            .map(Vec::len)
+            .sum()
     }
 }
 
@@ -1094,6 +1244,11 @@ async fn handle(
             last_error = Some("request deadline exceeded".into());
             break;
         }
+        // A service endpoint's load and latency feed its balancer; an
+        // external target has one destination and nothing to balance.
+        let balanced = settings.target.is_none();
+        let _in_flight = balanced.then(|| settings.in_flight(&addr));
+        let attempt_started = Instant::now();
         let attempt_future = attempt_request(
             &settings,
             &addr,
@@ -1115,6 +1270,14 @@ async fn handle(
             Ok(response) => {
                 let status = response.status();
                 settings.note_outcome(&addr, Some(status));
+                if balanced {
+                    let outcome = if status.is_server_error() {
+                        Outcome::Failure
+                    } else {
+                        Outcome::Latency(attempt_started.elapsed())
+                    };
+                    settings.balancer.observe(&addr, outcome);
+                }
                 let retry_this = retry.as_ref().is_some_and(|r| {
                     (r.on_5xx && status.is_server_error())
                         || (r.on_retriable_4xx && matches!(status.as_u16(), 408 | 425 | 429))
@@ -1165,6 +1328,9 @@ async fn handle(
             }
             Err(err) => {
                 settings.note_outcome(&addr, None);
+                if balanced {
+                    settings.balancer.observe(&addr, Outcome::Failure);
+                }
                 let retriable = match &err {
                     AttemptError::Connect(_) => {
                         retry.as_ref().is_some_and(|r| r.on_connect_failure)
@@ -1326,10 +1492,79 @@ async fn attempt_request(
             builder = builder.header(name.as_str(), value.as_str());
         }
     }
-    let request = builder
-        .body(full(body))
-        .map_err(|err| AttemptError::Reset(err.to_string()))?;
+    // The body is buffered, so the request can be rebuilt for a second try
+    // on a fresh connection when a pooled one turns out to be dead.
+    let (head, ()) = builder
+        .body(())
+        .map_err(|err| AttemptError::Reset(err.to_string()))?
+        .into_parts();
+    let request = || Request::from_parts(head.clone(), full(body.clone()));
 
+    let key = pool_key(settings, addr, hand_off, mesh);
+    if let Some(key) = key.as_ref() {
+        if let Some(mut sender) = settings.pool.checkout(key) {
+            match sender.try_send_request(request()).await {
+                Ok(response) => return Ok(finish(settings, Some(key.clone()), sender, response)),
+                Err(mut err) => {
+                    // The upstream closed the pooled connection under us.
+                    // A request that never left, or one that is safe to
+                    // repeat, goes again on a fresh connection.
+                    let unsent = err.take_message().is_some();
+                    if !unsent && !IDEMPOTENT.contains(&parts.method.as_str()) {
+                        return Err(AttemptError::Reset(err.into_error().to_string()));
+                    }
+                    debug!(
+                        upstream = %settings.key,
+                        destination = addr,
+                        unsent,
+                        "Pooled upstream connection was closed; retrying on a new one"
+                    );
+                }
+            }
+        }
+    }
+
+    let mut sender = open(settings, addr, hand_off, mesh).await?;
+    let response = sender
+        .send_request(request())
+        .await
+        .map_err(|err| AttemptError::Reset(err.to_string()))?;
+    Ok(finish(settings, key, sender, response))
+}
+
+/// Which pool a request's connection belongs to. A `proxy` hop is never
+/// pooled: its requests carry per-request attribution headers in absolute
+/// form to a proxy the policy names.
+fn pool_key(
+    settings: &HttpSettings,
+    addr: &str,
+    hand_off: Option<&HandOff>,
+    mesh: Option<&Endpoint>,
+) -> Option<PoolKey> {
+    if hand_off.is_some() {
+        return None;
+    }
+    if mesh.is_some() {
+        return Some(PoolKey::Mesh(addr.to_string()));
+    }
+    if settings.task.is_some() {
+        return Some(PoolKey::Task);
+    }
+    match settings.target.as_ref() {
+        Some(target) if target.tls => Some(PoolKey::Tls(addr.to_string())),
+        _ => Some(PoolKey::Plain(addr.to_string())),
+    }
+}
+
+/// Open a new upstream connection for one request: to the task (ingress),
+/// through a `proxy` hop, to a mesh endpoint with mTLS and a PROXY v2
+/// header, or to an endpoint or external target, with TLS when it asks.
+async fn open(
+    settings: &Arc<HttpSettings>,
+    addr: &str,
+    hand_off: Option<&HandOff>,
+    mesh: Option<&Endpoint>,
+) -> Result<Sender, AttemptError> {
     // Ingress: the task itself, through its namespace, its VMM's vsock, or
     // its bridge. A `proxy` hop and a mesh endpoint are dialed on the host,
     // like any endpoint.
@@ -1339,7 +1574,7 @@ async fn attempt_request(
                 .connect()
                 .await
                 .map_err(|err| AttemptError::Connect(format!("{err:#}")))?;
-            return send_over(TokioIo::new(stream), request).await;
+            return handshake(TokioIo::new(stream)).await;
         }
     }
     // A `proxy` handler's target comes from policy a job may append to, so
@@ -1387,10 +1622,10 @@ async fn attempt_request(
         tls.write_all(&header)
             .await
             .map_err(|err| AttemptError::Reset(err.to_string()))?;
-        return send_over(TokioIo::new(tls), request).await;
+        return handshake(TokioIo::new(tls)).await;
     }
 
-    let response = match settings.target.as_ref() {
+    match settings.target.as_ref() {
         Some(target) if target.tls && hand_off.is_none() => {
             let server_name = rustls_pki_types::ServerName::try_from(target.host.clone())
                 .map_err(|err| AttemptError::Connect(err.to_string()))?;
@@ -1400,14 +1635,15 @@ async fn attempt_request(
                 .connect(server_name, stream)
                 .await
                 .map_err(|err| AttemptError::Connect(format!("tls: {err}")))?;
-            send_over(TokioIo::new(tls), request).await?
+            handshake(TokioIo::new(tls)).await
         }
-        _ => send_over(TokioIo::new(stream), request).await?,
-    };
-    Ok(response)
+        _ => handshake(TokioIo::new(stream)).await,
+    }
 }
 
-async fn send_over<I>(io: I, request: Request<OutBody>) -> Result<Response<OutBody>, AttemptError>
+/// Start an HTTP/1.1 client connection over `io`. The connection runs on
+/// its own task until the upstream closes it or its sender is dropped.
+async fn handshake<I>(io: I) -> Result<Sender, AttemptError>
 where
     I: hyper::rt::Read + hyper::rt::Write + Unpin + Send + 'static,
 {
@@ -1423,16 +1659,33 @@ where
         .ready()
         .await
         .map_err(|err| AttemptError::Reset(err.to_string()))?;
-    let response = sender
-        .send_request(request)
-        .await
-        .map_err(|err| AttemptError::Reset(err.to_string()))?;
-    let (parts, body) = response.into_parts();
-    let mut parts = parts;
+    Ok(sender)
+}
+
+/// Strip hop-by-hop headers from an upstream response, and hand its
+/// connection back to the pool once the body has been read and the
+/// upstream kept the connection alive.
+fn finish(
+    settings: &Arc<HttpSettings>,
+    key: Option<PoolKey>,
+    mut sender: Sender,
+    response: Response<Incoming>,
+) -> Response<OutBody> {
+    if let Some(key) = key {
+        let pool = settings.pool.clone();
+        tokio::spawn(async move {
+            // Ready again only after this response's body is done; an error
+            // means the upstream closed the connection instead.
+            if sender.ready().await.is_ok() {
+                pool.checkin(key, sender);
+            }
+        });
+    }
+    let (mut parts, body) = response.into_parts();
     for name in HOP_BY_HOP {
         parts.headers.remove(*name);
     }
-    Ok(Response::from_parts(parts, body.boxed()))
+    Response::from_parts(parts, body.boxed())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1557,6 +1810,165 @@ mod tests {
             response.headers().get("legion-denied-reason").unwrap(),
             "nope"
         );
+    }
+
+    /// A raw origin: answers every request on a connection with a short
+    /// body, counting connections and requests. With `close_after_reply`
+    /// it closes each connection after its first reply, the way a server
+    /// with a short keep-alive timeout does to an idle connection.
+    async fn counting_origin(close_after_reply: bool) -> (String, Arc<AtomicU64>, Arc<AtomicU64>) {
+        use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let connections = Arc::new(AtomicU64::new(0));
+        let requests = Arc::new(AtomicU64::new(0));
+        let (conns, reqs) = (connections.clone(), requests.clone());
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                conns.fetch_add(1, Ordering::SeqCst);
+                let reqs = reqs.clone();
+                tokio::spawn(async move {
+                    let mut stream = BufReader::new(stream);
+                    loop {
+                        let mut length = 0usize;
+                        let mut line = String::new();
+                        // Request head, then a Content-Length body.
+                        loop {
+                            line.clear();
+                            match stream.read_line(&mut line).await {
+                                Ok(0) | Err(_) => return,
+                                Ok(_) => {}
+                            }
+                            let lower = line.to_ascii_lowercase();
+                            if let Some(value) = lower.strip_prefix("content-length:") {
+                                length = value.trim().parse().unwrap_or(0);
+                            }
+                            if line == "\r\n" {
+                                break;
+                            }
+                        }
+                        let mut body = vec![0u8; length];
+                        if stream.read_exact(&mut body).await.is_err() {
+                            return;
+                        }
+                        reqs.fetch_add(1, Ordering::SeqCst);
+                        let reply = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok";
+                        if stream.get_mut().write_all(reply).await.is_err() || close_after_reply {
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+        (addr, connections, requests)
+    }
+
+    /// An HTTP-mode egress listener for one service endpoint, served on a
+    /// loopback port the test dials.
+    async fn http_listener(endpoint: &str) -> (Arc<HttpSettings>, u16) {
+        let settings = Arc::new(HttpSettings::new(
+            1,
+            "svc".into(),
+            None,
+            Some(&UpstreamHttpConfig::default()),
+            &[],
+            Arc::new(ForwarderContext::default()),
+            crate::worker::balance::default_balancer(),
+            Arc::new(Mutex::new(Arc::new(vec![Endpoint {
+                addr: endpoint.to_string(),
+                allocation_id: 2,
+                node_id: "node-a".into(),
+                tags: Vec::new(),
+                mesh_tls: false,
+            }]))),
+            Arc::new(Mutex::new(HashMap::new())),
+            None,
+        ));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let serving = settings.clone();
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                tokio::spawn(serve(stream, serving.clone()));
+            }
+        });
+        (settings, port)
+    }
+
+    /// One request on a new client connection, so only the upstream side
+    /// can be reused.
+    async fn send(port: u16, method: &str) -> u16 {
+        use tokio::io::AsyncReadExt;
+        let mut stream = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        let raw = format!(
+            "{method} /x HTTP/1.1\r\nHost: svc\r\nContent-Length: 2\r\nConnection: close\r\n\r\nhi"
+        );
+        stream.write_all(raw.as_bytes()).await.unwrap();
+        let mut reply = Vec::new();
+        stream.read_to_end(&mut reply).await.unwrap();
+        String::from_utf8_lossy(&reply)
+            .split_whitespace()
+            .nth(1)
+            .and_then(|status| status.parse().ok())
+            .unwrap_or(0)
+    }
+
+    async fn wait_for_idle(settings: &HttpSettings, want: usize) {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while settings.pool.idle_count() != want {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("pool never reached the expected idle count");
+    }
+
+    /// Requests from separate client connections share one upstream
+    /// connection: the pool hands it back once each reply is read.
+    #[tokio::test]
+    async fn requests_reuse_a_pooled_upstream_connection_test() {
+        let (origin, connections, requests) = counting_origin(false).await;
+        let (settings, port) = http_listener(&origin).await;
+        for _ in 0..5 {
+            assert_eq!(send(port, "GET").await, 200);
+            wait_for_idle(&settings, 1).await;
+        }
+        assert_eq!(requests.load(Ordering::SeqCst), 5);
+        assert_eq!(
+            connections.load(Ordering::SeqCst),
+            1,
+            "one upstream connection"
+        );
+        // Nothing is left counted as in flight once the replies are back.
+        assert!(settings.inflight.lock().unwrap().is_empty());
+    }
+
+    /// A pooled connection the upstream has since closed is never handed
+    /// out; the request goes on a fresh connection and succeeds, POST
+    /// included.
+    #[tokio::test]
+    async fn a_connection_the_upstream_closed_is_not_reused_test() {
+        let (origin, connections, requests) = counting_origin(true).await;
+        let (settings, port) = http_listener(&origin).await;
+        for method in ["GET", "POST", "POST"] {
+            assert_eq!(send(port, method).await, 200, "{method}");
+        }
+        assert_eq!(requests.load(Ordering::SeqCst), 3);
+        assert_eq!(connections.load(Ordering::SeqCst), 3);
+        // Closed connections leave the pool rather than lingering in it.
+        assert_eq!(settings.pool.reap(), 0);
+    }
+
+    /// Pools are keyed by how a connection was dialed: a plain connection
+    /// to an address is never handed out for TLS or mesh to the same one.
+    #[test]
+    fn pool_keys_separate_dial_kinds() {
+        let plain = PoolKey::Plain("10.0.0.1:80".into());
+        let mesh = PoolKey::Mesh("10.0.0.1:80".into());
+        let tls = PoolKey::Tls("10.0.0.1:80".into());
+        assert_ne!(plain, mesh);
+        assert_ne!(plain, tls);
+        assert_ne!(mesh, tls);
     }
 }
 

@@ -68,6 +68,18 @@ rule. An allowed connection is spliced through without parsing. The only
 per-connection cost of a connect-time policy is one pass over the rules. No
 bytes are inspected.
 
+On Linux, when both ends of a flow are plain sockets, bulk transfers move
+with `splice(2)` and never enter the worker's memory. Each direction starts
+as an ordinary copy and switches to `splice` once it is clearly carrying
+bulk data (a read fills the 16 KiB copy buffer), because for small requests
+and replies a copy is cheaper. That covers upstream and ingress flows over
+TCP, and a sandbox's flows over its vsock relay. A flow that has to be
+decrypted or framed (TLS, a mesh hop, a PROXY header read off the
+connection) is copied in user space, as is every flow on macOS. A kernel
+that refuses `splice` (some sandboxed kernels) is detected once at first
+use, and every flow is then copied. The behavior is the same either way.
+Only the CPU cost differs.
+
 **HTTP mode.** An upstream is parsed as HTTP/1.1 when it declares HTTP (an
 `http://`/`https://` target, an `http` block, or a `dlp` handler), or when
 the effective egress policy is `protocol = "http"`. For each request:
@@ -85,8 +97,11 @@ the effective egress policy is `protocol = "http"`. For each request:
    - a weighted `split` by service tag
    - `outlier` ejection of an endpoint after `consecutive5xx` failures, for
      `ejectFor`
-4. Each request gets one upstream connection. TLS is opened for `https://`,
-   and the `Host` header is rewritten to an external target's host.
+4. Upstream connections are pooled per listener and reused across
+   requests, so a task's calls pay the TCP, TLS, and mesh handshakes once
+   rather than per request. TLS is opened for `https://`, and the `Host`
+   header is rewritten to an external target's host. See
+   [Connection pooling](#connection-pooling).
 
 `accessLog = true` on the chain (or a `log` handler) writes one NDJSON line
 per request to `<worker logs>/<allocation>/net-access.log`. Each line has
@@ -96,6 +111,86 @@ duration.
 HTTP mode supports HTTP/1.1 only, with no HTTP/2 and no WebSocket upgrades.
 A task that needs those should use a `tcp://`/`tls://` upstream and an L4
 policy.
+
+### Connection pooling
+
+In HTTP mode, the datapath keeps idle upstream connections and reuses them.
+This applies to service endpoints, external targets, mesh endpoints, and the
+task behind an HTTP-mode ingress chain.
+
+- **Per listener.** Each upstream of each allocation has its own pool. Two
+  allocations never share a connection, so a mesh connection's PROXY header,
+  sent once when it opens, always names the workload making the request.
+- **When a connection comes back.** After the response body has been read,
+  if the upstream kept the connection alive. A response with
+  `Connection: close` ends the connection instead.
+- **Limits.** A connection is closed after 30 seconds idle, and each
+  destination keeps at most 32 idle connections.
+- **A connection the upstream closed.** It is skipped when picked from the
+  pool. If the upstream closes it just as a request goes out, the request is
+  sent again on a new connection when it never left the node, or when its
+  method is idempotent (`GET`, `HEAD`, `OPTIONS`, `PUT`, `DELETE`, `TRACE`).
+  Otherwise the task gets a `502`. This retry is separate from the `retries`
+  policy and does not count against its budget.
+- **Not pooled.** A request handed to a [`proxy` handler](#proxy--bring-your-own-proxy).
+
+L4 flows are not pooled. Each connection the task opens is one connection
+upstream, and on a mesh endpoint, one mTLS handshake.
+
+### What the datapath costs
+
+These numbers come from `net_bench`
+([Testing and Benchmarks](testing-and-benchmarks.md)), which runs the real
+forwarder against backends on loopback. That isolates the cost of the hop
+itself: there is no NIC, no network round trip, and no TLS. The runs used
+Linux 7.0 in a 10-vCPU VM on an Apple M5, on a host shared with other work.
+Each figure is the range across runs, not a single best case.
+
+| One hop through the forwarder (L4) | Direct | Through the forwarder | The hop adds |
+| --- | --- | --- | --- |
+| Request and reply, 100 bytes, kept-open connection | 4–7 µs | 8–13 µs | 4–7 µs |
+| New connection, one request and reply | 19–37 µs | 63–120 µs | 45–80 µs |
+| Bulk transfer, one stream | 5.3–6.0 GiB/s | 4.1–4.9 GiB/s | |
+| CPU per GiB moved, the hop alone | | 0.09–0.11 CPU-s | |
+
+For comparison, a bare userspace proxy (accept, dial, copy) in the same
+harness moved about 2 GiB/s at 0.27–0.37 CPU-seconds per GiB. The forwarder
+beats it on bulk transfers because it splices them in the kernel on Linux.
+On macOS every flow is copied, so expect numbers closer to that baseline.
+
+What this means in practice:
+
+- **Kept-open connections pay a few microseconds per round trip.** A
+  request between two nodes in one datacenter usually takes a few hundred
+  microseconds on the network, so one hop is a small share of it. A call
+  through `connect` to a port another node fronts crosses two hops, one on
+  each node.
+- **New connections pay the most.** The forwarder accepts one connection and
+  dials another, which roughly doubles the setup cost on loopback. A client
+  that keeps its connections open avoids this.
+- **Mesh mTLS adds a handshake per new L4 connection.** That is one extra
+  network round trip plus the handshake's CPU, and it is not in the table.
+  HTTP mode pools its upstream connections, so a task making many requests
+  pays the handshake once per pooled connection, not once per request.
+- **HTTP mode parses every request and response.** On loopback, a request
+  through HTTP mode on a reused upstream connection measured within about
+  20 µs of a direct one. That figure is noisy: a direct HTTP request in the
+  same harness averaged anywhere from about 30 to over 100 µs across runs.
+
+Balancing matters more than the hop when a backend is slow. With three
+backends and one of them deliberately slow, strategies that spread traffic
+evenly averaged 1.8–1.9 ms per request. `least_latency` averaged 62–73 µs in
+HTTP mode, and 98–114 µs over L4 with a new connection per request, close to
+the fast backends alone
+([Balancing strategies](service-discovery.md#balancing-strategies)). A pick
+costs 90–145 ns across 16 endpoints, against 2–5 ns for `round_robin` and
+110–180 ns for `least_conn`.
+
+To reproduce these on your own hardware:
+
+```console
+$ cargo bench --bench net_bench
+```
 
 ## Policy
 
@@ -1587,7 +1682,8 @@ This section lists what that covers and what it does not.
   Legion stores and serves certificates but does not issue public ones: a
   renewal job (or any ACME client) writes them to KV. The mesh is node-to-node mTLS with attributed
   workload identity, never per-workload certificates. There is no kTLS fast
-  path (a terminated connection is copied in user space), no revocation
+  path (a TLS connection, mesh hops included, is copied in user space rather
+  than spliced), no revocation
   beyond the 24-hour lifetime, and an ingress `proxy` hop cannot reach a
   gated task's private port or a port inside a sandbox guest.
 - **No HTTP/2 or HTTP/3** (`protocol = "h2"` is rejected with that reason),

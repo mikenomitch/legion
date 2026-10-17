@@ -38,10 +38,11 @@ use crate::structs::netpolicy::HandlerConfig;
 use crate::structs::netpolicy::{ConnectFacts, Verdict, PROTOCOL_TCP};
 use crate::structs::{parse_upstream_target, UpstreamTarget, UPSTREAM_LOOPBACK_ADDR};
 use crate::structs::{UpstreamCredential, UpstreamHttpConfig};
-use crate::worker::balance::{balancer, default_balancer, Balancer, Endpoint};
+use crate::worker::balance::{balancer, default_balancer, Balancer, Endpoint, Outcome};
 use crate::worker::netd::handlers::{self, HopFacts, HopOutcome, ProxyTarget};
 use crate::worker::netd::http::HttpSettings;
 use crate::worker::netd::policy::{egress_connect_verdict, AllocIdentity};
+use crate::worker::netd::splice::{self as flow, SpliceStream};
 use crate::worker::netd::tls::MeshIdentity;
 use crate::worker::netd::{metrics as net_metrics, Denials, PolicyLookup};
 
@@ -50,7 +51,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{OnceLock, RwLock};
 use std::time::{Duration, Instant};
-use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
+use tokio::io::AsyncWriteExt;
 use tokio::net::{TcpListener, TcpStream, UnixListener};
 use tokio::task::JoinHandle;
 
@@ -123,8 +124,9 @@ struct UpstreamShared {
     allocation_id: i64,
     service: String,
     balancer: Arc<dyn Balancer>,
-    /// Latest endpoint snapshot from the manager. Replaced wholesale.
-    endpoints: Arc<Mutex<Vec<Endpoint>>>,
+    /// Latest endpoint snapshot from the manager. Replaced wholesale, and
+    /// shared as an `Arc` so the accept path never copies the list.
+    endpoints: Arc<Mutex<Arc<Vec<Endpoint>>>>,
     /// Live connection count per endpoint address, for load-aware strategies.
     /// Entries are removed at zero so the map stays bounded by live endpoints.
     inflight: Arc<Mutex<HashMap<String, usize>>>,
@@ -1059,7 +1061,7 @@ impl UpstreamShared {
             allocation_id: spec.allocation_id,
             service: spec.service.clone(),
             balancer,
-            endpoints: Arc::new(Mutex::new(Vec::new())),
+            endpoints: Arc::new(Mutex::new(Arc::new(Vec::new()))),
             inflight: Arc::new(Mutex::new(HashMap::new())),
             target,
             context,
@@ -1119,7 +1121,7 @@ impl UpstreamShared {
         )
     }
 
-    fn endpoints(&self) -> Vec<Endpoint> {
+    fn endpoints(&self) -> Arc<Vec<Endpoint>> {
         lock(&self.endpoints).clone()
     }
 
@@ -1326,7 +1328,7 @@ impl UpstreamForwarder {
             endpoints = endpoints.len(),
             "Updated upstream endpoints"
         );
-        *lock(&shared.endpoints) = endpoints;
+        *lock(&shared.endpoints) = Arc::new(endpoints);
     }
 
     /// The upstreams whose listener is currently bound. Diagnostics: an
@@ -1571,7 +1573,7 @@ async fn run_unix_listener(socket: UnixListener, shared: Arc<UpstreamShared>) {
 /// sandbox's VMM; `peer` is the TCP peer, for a `proxy` hop's PROXY header.
 async fn forward_connection<C>(mut client: C, peer: Option<SocketAddr>, shared: Arc<UpstreamShared>)
 where
-    C: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    C: SpliceStream + Send + 'static,
 {
     // HTTP mode parses requests instead of splicing; see `netd::http`.
     if let Some(settings) = shared.http_settings() {
@@ -1588,8 +1590,8 @@ where
         return;
     }
 
-    let mut candidates = shared.endpoints();
-    if candidates.is_empty() {
+    let snapshot = shared.endpoints();
+    if snapshot.is_empty() {
         debug!(
             allocation_id = shared.allocation_id,
             service = %shared.service,
@@ -1606,18 +1608,22 @@ where
         return;
     }
 
+    // The first pick reads the shared snapshot in place; only a failover
+    // copies it, to drop the endpoint that refused.
+    let mut remaining: Option<Vec<Endpoint>> = None;
     for _ in 0..MAX_DIAL_ATTEMPTS {
         // Re-picking against the shrinking candidate list is what makes
         // failover work: a refused endpoint is out of the running for this
         // connection, and load-aware strategies see fresh in-flight counts.
-        let inflight = shared.inflight();
-        let Some(index) = shared.balancer.pick(&candidates, &inflight) else {
+        let candidates: &[Endpoint] = remaining.as_deref().unwrap_or(&snapshot);
+        let picked = {
+            let inflight = lock(&shared.inflight);
+            shared.balancer.pick(candidates, &inflight)
+        };
+        let Some(index) = picked.filter(|index| *index < candidates.len()) else {
             break;
         };
-        if index >= candidates.len() {
-            break;
-        }
-        let endpoint = candidates.remove(index);
+        let endpoint = candidates[index].clone();
 
         // Policy, against the endpoint about to be dialed. A rule naming the
         // service (`host = "db"`) or the endpoint's address/port decides here.
@@ -1661,6 +1667,7 @@ where
         // Released on every exit path, including errors, by `Drop`.
         let _inflight_guard = InflightGuard::acquire(&shared, &endpoint.addr);
 
+        let dialed = Instant::now();
         let upstream =
             match tokio::time::timeout(DIAL_TIMEOUT, TcpStream::connect(&endpoint.addr)).await {
                 Ok(Ok(upstream)) => upstream,
@@ -1672,6 +1679,8 @@ where
                         error = ?err,
                         "Upstream dial failed; trying the next endpoint"
                     );
+                    shared.balancer.observe(&endpoint.addr, Outcome::Failure);
+                    remaining = Some(without(candidates, index));
                     continue;
                 }
                 Err(_) => {
@@ -1681,9 +1690,17 @@ where
                         endpoint = %endpoint.addr,
                         "Upstream dial timed out; trying the next endpoint"
                     );
+                    shared.balancer.observe(&endpoint.addr, Outcome::Failure);
+                    remaining = Some(without(candidates, index));
                     continue;
                 }
             };
+        shared
+            .balancer
+            .observe(&endpoint.addr, Outcome::Latency(dialed.elapsed()));
+        // Request/reply streams are latency-sensitive and the datapath
+        // forwards whatever it reads at once; coalescing is the task's call.
+        let _ = upstream.set_nodelay(true);
 
         shared.context.edges().record_connection(
             shared.allocation_id,
@@ -1691,12 +1708,18 @@ where
             endpoint.tags.first().map(String::as_str),
             true,
         );
-        if endpoint.mesh_tls {
-            mesh_splice(&shared, client, peer, upstream, &endpoint, &hop_facts).await;
-            return;
+        let tag = endpoint.tags.first().map(String::as_str);
+        let reply = if endpoint.mesh_tls {
+            mesh_splice(&shared, client, peer, upstream, &endpoint, &hop_facts).await
+        } else {
+            net_metrics::connection("egress", PROTOCOL_TCP, "allow");
+            splice(&shared, &endpoint.addr, tag, client, upstream).await
+        };
+        if let Some(reply) = reply {
+            shared
+                .balancer
+                .observe(&endpoint.addr, Outcome::Latency(reply));
         }
-        net_metrics::connection("egress", PROTOCOL_TCP, "allow");
-        splice(&shared, &endpoint.addr, client, upstream).await;
         return;
     }
 
@@ -1714,6 +1737,13 @@ where
     let _ = client.shutdown().await;
 }
 
+/// `list` minus the entry at `index`: the candidates left after a failed dial.
+fn without(list: &[Endpoint], index: usize) -> Vec<Endpoint> {
+    let mut rest = list.to_vec();
+    rest.remove(index);
+    rest
+}
+
 /// Dial an external upstream's fixed destination, originating TLS when the
 /// scheme asks for it.
 async fn forward_external<C>(
@@ -1722,7 +1752,7 @@ async fn forward_external<C>(
     shared: Arc<UpstreamShared>,
     target: UpstreamTarget,
 ) where
-    C: AsyncRead + AsyncWrite + Unpin,
+    C: SpliceStream,
 {
     let destination = target.addr();
     // The boot gate before anything else, as everywhere in the datapath.
@@ -1855,9 +1885,10 @@ async fn forward_external<C>(
             return;
         }
     };
+    let _ = upstream.set_nodelay(true);
     if !target.tls {
         net_metrics::connection("egress", PROTOCOL_TCP, "allow");
-        splice(&shared, &destination, client, upstream).await;
+        splice(&shared, &destination, None, client, upstream).await;
         return;
     }
     let server_name = match rustls_pki_types::ServerName::try_from(target.host.clone()) {
@@ -1879,7 +1910,7 @@ async fn forward_external<C>(
     match tokio::time::timeout(DIAL_TIMEOUT, connector.connect(server_name, upstream)).await {
         Ok(Ok(tls)) => {
             net_metrics::connection("egress", PROTOCOL_TCP, "allow");
-            splice(&shared, &destination, client, tls).await;
+            splice(&shared, &destination, None, client, tls).await;
         }
         Ok(Err(err)) => {
             debug!(
@@ -1987,7 +2018,6 @@ async fn deny_if_policy_says_so(
     }
 }
 
-/// Splice the two halves and account the bytes.
 /// The external hops that apply to this listener's flows: the effective
 /// egress chain's, then the upstream's own.
 async fn run_hops(shared: &Arc<UpstreamShared>, facts: &HopFacts<'_>) -> HopOutcome {
@@ -2044,7 +2074,7 @@ async fn hand_off<C>(
     target: ProxyTarget,
     destination: Option<SocketAddr>,
 ) where
-    C: AsyncRead + AsyncWrite + Unpin,
+    C: SpliceStream,
 {
     let mut proxy =
         match crate::worker::netd::guard::dial_guarded(&shared.context, &target.addr, DIAL_TIMEOUT)
@@ -2080,7 +2110,7 @@ async fn hand_off<C>(
         }
     }
     net_metrics::connection("egress", PROTOCOL_TCP, "allow");
-    splice(shared, &target.addr, client, proxy).await;
+    splice(shared, &target.addr, None, client, proxy).await;
 }
 
 /// Dial a mesh endpoint: TLS with this node's certificate, verify the peer
@@ -2092,8 +2122,9 @@ async fn mesh_splice<C>(
     upstream: TcpStream,
     endpoint: &Endpoint,
     facts: &HopFacts<'_>,
-) where
-    C: AsyncRead + AsyncWrite + Unpin,
+) -> Option<Duration>
+where
+    C: SpliceStream,
 {
     let Some(connector) = shared.context.mesh_connector() else {
         debug!(
@@ -2104,7 +2135,7 @@ async fn mesh_splice<C>(
         );
         net_metrics::connection("egress", PROTOCOL_TCP, "error");
         let _ = client.shutdown().await;
-        return;
+        return None;
     };
     let server_name = match crate::worker::netd::tls::server_name(
         &crate::manager::mesh_ca::node_dns_name(&endpoint.node_id),
@@ -2114,7 +2145,7 @@ async fn mesh_splice<C>(
             debug!(error = %err, "Mesh endpoint node name is not a valid server name");
             net_metrics::connection("egress", PROTOCOL_TCP, "error");
             let _ = client.shutdown().await;
-            return;
+            return None;
         }
     };
     match tokio::time::timeout(DIAL_TIMEOUT, connector.connect(server_name, upstream)).await {
@@ -2124,10 +2155,11 @@ async fn mesh_splice<C>(
             if tls.write_all(&header).await.is_err() {
                 net_metrics::connection("egress", PROTOCOL_TCP, "error");
                 let _ = client.shutdown().await;
-                return;
+                return None;
             }
             net_metrics::connection("egress", PROTOCOL_TCP, "allow");
-            splice(shared, &endpoint.addr, client, tls).await;
+            let tag = endpoint.tags.first().map(String::as_str);
+            splice(shared, &endpoint.addr, tag, client, tls).await
         }
         Ok(Err(err)) => {
             debug!(
@@ -2137,57 +2169,60 @@ async fn mesh_splice<C>(
                 error = ?err,
                 "Mesh TLS handshake failed"
             );
+            shared.balancer.observe(&endpoint.addr, Outcome::Failure);
             net_metrics::connection("egress", PROTOCOL_TCP, "error");
             let _ = client.shutdown().await;
+            None
         }
         Err(_) => {
+            shared.balancer.observe(&endpoint.addr, Outcome::Failure);
             net_metrics::connection("egress", PROTOCOL_TCP, "error");
             let _ = client.shutdown().await;
+            None
         }
     }
 }
 
+/// Move the flow's bytes until both sides close, account them, and return
+/// how long the first reply took (for the balancer).
 async fn splice<C, U>(
     shared: &Arc<UpstreamShared>,
     destination: &str,
+    tag: Option<&str>,
     mut client: C,
     mut upstream: U,
-) where
-    C: AsyncRead + AsyncWrite + Unpin,
-    U: AsyncRead + AsyncWrite + Unpin,
+) -> Option<Duration>
+where
+    C: SpliceStream,
+    U: SpliceStream,
 {
-    let tag = shared
-        .endpoints()
-        .iter()
-        .find(|e| e.addr == destination)
-        .and_then(|e| e.tags.first().cloned());
-    match tokio::io::copy_bidirectional(&mut client, &mut upstream).await {
-        Ok((to_upstream, to_client)) => {
-            net_metrics::bytes("egress", to_upstream);
-            net_metrics::bytes("ingress", to_client);
-            shared.context.edges().record_bytes(
-                shared.allocation_id,
-                &shared.service,
-                tag.as_deref(),
-                PROTOCOL_TCP,
-                to_upstream,
-                to_client,
-            );
-            debug!(
-                service = %shared.service,
-                endpoint = %destination,
-                to_upstream,
-                to_client,
-                "Upstream connection closed"
-            )
-        }
-        Err(err) => debug!(
+    let transfer = flow::bidirectional(&mut client, &mut upstream).await;
+    net_metrics::bytes("egress", transfer.sent);
+    net_metrics::bytes("ingress", transfer.received);
+    shared.context.edges().record_bytes(
+        shared.allocation_id,
+        &shared.service,
+        tag,
+        PROTOCOL_TCP,
+        transfer.sent,
+        transfer.received,
+    );
+    match &transfer.error {
+        None => debug!(
+            service = %shared.service,
+            endpoint = %destination,
+            to_upstream = transfer.sent,
+            to_client = transfer.received,
+            "Upstream connection closed"
+        ),
+        Some(err) => debug!(
             service = %shared.service,
             endpoint = %destination,
             error = ?err,
             "Upstream connection ended with an error"
         ),
     }
+    transfer.first_reply
 }
 
 /// Keeps one endpoint's in-flight count accurate for the lifetime of a

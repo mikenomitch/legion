@@ -264,6 +264,23 @@ impl<S: tokio::io::AsyncRead + Unpin> tokio::io::AsyncRead for Prefixed<S> {
     }
 }
 
+/// Splices only once the prefix has been read: until then some bytes live
+/// here, not in the socket.
+impl<S: crate::worker::netd::splice::SpliceStream> crate::worker::netd::splice::SpliceStream
+    for Prefixed<S>
+{
+    fn socket(&self) -> Option<crate::worker::netd::splice::Socket<'_>> {
+        if self.pos < self.prefix.len() {
+            return None;
+        }
+        self.inner.socket()
+    }
+
+    fn activity(&self) -> Option<crate::worker::netd::splice::SpliceActivity> {
+        self.inner.activity()
+    }
+}
+
 impl<S: tokio::io::AsyncWrite + Unpin> tokio::io::AsyncWrite for Prefixed<S> {
     fn poll_write(
         mut self: std::pin::Pin<&mut Self>,

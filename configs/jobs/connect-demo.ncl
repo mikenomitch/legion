@@ -70,8 +70,9 @@
                 upstreams = [
                     {
                         service = "web",
-                        # The default; "random" and "least_conn" are the other
-                        # built-ins. Omit `balance` to get round_robin.
+                        # Even spread, so the demo visibly alternates. Omit
+                        # `balance` for the default, least_latency; "random",
+                        # "least_conn", and "local_first" are the others.
                         balance = "round_robin",
                         # Without localPort the loopback port is assigned at
                         # placement out of the same per-node range as host

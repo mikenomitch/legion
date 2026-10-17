@@ -32,6 +32,7 @@ use crate::worker::netd::metrics as net_metrics;
 use crate::worker::netd::netns;
 use crate::worker::netd::policy::{egress_connect_verdict, gated_egress_connect_verdict};
 use crate::worker::netd::proxyproto::Prefixed;
+use crate::worker::netd::splice::SpliceStream;
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
@@ -493,7 +494,7 @@ async fn dial_proxy_target(
 
 async fn handle<S>(mut client: S, peer: Option<SocketAddr>, proxy: Arc<Proxy>)
 where
-    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    S: SpliceStream + Send + 'static,
 {
     // The first byte says which protocol the client speaks; it is handed
     // back to the handler in front of the stream.
@@ -590,7 +591,7 @@ async fn deny_http<S: AsyncWrite + Unpin>(
 
 async fn handle_http<S>(mut client: S, peer: Option<SocketAddr>, proxy: Arc<Proxy>)
 where
-    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    S: SpliceStream + Send + 'static,
 {
     let Some(head) = read_head(&mut client).await else {
         return;
@@ -879,25 +880,24 @@ async fn splice<S>(
     mut upstream: TcpStream,
     leftover: &[u8],
 ) where
-    S: AsyncRead + AsyncWrite + Unpin,
+    S: SpliceStream,
 {
     if !leftover.is_empty() && upstream.write_all(leftover).await.is_err() {
         return;
     }
-    match tokio::io::copy_bidirectional(&mut client, &mut upstream).await {
-        Ok((up, down)) => {
-            net_metrics::bytes("egress", up);
-            net_metrics::bytes("ingress", down);
-            proxy.context.edges().record_bytes(
-                proxy.allocation_id,
-                host,
-                None,
-                PROTOCOL_TCP,
-                up,
-                down,
-            );
-        }
-        Err(err) => debug!(error = ?err, "Egress proxy tunnel ended with an error"),
+    let transfer = crate::worker::netd::splice::bidirectional(&mut client, &mut upstream).await;
+    net_metrics::bytes("egress", transfer.sent);
+    net_metrics::bytes("ingress", transfer.received);
+    proxy.context.edges().record_bytes(
+        proxy.allocation_id,
+        host,
+        None,
+        PROTOCOL_TCP,
+        transfer.sent,
+        transfer.received,
+    );
+    if let Some(err) = transfer.error {
+        debug!(error = ?err, "Egress proxy tunnel ended with an error");
     }
 }
 
@@ -907,7 +907,7 @@ async fn splice<S>(
 
 async fn handle_socks5<S>(mut client: S, peer: Option<SocketAddr>, proxy: Arc<Proxy>)
 where
-    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    S: SpliceStream + Send + 'static,
 {
     // Greeting: VER NMETHODS METHODS...
     let mut hdr = [0u8; 2];

@@ -26,7 +26,7 @@ use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tonic::{Code, Status};
 
@@ -445,7 +445,7 @@ impl<C: Control> Gateway<C> {
 
     async fn handle<S>(&self, mut client: S, peer: SocketAddr)
     where
-        S: AsyncRead + AsyncWrite + Unpin,
+        S: crate::worker::netd::splice::SpliceStream,
     {
         let head = match tokio::time::timeout(HEAD_TIMEOUT, read_head(&mut client)).await {
             Ok(Ok(Some(head))) => head,
@@ -520,7 +520,8 @@ impl<C: Control> Gateway<C> {
                 if upstream.write_all(forward).await.is_err() {
                     return;
                 }
-                let _ = tokio::io::copy_bidirectional(&mut client, &mut upstream).await;
+                let _ =
+                    crate::worker::netd::splice::bidirectional(&mut client, &mut upstream).await;
             }
         }
     }

@@ -266,9 +266,10 @@
                     # Pin the loopback port for clients that cannot read env
                     # vars. Must not collide with a static port above.
                     { service = "cache", localPort = 6379 },
-                    # Strategy override: round_robin (default) | random |
-                    # least_conn | local_first (same-node endpoints first,
-                    # widening when none is healthy locally).
+                    # Strategy override: least_latency (default; two random
+                    # picks, the lower latency x load wins) | round_robin |
+                    # random | least_conn | local_first (same-node endpoints
+                    # first, widening when none is healthy locally).
                     { service = "search", balance = "least_conn" },
                     # HTTP framing and traffic management on a service
                     # upstream (docs/network-handlers.md): a per-request

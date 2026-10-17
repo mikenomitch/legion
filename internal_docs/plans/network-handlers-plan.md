@@ -745,6 +745,12 @@ without sending anything. All with `--json`, all in `catalog()`, `policy show`
 
 ### 7.12 Performance invariants — pinned, not promised
 
+> **Update (datapath-performance plan):** invariants 2 and 3 are measured by
+> `benchmarks/micro/net_bench.rs`, and the L4 path now splices on Linux.
+> The benchmarks are run by hand and reported in PRs rather than failing CI;
+> see [datapath-performance-plan_calls.md](../calls/datapath-performance-plan_calls.md)
+> entry 8.
+
 Stated as benchmarks in `benchmarks/micro/` that fail on regression:
 
 1. **A task with no policy and no capture is byte-identical on the wire**,
