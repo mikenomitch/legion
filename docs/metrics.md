@@ -154,6 +154,11 @@ neighbor rules a cause in or out, and which knob to turn), see
   scheduler-lane leader's wake pass, so it reads 0 on other managers and is
   refreshed when a capacity event arrives. A rising `class` count is a
   capacity signal for that class; `escaped` means no node was schedulable.
+- **`legion_gang_blocked_jobs`** (gauge): jobs whose blocked eval is a
+  [gang](gang-scheduling.md) short of its quorum. A waiting gang holds
+  nothing, so smaller jobs can keep taking the capacity it waits for; a value
+  that stays up while the cluster churns is that starvation. Set by the
+  scheduler-lane leader's wake pass, like `legion_evals_blocked`.
 - **`legion_evals_unblocked_total{event}`** (counter): blocked evals returned
   to the pending queue, by what woke them: `register`, `node` (pool,
   availability, or attributes changed), `ready`, `freed` (allocations left a

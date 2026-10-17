@@ -157,8 +157,9 @@ Per task, the scheduler:
 The scheduler truncates candidate lists to a budget (`max(64, 8 × remaining
 count)`, nearest fit first) only when nothing downstream needs the full set.
 A task always gets the whole shard if it has `count.per`, `distinct`
-constraints, volumes (which can pin placements), or belongs to a multi-task
-group. If placement exhausts a truncated list while the fleet still has room,
+constraints, volumes (which can pin placements), sets `gang` (deciding that a
+[gang](gang-scheduling.md) does not fit defers its whole plan, and only the
+full list can prove that), or belongs to a multi-task group. If placement exhausts a truncated list while the fleet still has room,
 the scheduler widens back to the full scan mid-task and keeps going
 (`refills` in the explain output).
 

@@ -1356,14 +1356,38 @@ How to use it:
   - [ ] Revisit fair share only with real multi-tenant demand. Bands +
         per-namespace band caps (the `bands` ACL selector) are the 80/20;
         hierarchical queues stay a non-goal.
-- [ ] Gang scheduling — `gang` on a task makes its replicas place
-      all-or-nothing, with capacity failures becoming blocked-and-retried
-      evals (woken on `node_join`) instead of terminal eval failures —
-      [plan](plans/gang-scheduling-plan.md) (PLANNED: gang contract + blocked
-      evals → `min` quorum + `placementTimeout` → whole-gang recovery →
-      blue-green updates; reservation/backfill anti-starvation and
-      gang-grained preemption deliberately deferred, the latter coordinated
-      with the preemption plan)
+- [ ] **Gang scheduling, after Phase 1.** Phase 1 (the contract, `min`,
+      the quorum preemption floor, `job plan` gang reports) is in Done below;
+      [plan](plans/gang-scheduling-plan.md) (IN EXECUTION) ·
+      [calls](calls/gang-scheduling-plan_calls.md) ·
+      [docs](../docs/gang-scheduling.md). Open, in the plan's order:
+  - [ ] `gang.placementTimeout` (Phase 2): stop waiting and fail the job.
+        Needs a "waiting since" that survives wake/re-block cycles (a
+        blocked eval's `blocked_at` resets on every block), a timer wake
+        (blocked evals only wake on capacity), and a decided meaning for a
+        failed job. Rejected as an unknown field today
+        ([calls](calls/gang-scheduling-plan_calls.md) 13).
+  - [ ] `gang.recovery: 'gang'` (Phase 3): a member failure or loss stops
+        the survivors and re-places the whole gang as one wave, consuming one
+        move-budget unit. Today members fail and top up one at a time.
+  - [ ] Phase 4: an integration test that makes the `createFirst` blue-green
+        gang update a supported path, and the autoscaler consuming a blocked
+        gang's shortfall as scale-up demand.
+  - [ ] **Gang-aware wake.** A blocked gang wakes on any capacity on its
+        class (one freed replica's worth for a gang of eight) and re-plans in
+        full every time. Wake only when the class's free capacity could fit
+        `min - running - placeable` replicas, once a measurement shows the
+        wasted re-plans matter ([calls](calls/gang-scheduling-plan_calls.md) 2).
+  - [ ] **Whole-gang preemption victims.** Preemption never takes a gang
+        below its quorum, so a `gang = true` job in a preemptible band is not
+        preemptible at all. Whole-gang victim selection (take every member,
+        cost it as one victim) belongs to the preemption plan
+        ([calls](calls/gang-scheduling-plan_calls.md) 5).
+  - [ ] **Reservation / backfill for starving gangs.** A waiting gang holds
+        nothing, so small jobs can keep taking freed capacity before a large
+        gang sees enough at once. Watch `legion_gang_blocked_jobs` first;
+        the fix is a plan of its own (reserve freed capacity for the oldest
+        waiting gang, backfill around it).
 - [ ] Schedule onto the same node as an *existing job*. Soft `same_node_as`
       colocation works within one job spec
       ([scheduler/policy.rs](../src/manager/scheduler/policy.rs)); cross-job
@@ -4977,6 +5001,25 @@ Deferred from [operator-ui-gaps-plan.md](plans/operator-ui-gaps-plan.md):
 
 docs: [scheduler-and-eval-loop.md](../docs/scheduler-and-eval-loop.md), [jobs-tasks-and-scheduling.md](../docs/jobs-tasks-and-scheduling.md)
 
+- [x] **Gang scheduling, Phase 1** (2026-10-17,
+      [plan](plans/gang-scheduling-plan.md) as revised ·
+      [calls](calls/gang-scheduling-plan_calls.md) ·
+      [docs](../docs/gang-scheduling.md)). Open follow-ups are under
+      Scheduling & placement above.
+  - [x] `gang = true | { min = N }` on a task, with submit validation
+        (`count.per`, keyed/session stateful, a shared group, `min` bounds,
+        multi-step rollouts, sequential slots) and a `task_config.gang`
+        column.
+  - [x] A gang short of its quorum makes its whole plan place nothing and
+        blocks on the shipped blocked-eval queue; above the quorum the rest
+        trickles in. Top-ups are all or nothing, and a backoff hold on one
+        member holds the whole top-up. Gang tasks never use truncated index
+        candidates.
+  - [x] Preemption never takes a gang below its quorum.
+  - [x] The rollout engine replaces a gang group in one step.
+  - [x] `PlanJobReply.gang_reports` (a deferred gang is a successful dry
+        run), `JobBlocked.gang`, `job plan` / `job info` / UI / MCP
+        rendering, `legion_gang_blocked_jobs`.
 - [x] **Elastic session envelopes, Phase 1.** `stateful.envelope.max` and
       `shrinkAfter`: each node grows its session envelope toward the
       ceiling as its sessions fill it and shrinks it after they drain, one

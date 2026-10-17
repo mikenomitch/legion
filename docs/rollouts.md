@@ -71,6 +71,7 @@ Legion validates rollout config when you submit the job.
 - `slots.order = "sequential"` cannot be combined with a step mode in the same scope.
 - `slots` is only valid for groups with a slot-mode stateful task.
 - `slots.updateFrom` requires `slots.order = "sequential"` and must be less than the slot task's `count.num`.
+- A group whose task sets [`gang`](gang-scheduling.md#rollouts) must roll out in one step: a step mode that resolves to more than one step (`percentSteps = [100]` is one), and `slots.order = "sequential"`, are rejected. The engine also runs a gang group in one step whatever a strategy plugin injects. With `destroyFirst` the update is a restart of the whole gang; with `createFirst` the new gang places whole beside the old one.
 
 ## Step semantics
 

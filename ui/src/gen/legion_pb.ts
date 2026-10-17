@@ -3668,6 +3668,25 @@ export class PlanJobReply extends Message<PlanJobReply> {
    */
   warnings: string[] = [];
 
+  /**
+   * One report per task that sets `gang` (docs/gang-scheduling.md), in task
+   * order: whether its quorum would place right now, and if not, how far it
+   * got and why the first missing replica did not fit.
+   *
+   * A gang that would not reach its quorum is not an error. The reply then
+   * succeeds with `allocations` empty (a gang short of its quorum places
+   * nothing, and neither does the rest of its job), the report's
+   * `would_place` false, and `message` saying the job would wait: a submit
+   * would block its eval until the whole quorum fits. A dry run of a job
+   * without `gang` still fails when a replica does not fit, as before.
+   *
+   * Like the rest of the reply, this is a plan against a snapshot, not a
+   * reservation.
+   *
+   * @generated from field: repeated legion.GangReport gang_reports = 9;
+   */
+  gangReports: GangReport[] = [];
+
   constructor(data?: PartialMessage<PlanJobReply>) {
     super();
     proto3.util.initPartial(data, this);
@@ -3684,6 +3703,7 @@ export class PlanJobReply extends Message<PlanJobReply> {
     { no: 6, name: "preemptions", kind: "message", T: PlannedPreemption, repeated: true },
     { no: 7, name: "preemption_mode", kind: "scalar", T: 9 /* ScalarType.STRING */ },
     { no: 8, name: "warnings", kind: "scalar", T: 9 /* ScalarType.STRING */, repeated: true },
+    { no: 9, name: "gang_reports", kind: "message", T: GangReport, repeated: true },
   ]);
 
   static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): PlanJobReply {
@@ -3700,6 +3720,125 @@ export class PlanJobReply extends Message<PlanJobReply> {
 
   static equals(a: PlanJobReply | PlainMessage<PlanJobReply> | undefined, b: PlanJobReply | PlainMessage<PlanJobReply> | undefined): boolean {
     return proto3.util.equals(PlanJobReply, a, b);
+  }
+}
+
+/**
+ * How one gang task fared in one plan (docs/gang-scheduling.md). The same
+ * shape is `PlanJobReply.gang_reports` for a dry run and `JobBlocked.gang`
+ * for a gang that is waiting, so a client reads one set of fields either way.
+ *
+ * @generated from message legion.GangReport
+ */
+export class GangReport extends Message<GangReport> {
+  /**
+   * The gang task's name.
+   *
+   * @generated from field: string task = 1;
+   */
+  task = "";
+
+  /**
+   * The task's desired replica count in this plan: its `count`, after a
+   * `job scale` override or a rollout's target.
+   *
+   * @generated from field: uint32 desired = 2;
+   */
+  desired = 0;
+
+  /**
+   * The quorum: how many replicas must run together. `gang.min` when set,
+   * else `desired`; never above `desired`.
+   *
+   * @generated from field: uint32 min = 3;
+   */
+  min = 0;
+
+  /**
+   * Replicas of the task already running. 0 for a fresh placement (a submit,
+   * a restart, a dry run); non-zero when the plan tops up a running gang that
+   * lost members.
+   *
+   * @generated from field: uint32 running = 4;
+   */
+  running = 0;
+
+  /**
+   * Replicas the plan could place before the first one that did not fit.
+   * Replicas place one at a time, best node first, so this is how many fit in
+   * the order the scheduler would place them.
+   *
+   * @generated from field: uint32 placeable = 5;
+   */
+  placeable = 0;
+
+  /**
+   * True when `running + placeable` reaches `min`: the plan places the
+   * quorum (and any further replicas that fit). False when it does not: the
+   * plan places nothing at all, and the job waits.
+   *
+   * @generated from field: bool would_place = 6;
+   */
+  wouldPlace = false;
+
+  /**
+   * Schedulable nodes whose constraints, permit, and volume drivers accept
+   * the task, whether or not they have room. 0 points at the jobspec (a
+   * constraint no node satisfies) rather than at capacity.
+   *
+   * @generated from field: uint32 eligible_nodes = 7;
+   */
+  eligibleNodes = 0;
+
+  /**
+   * Schedulable nodes the plan considered.
+   *
+   * @generated from field: uint32 nodes = 8;
+   */
+  nodes = 0;
+
+  /**
+   * Why the first replica that did not fit did not, in the scheduler's words
+   * (capacity, a static port, disk, a pinned node, preemption's diagnosis).
+   * Empty when every replica fit.
+   *
+   * @generated from field: string reason = 9;
+   */
+  reason = "";
+
+  constructor(data?: PartialMessage<GangReport>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.GangReport";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "task", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 2, name: "desired", kind: "scalar", T: 13 /* ScalarType.UINT32 */ },
+    { no: 3, name: "min", kind: "scalar", T: 13 /* ScalarType.UINT32 */ },
+    { no: 4, name: "running", kind: "scalar", T: 13 /* ScalarType.UINT32 */ },
+    { no: 5, name: "placeable", kind: "scalar", T: 13 /* ScalarType.UINT32 */ },
+    { no: 6, name: "would_place", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
+    { no: 7, name: "eligible_nodes", kind: "scalar", T: 13 /* ScalarType.UINT32 */ },
+    { no: 8, name: "nodes", kind: "scalar", T: 13 /* ScalarType.UINT32 */ },
+    { no: 9, name: "reason", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): GangReport {
+    return new GangReport().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): GangReport {
+    return new GangReport().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): GangReport {
+    return new GangReport().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: GangReport | PlainMessage<GangReport> | undefined, b: GangReport | PlainMessage<GangReport> | undefined): boolean {
+    return proto3.util.equals(GangReport, a, b);
   }
 }
 
@@ -10180,6 +10319,16 @@ export class JobBlocked extends Message<JobBlocked> {
    */
   evalId = "";
 
+  /**
+   * Set when the task that could not place is a gang
+   * (docs/gang-scheduling.md): how many of its replicas fit at the last
+   * attempt, against the quorum it must place together. `would_place` is
+   * always false here. Unset for every other task.
+   *
+   * @generated from field: legion.GangReport gang = 7;
+   */
+  gang?: GangReport;
+
   constructor(data?: PartialMessage<JobBlocked>) {
     super();
     proto3.util.initPartial(data, this);
@@ -10194,6 +10343,7 @@ export class JobBlocked extends Message<JobBlocked> {
     { no: 4, name: "message", kind: "scalar", T: 9 /* ScalarType.STRING */ },
     { no: 5, name: "since", kind: "scalar", T: 3 /* ScalarType.INT64 */ },
     { no: 6, name: "eval_id", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 7, name: "gang", kind: "message", T: GangReport },
   ]);
 
   static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): JobBlocked {

@@ -809,7 +809,7 @@ impl RolloutConfig {
     /// Whether the config asks for ordered one-slot-at-a-time updates
     /// (`slots.order: 'sequential'`). Sequential is a progression mode of
     /// its own and is mutually exclusive with the step-mode fields.
-    fn has_sequential_slots(&self) -> bool {
+    pub(crate) fn has_sequential_slots(&self) -> bool {
         self.slots
             .as_ref()
             .is_some_and(RolloutSlotsConfig::is_sequential)
@@ -1463,6 +1463,126 @@ fn parse_percent(raw: &str) -> Option<f64> {
     raw.trim().strip_suffix('%')?.trim().parse::<f64>().ok()
 }
 
+/// A task's `gang` block: its replicas place together or not at all
+/// (`docs/gang-scheduling.md`).
+///
+/// `gang = true` is `{ min = count }`: every replica places in one plan, or
+/// none does and the eval blocks until a plan can place them all. `min`
+/// lowers the quorum: the plan places when at least `min` fit, and the rest
+/// follow as room appears. A running gang tops up the same way — missing
+/// members place together, or wait — and preemption never takes it below
+/// its quorum.
+///
+/// Spelled `true`, `false` (no gang), or `{ min = N }`. It serializes back
+/// to the short form when `min` is unset, like [`TaskCount`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct GangConfig {
+    /// Replicas that must run together. `None` = the task's whole count.
+    pub min: Option<u32>,
+}
+
+impl GangConfig {
+    /// The replicas that must run together for a task whose desired count
+    /// in this pass is `desired`: `min`, capped at `desired`, so a scale-in
+    /// below `min` lowers the quorum with it.
+    pub fn quorum(&self, desired: u32) -> u32 {
+        self.min.unwrap_or(desired).min(desired)
+    }
+
+    /// The floor preemption may not take the gang below. `gang = true`
+    /// protects every member, whatever the task's count is scaled to;
+    /// `min` protects the quorum and leaves the members above it fair game.
+    pub fn preemption_floor(&self) -> u32 {
+        self.min.unwrap_or(u32::MAX)
+    }
+
+    /// Spec-shape rules for a task with this block and `count`.
+    pub fn validate(&self, task: &str, count: u32) -> R<()> {
+        if let Some(min) = self.min {
+            if min == 0 || min > count {
+                bail!(
+                    "task {task} gang.min is {min}, but must be between 1 and the task's count \
+                     ({count}); omit min (or write `gang = true`) to require every replica"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// Parse `true` / `{ min = N }`. `false` and `null` mean no gang and are
+    /// handled by [`deserialize_gang`], which wraps this.
+    fn from_value(value: Value) -> Result<GangConfig, String> {
+        match value {
+            Value::Bool(true) => Ok(GangConfig::default()),
+            Value::Object(fields) => {
+                let mut gang = GangConfig::default();
+                for (key, value) in fields {
+                    match key.as_str() {
+                        "min" => {
+                            let min = value
+                                .as_u64()
+                                .and_then(|min| u32::try_from(min).ok())
+                                .ok_or_else(|| {
+                                    format!("gang.min must be a whole number, got {value}")
+                                })?;
+                            gang.min = Some(min);
+                        }
+                        other => {
+                            return Err(format!(
+                                "unknown field `{other}` in gang, expected `min` \
+                                 (see docs/gang-scheduling.md)"
+                            ))
+                        }
+                    }
+                }
+                Ok(gang)
+            }
+            other => Err(format!(
+                "gang must be true, false, or {{ min = <count> }}, got {other}"
+            )),
+        }
+    }
+}
+
+impl Serialize for GangConfig {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        match self.min {
+            Some(min) => {
+                let mut state = serializer.serialize_struct("GangConfig", 1)?;
+                state.serialize_field("min", &min)?;
+                state.end()
+            }
+            None => serializer.serialize_bool(true),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for GangConfig {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        GangConfig::from_value(Value::deserialize(deserializer)?).map_err(D::Error::custom)
+    }
+}
+
+/// `gang` on a task: `false` and `null` are no gang at all, so a stored or
+/// round-tripped config never carries an empty block.
+fn deserialize_gang<'de, D>(deserializer: D) -> Result<Option<GangConfig>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    match Value::deserialize(deserializer)? {
+        Value::Null | Value::Bool(false) => Ok(None),
+        value => GangConfig::from_value(value)
+            .map(Some)
+            .map_err(D::Error::custom),
+    }
+}
+
 /// Volume names flow into env var names and CLI arguments, so they carry the
 /// same charset restriction instance ids do.
 pub fn validate_volume_name(task: &str, name: &str) -> R<()> {
@@ -1646,6 +1766,16 @@ pub struct TaskConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[tabled(skip)]
     pub disruption: Option<DisruptionConfig>,
+    /// All-or-nothing placement for this task's replicas (see
+    /// `docs/gang-scheduling.md`). None = replicas place independently, and
+    /// a plan places whatever fits.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_gang"
+    )]
+    #[tabled(skip)]
+    pub gang: Option<GangConfig>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[tabled(skip)]
     pub kv_injections: Option<TaskKvInjections>,
@@ -2164,6 +2294,8 @@ struct TaskConfigInput {
     stop: Option<StopConfig>,
     #[serde(default)]
     disruption: Option<DisruptionConfig>,
+    #[serde(default, deserialize_with = "deserialize_gang")]
+    gang: Option<GangConfig>,
     #[serde(default)]
     kv: Option<KvInjectionPolicy>,
     #[serde(default)]
@@ -2307,6 +2439,7 @@ impl TaskConfigInput {
             restart: self.restart,
             stop: self.stop,
             disruption: self.disruption,
+            gang: self.gang,
             kv_injections: Some(if let Some(existing) = self.kv_injections {
                 TaskKvInjections {
                     kv: self.kv.or(existing.kv),
@@ -2526,6 +2659,7 @@ impl TaskConfig {
             restart: None,
             stop: None,
             disruption: None,
+            gang: None,
             kv_injections: None,
             network: None,
             service: None,
@@ -3011,6 +3145,34 @@ impl TaskConfig {
             Some(disruption) => disruption.validate(&self.name),
             None => Ok(()),
         }
+    }
+
+    /// Validate the task's `gang` block (docs/gang-scheduling.md). The rules
+    /// that need the rest of the job — the task's group and its rollout —
+    /// live in `task_plugins::validate_job_config`.
+    pub fn validate_gang(&self) -> R<()> {
+        let Some(gang) = self.gang.as_ref() else {
+            return Ok(());
+        };
+        if self.count.per.is_some() {
+            bail!(
+                "task {} sets gang, which cannot be combined with count.per: a per-attribute \
+                 count has no single membership to place together. Use a fixed count and \
+                 constraints instead",
+                self.name
+            );
+        }
+        if self.stateful.as_ref().is_some_and(|stateful| {
+            matches!(stateful.mode, InstanceMode::Keyed | InstanceMode::Session)
+        }) {
+            bail!(
+                "task {} sets gang, but its stateful mode is keyed: a gang needs a fixed \
+                 membership, and a keyed task's instances come and go through the instance \
+                 API. Slot-mode stateful tasks can be gangs",
+                self.name
+            );
+        }
+        gang.validate(&self.name, self.count.num)
     }
 
     /// Validate declared actions: unique names, well-formed params, and that
@@ -4700,6 +4862,122 @@ mod tests {
         );
         let reparsed: TaskConfig = serde_json::from_value(serialized)?;
         assert_eq!(reparsed.stateful, task.stateful);
+        Ok(())
+    }
+
+    fn gang_task(gang: Value) -> Result<TaskConfig, serde_json::Error> {
+        let spec = serde_json::json!({
+            "name": "trainer",
+            "task": { "runtime": "noop", "count": 8, "gang": gang }
+        });
+        serde_json::from_value::<JobConfig>(spec).map(|config| config.tasks[0].clone())
+    }
+
+    #[test]
+    fn gang_parses_as_a_flag_or_a_quorum_and_round_trips() -> R<()> {
+        let all = gang_task(serde_json::json!(true))?;
+        assert_eq!(all.gang, Some(GangConfig { min: None }));
+        assert_eq!(all.gang.map(|gang| gang.quorum(8)), Some(8));
+        assert_eq!(serde_json::to_value(&all)?["gang"], serde_json::json!(true));
+
+        let quorum = gang_task(serde_json::json!({ "min": 6 }))?;
+        assert_eq!(quorum.gang, Some(GangConfig { min: Some(6) }));
+        assert_eq!(
+            serde_json::to_value(&quorum)?["gang"],
+            serde_json::json!({ "min": 6 })
+        );
+        // The stored form reads back the same.
+        let reparsed: TaskConfig = serde_json::from_value(serde_json::to_value(&quorum)?)?;
+        assert_eq!(reparsed.gang, quorum.gang);
+
+        // `false` is no gang, and leaves nothing behind.
+        let none = gang_task(serde_json::json!(false))?;
+        assert_eq!(none.gang, None);
+        assert!(serde_json::to_value(&none)?.get("gang").is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn gang_rejects_fields_it_does_not_have_yet() {
+        let error = gang_task(serde_json::json!({ "placementTimeout": "30m" }))
+            .expect_err("an unbuilt field is rejected, not ignored");
+        assert!(
+            error
+                .to_string()
+                .contains("unknown field `placementTimeout` in gang"),
+            "{error}"
+        );
+        let error = gang_task(serde_json::json!(8)).expect_err("a number is not a gang");
+        assert!(
+            error.to_string().contains("gang must be true, false"),
+            "{error}"
+        );
+        let error = gang_task(serde_json::json!({ "min": -1 })).expect_err("min is a whole number");
+        assert!(error.to_string().contains("gang.min"), "{error}");
+    }
+
+    #[test]
+    fn the_quorum_follows_a_scaled_count_down() {
+        let gang = GangConfig { min: Some(6) };
+        assert_eq!(gang.quorum(8), 6);
+        assert_eq!(gang.quorum(4), 4, "a scale-in below min lowers the quorum");
+        assert_eq!(GangConfig::default().quorum(10), 10);
+    }
+
+    #[test]
+    fn gang_validation_rejects_what_has_no_fixed_membership() -> R<()> {
+        let mut task = TaskConfig {
+            count: TaskCount::new(8),
+            gang: Some(GangConfig { min: Some(9) }),
+            ..TaskConfig::new("trainer", "noop")
+        };
+        let error = task.validate_gang().expect_err("min above count");
+        assert!(
+            error
+                .to_string()
+                .contains("must be between 1 and the task's count (8)"),
+            "{error}"
+        );
+        task.gang = Some(GangConfig { min: Some(0) });
+        assert!(task.validate_gang().is_err(), "min of zero");
+        task.gang = Some(GangConfig { min: Some(8) });
+        task.validate_gang()?;
+
+        let per = TaskConfig {
+            count: TaskCount::per(2, "zone"),
+            gang: Some(GangConfig::default()),
+            ..TaskConfig::new("trainer", "noop")
+        };
+        let error = per.validate_gang().expect_err("count.per");
+        assert!(error.to_string().contains("count.per"), "{error}");
+
+        let keyed = TaskConfig {
+            gang: Some(GangConfig::default()),
+            stateful: Some(StatefulConfig {
+                mode: InstanceMode::Keyed,
+                require_id: false,
+                initial_instances: None,
+                on_lost: None,
+                storage: None,
+                envelope: None,
+                promote: None,
+                placement: None,
+                fence_after: None,
+            }),
+            ..TaskConfig::new("sandbox", "noop")
+        };
+        let error = keyed.validate_gang().expect_err("keyed");
+        assert!(error.to_string().contains("keyed"), "{error}");
+
+        let slots = TaskConfig {
+            count: TaskCount::new(3),
+            stateful: Some(StatefulConfig {
+                mode: InstanceMode::Slot,
+                ..keyed.stateful.clone().expect("stateful")
+            }),
+            ..keyed.clone()
+        };
+        slots.validate_gang()?;
         Ok(())
     }
 }

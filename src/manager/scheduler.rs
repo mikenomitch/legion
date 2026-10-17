@@ -83,6 +83,132 @@ pub struct UnplacedTask {
     pub blocked: crate::manager::blocked::PlacementBlocked,
 }
 
+/// How a gang task fared in one plan (docs/gang-scheduling.md): the
+/// `job plan` gang report, and the `gang` block of a blocked job's
+/// `Job.blocked`. One shape everywhere, so an agent reads the same fields
+/// from a dry run and from a job that is waiting.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GangReport {
+    pub task_name: String,
+    /// The task's desired replica count in this pass (its count, after a
+    /// `job scale` override or a rollout target).
+    pub desired: u32,
+    /// The quorum: replicas that must run together (`gang.min`, else
+    /// `desired`).
+    pub min: u32,
+    /// Replicas already placed (a top-up); 0 for a fresh placement.
+    pub running: u32,
+    /// Replicas this pass could place, before the first that did not fit.
+    pub placeable: u32,
+    /// Whether the pass reached the quorum. False means the plan placed
+    /// nothing at all and the job waits.
+    pub would_place: bool,
+    /// Nodes whose constraints, permit, and volume drivers accept the task.
+    pub eligible_nodes: u32,
+    /// Schedulable nodes the pass considered.
+    pub nodes: u32,
+    /// Why the first replica that did not fit did not, or empty when every
+    /// replica fit.
+    pub reason: String,
+}
+
+impl GangReport {
+    /// The report as the blocked eval's `detail.gang`.
+    pub fn to_json(&self) -> Value {
+        serde_json::json!({
+            "task": self.task_name,
+            "desired": self.desired,
+            "min": self.min,
+            "running": self.running,
+            "placeable": self.placeable,
+            "wouldPlace": self.would_place,
+            "eligibleNodes": self.eligible_nodes,
+            "nodes": self.nodes,
+            "reason": self.reason,
+        })
+    }
+
+    /// The report back from a blocked eval's `detail.gang`.
+    pub fn from_json(value: &Value) -> Option<Self> {
+        let count = |name: &str| {
+            value
+                .get(name)
+                .and_then(Value::as_u64)
+                .map(|count| count as u32)
+                .unwrap_or(0)
+        };
+        let text = |name: &str| {
+            value
+                .get(name)
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string()
+        };
+        value.is_object().then(|| GangReport {
+            task_name: text("task"),
+            desired: count("desired"),
+            min: count("min"),
+            running: count("running"),
+            placeable: count("placeable"),
+            would_place: value
+                .get("wouldPlace")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+            eligible_nodes: count("eligibleNodes"),
+            nodes: count("nodes"),
+            reason: text("reason"),
+        })
+    }
+
+    /// The wire shape (`PlanJobReply.gang_reports`, `JobBlocked.gang`).
+    pub fn to_proto(&self) -> crate::structs::GangReport {
+        crate::structs::GangReport {
+            task: self.task_name.clone(),
+            desired: self.desired,
+            min: self.min,
+            running: self.running,
+            placeable: self.placeable,
+            would_place: self.would_place,
+            eligible_nodes: self.eligible_nodes,
+            nodes: self.nodes,
+            reason: self.reason.clone(),
+        }
+    }
+
+    /// The sentence a waiting gang blocks with, ahead of the reason its
+    /// first missing replica did not fit.
+    fn waiting_message(&self) -> String {
+        let head = if self.running == 0 && self.min == self.desired {
+            format!(
+                "Gang {} waits: {} of its {} replicas fit, and a gang places all of them \
+                 together or none",
+                self.task_name, self.placeable, self.desired
+            )
+        } else if self.running == 0 {
+            format!(
+                "Gang {} waits: {} of its {} replicas fit, and it places only once at least {} \
+                 (gang.min) fit together",
+                self.task_name, self.placeable, self.desired, self.min
+            )
+        } else {
+            format!(
+                "Gang {} waits: {} of its {} replicas run, the {} more its quorum of {} needs \
+                 must place together, and {} fit",
+                self.task_name,
+                self.running,
+                self.desired,
+                self.min.saturating_sub(self.running),
+                self.min,
+                self.placeable
+            )
+        };
+        format!(
+            "{head} ({} of {} nodes accept the task). {}",
+            self.eligible_nodes, self.nodes, self.reason
+        )
+    }
+}
+
 /// The error a plan returns when it could place nothing at all because no
 /// node has room for any of its placements. Typed so callers can tell a
 /// placement that is blocked (retry when the cluster changes) from a broken
@@ -388,8 +514,12 @@ struct BuiltPlan {
     /// reported through `allocation.preempt_planned` and `job plan`.
     observed_preemptions: Vec<PlannedPreemption>,
     /// Replicas no node had room for (only when the plan allows partial
-    /// placement; otherwise the first such replica fails the plan).
+    /// placement; otherwise the first such replica fails the plan). A gang
+    /// that could not reach its quorum is the only entry, with every
+    /// placement of the plan dropped.
     unplaced: Vec<UnplacedTask>,
+    /// One per gang task the plan tried to place, in task order.
+    gang_reports: Vec<GangReport>,
 }
 
 /// The planned config's own allocations, indexed by node: every node that
@@ -668,9 +798,21 @@ impl PreemptionPass {
                     band: row.band,
                     request,
                     age_secs: row.created_at_unix.map(|created| now_unix - created),
+                    // A gang's quorum is a floor of its own: taking a
+                    // member below it idles every other member, so the
+                    // stricter of the two binds (docs/gang-scheduling.md).
                     min_available: disruption
                         .map(|disruption| disruption.min_available_for(row.task_count))
-                        .unwrap_or(0),
+                        .unwrap_or(0)
+                        .max(
+                            row.gang_json
+                                .as_deref()
+                                .and_then(|raw| {
+                                    serde_json::from_str::<crate::structs::GangConfig>(raw).ok()
+                                })
+                                .map(|gang| gang.preemption_floor())
+                                .unwrap_or(0),
+                        ),
                     task_running: running_by_task
                         .get(&row.task_config_id)
                         .copied()
@@ -1398,6 +1540,18 @@ pub struct PlanConfigOutcome {
     /// for anyone submitting work that outranks something: the submit becomes
     /// a decision rather than a surprise.
     pub preemptions: Vec<PlannedPreemption>,
+    /// One per gang task (docs/gang-scheduling.md). A report with
+    /// `would_place: false` means the plan places nothing: a submit would
+    /// wait, blocked, until the whole quorum fits.
+    pub gang_reports: Vec<GangReport>,
+}
+
+/// A read-only plan of a stored config (`job plan` of an unchanged job).
+pub struct PlanPreview {
+    pub allocations: Vec<PlannedAllocation>,
+    pub index_report: Vec<TaskIndexUsage>,
+    pub preemptions: Vec<PlannedPreemption>,
+    pub gang_reports: Vec<GangReport>,
 }
 
 impl<'a> Scheduler<'a> {
@@ -1469,6 +1623,18 @@ impl<'a> Scheduler<'a> {
         Vec<TaskIndexUsage>,
         Vec<PlannedPreemption>,
     )> {
+        let preview = self.plan_only_preview(job_config_id, mode)?;
+        Ok((
+            preview.allocations,
+            preview.index_report,
+            preview.preemptions,
+        ))
+    }
+
+    /// `plan_only_with_report`, plus a report for each gang task
+    /// (docs/gang-scheduling.md).
+    #[instrument(skip_all)]
+    pub fn plan_only_preview(&self, job_config_id: &str, mode: PlanMode) -> R<PlanPreview> {
         let started = std::time::Instant::now();
         let mode_label = mode.as_str();
         info!(%job_config_id, mode = mode_label, "Starting scheduler plan_only");
@@ -1513,6 +1679,7 @@ impl<'a> Scheduler<'a> {
             evictions,
             observed_preemptions,
             unplaced: _,
+            gang_reports,
         } = self.build_plan(
             job_config_id,
             nodes,
@@ -1548,7 +1715,12 @@ impl<'a> Scheduler<'a> {
         } else {
             evictions
         };
-        Ok((placements, index_report, preemptions))
+        Ok(PlanPreview {
+            allocations: placements,
+            index_report,
+            preemptions,
+            gang_reports,
+        })
     }
 
     /// Takes the plan's capacity snapshot from the read model, optionally
@@ -1708,6 +1880,7 @@ impl<'a> Scheduler<'a> {
             evictions,
             observed_preemptions,
             unplaced: _,
+            gang_reports,
         } = self.build_plan(
             &job_config.id(),
             nodes,
@@ -1745,6 +1918,7 @@ impl<'a> Scheduler<'a> {
             } else {
                 evictions
             },
+            gang_reports,
         })
     }
 
@@ -1924,6 +2098,7 @@ impl<'a> Scheduler<'a> {
             evictions,
             observed_preemptions,
             unplaced,
+            gang_reports: _,
         } = self.build_plan(
             job_config_id,
             nodes,
@@ -2245,7 +2420,16 @@ impl<'a> Scheduler<'a> {
             else {
                 continue;
             };
-            let withhold = (*held).min(*required);
+            // A gang tops up all its missing members together, so one held
+            // member holds the whole top-up: placing the others now would
+            // let the backoff split a gang that capacity never could. The
+            // delayed reschedule of the last hold to lapse places them all
+            // (docs/gang-scheduling.md).
+            let withhold = if *held > 0 && task.gang.is_some() {
+                *required
+            } else {
+                (*held).min(*required)
+            };
             if withhold == 0 {
                 continue;
             }
@@ -2318,6 +2502,7 @@ impl<'a> Scheduler<'a> {
     ) -> R<BuiltPlan> {
         tasks.sort_by_key(|a| a.0);
         let mut unplaced: Vec<UnplacedTask> = Vec::new();
+        let mut gang_reports: Vec<GangReport> = Vec::new();
         // Preemption state for the whole plan: floors bind across placements,
         // and the victim index loads at most once (and only if a placement
         // actually fails for capacity).
@@ -2371,6 +2556,13 @@ impl<'a> Scheduler<'a> {
         };
         let existing_alloc_counts_by_task_node =
             Self::existing_alloc_counts_by_task_node(&own_by_node);
+        // A gang's running members, for its quorum. A Fresh plan replaces
+        // the job wholesale, so nothing of it counts as running.
+        let running_by_task = if matches!(mode, PlanMode::Reschedule) {
+            Self::existing_alloc_counts_by_task(&own_by_node)
+        } else {
+            HashMap::new()
+        };
         // The by-id lookup is the cached one: building a map over every
         // available node here, per plan, was O(fleet) on every eval.
         let node_lookup: &AvailableNodes = &node_set;
@@ -2525,7 +2717,7 @@ impl<'a> Scheduler<'a> {
             }
         }
 
-        for (task_id, task_config, _desired_count) in tasks {
+        for (task_id, task_config, desired_count) in tasks {
             let needed = required_counts.get(&task_id).copied().unwrap_or(0);
             let per_key = task_config.count.per.as_deref();
             if needed == 0 && per_key.is_none() {
@@ -2660,7 +2852,15 @@ impl<'a> Scheduler<'a> {
                 } else {
                     base_eligible.as_slice()
                 };
-                self.place_task_allocations(
+                // A gang records its own shortfall instead of failing or
+                // placing partially, so the quorum check below sees how far
+                // it got. Submit validation keeps gangs out of multi-task
+                // groups (which place all or nothing on one node anyway) and
+                // away from `count.per`.
+                let gang = task_config.gang.filter(|_| group_key.is_none());
+                let placed_before = placements.len();
+                let mut gang_unplaced: Vec<UnplacedTask> = Vec::new();
+                let placed = self.place_task_allocations(
                     needed,
                     task_id,
                     &task_config,
@@ -2686,8 +2886,110 @@ impl<'a> Scheduler<'a> {
                     candidates_setting,
                     &mut preemption_pass,
                     &mut port_ledger,
-                    applying.then_some(&mut unplaced),
-                )?;
+                    if gang.is_some() {
+                        Some(&mut gang_unplaced)
+                    } else {
+                        applying.then_some(&mut unplaced)
+                    },
+                );
+                let Some(gang) = gang else {
+                    placed?;
+                    index_report.push(plan.index_usage.clone());
+                    continue;
+                };
+                index_report.push(plan.index_usage.clone());
+                // The first replica that did not fit, and why. A bail site
+                // that fails outright (disk, checkpoint room) is a shortfall
+                // like any other when it is a placement block; anything else
+                // is a broken job and fails the plan.
+                let shortfall = match placed {
+                    Ok(()) => gang_unplaced.into_iter().next(),
+                    Err(error) => {
+                        let Some(blocked) =
+                            crate::manager::blocked::PlacementBlocked::in_chain(&error).cloned()
+                        else {
+                            return Err(error);
+                        };
+                        Some(UnplacedTask {
+                            task_config_id: task_id,
+                            task_name: task_config.name.clone(),
+                            count: 0,
+                            reason: blocked.message.clone(),
+                            static_port: error
+                                .downcast_ref::<PlacementBlocked>()
+                                .and_then(PlacementBlocked::static_port),
+                            blocked,
+                        })
+                    }
+                };
+                let running = running_by_task.get(&task_id).copied().unwrap_or(0);
+                let placed_now = placements[placed_before..]
+                    .iter()
+                    .filter(|placement| placement.task_config_id == task_id)
+                    .count() as u32;
+                let quorum = gang.quorum(desired_count);
+                let mut report = GangReport {
+                    task_name: task_config.name.clone(),
+                    desired: desired_count,
+                    min: quorum,
+                    running,
+                    placeable: placed_now,
+                    would_place: true,
+                    eligible_nodes: base_eligible.len() as u32,
+                    nodes: nodes.len() as u32,
+                    reason: String::new(),
+                };
+                let Some(mut shortfall) = shortfall else {
+                    gang_reports.push(report);
+                    continue;
+                };
+                report.reason = shortfall.reason.clone();
+                if running + placed_now >= quorum {
+                    // The quorum runs: the rest of the gang is ordinary
+                    // unplaced work, placed by whichever pass next has room.
+                    shortfall.count = needed.saturating_sub(placed_now);
+                    if applying {
+                        unplaced.push(shortfall);
+                    }
+                    gang_reports.push(report);
+                    continue;
+                }
+                // Short of the quorum: the plan places nothing at all — not
+                // this gang's members, not the job's other tasks, no
+                // evictions — and the eval blocks on what kept the first
+                // missing replica out (docs/gang-scheduling.md).
+                report.would_place = false;
+                let message = report.waiting_message();
+                let mut blocked = shortfall.blocked;
+                blocked.message = message.clone();
+                if let Some(detail) = blocked.detail.as_object_mut() {
+                    detail.insert("message".to_string(), Value::String(message.clone()));
+                    detail.insert("gang".to_string(), report.to_json());
+                }
+                info!(
+                    task = %task_config.name,
+                    desired = report.desired,
+                    min = report.min,
+                    running = report.running,
+                    placeable = report.placeable,
+                    "Gang short of its quorum; the plan places nothing"
+                );
+                gang_reports.push(report);
+                return Ok(BuiltPlan {
+                    placements: Vec::new(),
+                    index_report,
+                    evictions: Vec::new(),
+                    observed_preemptions: preemption_pass.observed,
+                    unplaced: vec![UnplacedTask {
+                        task_config_id: task_id,
+                        task_name: task_config.name.clone(),
+                        count: needed,
+                        reason: message,
+                        static_port: shortfall.static_port,
+                        blocked,
+                    }],
+                    gang_reports,
+                });
             }
             index_report.push(plan.index_usage.clone());
         }
@@ -2705,6 +3007,7 @@ impl<'a> Scheduler<'a> {
             evictions: preemption_pass.victims,
             observed_preemptions: preemption_pass.observed,
             unplaced,
+            gang_reports,
         })
     }
 
@@ -3135,12 +3438,16 @@ impl<'a> Scheduler<'a> {
         // Stateful tasks can carry pins too (a node-local `stateful.storage`
         // volume, or a restore from a `local` snapshot), and a truncated list
         // that leaves out the pinned node fails the placement as if the node
-        // were gone.
+        // were gone. A gang needs the whole list for the opposite reason:
+        // "the gang does not fit" defers the whole plan, and only a list
+        // that saw every eligible node can prove a negative
+        // (docs/gang-scheduling.md).
         let allow_truncation = index_armed
             && task_config.count.per.is_none()
             && constraint_set.distinct_keys().is_empty()
             && task_config.volumes.is_empty()
             && task_config.stateful.is_none()
+            && task_config.gang.is_none()
             && !in_multi_task_group;
 
         let base_eligible = if index_armed {
@@ -10673,6 +10980,377 @@ mod tests {
         );
         // A dry run must not touch anything.
         assert_eq!(store.allocs_for_node("node-a")?.len(), 2);
+        Ok(())
+    }
+
+    //
+    // GANG SCHEDULING (docs/gang-scheduling.md)
+    //
+
+    /// A job of `count` 256 MiB `worker` replicas with `gang` set, in `band`.
+    fn gang_job(
+        name: &str,
+        band: Band,
+        count: u32,
+        gang: Option<crate::structs::GangConfig>,
+    ) -> JobConfig {
+        JobConfig {
+            priority: band,
+            rollout: None,
+            rollout_by_group: Default::default(),
+            name: name.into(),
+            tasks: vec![TaskConfig {
+                count: TaskCount::new(count),
+                resources: json!({ "memory": 256 }),
+                gang,
+                group: "worker".into(),
+                ..TaskConfig::new("worker", "noop")
+            }],
+            version: None,
+        }
+    }
+
+    fn submit_config(store: &Store, job: &JobConfig) -> R<String> {
+        store.handle_job_submit(job, &[dummy_submission()])?;
+        Ok(store.get_job_config(&job.name)?.id())
+    }
+
+    fn whole_gang() -> Option<crate::structs::GangConfig> {
+        Some(crate::structs::GangConfig::default())
+    }
+
+    fn gang_detail(error: &anyhow::Error) -> Value {
+        crate::manager::blocked::PlacementBlocked::in_chain(error)
+            .map(|blocked| blocked.detail["gang"].clone())
+            .unwrap_or(Value::Null)
+    }
+
+    /// Room for two of three: without `gang` the plan places two (partial
+    /// placement); with it, the plan places nothing and blocks, saying how
+    /// far it got.
+    #[test]
+    fn a_gang_that_does_not_fit_places_nothing_and_blocks() -> R<()> {
+        let store = setup_store()?;
+        small_node(&store, "node-a")?;
+        let scheduler = Scheduler::new(&store)?;
+
+        let plain = submit_config(&store, &gang_job("plain", Band::Normal, 3, None))?;
+        let outcome = scheduler.plan_and_apply(&plain, PlanMode::Fresh)?;
+        assert_eq!(outcome.allocations.len(), 2, "a plain job places what fits");
+        store.remove_allocs_for_job("plain")?;
+
+        let trainer = submit_config(&store, &gang_job("trainer", Band::Normal, 3, whole_gang()))?;
+        let error = scheduler
+            .plan_and_apply(&trainer, PlanMode::Fresh)
+            .expect_err("a gang short of its quorum places nothing");
+        let blocked = crate::manager::blocked::PlacementBlocked::in_chain(&error)
+            .context("the eval blocks instead of failing")?;
+        assert_eq!(blocked.key, "class:pool=default");
+        assert!(
+            blocked
+                .message
+                .starts_with("Gang worker waits: 2 of its 3 replicas fit"),
+            "{}",
+            blocked.message
+        );
+        assert!(
+            blocked.message.contains("no available nodes matching"),
+            "the first missing replica's reason follows: {}",
+            blocked.message
+        );
+        let gang = gang_detail(&error);
+        assert_eq!(gang["desired"], 3);
+        assert_eq!(gang["min"], 3);
+        assert_eq!(gang["placeable"], 2);
+        assert_eq!(gang["running"], 0);
+        assert_eq!(gang["wouldPlace"], false);
+        assert_eq!(gang["eligibleNodes"], 1);
+        assert_eq!(gang["nodes"], 1);
+        assert!(
+            store.allocs_for_node("node-a")?.is_empty(),
+            "a waiting gang holds nothing"
+        );
+        Ok(())
+    }
+
+    /// The plan stays one unit: a gang short of its quorum keeps the job's
+    /// other tasks from placing in the same pass, and nothing is committed.
+    #[test]
+    fn a_short_gang_holds_back_its_whole_job() -> R<()> {
+        let store = setup_store()?;
+        small_node(&store, "node-a")?;
+        let mut job = gang_job("trainer", Band::Normal, 3, whole_gang());
+        job.tasks.insert(
+            0,
+            TaskConfig {
+                resources: json!({ "memory": 256 }),
+                group: "dashboard".into(),
+                ..TaskConfig::new("dashboard", "noop")
+            },
+        );
+        let trainer = submit_config(&store, &job)?;
+        let scheduler = Scheduler::new(&store)?;
+        let error = scheduler
+            .plan_and_apply(&trainer, PlanMode::Fresh)
+            .expect_err("the gang defers the plan");
+        assert_eq!(gang_detail(&error)["task"], "worker");
+        assert!(
+            store.allocs_for_node("node-a")?.is_empty(),
+            "the dashboard that fit was not placed either"
+        );
+        Ok(())
+    }
+
+    /// `gang.min` is the quorum: two of three fit, the plan places them, and
+    /// the third is ordinary unplaced work.
+    #[test]
+    fn a_gang_places_once_its_quorum_fits() -> R<()> {
+        let store = setup_store()?;
+        small_node(&store, "node-a")?;
+        let trainer = submit_config(
+            &store,
+            &gang_job(
+                "trainer",
+                Band::Normal,
+                3,
+                Some(crate::structs::GangConfig { min: Some(2) }),
+            ),
+        )?;
+        let scheduler = Scheduler::new(&store)?;
+        let outcome = scheduler.plan_and_apply(&trainer, PlanMode::Fresh)?;
+        assert_eq!(outcome.allocations.len(), 2);
+        assert_eq!(outcome.unplaced.len(), 1);
+        assert_eq!(outcome.unplaced[0].count, 1);
+
+        // With room for only one, the quorum of two is not met.
+        let store = setup_store()?;
+        store.insert_node(make_node_msg_with_sources(
+            "node-a",
+            json!({}),
+            json!({
+                "memory_total": "268435456",
+                "cpus": { "cpu-1": { "frequency": "1000" } }
+            }),
+            json!({}),
+        ))?;
+        let trainer = submit_config(
+            &store,
+            &gang_job(
+                "trainer",
+                Band::Normal,
+                3,
+                Some(crate::structs::GangConfig { min: Some(2) }),
+            ),
+        )?;
+        let error = Scheduler::new(&store)?
+            .plan_and_apply(&trainer, PlanMode::Fresh)
+            .expect_err("one of a quorum of two is not enough");
+        assert!(
+            error
+                .to_string()
+                .contains("it places only once at least 2 (gang.min) fit together"),
+            "{error}"
+        );
+        assert!(store.allocs_for_node("node-a")?.is_empty());
+        Ok(())
+    }
+
+    /// A running gang that lost members tops up all of them or none: one
+    /// of two missing replicas fitting is not enough, and the survivor keeps
+    /// running while the top-up waits.
+    #[test]
+    fn a_gang_tops_up_all_or_nothing() -> R<()> {
+        let store = setup_store()?;
+        for id in ["node-a", "node-b"] {
+            small_node(&store, id)?;
+        }
+        let scheduler = Scheduler::new(&store)?;
+        let trainer = submit_config(&store, &gang_job("trainer", Band::Normal, 4, whole_gang()))?;
+        assert_eq!(
+            scheduler
+                .plan_and_apply(&trainer, PlanMode::Fresh)?
+                .allocations
+                .len(),
+            4
+        );
+
+        // Two members go; another job takes one of the freed slots.
+        let lost: Vec<Allocation> = store
+            .allocs_for_node("node-a")?
+            .into_iter()
+            .filter(|allocation| allocation.job_id == "trainer")
+            .collect();
+        assert_eq!(lost.len(), 2);
+        store.remove_allocations(&lost, crate::structs::StopCause::NodeLost)?;
+        let filler = submit_config(&store, &gang_job("filler", Band::Normal, 1, None))?;
+        scheduler.plan_and_apply(&filler, PlanMode::Fresh)?;
+
+        let error = scheduler
+            .plan_and_apply(&trainer, PlanMode::Reschedule)
+            .expect_err("one of two missing members fits, which is not a gang");
+        let gang = gang_detail(&error);
+        assert_eq!(gang["running"], 2);
+        assert_eq!(gang["placeable"], 1);
+        assert_eq!(gang["min"], 4);
+        assert!(
+            error.to_string().contains("2 of its 4 replicas run"),
+            "{error}"
+        );
+        let running = |store: &Store| -> R<usize> {
+            let mut count = 0;
+            for id in ["node-a", "node-b"] {
+                count += store
+                    .allocs_for_node(id)?
+                    .iter()
+                    .filter(|allocation| allocation.job_id == "trainer")
+                    .count();
+            }
+            Ok(count)
+        };
+        assert_eq!(running(&store)?, 2, "the survivors run; nothing was added");
+
+        // The filler leaves: both missing members place together.
+        store.remove_allocs_for_job("filler")?;
+        let outcome = scheduler.plan_and_apply(&trainer, PlanMode::Reschedule)?;
+        assert_eq!(outcome.allocations.len(), 2);
+        assert_eq!(running(&store)?, 4);
+        Ok(())
+    }
+
+    /// A dry run answers "would the whole gang fit right now" as a report,
+    /// not an error, and a gang that would wait plans no placements.
+    #[test]
+    fn a_dry_run_reports_whether_each_gang_would_place() -> R<()> {
+        let store = setup_store()?;
+        small_node(&store, "node-a")?;
+        let scheduler = Scheduler::new(&store)?;
+
+        let preview = scheduler.plan_for_config(
+            &gang_job("trainer", Band::Normal, 3, whole_gang()),
+            PlanMode::Fresh,
+            None,
+        )?;
+        assert!(
+            preview.allocations.is_empty(),
+            "a waiting gang places nothing"
+        );
+        assert_eq!(preview.gang_reports.len(), 1);
+        let report = &preview.gang_reports[0];
+        assert!(!report.would_place);
+        assert_eq!(report.placeable, 2);
+        assert_eq!(report.min, 3);
+        assert_eq!(report.desired, 3);
+        assert_eq!(report.eligible_nodes, 1);
+        assert!(!report.reason.is_empty());
+
+        small_node(&store, "node-b")?;
+        let scheduler = Scheduler::new(&store)?;
+        let preview = scheduler.plan_for_config(
+            &gang_job("trainer", Band::Normal, 3, whole_gang()),
+            PlanMode::Fresh,
+            None,
+        )?;
+        assert_eq!(preview.allocations.len(), 3);
+        assert!(preview.gang_reports[0].would_place);
+        assert_eq!(preview.gang_reports[0].placeable, 3);
+        assert!(preview.gang_reports[0].reason.is_empty());
+
+        // The stored config's preview agrees with what a submit then does.
+        let trainer = submit_config(&store, &gang_job("trainer", Band::Normal, 3, whole_gang()))?;
+        let stored = scheduler.plan_only_preview(&trainer, PlanMode::Fresh)?;
+        assert!(stored.gang_reports[0].would_place);
+        assert_eq!(
+            scheduler
+                .plan_and_apply(&trainer, PlanMode::Fresh)?
+                .allocations
+                .len(),
+            3
+        );
+        Ok(())
+    }
+
+    /// Preemption never takes a gang below its quorum: evicting one member
+    /// would idle the rest. With `min` below the count, the members above
+    /// the quorum are fair game.
+    #[test]
+    fn preemption_never_takes_a_gang_below_its_quorum() -> R<()> {
+        let store = setup_store()?;
+        small_node(&store, "node-a")?;
+        let scheduler = Scheduler::new(&store)?;
+        let gang = submit_config(&store, &gang_job("trainer", Band::Low, 2, whole_gang()))?;
+        scheduler.plan_and_apply(&gang, PlanMode::Fresh)?;
+        age_allocations(&store)?;
+
+        let api = submit_banded(&store, "api", Band::High, 1, None)?;
+        let error = scheduler
+            .plan_and_apply(&api, PlanMode::Fresh)
+            .expect_err("the whole gang is under its floor");
+        assert!(
+            error.to_string().contains("disruption.minAvailable"),
+            "the floor is named: {error}"
+        );
+        assert_eq!(store.allocs_for_node("node-a")?.len(), 2);
+
+        // A quorum of one: one member may go.
+        let store = setup_store()?;
+        small_node(&store, "node-a")?;
+        let scheduler = Scheduler::new(&store)?;
+        let gang = submit_config(
+            &store,
+            &gang_job(
+                "trainer",
+                Band::Low,
+                2,
+                Some(crate::structs::GangConfig { min: Some(1) }),
+            ),
+        )?;
+        scheduler.plan_and_apply(&gang, PlanMode::Fresh)?;
+        age_allocations(&store)?;
+        let api = submit_banded(&store, "api", Band::High, 1, None)?;
+        let outcome = scheduler.plan_and_apply(&api, PlanMode::Fresh)?;
+        assert_eq!(outcome.evictions.len(), 1);
+        Ok(())
+    }
+
+    /// A reschedule backoff on one member holds the whole top-up: placing
+    /// the unheld members now would split a gang through the side door.
+    #[test]
+    fn a_held_member_holds_the_whole_gang_top_up() -> R<()> {
+        let store = setup_store()?;
+        for id in ["node-a", "node-b"] {
+            small_node(&store, id)?;
+        }
+        let scheduler = Scheduler::new(&store)?;
+        let trainer = submit_config(&store, &gang_job("trainer", Band::Normal, 4, whole_gang()))?;
+        scheduler.plan_and_apply(&trainer, PlanMode::Fresh)?;
+        let members = store.allocs_for_node("node-a")?;
+        assert_eq!(members.len(), 2);
+
+        // One member fails (its replacement waits out the move delay); the
+        // other is simply gone.
+        store
+            .remove_failed_allocation(
+                members[0].id,
+                crate::structs::StopCause::Unknown,
+                None,
+                crate::storage::store::FailedMove {
+                    policy: crate::storage::store::MovePolicy {
+                        move_delay_ms: 30_000,
+                        move_count: None,
+                        move_period_ms: 3_600_000,
+                    },
+                    reason: "exit status 1".into(),
+                },
+            )?
+            .context("removed")?;
+        store.remove_allocations(&members[1..], crate::structs::StopCause::NodeLost)?;
+
+        let outcome = scheduler.plan_and_apply(&trainer, PlanMode::Reschedule)?;
+        assert!(
+            outcome.allocations.is_empty(),
+            "neither missing member places while one is held"
+        );
+        assert_eq!(outcome.backoff_held, vec!["worker (2)".to_string()]);
         Ok(())
     }
 }

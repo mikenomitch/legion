@@ -2039,6 +2039,11 @@ fn migration_list() -> Vec<M<'static>> {
         );",
         )
         .down("DROP TABLE IF EXISTS cluster_ca_record;"),
+        // Gang scheduling (docs/gang-scheduling.md): `task_config.gang` is the
+        // task's `gang` block, `true` or `{"min":N}`, NULL when the task is
+        // not a gang. Appended at the end, since raft changesets bind columns
+        // by position. Control lane, like the rest of `task_config`.
+        M::up("ALTER TABLE task_config ADD COLUMN gang TEXT;").down(""),
     ]
 }
 

@@ -1791,9 +1791,13 @@ fn build_group_plans(
         let mut tasks = Vec::new();
         let mut base_count = 0;
         let mut slot_task: Option<(String, u32)> = None;
+        let mut gang_group = false;
         for name in task_names {
             let new_entry = new_tasks.get(&name).cloned();
             let old_entry = old_tasks.get(&name).cloned();
+            gang_group |= new_entry
+                .as_ref()
+                .is_some_and(|(_, task)| task.gang.is_some());
 
             // Keyed-mode stateful tasks are not driven by count.num: their
             // desired count is the number of live instances created via the
@@ -1896,9 +1900,16 @@ fn build_group_plans(
             _ => None,
         };
         // Sequential groups define their own one-slot-per-step progression
-        // (taking precedence over any plugin-injected step mode).
+        // (taking precedence over any plugin-injected step mode). A gang
+        // group replaces in one step whatever the config says: its replicas
+        // place as one unit, so a step that updates some of them is a broken
+        // gang, not a canary. Validation rejects a multi-step config for a
+        // gang group; this covers the steps a strategy plugin injects after
+        // validation, and a scale-out that grows a `countEachStep` rollout
+        // past one step (docs/gang-scheduling.md).
         let step_fractions = match sequential_slots.as_ref() {
             Some(slots) => sequential_step_fractions(slots.count, slots.update_from),
+            None if gang_group => vec![1.0],
             None => step_fractions_for_rollout(&effective_rollout, base_count.max(1)),
         };
         plans.push(GroupPlan {

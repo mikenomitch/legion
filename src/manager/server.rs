@@ -5054,79 +5054,110 @@ impl Manager for ManagerDaemonService {
             .map(|existing| artifact_pin_diffs(existing, &config))
             .unwrap_or_default();
 
-        let (plan, task_lookup, index_report, preemptions, message, matches_existing, same_content) =
-            match existing_config {
-                Some(existing) if existing.is_same_as(&config) => {
-                    let (plan, index_report, preemptions) = scheduler
-                        .plan_only_with_report(&existing.id(), PlanMode::Fresh)
-                        .map_err(|e| {
-                            error!("Error planning job {}: {:?}", existing.name, e);
-                            Status::invalid_argument(format!("Error planning job: {e}"))
-                        })?;
-                    let task_configs =
-                        self.store
-                            .get_task_configs_for_job_config(&existing.id())
-                            .map_err(|e| map_store_error("Error getting task configs", e))?;
-                    let task_lookup = task_configs
-                        .into_iter()
-                        .map(|(id, task)| (id, task.name))
-                        .collect::<HashMap<_, _>>();
+        let (
+            plan,
+            task_lookup,
+            index_report,
+            preemptions,
+            gang_reports,
+            message,
+            matches_existing,
+            same_content,
+        ) = match existing_config {
+            Some(existing) if existing.is_same_as(&config) => {
+                let crate::manager::scheduler::PlanPreview {
+                    allocations: plan,
+                    index_report,
+                    preemptions,
+                    gang_reports,
+                } = scheduler
+                    .plan_only_preview(&existing.id(), PlanMode::Fresh)
+                    .map_err(|e| {
+                        error!("Error planning job {}: {:?}", existing.name, e);
+                        Status::invalid_argument(format!("Error planning job: {e}"))
+                    })?;
+                let task_configs = self
+                    .store
+                    .get_task_configs_for_job_config(&existing.id())
+                    .map_err(|e| map_store_error("Error getting task configs", e))?;
+                let task_lookup = task_configs
+                    .into_iter()
+                    .map(|(id, task)| (id, task.name))
+                    .collect::<HashMap<_, _>>();
 
-                    (
-                        plan,
-                        task_lookup,
-                        index_report,
-                        preemptions,
-                        "Job config unchanged; showing force-reschedule placements".to_string(),
-                        true,
-                        true,
-                    )
-                }
-                Some(_existing) => {
-                    let PlanConfigOutcome {
-                        allocations,
-                        task_lookup,
-                        index_report,
-                        preemptions,
-                    } = scheduler
-                        .plan_for_config(&config, PlanMode::Fresh, Some(&config.name))
-                        .map_err(|e| {
-                            error!("Error planning updated job {}: {:?}", config.name, e);
-                            Status::invalid_argument(format!("Error planning job: {e}"))
-                        })?;
-                    (
-                        allocations,
-                        task_lookup,
-                        index_report,
-                        preemptions,
-                        "Job config changed; showing updated placements".to_string(),
-                        true,
-                        false,
-                    )
-                }
-                None => {
-                    let PlanConfigOutcome {
-                        allocations,
-                        task_lookup,
-                        index_report,
-                        preemptions,
-                    } = scheduler
-                        .plan_for_config(&config, PlanMode::Fresh, None)
-                        .map_err(|e| {
-                            error!("Error planning new job {}: {:?}", config.name, e);
-                            Status::invalid_argument(format!("Error planning job: {e}"))
-                        })?;
-                    (
-                        allocations,
-                        task_lookup,
-                        index_report,
-                        preemptions,
-                        "Job config new; showing placements".to_string(),
-                        false,
-                        false,
-                    )
-                }
-            };
+                (
+                    plan,
+                    task_lookup,
+                    index_report,
+                    preemptions,
+                    gang_reports,
+                    "Job config unchanged; showing force-reschedule placements".to_string(),
+                    true,
+                    true,
+                )
+            }
+            Some(_existing) => {
+                let PlanConfigOutcome {
+                    allocations,
+                    task_lookup,
+                    index_report,
+                    preemptions,
+                    gang_reports,
+                } = scheduler
+                    .plan_for_config(&config, PlanMode::Fresh, Some(&config.name))
+                    .map_err(|e| {
+                        error!("Error planning updated job {}: {:?}", config.name, e);
+                        Status::invalid_argument(format!("Error planning job: {e}"))
+                    })?;
+                (
+                    allocations,
+                    task_lookup,
+                    index_report,
+                    preemptions,
+                    gang_reports,
+                    "Job config changed; showing updated placements".to_string(),
+                    true,
+                    false,
+                )
+            }
+            None => {
+                let PlanConfigOutcome {
+                    allocations,
+                    task_lookup,
+                    index_report,
+                    preemptions,
+                    gang_reports,
+                } = scheduler
+                    .plan_for_config(&config, PlanMode::Fresh, None)
+                    .map_err(|e| {
+                        error!("Error planning new job {}: {:?}", config.name, e);
+                        Status::invalid_argument(format!("Error planning job: {e}"))
+                    })?;
+                (
+                    allocations,
+                    task_lookup,
+                    index_report,
+                    preemptions,
+                    gang_reports,
+                    "Job config new; showing placements".to_string(),
+                    false,
+                    false,
+                )
+            }
+        };
+        // A gang short of its quorum is the plan's answer, not an error: the
+        // job would wait, holding nothing, until the whole quorum fits
+        // (docs/gang-scheduling.md). Say so first.
+        let message = match gang_reports.iter().find(|report| !report.would_place) {
+            Some(report) => format!(
+                "Job would wait (blocked) and place nothing yet: gang {} needs {} replicas \
+                 together and {} fit now\n{message}",
+                report.task_name,
+                report.min.saturating_sub(report.running),
+                report.placeable
+            ),
+            None => message,
+        };
 
         let allocations = plan
             .into_iter()
@@ -5192,6 +5223,10 @@ impl Manager for ManagerDaemonService {
                 .gated_egress_submit_warnings(&config)
                 .into_iter()
                 .chain(crate::task_plugins::container_security_warnings(&config))
+                .collect(),
+            gang_reports: gang_reports
+                .iter()
+                .map(crate::manager::scheduler::GangReport::to_proto)
                 .collect(),
         };
 
@@ -12356,10 +12391,16 @@ fn build_rollout_group_status(
                         .is_some_and(|stateful| stateful.mode == InstanceMode::Slot)
             })
             .map(|task| task.count.num);
+        // A gang group replaces in one step, as the engine runs it.
+        let gang_group = to_config
+            .tasks
+            .iter()
+            .any(|task| task.group == group && task.gang.is_some());
         let total_steps = match (effective_rollout.slots.as_ref(), slot_count) {
             (Some(slots), Some(count)) if slots.is_sequential() => {
                 sequential_step_fractions(count, slots.update_from.unwrap_or(0)).len() as u32
             }
+            _ if gang_group => 1,
             _ => step_fractions_for_rollout(&effective_rollout, base_count).len() as u32,
         };
 

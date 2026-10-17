@@ -102,7 +102,16 @@ impl BlockedEval {
                 .map(|at| at.unix_timestamp())
                 .unwrap_or_default(),
             eval_id: self.id.clone(),
+            gang: self.gang().map(|report| report.to_proto()),
         }
+    }
+
+    /// The gang report a gang that could not reach its quorum blocked with
+    /// (docs/gang-scheduling.md); `None` for every other blocked eval.
+    pub fn gang(&self) -> Option<crate::manager::scheduler::GangReport> {
+        self.detail
+            .get("gang")
+            .and_then(crate::manager::scheduler::GangReport::from_json)
     }
 }
 
@@ -436,7 +445,8 @@ impl Store {
             }
         }
         self.lock_capacity_events().processed = upto;
-        self.publish_blocked_gauge(&blocked, woken.len());
+        let woken_ids: HashSet<&str> = woken.iter().map(|(eval, _, _)| eval.id.as_str()).collect();
+        self.publish_blocked_gauge(&blocked, &woken_ids);
         Ok(woken.len())
     }
 
@@ -472,9 +482,9 @@ impl Store {
         Ok(blocked.len())
     }
 
-    /// `legion_evals_blocked{key_kind}` after a pass that woke some of
-    /// `blocked`.
-    fn publish_blocked_gauge(&self, blocked: &[BlockedEval], woken: usize) {
+    /// `legion_evals_blocked{key_kind}` and `legion_gang_blocked_jobs` after a
+    /// pass that woke `woken` of `blocked`.
+    fn publish_blocked_gauge(&self, blocked: &[BlockedEval], woken: &HashSet<&str>) {
         let mut counts: BTreeMap<&'static str, i64> = [("class", 0), ("node", 0), ("escaped", 0)]
             .into_iter()
             .collect();
@@ -482,7 +492,7 @@ impl Store {
             *counts.entry(key_kind(&eval.key)).or_default() += 1;
         }
         // The woken ones are pending now; a later pass recounts exactly.
-        let mut remaining = woken as i64;
+        let mut remaining = woken.len() as i64;
         for count in counts.values_mut() {
             let take = remaining.min(*count);
             *count -= take;
@@ -492,6 +502,14 @@ impl Store {
         for (kind, count) in counts {
             gauge.set(&[kind], count);
         }
+        // The gangs still blocked after this pass.
+        let gangs = blocked
+            .iter()
+            .filter(|eval| !woken.contains(eval.id.as_str()) && eval.gang().is_some())
+            .count();
+        crate::manager::telemetry::metrics()
+            .gang_blocked_jobs
+            .set(gangs as i64);
     }
 
     fn unblock_evals_apply(

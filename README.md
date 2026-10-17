@@ -112,7 +112,9 @@ sandboxes.
   [`noop` example](plugins/tasks/noop/src/lib.rs) is under 100 lines.
 - **Any kind of workload.** Long-running services, batch jobs, sidecars, and
   [stateful workloads](docs/stateful-workloads.md) with stable identity and
-  [volumes](docs/volumes.md).
+  [volumes](docs/volumes.md). Distributed jobs set
+  [`gang`](docs/gang-scheduling.md) so their replicas start all at once or
+  wait, holding nothing, until they can.
 - **A built-in DAG system.** Tasks declare `dependsOn` to form a
   [dependency graph](docs/jobs-tasks-and-scheduling.md), gated on another
   task starting, completing, or succeeding. Dependencies can span groups
@@ -374,7 +376,6 @@ add:
 - **Submission middleware.** Modify or gate job submissions.
 - **Something akin to Kubernetes controllers.** Extend Legion with your own
   reconcile loops.
-- **Gang scheduling.** Place a group of tasks all at once or not at all.
 - **More runtimes.** WASM or remote serverless workloads, for example.
 - **Namespaces, multi-cluster federation, and Windows support.**
 
@@ -393,6 +394,7 @@ start:
 - **Running workloads:** [Task Runtimes](docs/task-runtime-plugins.md) ·
   [Artifacts](docs/artifacts.md) · [Rollouts](docs/rollouts.md) ·
   [Scaling Jobs](docs/autoscaling.md) ·
+  [Gang Scheduling](docs/gang-scheduling.md) ·
   [Task Supervision](docs/task-supervision.md) ·
   [Resource Enforcement](docs/resource-enforcement.md)
 - **Sandboxes:** [Sandbox Runtime](docs/task-runtime-sandbox.md) ·

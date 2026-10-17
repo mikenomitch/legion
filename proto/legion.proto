@@ -3135,6 +3135,65 @@ message PlanJobReply {
   // be refused with `gated-default`. Each line ends with a `hint:` naming the
   // fix. Empty when there is nothing to say.
   repeated string warnings = 8;
+
+  // One report per task that sets `gang` (docs/gang-scheduling.md), in task
+  // order: whether its quorum would place right now, and if not, how far it
+  // got and why the first missing replica did not fit.
+  //
+  // A gang that would not reach its quorum is not an error. The reply then
+  // succeeds with `allocations` empty (a gang short of its quorum places
+  // nothing, and neither does the rest of its job), the report's
+  // `would_place` false, and `message` saying the job would wait: a submit
+  // would block its eval until the whole quorum fits. A dry run of a job
+  // without `gang` still fails when a replica does not fit, as before.
+  //
+  // Like the rest of the reply, this is a plan against a snapshot, not a
+  // reservation.
+  repeated GangReport gang_reports = 9;
+}
+
+// How one gang task fared in one plan (docs/gang-scheduling.md). The same
+// shape is `PlanJobReply.gang_reports` for a dry run and `JobBlocked.gang`
+// for a gang that is waiting, so a client reads one set of fields either way.
+message GangReport {
+  // The gang task's name.
+  string task = 1;
+
+  // The task's desired replica count in this plan: its `count`, after a
+  // `job scale` override or a rollout's target.
+  uint32 desired = 2;
+
+  // The quorum: how many replicas must run together. `gang.min` when set,
+  // else `desired`; never above `desired`.
+  uint32 min = 3;
+
+  // Replicas of the task already running. 0 for a fresh placement (a submit,
+  // a restart, a dry run); non-zero when the plan tops up a running gang that
+  // lost members.
+  uint32 running = 4;
+
+  // Replicas the plan could place before the first one that did not fit.
+  // Replicas place one at a time, best node first, so this is how many fit in
+  // the order the scheduler would place them.
+  uint32 placeable = 5;
+
+  // True when `running + placeable` reaches `min`: the plan places the
+  // quorum (and any further replicas that fit). False when it does not: the
+  // plan places nothing at all, and the job waits.
+  bool would_place = 6;
+
+  // Schedulable nodes whose constraints, permit, and volume drivers accept
+  // the task, whether or not they have room. 0 points at the jobspec (a
+  // constraint no node satisfies) rather than at capacity.
+  uint32 eligible_nodes = 7;
+
+  // Schedulable nodes the plan considered.
+  uint32 nodes = 8;
+
+  // Why the first replica that did not fit did not, in the scheduler's words
+  // (capacity, a static port, disk, a pinned node, preemption's diagnosis).
+  // Empty when every replica fit.
+  string reason = 9;
 }
 
 // One allocation a plan would displace.
@@ -5329,6 +5388,12 @@ message JobBlocked {
 
   // The blocked eval's id.
   string eval_id = 6;
+
+  // Set when the task that could not place is a gang
+  // (docs/gang-scheduling.md): how many of its replicas fit at the last
+  // attempt, against the quorum it must place together. `would_place` is
+  // always false here. Unset for every other task.
+  GangReport gang = 7;
 }
 
 // Reply payload for ListJobs.

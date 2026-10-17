@@ -764,6 +764,8 @@ pub struct Metrics {
     pub eval_conflict_requeues_total: Arc<Counter>,
     /// `legion_evals_blocked{key_kind}`
     pub evals_blocked: Arc<GaugeVec>,
+    /// `legion_gang_blocked_jobs`
+    pub gang_blocked_jobs: Arc<Gauge>,
     /// `legion_evals_unblocked_total{event}`
     pub evals_unblocked_total: Arc<CounterVec>,
     /// `legion_blocked_wait_seconds`
@@ -1064,6 +1066,14 @@ impl Metrics {
                 labels: &["key_kind"],
             },
             series: Series::new(),
+        });
+        let gang_blocked_jobs = Arc::new(Gauge {
+            meta: FamilyMeta {
+                name: "legion_gang_blocked_jobs",
+                help: "Jobs whose blocked eval is a gang short of its quorum (docs/gang-scheduling.md): a waiting gang holds nothing, so a gang can wait behind smaller jobs that keep taking freed capacity. A value that stays up is the starvation signal. Set by the scheduler-lane leader's wake pass; zero elsewhere.",
+                labels: &[],
+            },
+            cell: GaugeCell::default(),
         });
         let evals_unblocked_total = Arc::new(CounterVec {
             meta: FamilyMeta {
@@ -1853,6 +1863,7 @@ impl Metrics {
             Arc::clone(&envelope_resizes_total) as Arc<dyn RenderMetric>,
             Arc::clone(&eval_conflict_requeues_total) as Arc<dyn RenderMetric>,
             Arc::clone(&evals_blocked) as Arc<dyn RenderMetric>,
+            Arc::clone(&gang_blocked_jobs) as Arc<dyn RenderMetric>,
             Arc::clone(&evals_unblocked_total) as Arc<dyn RenderMetric>,
             Arc::clone(&blocked_wait_seconds) as Arc<dyn RenderMetric>,
             Arc::clone(&plan_apply_total) as Arc<dyn RenderMetric>,
@@ -1925,6 +1936,7 @@ impl Metrics {
             scheduler_plan_candidate_rank,
             eval_conflict_requeues_total,
             evals_blocked,
+            gang_blocked_jobs,
             evals_unblocked_total,
             blocked_wait_seconds,
             scheduler_concurrency_limit,

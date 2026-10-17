@@ -179,9 +179,18 @@ fn maximal_job_spec_parse() {
 
     assert_eq!(config.name, "maximal-demo");
     assert_eq!(config.version, Some(1));
-    // Seven declared tasks, plus the envelope task Legion generates for the
+    // Eight declared tasks, plus the envelope task Legion generates for the
     // `scratch` session task at parse.
-    assert_eq!(config.tasks.len(), 8);
+    assert_eq!(config.tasks.len(), 9);
+    let trainer = config
+        .tasks
+        .iter()
+        .find(|task| task.name == "trainer")
+        .expect("maximal must declare the gang task");
+    assert_eq!(
+        trainer.gang,
+        Some(legion::structs::GangConfig { min: Some(3) })
+    );
     let scratch = config
         .tasks
         .iter()

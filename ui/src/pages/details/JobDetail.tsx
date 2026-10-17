@@ -510,6 +510,17 @@ function JobDetailContent() {
                           .join(', ') || 'room'}{' '}
                         per placement. It places on its own when a node it can run on joins or frees room.
                       </div>
+                      {/* A gang waits for its whole quorum, holding nothing
+                          (docs/gang-scheduling.md). */}
+                      <Show when={blocked().gang}>
+                        {(gang) => (
+                          <div>
+                            <span class="font-semibold">Gang</span>: {gang().running} running, {gang().placeable} more
+                            fit, and it places only once {gang().min} run together ({gang().eligibleNodes} of{' '}
+                            {gang().nodes} nodes accept the task).
+                          </div>
+                        )}
+                      </Show>
                       <div class="text-xs opacity-80">{blocked().message}</div>
                     </div>
                   </Note>
