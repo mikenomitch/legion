@@ -142,10 +142,11 @@ tasks of the job wait with the gang.
 
 ## 5. Preemption never takes a gang below its quorum *(Phase 1)*
 
-**Call.** A gang's quorum (`gang.min`, else its count) is a disruption floor
-for victim selection, combined with `disruption.minAvailable` by taking the
-stricter. A `gang = true` job cannot be preempted at all; with `min` below
-`count`, members above the quorum can be. The preemptor's placement error
+**Call.** A gang's quorum is a disruption floor for victim selection,
+combined with `disruption.minAvailable` by taking the stricter. A `gang =
+true` job cannot be preempted at all — its floor is "every member", not its
+spec count, so a gang scaled out past its spec count stays whole too; with
+`min`, members above `min` can be taken. The preemptor's placement error
 names the floor the way it already does:
 
 ```
