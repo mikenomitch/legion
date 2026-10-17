@@ -803,6 +803,11 @@ before the launch, so a miss is a transient bind error. Failing the restore
 would turn that into a cold boot that loses the user's running state, while
 a missing socket only means each dial is reset, which is fail-closed.
 
+**Later (2026-10-15).** The premise stopped holding once pushes and the work
+stream started tasks before any heartbeat, and the wait also ran for
+sandboxes that are not gated. Both are fixed, and the wait stays as is
+([gated-restore-datapath-wait calls](gated-restore-datapath-wait_calls.md)).
+
 ## 35. The guest agent owns the resume watch
 
 **Call.** `legion guest-agent` absorbs `legion guest-resume`'s identity-disk

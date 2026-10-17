@@ -278,18 +278,29 @@ How to use it:
           rewritten and `PUT /snapshot/load` has no drive override. The
           restore is refused by name. Revisit if Firecracker adds drive
           overrides, or if placement should prefer matching data dirs.
-    - [ ] The same restore logged `Resuming a restored gated sandbox before
+    - [x] The same restore logged `Resuming a restored gated sandbox before
           its egress proxy socket is bound` (5s wait for
-          `<alloc>/.sandbox/vsock.sock_1080`). The paths the daemon binds
-          and the restore waits for agree, so the cause is unknown. If the
-          allocation was not actually gated, the next item explains it.
-          Check `legion net doctor` and the socket during the rerun.
+          `<alloc>/.sandbox/vsock.sock_1080`). Two causes: the allocation
+          was not gated, so nothing ever bound the socket (next item), and
+          a gated restore delivered by push or the work stream launched
+          before any heartbeat bound it. Both fixed 2026-10-15
+          ([calls](calls/gated-restore-datapath-wait_calls.md),
+          [docs](../docs/suspend-and-resume.md)). Unit-tested, not yet
+          re-run on the rig.
     - [ ] Every microVM sandbox has a vsock (for exec), so every checkpoint
           records `network = gated` and every restore sets
-          `RestoreTarget.vsock`. A non-gated (TAP or loopback-only) sandbox
-          therefore waits the full 5s `DATAPATH_WAIT` and warns on every
-          restore, and the gated-vs-TAP refusal in `check_restorable` never
-          fires. Derive both from the allocation's network mode.
+          `RestoreTarget.vsock`.
+      - [x] A non-gated (TAP or loopback-only) sandbox waited the full 5s
+            `DATAPATH_WAIT` and warned on every restore. The wait now keys
+            off `RestoreTarget.gated`, the allocation's network mode
+            ([calls #2](calls/gated-restore-datapath-wait_calls.md)).
+      - [ ] The gated-vs-TAP refusal in `check_restorable` still never
+            fires, because the checkpoint's recorded `network` and
+            `RestoreTarget::network` still key off the vsock device. Derive
+            both from the allocation's network mode. The Firecracker
+            vsock-move refusal (`gated_memory_checkpoint_refusal`) keys off
+            the same field and really is about the device, so split the two
+            meanings rather than renaming one.
     - [ ] Rerun the store suspend and cross-node resume on the rig.
     - [ ] Placement ignores which `contentStore` a node has, so a resume can
           land on a node pointed at another bucket and fail. Prefer or
@@ -557,7 +568,7 @@ How to use it:
 
 | PR | What it lands | Notes |
 | --- | --- | --- |
-| [#45](https://github.com/mikenomitch/legion/pull/45) | The remaining `perf/*` branches stacked on main: lazy memory restore, chunked checkpoints on the work stream, elastic session envelopes, edge admission control, ratification without epoch fences, the keyed bind index and fused eval settles, and the worker lock fixes. Plus what the AWS rig found: non-blocking server console logs, `speculativeStart` on the dispatch, followers answering ratifications with not-leader, the settle window for a just-ratified claim, and an edge start's own instance identity | [results](../benchmarks/aws/sandbox-boot/RESULTS.md) · [sandbox boot calls](calls/sandbox-boot-throughput-plan_calls.md) · [ratify calls](calls/edge-ratify-throughput-plan_calls.md). The 5 s restore wait is open below |
+| [#45](https://github.com/mikenomitch/legion/pull/45) | The remaining `perf/*` branches stacked on main: lazy memory restore, chunked checkpoints on the work stream, elastic session envelopes, edge admission control, ratification without epoch fences, the keyed bind index and fused eval settles, and the worker lock fixes. Plus what the AWS rig found: non-blocking server console logs, `speculativeStart` on the dispatch, followers answering ratifications with not-leader, the settle window for a just-ratified claim, and an edge start's own instance identity | [results](../benchmarks/aws/sandbox-boot/RESULTS.md) · [sandbox boot calls](calls/sandbox-boot-throughput-plan_calls.md) · [ratify calls](calls/edge-ratify-throughput-plan_calls.md). The 5 s restore wait is fixed in code on `claude/legion-gated-restore-stall-th7ow9` (no PR yet), its rerun open below |
 | [#42](https://github.com/mikenomitch/legion/pull/42) | Datapath performance: `least_latency` as the default strategy, HTTP-mode connection pooling, `splice(2)` for bulk L4 on Linux, the per-byte `legion_net_bytes_total` fix, `net_bench` | [plan](plans/datapath-performance-plan.md) · [calls](calls/datapath-performance-plan_calls.md); kTLS and multiplexed mesh tunnels deferred |
 | [#36](https://github.com/mikenomitch/legion/pull/36) | Session durability, routing, and edge starts, Phases 1–4 (concurrent node starts, `sessions.db` re-adopt, node tag in session ids and tag routing, session tickets, `Worker.StartSession`, `ListSessionNodes`, `legion session`), the session UI pass, and the sandbox spot-check and bottleneck-measurement plans. Phase 5 in progress | [plan](plans/session-durability-and-routing-plan.md) · [calls](calls/session-durability-and-routing-plan_calls.md) |
 | [#30](https://github.com/mikenomitch/legion/pull/30) | Sandbox scaling Phases 4–6: untombstoned 130-bit minted ids, `suspend.archive`, `stateful.mode = "session"` and `legion instance promote` | [plan](plans/sandbox-scaling-plan.md) §16 · [calls](calls/sandbox-scaling-plan_calls.md); sessions ship without idle sessions, identity, or a session log (calls #18) |
@@ -2098,21 +2109,22 @@ Plans: [task-runtime-plugins](../docs/task-runtime-plugins.md).
         On-demand memory restore needs cloud-hypervisor v52+. The rig ran
         v51.2. Its restore matrix (1, 4, 8 GiB, lazy vs eager, v51 to v53 and
         Firecracker, suspend and fork right after a lazy resume) is the next
-        run, on a box with 32 GiB or more.
-  - [ ] **Every sandbox restore waits 5 s for an egress proxy socket**, and
-        that hides lazy against eager. Before it resumes a restored guest,
-        the node waits up to `DATAPATH_WAIT` (5 s, `sandbox_checkpoint.rs`)
-        for the datapath's proxy socket. Every guest has a vsock, so every
-        checkpoint records gated networking, and a guest that is not gated
-        never gets the socket. On main already. Measured on
-        cloud-hypervisor v53.0 with a 2.4 GB checkpoint (2 GiB guest, 900
-        MiB touched, `jobs/restore-vm-{lazy,eager}.ncl`): `restore_ms`
-        about 5,040 for both modes, a 5.0 s resume end to end against
-        15.6 s on main's worker
-        ([results](../benchmarks/aws/sandbox-boot/RESULTS.md#memory-restore-2026-10-14)).
-        Same root cause as the "non-gated sandbox waits the full 5s" item
-        under the spot-check rerun above. Derive the wait from the
-        allocation's network mode, then rerun the lazy and eager cells.
+        run, on a box with 32 GiB or more. The first v53.0 run was hidden by
+        the 5 s datapath wait, now fixed (Done, "Task runtimes"). Rerun on a
+        c5.metal with worker state on RAM-backed XFS and the
+        `restore-vm-{lazy,eager}.ncl` jobs, three rounds a mode: record
+        `restoreMs` and the worker's `restore_ms` line, confirm the
+        `Resuming a restored gated sandbox` warning is gone, and time the
+        guest's first read of its 900 MiB after the resume (`time cat
+        /dev/shm/fill > /dev/null` over exec), which is where lazy pays. Then
+        v51.2, which falls back to eager. Also once with the manager on
+        `LEGION_SANDBOX_GATED_DEFAULT=1`, so the gated launch-path bind is
+        measured too. Not run from the 2026-10-15 session, which had no AWS
+        credentials and no outbound SSH. The numbers go in the "Restore
+        time" paragraph of
+        [task-runtime-sandbox.md](../docs/task-runtime-sandbox.md), in
+        [RESULTS.md](../benchmarks/aws/sandbox-boot/RESULTS.md#memory-restore-2026-10-14),
+        and in [plan §9](plans/lazy-memory-restore-plan.md#9-testing-plan).
   - [ ] **Parallel branches not stacked** (calls 1), each still an
         uncommitted diff in its worktree unless noted: `sandbox-warm-pool`
         and `edge-prewarm` (warming, against the pre-warm stance until the
@@ -5139,6 +5151,19 @@ docs: [scheduler-and-eval-loop.md](../docs/scheduler-and-eval-loop.md), [jobs-ta
 docs: [task-runtime-plugins.md](../docs/task-runtime-plugins.md)
 
 - [x] A framework for task-runtime plugins
+- [x] **A sandbox restore no longer waits 5 s for an egress proxy socket**
+      (2026-10-15). Every restore waited up to `DATAPATH_WAIT` for
+      `vsock.sock_1080`, which hid lazy against eager on the rig
+      (`restore_ms` about 5,040 for both). A restore now waits only when the
+      allocation is gated, and `accept_work` binds a gated sandbox's proxy
+      before its launch for a push or a work-stream delivery, as the
+      heartbeat already did for its own. A proxy whose socket vanished (a
+      failed start removes its directory) is rebound by the next launch.
+      Unit-tested, not yet re-run on KVM (open under "Sandbox boot
+      throughput")
+      ([calls](calls/gated-restore-datapath-wait_calls.md) ·
+      [docs](../docs/suspend-and-resume.md) ·
+      [restore time](../docs/task-runtime-sandbox.md)).
 - [x] **Sandbox sessions boot in about 200 ms, and a cluster boots them at
       the sum of its nodes' rate** (2026-10-14). Measured on AWS, four
       4-vCPU workers: one boot from 2.9 s to 0.23 s, a burst of 160 from

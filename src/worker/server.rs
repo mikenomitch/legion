@@ -154,6 +154,12 @@ pub struct WorkerDaemonService {
     /// worker an edge resume probes (`StartSession.resume_id`). `None` in
     /// tests: such a node cannot probe, so it moves only with `force_move`.
     pub node_identity: Option<Arc<crate::worker::plane::NodeIdentity>>,
+    /// The node's egress proxies, so a gated sandbox delivered by push or
+    /// the work stream has its proxy socket bound before its launch rather
+    /// than on the next heartbeat (`daemon::bind_launch_datapath`). A
+    /// restored guest resumes only once that socket exists. `None` in tests
+    /// that run no datapath.
+    pub egress: Option<Arc<crate::worker::netd::proxy::EgressProxies>>,
 }
 
 impl WorkerDaemonService {
@@ -276,6 +282,19 @@ impl WorkerDaemonService {
         };
 
         let allocation_id = allocation.allocation_id;
+
+        // A gated sandbox's egress proxy, bound before the launch: a restore
+        // resumes its guest only once the socket exists, and no heartbeat
+        // has bound this delivery's datapath yet.
+        if let Some(egress) = self.egress.as_ref() {
+            let alloc_root = self
+                .task_manager
+                .lock()
+                .map_err(|_| Status::internal("Task manager lock poisoned"))?
+                .alloc_root()
+                .to_path_buf();
+            crate::worker::daemon::bind_launch_datapath(egress, &alloc_root, &allocation).await;
+        }
 
         // Synchronous failures (bad config, unknown runtime) surface here;
         // artifact-bearing tasks stage on a background thread and report
@@ -1730,6 +1749,7 @@ mod edge_overload_test {
                 Duration::from_secs(1),
             )),
             node_identity: None,
+            egress: None,
         };
         Ok(Node {
             service,

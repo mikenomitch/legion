@@ -622,16 +622,6 @@ async fn run_worker_with_manager(join: WorkerJoin, name_override: Option<&str>) 
     let launch_pool = Arc::new(crate::worker::launch_pool::LaunchPool::from_config(
         &edge_boot_config,
     ));
-    let worker_node = WorkerDaemonService {
-        node_id: name.clone(),
-        task_manager: task_manager.clone(),
-        identity: Some(identity_manager.clone()),
-        edge_boot: edge_boot.clone(),
-        direct_exec: direct_exec.clone(),
-        launch_pool: launch_pool.clone(),
-        node_identity: Some(node_identity.clone()),
-    };
-    let worker_router = Server::builder().add_service(WorkerServer::new(worker_node));
 
     let mut fingerprint_data = fingerprint_node(config.additional_node_checks.clone());
     // The manager loads no storage drivers of its own, so this is its only
@@ -815,6 +805,19 @@ async fn run_worker_with_manager(join: WorkerJoin, name_override: Option<&str>) 
     // Restored tasks are still running: give them their network back now,
     // not on the first successful heartbeat.
     restore_datapath(&forwarder, &task_manager).await;
+    // Built after the datapath: a push binds a gated sandbox's egress proxy
+    // before its launch (`bind_launch_datapath`).
+    let worker_node = WorkerDaemonService {
+        node_id: name.clone(),
+        task_manager: task_manager.clone(),
+        identity: Some(identity_manager.clone()),
+        edge_boot: edge_boot.clone(),
+        direct_exec: direct_exec.clone(),
+        launch_pool: launch_pool.clone(),
+        node_identity: Some(node_identity.clone()),
+        egress: forwarder.proxies().cloned(),
+    };
+    let worker_router = Server::builder().add_service(WorkerServer::new(worker_node));
     let worker_server_fut =
         serve_worker_plane(bind, advertised, node_identity.clone(), worker_router);
     // Work arrives over `Manager.StreamWork`: one long-lived stream, its
@@ -832,6 +835,7 @@ async fn run_worker_with_manager(join: WorkerJoin, name_override: Option<&str>) 
             direct_exec: direct_exec.clone(),
             launch_pool: launch_pool.clone(),
             node_identity: Some(node_identity.clone()),
+            egress: forwarder.proxies().cloned(),
         });
         tokio::spawn(crate::worker::work_stream::run_work_stream(
             client.clone(),
@@ -3900,18 +3904,56 @@ fn proxy_specs(
         })
         .collect();
     // Gated sandboxes: the proxy is the host end of the guest's vsock port.
-    for allocation in desired.iter().filter(|a| is_gated_sandbox(a)) {
-        specs.push(crate::worker::netd::proxy::ProxySpec {
-            allocation_id: allocation.allocation_id,
-            netns: None,
-            listen: None,
-            unix: Some(crate::worker::netd::guest_agent::host_socket_path(
-                &sandbox_vsock_base(alloc_root, allocation.allocation_id),
-                crate::worker::netd::guest_agent::PROXY_PORT,
-            )),
-        });
-    }
+    specs.extend(
+        desired
+            .iter()
+            .filter_map(|allocation| sandbox_proxy_spec(allocation, alloc_root)),
+    );
     specs
+}
+
+/// A gated sandbox's egress proxy: the host end of its guest's vsock port
+/// 1080 (`<allocs>/<id>/.sandbox/vsock.sock_1080`). `None` for anything
+/// else. Shared by [`proxy_specs`] and [`bind_launch_datapath`], so the
+/// heartbeat's sync sees the launch path's listener as its own and keeps it.
+fn sandbox_proxy_spec(
+    allocation: &TaskAllocation,
+    alloc_root: &std::path::Path,
+) -> Option<crate::worker::netd::proxy::ProxySpec> {
+    is_gated_sandbox(allocation).then(|| crate::worker::netd::proxy::ProxySpec {
+        allocation_id: allocation.allocation_id,
+        netns: None,
+        listen: None,
+        unix: Some(crate::worker::netd::guest_agent::host_socket_path(
+            &sandbox_vsock_base(alloc_root, allocation.allocation_id),
+            crate::worker::netd::guest_agent::PROXY_PORT,
+        )),
+    })
+}
+
+/// Bind a gated sandbox's egress proxy before its launch, for the delivery
+/// routes that start a task without a heartbeat: a `PostWork` push and a
+/// `StreamWork` delta (`WorkerDaemonService::accept_work`). The heartbeat
+/// binds its own deliveries before its reconcile. Without this a restored
+/// guest waits the full `DATAPATH_WAIT` (5 s) for a socket only the next
+/// heartbeat would bind.
+///
+/// Also wakes the heartbeat, which brings the allocation's policy,
+/// resolver, and upstream sockets: until the policy lands the proxy fails
+/// closed. A bind that fails is logged by the proxy, and the restore then
+/// resumes fail-closed exactly as before. Returns whether the proxy is
+/// serving, and false for anything but a gated sandbox.
+pub(crate) async fn bind_launch_datapath(
+    proxies: &crate::worker::netd::proxy::EgressProxies,
+    alloc_root: &std::path::Path,
+    allocation: &TaskAllocation,
+) -> bool {
+    let Some(spec) = sandbox_proxy_spec(allocation, alloc_root) else {
+        return false;
+    };
+    let serving = proxies.ensure(spec).await;
+    wake_heartbeat();
+    serving
 }
 
 /// The ingress listeners a desired set implies, all bound in the host
@@ -5756,6 +5798,76 @@ mod tests {
         crate::task_plugins::write_guest_upstreams_record(&scratch, &[("db", 20009)]).unwrap();
         let restored = upstream_specs(&[allocation], root.path());
         assert_eq!(restored, specs);
+    }
+
+    /// A gated sandbox delivered without a heartbeat (a `StreamWork` delta
+    /// or a `PostWork` push, both through `accept_work`) has its egress
+    /// proxy bound by the launch path, and one that is not gated gets none.
+    /// The next heartbeat's sync keeps the launch path's listener, and the
+    /// next launch rebinds it if a failed start removed its socket. The
+    /// restore that then finds the socket is in `sandbox_checkpoint`'s
+    /// tests.
+    #[tokio::test]
+    async fn a_gated_sandbox_delivered_without_a_heartbeat_binds_its_proxy_test() -> R<()> {
+        use std::os::unix::fs::MetadataExt;
+        let dir = TempDir::new()?;
+        let manager = WorkerTaskManager::with_state_store(WorkerStateStore::new(
+            dir.path().join("worker_state.json"),
+        ));
+        let alloc_root = manager.alloc_root().to_path_buf();
+        let proxies = Arc::new(crate::worker::netd::proxy::EgressProxies::new(Arc::new(
+            crate::worker::forwarder::ForwarderContext::new(
+                Arc::new(crate::worker::netd::NetPolicyCache::new()),
+                Arc::new(crate::worker::netd::Denials::new()),
+            ),
+        )));
+        let service = WorkerDaemonService {
+            node_id: "node-1".into(),
+            task_manager: Arc::new(Mutex::new(manager)),
+            identity: None,
+            edge_boot: None,
+            direct_exec: None,
+            launch_pool: Default::default(),
+            node_identity: None,
+            egress: Some(proxies.clone()),
+        };
+        let sandbox = |allocation_id: i64, mode: &str| TaskAllocation {
+            allocation_id,
+            task_name: "box".into(),
+            task_runtime: "sandbox".into(),
+            task_config: json!({ "image": "a" }).to_string(),
+            network: json!({ "mode": mode }).to_string(),
+            ..Default::default()
+        };
+
+        // The task config is incomplete, so each launch fails after the bind
+        // (and removes the allocation's directory). No heartbeat ran.
+        assert!(service.accept_work(sandbox(7, "gated")).await.is_err());
+        assert!(proxies.is_running(7), "bound by the launch path");
+        assert!(service.accept_work(sandbox(8, "host")).await.is_err());
+        assert!(!proxies.is_running(8), "nothing to bind when not gated");
+
+        let gated = sandbox(9, "gated");
+        assert!(bind_launch_datapath(&proxies, &alloc_root, &gated).await);
+        let socket = crate::worker::netd::guest_agent::host_socket_path(
+            &sandbox_vsock_base(&alloc_root, 9),
+            crate::worker::netd::guest_agent::PROXY_PORT,
+        );
+        let bound = std::fs::metadata(&socket)?.ino();
+        let heartbeat = proxy_specs(std::slice::from_ref(&gated), &alloc_root);
+        proxies.sync(&heartbeat).await;
+        assert_eq!(
+            std::fs::metadata(&socket)?.ino(),
+            bound,
+            "the heartbeat keeps the launch path's listener"
+        );
+        std::fs::remove_file(&socket)?;
+        assert!(bind_launch_datapath(&proxies, &alloc_root, &gated).await);
+        assert!(
+            socket.exists(),
+            "the next launch binds a removed socket again"
+        );
+        Ok(())
     }
 
     /// A gated sandbox's capture includes a vsock socket per upstream:

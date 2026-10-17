@@ -169,6 +169,15 @@ not gated never gets the socket and waits the full 5 seconds. That is
 pre-existing on `main`, and until it is fixed this rig cannot tell lazy
 from eager.
 
+The wait is fixed in code, not yet rerun here. A restore now waits only
+when the allocation's network mode is `gated`, and the launch path binds a
+gated sandbox's egress proxy before the restore for every delivery route
+(heartbeat, push, and work stream). These jobs are not gated (the manager
+runs without `LEGION_SANDBOX_GATED_DEFAULT=1`), so their restores should
+not wait at all. The lazy and eager cells above, the time for the guest to
+first read back its 900 MiB after the resume, and the v51.2 comparison are
+still to be measured.
+
 ## One boot, by stage
 
 Worker log `Task allocation started`, sequential starts on a c8i.xlarge:
