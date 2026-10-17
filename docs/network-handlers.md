@@ -533,9 +533,11 @@ memory, so never in its memory checkpoints, forks, or published snapshots.
 
 ## Name-is-config: `<key>.svc.legion`
 
-On Linux, every allocation that declares upstreams gets its own loopback /24
-at placement (`127.42.<b>`, unique per node). All of 127/8 is loopback on
-Linux with no configuration. In that block:
+On a Linux node, every allocation that declares upstreams gets its own
+loopback /24 at placement (`127.42.<b>`, unique per node). All of 127/8 is
+loopback on Linux with no configuration. Placement goes by the node's `os`
+fingerprint, so a manager on macOS assigns blocks to its Linux nodes and none
+to its macOS ones. In that block:
 
 - **`.1` is the allocation's resolver**, exported as `LEGION_DNS`. It answers
   `<key>.svc.legion` (and bare `<key>`, through the `svc.legion` search
@@ -575,6 +577,16 @@ allocation's resolver; on a host whose `resolv.conf` names systemd-resolved's
 agent's relay as its resolver (`nameserver 127.0.0.1` in the guest's
 `resolv.conf`), and the agent also listens on each upstream's VIP in the
 guest, so `<key>.svc.legion` works there too (see "Sandboxes").
+
+**Forwarding.** The host's resolvers are the `nameserver` lines of the
+node's `/etc/resolv.conf`, read when the worker starts. A forwarded query
+goes to them over UDP, first answer wins. When a client asked over TCP and
+the answer came back truncated, the resolver asks the same nameserver again
+over TCP and returns the full answer. A UDP client gets the truncated answer
+and asks again over TCP itself; the resolver serves TCP on the same address.
+A node whose `resolv.conf` names no nameserver answers every name outside
+`svc.legion` with `SERVFAIL` at once, and the worker logs a warning when it
+starts. No query goes to a public resolver the operator did not name.
 
 **macOS** configures only `127.0.0.1` on `lo0`, so no VIP block is assigned
 there. Upstreams keep their loopback ports and env vars, and there is no
@@ -737,13 +749,17 @@ ingress = {
 first DNS SAN, or else its CN. `identity` rules and `requireIdentity` match
 against that string.
 
-**The mesh (`certFrom = "legion"`).** The manager keeps one cluster **mesh
-CA**, created on first use and replicated with the control lane. Every
+**The mesh (`certFrom = "legion"`).** The mesh uses the **cluster CA**. By
+default that is a CA the manager creates on first use and replicates with the
+control lane; it can instead be an intermediate from your own PKI or an
+external signer such as Vault PKI ([The Cluster CA](cluster-ca.md)). Every
 worker node holds a short-lived **node certificate** from it: the worker
 generates its own key, sends a CSR (`IssueNodeCertificate`, authorized by its
-node token) right after registration, and the manager signs it with the SANs
-`<node>.node.legion` and `legion://node/<node id>`, valid for 24 hours. The
-worker refreshes it after 8. The same certificate serves the node's worker
+node token) right after registration, and the manager has it signed with the
+SANs `<node>.node.legion` and `legion://node/<node id>`, valid for 24 hours.
+The manager picks those names itself and checks what an external CA returns
+before handing it out. The worker refreshes it after 8 hours, or within one
+heartbeat when the cluster's trust bundle changes. The same certificate serves the node's worker
 plane ([auth-and-acls.md](auth-and-acls.md#the-worker-plane)), and the key
 and certificate persist under `<state-dir>/identity/` (mode `0600`) so a
 restarted node has its mesh identity before it reaches a manager. The
@@ -759,9 +775,12 @@ private key never leaves the node. Then:
   `authz`.
 - A plain client that dials the port directly is refused at the handshake.
   A non-Legion client that must reach the port has two options: present a
-  certificate from the mesh CA (`legion net ca show` prints the CA, but
-  Legion does not issue certificates for outside clients), or go through a
-  Legion task.
+  certificate from the cluster CA (`legion net ca show` prints its trust
+  bundle, but Legion does not issue certificates for outside clients), or go
+  through a Legion task. With a `file` or `exec` CA, remember that anything
+  your PKI signs under that CA with a `legion://` URI SAN is a node or a
+  manager to every peer: keep that intermediate (or Vault role) for Legion
+  alone.
 - Workloads never hold certificates. The node attributes identity, which
   keeps a per-user sandbox's identity out of the sandbox.
 
@@ -770,12 +789,15 @@ The mesh CA is the cluster CA, the same one behind the worker plane
 certificate is its node certificate: the worker generates the key and the
 manager signs a CSR.
 
-`legion net ca show` prints the CA trust bundle (never a key), its pin, and
-where a rotation stands. `legion net ca rotate` rotates it in two steps that
-break no mesh connection: the new CA, cross-signed by the old one, signs at
-once, and the old one stays in every trust bundle for one certificate
-lifetime (24 hours). Every node re-issues on its next heartbeat. Peers never
-fall back to plaintext ([Rotating the cluster
+`legion net ca show` prints the CA trust bundle (never a key), its pin, which
+provider supplies it, and where a rotation stands. `legion net ca rotate`
+rotates the built-in CA in two steps that break no mesh connection: the new
+CA, cross-signed by the old one, signs at once, and the old one stays in
+every trust bundle for one certificate lifetime (24 hours). Every node
+re-issues on its next heartbeat. A `file` or `exec` CA rotates outside
+Legion with the same add-switch-remove steps
+([The Cluster CA](cluster-ca.md#rotation)). Peers never fall back to
+plaintext ([Rotating the cluster
 CA](auth-and-acls.md#rotating-the-cluster-ca)).
 
 ### Certificates from KV
@@ -911,7 +933,10 @@ The proxy supports three protocols:
 
 - HTTP `CONNECT`, for TLS and other opaque traffic, checked by host and port.
 - Absolute-URI plain HTTP, also checked by the request head and forwarded in
-  origin form, one request per connection.
+  origin form on an upstream connection of its own. A client may keep its
+  connection to the proxy open or pipeline requests on it: each request is
+  checked on its own, so a request behind an allowed one is never let
+  through unchecked.
 - SOCKS5 `CONNECT`, with domain-name targets checked by name.
 
 Nothing is added to traffic through the proxy. In particular, a

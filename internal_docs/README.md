@@ -115,6 +115,7 @@ When one is required and what goes in it:
 | [job-templates-plan.md](plans/job-templates-plan.md) | in execution |
 | [job-updated-at-plan.md](plans/job-updated-at-plan.md) | shipped (detail-page header + node column label deferred) |
 | [chunked-checkpoint-publish-plan.md](plans/chunked-checkpoint-publish-plan.md) | in execution (Phase 1 built: published parts as sealed, deduplicated chunks per job and dedup window, zero chunks skipped. Fetching only missing chunks, dirty-page hashing, and a real-S3 run are deferred) |
+| [cluster-ca-provider-plan.md](plans/cluster-ca-provider-plan.md) | shipped (2026-10-14: the `clusterCa` provider seam — `builtin` default, `file` operator intermediate, `exec` external signer with a Vault PKI helper; post-sign verification, CSR manager certificates, heartbeat bundle pins, a leader-recorded agreement check, `legion net ca provider test`; switching providers without re-joining workers and per-manager agreement deferred) |
 | [checkpoint-encryption-plan.md](plans/checkpoint-encryption-plan.md) | shipped (2026-10-11: published checkpoint parts sealed under per-part keys from the keyring's checkpoint key, with manual checkpoint-key rotation, parallel sealing, and streaming decrypt deferred) |
 | [kv-encryption-plan.md](plans/kv-encryption-plan.md) | shipped (all four phases, 2026-09-21: KV values encrypted at rest by default, replicated keyring with the root key outside the store, `file`/`env`/`exec` providers, rotation + rewrap, join-time root key delivery; rendered task-config copies deliberately left for a follow-up plan) |
 | [kv-reactive-task-updates-plan.md](plans/kv-reactive-task-updates-plan.md) | shipped |
@@ -183,6 +184,7 @@ When one is required and what goes in it:
 | [session-ui-plan.md](plans/session-ui-plan.md) | shipped (UI only: sessions and envelopes on the job, instance, allocation, node, and task pages, Promote and End, and bounded fetching, polling, and rendering for very large session counts; `ListInstances` paging, counts, and node/envelope filters deferred to the API) |
 | [elastic-session-envelopes-plan.md](plans/elastic-session-envelopes-plan.md) | in execution: Phase 1 built (`stateful.envelope.max` and `shrinkAfter`: each node grows and shrinks its session envelope between a floor and a ceiling, one scheduler-lane entry per resize, a shrink capped on the node first); preemptible elastic room and a fleet resize budget planned |
 | [shared-alloc-dir-proposal.md](plans/shared-alloc-dir-proposal.md) | proposal |
+| [swappable-seams-plan.md](plans/swappable-seams-plan.md) | shipped (2026-10-14: one attachment type for the datapath, one listener and dialer, the typed worker ↔ `netd` boundary, one object-storage layer, DNS on hickory-proto, the egress proxy on hyper, and the VIP and mesh-TLS fixes; the `legion netd` process split, a `NetdInput` wire encoding, GCS/Azure, and a `Vmm` trait deferred) |
 | [data-dir-env-plan.md](plans/data-dir-env-plan.md) | shipped (`LEGION_DATA_DIR`; no config-file field, by design) |
 
 ## Judgement calls
@@ -205,6 +207,7 @@ by project impact. The full template and a worked example:
 - [auth-acl-plan_calls.md](calls/auth-acl-plan_calls.md)
 - [aws-comparative-benchmark-plan_calls.md](calls/aws-comparative-benchmark-plan_calls.md)
 - [bounded-candidate-scoring-plan_calls.md](calls/bounded-candidate-scoring-plan_calls.md)
+- [cluster-ca-provider-plan_calls.md](calls/cluster-ca-provider-plan_calls.md)
 - [container-runtime-exec-and-signals-plan_calls.md](calls/container-runtime-exec-and-signals-plan_calls.md)
 - [container-task-kind-macos_calls.md](calls/container-task-kind-macos_calls.md)
 - [data-dir-env-plan_calls.md](calls/data-dir-env-plan_calls.md)
@@ -220,6 +223,7 @@ by project impact. The full template and a worked example:
 - [rootfs-base-cache-plan_calls.md](calls/rootfs-base-cache-plan_calls.md)
 - [sandbox-boot-throughput-plan_calls.md](calls/sandbox-boot-throughput-plan_calls.md)
 - [sandbox-clean-stop_calls.md](calls/sandbox-clean-stop_calls.md)
+- [swappable-seams-plan_calls.md](calls/swappable-seams-plan_calls.md)
 - [sandbox-exec-plan_calls.md](calls/sandbox-exec-plan_calls.md)
 - [sandbox-scaling-plan_calls.md](calls/sandbox-scaling-plan_calls.md)
 - [sandbox-snapshots-and-fast-start-plan_calls.md](calls/sandbox-snapshots-and-fast-start-plan_calls.md)

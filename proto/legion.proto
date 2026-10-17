@@ -1056,14 +1056,24 @@ service Manager {
   // mesh (`certFrom = "legion"`, docs/network-handlers.md, "mTLS").
   //
   // The worker generates its key pair locally and sends only a CSR; the
-  // private key never crosses the network. The manager signs the CSR's
-  // public key with the cluster CA and SANs it chooses itself,
+  // private key never crosses the network. The manager has the CSR's public
+  // key signed by the cluster CA with SANs it chooses itself,
   // `<node>.node.legion` and `legion://node/<node id>`, ignoring every name,
   // extension, and subject the CSR requests. Valid for 24 hours. Workers call
   // it right after registration (the listener needs it), again after a third
-  // of the lifetime, and at once when a heartbeat reply names a CA their
-  // bundle lacks (a rotation). The first call creates the cluster CA
-  // (replicated with the control lane).
+  // of the lifetime, and at once when a heartbeat reply's
+  // `cluster_ca_pins` differ from the bundle they hold (a rotation, or a CA
+  // added to or removed from the bundle).
+  //
+  // Who signs is the manager's `clusterCa.provider` (docs/cluster-ca.md):
+  // the built-in CA (the default; the first call creates it, replicated with
+  // the control lane), an operator-provided CA on the manager's disk
+  // (`file`), or an external signer such as Vault PKI (`exec`). Whatever a
+  // `file` or `exec` provider returns is verified before it is handed out:
+  // it must chain to the trust bundle, carry the CSR's public key, carry
+  // exactly the SANs above, carry serverAuth and clientAuth and no other
+  // extended key usage, not be a CA, and be valid for between 2 hours and
+  // the requested 24 hours plus 10 minutes.
   //
   // `fleet` is for the simulator only (`legion start worker --simulate`),
   // which serves every simulated node from one listener: the certificate
@@ -1085,7 +1095,14 @@ service Manager {
   //   `fleet` does not match the node's registered `workerFleet`.
   // - NotFound: no node with `node_id` is registered.
   // - PermissionDenied: `node_id` does not match the caller's credential.
-  // - Internal: the CA could not be created or signing failed.
+  // - Unavailable: the cluster CA is not available on this manager yet (the
+  //   built-in CA has not replicated, or an `exec` provider could not be
+  //   run or did not answer). The worker keeps its certificate and retries.
+  // - FailedPrecondition: the CA needs an operator: the provider returned a
+  //   certificate Legion refuses (the message names the provider and the
+  //   mismatch), its CA files are unusable, or this manager's CA disagrees
+  //   with the cluster's (`GetMeshCa.problem` says why).
+  // - Internal: the built-in CA could not be created or signing failed.
   rpc IssueNodeCertificate (IssueNodeCertificateRequest)
       returns (IssueNodeCertificateReply);
 
@@ -1793,24 +1810,40 @@ service Manager {
   // reported as `defer`. ACL: `net:read` on the job.
   rpc TestNetPolicy (TestNetPolicyRequest) returns (TestNetPolicyReply);
 
-  // The cluster CA — what an operator hands a non-Legion client that must
-  // reach a mesh-TLS port or the worker plane (`legion sandbox start --node`,
-  // `legion exec --direct`), or verifies a node certificate against. Returns
-  // the signing CA, the full trust bundle (both CAs during a rotation), the
-  // pin new join tokens carry, and where a rotation stands. Never a key.
-  // Empty `cert_pem` when no CA exists yet (it is created on first use: the
-  // first join token or node certificate). ACL: `net:read`.
+  // The cluster CA as the answering manager sees it — what an operator
+  // hands a non-Legion client that must reach a mesh-TLS port or the worker
+  // plane (`legion sandbox start --node`, `legion exec --direct`), or
+  // verifies a node certificate against. Returns the signing CA, the full
+  // trust bundle (both CAs during a built-in rotation), the chain leaves
+  // carry, the pin new join tokens carry, where a rotation stands, which
+  // provider supplies the CA (`builtin`, `file`, or `exec`;
+  // docs/cluster-ca.md), and anything wrong with it on this manager. Never
+  // a key.
+  //
+  // Never fails for a CA problem: an unusable provider or a manager that
+  // disagrees with the cluster is reported in `problem`, so this is the
+  // call to diagnose one with. Empty `cert_pem` when no CA exists yet (the
+  // built-in CA is created on first use: the first join token or node
+  // certificate). ACL: `net:read`.
   rpc GetMeshCa (GetMeshCaRequest) returns (GetMeshCaReply);
 
-  // Rotate the cluster CA in two steps, without breaking any connection
-  // (worker-plane-auth plan §6.9). The new CA is generated, cross-signed by
-  // the current one, and signs every certificate from now on; the previous
-  // CA stays in every holder's trust bundle for one certificate lifetime (24
-  // hours), and chains carry the cross-signed certificate meanwhile, so a
-  // holder that has not refreshed its bundle yet keeps verifying. Nodes
-  // re-issue their certificates within one heartbeat (the reply names the
-  // new CA). Join tokens minted before the rotation keep working during the
-  // overlap; after it, mint new ones. ACL: `net:write` (unscoped).
+  // Rotate the built-in cluster CA in two steps, without breaking any
+  // connection (worker-plane-auth plan §6.9). The new CA is generated,
+  // cross-signed by the current one, and signs every certificate from now
+  // on; the previous CA stays in every holder's trust bundle for one
+  // certificate lifetime (24 hours), and chains carry the cross-signed
+  // certificate meanwhile, so a holder that has not refreshed its bundle
+  // yet keeps verifying. Nodes re-issue their certificates within one
+  // heartbeat (the reply names the new CA). Join tokens minted before the
+  // rotation keep working during the overlap; after it, mint new ones.
+  // ACL: `net:write` (unscoped).
+  //
+  // Errors:
+  // - FailedPrecondition: the manager's `clusterCa.provider` is `file` or
+  //   `exec`. Legion does not hold that CA's key, so it cannot rotate it;
+  //   the message names the provider and the procedure (add the new CA to
+  //   the trust bundle, wait a heartbeat, switch the signing CA, drop the
+  //   old CA a day later; docs/cluster-ca.md#rotation).
   rpc RotateMeshCa (RotateMeshCaRequest) returns (RotateMeshCaReply);
 
   // Worker plane: fetches the merged policy body for a hash the heartbeat
@@ -1976,6 +2009,17 @@ service Manager {
   // The reply contains a self-describing composite token (manager address +
   // secret + worker type) that introduces a worker in one command:
   // `legion join <TOKEN>`. The manager stores only a hash of the secret.
+  // The token also pins the cluster CA (`caHash`): the trust-bundle CA the
+  // signing CA chains to, whichever `clusterCa.provider` supplies it
+  // (docs/cluster-ca.md). A joining worker refuses a manager whose chain
+  // does not lead to it.
+  //
+  // Errors:
+  // - Unavailable: the cluster CA is not available on this manager yet (the
+  //   built-in CA has not replicated, or an `exec` provider did not answer).
+  // - FailedPrecondition: the cluster CA needs an operator (unusable CA
+  //   files, or this manager disagrees with the cluster's CA;
+  //   `GetMeshCa.problem` says why).
   rpc CreateJoinToken (CreateJoinTokenRequest) returns (CreateJoinTokenReply);
 
   // Lists worker join tokens (metadata only). Requires `node:read`.
@@ -5370,24 +5414,32 @@ message GetMeshCaRequest {}
 
 // Reply payload for GetMeshCa.
 message GetMeshCaReply {
-  // The signing CA certificate, PEM; empty when none exists yet.
+  // The CA certificate that signs leaves, PEM; empty when none exists yet
+  // or the provider could not supply one (see `problem`). For `file` and
+  // `exec` this is often an intermediate under the organization's root.
   string cert_pem = 1;
 
-  // When the signing CA was created (RFC 3339); empty when none exists.
+  // When the signing CA was created (`builtin`), or its `notBefore` (other
+  // providers), RFC 3339; empty when none exists.
   string created_at = 2;
 
-  // Every CA a holder should trust, PEM: the signing CA, then the previous
-  // CA while a rotation's overlap lasts. Clients that verify node or
-  // manager certificates (`legion sandbox start --node`, direct exec) use
-  // this, not `cert_pem`.
+  // Every CA a holder should trust, PEM, the anchor (the CA `pin` names)
+  // first. `builtin`: the signing CA, then the previous CA while a
+  // rotation's overlap lasts. `file`: `clusterCa.bundlePath`, or the
+  // signing CA itself when unset. `exec`: what the provider's `describe`
+  // reports. Clients that verify node or manager certificates
+  // (`legion sandbox start --node`, direct exec) use this, not `cert_pem`.
   string bundle_pem = 3;
 
-  // The signing CA's pin (`sha256:<hex of its DER>`), as join tokens carry
-  // it in `caHash`.
+  // The pin (`sha256:<hex of its DER>`) of the trust-bundle CA the signing
+  // CA chains to — the signing CA itself for `builtin` — as join tokens
+  // carry it in `caHash`.
   string pin = 4;
 
-  // Where a rotation stands: `stable` (one CA) or `overlap` (the new CA
-  // signs and the previous one is still trusted until `overlap_until`).
+  // Where a built-in rotation stands: `stable` (one CA) or `overlap` (the
+  // new CA signs and the previous one is still trusted until
+  // `overlap_until`). Always `stable` for `file` and `exec`, which rotate
+  // outside Legion.
   string phase = 5;
 
   // When the previous CA leaves the bundle (RFC 3339); empty when `stable`.
@@ -5396,12 +5448,36 @@ message GetMeshCaReply {
   // The previous CA certificate, PEM, while it is still trusted; empty
   // otherwise.
   string previous_cert_pem = 7;
+
+  // Which provider supplies the CA on the answering manager: `builtin`,
+  // `file`, or `exec` (`clusterCa.provider`, docs/cluster-ca.md). Set even
+  // when no CA exists yet.
+  string provider = 8;
+
+  // Where the provider's CA comes from, for display: the certificate (and
+  // bundle) paths for `file`, the command for `exec`; empty for `builtin`.
+  string provider_location = 9;
+
+  // The certificates a leaf carries after itself, PEM: the intermediates
+  // between a leaf and the anchor, or (`builtin`, during a rotation's
+  // overlap) the new CA cross-signed by the previous one. Empty when the
+  // signing CA is itself in the trust bundle.
+  string chain_pem = 10;
+
+  // Why this manager will not sign right now, or what is degraded; empty
+  // when the CA is healthy. Examples: the provider's command failed (with
+  // its stderr), the CA files changed and cannot be used (the previous CA
+  // keeps signing), or this manager's CA and the one the control-lane
+  // leader recorded do not trust each other (both pins and the recording
+  // manager are named). While it names a disagreement, the manager signs
+  // no certificates and mints no join tokens.
+  string problem = 11;
 }
 
 // Request payload for RotateMeshCa.
 message RotateMeshCaRequest {}
 
-// Reply payload for RotateMeshCa.
+// Reply payload for RotateMeshCa (built-in provider only).
 message RotateMeshCaReply {
   // The new CA certificate, PEM.
   string cert_pem = 1;
@@ -5440,17 +5516,21 @@ message IssueNodeCertificateRequest {
 message IssueNodeCertificateReply {
   // The node certificate chain, PEM, leaf first. SANs: `<node>.node.legion`
   // and `legion://node/<node id>` (or the fleet names for a fleet
-  // certificate). During a CA rotation's overlap the chain also carries the
-  // new CA cross-signed by the previous one.
+  // certificate). After the leaf come the intermediates between it and the
+  // trust bundle (a `file`/`exec` provider's signing CA when it is not
+  // itself in the bundle), or, during a built-in rotation's overlap, the new
+  // CA cross-signed by the previous one.
   string cert_pem = 1;
 
   reserved 2;
   reserved "key_pem";
 
-  // The cluster CA trust bundle, PEM: the signing CA, plus the previous CA
-  // while a rotation's overlap lasts. What a node verifies managers and
-  // peers against. A worker joining with a token checks that this bundle
-  // contains the token's pinned CA before trusting it.
+  // The cluster CA trust bundle, PEM, anchor first: the built-in signing
+  // CA plus the previous CA while a rotation's overlap lasts, or what a
+  // `file`/`exec` provider trusts (docs/cluster-ca.md). What a node
+  // verifies managers and peers against. A worker joining with a token
+  // checks that this bundle contains the token's pinned CA before trusting
+  // it.
   string ca_pem = 3;
 
   // Certificate expiry as Unix seconds.
@@ -6577,12 +6657,8 @@ message HeartbeatReply {
   // field; an empty list leaves the worker's known set unchanged.
   // See docs/architecture-managers-workers.md.
   repeated string manager_addresses = 13;
-  // The pin (`sha256:<hex>`) of the cluster CA the managers sign with now.
-  // A worker whose CA bundle does not contain it re-issues its node
-  // certificate at once instead of waiting for its refresh timer: that is
-  // how a `legion net ca rotate` reaches every node within one heartbeat.
-  // Empty when no cluster CA exists yet.
-  string cluster_ca_pin = 14;
+  reserved 14;
+  reserved "cluster_ca_pin";
 
   // The direct exec sessions from `HeartbeatRequest.exec_sessions` whose
   // minting credential no longer holds: the token was deleted or expired,
@@ -6652,6 +6728,18 @@ message HeartbeatReply {
   //
   // Default: empty list.
   repeated EnvelopeResizeResult envelope_resizes = 22;
+
+  // The pins (`sha256:<hex>`) of every CA in the cluster's trust bundle as
+  // the answering manager sees it, the anchor (the CA the signing CA chains
+  // to) first. A worker whose held bundle has a different first pin, or a
+  // different set of pins, re-issues its node certificate at once instead
+  // of waiting for its refresh timer, and the reply carries the new bundle:
+  // that is how a `legion net ca rotate`, or a CA added to or removed from
+  // a `file`/`exec` provider's bundle, reaches every node within one
+  // heartbeat (docs/cluster-ca.md#rotation). Empty when no cluster CA
+  // exists yet or the manager cannot vouch for one (its provider failed, or
+  // it disagrees with the cluster); a worker then keeps what it holds.
+  repeated string cluster_ca_pins = 23;
 }
 
 // Why one allocation is being stopped.

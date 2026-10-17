@@ -491,75 +491,7 @@ impl ExecRootKey {
 /// killing it after `timeout`. Shared by the provider and the conformance
 /// harness (`legion keyring provider test`).
 pub fn run_provider_command(command: &[String], request: &Value, timeout: Duration) -> R<Value> {
-    use std::io::{Read, Write};
-    use std::process::{Command, Stdio};
-
-    let program = command
-        .first()
-        .context("exec root key provider has an empty command")?;
-    let mut child = Command::new(program)
-        .args(&command[1..])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .with_context(|| format!("failed starting root key provider `{program}`"))?;
-    {
-        let mut stdin = child.stdin.take().context("provider stdin unavailable")?;
-        // A provider that exits without reading its request closes the pipe
-        // first; its exit status below is the error worth reporting, not
-        // the broken pipe.
-        let written = stdin
-            .write_all(request.to_string().as_bytes())
-            .and_then(|()| stdin.write_all(b"\n"));
-        match written {
-            Ok(()) => {}
-            Err(err) if err.kind() == std::io::ErrorKind::BrokenPipe => {}
-            Err(err) => return Err(err.into()),
-        }
-    }
-    let mut stdout = child.stdout.take().context("provider stdout unavailable")?;
-    let mut stderr = child.stderr.take().context("provider stderr unavailable")?;
-    let out_reader = std::thread::spawn(move || {
-        let mut buf = Vec::new();
-        let _ = stdout.read_to_end(&mut buf);
-        buf
-    });
-    let err_reader = std::thread::spawn(move || {
-        let mut buf = String::new();
-        let _ = stderr.read_to_string(&mut buf);
-        buf
-    });
-    let deadline = std::time::Instant::now() + timeout;
-    let status = loop {
-        if let Some(status) = child.try_wait()? {
-            break status;
-        }
-        if std::time::Instant::now() >= deadline {
-            let _ = child.kill();
-            let _ = child.wait();
-            bail!(
-                "root key provider `{program}` did not answer within {}s",
-                timeout.as_secs()
-            );
-        }
-        std::thread::sleep(Duration::from_millis(10));
-    };
-    let stdout = out_reader.join().unwrap_or_default();
-    let stderr = err_reader.join().unwrap_or_default();
-    if !status.success() {
-        bail!(
-            "root key provider `{program}` exited with {status}: {}",
-            stderr.trim()
-        );
-    }
-    let reply: Value = serde_json::from_slice(&stdout).with_context(|| {
-        format!(
-            "root key provider `{program}` printed something other than a JSON object: {}",
-            String::from_utf8_lossy(&stdout).trim()
-        )
-    })?;
-    Ok(reply)
+    crate::util::run_json_command("root key provider", command, request, timeout)
 }
 
 fn reply_field<'a>(reply: &'a Value, field: &str, op: &str) -> R<&'a str> {

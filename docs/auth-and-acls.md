@@ -135,9 +135,11 @@ store, including ACL metadata. What it cannot read:
   ([Certificates from KV](network-handlers.md#certificates-from-kv)).
 - Private keys and password hashes. `signing_key.private_key_pem` (the
   workload-identity and boot-ticket signing keys), `net_mesh_ca.key_pem` (the
-  mesh CA key), and `acl_user.password_hash` always read as `NULL` through
-  raw SQL, however the query reaches them. A `WHERE` clause on them matches
-  nothing, and `INSERT ... SELECT` copies `NULL`.
+  built-in cluster CA key), and `acl_user.password_hash` always read as
+  `NULL` through raw SQL, however the query reaches them. A `WHERE` clause on
+  them matches nothing, and `INSERT ... SELECT` copies `NULL`. With a `file`
+  or `exec` [cluster CA provider](cluster-ca.md), the CA key is not in the
+  store at all.
 
 `state:write` is still equivalent to full control of the cluster: it can
 rewrite any row, including ACL tokens and policies. State backups
@@ -528,7 +530,14 @@ manager's private key never leaves the managers:
 - Join tokens pin the cluster CA (`caHash`), and a joining worker refuses a
   manager whose CA does not match.
 - Node keys are generated on the node. `IssueNodeCertificate` takes a CSR
-  only and never returns a private key.
+  only and never returns a private key. Managers generate their own keys the
+  same way and have a CSR signed.
+- The cluster CA is built in by default. It can instead be an intermediate
+  from your own PKI on each manager's disk (`clusterCa.provider = "file"`)
+  or an external signer such as Vault PKI (`"exec"`), in which case its key
+  never enters the state store. Legion always chooses the names, and checks
+  every certificate such a provider returns before handing it out. See
+  [The Cluster CA](cluster-ca.md).
 
 See [Managers and Workers](architecture-managers-workers.md#the-worker-plane)
 for the caller-class table and the ports, and [Rotating the cluster
@@ -541,8 +550,9 @@ JWKS) is always TLS, verified against the same CA: see
 ### Rotating the cluster CA
 
 One CA per cluster signs node, manager, and mesh certificates
-(`legion net ca show` prints the trust bundle, its pin, and the rotation
-phase). Rotate it in two steps that break no connection:
+(`legion net ca show` prints the provider, the trust bundle, its pin, and
+the rotation phase). The built-in CA rotates in two steps that break no
+connection:
 
 ```console
 $ legion net ca rotate
@@ -561,6 +571,13 @@ the rotation work until then; mint new ones after.
 3. After the overlap, the old CA leaves the bundle. Join tokens that pin it
    stop working; mint new ones. A worker that was offline for the whole
    overlap must re-join.
+
+A CA from a `file` or `exec` provider rotates outside Legion, and
+`legion net ca rotate` refuses with `FailedPrecondition` and the procedure:
+add the new CA to the trust bundle, wait a heartbeat, switch the signing CA,
+and remove the old CA a day later. Each step reaches every worker within one
+heartbeat, because heartbeat replies name the manager's whole trust bundle.
+See [The Cluster CA](cluster-ca.md#rotation).
 
 ### TLS
 
@@ -590,8 +607,9 @@ the JWKS that boot and exec tickets are verified against all ride it.
 
 - The worker sends the name `manager.legion`, and the manager answers that
   name with its cluster server certificate (`manager.legion`,
-  `legion://manager/<id>`), signed by the cluster CA. Any other name gets
-  the operator's `server.tls` certificate when one is configured.
+  `legion://manager/<id>`), signed by the cluster CA, followed by any
+  intermediates and the trust bundle. Any other name gets the operator's
+  `server.tls` certificate when one is configured.
 - The worker verifies that certificate against its join token's CA pin from
   the first byte of the first connection, before it sends its join secret,
   and against the cluster CA bundle once it holds one. A manager whose CA

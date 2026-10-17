@@ -528,13 +528,23 @@ impl Authenticator {
         // can tell its manager from whoever answers at `addr` (plan §6.5).
         // Created here on a cluster's first token.
         let ca_hash = store
-            .ensure_mesh_ca()
-            .and_then(|ca| ca.pin())
+            .cluster_ca()
+            .ensure(store)
+            .map(|view| view.pin)
             .map_err(|e| {
-                error!(error = ?e, "Failed to read or create the cluster CA for a join token");
-                Status::unavailable(format!(
-                    "the cluster CA is unavailable, so a join token can't pin it: {e:#}"
-                ))
+                error!(error = %e, "Failed to read or create the cluster CA for a join token");
+                // A misconfigured CA needs an operator; anything else may
+                // clear on retry (the CA not replicated yet, a signer down).
+                let code = match e {
+                    crate::manager::cluster_ca::CaError::FailedPrecondition(_) => {
+                        tonic::Code::FailedPrecondition
+                    }
+                    _ => tonic::Code::Unavailable,
+                };
+                Status::new(
+                    code,
+                    format!("the cluster CA is unavailable, so a join token can't pin it: {e}"),
+                )
             })?;
         store
             .insert_join_token(&record)

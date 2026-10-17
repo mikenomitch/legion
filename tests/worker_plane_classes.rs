@@ -145,7 +145,7 @@ fn worker_service(dir: &tempfile::TempDir) -> WorkerDaemonService {
         direct_exec: None,
         launch_pool: Default::default(),
         node_identity: None,
-        egress: None,
+        netd: None,
     }
 }
 

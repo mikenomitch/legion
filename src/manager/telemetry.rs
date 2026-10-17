@@ -875,6 +875,8 @@ pub struct Metrics {
     pub kv_decrypt_failures_total: Arc<CounterVec>,
     /// `legion_keyring_provider_calls_total{op,outcome}`
     pub keyring_provider_calls_total: Arc<CounterVec>,
+    /// `legion_cluster_ca_provider_calls_total{provider,op,outcome}`
+    pub cluster_ca_provider_calls_total: Arc<CounterVec>,
     /// `legion_raft_voters{lane}`
     pub raft_voters: Arc<GaugeVec>,
     /// `legion_raft_quorum{lane}`
@@ -1480,6 +1482,14 @@ impl Metrics {
             },
             series: Series::new(),
         });
+        let cluster_ca_provider_calls_total = Arc::new(CounterVec {
+            meta: FamilyMeta {
+                name: "legion_cluster_ca_provider_calls_total",
+                help: "Calls to the cluster CA provider (load|describe|sign) by provider and outcome (ok|error|refused). `refused` counts certificates Legion would not hand out.",
+                labels: &["provider", "op", "outcome"],
+            },
+            series: Series::new(),
+        });
         let raft_quorum = Arc::new(GaugeVec {
             meta: FamilyMeta {
                 name: "legion_raft_quorum",
@@ -1877,6 +1887,7 @@ impl Metrics {
             Arc::clone(&kv_rows) as Arc<dyn RenderMetric>,
             Arc::clone(&kv_decrypt_failures_total) as Arc<dyn RenderMetric>,
             Arc::clone(&keyring_provider_calls_total) as Arc<dyn RenderMetric>,
+            Arc::clone(&cluster_ca_provider_calls_total) as Arc<dyn RenderMetric>,
             Arc::clone(&runtime_spawn_delay_seconds) as Arc<dyn RenderMetric>,
             Arc::clone(&runtime_worker_threads) as Arc<dyn RenderMetric>,
             Arc::clone(&scheduler_index_candidates) as Arc<dyn RenderMetric>,
@@ -1963,6 +1974,7 @@ impl Metrics {
             kv_rows,
             kv_decrypt_failures_total,
             keyring_provider_calls_total,
+            cluster_ca_provider_calls_total,
             raft_voters,
             raft_quorum,
             raft_term,

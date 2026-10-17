@@ -2550,7 +2550,7 @@ mod tests {
 
     /// An `s3://` stand-in: records the credential each open carried,
     /// refuses unsigned reads like a private bucket, and serves signed ones
-    /// from the sealed objects a `file://` publish wrote.
+    /// from the sealed objects a `file://` `StorePublisher` wrote.
     struct PrivateBucket {
         sealed_root: PathBuf,
         seen: Mutex<Vec<Option<Credential>>>,
@@ -2619,7 +2619,7 @@ mod tests {
     }
 
     fn part_rig(target: Option<&str>, kv: Option<&str>) -> R<PartRig> {
-        use crate::content_publish::{ContentPublishing, ContentStoreAuth, FileContentPublisher};
+        use crate::content_publish::{ContentPublishing, ContentStoreAuth, StorePublisher};
         let state = tempdir()?;
         let shared = tempdir()?;
         let publisher = tempdir()?;
@@ -2633,7 +2633,7 @@ mod tests {
         let chunks = crate::checkpoint_seal::ChunkKey::derive(&[7; 32], "ck_test", "job")?;
         let published = ContentPublishing::new(
             publisher_store,
-            Arc::new(FileContentPublisher::new(shared.path())),
+            Arc::new(StorePublisher::local(shared.path())?),
         )
         .publish(&key, &chunks)?;
         let object = published

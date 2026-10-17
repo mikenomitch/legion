@@ -3092,19 +3092,26 @@ mod tests {
 
     /// A gated restore delivered without a heartbeat (a work-stream delta or
     /// a push) does not wait out `DATAPATH_WAIT`: the launch path binds the
-    /// egress proxy first (`daemon::bind_launch_datapath`), on exactly the
+    /// egress proxy first (`Netd::bind_launch`), on exactly the
     /// socket the restore waits for, and the guest resumes at once. Before,
     /// only the heartbeat bound it, so every such restore waited 5 s.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_gated_restore_delivered_without_a_heartbeat_does_not_wait() -> R<()> {
         let tmp = tempfile::tempdir()?;
         let alloc_root = tmp.path().join("allocs");
-        let proxies = crate::worker::netd::proxy::EgressProxies::new(std::sync::Arc::new(
-            crate::worker::forwarder::ForwarderContext::new(
-                std::sync::Arc::new(crate::worker::netd::NetPolicyCache::new()),
-                std::sync::Arc::new(crate::worker::netd::Denials::new()),
-            ),
+        let context = std::sync::Arc::new(crate::worker::forwarder::ForwarderContext::new(
+            std::sync::Arc::new(crate::worker::netd::NetPolicyCache::new()),
+            std::sync::Arc::new(crate::worker::netd::Denials::new()),
         ));
+        let netd = crate::worker::netd::Netd::new(
+            std::sync::Arc::new(
+                crate::worker::forwarder::UpstreamForwarder::with_context(context.clone())
+                    .with_proxies(std::sync::Arc::new(
+                        crate::worker::netd::proxy::EgressProxies::new(context),
+                    )),
+            ),
+            alloc_root.clone(),
+        );
         let delivered = crate::structs::TaskAllocation {
             allocation_id: 8,
             task_name: "box".into(),
@@ -3112,9 +3119,7 @@ mod tests {
             network: json!({ "mode": "gated" }).to_string(),
             ..Default::default()
         };
-        assert!(
-            crate::worker::daemon::bind_launch_datapath(&proxies, &alloc_root, &delivered).await
-        );
+        assert_eq!(netd.bind_launch(&delivered).await, Some(true));
 
         let ch = Backend::CloudHypervisor {
             binary: "/usr/bin/true".into(),

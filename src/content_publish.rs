@@ -20,6 +20,14 @@
 //! uploads nothing. Every published digest's index URL is recorded in the
 //! node content store's index, so a caller can name where each part lives.
 //!
+//! The store is opened through the object-storage layer
+//! ([`crate::storage::objects`]), which parses `contentStore.url`, resolves
+//! the credential, and serves both `s3://` buckets and `file://` directories
+//! behind one `ObjectStore`; every client of a `contentStore` (this
+//! publisher, the session manifests, the manager's archive reads, and a
+//! restore's chunk reads) opens it there, through [`ContentStoreTarget::open`]
+//! or [`sealed_objects_for_url`].
+//!
 //! Reads never come through the publisher. Any worker restores published
 //! content through [`crate::artifacts::ArtifactStager::fetch_sealed_into_store`],
 //! which reads the index and the chunks from the store the URL names, opens
@@ -40,18 +48,16 @@
 //! # let _ = published; Ok(()) }
 //! ```
 
-use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Arc;
 
-use object_store::aws::AmazonS3Builder;
-use object_store::local::LocalFileSystem;
+use object_store::path::Path as ObjectPath;
 use object_store::prefix::PrefixStore;
-use object_store::{path::Path as ObjectPath, ObjectStore};
+use object_store::ObjectStore;
 use serde::{Deserialize, Serialize};
 use url::Url;
 
-use crate::artifacts::{Credential, CredentialSource};
+use crate::artifacts::{AnonymousCredentials, Credential, CredentialSource};
 use crate::checkpoint_chunks::{
     ChunkSettings, KnownChunks, CHUNK_ALIGN, DEF_CHUNK_SIZE, DEF_DEDUP_WINDOW, MAX_CHUNK_SIZE,
     MIN_CHUNK_SIZE, MIN_DEDUP_WINDOW,
@@ -59,6 +65,7 @@ use crate::checkpoint_chunks::{
 use crate::checkpoint_seal::{ChunkKey, PartKey, OBJECT_PREFIX};
 use crate::content_store::{ContentDigest, ContentStore};
 use crate::prelude::*;
+use crate::storage::objects::{self, ObjectCredential, OpenOptions, StoreUrl};
 
 /// What one publish did.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -115,9 +122,9 @@ pub trait ContentPublisher: Send + Sync {
 }
 
 /// Worker config `contentStore.auth`. Absent means the node's ambient
-/// credentials (for S3: the standard AWS environment variables, then the
-/// instance profile), which is how a region's workers usually reach their own
-/// region's bucket.
+/// credentials (for S3: the `AWS_*` key variables, web identity, an ECS task
+/// role, then the instance profile), which is how a region's workers usually
+/// reach their own region's bucket.
 #[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ContentStoreAuth {
@@ -196,30 +203,9 @@ impl ContentStoreTarget {
 
     /// Admission-time validation, run when the manager loads the worker
     /// config so a typo fails at startup instead of at the first publish.
-    pub fn validate(&self) -> R<Url> {
-        let url = Url::parse(self.url.trim())
+    pub fn validate(&self) -> R<StoreUrl> {
+        let url = StoreUrl::parse(&self.url)
             .with_context(|| format!("invalid contentStore.url {:?}", self.url))?;
-        match url.scheme() {
-            "s3" => {
-                if url.host_str().unwrap_or_default().is_empty() {
-                    bail!("contentStore.url {:?} has no bucket", self.url);
-                }
-            }
-            "file" => {
-                if url.to_file_path().is_err() {
-                    bail!(
-                        "contentStore.url {:?} is not an absolute file path",
-                        self.url
-                    );
-                }
-            }
-            other => {
-                bail!("contentStore.url scheme {other:?} is not supported; use s3:// or file://")
-            }
-        }
-        if url.query().is_some_and(|q| !q.is_empty()) && url.scheme() == "file" {
-            bail!("contentStore.url {:?}: file URLs take no query", self.url);
-        }
         self.chunk_settings()?;
         if let Some(auth) = &self.auth {
             if auth.node_identity.is_some() {
@@ -227,14 +213,14 @@ impl ContentStoreTarget {
                     "contentStore.auth.nodeIdentity is not supported yet: S3 uploads need an AWS \
                      credential, and node identity tokens are not exchanged for one. Use \
                      contentStore.auth.kv, or omit auth to use the node's ambient credentials \
-                     (AWS environment variables or the instance profile)"
+                     (AWS environment variables, web identity, or the instance profile)"
                 );
             }
             match auth.kv.as_deref() {
                 Some(path) if path.trim().is_empty() => {
                     bail!("contentStore.auth.kv cannot be empty")
                 }
-                Some(_) if url.scheme() == "file" => {
+                Some(_) if url.local_root().is_some() => {
                     bail!("contentStore.auth applies to s3:// stores only")
                 }
                 _ => {}
@@ -243,22 +229,68 @@ impl ContentStoreTarget {
         Ok(url)
     }
 
+    /// How every client of a `contentStore` opens it — the publisher, the
+    /// session manifests, and the manager's archive reads: the node's own
+    /// environment supplies the region and the other `AWS_*` settings.
+    /// Session manifests ask for conditional puts.
+    pub fn open_options(conditional_put: bool) -> OpenOptions {
+        OpenOptions {
+            conditional_put,
+            ..OpenOptions::default()
+        }
+    }
+
+    /// The KV path `auth.kv` names, if any.
+    pub fn kv(&self) -> Option<&str> {
+        self.auth.as_ref().and_then(|auth| auth.kv.as_deref())
+    }
+
+    /// The credential a client of this store signs with: the AWS credential
+    /// at `auth.kv` (resolved now, so a rotated credential is picked up on
+    /// the next open), the node's ambient chain when there is no `auth`, and
+    /// none for a `file://` store.
+    pub fn object_credential(&self, credentials: &dyn CredentialSource) -> R<ObjectCredential> {
+        let url = self.validate()?;
+        if url.local_root().is_some() {
+            return Ok(ObjectCredential::Anonymous);
+        }
+        match self.kv() {
+            Some(path) => {
+                let credential = credentials
+                    .kv_credential(path, url.url().as_str())
+                    .with_context(|| format!("contentStore credentials from kv {path}"))?;
+                ObjectCredential::from_artifact(
+                    &credential,
+                    &format!("contentStore.auth.kv {path}"),
+                )
+            }
+            None => Ok(ObjectCredential::Ambient),
+        }
+    }
+
+    /// Open this store, signing with [`Self::object_credential`].
+    pub fn open(
+        &self,
+        credentials: &dyn CredentialSource,
+        conditional_put: bool,
+    ) -> R<Arc<dyn ObjectStore>> {
+        objects::open(
+            &self.validate()?,
+            &self.object_credential(credentials)?,
+            &Self::open_options(conditional_put),
+        )
+    }
+
     /// Build the publisher. `credentials` resolves `auth.kv` at publish time.
     pub fn publisher(
         &self,
         credentials: Arc<dyn CredentialSource>,
     ) -> R<Arc<dyn ContentPublisher>> {
-        let url = self.validate()?;
-        Ok(match url.scheme() {
-            "file" => Arc::new(FileContentPublisher::new(
-                url.to_file_path().expect("validated"),
-            )),
-            _ => Arc::new(S3ContentPublisher {
-                url,
-                kv: self.auth.as_ref().and_then(|a| a.kv.clone()),
-                credentials,
-            }),
-        })
+        Ok(Arc::new(StorePublisher {
+            root: self.validate()?,
+            target: self.clone(),
+            credentials,
+        }))
     }
 
     /// Whether `url` names an object in this store: the same scheme, bucket
@@ -268,230 +300,82 @@ impl ContentStoreTarget {
     /// `content/`) or another endpoint serving the same bucket name is not
     /// this store, so the store's credential is never sent there.
     pub fn contains_url(&self, url: &str) -> bool {
-        let (Ok(store), Ok(url)) = (self.validate(), Url::parse(url.trim())) else {
-            return false;
-        };
-        let endpoint = |url: &Url| {
-            url.query_pairs()
-                .find(|(name, _)| name == "endpoint")
-                .map(|(_, value)| value.into_owned())
-        };
-        let prefix = store.path().trim_end_matches('/');
-        url.scheme() == store.scheme()
-            && url.host_str() == store.host_str()
-            && endpoint(&url) == endpoint(&store)
-            && url
-                .path()
-                .strip_prefix(prefix)
-                .is_some_and(|rest| rest.starts_with('/'))
+        match (self.validate(), StoreUrl::parse(url)) {
+            (Ok(store), Ok(url)) => store.covers(&url),
+            _ => false,
+        }
     }
 
-    /// The credential an object in this store is read with: the AWS
-    /// credential at `auth.kv` (resolved now, so a rotated credential is
-    /// picked up as the publisher picks it up), the node's ambient chain
-    /// when there is no `auth`, and none for a `file://` store.
+    /// The credential an object in this store is read with by the `s3://`
+    /// artifact fetcher: the AWS credential at `auth.kv` (resolved now, so a
+    /// rotated credential is picked up as the publisher picks it up), the
+    /// node's ambient chain when there is no `auth`, and none for a
+    /// `file://` store. A KV credential that names no region is read in the
+    /// node's environment region, the region the publisher signs for: the
+    /// fetcher's own default, a fixed `us-east-1`, is for jobspec artifacts.
     pub fn read_credential(
         &self,
         credentials: &dyn CredentialSource,
         redacted_source: &str,
     ) -> R<Option<Credential>> {
-        if self.validate()?.scheme() == "file" {
+        if self.validate()?.local_root().is_some() {
             return Ok(None);
         }
-        match self.auth.as_ref().and_then(|auth| auth.kv.as_deref()) {
-            Some(path) => credentials
-                .kv_credential(path, redacted_source)
-                .with_context(|| format!("contentStore credentials from kv {path}"))
-                .map(Some),
+        match self.kv() {
+            Some(path) => {
+                let mut credential = credentials
+                    .kv_credential(path, redacted_source)
+                    .with_context(|| format!("contentStore credentials from kv {path}"))?;
+                if let Credential::Aws { region, .. } = &mut credential {
+                    if region.is_none() {
+                        *region = objects::environment_region(&|name| std::env::var(name).ok());
+                    }
+                }
+                Ok(Some(credential))
+            }
             None => Ok(Some(Credential::AwsAmbient)),
         }
     }
 }
 
-/// Publishes into a directory (a shared mount, or a test's temp dir).
-#[derive(Debug, Clone)]
-pub struct FileContentPublisher {
-    root: PathBuf,
-}
-
-impl FileContentPublisher {
-    pub fn new(root: impl Into<PathBuf>) -> Self {
-        Self { root: root.into() }
-    }
-
-    fn path_for(&self, object_name: &str) -> PathBuf {
-        self.root.join(OBJECT_PREFIX).join(object_name)
-    }
-}
-
-/// Write `bytes` to `dest` atomically: beside it, then renamed over it.
-fn write_file_atomically(dest: &Path, bytes: &[u8]) -> R<()> {
-    let dir = dest.parent().context("document path has no parent")?;
-    fs::create_dir_all(dir).with_context(|| format!("create {}", dir.display()))?;
-    let name = dest
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("document");
-    let tmp = dir.join(format!(".{name}.{}.tmp", std::process::id()));
-    fs::write(&tmp, bytes).with_context(|| format!("write {}", tmp.display()))?;
-    if let Err(err) = fs::rename(&tmp, dest) {
-        let _ = fs::remove_file(&tmp);
-        return Err(anyhow!(err).context(format!("publish to {}", dest.display())));
-    }
-    Ok(())
-}
-
-impl ContentPublisher for FileContentPublisher {
-    fn url_for(&self, object_name: &str) -> String {
-        let path = self.path_for(object_name);
-        Url::from_file_path(&path)
-            .map(|url| url.to_string())
-            .unwrap_or_else(|_| format!("file://{}", path.display()))
-    }
-
-    fn sealed_objects(&self) -> R<Arc<dyn ObjectStore>> {
-        let dir = self.root.join(OBJECT_PREFIX);
-        fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
-        // object_store writes beside the destination and renames, so a
-        // reader never sees a partial object under its final name.
-        Ok(Arc::new(
-            LocalFileSystem::new_with_prefix(&dir)
-                .with_context(|| format!("open {} as a content store", dir.display()))?,
-        ))
-    }
-
-    fn put_document(&self, object_name: &str, bytes: &[u8]) -> R<String> {
-        let dest = self.root.join(object_name);
-        write_file_atomically(&dest, bytes)?;
-        Ok(Url::from_file_path(&dest)
-            .map(|url| url.to_string())
-            .unwrap_or_else(|_| format!("file://{}", dest.display())))
-    }
-}
-
-/// Publishes to an S3-compatible bucket. The URL takes the same `region` and
-/// `endpoint` query parameters the `s3://` fetcher reads, and they are kept on
-/// the published URL so readers reach the same endpoint.
-pub struct S3ContentPublisher {
-    url: Url,
-    kv: Option<String>,
+/// Publishes into the store a `contentStore.url` names: an S3-compatible
+/// bucket or a directory (a shared mount, or a test's temp dir). An `s3://`
+/// URL's `region` and `endpoint` query parameters are kept on every
+/// published URL, so readers reach the same endpoint. Uploads stream in
+/// parts and land whole: a reader never sees a partial object under its
+/// final name.
+pub struct StorePublisher {
+    root: StoreUrl,
+    target: ContentStoreTarget,
     credentials: Arc<dyn CredentialSource>,
 }
 
-impl std::fmt::Debug for S3ContentPublisher {
+impl std::fmt::Debug for StorePublisher {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("S3ContentPublisher")
-            .field("url", &self.url.as_str())
-            .field("kv", &self.kv)
+        f.debug_struct("StorePublisher")
+            .field("root", &self.root.url().as_str())
+            .field("kv", &self.target.kv())
             .finish_non_exhaustive()
     }
 }
 
-impl S3ContentPublisher {
-    fn key_for(&self, object_name: &str) -> String {
-        let prefix = self.url.path().trim_matches('/');
-        if prefix.is_empty() {
-            format!("{OBJECT_PREFIX}/{object_name}")
-        } else {
-            format!("{prefix}/{OBJECT_PREFIX}/{object_name}")
-        }
-    }
-
-    fn client(&self) -> R<object_store::aws::AmazonS3> {
-        let credential = match self.kv.as_deref() {
-            Some(path) => Some(
-                self.credentials
-                    .kv_credential(path, self.url.as_str())
-                    .with_context(|| format!("contentStore credentials from kv {path}"))?,
-            ),
-            None => None,
+impl StorePublisher {
+    /// A publisher into a local directory, which takes no credential.
+    pub fn local(root: impl AsRef<Path>) -> R<Self> {
+        let target = ContentStoreTarget {
+            url: objects::local_url(root.as_ref()),
+            ..ContentStoreTarget::default()
         };
-        s3_client(&self.url, credential)
+        Ok(Self {
+            root: target.validate()?,
+            target,
+            credentials: Arc::new(AnonymousCredentials),
+        })
     }
-}
 
-/// An S3 client for the bucket an `s3://bucket/prefix?region=…&endpoint=…`
-/// URL names. The URL's `region` and `endpoint` win over the credential's;
-/// with no credential the client uses the ambient chain (the AWS_*
-/// variables, web identity, then the instance profile). Shared by the
-/// worker's publisher and the manager's archive reads.
-pub fn s3_client(url: &Url, credential: Option<Credential>) -> R<object_store::aws::AmazonS3> {
-    s3_builder(url, credential)?
-        .build()
-        .context("build s3 client for contentStore")
-}
-
-/// [`s3_client`] with conditional writes on: `PutMode::Create` sends
-/// `If-None-Match: *` and `PutMode::Update` sends `If-Match`, as the
-/// session manifests' generations need ([`crate::session_manifest`]).
-pub fn s3_client_conditional(
-    url: &Url,
-    credential: Option<Credential>,
-) -> R<object_store::aws::AmazonS3> {
-    s3_builder(url, credential)?
-        .with_conditional_put(object_store::aws::S3ConditionalPut::ETagMatch)
-        .build()
-        .context("build s3 client for contentStore")
-}
-
-fn s3_builder(url: &Url, credential: Option<Credential>) -> R<AmazonS3Builder> {
-    let bucket = url.host_str().context("contentStore.url has no bucket")?;
-    let mut region: Option<String> = None;
-    let mut endpoint: Option<String> = None;
-    if let Some(Credential::Aws {
-        region: r,
-        endpoint: e,
-        ..
-    }) = &credential
-    {
-        region = r.clone();
-        endpoint = e.clone();
-    }
-    for (name, value) in url.query_pairs() {
-        match name.as_ref() {
-            "region" => region = Some(value.into_owned()),
-            "endpoint" => endpoint = Some(value.into_owned()),
-            _ => {}
-        }
-    }
-    // `from_env` is the ambient chain: AWS_* variables, then the instance
-    // profile, when no explicit keys are set below.
-    let mut builder = AmazonS3Builder::from_env().with_bucket_name(bucket);
-    if let Some(region) = region {
-        builder = builder.with_region(region);
-    }
-    if let Some(endpoint) = endpoint {
-        let allow_http = endpoint.starts_with("http://");
-        builder = builder.with_endpoint(endpoint).with_allow_http(allow_http);
-    }
-    match credential {
-        Some(Credential::Aws {
-            access_key_id,
-            secret_access_key,
-            session_token,
-            ..
-        }) => {
-            builder = builder
-                .with_access_key_id(access_key_id)
-                .with_secret_access_key(secret_access_key);
-            if let Some(token) = session_token {
-                builder = builder.with_token(token);
-            }
-        }
-        Some(other) => bail!("contentStore needs an aws credential, got {other:?}"),
-        None => {}
-    }
-    Ok(builder)
-}
-
-/// The object key of `object_name` under an `s3://bucket/prefix` URL's
-/// prefix.
-pub fn s3_key(url: &Url, object_name: &str) -> String {
-    let prefix = url.path().trim_matches('/');
-    if prefix.is_empty() {
-        object_name.to_string()
-    } else {
-        format!("{prefix}/{object_name}")
+    /// The client, opened per call so a rotated KV credential is picked up.
+    fn client(&self) -> R<Arc<dyn ObjectStore>> {
+        self.target.open(self.credentials.as_ref(), false)
     }
 }
 
@@ -499,97 +383,75 @@ pub fn s3_key(url: &Url, object_name: &str) -> String {
 /// `s3://` root's query (`region`, `endpoint`) so readers reach the same
 /// endpoint.
 pub fn document_url(root: &Url, object_name: &str) -> String {
-    match root.scheme() {
-        "file" => {
-            let path = root
-                .to_file_path()
-                .map(|path| path.join(object_name))
-                .unwrap_or_else(|_| PathBuf::from(object_name));
-            Url::from_file_path(&path)
-                .map(|url| url.to_string())
-                .unwrap_or_else(|_| format!("file://{}", path.display()))
-        }
-        _ => {
-            let mut url = root.clone();
-            url.set_path(&format!("/{}", s3_key(root, object_name)));
-            url.to_string()
-        }
-    }
+    objects::object_url(root, object_name)
 }
 
 /// The sealed-object directory a published object's URL is in, as an object
 /// store rooted there, and the object's name in it: what a reading node
 /// fetches a part's index and chunks through
-/// ([`crate::checkpoint_chunks::fetch_part`]). `credential` signs `s3://`
-/// reads: the node's own `contentStore` credential
+/// ([`crate::checkpoint_chunks::fetch_part`]). The store is opened through
+/// the object-storage layer, as the publisher's is. `credential` signs
+/// `s3://` reads: the node's own `contentStore` credential
 /// ([`ContentStoreTarget::read_credential`], `AwsAmbient` for the ambient
 /// chain), or `None` to read anonymously.
 pub fn sealed_objects_for_url(
     url: &str,
     credential: Option<Credential>,
 ) -> R<(Arc<dyn ObjectStore>, String)> {
-    let parsed = Url::parse(url.trim()).with_context(|| format!("invalid part URL {url:?}"))?;
-    match parsed.scheme() {
-        "file" => {
-            let path = parsed
-                .to_file_path()
-                .map_err(|_| anyhow!("part URL {url:?} is not an absolute file path"))?;
-            let name = path
-                .file_name()
-                .and_then(|name| name.to_str())
-                .with_context(|| format!("part URL {url:?} names no object"))?
-                .to_string();
-            let dir = path.parent().context("part URL has no directory")?;
-            let objects = LocalFileSystem::new_with_prefix(dir)
-                .with_context(|| format!("open {} as a content store", dir.display()))?;
-            Ok((Arc::new(objects), name))
+    let store = StoreUrl::parse(url).with_context(|| format!("invalid part URL {url:?}"))?;
+    let object = store.key("")?;
+    let mut parts: Vec<_> = object.parts().collect();
+    let name = parts
+        .pop()
+        .filter(|_| !parts.is_empty())
+        .map(|name| name.as_ref().to_string())
+        .with_context(|| format!("part URL {url:?} names no object under a prefix"))?;
+    let dir: ObjectPath = parts.into_iter().collect();
+    let credential = match credential {
+        None => ObjectCredential::Anonymous,
+        Some(credential) => {
+            ObjectCredential::from_artifact(&credential, "the contentStore read credential")?
         }
-        "s3" => {
-            let key = parsed.path().trim_start_matches('/');
-            let (dir, name) = key
-                .rsplit_once('/')
-                .with_context(|| format!("part URL {url:?} names no object under a prefix"))?;
-            let client = match credential {
-                None => s3_builder(&parsed, None)?.with_skip_signature(true),
-                Some(Credential::AwsAmbient) => s3_builder(&parsed, None)?,
-                Some(credential) => s3_builder(&parsed, Some(credential))?,
-            }
-            .build()
-            .context("build s3 client for contentStore")?;
-            Ok((Arc::new(PrefixStore::new(client, dir)), name.to_string()))
-        }
-        other => bail!(
-            "part URL scheme {other:?} is not supported; parts live in s3:// or file:// stores"
-        ),
-    }
+    };
+    let objects = objects::open(
+        &store,
+        &credential,
+        &ContentStoreTarget::open_options(false),
+    )?;
+    Ok((Arc::new(PrefixStore::new(objects, dir)), name))
 }
 
-impl ContentPublisher for S3ContentPublisher {
+/// A private current-thread runtime: publishing is blocking by contract
+/// (like the fetchers), and object_store is async.
+fn publish_runtime() -> R<tokio::runtime::Runtime> {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .context("build content publish runtime")
+}
+
+impl ContentPublisher for StorePublisher {
     fn url_for(&self, object_name: &str) -> String {
-        let mut url = self.url.clone();
-        url.set_path(&format!("/{}", self.key_for(object_name)));
-        url.to_string()
+        self.root
+            .object_url(&format!("{OBJECT_PREFIX}/{object_name}"))
     }
 
     fn sealed_objects(&self) -> R<Arc<dyn ObjectStore>> {
-        let prefix = self.key_for("");
+        // Objects land whole: a local put writes beside its destination and
+        // renames, and an S3 put is atomic.
         Ok(Arc::new(PrefixStore::new(
             self.client()?,
-            prefix.trim_end_matches('/'),
+            self.root.key(OBJECT_PREFIX)?,
         )))
     }
 
     fn put_document(&self, object_name: &str, bytes: &[u8]) -> R<String> {
         let client = self.client()?;
-        let object = ObjectPath::from(s3_key(&self.url, object_name));
-        let url = document_url(&self.url, object_name);
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .context("build content publish runtime")?;
-        // A single PUT replaces the object atomically: readers see the old
+        let object = self.root.key(object_name)?;
+        let url = self.root.object_url(object_name);
+        // A single put replaces the object atomically: readers see the old
         // document or the new one, never a mix.
-        runtime
+        publish_runtime()?
             .block_on(client.put(&object, bytes.to_vec().into()))
             .with_context(|| format!("write {url}"))?;
         Ok(url)
@@ -726,6 +588,7 @@ mod tests {
     use super::*;
     use crate::artifacts::AnonymousCredentials;
     use crate::content_store::{ContentClass, ContentStoreConfig, PutOptions};
+    use std::fs;
 
     fn target(raw: serde_json::Value) -> R<ContentStoreTarget> {
         Ok(serde_json::from_value(raw)?)
@@ -855,8 +718,7 @@ mod tests {
         let other_dir = tempfile::tempdir()?;
         let other_store = open_store(other_dir.path())?;
         other_store.put_bytes(ContentClass::Snapshots, &bytes, PutOptions::default())?;
-        let other =
-            ContentPublishing::new(other_store, Arc::new(FileContentPublisher::new(&shared)));
+        let other = ContentPublishing::new(other_store, Arc::new(StorePublisher::local(&shared)?));
         let third = other.publish(&key, &chunk_key())?;
         assert_eq!(third.uploaded_bytes, 0);
         assert_eq!(third.url, first.url);
@@ -896,14 +758,17 @@ mod tests {
         let key = part_key(&entry.digest);
         let shared = dir.path().join("shared");
         let publishing =
-            ContentPublishing::new(store.clone(), Arc::new(FileContentPublisher::new(&shared)));
+            ContentPublishing::new(store.clone(), Arc::new(StorePublisher::local(&shared)?));
         let err = publishing.publish(&key, &chunk_key()).unwrap_err();
         assert!(format!("{err:#}").contains("corrupt"), "{err:#}");
         // No index was written, so nothing names the bad bytes, and the
         // corrupt blob left the store.
-        let names: Vec<_> = fs::read_dir(shared.join("sealed"))?
-            .map(|entry| entry.unwrap().file_name())
-            .collect();
+        let names: Vec<_> = match fs::read_dir(shared.join("sealed")) {
+            Ok(dir) => dir.map(|entry| entry.unwrap().file_name()).collect(),
+            // Nothing was written, not even the directory.
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+            Err(err) => return Err(err.into()),
+        };
         assert!(names.len() <= 1, "at most the one chunk: {names:?}");
         assert!(store.get(&entry.digest)?.is_none());
         Ok(())
@@ -1106,7 +971,7 @@ mod tests {
             // The whole publish, as a worker runs it: a fresh destination
             // each run, so every run seals and writes the full part.
             let publishing =
-                ContentPublishing::new(store.clone(), Arc::new(FileContentPublisher::new(&shared)));
+                ContentPublishing::new(store.clone(), Arc::new(StorePublisher::local(&shared)?));
             let started = std::time::Instant::now();
             let published = publishing.publish(&key, &chunk_key())?;
             let secs = started.elapsed().as_secs_f64();

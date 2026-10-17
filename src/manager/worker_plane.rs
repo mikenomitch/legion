@@ -19,17 +19,19 @@
 //! - caches one channel per (CA, address, name), like the dispatcher's
 //!   per-address cache before it.
 //!
-//! The manager mints its own certificates from the CA key it already holds
-//! through the store, re-minting before they reach a third of their life.
-//! The same materials back the cluster TLS the manager serves on its own
-//! port to workers (`crate::manager::listener`).
+//! The manager mints its own certificates through the cluster CA provider
+//! (`Store::cluster_ca`, docs/cluster-ca.md): it generates the key and a
+//! CSR, and the provider signs. It re-mints before a certificate reaches a
+//! third of its life. The same materials back the cluster TLS the manager
+//! serves on its own port to workers (`crate::manager::daemon`).
 
 use crate::cluster_tls::{
     certified_key, client_config, tls_channel, NamedServerVerifier, SwappableIdentity,
     SwappableRoots,
 };
+use crate::manager::cluster_ca::CaView;
 use crate::manager::mesh_ca::{
-    fleet_dns_name, issue_manager_cert, node_dns_name, ManagerCertKind, NODE_CERT_REFRESH_AFTER,
+    fleet_dns_name, node_dns_name, ManagerCertKind, NODE_CERT_REFRESH_AFTER,
 };
 use crate::prelude::*;
 use crate::storage::store::Store;
@@ -41,8 +43,8 @@ use std::time::{Duration, Instant};
 use tonic::transport::Channel;
 use tonic::Status;
 
-/// How long a dial reuses the cluster CA's pin and this manager's material
-/// for it before reading the CA row again. A session start dials a worker
+/// How long a dial reuses the cluster CA's view and this manager's material
+/// for it before asking the provider again. A session start dials a worker
 /// per call; reading and parsing the CA twice per call was a fifth of the
 /// manager's share of a start. A rotated CA is picked up within this long,
 /// and the rotation's bundle still trusts the previous CA meanwhile.
@@ -127,14 +129,19 @@ pub fn worker_protocol_version(node: &Node) -> u64 {
         .unwrap_or(0)
 }
 
-/// One cluster CA's worth of manager TLS material. Keyed by the signing
-/// CA's pin, so several in-process clusters (tests) and a rotation each get
-/// their own.
+/// One cluster CA's worth of manager TLS material. Keyed by the CA view's
+/// fingerprint (signing CA, chain, bundle), so several in-process clusters
+/// (tests), a rotation, and a provider's bundle change each get their own.
 pub struct ManagerMaterials {
     pub client_identity: Arc<SwappableIdentity>,
     pub server_identity: Arc<SwappableIdentity>,
     pub roots: Arc<SwappableRoots>,
-    minted_at: Mutex<Instant>,
+    /// When to re-mint: a third of the shorter certificate's lifetime, at
+    /// most [`NODE_CERT_REFRESH_AFTER`] after minting.
+    refresh_at: Mutex<Instant>,
+    /// A background re-mint (a provider that signs out of process) is
+    /// running.
+    reminting: std::sync::atomic::AtomicBool,
 }
 
 impl std::fmt::Debug for ManagerMaterials {
@@ -153,7 +160,8 @@ pub struct WorkerPlane {
     current: Mutex<HashMap<usize, CurrentCa>>,
 }
 
-/// One store's CA pin and this manager's material for it, as last read.
+/// One store's CA fingerprint and this manager's material for it, as last
+/// read.
 struct CurrentCa {
     /// The store it was read from: a dropped store's address can be reused
     /// by the next one, which must not inherit this entry.
@@ -201,56 +209,98 @@ impl WorkerPlane {
 
     /// This manager's TLS material for the cluster `store` belongs to,
     /// minted on first use and re-minted after a third of its life. Creates
-    /// the cluster CA when none exists yet (a replicated write, so only a
-    /// control-lane leader can). A non-leader without a CA returns an error
-    /// without proposing anything: its callers retry until the leader's CA
-    /// replicates, and a doomed proposal would log an ERROR per attempt.
+    /// the built-in cluster CA when none exists yet (a replicated write, so
+    /// only a control-lane leader can). A non-leader without a CA returns an
+    /// error without proposing anything: its callers retry until the
+    /// leader's CA replicates, and a doomed proposal would log an ERROR per
+    /// attempt. Other providers always have a CA, or an error saying why
+    /// not (docs/cluster-ca.md).
     pub fn materials(&self, store: &Store) -> R<Arc<ManagerMaterials>> {
         Ok(self.materials_with_pin(store)?.1)
     }
 
-    /// [`Self::materials`], with the pin of the CA they were minted from.
+    /// [`Self::materials`], with the fingerprint of the CA view they were
+    /// minted under.
     fn materials_with_pin(&self, store: &Store) -> R<(String, Arc<ManagerMaterials>)> {
-        let ca = match store.mesh_ca()? {
-            Some(ca) => ca,
+        let cluster_ca = store.cluster_ca();
+        let view = match cluster_ca.current(store)? {
+            Some(view) => view,
             None if !store.is_raft_leader(crate::storage::Lane::Control) => {
                 bail!("the cluster CA has not replicated to this manager yet")
             }
-            None => store
-                .ensure_mesh_ca()
+            None => cluster_ca
+                .ensure(store)
                 .context("the cluster CA does not exist yet and could not be created")?,
         };
-        let pin = ca.pin()?;
+        let key = view.fingerprint();
         let existing = self
             .materials
             .lock()
             .unwrap_or_else(|p| p.into_inner())
-            .get(&pin)
+            .get(&key)
             .cloned();
         if let Some(materials) = existing {
-            let stale = materials
-                .minted_at
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .elapsed()
-                >= NODE_CERT_REFRESH_AFTER;
+            let stale = Instant::now()
+                >= *materials
+                    .refresh_at
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner());
             if stale {
-                self.mint_into(&materials, &ca)?;
+                if cluster_ca.signs_locally() {
+                    self.mint_into(store, &materials, &view)?;
+                } else {
+                    // An out-of-process signer can take seconds: re-mint in
+                    // the background while the current certificates, which
+                    // still have two thirds of their life, keep serving.
+                    self.remint_in_background(store, &materials, &view);
+                }
             }
-            return Ok((pin, materials));
+            return Ok((key, materials));
         }
         let materials = Arc::new(ManagerMaterials {
             client_identity: SwappableIdentity::new(),
             server_identity: SwappableIdentity::new(),
-            roots: SwappableRoots::from_pem(&ca.bundle_pem())?,
-            minted_at: Mutex::new(Instant::now()),
+            roots: SwappableRoots::from_pem(&view.bundle_pem)?,
+            refresh_at: Mutex::new(Instant::now()),
+            reminting: std::sync::atomic::AtomicBool::new(false),
         });
-        self.mint_into(&materials, &ca)?;
+        self.mint_into(store, &materials, &view)?;
         self.materials
             .lock()
             .unwrap_or_else(|p| p.into_inner())
-            .insert(pin.clone(), materials.clone());
-        Ok((pin, materials))
+            .insert(key.clone(), materials.clone());
+        Ok((key, materials))
+    }
+
+    fn remint_in_background(
+        &self,
+        store: &Store,
+        materials: &Arc<ManagerMaterials>,
+        view: &CaView,
+    ) {
+        use std::sync::atomic::Ordering;
+        if materials.reminting.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        let store = store.clone();
+        let for_thread = materials.clone();
+        let view = view.clone();
+        let spawned = std::thread::Builder::new()
+            .name("manager-cert-remint".into())
+            .spawn(move || {
+                let materials = for_thread;
+                if let Err(err) = WorkerPlane::global().mint_into(&store, &materials, &view) {
+                    warn!(
+                        error = %format!("{err:#}"),
+                        "Could not re-mint this manager's cluster certificates; keeping the \
+                         current ones and retrying"
+                    );
+                }
+                materials.reminting.store(false, Ordering::SeqCst);
+            });
+        if spawned.is_err() {
+            materials.reminting.store(false, Ordering::SeqCst);
+        }
     }
 
     /// The CA pin and material a dial uses, read from the store at most
@@ -289,38 +339,36 @@ impl WorkerPlane {
         Ok((pin, materials))
     }
 
-    fn mint_into(
-        &self,
-        materials: &ManagerMaterials,
-        ca: &crate::storage::netpolicy_store::MeshCa,
-    ) -> R<()> {
+    fn mint_into(&self, store: &Store, materials: &ManagerMaterials, view: &CaView) -> R<()> {
         let manager_id = self.manager_id();
-        let (client_pem, client_key, _) = issue_manager_cert(
-            &ca.cert_pem,
-            &ca.key_pem,
-            &manager_id,
-            ManagerCertKind::Client,
-        )?;
-        let (server_pem, server_key, _) = issue_manager_cert(
-            &ca.cert_pem,
-            &ca.key_pem,
-            &manager_id,
-            ManagerCertKind::Server,
-        )?;
-        materials.client_identity.set(certified_key(
-            &format!("{client_pem}{}", ca.chain_suffix()),
-            &client_key,
-        )?);
-        materials.server_identity.set(certified_key(
-            &format!("{server_pem}{}", ca.server_chain_suffix()),
-            &server_key,
-        )?);
-        materials.roots.set_pem(&ca.bundle_pem())?;
+        let cluster_ca = store.cluster_ca();
+        let (client, client_key) = cluster_ca
+            .issue_manager_cert(store, &manager_id, ManagerCertKind::Client)
+            .map_err(|err| anyhow!("{err}"))?;
+        let (server, server_key) = cluster_ca
+            .issue_manager_cert(store, &manager_id, ManagerCertKind::Server)
+            .map_err(|err| anyhow!("{err}"))?;
+        materials
+            .client_identity
+            .set(certified_key(&client.chain(), &client_key)?);
+        materials
+            .server_identity
+            .set(certified_key(&server.server_chain(), &server_key)?);
+        materials.roots.set_pem(&view.bundle_pem)?;
+        // A third of the shorter lifetime, and never later than the
+        // built-in 8 hours, so a provider that issues shorter certificates
+        // than asked is still re-minted in time.
+        let lifetime = client.lifetime().min(server.lifetime());
+        let refresh = (lifetime / 3).min(NODE_CERT_REFRESH_AFTER);
         *materials
-            .minted_at
+            .refresh_at
             .lock()
-            .unwrap_or_else(|p| p.into_inner()) = Instant::now();
-        debug!(manager_id = %manager_id, "Minted manager cluster certificates");
+            .unwrap_or_else(|p| p.into_inner()) = Instant::now() + refresh;
+        debug!(
+            manager_id = %manager_id,
+            provider = cluster_ca.kind(),
+            "Minted manager cluster certificates"
+        );
         Ok(())
     }
 

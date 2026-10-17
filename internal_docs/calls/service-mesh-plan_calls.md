@@ -227,6 +227,13 @@ listener is where PROXY v2, mTLS termination, and wake-on-request attach).
 
 ## 10. The mesh CA issues node certificates with manager-generated keys, not CSRs
 
+> **Superseded by [worker-plane-auth calls entry 11](worker-plane-auth-plan_calls.md#11-workers-send-a-csr-departing-from-mesh_cas-manager-generated-keys)**
+> (workers send a CSR; the manager never generates or returns a node's
+> private key). The CA itself is no longer necessarily in the state store
+> either: [`cluster-ca-provider-plan.md`](../plans/cluster-ca-provider-plan.md)
+> lets an operator's CA or an external signer issue these certificates.
+> Kept as the record of why the first version shipped keys over the wire.
+
 **Call.** `IssueNodeCertificate` returns a certificate *and* its private key
 over the authenticated, TLS-capable worker channel; the node keeps both in
 memory only and re-issues after a restart. The CA itself is generated on

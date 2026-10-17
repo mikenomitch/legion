@@ -669,13 +669,13 @@ fn tool_defs() -> Vec<ToolDef> {
         },
         ToolDef {
             name: "legion_net_ca_show",
-            description: "The cluster CA (PEM, never a key): the trust bundle (both CAs during a rotation), the pin join tokens carry, and the rotation phase. What a non-Legion client trusts to reach a mesh-TLS port or a worker plane. Empty until the first join token or node certificate.",
+            description: "The cluster CA as the answering manager sees it (PEM, never a key): the provider (builtin, file, or exec) and where it comes from, the trust bundle (both CAs during a built-in rotation), the chain leaves carry, the pin join tokens carry, the rotation phase, and `problem` when this manager will not sign (an unusable provider, or a CA that disagrees with the cluster's). What a non-Legion client trusts to reach a mesh-TLS port or a worker plane. Empty until the first join token or node certificate.",
             input_schema: empty_schema,
             mutates: false,
         },
         ToolDef {
             name: "legion_net_ca_rotate",
-            description: "Rotate the cluster CA in two steps: the new CA (cross-signed by the old one) signs at once, the old one stays trusted for 24 hours, and nodes re-issue within one heartbeat. No connection breaks. Mutating.",
+            description: "Rotate the built-in cluster CA in two steps: the new CA (cross-signed by the old one) signs at once, the old one stays trusted for 24 hours, and nodes re-issue within one heartbeat. No connection breaks. Fails with FailedPrecondition, naming the procedure, when the CA comes from a `file` or `exec` provider, which rotate outside Legion. Mutating.",
             input_schema: empty_schema,
             mutates: true,
         },

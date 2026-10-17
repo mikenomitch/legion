@@ -94,6 +94,8 @@ let secrets = import "secrets.ncl" in
 - `file://<path>` or a bare local path: replicate to a local directory via
   rustyriver's `FileReplicaClient` (useful for tests and single-host backups).
 - Empty string: replication is disabled (local SQLite only).
+- Any other `<scheme>://` URL (`gs://`, `az://`) fails the boot:
+  `scheme "gs" is not supported; use s3:// or file://`.
 
 ## Credentials
 
@@ -109,6 +111,16 @@ is configured wins:
 | 3 | Web identity | `AWS_WEB_IDENTITY_TOKEN_FILE` + `AWS_ROLE_ARN` (+ `AWS_ROLE_SESSION_NAME`). EKS IRSA injects these into the pod. |
 | 4 | ECS task role | `AWS_CONTAINER_CREDENTIALS_RELATIVE_URI`, which ECS sets. |
 | 5 | EC2 instance metadata | Nothing: this is what happens when none of the above is set. |
+
+This is the order every object store in Legion resolves ambient
+credentials in: a worker's [`contentStore`](artifacts.md#publishing-content)
+and the manager's archive reads use sources 2 to 5 the same way. Three things
+are specific to streaming persistence: the `credentials` block, the refusals
+above (a `contentStore` warns and continues down the chain instead), and that
+its stores are described entirely by its own config. The
+bucket, region and endpoint come from `replicaUrl` and
+`lease.objectStorage`, and the environment's other `AWS_*` store settings
+(`AWS_REGION`, `AWS_ENDPOINT`, `AWS_ALLOW_HTTP`) are not read.
 
 Sources 3 to 5 are short-lived and refresh themselves in-process: the manager
 never restarts for a rotation, and the WAL sync loop does not pause for it.

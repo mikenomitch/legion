@@ -336,9 +336,13 @@ pub fn mint_exec_ticket(
         )
         .map_err(|e| Status::internal(format!("failed to sign the exec ticket: {e:#}")))?;
     let ca_pem = store
-        .mesh_ca()
-        .map_err(|e| Status::internal(format!("failed to load the cluster CA: {e}")))?
-        .map(|ca| ca.bundle_pem())
+        .cluster_ca()
+        .current(store)
+        .map_err(|e| {
+            let status = e.to_status();
+            Status::new(status.code(), format!("failed to load the cluster CA: {e}"))
+        })?
+        .map(|view| view.bundle_pem)
         .unwrap_or_default();
 
     info!(

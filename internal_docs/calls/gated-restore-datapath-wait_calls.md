@@ -15,13 +15,16 @@ rank.
 **Call.** `WorkerDaemonService::accept_work`, which every push and every
 work-stream delta goes through, binds a gated sandbox's egress proxy on
 `<alloc>/.sandbox/vsock.sock_1080` before it launches the task
-(`daemon::bind_launch_datapath`, `EgressProxies::ensure`). The heartbeat
-already bound it before its own reconcile. The spec is built by the same
-function the heartbeat's `proxy_specs` uses, so the next sync sees the
-listener as its own and keeps it. The bind also wakes the heartbeat.
+(`Netd::bind_launch`, `EgressProxies::ensure`). The heartbeat already bound
+it before its own reconcile. The spec is built by `specs::proxy_specs`, the
+same function the heartbeat's desired set uses, so the next sync sees the
+listener as its own and keeps it. The bind is a method on the `Netd`
+boundary, so a `legion netd` process would carry it as one more input. The bind also wakes the heartbeat.
 Provisional starts return from `accept_work` before the bind, and that is
 fine: session tasks refuse gated networking at submit, and an edge-started
-sandbox gates on its TAP device, not on the vsock datapath.
+sandbox gates on its TAP device, not on the vsock datapath. A gated
+container or exec task is skipped too: its proxy binds inside its
+namespace, which the heartbeat creates.
 
 **Alternatives.** (a) Shorten `DATAPATH_WAIT`, so a miss costs less. (b)
 Have the restore wake the heartbeat and wait for the beat that binds the
@@ -32,7 +35,7 @@ the resolver, the upstream listeners, and the policy.
 has no policy, so it resets each connection, and its resolver and upstream
 sockets are not bound yet. The guest resumes with a working door that
 refuses for about one heartbeat round trip, instead of no door at all for
-5 seconds. The service now carries a handle on the node's egress proxies.
+5 seconds. The worker service now carries a handle on the `Netd`.
 
 **Why (performance, simplicity).** The wait exists for a transient bind
 error, and the restore should never be the thing waiting on a heartbeat

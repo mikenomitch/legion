@@ -1122,9 +1122,17 @@ rule on `manifests/` is how long an idle `manifestOnly` instance lives: once
 its manifest expires, the instance is gone.
 
 The manager reads, lists, and deletes manifests itself, so it needs read,
-list, and delete access to every `contentStore`. A bucket whose worker type
-sets `contentStore.auth.kv` is reached with that credential, and otherwise
-with the manager's ambient credentials (instance role, environment).
+list, and delete access to every `contentStore`. A manifest URL under a
+worker type's `contentStore` that sets `contentStore.auth.kv` (the same
+bucket, the same `endpoint`, under its prefix: the rule a restoring node
+applies) is reached with that credential. Any other is reached with the
+manager's ambient credentials, resolved in the same order a worker's are
+(the `AWS_*` key variables, web identity, an ECS task role, then the
+instance profile; see
+[Publishing content](artifacts.md#publishing-content)). An ambiguous
+configuration (one web-identity variable without the other, or EKS Pod
+Identity) continues down the chain to the instance profile with a warning,
+as a worker's does.
 
 ## Identity after a resume
 
@@ -1466,8 +1474,9 @@ moves the guest onto the **restoring allocation's own** socket:
 - cloud-hypervisor gets the socket rewritten in the restore's own copy of
   the snapshot's `config.json`, the same rewrite a fork's TAP uses.
 
-The datapath judges every connection by the listener it arrived on. So the restored guest's traffic is attributed to the new allocation and
-judged by the policy in force **now**: a `require` policy applied while the
+The datapath judges every connection by the listener it arrived on. So the
+restored guest's traffic is attributed to the new allocation and judged by
+the policy in force **now**: a `require` policy applied while the
 instance was suspended applies to its first connection after the resume. A
 fork is its own allocation with its own socket, so its traffic, denials, and
 service-graph edges are its own, and forks cannot collide on the network

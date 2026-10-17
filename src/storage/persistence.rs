@@ -1,9 +1,9 @@
 use crate::prelude::*;
-use crate::storage::raft::driver::MultiRaftDriver;
-use crate::storage::s3_credentials::{
-    build_s3_store, resolve_credential_source, resolve_from_process_env, CredentialSource,
-    S3Location,
+use crate::storage::objects::{
+    self, AwsCredential, AwsKeys, ObjectCredential, OpenOptions, Principal, RegionDefault,
+    S3Location, UrlOrPath,
 };
+use crate::storage::raft::driver::MultiRaftDriver;
 use crate::storage::store::Store;
 use crate::structs::{
     PersistenceConfigFull, PersistenceType, StreamingCredentialsConfig, StreamingLeaseProvider,
@@ -359,16 +359,22 @@ fn wait_for_exit(slot: &ExitSlot, deadline: std::time::Instant) -> bool {
 fn resolve_streaming_credentials(
     cfg: &StreamingPersistenceConfigFull,
     env: &dyn Fn(&str) -> Option<String>,
-) -> R<Option<CredentialSource>> {
+) -> R<Option<Principal>> {
     let uses_lease = matches!(cfg.lease.provider, StreamingLeaseProvider::ObjectStorage);
-    if !is_object_store_url(&cfg.replica_url) && !uses_lease {
+    let replica = objects::url_or_path(&cfg.replica_url).with_context(|| {
+        format!(
+            "invalid persistence.streaming.replicaUrl {:?}",
+            cfg.replica_url
+        )
+    })?;
+    if !matches!(replica, UrlOrPath::S3(_)) && !uses_lease {
         return Ok(None);
     }
-    let source = resolve_credential_source(cfg.credentials.as_ref(), env)?;
+    let source = objects::resolve_principal(&streaming_credential(cfg.credentials.as_ref()), env)?;
     // object_store derives the STS endpoint from the store's region, and
     // `auto` (the lease's default, which R2 wants) is not an AWS region.
     if uses_lease
-        && matches!(source, CredentialSource::WebIdentity { .. })
+        && matches!(source, Principal::WebIdentity { .. })
         && cfg.lease.object_storage.region.trim() == "auto"
     {
         bail!(
@@ -380,10 +386,46 @@ fn resolve_streaming_credentials(
     Ok(Some(source))
 }
 
+/// Who streaming persistence signs as before resolution: the
+/// `persistence.streaming.credentials` keys when set, else the manager's
+/// ambient chain. Every store it opens (replica, restore, lease) uses this.
+fn streaming_credential(config: Option<&StreamingCredentialsConfig>) -> ObjectCredential {
+    match config {
+        Some(keys) => ObjectCredential::Aws(AwsCredential {
+            keys: AwsKeys {
+                access_key_id: keys.access_key_id.clone().unwrap_or_default(),
+                secret_access_key: keys.secret_access_key.clone().unwrap_or_default(),
+                session_token: keys.session_token.clone(),
+            },
+            region: None,
+            endpoint: None,
+            origin: "persistence.streaming.credentials".to_string(),
+        }),
+        None => ObjectCredential::Ambient,
+    }
+}
+
+/// How streaming persistence opens a store: its config and replica URL
+/// describe the store completely, so the process's other `AWS_*` settings
+/// (an `AWS_ENDPOINT` meant for something else) never redirect it.
+fn streaming_open_options(conditional_put: bool) -> OpenOptions {
+    OpenOptions {
+        conditional_put,
+        // Every store here names its region; an empty one falls back to
+        // object_store's own default, never to AWS_REGION.
+        region_default: RegionDefault::Fixed(objects::FALLBACK_REGION),
+        aws_env_settings: false,
+        // An ambiguous environment fails the boot instead of signing the
+        // cluster's backups as the node's instance role
+        // (manager-workload-identity calls #5).
+        ambient_fallthrough: false,
+    }
+}
+
 /// The boot line that says which principal the manager is about to act as.
-fn log_streaming_credentials(source: &CredentialSource) {
+fn log_streaming_credentials(source: &Principal) {
     match source {
-        CredentialSource::WebIdentity {
+        Principal::WebIdentity {
             role_arn,
             token_file,
         } => info!(
@@ -590,18 +632,11 @@ async fn restore_replica_to(
             .context("failed restoring the streaming replica")?;
         Ok(true)
     }
-    if is_object_store_url(replica_url) {
-        restore_with(
-            replica_object_store_client(replica_url, credentials)?,
-            output,
-        )
-        .await
-    } else {
-        restore_with(
-            FileReplicaClient::new(file_replica_path(replica_url)),
-            output,
-        )
-        .await
+    match objects::url_or_path(replica_url)? {
+        UrlOrPath::S3(url) => {
+            restore_with(replica_object_store_client(url, credentials)?, output).await
+        }
+        UrlOrPath::Local(path) => restore_with(file_replica_client(&path), output).await,
     }
 }
 
@@ -684,17 +719,11 @@ fn parse_sync_interval(raw: &str) -> StdDuration {
     humantime::parse_duration(raw.trim()).unwrap_or_else(|_| StdDuration::from_secs(1))
 }
 
-/// Whether the replica URL targets S3/R2/MinIO (handled by [`ObjectStoreClient`]).
-/// Everything else — a `file://` URL or a bare filesystem path — uses the local
-/// [`FileReplicaClient`].
-fn is_object_store_url(url: &str) -> bool {
-    url.trim().to_ascii_lowercase().starts_with("s3://")
-}
-
-/// Strip a `file://` scheme prefix to recover a local replica directory path.
-fn file_replica_path(url: &str) -> String {
-    let u = url.trim();
-    u.strip_prefix("file://").unwrap_or(u).to_string()
+/// rustyriver's local replica client for a `file://` (or bare-path) replica
+/// URL: the object-storage layer classifies the URL, and rustyriver owns the
+/// on-disk layout (`<root>/ltx/<level>/…`).
+fn file_replica_client(path: &std::path::Path) -> FileReplicaClient {
+    FileReplicaClient::new(path.to_string_lossy().into_owned())
 }
 
 /// Select the rustyriver replica client for the URL and drive the sync loop.
@@ -706,22 +735,27 @@ async fn run_replica_loop(
     shutdown: Arc<AtomicBool>,
     fenced: Arc<AtomicBool>,
 ) -> R<()> {
-    if is_object_store_url(&replica_url) {
-        let client = replica_object_store_client(&replica_url, credentials.as_ref())?;
-        replica_sync_loop(db, client, interval, shutdown, fenced).await
-    } else {
-        let client = FileReplicaClient::new(file_replica_path(&replica_url));
-        replica_sync_loop(db, client, interval, shutdown, fenced).await
+    match objects::url_or_path(&replica_url)? {
+        UrlOrPath::S3(url) => {
+            let client = replica_object_store_client(url, credentials.as_ref())?;
+            replica_sync_loop(db, client, interval, shutdown, fenced).await
+        }
+        UrlOrPath::Local(path) => {
+            let client = file_replica_client(&path);
+            replica_sync_loop(db, client, interval, shutdown, fenced).await
+        }
     }
 }
 
-/// The rustyriver client for an `s3://` replica URL, on a store Legion builds
-/// itself so the replica authenticates exactly like the lease does.
+/// The rustyriver client for an `s3://` replica URL, on a store the
+/// object-storage layer opens, so the replica authenticates exactly like the
+/// lease does.
 ///
 /// rustyriver's own `ObjectStoreConfig::from_url` still parses the URL
-/// (bucket, region, endpoint, path-style and the provider defaults), but its
-/// credential handling — `AWS_*`/`LITESTREAM_*` static keys only — is
-/// replaced: the keys it read are cleared so the client never holds them.
+/// (bucket, region, endpoint, path-style and the provider defaults: its
+/// dialect accepts more than a plain `s3://` URL), but its credential
+/// handling — `AWS_*`/`LITESTREAM_*` static keys only — is replaced: the
+/// keys it read are cleared so the client never holds them.
 fn replica_object_store_client(
     replica_url: &str,
     credentials: Option<&StreamingCredentialsConfig>,
@@ -735,19 +769,21 @@ fn replica_object_store_client(
 
     let location = S3Location {
         bucket: config.bucket.clone(),
-        region: if config.region.is_empty() {
+        region: Some(if config.region.is_empty() {
             rustyriver::client::object_store::DEFAULT_REGION.to_string()
         } else {
             config.region.clone()
-        },
+        }),
         endpoint: (!config.endpoint.is_empty()).then(|| config.endpoint.clone()),
-        force_path_style: config.force_path_style,
+        force_path_style: Some(config.force_path_style),
         skip_verify: config.skip_verify,
-        conditional_put: false,
     };
-    let source = resolve_from_process_env(credentials)?;
-    let store = build_s3_store(&location, &source)
-        .with_context(|| format!("streaming replica {replica_url}"))?;
+    let store = objects::open_s3(
+        &location,
+        &streaming_credential(credentials),
+        &streaming_open_options(false),
+    )
+    .with_context(|| format!("streaming replica {replica_url}"))?;
     Ok(ObjectStoreClient::with_store(config, store))
 }
 
@@ -814,17 +850,20 @@ fn build_lease_store(
 ) -> R<Arc<dyn ObjectStore>> {
     let location = S3Location {
         bucket: object_cfg.bucket.clone(),
-        region: object_cfg.region.clone(),
+        region: Some(object_cfg.region.clone()),
         endpoint: object_cfg.endpoint.clone(),
         // The lease has always used path-style addressing.
-        force_path_style: true,
+        force_path_style: Some(true),
         skip_verify: false,
-        // S3Leaser acquires with `PutMode::Create` and renews with
-        // `PutMode::Update`; both need ETag preconditions on the wire.
-        conditional_put: true,
     };
-    let source = resolve_from_process_env(credentials)?;
-    build_s3_store(&location, &source).context("failed to build S3 store for persistence lease")
+    // S3Leaser acquires with `PutMode::Create` and renews with
+    // `PutMode::Update`; both need ETag preconditions on the wire.
+    objects::open_s3(
+        &location,
+        &streaming_credential(credentials),
+        &streaming_open_options(true),
+    )
+    .context("failed to build S3 store for persistence lease")
 }
 
 /// rustyriver's `S3Leaser` owns the `lock.json` lock filename and writes it under
@@ -1109,6 +1148,12 @@ mod tests {
 
     #[test]
     fn replica_url_dispatch_helpers() {
+        let is_object_store_url =
+            |url: &str| matches!(objects::url_or_path(url), Ok(UrlOrPath::S3(_)));
+        let file_replica_path = |url: &str| match objects::url_or_path(url) {
+            Ok(UrlOrPath::Local(path)) => path.to_string_lossy().into_owned(),
+            other => panic!("{url}: {other:?}"),
+        };
         assert!(is_object_store_url("s3://bucket/prefix"));
         assert!(is_object_store_url("S3://bucket/prefix"));
         assert!(!is_object_store_url("file:///var/replica"));
@@ -1162,7 +1207,7 @@ mod tests {
         cfg.lease.object_storage.region = "us-west-2".into();
         assert!(matches!(
             resolve_streaming_credentials(&cfg, &irsa).unwrap(),
-            Some(CredentialSource::WebIdentity { .. })
+            Some(Principal::WebIdentity { .. })
         ));
 
         // `auto` stays fine for keys (R2 wants exactly that).
@@ -1174,7 +1219,7 @@ mod tests {
         });
         assert!(matches!(
             resolve_streaming_credentials(&cfg, &irsa).unwrap(),
-            Some(CredentialSource::Config(_))
+            Some(Principal::Explicit(_))
         ));
     }
 

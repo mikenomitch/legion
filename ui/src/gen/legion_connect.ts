@@ -98,7 +98,10 @@ export const Manager = {
       kind: MethodKind.Unary,
     },
     /**
-     * Returns metadata for one job (status, creation time, etc).
+     * Returns metadata for one job (status, creation time, etc), what a
+     * blocked job waits for (`Job.blocked`), and the replacements of failed
+     * allocations still waiting out their reschedule backoff
+     * (`Job.reschedule_backoffs`).
      *
      * @generated from rpc legion.Manager.GetJobInfo
      */
@@ -619,7 +622,10 @@ export const Manager = {
      *
      * Starting an instance that is already live (pending, active, or
      * rescheduling) succeeds as a no-op, so the call is safe to retry even
-     * without an idempotency key.
+     * without an idempotency key. The one exception is a `rescheduling`
+     * instance whose replacement waits out its task's reschedule backoff
+     * (`InstanceInfo.reschedule_backoff`): the backoff is lifted and the
+     * replacement placed now. A repeat finds no backoff and is the no-op.
      *
      * A running session (docs/session-mode.md) is live too, and answers the
      * same no-op. A suspended session resumes on the node its id is tagged
@@ -641,8 +647,10 @@ export const Manager = {
      *   retry, or pass `force_move`).
      * - Aborted: a `store` session's resume lost its generation claim to a
      *   racing resume (`superseded`, naming the winner).
-     * - InvalidArgument: the instance is slot-mode (slot lifecycles are owned
-     *   by the scheduler via `count.num`, not this API).
+     * - InvalidArgument: the instance is slot-mode and not `rescheduling` (slot
+     *   lifecycles are owned by the scheduler via `count.num`, not this API;
+     *   lifting a slot instance's reschedule backoff is the one start it
+     *   takes).
      * - FailedPrecondition: the instance is Terminated (destroyed ids are
      *   tombstoned forever — create a NEW id instead), the owning job is
      *   stopped (run the job first; a stopped job schedules nothing), or a
@@ -1261,8 +1269,10 @@ export const Manager = {
     },
     /**
      * Lists volumes, optionally filtered by job, node, driver, instance, or
-     * state. Includes `destroyed` tombstones so an operator can still see where
-     * a job's storage went after it was reclaimed.
+     * state. Live volumes only by default: `destroyed` tombstones are left out
+     * unless the request sets `include_destroyed` or filters on
+     * `state = "destroyed"`, so an operator can still see where a job's storage
+     * went after it was reclaimed.
      *
      * A volume is the concrete storage behind an instance's opaque
      * `{driver}/{volume_id}` storage handle: which driver owns it, which node it
@@ -1381,6 +1391,9 @@ export const Manager = {
      *   task does not declare an identity named `identity_name`.
      * - PermissionDenied: the allocation exists but is not placed on
      *   `node_id` (a worker may only request tokens for its own allocations).
+     * - Unavailable: this manager has no signing key yet. It is a raft
+     *   follower that started before the leader's key replicated to it, and
+     *   adopts the key within seconds. Retry.
      * - Internal: signing failed.
      *
      * @generated from rpc legion.Manager.IssueWorkloadIdentityToken
@@ -1413,6 +1426,8 @@ export const Manager = {
      * - NotFound: no node with `node_id` is registered, or no node identity
      *   named `identity_name` is configured.
      * - PermissionDenied: `node_id` does not match the caller's credential.
+     * - Unavailable: this manager has no signing key yet (see
+     *   IssueWorkloadIdentityToken). Retry.
      * - Internal: signing failed.
      *
      * @generated from rpc legion.Manager.IssueNodeIdentityToken
@@ -1431,14 +1446,24 @@ export const Manager = {
      * mesh (`certFrom = "legion"`, docs/network-handlers.md, "mTLS").
      *
      * The worker generates its key pair locally and sends only a CSR; the
-     * private key never crosses the network. The manager signs the CSR's
-     * public key with the cluster CA and SANs it chooses itself,
+     * private key never crosses the network. The manager has the CSR's public
+     * key signed by the cluster CA with SANs it chooses itself,
      * `<node>.node.legion` and `legion://node/<node id>`, ignoring every name,
      * extension, and subject the CSR requests. Valid for 24 hours. Workers call
      * it right after registration (the listener needs it), again after a third
-     * of the lifetime, and at once when a heartbeat reply names a CA their
-     * bundle lacks (a rotation). The first call creates the cluster CA
-     * (replicated with the control lane).
+     * of the lifetime, and at once when a heartbeat reply's
+     * `cluster_ca_pins` differ from the bundle they hold (a rotation, or a CA
+     * added to or removed from the bundle).
+     *
+     * Who signs is the manager's `clusterCa.provider` (docs/cluster-ca.md):
+     * the built-in CA (the default; the first call creates it, replicated with
+     * the control lane), an operator-provided CA on the manager's disk
+     * (`file`), or an external signer such as Vault PKI (`exec`). Whatever a
+     * `file` or `exec` provider returns is verified before it is handed out:
+     * it must chain to the trust bundle, carry the CSR's public key, carry
+     * exactly the SANs above, carry serverAuth and clientAuth and no other
+     * extended key usage, not be a CA, and be valid for between 2 hours and
+     * the requested 24 hours plus 10 minutes.
      *
      * `fleet` is for the simulator only (`legion start worker --simulate`),
      * which serves every simulated node from one listener: the certificate
@@ -1460,7 +1485,14 @@ export const Manager = {
      *   `fleet` does not match the node's registered `workerFleet`.
      * - NotFound: no node with `node_id` is registered.
      * - PermissionDenied: `node_id` does not match the caller's credential.
-     * - Internal: the CA could not be created or signing failed.
+     * - Unavailable: the cluster CA is not available on this manager yet (the
+     *   built-in CA has not replicated, or an `exec` provider could not be
+     *   run or did not answer). The worker keeps its certificate and retries.
+     * - FailedPrecondition: the CA needs an operator: the provider returned a
+     *   certificate Legion refuses (the message names the provider and the
+     *   mismatch), its CA files are unusable, or this manager's CA disagrees
+     *   with the cluster's (`GetMeshCa.problem` says why).
+     * - Internal: the built-in CA could not be created or signing failed.
      *
      * @generated from rpc legion.Manager.IssueNodeCertificate
      */
@@ -1605,13 +1637,20 @@ export const Manager = {
      *   restart), a `last_seq` ahead of the manager's, or a `last_seq` older
      *   than the messages the manager still keeps. It also follows a heartbeat
      *   whose digest disagreed with the manager's (`HeartbeatReply.work_resync`).
+     * - **Checkpoint work.** A snapshot of the node entering a state that is
+     *   work for it (a capture, a delete, a publish), or a warm queued for it,
+     *   is pushed in `checkpoint_requests` on the next message, so the node
+     *   starts it one round trip after it commits instead of at its next
+     *   heartbeat. Each piece of work is pushed once per stream; a new stream
+     *   gets every piece still outstanding.
      *
      * A worker that reconnects with the same `epoch` and a `last_seq` the
      * manager still holds gets the messages after it replayed, then live
-     * deltas: nothing is lost and nothing is applied twice. Acked messages
-     * are pruned. The log is held in the manager's memory only: the
-     * committed allocation rows are the durable record, so a new manager
-     * process resyncs instead of replaying.
+     * deltas: nothing is lost and nothing is applied twice. A replayed message
+     * carries its allocation changes only, never its `checkpoint_requests`.
+     * Acked messages are pruned. The log is held in the manager's memory
+     * only: the committed allocation rows are the durable record, so a new
+     * manager process resyncs instead of replaying.
      *
      * Any manager serves the stream, leader or follower, from its own
      * replica of the store.
@@ -2591,13 +2630,21 @@ export const Manager = {
       kind: MethodKind.Unary,
     },
     /**
-     * The cluster CA — what an operator hands a non-Legion client that must
-     * reach a mesh-TLS port or the worker plane (`legion sandbox start --node`,
-     * `legion exec --direct`), or verifies a node certificate against. Returns
-     * the signing CA, the full trust bundle (both CAs during a rotation), the
-     * pin new join tokens carry, and where a rotation stands. Never a key.
-     * Empty `cert_pem` when no CA exists yet (it is created on first use: the
-     * first join token or node certificate). ACL: `net:read`.
+     * The cluster CA as the answering manager sees it — what an operator
+     * hands a non-Legion client that must reach a mesh-TLS port or the worker
+     * plane (`legion sandbox start --node`, `legion exec --direct`), or
+     * verifies a node certificate against. Returns the signing CA, the full
+     * trust bundle (both CAs during a built-in rotation), the chain leaves
+     * carry, the pin new join tokens carry, where a rotation stands, which
+     * provider supplies the CA (`builtin`, `file`, or `exec`;
+     * docs/cluster-ca.md), and anything wrong with it on this manager. Never
+     * a key.
+     *
+     * Never fails for a CA problem: an unusable provider or a manager that
+     * disagrees with the cluster is reported in `problem`, so this is the
+     * call to diagnose one with. Empty `cert_pem` when no CA exists yet (the
+     * built-in CA is created on first use: the first join token or node
+     * certificate). ACL: `net:read`.
      *
      * @generated from rpc legion.Manager.GetMeshCa
      */
@@ -2608,15 +2655,23 @@ export const Manager = {
       kind: MethodKind.Unary,
     },
     /**
-     * Rotate the cluster CA in two steps, without breaking any connection
-     * (worker-plane-auth plan §6.9). The new CA is generated, cross-signed by
-     * the current one, and signs every certificate from now on; the previous
-     * CA stays in every holder's trust bundle for one certificate lifetime (24
-     * hours), and chains carry the cross-signed certificate meanwhile, so a
-     * holder that has not refreshed its bundle yet keeps verifying. Nodes
-     * re-issue their certificates within one heartbeat (the reply names the
-     * new CA). Join tokens minted before the rotation keep working during the
-     * overlap; after it, mint new ones. ACL: `net:write` (unscoped).
+     * Rotate the built-in cluster CA in two steps, without breaking any
+     * connection (worker-plane-auth plan §6.9). The new CA is generated,
+     * cross-signed by the current one, and signs every certificate from now
+     * on; the previous CA stays in every holder's trust bundle for one
+     * certificate lifetime (24 hours), and chains carry the cross-signed
+     * certificate meanwhile, so a holder that has not refreshed its bundle
+     * yet keeps verifying. Nodes re-issue their certificates within one
+     * heartbeat (the reply names the new CA). Join tokens minted before the
+     * rotation keep working during the overlap; after it, mint new ones.
+     * ACL: `net:write` (unscoped).
+     *
+     * Errors:
+     * - FailedPrecondition: the manager's `clusterCa.provider` is `file` or
+     *   `exec`. Legion does not hold that CA's key, so it cannot rotate it;
+     *   the message names the provider and the procedure (add the new CA to
+     *   the trust bundle, wait a heartbeat, switch the signing CA, drop the
+     *   old CA a day later; docs/cluster-ca.md#rotation).
      *
      * @generated from rpc legion.Manager.RotateMeshCa
      */
@@ -2938,6 +2993,17 @@ export const Manager = {
      * The reply contains a self-describing composite token (manager address +
      * secret + worker type) that introduces a worker in one command:
      * `legion join <TOKEN>`. The manager stores only a hash of the secret.
+     * The token also pins the cluster CA (`caHash`): the trust-bundle CA the
+     * signing CA chains to, whichever `clusterCa.provider` supplies it
+     * (docs/cluster-ca.md). A joining worker refuses a manager whose chain
+     * does not lead to it.
+     *
+     * Errors:
+     * - Unavailable: the cluster CA is not available on this manager yet (the
+     *   built-in CA has not replicated, or an `exec` provider did not answer).
+     * - FailedPrecondition: the cluster CA needs an operator (unusable CA
+     *   files, or this manager disagrees with the cluster's CA;
+     *   `GetMeshCa.problem` says why).
      *
      * @generated from rpc legion.Manager.CreateJoinToken
      */
@@ -3022,14 +3088,22 @@ export const Manager = {
      * with its node token. The manager turns the claim into an ordinary plan
      * submission with a single placement on the calling node and applies it
      * through the same transaction every other placement goes through, with
-     * the same epoch compare-and-set, the same constraint re-validation, and
-     * the same at-most-one-live-allocation instance binding. A refusal here is
-     * that apply failing; there is no second code path for correctness.
+     * the same constraint and capacity re-validation against committed rows
+     * and the same at-most-one-live-allocation instance binding. It skips the
+     * plan epoch compare-and-set, because it never planned against a
+     * snapshot, so concurrent ratifications of one job do not refuse each
+     * other. A refusal here is that apply failing. There is no second code
+     * path for correctness.
      *
      * The reply is the verdict: `confirmed` carries the manager-minted
      * allocation id (the worker opens the network and the work becomes a normal
      * allocation), `refused` carries a machine-readable reason the worker kills
      * the work with.
+     *
+     * Only the raft leader ratifies. A follower answers `FAILED_PRECONDITION`
+     * ("this manager is not the raft leader…") instead of a verdict. It wrote
+     * nothing and the ticket is unspent, so the caller sends the same request
+     * to the leader.
      *
      * @generated from rpc legion.Manager.RatifyClaim
      */
@@ -3177,6 +3251,17 @@ export const Worker = {
      *
      * Rejected with FailedPrecondition unless the worker was configured with
      * `edgeBoot.acceptClaims: true`.
+     *
+     * Rejected with ResourceExhausted, carrying the stable error code
+     * `OVERLOADED` in the `legion-error-code` response metadata, when the
+     * node's claim window stayed full for `edgeBoot.queueTimeout`
+     * (docs/edge-boot.md, "Overload"). The window bounds the unratified edge
+     * claims a node holds (`edgeBoot.maxProvisionalPerNode`) and halves when
+     * ratifications come back later than `edgeBoot.overloadThreshold` of their
+     * lease. Such a refusal happens before admission: nothing is held, booted,
+     * or spent, so a retry may present the same ticket. Retry with backoff.
+     * A message that says recent ratifications were slow means the managers
+     * are behind, which other nodes of the pool share.
      *
      * Caller class: `ticket`. Callers are authorized by the boot ticket
      * alone; no client certificate is needed and one that is presented is

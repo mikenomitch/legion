@@ -150,8 +150,66 @@ pub fn config() -> Command {
                 )
                 .subcommand(
                     Command::new("rotate")
-                        .about("Rotate the cluster CA in two steps: the new CA signs now, the old one stays trusted for 24h")
+                        .about("Rotate the built-in cluster CA in two steps: the new CA signs now, the old one stays trusted for 24h")
                         .arg(json_flag()),
+                )
+                .subcommand(
+                    Command::new("provider")
+                        .about("Work with cluster CA providers (an operator CA on disk, or an external signer)")
+                        .subcommand_required(true)
+                        .arg_required_else_help(true)
+                        .subcommand(
+                            Command::new("test")
+                                .about("Check a cluster CA provider before pointing a manager at it")
+                                .long_about(
+                                    "Run a candidate `clusterCa` provider the way a manager will and report \
+                                     each check: an `exec` signer command (everything after `--`), or \
+                                     `file` material (--cert-path, --key-path, optional --bundle-path). \
+                                     It reads the trust bundle, has a node, a manager server, and a \
+                                     manager client certificate signed, verifies each one exactly as a \
+                                     manager would before handing it out, and checks that the names \
+                                     Legion asks for win over the names a CSR asks for. Runs locally; no \
+                                     manager is involved. An exec signer really issues the test \
+                                     certificates (for `conformance-node` and the manager id \
+                                     `conformance`), valid for 24 hours.",
+                                )
+                                .arg(
+                                    Arg::new("cert-path")
+                                        .long("cert-path")
+                                        .value_name("PATH")
+                                        .help("file: the signing CA certificate (then any intermediates)"),
+                                )
+                                .arg(
+                                    Arg::new("key-path")
+                                        .long("key-path")
+                                        .value_name("PATH")
+                                        .requires("cert-path")
+                                        .help("file: the signing CA's PKCS#8 private key"),
+                                )
+                                .arg(
+                                    Arg::new("bundle-path")
+                                        .long("bundle-path")
+                                        .value_name("PATH")
+                                        .requires("cert-path")
+                                        .help("file: the trust bundle (default: the signing CA itself)"),
+                                )
+                                .arg(
+                                    Arg::new("timeout")
+                                        .long("timeout")
+                                        .value_name("DURATION")
+                                        .default_value("10s")
+                                        .help("exec: how long one provider call may take"),
+                                )
+                                .arg(
+                                    Arg::new("command")
+                                        .value_name("COMMAND")
+                                        .num_args(1..)
+                                        .trailing_var_arg(true)
+                                        .conflicts_with("cert-path")
+                                        .help("exec: the signer command and its arguments"),
+                                )
+                                .arg(json_flag()),
+                        ),
                 ),
         )
 }
@@ -175,6 +233,10 @@ pub async fn handle(matches: &ArgMatches) -> R<()> {
         Some(("ca", ca)) => match ca.subcommand() {
             Some(("show", sub)) => ca_show(sub).await,
             Some(("rotate", sub)) => ca_rotate(sub).await,
+            Some(("provider", provider)) => match provider.subcommand() {
+                Some(("test", sub)) => ca_provider_test(sub),
+                _ => unreachable!(),
+            },
             _ => unreachable!(),
         },
         _ => unreachable!(),
@@ -433,35 +495,172 @@ async fn ca_show(matches: &ArgMatches) -> R<()> {
     .into_inner();
     if format.is_json() {
         output::print_success(&json!({
+            "provider": reply.provider,
+            "providerLocation": reply.provider_location,
             "certPem": reply.cert_pem,
             "bundlePem": reply.bundle_pem,
+            "chainPem": reply.chain_pem,
             "pin": reply.pin,
             "phase": reply.phase,
             "overlapUntil": reply.overlap_until,
             "previousCertPem": reply.previous_cert_pem,
             "createdAt": reply.created_at,
             "exists": !reply.cert_pem.is_empty(),
+            "problem": reply.problem,
         }));
-        return Ok(());
-    }
-    if reply.cert_pem.is_empty() {
-        println!("no cluster CA yet: it is created with the first join token or node certificate");
         return Ok(());
     }
     // Human output goes to stderr so `legion net ca show > ca.pem` writes a
     // bundle a client can trust as is.
-    eprintln!("Pin:     {}", reply.pin);
+    let provider = if reply.provider_location.is_empty() {
+        reply.provider.clone()
+    } else {
+        format!("{}  ({})", reply.provider, reply.provider_location)
+    };
+    if reply.cert_pem.is_empty() {
+        eprintln!("Provider: {provider}");
+        if reply.problem.is_empty() {
+            println!(
+                "no cluster CA yet: it is created with the first join token or node certificate"
+            );
+        } else {
+            eprintln!("Problem:  {}", reply.problem);
+        }
+        return Ok(());
+    }
+    eprintln!("Provider: {provider}");
+    eprintln!("Pin:      {}", reply.pin);
     if reply.phase == "overlap" {
         eprintln!(
-            "Phase:   rotating. The new CA signs; the previous CA stays trusted until {}",
+            "Phase:    rotating. The new CA signs; the previous CA stays trusted until {}",
             reply.overlap_until
         );
-        eprintln!("Bundle:  2 CAs (the signing CA first, then the previous one)");
+        eprintln!("Bundle:   2 CAs (the signing CA first, then the previous one)");
+    } else if reply.provider == "builtin" {
+        eprintln!("Phase:    stable (one CA)");
     } else {
-        eprintln!("Phase:   stable (one CA)");
+        let bundle = crate::cluster_tls::bundle_pins(&reply.bundle_pem).len();
+        let chain = crate::cluster_tls::bundle_pins(&reply.chain_pem).len();
+        eprintln!(
+            "Bundle:   {bundle} CA(s), the anchor first{}",
+            if chain == 0 {
+                ". Holders trust the signing CA itself.".to_string()
+            } else {
+                format!(". Leaves carry {chain} intermediate(s) after them.")
+            }
+        );
+    }
+    if !reply.problem.is_empty() {
+        eprintln!("Problem:  {}", reply.problem);
     }
     print!("{}", reply.bundle_pem);
     Ok(())
+}
+
+/// `legion net ca provider test`: the conformance harness
+/// (`crate::manager::cluster_ca::conformance`). Local only.
+fn ca_provider_test(matches: &ArgMatches) -> R<()> {
+    use crate::manager::cluster_ca::conformance::{test_provider, Candidate};
+    let format = OutputFormat::from_matches(matches);
+    let command: Vec<String> = matches
+        .get_many::<String>("command")
+        .map(|values| values.cloned().collect())
+        .unwrap_or_default();
+    let candidate = match matches.get_one::<String>("cert-path") {
+        Some(cert_path) => {
+            let key_path = matches.get_one::<String>("key-path").ok_or_else(|| {
+                output::fail_local(
+                    format,
+                    CliError::local(
+                        "InvalidArgument",
+                        "--cert-path needs --key-path (the signing CA's PKCS#8 key)",
+                        Some("pass both, or an exec command after `--`"),
+                    ),
+                )
+            })?;
+            Candidate::File {
+                cert_path: cert_path.into(),
+                key_path: key_path.into(),
+                bundle_path: matches.get_one::<String>("bundle-path").map(Into::into),
+            }
+        }
+        None if !command.is_empty() => Candidate::Exec {
+            command,
+            timeout: matches
+                .get_one::<String>("timeout")
+                .map(|value| humantime::parse_duration(value))
+                .transpose()
+                .context("--timeout is not a duration")?
+                .unwrap_or(std::time::Duration::from_secs(10)),
+        },
+        None => {
+            return Err(output::fail_local(
+                format,
+                CliError::local(
+                    "InvalidArgument",
+                    "nothing to test: pass an exec signer after `--`, or --cert-path and --key-path",
+                    Some(
+                        "legion net ca provider test -- legion-ca-vault --mount pki_legion --role legion",
+                    ),
+                ),
+            ))
+        }
+    };
+    let checks = test_provider(&candidate);
+    let passed = checks.iter().all(|check| check.passed);
+    let failed: Vec<_> = checks.iter().filter(|check| !check.passed).collect();
+    if format.is_json() {
+        let data = json!({
+            "provider": match candidate { Candidate::Exec { .. } => "exec", Candidate::File { .. } => "file" },
+            "candidate": candidate.describe(),
+            "passed": passed,
+            "config": if passed { candidate.config_line() } else { String::new() },
+            "checks": checks.iter().map(|check| json!({
+                "name": check.name,
+                "passed": check.passed,
+                "detail": check.detail,
+            })).collect::<Vec<_>>(),
+        });
+        if passed {
+            output::print_success(&data);
+            return Ok(());
+        }
+        return Err(output::fail_local(
+            format,
+            CliError::local(
+                "FailedPrecondition",
+                format!(
+                    "provider failed {} check(s): {}",
+                    failed.len(),
+                    failed
+                        .iter()
+                        .map(|c| format!("{} ({})", c.name, c.detail))
+                        .collect::<Vec<_>>()
+                        .join("; ")
+                ),
+                Some("fix the provider and run `legion net ca provider test` again"),
+            ),
+        ));
+    }
+    println!("Testing cluster CA provider: {}", candidate.describe());
+    for check in &checks {
+        println!(
+            "  [{}] {:<28} {}",
+            if check.passed { "ok" } else { "FAIL" },
+            check.name,
+            check.detail
+        );
+    }
+    if passed {
+        println!("\nProvider is usable. Configure it with:");
+        println!("  {}", candidate.config_line());
+        Ok(())
+    } else {
+        bail!(
+            "provider failed {} check(s); do not point a manager at it yet",
+            failed.len()
+        )
+    }
 }
 
 async fn ca_rotate(matches: &ArgMatches) -> R<()> {

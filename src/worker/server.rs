@@ -154,12 +154,12 @@ pub struct WorkerDaemonService {
     /// worker an edge resume probes (`StartSession.resume_id`). `None` in
     /// tests: such a node cannot probe, so it moves only with `force_move`.
     pub node_identity: Option<Arc<crate::worker::plane::NodeIdentity>>,
-    /// The node's egress proxies, so a gated sandbox delivered by push or
-    /// the work stream has its proxy socket bound before its launch rather
-    /// than on the next heartbeat (`daemon::bind_launch_datapath`). A
-    /// restored guest resumes only once that socket exists. `None` in tests
-    /// that run no datapath.
-    pub egress: Option<Arc<crate::worker::netd::proxy::EgressProxies>>,
+    /// The node datapath, so a gated sandbox delivered by push or the work
+    /// stream has its egress proxy bound before its launch rather than on
+    /// the next heartbeat ([`Netd::bind_launch`](crate::worker::netd::Netd::bind_launch)).
+    /// A restored guest resumes only once that socket exists. `None` in
+    /// tests that run no datapath.
+    pub netd: Option<Arc<crate::worker::netd::Netd>>,
 }
 
 impl WorkerDaemonService {
@@ -285,15 +285,12 @@ impl WorkerDaemonService {
 
         // A gated sandbox's egress proxy, bound before the launch: a restore
         // resumes its guest only once the socket exists, and no heartbeat
-        // has bound this delivery's datapath yet.
-        if let Some(egress) = self.egress.as_ref() {
-            let alloc_root = self
-                .task_manager
-                .lock()
-                .map_err(|_| Status::internal("Task manager lock poisoned"))?
-                .alloc_root()
-                .to_path_buf();
-            crate::worker::daemon::bind_launch_datapath(egress, &alloc_root, &allocation).await;
+        // has bound this delivery's datapath yet. It also wakes the
+        // heartbeat, which brings the policy, resolver, and upstream sockets.
+        if let Some(netd) = self.netd.as_ref() {
+            if netd.bind_launch(&allocation).await.is_some() {
+                crate::worker::daemon::wake_heartbeat();
+            }
         }
 
         // Synchronous failures (bad config, unknown runtime) surface here;
@@ -1749,7 +1746,7 @@ mod edge_overload_test {
                 Duration::from_secs(1),
             )),
             node_identity: None,
-            egress: None,
+            netd: None,
         };
         Ok(Node {
             service,

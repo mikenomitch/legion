@@ -434,6 +434,10 @@ ACLs are on.
   node-to-node reachability anyway, so a reverse tunnel would not make such a
   worker fully functional (calls entry 3).
 - **External or pluggable CAs** (Vault PKI, ACME). The CA stays built in.
+  *Reversed by [`cluster-ca-provider-plan.md`](cluster-ca-provider-plan.md)
+  (2026-10-14): the built-in CA stays the default, and an operator can supply
+  an intermediate on each manager's disk (`file`) or an external signer such
+  as Vault PKI (`exec`). ACME remains out of scope.*
 - **Registration through a raft follower.** `WorkerRegister` is not forwarded
   to the leader today, so a worker whose token names a follower fails to
   register. That is a separate bug, filed in `internal_docs/TODO.md`.

@@ -8,17 +8,18 @@
 //! `include_idle` lists a job's. It reaches the bucket with the credential the
 //! worker type's `contentStore.auth.kv` names when the URL is under that
 //! store, and with its own ambient credentials (the AWS environment, web
-//! identity, or the instance profile) otherwise.
-
-use std::path::PathBuf;
+//! identity, an ECS task role, or the instance profile) otherwise. Every
+//! store, `s3://` or `file://`, is opened through the object-storage layer
+//! ([`crate::storage::objects`]).
 
 use futures::TryStreamExt;
 use object_store::{path::Path as ObjectPath, ObjectStore};
 use url::Url;
 
-use crate::artifacts::Credential;
-use crate::content_publish::{document_url, s3_client, s3_key, ContentStoreTarget};
+use crate::artifacts::{Credential, CredentialSource};
+use crate::content_publish::{document_url, ContentStoreTarget};
 use crate::prelude::*;
+use crate::storage::objects::{self, ObjectCredential, StoreUrl};
 use crate::storage::store::Store;
 use crate::structs::archive::{
     archive_job_prefix, archive_object_name, parse_archive_object_name, ArchiveManifest,
@@ -74,95 +75,82 @@ pub fn content_store_roots(store: &Store) -> Vec<ContentStoreTarget> {
     roots
 }
 
-/// The credential for an `s3://` URL: the `auth.kv` credential of the worker
-/// type whose `contentStore` the URL is under, read from the store, or `None`
-/// for the ambient chain.
-fn credential_for(store: &Store, url: &Url) -> R<Option<Credential>> {
-    for root in content_store_roots(store) {
-        let Some(kv) = root.auth.as_ref().and_then(|auth| auth.kv.as_deref()) else {
-            continue;
-        };
-        let Ok(root_url) = Url::parse(root.url.trim()) else {
-            continue;
-        };
-        let under = root_url.scheme() == url.scheme()
-            && root_url.host_str() == url.host_str()
-            && url
-                .path()
-                .trim_start_matches('/')
-                .starts_with(root_url.path().trim_matches('/'));
-        if !under {
-            continue;
-        }
-        let entry = store
+/// The manager's KV, as the credential source a `contentStore.auth.kv`
+/// resolves against.
+struct StoreKv<'a>(&'a Store);
+
+impl CredentialSource for StoreKv<'_> {
+    fn kv_credential(&self, kv: &str, _redacted_source: &str) -> R<Credential> {
+        let entry = self
+            .0
             .get_kv(kv)?
             .with_context(|| format!("contentStore.auth.kv {kv} not found"))?;
-        return Ok(Some(Credential::from_json(&entry.value).with_context(
-            || format!("kv {kv} does not hold a valid contentStore credential"),
-        )?));
+        Credential::from_json(&entry.value)
+            .with_context(|| format!("kv {kv} does not hold a valid contentStore credential"))
     }
-    Ok(None)
 }
 
-enum Location {
-    File(PathBuf),
-    S3 {
-        client: object_store::aws::AmazonS3,
-        key: ObjectPath,
-    },
-}
-
-fn locate(store: &Store, raw: &str) -> R<Location> {
-    let url = Url::parse(raw).with_context(|| format!("archive manifest url {raw:?}"))?;
-    match url.scheme() {
-        "file" => Ok(Location::File(url.to_file_path().map_err(|_| {
-            anyhow!("archive manifest url {raw:?} is not an absolute file path")
-        })?)),
-        "s3" => {
-            let client = s3_client(&url, credential_for(store, &url)?)?;
-            let key = ObjectPath::from(url.path().trim_start_matches('/'));
-            Ok(Location::S3 { client, key })
+/// The credential for a store URL: the `auth.kv` credential of the worker
+/// type whose `contentStore` covers it (the same rule a restoring worker
+/// applies, [`ContentStoreTarget::contains_url`]), read from the store, or
+/// the manager's ambient chain.
+fn credential_for(store: &Store, url: &StoreUrl) -> R<ObjectCredential> {
+    if url.local_root().is_some() {
+        return Ok(ObjectCredential::Anonymous);
+    }
+    for root in content_store_roots(store) {
+        if root.kv().is_none() {
+            continue;
         }
-        other => bail!("archive manifest url scheme {other:?} is not supported"),
+        let Ok(root_url) = root.validate() else {
+            continue;
+        };
+        if root_url.covers(url) {
+            return root.object_credential(&StoreKv(store));
+        }
     }
+    Ok(ObjectCredential::Ambient)
+}
+
+/// Open the store `url` is in, as the manager reaches it.
+fn open(store: &Store, url: &StoreUrl) -> R<Arc<dyn ObjectStore>> {
+    objects::open(
+        url,
+        &credential_for(store, url)?,
+        &ContentStoreTarget::open_options(false),
+    )
+}
+
+fn locate(store: &Store, raw: &str) -> R<(Arc<dyn ObjectStore>, ObjectPath)> {
+    let url = StoreUrl::parse(raw).with_context(|| format!("archive manifest url {raw:?}"))?;
+    Ok((open(store, &url)?, url.key("")?))
 }
 
 /// Read and parse the archive manifest at `url`.
 pub async fn read_manifest(store: &Store, url: &str) -> Result<ArchiveManifest, ArchiveReadError> {
-    let location = locate(store, url).map_err(ArchiveReadError::Failed)?;
-    let bytes = match location {
-        Location::File(path) => match tokio::fs::read(&path).await {
-            Ok(bytes) => bytes,
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-                return Err(ArchiveReadError::NotFound)
+    let (client, key) = locate(store, url).map_err(ArchiveReadError::Failed)?;
+    let bytes = match client.get(&key).await {
+        Ok(result) => {
+            if result.meta.size > MAX_MANIFEST_BYTES {
+                return Err(ArchiveReadError::Failed(anyhow!(
+                    "{url} is {} bytes, larger than any archive manifest",
+                    result.meta.size
+                )));
             }
-            Err(err) => {
-                return Err(ArchiveReadError::Failed(
-                    anyhow!(err).context(format!("read {}", path.display())),
-                ))
-            }
-        },
-        Location::S3 { client, key } => match client.get(&key).await {
-            Ok(result) => {
-                if result.meta.size > MAX_MANIFEST_BYTES {
-                    return Err(ArchiveReadError::Failed(anyhow!(
-                        "{url} is {} bytes, larger than any archive manifest",
-                        result.meta.size
-                    )));
-                }
-                result
-                    .bytes()
-                    .await
-                    .map_err(|err| ArchiveReadError::Failed(anyhow!(err)))?
-                    .to_vec()
-            }
-            Err(object_store::Error::NotFound { .. }) => return Err(ArchiveReadError::NotFound),
-            Err(err) => {
-                return Err(ArchiveReadError::Failed(
-                    anyhow!(err).context(format!("read {url}")),
-                ))
-            }
-        },
+            result
+                .bytes()
+                .await
+                .map_err(|err| {
+                    ArchiveReadError::Failed(anyhow!(err).context(format!("read {url}")))
+                })?
+                .to_vec()
+        }
+        Err(object_store::Error::NotFound { .. }) => return Err(ArchiveReadError::NotFound),
+        Err(err) => {
+            return Err(ArchiveReadError::Failed(
+                anyhow!(err).context(format!("read {url}")),
+            ))
+        }
     };
     if bytes.len() > MAX_MANIFEST_BYTES {
         return Err(ArchiveReadError::Failed(anyhow!(
@@ -177,16 +165,10 @@ pub async fn read_manifest(store: &Store, url: &str) -> Result<ArchiveManifest, 
 /// error. The checkpoint parts it names stay, like every published part,
 /// until the bucket's lifecycle rule removes them.
 pub async fn delete_manifest(store: &Store, url: &str) -> R<()> {
-    match locate(store, url)? {
-        Location::File(path) => match tokio::fs::remove_file(&path).await {
-            Ok(()) => Ok(()),
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(err) => Err(anyhow!(err).context(format!("delete {}", path.display()))),
-        },
-        Location::S3 { client, key } => match client.delete(&key).await {
-            Ok(()) | Err(object_store::Error::NotFound { .. }) => Ok(()),
-            Err(err) => Err(anyhow!(err).context(format!("delete {url}"))),
-        },
+    let (client, key) = locate(store, url)?;
+    match client.delete(&key).await {
+        Ok(()) | Err(object_store::Error::NotFound { .. }) => Ok(()),
+        Err(err) => Err(anyhow!(err).context(format!("delete {url}"))),
     }
 }
 
@@ -263,7 +245,7 @@ pub async fn find_manifest_only(
         };
         for (job, group, task) in &candidates {
             let url = document_url(
-                &root_url,
+                root_url.url(),
                 &archive_object_name(job, group, task, instance_id),
             );
             match read_manifest(store, &url).await {
@@ -321,7 +303,7 @@ pub async fn list_job_archives(
     while root_index < roots.len() {
         let root_url = roots[root_index].validate()?;
         let want = page_size - listed.len();
-        let (names, more) = list_names(store, &root_url, &prefix, &after, want).await?;
+        let (names, more) = list_names(store, root_url.url(), &prefix, &after, want).await?;
         for (name, written_at) in &names {
             if let Some((job, group, task, id)) = parse_archive_object_name(name) {
                 listed.push(ListedArchive {
@@ -329,7 +311,7 @@ pub async fn list_job_archives(
                     group,
                     task,
                     instance_id: id,
-                    url: document_url(&root_url, name),
+                    url: document_url(root_url.url(), name),
                     written_at: written_at.clone(),
                 });
             }
@@ -366,76 +348,27 @@ async fn list_names(
     let rfc3339 = |time: chrono::DateTime<chrono::Utc>| {
         time.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
     };
-    let mut names: Vec<(String, String)> = match root.scheme() {
-        "file" => {
-            let base = root
-                .to_file_path()
-                .map_err(|_| anyhow!("contentStore url {root} is not a file path"))?;
-            let dir = base.join(prefix);
-            let after = after.to_string();
-            tokio::task::spawn_blocking(move || -> R<Vec<(String, String)>> {
-                let mut found = Vec::new();
-                let mut stack = vec![dir];
-                while let Some(dir) = stack.pop() {
-                    let entries = match std::fs::read_dir(&dir) {
-                        Ok(entries) => entries,
-                        Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
-                        Err(err) => return Err(anyhow!(err).context(format!("list {dir:?}"))),
-                    };
-                    for entry in entries {
-                        let entry = entry?;
-                        let path = entry.path();
-                        let meta = entry.metadata()?;
-                        if meta.is_dir() {
-                            stack.push(path);
-                            continue;
-                        }
-                        let Ok(rel) = path.strip_prefix(&base) else {
-                            continue;
-                        };
-                        let rel = rel.to_string_lossy().replace('\\', "/");
-                        if !rel.ends_with(".json") || rel.as_str() <= after.as_str() {
-                            continue;
-                        }
-                        let written: chrono::DateTime<chrono::Utc> = meta
-                            .modified()
-                            .map(Into::into)
-                            .unwrap_or_else(|_| chrono::Utc::now());
-                        found.push((rel, rfc3339(written)));
-                    }
-                }
-                Ok(found)
-            })
-            .await??
-        }
-        _ => {
-            let client = s3_client(root, credential_for(store, root)?)?;
-            let full_prefix = ObjectPath::from(s3_key(root, prefix));
-            let root_prefix = s3_key(root, "");
-            let offset = ObjectPath::from(s3_key(root, after));
-            let mut stream = if after.is_empty() {
-                client.list(Some(&full_prefix))
-            } else {
-                client.list_with_offset(Some(&full_prefix), &offset)
-            };
-            let mut found = Vec::new();
-            while let Some(meta) = stream.try_next().await? {
-                let key = meta.location.to_string();
-                let rel = key
-                    .strip_prefix(root_prefix.as_str())
-                    .unwrap_or(&key)
-                    .trim_start_matches('/')
-                    .to_string();
-                if rel.ends_with(".json") {
-                    found.push((rel, rfc3339(meta.last_modified)));
-                }
-                if found.len() > limit {
-                    break;
-                }
-            }
-            found
-        }
+    let root = &StoreUrl::from_url(root.clone())?;
+    let client = open(store, root)?;
+    let full_prefix = root.key(prefix)?;
+    let mut stream = if after.is_empty() {
+        client.list(Some(&full_prefix))
+    } else {
+        client.list_with_offset(Some(&full_prefix), &root.key(after)?)
     };
+    // A store that lists in key order can stop one past the page; a
+    // directory walk has to be read whole and sorted.
+    let ordered = root.lists_in_order();
+    let mut names = Vec::new();
+    while let Some(meta) = stream.try_next().await? {
+        let name = root.name_of(&meta.location);
+        if name.ends_with(".json") && name.as_str() > after {
+            names.push((name, rfc3339(meta.last_modified)));
+        }
+        if ordered && names.len() > limit {
+            break;
+        }
+    }
     names.sort();
     let more = names.len() > limit;
     names.truncate(limit);

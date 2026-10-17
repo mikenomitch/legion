@@ -438,6 +438,15 @@ pub fn platform_supports_vip_blocks() -> bool {
     cfg!(target_os = "linux")
 }
 
+/// Whether a node can serve VIP blocks, from its `os` fingerprint: only Linux
+/// routes all of 127/8 to loopback. Placement asks this about the node an
+/// allocation lands on — never [`platform_supports_vip_blocks`], which
+/// answers for the process asking (the manager). A node that reported no
+/// `os` gets no block; its upstreams still have their loopback ports.
+pub fn node_supports_vip_blocks(node_os: Option<&str>) -> bool {
+    node_os.is_some_and(|os| os.eq_ignore_ascii_case("linux"))
+}
+
 /// Pick the next free VIP block (`127.42.<b>`) on a node.
 pub fn next_vip_block(used_blocks: &HashSet<String>) -> R<String> {
     for b in 0..=VIP_BLOCK_MAX {

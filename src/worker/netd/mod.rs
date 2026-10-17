@@ -21,6 +21,8 @@
 //! setup and teardown. Nothing here reaches into the heartbeat loop.
 
 pub mod activity;
+pub mod attach;
+pub mod datapath;
 pub mod dns;
 pub mod graph;
 pub mod guard;
@@ -29,15 +31,18 @@ pub mod handlers;
 pub mod http;
 pub mod ingress;
 pub mod kernel_guard;
+pub mod listen;
 pub mod netns;
 pub mod policy;
 pub mod proxy;
 pub mod proxyproto;
+pub mod specs;
 pub mod splice;
 pub mod state;
 pub mod tls;
 pub mod vsock;
 
+pub use datapath::{DesiredNetwork, Netd, NetdInput, NetdReport, NetdWants};
 pub use policy::{Denials, NetPolicyCache, PolicyLookup};
 
 /// Bounded-label metric families for the datapath, on the worker registry.
