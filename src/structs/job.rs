@@ -1473,12 +1473,19 @@ fn parse_percent(raw: &str) -> Option<f64> {
 /// members place together, or wait — and preemption never takes it below
 /// its quorum.
 ///
-/// Spelled `true`, `false` (no gang), or `{ min = N }`. It serializes back
-/// to the short form when `min` is unset, like [`TaskCount`].
+/// `placementTimeout` bounds the wait: a gang still short of its quorum that
+/// long after it first blocked fails its job.
+///
+/// Spelled `true`, `false` (no gang), or `{ min = N, placementTimeout =
+/// "30m" }`. It serializes back to the short form when nothing but the
+/// defaults is set, like [`TaskCount`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct GangConfig {
     /// Replicas that must run together. `None` = the task's whole count.
     pub min: Option<u32>,
+    /// How long the gang may wait, short of its quorum, before its job is
+    /// failed. `None` = wait indefinitely.
+    pub placement_timeout: Option<Duration>,
 }
 
 impl GangConfig {
@@ -1498,6 +1505,15 @@ impl GangConfig {
 
     /// Spec-shape rules for a task with this block and `count`.
     pub fn validate(&self, task: &str, count: u32) -> R<()> {
+        if self
+            .placement_timeout
+            .is_some_and(|timeout| timeout < Duration::from_secs(1))
+        {
+            bail!(
+                "task {task} gang.placementTimeout must be at least 1s; omit it to wait until \
+                 the gang fits"
+            );
+        }
         if let Some(min) = self.min {
             if min == 0 || min > count {
                 bail!(
@@ -1527,10 +1543,16 @@ impl GangConfig {
                                 })?;
                             gang.min = Some(min);
                         }
+                        "placementTimeout" => {
+                            gang.placement_timeout = Some(
+                                parse_duration_value(&value)
+                                    .map_err(|err| format!("gang.placementTimeout: {err}"))?,
+                            );
+                        }
                         other => {
                             return Err(format!(
-                                "unknown field `{other}` in gang, expected `min` \
-                                 (see docs/gang-scheduling.md)"
+                                "unknown field `{other}` in gang, expected one of `min`, \
+                                 `placementTimeout` (see docs/gang-scheduling.md)"
                             ))
                         }
                     }
@@ -1538,7 +1560,8 @@ impl GangConfig {
                 Ok(gang)
             }
             other => Err(format!(
-                "gang must be true, false, or {{ min = <count> }}, got {other}"
+                "gang must be true, false, or an object like {{ min = <count>, \
+                 placementTimeout = \"30m\" }}, got {other}"
             )),
         }
     }
@@ -1549,14 +1572,20 @@ impl Serialize for GangConfig {
     where
         S: serde::Serializer,
     {
-        match self.min {
-            Some(min) => {
-                let mut state = serializer.serialize_struct("GangConfig", 1)?;
-                state.serialize_field("min", &min)?;
-                state.end()
-            }
-            None => serializer.serialize_bool(true),
+        if *self == GangConfig::default() {
+            return serializer.serialize_bool(true);
         }
+        let mut state = serializer.serialize_struct("GangConfig", 2)?;
+        if let Some(min) = self.min {
+            state.serialize_field("min", &min)?;
+        }
+        if let Some(timeout) = self.placement_timeout {
+            state.serialize_field(
+                "placementTimeout",
+                &humantime::format_duration(timeout).to_string(),
+            )?;
+        }
+        state.end()
     }
 }
 
@@ -4898,13 +4927,37 @@ mod tests {
     }
 
     #[test]
-    fn gang_rejects_fields_it_does_not_have_yet() {
-        let error = gang_task(serde_json::json!({ "placementTimeout": "30m" }))
-            .expect_err("an unbuilt field is rejected, not ignored");
+    fn gang_placement_timeout_parses_and_round_trips() -> R<()> {
+        let task = gang_task(serde_json::json!({ "min": 6, "placementTimeout": "30m" }))?;
+        let gang = task.gang.expect("gang");
+        assert_eq!(gang.placement_timeout, Some(Duration::from_secs(1800)));
+        let stored = serde_json::to_value(&task)?["gang"].clone();
+        assert_eq!(
+            stored,
+            serde_json::json!({ "min": 6, "placementTimeout": "30m" })
+        );
+        let reparsed: TaskConfig = serde_json::from_value(serde_json::to_value(&task)?)?;
+        assert_eq!(reparsed.gang, task.gang);
+        // Seconds work too, and a sub-second timeout is rejected at submit.
+        let seconds = gang_task(serde_json::json!({ "placementTimeout": 90 }))?;
+        assert_eq!(
+            seconds.gang.and_then(|gang| gang.placement_timeout),
+            Some(Duration::from_secs(90))
+        );
+        let zero = gang_task(serde_json::json!({ "placementTimeout": 0 }))?;
+        let error = zero.validate_gang().expect_err("a zero timeout");
+        assert!(error.to_string().contains("at least 1s"), "{error}");
+        Ok(())
+    }
+
+    #[test]
+    fn gang_rejects_fields_it_does_not_have() {
+        let error = gang_task(serde_json::json!({ "minimum": 3 }))
+            .expect_err("an unknown field is rejected, not ignored");
         assert!(
             error
                 .to_string()
-                .contains("unknown field `placementTimeout` in gang"),
+                .contains("unknown field `minimum` in gang"),
             "{error}"
         );
         let error = gang_task(serde_json::json!(8)).expect_err("a number is not a gang");

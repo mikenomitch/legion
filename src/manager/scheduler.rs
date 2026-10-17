@@ -110,6 +110,15 @@ pub struct GangReport {
     /// Why the first replica that did not fit did not, or empty when every
     /// replica fit.
     pub reason: String,
+    /// The gang's `placementTimeout` in seconds, 0 when it waits
+    /// indefinitely.
+    pub placement_timeout_secs: u64,
+    /// When a waiting gang first blocked, unix seconds; 0 in a dry run and
+    /// before the first block is written (`store/gang_waits.rs`).
+    pub waiting_since: i64,
+    /// When a waiting gang's `placementTimeout` runs out, unix seconds; 0
+    /// when it has none, and in a dry run.
+    pub deadline: i64,
 }
 
 impl GangReport {
@@ -125,6 +134,9 @@ impl GangReport {
             "eligibleNodes": self.eligible_nodes,
             "nodes": self.nodes,
             "reason": self.reason,
+            "placementTimeoutSeconds": self.placement_timeout_secs,
+            "waitingSince": self.waiting_since,
+            "deadline": self.deadline,
         })
     }
 
@@ -157,6 +169,15 @@ impl GangReport {
             eligible_nodes: count("eligibleNodes"),
             nodes: count("nodes"),
             reason: text("reason"),
+            placement_timeout_secs: value
+                .get("placementTimeoutSeconds")
+                .and_then(Value::as_u64)
+                .unwrap_or(0),
+            waiting_since: value
+                .get("waitingSince")
+                .and_then(Value::as_i64)
+                .unwrap_or(0),
+            deadline: value.get("deadline").and_then(Value::as_i64).unwrap_or(0),
         })
     }
 
@@ -172,6 +193,9 @@ impl GangReport {
             eligible_nodes: self.eligible_nodes,
             nodes: self.nodes,
             reason: self.reason.clone(),
+            placement_timeout_seconds: self.placement_timeout_secs,
+            waiting_since: self.waiting_since,
+            deadline: self.deadline,
         }
     }
 
@@ -2938,6 +2962,12 @@ impl<'a> Scheduler<'a> {
                     eligible_nodes: base_eligible.len() as u32,
                     nodes: nodes.len() as u32,
                     reason: String::new(),
+                    placement_timeout_secs: gang
+                        .placement_timeout
+                        .map(|timeout| timeout.as_secs().max(1))
+                        .unwrap_or(0),
+                    waiting_since: 0,
+                    deadline: 0,
                 };
                 let Some(mut shortfall) = shortfall else {
                     gang_reports.push(report);

@@ -34,6 +34,9 @@ mod job_status_ops;
 // Reschedule backoff: the failed-allocation removal op, its holds, and the
 // move history they double as.
 mod reschedule_holds;
+// Gang waits: when a gang started waiting for its quorum, and its
+// `placementTimeout`.
+mod gang_waits;
 use crate::storage::persistence::{
     build_persistence_driver, PersistenceDriver, PersistenceRole, PersistenceStatus,
     RaftHistoryEvent, RaftStatus,
@@ -41,6 +44,7 @@ use crate::storage::persistence::{
 use crate::storage::raft::{capture, ReplicatedOp, ReplicationHandle};
 use crate::storage::Lane;
 pub use fork_ops::{alias_target_problem, AliasOutcome, ForkCreated};
+pub use gang_waits::GangWait;
 pub use job_status_ops::{derive_job_status, JobStatusFacts, TaskStatusFact};
 pub use keyring_ops::{KeyringInit, KeyringReset, RewrapBatch, RewrapRun, RootKeyRewrap};
 pub use reschedule_holds::{
@@ -9540,6 +9544,7 @@ impl Store {
         )?;
         tx.execute("DELETE FROM instance WHERE job_id = ?1;", [job_id])?;
         tx.execute("DELETE FROM reschedule_hold WHERE job_id = ?1;", [job_id])?;
+        Self::delete_gang_waits_for_job_tx(&tx, job_id)?;
         Self::destroy_job_snapshots_tx(&tx, job_id)?;
         tx.execute("DELETE FROM rollout_event WHERE job_id = ?1;", [job_id])?;
         tx.execute("DELETE FROM rollout WHERE job_id = ?1;", [job_id])?;
@@ -9892,6 +9897,26 @@ impl Store {
         };
         if status == "stopped" {
             return Ok(Some(format!("job {job_id} is stopped")));
+        }
+        // A failed gang job stays down until `job run` restarts it (which
+        // clears the status first): its gang was failed as a unit (a
+        // placement timeout, an `onMemberLoss: fail`, or a member that ran
+        // out of moves), and a stray reschedule placing it again would undo
+        // exactly that (docs/gang-scheduling.md). Other failed jobs keep
+        // planning, as before.
+        if status == "failed" {
+            let gang: bool = conn
+                .prepare_cached(
+                    "SELECT EXISTS (
+                         SELECT 1 FROM task_config WHERE job_config_id = ?1 AND gang IS NOT NULL
+                     );",
+                )?
+                .query_row([job_config_id], |row| row.get(0))?;
+            if gang {
+                return Ok(Some(format!(
+                    "job {job_id} failed as a gang; `legion job run` restarts it"
+                )));
+            }
         }
         let Some(latest) = latest else {
             return Ok(None);

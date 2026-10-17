@@ -2044,6 +2044,30 @@ fn migration_list() -> Vec<M<'static>> {
         // not a gang. Appended at the end, since raft changesets bind columns
         // by position. Control lane, like the rest of `task_config`.
         M::up("ALTER TABLE task_config ADD COLUMN gang TEXT;").down(""),
+        // Gang waits (docs/gang-scheduling.md, "Placement timeout"): one row
+        // per job config whose gang is waiting for its quorum. `since_unix`
+        // is when it first blocked, kept as it blocks again; `deadline_unix`
+        // is `since_unix` plus the gang's `placementTimeout`, NULL when it
+        // waits indefinitely. Written in the entry that blocks the gang's
+        // eval, deleted when a plan reaches the quorum, the job stops,
+        // restarts, or is destroyed, or the timeout fires. Scheduler lane,
+        // like `eval`.
+        M::up(
+            "CREATE TABLE IF NOT EXISTS gang_wait (
+            job_config_id STRING PRIMARY KEY,
+            job_id STRING NOT NULL,
+            task_name STRING NOT NULL,
+            since_unix INTEGER NOT NULL,
+            deadline_unix INTEGER
+        );
+        CREATE INDEX IF NOT EXISTS idx_gang_wait_job ON gang_wait(job_id);
+        CREATE INDEX IF NOT EXISTS idx_gang_wait_deadline ON gang_wait(deadline_unix);",
+        )
+        .down(
+            "DROP INDEX IF EXISTS idx_gang_wait_deadline;
+        DROP INDEX IF EXISTS idx_gang_wait_job;
+        DROP TABLE IF EXISTS gang_wait;",
+        ),
     ]
 }
 

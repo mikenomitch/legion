@@ -230,6 +230,14 @@ const TABLE_OWNERS: &[(&str, Owner)] = &[
     // scheduler cleanup: all scheduler-lane ops. NOT commutative (rows are
     // updated and deleted).
     ("reschedule_hold", Owner::Lane(Lane::Scheduler)),
+    // `gang_wait` records when a gang started waiting for its quorum and
+    // its placement deadline (docs/gang-scheduling.md). Written by the eval
+    // completion op that blocks the gang's eval (`write_blocked_eval`),
+    // deleted by the scheduler after a plan reaches the quorum, by the
+    // `job_stop`/`job_update` evals, by the leader's timeout pass, and by job
+    // destroy's scheduler cleanup: all scheduler-lane ops. NOT commutative
+    // (rows are deleted).
+    ("gang_wait", Owner::Lane(Lane::Scheduler)),
     // `node_alloc_usage` caches the aggregated allocation usage of a node
     // for the plan-apply capacity recheck, next to a fingerprint of the rows
     // it was derived from (see the migration that creates it). Written by

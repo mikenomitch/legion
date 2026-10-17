@@ -766,6 +766,8 @@ pub struct Metrics {
     pub evals_blocked: Arc<GaugeVec>,
     /// `legion_gang_blocked_jobs`
     pub gang_blocked_jobs: Arc<Gauge>,
+    /// `legion_gang_outcomes_total{outcome}`
+    pub gang_outcomes_total: Arc<CounterVec>,
     /// `legion_evals_unblocked_total{event}`
     pub evals_unblocked_total: Arc<CounterVec>,
     /// `legion_blocked_wait_seconds`
@@ -1074,6 +1076,14 @@ impl Metrics {
                 labels: &[],
             },
             cell: GaugeCell::default(),
+        });
+        let gang_outcomes_total = Arc::new(CounterVec {
+            meta: FamilyMeta {
+                name: "legion_gang_outcomes_total",
+                help: "Gang lifecycle decisions (docs/gang-scheduling.md), by outcome: `timeout` (a gang did not reach its quorum within placementTimeout and its job failed), `replace` (a member was lost and is replaced alone), `restart` (a member was lost and the whole gang stops to be placed again), `fail` (a member was lost and the gang's job failed). Counted on the manager that made the decision.",
+                labels: &["outcome"],
+            },
+            series: Series::new(),
         });
         let evals_unblocked_total = Arc::new(CounterVec {
             meta: FamilyMeta {
@@ -1864,6 +1874,7 @@ impl Metrics {
             Arc::clone(&eval_conflict_requeues_total) as Arc<dyn RenderMetric>,
             Arc::clone(&evals_blocked) as Arc<dyn RenderMetric>,
             Arc::clone(&gang_blocked_jobs) as Arc<dyn RenderMetric>,
+            Arc::clone(&gang_outcomes_total) as Arc<dyn RenderMetric>,
             Arc::clone(&evals_unblocked_total) as Arc<dyn RenderMetric>,
             Arc::clone(&blocked_wait_seconds) as Arc<dyn RenderMetric>,
             Arc::clone(&plan_apply_total) as Arc<dyn RenderMetric>,
@@ -1937,6 +1948,7 @@ impl Metrics {
             eval_conflict_requeues_total,
             evals_blocked,
             gang_blocked_jobs,
+            gang_outcomes_total,
             evals_unblocked_total,
             blocked_wait_seconds,
             scheduler_concurrency_limit,

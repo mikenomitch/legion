@@ -300,3 +300,111 @@ fn a_lost_member_tops_up_when_room_appears() -> R<()> {
     assert!(cluster.job_info("trainer")?.blocked.is_none());
     Ok(())
 }
+
+fn gang_with_timeout(timeout: std::time::Duration) -> Option<GangConfig> {
+    Some(GangConfig {
+        placement_timeout: Some(timeout),
+        ..GangConfig::default()
+    })
+}
+
+/// The wait clock starts when the gang first blocks and is kept across
+/// every wake and re-block: capacity that frees but not enough wakes the
+/// gang, it re-plans, blocks again, and still counts from the first block.
+#[test]
+fn a_gang_wait_counts_from_its_first_block() -> R<()> {
+    let cluster = Cluster::new(&["n-1", "n-2"])?;
+    cluster.submit(&job("filler", 1, None))?;
+    cluster.settle()?;
+    let trainer = job(
+        "trainer",
+        2,
+        gang_with_timeout(std::time::Duration::from_secs(3600)),
+    );
+    cluster.submit(&trainer)?;
+    cluster.settle()?;
+    let config_id = cluster.store().get_job_config("trainer")?.id();
+    let first = cluster
+        .store()
+        .gang_wait(&config_id)?
+        .context("the first block starts the wait")?;
+    assert_eq!(first.deadline_unix, Some(first.since_unix + 3600));
+    let info = cluster.job_info("trainer")?;
+    let gang = info
+        .blocked
+        .and_then(|blocked| blocked.gang)
+        .context("gang report")?;
+    assert_eq!(gang.placement_timeout_seconds, 3600);
+    assert_eq!(gang.waiting_since, first.since_unix);
+    assert_eq!(gang.deadline, first.since_unix + 3600);
+
+    // A third node joins: the gang wakes, re-plans, and (the filler still
+    // holding one node) fits now. Before that, make the wake useless by
+    // filling the new node first.
+    std::thread::sleep(std::time::Duration::from_millis(1100));
+    cluster.store().insert_node(NodeMsg::from(node("n-3")))?;
+    cluster.submit(&job("filler-2", 1, None))?;
+    cluster.settle()?;
+    assert_eq!(cluster.running("trainer")?, 0);
+    let again = cluster
+        .store()
+        .gang_wait(&config_id)?
+        .context("still waiting")?;
+    assert_eq!(again.since_unix, first.since_unix, "the clock was kept");
+
+    // Room for both: the gang places and its wait ends.
+    cluster.store().remove_allocs_for_job("filler")?;
+    cluster.settle()?;
+    assert_eq!(cluster.running("trainer")?, 2);
+    assert!(cluster.store().gang_wait(&config_id)?.is_none());
+    Ok(())
+}
+
+/// A gang still short past its `placementTimeout` fails its job: the
+/// leader's timer wakes it, the plan comes up short again, and instead of
+/// blocking the job is failed. A failed gang job then places nothing, even
+/// when room appears, until `job run` restarts it.
+#[test]
+fn a_gang_past_its_placement_timeout_fails_its_job() -> R<()> {
+    let cluster = Cluster::new(&["n-1"])?;
+    let trainer = job(
+        "trainer",
+        2,
+        gang_with_timeout(std::time::Duration::from_secs(1)),
+    );
+    cluster.submit(&trainer)?;
+    cluster.settle()?;
+    assert_eq!(cluster.store().blocked_evals()?.len(), 1);
+    assert_eq!(cluster.store().wake_timed_out_gangs()?, 0, "not yet");
+
+    std::thread::sleep(std::time::Duration::from_millis(2100));
+    assert_eq!(cluster.store().wake_timed_out_gangs()?, 1);
+    cluster.settle()?;
+    let info = cluster.job_info("trainer")?;
+    assert_eq!(info.status, "failed");
+    assert!(cluster.store().blocked_evals()?.is_empty());
+    let config_id = cluster.store().get_job_config("trainer")?.id();
+    assert!(cluster.store().gang_wait(&config_id)?.is_none());
+    let timeout_events =
+        cluster
+            .store()
+            .list_scheduler_events(&legion::storage::events::SchedulerEventFilter {
+                kind: Some("job.gang_timeout".into()),
+                ..Default::default()
+            })?;
+    assert_eq!(timeout_events.len(), 1, "{timeout_events:?}");
+
+    // Room appears: a failed gang job stays down.
+    cluster.join("n-2")?;
+    cluster.settle()?;
+    assert_eq!(cluster.running("trainer")?, 0);
+
+    // `job run` clears the failure and restarts it.
+    cluster.store().clear_job_failed_status("trainer")?;
+    cluster
+        .store()
+        .enqueue_eval("job_update", Some("trainer"), Some(&config_id), None, None)?;
+    cluster.settle()?;
+    assert_eq!(cluster.running("trainer")?, 2);
+    Ok(())
+}

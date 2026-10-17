@@ -1002,6 +1002,27 @@ pub mod drafts {
         EventDraft::error("job.failed", format!("Job {job_id} marked failed")).job(job_id)
     }
 
+    /// `job.gang_timeout` — a gang did not reach its quorum within its
+    /// `placementTimeout`, so its job was failed and any survivors stopped
+    /// (docs/gang-scheduling.md, "Placement timeout").
+    pub fn job_gang_timeout(
+        job_id: &str,
+        task: &str,
+        timeout_secs: u64,
+        waited_secs: u64,
+        stopped: usize,
+        message: &str,
+    ) -> EventDraft {
+        EventDraft::error("job.gang_timeout", message.to_string())
+            .job(job_id)
+            .meta(json!({
+                "task": task,
+                "placementTimeoutSeconds": timeout_secs,
+                "waitedSeconds": waited_secs,
+                "stopped": stopped,
+            }))
+    }
+
     /// `job.destroyed` — a job and its records were removed.
     pub fn job_destroyed(job_id: &str) -> EventDraft {
         EventDraft::info("job.destroyed", format!("Job {job_id} destroyed")).job(job_id)
@@ -2313,6 +2334,25 @@ impl EventRecorder<'_> {
 
     pub fn job_failed(self, job_id: &str) {
         self.emit(drafts::job_failed(job_id));
+    }
+
+    pub fn job_gang_timeout(
+        self,
+        job_id: &str,
+        task: &str,
+        timeout_secs: u64,
+        waited_secs: u64,
+        stopped: usize,
+        message: &str,
+    ) {
+        self.emit(drafts::job_gang_timeout(
+            job_id,
+            task,
+            timeout_secs,
+            waited_secs,
+            stopped,
+            message,
+        ));
     }
 
     pub fn job_destroyed(self, job_id: &str) {
