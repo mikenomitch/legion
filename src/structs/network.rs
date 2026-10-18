@@ -884,7 +884,7 @@ pub fn parse_upstream_to(to: &str) -> R<UpstreamDestination> {
 /// One injected header on an external `https://` upstream. Whatever value
 /// the task sent for `header` is dropped and replaced with `prefix` + the
 /// secret, so a placeholder the task's SDK insists on is harmless.
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct UpstreamCredential {
     /// The request header to set (`x-api-key`, `Authorization`). Stored
@@ -893,56 +893,28 @@ pub struct UpstreamCredential {
     /// Text placed before the secret (`"Bearer "`). Optional.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prefix: Option<String>,
-    /// Where the secret comes from.
-    pub from: CredentialFrom,
-}
-
-/// The provider behind one credential. Exactly one field is set. Each
-/// provider is a sibling field, so a new one (a webhook) slots in without
-/// reshaping the jobspec.
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Default)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct CredentialFrom {
-    /// A KV path whose value is the secret. The node fetches it with
-    /// `GetUpstreamCredentials` and keeps it in memory only.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub kv: Option<String>,
-    /// The name of one of the task's `identities`: the manager mints that
-    /// workload-identity token for the allocation and the node injects it,
-    /// refreshed before it expires. The identity needs no `env` or `file`
-    /// delivery, in which case the token never reaches the task.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub identity: Option<String>,
+    /// Where the secret comes from: `{ kv = "<path>" }` or
+    /// `{ identity = "<task identity>" }`. Never a `file`: credentials stay
+    /// cluster-held, so a node's disk never becomes a secret store.
+    pub from: crate::structs::source::Source,
 }
 
 impl UpstreamCredential {
     /// The KV path this credential reads, when it is KV-backed.
     pub fn kv_path(&self) -> Option<&str> {
-        self.from
-            .kv
-            .as_deref()
-            .map(str::trim)
-            .filter(|path| !path.is_empty())
+        self.from.kv_path()
     }
 
     /// The task identity this credential injects, when it is
     /// identity-backed.
     pub fn identity_name(&self) -> Option<&str> {
-        self.from
-            .identity
-            .as_deref()
-            .map(str::trim)
-            .filter(|name| !name.is_empty())
+        self.from.identity_name()
     }
 
     /// Where the value comes from, as the jobspec names it, for status
     /// lines and logs: `kv secrets/openai` or `identity api`.
     pub fn source(&self) -> String {
-        match (self.kv_path(), self.identity_name()) {
-            (Some(path), _) => format!("kv {path}"),
-            (None, Some(name)) => format!("identity {name}"),
-            (None, None) => "no provider".to_string(),
-        }
+        self.from.to_string()
     }
 }
 
@@ -1051,33 +1023,30 @@ fn validate_upstream_credentials(task_name: &str, upstream: &UpstreamConfig) -> 
                 bail!("{at}: prefix must not contain CR, LF, or NUL");
             }
         }
-        match (
-            credential.from.kv.as_deref(),
-            credential.from.identity.as_deref(),
-        ) {
-            (Some(_), Some(_)) => {
-                bail!("{at}: from names two providers (kv and identity); set exactly one")
+        use crate::structs::source::SourceKind;
+        credential
+            .from
+            .check(
+                &format!("{at}: from"),
+                &[SourceKind::Kv, SourceKind::Identity],
+            )
+            .map_err(|err| {
+                anyhow!(
+                    "{err}. Hint: from = {{ kv = \"secrets/{key}\" }} or \
+                     {{ identity = \"<task identity name>\" }}"
+                )
+            })?;
+        if let Some(name) = credential.identity_name() {
+            crate::structs::workload_identity::validate_identity_name(name)
+                .map_err(|err| anyhow!("{at}: from.identity: {err}"))?;
+            if name == crate::structs::workload_identity::CONTROL_PLANE_IDENTITY_NAME {
+                bail!(
+                    "{at}: from.identity = \"{name}\" is the control-plane identity, which \
+                     authenticates to Legion itself; injecting it would hand a Legion \
+                     credential to {to}. Hint: declare an identity whose audience is \
+                     that origin"
+                );
             }
-            (Some(path), None) if !path.trim().is_empty() => {}
-            (Some(_), None) => bail!("{at}: from.kv must name a KV path"),
-            (None, Some(name)) => {
-                crate::structs::workload_identity::validate_identity_name(name.trim())
-                    .map_err(|err| anyhow!("{at}: from.identity: {err}"))?;
-                if name.trim() == crate::structs::workload_identity::CONTROL_PLANE_IDENTITY_NAME {
-                    bail!(
-                        "{at}: from.identity = \"{}\" is the control-plane identity, which \
-                         authenticates to Legion itself; injecting it would hand a Legion \
-                         credential to {to}. Hint: declare an identity whose audience is \
-                         that origin",
-                        name.trim()
-                    );
-                }
-            }
-            (None, None) => bail!(
-                "{at}: from needs a provider: {{ kv = \"<path>\" }} or \
-                 {{ identity = \"<task identity name>\" }}, e.g. \
-                 from = {{ kv = \"secrets/{key}\" }}"
-            ),
         }
     }
     Ok(())
@@ -2157,12 +2126,7 @@ pub fn normalize_task_connect(task_name: &str, connect: &mut Option<ConnectConfi
         upstream.to = upstream.to.trim().to_string();
         for credential in upstream.credentials.iter_mut() {
             credential.header = credential.header.trim().to_ascii_lowercase();
-            if let Some(path) = credential.from.kv.as_mut() {
-                *path = path.trim().to_string();
-            }
-            if let Some(name) = credential.from.identity.as_mut() {
-                *name = name.trim().to_string();
-            }
+            credential.from.trim();
         }
         let is_http = upstream.is_http();
         let key = upstream.key();
@@ -3256,9 +3220,13 @@ mod tests {
 
         // A provider is required, and its path non-empty.
         let err = check(json!([{ "name": "o", "to": "https://x.example", "credentials": [{ "header": "x", "from": { "kv": "  " } }] }])).unwrap_err();
-        assert!(err.contains("must name a KV path"), "{err}");
-        let err = check(json!([{ "name": "o", "to": "https://x.example", "credentials": [{ "header": "x", "from": {} }] }])).unwrap_err();
-        assert!(err.contains("needs a provider"), "{err}");
+        assert!(err.contains("kv is empty"), "{err}");
+        // `from` is one source: no key, or two, is a parse error.
+        assert!(serde_json::from_value::<ConnectConfig>(json!({ "upstreams": [{ "name": "o", "to": "https://x.example", "credentials": [{ "header": "x", "from": {} }] }] })).is_err());
+        assert!(serde_json::from_value::<ConnectConfig>(json!({ "upstreams": [{ "name": "o", "to": "https://x.example", "credentials": [{ "header": "x", "from": { "kv": "a", "identity": "b" } }] }] })).is_err());
+        // Credentials never come from a node's disk.
+        let err = check(json!([{ "name": "o", "to": "https://x.example", "credentials": [{ "header": "x", "from": { "file": "/etc/key" } }] }])).unwrap_err();
+        assert!(err.contains("file source is not allowed"), "{err}");
         // Unknown providers are a parse error, not silently ignored.
         assert!(serde_json::from_value::<ConnectConfig>(json!({ "upstreams": [{ "name": "o", "to": "https://x.example", "credentials": [{ "header": "x", "from": { "vault": "a" } }] }] })).is_err());
         let err = check(json!([{ "name": "o", "to": "https://x.example", "credentials": [{ "header": "x", "prefix": "a\r\nb", "from": { "kv": "k" } }] }])).unwrap_err();
@@ -3275,8 +3243,6 @@ mod tests {
         let credential = &normalized.unwrap().upstreams[0].credentials[0];
         assert_eq!(credential.identity_name(), Some("api"));
         assert_eq!(credential.source(), "identity api");
-        let err = check(json!([{ "name": "o", "to": "https://x.example", "credentials": [{ "header": "x", "from": { "kv": "k", "identity": "api" } }] }])).unwrap_err();
-        assert!(err.contains("two providers"), "{err}");
         let err = check(json!([{ "name": "o", "to": "https://x.example", "credentials": [{ "header": "x", "from": { "identity": "../x" } }] }])).unwrap_err();
         assert!(err.contains("from.identity"), "{err}");
         let err = check(json!([{ "name": "o", "to": "https://x.example", "credentials": [{ "header": "x", "from": { "identity": "legion" } }] }])).unwrap_err();

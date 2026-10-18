@@ -479,7 +479,7 @@ its first heartbeat, and until then requests on that upstream get a `503`.
   into a burst of `401`s, or into requests that succeed against an origin
   that allows anonymous access.
 - **Rotation.** `legion kv put secrets/openai ...` reaches every node on its
-  next heartbeat (`GetUpstreamCredentials`, asked only for versions newer
+  next heartbeat (`FetchDatapathMaterial`, asked only for versions newer
   than the one held). Requests already in flight keep the old value. Nothing
   restarts. Deleting the key revokes it on the next heartbeat. An identity
   token is replaced on the first heartbeat after half its TTL has passed.
@@ -898,7 +898,7 @@ legion kv put certs/app.example.com "$(cat fullchain.pem privkey.pem)"
   on its private port. The node terminates TLS.
 - **Swaps are live.** Each heartbeat, a node with KV-backed chains asks the
   manager for certificates newer than the version it holds
-  (`GetIngressCertificates`). New connections get the new certificate, and
+  (`FetchDatapathMaterial`). New connections get the new certificate, and
   connections already open keep theirs. Nothing restarts.
 - **Fail-static.** The manager checks a bundle before sending it: it must hold
   a certificate and a private key, and the key must match the leaf. A bad
@@ -1746,8 +1746,11 @@ the value out: `certFrom = { kv }` on an ingress chain
 `connect.upstreams[].credentials` ([Credential injection](#credential-injection)).
 The same rule covers every other place a job names a key
 ([KV references in a job](auth-and-acls.md#kv-references-in-a-job)).
-`GetIngressCertificates` and `GetUpstreamCredentials` are worker-plane, and a
-node only receives values that allocations placed on it declare.
+`FetchDatapathMaterial`, the one call a node's datapath fetches everything
+with, is worker-plane, and a node only receives values that allocations
+placed on it declare: the request names an allocation and what it needs
+(an upstream and a header, say), never a KV path, and the manager derives the
+path from the allocation's own declaration.
 
 ## Current scope and limitations
 

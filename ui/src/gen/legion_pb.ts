@@ -11116,135 +11116,117 @@ export class IssueNodeCertificateReply extends Message<IssueNodeCertificateReply
 }
 
 /**
- * One allocation in a GetIngressCertificates request.
+ * One piece of material a node asks for: what kind, and what it is for.
+ * Never where the value lives; the manager derives that (see
+ * `FetchDatapathMaterial`).
  *
- * @generated from message legion.IngressCertificateKnown
+ * @generated from message legion.MaterialRef
  */
-export class IngressCertificateKnown extends Message<IngressCertificateKnown> {
+export class MaterialRef extends Message<MaterialRef> {
   /**
-   * The allocation (manager-facing id) whose ingress certificate to fetch.
+   * `policy`, `ingress_cert`, or `credential`.
    *
-   * @generated from field: int64 allocation_id = 1;
+   * @generated from field: string kind = 1;
+   */
+  kind = "";
+
+  /**
+   * The allocation (manager-facing id) the material is for. 0 for `policy`,
+   * which is shared by content hash.
+   *
+   * @generated from field: int64 allocation_id = 2;
    */
   allocationId = protoInt64.zero;
 
   /**
-   * The KV version of the certificate the worker already holds, or 0 for
-   * none. When it matches the current version the reply is `unchanged`.
+   * `policy`: the content hash. `credential`: the upstream's key (its
+   * `name`, or the catalog service its `to` names). Empty for
+   * `ingress_cert`.
    *
-   * @generated from field: int64 version = 2;
+   * @generated from field: string key = 3;
+   */
+  key = "";
+
+  /**
+   * `credential`: the injected header, lower-cased. Empty otherwise.
+   *
+   * @generated from field: string part = 4;
+   */
+  part = "";
+
+  /**
+   * The version the worker already holds, or 0 for none: the KV entry's
+   * version, or an identity token's expiry in unix seconds. Unused for
+   * `policy` (a hash never changes).
+   *
+   * @generated from field: int64 version = 5;
    */
   version = protoInt64.zero;
 
-  constructor(data?: PartialMessage<IngressCertificateKnown>) {
+  constructor(data?: PartialMessage<MaterialRef>) {
     super();
     proto3.util.initPartial(data, this);
   }
 
   static readonly runtime: typeof proto3 = proto3;
-  static readonly typeName = "legion.IngressCertificateKnown";
+  static readonly typeName = "legion.MaterialRef";
   static readonly fields: FieldList = proto3.util.newFieldList(() => [
-    { no: 1, name: "allocation_id", kind: "scalar", T: 3 /* ScalarType.INT64 */ },
-    { no: 2, name: "version", kind: "scalar", T: 3 /* ScalarType.INT64 */ },
+    { no: 1, name: "kind", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 2, name: "allocation_id", kind: "scalar", T: 3 /* ScalarType.INT64 */ },
+    { no: 3, name: "key", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 4, name: "part", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 5, name: "version", kind: "scalar", T: 3 /* ScalarType.INT64 */ },
   ]);
 
-  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): IngressCertificateKnown {
-    return new IngressCertificateKnown().fromBinary(bytes, options);
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): MaterialRef {
+    return new MaterialRef().fromBinary(bytes, options);
   }
 
-  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): IngressCertificateKnown {
-    return new IngressCertificateKnown().fromJson(jsonValue, options);
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): MaterialRef {
+    return new MaterialRef().fromJson(jsonValue, options);
   }
 
-  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): IngressCertificateKnown {
-    return new IngressCertificateKnown().fromJsonString(jsonString, options);
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): MaterialRef {
+    return new MaterialRef().fromJsonString(jsonString, options);
   }
 
-  static equals(a: IngressCertificateKnown | PlainMessage<IngressCertificateKnown> | undefined, b: IngressCertificateKnown | PlainMessage<IngressCertificateKnown> | undefined): boolean {
-    return proto3.util.equals(IngressCertificateKnown, a, b);
+  static equals(a: MaterialRef | PlainMessage<MaterialRef> | undefined, b: MaterialRef | PlainMessage<MaterialRef> | undefined): boolean {
+    return proto3.util.equals(MaterialRef, a, b);
   }
 }
 
 /**
- * Request payload for GetIngressCertificates.
+ * The answer for one `MaterialRef`.
  *
- * @generated from message legion.GetIngressCertificatesRequest
+ * @generated from message legion.Material
  */
-export class GetIngressCertificatesRequest extends Message<GetIngressCertificatesRequest> {
+export class Material extends Message<Material> {
   /**
-   * The worker node asking. Must match the caller's authenticated per-node
-   * credential.
+   * The ref this answers, echoed as sent.
    *
-   * @generated from field: string node_id = 1;
+   * @generated from field: legion.MaterialRef ref = 1;
    */
-  nodeId = "";
+  ref?: MaterialRef;
 
   /**
-   * The allocations on this node with a `certFrom = { kv }` ingress chain.
+   * Where the value comes from, as the declaration names it: `kv
+   * certs/app`, `identity api`, or `policy <hash>`. Set even when `error`
+   * is, so the worker can report which key is at fault.
    *
-   * @generated from field: repeated legion.IngressCertificateKnown known = 2;
+   * @generated from field: string source = 2;
    */
-  known: IngressCertificateKnown[] = [];
-
-  constructor(data?: PartialMessage<GetIngressCertificatesRequest>) {
-    super();
-    proto3.util.initPartial(data, this);
-  }
-
-  static readonly runtime: typeof proto3 = proto3;
-  static readonly typeName = "legion.GetIngressCertificatesRequest";
-  static readonly fields: FieldList = proto3.util.newFieldList(() => [
-    { no: 1, name: "node_id", kind: "scalar", T: 9 /* ScalarType.STRING */ },
-    { no: 2, name: "known", kind: "message", T: IngressCertificateKnown, repeated: true },
-  ]);
-
-  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): GetIngressCertificatesRequest {
-    return new GetIngressCertificatesRequest().fromBinary(bytes, options);
-  }
-
-  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): GetIngressCertificatesRequest {
-    return new GetIngressCertificatesRequest().fromJson(jsonValue, options);
-  }
-
-  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): GetIngressCertificatesRequest {
-    return new GetIngressCertificatesRequest().fromJsonString(jsonString, options);
-  }
-
-  static equals(a: GetIngressCertificatesRequest | PlainMessage<GetIngressCertificatesRequest> | undefined, b: GetIngressCertificatesRequest | PlainMessage<GetIngressCertificatesRequest> | undefined): boolean {
-    return proto3.util.equals(GetIngressCertificatesRequest, a, b);
-  }
-}
-
-/**
- * One allocation's certificate in a GetIngressCertificates reply.
- *
- * @generated from message legion.IngressCertificate
- */
-export class IngressCertificate extends Message<IngressCertificate> {
-  /**
-   * The allocation this certificate is for.
-   *
-   * @generated from field: int64 allocation_id = 1;
-   */
-  allocationId = protoInt64.zero;
+  source = "";
 
   /**
-   * The KV path the allocation's effective ingress chain names. Set even
-   * when `error` is, so the worker can report which key is at fault.
-   *
-   * @generated from field: string kv_path = 2;
-   */
-  kvPath = "";
-
-  /**
-   * The KV entry's version. The worker re-fetches when it moves.
+   * The value's current version (see `MaterialRef.version`). The worker
+   * sends it back next time.
    *
    * @generated from field: int64 version = 3;
    */
   version = protoInt64.zero;
 
   /**
-   * True when `version` equals the version the worker sent. No material is
+   * True when the version the worker sent is still current. No value is
    * returned.
    *
    * @generated from field: bool unchanged = 4;
@@ -11252,172 +11234,69 @@ export class IngressCertificate extends Message<IngressCertificate> {
   unchanged = false;
 
   /**
-   * The PEM bundle: the certificate chain, leaf first, then the private
-   * key. Validated by the manager before it is sent. Treat as a secret:
+   * The material: an `EffectivePolicy` as JSON (`policy`), a PEM bundle
+   * (`ingress_cert`), or a header value (`credential`). Treat as a secret:
    * never log it, never write it to disk.
    *
-   * @generated from field: string bundle_pem = 5;
+   * @generated from field: string value = 5;
    */
-  bundlePem = "";
+  value = "";
 
   /**
-   * Why no certificate was returned, e.g. "kv certs/app not found" or
-   * "kv certs/app holds no private key". Empty on success.
+   * Why no value was returned. Empty on success.
    *
    * @generated from field: string error = 6;
    */
   error = "";
 
-  constructor(data?: PartialMessage<IngressCertificate>) {
+  /**
+   * True when `error` is authoritative: the key or the declaration is gone,
+   * so the worker drops what it holds instead of keeping it.
+   *
+   * @generated from field: bool absent = 7;
+   */
+  absent = false;
+
+  constructor(data?: PartialMessage<Material>) {
     super();
     proto3.util.initPartial(data, this);
   }
 
   static readonly runtime: typeof proto3 = proto3;
-  static readonly typeName = "legion.IngressCertificate";
+  static readonly typeName = "legion.Material";
   static readonly fields: FieldList = proto3.util.newFieldList(() => [
-    { no: 1, name: "allocation_id", kind: "scalar", T: 3 /* ScalarType.INT64 */ },
-    { no: 2, name: "kv_path", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 1, name: "ref", kind: "message", T: MaterialRef },
+    { no: 2, name: "source", kind: "scalar", T: 9 /* ScalarType.STRING */ },
     { no: 3, name: "version", kind: "scalar", T: 3 /* ScalarType.INT64 */ },
     { no: 4, name: "unchanged", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
-    { no: 5, name: "bundle_pem", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 5, name: "value", kind: "scalar", T: 9 /* ScalarType.STRING */ },
     { no: 6, name: "error", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 7, name: "absent", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
   ]);
 
-  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): IngressCertificate {
-    return new IngressCertificate().fromBinary(bytes, options);
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): Material {
+    return new Material().fromBinary(bytes, options);
   }
 
-  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): IngressCertificate {
-    return new IngressCertificate().fromJson(jsonValue, options);
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): Material {
+    return new Material().fromJson(jsonValue, options);
   }
 
-  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): IngressCertificate {
-    return new IngressCertificate().fromJsonString(jsonString, options);
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): Material {
+    return new Material().fromJsonString(jsonString, options);
   }
 
-  static equals(a: IngressCertificate | PlainMessage<IngressCertificate> | undefined, b: IngressCertificate | PlainMessage<IngressCertificate> | undefined): boolean {
-    return proto3.util.equals(IngressCertificate, a, b);
+  static equals(a: Material | PlainMessage<Material> | undefined, b: Material | PlainMessage<Material> | undefined): boolean {
+    return proto3.util.equals(Material, a, b);
   }
 }
 
 /**
- * Reply payload for GetIngressCertificates.
+ * Request payload for FetchDatapathMaterial.
  *
- * @generated from message legion.GetIngressCertificatesReply
+ * @generated from message legion.FetchDatapathMaterialRequest
  */
-export class GetIngressCertificatesReply extends Message<GetIngressCertificatesReply> {
-  /**
-   * One entry per requested allocation, in request order.
-   *
-   * @generated from field: repeated legion.IngressCertificate certificates = 1;
-   */
-  certificates: IngressCertificate[] = [];
-
-  constructor(data?: PartialMessage<GetIngressCertificatesReply>) {
-    super();
-    proto3.util.initPartial(data, this);
-  }
-
-  static readonly runtime: typeof proto3 = proto3;
-  static readonly typeName = "legion.GetIngressCertificatesReply";
-  static readonly fields: FieldList = proto3.util.newFieldList(() => [
-    { no: 1, name: "certificates", kind: "message", T: IngressCertificate, repeated: true },
-  ]);
-
-  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): GetIngressCertificatesReply {
-    return new GetIngressCertificatesReply().fromBinary(bytes, options);
-  }
-
-  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): GetIngressCertificatesReply {
-    return new GetIngressCertificatesReply().fromJson(jsonValue, options);
-  }
-
-  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): GetIngressCertificatesReply {
-    return new GetIngressCertificatesReply().fromJsonString(jsonString, options);
-  }
-
-  static equals(a: GetIngressCertificatesReply | PlainMessage<GetIngressCertificatesReply> | undefined, b: GetIngressCertificatesReply | PlainMessage<GetIngressCertificatesReply> | undefined): boolean {
-    return proto3.util.equals(GetIngressCertificatesReply, a, b);
-  }
-}
-
-/**
- * One injected header in a GetUpstreamCredentials request: an allocation on
- * the calling node, one of its upstreams, and one credential header on it.
- *
- * @generated from message legion.UpstreamCredentialKnown
- */
-export class UpstreamCredentialKnown extends Message<UpstreamCredentialKnown> {
-  /**
-   * The allocation (manager-facing id) whose credential to fetch.
-   *
-   * @generated from field: int64 allocation_id = 1;
-   */
-  allocationId = protoInt64.zero;
-
-  /**
-   * The upstream's key: the `name` of an external upstream
-   * (`connect.upstreams[].name`), as in `LEGION_UPSTREAM_<NAME>`.
-   *
-   * @generated from field: string upstream = 2;
-   */
-  upstream = "";
-
-  /**
-   * The injected header, lower-cased (`x-api-key`, `authorization`).
-   *
-   * @generated from field: string header = 3;
-   */
-  header = "";
-
-  /**
-   * The version of the value the worker already holds, or 0 for none: the
-   * KV entry's version for a `kv` credential, the token's expiry (unix
-   * seconds) for an `identity` one. When it is still current the reply is
-   * `unchanged`.
-   *
-   * @generated from field: int64 version = 4;
-   */
-  version = protoInt64.zero;
-
-  constructor(data?: PartialMessage<UpstreamCredentialKnown>) {
-    super();
-    proto3.util.initPartial(data, this);
-  }
-
-  static readonly runtime: typeof proto3 = proto3;
-  static readonly typeName = "legion.UpstreamCredentialKnown";
-  static readonly fields: FieldList = proto3.util.newFieldList(() => [
-    { no: 1, name: "allocation_id", kind: "scalar", T: 3 /* ScalarType.INT64 */ },
-    { no: 2, name: "upstream", kind: "scalar", T: 9 /* ScalarType.STRING */ },
-    { no: 3, name: "header", kind: "scalar", T: 9 /* ScalarType.STRING */ },
-    { no: 4, name: "version", kind: "scalar", T: 3 /* ScalarType.INT64 */ },
-  ]);
-
-  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): UpstreamCredentialKnown {
-    return new UpstreamCredentialKnown().fromBinary(bytes, options);
-  }
-
-  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): UpstreamCredentialKnown {
-    return new UpstreamCredentialKnown().fromJson(jsonValue, options);
-  }
-
-  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): UpstreamCredentialKnown {
-    return new UpstreamCredentialKnown().fromJsonString(jsonString, options);
-  }
-
-  static equals(a: UpstreamCredentialKnown | PlainMessage<UpstreamCredentialKnown> | undefined, b: UpstreamCredentialKnown | PlainMessage<UpstreamCredentialKnown> | undefined): boolean {
-    return proto3.util.equals(UpstreamCredentialKnown, a, b);
-  }
-}
-
-/**
- * Request payload for GetUpstreamCredentials.
- *
- * @generated from message legion.GetUpstreamCredentialsRequest
- */
-export class GetUpstreamCredentialsRequest extends Message<GetUpstreamCredentialsRequest> {
+export class FetchDatapathMaterialRequest extends Message<FetchDatapathMaterialRequest> {
   /**
    * The worker node asking. Must match the caller's authenticated per-node
    * credential.
@@ -11427,199 +11306,81 @@ export class GetUpstreamCredentialsRequest extends Message<GetUpstreamCredential
   nodeId = "";
 
   /**
-   * Every credential header declared by an allocation on this node.
+   * What the node's datapath needs: policy bodies it holds an assignment
+   * without a body for, and the certificates and credentials its
+   * allocations declare.
    *
-   * @generated from field: repeated legion.UpstreamCredentialKnown known = 2;
+   * @generated from field: repeated legion.MaterialRef refs = 2;
    */
-  known: UpstreamCredentialKnown[] = [];
+  refs: MaterialRef[] = [];
 
-  constructor(data?: PartialMessage<GetUpstreamCredentialsRequest>) {
+  constructor(data?: PartialMessage<FetchDatapathMaterialRequest>) {
     super();
     proto3.util.initPartial(data, this);
   }
 
   static readonly runtime: typeof proto3 = proto3;
-  static readonly typeName = "legion.GetUpstreamCredentialsRequest";
+  static readonly typeName = "legion.FetchDatapathMaterialRequest";
   static readonly fields: FieldList = proto3.util.newFieldList(() => [
     { no: 1, name: "node_id", kind: "scalar", T: 9 /* ScalarType.STRING */ },
-    { no: 2, name: "known", kind: "message", T: UpstreamCredentialKnown, repeated: true },
+    { no: 2, name: "refs", kind: "message", T: MaterialRef, repeated: true },
   ]);
 
-  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): GetUpstreamCredentialsRequest {
-    return new GetUpstreamCredentialsRequest().fromBinary(bytes, options);
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): FetchDatapathMaterialRequest {
+    return new FetchDatapathMaterialRequest().fromBinary(bytes, options);
   }
 
-  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): GetUpstreamCredentialsRequest {
-    return new GetUpstreamCredentialsRequest().fromJson(jsonValue, options);
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): FetchDatapathMaterialRequest {
+    return new FetchDatapathMaterialRequest().fromJson(jsonValue, options);
   }
 
-  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): GetUpstreamCredentialsRequest {
-    return new GetUpstreamCredentialsRequest().fromJsonString(jsonString, options);
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): FetchDatapathMaterialRequest {
+    return new FetchDatapathMaterialRequest().fromJsonString(jsonString, options);
   }
 
-  static equals(a: GetUpstreamCredentialsRequest | PlainMessage<GetUpstreamCredentialsRequest> | undefined, b: GetUpstreamCredentialsRequest | PlainMessage<GetUpstreamCredentialsRequest> | undefined): boolean {
-    return proto3.util.equals(GetUpstreamCredentialsRequest, a, b);
+  static equals(a: FetchDatapathMaterialRequest | PlainMessage<FetchDatapathMaterialRequest> | undefined, b: FetchDatapathMaterialRequest | PlainMessage<FetchDatapathMaterialRequest> | undefined): boolean {
+    return proto3.util.equals(FetchDatapathMaterialRequest, a, b);
   }
 }
 
 /**
- * One credential in a GetUpstreamCredentials reply.
+ * Reply payload for FetchDatapathMaterial.
  *
- * @generated from message legion.UpstreamCredentialValue
+ * @generated from message legion.FetchDatapathMaterialReply
  */
-export class UpstreamCredentialValue extends Message<UpstreamCredentialValue> {
+export class FetchDatapathMaterialReply extends Message<FetchDatapathMaterialReply> {
   /**
-   * The allocation this credential is for.
+   * One entry per requested ref, in request order.
    *
-   * @generated from field: int64 allocation_id = 1;
+   * @generated from field: repeated legion.Material materials = 1;
    */
-  allocationId = protoInt64.zero;
+  materials: Material[] = [];
 
-  /**
-   * The upstream key, echoed from the request.
-   *
-   * @generated from field: string upstream = 2;
-   */
-  upstream = "";
-
-  /**
-   * The header, echoed from the request.
-   *
-   * @generated from field: string header = 3;
-   */
-  header = "";
-
-  /**
-   * Where the value comes from, as the allocation's declaration names it:
-   * `kv secrets/openai` or `identity api`. Set even when `error` is, so the
-   * worker can report which key or identity is at fault. Empty when the
-   * declaration is gone.
-   *
-   * @generated from field: string source = 4;
-   */
-  source = "";
-
-  /**
-   * The value's version: the KV entry's version, or the identity token's
-   * expiry in unix seconds. The worker sends it back as
-   * `UpstreamCredentialKnown.version`.
-   *
-   * @generated from field: int64 version = 5;
-   */
-  version = protoInt64.zero;
-
-  /**
-   * True when the version the worker sent is still current (the KV entry
-   * has not moved, or the identity token it holds has more than half its
-   * TTL left). No value is returned.
-   *
-   * @generated from field: bool unchanged = 6;
-   */
-  unchanged = false;
-
-  /**
-   * The secret: the raw KV value, or the signed identity token, which the
-   * forwarder sends as the header value after the declared `prefix`. Treat
-   * as a secret: never log it, never write it to disk.
-   *
-   * @generated from field: string value = 7;
-   */
-  value = "";
-
-  /**
-   * Why no value was returned, e.g. "kv secrets/openai not found" or
-   * "workload identity is not enabled on this manager". Empty on success.
-   *
-   * @generated from field: string error = 8;
-   */
-  error = "";
-
-  /**
-   * True when `error` is authoritative rather than transient: the KV key
-   * does not exist, or the allocation is not on this node or no longer
-   * declares this credential. The worker drops any value it holds, so
-   * deleting the key revokes the credential on the next heartbeat. False
-   * for transient problems (a KV read failure, a failed token mint), where
-   * the worker keeps the last good value.
-   *
-   * @generated from field: bool absent = 9;
-   */
-  absent = false;
-
-  constructor(data?: PartialMessage<UpstreamCredentialValue>) {
+  constructor(data?: PartialMessage<FetchDatapathMaterialReply>) {
     super();
     proto3.util.initPartial(data, this);
   }
 
   static readonly runtime: typeof proto3 = proto3;
-  static readonly typeName = "legion.UpstreamCredentialValue";
+  static readonly typeName = "legion.FetchDatapathMaterialReply";
   static readonly fields: FieldList = proto3.util.newFieldList(() => [
-    { no: 1, name: "allocation_id", kind: "scalar", T: 3 /* ScalarType.INT64 */ },
-    { no: 2, name: "upstream", kind: "scalar", T: 9 /* ScalarType.STRING */ },
-    { no: 3, name: "header", kind: "scalar", T: 9 /* ScalarType.STRING */ },
-    { no: 4, name: "source", kind: "scalar", T: 9 /* ScalarType.STRING */ },
-    { no: 5, name: "version", kind: "scalar", T: 3 /* ScalarType.INT64 */ },
-    { no: 6, name: "unchanged", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
-    { no: 7, name: "value", kind: "scalar", T: 9 /* ScalarType.STRING */ },
-    { no: 8, name: "error", kind: "scalar", T: 9 /* ScalarType.STRING */ },
-    { no: 9, name: "absent", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
+    { no: 1, name: "materials", kind: "message", T: Material, repeated: true },
   ]);
 
-  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): UpstreamCredentialValue {
-    return new UpstreamCredentialValue().fromBinary(bytes, options);
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): FetchDatapathMaterialReply {
+    return new FetchDatapathMaterialReply().fromBinary(bytes, options);
   }
 
-  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): UpstreamCredentialValue {
-    return new UpstreamCredentialValue().fromJson(jsonValue, options);
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): FetchDatapathMaterialReply {
+    return new FetchDatapathMaterialReply().fromJson(jsonValue, options);
   }
 
-  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): UpstreamCredentialValue {
-    return new UpstreamCredentialValue().fromJsonString(jsonString, options);
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): FetchDatapathMaterialReply {
+    return new FetchDatapathMaterialReply().fromJsonString(jsonString, options);
   }
 
-  static equals(a: UpstreamCredentialValue | PlainMessage<UpstreamCredentialValue> | undefined, b: UpstreamCredentialValue | PlainMessage<UpstreamCredentialValue> | undefined): boolean {
-    return proto3.util.equals(UpstreamCredentialValue, a, b);
-  }
-}
-
-/**
- * Reply payload for GetUpstreamCredentials.
- *
- * @generated from message legion.GetUpstreamCredentialsReply
- */
-export class GetUpstreamCredentialsReply extends Message<GetUpstreamCredentialsReply> {
-  /**
-   * One entry per requested credential, in request order.
-   *
-   * @generated from field: repeated legion.UpstreamCredentialValue credentials = 1;
-   */
-  credentials: UpstreamCredentialValue[] = [];
-
-  constructor(data?: PartialMessage<GetUpstreamCredentialsReply>) {
-    super();
-    proto3.util.initPartial(data, this);
-  }
-
-  static readonly runtime: typeof proto3 = proto3;
-  static readonly typeName = "legion.GetUpstreamCredentialsReply";
-  static readonly fields: FieldList = proto3.util.newFieldList(() => [
-    { no: 1, name: "credentials", kind: "message", T: UpstreamCredentialValue, repeated: true },
-  ]);
-
-  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): GetUpstreamCredentialsReply {
-    return new GetUpstreamCredentialsReply().fromBinary(bytes, options);
-  }
-
-  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): GetUpstreamCredentialsReply {
-    return new GetUpstreamCredentialsReply().fromJson(jsonValue, options);
-  }
-
-  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): GetUpstreamCredentialsReply {
-    return new GetUpstreamCredentialsReply().fromJsonString(jsonString, options);
-  }
-
-  static equals(a: GetUpstreamCredentialsReply | PlainMessage<GetUpstreamCredentialsReply> | undefined, b: GetUpstreamCredentialsReply | PlainMessage<GetUpstreamCredentialsReply> | undefined): boolean {
-    return proto3.util.equals(GetUpstreamCredentialsReply, a, b);
+  static equals(a: FetchDatapathMaterialReply | PlainMessage<FetchDatapathMaterialReply> | undefined, b: FetchDatapathMaterialReply | PlainMessage<FetchDatapathMaterialReply> | undefined): boolean {
+    return proto3.util.equals(FetchDatapathMaterialReply, a, b);
   }
 }
 
@@ -13967,7 +13728,7 @@ export class HeartbeatReply extends Message<HeartbeatReply> {
 
   /**
    * The effective network policy for each desired allocation, as a content
-   * hash. The worker fetches a body it has not seen via `FetchNetPolicy`
+   * hash. The worker fetches a body it has not seen via `FetchDatapathMaterial`
    * and caches it; identical merged policies share one hash and one fetch.
    * An allocation absent from this list has no policy. Delivered every
    * heartbeat, applied only after a successful one, so a manager outage
@@ -31628,97 +31389,6 @@ export class TestNetPolicyReply extends Message<TestNetPolicyReply> {
 
   static equals(a: TestNetPolicyReply | PlainMessage<TestNetPolicyReply> | undefined, b: TestNetPolicyReply | PlainMessage<TestNetPolicyReply> | undefined): boolean {
     return proto3.util.equals(TestNetPolicyReply, a, b);
-  }
-}
-
-/**
- * Request payload for FetchNetPolicy (worker plane).
- *
- * @generated from message legion.FetchNetPolicyRequest
- */
-export class FetchNetPolicyRequest extends Message<FetchNetPolicyRequest> {
-  /**
-   * Node id of the caller. With ACLs enforced it must match the node token
-   * on the request (see `HeartbeatRequest.id`).
-   *
-   * @generated from field: string node_id = 1;
-   */
-  nodeId = "";
-
-  /**
-   * Content hash from `HeartbeatReply.net_policies`.
-   *
-   * @generated from field: string hash = 2;
-   */
-  hash = "";
-
-  constructor(data?: PartialMessage<FetchNetPolicyRequest>) {
-    super();
-    proto3.util.initPartial(data, this);
-  }
-
-  static readonly runtime: typeof proto3 = proto3;
-  static readonly typeName = "legion.FetchNetPolicyRequest";
-  static readonly fields: FieldList = proto3.util.newFieldList(() => [
-    { no: 1, name: "node_id", kind: "scalar", T: 9 /* ScalarType.STRING */ },
-    { no: 2, name: "hash", kind: "scalar", T: 9 /* ScalarType.STRING */ },
-  ]);
-
-  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): FetchNetPolicyRequest {
-    return new FetchNetPolicyRequest().fromBinary(bytes, options);
-  }
-
-  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): FetchNetPolicyRequest {
-    return new FetchNetPolicyRequest().fromJson(jsonValue, options);
-  }
-
-  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): FetchNetPolicyRequest {
-    return new FetchNetPolicyRequest().fromJsonString(jsonString, options);
-  }
-
-  static equals(a: FetchNetPolicyRequest | PlainMessage<FetchNetPolicyRequest> | undefined, b: FetchNetPolicyRequest | PlainMessage<FetchNetPolicyRequest> | undefined): boolean {
-    return proto3.util.equals(FetchNetPolicyRequest, a, b);
-  }
-}
-
-/**
- * Reply payload for FetchNetPolicy.
- *
- * @generated from message legion.FetchNetPolicyReply
- */
-export class FetchNetPolicyReply extends Message<FetchNetPolicyReply> {
-  /**
-   * The `EffectivePolicy` as JSON. Its `hash` field equals the request hash.
-   *
-   * @generated from field: string effective_json = 1;
-   */
-  effectiveJson = "";
-
-  constructor(data?: PartialMessage<FetchNetPolicyReply>) {
-    super();
-    proto3.util.initPartial(data, this);
-  }
-
-  static readonly runtime: typeof proto3 = proto3;
-  static readonly typeName = "legion.FetchNetPolicyReply";
-  static readonly fields: FieldList = proto3.util.newFieldList(() => [
-    { no: 1, name: "effective_json", kind: "scalar", T: 9 /* ScalarType.STRING */ },
-  ]);
-
-  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): FetchNetPolicyReply {
-    return new FetchNetPolicyReply().fromBinary(bytes, options);
-  }
-
-  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): FetchNetPolicyReply {
-    return new FetchNetPolicyReply().fromJson(jsonValue, options);
-  }
-
-  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): FetchNetPolicyReply {
-    return new FetchNetPolicyReply().fromJsonString(jsonString, options);
-  }
-
-  static equals(a: FetchNetPolicyReply | PlainMessage<FetchNetPolicyReply> | undefined, b: FetchNetPolicyReply | PlainMessage<FetchNetPolicyReply> | undefined): boolean {
-    return proto3.util.equals(FetchNetPolicyReply, a, b);
   }
 }
 

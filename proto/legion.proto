@@ -1111,84 +1111,57 @@ service Manager {
   rpc IssueNodeCertificate (IssueNodeCertificateRequest)
       returns (IssueNodeCertificateReply);
 
-  // Fetch the KV-held certificates behind `certFrom = { kv = "<path>" }`
-  // ingress chains (docs/network-handlers.md, "Certificates from KV").
+  // Fetch the material a node's datapath needs for the allocations placed
+  // on it, in one call per heartbeat: network-policy bodies by hash, the
+  // KV-held certificates behind ingress TLS, and the values behind
+  // `connect.upstreams[].credentials` (docs/network-handlers.md). It
+  // replaces one fetch per kind, so a new kind of material (or a new place
+  // a value comes from) is a provider on the manager, not a new call.
   //
-  // The worker names allocations, never KV paths. For each allocation the
-  // manager checks that it is placed on the calling node, recomputes its
-  // effective ingress chain (inline chain merged with any policy objects),
-  // takes the KV path from that chain, and reads the entry. So a node can
-  // only ever read a certificate that a job or policy on it declares, and a
-  // job can only declare one its submitter could read (RunJob and
-  // UpsertNetPolicy require `kv:read` on the path).
+  // Each `MaterialRef` names a kind and what it is for, never where the
+  // value lives:
+  // - `policy`: `key` is a content hash from `HeartbeatReply.net_policies`;
+  //   `value` is the `EffectivePolicy` as JSON. Policies are
+  //   content-addressed, so a node running a thousand identical sandboxes
+  //   fetches one body once.
+  // - `ingress_cert`: `allocation_id` names an allocation whose ingress TLS
+  //   takes its certificate from KV; `value` is the PEM bundle (chain, leaf
+  //   first, then the private key), validated by the manager first.
+  // - `credential`: `allocation_id`, `key` (the upstream's key), and `part`
+  //   (the header, lower-cased) name one injected header; `value` is the KV
+  //   value or a freshly minted workload-identity token.
   //
-  // Workers call it on their heartbeat loop, only while some allocation on
-  // the node has a KV-backed chain, passing the KV version they already
-  // hold so an unchanged certificate costs no material on the wire. The
-  // worker keeps the material in memory only.
+  // The manager derives every KV path and identity itself, from the
+  // allocation's own declaration (its task's `connect` block, or its
+  // effective ingress chain), after checking the allocation is placed on
+  // the calling node. So a node can only ever read material that a job or
+  // policy on it declares, and a job can only declare a KV path its
+  // submitter could read (RunJob, template runs, and UpsertNetPolicy
+  // require `kv:read` on it).
   //
-  // Per-allocation problems (not placed here, no KV-backed chain, key
-  // missing, bundle invalid) come back in that allocation's `error` rather
-  // than failing the call, so one broken certificate never blocks the
-  // others.
-  //
-  // Called by the worker for its own node: the caller's authenticated
-  // per-node principal (`node:<node_id>`) must match the request's
-  // `node_id`.
-  //
-  // Errors:
-  // - PermissionDenied: `node_id` does not match the caller's credential.
-  // - Internal: the node's allocations could not be loaded.
-  rpc GetIngressCertificates (GetIngressCertificatesRequest)
-      returns (GetIngressCertificatesReply);
-
-  // Fetch the values behind `connect.upstreams[].credentials`
-  // (docs/network-handlers.md, "Credential injection"): headers the node's
-  // forwarder sets on every request it sends to an external `https://`
-  // upstream, so the task (and anything captured from it: a sandbox's
-  // memory checkpoints, forks, published snapshots) never holds the secret.
-  //
-  // Each credential names one provider:
-  // - `from = { kv = "<path>" }`: the KV value at that path.
-  // - `from = { identity = "<name>" }`: a workload-identity token
-  //   (docs/workload-identity.md) the manager mints for the allocation
-  //   under the task's identity of that name, with that identity's
-  //   audience, TTL, `sub` template, and extra claims.
-  //
-  // The worker names (allocation, upstream, header) triples, never KV paths
-  // or identities. For each one the manager checks that the allocation is
-  // placed on the calling node, reads the allocation's own task `connect`
-  // declaration, finds the upstream and the credential for that header, and
-  // takes the provider from it. So a node can only ever read a secret that a
-  // job placed on it declares, and a job can only declare one its submitter
-  // could read (RunJob and template runs require `kv:read` on every
-  // credential path).
-  //
-  // Workers call it on their heartbeat loop, only while some allocation on
-  // the node declares credentials, passing the version they already hold so
-  // an unchanged value costs no material on the wire. For a KV value the
-  // version is the KV entry's; for an identity token it is the token's
-  // expiry, and the manager mints a new token once less than half the
-  // identity's TTL remains. The worker keeps values in memory only: never in
+  // Workers pass the version they already hold (`MaterialRef.version`): the
+  // KV entry's version, or for an identity token its expiry in unix
+  // seconds, which the manager re-mints once less than half the identity's
+  // TTL remains. An unchanged value comes back `unchanged` with no material
+  // on the wire. Material is held in memory only on the worker: never in
   // its state files, never in a log line.
   //
-  // Per-entry problems (not placed here, no such credential, key missing,
-  // workload identity disabled on the manager) come back in that entry's
-  // `error` rather than failing the call, so one missing secret never blocks
-  // the others. `absent` marks the problems that are authoritative (the key
-  // or the declaration is gone): the worker drops any value it holds and
-  // fails requests on that upstream closed. Any other error, and a failed
-  // call, keeps the last good value.
+  // Per-ref problems (not placed here, no such declaration, key missing,
+  // bundle invalid, workload identity disabled) come back in that ref's
+  // `error` rather than failing the call, so one broken certificate or
+  // missing secret never blocks the others. `absent` marks the
+  // authoritative ones (the key or the declaration is gone): the worker
+  // drops what it holds, so requests that need it fail closed. Any other
+  // error, and a failed call, keeps the last good value (fail-static).
   //
-  // Called by the worker for its own node: the caller's authenticated
-  // per-node principal (`node:<node_id>`) must match the request's
-  // `node_id`.
+  // ACL: worker plane. The caller's authenticated per-node principal
+  // (`node:<node_id>`) must match the request's `node_id`.
   //
   // Errors:
   // - PermissionDenied: `node_id` does not match the caller's credential.
   // - Internal: the node's allocations could not be loaded.
-  rpc GetUpstreamCredentials (GetUpstreamCredentialsRequest)
-      returns (GetUpstreamCredentialsReply);
+  rpc FetchDatapathMaterial (FetchDatapathMaterialRequest)
+      returns (FetchDatapathMaterialReply);
 
   // Worker heartbeat endpoint.
   //
@@ -1850,14 +1823,6 @@ service Manager {
   //   the trust bundle, wait a heartbeat, switch the signing CA, drop the
   //   old CA a day later; docs/cluster-ca.md#rotation).
   rpc RotateMeshCa (RotateMeshCaRequest) returns (RotateMeshCaReply);
-
-  // Worker plane: fetches the merged policy body for a hash the heartbeat
-  // reply named. Policies are content-addressed so a node running a thousand
-  // identical sandboxes fetches one body once; the worker caches by hash and
-  // keeps the last known good body if a fetch fails (fail-static).
-  //
-  // ACL: worker plane (node token).
-  rpc FetchNetPolicy (FetchNetPolicyRequest) returns (FetchNetPolicyReply);
 
   // Resolves an artifact credential stored in KV for a worker about to fetch.
   //
@@ -5642,137 +5607,78 @@ message IssueNodeCertificateReply {
   int64 expires_at = 4;
 }
 
-// One allocation in a GetIngressCertificates request.
-message IngressCertificateKnown {
-  // The allocation (manager-facing id) whose ingress certificate to fetch.
-  int64 allocation_id = 1;
+// One piece of material a node asks for: what kind, and what it is for.
+// Never where the value lives; the manager derives that (see
+// `FetchDatapathMaterial`).
+message MaterialRef {
+  // `policy`, `ingress_cert`, or `credential`.
+  string kind = 1;
 
-  // The KV version of the certificate the worker already holds, or 0 for
-  // none. When it matches the current version the reply is `unchanged`.
-  int64 version = 2;
+  // The allocation (manager-facing id) the material is for. 0 for `policy`,
+  // which is shared by content hash.
+  int64 allocation_id = 2;
+
+  // `policy`: the content hash. `credential`: the upstream's key (its
+  // `name`, or the catalog service its `to` names). Empty for
+  // `ingress_cert`.
+  string key = 3;
+
+  // `credential`: the injected header, lower-cased. Empty otherwise.
+  string part = 4;
+
+  // The version the worker already holds, or 0 for none: the KV entry's
+  // version, or an identity token's expiry in unix seconds. Unused for
+  // `policy` (a hash never changes).
+  int64 version = 5;
 }
 
-// Request payload for GetIngressCertificates.
-message GetIngressCertificatesRequest {
-  // The worker node asking. Must match the caller's authenticated per-node
-  // credential.
-  string node_id = 1;
+// The answer for one `MaterialRef`.
+message Material {
+  // The ref this answers, echoed as sent.
+  MaterialRef ref = 1;
 
-  // The allocations on this node with a `certFrom = { kv }` ingress chain.
-  repeated IngressCertificateKnown known = 2;
-}
+  // Where the value comes from, as the declaration names it: `kv
+  // certs/app`, `identity api`, or `policy <hash>`. Set even when `error`
+  // is, so the worker can report which key is at fault.
+  string source = 2;
 
-// One allocation's certificate in a GetIngressCertificates reply.
-message IngressCertificate {
-  // The allocation this certificate is for.
-  int64 allocation_id = 1;
-
-  // The KV path the allocation's effective ingress chain names. Set even
-  // when `error` is, so the worker can report which key is at fault.
-  string kv_path = 2;
-
-  // The KV entry's version. The worker re-fetches when it moves.
+  // The value's current version (see `MaterialRef.version`). The worker
+  // sends it back next time.
   int64 version = 3;
 
-  // True when `version` equals the version the worker sent. No material is
+  // True when the version the worker sent is still current. No value is
   // returned.
   bool unchanged = 4;
 
-  // The PEM bundle: the certificate chain, leaf first, then the private
-  // key. Validated by the manager before it is sent. Treat as a secret:
+  // The material: an `EffectivePolicy` as JSON (`policy`), a PEM bundle
+  // (`ingress_cert`), or a header value (`credential`). Treat as a secret:
   // never log it, never write it to disk.
-  string bundle_pem = 5;
+  string value = 5;
 
-  // Why no certificate was returned, e.g. "kv certs/app not found" or
-  // "kv certs/app holds no private key". Empty on success.
+  // Why no value was returned. Empty on success.
   string error = 6;
+
+  // True when `error` is authoritative: the key or the declaration is gone,
+  // so the worker drops what it holds instead of keeping it.
+  bool absent = 7;
 }
 
-// Reply payload for GetIngressCertificates.
-message GetIngressCertificatesReply {
-  // One entry per requested allocation, in request order.
-  repeated IngressCertificate certificates = 1;
-}
-
-// One injected header in a GetUpstreamCredentials request: an allocation on
-// the calling node, one of its upstreams, and one credential header on it.
-message UpstreamCredentialKnown {
-  // The allocation (manager-facing id) whose credential to fetch.
-  int64 allocation_id = 1;
-
-  // The upstream's key: the `name` of an external upstream
-  // (`connect.upstreams[].name`), as in `LEGION_UPSTREAM_<NAME>`.
-  string upstream = 2;
-
-  // The injected header, lower-cased (`x-api-key`, `authorization`).
-  string header = 3;
-
-  // The version of the value the worker already holds, or 0 for none: the
-  // KV entry's version for a `kv` credential, the token's expiry (unix
-  // seconds) for an `identity` one. When it is still current the reply is
-  // `unchanged`.
-  int64 version = 4;
-}
-
-// Request payload for GetUpstreamCredentials.
-message GetUpstreamCredentialsRequest {
+// Request payload for FetchDatapathMaterial.
+message FetchDatapathMaterialRequest {
   // The worker node asking. Must match the caller's authenticated per-node
   // credential.
   string node_id = 1;
 
-  // Every credential header declared by an allocation on this node.
-  repeated UpstreamCredentialKnown known = 2;
+  // What the node's datapath needs: policy bodies it holds an assignment
+  // without a body for, and the certificates and credentials its
+  // allocations declare.
+  repeated MaterialRef refs = 2;
 }
 
-// One credential in a GetUpstreamCredentials reply.
-message UpstreamCredentialValue {
-  // The allocation this credential is for.
-  int64 allocation_id = 1;
-
-  // The upstream key, echoed from the request.
-  string upstream = 2;
-
-  // The header, echoed from the request.
-  string header = 3;
-
-  // Where the value comes from, as the allocation's declaration names it:
-  // `kv secrets/openai` or `identity api`. Set even when `error` is, so the
-  // worker can report which key or identity is at fault. Empty when the
-  // declaration is gone.
-  string source = 4;
-
-  // The value's version: the KV entry's version, or the identity token's
-  // expiry in unix seconds. The worker sends it back as
-  // `UpstreamCredentialKnown.version`.
-  int64 version = 5;
-
-  // True when the version the worker sent is still current (the KV entry
-  // has not moved, or the identity token it holds has more than half its
-  // TTL left). No value is returned.
-  bool unchanged = 6;
-
-  // The secret: the raw KV value, or the signed identity token, which the
-  // forwarder sends as the header value after the declared `prefix`. Treat
-  // as a secret: never log it, never write it to disk.
-  string value = 7;
-
-  // Why no value was returned, e.g. "kv secrets/openai not found" or
-  // "workload identity is not enabled on this manager". Empty on success.
-  string error = 8;
-
-  // True when `error` is authoritative rather than transient: the KV key
-  // does not exist, or the allocation is not on this node or no longer
-  // declares this credential. The worker drops any value it holds, so
-  // deleting the key revokes the credential on the next heartbeat. False
-  // for transient problems (a KV read failure, a failed token mint), where
-  // the worker keeps the last good value.
-  bool absent = 9;
-}
-
-// Reply payload for GetUpstreamCredentials.
-message GetUpstreamCredentialsReply {
-  // One entry per requested credential, in request order.
-  repeated UpstreamCredentialValue credentials = 1;
+// Reply payload for FetchDatapathMaterial.
+message FetchDatapathMaterialReply {
+  // One entry per requested ref, in request order.
+  repeated Material materials = 1;
 }
 
 // Request payload for Heartbeat.
@@ -6690,7 +6596,7 @@ message HeartbeatReply {
   optional uint32 next_interval_seconds = 7;
 
   // The effective network policy for each desired allocation, as a content
-  // hash. The worker fetches a body it has not seen via `FetchNetPolicy`
+  // hash. The worker fetches a body it has not seen via `FetchDatapathMaterial`
   // and caches it; identical merged policies share one hash and one fetch.
   // An allocation absent from this list has no policy. Delivered every
   // heartbeat, applied only after a successful one, so a manager outage
@@ -12373,22 +12279,6 @@ message TestNetPolicyReply {
   // denial: the guard is changed on the worker (`hostGuard.allow`), not in
   // job policy. Empty otherwise.
   string hint = 7;
-}
-
-// Request payload for FetchNetPolicy (worker plane).
-message FetchNetPolicyRequest {
-  // Node id of the caller. With ACLs enforced it must match the node token
-  // on the request (see `HeartbeatRequest.id`).
-  string node_id = 1;
-
-  // Content hash from `HeartbeatReply.net_policies`.
-  string hash = 2;
-}
-
-// Reply payload for FetchNetPolicy.
-message FetchNetPolicyReply {
-  // The `EffectivePolicy` as JSON. Its `hash` field equals the request hash.
-  string effective_json = 1;
 }
 
 // One allocation's effective policy, by hash.

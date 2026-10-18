@@ -107,7 +107,7 @@ fn endpoint_table() -> Vec<(&'static str, Plane)> {
         ("TestNetPolicy", Plane::Protected("net:read")),
         ("GetMeshCa", Plane::Protected("net:read")),
         ("RotateMeshCa", Plane::Protected("net:write")),
-        ("FetchNetPolicy", Plane::Worker),
+        ("FetchDatapathMaterial", Plane::Worker),
         ("GetNodes", Plane::Protected("node:read")),
         ("GetHeartbeatCadence", Plane::Protected("node:read")),
         ("GetNodeUsage", Plane::Protected("node:read")),
@@ -200,8 +200,6 @@ fn endpoint_table() -> Vec<(&'static str, Plane)> {
         ("DeleteExecKey", Plane::Protected("acl:write")),
         ("ListJobActions", Plane::Protected("job:read")),
         ("GetArtifactCredential", Plane::Worker),
-        ("GetIngressCertificates", Plane::Worker),
-        ("GetUpstreamCredentials", Plane::Worker),
         ("ListEvents", Plane::Protected("operator:read")),
         ("StreamEvents", Plane::Protected("operator:read")),
         ("WhoAmI", Plane::Open),
@@ -632,11 +630,15 @@ async fn call_endpoint(
             .rotate_mesh_ca(req(RotateMeshCaRequest {}, token))
             .await
             .map(|_| ()),
-        "FetchNetPolicy" => svc
-            .fetch_net_policy(req(
-                FetchNetPolicyRequest {
+        "FetchDatapathMaterial" => svc
+            .fetch_datapath_material(req(
+                FetchDatapathMaterialRequest {
                     node_id: NODE_ID.into(),
-                    hash: "0000".into(),
+                    refs: vec![MaterialRef {
+                        kind: "policy".into(),
+                        key: "0000".into(),
+                        ..Default::default()
+                    }],
                 },
                 token,
             ))
@@ -1230,26 +1232,6 @@ async fn call_endpoint(
                     node_id: NODE_ID.into(),
                     kv_path: KV_KEY.into(),
                     source: "https://example.test/artifact".into(),
-                },
-                token,
-            ))
-            .await
-            .map(|_| ()),
-        "GetIngressCertificates" => svc
-            .get_ingress_certificates(req(
-                GetIngressCertificatesRequest {
-                    node_id: NODE_ID.into(),
-                    known: Vec::new(),
-                },
-                token,
-            ))
-            .await
-            .map(|_| ()),
-        "GetUpstreamCredentials" => svc
-            .get_upstream_credentials(req(
-                GetUpstreamCredentialsRequest {
-                    node_id: NODE_ID.into(),
-                    known: Vec::new(),
                 },
                 token,
             ))
@@ -1984,10 +1966,8 @@ async fn worker_plane_binds_node_ids_to_the_caller() -> R<()> {
         "WorkerRegister",
         "Heartbeat",
         "HealthCheck",
-        "FetchNetPolicy",
+        "FetchDatapathMaterial",
         "GetArtifactCredential",
-        "GetIngressCertificates",
-        "GetUpstreamCredentials",
         "RatifyClaim",
     ] {
         let status = call_endpoint(&svc, &fixtures, method, Some(&intruder))

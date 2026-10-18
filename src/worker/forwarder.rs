@@ -269,10 +269,10 @@ pub struct ForwarderContext {
     /// what built it, and the result (an error is reported as `tls_error`).
     ingress_tls: Mutex<IngressTlsConfigs>,
     /// `certFrom = { kv }` material per allocation, from
-    /// `GetIngressCertificates`. In memory only.
+    /// `FetchDatapathMaterial`. In memory only.
     kv_certs: Mutex<HashMap<i64, KvCertState>>,
     /// `connect.upstreams[].credentials` values, from
-    /// `GetUpstreamCredentials`. In memory only: never persisted, never
+    /// `FetchDatapathMaterial`. In memory only: never persisted, never
     /// logged, never handed to the task.
     credentials: Mutex<HashMap<CredentialKey, CredentialState>>,
     /// Service-graph samples since the last heartbeat.
@@ -538,7 +538,7 @@ impl ForwarderContext {
     // ----- credential injection -----------------------------------------
 
     /// The version of the credential held for a header (0 for none): the KV
-    /// version, or an identity token's expiry. What `GetUpstreamCredentials`
+    /// version, or an identity token's expiry. What `FetchDatapathMaterial`
     /// compares against.
     pub fn credential_version(&self, allocation_id: i64, upstream: &str, header: &str) -> i64 {
         lock(&self.credentials)
@@ -659,7 +659,7 @@ impl ForwarderContext {
     }
 
     /// The KV version of the certificate held for an allocation (0 for none),
-    /// what `GetIngressCertificates` compares against.
+    /// what `FetchDatapathMaterial` compares against.
     pub fn kv_cert_version(&self, allocation_id: i64) -> i64 {
         lock(&self.kv_certs)
             .get(&allocation_id)

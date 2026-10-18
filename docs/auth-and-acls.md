@@ -520,7 +520,7 @@ When ACLs are enforced:
   type, or registering into a pool other than that type's pool, fails with
   `PermissionDenied`.
 - A node token only speaks for its own node. Every worker-plane RPC that names
-  a node (`Heartbeat`, `HealthCheck`, `FetchNetPolicy`,
+  a node (`Heartbeat`, `HealthCheck`, `FetchDatapathMaterial`,
   `GetArtifactCredential`, `RatifyClaim`, and the identity and certificate
   issuers) refuses a node id that does not match the token with
   `PermissionDenied`. A node token can re-register its own node in its current

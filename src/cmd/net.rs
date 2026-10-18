@@ -1368,7 +1368,7 @@ pub(crate) fn diagnose_network(
                 layer: "datapath",
                 status: if status.mode == "gated" { "fail" } else { "warn" },
                 detail: format!("allocation {alloc}: the node has not received the policy body yet (fail-closed while gated)"),
-                hint: Some("the worker fetches it by hash on its next heartbeat; persistent means the manager could not serve FetchNetPolicy — check manager logs".into()),
+                hint: Some("the worker fetches it by hash on its next heartbeat; persistent means the manager could not serve FetchDatapathMaterial — check manager logs".into()),
             });
             return steps;
         }

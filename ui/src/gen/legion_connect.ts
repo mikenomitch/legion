@@ -3,7 +3,7 @@
 /* eslint-disable */
 // @ts-nocheck
 
-import { AcquireKvLockReply, AcquireKvLockRequest, AdvanceRolloutReply, AdvanceRolloutRequest, CreateAclTokenReply, CreateAclTokenRequest, CreateExecKeyReply, CreateExecKeyRequest, CreateInstanceReply, CreateInstanceRequest, CreateInstancesReply, CreateInstancesRequest, CreateJoinTokenReply, CreateJoinTokenRequest, CreateSnapshotReply, CreateSnapshotRequest, DeleteAclPolicyReply, DeleteAclPolicyRequest, DeleteAclTokenReply, DeleteAclTokenRequest, DeleteAclUserReply, DeleteAclUserRequest, DeleteExecKeyReply, DeleteExecKeyRequest, DeleteJobTemplateReply, DeleteJobTemplateRequest, DeleteJoinTokenReply, DeleteJoinTokenRequest, DeleteKvReply, DeleteKvRequest, DeleteNetPolicyReply, DeleteNetPolicyRequest, DeleteSavedStateQueryReply, DeleteSavedStateQueryRequest, DeleteSnapshotAliasReply, DeleteSnapshotAliasRequest, DeleteSnapshotReply, DeleteSnapshotRequest, DeleteVolumeReply, DeleteVolumeRequest, DestroyInstanceReply, DestroyInstanceRequest, DestroyJobReply, DestroyJobRequest, ExecClientFrame, ExecServerFrame, FetchNetPolicyReply, FetchNetPolicyRequest, FetchRootKeyReply, FetchRootKeyRequest, ForkInstanceReply, ForkInstanceRequest, GetAclPolicyReply, GetAclPolicyRequest, GetAllocationLogsReply, GetAllocationLogsRequest, GetArtifactCredentialReply, GetArtifactCredentialRequest, GetAuthMethodsReply, GetAuthMethodsRequest, GetHeartbeatCadenceReply, GetHeartbeatCadenceRequest, GetIngressCertificatesReply, GetIngressCertificatesRequest, GetInstanceReply, GetInstanceRequest, GetJobInfoReply, GetJobInfoRequest, GetJobScaleStatusReply, GetJobScaleStatusRequest, GetJobSpecByConfigRequest, GetJobSpecReply, GetJobSpecRequest, GetJobTemplateReply, GetJobTemplateRequest, GetKeyringStatusReply, GetKeyringStatusRequest, GetKvLockReply, GetKvLockRequest, GetKvReply, GetKvRequest, GetLedgerReply, GetLedgerRequest, GetManagerConfigsReply, GetManagerConfigsRequest, GetMeshCaReply, GetMeshCaRequest, GetNetPolicyObjectReply, GetNetPolicyObjectRequest, GetNodeContentReply, GetNodeContentRequest, GetNodeReply, GetNodeRequest, GetNodesReply, GetNodesRequest, GetNodeUsageReply, GetNodeUsageRequest, GetObservabilityReply, GetObservabilityRequest, GetRaftJoinTokenReply, GetRaftJoinTokenRequest, GetRaftStatusReply, GetRaftStatusRequest, GetRolloutReply, GetRolloutRequest, GetRolloutStatusReply, GetRolloutStatusRequest, GetSchedulerConcurrencyReply, GetSchedulerConcurrencyRequest, GetSessionReply, GetSessionRequest, GetSnapshotReply, GetSnapshotRequest, GetStateBackupReply, GetStateBackupRequest, GetStateStoreSchemaReply, GetStateStoreSchemaRequest, GetTaskLogsReply, GetTaskLogsRequest, GetUpstreamCredentialsReply, GetUpstreamCredentialsRequest, GetVolumeReply, GetVolumeRequest, HealthCheckReply, HealthCheckRequest, HeartbeatReply, HeartbeatRequest, IssueBootTicketReply, IssueBootTicketRequest, IssueNodeCertificateReply, IssueNodeCertificateRequest, IssueNodeIdentityTokenReply, IssueNodeIdentityTokenRequest, IssueRaftCommandReply, IssueRaftCommandRequest, IssueWorkloadIdentityTokenReply, IssueWorkloadIdentityTokenRequest, JoinRaftClusterReply, JoinRaftClusterRequest, ListAclPoliciesReply, ListAclPoliciesRequest, ListAclTokensReply, ListAclTokensRequest, ListAclUsersReply, ListAclUsersRequest, ListBootTicketsReply, ListBootTicketsRequest, ListEventsReply, ListEventsRequest, ListExecKeysReply, ListExecKeysRequest, ListInstancesReply, ListInstancesRequest, ListJobActionsReply, ListJobActionsRequest, ListJobSpecHistoryReply, ListJobSpecHistoryRequest, ListJobsReply, ListJobsRequest, ListJobTemplatesReply, ListJobTemplatesRequest, ListJoinTokensReply, ListJoinTokensRequest, ListKvReply, ListKvRequest, ListManagersReply, ListManagersRequest, ListNetPoliciesReply, ListNetPoliciesRequest, ListNodeUsageReply, ListNodeUsageRequest, ListRaftHistoryReply, ListRaftHistoryRequest, ListRolloutEventsReply, ListRolloutEventsRequest, ListRolloutsReply, ListRolloutsRequest, ListSavedStateQueriesReply, ListSavedStateQueriesRequest, ListServiceEdgesReply, ListServiceEdgesRequest, ListServicesReply, ListServicesRequest, ListSessionNodesReply, ListSessionNodesRequest, ListSnapshotsReply, ListSnapshotsRequest, ListVolumeDriversReply, ListVolumeDriversRequest, ListVolumesReply, ListVolumesRequest, LoginReply, LoginRequest, MintExecTicketReply, MintExecTicketRequest, NodeLivenessDigestReply, NodeLivenessDigestRequest, PatchKvReply, PatchKvRequest, PlanJobReply, PlanJobRequest, PostWorkReply, PostWorkRequest, ProbeReply, ProbeRequest, PromoteInstanceReply, PromoteInstanceRequest, PutKvReply, PutKvRequest, QuerySessionsReply, QuerySessionsRequest, QueryStateStoreReply, QueryStateStoreRequest, RaftLaneReply, RaftLaneRequest, RatifyClaimReply, RatifyClaimRequest, ReleaseKvLockReply, ReleaseKvLockRequest, RenderJobTemplateReply, RenderJobTemplateRequest, RenewKvLockReply, RenewKvLockRequest, ReplaceInstanceReply, ReplaceInstanceRequest, ResetKeyringReply, ResetKeyringRequest, ResolveServiceReply, ResolveServiceRequest, RestartWorkerReply, RestartWorkerRequest, RestoreInstanceReply, RestoreInstanceRequest, ResumeSessionReply, ResumeSessionRequest, RewrapKvReply, RewrapKvRequest, RewrapRootKeyReply, RewrapRootKeyRequest, RotateDataKeyReply, RotateDataKeyRequest, RotateMeshCaReply, RotateMeshCaRequest, RunJobReply, RunJobRequest, RunJobTemplateReply, RunJobTemplateRequest, ScaleTaskReply, ScaleTaskRequest, SchedulerEvent, SetNodeAvailabilityReply, SetNodeAvailabilityRequest, SetSnapshotAliasReply, SetSnapshotAliasRequest, ShowNetPolicyReply, ShowNetPolicyRequest, StartClaimReply, StartClaimRequest, StartInstanceReply, StartInstanceRequest, StartSessionReply, StartSessionRequest, StopInstanceReply, StopInstanceRequest, StopJobReply, StopJobRequest, StopRolloutReply, StopRolloutRequest, StopSessionReply, StopSessionRequest, StopSessionsReply, StopSessionsRequest, StreamEventsRequest, StreamWorkReply, StreamWorkRequest, SuspendInstanceReply, SuspendInstanceRequest, SuspendSessionsReply, SuspendSessionsRequest, TestNetPolicyReply, TestNetPolicyRequest, TriggerElectionReply, TriggerElectionRequest, UpdateNodeDynamicReply, UpdateNodeDynamicRequest, UpsertAclPolicyReply, UpsertAclPolicyRequest, UpsertAclUserReply, UpsertAclUserRequest, UpsertJobTemplateReply, UpsertJobTemplateRequest, UpsertNetPolicyReply, UpsertNetPolicyRequest, UpsertSavedStateQueryReply, UpsertSavedStateQueryRequest, WarmSnapshotReply, WarmSnapshotRequest, WhoAmIReply, WhoAmIRequest, WorkerPreRegisterReply, WorkerPreRegisterRequest, WorkerRegisterReply, WorkerRegisterRequest } from "./legion_pb.js";
+import { AcquireKvLockReply, AcquireKvLockRequest, AdvanceRolloutReply, AdvanceRolloutRequest, CreateAclTokenReply, CreateAclTokenRequest, CreateExecKeyReply, CreateExecKeyRequest, CreateInstanceReply, CreateInstanceRequest, CreateInstancesReply, CreateInstancesRequest, CreateJoinTokenReply, CreateJoinTokenRequest, CreateSnapshotReply, CreateSnapshotRequest, DeleteAclPolicyReply, DeleteAclPolicyRequest, DeleteAclTokenReply, DeleteAclTokenRequest, DeleteAclUserReply, DeleteAclUserRequest, DeleteExecKeyReply, DeleteExecKeyRequest, DeleteJobTemplateReply, DeleteJobTemplateRequest, DeleteJoinTokenReply, DeleteJoinTokenRequest, DeleteKvReply, DeleteKvRequest, DeleteNetPolicyReply, DeleteNetPolicyRequest, DeleteSavedStateQueryReply, DeleteSavedStateQueryRequest, DeleteSnapshotAliasReply, DeleteSnapshotAliasRequest, DeleteSnapshotReply, DeleteSnapshotRequest, DeleteVolumeReply, DeleteVolumeRequest, DestroyInstanceReply, DestroyInstanceRequest, DestroyJobReply, DestroyJobRequest, ExecClientFrame, ExecServerFrame, FetchDatapathMaterialReply, FetchDatapathMaterialRequest, FetchRootKeyReply, FetchRootKeyRequest, ForkInstanceReply, ForkInstanceRequest, GetAclPolicyReply, GetAclPolicyRequest, GetAllocationLogsReply, GetAllocationLogsRequest, GetArtifactCredentialReply, GetArtifactCredentialRequest, GetAuthMethodsReply, GetAuthMethodsRequest, GetHeartbeatCadenceReply, GetHeartbeatCadenceRequest, GetInstanceReply, GetInstanceRequest, GetJobInfoReply, GetJobInfoRequest, GetJobScaleStatusReply, GetJobScaleStatusRequest, GetJobSpecByConfigRequest, GetJobSpecReply, GetJobSpecRequest, GetJobTemplateReply, GetJobTemplateRequest, GetKeyringStatusReply, GetKeyringStatusRequest, GetKvLockReply, GetKvLockRequest, GetKvReply, GetKvRequest, GetLedgerReply, GetLedgerRequest, GetManagerConfigsReply, GetManagerConfigsRequest, GetMeshCaReply, GetMeshCaRequest, GetNetPolicyObjectReply, GetNetPolicyObjectRequest, GetNodeContentReply, GetNodeContentRequest, GetNodeReply, GetNodeRequest, GetNodesReply, GetNodesRequest, GetNodeUsageReply, GetNodeUsageRequest, GetObservabilityReply, GetObservabilityRequest, GetRaftJoinTokenReply, GetRaftJoinTokenRequest, GetRaftStatusReply, GetRaftStatusRequest, GetRolloutReply, GetRolloutRequest, GetRolloutStatusReply, GetRolloutStatusRequest, GetSchedulerConcurrencyReply, GetSchedulerConcurrencyRequest, GetSessionReply, GetSessionRequest, GetSnapshotReply, GetSnapshotRequest, GetStateBackupReply, GetStateBackupRequest, GetStateStoreSchemaReply, GetStateStoreSchemaRequest, GetTaskLogsReply, GetTaskLogsRequest, GetVolumeReply, GetVolumeRequest, HealthCheckReply, HealthCheckRequest, HeartbeatReply, HeartbeatRequest, IssueBootTicketReply, IssueBootTicketRequest, IssueNodeCertificateReply, IssueNodeCertificateRequest, IssueNodeIdentityTokenReply, IssueNodeIdentityTokenRequest, IssueRaftCommandReply, IssueRaftCommandRequest, IssueWorkloadIdentityTokenReply, IssueWorkloadIdentityTokenRequest, JoinRaftClusterReply, JoinRaftClusterRequest, ListAclPoliciesReply, ListAclPoliciesRequest, ListAclTokensReply, ListAclTokensRequest, ListAclUsersReply, ListAclUsersRequest, ListBootTicketsReply, ListBootTicketsRequest, ListEventsReply, ListEventsRequest, ListExecKeysReply, ListExecKeysRequest, ListInstancesReply, ListInstancesRequest, ListJobActionsReply, ListJobActionsRequest, ListJobSpecHistoryReply, ListJobSpecHistoryRequest, ListJobsReply, ListJobsRequest, ListJobTemplatesReply, ListJobTemplatesRequest, ListJoinTokensReply, ListJoinTokensRequest, ListKvReply, ListKvRequest, ListManagersReply, ListManagersRequest, ListNetPoliciesReply, ListNetPoliciesRequest, ListNodeUsageReply, ListNodeUsageRequest, ListRaftHistoryReply, ListRaftHistoryRequest, ListRolloutEventsReply, ListRolloutEventsRequest, ListRolloutsReply, ListRolloutsRequest, ListSavedStateQueriesReply, ListSavedStateQueriesRequest, ListServiceEdgesReply, ListServiceEdgesRequest, ListServicesReply, ListServicesRequest, ListSessionNodesReply, ListSessionNodesRequest, ListSnapshotsReply, ListSnapshotsRequest, ListVolumeDriversReply, ListVolumeDriversRequest, ListVolumesReply, ListVolumesRequest, LoginReply, LoginRequest, MintExecTicketReply, MintExecTicketRequest, NodeLivenessDigestReply, NodeLivenessDigestRequest, PatchKvReply, PatchKvRequest, PlanJobReply, PlanJobRequest, PostWorkReply, PostWorkRequest, ProbeReply, ProbeRequest, PromoteInstanceReply, PromoteInstanceRequest, PutKvReply, PutKvRequest, QuerySessionsReply, QuerySessionsRequest, QueryStateStoreReply, QueryStateStoreRequest, RaftLaneReply, RaftLaneRequest, RatifyClaimReply, RatifyClaimRequest, ReleaseKvLockReply, ReleaseKvLockRequest, RenderJobTemplateReply, RenderJobTemplateRequest, RenewKvLockReply, RenewKvLockRequest, ReplaceInstanceReply, ReplaceInstanceRequest, ResetKeyringReply, ResetKeyringRequest, ResolveServiceReply, ResolveServiceRequest, RestartWorkerReply, RestartWorkerRequest, RestoreInstanceReply, RestoreInstanceRequest, ResumeSessionReply, ResumeSessionRequest, RewrapKvReply, RewrapKvRequest, RewrapRootKeyReply, RewrapRootKeyRequest, RotateDataKeyReply, RotateDataKeyRequest, RotateMeshCaReply, RotateMeshCaRequest, RunJobReply, RunJobRequest, RunJobTemplateReply, RunJobTemplateRequest, ScaleTaskReply, ScaleTaskRequest, SchedulerEvent, SetNodeAvailabilityReply, SetNodeAvailabilityRequest, SetSnapshotAliasReply, SetSnapshotAliasRequest, ShowNetPolicyReply, ShowNetPolicyRequest, StartClaimReply, StartClaimRequest, StartInstanceReply, StartInstanceRequest, StartSessionReply, StartSessionRequest, StopInstanceReply, StopInstanceRequest, StopJobReply, StopJobRequest, StopRolloutReply, StopRolloutRequest, StopSessionReply, StopSessionRequest, StopSessionsReply, StopSessionsRequest, StreamEventsRequest, StreamWorkReply, StreamWorkRequest, SuspendInstanceReply, SuspendInstanceRequest, SuspendSessionsReply, SuspendSessionsRequest, TestNetPolicyReply, TestNetPolicyRequest, TriggerElectionReply, TriggerElectionRequest, UpdateNodeDynamicReply, UpdateNodeDynamicRequest, UpsertAclPolicyReply, UpsertAclPolicyRequest, UpsertAclUserReply, UpsertAclUserRequest, UpsertJobTemplateReply, UpsertJobTemplateRequest, UpsertNetPolicyReply, UpsertNetPolicyRequest, UpsertSavedStateQueryReply, UpsertSavedStateQueryRequest, WarmSnapshotReply, WarmSnapshotRequest, WhoAmIReply, WhoAmIRequest, WorkerPreRegisterReply, WorkerPreRegisterRequest, WorkerRegisterReply, WorkerRegisterRequest } from "./legion_pb.js";
 import { MethodKind } from "@bufbuild/protobuf";
 
 /**
@@ -1508,96 +1508,62 @@ export const Manager = {
       kind: MethodKind.Unary,
     },
     /**
-     * Fetch the KV-held certificates behind `certFrom = { kv = "<path>" }`
-     * ingress chains (docs/network-handlers.md, "Certificates from KV").
+     * Fetch the material a node's datapath needs for the allocations placed
+     * on it, in one call per heartbeat: network-policy bodies by hash, the
+     * KV-held certificates behind ingress TLS, and the values behind
+     * `connect.upstreams[].credentials` (docs/network-handlers.md). It
+     * replaces one fetch per kind, so a new kind of material (or a new place
+     * a value comes from) is a provider on the manager, not a new call.
      *
-     * The worker names allocations, never KV paths. For each allocation the
-     * manager checks that it is placed on the calling node, recomputes its
-     * effective ingress chain (inline chain merged with any policy objects),
-     * takes the KV path from that chain, and reads the entry. So a node can
-     * only ever read a certificate that a job or policy on it declares, and a
-     * job can only declare one its submitter could read (RunJob and
-     * UpsertNetPolicy require `kv:read` on the path).
+     * Each `MaterialRef` names a kind and what it is for, never where the
+     * value lives:
+     * - `policy`: `key` is a content hash from `HeartbeatReply.net_policies`;
+     *   `value` is the `EffectivePolicy` as JSON. Policies are
+     *   content-addressed, so a node running a thousand identical sandboxes
+     *   fetches one body once.
+     * - `ingress_cert`: `allocation_id` names an allocation whose ingress TLS
+     *   takes its certificate from KV; `value` is the PEM bundle (chain, leaf
+     *   first, then the private key), validated by the manager first.
+     * - `credential`: `allocation_id`, `key` (the upstream's key), and `part`
+     *   (the header, lower-cased) name one injected header; `value` is the KV
+     *   value or a freshly minted workload-identity token.
      *
-     * Workers call it on their heartbeat loop, only while some allocation on
-     * the node has a KV-backed chain, passing the KV version they already
-     * hold so an unchanged certificate costs no material on the wire. The
-     * worker keeps the material in memory only.
+     * The manager derives every KV path and identity itself, from the
+     * allocation's own declaration (its task's `connect` block, or its
+     * effective ingress chain), after checking the allocation is placed on
+     * the calling node. So a node can only ever read material that a job or
+     * policy on it declares, and a job can only declare a KV path its
+     * submitter could read (RunJob, template runs, and UpsertNetPolicy
+     * require `kv:read` on it).
      *
-     * Per-allocation problems (not placed here, no KV-backed chain, key
-     * missing, bundle invalid) come back in that allocation's `error` rather
-     * than failing the call, so one broken certificate never blocks the
-     * others.
-     *
-     * Called by the worker for its own node: the caller's authenticated
-     * per-node principal (`node:<node_id>`) must match the request's
-     * `node_id`.
-     *
-     * Errors:
-     * - PermissionDenied: `node_id` does not match the caller's credential.
-     * - Internal: the node's allocations could not be loaded.
-     *
-     * @generated from rpc legion.Manager.GetIngressCertificates
-     */
-    getIngressCertificates: {
-      name: "GetIngressCertificates",
-      I: GetIngressCertificatesRequest,
-      O: GetIngressCertificatesReply,
-      kind: MethodKind.Unary,
-    },
-    /**
-     * Fetch the values behind `connect.upstreams[].credentials`
-     * (docs/network-handlers.md, "Credential injection"): headers the node's
-     * forwarder sets on every request it sends to an external `https://`
-     * upstream, so the task (and anything captured from it: a sandbox's
-     * memory checkpoints, forks, published snapshots) never holds the secret.
-     *
-     * Each credential names one provider:
-     * - `from = { kv = "<path>" }`: the KV value at that path.
-     * - `from = { identity = "<name>" }`: a workload-identity token
-     *   (docs/workload-identity.md) the manager mints for the allocation
-     *   under the task's identity of that name, with that identity's
-     *   audience, TTL, `sub` template, and extra claims.
-     *
-     * The worker names (allocation, upstream, header) triples, never KV paths
-     * or identities. For each one the manager checks that the allocation is
-     * placed on the calling node, reads the allocation's own task `connect`
-     * declaration, finds the upstream and the credential for that header, and
-     * takes the provider from it. So a node can only ever read a secret that a
-     * job placed on it declares, and a job can only declare one its submitter
-     * could read (RunJob and template runs require `kv:read` on every
-     * credential path).
-     *
-     * Workers call it on their heartbeat loop, only while some allocation on
-     * the node declares credentials, passing the version they already hold so
-     * an unchanged value costs no material on the wire. For a KV value the
-     * version is the KV entry's; for an identity token it is the token's
-     * expiry, and the manager mints a new token once less than half the
-     * identity's TTL remains. The worker keeps values in memory only: never in
+     * Workers pass the version they already hold (`MaterialRef.version`): the
+     * KV entry's version, or for an identity token its expiry in unix
+     * seconds, which the manager re-mints once less than half the identity's
+     * TTL remains. An unchanged value comes back `unchanged` with no material
+     * on the wire. Material is held in memory only on the worker: never in
      * its state files, never in a log line.
      *
-     * Per-entry problems (not placed here, no such credential, key missing,
-     * workload identity disabled on the manager) come back in that entry's
-     * `error` rather than failing the call, so one missing secret never blocks
-     * the others. `absent` marks the problems that are authoritative (the key
-     * or the declaration is gone): the worker drops any value it holds and
-     * fails requests on that upstream closed. Any other error, and a failed
-     * call, keeps the last good value.
+     * Per-ref problems (not placed here, no such declaration, key missing,
+     * bundle invalid, workload identity disabled) come back in that ref's
+     * `error` rather than failing the call, so one broken certificate or
+     * missing secret never blocks the others. `absent` marks the
+     * authoritative ones (the key or the declaration is gone): the worker
+     * drops what it holds, so requests that need it fail closed. Any other
+     * error, and a failed call, keeps the last good value (fail-static).
      *
-     * Called by the worker for its own node: the caller's authenticated
-     * per-node principal (`node:<node_id>`) must match the request's
-     * `node_id`.
+     * ACL: worker plane. The caller's authenticated per-node principal
+     * (`node:<node_id>`) must match the request's `node_id`.
      *
      * Errors:
      * - PermissionDenied: `node_id` does not match the caller's credential.
      * - Internal: the node's allocations could not be loaded.
      *
-     * @generated from rpc legion.Manager.GetUpstreamCredentials
+     * @generated from rpc legion.Manager.FetchDatapathMaterial
      */
-    getUpstreamCredentials: {
-      name: "GetUpstreamCredentials",
-      I: GetUpstreamCredentialsRequest,
-      O: GetUpstreamCredentialsReply,
+    fetchDatapathMaterial: {
+      name: "FetchDatapathMaterial",
+      I: FetchDatapathMaterialRequest,
+      O: FetchDatapathMaterialReply,
       kind: MethodKind.Unary,
     },
     /**
@@ -2684,22 +2650,6 @@ export const Manager = {
       name: "RotateMeshCa",
       I: RotateMeshCaRequest,
       O: RotateMeshCaReply,
-      kind: MethodKind.Unary,
-    },
-    /**
-     * Worker plane: fetches the merged policy body for a hash the heartbeat
-     * reply named. Policies are content-addressed so a node running a thousand
-     * identical sandboxes fetches one body once; the worker caches by hash and
-     * keeps the last known good body if a fetch fails (fail-static).
-     *
-     * ACL: worker plane (node token).
-     *
-     * @generated from rpc legion.Manager.FetchNetPolicy
-     */
-    fetchNetPolicy: {
-      name: "FetchNetPolicy",
-      I: FetchNetPolicyRequest,
-      O: FetchNetPolicyReply,
       kind: MethodKind.Unary,
     },
     /**

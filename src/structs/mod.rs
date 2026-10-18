@@ -24,6 +24,7 @@ pub mod network;
 pub mod node;
 pub mod session;
 pub mod snapshot;
+pub mod source;
 pub mod stop;
 pub mod suspend;
 pub mod token;

@@ -2631,9 +2631,6 @@ async fn heartbeat_tick(
         // KV files marked `onChange = "update"`, rewritten under running
         // allocations whose rendered content moved.
         apply_live_kv_files(task_manager, &reply);
-        // Same authority for network policy: bodies fetched by hash, last
-        // known good kept on any failure.
-        fetch_net_policies(netd, &mut client_clone, credentials, name).await;
         refresh_node_identity(
             node_identity,
             netd,
@@ -2643,9 +2640,10 @@ async fn heartbeat_tick(
             &reply.cluster_ca_pins,
         )
         .await;
-        // KV-held ingress certificates and upstream credentials, for the
-        // desired set just applied (the reply's, or the StreamWork mirror's
-        // when the work arrives over the stream).
+        // Policy bodies by hash, KV-held ingress certificates, and upstream
+        // credentials, for the desired set just applied (the reply's, or the
+        // StreamWork mirror's when the work arrives over the stream). Last
+        // known good is kept on any failure.
         fetch_datapath_material(netd, &mut client_clone, credentials, name).await;
         netd.persist();
         // Allocations whose launch was dispatched this tick. Their refresh
@@ -3056,104 +3054,61 @@ async fn refresh_node_identity(
     }
 }
 
-/// Fetch the network-policy bodies the datapath holds an assignment for but
-/// has not seen. Fail-static: a fetch that fails leaves the allocation on
-/// whatever policy it had (or none, in which case a gated allocation stays
-/// closed until a later heartbeat succeeds).
-async fn fetch_net_policies(
-    netd: &Netd,
-    client: &mut ManagerClient<Channel>,
-    credentials: &Arc<WorkerCredentials>,
-    node_id: &str,
-) {
-    for hash in netd.wants().policy_bodies {
-        let request =
-            credentials.attach(tonic::Request::new(crate::structs::FetchNetPolicyRequest {
-                node_id: node_id.to_string(),
-                hash: hash.clone(),
-            }));
-        match client.fetch_net_policy(request).await {
-            Ok(response) => {
-                let body = response.into_inner().effective_json;
-                match serde_json::from_str::<crate::structs::netpolicy::EffectivePolicy>(&body) {
-                    Ok(policy) => {
-                        netd.send(NetdInput::PolicyBody {
-                            hash,
-                            policy: Box::new(policy),
-                        })
-                        .await
-                    }
-                    Err(err) => {
-                        warn!(hash = %hash, error = ?err, "Invalid network policy body from manager");
-                    }
-                }
-            }
-            Err(err) => {
-                warn!(
-                    hash = %hash,
-                    error = ?err,
-                    "Failed to fetch network policy body; keeping last known good"
-                );
-            }
-        }
-    }
-}
-
-/// Fetch what the datapath's chains need from the manager besides policy:
-/// `certFrom = { kv }` ingress certificates (docs/network-handlers.md,
-/// "Certificates from KV") and `connect.upstreams[].credentials`
-/// ("Credential injection"). One call of each per heartbeat, only while an
-/// allocation on the node needs it, carrying the version already held so an
-/// unchanged value costs nothing on the wire. Fail-static: a failed call
-/// keeps what the datapath holds.
+/// Fetch what the datapath needs from the manager, in one
+/// `FetchDatapathMaterial` call per heartbeat: policy bodies it holds an
+/// assignment for but has not seen, KV-held ingress certificates
+/// (docs/network-handlers.md, "Certificates from KV"), and
+/// `connect.upstreams[].credentials` ("Credential injection"). Each ref
+/// carries the version already held, so an unchanged value costs nothing on
+/// the wire, and no call is made while nothing is wanted. Fail-static: a
+/// failed call keeps what the datapath holds (a gated allocation with no
+/// policy body yet stays closed until a later heartbeat succeeds).
 async fn fetch_datapath_material(
     netd: &Netd,
     client: &mut ManagerClient<Channel>,
     credentials: &Arc<WorkerCredentials>,
     node_id: &str,
 ) {
-    let wants = netd.wants();
-    if !wants.ingress_certificates.is_empty() {
+    use crate::structs::source::MATERIAL_POLICY;
+    let mut refs = netd.wants().material;
+    // A policy body can declare more material (a KV-held ingress
+    // certificate), so a call that brought new bodies is followed by one
+    // more for what they declare, instead of waiting a heartbeat.
+    for _ in 0..2 {
+        if refs.is_empty() {
+            return;
+        }
+        let fetched_policy = refs.iter().any(|wanted| wanted.kind == MATERIAL_POLICY);
+        let asked = refs.clone();
         let request = credentials.attach(tonic::Request::new(
-            crate::structs::GetIngressCertificatesRequest {
+            crate::structs::FetchDatapathMaterialRequest {
                 node_id: node_id.to_string(),
-                known: wants.ingress_certificates,
+                refs,
             },
         ));
-        match client.get_ingress_certificates(request).await {
+        match client.fetch_datapath_material(request).await {
             Ok(response) => {
-                netd.send(NetdInput::IngressCertificates(
-                    response.into_inner().certificates,
-                ))
-                .await
+                netd.send(NetdInput::Material(response.into_inner().materials))
+                    .await
             }
-            Err(status) => warn!(
-                code = ?status.code(),
-                message = status.message(),
-                "Failed to fetch ingress certificates; keeping the current ones"
-            ),
-        }
-    }
-    if !wants.upstream_credentials.is_empty() {
-        let request = credentials.attach(tonic::Request::new(
-            crate::structs::GetUpstreamCredentialsRequest {
-                node_id: node_id.to_string(),
-                known: wants.upstream_credentials,
-            },
-        ));
-        match client.get_upstream_credentials(request).await {
-            Ok(response) => {
-                netd.send(NetdInput::UpstreamCredentials(
-                    response.into_inner().credentials,
-                ))
-                .await
+            Err(status) => {
+                warn!(
+                    code = ?status.code(),
+                    message = status.message(),
+                    "Failed to fetch datapath material; keeping what the datapath holds"
+                );
+                return;
             }
-            Err(status) => warn!(
-                code = ?status.code(),
-                message = status.message(),
-                "Failed to fetch upstream credentials; keeping the current ones"
-            ),
         }
+        if !fetched_policy {
+            return;
+        }
+        refs = netd
+            .wants()
+            .material
+            .into_iter()
+            .filter(|wanted| wanted.kind != MATERIAL_POLICY && !asked.contains(wanted))
+            .collect();
     }
 }
 
