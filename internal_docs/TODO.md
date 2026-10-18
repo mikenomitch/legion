@@ -3895,7 +3895,7 @@ mesh's surface. Phase 0 first, then S1. After S1 every track is independent.
       `requireIdentity`) and the reserved `bridge`/`cni/*` modes. Fixed on
       the way: the caller's group on the wire (was always `default`;
       `TaskAllocation.task_group`), and a port's own client CA no longer
-      vouches for `legion://node` peers (calls entry 22).
+      vouches for `legion://node` peers (calls entry 23).
       Docs: [network-handlers.md#the-mesh](../docs/network-handlers.md#the-mesh),
       [#tls-on-ports](../docs/network-handlers.md#tls-on-ports),
       [service-discovery.md](../docs/service-discovery.md#intentions-serviceallow).

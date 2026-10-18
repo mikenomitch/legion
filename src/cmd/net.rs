@@ -978,6 +978,24 @@ async fn show(matches: &ArgMatches) -> R<()> {
         &reply.matched_policies,
         &effective,
     );
+    // Where the egress chain runs in the kernel (plan §6.A).
+    let statuses: Vec<NodeStatus> = reply
+        .node_status_json
+        .iter()
+        .filter_map(|json| serde_json::from_str(json).ok())
+        .collect();
+    if effective.egress.is_some() && !statuses.is_empty() {
+        let enforced = statuses
+            .iter()
+            .filter(|status| status.kernel.as_ref().is_some_and(|k| k.enforced))
+            .count();
+        if enforced > 0 {
+            println!(
+                "  egress enforced in the kernel on {enforced}/{} running allocations; allowed flows connect directly",
+                statuses.len()
+            );
+        }
+    }
     Ok(())
 }
 
@@ -1203,6 +1221,29 @@ struct NodeStatus {
     tls_error: String,
     #[serde(default)]
     mesh_identity: bool,
+    /// The kernel classifier's view, on a node that runs it.
+    #[serde(default)]
+    kernel: Option<NodeKernelStatus>,
+}
+
+/// `NetAllocStatus.kernel`, as the node reports it.
+#[derive(serde::Deserialize, Default, Clone)]
+#[serde(rename_all = "camelCase")]
+struct NodeKernelStatus {
+    #[serde(default)]
+    enforced: bool,
+    #[serde(default)]
+    capture: bool,
+    #[serde(default)]
+    rules: u32,
+    #[serde(default)]
+    reason: String,
+    #[serde(default)]
+    passed: u64,
+    #[serde(default)]
+    redirected: u64,
+    #[serde(default)]
+    denied: u64,
 }
 
 fn default_true() -> bool {
@@ -1440,6 +1481,31 @@ pub(crate) fn diagnose_network(
                 detail: format!("allocation {alloc}: the node holds no mesh certificate yet; mesh peers are refused until it does"),
                 hint: Some("issued on the node's next heartbeat (IssueNodeCertificate); persistent means the manager could not create the mesh CA — check manager logs".into()),
             });
+        }
+        // The kernel classifier: whether the chain is enforced at connect().
+        if let Some(kernel) = &status.kernel {
+            if kernel.enforced {
+                steps.push(DoctorStep {
+                    layer: "kernel",
+                    status: "ok",
+                    detail: format!(
+                        "allocation {alloc}: egress chain enforced in the kernel ({} rules{}); last beat: {} passed, {} redirected, {} refused",
+                        kernel.rules,
+                        if kernel.capture { ", capture on" } else { "" },
+                        kernel.passed,
+                        kernel.redirected,
+                        kernel.denied
+                    ),
+                    hint: None,
+                });
+            } else if !kernel.reason.is_empty() {
+                steps.push(DoctorStep {
+                    layer: "kernel",
+                    status: "info",
+                    detail: format!("allocation {alloc}: {}", kernel.reason),
+                    hint: None,
+                });
+            }
         }
         // External handlers: each hop the datapath has run, with its health.
         for hop in &status.handlers {

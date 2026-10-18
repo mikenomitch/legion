@@ -637,7 +637,30 @@ restate the others. The owner asked for a single plan.
 
 ---
 
-## 22. Only the mesh CA vouches for nodes; a port's own client CA vouches for names
+## 22. Loopback is the guard's; the kernel chain judges what leaves the node
+
+**Call.** On a node with the classifier, a host-mode task's connection to a
+loopback address (`127.0.0.0/8`, `::1`) is never judged by its egress chain.
+The host guard still applies to it (Legion's control ports, other
+allocations' VIPs and upstream ports), and so does DNS capture on port 53.
+
+**Alternatives.** Judge loopback like any destination, so a `deny` chain
+refuses `127.0.0.1:5432` unless a rule allows it.
+
+**Trade-off.** A chain cannot stop a task from reaching another service on
+the node's loopback that the guard does not cover (an operator's own
+daemon). That is the same reach host mode has without the classifier.
+
+**Why (ease).** Host mode means the task shares the node's network on
+purpose, and every real chain would have to start with
+`allow = ["127.0.0.0/8"]` to keep a task talking to its own sidecars and
+to itself. A gated task's loopback is its own namespace, and the gated proxy
+does not judge it either, so this keeps the two modes saying the same thing:
+egress policy is about what leaves.
+
+---
+
+## 23. Only the mesh CA vouches for nodes; a port's own client CA vouches for names
 
 **Call.** On a port with its own `tls.clients.ca`, a verified client
 certificate carrying a `legion://node/<id>` SAN is treated as the plain name
@@ -660,7 +683,55 @@ before it ships.
 
 ---
 
-## 23. Stored rows are not migrated across the reshape
+## 24. A captured flow's name must own the address it dialed, and the original address is what is dialed
+
+**Call.** The capture listener reads the SNI or `Host` of a redirected flow
+and allows it only if the address the task dialed is one of that name's
+addresses (`Legion-Denied-By: capture/name` otherwise). It then dials the
+original address, not a fresh resolution of the name.
+
+**Alternatives.** (a) Trust the name and dial whatever it resolves to now,
+as the gated proxy does for a `CONNECT host:port`. (b) Judge by address
+only and ignore the name.
+
+**Trade-off.** A flow to a CDN address that rotated out of the name's
+current answer between the task's lookup and its connect is refused, and
+the task retries. Plaintext HTTP under an HTTP chain is served request by
+request, so a later request on the same connection may name another host
+and is dialed by that name.
+
+**Why (security).** Without the check, a task that wants a denied host can
+dial its address and put an allowed name in the SNI. With (a), the same
+trick is harmless but the flow silently goes somewhere other than where the
+task sent it, which breaks clients that pin an address. The check costs one
+resolution per captured connection.
+
+---
+
+## 25. The programs are C built with clang, checked in as an object
+
+**Call.** `bpf/legion_net.bpf.c` is plain C with its own helper
+declarations (no libbpf headers), built by `bpf/build.sh` with clang 18
+and checked in as `bpf/legion_net.bpf.o`. The worker loads it with `aya`.
+CI rebuilds it and fails when the object is stale.
+
+**Alternatives.** The plan's lean (open question 2): `aya-ebpf` sources in
+Rust, objects built in CI and committed.
+
+**Trade-off.** Two languages in the datapath, and an ABI header
+(`bpf/legion_net.h`) mirrored by hand in `kernel/abi.rs` (a size test pins
+each struct). A clang or kernel-header update can change the object's bytes
+and trip the CI check without any behavior change.
+
+**Why (simplicity).** `aya-ebpf` needs a nightly toolchain and
+`bpf-linker`; C needs clang, which every Linux CI image has. The programs
+are small, use only stable UAPI context fields (so no CO-RE is needed), and
+the verifier accepted them as written. `cargo build` still needs only
+`protoc`.
+
+---
+
+## 26. Stored rows are not migrated across the reshape
 
 **Call.** `AllocUpstream.service` became `key` (S2), `AllocNetwork.ingress_tls`
 was replaced by `AllocPort.mesh`/`tls` (S3), and chains lost `tls` with no
@@ -681,7 +752,52 @@ runs once on clusters that do not exist. The PR description says what broke.
 
 ---
 
-## 24. The caller's group travels on the allocation payload
+## 27. The programs attach once, to the cgroup parent
+
+**Call.** One set of links, on the worker's cgroup parent, serves every
+allocation: each program reads the caller's leaf with
+`bpf_get_current_ancestor_cgroup_id` and looks it up in `ln_allocs`. A
+socket under the parent that no known leaf owns gets the guard floor (key
+0), as the `nftables` table's `unattributed` chain does.
+
+**Alternatives.** The plan's sketch: attach to each allocation's leaf and
+pin links per allocation.
+
+**Trade-off.** Every process under the parent runs the programs, governed
+or not (an unknown leaf costs one hash lookup and passes). Per-allocation
+attach state is not visible in `bpftool cgroup tree`.
+
+**Why (performance, simplicity).** Ten programs per allocation would be
+ten link creations and pins on every placement and as many detaches on
+every exit, on the heartbeat path; one set is created at worker start.
+Nested cgroups under a leaf (a container runtime's) are covered by the
+ancestor lookup either way.
+
+---
+
+## 28. Pins stay when the worker stops
+
+**Call.** The worker never removes the classifier's pins on its own: a
+worker that stops (or crashes) leaves the programs attached and the maps
+pinned, and the next worker re-adopts them. `KernelNet::shutdown` removes
+them, and nothing calls it outside tests.
+
+**Alternatives.** The plan's text: a clean shutdown removes the pins, as
+it says the `nftables` table is deleted.
+
+**Trade-off.** A node that is decommissioned keeps a few idle programs on
+its Legion cgroup parent until reboot. They govern only leaves under that
+parent, which are gone with the worker's tasks.
+
+**Why (security).** Tasks can outlive the worker (a restart, an upgrade,
+a stop that leaves them running). Removing the pins on a clean stop would
+turn every worker restart into a window where host-mode tasks are
+unguarded and their chains unenforced. The `nftables` guard behaves the
+same today: nothing deletes its table at shutdown.
+
+---
+
+## 29. The caller's group travels on the allocation payload
 
 **Call.** `TaskAllocation` gains `task_group` and `task_service`. The worker
 names a mesh caller `<region>:<job>:<group>:<task>` from `task_group`, and the
@@ -704,7 +820,28 @@ per-heartbeat path that should not grow store reads.
 
 ---
 
-## 25. One fetch per heartbeat, and policy bodies are a provider
+## 30. A host-mode task with an egress chain gets a VIP block
+
+**Call.** On a Linux node, placement gives a host-mode `exec` or
+`container` allocation whose egress chain is inline or comes from a
+matching policy a VIP block, upstreams or not. Its `.1` is the
+allocation's resolver, which teaches the kernel the addresses of allowed
+names.
+
+**Alternatives.** The plan's open question 5 named a node-wide resolver
+that attributes queries through a connect-time map.
+
+**Trade-off.** One more `/24` of the `127.42.0.0/16` space and one resolver
+listener per such allocation.
+
+**Why (simplicity).** The per-allocation resolver already exists and
+already judges names with the allocation's chain; a node-wide one would be
+a second resolver with its own attribution path. The address space holds
+256 × 256 blocks, more than a node runs allocations.
+
+---
+
+## 31. One fetch per heartbeat, and policy bodies are a provider
 
 **Call.** `FetchDatapathMaterial` is one call per heartbeat carrying every
 ref the node wants. The manager resolves a ref in two steps: the
@@ -727,7 +864,28 @@ user writes, so it stays out of the grammar users see.
 
 ---
 
-## 26. A policy cannot make a port with its own `tls` the mesh port
+## 32. A chain beyond 64 rules or 64 hosts is judged by netd only
+
+**Call.** The kernel holds up to 64 connect-time rules and 64 distinct host
+globs per chain. A chain beyond either is not compiled; the allocation's
+`NetKernelStatus.reason` says so, and its egress behaves as it does on a
+node without the classifier.
+
+**Alternatives.** Larger fixed arrays, map-in-map rule sets, or an LPM trie
+for CIDR rules.
+
+**Trade-off.** A very large chain loses kernel enforcement in host mode
+(gated tasks are unaffected).
+
+**Why (performance, simplicity).** A bounded linear walk keeps first-match
+semantics exactly (an LPM trie does not), passes the verifier on old
+kernels, and measured within noise of no classifier at 32 rules. Real
+chains are a handful of rules; a policy that needs more is better written
+with CIDRs.
+
+---
+
+## 33. A policy cannot make a port with its own `tls` the mesh port
 
 **Call.** When a `require` or `default` policy turns `mesh` on and the
 service's port carries its own `tls`, placement leaves that port on its own
@@ -747,7 +905,7 @@ absolute; then the right shape is a submit-time refusal under `require`.
 
 ---
 
-## 27. Jobspec shapes are validated by serde and Rust, not Nickel contracts
+## 34. Jobspec shapes are validated by serde and Rust, not Nickel contracts
 
 **Call.** S1's "one contract per variant" is implemented as typed serde
 structs with `deny_unknown_fields`, plus a hand-written `Deserialize` for a
@@ -766,7 +924,7 @@ A second validator in Nickel would have to agree with the Rust one forever.
 
 ---
 
-## 28. Chains refuse unknown fields
+## 35. Chains refuse unknown fields
 
 **Call.** `ChainConfig` is `deny_unknown_fields`, so a chain that still
 carries a removed field (`onError`, `tls`) fails to parse:
@@ -784,7 +942,7 @@ the worst outcome: the policy reads as if it terminates TLS and does not.
 
 ---
 
-## 29. Removing `log` drops per-upstream access logging
+## 36. Removing `log` drops per-upstream access logging
 
 **Call.** With the `log` handler gone (§6.0), access logging is the chain's
 `accessLog`, which covers every HTTP request of the allocation's chain.
@@ -800,7 +958,7 @@ on each line.
 
 ---
 
-## 30. `net policy test` answers for `service/allow` only with `--identity`
+## 37. `net policy test` answers for `service/allow` only with `--identity`
 
 **Call.** `TestNetPolicy` runs a mesh service's `callers` check only when the
 request names an identity. Without one it answers as a non-mesh port would.
@@ -816,3 +974,20 @@ workload.
 an address; denying every such test on a mesh service would hide them. The
 proto comment says when the check applies.
 
+---
+
+## 38. Kernel denials are read once per heartbeat
+
+**Call.** The worker drains the ring buffer and the counters on each
+heartbeat, in the same blocking step that updates the maps, rather than
+on a dedicated reader task woken by the ring buffer.
+
+**Alternatives.** An `AsyncFd` reader that folds each event as it arrives.
+
+**Trade-off.** A burst of more than the ring's 256 KiB (about 5,000 events)
+within one heartbeat drops events; the counters still count every refusal,
+so the metrics stay exact while some `net.denied` rows are lost.
+
+**Why (simplicity).** Denials are reported on the heartbeat anyway, so a
+reader task would buffer for the same deadline. One code path, no extra
+task.

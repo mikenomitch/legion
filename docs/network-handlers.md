@@ -1408,8 +1408,11 @@ in `allow` is refused for the same reason.
 
 A `host`-mode task (an `exec` task, a container with `network.mode =
 "host"`) never passes through the datapath, so on Linux the worker also
-installs one `nftables` table, `inet legion_host_guard`, that applies a
-floor to every socket an allocation opens. It matches sockets by the
+applies a floor to every socket an allocation opens. On a node that can run
+the [kernel classifier](#the-kernel-classifier), the classifier's eBPF
+programs apply it (`hostGuard = active (ebpf)`), with the same classes,
+`EPERM`, and `net.denied` events described here. Elsewhere the worker
+installs one `nftables` table, `inet legion_host_guard`. It matches sockets by the
 allocation's cgroup leaf (`<cgroupParent>/{share,reserve}/legion-<alloc>`)
 in the output hook and drops:
 
@@ -1486,6 +1489,119 @@ $ aws ec2 modify-instance-metadata-options --instance-id i-0123456789abcdef0 \
 GCP and Azure require a `Metadata-Flavor: Google` or `Metadata: true`
 header, which a browser-style SSRF can't set but a task can. Grant each
 node's instance role only what the worker itself needs.
+
+## The kernel classifier
+
+On a Linux node that can run it, one fixed set of Legion-owned eBPF
+programs decides every flow a host-mode task opens, at `connect()`. Users
+write the same rules they write today; nothing in a job changes.
+
+```
+task: connect(151.101.0.223:443)
+  │
+  ▼  cgroup programs on the worker's cgroup parent
+  ├─ its own datapath (VIP block, upstream ports) ───► pass
+  ├─ host guard ─────────────────────────────────────► EPERM (final)
+  ├─ port 53 ────────────────────────────────────────► the allocation's resolver
+  ├─ the compiled egress chain ──────────────────────► pass | EPERM | redirect
+  └─ redirect ─► capture listener: SNI/Host, then the egress proxy's judge
+```
+
+- **Allowed flows that nothing reads connect directly.** No proxy hop: a
+  few map lookups at `connect()`. Denied flows fail at once with `EPERM`
+  ("Operation not permitted"), and nothing is sent.
+- **Host-mode egress chains are enforced.** In host mode, a chain used to
+  apply only to traffic that went through an upstream or the allocation's
+  resolver. On a node with the classifier, it applies to every TCP
+  `connect()`, every connected or unconnected UDP send, TCP Fast Open, and
+  `io_uring` connects. A task that dialed past its own chain now gets
+  `EPERM`.
+- **Hostnames are learned from the resolver.** The kernel sees addresses,
+  and rules name hosts. Every port-53 query a governed task sends goes to
+  its allocation's own resolver, whatever `resolv.conf` says, and the reply
+  reads as if it came from the nameserver the task asked. When the resolver
+  answers a name the chain allows, the addresses it returns satisfy that
+  name's host rules in the kernel for the record's TTL (at least five
+  minutes, so a client that caches longer is not cut off mid-use). A
+  host-mode task with an egress chain gets a VIP block on Linux nodes for
+  that resolver, upstreams or not.
+- **What only netd can decide is redirected**, to a capture listener on the
+  node's loopback: an address no answer taught the kernel under a chain with
+  host rules (a cached answer, `/etc/hosts`, a hard-coded IP), a rule that
+  needs the request head, and a chain with handlers or an HTTP access log.
+  The listener recovers the original destination, reads the TLS SNI or the
+  HTTP `Host`, and allows a named flow only if the address the task dialed is
+  one of that name's addresses, so a client that lies in its SNI gets
+  nothing (`Legion-Denied-By: capture/name` in the event). Then the flow is
+  judged, its hops run, and it is dialed and spliced exactly as a `CONNECT`
+  to the gated proxy is; plaintext HTTP under an HTTP chain is served request
+  by request. A flow with no name (a protocol where the server speaks first)
+  is judged by its address alone.
+- **Gated tasks never pass.** Their namespace is the boundary. The
+  classifier only makes capture **transparent**: a connect from a gated
+  `exec` or `container` task is redirected to a capture listener inside its
+  namespace (`127.0.0.1:1081`, beside its proxy), so a tool that ignores
+  `HTTPS_PROXY` still gets out under policy. The proxy variables stay set.
+- **Raw and packet sockets are refused** to governed tasks, so raw IP cannot
+  slip past the rest.
+- **Fail-static across restarts.** With bpffs mounted at `/sys/fs/bpf`, the
+  programs and maps are pinned under `/sys/fs/bpf/legion/`. A worker that
+  restarts re-opens them, attaches fresh programs, and drops the old ones;
+  in between, the kernel keeps enforcing the last policy it was given, and
+  allowed flows that never entered netd are untouched. Without bpffs, the
+  classifier stops enforcing while the worker is down, and the worker logs a
+  `WARN` at start.
+
+Whether a node runs it is the `netKernel` node attribute, and `hostGuard`
+says which mechanism guards the host:
+
+```console
+$ legion node info wkr-1
+Host guard     active (ebpf)
+Net kernel     active (ebpf: cgroup sock_addr, sock_create, sockops, cgroup_skb, ringbuf)
+```
+
+The probe runs once at start and checks features, not kernel versions
+(distribution kernels backport): the programs must load and attach to a
+cgroup. A node that cannot run the classifier says why, keeps the
+`nftables` guard, and treats host-mode egress as cooperative, exactly as
+before:
+
+```text
+Net kernel     unavailable (no cgroup v2 unified hierarchy at /sys/fs/cgroup)
+```
+
+Each allocation's datapath status (`legion net doctor`, `NetAllocStatus.kernel`)
+reports whether the kernel enforces its chain, whether capture is on, its
+compiled rule count, and how many connections the kernel passed,
+redirected, and refused since the last heartbeat. Kernel counters feed the
+`legion_net_*` connection metrics, and bytes the kernel moved count as
+activity for the [idle policy](suspend-and-resume.md#idle-policy),
+so pass flows are not invisible.
+
+**Limits.**
+
+- Up to 64 connect-time rules and 64 distinct host names per chain. A chain
+  beyond either keeps today's behavior (netd judges what goes through it),
+  and the allocation's status says why.
+- A root `exec` task with `CAP_SYS_ADMIN` or `CAP_BPF` can detach the
+  programs from its cgroup, as it can delete the `nftables` table. Governed
+  tasks must not hold `CAP_NET_RAW`.
+- DNS over HTTPS skips the resolver. Its addresses are never learned, so
+  those flows are redirected and judged by their SNI, which the policy has to
+  allow. A CDN address that an allowed name and a denied name share can be
+  reached through the allowed name, as with any egress control based on SNI
+  or address.
+- The resolver and the capture listener are IPv4: an IPv6 flow is passed or
+  refused in the kernel, never redirected, and an IPv6 address a resolver
+  returned is learned like an IPv4 one.
+- A sandbox's sockets live in its guest kernel, which the classifier never
+  sees: a gated sandbox's egress is judged by netd per vsock stream, as
+  before. macOS has no classifier.
+- UDP other than DNS is passed or refused in the kernel, never captured.
+- A body-reading hop (`dlp`) on a captured flow runs only on plaintext HTTP
+  under an HTTP chain; a TLS flow it cannot read is spliced after its SNI is
+  judged.
 
 ## The datapath across worker restarts
 
@@ -1821,17 +1937,21 @@ This section lists what that covers and what it does not.
   header), `dlp`, the `http` traffic block, and the external `authz` and
   `proxy` hops on every path (upstream splices, HTTP mode, the gated egress
   proxy, ingress).
-- **Egress is cooperative in `host` mode, and `gated` mode is not yet a full
-  boundary.** In `host` mode, policy applies to traffic that goes through an
-  upstream and to names resolved through the allocation's resolver. A
-  process that dials a raw address bypasses it. `mode = "gated"` (Linux,
+- **Egress in `host` mode is enforced only where the kernel classifier
+  runs, and `gated` mode is not yet a full boundary.** On a Linux node with
+  the [kernel classifier](#the-kernel-classifier), a host-mode `exec` or
+  `container` task's egress chain is enforced at `connect()`. Elsewhere, in
+  `host` mode, policy applies to traffic that goes through an upstream and
+  to names resolved through the allocation's resolver, and a process that
+  dials a raw address bypasses it. `mode = "gated"` (Linux,
   `container` and `exec`) closes that gap, because the namespace has no
   route except Legion's listeners, and every destination those listeners
   dial is judged by the [host guard](#the-host-guard) before policy. A root
-  `exec` task can still leave the namespace. A host-mode task's policy stays
-  cooperative, but the [kernel guard](#the-host-guard-in-the-kernel) keeps it
-  off the node's Legion ports, the metadata service, and other allocations'
-  listeners where it runs. On macOS, egress stays cooperative, and
+  `exec` task can still leave the namespace. Without the classifier, a
+  host-mode task's policy stays cooperative, but the
+  [kernel guard](#the-host-guard-in-the-kernel) keeps it off the node's
+  Legion ports, the metadata service, and other allocations' listeners where
+  it runs. On macOS, egress stays cooperative, and
   there are no VIPs, per-allocation resolvers, or gated namespaces. A gated
   `sandbox` is captured over vsock, upstreams included. That path is
   implemented and unit-tested but not exercised on a real VMM in CI. A

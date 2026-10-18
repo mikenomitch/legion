@@ -13491,6 +13491,16 @@ fn net_status_json(node_id: &str, status: &crate::structs::NetAllocStatus) -> Va
         "meshIdentity": status.mesh_identity,
         "guestAddress": status.guest_address,
         "guestBridge": status.guest_bridge,
+        "kernel": status.kernel.as_ref().map(|k| json!({
+            "attached": k.attached,
+            "enforced": k.enforced,
+            "capture": k.capture,
+            "rules": k.rules,
+            "reason": k.reason,
+            "passed": k.passed,
+            "redirected": k.redirected,
+            "denied": k.denied,
+        })),
     })
 }
 

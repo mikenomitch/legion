@@ -19,12 +19,21 @@
 //! - `slow_endpoint`: three backends, one of them 2 ms slower. Mean
 //!   per-request latency under each balancing strategy this build has.
 //! - `balancer_pick`: the cost of one pick across 16 endpoints.
+//! - `kernel_conn_rr` (Linux, root, cgroup v2; mesh interfaces plan §6.A,
+//!   phase A0): a new connection per request from a process inside an
+//!   allocation's cgroup leaf, with no classifier attached, with the kernel
+//!   passing the flow after its first rule or after 32 rules, through the
+//!   forwarder (the netd hop a pass flow skips), redirected through the
+//!   capture listener, and refused (`EPERM`). Printed, not a Criterion
+//!   group: the client is a child process in the leaf, so the datapath's
+//!   own dials are not classified. `kernel_connect_cost` is the pass rows
+//!   minus the unclassified row.
 
 use std::convert::Infallible;
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
-use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
+use criterion::{criterion_group, BenchmarkId, Criterion, Throughput};
 use http_body_util::{BodyExt, Full};
 use hyper::{Request, Response};
 use hyper_util::rt::TokioIo;
@@ -148,7 +157,8 @@ async fn forwarder(backends: &[String], balance: &str, http: bool) -> u16 {
     let spec = UpstreamSpec {
         allocation_id: 1,
         service: "bench".into(),
-        local_port: port,
+        local_port: Some(port),
+        http_protocol: http,
         balance: balance.into(),
         to: None,
         http: http.then(UpstreamHttpConfig::default),
@@ -157,8 +167,7 @@ async fn forwarder(backends: &[String], balance: &str, http: bool) -> u16 {
         ca: None,
         vip: None,
         canonical_port: None,
-        netns: None,
-        vsock: None,
+        attachment: legion::worker::netd::attach::Attachment::Host,
     };
     forwarder.sync(std::slice::from_ref(&spec)).await;
     let endpoints = backends
@@ -416,4 +425,254 @@ fn balancer_pick(c: &mut Criterion) {
 }
 
 criterion_group!(benches, l4, http, slow_endpoint, balancer_pick);
-criterion_main!(benches);
+
+fn main() {
+    if let Ok(spec) = std::env::var(kernel::CHILD_ENV) {
+        kernel::child(&spec);
+        return;
+    }
+    benches();
+    kernel::run();
+    Criterion::default().configure_from_args().final_summary();
+}
+
+mod kernel {
+    /// Set on the client child: `<addr>:<iterations>:<mode>`.
+    pub const CHILD_ENV: &str = "LEGION_NET_BENCH_CHILD";
+
+    /// The client: `rr` connects, sends 100 bytes (an HTTP head naming
+    /// `bench.test`, so a redirected flow carries a name), reads 100 back,
+    /// and waits for the close; `deny` only attempts the connect. Prints the
+    /// mean nanoseconds per iteration.
+    pub fn child(spec: &str) {
+        use std::io::{Read, Write};
+        let mut parts = spec.rsplitn(3, ':');
+        let mode = parts.next().unwrap().to_string();
+        let iterations: u32 = parts.next().unwrap().parse().unwrap();
+        let addr: std::net::SocketAddr = parts.next().unwrap().parse().unwrap();
+        let message = request();
+        let started = std::time::Instant::now();
+        for _ in 0..iterations {
+            match std::net::TcpStream::connect(addr) {
+                Ok(mut stream) if mode == "rr" => {
+                    let _ = stream.set_nodelay(true);
+                    stream.write_all(&message).unwrap();
+                    let mut buf = [0u8; super::MESSAGE];
+                    stream.read_exact(&mut buf).unwrap();
+                    let mut rest = Vec::new();
+                    let _ = stream.read_to_end(&mut rest);
+                }
+                Ok(_) => {}
+                Err(err) if mode == "deny" => {
+                    assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied)
+                }
+                Err(err) => panic!("connect {addr}: {err}"),
+            }
+        }
+        println!("{}", started.elapsed().as_nanos() / u128::from(iterations));
+    }
+
+    fn request() -> Vec<u8> {
+        let mut head = b"GET / HTTP/1.1\r\nHost: bench.test\r\nX-Pad: ".to_vec();
+        while head.len() < super::MESSAGE - 4 {
+            head.push(b'a');
+        }
+        head.extend_from_slice(b"\r\n\r\n");
+        head
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    pub fn run() {}
+
+    #[cfg(target_os = "linux")]
+    pub fn run() {
+        use legion::structs::netpolicy::{merge_policies, ChainConfig, InlinePolicy};
+        use legion::worker::forwarder::ForwarderContext;
+        use legion::worker::netd::kernel::runtime::{cgroup2_mount, KernelNet, KernelSettings};
+        use legion::worker::netd::kernel_guard::{GuardTable, GuardedAllocation};
+        use legion::worker::netd::{Denials, NetPolicyCache};
+        use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+        use std::sync::Arc;
+
+        let filter = std::env::args().skip(1).find(|arg| !arg.starts_with('-'));
+        if filter
+            .as_deref()
+            .is_some_and(|filter| !"kernel_conn_rr".contains(filter))
+        {
+            return;
+        }
+        // SAFETY: geteuid has no preconditions.
+        let root_user = unsafe { libc::geteuid() } == 0;
+        let (Some(root), true) = (cgroup2_mount(), root_user) else {
+            println!("kernel_conn_rr: skipped (needs root and a cgroup v2 mount)");
+            return;
+        };
+        let Some(ip) = legion::structs::host_guard::interface_addresses()
+            .into_iter()
+            .find_map(|ip| match ip {
+                IpAddr::V4(v4) if !v4.is_loopback() => Some(v4),
+                _ => None,
+            })
+        else {
+            println!("kernel_conn_rr: skipped (no non-loopback IPv4 address)");
+            return;
+        };
+        let rt = super::runtime();
+        let backend_port = rt.block_on(async {
+            let listener = tokio::net::TcpListener::bind((Ipv4Addr::UNSPECIFIED, 0))
+                .await
+                .unwrap();
+            let port = listener.local_addr().unwrap().port();
+            tokio::spawn(async move {
+                use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                while let Ok((mut stream, _)) = listener.accept().await {
+                    let _ = stream.set_nodelay(true);
+                    tokio::spawn(async move {
+                        let mut buf = [0u8; super::MESSAGE];
+                        if stream.read_exact(&mut buf).await.is_ok() {
+                            let _ = stream.write_all(&buf).await;
+                        }
+                    });
+                }
+            });
+            port
+        });
+        let backend = SocketAddr::from((ip, backend_port));
+        let parent = format!("legion-net-bench-{}", std::process::id());
+        let leaf = format!("{parent}/share/legion-1");
+        std::fs::create_dir_all(root.join(&leaf)).unwrap();
+        let iterations = 2000u32;
+        let measure = |addr: SocketAddr, mode: &str| -> f64 {
+            let exe = std::env::current_exe().unwrap();
+            let output = std::process::Command::new("sh")
+                .arg("-c")
+                .arg(format!(
+                    "echo $$ > {} && exec \"$0\"",
+                    root.join(&leaf).join("cgroup.procs").display()
+                ))
+                .arg(exe)
+                .env(CHILD_ENV, format!("{addr}:{iterations}:{mode}"))
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            String::from_utf8_lossy(&output.stdout)
+                .trim()
+                .parse::<f64>()
+                .unwrap()
+                / 1000.0
+        };
+        let mut rows: Vec<(&str, f64)> = Vec::new();
+        rows.push(("unclassified", measure(backend, "rr")));
+
+        let cache = Arc::new(NetPolicyCache::new());
+        let guard = legion::structs::host_guard::HostGuard::new(
+            &legion::structs::host_guard::HostGuardConfig {
+                allow: vec![format!("{ip}:{backend_port}")],
+                deny: vec![],
+            },
+        )
+        .unwrap();
+        struct Names(Ipv4Addr);
+        #[tonic::async_trait]
+        impl legion::worker::netd::guard::Resolver for Names {
+            async fn resolve(&self, _host: &str, port: u16) -> std::io::Result<Vec<SocketAddr>> {
+                Ok(vec![SocketAddr::from((self.0, port))])
+            }
+        }
+        let net = KernelNet::open(KernelSettings {
+            cgroup_root: root.clone(),
+            cgroup_parent: parent.clone(),
+            pin_dir: None,
+        })
+        .unwrap();
+        let context = Arc::new(
+            ForwarderContext::new(cache.clone(), Arc::new(Denials::new()))
+                .with_host_guard(Arc::new(guard))
+                .with_resolver(Arc::new(Names(ip)))
+                .with_kernel_classifier(
+                    GuardTable {
+                        cgroup_parent: parent.clone(),
+                        ..Default::default()
+                    },
+                    net,
+                ),
+        );
+        let capture = rt
+            .block_on(legion::worker::netd::capture::HostCapture::start(
+                context.clone(),
+            ))
+            .unwrap();
+        context.set_host_capture(Some(capture.addr));
+        let apply = |chain: serde_json::Value| {
+            let mut config: ChainConfig = serde_json::from_value(chain).unwrap();
+            config.normalize_and_validate("egress").unwrap();
+            let policy = merge_policies(
+                &[],
+                InlinePolicy {
+                    egress: Some(&config),
+                    ..Default::default()
+                },
+            );
+            cache.apply_assignments(&[legion::structs::AllocNetPolicy {
+                allocation_id: 1,
+                policy_hash: policy.hash.clone(),
+            }]);
+            let hash = policy.hash.clone();
+            cache.insert_body(&hash, policy).unwrap();
+            context.reconcile_kernel_guard(vec![GuardedAllocation {
+                allocation_id: 1,
+                cgroup: leaf.clone(),
+                vip_block: None,
+                loopback_ports: vec![],
+                resolver: None,
+                gated: false,
+                host_sockets: true,
+            }]);
+        };
+        apply(serde_json::json!({ "policy": "deny", "allow": [format!("{ip}/32")] }));
+        rows.push(("pass_first_rule", measure(backend, "rr")));
+        let mut rules: Vec<serde_json::Value> = (1..=32)
+            .map(|port| serde_json::json!({ "when": { "port": port }, "action": "deny" }))
+            .collect();
+        rules
+            .push(serde_json::json!({ "when": { "cidr": format!("{ip}/32") }, "action": "allow" }));
+        apply(serde_json::json!({ "policy": "deny", "rules": rules }));
+        rows.push(("pass_after_32_rules", measure(backend, "rr")));
+        let via = rt.block_on(super::forwarder(
+            &[backend.to_string()],
+            "round_robin",
+            false,
+        ));
+        rows.push((
+            "forwarder",
+            measure(SocketAddr::from((Ipv4Addr::LOCALHOST, via)), "rr"),
+        ));
+        apply(serde_json::json!({
+            "policy": "deny",
+            "rules": [{ "when": { "host": "bench.test" }, "action": "allow" }],
+        }));
+        rows.push(("redirect", measure(backend, "rr")));
+        apply(serde_json::json!({ "policy": "deny" }));
+        rows.push(("deny", measure(backend, "deny")));
+        context.shutdown_kernel();
+        drop(capture);
+        let _ = std::fs::remove_dir(root.join(&leaf));
+        let _ = std::fs::remove_dir(root.join(&parent).join("share"));
+        let _ = std::fs::remove_dir(root.join(&parent));
+
+        let base = rows[0].1;
+        for (name, micros) in &rows {
+            println!("kernel_conn_rr/{name:<22} {micros:>8.1} µs");
+        }
+        for (name, micros) in &rows[1..3] {
+            println!(
+                "kernel_connect_cost/{name:<17} {:>8.2} µs per connection",
+                micros - base
+            );
+        }
+    }
+}
