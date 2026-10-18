@@ -12,6 +12,9 @@
 //!   ([`Store::write_blocked_eval`]), and kept as the gang blocks again: the
 //!   insert never overwrites, so `since` is the start of the whole wait.
 //!   When the gang sets `placementTimeout`, `deadline` is `since` plus it.
+//!   Both are whole Unix seconds, so a wait is past its deadline only once
+//!   the second after it has begun ([`gang_wait_expired`]): never early,
+//!   at most a second late.
 //! - **Ended** by any eval of the config that succeeds (a plan that leaves
 //!   a gang short fails its eval, so success means the quorum placed or
 //!   nothing was missing; an elastic gang's plan that reaches the quorum but
@@ -27,6 +30,15 @@
 //! Scheduler lane, like `eval`. Rows are few (one per waiting gang job).
 
 use super::*;
+
+/// Whether a wait with this deadline has run out at `now` (both whole Unix
+/// seconds). `since` was truncated when the wait began, so the deadline
+/// second can start as little as a moment after it: the wait runs out only
+/// once the next second has begun, so it never lasts less than its
+/// `placementTimeout`.
+fn gang_wait_expired(deadline_unix: i64, now_unix: i64) -> bool {
+    deadline_unix < now_unix
+}
 
 /// One waiting gang, as its row records it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -116,13 +128,14 @@ impl Store {
         Ok(())
     }
 
-    /// The waits whose `placementTimeout` has run out.
+    /// The waits whose `placementTimeout` has run out
+    /// ([`gang_wait_expired`]).
     pub fn expired_gang_waits(&self) -> R<Vec<GangWait>> {
         let conn = self.read_connection()?;
         let mut stmt = conn.prepare_cached(
             "SELECT job_config_id, job_id, task_name, since_unix, deadline_unix
              FROM gang_wait
-             WHERE deadline_unix IS NOT NULL AND deadline_unix <= ?1
+             WHERE deadline_unix IS NOT NULL AND deadline_unix < ?1
              ORDER BY deadline_unix;",
         )?;
         let rows = stmt.query_map([Self::now_unix()], Self::gang_wait_from_row)?;
@@ -215,7 +228,7 @@ impl Store {
         let Some(deadline) = wait.deadline_unix else {
             return Ok(None);
         };
-        if deadline > Self::now_unix() {
+        if !gang_wait_expired(deadline, Self::now_unix()) {
             return Ok(None);
         }
         let waited = Self::now_unix().saturating_sub(wait.since_unix).max(0) as u64;
@@ -260,5 +273,19 @@ impl Store {
             "Gang placement timed out; job failed"
         );
         Ok(Some(message))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::gang_wait_expired;
+
+    #[test]
+    fn a_wait_never_runs_out_before_its_timeout() {
+        // A wait that began at 99.999s is stored as 99; with a one-second
+        // timeout its deadline is 100, which begins a millisecond later.
+        let deadline = 99 + 1;
+        assert!(!gang_wait_expired(deadline, 100), "1ms in is too soon");
+        assert!(gang_wait_expired(deadline, 101), "a full second has passed");
     }
 }

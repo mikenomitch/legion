@@ -132,8 +132,9 @@ Gang worker did not reach its quorum within placementTimeout 30m (waited 30m 1s)
 
 A failed gang job places nothing, even when capacity appears later.
 `legion job run` (or `--force-reschedule`) starts it again, with a new clock.
-Expiry is checked by the scheduler leader at least once a second, so a gang
-fails at most about a second after its deadline.
+A gang never fails before its full `placementTimeout` has passed. The clock
+is kept in whole seconds and the scheduler leader checks it once a second, so
+a gang fails within about two seconds after its deadline.
 
 The timeout covers every wait short of the quorum: a fresh submit, a
 `replace` top-up, and the re-placement after a `restart`. A gang that reaches

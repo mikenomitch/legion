@@ -410,17 +410,19 @@ fn a_gang_wait_counts_from_its_first_block() -> R<()> {
 #[test]
 fn a_gang_past_its_placement_timeout_fails_its_job() -> R<()> {
     let cluster = Cluster::new(&["n-1"])?;
+    // Long enough that the first settle never outlasts it on a slow runner.
     let trainer = job(
         "trainer",
         2,
-        gang_with_timeout(std::time::Duration::from_secs(1)),
+        gang_with_timeout(std::time::Duration::from_secs(2)),
     );
     cluster.submit(&trainer)?;
     cluster.settle()?;
     assert_eq!(cluster.store().blocked_evals()?.len(), 1);
     assert_eq!(cluster.store().wake_timed_out_gangs()?, 0, "not yet");
 
-    std::thread::sleep(std::time::Duration::from_millis(2100));
+    // Past the deadline second, which the wait outlasts (see gang_waits.rs).
+    std::thread::sleep(std::time::Duration::from_millis(3100));
     assert_eq!(cluster.store().wake_timed_out_gangs()?, 1);
     cluster.settle()?;
     let info = cluster.job_info("trainer")?;
@@ -460,7 +462,7 @@ fn a_gang_at_its_quorum_is_not_timed_out() -> R<()> {
     let cluster = Cluster::new(&["n-1"])?;
     let elastic = Some(GangConfig {
         min: Some(2),
-        placement_timeout: Some(Duration::from_secs(1)),
+        placement_timeout: Some(Duration::from_secs(2)),
         ..GangConfig::default()
     });
     cluster.submit(&job("trainer", 3, elastic))?;
@@ -482,7 +484,8 @@ fn a_gang_at_its_quorum_is_not_timed_out() -> R<()> {
         "the wait ended"
     );
 
-    std::thread::sleep(Duration::from_millis(2100));
+    // Past the second a deadline would have run out in.
+    std::thread::sleep(Duration::from_millis(3100));
     assert_eq!(cluster.store().wake_timed_out_gangs()?, 0);
     cluster.settle()?;
     assert_eq!(cluster.running("trainer")?, 2);
