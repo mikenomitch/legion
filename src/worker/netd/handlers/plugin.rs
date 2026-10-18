@@ -27,7 +27,9 @@ use crate::structs::netplugin::PluginConfig;
 use crate::worker::forwarder::ForwarderContext;
 use crate::worker::netd::metrics as net_metrics;
 use crate::worker::netd::plugins::abi::{Pairs, ACTION_PAUSE};
-use crate::worker::netd::plugins::vm::{prop_key, CallResponse, ContextState, PendingCall};
+use crate::worker::netd::plugins::vm::{
+    prop_key, CallResponse, ContextState, Facts, PendingCall, PropertySource,
+};
 use crate::worker::netd::plugins::{InstancePool, PluginHost, VmSlot};
 
 use bytes::Bytes;
@@ -35,16 +37,39 @@ use std::time::Duration;
 
 pub(super) struct Plugin {
     source: String,
-    config: PluginConfig,
     hop: HopConfig,
+    shared: Arc<Shared>,
+}
+
+/// What every exchange through one hop shares: the reference, its config
+/// encoded once, and the pools it last ran on.
+struct Shared {
+    reference: PluginConfig,
+    configuration: Vec<u8>,
+    config_hash: u64,
+    /// Scope (`policy`, `job:<id>`) to the pool for the revision it was
+    /// built for; a new revision of the plugin builds a new one.
+    pools: Mutex<HashMap<String, (u64, Arc<InstancePool>)>>,
 }
 
 impl Plugin {
     pub(super) fn new(source: String, config: PluginConfig, hop: HopConfig) -> Self {
+        let configuration = config.configuration_bytes();
+        let config_hash = {
+            use std::hash::{Hash, Hasher};
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            configuration.hash(&mut hasher);
+            hasher.finish()
+        };
         Plugin {
             source,
-            config,
             hop,
+            shared: Arc::new(Shared {
+                reference: config,
+                configuration,
+                config_hash,
+                pools: Mutex::new(HashMap::new()),
+            }),
         }
     }
 
@@ -64,7 +89,7 @@ impl Plugin {
 
     fn stages(&self, plugins: &PluginHost) -> Option<Vec<Stage>> {
         plugins
-            .entry(&self.config.name)
+            .entry(&self.shared.reference.name)
             .map(|e| e.object.stage_set())
     }
 }
@@ -96,19 +121,17 @@ impl Handler for Plugin {
         let mut run = Run::new(self, context, facts);
         let outcome = run.connect(context).await;
         run.done(0);
+        let name = &self.shared.reference.name;
         match outcome {
             Ok(true) => HopOutcome::Allow,
             Ok(false) => HopOutcome::Deny {
                 source: self.source.clone(),
-                reason: Some(format!(
-                    "plugin {} refused the connection",
-                    self.config.name
-                )),
+                reason: Some(format!("plugin {name} refused the connection")),
             },
             Err(_) if self.fails_open() => HopOutcome::Allow,
             Err(error) => HopOutcome::Deny {
                 source: self.source.clone(),
-                reason: Some(format!("plugin {} {error}", self.config.name)),
+                reason: Some(format!("plugin {name} {error}")),
             },
         }
     }
@@ -128,23 +151,77 @@ impl Handler for Plugin {
     }
 }
 
+/// The flow's facts, answered when a module asks (`legion.*`).
+struct FlowFacts {
+    context: Arc<ForwarderContext>,
+    allocation_id: i64,
+    direction: &'static str,
+    protocol: &'static str,
+    destination: String,
+    source: String,
+    upstream: Option<String>,
+    peer: Option<String>,
+}
+
+impl PropertySource for FlowFacts {
+    fn property(&self, path: &[&str]) -> Option<Vec<u8>> {
+        let text = |value: &str| Some(value.as_bytes().to_vec());
+        match path {
+            ["legion", "allocation"] => text(&self.allocation_id.to_string()),
+            ["legion", "direction"] => text(self.direction),
+            ["legion", "protocol"] => text(self.protocol),
+            ["legion", "destination"] => text(&self.destination),
+            ["legion", "source"] => text(&self.source),
+            ["legion", "upstream"] => self.upstream.as_deref().and_then(text),
+            ["legion", "peer_identity"] => self.peer.as_deref().and_then(text),
+            ["legion", "identity"] => self
+                .context
+                .identity_string_for(self.allocation_id)
+                .map(String::into_bytes),
+            ["legion", "node"] => self.context.node_id().map(String::into_bytes),
+            ["legion", field] => {
+                let who = self.context.identity_for(self.allocation_id)?;
+                match *field {
+                    "job" => text(&who.job_id),
+                    "group" => text(&who.group),
+                    "task" => text(&who.task_name),
+                    _ => None,
+                }
+            }
+            ["legion", "labels", key] => {
+                let who = self.context.identity_for(self.allocation_id)?;
+                who.labels.get(*key).and_then(|v| text(v))
+            }
+            _ => None,
+        }
+    }
+}
+
+/// The `direction` and `protocol` facts are a fixed vocabulary; keep them
+/// as statics so a context carries no copies.
+fn known(value: &str, choices: &[&'static str]) -> &'static str {
+    choices.iter().copied().find(|c| *c == value).unwrap_or("")
+}
+
 /// One stream context's worth of plugin calls.
 struct Run {
     source: String,
     plugin: String,
-    reference: PluginConfig,
     fails_open: bool,
     scope: String,
+    shared: Arc<Shared>,
     plugins: Arc<PluginHost>,
-    /// The flow's facts as properties, set on the context when it starts.
-    properties: BTreeMap<String, Vec<u8>>,
+    /// For the hop's health row (`NetHandlerStatus`), as `authz` and
+    /// `proxy` keep theirs: one sample per exchange.
+    context: Arc<ForwarderContext>,
+    facts: Arc<FlowFacts>,
     allocation_id: i64,
     started: Option<Started>,
     /// Why the context could not start, once it failed.
     failed: Option<String>,
+    /// The first callback failure of the exchange, for its health sample.
+    first_error: Option<String>,
 }
-
-use std::collections::BTreeMap;
 
 struct Started {
     pool: Arc<InstancePool>,
@@ -155,47 +232,59 @@ struct Started {
 
 impl Run {
     fn new(hop: &Plugin, context: &Arc<ForwarderContext>, facts: &HopFacts<'_>) -> Self {
-        let mut properties = BTreeMap::new();
-        let mut put = |path: &[&str], value: &str| {
-            properties.insert(prop_key(path), value.as_bytes().to_vec());
-        };
-        put(&["legion", "allocation"], &facts.allocation_id.to_string());
-        put(&["legion", "direction"], facts.direction);
-        put(&["legion", "protocol"], facts.protocol);
-        put(&["legion", "destination"], facts.destination);
-        put(&["legion", "source"], &hop.source);
-        if let Some(upstream) = facts.upstream {
-            put(&["legion", "upstream"], upstream);
-        }
-        if let Some(peer) = facts.identity {
-            put(&["legion", "peer_identity"], peer);
-        }
-        if let Some(who) = context.identity_for(facts.allocation_id) {
-            put(&["legion", "job"], &who.job_id);
-            put(&["legion", "group"], &who.group);
-            put(&["legion", "task"], &who.task_name);
-            for (key, value) in &who.labels {
-                put(&["legion", "labels", key], value);
-            }
-        }
-        if let Some(identity) = context.identity_string_for(facts.allocation_id) {
-            put(&["legion", "identity"], &identity);
-        }
-        if let Some(node) = context.node_id() {
-            put(&["legion", "node"], &node);
-        }
         Run {
             source: hop.source.clone(),
-            plugin: hop.config.name.clone(),
-            reference: hop.config.clone(),
+            plugin: hop.shared.reference.name.clone(),
             fails_open: hop.fails_open(),
             scope: hop.scope(context, facts.allocation_id),
+            shared: hop.shared.clone(),
             plugins: context.plugins().clone(),
-            properties,
+            context: context.clone(),
+            facts: Arc::new(FlowFacts {
+                context: context.clone(),
+                allocation_id: facts.allocation_id,
+                direction: known(facts.direction, &["egress", "ingress"]),
+                protocol: known(facts.protocol, &["tcp", "http"]),
+                destination: facts.destination.to_string(),
+                source: hop.source.clone(),
+                upstream: facts.upstream.map(str::to_string),
+                peer: facts.identity.map(str::to_string),
+            }),
             allocation_id: facts.allocation_id,
             started: None,
             failed: None,
+            first_error: None,
         }
+    }
+
+    /// The pool for this run's scope at the plugin's current revision.
+    fn pool(&self) -> Result<Arc<InstancePool>, String> {
+        let entry = self.plugins.entry(&self.plugin).ok_or_else(|| {
+            "is not on this node yet (its object has not arrived from the manager)".to_string()
+        })?;
+        if let Some((revision, pool)) = self
+            .shared
+            .pools
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .get(&self.scope)
+        {
+            if *revision == entry.revision {
+                return Ok(pool.clone());
+            }
+        }
+        let (entry, pool) = self.plugins.pool_for(
+            &self.plugin,
+            &self.shared.configuration,
+            self.shared.config_hash,
+            &self.scope,
+        )?;
+        self.shared
+            .pools
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .insert(self.scope.clone(), (entry.revision, pool.clone()));
+        Ok(pool)
     }
 
     /// Start the stream context on an instance, once.
@@ -207,14 +296,14 @@ impl Run {
             return Ok(());
         }
         let result = (|| {
-            let (_, pool) = self.plugins.pool(&self.reference, &self.scope)?;
+            let pool = self.pool()?;
             let slot = pool.pick()?;
             let mut ctx = slot
                 .vm
                 .lock()
                 .unwrap_or_else(|p| p.into_inner())
                 .new_context()?;
-            ctx.properties = self.properties.clone();
+            ctx.facts = Some(Facts(self.facts.clone()));
             Ok::<_, String>(Started {
                 pool,
                 slot,
@@ -229,6 +318,7 @@ impl Run {
             }
             Err(err) => {
                 debug!(plugin = %self.plugin, allocation_id = self.allocation_id, error = %err, "Net plugin context could not start");
+                self.first_error.get_or_insert_with(|| err.clone());
                 self.failed = Some(err.clone());
                 Err(err)
             }
@@ -236,11 +326,13 @@ impl Run {
     }
 
     /// One callback on this context. `prepare` sets what the callback reads;
-    /// the context comes back with what the module did.
+    /// the context comes back with what the module did. `stage` callbacks
+    /// are counted in the plugin's stats and metrics; the context's own
+    /// bookkeeping (`on_done`, `on_delete`) passes `None`.
     fn call(
         &mut self,
-        stage: Stage,
-        name: &str,
+        stage: Option<Stage>,
+        name: &'static str,
         args: impl FnOnce(&crate::worker::netd::plugins::vm::Vm, u32) -> Vec<i32>,
         prepare: impl FnOnce(&mut ContextState),
     ) -> Result<i32, String> {
@@ -262,11 +354,13 @@ impl Run {
         };
         started.ctx = Some(ctx);
         let error = outcome.result.as_ref().err().map(String::as_str);
-        if outcome.exported {
-            started.pool.stats.record(outcome.elapsed, error);
-            started
-                .pool
-                .stats
+        if let Some(error) = error {
+            self.first_error.get_or_insert_with(|| error.to_string());
+        }
+        if let (true, Some(stage)) = (outcome.exported, stage) {
+            let stats = &started.pool.stats;
+            stats.record(outcome.elapsed, error);
+            stats
                 .fuel
                 .fetch_add(outcome.fuel, std::sync::atomic::Ordering::Relaxed);
             net_metrics::plugin_call(
@@ -325,7 +419,7 @@ impl Run {
                 let count = headers.len() as i32;
                 let size = body.len() as i32;
                 self.call(
-                    stage,
+                    Some(stage),
                     "proxy_on_http_call_response",
                     |_, id| vec![id as i32, call.token as i32, count, size, 0],
                     |ctx| {
@@ -345,7 +439,7 @@ impl Run {
     /// The `connect` stage: whether the module lets the connection through.
     async fn connect(&mut self, context: &Arc<ForwarderContext>) -> Result<bool, String> {
         let action = self.call(
-            Stage::Connect,
+            Some(Stage::Connect),
             "proxy_on_new_connection",
             |_, id| vec![id as i32],
             |_| {},
@@ -434,45 +528,46 @@ impl Run {
     }
 
     /// `on_log` (when the plugin has the `done` stage), then `on_done` and
-    /// `on_delete`: the context is gone.
+    /// `on_delete`: the context is gone. The exchange's one health sample
+    /// is recorded here.
     fn done(&mut self, status: u16) {
-        let Some(started) = self.started.as_ref() else {
-            return;
-        };
-        if started.deleted {
+        let started = self.started.as_ref().map(|s| s.deleted);
+        if started == Some(true) {
             return;
         }
-        let logs = self
-            .plugins
-            .entry(&self.plugin)
-            .map(|e| e.object.has_stage(Stage::Done))
-            .unwrap_or(false);
-        if logs {
-            let code = (status as i64).to_le_bytes().to_vec();
-            let _ = self.call(
-                Stage::Done,
-                "proxy_on_log",
-                |_, id| vec![id as i32],
-                |ctx| {
-                    ctx.properties.insert(prop_key(&["response", "code"]), code);
-                },
-            );
+        if started == Some(false) {
+            let logs = self
+                .plugins
+                .entry(&self.plugin)
+                .map(|e| e.object.has_stage(Stage::Done))
+                .unwrap_or(false);
+            if logs {
+                let code = (status as i64).to_le_bytes().to_vec();
+                let _ = self.call(
+                    Some(Stage::Done),
+                    "proxy_on_log",
+                    |_, id| vec![id as i32],
+                    |ctx| {
+                        ctx.properties.insert(prop_key(&["response", "code"]), code);
+                    },
+                );
+            }
+            let _ = self.call(None, "proxy_on_done", |_, id| vec![id as i32], |_| {});
+            let _ = self.call(None, "proxy_on_delete", |_, id| vec![id as i32], |_| {});
+            if let Some(started) = self.started.as_mut() {
+                started.deleted = true;
+            }
         }
-        let _ = self.call(
-            Stage::Done,
-            "proxy_on_done",
-            |_, id| vec![id as i32],
-            |_| {},
+        self.context.note_handler(
+            self.allocation_id,
+            &self.source,
+            "plugin",
+            &format!("plugin {}", self.plugin),
+            match self.first_error.take() {
+                Some(error) => Err(error),
+                None => Ok(()),
+            },
         );
-        let _ = self.call(
-            Stage::Done,
-            "proxy_on_delete",
-            |_, id| vec![id as i32],
-            |_| {},
-        );
-        if let Some(started) = self.started.as_mut() {
-            started.deleted = true;
-        }
     }
 }
 
@@ -532,7 +627,7 @@ impl HopExchange for PluginExchange {
             ),
         ];
         let action = self.run.call(
-            Stage::Request,
+            Some(Stage::Request),
             "proxy_on_request_headers",
             |vm, id| vm.headers_args(id, count, eos),
             move |ctx| {
@@ -593,7 +688,7 @@ impl HopExchange for PluginExchange {
         let data = body.to_vec();
         let size = data.len() as i32;
         let action = self.run.call(
-            Stage::Body,
+            Some(Stage::Body),
             "proxy_on_request_body",
             |_, id| vec![id as i32, size, 1],
             move |ctx| {
@@ -638,7 +733,7 @@ impl HopExchange for PluginExchange {
         let count = pairs.len();
         let code = (head.status as i64).to_le_bytes().to_vec();
         let action = self.run.call(
-            Stage::Response,
+            Some(Stage::Response),
             "proxy_on_response_headers",
             |vm, id| vm.headers_args(id, count, false),
             move |ctx| {
@@ -710,7 +805,7 @@ impl HopExchange for PluginExchange {
         }
         let size = data.len() as i32;
         let action = self.run.call(
-            Stage::Response,
+            Some(Stage::Response),
             "proxy_on_response_body",
             |_, id| vec![id as i32, size, end as i32],
             move |ctx| {

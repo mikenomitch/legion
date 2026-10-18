@@ -328,6 +328,17 @@
                                 dlp = { maxBytes = "1Mi", patterns = ["(AKIA|sk-)[A-Za-z0-9]{16,}"] },
                                 onError = "deny",
                             },
+                            # A WASM network plugin (docs/network-plugins.md):
+                            # a stored plugin object with usableBy = "jobs",
+                            # run with this reference's config (checked
+                            # against the object's configSchema at submit).
+                            # Its stages, limits, and module live on the
+                            # object.
+                            {
+                                plugin = { name = "llm-token-meter", config = { budget = 100000, per = "1h" } },
+                                onError = "deny",
+                                timeout = "2s",
+                            },
                         ],
                         # Credential injection (docs/network-handlers.md,
                         # "Credential injection"): the node sets these headers

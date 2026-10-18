@@ -640,6 +640,7 @@ A handler is written as its kind, with the kind's settings inside it:
 | `authz` | POSTs the flow's facts to `url` and reads back a verdict, cached per (hop, identity, destination[, method, path]) for `cache` (default `10s`, at most `5m`) | connect, request | external |
 | `proxy` | hands the flow to any proxy (a catalog `service`, with `local = true` for its endpoints on this node only, or a sidecar's `port` label in the same job) with a PROXY protocol v2 header (TCP) or `Legion-*` headers (HTTP) | connect, request | external |
 | `dlp` | rejects HTTP request bodies matching `patterns`, buffering up to `maxBytes` (default 1 MiB) | body | netd |
+| `plugin` | runs a stored [network plugin](network-plugins.md) object's WASM module (proxy-wasm ABI) with this reference's `config`: it may answer, rewrite, meter, or sign | the stages its object declares: connect, request, body, response, done | netd (wasm) |
 
 **Stage** is where in a flow the kind acts. An L4 path runs a hop at
 `connect`, with the connect-time facts; an HTTP path runs it at `request`,
@@ -653,8 +654,9 @@ network.egress.protocol is "tcp". Set protocol = "http", or put it on an
 upstream whose `to` is http:// or https://
 ```
 
-**Runs** is where the work happens: in the node's datapath (`netd`) or
-outside it (`external`, a webhook or another proxy). `legion net policy
+**Runs** is where the work happens: in the node's datapath (`netd`), in
+the datapath inside a WASM sandbox (`netd (wasm)`), or outside it
+(`external`, a webhook or another proxy). `legion net policy
 show` prints both for every hop.
 
 Every hop has a `timeout` (default `2s`) and an `onError` (default `deny`).
@@ -681,8 +683,8 @@ A setting in the wrong place is an error that names the kind:
 
 ```
 handler 'proxy' has an unexpected field 'url' beside it; a handler is one
-kind (authz, proxy, dlp) plus timeout and onError, with the kind's settings
-inside it
+kind (authz, proxy, dlp, plugin) plus timeout and onError, with the kind's
+settings inside it
 ```
 
 There is no `log` handler. The chain's `accessLog = true` writes the access
@@ -1845,6 +1847,7 @@ legion net policy test <job> --to <dest> [--method M --path P]  # dry-run a verd
 legion net policy test <job> --from <peer> [--identity <sub>]
 legion net doctor <job> [--task <task>]                         # policy → mode → datapath → handlers → tls
 legion net handler test <url|host:port>                         # probe an authz webhook or a proxy
+legion net plugin new|test|apply|list|describe|status|delete     # WASM plugins (docs/network-plugins.md)
 legion net ca show | rotate                                     # the mesh CA
 ```
 
@@ -1884,12 +1887,16 @@ hang.
   `legion_net_denied_total{direction}`, `legion_net_bytes_total{direction}`,
   `legion_net_handler_total{handler,outcome}` (authz/proxy calls by
   allow|deny|proxy|error), `legion_net_handler_seconds` (webhook latency,
-  cache misses only).
+  cache misses only), and for [plugins](network-plugins.md#status-and-diagnostics)
+  `legion_net_plugin_calls_total{plugin,stage,outcome}`,
+  `legion_net_plugin_callback_seconds`, and
+  `legion_net_plugin_metric{plugin,scope,name}`.
   Attribution is never a metric label. The registry caps label
   combinations, and a per-user label would silently break the series.
 - **Events**: `net.denied` (warn) with the destination, the deciding rule,
   the reason, the peer identity, and the task's `network.labels`.
-  `net.policy_applied` and `net.policy_deleted` (info).
+  `net.policy_applied` and `net.policy_deleted` (info), and
+  `net.plugin_applied` and `net.plugin_deleted` (info).
 - **Access log** (`accessLog = true` on the chain): one NDJSON line
   per request in HTTP mode, at `<worker logs>/<allocation>/net-access.log`.
   L4 connections are counted in metrics, not logged one by one.
@@ -1911,6 +1918,8 @@ The `net` resource controls access:
   can set policy for their pool without cluster-wide write access.
 
 A cluster-wide policy (no pools in its selector) and `ca rotate` need
+unscoped `net:write`. [Plugin objects](network-plugins.md#acls) follow the
+same rule on their own `nodePools`, and a `usableBy = "jobs"` plugin needs
 unscoped `net:write`. `IssueNodeCertificate` is worker-plane, and a node may
 only mint its own certificate.
 
@@ -1974,7 +1983,8 @@ This section lists what that covers and what it does not.
   beyond the 24-hour lifetime, and an ingress `proxy` hop cannot reach a
   gated task's private port or a port inside a sandbox guest.
 - **No HTTP/2 or HTTP/3** (`protocol = "h2"` is rejected with that reason),
-  no UDP, no WASM handlers, and no TLS interception. Legion will not add TLS
+  no UDP, and no TLS interception. Custom per-request logic runs as
+  [WASM plugins](network-plugins.md); their own limits are listed there. Legion will not add TLS
   interception. Use external upstreams when policy needs to see the body,
   or when the node should add a credential the task never holds
   ([Credential injection](#credential-injection)): both work because the

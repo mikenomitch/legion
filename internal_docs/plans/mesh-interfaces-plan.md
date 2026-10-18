@@ -2,9 +2,29 @@
 
 > **Judgement calls:** [`calls/mesh-interfaces-plan_calls.md`](../calls/mesh-interfaces-plan_calls.md)
 
-> **Status: IN EXECUTION.** Phase 0 and track S (S1–S6) are shipped;
-> tracks A and B are in progress. Deviations from the text below are calls
-> entries 22 onward.
+> **Status: SHIPPED.** Phase 0, track S (S1–S6), track A (A0–A3), and
+> track B (B1–B3) are built. Deviations from the text below are calls
+> entries 22 onward; the public pages are
+> [network-handlers.md](../../docs/network-handlers.md) and
+> [network-plugins.md](../../docs/network-plugins.md), and the A0
+> measurements are in [kernel-classifier-findings.md](../kernel-classifier-findings.md).
+>
+> Deliberately deferred, and open in `internal_docs/TODO.md`:
+> - `oci://` plugin modules (calls entry 31).
+> - Streaming request bodies for plugins (33).
+> - Re-checking jobs when a plugin changes (43).
+> - Pooled `dispatch_http_call` connections (39).
+> - Plugin logs in allocation logs (53).
+> - Plugin ticks and shared queues (54).
+> - A CI check for the checked-in test modules (55).
+> - A plugins page in the UI.
+> - Per-rule kernel lines in `net policy show`.
+> - A store migration for rows in the pre-S2 shape (34).
+>
+> Two changes from this text:
+> - The plugin deadline is fuel plus a clock check, not an epoch (25).
+> - A failed plugin's `Legion-Denied-By` names the hop, not
+>   `plugin/<name>` (32).
 >
 > This is one plan for two questions about the mesh:
 >

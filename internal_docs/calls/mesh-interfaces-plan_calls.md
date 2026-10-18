@@ -6,7 +6,8 @@ rank. Each says what evidence would overturn it.
 
 Entries 1–21 are the plan's own calls, made before any code. Entries 22
 onward were made while executing it; they constrain less than the plan's
-architecture, so they rank below it, and among themselves by impact.
+architecture, so they rank below it, and among themselves by impact. Track
+B's (the WASM plugins) are interleaved at their rank.
 
 This file began as `egress-plugins-proposal_calls.md` (merged in
 [#49](https://github.com/mikenomitch/legion/pull/49)). That proposal's ten
@@ -637,7 +638,168 @@ restate the others. The owner asked for a single plan.
 
 ---
 
-## 22. Loopback is the guard's; the kernel chain judges what leaves the node
+## 22. The plugin engine is wasmi, an interpreter, not wasmtime
+
+**Call.** Plugins run in [wasmi](https://github.com/wasmi-labs/wasmi) 2.0
+(open question 3). Every callback gets fuel, and every instance a memory
+cap.
+
+**Alternatives.** wasmtime 49 with Cranelift: it compiles modules ahead of
+time and interrupts by epoch.
+
+**Trade-off.** An interpreter runs compute-heavy plugins many times slower
+than compiled code. A header-stage plugin costs tens of microseconds, not
+single digits. There is no clock-driven interruption either (entry 25).
+
+**Why (simplicity, performance where it counts).**
+- **Binary size.** Measured with stripped LTO builds of an otherwise empty
+  binary (scratch probes, 2026-10-18): wasmi adds 1.8 MB to the worker,
+  wasmtime with Cranelift about 10 MB. The worker ships at ~26 MB, and a
+  40% size jump for a feature most nodes never use is the wrong default.
+- **Build cost.** wasmtime also roughly doubles a clean build.
+- **Cost profile.** Plugins are meant for header logic, metering, and
+  signing, where a callback is a few thousand instructions. The no-op
+  `http_rr` row is the number to watch.
+
+Overturn it if a real plugin's callback time dominates its request, or if
+the shipping binary stops caring about 8 MB. The host code is
+engine-agnostic above `plugins::vm`.
+
+---
+
+## 23. `usableBy = "jobs"` widens, never narrows; the scope is the reference, not the plugin
+
+**Call.** `usableBy = "jobs"` means jobs *and* policy objects may reference
+the plugin; `policies` means only policy objects. A reference runs under a
+scope:
+- **A policy object's hop** (source `policy/…`) runs under the plugin's own
+  scope (`policy`).
+- **A job's own hop** (its chains or an upstream's handlers) runs under
+  `job:<id>`.
+
+Instances, shared data, and module metrics are per scope.
+
+```nickel
+{ plugin = { name = "llm-token-meter", config = { budget = 100000 } } }   # in a job: scope job:agents
+```
+
+**Alternatives.**
+- `jobs` meaning jobs only.
+- Scopes per allocation.
+- Scopes per (plugin, job) for policy references too.
+
+**Trade-off.** A policy that applies one plugin to many jobs shares one
+counter across them. A per-job budget from a policy object needs the module
+to key its shared data by `legion.job`.
+
+**Why (ease, safety).**
+- **The plan only reads one way.** It says a job's plugin never sees
+  another job's counters (B2's acceptance test). A policy object is written
+  by an operator who already sees every job it selects.
+- **Per-allocation scopes would break metering.** A replicated job's
+  instances could not share a budget on a node.
+- **Policies keep their access.** Making `jobs` exclusive would force an
+  operator to apply a plugin twice just to use it from a policy.
+
+---
+
+## 24. A plugin's object reaches the node as a material ref, not inlined into policy bodies
+
+**Call.** Nodes fetch a referenced plugin by name through
+`FetchDatapathMaterial` (kind `plugin`), versioned by its cluster-wide
+revision. The manager serves it only to a node whose allocations reference
+it, and only if the node's pool is in `nodePools`. Signing keys travel the
+same way (kind `plugin_credential`). Policy bodies keep `{ plugin = { name,
+config } }`. The hop binds late: it looks the plugin up when a request
+arrives.
+
+**Alternatives.** Resolve every plugin hop into the merged policy body at
+heartbeat time, so a plugin update changes the policy hash and reaches nodes
+as a new body.
+
+**Trade-off.** A hop can run before its plugin has arrived. It then fails
+with "not on this node yet", by its `onError`. The first requests after a
+new reference can fail closed for one heartbeat plus the module fetch.
+
+**Why (simplicity, extensibility).**
+- **One revision per plugin.** The plan says the digest reaches the node as
+  an S5 ref, and this is that. A plugin update is one ref with a new
+  revision, not a recomputed hash for every policy and allocation that uses
+  it.
+- **Upstream handlers are covered.** A job's upstream handlers, which live
+  on the allocation payload and not in a policy body, get the plugin the
+  same way.
+- **Module fetching stays independent.** It is decoupled from the policy
+  merge.
+
+---
+
+## 25. Deadlines are fuel plus a clock check after the callback
+
+**Call.** `limits.deadline` is enforced in two ways:
+- **Fuel.** Each callback gets fuel in proportion to its deadline
+  (5 million units per ms, from a measured 2.4 million units per ms on a
+  2.1 GHz Xeon). A runaway stops within about twice its deadline there.
+- **The clock.** A callback that returns past its deadline counts as
+  failed.
+
+Starting an instance gets ten callbacks' worth of fuel and no deadline.
+
+**Alternatives.**
+- Run callbacks on a separate thread and abandon them at the deadline.
+- wasmtime's epoch interruption (entry 22).
+
+**Trade-off.**
+- A spinning module holds a datapath thread for up to about 2× its
+  deadline, longer on slow cores.
+- A module that is slow but finishes is reported late, not stopped.
+- Fuel is per instruction, not per microsecond, so the same plugin gets
+  more wall time on a slow node.
+
+**Why (simplicity).**
+- **wasmi has no interruption.** A thread per callback costs a hop per
+  request and leaks a stuck thread per runaway.
+- **Fuel bounds every case.** The bound is deterministic, and the clock
+  check keeps the documented meaning honest for callbacks that return.
+- **Start-up stays off the deadline.** Instance start runs once per pool
+  slot, so holding it to a 10 ms deadline would fail cold starts in debug
+  builds and on slow nodes for no safety gain.
+
+---
+
+## 26. Plugin objects carry `nodePools`, and policies that use one must stay within it
+
+**Call.** The plan scopes `net:write` on a `usableBy = "policies"` plugin
+"by pools" without saying whose pools. The object gets a `nodePools` glob
+list; empty means every pool.
+- **ACL.** Applying a pool-scoped plugin needs `net:write` on each pool.
+- **Policies.** A policy that references it must select node pools within
+  those globs.
+- **Nodes.** The manager serves the plugin only to nodes in those pools.
+
+```
+policy 'p' egress.handlers[0]: plugin 'meter' runs only on node pools gpu-*; the
+policy must select node pools within those (selector.nodePools)
+```
+
+**Alternatives.**
+- Scope by the referencing policies' pools.
+- No pool scoping at all, with every plugin cluster-wide.
+
+**Trade-off.**
+- One more field.
+- A pool admin's plugin cannot be used by a cluster-wide policy.
+- Glob containment is checked by matching the policy's pool strings
+  against the plugin's globs, so a policy glob only passes when a plugin
+  glob matches its text.
+
+**Why (security, ease).** A pool admin must not be able to ship code to
+every node in the cluster. Without the field, the scope would have nothing
+to bind to.
+
+---
+
+## 27. Loopback is the guard's; the kernel chain judges what leaves the node
 
 **Call.** On a node with the classifier, a host-mode task's connection to a
 loopback address (`127.0.0.0/8`, `::1`) is never judged by its egress chain.
@@ -660,7 +822,7 @@ egress policy is about what leaves.
 
 ---
 
-## 23. Only the mesh CA vouches for nodes; a port's own client CA vouches for names
+## 28. Only the mesh CA vouches for nodes; a port's own client CA vouches for names
 
 **Call.** On a port with its own `tls.clients.ca`, a verified client
 certificate carrying a `legion://node/<id>` SAN is treated as the plain name
@@ -683,7 +845,7 @@ before it ships.
 
 ---
 
-## 24. A captured flow's name must own the address it dialed, and the original address is what is dialed
+## 29. A captured flow's name must own the address it dialed, and the original address is what is dialed
 
 **Call.** The capture listener reads the SNI or `Host` of a redirected flow
 and allows it only if the address the task dialed is one of that name's
@@ -708,7 +870,7 @@ resolution per captured connection.
 
 ---
 
-## 25. The programs are C built with clang, checked in as an object
+## 30. The programs are C built with clang, checked in as an object
 
 **Call.** `bpf/legion_net.bpf.c` is plain C with its own helper
 declarations (no libbpf headers), built by `bpf/build.sh` with clang 18
@@ -731,7 +893,80 @@ the verifier accepted them as written. `cargo build` still needs only
 
 ---
 
-## 26. Stored rows are not migrated across the reshape
+## 31. Plugin modules are single files: no `oci://` yet
+
+**Call.** `module.source` accepts `https://`, `http://`, `s3://`, and
+`file://`, with a required `sha256:` checksum. Each source is fetched with
+`ArtifactStager::fetch_into_store` into the node content store.
+
+**Alternatives.** Accept `oci://…@sha256:` as the plan's example did.
+ORAS-published WASM artifacts would then be pulled as layers.
+
+**Trade-off.** Teams that publish modules to an OCI registry must also host
+the `.wasm` over HTTPS or S3.
+
+**Why (simplicity).** The content store's single-flight, cached,
+digest-verified path handles single files only. An OCI fetch returns a
+manifest digest, not the module's, so caching it needs a second code path
+and a manifest-to-blob mapping. Recorded in TODO.md.
+
+---
+
+## 32. A failed plugin answers `503` with `Legion-Denied-By` naming the hop, not `plugin/<name>`
+
+**Call.** A trap, exhausted fuel, a passed deadline, or a module that will
+not start answers:
+
+```http
+HTTP/1.1 503 Service Unavailable
+legion-denied-by: policy/meter#0
+legion-denied-reason: plugin llm-token-meter exceeded its 10ms deadline (12931 µs)
+```
+
+A plugin's own refusal (`send_http_response`) keeps its status and its own
+`legion-denied-reason`, and gets `legion-denied-by` with the hop's source
+when it did not set one.
+
+**Alternatives.** `Legion-Denied-By: plugin/<name>`, as the plan sketched.
+
+**Trade-off.** The header names the policy hop, not the plugin, so a reader
+looks at the reason for the plugin's name.
+
+**Why (ease).** Every other denial (rules, `dlp`, `authz`, the host guard)
+names its source in that header, and the denial ledger, the `net.denied`
+event, and the access log key on it. One plugin used by two policies is two
+different decisions, and the hop source tells them apart.
+
+---
+
+## 33. Request bodies are buffered; response bodies stream chunk by chunk
+
+**Call.** The `body` stage sees the whole request body in one callback,
+with `end_of_stream = true`, up to `limits.maxBodyBytes`. The response body
+reaches the plugin one chunk at a time, as the upstream sends it, through a
+channel. A `Pause` holds the bytes until the next chunk, up to the same cap.
+
+**Alternatives.** Stream request bodies too.
+
+**Trade-off.**
+- A plugin cannot act on the first bytes of a large upload before the rest
+  arrives.
+- Request bodies over the cap are refused (or passed, under
+  `onError = "allow"`).
+- The response is sent chunked without `content-length` whenever a plugin
+  reads its body.
+
+**Why (simplicity).**
+- **Request bodies were already buffered.** Every HTTP path buffers them
+  for `dlp` and for retries (a retry re-sends the body). Streaming them
+  would mean a second, retry-less request path.
+- **Response streaming is the case that matters.** Server-sent events from
+  an LLM API are what scenario 1 meters, and buffering them would hold a
+  stream until it ends.
+
+---
+
+## 34. Stored rows are not migrated across the reshape
 
 **Call.** `AllocUpstream.service` became `key` (S2), `AllocNetwork.ingress_tls`
 was replaced by `AllocPort.mesh`/`tls` (S3), and chains lost `tls` with no
@@ -752,7 +987,7 @@ runs once on clusters that do not exist. The PR description says what broke.
 
 ---
 
-## 27. The programs attach once, to the cgroup parent
+## 35. The programs attach once, to the cgroup parent
 
 **Call.** One set of links, on the worker's cgroup parent, serves every
 allocation: each program reads the caller's leaf with
@@ -775,7 +1010,7 @@ ancestor lookup either way.
 
 ---
 
-## 28. Pins stay when the worker stops
+## 36. Pins stay when the worker stops
 
 **Call.** The worker never removes the classifier's pins on its own: a
 worker that stops (or crashes) leaves the programs attached and the maps
@@ -797,7 +1032,88 @@ same today: nothing deletes its table at shutdown.
 
 ---
 
-## 29. The caller's group travels on the allocation payload
+## 37. Instances are pooled per (revision, scope, config); a request keeps its instance
+
+**Call.** Each (plugin revision, scope, config) gets a pool of one slot per
+core, up to 16, with instances started on demand. A request takes the first
+instance no callback holds right now, else the next slot round-robin. It
+keeps that instance for its stream context, locking it only while a callback
+runs. Under light load every request lands on one cache-warm instance. A
+broken instance is replaced for the next request.
+
+**Alternatives.**
+- One instance per plugin, locked per callback.
+- A fresh instance per request.
+
+**Trade-off.**
+- Callbacks on the same instance serialize, so two requests that landed on
+  one slot wait on each other's callbacks (never on each other's I/O).
+- Shared data is host-side, so instances agree. In-module globals do not.
+
+**Why (performance).**
+- **Contexts live in instance memory.** A proxy-wasm stream context lives
+  in the instance that created it, so a request cannot move.
+- **The alternatives cost more.** A single instance serializes the node's
+  plugin work. A fresh instance per request costs an instantiation plus
+  `on_vm_start` and `on_configure` each time.
+
+---
+
+## 38. `legion_sign` is a foreign function with two algorithms
+
+**Call.** Signing is `proxy_call_foreign_function("legion_sign", <json>)`,
+with:
+- `hmac-sha256` (`data` or `dataBase64`), returning the MAC.
+- `aws4-hmac-sha256` (`date`, `region`, `service`, `stringToSign`),
+  returning the hex SigV4 signature, with the signing key derived host-side.
+
+Keys are declared on the object under `credentials`, as `{ kv = … }` only.
+Applying the plugin needs `kv:read` on each path.
+
+**Alternatives.**
+- A Legion-specific host import (`legion_sign(...)`).
+- Return the derived SigV4 signing key and let the module HMAC with it.
+
+**Trade-off.** A module can use the key as a signing oracle for anything.
+Two algorithms cover HMAC APIs and AWS, and others need a host change.
+
+**Why (extensibility, security).**
+- **Foreign functions are the ABI's extension point.** Any SDK can call
+  them without a Legion crate.
+- **The derived key would be a credential.** A SigV4 signing key is valid
+  for a whole day, region, and service, so handing it over would give the
+  module exactly what entry 12 forbids.
+
+---
+
+## 39. `dispatch_http_call` reaches only declared targets, judged like the task's own flows
+
+**Call.** A call names one of the object's `targets`. netd sends it to the
+declared scheme and authority with the module's `:path`, after:
+1. the calling allocation's egress chain at connect time
+2. the host guard, dialing the address the guard checked
+
+Each call uses a short-lived client pinned to that address.
+
+**Alternatives.**
+- Let the module name any URL.
+- Skip the egress chain, because the plugin object is operator-written.
+
+**Trade-off.**
+- A target change means re-applying the plugin.
+- A pinned client per call costs a fresh connection, with no pooling.
+
+**Why (security).**
+- **A `usableBy = "jobs"` plugin runs on a job's behalf.** If calls skipped
+  the chain, a plugin would become a way around the job's own egress
+  policy.
+- **Pinning closes a rebinding window.** Resolving twice would let a
+  rebinding name pass the guard and then dial elsewhere.
+- **Calls are rare.** Pooling can come when a measured plugin needs it.
+
+---
+
+## 40. The caller's group travels on the allocation payload
 
 **Call.** `TaskAllocation` gains `task_group` and `task_service`. The worker
 names a mesh caller `<region>:<job>:<group>:<task>` from `task_group`, and the
@@ -820,7 +1136,7 @@ per-heartbeat path that should not grow store reads.
 
 ---
 
-## 30. A host-mode task with an egress chain gets a VIP block
+## 41. A host-mode task with an egress chain gets a VIP block
 
 **Call.** On a Linux node, placement gives a host-mode `exec` or
 `container` allocation whose egress chain is inline or comes from a
@@ -841,7 +1157,7 @@ a second resolver with its own attribution path. The address space holds
 
 ---
 
-## 31. One fetch per heartbeat, and policy bodies are a provider
+## 42. One fetch per heartbeat, and policy bodies are a provider
 
 **Call.** `FetchDatapathMaterial` is one call per heartbeat carrying every
 ref the node wants. The manager resolves a ref in two steps: the
@@ -864,7 +1180,45 @@ user writes, so it stays out of the grammar users see.
 
 ---
 
-## 32. A chain beyond 64 rules or 64 hosts is judged by netd only
+## 43. Applying a plugin re-checks the policies that use it, not the jobs
+
+**Call.** UpsertNetPlugin re-runs every referencing stored policy's checks:
+stages against its chains, its config against the new schema, and its pools.
+It refuses the write if one fails. Jobs already submitted are not
+re-checked. Deleting a plugin that a policy uses is refused; deleting one
+that only jobs use is allowed, and their hops fail with "not on this node".
+
+**Alternatives.** Scan every job config on each plugin write.
+
+**Trade-off.** A plugin update can leave a running job with a config the new
+schema rejects. The module gets that config anyway, and the job's next
+submit is refused.
+
+**Why (simplicity, performance).** Policy objects are few and already
+listed on every write. Job configs are many, and a plugin write would
+become a full scan. Recorded as a known limitation in the public doc.
+
+---
+
+## 44. A plugin cannot change where a request goes
+
+**Call.** A module may rewrite `:path` and any header. Changes to
+`:method`, `:authority`, and `:scheme` are ignored, and the upstream path
+sets `host` from the upstream itself.
+
+**Alternatives.** Apply every pseudo-header change, as Envoy does.
+
+**Trade-off.** No method rewrites and no authority-based routing from a
+plugin.
+
+**Why (security).** The destination and method were judged by the chain's
+rules before any hop ran. Honoring a later change would let a plugin, and so
+a job's own `usableBy = "jobs"` plugin, send a request somewhere its policy
+never judged.
+
+---
+
+## 45. A chain beyond 64 rules or 64 hosts is judged by netd only
 
 **Call.** The kernel holds up to 64 connect-time rules and 64 distinct host
 globs per chain. A chain beyond either is not compiled; the allocation's
@@ -885,7 +1239,7 @@ with CIDRs.
 
 ---
 
-## 33. A policy cannot make a port with its own `tls` the mesh port
+## 46. A policy cannot make a port with its own `tls` the mesh port
 
 **Call.** When a `require` or `default` policy turns `mesh` on and the
 service's port carries its own `tls`, placement leaves that port on its own
@@ -905,7 +1259,7 @@ absolute; then the right shape is a submit-time refusal under `require`.
 
 ---
 
-## 34. Jobspec shapes are validated by serde and Rust, not Nickel contracts
+## 47. Jobspec shapes are validated by serde and Rust, not Nickel contracts
 
 **Call.** S1's "one contract per variant" is implemented as typed serde
 structs with `deny_unknown_fields`, plus a hand-written `Deserialize` for a
@@ -924,7 +1278,7 @@ A second validator in Nickel would have to agree with the Rust one forever.
 
 ---
 
-## 35. Chains refuse unknown fields
+## 48. Chains refuse unknown fields
 
 **Call.** `ChainConfig` is `deny_unknown_fields`, so a chain that still
 carries a removed field (`onError`, `tls`) fails to parse:
@@ -942,7 +1296,7 @@ the worst outcome: the policy reads as if it terminates TLS and does not.
 
 ---
 
-## 36. Removing `log` drops per-upstream access logging
+## 49. Removing `log` drops per-upstream access logging
 
 **Call.** With the `log` handler gone (§6.0), access logging is the chain's
 `accessLog`, which covers every HTTP request of the allocation's chain.
@@ -958,7 +1312,7 @@ on each line.
 
 ---
 
-## 37. `net policy test` answers for `service/allow` only with `--identity`
+## 50. `net policy test` answers for `service/allow` only with `--identity`
 
 **Call.** `TestNetPolicy` runs a mesh service's `callers` check only when the
 request names an identity. Without one it answers as a non-mesh port would.
@@ -976,7 +1330,7 @@ proto comment says when the check applies.
 
 ---
 
-## 38. Kernel denials are read once per heartbeat
+## 51. Kernel denials are read once per heartbeat
 
 **Call.** The worker drains the ring buffer and the counters on each
 heartbeat, in the same blocking step that updates the maps, rather than
@@ -991,3 +1345,86 @@ so the metrics stay exact while some `net.denied` rows are lost.
 **Why (simplicity).** Denials are reported on the heartbeat anyway, so a
 reader task would buffer for the same deadline. One code path, no extra
 task.
+
+---
+
+## 52. Shared data and module metrics carry across revisions on a node
+
+**Call.** A new plugin revision replaces its instances. The per-scope shared
+data and module metrics move to the new entry.
+
+**Alternatives.** Reset them with the instances.
+
+**Trade-off.** A revision that changes its shared-data layout reads the old
+layout's values and must cope.
+
+**Why (ease).** Scenario 1 is a token meter. Resetting every node's counts
+on each plugin update would let an update reset a budget.
+
+---
+
+## 53. Module log lines go to the worker log, rate-limited
+
+**Call.** `proxy_log`, and standard output or error, go to the worker's
+tracing log under target `legion::net_plugin`. Each line carries the
+plugin, the scope, and the context id, at the module's own level. Past 100
+lines per second per plugin, the rest are dropped and counted.
+
+**Alternatives.** Write to each allocation's log directory, next to
+`net-access.log`.
+
+**Trade-off.**
+- A job author reading their own allocation's logs does not see their
+  plugin's lines.
+- A noisy plugin's lines are dropped.
+
+**Why (simplicity).** Instances are pooled per scope, not per allocation
+(entry 37), so a line has no single allocation to go to. The worker log
+already carries the datapath's own lines. The cap stops a per-request log
+call from flooding a node.
+
+---
+
+## 54. Ticks are accepted and never fire; shared queues are unimplemented
+
+**Call.** `set_tick_period` returns `Ok` and never ticks. Shared queues,
+gRPC, and foreign functions other than `legion_sign` return
+`Unimplemented`.
+
+**Alternatives.**
+- Return `Unimplemented` for ticks too.
+- Run a timer per instance.
+
+**Trade-off.** A module that relies on ticks silently never gets one.
+
+**Why (ease).**
+- **The Rust SDK unwraps the tick call.** `Unimplemented` would make any
+  module that sets a tick in `on_vm_start` fail to start.
+- **Timers would be a scheduler.** Running a timer inside the datapath per
+  instance is a background scheduler nobody has asked for.
+
+The public doc says ticks never fire.
+
+---
+
+## 55. Test modules are checked in as built `.wasm`, with their sources
+
+**Call.** `tests/netplugins/` holds:
+- the sources of the conformance module and the documented example
+- `build.sh`
+- the two built modules, which the tests and `net_bench` load
+
+**Alternatives.**
+- Build them in `build.rs` or in CI, with `wasm32-wasip1` as a hard
+  requirement for `cargo test`.
+- Hand-written WAT.
+
+**Trade-off.**
+- About 225 KB of binaries in the tree.
+- A source change without rerunning `build.sh` tests the old module.
+- No CI step checks that the two agree.
+
+**Why (ease).** Every contributor runs `cargo test` without a WASM target.
+SDK-built modules exercise the real proxy-wasm Rust SDK, which WAT would
+not. `configs/netplugins/read-only-free-tier.ncl` pins the example's
+checksum, and a test checks it against the file.

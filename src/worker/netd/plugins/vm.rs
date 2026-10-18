@@ -122,12 +122,31 @@ pub struct CallResponse {
     pub trailers: Pairs,
 }
 
+/// The flow's facts, computed only when a module asks for one: most
+/// requests read none, so none is built up front.
+pub trait PropertySource: Send + Sync {
+    fn property(&self, path: &[&str]) -> Option<Vec<u8>>;
+}
+
+/// A context's [`PropertySource`].
+#[derive(Clone)]
+pub struct Facts(pub Arc<dyn PropertySource>);
+
+impl std::fmt::Debug for Facts {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Facts")
+    }
+}
+
 /// The host side of one stream context.
 #[derive(Debug, Default)]
 pub struct ContextState {
     pub id: u32,
-    /// Properties by path, the segments joined with NUL: the flow's facts,
-    /// plus anything the module set with `set_property`.
+    /// The flow's facts (`legion.*`), read on demand.
+    pub facts: Option<Facts>,
+    /// Properties by path, the segments joined with NUL: the request head
+    /// (`request.*`, `response.code`) and anything the module set with
+    /// `set_property`.
     pub properties: BTreeMap<String, Vec<u8>>,
     pub request_headers: Option<Pairs>,
     pub request_trailers: Option<Pairs>,
@@ -222,6 +241,9 @@ pub struct LogLine {
     pub context: u32,
 }
 
+/// Where a scope's module log lines go.
+pub type LogSink = Arc<dyn Fn(&Scope, &LogLine) + Send + Sync>;
+
 /// What every instance of one (plugin revision, scope, config) shares.
 pub struct Scope {
     pub plugin: String,
@@ -239,7 +261,7 @@ pub struct Scope {
     pub targets: BTreeMap<String, String>,
     /// Root-level properties (`legion.plugin`, `legion.node`, `plugin_name`).
     pub properties: BTreeMap<String, Vec<u8>>,
-    pub log: Arc<dyn Fn(&Scope, &LogLine) + Send + Sync>,
+    pub log: LogSink,
 }
 
 impl std::fmt::Debug for Scope {
@@ -316,12 +338,25 @@ pub struct CallOutcome {
     pub exported: bool,
 }
 
+/// One cached export: the function, how many parameters it takes and which
+/// of them are `i64` (a bit each), and how many results.
+#[derive(Clone, Copy)]
+struct Export {
+    func: wasmi::Func,
+    params: usize,
+    wide: u8,
+    results: usize,
+}
+
 /// One started, configured instance.
 pub struct Vm {
     store: Store<HostState>,
     instance: wasmi::Instance,
     pub abi: AbiVersion,
     next_context: u32,
+    /// Exports by name, with their parameter and result counts, looked up
+    /// once.
+    funcs: HashMap<&'static str, Option<Export>>,
     /// Why the instance may not run again.
     pub broken: Option<String>,
 }
@@ -366,6 +401,7 @@ impl Vm {
             instance,
             abi: compiled.abi,
             next_context: ROOT_CONTEXT + 1,
+            funcs: HashMap::new(),
             broken: None,
         };
         for init in ["_initialize", "_start"] {
@@ -436,7 +472,7 @@ impl Vm {
     /// module did to it.
     pub fn call(
         &mut self,
-        name: &str,
+        name: &'static str,
         args: &[i32],
         ctx: ContextState,
     ) -> (CallOutcome, ContextState) {
@@ -460,7 +496,7 @@ impl Vm {
 
     fn invoke(
         &mut self,
-        name: &str,
+        name: &'static str,
         args: &[i32],
         ctx: Option<ContextState>,
         metered: bool,
@@ -476,7 +512,31 @@ impl Vm {
                 ctx,
             );
         }
-        let Some(func) = self.instance.get_func(&self.store, name) else {
+        let (instance, store) = (&self.instance, &self.store);
+        let cached = self.funcs.entry(name).or_insert_with(|| {
+            instance.get_func(store, name).map(|func| {
+                let ty = func.ty(store);
+                let wide = ty
+                    .params()
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, ty)| **ty == ValType::I64)
+                    .fold(0u8, |mask, (i, _)| mask | (1 << i.min(7)));
+                Export {
+                    func,
+                    params: ty.params().len(),
+                    wide,
+                    results: ty.results().len(),
+                }
+            })
+        });
+        let Some(Export {
+            func,
+            params,
+            wide,
+            results,
+        }) = *cached
+        else {
             return (
                 CallOutcome {
                     result: Ok(0),
@@ -487,24 +547,43 @@ impl Vm {
                 ctx,
             );
         };
-        let ty = func.ty(&self.store);
-        let inputs: Vec<Val> = ty
-            .params()
-            .iter()
-            .enumerate()
-            .map(|(i, ty)| match ty {
-                ValType::I64 => Val::I64(args.get(i).copied().unwrap_or(0) as i64),
-                _ => Val::I32(args.get(i).copied().unwrap_or(0)),
-            })
-            .collect();
-        let mut outputs: Vec<Val> = ty.results().iter().map(|_| Val::I32(0)).collect();
+        let mut inputs = [
+            Val::I32(0),
+            Val::I32(0),
+            Val::I32(0),
+            Val::I32(0),
+            Val::I32(0),
+        ];
+        let inputs: &mut [Val] = if params <= inputs.len() {
+            &mut inputs[..params]
+        } else {
+            return (
+                CallOutcome {
+                    result: Err(format!("{name} takes {params} parameters")),
+                    elapsed: Duration::ZERO,
+                    fuel: 0,
+                    exported: true,
+                },
+                ctx,
+            );
+        };
+        for (i, input) in inputs.iter_mut().enumerate() {
+            let arg = args.get(i).copied().unwrap_or(0);
+            *input = if wide & (1 << i) != 0 {
+                Val::I64(arg as i64)
+            } else {
+                Val::I32(arg)
+            };
+        }
+        let mut outputs = [Val::I32(0)];
+        let outputs: &mut [Val] = &mut outputs[..results.min(1)];
         if metered {
             let fuel = self.store.data().scope.fuel;
             let _ = self.store.set_fuel(fuel);
         }
         self.store.data_mut().ctx = ctx;
         let started = Instant::now();
-        let called = func.call(&mut self.store, &inputs, &mut outputs);
+        let called = func.call(&mut self.store, inputs, outputs);
         let elapsed = started.elapsed();
         let fuel = if metered {
             self.store
@@ -566,9 +645,9 @@ impl Vm {
 }
 
 fn humanize(duration: Duration) -> String {
-    if duration.as_millis() >= 1000 && duration.as_millis() % 1000 == 0 {
+    if duration.as_millis() >= 1000 && duration.as_millis().is_multiple_of(1000) {
         format!("{}s", duration.as_secs())
-    } else if duration.as_micros() % 1000 == 0 {
+    } else if duration.as_micros().is_multiple_of(1000) {
         format!("{}ms", duration.as_millis())
     } else {
         format!("{}µs", duration.as_micros())
@@ -645,7 +724,7 @@ fn give(
     Ok(status::OK)
 }
 
-fn header_map<'a>(ctx: &'a mut ContextState, map_type: i32) -> Option<&'a mut Option<Pairs>> {
+fn header_map(ctx: &mut ContextState, map_type: i32) -> Option<&mut Option<Pairs>> {
     match map_type {
         map::HTTP_REQUEST_HEADERS => Some(&mut ctx.request_headers),
         map::HTTP_REQUEST_TRAILERS => Some(&mut ctx.request_trailers),
@@ -702,8 +781,16 @@ fn read_buffer(state: &HostState, buffer_type: i32) -> Option<Vec<u8>> {
 }
 
 fn property(state: &HostState, key: &str) -> Option<Vec<u8>> {
-    if let Some(value) = state.ctx.as_ref().and_then(|ctx| ctx.properties.get(key)) {
-        return Some(value.clone());
+    if let Some(ctx) = state.ctx.as_ref() {
+        if let Some(value) = ctx.properties.get(key) {
+            return Some(value.clone());
+        }
+        if let Some(Facts(facts)) = ctx.facts.as_ref() {
+            let path: Vec<&str> = key.split('\0').collect();
+            if let Some(value) = facts.property(&path) {
+                return Some(value);
+            }
+        }
     }
     state.scope.properties.get(key).cloned()
 }
@@ -764,9 +851,12 @@ fn host_linker(module: &Module) -> Result<Linker<HostState>, String> {
             Ok(status::OK)
         }
     );
+    // Ticks are accepted and never fire: a module that sets one in
+    // `on_vm_start` still starts (SDKs unwrap this call), and nothing runs on
+    // a timer inside the datapath.
     env!(
         "proxy_set_tick_period_milliseconds",
-        |_caller: HostCaller<'_>, _period: i32| -> i32 { status::UNIMPLEMENTED }
+        |_caller: HostCaller<'_>, _period: i32| -> i32 { status::OK }
     );
     env!("proxy_get_buffer_bytes", |mut caller: HostCaller<'_>,
                                     buffer_type: i32,

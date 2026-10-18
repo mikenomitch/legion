@@ -835,6 +835,16 @@ of worker readiness. Default: disabled.
   flow was handed off), `error` (timeout, bad reply, no endpoint).
 - **`legion_net_handler_seconds`** (histogram): wall-clock time of one `authz`
   webhook call. Cache hits are not observed.
+- **`legion_net_plugin_calls_total{plugin,stage,outcome}`** (counter): WASM
+  [network plugin](network-plugins.md) callbacks by stage (`connect`,
+  `request`, `body`, `response`, `done`) and outcome (`ok`, `error`: a trap,
+  exhausted fuel, a deadline, a memory limit).
+- **`legion_net_plugin_callback_seconds`** (histogram): wall-clock time of
+  one plugin callback.
+- **`legion_net_plugin_metric{plugin,scope,name}`** (gauge): the current value
+  of each metric a plugin module defines (`define_metric`), per scope
+  (`policy`, or `job:<id>` for a job's own reference). At most 64 per scope;
+  plugin authors choose the names, so keep them few.
 - **`legion_worker_heartbeat_duration_seconds`** (histogram): wall-clock
   time of one heartbeat round-trip (status report plus reconcile against the
   manager's reply). In a scale test, use it to show the workers are not the

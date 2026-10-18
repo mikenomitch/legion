@@ -11686,6 +11686,17 @@ export class HeartbeatRequest extends Message<HeartbeatRequest> {
    */
   envelopeResizes: EnvelopeResize[] = [];
 
+  /**
+   * The node datapath's network plugins (docs/network-plugins.md): one
+   * entry per plugin a local allocation references, with its revision,
+   * module state, and health. Replaced wholesale per node on every beat and
+   * kept in memory by the manager for GetNetPluginStatus and
+   * `legion net doctor`. Empty on a node that runs no plugin.
+   *
+   * @generated from field: repeated legion.NetPluginNodeStatus net_plugins = 21;
+   */
+  netPlugins: NetPluginNodeStatus[] = [];
+
   constructor(data?: PartialMessage<HeartbeatRequest>) {
     super();
     proto3.util.initPartial(data, this);
@@ -11714,6 +11725,7 @@ export class HeartbeatRequest extends Message<HeartbeatRequest> {
     { no: 18, name: "exec_keys_version", kind: "scalar", T: 9 /* ScalarType.STRING */ },
     { no: 19, name: "session_report", kind: "message", T: SessionReport, opt: true },
     { no: 20, name: "envelope_resizes", kind: "message", T: EnvelopeResize, repeated: true },
+    { no: 21, name: "net_plugins", kind: "message", T: NetPluginNodeStatus, repeated: true },
   ]);
 
   static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): HeartbeatRequest {
@@ -31083,6 +31095,674 @@ export class DeleteNetPolicyReply extends Message<DeleteNetPolicyReply> {
 }
 
 /**
+ * A stored network plugin object (docs/network-plugins.md).
+ *
+ * @generated from message legion.NetPlugin
+ */
+export class NetPlugin extends Message<NetPlugin> {
+  /**
+   * Unique name; what a `{ plugin = { name = ... } }` hop references.
+   *
+   * @generated from field: string name = 1;
+   */
+  name = "";
+
+  /**
+   * The normalized `NetPluginObject` as JSON: `module`, `stages`,
+   * `usableBy`, `nodePools`, `limits`, `configSchema`, `targets`, and
+   * `credentials` (KV paths only, never values).
+   *
+   * @generated from field: string object_json = 2;
+   */
+  objectJson = "";
+
+  /**
+   * The cluster-wide plugin generation this version was written at. A
+   * revision names one version of one plugin forever, even across a delete
+   * and a re-create; nodes report the revision they run.
+   *
+   * @generated from field: uint64 revision = 3;
+   */
+  revision = protoInt64.zero;
+
+  /**
+   * RFC 3339 timestamps of the first write and of this version.
+   *
+   * @generated from field: string created_at = 4;
+   */
+  createdAt = "";
+
+  /**
+   * @generated from field: string updated_at = 5;
+   */
+  updatedAt = "";
+
+  /**
+   * The stages the module acts at, in pipeline order: `connect`,
+   * `request`, `body`, `response`, `done`.
+   *
+   * @generated from field: repeated string stages = 6;
+   */
+  stages: string[] = [];
+
+  /**
+   * `policies` or `jobs`.
+   *
+   * @generated from field: string usable_by = 7;
+   */
+  usableBy = "";
+
+  /**
+   * The module's `sha256:` checksum.
+   *
+   * @generated from field: string module_checksum = 8;
+   */
+  moduleChecksum = "";
+
+  /**
+   * Stored policy objects whose chains reference this plugin. Filled by
+   * GetNetPlugin and GetNetPluginStatus; empty in list replies.
+   *
+   * @generated from field: repeated string referenced_by = 9;
+   */
+  referencedBy: string[] = [];
+
+  constructor(data?: PartialMessage<NetPlugin>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.NetPlugin";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "name", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 2, name: "object_json", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 3, name: "revision", kind: "scalar", T: 4 /* ScalarType.UINT64 */ },
+    { no: 4, name: "created_at", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 5, name: "updated_at", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 6, name: "stages", kind: "scalar", T: 9 /* ScalarType.STRING */, repeated: true },
+    { no: 7, name: "usable_by", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 8, name: "module_checksum", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 9, name: "referenced_by", kind: "scalar", T: 9 /* ScalarType.STRING */, repeated: true },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): NetPlugin {
+    return new NetPlugin().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): NetPlugin {
+    return new NetPlugin().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): NetPlugin {
+    return new NetPlugin().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: NetPlugin | PlainMessage<NetPlugin> | undefined, b: NetPlugin | PlainMessage<NetPlugin> | undefined): boolean {
+    return proto3.util.equals(NetPlugin, a, b);
+  }
+}
+
+/**
+ * Request payload for UpsertNetPlugin.
+ *
+ * @generated from message legion.UpsertNetPluginRequest
+ */
+export class UpsertNetPluginRequest extends Message<UpsertNetPluginRequest> {
+  /**
+   * A `NetPluginObject` as JSON, exactly as `legion net plugin apply -f`
+   * reads it (Nickel evaluated to JSON). Validated on write.
+   *
+   * @generated from field: string object_json = 1;
+   */
+  objectJson = "";
+
+  /**
+   * When set, validate (including every referencing policy's config against
+   * the new schema) and report what would be stored, but write nothing.
+   *
+   * @generated from field: bool dry_run = 2;
+   */
+  dryRun = false;
+
+  /**
+   * Optional: retries with the same key (from the same caller) return the
+   * first call's stored plugin with `deduplicated = true` instead of writing
+   * a new revision. Ignored on dry runs.
+   *
+   * @generated from field: optional string idempotency_key = 3;
+   */
+  idempotencyKey?: string;
+
+  constructor(data?: PartialMessage<UpsertNetPluginRequest>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.UpsertNetPluginRequest";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "object_json", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 2, name: "dry_run", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
+    { no: 3, name: "idempotency_key", kind: "scalar", T: 9 /* ScalarType.STRING */, opt: true },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): UpsertNetPluginRequest {
+    return new UpsertNetPluginRequest().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): UpsertNetPluginRequest {
+    return new UpsertNetPluginRequest().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): UpsertNetPluginRequest {
+    return new UpsertNetPluginRequest().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: UpsertNetPluginRequest | PlainMessage<UpsertNetPluginRequest> | undefined, b: UpsertNetPluginRequest | PlainMessage<UpsertNetPluginRequest> | undefined): boolean {
+    return proto3.util.equals(UpsertNetPluginRequest, a, b);
+  }
+}
+
+/**
+ * Reply payload for UpsertNetPlugin.
+ *
+ * @generated from message legion.UpsertNetPluginReply
+ */
+export class UpsertNetPluginReply extends Message<UpsertNetPluginReply> {
+  /**
+   * The stored (normalized) plugin. On a dry run, what would be stored,
+   * with `revision` 0.
+   *
+   * @generated from field: legion.NetPlugin plugin = 1;
+   */
+  plugin?: NetPlugin;
+
+  /**
+   * True when `idempotency_key` matched an earlier call; nothing was
+   * written and `plugin` is that call's result as currently stored.
+   *
+   * @generated from field: bool deduplicated = 2;
+   */
+  deduplicated = false;
+
+  constructor(data?: PartialMessage<UpsertNetPluginReply>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.UpsertNetPluginReply";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "plugin", kind: "message", T: NetPlugin },
+    { no: 2, name: "deduplicated", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): UpsertNetPluginReply {
+    return new UpsertNetPluginReply().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): UpsertNetPluginReply {
+    return new UpsertNetPluginReply().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): UpsertNetPluginReply {
+    return new UpsertNetPluginReply().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: UpsertNetPluginReply | PlainMessage<UpsertNetPluginReply> | undefined, b: UpsertNetPluginReply | PlainMessage<UpsertNetPluginReply> | undefined): boolean {
+    return proto3.util.equals(UpsertNetPluginReply, a, b);
+  }
+}
+
+/**
+ * Request payload for GetNetPlugin.
+ *
+ * @generated from message legion.GetNetPluginRequest
+ */
+export class GetNetPluginRequest extends Message<GetNetPluginRequest> {
+  /**
+   * @generated from field: string name = 1;
+   */
+  name = "";
+
+  constructor(data?: PartialMessage<GetNetPluginRequest>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.GetNetPluginRequest";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "name", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): GetNetPluginRequest {
+    return new GetNetPluginRequest().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): GetNetPluginRequest {
+    return new GetNetPluginRequest().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): GetNetPluginRequest {
+    return new GetNetPluginRequest().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: GetNetPluginRequest | PlainMessage<GetNetPluginRequest> | undefined, b: GetNetPluginRequest | PlainMessage<GetNetPluginRequest> | undefined): boolean {
+    return proto3.util.equals(GetNetPluginRequest, a, b);
+  }
+}
+
+/**
+ * Reply payload for GetNetPlugin.
+ *
+ * @generated from message legion.GetNetPluginReply
+ */
+export class GetNetPluginReply extends Message<GetNetPluginReply> {
+  /**
+   * @generated from field: legion.NetPlugin plugin = 1;
+   */
+  plugin?: NetPlugin;
+
+  constructor(data?: PartialMessage<GetNetPluginReply>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.GetNetPluginReply";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "plugin", kind: "message", T: NetPlugin },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): GetNetPluginReply {
+    return new GetNetPluginReply().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): GetNetPluginReply {
+    return new GetNetPluginReply().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): GetNetPluginReply {
+    return new GetNetPluginReply().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: GetNetPluginReply | PlainMessage<GetNetPluginReply> | undefined, b: GetNetPluginReply | PlainMessage<GetNetPluginReply> | undefined): boolean {
+    return proto3.util.equals(GetNetPluginReply, a, b);
+  }
+}
+
+/**
+ * Request payload for ListNetPlugins.
+ *
+ * @generated from message legion.ListNetPluginsRequest
+ */
+export class ListNetPluginsRequest extends Message<ListNetPluginsRequest> {
+  constructor(data?: PartialMessage<ListNetPluginsRequest>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.ListNetPluginsRequest";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): ListNetPluginsRequest {
+    return new ListNetPluginsRequest().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): ListNetPluginsRequest {
+    return new ListNetPluginsRequest().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): ListNetPluginsRequest {
+    return new ListNetPluginsRequest().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: ListNetPluginsRequest | PlainMessage<ListNetPluginsRequest> | undefined, b: ListNetPluginsRequest | PlainMessage<ListNetPluginsRequest> | undefined): boolean {
+    return proto3.util.equals(ListNetPluginsRequest, a, b);
+  }
+}
+
+/**
+ * Reply payload for ListNetPlugins.
+ *
+ * @generated from message legion.ListNetPluginsReply
+ */
+export class ListNetPluginsReply extends Message<ListNetPluginsReply> {
+  /**
+   * @generated from field: repeated legion.NetPlugin plugins = 1;
+   */
+  plugins: NetPlugin[] = [];
+
+  /**
+   * Monotonic generation of the plugin set; changes on every write.
+   *
+   * @generated from field: uint64 generation = 2;
+   */
+  generation = protoInt64.zero;
+
+  constructor(data?: PartialMessage<ListNetPluginsReply>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.ListNetPluginsReply";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "plugins", kind: "message", T: NetPlugin, repeated: true },
+    { no: 2, name: "generation", kind: "scalar", T: 4 /* ScalarType.UINT64 */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): ListNetPluginsReply {
+    return new ListNetPluginsReply().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): ListNetPluginsReply {
+    return new ListNetPluginsReply().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): ListNetPluginsReply {
+    return new ListNetPluginsReply().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: ListNetPluginsReply | PlainMessage<ListNetPluginsReply> | undefined, b: ListNetPluginsReply | PlainMessage<ListNetPluginsReply> | undefined): boolean {
+    return proto3.util.equals(ListNetPluginsReply, a, b);
+  }
+}
+
+/**
+ * Request payload for DeleteNetPlugin.
+ *
+ * @generated from message legion.DeleteNetPluginRequest
+ */
+export class DeleteNetPluginRequest extends Message<DeleteNetPluginRequest> {
+  /**
+   * @generated from field: string name = 1;
+   */
+  name = "";
+
+  constructor(data?: PartialMessage<DeleteNetPluginRequest>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.DeleteNetPluginRequest";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "name", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): DeleteNetPluginRequest {
+    return new DeleteNetPluginRequest().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): DeleteNetPluginRequest {
+    return new DeleteNetPluginRequest().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): DeleteNetPluginRequest {
+    return new DeleteNetPluginRequest().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: DeleteNetPluginRequest | PlainMessage<DeleteNetPluginRequest> | undefined, b: DeleteNetPluginRequest | PlainMessage<DeleteNetPluginRequest> | undefined): boolean {
+    return proto3.util.equals(DeleteNetPluginRequest, a, b);
+  }
+}
+
+/**
+ * Reply payload for DeleteNetPlugin.
+ *
+ * @generated from message legion.DeleteNetPluginReply
+ */
+export class DeleteNetPluginReply extends Message<DeleteNetPluginReply> {
+  constructor(data?: PartialMessage<DeleteNetPluginReply>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.DeleteNetPluginReply";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): DeleteNetPluginReply {
+    return new DeleteNetPluginReply().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): DeleteNetPluginReply {
+    return new DeleteNetPluginReply().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): DeleteNetPluginReply {
+    return new DeleteNetPluginReply().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: DeleteNetPluginReply | PlainMessage<DeleteNetPluginReply> | undefined, b: DeleteNetPluginReply | PlainMessage<DeleteNetPluginReply> | undefined): boolean {
+    return proto3.util.equals(DeleteNetPluginReply, a, b);
+  }
+}
+
+/**
+ * Request payload for GetNetPluginStatus.
+ *
+ * @generated from message legion.GetNetPluginStatusRequest
+ */
+export class GetNetPluginStatusRequest extends Message<GetNetPluginStatusRequest> {
+  /**
+   * @generated from field: string name = 1;
+   */
+  name = "";
+
+  constructor(data?: PartialMessage<GetNetPluginStatusRequest>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.GetNetPluginStatusRequest";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "name", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): GetNetPluginStatusRequest {
+    return new GetNetPluginStatusRequest().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): GetNetPluginStatusRequest {
+    return new GetNetPluginStatusRequest().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): GetNetPluginStatusRequest {
+    return new GetNetPluginStatusRequest().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: GetNetPluginStatusRequest | PlainMessage<GetNetPluginStatusRequest> | undefined, b: GetNetPluginStatusRequest | PlainMessage<GetNetPluginStatusRequest> | undefined): boolean {
+    return proto3.util.equals(GetNetPluginStatusRequest, a, b);
+  }
+}
+
+/**
+ * Reply payload for GetNetPluginStatus.
+ *
+ * @generated from message legion.GetNetPluginStatusReply
+ */
+export class GetNetPluginStatusReply extends Message<GetNetPluginStatusReply> {
+  /**
+   * The stored object, with `referenced_by` filled.
+   *
+   * @generated from field: legion.NetPlugin plugin = 1;
+   */
+  plugin?: NetPlugin;
+
+  /**
+   * One entry per node that holds the plugin, from its last heartbeat. A
+   * plugin no running allocation uses is on no node.
+   *
+   * @generated from field: repeated legion.NetPluginNodeStatus nodes = 2;
+   */
+  nodes: NetPluginNodeStatus[] = [];
+
+  constructor(data?: PartialMessage<GetNetPluginStatusReply>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.GetNetPluginStatusReply";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "plugin", kind: "message", T: NetPlugin },
+    { no: 2, name: "nodes", kind: "message", T: NetPluginNodeStatus, repeated: true },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): GetNetPluginStatusReply {
+    return new GetNetPluginStatusReply().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): GetNetPluginStatusReply {
+    return new GetNetPluginStatusReply().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): GetNetPluginStatusReply {
+    return new GetNetPluginStatusReply().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: GetNetPluginStatusReply | PlainMessage<GetNetPluginStatusReply> | undefined, b: GetNetPluginStatusReply | PlainMessage<GetNetPluginStatusReply> | undefined): boolean {
+    return proto3.util.equals(GetNetPluginStatusReply, a, b);
+  }
+}
+
+/**
+ * One node's view of one plugin, reported on every heartbeat
+ * (`HeartbeatRequest.net_plugins`) and read back by GetNetPluginStatus,
+ * `legion net plugin status`, and `legion net doctor`.
+ *
+ * @generated from message legion.NetPluginNodeStatus
+ */
+export class NetPluginNodeStatus extends Message<NetPluginNodeStatus> {
+  /**
+   * The reporting node. Empty on the heartbeat (the node is the caller);
+   * filled by the manager in GetNetPluginStatus.
+   *
+   * @generated from field: string node_id = 1;
+   */
+  nodeId = "";
+
+  /**
+   * The plugin's name.
+   *
+   * @generated from field: string plugin = 2;
+   */
+  plugin = "";
+
+  /**
+   * The revision the node holds; 0 before the object reached it.
+   *
+   * @generated from field: uint64 revision = 3;
+   */
+  revision = protoInt64.zero;
+
+  /**
+   * The module checksum the node runs (`sha256:<hex>`).
+   *
+   * @generated from field: string module_checksum = 4;
+   */
+  moduleChecksum = "";
+
+  /**
+   * `fetching` (the object arrived, the module is being fetched or
+   * compiled), `ready`, or `failed` (see `error`).
+   *
+   * @generated from field: string state = 5;
+   */
+  state = "";
+
+  /**
+   * Why the module is not ready: the fetch, checksum, compile, or
+   * instantiation error. A hop whose plugin is not ready fails with this
+   * reason and follows its `onError`.
+   *
+   * @generated from field: string error = 6;
+   */
+  error = "";
+
+  /**
+   * Callbacks run and callbacks that failed (trap, fuel or deadline
+   * exhausted, memory limit) since the worker started.
+   *
+   * @generated from field: uint64 calls = 7;
+   */
+  calls = protoInt64.zero;
+
+  /**
+   * @generated from field: uint64 errors = 8;
+   */
+  errors = protoInt64.zero;
+
+  /**
+   * The last callback failure, if any.
+   *
+   * @generated from field: string last_error = 9;
+   */
+  lastError = "";
+
+  /**
+   * 99th percentile callback time over the last 1024 callbacks, in
+   * microseconds.
+   *
+   * @generated from field: uint64 p99_micros = 10;
+   */
+  p99Micros = protoInt64.zero;
+
+  /**
+   * Live module instances on the node: one per (scope, config) the plugin
+   * runs under, times the instances its concurrency needed.
+   *
+   * @generated from field: uint64 instances = 11;
+   */
+  instances = protoInt64.zero;
+
+  constructor(data?: PartialMessage<NetPluginNodeStatus>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.NetPluginNodeStatus";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "node_id", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 2, name: "plugin", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 3, name: "revision", kind: "scalar", T: 4 /* ScalarType.UINT64 */ },
+    { no: 4, name: "module_checksum", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 5, name: "state", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 6, name: "error", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 7, name: "calls", kind: "scalar", T: 4 /* ScalarType.UINT64 */ },
+    { no: 8, name: "errors", kind: "scalar", T: 4 /* ScalarType.UINT64 */ },
+    { no: 9, name: "last_error", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 10, name: "p99_micros", kind: "scalar", T: 4 /* ScalarType.UINT64 */ },
+    { no: 11, name: "instances", kind: "scalar", T: 4 /* ScalarType.UINT64 */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): NetPluginNodeStatus {
+    return new NetPluginNodeStatus().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): NetPluginNodeStatus {
+    return new NetPluginNodeStatus().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): NetPluginNodeStatus {
+    return new NetPluginNodeStatus().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: NetPluginNodeStatus | PlainMessage<NetPluginNodeStatus> | undefined, b: NetPluginNodeStatus | PlainMessage<NetPluginNodeStatus> | undefined): boolean {
+    return proto3.util.equals(NetPluginNodeStatus, a, b);
+  }
+}
+
+/**
  * Request payload for ShowNetPolicy.
  *
  * @generated from message legion.ShowNetPolicyRequest
@@ -31913,7 +32593,7 @@ export class NetHandlerStatus extends Message<NetHandlerStatus> {
   source = "";
 
   /**
-   * `authz` or `proxy`.
+   * The handler kind: `authz`, `proxy`, `dlp`, or `plugin`.
    *
    * @generated from field: string handler = 2;
    */

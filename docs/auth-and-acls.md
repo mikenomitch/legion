@@ -119,7 +119,7 @@ reports `aclEnabled: false`.
 | `template` | job templates | list/inspect | publish versions, delete (scope with `templates`) |
 | `scale` | task count overrides ([Scaling Jobs](autoscaling.md)) | scale status | `job scale` / reset (scope by job name). Separate from `job:write`, so a principal can resize without redeploy rights. |
 | `boot` | boot tickets ([Edge Boot](edge-boot.md)) | list outstanding tickets | mint a ticket (scope by job name). Separate from `job:write` for the same reason as `scale`: a platform's ticket minter can authorize individual starts without the right to redeploy the fleet. |
-| `net` | network policy objects ([Network Handlers](network-handlers.md)) | list policies, show or test a job's effective policy (scope by job name) | apply or delete a policy. Scope with `pools`, which is matched against the policy's own `selector.nodePools`, so a pool's admin can set posture for their pool without cluster-wide write. |
+| `net` | network policy and plugin objects ([Network Handlers](network-handlers.md), [Network Plugins](network-plugins.md)) | list policies, show or test a job's effective policy (scope by job name); list, describe, and read the status of plugins | apply or delete a policy. Scope with `pools`, which is matched against the policy's own `selector.nodePools`, so a pool's admin can set posture for their pool without cluster-wide write. Apply or delete a plugin: a `usableBy = "policies"` plugin's `nodePools` scope it the same way; a cluster-wide one, or any `usableBy = "jobs"` plugin, needs unscoped write. |
 | `snapshot` | instance snapshots ([Suspend and Resume](suspend-and-resume.md)) | list, inspect, warm a published one onto nodes, restore an instance from one, and create instances from one (restore and create also need `job:write`) | create (including `--publish`), delete, and name snapshots, suspend with a memory checkpoint, and fork (fork also needs `job:write`) (scope by job name and namespace) |
 
 Actions are `read` and `write`. `write` does not imply `read`, so grant both.
@@ -133,7 +133,9 @@ store, including ACL metadata. What it cannot read:
   datapath ([KV references in a job](#kv-references-in-a-job)): a port's
   `tls.cert` or `tls.clients.ca`, an upstream's `ca`, or an upstream
   credential among them
-  ([Certificates and CAs from KV](network-handlers.md#certificates-and-cas-from-kv)).
+  ([Certificates and CAs from KV](network-handlers.md#certificates-and-cas-from-kv)),
+  and a network plugin object that names a signing key under `credentials`
+  ([Network Plugins](network-plugins.md#signing-without-the-key)).
 - Private keys, password hashes, and recorded replies.
   `signing_key.private_key_pem` (the workload-identity and boot-ticket
   signing keys), `net_mesh_ca.key_pem` (the built-in cluster CA key),

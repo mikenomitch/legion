@@ -188,10 +188,10 @@ pub fn model(compiled: &Compiled, ip: IpAddr, port: u16, learned: Option<u64>) -
         if rule.flags & abi::R_PORT != 0 && rule.port != abi::port_ne(port) {
             continue;
         }
-        if rule.flags & abi::R_CIDR != 0 {
-            if rule.family != family || !prefix_match(&rule.addr, &words, rule.prefix, family) {
-                continue;
-            }
+        if rule.flags & abi::R_CIDR != 0
+            && (rule.family != family || !prefix_match(&rule.addr, &words, rule.prefix, family))
+        {
+            continue;
         }
         if rule.flags & abi::R_HOST != 0 {
             let Some(bits) = learned else {

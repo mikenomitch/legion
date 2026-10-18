@@ -155,6 +155,12 @@ where
                         continue;
                     }
                 };
+                // A proxy forwards the application's writes as they come;
+                // Nagle on our side would hold a streamed response's small
+                // trailing writes until the client's delayed ACK.
+                if let Stream::Tcp(tcp) = &stream {
+                    let _ = tcp.set_nodelay(true);
+                }
                 tokio::spawn(handle(stream, peer));
             }
         }

@@ -270,7 +270,7 @@ impl NetPluginObject {
         if let Some(memory) = self.limits.memory.as_ref() {
             let bytes =
                 parse_bytes(memory).map_err(|err| anyhow!("{what}.limits.memory: {err}"))?;
-            if bytes < 64 * 1024 || bytes > MAX_PLUGIN_MEMORY {
+            if !(64 * 1024..=MAX_PLUGIN_MEMORY).contains(&bytes) {
                 bail!("{what}.limits.memory must be between 64Ki and 256Mi");
             }
         } else {
@@ -553,6 +553,34 @@ mod netplugin_test {
                 "properties": { "budget": { "type": "integer" } },
             },
         })
+    }
+
+    /// Every plugin object shipped under `configs/netplugins/` evaluates and
+    /// passes the validation `legion net plugin apply` runs, and its checksum
+    /// is the module the tests build.
+    #[test]
+    fn shipped_plugin_objects_validate_test() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let mut seen = 0;
+        for entry in std::fs::read_dir(root.join("configs/netplugins")).unwrap() {
+            let path = entry.unwrap().path();
+            if path.extension().and_then(|ext| ext.to_str()) != Some("ncl") {
+                continue;
+            }
+            let raw = crate::config_lang::eval_file(&path).unwrap();
+            let mut object: NetPluginObject = serde_json::from_str(&raw)
+                .unwrap_or_else(|err| panic!("{}: {err}", path.display()));
+            object
+                .normalize_and_validate()
+                .unwrap_or_else(|err| panic!("{}: {err}", path.display()));
+            let module = root.join(format!("tests/netplugins/{}.wasm", object.name));
+            if let Ok(bytes) = std::fs::read(&module) {
+                crate::worker::netd::plugins::verify_checksum(&bytes, &object.module.checksum)
+                    .unwrap_or_else(|err| panic!("{}: {err}", path.display()));
+            }
+            seen += 1;
+        }
+        assert!(seen >= 1);
     }
 
     #[test]

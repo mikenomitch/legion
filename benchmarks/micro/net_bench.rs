@@ -15,7 +15,10 @@
 //!   `l4_cpu`: CPU-seconds per GiB moved, printed (not a Criterion group),
 //!   because CPU time per byte survives a busy host and wall clock doesn't.
 //! - `http_rr`: HTTP/1.1 GETs on one kept-open client connection, through
-//!   HTTP mode (`connect.upstreams[].http`).
+//!   HTTP mode (`connect.upstreams[].http`), and through HTTP mode with a
+//!   no-op WASM plugin (`tests/netplugins/conformance.wasm`, mode `noop`) at
+//!   the `request` stage, and at `request`, `response`, and `done` (mesh
+//!   interfaces plan §6.B; the B1 acceptance number).
 //! - `slow_endpoint`: three backends, one of them 2 ms slower. Mean
 //!   per-request latency under each balancing strategy this build has.
 //! - `balancer_pick`: the cost of one pick across 16 endpoints.
@@ -179,6 +182,54 @@ async fn forwarder(backends: &[String], balance: &str, http: bool) -> u16 {
     port
 }
 
+/// An HTTP-mode forwarder whose upstream runs the no-op conformance plugin
+/// at `stages`.
+async fn plugin_forwarder(backend: &str, stages: &[&str]) -> (u16, &'static UpstreamForwarder) {
+    let forwarder: &'static UpstreamForwarder = Box::leak(Box::new(UpstreamForwarder::new()));
+    let mut object: legion::structs::netplugin::NetPluginObject =
+        serde_json::from_value(serde_json::json!({
+            "name": "noop",
+            "module": { "source": "file:///unused", "checksum": format!("sha256:{}", "0".repeat(64)) },
+            "stages": stages,
+            "usableBy": "jobs",
+        }))
+        .unwrap();
+    object.normalize_and_validate().unwrap();
+    let module = std::fs::read(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/netplugins/conformance.wasm"
+    ))
+    .unwrap();
+    forwarder
+        .context()
+        .plugins()
+        .install_compiled(object, 1, &module)
+        .unwrap();
+    let hop: legion::structs::hops::HopConfig = serde_json::from_value(serde_json::json!({
+        "plugin": { "name": "noop", "config": { "mode": "noop" } }
+    }))
+    .unwrap();
+    let port = free_port().await;
+    let spec = UpstreamSpec {
+        allocation_id: 1,
+        service: "bench".into(),
+        local_port: Some(port),
+        http_protocol: true,
+        balance: "round_robin".into(),
+        to: None,
+        http: Some(UpstreamHttpConfig::default()),
+        handlers: vec![hop],
+        credentials: Vec::new(),
+        ca: None,
+        vip: None,
+        canonical_port: None,
+        attachment: legion::worker::netd::attach::Attachment::Host,
+    };
+    forwarder.sync(std::slice::from_ref(&spec)).await;
+    forwarder.set_endpoints(1, "bench", vec![endpoint(backend, 1)]);
+    (port, forwarder)
+}
+
 async fn connect(port: u16) -> TcpStream {
     let stream = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
     stream.set_nodelay(true).unwrap();
@@ -339,21 +390,47 @@ fn l4(c: &mut Criterion) {
 
 fn http(c: &mut Criterion) {
     let rt = runtime();
-    let (direct, via) = rt.block_on(async {
+    let (direct, via, inert, request_plugin, all_plugin) = rt.block_on(async {
         let backend = http_backend(Duration::ZERO).await;
         let port = forwarder(std::slice::from_ref(&backend), "round_robin", true).await;
+        // A plugin with no HTTP stage: the exchange runs, no callback does.
+        let inert = plugin_forwarder(&backend, &["connect"]).await;
+        let request_plugin = plugin_forwarder(&backend, &["request"]).await;
+        let all_plugin = plugin_forwarder(&backend, &["request", "response", "done"]).await;
         let direct: u16 = backend.rsplit(':').next().unwrap().parse().unwrap();
-        (direct, port)
+        (direct, port, inert, request_plugin, all_plugin)
     });
     let mut group = c.benchmark_group("http_rr");
     group.measurement_time(Duration::from_secs(4));
-    for (name, port) in [("direct", direct), ("http_mode", via)] {
+    for (name, port) in [
+        ("direct", direct),
+        ("http_mode", via),
+        ("http_mode_plugin_without_http_stages", inert.0),
+        ("http_mode_noop_plugin_request", request_plugin.0),
+        ("http_mode_noop_plugin_all_stages", all_plugin.0),
+    ] {
         group.bench_function(name, |b| {
             let mut sender = rt.block_on(http_client(port));
             b.iter(|| rt.block_on(http_get(&mut sender)));
         });
     }
     group.finish();
+    // What the plugin's callbacks cost on the real path, from its stats.
+    for (name, (_, forwarder)) in [("request", request_plugin), ("all_stages", all_plugin)] {
+        for row in forwarder.context().plugins().report() {
+            let entry = forwarder.context().plugins().entry(&row.plugin).unwrap();
+            let micros = entry
+                .stats
+                .micros
+                .load(std::sync::atomic::Ordering::Relaxed);
+            println!(
+                "http_rr/plugin_{name:<12} {} stage callbacks, mean {:.2} µs, p99 {} µs",
+                row.calls,
+                micros as f64 / row.calls.max(1) as f64,
+                row.p99_micros
+            );
+        }
+    }
 }
 
 /// Mean latency of `requests` sequential requests through a forwarder whose
@@ -424,7 +501,121 @@ fn balancer_pick(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, l4, http, slow_endpoint, balancer_pick);
+/// The plugin host in-process, no network: one no-op callback on a live
+/// context, a context's whole life (create, `on_done`, `on_delete`), and a
+/// request-stage exchange end to end. Tells the host's own cost from the
+/// HTTP path's in `http_rr`.
+fn plugin_exchange(c: &mut Criterion) {
+    use legion::worker::netd::handlers::{HopFacts, Pipeline, RequestHead};
+    let rt = runtime();
+    let context = std::sync::Arc::new(legion::worker::forwarder::ForwarderContext::new(
+        std::sync::Arc::new(legion::worker::netd::NetPolicyCache::new()),
+        std::sync::Arc::new(legion::worker::netd::Denials::new()),
+    ));
+    let mut object: legion::structs::netplugin::NetPluginObject =
+        serde_json::from_value(serde_json::json!({
+            "name": "noop",
+            "module": { "source": "file:///unused", "checksum": format!("sha256:{}", "0".repeat(64)) },
+            "stages": ["request"],
+        }))
+        .unwrap();
+    object.normalize_and_validate().unwrap();
+    let module = std::fs::read(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/netplugins/conformance.wasm"
+    ))
+    .unwrap();
+    context
+        .plugins()
+        .install_compiled(object, 1, &module)
+        .unwrap();
+    let reference = legion::structs::netplugin::PluginConfig {
+        name: "noop".into(),
+        config: Some(serde_json::json!({ "mode": "noop" })),
+    };
+    let (_, pool) = context.plugins().pool(&reference, "policy").unwrap();
+    let slot = pool.pick().unwrap();
+    let mut group = c.benchmark_group("plugin_exchange");
+    group.measurement_time(Duration::from_secs(3));
+    {
+        let mut vm = slot.vm.lock().unwrap();
+        let mut ctx = Some(vm.new_context().unwrap());
+        group.bench_function("vm_request_headers_callback", |b| {
+            b.iter(|| {
+                let args = vm.headers_args(ctx.as_ref().unwrap().id, 0, true);
+                let (outcome, back) =
+                    vm.call("proxy_on_request_headers", &args, ctx.take().unwrap());
+                assert!(outcome.result.is_ok());
+                ctx = Some(back);
+            })
+        });
+        group.bench_function("vm_context_lifecycle", |b| {
+            b.iter(|| {
+                let fresh = vm.new_context().unwrap();
+                let id = fresh.id as i32;
+                let (_, fresh) = vm.call("proxy_on_done", &[id], fresh);
+                let _ = vm.call("proxy_on_delete", &[id], fresh);
+            })
+        });
+    }
+    let hop: legion::structs::hops::HopConfig = serde_json::from_value(serde_json::json!({
+        "plugin": { "name": "noop", "config": { "mode": "noop" } }
+    }))
+    .unwrap();
+    let chain = legion::structs::netpolicy::EffectiveChain {
+        protocol: "http".into(),
+        policy: "allow".into(),
+        access_log: false,
+        callers: None,
+        rules: Vec::new(),
+        handlers: vec![legion::structs::netpolicy::EffectiveHandler {
+            handler: hop,
+            source: "policy/bench#0".into(),
+        }],
+    };
+    let pipeline = std::sync::Arc::new(Pipeline::compile(Some(&chain), None, &[]));
+    let facts = HopFacts {
+        allocation_id: 1,
+        direction: "egress",
+        protocol: "http",
+        destination: "bench:80",
+        host: Some("bench"),
+        port: 80,
+        ..Default::default()
+    };
+    let headers = vec![
+        ("host".to_string(), "bench".to_string()),
+        ("accept".to_string(), "*/*".to_string()),
+    ];
+    group.bench_function("exchange_request_stage", |b| {
+        b.iter(|| {
+            rt.block_on(async {
+                let mut exchange = pipeline.exchange(&context, &facts);
+                let mut head = RequestHead {
+                    method: "GET".into(),
+                    path: "/".into(),
+                    authority: "bench".into(),
+                    scheme: "http".into(),
+                    headers: headers.clone(),
+                    end_of_stream: true,
+                    changed: false,
+                };
+                let _ = exchange.request(&facts, &mut head).await;
+                drop(exchange);
+            })
+        })
+    });
+    group.finish();
+}
+
+criterion_group!(
+    benches,
+    l4,
+    http,
+    slow_endpoint,
+    balancer_pick,
+    plugin_exchange
+);
 
 fn main() {
     if let Ok(spec) = std::env::var(kernel::CHILD_ENV) {

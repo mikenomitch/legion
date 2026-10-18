@@ -623,8 +623,19 @@ impl Exchange {
     pub async fn respond(mut self, response: hyper::Response<HopBody>) -> hyper::Response<HopBody> {
         if !self.states.iter().flatten().any(|s| s.reads_response()) {
             self.status = response.status().as_u16();
-            self.finish();
-            return response;
+            if self.states.iter().all(Option::is_none) {
+                return response;
+            }
+            // Stateful hops still end their exchange (a plugin's `on_done`),
+            // after the response is on its way, not before.
+            let (parts, body) = response.into_parts();
+            return hyper::Response::from_parts(
+                parts,
+                http_body_util::BodyExt::boxed(DoneOnEnd {
+                    inner: body,
+                    exchange: Some(std::sync::Mutex::new(self)),
+                }),
+            );
         }
         let (mut parts, body) = response.into_parts();
         let mut head = ResponseHead {
@@ -688,7 +699,17 @@ impl Exchange {
             // A hop may change the body's length.
             parts.headers.remove(hyper::header::CONTENT_LENGTH);
         }
-        hyper::Response::from_parts(parts, streamed(self, body, reads_body))
+        let body = if reads_body {
+            streamed(self, body)
+        } else {
+            // Only `done` waits on the body: run it when the body ends,
+            // with no task or channel in the way.
+            http_body_util::BodyExt::boxed(DoneOnEnd {
+                inner: body,
+                exchange: Some(std::sync::Mutex::new(self)),
+            })
+        };
+        hyper::Response::from_parts(parts, body)
     }
 
     /// Run `done` once.
@@ -710,79 +731,14 @@ impl Drop for Exchange {
     }
 }
 
-/// The response body, passed through the hops that read it; `done` runs
-/// when it ends. The exchange moves into the task that pumps it.
-fn streamed(mut exchange: Exchange, mut body: HopBody, reads_body: bool) -> HopBody {
-    use http_body_util::BodyExt;
-    let (tx, rx) =
-        tokio::sync::mpsc::channel::<Result<hyper::body::Frame<bytes::Bytes>, BoxError>>(8);
-    tokio::spawn(async move {
-        loop {
-            let frame = body.frame().await;
-            let (chunk, end, other) = match frame {
-                Some(Ok(frame)) => match frame.into_data() {
-                    Ok(data) => (data, false, None),
-                    Err(frame) => (bytes::Bytes::new(), false, Some(frame)),
-                },
-                Some(Err(err)) => {
-                    let _ = tx.send(Err(err)).await;
-                    break;
-                }
-                None => (bytes::Bytes::new(), true, None),
-            };
-            if let Some(frame) = other {
-                // Trailers: end of the data, then the trailers as they are.
-                if reads_body && !pump(&mut exchange, &tx, bytes::Bytes::new(), true).await {
-                    break;
-                }
-                let _ = tx.send(Ok(frame)).await;
-                continue;
-            }
-            if reads_body {
-                if !pump(&mut exchange, &tx, chunk, end).await {
-                    break;
-                }
-            } else if !chunk.is_empty()
-                && tx.send(Ok(hyper::body::Frame::data(chunk))).await.is_err()
-            {
-                break;
-            }
-            if end {
-                break;
-            }
-        }
-        exchange.finish();
-    });
-    ChannelBody { rx }.boxed()
+/// A response body that runs `done` when it ends (or is dropped unread).
+struct DoneOnEnd {
+    inner: HopBody,
+    /// In a mutex only so the body is `Sync`; nothing contends for it.
+    exchange: Option<std::sync::Mutex<Exchange>>,
 }
 
-/// One chunk through every body-reading hop in order; false to stop.
-async fn pump(
-    exchange: &mut Exchange,
-    tx: &tokio::sync::mpsc::Sender<Result<hyper::body::Frame<bytes::Bytes>, BoxError>>,
-    mut chunk: bytes::Bytes,
-    end: bool,
-) -> bool {
-    for state in exchange.states.iter_mut().flatten() {
-        if !state.reads_response_body() {
-            continue;
-        }
-        match state.on_response_chunk(&exchange.context, chunk, end).await {
-            Ok(out) => chunk = out,
-            Err(reason) => {
-                let _ = tx.send(Err(reason.into())).await;
-                return false;
-            }
-        }
-    }
-    chunk.is_empty() || tx.send(Ok(hyper::body::Frame::data(chunk))).await.is_ok()
-}
-
-struct ChannelBody {
-    rx: tokio::sync::mpsc::Receiver<Result<hyper::body::Frame<bytes::Bytes>, BoxError>>,
-}
-
-impl hyper::body::Body for ChannelBody {
+impl hyper::body::Body for DoneOnEnd {
     type Data = bytes::Bytes;
     type Error = BoxError;
 
@@ -790,7 +746,134 @@ impl hyper::body::Body for ChannelBody {
         mut self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Option<Result<hyper::body::Frame<Self::Data>, Self::Error>>> {
-        self.rx.poll_recv(cx)
+        let polled = std::pin::Pin::new(&mut self.inner).poll_frame(cx);
+        // Dropping the exchange runs `done`: at the end of the body, or when
+        // hyper drops a body it has finished writing.
+        if matches!(polled, std::task::Poll::Ready(None)) {
+            self.exchange.take();
+        }
+        polled
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.inner.is_end_stream()
+    }
+
+    fn size_hint(&self) -> hyper::body::SizeHint {
+        self.inner.size_hint()
+    }
+}
+
+/// The response body, passed through the hops that read it, chunk by
+/// chunk, inside `poll_frame`: no task or channel between the upstream and
+/// the client. `done` runs when hyper drops the body, after the last byte.
+fn streamed(exchange: Exchange, body: HopBody) -> HopBody {
+    http_body_util::BodyExt::boxed(StreamedBody {
+        state: std::sync::Mutex::new(Streamed {
+            inner: body,
+            exchange: Some(exchange),
+            pending: None,
+            ended: false,
+            trailers: None,
+        }),
+    })
+}
+
+type ChunkFuture = std::pin::Pin<
+    Box<dyn std::future::Future<Output = (Exchange, Result<bytes::Bytes, String>)> + Send>,
+>;
+
+/// In a mutex only so the body is `Sync`; only hyper polls it.
+struct StreamedBody {
+    state: std::sync::Mutex<Streamed>,
+}
+
+struct Streamed {
+    inner: HopBody,
+    exchange: Option<Exchange>,
+    /// The hops working on one chunk (usually done on the first poll).
+    pending: Option<ChunkFuture>,
+    ended: bool,
+    trailers: Option<hyper::body::Frame<bytes::Bytes>>,
+}
+
+/// One chunk through every body-reading hop in order.
+fn pump(mut exchange: Exchange, mut chunk: bytes::Bytes, end: bool) -> ChunkFuture {
+    Box::pin(async move {
+        let context = exchange.context.clone();
+        for state in exchange.states.iter_mut().flatten() {
+            if !state.reads_response_body() {
+                continue;
+            }
+            match state.on_response_chunk(&context, chunk, end).await {
+                Ok(out) => chunk = out,
+                Err(reason) => return (exchange, Err(reason)),
+            }
+        }
+        (exchange, Ok(chunk))
+    })
+}
+
+impl hyper::body::Body for StreamedBody {
+    type Data = bytes::Bytes;
+    type Error = BoxError;
+
+    fn poll_frame(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Result<hyper::body::Frame<Self::Data>, Self::Error>>> {
+        use std::task::Poll;
+        let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        let state = &mut *state;
+        loop {
+            if let Some(pending) = state.pending.as_mut() {
+                let (exchange, result) = match pending.as_mut().poll(cx) {
+                    Poll::Ready(done) => done,
+                    Poll::Pending => return Poll::Pending,
+                };
+                state.pending = None;
+                state.exchange = Some(exchange);
+                match result {
+                    Ok(chunk) if !chunk.is_empty() => {
+                        return Poll::Ready(Some(Ok(hyper::body::Frame::data(chunk))))
+                    }
+                    Ok(_) => continue,
+                    // A hop failed mid-stream: abort the response rather
+                    // than end it short.
+                    Err(reason) => return Poll::Ready(Some(Err(reason.into()))),
+                }
+            }
+            if state.ended {
+                return Poll::Ready(state.trailers.take().map(Ok));
+            }
+            let Some(exchange) = state.exchange.take() else {
+                return Poll::Ready(None);
+            };
+            match std::pin::Pin::new(&mut state.inner).poll_frame(cx) {
+                Poll::Pending => {
+                    state.exchange = Some(exchange);
+                    return Poll::Pending;
+                }
+                Poll::Ready(Some(Err(err))) => {
+                    state.exchange = Some(exchange);
+                    return Poll::Ready(Some(Err(err)));
+                }
+                Poll::Ready(Some(Ok(frame))) => match frame.into_data() {
+                    Ok(chunk) => state.pending = Some(pump(exchange, chunk, false)),
+                    Err(trailers) => {
+                        // Trailers end the data: the hops see the end, then
+                        // the trailers go out as they are.
+                        state.trailers = Some(trailers);
+                        state.ended = true;
+                        state.pending = Some(pump(exchange, bytes::Bytes::new(), true));
+                    }
+                },
+                Poll::Ready(None) => {
+                    state.ended = true;
+                    state.pending = Some(pump(exchange, bytes::Bytes::new(), true));
+                }
+            }
+        }
     }
 }
 

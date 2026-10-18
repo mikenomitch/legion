@@ -5,7 +5,7 @@ What phase A0 of the [mesh interfaces plan](plans/mesh-interfaces-plan.md)
 the `connect()` hooks, restart survival, and what a classified connection
 costs. Calls are in
 [`calls/mesh-interfaces-plan_calls.md`](calls/mesh-interfaces-plan_calls.md)
-(entries 22, 24, 25, 27, 28, 30, 32, and 38). The public page is
+(entries 27, 29, 30, 35, 36, 41, 45, and 51). The public page is
 [docs/network-handlers.md, "The kernel classifier"](../docs/network-handlers.md#the-kernel-classifier).
 
 **Where measured.** A Firecracker guest: kernel 6.18.44, 4 vCPUs (Xeon @

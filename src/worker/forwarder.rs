@@ -188,6 +188,11 @@ struct UpstreamShared {
 type HandlerEndpoints = HashMap<(i64, String), Vec<Endpoint>>;
 /// Ingress TLS configs by (allocation, port label): the fingerprint of what
 /// built each, and the result.
+/// Client configs for external upstreams that pin a `ca`, by (allocation,
+/// upstream key): the fingerprint of what built each, and the result.
+type UpstreamTlsConfigs =
+    HashMap<(i64, String), (String, Result<Arc<rustls::ClientConfig>, String>)>;
+
 type IngressTlsConfigs =
     HashMap<(i64, String), (String, Result<Arc<rustls::ServerConfig>, String>)>;
 /// KV-held TLS material by (kind, allocation, port label or upstream key):
@@ -303,8 +308,7 @@ pub struct ForwarderContext {
     tls_material: Mutex<HashMap<TlsMaterialKey, TlsMaterialState>>,
     /// Client configs for external upstreams that pin a `ca`, by (allocation,
     /// upstream key): the fingerprint of what built each, and the result.
-    upstream_tls:
-        Mutex<HashMap<(i64, String), (String, Result<Arc<rustls::ClientConfig>, String>)>>,
+    upstream_tls: Mutex<UpstreamTlsConfigs>,
     /// `connect.upstreams[].credentials` values, from
     /// `FetchDatapathMaterial`. In memory only: never persisted, never
     /// logged, never handed to the task.

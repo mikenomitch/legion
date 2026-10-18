@@ -155,12 +155,36 @@ What they measure:
     extra threads mostly measures the scheduler; CPU per byte holds up
     better, and the forwarder's own cost is its gap to `direct`.
   - `http_rr`: HTTP/1.1 requests on one kept-open client connection through
-    HTTP mode, which shows whether upstream connections are reused.
+    HTTP mode, which shows whether upstream connections are reused. More rows
+    put a [network plugin](network-plugins.md#cost) on that upstream:
+    - one with no HTTP stage
+    - the conformance module's no-op mode at `request`
+    - the same at `request`, `response`, and `done`
+
+    After the group, it prints each plugin's mean and p99 callback time
+    from its stats.
+  - `plugin_exchange`: the plugin host in-process, with no network:
+    - one no-op callback on a live stream context
+    - a context's whole life
+    - a whole `request`-stage exchange
+
+    The gap between this and the `http_rr` plugin rows is the HTTP path's
+    share.
   - `slow_endpoint`: three backends, one 2 ms slower, once per balancing
     strategy, in HTTP mode and over L4 with a connection per request. A
     strategy that avoids the slow backend lands near the fast backends'
     latency. One that spreads evenly pays a third of the delay on average.
   - `balancer_pick`: one pick across 16 endpoints, per strategy.
+  - `kernel_conn_rr` (Linux, root, cgroup v2): a new connection per request
+    from a process inside an allocation's cgroup leaf, with and without the
+    [kernel classifier](network-handlers.md#the-kernel-classifier):
+    - unclassified
+    - passed after one rule, and after 32 rules
+    - through the forwarder
+    - redirected through the capture listener
+    - refused
+
+    Printed, not a Criterion group.
 
   ```console
   $ cargo bench --bench net_bench

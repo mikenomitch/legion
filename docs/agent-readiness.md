@@ -398,6 +398,24 @@ fast with a name error rather than a timeout.
 behind `--allow-write`. `--dry-run` / `dry_run` validates the object and lists
 the running allocations whose effective policy would change, without writing.
 
+**Network plugins** ([Network Plugins](network-plugins.md)) have the same
+read-first shape. `legion net plugin test` (MCP `legion_net_plugin_test`)
+runs a `.wasm` module, or a stored plugin's, against one synthetic request
+on the caller's machine. It reports per stage what the plugin did, what it
+changed, and its time and fuel, so an agent writing a plugin can check it
+before anything is applied. `legion_net_plugin_list`,
+`legion_net_plugin_describe`, and `legion_net_plugin_status` are read-only.
+`legion_net_plugin_apply` mutates, takes `dry_run` (which re-checks every
+policy that uses the plugin) and an `idempotency_key`, and is gated behind
+`--allow-write`.
+
+```bash
+legion net plugin test ./meter.wasm --request 'POST https://api.openai.com/v1/chat' \
+    --label tier=free --config '{"budget":1000}' -j
+# → {"ok":true,"data":{"status":429,"stages":[{"stage":"request","outcome":"answered",
+#     "status":429,"reason":"budget spent","micros":…,"fuel":…}], …}}
+```
+
 **A TAP sandbox's address is something Legion reports**, not something an
 agent discovers by probing. A sandbox on `config.network = { mode = "tap",
 bridge = "br0" }` gets its address leased from the bridge's pool at boot and

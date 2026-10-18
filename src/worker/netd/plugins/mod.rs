@@ -37,6 +37,10 @@ const SAMPLES: usize = 1024;
 /// Log lines one plugin may write per second before the rest are dropped.
 const LOG_LINES_PER_SECOND: u64 = 100;
 
+/// Plugin signing keys by (plugin, credential), with the version held.
+type CredentialStore =
+    Arc<Mutex<HashMap<(String, String), (i64, crate::worker::forwarder::SecretValue)>>>;
+
 /// Fetches a module's bytes, checked against its checksum. Blocking.
 pub trait ModuleLoader: Send + Sync {
     fn load(&self, source: &str, checksum: &str) -> Result<Vec<u8>, String>;
@@ -217,8 +221,7 @@ pub struct PluginHost {
     compiled: Mutex<HashMap<String, Arc<Compiled>>>,
     loader: Option<Arc<dyn ModuleLoader>>,
     node_id: Mutex<String>,
-    credentials:
-        Arc<Mutex<HashMap<(String, String), (i64, crate::worker::forwarder::SecretValue)>>>,
+    credentials: CredentialStore,
     /// Instances per pool: enough for this node's cores to run callbacks at
     /// once.
     pool_size: usize,
@@ -455,20 +458,32 @@ impl PluginHost {
         reference: &PluginConfig,
         scope: &str,
     ) -> Result<(Arc<PluginEntry>, Arc<InstancePool>), String> {
-        let entry = self.entry(&reference.name).ok_or_else(|| {
-            "is not on this node yet (its object has not arrived from the manager)".to_string()
-        })?;
-        let compiled = match entry.state() {
-            LoadState::Ready(compiled) => compiled,
-            LoadState::Fetching => return Err("is still loading its module".to_string()),
-            LoadState::Failed { error, .. } => return Err(format!("failed to load: {error}")),
-        };
         let configuration = reference.configuration_bytes();
         let config_hash = {
             use std::hash::{Hash, Hasher};
             let mut hasher = std::collections::hash_map::DefaultHasher::new();
             configuration.hash(&mut hasher);
             hasher.finish()
+        };
+        self.pool_for(&reference.name, &configuration, config_hash, scope)
+    }
+
+    /// [`Self::pool`] with the configuration already encoded (a hop encodes
+    /// its reference's once).
+    pub fn pool_for(
+        &self,
+        name: &str,
+        configuration: &[u8],
+        config_hash: u64,
+        scope: &str,
+    ) -> Result<(Arc<PluginEntry>, Arc<InstancePool>), String> {
+        let entry = self.entry(name).ok_or_else(|| {
+            "is not on this node yet (its object has not arrived from the manager)".to_string()
+        })?;
+        let compiled = match entry.state() {
+            LoadState::Ready(compiled) => compiled,
+            LoadState::Fetching => return Err("is still loading its module".to_string()),
+            LoadState::Failed { error, .. } => return Err(format!("failed to load: {error}")),
         };
         let key = (scope.to_string(), config_hash);
         let mut pools = entry.pools.lock().unwrap_or_else(|p| p.into_inner());
@@ -525,7 +540,7 @@ impl PluginHost {
         let scope = Arc::new(Scope {
             plugin: object.name.clone(),
             revision: entry.revision,
-            configuration,
+            configuration: configuration.to_vec(),
             fuel: object.limits.fuel(),
             deadline: object.limits.deadline(),
             memory_bytes: object.limits.memory_bytes() as usize,
@@ -680,10 +695,23 @@ impl InstancePool {
         }
     }
 
-    /// An instance for a new request: the next slot round-robin, started (or
-    /// restarted, if the last one broke) on demand. Starting costs one
-    /// instantiation plus the root context's start and configure callbacks.
+    /// An instance for a new request: the first idle one, else the next slot
+    /// round-robin, started (or restarted, if the last one broke) on demand.
+    /// Starting costs one instantiation plus the root context's start and
+    /// configure callbacks.
     pub fn pick(&self) -> Result<Arc<VmSlot>, String> {
+        // The first started, healthy instance no callback holds right now:
+        // under light load every request lands on the same, cache-warm
+        // instance, and concurrency spreads to the next ones.
+        for slot in &self.slots {
+            let Some(current) = slot.lock().unwrap_or_else(|p| p.into_inner()).clone() else {
+                break;
+            };
+            let idle = current.vm.try_lock().is_ok_and(|vm| vm.broken.is_none());
+            if idle {
+                return Ok(current);
+            }
+        }
         let index = self.next.fetch_add(1, Ordering::Relaxed) % self.slots.len();
         let mut slot = self.slots[index].lock().unwrap_or_else(|p| p.into_inner());
         if let Some(current) = slot.as_ref() {
@@ -724,8 +752,7 @@ impl InstancePool {
 /// `legion_sign`: HMAC with a declared credential the module never reads.
 struct PluginSigner {
     plugin: String,
-    credentials:
-        Arc<Mutex<HashMap<(String, String), (i64, crate::worker::forwarder::SecretValue)>>>,
+    credentials: CredentialStore,
     declared: Vec<String>,
 }
 
