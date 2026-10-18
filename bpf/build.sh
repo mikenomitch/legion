@@ -18,12 +18,14 @@ if [ "${1:-}" = "--check" ]; then
 	out=$(mktemp)
 	trap 'rm -f "$out"' EXIT
 fi
-# -g emits BTF (the loader needs it for the maps); the prefix map keeps the
-# object independent of where the repository is checked out.
-"$clang" -O2 -g -target bpf -Wall -Werror \
-	-fdebug-prefix-map="$here"=bpf \
-	-I"$here/include" -I"$arch_include" -I"$here" \
-	-c "$here/legion_net.bpf.c" -o "$out"
+# -g emits BTF (the loader needs it for the maps). Compiling from the
+# repository root with relative paths and a fixed compilation directory keeps
+# the object independent of where the repository is checked out and of the
+# directory the script is run from.
+cd "$here/.."
+"$clang" -O2 -g -target bpf -Wall -Werror -fdebug-compilation-dir=. \
+	-Ibpf/include -I"$arch_include" -Ibpf \
+	-c bpf/legion_net.bpf.c -o "$out"
 if [ "${1:-}" = "--check" ]; then
 	if ! cmp -s "$out" "$here/legion_net.bpf.o"; then
 		echo "bpf/legion_net.bpf.o is stale: run bpf/build.sh and commit the result" >&2
