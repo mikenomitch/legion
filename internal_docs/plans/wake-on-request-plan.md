@@ -275,7 +275,7 @@ on the bridge (gated plan §6.10). The gateway sees an ordinary
   answer, `404` for an instance without `wake` and an unknown one, a stopped
   instance not woken, the webhook body, `CONNECT` to a declared port and
   `404` for an undeclared one, TLS termination.
-- `tests/wake_integration.rs`: a real manager, a suspended exec instance,
+- `tests/integration/wake_integration.rs`: a real manager, a suspended exec instance,
   the gateway resumes it through `StartInstance`, and the held request is
   answered by the resumed port.
 - Not in CI: a real microVM resume behind the gateway (no KVM in CI).

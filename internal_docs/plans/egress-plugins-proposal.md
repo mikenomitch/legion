@@ -753,7 +753,7 @@ not implied.
 - **A new `NetPlugin` record** (name, kind, module source and digest,
   stages, usableBy, limits, configSchema), stored like `net_policy`, with
   the five RPCs in §6.E. Each has full proto comments and an entry in
-  `tests/acl_endpoints.rs`.
+  `tests/integration/acl_endpoints.rs`.
 - **`NetAllocStatus` gains:**
   - `plugins` (health per plugin, as `handlers` reports today);
   - `kernel` (whether the allocation is attached, its map generation, and

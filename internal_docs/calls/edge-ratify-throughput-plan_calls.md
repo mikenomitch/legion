@@ -176,7 +176,7 @@ manager is routing, not a second try at a refused claim.
 
 ## 5. Measure in-process, through the real handler, before building a networked load generator
 
-**Call.** The first harness (`tests/ratify_throughput_measure.rs`) drives
+**Call.** The first harness (`tests/integration/ratify_throughput_measure.rs`) drives
 the real `RatifyClaim` handler in-process with real tickets, on local
 SQLite and on a single-node raft cluster, and the networked
 `legion-loadgen --mode ratify` the TODO described is Phase 3.

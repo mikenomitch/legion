@@ -2080,7 +2080,7 @@ fn refresh_cluster_gauges(store: &Store) {
 /// lost on the tick that discovers it.
 ///
 /// Public for the heartbeat scale benchmark
-/// (`tests/heartbeat_scale_benchmark.rs`), which times one liveness pass; not
+/// (`tests/integration/heartbeat_scale_benchmark.rs`), which times one liveness pass; not
 /// part of any stable API.
 pub fn liveness_snapshot(
     store: &Store,
@@ -2608,7 +2608,7 @@ async fn start_eval_loop(store: Store, max_threads: usize) -> R<()> {
     // process startup. The eval queue is REPLICATED (plan §7-C2, JC-41), so
     // a newly elected leader already HOLDS the failed leader's pending work
     // — that is what makes an acknowledged `job stop` or a mid-flight
-    // rollout survive (tests/raft_eval_failover.rs). What the new leader
+    // rollout survive (tests/integration/raft_eval_failover.rs). What the new leader
     // still has to do on acquisition is (1) drop rows a later replicated
     // write superseded (`prune_stale_evals`), (2) requeue evals the old
     // leader had CLAIMED but not completed — they are `in_flight` in
@@ -4102,7 +4102,7 @@ mod tests {
     fn setup_store() -> R<Store> {
         let store_dir = Builder::new()
             .prefix("legion-agent-store-")
-            .tempdir()
+            .tempdir_in(crate::test_scratch::root())
             .context("Error creating temp store directory")?
             .keep();
 

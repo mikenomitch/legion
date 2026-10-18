@@ -45,7 +45,7 @@ heartbeats/second. Today each one costs, unconditionally
   the cadence is a hard-coded constant, not configurable.
 
 Nothing measures any of this: there is no heartbeat benchmark
-(`tests/raft_perf_smoke.rs` floods heartbeats only as background load
+(`tests/integration/raft_perf_smoke.rs` floods heartbeats only as background load
 for a scheduler-lane isolation A/B).
 
 ## Prior art
@@ -126,7 +126,7 @@ See problem statement; the load-bearing code:
 
 ### 1. Heartbeat scale benchmark (first, so before/after exists)
 
-`tests/heartbeat_scale_benchmark.rs`, `#[ignore]`, mirroring the
+`tests/integration/heartbeat_scale_benchmark.rs`, `#[ignore]`, mirroring the
 scheduler scale benchmark's shape: fleet sizes {1k, 5k, 10k} × backends
 {local_disk, raft1, raft3} × driver threads {4, 16}, each thread
 heartbeating a partition of the fleet as fast as the store allows for a

@@ -900,7 +900,7 @@ a changeset touches `keyring_key`).
 `keyring.status` (read-only) and `keyring.rotate|rewrap|root_key_rewrap|reset`
 (`mutates: true`, `read_only_safe: false`); MCP tool
 `legion_keyring_status` (read-only) and `legion_keyring_rotate`
-(`mutates: true`, behind `--allow-write`). `tests/acl_endpoints.rs` gains the
+(`mutates: true`, behind `--allow-write`). `tests/integration/acl_endpoints.rs` gains the
 four RPCs — `every_manager_rpc_is_classified` fails the build otherwise.
 
 **Docs**: new `docs/kv-encryption.md`; cross-links from `docs/kv-store.md`,
@@ -987,7 +987,7 @@ outage during a rotation tick is retried and never touches KV traffic.
 **Join (Phase 4).** A joiner with only a join token ends up unlocked; the
 join token's secret alone does not decrypt anything in the store.
 
-**ACL.** `tests/acl_endpoints.rs` entries for the four RPCs; `status` denied
+**ACL.** `tests/integration/acl_endpoints.rs` entries for the four RPCs; `status` denied
 without `operator:read`.
 
 **Backup/restore.** The reply carries `encryption`; `--restore-from` with the
@@ -1218,7 +1218,7 @@ with a threshold of shares (or one passphrase — Docker autolock).
 - `legion state backup -j` carries `encryption.root_key_ids`; the human
   output prints the "NOT included" reminder.
 - `docs/kv-encryption.md` exists, `cargo test --all --locked` and
-  `cargo test --test acl_endpoints` pass, and the calls doc has its
+  `cargo test --test integration acl_endpoints::` pass, and the calls doc has its
   implementation-time entries.
 
 **Phase 2**

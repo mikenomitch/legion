@@ -145,7 +145,7 @@ ACL story, and extracts its manifest with a regex over comments.
 - Store: SQLite + append-only migrations; named-entity CRUD pattern =
   `saved_state_query` (`src/storage/store.rs:6334-6460`); idempotency via
   `idempotency_lookup`/`idempotency_record`.
-- `tests/acl_endpoints.rs` parses the proto service block and fails unless
+- `tests/integration/acl_endpoints.rs` parses the proto service block and fails unless
   every RPC is classified.
 
 ## 6. Proposed design
@@ -343,7 +343,7 @@ MCP tools: `legion_template_list`, `legion_template_get`,
   errors, typed variable validation and coercion, import rejection, render
   timeout config, run happy path, collision guard (reject + plain-job:write
   override), provenance in spec history, idempotent re-run.
-- **`tests/acl_endpoints.rs`:** six new classified rows + builders + seeded
+- **`tests/integration/acl_endpoints.rs`:** six new classified rows + builders + seeded
   fixture template; scenario test: template-scoped token can run its
   template but not raw `RunJob`, sees only its jobs.
 - **UI:** `npm run build` (tsc) green; manual smoke via seeded data.

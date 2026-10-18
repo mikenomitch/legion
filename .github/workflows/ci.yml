@@ -2,6 +2,18 @@ name: CI
 
 on:
   pull_request:
+  # Pushes to main run only the Rust jobs. Their job is to save the dependency
+  # cache: Actions caches written on a PR ref are visible to that PR alone,
+  # while main's are visible to every PR, so without these runs each new PR
+  # starts cold and rebuilds ~520 crates.
+  push:
+    branches: [main]
+
+# A new push to a PR supersedes the run in progress for it. Runs on main are
+# never cancelled, so each merge finishes and saves its cache.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 # Grant the read scopes the workflow needs. `pull-requests: read` is required by
 # dorny/paths-filter, which calls the PR "list files" API on pull_request events;
@@ -24,26 +36,29 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
 
       - name: Install protobuf compiler
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y protobuf-compiler
+        uses: ./.github/actions/setup-protoc
 
-      # `cargo test --all` links ~29 test binaries, and at full debuginfo the
-      # target dir reaches ~23 GiB — more than the ~14 GiB an ubuntu-latest
-      # runner has free. The job then dies mid-link with
-      # `ld terminated with signal 7 [Bus error]`, or the runner disappears
-      # outright (step stuck `in_progress`, logs 404). Dropping debuginfo takes
-      # the same tree to ~3.5 GiB and links faster; only backtrace detail is
-      # lost, never test behavior. Use `line-tables-only` instead of `0` if
-      # file/line in panic backtraces is worth the extra size.
+      # Dependencies only: Legion's own crates are always rebuilt. Saved from
+      # main alone (see `push` above) so PR runs cannot evict main's entry
+      # from the repo's 10 GB cache budget. The scheduler benchmark gate
+      # reads the same entry through `shared-key`.
+      - name: Cache cargo dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: cargo-test
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      # Debuginfo size comes from `[profile.dev]` in Cargo.toml (line tables
+      # for Legion's crates, none for dependencies), which keeps the target
+      # dir well inside the runner's ~14 GiB of free disk. Integration tests
+      # link as a few binaries rather than one per file
+      # (docs/testing-and-benchmarks.md, "Test Layout").
       # --all-features so the `loadgen` feature's bin (benchmarks/loadgen,
       # the AWS rig's native job submitter) is built and its unit tests run.
       # It is feature-gated to keep it out of ordinary local builds, which
       # would otherwise leave it untested until a campaign failed on it.
       - name: Run cargo tests
         env:
-          CARGO_PROFILE_DEV_DEBUG: 0
-          CARGO_PROFILE_TEST_DEBUG: 0
           # Compare the scheduler's read model with SQLite after every
           # local_disk mutation in the integration tests too (unit tests
           # always do). See docs/state-store.md, "Read model coherence".
@@ -62,9 +77,12 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
 
       - name: Install protobuf compiler
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y protobuf-compiler
+        uses: ./.github/actions/setup-protoc
+
+      - name: Cache cargo dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Run cargo clippy
         run: cargo clippy --all --all-features --locked -- -D warnings -A dead_code -A unused_variables
@@ -78,7 +96,7 @@ jobs:
   proto-breaking:
     name: Proto Breaking Changes
     runs-on: ubuntu-latest
-    if: ${{ !contains(github.event.pull_request.labels.*.name, 'proto-breaking-ok') }}
+    if: ${{ github.event_name == 'pull_request' && !contains(github.event.pull_request.labels.*.name, 'proto-breaking-ok') }}
 
     steps:
       - name: Checkout repository
@@ -109,6 +127,7 @@ jobs:
   ui-build:
     name: UI Build
     runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
 
     steps:
       - name: Checkout repository
@@ -135,9 +154,7 @@ jobs:
 
       - name: Install protobuf compiler
         if: steps.changes.outputs.ui == 'true'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y protobuf-compiler
+        uses: ./.github/actions/setup-protoc
 
       - name: Install UI dependencies
         if: steps.changes.outputs.ui == 'true'
@@ -163,6 +180,7 @@ jobs:
   scheduler-benchmark-gate:
     name: Scheduler Benchmark Gate
     runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
 
     steps:
       - name: Checkout repository
@@ -178,8 +196,8 @@ jobs:
               - 'src/storage/store.rs'
               - 'src/manager/daemon.rs'
               - 'benchmarks/scheduler/**'
-              - 'tests/scheduler_benchmark_slo.rs'
-              - 'tests/benchmark_support/**'
+              - 'tests/integration/scheduler_benchmark_slo.rs'
+              - 'tests/integration/benchmark_support/**'
 
       - name: Install Rust toolchain
         if: steps.changes.outputs.scheduler == 'true'
@@ -187,17 +205,25 @@ jobs:
 
       - name: Install protobuf compiler
         if: steps.changes.outputs.scheduler == 'true'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y protobuf-compiler
+        uses: ./.github/actions/setup-protoc
+
+      # Reads the Cargo Test job's dependency cache (same profile and
+      # dependency set; the `loadgen` feature adds no crates). Never saves.
+      - name: Cache cargo dependencies
+        if: steps.changes.outputs.scheduler == 'true'
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: cargo-test
+          save-if: false
 
       - name: Run scheduler benchmark SLO gate
         if: steps.changes.outputs.scheduler == 'true'
-        run: cargo test --test scheduler_benchmark_slo -- --ignored --nocapture
+        run: "cargo test --test integration scheduler_benchmark_slo:: -- --ignored --nocapture"
 
   aws-benchmark-rig:
     name: AWS Benchmark Rig (validate only)
     runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
 
     steps:
       - name: Checkout repository

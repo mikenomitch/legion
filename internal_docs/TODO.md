@@ -66,7 +66,7 @@ How to use it:
         `gated-default`, then allowed after `network.egress.allow`. This
         repository's CI starts no OCI runtime; the placement, port, resolver,
         and namespace pieces are tested separately
-        (`tests/gated_container_default.rs`,
+        (`tests/integration/gated_container_default.rs`,
         `netns::tests::gated_start_overhead_benchmark`).
   - [x] Phase 4: the encrypted worker-to-manager channel, with the ticket
         JWKS fetched over it (plan §6.8; calls 32 to 34). The manager's API
@@ -195,7 +195,7 @@ How to use it:
           order: the scheduler half marks the row and decides the status,
           and `set_task_status` (status lane) records it. Both forward from a
           follower (`SetTaskStatus` is a new forwardable op). Covered by
-          `tests/raft_ownership_guard.rs` and `tests/raft_follower_writes.rs`.
+          `tests/integration/raft_ownership_guard.rs` and `tests/integration/raft_follower_writes.rs`.
     - [ ] In the `lanes` topology the dependency eval can run before the
           scheduler leader applies the status-lane write, and then nothing
           re-evaluates the job (`docs/multi-raft.md`, "Non-leader write
@@ -1298,7 +1298,7 @@ How to use it:
           with its own node token, against a 3-voter raft cluster on the AWS
           rig. Report the rate where p99 crosses `ratifyTimeout`. Needs the
           simulated fleet to expose per-node credentials. The in-process
-          harness (`tests/ratify_throughput_measure.rs`) is the ceiling it
+          harness (`tests/integration/ratify_throughput_measure.rs`) is the ceiling it
           should approach ([plan](plans/edge-ratify-throughput-plan.md)
           Phase 3).
     - [ ] **Profile the per-ratification apply.** With the false conflicts
@@ -1453,7 +1453,7 @@ How to use it:
       (heterogeneous `node_profiles` + mixed `job_types` with
       resources/constraints, per-scenario SLOs), four realistic scenarios,
       shared runner, the scenario × backend matrix
-      (`tests/scheduler_scale_benchmark.rs`: local_disk / raft1 / raft3 /
+      (`tests/integration/scheduler_scale_benchmark.rs`: local_disk / raft1 / raft3 /
       streaming) with recorded release numbers, `PlanTimings` phase
       instrumentation + `legion_scheduler_plan_phase_seconds`
       ([docs/metrics.md](../docs/metrics.md)), and the fused
@@ -1483,7 +1483,7 @@ How to use it:
       ([plan](plans/heartbeat-scale-plan.md),
       [calls](calls/heartbeat-scale-plan_calls.md),
       [docs](../docs/architecture-managers-workers.md)) — heartbeat scale
-      benchmark (`tests/heartbeat_scale_benchmark.rs`), status-lane
+      benchmark (`tests/integration/heartbeat_scale_benchmark.rs`), status-lane
       heartbeat group commit with per-id verdicts, skip-reprojection for
       bare refreshes (leader + follower projection), integer liveness
       clock (`last_heartbeat_unix`), batched lost-node recheck, partial
@@ -1503,7 +1503,7 @@ How to use it:
         ([mini-plan](plans/worker-simulation-plan.md),
         [docs](../docs/worker-simulation.md)) — one process, N wire-real
         nodes from a `node_profiles` file, real cadences, stub dispatch
-        server; end-to-end test `tests/worker_simulation.rs`.
+        server; end-to-end test `tests/integration/worker_simulation.rs`.
   - [x] Phase 1 rig, everything short of the cloud:
         [`benchmarks/aws/`](../benchmarks/aws/README.md) — Terraform
         (validate-clean; system-agnostic boxes + spot sim fleet + S3),
@@ -2026,7 +2026,7 @@ How to use it:
 - [x] A raft-mode CONCURRENT-planning oversubscription test through the
       real `Scheduler::plan_and_apply` path (2026-07-30):
       `concurrent_planners_cannot_oversubscribe_under_raft[_lanes]` in
-      [tests/raft_apply_roundtrip.rs](../tests/raft_apply_roundtrip.rs)
+      [tests/integration/raft_apply_roundtrip.rs](../tests/integration/raft_apply_roundtrip.rs)
       drives two barrier-released planners against raft's
       commit-then-project ordering under both topologies — the exact
       window the epoch mirror closes. Regression insurance; the local_disk
@@ -2348,7 +2348,7 @@ Plans: [task-runtime-plugins](../docs/task-runtime-plugins.md).
         old terminal outcome when nothing fits
         ([calls](calls/sandbox-scaling-plan_calls.md) #41).
   - [ ] **The raft seam test does not read `src/storage/store/*.rs`.**
-        `tests/raft_seam.rs` parses only `store.rs` and `acl_store.rs`, so a
+        `tests/integration/raft_seam.rs` parses only `store.rs` and `acl_store.rs`, so a
         replicated write added in a store submodule (`eval_claims.rs`,
         `blocked_evals.rs`) is not checked for a lane classification
         ([calls](calls/sandbox-scaling-plan_calls.md) #48).
@@ -2386,7 +2386,7 @@ Plans: [task-runtime-plugins](../docs/task-runtime-plugins.md).
         on `raft_lanes`, the leader-kill "complete within one full-report
         period" check, and the peer fan-out are tested only by fake-node
         integration tests and unit tests
-        (`tests/session_integration.rs`,
+        (`tests/integration/session_integration.rs`,
         [calls](calls/sandbox-scaling-plan_calls.md) #58).
   - [ ] **Router locality.** The router ranks by free room only; plan §6.4
         also preferred nodes whose content store holds the image
@@ -2427,7 +2427,7 @@ Plans: [task-runtime-plugins](../docs/task-runtime-plugins.md).
         ([plan](plans/elastic-session-envelopes-plan.md) Phase 3).
   - [ ] **Phase 5's 10^6 acceptance run, and archive in the op-count
         test.** Archiving was tested at 20 instances
-        (`tests/archive_integration.rs`, local store); plan §13's 10^6
+        (`tests/integration/archive_integration.rs`, local store); plan §13's 10^6
         archived instances leaving 10^6 slim rows, a resume under the
         published-resume time, and a `tests/raft_lifecycle_ops.rs` stage
         proving the archive adds no entry to its publish are not measured
@@ -2456,7 +2456,7 @@ Plans: [task-runtime-plugins](../docs/task-runtime-plugins.md).
         watch or `certFrom = { kv }` like ingress chains).
   - [ ] A real microVM resume behind the gateway on KVM hardware; CI only
         runs the gateway against a real manager with a simulated worker
-        (`tests/wake_integration.rs`).
+        (`tests/integration/wake_integration.rs`).
 - [ ] **Sandbox exec**: [plan](plans/sandbox-exec-plan.md) (IN EXECUTION) ·
       [calls](calls/sandbox-exec-plan_calls.md). Exec into Linux microVM
       sandboxes, and exec sessions that skip the manager. Implemented
@@ -2474,7 +2474,7 @@ Plans: [task-runtime-plugins](../docs/task-runtime-plugins.md).
         into [worker-plane-auth §6.1](plans/worker-plane-auth-plan.md#61-the-worker-listener-is-mutual-tls-always)
         (2026-10-11), which added one dependency: ticket verifiers need the
         JWKS over TLS, so direct exec also waits on worker-plane-auth Phase 4.
-  - [x] Phase 0 (partly): `tests/exec_session_benchmark.rs` measures
+  - [x] Phase 0 (partly): `tests/integration/exec_session_benchmark.rs` measures
         proxied and direct sessions (open latency, manager CPU and bytes per
         session) at 1 to 500 concurrent sessions on one host, plus mint
         throughput. Numbers in
@@ -2524,7 +2524,7 @@ Plans: [task-runtime-plugins](../docs/task-runtime-plugins.md).
         `legion exec`, `legion action run`, and the MCP exec tools landed
         with it (`ExecStart.instance_id`). Docs:
         [exec-and-actions.md § Direct exec](../docs/exec-and-actions.md#direct-exec).
-        Tests: `tests/worker_plane_e2e.rs` (direct session, exit status,
+        Tests: `tests/integration/worker_plane_e2e.rs` (direct session, exit status,
         revocation within a heartbeat), `src/worker/direct_exec.rs`,
         `mint_exec_ticket_admits_exactly_what_exec_allocation_admits_test`.
   - [ ] Direct exec: bind a ticket to the client's key (a `cnf` claim and a
@@ -2555,7 +2555,7 @@ Plans: [task-runtime-plugins](../docs/task-runtime-plugins.md).
         their key is deleted, `legion exec-key create|list|delete`,
         `legion exec-ticket sign`, and the MCP key tools (calls 16 to 20).
         Docs: [exec-and-actions.md § Delegated minting keys](../docs/exec-and-actions.md#delegated-minting-keys).
-        Tests: `tests/worker_plane_e2e.rs` (a key reaches the worker, its
+        Tests: `tests/integration/worker_plane_e2e.rs` (a key reaches the worker, its
         ticket is refused for a host-level job and another job's, and stops
         verifying after delete),
         `a_delegated_key_mints_only_inside_its_glob_and_ceilings_test`.
@@ -3080,7 +3080,7 @@ Plans: [task-runtime-plugins](../docs/task-runtime-plugins.md).
       - [x] Fixed: index candidate truncation dropped the pinned node of a
             stateful task (a `local` restore, a node-local volume) on fleets
             large enough to arm the index. Stateful tasks no longer truncate
-            (call 88, `tests/restore_placement_indexed.rs`).
+            (call 88, `tests/integration/restore_placement_indexed.rs`).
       - [x] `scheduler_bench` `restore` group (`local_pinned`,
             `published_floating`), run once on a loaded host
             ([plan §9](plans/suspend-resume-and-oversubscription-plan.md#9-testing-plan)).
@@ -3548,7 +3548,7 @@ Plans: [stateful-workloads](plans/stateful-workloads-and-instance-identity-plan.
   - [ ] Phase 5b edge move: `StartSession.resume_id`'s probe and
         `StopSession` of the old copy over worker-to-worker TLS has no test
         (it needs two real workers with mesh certificates); the manager
-        fallback is covered in `tests/session_integration.rs` with fake
+        fallback is covered in `tests/integration/session_integration.rs` with fake
         nodes and a fake bucket.
   - [ ] An edge picker (`legion session nodes`) should set `force_move`
         itself when the node a session's tag names is listed `down` or
@@ -4039,7 +4039,7 @@ Plans: [persistence-plan.md](plans/persistence-plan.md), [multi-raft-persistence
         under `single` (to ~100–130ms) vs 1.6–2.4× under `lanes` (2.4–3.4ms
         — essentially flat), with identical unloaded baselines and 4–5×
         placement throughput retained. `lanes_vs_single_scheduler_isolation_ab`
-        in [tests/raft_perf_smoke.rs](../tests/raft_perf_smoke.rs);
+        in [tests/integration/raft_perf_smoke.rs](../tests/integration/raft_perf_smoke.rs);
         numbers in [docs/multi-raft.md](../docs/multi-raft.md) § "Lane
         isolation A/B".
   - [x] Contention instrumentation for the manager write path (2026-08-02):
@@ -4584,9 +4584,6 @@ Deferred from [ui-holistic-polish-plan.md](plans/ui-holistic-polish-plan.md):
 - [ ] ⌘K recents are per browser (localStorage); per-identity recents would
       need a manager-side store
       ([calls entry 7](calls/ui-holistic-polish-plan_calls.md))
-- [ ] The CI generated-client check trusts the runner's apt `protoc`; pin it
-      (buf, or a release download) if a runner image bump ever produces a
-      false drift ([calls entry 9](calls/ui-holistic-polish-plan_calls.md))
 - [ ] A toast primitive, should a feature need feedback away from the control
       that caused it; every message so far is an inline `Note`
 
@@ -4766,7 +4763,7 @@ Deferred from [operator-ui-gaps-plan.md](plans/operator-ui-gaps-plan.md):
       is untouched by it. Make the assertion independent of the child actually
       having started, or gate on an observed start.
 - [ ] **`simulated_fleet_feeds_the_worker_metric_registry` asserts a
-      process-global gauge.** `tests/worker_simulation.rs` checks
+      process-global gauge.** `tests/integration/worker_simulation.rs` checks
       `simulated_nodes >= 4` while the binary's other tests run fleets of
       their own, so another fleet shutting down can pull the gauge under 4.
       Failed once in a full local run (2026-10-12, PR #31, which does not
@@ -4782,7 +4779,7 @@ Deferred from [operator-ui-gaps-plan.md](plans/operator-ui-gaps-plan.md):
       interleaved same-window runs had base `3a62fcd` failing 3/4 while
       the migration branch passed 3/4 (and each side showed the opposite
       pattern in other windows). The other three tests in
-      `tests/raft_durability.rs` did not flap. Suspect the tight election
+      `tests/integration/raft_durability.rs` did not flap. Suspect the tight election
       timeouts the harness itself warns about ("under CPU starvation the
       tight election timeouts flap leadership") plus this box's scheduling
       jitter; wants either wider election timeouts under
@@ -4855,7 +4852,7 @@ Deferred from [operator-ui-gaps-plan.md](plans/operator-ui-gaps-plan.md):
 
 ---
 - [ ] **`cargo clippy --all-targets` fails on existing code**
-      (`daemon.rs` items-after-test-module, `tests/node_drain.rs`
+      (`daemon.rs` items-after-test-module, `tests/integration/node_drain.rs`
       needless_borrow). The project's standard `cargo clippy --all` passes.
 - [ ] **Flaky timing tests under load.** `worker::forwarder`
       (`sync_stops_a_listener_that_is_no_longer_desired`,
@@ -4864,6 +4861,31 @@ Deferred from [operator-ui-gaps-plan.md](plans/operator-ui-gaps-plan.md):
       each failed once in full parallel runs and pass on rerun.
 - [ ] **Create the `proto-breaking-ok` label** that skips the new
       `proto-breaking` CI job (audit M5).
+- [ ] **A test run killed before exit leaves its scratch root.** Kept test
+      directories live under one `legion-tests-*` root per process, removed
+      by an `atexit` hook ([calls 2](calls/test-build-footprint_calls.md)).
+      Ctrl-C skips the hook. Sweeping roots older than a day when the next
+      run starts would close it.
+- [ ] **One worker-side test still leaks a `.tmp*` directory per run**
+      (`allocs/` and `logs/` inside; 44 KB). Find it and give it a guard or
+      the scratch root.
+- [ ] **Move `legion-loadgen` out from behind the `loadgen` feature** into its
+      own workspace crate. Features are part of the build hash, so CI's
+      `--all-features` and a plain `cargo test --all` build every Legion
+      target twice for a developer who runs both (two ~600 MB rlibs, two
+      incremental caches of ~3.5 GB). As a workspace member `cargo test --all`
+      would test it with no flag. Needs the AWS rig's build scripts
+      (`build-and-upload.sh`, `local-smoke.sh`, `sandbox-boot/build.sh`) and
+      `driver.py`'s hint moved to `-p legion-loadgen`
+      ([development.md](development.md#keeping-builds-and-test-runs-small)).
+- [ ] **Four integration tests still link their own binaries**
+      (`tests/raft_lifecycle_ops.rs`, `tests/raft_job_eval_ops.rs`,
+      `tests/adaptive_scheduler_concurrency.rs`,
+      `tests/session_index_scale_measure.rs`; ~200 MB each), because they
+      read or set process-wide state. The two raft-ops tests could join
+      `tests/integration/` if the op counts they assert came from the store
+      under test rather than the global metrics
+      ([calls 1](calls/test-build-footprint_calls.md)).
 
 ## Long term
 
@@ -4895,7 +4917,7 @@ Deferred from [operator-ui-gaps-plan.md](plans/operator-ui-gaps-plan.md):
       (`--var`, `--var-code`, `--kv-var`, `--kv-var-code`); job templates hide
       their `job` function with `| not_exported` and reject imports lexically
       before evaluation; `source_jsonnet` became `source_nickel` in the proto,
-      the store, and the UI. `tests/config_jobs.rs` grew coverage for the
+      the store, and the UI. `tests/integration/config_jobs.rs` grew coverage for the
       manager configs, the worker configs, and the shipped job template, none
       of which were evaluated by any test before. **No compatibility path**:
       `.jsonnet` files are not recognized and stored template sources do not
@@ -5036,7 +5058,7 @@ docs: [scheduler-and-eval-loop.md](../docs/scheduler-and-eval-loop.md), [jobs-ta
       applied as a cut of the best-first verified list, i.e. one tied
       cell's sorted-id prefix, so every plan saw the same lowest-id nodes.
       The cut inside a tied cell is now a uniform sample of the cell
-      (`truncate_within_boundary_cell`); `tests/index_truncation_spread.rs`
+      (`truncate_within_boundary_cell`); `tests/integration/index_truncation_spread.rs`
       pins the rig shape (4 slices x 150 identical nodes, 40 jobs x 4,
       spread): 104/56/0/0 per slice on the old code, 49/30/43/38 fixed.
       Candidate
@@ -5125,7 +5147,7 @@ docs: [scheduler-and-eval-loop.md](../docs/scheduler-and-eval-loop.md), [jobs-ta
   - [x] Phase 2 — priority bands, governed by a `bands` selector on `job` ACL
         rules (not `operator:write`), normalized before enforcement and
         covering the template-render path, with explicit cases in
-        `tests/acl_endpoints.rs`. The selector composes with `namespaces`, so
+        `tests/integration/acl_endpoints.rs`. The selector composes with `namespaces`, so
         per-namespace band caps need no second surface — but they are not
         *live* until namespaces carry real values
         ([namespaces-plan.md](plans/namespaces-plan.md)); today the selector
@@ -5187,7 +5209,7 @@ docs: [scheduler-and-eval-loop.md](../docs/scheduler-and-eval-loop.md), [jobs-ta
       `plan_candidates` setting (default 8; 0 = kill switch + format-1
       emission), `job plan` candidate preview, `candidateRank`/`fallbacks`
       event metadata, the rank histogram + `fallback` outcome metrics, and
-      the `tests/plan_contention.rs` burst harness (also the raft-mode
+      the `tests/integration/plan_contention.rs` burst harness (also the raft-mode
       concurrent-planning regression) —
       [plan](plans/late-binding-plan-apply-plan.md),
       [docs/late-binding-plan-apply.md](../docs/late-binding-plan-apply.md).
@@ -5697,7 +5719,7 @@ docs: [task-runtime-plugins.md](../docs/task-runtime-plugins.md)
       load test and the retry gap are open above.
   - [x] Ratification load harness, in-process through the real `RatifyClaim`
         handler with real tickets, local and single-voter raft
-        (`tests/ratify_throughput_measure.rs`, before/after numbers in the
+        (`tests/integration/ratify_throughput_measure.rs`, before/after numbers in the
         plan §8 and [edge-boot.md](../docs/edge-boot.md#ratification-under-load)).
   - [x] Ratifications fill commit batches. They already shared the instance
         group commit (cap 64), not the plan coalescer, so
@@ -5766,11 +5788,11 @@ docs: [task-runtime-plugins.md](../docs/task-runtime-plugins.md)
         instances` drives create → running → suspend → resume → destroy at
         an open-loop rate (simulated nodes send allocation health and fake
         checkpoints); row sizes at 10^5 and 10^6 and heartbeat bytes at
-        1,000 and 10,000 allocations (`tests/instance_scale_measure.rs`).
+        1,000 and 10,000 allocations (`tests/integration/instance_scale_measure.rs`).
         Baseline: 22 entries per lifecycle, ~25 lifecycles/s.
   - [x] Phase 0 found and fixed: a keyed instance left `pending` by a full
         cluster was never retried by the capacity pass
-        (`tests/capacity_retry.rs`, calls #47).
+        (`tests/integration/capacity_retry.rs`, calls #47).
   - [x] Phase 1: 8 entries per lifecycle. Allocation health is written only
         on change; eval claims are leader memory; a placing eval settles
         inside its plan; stop and destroy queue no eval; concurrent instance
@@ -5785,6 +5807,13 @@ docs: [task-runtime-plugins.md](../docs/task-runtime-plugins.md)
         ([docs](../docs/architecture-managers-workers.md#delivery)).
         Replaces the "heartbeats rebuild the node's whole desired set every
         beat" item.
+  - [x] A reconnect no longer loses its opening resync (2026-10-18). The
+        superseded stream's sender, already past its `is_current` check,
+        could take the resync the new attach queued and send it down the
+        dead stream, leaving the new one silent until the next change.
+        `WorkLog::take_pending` now hands work only to the current session.
+        Found when the integration tests started sharing a process
+        ([calls 1](calls/test-build-footprint_calls.md)).
   - [x] Phase 3: unplaceable job evals end `blocked` under a key (pool
         class, pinned node, or `escaped`), one per job, woken only by
         matching capacity (registration, node change, readiness, freed
@@ -5855,7 +5884,7 @@ docs: [task-runtime-plugins.md](../docs/task-runtime-plugins.md)
       other connection when `install_state_db` swaps the state file. Left open
       on the replaced inode it checkpointed the new file's WAL into the old
       one and truncated it, which reverted a fresh joiner to the seed image
-      (`tests/raft_durability.rs` caught it once the KV encryption merge
+      (`tests/integration/raft_durability.rs` caught it once the KV encryption merge
       shifted the timing)
 - [x] `LEGION_DATA_DIR` moves every `.legion/*` default (store, raft, worker
       state, identity tokens) for one process, so a second cluster can run
@@ -5912,7 +5941,7 @@ docs: [task-runtime-plugins.md](../docs/task-runtime-plugins.md)
 [plan](plans/auth-acl-plan.md) · [docs](../docs/auth-and-acls.md)
 
 - [x] Phase 1 — the ACL model: resources, actions, scopes, default-deny, one-line
-      enforcement, and the `tests/acl_endpoints.rs` coverage gate
+      enforcement, and the `tests/integration/acl_endpoints.rs` coverage gate
 - [x] Phase 2 — interactive SSO and richer admin
 - [x] Phase 3 — worker-plane hardening (join tokens from the authenticated
       `CreateJoinToken` RPC; the insecure `:4748` bootstrap listener is gone)
@@ -6076,6 +6105,11 @@ docs: [task-runtime-plugins.md](../docs/task-runtime-plugins.md)
       deferrals (created/updated on the job header, per-page last-column
       label) and the stale "gen has drifted" item — the client was already
       current, and CI now keeps it so.
+- [x] The CI generated-client check no longer trusts the runner's apt
+      `protoc`: every job installs a pinned, checksummed protoc 21.12 release
+      through `.github/actions/setup-protoc`
+      ([calls entry 9](calls/ui-holistic-polish-plan_calls.md),
+      [test-build-footprint calls 7](calls/test-build-footprint_calls.md))
 - [x] Task page tabs (Overview · Logs · Exec & actions · Spec, in the URL as
       `?tab=` / `?alloc=`): health tiles, one Instances table replacing the
       three lists of the same allocations, declared checks, recent events;
@@ -6322,7 +6356,7 @@ Bug fixes, no plan. Uncommitted at the time of writing.
       [calls](calls/launch-spot-check-fixes-plan_calls.md#51-stored-cli-tokens-are-keyed-by-manager-address-and-a-first-start-replaces-the-file-for-its-address)).
 - [x] **The CLI panicked on a closed pipe.** One-shot commands restore the
       default SIGPIPE disposition and end with status 141 like `cat`
-      (`tests/cli_closed_pipe.rs`,
+      (`tests/integration/cli_closed_pipe.rs`,
       [calls](calls/launch-spot-check-fixes-plan_calls.md#58-a-one-shot-cli-command-dies-by-sigpipe-status-141-on-a-closed-pipe)).
 - [x] **`state query` user errors were `Internal`, with an ANSI tracing
       line.** SQL that does not compile or names a missing column or table
@@ -6480,3 +6514,24 @@ Found on the live AWS rig (3 raft managers, 2 workers). Bug fixes, so no plan.
       [docs](../docs/cluster-ca.md)
 - [x] **VIP blocks follow the node's OS.** Placement asked the manager's own
       OS, so a macOS manager gave its Linux nodes no VIP blocks.
+
+## Developer workflow & CI
+
+- [x] **Smaller, faster test builds** (2026-10-18,
+      [calls](calls/test-build-footprint_calls.md) ·
+      [docs/testing-and-benchmarks.md](../docs/testing-and-benchmarks.md#test-layout) ·
+      [development.md](development.md#keeping-builds-and-test-runs-small)).
+      Line-table debuginfo for Legion's crates and none for dependencies;
+      62 of the 66 integration test files merged into one binary
+      (`tests/integration/`), taking integration binaries from 12.9 GB to
+      1.1 GB; kept test directories under a per-process scratch root removed
+      at exit (a full run left over 1.1 GB in `$TMPDIR` before); the bundled
+      SQLite optimized in dev builds and the three quadratic migration walks
+      made linear (unit suite 335 s → 208 s); `build.rs` watching `proto/`
+      instead of the whole repository, so editing a doc no longer rebuilds
+      the crate; the empty doc-test pass and `legion` bin unit-test target
+      switched off.
+- [x] **CI dependency cache, cancellation, and pinned protoc.**
+      `Swatinem/rust-cache` on the Rust jobs, saved from `main` (CI now also
+      runs on pushes to `main`); superseded PR runs cancelled; `protoc` from
+      a pinned release instead of `apt-get update` in every job.

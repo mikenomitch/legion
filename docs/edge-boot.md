@@ -506,10 +506,10 @@ These are ceilings for the manager's commit path. They do not include the
 network, HTTP/2, or a follower round trip in a multi-voter raft cluster,
 and one manager's whole scheduler lane is shared with placements, creates,
 and every other instance write. To reproduce them, run the ignored test
-`tests/ratify_throughput_measure.rs`:
+`tests/integration/ratify_throughput_measure.rs`:
 
 ```console
-$ cargo test --release --test ratify_throughput_measure -- --ignored --nocapture
+$ cargo test --release --test integration ratify_throughput_measure:: -- --ignored --nocapture
 ```
 
 `LEGION_RATIFY_CLAIMS`, `LEGION_RATIFY_CONCURRENCY` (a comma list),

@@ -347,7 +347,7 @@ worth nothing on its own, and the change is a few hundred lines.
   `sealed/`, never the plaintext. A node that never held the part restores
   from it, and warm fetches it. A missing key, a wrong key, and a manifest without
   `keyId` each fail by name.
-- **Integration (`tests/published_resume_integration.rs`)**: publish and warm
+- **Integration (`tests/integration/published_resume_integration.rs`)**: publish and warm
   requests and the restore payload carry a key for every part, the publish
   key and the restore key agree, and a part published before encryption gets
   no key.

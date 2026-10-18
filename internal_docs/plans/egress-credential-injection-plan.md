@@ -290,7 +290,7 @@ and loopback-only sandboxes remain open.
   deleted key and a foreign allocation are `absent`.
 - Worker (`src/worker/daemon.rs`): declared keys and upstream specs follow
   the desired set.
-- ACL (`tests/acl_endpoints.rs`): the RPC is classified worker-plane and
+- ACL (`tests/integration/acl_endpoints.rs`): the RPC is classified worker-plane and
   refuses a foreign node token; RunJob needs `kv:read` on the path.
 
 ## 10. Rollout

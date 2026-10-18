@@ -819,7 +819,7 @@ wall per regime, and the plan-path plan needs the same read.
   cross-lane `ON DELETE CASCADE`, run with foreign keys disabled.
 - **Snapshots:** whole-file round-trip per shard; install refusal on a
   shard-map mismatch; `move-pool` round-trip (rung C).
-- **Isolation/scaling A/B** (`tests/raft_perf_smoke.rs` precedent):
+- **Isolation/scaling A/B** (`tests/integration/raft_perf_smoke.rs` precedent):
   alloc/s vs shard count on one box; one-pool storm isolation.
 - **Failure:** kill the leader → every shard fails over together (rung A)
   and independently (rung B); queue recovery on acquisition per shard.

@@ -129,7 +129,7 @@ Five evaluation sites, each constructing its own `JsonnetVm`:
 | `src/cmd/acl.rs:310` | ACL policy files ending in `.jsonnet` |
 | `src/manager/job_templates.rs:85` | job templates, with imports rejected via the VM import callback |
 
-Plus `tests/config_jobs.rs`, which built a sixth VM to evaluate every shipped
+Plus `tests/integration/config_jobs.rs`, which built a sixth VM to evaluate every shipped
 example.
 
 `source_jsonnet` was a proto field (`JobTemplate`, `UpsertJobTemplateRequest`),
@@ -233,14 +233,14 @@ each stand alone.
   default, `not_exported` dropped on export, import rejection (and the
   string/comment non-false-positive), contract errors carrying source context,
   `--var-code` expression evaluation, and import tracking.
-- `tests/config_jobs.rs` evaluates and fully validates every shipped jobspec —
+- `tests/integration/config_jobs.rs` evaluates and fully validates every shipped jobspec —
   extended with three new tests covering the **manager** configs, the **worker**
   configs, and the **job template** (parse manifest → resolve defaults →
   render → validate), none of which had coverage before.
 - `src/cmd/job.rs` tests: KV-backed vars keep their JSON type through
   `std.deserialize`, `--var-code` evaluates, and the Nickel string escaper
   escapes `%{`.
-- `tests/acl_endpoints.rs` template fixtures rewritten in Nickel, so the ACL
+- `tests/integration/acl_endpoints.rs` template fixtures rewritten in Nickel, so the ACL
   suite exercises the real render path.
 - A throwaway harness evaluated all 99 documentation code blocks; the four that
   do not evaluate standalone are illustrative alternative-value fragments and

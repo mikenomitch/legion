@@ -154,7 +154,7 @@ Legion's namespace support today is **vocabulary without values**. The pieces:
 - **List endpoints already filter per item.** `list_jobs`
   (`src/manager/server.rs:3758`) gates on `AclScope::any()` then `retain`s on
   `identity.allows(...)`. Namespace filtering rides the same path.
-- **`tests/acl_endpoints.rs` is a hard gate.** `every_manager_rpc_is_classified`
+- **`tests/integration/acl_endpoints.rs` is a hard gate.** `every_manager_rpc_is_classified`
   parses the proto and fails the build for an unclassified RPC, so new
   namespace RPCs cannot ship unprotected.
 - **Events are all-or-nothing.** `list_events` / `stream_events` gate on
@@ -1119,7 +1119,7 @@ developer policy for the new tenant.
 ## 12. Testing plan
 
 **Phase 0** — unit: name grammar, reserved names, `default` undeletable,
-non-empty deletion refused, cascade ordering. `tests/acl_endpoints.rs`: four
+non-empty deletion refused, cascade ordering. `tests/integration/acl_endpoints.rs`: four
 new endpoints in `endpoint_table` with builders; a scenario where a token
 scoped to `namespaces: ['team-*']` may create `team-b` and not `prod`.
 

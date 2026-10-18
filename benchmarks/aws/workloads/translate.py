@@ -2,7 +2,7 @@
 """Translate a benchmark scenario into per-system workload artifacts.
 
 One scenario file (benchmarks/scheduler/scenarios/*.json — the schema in
-tests/benchmark_support/mod.rs) becomes:
+tests/integration/benchmark_support/mod.rs) becomes:
 
   legion : one Nickel jobspec per job (.ncl, submitted with
            `legion job run <file>`)

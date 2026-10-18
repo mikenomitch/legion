@@ -628,7 +628,7 @@ comments per repo rule:
   `blocked_reason` (empty when not capacity-blocked).
 - Job status reply += the blocked detail (per-gang shortfall + since +
   attempts), mirroring §7's shape.
-- **No new RPCs** → no new entries in `tests/acl_endpoints.rs` (the
+- **No new RPCs** → no new entries in `tests/integration/acl_endpoints.rs` (the
   classification test will confirm nothing was missed).
 
 Structs and store:
@@ -734,7 +734,7 @@ Concurrency / property tests (extending the existing suite):
   the gang job; `blocked_since`/attempts survive or regenerate sanely.
 
 Integration (`tests/`, on the fake-node harness in
-`tests/scheduler_integration.rs`):
+`tests/integration/scheduler_integration.rs`):
 
 - S1 end to end: 8-gang on 6 slots → blocked status with correct shortfall
   + `job.gang_blocked` event; add two nodes → whole gang starts;
@@ -761,7 +761,7 @@ Regression:
   and branch, numbers in the PR per AGENTS.md. The gang branch must cost
   nothing when no task sets `gang` (the defer path is behind the flag; the
   only shared-path work is a per-task boolean).
-- `cargo test --test acl_endpoints` (standing rule; no new RPCs expected
+- `cargo test --test integration acl_endpoints::` (standing rule; no new RPCs expected
   to classify).
 
 ## Rollout and Backward Compatibility

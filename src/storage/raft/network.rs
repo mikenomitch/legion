@@ -134,7 +134,7 @@ pub(crate) struct ChannelPool {
     /// before dialing. Combined with dropping the node's inbound transport
     /// listener this fully isolates the node — the in-process equivalent of
     /// yanking its network cable, used by the durability tests
-    /// (`tests/raft_durability.rs`).
+    /// (`tests/integration/raft_durability.rs`).
     outbound_blocked: AtomicBool,
 }
 

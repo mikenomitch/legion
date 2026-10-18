@@ -164,7 +164,7 @@ Entries are ranked by project impact, highest first; the number is the rank.
 ## 7. Backend matrix lives in an integration-test runner, not Criterion
 
 - **The call:** the scenario × backend matrix is
-  `tests/scheduler_scale_benchmark.rs` (`#[ignore]`, env-driven, prints a
+  `tests/integration/scheduler_scale_benchmark.rs` (`#[ignore]`, env-driven, prints a
   table + writes JSON), not a Criterion bench.
 - **Alternatives:** parameterize the existing Criterion benches over
   backends.
@@ -232,7 +232,7 @@ Entries are ranked by project impact, highest first; the number is the rank.
   leadership flaps and failover gaps are excluded on purpose (they'd
   poison latency samples with election waits; the AWS plan owns failover
   measurement).
-- **Why it won:** same reasoning as `tests/raft_lanes.rs` — an in-process
+- **Why it won:** same reasoning as `tests/integration/raft_lanes.rs` — an in-process
   cluster on a loaded machine flaps at production timings, and a flapping
   benchmark measures the flap, not the scheduler.
 

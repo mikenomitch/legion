@@ -749,7 +749,7 @@ is a much more confusing error to receive.
 
 **Call.** A new `GetHeartbeatCadence` RPC and a `legion node cadence` verb,
 with `--json`, a `catalog()` entry (`read_only_safe: true`), an MCP tool,
-and a `tests/acl_endpoints.rs` row (`node`/`read`/`any`).
+and a `tests/integration/acl_endpoints.rs` row (`node`/`read`/`any`).
 
 ```console
 $ legion node cadence
@@ -823,7 +823,7 @@ better one than a wrong answer.
 adaptive-on/adaptive-off reproduction that is the cadence plan's phase-4
 acceptance criterion — have **not** been run. Correctness is covered by unit
 tests over the pure decision functions and by integration tests on the
-`tests/raft_lanes.rs` 3-node harness; scale is not.
+`tests/integration/raft_lanes.rs` 3-node harness; scale is not.
 
 **Alternative.** Hold the change until the rig is available.
 

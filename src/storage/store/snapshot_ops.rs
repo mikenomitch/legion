@@ -1215,7 +1215,7 @@ mod tests {
     fn store() -> R<Store> {
         let dir = tempfile::Builder::new()
             .prefix("legion-snapshot-ops-")
-            .tempdir()?
+            .tempdir_in(crate::test_scratch::root())?
             .keep();
         Store::start_storage(&ManagerConfigFull {
             store_path: dir.to_str().context("utf-8 path")?.to_string(),

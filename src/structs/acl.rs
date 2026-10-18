@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 /// Resource types ACL rules can cover.
 ///
 /// Deliberately a short, closed list: every gRPC endpoint maps onto exactly
-/// one of these (see the endpoint table in `tests/acl_endpoints.rs`).
+/// one of these (see the endpoint table in `tests/integration/acl_endpoints.rs`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AclResource {
     /// Jobs, rollouts, job specs, and plans.

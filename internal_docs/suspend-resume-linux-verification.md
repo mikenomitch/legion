@@ -314,7 +314,7 @@ the "UNDER PRESSURE, IN ORDER" preview in `legion node usage`. See
 What was tested on macOS: the ordering, the step runner, and the triggers
 against a fake node (`cargo test --lib worker::pressure`), capacity math and
 config validation (`resources::tests`, `structs::config::tests`), the manager
-half end to end (`cargo test --test node_pressure`), and the CLI rendering.
+half end to end (`cargo test --test integration node_pressure::`), and the CLI rendering.
 Nothing has written `memory.low` or `memory.reclaim` to a real kernel, and no
 real task has been evicted.
 
@@ -718,7 +718,7 @@ that captures into the node content store and restores at start. On macOS
 the `exec` disk round trip ran for real
 (`an_exec_disk_snapshot_round_trips_through_capture_and_restore`), the
 manager side ran against a simulated worker
-(`tests/snapshot_integration.rs`), and TAP handling ran against a fake host.
+(`tests/integration/snapshot_integration.rs`), and TAP handling ran against a fake host.
 The items below need a Linux worker, and the memory items need KVM.
 
 ### Prereqs
@@ -874,7 +874,7 @@ cat /proc/$VMM_PID/cgroup
 Suspend and resume: `legion instance suspend`, resume through `legion
 instance start`, `onRestoreFailure`, `reserve`, and the guest's resume
 handler (`legion guest-resume`). On macOS the manager side ran end to end
-against a simulated worker (`cargo test --test suspend_integration`), the
+against a simulated worker (`cargo test --test integration suspend_integration::`), the
 `exec` disk suspend ran for real
 (`an_exec_disk_suspend_cold_boots_on_its_retained_volume`), and the resume
 handler ran against a fake guest (`cargo test --lib guest_resume`). Nothing
@@ -1076,7 +1076,7 @@ Automatic suspend: the idle policy (worker detection, the manager's idle
 sweep), the `suspend` memory pressure step with local suspensions, and the
 sandbox balloon for `reclaim`. On macOS the manager side ran end to end with
 fake usage reports and simulated local-suspension reports (`cargo test
---test suspend_integration`), the idle detector and sampler ran against
+--test integration suspend_integration::`), the idle detector and sampler ran against
 fixture activity (`cargo test --lib worker::idle worker::usage`), the
 pressure ordering and step runner against a fake node (`cargo test --lib
 worker::pressure`), a pressure suspend of a real `exec` task ran through the
@@ -1244,7 +1244,7 @@ LEGION_SANDBOX_KERNEL=/path/to/vmlinux cargo test --lib sandbox_memory_checkpoin
 Fork and create-from-snapshot: `legion instance fork`, `legion instance
 create --from-snapshot`, and named snapshots (`legion snapshot alias`). On
 macOS the manager side ran end to end against a simulated worker (`cargo test
---test fork_integration`), a disk fork of an `exec` task ran for real with
+--test integration fork_integration::`), a disk fork of an `exec` task ran for real with
 three forks on real `local-dir` clones
 (`an_exec_disk_fork_gives_every_fork_its_own_copy_of_the_volume`), and the
 per-fork identity, MAC, and TAP handling ran against fakes
@@ -1547,7 +1547,7 @@ Durable checkpoints and cross-node resume: `suspend.durability = "store"`,
 `snapshot create --publish`, the `publish` and `warm` checkpoint ops,
 cross-node restore fetch, per-candidate `compat`, and `snapshot warm`. On
 macOS the manager side ran end to end against simulated workers (`cargo test
---test published_resume_integration`), and the worker transport ran for real
+--test integration published_resume_integration::`), and the worker transport ran for real
 with the `file` publisher between two worker task managers
 (`a_published_snapshot_restores_on_a_node_that_never_held_it`,
 `warm_fetches_published_parts_into_the_store_once`). That test carries its
@@ -1747,7 +1747,7 @@ constraint (docs/suspend-and-resume.md, "Capacity for resumes"). Nothing here
 is Linux-only code: the hold math, make-room, and the budget filter all run on
 the manager, and the worker's budget report reads its content store on any
 OS. On macOS they ran end to end with the heartbeat standing in for the worker
-(`cargo test --test suspend_integration`). What has never run is the whole
+(`cargo test --test integration suspend_integration::`). What has never run is the whole
 loop with real sandbox memory captures, whose timing (a capture takes about a
 second) is what make-room's "wait for the in-flight suspend" rule depends on,
 and a budget filled by real checkpoint files.
@@ -1858,7 +1858,7 @@ sandbox identity refresh through the identity disk, and the payload fix
 that carries `suspend` and `snapshots` to the worker. On macOS the TAP
 creation, counters, and identity disk rewrite ran against fakes and fixture
 trees, and the payload fix and Apple-container idle loop ran end to end
-(`cargo test --test apple_container_idle -- --ignored`). Nothing created a
+(`cargo test --test integration apple_container_idle:: -- --ignored`). Nothing created a
 real TAP on a bridge, read real `/sys/class/net` counters, or rewrote a
 running VMM's identity disk.
 
@@ -1984,7 +1984,7 @@ Pass: two more `lgf` devices on `br0`, named for `user-3-f1` and
 ### Ignored tests
 
 ```bash
-cargo test --test apple_container_idle -- --ignored   # macOS only
+cargo test --test integration apple_container_idle:: -- --ignored   # macOS only
 ```
 
 The Linux paths above have no ignored tests of their own: the TAP calls are

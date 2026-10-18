@@ -427,7 +427,7 @@ What differs from Linux:
   Apple containers instead of stalling the worker's heartbeat.
 
 The end-to-end test for this loop is
-`cargo test --test apple_container_idle -- --ignored`. It needs the
+`cargo test --test integration apple_container_idle:: -- --ignored`. It needs the
 `container` CLI and starts its service when it is down.
 
 ### Under memory pressure

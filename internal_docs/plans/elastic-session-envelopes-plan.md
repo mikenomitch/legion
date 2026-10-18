@@ -342,7 +342,7 @@ per-manager coalescer that folds every queued resize into one entry.
   committed size and the shrink cap, a grow answer raises the room, a
   stale payload inside the trust window is ignored.
 - **Unit, spec** (`src/structs/session.rs`): every refusal in §6.1.
-- **Integration** (`tests/session_integration.rs`, fake nodes, single-voter
+- **Integration** (`tests/integration/session_integration.rs`, fake nodes, single-voter
   raft): a heartbeat grow writes one entry and the router sees the new
   room, a grow on a node full of other work is `refused` with no entry, a
   partial grow takes what fits, a retried request is `applied` with no

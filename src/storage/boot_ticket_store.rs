@@ -201,7 +201,7 @@ mod boot_ticket_store_test {
     fn store() -> Store {
         let store_dir = tempfile::Builder::new()
             .prefix("legion-boot-ticket-")
-            .tempdir()
+            .tempdir_in(crate::test_scratch::root())
             .expect("temp dir")
             .keep();
         let config = crate::structs::ManagerConfigFull {

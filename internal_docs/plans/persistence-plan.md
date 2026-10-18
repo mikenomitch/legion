@@ -386,9 +386,9 @@ Implementation shape:
 Exit criteria:
 
 - [x] deterministic apply tests pass under network partitions
-      (`tests/raft_durability.rs`)
+      (`tests/integration/raft_durability.rs`)
 - [x] crash/restart + snapshot restore validated
-      (`tests/raft_snapshot_recovery.rs`)
+      (`tests/integration/raft_snapshot_recovery.rs`)
 
 ## Phase 3: Raft GA (control-plane operations) ✅ Done (2026-03-20)
 
@@ -421,11 +421,11 @@ Exit criteria:
       clusters (old simulated raft + real raft) are deliberately
       unsupported (fresh-bootstrap rule, `docs/upgrades.md`).
 - [x] Durability/partition/fault-injection test matrix for replicated
-      writes (`tests/raft_durability.rs`: divergence-under-interleaving,
+      writes (`tests/integration/raft_durability.rs`: divergence-under-interleaving,
       leader loss mid-burst, minority partition, any-single-node loss;
-      `tests/raft_snapshot_recovery.rs`: crash/restart + laggard
-      snapshot catch-up; `tests/raft_upgrade_bootstrap.rs`,
-      `tests/raft_cascade_delete.rs`).
+      `tests/integration/raft_snapshot_recovery.rs`: crash/restart + laggard
+      snapshot catch-up; `tests/integration/raft_upgrade_bootstrap.rs`,
+      `tests/integration/raft_cascade_delete.rs`).
 - [ ] Parallelize scheduler planning across manager nodes with Raft-fenced plan ownership so multiple managers can compute placement decisions concurrently without double-apply.
 
 ---

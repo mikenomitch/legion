@@ -481,7 +481,7 @@ Mechanics:
   protocol versions (refused with the upgrade order otherwise), and
   distinct cluster ids (self-peering refused).
 - ACL: `invite`/`join`/`leave` gate on `operator:write`; `members` on
-  `operator:read`. All are registered in `tests/acl_endpoints.rs`.
+  `operator:read`. All are registered in `tests/integration/acl_endpoints.rs`.
 
 ### 6.3 Request forwarding: one endpoint sees everything
 
@@ -947,7 +947,7 @@ parallel with them.
   incl. resume-after-failover (3), zone-failover decision logic under
   every health permutation (4), generation comparison and fencing (5).
 - **Integration (in-process multi-cluster harness, extending the
-  `tests/raft_durability.rs` pattern to N clusters):** peer two 3-node
+  `tests/integration/raft_durability.rs` pattern to N clusters):** peer two 3-node
   clusters and forward reads/writes/streams both ways; kill a peer
   mid-forward (typed error, local cluster unaffected); full S3 rollout
   with an induced failure per `onFailure` mode; partition the coordinator
@@ -956,7 +956,7 @@ parallel with them.
   promote, verify a worker rejects the resurrected primary's instructions
   and the demote path resubscribes it; measure and assert reported RPO
   bounds on the DR feed under write load.
-- **ACL:** every new RPC classified in `tests/acl_endpoints.rs` (the
+- **ACL:** every new RPC classified in `tests/integration/acl_endpoints.rs` (the
   build-failing gate), including `Federation` service methods and the
   worker-plane additions.
 - **Perf regression:** forwarding adds one hop — bound it in

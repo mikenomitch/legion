@@ -1957,7 +1957,7 @@ impl ManagerDaemonService {
     /// Every user-facing endpoint must call this (or `authenticate_acl` +
     /// `acl::enforce` when the scope is only known after parsing the request
     /// body) before doing any work. See AGENTS.md and
-    /// `tests/acl_endpoints.rs`, which fails when an endpoint is missing
+    /// `tests/integration/acl_endpoints.rs`, which fails when an endpoint is missing
     /// coverage.
     fn check_acl<T>(
         &self,
@@ -13700,7 +13700,7 @@ mod tests {
     fn setup_store() -> R<Store> {
         let store_dir = Builder::new()
             .prefix("legion-manager-server-")
-            .tempdir()
+            .tempdir_in(crate::test_scratch::root())
             .context("error creating temp store directory")?
             .keep();
         let store_config = ManagerConfigFull {

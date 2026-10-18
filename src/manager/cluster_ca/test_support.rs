@@ -72,7 +72,7 @@ pub fn write(dir: &Path, name: &str, contents: &str) -> R<PathBuf> {
 
 /// A store with the given `clusterCa` provider.
 pub fn store_with(cluster_ca: crate::structs::config::ClusterCaConfigFull) -> R<Store> {
-    let dir = tempfile::tempdir()?.keep();
+    let dir = tempfile::tempdir_in(crate::test_scratch::root())?.keep();
     Store::start_storage(&crate::structs::ManagerConfigFull {
         store_path: dir.display().to_string(),
         cluster_ca,

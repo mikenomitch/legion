@@ -280,6 +280,7 @@ by project impact. The full template and a worked example:
 - [suspend-resume-and-oversubscription-plan_calls.md](calls/suspend-resume-and-oversubscription-plan_calls.md)
 - [suspend-resume-ui-plan_calls.md](calls/suspend-resume-ui-plan_calls.md)
 - [session-ui-plan_calls.md](calls/session-ui-plan_calls.md)
+- [test-build-footprint_calls.md](calls/test-build-footprint_calls.md)
 - [volume-plugin-system-plan_calls.md](calls/volume-plugin-system-plan_calls.md)
 - [worker-plane-auth-plan_calls.md](calls/worker-plane-auth-plan_calls.md)
 - [worker-simulation-plan_calls.md](calls/worker-simulation-plan_calls.md)

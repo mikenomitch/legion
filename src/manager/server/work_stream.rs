@@ -27,9 +27,10 @@ pub(super) fn next_work_message(
     store: &Store,
     work_log: &WorkLog,
     log: &NodeWorkLog,
+    session: u64,
     node_id: &str,
 ) -> R<Option<StreamWorkReply>> {
-    let (resync, upserts, stops) = match WorkLog::take_pending(log) {
+    let (resync, upserts, stops) = match WorkLog::take_pending(log, session) {
         PendingWork::Nothing => (false, Vec::new(), Vec::new()),
         PendingWork::Resync => (
             true,
@@ -179,7 +180,7 @@ impl ManagerDaemonService {
                     let log = log.clone();
                     let node_id = node_id.clone();
                     tokio::task::spawn_blocking(move || {
-                        next_work_message(&store, &work_log, &log, &node_id)
+                        next_work_message(&store, &work_log, &log, session, &node_id)
                     })
                     .await
                 };

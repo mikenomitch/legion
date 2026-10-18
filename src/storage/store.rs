@@ -2347,7 +2347,7 @@ impl Store {
     /// from this node fails as unreachable before dialing. Paired with
     /// dropping the node's inbound transport listener this fully isolates
     /// the node from its peers — the in-process equivalent of yanking its
-    /// network cable (`tests/raft_durability.rs`). Errors on non-raft
+    /// network cable (`tests/integration/raft_durability.rs`). Errors on non-raft
     /// backends and before the raft engine has started.
     pub fn raft_set_outbound_blocked(&self, blocked: bool) -> R<()> {
         self.persistence_driver
@@ -5001,7 +5001,7 @@ impl Store {
     /// fast path, its re-run-singly fallback, and the
     /// `plan_apply_coalescing: false` path. Exactly the pre-D5 operation.
     /// The two formats propose under their own op names — the raft log (and
-    /// the lane classification in `tests/raft_seam.rs`) says which walk ran.
+    /// the lane classification in `tests/integration/raft_seam.rs`) says which walk ran.
     fn submit_and_apply_plan_replicated(&self, request: PlanApplyRequest) -> R<PlanApplyReply> {
         match request.placements {
             PlanPlacements::Nodes(_) => {
@@ -7773,7 +7773,7 @@ impl Store {
     /// and see only COMMITTED state, so a reconcile composed into the same
     /// capture as the eviction could not observe the eviction and placed
     /// nothing (latent raft-mode bug, exposed by
-    /// tests/raft_ownership_guard.rs). Sequencing the ops lets each read
+    /// tests/integration/raft_ownership_guard.rs). Sequencing the ops lets each read
     /// its predecessor's committed effects. A failed reconcile queues its
     /// own `job_reschedule` retry
     /// ([`Self::reconcile_job_configs_or_requeue`]), because a re-run of
@@ -21302,7 +21302,7 @@ mod tests {
     fn setup_store() -> R<Store> {
         let store_dir = Builder::new()
             .prefix("khepri-store-")
-            .tempdir()
+            .tempdir_in(crate::test_scratch::root())
             .context("Error creating temp store directory")?
             .keep();
 
@@ -28203,7 +28203,7 @@ mod tests {
     fn allocation_ids_are_never_reused_after_removal_or_restart() -> R<()> {
         let store_dir = Builder::new()
             .prefix("khepri-store-ids-")
-            .tempdir()
+            .tempdir_in(crate::test_scratch::root())
             .context("Error creating temp store directory")?
             .keep();
         let mut config = ManagerConfigFull {
@@ -30369,7 +30369,7 @@ mod tests {
         dst.insert_node(make_node_msg("node-a", "active"))?;
         let attached = dst.work_log().attach("node-a", 0, 0);
         assert!(matches!(
-            WorkLog::take_pending(&attached.log),
+            WorkLog::take_pending(&attached.log, attached.session),
             PendingWork::Resync
         ));
 
@@ -30391,7 +30391,10 @@ mod tests {
             "read model rebuilt from the committed rows"
         );
         assert!(
-            matches!(WorkLog::take_pending(&attached.log), PendingWork::Resync),
+            matches!(
+                WorkLog::take_pending(&attached.log, attached.session),
+                PendingWork::Resync
+            ),
             "streaming workers are resynced"
         );
         Ok(())

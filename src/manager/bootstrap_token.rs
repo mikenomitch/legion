@@ -238,7 +238,7 @@ mod bootstrap_token_test {
     fn test_store() -> R<Store> {
         let store_dir = tempfile::Builder::new()
             .prefix("legion-bootstrap-token-")
-            .tempdir()?
+            .tempdir_in(crate::test_scratch::root())?
             .keep();
         Store::start_storage(&ManagerConfigFull {
             store_path: store_dir.to_string_lossy().into_owned(),

@@ -5274,7 +5274,7 @@ mod tests {
     fn setup_store() -> R<Store> {
         let dir = tempfile::Builder::new()
             .prefix("khepri-raft-driver-")
-            .tempdir()
+            .tempdir_in(crate::test_scratch::root())
             .context("Error creating temp store directory")?
             .keep();
         let config = crate::structs::ManagerConfigFull {

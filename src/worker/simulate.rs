@@ -150,7 +150,7 @@ impl std::fmt::Debug for SimObserver {
 }
 
 /// One class of simulated node. Field-compatible with the benchmark
-/// scenario `node_profiles` entries (`tests/benchmark_support/mod.rs`), so
+/// scenario `node_profiles` entries (`tests/integration/benchmark_support/mod.rs`), so
 /// a scenario file can be passed to `--profiles` directly. `count` is a
 /// *weight*: `--simulate N` is distributed across profiles proportionally.
 #[derive(Debug, Clone, Deserialize)]
