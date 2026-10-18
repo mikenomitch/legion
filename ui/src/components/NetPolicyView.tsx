@@ -67,13 +67,15 @@ export type EffectiveChain = {
   protocol: string
   policy: string
   accessLog: boolean
-  tls?: { mode: string }
+  /** `service.allow` on a mesh service: the verified callers the mesh port admits. */
+  callers?: { allow: string[]; source: string }
   rules?: EffectiveRule[]
   handlers?: EffectiveHandler[]
 }
 
 export type EffectivePolicy = {
   mode?: string
+  mesh?: boolean
   egress?: EffectiveChain
   ingress?: EffectiveChain
   sources?: string[]
@@ -90,7 +92,7 @@ export const parseEffectivePolicy = (json: string): EffectivePolicy | undefined 
 }
 
 export const isPolicyEmpty = (policy?: EffectivePolicy) =>
-  !policy || (!policy.mode && !policy.egress && !policy.ingress)
+  !policy || (!policy.mode && policy.mesh === undefined && !policy.egress && !policy.ingress)
 
 const describeMatch = (match?: RuleMatch): string => {
   if (!match) return 'anything'
@@ -132,8 +134,10 @@ function ChainView(props: { direction: 'egress' | 'ingress'; chain: EffectiveCha
         <Badge tone={props.chain.policy === 'deny' ? 'warn' : 'ok'} dot>
           fallthrough {props.chain.policy}
         </Badge>
-        <Show when={props.chain.tls}>
-          <Badge tone="info">tls {props.chain.tls!.mode}</Badge>
+        <Show when={props.chain.callers}>
+          <Badge tone="info" title={`${props.chain.callers!.source}: only these callers reach the mesh port`}>
+            callers {props.chain.callers!.allow.join(', ')}
+          </Badge>
         </Show>
         <Show when={props.chain.accessLog}>
           <Badge tone="neutral">access log</Badge>

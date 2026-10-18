@@ -417,10 +417,11 @@ pub fn identities_from_desired(
                 .map(|network| network.labels)
                 .unwrap_or_default()
         };
-        let group = serde_json::from_str::<serde_json::Value>(&allocation.task_config)
-            .ok()
-            .and_then(|v| v.get("group").and_then(|g| g.as_str()).map(str::to_string))
-            .unwrap_or_else(|| "default".to_string());
+        let group = if allocation.task_group.is_empty() {
+            crate::structs::default_task_group()
+        } else {
+            allocation.task_group.clone()
+        };
         let ports = if allocation.network.trim().is_empty() {
             BTreeMap::new()
         } else {

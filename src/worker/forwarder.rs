@@ -97,6 +97,9 @@ pub struct UpstreamSpec {
     /// `connect.upstreams[].credentials` — headers injected in HTTP mode,
     /// with values from [`ForwarderContext`]'s credential store.
     pub credentials: Vec<UpstreamCredential>,
+    /// `connect.upstreams[].ca` — the trust bundle an external TLS upstream
+    /// is verified against instead of the public roots.
+    pub ca: Option<crate::structs::source::Source>,
     /// Name-is-config: the VIP (`127.42.b.n`) and canonical port this
     /// upstream is also served on, so `<key>.svc.legion:<port>` reaches the
     /// same listener state. `None` on platforms without 127/8 routing.
@@ -170,6 +173,7 @@ struct UpstreamShared {
     http_protocol: bool,
     handlers: Vec<HopConfig>,
     credentials: Vec<UpstreamCredential>,
+    ca: Option<crate::structs::source::Source>,
     /// The egress chain's hops plus this upstream's, compiled per policy body.
     pipelines: PipelineCache,
     /// HTTP-mode state, built on first use (an upstream can enter HTTP mode
@@ -186,13 +190,37 @@ type HandlerEndpoints = HashMap<(i64, String), Vec<Endpoint>>;
 /// built each, and the result.
 type IngressTlsConfigs =
     HashMap<(i64, String), (String, Result<Arc<rustls::ServerConfig>, String>)>;
-/// An allocation's KV-held ingress certificate: the last good one (kept when
-/// a later fetch fails, so a bad `kv put` never takes a listener down) and
-/// the latest fetch problem.
+/// KV-held TLS material by (kind, allocation, port label or upstream key):
+/// `port_cert`, `client_ca`, or `upstream_ca` (`structs::source`).
+pub type TlsMaterialKey = (&'static str, i64, String);
+
+/// One piece of KV-held TLS material: the last good value (kept when a later
+/// fetch fails, so a bad `kv put` never takes a listener down) and the
+/// latest fetch problem.
 #[derive(Debug, Default, Clone)]
-pub struct KvCertState {
-    pub cert: Option<Arc<crate::worker::netd::tls::KvCertificate>>,
+pub struct TlsMaterialState {
+    pub held: Option<Arc<HeldTls>>,
     pub error: Option<String>,
+}
+
+/// A fetched certificate (with its key) or CA bundle, validated on arrival.
+#[derive(Debug)]
+pub enum HeldTls {
+    Cert(crate::worker::netd::tls::CertKey),
+    Ca {
+        source: String,
+        version: i64,
+        roots: rustls::RootCertStore,
+    },
+}
+
+impl HeldTls {
+    pub fn version(&self) -> i64 {
+        match self {
+            HeldTls::Cert(cert) => cert.version,
+            HeldTls::Ca { version, .. } => *version,
+        }
+    }
 }
 
 /// A secret value held for credential injection. Debug never prints it, so
@@ -268,9 +296,13 @@ pub struct ForwarderContext {
     /// Ingress TLS configs per (allocation, port label): the fingerprint of
     /// what built it, and the result (an error is reported as `tls_error`).
     ingress_tls: Mutex<IngressTlsConfigs>,
-    /// `certFrom = { kv }` material per allocation, from
+    /// KV-held port certificates, client CAs, and upstream CAs, from
     /// `FetchDatapathMaterial`. In memory only.
-    kv_certs: Mutex<HashMap<i64, KvCertState>>,
+    tls_material: Mutex<HashMap<TlsMaterialKey, TlsMaterialState>>,
+    /// Client configs for external upstreams that pin a `ca`, by (allocation,
+    /// upstream key): the fingerprint of what built each, and the result.
+    upstream_tls:
+        Mutex<HashMap<(i64, String), (String, Result<Arc<rustls::ClientConfig>, String>)>>,
     /// `connect.upstreams[].credentials` values, from
     /// `FetchDatapathMaterial`. In memory only: never persisted, never
     /// logged, never handed to the task.
@@ -348,7 +380,8 @@ impl ForwarderContext {
             mesh: RwLock::new(None),
             mesh_wanted: AtomicBool::new(false),
             ingress_tls: Mutex::new(HashMap::new()),
-            kv_certs: Mutex::new(HashMap::new()),
+            tls_material: Mutex::new(HashMap::new()),
+            upstream_tls: Mutex::new(HashMap::new()),
             credentials: Mutex::new(HashMap::new()),
             edges: Arc::new(crate::worker::netd::graph::EdgeLedger::new()),
             activity: Arc::new(crate::worker::netd::activity::ActivityLedger::new()),
@@ -531,7 +564,8 @@ impl ForwarderContext {
         lock(&self.handler_endpoints).retain(|(id, _), _| live.contains(id));
         lock(&self.handler_health).retain(|(id, _), _| live.contains(id));
         lock(&self.ingress_tls).retain(|(id, _), _| live.contains(id));
-        lock(&self.kv_certs).retain(|id, _| live.contains(id));
+        lock(&self.tls_material).retain(|(_, id, _), _| live.contains(id));
+        lock(&self.upstream_tls).retain(|(id, _), _| live.contains(id));
         lock(&self.credentials).retain(|(id, _, _), _| live.contains(id));
     }
 
@@ -658,36 +692,66 @@ impl ForwarderContext {
         problems
     }
 
-    /// The KV version of the certificate held for an allocation (0 for none),
-    /// what `FetchDatapathMaterial` compares against.
-    pub fn kv_cert_version(&self, allocation_id: i64) -> i64 {
-        lock(&self.kv_certs)
-            .get(&allocation_id)
-            .and_then(|state| state.cert.as_ref())
-            .map(|cert| cert.version)
+    /// The version of the KV-held TLS material held (0 for none), what
+    /// `FetchDatapathMaterial` compares against.
+    pub fn tls_material_version(&self, kind: &'static str, allocation_id: i64, key: &str) -> i64 {
+        lock(&self.tls_material)
+            .get(&(kind, allocation_id, key.to_string()))
+            .and_then(|state| state.held.as_ref())
+            .map(|held| held.version())
             .unwrap_or(0)
     }
 
-    /// Install a freshly fetched certificate. New connections pick it up via
-    /// the version in the server-config fingerprint; open ones keep theirs.
-    pub fn set_kv_cert(&self, allocation_id: i64, cert: crate::worker::netd::tls::KvCertificate) {
-        lock(&self.kv_certs).insert(
-            allocation_id,
-            KvCertState {
-                cert: Some(Arc::new(cert)),
+    /// The KV-held TLS material for one port or upstream.
+    pub fn tls_material(
+        &self,
+        kind: &'static str,
+        allocation_id: i64,
+        key: &str,
+    ) -> TlsMaterialState {
+        lock(&self.tls_material)
+            .get(&(kind, allocation_id, key.to_string()))
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// Install freshly fetched material. New connections pick it up via the
+    /// version in the config fingerprint; open ones keep theirs.
+    pub fn set_tls_material(
+        &self,
+        kind: &'static str,
+        allocation_id: i64,
+        key: &str,
+        held: HeldTls,
+    ) {
+        lock(&self.tls_material).insert(
+            (kind, allocation_id, key.to_string()),
+            TlsMaterialState {
+                held: Some(Arc::new(held)),
                 error: None,
             },
         );
     }
 
-    /// Record a fetch problem, keeping whatever certificate is held.
-    pub fn set_kv_cert_error(&self, allocation_id: i64, error: String) {
-        lock(&self.kv_certs).entry(allocation_id).or_default().error = Some(error);
+    /// Record a fetch problem, keeping whatever is held.
+    pub fn set_tls_material_error(
+        &self,
+        kind: &'static str,
+        allocation_id: i64,
+        key: &str,
+        error: String,
+    ) {
+        lock(&self.tls_material)
+            .entry((kind, allocation_id, key.to_string()))
+            .or_default()
+            .error = Some(error);
     }
 
     /// Clear a fetch problem after an `unchanged` reply.
-    pub fn clear_kv_cert_error(&self, allocation_id: i64) {
-        if let Some(state) = lock(&self.kv_certs).get_mut(&allocation_id) {
+    pub fn clear_tls_material_error(&self, kind: &'static str, allocation_id: i64, key: &str) {
+        if let Some(state) =
+            lock(&self.tls_material).get_mut(&(kind, allocation_id, key.to_string()))
+        {
             state.error = None;
         }
     }
@@ -843,30 +907,46 @@ impl ForwarderContext {
             .map(|(_, client)| tokio_rustls::TlsConnector::from(client.clone()))
     }
 
-    /// The server config for an ingress listener's chain, built once per
-    /// (allocation, label, material) and rebuilt when the material changes.
+    /// The server config for an ingress port that terminates TLS, built
+    /// once per (allocation, label, material) and rebuilt when the material
+    /// changes: the node certificate for a mesh port (clients verified
+    /// against the mesh CA), or the port's own `tls`.
     pub fn ingress_server_config(
         &self,
         allocation_id: i64,
         label: &str,
-        tls: &crate::structs::netpolicy::TlsConfig,
+        termination: &PortTermination,
     ) -> Result<Arc<rustls::ServerConfig>, String> {
+        use crate::structs::source::{MATERIAL_CLIENT_CA, MATERIAL_PORT_CERT};
         let mesh = self.mesh_identity();
-        let kv_cert = tls.cert_kv_path().map(|_| {
-            lock(&self.kv_certs)
-                .get(&allocation_id)
-                .cloned()
-                .unwrap_or_default()
-        });
-        let fingerprint = format!(
-            "{}|{}|{}",
-            serde_json::to_string(tls).unwrap_or_default(),
-            mesh.as_ref().map(|m| m.expires_at).unwrap_or(0),
-            kv_cert
+        let (cert_state, ca_state) = match termination {
+            PortTermination::Mesh => (None, None),
+            PortTermination::Own(tls) => (
+                tls.cert
+                    .is_fetched()
+                    .then(|| self.tls_material(MATERIAL_PORT_CERT, allocation_id, label)),
+                tls.clients
+                    .as_ref()
+                    .filter(|clients| clients.ca.is_fetched())
+                    .map(|_| self.tls_material(MATERIAL_CLIENT_CA, allocation_id, label)),
+            ),
+        };
+        let version = |state: &Option<TlsMaterialState>| {
+            state
                 .as_ref()
-                .and_then(|state| state.cert.as_ref())
-                .map(|cert| cert.version)
+                .and_then(|state| state.held.as_ref())
+                .map(|held| held.version())
                 .unwrap_or(0)
+        };
+        let fingerprint = format!(
+            "{}|{}|{}|{}",
+            match termination {
+                PortTermination::Mesh => "mesh".to_string(),
+                PortTermination::Own(tls) => serde_json::to_string(tls).unwrap_or_default(),
+            },
+            mesh.as_ref().map(|m| m.expires_at).unwrap_or(0),
+            version(&cert_state),
+            version(&ca_state),
         );
         let key = (allocation_id, label.to_string());
         {
@@ -877,42 +957,17 @@ impl ForwarderContext {
                 }
             }
         }
-        let mutual = tls.mode == crate::structs::netpolicy::TLS_MUTUAL;
-        let result: Result<Arc<rustls::ServerConfig>, String> =
-            if let Some(path) = tls.cert_kv_path() {
-                let state = kv_cert.unwrap_or_default();
-                match state.cert {
-                    Some(cert) => cert
-                        .server_config(tls, mesh.as_deref())
-                        .map_err(|err| format!("kv {path}: {err:#}")),
-                    None => Err(state
-                        .error
-                        .unwrap_or_else(|| format!("kv {path}: certificate not fetched yet"))),
-                }
-            } else if tls.cert_from_mesh() {
-                match mesh {
-                    Some(identity) => identity
-                        .server_config(mutual)
-                        .map_err(|err| format!("mesh server config: {err:#}")),
-                    None => Err("mesh certificate not issued yet".to_string()),
-                }
-            } else if mutual && tls.client_ca.as_deref() == Some("legion") {
-                // BYO server cert, mesh clients.
-                match mesh {
-                    Some(identity) => crate::worker::netd::tls::byo_server_config(
-                        &crate::structs::netpolicy::TlsConfig {
-                            client_ca: None,
-                            mode: crate::structs::netpolicy::TLS_SERVER.to_string(),
-                            ..tls.clone()
-                        },
-                    )
-                    .and_then(|_| identity.server_config(true))
-                    .map_err(|err| format!("{err:#}")),
-                    None => Err("mesh certificate not issued yet".to_string()),
-                }
-            } else {
-                crate::worker::netd::tls::byo_server_config(tls).map_err(|err| format!("{err:#}"))
-            };
+        let result = match termination {
+            PortTermination::Mesh => match mesh {
+                Some(identity) => identity
+                    .server_config(true)
+                    .map_err(|err| format!("mesh server config: {err:#}")),
+                None => Err("mesh certificate not issued yet".to_string()),
+            },
+            PortTermination::Own(tls) => {
+                port_server_config(tls, cert_state.as_ref(), ca_state.as_ref())
+            }
+        };
         if let Err(err) = &result {
             debug!(allocation_id, label, error = %err, "Ingress TLS material is not usable");
         }
@@ -922,13 +977,25 @@ impl ForwarderContext {
 
     /// (ready, error) for the allocation's ingress TLS material.
     pub fn ingress_tls_status(&self, allocation_id: i64) -> (bool, String) {
-        // KV certificates are reported eagerly, from the fetch, rather than
+        use crate::structs::source::{MATERIAL_CLIENT_CA, MATERIAL_PORT_CERT};
+        // KV material is reported eagerly, from the fetch, rather than
         // waiting for the first connection to build a config: a missing key
-        // is not ready, and a failed renewal while an older certificate
-        // still serves is ready with the error attached.
-        if let Some(state) = lock(&self.kv_certs).get(&allocation_id) {
-            if let Some(error) = &state.error {
-                return (state.cert.is_some(), error.clone());
+        // is not ready, and a failed renewal while an older value still
+        // serves is ready with the error attached.
+        {
+            let material = lock(&self.tls_material);
+            let mut held: Vec<_> = material
+                .iter()
+                .filter(|((kind, id, _), _)| {
+                    *id == allocation_id
+                        && (*kind == MATERIAL_PORT_CERT || *kind == MATERIAL_CLIENT_CA)
+                })
+                .collect();
+            held.sort_by(|a, b| a.0.cmp(b.0));
+            for (_, state) in held {
+                if let Some(error) = &state.error {
+                    return (state.held.is_some(), error.clone());
+                }
             }
         }
         let cache = lock(&self.ingress_tls);
@@ -940,6 +1007,38 @@ impl ForwarderContext {
             }
         }
         (true, String::new())
+    }
+
+    /// Problems with the trust bundles external upstreams pin
+    /// (`connect.upstreams[].ca`), for the allocation's status.
+    pub fn upstream_ca_problems(&self, allocation_id: i64) -> Vec<String> {
+        use crate::structs::source::MATERIAL_UPSTREAM_CA;
+        let mut problems: Vec<String> = lock(&self.tls_material)
+            .iter()
+            .filter(|((kind, id, _), _)| *kind == MATERIAL_UPSTREAM_CA && *id == allocation_id)
+            .filter_map(|((_, _, upstream), state)| {
+                let error = state.error.as_deref()?;
+                Some(if state.held.is_some() {
+                    format!("upstream {upstream} ca: verifying with the previous bundle; {error}")
+                } else {
+                    format!("upstream {upstream} ca: {error} (connections on this upstream fail)")
+                })
+            })
+            .collect();
+        problems.extend(
+            lock(&self.upstream_tls)
+                .iter()
+                .filter(|((id, _), _)| *id == allocation_id)
+                .filter_map(|((_, upstream), (_, result))| {
+                    result
+                        .as_ref()
+                        .err()
+                        .map(|err| format!("upstream {upstream} ca: {err}"))
+                }),
+        );
+        problems.sort();
+        problems.dedup();
+        problems
     }
 
     /// Where to write per-allocation access logs.
@@ -1046,7 +1145,7 @@ impl ForwarderContext {
     }
 
     /// A rustls client trusting the Mozilla roots (webpki-roots). Built once
-    /// per process; external upstreams that pin a CA are a later phase.
+    /// per process.
     pub fn tls_connector(&self) -> tokio_rustls::TlsConnector {
         let config = self.tls.get_or_init(|| {
             let mut roots = rustls::RootCertStore::empty();
@@ -1059,6 +1158,110 @@ impl ForwarderContext {
         });
         tokio_rustls::TlsConnector::from(config.clone())
     }
+
+    /// The connector for one external upstream: the public roots, or the
+    /// trust bundle its `ca` pins (from KV or a file on the node). An error
+    /// means the upstream must not dial: a pinned CA that is not usable never
+    /// falls back to the public roots.
+    pub fn upstream_tls_connector(
+        &self,
+        allocation_id: i64,
+        upstream: &str,
+        ca: Option<&crate::structs::source::Source>,
+    ) -> Result<tokio_rustls::TlsConnector, String> {
+        use crate::structs::source::MATERIAL_UPSTREAM_CA;
+        let Some(ca) = ca else {
+            return Ok(self.tls_connector());
+        };
+        let state = ca
+            .is_fetched()
+            .then(|| self.tls_material(MATERIAL_UPSTREAM_CA, allocation_id, upstream));
+        let fingerprint = format!(
+            "{ca}|{}",
+            state
+                .as_ref()
+                .and_then(|state| state.held.as_ref())
+                .map(|held| held.version())
+                .unwrap_or(0)
+        );
+        let key = (allocation_id, upstream.to_string());
+        if let Some((fp, result)) = lock(&self.upstream_tls).get(&key) {
+            if *fp == fingerprint {
+                return result.clone().map(tokio_rustls::TlsConnector::from);
+            }
+        }
+        let result = match (ca.file_paths(), state) {
+            (Some((path, _)), _) => crate::worker::netd::tls::roots_from_file(path)
+                .map(crate::worker::netd::tls::pinned_client_config)
+                .map_err(|err| format!("{err:#}")),
+            (None, Some(state)) => match state.held.as_deref() {
+                Some(HeldTls::Ca { roots, .. }) => Ok(
+                    crate::worker::netd::tls::pinned_client_config(roots.clone()),
+                ),
+                _ => Err(state
+                    .error
+                    .unwrap_or_else(|| format!("{ca}: not fetched yet"))),
+            },
+            (None, None) => Err(format!("{ca}: not a CA source")),
+        };
+        lock(&self.upstream_tls).insert(key, (fingerprint, result.clone()));
+        result.map(tokio_rustls::TlsConnector::from)
+    }
+}
+
+/// How an ingress port terminates TLS.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PortTermination {
+    /// The service's mesh port: the node certificate, clients verified
+    /// against the mesh CA.
+    Mesh,
+    /// The port's own `tls`.
+    Own(crate::structs::network::PortTls),
+}
+
+/// Build a port's own server config from its sources and the fetched state
+/// of the KV-held ones.
+fn port_server_config(
+    tls: &crate::structs::network::PortTls,
+    cert_state: Option<&TlsMaterialState>,
+    ca_state: Option<&TlsMaterialState>,
+) -> Result<Arc<rustls::ServerConfig>, String> {
+    use crate::worker::netd::tls::{roots_from_file, CertKey};
+    let from_files;
+    let cert: &CertKey = match (tls.cert.file_paths(), cert_state) {
+        (Some((cert, key)), _) => {
+            from_files = CertKey::from_files(cert, key).map_err(|err| format!("{err:#}"))?;
+            &from_files
+        }
+        (None, Some(state)) => match state.held.as_deref() {
+            Some(HeldTls::Cert(cert)) => cert,
+            _ => {
+                return Err(state
+                    .error
+                    .clone()
+                    .unwrap_or_else(|| format!("{}: certificate not fetched yet", tls.cert)))
+            }
+        },
+        (None, None) => return Err(format!("{}: not a certificate source", tls.cert)),
+    };
+    let clients = match &tls.clients {
+        None => None,
+        Some(clients) => Some(match (clients.ca.file_paths(), ca_state) {
+            (Some((path, _)), _) => roots_from_file(path).map_err(|err| format!("{err:#}"))?,
+            (None, Some(state)) => match state.held.as_deref() {
+                Some(HeldTls::Ca { roots, .. }) => roots.clone(),
+                _ => {
+                    return Err(state
+                        .error
+                        .clone()
+                        .unwrap_or_else(|| format!("{}: client CA not fetched yet", clients.ca)))
+                }
+            },
+            (None, None) => return Err(format!("{}: not a CA source", clients.ca)),
+        }),
+    };
+    cert.server_config(clients)
+        .map_err(|err| format!("{}: {err:#}", cert.source))
 }
 
 impl UpstreamShared {
@@ -1103,6 +1306,7 @@ impl UpstreamShared {
             http_protocol: spec.http_protocol,
             handlers: spec.handlers.clone(),
             credentials: spec.credentials.clone(),
+            ca: spec.ca.clone(),
             pipelines: PipelineCache::default(),
             http: OnceLock::new(),
             gated: spec.attachment.is_gated(),
@@ -1144,6 +1348,7 @@ impl UpstreamShared {
                         self.context.log_dir_for(self.allocation_id),
                     );
                     settings.credentials = self.credentials.clone();
+                    settings.ca = self.ca.clone();
                     Arc::new(settings)
                 })
                 .clone(),
@@ -1858,7 +2063,24 @@ async fn forward_external<C>(
             return;
         }
     };
-    let connector = shared.context.tls_connector();
+    let connector = match shared.context.upstream_tls_connector(
+        shared.allocation_id,
+        &shared.service,
+        shared.ca.as_ref(),
+    ) {
+        Ok(connector) => connector,
+        Err(err) => {
+            warn!(
+                allocation_id = shared.allocation_id,
+                upstream = %shared.service,
+                error = %err,
+                "External upstream CA is not usable; refusing the connection"
+            );
+            net_metrics::connection("egress", PROTOCOL_TCP, "error");
+            let _ = client.shutdown().await;
+            return;
+        }
+    };
     match tokio::time::timeout(DIAL_TIMEOUT, connector.connect(server_name, upstream)).await {
         Ok(Ok(tls)) => {
             net_metrics::connection("egress", PROTOCOL_TCP, "allow");
@@ -2248,6 +2470,7 @@ mod tests {
             http: None,
             handlers: Vec::new(),
             credentials: Vec::new(),
+            ca: None,
             vip: None,
             canonical_port: None,
             attachment: Attachment::Host,

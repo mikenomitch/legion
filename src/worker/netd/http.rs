@@ -210,6 +210,9 @@ pub struct HttpSettings {
     /// `connect.upstreams[].credentials`: headers set on every request this
     /// upstream sends, with values from the context's credential store.
     pub credentials: Vec<UpstreamCredential>,
+    /// `connect.upstreams[].ca`: the trust bundle an external `https://`
+    /// upstream is verified against instead of the public roots.
+    pub ca: Option<crate::structs::source::Source>,
 }
 
 /// Headers to set on an outgoing request in place of whatever the task sent
@@ -277,6 +280,7 @@ impl HttpSettings {
             handlers: handlers.to_vec(),
             pipelines: PipelineCache::default(),
             credentials: Vec::new(),
+            ca: None,
         }
     }
 
@@ -1531,7 +1535,8 @@ async fn open(
                 .map_err(|err| AttemptError::Connect(err.to_string()))?;
             let tls = settings
                 .context
-                .tls_connector()
+                .upstream_tls_connector(settings.allocation_id, &settings.key, settings.ca.as_ref())
+                .map_err(AttemptError::Connect)?
                 .connect(server_name, stream)
                 .await
                 .map_err(|err| AttemptError::Connect(format!("tls: {err}")))?;
@@ -2062,6 +2067,7 @@ mod integration {
                 http: Some(http),
                 handlers: vec![dlp],
                 credentials: Vec::new(),
+                ca: None,
                 vip: None,
                 canonical_port: None,
                 attachment: crate::worker::netd::attach::Attachment::Host,
@@ -2186,6 +2192,7 @@ mod integration {
                 http: None,
                 handlers: Vec::new(),
                 credentials: Vec::new(),
+                ca: None,
                 vip: None,
                 canonical_port: None,
                 attachment: crate::worker::netd::attach::Attachment::Host,
@@ -2245,6 +2252,7 @@ mod integration {
                 http: None,
                 handlers: Vec::new(),
                 credentials,
+                ca: None,
                 vip: None,
                 canonical_port: None,
                 attachment: crate::worker::netd::attach::Attachment::Host,
@@ -2381,6 +2389,7 @@ mod integration {
                 http: None,
                 handlers: Vec::new(),
                 credentials,
+                ca: None,
                 vip: None,
                 canonical_port: None,
                 attachment: crate::worker::netd::attach::Attachment::GuestVsock {
@@ -2437,6 +2446,7 @@ mod integration {
                 http: None,
                 handlers: Vec::new(),
                 credentials: Vec::new(),
+                ca: None,
                 vip: None,
                 canonical_port: None,
                 attachment: crate::worker::netd::attach::Attachment::Host,

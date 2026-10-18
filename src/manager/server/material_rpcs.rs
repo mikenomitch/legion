@@ -5,8 +5,8 @@
 //! upstream key, a header), never where it lives. Resolving one is two steps:
 //!
 //! 1. **The declaration.** The manager finds the [`Source`] the allocation
-//!    itself declares for that ref (its task's `connect` block, or its
-//!    effective ingress chain), after checking the allocation is placed on
+//!    itself declares for that ref (its ports' `tls`, as placed, or its
+//!    task's `connect` block), after checking the allocation is placed on
 //!    the calling node. A ref nothing on the node declares gets an error.
 //! 2. **The provider.** One [`MaterialProvider`] per kind of source reads the
 //!    value: `kv`, `identity`, and `policy` (a body by content hash). A new
@@ -18,7 +18,8 @@
 use super::*;
 use crate::structs::netpolicy::EffectivePolicy;
 use crate::structs::source::{
-    Source, SourceKind, MATERIAL_CREDENTIAL, MATERIAL_INGRESS_CERT, MATERIAL_POLICY,
+    Source, SourceKind, MATERIAL_CLIENT_CA, MATERIAL_CREDENTIAL, MATERIAL_POLICY,
+    MATERIAL_PORT_CERT, MATERIAL_UPSTREAM_CA,
 };
 use crate::structs::{
     FetchDatapathMaterialReply, FetchDatapathMaterialRequest, Material, MaterialRef, TaskAllocation,
@@ -145,6 +146,8 @@ enum ValueCheck {
     /// A certificate chain and private key, validated so a bad bundle is
     /// reported here instead of failing handshakes on the node.
     PemBundle,
+    /// A CA bundle: at least one certificate.
+    CaBundle,
     /// An HTTP header value: one trailing line ending (a value put from a
     /// file) is trimmed; an empty value, or one with CR, LF, or NUL, which
     /// would split the request, is refused.
@@ -158,6 +161,9 @@ impl ValueCheck {
             ValueCheck::Raw => Ok(value),
             ValueCheck::PemBundle => crate::worker::netd::tls::validate_bundle(&value)
                 .map(|()| value)
+                .map_err(|err| format!("{source} {err:#}")),
+            ValueCheck::CaBundle => crate::worker::netd::tls::roots_from_pem(value.as_bytes())
+                .map(|_| value)
                 .map_err(|err| format!("{source} {err:#}")),
             ValueCheck::HeaderValue => {
                 let trimmed = value.trim_end_matches(['\r', '\n']);
@@ -174,8 +180,8 @@ impl ValueCheck {
     }
 }
 
-/// The node's desired allocations, their policy hashes, and their connect
-/// blocks, computed at most once per call and only when a ref needs them.
+/// The node's desired allocations' placed networks and connect blocks,
+/// computed at most once per call and only when a ref needs them.
 struct NodeView<'a> {
     service: &'a ManagerDaemonService,
     node_id: &'a str,
@@ -183,8 +189,8 @@ struct NodeView<'a> {
 }
 
 struct NodeDeclarations {
-    hashes: HashMap<i64, String>,
     connects: HashMap<i64, crate::structs::ConnectConfig>,
+    networks: HashMap<i64, crate::structs::AllocNetwork>,
 }
 
 impl NodeView<'_> {
@@ -205,12 +211,17 @@ impl NodeView<'_> {
     }
 
     fn declare(&self, desired: &[TaskAllocation]) -> NodeDeclarations {
-        // The same merge the heartbeat ran; it leaves each body in the cache.
-        let hashes = self
-            .service
-            .build_net_policies(self.node_id, desired)
-            .into_iter()
-            .map(|assignment| (assignment.allocation_id, assignment.policy_hash))
+        // The same merge the heartbeat ran; it leaves each body in the cache
+        // for a policy ref that missed it.
+        let _ = self.service.build_net_policies(self.node_id, desired);
+        let networks = desired
+            .iter()
+            .filter(|allocation| !allocation.network.trim().is_empty())
+            .filter_map(|allocation| {
+                serde_json::from_str(&allocation.network)
+                    .ok()
+                    .map(|network| (allocation.allocation_id, network))
+            })
             .collect();
         let connects = desired
             .iter()
@@ -221,7 +232,7 @@ impl NodeView<'_> {
                     .map(|connect| (allocation.allocation_id, connect))
             })
             .collect();
-        NodeDeclarations { hashes, connects }
+        NodeDeclarations { connects, networks }
     }
 }
 
@@ -337,29 +348,65 @@ impl ManagerDaemonService {
                 }
                 Ok(Declared::Policy(hash.to_string()))
             }
-            MATERIAL_INGRESS_CERT => {
-                let declarations = view
-                    .declarations()
-                    .map(|d| d.hashes.get(&wanted.allocation_id).cloned());
-                let hash = declarations.map_err(|error| Undeclared {
+            MATERIAL_PORT_CERT | MATERIAL_CLIENT_CA => {
+                let declarations = view.declarations().map_err(|error| Undeclared {
                     error,
                     absent: false,
                 })?;
-                let path = hash
-                    .and_then(|hash| self.cached_policy(&hash))
-                    .as_ref()
-                    .and_then(|policy| policy.ingress.as_ref())
-                    .and_then(|chain| chain.tls.as_ref())
-                    .and_then(|tls| tls.cert_kv_path())
-                    .map(str::to_string)
+                let tls = declarations
+                    .networks
+                    .get(&wanted.allocation_id)
+                    .and_then(|network| network.port(&wanted.key))
+                    .and_then(|port| port.tls.as_ref());
+                let source = if wanted.kind == MATERIAL_PORT_CERT {
+                    tls.map(|tls| tls.cert.clone())
+                } else {
+                    tls.and_then(|tls| tls.clients.as_ref())
+                        .map(|clients| clients.ca.clone())
+                };
+                let source = source.filter(Source::is_fetched).ok_or_else(|| {
+                    Undeclared::absent(format!(
+                        "allocation is not placed on this node or port {} declares no KV-held \
+                         {}",
+                        wanted.key,
+                        if wanted.kind == MATERIAL_PORT_CERT {
+                            "tls.cert"
+                        } else {
+                            "tls.clients.ca"
+                        }
+                    ))
+                })?;
+                let check = if wanted.kind == MATERIAL_PORT_CERT {
+                    ValueCheck::PemBundle
+                } else {
+                    ValueCheck::CaBundle
+                };
+                Ok(Declared::Source(source, check))
+            }
+            MATERIAL_UPSTREAM_CA => {
+                let declarations = view.declarations().map_err(|error| Undeclared {
+                    error,
+                    absent: false,
+                })?;
+                let source = declarations
+                    .connects
+                    .get(&wanted.allocation_id)
+                    .and_then(|connect| {
+                        connect
+                            .upstreams
+                            .iter()
+                            .find(|upstream| upstream.key() == wanted.key)
+                    })
+                    .and_then(|upstream| upstream.ca.clone())
+                    .filter(Source::is_fetched)
                     .ok_or_else(|| {
-                        Undeclared::absent(
-                            "allocation is not placed on this node or has no KV-held ingress \
-                             certificate"
-                                .into(),
-                        )
+                        Undeclared::absent(format!(
+                            "allocation is not placed on this node or upstream {} declares no \
+                             KV-held ca",
+                            wanted.key
+                        ))
                     })?;
-                Ok(Declared::Source(Source::Kv(path), ValueCheck::PemBundle))
+                Ok(Declared::Source(source, ValueCheck::CaBundle))
             }
             MATERIAL_CREDENTIAL => {
                 let header = wanted.part.trim().to_ascii_lowercase();
@@ -396,8 +443,8 @@ impl ManagerDaemonService {
             }
             other => Err(Undeclared {
                 error: format!(
-                    "unknown material kind {other:?} (this manager serves policy, \
-                     ingress_cert, credential)"
+                    "unknown material kind {other:?} (this manager serves policy, port_cert, \
+                     client_ca, upstream_ca, credential)"
                 ),
                 absent: false,
             }),

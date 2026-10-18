@@ -10,7 +10,9 @@
 use crate::prelude::*;
 use crate::structs::{AllocNetwork, TaskAllocation, UpstreamEndpoints};
 use crate::worker::balance::Endpoint;
-use crate::worker::forwarder::{CredentialKey, UpstreamForwarder, UpstreamSpec};
+use crate::worker::forwarder::{
+    CredentialKey, PortTermination, TlsMaterialKey, UpstreamForwarder, UpstreamSpec,
+};
 use crate::worker::netd::attach::{guest_socket, Attachment};
 use crate::worker::netd::dns::DnsSpec;
 use crate::worker::netd::ingress::IngressSpec;
@@ -82,6 +84,7 @@ pub fn upstream_specs(desired: &[TaskAllocation], alloc_root: &Path) -> Vec<Upst
                 credentials: declaration
                     .map(|d| d.credentials.clone())
                     .unwrap_or_default(),
+                ca: declaration.and_then(|d| d.ca.clone()),
                 vip: upstream.vip.clone().filter(|_| vips),
                 canonical_port: upstream.canonical_port.filter(|_| vips),
                 attachment: attachment.clone(),
@@ -189,6 +192,11 @@ fn allocation_ingress_specs(
             private_port: port.bind_port(),
             dial: dial.clone(),
             bind: None,
+            termination: if port.mesh {
+                Some(PortTermination::Mesh)
+            } else {
+                port.tls.clone().map(PortTermination::Own)
+            },
         })
         .collect()
 }
@@ -252,6 +260,59 @@ pub fn declared_credentials(desired: &[TaskAllocation]) -> Vec<CredentialKey> {
                     upstream.key().to_string(),
                     credential.header.trim().to_ascii_lowercase(),
                 ));
+            }
+        }
+    }
+    keys
+}
+
+/// The KV-held TLS material the desired set declares: each port's
+/// `tls.cert = { kv }` (`port_cert`) and `tls.clients.ca = { kv }`
+/// (`client_ca`), by port label, and each upstream's `ca = { kv }`
+/// (`upstream_ca`), by upstream key. File sources are read by the node and
+/// are not listed.
+pub fn declared_tls_material(desired: &[TaskAllocation]) -> Vec<TlsMaterialKey> {
+    use crate::structs::source::{MATERIAL_CLIENT_CA, MATERIAL_PORT_CERT, MATERIAL_UPSTREAM_CA};
+    let mut keys = Vec::new();
+    for allocation in desired {
+        if let Ok(network) =
+            serde_json::from_str::<crate::structs::AllocNetwork>(&allocation.network)
+        {
+            for port in &network.ports {
+                let Some(tls) = port.tls.as_ref() else {
+                    continue;
+                };
+                if tls.cert.is_fetched() {
+                    keys.push((
+                        MATERIAL_PORT_CERT,
+                        allocation.allocation_id,
+                        port.name.clone(),
+                    ));
+                }
+                if tls
+                    .clients
+                    .as_ref()
+                    .is_some_and(|clients| clients.ca.is_fetched())
+                {
+                    keys.push((
+                        MATERIAL_CLIENT_CA,
+                        allocation.allocation_id,
+                        port.name.clone(),
+                    ));
+                }
+            }
+        }
+        if let Ok(connect) =
+            serde_json::from_str::<crate::structs::ConnectConfig>(&allocation.task_connect)
+        {
+            for upstream in &connect.upstreams {
+                if upstream.ca.as_ref().is_some_and(|ca| ca.is_fetched()) {
+                    keys.push((
+                        MATERIAL_UPSTREAM_CA,
+                        allocation.allocation_id,
+                        upstream.key(),
+                    ));
+                }
             }
         }
     }
@@ -426,7 +487,8 @@ pub fn net_status(
         // requests with a 503; one whose refresh failed still injects the
         // previous value.
         problems.extend(context.credential_problems(id));
-        if network.ingress_tls.as_deref() == Some("legion") && context.mesh_identity().is_none() {
+        problems.extend(context.upstream_ca_problems(id));
+        if network.serves_mesh() && context.mesh_identity().is_none() {
             problems.push("mesh certificate not issued yet".into());
         }
         out.push(crate::structs::NetAllocStatus {
@@ -535,6 +597,7 @@ mod tests {
                 http: None,
                 handlers: Vec::new(),
                 credentials: Vec::new(),
+                ca: None,
                 vip: None,
                 canonical_port: None,
                 attachment: Attachment::Host,

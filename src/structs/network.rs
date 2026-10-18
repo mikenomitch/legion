@@ -272,9 +272,8 @@ pub fn task_tcp_upstream_warnings(
             return warnings;
         };
         let inline = InlinePolicy {
-            mode: None,
             egress: task.network.as_ref().and_then(|n| n.egress.as_ref()),
-            ingress: None,
+            ..Default::default()
         };
         let policy = merge_policies(objects, inline);
         let Some(chain) = policy.egress.as_ref().filter(|chain| chain.is_http()) else {
@@ -626,6 +625,56 @@ pub struct PortConfig {
     pub static_port: Option<u16>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub to: Option<u16>,
+    /// TLS the node terminates on this port with a certificate that is not
+    /// the mesh's (docs/network-handlers.md, "TLS on ports"). The task
+    /// speaks plaintext on its private port. Never on the service's mesh
+    /// port.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tls: Option<PortTls>,
+}
+
+/// `network.ports[].tls`.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Hash)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PortTls {
+    /// The certificate chain and key: `{ kv = "<path>" }` (one PEM bundle,
+    /// swapped live when the key changes) or `{ file = { cert, key } }` (or
+    /// one `file` holding both) on the node.
+    pub cert: crate::structs::source::Source,
+    /// Present: the port is mutual, and clients must present a certificate
+    /// that verifies against `ca`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub clients: Option<ClientAuth>,
+}
+
+/// `network.ports[].tls.clients`.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Hash)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ClientAuth {
+    /// The CA bundle client certificates are verified against:
+    /// `{ kv = "<path>" }` or `{ file = "<path>" }` (PEM).
+    pub ca: crate::structs::source::Source,
+}
+
+impl PortTls {
+    /// Validate the sources: a certificate or CA comes from KV or a file,
+    /// never an identity.
+    pub fn validate(&self, what: &str) -> R<()> {
+        use crate::structs::source::SourceKind;
+        self.cert
+            .check(&format!("{what}.cert"), &[SourceKind::Kv, SourceKind::File])?;
+        if let Some(clients) = &self.clients {
+            clients.ca.check(
+                &format!("{what}.clients.ca"),
+                &[SourceKind::Kv, SourceKind::File],
+            )?;
+        }
+        Ok(())
+    }
+
+    pub fn is_mutual(&self) -> bool {
+        self.clients.is_some()
+    }
 }
 
 /// `service.port` accepts either a named `network.ports` label, a literal port
@@ -651,10 +700,19 @@ pub struct ServiceConfig {
     pub tags: Vec<String>,
     #[serde(default, skip_serializing_if = "Map::is_empty")]
     pub meta: Map<String, Value>,
-    /// Connect intentions: job ids allowed to reach this service through an
-    /// upstream. Empty (the default) or `["*"]` means every job may connect.
-    /// A denied consumer simply receives an empty endpoint list — enforcement
-    /// is control-plane + forwarder, not cryptographic identity.
+    /// Put the service on the mesh: its port terminates node-to-node mTLS
+    /// with the node certificate, consumers originate mesh TLS to it, and a
+    /// plain client dialing the port directly is refused at the handshake.
+    /// A policy object can impose (`require`) or default it. Resolved at
+    /// placement.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mesh: Option<bool>,
+    /// Who may call the service. A bare entry is a job id glob (`web`,
+    /// `agent-*`); an entry with colons is a workload identity glob over
+    /// `<region>:<job>:<group>:<task>` (`*:billing:*:worker`). Empty (the
+    /// default) or `["*"]` means everyone. Always enforced by the endpoint
+    /// feed (a consumer not on the list gets no endpoints); on a mesh
+    /// service, also at the receiving node against the verified caller.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub allow: Vec<String>,
 }
@@ -671,11 +729,11 @@ impl ServiceConfig {
         }
     }
 
-    /// Whether `job_id` may connect to this service. Empty `allow` (the
-    /// default) or a `"*"` entry allows everyone, preserving pre-connect
-    /// behavior for services that declare no intentions.
-    pub fn allows_job(&self, job_id: &str) -> bool {
-        allow_permits(&self.allow, job_id)
+    /// Whether the workload `identity` (`<region>:<job>:<group>:<task>`)
+    /// may call this service. Empty `allow` (the default) or a `"*"` entry
+    /// allows everyone.
+    pub fn allows(&self, identity: &str) -> bool {
+        allow_permits(&self.allow, identity)
     }
 
     /// `service.meta` flattened to strings for transport (the wire type is a
@@ -695,10 +753,62 @@ impl ServiceConfig {
     }
 }
 
-/// Shared intention check so the catalog projection and `ServiceConfig` agree:
-/// an empty list or a `"*"` entry permits every consumer.
-pub fn allow_permits(allow: &[String], job_id: &str) -> bool {
-    allow.is_empty() || allow.iter().any(|entry| entry == "*" || entry == job_id)
+/// The workload identity subject of a task: `<region>:<job>:<group>:<task>`,
+/// as the mesh names a caller and `service.allow` matches it.
+pub fn workload_subject(job_id: &str, group: &str, task_name: &str) -> String {
+    format!(
+        "{}:{job_id}:{group}:{task_name}",
+        crate::constants::DEF_CLUSTER_REGION
+    )
+}
+
+/// One `service.allow` check, shared by the endpoint feed and the receiving
+/// node so the two never disagree. An empty list or a `"*"` entry permits
+/// everyone. A bare entry is a job glob, so `web` and `*:web:*:*` are the
+/// same rule; an entry with colons globs each of the four parts. An
+/// `identity` that is not a four-part workload subject (a node peer that
+/// named no workload) matches no entry.
+pub fn allow_permits(allow: &[String], identity: &str) -> bool {
+    use crate::structs::netpolicy::glob_matches;
+    if allow.is_empty() || allow.iter().any(|entry| entry == "*") {
+        return true;
+    }
+    let parts: Vec<&str> = identity.split(':').collect();
+    if parts.len() != 4 {
+        return false;
+    }
+    allow.iter().any(|entry| {
+        let entry = entry.trim();
+        if entry.contains(':') {
+            let globs: Vec<&str> = entry.split(':').collect();
+            globs.len() == 4
+                && globs
+                    .iter()
+                    .zip(&parts)
+                    .all(|(glob, part)| glob_matches(glob, part))
+        } else {
+            glob_matches(entry, parts[1])
+        }
+    })
+}
+
+/// Validate one `service.allow` entry's shape.
+fn validate_allow_entry(task_name: &str, entry: &str) -> R<()> {
+    let entry = entry.trim();
+    if entry.is_empty() {
+        bail!("task {task_name} service.allow entries must not be empty");
+    }
+    if entry.contains(':') {
+        let parts: Vec<&str> = entry.split(':').collect();
+        if parts.len() != 4 || parts.iter().any(|part| part.is_empty()) {
+            bail!(
+                "task {task_name} service.allow entry '{entry}': an identity glob has four parts, \
+                 <region>:<job>:<group>:<task> (e.g. *:billing:*:worker). A bare entry is a job \
+                 id glob (e.g. web or agent-*)"
+            );
+        }
+    }
+    Ok(())
 }
 
 /// Task-level `connect` block: the services this task dials through node-local
@@ -793,6 +903,11 @@ pub struct UpstreamConfig {
     /// external `https://` upstream, with values the task never sees.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub credentials: Vec<UpstreamCredential>,
+    /// The trust bundle an external `https://` or `tls://` upstream's
+    /// certificate is verified against, instead of the public roots:
+    /// `{ kv = "<path>" }` or `{ file = "<path>" }` (PEM).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ca: Option<crate::structs::source::Source>,
 }
 
 /// Where an upstream's `to` points.
@@ -1308,6 +1423,14 @@ pub struct AllocPort {
     /// so the task's instruction — bind `$LEGION_PORT_<label>` — is unchanged.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub private_port: Option<u16>,
+    /// The port terminates mesh mTLS: it is the service's port, and the
+    /// effective `service.mesh` (the task's, or a policy's) was on at
+    /// placement. Consumers originate mesh TLS to it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub mesh: bool,
+    /// The port's own `tls`, copied from the task at placement.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tls: Option<PortTls>,
 }
 
 impl AllocPort {
@@ -1350,16 +1473,15 @@ pub struct AllocNetwork {
     /// (treated as `host`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mode: Option<String>,
-    /// How the allocation's advertised ports terminate TLS, resolved at
-    /// placement from the effective ingress chain: `legion` (the mesh — a
-    /// consuming node originates mesh TLS to it), `byo` (operator files), or
-    /// absent (plaintext). Read by the catalog projection into
-    /// `ServiceEndpoint.mesh_tls`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub ingress_tls: Option<String>,
 }
 
 impl AllocNetwork {
+    /// Whether any port terminates mesh mTLS (the node needs its mesh
+    /// certificate before the port can serve).
+    pub fn serves_mesh(&self) -> bool {
+        self.ports.iter().any(|port| port.mesh)
+    }
+
     pub fn port(&self, label: &str) -> Option<&AllocPort> {
         self.ports.iter().find(|port| port.name == label)
     }
@@ -1520,8 +1642,8 @@ pub struct ServiceEndpointRow {
     pub meta: BTreeMap<String, String>,
     /// `network.ports` entry the service advertises, when it names a label.
     pub port_label: Option<String>,
-    /// The advertised port terminates mesh TLS (`AllocNetwork::ingress_tls`
-    /// is `legion`); consumers must dial it with their node certificate.
+    /// The advertised port terminates mesh TLS (its `AllocPort::mesh`);
+    /// consumers must dial it with their node certificate.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub mesh_tls: bool,
 }
@@ -1671,6 +1793,8 @@ pub fn assign_allocation_ports_full(
                 host_port: static_port,
                 to: port.to,
                 private_port: None,
+                mesh: false,
+                tls: port.tls.clone(),
             });
         }
     }
@@ -1705,6 +1829,8 @@ pub fn assign_allocation_ports_full(
             host_port,
             to: port.to,
             private_port: None,
+            mesh: false,
+            tls: port.tls.clone(),
         });
     }
     let loopback = loopback_upstreams || vip_block.is_none();
@@ -1835,6 +1961,16 @@ pub fn normalize_task_network(
         if let Some(chain) = network_config.egress.as_mut() {
             validate_inline_chain(task_name, Direction::Egress, chain)?;
         }
+        for tls in network_config
+            .ports
+            .iter_mut()
+            .filter_map(|port| port.tls.as_mut())
+        {
+            tls.cert.trim();
+            if let Some(clients) = tls.clients.as_mut() {
+                clients.ca.trim();
+            }
+        }
         if let Some(chain) = network_config.ingress.as_mut() {
             validate_inline_chain(task_name, Direction::Ingress, chain)?;
         }
@@ -1870,6 +2006,7 @@ pub fn normalize_task_network(
                 name: label.clone(),
                 static_port,
                 to: None,
+                tls: None,
             });
         }
     }
@@ -1912,6 +2049,12 @@ pub fn validate_task_network(
                     );
                 }
             }
+            if let Some(tls) = &port.tls {
+                tls.validate(&format!(
+                    "task {task_name} network.ports entry '{}' tls",
+                    port.name
+                ))?;
+            }
         }
     }
 
@@ -1936,6 +2079,20 @@ pub fn validate_task_network(
                 );
             }
         }
+        if service_config.mesh == Some(true) {
+            let label = service_config.port_label().unwrap_or_default();
+            let own_tls = network
+                .and_then(|network| network.ports.iter().find(|port| port.name == label))
+                .is_some_and(|port| port.tls.is_some());
+            if own_tls {
+                bail!(
+                    "task {task_name} service.mesh = true, but its port '{label}' also has its own \
+                     tls. A port is either the service's mesh port or carries its own tls, never \
+                     both. Hint: drop the port's tls (the mesh terminates with the node \
+                     certificate), or set service.mesh = false"
+                );
+            }
+        }
     }
 
     Ok(())
@@ -1955,9 +2112,7 @@ pub fn validate_task_connect(
 ) -> R<()> {
     if let Some(service_config) = service {
         for entry in &service_config.allow {
-            if entry.trim().is_empty() {
-                bail!("task {task_name} service.allow entries must not be empty");
-            }
+            validate_allow_entry(task_name, entry)?;
         }
     }
 
@@ -2011,6 +2166,23 @@ pub fn validate_task_connect(
             validate_upstream_http(task_name, &key, http)?;
         }
         validate_upstream_credentials(task_name, upstream)?;
+        if let Some(ca) = upstream.ca.as_ref() {
+            use crate::structs::source::SourceKind;
+            let what = format!("task {task_name} connect.upstreams entry '{key}' ca");
+            let originates = matches!(
+                &destination,
+                UpstreamDestination::External(target) if target.tls
+            );
+            if !originates {
+                bail!(
+                    "{what}: ca pins the trust bundle the node verifies an external tls:// or \
+                     https:// destination against, and '{}' is not one. A catalog service on \
+                     the mesh is verified against the cluster CA",
+                    upstream.to.trim()
+                );
+            }
+            ca.check(&what, &[SourceKind::Kv, SourceKind::File])?;
+        }
         for (index, handler) in upstream.handlers.iter().enumerate() {
             let mut handler = handler.clone();
             handler.normalize(
@@ -2127,6 +2299,9 @@ pub fn normalize_task_connect(task_name: &str, connect: &mut Option<ConnectConfi
         for credential in upstream.credentials.iter_mut() {
             credential.header = credential.header.trim().to_ascii_lowercase();
             credential.from.trim();
+        }
+        if let Some(ca) = upstream.ca.as_mut() {
+            ca.trim();
         }
         let is_http = upstream.is_http();
         let key = upstream.key();
@@ -2331,6 +2506,7 @@ mod tests {
                 name: "web".into(),
                 static_port: Some(8080),
                 to: None,
+                tls: None,
             }],
             ..NetworkConfig::default()
         });
@@ -2346,6 +2522,7 @@ mod tests {
                 name: "http".into(),
                 static_port: None,
                 to: Some(8080),
+                tls: None,
             }],
             ..NetworkConfig::default()
         };
@@ -2364,11 +2541,13 @@ mod tests {
                     name: "http".into(),
                     static_port: None,
                     to: None,
+                    tls: None,
                 },
                 PortConfig {
                     name: "http".into(),
                     static_port: Some(80),
                     to: None,
+                    tls: None,
                 },
             ],
             ..NetworkConfig::default()
@@ -2385,11 +2564,13 @@ mod tests {
                     name: "metrics".into(),
                     static_port: Some(9090),
                     to: None,
+                    tls: None,
                 },
                 PortConfig {
                     name: "http".into(),
                     static_port: None,
                     to: Some(8080),
+                    tls: None,
                 },
             ],
             ..NetworkConfig::default()
@@ -2415,12 +2596,13 @@ mod tests {
                 host_port: 20000,
                 to: Some(8080),
                 private_port: None,
+                mesh: false,
+                tls: None,
             }],
             upstreams: Vec::new(),
             vip_block: None,
             resolver: None,
             mode: None,
-            ingress_tls: None,
         };
 
         let pairs = network.env_pairs();
@@ -2770,11 +2952,13 @@ mod tests {
                     name: "http".into(),
                     static_port: Some(8080),
                     to: None,
+                    tls: None,
                 },
                 PortConfig {
                     name: "admin".into(),
                     static_port: None,
                     to: None,
+                    tls: None,
                 },
             ],
             ..NetworkConfig::default()
@@ -2820,11 +3004,13 @@ mod tests {
                     name: "http".into(),
                     static_port: None,
                     to: None,
+                    tls: None,
                 },
                 PortConfig {
                     name: "metrics".into(),
                     static_port: Some(9090),
                     to: None,
+                    tls: None,
                 },
             ],
             ..NetworkConfig::default()
@@ -2880,6 +3066,7 @@ mod tests {
                 name: "http".into(),
                 static_port: Some(6379),
                 to: None,
+                tls: None,
             }],
             ..NetworkConfig::default()
         };
@@ -2905,7 +3092,6 @@ mod tests {
             vip_block: None,
             resolver: None,
             mode: None,
-            ingress_tls: None,
         };
 
         let lookup: std::collections::HashMap<_, _> = network.env_pairs().into_iter().collect();
@@ -2944,6 +3130,7 @@ mod tests {
                 name: "http".into(),
                 static_port: Some(8080),
                 to: None,
+                tls: None,
             }],
             ..NetworkConfig::default()
         };
@@ -2955,8 +3142,8 @@ mod tests {
         let svc: ServiceConfig =
             serde_json::from_value(json!({ "port": "http", "allow": ["gateway"] }))?;
         validate_task_connect("api", Some(&network), Some(&connect_config), Some(&svc))?;
-        assert!(svc.allows_job("gateway"));
-        assert!(!svc.allows_job("other"));
+        assert!(svc.allows("global:gateway:web:web"));
+        assert!(!svc.allows("global:other:web:web"));
         Ok(())
     }
 
@@ -3368,6 +3555,7 @@ mod tests {
                 name: "http".into(),
                 static_port: Some(8080),
                 to: None,
+                tls: None,
             }],
             ..NetworkConfig::default()
         };
@@ -3420,11 +3608,88 @@ mod tests {
     fn allow_wildcard_and_absent_allow_permit_everyone() {
         let open: ServiceConfig =
             serde_json::from_value(json!({ "port": "http" })).expect("service config");
-        assert!(open.allows_job("anyone"));
+        assert!(open.allows("global:anyone:g:t"));
         let wildcard: ServiceConfig =
             serde_json::from_value(json!({ "port": "http", "allow": ["*"] }))
                 .expect("service config");
-        assert!(wildcard.allows_job("anyone"));
-        assert!(allow_permits(&[], "anyone"));
+        assert!(wildcard.allows("global:anyone:g:t"));
+        assert!(allow_permits(&[], "node:n1"));
+    }
+
+    /// One grammar: a bare entry is a job glob, a colon entry globs the
+    /// four parts of `<region>:<job>:<group>:<task>`, so `web` and
+    /// `*:web:*:*` are the same rule. A peer that names no workload matches
+    /// nothing on a closed list.
+    #[test]
+    fn allow_grammar_matches_jobs_and_identities_test() {
+        let allow =
+            |entries: &[&str]| -> Vec<String> { entries.iter().map(|e| e.to_string()).collect() };
+        let id = "global:agent-7:sandbox:runner";
+        assert!(allow_permits(&allow(&["agent-*"]), id));
+        assert!(allow_permits(&allow(&["*:agent-7:*:*"]), id));
+        assert!(allow_permits(&allow(&["*:*:sandbox:runner"]), id));
+        assert!(!allow_permits(&allow(&["*:*:sandbox:other"]), id));
+        assert!(!allow_permits(&allow(&["web"]), id));
+        assert!(!allow_permits(&allow(&["agent-*"]), "node:n1"));
+        assert_eq!(
+            allow_permits(&allow(&["web"]), "global:web:g:t"),
+            allow_permits(&allow(&["*:web:*:*"]), "global:web:g:t")
+        );
+        // Shape: an identity glob has exactly four non-empty parts.
+        for bad in ["a:b", "a:b:c:d:e", "*:web::*"] {
+            let svc: ServiceConfig =
+                serde_json::from_value(json!({ "port": "http", "allow": [bad] })).unwrap();
+            let err = validate_task_connect("api", None, None, Some(&svc)).unwrap_err();
+            assert!(err.to_string().contains("four parts"), "{bad}: {err}");
+        }
+    }
+
+    /// `service.mesh` and a port's own `tls` are exclusive, sources are
+    /// checked per field, and an upstream `ca` needs an external TLS
+    /// destination.
+    #[test]
+    fn mesh_port_tls_and_upstream_ca_validate_test() {
+        let network: NetworkConfig = serde_json::from_value(json!({
+            "ports": [
+                { "name": "http" },
+                { "name": "admin", "tls": {
+                    "cert": { "file": { "cert": "/etc/a.crt", "key": "/etc/a.key" } },
+                    "clients": { "ca": { "kv": "certs/admin-ca" } },
+                } },
+            ],
+        }))
+        .unwrap();
+        let mesh: ServiceConfig =
+            serde_json::from_value(json!({ "port": "http", "mesh": true })).unwrap();
+        validate_task_network("api", Some(&network), Some(&mesh)).unwrap();
+        let on_tls_port: ServiceConfig =
+            serde_json::from_value(json!({ "port": "admin", "mesh": true })).unwrap();
+        let err = validate_task_network("api", Some(&network), Some(&on_tls_port))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("never both"), "{err}");
+
+        let bad: NetworkConfig = serde_json::from_value(json!({
+            "ports": [{ "name": "https", "tls": { "cert": { "identity": "api" } } }],
+        }))
+        .unwrap();
+        let err = validate_task_network("api", Some(&bad), None)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("identity source is not allowed"), "{err}");
+
+        let check = |upstreams: Value| {
+            validate_task_connect("api", None, Some(&connect(upstreams)), None)
+                .map_err(|e| e.to_string())
+        };
+        check(json!([{ "name": "corp", "to": "https://api.corp.example", "ca": { "kv": "certs/corp-ca" } }]))
+            .unwrap();
+        let err = check(json!([{ "to": "db", "ca": { "kv": "certs/ca" } }])).unwrap_err();
+        assert!(err.contains("not one"), "{err}");
+        let err = check(
+            json!([{ "name": "x", "to": "http://x.example", "ca": { "file": "/etc/ca.pem" } }]),
+        )
+        .unwrap_err();
+        assert!(err.contains("not one"), "{err}");
     }
 }

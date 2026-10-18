@@ -6850,6 +6850,8 @@ mod tests {
             task_lifecycle: String::new(),
             task_restart: String::new(),
             task_speculative_start: String::new(),
+            task_group: String::new(),
+            task_service: String::new(),
         }
     }
 
@@ -10709,7 +10711,6 @@ mod tests {
                 vip_block: None,
                 resolver: None,
                 mode: None,
-                ingress_tls: None,
             }),
             ..alloc()
         };
@@ -11790,6 +11791,8 @@ mod tests {
                     host_port: 23456,
                     to: None,
                     private_port: None,
+                    mesh: false,
+                    tls: None,
                 }],
                 ..Default::default()
             }),

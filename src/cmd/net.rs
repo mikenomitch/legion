@@ -141,7 +141,7 @@ pub fn config() -> Command {
         )
         .subcommand(
             Command::new("ca")
-                .about("The cluster CA: the worker plane, the worker-to-manager channel, and certFrom = \"legion\"")
+                .about("The cluster CA: the worker plane, the worker-to-manager channel, and service.mesh")
                 .subcommand_required(true)
                 .subcommand(
                     Command::new("show")
@@ -1000,6 +1000,9 @@ fn print_effective(
     } else {
         println!("  mode: {effective_mode} (task declared {declared_mode})");
     }
+    if let Some(mesh) = effective.mesh {
+        println!("  mesh: {}", if mesh { "on" } else { "off" });
+    }
     if matched.is_empty() {
         println!("  stored policies: none matched");
     } else {
@@ -1026,8 +1029,12 @@ fn print_effective(
                 ""
             }
         );
-        if let Some(tls) = chain.tls.as_ref() {
-            println!("    tls: {}", tls.mode);
+        if let Some(callers) = chain.callers.as_ref() {
+            println!(
+                "    0. deny callers not in [{}] ({}; the mesh port only)",
+                callers.allow.join(", "),
+                callers.source
+            );
         }
         for (index, rule) in chain.rules.iter().enumerate() {
             let m = &rule.rule.matcher;
@@ -1391,18 +1398,18 @@ pub(crate) fn diagnose_network(
                 hint: Some("normal for a `boot`-gated provisional start; see docs/edge-boot.md".into()),
             });
         }
-        // TLS material: an ingress chain that terminates TLS needs its
-        // files (or the mesh certificate) before it accepts anything.
-        let kv_cert = effective
-            .ingress
-            .as_ref()
-            .and_then(|c| c.tls.as_ref())
-            .and_then(|t| t.cert_kv_path())
+        // TLS material: a port that terminates TLS needs its certificate
+        // (from KV or files, or the mesh certificate) before it accepts
+        // anything. A KV problem names its key: `kv <path> ...`.
+        let kv_cert = status
+            .tls_error
+            .split_once("kv ")
+            .and_then(|(_, rest)| rest.split_whitespace().next())
             .map(str::to_string);
         if !status.tls_ready {
             let hint = match &kv_cert {
-                Some(path) => format!("put the chain followed by the private key, as one PEM value: legion kv put {path} \"$(cat fullchain.pem privkey.pem)\""),
-                None => "for certPath/keyPath, put the files on the node (or stage them as artifacts); for certFrom = \"legion\", the node issues its certificate on its next heartbeat".into(),
+                Some(path) => format!("put the PEM value at {path} (a certificate: the chain followed by the private key, e.g. legion kv put {path} \"$(cat fullchain.pem privkey.pem)\"; a CA: the CA certificates)"),
+                None => "for tls.cert = { file }, put the files on the node (or stage them as artifacts); for service.mesh, the node issues its certificate on its next heartbeat".into(),
             };
             steps.push(DoctorStep {
                 layer: "tls",
@@ -1425,11 +1432,7 @@ pub(crate) fn diagnose_network(
                 hint: Some(format!("fix the value at {path}; the node picks it up on its next heartbeat")),
             });
         }
-        let wants_mesh = effective
-            .ingress
-            .as_ref()
-            .and_then(|c| c.tls.as_ref())
-            .is_some_and(|t| t.cert_from_mesh());
+        let wants_mesh = effective.mesh == Some(true);
         if wants_mesh && !status.mesh_identity {
             steps.push(DoctorStep {
                 layer: "tls",

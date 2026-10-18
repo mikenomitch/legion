@@ -470,7 +470,7 @@ mod tests {
             protocol: "tcp".into(),
             policy: "allow".into(),
             access_log: false,
-            tls: None,
+            callers: None,
             rules: Vec::new(),
             handlers: hops
                 .into_iter()

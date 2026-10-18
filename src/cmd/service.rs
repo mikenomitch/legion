@@ -275,7 +275,7 @@ fn service_json(service: &ServiceSummary) -> Value {
         "healthyCount": service.healthy_count,
         "totalCount": service.total_count,
         "tags": service.tags,
-        // Connect intentions; empty means every job may connect.
+        // Who may call the service; empty means every caller may connect.
         "allow": service.allow,
     })
 }
@@ -589,7 +589,8 @@ fn walk_layers(
 
     // Connect intentions. An empty `allow` means "everyone", so only say
     // something when the service actually restricts its consumers.
-    if let Some(check) = intentions_check(allow) {
+    let mesh = endpoints.iter().any(|endpoint| endpoint.mesh_tls);
+    if let Some(check) = intentions_check(service, allow, mesh) {
         checks.push(check);
     }
 
@@ -731,8 +732,10 @@ fn walk_layers(
     (checks, resolved)
 }
 
-/// The `service.allow` line, when the service declares intentions.
-fn intentions_check(allow: &[String]) -> Option<DoctorCheck> {
+/// The `service.allow` line, when the service declares who may call it.
+/// Without the mesh there is no verified caller at the receiving node, so
+/// the list is enforced by the endpoint feed only, and the line says so.
+fn intentions_check(service: &str, allow: &[String], mesh: bool) -> Option<DoctorCheck> {
     if allow.is_empty() {
         return None;
     }
@@ -741,22 +744,24 @@ fn intentions_check(allow: &[String]) -> Option<DoctorCheck> {
         return Some(DoctorCheck::new(
             "intentions",
             STATUS_INFO,
-            format!("service.allow = {list}  (wildcard: every job may connect)"),
+            format!("allow: {list}  (wildcard: every caller may connect)"),
         ));
     }
-    Some(
-        DoctorCheck::new(
-            "intentions",
-            STATUS_INFO,
-            format!("service.allow = {list}  (only these job ids may connect)"),
-        )
-        .with_details(vec![
-            "any other job's `connect` upstream for this service resolves to an empty \
-             endpoint list"
-                .to_string(),
-            "add the consumer's job id (or \"*\") to service.allow to permit it".to_string(),
-        ]),
-    )
+    let mut details = vec![
+        "any other caller's `connect` upstream for this service resolves to an empty \
+         endpoint list"
+            .to_string(),
+        "add the caller's job id (or a <region>:<job>:<group>:<task> glob, or \"*\") to \
+         service.allow to permit it"
+            .to_string(),
+    ];
+    let line = if mesh {
+        format!("allow: {list}   enforced by the endpoint feed and on the wire (mesh)")
+    } else {
+        details.push("Hint: set service.mesh = true to enforce it on the wire".to_string());
+        format!("allow: {list}   enforced by the endpoint feed only ({service} is not on the mesh)")
+    };
+    Some(DoctorCheck::new("intentions", STATUS_INFO, line).with_details(details))
 }
 
 fn status_glyph(status: &str) -> &'static str {
@@ -992,9 +997,34 @@ mod tests {
 
     #[test]
     fn intentions_check_calls_out_the_wildcard() {
-        let check = intentions_check(&["*".to_string()]).expect("check");
-        assert!(check.summary.contains("every job may connect"));
+        let check = intentions_check("web", &["*".to_string()], false).expect("check");
+        assert!(check.summary.contains("every caller may connect"));
         assert!(check.details.is_empty());
+    }
+
+    /// Without the mesh, nothing verifies a caller at the receiving node, so
+    /// the line says the feed is the only enforcement and how to change it.
+    #[test]
+    fn intentions_check_says_where_allow_is_enforced_test() {
+        let allow = vec!["web".to_string(), "agent-*".to_string()];
+        let feed_only = intentions_check("api", &allow, false).expect("check");
+        assert!(
+            feed_only
+                .summary
+                .contains("enforced by the endpoint feed only (api is not on the mesh)"),
+            "{}",
+            feed_only.summary
+        );
+        assert!(feed_only
+            .details
+            .iter()
+            .any(|line| line.contains("service.mesh = true")));
+        let mesh = intentions_check("api", &allow, true).expect("check");
+        assert!(mesh.summary.contains("on the wire"), "{}", mesh.summary);
+        assert!(!mesh
+            .details
+            .iter()
+            .any(|line| line.contains("service.mesh")));
     }
 
     #[test]

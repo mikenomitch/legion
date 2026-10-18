@@ -177,8 +177,10 @@ in
         env = { APP_PY = api_py, PYTHONUNBUFFERED = "1" },
       },
       network = { ports = [{ name = "http" }] },
-      # Only the frontend may reach the API through the mesh.
-      service = { port = "http", meta = { protocol = "http" }, allow = ["fullstack"] },
+      # On the mesh, so only callers from this job reach the API: the
+      # endpoint feed hides it from everyone else, and the receiving node
+      # refuses any verified caller outside `allow`.
+      service = { port = "http", meta = { protocol = "http" }, mesh = true, allow = ["fullstack"] },
       # Least-connections, so a slow query doesn't pile more requests on
       # the replica that's already busy.
       connect = { upstreams = [{ to = "postgres", balance = "least_conn" }] },

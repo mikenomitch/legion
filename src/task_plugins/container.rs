@@ -1799,18 +1799,21 @@ mod tests {
                     host_port: 21000,
                     to: Some(8080),
                     private_port: None,
+                    mesh: false,
+                    tls: None,
                 },
                 crate::structs::network::AllocPort {
                     name: "metrics".into(),
                     host_port: 21001,
                     to: None,
                     private_port: None,
+                    mesh: false,
+                    tls: None,
                 },
             ],
             vip_block: None,
             resolver: None,
             mode: None,
-            ingress_tls: None,
         });
         let args = build_apple_launch(
             &allocation,

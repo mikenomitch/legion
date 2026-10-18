@@ -688,6 +688,13 @@ pub fn build_task_allocation_with(
         task_lifecycle: task.lifecycle.to_string(),
         task_restart,
         task_speculative_start,
+        task_group: task.group.clone(),
+        task_service: match task.service.as_ref() {
+            Some(service) => {
+                serde_json::to_string(service).context("Failed to serialize service")?
+            }
+            None => String::new(),
+        },
         session_task_spec: String::new(),
         session_task_config_id: 0,
         session_seal_keys: Vec::new(),

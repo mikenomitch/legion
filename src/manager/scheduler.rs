@@ -9533,6 +9533,7 @@ mod tests {
                     name: "http".into(),
                     static_port: Some(port),
                     to: None,
+                    tls: None,
                 }],
             }),
             ..TaskConfig::new(name, "noop")

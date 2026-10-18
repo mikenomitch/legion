@@ -1058,7 +1058,7 @@ service Manager {
   // the node's identity on every plane Legion runs between its own
   // processes: the mTLS worker plane listener (what a manager verifies when
   // it dials the node, docs/auth-and-acls.md, "The worker plane") and the
-  // mesh (`certFrom = "legion"`, docs/network-handlers.md, "mTLS").
+  // mesh (`service.mesh = true`, docs/network-handlers.md, "The mesh").
   //
   // The worker generates its key pair locally and sends only a CSR; the
   // private key never crosses the network. The manager has the CSR's public
@@ -1113,10 +1113,11 @@ service Manager {
 
   // Fetch the material a node's datapath needs for the allocations placed
   // on it, in one call per heartbeat: network-policy bodies by hash, the
-  // KV-held certificates behind ingress TLS, and the values behind
-  // `connect.upstreams[].credentials` (docs/network-handlers.md). It
-  // replaces one fetch per kind, so a new kind of material (or a new place
-  // a value comes from) is a provider on the manager, not a new call.
+  // KV-held certificates and CA bundles behind `network.ports[].tls` and
+  // `connect.upstreams[].ca`, and the values behind
+  // `connect.upstreams[].credentials` (docs/network-handlers.md). One call
+  // serves every kind, so a new kind of material (or a new place a value
+  // comes from) is a provider on the manager, not a new call.
   //
   // Each `MaterialRef` names a kind and what it is for, never where the
   // value lives:
@@ -1124,20 +1125,23 @@ service Manager {
   //   `value` is the `EffectivePolicy` as JSON. Policies are
   //   content-addressed, so a node running a thousand identical sandboxes
   //   fetches one body once.
-  // - `ingress_cert`: `allocation_id` names an allocation whose ingress TLS
-  //   takes its certificate from KV; `value` is the PEM bundle (chain, leaf
-  //   first, then the private key), validated by the manager first.
+  // - `port_cert`: `allocation_id` and `key` (a port label) name a port whose
+  //   `tls.cert = { kv }`; `value` is the PEM bundle (chain, leaf first,
+  //   then the private key), validated by the manager first.
+  // - `client_ca`: the same, for the port's `tls.clients.ca = { kv }`;
+  //   `value` is a PEM CA bundle.
+  // - `upstream_ca`: `allocation_id` and `key` (an upstream key) name an
+  //   external upstream whose `ca = { kv }`; `value` is a PEM CA bundle.
   // - `credential`: `allocation_id`, `key` (the upstream's key), and `part`
   //   (the header, lower-cased) name one injected header; `value` is the KV
   //   value or a freshly minted workload-identity token.
   //
   // The manager derives every KV path and identity itself, from the
-  // allocation's own declaration (its task's `connect` block, or its
-  // effective ingress chain), after checking the allocation is placed on
-  // the calling node. So a node can only ever read material that a job or
-  // policy on it declares, and a job can only declare a KV path its
-  // submitter could read (RunJob, template runs, and UpsertNetPolicy
-  // require `kv:read` on it).
+  // allocation's own declaration (its ports, as placed, and its task's
+  // `connect` block), after checking the allocation is placed on the
+  // calling node. So a node can only ever read material that a job on it
+  // declares, and a job can only declare a KV path its submitter could read
+  // (RunJob and template runs require `kv:read` on it).
   //
   // Workers pass the version they already hold (`MaterialRef.version`): the
   // KV entry's version, or for an identity token its expiry in unix
@@ -5611,16 +5615,16 @@ message IssueNodeCertificateReply {
 // Never where the value lives; the manager derives that (see
 // `FetchDatapathMaterial`).
 message MaterialRef {
-  // `policy`, `ingress_cert`, or `credential`.
+  // `policy`, `port_cert`, `client_ca`, `upstream_ca`, or `credential`.
   string kind = 1;
 
   // The allocation (manager-facing id) the material is for. 0 for `policy`,
   // which is shared by content hash.
   int64 allocation_id = 2;
 
-  // `policy`: the content hash. `credential`: the upstream's key (its
-  // `name`, or the catalog service its `to` names). Empty for
-  // `ingress_cert`.
+  // `policy`: the content hash. `port_cert` and `client_ca`: the port
+  // label. `upstream_ca` and `credential`: the upstream's key (its `name`,
+  // or the catalog service its `to` names).
   string key = 3;
 
   // `credential`: the injected header, lower-cased. Empty otherwise.
@@ -5651,7 +5655,8 @@ message Material {
   bool unchanged = 4;
 
   // The material: an `EffectivePolicy` as JSON (`policy`), a PEM bundle
-  // (`ingress_cert`), or a header value (`credential`). Treat as a secret:
+  // (`port_cert`), a CA bundle (`client_ca`, `upstream_ca`), or a header
+  // value (`credential`). Treat as a secret:
   // never log it, never write it to disk.
   string value = 5;
 
@@ -8878,15 +8883,19 @@ message ServiceSummary {
   // is what clients use to turn an endpoint into a URL.
   map<string, string> meta = 7;
 
-  // Connect intentions declared in the task's `service.allow`: the job IDs
-  // permitted to reach this service through a `connect.upstreams` entry.
+  // Who may call the service, from the task's `service.allow`: bare entries
+  // are job id globs (`web`, `agent-*`), entries with colons are workload
+  // identity globs over `<region>:<job>:<group>:<task>`
+  // (`*:billing:*:worker`).
   //
-  // Empty — the default — means *every* job may connect, and so does a single
-  // `"*"` entry; the two are reported verbatim rather than normalized so
-  // tooling can tell "no policy declared" from "explicitly open". Intentions
-  // gate the connect datapath only: they filter the endpoint list a consuming
-  // allocation receives in `HeartbeatReply.upstream_endpoints`, and never
-  // affect who may *read* the catalog through ListServices/ResolveService.
+  // Empty — the default — means *every* caller may connect, and so does a
+  // single `"*"` entry; the two are reported verbatim rather than normalized
+  // so tooling can tell "no policy declared" from "explicitly open". The list
+  // filters the endpoint list a consuming allocation receives in
+  // `HeartbeatReply.upstream_endpoints`; on a `service.mesh = true` service
+  // the receiving node also refuses a verified caller outside it
+  // (`Legion-Denied-By: service/allow`). It never affects who may *read* the
+  // catalog through ListServices/ResolveService.
   //
   // Reported here so a read-only caller (`job:read`) can explain why its
   // consumer resolves to nothing — `legion service doctor` prints this list —
@@ -8960,8 +8969,8 @@ message ServiceEndpoint {
   string port_label = 12;
 
   // True when the endpoint's advertised port terminates **mesh TLS** — its
-  // task's ingress chain has `tls = { mode = "mutual", certFrom = "legion" }`
-  // (docs/network-handlers.md). A consuming node's datapath then originates
+  // task's service is on the mesh (`service.mesh = true`, or imposed by a
+  // policy object), resolved at placement (docs/network-handlers.md). A consuming node's datapath then originates
   // TLS with its own node certificate and names the consuming workload in a
   // PROXY protocol v2 TLV; a plain client dialing the port directly is
   // refused at the handshake.
@@ -10795,6 +10804,19 @@ message TaskAllocation {
   // far an edge start may get: a node that receives it empty treats the task
   // as `off` and refuses its edge starts.
   string task_speculative_start = 33;
+
+  // The task's group (`tasks[].group`). Together with `job_id` and
+  // `task_name` it forms the workload identity subject
+  // `<region>:<job>:<group>:<task>`: the identity a consuming node names
+  // its workload by on a mesh connection, and what `service.allow` and
+  // ingress `identity` rules match.
+  string task_group = 34;
+
+  // JSON `ServiceConfig` as the task declared it (`name`, `port`, `mesh`,
+  // `allow`, ...). Empty when the task advertises no service. The manager
+  // reads `mesh` and `allow` from it to compile the receiving side's
+  // `service/allow` check into the allocation's ingress policy.
+  string task_service = 35;
 }
 
 // Request payload for PostWork.
@@ -12369,9 +12391,10 @@ message NetAllocStatus {
   // upstreams (`authz`, `proxy`), with the health the datapath has observed.
   repeated NetHandlerStatus handlers = 11;
 
-  // Whether the ingress chain's TLS material is loaded: the BYO files parse,
-  // or the node holds a mesh certificate for `certFrom = "legion"`. Always
-  // true when no ingress chain terminates TLS.
+  // Whether the TLS material of every port that terminates TLS is loaded:
+  // a port's own `tls` (its KV-held certificate and client CA have arrived,
+  // or its files parse), or, for the service's mesh port, the node's mesh
+  // certificate. Always true when no port terminates TLS.
   bool tls_ready = 12;
 
   // Why `tls_ready` is false, when it is.

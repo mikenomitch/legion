@@ -2149,12 +2149,7 @@ impl ManagerDaemonService {
             Status::invalid_argument(format!("Error validating task configs: {e}"))
         })?;
         self.validate_identity_sub_templates(&config)?;
-        let ingress_chains: Vec<_> = config
-            .tasks
-            .iter()
-            .map(|task| task.network.as_ref().and_then(|n| n.ingress.as_ref()))
-            .collect();
-        enforce_kv_cert_read(identity, &ingress_chains)?;
+        enforce_kv_tls_read(identity, &config.tasks)?;
         enforce_kv_credential_read(
             identity,
             config.tasks.iter().filter_map(|task| task.connect.as_ref()),
@@ -9674,7 +9669,6 @@ impl Manager for ManagerDaemonService {
             .normalize_and_validate()
             .map_err(|e| Status::invalid_argument(e.to_string()))?;
         enforce_net_policy_scope(&identity, AclAction::Write, &object)?;
-        enforce_kv_cert_read(&identity, &[object.ingress.as_ref()])?;
 
         let (affected, warnings) = self.affected_allocations_for_policy(&object);
         if req.dry_run {
@@ -9798,7 +9792,8 @@ impl Manager for ManagerDaemonService {
         )?;
         let (task, facts) =
             self.net_policy_task_facts(&req.job_id, &req.task_name, &req.node_pool)?;
-        let (effective, matched) = self.effective_net_policy(&facts, task.network.as_ref());
+        let (effective, matched) =
+            self.effective_net_policy(&facts, task.network.as_ref(), task.service.as_ref());
         let declared_mode = task
             .network
             .as_ref()
@@ -9846,7 +9841,8 @@ impl Manager for ManagerDaemonService {
         )?;
         let (task, facts) =
             self.net_policy_task_facts(&req.job_id, &req.task_name, &req.node_pool)?;
-        let (effective, _) = self.effective_net_policy(&facts, task.network.as_ref());
+        let (effective, _) =
+            self.effective_net_policy(&facts, task.network.as_ref(), task.service.as_ref());
 
         let (direction, chain, target) = if !req.to.trim().is_empty() {
             (
@@ -10101,6 +10097,13 @@ impl Manager for ManagerDaemonService {
             .store
             .declared_consumers()
             .map_err(|e| map_store_error("Error listing declared consumers", e))?;
+        // A caller's group, for its identity subject: from its declaration.
+        // An observed caller that declares nothing is judged as the default
+        // group.
+        let groups: HashMap<(String, String), String> = consumers
+            .iter()
+            .map(|c| ((c.job_id.clone(), c.task_name.clone()), c.group.clone()))
+            .collect();
         for consumer in consumers {
             for upstream in &consumer.upstreams {
                 let service = upstream.key().to_string();
@@ -10134,9 +10137,16 @@ impl Manager for ManagerDaemonService {
             }
         }
         let secs = f64::from(window_secs);
-        for ((job, _, service, _), edge) in edges.iter_mut() {
+        for ((job, task, service, _), edge) in edges.iter_mut() {
             if let Some(allow) = allow_by_service.get(service) {
-                edge.allowed = crate::structs::allow_permits(allow, job);
+                let group = groups
+                    .get(&(job.clone(), task.clone()))
+                    .cloned()
+                    .unwrap_or_else(crate::structs::default_task_group);
+                edge.allowed = crate::structs::allow_permits(
+                    allow,
+                    &crate::structs::workload_subject(job, &group, task),
+                );
             }
             edge.rps = edge.requests as f64 / secs;
             edge.error_rate = if edge.requests + edge.errors > 0 {
@@ -12597,6 +12607,17 @@ fn derive_node_health(value: &Value) -> Option<bool> {
     }
 }
 
+/// The workload identity subject of a desired allocation, as the endpoint
+/// feed matches `service.allow` against it.
+fn allocation_subject(allocation: &crate::structs::TaskAllocation) -> String {
+    let group = if allocation.task_group.is_empty() {
+        crate::structs::default_task_group()
+    } else {
+        allocation.task_group.clone()
+    };
+    crate::structs::workload_subject(&allocation.job_id, &group, &allocation.task_name)
+}
+
 fn build_desired_allocations(
     store: &Store,
     node_id: &str,
@@ -12785,7 +12806,12 @@ impl ManagerDaemonService {
                     .map(|n| n.labels.clone())
                     .unwrap_or_default(),
             };
-            let (effective, _) = merge_net_policies(&stored, &facts, network.as_ref());
+            let service: Option<crate::structs::ServiceConfig> =
+                (!allocation.task_service.trim().is_empty())
+                    .then(|| serde_json::from_str(&allocation.task_service).ok())
+                    .flatten();
+            let (effective, _) =
+                merge_net_policies(&stored, &facts, network.as_ref(), service.as_ref());
             // A gated allocation is told about an *empty* policy too, so the
             // node can tell "known: nothing covers it" (`gated-default`) from
             // "pending" (`policy-pending`). Gated by its declaration, by a
@@ -12815,13 +12841,14 @@ impl ManagerDaemonService {
         &self,
         facts: &crate::structs::netpolicy::NetSelectorFacts,
         network: Option<&crate::structs::NetworkConfig>,
+        service: Option<&crate::structs::ServiceConfig>,
     ) -> (crate::structs::netpolicy::EffectivePolicy, Vec<String>) {
         let stored: Vec<crate::structs::netpolicy::NetPolicyObject> = self
             .store
             .list_net_policies()
             .map(|records| records.into_iter().map(|record| record.object).collect())
             .unwrap_or_default();
-        merge_net_policies(&stored, facts, network)
+        merge_net_policies(&stored, facts, network, service)
     }
 
     /// Resolve (job, task) to the task config and its selector facts.
@@ -12939,8 +12966,9 @@ impl ManagerDaemonService {
             }
             services.sort();
             services.dedup();
+            let caller = allocation_subject(allocation);
             for service in services {
-                wanted.push((allocation.allocation_id, service, allocation.job_id.clone()));
+                wanted.push((allocation.allocation_id, service, caller.clone()));
             }
         }
         if wanted.is_empty() {
@@ -12948,7 +12976,7 @@ impl ManagerDaemonService {
         }
         let mut resolved: HashMap<String, Vec<crate::structs::ServiceEndpointRow>> = HashMap::new();
         let mut out = Vec::new();
-        for (allocation_id, service, job_id) in wanted {
+        for (allocation_id, service, caller) in wanted {
             if !resolved.contains_key(&service) {
                 let rows = self
                     .store
@@ -12958,7 +12986,7 @@ impl ManagerDaemonService {
             }
             let endpoints = resolved[&service]
                 .iter()
-                .filter(|row| row.healthy && crate::structs::allow_permits(&row.allow, &job_id))
+                .filter(|row| row.healthy && crate::structs::allow_permits(&row.allow, &caller))
                 .map(|row| ServiceEndpoint {
                     service: row.service.clone(),
                     job_id: row.job_id.clone(),
@@ -13189,6 +13217,7 @@ fn merge_net_policies(
     stored: &[crate::structs::netpolicy::NetPolicyObject],
     facts: &crate::structs::netpolicy::NetSelectorFacts,
     network: Option<&crate::structs::NetworkConfig>,
+    service: Option<&crate::structs::ServiceConfig>,
 ) -> (crate::structs::netpolicy::EffectivePolicy, Vec<String>) {
     use crate::structs::netpolicy::{merge_policies, InlinePolicy};
     let matching: Vec<crate::structs::netpolicy::NetPolicyObject> = stored
@@ -13200,6 +13229,8 @@ fn merge_net_policies(
         mode: network.map(|n| n.mode.as_str()).filter(|m| *m != "auto"),
         egress: network.and_then(|n| n.egress.as_ref()),
         ingress: network.and_then(|n| n.ingress.as_ref()),
+        mesh: service.and_then(|s| s.mesh),
+        callers: service.map(|s| s.allow.as_slice()).unwrap_or_default(),
     };
     let effective = merge_policies(&matching, inline);
     let matched = effective
@@ -13213,16 +13244,41 @@ fn merge_net_policies(
 /// Per-pool scope enforcement for a policy object: a caller must hold the
 /// action on every pool the selector names (or on any pool when it names
 /// none, i.e. a cluster-wide policy).
-/// `certFrom = { kv }` hands a KV value to the datapath, so naming one needs
-/// the same right as reading it: `kv:read` on the path. Without this, job
-/// submit (or policy write) access would be a way to read any private key in
-/// KV. Applied to RunJob, template runs, and UpsertNetPolicy.
-fn enforce_kv_cert_read(
+/// A KV-held certificate or CA (`network.ports[].tls.cert`,
+/// `tls.clients.ca`, `connect.upstreams[].ca`) hands a KV value to the
+/// datapath, so naming one needs the same right as reading it: `kv:read` on
+/// the path. Without this, job submit access would be a way to read any
+/// private key in KV. Applied to RunJob and template runs.
+fn enforce_kv_tls_read(
     identity: &crate::structs::AclIdentity,
-    chains: &[Option<&crate::structs::netpolicy::ChainConfig>],
+    tasks: &[TaskConfig],
 ) -> Result<(), Status> {
-    for chain in chains.iter().flatten() {
-        if let Some(path) = chain.tls.as_ref().and_then(|tls| tls.cert_kv_path()) {
+    for task in tasks {
+        let ports = task.network.iter().flat_map(|network| {
+            network.ports.iter().filter_map(|port| {
+                let tls = port.tls.as_ref()?;
+                Some((port.name.as_str(), tls))
+            })
+        });
+        let mut named: Vec<(String, &crate::structs::source::Source)> = Vec::new();
+        for (label, tls) in ports {
+            named.push((format!("network.ports[{label}].tls.cert"), &tls.cert));
+            if let Some(clients) = &tls.clients {
+                named.push((
+                    format!("network.ports[{label}].tls.clients.ca"),
+                    &clients.ca,
+                ));
+            }
+        }
+        for upstream in task.connect.iter().flat_map(|connect| &connect.upstreams) {
+            if let Some(ca) = &upstream.ca {
+                named.push((format!("connect.upstreams[{}].ca", upstream.key()), ca));
+            }
+        }
+        for (field, source) in named {
+            let Some(path) = source.kv_path() else {
+                continue;
+            };
             acl::enforce(
                 identity,
                 AclResource::Kv,
@@ -13233,9 +13289,9 @@ fn enforce_kv_cert_read(
                 Status::new(
                     status.code(),
                     format!(
-                        "{} (ingress tls.certFrom names kv {path}; the submitter needs kv \
-                             read on it)",
-                        status.message()
+                        "{} (task {} {field} names kv {path}; the submitter needs kv read on it)",
+                        status.message(),
+                        task.name
                     ),
                 )
             })?;
@@ -13577,7 +13633,8 @@ fn build_upstream_endpoints(
             let Some(service) = upstream.service() else {
                 continue;
             };
-            let key = (service.clone(), allocation.job_id.clone());
+            let caller = allocation_subject(allocation);
+            let key = (service.clone(), caller.clone());
             if !resolved.contains_key(&key) {
                 let rows = match store.service_endpoints(Some(&service)) {
                     Ok(rows) => rows,
@@ -13597,9 +13654,7 @@ fn build_upstream_endpoints(
                 };
                 let endpoints = rows
                     .into_iter()
-                    .filter(|row| {
-                        row.healthy && crate::structs::allow_permits(&row.allow, &allocation.job_id)
-                    })
+                    .filter(|row| row.healthy && crate::structs::allow_permits(&row.allow, &caller))
                     .map(|row| ServiceEndpoint {
                         service: row.service,
                         job_id: row.job_id,
@@ -16289,6 +16344,82 @@ mod tests {
         Ok(())
     }
 
+    /// `service.mesh = true` is resolved at placement: the service's port
+    /// gets a datapath listener (a private twin for the task) and the mesh
+    /// flag, and the catalog marks the endpoint mesh, so consumers originate
+    /// mesh TLS. A `default` policy turns it on for a task that says
+    /// nothing; a task's own `mesh = false` beats a `default`.
+    #[tokio::test]
+    async fn service_mesh_is_resolved_at_placement_test() -> R<()> {
+        let store = setup_store()?;
+        let manager = ManagerDaemonService::new(store.clone());
+        insert_node(&store, "node-1")?;
+        let place = |job: &'static str, mesh: Option<bool>| {
+            let manager = &manager;
+            let store = &store;
+            async move {
+                let mut service = json!({ "port": "http" });
+                if let Some(mesh) = mesh {
+                    service["mesh"] = json!(mesh);
+                }
+                run_jobspec(
+                    manager,
+                    json!({
+                        "name": job,
+                        "task": {
+                            "runtime": "exec",
+                            "config": { "command": ["sleep", "30"] },
+                            "network": { "mode": "host", "ports": [{ "name": "http" }] },
+                            "service": service,
+                        },
+                    }),
+                )
+                .await?;
+                let job_config_id = store.get_job_config(job)?.id();
+                let (task_id, _) = store
+                    .get_task_configs_for_job_config(&job_config_id)?
+                    .into_iter()
+                    .next()
+                    .context("task config")?;
+                let alloc = store.place_alloc("node-1", task_id)?;
+                let network = alloc.network.context("allocation network")?;
+                let port = network.port("http").context("http port")?.clone();
+                let endpoint_mesh = store
+                    .service_endpoints(None)?
+                    .into_iter()
+                    .find(|row| row.allocation_id == alloc.id)
+                    .map(|row| row.mesh_tls);
+                Ok::<_, anyhow::Error>((port, endpoint_mesh))
+            }
+        };
+
+        let (port, endpoint_mesh) = place("api", Some(true)).await?;
+        assert!(port.mesh, "{port:?}");
+        assert_eq!(
+            endpoint_mesh,
+            Some(true),
+            "the catalog marks the endpoint mesh"
+        );
+        assert!(
+            port.private_port.is_some(),
+            "the datapath owns the port: {port:?}"
+        );
+
+        let (port, _) = place("plain", None).await?;
+        assert!(!port.mesh && port.private_port.is_none(), "{port:?}");
+
+        store.upsert_net_policy(serde_json::from_value(json!({
+            "name": "mesh-everything",
+            "enforcement": "default",
+            "mesh": true,
+        }))?)?;
+        let (port, _) = place("defaulted", None).await?;
+        assert!(port.mesh, "a default policy turns it on: {port:?}");
+        let (port, _) = place("opted-out", Some(false)).await?;
+        assert!(!port.mesh, "the task's own false beats a default: {port:?}");
+        Ok(())
+    }
+
     /// One `FetchDatapathMaterial` call from node-1.
     async fn fetch_material(
         manager: &ManagerDaemonService,
@@ -16319,11 +16450,12 @@ mod tests {
         }
     }
 
-    /// The node names allocations, never paths: the manager derives the KV
-    /// path from the allocation's chain, sends the bundle once per version,
-    /// and reports per-allocation problems without failing the call.
+    /// The node names (allocation, port), never paths: the manager derives
+    /// the KV path from the allocation's own port declaration, sends the
+    /// bundle once per version, and reports per-port problems without
+    /// failing the call. A client CA on the same port is its own ref.
     #[tokio::test]
-    async fn material_ingress_cert_derives_the_path_and_skips_unchanged_test() -> R<()> {
+    async fn material_port_cert_derives_the_path_and_skips_unchanged_test() -> R<()> {
         use crate::manager::mesh_ca::{generate_ca, issue_node_cert};
         let store = setup_store()?;
         let manager = ManagerDaemonService::new(store.clone());
@@ -16339,8 +16471,10 @@ mod tests {
                     "runtime": "exec",
                     "config": { "command": ["sleep", "30"] },
                     "network": {
-                        "ports": [{ "name": "https", "static": 8443 }],
-                        "ingress": { "tls": { "mode": "server", "certFrom": { "kv": "certs/edge" } } },
+                        "ports": [{ "name": "https", "static": 8443, "tls": {
+                            "cert": { "kv": "certs/edge" },
+                            "clients": { "ca": { "kv": "certs/edge-ca" } },
+                        } }],
                     },
                 },
             }),
@@ -16355,6 +16489,7 @@ mod tests {
             .context("task config")?;
         let alloc = store.place_alloc("node-1", task_id)?;
 
+        put_kv_entry(&manager, "certs/edge-ca", &ca_pem).await?;
         let fetch = |known: Vec<(i64, i64)>| {
             let manager = &manager;
             async move {
@@ -16363,8 +16498,9 @@ mod tests {
                     known
                         .into_iter()
                         .map(|(allocation_id, version)| MaterialRef {
-                            kind: "ingress_cert".into(),
+                            kind: "port_cert".into(),
                             allocation_id,
+                            key: "https".into(),
                             version,
                             ..Default::default()
                         })
@@ -16373,6 +16509,27 @@ mod tests {
                 .await
             }
         };
+        let ca = fetch_material(
+            &manager,
+            vec![
+                MaterialRef {
+                    kind: "client_ca".into(),
+                    allocation_id: alloc.id,
+                    key: "https".into(),
+                    ..Default::default()
+                },
+                MaterialRef {
+                    kind: "client_ca".into(),
+                    allocation_id: alloc.id,
+                    key: "other".into(),
+                    ..Default::default()
+                },
+            ],
+        )
+        .await?;
+        assert_eq!(ca[0].source, "kv certs/edge-ca");
+        assert_eq!(ca[0].value, ca_pem);
+        assert!(ca[1].absent, "{:?}", ca[1]);
 
         let first = fetch(vec![(alloc.id, 0), (alloc.id + 999, 0)]).await?;
         assert_eq!(first[0].source, "kv certs/edge");

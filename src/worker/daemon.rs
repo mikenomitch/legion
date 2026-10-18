@@ -3056,9 +3056,9 @@ async fn refresh_node_identity(
 
 /// Fetch what the datapath needs from the manager, in one
 /// `FetchDatapathMaterial` call per heartbeat: policy bodies it holds an
-/// assignment for but has not seen, KV-held ingress certificates
-/// (docs/network-handlers.md, "Certificates from KV"), and
-/// `connect.upstreams[].credentials` ("Credential injection"). Each ref
+/// assignment for but has not seen,
+/// `connect.upstreams[].credentials` ("Credential injection"), and KV-held
+/// port certificates, client CAs, and upstream CAs ("TLS on ports"). Each ref
 /// carries the version already held, so an unchanged value costs nothing on
 /// the wire, and no call is made while nothing is wanted. Fail-static: a
 /// failed call keeps what the datapath holds (a gated allocation with no
@@ -3069,46 +3069,26 @@ async fn fetch_datapath_material(
     credentials: &Arc<WorkerCredentials>,
     node_id: &str,
 ) {
-    use crate::structs::source::MATERIAL_POLICY;
-    let mut refs = netd.wants().material;
-    // A policy body can declare more material (a KV-held ingress
-    // certificate), so a call that brought new bodies is followed by one
-    // more for what they declare, instead of waiting a heartbeat.
-    for _ in 0..2 {
-        if refs.is_empty() {
-            return;
+    let refs = netd.wants().material;
+    if refs.is_empty() {
+        return;
+    }
+    let request = credentials.attach(tonic::Request::new(
+        crate::structs::FetchDatapathMaterialRequest {
+            node_id: node_id.to_string(),
+            refs,
+        },
+    ));
+    match client.fetch_datapath_material(request).await {
+        Ok(response) => {
+            netd.send(NetdInput::Material(response.into_inner().materials))
+                .await
         }
-        let fetched_policy = refs.iter().any(|wanted| wanted.kind == MATERIAL_POLICY);
-        let asked = refs.clone();
-        let request = credentials.attach(tonic::Request::new(
-            crate::structs::FetchDatapathMaterialRequest {
-                node_id: node_id.to_string(),
-                refs,
-            },
-        ));
-        match client.fetch_datapath_material(request).await {
-            Ok(response) => {
-                netd.send(NetdInput::Material(response.into_inner().materials))
-                    .await
-            }
-            Err(status) => {
-                warn!(
-                    code = ?status.code(),
-                    message = status.message(),
-                    "Failed to fetch datapath material; keeping what the datapath holds"
-                );
-                return;
-            }
-        }
-        if !fetched_policy {
-            return;
-        }
-        refs = netd
-            .wants()
-            .material
-            .into_iter()
-            .filter(|wanted| wanted.kind != MATERIAL_POLICY && !asked.contains(wanted))
-            .collect();
+        Err(status) => warn!(
+            code = ?status.code(),
+            message = status.message(),
+            "Failed to fetch datapath material; keeping what the datapath holds"
+        ),
     }
 }
 

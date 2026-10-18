@@ -27,8 +27,9 @@
 //! names that case.
 
 use crate::prelude::*;
-use crate::structs::netpolicy::{ConnectFacts, Verdict, PROTOCOL_TCP, TLS_MUTUAL, TLS_SERVER};
+use crate::structs::netpolicy::{ConnectFacts, Verdict, PROTOCOL_TCP};
 use crate::worker::forwarder::ForwarderContext;
+use crate::worker::forwarder::PortTermination;
 use crate::worker::netd::handlers::{self, HopFacts, HopOutcome};
 use crate::worker::netd::http::{self, HttpSettings};
 use crate::worker::netd::listen::{dial_tcp, spawn_accept_loop, ListenAddr, Stream};
@@ -170,6 +171,9 @@ pub struct IngressSpec {
     pub dial: TaskDial,
     /// Bind address; `None` is every interface.
     pub bind: Option<IpAddr>,
+    /// TLS the port terminates: the mesh (the service's port with
+    /// `service.mesh` on), the port's own `tls`, or none.
+    pub termination: Option<PortTermination>,
 }
 
 impl IngressSpec {
@@ -400,33 +404,30 @@ async fn handle(mut client: TcpStream, peer: SocketAddr, shared: Arc<Shared>) {
         None
     };
 
-    // TLS termination, when the effective ingress chain asks for it.
-    let tls = policy
-        .as_ref()
-        .and_then(|p| p.ingress.as_ref())
-        .and_then(|chain| chain.tls.clone())
-        .filter(|tls| matches!(tls.mode.as_str(), TLS_SERVER | TLS_MUTUAL));
-    let Some(tls) = tls else {
+    // TLS termination, when the port is the service's mesh port or has its
+    // own `tls`.
+    let Some(termination) = shared.spec.termination.clone() else {
         serve_accepted(client, Vec::new(), peer, None, shared, block, policy).await;
         return;
     };
-    let config = match shared
-        .context
-        .ingress_server_config(allocation_id, &shared.spec.label, &tls)
-    {
-        Ok(config) => config,
-        Err(err) => {
-            debug!(
-                allocation_id,
-                label = %shared.spec.label,
-                error = %err,
-                "Ingress TLS material is not usable; refusing the connection"
-            );
-            net_metrics::connection("ingress", PROTOCOL_TCP, "error");
-            let _ = client.shutdown().await;
-            return;
-        }
-    };
+    let config =
+        match shared
+            .context
+            .ingress_server_config(allocation_id, &shared.spec.label, &termination)
+        {
+            Ok(config) => config,
+            Err(err) => {
+                debug!(
+                    allocation_id,
+                    label = %shared.spec.label,
+                    error = %err,
+                    "Ingress TLS material is not usable; refusing the connection"
+                );
+                net_metrics::connection("ingress", PROTOCOL_TCP, "error");
+                let _ = client.shutdown().await;
+                return;
+            }
+        };
     let acceptor = tokio_rustls::TlsAcceptor::from(config);
     let mut stream =
         match tokio::time::timeout(TLS_HANDSHAKE_TIMEOUT, acceptor.accept(client)).await {
@@ -441,22 +442,19 @@ async fn handle(mut client: TcpStream, peer: SocketAddr, shared: Arc<Shared>) {
                 return;
             }
         };
-    // A `legion://node/` URI makes a peer a node, trusted to name the
-    // workload it forwards for, only on a chain verified against the
-    // cluster's CA. An operator's `clientCa` may issue whatever URIs its
-    // clients ask for, so there it is just that client's identity.
-    let cluster_verified = tls.client_ca.as_deref() == Some("legion")
-        || (tls.cert_from_mesh() && tls.cert_kv_path().is_none());
     let peer_identity = stream
         .get_ref()
         .1
         .peer_certificates()
         .and_then(net_tls::peer_identity)
-        .map(|identity| match identity {
-            PeerIdentity::Node(node) if !cluster_verified => {
+        .map(|peer| match (peer, &termination) {
+            // Only the mesh CA vouches for nodes. A port's own client CA can
+            // sign anything, so a `legion://node` name it verified is just a
+            // name: its PROXY header is never trusted.
+            (PeerIdentity::Node(node), PortTermination::Own(_)) => {
                 PeerIdentity::Other(format!("legion://node/{node}"))
             }
-            other => other,
+            (peer, _) => peer,
         });
     let (identity, leftover) = match peer_identity {
         // A node peer names the workload it forwards for in a PROXY v2
@@ -475,25 +473,35 @@ async fn handle(mut client: TcpStream, peer: SocketAddr, shared: Arc<Shared>) {
         Some(PeerIdentity::Other(identity)) => (Some(identity), Vec::new()),
         None => (None, Vec::new()),
     };
-    if !net_tls::identity_allowed(&tls.require_identity, identity.as_deref()) {
-        let reason = format!(
-            "peer identity {} is not in tls.requireIdentity",
-            identity.as_deref().unwrap_or("(none)")
-        );
-        net_metrics::connection("ingress", PROTOCOL_TCP, "deny");
-        shared.context.record_denial_for(
-            allocation_id,
-            identity.as_deref(),
-            "ingress",
-            PROTOCOL_TCP,
-            &peer.to_string(),
-            "tls/requireIdentity",
-            Some(&reason),
-            "",
-            "",
-        );
-        let _ = stream.shutdown().await;
-        return;
+    // `service.allow`, on the wire: a mesh port admits only the verified
+    // callers the service names (the chain's `callers`, first of all).
+    if termination == PortTermination::Mesh {
+        let chain = policy.as_ref().and_then(|p| p.ingress.as_ref());
+        if let Some(chain) = chain.filter(|chain| !chain.callers_permit(identity.as_deref())) {
+            let reason = format!(
+                "caller {} is not in service.allow",
+                identity.as_deref().unwrap_or("(none)")
+            );
+            let source = chain
+                .callers
+                .as_ref()
+                .map(|callers| callers.source.clone())
+                .unwrap_or_default();
+            net_metrics::connection("ingress", PROTOCOL_TCP, "deny");
+            shared.context.record_denial_for(
+                allocation_id,
+                identity.as_deref(),
+                "ingress",
+                PROTOCOL_TCP,
+                &peer.to_string(),
+                &source,
+                Some(&reason),
+                "",
+                "",
+            );
+            let _ = stream.shutdown().await;
+            return;
+        }
     }
     serve_accepted(stream, leftover, peer, identity, shared, block, policy).await;
 }
@@ -766,6 +774,7 @@ mod tests {
                 private_port: private,
                 dial: TaskDial::Loopback { netns: None },
                 bind: Some(IpAddr::V4(Ipv4Addr::LOCALHOST)),
+                termination: None,
             }])
             .await;
         assert_eq!(ingress.active(), vec![(11, "http".to_string())]);
@@ -802,11 +811,11 @@ mod tests {
         assert!(TcpStream::connect(("127.0.0.1", host_port)).await.is_err());
     }
 
-    /// Mesh mTLS end to end: node B fronts a task with a mutual, mesh-issued
-    /// ingress chain; node A dials with its node certificate and names the
-    /// workload in a PROXY v2 header. The chain sees that identity, so an
-    /// `identity` rule and `requireIdentity` decide; a plain client and a
-    /// workload outside `requireIdentity` are refused.
+    /// Mesh mTLS end to end: node B fronts a `service.mesh = true` task;
+    /// node A dials with its node certificate and names the workload in a
+    /// PROXY v2 header. `service.allow` (the chain's `callers`) admits only
+    /// the workloads it names, and an `identity` rule decides among those; a
+    /// plain client and a caller outside `allow` are refused.
     #[tokio::test]
     async fn mesh_mtls_ingress_attributes_the_peer_workload() {
         use crate::manager::mesh_ca::{generate_ca, issue_node_cert, node_dns_name};
@@ -824,12 +833,22 @@ mod tests {
         // Node B: the ingress side.
         let cache = Arc::new(NetPolicyCache::new());
         let denials = Arc::new(Denials::new());
-        let effective = policy(json!({
+        let mut chain: crate::structs::netpolicy::ChainConfig = serde_json::from_value(json!({
             "policy": "deny",
-            "tls": { "mode": "mutual", "certFrom": "legion", "clientCa": "legion",
-                     "requireIdentity": ["auto:web:*", "auto:ops:*"] },
             "rules": [ { "when": { "identity": "auto:web:*" }, "action": "allow" } ]
-        }));
+        }))
+        .unwrap();
+        chain.normalize_and_validate("ingress").unwrap();
+        let allow = vec!["web".to_string(), "*:ops:*:*".to_string()];
+        let effective = merge_policies(
+            &[],
+            InlinePolicy {
+                ingress: Some(&chain),
+                mesh: Some(true),
+                callers: &allow,
+                ..Default::default()
+            },
+        );
         let hash = effective.hash.clone();
         cache.apply_assignments(&[AllocNetPolicy {
             allocation_id: 21,
@@ -852,6 +871,7 @@ mod tests {
                 private_port: private,
                 dial: TaskDial::Loopback { netns: None },
                 bind: Some(IpAddr::V4(Ipv4Addr::LOCALHOST)),
+                termination: Some(PortTermination::Mesh),
             }])
             .await;
         assert_eq!(ingress.active(), vec![(21, "http".to_string())]);
@@ -890,11 +910,11 @@ mod tests {
         let ok = dial("auto:web:default:server").await;
         assert!(ok.contains("task saw GET /hello"), "{ok}");
 
-        // Allowed by requireIdentity, but no rule allows `ops`: the chain's
+        // Allowed by service.allow, but no rule allows `ops`: the chain's
         // deny fallthrough, attributed to the workload.
         let denied = dial("auto:ops:default:cli").await;
         assert!(denied.is_empty(), "{denied}");
-        // Outside requireIdentity entirely.
+        // Outside service.allow entirely.
         let refused = dial("auto:db:default:pg").await;
         assert!(refused.is_empty(), "{refused}");
         let drained = denials.drain();
@@ -907,7 +927,7 @@ mod tests {
         assert!(
             drained
                 .iter()
-                .any(|d| d.identity == "auto:db:default:pg" && d.source == "tls/requireIdentity"),
+                .any(|d| d.identity == "auto:db:default:pg" && d.source == "service/allow"),
             "{drained:?}"
         );
 
@@ -916,14 +936,16 @@ mod tests {
         assert!(!plain.contains("task saw"), "{plain}");
     }
 
-    /// `certFrom = { kv }`: the listener serves the certificate the node
-    /// fetched from KV, a newer version is presented to the next connection
-    /// with no listener restart, and a failed renewal keeps serving the last
-    /// good certificate while reporting the problem.
+    /// `ports[].tls.cert = { kv }`: the listener serves the certificate the
+    /// node fetched from KV, a newer version is presented to the next
+    /// connection with no listener restart, and a failed renewal keeps
+    /// serving the last good certificate while reporting the problem.
     #[tokio::test]
     async fn kv_backed_ingress_serves_and_hot_swaps_the_certificate_test() {
         use crate::manager::mesh_ca::{generate_ca, issue_node_cert, node_dns_name};
-        use crate::worker::netd::tls::{certs_from_pem, server_name, KvCertificate};
+        use crate::structs::source::MATERIAL_PORT_CERT;
+        use crate::worker::forwarder::HeldTls;
+        use crate::worker::netd::tls::{certs_from_pem, server_name, CertKey};
 
         let private = free_port().await;
         task_on(private).await;
@@ -933,16 +955,9 @@ mod tests {
         let (cert_2, key_2, _) = issue_node_cert(&ca_pem, &ca_key, "edge").unwrap();
 
         let cache = Arc::new(NetPolicyCache::new());
-        let effective = policy(json!({
-            "tls": { "mode": "server", "certFrom": { "kv": "certs/edge" } }
-        }));
-        let hash = effective.hash.clone();
-        cache.apply_assignments(&[AllocNetPolicy {
-            allocation_id: 31,
-            policy_hash: hash.clone(),
-        }]);
-        cache.insert_body(&hash, effective).unwrap();
         let context = Arc::new(ForwarderContext::new(cache, Arc::new(Denials::new())));
+        let tls: crate::structs::network::PortTls =
+            serde_json::from_value(json!({ "cert": { "kv": "certs/edge" } })).unwrap();
         let ingress = IngressListeners::new(context.clone());
         ingress
             .sync(&[IngressSpec {
@@ -952,6 +967,7 @@ mod tests {
                 private_port: private,
                 dial: TaskDial::Loopback { netns: None },
                 bind: Some(IpAddr::V4(Ipv4Addr::LOCALHOST)),
+                termination: Some(PortTermination::Own(tls)),
             }])
             .await;
 
@@ -985,19 +1001,29 @@ mod tests {
         };
         let leaf_of = |pem: &str| certs_from_pem(pem.as_bytes()).unwrap()[0].clone();
 
-        context.set_kv_cert(
+        let held = |version: i64, bundle: String| {
+            HeldTls::Cert(CertKey::from_bundle("kv certs/edge", version, &bundle).unwrap())
+        };
+        context.set_tls_material(
+            MATERIAL_PORT_CERT,
             31,
-            KvCertificate::from_bundle("certs/edge", 1, &format!("{cert_1}{key_1}")).unwrap(),
+            "https",
+            held(1, format!("{cert_1}{key_1}")),
         );
         let (leaf, body) = dial().await;
         assert_eq!(leaf, leaf_of(&cert_1));
         assert!(body.contains("task saw GET /hello"), "{body}");
 
-        context.set_kv_cert(
+        context.set_tls_material(
+            MATERIAL_PORT_CERT,
             31,
-            KvCertificate::from_bundle("certs/edge", 2, &format!("{cert_2}{key_2}")).unwrap(),
+            "https",
+            held(2, format!("{cert_2}{key_2}")),
         );
-        assert_eq!(context.kv_cert_version(31), 2);
+        assert_eq!(
+            context.tls_material_version(MATERIAL_PORT_CERT, 31, "https"),
+            2
+        );
         let (leaf, _) = dial().await;
         assert_eq!(
             leaf,
@@ -1005,7 +1031,12 @@ mod tests {
             "the next connection gets the new version"
         );
 
-        context.set_kv_cert_error(31, "kv certs/edge holds no private key".into());
+        context.set_tls_material_error(
+            MATERIAL_PORT_CERT,
+            31,
+            "https",
+            "kv certs/edge holds no private key".into(),
+        );
         assert_eq!(
             context.ingress_tls_status(31),
             (true, "kv certs/edge holds no private key".to_string())
@@ -1016,6 +1047,109 @@ mod tests {
             leaf_of(&cert_2),
             "a failed renewal keeps the last good cert"
         );
+    }
+
+    /// A mutual port whose client CA is held in KV: a client with a
+    /// certificate from that CA gets through, named by its certificate (a
+    /// `legion://node` SAN from a port's own CA is only a name, never a node
+    /// whose PROXY header is trusted), and a client with no certificate is
+    /// refused at the handshake.
+    #[tokio::test]
+    async fn mutual_port_verifies_clients_against_a_kv_ca_test() {
+        use crate::manager::mesh_ca::{generate_ca, issue_node_cert, node_dns_name};
+        use crate::structs::source::{MATERIAL_CLIENT_CA, MATERIAL_PORT_CERT};
+        use crate::worker::forwarder::HeldTls;
+        use crate::worker::netd::tls::{
+            certs_from_pem, key_from_pem, roots_from_pem, server_name, CertKey,
+        };
+
+        let private = free_port().await;
+        task_on(private).await;
+        let host_port = free_port().await;
+        let (ca_pem, ca_key) = generate_ca().unwrap();
+        let (server_cert, server_key, _) = issue_node_cert(&ca_pem, &ca_key, "edge").unwrap();
+        let (client_ca_pem, client_ca_key) = generate_ca().unwrap();
+        let (client_cert, client_key, _) =
+            issue_node_cert(&client_ca_pem, &client_ca_key, "outside").unwrap();
+
+        let cache = Arc::new(NetPolicyCache::new());
+        let denials = Arc::new(Denials::new());
+        let context = Arc::new(ForwarderContext::new(cache, denials.clone()));
+        let tls: crate::structs::network::PortTls = serde_json::from_value(json!({
+            "cert": { "kv": "certs/edge" },
+            "clients": { "ca": { "kv": "certs/edge-clients" } },
+        }))
+        .unwrap();
+        let ingress = IngressListeners::new(context.clone());
+        ingress
+            .sync(&[IngressSpec {
+                allocation_id: 41,
+                label: "admin".into(),
+                host_port,
+                private_port: private,
+                dial: TaskDial::Loopback { netns: None },
+                bind: Some(IpAddr::V4(Ipv4Addr::LOCALHOST)),
+                termination: Some(PortTermination::Own(tls)),
+            }])
+            .await;
+        context.set_tls_material(
+            MATERIAL_PORT_CERT,
+            41,
+            "admin",
+            HeldTls::Cert(
+                CertKey::from_bundle("kv certs/edge", 1, &format!("{server_cert}{server_key}"))
+                    .unwrap(),
+            ),
+        );
+        context.set_tls_material(
+            MATERIAL_CLIENT_CA,
+            41,
+            "admin",
+            HeldTls::Ca {
+                source: "kv certs/edge-clients".into(),
+                version: 1,
+                roots: roots_from_pem(client_ca_pem.as_bytes()).unwrap(),
+            },
+        );
+
+        let dial = |with_cert: bool| {
+            let ca_pem = ca_pem.clone();
+            let client_cert = client_cert.clone();
+            let client_key = client_key.clone();
+            async move {
+                let roots = roots_from_pem(ca_pem.as_bytes()).unwrap();
+                let builder = rustls::ClientConfig::builder().with_root_certificates(roots);
+                let config = if with_cert {
+                    builder
+                        .with_client_auth_cert(
+                            certs_from_pem(client_cert.as_bytes()).unwrap(),
+                            key_from_pem(client_key.as_bytes()).unwrap(),
+                        )
+                        .unwrap()
+                } else {
+                    builder.with_no_client_auth()
+                };
+                let connector = tokio_rustls::TlsConnector::from(Arc::new(config));
+                let stream = TcpStream::connect(("127.0.0.1", host_port)).await.unwrap();
+                let Ok(mut tls) = connector
+                    .connect(server_name(&node_dns_name("edge")).unwrap(), stream)
+                    .await
+                else {
+                    return String::new();
+                };
+                let _ = tls
+                    .write_all(b"GET /hello HTTP/1.1\r\nHost: svc\r\nConnection: close\r\n\r\n")
+                    .await;
+                let mut out = Vec::new();
+                let _ =
+                    tokio::time::timeout(Duration::from_secs(3), tls.read_to_end(&mut out)).await;
+                String::from_utf8_lossy(&out).to_string()
+            }
+        };
+        let ok = dial(true).await;
+        assert!(ok.contains("task saw GET /hello"), "{ok}");
+        let refused = dial(false).await;
+        assert!(!refused.contains("task saw"), "{refused}");
     }
 
     #[test]
@@ -1062,6 +1196,7 @@ mod tests {
                 private_port: private,
                 dial: TaskDial::Loopback { netns: None },
                 bind: Some(IpAddr::V4(Ipv4Addr::LOCALHOST)),
+                termination: None,
             }])
             .await;
         let out = request(host_port, "GET / HTTP/1.1\r\nHost: x\r\n\r\n").await;
@@ -1189,6 +1324,7 @@ mod tests {
                 scratch: scratch.clone(),
             },
             bind: Some(IpAddr::V4(Ipv4Addr::LOCALHOST)),
+            termination: None,
         };
         ingress
             .sync(&[
@@ -1326,6 +1462,7 @@ mod tests {
                     scratch: scratch.clone(),
                 },
                 bind: Some(IpAddr::V4(Ipv4Addr::LOCALHOST)),
+                termination: None,
             }])
             .await;
         let ok = request(

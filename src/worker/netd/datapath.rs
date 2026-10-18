@@ -22,7 +22,10 @@
 
 use crate::prelude::*;
 use crate::structs::netpolicy::EffectivePolicy;
-use crate::structs::source::{MATERIAL_CREDENTIAL, MATERIAL_INGRESS_CERT, MATERIAL_POLICY};
+use crate::structs::source::{
+    MATERIAL_CLIENT_CA, MATERIAL_CREDENTIAL, MATERIAL_POLICY, MATERIAL_PORT_CERT,
+    MATERIAL_UPSTREAM_CA,
+};
 use crate::structs::{
     AllocNetPolicy, Material, MaterialRef, NetAllocStatus, NetDenial, NetEdgeSample,
     TaskAllocation, UpstreamEndpoints,
@@ -33,7 +36,6 @@ use crate::worker::netd::kernel_guard::GuardedAllocation;
 use crate::worker::netd::specs;
 use crate::worker::netd::state::{NetdState, NetdStateStore};
 use crate::worker::netd::tls::MeshIdentity;
-use crate::worker::netd::PolicyLookup;
 use serde::{Deserialize, Serialize};
 
 use std::collections::HashSet;
@@ -189,22 +191,15 @@ impl Netd {
                 ..Default::default()
             })
             .collect();
-        material.extend(
-            desired
-                .iter()
-                .filter(|allocation| {
-                    cache
-                        .policy_for(allocation.allocation_id)
-                        .and_then(|policy| policy.ingress.as_ref()?.tls.clone())
-                        .is_some_and(|tls| tls.cert_kv_path().is_some())
-                })
-                .map(|allocation| MaterialRef {
-                    kind: MATERIAL_INGRESS_CERT.into(),
-                    allocation_id: allocation.allocation_id,
-                    version: context.kv_cert_version(allocation.allocation_id),
-                    ..Default::default()
-                }),
-        );
+        material.extend(specs::declared_tls_material(desired).into_iter().map(
+            |(kind, allocation_id, key)| MaterialRef {
+                kind: kind.into(),
+                allocation_id,
+                version: context.tls_material_version(kind, allocation_id, &key),
+                key,
+                ..Default::default()
+            },
+        ));
         material.extend(specs::declared_credentials(desired).into_iter().map(
             |(allocation_id, upstream, header)| MaterialRef {
                 kind: MATERIAL_CREDENTIAL.into(),
@@ -448,7 +443,7 @@ impl Netd {
         mesh_wanted |= desired.iter().any(|allocation| {
             !allocation.network.trim().is_empty()
                 && serde_json::from_str::<crate::structs::AllocNetwork>(&allocation.network)
-                    .map(|network| network.ingress_tls.as_deref() == Some("legion"))
+                    .map(|network| network.serves_mesh())
                     .unwrap_or(false)
         });
         context.set_mesh_wanted(mesh_wanted);
@@ -541,48 +536,68 @@ impl Netd {
                         }
                     }
                 }
-                MATERIAL_INGRESS_CERT => self.apply_ingress_certificate(wanted, material),
+                MATERIAL_PORT_CERT => self.apply_tls_material(MATERIAL_PORT_CERT, wanted, material),
+                MATERIAL_CLIENT_CA => self.apply_tls_material(MATERIAL_CLIENT_CA, wanted, material),
+                MATERIAL_UPSTREAM_CA => {
+                    self.apply_tls_material(MATERIAL_UPSTREAM_CA, wanted, material)
+                }
                 MATERIAL_CREDENTIAL => self.apply_upstream_credential(wanted, material),
                 other => debug!(kind = %other, "Ignoring material of an unknown kind"),
             }
         }
     }
 
-    /// Keep a KV-held ingress certificate current (docs/network-handlers.md,
-    /// "Certificates from KV"). Fail-static: a bad bundle keeps the
-    /// certificate in hand and only records the problem.
-    fn apply_ingress_certificate(&self, wanted: MaterialRef, material: Material) {
+    /// Keep KV-held TLS material current: a port's certificate, a mutual
+    /// port's client CA, or an external upstream's pinned CA
+    /// (docs/network-handlers.md, "TLS on ports"). Fail-static: a bad value
+    /// keeps what is held and only records the problem.
+    fn apply_tls_material(&self, kind: &'static str, wanted: MaterialRef, material: Material) {
+        use crate::worker::forwarder::HeldTls;
         let context = self.forwarder.context();
         let allocation_id = wanted.allocation_id;
+        let key = wanted.key;
         if !material.error.is_empty() {
-            context.set_kv_cert_error(allocation_id, material.error);
+            context.set_tls_material_error(kind, allocation_id, &key, material.error);
             return;
         }
         if material.unchanged {
-            context.clear_kv_cert_error(allocation_id);
+            context.clear_tls_material_error(kind, allocation_id, &key);
             return;
         }
-        let kv_path = material
-            .source
-            .strip_prefix("kv ")
-            .unwrap_or(&material.source);
-        match crate::worker::netd::tls::KvCertificate::from_bundle(
-            kv_path,
-            material.version,
-            &material.value,
-        ) {
-            Ok(cert) => {
-                context.set_kv_cert(allocation_id, cert);
+        let held = if kind == MATERIAL_PORT_CERT {
+            crate::worker::netd::tls::CertKey::from_bundle(
+                &material.source,
+                material.version,
+                &material.value,
+            )
+            .map(HeldTls::Cert)
+        } else {
+            crate::worker::netd::tls::roots_from_pem(material.value.as_bytes()).map(|roots| {
+                HeldTls::Ca {
+                    source: material.source.clone(),
+                    version: material.version,
+                    roots,
+                }
+            })
+        };
+        match held {
+            Ok(held) => {
+                context.set_tls_material(kind, allocation_id, &key, held);
                 info!(
                     allocation_id,
+                    kind,
+                    key = %key,
                     source = %material.source,
                     version = material.version,
-                    "Installed ingress certificate from KV"
+                    "Installed TLS material from KV"
                 );
             }
-            Err(err) => {
-                context.set_kv_cert_error(allocation_id, format!("{} {err:#}", material.source))
-            }
+            Err(err) => context.set_tls_material_error(
+                kind,
+                allocation_id,
+                &key,
+                format!("{} {err:#}", material.source),
+            ),
         }
     }
 
@@ -739,6 +754,7 @@ mod tests {
                 http: None,
                 handlers: Vec::new(),
                 credentials: Vec::new(),
+                ca: None,
                 vip: None,
                 canonical_port: None,
                 attachment: Attachment::Host,

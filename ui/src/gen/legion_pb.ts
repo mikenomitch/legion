@@ -11124,7 +11124,7 @@ export class IssueNodeCertificateReply extends Message<IssueNodeCertificateReply
  */
 export class MaterialRef extends Message<MaterialRef> {
   /**
-   * `policy`, `ingress_cert`, or `credential`.
+   * `policy`, `port_cert`, `client_ca`, `upstream_ca`, or `credential`.
    *
    * @generated from field: string kind = 1;
    */
@@ -11139,9 +11139,9 @@ export class MaterialRef extends Message<MaterialRef> {
   allocationId = protoInt64.zero;
 
   /**
-   * `policy`: the content hash. `credential`: the upstream's key (its
-   * `name`, or the catalog service its `to` names). Empty for
-   * `ingress_cert`.
+   * `policy`: the content hash. `port_cert` and `client_ca`: the port
+   * label. `upstream_ca` and `credential`: the upstream's key (its `name`,
+   * or the catalog service its `to` names).
    *
    * @generated from field: string key = 3;
    */
@@ -11235,7 +11235,8 @@ export class Material extends Message<Material> {
 
   /**
    * The material: an `EffectivePolicy` as JSON (`policy`), a PEM bundle
-   * (`ingress_cert`), or a header value (`credential`). Treat as a secret:
+   * (`port_cert`), a CA bundle (`client_ca`, `upstream_ca`), or a header
+   * value (`credential`). Treat as a secret:
    * never log it, never write it to disk.
    *
    * @generated from field: string value = 5;
@@ -20903,15 +20904,19 @@ export class ServiceSummary extends Message<ServiceSummary> {
   meta: { [key: string]: string } = {};
 
   /**
-   * Connect intentions declared in the task's `service.allow`: the job IDs
-   * permitted to reach this service through a `connect.upstreams` entry.
+   * Who may call the service, from the task's `service.allow`: bare entries
+   * are job id globs (`web`, `agent-*`), entries with colons are workload
+   * identity globs over `<region>:<job>:<group>:<task>`
+   * (`*:billing:*:worker`).
    *
-   * Empty — the default — means *every* job may connect, and so does a single
-   * `"*"` entry; the two are reported verbatim rather than normalized so
-   * tooling can tell "no policy declared" from "explicitly open". Intentions
-   * gate the connect datapath only: they filter the endpoint list a consuming
-   * allocation receives in `HeartbeatReply.upstream_endpoints`, and never
-   * affect who may *read* the catalog through ListServices/ResolveService.
+   * Empty — the default — means *every* caller may connect, and so does a
+   * single `"*"` entry; the two are reported verbatim rather than normalized
+   * so tooling can tell "no policy declared" from "explicitly open". The list
+   * filters the endpoint list a consuming allocation receives in
+   * `HeartbeatReply.upstream_endpoints`; on a `service.mesh = true` service
+   * the receiving node also refuses a verified caller outside it
+   * (`Legion-Denied-By: service/allow`). It never affects who may *read* the
+   * catalog through ListServices/ResolveService.
    *
    * Reported here so a read-only caller (`job:read`) can explain why its
    * consumer resolves to nothing — `legion service doctor` prints this list —
@@ -21150,8 +21155,8 @@ export class ServiceEndpoint extends Message<ServiceEndpoint> {
 
   /**
    * True when the endpoint's advertised port terminates **mesh TLS** — its
-   * task's ingress chain has `tls = { mode = "mutual", certFrom = "legion" }`
-   * (docs/network-handlers.md). A consuming node's datapath then originates
+   * task's service is on the mesh (`service.mesh = true`, or imposed by a
+   * policy object), resolved at placement (docs/network-handlers.md). A consuming node's datapath then originates
    * TLS with its own node certificate and names the consuming workload in a
    * PROXY protocol v2 TLV; a plain client dialing the port directly is
    * refused at the handshake.
@@ -26433,6 +26438,27 @@ export class TaskAllocation extends Message<TaskAllocation> {
    */
   taskSpeculativeStart = "";
 
+  /**
+   * The task's group (`tasks[].group`). Together with `job_id` and
+   * `task_name` it forms the workload identity subject
+   * `<region>:<job>:<group>:<task>`: the identity a consuming node names
+   * its workload by on a mesh connection, and what `service.allow` and
+   * ingress `identity` rules match.
+   *
+   * @generated from field: string task_group = 34;
+   */
+  taskGroup = "";
+
+  /**
+   * JSON `ServiceConfig` as the task declared it (`name`, `port`, `mesh`,
+   * `allow`, ...). Empty when the task advertises no service. The manager
+   * reads `mesh` and `allow` from it to compile the receiving side's
+   * `service/allow` check into the allocation's ingress policy.
+   *
+   * @generated from field: string task_service = 35;
+   */
+  taskService = "";
+
   constructor(data?: PartialMessage<TaskAllocation>) {
     super();
     proto3.util.initPartial(data, this);
@@ -26474,6 +26500,8 @@ export class TaskAllocation extends Message<TaskAllocation> {
     { no: 31, name: "session_seal_keys", kind: "message", T: SessionSealKey, repeated: true },
     { no: 32, name: "envelope_resources", kind: "scalar", T: 9 /* ScalarType.STRING */ },
     { no: 33, name: "task_speculative_start", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 34, name: "task_group", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 35, name: "task_service", kind: "scalar", T: 9 /* ScalarType.STRING */ },
   ]);
 
   static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): TaskAllocation {
@@ -31661,9 +31689,10 @@ export class NetAllocStatus extends Message<NetAllocStatus> {
   handlers: NetHandlerStatus[] = [];
 
   /**
-   * Whether the ingress chain's TLS material is loaded: the BYO files parse,
-   * or the node holds a mesh certificate for `certFrom = "legion"`. Always
-   * true when no ingress chain terminates TLS.
+   * Whether the TLS material of every port that terminates TLS is loaded:
+   * a port's own `tls` (its KV-held certificate and client CA have arrived,
+   * or its files parse), or, for the service's mesh port, the node's mesh
+   * certificate. Always true when no port terminates TLS.
    *
    * @generated from field: bool tls_ready = 12;
    */

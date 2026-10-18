@@ -1284,6 +1284,7 @@ mod tests {
                     name: "http".into(),
                     static_port: None,
                     to: None,
+                    tls: None,
                 }],
                 ..Default::default()
             });

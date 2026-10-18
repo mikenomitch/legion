@@ -154,6 +154,7 @@ async fn forwarder(backends: &[String], balance: &str, http: bool) -> u16 {
         http: http.then(UpstreamHttpConfig::default),
         handlers: Vec::new(),
         credentials: Vec::new(),
+        ca: None,
         vip: None,
         canonical_port: None,
         netns: None,

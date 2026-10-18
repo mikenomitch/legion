@@ -1448,7 +1448,7 @@ export const Manager = {
      * the node's identity on every plane Legion runs between its own
      * processes: the mTLS worker plane listener (what a manager verifies when
      * it dials the node, docs/auth-and-acls.md, "The worker plane") and the
-     * mesh (`certFrom = "legion"`, docs/network-handlers.md, "mTLS").
+     * mesh (`service.mesh = true`, docs/network-handlers.md, "The mesh").
      *
      * The worker generates its key pair locally and sends only a CSR; the
      * private key never crosses the network. The manager has the CSR's public
@@ -1510,10 +1510,11 @@ export const Manager = {
     /**
      * Fetch the material a node's datapath needs for the allocations placed
      * on it, in one call per heartbeat: network-policy bodies by hash, the
-     * KV-held certificates behind ingress TLS, and the values behind
-     * `connect.upstreams[].credentials` (docs/network-handlers.md). It
-     * replaces one fetch per kind, so a new kind of material (or a new place
-     * a value comes from) is a provider on the manager, not a new call.
+     * KV-held certificates and CA bundles behind `network.ports[].tls` and
+     * `connect.upstreams[].ca`, and the values behind
+     * `connect.upstreams[].credentials` (docs/network-handlers.md). One call
+     * serves every kind, so a new kind of material (or a new place a value
+     * comes from) is a provider on the manager, not a new call.
      *
      * Each `MaterialRef` names a kind and what it is for, never where the
      * value lives:
@@ -1521,20 +1522,23 @@ export const Manager = {
      *   `value` is the `EffectivePolicy` as JSON. Policies are
      *   content-addressed, so a node running a thousand identical sandboxes
      *   fetches one body once.
-     * - `ingress_cert`: `allocation_id` names an allocation whose ingress TLS
-     *   takes its certificate from KV; `value` is the PEM bundle (chain, leaf
-     *   first, then the private key), validated by the manager first.
+     * - `port_cert`: `allocation_id` and `key` (a port label) name a port whose
+     *   `tls.cert = { kv }`; `value` is the PEM bundle (chain, leaf first,
+     *   then the private key), validated by the manager first.
+     * - `client_ca`: the same, for the port's `tls.clients.ca = { kv }`;
+     *   `value` is a PEM CA bundle.
+     * - `upstream_ca`: `allocation_id` and `key` (an upstream key) name an
+     *   external upstream whose `ca = { kv }`; `value` is a PEM CA bundle.
      * - `credential`: `allocation_id`, `key` (the upstream's key), and `part`
      *   (the header, lower-cased) name one injected header; `value` is the KV
      *   value or a freshly minted workload-identity token.
      *
      * The manager derives every KV path and identity itself, from the
-     * allocation's own declaration (its task's `connect` block, or its
-     * effective ingress chain), after checking the allocation is placed on
-     * the calling node. So a node can only ever read material that a job or
-     * policy on it declares, and a job can only declare a KV path its
-     * submitter could read (RunJob, template runs, and UpsertNetPolicy
-     * require `kv:read` on it).
+     * allocation's own declaration (its ports, as placed, and its task's
+     * `connect` block), after checking the allocation is placed on the
+     * calling node. So a node can only ever read material that a job on it
+     * declares, and a job can only declare a KV path its submitter could read
+     * (RunJob and template runs require `kv:read` on it).
      *
      * Workers pass the version they already hold (`MaterialRef.version`): the
      * KV entry's version, or for an identity token its expiry in unix

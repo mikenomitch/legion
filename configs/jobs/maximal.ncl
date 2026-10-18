@@ -175,8 +175,7 @@
                 # `container` on a Linux node and `host` everywhere else
                 # (exec, macOS; sandboxes per docs/task-runtime-sandbox.md).
                 # `host` opts a container out. A `require` policy can impose
-                # a mode for a pool. `bridge` / `cni/<name>` are reserved for
-                # the datapath plugin.
+                # a mode for a pool.
                 mode = "auto",
                 ports = [
                     # Gated: the datapath owns the host port and forwards to
@@ -184,6 +183,25 @@
                     # port (macOS publishes it to 8080).
                     { name = "http", to = 8080 },
                     { name = "metrics", static = 9090 },  # fixed host port
+                    # TLS the node terminates on this port with a certificate
+                    # that is not the mesh's (docs/network-handlers.md, "TLS
+                    # on ports"); the task speaks plaintext on its private
+                    # port. `cert` is { kv = "<path>" } (one PEM bundle: the
+                    # chain, then the key; swapped live on `kv put`; the
+                    # submitter needs kv read on it) or { file = { cert, key } }
+                    # (or one `file` holding both) on the node. `clients`
+                    # makes the port mutual: client certificates must verify
+                    # against `ca` ({ kv } or { file }), and the verified
+                    # identity (URI SAN, else DNS SAN, else CN) feeds
+                    # `identity` rules and `authz`. Never on the service's
+                    # mesh port.
+                    {
+                        name = "admin",
+                        tls = {
+                            cert = { kv = "certs/admin.example.com" },
+                            clients = { ca = { kv = "certs/admin-clients" } },
+                        },
+                    },
                 ],
                 # Attribution keys carried on every net.denied event and
                 # access-log line (never on a metric label). Stored policies
@@ -228,27 +246,16 @@
                 # Inline ingress policy in front of this task's advertised
                 # ports: the datapath binds the advertised port, the task
                 # binds a private twin (docs/network-handlers.md, "Ingress").
+                # Chains carry policy only; TLS lives on the port (above) or
+                # is the mesh (service.mesh, below).
                 ingress = {
                     protocol = "http",
                     rules = [
                         { when = { path = "/admin/**" }, action = "deny", reason = "not externally reachable" },
-                        # Peer identity is known with tls.mode = "mutual".
-                        { when = { identity = "auto:web:*" }, action = "allow" },
+                        # Peer identity is known on the mesh port and on a
+                        # mutual port.
+                        { when = { identity = "*:web:*:*" }, action = "allow" },
                     ],
-                    # TLS on the advertised port. server | mutual with
-                    # certFrom = "legion" (the node's mesh certificate; peers
-                    # verified against the mesh CA with clientCa = "legion"),
-                    # certFrom = { kv = "<path>" } (a PEM bundle in KV: the
-                    # chain, then the key; swapped live on `kv put`, and the
-                    # submitter needs kv read on the path), or
-                    # certPath/keyPath (+ clientCa bundle) for your own PKI.
-                    tls = {
-                        mode = "off",          # off | server | mutual
-                        # certFrom = "legion",
-                        # certFrom = { kv = "certs/web.example.com" },
-                        # clientCa = "legion",
-                        # requireIdentity = ["auto:web:*"],
-                    },
                 },
             },
             service = {
@@ -256,12 +263,20 @@
                 port = "http",      # label from network.ports; or a number/'dynamic' to declare inline
                 tags = ["v1", "public"],
                 meta = { protocol = "http" },
-                # Connect intentions (see docs/service-discovery.md): job ids
-                # allowed to reach this service through a `connect` upstream.
-                # Omit the field (or use ["*"]) to allow every job. Denied
-                # consumers simply get an empty endpoint list; enforcement is
-                # control-plane + forwarder, not cryptographic identity.
-                allow = ["gateway", "maximal-demo"],
+                # Put the service on the mesh (docs/network-handlers.md, "The
+                # mesh"): its port terminates node-to-node mTLS with the node
+                # certificate, consumers originate mesh TLS to it, and a plain
+                # client dialing the port directly is refused at the
+                # handshake. A policy object can impose or default it.
+                mesh = true,
+                # Who may call the service (docs/service-discovery.md): a
+                # bare entry is a job id glob, an entry with colons globs
+                # <region>:<job>:<group>:<task>. Omit the field (or use
+                # ["*"]) to allow everyone. Always enforced by the endpoint
+                # feed (others get no endpoints); with mesh = true also at
+                # the receiving node, against the verified caller
+                # (Legion-Denied-By: service/allow).
+                allow = ["gateway", "maximal-demo", "*:ops:*:shell"],
             },
             # Services this task dials, each through the node's forwarder,
             # which load-balances across the upstream's healthy endpoints.
@@ -333,6 +348,10 @@
                         # task's "billing" workload identity for the
                         # allocation and the node injects it, asking for a
                         # new one once half its TTL has passed.
+                        # Verify the destination against this trust bundle
+                        # instead of the public roots: { kv } or { file }
+                        # (PEM). tls:// and https:// external upstreams only.
+                        ca = { kv = "certs/internal-ca" },
                         credentials = [
                             { header = "Authorization", prefix = "Bearer ", from = { identity = "billing" } },
                         ],

@@ -86,7 +86,7 @@ fn default_task_count() -> TaskCount {
     TaskCount::default()
 }
 
-fn default_task_group() -> String {
+pub fn default_task_group() -> String {
     "default".to_string()
 }
 

@@ -2624,9 +2624,10 @@ async fn kv_path_scoped_policy_limits_kv_access() -> R<()> {
     Ok(())
 }
 
-/// `certFrom = { kv }` hands a KV value to the datapath, so naming one in a
-/// job needs `kv:read` on that path: job-write access alone must not be a way
-/// to read private keys.
+/// A port's `tls.cert = { kv }` (and `tls.clients.ca`, and an upstream's
+/// `ca`) hands a KV value to the datapath, so naming one in a job needs
+/// `kv:read` on that path: job-write access alone must not be a way to read
+/// private keys.
 #[tokio::test]
 async fn kv_backed_ingress_cert_needs_kv_read_on_the_path() -> R<()> {
     let (svc, _fixtures, _) = setup_enabled()?;
@@ -2661,8 +2662,7 @@ async fn kv_backed_ingress_cert_needs_kv_read_on_the_path() -> R<()> {
                 "runtime": "container",
                 "config": { "image": "alpine", "command": ["sleep", "30"] },
                 "network": {
-                    "ports": [{ "name": "https", "static": 8443 }],
-                    "ingress": { "tls": { "mode": "server", "certFrom": { "kv": "certs/edge" } } },
+                    "ports": [{ "name": "https", "static": 8443, "tls": { "cert": { "kv": "certs/edge" } } }],
                 },
             },
         });
@@ -2687,7 +2687,9 @@ async fn kv_backed_ingress_cert_needs_kv_read_on_the_path() -> R<()> {
         .expect_err("job:write alone must not name a KV certificate");
     assert_eq!(status.code(), Code::PermissionDenied);
     assert!(
-        status.message().contains("certs/edge"),
+        status
+            .message()
+            .contains("network.ports[https].tls.cert names kv certs/edge"),
         "{}",
         status.message()
     );

@@ -23,9 +23,15 @@ use serde::{Deserialize, Serialize};
 /// `MaterialRef.kind` (proto `FetchDatapathMaterial`): a policy body by
 /// content hash.
 pub const MATERIAL_POLICY: &str = "policy";
-/// `MaterialRef.kind`: the PEM bundle behind an allocation's KV-held
-/// ingress certificate.
-pub const MATERIAL_INGRESS_CERT: &str = "ingress_cert";
+/// `MaterialRef.kind`: the PEM bundle (chain, then key) behind a port's
+/// `tls.cert = { kv }`; `key` is the port label.
+pub const MATERIAL_PORT_CERT: &str = "port_cert";
+/// `MaterialRef.kind`: the CA bundle behind a port's
+/// `tls.clients.ca = { kv }`; `key` is the port label.
+pub const MATERIAL_CLIENT_CA: &str = "client_ca";
+/// `MaterialRef.kind`: the CA bundle behind an upstream's `ca = { kv }`;
+/// `key` is the upstream key.
+pub const MATERIAL_UPSTREAM_CA: &str = "upstream_ca";
 /// `MaterialRef.kind`: one injected header value of an upstream credential.
 pub const MATERIAL_CREDENTIAL: &str = "credential";
 

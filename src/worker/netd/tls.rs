@@ -1,16 +1,15 @@
-//! TLS on the datapath (docs/network-handlers.md, "mTLS").
+//! TLS on the datapath (docs/network-handlers.md, "The mesh" and "TLS on
+//! ports").
 //!
-//! Legion terminates and originates; a handler never sees TLS. Two sources
-//! of material:
+//! Legion terminates and originates; a handler never sees TLS. Two kinds of
+//! port:
 //!
-//! - **bring-your-own** — `tls = { mode = "server" | "mutual", certPath,
-//!   keyPath, clientCa }` on an ingress chain: files the operator placed on
-//!   the node (or staged as artifacts). With `mutual`, the client's
-//!   certificate is verified against `clientCa` and its identity — the first
-//!   URI SAN, else the first DNS SAN, else the CN — feeds `identity` rules
-//!   and `requireIdentity`.
-//! - **the mesh** — `certFrom = "legion"` (and `clientCa = "legion"`): the
-//!   node's own certificate from `IssueNodeCertificate` — the same one its
+//! - **a port's own TLS** — `network.ports[].tls = { cert, clients }`: a
+//!   certificate from KV or files on the node. With `clients = { ca }` the
+//!   port is mutual, and the client's identity — the first URI SAN, else the
+//!   first DNS SAN, else the CN — feeds `identity` rules and `authz`.
+//! - **the mesh** — `service.mesh = true`: the service's port terminates
+//!   with the node's own certificate from `IssueNodeCertificate` — the same one its
 //!   worker plane serves (`crate::worker::plane`), issued at registration
 //!   from a key the node generated, persisted under `<state-dir>/identity/`,
 //!   and refreshed on the heartbeat loop. Node-to-node hops are mTLS on node
@@ -18,7 +17,6 @@
 //!   inside the session, trusted because the peer proved it is a node.
 
 use crate::prelude::*;
-use crate::structs::netpolicy::{glob_matches, TlsConfig, TLS_MUTUAL};
 
 use rustls::server::WebPkiClientVerifier;
 use rustls::{ClientConfig, RootCertStore, ServerConfig};
@@ -87,7 +85,7 @@ impl MeshIdentity {
         key_from_pem(self.key_pem.as_bytes())
     }
 
-    fn roots(&self) -> RootCertStore {
+    pub fn roots(&self) -> RootCertStore {
         let mut roots = RootCertStore::empty();
         for cert in &self.ca {
             let _ = roots.add(cert.clone());
@@ -124,75 +122,117 @@ impl MeshIdentity {
     }
 }
 
-/// A certificate held in KV (`certFrom = { kv = "<path>" }`), as one PEM
-/// bundle: the chain, leaf first, then the private key. Kept in memory only;
-/// the key is redacted from `Debug`.
-pub struct KvCertificate {
-    pub kv_path: String,
+/// A certificate chain and its private key for a port's own TLS, from a KV
+/// bundle or files on the node. Kept in memory only; the key is redacted
+/// from `Debug`.
+pub struct CertKey {
+    /// Where it came from (`kv certs/app`, `file /etc/app/tls.crt`).
+    pub source: String,
+    /// The KV version, or 0 for files.
     pub version: i64,
     pub cert_chain: Vec<CertificateDer<'static>>,
     key_pem: String,
 }
 
-impl std::fmt::Debug for KvCertificate {
+impl std::fmt::Debug for CertKey {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("KvCertificate")
-            .field("kv_path", &self.kv_path)
+        f.debug_struct("CertKey")
+            .field("source", &self.source)
             .field("version", &self.version)
             .finish_non_exhaustive()
     }
 }
 
-impl KvCertificate {
-    pub fn from_bundle(kv_path: &str, version: i64, bundle_pem: &str) -> R<Self> {
+impl CertKey {
+    /// One PEM bundle: the chain, leaf first, then the private key.
+    pub fn from_bundle(source: &str, version: i64, bundle_pem: &str) -> R<Self> {
         validate_bundle(bundle_pem)?;
-        Ok(KvCertificate {
-            kv_path: kv_path.to_string(),
+        Ok(CertKey {
+            source: source.to_string(),
             version,
             cert_chain: certs_from_pem(bundle_pem.as_bytes())?,
             key_pem: bundle_pem.to_string(),
         })
     }
 
-    /// Terminate with this certificate. `mutual` verifies clients against
-    /// `clientCa`: the mesh CA for `"legion"`, otherwise a bundle on disk.
-    pub fn server_config(
-        &self,
-        tls: &TlsConfig,
-        mesh: Option<&MeshIdentity>,
-    ) -> R<Arc<ServerConfig>> {
+    /// Files on the node: a chain and a key, or (with no `key_path`) one
+    /// file holding both.
+    pub fn from_files(cert_path: &str, key_path: Option<&str>) -> R<Self> {
+        let cert_pem = read(cert_path)?;
+        let key_pem = match key_path {
+            Some(path) => read(path)?,
+            None => cert_pem.clone(),
+        };
+        let cert_chain = certs_from_pem(&cert_pem)?;
+        if cert_chain.is_empty() {
+            bail!("{cert_path} holds no certificate");
+        }
+        let key_pem = String::from_utf8(key_pem).context("key PEM is not UTF-8")?;
+        let key = key_from_pem(key_pem.as_bytes())?;
+        ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(cert_chain.clone(), key)
+            .map_err(|err| anyhow::anyhow!("certificate and key do not match: {err}"))?;
+        Ok(CertKey {
+            source: match key_path {
+                Some(key_path) => format!("file {cert_path} + {key_path}"),
+                None => format!("file {cert_path}"),
+            },
+            version: 0,
+            cert_chain,
+            key_pem,
+        })
+    }
+
+    /// Terminate with this certificate; `clients` (a CA) makes it mutual.
+    pub fn server_config(&self, clients: Option<RootCertStore>) -> R<Arc<ServerConfig>> {
         let key = key_from_pem(self.key_pem.as_bytes())?;
         let builder = ServerConfig::builder();
-        let config = if tls.mode == TLS_MUTUAL {
-            let roots = match tls.client_ca.as_deref() {
-                Some("legion") => mesh
-                    .ok_or_else(|| anyhow::anyhow!("mesh certificate not issued yet"))?
-                    .roots(),
-                Some(path) => {
-                    let mut roots = RootCertStore::empty();
-                    for cert in certs_from_pem(&read(path)?)? {
-                        roots.add(cert)?;
-                    }
-                    roots
-                }
-                None => bail!("tls.clientCa is required for mutual"),
-            };
-            let verifier = WebPkiClientVerifier::builder(Arc::new(roots))
-                .build()
-                .map_err(|err| anyhow::anyhow!("client verifier: {err}"))?;
-            builder
-                .with_client_cert_verifier(verifier)
-                .with_single_cert(self.cert_chain.clone(), key)?
-        } else {
-            builder
+        let config = match clients {
+            Some(roots) => {
+                let verifier = WebPkiClientVerifier::builder(Arc::new(roots))
+                    .build()
+                    .map_err(|err| anyhow::anyhow!("client verifier: {err}"))?;
+                builder
+                    .with_client_cert_verifier(verifier)
+                    .with_single_cert(self.cert_chain.clone(), key)?
+            }
+            None => builder
                 .with_no_client_auth()
-                .with_single_cert(self.cert_chain.clone(), key)?
+                .with_single_cert(self.cert_chain.clone(), key)?,
         };
         Ok(Arc::new(config))
     }
 }
 
-/// Check a `certFrom = { kv }` bundle: at least one certificate, a private
+/// A CA bundle as a root store: at least one certificate.
+pub fn roots_from_pem(pem: &[u8]) -> R<RootCertStore> {
+    let mut roots = RootCertStore::empty();
+    for cert in certs_from_pem(pem)? {
+        roots.add(cert)?;
+    }
+    if roots.is_empty() {
+        bail!("holds no CA certificate (expected PEM)");
+    }
+    Ok(roots)
+}
+
+/// A CA bundle read from a file on the node.
+pub fn roots_from_file(path: &str) -> R<RootCertStore> {
+    roots_from_pem(&read(path)?).with_context(|| path.to_string())
+}
+
+/// Originate TLS to an external upstream that pins its own trust bundle
+/// (`connect.upstreams[].ca`) instead of the public roots.
+pub fn pinned_client_config(roots: RootCertStore) -> Arc<ClientConfig> {
+    Arc::new(
+        ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth(),
+    )
+}
+
+/// Check a KV-held certificate bundle: at least one certificate, a private
 /// key, and a key that belongs to the leaf. The manager runs this before
 /// sending a bundle, so a bad `kv put` names the key in the allocation's
 /// status instead of failing every handshake.
@@ -227,56 +267,6 @@ pub fn key_from_pem(pem: &[u8]) -> R<PrivateKeyDer<'static>> {
 
 fn read(path: &str) -> R<Vec<u8>> {
     std::fs::read(Path::new(path)).with_context(|| format!("reading {path}"))
-}
-
-/// Bring-your-own material for an ingress chain.
-pub fn byo_server_config(tls: &TlsConfig) -> R<Arc<ServerConfig>> {
-    let cert_path = tls
-        .cert_path
-        .as_deref()
-        .ok_or_else(|| anyhow::anyhow!("tls.certPath is required"))?;
-    let key_path = tls
-        .key_path
-        .as_deref()
-        .ok_or_else(|| anyhow::anyhow!("tls.keyPath is required"))?;
-    let chain = certs_from_pem(&read(cert_path)?)?;
-    if chain.is_empty() {
-        bail!("{cert_path} holds no certificate");
-    }
-    let key = key_from_pem(&read(key_path)?)?;
-    let builder = ServerConfig::builder();
-    let config = if tls.mode == TLS_MUTUAL {
-        let ca_path = tls
-            .client_ca
-            .as_deref()
-            .ok_or_else(|| anyhow::anyhow!("tls.clientCa is required for mutual"))?;
-        let mut roots = RootCertStore::empty();
-        for cert in certs_from_pem(&read(ca_path)?)? {
-            roots.add(cert)?;
-        }
-        let verifier = WebPkiClientVerifier::builder(Arc::new(roots))
-            .build()
-            .map_err(|err| anyhow::anyhow!("client verifier from {ca_path}: {err}"))?;
-        builder
-            .with_client_cert_verifier(verifier)
-            .with_single_cert(chain, key)?
-    } else {
-        builder.with_no_client_auth().with_single_cert(chain, key)?
-    };
-    Ok(Arc::new(config))
-}
-
-/// Egress `originate` against a pinned CA bundle (`tls.caPath`).
-pub fn pinned_client_config(ca_path: &str) -> R<Arc<ClientConfig>> {
-    let mut roots = RootCertStore::empty();
-    for cert in certs_from_pem(&read(ca_path)?)? {
-        roots.add(cert)?;
-    }
-    Ok(Arc::new(
-        ClientConfig::builder()
-            .with_root_certificates(roots)
-            .with_no_client_auth(),
-    ))
 }
 
 /// Who a verified client certificate says it is.
@@ -336,18 +326,6 @@ pub fn peer_identity(chain: &[CertificateDer<'_>]) -> Option<PeerIdentity> {
     common_name.map(PeerIdentity::Other)
 }
 
-/// `tls.requireIdentity`: every glob is an alternative; empty means any
-/// verified peer.
-pub fn identity_allowed(globs: &[String], identity: Option<&str>) -> bool {
-    if globs.is_empty() {
-        return true;
-    }
-    match identity {
-        Some(identity) => globs.iter().any(|glob| glob_matches(glob, identity)),
-        None => false,
-    }
-}
-
 pub fn server_name(host: &str) -> R<ServerName<'static>> {
     ServerName::try_from(host.to_string())
         .map_err(|err| anyhow::anyhow!("invalid TLS server name {host:?}: {err}"))
@@ -359,20 +337,6 @@ mod tests {
     use crate::manager::mesh_ca::{generate_ca, issue_node_cert};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::{TcpListener, TcpStream};
-
-    #[test]
-    fn identity_globs() {
-        assert!(identity_allowed(&[], None));
-        assert!(!identity_allowed(&["auto:web:*".into()], None));
-        assert!(identity_allowed(
-            &["auto:web:*".into()],
-            Some("auto:web:default:server")
-        ));
-        assert!(!identity_allowed(
-            &["auto:web:*".into()],
-            Some("auto:db:default:pg")
-        ));
-    }
 
     /// Two mesh identities from one CA: a node-to-node handshake verifies
     /// both ways and the server reads the client's node id off its SAN.

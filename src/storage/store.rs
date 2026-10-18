@@ -748,6 +748,8 @@ pub struct DeclaredService {
 pub struct DeclaredConsumer {
     pub job_id: String,
     pub task_name: String,
+    /// The task's group, for its workload identity subject.
+    pub group: String,
     pub upstreams: Vec<crate::structs::UpstreamConfig>,
 }
 
@@ -13287,28 +13289,38 @@ impl Store {
             .any(|policy| policy.ingress.is_some() && policy.selector.matches(&facts)))
     }
 
-    /// How the allocation's advertised ports terminate TLS — `legion`,
-    /// `byo`, or none — from the effective ingress chain the same merge the
-    /// heartbeat runs would produce for this (job, task, node). Resolved at
-    /// placement because the catalog projection reads it off the allocation
-    /// row for every consumer's endpoint feed.
-    fn ingress_tls_at_placement(
+    /// The port that terminates mesh mTLS, if any: the service's port, when
+    /// the effective `service.mesh` (a `require` policy's, else the task's,
+    /// else a `default` policy's) is on. Resolved at placement because the
+    /// catalog projection reads it off the allocation row for every
+    /// consumer's endpoint feed, and the listener and the catalog must agree.
+    fn mesh_port_at_placement(
         &self,
         tx: &Connection,
         node_id: &str,
         task_id: i64,
         network: Option<&crate::structs::NetworkConfig>,
     ) -> R<Option<String>> {
-        let (runtime, job_id): (String, String) = match tx
+        let (runtime, job_id, service): (String, String, Option<String>) = match tx
             .query_row(
-                "SELECT runtime, job_id FROM task_config WHERE id = ?;",
+                "SELECT runtime, job_id, service FROM task_config WHERE id = ?;",
                 [task_id],
-                |row| Ok((row.get(0)?, row.get(1)?)),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
             .optional()?
         {
             Some(row) => row,
             None => return Ok(None),
+        };
+        let Some(service) = service
+            .as_deref()
+            .filter(|raw| !raw.trim().is_empty())
+            .and_then(|raw| from_str::<crate::structs::ServiceConfig>(raw).ok())
+        else {
+            return Ok(None);
+        };
+        let Some(label) = service.port_label().map(str::to_string) else {
+            return Ok(None);
         };
         let matching: Vec<crate::structs::netpolicy::NetPolicyObject> =
             if self.net_policy_generation().unwrap_or(0) > 0 {
@@ -13327,7 +13339,7 @@ impl Store {
                 self.list_net_policies()?
                     .into_iter()
                     .map(|record| record.object)
-                    .filter(|policy| policy.selector.matches(&facts))
+                    .filter(|policy| policy.selector.matches(&facts) && policy.mesh.is_some())
                     .collect()
             } else {
                 Vec::new()
@@ -13335,28 +13347,11 @@ impl Store {
         let effective = crate::structs::netpolicy::merge_policies(
             &matching,
             crate::structs::netpolicy::InlinePolicy {
-                mode: None,
-                egress: None,
-                ingress: network.and_then(|n| n.ingress.as_ref()),
+                mesh: service.mesh,
+                ..Default::default()
             },
         );
-        Ok(effective
-            .ingress
-            .as_ref()
-            .and_then(|chain| chain.tls.as_ref())
-            .filter(|tls| {
-                matches!(
-                    tls.mode.as_str(),
-                    crate::structs::netpolicy::TLS_SERVER | crate::structs::netpolicy::TLS_MUTUAL
-                )
-            })
-            .map(|tls| {
-                if tls.cert_from_mesh() {
-                    "legion".to_string()
-                } else {
-                    "byo".to_string()
-                }
-            }))
+        Ok((effective.mesh == Some(true)).then_some(label))
     }
 
     /// Open or close the gated-default gate on this store (gated plan Phase
@@ -13628,10 +13623,15 @@ impl Store {
             (None, HashMap::new())
         };
 
-        // An ingress chain — inline, or from a matching stored policy — means
-        // the datapath owns the advertised ports and the task binds private
-        // twins. Decided here because ports are assigned here.
-        let has_ingress = network.as_ref().is_some_and(|n| n.ingress.is_some())
+        // An ingress chain — inline, or from a matching stored policy — a
+        // mesh service, or a port with its own TLS means the datapath owns
+        // the advertised ports and the task binds private twins. Decided here
+        // because ports are assigned here.
+        let mesh_port = self.mesh_port_at_placement(tx, node_id, task_id, network.as_ref())?;
+        let has_ingress = network
+            .as_ref()
+            .is_some_and(|n| n.ingress.is_some() || n.ports.iter().any(|port| port.tls.is_some()))
+            || mesh_port.is_some()
             || self.policy_declares_ingress(tx, node_id, task_id, network.as_ref())?;
         let (ports, upstreams) = crate::structs::assign_allocation_ports_full(
             network.as_ref(),
@@ -13656,11 +13656,15 @@ impl Store {
 
         let resolver = (gated_namespace && vip_block.is_none())
             .then(|| crate::structs::network::GATED_RESOLVER_ADDR.to_string());
-        let ingress_tls = if has_ingress {
-            self.ingress_tls_at_placement(tx, node_id, task_id, network.as_ref())?
-        } else {
-            None
-        };
+        let mut ports = ports;
+        if let Some(label) = mesh_port.as_deref() {
+            for port in ports.iter_mut().filter(|port| port.name == label) {
+                // A port's own `tls` is the task's explicit choice; a
+                // policy-imposed mesh does not override it (submit rejects
+                // the two together on the task itself).
+                port.mesh = port.tls.is_none();
+            }
+        }
         Ok(Some(crate::structs::AllocNetwork {
             address,
             ports,
@@ -13668,7 +13672,6 @@ impl Store {
             vip_block,
             resolver,
             mode,
-            ingress_tls,
         }))
     }
 
@@ -15206,9 +15209,12 @@ impl Store {
                 allow: service.allow.clone(),
                 meta: service.meta_strings(),
                 port_label: service.port_label().map(str::to_string),
-                mesh_tls: network
-                    .as_ref()
-                    .is_some_and(|network| network.ingress_tls.as_deref() == Some("legion")),
+                mesh_tls: network.as_ref().is_some_and(|network| {
+                    service
+                        .port_label()
+                        .and_then(|label| network.port(label))
+                        .is_some_and(|port| port.mesh)
+                }),
             });
         }
 
@@ -15258,7 +15264,7 @@ impl Store {
     pub fn declared_consumers(&self) -> R<Vec<DeclaredConsumer>> {
         let conn = self.read_connection()?;
         let mut stmt = conn.prepare(
-            "SELECT tc.name, tc.connect, tc.job_id
+            "SELECT tc.name, tc.connect, tc.job_id, tc.group_name
              FROM task_config tc
              INNER JOIN job_config jc ON jc.id = tc.job_config_id
              INNER JOIN (
@@ -15271,11 +15277,12 @@ impl Store {
                 row.get::<_, String>(0)?,
                 row.get::<_, String>(1)?,
                 row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
             ))
         })?;
         let mut out = Vec::new();
         for row in rows {
-            let (task_name, connect_raw, job_id) = row?;
+            let (task_name, connect_raw, job_id, group) = row?;
             let connect: crate::structs::ConnectConfig = match from_str(&connect_raw) {
                 Ok(connect) => connect,
                 Err(_) => continue,
@@ -15286,6 +15293,7 @@ impl Store {
             out.push(DeclaredConsumer {
                 job_id,
                 task_name,
+                group,
                 upstreams: connect.upstreams,
             });
         }
@@ -26671,6 +26679,7 @@ mod tests {
                     name: "http".into(),
                     static_port: Some(18080),
                     to: None,
+                    tls: None,
                 }],
             });
             task
@@ -26774,6 +26783,7 @@ mod tests {
                 name: "http".into(),
                 static_port: Some(18080),
                 to: None,
+                tls: None,
             }],
         });
         let (job_config_id, task_id) = submit_walk_job(&store, "walk-port-pair", port_task)?;
@@ -29955,6 +29965,7 @@ mod tests {
                 name: "http".into(),
                 static_port: None,
                 to: Some(8080),
+                tls: None,
             }],
             ..Default::default()
         });
@@ -31473,6 +31484,7 @@ mod tests {
                 name: "http".into(),
                 static_port: None,
                 to: None,
+                tls: None,
             }],
             ..Default::default()
         });

@@ -1645,7 +1645,7 @@ fn migration_list() -> Vec<M<'static>> {
         INSERT OR IGNORE INTO net_policy_meta (id, generation) VALUES (1, 0);",
         )
         .down("DROP TABLE IF EXISTS net_policy; DROP TABLE IF EXISTS net_policy_meta;"),
-        // The mesh CA behind `certFrom = "legion"` (docs/network-handlers.md):
+        // The mesh CA behind `service.mesh = true` (docs/network-handlers.md):
         // one row, created on the first IssueNodeCertificate, replicated
         // with the control lane so every manager signs with the same key.
         M::up(
