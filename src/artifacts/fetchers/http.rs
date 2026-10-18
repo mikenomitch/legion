@@ -22,15 +22,109 @@ impl HttpFetcher {
         Self
     }
 
-    /// Builds the blocking client lazily per fetch: `reqwest::blocking`
-    /// clients may not be constructed inside an async runtime, and fetchers
-    /// always run on staging threads while the registry itself is built
-    /// wherever (worker startup, manager admission).
-    fn client(&self) -> R<Client> {
-        Client::builder()
-            .redirect(Policy::limited(MAX_REDIRECTS))
-            .build()
-            .context("build http artifact client")
+    /// A blocking client for one request to `url`, following no redirects
+    /// (the fetch follows them itself, judging each hop). Built per request:
+    /// `reqwest::blocking` clients may not be constructed inside an async
+    /// runtime, and fetchers always run on staging threads while the
+    /// registry itself is built wherever (worker startup, manager admission).
+    ///
+    /// With a host guard, the host is resolved here, every address judged,
+    /// and the client pinned to the ones that pass, so the connection goes
+    /// where the guard looked (a second lookup cannot answer differently).
+    fn client_for(
+        &self,
+        url: &reqwest::Url,
+        guard: Option<&crate::structs::host_guard::HostGuard>,
+        redacted_source: &str,
+    ) -> R<Client> {
+        let mut builder = Client::builder().redirect(Policy::none());
+        if let Some(guard) = guard {
+            let host = url
+                .host()
+                .with_context(|| format!("{redacted_source} names no host"))?;
+            let port = url
+                .port_or_known_default()
+                .with_context(|| format!("{redacted_source} names no port"))?;
+            let allowed = judged_addrs(guard, &host, port, redacted_source)?;
+            if let url::Host::Domain(domain) = host {
+                builder = builder.resolve_to_addrs(domain, &allowed);
+            }
+        }
+        builder.build().context("build http artifact client")
+    }
+}
+
+/// The addresses `host:port` resolves to that the worker's host guard lets
+/// an artifact fetch reach. Fails, naming the guard's reason, when it
+/// refuses every one.
+pub(crate) fn judged_addrs(
+    guard: &crate::structs::host_guard::HostGuard,
+    host: &url::Host<&str>,
+    port: u16,
+    redacted_source: &str,
+) -> R<Vec<std::net::SocketAddr>> {
+    let addrs: Vec<std::net::SocketAddr> = match host {
+        url::Host::Ipv4(ip) => vec![(*ip, port).into()],
+        url::Host::Ipv6(ip) => vec![(*ip, port).into()],
+        url::Host::Domain(domain) => {
+            use std::net::ToSocketAddrs;
+            (*domain, port)
+                .to_socket_addrs()
+                .with_context(|| format!("resolve {domain} for {redacted_source}"))?
+                .collect()
+        }
+    };
+    let mut denial = None;
+    let allowed: Vec<std::net::SocketAddr> = addrs
+        .into_iter()
+        .filter(|addr| match guard.judge(addr.ip(), addr.port()) {
+            Ok(()) => true,
+            Err(denied) => {
+                denial.get_or_insert(denied);
+                false
+            }
+        })
+        .collect();
+    if allowed.is_empty() {
+        match denial {
+            Some(denied) => bail!(
+                "{redacted_source}: the host guard refuses {} ({}); an artifact may not be \
+                 fetched from it unless the worker's hostGuard.allow opens {}:{port}",
+                denied.ip,
+                denied.class.short(),
+                denied.ip
+            ),
+            None => bail!("{redacted_source} resolved to no address"),
+        }
+    }
+    Ok(allowed)
+}
+
+/// The next URL of a redirect `response` to `from`, or `None` when it is not
+/// a redirect. Only `http(s)` destinations, and never from `https` down to
+/// `http`.
+fn redirect_target(
+    from: &reqwest::Url,
+    response: &reqwest::blocking::Response,
+    redacted_source: &str,
+) -> R<Option<reqwest::Url>> {
+    if !response.status().is_redirection() {
+        return Ok(None);
+    }
+    let Some(location) = response
+        .headers()
+        .get(reqwest::header::LOCATION)
+        .and_then(|value| value.to_str().ok())
+    else {
+        return Ok(None);
+    };
+    let next = from
+        .join(location)
+        .with_context(|| format!("{redacted_source} redirected to an invalid location"))?;
+    match (from.scheme(), next.scheme()) {
+        (_, "https") | ("http", "http") => Ok(Some(next)),
+        ("https", "http") => bail!("{redacted_source} redirected from https to plain http"),
+        (_, other) => bail!("{redacted_source} redirected to an unsupported scheme {other}"),
     }
 }
 
@@ -40,34 +134,54 @@ impl ArtifactFetcher for HttpFetcher {
     }
 
     fn fetch(&self, req: &FetchRequest<'_>, sink: &mut ArtifactSink) -> R<FetchedArtifact> {
-        let mut request = self.client()?.get(req.url.clone());
-        match req.credential {
-            None => {}
-            Some(Credential::Basic { username, password }) => {
-                request = request.basic_auth(username, Some(password));
+        let origin = req.url.origin();
+        let mut url = req.url.clone();
+        let mut redirects = 0;
+        let response = loop {
+            let mut request = self
+                .client_for(&url, req.limits.egress.as_deref(), req.redacted_source)?
+                .get(url.clone());
+            // Credentials go to the source's own origin only, never along a
+            // redirect to another host (a header credential included).
+            if url.origin() == origin {
+                request = match req.credential {
+                    None => request,
+                    Some(Credential::Basic { username, password }) => {
+                        request.basic_auth(username, Some(password))
+                    }
+                    Some(Credential::Bearer { token }) => request.bearer_auth(token),
+                    Some(Credential::Headers { headers }) => {
+                        headers.iter().fold(request, |request, (name, value)| {
+                            request.header(name, value)
+                        })
+                    }
+                    Some(Credential::Aws { .. } | Credential::AwsAmbient) => {
+                        bail!(
+                            "aws credentials are not valid for {} (use them with s3:// sources)",
+                            req.redacted_source
+                        );
+                    }
+                };
             }
-            Some(Credential::Bearer { token }) => {
-                request = request.bearer_auth(token);
-            }
-            Some(Credential::Headers { headers }) => {
-                for (name, value) in headers {
-                    request = request.header(name, value);
+            // reqwest errors render the full URL (query included); strip it so
+            // presigned-URL secrets and tokens never reach error strings.
+            let response = request
+                .send()
+                .map_err(reqwest::Error::without_url)
+                .with_context(|| format!("request {}", req.redacted_source))?;
+            match redirect_target(&url, &response, req.redacted_source)? {
+                Some(next) if redirects < MAX_REDIRECTS => {
+                    redirects += 1;
+                    url = next;
                 }
-            }
-            Some(Credential::Aws { .. } | Credential::AwsAmbient) => {
-                bail!(
-                    "aws credentials are not valid for {} (use them with s3:// sources)",
+                Some(_) => bail!(
+                    "{} redirected more than {MAX_REDIRECTS} times",
                     req.redacted_source
-                );
+                ),
+                None => break response,
             }
-        }
-
-        // reqwest errors render the full URL (query included); strip it so
-        // presigned-URL secrets and tokens never reach error strings.
-        let response = request
-            .send()
-            .map_err(reqwest::Error::without_url)
-            .with_context(|| format!("request {}", req.redacted_source))?
+        };
+        let response = response
             .error_for_status()
             .map_err(reqwest::Error::without_url)
             .with_context(|| format!("request {} returned error status", req.redacted_source))?;
@@ -174,6 +288,91 @@ mod tests {
             }
             other => panic!("expected file payload, got {other:?}"),
         }
+        server.join().expect("server");
+        Ok(())
+    }
+
+    /// A credential goes to the source's own origin: a redirect to another
+    /// one (here, another port) is followed without it.
+    #[test]
+    fn credentials_do_not_follow_a_redirect_to_another_origin_test() -> R<()> {
+        let (elsewhere, other) = serve_http(vec![("200 OK".into(), b"moved".to_vec())]);
+        let (base, origin) = serve_http(vec![(
+            format!("302 Found\r\nLocation: {elsewhere}/tool.bin"),
+            Vec::new(),
+        )]);
+        let (fetched, _staging) = fetch(
+            &format!("{base}/tool.bin"),
+            Some(Credential::Headers {
+                headers: [("X-Api-Key".to_string(), "secret-key".to_string())]
+                    .into_iter()
+                    .collect(),
+            }),
+        )?;
+        assert!(matches!(fetched.payload, FetchedPayload::File { .. }));
+        let first = origin.join().expect("origin");
+        let second = other.join().expect("other");
+        assert!(
+            first[0].to_lowercase().contains("x-api-key: secret-key"),
+            "{}",
+            first[0]
+        );
+        assert!(
+            !second[0].to_lowercase().contains("secret-key"),
+            "{}",
+            second[0]
+        );
+        Ok(())
+    }
+
+    /// With the worker's host guard, a source on a guarded address (here
+    /// loopback) is refused before anything is sent, and an allow entry for
+    /// that address and port opens it.
+    #[test]
+    fn the_host_guard_judges_artifact_sources_test() -> R<()> {
+        use crate::structs::host_guard::{HostGuard, HostGuardConfig};
+        let fetch_guarded = |source: &str, guard: HostGuard| -> R<FetchedArtifact> {
+            let staging = tempdir()?;
+            let mut sink = ArtifactSink::new(staging.path().join("sink"), 1024 * 1024)?;
+            let parsed = parse_artifact_source(source)?;
+            let limits = FetchLimits {
+                egress: Some(std::sync::Arc::new(guard)),
+                ..FetchLimits::default()
+            };
+            let redacted = crate::structs::redact_source(source);
+            HttpFetcher::new().fetch(
+                &FetchRequest {
+                    scheme: &parsed.scheme,
+                    url: &parsed.url,
+                    redacted_source: &redacted,
+                    checksum: None,
+                    media_type: None,
+                    credential: None,
+                    limits: &limits,
+                },
+                &mut sink,
+            )
+        };
+        let err = fetch_guarded(
+            "http://127.0.0.1:9/tool.bin",
+            HostGuard::new(&HostGuardConfig::default())?,
+        )
+        .expect_err("loopback is guarded");
+        assert!(format!("{err:#}").contains("host guard refuses"), "{err:#}");
+        let err = fetch_guarded(
+            "http://169.254.169.254/latest/meta-data/",
+            HostGuard::new(&HostGuardConfig::default())?,
+        )
+        .expect_err("the metadata service is guarded");
+        assert!(format!("{err:#}").contains("host guard refuses"), "{err:#}");
+
+        let (base, server) = serve_http(vec![("200 OK".into(), b"ok".to_vec())]);
+        let port = base.rsplit(':').next().unwrap_or_default().to_string();
+        let open = HostGuard::new(&HostGuardConfig {
+            allow: vec![format!("127.0.0.1:{port}")],
+            ..HostGuardConfig::default()
+        })?;
+        fetch_guarded(&format!("{base}/tool.bin"), open)?;
         server.join().expect("server");
         Ok(())
     }

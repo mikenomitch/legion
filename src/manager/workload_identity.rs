@@ -935,6 +935,13 @@ impl WorkloadIdentityState {
                     config.sub_template
                 )
             })?;
+        // An allowed template may use the stateful-only placeholders: whether
+        // a task may is checked against that task at admission.
+        for template in &config.allowed_sub_templates {
+            crate::structs::workload_identity::validate_sub_template(template, true).with_context(
+                || format!("workloadIdentity.allowedSubTemplates entry {template:?} is invalid"),
+            )?;
+        }
 
         // Token `exp` is clamped to the rotation overlap window (P1).
         let overlap = config
@@ -1024,7 +1031,38 @@ impl WorkloadIdentityState {
         identity: &WorkloadIdentity,
         now: SystemTime,
     ) -> R<IssuedToken> {
+        // Admission already refused it; a job admitted before the operator
+        // took a template off the list gets no more tokens under it.
+        self.check_sub_template(identity)?;
         self.read_issuer()?.issue(claims, identity, now)
+    }
+
+    /// Whether an identity's own `subTemplate` (if it sets one) is the
+    /// cluster default or one the operator allows
+    /// (`workloadIdentity.allowedSubTemplates`). A job choosing a free-form
+    /// template could render another workload's subject: with `job:write`
+    /// on `web` alone, `{region}:{group}:{job}:{task}` for group `api`, job
+    /// `web`, task `server` renders `auto:api:web:server`, the subject of job
+    /// `api`'s group `web`, and AWS trusts nothing but `sub`.
+    pub fn check_sub_template(&self, identity: &WorkloadIdentity) -> R<()> {
+        let Some(template) = identity.sub_template.as_deref() else {
+            return Ok(());
+        };
+        if template == self.config.sub_template
+            || self
+                .config
+                .allowed_sub_templates
+                .iter()
+                .any(|allowed| allowed == template)
+        {
+            return Ok(());
+        }
+        bail!(
+            "identity {:?} sets subTemplate {template:?}, which is neither the cluster default \
+             nor in workloadIdentity.allowedSubTemplates; an operator must allow a subject \
+             shape before a job can use it (docs/workload-identity.md)",
+            identity.name
+        )
     }
 
     /// Sign a node-identity token with the active key.
@@ -1834,6 +1872,53 @@ mod tests {
             WorkloadIdentityState::initialize(&store, &config, "http://127.0.0.1:4747", now())
                 .unwrap_err();
         assert!(err.to_string().contains("subTemplate"), "{err}");
+        Ok(())
+    }
+
+    /// A job's identity may name the cluster default or an allowed template,
+    /// and nothing else, both when it is admitted and when a token is minted.
+    #[test]
+    fn identity_sub_templates_must_be_allowed_by_the_operator_test() -> R<()> {
+        let store = claims_test_store()?;
+        let config = WorkloadIdentityConfigFull {
+            enabled: true,
+            issuer: Some("https://manager.example.com:4747".into()),
+            allowed_sub_templates: vec!["{region}:{job}:{group}:{task}:{instance}".into()],
+            ..Default::default()
+        };
+        let state =
+            WorkloadIdentityState::initialize(&store, &config, "http://127.0.0.1:4747", now())?;
+        let with_template = |template: Option<&str>| WorkloadIdentity {
+            sub_template: template.map(str::to_string),
+            ..aws_identity()
+        };
+        state.check_sub_template(&with_template(None))?;
+        state.check_sub_template(&with_template(Some(&config.sub_template)))?;
+        state.check_sub_template(&with_template(Some(
+            "{region}:{job}:{group}:{task}:{instance}",
+        )))?;
+        // Reordered fields: renders another workload's default subject.
+        let reordered = with_template(Some("{region}:{group}:{job}:{task}"));
+        let err = state.check_sub_template(&reordered).unwrap_err();
+        assert!(err.to_string().contains("allowedSubTemplates"), "{err}");
+        let claims = WorkloadIdentityClaims {
+            region: "auto".into(),
+            job: "web".into(),
+            group: "api".into(),
+            task: "server".into(),
+            ..claims()
+        };
+        assert!(state.issue(&claims, &reordered, now()).is_err());
+
+        // An allowed template that is itself invalid fails startup.
+        let bad = WorkloadIdentityConfigFull {
+            allowed_sub_templates: vec!["{job}".into()],
+            ..config
+        };
+        assert!(
+            WorkloadIdentityState::initialize(&store, &bad, "http://127.0.0.1:4747", now())
+                .is_err()
+        );
         Ok(())
     }
 

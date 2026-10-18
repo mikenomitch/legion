@@ -42,6 +42,7 @@ use rcgen::{
     BasicConstraints, CertificateParams, CertificateSigningRequestParams, DistinguishedName,
     DnType, ExtendedKeyUsagePurpose, Ia5String, IsCa, KeyPair, KeyUsagePurpose, SanType,
 };
+use sha2::{Digest, Sha256};
 use std::time::Duration;
 
 /// How long a node, fleet, or manager certificate is valid.
@@ -70,18 +71,56 @@ pub fn fleet_dns_name(fleet: &str) -> String {
     format!("{}.fleet.legion", dns_label(fleet))
 }
 
+/// One DNS label for a node, fleet, or manager name, distinct for distinct
+/// names. A name that already is a plain label (lowercase `[a-z0-9-]`, at
+/// most 63 characters, no leading, trailing, or doubled `-`) is its own
+/// label. Any other name gets a readable head and `--` plus 16 hex digits of
+/// its SHA-256, a form no plain label takes. Folding case and characters
+/// alone (`NODE-1`, `node.1`, and `node_1` all became `node-1`) let a node
+/// registered under a look-alike name hold a certificate that verified as
+/// another node.
 fn dns_label(raw: &str) -> String {
-    let safe: String = raw
+    let plain = !raw.is_empty()
+        && raw.len() <= 63
+        && !raw.starts_with('-')
+        && !raw.ends_with('-')
+        && !raw.contains("--")
+        && raw
+            .chars()
+            .all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == '-');
+    if plain {
+        return raw.to_string();
+    }
+    let folded: String = raw
         .chars()
         .map(|ch| {
-            if ch.is_ascii_alphanumeric() || ch == '-' {
+            if ch.is_ascii_alphanumeric() {
                 ch.to_ascii_lowercase()
             } else {
                 '-'
             }
         })
         .collect();
-    safe.trim_matches('-').to_string()
+    let mut head = String::new();
+    for ch in folded.trim_matches('-').chars() {
+        if head.len() == 45 {
+            break;
+        }
+        // Collapse runs, so the only `--` is the one before the digest.
+        if !(ch == '-' && head.ends_with('-')) {
+            head.push(ch);
+        }
+    }
+    let head = head.trim_end_matches('-');
+    let digest: String = Sha256::digest(raw.as_bytes())[..8]
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    if head.is_empty() {
+        digest
+    } else {
+        format!("{head}--{digest}")
+    }
 }
 
 /// The URI SAN that names a node.
@@ -459,10 +498,30 @@ mod tests {
 
     #[test]
     fn node_names_are_dns_safe() {
-        assert_eq!(node_dns_name("Node_1.local"), "node-1-local.node.legion");
+        let folded = node_dns_name("Node_1.local");
+        assert!(folded.starts_with("node-1-local--"), "{folded}");
+        assert!(folded.ends_with(".node.legion"), "{folded}");
+        assert_eq!(node_dns_name("node-1"), "node-1.node.legion");
         assert_eq!(node_uri("n1"), "legion://node/n1");
         assert_eq!(fleet_dns_name("sim"), "sim.fleet.legion");
         assert_eq!(manager_uri("mgr-a"), "legion://manager/mgr-a");
+    }
+
+    /// Names that fold to the same characters keep distinct certificate
+    /// names, and no name can take the label another name was given.
+    #[test]
+    fn look_alike_node_names_get_distinct_dns_names_test() {
+        let names = ["node-1", "NODE-1", "node.1", "node_1", "node--1", "-node-1"];
+        let labels: std::collections::HashSet<String> =
+            names.iter().map(|name| node_dns_name(name)).collect();
+        assert_eq!(labels.len(), names.len(), "{labels:?}");
+        // A plain name that spells out another name's hashed label is itself
+        // hashed (it contains `--`), so it cannot claim that label.
+        let hashed = dns_label("node.1");
+        assert_ne!(dns_label(&hashed), hashed);
+        let long = "a".repeat(80);
+        assert!(dns_label(&long).len() <= 63);
+        assert!(!dns_label("...").is_empty());
     }
 
     #[test]

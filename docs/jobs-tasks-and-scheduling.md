@@ -27,6 +27,15 @@ Task names:
 - map keys become task names
 - list tasks default to `task-<n>` unless they set `name`
 
+Job, group, and task names may use only `A-Z`, `a-z`, `0-9`, `.`, `_`, and
+`-`, are 1 to 128 characters, and may not start with `.`. A task's name is a
+directory on every worker that runs it (`allocs/<allocation>/<task>/`), so a
+name that is a path, or `.`/`..`, is refused at submit:
+
+```console
+error: Error validating task configs: task name "../web" may only contain [A-Za-z0-9._-] and may not start with "." (the name becomes a directory on every worker that runs it)
+```
+
 ## Task Fields That Affect Placement
 
 Important `TaskConfig` fields:
@@ -428,6 +437,15 @@ When the unhealthy threshold is reached:
 
 1. Restart locally if `on_unhealthy.restart_count/restart_period/restart_delay` allows it.
 2. If restarts are exhausted, record an allocation failure.
+
+Check types are `tcp` and `http` (dialed by the worker on loopback, at the
+task's port) and `exec`. An `exec` check's command runs **on the host**, as
+the worker's user, whatever the task's runtime: it is not run inside a
+container or sandbox. So a task with an `exec` check is
+[host-level](auth-and-acls.md#host-level-jobs), and submitting it needs a
+`job:write` rule with `host = true`. The command gets the same allowlisted
+environment an `exec` task gets ([Exec runtime](task-runtime-exec.md)), not
+the worker's own.
 
 Health checks start when the task starts, including tasks that stage
 artifacts first (every container image when `containerImageDesugar` is on).

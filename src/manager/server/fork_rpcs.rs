@@ -233,8 +233,12 @@ impl ManagerDaemonService {
                 ))),
             })
             .transpose()?;
-        let idempotency_key =
-            scoped_idempotency_key(&identity, "fork_instance", inner.idempotency_key.as_deref());
+        let idempotency_key = scoped_idempotency_key(
+            &identity,
+            "fork_instance",
+            inner.idempotency_key.as_deref(),
+            &inner,
+        );
         if let Some(recorded) = self
             .store
             .idempotency_lookup(&idempotency_key)
@@ -522,6 +526,7 @@ impl ManagerDaemonService {
             &identity,
             "set_snapshot_alias",
             inner.idempotency_key.as_deref(),
+            &inner,
         );
         if let Some(recorded) = self
             .store
@@ -596,6 +601,7 @@ impl ManagerDaemonService {
             &identity,
             "delete_snapshot_alias",
             inner.idempotency_key.as_deref(),
+            &inner,
         );
         if let Some(message) = self
             .store

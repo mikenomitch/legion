@@ -120,6 +120,9 @@ plaintext. Workers speak TLS to the gRPC listener either way: the manager
 answers a TLS handshake for `manager.legion` with its cluster server
 certificate, and, without `server.tls`, still answers plaintext for the CLI
 and UI on the same port ([auth-and-acls.md](auth-and-acls.md#workers-reach-managers-over-tls)).
+Managers speak TLS to each other on that port too, under the name
+`raft.legion` and a key derived from the cluster secret, with or without
+`server.tls` ([auth-and-acls.md](auth-and-acls.md#managers-reach-each-other-over-tls)).
 
 ## Worker Startup and Join Flow
 
@@ -624,10 +627,6 @@ Two code paths exist:
 
 ## What Is Not Implemented Yet
 
-- Manager-to-manager (raft) TLS: raft peers dial each other in plaintext,
-  so keep the managers on a network you trust. With `server.tls` on, the
-  managers' API port drops plaintext connections, which a multi-manager raft
-  cluster still needs.
 - Workers behind NAT that managers can't dial: exec, logs, restart, and the
   mesh need a reachable `workerAddress`. Work still reaches such a worker
   through heartbeat replies.

@@ -1787,9 +1787,10 @@ async fn worker_join_flow_with_acls_enabled() -> R<()> {
         .expect_err("node tokens must not grant API access");
     assert_eq!(status.code(), Code::PermissionDenied);
 
-    // Re-registering rotates the node token; the old one stops working.
-    let re_registered = svc
-        .worker_register(req(
+    // The join secret alone may not take over the live node's name: every
+    // node of the worker type holds that secret.
+    let re_register = |bearer: Option<&str>| {
+        req(
             WorkerRegisterRequest {
                 name: "joined-worker".into(),
                 pool: "default".into(),
@@ -1799,8 +1800,24 @@ async fn worker_join_flow_with_acls_enabled() -> R<()> {
                 join_token: Some(join_token.secret.clone()),
                 ..Default::default()
             },
-            None,
-        ))
+            bearer,
+        )
+    };
+    let takeover = svc
+        .worker_register(re_register(None))
+        .await
+        .expect_err("a join token must not take over a live node");
+    assert_eq!(
+        takeover.code(),
+        Code::PermissionDenied,
+        "{}",
+        takeover.message()
+    );
+
+    // With the node's own token alongside, re-registering rotates it; the
+    // old one stops working.
+    let re_registered = svc
+        .worker_register(re_register(Some(&node_token)))
         .await?
         .into_inner();
     let rotated = re_registered

@@ -33,6 +33,10 @@ pub struct ExecOptions {
     pub cwd: Option<std::path::PathBuf>,
     /// Extra environment for the exec'd process.
     pub env: BTreeMap<String, String>,
+    /// Start from an empty environment instead of the worker's, so `env` is
+    /// all the process gets. The `exec` runtime sets it: its sessions are
+    /// host processes, which must not inherit the worker's credentials.
+    pub clear_env: bool,
     /// A cgroup v2 directory (absolute) the process joins before it runs the
     /// command, so a session into a governed host-process task runs under
     /// that task's memory/CPU limits rather than in the worker's cgroup.
@@ -48,6 +52,7 @@ impl ExecOptions {
             winsize: (80, 24),
             cwd: None,
             env: BTreeMap::new(),
+            clear_env: false,
             cgroup: None,
         }
     }
@@ -92,6 +97,9 @@ pub trait ExecSession: Send {
 }
 
 fn apply_common(builder: &mut CommandBuilder, opts: &ExecOptions) {
+    if opts.clear_env {
+        builder.env_clear();
+    }
     for (k, v) in &opts.env {
         builder.env(k, v);
     }
@@ -168,6 +176,9 @@ pub fn spawn_pipe(opts: &ExecOptions) -> R<Box<dyn ExecSession>> {
 
     let mut cmd = std::process::Command::new(program);
     cmd.args(args);
+    if opts.clear_env {
+        cmd.env_clear();
+    }
     for (k, v) in &opts.env {
         cmd.env(k, v);
     }

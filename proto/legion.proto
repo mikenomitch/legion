@@ -31,6 +31,11 @@ service Manager {
   // their count and jobs with `count.per` tasks. While one pass is pending,
   // further registrations queue nothing. Failing to queue the pass does not
   // fail the registration.
+  //
+  // A join token may introduce a new node or rejoin one that has gone `lost`,
+  // but registering under the name of a node that is still live is
+  // PERMISSION_DENIED unless the request also carries that node's own token
+  // (a restart). See docs/auth-and-acls.md, "Worker nodes".
   rpc WorkerRegister (WorkerRegisterRequest) returns (WorkerRegisterReply);
 
   // Submits or updates a job from a fully rendered jobspec.
@@ -1861,9 +1866,18 @@ service Manager {
   // names a KV credential path. The credential value is returned to the
   // worker and is never persisted on allocations, logged, or traced.
   //
-  // SECURITY: KV ACLs do not exist yet, so any task spec may reference any
-  // KV path via `auth.kv`. When the ACL system lands, this RPC is the
-  // enforcement point for artifact credential reads (see docs/artifacts.md).
+  // A node is served only paths its own work names: an artifact `auth.kv` of
+  // an allocation placed on it, of the task of a live boot ticket for its
+  // pool (edge starts stage before the allocation exists), or its pool's
+  // `contentStore.auth.kv`. Any other path is NOT_FOUND, decided before the
+  // value is read, so a node cannot probe which paths exist. A spec that
+  // names `auth.kv` itself needed `kv:read` on the path to be admitted (see
+  // docs/artifacts.md).
+  //
+  // Errors:
+  // - PermissionDenied: `node_id` does not match the caller's credential.
+  // - NotFound: no work on the node names `kv_path`, or the KV entry is
+  //   missing.
   rpc GetArtifactCredential (GetArtifactCredentialRequest)
     returns (GetArtifactCredentialReply);
 
@@ -1872,7 +1886,9 @@ service Manager {
   // Read-only mode is the default safety behavior and rejects write statements
   // unless explicitly enabled in the request.
   //
-  // Private key material and password hashes always read as NULL, in any
+  // Private key material, password hashes, and recorded idempotency replies
+  // (`idempotency_record.response_message`, which can hold a live boot
+  // ticket) always read as NULL, in any
   // statement and however the query reaches them: `signing_key.private_key_pem`,
   // `net_mesh_ca.key_pem`, and `acl_user.password_hash`. Predicates on those
   // columns match nothing, and `INSERT ... SELECT` copies NULL.
@@ -1952,6 +1968,11 @@ service Manager {
   // on the manager (`method` = the configured method name, `jwt` = the
   // externally issued token). The reply contains the token secret exactly
   // once; the manager stores only a hash of it.
+  //
+  // A token minted through the `legion` method (a workload's identity token)
+  // expires no later than that identity token does, whatever `ttl` asks for:
+  // a fork or snapshot retires the identity token, and a login token copied
+  // with it must not outlive it.
   rpc Login (LoginRequest) returns (LoginReply);
 
   // Creates or replaces a named ACL policy. Requires `acl:write`.
@@ -2442,9 +2463,11 @@ message RunJobRequest {
   // Keys are scoped to the RPC and to the caller (the ACL token's accessor
   // ID, or the principal for JWT and anonymous callers): the same key on a
   // different RPC, or from a different caller, is a new request and never
-  // replays another caller's reply. The key does not cover the request body.
-  // Records are kept for 24 hours, then pruned; a retry after that is applied
-  // again. Every other RPC's `idempotency_key` follows these rules.
+  // replays another caller's reply. The key also covers the request: the same
+  // key with different arguments fails with INVALID_ARGUMENT instead of
+  // replaying the first reply. Records are kept for 24 hours, then pruned; a
+  // retry after that is applied again. Every other RPC's `idempotency_key`
+  // follows these rules.
   optional string idempotency_key = 5;
 }
 
@@ -11493,7 +11516,9 @@ message IssueBootTicketRequest {
   // Exact job config id the ticket authorizes. Optional: when empty the
   // manager pins the job's current config at mint time and returns it in the
   // reply. A ticket NEVER means "latest" — pinning at mint is what keeps a
-  // redeploy from silently widening what a live ticket can start.
+  // redeploy from silently widening what a live ticket can start. When set,
+  // it must be a config of `job` (the job `boot:write` was checked against);
+  // another job's config is NOT_FOUND.
   string job_config_id = 3;
 
   // Exactly one of these bounds which instance may be started:
@@ -11633,11 +11658,11 @@ message RatifyClaimRequest {
   // Gate level the work is currently held at, for the audit trail.
   GateLevel gate = 6;
 
-  // Boot ticket that authorized the start, for edge-originated claims. The
-  // manager re-verifies it (nodes are honest but not trusted to be the only
-  // holder) and spends its `jti` when the ticket is single-use. Empty for
-  // manager-originated claims, which were authorized by the submit that
-  // produced them.
+  // Boot ticket that authorized the start. Required: a claim without one is
+  // refused `TICKET_INVALID`. The manager re-verifies it (nodes are honest
+  // but not trusted to be the only holder), refuses it unless it names this
+  // claim's `job_config_id` and `task_name` with a gate at least `gate`, and
+  // spends its `jti` when the ticket is single-use.
   string ticket = 7;
 }
 

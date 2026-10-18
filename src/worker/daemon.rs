@@ -479,6 +479,8 @@ async fn run_worker_with_manager(join: WorkerJoin, name_override: Option<&str>) 
         }
     }
     apply_container_env(&config.container);
+    // One host guard for the datapath and artifact fetches alike.
+    let host_guard = Arc::new(host_guard_for(&config.security));
     let sandbox_bridges = apply_sandbox_bridges_env(enforcement_config.sandbox.as_ref());
     crate::task_plugins::warn_if_no_static_guest_binary();
     let restored_allocations = {
@@ -503,6 +505,7 @@ async fn run_worker_with_manager(join: WorkerJoin, name_override: Option<&str>) 
                 credentials.clone(),
             )),
             content_store_target.clone(),
+            Some(host_guard.clone()),
         );
         manager.restore_allocations().unwrap_or_else(|err| {
             warn!(error = ?err, "Failed to restore persisted allocations");
@@ -767,7 +770,7 @@ async fn run_worker_with_manager(join: WorkerJoin, name_override: Option<&str>) 
             Arc::new(crate::worker::netd::Denials::new()),
         )
         .with_logs_base_dir(logs_base_dir.clone())
-        .with_host_guard(Arc::new(host_guard_for(&config.security)))
+        .with_host_guard(host_guard.clone())
         .with_kernel_guard_if(
             (kernel_guard == crate::worker::netd::kernel_guard::Availability::Active).then(|| {
                 kernel_guard_base(
@@ -2966,10 +2969,7 @@ async fn apply_templates(task_manager: &Arc<Mutex<WorkerTaskManager>>, reply: &H
             (running, (base, task_dir))
         };
         let (delivery, task_dir) = base;
-        let (in_task_root, host_task_dir) = match delivery {
-            Some((root, dir)) => (Some(root), dir),
-            None => (None, task_dir),
-        };
+        let (in_task_root, host_task_dir) = delivery.unwrap_or((None, task_dir));
         let mut env: std::collections::BTreeMap<String, String> = network
             .as_ref()
             .map(|n| n.env_pairs().into_iter().collect())
@@ -3955,7 +3955,7 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
         let addr = format!("http://127.0.0.1:{}", listener.local_addr()?.port());
         let service = crate::structs::manager_server::ManagerServer::new(
-            crate::manager::server::ManagerDaemonService::with_acl(store, auth),
+            crate::manager::server::ManagerDaemonService::with_acl(store.clone(), auth),
         );
         tokio::spawn(async move {
             let incoming = tokio_stream::wrappers::TcpListenerStream::new(listener);
@@ -4004,13 +4004,24 @@ mod tests {
         register_self(client.clone(), &payload, &restarted).await?;
         assert_eq!(state.load_node_token().as_deref(), Some(token.as_str()));
 
-        // A refused node token falls back to a valid join token, which
-        // mints and persists a replacement.
+        // A refused node token falls back to the join token, which may not
+        // take over the node while it is live (the node token is what proves
+        // a restart)...
         state.save_node_token("lgn_not_a_real_token")?;
         let fallback = Arc::new(WorkerCredentials::with_join_secret(Some(join_secret)));
         assert!(fallback.restore_from(&state));
         fallback.persist_to(state.clone());
         pre_register_self(client.clone(), "default".into(), &fallback).await?;
+        let err = register_self(client.clone(), &payload, &fallback)
+            .await
+            .expect_err("a join token may not take over a live node");
+        assert!(
+            format!("{err:#}").contains("registered and live"),
+            "{err:#}"
+        );
+        // ...and rejoins it, minting and persisting a replacement, once the
+        // node has gone lost.
+        store.mark_node_lost("w1")?;
         register_self(client.clone(), &payload, &fallback).await?;
         let replaced = state.load_node_token().context("replacement persisted")?;
         assert_ne!(replaced, "lgn_not_a_real_token");

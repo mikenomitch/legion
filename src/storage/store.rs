@@ -1895,16 +1895,19 @@ const EVENT_ID_SEQ_BITS: u32 = 18;
 
 // NOTE: This will become a general interface for all storage backends
 
-/// Columns `QueryStateStore` reads as NULL: private key material and password
-/// hashes. Raw SQL is a `state:read` capability, and a holder of these could
-/// forge workload-identity JWTs and boot tickets (`signing_key`), mint mesh
-/// certificates (`net_mesh_ca`), or crack user passwords offline (`acl_user`).
-/// The manager reads these through its own code paths, never through
-/// `query_state_store`.
+/// Columns `QueryStateStore` reads as NULL: private key material, password
+/// hashes, and recorded replies. Raw SQL is a `state:read` capability, and a
+/// holder of these could forge workload-identity JWTs and boot tickets
+/// (`signing_key`), mint mesh certificates (`net_mesh_ca`), crack user
+/// passwords offline (`acl_user`), or redeem a live boot ticket, which a
+/// keyed `IssueBootTicket` records whole so a retry gets the same ticket back
+/// (`idempotency_record`). The manager reads these through its own code
+/// paths, never through `query_state_store`.
 pub const STATE_QUERY_REDACTED_COLUMNS: &[(&str, &str)] = &[
     ("signing_key", "private_key_pem"),
     ("net_mesh_ca", "key_pem"),
     ("acl_user", "password_hash"),
+    ("idempotency_record", "response_message"),
 ];
 
 /// Installs a SQLite authorizer that reads every redacted column as NULL for
@@ -2294,6 +2297,18 @@ impl Store {
             .as_any()
             .downcast_ref::<crate::storage::raft::driver::MultiRaftDriver>()
             .and_then(|driver| driver.peer_channel(host_port))
+    }
+
+    /// The TLS identity this manager's raft transport speaks to its peers
+    /// with ([`crate::cluster_tls::RaftTransportTls`]). `None` outside raft
+    /// mode or before the engine starts. The manager's listener presents it
+    /// to a client asking for `raft.legion`; a process that serves the raft
+    /// transport on its own listener uses [`crate::cluster_tls::RaftTransportTls::incoming`].
+    pub fn raft_transport_tls(&self) -> Option<Arc<crate::cluster_tls::RaftTransportTls>> {
+        self.persistence_driver
+            .as_any()
+            .downcast_ref::<crate::storage::raft::driver::MultiRaftDriver>()
+            .and_then(|driver| driver.transport_tls())
     }
 
     /// Whether this manager leads every raft lane (always true outside raft
@@ -19660,7 +19675,8 @@ impl Store {
     /// Returns `Some(response_message)` when a request with this key was already
     /// applied, allowing the caller to replay the prior outcome instead of
     /// re-applying. An empty key disables deduplication and always returns
-    /// `None`.
+    /// `None`. A key whose record was made for a different request (the
+    /// fingerprint after its last `#` differs) is an `InvalidInput` error.
     pub fn idempotency_lookup(&self, key: &str) -> R<Option<String>> {
         let key = key.trim();
         if key.is_empty() {
@@ -19674,7 +19690,39 @@ impl Store {
                 |row| row.get::<_, String>(0),
             )
             .optional()?;
-        Ok(result)
+        if result.is_some() {
+            return Ok(result);
+        }
+        // A key carrying a request fingerprint after its last `#`: the same
+        // key recorded with another fingerprint was first used for a
+        // different request, and replaying (or re-running) either one would
+        // misreport what happened.
+        if let Some((base, fingerprint)) = key.rsplit_once('#') {
+            // `$` sorts right after `#`, so the range is "starts with
+            // `base#`" with no wildcard characters to escape, and the byte
+            // length pins the rest to one fingerprint (a key of its own may
+            // contain `#`: `a` must not match a recorded `a#b`).
+            let reused = conn
+                .query_row(
+                    "SELECT 1 FROM idempotency_record \
+                     WHERE key > ?1 AND key < ?2 AND length(CAST(key AS BLOB)) = ?3 LIMIT 1;",
+                    rusqlite::params![format!("{base}#"), format!("{base}$"), key.len() as i64],
+                    |_| Ok(()),
+                )
+                .optional()?
+                .is_some()
+                && !fingerprint.is_empty();
+            if reused {
+                return Err(StorageError::InvalidInput {
+                    message: "this idempotency key was first used with different request \
+                              arguments; a key names one request, so use a new key for a \
+                              different one"
+                        .into(),
+                }
+                .into());
+            }
+        }
+        Ok(None)
     }
 
     /// Record the response for an idempotency `key`.
@@ -21394,6 +21442,21 @@ mod tests {
             store.idempotency_lookup("k1")?.as_deref(),
             Some("Job submit success")
         );
+
+        // A fingerprinted key replays only the request it was recorded for.
+        assert!(store.idempotency_record("run_job/3:acc/k#00aa", "run_job", "first")?);
+        assert_eq!(
+            store.idempotency_lookup("run_job/3:acc/k#00aa")?.as_deref(),
+            Some("first")
+        );
+        let err = store
+            .idempotency_lookup("run_job/3:acc/k#00bb")
+            .expect_err("same key, different request");
+        assert!(err.to_string().contains("different request"), "{err:#}");
+        // A key that merely starts like a recorded one (a key may contain
+        // `#`) is a different key, not a reuse.
+        assert!(store.idempotency_record("run_job/3:acc/a#b#00aa", "run_job", "ab")?);
+        assert_eq!(store.idempotency_lookup("run_job/3:acc/a#00cc")?, None);
 
         // Empty key disables deduplication entirely.
         assert_eq!(store.idempotency_lookup("")?, None);

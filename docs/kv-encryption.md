@@ -43,8 +43,6 @@ API, where [`kv` path policies](auth-and-acls.md) apply. Without encryption,
   streamed WAL segments from before the upgrade stay plaintext until log
   compaction (a snapshot) and bucket retention remove them. A rewrap
   rewrites rows, not history.
-- **The `GetArtifactCredential` path** still has no KV path ACL of its own
-  (see [Artifacts](artifacts.md)). Encryption does not change this.
 - **FIPS.** AES-256-GCM is a FIPS-approved algorithm, but the implementation
   (`ring`) is not a validated module.
 

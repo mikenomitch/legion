@@ -25,6 +25,13 @@ pub struct FetchLimits {
     pub max_bytes: u64,
     /// Absolute deadline for the whole fetch attempt.
     pub deadline: Option<Instant>,
+    /// The worker's host guard, judging every address an `http(s)` fetch
+    /// connects to, redirects included: the job chooses the source, and the
+    /// response lands in its task directory, so loopback, link-local, cloud
+    /// metadata, and this node's own addresses are refused unless a
+    /// `hostGuard.allow` entry opens them. `None` (the manager, tests) leaves
+    /// fetches unjudged.
+    pub egress: Option<std::sync::Arc<crate::structs::host_guard::HostGuard>>,
 }
 
 impl Default for FetchLimits {
@@ -33,6 +40,7 @@ impl Default for FetchLimits {
             max_bytes: crate::structs::WorkerArtifactFetchConfigFull::default()
                 .max_artifact_size_bytes,
             deadline: None,
+            egress: None,
         }
     }
 }
