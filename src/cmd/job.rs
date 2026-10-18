@@ -721,6 +721,32 @@ pub(crate) fn build_jobspec_schema() -> Value {
                             }
                         }
                     },
+                    "gang": {
+                        "description": "All-or-nothing placement for this task's replicas. `true`: every replica places in one plan or none does, and a gang that does not fit places nothing (nor do the job's other tasks in that pass), holds no capacity, and waits blocked until a node that could help has room. `{ min: N }` places once N replicas fit together and adds the rest as room appears; `placementTimeout` bounds the wait and `onMemberLoss` says what a lost member does to the rest. Not combinable with count.per or keyed stateful tasks; the task must have its group to itself, and that group's rollout must replace it in one step. See docs/gang-scheduling.md.",
+                        "oneOf": [
+                            { "type": "boolean" },
+                            {
+                                "type": "object",
+                                "additionalProperties": false,
+                                "properties": {
+                                    "min": {
+                                        "type": "integer",
+                                        "minimum": 1,
+                                        "description": "Quorum: replicas that must place together, 1..=count. Default: the whole count."
+                                    },
+                                    "placementTimeout": {
+                                        "type": ["string", "integer"],
+                                        "description": "How long the gang may wait for its quorum before its job fails (any members already running stop), as a duration (`\"30m\"`) or seconds. Counted from the first time the gang came up short. At least 1s. Default: unset, wait indefinitely."
+                                    },
+                                    "onMemberLoss": {
+                                        "type": "string",
+                                        "enum": ["restart", "replace", "fail"],
+                                        "description": "What a lost member does to the rest when it leaves fewer than the quorum running. `restart` (default): stop the survivors and place the whole gang again once their stop grace has passed. `replace`: keep the survivors and place the missing members together once they fit. `fail`: fail the job and stop every member. A loss that leaves the quorum running is replaced alone. Restarts after a failure spend on_unhealthy's move budget; once it is spent the job fails."
+                                    }
+                                }
+                            }
+                        ]
+                    },
                     "speculativeStart": {
                         "type": "object",
                         "description": "How far a node may get on a start for this task BEFORE the placement is durable. Absent = off, today's behavior. A task declaring network ports, connect upstreams, or storage whose driver cannot fence a concurrent attach is downgraded to `stage` (reported by `job validate`). See docs/edge-boot.md.",
@@ -2036,6 +2062,52 @@ async fn plan_job(arg_matches: &ArgMatches) -> R<()> {
                 println!("  {line}");
             }
         }
+        // Whether each gang reaches its quorum (docs/gang-scheduling.md). A
+        // gang that does not makes the whole plan place nothing: the submit
+        // would wait, blocked, until it fits.
+        if !reply.gang_reports.is_empty() {
+            println!("Gang:");
+            for report in &reply.gang_reports {
+                let together = report.min.saturating_sub(report.running);
+                let quorum = if report.min == report.desired {
+                    format!("all {} together", report.desired)
+                } else {
+                    format!("at least {} of {} together", report.min, report.desired)
+                };
+                let running = if report.running > 0 {
+                    format!("{} running, ", report.running)
+                } else {
+                    String::new()
+                };
+                let nodes = format!(
+                    "{} of {} nodes accept it",
+                    report.eligible_nodes, report.nodes
+                );
+                if report.would_place {
+                    println!(
+                        "  {}: places ({running}{} fit, needs {quorum}; {nodes})",
+                        report.task, report.placeable
+                    );
+                } else {
+                    println!(
+                        "  {}: would NOT place — {running}{} of the {together} it needs fit \
+                         ({quorum}; {nodes}); the job would wait, holding nothing",
+                        report.task, report.placeable
+                    );
+                }
+                if !report.reason.is_empty() && !report.would_place {
+                    println!("    {}", report.reason);
+                }
+                if report.placement_timeout_seconds > 0 && !report.would_place {
+                    println!(
+                        "    The job fails if the gang is still short after its placementTimeout ({})",
+                        humantime::format_duration(std::time::Duration::from_secs(
+                            report.placement_timeout_seconds
+                        ))
+                    );
+                }
+            }
+        }
         // Who this submit would displace. Printed last and unmissably,
         // because it is the one thing in a plan that costs somebody else
         // something (S3 in the preemption plan: the submit becomes a
@@ -2506,19 +2578,46 @@ async fn get_info(arg_matches: &ArgMatches) -> R<()> {
                 .map(|(resource, amount)| format!("{resource} {amount}"))
                 .collect();
             shortfall.sort();
-            println!(
-                "Blocked on {} since {}: task {} needs {} per placement",
-                blocked.key,
-                chrono::DateTime::from_timestamp(blocked.since, 0)
-                    .map(|at| at.to_rfc3339_opts(chrono::SecondsFormat::Secs, true))
-                    .unwrap_or_else(|| blocked.since.to_string()),
-                blocked.task,
-                if shortfall.is_empty() {
-                    "room".to_string()
-                } else {
-                    shortfall.join(", ")
+            let per_placement = if shortfall.is_empty() {
+                "room".to_string()
+            } else {
+                shortfall.join(", ")
+            };
+            let since = chrono::DateTime::from_timestamp(blocked.since, 0)
+                .map(|at| at.to_rfc3339_opts(chrono::SecondsFormat::Secs, true))
+                .unwrap_or_else(|| blocked.since.to_string());
+            match blocked.gang.as_ref() {
+                // A gang waits for its whole quorum, not for one placement
+                // (docs/gang-scheduling.md).
+                Some(gang) => {
+                    println!(
+                        "Blocked on {} since {}: gang {} is short {} replica(s) of {} each \
+                         ({} running, {} more fit, needs {} together)",
+                        blocked.key,
+                        since,
+                        blocked.task,
+                        gang.min
+                            .saturating_sub(gang.running)
+                            .saturating_sub(gang.placeable),
+                        per_placement,
+                        gang.running,
+                        gang.placeable,
+                        gang.min
+                    );
+                    if let Some(deadline) = chrono::DateTime::from_timestamp(gang.deadline, 0)
+                        .filter(|_| gang.deadline > 0)
+                    {
+                        println!(
+                            "  Fails at {} if still short (placementTimeout)",
+                            deadline.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+                        );
+                    }
                 }
-            );
+                None => println!(
+                    "Blocked on {} since {}: task {} needs {} per placement",
+                    blocked.key, since, blocked.task, per_placement
+                ),
+            }
             println!("  {}", blocked.message);
         }
     }

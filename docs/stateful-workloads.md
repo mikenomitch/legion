@@ -272,6 +272,7 @@ dispatch time, so they are present at process start for `exec` and
 | `LEGION_INSTANCE_SLOT` | slot mode only | Ordinal slot index `0..count-1`. |
 | `LEGION_STORAGE_DIR` | tasks with `stateful.storage` | The instance volume's path. See [volumes.md](volumes.md#how-path-works-per-task-runtime) for why exec and container tasks get different values. |
 | `LEGION_VOLUME_<NAME>` | per declared volume | Same, for every volume including `volumes[]` claims. |
+| `LEGION_GANG_RANK`, `LEGION_GANG_SIZE`, `LEGION_GANG_MIN`, `LEGION_GANG_LEADER_ADDR` | [gang](gang-scheduling.md#starting-together) tasks only | The member's rank `0..size-1`, the gang's count, its quorum, and the address of the node running rank 0. Fixed when the member is placed. |
 | `LEGION_CLAIM_ID` | provisional starts only | The claim a workload was started under, before its placement was durable ([edge-boot.md](edge-boot.md)). Such a task has **no** `LEGION_ALLOC_ID` yet, and Legion doesn't set a placeholder. `LEGION_INSTANCE_ID` is correct from the start. |
 
 Key your app's durable state and "who am I" decisions on

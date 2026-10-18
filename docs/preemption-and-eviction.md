@@ -208,6 +208,13 @@ example, a `high` job that wants 2 replicas on a node full of a 2-allocation
 replica, and leaves the other unplaced with `preemption found no eligible
 victims (1 protected by disruption.minAvailable)`.
 
+A [gang](gang-scheduling.md)'s quorum is a floor of the same kind: preemption
+never leaves fewer than `gang.min` members running (all of them for `gang =
+true`), because taking one member idles the rest. The stricter of the two
+floors binds, and the placement error names `disruption.minAvailable` either
+way. A gang that preempts does so as a unit: if every replica cannot fit with
+the victims it may take, the plan evicts nothing.
+
 **What this does not protect you from:** an operator draining half the
 cluster can take your service below `minAvailable`. A Kubernetes
 PodDisruptionBudget would block that. Legion accepts this gap so the floor can

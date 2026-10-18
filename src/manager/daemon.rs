@@ -3502,6 +3502,32 @@ pub fn resolve_claimed_eval(store: &Store, worker_id: usize, eval: &Eval) -> Eva
                     )),
                 };
             }
+            // A gang still short of its quorum past its `placementTimeout`
+            // fails its job instead of waiting again
+            // (docs/gang-scheduling.md, "Placement timeout").
+            if let Some(report) = blocked.detail.get("gang") {
+                match store.time_out_gang(eval, report) {
+                    Ok(Some(message)) => {
+                        clear_not_leader_attempts(&eval.id);
+                        return EvalCompletion::Finished {
+                            succeeded: false,
+                            event: drafts::eval_failed(
+                                eval,
+                                &anyhow::anyhow!(message),
+                                started.elapsed(),
+                            ),
+                        };
+                    }
+                    Ok(None) => {}
+                    // The job stays blocked and the next attempt re-checks;
+                    // a timeout that cannot be applied must not be lost.
+                    Err(err) => warn!(
+                        eval_id = %eval.id,
+                        error = %format!("{err:#}"),
+                        "Failed to apply a gang placement timeout; blocking again"
+                    ),
+                }
+            }
             warn!(
                 worker_id,
                 eval_id = %eval.id,
@@ -3563,6 +3589,15 @@ fn spawn_blocked_eval_waker(store: &Store) {
                 // The events stay unhandled, so the next pass retries them.
                 Ok(Err(err)) => warn!(error = ?err, "Blocked-eval wake pass failed"),
                 Err(err) => warn!(error = ?err, "Blocked-eval wake pass panicked"),
+            }
+            // Gangs past their `placementTimeout` get one more plan, which
+            // fails the job if they are still short. At most a second late:
+            // this loop runs at least every BLOCKED_WAKE_FALLBACK.
+            let timer_store = store.clone();
+            match tokio::task::spawn_blocking(move || timer_store.wake_timed_out_gangs()).await {
+                Ok(Ok(_)) => {}
+                Ok(Err(err)) => warn!(error = ?err, "Gang placement timeout pass failed"),
+                Err(err) => warn!(error = ?err, "Gang placement timeout pass panicked"),
             }
         }
     });

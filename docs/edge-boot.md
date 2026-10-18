@@ -149,9 +149,9 @@ need to flush before they exit.
 
 ### Automatic downgrades
 
-Two things force a task down to `stage` whatever it declares, because
+Three things force a task down to `stage` whatever it declares, because
 starting earlier would need something the apply transaction has not produced
-yet. `legion job validate` reports both before you deploy:
+yet. `legion job validate` reports them before you deploy:
 
 ```console
 $ legion job validate api.ncl
@@ -173,6 +173,9 @@ envelope.
   (`local-dir`, `host`, `tmpfs`) are exempt. The only possible competitor is
   on the same node, where the worker's claim table already allows one live
   claim per instance.
+- **Gangs.** A [gang](gang-scheduling.md) member's rank (`LEGION_GANG_RANK`)
+  is assigned with its allocation row, inside the apply. A `stage`-gated
+  member picks it up from the committed payload before it starts.
 
 ## What is never speculative
 

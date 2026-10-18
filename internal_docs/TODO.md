@@ -576,7 +576,7 @@ How to use it:
 
 | PR | What it lands | Notes |
 | --- | --- | --- |
-| [#50](https://github.com/mikenomitch/legion/pull/50) | Close the known security gaps and the ones a review found: `kv:read` for every KV key a job names, path-safe object names and no-follow writes on the worker, host-level `exec` checks and `file://` sources, guarded HTTP artifact redirects, identity and boot-ticket binding, raft peers over TLS, allowlisted `exec` environments, fingerprinted idempotency keys | [plan](plans/security-gap-closure-plan.md) · [calls](calls/security-gap-closure-plan_calls.md); breaking, see the PR; deferrals are open under "Auth, TLS & security" |
+| [#48](https://github.com/mikenomitch/legion/pull/48) | Gang scheduling: all-or-nothing placement for a task's replicas, `placementTimeout`, `onMemberLoss` (restart / replace / fail), and each member's `LEGION_GANG_RANK` / `SIZE` / `MIN` / `LEADER_ADDR` | [plan](plans/gang-scheduling-plan.md) · [calls](calls/gang-scheduling-plan_calls.md) · [docs](../docs/gang-scheduling.md); what is left is under "Gang scheduling, what is left" |
 | [#162](https://github.com/mikenomitch/legion/pull/162) | Lanes hardening: worker-write forwarding, split-tolerant submits, adversarial fixes | Plan §8 + calls doc in [durability-and-ops-execution-plan.md](plans/durability-and-ops-execution-plan.md) |
 | [#143](https://github.com/mikenomitch/legion/pull/143) | Note the node-level builtin resource override gap | Docs only; the fix itself is a todo below |
 | [#84](https://github.com/mikenomitch/legion/pull/84) | Instrument DB hot paths, batch task-status updates | Old; rebase or close |
@@ -1375,14 +1375,48 @@ How to use it:
   - [ ] Revisit fair share only with real multi-tenant demand. Bands +
         per-namespace band caps (the `bands` ACL selector) are the 80/20;
         hierarchical queues stay a non-goal.
-- [ ] Gang scheduling — `gang` on a task makes its replicas place
-      all-or-nothing, with capacity failures becoming blocked-and-retried
-      evals (woken on `node_join`) instead of terminal eval failures —
-      [plan](plans/gang-scheduling-plan.md) (PLANNED: gang contract + blocked
-      evals → `min` quorum + `placementTimeout` → whole-gang recovery →
-      blue-green updates; reservation/backfill anti-starvation and
-      gang-grained preemption deliberately deferred, the latter coordinated
-      with the preemption plan)
+- [ ] **Gang scheduling, what is left.** Phase 1 (the contract, `min`,
+      the quorum preemption floor, `job plan` gang reports) and Revision 2
+      (`placementTimeout`, `onMemberLoss`) are in Done below;
+      [plan](plans/gang-scheduling-plan.md) (IN EXECUTION) ·
+      [calls](calls/gang-scheduling-plan_calls.md) ·
+      [docs](../docs/gang-scheduling.md). Open:
+  - [ ] **Gang variables after a scale or a re-placed leader.** A running
+        member keeps the `LEGION_GANG_SIZE` and `LEGION_GANG_LEADER_ADDR` it
+        was placed with (a changed payload would restart it), so after `job
+        scale`, or a `replace` that moved rank 0, members disagree until the
+        gang restarts. Options: restart a gang on scale, or deliver the new
+        values as a file the workload re-reads
+        ([calls](calls/gang-scheduling-plan_calls.md) 9).
+  - [ ] **Readiness timeout** (Kueue's `waitForPodsReady`). A member that
+        is placed but hangs before it runs (an image pull that never ends)
+        holds the others at their rendezvous until its start fails.
+        `placementTimeout` covers placement only.
+  - [ ] **In-place gang restart** (JobSet `InPlaceRestart`): restart every
+        member's process on its current node instead of a full re-placement.
+  - [ ] **Local restarts as gang losses.** A worker restarting a crashed
+        member in place under `restart` is invisible to the manager, so the
+        gang keeps running beside it. Today the doc says to set `restart = {
+        policy = "never" }`; a worker report would let `onMemberLoss` apply
+        ([calls](calls/gang-scheduling-plan_calls.md) 5).
+  - [ ] Phase 4: an integration test that makes the `createFirst` blue-green
+        gang update a supported path, and the autoscaler consuming a blocked
+        gang's shortfall as scale-up demand.
+  - [ ] **Gang-aware wake.** A blocked gang wakes on any capacity on its
+        class (one freed replica's worth for a gang of eight) and re-plans in
+        full every time. Wake only when the class's free capacity could fit
+        `min - running - placeable` replicas, once a measurement shows the
+        wasted re-plans matter ([calls](calls/gang-scheduling-plan_calls.md) 2).
+  - [ ] **Whole-gang preemption victims.** Preemption never takes a gang
+        below its quorum, so a `gang = true` job in a preemptible band is not
+        preemptible at all. Whole-gang victim selection (take every member,
+        cost it as one victim) belongs to the preemption plan
+        ([calls](calls/gang-scheduling-plan_calls.md) 7).
+  - [ ] **Reservation / backfill for starving gangs.** A waiting gang holds
+        nothing, so small jobs can keep taking freed capacity before a large
+        gang sees enough at once. Watch `legion_gang_blocked_jobs` first;
+        the fix is a plan of its own (reserve freed capacity for the oldest
+        waiting gang, backfill around it).
 - [ ] Schedule onto the same node as an *existing job*. Soft `same_node_as`
       colocation works within one job spec
       ([scheduler/policy.rs](../src/manager/scheduler/policy.rs)); cross-job
@@ -5010,6 +5044,51 @@ Deferred from [operator-ui-gaps-plan.md](plans/operator-ui-gaps-plan.md):
 
 docs: [scheduler-and-eval-loop.md](../docs/scheduler-and-eval-loop.md), [jobs-tasks-and-scheduling.md](../docs/jobs-tasks-and-scheduling.md)
 
+- [x] **Gang scheduling, Phase 1** (2026-10-17, in flight in
+      [#48](https://github.com/mikenomitch/legion/pull/48),
+      [plan](plans/gang-scheduling-plan.md) as revised ·
+      [calls](calls/gang-scheduling-plan_calls.md) ·
+      [docs](../docs/gang-scheduling.md)). Open follow-ups are under
+      Scheduling & placement above.
+  - [x] `gang = true | { min = N }` on a task, with submit validation
+        (`count.per`, keyed/session stateful, a shared group, `min` bounds,
+        multi-step rollouts, sequential slots) and a `task_config.gang`
+        column.
+  - [x] A gang short of its quorum makes its whole plan place nothing and
+        blocks on the shipped blocked-eval queue; above the quorum the rest
+        trickles in. Top-ups are all or nothing, and a backoff hold on one
+        member holds the whole top-up. Gang tasks never use truncated index
+        candidates.
+  - [x] Preemption never takes a gang below its quorum.
+  - [x] The rollout engine replaces a gang group in one step.
+  - [x] `PlanJobReply.gang_reports` (a deferred gang is a successful dry
+        run), `JobBlocked.gang`, `job plan` / `job info` / UI / MCP
+        rendering, `legion_gang_blocked_jobs`.
+- [x] **Gang scheduling, Revision 2: placement timeout, member loss, and
+      member identity** (2026-10-17, in flight in
+      [#48](https://github.com/mikenomitch/legion/pull/48),
+      [plan](plans/gang-scheduling-plan.md#revision-2-placement-timeout-and-member-loss-2026-10-17) ·
+      [calls](calls/gang-scheduling-plan_calls.md) 4, 5, 8, 9, 11, 18, 19, 22 ·
+      [docs](../docs/gang-scheduling.md#placement-timeout)).
+  - [x] `gang.placementTimeout`: a scheduler-lane `gang_wait` clock from
+        the gang's first block, a leader timer that wakes the blocked eval
+        past its deadline, and a job failed (survivors stopped with the new
+        `gang` stop cause) when the quorum still does not fit. A failed gang
+        job places nothing until `job run`. `job.gang_timeout`;
+        `GangReport.placement_timeout_seconds` / `waiting_since` /
+        `deadline`.
+  - [x] `gang.onMemberLoss = restart (default) | replace | fail`, applied
+        when a failure, node loss, drain, or memory-pressure eviction leaves
+        fewer than `min` running. Restarts wait out the survivors' stop
+        grace (and a failed member's backoff); failure-driven ones spend the
+        move budget, and an exhausted budget fails the job. One forwarded
+        scheduler-lane op (`gang_member_lost`); `job.gang_member_lost`;
+        `legion_gang_outcomes_total`.
+  - [x] `LEGION_GANG_RANK` / `LEGION_GANG_SIZE` / `LEGION_GANG_MIN` /
+        `LEGION_GANG_LEADER_ADDR` in every member's env: lowest-free ranks
+        (a `replace` replacement inherits the lost rank), all four fixed at
+        placement in a scheduler-lane `gang_member` table and attached on
+        every dispatch path. A gang's `speculativeStart` is capped at `stage`.
 - [x] **Elastic session envelopes, Phase 1.** `stateful.envelope.max` and
       `shrinkAfter`: each node grows its session envelope toward the
       ceiling as its sessions fill it and shrinks it after they drain, one

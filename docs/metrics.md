@@ -154,11 +154,25 @@ neighbor rules a cause in or out, and which knob to turn), see
   scheduler-lane leader's wake pass, so it reads 0 on other managers and is
   refreshed when a capacity event arrives. A rising `class` count is a
   capacity signal for that class; `escaped` means no node was schedulable.
+- **`legion_gang_blocked_jobs`** (gauge): jobs whose blocked eval is a
+  [gang](gang-scheduling.md) short of its quorum. A waiting gang holds
+  nothing, so smaller jobs can keep taking the capacity it waits for; a value
+  that stays up while the cluster churns is that starvation. Set by the
+  scheduler-lane leader's wake pass, like `legion_evals_blocked`.
+- **`legion_gang_outcomes_total{outcome}`** (counter): what happened to
+  gangs that lost a member or waited too long: `replace` (the member was
+  replaced alone, or the survivors kept running for a `replace` top-up),
+  `restart` (the survivors stopped so the whole gang re-places), `fail` (the
+  job failed: `onMemberLoss = "fail"` or the move budget ran out), and
+  `timeout` (the gang did not reach its quorum within `placementTimeout`).
+  A rising `restart` rate is a gang whose members keep dying; see
+  [When a member is lost](gang-scheduling.md#when-a-member-is-lost).
 - **`legion_evals_unblocked_total{event}`** (counter): blocked evals returned
   to the pending queue, by what woke them: `register`, `node` (pool,
   availability, or attributes changed), `ready`, `freed` (allocations left a
   node), `missed` (capacity appeared while the eval ran, so it never
-  blocked), or `startup`.
+  blocked), `startup`, or `timeout` (a gang past its `placementTimeout`,
+  woken for its last attempt).
 - **`legion_blocked_wait_seconds`** (histogram): how long a blocked eval
   waited, from the entry that blocked it to the one that woke it. Buckets run
   from 100 ms to an hour.

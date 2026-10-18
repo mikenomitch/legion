@@ -764,6 +764,10 @@ pub struct Metrics {
     pub eval_conflict_requeues_total: Arc<Counter>,
     /// `legion_evals_blocked{key_kind}`
     pub evals_blocked: Arc<GaugeVec>,
+    /// `legion_gang_blocked_jobs`
+    pub gang_blocked_jobs: Arc<Gauge>,
+    /// `legion_gang_outcomes_total{outcome}`
+    pub gang_outcomes_total: Arc<CounterVec>,
     /// `legion_evals_unblocked_total{event}`
     pub evals_unblocked_total: Arc<CounterVec>,
     /// `legion_blocked_wait_seconds`
@@ -1062,6 +1066,22 @@ impl Metrics {
                 name: "legion_evals_blocked",
                 help: "Evals waiting blocked on capacity, by the kind of key they wait under: `class` (a pool and pinned attributes), `node` (a resume pinned to the node holding its checkpoint), `escaped` (no schedulable node at all). Set by the scheduler-lane leader's wake pass; zero elsewhere.",
                 labels: &["key_kind"],
+            },
+            series: Series::new(),
+        });
+        let gang_blocked_jobs = Arc::new(Gauge {
+            meta: FamilyMeta {
+                name: "legion_gang_blocked_jobs",
+                help: "Jobs whose blocked eval is a gang short of its quorum (docs/gang-scheduling.md): a waiting gang holds nothing, so a gang can wait behind smaller jobs that keep taking freed capacity. A value that stays up is the starvation signal. Set by the scheduler-lane leader's wake pass; zero elsewhere.",
+                labels: &[],
+            },
+            cell: GaugeCell::default(),
+        });
+        let gang_outcomes_total = Arc::new(CounterVec {
+            meta: FamilyMeta {
+                name: "legion_gang_outcomes_total",
+                help: "Gang lifecycle decisions (docs/gang-scheduling.md), by outcome: `timeout` (a gang did not reach its quorum within placementTimeout and its job failed), `replace` (a member was lost and is replaced alone), `restart` (a member was lost and the whole gang stops to be placed again), `fail` (a member was lost and the gang's job failed). Counted on the manager that made the decision.",
+                labels: &["outcome"],
             },
             series: Series::new(),
         });
@@ -1853,6 +1873,8 @@ impl Metrics {
             Arc::clone(&envelope_resizes_total) as Arc<dyn RenderMetric>,
             Arc::clone(&eval_conflict_requeues_total) as Arc<dyn RenderMetric>,
             Arc::clone(&evals_blocked) as Arc<dyn RenderMetric>,
+            Arc::clone(&gang_blocked_jobs) as Arc<dyn RenderMetric>,
+            Arc::clone(&gang_outcomes_total) as Arc<dyn RenderMetric>,
             Arc::clone(&evals_unblocked_total) as Arc<dyn RenderMetric>,
             Arc::clone(&blocked_wait_seconds) as Arc<dyn RenderMetric>,
             Arc::clone(&plan_apply_total) as Arc<dyn RenderMetric>,
@@ -1925,6 +1947,8 @@ impl Metrics {
             scheduler_plan_candidate_rank,
             eval_conflict_requeues_total,
             evals_blocked,
+            gang_blocked_jobs,
+            gang_outcomes_total,
             evals_unblocked_total,
             blocked_wait_seconds,
             scheduler_concurrency_limit,

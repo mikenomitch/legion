@@ -72,6 +72,20 @@ pub(crate) enum ForwardableLaneWrite {
     },
     /// `Store::mark_job_failed` — control lane.
     MarkJobFailed { job_id: String },
+    /// The decision half of `Store::gang_member_lost` — scheduler lane. A
+    /// worker's failure report lost a gang member: the leader reads the
+    /// gang's survivors from its own state (it is the decision, made where
+    /// the authoritative copy lives) and restarts them as the gang's
+    /// `onMemberLoss` says, or (`stop_job`) stops every allocation of a job
+    /// the origin just marked failed. Returns the `GangLoss`, when the task
+    /// is a gang its job still wants.
+    GangMemberLost {
+        job_id: String,
+        job_config_id: String,
+        task_config_id: i64,
+        exhausted: bool,
+        stop_job: bool,
+    },
     /// `Store::remove_allocation_by_id` — scheduler lane. Returns the
     /// removed allocation, when one existed.
     ///
@@ -187,6 +201,7 @@ impl ForwardableLaneWrite {
             ForwardableLaneWrite::SyncNodeAvailability { .. }
             | ForwardableLaneWrite::MarkJobFailed { .. } => Lane::Control,
             ForwardableLaneWrite::RemoveAllocationById { .. }
+            | ForwardableLaneWrite::GangMemberLost { .. }
             | ForwardableLaneWrite::RemoveFailedAllocation { .. }
             | ForwardableLaneWrite::EnqueueEval { .. }
             | ForwardableLaneWrite::SeedKeyedInstances { .. }
@@ -212,6 +227,7 @@ impl ForwardableLaneWrite {
             }
             ForwardableLaneWrite::SyncNodeAvailability { .. } => "sync_node_availability",
             ForwardableLaneWrite::MarkJobFailed { .. } => "mark_job_failed",
+            ForwardableLaneWrite::GangMemberLost { .. } => "gang_member_lost",
             ForwardableLaneWrite::RemoveAllocationById { .. } => "remove_allocation_by_id",
             ForwardableLaneWrite::RemoveFailedAllocation { .. } => "remove_failed_allocation",
             ForwardableLaneWrite::EnqueueEval { .. } => "enqueue_eval",
@@ -286,6 +302,19 @@ pub(crate) fn execute(store: &Store, op: ForwardableLaneWrite) -> ForwardOutcome
         ForwardableLaneWrite::MarkJobFailed { job_id } => {
             done(store.mark_job_failed_local(&job_id))
         }
+        ForwardableLaneWrite::GangMemberLost {
+            job_id,
+            job_config_id,
+            task_config_id,
+            exhausted,
+            stop_job,
+        } => done(store.gang_loss_op_local(
+            &job_id,
+            &job_config_id,
+            task_config_id,
+            exhausted,
+            stop_job,
+        )),
         ForwardableLaneWrite::RemoveAllocationById {
             allocation_id,
             cause,
@@ -387,6 +416,13 @@ mod tests {
             },
             ForwardableLaneWrite::MarkJobFailed {
                 job_id: "job".into(),
+            },
+            ForwardableLaneWrite::GangMemberLost {
+                job_id: "job".into(),
+                job_config_id: "job-1".into(),
+                task_config_id: 3,
+                exhausted: false,
+                stop_job: false,
             },
             ForwardableLaneWrite::RemoveAllocationById {
                 allocation_id: 7,

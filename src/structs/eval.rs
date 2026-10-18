@@ -240,6 +240,8 @@ impl Eval {
         }
 
         store.remove_allocs_for_job(&self.job_id)?;
+        // A restart starts any gang's placement timeout over.
+        store.clear_gang_waits_for_job(&self.job_id)?;
         // A restart (a batch schedule's next run, a forced reschedule, a KV
         // restart) runs the job again from the top: its tasks' statuses from
         // the previous run must not satisfy this run's `dependsOn`, or every
@@ -337,6 +339,8 @@ impl Eval {
         }
 
         store.remove_allocs_for_job(&self.job_id)?;
+        // A stopped gang is not waiting for anything (docs/gang-scheduling.md).
+        store.clear_gang_waits_for_job(&self.job_id)?;
         // Stateful instance ROWS of a stopped job are always retained: slot
         // rows are terminated so a later re-run re-materializes the same
         // ordinal identities; keyed rows are merely stopped, so resubmitting

@@ -34,6 +34,13 @@ mod job_status_ops;
 // Reschedule backoff: the failed-allocation removal op, its holds, and the
 // move history they double as.
 mod reschedule_holds;
+// Gang waits: when a gang started waiting for its quorum, and its
+// `placementTimeout`.
+mod gang_waits;
+// Gang member losses: what a lost member does to the rest of its gang.
+mod gang_losses;
+// Gang members: each gang allocation's rank, size, and leader address.
+mod gang_members;
 use crate::storage::persistence::{
     build_persistence_driver, PersistenceDriver, PersistenceRole, PersistenceStatus,
     RaftHistoryEvent, RaftStatus,
@@ -41,6 +48,9 @@ use crate::storage::persistence::{
 use crate::storage::raft::{capture, ReplicatedOp, ReplicationHandle};
 use crate::storage::Lane;
 pub use fork_ops::{alias_target_problem, AliasOutcome, ForkCreated};
+pub use gang_losses::GangLoss;
+pub use gang_members::GangMember;
+pub use gang_waits::GangWait;
 pub use job_status_ops::{derive_job_status, JobStatusFacts, TaskStatusFact};
 pub use keyring_ops::{KeyringInit, KeyringReset, RewrapBatch, RewrapRun, RootKeyRewrap};
 pub use reschedule_holds::{
@@ -819,6 +829,9 @@ pub struct PreemptionVictimRow {
     /// resolve against.
     pub task_count: u32,
     pub disruption_json: Option<String>,
+    /// The task's `gang` block: its quorum is a floor preemption never
+    /// crosses, like `disruption.minAvailable` (docs/gang-scheduling.md).
+    pub gang_json: Option<String>,
     pub stop_json: Option<String>,
     /// The owning job config's priority band.
     pub band: Band,
@@ -3352,7 +3365,7 @@ impl Store {
 
         let mut task_stmt = conn.prepare(
             r#"
-            SELECT id, name, runtime, count, count_per, group_name, lifecycle, schedule, depends_on, config, resources, constraints, permit, affinities, checks, on_unhealthy, kv_injections, job_config_id, identities, stateful, artifacts, network, service, actions, volumes, connect, restart, stop, disruption, speculative_start, snapshots, suspend
+            SELECT id, name, runtime, count, count_per, group_name, lifecycle, schedule, depends_on, config, resources, constraints, permit, affinities, checks, on_unhealthy, kv_injections, job_config_id, identities, stateful, artifacts, network, service, actions, volumes, connect, restart, stop, disruption, speculative_start, snapshots, suspend, gang
             FROM task_config;
             "#,
         )?;
@@ -3373,6 +3386,7 @@ impl Store {
                 speculative_start: parse_json_column(29, row.get(29)?)?,
                 snapshots: parse_json_column(30, row.get(30)?)?,
                 suspend: parse_json_column(31, row.get(31)?)?,
+                gang: parse_json_column(32, row.get(32)?)?,
                 name: row.get(1)?,
                 runtime: row.get(2)?,
                 count: TaskCount {
@@ -4446,7 +4460,8 @@ impl Store {
                     EXISTS( \
                         SELECT 1 FROM volume v \
                         WHERE v.instance_id = a.instance_id AND v.node_local = 1 \
-                    ) AS node_pinned \
+                    ) AS node_pinned, \
+                    tc.gang \
              FROM allocation a \
              INNER JOIN task_config tc ON tc.id = a.task_config_id \
              INNER JOIN job_config jc ON jc.id = a.job_config_id \
@@ -4470,6 +4485,7 @@ impl Store {
                     stop_json: row.get(10)?,
                     band: Band::from_stored(&row.get::<_, String>(11)?),
                     node_pinned: row.get::<_, i64>(12)? != 0,
+                    gang_json: row.get(13)?,
                 })
             })?)?;
         Ok(rows)
@@ -7343,6 +7359,7 @@ impl Store {
             speculative_start: parse_json_column(30, row.get(30)?)?,
             snapshots: parse_json_column(31, row.get(31)?)?,
             suspend: parse_json_column(32, row.get(32)?)?,
+            gang: parse_json_column(33, row.get(33)?)?,
         };
 
         Ok(task_config)
@@ -7822,6 +7839,8 @@ impl Store {
 
         let evicted = removable.len();
         let affected_job_configs = self.remove_allocations(&removable, StopCause::Drain)?;
+        let affected_job_configs =
+            self.gang_members_lost_on_node(&removable, StopCause::Drain, affected_job_configs);
         let reconciled = self.reconcile_job_configs_or_requeue(affected_job_configs);
 
         self.events().node_drained(node_id, evicted, held);
@@ -9548,6 +9567,8 @@ impl Store {
         )?;
         tx.execute("DELETE FROM instance WHERE job_id = ?1;", [job_id])?;
         tx.execute("DELETE FROM reschedule_hold WHERE job_id = ?1;", [job_id])?;
+        Self::delete_gang_waits_for_job_tx(&tx, job_id)?;
+        Self::delete_gang_members_for_job_tx(&tx, job_id)?;
         Self::destroy_job_snapshots_tx(&tx, job_id)?;
         tx.execute("DELETE FROM rollout_event WHERE job_id = ?1;", [job_id])?;
         tx.execute("DELETE FROM rollout WHERE job_id = ?1;", [job_id])?;
@@ -9900,6 +9921,26 @@ impl Store {
         };
         if status == "stopped" {
             return Ok(Some(format!("job {job_id} is stopped")));
+        }
+        // A failed gang job stays down until `job run` restarts it (which
+        // clears the status first): its gang was failed as a unit (a
+        // placement timeout, an `onMemberLoss: fail`, or a member that ran
+        // out of moves), and a stray reschedule placing it again would undo
+        // exactly that (docs/gang-scheduling.md). Other failed jobs keep
+        // planning, as before.
+        if status == "failed" {
+            let gang: bool = conn
+                .prepare_cached(
+                    "SELECT EXISTS (
+                         SELECT 1 FROM task_config WHERE job_config_id = ?1 AND gang IS NOT NULL
+                     );",
+                )?
+                .query_row([job_config_id], |row| row.get(0))?;
+            if gang {
+                return Ok(Some(format!(
+                    "job {job_id} failed as a gang; `legion job run` restarts it"
+                )));
+            }
         }
         let Some(latest) = latest else {
             return Ok(None);
@@ -10654,6 +10695,7 @@ impl Store {
                 .map(serde_json::to_string)
                 .transpose()?;
             let suspend = t.suspend.as_ref().map(serde_json::to_string).transpose()?;
+            let gang = t.gang.as_ref().map(serde_json::to_string).transpose()?;
             let schedule = t.schedule.as_ref().map(ToString::to_string);
             let task_params = named_params! {
                 ":name": t.name,
@@ -10688,6 +10730,7 @@ impl Store {
                 ":speculative_start": speculative_start,
                 ":snapshots": snapshots,
                 ":suspend": suspend,
+                ":gang": gang,
             };
 
             let task_id: i64 = tx.query_row(&INSERT_TASK, task_params, |row| row.get(0))?;
@@ -13670,6 +13713,8 @@ impl Store {
             )?
             .execute(params![allocation.id, now, instance_id])?;
         }
+        // A gang member's rank, like a slot, is bound with the row.
+        self.assign_gang_member_tx(tx, &allocation)?;
 
         Ok(allocation)
     }
@@ -16425,6 +16470,8 @@ impl Store {
         }
 
         let affected_job_configs = self.remove_allocations(&removable, StopCause::NodeLost)?;
+        let affected_job_configs =
+            self.gang_members_lost_on_node(&removable, StopCause::NodeLost, affected_job_configs);
         self.reconcile_job_configs_or_requeue(affected_job_configs)
     }
 
@@ -21048,6 +21095,10 @@ fn mint_storage_handle(driver: &str) -> String {
 /// loopback ports and the task with no env — silently, and permanently.
 fn task_schedule_equivalent(left: &TaskConfig, right: &TaskConfig) -> bool {
     left.count == right.count
+        // Turning a gang on or off, or moving its quorum, changes how the
+        // replicas must be placed, so the job re-plans under the new rule
+        // instead of carrying a partial set across.
+        && left.gang == right.gang
         && left.schedule == right.schedule
         && left.resources == right.resources
         && left.constraints == right.constraints

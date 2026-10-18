@@ -48,6 +48,13 @@ Important `TaskConfig` fields:
 - `count`:
   - integer count
   - or `{ num, per }` for per-attribute placement
+- `gang`: `true` or `{ min, placementTimeout, onMemberLoss }`. The task's
+  replicas place all together (or at least `min` of them together) or not at
+  all, and a gang that does not fit waits, blocked and holding nothing,
+  instead of placing what fits. `placementTimeout` fails the job if the wait
+  runs too long, and a lost member restarts the whole gang (or, with
+  `onMemberLoss`, is replaced alone or fails the job). See
+  [Gang Scheduling](gang-scheduling.md).
 - `group`: task grouping for rollouts and automatic anti-affinity
 - `runtime`: task-runtime plugin (`exec`, `container`, etc.)
 - `resources`: normalized by the manager's `ResourcePolicy`

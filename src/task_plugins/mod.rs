@@ -1168,6 +1168,62 @@ impl TaskPluginRegistry {
     }
 }
 
+/// The `gang` rules that need the rest of the job (docs/gang-scheduling.md):
+/// a gang has its group to itself, and that group's rollout replaces it in
+/// one step.
+fn validate_gang_groups(config: &JobConfig) -> R<()> {
+    for task in &config.tasks {
+        if task.gang.is_none() {
+            continue;
+        }
+        let groupmates = config
+            .tasks
+            .iter()
+            .filter(|other| other.group == task.group && other.name != task.name)
+            .map(|other| other.name.as_str())
+            .collect::<Vec<_>>();
+        if !groupmates.is_empty() {
+            bail!(
+                "task {} sets gang but shares group {} with {}. A multi-task group already \
+                 places all of its tasks together on one node, all or nothing; give the gang \
+                 task a group of its own (`group = \"{}\"`)",
+                task.name,
+                task.group,
+                groupmates.join(", "),
+                task.name
+            );
+        }
+        let Some(rollout) = config.rollout_config_for_group(&task.group) else {
+            continue;
+        };
+        if rollout.has_sequential_slots() {
+            bail!(
+                "rollout: slots.order \"sequential\" cannot apply to group {}: task {} is a gang \
+                 (its replicas place and replace as one unit); remove the slots order or remove \
+                 `gang`",
+                task.group,
+                task.name
+            );
+        }
+        let steps =
+            crate::manager::rollout::step_fractions_for_rollout(&rollout, task.count.num.max(1));
+        if steps.len() > 1 {
+            bail!(
+                "rollout: the step mode for group {} replaces task {} in {} steps, but the task \
+                 is a gang (its {} replicas place and replace as one unit). Remove the step mode \
+                 for this group (for example `rolloutByGroup.{} = {{ percentSteps = [100] }}`) or \
+                 remove `gang`",
+                task.group,
+                task.name,
+                steps.len(),
+                task.count.num,
+                task.group
+            );
+        }
+    }
+    Ok(())
+}
+
 #[instrument(err, skip_all)]
 pub fn validate_job_config(config: &JobConfig) -> R<()> {
     use crate::structs::job::validate_object_name;
@@ -1189,6 +1245,7 @@ pub fn validate_job_config(config: &JobConfig) -> R<()> {
         task.validate_actions()?;
         task.validate_stop()?;
         task.validate_disruption()?;
+        task.validate_gang()?;
         task.validate_speculative_start()
             .map_err(|err| anyhow!(err))?;
         if let Some(snapshots) = task.snapshots.as_ref() {
@@ -1414,6 +1471,7 @@ pub fn validate_job_config(config: &JobConfig) -> R<()> {
             }
         }
     }
+    validate_gang_groups(config)?;
     config.validate_rollout()?;
     if let Some(rollout) = config.rollout.as_ref() {
         if let Some(strategy) = rollout.strategy.as_ref() {
@@ -3609,5 +3667,95 @@ mod tests {
         let implicit = plugin.implicit_artifacts(&json!({"image": "alpine:latest"}))?;
         assert_eq!(implicit[0].source, "oci://docker.io/library/alpine:latest");
         Ok(())
+    }
+
+    fn gang_job(
+        tasks: Vec<TaskConfig>,
+        rollout: Option<crate::structs::RolloutConfig>,
+    ) -> JobConfig {
+        JobConfig {
+            priority: Default::default(),
+            rollout,
+            rollout_by_group: Default::default(),
+            name: "trainer".into(),
+            tasks,
+            version: None,
+        }
+    }
+
+    fn gang_worker(group: &str) -> TaskConfig {
+        TaskConfig {
+            count: crate::structs::TaskCount::new(8),
+            gang: Some(crate::structs::GangConfig::default()),
+            group: group.into(),
+            config: json!({"command": ["true"]}),
+            ..TaskConfig::new("worker", "exec")
+        }
+    }
+
+    #[test]
+    fn a_gang_needs_a_group_of_its_own() -> R<()> {
+        let launcher = TaskConfig {
+            config: json!({"command": ["true"]}),
+            ..TaskConfig::new("launcher", "exec")
+        };
+        let err = validate_job_config(&gang_job(
+            vec![launcher.clone(), gang_worker("default")],
+            None,
+        ))
+        .expect_err("a gang in a multi-task group");
+        assert!(
+            err.to_string()
+                .contains("task worker sets gang but shares group default with launcher"),
+            "{err}"
+        );
+        validate_job_config(&gang_job(vec![launcher, gang_worker("worker")], None))?;
+        Ok(())
+    }
+
+    #[test]
+    fn a_gang_rollout_replaces_it_in_one_step() -> R<()> {
+        let steps = crate::structs::RolloutConfig {
+            percent_steps: Some(vec![10, 50, 100]),
+            ..Default::default()
+        };
+        let err = validate_job_config(&gang_job(vec![gang_worker("worker")], Some(steps.clone())))
+            .expect_err("a canary of a gang");
+        assert!(
+            err.to_string()
+                .contains("replaces task worker in 3 steps, but the task is a gang"),
+            "{err}"
+        );
+
+        // A group override that resolves to one step is fine.
+        let mut config = gang_job(vec![gang_worker("worker")], Some(steps));
+        config.rollout_by_group.insert(
+            "worker".into(),
+            crate::structs::RolloutConfig {
+                percent_steps: Some(vec![100]),
+                ..Default::default()
+            },
+        );
+        validate_job_config(&config)?;
+        Ok(())
+    }
+
+    #[test]
+    fn a_gang_rejects_sequential_slots() {
+        let mut worker = stateful_slot_task();
+        worker.gang = Some(crate::structs::GangConfig::default());
+        let config = gang_job(
+            vec![worker],
+            Some(crate::structs::RolloutConfig {
+                slots: Some(crate::structs::RolloutSlotsConfig {
+                    order: Some(crate::structs::RolloutSlotOrder::Sequential),
+                    update_from: None,
+                }),
+                ..Default::default()
+            }),
+        );
+        let err = validate_job_config(&config).expect_err("sequential slots on a gang");
+        assert!(err.to_string().contains("sequential"), "{err}");
+        assert!(err.to_string().contains("is a gang"), "{err}");
     }
 }

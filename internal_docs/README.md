@@ -107,7 +107,7 @@ When one is required and what goes in it:
 | [edge-admission-control-plan.md](plans/edge-admission-control-plan.md) | in execution (Phase 1 built: the per-node claim window that sheds edge starts `OVERLOADED` before boot when ratification is slow, and enforces `maxProvisionalPerNode`. Manager-side speculation shedding and deadline-aware ratification planned) |
 | [edge-boot-plan.md](plans/edge-boot-plan.md) | shipped (phases 1–4); phase 0 measurement not run, phase 5 backlog |
 | [edge-ratify-throughput-plan.md](plans/edge-ratify-throughput-plan.md) | in execution (Phase 1 shipped 2026-10-14: in-process ratify load harness, ratifications fenced by committed state instead of epochs, create decided inside the entry, ratify off the async runtime. Per-node RPC batching deferred on data, networked load test planned) |
-| [gang-scheduling-plan.md](plans/gang-scheduling-plan.md) | planned |
+| [gang-scheduling-plan.md](plans/gang-scheduling-plan.md) | in execution (Phases 1–3 shipped; rank/world size, readiness timeout, and Phase 4 open) |
 | [gated-sandbox-checkpoints-plan.md](plans/gated-sandbox-checkpoints-plan.md) | in execution (Phases 1 to 5 built: gated memory checkpoints, default deny, the static guest agent, gated idle signals, Legion-addressed TAPs, ingress into gated and TAP sandboxes, and upstreams in gated sandboxes; Phase 0, the real-VMM gate, is pending, so the gated-by-default flip is held) |
 | [host-convergence-plan.md](plans/host-convergence-plan.md) | planned |
 | [host-process-supervision-plan.md](plans/host-process-supervision-plan.md) | in execution (phases 1–3 landed; phase 4 uncommitted) |
