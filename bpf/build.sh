@@ -3,9 +3,12 @@
 # in, so `cargo build` needs only protoc; CI runs this and fails when the
 # result differs from the committed object (`bpf/build.sh --check`).
 #
-# Needs clang with the bpf target and the kernel UAPI headers
-# (linux-libc-dev). The programs use only stable UAPI context fields, so the
-# object loads on any kernel with the features `netKernel` probes for.
+# Needs clang with the bpf target and the kernel's asm/types.h
+# (linux-libc-dev). linux/bpf.h is vendored in include/ (copied from Ubuntu's
+# linux-libc-dev 6.8.0-147) so a distro header update cannot change the
+# object's debug info and fail the check. The programs use only stable UAPI
+# context fields, so the object loads on any kernel with the features
+# `netKernel` probes for.
 set -eu
 here=$(cd "$(dirname "$0")" && pwd)
 clang=${CLANG:-clang}
@@ -19,7 +22,7 @@ fi
 # object independent of where the repository is checked out.
 "$clang" -O2 -g -target bpf -Wall -Werror \
 	-fdebug-prefix-map="$here"=bpf \
-	-I"$arch_include" -I"$here" \
+	-I"$here/include" -I"$arch_include" -I"$here" \
 	-c "$here/legion_net.bpf.c" -o "$out"
 if [ "${1:-}" = "--check" ]; then
 	if ! cmp -s "$out" "$here/legion_net.bpf.o"; then
