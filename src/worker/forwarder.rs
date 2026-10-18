@@ -774,6 +774,16 @@ impl ForwarderContext {
                 "deny"
             };
             crate::worker::netd::metrics::connections("egress", "tcp", verdict, count);
+            // Pass flows never reach netd's ledgers: the graph learns them
+            // from the rule that allowed them.
+            let rule = (slot as usize) < abi::MAX_RULES || slot == abi::SLOT_FALLTHROUGH;
+            if allowed && rule {
+                let target = net
+                    .chain(id)
+                    .and_then(|chain| chain.targets.get(slot as usize).cloned())
+                    .unwrap_or_else(|| "*".to_string());
+                self.edges.record_connections(id, &target, true, count);
+            }
             if let Some(status) = statuses.get_mut(&id) {
                 match verdict {
                     "redirect" => status.redirected += count,

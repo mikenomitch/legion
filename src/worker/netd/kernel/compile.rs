@@ -25,6 +25,9 @@ pub struct Compiled {
     /// Each compiled rule's source (`policy/sandbox#2`, `task#0`) and
     /// reason, for the events a denial raises.
     pub labels: Vec<(String, Option<String>)>,
+    /// What each compiled rule matches, as the service graph names a pass
+    /// flow's destination (`*.pypi.org`, `10.0.0.0/8:5432`, `port 25`).
+    pub targets: Vec<String>,
     pub default_allow: bool,
     /// Allowed TCP flows still need netd: the chain has hops, or it is an
     /// HTTP chain with an access log.
@@ -42,6 +45,7 @@ pub fn compile(chain: &EffectiveChain) -> Result<Compiled, Unsupported> {
         rules: Vec::new(),
         hosts: Vec::new(),
         labels: Vec::new(),
+        targets: Vec::new(),
         default_allow: !chain.denies_by_default(),
         inspect: !chain.handlers.is_empty() || (chain.is_http() && chain.access_log),
     };
@@ -118,6 +122,16 @@ pub fn compile(chain: &EffectiveChain) -> Result<Compiled, Unsupported> {
         out.rules.push(rule);
         out.labels
             .push((entry.source.clone(), entry.rule.reason.clone()));
+        let what = matcher
+            .host
+            .clone()
+            .or_else(|| matcher.cidr.clone())
+            .unwrap_or_else(|| "*".to_string());
+        out.targets.push(match matcher.port {
+            Some(port) if what == "*" => format!("port {port}"),
+            Some(port) => format!("{what}:{port}"),
+            None => what,
+        });
     }
     Ok(out)
 }
