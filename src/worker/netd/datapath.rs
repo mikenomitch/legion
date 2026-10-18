@@ -667,9 +667,9 @@ mod tests {
             job_id: "web".into(),
             task_name: "server".into(),
             task_runtime: "exec".into(),
-            task_connect: json!({ "upstreams": [{ "service": service }] }).to_string(),
+            task_connect: json!({ "upstreams": [{ "to": service }] }).to_string(),
             network: json!({
-                "upstreams": [{ "service": service, "localPort": local_port, "balance": "least_conn" }]
+                "upstreams": [{ "key": service, "localPort": local_port, "balance": "least_conn" }]
             })
             .to_string(),
             ..Default::default()
@@ -711,7 +711,8 @@ mod tests {
             vec![UpstreamSpec {
                 allocation_id: 11,
                 service: "db".into(),
-                local_port,
+                local_port: Some(local_port),
+                http_protocol: false,
                 balance: "least_conn".into(),
                 to: None,
                 http: None,

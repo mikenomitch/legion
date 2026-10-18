@@ -302,10 +302,11 @@ the service ([Service Discovery](service-discovery.md)):
 # producer
 service = { port = 8080, allow = ["api"] },      # allow is optional; omit = any job
 # consumer
-connect = { upstreams = [{ service = "db", balance = "least_conn" }] },
+connect = { upstreams = [{ to = "db", balance = "least_conn" }] },
 ```
 
-The consumer's task then dials `$LEGION_UPSTREAM_DB` (`127.0.0.1:<port>`), and
+The consumer's task then dials `$LEGION_UPSTREAM_DB` (its one address: the
+upstream's VIP on Linux, a loopback port elsewhere), and
 the worker load-balances that connection across `db`'s healthy endpoints. Two
 properties matter for agents:
 
@@ -316,8 +317,12 @@ properties matter for agents:
 - **You can self-correct before mutating.** `legion job validate <spec>` runs
   the same connect validation the manager applies on submit. It catches an
   unknown `balance` strategy (the error lists the valid names), a duplicate
-  upstream service, a `localPort` that collides with a declared static port,
-  and an empty `service.allow` entry. Validate, fix, then submit.
+  upstream, a `to` that is neither a service name nor a URL, an `http` block
+  on an upstream that does not speak HTTP, a `port` that collides with a
+  declared static port, and an empty `service.allow` entry. It also warns
+  when the task's own HTTP egress chain cannot decide a `tcp` upstream at
+  connect (`job plan` and `job run` add stored policies). Validate, fix, then
+  submit.
 
 To observe the result (all read-only, all `-j`, all on the standard envelope):
 

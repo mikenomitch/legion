@@ -3868,10 +3868,21 @@ mesh's surface. Phase 0 first, then S1. After S1 every track is independent.
       show` and `net doctor`. Removed the `log` handler (use `accessLog`),
       chain-level `onError`, and `proxy.node` (`service` + `local = true`).
       Docs: [network-handlers.md#handlers](../docs/network-handlers.md#handlers).
-- [ ] S2: upstreams as one `to` whose scheme is the protocol (an HTTP chain
-      no longer parses `tcp` upstreams as HTTP), one dialable address per
-      upstream, VIP-only binding on Linux. Removes `http.outlier` and the
-      `random` balancer (`round_robin` starts at a random offset instead).
+- [x] S2: upstreams as one `to` whose scheme is the protocol
+      ([structs/network.rs](../src/structs/network.rs), `parse_upstream_to`):
+      an HTTP chain no longer parses `tcp` upstreams as HTTP; an undecidable
+      verdict fails closed naming the rule and the upstream, and `job
+      validate`/`plan`/`run` and `net policy apply` warn about it. One
+      dialable address per upstream (`LEGION_UPSTREAM_<KEY>` plus `_HOST_`
+      and `_PORT_`; `_VIP_` removed), VIP-only binding on Linux with a
+      loopback port only when pinned, without a VIP block, or for a sandbox.
+      Removed `http.outlier` (fixed 5 × 5xx / 30s ejection) and the `random`
+      balancer (`round_robin` and `least_conn` start at a random offset).
+      Docs: [service-discovery.md](../docs/service-discovery.md#connecting-to-services-the-connect-block),
+      [network-handlers.md](../docs/network-handlers.md#upstreams).
+      Not done: a store migration for allocation rows and stored specs in
+      the old shape (see the plan's calls file); clusters with such data
+      re-submit their jobs.
 - [ ] S3 + S4: `service.mesh = true` and TLS on `network.ports[].tls`
       instead of chain `tls`; `service.allow` as the one caller list,
       enforced at the receiving node on mesh services. Removes

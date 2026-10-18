@@ -2400,6 +2400,7 @@ impl ManagerDaemonService {
                 .chain(crate::task_plugins::resource_submit_warnings(&config))
                 .chain(crate::structs::suspend::sandbox_submit_warnings(&config))
                 .chain(self.gated_egress_submit_warnings(&config))
+                .chain(self.tcp_upstream_submit_warnings(&config))
                 .chain(crate::task_plugins::container_security_warnings(&config))
                 .collect(),
         })
@@ -2491,6 +2492,36 @@ impl ManagerDaemonService {
     /// matches the task counts as coverage. Its `nodePools` are ignored,
     /// because the pool is not known until placement, so a pool-scoped
     /// object silences the warning rather than raising a false one.
+    /// `tcp` upstreams under an HTTP egress chain that cannot decide them at
+    /// connect (see [`crate::structs::network::tcp_upstream_http_chain_warnings`]),
+    /// with every stored policy whose selector matches the task apart from
+    /// its pool, which is not known before placement.
+    fn tcp_upstream_submit_warnings(&self, config: &JobConfig) -> Vec<String> {
+        let policies = self.store.list_net_policies().unwrap_or_default();
+        crate::structs::network::tcp_upstream_http_chain_warnings(config, |task| {
+            let facts = crate::structs::netpolicy::NetSelectorFacts {
+                node_pool: None,
+                namespace: String::new(),
+                runtime: task.runtime.clone(),
+                job: config.name.clone(),
+                labels: task
+                    .network
+                    .as_ref()
+                    .map(|network| network.labels.clone())
+                    .unwrap_or_default(),
+            };
+            policies
+                .iter()
+                .filter(|record| {
+                    let mut selector = record.object.selector.clone();
+                    selector.node_pools.clear();
+                    selector.matches(&facts)
+                })
+                .map(|record| record.object.clone())
+                .collect()
+        })
+    }
+
     fn gated_egress_submit_warnings(&self, config: &JobConfig) -> Vec<String> {
         let policies = self.store.list_net_policies().unwrap_or_default();
         crate::structs::network::gated_egress_warnings(config, |task| {
@@ -5369,6 +5400,7 @@ impl Manager for ManagerDaemonService {
             warnings: self
                 .gated_egress_submit_warnings(&config)
                 .into_iter()
+                .chain(self.tcp_upstream_submit_warnings(&config))
                 .chain(crate::task_plugins::container_security_warnings(&config))
                 .collect(),
             gang_reports: gang_reports
@@ -9645,11 +9677,12 @@ impl Manager for ManagerDaemonService {
         enforce_net_policy_scope(&identity, AclAction::Write, &object)?;
         enforce_kv_cert_read(&identity, &[object.ingress.as_ref()])?;
 
-        let affected = self.affected_allocations_for_policy(&object);
+        let (affected, warnings) = self.affected_allocations_for_policy(&object);
         if req.dry_run {
             return Ok(Response::new(UpsertNetPolicyReply {
                 policy: Some(net_policy_to_proto(&object, "", "")),
                 affected_allocations: affected,
+                warnings,
             }));
         }
         let record = self
@@ -9670,6 +9703,7 @@ impl Manager for ManagerDaemonService {
                 &record.updated_at,
             )),
             affected_allocations: affected,
+            warnings,
         }))
     }
 
@@ -13405,16 +13439,30 @@ impl ManagerDaemonService {
     /// Running allocations whose effective policy would change if `object`
     /// were applied, as `job/task@allocation`. Best effort; used by dry runs
     /// and the applied event.
+    /// The running allocations `object` would apply to, and the advisory
+    /// lines about them (`UpsertNetPolicyReply.warnings`), one per task.
     fn affected_allocations_for_policy(
         &self,
         object: &crate::structs::netpolicy::NetPolicyObject,
-    ) -> Vec<String> {
+    ) -> (Vec<String>, Vec<String>) {
         use crate::structs::netpolicy::NetSelectorFacts;
         let Ok(allocations) = self.store.get_allocs() else {
-            return Vec::new();
+            return (Vec::new(), Vec::new());
         };
+        // The stored set as it would be with `object` written.
+        let mut stored: Vec<crate::structs::netpolicy::NetPolicyObject> = self
+            .store
+            .list_net_policies()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|record| record.object)
+            .filter(|existing| existing.name != object.name)
+            .collect();
+        stored.push(object.clone());
         let mut nodes: HashMap<String, Option<String>> = HashMap::new();
         let mut configs: HashMap<i64, crate::structs::TaskConfig> = HashMap::new();
+        let mut warned: HashSet<i64> = HashSet::new();
+        let mut warnings = Vec::new();
         let mut out = Vec::new();
         for allocation in allocations {
             let pool = nodes
@@ -13452,9 +13500,21 @@ impl ManagerDaemonService {
                     "{}/{}@{}",
                     allocation.job_id, task.name, allocation.id
                 ));
+                if warned.insert(allocation.task_config_id) {
+                    let matching: Vec<_> = stored
+                        .iter()
+                        .filter(|policy| policy.selector.matches(&facts))
+                        .cloned()
+                        .collect();
+                    warnings.extend(
+                        crate::structs::network::task_tcp_upstream_warnings(&task, &matching)
+                            .into_iter()
+                            .map(|line| format!("job {:?} {line}", allocation.job_id)),
+                    );
+                }
             }
         }
-        out
+        (out, warnings)
     }
 }
 
@@ -13848,12 +13908,12 @@ fn build_upstream_endpoints(
         for upstream in &connect.upstreams {
             // External upstreams dial a fixed destination; the worker reads it
             // off `AllocUpstream.to` and needs no endpoint feed.
-            if upstream.is_external() {
+            let Some(service) = upstream.service() else {
                 continue;
-            }
-            let key = (upstream.service.clone(), allocation.job_id.clone());
+            };
+            let key = (service.clone(), allocation.job_id.clone());
             if !resolved.contains_key(&key) {
-                let rows = match store.service_endpoints(Some(&upstream.service)) {
+                let rows = match store.service_endpoints(Some(&service)) {
                     Ok(rows) => rows,
                     Err(err) => {
                         // Same reasoning as the corrupt-payload arm above:
@@ -13862,7 +13922,7 @@ fn build_upstream_endpoints(
                         // stall this node's reconciliation entirely.
                         warn!(
                             allocation_id = allocation.allocation_id,
-                            service = %upstream.service,
+                            service = %service,
                             error = ?err,
                             "Skipping upstream endpoints; service lookup failed"
                         );
@@ -13896,13 +13956,15 @@ fn build_upstream_endpoints(
             let endpoints = resolved.get(&key).cloned().unwrap_or_default();
             debug!(
                 allocation_id = allocation.allocation_id,
-                service = %upstream.service,
+                service = %service,
                 endpoints = endpoints.len(),
                 "Resolved upstream endpoints"
             );
+            // Named by the upstream's key, which is how the node's listener
+            // is known (a `name` can alias the service).
             upstreams.push(crate::structs::UpstreamEndpoints {
                 allocation_id: allocation.allocation_id,
-                service: upstream.service.clone(),
+                service: upstream.key(),
                 endpoints,
                 for_handler: false,
             });
@@ -18902,7 +18964,7 @@ mod tests {
             provisional: None,
             allocation_id,
             job_id: job_id.into(),
-            task_connect: json!({ "upstreams": [{ "service": service }] }).to_string(),
+            task_connect: json!({ "upstreams": [{ "to": service }] }).to_string(),
             ..Default::default()
         }
     }

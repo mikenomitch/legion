@@ -183,15 +183,13 @@ fn split_words(action: &str) -> Vec<String> {
     words
 }
 
-/// The address a task dials for an upstream, as `LEGION_UPSTREAM_<KEY>`
-/// carries it: the VIP on its canonical port where the node has one, else
-/// the loopback port.
+/// The address a task dials for an upstream: [`AllocUpstream::dial`], the
+/// same function `LEGION_UPSTREAM_<KEY>` is built from, so the two cannot
+/// disagree.
+///
+/// [`AllocUpstream::dial`]: crate::structs::AllocUpstream::dial
 fn service_address(network: Option<&AllocNetwork>, key: &str) -> Option<(String, u16)> {
-    let upstream = network?.upstreams.iter().find(|u| u.service == key)?;
-    match (upstream.vip.as_deref(), upstream.canonical_port) {
-        (Some(vip), Some(port)) => Some((vip.to_string(), port)),
-        _ => Some(("127.0.0.1".to_string(), upstream.local_port)),
-    }
+    network?.upstream(key)?.dial()
 }
 
 /// Render `source` against the context.
@@ -510,16 +508,16 @@ mod tests {
         AllocNetwork {
             upstreams: vec![
                 AllocUpstream {
-                    service: "db".into(),
-                    local_port: 20001,
+                    key: "db".into(),
+                    local_port: Some(20001),
                     balance: "round_robin".into(),
                     to: None,
                     vip: Some("127.42.3.2".into()),
                     canonical_port: Some(5432),
                 },
                 AllocUpstream {
-                    service: "cache".into(),
-                    local_port: 20002,
+                    key: "cache".into(),
+                    local_port: Some(20002),
                     balance: "round_robin".into(),
                     to: None,
                     vip: None,

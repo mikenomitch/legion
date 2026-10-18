@@ -54,6 +54,10 @@ use std::time::{Duration, Instant};
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
 
+/// Consecutive 5xx answers that eject an endpoint in HTTP mode.
+const OUTLIER_CONSECUTIVE_5XX: u32 = 5;
+/// How long an ejected endpoint is skipped.
+const OUTLIER_EJECT_FOR: Duration = Duration::from_secs(30);
 /// How long an upstream dial may take before it counts as a connect failure.
 const DIAL_TIMEOUT: Duration = Duration::from_secs(2);
 /// Retry budget window.
@@ -247,14 +251,10 @@ impl HttpSettings {
                     .collect::<Vec<_>>()
             })
             .unwrap_or_default();
-        let outlier_threshold = config
-            .and_then(|c| c.outlier.as_ref())
-            .map(|o| o.consecutive_5xx.unwrap_or(5).max(1));
-        let outlier_eject = config
-            .and_then(|c| c.outlier.as_ref())
-            .and_then(|o| o.eject_for.as_deref())
-            .and_then(|d| parse_duration(d).ok())
-            .unwrap_or(Duration::from_secs(30));
+        // Outlier ejection has no knob: an endpoint that answers 5xx this
+        // many times in a row is skipped for this long, whatever the balancer.
+        let outlier_threshold = Some(OUTLIER_CONSECUTIVE_5XX);
+        let outlier_eject = OUTLIER_EJECT_FOR;
         HttpSettings {
             allocation_id,
             key,
@@ -2055,7 +2055,8 @@ mod integration {
             .sync(&[UpstreamSpec {
                 allocation_id: 7,
                 service: "origin".into(),
-                local_port: port,
+                local_port: Some(port),
+                http_protocol: false,
                 balance: "round_robin".into(),
                 to: Some(format!("http://127.0.0.1:{origin}")),
                 http: Some(http),
@@ -2178,7 +2179,8 @@ mod integration {
             .sync(&[UpstreamSpec {
                 allocation_id: 8,
                 service: "origin".into(),
-                local_port: port,
+                local_port: Some(port),
+                http_protocol: false,
                 balance: "round_robin".into(),
                 to: Some(format!("http://127.0.0.1:{origin}")),
                 http: None,
@@ -2236,7 +2238,8 @@ mod integration {
             .sync(&[UpstreamSpec {
                 allocation_id: 9,
                 service: "openai".into(),
-                local_port: port,
+                local_port: Some(port),
+                http_protocol: false,
                 balance: "round_robin".into(),
                 to: Some(format!("http://127.0.0.1:{origin}")),
                 http: None,
@@ -2371,7 +2374,8 @@ mod integration {
             .sync(&[UpstreamSpec {
                 allocation_id: 9,
                 service: "api".into(),
-                local_port: 20010,
+                local_port: Some(20010),
+                http_protocol: false,
                 balance: "round_robin".into(),
                 to: Some(format!("http://127.0.0.1:{origin}")),
                 http: None,
@@ -2426,7 +2430,8 @@ mod integration {
             .sync(&[UpstreamSpec {
                 allocation_id: 8,
                 service: "raw".into(),
-                local_port: port,
+                local_port: Some(port),
+                http_protocol: false,
                 balance: "round_robin".into(),
                 to: Some(format!("tcp://127.0.0.1:{origin}")),
                 http: None,

@@ -147,13 +147,13 @@ in
       connect = {
         upstreams = [
           {
-            service = "api",
+            to = "http://api",
             # HTTP mode: per-request balancing, a deadline, retries on
-            # idempotent requests, and ejecting a replica that keeps failing.
+            # idempotent requests. A replica that keeps answering 5xx is
+            # ejected for 30s on its own.
             http = {
               timeout = "5s",
               retries = { attempts = 2, on = ["5xx", "connect-failure"] },
-              outlier = { consecutive5xx = 5, ejectFor = "30s" },
             },
           },
         ],
@@ -181,7 +181,7 @@ in
       service = { port = "http", meta = { protocol = "http" }, allow = ["fullstack"] },
       # Least-connections, so a slow query doesn't pile more requests on
       # the replica that's already busy.
-      connect = { upstreams = [{ service = "postgres", balance = "least_conn" }] },
+      connect = { upstreams = [{ to = "postgres", balance = "least_conn" }] },
       checks = [http_check "/healthz" & { boot_grace_time = "60s" }],
       resources = { cpus = 0.25, memory = 128 },
     },
@@ -237,7 +237,7 @@ in
       },
       network = { ports = [{ name = "metrics" }] },
       service = { name = "postgres-metrics", port = "metrics", meta = { protocol = "http", path = "/metrics" } },
-      connect = { upstreams = [{ service = "postgres" }] },
+      connect = { upstreams = [{ to = "postgres" }] },
       resources = { cpus = 0.05, memory = 32 },
     },
   ],

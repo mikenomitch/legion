@@ -36,7 +36,7 @@ in
       connect = {
         upstreams = [
           {
-            service = "api",
+            to = "api",
             # HTTP mode: per-request balancing, retries, and outlier ejection.
             http = {
               timeout = "5s",
@@ -66,8 +66,8 @@ in
       service = { port = "http", meta = { protocol = "http" }, allow = ["fullstack"] },
       connect = {
         upstreams = [
-          { service = "postgres", balance = "least_conn" },
-          { service = "cache" },
+          { to = "postgres", balance = "least_conn" },
+          { to = "cache" },
         ],
       },
       checks = [

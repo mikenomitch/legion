@@ -901,7 +901,7 @@ A gated sandbox reaches its `connect.upstreams` as a container does:
 `$LEGION_UPSTREAM_<KEY>` and `<key>.svc.legion` both work in the guest. The
 guest agent listens on each upstream's loopback port and VIP and relays to
 the node's upstream listener over the vsock, so HTTP mode, policy, and
-handlers apply as on any runtime. Submit refuses an upstream `localPort` of
+handlers apply as on any runtime. Submit refuses an upstream `port` of
 1080 or 53, and an advertised port the guest would bind on 1080 or 1100,
 because the agent holds those. A TAP-wired or loopback-only sandbox cannot reach its
 upstreams. See [network-handlers.md](network-handlers.md#sandboxes).

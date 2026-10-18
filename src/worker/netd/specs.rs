@@ -69,11 +69,12 @@ pub fn upstream_specs(desired: &[TaskAllocation], alloc_root: &Path) -> Vec<Upst
             let declaration = declared
                 .upstreams
                 .iter()
-                .find(|candidate| candidate.key() == upstream.service);
+                .find(|candidate| candidate.key() == upstream.key);
             specs.push(UpstreamSpec {
                 allocation_id: allocation.allocation_id,
-                service: upstream.service.clone(),
+                service: upstream.key.clone(),
                 local_port: upstream.local_port,
+                http_protocol: declaration.is_some_and(|d| d.is_http()),
                 balance: upstream.balance.clone(),
                 to: upstream.to.clone(),
                 http: declaration.and_then(|d| d.http.clone()),
@@ -375,12 +376,15 @@ pub fn net_status(
                 for upstream in network
                     .upstreams
                     .iter()
-                    .filter(|upstream| !upstreams.contains(&upstream.service))
+                    .filter(|upstream| !upstreams.contains(&upstream.key))
                 {
+                    let socket = upstream
+                        .local_port
+                        .map(|port| guest_socket(scratch, port).display().to_string())
+                        .unwrap_or_else(|| "(no local port)".to_string());
                     problems.push(format!(
-                        "upstream {} is not bound on the guest's vsock socket {}",
-                        upstream.service,
-                        guest_socket(scratch, upstream.local_port).display()
+                        "upstream {} is not bound on the guest's vsock socket {socket}",
+                        upstream.key,
                     ));
                 }
             }
@@ -476,11 +480,11 @@ mod tests {
         TaskAllocation {
             provisional: None,
             allocation_id,
-            task_connect: json!({ "upstreams": [{ "service": service }] }).to_string(),
+            task_connect: json!({ "upstreams": [{ "to": service }] }).to_string(),
             network: json!({
                 "ports": [{ "name": "http", "hostPort": 20000 }],
                 "upstreams": [{
-                    "service": service,
+                    "key": service,
                     "localPort": local_port,
                     "balance": "least_conn",
                 }],
@@ -524,7 +528,8 @@ mod tests {
             vec![UpstreamSpec {
                 allocation_id: 11,
                 service: "db".into(),
-                local_port: 20003,
+                local_port: Some(20003),
+                http_protocol: false,
                 balance: "least_conn".into(),
                 to: None,
                 http: None,
@@ -542,7 +547,7 @@ mod tests {
     #[test]
     fn declared_credentials_follow_the_desired_set_test() {
         let connect = json!({ "upstreams": [
-            { "service": "db" },
+            { "to": "db" },
             { "name": "openai", "to": "https://api.openai.com", "credentials": [
                 { "header": "authorization", "prefix": "Bearer ", "from": { "kv": "secrets/openai" } },
                 { "header": "openai-organization", "from": { "kv": "secrets/org" } },
@@ -554,7 +559,7 @@ mod tests {
             allocation_id: 21,
             task_connect: connect,
             network: json!({ "upstreams": [
-                { "service": "openai", "localPort": 20010, "balance": "round_robin", "to": "https://api.openai.com" },
+                { "key": "openai", "localPort": 20010, "balance": "round_robin", "to": "https://api.openai.com" },
             ] })
             .to_string(),
             ..TaskAllocation::default()
@@ -588,7 +593,7 @@ mod tests {
         allocation.network = json!({
             "mode": "gated",
             "upstreams": [{
-                "service": "db",
+                "key": "db",
                 "localPort": 20003,
                 "balance": "least_conn",
                 "vip": "127.42.0.2",
@@ -605,7 +610,7 @@ mod tests {
         };
         let specs = upstream_specs(std::slice::from_ref(&allocation), root.path());
         assert_eq!(specs.len(), 1);
-        assert_eq!(specs[0].listen(), ListenAddr::Unix(socket(20003)));
+        assert_eq!(specs[0].listen(), Some(ListenAddr::Unix(socket(20003))));
         assert!(socket(20003).ends_with(".sandbox/vsock.sock_20003"));
         assert_eq!(
             (
@@ -634,7 +639,7 @@ mod tests {
         allocation.task_config = json!({ "image": "a" }).to_string();
         allocation.network = json!({
             "mode": "gated",
-            "upstreams": [{ "service": "db", "localPort": 20003, "balance": "least_conn" }],
+            "upstreams": [{ "key": "db", "localPort": 20003, "balance": "least_conn" }],
         })
         .to_string();
         let desired = vec![allocation];
@@ -775,13 +780,13 @@ mod tests {
         let unplaced = TaskAllocation {
             provisional: None,
             allocation_id: 2,
-            task_connect: json!({ "upstreams": [{ "service": "db" }] }).to_string(),
+            task_connect: json!({ "upstreams": [{ "to": "db" }] }).to_string(),
             ..TaskAllocation::default()
         };
         let corrupt = TaskAllocation {
             provisional: None,
             allocation_id: 3,
-            task_connect: json!({ "upstreams": [{ "service": "db" }] }).to_string(),
+            task_connect: json!({ "upstreams": [{ "to": "db" }] }).to_string(),
             network: "{not json".into(),
             ..TaskAllocation::default()
         };

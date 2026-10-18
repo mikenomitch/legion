@@ -10675,8 +10675,8 @@ mod tests {
         // listeners from the pair.
         let connect: crate::structs::ConnectConfig = serde_json::from_value(json!({
             "upstreams": [
-                { "service": "db" },
-                { "service": "cache", "localPort": 6379, "balance": "least_conn" },
+                { "to": "db" },
+                { "to": "cache", "port": 6379, "balance": "least_conn" },
             ]
         }))?;
         let task = TaskConfig {
@@ -10690,16 +10690,16 @@ mod tests {
                 ports: Vec::new(),
                 upstreams: vec![
                     crate::structs::AllocUpstream {
-                        service: "db".into(),
-                        local_port: 20003,
+                        key: "db".into(),
+                        local_port: Some(20003),
                         balance: "round_robin".into(),
                         to: None,
                         vip: None,
                         canonical_port: None,
                     },
                     crate::structs::AllocUpstream {
-                        service: "cache".into(),
-                        local_port: 6379,
+                        key: "cache".into(),
+                        local_port: Some(6379),
                         balance: "least_conn".into(),
                         to: None,
                         vip: None,
@@ -10719,7 +10719,9 @@ mod tests {
         assert_eq!(parsed_task.connect, Some(connect));
         let network = parsed_alloc.network.context("network lost on the wire")?;
         assert_eq!(
-            network.upstream("db").map(|upstream| upstream.local_port),
+            network
+                .upstream("db")
+                .and_then(|upstream| upstream.local_port),
             Some(20003)
         );
         assert_eq!(

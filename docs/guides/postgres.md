@@ -324,7 +324,7 @@ lose data. There are two built-in ways to back up:
   schedule = "0 3 * * *",
   # Reach the database through service discovery. The worker load-balances
   # $LEGION_UPSTREAM_POSTGRES (127.0.0.1:<port>) to the healthy Postgres.
-  connect = { upstreams = [{ service = "postgres" }] },
+  connect = { upstreams = [{ to = "postgres" }] },
   config = {
     image = "postgres:16-alpine",
     command = ["sh", "-c", "pg_dump \"postgres://postgres:legion-demo@$LEGION_UPSTREAM_POSTGRES/legion\" | gzip > \"$LEGION_TASK_DIR/pg-$(date +%F).sql.gz\""],

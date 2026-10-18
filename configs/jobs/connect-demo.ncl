@@ -10,7 +10,7 @@
 #   legion job logs connect-demo --tail    # client alternating between them
 #
 # The client never learns a backend address: it dials $LEGION_UPSTREAM_WEB
-# (127.0.0.1:<assigned port>) and the worker forwards each connection to a
+# (its upstream address: a VIP on Linux, a loopback port elsewhere) and the worker forwards each connection to a
 # healthy endpoint of `web`. See docs/service-discovery.md.
 {
     name = "connect-demo",
@@ -69,16 +69,15 @@
             connect = {
                 upstreams = [
                     {
-                        service = "web",
+                        to = "web",
                         # Even spread, so the demo visibly alternates. Omit
-                        # `balance` for the default, least_latency; "random",
-                        # "least_conn", and "local_first" are the others.
+                        # `balance` for the default, least_latency;
+                        # "least_conn" and "local_first" are the others.
                         balance = "round_robin",
-                        # Without localPort the loopback port is assigned at
-                        # placement out of the same per-node range as host
-                        # ports. Pin it only for clients that cannot read env
-                        # vars:
-                        # localPort = 8081,
+                        # The task dials $LEGION_UPSTREAM_WEB. Pin a port
+                        # only for clients that need a literal
+                        # 127.0.0.1:<port>:
+                        # port = 8081,
                     },
                 ],
             },

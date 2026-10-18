@@ -1518,9 +1518,9 @@ upstream listener is. The agent relays the old port to it from the first
 connection. The agent also listens on the new allocation's VIPs, and keeps
 relaying the old ones, so a resolver cache that still holds an old
 `<key>.svc.legion` answer works too. In `/legion/resume.env`,
-`LEGION_UPSTREAM_<KEY>` and `LEGION_UPSTREAM_PORT_<KEY>` name the loopback
-port the restored workload dials, and `LEGION_UPSTREAM_VIP_<KEY>` the new
-VIP. An upstream the job added while the instance was suspended gets its
+`LEGION_UPSTREAM_<KEY>` (with its `_HOST_` and `_PORT_` parts) names the
+loopback address the restored workload dials, and `<key>.svc.legion`
+resolves to the new allocation's VIP. An upstream the job added while the instance was suspended gets its
 listener in the guest on restore. One the job removed stops working: its
 loopback port in the guest stays open, but the new allocation has no
 listener behind it.

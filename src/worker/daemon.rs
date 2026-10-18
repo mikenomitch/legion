@@ -1449,7 +1449,7 @@ fn kernel_guarded_allocations(
                         network
                             .upstreams
                             .iter()
-                            .map(|upstream| upstream.local_port)
+                            .filter_map(|upstream| upstream.local_port)
                             .collect()
                     })
                     .unwrap_or_default(),

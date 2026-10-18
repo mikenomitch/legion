@@ -570,6 +570,11 @@ async fn validate_job(arg_matches: &ArgMatches) -> R<()> {
         &config,
         |_| false,
     ));
+    // The task's own chain only; `job plan` and `job run` add stored policies.
+    warnings.extend(crate::structs::network::tcp_upstream_http_chain_warnings(
+        &config,
+        |_| Vec::new(),
+    ));
     warnings.extend(crate::task_plugins::container_security_warnings(&config));
 
     if format.is_json() {

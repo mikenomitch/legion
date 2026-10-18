@@ -1173,6 +1173,20 @@ pub fn evaluate_connect(chain: &EffectiveChain, facts: &ConnectFacts<'_>) -> Ver
     fallthrough(chain)
 }
 
+/// The source of the rule that makes [`evaluate_connect`] answer
+/// [`Verdict::Defer`]: the first rule whose connect-time parts match and that
+/// needs the request head. `None` when the chain decides at connect.
+pub fn deferring_rule(chain: &EffectiveChain, facts: &ConnectFacts<'_>) -> Option<String> {
+    for entry in &chain.rules {
+        let matcher = &entry.rule.matcher;
+        if !connect_parts_match(matcher, facts.host, facts.ip, facts.port, facts.identity) {
+            continue;
+        }
+        return matcher.needs_request().then(|| entry.source.clone());
+    }
+    None
+}
+
 /// Decide a request from the HTTP head. Connect-time parts are re-checked so
 /// a chain evaluates identically whether or not `evaluate_connect` ran first.
 pub fn evaluate_request(chain: &EffectiveChain, facts: &RequestFacts<'_>) -> Verdict {

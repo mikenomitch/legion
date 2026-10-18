@@ -34,7 +34,7 @@ legion service doctor redis     # layer-by-layer diagnosis when something's off
 To use it from another task, add one block and read one env var:
 
 ```nickel
-connect = { upstreams = [{ service = "redis" }] },   # -> $LEGION_UPSTREAM_REDIS
+connect = { upstreams = [{ to = "redis" }] },   # -> $LEGION_UPSTREAM_REDIS
 ```
 
 See [Connecting to services](#connecting-to-services-the-connect-block).
@@ -94,9 +94,8 @@ checks = [
 ## Environment variables
 
 > On Linux an allocation with upstreams also gets `LEGION_DNS` (its own
-> resolver) and, per upstream, `LEGION_UPSTREAM_HOST_<KEY>` /
-> `LEGION_UPSTREAM_VIP_<KEY>`, so `<key>.svc.legion:<port>` works in a URL or
-> config file with no env plumbing. See
+> resolver), so `<key>.svc.legion:<port>` works in a URL or config file with
+> no env plumbing. See
 > [Network Handlers: Name-is-config](network-handlers.md#name-is-config-keysvclegion).
 
 Every task gets its identity and assigned ports injected into its environment.
@@ -111,12 +110,13 @@ If you declare the same variable yourself, your value wins:
 | `LEGION_PORT_TO_<LABEL>` | Declared in-task target port (when `to` is set). |
 | `LEGION_IP_<LABEL>` | Node address serving the port (when known). |
 | `LEGION_ADDR_<LABEL>` | `ip:port` convenience form. |
-| `LEGION_UPSTREAM_<SERVICE>` | `127.0.0.1:<port>` to dial a declared upstream ([below](#connecting-to-services-the-connect-block)). |
-| `LEGION_UPSTREAM_PORT_<SERVICE>` | Just the local port of that upstream. |
+| `LEGION_UPSTREAM_<KEY>` | The one `host:port` to dial for a declared upstream ([below](#connecting-to-services-the-connect-block)). |
+| `LEGION_UPSTREAM_HOST_<KEY>` | Its host part. |
+| `LEGION_UPSTREAM_PORT_<KEY>` | Its port part. |
 
 Labels are uppercased, with non-alphanumeric characters mapped to `_` (`http-2`
-becomes `HTTP_2`). Upstream service names follow the same rule (`user-db`
-becomes `LEGION_UPSTREAM_USER_DB`). A server binds its dynamic port with, for
+becomes `HTTP_2`). Upstream keys follow the same rule (`user-db` becomes
+`LEGION_UPSTREAM_USER_DB`). A server binds its dynamic port with, for
 example, `python3 -m http.server $LEGION_PORT_HTTP`.
 
 A task only receives endpoints for services it asked for. Its environment
@@ -127,16 +127,15 @@ cluster.
 
 > **External destinations, HTTP mode, and policy.** An upstream can also be
 > an external destination (`{ name = "openai", to = "https://api.openai.com" }`),
-> carry an `http` block (timeouts, budgeted retries, canary split by tag,
-> outlier ejection), and be governed by egress policy. All of this runs on the
-> same loopback forwarder and is documented in
-> [Network Handlers](network-handlers.md).
+> speak HTTP with an `http` block (timeouts, budgeted retries, canary split by
+> tag), and be governed by egress policy. All of this runs on the same node
+> forwarder and is documented in [Network Handlers](network-handlers.md).
 
 
 Discovery tells you where a service is. `connect` gets your task there. The
-task gets one fixed local address per upstream, and the worker load-balances
-every connection to that address across the service's healthy endpoints. You
-don't need a client library, a sidecar, DNS, or service-specific code.
+task gets one fixed address per upstream, and the worker load-balances every
+connection to that address across the service's healthy endpoints. You don't
+need a client library, a sidecar, DNS, or service-specific code.
 
 ```nickel
 {
@@ -145,40 +144,73 @@ don't need a client library, a sidecar, DNS, or service-specific code.
     config = { command = ["sh", "-c", "exec ./api"] },
     connect = {
         upstreams = [
-            { service = "db" },                             # dynamic local port
-            { service = "cache", localPort = 6379 },         # pinned local port
-            { service = "search", balance = "least_conn" },  # strategy override
+            { to = "db" },                              # a catalog service, L4
+            { to = "http://search", balance = "least_conn" },  # parsed as HTTP; strategy override
+            { to = "cache", port = 6379 },              # pinned port, also on 127.0.0.1:6379
         ],
     },
 }
 ```
 
-The task dials `$LEGION_UPSTREAM_DB` (say, `127.0.0.1:20003`), and the worker
-forwards that connection to one of `db`'s healthy endpoints:
+`to` names the upstream, and its scheme alone decides the protocol:
+
+| `to` | Destination | Protocol | Key |
+| --- | --- | --- | --- |
+| `db`, `tcp://db`, `db.svc.legion` | catalog service `db` | L4 | `name`, default `db` |
+| `http://search` | catalog service `search` | HTTP | `name`, default `search` |
+| `tcp://10.0.0.5:5432`, `tls://ledger.example:7000`, `http://intranet.example`, `https://api.openai.com` | an external destination | by scheme | `name`, required |
+
+A host that is a bare service name (letters, digits, `-`, `_`, with no dot and
+no port) or ends in `.svc.legion` is a catalog service. Anything else is an
+external destination and needs a scheme. A dotless external host is written
+with its port (`http://wiki:80`). Catalog services take `tcp` (the default)
+or `http`; they are reached over the mesh when they are on it, so `tls://` and
+`https://` name external destinations only.
+
+The task dials `$LEGION_UPSTREAM_DB`, and the worker forwards that connection
+to one of `db`'s healthy endpoints:
 
 ```sh
-psql "host=127.0.0.1 port=$LEGION_UPSTREAM_PORT_DB"
+psql "host=$LEGION_UPSTREAM_HOST_DB port=$LEGION_UPSTREAM_PORT_DB"
 curl "http://$LEGION_UPSTREAM_SEARCH/_search"
 ```
 
-Only `service` is required. `localPort` pins the loopback port for clients that
-can't read environment variables, such as a config file that wants a literal
-`127.0.0.1:6379`. Without it, the port is assigned at placement from the same
-per-node dynamic range (20000-32000) and used-port set as task ports. An
-upstream port can never collide with a host port on that node. `balance`
-overrides the strategy for that one upstream.
+**One address per upstream.** `LEGION_UPSTREAM_<KEY>` is what the task dials,
+and `LEGION_UPSTREAM_HOST_<KEY>` and `LEGION_UPSTREAM_PORT_<KEY>` are its parts.
+`{{ service "<key>" }}` in a [template](#templates-config-files-from-the-feed)
+renders the same address.
 
-Upstream ports are per allocation, like host ports. A `count = 3` client task
-gets three independent listeners on three distinct ports.
+| Node | `LEGION_UPSTREAM_DB` |
+| --- | --- |
+| Linux | `127.42.7.2:5432`: the upstream's VIP on its canonical port ([Name-is-config](network-handlers.md#name-is-config-keysvclegion)) |
+| macOS, or a node with no VIP block left | `127.0.0.1:20003`: a loopback port from the dynamic range |
+
+On Linux an upstream takes no port from the node's range: its VIP is unique to
+the allocation. `port` pins the canonical port and also binds
+`127.0.0.1:<port>`, for a client config that wants a literal loopback address
+such as `127.0.0.1:6379`. A sandbox's upstreams also get a loopback port,
+because the guest's relay is keyed by it. A loopback port never collides with
+a host port on that node. `balance` overrides the strategy for that one
+upstream.
+
+Upstream addresses are per allocation, like host ports. A `count = 3` client
+task gets three independent listeners.
+
+An `http` block (timeouts, budgeted retries, a split by tag) needs an upstream
+that speaks HTTP, and the scheme is what says so:
+
+```
+task api connect.upstreams entry 'db' to = "db" is reached over L4, but it has
+an http block. Hint: write to = "http://db" if it speaks HTTP
+```
 
 ### Balancing strategies
 
 | `balance` | Behavior |
 | --- | --- |
 | `least_latency` *(default)* | Latency-aware. Each pick compares two random endpoints and takes the one with the lower latency × (in-flight + 1). A slow-but-alive backend sheds traffic within a few requests, and gets it back once it recovers. |
-| `round_robin` | Hand out endpoints in order, wrapping around. Even spread, no state to warm up. |
-| `random` | Uniform random pick. Best when many clients share one backend set, since there are no cursors to fall into sync. |
-| `least_conn` | Fewest in-flight connections wins, and ties break round-robin. For long-lived or uneven connections. |
+| `round_robin` | Hand out endpoints in order, wrapping around. Even spread, no state to warm up. Each listener starts at a random point in the list, so many clients started together do not all send their first connection to the same endpoint. |
+| `least_conn` | Fewest in-flight connections wins, and ties break round-robin from a random start. Keeps connection counts even whatever the distance, which is what long-lived connections (database pools, gRPC channels, websockets) need: `least_latency` deliberately favors nearby endpoints, so it would pile them onto whichever replica answered first. |
 | `local_first` | Round-robin over the endpoints on the same node as the caller. Widens to every endpoint when none is local, so a caller never waits for a local backend that is not there. |
 
 Names are normalized before lookup (trimmed, lowercased, `-` mapped to `_`),
@@ -245,10 +277,11 @@ needs no proto change and no migration.
 
 ### How it works
 
-1. **Placement.** The manager assigns each upstream a loopback port and stores
-   it on the allocation next to its host ports.
+1. **Placement.** The manager assigns each upstream its address and stores it
+   on the allocation next to its host ports: a VIP and canonical port on
+   Linux, a loopback port elsewhere (and for a pinned `port`).
 2. **Listeners.** The worker runs one TCP listener per
-   `(allocation, upstream service)` bound on `127.0.0.1:<local port>`.
+   `(allocation, upstream)` on that address.
 3. **Endpoint feed.** On every heartbeat (the worker type's
    `heartbeatSeconds`, 2s by default), the manager sends the current endpoint set for each upstream this
    node's allocations declare. The set holds healthy endpoints only, already
@@ -320,9 +353,12 @@ and restrict callers with `requireIdentity`. See
 
 These are checked at submit, and by `legion job validate <spec>` before you submit:
 
-- Upstream `service` is non-empty, with no duplicate upstream services in one
+- Upstream `to` is a catalog service name or an external URL (see the table
+  above), an external one has a `name`, and no key is declared twice in one
   task.
-- `localPort` is greater than 0, with no duplicates and no collision with a
+- An `http` block, a body-reading handler, or credentials need an upstream
+  whose `to` speaks HTTP.
+- `port` is greater than 0, with no duplicates and no collision with a
   static port declared in the same task's `network.ports` (including one
   declared by the `service.port` number shorthand).
 - `balance` is a known strategy. The error lists the valid names.
@@ -342,7 +378,7 @@ starts and again on every heartbeat that changes the result:
 
 ```nickel
 connect = {
-    upstreams = [{ service = "db" }, { service = "api" }],
+    upstreams = [{ to = "db" }, { to = "api" }],
     templates = [
         {
             name = "backends",
@@ -397,10 +433,10 @@ arithmetic.
 
 ### Platform behavior
 
-Connect is plain userspace loopback TCP, so the loopback ports and
-`LEGION_UPSTREAM_*` addresses behave the same on macOS and Linux. Upstream
-names and VIPs (`LEGION_DNS`, `LEGION_UPSTREAM_HOST_*`,
-`LEGION_UPSTREAM_VIP_*`) are Linux-only. See [Platform notes](#platform-notes).
+Connect is plain userspace loopback TCP, so `LEGION_UPSTREAM_*` behaves the
+same on macOS and Linux: it is the address to dial on either. On Linux it is
+an upstream VIP, and the names (`LEGION_DNS`, `<key>.svc.legion`) come with
+it; on macOS it is a loopback port. See [Platform notes](#platform-notes).
 
 ## Querying: CLI and API
 
@@ -537,10 +573,10 @@ and no `SO_REUSEPORT`.
 
 Upstream names and VIPs need the whole `127.0.0.0/8` range routed to
 loopback. Linux does this by default, and macOS only has `127.0.0.1`. So on
-macOS an allocation gets no VIP block: no `LEGION_DNS`, no
-`LEGION_UPSTREAM_HOST_*` or `LEGION_UPSTREAM_VIP_*`, and `{{ service }}`
-renders `127.0.0.1:<local port>`. On Linux, if a node runs out of VIP blocks,
-the allocation still places and gets loopback ports only. macOS has no network-namespace isolation, so all tasks share
+macOS an allocation gets no VIP block: no `LEGION_DNS`, and
+`LEGION_UPSTREAM_<KEY>` and `{{ service }}` are `127.0.0.1:<local port>`. On
+Linux, if a node runs out of VIP blocks, the allocation still places and its
+upstreams get loopback ports instead. macOS has no network-namespace isolation, so all tasks share
 the host port space. Dynamic ports (both task ports and upstream ports) avoid
 collisions. Static ports are first come, first served per node.
 

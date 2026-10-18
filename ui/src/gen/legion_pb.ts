@@ -14346,9 +14346,11 @@ export class UpstreamEndpoints extends Message<UpstreamEndpoints> {
   allocationId = protoInt64.zero;
 
   /**
-   * Upstream service name, exactly as written in the task's
-   * `connect.upstreams[].service`. Echoed so the worker can match the list to
-   * one of its listeners without relying on ordering.
+   * The upstream's key: its `connect.upstreams[].name`, or the catalog
+   * service its `to` names when it has no name. This is how the node's
+   * listener is known, so the worker matches the list to one of its
+   * listeners without relying on ordering. For a `proxy` handler's feed
+   * (`for_handler`), the handler's service name.
    *
    * @generated from field: string service = 2;
    */
@@ -26312,9 +26314,11 @@ export class TaskAllocation extends Message<TaskAllocation> {
    * this allocation, matching the `AllocNetwork` shape. Workers use it to
    * inject `LEGION_PORT_*` / `LEGION_ADDR_*` environment variables into the
    * task, and — when the task declares upstreams — the `upstreams` array
-   * (`[{"service":"db","localPort":20003,"balance":"least_latency"}]`) carries
-   * the loopback ports the node-local forwarders listen on, surfaced to the
-   * task as `LEGION_UPSTREAM_*`.
+   * (`[{"key":"db","balance":"least_latency","vip":"127.42.7.2",
+   * "canonicalPort":5432}]`) carries each upstream's address: its VIP and
+   * canonical port, plus a `localPort` when it has a loopback port (a pinned
+   * `port`, a node with no VIP block, or a sandbox). The task sees one
+   * address per upstream as `LEGION_UPSTREAM_<KEY>`.
    *
    * Empty string when the task declares no network block and no upstreams.
    *
@@ -26324,13 +26328,13 @@ export class TaskAllocation extends Message<TaskAllocation> {
 
   /**
    * JSON-encoded `connect` block declared by the task, matching the
-   * `ConnectConfig` shape: `{"upstreams":[{"service":"db"},
-   * {"service":"cache","localPort":6379,"balance":"least_conn"}]}`.
+   * `ConnectConfig` shape: `{"upstreams":[{"to":"db"},
+   * {"to":"http://cache","port":6379,"balance":"least_conn"}]}`.
    *
-   * This is the *declared* form (which services the task dials and with which
-   * balancing strategy); the *assigned* loopback ports live in `network`
-   * alongside the task's host ports, because both come out of the same
-   * per-node port space. The worker starts one loopback TCP forwarder per
+   * This is the *declared* form (what the task dials, over which protocol,
+   * and with which balancing strategy); the *assigned* addresses live in
+   * `network` alongside the task's host ports, because loopback ports come
+   * out of the same per-node port space. The worker starts one forwarder per
    * upstream and load-balances new connections across that service's healthy
    * endpoints, which the manager refreshes every heartbeat in
    * `HeartbeatReply.upstream_endpoints`. An upstream that names no `balance`
@@ -31016,6 +31020,19 @@ export class UpsertNetPolicyReply extends Message<UpsertNetPolicyReply> {
    */
   affectedAllocations: string[] = [];
 
+  /**
+   * Advisory lines about what the policy would do to running work, one per
+   * affected task, populated on dry runs and on writes. Today: an upstream
+   * whose `to` does not speak HTTP (a bare service name, `tcp://`, or
+   * `tls://`) under an HTTP chain whose first rule for it needs a path,
+   * method, or header. A policy never changes how a stream is parsed, so
+   * such connections are refused at connect; the line names the task, the
+   * upstream, and the rule, and says how to fix it.
+   *
+   * @generated from field: repeated string warnings = 3;
+   */
+  warnings: string[] = [];
+
   constructor(data?: PartialMessage<UpsertNetPolicyReply>) {
     super();
     proto3.util.initPartial(data, this);
@@ -31026,6 +31043,7 @@ export class UpsertNetPolicyReply extends Message<UpsertNetPolicyReply> {
   static readonly fields: FieldList = proto3.util.newFieldList(() => [
     { no: 1, name: "policy", kind: "message", T: NetPolicy },
     { no: 2, name: "affected_allocations", kind: "scalar", T: 9 /* ScalarType.STRING */, repeated: true },
+    { no: 3, name: "warnings", kind: "scalar", T: 9 /* ScalarType.STRING */, repeated: true },
   ]);
 
   static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): UpsertNetPolicyReply {

@@ -55,8 +55,8 @@ legion net policy test agent --to https://api.github.com/user   # would this be 
 ## What the datapath does today
 
 Every connection a task makes through an upstream (`LEGION_UPSTREAM_<KEY>`,
-a loopback port the node owns) passes through the node's forwarder. The
-forwarder runs in one of two modes.
+an address the node owns) passes through the node's forwarder. The forwarder
+runs in one of two modes, and the upstream's `to` scheme alone decides which.
 
 **L4 (the default).** Before dialing, the forwarder evaluates the task's
 **effective egress policy** using what is known at connect time: the
@@ -80,9 +80,25 @@ that refuses `splice` (some sandboxed kernels) is detected once at first
 use, and every flow is then copied. The behavior is the same either way.
 Only the CPU cost differs.
 
-**HTTP mode.** An upstream is parsed as HTTP/1.1 when it declares HTTP (an
-`http://`/`https://` target, an `http` block, or a `dlp` handler), or when
-the effective egress policy is `protocol = "http"`. For each request:
+**A policy never changes how a stream is parsed.** A chain's `protocol =
+"http"` says which rules it may hold (path, method, header); it does not put
+an upstream in HTTP mode. Under an HTTP chain, an upstream whose `to` does not
+speak HTTP (`db`, `tcp://…`, `tls://…`) is judged with the connect-time facts.
+When the first rule that could match it needs the request head, the
+connection is refused, and the `net.denied` event names both:
+
+```
+net.denied  policy/prod-web#1  upstream 'db' is tcp://, and the first rule that
+could match it needs a path, method, or header. Hint: allow 'db' by host ahead
+of path rules, or write to = "http://db" if it speaks HTTP
+```
+
+`legion job validate`, `job plan`, and `job run` warn about such an upstream
+before it is placed, and `legion net policy apply --dry-run` warns about the
+running tasks a new policy would do it to.
+
+**HTTP mode.** An upstream is parsed as HTTP/1.1 when its `to` is `http://` or
+`https://`. For each request:
 
 1. The chain is evaluated with the request head (method, path, headers) in
    addition to the connect-time facts. A denial returns a `403`. Its body and
@@ -95,8 +111,8 @@ the effective egress policy is `protocol = "http"`. For each request:
    - `retries` on connect failures and 5xx, for idempotent methods only (by
      default), under a `budget` (default 20% of requests per minute)
    - a weighted `split` by service tag
-   - `outlier` ejection of an endpoint after `consecutive5xx` failures, for
-     `ejectFor`
+   - outlier ejection, which has no setting: an endpoint that answers 5xx five
+     times in a row is skipped for 30 seconds, whatever the balancer
 4. Upstream connections are pooled per listener and reused across
    requests, so a task's calls pay the TCP, TLS, and mesh handshakes once
    rather than per request. TLS is opened for `https://`, and the `Host`
@@ -301,21 +317,24 @@ stored policy and no task that declares one pays nothing extra per heartbeat.
 
 ## Upstreams
 
-Each `connect.upstreams` entry is either a catalog **service** or an
-**external destination**:
+Each `connect.upstreams` entry names its destination with `to`: a catalog
+**service** by its bare name, or an **external destination** by URL
+([Service Discovery](service-discovery.md#connecting-to-services-the-connect-block)
+has the full rule):
 
 ```nickel
 connect = {
     upstreams = [
-        { service = "db" },                                   # as before
+        { to = "db" },                                       # a catalog service, L4
+        { to = "http://search" },                            # a catalog service, HTTP
         { name = "openai", to = "https://api.openai.com" },  # external
     ],
 },
 ```
 
 An external upstream has a `name` and a `to`. The task gets
-`LEGION_UPSTREAM_<NAME>` (`127.0.0.1:<port>`), the same as for a service
-upstream. The scheme of `to` decides two things:
+`LEGION_UPSTREAM_<NAME>`, the same as for a service upstream. The scheme of
+`to` decides two things:
 
 | `to` | Legion originates TLS | HTTP framing |
 | --- | --- | --- |
@@ -324,7 +343,10 @@ upstream. The scheme of `to` decides two things:
 | `http://host[:port]` | no | yes |
 | `https://host[:port]` | yes | yes |
 
-With `https://`, the task speaks **plaintext HTTP to loopback**, and the
+A dotless external host carries its port (`http://wiki:80`); without one, a
+bare name is a catalog service.
+
+With `https://`, the task speaks **plaintext HTTP to its upstream address**, and the
 node's forwarder dials the destination over TLS (verified against the Mozilla
 roots). This lets policy and handlers see an LLM API call's body **without
 intercepting anyone's TLS**. Point the client at the upstream:
@@ -336,8 +358,8 @@ export OPENAI_BASE_URL="http://$LEGION_UPSTREAM_OPENAI/v1"
 Legion never holds a certificate authority that can impersonate the public
 internet. `to` must not include a path or query. The task chooses paths.
 
-The `http` block on an upstream (`timeout`, `retries`, `split`, `outlier`)
-turns on HTTP mode with traffic management. Per-upstream `handlers` run
+The `http` block on an upstream (`timeout`, `retries`, `split`) adds traffic
+management to an upstream that speaks HTTP. Per-upstream `handlers` run
 there too. See [What the datapath does today](#what-the-datapath-does-today).
 
 ### Credential injection
@@ -548,20 +570,28 @@ to its macOS ones. In that block:
   because the rule needs the address.
 - **`.2` onward are the upstream VIPs**, one per `connect.upstreams` entry in
   declaration order. Each listens on the upstream's **canonical port**,
-  which is the first of these that applies: a pinned `localPort`, the port
-  the service declared on its own task (`network.ports[].to`, or its static
-  port), an external target's port, or the dynamic loopback port.
+  which is the first of these that applies: a pinned `port`, the port the
+  service declared on its own task (`network.ports[].to`, or its static
+  port), an external target's port, or a port from the dynamic range.
   `db.svc.legion:5432` works because the `db` service declared 5432.
 
-Both addresses reach the same listener, so policy, HTTP mode, and endpoints
-behave the same whichever one the task dials. The loopback port and
-`LEGION_UPSTREAM_<KEY>` still work. The name is an addition.
+The VIP is the upstream's address: `LEGION_UPSTREAM_<KEY>` is
+`<vip>:<canonical port>`, and the upstream takes no port from the node's
+dynamic range. A pinned `port` also binds `127.0.0.1:<port>` (the same
+listener), for a config file that wants a literal loopback address. A
+sandbox's upstreams keep a loopback port too, because the guest's relay is
+keyed by it.
 
 | Env var | Value |
 | --- | --- |
 | `LEGION_DNS` | `127.42.<b>.1`, the allocation's resolver (`127.0.0.53` for a gated allocation with no upstreams) |
-| `LEGION_UPSTREAM_HOST_<KEY>` | `<key>.svc.legion` |
-| `LEGION_UPSTREAM_VIP_<KEY>` | `<vip>:<canonical port>` |
+| `LEGION_UPSTREAM_<KEY>` | `<vip>:<canonical port>` |
+| `LEGION_UPSTREAM_HOST_<KEY>` | `<vip>` |
+| `LEGION_UPSTREAM_PORT_<KEY>` | `<canonical port>` |
+
+The variables carry the address rather than the name because an `exec` task
+keeps the host's `/etc/resolv.conf` (below), where `<key>.svc.legion` does
+not resolve.
 
 **Who gets the resolver automatically.** Every allocation with upstreams,
 and every gated `container` or `exec` allocation, upstreams or not. A gated
@@ -588,8 +618,9 @@ A node whose `resolv.conf` names no nameserver answers every name outside
 starts. No query goes to a public resolver the operator did not name.
 
 **macOS** configures only `127.0.0.1` on `lo0`, so no VIP block is assigned
-there. Upstreams keep their loopback ports and env vars, and there is no
-per-allocation resolver.
+there. Each upstream gets a loopback port from the dynamic range, which is
+what `LEGION_UPSTREAM_<KEY>` names, and there is no per-allocation resolver.
+The same applies on a Linux node that has run out of VIP blocks.
 
 ## Handlers
 
@@ -1088,12 +1119,14 @@ allocation's policy is pending. Names work too. The
 resolver on vsock port 53 answers `<key>.svc.legion` with the upstream's
 VIP, and the agent also listens on `<vip>:<canonical port>` in the guest
 (the guest's `lo` holds all of 127/8), relaying to the same vsock port.
-`LEGION_UPSTREAM_VIP_<KEY>` and `LEGION_UPSTREAM_HOST_<KEY>` are set as for
-a container.
+In the guest, `LEGION_UPSTREAM_<KEY>` is the guest-side loopback address the
+agent relays, `127.0.0.1:<port>`, with `LEGION_UPSTREAM_HOST_<KEY>` and
+`LEGION_UPSTREAM_PORT_<KEY>` as its parts, and the VIP name works as for a
+container.
 
 ```nickel
 connect = {
-    upstreams = [{ service = "db" }],
+    upstreams = [{ to = "db" }],
 },
 network = { mode = "gated" },
 ```
@@ -1146,8 +1179,8 @@ What is and is not enforced:
   a gated sandbox guest 127.0.0.1:1080 is the guest agent's egress proxy`)
   or on 1100 (`... but in a gated sandbox guest the node serves each port on
   the guest vsock port of the same number, and vsock port 1100 is the guest
-  agent's exec listener`), and an upstream `localPort` of 1080 or 53 (`task
-  "workspace" connect.upstreams entry "db" sets localPort 53, but a gated
+  agent's exec listener`), and an upstream `port` of 1080 or 53 (`task
+  "workspace" connect.upstreams entry "db" sets port 53, but a gated
   sandbox's upstreams are relayed to the node on vsock ports of the same
   number, and 1080 and 53 are the guest's egress proxy and resolver`).
   Dynamic ports never collide with any of them.

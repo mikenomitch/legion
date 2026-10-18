@@ -13545,8 +13545,9 @@ impl Store {
         // A gated container or exec task gets a namespace resolver and
         // ingress listeners whatever it declares (plan §6.12). A gated
         // sandbox is reached over vsock instead, so it gets neither here.
-        let gated_namespace =
-            gated && self.task_runtime(tx, task_id)?.as_deref() != Some("sandbox");
+        let runtime = self.task_runtime(tx, task_id)?;
+        let sandbox = runtime.as_deref() == Some("sandbox");
+        let gated_namespace = gated && !sandbox;
         if !has_ports && !has_upstreams {
             // No ports and no upstreams: the row carries a network only when
             // a mode other than `host` applies (the task asked for `gated`,
@@ -13588,7 +13589,7 @@ impl Store {
                 existing
                     .upstreams
                     .iter()
-                    .map(|upstream| upstream.local_port),
+                    .filter_map(|upstream| upstream.local_port),
             );
             if let Some(block) = existing.vip_block.as_ref() {
                 used_blocks.insert(block.clone());
@@ -13614,8 +13615,11 @@ impl Store {
                     if upstream.is_external() {
                         continue;
                     }
-                    if let Some(port) = self.declared_service_port(tx, &upstream.service)? {
-                        service_ports.insert(upstream.key().to_string(), port);
+                    let Some(service) = upstream.service() else {
+                        continue;
+                    };
+                    if let Some(port) = self.declared_service_port(tx, &service)? {
+                        service_ports.insert(upstream.key(), port);
                     }
                 }
             }
@@ -13639,6 +13643,9 @@ impl Store {
             // gets an ingress listener, chain or not (plan §6.12).
             has_ingress || gated_namespace,
             gated_namespace,
+            // A sandbox's upstreams are relayed over vsock ports keyed by a
+            // loopback port number, so each keeps one.
+            sandbox,
         )
         .with_context(|| format!("failed to assign ports on node {node_id}"))?;
         let address = tx
@@ -31438,8 +31445,8 @@ mod tests {
         let task = connect_task(
             "api",
             json!([
-                { "service": "db" },
-                { "service": "cache", "localPort": 6379, "balance": "least_conn" },
+                { "to": "db" },
+                { "to": "cache", "port": 6379, "balance": "least_conn" },
             ]),
         );
         submit_service_job(&store, "svc-connect-roundtrip", vec![task])?;
@@ -31449,9 +31456,9 @@ mod tests {
         let (_, stored) = tasks.first().context("missing stored task")?;
         let connect = stored.connect.as_ref().context("connect not persisted")?;
         assert_eq!(connect.upstreams.len(), 2);
-        assert_eq!(connect.upstreams[0].service, "db");
-        assert_eq!(connect.upstreams[0].local_port, None);
-        assert_eq!(connect.upstreams[1].local_port, Some(6379));
+        assert_eq!(connect.upstreams[0].service().as_deref(), Some("db"));
+        assert_eq!(connect.upstreams[0].port, None);
+        assert_eq!(connect.upstreams[1].port, Some(6379));
         assert_eq!(connect.upstreams[1].balance.as_deref(), Some("least_conn"));
         Ok(())
     }
@@ -31460,7 +31467,7 @@ mod tests {
     fn upstream_assignment_gives_distinct_local_ports_per_allocation() -> R<()> {
         let store = setup_store()?;
         store.insert_node(make_node_msg("node-a", "ready"))?;
-        let mut task = connect_task("api", json!([{ "service": "db" }]));
+        let mut task = connect_task("api", json!([{ "to": "db" }]));
         task.network = Some(crate::structs::NetworkConfig {
             ports: vec![crate::structs::PortConfig {
                 name: "http".into(),
@@ -31480,7 +31487,7 @@ mod tests {
                 .network
                 .as_ref()
                 .and_then(|network| network.upstream("db"))
-                .map(|upstream| upstream.local_port)
+                .and_then(|upstream| upstream.local_port)
                 .context("alloc missing db upstream")
         };
         let first_local = local_port(&first)?;
@@ -31534,7 +31541,7 @@ mod tests {
         store.insert_node(node("linux-node", Some("linux")))?;
         store.insert_node(node("mac-node", Some("macos")))?;
         store.insert_node(node("bare-node", None))?;
-        let task = connect_task("api", json!([{ "service": "db" }]));
+        let task = connect_task("api", json!([{ "to": "db" }]));
         submit_service_job(&store, "svc-vip-os", vec![task])?;
         let task_id = task_id_for(&store, "api", "svc-vip-os")?;
 
@@ -31555,7 +31562,7 @@ mod tests {
     fn upstream_static_local_port_conflict_fails_placement() -> R<()> {
         let store = setup_store()?;
         store.insert_node(make_node_msg("node-a", "ready"))?;
-        let task = connect_task("api", json!([{ "service": "cache", "localPort": 6379 }]));
+        let task = connect_task("api", json!([{ "to": "cache", "port": 6379 }]));
         submit_service_job(&store, "svc-upstream-static", vec![task])?;
         let task_id = task_id_for(&store, "api", "svc-upstream-static")?;
 
@@ -31565,7 +31572,7 @@ mod tests {
                 .network
                 .as_ref()
                 .and_then(|network| network.upstream("cache"))
-                .map(|upstream| upstream.local_port),
+                .and_then(|upstream| upstream.local_port),
             Some(6379)
         );
 
@@ -31622,7 +31629,7 @@ mod tests {
         submit_service_job(
             &store,
             "svc-connect-added",
-            vec![connect_task("api", json!([{ "service": "db" }]))],
+            vec![connect_task("api", json!([{ "to": "db" }]))],
         )?;
         let v2_id = store.get_job_config("svc-connect-added")?.id();
         assert_ne!(v1_id, v2_id);
@@ -31639,7 +31646,7 @@ mod tests {
             .as_ref()
             .and_then(|network| network.upstream("db"))
             .context("fresh allocation missing db upstream")?;
-        assert!(upstream.local_port >= crate::structs::DYNAMIC_PORT_MIN);
+        assert!(upstream.local_port >= Some(crate::structs::DYNAMIC_PORT_MIN));
         assert_eq!(upstream.balance, crate::structs::DEFAULT_BALANCE);
 
         // Changing an existing connect block is equally disqualifying, while
@@ -31649,14 +31656,14 @@ mod tests {
             "svc-connect-added",
             vec![connect_task(
                 "api",
-                json!([{ "service": "db", "balance": "random" }]),
+                json!([{ "to": "db", "balance": "random" }]),
             )],
         )?;
         let v3_id = store.get_job_config("svc-connect-added")?.id();
         assert!(!store.job_configs_schedule_equivalent(&v2_id, &v3_id)?);
 
         let mut unchanged_connect =
-            connect_task("api", json!([{ "service": "db", "balance": "random" }]));
+            connect_task("api", json!([{ "to": "db", "balance": "random" }]));
         unchanged_connect.config = json!({ "changed": true });
         submit_service_job(&store, "svc-connect-added", vec![unchanged_connect])?;
         let v4_id = store.get_job_config("svc-connect-added")?.id();

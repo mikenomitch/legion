@@ -207,7 +207,7 @@ pub(crate) fn boot_guest_upstreams(
             network
                 .upstreams
                 .iter()
-                .map(|upstream| (upstream.service.clone(), upstream.local_port))
+                .filter_map(|upstream| Some((upstream.key.clone(), upstream.local_port?)))
                 .collect()
         })
         .unwrap_or_default()
@@ -2116,8 +2116,8 @@ mod tests {
                 { "name": "admin", "hostPort": 30002, "privatePort": 9000 },
             ],
             "upstreams": [
-                { "service": "db", "localPort": 30003, "balance": "least_conn" },
-                { "service": "cache", "localPort": 30004, "balance": "least_conn" },
+                { "key": "db", "localPort": 30003, "balance": "least_conn" },
+                { "key": "cache", "localPort": 30004, "balance": "least_conn" },
             ],
         }))
         .unwrap();

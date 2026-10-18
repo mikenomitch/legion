@@ -263,44 +263,48 @@
                 # control-plane + forwarder, not cryptographic identity.
                 allow = ["gateway", "maximal-demo"],
             },
-            # Services this task dials, each via a node-local loopback
-            # forwarder that load-balances across the upstream's healthy
-            # endpoints. The task reads $LEGION_UPSTREAM_<SERVICE>
-            # ("127.0.0.1:<port>") and $LEGION_UPSTREAM_PORT_<SERVICE>.
-            # The named service need not exist yet.
+            # Services this task dials, each through the node's forwarder,
+            # which load-balances across the upstream's healthy endpoints.
+            # `to` names the upstream and its scheme alone decides the
+            # protocol: a bare service name (or tcp://name) is L4,
+            # http://name parses HTTP; a URL with a dotted host (or a port)
+            # is an external destination. The task reads one address per
+            # upstream: $LEGION_UPSTREAM_<KEY> (the VIP on Linux, a loopback
+            # port elsewhere) and its _HOST_ and _PORT_ parts. The named
+            # service need not exist yet.
             connect = {
                 upstreams = [
-                    # Minimal form: loopback port assigned at placement out of
-                    # the same per-node range as host ports.
-                    { service = "db" },
-                    # Pin the loopback port for clients that cannot read env
-                    # vars. Must not collide with a static port above.
-                    { service = "cache", localPort = 6379 },
+                    # Minimal form: a catalog service over L4.
+                    { to = "db" },
+                    # Pin the port: the VIP listens on it and 127.0.0.1:6379
+                    # is bound too, for clients that need a literal loopback
+                    # address. Must not collide with a static port above.
+                    { to = "cache", port = 6379 },
                     # Strategy override: least_latency (default; two random
                     # picks, the lower latency x load wins) | round_robin |
-                    # random | least_conn | local_first (same-node endpoints
-                    # first, widening when none is healthy locally).
-                    { service = "search", balance = "least_conn" },
-                    # HTTP framing and traffic management on a service
-                    # upstream (docs/network-handlers.md): a per-request
-                    # deadline, bounded retries (idempotent methods only by
-                    # default), a canary split by service tag, and outlier
-                    # ejection.
+                    # least_conn (even connection counts, for long-lived
+                    # connections) | local_first (same-node endpoints first,
+                    # widening when none is healthy locally).
+                    { to = "search", balance = "least_conn" },
+                    # An HTTP service upstream (docs/network-handlers.md):
+                    # a per-request deadline, bounded retries (idempotent
+                    # methods only by default), and a canary split by service
+                    # tag. An endpoint that answers 5xx five times in a row is
+                    # ejected for 30s, with no setting.
                     {
-                        service = "api",
+                        to = "http://api",
                         http = {
                             timeout = "3s",
                             retries = { attempts = 2, on = ["5xx", "connect-failure"], budget = "20%" },
                             split = [{ tag = "canary", weight = 10 }],
-                            outlier = { consecutive5xx = 5, ejectFor = "30s" },
                         },
                     },
-                    # An external upstream: `name` + `to` instead of a
-                    # service. The task gets $LEGION_UPSTREAM_OPENAI on
-                    # loopback and speaks plaintext; Legion originates TLS
-                    # (https / tls schemes), so the body is visible to
-                    # handlers without intercepting anyone's TLS. The scheme
-                    # also decides HTTP framing (http / https).
+                    # An external upstream: a URL plus a `name`. The task
+                    # dials $LEGION_UPSTREAM_OPENAI and speaks plaintext;
+                    # Legion originates TLS (https / tls schemes), so the
+                    # body is visible to handlers without intercepting
+                    # anyone's TLS. The scheme also decides HTTP framing
+                    # (http / https).
                     {
                         name = "openai",
                         to = "https://api.openai.com",
@@ -1062,7 +1066,7 @@
             # localPort of 1080 or 53 here (the agent's proxy and resolver).
             # A sandbox that is not gated cannot reach its upstreams.
             connect = {
-                upstreams = [{ service = "api" }],
+                upstreams = [{ to = "api" }],
             },
             network = {
                 mode = "gated",

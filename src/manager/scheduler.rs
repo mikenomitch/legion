@@ -1032,11 +1032,12 @@ fn allocation_host_ports(allocation: &Allocation) -> impl Iterator<Item = u16> +
         .iter()
         .filter(move |_| holds)
         .flat_map(|network| {
-            network
-                .ports
-                .iter()
-                .map(|port| port.host_port)
-                .chain(network.upstreams.iter().map(|upstream| upstream.local_port))
+            network.ports.iter().map(|port| port.host_port).chain(
+                network
+                    .upstreams
+                    .iter()
+                    .filter_map(|upstream| upstream.local_port),
+            )
         })
 }
 
@@ -1052,7 +1053,7 @@ fn task_static_ports(task: &TaskConfig) -> Vec<u16> {
             connect
                 .upstreams
                 .iter()
-                .filter_map(|upstream| upstream.local_port)
+                .filter_map(|upstream| upstream.port)
         }))
         .collect();
     ports.sort_unstable();

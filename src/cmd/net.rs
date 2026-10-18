@@ -823,6 +823,7 @@ async fn apply(matches: &ArgMatches) -> R<()> {
             "dryRun": dry_run,
             "policy": policy_json(&policy),
             "affectedAllocations": reply.affected_allocations,
+            "warnings": reply.warnings,
         }));
         return Ok(());
     }
@@ -846,6 +847,9 @@ async fn apply(matches: &ArgMatches) -> R<()> {
         for entry in &reply.affected_allocations {
             println!("  {entry}");
         }
+    }
+    for warning in &reply.warnings {
+        println!("warning: {warning}");
     }
     Ok(())
 }

@@ -80,7 +80,12 @@ pub struct UpstreamSpec {
     /// The upstream key: a catalog service name, or the `name` of an external
     /// upstream (whose destination is `to`).
     pub service: String,
-    pub local_port: u16,
+    /// The loopback port the listener binds, when the upstream has one; the
+    /// VIP is the only address otherwise.
+    pub local_port: Option<u16>,
+    /// Whether the upstream's `to` speaks HTTP (`http://`, `https://`): the
+    /// only thing that puts the listener in HTTP mode.
+    pub http_protocol: bool,
     pub balance: String,
     /// External destination URL (`tcp://`, `tls://`, `http://`, `https://`);
     /// `None` for a catalog service, which is dialed from the endpoint feed.
@@ -111,16 +116,27 @@ impl UpstreamSpec {
         (self.allocation_id, self.service.clone())
     }
 
-    /// Where the upstream's loopback listener binds.
-    pub fn listen(&self) -> ListenAddr {
-        let loopback = UPSTREAM_LOOPBACK_ADDR
-            .parse()
-            .expect("the upstream loopback address parses");
-        self.attachment.listen(loopback, self.local_port)
+    /// Where the upstream's primary listener binds: its loopback port when it
+    /// has one, else its VIP. `None` when it has neither the node can serve.
+    pub fn listen(&self) -> Option<ListenAddr> {
+        match self.local_port {
+            Some(port) => {
+                let loopback = UPSTREAM_LOOPBACK_ADDR
+                    .parse()
+                    .expect("the upstream loopback address parses");
+                Some(self.attachment.listen(loopback, port))
+            }
+            None => self.vip_addr(),
+        }
     }
 
-    /// Where its VIP listener binds, when it has one the node serves.
+    /// Where its second, VIP listener binds: only when the loopback port is
+    /// the primary one and the node serves the VIP.
     fn vip_listen(&self) -> Option<ListenAddr> {
+        self.local_port.and(self.vip_addr())
+    }
+
+    fn vip_addr(&self) -> Option<ListenAddr> {
         let (Some(vip), Some(port)) = (self.vip.as_deref(), self.canonical_port) else {
             return None;
         };
@@ -150,6 +166,8 @@ struct UpstreamShared {
     context: Arc<ForwarderContext>,
     /// The upstream's `http` block, handlers, and credentials, as declared.
     http_config: Option<UpstreamHttpConfig>,
+    /// Whether `to` speaks HTTP.
+    http_protocol: bool,
     handlers: Vec<HopConfig>,
     credentials: Vec<UpstreamCredential>,
     /// The egress chain's hops plus this upstream's, compiled per policy body.
@@ -1082,6 +1100,7 @@ impl UpstreamShared {
             target,
             context,
             http_config: spec.http.clone(),
+            http_protocol: spec.http_protocol,
             handlers: spec.handlers.clone(),
             credentials: spec.credentials.clone(),
             pipelines: PipelineCache::default(),
@@ -1090,27 +1109,23 @@ impl UpstreamShared {
         }
     }
 
-    /// Whether this upstream declares HTTP itself (an `http` block, an
-    /// `http://`/`https://` target, handlers that need bodies, or
-    /// credentials, which need a request head to go in: an upstream with
-    /// credentials is never spliced).
+    /// Whether this upstream speaks HTTP: its `to` scheme says so. Submit
+    /// refuses an `http` block, credentials, or a body-reading handler on an
+    /// upstream that does not, so those never turn HTTP mode on by
+    /// themselves; they are checked here too for a spec written by hand.
     fn declares_http(&self) -> bool {
-        self.http_config.is_some()
-            || !self.credentials.is_empty()
+        self.http_protocol
             || self.target.as_ref().is_some_and(|t| t.http)
+            || !self.credentials.is_empty()
             || self.handlers.iter().any(|h| h.kind.entry().needs_http())
     }
 
     /// HTTP-mode settings when this connection must be parsed: the upstream
-    /// declares HTTP, or the allocation's effective egress policy is an HTTP
-    /// chain. `None` means splice bytes.
+    /// speaks HTTP. A policy never changes how a stream is parsed: an HTTP
+    /// chain over a `tcp` upstream is judged with connect-time facts (see
+    /// [`deny_if_policy_says_so`]). `None` means splice bytes.
     fn http_settings(self: &Arc<Self>) -> Option<Arc<HttpSettings>> {
-        let policy_http = self
-            .context
-            .policy_for(self.allocation_id)
-            .and_then(|p| p.egress.as_ref().map(|c| c.is_http()))
-            .unwrap_or(false);
-        if !(self.declares_http() || policy_http) {
+        if !self.declares_http() {
             return None;
         }
         Some(
@@ -1371,7 +1386,14 @@ impl UpstreamForwarder {
 
     async fn start_listener(&self, spec: UpstreamSpec, shared: Arc<UpstreamShared>) {
         let key = spec.key();
-        let listen = spec.listen();
+        let Some(listen) = spec.listen() else {
+            warn!(
+                allocation_id = spec.allocation_id,
+                service = %spec.service,
+                "Upstream has neither a loopback port nor a VIP this node serves; not binding"
+            );
+            return;
+        };
         let bound = listen.bind().await.map(|socket| {
             debug!(
                 allocation_id = spec.allocation_id,
@@ -1408,14 +1430,14 @@ impl UpstreamForwarder {
                     debug!(
                         allocation_id = spec.allocation_id,
                         service = %spec.service,
-                        local_port = spec.local_port,
+                        listen = %listen,
                         "Upstream forwarder port still unavailable"
                     );
                 } else {
                     warn!(
                         allocation_id = spec.allocation_id,
                         service = %spec.service,
-                        local_port = spec.local_port,
+                        listen = %listen,
                         error = ?err,
                         "Failed to bind upstream forwarder port; retrying on the next heartbeat"
                     );
@@ -1917,6 +1939,25 @@ async fn deny_if_policy_says_so(
         Some((source, reason)) => Verdict::Deny { source, reason },
         None => egress_connect_verdict(policy.as_deref(), facts),
     };
+    // An HTTP chain over an upstream that does not speak HTTP: a rule that
+    // needs the request head cannot be decided, so the connection fails
+    // closed, naming the rule and the upstream.
+    let verdict = match verdict {
+        Verdict::Defer => Verdict::Deny {
+            source: policy
+                .as_ref()
+                .and_then(|p| p.egress.as_ref())
+                .and_then(|chain| crate::structs::netpolicy::deferring_rule(chain, facts))
+                .unwrap_or_else(|| "policy".to_string()),
+            reason: Some(format!(
+                "upstream '{}' is tcp://, and the first rule that could match it needs a path, \
+                 method, or header. Hint: allow '{}' by host ahead of path rules, or write \
+                 to = \"http://{}\" if it speaks HTTP",
+                shared.service, shared.service, shared.service
+            )),
+        },
+        other => other,
+    };
     match verdict {
         Verdict::Allow | Verdict::Defer => false,
         Verdict::Deny { source, reason } => {
@@ -2200,7 +2241,8 @@ mod tests {
         UpstreamSpec {
             allocation_id: 7,
             service: "db".into(),
-            local_port: port,
+            local_port: Some(port),
+            http_protocol: false,
             balance: balance.into(),
             to: None,
             http: None,
@@ -2361,13 +2403,17 @@ mod tests {
         forwarder.set_endpoints(7, "db", vec![endpoint(&first), endpoint(&second)]);
 
         // Sequential connections, so each pick happens before the next dial:
-        // round robin must hand them out in order and then wrap.
+        // round robin must hand them out in order and then wrap. Where it
+        // starts is random per listener.
         let mut tags = Vec::new();
         for _ in 0..3 {
             let mut client = connect(port).await;
             tags.push(served_by(&mut client).await);
         }
-        assert_eq!(tags, vec!["a", "b", "a"]);
+        assert!(
+            tags == vec!["a", "b", "a"] || tags == vec!["b", "a", "b"],
+            "{tags:?}"
+        );
     }
 
     #[tokio::test]
@@ -2434,8 +2480,8 @@ mod tests {
         vsock.attachment = Attachment::GuestVsock {
             scratch: scratch.clone(),
         };
-        let path = scratch.join(format!("vsock.sock_{}", vsock.local_port));
-        assert_eq!(vsock.listen(), ListenAddr::Unix(path.clone()));
+        let path = scratch.join(format!("vsock.sock_{}", vsock.local_port.unwrap()));
+        assert_eq!(vsock.listen(), Some(ListenAddr::Unix(path.clone())));
         std::fs::create_dir_all(&scratch).unwrap();
         std::fs::write(&path, b"stale").unwrap();
         let live = spawn_echo("a").await;
@@ -2449,7 +2495,7 @@ mod tests {
         assert_eq!(forwarder.active(), vec![vsock.clone()]);
         forwarder.set_endpoints(7, "db", vec![endpoint(&live)]);
         assert!(
-            TcpListener::bind(("127.0.0.1", vsock.local_port))
+            TcpListener::bind(("127.0.0.1", vsock.local_port.unwrap()))
                 .await
                 .is_ok(),
             "a vsock upstream must not hold the node's loopback port"
@@ -2491,6 +2537,68 @@ mod tests {
 
         forwarder.sync(&[]).await;
         assert!(forwarder.active().is_empty());
+    }
+
+    /// An HTTP `require` chain over a `tcp` upstream: a host rule allows it
+    /// at connect and the bytes are spliced untouched (the endpoint speaks
+    /// first, like a Postgres greeting); a chain whose first rule for it
+    /// needs a path refuses it, naming the rule and the upstream. A policy
+    /// never makes the forwarder parse a `tcp` upstream as HTTP.
+    #[tokio::test]
+    async fn an_http_chain_never_parses_a_tcp_upstream_test() {
+        use crate::structs::netpolicy::{merge_policies, InlinePolicy, NetPolicyObject};
+        use crate::structs::AllocNetPolicy;
+
+        let greeting = spawn_echo("p").await;
+        let cache = Arc::new(crate::worker::netd::NetPolicyCache::new());
+        let denials = Arc::new(Denials::new());
+        let set_policy = |egress: serde_json::Value| {
+            let mut object: NetPolicyObject = serde_json::from_value(serde_json::json!({
+                "name": "web", "enforcement": "require", "egress": egress
+            }))
+            .unwrap();
+            object.normalize_and_validate().unwrap();
+            let body = merge_policies(&[object], InlinePolicy::default());
+            cache.apply_assignments(&[AllocNetPolicy {
+                allocation_id: 7,
+                policy_hash: body.hash.clone(),
+            }]);
+            cache.insert_body(&body.hash.clone(), body).unwrap();
+        };
+        set_policy(
+            serde_json::json!({ "protocol": "http", "allow": ["db", "api.github.com/repos/**"] }),
+        );
+        let forwarder = UpstreamForwarder::with_context(Arc::new(ForwarderContext::new(
+            cache.clone(),
+            denials.clone(),
+        )));
+        let port = free_port().await;
+        forwarder.sync(&[spec(port, "round_robin")]).await;
+        forwarder.set_endpoints(7, "db", vec![endpoint(&greeting)]);
+
+        let mut client = connect(port).await;
+        assert_eq!(served_by(&mut client).await, "p", "spliced, not parsed");
+
+        set_policy(serde_json::json!({
+            "protocol": "http", "policy": "deny",
+            "rules": [{ "when": { "path": "/x/**" }, "action": "allow" }]
+        }));
+        let mut client = connect(port).await;
+        let mut buf = [0u8; 1];
+        let read = tokio::time::timeout(TEST_TIMEOUT, client.read(&mut buf))
+            .await
+            .expect("an undecidable verdict must close the connection promptly");
+        assert_eq!(read.expect("read from forwarder"), 0);
+        let drained = denials.drain();
+        let denial = drained
+            .iter()
+            .find(|d| d.source == "policy/web#0")
+            .unwrap_or_else(|| panic!("{drained:?}"));
+        assert!(
+            denial.reason.contains("upstream 'db' is tcp://"),
+            "{}",
+            denial.reason
+        );
     }
 
     #[tokio::test]
@@ -2552,24 +2660,29 @@ mod tests {
         forwarder.sync(&[spec(port, "least_conn")]).await;
         forwarder.set_endpoints(7, "db", vec![endpoint(&first), endpoint(&second)]);
 
-        // Both endpoints idle: the tie breaks round robin onto the first.
+        // Both endpoints idle: the tie breaks round robin, from a random start.
         let mut held = connect(port).await;
-        assert_eq!(served_by(&mut held).await, "a");
+        let held_by = served_by(&mut held).await;
+        let (held_addr, other) = if held_by == "a" {
+            (first.clone(), "b")
+        } else {
+            (second.clone(), "a")
+        };
         assert_eq!(
-            forwarder.inflight(7, "db").get(&first).copied(),
+            forwarder.inflight(7, "db").get(&held_addr).copied(),
             Some(1),
             "a live connection must count against its endpoint"
         );
 
         // `held` is still open, so the next connection must avoid that endpoint.
         let mut next = connect(port).await;
-        assert_eq!(served_by(&mut next).await, "b");
+        assert_eq!(served_by(&mut next).await, other);
 
         // Closing a connection releases its slot again.
         drop(held);
         wait_until(
             "the closed connection to release its in-flight slot",
-            || !forwarder.inflight(7, "db").contains_key(&first),
+            || !forwarder.inflight(7, "db").contains_key(&held_addr),
         )
         .await;
     }
