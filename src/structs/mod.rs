@@ -14,6 +14,7 @@ pub mod edge_boot;
 pub mod eval;
 pub mod exec_ticket;
 pub mod fork;
+pub mod hops;
 pub mod host_guard;
 pub mod instance;
 pub mod job;

@@ -34,13 +34,13 @@
 //! Choosing *which* endpoint a connection goes to is [`crate::worker::balance`].
 
 use crate::prelude::*;
-use crate::structs::netpolicy::HandlerConfig;
+use crate::structs::hops::HopConfig;
 use crate::structs::netpolicy::{ConnectFacts, Verdict, PROTOCOL_TCP};
 use crate::structs::{parse_upstream_target, UpstreamTarget, UPSTREAM_LOOPBACK_ADDR};
 use crate::structs::{UpstreamCredential, UpstreamHttpConfig};
 use crate::worker::balance::{balancer, default_balancer, Balancer, Endpoint, Outcome};
 use crate::worker::netd::attach::Attachment;
-use crate::worker::netd::handlers::{self, HopFacts, HopOutcome, ProxyTarget};
+use crate::worker::netd::handlers::{self, HopFacts, HopOutcome, PipelineCache, ProxyTarget};
 use crate::worker::netd::http::HttpSettings;
 use crate::worker::netd::listen::{self, dial_tcp, spawn_accept_loop, ListenAddr};
 use crate::worker::netd::policy::{egress_connect_verdict, AllocIdentity};
@@ -88,7 +88,7 @@ pub struct UpstreamSpec {
     /// `connect.upstreams[].http` — turns on HTTP mode with traffic management.
     pub http: Option<UpstreamHttpConfig>,
     /// `connect.upstreams[].handlers` — run in HTTP mode.
-    pub handlers: Vec<HandlerConfig>,
+    pub handlers: Vec<HopConfig>,
     /// `connect.upstreams[].credentials` — headers injected in HTTP mode,
     /// with values from [`ForwarderContext`]'s credential store.
     pub credentials: Vec<UpstreamCredential>,
@@ -150,8 +150,10 @@ struct UpstreamShared {
     context: Arc<ForwarderContext>,
     /// The upstream's `http` block, handlers, and credentials, as declared.
     http_config: Option<UpstreamHttpConfig>,
-    handlers: Vec<HandlerConfig>,
+    handlers: Vec<HopConfig>,
     credentials: Vec<UpstreamCredential>,
+    /// The egress chain's hops plus this upstream's, compiled per policy body.
+    pipelines: PipelineCache,
     /// HTTP-mode state, built on first use (an upstream can enter HTTP mode
     /// through its own declaration or through the effective policy's
     /// `protocol = "http"`, which is only known once policy arrives).
@@ -1082,6 +1084,7 @@ impl UpstreamShared {
             http_config: spec.http.clone(),
             handlers: spec.handlers.clone(),
             credentials: spec.credentials.clone(),
+            pipelines: PipelineCache::default(),
             http: OnceLock::new(),
             gated: spec.attachment.is_gated(),
         }
@@ -1095,10 +1098,7 @@ impl UpstreamShared {
         self.http_config.is_some()
             || !self.credentials.is_empty()
             || self.target.as_ref().is_some_and(|t| t.http)
-            || self
-                .handlers
-                .iter()
-                .any(|h| h.handler == crate::structs::netpolicy::HANDLER_DLP)
+            || self.handlers.iter().any(|h| h.kind.entry().needs_http())
     }
 
     /// HTTP-mode settings when this connection must be parsed: the upstream
@@ -1951,17 +1951,17 @@ async fn deny_if_policy_says_so(
 /// The external hops that apply to this listener's flows: the effective
 /// egress chain's, then the upstream's own.
 async fn run_hops(shared: &Arc<UpstreamShared>, facts: &HopFacts<'_>) -> HopOutcome {
-    let hops = handlers::hops_for(
-        &shared.context,
-        shared.allocation_id,
-        "egress",
-        Some(&shared.service),
-        &shared.handlers,
-    );
-    if hops.is_empty() {
-        return HopOutcome::Allow;
-    }
-    handlers::run(&shared.context, &hops, facts).await
+    let policy = shared.context.policy_for(shared.allocation_id);
+    shared
+        .pipelines
+        .get(
+            policy.as_deref(),
+            "egress",
+            Some(&shared.service),
+            &shared.handlers,
+        )
+        .run_connect(&shared.context, facts)
+        .await
 }
 
 fn deny_connection(
@@ -2022,7 +2022,7 @@ async fn hand_off<C>(
                 shared.context.note_handler(
                     shared.allocation_id,
                     &target.source,
-                    crate::structs::netpolicy::HANDLER_PROXY,
+                    "proxy",
                     &target.addr,
                     Err(format!("dial {}: {err}", target.addr)),
                 );

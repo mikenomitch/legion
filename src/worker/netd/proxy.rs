@@ -225,6 +225,7 @@ impl EgressProxies {
                     allocation_id: spec.allocation_id,
                     gated: spec.gated(),
                     context: self.context.clone(),
+                    pipelines: handlers::PipelineCache::default(),
                 });
                 let task = spawn_accept_loop(listener, "egress proxy", move |client, peer| {
                     // Counted as open (and its bytes as activity, as they
@@ -282,6 +283,8 @@ struct Proxy {
     /// edge-boot gate is shut.
     gated: bool,
     context: Arc<ForwarderContext>,
+    /// The egress chain's hops, compiled per policy body.
+    pipelines: handlers::PipelineCache,
 }
 
 /// An HTTP request head as policy sees it: method, path, lower-cased headers.
@@ -435,12 +438,15 @@ async fn dial(addrs: &[SocketAddr]) -> Option<TcpStream> {
 }
 
 /// The external hops on the allocation's effective egress chain.
+/// The egress chain's hops, compiled once per policy body.
+fn pipeline(proxy: &Proxy) -> Arc<handlers::Pipeline> {
+    let policy = proxy.context.policy_for(proxy.allocation_id);
+    proxy.pipelines.get(policy.as_deref(), "egress", None, &[])
+}
+
+/// The hops at `connect` (`CONNECT`, SOCKS5), with the connect-time facts.
 async fn hops(proxy: &Arc<Proxy>, facts: &HopFacts<'_>) -> HopOutcome {
-    let hops = handlers::hops_for(&proxy.context, proxy.allocation_id, "egress", None, &[]);
-    if hops.is_empty() {
-        return HopOutcome::Allow;
-    }
-    handlers::run(&proxy.context, &hops, facts).await
+    pipeline(proxy).run_connect(&proxy.context, facts).await
 }
 
 /// Dial a `proxy` handler's target and start it with the PROXY v2 header.
@@ -459,7 +465,7 @@ async fn dial_proxy_target(
             proxy.context.note_handler(
                 proxy.allocation_id,
                 &target.source,
-                crate::structs::netpolicy::HANDLER_PROXY,
+                "proxy",
                 &target.addr,
                 Err(format!("dial {}: {err}", target.addr)),
             );
@@ -807,7 +813,9 @@ async fn forward_absolute(
         headers: &headers,
         ..Default::default()
     };
-    let (upstream, absolute_form, extra) = match hops(&proxy, &hop_facts).await {
+    let hops = pipeline(&proxy);
+    let (upstream, absolute_form, extra) = match hops.run_request(&proxy.context, &hop_facts).await
+    {
         HopOutcome::Allow => match dial(&addrs).await {
             Some(stream) => (stream, false, Vec::new()),
             None => {
@@ -858,21 +866,20 @@ async fn forward_absolute(
         }
     };
     let (mut parts, body) = request.into_parts();
-    // The chain's `dlp` hops read the body before it leaves, exactly as they
-    // do on an HTTP-mode upstream.
-    let dlps = chain_dlp(&proxy);
+    // The chain's body hops (`dlp`) read the body before it leaves, exactly
+    // as they do on an HTTP-mode upstream.
     let mut bytes_in = 0u64;
-    let body: ProxyBody = if dlps.is_empty() {
+    let body: ProxyBody = if !hops.reads_body() {
         body.boxed()
     } else {
-        match http_body_util::Limited::new(body, http::dlp_cap(&dlps) as usize)
+        match http_body_util::Limited::new(body, hops.body_cap() as usize)
             .collect()
             .await
         {
             Ok(collected) => {
                 let bytes = collected.to_bytes();
                 bytes_in = bytes.len() as u64;
-                if let Some((source, reason)) = http::dlp_check(&dlps, &bytes) {
+                if let Some((source, reason)) = hops.check_body(&bytes) {
                     log_request(
                         &proxy,
                         &method,
@@ -897,11 +904,7 @@ async fn forward_absolute(
             }
             Err(_) => {
                 // Over the cap, or the client went away mid-body.
-                if dlps.iter().any(|d| d.on_error_deny()) {
-                    let source = dlps
-                        .first()
-                        .map(|d| d.source().to_string())
-                        .unwrap_or_default();
+                if let Some(source) = hops.body_unreadable_denied_by() {
                     log_request(
                         &proxy,
                         &method,
@@ -995,19 +998,8 @@ async fn forward_absolute(
     }
 }
 
-/// The egress chain's `dlp` hops, compiled once per policy body.
-fn chain_dlp(proxy: &Proxy) -> Arc<Vec<http::Dlp>> {
-    let Some(policy) = proxy.context.policy_for(proxy.allocation_id) else {
-        return Arc::new(Vec::new());
-    };
-    match policy.egress.as_ref() {
-        Some(chain) if chain.is_http() => http::chain_body_hops(&policy, chain, "egress").dlp,
-        _ => Arc::new(Vec::new()),
-    }
-}
-
 /// One access-log line for an absolute-URI request through the proxy, when
-/// the egress chain asks for one (`accessLog = true` or a `log` handler).
+/// the egress chain asks for one (`accessLog = true`).
 #[allow(clippy::too_many_arguments)]
 fn log_request(
     proxy: &Proxy,
@@ -1026,7 +1018,7 @@ fn log_request(
     let Some(chain) = policy.egress.as_ref() else {
         return;
     };
-    if !chain.access_log && !http::chain_declares_log(chain) {
+    if !chain.access_log {
         return;
     }
     let Some(dir) = proxy.context.log_dir_for(proxy.allocation_id) else {
@@ -1458,7 +1450,7 @@ mod tests {
     }
 
     /// A chain `dlp` handler reads an absolute-URI request's body through the
-    /// gated proxy, and a chain `log` handler writes the access log there.
+    /// gated proxy, and the chain's `accessLog` writes the access log there.
     #[tokio::test]
     async fn chain_dlp_and_log_run_on_absolute_uri_requests_test() {
         let origin_port = origin().await;
@@ -1466,10 +1458,9 @@ mod tests {
         let mut object: NetPolicyObject = serde_json::from_value(json!({
             "name": "p", "enforcement": "require",
             "egress": {
-                "protocol": "http", "allow": ["127.0.0.1"],
+                "protocol": "http", "allow": ["127.0.0.1"], "accessLog": true,
                 "handlers": [
-                    { "handler": "dlp", "config": { "patterns": ["sk-[a-z]{8,}"] } },
-                    { "handler": "log" }
+                    { "dlp": { "patterns": ["sk-[a-z]{8,}"] } }
                 ]
             }
         }))
@@ -1745,7 +1736,7 @@ mod tests {
         let (_proxies, context, addr) = proxies_with_handler(
             json!({
                 "protocol": "http",
-                "handlers": [{ "handler": "proxy", "service": "filter" }]
+                "handlers": [{ "proxy": { "service": "filter" } }]
             }),
             &[filter.port()],
         )
@@ -1840,7 +1831,7 @@ mod tests {
         let (_proxies, context, addr) = proxies_with_handler(
             json!({
                 "protocol": "http",
-                "handlers": [{ "handler": "proxy", "service": "nowhere" }]
+                "handlers": [{ "proxy": { "service": "nowhere" } }]
             }),
             &[origin_port],
         )
@@ -1858,7 +1849,7 @@ mod tests {
         let (_proxies, _context, addr) = proxies_with_handler(
             json!({
                 "protocol": "http",
-                "handlers": [{ "handler": "proxy", "service": "nowhere", "onError": "allow" }]
+                "handlers": [{ "proxy": { "service": "nowhere" }, "onError": "allow" }]
             }),
             &[origin_port],
         )

@@ -195,7 +195,6 @@
                 egress = {
                     protocol = "tcp",         # tcp (default) | http — never inferred
                     policy = "deny",          # fallthrough: allow | deny (deny when `allow` is used)
-                    onError = "deny",         # what a failed handler means: deny | allow
                     accessLog = false,
                     # Sugar: host, host:port, cidr, cidr:port — and host/path
                     # once protocol = "http". Desugars to allow rules ahead of
@@ -210,16 +209,20 @@
                     ],
                     # Handlers: code on the path, only when policy is not
                     # enough, run in order after the rules allow the flow.
+                    # Each is written as its kind, with the kind's settings
+                    # inside it:
                     # authz = a webhook verdict, cached per (identity,
                     # destination) for `cache` (default 10s, max 5m);
                     # proxy = hand the flow to any proxy (PROXY v2 header on
-                    # TCP, Legion-* headers on HTTP) by catalog service /
-                    # node-local service / a sidecar's port label;
-                    # log; dlp (HTTP bodies, needs protocol = "http").
-                    # Every hop: timeout (default 2s) and onError (deny).
+                    # TCP, Legion-* headers on HTTP): a catalog `service`
+                    # (`local = true` for its endpoints on this node only) or
+                    # a sidecar's `port` label;
+                    # dlp = reject HTTP bodies that match (needs HTTP).
+                    # Every hop: timeout (default 2s) and onError (what a
+                    # failed hop means: deny, the default, or allow).
                     handlers = [
-                        { handler = "authz", url = "http://policy.internal/check", cache = "30s", timeout = "2s", onError = "deny" },
-                        { handler = "proxy", service = "egress-filter", proxyProtocol = true, onError = "deny" },
+                        { authz = { url = "http://policy.internal/check", cache = "30s" }, timeout = "2s", onError = "deny" },
+                        { proxy = { service = "egress-filter", local = true, proxyProtocol = true }, onError = "deny" },
                     ],
                 },
                 # Inline ingress policy in front of this task's advertised
@@ -303,8 +306,7 @@
                         to = "https://api.openai.com",
                         handlers = [
                             {
-                                handler = "dlp",
-                                config = { maxBytes = "1Mi", patterns = ["(AKIA|sk-)[A-Za-z0-9]{16,}"] },
+                                dlp = { maxBytes = "1Mi", patterns = ["(AKIA|sk-)[A-Za-z0-9]{16,}"] },
                                 onError = "deny",
                             },
                         ],

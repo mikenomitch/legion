@@ -3861,10 +3861,13 @@ mesh's surface. Phase 0 first, then S1. After S1 every track is independent.
       `chain_dlp_and_log_handlers_run_on_an_http_upstream_test`,
       `chain_dlp_and_log_run_on_absolute_uri_requests_test`,
       `hops_inherit_the_chain_on_error_test`.
-- [ ] S1: keyed handler variants on one `Handler` trait and `HANDLERS`
-      registry, one compiled pipeline on every path, stage checks at submit,
-      placement in `show`/`doctor`. Removes the `log` handler (use
-      `accessLog`), chain-level `onError`, and `proxy.node`.
+- [x] S1: keyed handler variants on one `Handler` trait and `HANDLERS`
+      registry ([structs/hops.rs](../src/structs/hops.rs)), one compiled
+      `Pipeline` on every path ([netd/handlers.rs](../src/worker/netd/handlers.rs)),
+      stage checks at submit, kind, stage, and placement in `net policy
+      show` and `net doctor`. Removed the `log` handler (use `accessLog`),
+      chain-level `onError`, and `proxy.node` (`service` + `local = true`).
+      Docs: [network-handlers.md#handlers](../docs/network-handlers.md#handlers).
 - [ ] S2: upstreams as one `to` whose scheme is the protocol (an HTTP chain
       no longer parses `tcp` upstreams as HTTP), one dialable address per
       upstream, VIP-only binding on Linux. Removes `http.outlier` and the

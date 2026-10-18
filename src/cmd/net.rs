@@ -1013,10 +1013,9 @@ fn print_effective(
             continue;
         };
         println!(
-            "  {direction}: protocol {} · fallthrough {} · onError {}{}",
+            "  {direction}: protocol {} · fallthrough {}{}",
             chain.protocol,
             chain.policy,
-            chain.on_error,
             if chain.access_log {
                 " · accessLog"
             } else {
@@ -1069,19 +1068,19 @@ fn print_effective(
         }
         for handler in &chain.handlers {
             let h = &handler.handler;
-            let target = h
-                .url
-                .clone()
-                .or(h.service.clone().map(|s| format!("service {s}")))
-                .or(h.port.clone().map(|p| format!("port {p}")))
-                .or(h.node.clone().map(|n| format!("node {n}")))
-                .unwrap_or_default();
+            let entry = h.kind.entry();
             println!(
-                "    handler {} {}  timeout {} onError {}  [{}]",
-                h.handler,
-                target,
-                h.timeout.as_deref().unwrap_or("2s"),
-                h.on_error.as_deref().unwrap_or(&chain.on_error),
+                "    handler {} {}  {}  stage {}  timeout {} onError {}  [{}]",
+                entry.name,
+                h.kind.target(),
+                entry.placement.as_str(),
+                entry.stage_names(),
+                h.timeout
+                    .as_deref()
+                    .unwrap_or(crate::structs::hops::DEFAULT_HOP_TIMEOUT),
+                h.on_error
+                    .as_deref()
+                    .unwrap_or(crate::structs::netpolicy::ON_ERROR_DENY),
                 handler.source
             );
         }
@@ -1441,9 +1440,12 @@ pub(crate) fn diagnose_network(
                 layer: "handler",
                 status: if hop.healthy { "ok" } else { "warn" },
                 detail: format!(
-                    "allocation {alloc}: {} {} → {} ({} calls, {} errors){}",
+                    "allocation {alloc}: {} {} [{}] → {} ({} calls, {} errors){}",
                     hop.source,
                     hop.handler,
+                    crate::structs::hops::handler_entry(&hop.handler)
+                        .map(|entry| entry.placement.as_str())
+                        .unwrap_or("?"),
                     hop.target,
                     hop.calls,
                     hop.errors,

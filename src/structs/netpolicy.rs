@@ -56,15 +56,7 @@ pub const ON_ERROR_DENY: &str = "deny";
 pub const ON_ERROR_ALLOW: &str = "allow";
 pub const ON_ERRORS: &[&str] = &[ON_ERROR_DENY, ON_ERROR_ALLOW];
 
-/// Handler kinds config validation accepts. The datapath dispatches on
-/// these names: `authz` and `proxy` in `crate::worker::netd::handlers`, `dlp`
-/// and `log` in `crate::worker::netd::http`. A new kind is a name here plus
-/// its arm there.
-pub const HANDLER_AUTHZ: &str = "authz";
-pub const HANDLER_PROXY: &str = "proxy";
-pub const HANDLER_LOG: &str = "log";
-pub const HANDLER_DLP: &str = "dlp";
-pub const HANDLERS: &[&str] = &[HANDLER_AUTHZ, HANDLER_PROXY, HANDLER_LOG, HANDLER_DLP];
+pub use crate::structs::hops::HopConfig;
 
 /// `network.mode` values. `host` is today's networking; `gated` is a namespace
 /// containing loopback and the datapath only; `auto` picks `gated` where the
@@ -107,8 +99,6 @@ pub const TLS_ORIGINATE: &str = "originate";
 pub const TLS_MODES_INGRESS: &[&str] = &[TLS_OFF, TLS_SERVER, TLS_MUTUAL];
 pub const TLS_MODES_EGRESS: &[&str] = &[TLS_PASSTHROUGH, TLS_ORIGINATE];
 
-/// Default per-handler timeout when a hop names none.
-pub const DEFAULT_HANDLER_TIMEOUT: &str = "2s";
 /// Hard cap on an `authz` verdict cache TTL, so a revoked allow cannot outlive
 /// a policy change by more than this.
 pub const MAX_AUTHZ_CACHE: &str = "5m";
@@ -308,7 +298,7 @@ impl Direction {
 /// [`ChainConfig::normalize_and_validate`], so downstream code only ever sees
 /// `rules`.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Default)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ChainConfig {
     /// `tcp` (default) or `http`. Never inferred from the rules.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -317,9 +307,8 @@ pub struct ChainConfig {
     /// when `allow` sugar is used, `allow` otherwise.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub policy: Option<String>,
-    /// `deny` (default) or `allow`: what a failed handler means.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub on_error: Option<String>,
+    /// One NDJSON line per HTTP request in the allocation's
+    /// `net-access.log`.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub access_log: bool,
     /// Sugar: `host`, `host:port`, `cidr`, `cidr:port`, or (HTTP only)
@@ -328,8 +317,10 @@ pub struct ChainConfig {
     pub allow: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub rules: Vec<RuleConfig>,
+    /// Hops that run after the rules allow a flow; each says what a failure
+    /// means with its own `onError`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub handlers: Vec<HandlerConfig>,
+    pub handlers: Vec<HopConfig>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tls: Option<TlsConfig>,
 }
@@ -395,39 +386,6 @@ impl RuleMatch {
             && self.header.is_empty()
             && self.identity.is_none()
     }
-}
-
-/// One hop of code on the path. `handler` names the kind; the other fields are
-/// per kind and validated per kind.
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Default)]
-#[serde(rename_all = "camelCase")]
-pub struct HandlerConfig {
-    pub handler: String,
-    /// `authz`: the webhook URL.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub url: Option<String>,
-    /// `authz`: verdict cache TTL (capped at [`MAX_AUTHZ_CACHE`]).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub cache: Option<String>,
-    /// `proxy`: a catalog service (any healthy endpoint).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub service: Option<String>,
-    /// `proxy`: a sidecar task's port label in this group.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub port: Option<String>,
-    /// `proxy`: a catalog service, node-local endpoints only.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub node: Option<String>,
-    /// Whether to prepend a PROXY protocol v2 header (`proxy`, default true).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub proxy_protocol: Option<bool>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub timeout: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub on_error: Option<String>,
-    /// Kind-specific settings (`dlp`: `{ maxBytes, patterns, replace }`).
-    #[serde(default, skip_serializing_if = "Value::is_null")]
-    pub config: Value,
 }
 
 /// TLS on a chain. Handlers never see TLS; the datapath terminates or
@@ -563,19 +521,6 @@ impl ChainConfig {
         }
         self.policy = Some(policy);
 
-        let on_error = self
-            .on_error
-            .take()
-            .map(|p| p.trim().to_ascii_lowercase())
-            .unwrap_or_else(|| ON_ERROR_DENY.to_string());
-        if !ON_ERRORS.contains(&on_error.as_str()) {
-            bail!(
-                "{what}.onError must be one of {}, got '{on_error}'",
-                ON_ERRORS.join(", ")
-            );
-        }
-        self.on_error = Some(on_error);
-
         for (index, rule) in self.rules.iter_mut().enumerate() {
             rule.action = rule.action.trim().to_ascii_lowercase();
             if !ACTIONS.contains(&rule.action.as_str()) {
@@ -626,8 +571,9 @@ impl ChainConfig {
             rule.matcher.header = headers;
         }
 
+        let not_http = format!("{what}.protocol is \"tcp\". Set protocol = \"http\", or put it on an upstream whose `to` is http:// or https://");
         for (index, handler) in self.handlers.iter_mut().enumerate() {
-            normalize_handler(&format!("{what}.handlers[{index}]"), handler, is_http)?;
+            handler.normalize(&format!("{what}.handlers[{index}]"), is_http, &not_http)?;
         }
 
         if let Some(tls) = self.tls.as_mut() {
@@ -693,94 +639,6 @@ impl ChainConfig {
         }
         Ok(())
     }
-}
-
-/// Normalize and validate one handler hop. Shared by chains and by
-/// `connect.upstreams[].handlers`, so a handler is spelled identically
-/// wherever it appears. `is_http` says whether the surrounding path parses
-/// HTTP, which body-inspecting handlers need.
-pub fn normalize_handler(hwhat: &str, handler: &mut HandlerConfig, is_http: bool) -> R<()> {
-    handler.handler = handler.handler.trim().to_ascii_lowercase();
-    if !HANDLERS.contains(&handler.handler.as_str()) {
-        bail!(
-            "{hwhat}.handler must be one of {}, got '{}'",
-            HANDLERS.join(", "),
-            handler.handler
-        );
-    }
-    match handler.handler.as_str() {
-        HANDLER_AUTHZ => {
-            let url = handler.url.as_deref().unwrap_or("").trim();
-            if !(url.starts_with("http://") || url.starts_with("https://")) {
-                bail!("{hwhat}: authz needs url = \"http(s)://...\"");
-            }
-            if let Some(cache) = handler.cache.as_deref() {
-                let ttl =
-                    parse_duration(cache).map_err(|err| anyhow::anyhow!("{hwhat}.cache: {err}"))?;
-                let cap = parse_duration(MAX_AUTHZ_CACHE).expect("constant");
-                if ttl > cap {
-                    bail!("{hwhat}.cache must be at most {MAX_AUTHZ_CACHE}");
-                }
-            }
-        }
-        HANDLER_PROXY => {
-            let targets = [
-                handler.service.as_deref(),
-                handler.port.as_deref(),
-                handler.node.as_deref(),
-            ]
-            .iter()
-            .filter(|t| t.is_some_and(|t| !t.trim().is_empty()))
-            .count();
-            if targets != 1 {
-                bail!(
-                    "{hwhat}: proxy needs exactly one of service (any endpoint), port \
-                     (a sidecar's port label), or node (node-local endpoints)"
-                );
-            }
-        }
-        HANDLER_DLP => {
-            if !is_http {
-                bail!("{hwhat}: dlp inspects HTTP bodies, which needs protocol = \"http\"");
-            }
-            if let Some(max) = handler.config.get("maxBytes") {
-                parse_bytes(max)
-                    .map_err(|err| anyhow::anyhow!("{hwhat}.config.maxBytes: {err}"))?;
-            }
-            let patterns = handler
-                .config
-                .get("patterns")
-                .and_then(|p| p.as_array())
-                .cloned()
-                .unwrap_or_default();
-            if patterns.is_empty() {
-                bail!("{hwhat}: dlp needs config.patterns = [\"<regex>\", ...]");
-            }
-            for pattern in &patterns {
-                let Some(pattern) = pattern.as_str() else {
-                    bail!("{hwhat}.config.patterns entries must be strings");
-                };
-                regex::Regex::new(pattern)
-                    .map_err(|err| anyhow::anyhow!("{hwhat}.config.patterns '{pattern}': {err}"))?;
-            }
-        }
-        _ => {}
-    }
-    if let Some(timeout) = handler.timeout.as_deref() {
-        parse_duration(timeout).map_err(|err| anyhow::anyhow!("{hwhat}.timeout: {err}"))?;
-    } else {
-        handler.timeout = Some(DEFAULT_HANDLER_TIMEOUT.to_string());
-    }
-    if let Some(on_error) = handler.on_error.as_mut() {
-        *on_error = on_error.trim().to_ascii_lowercase();
-        if !ON_ERRORS.contains(&on_error.as_str()) {
-            bail!(
-                "{hwhat}.onError must be one of {}, got '{on_error}'",
-                ON_ERRORS.join(", ")
-            );
-        }
-    }
-    Ok(())
 }
 
 /// `host`, `host:port`, `cidr`, `cidr:port`, or `host/path` → one allow rule.
@@ -931,7 +789,7 @@ pub struct EffectiveRule {
 #[serde(rename_all = "camelCase")]
 pub struct EffectiveHandler {
     #[serde(flatten)]
-    pub handler: HandlerConfig,
+    pub handler: HopConfig,
     pub source: String,
 }
 
@@ -941,7 +799,6 @@ pub struct EffectiveHandler {
 pub struct EffectiveChain {
     pub protocol: String,
     pub policy: String,
-    pub on_error: String,
     pub access_log: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tls: Option<TlsConfig>,
@@ -1114,7 +971,6 @@ fn merge_direction(
     let mut merged = EffectiveChain {
         protocol: PROTOCOL_TCP.to_string(),
         policy: ACTION_ALLOW.to_string(),
-        on_error: ON_ERROR_ALLOW.to_string(),
         access_log: false,
         tls: None,
         rules: Vec::new(),
@@ -1130,9 +986,6 @@ fn merge_direction(
                 .any(|p| format!("policy/{}", p.name) == *source);
         if chain.is_http() {
             merged.protocol = PROTOCOL_HTTP.to_string();
-        }
-        if chain.on_error.as_deref() == Some(ON_ERROR_DENY) {
-            merged.on_error = ON_ERROR_DENY.to_string();
         }
         merged.access_log |= chain.access_log;
         // TLS: a required policy's TLS wins; otherwise the last contributor's
@@ -1158,14 +1011,8 @@ fn merge_direction(
             });
         }
         for (index, handler) in chain.handlers.iter().enumerate() {
-            // A hop without its own `onError` takes the chain's, so what
-            // `net policy show` prints is what the datapath does.
-            let mut handler = handler.clone();
-            if handler.on_error.is_none() {
-                handler.on_error = chain.on_error.clone();
-            }
             merged.handlers.push(EffectiveHandler {
-                handler,
+                handler: handler.clone(),
                 source: format!("{source}#{index}"),
             });
         }
@@ -1581,26 +1428,18 @@ pub fn normalize_labels(labels: &BTreeMap<String, String>) -> R<BTreeMap<String,
 mod tests {
     use super::*;
 
-    /// A hop without its own `onError` takes its chain's, so what `net
-    /// policy show` prints is what the datapath enforces.
+    /// `onError` lives on each hop; a chain-level one is refused rather than
+    /// silently ignored.
     #[test]
-    fn hops_inherit_the_chain_on_error_test() {
-        let mut object: NetPolicyObject = serde_json::from_value(json!({
-            "name": "p", "enforcement": "require",
-            "egress": {
-                "protocol": "http", "onError": "allow",
-                "handlers": [
-                    { "handler": "authz", "url": "http://x/check" },
-                    { "handler": "authz", "url": "http://y/check", "onError": "deny" }
-                ]
-            }
-        }))
-        .unwrap();
-        object.normalize_and_validate().unwrap();
-        let policy = merge_policies(&[object], InlinePolicy::default());
-        let hops = &policy.egress.as_ref().unwrap().handlers;
-        assert_eq!(hops[0].handler.on_error.as_deref(), Some("allow"));
-        assert_eq!(hops[1].handler.on_error.as_deref(), Some("deny"));
+    fn on_error_is_a_hop_setting_test() {
+        let err = serde_json::from_value::<ChainConfig>(json!({ "onError": "allow" }))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("onError"), "{err}");
+        let c = chain(json!({
+            "handlers": [{ "authz": { "url": "http://x/check" }, "onError": "allow" }]
+        }));
+        assert!(c.handlers[0].fails_open());
     }
     use serde_json::json;
 
@@ -1691,25 +1530,22 @@ mod tests {
 
     #[test]
     fn unknown_handler_lists_valid_ones() {
-        let mut c: ChainConfig =
-            serde_json::from_value(json!({ "handlers": [{ "handler": "wasm" }] })).unwrap();
-        let err = c
-            .normalize_and_validate("egress", Direction::Egress)
+        let err = serde_json::from_value::<ChainConfig>(json!({ "handlers": [{ "wasm": {} }] }))
             .unwrap_err()
             .to_string();
-        assert!(err.contains("authz, proxy, log, dlp"), "{err}");
+        assert!(err.contains("authz, proxy, dlp"), "{err}");
     }
 
     #[test]
     fn handler_kinds_are_validated_per_kind() {
         for bad in [
-            json!({ "handlers": [{ "handler": "authz" }] }),
-            json!({ "handlers": [{ "handler": "authz", "url": "http://x", "cache": "10m" }] }),
-            json!({ "handlers": [{ "handler": "proxy" }] }),
-            json!({ "handlers": [{ "handler": "proxy", "service": "a", "port": "b" }] }),
-            json!({ "handlers": [{ "handler": "dlp", "config": { "patterns": ["x"] } }] }),
-            json!({ "protocol": "http", "handlers": [{ "handler": "dlp" }] }),
-            json!({ "handlers": [{ "handler": "log", "timeout": "soon" }] }),
+            json!({ "handlers": [{ "authz": { "url": "" } }] }),
+            json!({ "handlers": [{ "authz": { "url": "http://x", "cache": "10m" } }] }),
+            json!({ "handlers": [{ "proxy": {} }] }),
+            json!({ "handlers": [{ "proxy": { "service": "a", "port": "b" } }] }),
+            json!({ "handlers": [{ "dlp": { "patterns": ["x"] } }] }),
+            json!({ "protocol": "http", "handlers": [{ "dlp": { "patterns": [] } }] }),
+            json!({ "handlers": [{ "authz": { "url": "http://x" }, "timeout": "soon" }] }),
         ] {
             let mut c: ChainConfig = serde_json::from_value(bad.clone()).unwrap();
             assert!(
@@ -1719,11 +1555,11 @@ mod tests {
             );
         }
         let c = chain(
-            json!({ "handlers": [{ "handler": "authz", "url": "http://policy/check", "cache": "30s" }] }),
+            json!({ "handlers": [{ "authz": { "url": "http://policy/check", "cache": "30s" } }] }),
         );
         assert_eq!(
             c.handlers[0].timeout.as_deref(),
-            Some(DEFAULT_HANDLER_TIMEOUT)
+            Some(crate::structs::hops::DEFAULT_HOP_TIMEOUT)
         );
     }
 

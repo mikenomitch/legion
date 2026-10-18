@@ -103,7 +103,7 @@ the effective egress policy is `protocol = "http"`. For each request:
    header is rewritten to an external target's host. See
    [Connection pooling](#connection-pooling).
 
-`accessLog = true` on the chain (or a `log` handler) writes one NDJSON line
+`accessLog = true` on the chain writes one NDJSON line
 per request to `<worker logs>/<allocation>/net-access.log`. Each line has
 the task's labels, the verdict, the deciding rule, status, bytes, and
 duration.
@@ -205,7 +205,6 @@ network = {
     egress = {
         protocol = "tcp",       # tcp (default) | http — never inferred from the rules
         policy = "deny",        # fallthrough: allow | deny (deny when `allow` is used)
-        onError = "deny",       # what a failed handler means: deny | allow
         accessLog = false,
         allow = ["*.pypi.org", "api.github.com:443", "10.0.0.0/8:5432"],
         rules = [
@@ -598,30 +597,65 @@ Handlers are code on the path. They only run when declared, either on a
 chain (`egress.handlers`, `ingress.handlers`, on a task or a policy object)
 or on one upstream (`connect.upstreams[].handlers`). They run in order after
 the rules have allowed the flow, with the chain's handlers first, then the
-upstream's.
+upstream's. Every path runs the same list: an L4 upstream, an HTTP-mode
+upstream, the gated proxy (`CONNECT`, SOCKS5, and absolute-URI requests), and
+ingress.
 
-| `handler` | What it does | Sees bytes |
-| --- | --- | --- |
-| `authz` | POSTs the flow's facts to `url` and reads back a verdict, cached per (hop, identity, destination[, method, path]) for `cache` (default `10s`, at most `5m`) | no |
-| `proxy` | hands the flow to any proxy (a catalog `service`, its `node`-local endpoints, or a sidecar's `port` label in the same job) with a PROXY protocol v2 header (TCP) or `Legion-*` headers (HTTP) | yes |
-| `log` | access log for this hop | as declared |
-| `dlp` | rejects HTTP bodies matching `config.patterns` up to `config.maxBytes` (needs `protocol = "http"`) | yes |
+A handler is written as its kind, with the kind's settings inside it:
+
+| Kind | What it does | Stage | Runs |
+| --- | --- | --- | --- |
+| `authz` | POSTs the flow's facts to `url` and reads back a verdict, cached per (hop, identity, destination[, method, path]) for `cache` (default `10s`, at most `5m`) | connect, request | external |
+| `proxy` | hands the flow to any proxy (a catalog `service`, with `local = true` for its endpoints on this node only, or a sidecar's `port` label in the same job) with a PROXY protocol v2 header (TCP) or `Legion-*` headers (HTTP) | connect, request | external |
+| `dlp` | rejects HTTP request bodies matching `patterns`, buffering up to `maxBytes` (default 1 MiB) | body | netd |
+
+**Stage** is where in a flow the kind acts. An L4 path runs a hop at
+`connect`, with the connect-time facts; an HTTP path runs it at `request`,
+with the request head, and then at `body`. A kind whose stages all need
+HTTP, such as `dlp`, is refused at submit on a chain whose `protocol` is
+`tcp` or on an upstream that does not parse HTTP:
+
+```
+network.egress.handlers[0] dlp acts at stage "body", which needs HTTP, but
+network.egress.protocol is "tcp". Set protocol = "http", or put it on an
+upstream whose `to` is http:// or https://
+```
+
+**Runs** is where the work happens: in the node's datapath (`netd`) or
+outside it (`external`, a webhook or another proxy). `legion net policy
+show` prints both for every hop.
 
 Every hop has a `timeout` (default `2s`) and an `onError` (default `deny`).
-You cannot declare a handler without a timeout. If a hop cannot be reached
-(a webhook that times out, a proxy with no endpoint), the chain fails
-**closed** unless the hop sets `onError = "allow"`.
+If a hop cannot be reached (a webhook that times out, a proxy with no
+endpoint) or a `dlp` body is larger than `maxBytes`, the flow fails
+**closed** unless the hop sets `onError = "allow"`. `onError` belongs to the
+hop: a chain has no `onError` of its own, and a chain that sets one is
+refused at submit.
 
 ```nickel
 egress = {
     protocol = "http",
     allow = ["api.github.com/**"],
+    accessLog = true,
     handlers = [
-        { handler = "authz", url = "http://policy.internal:8080/check", cache = "30s" },
-        { handler = "proxy", service = "egress-filter", onError = "deny" },
+        { authz = { url = "http://policy.internal:8080/check", cache = "30s" } },
+        { proxy = { service = "egress-filter" }, onError = "deny" },
+        { dlp = { patterns = ["(AKIA|sk-)[A-Za-z0-9]{16,}"], maxBytes = "1Mi" } },
     ],
 },
 ```
+
+A setting in the wrong place is an error that names the kind:
+
+```
+handler 'proxy' has an unexpected field 'url' beside it; a handler is one
+kind (authz, proxy, dlp) plus timeout and onError, with the kind's settings
+inside it
+```
+
+There is no `log` handler. The chain's `accessLog = true` writes the access
+log for every HTTP request the chain governs, upstreams and the gated proxy
+alike.
 
 ### `authz` — ask your service
 
@@ -686,11 +720,15 @@ splices:
 
 Targets:
 
-- `service = "x"`: any healthy endpoint of catalog service `x`, round-robin.
-- `node = "x"`: only endpoints of `x` on the same node, such as a per-node
-  filter run as a system job.
-- `port = "filter"`: a sidecar task in the same job with a port of that
-  label, on this node.
+- `{ proxy = { service = "x" } }`: any healthy endpoint of catalog service
+  `x`, round-robin.
+- `{ proxy = { service = "x", local = true } }`: only endpoints of `x` on the
+  same node, such as a per-node filter run as a system job.
+- `{ proxy = { port = "filter" } }`: a sidecar task in the same job with a
+  port of that label, on this node.
+
+Exactly one of `service` and `port` is set. `proxyProtocol = false` leaves
+out the PROXY v2 header.
 
 The manager sends the endpoints on the heartbeat, as it does for an
 upstream. A target with no endpoint is a handler error (`onError`).
@@ -1645,7 +1683,7 @@ hang.
 - **Events**: `net.denied` (warn) with the destination, the deciding rule,
   the reason, the peer identity, and the task's `network.labels`.
   `net.policy_applied` and `net.policy_deleted` (info).
-- **Access log** (`accessLog = true`, or a `log` handler): one NDJSON line
+- **Access log** (`accessLog = true` on the chain): one NDJSON line
   per request in HTTP mode, at `<worker logs>/<allocation>/net-access.log`.
   L4 connections are counted in metrics, not logged one by one.
 - **Datapath status**: every heartbeat carries the node's view of each

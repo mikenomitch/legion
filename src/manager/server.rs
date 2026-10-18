@@ -13196,7 +13196,6 @@ impl ManagerDaemonService {
         desired: &[crate::structs::TaskAllocation],
         policies: &[crate::structs::AllocNetPolicy],
     ) -> Vec<crate::structs::UpstreamEndpoints> {
-        use crate::structs::netpolicy::HANDLER_PROXY;
         let mut wanted: Vec<(i64, String, String)> = Vec::new();
         let by_alloc: HashMap<i64, &str> = policies
             .iter()
@@ -13218,12 +13217,8 @@ impl ManagerDaemonService {
                         .flatten()
                     {
                         for hop in &chain.handlers {
-                            if hop.handler.handler == HANDLER_PROXY {
-                                if let Some(service) =
-                                    hop.handler.service.as_ref().or(hop.handler.node.as_ref())
-                                {
-                                    services.push(service.clone());
-                                }
+                            if let Some(service) = hop.handler.kind.endpoint_need() {
+                                services.push(service.to_string());
                             }
                         }
                     }
@@ -13235,10 +13230,8 @@ impl ManagerDaemonService {
                 {
                     for upstream in &connect.upstreams {
                         for hop in &upstream.handlers {
-                            if hop.handler == HANDLER_PROXY {
-                                if let Some(service) = hop.service.as_ref().or(hop.node.as_ref()) {
-                                    services.push(service.clone());
-                                }
+                            if let Some(service) = hop.kind.endpoint_need() {
+                                services.push(service.to_string());
                             }
                         }
                     }

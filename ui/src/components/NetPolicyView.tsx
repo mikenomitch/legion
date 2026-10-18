@@ -23,22 +23,49 @@ export type EffectiveRule = {
   source: string
 }
 
-export type EffectiveHandler = {
-  handler: string
+// A handler is written as its kind (`{ authz = { url } }`), plus the settings
+// every hop shares. Mirrors `HopConfig` in src/structs/hops.rs.
+export type HandlerSettings = {
   url?: string
+  cache?: string
   service?: string
+  local?: boolean
   port?: string
-  node?: string
+  proxyProtocol?: boolean
+  patterns?: string[]
+  maxBytes?: string | number
+}
+
+export type EffectiveHandler = {
+  authz?: HandlerSettings
+  proxy?: HandlerSettings
+  dlp?: HandlerSettings
   timeout?: string
   onError?: string
-  cache?: string
   source: string
+}
+
+const HANDLER_KINDS = ['authz', 'proxy', 'dlp'] as const
+
+/** The hop's kind and what it points at, for one line of the view. */
+export const describeHandler = (handler: EffectiveHandler): { kind: string; target: string } => {
+  const kind = HANDLER_KINDS.find((name) => handler[name] !== undefined) ?? '?'
+  const settings = (kind === '?' ? undefined : handler[kind]) ?? {}
+  let target = ''
+  if (kind === 'authz') target = settings.url ?? ''
+  else if (kind === 'proxy')
+    target = settings.service
+      ? `service ${settings.service}${settings.local ? ' (node-local)' : ''}`
+      : settings.port
+        ? `port ${settings.port}`
+        : ''
+  else if (kind === 'dlp') target = `${settings.patterns?.length ?? 0} pattern(s)`
+  return { kind, target }
 }
 
 export type EffectiveChain = {
   protocol: string
   policy: string
-  onError: string
   accessLog: boolean
   tls?: { mode: string }
   rules?: EffectiveRule[]
@@ -105,7 +132,6 @@ function ChainView(props: { direction: 'egress' | 'ingress'; chain: EffectiveCha
         <Badge tone={props.chain.policy === 'deny' ? 'warn' : 'ok'} dot>
           fallthrough {props.chain.policy}
         </Badge>
-        <Badge tone="neutral">onError {props.chain.onError}</Badge>
         <Show when={props.chain.tls}>
           <Badge tone="info">tls {props.chain.tls!.mode}</Badge>
         </Show>
@@ -147,8 +173,7 @@ function ChainView(props: { direction: 'egress' | 'ingress'; chain: EffectiveCha
               <li class="flex flex-wrap items-baseline gap-x-2 gap-y-1">
                 <span class="text-xs font-semibold uppercase text-muted">handler</span>
                 <span class="font-mono text-xs text-ink">
-                  {handler.handler}{' '}
-                  {handler.url ?? (handler.service ? `service ${handler.service}` : handler.port ? `port ${handler.port}` : handler.node ? `node ${handler.node}` : '')}
+                  {describeHandler(handler).kind} {describeHandler(handler).target}
                 </span>
                 <Badge tone="neutral">timeout {handler.timeout ?? '2s'}</Badge>
                 <Show when={handler.onError}>

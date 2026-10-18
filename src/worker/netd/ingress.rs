@@ -189,6 +189,8 @@ struct Shared {
     target: TaskTarget,
     context: Arc<ForwarderContext>,
     http: OnceLock<Arc<HttpSettings>>,
+    /// The ingress chain's hops, compiled per policy body.
+    pipelines: handlers::PipelineCache,
 }
 
 impl Shared {
@@ -315,6 +317,7 @@ impl IngressListeners {
                     spec: spec.clone(),
                     context: self.context.clone(),
                     http: OnceLock::new(),
+                    pipelines: handlers::PipelineCache::default(),
                 });
                 let task = spawn_accept_loop(listener, "ingress", move |client, peer| {
                     let shared = shared.clone();
@@ -557,9 +560,12 @@ async fn serve_accepted<S>(
         identity: identity.as_deref(),
         ..Default::default()
     };
-    let hops = handlers::hops_for(&shared.context, allocation_id, "ingress", None, &[]);
+    let policy = shared.context.policy_for(allocation_id);
+    let hops = shared
+        .pipelines
+        .get(policy.as_deref(), "ingress", None, &[]);
     if !hops.is_empty() && shared.http_settings().is_none() {
-        match handlers::run(&shared.context, &hops, &hop_facts).await {
+        match hops.run_connect(&shared.context, &hop_facts).await {
             HopOutcome::Allow => {}
             HopOutcome::Deny { source, reason } => {
                 net_metrics::connection("ingress", PROTOCOL_TCP, "deny");
@@ -596,7 +602,7 @@ async fn serve_accepted<S>(
                         shared.context.note_handler(
                             allocation_id,
                             &target.source,
-                            crate::structs::netpolicy::HANDLER_PROXY,
+                            "proxy",
                             &target.addr,
                             Err(format!("dial {}: {err}", target.addr)),
                         );

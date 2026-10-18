@@ -128,6 +128,7 @@ zeroize = "1"
 tabled = "0.16.0"
 lazy_static = "1.4.0"
 anyhow = "1.0.100"
+async-trait = "0.1"
 regex = "1.11.1"
 semver = "1.0.25"
 chrono = { version = "0.4.42", default-features = false, features = ["clock"] }

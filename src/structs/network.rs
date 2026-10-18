@@ -705,7 +705,7 @@ pub struct UpstreamConfig {
     /// Handlers on this upstream's path, run after the effective egress
     /// policy and before the dial.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub handlers: Vec<crate::structs::netpolicy::HandlerConfig>,
+    pub handlers: Vec<crate::structs::hops::HopConfig>,
     /// Credential injection (docs/network-handlers.md, "Credential
     /// injection"): headers the node sets on every request it sends to an
     /// external `https://` upstream, with values the task never sees.
@@ -1851,13 +1851,13 @@ pub fn validate_task_connect(
         validate_upstream_credentials(task_name, upstream)?;
         for (index, handler) in upstream.handlers.iter().enumerate() {
             let mut handler = handler.clone();
-            crate::structs::netpolicy::normalize_handler(
+            handler.normalize(
                 &format!(
                     "task {task_name} connect.upstreams entry '{}' handlers[{index}]",
                     upstream.key()
                 ),
-                &mut handler,
                 upstream.is_http(),
+                &format!("upstream '{}' is not HTTP. Give it an http:// or https:// target, or an http block", upstream.key()),
             )?;
         }
         if let Some(local_port) = upstream.local_port {
@@ -1985,10 +1985,10 @@ pub fn normalize_task_connect(task_name: &str, connect: &mut Option<ConnectConfi
         let is_http = upstream.is_http();
         let key = upstream.key().to_string();
         for (index, handler) in upstream.handlers.iter_mut().enumerate() {
-            crate::structs::netpolicy::normalize_handler(
+            handler.normalize(
                 &format!("task {task_name} connect.upstreams entry '{key}' handlers[{index}]"),
-                handler,
                 is_http,
+                &format!("upstream '{key}' is not HTTP. Give it an http:// or https:// target, or an http block"),
             )?;
         }
     }
@@ -2890,15 +2890,21 @@ mod tests {
             .any(|(k, v)| k == "LEGION_UPSTREAM_OPENAI" && v == "127.0.0.1:8443"));
 
         // Handlers on an upstream are validated like a chain's.
-        let bad = connect(json!([{ "service": "db", "handlers": [{ "handler": "wasm" }] }]));
-        assert!(validate_task_connect("api", None, Some(&bad), None).is_err());
+        assert!(serde_json::from_value::<ConnectConfig>(
+            json!({ "upstreams": [{ "service": "db", "handlers": [{ "wasm": {} }] }] })
+        )
+        .is_err());
         let bad = connect(
-            json!([{ "name": "o", "to": "tcp://x:1", "handlers": [{ "handler": "dlp", "config": { "patterns": ["x"] } }] }]),
+            json!([{ "name": "o", "to": "tcp://x:1", "handlers": [{ "dlp": { "patterns": ["x"] } }] }]),
         );
         let err = validate_task_connect("api", None, Some(&bad), None).unwrap_err();
-        assert!(err.to_string().contains("protocol = \"http\""), "{err}");
+        assert!(err.to_string().contains("stage \"body\""), "{err}");
+        assert!(
+            err.to_string().contains("upstream 'o' is not HTTP"),
+            "{err}"
+        );
         let ok = connect(
-            json!([{ "name": "o", "to": "https://x", "handlers": [{ "handler": "dlp", "config": { "patterns": ["x"] } }] }]),
+            json!([{ "name": "o", "to": "https://x", "handlers": [{ "dlp": { "patterns": ["x"] } }] }]),
         );
         validate_task_connect("api", None, Some(&ok), None).unwrap();
 

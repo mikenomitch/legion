@@ -10,10 +10,10 @@
 //!    answered with a `403` whose body and `Legion-Denied-By` header name the
 //!    rule and reason, so a client — an agent in a sandbox, say — can read
 //!    *why* and change its approach instead of retrying.
-//! 2. **Handlers.** `dlp` buffers the request body up to `maxBytes` and
-//!    rejects it when a pattern matches; `log` and the chain's `accessLog`
-//!    write one NDJSON line per request. (`authz` and `proxy` land with the
-//!    external-handlers phase and are skipped here with a debug log.)
+//! 2. **Handlers.** The chain's hops and then the upstream's own run as one
+//!    pipeline ([`crate::worker::netd::handlers::Pipeline`]): `authz` and
+//!    `proxy` with the request head, then `dlp` on the buffered body. The
+//!    chain's `accessLog` writes one NDJSON line per request.
 //! 3. **Traffic management** (`connect.upstreams[].http`): a per-request
 //!    deadline, bounded retries for idempotent methods under a budget, a
 //!    weighted split by service tag, and outlier ejection of endpoints that
@@ -32,14 +32,14 @@
 //! budget, requests have a deadline. Per-request logging stays at `debug`.
 
 use crate::prelude::*;
+use crate::structs::hops::HopConfig;
 use crate::structs::netpolicy::{
-    parse_bytes, parse_duration, EffectiveChain, HandlerConfig, RequestFacts, Verdict, HANDLER_DLP,
-    HANDLER_LOG, PROTOCOL_HTTP,
+    parse_duration, EffectiveChain, RequestFacts, Verdict, PROTOCOL_HTTP,
 };
 use crate::structs::{UpstreamCredential, UpstreamHttpConfig, UpstreamTarget};
 use crate::worker::balance::{Balancer, Endpoint, Outcome};
 use crate::worker::forwarder::ForwarderContext;
-use crate::worker::netd::handlers::{self, HopFacts, HopOutcome, ProxyTarget};
+use crate::worker::netd::handlers::{self, HopFacts, HopOutcome, PipelineCache, ProxyTarget};
 use crate::worker::netd::metrics as net_metrics;
 
 use bytes::Bytes;
@@ -56,8 +56,6 @@ use tokio::net::TcpStream;
 
 /// How long an upstream dial may take before it counts as a connect failure.
 const DIAL_TIMEOUT: Duration = Duration::from_secs(2);
-/// Bodies buffered for `dlp` when the handler names no `maxBytes`.
-const DEFAULT_DLP_MAX_BYTES: u64 = 1024 * 1024;
 /// Retry budget window.
 const BUDGET_WINDOW: Duration = Duration::from_secs(60);
 /// Idempotent methods retried by default.
@@ -80,127 +78,6 @@ const HOP_BY_HOP: &[&str] = &[
     "trailer",
     "upgrade",
 ];
-
-/// A compiled `dlp` handler.
-#[derive(Clone)]
-pub(crate) struct Dlp {
-    max_bytes: u64,
-    patterns: Vec<regex::Regex>,
-    on_error_deny: bool,
-    source: String,
-}
-
-impl Dlp {
-    pub(crate) fn on_error_deny(&self) -> bool {
-        self.on_error_deny
-    }
-
-    pub(crate) fn source(&self) -> &str {
-        &self.source
-    }
-
-    /// Compile one `dlp` hop. Patterns were validated at submit, so one that
-    /// fails to compile here is skipped rather than failing the listener.
-    pub(crate) fn compile(handler: &HandlerConfig, source: String) -> Dlp {
-        let max_bytes = handler
-            .config
-            .get("maxBytes")
-            .and_then(|m| parse_bytes(m).ok())
-            .unwrap_or(DEFAULT_DLP_MAX_BYTES);
-        let patterns = handler
-            .config
-            .get("patterns")
-            .and_then(|p| p.as_array())
-            .map(|p| {
-                p.iter()
-                    .filter_map(|v| v.as_str())
-                    .filter_map(|v| regex::Regex::new(v).ok())
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_default();
-        Dlp {
-            max_bytes,
-            patterns,
-            on_error_deny: handler.on_error.as_deref() != Some("allow"),
-            source,
-        }
-    }
-}
-
-/// What the `dlp` hops decided about one buffered body: `None` to send it,
-/// or the deciding hop's source and the reason to deny.
-pub(crate) fn dlp_check(dlps: &[Dlp], bytes: &[u8]) -> Option<(String, String)> {
-    for dlp in dlps {
-        if bytes.len() as u64 > dlp.max_bytes {
-            if dlp.on_error_deny {
-                return Some((dlp.source.clone(), "body larger than dlp maxBytes".into()));
-            }
-            continue;
-        }
-        let text = String::from_utf8_lossy(bytes);
-        if let Some(pattern) = dlp.patterns.iter().find(|p| p.is_match(&text)) {
-            return Some((
-                dlp.source.clone(),
-                format!("body matches dlp pattern {}", pattern.as_str()),
-            ));
-        }
-    }
-    None
-}
-
-/// The body cap for a set of `dlp` hops.
-pub(crate) fn dlp_cap(dlps: &[Dlp]) -> u64 {
-    dlps.iter()
-        .map(|d| d.max_bytes)
-        .max()
-        .unwrap_or(DEFAULT_DLP_MAX_BYTES)
-}
-
-/// A chain's own body-reading hops, compiled once per policy body.
-#[derive(Clone, Default)]
-pub(crate) struct ChainBodyHops {
-    pub(crate) dlp: Arc<Vec<Dlp>>,
-}
-
-/// Compiled chain hops by `<policy hash>|<direction>`. Bounded: cleared when
-/// it grows past what any node runs at once.
-static CHAIN_BODY_HOPS: std::sync::LazyLock<Mutex<HashMap<String, ChainBodyHops>>> =
-    std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
-const CHAIN_BODY_HOPS_MAX: usize = 1024;
-
-/// The `dlp` hops a merged chain declares (inline or from a policy
-/// object), compiled once per policy hash. These run on every HTTP path the
-/// chain governs, beside an upstream's own.
-pub(crate) fn chain_body_hops(
-    policy: &crate::structs::netpolicy::EffectivePolicy,
-    chain: &EffectiveChain,
-    direction: &str,
-) -> ChainBodyHops {
-    let compile = || ChainBodyHops {
-        dlp: Arc::new(
-            chain
-                .handlers
-                .iter()
-                .filter(|hop| hop.handler.handler == HANDLER_DLP)
-                .map(|hop| Dlp::compile(&hop.handler, hop.source.clone()))
-                .collect(),
-        ),
-    };
-    if policy.hash.is_empty() {
-        return compile();
-    }
-    let key = format!("{}|{direction}", policy.hash);
-    let mut cache = CHAIN_BODY_HOPS.lock().unwrap_or_else(|p| p.into_inner());
-    if let Some(hops) = cache.get(&key) {
-        return hops.clone();
-    }
-    if cache.len() >= CHAIN_BODY_HOPS_MAX {
-        cache.clear();
-    }
-    let hops = compile();
-    cache.insert(key, hops.clone());
-    hops
-}
 
 /// A retry policy with defaults filled in.
 #[derive(Clone)]
@@ -321,11 +198,11 @@ pub struct HttpSettings {
     outlier_threshold: Option<u32>,
     outlier_eject: Duration,
     outliers: Mutex<HashMap<String, OutlierState>>,
-    dlp: Arc<Vec<Dlp>>,
-    log_handler: bool,
-    /// The upstream's own handlers (`connect.upstreams[].handlers`); the
-    /// external ones (`authz`, `proxy`) run per request after the chain's.
-    pub handlers: Vec<HandlerConfig>,
+    /// The upstream's own handlers (`connect.upstreams[].handlers`); they run
+    /// per request after the chain's.
+    pub handlers: Vec<HopConfig>,
+    /// The chain's hops plus the upstream's, compiled per policy body.
+    pipelines: PipelineCache,
     /// `connect.upstreams[].credentials`: headers set on every request this
     /// upstream sends, with values from the context's credential store.
     pub credentials: Vec<UpstreamCredential>,
@@ -350,7 +227,7 @@ impl HttpSettings {
         key: String,
         target: Option<UpstreamTarget>,
         config: Option<&UpstreamHttpConfig>,
-        handlers: &[HandlerConfig],
+        handlers: &[HopConfig],
         context: Arc<ForwarderContext>,
         balancer: Arc<dyn Balancer>,
         endpoints: Arc<Mutex<Arc<Vec<Endpoint>>>>,
@@ -378,19 +255,6 @@ impl HttpSettings {
             .and_then(|o| o.eject_for.as_deref())
             .and_then(|d| parse_duration(d).ok())
             .unwrap_or(Duration::from_secs(30));
-        let mut dlp = Vec::new();
-        let mut log_handler = false;
-        for (index, handler) in handlers.iter().enumerate() {
-            match handler.handler.as_str() {
-                HANDLER_DLP => dlp.push(Dlp::compile(handler, format!("upstream/{key}#{index}"))),
-                HANDLER_LOG => log_handler = true,
-                other => debug!(
-                    upstream = %key,
-                    handler = other,
-                    "Handler kind is not served on the datapath yet; skipping"
-                ),
-            }
-        }
         HttpSettings {
             allocation_id,
             key,
@@ -410,9 +274,8 @@ impl HttpSettings {
             outlier_threshold,
             outlier_eject,
             outliers: Mutex::new(HashMap::new()),
-            dlp: Arc::new(dlp),
-            log_handler,
             handlers: handlers.to_vec(),
+            pipelines: PipelineCache::default(),
             credentials: Vec::new(),
         }
     }
@@ -932,16 +795,15 @@ async fn handle(
         path: Some(&path_only),
         headers: &headers,
     };
-    let hops = handlers::hops_for(
-        &settings.context,
-        settings.allocation_id,
+    let pipeline = settings.pipelines.get(
+        policy.as_deref(),
         direction,
         Some(&settings.key),
         &settings.handlers,
     );
     let mut hand_off: Option<ProxyTarget> = None;
-    if !hops.is_empty() {
-        match handlers::run(&settings.context, &hops, &hop_facts).await {
+    if !pipeline.is_empty() {
+        match pipeline.run_request(&settings.context, &hop_facts).await {
             HopOutcome::Allow => {}
             HopOutcome::Deny { source, reason } => {
                 net_metrics::connection(direction, PROTOCOL_HTTP, "deny");
@@ -1020,32 +882,10 @@ async fn handle(
     };
 
     // Split the head from the body. The body is read fully either way (one
-    // upstream connection per request, no streaming yet); `dlp` caps it.
-    // The chain's `dlp` hops (inline or from a policy object) run first, then
-    // the upstream's own, in declaration order.
-    let chain_hops = match (policy.as_deref(), chain) {
-        (Some(policy), Some(chain)) => chain_body_hops(policy, chain, direction),
-        _ => ChainBodyHops::default(),
-    };
-    let dlps: Arc<Vec<Dlp>> = if chain_hops.dlp.is_empty() {
-        settings.dlp.clone()
-    } else if settings.dlp.is_empty() {
-        chain_hops.dlp.clone()
-    } else {
-        Arc::new(
-            chain_hops
-                .dlp
-                .iter()
-                .chain(settings.dlp.iter())
-                .cloned()
-                .collect(),
-        )
-    };
-
-    // Split the head from the body. The body is read fully either way (one
-    // upstream connection per request, no streaming yet); `dlp` caps it.
+    // upstream connection per request, no streaming yet); the pipeline's
+    // body hops (`dlp`) cap it.
     let (parts, body) = req.into_parts();
-    let body_bytes: Bytes = if dlps.is_empty() {
+    let body_bytes: Bytes = if !pipeline.reads_body() {
         match body.collect().await {
             Ok(collected) => collected.to_bytes(),
             Err(err) => {
@@ -1057,10 +897,13 @@ async fn handle(
             }
         }
     } else {
-        match Limited::new(body, dlp_cap(&dlps) as usize).collect().await {
+        match Limited::new(body, pipeline.body_cap() as usize)
+            .collect()
+            .await
+        {
             Ok(collected) => {
                 let bytes = collected.to_bytes();
-                if let Some((source, reason)) = dlp_check(&dlps, &bytes) {
+                if let Some((source, reason)) = pipeline.check_body(&bytes) {
                     net_metrics::connection(direction, PROTOCOL_HTTP, "deny");
                     settings.context.record_denial(
                         settings.allocation_id,
@@ -1101,11 +944,9 @@ async fn handle(
             }
             Err(err) => {
                 // Over the cap, or the client went away mid-body.
-                let deny = dlps.iter().any(|d| d.on_error_deny);
                 debug!(upstream = %settings.key, error = %err, "dlp could not buffer the request body");
-                if deny {
+                if let Some(source) = pipeline.body_unreadable_denied_by() {
                     net_metrics::connection(direction, PROTOCOL_HTTP, "deny");
-                    let source = dlps.first().map(|d| d.source.clone()).unwrap_or_default();
                     note_edge_denied(&settings);
                     return denied_response(
                         direction,
@@ -1179,7 +1020,7 @@ async fn handle(
                 settings.context.note_handler(
                     settings.allocation_id,
                     &target.source,
-                    crate::structs::netpolicy::HANDLER_PROXY,
+                    "proxy",
                     &target.addr,
                     Err(err.to_string()),
                 );
@@ -1373,20 +1214,6 @@ async fn handle(
                     access_log(
                         &settings,
                         chain,
-                        &method,
-                        &path,
-                        host_header.as_deref(),
-                        status.as_u16(),
-                        "allow",
-                        None,
-                        started,
-                        bytes_in,
-                        0,
-                    )
-                    .await;
-                } else if settings.log_handler {
-                    write_access_line(
-                        &settings,
                         &method,
                         &path,
                         host_header.as_deref(),
@@ -1775,22 +1602,13 @@ async fn access_log(
     bytes_in: u64,
     bytes_out: u64,
 ) {
-    if !chain.access_log && !settings.log_handler && !chain_declares_log(chain) {
+    if !chain.access_log {
         return;
     }
     write_access_line(
         settings, method, path, host, status, verdict, source, started, bytes_in, bytes_out,
     )
     .await;
-}
-
-/// Whether a merged chain declares a `log` handler (inline or from a policy
-/// object), which asks for the same access log as `accessLog = true`.
-pub(crate) fn chain_declares_log(chain: &EffectiveChain) -> bool {
-    chain
-        .handlers
-        .iter()
-        .any(|hop| hop.handler.handler == HANDLER_LOG)
 }
 
 /// Append one NDJSON line to `<dir>/net-access.log`, off the async runtime.
@@ -2229,12 +2047,10 @@ mod integration {
             "timeout": "5s"
         }))
         .unwrap();
-        let dlp: crate::structs::netpolicy::HandlerConfig =
-            serde_json::from_value(serde_json::json!({
-                "handler": "dlp",
-                "config": { "maxBytes": "64Ki", "patterns": ["sk-[A-Za-z0-9]{8,}"] }
-            }))
-            .unwrap();
+        let dlp: crate::structs::hops::HopConfig = serde_json::from_value(serde_json::json!({
+            "dlp": { "maxBytes": "64Ki", "patterns": ["sk-[A-Za-z0-9]{8,}"] }
+        }))
+        .unwrap();
         forwarder
             .sync(&[UpstreamSpec {
                 allocation_id: 7,
@@ -2315,9 +2131,9 @@ mod integration {
         );
     }
 
-    /// A `dlp` and a `log` handler declared on the *chain* (here on a policy
-    /// object) run on an HTTP-mode upstream that declares no handlers of its
-    /// own. Before this they passed validation and never ran.
+    /// A `dlp` handler declared on the *chain* (here on a policy object) runs
+    /// on an HTTP-mode upstream that declares no handlers of its own, and the
+    /// chain's `accessLog` writes both requests.
     #[tokio::test]
     async fn chain_dlp_and_log_handlers_run_on_an_http_upstream_test() {
         let (origin, _hits) = start_origin(0).await;
@@ -2327,9 +2143,9 @@ mod integration {
             "egress": {
                 "protocol": "http",
                 "policy": "allow",
+                "accessLog": true,
                 "handlers": [
-                    { "handler": "dlp", "config": { "patterns": ["sk-[A-Za-z0-9]{8,}"] } },
-                    { "handler": "log" }
+                    { "dlp": { "patterns": ["sk-[A-Za-z0-9]{8,}"] } }
                 ]
             }
         }))
@@ -2386,7 +2202,7 @@ mod integration {
         let (status, _, body) = request(port, "GET /fine HTTP/1.1\r\nHost: x\r\n\r\n").await;
         assert_eq!(status, 200, "{body}");
 
-        // The chain's `log` handler wrote both requests.
+        // The chain's access log has both requests.
         let log = logs.path().join("8").join("net-access.log");
         let mut text = String::new();
         for _ in 0..50 {
