@@ -30,6 +30,7 @@ pub mod guest_agent;
 pub mod handlers;
 pub mod http;
 pub mod ingress;
+pub mod kernel;
 pub mod kernel_guard;
 pub mod listen;
 pub mod netns;

@@ -14521,7 +14521,11 @@ mod tests {
         let denied = test("global:batch:jobs:worker").await?;
         assert_eq!(denied.verdict, "deny");
         assert_eq!(denied.source, "service/allow");
-        assert!(denied.reason.contains("not in service.allow"), "{}", denied.reason);
+        assert!(
+            denied.reason.contains("not in service.allow"),
+            "{}",
+            denied.reason
+        );
         assert_eq!(test("global:web:web:web").await?.verdict, "allow");
         assert_eq!(test("global:ops:tools:shell").await?.verdict, "allow");
         Ok(())

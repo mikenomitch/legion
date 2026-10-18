@@ -1,0 +1,30 @@
+#!/bin/sh
+# Rebuild bpf/legion_net.bpf.o from legion_net.bpf.c. The object is checked
+# in, so `cargo build` needs only protoc; CI runs this and fails when the
+# result differs from the committed object (`bpf/build.sh --check`).
+#
+# Needs clang with the bpf target and the kernel UAPI headers
+# (linux-libc-dev). The programs use only stable UAPI context fields, so the
+# object loads on any kernel with the features `netKernel` probes for.
+set -eu
+here=$(cd "$(dirname "$0")" && pwd)
+clang=${CLANG:-clang}
+arch_include=/usr/include/$(uname -m)-linux-gnu
+out="$here/legion_net.bpf.o"
+if [ "${1:-}" = "--check" ]; then
+	out=$(mktemp)
+	trap 'rm -f "$out"' EXIT
+fi
+# -g emits BTF (the loader needs it for the maps); the prefix map keeps the
+# object independent of where the repository is checked out.
+"$clang" -O2 -g -target bpf -Wall -Werror \
+	-fdebug-prefix-map="$here"=bpf \
+	-I"$arch_include" -I"$here" \
+	-c "$here/legion_net.bpf.c" -o "$out"
+if [ "${1:-}" = "--check" ]; then
+	if ! cmp -s "$out" "$here/legion_net.bpf.o"; then
+		echo "bpf/legion_net.bpf.o is stale: run bpf/build.sh and commit the result" >&2
+		exit 1
+	fi
+	echo "bpf/legion_net.bpf.o is current"
+fi
