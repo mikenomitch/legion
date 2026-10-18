@@ -322,14 +322,51 @@ pub struct ForwarderContext {
     /// The host guard in the kernel (`netd::kernel_guard`), on a node that
     /// can run it.
     kernel_guard: Option<Mutex<KernelGuardRuntime>>,
+    /// The node-wide capture listener host-mode flows are redirected to
+    /// when only netd can decide them (`netd::capture`).
+    host_capture: RwLock<Option<std::net::SocketAddrV4>>,
+    /// Each gated allocation's in-namespace capture listener.
+    gated_captures: Mutex<HashMap<i64, std::net::SocketAddrV4>>,
 }
 
+/// The shortest time a learned address stays in the kernel, whatever the
+/// record's TTL: a client that caches longer than the TTL must not be cut
+/// off mid-use (plan §6.A.4).
+pub const LEARNED_TTL_FLOOR: Duration = Duration::from_secs(300);
+
 /// The kernel host guard's state on one worker: the table without its
-/// allocations (ports, operator entries), and what is loaded.
-#[derive(Debug)]
+/// allocations (ports, operator entries), and the backend that enforces it.
 pub struct KernelGuardRuntime {
     pub base: crate::worker::netd::kernel_guard::GuardTable,
-    pub guard: crate::worker::netd::kernel_guard::KernelGuard,
+    pub backend: KernelBackend,
+    /// The eBPF backend's per-allocation report, from the last heartbeat.
+    kernel_status: HashMap<i64, crate::structs::NetKernelStatus>,
+    /// Whether the node-wide guard maps hold `base` and these addresses.
+    applied: Option<Vec<std::net::IpAddr>>,
+}
+
+/// How the host guard (and, with eBPF, the egress chain) is enforced in
+/// the kernel.
+pub enum KernelBackend {
+    /// The `nftables` table (`netd::kernel_guard`): the guard only.
+    Nft(crate::worker::netd::kernel_guard::KernelGuard),
+    /// The kernel classifier (`netd::kernel`): the guard, host-mode egress
+    /// chains, DNS capture, and the capture redirect.
+    #[cfg(target_os = "linux")]
+    Ebpf(Box<crate::worker::netd::kernel::runtime::KernelNet>),
+}
+
+impl std::fmt::Debug for KernelGuardRuntime {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let backend = match &self.backend {
+            KernelBackend::Nft(_) => "nftables",
+            #[cfg(target_os = "linux")]
+            KernelBackend::Ebpf(_) => "ebpf",
+        };
+        f.debug_struct("KernelGuardRuntime")
+            .field("backend", &backend)
+            .finish_non_exhaustive()
+    }
 }
 
 /// The default guard: no operator overrides, the node's current interface
@@ -388,20 +425,90 @@ impl ForwarderContext {
             host_guard: Some(Arc::new(default_host_guard())),
             resolver: None,
             kernel_guard: None,
+            host_capture: RwLock::new(None),
+            gated_captures: Mutex::new(HashMap::new()),
         }
     }
 
+    /// Where host-mode flows only netd can decide are redirected.
+    pub fn set_host_capture(&self, addr: Option<std::net::SocketAddrV4>) {
+        *self.host_capture.write().unwrap_or_else(|p| p.into_inner()) = addr;
+    }
+
+    pub fn host_capture_addr(&self) -> Option<std::net::SocketAddrV4> {
+        *self.host_capture.read().unwrap_or_else(|p| p.into_inner())
+    }
+
+    /// A gated allocation's in-namespace capture listener, or none.
+    pub fn set_gated_capture(&self, allocation_id: i64, addr: Option<std::net::SocketAddrV4>) {
+        let mut captures = lock(&self.gated_captures);
+        match addr {
+            Some(addr) => {
+                captures.insert(allocation_id, addr);
+            }
+            None => {
+                captures.remove(&allocation_id);
+            }
+        }
+    }
+
+    pub fn gated_capture_addr(&self, allocation_id: i64) -> Option<std::net::SocketAddrV4> {
+        lock(&self.gated_captures).get(&allocation_id).copied()
+    }
+
     /// Runs the kernel host guard with `base` (its ports and operator
-    /// entries); the allocations come from each heartbeat.
+    /// entries) on `nftables`; the allocations come from each heartbeat.
     pub fn with_kernel_guard(
         mut self,
         base: crate::worker::netd::kernel_guard::GuardTable,
     ) -> Self {
         self.kernel_guard = Some(Mutex::new(KernelGuardRuntime {
             base,
-            guard: Default::default(),
+            backend: KernelBackend::Nft(Default::default()),
+            kernel_status: HashMap::new(),
+            applied: None,
         }));
         self
+    }
+
+    /// Runs the kernel classifier (`netd::kernel`) with `base`: the guard,
+    /// host-mode egress chains, DNS capture, and the capture redirect.
+    #[cfg(target_os = "linux")]
+    pub fn with_kernel_classifier(
+        mut self,
+        base: crate::worker::netd::kernel_guard::GuardTable,
+        net: crate::worker::netd::kernel::runtime::KernelNet,
+    ) -> Self {
+        self.kernel_guard = Some(Mutex::new(KernelGuardRuntime {
+            base,
+            backend: KernelBackend::Ebpf(Box::new(net)),
+            kernel_status: HashMap::new(),
+            applied: None,
+        }));
+        self
+    }
+
+    /// The kernel backend the worker probed for: the classifier when it
+    /// loaded, else the `nftables` guard when `base` is set.
+    #[cfg(target_os = "linux")]
+    pub fn with_kernel(
+        self,
+        base: Option<crate::worker::netd::kernel_guard::GuardTable>,
+        classifier: Option<crate::worker::netd::kernel::runtime::KernelNet>,
+    ) -> Self {
+        match (base, classifier) {
+            (Some(base), Some(net)) => self.with_kernel_classifier(base, net),
+            (base, _) => self.with_kernel_guard_if(base),
+        }
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    pub fn with_kernel(
+        self,
+        base: Option<crate::worker::netd::kernel_guard::GuardTable>,
+        _classifier: Option<()>,
+    ) -> Self {
+        self.with_kernel_guard_if(base)
     }
 
     /// [`Self::with_kernel_guard`] when `base` is set.
@@ -420,9 +527,19 @@ impl ForwarderContext {
         self.kernel_guard.is_some()
     }
 
-    /// Reloads the kernel table for `allocations` when it changed, and
-    /// records drops since the last call as `host-guard` denials for the
-    /// next heartbeat. Blocking: it runs `nft`.
+    /// Whether the kernel classifier (not only the `nftables` guard) runs.
+    pub fn kernel_classifier_active(&self) -> bool {
+        #[cfg(target_os = "linux")]
+        if let Some(runtime) = &self.kernel_guard {
+            return matches!(lock(runtime).backend, KernelBackend::Ebpf(_));
+        }
+        false
+    }
+
+    /// Brings the kernel up to date with `allocations` (the guard's
+    /// classes, and with eBPF each allocation's compiled egress chain), and
+    /// records what the kernel refused since the last call as denials for
+    /// the next heartbeat. Blocking: it runs `nft` or writes BPF maps.
     pub fn reconcile_kernel_guard(
         &self,
         allocations: Vec<crate::worker::netd::kernel_guard::GuardedAllocation>,
@@ -431,46 +548,308 @@ impl ForwarderContext {
             return;
         };
         let mut runtime = lock(runtime);
-        let mut table = runtime.base.clone();
-        table.allocations = allocations;
-        match runtime.guard.reconcile(table) {
-            Ok(true) => debug!(
-                allocations = runtime.guard.allocations(),
-                "Reloaded the kernel host guard"
-            ),
-            Ok(false) => {}
-            Err(err) => {
-                warn!(error = %format!("{err:#}"), "Failed to load the kernel host guard; retrying on the next heartbeat");
-                return;
+        let runtime = &mut *runtime;
+        match &mut runtime.backend {
+            KernelBackend::Nft(guard) => {
+                let mut table = runtime.base.clone();
+                table.allocations = allocations;
+                match guard.reconcile(table) {
+                    Ok(true) => debug!(
+                        allocations = guard.allocations(),
+                        "Reloaded the kernel host guard"
+                    ),
+                    Ok(false) => {}
+                    Err(err) => {
+                        warn!(error = %format!("{err:#}"), "Failed to load the kernel host guard; retrying on the next heartbeat");
+                        return;
+                    }
+                }
+                let counters = match crate::worker::netd::kernel_guard::read_counters() {
+                    Ok(counters) => counters,
+                    Err(err) => {
+                        debug!(error = %format!("{err:#}"), "Could not read the kernel host guard's counters");
+                        return;
+                    }
+                };
+                for (allocation_id, reason, packets) in guard.new_drops(counters) {
+                    self.record_guard_drop(
+                        allocation_id,
+                        &reason,
+                        u32::try_from(packets).unwrap_or(u32::MAX),
+                    );
+                }
+            }
+            #[cfg(target_os = "linux")]
+            KernelBackend::Ebpf(net) => {
+                let addresses: Vec<std::net::IpAddr> = self
+                    .host_guard
+                    .as_ref()
+                    .map(|guard| guard.node_addrs())
+                    .unwrap_or_default();
+                if runtime.applied.as_ref() != Some(&addresses) {
+                    let applied = net
+                        .set_guard(&runtime.base)
+                        .and_then(|()| net.set_local_addresses(&addresses));
+                    match applied {
+                        Ok(()) => runtime.applied = Some(addresses),
+                        Err(err) => {
+                            warn!(error = %format!("{err:#}"), "Failed to load the kernel guard's maps; retrying on the next heartbeat")
+                        }
+                    }
+                }
+                let (kernel, statuses) = self.kernel_allocations(&allocations);
+                if let Err(err) = net.reconcile(&kernel) {
+                    warn!(error = %format!("{err:#}"), "Failed to update the kernel classifier; retrying on the next heartbeat");
+                }
+                runtime.kernel_status = statuses;
+                self.fold_kernel_reports(net, &mut runtime.kernel_status);
             }
         }
-        let counters = match crate::worker::netd::kernel_guard::read_counters() {
-            Ok(counters) => counters,
-            Err(err) => {
-                debug!(error = %format!("{err:#}"), "Could not read the kernel host guard's counters");
-                return;
-            }
+    }
+
+    /// One `host-guard` denial row, as both backends report them.
+    fn record_guard_drop(&self, allocation_id: i64, reason: &str, count: u32) {
+        let Some(denials) = self.denials.as_ref() else {
+            return;
         };
-        for (allocation_id, reason, packets) in runtime.guard.new_drops(counters) {
-            let Some(denials) = self.denials.as_ref() else {
-                return;
+        let who = self.identity_for(allocation_id);
+        denials.record_count(
+            allocation_id,
+            who.as_ref(),
+            "egress",
+            "tcp",
+            reason,
+            crate::structs::host_guard::HOST_GUARD_SOURCE,
+            Some(&format!(
+                "dropped in the kernel: {reason}; allocations may not reach it"
+            )),
+            None,
+            "",
+            "",
+            count,
+        );
+    }
+
+    /// What the classifier should hold for each allocation, and the status
+    /// each gets reported with.
+    #[cfg(target_os = "linux")]
+    fn kernel_allocations(
+        &self,
+        allocations: &[crate::worker::netd::kernel_guard::GuardedAllocation],
+    ) -> (
+        Vec<crate::worker::netd::kernel::runtime::KernelAllocation>,
+        HashMap<i64, crate::structs::NetKernelStatus>,
+    ) {
+        use crate::worker::netd::kernel::compile::compile;
+        let capture = self.host_capture_addr();
+        let mut out = Vec::new();
+        let mut statuses = HashMap::new();
+        for allocation in allocations {
+            let mut status = crate::structs::NetKernelStatus {
+                attached: true,
+                ..Default::default()
             };
-            let who = self.identity_for(allocation_id);
-            denials.record_count(
-                allocation_id,
-                who.as_ref(),
-                "egress",
-                "tcp",
-                &reason,
-                crate::structs::host_guard::HOST_GUARD_SOURCE,
-                Some(&format!(
-                    "dropped in the kernel: {reason}; allocations may not reach it"
-                )),
-                None,
-                "",
-                "",
-                u32::try_from(packets).unwrap_or(u32::MAX),
-            );
+            let policy = self.policy_for(allocation.allocation_id);
+            let chain = match policy.as_ref().and_then(|policy| policy.egress.as_ref()) {
+                Some(chain) if allocation.host_sockets && !allocation.gated => match compile(chain)
+                {
+                    Ok(compiled) => {
+                        status.enforced = true;
+                        status.rules = compiled.rules.len() as u32;
+                        Some(compiled)
+                    }
+                    Err(unsupported) => {
+                        status.reason = format!("egress is judged by netd only: {}", unsupported.0);
+                        None
+                    }
+                },
+                Some(_) if !allocation.host_sockets => {
+                    status.reason =
+                        "a sandbox's sockets live in its guest; netd judges them".into();
+                    None
+                }
+                _ => None,
+            };
+            let capture = if allocation.gated {
+                self.gated_capture_addr(allocation.allocation_id)
+            } else if chain.is_some() {
+                capture
+            } else {
+                None
+            };
+            status.capture = capture.is_some();
+            out.push(crate::worker::netd::kernel::runtime::KernelAllocation {
+                allocation_id: allocation.allocation_id,
+                cgroup: allocation.cgroup.clone(),
+                vip_block: allocation.vip_block.clone(),
+                loopback_ports: allocation.loopback_ports.clone(),
+                resolver: allocation.resolver,
+                gated: allocation.gated,
+                capture,
+                chain,
+            });
+            statuses.insert(allocation.allocation_id, status);
+        }
+        (out, statuses)
+    }
+
+    /// Fold what the classifier saw since the last beat into the denial
+    /// ledger, the connection metrics, the idle ledger, and each
+    /// allocation's counters.
+    #[cfg(target_os = "linux")]
+    fn fold_kernel_reports(
+        &self,
+        net: &mut crate::worker::netd::kernel::runtime::KernelNet,
+        statuses: &mut HashMap<i64, crate::structs::NetKernelStatus>,
+    ) {
+        use crate::worker::netd::kernel::abi;
+        for event in net.events() {
+            let id = event.allocation_id;
+            let destination = event.destination().to_string();
+            let protocol = if event.protocol == 17 { "udp" } else { "tcp" };
+            let reason_for_guard = match event.kind {
+                abi::EV_METADATA => Some(crate::worker::netd::kernel_guard::DROP_METADATA),
+                abi::EV_DENY_LIST => Some(crate::worker::netd::kernel_guard::DROP_DENY),
+                abi::EV_CONTROL => Some(crate::worker::netd::kernel_guard::DROP_CONTROL),
+                abi::EV_DATAPATH => Some(crate::worker::netd::kernel_guard::DROP_DATAPATH),
+                _ => None,
+            };
+            if let Some(reason) = reason_for_guard {
+                self.record_guard_drop(id, reason, 1);
+                continue;
+            }
+            let (source, reason) = match event.kind {
+                abi::EV_RULE => net
+                    .chain(id)
+                    .and_then(|chain| chain.label(event.index))
+                    .map(|(source, reason)| (source.clone(), reason.clone()))
+                    .unwrap_or_else(|| ("policy".to_string(), None)),
+                abi::EV_FALLTHROUGH => (
+                    "fallthrough".to_string(),
+                    Some("no rule matched and chain.policy is deny".to_string()),
+                ),
+                abi::EV_NEEDS_NETD if event.index == abi::INDEX_UNLEARNED => (
+                    crate::structs::netpolicy::SOURCE_KERNEL_UNLEARNED.to_string(),
+                    Some(format!(
+                        "{destination} was not returned by the allocation's resolver for a name \
+                         a host rule allows, and capture is off on this node"
+                    )),
+                ),
+                abi::EV_NEEDS_NETD => (
+                    net.chain(id)
+                        .and_then(|chain| chain.label(event.index))
+                        .map(|(source, _)| source.clone())
+                        .unwrap_or_else(|| "policy".to_string()),
+                    Some("the rule needs the request head, and capture is off on this node".into()),
+                ),
+                abi::EV_RAW_SOCKET => (
+                    crate::structs::host_guard::HOST_GUARD_SOURCE.to_string(),
+                    Some("raw and packet sockets are refused to governed tasks".into()),
+                ),
+                _ => continue,
+            };
+            if let Some(denials) = self.denials.as_ref() {
+                let who = self.identity_for(id);
+                denials.record_count(
+                    id,
+                    who.as_ref(),
+                    "egress",
+                    protocol,
+                    &destination,
+                    &source,
+                    reason.as_deref(),
+                    None,
+                    "",
+                    "",
+                    1,
+                );
+            }
+        }
+        for (id, slot, allowed, count) in net.counters() {
+            let verdict = if slot == abi::SLOT_REDIRECT {
+                "redirect"
+            } else if allowed {
+                "allow"
+            } else {
+                "deny"
+            };
+            crate::worker::netd::metrics::connections("egress", "tcp", verdict, count);
+            if let Some(status) = statuses.get_mut(&id) {
+                match verdict {
+                    "redirect" => status.redirected += count,
+                    "allow" => status.passed += count,
+                    _ => status.denied += count,
+                }
+            }
+        }
+        for (id, (tx, rx)) in net.bytes() {
+            self.activity.touch_external(id);
+            crate::worker::netd::metrics::bytes("egress", tx);
+            crate::worker::netd::metrics::bytes("ingress", rx);
+        }
+    }
+
+    /// The classifier's report for one allocation, when it runs.
+    pub fn kernel_status(&self, allocation_id: i64) -> Option<crate::structs::NetKernelStatus> {
+        let runtime = self.kernel_guard.as_ref()?;
+        lock(runtime).kernel_status.get(&allocation_id).cloned()
+    }
+
+    /// Teach the classifier the addresses an allowed name resolved to, so
+    /// host rules decide at `connect()` (plan §6.A.4). No-op without it.
+    pub fn kernel_learn(
+        &self,
+        allocation_id: i64,
+        name: &str,
+        addresses: &[std::net::IpAddr],
+        ttl: Duration,
+    ) {
+        #[cfg(target_os = "linux")]
+        if let Some(runtime) = &self.kernel_guard {
+            let mut runtime = lock(runtime);
+            if let KernelBackend::Ebpf(net) = &mut runtime.backend {
+                let Some(bits) = net
+                    .chain(allocation_id)
+                    .filter(|chain| chain.has_hosts())
+                    .map(|chain| chain.learned_bits(name))
+                else {
+                    return;
+                };
+                net.learn(allocation_id, addresses, bits, ttl.max(LEARNED_TTL_FLOOR));
+            }
+        }
+        #[cfg(not(target_os = "linux"))]
+        let _ = (allocation_id, name, addresses, ttl);
+    }
+
+    /// The original destination of a flow the classifier redirected, by
+    /// the capture listener's netns cookie and the peer it accepted.
+    pub fn kernel_original_destination(
+        &self,
+        netns: u64,
+        peer: SocketAddr,
+    ) -> Option<(SocketAddr, i64)> {
+        #[cfg(target_os = "linux")]
+        if let Some(runtime) = &self.kernel_guard {
+            if let KernelBackend::Ebpf(net) = &mut lock(runtime).backend {
+                return net.original_destination(netns, peer);
+            }
+        }
+        #[cfg(not(target_os = "linux"))]
+        let _ = (netns, peer);
+        None
+    }
+
+    /// Detach the classifier and remove its pins (clean shutdown).
+    pub fn shutdown_kernel(&self) {
+        #[cfg(target_os = "linux")]
+        if let Some(runtime) = &self.kernel_guard {
+            let mut runtime = lock(runtime);
+            let backend =
+                std::mem::replace(&mut runtime.backend, KernelBackend::Nft(Default::default()));
+            if let KernelBackend::Ebpf(net) = backend {
+                net.shutdown();
+            }
         }
     }
 

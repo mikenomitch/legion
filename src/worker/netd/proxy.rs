@@ -92,6 +92,9 @@ struct Listener {
     spec: ProxySpec,
     task: Option<JoinHandle<()>>,
     addr: Option<SocketAddr>,
+    /// The allocation's in-namespace capture listener, on a node whose
+    /// kernel classifier redirects its flows here.
+    capture: Option<JoinHandle<()>>,
 }
 
 impl Listener {
@@ -142,6 +145,10 @@ impl EgressProxies {
                 if let Some(task) = listener.task.take() {
                     stopped.push(task);
                 }
+                if let Some(task) = listener.capture.take() {
+                    stopped.push(task);
+                }
+                self.context.set_gated_capture(*id, None);
                 false
             });
             for (id, spec) in wanted {
@@ -193,9 +200,71 @@ impl EgressProxies {
     /// owns.
     fn install(&self, listener: Listener) {
         let replaced = lock(&self.listeners).insert(listener.spec.allocation_id, listener);
-        if let Some(task) = replaced.and_then(|mut old| old.task.take()) {
-            task.abort();
+        if let Some(mut old) = replaced {
+            if let Some(task) = old.task.take() {
+                task.abort();
+            }
+            if let Some(task) = old.capture.take() {
+                task.abort();
+            }
         }
+    }
+
+    /// Bind a gated allocation's capture listener inside its namespace
+    /// (`127.0.0.1:1081`, beside the proxy), when the kernel classifier runs
+    /// and can redirect there. A gated sandbox's sockets live in its guest,
+    /// which the classifier never sees, so it gets none.
+    async fn start_capture(&self, spec: &ProxySpec) -> Option<JoinHandle<()>> {
+        if !self.context.kernel_classifier_active() || spec.attachment.guest_vsock().is_some() {
+            return None;
+        }
+        let listen = spec.attachment.listen(
+            IpAddr::V4(PROXY_ADDR),
+            crate::worker::netd::capture::GATED_CAPTURE_PORT,
+        );
+        let listener = match listen.bind().await {
+            Ok(listener) => listener,
+            Err(err) => {
+                warn!(allocation_id = spec.allocation_id, error = ?err, "Failed to bind the capture listener; flows only netd can decide are refused until the next heartbeat");
+                return None;
+            }
+        };
+        let netns = match &listener {
+            crate::worker::netd::listen::Listener::Tcp(tcp) => {
+                crate::worker::netd::capture::netns_cookie(tcp).ok()?
+            }
+            _ => return None,
+        };
+        let proxy = Proxy::new(spec.allocation_id, true, self.context.clone());
+        self.context.set_gated_capture(
+            spec.allocation_id,
+            Some(std::net::SocketAddrV4::new(
+                PROXY_ADDR,
+                crate::worker::netd::capture::GATED_CAPTURE_PORT,
+            )),
+        );
+        Some(spawn_accept_loop(
+            listener,
+            "capture",
+            move |client, peer| {
+                let proxy = proxy.clone();
+                async move {
+                    let Some(peer) = peer else {
+                        return;
+                    };
+                    let Some((original, allocation_id)) =
+                        proxy.context.kernel_original_destination(netns, peer)
+                    else {
+                        return;
+                    };
+                    if allocation_id != proxy.allocation_id {
+                        return;
+                    }
+                    let client = proxy.context.activity().track(allocation_id, client);
+                    serve_captured(proxy, client, Some(peer), original).await;
+                }
+            },
+        ))
     }
 
     /// The bound address of an allocation's proxy, when it is serving on a
@@ -227,6 +296,7 @@ impl EgressProxies {
                     context: self.context.clone(),
                     pipelines: handlers::PipelineCache::default(),
                 });
+                let capture = self.start_capture(&spec).await;
                 let task = spawn_accept_loop(listener, "egress proxy", move |client, peer| {
                     // Counted as open (and its bytes as activity, as they
                     // move) for the idle policy's `connections` and
@@ -244,6 +314,7 @@ impl EgressProxies {
                     spec,
                     task: Some(task),
                     addr: bound,
+                    capture,
                 });
             }
             Err(err) => {
@@ -257,6 +328,7 @@ impl EgressProxies {
                     spec,
                     task: None,
                     addr: None,
+                    capture: None,
                 });
             }
         }
@@ -269,6 +341,9 @@ impl Drop for EgressProxies {
             if let Some(task) = listener.task.take() {
                 task.abort();
             }
+            if let Some(task) = listener.capture.take() {
+                task.abort();
+            }
         }
     }
 }
@@ -277,7 +352,7 @@ fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(|p| p.into_inner())
 }
 
-struct Proxy {
+pub(crate) struct Proxy {
     allocation_id: i64,
     /// A gated proxy fails closed while its policy is still pending or its
     /// edge-boot gate is shut.
@@ -285,6 +360,263 @@ struct Proxy {
     context: Arc<ForwarderContext>,
     /// The egress chain's hops, compiled per policy body.
     pipelines: handlers::PipelineCache,
+}
+
+/// The proxy state the capture listener judges a redirected flow with.
+pub(crate) type CaptureProxy = Proxy;
+
+impl Proxy {
+    /// A proxy for `allocation_id`'s captured flows (`netd::capture`).
+    pub(crate) fn new(
+        allocation_id: i64,
+        gated: bool,
+        context: Arc<ForwarderContext>,
+    ) -> Arc<Self> {
+        Arc::new(Proxy {
+            allocation_id,
+            gated,
+            context,
+            pipelines: handlers::PipelineCache::default(),
+        })
+    }
+}
+
+/// A flow the kernel classifier redirected to a capture listener
+/// (`netd::capture`): the task dialed `original` directly, with no proxy
+/// protocol. The first bytes name the destination (TLS SNI or HTTP
+/// `Host`), and a named flow is allowed only if `original` is one of that
+/// name's addresses. Then it is judged and dialed exactly as a `CONNECT` to
+/// the gated proxy is, or, for plaintext HTTP under an HTTP chain, served
+/// request by request as absolute-URI requests are.
+pub(crate) async fn serve_captured<S>(
+    proxy: Arc<Proxy>,
+    mut client: S,
+    peer: Option<SocketAddr>,
+    original: SocketAddr,
+) where
+    S: SpliceStream + Send + 'static,
+{
+    use crate::worker::netd::capture::{peek, read_first, Peeked};
+    let first = read_first(&mut client).await;
+    let peeked = peek(&first);
+    let destination = original.to_string();
+    let label = peeked
+        .name()
+        .map(str::to_string)
+        .unwrap_or_else(|| original.ip().to_string());
+    // A gated allocation fails closed, here as at its proxy.
+    if proxy.gated && netns::gate_is_shut(proxy.allocation_id) {
+        refuse_captured(
+            &proxy,
+            &label,
+            &destination,
+            "gate".to_string(),
+            Some("network gate is shut until the placement is ratified".into()),
+        );
+        return;
+    }
+    let policy = proxy.context.policy_for(proxy.allocation_id);
+    if proxy.gated && policy.is_none() && !proxy.context.policy_known(proxy.allocation_id) {
+        refuse_captured(
+            &proxy,
+            &label,
+            &destination,
+            "policy-pending".to_string(),
+            Some("network policy has not arrived yet".into()),
+        );
+        return;
+    }
+    let http_chain = policy
+        .as_ref()
+        .and_then(|policy| policy.egress.as_ref())
+        .is_some_and(|chain| chain.is_http());
+    if let Some(name) = peeked.name() {
+        if let Err(Refused::Denied(source, reason)) =
+            name_owns_address(&proxy, name, original).await
+        {
+            refuse_captured(&proxy, name, &destination, source, reason);
+            return;
+        }
+    }
+    let client = Prefixed::new(first, client);
+    if let (Peeked::Http(Some(host)), true) = (&peeked, http_chain) {
+        serve_captured_http(client, peer, proxy, host.clone(), original.port()).await;
+        return;
+    }
+    let host = peeked.name().map(str::to_string);
+    let verdict = connect_verdict(
+        &proxy,
+        policy.as_deref(),
+        &ConnectFacts {
+            host: host.as_deref(),
+            ip: Some(original.ip()),
+            port: original.port(),
+            identity: None,
+        },
+    );
+    match verdict {
+        Verdict::Allow => {}
+        Verdict::Deny { source, reason } => {
+            refuse_captured(&proxy, &label, &destination, source, reason);
+            return;
+        }
+        Verdict::Defer => {
+            let source = crate::structs::netpolicy::deferring_rule(
+                policy
+                    .as_ref()
+                    .and_then(|p| p.egress.as_ref())
+                    .expect("a verdict defers only with a chain"),
+                &ConnectFacts {
+                    host: host.as_deref(),
+                    ip: Some(original.ip()),
+                    port: original.port(),
+                    identity: None,
+                },
+            )
+            .unwrap_or_else(|| "policy".to_string());
+            refuse_captured(
+                &proxy,
+                &label,
+                &destination,
+                source,
+                Some("a request-time rule decides this flow, and it is not plaintext HTTP".into()),
+            );
+            return;
+        }
+    }
+    let hop_facts = HopFacts {
+        allocation_id: proxy.allocation_id,
+        direction: "egress",
+        protocol: PROTOCOL_TCP,
+        destination: &destination,
+        host: host.as_deref(),
+        ip: Some(original.ip()),
+        port: original.port(),
+        ..Default::default()
+    };
+    let upstream = match hops(&proxy, &hop_facts).await {
+        HopOutcome::Allow => dial(&[original]).await,
+        HopOutcome::Deny { source, reason } => {
+            refuse_captured(&proxy, &label, &destination, source, reason);
+            return;
+        }
+        HopOutcome::Proxy(target) => dial_proxy_target(&proxy, &target, &hop_facts, peer).await,
+    };
+    let Some(upstream) = upstream else {
+        net_metrics::connection("egress", PROTOCOL_TCP, "error");
+        proxy
+            .context
+            .edges()
+            .record_connection(proxy.allocation_id, &label, None, false);
+        return;
+    };
+    net_metrics::connection("egress", PROTOCOL_TCP, "allow");
+    proxy
+        .context
+        .edges()
+        .record_connection(proxy.allocation_id, &label, None, true);
+    splice(&proxy, &label, client, upstream, &[]).await;
+}
+
+/// A captured flow names `name`: the address the task dialed must be one
+/// of that name's, or the name is a lie told to pass a host rule.
+async fn name_owns_address(proxy: &Proxy, name: &str, original: SocketAddr) -> Result<(), Refused> {
+    match guard::resolve_and_guard(
+        proxy.context.resolver(),
+        proxy.context.host_guard(),
+        name,
+        original.port(),
+    )
+    .await
+    {
+        Ok(addrs) if addrs.iter().any(|addr| addr.ip() == original.ip()) => Ok(()),
+        Ok(_) | Err(GuardRefusal::Unresolved(_)) => Err(Refused::Denied(
+            crate::structs::netpolicy::SOURCE_CAPTURE_NAME.to_string(),
+            Some(format!(
+                "the flow names {name}, but {} is not one of {name}'s addresses",
+                original.ip()
+            )),
+        )),
+        Err(GuardRefusal::Denied(reason)) => Err(Refused::Denied(
+            crate::structs::host_guard::HOST_GUARD_SOURCE.to_string(),
+            Some(reason),
+        )),
+    }
+}
+
+/// Record a refused captured flow and close it (there is no HTTP answer to
+/// give a stream the task opened with `connect()`).
+fn refuse_captured(
+    proxy: &Proxy,
+    host: &str,
+    destination: &str,
+    source: String,
+    reason: Option<String>,
+) {
+    net_metrics::connection("egress", PROTOCOL_TCP, "deny");
+    proxy
+        .context
+        .edges()
+        .record_denied(proxy.allocation_id, host, PROTOCOL_TCP);
+    proxy.context.record_denial(
+        proxy.allocation_id,
+        "egress",
+        PROTOCOL_TCP,
+        destination,
+        &source,
+        reason.as_deref(),
+        "",
+        "",
+    );
+}
+
+/// Plaintext HTTP under an HTTP chain: each origin-form request is served
+/// as the absolute-URI request it names (`http://<Host><path>`), judged
+/// with its head like any request to the gated proxy.
+async fn serve_captured_http<S>(
+    client: S,
+    peer: Option<SocketAddr>,
+    proxy: Arc<Proxy>,
+    host: String,
+    port: u16,
+) where
+    S: SpliceStream + Send + 'static,
+{
+    let service = hyper::service::service_fn(move |mut request: Request<Incoming>| {
+        let proxy = proxy.clone();
+        let fallback = host.clone();
+        async move {
+            let named = request
+                .headers()
+                .get(header::HOST)
+                .and_then(|value| value.to_str().ok())
+                .map(|value| split_host_port(value, port).0)
+                .unwrap_or(fallback);
+            let path = request
+                .uri()
+                .path_and_query()
+                .map(|p| p.as_str().to_string())
+                .unwrap_or_else(|| "/".to_string());
+            let authority = if port == 80 {
+                named
+            } else {
+                format!("{named}:{port}")
+            };
+            match format!("http://{authority}{path}").parse() {
+                Ok(uri) => *request.uri_mut() = uri,
+                Err(_) => return Ok::<_, hyper::Error>(status_response(StatusCode::BAD_REQUEST)),
+            }
+            Ok(forward_absolute(request, peer, proxy).await)
+        }
+    });
+    if let Err(err) = hyper::server::conn::http1::Builder::new()
+        .preserve_header_case(true)
+        .max_buf_size(MAX_HEAD)
+        .serve_connection(TokioIo::new(client), service)
+        .await
+    {
+        debug!(error = ?err, "Captured HTTP connection ended with an error");
+    }
 }
 
 /// An HTTP request head as policy sees it: method, path, lower-cased headers.

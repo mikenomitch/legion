@@ -453,10 +453,22 @@ async fn run_worker_with_manager(join: WorkerJoin, name_override: Option<&str>) 
     let enforcement_config =
         usable_resource_enforcement(parse_resource_enforcement(&config.resource_enforcement));
     apply_resource_enforcement_env(&enforcement_config);
-    // The host guard in the kernel (worker-plane-auth plan §6.13). It
-    // matches sockets by cgroup leaf, so where it runs every task gets one,
-    // enforcement or not.
-    let kernel_guard = crate::worker::netd::kernel_guard::probe();
+    // The kernel classifier (mesh interfaces plan §6.A) where the node can
+    // run it: the host guard, host-mode egress chains, and DNS capture, in
+    // eBPF. Elsewhere, the host guard in `nftables` (worker-plane-auth plan
+    // §6.13). Both match sockets by cgroup leaf, so where either runs every
+    // task gets one, enforcement or not.
+    let (net_kernel, classifier) = open_kernel_classifier(&enforcement_config.cgroup_parent);
+    let kernel_guard = if classifier.is_some() {
+        crate::worker::netd::kernel_guard::Availability::Active
+    } else {
+        crate::worker::netd::kernel_guard::probe()
+    };
+    let host_guard_attribute = if classifier.is_some() {
+        "active (ebpf)".to_string()
+    } else {
+        kernel_guard.attribute()
+    };
     match &kernel_guard {
         crate::worker::netd::kernel_guard::Availability::Active => {
             std::env::set_var(crate::constants::ENV_HOST_GUARD_KERNEL, "1");
@@ -465,8 +477,13 @@ async fn run_worker_with_manager(join: WorkerJoin, name_override: Option<&str>) 
                 &enforcement_config.cgroup_parent,
             );
             info!(
-                "Host guard active in the kernel (nftables): host-mode tasks cannot reach this \
-                 node's Legion ports, cloud metadata, or other allocations' listeners"
+                backend = if classifier.is_some() {
+                    "ebpf"
+                } else {
+                    "nftables"
+                },
+                "Host guard active in the kernel: host-mode tasks cannot reach this node's \
+                 Legion ports, cloud metadata, or other allocations' listeners"
             );
         }
         crate::worker::netd::kernel_guard::Availability::Unavailable(reason) => {
@@ -696,7 +713,11 @@ async fn run_worker_with_manager(join: WorkerJoin, name_override: Option<&str>) 
     // `legion node info` shows whether host-mode tasks are guarded here.
     config_attrs.insert(
         crate::worker::netd::kernel_guard::NODE_ATTR.into(),
-        Value::String(kernel_guard.attribute()),
+        Value::String(host_guard_attribute.clone()),
+    );
+    config_attrs.insert(
+        crate::worker::netd::kernel::NODE_ATTR.into(),
+        Value::String(net_kernel.attribute()),
     );
     if let Some(public_address) = worker_public_address() {
         config_attrs.insert("publicAddress".into(), Value::String(public_address));
@@ -771,7 +792,7 @@ async fn run_worker_with_manager(join: WorkerJoin, name_override: Option<&str>) 
         )
         .with_logs_base_dir(logs_base_dir.clone())
         .with_host_guard(host_guard.clone())
-        .with_kernel_guard_if(
+        .with_kernel(
             (kernel_guard == crate::worker::netd::kernel_guard::Availability::Active).then(|| {
                 kernel_guard_base(
                     &config.security,
@@ -780,8 +801,25 @@ async fn run_worker_with_manager(join: WorkerJoin, name_override: Option<&str>) 
                     &enforcement_config.cgroup_parent,
                 )
             }),
+            classifier,
         ),
     );
+    // Where the kernel classifier redirects host-mode flows only netd can
+    // decide. Held for the worker's lifetime.
+    let _host_capture = if net_context.kernel_classifier_active() {
+        match crate::worker::netd::capture::HostCapture::start(net_context.clone()).await {
+            Ok(capture) => {
+                net_context.set_host_capture(Some(capture.addr));
+                Some(capture)
+            }
+            Err(err) => {
+                warn!(error = %format!("{err:#}"), "Capture listener unavailable; host-mode flows only netd can decide are refused");
+                None
+            }
+        }
+    } else {
+        None
+    };
     let net_dns = Arc::new(crate::worker::netd::dns::NetDns::new(
         net_context.clone(),
         crate::worker::netd::dns::NetDns::host_forwarders(),
@@ -1355,6 +1393,63 @@ impl crate::worker::server::ClaimRatifier for ManagerClaimRatifier {
     }
 }
 
+/// Probe for the kernel classifier and, when the node can run it, load and
+/// attach it under the worker's cgroup parent, pinned in bpffs when bpffs is
+/// mounted (so enforcement survives a worker restart). The probe's answer is
+/// the `netKernel` node attribute.
+#[cfg(target_os = "linux")]
+fn open_kernel_classifier(
+    cgroup_parent: &str,
+) -> (
+    crate::worker::netd::kernel::probe::Availability,
+    Option<crate::worker::netd::kernel::runtime::KernelNet>,
+) {
+    use crate::worker::netd::kernel::probe::{probe, Availability};
+    use crate::worker::netd::kernel::runtime::{KernelNet, KernelSettings};
+    let root = std::path::Path::new(crate::task_plugins::CGROUP_ROOT);
+    let availability = probe(root);
+    if !availability.is_active() {
+        if let Availability::Unavailable(reason) = &availability {
+            info!(%reason, "Kernel classifier unavailable; host-mode egress stays cooperative");
+        }
+        return (availability, None);
+    }
+    let bpffs = std::fs::read_to_string("/proc/mounts")
+        .unwrap_or_default()
+        .lines()
+        .any(|line| {
+            line.split_whitespace().nth(1) == Some("/sys/fs/bpf") && line.contains(" bpf ")
+        });
+    if !bpffs {
+        warn!("No bpffs at /sys/fs/bpf: the kernel classifier stops enforcing while the worker restarts");
+    }
+    match KernelNet::open(KernelSettings {
+        cgroup_root: root.to_path_buf(),
+        cgroup_parent: cgroup_parent.to_string(),
+        pin_dir: bpffs.then(|| std::path::PathBuf::from("/sys/fs/bpf/legion")),
+    }) {
+        Ok(net) => {
+            info!("Kernel classifier active: host-mode egress chains are enforced at connect()");
+            (availability, Some(net))
+        }
+        Err(err) => {
+            let reason = format!("{err:#}");
+            warn!(%reason, "Kernel classifier failed to load; using the nftables guard");
+            (Availability::Unavailable(reason), None)
+        }
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn open_kernel_classifier(
+    _cgroup_parent: &str,
+) -> (crate::worker::netd::kernel::probe::Availability, Option<()>) {
+    (
+        crate::worker::netd::kernel::probe::Availability::Unavailable("not Linux".into()),
+        None,
+    )
+}
+
 /// The host guard this worker type's `hostGuard` block describes. A block
 /// the manager validated can't fail here; if it somehow does, the worker
 /// keeps the default guard (no overrides), which refuses more, never less.
@@ -1444,6 +1539,12 @@ fn kernel_guarded_allocations(
                 vip_block: network
                     .as_ref()
                     .and_then(|network| network.vip_block.clone()),
+                resolver: network
+                    .as_ref()
+                    .and_then(|network| network.resolver_address())
+                    .and_then(|addr| addr.parse().ok()),
+                gated: network.as_ref().is_some_and(|network| network.is_gated()),
+                host_sockets: allocation.task_runtime != "sandbox",
                 loopback_ports: network
                     .map(|network| {
                         network

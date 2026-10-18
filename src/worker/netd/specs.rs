@@ -526,6 +526,7 @@ pub fn net_status(
                 .map(|lease| lease.address.to_string())
                 .unwrap_or_default(),
             guest_bridge: lease.map(|lease| lease.bridge).unwrap_or_default(),
+            kernel: context.kernel_status(id),
         });
     }
     out

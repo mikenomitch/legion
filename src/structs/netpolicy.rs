@@ -87,6 +87,15 @@ pub fn gated_default_hint(destination: &str) -> String {
     )
 }
 
+/// The denial source when a host rule could match an address the kernel
+/// classifier never learned through the allocation's resolver, on a node
+/// that cannot capture the flow for netd to read its name.
+pub const SOURCE_KERNEL_UNLEARNED: &str = "kernel/unlearned";
+
+/// The denial source when a captured flow's SNI or `Host` names a host the
+/// address it dialed does not belong to.
+pub const SOURCE_CAPTURE_NAME: &str = "capture/name";
+
 /// The source of the first ingress rule a `service.mesh = true` service's
 /// `service.allow` compiles to.
 pub const SOURCE_SERVICE_ALLOW: &str = "service/allow";

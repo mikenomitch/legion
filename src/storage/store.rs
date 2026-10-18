@@ -13256,6 +13256,28 @@ impl Store {
         task_id: i64,
         network: Option<&crate::structs::NetworkConfig>,
     ) -> R<bool> {
+        self.policy_declares(tx, node_id, task_id, network, true)
+    }
+
+    /// Whether a stored policy matching this task declares an egress chain.
+    fn policy_declares_egress(
+        &self,
+        tx: &Connection,
+        node_id: &str,
+        task_id: i64,
+        network: Option<&crate::structs::NetworkConfig>,
+    ) -> R<bool> {
+        self.policy_declares(tx, node_id, task_id, network, false)
+    }
+
+    fn policy_declares(
+        &self,
+        tx: &Connection,
+        node_id: &str,
+        task_id: i64,
+        network: Option<&crate::structs::NetworkConfig>,
+        ingress: bool,
+    ) -> R<bool> {
         if self.net_policy_generation().unwrap_or(0) == 0 {
             return Ok(false);
         }
@@ -13286,7 +13308,14 @@ impl Store {
             .list_net_policies()?
             .into_iter()
             .map(|record| record.object)
-            .any(|policy| policy.ingress.is_some() && policy.selector.matches(&facts)))
+            .any(|policy| {
+                let declares = if ingress {
+                    policy.ingress.is_some()
+                } else {
+                    policy.egress.is_some()
+                };
+                declares && policy.selector.matches(&facts)
+            }))
     }
 
     /// The port that terminates mesh mTLS, if any: the service's port, when
@@ -13543,7 +13572,19 @@ impl Store {
         let runtime = self.task_runtime(tx, task_id)?;
         let sandbox = runtime.as_deref() == Some("sandbox");
         let gated_namespace = gated && !sandbox;
-        if !has_ports && !has_upstreams {
+        // A host-mode task whose egress chain the kernel classifier enforces
+        // needs a resolver of its own: its answers teach the kernel which
+        // addresses a host rule allows (plan §6.A.4, open question 5). A
+        // VIP block's `.1` is that resolver, so such a task gets a block.
+        // Cheapest first: a plain job pays no node read here.
+        let wants_resolver = !gated
+            && !sandbox
+            && (network.as_ref().is_some_and(|n| n.egress.is_some())
+                || self.policy_declares_egress(tx, node_id, task_id, network.as_ref())?)
+            && crate::structs::network::node_supports_vip_blocks(
+                self.node_os(tx, node_id)?.as_deref(),
+            );
+        if !has_ports && !has_upstreams && !wants_resolver {
             // No ports and no upstreams: the row carries a network only when
             // a mode other than `host` applies (the task asked for `gated`,
             // the node defaults it, or a required policy imposes it), so
@@ -13596,10 +13637,11 @@ impl Store {
         // a VIP on the port the service declared. Only where the platform
         // routes 127/8; a block that cannot be assigned is not a placement
         // failure — the loopback ports still work — so this is best effort.
-        let (vip_block, service_ports) = if has_upstreams
-            && crate::structs::network::node_supports_vip_blocks(
-                self.node_os(tx, node_id)?.as_deref(),
-            ) {
+        let (vip_block, service_ports) = if wants_resolver
+            || (has_upstreams
+                && crate::structs::network::node_supports_vip_blocks(
+                    self.node_os(tx, node_id)?.as_deref(),
+                )) {
             let block = crate::structs::next_vip_block(&used_blocks).ok();
             if block.is_none() {
                 warn!(node_id = %node_id, "No free VIP block; upstreams get loopback ports only");

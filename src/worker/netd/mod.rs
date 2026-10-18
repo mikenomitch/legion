@@ -22,6 +22,7 @@
 
 pub mod activity;
 pub mod attach;
+pub mod capture;
 pub mod datapath;
 pub mod dns;
 pub mod graph;
@@ -57,6 +58,19 @@ pub mod metrics {
             crate::manager::telemetry::worker_metrics()
                 .net_denied_total
                 .inc(&[direction]);
+        }
+    }
+
+    /// Add `count` connections with one verdict (the kernel classifier's
+    /// counters, read once per heartbeat).
+    pub fn connections(direction: &str, protocol: &str, verdict: &str, count: u64) {
+        crate::manager::telemetry::worker_metrics()
+            .net_conns_total
+            .inc_by(&[direction, protocol, verdict], count);
+        if verdict == "deny" {
+            crate::manager::telemetry::worker_metrics()
+                .net_denied_total
+                .inc_by(&[direction], count);
         }
     }
 

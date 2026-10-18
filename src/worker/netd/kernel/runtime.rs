@@ -853,21 +853,21 @@ pub fn cgroup2_mount() -> Option<PathBuf> {
         .min_by_key(|path| path.as_os_str().len())
 }
 
+/// Real-kernel test scaffolding, shared with `netd::capture`'s tests.
 #[cfg(test)]
-mod runtime_test {
+pub(crate) mod testkit {
     use super::*;
-    use crate::worker::netd::kernel::compile::compile;
     use std::process::Command;
 
     /// A scratch cgroup parent with one allocation leaf, removed on drop.
-    struct Scratch {
-        root: PathBuf,
-        parent: String,
-        leaf: String,
+    pub struct Scratch {
+        pub root: PathBuf,
+        pub parent: String,
+        pub leaf: String,
     }
 
     impl Scratch {
-        fn new(tag: &str) -> Option<Scratch> {
+        pub fn new(tag: &str) -> Option<Scratch> {
             let root = cgroup2_mount()?;
             let parent = format!("legion-kn-{tag}-{}", std::process::id());
             let leaf = format!("{parent}/share/legion-1");
@@ -875,7 +875,7 @@ mod runtime_test {
             Some(Scratch { root, parent, leaf })
         }
 
-        fn settings(&self, pin_dir: Option<PathBuf>) -> KernelSettings {
+        pub fn settings(&self, pin_dir: Option<PathBuf>) -> KernelSettings {
             KernelSettings {
                 cgroup_root: self.root.clone(),
                 cgroup_parent: self.parent.clone(),
@@ -884,7 +884,7 @@ mod runtime_test {
         }
 
         /// Run a Python snippet inside the leaf; its stdout.
-        fn run(&self, script: &str) -> String {
+        pub fn run(&self, script: &str) -> String {
             let procs = self.root.join(&self.leaf).join("cgroup.procs");
             let output = Command::new("sh")
                 .arg("-c")
@@ -908,7 +908,7 @@ mod runtime_test {
         }
     }
 
-    fn capable() -> bool {
+    pub fn capable() -> bool {
         // SAFETY: geteuid has no preconditions.
         let root = unsafe { libc::geteuid() } == 0;
         let python = Command::new("python3").arg("-V").output().is_ok();
@@ -917,7 +917,7 @@ mod runtime_test {
 
     /// A local, non-loopback IPv4 address of this host: what the chain
     /// judges (loopback is the guard's alone).
-    fn node_ip() -> Option<Ipv4Addr> {
+    pub fn node_ip() -> Option<Ipv4Addr> {
         crate::structs::host_guard::interface_addresses()
             .into_iter()
             .find_map(|ip| match ip {
@@ -925,6 +925,14 @@ mod runtime_test {
                 _ => None,
             })
     }
+}
+
+#[cfg(test)]
+mod runtime_test {
+    use super::testkit::*;
+    use super::*;
+    use crate::worker::netd::kernel::compile::compile;
+    use std::process::Command;
 
     fn chain(value: serde_json::Value) -> Compiled {
         let mut config: crate::structs::netpolicy::ChainConfig =
@@ -1134,6 +1142,82 @@ def dial(host, port):
         let original = net.original_destination(netns, peer);
         assert_eq!(child.join().unwrap()?, "sent");
         assert_eq!(original, Some((SocketAddr::from((ip, 8080)), 7)));
+        net.shutdown();
+        Ok(())
+    }
+
+    /// Coverage (plan §6.A.8, phase A0): IPv6, an IPv4-mapped dial on a
+    /// dual-stack socket, connected and unconnected UDP, TCP Fast Open, and
+    /// (with `LEGION_URING_PROBE` naming the probe binary from the findings
+    /// doc) an `io_uring` connect all meet the same rule.
+    #[test]
+    #[ignore = "requires root, cgroup v2, and BPF"]
+    fn every_way_to_open_a_flow_meets_the_rule_test() -> R<()> {
+        if !capable() {
+            return Ok(());
+        }
+        let scratch = Scratch::new("coverage").context("scratch cgroup")?;
+        let mut net = KernelNet::open(scratch.settings(None))?;
+        net.set_guard(&GuardTable::default())?;
+        net.reconcile(&[KernelAllocation {
+            allocation_id: 9,
+            cgroup: scratch.leaf.clone(),
+            vip_block: None,
+            loopback_ports: vec![],
+            resolver: None,
+            gated: false,
+            capture: None,
+            chain: Some(chain(serde_json::json!({
+                "rules": [
+                    { "when": { "port": 25 }, "action": "deny" },
+                    { "when": { "cidr": "2001:db8::/32" }, "action": "deny" },
+                ],
+            }))),
+        }])?;
+        let said = scratch.run(
+            r#"
+import socket
+def attempt(f):
+    try:
+        f(); return 'ok'
+    except PermissionError: return 'eperm'
+    except OSError as e:
+        return 'nov6' if e.errno == 97 else type(e).__name__
+    except Exception as e: return type(e).__name__
+def v6():
+    s = socket.socket(socket.AF_INET6, socket.SOCK_STREAM); s.settimeout(1); s.connect(('2001:db8::1', 80))
+def mapped():
+    s = socket.socket(socket.AF_INET6, socket.SOCK_STREAM); s.settimeout(1); s.connect(('::ffff:192.0.2.1', 25))
+def udp_connected():
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); s.connect(('192.0.2.1', 25)); s.send(b'x')
+def udp_sendto():
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); s.sendto(b'x', ('192.0.2.1', 25))
+def tfo():
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM); s.settimeout(1); s.sendto(b'x', socket.MSG_FASTOPEN, ('192.0.2.1', 25))
+print(attempt(v6), attempt(mapped), attempt(udp_connected), attempt(udp_sendto), attempt(tfo))
+"#,
+        );
+        // A kernel built without IPv6 has no AF_INET6 to test.
+        let said = said.replace("nov6 nov6", "eperm eperm");
+        assert_eq!(
+            said, "eperm eperm eperm eperm eperm",
+            "v6, mapped, udp connect, udp sendto, tfo"
+        );
+        if let Ok(probe) = std::env::var("LEGION_URING_PROBE") {
+            let procs = scratch.root.join(&scratch.leaf).join("cgroup.procs");
+            let output = Command::new("sh")
+                .arg("-c")
+                .arg(format!(
+                    "echo $$ > {} && exec {probe} 192.0.2.1 25",
+                    procs.display()
+                ))
+                .output()?;
+            assert_eq!(
+                String::from_utf8_lossy(&output.stdout).trim(),
+                "eperm",
+                "io_uring connect"
+            );
+        }
         net.shutdown();
         Ok(())
     }

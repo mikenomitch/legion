@@ -31262,14 +31262,19 @@ export class TestNetPolicyRequest extends Message<TestNetPolicyRequest> {
   to = "";
 
   /**
-   * Ingress test: the peer, as `host[:port]` / IP, optionally with an
-   * identity (`prod:default:checkout:web`).
+   * Ingress test: the peer, as `host[:port]` / IP.
    *
    * @generated from field: string from = 5;
    */
   from = "";
 
   /**
+   * Ingress test: the caller's verified workload identity,
+   * `<region>:<job>:<group>:<task>` (`global:checkout:web:web`), as the mesh
+   * port or a mutual port would see it. On a `service.mesh = true` service
+   * with a closed `service.allow`, an identity outside the list is denied
+   * by `service/allow` before any rule.
+   *
    * @generated from field: string identity = 6;
    */
   identity = "";
@@ -31730,6 +31735,16 @@ export class NetAllocStatus extends Message<NetAllocStatus> {
    */
   guestBridge = "";
 
+  /**
+   * The kernel classifier's view of the allocation, on a node whose
+   * `netKernel` attribute is active (docs/network-handlers.md, "The kernel
+   * classifier"). Absent elsewhere, and for an allocation whose cgroup leaf
+   * does not exist yet.
+   *
+   * @generated from field: optional legion.NetKernelStatus kernel = 17;
+   */
+  kernel?: NetKernelStatus;
+
   constructor(data?: PartialMessage<NetAllocStatus>) {
     super();
     proto3.util.initPartial(data, this);
@@ -31754,6 +31769,7 @@ export class NetAllocStatus extends Message<NetAllocStatus> {
     { no: 14, name: "mesh_identity", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
     { no: 15, name: "guest_address", kind: "scalar", T: 9 /* ScalarType.STRING */ },
     { no: 16, name: "guest_bridge", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 17, name: "kernel", kind: "message", T: NetKernelStatus, opt: true },
   ]);
 
   static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): NetAllocStatus {
@@ -31770,6 +31786,115 @@ export class NetAllocStatus extends Message<NetAllocStatus> {
 
   static equals(a: NetAllocStatus | PlainMessage<NetAllocStatus> | undefined, b: NetAllocStatus | PlainMessage<NetAllocStatus> | undefined): boolean {
     return proto3.util.equals(NetAllocStatus, a, b);
+  }
+}
+
+/**
+ * What the kernel classifier holds for one allocation, and what it did with
+ * the allocation's flows since the previous report.
+ *
+ * @generated from message legion.NetKernelStatus
+ */
+export class NetKernelStatus extends Message<NetKernelStatus> {
+  /**
+   * The allocation's cgroup leaf is described to the classifier: the host
+   * guard applies, and its port-53 traffic goes to its resolver.
+   *
+   * @generated from field: bool attached = 1;
+   */
+  attached = false;
+
+  /**
+   * Its egress chain is compiled into the kernel and enforced at
+   * `connect()`: denied flows fail with `EPERM`, and allowed flows that
+   * nothing reads connect directly. False for a gated allocation (its
+   * namespace is the boundary), a sandbox (its sockets live in its guest),
+   * an allocation with no egress chain, and a chain the kernel cannot hold
+   * (`reason`).
+   *
+   * @generated from field: bool enforced = 2;
+   */
+  enforced = false;
+
+  /**
+   * Flows only netd can decide (a request-time rule, a host rule for an
+   * address the resolver never returned, a chain with hops) are redirected
+   * to a capture listener rather than refused.
+   *
+   * @generated from field: bool capture = 3;
+   */
+  capture = false;
+
+  /**
+   * Compiled connect-time rules.
+   *
+   * @generated from field: uint32 rules = 4;
+   */
+  rules = 0;
+
+  /**
+   * Why the chain is not enforced in the kernel, when it is not. Empty
+   * otherwise.
+   *
+   * @generated from field: string reason = 5;
+   */
+  reason = "";
+
+  /**
+   * Connections passed straight through (no proxy hop) since the previous
+   * report.
+   *
+   * @generated from field: uint64 passed = 6;
+   */
+  passed = protoInt64.zero;
+
+  /**
+   * Connections redirected to the capture listener since the previous
+   * report.
+   *
+   * @generated from field: uint64 redirected = 7;
+   */
+  redirected = protoInt64.zero;
+
+  /**
+   * Connections refused in the kernel since the previous report.
+   *
+   * @generated from field: uint64 denied = 8;
+   */
+  denied = protoInt64.zero;
+
+  constructor(data?: PartialMessage<NetKernelStatus>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.NetKernelStatus";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "attached", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
+    { no: 2, name: "enforced", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
+    { no: 3, name: "capture", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
+    { no: 4, name: "rules", kind: "scalar", T: 13 /* ScalarType.UINT32 */ },
+    { no: 5, name: "reason", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 6, name: "passed", kind: "scalar", T: 4 /* ScalarType.UINT64 */ },
+    { no: 7, name: "redirected", kind: "scalar", T: 4 /* ScalarType.UINT64 */ },
+    { no: 8, name: "denied", kind: "scalar", T: 4 /* ScalarType.UINT64 */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): NetKernelStatus {
+    return new NetKernelStatus().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): NetKernelStatus {
+    return new NetKernelStatus().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): NetKernelStatus {
+    return new NetKernelStatus().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: NetKernelStatus | PlainMessage<NetKernelStatus> | undefined, b: NetKernelStatus | PlainMessage<NetKernelStatus> | undefined): boolean {
+    return proto3.util.equals(NetKernelStatus, a, b);
   }
 }
 

@@ -12417,6 +12417,51 @@ message NetAllocStatus {
 
   // The bridge `guest_address` belongs to. Empty exactly when it is.
   string guest_bridge = 16;
+
+  // The kernel classifier's view of the allocation, on a node whose
+  // `netKernel` attribute is active (docs/network-handlers.md, "The kernel
+  // classifier"). Absent elsewhere, and for an allocation whose cgroup leaf
+  // does not exist yet.
+  optional NetKernelStatus kernel = 17;
+}
+
+// What the kernel classifier holds for one allocation, and what it did with
+// the allocation's flows since the previous report.
+message NetKernelStatus {
+  // The allocation's cgroup leaf is described to the classifier: the host
+  // guard applies, and its port-53 traffic goes to its resolver.
+  bool attached = 1;
+
+  // Its egress chain is compiled into the kernel and enforced at
+  // `connect()`: denied flows fail with `EPERM`, and allowed flows that
+  // nothing reads connect directly. False for a gated allocation (its
+  // namespace is the boundary), a sandbox (its sockets live in its guest),
+  // an allocation with no egress chain, and a chain the kernel cannot hold
+  // (`reason`).
+  bool enforced = 2;
+
+  // Flows only netd can decide (a request-time rule, a host rule for an
+  // address the resolver never returned, a chain with hops) are redirected
+  // to a capture listener rather than refused.
+  bool capture = 3;
+
+  // Compiled connect-time rules.
+  uint32 rules = 4;
+
+  // Why the chain is not enforced in the kernel, when it is not. Empty
+  // otherwise.
+  string reason = 5;
+
+  // Connections passed straight through (no proxy hop) since the previous
+  // report.
+  uint64 passed = 6;
+
+  // Connections redirected to the capture listener since the previous
+  // report.
+  uint64 redirected = 7;
+
+  // Connections refused in the kernel since the previous report.
+  uint64 denied = 8;
 }
 
 // One external handler hop as the datapath sees it.
