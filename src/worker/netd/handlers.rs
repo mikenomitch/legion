@@ -217,9 +217,16 @@ async fn authz(
     facts: &HopFacts<'_>,
 ) -> Option<(String, Option<String>)> {
     let url = hop.config.url.clone().unwrap_or_default();
+    // Everything the webhook is told that can change its answer: a verdict
+    // for one allocation (or one webhook) must never answer for another on
+    // this node. The cache is node-wide.
     let key = format!(
-        "{}|{}|{}|{}|{}",
+        "{}|{}|{}|{}|{}|{}|{}|{}|{}",
         hop.source,
+        url,
+        facts.allocation_id,
+        facts.direction,
+        facts.protocol,
         facts.identity.unwrap_or(""),
         facts.destination,
         facts.method.unwrap_or(""),

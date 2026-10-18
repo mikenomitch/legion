@@ -158,6 +158,16 @@ impl CheckpointDir {
         self.path.join(file)
     }
 
+    /// [`Self::part_path`] for a `file` read from a snapshot manifest, which
+    /// another node published: it must be one plain name inside this
+    /// directory, never a path the worker would remove or link over as root.
+    pub fn manifest_part_path(&self, file: &str) -> R<PathBuf> {
+        if !crate::structs::job::is_safe_path_component(file) {
+            bail!("snapshot part file {file:?} is not a plain file name");
+        }
+        Ok(self.path.join(file))
+    }
+
     /// Hash and size each `(role, file)` the runtime wrote. A file that does
     /// not exist is an error: the runtime promised it.
     pub fn seal(&self, parts: &[(&str, &str)]) -> R<Vec<MemoryPart>> {

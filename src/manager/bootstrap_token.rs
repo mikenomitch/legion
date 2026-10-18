@@ -206,28 +206,7 @@ pub fn log_outcome(outcome: &BootstrapOutcome) {
 /// Writes `secret` to `path` with mode 0600, created that way so the secret
 /// is never readable by others, even briefly.
 fn write_secret_file(path: &Path, secret: &str) -> R<()> {
-    use std::io::Write;
-    let mut options = std::fs::OpenOptions::new();
-    options.write(true).create(true).truncate(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
-    }
-    let mut file = options
-        .open(path)
-        .with_context(|| format!("failed to write {}", path.display()))?;
-    #[cfg(unix)]
-    {
-        // `mode` applies only on creation; tighten a pre-existing file too.
-        use std::os::unix::fs::PermissionsExt;
-        file.set_permissions(std::fs::Permissions::from_mode(0o600))
-            .with_context(|| format!("failed to chmod {}", path.display()))?;
-    }
-    file.write_all(format!("{secret}\n").as_bytes())
-        .with_context(|| format!("failed to write {}", path.display()))?;
-    file.sync_all().ok();
-    Ok(())
+    crate::util::write_private_file(path, format!("{secret}\n").as_bytes())
 }
 
 #[cfg(test)]

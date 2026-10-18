@@ -1399,11 +1399,13 @@ impl WorkerTaskManager {
         config: WorkerArtifactFetchConfigFull,
         credentials: Box<dyn CredentialSource>,
         content_store_target: Option<crate::content_publish::ContentStoreTarget>,
+        egress: Option<Arc<crate::structs::host_guard::HostGuard>>,
     ) {
         self.stager = Arc::new(
             ArtifactStager::new(config, credentials)
                 .with_content_store(self.content_store.clone())
-                .with_content_store_target(content_store_target),
+                .with_content_store_target(content_store_target)
+                .with_egress_guard(egress),
         );
     }
 
@@ -1834,18 +1836,21 @@ impl WorkerTaskManager {
                     continue;
                 }
             }
-            let host_path = match root {
-                Some(root) => match crate::task_plugins::resolve_task_dir_destination(root, path) {
-                    Ok(relative) => task_dir.join(relative),
-                    Err(err) => {
-                        warn!(allocation_id, path, error = %err, "Skipping live KV file");
-                        continue;
-                    }
-                },
-                None => PathBuf::from(path),
-            };
             let bits = crate::task_plugins::injected_file_mode(mode);
-            if let Err(err) = crate::worker::identity::write_token_file(&host_path, content, bits) {
+            let written = match crate::task_plugins::task_file_target(root, path) {
+                // Rewritten while the task runs, in a directory it can write.
+                Ok(crate::task_plugins::TaskFileTarget::BelowTaskDir(relative)) => {
+                    crate::util::write_file_beneath(&task_dir, &relative, content.as_bytes(), bits)
+                }
+                Ok(crate::task_plugins::TaskFileTarget::Host(host_path)) => {
+                    crate::worker::identity::write_token_file(&host_path, content, bits)
+                }
+                Err(err) => {
+                    warn!(allocation_id, path, error = %err, "Skipping live KV file");
+                    continue;
+                }
+            };
+            if let Err(err) = written {
                 warn!(allocation_id, path, error = ?err, "Failed to rewrite live KV file");
                 continue;
             }
@@ -2226,31 +2231,36 @@ impl WorkerTaskManager {
         self.alloc_root.join(allocation_id.to_string())
     }
 
-    /// Where an allocation's declared file destinations land on the host,
-    /// for a runtime that mounts its task directory somewhere else.
+    /// Where an allocation's declared file destinations land on the host.
     ///
-    /// `Some((in_task_root, host_task_dir))` for such a runtime (the
-    /// `container` runtime's `/legion/task`), `None` for one whose filesystem
+    /// `(Some(in_task_root), host_task_dir)` for a runtime that mounts its
+    /// task directory somewhere else (the `container` runtime's
+    /// `/legion/task`), and `(None, host_task_dir)` for one whose filesystem
     /// *is* the host's (`exec`), where a declared absolute path is already
-    /// the real path. Used by identity delivery, which writes token files
-    /// before the task starts and must put them where the workload will
-    /// actually look.
+    /// the real path and a relative one is below the task directory. `None`
+    /// only when the runtime does not load. Used by identity delivery, which
+    /// writes token files before the task starts and must put them where the
+    /// workload will actually look.
     pub fn file_delivery_base(
         &mut self,
         allocation_id: i64,
         task_name: &str,
         runtime: &str,
-    ) -> Option<(&'static str, PathBuf)> {
+    ) -> Option<(Option<&'static str>, PathBuf)> {
         if self.registry.load_plugin(runtime, false).is_err() {
             return None;
         }
         let plugin = self.registry.plugin(runtime)?;
-        let root = plugin.file_delivery_root()?;
-        let mut host = self.alloc_dir(allocation_id).join(task_name);
+        let mut host = task_dir_in(&self.alloc_dir(allocation_id), task_name);
+        let Some(root) = plugin.file_delivery_root() else {
+            // The host's own filesystem: an absolute path is the real path,
+            // and a relative one is below the task directory.
+            return Some((None, host));
+        };
         if let Some(subdir) = plugin.file_delivery_host_subdir() {
             host.push(subdir);
         }
-        Some((root, host))
+        Some((Some(root), host))
     }
 
     /// Root of per-allocation directories (`<state>/allocs/`).
@@ -2266,7 +2276,7 @@ impl WorkerTaskManager {
     /// The host task directory (`allocs/<alloc>/<task>/`), whether or not
     /// the task has started yet.
     pub fn task_dir_for(&self, allocation_id: i64, task_name: &str) -> PathBuf {
-        self.alloc_dir(allocation_id).join(task_name)
+        task_dir_in(&self.alloc_dir(allocation_id), task_name)
     }
 
     fn cleanup_alloc_dir(&self, allocation_id: i64) {
@@ -2293,7 +2303,16 @@ impl WorkerTaskManager {
     /// pre-wired with dirs and the `LEGION_ALLOC_DIR`/`LEGION_TASK_DIR` env.
     fn prepare_instance(&self, allocation: &Allocation, task: &TaskConfig) -> R<TaskInstance> {
         let alloc_dir = self.alloc_dir(allocation.id);
-        let task_dir = alloc_dir.join(&task.name);
+        // Admission already restricts task names; this is the worker's own
+        // check, because it runs as root and the name becomes a path.
+        if !crate::structs::job::is_safe_path_component(&task.name) {
+            bail!(
+                "task name {:?} is not a single path component; refusing to create its \
+                 directory",
+                task.name
+            );
+        }
+        let task_dir = task_dir_in(&alloc_dir, &task.name);
         std::fs::create_dir_all(&task_dir)
             .with_context(|| format!("create task directory {}", task_dir.display()))?;
         // The alloc dir is the isolation boundary between allocations sharing
@@ -5971,6 +5990,18 @@ const REMOVING_DIR: &str = ".removing";
 /// Rename `dir` into `alloc_root`'s removal area and queue it for a
 /// background thread to delete. False when the rename failed, and the
 /// caller removes it in place.
+/// A task's directory under its allocation directory. A name that is not one
+/// safe path component (admission refuses those) maps to a name admission
+/// can never produce, so the root worker never reads, writes, or removes a
+/// path outside the allocation on a task name's say-so.
+fn task_dir_in(alloc_dir: &std::path::Path, task_name: &str) -> PathBuf {
+    if crate::structs::job::is_safe_path_component(task_name) {
+        alloc_dir.join(task_name)
+    } else {
+        alloc_dir.join("!invalid-task-name")
+    }
+}
+
 fn remove_dir_later(alloc_root: &std::path::Path, dir: &std::path::Path) -> bool {
     static JANITOR: std::sync::OnceLock<std::sync::mpsc::Sender<PathBuf>> =
         std::sync::OnceLock::new();
@@ -7408,6 +7439,7 @@ mod tests {
         manager.configure_artifacts(
             crate::structs::WorkerArtifactFetchConfigFull::default(),
             Box::new(crate::artifacts::AnonymousCredentials),
+            None,
             None,
         );
         Ok(Arc::new(Mutex::new(manager)))
@@ -11571,6 +11603,7 @@ mod tests {
                 ..Default::default()
             },
             Box::new(crate::artifacts::AnonymousCredentials),
+            None,
             None,
         );
         let source = temp_dir.path().join("tool.sh");

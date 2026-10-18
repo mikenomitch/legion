@@ -268,7 +268,9 @@ Expires (unix): 1770000300
 Minting requires the ACL resource **`boot`** (`boot:write`, scoped by job
 name). It is separate from `job:write` so a platform's ticket minter can
 authorize individual starts without the right to redeploy the fleet.
-`boot:read` lists outstanding tickets.
+`boot:read` lists outstanding tickets. A `--job-config` given explicitly
+must be one of the named job's configs; another job's is refused as not
+found, so `boot:write` on one job never mints a ticket for another's spec.
 
 A ticket must name an instance or a **non-empty** prefix. A ticket with
 neither would authorize every sandbox of the task, so Legion does not mint
@@ -342,6 +344,15 @@ use by spending the `jti` in one conditional update, so the second
 ratification is refused even if the first workload has since exited. Nodes
 are expected to behave correctly, but Legion does not trust any node to be
 the only holder of a ticket.
+
+**A ratification is the start its ticket authorized.** The manager refuses
+a claim that carries no ticket, and one whose ticket names another job
+config or task, or a lower gate than the claim asks for (`ticket_invalid`).
+A node holding one valid ticket cannot ratify a placement of anything else,
+which would hand it that job's rendered spec. While a ticket is live, a node
+in its pool may also read the `auth.kv` artifact credentials of its task, so
+it can stage before the allocation exists
+([Artifacts](artifacts.md#secret-based-auth-kv)).
 
 **The ratification is one write.** The ticket spend, the instance bind, the
 allocation, and the `provisional.ratified` event commit in a single

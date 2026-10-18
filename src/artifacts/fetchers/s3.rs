@@ -44,6 +44,29 @@ fn build_target(req: &FetchRequest<'_>) -> R<S3Target> {
     if req.url.host_str().unwrap_or_default().is_empty() {
         bail!("{} has no bucket host", req.redacted_source);
     }
+    // A custom `endpoint` is a host the job chose, judged like any other
+    // fetch destination. The default AWS endpoints are left alone.
+    if let Some(guard) = req.limits.egress.as_deref() {
+        let endpoint = req
+            .url
+            .query_pairs()
+            .find(|(name, _)| name == "endpoint")
+            .map(|(_, value)| value.into_owned());
+        if let Some(endpoint) = endpoint {
+            let endpoint = url::Url::parse(&endpoint)
+                .with_context(|| format!("{} has an invalid endpoint", req.redacted_source))?;
+            let host = endpoint
+                .host()
+                .with_context(|| format!("{} endpoint names no host", req.redacted_source))?;
+            let port = endpoint.port_or_known_default().unwrap_or(443);
+            crate::artifacts::fetchers::http::judged_addrs(
+                guard,
+                &host,
+                port,
+                req.redacted_source,
+            )?;
+        }
+    }
     let url = StoreUrl::from_url(req.url.clone())
         .with_context(|| format!("invalid s3 source {}", req.redacted_source))?;
     let key = url.key("")?;

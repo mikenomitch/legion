@@ -447,9 +447,12 @@ A key is scoped to one operation and one caller:
   ACL token (by accessor ID), or the principal for JWT and anonymous callers.
   One caller can never read another's recorded reply. With ACLs disabled,
   every caller is the same caller.
-- The key does not cover the request body. Retrying a key with different
-  arguments (another job name, say) replays the first reply. Use a fresh key
-  per intended change.
+- The key covers the request. A key names one request: retrying it with
+  different arguments (another job name, say) fails with `INVALID_ARGUMENT`
+  ("this idempotency key was first used with different request arguments")
+  instead of replaying the first reply, so a retry loop that changed its
+  request never believes the change was made. Use a fresh key per intended
+  change, and retry with the exact same request.
 
 Records are kept for 24 hours, then pruned by the manager (the control-lane
 leader in raft mode) within the following hour. A retry after that runs the

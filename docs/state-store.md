@@ -254,8 +254,10 @@ Server-side backups work in every mode: `legion state backup` (a
   write redirects and forwarding"); when the leader is unreachable from the
   manager that received the write, it fails with the leader hint rather than
   being retried elsewhere.
-- Managers dial each other's raft transport over plaintext HTTP/2 and
-  authenticate with a shared cluster secret. There is no mTLS between
-  managers.
+- Managers dial each other's raft transport over TLS, under one key every
+  manager derives from the shared cluster secret, and authenticate each
+  call with that secret. All managers hold the same key, so the transport
+  does not tell one manager from another
+  ([auth-and-acls.md](auth-and-acls.md#managers-reach-each-other-over-tls)).
 - Key-range sharding, cross-region topologies, and parallel scheduler
   planning across managers are not implemented.

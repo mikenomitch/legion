@@ -847,6 +847,7 @@ fn start_transport(
     tokio::sync::oneshot::Sender<()>,
 ) {
     let service = store.raft_transport_server();
+    let transport_tls = store.raft_transport_tls().expect("raft engine started");
     let addr: std::net::SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
     let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
     let handle = rt.spawn(async move {
@@ -854,7 +855,9 @@ fn start_transport(
         socket.set_reuseaddr(true).expect("reuseaddr");
         socket.bind(addr).expect("bind transport port");
         let listener = socket.listen(64).expect("listen");
-        let incoming = tokio_stream::wrappers::TcpListenerStream::new(listener);
+        let incoming = transport_tls
+            .incoming(listener)
+            .expect("raft transport listener");
         if let Err(err) = tonic::transport::Server::builder()
             .add_service(service)
             .serve_with_incoming_shutdown(incoming, async {

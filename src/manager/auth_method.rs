@@ -151,6 +151,15 @@ pub trait AuthMethod: Send + Sync {
     /// method.
     fn login_token_ttl(&self) -> Duration;
 
+    /// Whether a token minted through this method must expire no later than
+    /// the credential presented for it (`VerifiedIdentity::expires_at`).
+    /// True for workload identity: a workload's identity token is retired by
+    /// a fork or snapshot (its identity epoch moves), and an ACL token minted
+    /// from it must not outlive it in every copy of the workload's memory.
+    fn clamps_to_credential_expiry(&self) -> bool {
+        false
+    }
+
     /// Public metadata for login UIs. Never include secrets or key material.
     fn public_info(&self) -> MethodPublicInfo {
         MethodPublicInfo {
@@ -276,6 +285,23 @@ pub struct JwtAuthMethod {
     keys: RwLock<Option<Value>>,
 }
 
+/// An identity provider URL must be `https`, or `http` to a loopback host
+/// (a local test provider).
+fn require_https_unless_loopback(raw: &str) -> R<()> {
+    let url = url::Url::parse(raw).with_context(|| format!("{raw:?} is not a URL"))?;
+    let loopback = match url.host() {
+        Some(url::Host::Domain(host)) => host.eq_ignore_ascii_case("localhost"),
+        Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
+        Some(url::Host::Ipv6(ip)) => ip.is_loopback(),
+        None => false,
+    };
+    match url.scheme() {
+        "https" => Ok(()),
+        "http" if loopback => Ok(()),
+        scheme => bail!("{raw:?} uses {scheme}; identity provider URLs must be https"),
+    }
+}
+
 impl JwtAuthMethod {
     pub fn from_config(config: &AclAuthMethodConfig, default_login_ttl: Duration) -> R<Self> {
         let name = config.name.trim().to_string();
@@ -304,6 +330,34 @@ impl JwtAuthMethod {
         {
             bail!("auth method `{name}`: jwt methods require one of `jwksUrl`, `jwksJson`, or `hmacSecret`");
         }
+        // An issuer mints tokens for many services. Without an audience to
+        // match, a token it minted for any of them (another app's ID token,
+        // a CI job's OIDC token) would log in here.
+        let mut bound_audiences = config.bound_audiences.clone().unwrap_or_default();
+        if bound_audiences.is_empty() {
+            if let Some(client_id) = config
+                .oidc_client_id
+                .as_ref()
+                .filter(|id| !id.trim().is_empty())
+            {
+                bound_audiences.push(client_id.clone());
+            }
+        }
+        if bound_audiences.is_empty() && config.hmac_secret.is_none() {
+            bail!(
+                "auth method `{name}`: set `boundAudiences` (an oidc method may set \
+                 `oidcClientId` instead); without one, a token its issuer minted for any other \
+                 service would be accepted"
+            );
+        }
+        // Keys and discovery fetched over plain HTTP could be replaced in
+        // transit, and with them every identity the method vouches for.
+        for (field, url) in [("jwksUrl", &config.jwks_url), ("issuer", &config.issuer)] {
+            if let Some(url) = url.as_deref() {
+                require_https_unless_loopback(url)
+                    .with_context(|| format!("auth method `{name}`: {field}"))?;
+            }
+        }
         let token_ttl = match &config.token_ttl {
             Some(raw) => {
                 parse_ttl(raw).with_context(|| format!("auth method `{name}`: invalid tokenTtl"))?
@@ -317,7 +371,7 @@ impl JwtAuthMethod {
             hmac_secret: config.hmac_secret.clone(),
             issuer: config.issuer.clone(),
             bound_issuer: config.bound_issuer.clone(),
-            bound_audiences: config.bound_audiences.clone().unwrap_or_default(),
+            bound_audiences,
             user_claim: config
                 .user_claim
                 .clone()
@@ -599,6 +653,10 @@ impl AuthMethod for ControlPlaneIdentityMethod {
 
     fn login_token_ttl(&self) -> Duration {
         self.token_ttl
+    }
+
+    fn clamps_to_credential_expiry(&self) -> bool {
+        true
     }
 
     fn public_info(&self) -> MethodPublicInfo {
@@ -955,6 +1013,50 @@ mod auth_method_test {
             ..Default::default()
         };
         assert!(method_from_config(&saml, ttl).is_err());
+    }
+
+    /// A key-verified method must name its audience (an oidc method's
+    /// client id counts), and its provider URLs must be https off loopback.
+    #[test]
+    fn jwt_methods_require_an_audience_and_https_test() {
+        let ttl = Duration::from_secs(60);
+        let jwks = AclAuthMethodConfig {
+            name: "ci".into(),
+            r#type: Some("jwt".into()),
+            jwks_url: Some("https://token.actions.example.com/.well-known/jwks".into()),
+            ..Default::default()
+        };
+        let err = JwtAuthMethod::from_config(&jwks, ttl)
+            .err()
+            .expect("no audience");
+        assert!(format!("{err:#}").contains("boundAudiences"), "{err:#}");
+        let bound = AclAuthMethodConfig {
+            bound_audiences: Some(vec!["legion".into()]),
+            ..jwks.clone()
+        };
+        JwtAuthMethod::from_config(&bound, ttl).expect("bound audience");
+        let plain = AclAuthMethodConfig {
+            jwks_url: Some("http://idp.example.com/jwks".into()),
+            ..bound.clone()
+        };
+        let err = JwtAuthMethod::from_config(&plain, ttl)
+            .err()
+            .expect("plain http");
+        assert!(format!("{err:#}").contains("https"), "{err:#}");
+        let local = AclAuthMethodConfig {
+            jwks_url: Some("http://127.0.0.1:8200/jwks".into()),
+            ..bound
+        };
+        JwtAuthMethod::from_config(&local, ttl).expect("loopback http is a local provider");
+        let oidc = AclAuthMethodConfig {
+            name: "corp".into(),
+            r#type: Some("oidc".into()),
+            issuer: Some("https://idp.test".into()),
+            oidc_client_id: Some("legion-ui".into()),
+            ..Default::default()
+        };
+        let method = JwtAuthMethod::from_config(&oidc, ttl).expect("client id is the audience");
+        assert_eq!(method.bound_audiences, vec!["legion-ui"]);
     }
 
     #[test]

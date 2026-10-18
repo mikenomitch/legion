@@ -262,6 +262,9 @@
   #   defaultTtl = "15m",      # token TTL when an identity sets none
   #   rotationAge = "24h",     # rotate the signing key past this age
   #   subTemplate = "{region}:{job}:{group}:{task}",
+  #   # Other subject shapes a job's identity may name in its own
+  #   # `subTemplate` (default: none, only the one above).
+  #   allowedSubTemplates = ["{region}:{job}:{group}:{task}:{instance}"],
   #   nodeIdentities = [
   #     {
   #       name = "artifact-pull",

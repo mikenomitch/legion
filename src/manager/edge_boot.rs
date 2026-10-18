@@ -503,6 +503,35 @@ pub fn verify_ticket(
     Ok(claims)
 }
 
+/// A ratified claim must be the start its ticket authorized: the same job
+/// config and task, at no higher a gate. Without this a node holding any
+/// valid ticket could ratify an allocation of any job config, and the
+/// committed payload it gets back carries that job's rendered spec.
+pub fn ticket_covers_claim(
+    claims: &BootTicketClaims,
+    job_config_id: &str,
+    task_name: &str,
+    gate: Gate,
+) -> R<()> {
+    if claims.job_config_id != job_config_id {
+        bail!(
+            "boot ticket is for job config {}, not {job_config_id}",
+            claims.job_config_id
+        );
+    }
+    if claims.task != task_name {
+        bail!("boot ticket is for task {}, not {task_name}", claims.task);
+    }
+    if gate > claims.gate {
+        bail!(
+            "boot ticket allows gate {} at most, not {}",
+            claims.gate.as_str(),
+            gate.as_str()
+        );
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod edge_boot_manager_test {
     use super::*;

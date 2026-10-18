@@ -2008,6 +2008,60 @@ impl ManagerDaemonService {
         AclScope::job(name).with_template(provenance)
     }
 
+    /// The KV paths `GetArtifactCredential` serves `node_id`: every
+    /// `auth.kv` on an artifact of an allocation placed on the node (the
+    /// effective auth admission stored, cluster matchers included), the same
+    /// for the task of every live boot ticket for the node's pool (a node
+    /// stages those before any allocation exists, docs/edge-boot.md), and
+    /// the `contentStore.auth.kv` of the worker types in the node's pool,
+    /// which it publishes and restores snapshot parts with.
+    fn artifact_credential_paths_for_node(&self, node_id: &str) -> R<HashSet<String>> {
+        fn auth_kv_paths(artifacts: Vec<crate::structs::ArtifactSpec>) -> Vec<String> {
+            artifacts
+                .into_iter()
+                .filter_map(|artifact| artifact.auth.and_then(|auth| auth.kv))
+                .collect()
+        }
+        let mut paths = HashSet::new();
+        for allocation in build_desired_allocations(&self.store, node_id, &[])? {
+            if allocation.task_artifacts.trim().is_empty() {
+                continue;
+            }
+            paths.extend(auth_kv_paths(
+                serde_json::from_str(&allocation.task_artifacts).unwrap_or_default(),
+            ));
+        }
+        let pool = self.store.get_node(node_id)?.pool;
+        let now = OffsetDateTime::now_utc().unix_timestamp();
+        for ticket in self.store.list_boot_tickets("", now)? {
+            if ticket.pool != pool || ticket.uses_remaining() == 0 {
+                continue;
+            }
+            for (_, task) in self
+                .store
+                .get_task_configs_for_job_config(&ticket.job_config_id)?
+            {
+                if task.name == ticket.task {
+                    paths.extend(auth_kv_paths(task.artifacts));
+                }
+            }
+        }
+        for worker_type in self.store.list_worker_types()? {
+            if worker_type.pool != pool || worker_type.artifacts.trim().is_empty() {
+                continue;
+            }
+            let Ok(payload) = serde_json::from_str::<crate::structs::WorkerArtifactsPayload>(
+                &worker_type.artifacts,
+            ) else {
+                continue;
+            };
+            if let Some(path) = payload.content_store.as_ref().and_then(|store| store.kv()) {
+                paths.insert(path.to_string());
+            }
+        }
+        Ok(paths)
+    }
+
     /// Everything RunJob does once it holds a rendered jobspec, shared with
     /// RunJobTemplate so both submission paths behave identically: KV
     /// reference resolution, precise ACL enforcement, the template collision
@@ -2095,6 +2149,7 @@ impl ManagerDaemonService {
             error!("Error validating task configs: {:?}", e);
             Status::invalid_argument(format!("Error validating task configs: {e}"))
         })?;
+        self.validate_identity_sub_templates(&config)?;
         let ingress_chains: Vec<_> = config
             .tasks
             .iter()
@@ -2105,6 +2160,8 @@ impl ManagerDaemonService {
             identity,
             config.tasks.iter().filter_map(|task| task.connect.as_ref()),
         )?;
+        enforce_kv_reference_read(identity, &kv_refs)?;
+        enforce_kv_artifact_read(identity, &config)?;
         self.validate_job_volumes(&config).map_err(|e| {
             error!("Error validating volumes: {:?}", e);
             Status::invalid_argument(format!("Error validating volumes: {e:#}"))
@@ -2356,11 +2413,15 @@ impl ManagerDaemonService {
         identity: &AclIdentity,
         inner: RunJobRequest,
     ) -> Result<Response<RunJobReply>, Status> {
+        let idempotency_key = scoped_idempotency_key(
+            identity,
+            "run_job",
+            inner.idempotency_key.as_deref(),
+            &inner,
+        );
         let js = inner.parsed_jobspec;
         let subs = inner.submissions;
         let priority = inner.priority;
-        let idempotency_key =
-            scoped_idempotency_key(identity, "run_job", inner.idempotency_key.as_deref());
 
         if let Some(message) = self
             .store
@@ -2570,7 +2631,10 @@ impl ManagerDaemonService {
             }
         }
         match self.auth.verify_join_secret(&self.store, join_token) {
-            Ok(record) => Ok(RegistrationGrant::JoinToken(record)),
+            Ok(record) => Ok(RegistrationGrant::JoinToken {
+                record,
+                caller_node: acl::worker_node_id(identity).map(str::to_string),
+            }),
             Err(status) if self.auth.audit_only => {
                 warn!(
                     target: "acl_audit",
@@ -2598,24 +2662,48 @@ impl ManagerDaemonService {
     ) -> Result<(), Status> {
         let refusal = match grant {
             RegistrationGrant::Unrestricted => None,
-            RegistrationGrant::JoinToken(record) => {
+            RegistrationGrant::JoinToken {
+                record,
+                caller_node,
+            } => {
                 if let Some(requested) = worker_type.filter(|t| *t != record.worker_type) {
                     Some(format!(
                         "this join token is pinned to worker type {:?}, not {requested:?}",
                         record.worker_type
                     ))
-                } else if let Some((_, pool)) = node {
+                } else if let Some((name, pool)) = node {
                     let pinned = self
                         .store
                         .get_worker_type(record.worker_type.clone())
                         .map_err(|e| map_store_error("Error loading worker type", e))?;
-                    (pool != pinned.pool).then(|| {
-                        format!(
+                    if pool != pinned.pool {
+                        Some(format!(
                             "this join token is pinned to worker type {:?}, whose pool is \
                              {:?}, not {pool:?}",
                             record.worker_type, pinned.pool
-                        )
-                    })
+                        ))
+                    } else if caller_node.as_deref() == Some(name) {
+                        // The node's own token rides along: a restart.
+                        None
+                    } else {
+                        // A join secret introduces a node; it does not take
+                        // over one that is running. Every node of a worker
+                        // type holds the same secret, so without this any of
+                        // them could register as a live peer, rotate away its
+                        // token, and mint its certificates. A node that has
+                        // gone `lost` (a worker that lost its disk) can be
+                        // joined again under its name.
+                        match self.store.get_node(name) {
+                            Ok(existing) if existing.status != "lost" => Some(format!(
+                                "node {name:?} is registered and live ({}); a join token may \
+                                 not take over a running node's name. Restart the worker with \
+                                 its own state directory (it holds the node's token), give it \
+                                 another name, or wait until the old node is marked lost",
+                                existing.status
+                            )),
+                            _ => None,
+                        }
+                    }
                 } else {
                     None
                 }
@@ -2972,6 +3060,53 @@ impl ManagerDaemonService {
     /// with the same advice instead of placing and failing. A set some
     /// worker type allows passes, even if placement then lands the task on a
     /// node of another type; that start fails on the node.
+    /// The template a render or run names. Those RPCs gate on a coarse
+    /// `job:write` before the lookup, so a missing template is reported as
+    /// missing only to a caller that may read it; anyone else gets the same
+    /// refusal an out-of-scope template gets, and cannot probe names.
+    fn load_template_for_run(
+        &self,
+        identity: &AclIdentity,
+        name: &str,
+        version: Option<u32>,
+    ) -> Result<crate::storage::store::JobTemplateVersionRecord, Status> {
+        self.store
+            .get_job_template_version(name, version)
+            .map_err(|e| {
+                let status = map_store_error("Error loading template", e);
+                let may_read = identity.allows(
+                    AclResource::Template,
+                    AclAction::Read,
+                    &AclScope::template(name),
+                );
+                if status.code() == tonic::Code::NotFound && !may_read {
+                    Status::permission_denied(format!(
+                        "this token may not run template {name:?} (it needs a job:write rule \
+                         for the jobs it renders, or template:read to see whether it exists)"
+                    ))
+                } else {
+                    status
+                }
+            })
+    }
+
+    /// Admission half of [`crate::manager::workload_identity::WorkloadIdentityState::check_sub_template`]:
+    /// a job's identity may name only the cluster's `sub` template or one the
+    /// operator allows.
+    fn validate_identity_sub_templates(&self, config: &JobConfig) -> Result<(), Status> {
+        let Some(state) = self.workload_identity.as_ref() else {
+            return Ok(());
+        };
+        for task in &config.tasks {
+            for identity in &task.identities {
+                state
+                    .check_sub_template(identity)
+                    .map_err(|e| Status::invalid_argument(format!("task {}: {e:#}", task.name)))?;
+            }
+        }
+        Ok(())
+    }
+
     fn validate_job_capabilities(&self, config: &JobConfig) -> R<()> {
         let mut requested = Vec::new();
         for task in &config.tasks {
@@ -4199,10 +4334,7 @@ impl Manager for ManagerDaemonService {
         )?;
         let inner = request.into_inner();
 
-        let template = self
-            .store
-            .get_job_template_version(&inner.name, inner.version)
-            .map_err(|e| map_store_error("Error loading template", e))?;
+        let template = self.load_template_for_run(&identity, &inner.name, inner.version)?;
         let values =
             job_templates::resolve_variable_values(&template.variables, &inner.variables_json)
                 .map_err(|e| Status::invalid_argument(e.to_string()))?;
@@ -4210,7 +4342,7 @@ impl Manager for ManagerDaemonService {
             .await
             .map_err(template_eval_status)?;
 
-        let (config, _kv_refs) = resolve_jobspec_kv_references(&self.store, &rendered)
+        let (config, kv_refs) = resolve_jobspec_kv_references(&self.store, &rendered)
             .map_err(|e| Status::invalid_argument(format!("rendered jobspec is invalid: {e}")))?;
         acl::enforce(
             &identity,
@@ -4221,6 +4353,8 @@ impl Manager for ManagerDaemonService {
             // submit that follows it.
             &AclScope::job_via_template(&config.name, &template.name).with_band(config.priority),
         )?;
+        enforce_kv_reference_read(&identity, &kv_refs)?;
+        enforce_kv_artifact_read(&identity, &config)?;
         validate_job_config(&config).map_err(|e| {
             Status::invalid_argument(format!("rendered jobspec failed validation: {e}"))
         })?;
@@ -4251,6 +4385,7 @@ impl Manager for ManagerDaemonService {
             &identity,
             "run_job_template",
             inner.idempotency_key.as_deref(),
+            &inner,
         );
 
         if let Some(recorded) = self
@@ -4272,10 +4407,7 @@ impl Manager for ManagerDaemonService {
             }));
         }
 
-        let template = self
-            .store
-            .get_job_template_version(&inner.name, inner.version)
-            .map_err(|e| map_store_error("Error loading template", e))?;
+        let template = self.load_template_for_run(&identity, &inner.name, inner.version)?;
         let values =
             job_templates::resolve_variable_values(&template.variables, &inner.variables_json)
                 .map_err(|e| Status::invalid_argument(e.to_string()))?;
@@ -4704,8 +4836,12 @@ impl Manager for ManagerDaemonService {
             AclScope::none(),
         )?;
         let req = request.into_inner();
-        let idempotency_key =
-            scoped_idempotency_key(&identity, "create_exec_key", req.idempotency_key.as_deref());
+        let idempotency_key = scoped_idempotency_key(
+            &identity,
+            "create_exec_key",
+            req.idempotency_key.as_deref(),
+            &req,
+        );
         if let Some(recorded) = self
             .store
             .idempotency_lookup(&idempotency_key)
@@ -4781,8 +4917,12 @@ impl Manager for ManagerDaemonService {
             AclScope::none(),
         )?;
         let req = request.into_inner();
-        let idempotency_key =
-            scoped_idempotency_key(&identity, "delete_exec_key", req.idempotency_key.as_deref());
+        let idempotency_key = scoped_idempotency_key(
+            &identity,
+            "delete_exec_key",
+            req.idempotency_key.as_deref(),
+            &req,
+        );
         if self
             .store
             .idempotency_lookup(&idempotency_key)
@@ -5000,7 +5140,7 @@ impl Manager for ManagerDaemonService {
             return Err(Status::invalid_argument("Plan request missing jobspec"));
         }
 
-        let (config, _kv_refs) =
+        let (config, kv_refs) =
             resolve_jobspec_kv_references(&self.store, &jobspec).map_err(|e| {
                 error!("Error parsing jobspec for plan: {:?}", e);
                 Status::invalid_argument(format!("Error parsing jobspec: {e}"))
@@ -5011,6 +5151,10 @@ impl Manager for ManagerDaemonService {
             AclAction::Read,
             &AclScope::job(&config.name),
         )?;
+        // The plan compares the KV-rendered config with the stored one
+        // (`same_content`), so it needs the reads a submit would.
+        enforce_kv_reference_read(&identity, &kv_refs)?;
+        enforce_kv_artifact_read(&identity, &config)?;
         let mut config = self
             .store
             .normalize_job_config(&config)
@@ -5019,6 +5163,7 @@ impl Manager for ManagerDaemonService {
             error!("Error validating task configs: {:?}", e);
             Status::invalid_argument(format!("Error validating task configs: {e}"))
         })?;
+        self.validate_identity_sub_templates(&config)?;
         self.validate_job_volumes(&config).map_err(|e| {
             error!("Error validating volumes: {:?}", e);
             Status::invalid_argument(format!("Error validating volumes: {e:#}"))
@@ -5412,10 +5557,14 @@ impl Manager for ManagerDaemonService {
             self.job_read_scope(&request.get_ref().name),
         )?;
         let inner = request.into_inner();
+        let idempotency_key = scoped_idempotency_key(
+            &identity,
+            "stop_job",
+            inner.idempotency_key.as_deref(),
+            &inner,
+        );
         let name = inner.name;
         let priority = inner.priority.unwrap_or(self.store.default_eval_priority);
-        let idempotency_key =
-            scoped_idempotency_key(&identity, "stop_job", inner.idempotency_key.as_deref());
 
         if let Some(message) = self
             .store
@@ -5475,9 +5624,13 @@ impl Manager for ManagerDaemonService {
             self.job_read_scope(&request.get_ref().name),
         )?;
         let inner = request.into_inner();
+        let idempotency_key = scoped_idempotency_key(
+            &ident,
+            "scale_task",
+            inner.idempotency_key.as_deref(),
+            &inner,
+        );
         let name = inner.name;
-        let idempotency_key =
-            scoped_idempotency_key(&ident, "scale_task", inner.idempotency_key.as_deref());
 
         if let Some(message) = self
             .store
@@ -5698,9 +5851,13 @@ impl Manager for ManagerDaemonService {
             self.job_read_scope(&request.get_ref().name),
         )?;
         let inner = request.into_inner();
+        let idempotency_key = scoped_idempotency_key(
+            &identity,
+            "destroy_job",
+            inner.idempotency_key.as_deref(),
+            &inner,
+        );
         let name = inner.name;
-        let idempotency_key =
-            scoped_idempotency_key(&identity, "destroy_job", inner.idempotency_key.as_deref());
 
         if let Some(message) = self
             .store
@@ -5764,6 +5921,7 @@ impl Manager for ManagerDaemonService {
             &identity,
             "create_instance",
             inner.idempotency_key.as_deref(),
+            &inner,
         );
 
         if let Some(recorded) = self
@@ -5943,6 +6101,7 @@ impl Manager for ManagerDaemonService {
             &identity,
             "create_instances",
             inner.idempotency_key.as_deref(),
+            &inner,
         );
 
         if let Some(recorded) = self
@@ -6108,8 +6267,12 @@ impl Manager for ManagerDaemonService {
             AclScope::any(),
         )?;
         let inner = request.into_inner();
-        let idempotency_key =
-            scoped_idempotency_key(&identity, "stop_instance", inner.idempotency_key.as_deref());
+        let idempotency_key = scoped_idempotency_key(
+            &identity,
+            "stop_instance",
+            inner.idempotency_key.as_deref(),
+            &inner,
+        );
 
         if let Some(message) = self
             .store
@@ -6222,6 +6385,7 @@ impl Manager for ManagerDaemonService {
             &identity,
             "start_instance",
             inner.idempotency_key.as_deref(),
+            &inner,
         );
 
         if let Some(recorded) = self
@@ -6424,6 +6588,7 @@ impl Manager for ManagerDaemonService {
             &identity,
             "destroy_instance",
             inner.idempotency_key.as_deref(),
+            &inner,
         );
 
         if let Some(message) = self
@@ -6553,6 +6718,7 @@ impl Manager for ManagerDaemonService {
             &identity,
             "replace_instance",
             inner.idempotency_key.as_deref(),
+            &inner,
         );
 
         if let Some(message) = self
@@ -7060,8 +7226,12 @@ impl Manager for ManagerDaemonService {
             AclScope::any(),
         )?;
         let inner = request.into_inner();
-        let idempotency_key =
-            scoped_idempotency_key(&identity, "DeleteVolume", inner.idempotency_key.as_deref());
+        let idempotency_key = scoped_idempotency_key(
+            &identity,
+            "DeleteVolume",
+            inner.idempotency_key.as_deref(),
+            &inner,
+        );
 
         if let Some(message) = self
             .store
@@ -8336,14 +8506,15 @@ impl Manager for ManagerDaemonService {
             AclScope::any(),
         )?;
         let inner = request.into_inner();
-        let node_id = inner.node_id;
-        let availability = inner.availability;
-        let evict = inner.evict;
         let idempotency_key = scoped_idempotency_key(
             &identity,
             "set_node_availability",
             inner.idempotency_key.as_deref(),
+            &inner,
         );
+        let node_id = inner.node_id;
+        let availability = inner.availability;
+        let evict = inner.evict;
 
         if availability != "available" && availability != "drained" {
             return Err(Status::invalid_argument(format!(
@@ -9167,8 +9338,12 @@ impl Manager for ManagerDaemonService {
             AclScope::none(),
         )?;
         let req = request.into_inner();
-        let idempotency_key =
-            scoped_idempotency_key(&identity, "rotate_data_key", req.idempotency_key.as_deref());
+        let idempotency_key = scoped_idempotency_key(
+            &identity,
+            "rotate_data_key",
+            req.idempotency_key.as_deref(),
+            &req,
+        );
         if let Some(message) = self
             .store
             .idempotency_lookup(&idempotency_key)
@@ -9220,7 +9395,7 @@ impl Manager for ManagerDaemonService {
         )?;
         let req = request.into_inner();
         let idempotency_key =
-            scoped_idempotency_key(&identity, "rewrap_kv", req.idempotency_key.as_deref());
+            scoped_idempotency_key(&identity, "rewrap_kv", req.idempotency_key.as_deref(), &req);
         if let Some(message) = self
             .store
             .idempotency_lookup(&idempotency_key)
@@ -9262,8 +9437,12 @@ impl Manager for ManagerDaemonService {
             AclScope::none(),
         )?;
         let req = request.into_inner();
-        let idempotency_key =
-            scoped_idempotency_key(&identity, "rewrap_root_key", req.idempotency_key.as_deref());
+        let idempotency_key = scoped_idempotency_key(
+            &identity,
+            "rewrap_root_key",
+            req.idempotency_key.as_deref(),
+            &req,
+        );
         if let Some(message) = self
             .store
             .idempotency_lookup(&idempotency_key)
@@ -10305,11 +10484,11 @@ impl Manager for ManagerDaemonService {
     /// The value is returned for immediate use and never persisted on
     /// allocations or logged (the span carries node/path/source only).
     ///
-    /// SECURITY BOUNDARY (KV ACLs do not exist yet): any task spec may
-    /// reference any KV path via auth.kv, so possession of job-submit access
-    /// implies read access to every KV credential. Revisit when the ACL
-    /// system lands — this credential read must become an early enforcement
-    /// point. Tracked in internal_docs/TODO.md (Auth, TLS & security).
+    /// Two checks keep this from being a way to read KV: admission requires
+    /// `kv:read` on a jobspec's `auth.kv` (`enforce_kv_artifact_read`), and
+    /// here a node only receives a path that an allocation placed on it, the
+    /// task of a live boot ticket for its pool, or its own pool's
+    /// `contentStore` names ([`Self::artifact_credential_paths_for_node`]).
     #[instrument(skip_all, fields(node_id = %request.get_ref().node_id, kv_path = %request.get_ref().kv_path, source = %request.get_ref().source))]
     async fn get_artifact_credential(
         &self,
@@ -10321,6 +10500,20 @@ impl Manager for ManagerDaemonService {
         acl::enforce_worker_plane(&identity)?;
         let req = request.into_inner();
         acl::enforce_node_binding(&identity, &req.node_id)?;
+        // Before the read, so a node cannot probe which paths exist.
+        let named = self
+            .artifact_credential_paths_for_node(&req.node_id)
+            .map_err(|e| map_store_error("Error resolving artifact credentials", e))?;
+        // NotFound rather than PermissionDenied: the node is authenticated
+        // and bound above, and what it asked for is simply not one of its
+        // credentials (it learns nothing about which KV paths exist).
+        if !named.contains(&req.kv_path) {
+            return Err(Status::not_found(format!(
+                "kv {} is not an artifact credential of node {}: no allocation placed on it, \
+                 live boot ticket for its pool, or contentStore of its pool names it",
+                req.kv_path, req.node_id
+            )));
+        }
         let entry = self
             .store
             .get_kv(&req.kv_path)
@@ -11153,6 +11346,7 @@ impl Manager for ManagerDaemonService {
             &identity,
             "issue_boot_ticket",
             req.idempotency_key.as_deref(),
+            &req,
         );
         if let Some(recorded) = self
             .store
@@ -11182,6 +11376,19 @@ impl Manager for ManagerDaemonService {
                 })?
                 .id()
         } else {
+            // The ACL check above covered `req.job`, so a named config must
+            // be one of that job's: otherwise `boot:write` on one job would
+            // mint tickets that start another job's spec.
+            let owner = self
+                .store
+                .job_id_for_job_config(&req.job_config_id)
+                .map_err(|e| map_store_error("Error resolving job config", e))?;
+            if owner.as_deref() != Some(req.job.as_str()) {
+                return Err(Status::not_found(format!(
+                    "job `{}` has no config {}",
+                    req.job, req.job_config_id
+                )));
+            }
             req.job_config_id.clone()
         };
 
@@ -11378,46 +11585,58 @@ impl Manager for ManagerDaemonService {
             }))
         };
 
-        // An edge-originated claim carries the ticket that authorized it,
-        // spent inside the ratification's own entry.
-        let mut spend = None;
-        if !req.ticket.trim().is_empty() {
-            if !self.edge_boot.enabled {
-                return refuse(
-                    crate::structs::edge_boot::RefusalReason::Disabled,
-                    "edge boot is not enabled on this manager".into(),
-                );
-            }
-            let Some(state) = self.workload_identity.as_ref() else {
-                return refuse(
-                    crate::structs::edge_boot::RefusalReason::Disabled,
-                    "the workload-identity issuer that signs boot tickets is not enabled".into(),
-                );
-            };
-            let node = self
-                .store
-                .get_node(&req.node_id)
-                .map_err(|e| map_store_error("Error loading node", e))?;
-            match crate::manager::edge_boot::verify_ticket(
-                state,
-                &req.ticket,
-                &req.instance_id,
-                &node.pool,
-            ) {
-                Ok(claims) => {
-                    spend = Some(crate::manager::edge_boot::TicketSpend {
-                        jti: claims.jti,
-                        now_unix: time::OffsetDateTime::now_utc().unix_timestamp(),
-                    });
-                }
-                Err(err) => {
-                    return refuse(
-                        crate::structs::edge_boot::RefusalReason::TicketInvalid,
-                        format!("{err:#}"),
-                    );
-                }
-            }
+        // Every claim carries the ticket that authorized it (a node admits
+        // no start without one), spent inside the ratification's own entry.
+        // A ticketless claim would let a node place any job config on itself.
+        if req.ticket.trim().is_empty() {
+            return refuse(
+                crate::structs::edge_boot::RefusalReason::TicketInvalid,
+                "a claim must carry the boot ticket that authorized it".into(),
+            );
         }
+        if !self.edge_boot.enabled {
+            return refuse(
+                crate::structs::edge_boot::RefusalReason::Disabled,
+                "edge boot is not enabled on this manager".into(),
+            );
+        }
+        let Some(state) = self.workload_identity.as_ref() else {
+            return refuse(
+                crate::structs::edge_boot::RefusalReason::Disabled,
+                "the workload-identity issuer that signs boot tickets is not enabled".into(),
+            );
+        };
+        let node = self
+            .store
+            .get_node(&req.node_id)
+            .map_err(|e| map_store_error("Error loading node", e))?;
+        let verified = crate::manager::edge_boot::verify_ticket(
+            state,
+            &req.ticket,
+            &req.instance_id,
+            &node.pool,
+        )
+        .and_then(|claims| {
+            crate::manager::edge_boot::ticket_covers_claim(
+                &claims,
+                &req.job_config_id,
+                &req.task_name,
+                crate::structs::edge_boot::Gate::from_wire(req.gate),
+            )?;
+            Ok(claims)
+        });
+        let spend = match verified {
+            Ok(claims) => Some(crate::manager::edge_boot::TicketSpend {
+                jti: claims.jti,
+                now_unix: time::OffsetDateTime::now_utc().unix_timestamp(),
+            }),
+            Err(err) => {
+                return refuse(
+                    crate::structs::edge_boot::RefusalReason::TicketInvalid,
+                    format!("{err:#}"),
+                );
+            }
+        };
 
         let started = std::time::Instant::now();
         let claim = crate::manager::edge_boot::ClaimRatification {
@@ -11509,15 +11728,25 @@ struct MintedTicketRecord {
 }
 
 /// The stored form of a client-chosen idempotency key, scoped to one
-/// operation and one caller. Keys used to be a single global namespace: a
-/// `job run` key replayed on `job destroy` silently skipped the destroy and
-/// reported `deduplicated`, and a second caller presenting someone else's key
-/// read back their recorded reply. The caller is the token's accessor id
+/// operation and one caller, and bound to the request it was first used
+/// with. Keys used to be a single global namespace: a `job run` key replayed
+/// on `job destroy` silently skipped the destroy and reported
+/// `deduplicated`, and a second caller presenting someone else's key read
+/// back their recorded reply. Then the same key with different arguments
+/// replayed the first reply, so a retry loop that changed its request
+/// believed the change had been made. The caller is the token's accessor id
 /// (stable across a token's lifetime and safe to store), falling back to the
 /// principal for JWT and anonymous callers. A missing or blank key stays
 /// empty, which disables deduplication. Length prefixes keep the encoding
-/// unambiguous whatever the parts contain.
-fn scoped_idempotency_key(identity: &AclIdentity, operation: &str, key: Option<&str>) -> String {
+/// unambiguous whatever the parts contain, and the request's fingerprint
+/// follows the last `#` ([`Store::idempotency_lookup`] refuses a key whose
+/// record carries another one).
+fn scoped_idempotency_key(
+    identity: &AclIdentity,
+    operation: &str,
+    key: Option<&str>,
+    request: &impl serde::Serialize,
+) -> String {
     let key = key.map(str::trim).unwrap_or_default();
     if key.is_empty() {
         return String::new();
@@ -11526,7 +11755,26 @@ fn scoped_idempotency_key(identity: &AclIdentity, operation: &str, key: Option<&
         .accessor_id
         .as_deref()
         .unwrap_or(identity.principal.as_str());
-    format!("{operation}/{}:{caller}/{key}", caller.len())
+    format!(
+        "{operation}/{}:{caller}/{key}#{}",
+        caller.len(),
+        request_fingerprint(request)
+    )
+}
+
+/// A digest of a request's arguments, without its idempotency key: the
+/// request's JSON form (object keys sorted, so equal requests encode
+/// equally), SHA-256, first 16 bytes in hex.
+fn request_fingerprint(request: &impl serde::Serialize) -> String {
+    use sha2::Digest;
+    let mut value = serde_json::to_value(request).unwrap_or(Value::Null);
+    if let Value::Object(fields) = &mut value {
+        fields.remove("idempotencyKey");
+    }
+    sha2::Sha256::digest(value.to_string().as_bytes())[..16]
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
 }
 
 /// The scope a volume write is checked against. A job's volume belongs to
@@ -11547,7 +11795,13 @@ enum RegistrationGrant {
     /// ACLs off, a management credential, or an audit-only pass.
     Unrestricted,
     /// A verified join token: pins the worker type, and through it the pool.
-    JoinToken(crate::storage::acl_store::JoinTokenRecord),
+    /// It may introduce a new node or rejoin a lost one, but not take over a
+    /// live node, unless the caller also presented that node's own token
+    /// (`caller_node`).
+    JoinToken {
+        record: crate::storage::acl_store::JoinTokenRecord,
+        caller_node: Option<String>,
+    },
     /// A node token: may only re-register its own node, in its current pool.
     Node(String),
 }
@@ -13188,6 +13442,79 @@ fn enforce_kv_credential_read<'a>(
     Ok(())
 }
 
+/// Every KV value a jobspec consumes (`$path` references, `kvInjections`
+/// env and files, the `{{ kv "…" }}` lookups inside their templates, and a
+/// `templateKv` pointer) is rendered into the task, which can read it, so
+/// naming one needs the same right as reading it: `kv:read` on the path.
+/// Without this, `job:write` on any job was a way to read every KV secret.
+/// Applied to RunJob, template runs and renders, and PlanJob.
+fn enforce_kv_reference_read(
+    identity: &crate::structs::AclIdentity,
+    references: &[KvReference],
+) -> Result<(), Status> {
+    let mut checked = HashSet::new();
+    for reference in references {
+        if !checked.insert(reference.key.as_str()) {
+            continue;
+        }
+        acl::enforce(
+            identity,
+            AclResource::Kv,
+            AclAction::Read,
+            &AclScope::path(&reference.key),
+        )
+        .map_err(|status| {
+            Status::new(
+                status.code(),
+                format!(
+                    "{} (the jobspec reads kv {}; the submitter needs kv read on it)",
+                    status.message(),
+                    reference.key
+                ),
+            )
+        })?;
+    }
+    Ok(())
+}
+
+/// An artifact's `auth.kv` hands a KV credential to the fetcher, which sends
+/// it to the artifact's source (and the manager uses it to resolve a pin at
+/// submit), so naming one in a jobspec needs `kv:read` on the path. Checked
+/// on the spec as submitted, before cluster `artifacts.auth` matchers fill
+/// in their own credentials: those are the operator's choice, not the
+/// submitter's.
+fn enforce_kv_artifact_read(
+    identity: &crate::structs::AclIdentity,
+    config: &JobConfig,
+) -> Result<(), Status> {
+    for task in &config.tasks {
+        for artifact in &task.artifacts {
+            let Some(path) = artifact.auth.as_ref().and_then(|auth| auth.kv.as_deref()) else {
+                continue;
+            };
+            acl::enforce(
+                identity,
+                AclResource::Kv,
+                AclAction::Read,
+                &AclScope::path(path),
+            )
+            .map_err(|status| {
+                Status::new(
+                    status.code(),
+                    format!(
+                        "{} (task {} artifact {} names auth.kv {path}; the submitter needs kv \
+                         read on it)",
+                        status.message(),
+                        task.name,
+                        artifact.redacted_source()
+                    ),
+                )
+            })?;
+        }
+    }
+    Ok(())
+}
+
 fn enforce_net_policy_scope(
     identity: &crate::structs::AclIdentity,
     action: AclAction,
@@ -14047,6 +14374,51 @@ mod tests {
             .next()
             .context("missing task config")?;
         store.place_alloc("node-1", task_id)
+    }
+
+    /// A node is served the `auth.kv` its allocation names and nothing else,
+    /// and a path it is not owed is NotFound before the value is read.
+    #[tokio::test]
+    async fn a_node_reads_only_the_artifact_credentials_its_work_names_test() -> R<()> {
+        let store = setup_store()?;
+        let task = TaskConfig {
+            artifacts: serde_json::from_value(json!([{
+                "source": "https://example.test/tool.tgz",
+                "auth": { "kv": "secrets/pull" },
+            }]))?,
+            ..TaskConfig::new("fetcher", "noop")
+        };
+        submit_and_place_identity_task(&store, "fetch", task)?;
+        let credential = json!({ "type": "bearer", "token": "t0k" }).to_string();
+        for key in ["secrets/pull", "secrets/other"] {
+            store.put_kv(key, &credential, KvValueType::String, None, None)?;
+        }
+        let manager = ManagerDaemonService::new(store.clone());
+        let ask = |kv_path: &str| {
+            Request::new(GetArtifactCredentialRequest {
+                node_id: "node-1".into(),
+                kv_path: kv_path.into(),
+                source: "https://example.test/tool.tgz".into(),
+            })
+        };
+
+        let reply = manager
+            .get_artifact_credential(ask("secrets/pull"))
+            .await?
+            .into_inner();
+        assert_eq!(reply.credential_json, credential);
+        let err = manager
+            .get_artifact_credential(ask("secrets/other"))
+            .await
+            .expect_err("a path no work on the node names is refused");
+        assert_eq!(err.code(), tonic::Code::NotFound);
+        assert!(
+            err.message()
+                .contains("is not an artifact credential of node node-1"),
+            "{}",
+            err.message()
+        );
+        Ok(())
     }
 
     fn issue_request(

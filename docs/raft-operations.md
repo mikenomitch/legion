@@ -310,8 +310,9 @@ asked.
   the leader that you can reach.
 - `ExecAllocation` (`legion exec`) is not forwarded: it is a stream, and it
   does not write raft state, so any manager serves it.
-- The forward uses plaintext HTTP/2 between managers, like the raft
-  transport.
+- The forward rides the raft transport's TLS between managers, carrying
+  the caller's token encrypted
+  ([Managers reach each other over TLS](auth-and-acls.md#managers-reach-each-other-over-tls)).
 
 ## UI operations
 

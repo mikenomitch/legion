@@ -1478,6 +1478,40 @@ pub fn validate_volume_name(task: &str, name: &str) -> R<()> {
     Ok(())
 }
 
+/// Longest job, group, or task name admission accepts.
+pub const MAX_OBJECT_NAME_LEN: usize = 128;
+
+/// Whether `name` is safe as one host path component: non-empty,
+/// `[A-Za-z0-9._-]` only, and not starting with `.`. The worker, which runs
+/// as root, joins task names onto allocation directories, so a `/` or a `..`
+/// would name a path outside the allocation, and a leading `.` could name
+/// one of the worker's own entries beside the task directories
+/// (`.container`, `.sandbox`).
+pub fn is_safe_path_component(name: &str) -> bool {
+    !name.is_empty()
+        && !name.starts_with('.')
+        && name
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | '-'))
+}
+
+/// Job, group, and task names become host path components on the worker
+/// (`allocs/<alloc>/<task>/`), OIDC subject parts, and DNS-style labels, so
+/// admission restricts them to `[A-Za-z0-9._-]`, 1-128 characters, not
+/// starting with `.`.
+pub fn validate_object_name(label: &str, name: &str) -> R<()> {
+    if name.is_empty() || name.len() > MAX_OBJECT_NAME_LEN {
+        bail!("{label} {name:?} must be 1-{MAX_OBJECT_NAME_LEN} characters");
+    }
+    if !is_safe_path_component(name) {
+        bail!(
+            "{label} {name:?} may only contain [A-Za-z0-9._-] and may not start with \".\" \
+             (the name becomes a directory on every worker that runs it)"
+        );
+    }
+    Ok(())
+}
+
 /// The `size` param of a volume declaration in bytes, when present and
 /// parseable. Used for placement-time disk accounting; a driver still receives
 /// the raw string.

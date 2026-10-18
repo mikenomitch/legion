@@ -268,6 +268,7 @@ impl ManagerDaemonService {
             &identity,
             "create_snapshot",
             inner.idempotency_key.as_deref(),
+            &inner,
         );
         if let Some(snapshot_id) = self
             .store
@@ -525,6 +526,7 @@ impl ManagerDaemonService {
             &identity,
             "delete_snapshot",
             inner.idempotency_key.as_deref(),
+            &inner,
         );
         if let Some(message) = self
             .store
@@ -615,6 +617,7 @@ impl ManagerDaemonService {
             &identity,
             "restore_instance",
             inner.idempotency_key.as_deref(),
+            &inner,
         );
         if let Some(recorded) = self
             .store
@@ -755,8 +758,12 @@ impl ManagerDaemonService {
         )?;
         let inner = request.into_inner();
         let constraints = parse_warm_constraints(&inner.constraints)?;
-        let idempotency_key =
-            scoped_idempotency_key(&identity, "warm_snapshot", inner.idempotency_key.as_deref());
+        let idempotency_key = scoped_idempotency_key(
+            &identity,
+            "warm_snapshot",
+            inner.idempotency_key.as_deref(),
+            &inner,
+        );
         if let Some(recorded) = self
             .store
             .idempotency_lookup(&idempotency_key)

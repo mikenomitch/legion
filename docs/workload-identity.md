@@ -62,8 +62,22 @@ doesn't expose custom claims as condition keys. GCP and Vault can match any
 
 Operators can override the format with a simple `{field}` template. It does
 plain substitution with no logic. Set it at the cluster level
-(`workloadIdentity.subTemplate`) or per identity (`subTemplate`). Admission
-validation enforces these rules:
+(`workloadIdentity.subTemplate`), and allow other shapes for jobs to choose
+per identity with `workloadIdentity.allowedSubTemplates`. A job's
+per-identity `subTemplate` must be the cluster template or one of the allowed
+ones; anything else is refused at submit, and no token is minted under it:
+
+```console
+error: task replica: identity "aws" sets subTemplate "{region}:{group}:{job}:{task}", which is neither the cluster default nor in workloadIdentity.allowedSubTemplates; an operator must allow a subject shape before a job can use it
+```
+
+Two templates can render the same subject for two different workloads. With
+`job:write` on a job called `web` alone, `{region}:{group}:{job}:{task}` for
+group `api` and task `server` renders `auto:api:web:server`, which is the
+default subject of job `api`'s group `web`. AWS trust policies match nothing
+but `sub`, so which subject shapes exist is the operator's decision. Every
+template, the allowed ones included, must pass these rules (an invalid entry
+stops the manager from starting):
 
 - **Allow-list only.** Allowed: `{region}`, `{job}`, `{group}`, `{task}`, and
   `{instance}`/`{slot}` (stateful tasks only). Unknown placeholders are rejected.
@@ -195,6 +209,9 @@ restart. See [docs/task-runtime-container.md](task-runtime-container.md).
     defaultTtl = "15m",
     rotationAge = "24h",
     subTemplate = "{region}:{job}:{group}:{task}",
+    # The other subject shapes a job's identity may name in its own
+    # `subTemplate`. Empty (the default): only `subTemplate` above.
+    allowedSubTemplates = ["{region}:{job}:{group}:{task}:{instance}"],
   },
 }
 ```
@@ -546,12 +563,13 @@ What this covers, and what it does not:
   expires. Keep `ttl` short on tasks you fork or snapshot, and bind
   per-instance access to `legion.io/instance` only when one TTL of overlap
   is acceptable.
-- **Not covered: ACL tokens minted from an identity token.** An ACL token
-  the origin got with `legion login --method legion` before the capture is an
-  ordinary ACL token. It is copied into every fork and stays valid for
-  `acl.loginTtl` (24 hours by default). Present the identity token as a
-  bearer credential instead of logging in, or delete the ACL token after a
-  fork.
+- **ACL tokens minted from an identity token last as long as it does.** An
+  ACL token the origin got with `legion login --method legion` before the
+  capture is copied into every fork. It expires when the identity token it
+  was minted from would have (never later than `acl.loginTtl`), not when the
+  epoch moves, so a fork can use it for at most one identity `ttl`. Present
+  the identity token as a bearer credential instead of logging in, or delete
+  the ACL token after a fork, to close that window too.
 - **The window before the refresh.** Between the capture and the origin's
   re-issue (about a heartbeat), the origin's own current token is already
   refused. A process that cached its token in memory gets one failed call,
@@ -719,7 +737,11 @@ substitution, and admission validation enforces these rules:
 The **artifact system** ([docs/artifacts.md](artifacts.md)) uses node
 identities. A task artifact can set `auth = { nodeIdentity = "artifact-pull" }`,
 and cluster-level `artifacts.auth` matchers can route source prefixes to a
-node identity. Cluster matchers can use node identities because they are
+node identity. A node token is the worker node's own credential, sent to
+whatever source the artifact names, so a job that sets `auth.nodeIdentity`
+itself is [host-level](auth-and-acls.md#host-level-jobs): submitting it needs
+a `job:write` rule with `host = true`. A cluster matcher is how an operator
+lends a node identity to every job, for the sources it names. Cluster matchers can use node identities because they are
 cluster-scoped. Attaching a per-task identity cluster-wide would weaken the
 per-task `sub` security boundary, so matchers accept only `kv` and
 `nodeIdentity`.

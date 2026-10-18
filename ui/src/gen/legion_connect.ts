@@ -42,6 +42,11 @@ export const Manager = {
      * further registrations queue nothing. Failing to queue the pass does not
      * fail the registration.
      *
+     * A join token may introduce a new node or rejoin one that has gone `lost`,
+     * but registering under the name of a node that is still live is
+     * PERMISSION_DENIED unless the request also carries that node's own token
+     * (a restart). See docs/auth-and-acls.md, "Worker nodes".
+     *
      * @generated from rpc legion.Manager.WorkerRegister
      */
     workerRegister: {
@@ -2705,9 +2710,18 @@ export const Manager = {
      * names a KV credential path. The credential value is returned to the
      * worker and is never persisted on allocations, logged, or traced.
      *
-     * SECURITY: KV ACLs do not exist yet, so any task spec may reference any
-     * KV path via `auth.kv`. When the ACL system lands, this RPC is the
-     * enforcement point for artifact credential reads (see docs/artifacts.md).
+     * A node is served only paths its own work names: an artifact `auth.kv` of
+     * an allocation placed on it, of the task of a live boot ticket for its
+     * pool (edge starts stage before the allocation exists), or its pool's
+     * `contentStore.auth.kv`. Any other path is NOT_FOUND, decided before the
+     * value is read, so a node cannot probe which paths exist. A spec that
+     * names `auth.kv` itself needed `kv:read` on the path to be admitted (see
+     * docs/artifacts.md).
+     *
+     * Errors:
+     * - PermissionDenied: `node_id` does not match the caller's credential.
+     * - NotFound: no work on the node names `kv_path`, or the KV entry is
+     *   missing.
      *
      * @generated from rpc legion.Manager.GetArtifactCredential
      */
@@ -2723,7 +2737,9 @@ export const Manager = {
      * Read-only mode is the default safety behavior and rejects write statements
      * unless explicitly enabled in the request.
      *
-     * Private key material and password hashes always read as NULL, in any
+     * Private key material, password hashes, and recorded idempotency replies
+     * (`idempotency_record.response_message`, which can hold a live boot
+     * ticket) always read as NULL, in any
      * statement and however the query reaches them: `signing_key.private_key_pem`,
      * `net_mesh_ca.key_pem`, and `acl_user.password_hash`. Predicates on those
      * columns match nothing, and `INSERT ... SELECT` copies NULL.
@@ -2840,6 +2856,11 @@ export const Manager = {
      * on the manager (`method` = the configured method name, `jwt` = the
      * externally issued token). The reply contains the token secret exactly
      * once; the manager stores only a hash of it.
+     *
+     * A token minted through the `legion` method (a workload's identity token)
+     * expires no later than that identity token does, whatever `ttl` asks for:
+     * a fork or snapshot retires the identity token, and a login token copied
+     * with it must not outlive it.
      *
      * @generated from rpc legion.Manager.Login
      */

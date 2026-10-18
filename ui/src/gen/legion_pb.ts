@@ -934,9 +934,11 @@ export class RunJobRequest extends Message<RunJobRequest> {
    * Keys are scoped to the RPC and to the caller (the ACL token's accessor
    * ID, or the principal for JWT and anonymous callers): the same key on a
    * different RPC, or from a different caller, is a new request and never
-   * replays another caller's reply. The key does not cover the request body.
-   * Records are kept for 24 hours, then pruned; a retry after that is applied
-   * again. Every other RPC's `idempotency_key` follows these rules.
+   * replays another caller's reply. The key also covers the request: the same
+   * key with different arguments fails with INVALID_ARGUMENT instead of
+   * replaying the first reply. Records are kept for 24 hours, then pruned; a
+   * retry after that is applied again. Every other RPC's `idempotency_key`
+   * follows these rules.
    *
    * @generated from field: optional string idempotency_key = 5;
    */
@@ -28886,7 +28888,9 @@ export class IssueBootTicketRequest extends Message<IssueBootTicketRequest> {
    * Exact job config id the ticket authorizes. Optional: when empty the
    * manager pins the job's current config at mint time and returns it in the
    * reply. A ticket NEVER means "latest" — pinning at mint is what keeps a
-   * redeploy from silently widening what a live ticket can start.
+   * redeploy from silently widening what a live ticket can start. When set,
+   * it must be a config of `job` (the job `boot:write` was checked against);
+   * another job's config is NOT_FOUND.
    *
    * @generated from field: string job_config_id = 3;
    */
@@ -29359,11 +29363,11 @@ export class RatifyClaimRequest extends Message<RatifyClaimRequest> {
   gate = GateLevel.GATE_OFF;
 
   /**
-   * Boot ticket that authorized the start, for edge-originated claims. The
-   * manager re-verifies it (nodes are honest but not trusted to be the only
-   * holder) and spends its `jti` when the ticket is single-use. Empty for
-   * manager-originated claims, which were authorized by the submit that
-   * produced them.
+   * Boot ticket that authorized the start. Required: a claim without one is
+   * refused `TICKET_INVALID`. The manager re-verifies it (nodes are honest
+   * but not trusted to be the only holder), refuses it unless it names this
+   * claim's `job_config_id` and `task_name` with a gate at least `gate`, and
+   * spends its `jti` when the ticket is single-use.
    *
    * @generated from field: string ticket = 7;
    */

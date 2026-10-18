@@ -1696,6 +1696,12 @@ pub struct WorkloadIdentityConfig {
     pub rotation_age: Option<String>,
     /// Cluster-default `sub` template; per-identity `subTemplate` overrides it.
     pub sub_template: Option<String>,
+    /// The other `sub` templates a job's identity may name in its own
+    /// `subTemplate`. Empty (the default) means a job may name only the
+    /// cluster default: two templates can render the same subject for two
+    /// different workloads, so which shapes exist is the operator's call.
+    #[serde(default)]
+    pub allowed_sub_templates: Option<Vec<String>>,
     /// Identities issued to worker nodes rather than tasks (artifact system
     /// plan §6). Referenced by `auth.nodeIdentity` and cluster artifact-auth
     /// matchers.
@@ -1720,6 +1726,8 @@ pub struct WorkloadIdentityConfigFull {
     pub default_ttl: String,
     pub rotation_age: String,
     pub sub_template: String,
+    #[serde(default)]
+    pub allowed_sub_templates: Vec<String>,
     #[serde(default)]
     pub node_identities: Vec<NodeIdentityConfig>,
     #[serde(default)]
@@ -1756,6 +1764,7 @@ impl Default for WorkloadIdentityConfigFull {
             default_ttl: DEF_WORKLOAD_IDENTITY_TTL.into(),
             rotation_age: DEF_WORKLOAD_IDENTITY_ROTATION_AGE.into(),
             sub_template: crate::structs::workload_identity::DEFAULT_SUB_TEMPLATE.into(),
+            allowed_sub_templates: Vec::new(),
             node_identities: Vec::new(),
             control_plane_bindings: Vec::new(),
         }
@@ -1772,6 +1781,7 @@ impl From<WorkloadIdentityConfigFull> for WorkloadIdentityConfig {
             default_ttl: Some(val.default_ttl),
             rotation_age: Some(val.rotation_age),
             sub_template: Some(val.sub_template),
+            allowed_sub_templates: Some(val.allowed_sub_templates),
             node_identities: Some(val.node_identities),
             control_plane_bindings: Some(val.control_plane_bindings),
         }
@@ -1789,6 +1799,10 @@ impl WorkloadIdentityConfig {
             default_ttl: self.default_ttl.clone().unwrap_or(d.default_ttl),
             rotation_age: self.rotation_age.clone().unwrap_or(d.rotation_age),
             sub_template: self.sub_template.clone().unwrap_or(d.sub_template),
+            allowed_sub_templates: self
+                .allowed_sub_templates
+                .clone()
+                .unwrap_or(d.allowed_sub_templates),
             node_identities: self.node_identities.clone().unwrap_or(d.node_identities),
             control_plane_bindings: self
                 .control_plane_bindings

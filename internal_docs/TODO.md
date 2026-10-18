@@ -74,11 +74,12 @@ How to use it:
         plaintext for the CLI and UI, told apart by the first byte; workers
         always dial TLS pinned to the CA. Docs:
         [auth-and-acls.md](../docs/auth-and-acls.md#workers-reach-managers-over-tls).
-  - [ ] Raft peers still dial each other in plaintext, and with `server.tls`
-        on the API port drops plaintext, which a multi-manager raft cluster
-        needs (`src/storage/raft/network.rs:197`, `driver.rs:934`). Deferred by
-        the plan (non-goals); listed in
-        [architecture-managers-workers.md](../docs/architecture-managers-workers.md#what-is-not-implemented-yet).
+  - [x] Raft peers dial each other over TLS (2026-10-17): every manager
+        derives one key from the cluster secret and answers `raft.legion`
+        with it on the API port, `server.tls` or not; the log, joins,
+        member probes, and lane-write and leader forwarding ride it
+        ([plan](plans/security-gap-closure-plan.md) · [calls #1](calls/security-gap-closure-plan_calls.md) ·
+        [docs](../docs/auth-and-acls.md#managers-reach-each-other-over-tls)).
   - [x] Phase 5: the host guard in the kernel: an `inet legion_host_guard`
         table with one chain per allocation leaf, counters reported as
         `host-guard` denials, the `hostGuard` node attribute in
@@ -162,9 +163,16 @@ How to use it:
   - [x] Fix the public docs' "cannot be bypassed" claims for gated
         `container` and `exec`: they now describe the host guard, and that a
         root `exec` task can `setns` back out.
-  - [ ] `authz` webhooks, artifact fetches, and the worker's own calls are
-        not judged by the host guard (calls entry 23). Revisit if `authz`
-        ever returns data to the task.
+  - [x] `http(s)` artifact fetches and their redirects are judged by the
+        host guard and pinned to the judged addresses (2026-10-17;
+        [calls #6](calls/security-gap-closure-plan_calls.md),
+        [docs](../docs/artifacts.md#what-the-host-guard-checks)).
+  - [ ] Git and OCI artifact fetches, `authz` webhooks, and the worker's own
+        calls are still not judged (calls entry 23 here). Git shells out and
+        `oci-client` builds its own HTTP client, so neither takes a pinned
+        resolver; an `s3://` `endpoint` is judged before the fetch but the
+        S3 client resolves it again. Revisit if `authz` ever returns data to
+        the task.
   - [ ] `legion net policy test` judges only the host guard's built-in
         classes, not a node's own addresses or its `hostGuard` entries
         (calls entry 27).
@@ -568,8 +576,7 @@ How to use it:
 
 | PR | What it lands | Notes |
 | --- | --- | --- |
-| [#47](https://github.com/mikenomitch/legion/pull/47) | Sandbox restores stop waiting out the 5 s datapath timeout: the wait runs only for gated allocations, and push and work-stream launches bind a gated sandbox's egress proxy first | [calls](calls/gated-restore-datapath-wait_calls.md); the lazy against eager KVM rerun is open under "Sandbox boot throughput" |
-| [#44](https://github.com/mikenomitch/legion/pull/44) | Swappable seams: one `Attachment` type for how an allocation reaches the datapath, a typed worker ↔ netd boundary (`Netd`, `NetdInput`/`NetdWants`/`NetdReport`), one listener and dialer, one object-storage layer, pluggable cluster CA providers (`builtin`/`file`/`exec`), DNS on hickory-proto and the egress proxy on hyper, plus the mesh-upstream, VIP-by-node-OS and pipelined-request fixes | [plan](plans/swappable-seams-plan.md) · [calls](calls/swappable-seams-plan_calls.md) · [CA plan](plans/cluster-ca-provider-plan.md); the `legion netd` process split and the rest deferred below |
+| [#50](https://github.com/mikenomitch/legion/pull/50) | Close the known security gaps and the ones a review found: `kv:read` for every KV key a job names, path-safe object names and no-follow writes on the worker, host-level `exec` checks and `file://` sources, guarded HTTP artifact redirects, identity and boot-ticket binding, raft peers over TLS, allowlisted `exec` environments, fingerprinted idempotency keys | [plan](plans/security-gap-closure-plan.md) · [calls](calls/security-gap-closure-plan_calls.md); breaking, see the PR; deferrals are open under "Auth, TLS & security" |
 | [#162](https://github.com/mikenomitch/legion/pull/162) | Lanes hardening: worker-write forwarding, split-tolerant submits, adversarial fixes | Plan §8 + calls doc in [durability-and-ops-execution-plan.md](plans/durability-and-ops-execution-plan.md) |
 | [#143](https://github.com/mikenomitch/legion/pull/143) | Note the node-level builtin resource override gap | Docs only; the fix itself is a todo below |
 | [#84](https://github.com/mikenomitch/legion/pull/84) | Instrument DB hot paths, batch task-status updates | Old; rebase or close |
@@ -2984,11 +2991,12 @@ Plans: [task-runtime-plugins](../docs/task-runtime-plugins.md).
           the epoch
           ([calls 137, 138](calls/suspend-resume-and-oversubscription-plan_calls.md#137-fork-and-snapshot-captures-retire-the-origins-earlier-tokens-with-a-per-instance-identity-epoch),
           [docs](../docs/workload-identity.md#forks-and-snapshots)).
-    - [ ] ACL tokens minted with `legion login --method legion` before a fork
-          are copied into every fork and stay valid for `acl.loginTtl` (24h).
-          Record the instance and epoch on such tokens, or clamp them to the
-          identity token's expiry
-          ([call 139](calls/suspend-resume-and-oversubscription-plan_calls.md#139-acl-tokens-minted-from-an-identity-token-survive-a-fork)).
+    - [x] ACL tokens minted with `legion login --method legion` expire with
+          the identity token they were minted from, so a fork can use a
+          copied one for at most one identity `ttl` (2026-10-17;
+          [call 139](calls/suspend-resume-and-oversubscription-plan_calls.md#139-acl-tokens-minted-from-an-identity-token-survive-a-fork),
+          [calls #15](calls/security-gap-closure-plan_calls.md)). Recording the instance and epoch on the token
+          was not done: it would put a lookup on every request.
     - [x] A resume, fork, or rollback whose restore failed under
           `onRestoreFailure = "cold"` was visible only as an event and a
           `detail` string. It is now `InstanceInfo.cold_boot`, persisted on
@@ -4225,12 +4233,6 @@ Plan: [kv-encryption-plan.md](plans/kv-encryption-plan.md) · docs: [kv-encrypti
       avoid it ([calls #3](calls/kv-cert-delivery-plan_calls.md)). Confirm
       with a test, then decide: migrate in place (and keep files unmarked), or
       document `none` as "on the next replacement".
-- [ ] **Relative KV file paths on `exec` land in the worker's directory.**
-      Start and live rewrites resolve `path` as given, so `tls/bundle.pem` is
-      written relative to the worker's cwd, not the task directory. Identity
-      files share the rule. Fix both together
-      ([calls #10](calls/kv-cert-delivery-plan_calls.md)).
-
 ## Auth, TLS & security
 
 Plan: [auth-acl-plan.md](plans/auth-acl-plan.md) · docs: [auth-and-acls.md](../docs/auth-and-acls.md)
@@ -4262,12 +4264,6 @@ Plan: [auth-acl-plan.md](plans/auth-acl-plan.md) · docs: [auth-and-acls.md](../
   - [ ] Phase 5 — governance on the namespace object: quota,
         `allowedPools`, `allowedRuntimes`, default band. Enforcement point for
         quota is open (plan § 14).
-- [ ] **KV ACLs on `GetArtifactCredential`.** Artifact auth (`auth.kv`) lets any
-      job read any KV credential path today. The enforcement point exists and is
-      marked — see the SECURITY BOUNDARY comment on `get_artifact_credential` in
-      [src/manager/server.rs](../src/manager/server.rs), the RPC comment in
-      `proto/legion.proto`, and the call-out in
-      [docs/artifacts.md](../docs/artifacts.md). Accepted for now; close it.
 - [ ] **Worker mTLS (deferred from auth phase 3).** Now planned as part of
       the worker-plane fix at the top of this file:
       [worker-plane-auth-plan.md](plans/worker-plane-auth-plan.md).
@@ -4285,33 +4281,39 @@ Plan: [auth-acl-plan.md](plans/auth-acl-plan.md) · docs: [auth-and-acls.md](../
         shouldn't need to be supplied, since it's in the JWT
 - [ ] **Cert manager built in**, with public-CA routes, usable by workloads and
       not just the control plane
-- [ ] **A join secret can still claim an existing node's name (audit S1).**
-      Node tokens are now bound to their node, but a compromised worker still
-      holds its join secret. Fix shape: per-node join tokens, or workers
-      persisting their node token. Mitigation today: short join-token TTLs,
-      revoked after the fleet joins. [calls #3](calls/architecture-audit-2026-10-09_calls.md).
-- [ ] **`GetArtifactCredential` is bound to the node but not to its
-      allocations.** Any node can read any credential-shaped KV path. Its proto
-      comment ("KV ACLs do not exist yet") is stale. Found during audit S1.
-- [ ] **Idempotency keys don't cover the request body (audit S4).** The same
-      key with different arguments replays the first reply. Documented in
-      [agent-readiness.md](../docs/agent-readiness.md).
-- [ ] **Exec tasks inherit the worker's whole environment.**
-      `src/task_plugins/exec.rs` adds the allocation env to the worker's and
-      never clears it, so anything in the worker's environment (a
-      `LEGION_TOKEN`, cloud credentials, `RUST_LOG`) reaches every host-mode
-      exec task. It is why the join token went to `--token-file` and not an
-      env var. Decide on an allowlist (Nomad's exec driver passes a filtered
-      set). [calls #1](calls/join-token-file-and-cli-timeouts_calls.md)
+- [ ] **A join secret can still claim the name of a node that is down.** A
+      live node's name is refused to a join token since 2026-10-17
+      ([calls #8](calls/security-gap-closure-plan_calls.md)); a `lost` one is not, so a host that lost its
+      disk can rejoin. Per-node join tokens would close the rest
+      ([audit calls #3](calls/architecture-audit-2026-10-09_calls.md)).
 - [ ] **A restarted worker still needs its join token string.** It
       re-registers with its persisted node token, but reads the manager
       address, worker type, and CA pin from the join token at every start.
       Persist those beside `node_token` so `legion start worker` runs with no
       token after the first registration and the token file can be deleted.
       [calls #6](calls/join-token-file-and-cli-timeouts_calls.md)
-- [ ] **`prune_expired_boot_tickets` is never called outside tests.**
-- [ ] **The ACL credential pruner runs only with ACLs enabled and isn't gated
-      to the raft leader.**
+- [ ] **Push direct exec revocations to the worker.** A revoked token,
+      policy, or exec key ends a direct exec session on the node's next
+      heartbeat (about 2 seconds). A push needs the manager to know which
+      nodes hold sessions, across managers ([calls #18](calls/security-gap-closure-plan_calls.md)).
+- [ ] **Fleet certificates come from the node's own claim.** A node that
+      registers with `workerFleet = "x"` can get the `x.fleet.legion`
+      certificate. Only the worker simulator uses fleets; grant them from the
+      worker type instead (`src/manager/server.rs`, `issue_node_certificate`).
+- [ ] **A `templateKv` edit is not re-checked against the submitter.** The
+      KV references a job names are checked for `kv:read` at submit, but a
+      template stored in KV is re-rendered when it changes, and an edit can
+      name a key the submitter could not read. Re-check at re-render, or
+      refuse new keys there ([calls #2](calls/security-gap-closure-plan_calls.md)).
+- [ ] **Run `exec` health checks inside the task's runtime.** They run on
+      the host as the worker, so since 2026-10-17 a task with one is
+      host-level. `runc exec` for containers and the guest agent for
+      sandboxes would let container and sandbox jobs use them without the
+      `host` grant ([calls #4](calls/security-gap-closure-plan_calls.md)).
+- [ ] **One raft transport key for every manager.** Peers are authenticated
+      by the cluster secret alone, so the transport cannot tell managers
+      apart or revoke one. Per-manager certificates from the cluster CA once
+      a cluster is formed would ([calls #1](calls/security-gap-closure-plan_calls.md)).
 - [ ] **Switch a running cluster's CA provider without re-joining workers**
       (cross-sign during an overlap, as the builtin rotation does).
       [cluster-CA calls #13](calls/cluster-ca-provider-plan_calls.md)
@@ -6480,3 +6482,50 @@ Found on the live AWS rig (3 raft managers, 2 workers). Bug fixes, so no plan.
       [docs](../docs/cluster-ca.md)
 - [x] **VIP blocks follow the node's OS.** Placement asked the manager's own
       OS, so a macOS manager gave its Linux nodes no VIP blocks.
+
+## Security gap closure (2026-10-17)
+
+[plan](plans/security-gap-closure-plan.md) · [calls](calls/security-gap-closure-plan_calls.md) · docs:
+[auth-and-acls.md](../docs/auth-and-acls.md),
+[artifacts.md](../docs/artifacts.md),
+[workload-identity.md](../docs/workload-identity.md)
+
+- [x] **Naming a KV key in a job needs `kv:read` on it**: `$path`
+      references, `kvInjections` env and files and their template lookups,
+      `templateKv`, and artifact `auth.kv`, on run, plan, and template render
+      and run. `GetArtifactCredential` serves a node only the paths its
+      allocations, its pool's live boot tickets, and its pool's
+      `contentStore` name ([calls #2, #3](calls/security-gap-closure-plan_calls.md)).
+- [x] **The root worker stays inside the allocation.** Job, group, and task
+      names are `[A-Za-z0-9._-]` and never start with `.`; tar entries unpack
+      with `unpack_in` and hard links are refused; templates, identity
+      tokens, and KV files below the task directory are written without
+      following links; staged-manifest and snapshot part paths are checked
+      ([calls #7, #11, #17](calls/security-gap-closure-plan_calls.md)).
+- [x] **Relative `exec` file paths land in the task directory** (KV files and
+      identity files alike), not the worker's working directory
+      ([kv-cert-delivery calls #10](calls/kv-cert-delivery-plan_calls.md),
+      [docs](../docs/kv-store.md)).
+- [x] **Host-level now covers host commands, node credentials, and node
+      files**: an `exec` health check (it ran on the host as root on any
+      runtime), `file://` artifacts and images, `git::file://`, and a
+      task-level `auth.nodeIdentity` ([calls #4](calls/security-gap-closure-plan_calls.md)).
+- [x] **Identities can't be forged**: `workloadIdentity.allowedSubTemplates`;
+      injective certificate DNS labels; ingress node identity only on
+      cluster-verified chains; a join token can't take over a live node;
+      boot tickets bound to their job's config and checked against the claim
+      at ratification; JWT/OIDC methods need an audience and `https`
+      ([calls #5, #8, #9, #13, #14, #16](calls/security-gap-closure-plan_calls.md)).
+- [x] **Exec tasks and sessions get an allowlisted environment** instead of
+      the worker's ([calls #10](calls/security-gap-closure-plan_calls.md),
+      [docs](../docs/task-runtime-exec.md)).
+- [x] **A reused idempotency key with another request fails** instead of
+      replaying ([calls #12](calls/security-gap-closure-plan_calls.md),
+      [docs](../docs/agent-readiness.md)).
+- [x] **Smaller fixes**: recorded idempotency replies (boot tickets) read as
+      `NULL` through raw SQL; delegated exec tickets can't be future-dated;
+      secret files are `0600` from creation; the `authz` verdict cache is
+      keyed per allocation and webhook; git fetches are pinned to their
+      transport; template renders and runs don't reveal templates the
+      caller can't read; expired boot tickets are pruned, and the credential
+      pruner runs with ACLs off too ([calls #19, #20](calls/security-gap-closure-plan_calls.md)).

@@ -215,17 +215,9 @@ pub fn load_cli_token(address: &str) -> (Option<String>, TokenSource) {
 pub fn save_cli_token(address: &str, secret: &str) -> R<std::path::PathBuf> {
     let path = cli_token_path(address);
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("failed to create {}", parent.display()))?;
+        crate::util::create_private_dir_all(parent)?;
     }
-    std::fs::write(&path, format!("{secret}\n"))
-        .with_context(|| format!("failed to write {}", path.display()))?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
-            .with_context(|| format!("failed to chmod {}", path.display()))?;
-    }
+    crate::util::write_private_file(&path, format!("{secret}\n").as_bytes())?;
     Ok(path)
 }
 

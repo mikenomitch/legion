@@ -48,11 +48,22 @@ fn is_full_sha(reference: &str) -> bool {
     reference.len() == 40 && reference.chars().all(|c| c.is_ascii_hexdigit())
 }
 
-/// Builds a `git` command with credentials injected via environment-scoped
-/// config so secrets stay out of argv.
-fn git_command(credential: Option<&Credential>) -> R<Command> {
+/// Transports a git artifact may name. `ext::` and `fd::` run commands or
+/// read descriptors, so they never are.
+const GIT_TRANSPORTS: &[&str] = &["https", "http", "ssh", "git", "file"];
+
+/// Builds a `git` command for `url` with credentials injected via
+/// environment-scoped config so secrets stay out of argv, allowed to speak
+/// only the URL's own transport (`GIT_ALLOW_PROTOCOL`), so a remote cannot
+/// switch the fetch to another one.
+fn git_command(url: &Url, credential: Option<&Credential>) -> R<Command> {
+    let transport = url.scheme();
+    if !GIT_TRANSPORTS.contains(&transport) {
+        bail!("git artifacts do not support the {transport:?} transport");
+    }
     let mut cmd = Command::new("git");
     cmd.env("GIT_TERMINAL_PROMPT", "0");
+    cmd.env("GIT_ALLOW_PROTOCOL", transport);
     match credential {
         None => {}
         Some(Credential::Basic { username, password }) => {
@@ -105,11 +116,11 @@ fn shallow_clone(
         // init + fetch the exact object instead.
         Some(sha) if is_full_sha(sha) => {
             std::fs::create_dir_all(dest)?;
-            let mut init = git_command(credential)?;
+            let mut init = git_command(&clean, credential)?;
             init.arg("init").arg("--quiet").arg(dest);
             run_git(init, "init", redacted_source)?;
 
-            let mut fetch = git_command(credential)?;
+            let mut fetch = git_command(&clean, credential)?;
             fetch
                 .current_dir(dest)
                 .arg("fetch")
@@ -120,7 +131,7 @@ fn shallow_clone(
                 .arg(sha);
             run_git(fetch, "fetch", redacted_source)?;
 
-            let mut checkout = git_command(credential)?;
+            let mut checkout = git_command(&clean, credential)?;
             checkout
                 .current_dir(dest)
                 .arg("checkout")
@@ -130,7 +141,7 @@ fn shallow_clone(
             Ok(())
         }
         Some(branch_or_tag) => {
-            let mut clone = git_command(credential)?;
+            let mut clone = git_command(&clean, credential)?;
             clone
                 .arg("clone")
                 .arg("--quiet")
@@ -144,7 +155,7 @@ fn shallow_clone(
             Ok(())
         }
         None => {
-            let mut clone = git_command(credential)?;
+            let mut clone = git_command(&clean, credential)?;
             clone
                 .arg("clone")
                 .arg("--quiet")
@@ -185,7 +196,7 @@ impl ArtifactFetcher for GitFetcher {
             return Ok(None);
         }
         let clean = clone_url(req.url);
-        let mut cmd = git_command(req.credential)?;
+        let mut cmd = git_command(&clean, req.credential)?;
         cmd.arg("ls-remote").arg(clean.as_str());
         let pattern = reference.clone().unwrap_or_else(|| "HEAD".to_string());
         cmd.arg(&pattern);

@@ -563,6 +563,10 @@ fn run_exec_check(runtime: &CheckRuntime) -> Result<(), String> {
         .ok_or_else(|| "exec check requires a command".to_string())?;
     let mut cmd = Command::new(program);
     cmd.args(args);
+    // A host command, run as the worker: never with the worker's whole
+    // environment (it can hold a `LEGION_TOKEN` or cloud credentials).
+    cmd.env_clear();
+    cmd.envs(crate::task_plugins::host_command_env());
     let status = cmd
         .status()
         .map_err(|err| format!("exec check failed to run: {err}"))?;

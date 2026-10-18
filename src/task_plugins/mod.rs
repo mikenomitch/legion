@@ -17,6 +17,7 @@ pub mod checkpoint;
 mod container;
 mod envelope;
 mod exec;
+pub(crate) use exec::host_command_env;
 pub mod exec_isolation;
 mod exec_session;
 pub mod guest_resume;
@@ -1169,8 +1170,12 @@ impl TaskPluginRegistry {
 
 #[instrument(err, skip_all)]
 pub fn validate_job_config(config: &JobConfig) -> R<()> {
+    use crate::structs::job::validate_object_name;
+    validate_object_name("job name", &config.name)?;
     let mut registry = TaskPluginRegistry::new();
     for task in &config.tasks {
+        validate_object_name("task name", &task.name)?;
+        validate_object_name(&format!("task {} group", task.name), &task.group)?;
         registry.validate_task_config(task)?;
         validate_memory_max(task)?;
         task.validate_checks()?;
@@ -1433,6 +1438,49 @@ pub fn injected_file_mode(mode: Option<&str>) -> u32 {
         .unwrap_or(0o644)
 }
 
+/// Where the worker writes a declared task file (a KV file, an identity
+/// token, a template): below the task directory, or at a host path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TaskFileTarget {
+    /// Relative to the task directory, which the task can write, so it is
+    /// written without following links (`crate::util::write_file_beneath`).
+    BelowTaskDir(PathBuf),
+    /// An absolute path on the host's own filesystem: an `exec` task's
+    /// destination, which only a submitter holding the `host` grant can name.
+    Host(PathBuf),
+}
+
+/// Resolve a declared file path for a runtime whose task directory is
+/// mounted at `root` (`Some`, see [`resolve_task_dir_destination`]), or for
+/// one that runs on the host's filesystem (`None`, `exec`): there an
+/// absolute path is the real path, and a relative one is below the task
+/// directory, never the worker's working directory.
+pub fn task_file_target(root: Option<&str>, declared: &str) -> Result<TaskFileTarget, String> {
+    match root {
+        Some(root) => {
+            resolve_task_dir_destination(root, declared).map(TaskFileTarget::BelowTaskDir)
+        }
+        None => {
+            let declared = declared.trim();
+            let path = std::path::Path::new(declared);
+            if declared.is_empty() {
+                Err("path cannot be empty".to_string())
+            } else if path.is_absolute() {
+                Ok(TaskFileTarget::Host(path.to_path_buf()))
+            } else if path.components().any(|c| {
+                !matches!(
+                    c,
+                    std::path::Component::Normal(_) | std::path::Component::CurDir
+                )
+            }) {
+                Err(format!("{declared:?} climbs out of the task directory"))
+            } else {
+                Ok(TaskFileTarget::BelowTaskDir(path.to_path_buf()))
+            }
+        }
+    }
+}
+
 /// Resolve a declared file-delivery destination against an isolating
 /// runtime's task-dir mount, returning the path *relative to the task
 /// directory* — which is exactly what the worker joins onto the host task dir.
@@ -1577,7 +1625,69 @@ fn tiny_cpu_warning(task: &TaskConfig) -> Option<String> {
 /// | `sandbox` | `hypervisor = "dev"` (a container standing in for a VM) |
 /// | `noop` | never: it runs nothing |
 /// | anything else | always: a plugin Legion cannot classify runs code on the host |
+/// | any runtime | an `exec` health check: the worker runs its command on the host |
+/// | any runtime | an artifact (or `image`) is a `file://` source or a local git repository: the root worker copies node files into the task |
+/// | any runtime | an artifact names `auth.nodeIdentity`: the fetch presents the node's own credential |
 pub fn task_host_level_reason(task: &crate::structs::TaskConfig) -> Option<String> {
+    let name = &task.name;
+    if let Some(reason) = runtime_host_level_reason(task) {
+        return Some(reason);
+    }
+    // An `exec` health check is a command the worker runs on the host,
+    // whatever the task's runtime, so declaring one is running on the host.
+    if let Some(check) = task
+        .checks
+        .iter()
+        .find(|check| check.kind == crate::structs::TaskCheckKind::Exec)
+    {
+        return Some(format!(
+            "{name:?} declares exec health check {:?}, which the worker runs on the host",
+            check.default_name()
+        ));
+    }
+    // The root worker copies a `file://` source (or clones a local git
+    // repository) from any path on the node into the task, so it reads the
+    // host the way an `exec` task would. A container or sandbox `image` can
+    // name one too; it becomes an artifact at admission, after this check.
+    let image = task
+        .config
+        .get("image")
+        .and_then(Value::as_str)
+        .map(crate::structs::ArtifactSpec::oci_image);
+    if let Some(artifact) = task
+        .artifacts
+        .iter()
+        .chain(image.as_ref())
+        .find(|artifact| artifact_reads_node_files(&artifact.source))
+    {
+        return Some(format!(
+            "{name:?} fetches artifact {} from the node's own filesystem",
+            artifact.redacted_source()
+        ));
+    }
+    // A node identity is the node's own credential: the worker presents it
+    // to the artifact's source as a bearer token (or to the cloud's STS), so
+    // naming one from a spec acts as the node, which is what `host` grants.
+    // Cluster `artifacts.auth` matchers are the operator's way to lend it to
+    // every job for chosen sources; they are applied after this check.
+    task.artifacts.iter().find_map(|artifact| {
+        let identity = artifact.auth.as_ref()?.node_identity.as_deref()?;
+        Some(format!(
+            "{name:?} fetches artifact {} with auth.nodeIdentity {identity:?}, the worker \
+             node's own credential",
+            artifact.redacted_source()
+        ))
+    })
+}
+
+/// Whether an artifact source reads the node's filesystem: `file://`, or a
+/// git repository cloned over the `file` transport.
+fn artifact_reads_node_files(source: &str) -> bool {
+    crate::structs::parse_artifact_source(source)
+        .is_ok_and(|parsed| parsed.scheme == "file" || parsed.url.scheme() == "file")
+}
+
+fn runtime_host_level_reason(task: &crate::structs::TaskConfig) -> Option<String> {
     let name = &task.name;
     match task.runtime.as_str() {
         "exec" => Some(format!("{name:?} uses runtime \"exec\"")),
@@ -2029,6 +2139,52 @@ mod tests {
             reason(serde_json::json!({ "name": "p", "runtime": "custom", "config": {} })).is_some()
         );
     }
+
+    /// Reading node files (`file://`, a local git repository, a `file://`
+    /// image) and presenting the node's identity are host-level on any
+    /// runtime; a remote source with `auth.kv` is not.
+    #[test]
+    fn node_reading_artifacts_are_host_level_test() {
+        let reason = |value: serde_json::Value| task_host_level_reason(&task(value));
+        let with_artifact = |artifact: serde_json::Value| {
+            serde_json::json!({
+                "name": "c", "runtime": "container",
+                "config": { "image": "a", "command": ["true"] },
+                "artifacts": [artifact],
+            })
+        };
+        for source in ["file:///etc/legion/", "git::file:///srv/repo"] {
+            let why = reason(with_artifact(serde_json::json!({ "source": source })))
+                .unwrap_or_else(|| panic!("{source} is host-level"));
+            assert!(why.contains("node's own filesystem"), "{why}");
+        }
+        let why = reason(serde_json::json!({
+            "name": "c", "runtime": "container",
+            "config": { "image": "file:///var/lib/legion/layout", "command": ["true"] },
+        }))
+        .expect("a file:// image is host-level");
+        assert!(why.contains("node's own filesystem"), "{why}");
+        let why = reason(serde_json::json!({
+            "name": "c", "runtime": "container",
+            "config": { "image": "a", "command": ["true"] },
+            "checks": [{ "type": "health", "kind": "exec", "command": ["/bin/true"] }],
+        }))
+        .expect("an exec health check is host-level");
+        assert!(why.contains("exec health check"), "{why}");
+        let why = reason(with_artifact(serde_json::json!({
+            "source": "https://example.com/tool.tgz",
+            "auth": { "nodeIdentity": "artifact-pull" },
+        })))
+        .expect("a node identity is host-level");
+        assert!(why.contains("auth.nodeIdentity"), "{why}");
+        assert_eq!(
+            reason(with_artifact(serde_json::json!({
+                "source": "https://example.com/tool.tgz",
+                "auth": { "kv": "secrets/pull" },
+            }))),
+            None
+        );
+    }
     use serde_json::json;
     use std::path::Path;
 
@@ -2394,6 +2550,46 @@ mod tests {
             }
         }
         Ok(())
+    }
+
+    /// The root worker joins task names onto allocation directories, so a
+    /// name that is a path (or `.`/`..`) is refused at admission, as are job
+    /// and group names outside the same charset.
+    #[test]
+    fn object_names_that_would_leave_the_allocation_dir_are_refused_test() {
+        let job = |name: &str, task: TaskConfig| JobConfig {
+            priority: Default::default(),
+            rollout: None,
+            rollout_by_group: Default::default(),
+            name: name.into(),
+            tasks: vec![task],
+            version: None,
+        };
+        let noop = |name: &str| TaskConfig::new(name, "noop");
+        for bad in [
+            "../../etc",
+            "/etc",
+            "..",
+            ".",
+            ".container",
+            "a/b",
+            "",
+            "web app",
+        ] {
+            let err = validate_job_config(&job("web", noop(bad))).unwrap_err();
+            assert!(err.to_string().contains("task name"), "{bad:?}: {err:#}");
+        }
+        let err = validate_job_config(&job("../web", noop("api"))).unwrap_err();
+        assert!(err.to_string().contains("job name"), "{err:#}");
+        let mut grouped = noop("api");
+        grouped.group = "../g".into();
+        let err = validate_job_config(&job("web", grouped)).unwrap_err();
+        assert!(err.to_string().contains("group"), "{err:#}");
+        let valid = TaskConfig {
+            config: json!({"command": ["true"]}),
+            ..TaskConfig::new("api_server-2", "exec")
+        };
+        validate_job_config(&job("web-1.v2", valid)).unwrap();
     }
 
     #[test]

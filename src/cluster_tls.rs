@@ -820,26 +820,212 @@ pub fn tls_incoming(
 
 /// What a manager presents on its API port (worker-plane-auth plan §6.8):
 /// the cluster server certificate (`manager.legion`) to a client that asks
-/// for that name, and the operator's `server.tls` certificate, when one is
-/// configured, to everyone else. Without an operator certificate every TLS
-/// client gets the cluster certificate. Workers always send
-/// `manager.legion`, so they never need the operator's CA, and the CLI and
+/// for that name, the raft transport identity (`raft.legion`) to a peer
+/// manager that asks for that one, and the operator's `server.tls`
+/// certificate, when one is configured, to everyone else. Without an
+/// operator certificate every other TLS client gets the cluster
+/// certificate. Workers always send `manager.legion` and peers always send
+/// `raft.legion`, so neither needs the operator's CA, and the CLI and
 /// browsers never see a certificate they cannot verify.
 #[derive(Debug)]
 pub struct ManagerServerCerts {
     pub cluster: Arc<SwappableIdentity>,
     pub operator: Option<Arc<CertifiedKey>>,
+    /// The raft transport identity, on a manager that runs raft.
+    pub raft: Option<Arc<CertifiedKey>>,
 }
 
 impl ResolvesServerCert for ManagerServerCerts {
     fn resolve(&self, client_hello: ClientHello<'_>) -> Option<Arc<CertifiedKey>> {
-        let wants_cluster = client_hello
-            .server_name()
-            .is_some_and(|name| name.eq_ignore_ascii_case(MANAGER_SERVER_NAME));
-        match (&self.operator, wants_cluster) {
+        let asks_for = |wanted: &str| {
+            client_hello
+                .server_name()
+                .is_some_and(|name| name.eq_ignore_ascii_case(wanted))
+        };
+        if asks_for(RAFT_SERVER_NAME) {
+            return self.raft.clone();
+        }
+        match (&self.operator, asks_for(MANAGER_SERVER_NAME)) {
             (Some(operator), false) => Some(operator.clone()),
             _ => self.cluster.current(),
         }
+    }
+}
+
+/// The server name a manager asks for when it dials a raft peer.
+pub const RAFT_SERVER_NAME: &str = "raft.legion";
+
+const RAFT_KEY_SALT: &[u8] = b"legion-raft-transport";
+const RAFT_KEY_INFO: &[u8] = b"ed25519-identity-v1";
+
+/// TLS for the manager-to-manager raft transport: the raft log, snapshots,
+/// lane-write and leader forwarding (which carry callers' bearer tokens),
+/// and the cluster secret every call authenticates with.
+///
+/// Every manager of a raft cluster holds the cluster secret before it can
+/// say anything to a peer (a joining manager gets it in its raft join
+/// token), and it holds it before any cluster CA exists, so the identity is
+/// derived from the secret: an Ed25519 key from HKDF-SHA256 over it, and a
+/// self-signed certificate for [`RAFT_SERVER_NAME`]. Every manager derives
+/// the same key; a client accepts exactly that public key and nothing else
+/// ([`PinnedKeyVerifier`]), so a peer that answers proves it holds the
+/// secret before the secret is sent, and nothing on the path can read or
+/// alter the traffic. The secret in the request metadata stays the client's
+/// half of the authentication.
+pub struct RaftTransportTls {
+    server_key: Arc<CertifiedKey>,
+    client: Arc<ClientConfig>,
+}
+
+impl std::fmt::Debug for RaftTransportTls {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("RaftTransportTls")
+    }
+}
+
+impl RaftTransportTls {
+    pub fn from_cluster_secret(secret: &str) -> R<Arc<Self>> {
+        use ring::hkdf::{Salt, HKDF_SHA256};
+        let prk = Salt::new(HKDF_SHA256, RAFT_KEY_SALT).extract(secret.as_bytes());
+        let okm = prk
+            .expand(&[RAFT_KEY_INFO], HKDF_SHA256)
+            .map_err(|_| anyhow!("hkdf expand failed"))?;
+        // An Ed25519 private key in PKCS#8 v1 (RFC 8410) is this fixed
+        // prefix followed by the 32-byte seed.
+        let mut pkcs8 = zeroize::Zeroizing::new(vec![
+            0x30, 0x2e, 0x02, 0x01, 0x00, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70, 0x04, 0x22,
+            0x04, 0x20,
+        ]);
+        let prefix = pkcs8.len();
+        pkcs8.resize(prefix + 32, 0);
+        okm.fill(&mut pkcs8[prefix..])
+            .map_err(|_| anyhow!("hkdf fill failed"))?;
+        let key_pair = rcgen::KeyPair::from_pkcs8_der_and_sign_algo(
+            &rustls_pki_types::PrivatePkcs8KeyDer::from(pkcs8.as_slice()),
+            &rcgen::PKCS_ED25519,
+        )
+        .context("derive the raft transport key")?;
+        let cert = rcgen::CertificateParams::new(vec![RAFT_SERVER_NAME.to_string()])?
+            .self_signed(&key_pair)
+            .context("sign the raft transport certificate")?;
+        let key_pem = zeroize::Zeroizing::new(key_pair.serialize_pem());
+        let server_key = certified_key(&cert.pem(), &key_pem)?;
+        let verifier = Arc::new(PinnedKeyVerifier {
+            public_key: key_pair.public_key_raw().to_vec(),
+        });
+        Ok(Arc::new(RaftTransportTls {
+            server_key,
+            client: client_config(verifier, None)?,
+        }))
+    }
+
+    /// The certificate and key a manager presents to a peer that asks for
+    /// [`RAFT_SERVER_NAME`].
+    pub fn server_key(&self) -> Arc<CertifiedKey> {
+        self.server_key.clone()
+    }
+
+    /// A lazily connecting channel to a peer manager at `host_port`.
+    pub fn channel(&self, host_port: &str) -> R<tonic::transport::Channel> {
+        tls_channel(
+            &format!("http://{host_port}"),
+            self.client.clone(),
+            RAFT_SERVER_NAME,
+        )
+    }
+
+    /// [`Self::channel`], connected (TCP and handshake) before it returns.
+    pub async fn connect(&self, host_port: &str) -> R<tonic::transport::Channel> {
+        tls_connect(
+            &format!("http://{host_port}"),
+            self.client.clone(),
+            RAFT_SERVER_NAME,
+        )
+        .await
+    }
+
+    /// A listener that answers raft peers over TLS and anything else in
+    /// plaintext, for a process that serves the raft transport without the
+    /// manager's own listener ([`crate::manager::daemon::manager_incoming`]
+    /// presents this identity too): tests and embedders.
+    pub fn incoming(
+        &self,
+        listener: tokio::net::TcpListener,
+    ) -> R<tokio_stream::wrappers::ReceiverStream<std::io::Result<MaybeTlsStream>>> {
+        let config = server_config(
+            Arc::new(ManagerServerCerts {
+                cluster: SwappableIdentity::new(),
+                operator: None,
+                raft: Some(self.server_key.clone()),
+            }),
+            None,
+            true,
+        )?;
+        Ok(sniffing_incoming(listener, config, false))
+    }
+}
+
+/// Accepts exactly one public key, the one every manager of the raft cluster
+/// derives ([`RaftTransportTls`]). The certificate around it is not judged
+/// (it is self-signed by that key); the handshake signature still has to
+/// verify with it.
+#[derive(Debug)]
+pub struct PinnedKeyVerifier {
+    public_key: Vec<u8>,
+}
+
+impl ServerCertVerifier for PinnedKeyVerifier {
+    fn verify_server_cert(
+        &self,
+        end_entity: &CertificateDer<'_>,
+        _intermediates: &[CertificateDer<'_>],
+        _server_name: &ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: UnixTime,
+    ) -> Result<ServerCertVerified, rustls::Error> {
+        let (_, cert) = x509_parser::parse_x509_certificate(end_entity.as_ref()).map_err(|_| {
+            rustls::Error::InvalidCertificate(rustls::CertificateError::BadEncoding)
+        })?;
+        if cert.public_key().subject_public_key.data.as_ref() != self.public_key.as_slice() {
+            return Err(rustls::Error::InvalidCertificate(
+                rustls::CertificateError::ApplicationVerificationFailure,
+            ));
+        }
+        Ok(ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls12_signature(
+            message,
+            cert,
+            dss,
+            &provider().signature_verification_algorithms,
+        )
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls13_signature(
+            message,
+            cert,
+            dss,
+            &provider().signature_verification_algorithms,
+        )
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        provider()
+            .signature_verification_algorithms
+            .supported_schemes()
     }
 }
 
@@ -1111,7 +1297,11 @@ mod cluster_tls_test {
         cluster.set(cluster_key);
         let tls_only = operator.is_some();
         let config = server_config(
-            Arc::new(ManagerServerCerts { cluster, operator }),
+            Arc::new(ManagerServerCerts {
+                cluster,
+                operator,
+                raft: None,
+            }),
             None,
             true,
         )?;
@@ -1197,6 +1387,62 @@ mod cluster_tls_test {
                 .await
                 .is_err(),
             "no plaintext connection is yielded"
+        );
+        Ok(())
+    }
+
+    async fn raft_handshake(
+        server: &RaftTransportTls,
+        client: &RaftTransportTls,
+        operator: Option<Arc<CertifiedKey>>,
+    ) -> R<std::io::Result<()>> {
+        use tokio_stream::StreamExt;
+        let tls_only = operator.is_some();
+        let config = server_config(
+            Arc::new(ManagerServerCerts {
+                cluster: SwappableIdentity::new(),
+                operator,
+                raft: Some(server.server_key()),
+            }),
+            None,
+            true,
+        )?;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let addr = listener.local_addr()?;
+        let mut incoming = sniffing_incoming(listener, config, tls_only);
+        tokio::spawn(async move { while incoming.next().await.is_some() {} });
+        let tcp = tokio::net::TcpStream::connect(addr).await?;
+        Ok(tokio_rustls::TlsConnector::from(client.client.clone())
+            .connect(
+                ServerName::try_from(RAFT_SERVER_NAME.to_string()).expect("name"),
+                tcp,
+            )
+            .await
+            .map(|_| ()))
+    }
+
+    /// Managers that share the cluster secret derive the same raft identity
+    /// and complete the handshake, also on a port the operator turned TLS-only;
+    /// a manager with another secret is refused before it sends anything.
+    #[tokio::test]
+    async fn raft_peers_handshake_only_with_their_own_cluster_test() -> R<()> {
+        let ours = RaftTransportTls::from_cluster_secret("cluster-secret-a")?;
+        let peer = RaftTransportTls::from_cluster_secret("cluster-secret-a")?;
+        let theirs = RaftTransportTls::from_cluster_secret("cluster-secret-b")?;
+        raft_handshake(&ours, &peer, None)
+            .await?
+            .context("same secret, same identity")?;
+        let (operator, _) = manager_server_key()?;
+        raft_handshake(&ours, &peer, Some(operator))
+            .await?
+            .context("`raft.legion` is served on a TLS-only port too")?;
+        assert!(
+            raft_handshake(&ours, &theirs, None).await?.is_err(),
+            "another cluster's key is refused"
+        );
+        assert!(
+            raft_handshake(&theirs, &peer, None).await?.is_err(),
+            "a server holding another cluster's key is refused"
         );
         Ok(())
     }

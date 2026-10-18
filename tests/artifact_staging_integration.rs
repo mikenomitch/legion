@@ -152,6 +152,8 @@ fn worker_manager(temp_dir: &TempDir) -> Arc<Mutex<WorkerTaskManager>> {
         },
         Box::new(legion::artifacts::AnonymousCredentials),
         None,
+        // The fixture serves on loopback, which the host guard refuses.
+        None,
     );
     Arc::new(Mutex::new(manager))
 }
