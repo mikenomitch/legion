@@ -119,6 +119,28 @@ pub fn worker_fleet(node: &Node) -> Option<String> {
         .map(str::to_string)
 }
 
+/// The fleet a registration claims, from its `config_attrs` JSON.
+pub fn claimed_fleet(config_attrs: &str) -> Option<String> {
+    serde_json::from_str::<Value>(config_attrs)
+        .ok()?
+        .get(WORKER_FLEET_ATTR)
+        .and_then(Value::as_str)
+        .filter(|fleet| !fleet.is_empty())
+        .map(str::to_string)
+}
+
+/// Whether a worker type lets its nodes register as part of `fleet`: its
+/// `workerFleet` attribute names the fleet, or a `*` glob over fleet names
+/// (`sim-*` for simulator processes started with `--name-prefix sim-0`,
+/// `sim-1`, ...). A fleet certificate names every node of the fleet, so the
+/// operator's worker type grants it, never the node's own registration.
+pub fn worker_type_grants_fleet(worker_type: &crate::structs::WorkerConfig, fleet: &str) -> bool {
+    worker_type
+        .attributes
+        .get(WORKER_FLEET_ATTR)
+        .is_some_and(|pattern| crate::structs::acl::glob_match(pattern, fleet))
+}
+
 /// The protocol version the node reported at registration (0 when it
 /// predates the field).
 pub fn worker_protocol_version(node: &Node) -> u64 {

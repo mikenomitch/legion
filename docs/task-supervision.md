@@ -157,6 +157,15 @@ is ignored. The worker stops re-sending once it no longer holds the
 allocation. If a `success` dependent stays held after its dependency exited,
 look in the manager logs for `asking the worker to report it again`.
 
+Failure reports (a task that crashed, failed a health check, or failed
+staging) travel the same way. When the manager can't read the allocation or
+record the failure (the write can't reach the raft leader, say), it asks the
+worker to send the report again (`HeartbeatReply.retry_failed_allocations`),
+and the allocation is moved once the report lands. A report for an
+allocation the manager has no row for, or has already removed, is not asked
+for again. Before this, such a report was logged and lost, and the
+allocation stayed placed on a node that had already torn it down.
+
 A completed allocation keeps its row and its slot, and Legion never dispatches
 it to a worker again. It no longer counts against the node's resources or
 holds its ports, so other work can use them. Batch tasks with a `schedule` still re-run on their

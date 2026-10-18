@@ -1821,3 +1821,71 @@ could not have helped: it only looks at the pinned node.
 **Why.** Ease. On the rig the generic message pointed at capacity on the
 wrong node. The read model is what placement uses, so the reason matches
 what the scheduler saw even when the stored row disagrees (spot-check P0-6).
+
+## 70. A failure report the manager cannot record is handed back, but only for an error
+
+*Workstream: Task lifecycle. Follow-up, 2026-10-18.*
+
+**The call.** `HeartbeatReply.retry_failed_allocations` lists the failure
+reports a manager could not record: reading the allocation or the removal
+write failed (a forward to a lane leader that had just stepped down, seen on
+the rig). The worker re-queues exactly those reports, artifact states
+included, without running the teardown again. A report for an allocation
+the manager has no row for is not retried, unlike a terminal report.
+
+**Alternatives.** Retry "not found" too, as `retry_terminated_allocations`
+does for a heartbeat that lands on a replica that has not applied the
+placement yet.
+
+**Trade-off.** A failure reported to a lagging replica within the placement's
+replication window is still dropped. A failure comes after a start, long
+after the placement applied everywhere, so the window is much smaller than a
+fast batch exit's; and the worker removes a failed allocation at once, so
+the "stop once the node no longer holds it" bound terminal reports use does
+not exist here. Retrying "not found" would resend a report for an
+allocation that was removed for good on every heartbeat, forever.
+
+**Why.** Simplicity. The bug was a failed write, and a failed write is the
+one case where the manager knows the report did not land.
+
+## 71. One-shot commands log to stderr and write no files
+
+*Workstream: CLI and diagnostics. Follow-up, 2026-10-18.*
+
+**The call.** Servers (every `legion start` subcommand, and `legion join`)
+keep their console on stdout and their JSON file logs under `./logs`. Every
+other command, `mcp serve` included, sends its console to stderr at the same
+default level (`info`) and creates no `./logs` or `./traces`. `start gateway`
+also keeps SIGPIPE ignored now: its copy loop `splice`s into client sockets,
+which raises SIGPIPE when a client hangs up, and the closed-pipe fix had
+restored the default disposition for it.
+
+**Alternatives.** Default one-shot commands to `warn`, so a human sees fewer
+trace lines.
+
+**Trade-off.** A one-shot command's `info` lines still print, now on stderr.
+
+**Why.** Ease. Moving them off stdout fixes `--json` for agents without
+hiding anything a command reports through `info!`; the level can change
+separately.
+
+## 72. A loopback join-token address from a wildcard bind warns, it does not refuse
+
+*Workstream: Manager availability. Follow-up, 2026-10-18.*
+
+**The call.** A manager bound to `0.0.0.0` or `::` with no
+`server.advertiseAddr` logs a warning at startup, and `CreateJoinToken`
+returns it with every token (`CreateJoinTokenReply.warning`; `legion
+join-token create` prints it on stderr, `--json` carries `data.warning`,
+the UI's join form shows it). A manager bound to one address, loopback
+included, gets no warning.
+
+**Alternatives.** Refuse to mint the token in that state.
+
+**Trade-off.** An operator can still hand out a token no other machine can
+use, if they ignore the warning.
+
+**Why.** Ease. The same token is right for a worker on the manager's own
+machine (`--run-worker`, a laptop cluster), so refusing would break a valid
+setup to prevent a likely mistake.
+

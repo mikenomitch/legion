@@ -2186,6 +2186,15 @@ impl WorkerTaskManager {
 
     /// Put drained terminal reports back after a failed heartbeat, so a dead
     /// connection cannot swallow a batch task's completion.
+    /// Put back failure reports a heartbeat did not get recorded: the
+    /// connection died, or the manager answered but could not record them
+    /// (`HeartbeatReply.retry_failed_allocations`). The allocation was torn
+    /// down when it failed, so only the report goes back; the teardown does
+    /// not run again, and the report keeps its artifact states.
+    pub fn requeue_failures(&mut self, reports: impl IntoIterator<Item = FailedAllocationReport>) {
+        self.failed.extend(reports);
+    }
+
     pub fn requeue_terminations(&mut self, reports: Vec<TerminatedAllocationReport>) {
         self.terminated_reports.extend(reports);
     }
@@ -11133,6 +11142,30 @@ mod tests {
         assert!(manager
             .self_fence_expired_allocations(Duration::from_secs(60))
             .is_empty());
+        Ok(())
+    }
+
+    /// A failure report the manager hands back goes out again as it was
+    /// first sent, artifact states included, and the allocation's teardown
+    /// does not run a second time (it is already gone).
+    #[test]
+    fn a_requeued_failure_report_is_sent_again_unchanged() -> R<()> {
+        let temp_dir = TempDir::new()?;
+        let state_store = WorkerStateStore::new(temp_dir.path().join("worker_state.json"));
+        let mut manager = WorkerTaskManager::with_state_store(state_store);
+        insert_running_allocation(&mut manager, 4, None);
+        manager.record_failure(4, "boom");
+        let mut sent = manager.drain_failures();
+        assert_eq!(sent.len(), 1);
+        sent[0].artifact_states = Some("[]".into());
+
+        manager.requeue_failures(sent);
+        let again = manager.drain_failures();
+        assert_eq!(again.len(), 1);
+        assert_eq!(again[0].allocation_id, 4);
+        assert_eq!(again[0].reason, "boom");
+        assert_eq!(again[0].artifact_states.as_deref(), Some("[]"));
+        assert!(manager.drain_failures().is_empty(), "sent once per requeue");
         Ok(())
     }
 

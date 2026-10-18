@@ -1177,19 +1177,51 @@ impl Store {
              AND COALESCE(instance.pending_op, '') != 'fork' \
              ORDER BY instance.created_at ASC, instance.instance_id ASC;",
         )?;
-        let rows = stmt.query_map([task_id], |row| {
-            Ok(RestorePin {
-                instance_id: row.get(0)?,
-                snapshot_id: row.get(1)?,
-                node_id: row.get(2)?,
-                manifest_json: row.get(3)?,
-                published: row.get::<_, String>(4)? == SnapshotState::Published.as_str(),
-                // A fork checkpoint is published only for --spread.
-                spread: row.get::<_, String>(5)? == SnapshotPurpose::Fork.as_str()
-                    && row.get::<_, String>(6)? == SnapshotDurability::Store.as_str(),
-            })
-        })?;
+        let rows = stmt.query_map([task_id], Self::restore_pin_from_row)?;
         Self::collect_rows(rows)
+    }
+
+    /// [`Self::restore_pins_for_task`] for a task named by job, group, and
+    /// name rather than a stored id, for a dry-run plan of an unsubmitted
+    /// config (see [`Self::pinned_placements_for_task_named`]).
+    pub fn restore_pins_for_task_named(
+        &self,
+        job_id: &str,
+        group_name: &str,
+        task_name: &str,
+    ) -> R<Vec<RestorePin>> {
+        let conn = self.read_connection()?;
+        let mut stmt = conn.prepare_cached(
+            "SELECT instance.instance_id, snapshot.snapshot_id, snapshot.node_id, \
+             snapshot.manifest_json, snapshot.state, snapshot.purpose, snapshot.durability \
+             FROM instance \
+             INNER JOIN snapshot ON snapshot.snapshot_id = instance.restore_from \
+             WHERE instance.job_id = ?1 \
+             AND instance.group_name = ?2 \
+             AND instance.task_name = ?3 \
+             AND instance.state IN ('pending', 'rescheduling') \
+             AND instance.current_alloc_id IS NULL \
+             AND COALESCE(instance.pending_op, '') != 'fork' \
+             ORDER BY instance.created_at ASC, instance.instance_id ASC;",
+        )?;
+        let rows = stmt.query_map(
+            params![job_id, group_name, task_name],
+            Self::restore_pin_from_row,
+        )?;
+        Self::collect_rows(rows)
+    }
+
+    fn restore_pin_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<RestorePin> {
+        Ok(RestorePin {
+            instance_id: row.get(0)?,
+            snapshot_id: row.get(1)?,
+            node_id: row.get(2)?,
+            manifest_json: row.get(3)?,
+            published: row.get::<_, String>(4)? == SnapshotState::Published.as_str(),
+            // A fork checkpoint is published only for --spread.
+            spread: row.get::<_, String>(5)? == SnapshotPurpose::Fork.as_str()
+                && row.get::<_, String>(6)? == SnapshotDurability::Store.as_str(),
+        })
     }
 
     /// The nodes running an instance forked from `snapshot_id` (restoring

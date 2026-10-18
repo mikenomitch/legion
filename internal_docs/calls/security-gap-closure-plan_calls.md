@@ -42,10 +42,9 @@ any KV a job names") and recommend separate clusters for tenants, as the
 artifacts doc did.
 
 **Trade-off.** Jobs whose submitters lack `kv:read` on keys they reference now
-fail at submit. A `kv:write` holder on a `templateKv` key can still make that
-template name a key the original submitter could not read; the re-render does
-not re-check (TODO). Accepted: catching it needs the submitter's identity at
-re-render time.
+fail at submit. A `kv:write` holder on a `templateKv` key could at first make
+that template name a key the original submitter could not read; a re-render
+now refuses any key the job did not already name (entry 21).
 
 **Why (simplicity).** One rule (naming a key is reading it) already covered
 `certFrom` and `connect` credentials. Applying it everywhere is easier to
@@ -333,7 +332,72 @@ because a keyed `IssueBootTicket` records the whole ticket.
 **Why (simplicity).** No operator reads replay payloads through SQL; hiding
 the column is one line.
 
-## 20. The rest
+## 20. A fleet certificate needs the worker type to grant the fleet
+
+*Follow-up, 2026-10-18.*
+
+**Call.** A registration's `workerFleet` claim is checked against its
+credential: a join token's worker type must grant the fleet in its own
+`workerFleet` attribute, an exact name or a `*` glob (`sim-*`), and a node
+token cannot move its node to another fleet. `IssueNodeCertificate` keeps
+its check that the request names the node's registered fleet, which is now
+the operator's word, not the node's. A management token (or ACLs off)
+registers any fleet.
+
+```console
+PermissionDenied: node "sim-a-web-0" registers as part of fleet "sim-a", which its worker type "default" does not grant
+Hint: a fleet is for the worker simulator; set `attributes = { workerFleet = "sim-a" }` (or a glob such as "sim-*") on worker type "default"
+```
+
+**Alternatives.** (a) Gate issuance on any worker type in the node's pool
+granting the fleet: no registration change, but the rig's simulators share
+the `default` pool with real workers, so every real node there could claim
+the simulators' fleet. (b) Record each node's worker type at registration
+and check that at issuance: a schema change, and management or
+unrestricted registrations have no type to record. (c) Derive the fleet
+from the worker type alone and ignore `--name-prefix`: the rig runs one
+simulator process per prefix (`sim-0`, `sim-1`, ...) under one worker type.
+
+**Trade-off.** Running the simulator with a join token now needs the worker
+type to say `workerFleet` (the rig's `sim` type grants `*`), and
+`legion-loadgen --mode instances` needs the same. A type that grants a fleet
+lets any node joined with it serve that fleet's name, so simulators want a
+type of their own; the docs say so.
+
+**Why (simplicity).** Registration is where the join token's worker type is
+known, and checking the claim there keeps issuance unchanged. A glob covers
+per-process fleets with one attribute and reuses the ACL matcher, the only
+wildcard the security code has.
+
+## 21. A `templateKv` re-render may not read a key the job never named
+
+*Follow-up, 2026-10-18; closes the gap entry 2 left.*
+
+**Call.** When a watched key changes and the job's templates re-render to
+look up a key the job's references did not include, the re-render is
+dropped: the job keeps its last render (nothing is stored, so the new key's
+value reaches no task), its references are unchanged, and a
+`job.kv_render_refused` warning event names the keys. Resubmitting the job
+checks the new keys against whoever submits it.
+
+**Alternatives.** (a) Re-check the new keys against the submitter's current
+policies: needs the submitter's identity stored with the job (submissions
+record no principal) and a policy evaluation inside the KV reconcile, and
+the submitter's token may be gone. (b) Fail the job, as `onDelete = "fail"`
+does: louder, but it takes a running service down because someone edited a
+template.
+
+**Trade-off.** A template edit that adds a key needs a resubmit, even when
+the original submitter could read the key. A key dropped by one edit and
+added back by a later one counts as new, since the job's references follow
+its last render.
+
+**Why (simplicity).** "A job reads only the keys it was submitted with" is
+one rule with one remedy, and it needs no stored identity. Keeping the job
+running on its last render is what `KeepExisting` already does for a
+missing key.
+
+## 22. The rest
 
 The credential pruner runs with ACLs off too, expired boot tickets are
 pruned hourly on the scheduler-lane leader, secret files are `0600` from

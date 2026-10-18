@@ -190,10 +190,10 @@ cleanup_jobs() {
         names=\$(legion state query 'SELECT name FROM job' -j 2>/dev/null |
             jq -r '.data.rows[].name // empty')
         [ -z \"\$names\" ] && { echo 0; exit 0; }
-        # Stop, then destroy. A running job cannot be destroyed --
-        # 'Job must be stopped before it can be destroyed' -- and the
-        # CLI reports that as a bare Internal 'Error deleting job', so
-        # skipping the stop fails silently and leaves every job behind.
+        # Stop, then destroy. A running job cannot be destroyed (the
+        # destroy fails with FailedPrecondition, 'must be stopped'), and
+        # the output below goes to /dev/null, so skipping the stop would
+        # leave every job behind without a word.
         printf '%s\n' \"\$names\" |
             xargs -r -P 8 -n 1 -I{} legion job stop {} >/dev/null 2>&1 || true
         sleep 5

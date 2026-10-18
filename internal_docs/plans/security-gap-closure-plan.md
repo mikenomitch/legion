@@ -7,12 +7,15 @@
 
 - Pushing a direct exec revocation to the worker at once. Revocation still
   lands on the next heartbeat (about 2 seconds).
-- Fleet certificates for the worker simulator are granted from the
-  registering node's own `workerFleet` attribute.
+- ~~Fleet certificates for the worker simulator are granted from the
+  registering node's own `workerFleet` attribute.~~ Closed 2026-10-18: the
+  join token's worker type must grant the fleet (calls 20).
 - Git and OCI artifact fetches are not judged by the host guard (HTTP is, and
   an S3 `endpoint` is checked but not pinned).
-- A `templateKv` template edited in KV is re-rendered without re-checking the
-  submitter's `kv:read` on any new key it names (calls 2).
+- ~~A `templateKv` template edited in KV is re-rendered without re-checking
+  the submitter's `kv:read` on any new key it names (calls 2).~~ Closed
+  2026-10-18: a re-render may not read a key the job did not already name
+  (calls 21).
 - `exec` health checks run on the host, so they make a task host-level;
   running them inside the task's runtime would lift that (calls 4).
 - A join secret can still claim the name of a `lost` node (calls 8).

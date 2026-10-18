@@ -1002,6 +1002,23 @@ pub mod drafts {
         EventDraft::error("job.failed", format!("Job {job_id} marked failed")).job(job_id)
     }
 
+    /// `job.kv_render_refused` — a watched KV change re-rendered the job's
+    /// templates into lookups of keys the job never named, so the job keeps
+    /// its last render (docs/kv-store.md, the `templateKv` paragraphs).
+    pub fn job_kv_render_refused(job_id: &str, keys: &[String]) -> EventDraft {
+        EventDraft::warn(
+            "job.kv_render_refused",
+            format!(
+                "Job {job_id} kept its last render: a KV change made its templates read {}, \
+                 which the job did not name when it was submitted; resubmit the job to \
+                 read them",
+                keys.join(", ")
+            ),
+        )
+        .job(job_id)
+        .meta(json!({ "keys": keys }))
+    }
+
     /// `job.gang_timeout` — a gang did not reach its quorum within its
     /// `placementTimeout`, so its job was failed and any survivors stopped
     /// (docs/gang-scheduling.md, "Placement timeout").
@@ -2391,6 +2408,10 @@ impl EventRecorder<'_> {
 
     pub fn job_failed(self, job_id: &str) {
         self.emit(drafts::job_failed(job_id));
+    }
+
+    pub fn job_kv_render_refused(self, job_id: &str, keys: &[String]) {
+        self.emit(drafts::job_kv_render_refused(job_id, keys));
     }
 
     pub fn job_gang_member_lost(

@@ -15559,10 +15559,17 @@ impl Store {
         }
         // `count.per` places `count` per attribute value, so the total is not
         // known here: every replica that was placed has finished, which is
-        // the best available answer.
+        // the best available answer. A `legion job scale` override laid over
+        // this spec count is the count to cover (`effective_task_count`):
+        // read against the spec, a batch task scaled below it never reached
+        // `success` and its dependents never started.
         let (count, per): (i64, Option<String>) = tx
             .query_row(
-                "SELECT count, count_per FROM task_config WHERE id = ?1;",
+                "SELECT COALESCE(ts.count, tc.count), tc.count_per FROM task_config tc \
+                 LEFT JOIN task_scale ts \
+                   ON ts.job_id = tc.job_id AND ts.task_group = tc.group_name \
+                  AND ts.task_name = tc.name AND ts.base_count = tc.count \
+                 WHERE tc.id = ?1;",
                 [task_config_id],
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
@@ -19440,6 +19447,7 @@ impl Store {
                 message: "sql must not be empty".to_string(),
             }));
         }
+        self.refuse_trailing_statements(trimmed)?;
 
         let statement_type = Self::sqlite_statement_type(trimmed);
         if !allow_write && !Self::is_read_only_statement(&statement_type) {
@@ -19528,6 +19536,24 @@ impl Store {
         self.replicated(Lane::Control, "query_state_store", move |s| {
             s.query_state_store_apply(&sql, &statement_type)
         })
+    }
+
+    /// Refuse SQL holding more than one statement. `prepare` and `execute`
+    /// compile the first statement and silently drop the rest, so
+    /// `SELECT 1; SELECT 2` answered only the first, and an `--allow-write`
+    /// batch ran only its first write while reporting success. The
+    /// read-only gate also classifies the first statement alone. A trailing
+    /// comment or whitespace is not a statement and passes.
+    fn refuse_trailing_statements(&self, sql: &str) -> R<()> {
+        let conn = self.read_connection()?;
+        let mut batch = rusqlite::Batch::new(&conn, sql);
+        batch.next().map_err(Self::user_sql_error)?;
+        // Any further statement is refused, even one that does not compile:
+        // the caller's mistake is sending two.
+        if !matches!(batch.next(), Ok(None)) {
+            return Err(Self::user_sql_error(rusqlite::Error::MultipleStatement));
+        }
+        Ok(())
     }
 
     fn query_state_store_apply(&self, sql: &str, statement_type: &str) -> R<StateStoreQueryResult> {
@@ -20909,6 +20935,38 @@ impl Store {
              ORDER BY instance.slot_index ASC, instance.instance_id ASC;",
         )?;
         let rows = stmt.query_map([task_id], |row| Ok((row.get(0)?, row.get(1)?)))?;
+        Self::collect_rows(rows)
+    }
+
+    /// [`Self::pinned_placements_for_task`] for a task named by job, group,
+    /// and name rather than a stored id. A dry-run plan of an unsubmitted
+    /// config has no task ids, yet a resubmit of a stateful job still places
+    /// onto its instances' pinned volumes.
+    pub fn pinned_placements_for_task_named(
+        &self,
+        job_id: &str,
+        group_name: &str,
+        task_name: &str,
+    ) -> R<Vec<(String, String)>> {
+        let conn = self.read_connection()?;
+        let mut stmt = conn.prepare_cached(
+            "SELECT instance.instance_id, volume.node_id \
+             FROM instance \
+             INNER JOIN volume ON volume.instance_id = instance.instance_id \
+             WHERE instance.job_id = ?1 \
+             AND instance.group_name = ?2 \
+             AND instance.task_name = ?3 \
+             AND instance.state IN ('pending', 'rescheduling') \
+             AND instance.current_alloc_id IS NULL \
+             AND instance.storage_handle = volume.driver || '/' || volume.volume_id \
+             AND volume.node_local = 1 \
+             AND volume.node_id IS NOT NULL \
+             AND volume.state IN ('pending', 'created') \
+             ORDER BY instance.slot_index ASC, instance.instance_id ASC;",
+        )?;
+        let rows = stmt.query_map(params![job_id, group_name, task_name], |row| {
+            Ok((row.get(0)?, row.get(1)?))
+        })?;
         Self::collect_rows(rows)
     }
 
@@ -27046,6 +27104,78 @@ mod tests {
         Ok(())
     }
 
+    /// `legion job scale` on a batch task: the task is done when the
+    /// SCALED count has exited, not the spec count. Read against the spec,
+    /// a `count = 3` task scaled to 2 never reached `success`, so every
+    /// `success` dependent stayed held.
+    #[test]
+    fn a_scaled_down_batch_task_succeeds_at_its_scaled_count_test() -> R<()> {
+        let store = setup_store()?;
+        let mut node = make_node_msg("node-a", "ready");
+        node.dynamic_attrs = json!({ "protocolVersion": 2 }).to_string();
+        store.insert_node(node)?;
+
+        let job = JobConfig {
+            priority: Default::default(),
+            rollout: None,
+            rollout_by_group: Default::default(),
+            name: "scaled-batch".into(),
+            tasks: vec![TaskConfig {
+                lifecycle: TaskLifecycle::Batch,
+                count: TaskCount::new(3),
+                ..TaskConfig::new("prep", "exec")
+            }],
+            version: None,
+        };
+        store.handle_job_submit(
+            &job,
+            &[Submission {
+                path: "job.ncl".into(),
+                content: "job".into(),
+                is_primary: true,
+            }],
+        )?;
+        store.set_task_scale_override(
+            "scaled-batch",
+            "default",
+            "prep",
+            2,
+            3,
+            "operator",
+            "test",
+            "t",
+        )?;
+        let job_config_id = store.get_job_config(&job.name)?.id();
+        let prep_id = task_id_for(&store, "prep", &job.name)?;
+
+        let scheduler = Scheduler::new(&store)?;
+        let outcome = scheduler.plan_and_apply(&job_config_id, PlanMode::Fresh)?;
+        store.update_task_statuses_for_allocations(&outcome.allocations)?;
+        assert_eq!(
+            outcome.allocations.len(),
+            2,
+            "the plan places the scaled count"
+        );
+
+        store.complete_allocation(outcome.allocations[0].id, true)?;
+        assert_eq!(
+            store
+                .task_statuses_for_job_config(&job_config_id)?
+                .get(&prep_id),
+            Some(&TaskStatusState::Running),
+            "one of two replicas exited"
+        );
+        store.complete_allocation(outcome.allocations[1].id, true)?;
+        assert_eq!(
+            store
+                .task_statuses_for_job_config(&job_config_id)?
+                .get(&prep_id),
+            Some(&TaskStatusState::Success),
+            "both scaled replicas exited, so the task is done"
+        );
+        Ok(())
+    }
+
     /// The status GetJobInfo/ListJobs report follows the workload: a service
     /// with a placed allocation is `running`, a batch job reads `pending`
     /// until placed, `running` while its process runs, and `complete` once
@@ -31421,6 +31551,49 @@ mod tests {
             );
             assert!(format!("{err:#}").contains(needle), "{sql}: {err:#}");
         }
+        Ok(())
+    }
+
+    /// `state query` ran only the first of several statements and dropped
+    /// the rest without a word, on the read path and the `--allow-write`
+    /// path alike. A second statement is now refused before anything runs.
+    #[test]
+    fn a_state_query_with_two_statements_is_refused_test() -> R<()> {
+        let store = setup_store()?;
+        store.query_state_store("CREATE TABLE two_statements (v TEXT);", true)?;
+        for (sql, allow_write) in [
+            ("SELECT 1; SELECT 2", false),
+            ("SELECT 1; DELETE FROM two_statements", false),
+            ("SELECT 1; not even sql", false),
+            (
+                "INSERT INTO two_statements VALUES ('a'); INSERT INTO two_statements VALUES ('b')",
+                true,
+            ),
+        ] {
+            let err = store
+                .query_state_store(sql, allow_write)
+                .err()
+                .with_context(|| format!("{sql} should be refused"))?;
+            assert!(
+                matches!(
+                    StorageError::from_anyhow(&err),
+                    Some(StorageError::InvalidInput { .. })
+                ),
+                "{sql}: {err:#}"
+            );
+            assert!(
+                format!("{err:#}").contains("more than one statement"),
+                "{sql}: {err:#}"
+            );
+        }
+        // Nothing from the refused write batch ran.
+        let count = store.query_state_store("SELECT COUNT(*) AS n FROM two_statements", false)?;
+        assert_eq!(count.rows[0].json, r#"{"n":0}"#);
+
+        // One statement with a trailing semicolon, whitespace, or comment is
+        // still one statement.
+        store.query_state_store("SELECT 1;  ", false)?;
+        store.query_state_store("SELECT 1; -- trailing comment", false)?;
         Ok(())
     }
 
