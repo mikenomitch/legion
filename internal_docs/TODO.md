@@ -568,7 +568,7 @@ How to use it:
 
 | PR | What it lands | Notes |
 | --- | --- | --- |
-| [#47](https://github.com/mikenomitch/legion/pull/47) | Sandbox restores stop waiting out the 5 s datapath timeout: the wait runs only for gated allocations, and push and work-stream launches bind a gated sandbox's egress proxy first | [calls](calls/gated-restore-datapath-wait_calls.md); the lazy against eager KVM rerun is open under "Sandbox boot throughput" |
+| [#48](https://github.com/mikenomitch/legion/pull/48) | Gang scheduling: all-or-nothing placement for a task's replicas, `placementTimeout`, `onMemberLoss` (restart / replace / fail), and each member's `LEGION_GANG_RANK` / `SIZE` / `MIN` / `LEADER_ADDR` | [plan](plans/gang-scheduling-plan.md) · [calls](calls/gang-scheduling-plan_calls.md) · [docs](../docs/gang-scheduling.md); what is left is under "Gang scheduling, what is left" |
 | [#44](https://github.com/mikenomitch/legion/pull/44) | Swappable seams: one `Attachment` type for how an allocation reaches the datapath, a typed worker ↔ netd boundary (`Netd`, `NetdInput`/`NetdWants`/`NetdReport`), one listener and dialer, one object-storage layer, pluggable cluster CA providers (`builtin`/`file`/`exec`), DNS on hickory-proto and the egress proxy on hyper, plus the mesh-upstream, VIP-by-node-OS and pipelined-request fixes | [plan](plans/swappable-seams-plan.md) · [calls](calls/swappable-seams-plan_calls.md) · [CA plan](plans/cluster-ca-provider-plan.md); the `legion netd` process split and the rest deferred below |
 | [#162](https://github.com/mikenomitch/legion/pull/162) | Lanes hardening: worker-write forwarding, split-tolerant submits, adversarial fixes | Plan §8 + calls doc in [durability-and-ops-execution-plan.md](plans/durability-and-ops-execution-plan.md) |
 | [#143](https://github.com/mikenomitch/legion/pull/143) | Note the node-level builtin resource override gap | Docs only; the fix itself is a todo below |
@@ -5042,7 +5042,8 @@ Deferred from [operator-ui-gaps-plan.md](plans/operator-ui-gaps-plan.md):
 
 docs: [scheduler-and-eval-loop.md](../docs/scheduler-and-eval-loop.md), [jobs-tasks-and-scheduling.md](../docs/jobs-tasks-and-scheduling.md)
 
-- [x] **Gang scheduling, Phase 1** (2026-10-17,
+- [x] **Gang scheduling, Phase 1** (2026-10-17, in flight in
+      [#48](https://github.com/mikenomitch/legion/pull/48),
       [plan](plans/gang-scheduling-plan.md) as revised ·
       [calls](calls/gang-scheduling-plan_calls.md) ·
       [docs](../docs/gang-scheduling.md)). Open follow-ups are under
@@ -5062,7 +5063,9 @@ docs: [scheduler-and-eval-loop.md](../docs/scheduler-and-eval-loop.md), [jobs-ta
         run), `JobBlocked.gang`, `job plan` / `job info` / UI / MCP
         rendering, `legion_gang_blocked_jobs`.
 - [x] **Gang scheduling, Revision 2: placement timeout, member loss, and
-      member identity** (2026-10-17, [plan](plans/gang-scheduling-plan.md#revision-2-placement-timeout-and-member-loss-2026-10-17) ·
+      member identity** (2026-10-17, in flight in
+      [#48](https://github.com/mikenomitch/legion/pull/48),
+      [plan](plans/gang-scheduling-plan.md#revision-2-placement-timeout-and-member-loss-2026-10-17) ·
       [calls](calls/gang-scheduling-plan_calls.md) 4, 5, 8, 9, 11, 18, 19, 22 ·
       [docs](../docs/gang-scheduling.md#placement-timeout)).
   - [x] `gang.placementTimeout`: a scheduler-lane `gang_wait` clock from
