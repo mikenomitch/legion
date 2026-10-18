@@ -10,8 +10,9 @@ below, which win over the original design text wherever they disagree.
 Phase 1 pulled `gang.min` forward from Phase 2 and a minimal gang-as-victim
 rule forward from the deferrals; Revision 2 built `placementTimeout` (Phase
 2) and member-loss recovery (Phase 3, as `onMemberLoss` rather than
-`recovery`). Still deferred: a readiness timeout, in-place gang restarts,
-rank and world-size variables for members, the Phase 4 items, capacity reservation / backfill anti-starvation, gang-grained
+`recovery`), and gives each member its rank, the world size, and rank 0's
+address. Still deferred: a readiness timeout, in-place gang restarts, the
+Phase 4 items, capacity reservation / backfill anti-starvation, gang-grained
 preemption beyond "never below quorum" (coordinated with the
 [preemption plan](preemption-and-eviction-plan.md)), cross-job gangs, named
 cross-task gangs, topology-aware placement (same rack/zone), and autoscaler
@@ -39,7 +40,7 @@ build:
   other. The `attempts`/`blocked_reason` eval columns,
   `Store::block_eval_for_capacity`, the 5s-to-2m backoff, and the
   `node_join` clause in `reschedule_allocations_for_new_node` are dropped.
-  Judgement call 24 (blocked semantics gang-opt-in) is moot, and call 23
+  Judgement call 25 (blocked semantics gang-opt-in) is moot, and call 24
   (`node_join` + capped backoff) is superseded by new call 2.
 - **Partial placement shipped for every job**
   (`docs/scheduler-and-eval-loop.md`, "Partial placement"). A plan now places
@@ -53,7 +54,7 @@ What Phase 1 builds, as executed:
 
 1. **Surface.** `gang = true` or `gang = { min = N }` on a task. `min` was
    Phase 2; it is the same quorum check with a different number, so it
-   ships now (new call 9). `placementTimeout` and `recovery` are not
+   ships now (new call 10). `placementTimeout` and `recovery` are not
    accepted yet (unknown fields are rejected), rather than parsed and
    ignored.
 2. **Planner.** After placing a gang task, `build_plan` checks the quorum:
@@ -64,20 +65,20 @@ What Phase 1 builds, as executed:
    remainder is ordinary unplaced work and trickles in through the capacity
    pass, as open question 4 leaned. Bail sites that return a typed
    `PlacementBlocked` (disk, checkpoint room, pins) are folded into the same
-   gang diagnosis. Gang tasks keep the no-truncation rule (call 16).
+   gang diagnosis. Gang tasks keep the no-truncation rule (call 17).
 3. **Waiting.** Nothing new: the shipped blocked-eval queue (new call 2).
    A gang blocked on its pool class wakes when a node of that class
    registers or frees allocations.
 4. **Top-ups.** A `Reschedule` pass places all missing members or none, and
    a reschedule backoff hold on any member withholds the whole top-up until
-   the last hold lapses (new call 19), so the backoff cannot become a side
+   the last hold lapses (new call 20), so the backoff cannot become a side
    door to a partial gang.
 5. **Validation.** Rejected at submit, `job validate`, and `job plan`:
    `count.per`; keyed and session stateful tasks; a gang task that shares
    its group with other tasks (a multi-task group already co-places every
-   task on one node, all or nothing — new call 13, replacing "gang on a
+   task on one node, all or nothing — new call 14, replacing "gang on a
    sidecar"); `min` outside `1..=count`; a rollout for the gang's group that
-   resolves to more than one step, and `slots.order: sequential` (call 14,
+   resolves to more than one step, and `slots.order: sequential` (call 15,
    amended: `percentSteps: [100]` is one step and is allowed). The rollout
    engine also forces one step for a gang group, because a rollout strategy
    plugin can inject step modes after validation.
@@ -88,17 +89,17 @@ What Phase 1 builds, as executed:
    task: desired, min, running, placeable, would_place, eligible/total
    nodes, reason), and the same message as `Job.blocked.gang`. `job plan`
    reports a gang that would wait as a successful reply with
-   `would_place: false` rather than an error (new call 15). The
+   `would_place: false` rather than an error (new call 16). The
    `legion_gang_blocked_jobs` gauge counts blocked evals whose blocked task
    is a gang. No new event kinds: `eval.blocked` carries the gang detail and
    `eval.unblocked` plus `legion_blocked_wait_seconds` measure the wait
-   (new call 22). Changing `gang` counts as a scheduling change, so in-place
-   config migrations re-plan (new call 20).
+   (new call 23). Changing `gang` counts as a scheduling change, so in-place
+   config migrations re-plan (new call 21).
 
 Unchanged from the original design: hold-nothing waiting (call 1),
 whole-plan deferral (call 6, revisited for the partial-placement world),
-update-restarts-the-gang (call 11), the bool-or-object field (call 12), and
-the no-truncation rule (call 16).
+update-restarts-the-gang (call 12), the bool-or-object field (call 13), and
+the no-truncation rule (call 17).
 
 ## Revision 2: placement timeout and member loss (2026-10-17)
 
@@ -128,7 +129,7 @@ anything is terminal: fail the job, like YuniKorn `Hard` and Slurm
 exactly the hoarding gang exists to prevent, and is rejected. The clock
 starts at the gang's first block, so a gang that never places anything still
 times out (YuniKorn's starts at the first placeholder and has that hole).
-Kubernetes' finding argues for no default timeout, which is Legion's call 17.
+Kubernetes' finding argues for no default timeout, which is Legion's call 18.
 
 **What happens to survivors.** Four shapes recur:
 
@@ -229,9 +230,10 @@ counts both. Workers follow the new `gang` stop cause.
 
 **Judgement calls.** New: 4 (`restart` default), 5 (the policy applies only
 below the quorum, and only to losses the manager sees), 8 (starting together
-is the workload's job), 10 (the move budget), 18 (the stop-grace delay), 21
-(the forwarded decision op). Amended: 17 (the timeout, as built) and 22 (two
-gang events after all).
+is the workload's job; members get a rank, the size, and rank 0's address),
+9 (those variables are fixed at placement), 11 (the move budget), 19 (the
+stop-grace delay), 22 (the forwarded decision op). Amended: 18 (the timeout,
+as built) and 23 (two gang events after all).
 
 **Starting together** (asked in review: "do we need to start them at the
 same time, or does the application handle it? If the latter, do we need to
@@ -240,16 +242,22 @@ starts when its worker receives it. No surveyed gang scheduler synchronizes
 start; the framework's rendezvous (torchrun, NCCL `init_process_group`, MPI,
 `jax.distributed`) is the sync point, and the orchestrator's job is
 fate-sharing: `restart` means survivors never need to watch peers. What a
-rendezvous still needs from Legion is identity and an address: today a
-member has `LEGION_ALLOC_ID`, a slot-mode stateful gang has
-`LEGION_INSTANCE_SLOT`, and service discovery lists healthy members (call 8).
+rendezvous still needs from Legion is identity and an address, so every
+member starts with `LEGION_GANG_RANK` (the lowest rank no running member
+holds, so a `replace` replacement inherits the lost rank), `LEGION_GANG_SIZE`,
+`LEGION_GANG_MIN`, and `LEGION_GANG_LEADER_ADDR` (rank 0's node address). All
+four are decided with the allocation row and stored in a scheduler-lane
+`gang_member` table, never recomputed, because a payload that changed would
+restart the running member; a scale or a re-placed rank 0 reaches only
+members placed after it (calls 8, 9). A gang's `speculativeStart` is capped
+at `stage`, since a provisional start predates its rank.
 
 **Deliberately not built** (open in `TODO.md`):
 
-- Rank and world-size variables (`LEGION_GANG_RANK`, `LEGION_GANG_SIZE`) and
-  a coordinator address for stateless gangs. Ranks must be stored per
-  allocation, so a `replace` top-up hands the missing member's rank to its
-  replacement and a restart reassigns `0..count-1`.
+- Propagating a scale or a re-placed rank 0 to running members. Their gang
+  variables are fixed at placement; a resize means stopping and re-running.
+- A rendezvous port. Legion gives rank 0's address; the port is the
+  workload's (a static port for containers).
 - A readiness timeout (Kueue's `waitForPodsReady`): placed members that
   never start are covered only by their own failure.
 - In-place gang restarts (JobSet `InPlaceRestart`).
@@ -691,7 +699,7 @@ gang task cannot reach membership does not error — it **defers**:
   (`scheduler.rs:1558-1564`). Deciding "the gang does not fit" requires
   having seen every candidate; a truncated list plus refill loop can prove
   fit but never non-fit. Gang tasks take the scan path; everything else
-  keeps the index. (Ranked judgement call #16.)
+  keeps the index. (Ranked judgement call #17.)
 - In `Reschedule` mode the missing count *is* the membership delta: place
   all of it or defer. Running members are untouched by a deferred top-up.
 
@@ -722,7 +730,7 @@ When the plan defers, the eval does not complete and does not fail — it
   capacity-blocked eval get their eval's `ready_at` pulled to *now* on
   `node_join`. Allocation-removal wake (a big job freeing half the cluster
   mid-backoff) is Phase 2; until then the backoff cap bounds that latency
-  at 2 minutes. (Ranked judgement call #23, superseded by #2.)
+  at 2 minutes. (Ranked judgement call #24, superseded by #2.)
 - **The terminal-failure contract is unchanged for everything else.**
   Non-gang placement failures still fail terminally in v1. Extending
   blocked semantics to all capacity failures is the standing open question
@@ -735,7 +743,7 @@ gang task, `handle_job_update` keeps its remove-then-plan order (an update
 use it), but a deferred plan now leaves the job **blocked at zero and
 retrying** instead of stranded at zero with a dead eval. The status line
 says so: `blocked (gang): updating — 0/8 placed`. Zero-downtime gang
-updates are the Phase 4 blue-green pattern. (Ranked judgement call #11.)
+updates are the Phase 4 blue-green pattern. (Ranked judgement call #12.)
 
 ### 4) What the user sees
 

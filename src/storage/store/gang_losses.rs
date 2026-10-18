@@ -64,7 +64,7 @@ impl Store {
     ) -> R<Option<GangLoss>> {
         // Free for every task that is not a gang: one read-model lookup.
         let is_gang = self
-            .cached_task_configs_for_job_config(&lost.job_config_id)?
+            .shared_task_configs_for_job_config(&lost.job_config_id)?
             .iter()
             .any(|(id, task)| *id == lost.task_config_id && task.gang.is_some());
         if !is_gang {
@@ -226,10 +226,10 @@ impl Store {
         exhausted: bool,
     ) -> R<Option<GangLoss>> {
         let Some(task) = self
-            .cached_task_configs_for_job_config(job_config_id)?
-            .into_iter()
+            .shared_task_configs_for_job_config(job_config_id)?
+            .iter()
             .find(|(id, _)| *id == task_config_id)
-            .map(|(_, task)| task)
+            .map(|(_, task)| task.clone())
         else {
             return Ok(None);
         };

@@ -2786,6 +2786,8 @@ impl ManagerDaemonService {
             &volumes,
         )
         .ok()?;
+        crate::manager::dispatcher::attach_gang_env(&self.store, &task, &allocation, &mut payload)
+            .ok()?;
         payload.provisional = Some(crate::structs::ProvisionalAllocation {
             claim_id: claim_id.to_string(),
             gate,
@@ -12599,6 +12601,7 @@ pub(crate) fn desired_payload(
     let volumes =
         store.volume_mounts_for_allocation(&allocation.job_id, task, instance.as_ref())?;
     let mut payload = build_task_allocation(task, allocation, instance.as_ref(), &volumes)?;
+    crate::manager::dispatcher::attach_gang_env(store, task, allocation, &mut payload)?;
     let session_task = crate::manager::dispatcher::attach_session_task_spec(
         &mut payload,
         task,

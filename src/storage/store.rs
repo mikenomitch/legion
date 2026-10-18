@@ -39,6 +39,8 @@ mod reschedule_holds;
 mod gang_waits;
 // Gang member losses: what a lost member does to the rest of its gang.
 mod gang_losses;
+// Gang members: each gang allocation's rank, size, and leader address.
+mod gang_members;
 use crate::storage::persistence::{
     build_persistence_driver, PersistenceDriver, PersistenceRole, PersistenceStatus,
     RaftHistoryEvent, RaftStatus,
@@ -47,6 +49,7 @@ use crate::storage::raft::{capture, ReplicatedOp, ReplicationHandle};
 use crate::storage::Lane;
 pub use fork_ops::{alias_target_problem, AliasOutcome, ForkCreated};
 pub use gang_losses::GangLoss;
+pub use gang_members::GangMember;
 pub use gang_waits::GangWait;
 pub use job_status_ops::{derive_job_status, JobStatusFacts, TaskStatusFact};
 pub use keyring_ops::{KeyringInit, KeyringReset, RewrapBatch, RewrapRun, RootKeyRewrap};
@@ -9550,6 +9553,7 @@ impl Store {
         tx.execute("DELETE FROM instance WHERE job_id = ?1;", [job_id])?;
         tx.execute("DELETE FROM reschedule_hold WHERE job_id = ?1;", [job_id])?;
         Self::delete_gang_waits_for_job_tx(&tx, job_id)?;
+        Self::delete_gang_members_for_job_tx(&tx, job_id)?;
         Self::destroy_job_snapshots_tx(&tx, job_id)?;
         tx.execute("DELETE FROM rollout_event WHERE job_id = ?1;", [job_id])?;
         tx.execute("DELETE FROM rollout WHERE job_id = ?1;", [job_id])?;
@@ -13694,6 +13698,8 @@ impl Store {
             )?
             .execute(params![allocation.id, now, instance_id])?;
         }
+        // A gang member's rank, like a slot, is bound with the row.
+        self.assign_gang_member_tx(tx, &allocation)?;
 
         Ok(allocation)
     }

@@ -2068,6 +2068,32 @@ fn migration_list() -> Vec<M<'static>> {
         DROP INDEX IF EXISTS idx_gang_wait_job;
         DROP TABLE IF EXISTS gang_wait;",
         ),
+        // Gang members (docs/gang-scheduling.md, "Starting together"): one
+        // row per allocation of a gang task, written with the allocation
+        // row. `rank` is the lowest rank no live member of the task holds;
+        // `size`, `quorum`, and `leader_address` (rank 0's address) are
+        // fixed at placement, because a payload that changed would restart
+        // the running member. Rows of removed allocations are pruned when
+        // the task places again, and with the job on destroy. Scheduler
+        // lane, like `allocation`.
+        M::up(
+            "CREATE TABLE IF NOT EXISTS gang_member (
+            allocation_id INTEGER PRIMARY KEY,
+            job_id STRING NOT NULL,
+            job_config_id STRING NOT NULL,
+            rank INTEGER NOT NULL,
+            size INTEGER NOT NULL,
+            quorum INTEGER NOT NULL,
+            leader_address STRING
+        );
+        CREATE INDEX IF NOT EXISTS idx_gang_member_job ON gang_member(job_id);
+        CREATE INDEX IF NOT EXISTS idx_gang_member_job_config ON gang_member(job_config_id);",
+        )
+        .down(
+            "DROP INDEX IF EXISTS idx_gang_member_job_config;
+        DROP INDEX IF EXISTS idx_gang_member_job;
+        DROP TABLE IF EXISTS gang_member;",
+        ),
     ]
 }
 

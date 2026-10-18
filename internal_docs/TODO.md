@@ -1362,14 +1362,13 @@ How to use it:
       [plan](plans/gang-scheduling-plan.md) (IN EXECUTION) ·
       [calls](calls/gang-scheduling-plan_calls.md) ·
       [docs](../docs/gang-scheduling.md). Open:
-  - [ ] **Rank and world size for members.** A stateless gang member gets
-        only `LEGION_ALLOC_ID`, so a framework's rendezvous has to assign
-        ranks itself and take the world size from `env`. Add
-        `LEGION_GANG_RANK` / `LEGION_GANG_SIZE` (and a coordinator address,
-        rank 0's, that does not wait for health checks). Ranks need storing
-        per allocation so a `replace` top-up hands the missing rank to the
-        replacement ([plan](plans/gang-scheduling-plan.md#revision-2-placement-timeout-and-member-loss-2026-10-17),
-        [calls](calls/gang-scheduling-plan_calls.md) 8).
+  - [ ] **Gang variables after a scale or a re-placed leader.** A running
+        member keeps the `LEGION_GANG_SIZE` and `LEGION_GANG_LEADER_ADDR` it
+        was placed with (a changed payload would restart it), so after `job
+        scale`, or a `replace` that moved rank 0, members disagree until the
+        gang restarts. Options: restart a gang on scale, or deliver the new
+        values as a file the workload re-reads
+        ([calls](calls/gang-scheduling-plan_calls.md) 9).
   - [ ] **Readiness timeout** (Kueue's `waitForPodsReady`). A member that
         is placed but hangs before it runs (an image pull that never ends)
         holds the others at their rendezvous until its start fails.
@@ -5031,9 +5030,9 @@ docs: [scheduler-and-eval-loop.md](../docs/scheduler-and-eval-loop.md), [jobs-ta
   - [x] `PlanJobReply.gang_reports` (a deferred gang is a successful dry
         run), `JobBlocked.gang`, `job plan` / `job info` / UI / MCP
         rendering, `legion_gang_blocked_jobs`.
-- [x] **Gang scheduling, Revision 2: placement timeout and member loss**
-      (2026-10-17, [plan](plans/gang-scheduling-plan.md#revision-2-placement-timeout-and-member-loss-2026-10-17) ·
-      [calls](calls/gang-scheduling-plan_calls.md) 4, 5, 8, 10, 17, 18, 21 ·
+- [x] **Gang scheduling, Revision 2: placement timeout, member loss, and
+      member identity** (2026-10-17, [plan](plans/gang-scheduling-plan.md#revision-2-placement-timeout-and-member-loss-2026-10-17) ·
+      [calls](calls/gang-scheduling-plan_calls.md) 4, 5, 8, 9, 11, 18, 19, 22 ·
       [docs](../docs/gang-scheduling.md#placement-timeout)).
   - [x] `gang.placementTimeout`: a scheduler-lane `gang_wait` clock from
         the gang's first block, a leader timer that wakes the blocked eval
@@ -5049,6 +5048,11 @@ docs: [scheduler-and-eval-loop.md](../docs/scheduler-and-eval-loop.md), [jobs-ta
         move budget, and an exhausted budget fails the job. One forwarded
         scheduler-lane op (`gang_member_lost`); `job.gang_member_lost`;
         `legion_gang_outcomes_total`.
+  - [x] `LEGION_GANG_RANK` / `LEGION_GANG_SIZE` / `LEGION_GANG_MIN` /
+        `LEGION_GANG_LEADER_ADDR` in every member's env: lowest-free ranks
+        (a `replace` replacement inherits the lost rank), all four fixed at
+        placement in a scheduler-lane `gang_member` table and attached on
+        every dispatch path. A gang's `speculativeStart` is capped at `stage`.
 - [x] **Elastic session envelopes, Phase 1.** `stateful.envelope.max` and
       `shrinkAfter`: each node grows its session envelope toward the
       ceiling as its sessions fill it and shrinks it after they drain, one

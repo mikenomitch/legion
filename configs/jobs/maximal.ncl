@@ -1223,6 +1223,12 @@
                 # budget; once it is spent the job fails.
                 onMemberLoss = "restart",
             },
+            # Every member starts with LEGION_GANG_RANK (0..count-1),
+            # LEGION_GANG_SIZE, LEGION_GANG_MIN, and LEGION_GANG_LEADER_ADDR
+            # (rank 0's node), fixed when it is placed: what a rendezvous
+            # such as torchrun needs. Members start as their workers get
+            # them; the rendezvous is where they meet. A gang's
+            # speculativeStart is capped at `stage`.
             config = {
                 command = ["sleep", "3600"],
             },

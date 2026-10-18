@@ -238,6 +238,12 @@ const TABLE_OWNERS: &[(&str, Owner)] = &[
     // destroy's scheduler cleanup: all scheduler-lane ops. NOT commutative
     // (rows are deleted).
     ("gang_wait", Owner::Lane(Lane::Scheduler)),
+    // `gang_member` holds each gang allocation's rank, size, and leader
+    // address. Written in the same transaction as the allocation row (the
+    // plan apply and every other placement path), pruned there and by job
+    // destroy's scheduler cleanup: all scheduler-lane ops, like `allocation`.
+    // NOT commutative (ranks are assigned from the live set).
+    ("gang_member", Owner::Lane(Lane::Scheduler)),
     // `node_alloc_usage` caches the aggregated allocation usage of a node
     // for the plan-apply capacity recheck, next to a fingerprint of the rows
     // it was derived from (see the migration that creates it). Written by

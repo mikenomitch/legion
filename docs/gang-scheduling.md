@@ -221,26 +221,69 @@ point belongs in the workload, as a rendezvous that waits for every member,
 because only the workload knows when it is ready (its weights loaded, its
 data opened). Distributed frameworks already have one: PyTorch's
 `init_process_group` and torchrun's rendezvous, MPI's launch, JAX's
-`jax.distributed.initialize`. Point them at a rendezvous every member can
-reach, and give them the world size, which is the gang's count.
+`jax.distributed.initialize`. Legion's part is to tell each member who it is
+and where to meet, and to share fate: a member that fails or loses its node
+restarts the whole gang (the default `onMemberLoss`), so survivors never wait
+forever on a peer that is not coming back, and no member needs to watch the
+others' status.
 
-Legion's part is fate-sharing. A member that fails or loses its node restarts
-the whole gang (the default `onMemberLoss`), so survivors never wait forever
-on a peer that is not coming back, and no workload needs to watch its peers'
-status. What Legion gives a member today:
+Every member of a gang starts with:
 
-- **Its identity.** Every member gets `LEGION_ALLOC_ID`. A slot-mode stateful
-  gang also gets `LEGION_INSTANCE_SLOT`, a stable ordinal `0..count-1` that
-  works as a rank ([stateful workloads](stateful-workloads.md#environment-variables)).
-- **Its peers' addresses.** A gang task with a `service` block registers each
-  member, and [service discovery](service-discovery.md) (`connect` upstreams,
-  `LEGION_DNS`, templates with `{{ range endpoints "worker" }}`) lists them.
-  The catalog lists healthy endpoints only, so a member shows up once its
-  checks pass.
+| Variable | Value |
+| --- | --- |
+| `LEGION_GANG_RANK` | The member's rank, `0` to `size - 1`, unique among the gang's running members. |
+| `LEGION_GANG_SIZE` | The world size: the gang's count (after `legion job scale`). |
+| `LEGION_GANG_MIN` | The quorum: `gang.min`, else the count. For an elastic rendezvous, `min:size` is the range of members it may start with. |
+| `LEGION_GANG_LEADER_ADDR` | The address of the node running rank 0: the address service discovery reports for its allocation. Unset if that node advertises none. |
 
-Gaps are in [Limitations](#limitations): a stateless gang has no rank or
-world-size variable, and a member that is placed but never starts holds the
-others at the rendezvous until its start fails.
+They are set like `LEGION_ALLOC_ID`: in the task's runtime `env`, at process
+start, winning over a jobspec key of the same name
+([environment variables](stateful-workloads.md#environment-variables)).
+
+Rank 0 is the natural rendezvous host. With PyTorch, for example:
+
+```nickel
+{
+  name = "worker",
+  runtime = "exec",
+  group = "worker",
+  count = 8,
+  gang = true,
+  # The rendezvous port is fixed, so every member can dial rank 0 on it. A
+  # container task publishes it with a static port in `network.ports`.
+  config = {
+    command = ["sh", "-c", m%"
+      exec torchrun --nnodes="$LEGION_GANG_SIZE" --nproc-per-node=8 \
+        --node-rank="$LEGION_GANG_RANK" \
+        --master-addr="$LEGION_GANG_LEADER_ADDR" --master-port=29500 \
+        train.py
+    "%],
+  },
+}
+```
+
+**Ranks.** A fresh gang (a submit, or a `restart`) is ranked `0..count-1`.
+Each member gets the lowest rank no running member holds, so with
+`onMemberLoss = "replace"` the replacement of a lost member takes its rank,
+and the survivors keep theirs. With `min` below `count`, members placed later
+take the ranks above the quorum's.
+
+**Fixed for the member's lifetime.** The values are decided when the member
+is placed and never change while it runs: a change would be a payload update,
+which restarts the member. So members placed before a `legion job scale` keep
+the old `LEGION_GANG_SIZE`, and with `replace`, survivors keep the old
+`LEGION_GANG_LEADER_ADDR` when rank 0 itself was replaced on another node.
+The default `restart` re-places every member, so the whole gang always agrees.
+
+A slot-mode stateful gang also gets `LEGION_INSTANCE_SLOT`, the stable ordinal
+of its instance. It usually matches the rank but is not guaranteed to; use
+`LEGION_GANG_RANK` for the rendezvous. Service discovery lists the members'
+addresses too, for a workload that wants all of them: a gang task with a
+`service` block registers each member, and `connect` upstreams or templates
+(`{{ range endpoints "worker" }}`) list the healthy ones.
+
+A gang's [`speculativeStart`](edge-boot.md#automatic-downgrades) is capped at
+`stage`, because a member's rank is assigned when its placement commits.
 
 ## Seeing it
 
@@ -433,7 +476,10 @@ finish while the gang waits for it.
 `legion job scale` changes a gang's count. Scaling out places the new
 replicas together (with `gang = true`, the quorum is the new count). Scaling
 in removes replicas and lowers the quorum to the new count if it falls below
-`min`.
+`min`. Neither restarts the running members, so they keep the
+`LEGION_GANG_SIZE` they were placed with, and a scale-in can leave gaps in
+the ranks. A workload with a fixed world size should be stopped and re-run at
+the new size instead.
 
 ## Failure modes and diagnostics
 
@@ -446,6 +492,8 @@ in removes replicas and lowers the quorum to the new count if it falls below
 | Every member stopped with cause `gang`, then the gang placed again | A member was lost and `onMemberLoss = "restart"` restarted the gang. `job.gang_member_lost` names the member and the cause. | Nothing, if losses are rare. A member that keeps failing spends the move budget and fails the job; look at its logs. |
 | `status: failed` after `job.gang_member_lost` with `action: fail` | `onMemberLoss = "fail"`, or the task's move budget ran out. | Fix the failing member, then `legion job run`. |
 | Members start minutes apart and the workload's rendezvous times out | Members start independently ([Starting together](#starting-together)): a large image or artifact on one node delays its member. | Raise the rendezvous timeout in the workload, or pre-pull the image. |
+| `LEGION_GANG_LEADER_ADDR` is unset | Rank 0's node advertises no `workerAddress` (and its allocation has no network address). | Set the worker's advertised address, or find rank 0 through service discovery. |
+| Members disagree on `LEGION_GANG_SIZE` after `legion job scale` | Running members keep the size they were placed with. | Stop and re-run the job to resize a gang. |
 | `legion_gang_blocked_jobs` stays above zero while jobs keep placing | Smaller jobs take capacity as it frees, and the gang never sees enough at once. | Fence capacity for the gang with a node pool and `permit` ([Jobs, Tasks, and Scheduling](jobs-tasks-and-scheduling.md)), or stop competing work. See [Limitations](#limitations). |
 | A higher-band job fails to place, naming `disruption.minAvailable` | Every candidate victim is a gang member at its quorum. | Expected. Stop the gang, or give it `min` below `count`. |
 | `job validate` rejects the gang | One of the [validation](#validation) rules. | The error names the fix. |
@@ -458,13 +506,15 @@ in removes replicas and lowers the quorum to the new count if it falls below
   waiting gang. Pools and permits are the way to fence capacity for gangs
   today, `legion_gang_blocked_jobs` shows when it matters, and
   `placementTimeout` turns an endless wait into a failure.
-- **No start barrier, rank, or world size.** Members start as their workers
-  get them ([Starting together](#starting-together)). A stateless gang gets no
-  rank or world-size variable; pass the world size in the task's `env` (it is
-  the count) and take a rank from the framework's rendezvous, or use a
-  slot-mode stateful gang for `LEGION_INSTANCE_SLOT`. There is no built-in
-  coordinator address beyond service discovery, which lists healthy members
-  only.
+- **No start barrier.** Members start as their workers get them, and the
+  workload's rendezvous is where they meet
+  ([Starting together](#starting-together)). The rendezvous port is the
+  workload's to fix: Legion gives the leader's address, not a port.
+- **Gang variables do not follow a scale or a replaced leader.** A running
+  member keeps the `LEGION_GANG_SIZE` and `LEGION_GANG_LEADER_ADDR` it was
+  placed with. Scaling a gang does not restart it, and with `replace` a new
+  rank 0 on another node is not announced to the survivors. Stop and re-run a
+  gang to resize it.
 - **No readiness timeout.** `placementTimeout` covers placing the gang, not
   starting it. A member that is placed but hangs before it runs (an image pull
   that never finishes) holds the others at their rendezvous until the worker

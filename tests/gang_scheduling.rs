@@ -78,6 +78,10 @@ struct Cluster {
 
 impl Cluster {
     fn new(nodes: &[&str]) -> R<Self> {
+        Self::with_nodes(nodes.iter().map(|id| node(id)).collect())
+    }
+
+    fn with_nodes(nodes: Vec<Node>) -> R<Self> {
         let dir = tempfile::tempdir()?;
         let store = Store::start_storage(&ManagerConfigFull {
             store_path: dir.path().to_str().context("store path")?.to_string(),
@@ -85,8 +89,8 @@ impl Cluster {
             scheduler_settings: Some(json!({ "nodes_considered": "100%" })),
             ..Default::default()
         })?;
-        for id in nodes {
-            store.insert_node(NodeMsg::from(node(id)))?;
+        for node in nodes {
+            store.insert_node(NodeMsg::from(node))?;
         }
         Ok(Cluster {
             _dir: dir,
@@ -652,5 +656,114 @@ fn failure_driven_restarts_spend_the_move_budget() -> R<()> {
         .map(|event| event["action"].as_str().unwrap_or_default().to_string())
         .collect();
     assert_eq!(actions, ["restart", "fail"]);
+    Ok(())
+}
+
+/// A node that advertises a worker address, as a registered worker does.
+fn addressed_node(id: &str, host: &str) -> Node {
+    let mut node = node(id);
+    node.config_attrs["workerAddress"] = json!(format!("http://{host}:4848"));
+    node
+}
+
+/// Each member's gang identity, keyed by rank, with the node it runs on.
+fn ranks(cluster: &Cluster, job: &str) -> R<std::collections::BTreeMap<u32, (i64, String)>> {
+    let mut ranks = std::collections::BTreeMap::new();
+    for allocation in cluster.store().allocs_for_job(job)? {
+        let member = cluster
+            .store()
+            .gang_member(allocation.id)?
+            .context("every gang allocation has a rank")?;
+        let previous = ranks.insert(member.rank, (allocation.id, allocation.node_id.clone()));
+        assert!(previous.is_none(), "rank {} held twice", member.rank);
+    }
+    Ok(ranks)
+}
+
+/// A gang's members start with their rank, the world size, the quorum, and
+/// the address of rank 0, as `LEGION_GANG_*` variables in the payload every
+/// dispatch path builds.
+#[test]
+fn members_start_with_a_rank_the_world_size_and_the_leader() -> R<()> {
+    let cluster = Cluster::with_nodes(vec![
+        addressed_node("n-1", "10.0.0.1"),
+        addressed_node("n-2", "10.0.0.2"),
+        addressed_node("n-3", "10.0.0.3"),
+    ])?;
+    let elastic = Some(GangConfig {
+        min: Some(2),
+        ..GangConfig::default()
+    });
+    cluster.submit(&job("trainer", 3, elastic))?;
+    cluster.settle()?;
+    let ranks = ranks(&cluster, "trainer")?;
+    assert_eq!(ranks.keys().copied().collect::<Vec<_>>(), [0, 1, 2]);
+    let leader_host = format!("10.0.0.{}", &ranks[&0].1["n-".len()..]);
+
+    let store = cluster.store();
+    for (rank, (allocation_id, _)) in &ranks {
+        let allocation = store
+            .get_allocation_by_id(*allocation_id)?
+            .context("allocation")?;
+        let task = store
+            .get_task_config_by_id(allocation.task_config_id)?
+            .context("task")?;
+        let mut payload =
+            legion::manager::dispatcher::build_task_allocation(&task, &allocation, None, &[])?;
+        legion::manager::dispatcher::attach_gang_env(store, &task, &allocation, &mut payload)?;
+        let config: serde_json::Value = serde_json::from_str(&payload.task_config)?;
+        let env = &config["env"];
+        assert_eq!(env["LEGION_GANG_RANK"], rank.to_string());
+        assert_eq!(env["LEGION_GANG_SIZE"], "3");
+        assert_eq!(env["LEGION_GANG_MIN"], "2");
+        assert_eq!(env["LEGION_GANG_LEADER_ADDR"], leader_host.as_str());
+        assert_eq!(env["LEGION_ALLOC_ID"], allocation.id.to_string());
+    }
+    Ok(())
+}
+
+/// With `onMemberLoss = "replace"`, the replacement takes the lost member's
+/// rank, and the survivors keep theirs.
+#[test]
+fn a_replacement_takes_the_lost_rank() -> R<()> {
+    let cluster = Cluster::new(&["n-1", "n-2", "n-3", "n-4"])?;
+    cluster.submit(&job("trainer", 3, gang_on_loss(MemberLossPolicy::Replace)))?;
+    cluster.settle()?;
+    let before = ranks(&cluster, "trainer")?;
+    let (lost_id, lost_node) = before[&1].clone();
+
+    lose_node(&cluster, &lost_node)?;
+    let config_id = cluster.store().get_job_config("trainer")?.id();
+    cluster.store().enqueue_eval(
+        "job_reschedule",
+        Some("trainer"),
+        Some(&config_id),
+        None,
+        None,
+    )?;
+    cluster.settle()?;
+    let after = ranks(&cluster, "trainer")?;
+    assert_eq!(after.keys().copied().collect::<Vec<_>>(), [0, 1, 2]);
+    assert_eq!(after[&0], before[&0], "survivors keep their ranks");
+    assert_eq!(after[&2], before[&2]);
+    assert_ne!(after[&1].0, lost_id, "rank 1 is a new allocation");
+    assert_ne!(after[&1].1, lost_node);
+    Ok(())
+}
+
+/// A restarted gang is ranked afresh, `0..count-1`, on its new allocations.
+#[test]
+fn a_restarted_gang_is_ranked_afresh() -> R<()> {
+    let cluster = Cluster::new(&["n-1", "n-2", "n-3", "n-4"])?;
+    cluster.submit(&quick_stop(job("trainer", 3, gang())))?;
+    cluster.settle()?;
+    let before = ranks(&cluster, "trainer")?;
+    lose_node(&cluster, &before[&0].1)?;
+    std::thread::sleep(Duration::from_millis(1100));
+    cluster.settle()?;
+    let after = ranks(&cluster, "trainer")?;
+    assert_eq!(after.keys().copied().collect::<Vec<_>>(), [0, 1, 2]);
+    let old: std::collections::HashSet<i64> = before.values().map(|(id, _)| *id).collect();
+    assert!(after.values().all(|(id, _)| !old.contains(id)));
     Ok(())
 }
