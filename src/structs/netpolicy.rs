@@ -1158,8 +1158,14 @@ fn merge_direction(
             });
         }
         for (index, handler) in chain.handlers.iter().enumerate() {
+            // A hop without its own `onError` takes the chain's, so what
+            // `net policy show` prints is what the datapath does.
+            let mut handler = handler.clone();
+            if handler.on_error.is_none() {
+                handler.on_error = chain.on_error.clone();
+            }
             merged.handlers.push(EffectiveHandler {
-                handler: handler.clone(),
+                handler,
                 source: format!("{source}#{index}"),
             });
         }
@@ -1574,6 +1580,28 @@ pub fn normalize_labels(labels: &BTreeMap<String, String>) -> R<BTreeMap<String,
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A hop without its own `onError` takes its chain's, so what `net
+    /// policy show` prints is what the datapath enforces.
+    #[test]
+    fn hops_inherit_the_chain_on_error_test() {
+        let mut object: NetPolicyObject = serde_json::from_value(json!({
+            "name": "p", "enforcement": "require",
+            "egress": {
+                "protocol": "http", "onError": "allow",
+                "handlers": [
+                    { "handler": "authz", "url": "http://x/check" },
+                    { "handler": "authz", "url": "http://y/check", "onError": "deny" }
+                ]
+            }
+        }))
+        .unwrap();
+        object.normalize_and_validate().unwrap();
+        let policy = merge_policies(&[object], InlinePolicy::default());
+        let hops = &policy.egress.as_ref().unwrap().handlers;
+        assert_eq!(hops[0].handler.on_error.as_deref(), Some("allow"));
+        assert_eq!(hops[1].handler.on_error.as_deref(), Some("deny"));
+    }
     use serde_json::json;
 
     fn chain(v: Value) -> ChainConfig {

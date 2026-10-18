@@ -30,6 +30,7 @@ use crate::worker::forwarder::ForwarderContext;
 use crate::worker::netd::attach::Attachment;
 use crate::worker::netd::guard::{self, GuardRefusal};
 use crate::worker::netd::handlers::{self, HopFacts, HopOutcome, ProxyTarget};
+use crate::worker::netd::http;
 use crate::worker::netd::listen::{dial_tcp, spawn_accept_loop, ListenAddr};
 use crate::worker::netd::metrics as net_metrics;
 use crate::worker::netd::netns;
@@ -740,6 +741,7 @@ async fn forward_absolute(
     peer: Option<SocketAddr>,
     proxy: Arc<Proxy>,
 ) -> Response<ProxyBody> {
+    let started = std::time::Instant::now();
     let uri = request.uri().clone();
     let (Some(scheme), Some(authority)) = (uri.scheme_str(), uri.authority()) else {
         return status_response(StatusCode::BAD_REQUEST);
@@ -770,6 +772,17 @@ async fn forward_absolute(
     let addrs = match judge(&proxy, &host, port, Some((&method, path_only, &headers))).await {
         Ok(addrs) => addrs,
         Err(Refused::Denied(source, reason)) => {
+            log_request(
+                &proxy,
+                &method,
+                path_only,
+                &destination,
+                403,
+                "deny",
+                Some(&source),
+                started,
+                0,
+            );
             return refuse(
                 &proxy,
                 &host,
@@ -777,7 +790,7 @@ async fn forward_absolute(
                 &destination,
                 (source, reason),
                 (&method, path_only),
-            )
+            );
         }
     };
     let ip = addrs.first().map(|addr| addr.ip());
@@ -807,6 +820,17 @@ async fn forward_absolute(
             }
         },
         HopOutcome::Deny { source, reason } => {
+            log_request(
+                &proxy,
+                &method,
+                path_only,
+                &destination,
+                403,
+                "deny",
+                Some(&source),
+                started,
+                0,
+            );
             return refuse(
                 &proxy,
                 &host,
@@ -814,7 +838,7 @@ async fn forward_absolute(
                 &destination,
                 (source, reason),
                 (&method, path_only),
-            )
+            );
         }
         HopOutcome::Proxy(target) => {
             let extra = handlers::legion_headers(&proxy.context, &hop_facts);
@@ -834,6 +858,74 @@ async fn forward_absolute(
         }
     };
     let (mut parts, body) = request.into_parts();
+    // The chain's `dlp` hops read the body before it leaves, exactly as they
+    // do on an HTTP-mode upstream.
+    let dlps = chain_dlp(&proxy);
+    let mut bytes_in = 0u64;
+    let body: ProxyBody = if dlps.is_empty() {
+        body.boxed()
+    } else {
+        match http_body_util::Limited::new(body, http::dlp_cap(&dlps) as usize)
+            .collect()
+            .await
+        {
+            Ok(collected) => {
+                let bytes = collected.to_bytes();
+                bytes_in = bytes.len() as u64;
+                if let Some((source, reason)) = http::dlp_check(&dlps, &bytes) {
+                    log_request(
+                        &proxy,
+                        &method,
+                        path_only,
+                        &destination,
+                        403,
+                        "deny",
+                        Some(&source),
+                        started,
+                        bytes_in,
+                    );
+                    return refuse(
+                        &proxy,
+                        &host,
+                        PROTOCOL_HTTP,
+                        &destination,
+                        (source, Some(reason)),
+                        (&method, path_only),
+                    );
+                }
+                full_body(bytes)
+            }
+            Err(_) => {
+                // Over the cap, or the client went away mid-body.
+                if dlps.iter().any(|d| d.on_error_deny()) {
+                    let source = dlps
+                        .first()
+                        .map(|d| d.source().to_string())
+                        .unwrap_or_default();
+                    log_request(
+                        &proxy,
+                        &method,
+                        path_only,
+                        &destination,
+                        403,
+                        "deny",
+                        Some(&source),
+                        started,
+                        0,
+                    );
+                    return refuse(
+                        &proxy,
+                        &host,
+                        PROTOCOL_HTTP,
+                        &destination,
+                        (source, Some("request body exceeds dlp maxBytes".into())),
+                        (&method, path_only),
+                    );
+                }
+                return status_response(StatusCode::PAYLOAD_TOO_LARGE);
+            }
+        }
+    };
     // Hop-by-hop headers stay on this hop; the upstream connection carries
     // this one request and closes.
     for name in ["proxy-connection", "connection", "keep-alive"] {
@@ -870,13 +962,98 @@ async fn forward_absolute(
         .edges()
         .record_connection(proxy.allocation_id, &host, None, true);
     let upstream = CountedUpstream::new(upstream, proxy.clone(), host);
-    match send_one(upstream, Request::from_parts(parts, body.boxed())).await {
-        Ok(response) => response,
+    match send_one(upstream, Request::from_parts(parts, body)).await {
+        Ok(response) => {
+            log_request(
+                &proxy,
+                &method,
+                path_only,
+                &destination,
+                response.status().as_u16(),
+                "allow",
+                None,
+                started,
+                bytes_in,
+            );
+            response
+        }
         Err(err) => {
             debug!(allocation_id = proxy.allocation_id, destination = %destination, error = %err, "Egress proxy request failed");
+            log_request(
+                &proxy,
+                &method,
+                path_only,
+                &destination,
+                502,
+                "error",
+                None,
+                started,
+                bytes_in,
+            );
             status_response(StatusCode::BAD_GATEWAY)
         }
     }
+}
+
+/// The egress chain's `dlp` hops, compiled once per policy body.
+fn chain_dlp(proxy: &Proxy) -> Arc<Vec<http::Dlp>> {
+    let Some(policy) = proxy.context.policy_for(proxy.allocation_id) else {
+        return Arc::new(Vec::new());
+    };
+    match policy.egress.as_ref() {
+        Some(chain) if chain.is_http() => http::chain_body_hops(&policy, chain, "egress").dlp,
+        _ => Arc::new(Vec::new()),
+    }
+}
+
+/// One access-log line for an absolute-URI request through the proxy, when
+/// the egress chain asks for one (`accessLog = true` or a `log` handler).
+#[allow(clippy::too_many_arguments)]
+fn log_request(
+    proxy: &Proxy,
+    method: &str,
+    path: &str,
+    destination: &str,
+    status: u16,
+    verdict: &str,
+    source: Option<&str>,
+    started: std::time::Instant,
+    bytes_in: u64,
+) {
+    let Some(policy) = proxy.context.policy_for(proxy.allocation_id) else {
+        return;
+    };
+    let Some(chain) = policy.egress.as_ref() else {
+        return;
+    };
+    if !chain.access_log && !http::chain_declares_log(chain) {
+        return;
+    }
+    let Some(dir) = proxy.context.log_dir_for(proxy.allocation_id) else {
+        return;
+    };
+    let identity = proxy.context.identity_for(proxy.allocation_id);
+    let line = json!({
+        "ts": time::OffsetDateTime::now_utc()
+            .format(&time::format_description::well_known::Rfc3339)
+            .unwrap_or_default(),
+        "allocation": proxy.allocation_id,
+        "job": identity.as_ref().map(|i| i.job_id.clone()).unwrap_or_default(),
+        "task": identity.as_ref().map(|i| i.task_name.clone()).unwrap_or_default(),
+        "labels": identity.as_ref().map(|i| i.labels.clone()).unwrap_or_default(),
+        "direction": "egress",
+        "protocol": "http",
+        "upstream": "egress-proxy",
+        "destination": destination,
+        "method": method,
+        "path": path,
+        "status": status,
+        "verdict": verdict,
+        "source": source.unwrap_or_default(),
+        "bytesIn": bytes_in,
+        "durationMs": started.elapsed().as_millis() as u64,
+    });
+    tokio::spawn(http::append_access_line(dir, line));
 }
 
 /// Send one request on a fresh upstream connection and hand its response
@@ -1278,6 +1455,84 @@ mod tests {
         let mut out = Vec::new();
         let _ = tokio::time::timeout(Duration::from_secs(3), stream.read_to_end(&mut out)).await;
         String::from_utf8_lossy(&out).to_string()
+    }
+
+    /// A chain `dlp` handler reads an absolute-URI request's body through the
+    /// gated proxy, and a chain `log` handler writes the access log there.
+    #[tokio::test]
+    async fn chain_dlp_and_log_run_on_absolute_uri_requests_test() {
+        let origin_port = origin().await;
+        let cache = Arc::new(NetPolicyCache::new());
+        let mut object: NetPolicyObject = serde_json::from_value(json!({
+            "name": "p", "enforcement": "require",
+            "egress": {
+                "protocol": "http", "allow": ["127.0.0.1"],
+                "handlers": [
+                    { "handler": "dlp", "config": { "patterns": ["sk-[a-z]{8,}"] } },
+                    { "handler": "log" }
+                ]
+            }
+        }))
+        .unwrap();
+        object.normalize_and_validate().unwrap();
+        let policy = merge_policies(&[object], InlinePolicy::default());
+        let hash = policy.hash.clone();
+        cache.apply_assignments(&[AllocNetPolicy {
+            allocation_id: 6,
+            policy_hash: hash.clone(),
+        }]);
+        cache.insert_body(&hash, policy).unwrap();
+        let logs = tempfile::tempdir().unwrap();
+        let context = ForwarderContext::new(cache, Arc::new(Denials::new()))
+            .with_host_guard(guard_opening(&[origin_port]))
+            .with_logs_base_dir(logs.path().to_path_buf());
+        let proxies = Arc::new(EgressProxies::new(Arc::new(context)));
+        proxies
+            .sync(&[ProxySpec {
+                allocation_id: 6,
+                attachment: Attachment::Host,
+                listen: Some("127.0.0.1:0".parse().unwrap()),
+            }])
+            .await;
+        let addr = proxies.address(6).expect("proxy bound");
+
+        let body = "token=sk-abcdefghij";
+        let response = raw(
+            addr,
+            format!(
+                "POST http://127.0.0.1:{origin_port}/up HTTP/1.1\r\nHost: x\r\nContent-Length: {}\r\n\r\n{body}",
+                body.len()
+            )
+            .as_bytes(),
+        )
+        .await;
+        assert!(response.starts_with("HTTP/1.1 403"), "{response}");
+        assert!(
+            response
+                .to_ascii_lowercase()
+                .contains("legion-denied-by: policy/p#0"),
+            "{response}"
+        );
+
+        let response = raw(
+            addr,
+            format!("GET http://127.0.0.1:{origin_port}/fine HTTP/1.1\r\nHost: x\r\n\r\n")
+                .as_bytes(),
+        )
+        .await;
+        assert!(response.contains("saw GET /fine"), "{response}");
+
+        let log = logs.path().join("6").join("net-access.log");
+        let mut text = String::new();
+        for _ in 0..50 {
+            text = std::fs::read_to_string(&log).unwrap_or_default();
+            if text.lines().count() >= 2 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(text.contains("\"verdict\":\"deny\""), "{text}");
+        assert!(text.contains("\"path\":\"/fine\""), "{text}");
     }
 
     #[tokio::test]

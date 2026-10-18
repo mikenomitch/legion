@@ -3850,14 +3850,17 @@ merges the egress-plugins proposal from
 [#49](https://github.com/mikenomitch/legion/pull/49) with a review of the
 mesh's surface. Phase 0 first, then S1. After S1 every track is independent.
 
-- [ ] **Phase 0 (bugs).** `dlp` and `log` handlers declared on a chain
-      (inline or on a policy object) pass validation and never run:
-      `HttpSettings` only gets the upstream's own handlers
-      ([forwarder.rs:1119](../src/worker/forwarder.rs)), and ingress gets
-      none ([netd/http.rs:359](../src/worker/netd/http.rs)). A chain's
-      `onError` is printed by `net policy show` but never read by the
-      datapath, which treats a hop without its own as `deny`. Found by
-      reading the code. Confirm with tests, then fix (plan §8).
+- [x] **Phase 0 (bugs).** `dlp` and `log` handlers declared on a chain
+      (inline or on a policy object) passed validation and never ran:
+      `HttpSettings` only got the upstream's own handlers, ingress got none,
+      and the gated proxy's absolute-URI path ran neither. A chain's
+      `onError` was printed by `net policy show` but never read by the
+      datapath. Fixed: chain `dlp`/`log` run on HTTP-mode upstreams, HTTP
+      ingress, and absolute-URI requests through the gated proxy, and a hop
+      without its own `onError` takes its chain's. Regression tests:
+      `chain_dlp_and_log_handlers_run_on_an_http_upstream_test`,
+      `chain_dlp_and_log_run_on_absolute_uri_requests_test`,
+      `hops_inherit_the_chain_on_error_test`.
 - [ ] S1: keyed handler variants on one `Handler` trait and `HANDLERS`
       registry, one compiled pipeline on every path, stage checks at submit,
       placement in `show`/`doctor`. Removes the `log` handler (use
