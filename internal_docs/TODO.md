@@ -576,6 +576,7 @@ How to use it:
 
 | PR | What it lands | Notes |
 | --- | --- | --- |
+| [#51](https://github.com/mikenomitch/legion/pull/51) | Mesh interfaces: one handler pipeline, a smaller surface, the eBPF kernel classifier, WASM network plugins | Plan [mesh-interfaces-plan.md](plans/mesh-interfaces-plan.md); B1 end-to-end plugin overhead still open below |
 | [#162](https://github.com/mikenomitch/legion/pull/162) | Lanes hardening: worker-write forwarding, split-tolerant submits, adversarial fixes | Plan §8 + calls doc in [durability-and-ops-execution-plan.md](plans/durability-and-ops-execution-plan.md) |
 | [#143](https://github.com/mikenomitch/legion/pull/143) | Note the node-level builtin resource override gap | Docs only; the fix itself is a todo below |
 | [#84](https://github.com/mikenomitch/legion/pull/84) | Instrument DB hot paths, batch task-status updates | Old; rebase or close |
