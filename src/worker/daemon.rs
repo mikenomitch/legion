@@ -621,16 +621,6 @@ async fn run_worker_with_manager(join: WorkerJoin, name_override: Option<&str>) 
     let launch_pool = Arc::new(crate::worker::launch_pool::LaunchPool::from_config(
         &edge_boot_config,
     ));
-    let worker_node = WorkerDaemonService {
-        node_id: name.clone(),
-        task_manager: task_manager.clone(),
-        identity: Some(identity_manager.clone()),
-        edge_boot: edge_boot.clone(),
-        direct_exec: direct_exec.clone(),
-        launch_pool: launch_pool.clone(),
-        node_identity: Some(node_identity.clone()),
-    };
-    let worker_router = Server::builder().add_service(WorkerServer::new(worker_node));
 
     let mut fingerprint_data = fingerprint_node(config.additional_node_checks.clone());
     // The manager loads no storage drivers of its own, so this is its only
@@ -829,6 +819,19 @@ async fn run_worker_with_manager(join: WorkerJoin, name_override: Option<&str>) 
             .collect();
         netd.restore(&live).await;
     }
+    // Built after the datapath: a push binds a gated sandbox's egress proxy
+    // before its launch (`Netd::bind_launch`).
+    let worker_node = WorkerDaemonService {
+        node_id: name.clone(),
+        task_manager: task_manager.clone(),
+        identity: Some(identity_manager.clone()),
+        edge_boot: edge_boot.clone(),
+        direct_exec: direct_exec.clone(),
+        launch_pool: launch_pool.clone(),
+        node_identity: Some(node_identity.clone()),
+        netd: Some(netd.clone()),
+    };
+    let worker_router = Server::builder().add_service(WorkerServer::new(worker_node));
     let worker_server_fut =
         serve_worker_plane(bind, advertised, node_identity.clone(), worker_router);
     // Work arrives over `Manager.StreamWork`: one long-lived stream, its
@@ -846,6 +849,7 @@ async fn run_worker_with_manager(join: WorkerJoin, name_override: Option<&str>) 
             direct_exec: direct_exec.clone(),
             launch_pool: launch_pool.clone(),
             node_identity: Some(node_identity.clone()),
+            netd: Some(netd.clone()),
         });
         tokio::spawn(crate::worker::work_stream::run_work_stream(
             client.clone(),

@@ -154,6 +154,12 @@ pub struct WorkerDaemonService {
     /// worker an edge resume probes (`StartSession.resume_id`). `None` in
     /// tests: such a node cannot probe, so it moves only with `force_move`.
     pub node_identity: Option<Arc<crate::worker::plane::NodeIdentity>>,
+    /// The node datapath, so a gated sandbox delivered by push or the work
+    /// stream has its egress proxy bound before its launch rather than on
+    /// the next heartbeat ([`Netd::bind_launch`](crate::worker::netd::Netd::bind_launch)).
+    /// A restored guest resumes only once that socket exists. `None` in
+    /// tests that run no datapath.
+    pub netd: Option<Arc<crate::worker::netd::Netd>>,
 }
 
 impl WorkerDaemonService {
@@ -276,6 +282,16 @@ impl WorkerDaemonService {
         };
 
         let allocation_id = allocation.allocation_id;
+
+        // A gated sandbox's egress proxy, bound before the launch: a restore
+        // resumes its guest only once the socket exists, and no heartbeat
+        // has bound this delivery's datapath yet. It also wakes the
+        // heartbeat, which brings the policy, resolver, and upstream sockets.
+        if let Some(netd) = self.netd.as_ref() {
+            if netd.bind_launch(&allocation).await.is_some() {
+                crate::worker::daemon::wake_heartbeat();
+            }
+        }
 
         // Synchronous failures (bad config, unknown runtime) surface here;
         // artifact-bearing tasks stage on a background thread and report
@@ -1730,6 +1746,7 @@ mod edge_overload_test {
                 Duration::from_secs(1),
             )),
             node_identity: None,
+            netd: None,
         };
         Ok(Node {
             service,
