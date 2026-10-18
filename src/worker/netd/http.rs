@@ -39,7 +39,9 @@ use crate::structs::netpolicy::{
 use crate::structs::{UpstreamCredential, UpstreamHttpConfig, UpstreamTarget};
 use crate::worker::balance::{Balancer, Endpoint, Outcome};
 use crate::worker::forwarder::ForwarderContext;
-use crate::worker::netd::handlers::{self, HopFacts, HopOutcome, PipelineCache, ProxyTarget};
+use crate::worker::netd::handlers::{
+    self, ExchangeOutcome, HopFacts, LocalResponse, PipelineCache, ProxyTarget, RequestHead,
+};
 use crate::worker::netd::metrics as net_metrics;
 
 use bytes::Bytes;
@@ -613,7 +615,7 @@ where
     }
 }
 
-type OutBody = http_body_util::combinators::BoxBody<Bytes, hyper::Error>;
+type OutBody = handlers::HopBody;
 
 fn full(bytes: impl Into<Bytes>) -> OutBody {
     Full::new(bytes.into())
@@ -783,8 +785,8 @@ async fn handle(
         }
     }
 
-    // 1b. External handlers, with the request head: a webhook may deny, a
-    // proxy may take the request.
+    // 1b. Handlers, with the request head: a webhook may deny, a proxy may
+    // take the request, a plugin may answer or rewrite it.
     let path_only = path.split('?').next().unwrap_or("/").to_string();
     let hop_facts = HopFacts {
         allocation_id: settings.allocation_id,
@@ -795,6 +797,7 @@ async fn handle(
         ip: fact_host.parse().ok(),
         port: fact_port,
         identity: conn.identity.as_deref(),
+        upstream: (direction == "egress").then_some(settings.key.as_str()),
         method: Some(&method),
         path: Some(&path_only),
         headers: &headers,
@@ -805,11 +808,25 @@ async fn handle(
         Some(&settings.key),
         &settings.handlers,
     );
+    let mut exchange = pipeline.exchange(&settings.context, &hop_facts);
+    let mut head = RequestHead {
+        method: method.clone(),
+        path: path.clone(),
+        authority: host_header.clone().unwrap_or_else(|| destination.clone()),
+        scheme: if settings.target.as_ref().is_some_and(|t| t.tls) {
+            "https".into()
+        } else {
+            "http".into()
+        },
+        headers: headers.clone(),
+        end_of_stream: RequestHead::no_body(&headers),
+        changed: false,
+    };
     let mut hand_off: Option<ProxyTarget> = None;
-    if !pipeline.is_empty() {
-        match pipeline.run_request(&settings.context, &hop_facts).await {
-            HopOutcome::Allow => {}
-            HopOutcome::Deny { source, reason } => {
+    if !exchange.is_empty() {
+        match exchange.request(&hop_facts, &mut head).await {
+            ExchangeOutcome::Continue => {}
+            ExchangeOutcome::Deny { source, reason } => {
                 net_metrics::connection(direction, PROTOCOL_HTTP, "deny");
                 settings.context.record_denial_for(
                     settings.allocation_id,
@@ -839,6 +856,7 @@ async fn handle(
                     .await;
                 }
                 note_edge_denied(&settings);
+                exchange.answered(403);
                 return denied_response(
                     direction,
                     &settings.key,
@@ -847,7 +865,23 @@ async fn handle(
                     reason.as_deref(),
                 );
             }
-            HopOutcome::Proxy(target) => hand_off = Some(target),
+            ExchangeOutcome::Respond(local) => {
+                return answer_locally(
+                    &settings,
+                    &conn,
+                    chain,
+                    exchange,
+                    local,
+                    &destination,
+                    &method,
+                    &path,
+                    host_header.as_deref(),
+                    started,
+                    0,
+                )
+                .await;
+            }
+            ExchangeOutcome::Proxy(target) => hand_off = Some(target),
         }
     }
 
@@ -886,10 +920,13 @@ async fn handle(
     };
 
     // Split the head from the body. The body is read fully either way (one
-    // upstream connection per request, no streaming yet); the pipeline's
-    // body hops (`dlp`) cap it.
-    let (parts, body) = req.into_parts();
-    let body_bytes: Bytes = if !pipeline.reads_body() {
+    // upstream connection per request, no streaming yet); the body hops
+    // (`dlp`, a plugin's `body` stage) cap it.
+    let (mut parts, body) = req.into_parts();
+    if head.changed {
+        apply_head(&mut parts, &head);
+    }
+    let body_bytes: Bytes = if !exchange.reads_body() {
         match body.collect().await {
             Ok(collected) => collected.to_bytes(),
             Err(err) => {
@@ -901,55 +938,76 @@ async fn handle(
             }
         }
     } else {
-        match Limited::new(body, pipeline.body_cap() as usize)
+        match Limited::new(body, exchange.body_cap() as usize)
             .collect()
             .await
         {
             Ok(collected) => {
-                let bytes = collected.to_bytes();
-                if let Some((source, reason)) = pipeline.check_body(&bytes) {
-                    net_metrics::connection(direction, PROTOCOL_HTTP, "deny");
-                    settings.context.record_denial(
-                        settings.allocation_id,
-                        direction,
-                        PROTOCOL_HTTP,
-                        &destination,
-                        &source,
-                        Some(&reason),
-                        &method,
-                        &path,
-                    );
-                    if let Some(chain) = chain {
-                        access_log(
+                let mut bytes = collected.to_bytes();
+                match exchange.body(&mut bytes).await {
+                    ExchangeOutcome::Continue | ExchangeOutcome::Proxy(_) => {}
+                    ExchangeOutcome::Deny { source, reason } => {
+                        net_metrics::connection(direction, PROTOCOL_HTTP, "deny");
+                        settings.context.record_denial(
+                            settings.allocation_id,
+                            direction,
+                            PROTOCOL_HTTP,
+                            &destination,
+                            &source,
+                            reason.as_deref(),
+                            &method,
+                            &path,
+                        );
+                        if let Some(chain) = chain {
+                            access_log(
+                                &settings,
+                                chain,
+                                &method,
+                                &path,
+                                host_header.as_deref(),
+                                403,
+                                "deny",
+                                Some(&source),
+                                started,
+                                bytes.len() as u64,
+                                0,
+                            )
+                            .await;
+                        }
+                        note_edge_denied(&settings);
+                        exchange.answered(403);
+                        return denied_response(
+                            direction,
+                            &settings.key,
+                            &destination,
+                            &source,
+                            reason.as_deref(),
+                        );
+                    }
+                    ExchangeOutcome::Respond(local) => {
+                        let bytes_in = bytes.len() as u64;
+                        return answer_locally(
                             &settings,
+                            &conn,
                             chain,
+                            exchange,
+                            local,
+                            &destination,
                             &method,
                             &path,
                             host_header.as_deref(),
-                            403,
-                            "deny",
-                            Some(&source),
                             started,
-                            bytes.len() as u64,
-                            0,
+                            bytes_in,
                         )
                         .await;
                     }
-                    note_edge_denied(&settings);
-                    return denied_response(
-                        direction,
-                        &settings.key,
-                        &destination,
-                        &source,
-                        Some(&reason),
-                    );
                 }
                 bytes
             }
             Err(err) => {
                 // Over the cap, or the client went away mid-body.
-                debug!(upstream = %settings.key, error = %err, "dlp could not buffer the request body");
-                if let Some(source) = pipeline.body_unreadable_denied_by() {
+                debug!(upstream = %settings.key, error = %err, "A body hop could not buffer the request body");
+                if let Some(source) = exchange.body_unreadable_denied_by() {
                     net_metrics::connection(direction, PROTOCOL_HTTP, "deny");
                     note_edge_denied(&settings);
                     return denied_response(
@@ -957,12 +1015,12 @@ async fn handle(
                         &settings.key,
                         &destination,
                         &source,
-                        Some("request body exceeds dlp maxBytes"),
+                        Some("request body exceeds the body hop's maxBytes"),
                     );
                 }
                 return error_response(
                     StatusCode::PAYLOAD_TOO_LARGE,
-                    "request body exceeds dlp maxBytes".into(),
+                    "request body exceeds the body hop's maxBytes".into(),
                 );
             }
         }
@@ -1018,7 +1076,7 @@ async fn handle(
                     )
                     .await;
                 }
-                response
+                exchange.respond(response).await
             }
             Err(err) => {
                 settings.context.note_handler(
@@ -1230,7 +1288,7 @@ async fn handle(
                     )
                     .await;
                 }
-                return response;
+                return exchange.respond(response).await;
             }
             Err(err) => {
                 settings.note_outcome(&addr, None);
@@ -1277,6 +1335,78 @@ async fn handle(
         .await;
     }
     error_response(status, message)
+}
+
+/// A request a hop answered instead of the upstream (a plugin's local
+/// response, or the `503` of a failed plugin): recorded as a denial when it
+/// refuses, logged, and sent.
+#[allow(clippy::too_many_arguments)]
+async fn answer_locally(
+    settings: &Arc<HttpSettings>,
+    conn: &ConnInfo,
+    chain: Option<&EffectiveChain>,
+    mut exchange: handlers::Exchange,
+    local: LocalResponse,
+    destination: &str,
+    method: &str,
+    path: &str,
+    host_header: Option<&str>,
+    started: Instant,
+    bytes_in: u64,
+) -> Response<OutBody> {
+    let direction = settings.direction;
+    let verdict = if local.denies() { "deny" } else { "allow" };
+    net_metrics::connection(direction, PROTOCOL_HTTP, verdict);
+    if local.denies() {
+        settings.context.record_denial_for(
+            settings.allocation_id,
+            conn.identity.as_deref(),
+            direction,
+            PROTOCOL_HTTP,
+            destination,
+            &local.source,
+            local.reason.as_deref(),
+            method,
+            path.split('?').next().unwrap_or("/"),
+        );
+        note_edge_denied(settings);
+    } else {
+        note_edge_request(settings, None, Some(local.status), started, bytes_in);
+    }
+    if let Some(chain) = chain {
+        access_log(
+            settings,
+            chain,
+            method,
+            path,
+            host_header,
+            local.status,
+            verdict,
+            Some(&local.source),
+            started,
+            bytes_in,
+            local.body.len() as u64,
+        )
+        .await;
+    }
+    exchange.answered(local.status);
+    local.into_response()
+}
+
+/// Apply a rewritten request head (a plugin's) to the request that goes on.
+fn apply_head(parts: &mut http::request::Parts, head: &RequestHead) {
+    parts.headers.clear();
+    for (name, value) in &head.headers {
+        if let (Ok(name), Ok(value)) = (
+            hyper::header::HeaderName::from_bytes(name.as_bytes()),
+            hyper::header::HeaderValue::from_str(value),
+        ) {
+            parts.headers.append(name, value);
+        }
+    }
+    if let Ok(uri) = head.path.parse::<hyper::Uri>() {
+        parts.uri = uri;
+    }
 }
 
 /// Service-graph sample for one egress request (docs/network-handlers.md,
@@ -1590,7 +1720,11 @@ fn finish(
     for name in HOP_BY_HOP {
         parts.headers.remove(*name);
     }
-    Response::from_parts(parts, body.boxed())
+    Response::from_parts(
+        parts,
+        body.map_err(|err| Box::new(err) as handlers::BoxError)
+            .boxed(),
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2223,6 +2357,104 @@ mod integration {
         }
         assert!(text.contains("\"verdict\":\"deny\""), "{text}");
         assert!(text.contains("\"path\":\"/fine\""), "{text}");
+    }
+
+    /// A plugin on an HTTP-mode upstream, end to end: one hop rewrites the
+    /// path before the origin sees it, a second (the same module, another
+    /// config) rewrites the origin's answer; a trapping one answers `503`.
+    #[tokio::test]
+    async fn plugins_rewrite_requests_and_responses_on_an_http_upstream_test() {
+        let (origin, _hits) = start_origin(0).await;
+        let mut object: NetPolicyObject = serde_json::from_value(serde_json::json!({
+            "name": "t",
+            "enforcement": "require",
+            "egress": {
+                "protocol": "http",
+                "policy": "allow",
+                "handlers": [
+                    { "plugin": { "name": "c", "config": { "mode": "rewrite" } } },
+                    { "plugin": { "name": "c", "config": { "mode": "response" } } }
+                ]
+            }
+        }))
+        .unwrap();
+        object.normalize_and_validate().unwrap();
+        let mut trapping = object.clone();
+        trapping.name = "trap".into();
+        trapping.egress.as_mut().unwrap().handlers = vec![serde_json::from_value(
+            serde_json::json!({ "plugin": { "name": "c", "config": { "mode": "trap" } } }),
+        )
+        .unwrap()];
+        let cache = Arc::new(NetPolicyCache::new());
+        let mut assignments = Vec::new();
+        for (allocation_id, policy) in [(8, object), (9, trapping)] {
+            let policy = merge_policies(&[policy], InlinePolicy::default());
+            assignments.push(AllocNetPolicy {
+                allocation_id,
+                policy_hash: policy.hash.clone(),
+            });
+            cache.insert_body(&policy.hash.clone(), policy).unwrap();
+        }
+        cache.apply_assignments(&assignments);
+        let guard = crate::structs::host_guard::HostGuard::new(
+            &crate::structs::host_guard::HostGuardConfig {
+                allow: vec![format!("127.0.0.1:{origin}")],
+                deny: vec![],
+            },
+        )
+        .unwrap();
+        let context = Arc::new(
+            ForwarderContext::new(cache, Arc::new(Denials::new())).with_host_guard(Arc::new(guard)),
+        );
+        let mut plugin: crate::structs::netplugin::NetPluginObject =
+            serde_json::from_value(serde_json::json!({
+                "name": "c",
+                "module": { "source": "file:///unused", "checksum": format!("sha256:{}", "0".repeat(64)) },
+                "stages": ["request", "response"],
+            }))
+            .unwrap();
+        plugin.normalize_and_validate().unwrap();
+        let bytes = std::fs::read(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/netplugins/conformance.wasm"
+        ))
+        .unwrap();
+        context
+            .plugins()
+            .install_compiled(plugin, 1, &bytes)
+            .unwrap();
+        let forwarder = UpstreamForwarder::with_context(context);
+        let (ok_port, trap_port) = (free_port().await, free_port().await);
+        let spec = |allocation_id, port| UpstreamSpec {
+            allocation_id,
+            service: "origin".into(),
+            local_port: Some(port),
+            http_protocol: false,
+            balance: "round_robin".into(),
+            to: Some(format!("http://127.0.0.1:{origin}")),
+            http: None,
+            handlers: Vec::new(),
+            credentials: Vec::new(),
+            ca: None,
+            vip: None,
+            canonical_port: None,
+            attachment: crate::worker::netd::attach::Attachment::Host,
+        };
+        forwarder
+            .sync(&[spec(8, ok_port), spec(9, trap_port)])
+            .await;
+
+        let (status, head, body) =
+            request(ok_port, "GET /old/thing HTTP/1.1\r\nHost: x\r\n\r\n").await;
+        assert_eq!(status, 200, "{head}");
+        assert!(head.contains("x-plugin: seen"), "{head}");
+        // Chunked: the plugin may change the length, so it is not declared.
+        assert!(body.contains("GET /NEW/THING HOST="), "{body}");
+
+        let (status, head, body) = request(trap_port, "GET / HTTP/1.1\r\nHost: x\r\n\r\n").await;
+        assert_eq!(status, 503, "{head}");
+        assert!(head.contains("legion-denied-by: policy/trap#0"), "{head}");
+        assert!(body.contains("plugin c trapped"), "{body}");
     }
 
     /// Credential injection: the node sets each declared header from the

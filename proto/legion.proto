@@ -1792,6 +1792,44 @@ service Manager {
   // reported as `defer`. ACL: `net:read` on the job.
   rpc TestNetPolicy (TestNetPolicyRequest) returns (TestNetPolicyReply);
 
+  // Creates or replaces a network plugin object: a WASM module on the
+  // proxy-wasm ABI that runs inside the node datapath as one more handler
+  // (docs/network-plugins.md). The object names the module (a `.wasm` URL
+  // pinned by `sha256:` checksum), the stages it acts at, who may reference
+  // it (`usableBy`), the node pools it may run on, its limits, the JSON
+  // Schema every reference's `config` must satisfy, the HTTP targets it may
+  // call, and the KV-held keys it may sign with. Validated on write; a
+  // plugin that a stored policy references must keep stages that policy can
+  // run and a schema its config still satisfies, or the write is refused.
+  // Nodes running the plugin pick up the new revision on their next
+  // heartbeat and fetch the module once per node.
+  //
+  // ACL: `net:write`. A `usableBy = "policies"` plugin with `nodePools`
+  // needs it on each pool; one without pools, and every `usableBy = "jobs"`
+  // plugin, needs it unscoped (cluster-wide). Naming a `credentials` KV path
+  // also needs `kv:read` on that path.
+  rpc UpsertNetPlugin (UpsertNetPluginRequest) returns (UpsertNetPluginReply);
+
+  // Fetches one stored plugin object by name, with the policy objects that
+  // reference it. ACL: `net:read`.
+  rpc GetNetPlugin (GetNetPluginRequest) returns (GetNetPluginReply);
+
+  // Lists stored plugin objects by name. ACL: `net:read`.
+  rpc ListNetPlugins (ListNetPluginsRequest) returns (ListNetPluginsReply);
+
+  // Deletes a stored plugin object. Refused while a stored policy object
+  // references it (the error names them). A job that references it keeps
+  // running; its plugin hops fail with "plugin not found" and follow their
+  // `onError` from the next heartbeat. ACL: `net:write`, as for
+  // UpsertNetPlugin.
+  rpc DeleteNetPlugin (DeleteNetPluginRequest) returns (DeleteNetPluginReply);
+
+  // Where a plugin runs and how it is doing, as each node last reported it
+  // on its heartbeat: the revision and module the node holds, whether the
+  // module is fetched and instantiated, calls, errors, the last error, and
+  // the p99 callback time. ACL: `net:read`.
+  rpc GetNetPluginStatus (GetNetPluginStatusRequest) returns (GetNetPluginStatusReply);
+
   // The cluster CA as the answering manager sees it — what an operator
   // hands a non-Legion client that must reach a mesh-TLS port or the worker
   // plane (`legion sandbox start --node`, `legion exec --direct`), or
@@ -5901,6 +5939,13 @@ message HeartbeatRequest {
   //
   // Default: empty list. Fixed envelopes never send one.
   repeated EnvelopeResize envelope_resizes = 20;
+
+  // The node datapath's network plugins (docs/network-plugins.md): one
+  // entry per plugin a local allocation references, with its revision,
+  // module state, and health. Replaced wholesale per node on every beat and
+  // kept in memory by the manager for GetNetPluginStatus and
+  // `legion net doctor`. Empty on a node that runs no plugin.
+  repeated NetPluginNodeStatus net_plugins = 21;
 }
 
 // One envelope resize a node asks for. See
@@ -12204,6 +12249,154 @@ message DeleteNetPolicyRequest {
 // Reply payload for DeleteNetPolicy.
 message DeleteNetPolicyReply {}
 
+// A stored network plugin object (docs/network-plugins.md).
+message NetPlugin {
+  // Unique name; what a `{ plugin = { name = ... } }` hop references.
+  string name = 1;
+
+  // The normalized `NetPluginObject` as JSON: `module`, `stages`,
+  // `usableBy`, `nodePools`, `limits`, `configSchema`, `targets`, and
+  // `credentials` (KV paths only, never values).
+  string object_json = 2;
+
+  // The cluster-wide plugin generation this version was written at. A
+  // revision names one version of one plugin forever, even across a delete
+  // and a re-create; nodes report the revision they run.
+  uint64 revision = 3;
+
+  // RFC 3339 timestamps of the first write and of this version.
+  string created_at = 4;
+  string updated_at = 5;
+
+  // The stages the module acts at, in pipeline order: `connect`,
+  // `request`, `body`, `response`, `done`.
+  repeated string stages = 6;
+
+  // `policies` or `jobs`.
+  string usable_by = 7;
+
+  // The module's `sha256:` checksum.
+  string module_checksum = 8;
+
+  // Stored policy objects whose chains reference this plugin. Filled by
+  // GetNetPlugin and GetNetPluginStatus; empty in list replies.
+  repeated string referenced_by = 9;
+}
+
+// Request payload for UpsertNetPlugin.
+message UpsertNetPluginRequest {
+  // A `NetPluginObject` as JSON, exactly as `legion net plugin apply -f`
+  // reads it (Nickel evaluated to JSON). Validated on write.
+  string object_json = 1;
+
+  // When set, validate (including every referencing policy's config against
+  // the new schema) and report what would be stored, but write nothing.
+  bool dry_run = 2;
+
+  // Optional: retries with the same key (from the same caller) return the
+  // first call's stored plugin with `deduplicated = true` instead of writing
+  // a new revision. Ignored on dry runs.
+  optional string idempotency_key = 3;
+}
+
+// Reply payload for UpsertNetPlugin.
+message UpsertNetPluginReply {
+  // The stored (normalized) plugin. On a dry run, what would be stored,
+  // with `revision` 0.
+  NetPlugin plugin = 1;
+
+  // True when `idempotency_key` matched an earlier call; nothing was
+  // written and `plugin` is that call's result as currently stored.
+  bool deduplicated = 2;
+}
+
+// Request payload for GetNetPlugin.
+message GetNetPluginRequest {
+  string name = 1;
+}
+
+// Reply payload for GetNetPlugin.
+message GetNetPluginReply {
+  NetPlugin plugin = 1;
+}
+
+// Request payload for ListNetPlugins.
+message ListNetPluginsRequest {}
+
+// Reply payload for ListNetPlugins.
+message ListNetPluginsReply {
+  repeated NetPlugin plugins = 1;
+
+  // Monotonic generation of the plugin set; changes on every write.
+  uint64 generation = 2;
+}
+
+// Request payload for DeleteNetPlugin.
+message DeleteNetPluginRequest {
+  string name = 1;
+}
+
+// Reply payload for DeleteNetPlugin.
+message DeleteNetPluginReply {}
+
+// Request payload for GetNetPluginStatus.
+message GetNetPluginStatusRequest {
+  string name = 1;
+}
+
+// Reply payload for GetNetPluginStatus.
+message GetNetPluginStatusReply {
+  // The stored object, with `referenced_by` filled.
+  NetPlugin plugin = 1;
+
+  // One entry per node that holds the plugin, from its last heartbeat. A
+  // plugin no running allocation uses is on no node.
+  repeated NetPluginNodeStatus nodes = 2;
+}
+
+// One node's view of one plugin, reported on every heartbeat
+// (`HeartbeatRequest.net_plugins`) and read back by GetNetPluginStatus,
+// `legion net plugin status`, and `legion net doctor`.
+message NetPluginNodeStatus {
+  // The reporting node. Empty on the heartbeat (the node is the caller);
+  // filled by the manager in GetNetPluginStatus.
+  string node_id = 1;
+
+  // The plugin's name.
+  string plugin = 2;
+
+  // The revision the node holds; 0 before the object reached it.
+  uint64 revision = 3;
+
+  // The module checksum the node runs (`sha256:<hex>`).
+  string module_checksum = 4;
+
+  // `fetching` (the object arrived, the module is being fetched or
+  // compiled), `ready`, or `failed` (see `error`).
+  string state = 5;
+
+  // Why the module is not ready: the fetch, checksum, compile, or
+  // instantiation error. A hop whose plugin is not ready fails with this
+  // reason and follows its `onError`.
+  string error = 6;
+
+  // Callbacks run and callbacks that failed (trap, fuel or deadline
+  // exhausted, memory limit) since the worker started.
+  uint64 calls = 7;
+  uint64 errors = 8;
+
+  // The last callback failure, if any.
+  string last_error = 9;
+
+  // 99th percentile callback time over the last 1024 callbacks, in
+  // microseconds.
+  uint64 p99_micros = 10;
+
+  // Live module instances on the node: one per (scope, config) the plugin
+  // runs under, times the instances its concurrency needed.
+  uint64 instances = 11;
+}
+
 // Request payload for ShowNetPolicy.
 message ShowNetPolicyRequest {
   // Job id.
@@ -12470,7 +12663,7 @@ message NetHandlerStatus {
   // `upstream/<key>#<index>`.
   string source = 1;
 
-  // `authz` or `proxy`.
+  // The handler kind: `authz`, `proxy`, `dlp`, or `plugin`.
   string handler = 2;
 
   // The webhook URL, or the resolved proxy target (`service`, `node`, or

@@ -123,6 +123,12 @@ sha2 = "0.10.8"
 # for wrapping data keys, HKDF for the raft-join root key bundle. `ring` is
 # already in the tree via jsonwebtoken/rustls/rcgen — no new crate.
 ring = "0.17"
+# Network plugins (docs/network-plugins.md): an interpreter keeps the
+# shipping binary small; fuel bounds every callback.
+wasmi = { version = "=2.0.0", default-features = false, features = ["std", "stable", "validate", "auto-dispatch", "wat"] }
+# Only to name `LimiterError` in the plugin memory cap; wasmi does not
+# re-export it.
+wasmi_core = { version = "=2.0.0", default-features = false, features = ["std"] }
 # Key material is wiped from memory when dropped.
 zeroize = "1"
 tabled = "0.16.0"

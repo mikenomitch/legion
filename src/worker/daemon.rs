@@ -792,6 +792,11 @@ async fn run_worker_with_manager(join: WorkerJoin, name_override: Option<&str>) 
         )
         .with_logs_base_dir(logs_base_dir.clone())
         .with_host_guard(host_guard.clone())
+        // Network plugin modules come through the artifact stager into the
+        // node content store (docs/network-plugins.md).
+        .with_plugin_loader(Arc::new(crate::worker::netd::plugins::StagerLoader(
+            task_manager.lock().expect("task manager").stager_handle(),
+        )))
         .with_kernel(
             (kernel_guard == crate::worker::netd::kernel_guard::Availability::Active).then(|| {
                 kernel_guard_base(
@@ -2323,11 +2328,13 @@ async fn heartbeat_tick(
             denials: net_denials,
             edges: net_edges,
             statuses: mut net_status,
+            plugins: net_plugins,
         } = netd.report();
         let net_redrive = NetdReport {
             denials: net_denials.clone(),
             edges: net_edges.clone(),
             statuses: Vec::new(),
+            plugins: Vec::new(),
         };
         // Config-file templates render from the same feed; a template that
         // cannot render is the allocation's network problem too.
@@ -2528,6 +2535,7 @@ async fn heartbeat_tick(
             net_denials,
             net_status,
             net_edges,
+            net_plugins,
             id: name.to_string(),
             provisional_claims,
             allocation_ids: allocations,

@@ -34,6 +34,13 @@ pub const MATERIAL_CLIENT_CA: &str = "client_ca";
 pub const MATERIAL_UPSTREAM_CA: &str = "upstream_ca";
 /// `MaterialRef.kind`: one injected header value of an upstream credential.
 pub const MATERIAL_CREDENTIAL: &str = "credential";
+/// `MaterialRef.kind`: a network plugin object by name, versioned by its
+/// revision; the value is the object's JSON (module URL and checksum,
+/// stages, limits).
+pub const MATERIAL_PLUGIN: &str = "plugin";
+/// `MaterialRef.kind`: one of a plugin's signing keys; `key` is the plugin,
+/// `part` the credential name. Held by netd, never handed to the module.
+pub const MATERIAL_PLUGIN_CREDENTIAL: &str = "plugin_credential";
 
 /// Where one value comes from. Exactly one key.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Hash)]

@@ -172,6 +172,9 @@ const TABLE_OWNERS: &[(&str, Owner)] = &[
     // bumped inside the same replicated write.
     ("net_policy", Owner::Lane(Lane::Control)),
     ("net_policy_meta", Owner::Lane(Lane::Control)),
+    // Network plugin objects (docs/network-plugins.md): like policy objects.
+    ("net_plugin", Owner::Lane(Lane::Control)),
+    ("net_plugin_meta", Owner::Lane(Lane::Control)),
     ("net_mesh_ca", Owner::Lane(Lane::Control)),
     // The leader's view of the cluster CA (docs/cluster-ca.md): written
     // when the control-lane leader's provider reports a new CA.

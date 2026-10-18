@@ -17,6 +17,7 @@ use crate::worker::netd::attach::{guest_socket, Attachment};
 use crate::worker::netd::dns::DnsSpec;
 use crate::worker::netd::ingress::IngressSpec;
 use crate::worker::netd::proxy::ProxySpec;
+use std::collections::HashSet;
 
 use std::path::Path;
 
@@ -264,6 +265,30 @@ pub fn declared_credentials(desired: &[TaskAllocation]) -> Vec<CredentialKey> {
         }
     }
     keys
+}
+
+/// Every network plugin the desired set references: from each allocation's
+/// effective policy (policy objects and its own inline chains) and its
+/// upstreams' own handlers.
+pub fn referenced_plugins(
+    desired: &[TaskAllocation],
+    context: &crate::worker::forwarder::ForwarderContext,
+) -> HashSet<String> {
+    let mut names = HashSet::new();
+    for allocation in desired {
+        if let Some(policy) = context.policy_for(allocation.allocation_id) {
+            names.extend(crate::structs::netplugin::policy_plugin_names(&policy));
+        }
+        if allocation.task_connect.trim().is_empty() {
+            continue;
+        }
+        if let Ok(connect) =
+            serde_json::from_str::<crate::structs::ConnectConfig>(&allocation.task_connect)
+        {
+            names.extend(crate::structs::netplugin::connect_plugin_names(&connect));
+        }
+    }
+    names
 }
 
 /// The KV-held TLS material the desired set declares: each port's

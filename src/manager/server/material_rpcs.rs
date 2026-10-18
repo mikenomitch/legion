@@ -18,8 +18,8 @@
 use super::*;
 use crate::structs::netpolicy::EffectivePolicy;
 use crate::structs::source::{
-    Source, SourceKind, MATERIAL_CLIENT_CA, MATERIAL_CREDENTIAL, MATERIAL_POLICY,
-    MATERIAL_PORT_CERT, MATERIAL_UPSTREAM_CA,
+    Source, SourceKind, MATERIAL_CLIENT_CA, MATERIAL_CREDENTIAL, MATERIAL_PLUGIN,
+    MATERIAL_PLUGIN_CREDENTIAL, MATERIAL_POLICY, MATERIAL_PORT_CERT, MATERIAL_UPSTREAM_CA,
 };
 use crate::structs::{
     FetchDatapathMaterialReply, FetchDatapathMaterialRequest, Material, MaterialRef, TaskAllocation,
@@ -59,8 +59,12 @@ pub(crate) trait MaterialProvider: Sync {
 
 /// Every provider. A `Source` kind the node fetches (not `file`) must have
 /// one here; `providers_cover_every_fetched_source_test` checks it.
-pub(crate) const PROVIDERS: &[&dyn MaterialProvider] =
-    &[&KvProvider, &IdentityProvider, &PolicyProvider];
+pub(crate) const PROVIDERS: &[&dyn MaterialProvider] = &[
+    &KvProvider,
+    &IdentityProvider,
+    &PolicyProvider,
+    &PluginProvider,
+];
 
 pub(crate) fn provider(name: &str) -> Option<&'static dyn MaterialProvider> {
     PROVIDERS.iter().copied().find(|p| p.name() == name)
@@ -138,6 +142,35 @@ impl MaterialProvider for PolicyProvider {
     }
 }
 
+/// `plugin`: a network plugin object by name, as JSON, versioned by its
+/// revision.
+pub(crate) struct PluginProvider;
+
+impl MaterialProvider for PluginProvider {
+    fn name(&self) -> &'static str {
+        "plugin"
+    }
+
+    fn read(&self, service: &ManagerDaemonService, input: &ProviderInput<'_>) -> ProviderRead {
+        match service.store.get_net_plugin(input.name) {
+            Ok(Some(record)) if record.revision as i64 == input.have_version => {
+                ProviderRead::Unchanged {
+                    version: record.revision as i64,
+                }
+            }
+            Ok(Some(record)) => ProviderRead::Value {
+                value: serde_json::to_string(&record.object).unwrap_or_default(),
+                version: record.revision as i64,
+            },
+            Ok(None) => ProviderRead::Absent(format!("no net plugin named {}", input.name)),
+            Err(err) => {
+                warn!(plugin = %input.name, error = ?err, "Failed reading a net plugin for a node");
+                ProviderRead::Failed(format!("net plugin {} could not be read", input.name))
+            }
+        }
+    }
+}
+
 /// How a resolved value is checked before it goes on the wire.
 #[derive(Clone, Copy)]
 enum ValueCheck {
@@ -191,6 +224,11 @@ struct NodeView<'a> {
 struct NodeDeclarations {
     connects: HashMap<i64, crate::structs::ConnectConfig>,
     networks: HashMap<i64, crate::structs::AllocNetwork>,
+    /// Plugins the node's allocations reference, from their effective
+    /// policies and their upstreams' own handlers.
+    plugins: HashSet<String>,
+    /// The node's pool, for a plugin's `nodePools`.
+    pool: String,
 }
 
 impl NodeView<'_> {
@@ -213,7 +251,12 @@ impl NodeView<'_> {
     fn declare(&self, desired: &[TaskAllocation]) -> NodeDeclarations {
         // The same merge the heartbeat ran; it leaves each body in the cache
         // for a policy ref that missed it.
-        let _ = self.service.build_net_policies(self.node_id, desired);
+        let policies = self.service.build_net_policies(self.node_id, desired);
+        let mut plugins: HashSet<String> = policies
+            .iter()
+            .filter_map(|assigned| self.service.cached_policy(&assigned.policy_hash))
+            .flat_map(|policy| crate::structs::netplugin::policy_plugin_names(&policy))
+            .collect();
         let networks = desired
             .iter()
             .filter(|allocation| !allocation.network.trim().is_empty())
@@ -223,7 +266,7 @@ impl NodeView<'_> {
                     .map(|network| (allocation.allocation_id, network))
             })
             .collect();
-        let connects = desired
+        let connects: HashMap<i64, crate::structs::ConnectConfig> = desired
             .iter()
             .filter(|allocation| !allocation.task_connect.trim().is_empty())
             .filter_map(|allocation| {
@@ -232,7 +275,23 @@ impl NodeView<'_> {
                     .map(|connect| (allocation.allocation_id, connect))
             })
             .collect();
-        NodeDeclarations { connects, networks }
+        plugins.extend(
+            connects
+                .values()
+                .flat_map(crate::structs::netplugin::connect_plugin_names),
+        );
+        let pool = self
+            .service
+            .store
+            .get_node(self.node_id)
+            .map(|node| node.pool)
+            .unwrap_or_default();
+        NodeDeclarations {
+            connects,
+            networks,
+            plugins,
+            pool,
+        }
     }
 }
 
@@ -297,6 +356,10 @@ impl ManagerDaemonService {
             Declared::Policy(hash) => {
                 out.source = format!("policy {hash}");
                 ("policy", hash.clone(), ValueCheck::Raw)
+            }
+            Declared::Plugin(name) => {
+                out.source = format!("net plugin {name}");
+                ("plugin", name.clone(), ValueCheck::Raw)
             }
             Declared::Source(source, check) => {
                 out.source = source.to_string();
@@ -441,10 +504,59 @@ impl ManagerDaemonService {
                     ValueCheck::HeaderValue,
                 ))
             }
+            MATERIAL_PLUGIN | MATERIAL_PLUGIN_CREDENTIAL => {
+                let name = wanted.key.trim();
+                let declarations = view.declarations().map_err(|error| Undeclared {
+                    error,
+                    absent: false,
+                })?;
+                if !declarations.plugins.contains(name) {
+                    return Err(Undeclared::absent(format!(
+                        "no allocation on this node references net plugin {name}"
+                    )));
+                }
+                let pool = declarations.pool.clone();
+                let record = match self.store.get_net_plugin(name) {
+                    Ok(Some(record)) => record,
+                    Ok(None) => {
+                        return Err(Undeclared::absent(format!("no net plugin named {name}")))
+                    }
+                    Err(err) => {
+                        warn!(plugin = %name, error = ?err, "Failed reading a net plugin for a node");
+                        return Err(Undeclared {
+                            error: format!("net plugin {name} could not be read"),
+                            absent: false,
+                        });
+                    }
+                };
+                if !record.object.runs_on_pool(&pool) {
+                    return Err(Undeclared::absent(format!(
+                        "net plugin {name} runs only on node pools {}; this node is in pool \
+                         {pool:?}",
+                        record.object.node_pools.join(", ")
+                    )));
+                }
+                if wanted.kind == MATERIAL_PLUGIN {
+                    return Ok(Declared::Plugin(name.to_string()));
+                }
+                let credential = wanted.part.trim();
+                let source = record
+                    .object
+                    .credentials
+                    .get(credential)
+                    .cloned()
+                    .filter(Source::is_fetched)
+                    .ok_or_else(|| {
+                        Undeclared::absent(format!(
+                            "net plugin {name} declares no credential {credential:?}"
+                        ))
+                    })?;
+                Ok(Declared::Source(source, ValueCheck::Raw))
+            }
             other => Err(Undeclared {
                 error: format!(
                     "unknown material kind {other:?} (this manager serves policy, port_cert, \
-                     client_ca, upstream_ca, credential)"
+                     client_ca, upstream_ca, credential, plugin, plugin_credential)"
                 ),
                 absent: false,
             }),
@@ -569,6 +681,7 @@ impl ManagerDaemonService {
 /// What a ref's declaration names.
 enum Declared {
     Policy(String),
+    Plugin(String),
     Source(Source, ValueCheck),
 }
 

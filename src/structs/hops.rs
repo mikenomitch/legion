@@ -7,6 +7,7 @@
 //! { authz = { url = "http://policy.internal/check", cache = "30s" }, onError = "deny" }
 //! { proxy = { service = "egress-filter", local = true } }
 //! { dlp = { patterns = ["sk-[A-Za-z0-9]{16,}"], maxBytes = "1Mi" } }
+//! { plugin = { name = "llm-token-meter", config = { budget = 100000 } } }
 //! ```
 //!
 //! [`HANDLERS`] is the only list of handler kinds. Validation, the datapath
@@ -138,6 +139,21 @@ pub const HANDLERS: &[HandlerEntry] = &[
         placement: Placement::Netd,
         summary: "reject request bodies that match a pattern",
     },
+    // A plugin's own stages are on its object (`NetPluginObject.stages`) and
+    // are checked against the path when the referencing policy or job is
+    // submitted; the row lists every stage a plugin may declare.
+    HandlerEntry {
+        name: "plugin",
+        stages: &[
+            Stage::Connect,
+            Stage::Request,
+            Stage::Body,
+            Stage::Response,
+            Stage::Done,
+        ],
+        placement: Placement::NetdWasm,
+        summary: "run a WASM plugin object (proxy-wasm ABI) at the stages it declares",
+    },
 ];
 
 /// The registry row for a kind name.
@@ -199,6 +215,7 @@ pub enum HandlerKind {
     Authz(AuthzConfig),
     Proxy(ProxyConfig),
     Dlp(DlpConfig),
+    Plugin(crate::structs::netplugin::PluginConfig),
 }
 
 impl HandlerKind {
@@ -207,6 +224,7 @@ impl HandlerKind {
             HandlerKind::Authz(_) => "authz",
             HandlerKind::Proxy(_) => "proxy",
             HandlerKind::Dlp(_) => "dlp",
+            HandlerKind::Plugin(_) => "plugin",
         }
     }
 
@@ -234,6 +252,7 @@ impl HandlerKind {
                 (None, None) => String::new(),
             },
             HandlerKind::Dlp(dlp) => format!("{} pattern(s)", dlp.patterns.len()),
+            HandlerKind::Plugin(plugin) => format!("plugin {}", plugin.name),
         }
     }
 
@@ -242,6 +261,7 @@ impl HandlerKind {
             HandlerKind::Authz(config) => serde_json::to_value(config),
             HandlerKind::Proxy(config) => serde_json::to_value(config),
             HandlerKind::Dlp(config) => serde_json::to_value(config),
+            HandlerKind::Plugin(config) => serde_json::to_value(config),
         };
         value.unwrap_or(Value::Null)
     }
@@ -257,6 +277,9 @@ impl HandlerKind {
                 .map_err(typed),
             "dlp" => serde_json::from_value(value)
                 .map(HandlerKind::Dlp)
+                .map_err(typed),
+            "plugin" => serde_json::from_value(value)
+                .map(HandlerKind::Plugin)
                 .map_err(typed),
             other => Err(format!(
                 "unknown handler kind '{other}'; handler kinds are {}",
@@ -432,6 +455,14 @@ impl HopConfig {
                         .map_err(|err| anyhow!("{what}.patterns '{pattern}': {err}"))?;
                 }
             }
+            // The object's stages, schema, and `usableBy` are checked by the
+            // manager, which holds the object (`check_plugin_reference`).
+            HandlerKind::Plugin(plugin) => {
+                plugin.name = plugin.name.trim().to_string();
+                if plugin.name.is_empty() {
+                    bail!("{what}: plugin needs name = \"<a net plugin object>\"");
+                }
+            }
         }
         if let Some(timeout) = self.timeout.as_deref() {
             parse_duration(timeout).map_err(|err| anyhow!("{what}.timeout: {err}"))?;
@@ -518,6 +549,7 @@ mod tests {
             json!({ "authz": { "url": "http://x" } }),
             json!({ "proxy": { "service": "x" } }),
             json!({ "dlp": { "patterns": ["x"] } }),
+            json!({ "plugin": { "name": "x" } }),
         ];
         let parsed: Vec<&'static str> = samples
             .iter()

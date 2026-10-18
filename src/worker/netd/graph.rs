@@ -88,13 +88,7 @@ impl EdgeLedger {
 
     /// `count` L4 dials at once (the kernel classifier's counters, read once
     /// per heartbeat).
-    pub fn record_connections(
-        &self,
-        allocation_id: i64,
-        service: &str,
-        ok: bool,
-        count: u64,
-    ) {
+    pub fn record_connections(&self, allocation_id: i64, service: &str, ok: bool, count: u64) {
         self.with(allocation_id, service, None, "tcp", |c| {
             if ok {
                 c.requests += count;

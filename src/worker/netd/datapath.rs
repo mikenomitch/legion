@@ -23,8 +23,8 @@
 use crate::prelude::*;
 use crate::structs::netpolicy::EffectivePolicy;
 use crate::structs::source::{
-    MATERIAL_CLIENT_CA, MATERIAL_CREDENTIAL, MATERIAL_POLICY, MATERIAL_PORT_CERT,
-    MATERIAL_UPSTREAM_CA,
+    MATERIAL_CLIENT_CA, MATERIAL_CREDENTIAL, MATERIAL_PLUGIN, MATERIAL_PLUGIN_CREDENTIAL,
+    MATERIAL_POLICY, MATERIAL_PORT_CERT, MATERIAL_UPSTREAM_CA,
 };
 use crate::structs::{
     AllocNetPolicy, Material, MaterialRef, NetAllocStatus, NetDenial, NetEdgeSample,
@@ -105,6 +105,8 @@ pub struct NetdReport {
     /// Status of every allocation in the last desired set the datapath was
     /// told about.
     pub statuses: Vec<NetAllocStatus>,
+    /// Every network plugin the node holds, with its module state and health.
+    pub plugins: Vec<crate::structs::NetPluginNodeStatus>,
 }
 
 /// The node datapath behind its boundary.
@@ -209,6 +211,30 @@ impl Netd {
                 part: header,
             },
         ));
+        // Plugins: every one a local allocation references, with the
+        // revision held, then the signing keys the held ones declare. A
+        // plugin nothing references any more is dropped here.
+        let plugins = context.plugins();
+        let mut referenced: Vec<String> = specs::referenced_plugins(desired, context)
+            .into_iter()
+            .collect();
+        referenced.sort();
+        plugins.retain(&referenced.iter().cloned().collect());
+        material.extend(referenced.into_iter().map(|name| MaterialRef {
+            kind: MATERIAL_PLUGIN.into(),
+            version: plugins.held_revision(&name),
+            key: name,
+            ..Default::default()
+        }));
+        material.extend(plugins.wanted_credentials().into_iter().map(
+            |(plugin, credential, version)| MaterialRef {
+                kind: MATERIAL_PLUGIN_CREDENTIAL.into(),
+                version,
+                key: plugin,
+                part: credential,
+                ..Default::default()
+            },
+        ));
         NetdWants { material }
     }
 
@@ -223,6 +249,10 @@ impl Netd {
                 .unwrap_or_default(),
             edges: context.edges().drain(),
             statuses: self.statuses(),
+            plugins: {
+                context.plugins().export_metrics();
+                context.plugins().report()
+            },
         }
     }
 
@@ -542,7 +572,52 @@ impl Netd {
                     self.apply_tls_material(MATERIAL_UPSTREAM_CA, wanted, material)
                 }
                 MATERIAL_CREDENTIAL => self.apply_upstream_credential(wanted, material),
+                MATERIAL_PLUGIN => self.apply_plugin(wanted, material),
+                MATERIAL_PLUGIN_CREDENTIAL => {
+                    let plugins = context.plugins();
+                    if material.absent {
+                        plugins.drop_credential(&wanted.key, &wanted.part);
+                    } else if !material.error.is_empty() {
+                        warn!(plugin = %wanted.key, credential = %wanted.part, source = %material.source, error = %material.error, "Failed to fetch a net plugin credential; keeping the last value");
+                    } else if !material.unchanged {
+                        plugins.set_credential(
+                            &wanted.key,
+                            &wanted.part,
+                            material.version,
+                            material.value,
+                        );
+                    }
+                }
                 other => debug!(kind = %other, "Ignoring material of an unknown kind"),
+            }
+        }
+    }
+
+    /// Hold a plugin object at the revision the manager sent; its module
+    /// loads in the background. An absent one is dropped (its hops fail with
+    /// "not on this node" and follow `onError`).
+    fn apply_plugin(&self, wanted: MaterialRef, material: Material) {
+        let plugins = self.forwarder.context().plugins().clone();
+        if material.absent {
+            debug!(plugin = %wanted.key, error = %material.error, "Net plugin is gone");
+            plugins.remove(&wanted.key);
+            return;
+        }
+        if !material.error.is_empty() {
+            warn!(plugin = %wanted.key, error = %material.error, "Failed to fetch a net plugin; keeping the last revision");
+            return;
+        }
+        if material.unchanged {
+            // Same revision: a failed load retries after its back-off.
+            if let Some(entry) = plugins.entry(&wanted.key) {
+                plugins.apply(entry.object.clone(), entry.revision);
+            }
+            return;
+        }
+        match serde_json::from_str::<crate::structs::netplugin::NetPluginObject>(&material.value) {
+            Ok(object) => plugins.apply(object, material.version.max(0) as u64),
+            Err(err) => {
+                warn!(plugin = %wanted.key, error = ?err, "Invalid net plugin object from manager")
             }
         }
     }

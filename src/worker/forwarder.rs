@@ -289,6 +289,8 @@ pub struct ForwarderContext {
     /// `authz` verdicts: key → (allowed, reason, expires).
     authz_cache: Mutex<AuthzCache>,
     http_client: OnceLock<reqwest::Client>,
+    /// The node's network plugins (docs/network-plugins.md).
+    plugins: Arc<crate::worker::netd::plugins::PluginHost>,
     /// The node's mesh credential and the client config built from it.
     mesh: RwLock<Option<(Arc<MeshIdentity>, Arc<rustls::ClientConfig>)>>,
     /// Whether anything on this node needs a mesh certificate.
@@ -414,6 +416,7 @@ impl ForwarderContext {
             handler_pick: AtomicUsize::new(0),
             authz_cache: Mutex::new(HashMap::new()),
             http_client: OnceLock::new(),
+            plugins: Arc::new(crate::worker::netd::plugins::PluginHost::default()),
             mesh: RwLock::new(None),
             mesh_wanted: AtomicBool::new(false),
             ingress_tls: Mutex::new(HashMap::new()),
@@ -923,6 +926,21 @@ impl ForwarderContext {
     /// Same, after construction (the first heartbeat knows the id).
     pub fn set_node_id(&self, node_id: &str) {
         let _ = self.node_id.set(node_id.to_string());
+        self.plugins.set_node_id(node_id);
+    }
+
+    /// The node's network plugins.
+    pub fn plugins(&self) -> &Arc<crate::worker::netd::plugins::PluginHost> {
+        &self.plugins
+    }
+
+    /// Fetch plugin modules with `loader` (the worker's artifact stager).
+    pub fn with_plugin_loader(
+        mut self,
+        loader: Arc<dyn crate::worker::netd::plugins::ModuleLoader>,
+    ) -> Self {
+        self.plugins = Arc::new(crate::worker::netd::plugins::PluginHost::new(Some(loader)));
+        self
     }
 
     pub fn node_id(&self) -> Option<String> {

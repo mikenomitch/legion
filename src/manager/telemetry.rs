@@ -2172,6 +2172,15 @@ pub struct WorkerMetrics {
     pub net_handler_total: Arc<CounterVec>,
     /// `legion_net_handler_seconds` — wall-clock of one `authz` webhook call.
     pub net_handler_seconds: Arc<Histogram>,
+    /// `legion_net_plugin_calls_total{plugin,stage,outcome}` — WASM plugin
+    /// callbacks (docs/network-plugins.md) by outcome (ok|error).
+    pub net_plugin_calls_total: Arc<CounterVec>,
+    /// `legion_net_plugin_callback_seconds` — wall-clock of one plugin
+    /// callback.
+    pub net_plugin_callback_seconds: Arc<Histogram>,
+    /// `legion_net_plugin_metric{plugin,scope,name}` — the current value of
+    /// each metric a plugin module defines (`define_metric`), per scope.
+    pub net_plugin_metric: Arc<GaugeVec>,
     /// `legion_task_start_stage_seconds{runtime,stage}` — wall-clock of each
     /// stage of a task start on this node (`crate::worker::start_timing`).
     pub task_start_stage_seconds: Arc<HistogramVec>,
@@ -2412,6 +2421,30 @@ impl WorkerMetrics {
             },
             cell: HistogramCell::new(DURATION_BUCKETS),
         });
+        let net_plugin_calls_total = Arc::new(CounterVec {
+            meta: FamilyMeta {
+                name: "legion_net_plugin_calls_total",
+                help: "WASM network plugin callbacks by plugin, stage (connect|request|body|response|done), and outcome (ok|error).",
+                labels: &["plugin", "stage", "outcome"],
+            },
+            series: Series::new(),
+        });
+        let net_plugin_callback_seconds = Arc::new(Histogram {
+            meta: FamilyMeta {
+                name: "legion_net_plugin_callback_seconds",
+                help: "Wall-clock of one WASM network plugin callback.",
+                labels: &[],
+            },
+            cell: HistogramCell::new(DURATION_BUCKETS),
+        });
+        let net_plugin_metric = Arc::new(GaugeVec {
+            meta: FamilyMeta {
+                name: "legion_net_plugin_metric",
+                help: "Current value of each metric a WASM network plugin defines, by plugin, scope (policy or job:<id>), and metric name.",
+                labels: &["plugin", "scope", "name"],
+            },
+            series: Series::new(),
+        });
         let task_start_stage_seconds = Arc::new(HistogramVec {
             meta: FamilyMeta {
                 name: "legion_task_start_stage_seconds",
@@ -2430,6 +2463,9 @@ impl WorkerMetrics {
             Arc::clone(&net_denied_total) as Arc<dyn RenderMetric>,
             Arc::clone(&net_handler_total) as Arc<dyn RenderMetric>,
             Arc::clone(&net_handler_seconds) as Arc<dyn RenderMetric>,
+            Arc::clone(&net_plugin_calls_total) as Arc<dyn RenderMetric>,
+            Arc::clone(&net_plugin_callback_seconds) as Arc<dyn RenderMetric>,
+            Arc::clone(&net_plugin_metric) as Arc<dyn RenderMetric>,
             Arc::clone(&heartbeat_duration_seconds) as Arc<dyn RenderMetric>,
             Arc::clone(&heartbeats_total) as Arc<dyn RenderMetric>,
             Arc::clone(&launch_pool_refusals_total) as Arc<dyn RenderMetric>,
@@ -2481,6 +2517,9 @@ impl WorkerMetrics {
             net_bytes_total,
             net_handler_total,
             net_handler_seconds,
+            net_plugin_calls_total,
+            net_plugin_callback_seconds,
+            net_plugin_metric,
             task_start_stage_seconds,
             families,
         }

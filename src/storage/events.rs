@@ -1410,6 +1410,24 @@ pub mod drafts {
         .meta(json!({ "policy": name }))
     }
 
+    /// A network plugin object was created or replaced.
+    pub fn net_plugin_applied(name: &str, revision: u64, digest: &str) -> EventDraft {
+        EventDraft::info(
+            "net.plugin_applied",
+            format!("Network plugin {name} applied (revision {revision}, module {digest})"),
+        )
+        .meta(json!({ "plugin": name, "revision": revision, "module": digest }))
+    }
+
+    /// A network plugin object was deleted.
+    pub fn net_plugin_deleted(name: &str) -> EventDraft {
+        EventDraft::info(
+            "net.plugin_deleted",
+            format!("Network plugin {name} deleted"),
+        )
+        .meta(json!({ "plugin": name }))
+    }
+
     pub fn volume_mounted(
         volume: &crate::structs::Volume,
         node_id: &str,
@@ -2525,6 +2543,14 @@ impl EventRecorder<'_> {
 
     pub fn net_policy_deleted(self, name: &str) {
         self.emit(drafts::net_policy_deleted(name));
+    }
+
+    pub fn net_plugin_applied(self, name: &str, revision: u64, digest: &str) {
+        self.emit(drafts::net_plugin_applied(name, revision, digest));
+    }
+
+    pub fn net_plugin_deleted(self, name: &str) {
+        self.emit(drafts::net_plugin_deleted(name));
     }
 
     pub fn volume_mounted(self, volume: &crate::structs::Volume, node_id: &str, path: &str) {

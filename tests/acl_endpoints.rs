@@ -42,6 +42,8 @@ const FIXTURE_POLICY: &str = "fixture-policy";
 const DELETABLE_POLICY: &str = "deletable-policy";
 const FIXTURE_NET_POLICY: &str = "fixture-net-policy";
 const DELETABLE_NET_POLICY: &str = "deletable-net-policy";
+const FIXTURE_NET_PLUGIN: &str = "fixture-net-plugin";
+const DELETABLE_NET_PLUGIN: &str = "deletable-net-plugin";
 const DELETABLE_USER: &str = "deletable-user";
 
 /// How an endpoint participates in the ACL system.
@@ -103,6 +105,11 @@ fn endpoint_table() -> Vec<(&'static str, Plane)> {
         ("GetNetPolicyObject", Plane::Protected("net:read")),
         ("ListNetPolicies", Plane::Protected("net:read")),
         ("DeleteNetPolicy", Plane::Protected("net:write")),
+        ("UpsertNetPlugin", Plane::Protected("net:write")),
+        ("GetNetPlugin", Plane::Protected("net:read")),
+        ("ListNetPlugins", Plane::Protected("net:read")),
+        ("DeleteNetPlugin", Plane::Protected("net:write")),
+        ("GetNetPluginStatus", Plane::Protected("net:read")),
         ("ShowNetPolicy", Plane::Protected("net:read")),
         ("TestNetPolicy", Plane::Protected("net:read")),
         ("GetMeshCa", Plane::Protected("net:read")),
@@ -595,6 +602,51 @@ async fn call_endpoint(
             .delete_net_policy(req(
                 DeleteNetPolicyRequest {
                     name: DELETABLE_NET_POLICY.into(),
+                },
+                token,
+            ))
+            .await
+            .map(|_| ()),
+        "UpsertNetPlugin" => svc
+            .upsert_net_plugin(req(
+                UpsertNetPluginRequest {
+                    object_json: format!(
+                        r#"{{"name":"acl-net-plugin","module":{{"source":"https://example.com/p.wasm","checksum":"sha256:{}"}},"stages":["request"]}}"#,
+                        "a".repeat(64)
+                    ),
+                    dry_run: false,
+                    idempotency_key: None,
+                },
+                token,
+            ))
+            .await
+            .map(|_| ()),
+        "GetNetPlugin" => svc
+            .get_net_plugin(req(
+                GetNetPluginRequest {
+                    name: FIXTURE_NET_PLUGIN.into(),
+                },
+                token,
+            ))
+            .await
+            .map(|_| ()),
+        "ListNetPlugins" => svc
+            .list_net_plugins(req(ListNetPluginsRequest::default(), token))
+            .await
+            .map(|_| ()),
+        "DeleteNetPlugin" => svc
+            .delete_net_plugin(req(
+                DeleteNetPluginRequest {
+                    name: DELETABLE_NET_PLUGIN.into(),
+                },
+                token,
+            ))
+            .await
+            .map(|_| ()),
+        "GetNetPluginStatus" => svc
+            .get_net_plugin_status(req(
+                GetNetPluginStatusRequest {
+                    name: FIXTURE_NET_PLUGIN.into(),
                 },
                 token,
             ))
@@ -1475,6 +1527,20 @@ fn seed_fixtures(store: &Store) -> R<Fixtures> {
                 "egress": { "allow": ["*.example.com"] },
             }))?;
         store.upsert_net_policy(object)?;
+    }
+    // Network plugin fixtures (docs/network-plugins.md): one to read, one to
+    // delete.
+    for name in [FIXTURE_NET_PLUGIN, DELETABLE_NET_PLUGIN] {
+        let object: legion::structs::netplugin::NetPluginObject =
+            serde_json::from_value(serde_json::json!({
+                "name": name,
+                "module": {
+                    "source": "https://example.com/p.wasm",
+                    "checksum": format!("sha256:{}", "b".repeat(64)),
+                },
+                "stages": ["request"],
+            }))?;
+        store.upsert_net_plugin(object)?;
     }
 
     store.upsert_job_template_version(

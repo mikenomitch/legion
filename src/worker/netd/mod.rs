@@ -35,6 +35,7 @@ pub mod kernel;
 pub mod kernel_guard;
 pub mod listen;
 pub mod netns;
+pub mod plugins;
 pub mod policy;
 pub mod proxy;
 pub mod proxyproto;
@@ -79,6 +80,16 @@ pub mod metrics {
         crate::manager::telemetry::worker_metrics()
             .net_bytes_total
             .inc_by(&[direction], count);
+    }
+
+    /// One plugin callback: `stage` is the pipeline stage, `outcome`
+    /// ok|error.
+    pub fn plugin_call(plugin: &str, stage: &str, outcome: &str, seconds: f64) {
+        let metrics = crate::manager::telemetry::worker_metrics();
+        metrics
+            .net_plugin_calls_total
+            .inc(&[plugin, stage, outcome]);
+        metrics.net_plugin_callback_seconds.observe(seconds);
     }
 
     /// One external handler call: `outcome` is allow|deny|proxy|error.

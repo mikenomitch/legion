@@ -22,6 +22,7 @@ pub mod ledger;
 pub mod login;
 pub mod mcp;
 pub mod net;
+pub mod net_plugin;
 pub mod node;
 pub mod oidc;
 pub mod output;

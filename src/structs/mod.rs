@@ -19,6 +19,7 @@ pub mod host_guard;
 pub mod instance;
 pub mod job;
 pub mod ledger;
+pub mod netplugin;
 pub mod netpolicy;
 pub mod network;
 pub mod node;

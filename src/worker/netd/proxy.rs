@@ -29,7 +29,7 @@ use crate::structs::netpolicy::{ConnectFacts, RequestFacts, Verdict, PROTOCOL_HT
 use crate::worker::forwarder::ForwarderContext;
 use crate::worker::netd::attach::Attachment;
 use crate::worker::netd::guard::{self, GuardRefusal};
-use crate::worker::netd::handlers::{self, HopFacts, HopOutcome, ProxyTarget};
+use crate::worker::netd::handlers::{self, ExchangeOutcome, HopFacts, HopOutcome, ProxyTarget};
 use crate::worker::netd::http;
 use crate::worker::netd::listen::{dial_tcp, spawn_accept_loop, ListenAddr};
 use crate::worker::netd::metrics as net_metrics;
@@ -39,7 +39,7 @@ use crate::worker::netd::proxyproto::Prefixed;
 use crate::worker::netd::splice::SpliceStream;
 
 use bytes::Bytes;
-use http_body_util::{combinators::BoxBody, BodyExt, Full};
+use http_body_util::{BodyExt, Full};
 use hyper::body::Incoming;
 use hyper::{header, Method, Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
@@ -838,7 +838,7 @@ where
 // HTTP: CONNECT and absolute-URI requests, parsed by hyper
 // ---------------------------------------------------------------------------
 
-type ProxyBody = BoxBody<Bytes, hyper::Error>;
+type ProxyBody = handlers::HopBody;
 
 fn full_body(bytes: impl Into<Bytes>) -> ProxyBody {
     Full::new(bytes.into())
@@ -1146,9 +1146,26 @@ async fn forward_absolute(
         ..Default::default()
     };
     let hops = pipeline(&proxy);
-    let (upstream, absolute_form, extra) = match hops.run_request(&proxy.context, &hop_facts).await
-    {
-        HopOutcome::Allow => match dial(&addrs).await {
+    let mut exchange = hops.exchange(&proxy.context, &hop_facts);
+    let mut head = handlers::RequestHead {
+        method: method.clone(),
+        path: uri
+            .path_and_query()
+            .map(|pq| pq.as_str().to_string())
+            .unwrap_or_else(|| "/".to_string()),
+        authority: authority.as_str().to_string(),
+        scheme: scheme.to_ascii_lowercase(),
+        headers: headers.clone(),
+        end_of_stream: handlers::RequestHead::no_body(&headers),
+        changed: false,
+    };
+    let decided = if exchange.is_empty() {
+        ExchangeOutcome::Continue
+    } else {
+        exchange.request(&hop_facts, &mut head).await
+    };
+    let (upstream, absolute_form, extra) = match decided {
+        ExchangeOutcome::Continue => match dial(&addrs).await {
             Some(stream) => (stream, false, Vec::new()),
             None => {
                 net_metrics::connection("egress", PROTOCOL_HTTP, "error");
@@ -1159,7 +1176,7 @@ async fn forward_absolute(
                 return status_response(StatusCode::BAD_GATEWAY);
             }
         },
-        HopOutcome::Deny { source, reason } => {
+        ExchangeOutcome::Deny { source, reason } => {
             log_request(
                 &proxy,
                 &method,
@@ -1171,6 +1188,7 @@ async fn forward_absolute(
                 started,
                 0,
             );
+            exchange.answered(403);
             return refuse(
                 &proxy,
                 &host,
@@ -1180,7 +1198,19 @@ async fn forward_absolute(
                 (&method, path_only),
             );
         }
-        HopOutcome::Proxy(target) => {
+        ExchangeOutcome::Respond(local) => {
+            return answer_locally(
+                &proxy,
+                exchange,
+                local,
+                &destination,
+                &method,
+                path_only,
+                started,
+                0,
+            );
+        }
+        ExchangeOutcome::Proxy(target) => {
             let extra = handlers::legion_headers(&proxy.context, &hop_facts);
             // An HTTP proxy speaks HTTP: no PROXY header, the request itself
             // says where it is going.
@@ -1198,45 +1228,77 @@ async fn forward_absolute(
         }
     };
     let (mut parts, body) = request.into_parts();
-    // The chain's body hops (`dlp`) read the body before it leaves, exactly
-    // as they do on an HTTP-mode upstream.
+    if head.changed {
+        parts.headers.clear();
+        for (name, value) in &head.headers {
+            if let (Ok(name), Ok(value)) = (
+                header::HeaderName::from_bytes(name.as_bytes()),
+                header::HeaderValue::from_str(value),
+            ) {
+                parts.headers.append(name, value);
+            }
+        }
+        let rewritten = format!("{}://{}{}", head.scheme, authority.as_str(), head.path);
+        if let Ok(rewritten) = rewritten.parse::<hyper::Uri>() {
+            parts.uri = rewritten;
+        }
+    }
+    // The chain's body hops (`dlp`, a plugin's `body` stage) read the body
+    // before it leaves, exactly as they do on an HTTP-mode upstream.
     let mut bytes_in = 0u64;
-    let body: ProxyBody = if !hops.reads_body() {
-        body.boxed()
+    let body: ProxyBody = if !exchange.reads_body() {
+        body.map_err(|err| Box::new(err) as handlers::BoxError)
+            .boxed()
     } else {
-        match http_body_util::Limited::new(body, hops.body_cap() as usize)
+        match http_body_util::Limited::new(body, exchange.body_cap() as usize)
             .collect()
             .await
         {
             Ok(collected) => {
-                let bytes = collected.to_bytes();
+                let mut bytes = collected.to_bytes();
                 bytes_in = bytes.len() as u64;
-                if let Some((source, reason)) = hops.check_body(&bytes) {
-                    log_request(
-                        &proxy,
-                        &method,
-                        path_only,
-                        &destination,
-                        403,
-                        "deny",
-                        Some(&source),
-                        started,
-                        bytes_in,
-                    );
-                    return refuse(
-                        &proxy,
-                        &host,
-                        PROTOCOL_HTTP,
-                        &destination,
-                        (source, Some(reason)),
-                        (&method, path_only),
-                    );
+                match exchange.body(&mut bytes).await {
+                    ExchangeOutcome::Continue | ExchangeOutcome::Proxy(_) => {}
+                    ExchangeOutcome::Deny { source, reason } => {
+                        log_request(
+                            &proxy,
+                            &method,
+                            path_only,
+                            &destination,
+                            403,
+                            "deny",
+                            Some(&source),
+                            started,
+                            bytes_in,
+                        );
+                        exchange.answered(403);
+                        return refuse(
+                            &proxy,
+                            &host,
+                            PROTOCOL_HTTP,
+                            &destination,
+                            (source, reason),
+                            (&method, path_only),
+                        );
+                    }
+                    ExchangeOutcome::Respond(local) => {
+                        return answer_locally(
+                            &proxy,
+                            exchange,
+                            local,
+                            &destination,
+                            &method,
+                            path_only,
+                            started,
+                            bytes_in,
+                        );
+                    }
                 }
                 full_body(bytes)
             }
             Err(_) => {
                 // Over the cap, or the client went away mid-body.
-                if let Some(source) = hops.body_unreadable_denied_by() {
+                if let Some(source) = exchange.body_unreadable_denied_by() {
                     log_request(
                         &proxy,
                         &method,
@@ -1253,7 +1315,10 @@ async fn forward_absolute(
                         &host,
                         PROTOCOL_HTTP,
                         &destination,
-                        (source, Some("request body exceeds dlp maxBytes".into())),
+                        (
+                            source,
+                            Some("request body exceeds the body hop's maxBytes".into()),
+                        ),
                         (&method, path_only),
                     );
                 }
@@ -1310,7 +1375,7 @@ async fn forward_absolute(
                 started,
                 bytes_in,
             );
-            response
+            exchange.respond(response).await
         }
         Err(err) => {
             debug!(allocation_id = proxy.allocation_id, destination = %destination, error = %err, "Egress proxy request failed");
@@ -1380,6 +1445,48 @@ fn log_request(
     tokio::spawn(http::append_access_line(dir, line));
 }
 
+/// A request a hop answered instead of the destination (a plugin's local
+/// response, or the `503` of a failed plugin).
+#[allow(clippy::too_many_arguments)]
+fn answer_locally(
+    proxy: &Arc<Proxy>,
+    mut exchange: handlers::Exchange,
+    local: handlers::LocalResponse,
+    destination: &str,
+    method: &str,
+    path: &str,
+    started: std::time::Instant,
+    bytes_in: u64,
+) -> Response<ProxyBody> {
+    let verdict = if local.denies() { "deny" } else { "allow" };
+    net_metrics::connection("egress", PROTOCOL_HTTP, verdict);
+    if local.denies() {
+        proxy.context.record_denial(
+            proxy.allocation_id,
+            "egress",
+            PROTOCOL_HTTP,
+            destination,
+            &local.source,
+            local.reason.as_deref(),
+            method,
+            path,
+        );
+    }
+    log_request(
+        proxy,
+        method,
+        path,
+        destination,
+        local.status,
+        verdict,
+        Some(&local.source),
+        started,
+        bytes_in,
+    );
+    exchange.answered(local.status);
+    local.into_response()
+}
+
 /// Send one request on a fresh upstream connection and hand its response
 /// back, minus the hop-by-hop headers that belong to that connection.
 async fn send_one(
@@ -1398,7 +1505,11 @@ async fn send_one(
     for name in ["connection", "keep-alive", "proxy-connection"] {
         parts.headers.remove(name);
     }
-    Ok(Response::from_parts(parts, body.boxed()))
+    Ok(Response::from_parts(
+        parts,
+        body.map_err(|err| Box::new(err) as handlers::BoxError)
+            .boxed(),
+    ))
 }
 
 /// An upstream connection that counts the bytes it moves and records them

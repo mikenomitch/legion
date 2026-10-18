@@ -117,6 +117,7 @@ pub fn config() -> Command {
                         .arg(json_flag()),
                 ),
         )
+        .subcommand(crate::cmd::net_plugin::config())
         .subcommand(
             job_scope(Command::new("doctor"))
                 .about("Walk a task's network layers — policy, mode, datapath, handlers, TLS, gate — and name the first one that is wrong")
@@ -225,6 +226,7 @@ pub async fn handle(matches: &ArgMatches) -> R<()> {
             Some(("test", sub)) => test(sub).await,
             _ => unreachable!(),
         },
+        Some(("plugin", plugin)) => crate::cmd::net_plugin::handle(plugin).await,
         Some(("doctor", sub)) => doctor(sub).await,
         Some(("handler", handler)) => match handler.subcommand() {
             Some(("test", sub)) => handler_test(sub).await,

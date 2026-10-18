@@ -107,6 +107,11 @@ use crate::structs::{
     KeyringRewrapProgress, ResetKeyringReply, ResetKeyringRequest, RewrapKvReply, RewrapKvRequest,
     RewrapRootKeyReply, RewrapRootKeyRequest, RotateDataKeyReply, RotateDataKeyRequest,
 };
+use crate::structs::{
+    DeleteNetPluginReply, DeleteNetPluginRequest, GetNetPluginReply, GetNetPluginRequest,
+    GetNetPluginStatusReply, GetNetPluginStatusRequest, ListNetPluginsReply, ListNetPluginsRequest,
+    UpsertNetPluginReply, UpsertNetPluginRequest,
+};
 use crate::task_plugins::validate_job_config;
 use crate::tracing_util::{o11y_enabled, read_recent_observability};
 
@@ -121,6 +126,7 @@ mod fork_rpcs;
 mod make_room;
 mod material_rpcs;
 mod node_content_rpcs;
+mod plugin_rpcs;
 mod session_rpcs;
 mod snapshot_rpcs;
 mod suspend_rpcs;
@@ -1758,6 +1764,9 @@ pub struct ManagerDaemonService {
     /// is at most one heartbeat stale and a failover shows nothing until
     /// the next beat, never a wrong answer.
     net_status: Arc<Mutex<HashMap<String, Vec<crate::structs::NetAllocStatus>>>>,
+    /// Each node's last plugin report (docs/network-plugins.md), in memory
+    /// like `net_status`.
+    net_plugin_status: Arc<Mutex<HashMap<String, Vec<crate::structs::NetPluginNodeStatus>>>>,
     /// How often `StreamEvents` and exec sessions re-check their caller's
     /// credential (`acl::STREAM_REAUTH_INTERVAL`; tests shorten it).
     stream_reauth_interval: Duration,
@@ -1813,6 +1822,7 @@ impl ManagerDaemonService {
             net_policy_cache: Arc::new(Mutex::new(HashMap::new())),
             net_policy_generation: Arc::new(Mutex::new(None)),
             net_status: Arc::new(Mutex::new(HashMap::new())),
+            net_plugin_status: Arc::new(Mutex::new(HashMap::new())),
             net_edges: Arc::new(Mutex::new(HashMap::new())),
             stream_reauth_interval: acl::STREAM_REAUTH_INTERVAL,
             usage: Arc::new(Mutex::new(crate::manager::usage::UsageTable::default())),
@@ -2150,6 +2160,7 @@ impl ManagerDaemonService {
         })?;
         self.validate_identity_sub_templates(&config)?;
         enforce_kv_tls_read(identity, &config.tasks)?;
+        self.check_job_plugins(&config.tasks)?;
         enforce_kv_credential_read(
             identity,
             config.tasks.iter().filter_map(|task| task.connect.as_ref()),
@@ -7915,6 +7926,7 @@ impl Manager for ManagerDaemonService {
                 status.insert(id.clone(), req.net_status.clone());
             }
         }
+        self.record_net_plugin_status(&id, &req.net_plugins);
         // Measured usage, when this beat carries a report (every 10s from
         // workers with enforcement on). In memory only, never the store.
         {
@@ -9669,6 +9681,7 @@ impl Manager for ManagerDaemonService {
             .normalize_and_validate()
             .map_err(|e| Status::invalid_argument(e.to_string()))?;
         enforce_net_policy_scope(&identity, AclAction::Write, &object)?;
+        self.check_policy_plugins(&object)?;
 
         let (affected, warnings) = self.affected_allocations_for_policy(&object);
         if req.dry_run {
@@ -9774,6 +9787,46 @@ impl Manager for ManagerDaemonService {
         self.bump_net_policy_generation();
         self.store.events().net_policy_deleted(&name);
         Ok(Response::new(DeleteNetPolicyReply {}))
+    }
+
+    #[instrument(skip_all)]
+    async fn upsert_net_plugin(
+        &self,
+        request: Request<UpsertNetPluginRequest>,
+    ) -> Result<Response<UpsertNetPluginReply>, Status> {
+        self.upsert_net_plugin_rpc(request).await
+    }
+
+    #[instrument(skip_all)]
+    async fn get_net_plugin(
+        &self,
+        request: Request<GetNetPluginRequest>,
+    ) -> Result<Response<GetNetPluginReply>, Status> {
+        self.get_net_plugin_rpc(request).await
+    }
+
+    #[instrument(skip_all)]
+    async fn list_net_plugins(
+        &self,
+        request: Request<ListNetPluginsRequest>,
+    ) -> Result<Response<ListNetPluginsReply>, Status> {
+        self.list_net_plugins_rpc(request).await
+    }
+
+    #[instrument(skip_all)]
+    async fn delete_net_plugin(
+        &self,
+        request: Request<DeleteNetPluginRequest>,
+    ) -> Result<Response<DeleteNetPluginReply>, Status> {
+        self.delete_net_plugin_rpc(request).await
+    }
+
+    #[instrument(skip_all)]
+    async fn get_net_plugin_status(
+        &self,
+        request: Request<GetNetPluginStatusRequest>,
+    ) -> Result<Response<GetNetPluginStatusReply>, Status> {
+        self.get_net_plugin_status_rpc(request).await
     }
 
     #[instrument(skip_all)]
