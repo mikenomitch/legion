@@ -72,10 +72,14 @@ impl ManagerDaemonService {
                 deduplicated: false,
             }));
         }
+        // The fingerprint is the normalized object: a retry with the same key
+        // and a different plugin is refused rather than answered with the
+        // first one.
         let idempotency_key = scoped_idempotency_key(
             &identity,
             "upsert_net_plugin",
             req.idempotency_key.as_deref(),
+            &object,
         );
         if self
             .store
@@ -443,14 +447,18 @@ fn check_policy_pools(what: &str, policy: &NetPolicyObject, object: &NetPluginOb
 }
 
 /// `net:write` on each pool a pool-scoped `usableBy = "policies"` plugin
-/// names; unscoped otherwise (a cluster-wide plugin, or one every job may
-/// reference).
+/// names; unscoped otherwise (a cluster-wide plugin, one every job may
+/// reference, or one whose module is a node file).
 fn enforce_net_plugin_scope(
     identity: &crate::structs::AclIdentity,
     action: AclAction,
     object: &NetPluginObject,
 ) -> Result<(), Status> {
-    if object.node_pools.is_empty() || object.usable_by_jobs() {
+    // A `file://` module is read from the node's disk as root, so it is
+    // cluster-wide however the plugin is scoped (like a `file://` artifact,
+    // which makes a job host-level).
+    let local_module = object.module.source.starts_with("file://");
+    if object.node_pools.is_empty() || object.usable_by_jobs() || local_module {
         return acl::enforce(identity, AclResource::Net, action, &AclScope::none());
     }
     for pool in &object.node_pools {

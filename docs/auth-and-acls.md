@@ -306,8 +306,9 @@ the key, on top of `job:write`. That covers every place a job can name one:
   templates, and a `templateKv` pointer,
 - an artifact's `auth.kv` (a path filled in by a cluster `artifacts.auth`
   matcher needs no grant),
-- `tls.certFrom = { kv }` on an ingress chain and
-  `connect.upstreams[].credentials`.
+- a port's `tls.cert` or `tls.clients.ca`, an upstream's `ca`, and
+  `connect.upstreams[].credentials` (the
+  [Sources](network-handlers.md#sources) the datapath fetches).
 
 `job run`, `job plan`, and template renders and runs check it before anything
 is placed:

@@ -550,6 +550,9 @@ The RPCs are `UpsertNetPlugin` (with an `idempotency_key`), `GetNetPlugin`,
   - **Cluster-wide plugins.** One without pools, and every
     `usableBy = "jobs"` plugin (which every job may reference, so it is
     cluster-wide by nature), needs unscoped `net:write`.
+- A `file://` module is read from each node's disk by the worker, so it
+  needs unscoped `net:write` whatever the plugin's `nodePools`, as a
+  `file://` artifact makes a job [host-level](auth-and-acls.md#host-level-jobs).
 - Naming a `credentials` KV path needs `kv:read` on it.
 
 Referencing a plugin needs no extra right beyond writing the policy or

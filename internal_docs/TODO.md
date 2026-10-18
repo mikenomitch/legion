@@ -576,7 +576,6 @@ How to use it:
 
 | PR | What it lands | Notes |
 | --- | --- | --- |
-| [#48](https://github.com/mikenomitch/legion/pull/48) | Gang scheduling: all-or-nothing placement for a task's replicas, `placementTimeout`, `onMemberLoss` (restart / replace / fail), and each member's `LEGION_GANG_RANK` / `SIZE` / `MIN` / `LEADER_ADDR` | [plan](plans/gang-scheduling-plan.md) · [calls](calls/gang-scheduling-plan_calls.md) · [docs](../docs/gang-scheduling.md); what is left is under "Gang scheduling, what is left" |
 | [#162](https://github.com/mikenomitch/legion/pull/162) | Lanes hardening: worker-write forwarding, split-tolerant submits, adversarial fixes | Plan §8 + calls doc in [durability-and-ops-execution-plan.md](plans/durability-and-ops-execution-plan.md) |
 | [#143](https://github.com/mikenomitch/legion/pull/143) | Note the node-level builtin resource override gap | Docs only; the fix itself is a todo below |
 | [#84](https://github.com/mikenomitch/legion/pull/84) | Instrument DB hot paths, batch task-status updates | Old; rebase or close |
