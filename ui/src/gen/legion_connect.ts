@@ -2619,8 +2619,9 @@ export const Manager = {
      *
      * ACL: `net:write`. A `usableBy = "policies"` plugin with `nodePools`
      * needs it on each pool; one without pools, and every `usableBy = "jobs"`
-     * plugin, needs it unscoped (cluster-wide). Naming a `credentials` KV path
-     * also needs `kv:read` on that path.
+     * plugin, and any plugin whose module is a `file://` node path, needs it
+     * unscoped (cluster-wide). Naming a `credentials` KV path also needs
+     * `kv:read` on that path.
      *
      * @generated from rpc legion.Manager.UpsertNetPlugin
      */
