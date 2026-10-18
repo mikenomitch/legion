@@ -4085,33 +4085,68 @@ Plan: [kv-encryption-plan.md](plans/kv-encryption-plan.md) · docs: [kv-encrypti
 
 Plan: [auth-acl-plan.md](plans/auth-acl-plan.md) · docs: [auth-and-acls.md](../docs/auth-and-acls.md)
 
-- [ ] **Namespaces** — [plan](plans/namespaces-plan.md) (PLANNED) ·
+- [ ] **Namespaces** — [plan](plans/namespaces-plan.md) (PLANNED, revised
+      2026-10-18 against a sourced K8s/Nomad survey) ·
       [calls](calls/namespaces-plan_calls.md). Today namespaces are vocabulary
-      without values: the `namespaces` ACL selector globs correctly but every
-      scope is stamped `"default"` (`src/structs/acl.rs:213`), so a policy
-      naming any other namespace silently grants nothing.
-  - [ ] Phase 0 — `Namespace` object + CRUD (gRPC/CLI/MCP), the `namespace`
-        ACL resource, and validation that a `namespaces` selector names a
-        namespace that exists (kills the silent-no-op policy footgun).
-  - [ ] Phase 1 — jobs carry a namespace; `-n`/`LEGION_NAMESPACE`/`-A`,
-        `namespace/name` references, namespace on every job-derived ACL scope,
-        list filtering, `$LEGION_NAMESPACE` in task env. Names stay globally
-        unique; resolution becomes namespace-scoped (the plan's one behavioral
-        change, landed while everything is still in `default`).
-  - [ ] Phase 2 — per-namespace name uniqueness, **and** `{namespace}` in the
-        default workload-identity subject template in the same phase (without
-        it, `prod/web` and `dev/web` mint identical JWT subjects — see
-        [call 4](calls/namespaces-plan_calls.md)).
-  - [ ] Phase 3 — namespaced service catalog + same-namespace `connect`
-        resolution, and per-namespace event filtering (`list_events` /
-        `stream_events` are `operator:read` all-or-nothing today,
-        `src/manager/server.rs:3133`).
-  - [ ] Phase 4 — namespaced volumes and templates; UI (namespace in the URL,
-        header switcher, All-namespaces mode, Namespaces page, switcher
-        suppressed for single-namespace identities).
-  - [ ] Phase 5 — governance on the namespace object: quota,
-        `allowedPools`, `allowedRuntimes`, default band. Enforcement point for
-        quota is open (plan § 14).
+      without values. The `namespaces` ACL selector globs correctly, but every
+      scope is stamped `"default"` (`src/structs/acl.rs:235`), so a policy
+      naming any other namespace silently grants nothing. A `net` rule with
+      `namespaces` matches nothing at all (`src/manager/server.rs:13518`).
+  - [ ] Phase 1 — namespaces are real. Ships as a PR stack:
+    - (a) The object, delegable CRUD over gRPC, CLI and MCP, the `namespace`
+      ACL resource, and the per-item namespace list. Rules over namespaced
+      resources must name `namespaces`
+      ([call 3](calls/namespaces-plan_calls.md)).
+    - (b) The qualified `namespace/name` job id
+      ([call 1](calls/namespaces-plan_calls.md)), per-namespace names and
+      instance ids, `-n`/`LEGION_NAMESPACE`/`-A`, and a server-side
+      spec/request conflict error. `{namespace}` joins the identity-subject
+      floor ([call 5](calls/namespaces-plan_calls.md)). Delete is refused
+      while non-empty, with a synchronous `--cascade`.
+    - (c) The service catalog keyed by namespace, same-namespace `connect`
+      and DNS, and per-item filtering on `ListServices`, `ResolveService` and
+      `ListServiceEdges` ([call 4](calls/namespaces-plan_calls.md)).
+    - (d) Namespace path segments in UI detail routes.
+  - [ ] Phase 2 — cross-namespace upstreams with target-side `allow`, the
+        `<svc>.<ns>.svc.legion` DNS form, tenant-readable events
+        (`list_events`/`stream_events` are `operator:read` all-or-nothing
+        today, `src/manager/server.rs:4666`), `namespace` metric labels,
+        exec keys over qualified ids, and namespaced standalone volumes.
+  - [ ] Phase 3 — UI: header switcher, All-namespaces view, Namespaces page,
+        and no tenancy UI for single-namespace identities.
+  - [ ] Phase 4 — governance as glob-selecting **namespace policies**:
+        aggregate per-band quota, `maxNamespaces`, allowed pools, runtimes
+        and host volumes, all checked at admission
+        ([call 6](calls/namespaces-plan_calls.md)). How usage is counted is
+        open (plan § 15).
+- [ ] **Node caches serve private images to jobs without credentials for
+      them.** A digest the node already holds is served "with no registry
+      request". A tag whose registry lookup fails, auth failures included,
+      falls back to the node's last-resolved digest
+      (`src/artifacts/fetchers/oci.rs:611-621, :701`). So a job that can't
+      pull a private image runs it anyway if another job pulled it to the
+      same node. This is the problem Kubernetes' `AlwaysPullImages` admission
+      plugin exists for. It becomes tenant-to-tenant once namespaces ship,
+      and [namespaces-plan.md § 8.6](plans/namespaces-plan.md) lists it as a
+      known limitation until fixed. Likely fix: check the task's own
+      credentials against the registry (one manifest `HEAD`) before serving a
+      cached private image, and fall back on registry *unavailability* only,
+      never on an auth failure. Found during namespace recon (inferred from
+      the code, not yet reproduced).
+- [ ] **The template collision guard reveals whether a job exists.**
+      `enforce_template_collision_guard` (`src/manager/server.rs:2574-2607`)
+      answers "job '…' already exists" to a template-only submitter who may
+      lack `job:read` on that job. Namespaces confine this to namespaces the
+      caller can submit into (plan § 8.10), but it should still answer with
+      the same message whether or not the job exists. Found during namespace
+      recon.
+- [ ] **The UI's client-side ACL mirror has drifted from the engine.**
+      `ui/src/utils/acl.ts` has no `boot` resource and no `bands` selector,
+      and applies the `host` check only to `exec` (Rust checks `exec` and
+      `job`, `src/structs/acl.rs:424-429`). So the UI can show or hide the
+      wrong controls. Namespaces Phase 1 has to touch this file anyway (plan
+      § 10). Fix the drift then, and add parity cases shared with the Rust
+      tests so it can't drift silently again.
 - [ ] Dynamic auth-method dylib plugins (deferred from auth phase 2)
 - [ ] Workload-identity API credentials (deferred from auth phase 4)
 - [ ] Token-resolution cache (deferred from auth phase 4)

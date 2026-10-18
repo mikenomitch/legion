@@ -115,7 +115,7 @@ reports `aclEnabled: false`.
 | `operator` | raft, manager configs, observability | status/history/logs | raft commands, raft join tokens |
 | `acl` | tokens, policies, users, delegated exec keys | list/get | create/update/delete |
 | `exec` | exec into a running allocation | n/a | open a session, or mint an exec ticket for one (`host = true` for host-level runtimes) |
-| `action` | run declared actions on an allocation | n/a | run an action (scope with `action_names`) |
+| `action` | run declared actions on an allocation | n/a | run an action (scope with `actionNames`) |
 | `template` | job templates | list/inspect | publish versions, delete (scope with `templates`) |
 | `scale` | task count overrides ([Scaling Jobs](autoscaling.md)) | scale status | `job scale` / reset (scope by job name). Separate from `job:write`, so a principal can resize without redeploy rights. |
 | `boot` | boot tickets ([Edge Boot](edge-boot.md)) | list outstanding tickets | mint a ticket (scope by job name). Separate from `job:write` for the same reason as `scale`: a platform's ticket minter can authorize individual starts without the right to redeploy the fleet. |
