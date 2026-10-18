@@ -130,7 +130,10 @@ store, including ACL metadata. What it cannot read:
   ([KV Encryption at Rest](kv-encryption.md)), so raw SQL sees ciphertext. A
   `kv` rule scoped by `paths` is the only way to read a value. That includes
   naming one in a job or net policy, which hands it to the task or the
-  datapath ([KV references in a job](#kv-references-in-a-job)).
+  datapath ([KV references in a job](#kv-references-in-a-job)): a port's
+  `tls.cert` or `tls.clients.ca`, an upstream's `ca`, or an upstream
+  credential among them
+  ([Certificates and CAs from KV](network-handlers.md#certificates-and-cas-from-kv)).
 - Private keys, password hashes, and recorded replies.
   `signing_key.private_key_pem` (the workload-identity and boot-ticket
   signing keys), `net_mesh_ca.key_pem` (the built-in cluster CA key),

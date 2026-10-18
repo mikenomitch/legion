@@ -348,7 +348,8 @@ bare name is a catalog service.
 
 With `https://`, the task speaks **plaintext HTTP to its upstream address**, and the
 node's forwarder dials the destination over TLS (verified against the Mozilla
-roots). This lets policy and handlers see an LLM API call's body **without
+roots, or against the bundle the upstream's `ca` pins,
+[TLS on ports](#tls-on-ports)). This lets policy and handlers see an LLM API call's body **without
 intercepting anyone's TLS**. Point the client at the upstream:
 
 ```sh
@@ -786,80 +787,73 @@ each check (`reachable`, `status_2xx`, `verdict`, `ttl`, or
 `proxy_protocol`) with a fix, and exits non-zero when a check fails. It is
 also available as an MCP tool (`legion_net_handler_test`).
 
-## mTLS
+## The mesh
 
-Legion terminates and originates TLS, so a handler never sees it. You choose
-one of three kinds of certificate material per chain: the mesh certificate,
-a certificate held in KV, or files on the node.
+One switch puts a service on the mesh:
 
 ```nickel
-ingress = {
-    tls = {
-        mode = "mutual",                      # off | server | mutual
-        certFrom = "legion",                  # the mesh: this node's certificate
-        clientCa = "legion",                  # verify peers against the mesh CA
-        requireIdentity = ["auto:web:*"],     # workload globs a peer must match
-    },
-},
+service = { port = "http", mesh = true, allow = ["web", "agent-*"] },
 ```
 
-| Field | Meaning |
-| --- | --- |
-| `mode` | `server` presents a certificate. `mutual` also verifies the client's. Egress: `passthrough` (default, opaque) or `originate` (external upstreams, with TLS from the node and plaintext from the task). |
-| `certFrom = "legion"` | the node's mesh certificate (below). Omit it and give `certPath`/`keyPath` for bring-your-own files on the node (or staged artifacts). |
-| `certFrom = { kv = "<path>" }` | a certificate held in KV, swapped live when the key changes. Ingress only. See [Certificates from KV](#certificates-from-kv). |
-| `clientCa` | `"legion"` (the mesh CA) or a CA bundle path. Required for `mutual`. |
-| `requireIdentity` | identity globs. A verified peer outside them is refused with `Legion-Denied-By: tls/requireIdentity` and a `net.denied` event. Empty = any verified peer. |
-| `caPath` | egress `originate`: verify the destination against this bundle instead of the system roots. |
+With `mesh = true`:
 
-**Bring-your-own PKI.** With `certPath`/`keyPath` (and `clientCa` for
-`mutual`), the advertised port terminates TLS with your certificate. A
-`mutual` peer's identity is its certificate's first URI SAN, or else its
-first DNS SAN, or else its CN. `identity` rules and `requireIdentity` match
-against that string. A `legion://node/<id>` URI from your own `clientCa` is
-just that string too: only a chain verified against the cluster CA makes a
-peer a Legion node, trusted to name the workload it forwards for (below), so
-a CA that issues whatever URIs its clients ask for cannot mint one.
-
-**The mesh (`certFrom = "legion"`).** The mesh uses the **cluster CA**. By
-default that is a CA the manager creates on first use and replicates with the
-control lane; it can instead be an intermediate from your own PKI or an
-external signer such as Vault PKI ([The Cluster CA](cluster-ca.md)). Every
-worker node holds a short-lived **node certificate** from it: the worker
-generates its own key, sends a CSR (`IssueNodeCertificate`, authorized by its
-node token) right after registration, and the manager has it signed with the
-SANs `<node>.node.legion` and `legion://node/<node id>`, valid for 24 hours.
-The manager picks those names itself and checks what an external CA returns
-before handing it out. The worker refreshes it after 8 hours, or within one
-heartbeat when the cluster's trust bundle changes. The same certificate serves the node's worker
-plane ([auth-and-acls.md](auth-and-acls.md#the-worker-plane)), and the key
-and certificate persist under `<state-dir>/identity/` (mode `0600`) so a
-restarted node has its mesh identity before it reaches a manager. The
-private key never leaves the node. Then:
-
-- A task whose ingress chain sets `mode = "mutual", certFrom = "legion"` has
-  its advertised port terminate **node-to-node mTLS**. The catalog marks the
-  endpoint `mesh_tls`. Each consumer's datapath dials it with its own node
-  certificate, verifies the peer node, and names the consuming **workload**
+- **The service's port terminates node-to-node mTLS** with the node's
+  certificate, and verifies peers against the cluster CA. The datapath owns
+  the advertised port and the task binds a private twin, as with any
+  [ingress](#ingress) chain, so the task never holds a certificate.
+- **The catalog marks the endpoints mesh** (`ServiceEndpoint.mesh_tls`).
+  Each consumer's datapath dials them with its own node certificate,
+  verifies the peer node, and names the consuming **workload**
   (`<region>:<job>:<group>:<task>`) in a PROXY v2 TLV inside the session.
   The receiving node trusts that attribution because the peer proved it is a
-  node. It passes the identity to `identity` rules, `requireIdentity`, and
-  `authz`.
-- A plain client that dials the port directly is refused at the handshake.
-  A non-Legion client that must reach the port has two options: present a
-  certificate from the cluster CA (`legion net ca show` prints its trust
-  bundle, but Legion does not issue certificates for outside clients), or go
-  through a Legion task. With a `file` or `exec` CA, remember that anything
-  your PKI signs under that CA with a `legion://` URI SAN is a node or a
-  manager to every peer: keep that intermediate (or Vault role) for Legion
-  alone.
-- Workloads never hold certificates. The node attributes identity, which
-  keeps a per-user sandbox's identity out of the sandbox.
+  node, and passes the identity to `identity` rules and `authz`.
+- **`service.allow` is enforced on the wire.** Its entries compile into the
+  service's ingress chain as a check that runs before any rule, with the
+  source `service/allow`. A verified caller outside the list is refused, and
+  a `net.denied` event names it. `legion net policy show` prints the check
+  as rule `0.` Without the mesh, `allow` is enforced by the endpoint feed
+  only ([Service Discovery](service-discovery.md#intentions-serviceallow)).
+- **A plain client that dials the port directly is refused at the
+  handshake.** A non-Legion client that must reach the port has two options:
+  present a certificate from the cluster CA (`legion net ca show` prints its
+  trust bundle, but Legion does not issue certificates for outside clients),
+  or go through a Legion task. With a `file` or `exec` CA, remember that
+  anything your PKI signs under that CA with a `legion://` URI SAN is a node
+  or a manager to every peer: keep that intermediate (or Vault role) for
+  Legion alone.
+- **Workloads never hold certificates.** The node attributes identity,
+  which keeps a per-user sandbox's identity out of the sandbox.
 
-The mesh CA is the cluster CA, the same one behind the worker plane
-([Auth & ACLs](auth-and-acls.md#the-worker-plane)). A node's mesh
-certificate is its node certificate: the worker generates the key and the
-manager signs a CSR.
+`mesh` is resolved **at placement**, like [`network.mode`](#networkmode),
+because the catalog's flag and the listener must agree. A policy object can
+set it for the tasks it matches:
+
+```nickel
+{ name = "mesh-prod", enforcement = "require", selector = { nodePools = ["prod"] }, mesh = true }
+```
+
+Under `require` it wins over the task; under `default` it applies only to a
+task that does not set `mesh` itself, so a task's own `mesh = false` beats a
+default. A port that carries its own `tls` (below) is never made the mesh
+port by a policy, and a task that sets both on one port is rejected at
+submit. A policy change reaches an allocation at its next placement.
+
+**The node certificate.** The mesh uses the **cluster CA**. By default that
+is a CA the manager creates on first use and replicates with the control
+lane; it can instead be an intermediate from your own PKI or an external
+signer such as Vault PKI ([The Cluster CA](cluster-ca.md)). Every worker
+node holds a short-lived **node certificate** from it: the worker generates
+its own key, sends a CSR (`IssueNodeCertificate`, authorized by its node
+token) right after registration, and the manager has it signed with the SANs
+`<node>.node.legion` and `legion://node/<node id>`, valid for 24 hours. The
+manager picks those names itself and checks what an external CA returns
+before handing it out. The worker refreshes it after 8 hours, or within one
+heartbeat when the cluster's trust bundle changes. The same certificate
+serves the node's worker plane
+([auth-and-acls.md](auth-and-acls.md#the-worker-plane)), and the key and
+certificate persist under `<state-dir>/identity/` (mode `0600`) so a
+restarted node has its mesh identity before it reaches a manager. The
+private key never leaves the node.
 
 `legion net ca show` prints the CA trust bundle (never a key), its pin, which
 provider supplies it, and where a rotation stands. `legion net ca rotate`
@@ -872,54 +866,96 @@ Legion with the same add-switch-remove steps
 plaintext ([Rotating the cluster
 CA](auth-and-acls.md#rotating-the-cluster-ca)).
 
-### Certificates from KV
+## TLS on ports
 
-A public certificate (from Let's Encrypt or your own CA) can live in KV
-instead of on node disks. The node serves it on the advertised port and swaps
-it when the key changes, so renewal is a single `kv put`:
+TLS that is not the mesh goes on the port that serves it. The node
+terminates it, and the task speaks plaintext on its private port:
 
 ```nickel
 network = {
-    ports = [{ name = "https", static = 443 }],
-    ingress = {
-        tls = { mode = "server", certFrom = { kv = "certs/app.example.com" } },
-    },
+    ports = [
+        { name = "https", static = 443, tls = { cert = { kv = "certs/app.example.com" } } },
+        { name = "admin", to = 9443,
+          tls = { cert = { file = { cert = "/etc/app/tls.crt", key = "/etc/app/tls.key" } },
+                  clients = { ca = { kv = "certs/admin-clients" } } } },   # present = mutual
+    ],
 },
 ```
 
-```bash
-legion kv put certs/app.example.com "$(cat fullchain.pem privkey.pem)"
+| Field | Meaning |
+| --- | --- |
+| `tls.cert` | The certificate chain and its private key. `{ kv = "<path>" }`: one PEM bundle held in KV, swapped live when the key changes ([below](#certificates-and-cas-from-kv)). `{ file = { cert, key } }`: two files on the node (or staged artifacts); `{ file = "<path>" }`: one file holding both. |
+| `tls.clients.ca` | Present: the port is **mutual**, and a client must present a certificate that verifies against this CA bundle, `{ kv = "<path>" }` or `{ file = "<path>" }`. |
+
+- **A mutual port's peer identity** is its certificate's first URI SAN, or
+  else its first DNS SAN, or else its CN. `identity` rules and `authz` see
+  that string. A port's own CA vouches only for names: a `legion://node/…`
+  SAN it verifies is just a name, never a node whose PROXY v2 attribution is
+  trusted. Only the mesh CA vouches for nodes.
+- **A port is either the service's mesh port or carries its own `tls`,
+  never both.** Submit says so.
+- **An identity is not a certificate.** `cert = { identity = … }` is a
+  submit error, and so is a relative file path.
+- **Chains carry policy only.** An ingress chain or policy object has no
+  `tls`; a policy object can impose `mesh = true` but cannot push
+  certificate material onto the tasks it matches.
+
+**Originating TLS to an external upstream** needs no block: a `tls://` or
+`https://` [upstream](#upstreams) already originates. Its certificate is
+verified against the public (Mozilla) roots, or against the bundle the
+upstream's `ca` pins:
+
+```nickel
+{ name = "corp", to = "https://api.corp.example", ca = { kv = "certs/corp-ca" } }
 ```
 
-- **One value, one bundle.** The KV value is PEM: the certificate chain, leaf
-  first, then the private key. Keeping both in one key means a reader never
-  pairs a new certificate with an old key.
-- **The task never holds the key.** The task speaks plain HTTP (or any TCP)
-  on its private port. The node terminates TLS.
-- **Swaps are live.** Each heartbeat, a node with KV-backed chains asks the
-  manager for certificates newer than the version it holds
-  (`FetchDatapathMaterial`). New connections get the new certificate, and
-  connections already open keep theirs. Nothing restarts.
-- **Fail-static.** The manager checks a bundle before sending it: it must hold
-  a certificate and a private key, and the key must match the leaf. A bad
-  value, a deleted key, or an unreachable manager leaves the node serving the
-  last good certificate. The allocation reports the problem: `tls_error`
-  names the key, and `problems` reads
+`ca` takes `{ kv }` or `{ file }` and applies to external `tls://` and
+`https://` upstreams only (a catalog service on the mesh is verified
+against the cluster CA). A pinned bundle that is missing or does not parse
+fails the upstream's connections; it never falls back to the public roots,
+and the allocation's `problems` say why.
+
+### Certificates and CAs from KV
+
+A public certificate (from Let's Encrypt or your own CA), a client CA, or an
+upstream's trust bundle can live in KV instead of on node disks. The node
+serves it and swaps it when the key changes, so renewal is a single
+`kv put`:
+
+```bash
+legion kv put certs/app.example.com "$(cat fullchain.pem privkey.pem)"
+legion kv put certs/admin-clients "$(cat clients-ca.pem)"
+```
+
+- **One value, one bundle.** A certificate's KV value is PEM: the chain,
+  leaf first, then the private key. Keeping both in one key means a reader
+  never pairs a new certificate with an old key. A CA's value is one or more
+  PEM certificates.
+- **The task never holds the key.** The node terminates TLS.
+- **Swaps are live.** Each heartbeat, a node asks the manager for material
+  newer than the version it holds (`FetchDatapathMaterial`). New connections
+  get the new certificate or CA, and connections already open keep theirs.
+  Nothing restarts.
+- **Fail-static.** The manager checks a value before sending it: a
+  certificate bundle must hold a certificate and a private key that matches
+  the leaf, and a CA bundle at least one certificate. A bad value, a deleted
+  key, or an unreachable manager leaves the node serving the last good
+  material. The allocation reports the problem: `tls_error` names the key,
+  and `problems` reads
   `ingress TLS: serving the previous certificate; kv certs/app.example.com holds no private key`.
-  An allocation that has never had a good certificate is not ready, and its
-  handshakes fail.
-- **Access.** Naming a key in `certFrom` hands its value to the datapath, so
-  it needs the right to read it. `RunJob` (and template runs) and
-  `UpsertNetPolicy` require `kv:read` on the path in addition to their own
-  permissions. Without it the submit fails with `PermissionDenied`, naming
-  the key. A node can only fetch the key that an allocation placed on it
-  declares. It names allocations, and the manager derives each path itself.
-- **Where it works.** Inline ingress chains and policy objects. `mode` may be
-  `server` or `mutual`, with `clientCa = "legion"` or a CA bundle path for
-  `mutual`. Not on egress.
+  A port that has never had good material is not ready, and its handshakes
+  fail.
+- **Access.** Naming a key hands its value to the datapath, so it needs the
+  right to read it. `RunJob` (and template runs) require `kv:read` on every
+  path a task names in `ports[].tls.cert`, `ports[].tls.clients.ca`, or
+  `connect.upstreams[].ca`, in addition to their own permissions. Without it
+  the submit fails with `PermissionDenied`, naming the field and the key. A
+  node can only fetch what an allocation placed on it declares: it names an
+  allocation and a port label (or upstream key), and the manager derives each
+  path itself.
 - **In memory only.** The node never writes the material to disk, including
-  its `netd_state.json`. After a worker restart it fetches the certificate
-  again on its first heartbeat.
+  its `netd_state.json`. After a worker restart it fetches it again on its
+  first heartbeat.
 
 To renew automatically, run a scheduled batch job that puts the new bundle.
 [`configs/jobs/cert-renewer.ncl`](../configs/jobs/cert-renewer.ncl) does it
@@ -930,19 +966,40 @@ a file with `onChange = "update"` instead
 ([Live file updates](kv-store.md#live-file-updates)).
 
 Limits: a renewal reaches the node on its next heartbeat, so expect up to
-one heartbeat interval of delay. There is no `clientCa = { kv }` yet: a
-client CA bundle comes from the mesh or a path. Legion does not run an ACME
-client itself.
+one heartbeat interval of delay. Legion does not run an ACME client itself.
 
-**Doctor.** `legion net doctor` reports `tls` as a layer. It flags BYO files
-that do not parse, and a mesh certificate the node has not received yet.
-Until it arrives, mesh peers are refused, and the allocation's `problems`
-say so. For a KV-backed chain, it names the key and shows the
-`legion kv put` that fixes it.
+**Doctor.** `legion net doctor` reports `tls` as a layer. It flags files
+that do not parse, a KV value that was rejected (naming the key and the
+`legion kv put` that fixes it), and a mesh certificate the node has not
+received yet. Until it arrives, mesh peers are refused, and the
+allocation's `problems` say so.
 
-Limits: there is no kTLS/`splice` fast path, so a terminated mesh connection
-is copied in user space. TLS 1.2 and 1.3 are supported. There is no
-certificate revocation. The 24-hour lifetime takes its place.
+Limits: there is no kTLS/`splice` fast path, so a terminated connection is
+copied in user space. TLS 1.2 and 1.3 are supported. There is no
+certificate revocation; the mesh's 24-hour lifetime takes its place.
+
+## Sources
+
+Everywhere a value comes from somewhere, it is the same record:
+
+| Source | Read by | Allowed in |
+| --- | --- | --- |
+| `{ kv = "<path>" }` | the manager, for the node; the submitter needs `kv:read` on it | `ports[].tls.cert`, `ports[].tls.clients.ca`, `connect.upstreams[].ca`, `credentials[].from` |
+| `{ identity = "<name>" }` | the manager mints the task's workload identity of that name for the allocation | `credentials[].from` |
+| `{ file = "<path>" }` or `{ file = { cert, key } }` | the node itself; never sent over the wire | `ports[].tls.cert`, `ports[].tls.clients.ca`, `connect.upstreams[].ca` |
+
+Each field allows the kinds that make sense for it, and anything else is a
+submit error that names the field. Credentials take no `file`, so a node's
+disk never becomes a secret store, and every credential's access is checked
+at submit against `kv:read`. Exactly one key per source: `{ kv = …,
+identity = … }` does not parse.
+
+A node fetches everything `kv` and `identity` sources hold, plus the policy
+bodies its allocations are assigned, in **one** worker-plane call per
+heartbeat, `FetchDatapathMaterial`. Each request entry names a kind
+(`policy`, `port_cert`, `client_ca`, `upstream_ca`, `credential`) and what
+it is for, with the version the node holds, so an unchanged value costs
+nothing on the wire. Values stay in memory only.
 
 ## `network.mode`
 
@@ -951,7 +1008,6 @@ certificate revocation. The 24-hour lifetime takes its place.
 | `host` | host networking. Policy is cooperative (proxy env vars, upstreams, the resolver) | `exec`, `sandbox`, `container` on macOS |
 | `gated` | the workload's network namespace holds loopback and the datapath only, so a `container` or non-root `exec` task can't open a socket around it. Every destination the egress proxy dials is judged by the [host guard](#the-host-guard) and then by policy, by the address a name resolves to. A root `exec` task can leave the namespace. For a `sandbox`, it is a microVM with no NIC whose only way out is a vsock to the datapath (see "Sandboxes") | `container` on Linux |
 | `auto` (the default) | `gated` for a `container` on a Linux node, `host` for everything else | — |
-| `bridge`, `cni/<name>` | reserved for the datapath plugin, rejected at submit | — |
 
 The effective mode is resolved **at placement**, with the node in hand:
 `auto` reads the node's `os` fingerprint, so one `container` job runs gated
@@ -1461,8 +1517,10 @@ count it as up, and `legion net doctor` names the cause.
 
 ## Ingress
 
-Declare an `ingress` chain on a task, or impose one with a `require` policy
-object, and the datapath fronts every port the task advertises:
+Declare an `ingress` chain on a task, impose one with a `require` policy
+object, put the service on the [mesh](#the-mesh), or give a port its own
+[`tls`](#tls-on-ports), and the datapath fronts every port the task
+advertises:
 
 ```nickel
 network = {
@@ -1491,8 +1549,8 @@ network = {
   fails with the address already in use. This makes ingress enforceable on
   every runtime and platform, not only on gated Linux.
 - **Every accepted connection is checked** against the ingress chain using
-  the peer's address (`cidr`, `port`) and, with mesh mTLS, the peer's
-  attributed identity (`identity`). In HTTP mode, the request head is
+  the peer's address (`cidr`, `port`) and, on the mesh port or a mutual
+  port, the peer's verified identity (`identity`). In HTTP mode, the request head is
   checked too, with the same request rules, `dlp`, structured `403`s, and
   access log as egress. A denial closes the connection and records
   `net.denied` with `direction = ingress`.
@@ -1741,8 +1799,9 @@ unscoped `net:write`. `IssueNodeCertificate` is worker-plane, and a node may
 only mint its own certificate.
 
 Naming a KV key in a job needs `kv:read` on it, because the datapath hands
-the value out: `certFrom = { kv }` on an ingress chain
-([Certificates from KV](#certificates-from-kv)) and
+the value out: `ports[].tls.cert`, `ports[].tls.clients.ca`, and
+`connect.upstreams[].ca`
+([Certificates and CAs from KV](#certificates-and-cas-from-kv)), and
 `connect.upstreams[].credentials` ([Credential injection](#credential-injection)).
 The same rule covers every other place a job names a key
 ([KV references in a job](auth-and-acls.md#kv-references-in-a-job)).
@@ -1784,8 +1843,9 @@ This section lists what that covers and what it does not.
   platform. A gated or TAP-wired sandbox's ports are always fronted, over
   vsock or at the guest's bridge address. TCP only. The task sees the
   datapath as the peer, not the original client.
-- **TLS**: ingress chains terminate `server`/`mutual` TLS with your files, a
-  certificate held in KV (swapped live on renewal), or the mesh certificate.
+- **TLS**: a port terminates TLS (mutual with `clients`) with your files or
+  a certificate held in KV (swapped live on renewal), and a mesh service's
+  port with the node certificate.
   Legion stores and serves certificates but does not issue public ones: a
   renewal job (or any ACME client) writes them to KV. The mesh is node-to-node mTLS with attributed
   workload identity, never per-workload certificates. There is no kTLS fast

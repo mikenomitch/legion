@@ -68,7 +68,8 @@ service = {
     # port = "dynamic",   # ...or "dynamic" -> declares a dynamic port inline
     tags = ["v1"],
     meta = { protocol = "http" },
-    # allow = ["gateway"],   # optional connect intentions; see below
+    # mesh = true,           # node-to-node mTLS on the port; see below
+    # allow = ["gateway"],   # who may call it; see below
 },
 ```
 
@@ -316,38 +317,55 @@ forwarded drain on their own. Per-connection logging stays at `debug`.
 
 ### Intentions: `service.allow`
 
-A service can name the jobs allowed to reach it through connect:
+A service names who may call it, in one list:
 
 ```nickel
 service = {
     port = "http",
-    allow = ["gateway", "api"],   # job ids; absent or ["*"] = every job
+    mesh = true,
+    allow = ["web", "agent-*", "*:billing:*:worker"],
 },
 ```
 
-- Entries are job ids (a job's `name`), matched against the consuming
-  allocation's job.
-- Absent or `["*"]` means every job may connect. This is the default.
-- Enforcement happens in the endpoint feed. A denied consumer's forwarder gets
-  an empty list, so its connections are accepted and closed. There is no error
-  code and no partial list. When a client sees only immediate closes, run
-  `legion service doctor <svc>`. It prints the service's `allow` list, so you
-  can tell "no healthy endpoints" apart from "your job is not on the list". The
-  list comes back on `ListServices` (`ServiceSummary.allow`), so `doctor` needs
-  only `job:read`, the same scope as the rest of the report.
-- Intentions don't affect the catalog. `legion service list|resolve` and the
-  `ListServices`/`ResolveService` RPCs still show the service to anyone whose
-  ACLs permit the read. Intentions gate the connect datapath, not who can see
-  the service.
+- **One grammar.** A bare entry is a job id glob (`web`, `agent-*`). An
+  entry with colons is a workload identity glob over
+  `<region>:<job>:<group>:<task>` (`*:billing:*:worker`), each part globbed
+  on its own. Both match the same identity string, so `web` and `*:web:*:*`
+  are the same rule. An identity glob has exactly four non-empty parts; the
+  submit error says so.
+- **Absent or `["*"]` means everyone.** This is the default.
+- **Always enforced in the endpoint feed.** The manager matches each
+  consuming allocation's identity against the list, and a caller that is not
+  on it gets an empty endpoint list, so its connections are accepted and
+  closed. There is no error code and no partial list.
+- **Enforced on the wire with the mesh.** On a `mesh = true` service the
+  list also compiles into the service's ingress chain as its first check,
+  with the source `service/allow`. A verified caller outside it is refused
+  at the receiving node, and a `net.denied` event names the caller
+  ([The mesh](network-handlers.md#the-mesh)). `legion net policy show`
+  prints the check.
+- **Without the mesh there is no verified caller** at the receiving node, so
+  the endpoint feed is the only enforcement. It governs what Legion's own
+  connect path hands out; it does not stop a task that already knows a
+  backend's `address:port` from dialing it directly. `legion service doctor`
+  says which applies:
 
-**Scope.** Intentions are enforced by the control plane and the forwarder.
-They don't use cryptographic identity. They govern what Legion's own connect
-path hands out. They don't stop a task that already knows a backend's
-`address:port` from dialing it directly, and nothing on that wire is
-authenticated or encrypted by default. Intentions do not use mTLS identity.
-For cryptographic identity, turn on mesh mTLS on the service's ingress chain
-and restrict callers with `requireIdentity`. See
-[network-handlers.md](network-handlers.md#mtls).
+  ```
+  allow: web, agent-*   enforced by the endpoint feed only (api is not on the mesh)
+    Hint: set service.mesh = true to enforce it on the wire
+  ```
+
+  It also prints the list itself, so you can tell "no healthy endpoints"
+  apart from "your job is not on the list". The list comes back on
+  `ListServices` (`ServiceSummary.allow`), so `doctor` needs only
+  `job:read`, the same scope as the rest of the report.
+- **`allow` doesn't affect the catalog.** `legion service list|resolve` and
+  the `ListServices`/`ResolveService` RPCs still show the service to anyone
+  whose ACLs permit the read.
+- For identity combined with a path or method, use an ingress rule
+  (`when = { identity = "*:web:*:*", path = "/admin/**" }`).
+  `legion net policy test api --from web --identity …` answers for the whole
+  set.
 
 ### Validation
 
@@ -362,7 +380,9 @@ These are checked at submit, and by `legion job validate <spec>` before you subm
   static port declared in the same task's `network.ports` (including one
   declared by the `service.port` number shorthand).
 - `balance` is a known strategy. The error lists the valid names.
-- `service.allow` entries are non-empty.
+- `service.allow` entries are non-empty, and an entry with colons has four
+  parts.
+- `service.mesh = true` is not combined with the same port's own `tls`.
 
 The upstream service doesn't have to exist yet. It may be submitted later, or
 by someone else, and Legion won't fail a submission because of ordering. An

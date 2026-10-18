@@ -2,8 +2,11 @@
 
 Calls behind [`plans/mesh-interfaces-plan.md`](../plans/mesh-interfaces-plan.md).
 Entries are ranked by project impact, highest first; an entry's number is its
-rank. Nothing in the plan is built, so these are the calls the plan makes and
-asks the owner to ratify. Each says what evidence would overturn it.
+rank. Each says what evidence would overturn it.
+
+Entries 1–21 are the plan's own calls, made before any code. Entries 22
+onward were made while executing it; they constrain less than the plan's
+architecture, so they rank below it, and among themselves by impact.
 
 This file began as `egress-plugins-proposal_calls.md` (merged in
 [#49](https://github.com/mikenomitch/legion/pull/49)). That proposal's ten
@@ -631,3 +634,185 @@ and saying so. A superseded stub would be a second document to keep honest.
 The tracks also depend on each other (B needs S1; A reads S1's stages and
 S2's protocol rule; B3 signs with S5's refs), so separate plans would each
 restate the others. The owner asked for a single plan.
+
+---
+
+## 22. Only the mesh CA vouches for nodes; a port's own client CA vouches for names
+
+**Call.** On a port with its own `tls.clients.ca`, a verified client
+certificate carrying a `legion://node/<id>` SAN is treated as the plain name
+`legion://node/<id>`. Only on the mesh port does a node peer's PROXY v2
+header name the workload it forwards for.
+
+**Alternatives.** Keep what the BYO `clientCa` path did before: any verified
+peer whose SAN reads `legion://node/…` is a node, whichever CA verified it.
+
+**Trade-off.** A client of a mutual port cannot use a node certificate to
+forward an attributed workload identity through that port. Nobody does this
+on purpose; the mesh port is where attribution lives.
+
+**Why (security).** A port's client CA is the operator's (or a customer's)
+to sign with. Under the old rule anyone who could get a certificate with a
+`legion://node/x` SAN from that CA could send a PROXY header naming any
+workload and pass every `identity` rule. The fix is three lines in
+`ingress::handle` and closes the hole for the new `clients.ca = { kv }` path
+before it ships.
+
+---
+
+## 23. Stored rows are not migrated across the reshape
+
+**Call.** `AllocUpstream.service` became `key` (S2), `AllocNetwork.ingress_tls`
+was replaced by `AllocPort.mesh`/`tls` (S3), and chains lost `tls` with no
+store migration. Rows written by an older build are not rewritten.
+
+**Alternatives.** The plan's §7 sketch: a migration in
+`storage/migrations.rs` that renames `service` to `key` in every stored
+allocation network.
+
+**Trade-off.** An allocation row written before this change does not parse
+under the new build, so a cluster upgraded in place loses its running
+allocations' datapath state and they are rescheduled. Stored policy objects
+that carried `tls` fail to load and must be re-applied without it.
+
+**Why (simplicity).** AGENTS.md: Legion has no installed base to protect, and
+compatibility code for the old form is not added. A migration is code that
+runs once on clusters that do not exist. The PR description says what broke.
+
+---
+
+## 24. The caller's group travels on the allocation payload
+
+**Call.** `TaskAllocation` gains `task_group` and `task_service`. The worker
+names a mesh caller `<region>:<job>:<group>:<task>` from `task_group`, and the
+manager matches `service.allow` in the endpoint feed against the same string
+and compiles the receiving side's `callers` from `task_service`.
+
+**Alternatives.** (a) Keep reading `group` out of `task_config`, which is the
+plugin config and almost never has one, so every caller was
+`…:default:…`. (b) Look the group up from the task config on each feed
+build.
+
+**Trade-off.** Two more fields on a per-heartbeat message (both small, and
+empty for tasks without a service).
+
+**Why (correctness, performance).** S4's `*:billing:*:worker` form is
+meaningless if every caller's group reads `default`; the bug predates this
+plan and made `identity` rules on group silently never match. The payload is
+already where the worker reads job and task from, and the feed is a
+per-heartbeat path that should not grow store reads.
+
+---
+
+## 25. One fetch per heartbeat, and policy bodies are a provider
+
+**Call.** `FetchDatapathMaterial` is one call per heartbeat carrying every
+ref the node wants. The manager resolves a ref in two steps: the
+declaration (which `Source` the allocation declares for it) and a
+`MaterialProvider` per source kind (`kv`, `identity`), plus a `policy`
+provider for content-addressed bodies, which are not a `Source`.
+
+**Alternatives.** (a) Keep three calls and add three more for port
+certificates, client CAs, and upstream CAs. (b) Make `policy` a `Source`
+variant (`{ policy = "<hash>" }`), so there is only one dispatch.
+
+**Trade-off.** One RPC whose reply mixes kinds, so a per-ref error lives in
+the entry rather than the status. Policy bodies get a provider that no
+jobspec can name.
+
+**Why (extensibility, simplicity).** A new secret store is one provider and
+one `Source` variant; a new kind of material is one ref kind. Neither needs
+an RPC, an ACL table row, or a netd change. A policy hash is not something a
+user writes, so it stays out of the grammar users see.
+
+---
+
+## 26. A policy cannot make a port with its own `tls` the mesh port
+
+**Call.** When a `require` or `default` policy turns `mesh` on and the
+service's port carries its own `tls`, placement leaves that port on its own
+TLS. A task that sets both itself is rejected at submit.
+
+**Alternatives.** The policy wins and the port's `tls` is ignored, or
+placement fails.
+
+**Trade-off.** A policy that means "everything on the mesh" has a hole where
+a task terminates TLS with its own certificate. `legion net policy show`
+reports `mesh: on` for it while its catalog endpoint is not mesh.
+
+**Why (simplicity).** The task's explicit certificate is the more specific
+statement, and failing placement for a policy that a task cannot satisfy
+would strand it. Revisit if an operator needs mesh enforcement to be
+absolute; then the right shape is a submit-time refusal under `require`.
+
+---
+
+## 27. Jobspec shapes are validated by serde and Rust, not Nickel contracts
+
+**Call.** S1's "one contract per variant" is implemented as typed serde
+structs with `deny_unknown_fields`, plus a hand-written `Deserialize` for a
+hop that names the stray field and the variant (`unknown field "url" in
+proxy`). The parity test checks `HANDLERS` against `maximal.ncl` and the
+docs table instead of against contracts.
+
+**Alternatives.** Ship a Nickel contract library that jobspecs import.
+
+**Trade-off.** Errors come at submit (or `job validate`), not at Nickel
+evaluation, so an editor running `nickel` alone does not see them.
+
+**Why (simplicity).** The repository has no contract library: every jobspec
+field is validated in Rust at submit, and `job validate` runs the same code.
+A second validator in Nickel would have to agree with the Rust one forever.
+
+---
+
+## 28. Chains refuse unknown fields
+
+**Call.** `ChainConfig` is `deny_unknown_fields`, so a chain that still
+carries a removed field (`onError`, `tls`) fails to parse:
+
+```
+unknown field `tls`, expected one of `protocol`, `policy`, `accessLog`, `allow`, `rules`, `handlers`
+```
+
+**Alternatives.** Accept and ignore unknown fields, as chains did before.
+
+**Trade-off.** A typo in an optional chain field is now an error too.
+
+**Why (simplicity).** A removed security field that is silently ignored is
+the worst outcome: the policy reads as if it terminates TLS and does not.
+
+---
+
+## 29. Removing `log` drops per-upstream access logging
+
+**Call.** With the `log` handler gone (§6.0), access logging is the chain's
+`accessLog`, which covers every HTTP request of the allocation's chain.
+
+**Alternatives.** Keep `log` as an upstream-only hop.
+
+**Trade-off.** An allocation cannot log one upstream's requests and not
+another's.
+
+**Why (simplicity).** One way to turn on access logs. Nobody asked for
+per-upstream granularity, and the access log already carries the upstream
+on each line.
+
+---
+
+## 30. `net policy test` answers for `service/allow` only with `--identity`
+
+**Call.** `TestNetPolicy` runs a mesh service's `callers` check only when the
+request names an identity. Without one it answers as a non-mesh port would.
+
+**Alternatives.** Treat a missing identity as the mesh port's unverified
+caller, and deny it.
+
+**Trade-off.** `legion net policy test api --from 10.0.0.9` reports the
+rules' verdict even though the mesh port would refuse a caller that names no
+workload.
+
+**Why (ease).** The common question without `--identity` is about rules on
+an address; denying every such test on a mesh service would hide them. The
+proto comment says when the check applies.
+

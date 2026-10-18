@@ -2,8 +2,11 @@
 
 > **Judgement calls:** [`calls/mesh-interfaces-plan_calls.md`](../calls/mesh-interfaces-plan_calls.md)
 
-> **Status: PLANNED.** Nothing here is built. This is one plan for two
-> questions about the mesh:
+> **Status: IN EXECUTION.** Phase 0 and track S (S1–S6) are shipped;
+> tracks A and B are in progress. Deviations from the text below are calls
+> entries 22 onward.
+>
+> This is one plan for two questions about the mesh:
 >
 > 1. *Is the surface people type as small as it can be, and is the code
 >    behind it pluggable?* Six surface changes (S1–S6): handlers as one typed

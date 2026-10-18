@@ -5,7 +5,7 @@ to each other:
 
 | Certificate | Names (SANs) | Used for |
 | --- | --- | --- |
-| node | `<node>.node.legion`, `legion://node/<id>` | the worker plane listener (port 4848), the mesh (`certFrom = "legion"`) |
+| node | `<node>.node.legion`, `legion://node/<id>` | the worker plane listener (port 4848), the mesh (`service.mesh = true`) |
 | fleet | `<fleet>.fleet.legion`, `legion://fleet/<name>` | one simulator process serving many nodes |
 | manager client | `legion://manager/<id>` | managers dialing the worker plane |
 | manager server | `manager.legion`, `legion://manager/<id>` | workers dialing a manager (port 4747) |

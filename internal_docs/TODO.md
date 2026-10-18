@@ -3843,7 +3843,7 @@ Deliberately not in the plan (see its §5): TLS interception / MITM — external
 upstreams are the body-visible route; rate limits and quotas; a cluster-edge
 load balancer.
 
-Planned, nothing built:
+In execution:
 [mesh-interfaces-plan.md](plans/mesh-interfaces-plan.md) · calls:
 [mesh-interfaces-plan_calls.md](calls/mesh-interfaces-plan_calls.md). It
 merges the egress-plugins proposal from
@@ -3883,13 +3883,30 @@ mesh's surface. Phase 0 first, then S1. After S1 every track is independent.
       Not done: a store migration for allocation rows and stored specs in
       the old shape (see the plan's calls file); clusters with such data
       re-submit their jobs.
-- [ ] S3 + S4: `service.mesh = true` and TLS on `network.ports[].tls`
-      instead of chain `tls`; `service.allow` as the one caller list,
-      enforced at the receiving node on mesh services. Removes
-      `requireIdentity` and the reserved `bridge`/`cni/*` modes.
-- [ ] S5: one `{ kv | identity | file }` source grammar,
-      `FetchDatapathMaterial` in place of three worker-plane RPCs, and a
-      manager-side `MaterialProvider` trait.
+- [x] S3 + S4: `service.mesh = true` (resolved at placement onto
+      `AllocPort.mesh`; a policy object can impose or default `mesh`) and
+      TLS on `network.ports[].tls = { cert, clients = { ca } }` instead of
+      chain `tls`; an external upstream's `ca` pins its trust bundle.
+      `service.allow` is the one caller list (bare = job glob, colons =
+      `<region>:<job>:<group>:<task>` glob), matched in the endpoint feed
+      and, on mesh services, compiled into the ingress chain's `callers`
+      (`Legion-Denied-By: service/allow`); `service doctor` says when it is
+      feed-only. Removed `TlsConfig` (`certFrom`, `clientCa`, `caPath`,
+      `requireIdentity`) and the reserved `bridge`/`cni/*` modes. Fixed on
+      the way: the caller's group on the wire (was always `default`;
+      `TaskAllocation.task_group`), and a port's own client CA no longer
+      vouches for `legion://node` peers (calls entry 22).
+      Docs: [network-handlers.md#the-mesh](../docs/network-handlers.md#the-mesh),
+      [#tls-on-ports](../docs/network-handlers.md#tls-on-ports),
+      [service-discovery.md](../docs/service-discovery.md#intentions-serviceallow).
+- [x] S5: one `{ kv | identity | file }` source grammar
+      ([structs/source.rs](../src/structs/source.rs)), `FetchDatapathMaterial`
+      in place of `FetchNetPolicy`, `GetIngressCertificates`, and
+      `GetUpstreamCredentials`, with `policy`, `port_cert`, `client_ca`,
+      `upstream_ca`, and `credential` refs, and a manager-side
+      `MaterialProvider` per source kind
+      ([manager/server/material_rpcs.rs](../src/manager/server/material_rpcs.rs)).
+      Docs: [network-handlers.md#sources](../docs/network-handlers.md#sources).
 - [ ] Track A: kernel classifier. Policy compiled to eBPF maps on each
       allocation's cgroup leaf: allowed L4 flows that nothing reads skip the
       proxy, host-mode egress chains become enforced, gated capture becomes
@@ -3922,11 +3939,10 @@ Still unplanned, and not covered by the plan:
 - [ ] Port forwarding
 - [ ] Cluster-edge ingress load balancer. The plan's ingress is node-local,
       in front of one allocation; a cluster edge is separate work
-- [ ] `clientCa = { kv = "<path>" }` for `mutual` ingress, so a private client
-      CA can live in KV like the server certificate. Not in
-      [kv-cert-delivery-plan.md](plans/kv-cert-delivery-plan.md). Planned as
-      `tls.clients.ca = { kv }` in
-      [mesh-interfaces-plan.md](plans/mesh-interfaces-plan.md) S5.
+- [x] A KV-held client CA for mutual ingress: shipped as
+      `network.ports[].tls.clients.ca = { kv }` in
+      [mesh-interfaces-plan.md](plans/mesh-interfaces-plan.md) S5
+      ([network-handlers.md#certificates-and-cas-from-kv](../docs/network-handlers.md#certificates-and-cas-from-kv)).
 - [ ] A built-in ACME client (answering HTTP-01 from the ingress datapath).
       Only worth it once the cluster edge above exists. Until then, the
       renewer job in `configs/jobs/cert-renewer.ncl` covers it.

@@ -9956,7 +9956,23 @@ impl Manager for ManagerDaemonService {
         };
         let identity_str = req.identity.trim();
         let identity_opt = (!identity_str.is_empty()).then_some(identity_str);
-        let verdict = if !req.method.trim().is_empty() || path.is_some() {
+        // A mesh service's `service.allow` runs before any rule, for a
+        // verified caller on the mesh port.
+        let callers_denial = chain
+            .callers
+            .as_ref()
+            .filter(|_| direction == "ingress" && identity_opt.is_some())
+            .filter(|_| !chain.callers_permit(identity_opt))
+            .map(|callers| Verdict::Deny {
+                source: callers.source.clone(),
+                reason: Some(format!(
+                    "caller {identity_str} is not in service.allow ({})",
+                    callers.allow.join(", ")
+                )),
+            });
+        let verdict = if let Some(denial) = callers_denial {
+            denial
+        } else if !req.method.trim().is_empty() || path.is_some() {
             if !chain.is_http() {
                 // A tcp chain never sees requests; report the connect verdict.
                 evaluate_connect(
@@ -14460,6 +14476,54 @@ mod tests {
         assert_eq!(test("agents").await?.verdict, "allow");
         store.set_sandbox_gated_default(true);
         assert_eq!(test("agents").await?.source, "gated-default");
+        Ok(())
+    }
+
+    /// On a mesh service, `net policy test --identity` answers for
+    /// `service.allow` first: a caller outside it is denied by
+    /// `service/allow`, one inside it reaches the chain's rules.
+    #[tokio::test]
+    async fn net_policy_test_answers_for_service_allow_on_the_mesh() -> R<()> {
+        let store = setup_store()?;
+        let task: TaskConfig = serde_json::from_value(json!({
+            "name": "api",
+            "runtime": "container",
+            "config": { "image": "alpine", "command": ["sleep", "1"] },
+            "network": { "mode": "host", "ports": [{ "name": "http" }] },
+            "service": { "port": "http", "mesh": true, "allow": ["web", "*:ops:*:shell"] },
+        }))?;
+        store.handle_job_submit(
+            &JobConfig {
+                priority: Default::default(),
+                name: "api".into(),
+                tasks: vec![task],
+                rollout: None,
+                rollout_by_group: Default::default(),
+                version: None,
+            },
+            &[submission()],
+        )?;
+        let manager = ManagerDaemonService::new(store.clone());
+        let test = |identity: &'static str| {
+            let manager = &manager;
+            async move {
+                manager
+                    .test_net_policy(Request::new(TestNetPolicyRequest {
+                        job_id: "api".into(),
+                        from: "10.0.0.9".into(),
+                        identity: identity.into(),
+                        ..Default::default()
+                    }))
+                    .await
+                    .map(|reply| reply.into_inner())
+            }
+        };
+        let denied = test("global:batch:jobs:worker").await?;
+        assert_eq!(denied.verdict, "deny");
+        assert_eq!(denied.source, "service/allow");
+        assert!(denied.reason.contains("not in service.allow"), "{}", denied.reason);
+        assert_eq!(test("global:web:web:web").await?.verdict, "allow");
+        assert_eq!(test("global:ops:tools:shell").await?.verdict, "allow");
         Ok(())
     }
 

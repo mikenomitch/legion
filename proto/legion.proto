@@ -12259,9 +12259,14 @@ message TestNetPolicyRequest {
   // (`https://api.github.com/user` sets host, port, and path).
   string to = 4;
 
-  // Ingress test: the peer, as `host[:port]` / IP, optionally with an
-  // identity (`prod:default:checkout:web`).
+  // Ingress test: the peer, as `host[:port]` / IP.
   string from = 5;
+
+  // Ingress test: the caller's verified workload identity,
+  // `<region>:<job>:<group>:<task>` (`global:checkout:web:web`), as the mesh
+  // port or a mutual port would see it. On a `service.mesh = true` service
+  // with a closed `service.allow`, an identity outside the list is denied
+  // by `service/allow` before any rule.
   string identity = 6;
 
   // Request-time facts for HTTP chains. Optional.
