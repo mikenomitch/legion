@@ -2774,7 +2774,7 @@ mod tests {
             tap: tap.map(str::to_string),
             bridge: bridge.map(str::to_string),
             vsock: gated.then(|| PathBuf::from("/allocs/9/.sandbox/vsock.sock")),
-            gated: gated,
+            gated,
             datapath_wait: DATAPATH_WAIT,
             memory_restore: MemoryRestore::Lazy,
             userfaultfd: false,

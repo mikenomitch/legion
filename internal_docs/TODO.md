@@ -4194,8 +4194,6 @@ The Pack/Helm equivalent. Job templates are in flight on
 - [ ] Publish `legion-rs` to crates.io. The crate is renamed and packages
       cleanly (`cargo package`), but nothing is published yet, so the
       README's `cargo install legion-rs` fails until the first publish.
-- [ ] Bump the yanked `validit` 0.2.5 and `wide` 1.6.0 pins in `Cargo.lock`.
-      `cargo package` warns about both.
 - [ ] Prebuilt release binaries and a Homebrew formula, so installing does
       not need Rust or `protoc`
 
@@ -4623,14 +4621,14 @@ Deferred from [operator-ui-gaps-plan.md](plans/operator-ui-gaps-plan.md):
       a UI.
 
 ---
-- [ ] **`cargo clippy --all-targets` fails on existing code**
-      (`daemon.rs` items-after-test-module, `tests/node_drain.rs`
-      needless_borrow). The project's standard `cargo clippy --all` passes.
 - [ ] **Flaky timing tests under load.** `worker::forwarder`
       (`sync_stops_a_listener_that_is_no_longer_desired`,
-      `failover_skips_a_dead_endpoint_and_still_serves`) and
-      `manager::daemon::tests::wait_for_next_eval_does_not_busy_loop_when_only_future_work_exists`
-      each failed once in full parallel runs and pass on rerun.
+      `failover_skips_a_dead_endpoint_and_still_serves`),
+      `manager::daemon::tests::wait_for_next_eval_does_not_busy_loop_when_only_future_work_exists`,
+      and `legion-guest`'s
+      `agent::tests::upstreams_relay_the_workload_to_the_host_vsock_port`
+      ("the relay is tracked", 2026-10-19 on a 4-core box) each failed once
+      in full parallel runs and pass on rerun.
 - [ ] **Create the `proto-breaking-ok` label** that skips the new
       `proto-breaking` CI job (audit M5).
 
@@ -6229,3 +6227,9 @@ Found on the live AWS rig (3 raft managers, 2 workers).
       for its trap** before stopping the task (found fixed 2026-10-19: the
       shell writes a marker once `trap '' TERM` is in place, so a signal can
       no longer land before it).
+- [x] **`cargo clippy --all-targets -D warnings` passes** (2026-10-19). The
+      `net_bench` benchmark no longer compiled (`UpstreamSpec` had traded
+      `netns`/`vsock` for `attachment`), and nine lints in tests and benches
+      are fixed.
+- [x] **The yanked `validit` 0.2.5 and `wide` 1.6.0 pins are bumped** to
+      0.2.6 and 1.7.1 (2026-10-19).
