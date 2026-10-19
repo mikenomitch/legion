@@ -215,6 +215,9 @@ pub struct HttpSettings {
     /// `connect.upstreams[].ca`: the trust bundle an external `https://`
     /// upstream is verified against instead of the public roots.
     pub ca: Option<crate::structs::source::Source>,
+    /// The allocation is gated: its egress requests fail closed while its
+    /// boot gate is shut or its policy has not arrived.
+    pub gated: bool,
 }
 
 /// Headers to set on an outgoing request in place of whatever the task sent
@@ -283,6 +286,7 @@ impl HttpSettings {
             pipelines: PipelineCache::default(),
             credentials: Vec::new(),
             ca: None,
+            gated: false,
         }
     }
 
@@ -726,7 +730,11 @@ async fn handle(
     };
     settings.budget.note_request();
 
-    // 1. Policy.
+    // 1. Policy. An egress request to an external target runs the shared
+    // judge: the gate, the host guard on every resolved address, then the
+    // chain per address with the request head, so a CIDR rule sees what the
+    // name resolves to. A catalog service's endpoints are judged at the
+    // gate and by the service name; ingress by its own chain.
     let direction = settings.direction;
     let policy = settings.context.policy_for(settings.allocation_id);
     let chain: Option<&EffectiveChain> = policy.as_ref().and_then(|p| {
@@ -736,30 +744,63 @@ async fn handle(
             p.egress.as_ref()
         }
     });
-    if let Some(chain) = chain {
-        let facts = RequestFacts {
-            host: Some(fact_host.as_str()),
-            ip: fact_host.parse().ok(),
-            port: fact_port,
-            identity: conn.identity.as_deref(),
-            method: &method,
-            path: path.split('?').next().unwrap_or("/"),
-            headers: &headers,
-        };
-        if let Verdict::Deny { source, reason } =
-            crate::structs::netpolicy::evaluate_request(chain, &facts)
+    let path_only = path.split('?').next().unwrap_or("/");
+    let mut judged: Option<Vec<std::net::SocketAddr>> = None;
+    let denial = match (direction, settings.target.as_ref()) {
+        ("egress", Some(target)) => match crate::worker::netd::egress::judge(
+            &settings.context,
+            settings.allocation_id,
+            settings.gated,
+            true,
+            &target.host,
+            target.port,
+            Some((&method, path_only, &headers)),
+        )
+        .await
         {
-            net_metrics::connection(direction, PROTOCOL_HTTP, "deny");
-            settings.context.record_denial(
-                settings.allocation_id,
-                direction,
-                PROTOCOL_HTTP,
-                &destination,
-                &source,
-                reason.as_deref(),
-                &method,
-                facts.path,
-            );
+            Ok(addrs) => {
+                judged = Some(addrs);
+                None
+            }
+            Err(denial) => Some(denial),
+        },
+        _ => crate::worker::netd::egress::gate_block(
+            &settings.context,
+            settings.allocation_id,
+            settings.gated && direction == "egress",
+            policy.as_deref(),
+        )
+        .or_else(|| {
+            let facts = RequestFacts {
+                host: Some(fact_host.as_str()),
+                ip: fact_host.parse().ok(),
+                port: fact_port,
+                identity: conn.identity.as_deref(),
+                method: &method,
+                path: path_only,
+                headers: &headers,
+            };
+            match crate::structs::netpolicy::evaluate_request(chain?, &facts) {
+                Verdict::Deny { source, reason } => {
+                    Some(crate::worker::netd::egress::Denial::new(source, reason))
+                }
+                _ => None,
+            }
+        }),
+    };
+    if let Some(crate::worker::netd::egress::Denial { source, reason }) = denial {
+        net_metrics::connection(direction, PROTOCOL_HTTP, "deny");
+        settings.context.record_denial(
+            settings.allocation_id,
+            direction,
+            PROTOCOL_HTTP,
+            &destination,
+            &source,
+            reason.as_deref(),
+            &method,
+            path_only,
+        );
+        if let Some(chain) = chain {
             access_log(
                 &settings,
                 chain,
@@ -774,20 +815,19 @@ async fn handle(
                 0,
             )
             .await;
-            note_edge_denied(&settings);
-            return denied_response(
-                direction,
-                &settings.key,
-                &destination,
-                &source,
-                reason.as_deref(),
-            );
         }
+        note_edge_denied(&settings);
+        return denied_response(
+            direction,
+            &settings.key,
+            &destination,
+            &source,
+            reason.as_deref(),
+        );
     }
 
     // 1b. Handlers, with the request head: a webhook may deny, a proxy may
     // take the request, a plugin may answer or rewrite it.
-    let path_only = path.split('?').next().unwrap_or("/").to_string();
     let hop_facts = HopFacts {
         allocation_id: settings.allocation_id,
         direction,
@@ -799,7 +839,7 @@ async fn handle(
         identity: conn.identity.as_deref(),
         upstream: (direction == "egress").then_some(settings.key.as_str()),
         method: Some(&method),
-        path: Some(&path_only),
+        path: Some(path_only),
         headers: &headers,
     };
     let pipeline = settings.pipelines.get(
@@ -1096,49 +1136,21 @@ async fn handle(
         };
     }
 
-    // An external target is resolved once and judged by the host guard
-    // before any attempt; every attempt dials the address that passed, never
-    // the name again (worker-plane-auth plan §6.11).
-    let judged_target: Option<String> = match settings.target.as_ref() {
-        Some(target) if direction == "egress" => {
-            match crate::worker::netd::guard::resolve_and_guard(
-                settings.context.resolver(),
-                settings.context.host_guard(),
-                &target.host,
-                target.port,
-            )
-            .await
-            {
-                Ok(addrs) => Some(addrs[0].to_string()),
-                Err(crate::worker::netd::guard::GuardRefusal::Denied(reason)) => {
-                    let source = crate::structs::host_guard::HOST_GUARD_SOURCE;
-                    net_metrics::connection(direction, PROTOCOL_HTTP, "deny");
-                    settings.context.record_denial(
-                        settings.allocation_id,
-                        direction,
-                        PROTOCOL_HTTP,
-                        &destination,
-                        source,
-                        Some(&reason),
-                        &method,
-                        path.split('?').next().unwrap_or("/"),
-                    );
-                    note_edge_denied(&settings);
-                    return denied_response(
-                        direction,
-                        &settings.key,
-                        &destination,
-                        source,
-                        Some(&reason),
-                    );
-                }
-                Err(crate::worker::netd::guard::GuardRefusal::Unresolved(reason)) => {
-                    net_metrics::connection(direction, PROTOCOL_HTTP, "error");
-                    note_edge_request(&settings, None, None, started, bytes_in);
-                    return error_response(StatusCode::BAD_GATEWAY, reason);
-                }
+    // An external target was resolved once and judged above; every attempt
+    // dials the first address that passed, never the name again
+    // (worker-plane-auth plan §6.11).
+    let judged_target: Option<String> = match (judged, settings.target.as_ref()) {
+        (Some(addrs), Some(target)) => match addrs.first() {
+            Some(addr) => Some(addr.to_string()),
+            None => {
+                net_metrics::connection(direction, PROTOCOL_HTTP, "error");
+                note_edge_request(&settings, None, None, started, bytes_in);
+                return error_response(
+                    StatusCode::BAD_GATEWAY,
+                    format!("{} did not resolve", target.host),
+                );
             }
-        }
+        },
         _ => None,
     };
 
@@ -2659,6 +2671,148 @@ mod integration {
             text.contains("auth=[authorization:Bearer eyJ.token]"),
             "{text}"
         );
+    }
+
+    /// A forwarder whose context knows allocation 9 and resolves
+    /// `origin.test` to loopback, where the host guard opens only `origin`.
+    fn judged_context(origin: u16) -> (Arc<NetPolicyCache>, Arc<Denials>, UpstreamForwarder) {
+        let cache = Arc::new(NetPolicyCache::new());
+        let denials = Arc::new(Denials::new());
+        let resolver = crate::worker::netd::guard::test_support::FakeResolver::new();
+        resolver.answer("origin.test", vec![vec!["127.0.0.1".parse().unwrap()]]);
+        let guard = crate::structs::host_guard::HostGuard::new(
+            &crate::structs::host_guard::HostGuardConfig {
+                allow: vec![format!("127.0.0.1:{origin}")],
+                deny: vec![],
+            },
+        )
+        .unwrap();
+        let context = ForwarderContext::new(cache.clone(), denials.clone())
+            .with_resolver(resolver)
+            .with_host_guard(Arc::new(guard));
+        (
+            cache,
+            denials,
+            UpstreamForwarder::with_context(Arc::new(context)),
+        )
+    }
+
+    fn install(cache: &NetPolicyCache, allocation_id: i64, egress: serde_json::Value) {
+        let mut object: NetPolicyObject = serde_json::from_value(serde_json::json!({
+            "name": "t", "enforcement": "require", "egress": egress,
+        }))
+        .unwrap();
+        object.normalize_and_validate().unwrap();
+        let policy = merge_policies(&[object], InlinePolicy::default());
+        let hash = policy.hash.clone();
+        cache.apply_assignments(&[AllocNetPolicy {
+            allocation_id,
+            policy_hash: hash.clone(),
+        }]);
+        cache.insert_body(&hash, policy).unwrap();
+    }
+
+    fn external_spec(
+        allocation_id: i64,
+        port: u16,
+        to: String,
+        attachment: crate::worker::netd::attach::Attachment,
+    ) -> UpstreamSpec {
+        UpstreamSpec {
+            allocation_id,
+            service: "ext".into(),
+            local_port: Some(port),
+            http_protocol: false,
+            balance: "round_robin".into(),
+            to: Some(to),
+            http: None,
+            handlers: Vec::new(),
+            credentials: Vec::new(),
+            ca: None,
+            vip: None,
+            canonical_port: None,
+            attachment,
+        }
+    }
+
+    /// A gated allocation's HTTP-mode upstream fails closed like its L4
+    /// path: nothing is served until its policy arrives.
+    #[tokio::test]
+    async fn a_gated_http_upstream_fails_closed_until_its_policy_arrives_test() {
+        use tokio::net::UnixStream;
+        let (origin, hits) = start_origin(0).await;
+        let (cache, denials, forwarder) = judged_context(origin);
+        let dir = tempfile::tempdir().unwrap();
+        forwarder
+            .sync(&[external_spec(
+                9,
+                20011,
+                format!("http://origin.test:{origin}"),
+                crate::worker::netd::attach::Attachment::GuestVsock {
+                    scratch: dir.path().to_path_buf(),
+                },
+            )])
+            .await;
+        let get = || async {
+            let mut stream = UnixStream::connect(dir.path().join("vsock.sock_20011"))
+                .await
+                .unwrap();
+            stream
+                .write_all(b"GET /x HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
+                .await
+                .unwrap();
+            let mut buf = Vec::new();
+            stream.read_to_end(&mut buf).await.unwrap();
+            String::from_utf8_lossy(&buf).to_ascii_lowercase()
+        };
+        let pending = get().await;
+        assert!(pending.starts_with("http/1.1 403"), "{pending}");
+        assert!(
+            pending.contains("legion-denied-by: policy-pending"),
+            "{pending}"
+        );
+        assert_eq!(hits.load(Ordering::SeqCst), 0, "nothing reached the origin");
+        assert_eq!(denials.drain()[0].source, "policy-pending");
+
+        install(
+            &cache,
+            9,
+            serde_json::json!({ "protocol": "http", "policy": "allow" }),
+        );
+        let served = get().await;
+        assert!(served.starts_with("http/1.1 200"), "{served}");
+    }
+
+    /// A CIDR rule judges the address an HTTP-mode upstream's name resolves
+    /// to, as it does on the L4 path: the name alone does not get past it.
+    #[tokio::test]
+    async fn cidr_rules_judge_an_http_upstreams_resolved_address_test() {
+        let (origin, hits) = start_origin(0).await;
+        let (cache, denials, forwarder) = judged_context(origin);
+        install(
+            &cache,
+            7,
+            serde_json::json!({
+                "protocol": "http",
+                "policy": "allow",
+                "rules": [{ "when": { "cidr": "127.0.0.0/8" }, "action": "deny", "reason": "no loopback" }]
+            }),
+        );
+        let port = free_port().await;
+        forwarder
+            .sync(&[external_spec(
+                7,
+                port,
+                format!("http://origin.test:{origin}"),
+                crate::worker::netd::attach::Attachment::Host,
+            )])
+            .await;
+        let (status, head, _) = request(port, "GET /x HTTP/1.1\r\nHost: x\r\n\r\n").await;
+        assert_eq!(status, 403, "{head}");
+        assert!(head.contains("legion-denied-by: policy/t#0"), "{head}");
+        assert_eq!(hits.load(Ordering::SeqCst), 0);
+        let recorded = denials.drain();
+        assert_eq!(recorded[0].reason, "no loopback", "{recorded:?}");
     }
 
     #[tokio::test]

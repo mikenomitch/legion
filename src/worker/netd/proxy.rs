@@ -25,16 +25,15 @@
 //! which is what makes the namespace a boundary and the proxy the door.
 
 use crate::prelude::*;
-use crate::structs::netpolicy::{ConnectFacts, RequestFacts, Verdict, PROTOCOL_HTTP, PROTOCOL_TCP};
+use crate::structs::netpolicy::{ConnectFacts, Verdict, PROTOCOL_HTTP, PROTOCOL_TCP};
 use crate::worker::forwarder::ForwarderContext;
 use crate::worker::netd::attach::Attachment;
+use crate::worker::netd::egress::{self, Denial};
 use crate::worker::netd::guard::{self, GuardRefusal};
 use crate::worker::netd::handlers::{self, ExchangeOutcome, HopFacts, HopOutcome, ProxyTarget};
 use crate::worker::netd::http;
 use crate::worker::netd::listen::{dial_tcp, spawn_accept_loop, ListenAddr};
 use crate::worker::netd::metrics as net_metrics;
-use crate::worker::netd::netns;
-use crate::worker::netd::policy::{egress_connect_verdict, gated_egress_connect_verdict};
 use crate::worker::netd::proxyproto::Prefixed;
 use crate::worker::netd::splice::SpliceStream;
 
@@ -405,25 +404,14 @@ pub(crate) async fn serve_captured<S>(
         .map(str::to_string)
         .unwrap_or_else(|| original.ip().to_string());
     // A gated allocation fails closed, here as at its proxy.
-    if proxy.gated && netns::gate_is_shut(proxy.allocation_id) {
-        refuse_captured(
-            &proxy,
-            &label,
-            &destination,
-            "gate".to_string(),
-            Some("network gate is shut until the placement is ratified".into()),
-        );
-        return;
-    }
     let policy = proxy.context.policy_for(proxy.allocation_id);
-    if proxy.gated && policy.is_none() && !proxy.context.policy_known(proxy.allocation_id) {
-        refuse_captured(
-            &proxy,
-            &label,
-            &destination,
-            "policy-pending".to_string(),
-            Some("network policy has not arrived yet".into()),
-        );
+    if let Some(Denial { source, reason }) = egress::gate_block(
+        &proxy.context,
+        proxy.allocation_id,
+        proxy.gated,
+        policy.as_deref(),
+    ) {
+        refuse_captured(&proxy, &label, &destination, source, reason);
         return;
     }
     let http_chain = policy
@@ -431,9 +419,7 @@ pub(crate) async fn serve_captured<S>(
         .and_then(|policy| policy.egress.as_ref())
         .is_some_and(|chain| chain.is_http());
     if let Some(name) = peeked.name() {
-        if let Err(Refused::Denied(source, reason)) =
-            name_owns_address(&proxy, name, original).await
-        {
+        if let Err(Denial { source, reason }) = name_owns_address(&proxy, name, original).await {
             refuse_captured(&proxy, name, &destination, source, reason);
             return;
         }
@@ -444,8 +430,8 @@ pub(crate) async fn serve_captured<S>(
         return;
     }
     let host = peeked.name().map(str::to_string);
-    let verdict = connect_verdict(
-        &proxy,
+    let verdict = egress::connect_verdict(
+        proxy.gated,
         policy.as_deref(),
         &ConnectFacts {
             host: host.as_deref(),
@@ -520,7 +506,7 @@ pub(crate) async fn serve_captured<S>(
 
 /// A captured flow names `name`: the address the task dialed must be one
 /// of that name's, or the name is a lie told to pass a host rule.
-async fn name_owns_address(proxy: &Proxy, name: &str, original: SocketAddr) -> Result<(), Refused> {
+async fn name_owns_address(proxy: &Proxy, name: &str, original: SocketAddr) -> Result<(), Denial> {
     match guard::resolve_and_guard(
         proxy.context.resolver(),
         proxy.context.host_guard(),
@@ -530,15 +516,15 @@ async fn name_owns_address(proxy: &Proxy, name: &str, original: SocketAddr) -> R
     .await
     {
         Ok(addrs) if addrs.iter().any(|addr| addr.ip() == original.ip()) => Ok(()),
-        Ok(_) | Err(GuardRefusal::Unresolved(_)) => Err(Refused::Denied(
-            crate::structs::netpolicy::SOURCE_CAPTURE_NAME.to_string(),
+        Ok(_) | Err(GuardRefusal::Unresolved(_)) => Err(Denial::new(
+            crate::structs::netpolicy::SOURCE_CAPTURE_NAME,
             Some(format!(
                 "the flow names {name}, but {} is not one of {name}'s addresses",
                 original.ip()
             )),
         )),
-        Err(GuardRefusal::Denied(reason)) => Err(Refused::Denied(
-            crate::structs::host_guard::HOST_GUARD_SOURCE.to_string(),
+        Err(GuardRefusal::Denied(reason)) => Err(Denial::new(
+            crate::structs::host_guard::HOST_GUARD_SOURCE,
             Some(reason),
         )),
     }
@@ -616,147 +602,6 @@ async fn serve_captured_http<S>(
         .await
     {
         debug!(error = ?err, "Captured HTTP connection ended with an error");
-    }
-}
-
-/// An HTTP request head as policy sees it: method, path, lower-cased headers.
-type RequestHead<'a> = (&'a str, &'a str, &'a [(String, String)]);
-
-/// Why a destination may not be dialed: the verdict's source and reason,
-/// which a `403` (or a SOCKS `0x02`) carries.
-enum Refused {
-    Denied(String, Option<String>),
-}
-
-/// Judges one destination and returns the addresses that may be dialed.
-///
-/// Order: the boot gate, then the host guard (which needs the name
-/// resolved), then pending policy, then the egress chain, evaluated once per
-/// resolved address with the name still attached, so a name rule matches
-/// the name and a CIDR rule matches the address. A host-guard denial is
-/// final: no rule below it can allow what it refused. The caller dials only
-/// the returned addresses and never resolves the name again
-/// (worker-plane-auth plan §6.11).
-async fn judge(
-    proxy: &Proxy,
-    host: &str,
-    port: u16,
-    request: Option<RequestHead<'_>>,
-) -> Result<Vec<SocketAddr>, Refused> {
-    if proxy.gated && netns::gate_is_shut(proxy.allocation_id) {
-        return Err(Refused::Denied(
-            "gate".to_string(),
-            Some("network gate is shut until the placement is ratified".into()),
-        ));
-    }
-    let addrs = match guard::resolve_and_guard(
-        proxy.context.resolver(),
-        proxy.context.host_guard(),
-        host,
-        port,
-    )
-    .await
-    {
-        Ok(addrs) => addrs,
-        Err(GuardRefusal::Denied(reason)) => {
-            return Err(Refused::Denied(
-                crate::structs::host_guard::HOST_GUARD_SOURCE.to_string(),
-                Some(reason),
-            ))
-        }
-        Err(GuardRefusal::Unresolved(reason)) => {
-            debug!(allocation_id = proxy.allocation_id, %reason, "Egress proxy could not resolve the destination");
-            // Nothing to dial. A name the policy refuses still reads as that
-            // refusal (more useful than a 502); anything else is unreachable.
-            let policy = proxy.context.policy_for(proxy.allocation_id);
-            if proxy.gated && policy.is_none() && !proxy.context.policy_known(proxy.allocation_id) {
-                return Err(Refused::Denied(
-                    "policy-pending".to_string(),
-                    Some("network policy has not arrived yet".into()),
-                ));
-            }
-            let verdict = connect_verdict(
-                proxy,
-                policy.as_deref(),
-                &ConnectFacts {
-                    host: Some(host),
-                    ip: None,
-                    port,
-                    identity: None,
-                },
-            );
-            // Allowed by name: nothing this node can dial (the caller's
-            // direct dial fails with a 502), but a `proxy` handler may still
-            // take the flow and resolve the name on its own side.
-            return match verdict {
-                Verdict::Deny { source, reason } => Err(Refused::Denied(source, reason)),
-                _ => Ok(Vec::new()),
-            };
-        }
-    };
-    let policy = proxy.context.policy_for(proxy.allocation_id);
-    if proxy.gated && policy.is_none() && !proxy.context.policy_known(proxy.allocation_id) {
-        return Err(Refused::Denied(
-            "policy-pending".to_string(),
-            Some("network policy has not arrived yet".into()),
-        ));
-    }
-    let mut first_denial: Option<(String, Option<String>)> = None;
-    let mut allowed = Vec::with_capacity(addrs.len());
-    for addr in addrs {
-        let ip = Some(addr.ip());
-        let verdict = match (policy.as_ref().and_then(|p| p.egress.as_ref()), request) {
-            (Some(chain), Some((method, path, headers))) if chain.is_http() => {
-                crate::structs::netpolicy::evaluate_request(
-                    chain,
-                    &RequestFacts {
-                        host: Some(host),
-                        ip,
-                        port,
-                        identity: None,
-                        method,
-                        path,
-                        headers,
-                    },
-                )
-            }
-            _ => connect_verdict(
-                proxy,
-                policy.as_deref(),
-                &ConnectFacts {
-                    host: Some(host),
-                    ip,
-                    port,
-                    identity: None,
-                },
-            ),
-        };
-        match verdict {
-            Verdict::Allow | Verdict::Defer => allowed.push(addr),
-            Verdict::Deny { source, reason } => {
-                first_denial.get_or_insert((source, reason));
-            }
-        }
-    }
-    if allowed.is_empty() {
-        let (source, reason) = first_denial.unwrap_or_else(|| ("policy".into(), None));
-        return Err(Refused::Denied(source, reason));
-    }
-    Ok(allowed)
-}
-
-/// The connect-time verdict: a gated allocation that no egress chain
-/// covers denies (`gated-default`); a cooperative one allows with
-/// attribution.
-fn connect_verdict(
-    proxy: &Proxy,
-    policy: Option<&crate::structs::netpolicy::EffectivePolicy>,
-    facts: &ConnectFacts<'_>,
-) -> Verdict {
-    if proxy.gated {
-        gated_egress_connect_verdict(policy, facts)
-    } else {
-        egress_connect_verdict(policy, facts)
     }
 }
 
@@ -992,9 +837,19 @@ where
         .unwrap_or_else(|| request.uri().to_string());
     let (host, port) = split_host_port(&target, 443);
     let destination = format!("{host}:{port}");
-    let addrs = match judge(&proxy, &host, port, None).await {
+    let addrs = match egress::judge(
+        &proxy.context,
+        proxy.allocation_id,
+        proxy.gated,
+        false,
+        &host,
+        port,
+        None,
+    )
+    .await
+    {
         Ok(addrs) => addrs,
-        Err(Refused::Denied(source, reason)) => {
+        Err(Denial { source, reason }) => {
             return refuse(
                 &proxy,
                 &host,
@@ -1107,9 +962,19 @@ async fn forward_absolute(
             )
         })
         .collect();
-    let addrs = match judge(&proxy, &host, port, Some((&method, path_only, &headers))).await {
+    let addrs = match egress::judge(
+        &proxy.context,
+        proxy.allocation_id,
+        proxy.gated,
+        false,
+        &host,
+        port,
+        Some((&method, path_only, &headers)),
+    )
+    .await
+    {
         Ok(addrs) => addrs,
-        Err(Refused::Denied(source, reason)) => {
+        Err(Denial { source, reason }) => {
             log_request(
                 &proxy,
                 &method,
@@ -1699,9 +1564,19 @@ where
     }
     let port = u16::from_be_bytes(port_bytes);
     let destination = format!("{host}:{port}");
-    let addrs = match judge(&proxy, &host, port, None).await {
+    let addrs = match egress::judge(
+        &proxy.context,
+        proxy.allocation_id,
+        proxy.gated,
+        false,
+        &host,
+        port,
+        None,
+    )
+    .await
+    {
         Ok(addrs) => addrs,
-        Err(Refused::Denied(source, reason)) => {
+        Err(Denial { source, reason }) => {
             net_metrics::connection("egress", PROTOCOL_TCP, "deny");
             proxy
                 .context

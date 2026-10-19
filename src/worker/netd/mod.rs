@@ -25,6 +25,7 @@ pub mod attach;
 pub mod capture;
 pub mod datapath;
 pub mod dns;
+pub mod egress;
 pub mod graph;
 pub mod guard;
 pub mod guest_agent;

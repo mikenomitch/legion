@@ -341,6 +341,9 @@ mod harness_test {
             "name": "read-only-free-tier",
             "module": { "source": "file:///x.wasm", "checksum": format!("sha256:{}", "0".repeat(64)) },
             "stages": ["request"],
+            // A debug build on a loaded test runner can take longer than the
+            // default 10ms for one callback; this test is about the answer.
+            "limits": { "deadline": "1s" },
         }))
         .unwrap();
         object.normalize_and_validate().unwrap();

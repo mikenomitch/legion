@@ -1760,6 +1760,7 @@ impl UpstreamShared {
                     );
                     settings.credentials = self.credentials.clone();
                     settings.ca = self.ca.clone();
+                    settings.gated = self.gated;
                     Arc::new(settings)
                 })
                 .clone(),
@@ -2335,77 +2336,41 @@ async fn forward_external<C>(
     C: SpliceStream,
 {
     let destination = target.addr();
-    // The boot gate before anything else, as everywhere in the datapath.
-    if shared.gated && crate::worker::netd::netns::gate_is_shut(shared.allocation_id) {
-        let facts = ConnectFacts {
-            host: Some(target.host.as_str()),
-            ip: target.host.parse().ok(),
-            port: target.port,
-            identity: None,
-        };
-        deny_if_policy_says_so(&shared, &facts, &destination).await;
-        let _ = client.shutdown().await;
-        return;
-    }
-    // Resolve once, judge every address against the host guard, and dial
-    // only what passed (worker-plane-auth plan §6.11): `to = "tcp://localhost:4747"`
-    // and a name that resolves to the metadata service are refused here.
-    let addrs = match crate::worker::netd::guard::resolve_and_guard(
-        shared.context.resolver(),
-        shared.context.host_guard(),
+    // The gate, the host guard, and policy per resolved address, in the
+    // datapath's one order; only addresses every check passed are dialed.
+    let allowed = match crate::worker::netd::egress::judge(
+        &shared.context,
+        shared.allocation_id,
+        shared.gated,
+        true,
         &target.host,
         target.port,
+        None,
     )
     .await
     {
-        Ok(addrs) => addrs,
-        Err(crate::worker::netd::guard::GuardRefusal::Denied(reason)) => {
-            deny_connection(
-                &shared,
-                &destination,
-                crate::structs::host_guard::HOST_GUARD_SOURCE,
-                Some(&reason),
-            );
-            let _ = client.shutdown().await;
-            return;
-        }
-        Err(crate::worker::netd::guard::GuardRefusal::Unresolved(reason)) => {
+        Ok(allowed) if allowed.is_empty() => {
             debug!(
                 allocation_id = shared.allocation_id,
                 upstream = %shared.service,
-                %reason,
                 "External upstream did not resolve"
             );
             net_metrics::connection("egress", PROTOCOL_TCP, "error");
             let _ = client.shutdown().await;
             return;
         }
-    };
-    // Policy per resolved address: a name rule matches the name, a CIDR
-    // rule the address. Only addresses every check passed are dialed.
-    let mut allowed = Vec::with_capacity(addrs.len());
-    for addr in &addrs {
-        let facts = ConnectFacts {
-            host: Some(target.host.as_str()),
-            ip: Some(addr.ip()),
-            port: target.port,
-            identity: None,
-        };
-        if !policy_denies(&shared, &facts) {
-            allowed.push(*addr);
+        Ok(allowed) => allowed,
+        Err(denial) => {
+            deny_connection(
+                &shared,
+                &destination,
+                &denial.source,
+                denial.reason.as_deref(),
+            );
+            let _ = client.shutdown().await;
+            return;
         }
-    }
-    if allowed.is_empty() {
-        let facts = ConnectFacts {
-            host: Some(target.host.as_str()),
-            ip: addrs.first().map(|addr| addr.ip()),
-            port: target.port,
-            identity: None,
-        };
-        deny_if_policy_says_so(&shared, &facts, &destination).await;
-        let _ = client.shutdown().await;
-        return;
-    }
+    };
     let hop_facts = HopFacts {
         allocation_id: shared.allocation_id,
         direction: "egress",
@@ -2521,28 +2486,9 @@ async fn forward_external<C>(
     }
 }
 
-/// Evaluate the allocation's egress policy for one destination. Returns true
-/// when the connection must be closed, having recorded the denial and the
-/// metric. No policy (or an allow / defer verdict) returns false.
-/// Whether the allocation's egress verdict (the gate, pending policy, then
-/// the chain) would refuse `facts`, without recording anything.
-fn policy_denies(shared: &Arc<UpstreamShared>, facts: &ConnectFacts<'_>) -> bool {
-    if shared.gated {
-        if crate::worker::netd::netns::gate_is_shut(shared.allocation_id) {
-            return true;
-        }
-        let policy = shared.context.policy_for(shared.allocation_id);
-        if policy.is_none() && !shared.context.policy_known(shared.allocation_id) {
-            return true;
-        }
-    }
-    let policy = shared.context.policy_for(shared.allocation_id);
-    matches!(
-        egress_connect_verdict(policy.as_deref(), facts),
-        Verdict::Deny { .. }
-    )
-}
-
+/// Evaluate the allocation's egress policy for one catalog endpoint.
+/// Returns true when the connection must be closed, having recorded the
+/// denial and the metric. No policy (or an allow verdict) returns false.
 async fn deny_if_policy_says_so(
     shared: &Arc<UpstreamShared>,
     facts: &ConnectFacts<'_>,
@@ -2550,26 +2496,18 @@ async fn deny_if_policy_says_so(
 ) -> bool {
     let policy = shared.context.policy_for(shared.allocation_id);
     // A gated allocation fails closed: while its policy is still pending, or
-    // while its edge-boot gate is shut, nothing leaves.
-    let gated_block = if shared.gated {
-        if crate::worker::netd::netns::gate_is_shut(shared.allocation_id) {
-            Some((
-                "gate".to_string(),
-                Some("network gate is shut until the placement is ratified".to_string()),
-            ))
-        } else if policy.is_none() && !shared.context.policy_known(shared.allocation_id) {
-            Some((
-                "policy-pending".to_string(),
-                Some("network policy has not arrived yet".to_string()),
-            ))
-        } else {
-            None
-        }
-    } else {
-        None
-    };
-    let verdict = match gated_block {
-        Some((source, reason)) => Verdict::Deny { source, reason },
+    // while its edge-boot gate is shut, nothing leaves. A declared upstream
+    // is an explicit allowance, so no chain means allow.
+    let verdict = match crate::worker::netd::egress::gate_block(
+        &shared.context,
+        shared.allocation_id,
+        shared.gated,
+        policy.as_deref(),
+    ) {
+        Some(denial) => Verdict::Deny {
+            source: denial.source,
+            reason: denial.reason,
+        },
         None => egress_connect_verdict(policy.as_deref(), facts),
     };
     // An HTTP chain over an upstream that does not speak HTTP: a rule that
@@ -2594,29 +2532,7 @@ async fn deny_if_policy_says_so(
     match verdict {
         Verdict::Allow | Verdict::Defer => false,
         Verdict::Deny { source, reason } => {
-            debug!(
-                allocation_id = shared.allocation_id,
-                upstream = %shared.service,
-                destination = %destination,
-                source = %source,
-                "Egress connection denied by policy"
-            );
-            net_metrics::connection("egress", PROTOCOL_TCP, "deny");
-            shared.context.edges().record_denied(
-                shared.allocation_id,
-                &shared.service,
-                PROTOCOL_TCP,
-            );
-            shared.context.record_denial(
-                shared.allocation_id,
-                "egress",
-                PROTOCOL_TCP,
-                destination,
-                &source,
-                reason.as_deref(),
-                "",
-                "",
-            );
+            deny_connection(shared, destination, &source, reason.as_deref());
             true
         }
     }
@@ -2649,7 +2565,7 @@ fn deny_connection(
         upstream = %shared.service,
         destination = %destination,
         source = %source,
-        "Egress connection denied by a handler"
+        "Egress connection denied"
     );
     net_metrics::connection("egress", PROTOCOL_TCP, "deny");
     shared
