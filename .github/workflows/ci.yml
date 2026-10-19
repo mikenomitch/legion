@@ -91,6 +91,63 @@ jobs:
   # rolling upgrade (docs/upgrades.md), so a wire-incompatible change to
   # proto/legion.proto must be deliberate. This compares the PR's proto with the
   # base branch's using `buf breaking` and the WIRE rules in proto/buf.yaml.
+  # The kernel classifier's programs are checked in as an object
+  # (bpf/legion_net.bpf.o) so `cargo build` needs only protoc. This rebuilds
+  # it from bpf/legion_net.bpf.c with the pinned clang and fails when the
+  # committed object is stale.
+  bpf-object:
+    name: BPF Object Is Current
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install clang
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang-18 linux-libc-dev
+
+      - name: Rebuild and compare
+        env:
+          CLANG: clang-18
+        run: bpf/build.sh --check
+
+  # The kernel classifier's tests load the programs into the runner's
+  # kernel, attach them to scratch cgroups, and dial from child processes,
+  # so they need root. They are `#[ignore]`d in the ordinary run.
+  kernel-tests:
+    name: Kernel Classifier Tests
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install protobuf compiler and clang
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler clang-18
+
+      - name: Build the tests and the io_uring probe
+        env:
+          CARGO_PROFILE_DEV_DEBUG: 0
+          CARGO_PROFILE_TEST_DEBUG: 0
+        run: |
+          cargo test --lib --locked --no-run
+          clang-18 -O2 -o "$RUNNER_TEMP/uring_connect" bpf/tests/uring_connect.c
+
+      - name: Run the root-only kernel tests
+        env:
+          CARGO_PROFILE_DEV_DEBUG: 0
+          CARGO_PROFILE_TEST_DEBUG: 0
+        run: |
+          sudo -E env "PATH=$PATH" LEGION_URING_PROBE="$RUNNER_TEMP/uring_connect" \
+            cargo test --lib --locked -- --ignored --test-threads=1 kernel:: capture_kernel
+
   # For an intentional break, bump PROTOCOL_VERSION and label the PR
   # `proto-breaking-ok` to skip the check.
   proto-breaking:

@@ -408,7 +408,7 @@ connect = {
 ```
 
 The task calls `http://$LEGION_UPSTREAM_API/...` with no token. The node's
-forwarder fetches the token with `GetUpstreamCredentials` (the manager
+forwarder fetches the token with `FetchDatapathMaterial` (the manager
 mints it from the scheduling record, as above), holds it in memory, and asks
 for a new one once less than half the TTL is left. The worker does not run a
 refresh loop or write a file for an identity with no `env` or `file`, so the

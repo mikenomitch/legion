@@ -117,6 +117,7 @@ pub fn config() -> Command {
                         .arg(json_flag()),
                 ),
         )
+        .subcommand(crate::cmd::net_plugin::config())
         .subcommand(
             job_scope(Command::new("doctor"))
                 .about("Walk a task's network layers — policy, mode, datapath, handlers, TLS, gate — and name the first one that is wrong")
@@ -141,7 +142,7 @@ pub fn config() -> Command {
         )
         .subcommand(
             Command::new("ca")
-                .about("The cluster CA: the worker plane, the worker-to-manager channel, and certFrom = \"legion\"")
+                .about("The cluster CA: the worker plane, the worker-to-manager channel, and service.mesh")
                 .subcommand_required(true)
                 .subcommand(
                     Command::new("show")
@@ -225,6 +226,7 @@ pub async fn handle(matches: &ArgMatches) -> R<()> {
             Some(("test", sub)) => test(sub).await,
             _ => unreachable!(),
         },
+        Some(("plugin", plugin)) => crate::cmd::net_plugin::handle(plugin).await,
         Some(("doctor", sub)) => doctor(sub).await,
         Some(("handler", handler)) => match handler.subcommand() {
             Some(("test", sub)) => handler_test(sub).await,
@@ -823,6 +825,7 @@ async fn apply(matches: &ArgMatches) -> R<()> {
             "dryRun": dry_run,
             "policy": policy_json(&policy),
             "affectedAllocations": reply.affected_allocations,
+            "warnings": reply.warnings,
         }));
         return Ok(());
     }
@@ -846,6 +849,9 @@ async fn apply(matches: &ArgMatches) -> R<()> {
         for entry in &reply.affected_allocations {
             println!("  {entry}");
         }
+    }
+    for warning in &reply.warnings {
+        println!("warning: {warning}");
     }
     Ok(())
 }
@@ -974,6 +980,24 @@ async fn show(matches: &ArgMatches) -> R<()> {
         &reply.matched_policies,
         &effective,
     );
+    // Where the egress chain runs in the kernel (plan §6.A).
+    let statuses: Vec<NodeStatus> = reply
+        .node_status_json
+        .iter()
+        .filter_map(|json| serde_json::from_str(json).ok())
+        .collect();
+    if effective.egress.is_some() && !statuses.is_empty() {
+        let enforced = statuses
+            .iter()
+            .filter(|status| status.kernel.as_ref().is_some_and(|k| k.enforced))
+            .count();
+        if enforced > 0 {
+            println!(
+                "  egress enforced in the kernel on {enforced}/{} running allocations; allowed flows connect directly",
+                statuses.len()
+            );
+        }
+    }
     Ok(())
 }
 
@@ -996,6 +1020,9 @@ fn print_effective(
     } else {
         println!("  mode: {effective_mode} (task declared {declared_mode})");
     }
+    if let Some(mesh) = effective.mesh {
+        println!("  mesh: {}", if mesh { "on" } else { "off" });
+    }
     if matched.is_empty() {
         println!("  stored policies: none matched");
     } else {
@@ -1013,18 +1040,21 @@ fn print_effective(
             continue;
         };
         println!(
-            "  {direction}: protocol {} · fallthrough {} · onError {}{}",
+            "  {direction}: protocol {} · fallthrough {}{}",
             chain.protocol,
             chain.policy,
-            chain.on_error,
             if chain.access_log {
                 " · accessLog"
             } else {
                 ""
             }
         );
-        if let Some(tls) = chain.tls.as_ref() {
-            println!("    tls: {}", tls.mode);
+        if let Some(callers) = chain.callers.as_ref() {
+            println!(
+                "    0. deny callers not in [{}] ({}; the mesh port only)",
+                callers.allow.join(", "),
+                callers.source
+            );
         }
         for (index, rule) in chain.rules.iter().enumerate() {
             let m = &rule.rule.matcher;
@@ -1069,19 +1099,19 @@ fn print_effective(
         }
         for handler in &chain.handlers {
             let h = &handler.handler;
-            let target = h
-                .url
-                .clone()
-                .or(h.service.clone().map(|s| format!("service {s}")))
-                .or(h.port.clone().map(|p| format!("port {p}")))
-                .or(h.node.clone().map(|n| format!("node {n}")))
-                .unwrap_or_default();
+            let entry = h.kind.entry();
             println!(
-                "    handler {} {}  timeout {} onError {}  [{}]",
-                h.handler,
-                target,
-                h.timeout.as_deref().unwrap_or("2s"),
-                h.on_error.as_deref().unwrap_or(&chain.on_error),
+                "    handler {} {}  {}  stage {}  timeout {} onError {}  [{}]",
+                entry.name,
+                h.kind.target(),
+                entry.placement.as_str(),
+                entry.stage_names(),
+                h.timeout
+                    .as_deref()
+                    .unwrap_or(crate::structs::hops::DEFAULT_HOP_TIMEOUT),
+                h.on_error
+                    .as_deref()
+                    .unwrap_or(crate::structs::netpolicy::ON_ERROR_DENY),
                 handler.source
             );
         }
@@ -1193,6 +1223,29 @@ struct NodeStatus {
     tls_error: String,
     #[serde(default)]
     mesh_identity: bool,
+    /// The kernel classifier's view, on a node that runs it.
+    #[serde(default)]
+    kernel: Option<NodeKernelStatus>,
+}
+
+/// `NetAllocStatus.kernel`, as the node reports it.
+#[derive(serde::Deserialize, Default, Clone)]
+#[serde(rename_all = "camelCase")]
+struct NodeKernelStatus {
+    #[serde(default)]
+    enforced: bool,
+    #[serde(default)]
+    capture: bool,
+    #[serde(default)]
+    rules: u32,
+    #[serde(default)]
+    reason: String,
+    #[serde(default)]
+    passed: u64,
+    #[serde(default)]
+    redirected: u64,
+    #[serde(default)]
+    denied: u64,
 }
 
 fn default_true() -> bool {
@@ -1365,7 +1418,7 @@ pub(crate) fn diagnose_network(
                 layer: "datapath",
                 status: if status.mode == "gated" { "fail" } else { "warn" },
                 detail: format!("allocation {alloc}: the node has not received the policy body yet (fail-closed while gated)"),
-                hint: Some("the worker fetches it by hash on its next heartbeat; persistent means the manager could not serve FetchNetPolicy — check manager logs".into()),
+                hint: Some("the worker fetches it by hash on its next heartbeat; persistent means the manager could not serve FetchDatapathMaterial — check manager logs".into()),
             });
             return steps;
         }
@@ -1388,18 +1441,18 @@ pub(crate) fn diagnose_network(
                 hint: Some("normal for a `boot`-gated provisional start; see docs/edge-boot.md".into()),
             });
         }
-        // TLS material: an ingress chain that terminates TLS needs its
-        // files (or the mesh certificate) before it accepts anything.
-        let kv_cert = effective
-            .ingress
-            .as_ref()
-            .and_then(|c| c.tls.as_ref())
-            .and_then(|t| t.cert_kv_path())
+        // TLS material: a port that terminates TLS needs its certificate
+        // (from KV or files, or the mesh certificate) before it accepts
+        // anything. A KV problem names its key: `kv <path> ...`.
+        let kv_cert = status
+            .tls_error
+            .split_once("kv ")
+            .and_then(|(_, rest)| rest.split_whitespace().next())
             .map(str::to_string);
         if !status.tls_ready {
             let hint = match &kv_cert {
-                Some(path) => format!("put the chain followed by the private key, as one PEM value: legion kv put {path} \"$(cat fullchain.pem privkey.pem)\""),
-                None => "for certPath/keyPath, put the files on the node (or stage them as artifacts); for certFrom = \"legion\", the node issues its certificate on its next heartbeat".into(),
+                Some(path) => format!("put the PEM value at {path} (a certificate: the chain followed by the private key, e.g. legion kv put {path} \"$(cat fullchain.pem privkey.pem)\"; a CA: the CA certificates)"),
+                None => "for tls.cert = { file }, put the files on the node (or stage them as artifacts); for service.mesh, the node issues its certificate on its next heartbeat".into(),
             };
             steps.push(DoctorStep {
                 layer: "tls",
@@ -1422,11 +1475,7 @@ pub(crate) fn diagnose_network(
                 hint: Some(format!("fix the value at {path}; the node picks it up on its next heartbeat")),
             });
         }
-        let wants_mesh = effective
-            .ingress
-            .as_ref()
-            .and_then(|c| c.tls.as_ref())
-            .is_some_and(|t| t.cert_from_mesh());
+        let wants_mesh = effective.mesh == Some(true);
         if wants_mesh && !status.mesh_identity {
             steps.push(DoctorStep {
                 layer: "tls",
@@ -1435,15 +1484,43 @@ pub(crate) fn diagnose_network(
                 hint: Some("issued on the node's next heartbeat (IssueNodeCertificate); persistent means the manager could not create the mesh CA — check manager logs".into()),
             });
         }
+        // The kernel classifier: whether the chain is enforced at connect().
+        if let Some(kernel) = &status.kernel {
+            if kernel.enforced {
+                steps.push(DoctorStep {
+                    layer: "kernel",
+                    status: "ok",
+                    detail: format!(
+                        "allocation {alloc}: egress chain enforced in the kernel ({} rules{}); last beat: {} passed, {} redirected, {} refused",
+                        kernel.rules,
+                        if kernel.capture { ", capture on" } else { "" },
+                        kernel.passed,
+                        kernel.redirected,
+                        kernel.denied
+                    ),
+                    hint: None,
+                });
+            } else if !kernel.reason.is_empty() {
+                steps.push(DoctorStep {
+                    layer: "kernel",
+                    status: "info",
+                    detail: format!("allocation {alloc}: {}", kernel.reason),
+                    hint: None,
+                });
+            }
+        }
         // External handlers: each hop the datapath has run, with its health.
         for hop in &status.handlers {
             steps.push(DoctorStep {
                 layer: "handler",
                 status: if hop.healthy { "ok" } else { "warn" },
                 detail: format!(
-                    "allocation {alloc}: {} {} → {} ({} calls, {} errors){}",
+                    "allocation {alloc}: {} {} [{}] → {} ({} calls, {} errors){}",
                     hop.source,
                     hop.handler,
+                    crate::structs::hops::handler_entry(&hop.handler)
+                        .map(|entry| entry.placement.as_str())
+                        .unwrap_or("?"),
                     hop.target,
                     hop.calls,
                     hop.errors,

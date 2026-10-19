@@ -11242,135 +11242,117 @@ export class IssueNodeCertificateReply extends Message<IssueNodeCertificateReply
 }
 
 /**
- * One allocation in a GetIngressCertificates request.
+ * One piece of material a node asks for: what kind, and what it is for.
+ * Never where the value lives; the manager derives that (see
+ * `FetchDatapathMaterial`).
  *
- * @generated from message legion.IngressCertificateKnown
+ * @generated from message legion.MaterialRef
  */
-export class IngressCertificateKnown extends Message<IngressCertificateKnown> {
+export class MaterialRef extends Message<MaterialRef> {
   /**
-   * The allocation (manager-facing id) whose ingress certificate to fetch.
+   * `policy`, `port_cert`, `client_ca`, `upstream_ca`, or `credential`.
    *
-   * @generated from field: int64 allocation_id = 1;
+   * @generated from field: string kind = 1;
+   */
+  kind = "";
+
+  /**
+   * The allocation (manager-facing id) the material is for. 0 for `policy`,
+   * which is shared by content hash.
+   *
+   * @generated from field: int64 allocation_id = 2;
    */
   allocationId = protoInt64.zero;
 
   /**
-   * The KV version of the certificate the worker already holds, or 0 for
-   * none. When it matches the current version the reply is `unchanged`.
+   * `policy`: the content hash. `port_cert` and `client_ca`: the port
+   * label. `upstream_ca` and `credential`: the upstream's key (its `name`,
+   * or the catalog service its `to` names).
    *
-   * @generated from field: int64 version = 2;
+   * @generated from field: string key = 3;
+   */
+  key = "";
+
+  /**
+   * `credential`: the injected header, lower-cased. Empty otherwise.
+   *
+   * @generated from field: string part = 4;
+   */
+  part = "";
+
+  /**
+   * The version the worker already holds, or 0 for none: the KV entry's
+   * version, or an identity token's expiry in unix seconds. Unused for
+   * `policy` (a hash never changes).
+   *
+   * @generated from field: int64 version = 5;
    */
   version = protoInt64.zero;
 
-  constructor(data?: PartialMessage<IngressCertificateKnown>) {
+  constructor(data?: PartialMessage<MaterialRef>) {
     super();
     proto3.util.initPartial(data, this);
   }
 
   static readonly runtime: typeof proto3 = proto3;
-  static readonly typeName = "legion.IngressCertificateKnown";
+  static readonly typeName = "legion.MaterialRef";
   static readonly fields: FieldList = proto3.util.newFieldList(() => [
-    { no: 1, name: "allocation_id", kind: "scalar", T: 3 /* ScalarType.INT64 */ },
-    { no: 2, name: "version", kind: "scalar", T: 3 /* ScalarType.INT64 */ },
+    { no: 1, name: "kind", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 2, name: "allocation_id", kind: "scalar", T: 3 /* ScalarType.INT64 */ },
+    { no: 3, name: "key", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 4, name: "part", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 5, name: "version", kind: "scalar", T: 3 /* ScalarType.INT64 */ },
   ]);
 
-  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): IngressCertificateKnown {
-    return new IngressCertificateKnown().fromBinary(bytes, options);
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): MaterialRef {
+    return new MaterialRef().fromBinary(bytes, options);
   }
 
-  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): IngressCertificateKnown {
-    return new IngressCertificateKnown().fromJson(jsonValue, options);
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): MaterialRef {
+    return new MaterialRef().fromJson(jsonValue, options);
   }
 
-  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): IngressCertificateKnown {
-    return new IngressCertificateKnown().fromJsonString(jsonString, options);
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): MaterialRef {
+    return new MaterialRef().fromJsonString(jsonString, options);
   }
 
-  static equals(a: IngressCertificateKnown | PlainMessage<IngressCertificateKnown> | undefined, b: IngressCertificateKnown | PlainMessage<IngressCertificateKnown> | undefined): boolean {
-    return proto3.util.equals(IngressCertificateKnown, a, b);
+  static equals(a: MaterialRef | PlainMessage<MaterialRef> | undefined, b: MaterialRef | PlainMessage<MaterialRef> | undefined): boolean {
+    return proto3.util.equals(MaterialRef, a, b);
   }
 }
 
 /**
- * Request payload for GetIngressCertificates.
+ * The answer for one `MaterialRef`.
  *
- * @generated from message legion.GetIngressCertificatesRequest
+ * @generated from message legion.Material
  */
-export class GetIngressCertificatesRequest extends Message<GetIngressCertificatesRequest> {
+export class Material extends Message<Material> {
   /**
-   * The worker node asking. Must match the caller's authenticated per-node
-   * credential.
+   * The ref this answers, echoed as sent.
    *
-   * @generated from field: string node_id = 1;
+   * @generated from field: legion.MaterialRef ref = 1;
    */
-  nodeId = "";
+  ref?: MaterialRef;
 
   /**
-   * The allocations on this node with a `certFrom = { kv }` ingress chain.
+   * Where the value comes from, as the declaration names it: `kv
+   * certs/app`, `identity api`, or `policy <hash>`. Set even when `error`
+   * is, so the worker can report which key is at fault.
    *
-   * @generated from field: repeated legion.IngressCertificateKnown known = 2;
+   * @generated from field: string source = 2;
    */
-  known: IngressCertificateKnown[] = [];
-
-  constructor(data?: PartialMessage<GetIngressCertificatesRequest>) {
-    super();
-    proto3.util.initPartial(data, this);
-  }
-
-  static readonly runtime: typeof proto3 = proto3;
-  static readonly typeName = "legion.GetIngressCertificatesRequest";
-  static readonly fields: FieldList = proto3.util.newFieldList(() => [
-    { no: 1, name: "node_id", kind: "scalar", T: 9 /* ScalarType.STRING */ },
-    { no: 2, name: "known", kind: "message", T: IngressCertificateKnown, repeated: true },
-  ]);
-
-  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): GetIngressCertificatesRequest {
-    return new GetIngressCertificatesRequest().fromBinary(bytes, options);
-  }
-
-  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): GetIngressCertificatesRequest {
-    return new GetIngressCertificatesRequest().fromJson(jsonValue, options);
-  }
-
-  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): GetIngressCertificatesRequest {
-    return new GetIngressCertificatesRequest().fromJsonString(jsonString, options);
-  }
-
-  static equals(a: GetIngressCertificatesRequest | PlainMessage<GetIngressCertificatesRequest> | undefined, b: GetIngressCertificatesRequest | PlainMessage<GetIngressCertificatesRequest> | undefined): boolean {
-    return proto3.util.equals(GetIngressCertificatesRequest, a, b);
-  }
-}
-
-/**
- * One allocation's certificate in a GetIngressCertificates reply.
- *
- * @generated from message legion.IngressCertificate
- */
-export class IngressCertificate extends Message<IngressCertificate> {
-  /**
-   * The allocation this certificate is for.
-   *
-   * @generated from field: int64 allocation_id = 1;
-   */
-  allocationId = protoInt64.zero;
+  source = "";
 
   /**
-   * The KV path the allocation's effective ingress chain names. Set even
-   * when `error` is, so the worker can report which key is at fault.
-   *
-   * @generated from field: string kv_path = 2;
-   */
-  kvPath = "";
-
-  /**
-   * The KV entry's version. The worker re-fetches when it moves.
+   * The value's current version (see `MaterialRef.version`). The worker
+   * sends it back next time.
    *
    * @generated from field: int64 version = 3;
    */
   version = protoInt64.zero;
 
   /**
-   * True when `version` equals the version the worker sent. No material is
+   * True when the version the worker sent is still current. No value is
    * returned.
    *
    * @generated from field: bool unchanged = 4;
@@ -11378,172 +11360,70 @@ export class IngressCertificate extends Message<IngressCertificate> {
   unchanged = false;
 
   /**
-   * The PEM bundle: the certificate chain, leaf first, then the private
-   * key. Validated by the manager before it is sent. Treat as a secret:
+   * The material: an `EffectivePolicy` as JSON (`policy`), a PEM bundle
+   * (`port_cert`), a CA bundle (`client_ca`, `upstream_ca`), or a header
+   * value (`credential`). Treat as a secret:
    * never log it, never write it to disk.
    *
-   * @generated from field: string bundle_pem = 5;
+   * @generated from field: string value = 5;
    */
-  bundlePem = "";
+  value = "";
 
   /**
-   * Why no certificate was returned, e.g. "kv certs/app not found" or
-   * "kv certs/app holds no private key". Empty on success.
+   * Why no value was returned. Empty on success.
    *
    * @generated from field: string error = 6;
    */
   error = "";
 
-  constructor(data?: PartialMessage<IngressCertificate>) {
+  /**
+   * True when `error` is authoritative: the key or the declaration is gone,
+   * so the worker drops what it holds instead of keeping it.
+   *
+   * @generated from field: bool absent = 7;
+   */
+  absent = false;
+
+  constructor(data?: PartialMessage<Material>) {
     super();
     proto3.util.initPartial(data, this);
   }
 
   static readonly runtime: typeof proto3 = proto3;
-  static readonly typeName = "legion.IngressCertificate";
+  static readonly typeName = "legion.Material";
   static readonly fields: FieldList = proto3.util.newFieldList(() => [
-    { no: 1, name: "allocation_id", kind: "scalar", T: 3 /* ScalarType.INT64 */ },
-    { no: 2, name: "kv_path", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 1, name: "ref", kind: "message", T: MaterialRef },
+    { no: 2, name: "source", kind: "scalar", T: 9 /* ScalarType.STRING */ },
     { no: 3, name: "version", kind: "scalar", T: 3 /* ScalarType.INT64 */ },
     { no: 4, name: "unchanged", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
-    { no: 5, name: "bundle_pem", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 5, name: "value", kind: "scalar", T: 9 /* ScalarType.STRING */ },
     { no: 6, name: "error", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 7, name: "absent", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
   ]);
 
-  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): IngressCertificate {
-    return new IngressCertificate().fromBinary(bytes, options);
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): Material {
+    return new Material().fromBinary(bytes, options);
   }
 
-  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): IngressCertificate {
-    return new IngressCertificate().fromJson(jsonValue, options);
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): Material {
+    return new Material().fromJson(jsonValue, options);
   }
 
-  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): IngressCertificate {
-    return new IngressCertificate().fromJsonString(jsonString, options);
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): Material {
+    return new Material().fromJsonString(jsonString, options);
   }
 
-  static equals(a: IngressCertificate | PlainMessage<IngressCertificate> | undefined, b: IngressCertificate | PlainMessage<IngressCertificate> | undefined): boolean {
-    return proto3.util.equals(IngressCertificate, a, b);
+  static equals(a: Material | PlainMessage<Material> | undefined, b: Material | PlainMessage<Material> | undefined): boolean {
+    return proto3.util.equals(Material, a, b);
   }
 }
 
 /**
- * Reply payload for GetIngressCertificates.
+ * Request payload for FetchDatapathMaterial.
  *
- * @generated from message legion.GetIngressCertificatesReply
+ * @generated from message legion.FetchDatapathMaterialRequest
  */
-export class GetIngressCertificatesReply extends Message<GetIngressCertificatesReply> {
-  /**
-   * One entry per requested allocation, in request order.
-   *
-   * @generated from field: repeated legion.IngressCertificate certificates = 1;
-   */
-  certificates: IngressCertificate[] = [];
-
-  constructor(data?: PartialMessage<GetIngressCertificatesReply>) {
-    super();
-    proto3.util.initPartial(data, this);
-  }
-
-  static readonly runtime: typeof proto3 = proto3;
-  static readonly typeName = "legion.GetIngressCertificatesReply";
-  static readonly fields: FieldList = proto3.util.newFieldList(() => [
-    { no: 1, name: "certificates", kind: "message", T: IngressCertificate, repeated: true },
-  ]);
-
-  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): GetIngressCertificatesReply {
-    return new GetIngressCertificatesReply().fromBinary(bytes, options);
-  }
-
-  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): GetIngressCertificatesReply {
-    return new GetIngressCertificatesReply().fromJson(jsonValue, options);
-  }
-
-  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): GetIngressCertificatesReply {
-    return new GetIngressCertificatesReply().fromJsonString(jsonString, options);
-  }
-
-  static equals(a: GetIngressCertificatesReply | PlainMessage<GetIngressCertificatesReply> | undefined, b: GetIngressCertificatesReply | PlainMessage<GetIngressCertificatesReply> | undefined): boolean {
-    return proto3.util.equals(GetIngressCertificatesReply, a, b);
-  }
-}
-
-/**
- * One injected header in a GetUpstreamCredentials request: an allocation on
- * the calling node, one of its upstreams, and one credential header on it.
- *
- * @generated from message legion.UpstreamCredentialKnown
- */
-export class UpstreamCredentialKnown extends Message<UpstreamCredentialKnown> {
-  /**
-   * The allocation (manager-facing id) whose credential to fetch.
-   *
-   * @generated from field: int64 allocation_id = 1;
-   */
-  allocationId = protoInt64.zero;
-
-  /**
-   * The upstream's key: the `name` of an external upstream
-   * (`connect.upstreams[].name`), as in `LEGION_UPSTREAM_<NAME>`.
-   *
-   * @generated from field: string upstream = 2;
-   */
-  upstream = "";
-
-  /**
-   * The injected header, lower-cased (`x-api-key`, `authorization`).
-   *
-   * @generated from field: string header = 3;
-   */
-  header = "";
-
-  /**
-   * The version of the value the worker already holds, or 0 for none: the
-   * KV entry's version for a `kv` credential, the token's expiry (unix
-   * seconds) for an `identity` one. When it is still current the reply is
-   * `unchanged`.
-   *
-   * @generated from field: int64 version = 4;
-   */
-  version = protoInt64.zero;
-
-  constructor(data?: PartialMessage<UpstreamCredentialKnown>) {
-    super();
-    proto3.util.initPartial(data, this);
-  }
-
-  static readonly runtime: typeof proto3 = proto3;
-  static readonly typeName = "legion.UpstreamCredentialKnown";
-  static readonly fields: FieldList = proto3.util.newFieldList(() => [
-    { no: 1, name: "allocation_id", kind: "scalar", T: 3 /* ScalarType.INT64 */ },
-    { no: 2, name: "upstream", kind: "scalar", T: 9 /* ScalarType.STRING */ },
-    { no: 3, name: "header", kind: "scalar", T: 9 /* ScalarType.STRING */ },
-    { no: 4, name: "version", kind: "scalar", T: 3 /* ScalarType.INT64 */ },
-  ]);
-
-  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): UpstreamCredentialKnown {
-    return new UpstreamCredentialKnown().fromBinary(bytes, options);
-  }
-
-  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): UpstreamCredentialKnown {
-    return new UpstreamCredentialKnown().fromJson(jsonValue, options);
-  }
-
-  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): UpstreamCredentialKnown {
-    return new UpstreamCredentialKnown().fromJsonString(jsonString, options);
-  }
-
-  static equals(a: UpstreamCredentialKnown | PlainMessage<UpstreamCredentialKnown> | undefined, b: UpstreamCredentialKnown | PlainMessage<UpstreamCredentialKnown> | undefined): boolean {
-    return proto3.util.equals(UpstreamCredentialKnown, a, b);
-  }
-}
-
-/**
- * Request payload for GetUpstreamCredentials.
- *
- * @generated from message legion.GetUpstreamCredentialsRequest
- */
-export class GetUpstreamCredentialsRequest extends Message<GetUpstreamCredentialsRequest> {
+export class FetchDatapathMaterialRequest extends Message<FetchDatapathMaterialRequest> {
   /**
    * The worker node asking. Must match the caller's authenticated per-node
    * credential.
@@ -11553,199 +11433,81 @@ export class GetUpstreamCredentialsRequest extends Message<GetUpstreamCredential
   nodeId = "";
 
   /**
-   * Every credential header declared by an allocation on this node.
+   * What the node's datapath needs: policy bodies it holds an assignment
+   * without a body for, and the certificates and credentials its
+   * allocations declare.
    *
-   * @generated from field: repeated legion.UpstreamCredentialKnown known = 2;
+   * @generated from field: repeated legion.MaterialRef refs = 2;
    */
-  known: UpstreamCredentialKnown[] = [];
+  refs: MaterialRef[] = [];
 
-  constructor(data?: PartialMessage<GetUpstreamCredentialsRequest>) {
+  constructor(data?: PartialMessage<FetchDatapathMaterialRequest>) {
     super();
     proto3.util.initPartial(data, this);
   }
 
   static readonly runtime: typeof proto3 = proto3;
-  static readonly typeName = "legion.GetUpstreamCredentialsRequest";
+  static readonly typeName = "legion.FetchDatapathMaterialRequest";
   static readonly fields: FieldList = proto3.util.newFieldList(() => [
     { no: 1, name: "node_id", kind: "scalar", T: 9 /* ScalarType.STRING */ },
-    { no: 2, name: "known", kind: "message", T: UpstreamCredentialKnown, repeated: true },
+    { no: 2, name: "refs", kind: "message", T: MaterialRef, repeated: true },
   ]);
 
-  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): GetUpstreamCredentialsRequest {
-    return new GetUpstreamCredentialsRequest().fromBinary(bytes, options);
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): FetchDatapathMaterialRequest {
+    return new FetchDatapathMaterialRequest().fromBinary(bytes, options);
   }
 
-  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): GetUpstreamCredentialsRequest {
-    return new GetUpstreamCredentialsRequest().fromJson(jsonValue, options);
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): FetchDatapathMaterialRequest {
+    return new FetchDatapathMaterialRequest().fromJson(jsonValue, options);
   }
 
-  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): GetUpstreamCredentialsRequest {
-    return new GetUpstreamCredentialsRequest().fromJsonString(jsonString, options);
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): FetchDatapathMaterialRequest {
+    return new FetchDatapathMaterialRequest().fromJsonString(jsonString, options);
   }
 
-  static equals(a: GetUpstreamCredentialsRequest | PlainMessage<GetUpstreamCredentialsRequest> | undefined, b: GetUpstreamCredentialsRequest | PlainMessage<GetUpstreamCredentialsRequest> | undefined): boolean {
-    return proto3.util.equals(GetUpstreamCredentialsRequest, a, b);
+  static equals(a: FetchDatapathMaterialRequest | PlainMessage<FetchDatapathMaterialRequest> | undefined, b: FetchDatapathMaterialRequest | PlainMessage<FetchDatapathMaterialRequest> | undefined): boolean {
+    return proto3.util.equals(FetchDatapathMaterialRequest, a, b);
   }
 }
 
 /**
- * One credential in a GetUpstreamCredentials reply.
+ * Reply payload for FetchDatapathMaterial.
  *
- * @generated from message legion.UpstreamCredentialValue
+ * @generated from message legion.FetchDatapathMaterialReply
  */
-export class UpstreamCredentialValue extends Message<UpstreamCredentialValue> {
+export class FetchDatapathMaterialReply extends Message<FetchDatapathMaterialReply> {
   /**
-   * The allocation this credential is for.
+   * One entry per requested ref, in request order.
    *
-   * @generated from field: int64 allocation_id = 1;
+   * @generated from field: repeated legion.Material materials = 1;
    */
-  allocationId = protoInt64.zero;
+  materials: Material[] = [];
 
-  /**
-   * The upstream key, echoed from the request.
-   *
-   * @generated from field: string upstream = 2;
-   */
-  upstream = "";
-
-  /**
-   * The header, echoed from the request.
-   *
-   * @generated from field: string header = 3;
-   */
-  header = "";
-
-  /**
-   * Where the value comes from, as the allocation's declaration names it:
-   * `kv secrets/openai` or `identity api`. Set even when `error` is, so the
-   * worker can report which key or identity is at fault. Empty when the
-   * declaration is gone.
-   *
-   * @generated from field: string source = 4;
-   */
-  source = "";
-
-  /**
-   * The value's version: the KV entry's version, or the identity token's
-   * expiry in unix seconds. The worker sends it back as
-   * `UpstreamCredentialKnown.version`.
-   *
-   * @generated from field: int64 version = 5;
-   */
-  version = protoInt64.zero;
-
-  /**
-   * True when the version the worker sent is still current (the KV entry
-   * has not moved, or the identity token it holds has more than half its
-   * TTL left). No value is returned.
-   *
-   * @generated from field: bool unchanged = 6;
-   */
-  unchanged = false;
-
-  /**
-   * The secret: the raw KV value, or the signed identity token, which the
-   * forwarder sends as the header value after the declared `prefix`. Treat
-   * as a secret: never log it, never write it to disk.
-   *
-   * @generated from field: string value = 7;
-   */
-  value = "";
-
-  /**
-   * Why no value was returned, e.g. "kv secrets/openai not found" or
-   * "workload identity is not enabled on this manager". Empty on success.
-   *
-   * @generated from field: string error = 8;
-   */
-  error = "";
-
-  /**
-   * True when `error` is authoritative rather than transient: the KV key
-   * does not exist, or the allocation is not on this node or no longer
-   * declares this credential. The worker drops any value it holds, so
-   * deleting the key revokes the credential on the next heartbeat. False
-   * for transient problems (a KV read failure, a failed token mint), where
-   * the worker keeps the last good value.
-   *
-   * @generated from field: bool absent = 9;
-   */
-  absent = false;
-
-  constructor(data?: PartialMessage<UpstreamCredentialValue>) {
+  constructor(data?: PartialMessage<FetchDatapathMaterialReply>) {
     super();
     proto3.util.initPartial(data, this);
   }
 
   static readonly runtime: typeof proto3 = proto3;
-  static readonly typeName = "legion.UpstreamCredentialValue";
+  static readonly typeName = "legion.FetchDatapathMaterialReply";
   static readonly fields: FieldList = proto3.util.newFieldList(() => [
-    { no: 1, name: "allocation_id", kind: "scalar", T: 3 /* ScalarType.INT64 */ },
-    { no: 2, name: "upstream", kind: "scalar", T: 9 /* ScalarType.STRING */ },
-    { no: 3, name: "header", kind: "scalar", T: 9 /* ScalarType.STRING */ },
-    { no: 4, name: "source", kind: "scalar", T: 9 /* ScalarType.STRING */ },
-    { no: 5, name: "version", kind: "scalar", T: 3 /* ScalarType.INT64 */ },
-    { no: 6, name: "unchanged", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
-    { no: 7, name: "value", kind: "scalar", T: 9 /* ScalarType.STRING */ },
-    { no: 8, name: "error", kind: "scalar", T: 9 /* ScalarType.STRING */ },
-    { no: 9, name: "absent", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
+    { no: 1, name: "materials", kind: "message", T: Material, repeated: true },
   ]);
 
-  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): UpstreamCredentialValue {
-    return new UpstreamCredentialValue().fromBinary(bytes, options);
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): FetchDatapathMaterialReply {
+    return new FetchDatapathMaterialReply().fromBinary(bytes, options);
   }
 
-  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): UpstreamCredentialValue {
-    return new UpstreamCredentialValue().fromJson(jsonValue, options);
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): FetchDatapathMaterialReply {
+    return new FetchDatapathMaterialReply().fromJson(jsonValue, options);
   }
 
-  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): UpstreamCredentialValue {
-    return new UpstreamCredentialValue().fromJsonString(jsonString, options);
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): FetchDatapathMaterialReply {
+    return new FetchDatapathMaterialReply().fromJsonString(jsonString, options);
   }
 
-  static equals(a: UpstreamCredentialValue | PlainMessage<UpstreamCredentialValue> | undefined, b: UpstreamCredentialValue | PlainMessage<UpstreamCredentialValue> | undefined): boolean {
-    return proto3.util.equals(UpstreamCredentialValue, a, b);
-  }
-}
-
-/**
- * Reply payload for GetUpstreamCredentials.
- *
- * @generated from message legion.GetUpstreamCredentialsReply
- */
-export class GetUpstreamCredentialsReply extends Message<GetUpstreamCredentialsReply> {
-  /**
-   * One entry per requested credential, in request order.
-   *
-   * @generated from field: repeated legion.UpstreamCredentialValue credentials = 1;
-   */
-  credentials: UpstreamCredentialValue[] = [];
-
-  constructor(data?: PartialMessage<GetUpstreamCredentialsReply>) {
-    super();
-    proto3.util.initPartial(data, this);
-  }
-
-  static readonly runtime: typeof proto3 = proto3;
-  static readonly typeName = "legion.GetUpstreamCredentialsReply";
-  static readonly fields: FieldList = proto3.util.newFieldList(() => [
-    { no: 1, name: "credentials", kind: "message", T: UpstreamCredentialValue, repeated: true },
-  ]);
-
-  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): GetUpstreamCredentialsReply {
-    return new GetUpstreamCredentialsReply().fromBinary(bytes, options);
-  }
-
-  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): GetUpstreamCredentialsReply {
-    return new GetUpstreamCredentialsReply().fromJson(jsonValue, options);
-  }
-
-  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): GetUpstreamCredentialsReply {
-    return new GetUpstreamCredentialsReply().fromJsonString(jsonString, options);
-  }
-
-  static equals(a: GetUpstreamCredentialsReply | PlainMessage<GetUpstreamCredentialsReply> | undefined, b: GetUpstreamCredentialsReply | PlainMessage<GetUpstreamCredentialsReply> | undefined): boolean {
-    return proto3.util.equals(GetUpstreamCredentialsReply, a, b);
+  static equals(a: FetchDatapathMaterialReply | PlainMessage<FetchDatapathMaterialReply> | undefined, b: FetchDatapathMaterialReply | PlainMessage<FetchDatapathMaterialReply> | undefined): boolean {
+    return proto3.util.equals(FetchDatapathMaterialReply, a, b);
   }
 }
 
@@ -12050,6 +11812,17 @@ export class HeartbeatRequest extends Message<HeartbeatRequest> {
    */
   envelopeResizes: EnvelopeResize[] = [];
 
+  /**
+   * The node datapath's network plugins (docs/network-plugins.md): one
+   * entry per plugin a local allocation references, with its revision,
+   * module state, and health. Replaced wholesale per node on every beat and
+   * kept in memory by the manager for GetNetPluginStatus and
+   * `legion net doctor`. Empty on a node that runs no plugin.
+   *
+   * @generated from field: repeated legion.NetPluginNodeStatus net_plugins = 21;
+   */
+  netPlugins: NetPluginNodeStatus[] = [];
+
   constructor(data?: PartialMessage<HeartbeatRequest>) {
     super();
     proto3.util.initPartial(data, this);
@@ -12078,6 +11851,7 @@ export class HeartbeatRequest extends Message<HeartbeatRequest> {
     { no: 18, name: "exec_keys_version", kind: "scalar", T: 9 /* ScalarType.STRING */ },
     { no: 19, name: "session_report", kind: "message", T: SessionReport, opt: true },
     { no: 20, name: "envelope_resizes", kind: "message", T: EnvelopeResize, repeated: true },
+    { no: 21, name: "net_plugins", kind: "message", T: NetPluginNodeStatus, repeated: true },
   ]);
 
   static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): HeartbeatRequest {
@@ -14093,7 +13867,7 @@ export class HeartbeatReply extends Message<HeartbeatReply> {
 
   /**
    * The effective network policy for each desired allocation, as a content
-   * hash. The worker fetches a body it has not seen via `FetchNetPolicy`
+   * hash. The worker fetches a body it has not seen via `FetchDatapathMaterial`
    * and caches it; identical merged policies share one hash and one fetch.
    * An allocation absent from this list has no policy. Delivered every
    * heartbeat, applied only after a successful one, so a manager outage
@@ -14492,9 +14266,11 @@ export class UpstreamEndpoints extends Message<UpstreamEndpoints> {
   allocationId = protoInt64.zero;
 
   /**
-   * Upstream service name, exactly as written in the task's
-   * `connect.upstreams[].service`. Echoed so the worker can match the list to
-   * one of its listeners without relying on ordering.
+   * The upstream's key: its `connect.upstreams[].name`, or the catalog
+   * service its `to` names when it has no name. This is how the node's
+   * listener is known, so the worker matches the list to one of its
+   * listeners without relying on ordering. For a `proxy` handler's feed
+   * (`for_handler`), the handler's service name.
    *
    * @generated from field: string service = 2;
    */
@@ -21299,15 +21075,19 @@ export class ServiceSummary extends Message<ServiceSummary> {
   meta: { [key: string]: string } = {};
 
   /**
-   * Connect intentions declared in the task's `service.allow`: the job IDs
-   * permitted to reach this service through a `connect.upstreams` entry.
+   * Who may call the service, from the task's `service.allow`: bare entries
+   * are job id globs (`web`, `agent-*`), entries with colons are workload
+   * identity globs over `<region>:<job>:<group>:<task>`
+   * (`*:billing:*:worker`).
    *
-   * Empty — the default — means *every* job may connect, and so does a single
-   * `"*"` entry; the two are reported verbatim rather than normalized so
-   * tooling can tell "no policy declared" from "explicitly open". Intentions
-   * gate the connect datapath only: they filter the endpoint list a consuming
-   * allocation receives in `HeartbeatReply.upstream_endpoints`, and never
-   * affect who may *read* the catalog through ListServices/ResolveService.
+   * Empty — the default — means *every* caller may connect, and so does a
+   * single `"*"` entry; the two are reported verbatim rather than normalized
+   * so tooling can tell "no policy declared" from "explicitly open". The list
+   * filters the endpoint list a consuming allocation receives in
+   * `HeartbeatReply.upstream_endpoints`; on a `service.mesh = true` service
+   * the receiving node also refuses a verified caller outside it
+   * (`Legion-Denied-By: service/allow`). It never affects who may *read* the
+   * catalog through ListServices/ResolveService.
    *
    * Reported here so a read-only caller (`job:read`) can explain why its
    * consumer resolves to nothing — `legion service doctor` prints this list —
@@ -21560,8 +21340,8 @@ export class ServiceEndpoint extends Message<ServiceEndpoint> {
 
   /**
    * True when the endpoint's advertised port terminates **mesh TLS** — its
-   * task's ingress chain has `tls = { mode = "mutual", certFrom = "legion" }`
-   * (docs/network-handlers.md). A consuming node's datapath then originates
+   * task's service is on the mesh (`service.mesh = true`, or imposed by a
+   * policy object), resolved at placement (docs/network-handlers.md). A consuming node's datapath then originates
    * TLS with its own node certificate and names the consuming workload in a
    * PROXY protocol v2 TLV; a plain client dialing the port directly is
    * refused at the handshake.
@@ -26541,9 +26321,11 @@ export class TaskAllocation extends Message<TaskAllocation> {
    * this allocation, matching the `AllocNetwork` shape. Workers use it to
    * inject `LEGION_PORT_*` / `LEGION_ADDR_*` environment variables into the
    * task, and — when the task declares upstreams — the `upstreams` array
-   * (`[{"service":"db","localPort":20003,"balance":"least_latency"}]`) carries
-   * the loopback ports the node-local forwarders listen on, surfaced to the
-   * task as `LEGION_UPSTREAM_*`.
+   * (`[{"key":"db","balance":"least_latency","vip":"127.42.7.2",
+   * "canonicalPort":5432}]`) carries each upstream's address: its VIP and
+   * canonical port, plus a `localPort` when it has a loopback port (a pinned
+   * `port`, a node with no VIP block, or a sandbox). The task sees one
+   * address per upstream as `LEGION_UPSTREAM_<KEY>`.
    *
    * Empty string when the task declares no network block and no upstreams.
    *
@@ -26553,13 +26335,13 @@ export class TaskAllocation extends Message<TaskAllocation> {
 
   /**
    * JSON-encoded `connect` block declared by the task, matching the
-   * `ConnectConfig` shape: `{"upstreams":[{"service":"db"},
-   * {"service":"cache","localPort":6379,"balance":"least_conn"}]}`.
+   * `ConnectConfig` shape: `{"upstreams":[{"to":"db"},
+   * {"to":"http://cache","port":6379,"balance":"least_conn"}]}`.
    *
-   * This is the *declared* form (which services the task dials and with which
-   * balancing strategy); the *assigned* loopback ports live in `network`
-   * alongside the task's host ports, because both come out of the same
-   * per-node port space. The worker starts one loopback TCP forwarder per
+   * This is the *declared* form (what the task dials, over which protocol,
+   * and with which balancing strategy); the *assigned* addresses live in
+   * `network` alongside the task's host ports, because loopback ports come
+   * out of the same per-node port space. The worker starts one forwarder per
    * upstream and load-balances new connections across that service's healthy
    * endpoints, which the manager refreshes every heartbeat in
    * `HeartbeatReply.upstream_endpoints`. An upstream that names no `balance`
@@ -26897,6 +26679,27 @@ export class TaskAllocation extends Message<TaskAllocation> {
    */
   taskSpeculativeStart = "";
 
+  /**
+   * The task's group (`tasks[].group`). Together with `job_id` and
+   * `task_name` it forms the workload identity subject
+   * `<region>:<job>:<group>:<task>`: the identity a consuming node names
+   * its workload by on a mesh connection, and what `service.allow` and
+   * ingress `identity` rules match.
+   *
+   * @generated from field: string task_group = 34;
+   */
+  taskGroup = "";
+
+  /**
+   * JSON `ServiceConfig` as the task declared it (`name`, `port`, `mesh`,
+   * `allow`, ...). Empty when the task advertises no service. The manager
+   * reads `mesh` and `allow` from it to compile the receiving side's
+   * `service/allow` check into the allocation's ingress policy.
+   *
+   * @generated from field: string task_service = 35;
+   */
+  taskService = "";
+
   constructor(data?: PartialMessage<TaskAllocation>) {
     super();
     proto3.util.initPartial(data, this);
@@ -26938,6 +26741,8 @@ export class TaskAllocation extends Message<TaskAllocation> {
     { no: 31, name: "session_seal_keys", kind: "message", T: SessionSealKey, repeated: true },
     { no: 32, name: "envelope_resources", kind: "scalar", T: 9 /* ScalarType.STRING */ },
     { no: 33, name: "task_speculative_start", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 34, name: "task_group", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 35, name: "task_service", kind: "scalar", T: 9 /* ScalarType.STRING */ },
   ]);
 
   static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): TaskAllocation {
@@ -31289,6 +31094,19 @@ export class UpsertNetPolicyReply extends Message<UpsertNetPolicyReply> {
    */
   affectedAllocations: string[] = [];
 
+  /**
+   * Advisory lines about what the policy would do to running work, one per
+   * affected task, populated on dry runs and on writes. Today: an upstream
+   * whose `to` does not speak HTTP (a bare service name, `tcp://`, or
+   * `tls://`) under an HTTP chain whose first rule for it needs a path,
+   * method, or header. A policy never changes how a stream is parsed, so
+   * such connections are refused at connect; the line names the task, the
+   * upstream, and the rule, and says how to fix it.
+   *
+   * @generated from field: repeated string warnings = 3;
+   */
+  warnings: string[] = [];
+
   constructor(data?: PartialMessage<UpsertNetPolicyReply>) {
     super();
     proto3.util.initPartial(data, this);
@@ -31299,6 +31117,7 @@ export class UpsertNetPolicyReply extends Message<UpsertNetPolicyReply> {
   static readonly fields: FieldList = proto3.util.newFieldList(() => [
     { no: 1, name: "policy", kind: "message", T: NetPolicy },
     { no: 2, name: "affected_allocations", kind: "scalar", T: 9 /* ScalarType.STRING */, repeated: true },
+    { no: 3, name: "warnings", kind: "scalar", T: 9 /* ScalarType.STRING */, repeated: true },
   ]);
 
   static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): UpsertNetPolicyReply {
@@ -31549,6 +31368,674 @@ export class DeleteNetPolicyReply extends Message<DeleteNetPolicyReply> {
 }
 
 /**
+ * A stored network plugin object (docs/network-plugins.md).
+ *
+ * @generated from message legion.NetPlugin
+ */
+export class NetPlugin extends Message<NetPlugin> {
+  /**
+   * Unique name; what a `{ plugin = { name = ... } }` hop references.
+   *
+   * @generated from field: string name = 1;
+   */
+  name = "";
+
+  /**
+   * The normalized `NetPluginObject` as JSON: `module`, `stages`,
+   * `usableBy`, `nodePools`, `limits`, `configSchema`, `targets`, and
+   * `credentials` (KV paths only, never values).
+   *
+   * @generated from field: string object_json = 2;
+   */
+  objectJson = "";
+
+  /**
+   * The cluster-wide plugin generation this version was written at. A
+   * revision names one version of one plugin forever, even across a delete
+   * and a re-create; nodes report the revision they run.
+   *
+   * @generated from field: uint64 revision = 3;
+   */
+  revision = protoInt64.zero;
+
+  /**
+   * RFC 3339 timestamps of the first write and of this version.
+   *
+   * @generated from field: string created_at = 4;
+   */
+  createdAt = "";
+
+  /**
+   * @generated from field: string updated_at = 5;
+   */
+  updatedAt = "";
+
+  /**
+   * The stages the module acts at, in pipeline order: `connect`,
+   * `request`, `body`, `response`, `done`.
+   *
+   * @generated from field: repeated string stages = 6;
+   */
+  stages: string[] = [];
+
+  /**
+   * `policies` or `jobs`.
+   *
+   * @generated from field: string usable_by = 7;
+   */
+  usableBy = "";
+
+  /**
+   * The module's `sha256:` checksum.
+   *
+   * @generated from field: string module_checksum = 8;
+   */
+  moduleChecksum = "";
+
+  /**
+   * Stored policy objects whose chains reference this plugin. Filled by
+   * GetNetPlugin and GetNetPluginStatus; empty in list replies.
+   *
+   * @generated from field: repeated string referenced_by = 9;
+   */
+  referencedBy: string[] = [];
+
+  constructor(data?: PartialMessage<NetPlugin>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.NetPlugin";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "name", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 2, name: "object_json", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 3, name: "revision", kind: "scalar", T: 4 /* ScalarType.UINT64 */ },
+    { no: 4, name: "created_at", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 5, name: "updated_at", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 6, name: "stages", kind: "scalar", T: 9 /* ScalarType.STRING */, repeated: true },
+    { no: 7, name: "usable_by", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 8, name: "module_checksum", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 9, name: "referenced_by", kind: "scalar", T: 9 /* ScalarType.STRING */, repeated: true },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): NetPlugin {
+    return new NetPlugin().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): NetPlugin {
+    return new NetPlugin().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): NetPlugin {
+    return new NetPlugin().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: NetPlugin | PlainMessage<NetPlugin> | undefined, b: NetPlugin | PlainMessage<NetPlugin> | undefined): boolean {
+    return proto3.util.equals(NetPlugin, a, b);
+  }
+}
+
+/**
+ * Request payload for UpsertNetPlugin.
+ *
+ * @generated from message legion.UpsertNetPluginRequest
+ */
+export class UpsertNetPluginRequest extends Message<UpsertNetPluginRequest> {
+  /**
+   * A `NetPluginObject` as JSON, exactly as `legion net plugin apply -f`
+   * reads it (Nickel evaluated to JSON). Validated on write.
+   *
+   * @generated from field: string object_json = 1;
+   */
+  objectJson = "";
+
+  /**
+   * When set, validate (including every referencing policy's config against
+   * the new schema) and report what would be stored, but write nothing.
+   *
+   * @generated from field: bool dry_run = 2;
+   */
+  dryRun = false;
+
+  /**
+   * Optional: retries with the same key (from the same caller) return the
+   * first call's stored plugin with `deduplicated = true` instead of writing
+   * a new revision. Ignored on dry runs.
+   *
+   * @generated from field: optional string idempotency_key = 3;
+   */
+  idempotencyKey?: string;
+
+  constructor(data?: PartialMessage<UpsertNetPluginRequest>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.UpsertNetPluginRequest";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "object_json", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 2, name: "dry_run", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
+    { no: 3, name: "idempotency_key", kind: "scalar", T: 9 /* ScalarType.STRING */, opt: true },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): UpsertNetPluginRequest {
+    return new UpsertNetPluginRequest().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): UpsertNetPluginRequest {
+    return new UpsertNetPluginRequest().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): UpsertNetPluginRequest {
+    return new UpsertNetPluginRequest().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: UpsertNetPluginRequest | PlainMessage<UpsertNetPluginRequest> | undefined, b: UpsertNetPluginRequest | PlainMessage<UpsertNetPluginRequest> | undefined): boolean {
+    return proto3.util.equals(UpsertNetPluginRequest, a, b);
+  }
+}
+
+/**
+ * Reply payload for UpsertNetPlugin.
+ *
+ * @generated from message legion.UpsertNetPluginReply
+ */
+export class UpsertNetPluginReply extends Message<UpsertNetPluginReply> {
+  /**
+   * The stored (normalized) plugin. On a dry run, what would be stored,
+   * with `revision` 0.
+   *
+   * @generated from field: legion.NetPlugin plugin = 1;
+   */
+  plugin?: NetPlugin;
+
+  /**
+   * True when `idempotency_key` matched an earlier call; nothing was
+   * written and `plugin` is that call's result as currently stored.
+   *
+   * @generated from field: bool deduplicated = 2;
+   */
+  deduplicated = false;
+
+  constructor(data?: PartialMessage<UpsertNetPluginReply>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.UpsertNetPluginReply";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "plugin", kind: "message", T: NetPlugin },
+    { no: 2, name: "deduplicated", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): UpsertNetPluginReply {
+    return new UpsertNetPluginReply().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): UpsertNetPluginReply {
+    return new UpsertNetPluginReply().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): UpsertNetPluginReply {
+    return new UpsertNetPluginReply().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: UpsertNetPluginReply | PlainMessage<UpsertNetPluginReply> | undefined, b: UpsertNetPluginReply | PlainMessage<UpsertNetPluginReply> | undefined): boolean {
+    return proto3.util.equals(UpsertNetPluginReply, a, b);
+  }
+}
+
+/**
+ * Request payload for GetNetPlugin.
+ *
+ * @generated from message legion.GetNetPluginRequest
+ */
+export class GetNetPluginRequest extends Message<GetNetPluginRequest> {
+  /**
+   * @generated from field: string name = 1;
+   */
+  name = "";
+
+  constructor(data?: PartialMessage<GetNetPluginRequest>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.GetNetPluginRequest";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "name", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): GetNetPluginRequest {
+    return new GetNetPluginRequest().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): GetNetPluginRequest {
+    return new GetNetPluginRequest().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): GetNetPluginRequest {
+    return new GetNetPluginRequest().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: GetNetPluginRequest | PlainMessage<GetNetPluginRequest> | undefined, b: GetNetPluginRequest | PlainMessage<GetNetPluginRequest> | undefined): boolean {
+    return proto3.util.equals(GetNetPluginRequest, a, b);
+  }
+}
+
+/**
+ * Reply payload for GetNetPlugin.
+ *
+ * @generated from message legion.GetNetPluginReply
+ */
+export class GetNetPluginReply extends Message<GetNetPluginReply> {
+  /**
+   * @generated from field: legion.NetPlugin plugin = 1;
+   */
+  plugin?: NetPlugin;
+
+  constructor(data?: PartialMessage<GetNetPluginReply>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.GetNetPluginReply";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "plugin", kind: "message", T: NetPlugin },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): GetNetPluginReply {
+    return new GetNetPluginReply().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): GetNetPluginReply {
+    return new GetNetPluginReply().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): GetNetPluginReply {
+    return new GetNetPluginReply().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: GetNetPluginReply | PlainMessage<GetNetPluginReply> | undefined, b: GetNetPluginReply | PlainMessage<GetNetPluginReply> | undefined): boolean {
+    return proto3.util.equals(GetNetPluginReply, a, b);
+  }
+}
+
+/**
+ * Request payload for ListNetPlugins.
+ *
+ * @generated from message legion.ListNetPluginsRequest
+ */
+export class ListNetPluginsRequest extends Message<ListNetPluginsRequest> {
+  constructor(data?: PartialMessage<ListNetPluginsRequest>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.ListNetPluginsRequest";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): ListNetPluginsRequest {
+    return new ListNetPluginsRequest().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): ListNetPluginsRequest {
+    return new ListNetPluginsRequest().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): ListNetPluginsRequest {
+    return new ListNetPluginsRequest().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: ListNetPluginsRequest | PlainMessage<ListNetPluginsRequest> | undefined, b: ListNetPluginsRequest | PlainMessage<ListNetPluginsRequest> | undefined): boolean {
+    return proto3.util.equals(ListNetPluginsRequest, a, b);
+  }
+}
+
+/**
+ * Reply payload for ListNetPlugins.
+ *
+ * @generated from message legion.ListNetPluginsReply
+ */
+export class ListNetPluginsReply extends Message<ListNetPluginsReply> {
+  /**
+   * @generated from field: repeated legion.NetPlugin plugins = 1;
+   */
+  plugins: NetPlugin[] = [];
+
+  /**
+   * Monotonic generation of the plugin set; changes on every write.
+   *
+   * @generated from field: uint64 generation = 2;
+   */
+  generation = protoInt64.zero;
+
+  constructor(data?: PartialMessage<ListNetPluginsReply>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.ListNetPluginsReply";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "plugins", kind: "message", T: NetPlugin, repeated: true },
+    { no: 2, name: "generation", kind: "scalar", T: 4 /* ScalarType.UINT64 */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): ListNetPluginsReply {
+    return new ListNetPluginsReply().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): ListNetPluginsReply {
+    return new ListNetPluginsReply().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): ListNetPluginsReply {
+    return new ListNetPluginsReply().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: ListNetPluginsReply | PlainMessage<ListNetPluginsReply> | undefined, b: ListNetPluginsReply | PlainMessage<ListNetPluginsReply> | undefined): boolean {
+    return proto3.util.equals(ListNetPluginsReply, a, b);
+  }
+}
+
+/**
+ * Request payload for DeleteNetPlugin.
+ *
+ * @generated from message legion.DeleteNetPluginRequest
+ */
+export class DeleteNetPluginRequest extends Message<DeleteNetPluginRequest> {
+  /**
+   * @generated from field: string name = 1;
+   */
+  name = "";
+
+  constructor(data?: PartialMessage<DeleteNetPluginRequest>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.DeleteNetPluginRequest";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "name", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): DeleteNetPluginRequest {
+    return new DeleteNetPluginRequest().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): DeleteNetPluginRequest {
+    return new DeleteNetPluginRequest().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): DeleteNetPluginRequest {
+    return new DeleteNetPluginRequest().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: DeleteNetPluginRequest | PlainMessage<DeleteNetPluginRequest> | undefined, b: DeleteNetPluginRequest | PlainMessage<DeleteNetPluginRequest> | undefined): boolean {
+    return proto3.util.equals(DeleteNetPluginRequest, a, b);
+  }
+}
+
+/**
+ * Reply payload for DeleteNetPlugin.
+ *
+ * @generated from message legion.DeleteNetPluginReply
+ */
+export class DeleteNetPluginReply extends Message<DeleteNetPluginReply> {
+  constructor(data?: PartialMessage<DeleteNetPluginReply>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.DeleteNetPluginReply";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): DeleteNetPluginReply {
+    return new DeleteNetPluginReply().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): DeleteNetPluginReply {
+    return new DeleteNetPluginReply().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): DeleteNetPluginReply {
+    return new DeleteNetPluginReply().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: DeleteNetPluginReply | PlainMessage<DeleteNetPluginReply> | undefined, b: DeleteNetPluginReply | PlainMessage<DeleteNetPluginReply> | undefined): boolean {
+    return proto3.util.equals(DeleteNetPluginReply, a, b);
+  }
+}
+
+/**
+ * Request payload for GetNetPluginStatus.
+ *
+ * @generated from message legion.GetNetPluginStatusRequest
+ */
+export class GetNetPluginStatusRequest extends Message<GetNetPluginStatusRequest> {
+  /**
+   * @generated from field: string name = 1;
+   */
+  name = "";
+
+  constructor(data?: PartialMessage<GetNetPluginStatusRequest>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.GetNetPluginStatusRequest";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "name", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): GetNetPluginStatusRequest {
+    return new GetNetPluginStatusRequest().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): GetNetPluginStatusRequest {
+    return new GetNetPluginStatusRequest().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): GetNetPluginStatusRequest {
+    return new GetNetPluginStatusRequest().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: GetNetPluginStatusRequest | PlainMessage<GetNetPluginStatusRequest> | undefined, b: GetNetPluginStatusRequest | PlainMessage<GetNetPluginStatusRequest> | undefined): boolean {
+    return proto3.util.equals(GetNetPluginStatusRequest, a, b);
+  }
+}
+
+/**
+ * Reply payload for GetNetPluginStatus.
+ *
+ * @generated from message legion.GetNetPluginStatusReply
+ */
+export class GetNetPluginStatusReply extends Message<GetNetPluginStatusReply> {
+  /**
+   * The stored object, with `referenced_by` filled.
+   *
+   * @generated from field: legion.NetPlugin plugin = 1;
+   */
+  plugin?: NetPlugin;
+
+  /**
+   * One entry per node that holds the plugin, from its last heartbeat. A
+   * plugin no running allocation uses is on no node.
+   *
+   * @generated from field: repeated legion.NetPluginNodeStatus nodes = 2;
+   */
+  nodes: NetPluginNodeStatus[] = [];
+
+  constructor(data?: PartialMessage<GetNetPluginStatusReply>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.GetNetPluginStatusReply";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "plugin", kind: "message", T: NetPlugin },
+    { no: 2, name: "nodes", kind: "message", T: NetPluginNodeStatus, repeated: true },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): GetNetPluginStatusReply {
+    return new GetNetPluginStatusReply().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): GetNetPluginStatusReply {
+    return new GetNetPluginStatusReply().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): GetNetPluginStatusReply {
+    return new GetNetPluginStatusReply().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: GetNetPluginStatusReply | PlainMessage<GetNetPluginStatusReply> | undefined, b: GetNetPluginStatusReply | PlainMessage<GetNetPluginStatusReply> | undefined): boolean {
+    return proto3.util.equals(GetNetPluginStatusReply, a, b);
+  }
+}
+
+/**
+ * One node's view of one plugin, reported on every heartbeat
+ * (`HeartbeatRequest.net_plugins`) and read back by GetNetPluginStatus,
+ * `legion net plugin status`, and `legion net doctor`.
+ *
+ * @generated from message legion.NetPluginNodeStatus
+ */
+export class NetPluginNodeStatus extends Message<NetPluginNodeStatus> {
+  /**
+   * The reporting node. Empty on the heartbeat (the node is the caller);
+   * filled by the manager in GetNetPluginStatus.
+   *
+   * @generated from field: string node_id = 1;
+   */
+  nodeId = "";
+
+  /**
+   * The plugin's name.
+   *
+   * @generated from field: string plugin = 2;
+   */
+  plugin = "";
+
+  /**
+   * The revision the node holds; 0 before the object reached it.
+   *
+   * @generated from field: uint64 revision = 3;
+   */
+  revision = protoInt64.zero;
+
+  /**
+   * The module checksum the node runs (`sha256:<hex>`).
+   *
+   * @generated from field: string module_checksum = 4;
+   */
+  moduleChecksum = "";
+
+  /**
+   * `fetching` (the object arrived, the module is being fetched or
+   * compiled), `ready`, or `failed` (see `error`).
+   *
+   * @generated from field: string state = 5;
+   */
+  state = "";
+
+  /**
+   * Why the module is not ready: the fetch, checksum, compile, or
+   * instantiation error. A hop whose plugin is not ready fails with this
+   * reason and follows its `onError`.
+   *
+   * @generated from field: string error = 6;
+   */
+  error = "";
+
+  /**
+   * Callbacks run and callbacks that failed (trap, fuel or deadline
+   * exhausted, memory limit) since the worker started.
+   *
+   * @generated from field: uint64 calls = 7;
+   */
+  calls = protoInt64.zero;
+
+  /**
+   * @generated from field: uint64 errors = 8;
+   */
+  errors = protoInt64.zero;
+
+  /**
+   * The last callback failure, if any.
+   *
+   * @generated from field: string last_error = 9;
+   */
+  lastError = "";
+
+  /**
+   * 99th percentile callback time over the last 1024 callbacks, in
+   * microseconds.
+   *
+   * @generated from field: uint64 p99_micros = 10;
+   */
+  p99Micros = protoInt64.zero;
+
+  /**
+   * Live module instances on the node: one per (scope, config) the plugin
+   * runs under, times the instances its concurrency needed.
+   *
+   * @generated from field: uint64 instances = 11;
+   */
+  instances = protoInt64.zero;
+
+  constructor(data?: PartialMessage<NetPluginNodeStatus>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.NetPluginNodeStatus";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "node_id", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 2, name: "plugin", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 3, name: "revision", kind: "scalar", T: 4 /* ScalarType.UINT64 */ },
+    { no: 4, name: "module_checksum", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 5, name: "state", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 6, name: "error", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 7, name: "calls", kind: "scalar", T: 4 /* ScalarType.UINT64 */ },
+    { no: 8, name: "errors", kind: "scalar", T: 4 /* ScalarType.UINT64 */ },
+    { no: 9, name: "last_error", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 10, name: "p99_micros", kind: "scalar", T: 4 /* ScalarType.UINT64 */ },
+    { no: 11, name: "instances", kind: "scalar", T: 4 /* ScalarType.UINT64 */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): NetPluginNodeStatus {
+    return new NetPluginNodeStatus().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): NetPluginNodeStatus {
+    return new NetPluginNodeStatus().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): NetPluginNodeStatus {
+    return new NetPluginNodeStatus().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: NetPluginNodeStatus | PlainMessage<NetPluginNodeStatus> | undefined, b: NetPluginNodeStatus | PlainMessage<NetPluginNodeStatus> | undefined): boolean {
+    return proto3.util.equals(NetPluginNodeStatus, a, b);
+  }
+}
+
+/**
  * Request payload for ShowNetPolicy.
  *
  * @generated from message legion.ShowNetPolicyRequest
@@ -31728,14 +32215,19 @@ export class TestNetPolicyRequest extends Message<TestNetPolicyRequest> {
   to = "";
 
   /**
-   * Ingress test: the peer, as `host[:port]` / IP, optionally with an
-   * identity (`prod:default:checkout:web`).
+   * Ingress test: the peer, as `host[:port]` / IP.
    *
    * @generated from field: string from = 5;
    */
   from = "";
 
   /**
+   * Ingress test: the caller's verified workload identity,
+   * `<region>:<job>:<group>:<task>` (`global:checkout:web:web`), as the mesh
+   * port or a mutual port would see it. On a `service.mesh = true` service
+   * with a closed `service.allow`, an identity outside the list is denied
+   * by `service/allow` before any rule.
+   *
    * @generated from field: string identity = 6;
    */
   identity = "";
@@ -31883,97 +32375,6 @@ export class TestNetPolicyReply extends Message<TestNetPolicyReply> {
 
   static equals(a: TestNetPolicyReply | PlainMessage<TestNetPolicyReply> | undefined, b: TestNetPolicyReply | PlainMessage<TestNetPolicyReply> | undefined): boolean {
     return proto3.util.equals(TestNetPolicyReply, a, b);
-  }
-}
-
-/**
- * Request payload for FetchNetPolicy (worker plane).
- *
- * @generated from message legion.FetchNetPolicyRequest
- */
-export class FetchNetPolicyRequest extends Message<FetchNetPolicyRequest> {
-  /**
-   * Node id of the caller. With ACLs enforced it must match the node token
-   * on the request (see `HeartbeatRequest.id`).
-   *
-   * @generated from field: string node_id = 1;
-   */
-  nodeId = "";
-
-  /**
-   * Content hash from `HeartbeatReply.net_policies`.
-   *
-   * @generated from field: string hash = 2;
-   */
-  hash = "";
-
-  constructor(data?: PartialMessage<FetchNetPolicyRequest>) {
-    super();
-    proto3.util.initPartial(data, this);
-  }
-
-  static readonly runtime: typeof proto3 = proto3;
-  static readonly typeName = "legion.FetchNetPolicyRequest";
-  static readonly fields: FieldList = proto3.util.newFieldList(() => [
-    { no: 1, name: "node_id", kind: "scalar", T: 9 /* ScalarType.STRING */ },
-    { no: 2, name: "hash", kind: "scalar", T: 9 /* ScalarType.STRING */ },
-  ]);
-
-  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): FetchNetPolicyRequest {
-    return new FetchNetPolicyRequest().fromBinary(bytes, options);
-  }
-
-  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): FetchNetPolicyRequest {
-    return new FetchNetPolicyRequest().fromJson(jsonValue, options);
-  }
-
-  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): FetchNetPolicyRequest {
-    return new FetchNetPolicyRequest().fromJsonString(jsonString, options);
-  }
-
-  static equals(a: FetchNetPolicyRequest | PlainMessage<FetchNetPolicyRequest> | undefined, b: FetchNetPolicyRequest | PlainMessage<FetchNetPolicyRequest> | undefined): boolean {
-    return proto3.util.equals(FetchNetPolicyRequest, a, b);
-  }
-}
-
-/**
- * Reply payload for FetchNetPolicy.
- *
- * @generated from message legion.FetchNetPolicyReply
- */
-export class FetchNetPolicyReply extends Message<FetchNetPolicyReply> {
-  /**
-   * The `EffectivePolicy` as JSON. Its `hash` field equals the request hash.
-   *
-   * @generated from field: string effective_json = 1;
-   */
-  effectiveJson = "";
-
-  constructor(data?: PartialMessage<FetchNetPolicyReply>) {
-    super();
-    proto3.util.initPartial(data, this);
-  }
-
-  static readonly runtime: typeof proto3 = proto3;
-  static readonly typeName = "legion.FetchNetPolicyReply";
-  static readonly fields: FieldList = proto3.util.newFieldList(() => [
-    { no: 1, name: "effective_json", kind: "scalar", T: 9 /* ScalarType.STRING */ },
-  ]);
-
-  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): FetchNetPolicyReply {
-    return new FetchNetPolicyReply().fromBinary(bytes, options);
-  }
-
-  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): FetchNetPolicyReply {
-    return new FetchNetPolicyReply().fromJson(jsonValue, options);
-  }
-
-  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): FetchNetPolicyReply {
-    return new FetchNetPolicyReply().fromJsonString(jsonString, options);
-  }
-
-  static equals(a: FetchNetPolicyReply | PlainMessage<FetchNetPolicyReply> | undefined, b: FetchNetPolicyReply | PlainMessage<FetchNetPolicyReply> | undefined): boolean {
-    return proto3.util.equals(FetchNetPolicyReply, a, b);
   }
 }
 
@@ -32246,9 +32647,10 @@ export class NetAllocStatus extends Message<NetAllocStatus> {
   handlers: NetHandlerStatus[] = [];
 
   /**
-   * Whether the ingress chain's TLS material is loaded: the BYO files parse,
-   * or the node holds a mesh certificate for `certFrom = "legion"`. Always
-   * true when no ingress chain terminates TLS.
+   * Whether the TLS material of every port that terminates TLS is loaded:
+   * a port's own `tls` (its KV-held certificate and client CA have arrived,
+   * or its files parse), or, for the service's mesh port, the node's mesh
+   * certificate. Always true when no port terminates TLS.
    *
    * @generated from field: bool tls_ready = 12;
    */
@@ -32286,6 +32688,16 @@ export class NetAllocStatus extends Message<NetAllocStatus> {
    */
   guestBridge = "";
 
+  /**
+   * The kernel classifier's view of the allocation, on a node whose
+   * `netKernel` attribute is active (docs/network-handlers.md, "The kernel
+   * classifier"). Absent elsewhere, and for an allocation whose cgroup leaf
+   * does not exist yet.
+   *
+   * @generated from field: optional legion.NetKernelStatus kernel = 17;
+   */
+  kernel?: NetKernelStatus;
+
   constructor(data?: PartialMessage<NetAllocStatus>) {
     super();
     proto3.util.initPartial(data, this);
@@ -32310,6 +32722,7 @@ export class NetAllocStatus extends Message<NetAllocStatus> {
     { no: 14, name: "mesh_identity", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
     { no: 15, name: "guest_address", kind: "scalar", T: 9 /* ScalarType.STRING */ },
     { no: 16, name: "guest_bridge", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 17, name: "kernel", kind: "message", T: NetKernelStatus, opt: true },
   ]);
 
   static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): NetAllocStatus {
@@ -32330,6 +32743,115 @@ export class NetAllocStatus extends Message<NetAllocStatus> {
 }
 
 /**
+ * What the kernel classifier holds for one allocation, and what it did with
+ * the allocation's flows since the previous report.
+ *
+ * @generated from message legion.NetKernelStatus
+ */
+export class NetKernelStatus extends Message<NetKernelStatus> {
+  /**
+   * The allocation's cgroup leaf is described to the classifier: the host
+   * guard applies, and its port-53 traffic goes to its resolver.
+   *
+   * @generated from field: bool attached = 1;
+   */
+  attached = false;
+
+  /**
+   * Its egress chain is compiled into the kernel and enforced at
+   * `connect()`: denied flows fail with `EPERM`, and allowed flows that
+   * nothing reads connect directly. False for a gated allocation (its
+   * namespace is the boundary), a sandbox (its sockets live in its guest),
+   * an allocation with no egress chain, and a chain the kernel cannot hold
+   * (`reason`).
+   *
+   * @generated from field: bool enforced = 2;
+   */
+  enforced = false;
+
+  /**
+   * Flows only netd can decide (a request-time rule, a host rule for an
+   * address the resolver never returned, a chain with hops) are redirected
+   * to a capture listener rather than refused.
+   *
+   * @generated from field: bool capture = 3;
+   */
+  capture = false;
+
+  /**
+   * Compiled connect-time rules.
+   *
+   * @generated from field: uint32 rules = 4;
+   */
+  rules = 0;
+
+  /**
+   * Why the chain is not enforced in the kernel, when it is not. Empty
+   * otherwise.
+   *
+   * @generated from field: string reason = 5;
+   */
+  reason = "";
+
+  /**
+   * Connections passed straight through (no proxy hop) since the previous
+   * report.
+   *
+   * @generated from field: uint64 passed = 6;
+   */
+  passed = protoInt64.zero;
+
+  /**
+   * Connections redirected to the capture listener since the previous
+   * report.
+   *
+   * @generated from field: uint64 redirected = 7;
+   */
+  redirected = protoInt64.zero;
+
+  /**
+   * Connections refused in the kernel since the previous report.
+   *
+   * @generated from field: uint64 denied = 8;
+   */
+  denied = protoInt64.zero;
+
+  constructor(data?: PartialMessage<NetKernelStatus>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.NetKernelStatus";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "attached", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
+    { no: 2, name: "enforced", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
+    { no: 3, name: "capture", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
+    { no: 4, name: "rules", kind: "scalar", T: 13 /* ScalarType.UINT32 */ },
+    { no: 5, name: "reason", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 6, name: "passed", kind: "scalar", T: 4 /* ScalarType.UINT64 */ },
+    { no: 7, name: "redirected", kind: "scalar", T: 4 /* ScalarType.UINT64 */ },
+    { no: 8, name: "denied", kind: "scalar", T: 4 /* ScalarType.UINT64 */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): NetKernelStatus {
+    return new NetKernelStatus().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): NetKernelStatus {
+    return new NetKernelStatus().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): NetKernelStatus {
+    return new NetKernelStatus().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: NetKernelStatus | PlainMessage<NetKernelStatus> | undefined, b: NetKernelStatus | PlainMessage<NetKernelStatus> | undefined): boolean {
+    return proto3.util.equals(NetKernelStatus, a, b);
+  }
+}
+
+/**
  * One external handler hop as the datapath sees it.
  *
  * @generated from message legion.NetHandlerStatus
@@ -32344,7 +32866,7 @@ export class NetHandlerStatus extends Message<NetHandlerStatus> {
   source = "";
 
   /**
-   * `authz` or `proxy`.
+   * The handler kind: `authz`, `proxy`, `dlp`, or `plugin`.
    *
    * @generated from field: string handler = 2;
    */

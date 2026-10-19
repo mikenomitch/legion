@@ -511,7 +511,7 @@ How to use it:
 
 | PR | What it lands | Notes |
 | --- | --- | --- |
-| [#53](https://github.com/mikenomitch/legion/pull/53) | Namespaces: scoped job identity, ACLs, services, UI, and namespace policies | The namespaces items are already checked off and in Done; follow-ups are open under Auth, TLS & security |
+| [#51](https://github.com/mikenomitch/legion/pull/51) | Mesh interfaces: one handler pipeline, a smaller surface, the eBPF kernel classifier, WASM network plugins | Plan [mesh-interfaces-plan.md](plans/mesh-interfaces-plan.md); B1 end-to-end plugin overhead still open below |
 | [#54](https://github.com/mikenomitch/legion/pull/54) | TODO bugs and gaps, second pass | The items it closes are already checked off and in Done |
 | [#41](https://github.com/mikenomitch/legion/pull/41) | Keep plugins out of the workspace so they build again | Likely also closes "Plugin lockfiles are stale" (Plugin surface) |
 | [#39](https://github.com/mikenomitch/legion/pull/39) | Stop macOS single-process clusters cleanly | Closes "Stopping the macOS manager leaves its Apple containers running" (Cross-cutting) |
@@ -2107,7 +2107,19 @@ Plans: [task-runtime-plugins](../docs/task-runtime-plugins.md).
       `sd_notify`-compatible readiness socket, `WatchdogSec`-style pings, and
       socket activation via pre-bound fds
       ([plan §8 phase 4](plans/host-process-supervision-plan.md))
-- [ ] A **WASM** runtime
+- [ ] A **WASM** runtime: run a WASI command module (`wasm32-wasip1`) as a
+      task. The embedding layer it needs is shared with the network plugins
+      and ready in [`src/wasm/`](../src/wasm/mod.rs): the engine, a memory cap
+      that names a refusal, failure descriptions, guest-memory helpers, a
+      WASI preview1 shim with real `args`/`environ` and pluggable
+      stdout/stderr (`WasiHost`), and module fetching by URL and checksum
+      through the artifact stager. Still to decide and build, in a plan:
+      the task surface (`runtime = "wasm"`, `config.module`), a CPU budget
+      for a whole run in place of a plugin's per-callback fuel, preopened
+      directories (the shim has no filesystem), networking (none, or the
+      gated datapath's proxy over a host function), and whether an
+      interpreter is fast enough for tasks or a task wants wasmtime beside
+      the plugin's wasmi.
 - [ ] A **`converge`** runtime — idempotent host resources (package, file,
       template, directory, user, service, mount) with per-resource
       `unchanged | changed | failed` reporting, i.e. the Chef-replacement shape —
@@ -3515,11 +3527,6 @@ has open:
 - [ ] Datapath plugin ABI + bridge/CNI shim (`mode: 'auto'` picking a real
       overlay). The datapath half — overlay, CNI, fingerprinters — is still
       unplanned; it remains the service-discovery plan's item 2.
-- [ ] Sandboxed WASM middleware filters on the L7 path (retries, timeouts,
-      weighted split and outlier ejection shipped in M2 inside the upstream
-      listener). They are the handlers plan's phase 8 — whichever of the two
-      plans grows a sandbox first should host the other's filters rather
-      than growing a second one.
 - [ ] `legion net doctor` citing live-traffic evidence: it walks policy →
       mode → datapath status (M6) but does not yet pull the task's edges
       from the service graph (M8) into its verdict.
@@ -3679,8 +3686,6 @@ worker:
       runtime mounts that dir).
 - [ ] Phase 7 — UDP (SOCKS5 `UDP ASSOCIATE`) and transparent capture (TUN +
       userspace stack in the gated namespace)
-- [ ] Phase 8 — sandboxed WASM handlers (in-process `cdylib` handlers are
-      deliberately not planned — see calls entry 4)
 - [ ] Publish `pool` and `nodeId` into worker `config_attrs`
       ([daemon.rs:281](../src/worker/daemon.rs)) so `count.per` can express
       one-per-node handler jobs — also what the pool-scheduling item above
@@ -3690,23 +3695,58 @@ Deliberately not in the plan (see its §5): TLS interception / MITM — external
 upstreams are the body-visible route; rate limits and quotas; a cluster-edge
 load balancer.
 
-Proposed, not yet planned:
-[egress-plugins-proposal.md](plans/egress-plugins-proposal.md) · calls:
-[egress-plugins-proposal_calls.md](calls/egress-plugins-proposal_calls.md).
-Two independent tracks; each phase would graduate into its own plan.
+Shipped: [mesh-interfaces-plan.md](plans/mesh-interfaces-plan.md) · calls:
+[mesh-interfaces-plan_calls.md](calls/mesh-interfaces-plan_calls.md) (see
+Done, Networking: mesh interfaces). What it left open:
 
-- [ ] Track A: kernel classifier. Policy compiled to eBPF maps on each
-      allocation's cgroup leaf: allowed L4 flows that nothing reads skip the
-      proxy, host-mode egress chains become enforced, gated capture becomes
-      transparent (supersedes phase 7's TUN capture on capable nodes), and the
-      `nftables` host guard moves to eBPF. A0 (probe + `net_bench` numbers)
-      comes first.
-- [ ] Track B: WASM plugins on the proxy-wasm ABI at the connect, request,
-      body, response, and done stages, with plugin objects and keyed handler
-      variants (`{ authz = { … } }`). This is phase 8 above, reshaped.
-- [ ] Operator eBPF connect programs with an SDK (proposal C), only on demand.
+- [ ] **`oci://` plugin modules.** `module.source` takes single `.wasm`
+      files over `https://`, `http://`, `s3://`, and `file://`; a module
+      published as an OCI artifact needs a manifest-to-blob path in the node
+      content store ([calls entry 31](calls/mesh-interfaces-plan_calls.md#31-plugin-modules-are-single-files-no-oci-yet)).
+- [ ] **Streaming request bodies for plugins.** The `body` stage buffers the
+      whole request (up to `maxBodyBytes`); responses already stream
+      ([calls entry 33](calls/mesh-interfaces-plan_calls.md#33-request-bodies-are-buffered-response-bodies-stream-chunk-by-chunk)).
+- [ ] **Re-check jobs when a plugin changes.** `UpsertNetPlugin` re-checks the
+      policy objects that use the plugin, not submitted jobs, so a schema
+      change can leave a running job's config invalid
+      ([calls entry 43](calls/mesh-interfaces-plan_calls.md#43-applying-a-plugin-re-checks-the-policies-that-use-it-not-the-jobs)).
+- [ ] **Pool `dispatch_http_call` connections.** Each call builds a client
+      pinned to the guarded address; fine for rare calls, not for a plugin
+      that calls per request
+      ([calls entry 39](calls/mesh-interfaces-plan_calls.md#39-dispatch_http_call-reaches-only-declared-targets-judged-like-the-tasks-own-flows)).
+- [ ] **Plugin log lines in the allocation's logs.** They go to the worker
+      log only ([calls entry 53](calls/mesh-interfaces-plan_calls.md#53-module-log-lines-go-to-the-worker-log-rate-limited)).
+- [ ] **Plugin ticks and shared queues.** Ticks are accepted and never fire;
+      queues answer `Unimplemented`
+      ([calls entry 54](calls/mesh-interfaces-plan_calls.md#54-ticks-are-accepted-and-never-fire-shared-queues-are-unimplemented)).
+- [ ] **A CI check that `tests/netplugins/*.wasm` match their sources**
+      (`tests/netplugins/build.sh`), like `bpf/build.sh --check`
+      ([calls entry 55](calls/mesh-interfaces-plan_calls.md#55-test-modules-are-checked-in-as-built-wasm-with-their-sources)).
+- [ ] **Attribute the plugin `request`-stage cost on the HTTP path.** In
+      process, a no-op plugin's whole request-stage exchange is under 7 µs
+      (`net_bench plugin_exchange`). Through `http_rr` it adds 25–70 µs,
+      while its callback averages about 1.2 µs there. The plan's B1 target
+      (single-digit µs end to end) is not met until this is found.
+- [ ] **A plugins page in the UI.** Plugin hops show in a task's Network
+      section with the other handlers; per-node plugin status
+      (`GetNetPluginStatus`) is CLI and MCP only.
+- [ ] **Per-rule kernel lines in `net policy show`.** `show` and `doctor`
+      report whether the kernel enforces a chain and its counters; they do
+      not yet mark which rules compiled to the kernel and which netd judges.
+
+Cut from that plan to on-demand (plan §6.F, calls entry 20). Do each only
+when someone brings a need the plan does not cover:
+
+- [ ] Operator eBPF connect programs with an SDK and `net plugin build`.
 - [ ] File-descriptor hand-off for node-local `proxy` targets, and `authz` to
-      a sidecar port (proposal D).
+      a sidecar port.
+- [ ] Kernel balancing for plain L4 upstreams (VIP rewritten at `connect()`).
+- [ ] `tc` enforcement for TAP-wired sandboxes.
+- [ ] One template engine. The manager renders `{{ kv }}` into env and
+      files, and the worker renders `connect.templates` from the endpoint
+      feed, with different functions and change policies. Merging them is a
+      real simplification but reshapes KV injection, so it is outside the
+      mesh plan (its §4 non-goals).
 
 Still unplanned, and not covered by the plan:
 
@@ -3716,9 +3756,10 @@ Still unplanned, and not covered by the plan:
 - [ ] Port forwarding
 - [ ] Cluster-edge ingress load balancer. The plan's ingress is node-local,
       in front of one allocation; a cluster edge is separate work
-- [ ] `clientCa = { kv = "<path>" }` for `mutual` ingress, so a private client
-      CA can live in KV like the server certificate. Not in
-      [kv-cert-delivery-plan.md](plans/kv-cert-delivery-plan.md).
+- [x] A KV-held client CA for mutual ingress: shipped as
+      `network.ports[].tls.clients.ca = { kv }` in
+      [mesh-interfaces-plan.md](plans/mesh-interfaces-plan.md) S5
+      ([network-handlers.md#certificates-and-cas-from-kv](../docs/network-handlers.md#certificates-and-cas-from-kv)).
 - [ ] A built-in ACME client (answering HTTP-01 from the ingress datapath).
       Only worth it once the cluster edge above exists. Until then, the
       renewer job in `configs/jobs/cert-renewer.ncl` covers it.
@@ -3787,6 +3828,60 @@ Datapath performance). Deferred, by name:
       creates small pipes and splice moves less per call. Measure on a node
       with tens of thousands of concurrent bulk flows
       ([calls #6](calls/datapath-performance-plan_calls.md)).
+
+
+### macOS gated networking
+
+[plan](plans/macos-gated-plan.md) · [calls](calls/macos-gated-plan_calls.md)
+· docs: [network-handlers.md § Gated mode on macOS](../docs/network-handlers.md#gated-mode-on-macos)
+
+- [ ] **Phase 4: run it on macOS hardware.** Phases 1–3 are implemented and
+      unit-tested on Linux only. On a macOS 26 machine with a root worker, run
+      the plan's three scenarios (§3): a confined `exec` task's direct dial
+      gets `EPERM` and its proxied request the policy's answer; a confined
+      `container` reaches its upstream and not `1.1.1.1`; a non-root worker
+      fails the start with its message. Settle the plan's open questions
+      (rdr to `127.0.0.1` without forwarding, vmnet's resolver, IPv6).
+- [ ] **`auto` resolves to `gated` for `container` and `sandbox` on macOS 26**,
+      once phase 4 passes (calls entry 1).
+- [ ] **Upstreams from ungated Apple containers.** `LEGION_UPSTREAM_*` names
+      `127.0.0.1`, the VM's own loopback, so a host-mode Apple container
+      cannot reach its upstreams (found while planning this; also on main).
+      The same per-VM `rdr`, without the block, fixes it on the `default`
+      network, but needs a root worker (plan §6.6).
+- [ ] **DNS for confined tasks**, if a real tool needs to resolve before it
+      proxies (calls entry 5).
+- [ ] **A configurable gated subnet** for Macs that already use
+      `192.168.239.0/24` (calls entry 4).
+
+### Datapath simplification candidates not taken
+
+From the deletion survey on PR #51. Each removes code but changes behavior
+or needs a decision:
+
+- [ ] **Drop the `nftables` host guard and keep only eBPF** (~730 lines):
+      nodes whose kernel cannot load the classifier (no ringbuf or sockops,
+      kernels before ~5.8) would lose the kernel floor for host-mode tasks;
+      mesh interfaces plan §11 Q4 leans keep.
+- [ ] **Drop `legion_sign` and plugin credentials** (~300 lines), if no
+      plugin needs to sign with a key it never sees.
+- [ ] **Drop `legion net plugin new`** (~190 lines); `tests/netplugins/*`
+      already serve as templates.
+- [ ] **Drop the gated in-namespace capture listener on `:1081`** (~200
+      lines), back to the explicit-proxy model for gated tasks.
+- [ ] **One store for held material on the worker** (~120 lines, no
+      behavior change): credentials, TLS material and plugin credentials each
+      repeat version / set / error / retain.
+- [ ] **Share HTTP plumbing between the gated proxy's absolute-URI path and
+      `netd::http`** (~120 lines, no behavior change): two `denied_response`,
+      access-log, `answer_locally` and header-rewrite copies, whose 403
+      bodies already differ.
+- [ ] **Remove the policy-less forwarder path** (~70 lines, tests only):
+      `ForwarderContext`'s `Option` fields exist only for
+      `UpstreamForwarder::new()` in tests.
+- [ ] **Collapse the port-assignment wrappers** in `structs/network.rs`
+      (~25 lines net, test-only wrappers around
+      `assign_allocation_ports_full`).
 
 ## Persistence & cluster operations
 
@@ -5515,6 +5610,123 @@ docs: [task-runtime-plugins.md](../docs/task-runtime-plugins.md)
       close (about 0.1 GiB/s and 50 CPU-s/GiB through the forwarder in
       `net_bench`).
 - [x] `benchmarks/micro/net_bench.rs` (network-handlers plan §7.12).
+
+## Networking: mesh interfaces
+
+[plan](plans/mesh-interfaces-plan.md) · [calls](calls/mesh-interfaces-plan_calls.md)
+· docs: [network-handlers.md](../docs/network-handlers.md),
+[network-plugins.md](../docs/network-plugins.md),
+[service-discovery.md](../docs/service-discovery.md),
+findings: [kernel-classifier-findings.md](kernel-classifier-findings.md)
+
+- [x] **Phase 0 (bugs).** `dlp` and `log` handlers declared on a chain
+      (inline or on a policy object) passed validation and never ran:
+      `HttpSettings` only got the upstream's own handlers, ingress got none,
+      and the gated proxy's absolute-URI path ran neither. A chain's
+      `onError` was printed by `net policy show` but never read by the
+      datapath. Fixed: chain `dlp`/`log` run on HTTP-mode upstreams, HTTP
+      ingress, and absolute-URI requests through the gated proxy, and a hop
+      without its own `onError` takes its chain's. Regression tests:
+      `chain_dlp_and_log_handlers_run_on_an_http_upstream_test`,
+      `chain_dlp_and_log_run_on_absolute_uri_requests_test`,
+      `hops_inherit_the_chain_on_error_test`.
+- [x] S1: keyed handler variants on one `Handler` trait and `HANDLERS`
+      registry ([structs/hops.rs](../src/structs/hops.rs)), one compiled
+      `Pipeline` on every path ([netd/handlers.rs](../src/worker/netd/handlers.rs)),
+      stage checks at submit, kind, stage, and placement in `net policy
+      show` and `net doctor`. Removed the `log` handler (use `accessLog`),
+      chain-level `onError`, and `proxy.node` (`service` + `local = true`).
+      Docs: [network-handlers.md#handlers](../docs/network-handlers.md#handlers).
+- [x] S2: upstreams as one `to` whose scheme is the protocol
+      ([structs/network.rs](../src/structs/network.rs), `parse_upstream_to`):
+      an HTTP chain no longer parses `tcp` upstreams as HTTP; an undecidable
+      verdict fails closed naming the rule and the upstream, and `job
+      validate`/`plan`/`run` and `net policy apply` warn about it. One
+      dialable address per upstream (`LEGION_UPSTREAM_<KEY>` plus `_HOST_`
+      and `_PORT_`; `_VIP_` removed), VIP-only binding on Linux with a
+      loopback port only when pinned, without a VIP block, or for a sandbox.
+      Removed `http.outlier` (fixed 5 × 5xx / 30s ejection) and the `random`
+      balancer (`round_robin` and `least_conn` start at a random offset).
+      Docs: [service-discovery.md](../docs/service-discovery.md#connecting-to-services-the-connect-block),
+      [network-handlers.md](../docs/network-handlers.md#upstreams).
+      Not done: a store migration for allocation rows and stored specs in
+      the old shape (see the plan's calls file); clusters with such data
+      re-submit their jobs.
+- [x] S3 + S4: `service.mesh = true` (resolved at placement onto
+      `AllocPort.mesh`; a policy object can impose or default `mesh`) and
+      TLS on `network.ports[].tls = { cert, clients = { ca } }` instead of
+      chain `tls`; an external upstream's `ca` pins its trust bundle.
+      `service.allow` is the one caller list (bare = job glob, colons =
+      `<region>:<job>:<group>:<task>` glob), matched in the endpoint feed
+      and, on mesh services, compiled into the ingress chain's `callers`
+      (`Legion-Denied-By: service/allow`); `service doctor` says when it is
+      feed-only. Removed `TlsConfig` (`certFrom`, `clientCa`, `caPath`,
+      `requireIdentity`) and the reserved `bridge`/`cni/*` modes. Fixed on
+      the way: the caller's group on the wire (was always `default`;
+      `TaskAllocation.task_group`), and a port's own client CA no longer
+      vouches for `legion://node` peers (calls entry 28).
+      Docs: [network-handlers.md#the-mesh](../docs/network-handlers.md#the-mesh),
+      [#tls-on-ports](../docs/network-handlers.md#tls-on-ports),
+      [service-discovery.md](../docs/service-discovery.md#intentions-serviceallow).
+- [x] S5: one `{ kv | identity | file }` source grammar
+      ([structs/source.rs](../src/structs/source.rs)), `FetchDatapathMaterial`
+      in place of `FetchNetPolicy`, `GetIngressCertificates`, and
+      `GetUpstreamCredentials`, with `policy`, `port_cert`, `client_ca`,
+      `upstream_ca`, and `credential` refs, and a manager-side
+      `MaterialProvider` per source kind
+      ([manager/server/material_rpcs.rs](../src/manager/server/material_rpcs.rs)).
+      Docs: [network-handlers.md#sources](../docs/network-handlers.md#sources).
+- [x] Track A: the kernel classifier
+      ([netd/kernel/](../src/worker/netd/kernel/), C programs in
+      [bpf/](../bpf/)). A0: the feature probe (`netKernel`), coverage and
+      restart findings, and `net_bench kernel_conn_rr`. A1: the host guard
+      in eBPF (`Host guard active (ebpf)`), pinned under
+      `/sys/fs/bpf/legion/abi-1`. A2: host-mode egress chains compiled to
+      maps and enforced at `connect()`, DNS capture with learned
+      addresses, ring-buffer denials, and kernel counters feeding metrics,
+      the service graph, idle detection, and `net doctor`. A3: transparent
+      capture into netd (host mode and gated namespaces) with the SNI/Host
+      peek. Docs: [network-handlers.md#the-kernel-classifier](../docs/network-handlers.md#the-kernel-classifier).
+- [x] Track B: WASM network plugins on the proxy-wasm ABI
+      ([netd/plugins/](../src/worker/netd/plugins/),
+      [handlers/plugin.rs](../src/worker/netd/handlers/plugin.rs)). B1:
+      plugin objects (`UpsertNetPlugin`, `GetNetPlugin`, `ListNetPlugins`,
+      `DeleteNetPlugin`, `GetNetPluginStatus`), `legion net plugin
+      new|test|apply|list|describe|status|delete`, MCP tools, and the
+      `request` and `done` stages on wasmi with fuel and memory limits. B2:
+      the `body` and `response` stages with streamed response bodies, and
+      `usableBy = "jobs"` with shared data scoped per job. B3: `legion_sign`
+      (HMAC-SHA256, SigV4) over keys the module never reads, and
+      `dispatch_http_call` to declared targets. Conformance modules built
+      with the proxy-wasm Rust SDK in `tests/netplugins/`; `net_bench
+      http_rr` no-op plugin rows.
+      Docs: [network-plugins.md](../docs/network-plugins.md).
+- [x] Phase 8 of the handlers plan (sandboxed WASM handlers) and the
+      service-discovery plan's "sandboxed WASM middleware filters on the L7
+      path": both shipped as Track B's plugins.
+
+- [x] **macOS gated networking, phases 1–3.** A gated allocation on a macOS
+      node is confined: an egress proxy port of its own
+      (`AllocNetwork.egressProxy`), twins for every port, the datapath's
+      `Attachment::Confined` failing closed; `exec` under a Seatbelt profile;
+      Apple `container` VMs (`container`, dev-mode `sandbox`) on the
+      `legion-gated` network under a `pf` anchor. Unit-tested on Linux;
+      phase 4 (macOS hardware) is open above.
+      [plan](plans/macos-gated-plan.md) ·
+      [docs](../docs/network-handlers.md#gated-mode-on-macos)
+- [x] **Datapath simplification.** One egress judge (`netd::egress`) for
+      the gated proxy, capture, and external upstreams, which also fixed a
+      gated allocation's HTTP-mode upstream serving before its policy
+      arrived (fail-open, also on main) and HTTP-mode upstreams ignoring
+      CIDR rules on resolved addresses; SOCKS5 dropped from the gated proxy;
+      the vendored `linux/bpf.h` cut to the 272 lines the classifier uses;
+      dead code, the `MaterialProvider` trait, the rule `match` alias,
+      `net plugin new --lang`, and three kernel builders removed; the host
+      capture listener prunes state for gone allocations.
+- [x] **A shared WASM embedding layer** (`src/wasm/`): engine, memory cap,
+      failure descriptions, guest memory, a WASI preview1 shim with real
+      `args`/`environ`, and module fetching, so a `wasm` task runtime reuses
+      what the network plugins run on (open item under Task runtimes).
 
 ## Stateful workloads & volumes
 

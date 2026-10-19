@@ -272,8 +272,8 @@ namespace you can read), and every `ServiceSummary` and `ServiceEndpoint`
 carries its `namespace`. A service reference on the API is canonical like a
 job id: `api` in `default`, `payments-prod/api` elsewhere.
 
-**Upstreams resolve in the consumer's own namespace.** `{ service = "redis"
-}` means the `redis` of the namespace the task runs in, and the short DNS
+**Upstreams resolve in the consumer's own namespace.** `{ to = "redis" }`
+means the `redis` of the namespace the task runs in, and the short DNS
 form `redis.svc.legion` keeps meaning that. A bare name never reaches
 across.
 
@@ -283,9 +283,9 @@ namespace it reaches into, and the target admits the consumer:
 ```nickel
 # in checkout-prod: the consumer names where it is reaching
 connect = { upstreams = [
-  { service = "redis" },                               # own namespace
-  { service = "auth", namespace = "shared" },          # explicit crossing
-  # the same thing, qualified: { service = "shared/auth" }
+  { to = "redis" },                                    # own namespace
+  { to = "auth", namespace = "shared" },               # explicit crossing, L4
+  { to = "http://billing", namespace = "shared" },     # explicit crossing, HTTP
 ] },
 
 # in shared: the target admits the consumer
@@ -311,14 +311,15 @@ the config that uses it. The node resolver also answers the SRV form
 alias as the key. A namespace name is a DNS label, and Legion answers only
 under `svc.legion`, so a namespace called `com` shadows nothing.
 
-Validation refuses an upstream whose `namespace` is not a namespace name,
-whose `namespace` disagrees with a qualified `service`
-(`names namespace 'shared' in service and 'other' in namespace; write one of
-them`), or that sets `namespace` on an external (`to`) destination.
+Validation refuses an upstream whose `namespace` is not a namespace name, or
+that sets `namespace` on an external destination (`https://…`, `tcp://…`).
+A crossing is always the `namespace` field: `to` is a service name or a URL,
+so a `shared/auth` form would read as a URL path under `http://`.
 
-`allow` is not cryptographic identity: it controls what the catalog offers
-a consumer. Enforcement on the wire is `network.mode = "gated"` plus net
-policies. Net policies are cluster objects whose selector can name
+Without the mesh, `allow` controls what the catalog offers a consumer; on a
+`mesh = true` service the receiving node also applies it to the verified
+caller's job ([The mesh](network-handlers.md#the-mesh)). Beyond that,
+enforcement on the wire is `network.mode = "gated"` plus net policies. Net policies are cluster objects whose selector can name
 `namespaces`; their selector facts carry each task's real namespace, and a
 `jobs` glob matches the job's bare name.
 

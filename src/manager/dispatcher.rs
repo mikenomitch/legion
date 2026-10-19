@@ -692,6 +692,13 @@ pub fn build_task_allocation_with(
         task_lifecycle: task.lifecycle.to_string(),
         task_restart,
         task_speculative_start,
+        task_group: task.group.clone(),
+        task_service: match task.service.as_ref() {
+            Some(service) => {
+                serde_json::to_string(service).context("Failed to serialize service")?
+            }
+            None => String::new(),
+        },
         session_task_spec: String::new(),
         session_task_config_id: 0,
         session_seal_keys: Vec::new(),
@@ -1334,8 +1341,8 @@ mod tests {
     fn declared_upstreams_are_serialized_onto_the_allocation() -> R<()> {
         let connect: crate::structs::ConnectConfig = serde_json::from_value(json!({
             "upstreams": [
-                { "service": "db" },
-                { "service": "cache", "localPort": 6379, "balance": "least_conn" },
+                { "to": "db" },
+                { "to": "cache", "port": 6379, "balance": "least_conn" },
             ]
         }))?;
         let task = TaskConfig {
@@ -1348,7 +1355,7 @@ mod tests {
         let decoded: crate::structs::ConnectConfig = serde_json::from_str(&built.task_connect)?;
         assert_eq!(decoded, connect);
         // camelCase on the wire, like the rest of the jobspec.
-        assert!(built.task_connect.contains("\"localPort\":6379"));
+        assert!(built.task_connect.contains("\"port\":6379"));
         Ok(())
     }
 
@@ -1472,7 +1479,7 @@ mod tests {
     #[test]
     fn connect_upstreams_cap_the_gate_at_stage() -> R<()> {
         let connect: crate::structs::ConnectConfig =
-            serde_json::from_value(json!({ "upstreams": [{ "service": "db" }] }))?;
+            serde_json::from_value(json!({ "upstreams": [{ "to": "db" }] }))?;
         let task = TaskConfig {
             speculative_start: speculative("boot"),
             connect: Some(connect),

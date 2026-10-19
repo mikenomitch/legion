@@ -453,10 +453,22 @@ async fn run_worker_with_manager(join: WorkerJoin, name_override: Option<&str>) 
     let enforcement_config =
         usable_resource_enforcement(parse_resource_enforcement(&config.resource_enforcement));
     apply_resource_enforcement_env(&enforcement_config);
-    // The host guard in the kernel (worker-plane-auth plan §6.13). It
-    // matches sockets by cgroup leaf, so where it runs every task gets one,
-    // enforcement or not.
-    let kernel_guard = crate::worker::netd::kernel_guard::probe();
+    // The kernel classifier (mesh interfaces plan §6.A) where the node can
+    // run it: the host guard, host-mode egress chains, and DNS capture, in
+    // eBPF. Elsewhere, the host guard in `nftables` (worker-plane-auth plan
+    // §6.13). Both match sockets by cgroup leaf, so where either runs every
+    // task gets one, enforcement or not.
+    let (net_kernel, classifier) = open_kernel_classifier(&enforcement_config.cgroup_parent);
+    let kernel_guard = if classifier.is_some() {
+        crate::worker::netd::kernel_guard::Availability::Active
+    } else {
+        crate::worker::netd::kernel_guard::probe()
+    };
+    let host_guard_attribute = if classifier.is_some() {
+        "active (ebpf)".to_string()
+    } else {
+        kernel_guard.attribute()
+    };
     match &kernel_guard {
         crate::worker::netd::kernel_guard::Availability::Active => {
             std::env::set_var(crate::constants::ENV_HOST_GUARD_KERNEL, "1");
@@ -465,8 +477,13 @@ async fn run_worker_with_manager(join: WorkerJoin, name_override: Option<&str>) 
                 &enforcement_config.cgroup_parent,
             );
             info!(
-                "Host guard active in the kernel (nftables): host-mode tasks cannot reach this \
-                 node's Legion ports, cloud metadata, or other allocations' listeners"
+                backend = if classifier.is_some() {
+                    "ebpf"
+                } else {
+                    "nftables"
+                },
+                "Host guard active in the kernel: host-mode tasks cannot reach this node's \
+                 Legion ports, cloud metadata, or other allocations' listeners"
             );
         }
         crate::worker::netd::kernel_guard::Availability::Unavailable(reason) => {
@@ -696,7 +713,11 @@ async fn run_worker_with_manager(join: WorkerJoin, name_override: Option<&str>) 
     // `legion node info` shows whether host-mode tasks are guarded here.
     config_attrs.insert(
         crate::worker::netd::kernel_guard::NODE_ATTR.into(),
-        Value::String(kernel_guard.attribute()),
+        Value::String(host_guard_attribute.clone()),
+    );
+    config_attrs.insert(
+        crate::worker::netd::kernel::NODE_ATTR.into(),
+        Value::String(net_kernel.attribute()),
     );
     if let Some(public_address) = worker_public_address() {
         config_attrs.insert("publicAddress".into(), Value::String(public_address));
@@ -771,7 +792,13 @@ async fn run_worker_with_manager(join: WorkerJoin, name_override: Option<&str>) 
         )
         .with_logs_base_dir(logs_base_dir.clone())
         .with_host_guard(host_guard.clone())
-        .with_kernel_guard_if(
+        // Network plugin modules come through the artifact stager into the
+        // node content store (docs/network-plugins.md).
+        .with_plugin_loader(Arc::new(crate::wasm::module::StagerLoader {
+            stager: task_manager.lock().expect("task manager").stager_handle(),
+            label: "net plugin module",
+        }))
+        .with_kernel(
             (kernel_guard == crate::worker::netd::kernel_guard::Availability::Active).then(|| {
                 kernel_guard_base(
                     &config.security,
@@ -780,8 +807,25 @@ async fn run_worker_with_manager(join: WorkerJoin, name_override: Option<&str>) 
                     &enforcement_config.cgroup_parent,
                 )
             }),
+            classifier,
         ),
     );
+    // Where the kernel classifier redirects host-mode flows only netd can
+    // decide. Held for the worker's lifetime.
+    let _host_capture = if net_context.kernel_classifier_active() {
+        match crate::worker::netd::capture::HostCapture::start(net_context.clone()).await {
+            Ok(capture) => {
+                net_context.set_host_capture(Some(capture.addr));
+                Some(capture)
+            }
+            Err(err) => {
+                warn!(error = %format!("{err:#}"), "Capture listener unavailable; host-mode flows only netd can decide are refused");
+                None
+            }
+        }
+    } else {
+        None
+    };
     let net_dns = Arc::new(crate::worker::netd::dns::NetDns::new(
         net_context.clone(),
         crate::worker::netd::dns::NetDns::host_forwarders(),
@@ -1355,6 +1399,63 @@ impl crate::worker::server::ClaimRatifier for ManagerClaimRatifier {
     }
 }
 
+/// Probe for the kernel classifier and, when the node can run it, load and
+/// attach it under the worker's cgroup parent, pinned in bpffs when bpffs is
+/// mounted (so enforcement survives a worker restart). The probe's answer is
+/// the `netKernel` node attribute.
+#[cfg(target_os = "linux")]
+fn open_kernel_classifier(
+    cgroup_parent: &str,
+) -> (
+    crate::worker::netd::kernel::probe::Availability,
+    Option<crate::worker::netd::kernel::runtime::KernelNet>,
+) {
+    use crate::worker::netd::kernel::probe::{probe, Availability};
+    use crate::worker::netd::kernel::runtime::{KernelNet, KernelSettings};
+    let root = std::path::Path::new(crate::task_plugins::CGROUP_ROOT);
+    let availability = probe(root);
+    if !availability.is_active() {
+        if let Availability::Unavailable(reason) = &availability {
+            info!(%reason, "Kernel classifier unavailable; host-mode egress stays cooperative");
+        }
+        return (availability, None);
+    }
+    let bpffs = std::fs::read_to_string("/proc/mounts")
+        .unwrap_or_default()
+        .lines()
+        .any(|line| {
+            line.split_whitespace().nth(1) == Some("/sys/fs/bpf") && line.contains(" bpf ")
+        });
+    if !bpffs {
+        warn!("No bpffs at /sys/fs/bpf: the kernel classifier stops enforcing while the worker restarts");
+    }
+    match KernelNet::open(KernelSettings {
+        cgroup_root: root.to_path_buf(),
+        cgroup_parent: cgroup_parent.to_string(),
+        pin_dir: bpffs.then(|| std::path::PathBuf::from("/sys/fs/bpf/legion")),
+    }) {
+        Ok(net) => {
+            info!("Kernel classifier active: host-mode egress chains are enforced at connect()");
+            (availability, Some(net))
+        }
+        Err(err) => {
+            let reason = format!("{err:#}");
+            warn!(%reason, "Kernel classifier failed to load; using the nftables guard");
+            (Availability::Unavailable(reason), None)
+        }
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn open_kernel_classifier(
+    _cgroup_parent: &str,
+) -> (crate::worker::netd::kernel::probe::Availability, Option<()>) {
+    (
+        crate::worker::netd::kernel::probe::Availability::Unavailable("not Linux".into()),
+        None,
+    )
+}
+
 /// The host guard this worker type's `hostGuard` block describes. A block
 /// the manager validated can't fail here; if it somehow does, the worker
 /// keeps the default guard (no overrides), which refuses more, never less.
@@ -1444,12 +1545,18 @@ fn kernel_guarded_allocations(
                 vip_block: network
                     .as_ref()
                     .and_then(|network| network.vip_block.clone()),
+                resolver: network
+                    .as_ref()
+                    .and_then(|network| network.resolver_address())
+                    .and_then(|addr| addr.parse().ok()),
+                gated: network.as_ref().is_some_and(|network| network.is_gated()),
+                host_sockets: allocation.task_runtime != "sandbox",
                 loopback_ports: network
                     .map(|network| {
                         network
                             .upstreams
                             .iter()
-                            .map(|upstream| upstream.local_port)
+                            .filter_map(|upstream| upstream.local_port)
                             .collect()
                     })
                     .unwrap_or_default(),
@@ -2234,11 +2341,13 @@ async fn heartbeat_tick(
             denials: net_denials,
             edges: net_edges,
             statuses: mut net_status,
+            plugins: net_plugins,
         } = netd.report();
         let net_redrive = NetdReport {
             denials: net_denials.clone(),
             edges: net_edges.clone(),
             statuses: Vec::new(),
+            plugins: Vec::new(),
         };
         // Config-file templates render from the same feed; a template that
         // cannot render is the allocation's network problem too.
@@ -2440,6 +2549,7 @@ async fn heartbeat_tick(
             net_denials,
             net_status,
             net_edges,
+            net_plugins,
             id: name.to_string(),
             provisional_claims,
             allocation_ids: allocations,
@@ -2654,9 +2764,6 @@ async fn heartbeat_tick(
         // KV files marked `onChange = "update"`, rewritten under running
         // allocations whose rendered content moved.
         apply_live_kv_files(task_manager, &reply);
-        // Same authority for network policy: bodies fetched by hash, last
-        // known good kept on any failure.
-        fetch_net_policies(netd, &mut client_clone, credentials, name).await;
         refresh_node_identity(
             node_identity,
             netd,
@@ -2666,9 +2773,10 @@ async fn heartbeat_tick(
             &reply.cluster_ca_pins,
         )
         .await;
-        // KV-held ingress certificates and upstream credentials, for the
-        // desired set just applied (the reply's, or the StreamWork mirror's
-        // when the work arrives over the stream).
+        // Policy bodies by hash, KV-held ingress certificates, and upstream
+        // credentials, for the desired set just applied (the reply's, or the
+        // StreamWork mirror's when the work arrives over the stream). Last
+        // known good is kept on any failure.
         fetch_datapath_material(netd, &mut client_clone, credentials, name).await;
         netd.persist();
         // Allocations whose launch was dispatched this tick. Their refresh
@@ -3079,104 +3187,41 @@ async fn refresh_node_identity(
     }
 }
 
-/// Fetch the network-policy bodies the datapath holds an assignment for but
-/// has not seen. Fail-static: a fetch that fails leaves the allocation on
-/// whatever policy it had (or none, in which case a gated allocation stays
-/// closed until a later heartbeat succeeds).
-async fn fetch_net_policies(
-    netd: &Netd,
-    client: &mut ManagerClient<Channel>,
-    credentials: &Arc<WorkerCredentials>,
-    node_id: &str,
-) {
-    for hash in netd.wants().policy_bodies {
-        let request =
-            credentials.attach(tonic::Request::new(crate::structs::FetchNetPolicyRequest {
-                node_id: node_id.to_string(),
-                hash: hash.clone(),
-            }));
-        match client.fetch_net_policy(request).await {
-            Ok(response) => {
-                let body = response.into_inner().effective_json;
-                match serde_json::from_str::<crate::structs::netpolicy::EffectivePolicy>(&body) {
-                    Ok(policy) => {
-                        netd.send(NetdInput::PolicyBody {
-                            hash,
-                            policy: Box::new(policy),
-                        })
-                        .await
-                    }
-                    Err(err) => {
-                        warn!(hash = %hash, error = ?err, "Invalid network policy body from manager");
-                    }
-                }
-            }
-            Err(err) => {
-                warn!(
-                    hash = %hash,
-                    error = ?err,
-                    "Failed to fetch network policy body; keeping last known good"
-                );
-            }
-        }
-    }
-}
-
-/// Fetch what the datapath's chains need from the manager besides policy:
-/// `certFrom = { kv }` ingress certificates (docs/network-handlers.md,
-/// "Certificates from KV") and `connect.upstreams[].credentials`
-/// ("Credential injection"). One call of each per heartbeat, only while an
-/// allocation on the node needs it, carrying the version already held so an
-/// unchanged value costs nothing on the wire. Fail-static: a failed call
-/// keeps what the datapath holds.
+/// Fetch what the datapath needs from the manager, in one
+/// `FetchDatapathMaterial` call per heartbeat: policy bodies it holds an
+/// assignment for but has not seen,
+/// `connect.upstreams[].credentials` ("Credential injection"), and KV-held
+/// port certificates, client CAs, and upstream CAs ("TLS on ports"). Each ref
+/// carries the version already held, so an unchanged value costs nothing on
+/// the wire, and no call is made while nothing is wanted. Fail-static: a
+/// failed call keeps what the datapath holds (a gated allocation with no
+/// policy body yet stays closed until a later heartbeat succeeds).
 async fn fetch_datapath_material(
     netd: &Netd,
     client: &mut ManagerClient<Channel>,
     credentials: &Arc<WorkerCredentials>,
     node_id: &str,
 ) {
-    let wants = netd.wants();
-    if !wants.ingress_certificates.is_empty() {
-        let request = credentials.attach(tonic::Request::new(
-            crate::structs::GetIngressCertificatesRequest {
-                node_id: node_id.to_string(),
-                known: wants.ingress_certificates,
-            },
-        ));
-        match client.get_ingress_certificates(request).await {
-            Ok(response) => {
-                netd.send(NetdInput::IngressCertificates(
-                    response.into_inner().certificates,
-                ))
-                .await
-            }
-            Err(status) => warn!(
-                code = ?status.code(),
-                message = status.message(),
-                "Failed to fetch ingress certificates; keeping the current ones"
-            ),
-        }
+    let refs = netd.wants().material;
+    if refs.is_empty() {
+        return;
     }
-    if !wants.upstream_credentials.is_empty() {
-        let request = credentials.attach(tonic::Request::new(
-            crate::structs::GetUpstreamCredentialsRequest {
-                node_id: node_id.to_string(),
-                known: wants.upstream_credentials,
-            },
-        ));
-        match client.get_upstream_credentials(request).await {
-            Ok(response) => {
-                netd.send(NetdInput::UpstreamCredentials(
-                    response.into_inner().credentials,
-                ))
+    let request = credentials.attach(tonic::Request::new(
+        crate::structs::FetchDatapathMaterialRequest {
+            node_id: node_id.to_string(),
+            refs,
+        },
+    ));
+    match client.fetch_datapath_material(request).await {
+        Ok(response) => {
+            netd.send(NetdInput::Material(response.into_inner().materials))
                 .await
-            }
-            Err(status) => warn!(
-                code = ?status.code(),
-                message = status.message(),
-                "Failed to fetch upstream credentials; keeping the current ones"
-            ),
         }
+        Err(status) => warn!(
+            code = ?status.code(),
+            message = status.message(),
+            "Failed to fetch datapath material; keeping what the datapath holds"
+        ),
     }
 }
 

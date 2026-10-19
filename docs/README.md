@@ -120,6 +120,10 @@ Plans, roadmaps, to-do lists, and development notes live in
   sandboxes), ingress chains, `authz`/`proxy` handlers, mTLS with the mesh
   CA, certificates served from KV, the service graph, drain-before-stop, and
   `legion net`.
+- [Network Plugins](network-plugins.md): WASM modules on the proxy-wasm ABI
+  that run inside the node datapath as handlers. Covers plugin objects,
+  stages, properties, limits and failure, signing without the key, declared
+  HTTP calls, and `legion net plugin`.
 - [KV Store](kv-store.md): CRUD, versioning, locks, reactive task updates, and
   live file updates (`onChange = "update"`).
 - [Serving TLS Certificates from KV](guides/tls-certificates.md): a guide to

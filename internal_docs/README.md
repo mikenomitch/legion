@@ -132,7 +132,8 @@ When one is required and what goes in it:
 | [service-mesh-plan.md](plans/service-mesh-plan.md) | **authoritative for the mesh**; shipped M1–M10 (policy, HTTP mode, name-is-config, gated, ingress, handlers, mTLS, graph, sandbox vsock, templates) with two named deferrals — unifies the SD §8 follow-on with the handlers plan |
 | [network-handlers-plan.md](plans/network-handlers-plan.md) | shipped as phases of service-mesh-plan (policy objects, `gated` mode, handlers); the `legion netd` process split is the deferred piece |
 | [datapath-performance-plan.md](plans/datapath-performance-plan.md) | shipped: HTTP-mode pooling, `splice(2)` for bulk L4 on Linux, `least_latency` as the default strategy, the per-byte `legion_net_bytes_total` fix, `net_bench`; kTLS and multiplexed mesh tunnels deferred |
-| [egress-plugins-proposal.md](plans/egress-plugins-proposal.md) | proposal (nothing built): a kernel classifier that compiles policy to eBPF maps so allowed L4 flows skip the proxy and host-mode policy is enforced (A), in-process WASM plugins on the proxy-wasm ABI (B, the handlers plan's phase 8 reshaped), operator eBPF programs (C, last), fd hand-off for external handlers (D), and keyed handler variants plus plugin objects (E); recommends A + B + E |
+| [macos-gated-plan.md](plans/macos-gated-plan.md) | in execution: phases 1–3 (placement, the confined datapath, Seatbelt for `exec`, `pf` for Apple `container` VMs) implemented and unit-tested; phase 4, running it on macOS hardware, is open, so `auto` stays `host` on macOS |
+| [mesh-interfaces-plan.md](plans/mesh-interfaces-plan.md) | shipped. Phase 0 fixed chain `dlp`/`log` and chain `onError`. Surface: one typed handler pipeline (S1), one upstream `to` whose scheme is its protocol (S2), `service.mesh` and TLS on ports (S3), one caller list (S4), one material source grammar and `FetchDatapathMaterial` (S5), and the removed knobs (S6). Datapath: the eBPF kernel classifier (A0–A3; host-mode egress enforced at `connect()`, transparent capture) and WASM plugins on proxy-wasm (B1–B3; `legion net plugin`). Deferred: `oci://` modules, streamed request bodies, plugin UI, see TODO |
 | [nickel-config-language-plan.md](plans/nickel-config-language-plan.md) | shipped (2026-08-03; jsonnet removed, no compat shim) |
 | [scheduler-performance-plan.md](plans/scheduler-performance-plan.md) | in execution |
 | [scheduler-architecture-review-plan.md](plans/scheduler-architecture-review-plan.md) | proposals accepted; D1/D4/D5/D6 graduated into the two plans below, D8's local slice into the heartbeat plan |
@@ -218,7 +219,6 @@ by project impact. The full template and a worked example:
 - [edge-boot-plan_calls.md](calls/edge-boot-plan_calls.md)
 - [edge-ratify-throughput-plan_calls.md](calls/edge-ratify-throughput-plan_calls.md)
 - [egress-credential-injection-plan_calls.md](calls/egress-credential-injection-plan_calls.md)
-- [egress-plugins-proposal_calls.md](calls/egress-plugins-proposal_calls.md)
 - [elastic-session-envelopes-plan_calls.md](calls/elastic-session-envelopes-plan_calls.md)
 - [exec-and-actions-plan_calls.md](calls/exec-and-actions-plan_calls.md)
 - [gated-restore-datapath-wait_calls.md](calls/gated-restore-datapath-wait_calls.md): the 5 s datapath wait on every sandbox restore (no plan, a fix to the gated checkpoints plan's wait)
@@ -262,6 +262,8 @@ by project impact. The full template and a worked example:
 - [managers-page-raft-members_calls.md](calls/managers-page-raft-members_calls.md)
 - [manager-reverse-proxy-plan_calls.md](calls/manager-reverse-proxy-plan_calls.md)
 - [manager-workload-identity-plan_calls.md](calls/manager-workload-identity-plan_calls.md)
+- [macos-gated-plan_calls.md](calls/macos-gated-plan_calls.md)
+- [mesh-interfaces-plan_calls.md](calls/mesh-interfaces-plan_calls.md)
 - [multi-cluster-federation-plan_calls.md](calls/multi-cluster-federation-plan_calls.md)
 - [multi-raft-persistence-plan_calls.md](calls/multi-raft-persistence-plan_calls.md)
 - [multi-eval-plans-plan_calls.md](calls/multi-eval-plans-plan_calls.md)

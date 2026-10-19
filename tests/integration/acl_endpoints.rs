@@ -42,6 +42,8 @@ const FIXTURE_POLICY: &str = "fixture-policy";
 const DELETABLE_POLICY: &str = "deletable-policy";
 const FIXTURE_NET_POLICY: &str = "fixture-net-policy";
 const DELETABLE_NET_POLICY: &str = "deletable-net-policy";
+const FIXTURE_NET_PLUGIN: &str = "fixture-net-plugin";
+const DELETABLE_NET_PLUGIN: &str = "deletable-net-plugin";
 const DELETABLE_USER: &str = "deletable-user";
 const FIXTURE_NAMESPACE: &str = "acl-ns";
 const DELETABLE_NAMESPACE: &str = "deletable-ns";
@@ -119,11 +121,16 @@ fn endpoint_table() -> Vec<(&'static str, Plane)> {
         ("GetNetPolicyObject", Plane::Protected("net:read")),
         ("ListNetPolicies", Plane::Protected("net:read")),
         ("DeleteNetPolicy", Plane::Protected("net:write")),
+        ("UpsertNetPlugin", Plane::Protected("net:write")),
+        ("GetNetPlugin", Plane::Protected("net:read")),
+        ("ListNetPlugins", Plane::Protected("net:read")),
+        ("DeleteNetPlugin", Plane::Protected("net:write")),
+        ("GetNetPluginStatus", Plane::Protected("net:read")),
         ("ShowNetPolicy", Plane::Protected("net:read")),
         ("TestNetPolicy", Plane::Protected("net:read")),
         ("GetMeshCa", Plane::Protected("net:read")),
         ("RotateMeshCa", Plane::Protected("net:write")),
-        ("FetchNetPolicy", Plane::Worker),
+        ("FetchDatapathMaterial", Plane::Worker),
         ("GetNodes", Plane::Protected("node:read")),
         ("GetHeartbeatCadence", Plane::Protected("node:read")),
         ("GetNodeUsage", Plane::Protected("node:read")),
@@ -216,8 +223,6 @@ fn endpoint_table() -> Vec<(&'static str, Plane)> {
         ("DeleteExecKey", Plane::Protected("acl:write")),
         ("ListJobActions", Plane::Protected("job:read")),
         ("GetArtifactCredential", Plane::Worker),
-        ("GetIngressCertificates", Plane::Worker),
-        ("GetUpstreamCredentials", Plane::Worker),
         ("ListEvents", Plane::Protected("operator:read")),
         ("StreamEvents", Plane::Protected("operator:read")),
         ("WhoAmI", Plane::Open),
@@ -687,6 +692,51 @@ async fn call_endpoint(
             ))
             .await
             .map(|_| ()),
+        "UpsertNetPlugin" => svc
+            .upsert_net_plugin(req(
+                UpsertNetPluginRequest {
+                    object_json: format!(
+                        r#"{{"name":"acl-net-plugin","module":{{"source":"https://example.com/p.wasm","checksum":"sha256:{}"}},"stages":["request"]}}"#,
+                        "a".repeat(64)
+                    ),
+                    dry_run: false,
+                    idempotency_key: None,
+                },
+                token,
+            ))
+            .await
+            .map(|_| ()),
+        "GetNetPlugin" => svc
+            .get_net_plugin(req(
+                GetNetPluginRequest {
+                    name: FIXTURE_NET_PLUGIN.into(),
+                },
+                token,
+            ))
+            .await
+            .map(|_| ()),
+        "ListNetPlugins" => svc
+            .list_net_plugins(req(ListNetPluginsRequest::default(), token))
+            .await
+            .map(|_| ()),
+        "DeleteNetPlugin" => svc
+            .delete_net_plugin(req(
+                DeleteNetPluginRequest {
+                    name: DELETABLE_NET_PLUGIN.into(),
+                },
+                token,
+            ))
+            .await
+            .map(|_| ()),
+        "GetNetPluginStatus" => svc
+            .get_net_plugin_status(req(
+                GetNetPluginStatusRequest {
+                    name: FIXTURE_NET_PLUGIN.into(),
+                },
+                token,
+            ))
+            .await
+            .map(|_| ()),
         "ShowNetPolicy" => svc
             .show_net_policy(req(
                 ShowNetPolicyRequest {
@@ -717,11 +767,15 @@ async fn call_endpoint(
             .rotate_mesh_ca(req(RotateMeshCaRequest {}, token))
             .await
             .map(|_| ()),
-        "FetchNetPolicy" => svc
-            .fetch_net_policy(req(
-                FetchNetPolicyRequest {
+        "FetchDatapathMaterial" => svc
+            .fetch_datapath_material(req(
+                FetchDatapathMaterialRequest {
                     node_id: NODE_ID.into(),
-                    hash: "0000".into(),
+                    refs: vec![MaterialRef {
+                        kind: "policy".into(),
+                        key: "0000".into(),
+                        ..Default::default()
+                    }],
                 },
                 token,
             ))
@@ -1320,26 +1374,6 @@ async fn call_endpoint(
             ))
             .await
             .map(|_| ()),
-        "GetIngressCertificates" => svc
-            .get_ingress_certificates(req(
-                GetIngressCertificatesRequest {
-                    node_id: NODE_ID.into(),
-                    known: Vec::new(),
-                },
-                token,
-            ))
-            .await
-            .map(|_| ()),
-        "GetUpstreamCredentials" => svc
-            .get_upstream_credentials(req(
-                GetUpstreamCredentialsRequest {
-                    node_id: NODE_ID.into(),
-                    known: Vec::new(),
-                },
-                token,
-            ))
-            .await
-            .map(|_| ()),
         "ListEvents" => svc
             .list_events(req(ListEventsRequest::default(), token))
             .await
@@ -1578,6 +1612,20 @@ fn seed_fixtures(store: &Store) -> R<Fixtures> {
                 "egress": { "allow": ["*.example.com"] },
             }))?;
         store.upsert_net_policy(object)?;
+    }
+    // Network plugin fixtures (docs/network-plugins.md): one to read, one to
+    // delete.
+    for name in [FIXTURE_NET_PLUGIN, DELETABLE_NET_PLUGIN] {
+        let object: legion::structs::netplugin::NetPluginObject =
+            serde_json::from_value(serde_json::json!({
+                "name": name,
+                "module": {
+                    "source": "https://example.com/p.wasm",
+                    "checksum": format!("sha256:{}", "b".repeat(64)),
+                },
+                "stages": ["request"],
+            }))?;
+        store.upsert_net_plugin(object)?;
     }
 
     for name in [FIXTURE_NAMESPACE, DELETABLE_NAMESPACE] {
@@ -2174,10 +2222,8 @@ async fn worker_plane_binds_node_ids_to_the_caller() -> R<()> {
         "WorkerRegister",
         "Heartbeat",
         "HealthCheck",
-        "FetchNetPolicy",
+        "FetchDatapathMaterial",
         "GetArtifactCredential",
-        "GetIngressCertificates",
-        "GetUpstreamCredentials",
         "RatifyClaim",
     ] {
         let status = call_endpoint(&svc, &fixtures, method, Some(&intruder))
@@ -2838,9 +2884,10 @@ async fn kv_path_scoped_policy_limits_kv_access() -> R<()> {
     Ok(())
 }
 
-/// `certFrom = { kv }` hands a KV value to the datapath, so naming one in a
-/// job needs `kv:read` on that path: job-write access alone must not be a way
-/// to read private keys.
+/// A port's `tls.cert = { kv }` (and `tls.clients.ca`, and an upstream's
+/// `ca`) hands a KV value to the datapath, so naming one in a job needs
+/// `kv:read` on that path: job-write access alone must not be a way to read
+/// private keys.
 #[tokio::test]
 async fn kv_backed_ingress_cert_needs_kv_read_on_the_path() -> R<()> {
     let (svc, _fixtures, _) = setup_enabled()?;
@@ -2875,8 +2922,7 @@ async fn kv_backed_ingress_cert_needs_kv_read_on_the_path() -> R<()> {
                 "runtime": "container",
                 "config": { "image": "alpine", "command": ["sleep", "30"] },
                 "network": {
-                    "ports": [{ "name": "https", "static": 8443 }],
-                    "ingress": { "tls": { "mode": "server", "certFrom": { "kv": "certs/edge" } } },
+                    "ports": [{ "name": "https", "static": 8443, "tls": { "cert": { "kv": "certs/edge" } } }],
                 },
             },
         });
@@ -2902,7 +2948,9 @@ async fn kv_backed_ingress_cert_needs_kv_read_on_the_path() -> R<()> {
         .expect_err("job:write alone must not name a KV certificate");
     assert_eq!(status.code(), Code::PermissionDenied);
     assert!(
-        status.message().contains("certs/edge"),
+        status
+            .message()
+            .contains("network.ports[https].tls.cert names kv certs/edge"),
         "{}",
         status.message()
     );

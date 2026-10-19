@@ -1217,16 +1217,30 @@ impl TaskPlugin for ContainerTaskPlugin {
                     %image,
                     "Starting container task"
                 );
-                let mut cmd = Command::new(APPLE_CONTAINER_BIN);
-                cmd.args(build_apple_launch(
+                // A gated VM on macOS runs on the gated network, where pf
+                // keeps it on its own datapath ports
+                // (internal_docs/plans/macos-gated-plan.md §6.5).
+                let mut vm_env = merged_env.clone();
+                let gated_network =
+                    crate::task_plugins::confine::prepare_vm(allocation, vm_env.iter_mut())?;
+                let mut args = build_apple_launch(
                     allocation,
                     task,
                     &config,
-                    &merged_env,
+                    &vm_env,
                     &instance.volumes,
                     instance.task_dir.as_deref(),
                     &image,
-                ));
+                );
+                if let Some(network) = gated_network {
+                    args.splice(2..2, network);
+                    crate::task_plugins::confine::admit_when_ready(
+                        allocation.id,
+                        container_name(&oci_runtime, allocation),
+                    );
+                }
+                let mut cmd = Command::new(APPLE_CONTAINER_BIN);
+                cmd.args(args);
                 cmd
             }
             ContainerRuntime::Oci { binary } => {
@@ -1325,12 +1339,14 @@ impl TaskPlugin for ContainerTaskPlugin {
         if let Some((uid, gid)) = log_owner {
             oci_bundle::hand_task_logs_to(instance.log_dir.as_deref(), uid, gid);
         }
-        let child = spawn_task_process(&mut cmd).with_context(|| {
-            format!(
-                "Failed to spawn container task {} for allocation {}",
-                task.name, allocation.id
-            )
-        })?;
+        let child = spawn_task_process(&mut cmd)
+            .inspect_err(|_| crate::task_plugins::confine::release_vm(allocation))
+            .with_context(|| {
+                format!(
+                    "Failed to spawn container task {} for allocation {}",
+                    task.name, allocation.id
+                )
+            })?;
         instance.pid = Some(child.id());
         instance.child = Some(child);
         Ok(())
@@ -1468,6 +1484,7 @@ impl TaskPlugin for ContainerTaskPlugin {
         }
 
         reap_task_process(allocation.id, &task.name, instance, "container");
+        crate::task_plugins::confine::release_vm(allocation);
         Ok(())
     }
 
@@ -1799,18 +1816,22 @@ mod tests {
                     host_port: 21000,
                     to: Some(8080),
                     private_port: None,
+                    mesh: false,
+                    tls: None,
                 },
                 crate::structs::network::AllocPort {
                     name: "metrics".into(),
                     host_port: 21001,
                     to: None,
                     private_port: None,
+                    mesh: false,
+                    tls: None,
                 },
             ],
             vip_block: None,
             resolver: None,
             mode: None,
-            ingress_tls: None,
+            egress_proxy: None,
         });
         let args = build_apple_launch(
             &allocation,

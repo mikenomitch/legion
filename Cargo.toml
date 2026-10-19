@@ -123,11 +123,18 @@ sha2 = "0.10.8"
 # for wrapping data keys, HKDF for the raft-join root key bundle. `ring` is
 # already in the tree via jsonwebtoken/rustls/rcgen — no new crate.
 ring = "0.17"
+# Network plugins (docs/network-plugins.md): an interpreter keeps the
+# shipping binary small; fuel bounds every callback.
+wasmi = { version = "=2.0.0", default-features = false, features = ["std", "stable", "validate", "auto-dispatch", "wat"] }
+# Only to name `LimiterError` in the plugin memory cap; wasmi does not
+# re-export it.
+wasmi_core = { version = "=2.0.0", default-features = false, features = ["std"] }
 # Key material is wiped from memory when dropped.
 zeroize = "1"
 tabled = "0.16.0"
 lazy_static = "1.4.0"
 anyhow = "1.0.100"
+async-trait = "0.1"
 regex = "1.11.1"
 semver = "1.0.25"
 chrono = { version = "0.4.42", default-features = false, features = ["clock"] }
@@ -164,6 +171,10 @@ crossterm = "0.28"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 landlock = "0.4.1"
+# The kernel classifier's loader (src/worker/netd/kernel): pure Rust over
+# the bpf syscall, no libbpf. The programs themselves are a checked-in
+# object (bpf/legion_net.bpf.o).
+aya = "0.14.0"
 
 [dev-dependencies]
 criterion = "0.5.1"

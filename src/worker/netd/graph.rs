@@ -86,6 +86,18 @@ impl EdgeLedger {
         });
     }
 
+    /// `count` L4 dials at once (the kernel classifier's counters, read once
+    /// per heartbeat).
+    pub fn record_connections(&self, allocation_id: i64, service: &str, ok: bool, count: u64) {
+        self.with(allocation_id, service, None, "tcp", |c| {
+            if ok {
+                c.requests += count;
+            } else {
+                c.errors += count;
+            }
+        });
+    }
+
     /// Bytes an L4 flow moved (`out` toward the service, `in` back).
     pub fn record_bytes(
         &self,

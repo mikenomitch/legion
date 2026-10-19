@@ -412,7 +412,8 @@ start:
   [Running Redis](docs/guides/redis.md) ·
   [Serving TLS Certificates from KV](docs/guides/tls-certificates.md)
 - **Platform services:** [Service Discovery](docs/service-discovery.md) ·
-  [Network Handlers](docs/network-handlers.md) · [KV Store](docs/kv-store.md) ·
+  [Network Handlers](docs/network-handlers.md) ·
+  [Network Plugins](docs/network-plugins.md) · [KV Store](docs/kv-store.md) ·
   [Exec & Actions](docs/exec-and-actions.md) · [The Cluster CA](docs/cluster-ca.md)
 - **Sharing a cluster:** [Namespaces](docs/namespaces.md) ·
   [Auth & ACLs](docs/auth-and-acls.md) ·

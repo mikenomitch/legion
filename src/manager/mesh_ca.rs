@@ -1,5 +1,5 @@
 //! The cluster CA: the certificates behind the worker plane, the
-//! worker-to-manager channel, and the mesh's `certFrom = "legion"`
+//! worker-to-manager channel, and the mesh (`service.mesh = true`)
 //! (docs/auth-and-acls.md, "The worker plane"; docs/network-handlers.md,
 //! "mTLS").
 //!

@@ -1078,6 +1078,67 @@ pub fn catalog() -> Vec<Capability> {
             read_only_safe: false,
         },
         Capability {
+            name: "net.plugin.new",
+            cli: "legion net plugin new <NAME> [--dir <DIR>]",
+            grpc: None,
+            summary: "Scaffold a WASM network plugin crate (proxy-wasm Rust SDK) and its object \
+                 file. Local only.",
+            mutates: false,
+            read_only_safe: true,
+        },
+        Capability {
+            name: "net.plugin.test",
+            cli: "legion net plugin test <MODULE|NAME> --request '<METHOD> <URL>' [--label k=v] \
+                 [--config <JSON>]",
+            grpc: None,
+            summary: "Run a .wasm module or a stored plugin against one synthetic request, \
+                 locally: per stage what it did, what it changed, its time and fuel.",
+            mutates: false,
+            read_only_safe: true,
+        },
+        Capability {
+            name: "net.plugin.apply",
+            cli: "legion net plugin apply -f <FILE> [--dry-run] [--idempotency-key <KEY>]",
+            grpc: Some("Manager/UpsertNetPlugin"),
+            summary: "Create or replace a network plugin object; --dry-run validates it and \
+                 every policy that uses it without writing.",
+            mutates: true,
+            read_only_safe: false,
+        },
+        Capability {
+            name: "net.plugin.list",
+            cli: "legion net plugin list",
+            grpc: Some("Manager/ListNetPlugins"),
+            summary: "List stored network plugin objects.",
+            mutates: false,
+            read_only_safe: true,
+        },
+        Capability {
+            name: "net.plugin.describe",
+            cli: "legion net plugin describe <NAME>",
+            grpc: Some("Manager/GetNetPlugin"),
+            summary: "Fetch one stored plugin object and the policies that use it.",
+            mutates: false,
+            read_only_safe: true,
+        },
+        Capability {
+            name: "net.plugin.status",
+            cli: "legion net plugin status <NAME>",
+            grpc: Some("Manager/GetNetPluginStatus"),
+            summary: "Per node: the revision held, module state, calls, errors, last error, \
+                 and p99 callback time.",
+            mutates: false,
+            read_only_safe: true,
+        },
+        Capability {
+            name: "net.plugin.delete",
+            cli: "legion net plugin delete <NAME>",
+            grpc: Some("Manager/DeleteNetPlugin"),
+            summary: "Delete a stored plugin object (refused while a policy uses it).",
+            mutates: true,
+            read_only_safe: false,
+        },
+        Capability {
             name: "net.policy.show",
             cli: "legion net policy show <JOB> [--task <TASK>] [--pool <POOL>]",
             grpc: Some("Manager/ShowNetPolicy"),

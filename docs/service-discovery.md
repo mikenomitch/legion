@@ -34,7 +34,7 @@ legion service doctor redis     # layer-by-layer diagnosis when something's off
 To use it from another task, add one block and read one env var:
 
 ```nickel
-connect = { upstreams = [{ service = "redis" }] },   # -> $LEGION_UPSTREAM_REDIS
+connect = { upstreams = [{ to = "redis" }] },   # -> $LEGION_UPSTREAM_REDIS
 ```
 
 See [Connecting to services](#connecting-to-services-the-connect-block).
@@ -68,7 +68,8 @@ service = {
     # port = "dynamic",   # ...or "dynamic" -> declares a dynamic port inline
     tags = ["v1"],
     meta = { protocol = "http" },
-    # allow = ["gateway"],   # optional connect intentions; see below
+    # mesh = true,           # node-to-node mTLS on the port; see below
+    # allow = ["gateway"],   # who may call it; see below
 },
 ```
 
@@ -94,9 +95,8 @@ checks = [
 ## Environment variables
 
 > On Linux an allocation with upstreams also gets `LEGION_DNS` (its own
-> resolver) and, per upstream, `LEGION_UPSTREAM_HOST_<KEY>` /
-> `LEGION_UPSTREAM_VIP_<KEY>`, so `<key>.svc.legion:<port>` works in a URL or
-> config file with no env plumbing. See
+> resolver), so `<key>.svc.legion:<port>` works in a URL or config file with
+> no env plumbing. See
 > [Network Handlers: Name-is-config](network-handlers.md#name-is-config-keysvclegion).
 
 Every task gets its identity and assigned ports injected into its environment.
@@ -113,8 +113,9 @@ If you declare the same variable yourself, your value wins:
 | `LEGION_PORT_TO_<LABEL>` | Declared in-task target port (when `to` is set). |
 | `LEGION_IP_<LABEL>` | Node address serving the port (when known). |
 | `LEGION_ADDR_<LABEL>` | `ip:port` convenience form. |
-| `LEGION_UPSTREAM_<SERVICE>` | `127.0.0.1:<port>` to dial a declared upstream ([below](#connecting-to-services-the-connect-block)). |
-| `LEGION_UPSTREAM_PORT_<SERVICE>` | Just the local port of that upstream. |
+| `LEGION_UPSTREAM_<KEY>` | The one `host:port` to dial for a declared upstream ([below](#connecting-to-services-the-connect-block)). |
+| `LEGION_UPSTREAM_HOST_<KEY>` | Its host part. |
+| `LEGION_UPSTREAM_PORT_<KEY>` | Its port part. |
 
 Labels are uppercased, with non-alphanumeric characters mapped to `_` (`http-2`
 becomes `HTTP_2`). Upstream keys follow the same rule (`user-db` becomes
@@ -130,16 +131,15 @@ cluster.
 
 > **External destinations, HTTP mode, and policy.** An upstream can also be
 > an external destination (`{ name = "openai", to = "https://api.openai.com" }`),
-> carry an `http` block (timeouts, budgeted retries, canary split by tag,
-> outlier ejection), and be governed by egress policy. All of this runs on the
-> same loopback forwarder and is documented in
-> [Network Handlers](network-handlers.md).
+> speak HTTP with an `http` block (timeouts, budgeted retries, canary split by
+> tag), and be governed by egress policy. All of this runs on the same node
+> forwarder and is documented in [Network Handlers](network-handlers.md).
 
 
 Discovery tells you where a service is. `connect` gets your task there. The
-task gets one fixed local address per upstream, and the worker load-balances
-every connection to that address across the service's healthy endpoints. You
-don't need a client library, a sidecar, DNS, or service-specific code.
+task gets one fixed address per upstream, and the worker load-balances every
+connection to that address across the service's healthy endpoints. You don't
+need a client library, a sidecar, DNS, or service-specific code.
 
 ```nickel
 {
@@ -148,42 +148,76 @@ don't need a client library, a sidecar, DNS, or service-specific code.
     config = { command = ["sh", "-c", "exec ./api"] },
     connect = {
         upstreams = [
-            { service = "db" },                             # dynamic local port
-            { service = "cache", localPort = 6379 },         # pinned local port
-            { service = "search", balance = "least_conn" },  # strategy override
+            { to = "db" },                              # a catalog service, L4
+            { to = "http://search", balance = "least_conn" },  # parsed as HTTP; strategy override
+            { to = "cache", port = 6379 },              # pinned port, also on 127.0.0.1:6379
         ],
     },
 }
 ```
 
-The task dials `$LEGION_UPSTREAM_DB` (say, `127.0.0.1:20003`), and the worker
-forwards that connection to one of `db`'s healthy endpoints:
+`to` names the upstream, and its scheme alone decides the protocol:
+
+| `to` | Destination | Protocol | Key |
+| --- | --- | --- | --- |
+| `db`, `tcp://db`, `db.svc.legion` | catalog service `db` | L4 | `name`, default `db` |
+| `http://search` | catalog service `search` | HTTP | `name`, default `search` |
+| `tcp://10.0.0.5:5432`, `tls://ledger.example:7000`, `http://intranet.example`, `https://api.openai.com` | an external destination | by scheme | `name`, required |
+
+A host that is a bare service name (letters, digits, `-`, `_`, with no dot and
+no port) or ends in `.svc.legion` is a catalog service. Anything else is an
+external destination and needs a scheme. A dotless external host is written
+with its port (`http://wiki:80`). Catalog services take `tcp` (the default)
+or `http`; they are reached over the mesh when they are on it, so `tls://` and
+`https://` name external destinations only.
+
+The task dials `$LEGION_UPSTREAM_DB`, and the worker forwards that connection
+to one of `db`'s healthy endpoints:
 
 ```sh
-psql "host=127.0.0.1 port=$LEGION_UPSTREAM_PORT_DB"
+psql "host=$LEGION_UPSTREAM_HOST_DB port=$LEGION_UPSTREAM_PORT_DB"
 curl "http://$LEGION_UPSTREAM_SEARCH/_search"
 ```
 
-Only `service` is required. `localPort` pins the loopback port for clients that
-can't read environment variables, such as a config file that wants a literal
-`127.0.0.1:6379`. Without it, the port is assigned at placement from the same
-per-node dynamic range (20000-32000) and used-port set as task ports. An
-upstream port can never collide with a host port on that node. `balance`
-overrides the strategy for that one upstream.
+**One address per upstream.** `LEGION_UPSTREAM_<KEY>` is what the task dials,
+and `LEGION_UPSTREAM_HOST_<KEY>` and `LEGION_UPSTREAM_PORT_<KEY>` are its parts.
+`{{ service "<key>" }}` in a [template](#templates-config-files-from-the-feed)
+renders the same address.
 
-Upstream ports are per allocation, like host ports. A `count = 3` client task
-gets three independent listeners on three distinct ports.
+| Node | `LEGION_UPSTREAM_DB` |
+| --- | --- |
+| Linux | `127.42.7.2:5432`: the upstream's VIP on its canonical port ([Name-is-config](network-handlers.md#name-is-config-keysvclegion)) |
+| macOS, or a node with no VIP block left | `127.0.0.1:20003`: a loopback port from the dynamic range |
+
+On Linux an upstream takes no port from the node's range: its VIP is unique to
+the allocation. `port` pins the canonical port and also binds
+`127.0.0.1:<port>`, for a client config that wants a literal loopback address
+such as `127.0.0.1:6379`. A sandbox's upstreams also get a loopback port,
+because the guest's relay is keyed by it. A loopback port never collides with
+a host port on that node. `balance` overrides the strategy for that one
+upstream.
+
+Upstream addresses are per allocation, like host ports. A `count = 3` client
+task gets three independent listeners.
+
+An `http` block (timeouts, budgeted retries, a split by tag) needs an upstream
+that speaks HTTP, and the scheme is what says so:
+
+```
+task api connect.upstreams entry 'db' to = "db" is reached over L4, but it has
+an http block. Hint: write to = "http://db" if it speaks HTTP
+```
 
 ### Namespaces
 
 A service lives in its job's [namespace](namespaces.md), and an upstream
-resolves in the consumer's own namespace: `{ service = "db" }` is the `db` of
+resolves in the consumer's own namespace: `{ to = "db" }` is the `db` of
 the namespace the task runs in, never another tenant's. Reaching into another
 namespace is written on both sides:
 
 ```nickel
-# the consumer names where it is reaching (or writes service = "shared/auth")
-connect = { upstreams = [{ service = "auth", namespace = "shared" }] },
+# the consumer names where it is reaching
+connect = { upstreams = [{ to = "auth", namespace = "shared" }] },
 
 # the target, in shared, admits the consumer by qualified id or glob
 service = { name = "auth", port = 8443, allow = ["checkout-prod/api", "payments-*/api"] },
@@ -200,9 +234,8 @@ service reference on the CLI and API is canonical like a job id
 | `balance` | Behavior |
 | --- | --- |
 | `least_latency` *(default)* | Latency-aware. Each pick compares two random endpoints and takes the one with the lower latency × (in-flight + 1). A slow-but-alive backend sheds traffic within a few requests, and gets it back once it recovers. |
-| `round_robin` | Hand out endpoints in order, wrapping around. Even spread, no state to warm up. |
-| `random` | Uniform random pick. Best when many clients share one backend set, since there are no cursors to fall into sync. |
-| `least_conn` | Fewest in-flight connections wins, and ties break round-robin. For long-lived or uneven connections. |
+| `round_robin` | Hand out endpoints in order, wrapping around. Even spread, no state to warm up. Each listener starts at a random point in the list, so many clients started together do not all send their first connection to the same endpoint. |
+| `least_conn` | Fewest in-flight connections wins, and ties break round-robin from a random start. Keeps connection counts even whatever the distance, which is what long-lived connections (database pools, gRPC channels, websockets) need: `least_latency` deliberately favors nearby endpoints, so it would pile them onto whichever replica answered first. |
 | `local_first` | Round-robin over the endpoints on the same node as the caller. Widens to every endpoint when none is local, so a caller never waits for a local backend that is not there. |
 
 Names are normalized before lookup (trimmed, lowercased, `-` mapped to `_`),
@@ -269,10 +302,11 @@ needs no proto change and no migration.
 
 ### How it works
 
-1. **Placement.** The manager assigns each upstream a loopback port and stores
-   it on the allocation next to its host ports.
+1. **Placement.** The manager assigns each upstream its address and stores it
+   on the allocation next to its host ports: a VIP and canonical port on
+   Linux, a loopback port elsewhere (and for a pinned `port`).
 2. **Listeners.** The worker runs one TCP listener per
-   `(allocation, upstream service)` bound on `127.0.0.1:<local port>`.
+   `(allocation, upstream)` on that address.
 3. **Endpoint feed.** On every heartbeat (the worker type's
    `heartbeatSeconds`, 2s by default), the manager sends the current endpoint set for each upstream this
    node's allocations declare. The set holds healthy endpoints only, already
@@ -307,57 +341,82 @@ forwarded drain on their own. Per-connection logging stays at `debug`.
 
 ### Intentions: `service.allow`
 
-A service can name the jobs allowed to reach it through connect:
+A service names who may call it, in one list:
 
 ```nickel
 service = {
     port = "http",
-    allow = ["gateway", "api"],   # job globs; absent or ["*"] = every job in this namespace
+    mesh = true,
+    allow = ["gateway", "api", "payments-*/api"],   # job globs; absent or ["*"] = every job in this namespace
 },
 ```
 
-- Entries are job globs matched against the consuming allocation's job. A bare
-  entry (`"gateway"`, `"web-*"`) matches jobs in the service's **own**
-  namespace; `"checkout-prod/api"` or `"payments-*/api"` admits jobs in other
-  namespaces, and `"*/*"` admits every job everywhere.
-- Absent or `["*"]` means every job in the service's own namespace may
-  connect. This is the default; a consumer in another namespace needs an
-  entry that names its namespace.
-- Enforcement happens in the endpoint feed. A denied consumer's forwarder gets
-  an empty list, so its connections are accepted and closed. There is no error
-  code and no partial list. When a client sees only immediate closes, run
-  `legion service doctor <svc>`. It prints the service's `allow` list, so you
-  can tell "no healthy endpoints" apart from "your job is not on the list". The
-  list comes back on `ListServices` (`ServiceSummary.allow`), so `doctor` needs
-  only `job:read`, the same scope as the rest of the report.
-- Intentions don't affect the catalog. `legion service list|resolve` and the
-  `ListServices`/`ResolveService` RPCs still show the service to anyone whose
-  ACLs permit the read. Intentions gate the connect datapath, not who can see
-  the service.
+- **Entries are job globs** matched against the consuming allocation's job.
+  A bare entry (`"gateway"`, `"web-*"`) matches jobs in the service's
+  **own** namespace; `"checkout-prod/api"` or `"payments-*/api"` admits jobs
+  in other namespaces, and `"*/*"` admits every job everywhere. An entry
+  with colons is refused at submit: `allow` names jobs, and a caller's task
+  is matched with an ingress `identity` rule instead.
+- **Absent or `["*"]` means every job in the service's own namespace.** This
+  is the default; a consumer in another namespace needs an entry that names
+  its namespace.
+- **Always enforced in the endpoint feed.** A denied consumer's forwarder
+  gets an empty list, so its connections are accepted and closed. There is
+  no error code and no partial list. The list comes back on `ListServices`
+  (`ServiceSummary.allow`), so `legion service doctor <svc>` can tell "no
+  healthy endpoints" apart from "your job is not on the list" with only
+  `job:read`.
+- **Enforced on the wire with the mesh.** On a `mesh = true` service the
+  list also compiles into the service's ingress chain as its first check,
+  with the source `service/allow`. The receiving node takes the job from the
+  verified caller's identity and applies the same rules; a caller outside
+  the list is refused, and a `net.denied` event names it
+  ([The mesh](network-handlers.md#the-mesh)). `legion net policy show`
+  prints the check.
+- **Intentions don't affect the catalog.** `legion service list|resolve` and
+  the `ListServices`/`ResolveService` RPCs still show the service to anyone
+  whose ACLs permit the read.
+- **Without the mesh there is no verified caller** at the receiving node, so
+  the endpoint feed is the only enforcement. It governs what Legion's own
+  connect path hands out; it does not stop a task that already knows a
+  backend's `address:port` from dialing it directly. `legion service doctor`
+  says which applies:
 
-**Scope.** Intentions are enforced by the control plane and the forwarder.
-They don't use cryptographic identity. They govern what Legion's own connect
-path hands out. They don't stop a task that already knows a backend's
-`address:port` from dialing it directly, and nothing on that wire is
-authenticated or encrypted by default. Intentions do not use mTLS identity.
-For cryptographic identity, turn on mesh mTLS on the service's ingress chain
-and restrict callers with `requireIdentity`. See
-[network-handlers.md](network-handlers.md#mtls).
+  ```
+  allow: web, agent-*   enforced by the endpoint feed only (api is not on the mesh)
+    Hint: set service.mesh = true to enforce it on the wire
+  ```
+
+  It also prints the list itself, so you can tell "no healthy endpoints"
+  apart from "your job is not on the list". The list comes back on
+  `ListServices` (`ServiceSummary.allow`), so `doctor` needs only
+  `job:read`, the same scope as the rest of the report.
+- **`allow` doesn't affect the catalog.** `legion service list|resolve` and
+  the `ListServices`/`ResolveService` RPCs still show the service to anyone
+  whose ACLs permit the read.
+- For identity combined with a path or method, use an ingress rule
+  (`when = { identity = "*:web:*:*", path = "/admin/**" }`).
+  `legion net policy test api --from web --identity …` answers for the whole
+  set.
 
 ### Validation
 
 These are checked at submit, and by `legion job validate <spec>` before you submit:
 
-- Upstream `service` is non-empty, with no duplicate upstream keys in one
+- Upstream `to` is a catalog service name or an external URL (see the table
+  above), an external one has a `name`, and no key is declared twice in one
   task (`auth` and `auth` in `shared` are different keys).
-- An upstream's `namespace`, or the qualifier of a `namespace/service`
-  reference, is a namespace name; when both are written they agree; an
-  external (`to`) destination sets no `namespace`.
-- `localPort` is greater than 0, with no duplicates and no collision with a
+- An upstream's `namespace` is a namespace name, and only a catalog service
+  has one.
+- An `http` block, a body-reading handler, or credentials need an upstream
+  whose `to` speaks HTTP.
+- `port` is greater than 0, with no duplicates and no collision with a
   static port declared in the same task's `network.ports` (including one
   declared by the `service.port` number shorthand).
 - `balance` is a known strategy. The error lists the valid names.
-- `service.allow` entries are non-empty.
+- `service.allow` entries are non-empty, and an entry with colons has four
+  parts.
+- `service.mesh = true` is not combined with the same port's own `tls`.
 
 The upstream service doesn't have to exist yet. It may be submitted later, or
 by someone else, and Legion won't fail a submission because of ordering. An
@@ -373,7 +432,7 @@ starts and again on every heartbeat that changes the result:
 
 ```nickel
 connect = {
-    upstreams = [{ service = "db" }, { service = "api" }],
+    upstreams = [{ to = "db" }, { to = "api" }],
     templates = [
         {
             name = "backends",
@@ -428,10 +487,10 @@ arithmetic.
 
 ### Platform behavior
 
-Connect is plain userspace loopback TCP, so the loopback ports and
-`LEGION_UPSTREAM_*` addresses behave the same on macOS and Linux. Upstream
-names and VIPs (`LEGION_DNS`, `LEGION_UPSTREAM_HOST_*`,
-`LEGION_UPSTREAM_VIP_*`) are Linux-only. See [Platform notes](#platform-notes).
+Connect is plain userspace loopback TCP, so `LEGION_UPSTREAM_*` behaves the
+same on macOS and Linux: it is the address to dial on either. On Linux it is
+an upstream VIP, and the names (`LEGION_DNS`, `<key>.svc.legion`) come with
+it; on macOS it is a loopback port. See [Platform notes](#platform-notes).
 
 ## Querying: CLI and API
 
@@ -569,10 +628,10 @@ and no `SO_REUSEPORT`.
 
 Upstream names and VIPs need the whole `127.0.0.0/8` range routed to
 loopback. Linux does this by default, and macOS only has `127.0.0.1`. So on
-macOS an allocation gets no VIP block: no `LEGION_DNS`, no
-`LEGION_UPSTREAM_HOST_*` or `LEGION_UPSTREAM_VIP_*`, and `{{ service }}`
-renders `127.0.0.1:<local port>`. On Linux, if a node runs out of VIP blocks,
-the allocation still places and gets loopback ports only. macOS has no network-namespace isolation, so all tasks share
+macOS an allocation gets no VIP block: no `LEGION_DNS`, and
+`LEGION_UPSTREAM_<KEY>` and `{{ service }}` are `127.0.0.1:<local port>`. On
+Linux, if a node runs out of VIP blocks, the allocation still places and its
+upstreams get loopback ports instead. macOS has no network-namespace isolation, so all tasks share
 the host port space. Dynamic ports (both task ports and upstream ports) avoid
 collisions. Static ports are first come, first served per node.
 

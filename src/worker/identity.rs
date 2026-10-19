@@ -454,7 +454,7 @@ impl WorkerIdentityManager {
 /// Parse the JSON-encoded identity list off a [`TaskAllocation`].
 /// The identities the worker delivers to the task (env or file). One that is
 /// only named by a `connect.upstreams` credential is left out: the manager
-/// mints it for the node's forwarder through `GetUpstreamCredentials`, and
+/// mints it for the node's forwarder through `FetchDatapathMaterial`, and
 /// nothing is written into the task for it.
 pub fn parse_identities(raw: &str) -> R<Vec<WorkloadIdentity>> {
     if raw.trim().is_empty() {

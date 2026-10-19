@@ -1645,7 +1645,7 @@ fn migration_list() -> Vec<M<'static>> {
         INSERT OR IGNORE INTO net_policy_meta (id, generation) VALUES (1, 0);",
         )
         .down("DROP TABLE IF EXISTS net_policy; DROP TABLE IF EXISTS net_policy_meta;"),
-        // The mesh CA behind `certFrom = "legion"` (docs/network-handlers.md):
+        // The mesh CA behind `service.mesh = true` (docs/network-handlers.md):
         // one row, created on the first IssueNodeCertificate, replicated
         // with the control lane so every manager signs with the same key.
         M::up(
@@ -2127,6 +2127,27 @@ fn migration_list() -> Vec<M<'static>> {
         );",
         )
         .down("DROP TABLE IF EXISTS namespace_policy;"),
+        // Network plugin objects (`legion net plugin`, docs/network-plugins.md):
+        // the canonical JSON of a `NetPluginObject`. `revision` is the value
+        // of `net_plugin_meta.generation` after the write that stored the
+        // row, so a revision never repeats, even across a delete and a
+        // re-create; nodes hold a plugin by (name, revision).
+        M::up(
+            "CREATE TABLE IF NOT EXISTS net_plugin (
+            name STRING PRIMARY KEY,
+            usable_by STRING NOT NULL DEFAULT 'policies',
+            revision INTEGER NOT NULL,
+            body TEXT NOT NULL,
+            created_at TIMESTAMP NOT NULL,
+            updated_at TIMESTAMP NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS net_plugin_meta (
+            id INTEGER PRIMARY KEY CHECK (id = 1),
+            generation INTEGER NOT NULL DEFAULT 0
+        );
+        INSERT OR IGNORE INTO net_plugin_meta (id, generation) VALUES (1, 0);",
+        )
+        .down("DROP TABLE IF EXISTS net_plugin; DROP TABLE IF EXISTS net_plugin_meta;"),
     ]
 }
 

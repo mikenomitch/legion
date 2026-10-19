@@ -11,7 +11,7 @@
 #      never see a new certificate paired with an old key.
 #
 # Consumers pick the new value up on their own: see configs/jobs/tls-edge.ncl,
-# which serves it straight from the node datapath (`certFrom = { kv }`) and
+# which serves it straight from the node datapath (`ports[].tls.cert = { kv }`) and
 # also hands it to nginx as a file that is rewritten in place on renewal
 # (`onChange = "update"`, then SIGHUP).
 #

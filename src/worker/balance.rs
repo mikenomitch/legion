@@ -106,9 +106,8 @@ type BalancerRow = (&'static str, fn() -> Arc<dyn Balancer>);
 /// only one list.
 const BALANCERS: &[BalancerRow] = &[
     ("least_latency", default_balancer),
-    ("round_robin", || Arc::new(RoundRobin::default())),
-    ("random", || Arc::new(Random)),
-    ("least_conn", || Arc::new(LeastConn::default())),
+    ("round_robin", || Arc::new(RoundRobin::seeded())),
+    ("least_conn", || Arc::new(LeastConn::seeded())),
     ("local_first", || Arc::new(LocalFirst::default())),
 ];
 
@@ -288,6 +287,21 @@ struct RoundRobin {
     cursor: AtomicUsize,
 }
 
+/// A cursor starting at a random offset, so many listeners built at once
+/// (every allocation of a job, say) do not all send their first connection
+/// to the same endpoint.
+fn seeded_cursor() -> AtomicUsize {
+    AtomicUsize::new(rand::thread_rng().gen_range(0..1024))
+}
+
+impl RoundRobin {
+    fn seeded() -> Self {
+        RoundRobin {
+            cursor: seeded_cursor(),
+        }
+    }
+}
+
 impl Balancer for RoundRobin {
     fn name(&self) -> &'static str {
         "round_robin"
@@ -338,30 +352,20 @@ impl Balancer for LocalFirst {
     }
 }
 
-/// Uniform random choice. Stateless, and the best default when many clients
-/// share one backend set (no synchronized cursors).
-#[derive(Debug)]
-struct Random;
-
-impl Balancer for Random {
-    fn name(&self) -> &'static str {
-        "random"
-    }
-
-    fn pick(&self, endpoints: &[Endpoint], _inflight: &HashMap<String, usize>) -> Option<usize> {
-        if endpoints.is_empty() {
-            return None;
-        }
-        Some(rand::thread_rng().gen_range(0..endpoints.len()))
-    }
-}
-
 /// Fewest in-flight connections wins; ties are broken round-robin so a cold
 /// backend set still spreads evenly. Counts are per-listener, which is the
 /// honest scope — a worker only knows about the connections it forwards.
 #[derive(Debug, Default)]
 struct LeastConn {
     cursor: AtomicUsize,
+}
+
+impl LeastConn {
+    fn seeded() -> Self {
+        LeastConn {
+            cursor: seeded_cursor(),
+        }
+    }
 }
 
 impl Balancer for LeastConn {
@@ -390,6 +394,21 @@ impl Balancer for LeastConn {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Fresh `round_robin` listeners over one endpoint list spread their
+    /// first picks instead of all starting at index 0.
+    #[test]
+    fn fresh_round_robin_listeners_spread_their_first_picks_test() -> R<()> {
+        let endpoints = endpoints();
+        let inflight = HashMap::new();
+        let mut first = std::collections::HashSet::new();
+        for _ in 0..64 {
+            first.insert(balancer("round_robin")?.pick(&endpoints, &inflight));
+        }
+        // 2^-63 chance of a false failure.
+        assert_eq!(first.len(), 2, "first picks reach every endpoint");
+        Ok(())
+    }
 
     #[test]
     fn local_first_prefers_this_node_and_widens_when_nothing_is_local() {
@@ -509,7 +528,11 @@ mod tests {
         let picks: Vec<usize> = (0..5)
             .filter_map(|_| balancer.pick(&endpoints, &inflight))
             .collect();
-        assert_eq!(picks, vec![0, 1, 0, 1, 0]);
+        // In order, wrapping; the start is random per listener.
+        assert!(
+            picks == vec![0, 1, 0, 1, 0] || picks == vec![1, 0, 1, 0, 1],
+            "{picks:?}"
+        );
         Ok(())
     }
 
@@ -523,22 +546,6 @@ mod tests {
                 "{name} must not pick from an empty list"
             );
         }
-        Ok(())
-    }
-
-    #[test]
-    fn random_stays_in_range_and_reaches_both_endpoints() -> R<()> {
-        let balancer = balancer("random")?;
-        let endpoints = endpoints();
-        let inflight = HashMap::new();
-        let mut seen = std::collections::HashSet::new();
-        for _ in 0..200 {
-            let index = balancer.pick(&endpoints, &inflight).expect("pick");
-            assert!(index < endpoints.len());
-            seen.insert(index);
-        }
-        // 2^-200 chance of a false failure.
-        assert_eq!(seen.len(), 2, "random must reach every endpoint");
         Ok(())
     }
 
@@ -647,7 +654,11 @@ mod tests {
         let picks: Vec<usize> = (0..4)
             .filter_map(|_| balancer.pick(&endpoints, &inflight))
             .collect();
-        assert_eq!(picks, vec![0, 1, 0, 1]);
+        // Ties alternate; where the cursor starts is random per listener.
+        assert!(
+            picks == vec![0, 1, 0, 1] || picks == vec![1, 0, 1, 0],
+            "{picks:?}"
+        );
         Ok(())
     }
 }

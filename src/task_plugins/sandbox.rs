@@ -681,18 +681,18 @@ fn gated_guest_upstreams(
     let mut upstreams: Vec<legion_guest::identity::GuestUpstream> = network
         .upstreams
         .iter()
-        .map(|upstream| {
-            let port = ports
-                .get(&upstream.service)
-                .copied()
-                .unwrap_or(upstream.local_port);
-            legion_guest::identity::GuestUpstream {
+        // A sandbox's upstreams always carry a local port (placement gives
+        // each one): it names the vsock port the relay runs on.
+        .filter_map(|upstream| {
+            let local = upstream.local_port?;
+            let port = ports.get(&upstream.key).copied().unwrap_or(local);
+            Some(legion_guest::identity::GuestUpstream {
                 port,
-                vsock_port: (port != upstream.local_port).then_some(upstream.local_port),
+                vsock_port: (port != local).then_some(local),
                 vip: upstream
                     .vip_address()
                     .and_then(|address| address.parse().ok()),
-            }
+            })
         })
         .collect();
     upstreams.sort();
@@ -715,10 +715,10 @@ fn gated_ingress_ports(allocation: &Allocation) -> Vec<u16> {
 /// `LEGION_PORT_<label>` is the port the guest listens on (unchanged by the
 /// restore for a port it was captured with), and `LEGION_IP_<label>` and
 /// `LEGION_ADDR_<label>` are where the restoring allocation advertises it.
-/// For a gated guest's upstreams, `LEGION_UPSTREAM_<KEY>` and
-/// `LEGION_UPSTREAM_PORT_<KEY>` name the loopback port the guest dials
-/// (likewise unchanged), and `LEGION_UPSTREAM_VIP_<KEY>` the restoring
-/// allocation's VIP, which the agent also listens on.
+/// For a gated guest's upstreams, `LEGION_UPSTREAM_<KEY>` (with its
+/// `_HOST_` and `_PORT_` parts) names the one loopback address the guest
+/// dials, likewise unchanged. The agent also listens on the restoring
+/// allocation's VIPs, which `<key>.svc.legion` resolves to.
 fn restored_port_env(
     allocation: &Allocation,
     guest_ports: &BTreeMap<String, u16>,
@@ -744,18 +744,19 @@ fn restored_port_env(
         }
     }
     for upstream in &network.upstreams {
-        let Some(port) = guest_upstreams.get(&upstream.service).copied() else {
+        let Some(port) = guest_upstreams.get(&upstream.key).copied() else {
             continue;
         };
-        let label = crate::structs::sanitize_env_label(&upstream.service);
+        let label = crate::structs::sanitize_env_label(&upstream.key);
         env.insert(
             format!("LEGION_UPSTREAM_{label}"),
             format!("{}:{port}", crate::structs::UPSTREAM_LOOPBACK_ADDR),
         );
+        env.insert(
+            format!("LEGION_UPSTREAM_HOST_{label}"),
+            crate::structs::UPSTREAM_LOOPBACK_ADDR.to_string(),
+        );
         env.insert(format!("LEGION_UPSTREAM_PORT_{label}"), port.to_string());
-        if let Some(vip) = upstream.vip_address() {
-            env.insert(format!("LEGION_UPSTREAM_VIP_{label}"), vip);
-        }
     }
     env
 }
@@ -1631,8 +1632,10 @@ impl SandboxTaskPlugin {
             }
             _ => None,
         };
-        let mut cmd = Command::new("container");
-        cmd.args(build_apple_launch(
+        // A gated sandbox on macOS runs on the gated network, where pf keeps
+        // it on its own datapath ports (internal_docs/plans/macos-gated-plan.md).
+        let gated_network = crate::task_plugins::confine::prepare_vm(allocation, env.iter_mut())?;
+        let mut args = build_apple_launch(
             &name,
             // What stale-container cleanup checks before it removes anything.
             &apple_container::ownership_labels(allocation),
@@ -1640,7 +1643,13 @@ impl SandboxTaskPlugin {
             &env,
             &instance.volumes,
             identity_dir.as_deref(),
-        ));
+        );
+        if let Some(network) = gated_network {
+            args.splice(2..2, network);
+            crate::task_plugins::confine::admit_when_ready(allocation.id, name.clone());
+        }
+        let mut cmd = Command::new("container");
+        cmd.args(args);
         Ok(cmd)
     }
 
@@ -2402,6 +2411,7 @@ impl TaskPlugin for SandboxTaskPlugin {
         }
 
         reap_task_process(allocation.id, &task.name, instance, "sandbox");
+        crate::task_plugins::confine::release_vm(allocation);
         // Whatever the VMM left behind (a helper it forked, a dev-mode
         // container init) is still in the allocation's cgroup.
         if let Some(assignment) = instance.resource_assignment.as_ref() {
@@ -4446,11 +4456,11 @@ mod tests {
             "mode": "gated",
             "upstreams": [
                 {
-                    "service": "db", "localPort": 20003, "balance": "least_conn",
+                    "key": "db", "localPort": 20003, "balance": "least_conn",
                     "vip": "127.42.0.2", "canonicalPort": 5432,
                 },
                 {
-                    "service": "api", "localPort": 20004, "balance": "least_conn",
+                    "key": "api", "localPort": 20004, "balance": "least_conn",
                     "to": "https://api.example.com",
                 },
             ],
@@ -4486,9 +4496,11 @@ mod tests {
         let env = restored_port_env(&allocation, &BTreeMap::new(), &captured);
         assert_eq!(env["LEGION_UPSTREAM_DB"], "127.0.0.1:20011");
         assert_eq!(env["LEGION_UPSTREAM_PORT_DB"], "20011");
-        assert_eq!(env["LEGION_UPSTREAM_VIP_DB"], "127.42.0.2:5432");
+        assert_eq!(env["LEGION_UPSTREAM_HOST_DB"], "127.0.0.1");
         assert_eq!(env["LEGION_UPSTREAM_API"], "127.0.0.1:20004");
-        assert!(!env.contains_key("LEGION_UPSTREAM_VIP_API"));
+        assert!(!env
+            .keys()
+            .any(|key| key.starts_with("LEGION_UPSTREAM_VIP_")));
 
         let host = crate::structs::AllocNetwork {
             mode: None,

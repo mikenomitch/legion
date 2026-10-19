@@ -514,7 +514,41 @@ async fn answer(resolver: &Arc<Resolver>, query: &[u8], over_stream: bool) -> Op
         // time out. Nothing is sent to a resolver the operator did not name.
         return respond(&asked, ResponseCode::ServFail, Vec::new());
     }
-    forward(resolver, query, over_stream).await
+    let response = forward(resolver, query, over_stream).await?;
+    // An allowed name's addresses teach the kernel classifier, so a host
+    // rule decides at connect() with no proxy hop (plan §6.A.4).
+    if chain.is_some() && resolver.context.kernel_classifier_active() {
+        let (addresses, ttl) = answered_addresses(&response);
+        if !addresses.is_empty() {
+            resolver
+                .context
+                .kernel_learn(allocation_id, &asked.name, &addresses, ttl);
+        }
+    }
+    Some(response)
+}
+
+/// The A and AAAA addresses in a response, and the shortest TTL among them.
+fn answered_addresses(response: &[u8]) -> (Vec<IpAddr>, Duration) {
+    let Ok(message) = Message::from_vec(response) else {
+        return (Vec::new(), Duration::ZERO);
+    };
+    let mut ttl = u32::MAX;
+    let addresses = message
+        .answers()
+        .iter()
+        .filter_map(|record| {
+            let ip = match record.data() {
+                RData::A(a) => IpAddr::V4(a.0),
+                RData::AAAA(aaaa) => IpAddr::V6(aaaa.0),
+                _ => return None,
+            };
+            ttl = ttl.min(record.ttl());
+            Some(ip)
+        })
+        .collect::<Vec<_>>();
+    let ttl = if addresses.is_empty() { 0 } else { ttl };
+    (addresses, Duration::from_secs(u64::from(ttl)))
 }
 
 /// Proxy a query to the host resolvers over UDP, first answer wins. An
@@ -585,6 +619,35 @@ mod tests {
     const TYPE_SRV: RecordType = RecordType::SRV;
     const RCODE_NXDOMAIN: u8 = 3;
     const RCODE_SERVFAIL: u8 = 2;
+
+    /// The addresses an answer teaches the kernel, with the shortest TTL;
+    /// a CNAME on the way is not an address.
+    #[test]
+    fn answered_addresses_take_a_and_aaaa_with_the_shortest_ttl_test() {
+        use hickory_proto::rr::rdata::{AAAA, CNAME};
+        let name = Name::from_ascii("files.pypi.org.").unwrap();
+        let mut message = Message::new();
+        message.set_message_type(MessageType::Response);
+        message.add_answer(Record::from_rdata(
+            name.clone(),
+            300,
+            RData::CNAME(CNAME(Name::from_ascii("cdn.example.").unwrap())),
+        ));
+        message.add_answer(Record::from_rdata(
+            name.clone(),
+            120,
+            RData::A(A(Ipv4Addr::new(151, 101, 0, 223))),
+        ));
+        message.add_answer(Record::from_rdata(
+            name,
+            60,
+            RData::AAAA(AAAA("2a04:4e42::223".parse().unwrap())),
+        ));
+        let (addresses, ttl) = answered_addresses(&message.to_vec().unwrap());
+        assert_eq!(addresses.len(), 2);
+        assert_eq!(ttl, Duration::from_secs(60));
+        assert_eq!(answered_addresses(b"not dns"), (Vec::new(), Duration::ZERO));
+    }
 
     fn query(name: &str, qtype: RecordType) -> Vec<u8> {
         let mut message = Message::new();

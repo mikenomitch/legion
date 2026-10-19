@@ -5,7 +5,7 @@
 # Put one by hand to try this without the renewer:
 #   legion kv put certs/app.example.com "$(cat fullchain.pem privkey.pem)"
 #
-# 1. `app`: TLS from the node datapath (`certFrom = { kv }`).
+# 1. `app`: TLS from the node datapath (`ports[].tls.cert = { kv }`).
 #    The app speaks plain HTTP on a private port. The node terminates TLS on
 #    the advertised port with the certificate from KV, so the app never holds
 #    the key. On a `kv put`, new connections get the new certificate and open
@@ -42,13 +42,9 @@
         command = ["sh", "-c", "exec python3 -m http.server \"$LEGION_PORT_HTTPS\""],
       },
       network = {
-        ports = [{ name = "https", static = 8443 }],
-        ingress = {
-          tls = {
-            mode = "server",
-            certFrom = { kv = "certs/app.example.com" },
-          },
-        },
+        ports = [
+          { name = "https", static = 8443, tls = { cert = { kv = "certs/app.example.com" } } },
+        ],
       },
       resources = { cpus = 0.1, memory = 64 },
     },

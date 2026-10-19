@@ -119,7 +119,7 @@ fn default_task_count() -> TaskCount {
     TaskCount::default()
 }
 
-fn default_task_group() -> String {
+pub fn default_task_group() -> String {
     "default".to_string()
 }
 
@@ -4762,9 +4762,9 @@ mod tests {
                 "runtime": "exec",
                 "connect": {
                     "upstreams": [
-                        { "service": "db" },
-                        { "service": "cache", "localPort": 6379 },
-                        { "service": "web", "balance": "least_conn" },
+                        { "to": "db" },
+                        { "to": "cache", "port": 6379 },
+                        { "to": "web", "balance": "least_conn" },
                     ]
                 },
                 "service": { "port": 8080, "allow": ["gateway"] }
@@ -4774,7 +4774,7 @@ mod tests {
         let task = &config.tasks[0];
         let connect = task.connect.as_ref().expect("connect not parsed");
         assert_eq!(connect.upstreams.len(), 3);
-        assert_eq!(connect.upstreams[1].local_port, Some(6379));
+        assert_eq!(connect.upstreams[1].port, Some(6379));
         assert_eq!(
             task.service
                 .as_ref()
@@ -4793,7 +4793,7 @@ mod tests {
             "name": "demo",
             "task": {
                 "runtime": "exec",
-                "connect": { "upstreams": [{ "service": "cache", "localPort": 6379 }] },
+                "connect": { "upstreams": [{ "to": "cache", "port": 6379 }] },
                 "service": { "port": 6379 }
             }
         });

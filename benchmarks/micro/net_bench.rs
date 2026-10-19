@@ -15,16 +15,28 @@
 //!   `l4_cpu`: CPU-seconds per GiB moved, printed (not a Criterion group),
 //!   because CPU time per byte survives a busy host and wall clock doesn't.
 //! - `http_rr`: HTTP/1.1 GETs on one kept-open client connection, through
-//!   HTTP mode (`connect.upstreams[].http`).
+//!   HTTP mode (`connect.upstreams[].http`), and through HTTP mode with a
+//!   no-op WASM plugin (`tests/netplugins/conformance.wasm`, mode `noop`) at
+//!   the `request` stage, and at `request`, `response`, and `done` (mesh
+//!   interfaces plan §6.B; the B1 acceptance number).
 //! - `slow_endpoint`: three backends, one of them 2 ms slower. Mean
 //!   per-request latency under each balancing strategy this build has.
 //! - `balancer_pick`: the cost of one pick across 16 endpoints.
+//! - `kernel_conn_rr` (Linux, root, cgroup v2; mesh interfaces plan §6.A,
+//!   phase A0): a new connection per request from a process inside an
+//!   allocation's cgroup leaf, with no classifier attached, with the kernel
+//!   passing the flow after its first rule or after 32 rules, through the
+//!   forwarder (the netd hop a pass flow skips), redirected through the
+//!   capture listener, and refused (`EPERM`). Printed, not a Criterion
+//!   group: the client is a child process in the leaf, so the datapath's
+//!   own dials are not classified. `kernel_connect_cost` is the pass rows
+//!   minus the unclassified row.
 
 use std::convert::Infallible;
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
-use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
+use criterion::{criterion_group, BenchmarkId, Criterion, Throughput};
 use http_body_util::{BodyExt, Full};
 use hyper::{Request, Response};
 use hyper_util::rt::TokioIo;
@@ -149,12 +161,14 @@ async fn forwarder(backends: &[String], balance: &str, http: bool) -> u16 {
     let spec = UpstreamSpec {
         allocation_id: 1,
         service: "bench".into(),
-        local_port: port,
+        local_port: Some(port),
+        http_protocol: http,
         balance: balance.into(),
         to: None,
         http: http.then(UpstreamHttpConfig::default),
         handlers: Vec::new(),
         credentials: Vec::new(),
+        ca: None,
         vip: None,
         canonical_port: None,
         attachment: Attachment::Host,
@@ -167,6 +181,54 @@ async fn forwarder(backends: &[String], balance: &str, http: bool) -> u16 {
         .collect();
     forwarder.set_endpoints(1, "bench", endpoints);
     port
+}
+
+/// An HTTP-mode forwarder whose upstream runs the no-op conformance plugin
+/// at `stages`.
+async fn plugin_forwarder(backend: &str, stages: &[&str]) -> (u16, &'static UpstreamForwarder) {
+    let forwarder: &'static UpstreamForwarder = Box::leak(Box::new(UpstreamForwarder::new()));
+    let mut object: legion::structs::netplugin::NetPluginObject =
+        serde_json::from_value(serde_json::json!({
+            "name": "noop",
+            "module": { "source": "file:///unused", "checksum": format!("sha256:{}", "0".repeat(64)) },
+            "stages": stages,
+            "usableBy": "jobs",
+        }))
+        .unwrap();
+    object.normalize_and_validate().unwrap();
+    let module = std::fs::read(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/netplugins/conformance.wasm"
+    ))
+    .unwrap();
+    forwarder
+        .context()
+        .plugins()
+        .install_compiled(object, 1, &module)
+        .unwrap();
+    let hop: legion::structs::hops::HopConfig = serde_json::from_value(serde_json::json!({
+        "plugin": { "name": "noop", "config": { "mode": "noop" } }
+    }))
+    .unwrap();
+    let port = free_port().await;
+    let spec = UpstreamSpec {
+        allocation_id: 1,
+        service: "bench".into(),
+        local_port: Some(port),
+        http_protocol: true,
+        balance: "round_robin".into(),
+        to: None,
+        http: Some(UpstreamHttpConfig::default()),
+        handlers: vec![hop],
+        credentials: Vec::new(),
+        ca: None,
+        vip: None,
+        canonical_port: None,
+        attachment: legion::worker::netd::attach::Attachment::Host,
+    };
+    forwarder.sync(std::slice::from_ref(&spec)).await;
+    forwarder.set_endpoints(1, "bench", vec![endpoint(backend, 1)]);
+    (port, forwarder)
 }
 
 async fn connect(port: u16) -> TcpStream {
@@ -329,21 +391,47 @@ fn l4(c: &mut Criterion) {
 
 fn http(c: &mut Criterion) {
     let rt = runtime();
-    let (direct, via) = rt.block_on(async {
+    let (direct, via, inert, request_plugin, all_plugin) = rt.block_on(async {
         let backend = http_backend(Duration::ZERO).await;
         let port = forwarder(std::slice::from_ref(&backend), "round_robin", true).await;
+        // A plugin with no HTTP stage: the exchange runs, no callback does.
+        let inert = plugin_forwarder(&backend, &["connect"]).await;
+        let request_plugin = plugin_forwarder(&backend, &["request"]).await;
+        let all_plugin = plugin_forwarder(&backend, &["request", "response", "done"]).await;
         let direct: u16 = backend.rsplit(':').next().unwrap().parse().unwrap();
-        (direct, port)
+        (direct, port, inert, request_plugin, all_plugin)
     });
     let mut group = c.benchmark_group("http_rr");
     group.measurement_time(Duration::from_secs(4));
-    for (name, port) in [("direct", direct), ("http_mode", via)] {
+    for (name, port) in [
+        ("direct", direct),
+        ("http_mode", via),
+        ("http_mode_plugin_without_http_stages", inert.0),
+        ("http_mode_noop_plugin_request", request_plugin.0),
+        ("http_mode_noop_plugin_all_stages", all_plugin.0),
+    ] {
         group.bench_function(name, |b| {
             let mut sender = rt.block_on(http_client(port));
             b.iter(|| rt.block_on(http_get(&mut sender)));
         });
     }
     group.finish();
+    // What the plugin's callbacks cost on the real path, from its stats.
+    for (name, (_, forwarder)) in [("request", request_plugin), ("all_stages", all_plugin)] {
+        for row in forwarder.context().plugins().report() {
+            let entry = forwarder.context().plugins().entry(&row.plugin).unwrap();
+            let micros = entry
+                .stats
+                .micros
+                .load(std::sync::atomic::Ordering::Relaxed);
+            println!(
+                "http_rr/plugin_{name:<12} {} stage callbacks, mean {:.2} µs, p99 {} µs",
+                row.calls,
+                micros as f64 / row.calls.max(1) as f64,
+                row.p99_micros
+            );
+        }
+    }
 }
 
 /// Mean latency of `requests` sequential requests through a forwarder whose
@@ -414,5 +502,369 @@ fn balancer_pick(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, l4, http, slow_endpoint, balancer_pick);
-criterion_main!(benches);
+/// The plugin host in-process, no network: one no-op callback on a live
+/// context, a context's whole life (create, `on_done`, `on_delete`), and a
+/// request-stage exchange end to end. Tells the host's own cost from the
+/// HTTP path's in `http_rr`.
+fn plugin_exchange(c: &mut Criterion) {
+    use legion::worker::netd::handlers::{HopFacts, Pipeline, RequestHead};
+    let rt = runtime();
+    let context = std::sync::Arc::new(legion::worker::forwarder::ForwarderContext::new(
+        std::sync::Arc::new(legion::worker::netd::NetPolicyCache::new()),
+        std::sync::Arc::new(legion::worker::netd::Denials::new()),
+    ));
+    let mut object: legion::structs::netplugin::NetPluginObject =
+        serde_json::from_value(serde_json::json!({
+            "name": "noop",
+            "module": { "source": "file:///unused", "checksum": format!("sha256:{}", "0".repeat(64)) },
+            "stages": ["request"],
+        }))
+        .unwrap();
+    object.normalize_and_validate().unwrap();
+    let module = std::fs::read(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/netplugins/conformance.wasm"
+    ))
+    .unwrap();
+    context
+        .plugins()
+        .install_compiled(object, 1, &module)
+        .unwrap();
+    let reference = legion::structs::netplugin::PluginConfig {
+        name: "noop".into(),
+        config: Some(serde_json::json!({ "mode": "noop" })),
+    };
+    let (_, pool) = context.plugins().pool(&reference, "policy").unwrap();
+    let slot = pool.pick().unwrap();
+    let mut group = c.benchmark_group("plugin_exchange");
+    group.measurement_time(Duration::from_secs(3));
+    {
+        let mut vm = slot.vm.lock().unwrap();
+        let mut ctx = Some(vm.new_context().unwrap());
+        group.bench_function("vm_request_headers_callback", |b| {
+            b.iter(|| {
+                let args = vm.headers_args(ctx.as_ref().unwrap().id, 0, true);
+                let (outcome, back) =
+                    vm.call("proxy_on_request_headers", &args, ctx.take().unwrap());
+                assert!(outcome.result.is_ok());
+                ctx = Some(back);
+            })
+        });
+        group.bench_function("vm_context_lifecycle", |b| {
+            b.iter(|| {
+                let fresh = vm.new_context().unwrap();
+                let id = fresh.id as i32;
+                let (_, fresh) = vm.call("proxy_on_done", &[id], fresh);
+                let _ = vm.call("proxy_on_delete", &[id], fresh);
+            })
+        });
+    }
+    let hop: legion::structs::hops::HopConfig = serde_json::from_value(serde_json::json!({
+        "plugin": { "name": "noop", "config": { "mode": "noop" } }
+    }))
+    .unwrap();
+    let chain = legion::structs::netpolicy::EffectiveChain {
+        protocol: "http".into(),
+        policy: "allow".into(),
+        access_log: false,
+        callers: None,
+        rules: Vec::new(),
+        handlers: vec![legion::structs::netpolicy::EffectiveHandler {
+            handler: hop,
+            source: "policy/bench#0".into(),
+        }],
+    };
+    let pipeline = std::sync::Arc::new(Pipeline::compile(Some(&chain), None, &[]));
+    let facts = HopFacts {
+        allocation_id: 1,
+        direction: "egress",
+        protocol: "http",
+        destination: "bench:80",
+        host: Some("bench"),
+        port: 80,
+        ..Default::default()
+    };
+    let headers = vec![
+        ("host".to_string(), "bench".to_string()),
+        ("accept".to_string(), "*/*".to_string()),
+    ];
+    group.bench_function("exchange_request_stage", |b| {
+        b.iter(|| {
+            rt.block_on(async {
+                let mut exchange = pipeline.exchange(&context, &facts);
+                let mut head = RequestHead {
+                    method: "GET".into(),
+                    path: "/".into(),
+                    authority: "bench".into(),
+                    scheme: "http".into(),
+                    headers: headers.clone(),
+                    end_of_stream: true,
+                    changed: false,
+                };
+                let _ = exchange.request(&facts, &mut head).await;
+                drop(exchange);
+            })
+        })
+    });
+    group.finish();
+}
+
+criterion_group!(
+    benches,
+    l4,
+    http,
+    slow_endpoint,
+    balancer_pick,
+    plugin_exchange
+);
+
+fn main() {
+    if let Ok(spec) = std::env::var(kernel::CHILD_ENV) {
+        kernel::child(&spec);
+        return;
+    }
+    benches();
+    kernel::run();
+    Criterion::default().configure_from_args().final_summary();
+}
+
+mod kernel {
+    /// Set on the client child: `<addr>:<iterations>:<mode>`.
+    pub const CHILD_ENV: &str = "LEGION_NET_BENCH_CHILD";
+
+    /// The client: `rr` connects, sends 100 bytes (an HTTP head naming
+    /// `bench.test`, so a redirected flow carries a name), reads 100 back,
+    /// and waits for the close; `deny` only attempts the connect. Prints the
+    /// mean nanoseconds per iteration.
+    pub fn child(spec: &str) {
+        use std::io::{Read, Write};
+        let mut parts = spec.rsplitn(3, ':');
+        let mode = parts.next().unwrap().to_string();
+        let iterations: u32 = parts.next().unwrap().parse().unwrap();
+        let addr: std::net::SocketAddr = parts.next().unwrap().parse().unwrap();
+        let message = request();
+        let started = std::time::Instant::now();
+        for _ in 0..iterations {
+            match std::net::TcpStream::connect(addr) {
+                Ok(mut stream) if mode == "rr" => {
+                    let _ = stream.set_nodelay(true);
+                    stream.write_all(&message).unwrap();
+                    let mut buf = [0u8; super::MESSAGE];
+                    stream.read_exact(&mut buf).unwrap();
+                    let mut rest = Vec::new();
+                    let _ = stream.read_to_end(&mut rest);
+                }
+                Ok(_) => {}
+                Err(err) if mode == "deny" => {
+                    assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied)
+                }
+                Err(err) => panic!("connect {addr}: {err}"),
+            }
+        }
+        println!("{}", started.elapsed().as_nanos() / u128::from(iterations));
+    }
+
+    fn request() -> Vec<u8> {
+        let mut head = b"GET / HTTP/1.1\r\nHost: bench.test\r\nX-Pad: ".to_vec();
+        while head.len() < super::MESSAGE - 4 {
+            head.push(b'a');
+        }
+        head.extend_from_slice(b"\r\n\r\n");
+        head
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    pub fn run() {}
+
+    #[cfg(target_os = "linux")]
+    pub fn run() {
+        use legion::structs::netpolicy::{merge_policies, ChainConfig, InlinePolicy};
+        use legion::worker::forwarder::ForwarderContext;
+        use legion::worker::netd::kernel::runtime::{cgroup2_mount, KernelNet, KernelSettings};
+        use legion::worker::netd::kernel_guard::{GuardTable, GuardedAllocation};
+        use legion::worker::netd::{Denials, NetPolicyCache};
+        use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+        use std::sync::Arc;
+
+        let filter = std::env::args().skip(1).find(|arg| !arg.starts_with('-'));
+        if filter
+            .as_deref()
+            .is_some_and(|filter| !"kernel_conn_rr".contains(filter))
+        {
+            return;
+        }
+        // SAFETY: geteuid has no preconditions.
+        let root_user = unsafe { libc::geteuid() } == 0;
+        let (Some(root), true) = (cgroup2_mount(), root_user) else {
+            println!("kernel_conn_rr: skipped (needs root and a cgroup v2 mount)");
+            return;
+        };
+        let Some(ip) = legion::structs::host_guard::interface_addresses()
+            .into_iter()
+            .find_map(|ip| match ip {
+                IpAddr::V4(v4) if !v4.is_loopback() => Some(v4),
+                _ => None,
+            })
+        else {
+            println!("kernel_conn_rr: skipped (no non-loopback IPv4 address)");
+            return;
+        };
+        let rt = super::runtime();
+        let backend_port = rt.block_on(async {
+            let listener = tokio::net::TcpListener::bind((Ipv4Addr::UNSPECIFIED, 0))
+                .await
+                .unwrap();
+            let port = listener.local_addr().unwrap().port();
+            tokio::spawn(async move {
+                use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                while let Ok((mut stream, _)) = listener.accept().await {
+                    let _ = stream.set_nodelay(true);
+                    tokio::spawn(async move {
+                        let mut buf = [0u8; super::MESSAGE];
+                        if stream.read_exact(&mut buf).await.is_ok() {
+                            let _ = stream.write_all(&buf).await;
+                        }
+                    });
+                }
+            });
+            port
+        });
+        let backend = SocketAddr::from((ip, backend_port));
+        let parent = format!("legion-net-bench-{}", std::process::id());
+        let leaf = format!("{parent}/share/legion-1");
+        std::fs::create_dir_all(root.join(&leaf)).unwrap();
+        let iterations = 2000u32;
+        let measure = |addr: SocketAddr, mode: &str| -> f64 {
+            let exe = std::env::current_exe().unwrap();
+            let output = std::process::Command::new("sh")
+                .arg("-c")
+                .arg(format!(
+                    "echo $$ > {} && exec \"$0\"",
+                    root.join(&leaf).join("cgroup.procs").display()
+                ))
+                .arg(exe)
+                .env(CHILD_ENV, format!("{addr}:{iterations}:{mode}"))
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            String::from_utf8_lossy(&output.stdout)
+                .trim()
+                .parse::<f64>()
+                .unwrap()
+                / 1000.0
+        };
+        let mut rows: Vec<(&str, f64)> = Vec::new();
+        rows.push(("unclassified", measure(backend, "rr")));
+
+        let cache = Arc::new(NetPolicyCache::new());
+        let guard = legion::structs::host_guard::HostGuard::new(
+            &legion::structs::host_guard::HostGuardConfig {
+                allow: vec![format!("{ip}:{backend_port}")],
+                deny: vec![],
+            },
+        )
+        .unwrap();
+        struct Names(Ipv4Addr);
+        #[tonic::async_trait]
+        impl legion::worker::netd::guard::Resolver for Names {
+            async fn resolve(&self, _host: &str, port: u16) -> std::io::Result<Vec<SocketAddr>> {
+                Ok(vec![SocketAddr::from((self.0, port))])
+            }
+        }
+        let net = KernelNet::open(KernelSettings {
+            cgroup_root: root.clone(),
+            cgroup_parent: parent.clone(),
+            pin_dir: None,
+        })
+        .unwrap();
+        let context = Arc::new(
+            ForwarderContext::new(cache.clone(), Arc::new(Denials::new()))
+                .with_host_guard(Arc::new(guard))
+                .with_resolver(Arc::new(Names(ip)))
+                .with_kernel_classifier(
+                    GuardTable {
+                        cgroup_parent: parent.clone(),
+                        ..Default::default()
+                    },
+                    net,
+                ),
+        );
+        let capture = rt
+            .block_on(legion::worker::netd::capture::HostCapture::start(
+                context.clone(),
+            ))
+            .unwrap();
+        context.set_host_capture(Some(capture.addr));
+        let apply = |chain: serde_json::Value| {
+            let mut config: ChainConfig = serde_json::from_value(chain).unwrap();
+            config.normalize_and_validate("egress").unwrap();
+            let policy = merge_policies(
+                &[],
+                InlinePolicy {
+                    egress: Some(&config),
+                    ..Default::default()
+                },
+            );
+            cache.apply_assignments(&[legion::structs::AllocNetPolicy {
+                allocation_id: 1,
+                policy_hash: policy.hash.clone(),
+            }]);
+            let hash = policy.hash.clone();
+            cache.insert_body(&hash, policy).unwrap();
+            context.reconcile_kernel_guard(vec![GuardedAllocation {
+                allocation_id: 1,
+                cgroup: leaf.clone(),
+                vip_block: None,
+                loopback_ports: vec![],
+                resolver: None,
+                gated: false,
+                host_sockets: true,
+            }]);
+        };
+        apply(serde_json::json!({ "policy": "deny", "allow": [format!("{ip}/32")] }));
+        rows.push(("pass_first_rule", measure(backend, "rr")));
+        let mut rules: Vec<serde_json::Value> = (1..=32)
+            .map(|port| serde_json::json!({ "when": { "port": port }, "action": "deny" }))
+            .collect();
+        rules
+            .push(serde_json::json!({ "when": { "cidr": format!("{ip}/32") }, "action": "allow" }));
+        apply(serde_json::json!({ "policy": "deny", "rules": rules }));
+        rows.push(("pass_after_32_rules", measure(backend, "rr")));
+        let via = rt.block_on(super::forwarder(
+            &[backend.to_string()],
+            "round_robin",
+            false,
+        ));
+        rows.push((
+            "forwarder",
+            measure(SocketAddr::from((Ipv4Addr::LOCALHOST, via)), "rr"),
+        ));
+        apply(serde_json::json!({
+            "policy": "deny",
+            "rules": [{ "when": { "host": "bench.test" }, "action": "allow" }],
+        }));
+        rows.push(("redirect", measure(backend, "rr")));
+        apply(serde_json::json!({ "policy": "deny" }));
+        rows.push(("deny", measure(backend, "deny")));
+        context.shutdown_kernel();
+        drop(capture);
+        let _ = std::fs::remove_dir(root.join(&leaf));
+        let _ = std::fs::remove_dir(root.join(&parent).join("share"));
+        let _ = std::fs::remove_dir(root.join(&parent));
+
+        let base = rows[0].1;
+        for (name, micros) in &rows {
+            println!("kernel_conn_rr/{name:<22} {micros:>8.1} µs");
+        }
+        for (name, micros) in &rows[1..3] {
+            println!(
+                "kernel_connect_cost/{name:<17} {:>8.2} µs per connection",
+                micros - base
+            );
+        }
+    }
+}

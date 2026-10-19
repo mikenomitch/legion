@@ -119,7 +119,7 @@ reports `aclEnabled: false`.
 | `template` | job templates | list/inspect | publish versions, delete (scope with `templates`) |
 | `scale` | task count overrides ([Scaling Jobs](autoscaling.md)) | scale status | `job scale` / reset (scope by job name). Separate from `job:write`, so a principal can resize without redeploy rights. |
 | `boot` | boot tickets ([Edge Boot](edge-boot.md)) | list outstanding tickets | mint a ticket (scope by job name). Separate from `job:write` for the same reason as `scale`: a platform's ticket minter can authorize individual starts without the right to redeploy the fleet. |
-| `net` | network policy objects ([Network Handlers](network-handlers.md)) | list policies, show or test a job's effective policy (scope by job name) | apply or delete a policy. Scope with `pools`, which is matched against the policy's own `selector.nodePools`, so a pool's admin can set posture for their pool without cluster-wide write. |
+| `net` | network policy and plugin objects ([Network Handlers](network-handlers.md), [Network Plugins](network-plugins.md)) | list policies, show or test a job's effective policy (scope by job name); list, describe, and read the status of plugins | apply or delete a policy. Scope with `pools`, which is matched against the policy's own `selector.nodePools`, so a pool's admin can set posture for their pool without cluster-wide write. Apply or delete a plugin: a `usableBy = "policies"` plugin's `nodePools` scope it the same way; a cluster-wide one, or any `usableBy = "jobs"` plugin, needs unscoped write. |
 | `snapshot` | instance snapshots ([Suspend and Resume](suspend-and-resume.md)) | list, inspect, warm a published one onto nodes, restore an instance from one, and create instances from one (restore and create also need `job:write`) | create (including `--publish`), delete, and name snapshots, suspend with a memory checkpoint, and fork (fork also needs `job:write`) (scope by job name and namespace) |
 | `namespace` | namespace objects ([Namespaces](namespaces.md)) | get a namespace (listing is per item: any allow in a namespace shows it) | create, update, and delete namespaces whose names match (scope with `namespaces`). A cascade delete also needs `job:write` there. |
 
@@ -131,7 +131,12 @@ store, including ACL metadata. What it cannot read:
   ([KV Encryption at Rest](kv-encryption.md)), so raw SQL sees ciphertext. A
   `kv` rule scoped by `paths` is the only way to read a value. That includes
   naming one in a job or net policy, which hands it to the task or the
-  datapath ([KV references in a job](#kv-references-in-a-job)).
+  datapath ([KV references in a job](#kv-references-in-a-job)): a port's
+  `tls.cert` or `tls.clients.ca`, an upstream's `ca`, or an upstream
+  credential among them
+  ([Certificates and CAs from KV](network-handlers.md#certificates-and-cas-from-kv)),
+  and a network plugin object that names a signing key under `credentials`
+  ([Network Plugins](network-plugins.md#signing-without-the-key)).
 - Private keys, password hashes, and recorded replies.
   `signing_key.private_key_pem` (the workload-identity and boot-ticket
   signing keys), `net_mesh_ca.key_pem` (the built-in cluster CA key),
@@ -309,8 +314,9 @@ the key, on top of `job:write`. That covers every place a job can name one:
   templates, and a `templateKv` pointer,
 - an artifact's `auth.kv` (a path filled in by a cluster `artifacts.auth`
   matcher needs no grant),
-- `tls.certFrom = { kv }` on an ingress chain and
-  `connect.upstreams[].credentials`.
+- a port's `tls.cert` or `tls.clients.ca`, an upstream's `ca`, and
+  `connect.upstreams[].credentials` (the
+  [Sources](network-handlers.md#sources) the datapath fetches).
 
 `job run`, `job plan`, and template renders and runs check it before anything
 is placed:
@@ -561,7 +567,7 @@ When ACLs are enforced:
   type, or registering into a pool other than that type's pool, fails with
   `PermissionDenied`.
 - A node token only speaks for its own node. Every worker-plane RPC that names
-  a node (`Heartbeat`, `HealthCheck`, `FetchNetPolicy`,
+  a node (`Heartbeat`, `HealthCheck`, `FetchDatapathMaterial`,
   `GetArtifactCredential`, `RatifyClaim`, and the identity and certificate
   issuers) refuses a node id that does not match the token with
   `PermissionDenied`. A node token can re-register its own node in its current

@@ -36,6 +36,8 @@ It is available from the CLI, the MCP server, the UI, and raw gRPC.
 | `net.denied` | warn | A node's datapath denied a connection or request by [network policy](network-handlers.md). Metadata carries the direction, destination, deciding rule (`policy/<name>#<index>`, `task#<index>`, or `fallthrough`), reason, peer identity, the task's `network.labels`, and how many identical denials the row stands for. |
 | `net.policy_applied` | info | A network policy object was created or replaced (`legion net policy apply`). Metadata names it and counts the running allocations it affects. |
 | `net.policy_deleted` | info | A network policy object was deleted. |
+| `net.plugin_applied` | info | A network plugin object was created or replaced (`legion net plugin apply`). Metadata names it, its revision, and the module checksum. See [Network Plugins](network-plugins.md). |
+| `net.plugin_deleted` | info | A network plugin object was deleted. |
 | `volume.mounted` | info | A worker materialized a [volume](volumes.md) at a host path. For a node-local volume, this is also when its instance becomes pinned to that node. |
 | `volume.failed` | warn | A driver operation failed (mount/unmount/destroy). The detail is also recorded on the volume row, so `legion volume get` explains a stuck volume. |
 | `volume.reclaiming` | info | A volume's instance no longer references it, so its storage is queued for the driver's `destroy`. |

@@ -1,4 +1,3 @@
-use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 use serde::{Deserialize, Serialize};
@@ -241,6 +240,85 @@ pub fn gated_egress_warnings(
     warnings
 }
 
+/// Warnings for upstreams that do not speak HTTP under an HTTP egress chain
+/// whose verdict for them needs a request head: a policy never changes how a
+/// stream is parsed, so those connections are refused at connect.
+/// `matching` returns the stored policies a task's selector facts match
+/// (`job validate` passes none; `job run` and `job plan` pass the stored
+/// ones).
+pub fn tcp_upstream_http_chain_warnings(
+    config: &crate::structs::JobConfig,
+    matching: impl Fn(&crate::structs::TaskConfig) -> Vec<crate::structs::netpolicy::NetPolicyObject>,
+) -> Vec<String> {
+    config
+        .tasks
+        .iter()
+        .flat_map(|task| task_tcp_upstream_warnings(task, &matching(task)))
+        .collect()
+}
+
+/// [`tcp_upstream_http_chain_warnings`] for one task, under the stored
+/// policies `objects` that match it.
+pub fn task_tcp_upstream_warnings(
+    task: &crate::structs::TaskConfig,
+    objects: &[crate::structs::netpolicy::NetPolicyObject],
+) -> Vec<String> {
+    use crate::structs::netpolicy::{
+        deferring_rule, evaluate_connect, merge_policies, ConnectFacts, InlinePolicy, Verdict,
+    };
+    let mut warnings = Vec::new();
+    {
+        let Some(connect) = task.connect.as_ref() else {
+            return warnings;
+        };
+        let inline = InlinePolicy {
+            egress: task.network.as_ref().and_then(|n| n.egress.as_ref()),
+            ..Default::default()
+        };
+        let policy = merge_policies(objects, inline);
+        let Some(chain) = policy.egress.as_ref().filter(|chain| chain.is_http()) else {
+            return warnings;
+        };
+        for upstream in &connect.upstreams {
+            let (host, port) = match upstream.destination() {
+                Ok(UpstreamDestination::Catalog {
+                    service,
+                    http: false,
+                }) => (service, 0),
+                Ok(UpstreamDestination::External(target)) if !target.http => {
+                    (target.host.clone(), target.port)
+                }
+                _ => continue,
+            };
+            let facts = ConnectFacts {
+                host: Some(&host),
+                ip: host.parse().ok(),
+                port,
+                identity: None,
+            };
+            if evaluate_connect(chain, &facts) != Verdict::Defer {
+                continue;
+            }
+            let rule = deferring_rule(chain, &facts).unwrap_or_else(|| "a rule".into());
+            let key = upstream.key();
+            warnings.push(format!(
+                "task {:?} upstream '{key}' is {}, but the egress policy's rule {rule} needs a \
+                 path, method, or header to decide it, so its connections will be refused.\n\
+                 hint: allow '{host}' by host ahead of path rules, or write to = \"http://{}\" \
+                 if it speaks HTTP",
+                task.name,
+                if upstream.is_external() {
+                    "not HTTP"
+                } else {
+                    "tcp://"
+                },
+                upstream.to.trim().trim_start_matches("tcp://"),
+            ));
+        }
+    }
+    warnings
+}
+
 /// Whether a task's own spec puts it on gated networking on a microVM node:
 /// it declares `gated`, or it is a sandbox whose `auto` resolves there.
 /// Submit-time checks use this (only the declared mode and the task's
@@ -380,17 +458,17 @@ fn validate_gated_guest_ports(task: &crate::structs::TaskConfig) -> Result<(), S
         connect
             .upstreams
             .iter()
-            .find(|upstream| matches!(upstream.local_port, Some(PROXY | RESOLVER)))
+            .find(|upstream| matches!(upstream.port, Some(PROXY | RESOLVER)))
     });
     if let Some(upstream) = upstream {
         return Err(format!(
-            "task {:?} connect.upstreams entry {:?} sets localPort {}, but a gated sandbox's \
+            "task {:?} connect.upstreams entry {:?} sets port {}, but a gated sandbox's \
              upstreams are relayed to the node on vsock ports of the same number, and {PROXY} \
              and {RESOLVER} are the guest's egress proxy and resolver\nHint: pick another \
-             localPort, or drop it to take a dynamic one",
+             port, or drop it to take a dynamic one",
             task.name,
             upstream.key(),
-            upstream.local_port.unwrap_or_default()
+            upstream.port.unwrap_or_default()
         ));
     }
     Ok(())
@@ -446,6 +524,31 @@ pub fn platform_supports_vip_blocks() -> bool {
 /// `os` gets no block; its upstreams still have their loopback ports.
 pub fn node_supports_vip_blocks(node_os: Option<&str>) -> bool {
     node_os.is_some_and(|os| os.eq_ignore_ascii_case("linux"))
+}
+
+/// Whether a gated task on a node with this `os` fingerprint is confined
+/// rather than namespaced: macOS has no network namespaces, so its runtime
+/// keeps the task on the node's loopback instead (Seatbelt for `exec`, pf for
+/// an Apple container VM; internal_docs/plans/macos-gated-plan.md).
+pub fn node_confines_gated(node_os: Option<&str>) -> bool {
+    node_os.is_some_and(|os| os.eq_ignore_ascii_case("macos"))
+}
+
+/// The egress proxy address of a confined allocation: the first dynamic
+/// port that neither another allocation on the node (`used`) nor this one
+/// (`ports`, `upstreams`) holds, on the node's loopback.
+pub fn assign_confined_proxy(
+    used: &HashSet<u16>,
+    ports: &[AllocPort],
+    upstreams: &[AllocUpstream],
+) -> R<String> {
+    let mut taken = used.clone();
+    taken.extend(ports.iter().map(|port| port.host_port));
+    taken.extend(ports.iter().filter_map(|port| port.private_port));
+    taken.extend(upstreams.iter().filter_map(|upstream| upstream.local_port));
+    let mut cursor = DYNAMIC_PORT_MIN;
+    let port = next_dynamic_port(&mut cursor, &mut taken, "a confined egress proxy")?;
+    Ok(format!("{GATED_PROXY_ADDR}:{port}"))
 }
 
 /// Pick the next free VIP block (`127.42.<b>`) on a node.
@@ -547,6 +650,52 @@ pub struct PortConfig {
     pub static_port: Option<u16>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub to: Option<u16>,
+    /// TLS the node terminates on this port with a certificate that is not
+    /// the mesh's (docs/network-handlers.md, "TLS on ports"). The task
+    /// speaks plaintext on its private port. Never on the service's mesh
+    /// port.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tls: Option<PortTls>,
+}
+
+/// `network.ports[].tls`.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Hash)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PortTls {
+    /// The certificate chain and key: `{ kv = "<path>" }` (one PEM bundle,
+    /// swapped live when the key changes) or `{ file = { cert, key } }` (or
+    /// one `file` holding both) on the node.
+    pub cert: crate::structs::source::Source,
+    /// Present: the port is mutual, and clients must present a certificate
+    /// that verifies against `ca`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub clients: Option<ClientAuth>,
+}
+
+/// `network.ports[].tls.clients`.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Hash)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ClientAuth {
+    /// The CA bundle client certificates are verified against:
+    /// `{ kv = "<path>" }` or `{ file = "<path>" }` (PEM).
+    pub ca: crate::structs::source::Source,
+}
+
+impl PortTls {
+    /// Validate the sources: a certificate or CA comes from KV or a file,
+    /// never an identity.
+    pub fn validate(&self, what: &str) -> R<()> {
+        use crate::structs::source::SourceKind;
+        self.cert
+            .check(&format!("{what}.cert"), &[SourceKind::Kv, SourceKind::File])?;
+        if let Some(clients) = &self.clients {
+            clients.ca.check(
+                &format!("{what}.clients.ca"),
+                &[SourceKind::Kv, SourceKind::File],
+            )?;
+        }
+        Ok(())
+    }
 }
 
 /// `service.port` accepts either a named `network.ports` label, a literal port
@@ -572,14 +721,22 @@ pub struct ServiceConfig {
     pub tags: Vec<String>,
     #[serde(default, skip_serializing_if = "Map::is_empty")]
     pub meta: Map<String, Value>,
-    /// Connect intentions: the jobs allowed to reach this service through an
-    /// upstream. Empty (the default) or `["*"]` means every job in the
-    /// service's own namespace; a bare entry (`gateway`, `web-*`) names jobs
-    /// in that same namespace; reaching across namespaces takes a qualified
-    /// entry — `checkout-prod/api`, `payments-*/api`, `*/*` — so a crossing
-    /// is always written on the side being reached (docs/namespaces.md). A
-    /// denied consumer simply receives an empty endpoint list — enforcement is
-    /// control-plane + forwarder, not cryptographic identity.
+    /// Put the service on the mesh: its port terminates node-to-node mTLS
+    /// with the node certificate, consumers originate mesh TLS to it, and a
+    /// plain client dialing the port directly is refused at the handshake.
+    /// A policy object can impose (`require`) or default it. Resolved at
+    /// placement.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mesh: Option<bool>,
+    /// Connect intentions: the jobs allowed to reach this service. Empty (the
+    /// default) or `["*"]` means every job in the service's own namespace; a
+    /// bare entry (`gateway`, `web-*`) names jobs in that same namespace;
+    /// reaching across namespaces takes a qualified entry —
+    /// `checkout-prod/api`, `payments-*/api`, `*/*` — so a crossing is always
+    /// written on the side being reached (docs/namespaces.md). Always
+    /// enforced by the endpoint feed (a consumer not on the list gets no
+    /// endpoints); on a mesh service, also by the receiving node against the
+    /// verified caller's job.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub allow: Vec<String>,
 }
@@ -617,6 +774,23 @@ impl ServiceConfig {
             })
             .collect()
     }
+}
+
+/// The workload identity subject of a task: `<region>:<job>:<group>:<task>`,
+/// as the mesh names a caller and `service.allow` matches it.
+pub fn workload_subject(job_id: &str, group: &str, task_name: &str) -> String {
+    format!(
+        "{}:{job_id}:{group}:{task_name}",
+        crate::constants::DEF_CLUSTER_REGION
+    )
+}
+
+/// The job id a workload identity subject (`<region>:<job>:<group>:<task>`)
+/// names, or `None` for a peer that named no workload (`node:<id>`).
+pub fn identity_job(identity: &str) -> Option<&str> {
+    let mut parts = identity.split(':');
+    let job = parts.nth(1)?;
+    (parts.count() == 2 && !job.is_empty()).then_some(job)
 }
 
 /// Shared intention check so the catalog projection and `ServiceConfig` agree.
@@ -694,59 +868,153 @@ pub struct ConnectTemplate {
     pub coalesce: Option<String>,
 }
 
-/// One declared upstream: a catalog service (`service`) or an external
-/// destination (`name` + `to`). Either way the task gets a loopback port and
-/// `LEGION_UPSTREAM_<KEY>`, and the node datapath does the dialing.
+/// One declared upstream. `to` names it, and its scheme alone decides the
+/// protocol:
 ///
-/// `localPort` pins the loopback port (handy for clients that cannot read env
-/// vars); without it a port is assigned from the dynamic range at placement
-/// time, exactly like a task port. `balance` overrides the default strategy
-/// for this upstream only. `to` is `tcp://`, `tls://`, `http://`, or
-/// `https://` — the `tls`/`https` forms make the datapath originate TLS, so
-/// the task speaks plaintext to a loopback port and the body is visible to
-/// `handlers` without intercepting anyone's TLS. `http` opts this upstream
-/// into HTTP framing with traffic management.
+/// - a catalog service, by its bare name (`db`, or `db.svc.legion`): L4;
+///   `tcp://db` is the same; `http://search` parses HTTP;
+/// - an external destination, by URL: `tcp://host:port`, `tls://host:port`,
+///   `http://host[:port]`, or `https://host[:port]`. The `tls`/`https` forms
+///   make the datapath originate TLS, so the task speaks plaintext to its
+///   upstream address and the body is visible to `handlers` without
+///   intercepting anyone's TLS. An external upstream needs a `name`.
+///
+/// The task gets one address per upstream, `LEGION_UPSTREAM_<KEY>`: the
+/// upstream's VIP and canonical port where the node has a VIP block, else a
+/// loopback port. `port` pins the canonical port and also binds
+/// `127.0.0.1:<port>`, for a client config that needs a literal loopback
+/// address. `balance` overrides the default strategy for this upstream only.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Default)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct UpstreamConfig {
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    pub service: String,
-    /// The namespace `service` lives in, when it is not the consumer's own
-    /// (docs/namespaces.md, "Crossing a namespace"). The service must admit
-    /// the consumer with a qualified `allow` entry, so a crossing is written
-    /// on both sides. `service` may instead be qualified (`shared/auth`);
-    /// the two must agree.
+    /// A catalog service name or an external URL (see above).
+    pub to: String,
+    /// The namespace the catalog service `to` names lives in, when it is not
+    /// the consumer's own (docs/namespaces.md, "Crossing a namespace"). The
+    /// service must admit the consumer with a qualified `allow` entry, so a
+    /// crossing is written on both sides. Not allowed on an external
+    /// destination.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub namespace: Option<String>,
-    /// Key for an external upstream (`LEGION_UPSTREAM_<NAME>`); optional
-    /// alias for a service upstream.
+    /// The key (`LEGION_UPSTREAM_<NAME>`): defaults to the service name
+    /// (`<service>.<namespace>` across a namespace); required for an
+    /// external destination.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
-    /// External destination URL. Mutually exclusive with `service`.
+    /// Pin the canonical port, and also bind `127.0.0.1:<port>`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub to: Option<String>,
-    #[serde(default, alias = "local_port", skip_serializing_if = "Option::is_none")]
-    pub local_port: Option<u16>,
+    pub port: Option<u16>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub balance: Option<String>,
-    /// HTTP framing and traffic management for this upstream.
+    /// HTTP traffic management. Only on an upstream whose `to` speaks HTTP.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub http: Option<UpstreamHttpConfig>,
     /// Handlers on this upstream's path, run after the effective egress
     /// policy and before the dial.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub handlers: Vec<crate::structs::netpolicy::HandlerConfig>,
+    pub handlers: Vec<crate::structs::hops::HopConfig>,
     /// Credential injection (docs/network-handlers.md, "Credential
     /// injection"): headers the node sets on every request it sends to an
     /// external `https://` upstream, with values the task never sees.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub credentials: Vec<UpstreamCredential>,
+    /// The trust bundle an external `https://` or `tls://` upstream's
+    /// certificate is verified against, instead of the public roots:
+    /// `{ kv = "<path>" }` or `{ file = "<path>" }` (PEM).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ca: Option<crate::structs::source::Source>,
+}
+
+/// Where an upstream's `to` points.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UpstreamDestination {
+    /// A catalog service, dialed from the endpoint feed.
+    Catalog { service: String, http: bool },
+    /// A fixed external destination.
+    External(UpstreamTarget),
+}
+
+impl UpstreamDestination {
+    pub fn is_http(&self) -> bool {
+        match self {
+            UpstreamDestination::Catalog { http, .. } => *http,
+            UpstreamDestination::External(target) => target.http,
+        }
+    }
+}
+
+/// A service name as `to` accepts it bare: letters, digits, `-`, `_`.
+fn is_service_name(name: &str) -> bool {
+    !name.is_empty()
+        && name
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_ascii_alphanumeric())
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+}
+
+/// Parse an upstream's `to`: a bare name (no dot, no port) or a
+/// `<name>.svc.legion` host is a catalog service; anything else is an
+/// external URL, which needs a scheme. A dotless external host is written
+/// with its port (`http://wiki:80`).
+pub fn parse_upstream_to(to: &str) -> R<UpstreamDestination> {
+    let to = to.trim();
+    if to.is_empty() {
+        bail!(
+            "to is required: a catalog service (`db`, `http://search`) or an external URL \
+             (`https://api.example.com`)"
+        );
+    }
+    let (scheme, rest) = match to.split_once("://") {
+        Some((scheme, rest)) => (Some(scheme.to_ascii_lowercase()), rest),
+        None => (None, to),
+    };
+    let host = rest.trim_end_matches('/');
+    let zoned = host.strip_suffix(&format!(".{SVC_ZONE}"));
+    let bare = (!host.contains('.') && !host.contains(':') && !host.contains('/')).then_some(host);
+    if let Some(name) = zoned.or(bare) {
+        if is_service_name(name) {
+            return match scheme.as_deref() {
+                None | Some("tcp") => Ok(UpstreamDestination::Catalog {
+                    service: name.to_string(),
+                    http: false,
+                }),
+                Some("http") => Ok(UpstreamDestination::Catalog {
+                    service: name.to_string(),
+                    http: true,
+                }),
+                Some("tls" | "https") => bail!(
+                    "'{to}': catalog services are reached over the mesh, so tls:// and \
+                     https:// name external destinations. Hint: write to = \"http://{name}\", \
+                     and put the {name} service on the mesh (service.mesh = true)"
+                ),
+                Some(other) => {
+                    bail!("'{to}': unknown scheme '{other}' (use tcp, tls, http, or https)")
+                }
+            };
+        }
+        if zoned.is_some() || scheme.is_none() {
+            bail!(
+                "'{to}': '{name}' is not a service name (letters, digits, '-', '_'). Hint: an \
+                 external destination is a URL such as tcp://host:port or https://host"
+            );
+        }
+    }
+    if scheme.is_none() {
+        bail!(
+            "'{to}': an external destination needs a scheme: tcp://host:port, tls://host:port, \
+             http://host, or https://host. A catalog service is written as its bare name (`db`)"
+        );
+    }
+    Ok(UpstreamDestination::External(parse_upstream_target(to)?))
 }
 
 /// One injected header on an external `https://` upstream. Whatever value
 /// the task sent for `header` is dropped and replaced with `prefix` + the
 /// secret, so a placeholder the task's SDK insists on is harmless.
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct UpstreamCredential {
     /// The request header to set (`x-api-key`, `Authorization`). Stored
@@ -755,56 +1023,28 @@ pub struct UpstreamCredential {
     /// Text placed before the secret (`"Bearer "`). Optional.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prefix: Option<String>,
-    /// Where the secret comes from.
-    pub from: CredentialFrom,
-}
-
-/// The provider behind one credential. Exactly one field is set. Each
-/// provider is a sibling field, so a new one (a webhook) slots in without
-/// reshaping the jobspec.
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Default)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct CredentialFrom {
-    /// A KV path whose value is the secret. The node fetches it with
-    /// `GetUpstreamCredentials` and keeps it in memory only.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub kv: Option<String>,
-    /// The name of one of the task's `identities`: the manager mints that
-    /// workload-identity token for the allocation and the node injects it,
-    /// refreshed before it expires. The identity needs no `env` or `file`
-    /// delivery, in which case the token never reaches the task.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub identity: Option<String>,
+    /// Where the secret comes from: `{ kv = "<path>" }` or
+    /// `{ identity = "<task identity>" }`. Never a `file`: credentials stay
+    /// cluster-held, so a node's disk never becomes a secret store.
+    pub from: crate::structs::source::Source,
 }
 
 impl UpstreamCredential {
     /// The KV path this credential reads, when it is KV-backed.
     pub fn kv_path(&self) -> Option<&str> {
-        self.from
-            .kv
-            .as_deref()
-            .map(str::trim)
-            .filter(|path| !path.is_empty())
+        self.from.kv_path()
     }
 
     /// The task identity this credential injects, when it is
     /// identity-backed.
     pub fn identity_name(&self) -> Option<&str> {
-        self.from
-            .identity
-            .as_deref()
-            .map(str::trim)
-            .filter(|name| !name.is_empty())
+        self.from.identity_name()
     }
 
     /// Where the value comes from, as the jobspec names it, for status
     /// lines and logs: `kv secrets/openai` or `identity api`.
     pub fn source(&self) -> String {
-        match (self.kv_path(), self.identity_name()) {
-            (Some(path), _) => format!("kv {path}"),
-            (None, Some(name)) => format!("identity {name}"),
-            (None, None) => "no provider".to_string(),
-        }
+        self.from.to_string()
     }
 }
 
@@ -851,39 +1091,24 @@ fn is_header_token(name: &str) -> bool {
         })
 }
 
-/// Validate where a service upstream points: `namespace` and a qualified
-/// `service` are namespace names, and when both are written they agree.
+/// Validate where a service upstream points: `namespace` is a namespace
+/// name, and only a catalog service has one.
 fn validate_upstream_namespace(task_name: &str, upstream: &UpstreamConfig) -> R<()> {
+    let Some(namespace) = upstream.namespace.as_deref() else {
+        return Ok(());
+    };
     let what = format!(
         "task {task_name} connect.upstreams entry '{}'",
-        upstream.service
+        upstream.key()
     );
-    let field = upstream
-        .namespace
-        .as_deref()
-        .map(str::trim)
-        .filter(|namespace| !namespace.is_empty());
-    let qualifier = upstream
-        .service
-        .split_once('/')
-        .map(|(namespace, _)| namespace);
-    for namespace in field.iter().chain(qualifier.iter()) {
-        crate::structs::namespace::validate_namespace_name(namespace)
-            .map_err(|err| anyhow!("{what} namespace: {err}"))?;
+    if upstream.is_external() {
+        bail!(
+            "{what} sets namespace on an external destination; namespace names where a catalog \
+             service lives"
+        );
     }
-    if let (Some(field), Some(qualifier)) = (field, qualifier) {
-        if field != qualifier {
-            bail!(
-                "{what} names namespace '{qualifier}' in service and '{field}' in namespace; \
-                 write one of them"
-            );
-        }
-    }
-    let name = upstream.service_name();
-    if name.is_empty() || name.contains('/') {
-        bail!("{what}: service must be a name or namespace/name");
-    }
-    Ok(())
+    crate::structs::namespace::validate_namespace_name(namespace.trim())
+        .map_err(|err| anyhow!("{what} namespace: {err}"))
 }
 
 /// Validate one upstream's `credentials`: only on an external `https://`
@@ -902,7 +1127,7 @@ fn validate_upstream_credentials(task_name: &str, upstream: &UpstreamConfig) -> 
              service read the secret itself"
         );
     }
-    let to = upstream.to.as_deref().unwrap_or_default();
+    let to = upstream.to.trim();
     let scheme = to
         .split_once("://")
         .map(|(scheme, _)| scheme.to_ascii_lowercase())
@@ -948,33 +1173,30 @@ fn validate_upstream_credentials(task_name: &str, upstream: &UpstreamConfig) -> 
                 bail!("{at}: prefix must not contain CR, LF, or NUL");
             }
         }
-        match (
-            credential.from.kv.as_deref(),
-            credential.from.identity.as_deref(),
-        ) {
-            (Some(_), Some(_)) => {
-                bail!("{at}: from names two providers (kv and identity); set exactly one")
+        use crate::structs::source::SourceKind;
+        credential
+            .from
+            .check(
+                &format!("{at}: from"),
+                &[SourceKind::Kv, SourceKind::Identity],
+            )
+            .map_err(|err| {
+                anyhow!(
+                    "{err}. Hint: from = {{ kv = \"secrets/{key}\" }} or \
+                     {{ identity = \"<task identity name>\" }}"
+                )
+            })?;
+        if let Some(name) = credential.identity_name() {
+            crate::structs::workload_identity::validate_identity_name(name)
+                .map_err(|err| anyhow!("{at}: from.identity: {err}"))?;
+            if name == crate::structs::workload_identity::CONTROL_PLANE_IDENTITY_NAME {
+                bail!(
+                    "{at}: from.identity = \"{name}\" is the control-plane identity, which \
+                     authenticates to Legion itself; injecting it would hand a Legion \
+                     credential to {to}. Hint: declare an identity whose audience is \
+                     that origin"
+                );
             }
-            (Some(path), None) if !path.trim().is_empty() => {}
-            (Some(_), None) => bail!("{at}: from.kv must name a KV path"),
-            (None, Some(name)) => {
-                crate::structs::workload_identity::validate_identity_name(name.trim())
-                    .map_err(|err| anyhow!("{at}: from.identity: {err}"))?;
-                if name.trim() == crate::structs::workload_identity::CONTROL_PLANE_IDENTITY_NAME {
-                    bail!(
-                        "{at}: from.identity = \"{}\" is the control-plane identity, which \
-                         authenticates to Legion itself; injecting it would hand a Legion \
-                         credential to {to}. Hint: declare an identity whose audience is \
-                         that origin",
-                        name.trim()
-                    );
-                }
-            }
-            (None, None) => bail!(
-                "{at}: from needs a provider: {{ kv = \"<path>\" }} or \
-                 {{ identity = \"<task identity name>\" }}, e.g. \
-                 from = {{ kv = \"secrets/{key}\" }}"
-            ),
         }
     }
     Ok(())
@@ -990,70 +1212,80 @@ impl UpstreamConfig {
         }
     }
 
+    /// Where `to` points; `Err` for a `to` validation rejects.
+    pub fn destination(&self) -> R<UpstreamDestination> {
+        parse_upstream_to(&self.to)
+    }
+
+    /// The catalog service this upstream dials, when it dials one.
+    pub fn service(&self) -> Option<String> {
+        match self.destination() {
+            Ok(UpstreamDestination::Catalog { service, .. }) => Some(service),
+            _ => None,
+        }
+    }
+
     /// Whether this upstream dials a fixed external destination rather than
     /// a catalog service.
     pub fn is_external(&self) -> bool {
-        self.to.as_deref().is_some_and(|to| !to.trim().is_empty())
+        matches!(self.destination(), Ok(UpstreamDestination::External(_)))
+    }
+
+    /// The external URL, when this upstream has one.
+    pub fn external_to(&self) -> Option<String> {
+        self.is_external().then(|| self.to.trim().to_string())
     }
 
     /// The key this upstream is known by: `name` when given, else the
     /// service, written `<service>.<namespace>` when the upstream crosses
     /// into another namespace. It is what `LEGION_UPSTREAM_<KEY>`,
-    /// `<key>.svc.legion`, and `AllocUpstream.service` carry, so a crossing
-    /// stays visible wherever the task uses it.
-    pub fn key(&self) -> Cow<'_, str> {
+    /// `<key>.svc.legion`, and `AllocUpstream.key` carry, so a crossing stays
+    /// visible wherever the task uses it.
+    pub fn key(&self) -> String {
         match self.name.as_deref() {
-            Some(name) if !name.trim().is_empty() => Cow::Borrowed(name),
-            _ => match self.target_namespace() {
-                Some(namespace) => Cow::Owned(format!("{}.{namespace}", self.service_name())),
-                None => Cow::Borrowed(self.service.as_str()),
-            },
+            Some(name) if !name.trim().is_empty() => name.trim().to_string(),
+            _ => {
+                let service = self.service().unwrap_or_default();
+                match self.target_namespace() {
+                    Some(namespace) => format!("{service}.{namespace}"),
+                    None => service,
+                }
+            }
         }
     }
 
-    /// The namespace this upstream names for its service, if any: the
-    /// `namespace` field, else the qualifier of a `namespace/service`
-    /// reference. `None` means the consumer's own namespace.
+    /// The namespace this upstream names for its service, if any. `None`
+    /// means the consumer's own namespace.
     pub fn target_namespace(&self) -> Option<&str> {
         self.namespace
             .as_deref()
             .map(str::trim)
             .filter(|namespace| !namespace.is_empty())
-            .or_else(|| self.service.split_once('/').map(|(namespace, _)| namespace))
-    }
-
-    /// The service's bare name, without a `namespace/` qualifier.
-    pub fn service_name(&self) -> &str {
-        self.service
-            .split_once('/')
-            .map_or(self.service.as_str(), |(_, name)| name)
     }
 
     /// The canonical service reference this upstream dials from
     /// `consumer_job`: the named namespace, else the consumer's own. A bare
-    /// service never resolves across a namespace boundary.
-    pub fn service_ref(&self, consumer_job: &str) -> String {
+    /// service never resolves across a namespace boundary. `None` for an
+    /// external destination.
+    pub fn service_ref(&self, consumer_job: &str) -> Option<String> {
+        let service = self.service()?;
         let namespace = self
             .target_namespace()
             .unwrap_or_else(|| crate::structs::namespace::job_namespace(consumer_job));
-        crate::structs::namespace::job_id(namespace, self.service_name())
+        Some(crate::structs::namespace::job_id(namespace, &service))
     }
 
-    /// Whether the datapath parses HTTP on this upstream.
+    /// Whether the datapath parses HTTP on this upstream: its scheme says so.
     pub fn is_http(&self) -> bool {
-        self.http.is_some()
-            || self
-                .to
-                .as_deref()
-                .and_then(|to| parse_upstream_target(to).ok())
-                .is_some_and(|target| target.http)
+        self.destination().is_ok_and(|d| d.is_http())
     }
 }
 
-/// HTTP traffic management for one upstream (service-mesh-plan §3.4). Every
-/// field is optional; an empty block still turns on HTTP framing.
+/// HTTP traffic management for one HTTP upstream (service-mesh-plan §3.4).
+/// Every field is optional. An endpoint that answers 5xx five times in a row
+/// is ejected for 30 seconds, with no setting to write.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Default)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct UpstreamHttpConfig {
     /// Per-request deadline (`3s`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1064,12 +1296,10 @@ pub struct UpstreamHttpConfig {
     /// the remainder.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub split: Vec<SplitConfig>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub outlier: Option<OutlierConfig>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Default)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct RetryConfig {
     /// Extra attempts after the first (default 1).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1093,19 +1323,6 @@ pub struct SplitConfig {
     pub tag: String,
     /// Percent of requests, 0–100.
     pub weight: u32,
-}
-
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Default)]
-#[serde(rename_all = "camelCase")]
-pub struct OutlierConfig {
-    #[serde(
-        default,
-        rename = "consecutive5xx",
-        skip_serializing_if = "Option::is_none"
-    )]
-    pub consecutive_5xx: Option<u32>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub eject_for: Option<String>,
 }
 
 /// A parsed `connect.upstreams[].to`.
@@ -1196,8 +1413,14 @@ pub fn parse_upstream_target(to: &str) -> R<UpstreamTarget> {
 pub struct AllocUpstream {
     /// The upstream's key (`UpstreamConfig::key`): the service name, or the
     /// `name` of an external upstream.
-    pub service: String,
-    pub local_port: u16,
+    pub key: String,
+    /// The loopback port the datapath also binds (`127.0.0.1:<port>`): a
+    /// pinned `port`, or one assigned from the dynamic range where the node
+    /// has no VIP block (macOS, or the blocks are used up) or the runtime
+    /// needs one (a sandbox's vsock relay). Absent when the VIP is the only
+    /// address.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub local_port: Option<u16>,
     /// Resolved strategy name, never empty (see [`DEFAULT_BALANCE`]).
     pub balance: String,
     /// External destination (`UpstreamConfig::to`) when this upstream does
@@ -1212,18 +1435,33 @@ pub struct AllocUpstream {
     /// and on platforms without a routable 127/8 (macOS).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub vip: Option<String>,
-    /// The port the VIP listens on: the upstream's pinned `localPort`, else
-    /// the service's declared in-task port, else an external target's port,
-    /// else the dynamic loopback port. `db.svc.legion:5432` works because
+    /// The port the VIP listens on: the upstream's pinned `port`, else the
+    /// service's declared in-task port, else an external target's port, else
+    /// a port from the dynamic range. `db.svc.legion:5432` works because
     /// this is 5432 for a service that declared it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub canonical_port: Option<u16>,
 }
 
 impl AllocUpstream {
-    /// `127.0.0.1:<local_port>` — what `LEGION_UPSTREAM_<SERVICE>` contains.
+    /// The one address a task dials for this upstream, as host and port:
+    /// the VIP on its canonical port where one was assigned, else the
+    /// loopback port. `LEGION_UPSTREAM_<KEY>` and `{{ service "<key>" }}`
+    /// both read this.
+    pub fn dial(&self) -> Option<(String, u16)> {
+        match (self.vip.as_deref(), self.canonical_port) {
+            (Some(vip), Some(port)) => Some((vip.to_string(), port)),
+            _ => self
+                .local_port
+                .map(|port| (UPSTREAM_LOOPBACK_ADDR.to_string(), port)),
+        }
+    }
+
+    /// [`Self::dial`] as `host:port`.
     pub fn address(&self) -> String {
-        format!("{UPSTREAM_LOOPBACK_ADDR}:{}", self.local_port)
+        self.dial()
+            .map(|(host, port)| format!("{host}:{port}"))
+            .unwrap_or_default()
     }
 
     /// `<vip>:<canonical port>` when a VIP was assigned — what
@@ -1249,6 +1487,14 @@ pub struct AllocPort {
     /// so the task's instruction — bind `$LEGION_PORT_<label>` — is unchanged.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub private_port: Option<u16>,
+    /// The port terminates mesh mTLS: it is the service's port, and the
+    /// effective `service.mesh` (the task's, or a policy's) was on at
+    /// placement. Consumers originate mesh TLS to it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub mesh: bool,
+    /// The port's own `tls`, copied from the task at placement.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tls: Option<PortTls>,
 }
 
 impl AllocPort {
@@ -1291,29 +1537,63 @@ pub struct AllocNetwork {
     /// (treated as `host`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mode: Option<String>,
-    /// How the allocation's advertised ports terminate TLS, resolved at
-    /// placement from the effective ingress chain: `legion` (the mesh — a
-    /// consuming node originates mesh TLS to it), `byo` (operator files), or
-    /// absent (plaintext). Read by the catalog projection into
-    /// `ServiceEndpoint.mesh_tls`.
+    /// A gated allocation on a node with no network namespaces (macOS):
+    /// where its egress proxy listens on the node's loopback
+    /// (`127.0.0.1:<port>`, assigned at placement). Its presence is what
+    /// makes the allocation *confined* rather than namespaced
+    /// (internal_docs/plans/macos-gated-plan.md §6.2).
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub ingress_tls: Option<String>,
+    pub egress_proxy: Option<String>,
 }
 
 impl AllocNetwork {
+    /// Whether the allocation is gated without a namespace: its listeners
+    /// are on the node's loopback and its runtime confines it (Seatbelt for
+    /// `exec`, pf for an Apple container VM).
+    pub fn is_confined(&self) -> bool {
+        self.is_gated() && self.egress_proxy.is_some()
+    }
+
+    /// The node-loopback ports a confined task may reach: its egress proxy
+    /// and its upstreams' loopback ports. Its Seatbelt profile or pf rules
+    /// allow these and nothing else.
+    pub fn confined_ports(&self) -> Vec<u16> {
+        let proxy = self
+            .egress_proxy
+            .as_deref()
+            .and_then(|addr| addr.parse::<std::net::SocketAddr>().ok())
+            .map(|addr| addr.port());
+        let mut ports: Vec<u16> = proxy
+            .into_iter()
+            .chain(
+                self.upstreams
+                    .iter()
+                    .filter_map(|upstream| upstream.local_port),
+            )
+            .collect();
+        ports.sort_unstable();
+        ports.dedup();
+        ports
+    }
+
+    /// Whether any port terminates mesh mTLS (the node needs its mesh
+    /// certificate before the port can serve).
+    pub fn serves_mesh(&self) -> bool {
+        self.ports.iter().any(|port| port.mesh)
+    }
+
     pub fn port(&self, label: &str) -> Option<&AllocPort> {
         self.ports.iter().find(|port| port.name == label)
     }
 
-    pub fn upstream(&self, service: &str) -> Option<&AllocUpstream> {
-        self.upstreams
-            .iter()
-            .find(|upstream| upstream.service == service)
+    pub fn upstream(&self, key: &str) -> Option<&AllocUpstream> {
+        self.upstreams.iter().find(|upstream| upstream.key == key)
     }
 
     /// Env pairs for the assigned ports: LEGION_PORT_<L>, LEGION_ADDR_<L>,
-    /// LEGION_IP_<L>, LEGION_PORT_TO_<L>; plus, per upstream,
-    /// LEGION_UPSTREAM_<L> (`127.0.0.1:<port>`) and LEGION_UPSTREAM_PORT_<L>.
+    /// LEGION_IP_<L>, LEGION_PORT_TO_<L>; plus, per upstream, the one address
+    /// to dial: LEGION_UPSTREAM_<K> (`host:port`), LEGION_UPSTREAM_HOST_<K>,
+    /// and LEGION_UPSTREAM_PORT_<K>.
     pub fn env_pairs(&self) -> Vec<(String, String)> {
         let mut pairs = Vec::new();
         for port in &self.ports {
@@ -1331,21 +1611,13 @@ impl AllocNetwork {
             }
         }
         for upstream in &self.upstreams {
-            let label = sanitize_env_label(&upstream.service);
-            pairs.push((format!("LEGION_UPSTREAM_{label}"), upstream.address()));
-            pairs.push((
-                format!("LEGION_UPSTREAM_PORT_{label}"),
-                upstream.local_port.to_string(),
-            ));
-            if let Some(vip_address) = upstream.vip_address() {
-                // Name-is-config: the same upstream by DNS name, on the port
-                // the service declared.
-                pairs.push((
-                    format!("LEGION_UPSTREAM_HOST_{label}"),
-                    format!("{}.{SVC_ZONE}", upstream.service),
-                ));
-                pairs.push((format!("LEGION_UPSTREAM_VIP_{label}"), vip_address));
-            }
+            let label = sanitize_env_label(&upstream.key);
+            let Some((host, port)) = upstream.dial() else {
+                continue;
+            };
+            pairs.push((format!("LEGION_UPSTREAM_{label}"), format!("{host}:{port}")));
+            pairs.push((format!("LEGION_UPSTREAM_HOST_{label}"), host));
+            pairs.push((format!("LEGION_UPSTREAM_PORT_{label}"), port.to_string()));
         }
         if let Some(resolver) = self.resolver_address() {
             pairs.push(("LEGION_DNS".to_string(), resolver));
@@ -1357,7 +1629,10 @@ impl AllocNetwork {
             // HTTP_PROXY for plain HTTP, and apt reads only lower case.
             // NODE_USE_ENV_PROXY makes Node's built-in fetch and http honor
             // them (Node 22.21 and 24.5 or later; older Node ignores it).
-            let proxy = format!("http://{GATED_PROXY_ADDR}:{GATED_PROXY_PORT}");
+            let proxy = match self.egress_proxy.as_deref() {
+                Some(addr) => format!("http://{addr}"),
+                None => format!("http://{GATED_PROXY_ADDR}:{GATED_PROXY_PORT}"),
+            };
             let no_proxy = format!("localhost,127.0.0.0/8,{SVC_ZONE}");
             pairs.push(("LEGION_EGRESS_PROXY".to_string(), proxy.clone()));
             pairs.push(("LEGION_NETWORK_MODE".to_string(), "gated".to_string()));
@@ -1399,7 +1674,7 @@ impl AllocNetwork {
             .iter()
             .filter_map(|upstream| {
                 Some((
-                    upstream.service.clone(),
+                    upstream.key.clone(),
                     (upstream.vip.clone()?, upstream.canonical_port?),
                 ))
             })
@@ -1470,8 +1745,8 @@ pub struct ServiceEndpointRow {
     pub meta: BTreeMap<String, String>,
     /// `network.ports` entry the service advertises, when it names a label.
     pub port_label: Option<String>,
-    /// The advertised port terminates mesh TLS (`AllocNetwork::ingress_tls`
-    /// is `legion`); consumers must dial it with their node certificate.
+    /// The advertised port terminates mesh TLS (its `AllocPort::mesh`);
+    /// consumers must dial it with their node certificate.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub mesh_tls: bool,
 }
@@ -1575,12 +1850,20 @@ pub fn assign_allocation_ports_with_vips(
         vip_block,
         false,
         false,
+        false,
     )
 }
 
 /// [`assign_allocation_ports_with_vips`] plus, when `ingress` is set, a
 /// second, private port per declared port: the datapath binds the advertised
 /// one and the task binds the private one.
+///
+/// Upstreams: with a VIP block, each upstream's address is its VIP on the
+/// canonical port, and it takes no port from the node's range unless it pins
+/// one (`port`, which also binds `127.0.0.1:<port>`) or `loopback_upstreams`
+/// says the runtime needs a loopback port for each (a sandbox's vsock relay
+/// is keyed by it). Without a VIP block every upstream gets a loopback port.
+#[allow(clippy::too_many_arguments)]
 pub fn assign_allocation_ports_full(
     network: Option<&NetworkConfig>,
     connect: Option<&ConnectConfig>,
@@ -1589,6 +1872,7 @@ pub fn assign_allocation_ports_full(
     vip_block: Option<&str>,
     ingress: bool,
     gated: bool,
+    loopback_upstreams: bool,
 ) -> R<(Vec<AllocPort>, Vec<AllocUpstream>)> {
     const NO_PORTS: &[PortConfig] = &[];
     const NO_UPSTREAMS: &[UpstreamConfig] = &[];
@@ -1612,11 +1896,13 @@ pub fn assign_allocation_ports_full(
                 host_port: static_port,
                 to: port.to,
                 private_port: None,
+                mesh: false,
+                tls: port.tls.clone(),
             });
         }
     }
     for upstream in upstreams {
-        if let Some(local_port) = upstream.local_port {
+        if let Some(local_port) = upstream.port {
             if !taken.insert(local_port) {
                 return Err(anyhow::Error::new(StaticPortInUse::for_upstream(
                     local_port,
@@ -1624,10 +1910,10 @@ pub fn assign_allocation_ports_full(
                 )));
             }
             assigned_upstreams.push(AllocUpstream {
-                service: upstream.key().to_string(),
-                local_port,
+                key: upstream.key(),
+                local_port: Some(local_port),
                 balance: upstream.balance_name(),
-                to: upstream.to.clone(),
+                to: upstream.external_to(),
                 vip: None,
                 canonical_port: None,
             });
@@ -1646,22 +1932,29 @@ pub fn assign_allocation_ports_full(
             host_port,
             to: port.to,
             private_port: None,
+            mesh: false,
+            tls: port.tls.clone(),
         });
     }
+    let loopback = loopback_upstreams || vip_block.is_none();
     for upstream in upstreams {
-        if upstream.local_port.is_some() {
+        if upstream.port.is_some() {
             continue;
         }
-        let local_port = next_dynamic_port(
-            &mut cursor,
-            &mut taken,
-            &format!("upstream '{}' local port", upstream.key()),
-        )?;
+        let local_port = if loopback {
+            Some(next_dynamic_port(
+                &mut cursor,
+                &mut taken,
+                &format!("upstream '{}' local port", upstream.key()),
+            )?)
+        } else {
+            None
+        };
         assigned_upstreams.push(AllocUpstream {
-            service: upstream.key().to_string(),
+            key: upstream.key(),
             local_port,
             balance: upstream.balance_name(),
-            to: upstream.to.clone(),
+            to: upstream.external_to(),
             vip: None,
             canonical_port: None,
         });
@@ -1690,28 +1983,35 @@ pub fn assign_allocation_ports_full(
     // VIPs: in declaration order so `<block>.2` is the first upstream the
     // task wrote, which keeps `legion net doctor` output legible.
     if let Some(block) = vip_block {
-        for upstream in upstreams {
+        for (index, upstream) in upstreams.iter().enumerate() {
             let key = upstream.key();
-            let Some(assigned_upstream) = assigned_upstreams.iter_mut().find(|u| u.service == key)
+            let Some(assigned_upstream) = assigned_upstreams.iter_mut().find(|u| u.key == key)
             else {
                 continue;
             };
-            let index = upstreams.iter().position(|u| u.key() == key).unwrap_or(0);
             let host = usize::from(VIP_FIRST_HOST) + index;
             if host > 254 {
                 bail!("upstream '{key}' has no free VIP in block {block} (at most 253 upstreams per task)");
             }
-            let canonical_port = upstream
-                .local_port
-                .or_else(|| service_ports.get(key.as_ref()).copied())
-                .or_else(|| {
-                    upstream
-                        .to
-                        .as_deref()
-                        .and_then(|to| parse_upstream_target(to).ok())
-                        .map(|target| target.port)
+            let known = upstream
+                .port
+                .or_else(|| service_ports.get(&key).copied())
+                .or_else(|| match upstream.destination() {
+                    Ok(UpstreamDestination::External(target)) => Some(target.port),
+                    _ => None,
                 })
-                .unwrap_or(assigned_upstream.local_port);
+                .or(assigned_upstream.local_port);
+            // A service nobody has declared yet has no port of its own: the
+            // VIP listens on one from the dynamic range, which no other
+            // allocation on the node will be handed.
+            let canonical_port = match known {
+                Some(port) => port,
+                None => next_dynamic_port(
+                    &mut cursor,
+                    &mut taken,
+                    &format!("upstream '{key}' canonical port"),
+                )?,
+            };
             assigned_upstream.vip = Some(format!("{block}.{host}"));
             assigned_upstream.canonical_port = Some(canonical_port);
         }
@@ -1764,6 +2064,16 @@ pub fn normalize_task_network(
         if let Some(chain) = network_config.egress.as_mut() {
             validate_inline_chain(task_name, Direction::Egress, chain)?;
         }
+        for tls in network_config
+            .ports
+            .iter_mut()
+            .filter_map(|port| port.tls.as_mut())
+        {
+            tls.cert.trim();
+            if let Some(clients) = tls.clients.as_mut() {
+                clients.ca.trim();
+            }
+        }
         if let Some(chain) = network_config.ingress.as_mut() {
             validate_inline_chain(task_name, Direction::Ingress, chain)?;
         }
@@ -1799,6 +2109,7 @@ pub fn normalize_task_network(
                 name: label.clone(),
                 static_port,
                 to: None,
+                tls: None,
             });
         }
     }
@@ -1841,6 +2152,12 @@ pub fn validate_task_network(
                     );
                 }
             }
+            if let Some(tls) = &port.tls {
+                tls.validate(&format!(
+                    "task {task_name} network.ports entry '{}' tls",
+                    port.name
+                ))?;
+            }
         }
     }
 
@@ -1865,6 +2182,20 @@ pub fn validate_task_network(
                 );
             }
         }
+        if service_config.mesh == Some(true) {
+            let label = service_config.port_label().unwrap_or_default();
+            let own_tls = network
+                .and_then(|network| network.ports.iter().find(|port| port.name == label))
+                .is_some_and(|port| port.tls.is_some());
+            if own_tls {
+                bail!(
+                    "task {task_name} service.mesh = true, but its port '{label}' also has its own \
+                     tls. A port is either the service's mesh port or carries its own tls, never \
+                     both. Hint: drop the port's tls (the mesh terminates with the node \
+                     certificate), or set service.mesh = false"
+                );
+            }
+        }
     }
 
     Ok(())
@@ -1884,8 +2215,16 @@ pub fn validate_task_connect(
 ) -> R<()> {
     if let Some(service_config) = service {
         for entry in &service_config.allow {
-            if entry.trim().is_empty() {
+            let entry = entry.trim();
+            if entry.is_empty() {
                 bail!("task {task_name} service.allow entries must not be empty");
+            }
+            if entry.contains(':') {
+                bail!(
+                    "task {task_name} service.allow entry '{entry}' names a workload identity; \
+                     allow names jobs (`web`, `payments-*/api`). Match a caller's task with an \
+                     ingress `identity` rule"
+                );
             }
         }
     }
@@ -1905,83 +2244,82 @@ pub fn validate_task_connect(
         }
     }
 
-    let mut services: HashSet<Cow<'_, str>> = HashSet::new();
+    let mut keys: HashSet<String> = HashSet::new();
     let mut local_ports: HashSet<u16> = HashSet::new();
     for upstream in &connect_config.upstreams {
-        let has_service = !upstream.service.trim().is_empty();
-        match (has_service, upstream.is_external()) {
-            (false, false) => bail!(
-                "task {task_name} connect.upstreams entries need a service (a catalog service) or \
-                 a name + to (an external destination)"
-            ),
-            (true, true) => bail!(
-                "task {task_name} connect.upstreams entry '{}' sets both service and to; an \
-                 upstream is either a catalog service or an external destination",
-                upstream.key()
-            ),
-            (false, true) => {
-                if upstream.name.as_deref().is_none_or(|n| n.trim().is_empty()) {
-                    bail!(
-                        "task {task_name} connect.upstreams entry with to = '{}' needs a name \
-                         (it becomes LEGION_UPSTREAM_<NAME>)",
-                        upstream.to.as_deref().unwrap_or_default()
-                    );
-                }
-                parse_upstream_target(upstream.to.as_deref().unwrap_or_default()).map_err(
-                    |err| {
-                        anyhow::anyhow!(
-                            "task {task_name} connect.upstreams entry '{}' to: {err}",
-                            upstream.key()
-                        )
-                    },
-                )?;
-            }
-            (true, false) => validate_upstream_namespace(task_name, upstream)?,
-        }
-        if upstream.is_external() && upstream.namespace.is_some() {
+        let destination = upstream.destination().map_err(|err| {
+            anyhow::anyhow!(
+                "task {task_name} connect.upstreams entry to = {:?}: {err}",
+                upstream.to
+            )
+        })?;
+        if matches!(destination, UpstreamDestination::External(_))
+            && upstream.name.as_deref().is_none_or(|n| n.trim().is_empty())
+        {
             bail!(
-                "task {task_name} connect.upstreams entry '{}' sets namespace on an external \
-                 destination; namespace names where a catalog service lives",
-                upstream.key()
+                "task {task_name} connect.upstreams entry with to = '{}' needs a name \
+                 (it becomes LEGION_UPSTREAM_<NAME>)",
+                upstream.to.trim()
             );
         }
-        if !services.insert(upstream.key()) {
-            bail!(
-                "task {task_name} connect.upstreams declares '{}' more than once",
-                upstream.key()
-            );
+        let key = upstream.key();
+        if !keys.insert(key.clone()) {
+            bail!("task {task_name} connect.upstreams declares '{key}' more than once");
         }
+        validate_upstream_namespace(task_name, upstream)?;
         if let Some(http) = upstream.http.as_ref() {
-            validate_upstream_http(task_name, &upstream.key(), http)?;
+            if !destination.is_http() {
+                bail!(
+                    "task {task_name} connect.upstreams entry '{key}' to = \"{}\" is reached \
+                     over L4, but it has an http block. Hint: write to = \"http://{}\" if it \
+                     speaks HTTP",
+                    upstream.to.trim(),
+                    upstream.to.trim().trim_start_matches("tcp://")
+                );
+            }
+            validate_upstream_http(task_name, &key, http)?;
         }
         validate_upstream_credentials(task_name, upstream)?;
+        if let Some(ca) = upstream.ca.as_ref() {
+            use crate::structs::source::SourceKind;
+            let what = format!("task {task_name} connect.upstreams entry '{key}' ca");
+            let originates = matches!(
+                &destination,
+                UpstreamDestination::External(target) if target.tls
+            );
+            if !originates {
+                bail!(
+                    "{what}: ca pins the trust bundle the node verifies an external tls:// or \
+                     https:// destination against, and '{}' is not one. A catalog service on \
+                     the mesh is verified against the cluster CA",
+                    upstream.to.trim()
+                );
+            }
+            ca.check(&what, &[SourceKind::Kv, SourceKind::File])?;
+        }
         for (index, handler) in upstream.handlers.iter().enumerate() {
             let mut handler = handler.clone();
-            crate::structs::netpolicy::normalize_handler(
-                &format!(
-                    "task {task_name} connect.upstreams entry '{}' handlers[{index}]",
-                    upstream.key()
-                ),
-                &mut handler,
-                upstream.is_http(),
+            handler.normalize(
+                &format!("task {task_name} connect.upstreams entry '{key}' handlers[{index}]"),
+                destination.is_http(),
+                &format!("upstream '{key}' is not HTTP. Give it an http:// or https:// target"),
             )?;
         }
-        if let Some(local_port) = upstream.local_port {
+        if let Some(local_port) = upstream.port {
             if local_port == 0 {
                 bail!(
-                    "task {task_name} connect.upstreams entry '{}' localPort must be greater than 0",
-                    upstream.key()
+                    "task {task_name} connect.upstreams entry '{key}' port must be greater than 0"
                 );
             }
             if !local_ports.insert(local_port) {
                 bail!(
-                    "task {task_name} connect.upstreams declares localPort {local_port} more than once"
+                    "task {task_name} connect.upstreams declares port {local_port} more than once"
                 );
             }
             if static_ports.contains(&local_port) {
                 bail!(
-                    "task {task_name} connect.upstreams entry '{}' localPort {local_port} collides with a static port declared in network.ports",
-                    upstream.key()
+                    "task {task_name} connect.upstreams entry '{key}' port {local_port} collides \
+                     with a static port declared in network.ports"
                 );
             }
         }
@@ -1989,8 +2327,7 @@ pub fn validate_task_connect(
             let normalized = normalize_balance(balance);
             if !is_known_balance(&normalized) {
                 bail!(
-                    "task {task_name} connect.upstreams entry '{}' has unknown balance '{balance}'; valid strategies are {}",
-                    upstream.key(),
+                    "task {task_name} connect.upstreams entry '{key}' has unknown balance '{balance}'; valid strategies are {}",
                     balance_strategies().join(", ")
                 );
             }
@@ -2006,11 +2343,7 @@ pub fn normalize_task_connect(task_name: &str, connect: &mut Option<ConnectConfi
     let Some(connect_config) = connect.as_mut() else {
         return Ok(());
     };
-    let declared: HashSet<String> = connect_config
-        .upstreams
-        .iter()
-        .map(|u| u.key().to_string())
-        .collect();
+    let declared: HashSet<String> = connect_config.upstreams.iter().map(|u| u.key()).collect();
     let mut names: HashSet<String> = HashSet::new();
     for template in connect_config.templates.iter_mut() {
         template.name = template.name.trim().to_string();
@@ -2076,25 +2409,21 @@ pub fn normalize_task_connect(task_name: &str, connect: &mut Option<ConnectConfi
         if let Some(name) = upstream.name.as_mut() {
             *name = name.trim().to_string();
         }
-        if let Some(to) = upstream.to.as_mut() {
-            *to = to.trim().to_string();
-        }
+        upstream.to = upstream.to.trim().to_string();
         for credential in upstream.credentials.iter_mut() {
             credential.header = credential.header.trim().to_ascii_lowercase();
-            if let Some(path) = credential.from.kv.as_mut() {
-                *path = path.trim().to_string();
-            }
-            if let Some(name) = credential.from.identity.as_mut() {
-                *name = name.trim().to_string();
-            }
+            credential.from.trim();
+        }
+        if let Some(ca) = upstream.ca.as_mut() {
+            ca.trim();
         }
         let is_http = upstream.is_http();
-        let key = upstream.key().to_string();
+        let key = upstream.key();
         for (index, handler) in upstream.handlers.iter_mut().enumerate() {
-            crate::structs::netpolicy::normalize_handler(
+            handler.normalize(
                 &format!("task {task_name} connect.upstreams entry '{key}' handlers[{index}]"),
-                handler,
                 is_http,
+                &format!("upstream '{key}' is not HTTP. Give it an http:// or https:// target"),
             )?;
         }
     }
@@ -2143,15 +2472,6 @@ fn validate_upstream_http(task_name: &str, key: &str, http: &UpstreamHttpConfig)
     if total > 100 {
         bail!("{what}.split weights add up to {total}%, which is more than 100%");
     }
-    if let Some(outlier) = http.outlier.as_ref() {
-        if outlier.consecutive_5xx == Some(0) {
-            bail!("{what}.outlier.consecutive5xx must be greater than 0");
-        }
-        if let Some(eject) = outlier.eject_for.as_deref() {
-            parse_duration(eject)
-                .map_err(|err| anyhow::anyhow!("{what}.outlier.ejectFor: {err}"))?;
-        }
-    }
     Ok(())
 }
 
@@ -2199,6 +2519,7 @@ mod tests {
             None,
             true,
             true,
+            false,
         )
         .unwrap();
         assert_eq!(ports[0].name, "admin");
@@ -2212,6 +2533,7 @@ mod tests {
             &HashMap::new(),
             None,
             true,
+            false,
             false,
         )
         .unwrap();
@@ -2298,6 +2620,7 @@ mod tests {
                 name: "web".into(),
                 static_port: Some(8080),
                 to: None,
+                tls: None,
             }],
             ..NetworkConfig::default()
         });
@@ -2313,6 +2636,7 @@ mod tests {
                 name: "http".into(),
                 static_port: None,
                 to: Some(8080),
+                tls: None,
             }],
             ..NetworkConfig::default()
         };
@@ -2331,11 +2655,13 @@ mod tests {
                     name: "http".into(),
                     static_port: None,
                     to: None,
+                    tls: None,
                 },
                 PortConfig {
                     name: "http".into(),
                     static_port: Some(80),
                     to: None,
+                    tls: None,
                 },
             ],
             ..NetworkConfig::default()
@@ -2352,11 +2678,13 @@ mod tests {
                     name: "metrics".into(),
                     static_port: Some(9090),
                     to: None,
+                    tls: None,
                 },
                 PortConfig {
                     name: "http".into(),
                     static_port: None,
                     to: Some(8080),
+                    tls: None,
                 },
             ],
             ..NetworkConfig::default()
@@ -2382,12 +2710,14 @@ mod tests {
                 host_port: 20000,
                 to: Some(8080),
                 private_port: None,
+                mesh: false,
+                tls: None,
             }],
             upstreams: Vec::new(),
             vip_block: None,
             resolver: None,
             mode: None,
-            ingress_tls: None,
+            egress_proxy: None,
         };
 
         let pairs = network.env_pairs();
@@ -2611,25 +2941,25 @@ mod tests {
         };
         let gated = json!({ "mode": "gated" });
         for port in [1080, 53] {
-            let task = with_connect(gated.clone(), json!({ "service": "db", "localPort": port }));
+            let task = with_connect(gated.clone(), json!({ "to": "db", "port": port }));
             let err = validate_gated_sandbox(&task, false).unwrap_err();
             assert_eq!(
                 err,
                 format!(
-                    "task \"workspace\" connect.upstreams entry \"db\" sets localPort {port}, but a \
+                    "task \"workspace\" connect.upstreams entry \"db\" sets port {port}, but a \
                      gated sandbox's upstreams are relayed to the node on vsock ports of the same \
                      number, and 1080 and 53 are the guest's egress proxy and resolver\nHint: pick \
-                     another localPort, or drop it to take a dynamic one"
+                     another port, or drop it to take a dynamic one"
                 )
             );
         }
-        let fine = with_connect(gated.clone(), json!({ "service": "db", "localPort": 5432 }));
+        let fine = with_connect(gated.clone(), json!({ "to": "db", "port": 5432 }));
         assert!(validate_gated_sandbox(&fine, false).is_ok());
         // Off gated networking the agent relays nothing.
         let tap = json!({ "image": "a", "command": ["sh"], "network": { "mode": "tap" } });
         let mut on_tap = task_of("sandbox", None, tap);
         on_tap.connect = fine.connect.clone();
-        on_tap.connect.as_mut().unwrap().upstreams[0].local_port = Some(1080);
+        on_tap.connect.as_mut().unwrap().upstreams[0].port = Some(1080);
         assert!(validate_gated_sandbox(&on_tap, false).is_ok());
 
         for port in [
@@ -2706,22 +3036,22 @@ mod tests {
     }
 
     #[test]
-    fn upstream_config_parses_camel_case_and_snake_case_local_port() {
+    fn upstream_config_parses_to_and_port_test() {
         let config = connect(json!([
-            { "service": "db" },
-            { "service": "cache", "localPort": 6379 },
-            { "service": "web", "local_port": 8080, "balance": "least_conn" },
+            { "to": "db" },
+            { "to": "cache", "port": 6379 },
+            { "to": "web", "port": 8080, "balance": "least_conn" },
         ]));
-        assert_eq!(config.upstreams[0].local_port, None);
+        assert_eq!(config.upstreams[0].port, None);
         assert_eq!(config.upstreams[0].balance_name(), DEFAULT_BALANCE);
-        assert_eq!(config.upstreams[1].local_port, Some(6379));
-        assert_eq!(config.upstreams[2].local_port, Some(8080));
+        assert_eq!(config.upstreams[1].port, Some(6379));
+        assert_eq!(config.upstreams[2].port, Some(8080));
         assert_eq!(config.upstreams[2].balance_name(), "least_conn");
     }
 
     #[test]
     fn balance_name_normalizes_case_and_dashes() {
-        let config = connect(json!([{ "service": "db", "balance": " Least-Conn " }]));
+        let config = connect(json!([{ "to": "db", "balance": " Least-Conn " }]));
         assert_eq!(config.upstreams[0].balance_name(), "least_conn");
         assert!(is_known_balance(&config.upstreams[0].balance_name()));
         assert!(is_known_balance(DEFAULT_BALANCE));
@@ -2737,11 +3067,13 @@ mod tests {
                     name: "http".into(),
                     static_port: Some(8080),
                     to: None,
+                    tls: None,
                 },
                 PortConfig {
                     name: "admin".into(),
                     static_port: None,
                     to: None,
+                    tls: None,
                 },
             ],
             ..NetworkConfig::default()
@@ -2753,6 +3085,7 @@ mod tests {
             &HashMap::new(),
             None,
             true,
+            false,
             false,
         )?;
         assert_eq!(ports.len(), 2);
@@ -2786,16 +3119,18 @@ mod tests {
                     name: "http".into(),
                     static_port: None,
                     to: None,
+                    tls: None,
                 },
                 PortConfig {
                     name: "metrics".into(),
                     static_port: Some(9090),
                     to: None,
+                    tls: None,
                 },
             ],
             ..NetworkConfig::default()
         };
-        let connect_config = connect(json!([{ "service": "db" }, { "service": "cache" }]));
+        let connect_config = connect(json!([{ "to": "db" }, { "to": "cache" }]));
 
         let used: HashSet<u16> = [DYNAMIC_PORT_MIN].into();
         let (ports, upstreams) =
@@ -2806,15 +3141,15 @@ mod tests {
         // Statics first, then dynamics from one shared cursor.
         assert_eq!(ports[0].host_port, 9090);
         assert_eq!(ports[1].host_port, DYNAMIC_PORT_MIN + 1);
-        assert_eq!(upstreams[0].service, "db");
-        assert_eq!(upstreams[0].local_port, DYNAMIC_PORT_MIN + 2);
+        assert_eq!(upstreams[0].key, "db");
+        assert_eq!(upstreams[0].local_port, Some(DYNAMIC_PORT_MIN + 2));
         assert_eq!(upstreams[0].balance, DEFAULT_BALANCE);
-        assert_eq!(upstreams[1].local_port, DYNAMIC_PORT_MIN + 3);
+        assert_eq!(upstreams[1].local_port, Some(DYNAMIC_PORT_MIN + 3));
 
         let all: HashSet<u16> = ports
             .iter()
             .map(|port| port.host_port)
-            .chain(upstreams.iter().map(|upstream| upstream.local_port))
+            .chain(upstreams.iter().filter_map(|upstream| upstream.local_port))
             .collect();
         assert_eq!(all.len(), 4, "assigned ports must all be distinct");
         Ok(())
@@ -2823,14 +3158,14 @@ mod tests {
     #[test]
     fn upstream_static_local_port_is_honored_and_conflicts_name_the_port() -> R<()> {
         let connect_config = connect(json!([
-            { "service": "cache", "localPort": 6379 },
-            { "service": "db" },
+            { "to": "cache", "port": 6379 },
+            { "to": "db" },
         ]));
 
         let upstreams = assign_upstream_ports(&connect_config, &HashSet::new())?;
-        assert_eq!(upstreams[0].service, "cache");
-        assert_eq!(upstreams[0].local_port, 6379);
-        assert_eq!(upstreams[1].local_port, DYNAMIC_PORT_MIN);
+        assert_eq!(upstreams[0].key, "cache");
+        assert_eq!(upstreams[0].local_port, Some(6379));
+        assert_eq!(upstreams[1].local_port, Some(DYNAMIC_PORT_MIN));
 
         let taken: HashSet<u16> = [6379].into();
         let err = assign_upstream_ports(&connect_config, &taken).unwrap_err();
@@ -2846,10 +3181,11 @@ mod tests {
                 name: "http".into(),
                 static_port: Some(6379),
                 to: None,
+                tls: None,
             }],
             ..NetworkConfig::default()
         };
-        let connect_config = connect(json!([{ "service": "cache", "localPort": 6379 }]));
+        let connect_config = connect(json!([{ "to": "cache", "port": 6379 }]));
         let err = assign_allocation_ports(Some(&network), Some(&connect_config), &HashSet::new())
             .unwrap_err();
         assert!(err.to_string().contains("static local port 6379"), "{err}");
@@ -2861,8 +3197,8 @@ mod tests {
             address: Some("10.0.0.5".into()),
             ports: Vec::new(),
             upstreams: vec![AllocUpstream {
-                service: "user-db".into(),
-                local_port: 20003,
+                key: "user-db".into(),
+                local_port: Some(20003),
                 balance: DEFAULT_BALANCE.into(),
                 to: None,
                 vip: None,
@@ -2871,7 +3207,7 @@ mod tests {
             vip_block: None,
             resolver: None,
             mode: None,
-            ingress_tls: None,
+            egress_proxy: None,
         };
 
         let lookup: std::collections::HashMap<_, _> = network.env_pairs().into_iter().collect();
@@ -2910,13 +3246,14 @@ mod tests {
                 name: "http".into(),
                 static_port: Some(8080),
                 to: None,
+                tls: None,
             }],
             ..NetworkConfig::default()
         };
         let connect_config = connect(json!([
-            { "service": "db" },
-            { "service": "cache", "localPort": 6379 },
-            { "service": "web", "balance": "least_conn" },
+            { "to": "db" },
+            { "to": "cache", "port": 6379 },
+            { "to": "web", "balance": "least_conn" },
         ]));
         let svc: ServiceConfig =
             serde_json::from_value(json!({ "port": "http", "allow": ["gateway"] }))?;
@@ -2928,7 +3265,7 @@ mod tests {
 
     #[test]
     fn validate_connect_rejects_duplicate_upstream_service() {
-        let connect_config = connect(json!([{ "service": "db" }, { "service": "db" }]));
+        let connect_config = connect(json!([{ "to": "db" }, { "to": "db" }]));
         let err = validate_task_connect("api", None, Some(&connect_config), None).unwrap_err();
         assert!(
             err.to_string().contains("declares 'db' more than once"),
@@ -2940,21 +3277,17 @@ mod tests {
     #[test]
     fn crossing_upstreams_key_by_service_and_namespace() {
         let config = connect(json!([
-            { "service": "redis" },
-            { "service": "auth", "namespace": "shared" },
-            { "service": "shared/billing" },
-            { "service": "ledger", "namespace": "shared", "name": "books" },
+            { "to": "redis" },
+            { "to": "auth", "namespace": "shared" },
+            { "to": "http://billing", "namespace": "shared" },
+            { "to": "ledger", "namespace": "shared", "name": "books" },
         ]));
-        let keys: Vec<String> = config
-            .upstreams
-            .iter()
-            .map(|u| u.key().into_owned())
-            .collect();
+        let keys: Vec<String> = config.upstreams.iter().map(|u| u.key()).collect();
         assert_eq!(keys, ["redis", "auth.shared", "billing.shared", "books"]);
         let refs: Vec<String> = config
             .upstreams
             .iter()
-            .map(|u| u.service_ref("checkout/api"))
+            .map(|u| u.service_ref("checkout/api").unwrap())
             .collect();
         assert_eq!(
             refs,
@@ -2967,10 +3300,12 @@ mod tests {
         );
         // A bare service from `default` stays in `default`; a crossing into
         // `default` is the bare id.
-        assert_eq!(config.upstreams[0].service_ref("api"), "redis");
-        let into_default = connect(json!([{ "service": "auth", "namespace": "default" }]));
+        assert_eq!(config.upstreams[0].service_ref("api").unwrap(), "redis");
+        let into_default = connect(json!([{ "to": "auth", "namespace": "default" }]));
         assert_eq!(
-            into_default.upstreams[0].service_ref("checkout/api"),
+            into_default.upstreams[0]
+                .service_ref("checkout/api")
+                .unwrap(),
             "auth"
         );
         assert!(validate_task_connect("api", None, Some(&config), None).is_ok());
@@ -2980,13 +3315,8 @@ mod tests {
     fn validate_connect_rejects_bad_or_conflicting_upstream_namespaces() {
         for (upstreams, expect) in [
             (
-                json!([{ "service": "auth", "namespace": "Shared" }]),
+                json!([{ "to": "auth", "namespace": "Shared" }]),
                 "namespace",
-            ),
-            (json!([{ "service": "a/b/c" }]), "namespace/name"),
-            (
-                json!([{ "service": "shared/auth", "namespace": "other" }]),
-                "write one of them",
             ),
             (
                 json!([{ "name": "x", "to": "https://example.com", "namespace": "shared" }]),
@@ -3000,17 +3330,96 @@ mod tests {
         }
         // Two upstreams for the same service in two namespaces are distinct.
         let both = connect(json!([
-            { "service": "auth" },
-            { "service": "auth", "namespace": "shared" },
+            { "to": "auth" },
+            { "to": "auth", "namespace": "shared" },
         ]));
         assert!(validate_task_connect("api", None, Some(&both), None).is_ok());
     }
 
     #[test]
+    fn to_names_a_catalog_service_or_an_external_url_test() {
+        let catalog = |to: &str, http: bool| {
+            assert_eq!(
+                parse_upstream_to(to).unwrap(),
+                UpstreamDestination::Catalog {
+                    service: "db".into(),
+                    http
+                },
+                "{to}"
+            );
+        };
+        catalog("db", false);
+        catalog(" tcp://db ", false);
+        catalog("db.svc.legion", false);
+        catalog("http://db", true);
+        catalog("http://db.svc.legion/", true);
+        let external = |to: &str| match parse_upstream_to(to).unwrap() {
+            UpstreamDestination::External(target) => target,
+            other => panic!("{to}: {other:?}"),
+        };
+        assert_eq!(external("https://api.openai.com").port, 443);
+        assert!(external("https://api.openai.com").http);
+        assert_eq!(external("tcp://10.0.0.5:5432").host, "10.0.0.5");
+        // A dotless external host carries its port.
+        assert_eq!(external("http://wiki:80").host, "wiki");
+        for (to, why) in [
+            ("https://db", "reached over the mesh"),
+            ("tls://db", "reached over the mesh"),
+            ("api.example.com", "needs a scheme"),
+            ("db:5432", "needs a scheme"),
+            ("bad name", "not a service name"),
+            ("", "to is required"),
+        ] {
+            let err = parse_upstream_to(to).unwrap_err().to_string();
+            assert!(err.contains(why), "{to}: {err}");
+        }
+    }
+
+    #[test]
+    fn a_tcp_upstream_under_an_http_chain_warns_at_submit_test() {
+        let job: crate::structs::JobConfig = serde_json::from_value(json!({
+            "name": "api",
+            "task": {
+                "runtime": "exec",
+                "connect": { "upstreams": [{ "to": "db" }, { "to": "http://search" }] },
+                "network": { "egress": {
+                    "protocol": "http", "policy": "deny",
+                    "rules": [{ "when": { "path": "/v1/**" }, "action": "allow" }]
+                } }
+            }
+        }))
+        .unwrap();
+        let warnings = tcp_upstream_http_chain_warnings(&job, |_| Vec::new());
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(
+            warnings[0].contains("upstream 'db' is tcp://"),
+            "{}",
+            warnings[0]
+        );
+        assert!(warnings[0].contains("task#0"), "{}", warnings[0]);
+        // A host rule ahead of the path rule decides it at connect.
+        let mut job = job;
+        job.tasks[0]
+            .network
+            .as_mut()
+            .unwrap()
+            .egress
+            .as_mut()
+            .unwrap()
+            .rules
+            .insert(
+                0,
+                serde_json::from_value(json!({ "when": { "host": "db" }, "action": "allow" }))
+                    .unwrap(),
+            );
+        assert!(tcp_upstream_http_chain_warnings(&job, |_| Vec::new()).is_empty());
+    }
+
+    #[test]
     fn validate_connect_rejects_empty_upstream_service() {
-        let connect_config = connect(json!([{ "service": "  " }]));
+        let connect_config = connect(json!([{ "to": "  " }]));
         let err = validate_task_connect("api", None, Some(&connect_config), None).unwrap_err();
-        assert!(err.to_string().contains("need a service"), "{err}");
+        assert!(err.to_string().contains("to is required"), "{err}");
     }
 
     #[test]
@@ -3040,20 +3449,23 @@ mod tests {
         let bad = connect(json!([{ "to": "https://api.openai.com" }]));
         let err = validate_task_connect("api", None, Some(&bad), None).unwrap_err();
         assert!(err.to_string().contains("needs a name"), "{err}");
-        let bad = connect(json!([{ "service": "db", "to": "tcp://x:1" }]));
+        // A catalog service is not reached over TLS by the task: that is the
+        // mesh's job.
+        let bad = connect(json!([{ "to": "https://search" }]));
         let err = validate_task_connect("api", None, Some(&bad), None).unwrap_err();
-        assert!(err.to_string().contains("both service and to"), "{err}");
-        let bad = connect(json!([{ "name": "x", "to": "nope" }]));
-        assert!(validate_task_connect("api", None, Some(&bad), None).is_err());
+        assert!(err.to_string().contains("reached over the mesh"), "{err}");
+        // A dotted host with no scheme is neither a service nor a URL.
+        let bad = connect(json!([{ "name": "x", "to": "api.example.com" }]));
+        let err = validate_task_connect("api", None, Some(&bad), None).unwrap_err();
+        assert!(err.to_string().contains("needs a scheme"), "{err}");
 
         // An external upstream keys by name and carries its destination.
-        let ok = connect(
-            json!([{ "name": "openai", "to": "https://api.openai.com", "localPort": 8443 }]),
-        );
+        let ok =
+            connect(json!([{ "name": "openai", "to": "https://api.openai.com", "port": 8443 }]));
         validate_task_connect("api", None, Some(&ok), None).unwrap();
         let (_, upstreams) = assign_allocation_ports(None, Some(&ok), &HashSet::new()).unwrap();
-        assert_eq!(upstreams[0].service, "openai");
-        assert_eq!(upstreams[0].local_port, 8443);
+        assert_eq!(upstreams[0].key, "openai");
+        assert_eq!(upstreams[0].local_port, Some(8443));
         assert_eq!(upstreams[0].to.as_deref(), Some("https://api.openai.com"));
         let env = AllocNetwork {
             upstreams: upstreams.clone(),
@@ -3065,28 +3477,46 @@ mod tests {
             .any(|(k, v)| k == "LEGION_UPSTREAM_OPENAI" && v == "127.0.0.1:8443"));
 
         // Handlers on an upstream are validated like a chain's.
-        let bad = connect(json!([{ "service": "db", "handlers": [{ "handler": "wasm" }] }]));
-        assert!(validate_task_connect("api", None, Some(&bad), None).is_err());
+        assert!(serde_json::from_value::<ConnectConfig>(
+            json!({ "upstreams": [{ "to": "db", "handlers": [{ "wasm": {} }] }] })
+        )
+        .is_err());
         let bad = connect(
-            json!([{ "name": "o", "to": "tcp://x:1", "handlers": [{ "handler": "dlp", "config": { "patterns": ["x"] } }] }]),
+            json!([{ "name": "o", "to": "tcp://x:1", "handlers": [{ "dlp": { "patterns": ["x"] } }] }]),
         );
         let err = validate_task_connect("api", None, Some(&bad), None).unwrap_err();
-        assert!(err.to_string().contains("protocol = \"http\""), "{err}");
+        assert!(err.to_string().contains("stage \"body\""), "{err}");
+        assert!(
+            err.to_string().contains("upstream 'o' is not HTTP"),
+            "{err}"
+        );
         let ok = connect(
-            json!([{ "name": "o", "to": "https://x", "handlers": [{ "handler": "dlp", "config": { "patterns": ["x"] } }] }]),
+            json!([{ "name": "o", "to": "https://x.example", "handlers": [{ "dlp": { "patterns": ["x"] } }] }]),
         );
         validate_task_connect("api", None, Some(&ok), None).unwrap();
 
         // http traffic-management block validation.
         let bad = connect(
-            json!([{ "service": "api", "http": { "split": [{ "tag": "a", "weight": 60 }, { "tag": "b", "weight": 60 }] } }]),
+            json!([{ "to": "http://api", "http": { "split": [{ "tag": "a", "weight": 60 }, { "tag": "b", "weight": 60 }] } }]),
         );
         let err = validate_task_connect("api", None, Some(&bad), None).unwrap_err();
         assert!(err.to_string().contains("more than 100%"), "{err}");
         let ok = connect(
-            json!([{ "service": "api", "http": { "timeout": "3s", "retries": { "attempts": 2, "budget": "20%" }, "outlier": { "consecutive5xx": 5, "ejectFor": "30s" } } }]),
+            json!([{ "to": "http://api", "http": { "timeout": "3s", "retries": { "attempts": 2, "budget": "20%" } } }]),
         );
         validate_task_connect("api", None, Some(&ok), None).unwrap();
+        // An http block needs an upstream that speaks HTTP; the scheme says so.
+        let bad = connect(json!([{ "to": "api", "http": { "timeout": "3s" } }]));
+        let err = validate_task_connect("api", None, Some(&bad), None).unwrap_err();
+        assert!(
+            err.to_string().contains("write to = \"http://api\""),
+            "{err}"
+        );
+        // Outlier ejection has no knob.
+        assert!(serde_json::from_value::<ConnectConfig>(json!({
+            "upstreams": [{ "to": "http://api", "http": { "outlier": { "consecutive5xx": 5 } } }]
+        }))
+        .is_err());
     }
 
     #[test]
@@ -3108,7 +3538,7 @@ mod tests {
         }]))
         .unwrap();
         let mut normalized = Some(connect(
-            json!([{ "name": "a", "to": "https://x", "credentials": [{ "header": " X-Api-Key ", "from": { "kv": " secrets/a " } }] }]),
+            json!([{ "name": "a", "to": "https://x.example", "credentials": [{ "header": " X-Api-Key ", "from": { "kv": " secrets/a " } }] }]),
         ));
         normalize_task_connect("api", &mut normalized).unwrap();
         let credential = &normalized.unwrap().upstreams[0].credentials[0];
@@ -3126,8 +3556,7 @@ mod tests {
                 .unwrap_err();
             assert!(err.contains("no request head"), "{err}");
         }
-        let err =
-            check(json!([{ "service": "db", "credentials": [cred("x-api-key")] }])).unwrap_err();
+        let err = check(json!([{ "to": "db", "credentials": [cred("x-api-key")] }])).unwrap_err();
         assert!(err.contains("external https://"), "{err}");
 
         // Header names: valid, not hop-by-hop or host, at most once.
@@ -3137,47 +3566,51 @@ mod tests {
             "proxy-authorization",
             "transfer-encoding",
         ] {
-            let err =
-                check(json!([{ "name": "o", "to": "https://x", "credentials": [cred(header)] }]))
-                    .unwrap_err();
+            let err = check(
+                json!([{ "name": "o", "to": "https://x.example", "credentials": [cred(header)] }]),
+            )
+            .unwrap_err();
             assert!(err.contains("cannot be injected"), "{header}: {err}");
         }
         let err =
-            check(json!([{ "name": "o", "to": "https://x", "credentials": [cred("bad header")] }]))
+            check(json!([{ "name": "o", "to": "https://x.example", "credentials": [cred("bad header")] }]))
                 .unwrap_err();
         assert!(err.contains("not a valid HTTP header name"), "{err}");
-        let err = check(json!([{ "name": "o", "to": "https://x", "credentials": [cred("")] }]))
-            .unwrap_err();
+        let err =
+            check(json!([{ "name": "o", "to": "https://x.example", "credentials": [cred("")] }]))
+                .unwrap_err();
         assert!(err.contains("header is required"), "{err}");
-        let err = check(json!([{ "name": "o", "to": "https://x", "credentials": [cred("X-Api-Key"), cred("x-api-key")] }])).unwrap_err();
+        let err = check(json!([{ "name": "o", "to": "https://x.example", "credentials": [cred("X-Api-Key"), cred("x-api-key")] }])).unwrap_err();
         assert!(err.contains("more than once"), "{err}");
 
         // A provider is required, and its path non-empty.
-        let err = check(json!([{ "name": "o", "to": "https://x", "credentials": [{ "header": "x", "from": { "kv": "  " } }] }])).unwrap_err();
-        assert!(err.contains("must name a KV path"), "{err}");
-        let err = check(json!([{ "name": "o", "to": "https://x", "credentials": [{ "header": "x", "from": {} }] }])).unwrap_err();
-        assert!(err.contains("needs a provider"), "{err}");
+        let err = check(json!([{ "name": "o", "to": "https://x.example", "credentials": [{ "header": "x", "from": { "kv": "  " } }] }])).unwrap_err();
+        assert!(err.contains("kv is empty"), "{err}");
+        // `from` is one source: no key, or two, is a parse error.
+        assert!(serde_json::from_value::<ConnectConfig>(json!({ "upstreams": [{ "name": "o", "to": "https://x.example", "credentials": [{ "header": "x", "from": {} }] }] })).is_err());
+        assert!(serde_json::from_value::<ConnectConfig>(json!({ "upstreams": [{ "name": "o", "to": "https://x.example", "credentials": [{ "header": "x", "from": { "kv": "a", "identity": "b" } }] }] })).is_err());
+        // Credentials never come from a node's disk.
+        let err = check(json!([{ "name": "o", "to": "https://x.example", "credentials": [{ "header": "x", "from": { "file": "/etc/key" } }] }])).unwrap_err();
+        assert!(err.contains("file source is not allowed"), "{err}");
         // Unknown providers are a parse error, not silently ignored.
-        assert!(serde_json::from_value::<ConnectConfig>(json!({ "upstreams": [{ "name": "o", "to": "https://x", "credentials": [{ "header": "x", "from": { "vault": "a" } }] }] })).is_err());
-        let err = check(json!([{ "name": "o", "to": "https://x", "credentials": [{ "header": "x", "prefix": "a\r\nb", "from": { "kv": "k" } }] }])).unwrap_err();
+        assert!(serde_json::from_value::<ConnectConfig>(json!({ "upstreams": [{ "name": "o", "to": "https://x.example", "credentials": [{ "header": "x", "from": { "vault": "a" } }] }] })).is_err());
+        let err = check(json!([{ "name": "o", "to": "https://x.example", "credentials": [{ "header": "x", "prefix": "a\r\nb", "from": { "kv": "k" } }] }])).unwrap_err();
         assert!(err.contains("CR, LF"), "{err}");
 
         // The identity provider: a valid name, one provider at a time, and
         // never the control-plane identity.
-        check(json!([{ "name": "o", "to": "https://x", "credentials": [{ "header": "authorization", "prefix": "Bearer ", "from": { "identity": "api" } }] }]))
+        check(json!([{ "name": "o", "to": "https://x.example", "credentials": [{ "header": "authorization", "prefix": "Bearer ", "from": { "identity": "api" } }] }]))
             .unwrap();
         let mut normalized = Some(connect(
-            json!([{ "name": "a", "to": "https://x", "credentials": [{ "header": "authorization", "from": { "identity": " api " } }] }]),
+            json!([{ "name": "a", "to": "https://x.example", "credentials": [{ "header": "authorization", "from": { "identity": " api " } }] }]),
         ));
         normalize_task_connect("api", &mut normalized).unwrap();
         let credential = &normalized.unwrap().upstreams[0].credentials[0];
         assert_eq!(credential.identity_name(), Some("api"));
         assert_eq!(credential.source(), "identity api");
-        let err = check(json!([{ "name": "o", "to": "https://x", "credentials": [{ "header": "x", "from": { "kv": "k", "identity": "api" } }] }])).unwrap_err();
-        assert!(err.contains("two providers"), "{err}");
-        let err = check(json!([{ "name": "o", "to": "https://x", "credentials": [{ "header": "x", "from": { "identity": "../x" } }] }])).unwrap_err();
+        let err = check(json!([{ "name": "o", "to": "https://x.example", "credentials": [{ "header": "x", "from": { "identity": "../x" } }] }])).unwrap_err();
         assert!(err.contains("from.identity"), "{err}");
-        let err = check(json!([{ "name": "o", "to": "https://x", "credentials": [{ "header": "x", "from": { "identity": "legion" } }] }])).unwrap_err();
+        let err = check(json!([{ "name": "o", "to": "https://x.example", "credentials": [{ "header": "x", "from": { "identity": "legion" } }] }])).unwrap_err();
         assert!(err.contains("control-plane identity"), "{err}");
     }
 
@@ -3193,10 +3626,10 @@ mod tests {
         assert!(next_vip_block(&used_blocks).is_err());
 
         let connect = connect(json!([
-            { "service": "db" },
-            { "service": "cache", "localPort": 6379 },
+            { "to": "db" },
+            { "to": "cache", "port": 6379 },
             { "name": "openai", "to": "https://api.openai.com" },
-            { "service": "unknown" }
+            { "to": "unknown" }
         ]));
         let service_ports: HashMap<String, u16> = [("db".to_string(), 5432)].into_iter().collect();
         let (_, upstreams) = assign_allocation_ports_with_vips(
@@ -3207,7 +3640,7 @@ mod tests {
             Some("127.42.7"),
         )
         .unwrap();
-        let by_key = |key: &str| upstreams.iter().find(|u| u.service == key).unwrap().clone();
+        let by_key = |key: &str| upstreams.iter().find(|u| u.key == key).unwrap().clone();
         assert_eq!(by_key("db").vip.as_deref(), Some("127.42.7.2"));
         assert_eq!(
             by_key("db").canonical_port,
@@ -3218,7 +3651,7 @@ mod tests {
         assert_eq!(
             by_key("cache").canonical_port,
             Some(6379),
-            "a pinned localPort wins"
+            "a pinned port wins"
         );
         assert_eq!(
             by_key("openai").canonical_port,
@@ -3226,11 +3659,13 @@ mod tests {
             "an external target's port"
         );
         let unknown = by_key("unknown");
-        assert_eq!(
-            unknown.canonical_port,
-            Some(unknown.local_port),
-            "falls back to the dynamic port"
+        assert!(
+            unknown.canonical_port >= Some(DYNAMIC_PORT_MIN),
+            "falls back to a port from the dynamic range"
         );
+        // With a VIP block only a pinned port is bound on loopback.
+        assert_eq!(by_key("db").local_port, None);
+        assert_eq!(by_key("cache").local_port, Some(6379));
 
         let network = AllocNetwork {
             upstreams: upstreams.clone(),
@@ -3242,12 +3677,20 @@ mod tests {
         assert!(env
             .iter()
             .any(|(k, v)| k == "LEGION_DNS" && v == "127.42.7.1"));
+        // One address per upstream: the VIP on the canonical port, and its
+        // parts.
         assert!(env
             .iter()
-            .any(|(k, v)| k == "LEGION_UPSTREAM_HOST_DB" && v == "db.svc.legion"));
+            .any(|(k, v)| k == "LEGION_UPSTREAM_DB" && v == "127.42.7.2:5432"));
         assert!(env
             .iter()
-            .any(|(k, v)| k == "LEGION_UPSTREAM_VIP_DB" && v == "127.42.7.2:5432"));
+            .any(|(k, v)| k == "LEGION_UPSTREAM_HOST_DB" && v == "127.42.7.2"));
+        assert!(env
+            .iter()
+            .any(|(k, v)| k == "LEGION_UPSTREAM_PORT_DB" && v == "5432"));
+        assert!(!env
+            .iter()
+            .any(|(k, _)| k.starts_with("LEGION_UPSTREAM_VIP_")));
         assert_eq!(network.vip_names()["db"], ("127.42.7.2".to_string(), 5432));
 
         // Without a block nothing changes, including the env.
@@ -3260,24 +3703,25 @@ mod tests {
             ..Default::default()
         }
         .env_pairs();
-        assert!(!env
+        assert!(!env.iter().any(|(k, _)| k == "LEGION_DNS"));
+        assert!(env
             .iter()
-            .any(|(k, _)| k == "LEGION_DNS" || k.starts_with("LEGION_UPSTREAM_HOST_")));
+            .any(|(k, v)| k == "LEGION_UPSTREAM_HOST_DB" && v == "127.0.0.1"));
     }
 
     #[test]
     fn validate_connect_rejects_duplicate_and_zero_local_ports() {
         let duplicate = connect(json!([
-            { "service": "db", "localPort": 6379 },
-            { "service": "cache", "localPort": 6379 },
+            { "to": "db", "port": 6379 },
+            { "to": "cache", "port": 6379 },
         ]));
         let err = validate_task_connect("api", None, Some(&duplicate), None).unwrap_err();
         assert!(
-            err.to_string().contains("localPort 6379 more than once"),
+            err.to_string().contains("port 6379 more than once"),
             "{err}"
         );
 
-        let zero = connect(json!([{ "service": "db", "localPort": 0 }]));
+        let zero = connect(json!([{ "to": "db", "port": 0 }]));
         let err = validate_task_connect("api", None, Some(&zero), None).unwrap_err();
         assert!(err.to_string().contains("must be greater than 0"), "{err}");
     }
@@ -3289,10 +3733,11 @@ mod tests {
                 name: "http".into(),
                 static_port: Some(8080),
                 to: None,
+                tls: None,
             }],
             ..NetworkConfig::default()
         };
-        let connect_config = connect(json!([{ "service": "db", "localPort": 8080 }]));
+        let connect_config = connect(json!([{ "to": "db", "port": 8080 }]));
         let err =
             validate_task_connect("api", Some(&network), Some(&connect_config), None).unwrap_err();
         assert!(
@@ -3304,7 +3749,7 @@ mod tests {
 
     #[test]
     fn validate_connect_rejects_unknown_balance_and_lists_valid_names() {
-        let connect_config = connect(json!([{ "service": "db", "balance": "magic" }]));
+        let connect_config = connect(json!([{ "to": "db", "balance": "magic" }]));
         let err = validate_task_connect("api", None, Some(&connect_config), None).unwrap_err();
         let message = err.to_string();
         assert!(message.contains("unknown balance 'magic'"), "{message}");
@@ -3319,7 +3764,7 @@ mod tests {
         // strategy the worker can build is always submittable — and one it
         // cannot build is always rejected.
         for name in balance_strategies() {
-            let connect_config = connect(json!([{ "service": "db", "balance": name }]));
+            let connect_config = connect(json!([{ "to": "db", "balance": name }]));
             validate_task_connect("api", None, Some(&connect_config), None)
                 .unwrap_or_else(|err| panic!("registered strategy {name} rejected: {err}"));
             assert!(crate::worker::balance::balancer(name).is_ok());
@@ -3369,5 +3814,54 @@ mod tests {
         // A bare entry still means the owner's namespace, and globs.
         assert!(allow_permits(&["web-*".into()], "web", "web-2"));
         assert!(!allow_permits(&["web".into()], "prod/x", "web"));
+    }
+
+    /// `service.mesh` and a port's own `tls` are exclusive, sources are
+    /// checked per field, and an upstream `ca` needs an external TLS
+    /// destination.
+    #[test]
+    fn mesh_port_tls_and_upstream_ca_validate_test() {
+        let network: NetworkConfig = serde_json::from_value(json!({
+            "ports": [
+                { "name": "http" },
+                { "name": "admin", "tls": {
+                    "cert": { "file": { "cert": "/etc/a.crt", "key": "/etc/a.key" } },
+                    "clients": { "ca": { "kv": "certs/admin-ca" } },
+                } },
+            ],
+        }))
+        .unwrap();
+        let mesh: ServiceConfig =
+            serde_json::from_value(json!({ "port": "http", "mesh": true })).unwrap();
+        validate_task_network("api", Some(&network), Some(&mesh)).unwrap();
+        let on_tls_port: ServiceConfig =
+            serde_json::from_value(json!({ "port": "admin", "mesh": true })).unwrap();
+        let err = validate_task_network("api", Some(&network), Some(&on_tls_port))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("never both"), "{err}");
+
+        let bad: NetworkConfig = serde_json::from_value(json!({
+            "ports": [{ "name": "https", "tls": { "cert": { "identity": "api" } } }],
+        }))
+        .unwrap();
+        let err = validate_task_network("api", Some(&bad), None)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("identity source is not allowed"), "{err}");
+
+        let check = |upstreams: Value| {
+            validate_task_connect("api", None, Some(&connect(upstreams)), None)
+                .map_err(|e| e.to_string())
+        };
+        check(json!([{ "name": "corp", "to": "https://api.corp.example", "ca": { "kv": "certs/corp-ca" } }]))
+            .unwrap();
+        let err = check(json!([{ "to": "db", "ca": { "kv": "certs/ca" } }])).unwrap_err();
+        assert!(err.contains("not one"), "{err}");
+        let err = check(
+            json!([{ "name": "x", "to": "http://x.example", "ca": { "file": "/etc/ca.pem" } }]),
+        )
+        .unwrap_err();
+        assert!(err.contains("not one"), "{err}");
     }
 }

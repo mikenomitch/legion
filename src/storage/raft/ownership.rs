@@ -172,6 +172,9 @@ const TABLE_OWNERS: &[(&str, Owner)] = &[
     // bumped inside the same replicated write.
     ("net_policy", Owner::Lane(Lane::Control)),
     ("net_policy_meta", Owner::Lane(Lane::Control)),
+    // Network plugin objects (docs/network-plugins.md): like policy objects.
+    ("net_plugin", Owner::Lane(Lane::Control)),
+    ("net_plugin_meta", Owner::Lane(Lane::Control)),
     // Namespaces (docs/namespaces.md): operator intent, written by
     // ApplyNamespace/DeleteNamespace. Control lane with `job`, so the
     // "delete only if empty" check and the delete are one entry.

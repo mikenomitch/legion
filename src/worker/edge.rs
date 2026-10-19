@@ -538,6 +538,8 @@ mod worker_edge_test {
             task_lifecycle: String::new(),
             task_restart: String::new(),
             task_speculative_start: String::new(),
+            task_group: String::new(),
+            task_service: String::new(),
         }
     }
 

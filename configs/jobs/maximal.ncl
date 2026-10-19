@@ -183,8 +183,7 @@
                 # `container` on a Linux node and `host` everywhere else
                 # (exec, macOS; sandboxes per docs/task-runtime-sandbox.md).
                 # `host` opts a container out. A `require` policy can impose
-                # a mode for a pool. `bridge` / `cni/<name>` are reserved for
-                # the datapath plugin.
+                # a mode for a pool.
                 mode = "auto",
                 ports = [
                     # Gated: the datapath owns the host port and forwards to
@@ -192,6 +191,25 @@
                     # port (macOS publishes it to 8080).
                     { name = "http", to = 8080 },
                     { name = "metrics", static = 9090 },  # fixed host port
+                    # TLS the node terminates on this port with a certificate
+                    # that is not the mesh's (docs/network-handlers.md, "TLS
+                    # on ports"); the task speaks plaintext on its private
+                    # port. `cert` is { kv = "<path>" } (one PEM bundle: the
+                    # chain, then the key; swapped live on `kv put`; the
+                    # submitter needs kv read on it) or { file = { cert, key } }
+                    # (or one `file` holding both) on the node. `clients`
+                    # makes the port mutual: client certificates must verify
+                    # against `ca` ({ kv } or { file }), and the verified
+                    # identity (URI SAN, else DNS SAN, else CN) feeds
+                    # `identity` rules and `authz`. Never on the service's
+                    # mesh port.
+                    {
+                        name = "admin",
+                        tls = {
+                            cert = { kv = "certs/admin.example.com" },
+                            clients = { ca = { kv = "certs/admin-clients" } },
+                        },
+                    },
                 ],
                 # Attribution keys carried on every net.denied event and
                 # access-log line (never on a metric label). Stored policies
@@ -203,7 +221,6 @@
                 egress = {
                     protocol = "tcp",         # tcp (default) | http — never inferred
                     policy = "deny",          # fallthrough: allow | deny (deny when `allow` is used)
-                    onError = "deny",         # what a failed handler means: deny | allow
                     accessLog = false,
                     # Sugar: host, host:port, cidr, cidr:port — and host/path
                     # once protocol = "http". Desugars to allow rules ahead of
@@ -218,42 +235,35 @@
                     ],
                     # Handlers: code on the path, only when policy is not
                     # enough, run in order after the rules allow the flow.
+                    # Each is written as its kind, with the kind's settings
+                    # inside it:
                     # authz = a webhook verdict, cached per (identity,
                     # destination) for `cache` (default 10s, max 5m);
                     # proxy = hand the flow to any proxy (PROXY v2 header on
-                    # TCP, Legion-* headers on HTTP) by catalog service /
-                    # node-local service / a sidecar's port label;
-                    # log; dlp (HTTP bodies, needs protocol = "http").
-                    # Every hop: timeout (default 2s) and onError (deny).
+                    # TCP, Legion-* headers on HTTP): a catalog `service`
+                    # (`local = true` for its endpoints on this node only) or
+                    # a sidecar's `port` label;
+                    # dlp = reject HTTP bodies that match (needs HTTP).
+                    # Every hop: timeout (default 2s) and onError (what a
+                    # failed hop means: deny, the default, or allow).
                     handlers = [
-                        { handler = "authz", url = "http://policy.internal/check", cache = "30s", timeout = "2s", onError = "deny" },
-                        { handler = "proxy", service = "egress-filter", proxyProtocol = true, onError = "deny" },
+                        { authz = { url = "http://policy.internal/check", cache = "30s" }, timeout = "2s", onError = "deny" },
+                        { proxy = { service = "egress-filter", local = true, proxyProtocol = true }, onError = "deny" },
                     ],
                 },
                 # Inline ingress policy in front of this task's advertised
                 # ports: the datapath binds the advertised port, the task
                 # binds a private twin (docs/network-handlers.md, "Ingress").
+                # Chains carry policy only; TLS lives on the port (above) or
+                # is the mesh (service.mesh, below).
                 ingress = {
                     protocol = "http",
                     rules = [
                         { when = { path = "/admin/**" }, action = "deny", reason = "not externally reachable" },
-                        # Peer identity is known with tls.mode = "mutual".
-                        { when = { identity = "auto:web:*" }, action = "allow" },
+                        # Peer identity is known on the mesh port and on a
+                        # mutual port.
+                        { when = { identity = "*:web:*:*" }, action = "allow" },
                     ],
-                    # TLS on the advertised port. server | mutual with
-                    # certFrom = "legion" (the node's mesh certificate; peers
-                    # verified against the mesh CA with clientCa = "legion"),
-                    # certFrom = { kv = "<path>" } (a PEM bundle in KV: the
-                    # chain, then the key; swapped live on `kv put`, and the
-                    # submitter needs kv read on the path), or
-                    # certPath/keyPath (+ clientCa bundle) for your own PKI.
-                    tls = {
-                        mode = "off",          # off | server | mutual
-                        # certFrom = "legion",
-                        # certFrom = { kv = "certs/web.example.com" },
-                        # clientCa = "legion",
-                        # requireIdentity = ["auto:web:*"],
-                    },
                 },
             },
             service = {
@@ -261,69 +271,89 @@
                 port = "http",      # label from network.ports; or a number/'dynamic' to declare inline
                 tags = ["v1", "public"],
                 meta = { protocol = "http" },
+                # Put the service on the mesh (docs/network-handlers.md, "The
+                # mesh"): its port terminates node-to-node mTLS with the node
+                # certificate, consumers originate mesh TLS to it, and a plain
+                # client dialing the port directly is refused at the
+                # handshake. A policy object can impose or default it.
+                mesh = true,
                 # Connect intentions (see docs/service-discovery.md): job
                 # globs allowed to reach this service through a `connect`
                 # upstream. A bare entry matches jobs in this job's own
                 # namespace; `ns/job` (globs on either side, `payments-*/api`)
                 # admits a consumer in another namespace. Omit the field (or
-                # use ["*"]) to allow every job in this namespace. Denied
-                # consumers simply get an empty endpoint list; enforcement is
-                # control-plane + forwarder, not cryptographic identity.
+                # use ["*"]) to allow every job in this namespace. Always
+                # enforced by the endpoint feed (others get no endpoints);
+                # with mesh = true also at the receiving node, against the
+                # verified caller's job (Legion-Denied-By: service/allow).
                 allow = ["gateway", "maximal-demo", "checkout-*/api"],
             },
-            # Services this task dials, each via a node-local loopback
-            # forwarder that load-balances across the upstream's healthy
-            # endpoints. The task reads $LEGION_UPSTREAM_<SERVICE>
-            # ("127.0.0.1:<port>") and $LEGION_UPSTREAM_PORT_<SERVICE>.
-            # The named service need not exist yet.
+            # Services this task dials, each through the node's forwarder,
+            # which load-balances across the upstream's healthy endpoints.
+            # `to` names the upstream and its scheme alone decides the
+            # protocol: a bare service name (or tcp://name) is L4,
+            # http://name parses HTTP; a URL with a dotted host (or a port)
+            # is an external destination. The task reads one address per
+            # upstream: $LEGION_UPSTREAM_<KEY> (the VIP on Linux, a loopback
+            # port elsewhere) and its _HOST_ and _PORT_ parts. The named
+            # service need not exist yet.
             connect = {
                 upstreams = [
-                    # Minimal form: loopback port assigned at placement out of
-                    # the same per-node range as host ports.
-                    { service = "db" },
-                    # Pin the loopback port for clients that cannot read env
-                    # vars. Must not collide with a static port above.
-                    { service = "cache", localPort = 6379 },
+                    # Minimal form: a catalog service over L4.
+                    { to = "db" },
+                    # Pin the port: the VIP listens on it and 127.0.0.1:6379
+                    # is bound too, for clients that need a literal loopback
+                    # address. Must not collide with a static port above.
+                    { to = "cache", port = 6379 },
                     # Strategy override: least_latency (default; two random
                     # picks, the lower latency x load wins) | round_robin |
-                    # random | least_conn | local_first (same-node endpoints
-                    # first, widening when none is healthy locally).
-                    { service = "search", balance = "least_conn" },
+                    # least_conn (even connection counts, for long-lived
+                    # connections) | local_first (same-node endpoints first,
+                    # widening when none is healthy locally).
+                    { to = "search", balance = "least_conn" },
                     # Reaching a service in another namespace is explicit,
                     # and the target must admit this job with a qualified
                     # `allow` entry (`"default/maximal-demo"`). The key, env
                     # vars and DNS name become `<service>.<namespace>`:
                     # LEGION_UPSTREAM_AUTH_SHARED, auth.shared.svc.legion.
-                    # `service = "shared/auth"` is the same thing.
-                    { service = "auth", namespace = "shared" },
-                    # HTTP framing and traffic management on a service
-                    # upstream (docs/network-handlers.md): a per-request
-                    # deadline, bounded retries (idempotent methods only by
-                    # default), a canary split by service tag, and outlier
-                    # ejection.
+                    { to = "auth", namespace = "shared" },
+                    # An HTTP service upstream (docs/network-handlers.md):
+                    # a per-request deadline, bounded retries (idempotent
+                    # methods only by default), and a canary split by service
+                    # tag. An endpoint that answers 5xx five times in a row is
+                    # ejected for 30s, with no setting.
                     {
-                        service = "api",
+                        to = "http://api",
                         http = {
                             timeout = "3s",
                             retries = { attempts = 2, on = ["5xx", "connect-failure"], budget = "20%" },
                             split = [{ tag = "canary", weight = 10 }],
-                            outlier = { consecutive5xx = 5, ejectFor = "30s" },
                         },
                     },
-                    # An external upstream: `name` + `to` instead of a
-                    # service. The task gets $LEGION_UPSTREAM_OPENAI on
-                    # loopback and speaks plaintext; Legion originates TLS
-                    # (https / tls schemes), so the body is visible to
-                    # handlers without intercepting anyone's TLS. The scheme
-                    # also decides HTTP framing (http / https).
+                    # An external upstream: a URL plus a `name`. The task
+                    # dials $LEGION_UPSTREAM_OPENAI and speaks plaintext;
+                    # Legion originates TLS (https / tls schemes), so the
+                    # body is visible to handlers without intercepting
+                    # anyone's TLS. The scheme also decides HTTP framing
+                    # (http / https).
                     {
                         name = "openai",
                         to = "https://api.openai.com",
                         handlers = [
                             {
-                                handler = "dlp",
-                                config = { maxBytes = "1Mi", patterns = ["(AKIA|sk-)[A-Za-z0-9]{16,}"] },
+                                dlp = { maxBytes = "1Mi", patterns = ["(AKIA|sk-)[A-Za-z0-9]{16,}"] },
                                 onError = "deny",
+                            },
+                            # A WASM network plugin (docs/network-plugins.md):
+                            # a stored plugin object with usableBy = "jobs",
+                            # run with this reference's config (checked
+                            # against the object's configSchema at submit).
+                            # Its stages, limits, and module live on the
+                            # object.
+                            {
+                                plugin = { name = "llm-token-meter", config = { budget = 100000, per = "1h" } },
+                                onError = "deny",
+                                timeout = "2s",
                             },
                         ],
                         # Credential injection (docs/network-handlers.md,
@@ -345,6 +375,10 @@
                         # task's "billing" workload identity for the
                         # allocation and the node injects it, asking for a
                         # new one once half its TTL has passed.
+                        # Verify the destination against this trust bundle
+                        # instead of the public roots: { kv } or { file }
+                        # (PEM). tls:// and https:// external upstreams only.
+                        ca = { kv = "certs/internal-ca" },
                         credentials = [
                             { header = "Authorization", prefix = "Bearer ", from = { identity = "billing" } },
                         ],
@@ -1075,10 +1109,10 @@
             # the guest agent listens on $LEGION_UPSTREAM_API and on the
             # VIP api.svc.legion resolves to, and relays to the node's
             # upstream listener over vsock ("Sandboxes"). Submit refuses a
-            # localPort of 1080 or 53 here (the agent's proxy and resolver).
+            # port of 1080 or 53 here (the agent's proxy and resolver).
             # A sandbox that is not gated cannot reach its upstreams.
             connect = {
-                upstreams = [{ service = "api" }],
+                upstreams = [{ to = "api" }],
             },
             network = {
                 mode = "gated",

@@ -44,6 +44,11 @@ pub enum Attachment {
     /// own address on a bridge and host networking for policy. The datapath
     /// reaches its ports at that address.
     GuestTap { scratch: PathBuf },
+    /// `network.mode = "gated"` on a node without network namespaces
+    /// (macOS): the datapath binds on the node's loopback, the egress proxy
+    /// at `proxy`, and the runtime confines the task to those listeners
+    /// (Seatbelt for `exec`, pf for an Apple container VM). Fails closed.
+    Confined { proxy: SocketAddr },
 }
 
 impl Attachment {
@@ -53,6 +58,13 @@ impl Attachment {
     /// scratch dir.
     pub fn of(allocation: &TaskAllocation, network: &AllocNetwork, alloc_root: &Path) -> Self {
         let sandbox = allocation.task_runtime == "sandbox";
+        if let Some(proxy) = network
+            .is_confined()
+            .then(|| network.egress_proxy.as_deref()?.parse().ok())
+            .flatten()
+        {
+            return Attachment::Confined { proxy };
+        }
         if network.is_gated() {
             return if sandbox {
                 Attachment::GuestVsock {
@@ -79,8 +91,17 @@ impl Attachment {
     pub fn is_gated(&self) -> bool {
         matches!(
             self,
-            Attachment::Netns { .. } | Attachment::GuestVsock { .. }
+            Attachment::Netns { .. } | Attachment::GuestVsock { .. } | Attachment::Confined { .. }
         )
+    }
+
+    /// Where the egress proxy listens, when it is not the namespace's or the
+    /// guest's own `:1080`: a confined allocation's assigned port.
+    pub fn egress_proxy(&self) -> Option<SocketAddr> {
+        match self {
+            Attachment::Confined { proxy } => Some(*proxy),
+            _ => None,
+        }
     }
 
     /// The gated namespace listeners bind inside, when there is one.
@@ -127,17 +148,19 @@ impl Attachment {
                 netns: Some(path.clone()),
                 addr: SocketAddr::new(ip, port),
             },
-            Attachment::Host | Attachment::GuestTap { .. } => ListenAddr::Tcp {
-                netns: None,
-                addr: SocketAddr::new(ip, port),
-            },
+            Attachment::Host | Attachment::GuestTap { .. } | Attachment::Confined { .. } => {
+                ListenAddr::Tcp {
+                    netns: None,
+                    addr: SocketAddr::new(ip, port),
+                }
+            }
         }
     }
 
     /// How an ingress listener in the host namespace reaches the task.
     pub fn task_dial(&self) -> TaskDial {
         match self {
-            Attachment::Host => TaskDial::Loopback { netns: None },
+            Attachment::Host | Attachment::Confined { .. } => TaskDial::Loopback { netns: None },
             Attachment::Netns { path } => TaskDial::Loopback {
                 netns: Some(path.clone()),
             },
@@ -235,6 +258,45 @@ mod tests {
                 &AllocNetwork::default(),
                 root
             ),
+            Attachment::Host
+        );
+    }
+
+    /// A gated allocation placed with an egress proxy (a macOS node) is
+    /// confined: host listeners, the proxy at its own port, failing closed.
+    #[test]
+    fn a_gated_allocation_with_an_egress_proxy_is_confined_test() {
+        let root = Path::new("/allocs");
+        let network = AllocNetwork {
+            mode: Some(MODE_GATED.into()),
+            egress_proxy: Some("127.0.0.1:20017".into()),
+            ..Default::default()
+        };
+        for runtime in ["exec", "container", "sandbox"] {
+            let attachment = Attachment::of(&allocation(7, runtime, "{}"), &network, root);
+            assert_eq!(
+                attachment,
+                Attachment::Confined {
+                    proxy: "127.0.0.1:20017".parse().unwrap()
+                },
+                "{runtime}"
+            );
+            assert!(attachment.is_gated());
+            assert!(attachment.netns().is_none());
+            assert_eq!(
+                attachment.egress_proxy(),
+                Some("127.0.0.1:20017".parse().unwrap())
+            );
+            assert_eq!(attachment.task_dial(), TaskDial::Loopback { netns: None });
+        }
+        // An egress proxy on a host-mode row means nothing.
+        let host = AllocNetwork {
+            mode: Some(MODE_HOST.into()),
+            egress_proxy: Some("127.0.0.1:20017".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            Attachment::of(&allocation(7, "exec", "{}"), &host, root),
             Attachment::Host
         );
     }

@@ -346,6 +346,13 @@ const buildHostFacts = (fingerprintData: unknown, configData: unknown, dynamicDa
     facts.push({ label: 'Host guard', value: hostGuard })
   }
 
+  // Whether host-mode egress chains are enforced in the kernel here (mesh
+  // interfaces plan §6.A).
+  const netKernel = extractField(configData, 'netKernel')
+  if (typeof netKernel === 'string' && netKernel) {
+    facts.push({ label: 'Net kernel', value: netKernel })
+  }
+
   return facts
 }
 
@@ -357,6 +364,7 @@ const OMITTED_ATTRIBUTE_KEYS = new Set([
   'reserved_resources',
   'workerAddress',
   'hostGuard',
+  'netKernel',
   'workerPlane',
 ])
 

@@ -80,6 +80,12 @@ impl ActivityLedger {
         }
     }
 
+    /// Bytes moved for an allocation outside any tracked connection (a flow
+    /// the kernel passed straight through): it is not idle.
+    pub fn touch_external(&self, allocation_id: i64) {
+        self.slot(allocation_id).touch();
+    }
+
     /// The counters of every allocation the ledger knows.
     pub fn snapshot(&self) -> HashMap<i64, DatapathActivity> {
         self.slots
