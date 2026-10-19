@@ -224,7 +224,7 @@ network = {
 - `TlsConfig.cert_from` becomes `CertFrom` (`"legion"` or `{ kv }`). The
   string form serializes identically, so existing policy hashes are stable.
 - New RPC `GetIngressCertificates` with request and reply messages,
-  classified `Plane::Worker` in `tests/acl_endpoints.rs`.
+  classified `Plane::Worker` in `tests/integration/acl_endpoints.rs`.
 - `configs/jobs/maximal.ncl`: both surfaces.
 - No storage migration.
 

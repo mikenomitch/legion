@@ -60,7 +60,7 @@ def load_fixture_run(name):
 
 class PercentileMath(unittest.TestCase):
     def test_nearest_rank_matches_rust_pctl(self):
-        # Same convention as tests/benchmark_support/mod.rs::pctl —
+        # Same convention as tests/integration/benchmark_support/mod.rs::pctl —
         # round((len-1) * fraction) on the sorted list.
         values = [10.0, 20.0, 30.0, 40.0, 50.0]
         self.assertEqual(percentile(values, 0.50), 30.0)

@@ -6360,7 +6360,7 @@ mod tests {
     fn store_path() -> R<String> {
         let store_dir = Builder::new()
             .prefix("khepri-scheduler-")
-            .tempdir()
+            .tempdir_in(crate::test_scratch::root())
             .context("Error creating temp store directory")?
             .keep();
 

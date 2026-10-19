@@ -172,7 +172,7 @@ the stream the one RPC that has to find the leader, and a leader failover
 would resync every worker in the fleet at once, which is the burst entry 4
 accepted. With the log on every replica, a failover disturbs only the
 streams attached to the manager that died
-(`tests/work_stream.rs::a_leader_kill_resyncs_only_the_workers_that_lost_their_manager`:
+(`tests/integration/work_stream.rs::a_leader_kill_resyncs_only_the_workers_that_lost_their_manager`:
 the surviving manager's worker saw zero resyncs, the orphaned one exactly
 one). The raft term would also not be a valid epoch on a follower, and a
 process-random epoch costs nothing. (b) puts a write on every delivery,
@@ -689,7 +689,7 @@ key string cannot express `>` or `matches`), so the index would only have
 narrowed which rows to test. (b) adds a raft write per stop. (c) turns
 every election into a re-plan of every blocked job; the replay window is
 exact for the window that matters
-(`tests/blocked_evals.rs::a_new_leader_rebuilds_from_rows_and_replays_a_missed_wake`).
+(`tests/integration/blocked_evals.rs::a_new_leader_rebuilds_from_rows_and_replays_a_missed_wake`).
 
 ## 22. Every phase carries p50 and p99 latency targets, measured first in Phase 0
 
@@ -917,7 +917,7 @@ start on two lanes. One entry is what the plan's Phase 1 target asks for
 (an edge start is one scheduler-lane entry plus the status projection),
 and the double-spend refusal still holds because the spend is a
 conditional update inside the same transaction
-(`tests/edge_boot_integration.rs::a_ticket_is_spent_only_by_a_ratification_that_commits`).
+(`tests/integration/edge_boot_integration.rs::a_ticket_is_spent_only_by_a_ratification_that_commits`).
 (b) costs a create and its placement eval per start, the very writes edge
 boot was meant to skip.
 
@@ -1245,7 +1245,7 @@ jobs.
 
 ## 48. The raft seam test still parses only `store.rs` and `acl_store.rs`
 
-**Call.** `tests/raft_seam.rs` was updated for the ops this work removed
+**Call.** `tests/integration/raft_seam.rs` was updated for the ops this work removed
 (`claim_eval{,s}`, the `complete_*_and_claim_next` pair) and added
 (`complete_evals`), but its file list was left alone, so the new
 `unblock_evals` op in `store/blocked_evals.rs` is not classified there.
@@ -1439,7 +1439,7 @@ does not fit starts that fail node by node.
 
 ## 58. Phase 6 is tested with fake nodes on real gRPC, not the planned 10^4-session `raft_lanes` run
 
-**Call.** `tests/session_integration.rs` runs a real raft-backed manager
+**Call.** `tests/integration/session_integration.rs` runs a real raft-backed manager
 against fake worker gRPC servers that admit, refuse, adopt, and report
 sessions, and counts raft entries as the applied index summed over lanes:
 zero for unnamed starts, one for a promotion. An ignored

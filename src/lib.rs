@@ -30,6 +30,8 @@ pub mod signals;
 pub mod storage;
 pub mod structs;
 pub mod task_plugins;
+#[cfg(test)]
+pub(crate) mod test_scratch;
 pub mod tracing_util;
 pub mod util;
 pub mod volumes;

@@ -3323,7 +3323,7 @@ export const Manager = {
  *   verifies offline.
  * A request that presents a certificate other than a manager's is refused
  * with Unauthenticated, never treated as a ticket holder.
- * `tests/worker_plane_classes.rs` fails the build when an RPC here has no
+ * `tests/integration/worker_plane_classes.rs` fails the build when an RPC here has no
  * class.
  *
  * @generated from service legion.Worker
@@ -3702,7 +3702,7 @@ export const Worker = {
  * replicated state store (docs/plans/durability-and-ops-execution-plan.md §2).
  *
  * This service is NOT part of the public Legion API and is NOT covered by the
- * Manager-service ACL system (`tests/acl_endpoints.rs` classifies Manager
+ * Manager-service ACL system (`tests/integration/acl_endpoints.rs` classifies Manager
  * RPCs only). It is called exclusively by other managers in the same cluster —
  * never by workers, CLIs, or UIs.
  *
@@ -3864,7 +3864,7 @@ export const RaftTransport = {
      *
      * ACL: manager-plane internal, authenticated by cluster secret metadata —
      * it is not a `Manager` RPC, so it takes no ACL row and
-     * `tests/acl_endpoints.rs::every_manager_rpc_is_classified` does not cover
+     * `tests/integration/acl_endpoints.rs::every_manager_rpc_is_classified` does not cover
      * it. See docs/node-liveness.md.
      *
      * @generated from rpc legion.RaftTransport.ReportNodeLiveness

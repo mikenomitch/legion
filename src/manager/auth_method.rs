@@ -1162,7 +1162,7 @@ mod auth_method_test {
     fn webhook_store() -> Store {
         let dir = tempfile::Builder::new()
             .prefix("legion-webhook-")
-            .tempdir()
+            .tempdir_in(crate::test_scratch::root())
             .expect("tempdir")
             .keep();
         Store::start_storage(&crate::structs::ManagerConfigFull {

@@ -474,7 +474,7 @@ Full procedures (including rollback out of raft mode): `docs/upgrades.md`.
 ## Failure modes
 
 An in-process 3-node test covers each of these, in
-`tests/raft_durability.rs` / `tests/raft_snapshot_recovery.rs`:
+`tests/integration/raft_durability.rs` / `tests/integration/raft_snapshot_recovery.rs`:
 
 | Scenario | Behavior |
 | --- | --- |
@@ -484,7 +484,7 @@ An in-process 3-node test covers each of these, in
 | **Full-cluster restart** | Every node recovers from its raft log and state DB. A leader is re-elected, and the cluster resumes with all committed state. A restarted member that cannot yet hear the leader (its inbound transport shares the manager listener) starts without a leader, logs a warning, and catches up once it is serving. Startup never deadlocks on the election. |
 | **Operator double-start** | The second process fails fast on the `dataDir` advisory lock. |
 | **Wiped `dataDir`, kept state DB** | The cluster stamp blocks startup unless `forceNewCluster = true` (an intentional re-stamp). |
-| **Standing lane split** (`lanes` topology, different managers keep leading different lanes) | Nothing is lost. Worker liveness and reports forward to the owning lane's leader. The control leader accepts submits, and lane reconcilers complete them within the checker cadence. Single-lane operations and reads are unaffected. Costs: slower scheduling, briefly lagging task statuses, claims, and rollouts, no `state backup`, and `/readyz` returns 503 after about 10s to alert the operator. Covered by `tests/raft_lanes.rs` (standing-split and forwarding tests). |
+| **Standing lane split** (`lanes` topology, different managers keep leading different lanes) | Nothing is lost. Worker liveness and reports forward to the owning lane's leader. The control leader accepts submits, and lane reconcilers complete them within the checker cadence. Single-lane operations and reads are unaffected. Costs: slower scheduling, briefly lagging task statuses, claims, and rollouts, no `state backup`, and `/readyz` returns 503 after about 10s to alert the operator. Covered by `tests/integration/raft_lanes.rs` (standing-split and forwarding tests). |
 
 ## Non-leader write redirects and forwarding
 
@@ -538,8 +538,8 @@ check.
 ## Performance
 
 This is the raft-mode write-path baseline, measured by
-`tests/raft_perf_smoke.rs`
-(`cargo test --test raft_perf_smoke --locked -- --ignored --nocapture`). It
+`tests/integration/raft_perf_smoke.rs`
+(`cargo test --test integration raft_perf_smoke:: --locked -- --ignored --nocapture`). It
 runs a single-node bootstrap cluster (`topology = single`, self-quorum) and
 sends `put_kv` through the full propose → capture → quorum-commit →
 state-machine-apply pipeline. Debug build, 2026-07-23:
@@ -558,7 +558,7 @@ sync→async bridge to `client_write`, local log append and fsync, and
 changeset apply with read-model and event projection.
 
 For comparison, the `local_disk` scheduler SLO gate
-(`cargo test --test scheduler_benchmark_slo --locked -- --ignored --nocapture`)
+(`cargo test --test integration scheduler_benchmark_slo:: --locked -- --ignored --nocapture`)
 at the same commit measured: steady-small 238.7 evals/s / p99 5.34 ms,
 churn-medium 174.0 evals/s / p99 7.27 ms, high-fanout 135.0 evals/s /
 p99 10.84 ms. All are within SLO. Raft mode does not change `local_disk`
@@ -567,7 +567,7 @@ behavior.
 ### Lane isolation A/B (lanes vs single, 2026-07-28)
 
 Lanes exist so that saturating one lane does not slow down another. The
-`lanes_vs_single_scheduler_isolation_ab` test in `tests/raft_perf_smoke.rs`
+`lanes_vs_single_scheduler_isolation_ab` test in `tests/integration/raft_perf_smoke.rs`
 measures this. It runs a 3-node in-process cluster (tonic `RaftTransport`
 listeners over loopback) and samples scheduler-lane `place_alloc`
 propose→apply latency twice per topology. The first phase is unloaded. In
@@ -615,7 +615,7 @@ counter-result.
 In order of impact:
 
 1. **`lanes` is opt-in, not the default.** It runs, it is tested (the
-   `tests/raft_lanes.rs` suite plus the standing-split and forwarding
+   `tests/integration/raft_lanes.rs` suite plus the standing-split and forwarding
    tests), and its isolation benefit is measured (above). `single` stays the
    recommended default until lanes has more production use. Choose `lanes`
    when a single group's log is clearly the bottleneck for your write load.

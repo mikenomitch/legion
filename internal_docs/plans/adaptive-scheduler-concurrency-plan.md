@@ -933,7 +933,7 @@ conflict rate, and by running the fixed-limit sweep that separates
   and `is_scheduler_lane_leader`. Full public-facing comments on every
   field, per the documentation rule. ACL:
   `check_acl(.., AclResource::Operator, AclAction::Read,
-  AclScope::any())`, plus an entry in `tests/acl_endpoints.rs`
+  AclScope::any())`, plus an entry in `tests/integration/acl_endpoints.rs`
   (`endpoint_table` + request builder) — the
   `every_manager_rpc_is_classified` test fails the build otherwise.
 - **Manager config:** `schedulerSettings.adaptiveConcurrency`
@@ -1184,7 +1184,7 @@ Each phase ships and stands alone.
   `concurrent_planners_cannot_oversubscribe_under_raft[_lanes]`, and the
   epoch-fencing suites, run at limit 1 and at the ceiling. The
   controller must be invisible to correctness.
-- **ACL:** `tests/acl_endpoints.rs` entry for
+- **ACL:** `tests/integration/acl_endpoints.rs` entry for
   `GetSchedulerConcurrency`; `every_manager_rpc_is_classified` stays
   green.
 - **Benchmarks:** `benchmarks/micro/scheduler_bench.rs` before/after,

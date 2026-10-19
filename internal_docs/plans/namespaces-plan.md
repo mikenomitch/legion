@@ -1497,7 +1497,7 @@ Namespace policies:
 
 **Cross-cutting suites, added in Phase 1 and extended in each phase:**
 
-- **The namespace-isolation matrix** (`tests/acl_endpoints.rs`). Every
+- **The namespace-isolation matrix** (`tests/integration/acl_endpoints.rs`). Every
   Manager RPC whose scope is namespaced is called with a `payments-*` token
   against a `checkout-prod` object, and must return `PermissionDenied`, not
   `NotFound` or success. The existing `every_manager_rpc_is_classified` test

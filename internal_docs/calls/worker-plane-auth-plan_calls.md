@@ -647,7 +647,7 @@ Found while implementing Phase 1. The plan's integration test runs two
 workers in one process on `127.0.0.2` and `127.0.0.3`, relying on
 auto-detection. On Linux the source address of the route to any `127/8`
 manager is `127.0.0.1`, so both would advertise `127.0.0.1`. The end-to-end
-test (`tests/worker_plane_e2e.rs`) runs one real worker through the binary
+test (`tests/integration/worker_plane_e2e.rs`) runs one real worker through the binary
 instead, and the docs say co-located workers need their own port and, to be
 distinguished by address, `--advertise-addr`.
 
@@ -1197,7 +1197,7 @@ ulimits, blocked evals, the work stream).
 **Trade-off.** Users of #17's surface see two changes:
 `legion sandbox start --ca-cert` is `--ca` (with `--node-name`), and a
 simulated node carries `workerFleet` instead of `workerPlaneName`.
-`tests/worker_plane.rs` is gone; `tests/worker_plane_classes.rs` covers the
+`tests/worker_plane.rs` is gone; `tests/integration/worker_plane_classes.rs` covers the
 same cases (classification, a request per class, foreign CA, wrong node).
 
 **Why.** Every call #17 deferred is built here, on one set of modules. Two

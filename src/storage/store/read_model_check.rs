@@ -467,7 +467,7 @@ mod tests {
     fn setup_store() -> R<Store> {
         let store_dir = Builder::new()
             .prefix("legion-read-model-")
-            .tempdir()?
+            .tempdir_in(crate::test_scratch::root())?
             .keep();
         let mut config = ManagerConfigFull {
             store_path: store_dir

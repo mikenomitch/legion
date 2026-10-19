@@ -330,7 +330,7 @@ management registration still mints and rotates.
   persist each new token.
 - **Trade-off.** A leaked node token is not invalidated by the node's next
   restart; revocation is by removing the node (or resetting ACLs). Behavior
-  change in `tests/acl_endpoints.rs` (`re-registration rotates the node token`
+  change in `tests/integration/acl_endpoints.rs` (`re-registration rotates the node token`
   for node-token registrations is gone).
 - **Why.** Simplicity and robustness: with rotation, a crash between the
   manager's commit and the worker's fsync leaves the worker holding a revoked

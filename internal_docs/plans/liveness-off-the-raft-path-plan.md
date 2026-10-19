@@ -481,9 +481,9 @@ bearing half of §6.4, not a side quest.
 `Lane` is `Control | Scheduler | Status` (`src/storage/raft/mod.rs:41-48`),
 three independent raft groups. The engine's convergence loop pulls lanes
 onto the control anchor, but convergence is explicitly **best effort** —
-openraft 0.9 has no leader-transfer API — and `tests/raft_lanes.rs` asserts
+openraft 0.9 has no leader-transfer API — and `tests/integration/raft_lanes.rs` asserts
 correctness of the *standing split*, not its absence
-(`lanes_that_settle_on_different_leaders_stay_correct`, `tests/raft_lanes.rs:1602`).
+(`lanes_that_settle_on_different_leaders_stay_correct`, `tests/integration/raft_lanes.rs:1602`).
 So the status-lane leader and the scheduler-lane leader **can be different
 managers**, indefinitely. Any design must be correct in that state.
 
@@ -935,7 +935,7 @@ documentation rule:
   `ForwardLaneWrite` callers do). **Manager-plane, not user-facing.**
   Authenticated by the existing `RaftTransport` shared secret
   (`src/storage/raft/server.rs:70`) — it is not a `Manager` RPC, so it takes
-  no ACL row and `tests/acl_endpoints.rs::every_manager_rpc_is_classified`
+  no ACL row and `tests/integration/acl_endpoints.rs::every_manager_rpc_is_classified`
   is unaffected. That exemption is stated in the proto comment so the next
   reader does not have to infer it.
 - `NodeMsg` gains `string heartbeat_source` — `"live"` (this manager owns
@@ -1098,7 +1098,7 @@ is a performance regression relative to phase 3, never a correctness one.
 - Config validation: each rejected combination in §7, with the values named
   in the error.
 
-**Integration**, on the `tests/raft_lanes.rs` harness — `start_cluster`
+**Integration**, on the `tests/integration/raft_lanes.rs` harness — `start_cluster`
 (`:312`), `move_lane_leadership` (`:502`), `wait_for` (`:111`) — extending
 the existing `worker_heartbeats_forward_across_a_status_lane_split`
 (`:1797`), which is the closest precedent:
@@ -1113,7 +1113,7 @@ the existing `worker_heartbeats_forward_across_a_status_lane_split`
 - `liveness_reaches_the_leader_from_a_manager_that_leads_nothing` —
   heartbeats delivered only to the non-leading manager; the leader keeps
   those nodes active. Forces the split with `set_convergence(nodes, false)`
-  (`tests/raft_lanes.rs:492`), the same primitive
+  (`tests/integration/raft_lanes.rs:492`), the same primitive
   `lanes_that_settle_on_different_leaders_stay_correct` uses. Phase 4.
 - `a_silent_peer_manager_does_not_kill_its_nodes` — stop peer C's digests
   (drop the RPC) while its workers keep beating to C; assert zero of C's
@@ -1129,16 +1129,16 @@ the existing `worker_heartbeats_forward_across_a_status_lane_split`
 - `a_recovered_node_transitions_through_raft` — kill and restart a worker;
   assert the `lost → active` transition is a replicated write visible on all
   three replicas, not just leader memory.
-- Existing `tests/raft_lanes.rs`, `tests/raft_lanes_durability.rs`,
-  `tests/node_drain.rs`, and the `metrics_endpoint` heartbeat-counter test
+- Existing `tests/integration/raft_lanes.rs`, `tests/integration/raft_lanes_durability.rs`,
+  `tests/integration/node_drain.rs`, and the `metrics_endpoint` heartbeat-counter test
   stay green unchanged.
 
 **Scale / regression.**
 
-- `tests/heartbeat_scale_benchmark.rs` gains a case asserting **zero
+- `tests/integration/heartbeat_scale_benchmark.rs` gains a case asserting **zero
   replicated status-lane ops** for `N` steady-state heartbeats on an active
   fleet (phase 3+), and a per-heartbeat cost assertion. Its liveness phase
-  (`tests/heartbeat_scale_benchmark.rs:128-141`) currently calls
+  (`tests/integration/heartbeat_scale_benchmark.rs:128-141`) currently calls
   `nodes_to_mark_lost(rows, Duration::from_secs(3600))` — a fake one-hour
   uptime to bypass the startup grace. That call site is exactly where the
   grace clock changes shape, so it is the first thing to update in phase 2,

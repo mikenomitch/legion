@@ -167,7 +167,7 @@ mod tests {
     fn setup_store() -> R<Store> {
         let store_dir = tempfile::Builder::new()
             .prefix("legion-oidc-http-")
-            .tempdir()
+            .tempdir_in(crate::test_scratch::root())
             .context("error creating temp store directory")?
             .keep();
         let store_config = ManagerConfigFull {
@@ -362,7 +362,7 @@ mod tests {
     #[tokio::test]
     async fn keyless_manager_answers_jwks_with_503() -> R<()> {
         // A streaming standby can't write, so it initializes keyless.
-        let dir = tempfile::tempdir()?.keep();
+        let dir = tempfile::tempdir_in(crate::test_scratch::root())?.keep();
         let mut config = ManagerConfigFull {
             store_path: dir
                 .to_str()

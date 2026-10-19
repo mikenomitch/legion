@@ -425,7 +425,7 @@ keeps the recheck's cost proportional to the skips actually taken.
 coalescer as `submit_and_apply_plan`: `PlanApplyRequest` carries a
 `PlanPlacements` enum (format-1 nodes or format-2 candidate lists), and
 the batch body dispatches per format. Each format keeps its own
-replicated-op name, so the raft log and `tests/raft_seam.rs` still say
+replicated-op name, so the raft log and `tests/integration/raft_seam.rs` still say
 which walk ran.
 
 **Alternatives.** Leave the candidate path on the single-plan replicated

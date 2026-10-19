@@ -1463,7 +1463,7 @@ pub(crate) mod test_support {
         PATH.get_or_init(|| {
             let dir = tempfile::Builder::new()
                 .prefix("legion-test-root-key-")
-                .tempdir()
+                .tempdir_in(crate::test_scratch::root())
                 .expect("tempdir for the shared test root key")
                 .keep();
             let provider = super::FileRootKey::new(dir.join(super::ROOT_KEY_FILE));

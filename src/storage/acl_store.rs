@@ -778,7 +778,7 @@ mod acl_store_test {
     fn setup_store() -> R<Store> {
         let store_dir = Builder::new()
             .prefix("legion-acl-store-")
-            .tempdir()
+            .tempdir_in(crate::test_scratch::root())
             .context("Error creating temp store directory")?
             .keep();
 

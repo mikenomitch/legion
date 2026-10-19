@@ -428,9 +428,9 @@ listener and no setting that turns one on.
   A node's certificate is signed by the same CA, but it is not a manager
   certificate: the role in the URI SAN is what the worker checks. A request
   that presents a non-manager certificate is refused outright, never treated
-  as a ticket holder. `tests/worker_plane_classes.rs` parses the proto and
+  as a ticket holder. `tests/integration/worker_plane_classes.rs` parses the proto and
   fails the build when a `Worker` RPC has no class, the same way
-  `tests/acl_endpoints.rs` guards the `Manager` service.
+  `tests/integration/acl_endpoints.rs` guards the `Manager` service.
 
   ```console
   $ grpcurl -cacert ca.pem 10.0.1.7:4848 legion.Worker/GetTaskLogs

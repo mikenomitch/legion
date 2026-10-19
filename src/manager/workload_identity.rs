@@ -1631,7 +1631,7 @@ mod tests {
     fn claims_test_store() -> R<Store> {
         let store_dir = tempfile::Builder::new()
             .prefix("legion-wi-claims-")
-            .tempdir()
+            .tempdir_in(crate::test_scratch::root())
             .context("error creating temp store directory")?
             .keep();
         let config = crate::structs::ManagerConfigFull {
@@ -2111,7 +2111,7 @@ mod tests {
     /// streaming standby whose lease loop can never acquire (no bucket), so
     /// `is_raft_leader` stays false and every replicated write is refused.
     fn non_leader_store() -> R<Store> {
-        let dir = tempfile::tempdir()?.keep();
+        let dir = tempfile::tempdir_in(crate::test_scratch::root())?.keep();
         let mut config = crate::structs::ManagerConfigFull {
             store_path: dir
                 .to_str()

@@ -1091,7 +1091,7 @@ mod tests {
 
     // Real-driver bootstrap status: a single-node raft store on a tempdir
     // elects itself and reports leader status through the driver. The full
-    // propose->commit->apply path is covered by tests/raft_apply_roundtrip.rs.
+    // propose->commit->apply path is covered by tests/integration/raft_apply_roundtrip.rs.
     #[test]
     fn raft_status_reports_bootstrap_node() {
         let dir = tempfile::tempdir().unwrap();

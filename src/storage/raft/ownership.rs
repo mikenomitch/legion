@@ -135,7 +135,7 @@ pub(crate) enum Owner {
 /// it does not compile^W pass CI.
 ///
 /// Lane assignments follow plan §7-C2 and the existing `Store::replicated`
-/// lane classification (tests/raft_seam.rs).
+/// lane classification (tests/integration/raft_seam.rs).
 const TABLE_OWNERS: &[(&str, Owner)] = &[
     // ── control lane: operator/user intent ───────────────────────────────
     ("job", Owner::Lane(Lane::Control)),
@@ -579,7 +579,7 @@ mod tests {
     fn setup_store() -> R<Store> {
         let dir = tempfile::Builder::new()
             .prefix("khepri-raft-ownership-")
-            .tempdir()
+            .tempdir_in(crate::test_scratch::root())
             .context("Error creating temp store directory")?
             .keep();
         let config = ManagerConfigFull {

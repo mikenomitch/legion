@@ -1091,7 +1091,7 @@ Status: built 2026-10-12 (G5.1 pending). See §6.10, "As built".
   restart, exhaustion error), the `ip=` cmdline, the identity disk carries
   the address, the resume handler applies it through a fake netlink host,
   removed fields are refused at submit with the migration hint.
-- `tests/acl_endpoints.rs` needs no change (no new RPC), and the
+- `tests/integration/acl_endpoints.rs` needs no change (no new RPC), and the
   capabilities catalog test still passes.
 
 **Integration (one manager, one worker, fake VMM API servers)**

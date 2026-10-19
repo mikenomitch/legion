@@ -124,7 +124,7 @@ Line numbers as of 2026-10-12. Several of these files are being edited.
   (`src/worker/netd/ingress.rs:521-522`).
 - **ACLs**: `exec`, `scale`, `boot`, and `snapshot` are separate resources
   so narrow grants stay narrow (`src/structs/acl.rs:14-66`). `check_acl` is
-  at `src/manager/server.rs:1606`, and `tests/acl_endpoints.rs:1489`
+  at `src/manager/server.rs:1606`, and `tests/integration/acl_endpoints.rs:1489`
   enforces coverage.
 - **Adjacent**: `legion start gateway` will serve
   `https://<port>-<instance>.<domain>` over the worker plane

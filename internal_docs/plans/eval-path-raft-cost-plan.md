@@ -366,7 +366,7 @@ well below its `_count`.
 
 ## 7. Testing
 
-- `tests/eval_regen_failover.rs`: a batch of one is indistinguishable
+- `tests/integration/eval_regen_failover.rs`: a batch of one is indistinguishable
   from a single claim and an empty queue returns immediately; priority
   order is preserved across a batch; the fused batch write settles every
   member and claims the next batch; an unobserved member stays
@@ -380,7 +380,7 @@ well below its `_count`.
   concurrent submitters each get their own eval exactly once; the batched
   status seed writes what N single seeds would, duplicates included; and
   concurrent `idempotency_record` calls for one key have exactly one
-  winner whose response the losers can read. `tests/raft_seam.rs`
+  winner whose response the losers can read. `tests/integration/raft_seam.rs`
   classifies `enqueue_evals_isolated` (scheduler) and
   `seed_task_statuses_batch` (status). Like everything else here, the
   round-trip saving is **structurally unmeasurable locally**.
@@ -388,11 +388,11 @@ well below its `_count`.
   boundaries that matter: a shallow queue must yield exactly one, a deep
   one must be capped, and degenerate inputs must not produce a zero-sized
   batch.
-- `tests/eval_regen_failover.rs`: the fused call finishes one eval and
+- `tests/integration/eval_regen_failover.rs`: the fused call finishes one eval and
   claims the next; the queue draining returns `None`; a delayed
   `Released` goes back to pending and does not re-claim itself; batched
   enqueue creates every row and each stays independently claimable.
-- `tests/raft_seam.rs` classifies both new ops onto the scheduler lane —
+- `tests/integration/raft_seam.rs` classifies both new ops onto the scheduler lane —
   the guard that fails the build if a replicated op is unclassified. It
   caught both of these during development, which is the point of it —
   and phase 4's `claim_evals` /

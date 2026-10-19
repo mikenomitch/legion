@@ -485,7 +485,7 @@ the worker against the cluster's JWKS — the same key material, rotation, and
 (`boot:write`, scoped by job name), following the `scale` precedent: a platform's
 ticket minter should be able to authorize starts without holding `job:write`,
 because `job:write` means "redeploy the fleet". `boot:read` lists outstanding
-tickets. Both go in `tests/acl_endpoints.rs` (`endpoint_table` + a request
+tickets. Both go in `tests/integration/acl_endpoints.rs` (`endpoint_table` + a request
 builder) — the classification test fails the build otherwise.
 
 **Verification on the worker** is entirely offline:
@@ -646,7 +646,7 @@ clockSkew: '30s' }`, plus the listener the `StartClaim` RPC is served on
 
 **ACL:** new resource `boot` in `AclResource` (`src/structs/acl.rs:19`) with
 `read`/`write`, scoped by job name; `ListBootTickets`/`IssueBootTicket` entries
-in `tests/acl_endpoints.rs`; `RatifyClaim` classified worker-plane via
+in `tests/integration/acl_endpoints.rs`; `RatifyClaim` classified worker-plane via
 `acl::enforce_worker_plane`. Documented in `docs/auth-and-acls.md`.
 
 **Store:** a `boot_ticket` table (`jti` PK, job, task, job_config_id, instance
@@ -723,7 +723,7 @@ risk appetite — `stage` needs the least new machinery, `boot` the most.
   allocation, node-loss fencing, `concurrent_plans_cannot_oversubscribe_a_node`
   — run **unmodified** with `speculativeStart` on and off. Any change to those
   files is a design failure, not a test update.
-- **ACL:** `cargo test --test acl_endpoints` covers the new manager RPCs;
+- **ACL:** `cargo test --test integration acl_endpoints::` covers the new manager RPCs;
   `RatifyClaim` is classified worker-plane; a node token cannot mint a ticket
   and a boot ticket cannot call anything else.
 - **Raft:** ratification is a scheduler-lane op — replay determinism across

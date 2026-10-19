@@ -2214,9 +2214,12 @@ mod migrations_test {
             }
             Ok(false)
         };
+        // One connection stepped forward a version at a time: rebuilding
+        // from scratch per version made this walk quadratic in the number
+        // of migrations (6-35 s per test in a debug build).
         let mut pre_rename_version = None;
+        let mut probe = Connection::open_in_memory()?;
         for version in 1..=latest as usize {
-            let mut probe = Connection::open_in_memory()?;
             migrations.to_version(&mut probe, version)?;
             if has_kind_column(&probe)? {
                 pre_rename_version = Some(version);
@@ -2285,8 +2288,8 @@ mod migrations_test {
         // pre-rebuild schema. Searching (like the rename tests above) keeps
         // this valid as migrations are appended after the rebuild.
         let mut pre_version = None;
+        let mut walk = Connection::open_in_memory()?;
         for version in 1..=latest {
-            let mut walk = Connection::open_in_memory()?;
             migrations.to_version(&mut walk, version)?;
             if jsonb_count(&walk)? > 0 {
                 pre_version = Some(version);
@@ -2516,8 +2519,8 @@ mod migrations_test {
             Ok(false)
         };
         let mut pre_column_version = None;
+        let mut probe = Connection::open_in_memory()?;
         for version in 1..=latest {
-            let mut probe = Connection::open_in_memory()?;
             migrations.to_version(&mut probe, version)?;
             if !has_updated_at(&probe)? {
                 pre_column_version = Some(version);

@@ -83,6 +83,71 @@ mise run join --linux --count 3
 
 By default Linux workers connect to `http://192.168.64.1:4747` (the default `container` host gateway for the default network). If your setup differs, pass `--manager-addr`. Run `mise run join --help` for additional options (platform, custom manager address, container name prefix, startup log tail behavior, and forwarded join args).
 
+### Keeping builds and test runs small
+
+A full `cargo test --all` used to leave ~20+ GB in `target/` and another
+gigabyte of SQLite stores in the system temp dir on every run. What keeps it
+down now, and what to keep doing:
+
+- **Debuginfo.** `[profile.dev]` keeps line tables for Legion's crates and
+  none for dependencies. Panics keep `file:line`. For a debugger session with
+  variables, build with `CARGO_PROFILE_DEV_DEBUG=2`.
+- **One integration binary.** Integration tests are modules of
+  `tests/integration/main.rs` (see "Test Layout" in
+  `docs/testing-and-benchmarks.md`). The 66 per-file binaries were ~200 MB
+  each (12.9 GB together); now there are five test binaries totalling ~1.1 GB.
+  New integration tests go in as modules, not as new `tests/*.rs` files.
+- **Temp dirs.** Store helpers that `keep()` a `TempDir` create it under the
+  per-process scratch root (`src/test_scratch.rs`,
+  `tests/integration/support.rs`), which is removed when the test process
+  exits. A run killed with Ctrl-C leaves its one `legion-tests-*` directory in
+  `$TMPDIR`; delete those by hand if they pile up.
+- **Build script.** `build.rs` re-runs only when `proto/`, `build.rs`, or the
+  plugin env vars change. It used to watch the whole repository, so editing a
+  doc or a UI file rebuilt the crate.
+- **Incremental cache.** `target/debug/incremental` is usually the largest
+  thing in `target/`: rustc keeps up to two sessions of ~1.7 GB for each way
+  the `legion` crate gets built (library, library tests, clippy's check of
+  each), and a variant you stop using is never collected.
+- **One set of feature flags.** Features are part of a crate's build hash, so
+  `cargo test --all` and CI's `cargo test --all --all-features` build every
+  Legion target twice, with a separate incremental cache for each. Pick one
+  and stick to it; `--all-features` only adds the `legion-loadgen` bench tool.
+- **Habits.** Run the part you are changing (`cargo test --lib <filter>`,
+  `cargo test --test integration <module>::`) rather than `--all` on every
+  edit. Each git worktree has its own `target/`; pointing several at one
+  `CARGO_TARGET_DIR` shares the dependency builds at the cost of serializing
+  builds on Cargo's lock. `cargo clean` now and then drops stale artifacts.
+
+Measured on a 4-core Linux container (2026-10-18), before and after these
+changes:
+
+| | Before | After |
+| --- | --- | --- |
+| Test binaries | 70 (66 integration) | 9 (5 integration) |
+| Integration test binaries on disk | 12.9 GB (line tables only) | 1.1 GB |
+| `target/` after a clean `cargo test --all --no-run` | 20 GB (line tables only) | 8.3 GB |
+| Temp dir left behind per full run | > 1.1 GB | 0–44 KB |
+| Library unit tests | 335 s | 208–225 s |
+| Full suite, test execution only | 10 m 20 s | 7 m 21 s |
+| No-op build after editing a doc | crate rebuild (44 s incremental) | 0.3 s |
+
+The "before" column already includes the debuginfo change and the two
+targets dropped from `Cargo.toml` (the library's doc-test pass and the
+`legion` binary's empty unit-test binary), so the original tree was larger
+and slower still; CI recorded ~23 GB at full debuginfo with only 29 test
+binaries.
+
+### CI caching
+
+The Rust jobs restore a dependency cache (`Swatinem/rust-cache`) keyed on the
+toolchain and `Cargo.lock`. Only runs on `main` save it, because a cache
+written on a PR ref is visible to that PR alone and would crowd main's entry
+out of the repo's 10 GB budget; CI runs on pushes to `main` for that reason.
+The first run after a `Cargo.lock` change rebuilds every dependency. A new
+push to a PR cancels the run in progress for it. `protoc` comes from a pinned
+release download (`.github/actions/setup-protoc`), not `apt-get`.
+
 ### Building a shipping binary (`--profile dist`)
 
 Use `--release` for local work and `--profile dist` for anything you hand to

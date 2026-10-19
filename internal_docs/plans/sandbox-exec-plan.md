@@ -554,7 +554,7 @@ Every new RPC and field gets public-facing comments in `proto/legion.proto`.
   to the current allocation or envelope) and `exec_ticket`.
 - `Manager.MintExecTicket { target, argv, action, action_params, tty, ttl }`
   returns `{ ticket, worker_address, node, expires_at }`. Same ACL as
-  `ExecAllocation`. Added to `tests/acl_endpoints.rs`, to `catalog()` as
+  `ExecAllocation`. Added to `tests/integration/acl_endpoints.rs`, to `catalog()` as
   `exec-ticket mint` (`mutates: false`, `read_only_safe: false`, since a
   ticket opens a shell), and to MCP as a tool gated like `legion_exec_run`.
 - `Manager.CreateExecKey`, `ListExecKeys`, `DeleteExecKey` (Phase 3), ACL
@@ -670,7 +670,7 @@ What ran where, and what still needs hardware:
   process-group kill on disconnect, an old agent's hello, a hostile 4 GiB
   frame, a guest with no agent); the init script and root-disk payload for
   gated and ungated guests; direct exec end to end on a manager and an
-  in-process worker (`tests/worker_plane_e2e.rs`: session, exit status,
+  in-process worker (`tests/integration/worker_plane_e2e.rs`: session, exit status,
   mint JSON, revocation within a heartbeat, delegated keys reaching the
   worker, refused for a host-level job and another job, and dropped on
   delete); the mint ACL matrix; Phase 0 at 1 to 500 sessions.

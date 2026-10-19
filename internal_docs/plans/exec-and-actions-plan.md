@@ -422,7 +422,7 @@ Enforcement placement follows AGENTS.md ("Auth & ACL Checks"): the
 streaming handler authenticates the transport, then enforces on the parsed
 `ExecStart` (two-step `authenticate_acl` → `acl::enforce` form, coarse
 `AclScope::any()` gate before the alloc→job lookup to avoid existence
-probing). `tests/acl_endpoints.rs` gains entries for `ExecAllocation` and
+probing). `tests/integration/acl_endpoints.rs` gains entries for `ExecAllocation` and
 `ListJobActions` — the `every_manager_rpc_is_classified` test makes this
 non-optional.
 
@@ -630,7 +630,7 @@ interactive PTY over MCP.
    disconnect.
 2. **Manager proxy + CLI** — `Manager.ExecAllocation` (proxying,
    ACL `exec` resource + `host` selector, audit events,
-   `tests/acl_endpoints.rs` entries), `legion exec` with raw mode, resize,
+   `tests/integration/acl_endpoints.rs` entries), `legion exec` with raw mode, resize,
    exit-code propagation, `--job` convenience.
 3. **Browser path** — WS bridge tower layer (hyper upgrade +
    `tokio-tungstenite`, first-frame auth), `ExecSocket` TS module,

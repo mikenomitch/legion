@@ -19,6 +19,11 @@
 //! controller), so every test here takes `SERIAL` — they share the same
 //! statics and would otherwise read each other's state.
 
+// Only `scratch_root` is used here; the cluster gate is for the raft tests.
+#[allow(dead_code)]
+#[path = "integration/support.rs"]
+mod support;
+
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -49,7 +54,7 @@ fn serial() -> MutexGuard<'static, ()> {
 fn setup_store() -> R<Store> {
     let store_dir = Builder::new()
         .prefix("legion-adaptive-concurrency-")
-        .tempdir()
+        .tempdir_in(support::scratch_root())
         .context("error creating temp store directory")?
         .keep();
     let store_config = ManagerConfigFull {

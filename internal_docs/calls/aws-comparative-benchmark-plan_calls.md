@@ -427,7 +427,7 @@ build on (dev tooling uses Apple's `container` CLI), and the
 `--simulate` flag made real-wire fleets a plain process — compose would
 have added a Docker dependency to reach the same loop. The event-shape
 assumptions compose would have covered are pinned by the wire-real
-integration test (`tests/worker_simulation.rs`) instead.
+integration test (`tests/integration/worker_simulation.rs`) instead.
 
 ## 19. Batch workloads translate to K8s Deployments, not Jobs
 

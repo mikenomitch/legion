@@ -549,7 +549,7 @@ mod namespace_policy_store_test {
     fn setup_store() -> R<Store> {
         let store_dir = Builder::new()
             .prefix("legion-namespace-policy-store-")
-            .tempdir()?
+            .tempdir_in(crate::test_scratch::root())?
             .keep();
         Store::start_storage(&ManagerConfigFull {
             store_path: store_dir.to_str().context("path")?.to_string(),

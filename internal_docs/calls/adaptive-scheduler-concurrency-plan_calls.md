@@ -283,7 +283,7 @@ one public function in `manager::daemon`, called by `eval_worker_loop` and by
 `tests/adaptive_scheduler_concurrency.rs`.
 
 **Alternative.** Keep it inline and have the integration test re-implement
-it, the way `tests/plan_contention.rs` re-implements the claim loop around
+it, the way `tests/integration/plan_contention.rs` re-implements the claim loop around
 the already-public `handle_claimed_eval`.
 
 **Trade-off.** One more public item on `daemon`, exported for testing rather

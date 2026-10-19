@@ -104,7 +104,7 @@ the code:
 | --- | --- | --- |
 | **The manager on 4747**, when co-located (`--run-worker`, single-box setups) | Full control of the cluster with no token. ACLs are off by default (`docs/auth-and-acls.md:9`, `src/structs/config.rs:1129-1131`). The manager binds `127.0.0.1` by default (`src/constants.rs:73`, `configs/manager.ncl:4`), which a host-network task shares. The origin guard does not help: it ignores requests without an `Origin` header (`src/structs/config.rs:37-41`). | `src/manager/daemon.rs:432-433` |
 | **The manager on another host**, in any multi-host cluster | The same, over the network. Workers must reach the manager, so `server.host` is a reachable address, and every task on every worker can reach it too. | `src/structs/config.rs:1633-1647` |
-| **The open `BootstrapAcl` RPC**, even with ACLs on | Succeeds whenever no management token exists (`src/manager/server.rs:8752-8754`, `docs/auth-and-acls.md:371`). A task on the manager's host can race the operator to it after first start, or after a recovery. | `tests/acl_endpoints.rs:194` (`Plane::Open`) |
+| **The open `BootstrapAcl` RPC**, even with ACLs on | Succeeds whenever no management token exists (`src/manager/server.rs:8752-8754`, `docs/auth-and-acls.md:371`). A task on the manager's host can race the operator to it after first start, or after a recovery. | `tests/integration/acl_endpoints.rs:194` (`Plane::Open`) |
 | **The exec WebSocket on 4748** and **metrics on 4749** | Both bind `server.host`. The WebSocket enforces ACLs, so with ACLs off it is another unauthenticated shell into every task. `/metrics` is unauthenticated, though its labels are bounded and low-cardinality, so it leaks cluster shape rather than secrets. | `src/manager/daemon.rs:436-477` |
 | **The worker plane on 4848** | `ExecTask` into any allocation on the node, `GetTaskLogs`, `PostWork`, `RestartWorker`, with no credential. `StartClaim` is ticket-protected and fine. | `src/worker/daemon.rs:155`, `src/worker/server.rs` |
 | **The cloud metadata service** (`169.254.169.254`, `fd00:ec2::254`) | The instance role's credentials. IMDSv2 does not help: a host-network task is zero hops from the instance. | (host networking) |
@@ -619,7 +619,7 @@ ERROR:
 
 **The classification test.** `every_worker_rpc_is_classified` parses
 `proto/legion.proto` and fails the build if a `Worker` RPC has no caller
-class, the same way `tests/acl_endpoints.rs` guards the `Manager` service. It
+class, the same way `tests/integration/acl_endpoints.rs` guards the `Manager` service. It
 reads a table that allows more than one class per RPC:
 
 ```rust
@@ -1210,7 +1210,7 @@ code belongs on Linux.
     default the worker validates against `/etc/subuid` (open question 7)
   - `exec.direct` (from the sandbox-exec plan) builds the JWKS verifier
 - ACL: `host` becomes valid on `job` rules (`src/structs/acl.rs:174-178`).
-  `tests/acl_endpoints.rs` drops `BootstrapAcl`. `catalog()` drops
+  `tests/integration/acl_endpoints.rs` drops `BootstrapAcl`. `catalog()` drops
   `acl.bootstrap`.
 - Job config:
   - `container.config.security = { userNamespace, seccomp }`, both into
@@ -1295,7 +1295,7 @@ pieces of #17 survived). As merged:
 - [x] Two-step CA rotation by cross-signing (§6.9).
 - [x] The simulator's fleet certificate, `<prefix>.fleet.legion` (open
   question 4, calls entry 21).
-- [x] `PROTOCOL_VERSION = 3`; `tests/worker_plane_classes.rs` classifies
+- [x] `PROTOCOL_VERSION = 3`; `tests/integration/worker_plane_classes.rs` classifies
   every `Worker` RPC.
 - [ ] Two workers on `127.0.0.2`/`127.0.0.3` in one test process, and the
   AWS 1,000-node throughput comparison (§9).
@@ -1520,7 +1520,7 @@ sudo -E LEGION_OCI_RUNTIME=runc cargo test --lib oci_runtime_security -- --ignor
 
 **Regression and performance**
 
-- `cargo test --all --locked`, `tests/acl_endpoints.rs`, and the simulator
+- `cargo test --all --locked`, `tests/integration/acl_endpoints.rs`, and the simulator
   smoke at 1,000 nodes.
 - Dispatch now runs over TLS. Run the AWS rig's 1,000-node cell before and
   after, and put both placement-throughput numbers in the PR. Channels are
@@ -1544,10 +1544,10 @@ item in `internal_docs/TODO.md`.
 
 - **Phases 0 to 2** ran in a Linux 6.18 VM as root (cgroup hybrid, `nft`,
   `runc`, no KVM): `cargo test --all --locked` green, including
-  `tests/worker_plane_e2e.rs` (the real binary with an in-process worker
+  `tests/integration/worker_plane_e2e.rs` (the real binary with an in-process worker
   over mTLS: logs, exec with exit status, a CA rotation in the middle) and
   the datapath guard tests against real namespaces.
-- **Phase 3** ran on the same VM: `tests/gated_container_default.rs`
+- **Phase 3** ran on the same VM: `tests/integration/gated_container_default.rs`
   (placement), the network unit tests, and both start benchmarks with `runc`:
   the namespace and listeners add p50 1.0 ms / p99 3.9 ms
   (`gated_start_overhead_benchmark`, 200 runs), and a whole `alpine` start
@@ -1579,7 +1579,7 @@ item in `internal_docs/TODO.md`.
   and crun. Five older ignored runc tests fail here with and without the
   floor (listed in TODO.md).
 - **Phase 7** ran as unit and integration tests: the host-grant matrix in
-  `tests/acl_endpoints.rs` (an exec task, a host-network container, and a
+  `tests/integration/acl_endpoints.rs` (an exec task, a host-network container, and a
   floor-less container refused without `host` and admitted with it), the
   gated-root refusal, and the classification table.
 - **Phase 8** ran end to end in `worker_plane_e2e` (the in-process worker is
@@ -1669,7 +1669,7 @@ decision and not a surprise:
 - `<dataDir>/bootstrap-token` and `~/.legion/token` exist with mode `0600`
   after first start. A restart mints nothing new.
 - `legion acl bootstrap` and `BootstrapAcl` no longer exist, and
-  `tests/acl_endpoints.rs` passes.
+  `tests/integration/acl_endpoints.rs` passes.
 
 **Phase 1**
 - On two hosts with only 4747 and 4848 open, `legion job logs`, `legion exec

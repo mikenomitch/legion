@@ -12,7 +12,7 @@
 //!   holders have none; a certificate that is presented must chain to the
 //!   cluster CA or the handshake fails.
 //! - [`Caller`] and the per-RPC checks: which caller classes each `Worker`
-//!   RPC admits. The table `tests/worker_plane_classes.rs` checks against the
+//!   RPC admits. The table `tests/integration/worker_plane_classes.rs` checks against the
 //!   proto is the source of truth.
 //! - [`advertise_address`]: what the worker tells managers to dial.
 

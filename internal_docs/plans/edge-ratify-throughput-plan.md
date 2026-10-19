@@ -206,7 +206,7 @@ fills the group commit up to its cap and heartbeats keep flowing.
 
 ### 6.4 The harness
 
-`tests/ratify_throughput_measure.rs` (ignored by default) drives the real
+`tests/integration/ratify_throughput_measure.rs` (ignored by default) drives the real
 `RatifyClaim` handler in-process: a multi-use prefix boot ticket minted
 through `IssueBootTicket`, ticket re-verification, the spend, the
 create-and-bind, the event, and the committed payload. It runs two fleet
@@ -227,7 +227,7 @@ Ratification `plan_submission` rows now carry an empty
 **Phase 1 (shipped).** §6.1 to §6.4, with regression tests and
 before/after numbers (below).
 
-Measured 2026-10-14 with `tests/ratify_throughput_measure.rs` on an Apple
+Measured 2026-10-14 with `tests/integration/ratify_throughput_measure.rs` on an Apple
 M5 laptop (10 cores, 32 GB) shared with other agents' builds (load
 average about 20). Base is `origin/main` at 37f43a5b, after PR #43.
 Baseline and change ran back to back, twice. Round 1 is shown, and round
@@ -279,7 +279,7 @@ follower round trip. Report the rate where p99 crosses `ratifyTimeout`.
 
 ## 9. Testing plan
 
-- `tests/edge_boot_integration.rs`:
+- `tests/integration/edge_boot_integration.rs`:
   - `concurrent_ratifications_for_one_job_all_confirm`: 16 nodes ratify 16
     new sandboxes of one job at once, all confirm.
   - `concurrent_ratifications_on_one_node_confirm_up_to_its_capacity`: 24
@@ -289,7 +289,7 @@ follower round trip. Report the rate where p99 crosses `ratifyTimeout`.
     every loser `instance_claimed`.
   - The existing suite (lost race, tombstone, cordon, ticket spend,
     reschedule) unchanged.
-- `tests/ratify_throughput_measure.rs` for the numbers.
+- `tests/integration/ratify_throughput_measure.rs` for the numbers.
 - The late-binding and plan-contention suites run unchanged: the
   scheduler's own plans keep both epoch fences.
 

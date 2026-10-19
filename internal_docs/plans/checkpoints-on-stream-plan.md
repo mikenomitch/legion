@@ -242,7 +242,7 @@ Instance user-42 suspended (snap-…)        # capture time + a few ms, not + ~3
   checkpoint-only message keeps the sequence), `checkpoints` (a push starts
   work and forgets nothing, an older reply does not forget unreported
   work), `simulate` (the faked channel answers pushes and wakes).
-- Integration: `tests/work_stream.rs`
+- Integration: `tests/integration/work_stream.rs`
   `checkpoint_work_reaches_a_streaming_worker_without_a_heartbeat`, on a
   raft manager so the projection runs inside the state machine's apply.
 - Regression: `tests/raft_lifecycle_ops.rs` unchanged (pushes and early

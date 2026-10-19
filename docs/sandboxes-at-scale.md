@@ -142,7 +142,7 @@ Every manager holds the whole replicated store, and a manager that joins, or
 a follower that falls behind, receives all of it as a snapshot. So the
 number that limits how many sandboxes a cluster can have is what each one
 leaves in the store, and the table below is what Legion keeps for each
-state. Sizes are from `tests/instance_scale_measure.rs`.
+state. Sizes are from `tests/integration/instance_scale_measure.rs`.
 
 | Sandbox | What the replicated store keeps |
 | --- | --- |

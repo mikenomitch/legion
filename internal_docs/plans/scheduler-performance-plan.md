@@ -110,11 +110,11 @@ Today we cannot prove it, and we only partially know it:
   and `candidate_construction` (indexes on/off) Criterion groups.
 - `benchmarks/micro/eval_critical_path_bench.rs`: enqueue→claim→apply→complete
   under 1/4/8 threads, local_disk only.
-- `tests/scheduler_benchmark_slo.rs` + `benchmarks/scheduler/scenarios/*.json`
+- `tests/integration/scheduler_benchmark_slo.rs` + `benchmarks/scheduler/scenarios/*.json`
   + `slo.json`: 3 small uniform scenarios, generous global thresholds, CI
   gate on scheduler-file changes.
-- `tests/raft_perf_smoke.rs`: single-node raft `put_kv` latency smoke +
-  lanes-vs-single A/B; `tests/raft_lanes.rs`: reusable 3-node in-process
+- `tests/integration/raft_perf_smoke.rs`: single-node raft `put_kv` latency smoke +
+  lanes-vs-single A/B; `tests/integration/raft_lanes.rs`: reusable 3-node in-process
   cluster harness (real tonic transport).
 - `src/storage/persistence.rs`: `PersistenceType::{LocalDisk, Raft,
   Streaming}`; streaming = rustyriver with `file://` or `s3://` replica.
@@ -175,13 +175,13 @@ one job type):
 ### 2. Shared runner + backend axis
 
 Scenario parsing/build/run/validate code moves to
-`tests/benchmark_support/mod.rs`, included via `#[path]` from both test
+`tests/integration/benchmark_support/mod.rs`, included via `#[path]` from both test
 binaries (same pattern as the existing `tests/store/`, `tests/eval/`
 dirs):
 
-- `tests/scheduler_benchmark_slo.rs` — unchanged role: local_disk CI gate,
+- `tests/integration/scheduler_benchmark_slo.rs` — unchanged role: local_disk CI gate,
   now over v2 scenarios with per-scenario SLOs.
-- `tests/scheduler_scale_benchmark.rs` (new, `#[ignore]`) — the full
+- `tests/integration/scheduler_scale_benchmark.rs` (new, `#[ignore]`) — the full
   matrix: every scenario × every requested backend.
   `LEGION_BENCH_BACKENDS=local_disk,raft1,raft3,streaming` (default
   `local_disk`) and `LEGION_BENCH_SCENARIOS=<name,...>` (default all)
@@ -194,10 +194,10 @@ Backends:
 
 - `local_disk` — today's store.
 - `raft1` — `PersistenceType::Raft`, bootstrap single node
-  (`tests/raft_perf_smoke.rs` config shape). Isolates
+  (`tests/integration/raft_perf_smoke.rs` config shape). Isolates
   propose→commit→apply cost without network.
 - `raft3` — 3-node in-process cluster, real tonic `RaftTransport`
-  (`tests/raft_lanes.rs` harness, extracted into the shared support
+  (`tests/integration/raft_lanes.rs` harness, extracted into the shared support
   module). Scheduling drives the leader's store. Measures quorum-commit
   cost on the scheduler write path.
 - `streaming` — `PersistenceType::Streaming`, `file://` replica, 1s sync
@@ -274,7 +274,7 @@ Each phase leaves the tree green and ships value on its own.
   (correctness ratio = 1.0 required for a cell to count).
 - Instrumentation: unit test that `PlanTimings` phases sum ≈ total and
   that all phases are nonzero on a real plan; metrics endpoint test
-  extends `tests/metrics_endpoint.rs`.
+  extends `tests/integration/metrics_endpoint.rs`.
 
 ## Rollout
 

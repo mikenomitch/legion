@@ -382,7 +382,7 @@ mod archive_test {
     fn setup_store() -> R<Store> {
         let store_dir = tempfile::Builder::new()
             .prefix("legion-archive-")
-            .tempdir()
+            .tempdir_in(crate::test_scratch::root())
             .context("error creating temp store directory")?
             .keep();
         let store_config = crate::structs::ManagerConfigFull {

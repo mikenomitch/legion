@@ -234,13 +234,13 @@ Ordering within the single phase, chosen so the compiler drives correctness:
 - **Compiler as the primary check.** Renaming a struct field and a public type
   makes every stale reference a hard error; `cargo build --all` passing is most
   of the coverage.
-- **`tests/config_jobs.rs`** parses every `configs/jobs/*.jsonnet`, so it is the
+- **`tests/integration/config_jobs.rs`** parses every `configs/jobs/*.jsonnet`, so it is the
   regression net for the config surface.
 - **New unit test in `src/structs/job.rs`**: a jobspec using `kind:` is rejected,
   and the error message names `runtime`.
 - **New migration test**: an existing DB with a populated `task_config.kind`
   migrates and the value is readable as `runtime`.
-- **`tests/acl_endpoints.rs`** re-run per AGENTS.md, since the proto is touched.
+- **`tests/integration/acl_endpoints.rs`** re-run per AGENTS.md, since the proto is touched.
 - **Full suite**: `cargo fmt --all`, `cargo clippy --all -- -D warnings`,
   `cargo test --all --locked`.
 

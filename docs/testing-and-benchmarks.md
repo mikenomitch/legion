@@ -7,11 +7,81 @@ This page covers how Legion is tested and benchmarked, and how to run each suite
 Legion uses a mixed strategy:
 
 - Unit tests colocated in module files (`#[cfg(test)]` in `src/`).
-- Integration tests under `tests/`.
+- Integration tests under `tests/`, almost all of them modules of one test
+  binary, `tests/integration/main.rs`.
 
-Integration tests currently include:
+### One integration binary
 
-- `tests/config_jobs.rs`
+Cargo builds every top-level `tests/*.rs` file as its own test binary, and
+each of those links all of Legion and its ~520 dependencies: about 200 MB of
+unoptimized code and a full link per file, repeated whenever the library
+changes. With some sixty files that was most of a `cargo test` run's build
+time and most of the target directory. So the integration tests are modules
+of `tests/integration/main.rs` and link once.
+
+Run one module, or one test, with a filter:
+
+```sh
+cargo test --test integration acl_endpoints::
+cargo test --test integration raft_lanes::killing_a_single_lane_leader_disturbs_only_that_lane -- --nocapture
+cargo test --test integration scheduler_benchmark_slo:: -- --ignored --nocapture
+```
+
+The filter is a substring of the test's full path, so the trailing `::`
+keeps `raft_lanes::` from also matching `raft_lanes_durability::`. libtest
+treats several filters as "any of", so name a single test by its full path
+rather than adding a second filter after `--`.
+
+The modules share one process and libtest's thread pool, which decides what
+may live there:
+
+- **Process-wide state.** A test that asserts on exact deltas of the global
+  Prometheus metrics, sets the scheduler's planner-concurrency gate, or
+  installs a `#[global_allocator]` would see or disturb its neighbours. Those
+  stay as separate `tests/*.rs` binaries: `tests/raft_lifecycle_ops.rs`,
+  `tests/raft_job_eval_ops.rs`, `tests/adaptive_scheduler_concurrency.rs`,
+  and `tests/session_index_scale_measure.rs`. Assert monotonic growth, as
+  `metrics_endpoint` does, when a shared-binary test reads a global.
+- **Raft clusters.** Tests that bring up a multi-node in-process cluster with
+  tight election timeouts take `support::cluster_gate()`, so only one runs
+  at a time across the whole binary.
+- **Measurements.** Benchmark and measurement tests are `#[ignore]`d and
+  live in the binary too. Run them with a module filter, as above; a bare
+  `--ignored` runs every one of them at once.
+
+### Build footprint
+
+`[profile.dev]` in `Cargo.toml` (which the test profile inherits) keeps line
+tables for Legion's own crates and drops debuginfo for dependencies. Panics
+and backtraces keep `file:line`; stepping through code with variables in a
+debugger needs `CARGO_PROFILE_DEV_DEBUG=2` for that build. The bundled
+SQLite is compiled with optimizations even in dev builds, because every
+store-backed test runs the full migration chain through it. The library's
+doc-test pass and the `legion` binary's empty unit-test target are switched
+off, since both cost a full rustdoc pass or link and ran nothing.
+
+### Temporary directories
+
+A test helper that returns a `Store` has to keep the store's directory alive
+past its `TempDir` guard, so it calls `keep()`. Such directories go under a
+per-process scratch root, `crate::test_scratch::root()` in `src/` and
+`crate::support::scratch_root()` in `tests/integration/`:
+
+```rust
+let dir = tempfile::Builder::new()
+    .prefix("legion-store-")
+    .tempdir_in(crate::test_scratch::root())?
+    .keep();
+```
+
+The root is removed when the test process exits. A directory kept directly
+in the system temp dir is never removed; at ~1.7 MB per store, a full run
+used to leave over a gigabyte behind. A run killed before it exits (Ctrl-C)
+still leaves its one `legion-tests-*` root in `$TMPDIR`.
+
+### Notable integration tests
+
+- `config_jobs`
   - evaluates every shipped `configs/jobs/*.ncl` and validates it the same
     way the manager does on submit. Deserializing to `JobConfig` alone is not
     enough to pass.
@@ -20,11 +90,11 @@ Integration tests currently include:
     (`configs/workers/*.ncl`) into their config structs.
   - parses the shipped job template, resolves its defaults, renders it through
     the manager's sandboxed path, and validates the result.
-- `tests/scheduler_integration.rs`
+- `scheduler_integration`
   - end-to-end scheduling scenarios (constraints, permit, count.per, reschedule behavior).
-- `tests/eval_loop.rs`
+- `eval_loop`
   - eval ordering and eval-driven ledger reconciliation behavior.
-- `tests/rollout_integration.rs`
+- `rollout_integration`
   - rollout progression behavior (auto/manual/create-first/destroy-first, etc).
 
 ## Running Tests
@@ -32,6 +102,11 @@ Integration tests currently include:
 Primary command:
 
 - `cargo test --all --locked`
+
+While iterating, build and run only what the change touches:
+
+- `cargo test --lib <filter>` for unit tests in `src/`.
+- `cargo test --test integration <module>::` for one integration module.
 
 Run the tests for any Rust change. Docs-only and frontend-only changes are the usual exception.
 
@@ -64,14 +139,14 @@ Benchmark targets:
 - `benchmarks/micro/scheduler_bench.rs` (Criterion)
 - `benchmarks/micro/eval_critical_path_bench.rs` (Criterion)
 - `benchmarks/micro/net_bench.rs` (Criterion)
-- `tests/scheduler_benchmark_slo.rs` (scenario runner + SLO gate, CI)
-- `tests/scheduler_scale_benchmark.rs` (scenario × persistence-backend
+- `tests/integration/scheduler_benchmark_slo.rs` (scenario runner + SLO gate, CI)
+- `tests/integration/scheduler_scale_benchmark.rs` (scenario × persistence-backend
   matrix, manual)
-- `tests/plan_contention.rs` (concurrent-submit contention harness)
+- `tests/integration/plan_contention.rs` (concurrent-submit contention harness)
 - Scenario definitions in `benchmarks/scheduler/scenarios/*.json`
 - SLO thresholds in `benchmarks/scheduler/slo.json` (global), overridable
   per scenario via the scenario's `slo` block
-- Shared runner code in `tests/benchmark_support/mod.rs`
+- Shared runner code in `tests/integration/benchmark_support/mod.rs`
 
 What they measure:
 
@@ -213,25 +288,25 @@ Run commands:
 
 - `cargo bench --bench scheduler_bench`
 - `cargo bench --bench eval_critical_path_bench`
-- `cargo test --test scheduler_benchmark_slo -- --ignored --nocapture`
-- `cargo test --test plan_contention -- --ignored --nocapture`
+- `cargo test --test integration scheduler_benchmark_slo:: -- --ignored --nocapture`
+- `cargo test --test integration plan_contention:: -- --ignored --nocapture`
 - Full backend matrix (use a release build for recorded numbers):
 
 ```bash
-LEGION_BENCH_BACKENDS=local_disk,raft1,raft3,streaming cargo test --release --test scheduler_scale_benchmark -- --ignored --nocapture
+LEGION_BENCH_BACKENDS=local_disk,raft1,raft3,streaming cargo test --release --test integration scheduler_scale_benchmark:: -- --ignored --nocapture
 ```
 
 - Subsets via `LEGION_BENCH_BACKENDS` and `LEGION_BENCH_SCENARIOS`
   (comma-separated scenario names).
 
-- Heartbeat scale matrix (`tests/heartbeat_scale_benchmark.rs`): fleet
+- Heartbeat scale matrix (`tests/integration/heartbeat_scale_benchmark.rs`): fleet
   size × backend. It measures heartbeat throughput (N driver threads
   heartbeating a fleet partition as fast as they can), p50/p99 heartbeat
   latency, and the wall-clock time of one liveness tick at that fleet size:
 
 ```bash
 LEGION_BENCH_BACKENDS=local_disk,raft1 LEGION_HEARTBEAT_NODES=1000,5000 \
-  cargo test --release --test heartbeat_scale_benchmark -- --ignored --nocapture
+  cargo test --release --test integration heartbeat_scale_benchmark:: -- --ignored --nocapture
 ```
 
   Knobs: `LEGION_HEARTBEAT_THREADS` (default 8) and
@@ -301,7 +376,7 @@ Scenario files encode:
 
 CI behavior:
 
-- `.github/workflows/ci.yml` runs the SLO benchmark gate only when scheduler-impacting files are changed (`src/manager/scheduler.rs`, `src/storage/store.rs`, `src/manager/daemon.rs`, benchmark scenarios, the shared runner in `tests/benchmark_support/`, or the gate test itself).
+- `.github/workflows/ci.yml` runs the SLO benchmark gate only when scheduler-impacting files are changed (`src/manager/scheduler.rs`, `src/storage/store.rs`, `src/manager/daemon.rs`, benchmark scenarios, the shared runner in `tests/integration/benchmark_support/`, or the gate test itself).
 - The backend matrix (`scheduler_scale_benchmark`) runs manually. It stands
   up raft clusters and is too heavy for per-PR CI. Its
   `plan_timings_are_populated_and_coherent` smoke test does run in normal CI
@@ -327,7 +402,7 @@ benchmarks/aws/scripts/local-smoke.sh
 
 CI runs the fixture tests, `terraform validate`, and shell syntax checks
 whenever `benchmarks/aws/**` or `benchmarks/loadgen/**` changes. Nothing in CI touches AWS. The
-end-to-end sim-fleet wire test is `tests/worker_simulation.rs`, which runs
+end-to-end sim-fleet wire test is `tests/integration/worker_simulation.rs`, which runs
 in the normal `cargo test` suite.
 
 The rig submits Legion jobs through `legion-loadgen`
@@ -451,21 +526,21 @@ sandbox-scaling work bought:
   keyed instance's lifecycle costs, on `single` and `lanes`, by summing every
   lane's applied index. A change that adds an entry to a stage fails it; a
   change that removes one updates the expected table.
-- `tests/work_stream.rs` covers `Manager.StreamWork`: delivery within a
+- `tests/integration/work_stream.rs` covers `Manager.StreamWork`: delivery within a
   round trip with no heartbeat, replay after a dropped stream, resync on
   another epoch or a gap, a sub-KiB steady heartbeat, a leader kill on a
   3-manager raft cluster, and checkpoint work (a suspend's capture, the
   reclaim after a resume) pushed with no heartbeat and never replayed. `LEGION_MEASURE_STREAM_ALLOCS=10000 cargo test
-  --release --test work_stream -- a_streaming_heartbeat --nocapture` is the
+  --release --test integration work_stream::a_streaming_heartbeat -- --nocapture` is the
   10,000-allocation heartbeat measurement.
-- `tests/blocked_evals.rs` covers blocked evals: wake by pool, by freed
+- `tests/integration/blocked_evals.rs` covers blocked evals: wake by pool, by freed
   capacity, escaped, an unblock during the running eval, one blocked eval
   per job, and a scheduler-lane failover that replays a missed wake.
-- `tests/instance_scale_measure.rs` (ignored; run with `--ignored
+- `tests/integration/instance_scale_measure.rs` (ignored; run with `--ignored
   --nocapture`) measures bytes per instance and snapshot row, the store
   image at 10^5 (or `LEGION_MEASURE_INSTANCES`) instances, and full-set
   heartbeat bytes per dense node.
-- `tests/session_integration.rs` has two ignored session measurements,
+- `tests/integration/session_integration.rs` has two ignored session measurements,
   against 16 fake nodes on loopback mTLS with no raft entry per start.
   `session_start_latency_measure` times routed starts one at a time and 64
   in flight. `session_start_cost_breakdown_measure` times each step of a
@@ -473,7 +548,7 @@ sandbox-scaling work bought:
   payload, the `PostWork` round trip, the router, and the whole
   `CreateInstance`) and prints the median and mean of each. Run them in a
   release build:
-  `cargo test --release --test session_integration -- --ignored --nocapture session_start`.
+  `cargo test --release --test integration session_integration::session_start -- --ignored --nocapture`.
 
 ## Plugin-Related Test Notes
 
