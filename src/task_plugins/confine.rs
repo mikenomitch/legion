@@ -187,8 +187,11 @@ pub fn inspect_address(inspect: &Value) -> Option<Ipv4Addr> {
 /// fails the VM's start: a gated VM never runs unconfined.
 pub struct PfConfiner {
     state: Mutex<PfState>,
-    run: Box<dyn Fn(&str, &[&str], Option<&str>) -> R<String> + Send + Sync>,
+    run: Box<CommandRunner>,
 }
+
+/// Runs `program` with `args` (and `stdin`), returning its output.
+type CommandRunner = dyn Fn(&str, &[&str], Option<&str>) -> R<String> + Send + Sync;
 
 #[derive(Default)]
 struct PfState {

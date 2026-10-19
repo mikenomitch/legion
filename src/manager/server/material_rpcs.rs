@@ -407,7 +407,7 @@ impl ManagerDaemonService {
                     )));
                 }
                 if wanted.kind == MATERIAL_PLUGIN {
-                    return Ok(Declared::Plugin(record));
+                    return Ok(Declared::Plugin(Box::new(record)));
                 }
                 let credential = wanted.part.trim();
                 let source = record
@@ -604,7 +604,7 @@ impl ManagerDaemonService {
 /// What a ref's declaration names.
 enum Declared {
     Policy(String),
-    Plugin(crate::storage::netplugin_store::NetPluginRecord),
+    Plugin(Box<crate::storage::netplugin_store::NetPluginRecord>),
     Source(Source, ValueCheck),
 }
 

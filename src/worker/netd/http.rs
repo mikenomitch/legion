@@ -877,7 +877,7 @@ async fn handle(
                     &source,
                     reason.as_deref(),
                     &method,
-                    &path_only,
+                    path_only,
                 );
                 if let Some(chain) = chain {
                     access_log(
