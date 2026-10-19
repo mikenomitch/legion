@@ -736,7 +736,7 @@ A `store` session's record lives beside its checkpoints in the worker's
 `contentStore`, one JSON object per session:
 
 ```
-<contentStore.url>/sessions/<job>/<id-prefix>/<id>.json
+<contentStore.url>/sessions/<namespace>/<job>/<id-prefix>/<id>.json
 ```
 
 `<id-prefix>` is the first two characters of the id's random part, so a
@@ -791,7 +791,7 @@ mechanisms stop an older copy.
    checkpoint, a suspend, an `onWorkerStop` checkpoint) checks that the
    manifest still names its node at its generation. A copy that finds a
    newer generation ends itself with reason `superseded`.
-2. **Fence list.** A move leaves `sessions/fence/<old-node>/<id>` in the
+2. **Fence list.** A move leaves `sessions/_fence/<old-node>/<id>` in the
    content store. Every node lists its own fence prefix every
    `sessions.fenceListEvery` (worker config, default `30s`), stops each
    session at or below the fenced generation, and deletes the marker.

@@ -809,7 +809,7 @@ mod acl_store_test {
     fn policy_crud_roundtrip_and_validation() -> R<()> {
         let store = setup_store()?;
 
-        let rules = r#"[{"resources": ["job"], "actions": ["read"]}]"#;
+        let rules = r#"[{"resources": ["job"], "namespaces": ["*"], "actions": ["read"]}]"#;
         let policy = store.upsert_acl_policy("readers", "read jobs", rules)?;
         assert_eq!(policy.name, "readers");
         assert_eq!(policy.rules_json, rules);
@@ -985,7 +985,11 @@ mod acl_store_test {
     #[test]
     fn resolve_acl_rules_flattens_and_skips_missing() -> R<()> {
         let store = setup_store()?;
-        store.upsert_acl_policy("a", "", r#"[{"resources": ["job"], "actions": ["read"]}]"#)?;
+        store.upsert_acl_policy(
+            "a",
+            "",
+            r#"[{"resources": ["job"], "namespaces": ["*"], "actions": ["read"]}]"#,
+        )?;
         store.upsert_acl_policy(
             "b",
             "",

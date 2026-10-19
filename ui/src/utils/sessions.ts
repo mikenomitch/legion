@@ -2,6 +2,7 @@ import { createSignal } from 'solid-js'
 import type { InstanceInfo, SessionNode } from '../gen/legion_pb'
 import { allows, jobScope } from './acl'
 import type { JobTask } from './jobspec'
+import { jobPath } from './namespaces'
 
 /*
  * Session mode in the UI (docs/session-mode.md): which instances are
@@ -216,7 +217,7 @@ export const jobInstancesHref = (jobId: string, filter: Omit<InstanceFilter, 'te
   if (filter.node) params.set('node', filter.node)
   if (filter.envelope) params.set('envelope', filter.envelope)
   const query = params.toString()
-  return `/jobs/${encodeURIComponent(jobId)}${query ? `?${query}` : ''}#instances`
+  return `${jobPath(jobId)}${query ? `?${query}` : ''}#instances`
 }
 
 /** The CLI line that lists a job's instances in full. */

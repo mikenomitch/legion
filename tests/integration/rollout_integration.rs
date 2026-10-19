@@ -52,6 +52,7 @@ fn insert_node(store: &Store, id: &str) -> R<()> {
 
 fn run_request(jobspec: String, name: &str) -> RunJobRequest {
     RunJobRequest {
+        namespace: Default::default(),
         parsed_jobspec: jobspec,
         submissions: vec![Submission {
             path: format!("{name}.ncl"),

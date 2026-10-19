@@ -323,7 +323,7 @@ mod tests {
         validation.set_issuer(&[&base]);
         validation.set_audience(&["sts.amazonaws.com"]);
         let decoded = decode::<Map<String, Value>>(&issued.token, &decoding, &validation)?.claims;
-        assert_eq!(decoded["sub"], json!("auto:api:web:server"));
+        assert_eq!(decoded["sub"], json!("auto:default:api:web:server"));
         assert_eq!(decoded["legion.io/alloc"], json!("7"));
 
         // 3. Unknown well-known paths are plain 404s.

@@ -43,6 +43,8 @@ const DELETABLE_POLICY: &str = "deletable-policy";
 const FIXTURE_NET_POLICY: &str = "fixture-net-policy";
 const DELETABLE_NET_POLICY: &str = "deletable-net-policy";
 const DELETABLE_USER: &str = "deletable-user";
+const FIXTURE_NAMESPACE: &str = "acl-ns";
+const DELETABLE_NAMESPACE: &str = "deletable-ns";
 
 /// How an endpoint participates in the ACL system.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -90,6 +92,20 @@ fn endpoint_table() -> Vec<(&'static str, Plane)> {
         ("GetJobScaleStatus", Plane::Protected("scale:read")),
         ("DestroyJob", Plane::Protected("job:write")),
         ("ListJobs", Plane::Protected("job:read")),
+        // Namespaces (docs/namespaces.md). ListNamespaces filters per item
+        // and is denied outright only to a caller that reaches none.
+        (
+            "ListNamespaces",
+            Plane::Protected("namespace:read (per item)"),
+        ),
+        ("GetNamespace", Plane::Protected("namespace:read")),
+        ("ApplyNamespace", Plane::Protected("namespace:write")),
+        ("DeleteNamespace", Plane::Protected("namespace:write")),
+        // Namespace policies are governance: ACL-policy privilege.
+        ("ListNamespacePolicies", Plane::Protected("acl:read")),
+        ("GetNamespacePolicy", Plane::Protected("acl:read")),
+        ("ApplyNamespacePolicy", Plane::Protected("acl:write")),
+        ("DeleteNamespacePolicy", Plane::Protected("acl:write")),
         ("UpsertJobTemplate", Plane::Protected("template:write")),
         ("ListJobTemplates", Plane::Protected("template:read")),
         ("GetJobTemplate", Plane::Protected("template:read")),
@@ -395,7 +411,7 @@ async fn call_endpoint(
             .map(|_| ()),
         "RenderJobTemplate" => svc
             .render_job_template(req(
-                RenderJobTemplateRequest {
+                RenderJobTemplateRequest { namespace: Default::default(),
                     name: TEMPLATE_NAME.into(),
                     version: None,
                     variables_json: "{}".into(),
@@ -406,7 +422,7 @@ async fn call_endpoint(
             .map(|_| ()),
         "RunJobTemplate" => svc
             .run_job_template(req(
-                RunJobTemplateRequest {
+                RunJobTemplateRequest { namespace: Default::default(),
                     name: TEMPLATE_NAME.into(),
                     version: None,
                     variables_json: "{}".into(),
@@ -507,7 +523,7 @@ async fn call_endpoint(
             .map(|_| ()),
         "PlanJob" => svc
             .plan_job(req(
-                PlanJobRequest {
+                PlanJobRequest { namespace: Default::default(),
                     parsed_jobspec: jobspec(JOB_NAME),
                 },
                 token,
@@ -568,6 +584,75 @@ async fn call_endpoint(
             .map(|_| ()),
         "ResolveService" => svc
             .resolve_service(req(ResolveServiceRequest::default(), token))
+            .await
+            .map(|_| ()),
+        "ListNamespaces" => svc
+            .list_namespaces(req(ListNamespacesRequest::default(), token))
+            .await
+            .map(|_| ()),
+        "GetNamespace" => svc
+            .get_namespace(req(
+                GetNamespaceRequest {
+                    name: FIXTURE_NAMESPACE.into(),
+                },
+                token,
+            ))
+            .await
+            .map(|_| ()),
+        "ApplyNamespace" => svc
+            .apply_namespace(req(
+                ApplyNamespaceRequest {
+                    namespace: Some(Namespace {
+                        name: "acl-applied-ns".into(),
+                        ..Default::default()
+                    }),
+                    dry_run: false,
+                },
+                token,
+            ))
+            .await
+            .map(|_| ()),
+        "DeleteNamespace" => svc
+            .delete_namespace(req(
+                DeleteNamespaceRequest {
+                    name: DELETABLE_NAMESPACE.into(),
+                    ..Default::default()
+                },
+                token,
+            ))
+            .await
+            .map(|_| ()),
+        "ListNamespacePolicies" => svc
+            .list_namespace_policies(req(ListNamespacePoliciesRequest::default(), token))
+            .await
+            .map(|_| ()),
+        "GetNamespacePolicy" => svc
+            .get_namespace_policy(req(
+                GetNamespacePolicyRequest {
+                    name: "acl-namespace-policy".into(),
+                },
+                token,
+            ))
+            .await
+            .map(|_| ()),
+        "ApplyNamespacePolicy" => svc
+            .apply_namespace_policy(req(
+                ApplyNamespacePolicyRequest {
+                    object_json: r#"{"name":"acl-namespace-policy","namespaces":["acl-*"],"maxJobs":100}"#.into(),
+                    ..Default::default()
+                },
+                token,
+            ))
+            .await
+            .map(|_| ()),
+        "DeleteNamespacePolicy" => svc
+            .delete_namespace_policy(req(
+                DeleteNamespacePolicyRequest {
+                    name: "acl-namespace-policy-deletable".into(),
+                    ..Default::default()
+                },
+                token,
+            ))
             .await
             .map(|_| ()),
         "UpsertNetPolicy" => svc
@@ -1347,7 +1432,7 @@ async fn call_endpoint(
                 UpsertAclPolicyRequest {
                     name: "acl-test-policy".into(),
                     description: String::new(),
-                    rules_json: r#"[{"resources": ["job"], "actions": ["read"]}]"#.into(),
+                    rules_json: r#"[{"resources": ["job"], "namespaces": ["*"], "actions": ["read"]}]"#.into(),
                 },
                 token,
             ))
@@ -1495,6 +1580,21 @@ fn seed_fixtures(store: &Store) -> R<Fixtures> {
         store.upsert_net_policy(object)?;
     }
 
+    for name in [FIXTURE_NAMESPACE, DELETABLE_NAMESPACE] {
+        store.apply_namespace(legion::structs::namespace::Namespace {
+            name: name.into(),
+            ..Default::default()
+        })?;
+    }
+    for name in ["acl-namespace-policy", "acl-namespace-policy-deletable"] {
+        store.apply_namespace_policy(
+            legion::structs::namespace_policy::NamespacePolicy::from_json(
+                &serde_json::json!({ "name": name, "namespaces": ["acl-*"] }).to_string(),
+            )
+            .map_err(|err| anyhow!(err))?,
+        )?;
+    }
+
     store.upsert_job_template_version(
         TEMPLATE_NAME,
         Some("acl fixture template"),
@@ -1510,12 +1610,12 @@ fn seed_fixtures(store: &Store) -> R<Fixtures> {
     store.upsert_acl_policy(
         FIXTURE_POLICY,
         "fixture",
-        r#"[{"resources": ["job"], "actions": ["read"]}]"#,
+        r#"[{"resources": ["job"], "namespaces": ["*"], "actions": ["read"]}]"#,
     )?;
     store.upsert_acl_policy(
         DELETABLE_POLICY,
         "fixture",
-        r#"[{"resources": ["job"], "actions": ["read"]}]"#,
+        r#"[{"resources": ["job"], "namespaces": ["*"], "actions": ["read"]}]"#,
     )?;
     store.upsert_acl_user(
         DELETABLE_USER,
@@ -2245,7 +2345,7 @@ async fn job_name_scoped_policy_limits_job_access() -> R<()> {
         "acl-job-only",
         "",
         &format!(
-            r#"[{{"resources": ["job"], "actions": ["read", "write"], "names": ["{JOB_NAME}"]}}]"#
+            r#"[{{"resources": ["job"], "namespaces": ["*"], "actions": ["read", "write"], "names": ["{JOB_NAME}"]}}]"#
         ),
     )?;
     let (_, secret) = authenticator
@@ -2302,7 +2402,7 @@ async fn template_scoped_policy_gates_submission_channel() -> R<()> {
             r#"[
                 {{"resources": ["template"], "actions": ["read"],
                   "templates": ["{TEMPLATE_NAME}", "acl-hijack"]}},
-                {{"resources": ["job"], "actions": ["read", "write"],
+                {{"resources": ["job"], "namespaces": ["*"], "actions": ["read", "write"],
                   "templates": ["{TEMPLATE_NAME}", "acl-hijack"]}}
             ]"#
         ),
@@ -2378,6 +2478,7 @@ async fn template_scoped_policy_gates_submission_channel() -> R<()> {
     let status = svc
         .run_job_template(req(
             RunJobTemplateRequest {
+                namespace: Default::default(),
                 name: "acl-hijack".into(),
                 version: None,
                 variables_json: "{}".into(),
@@ -2404,12 +2505,12 @@ async fn host_level_jobs_need_the_host_grant_test() -> R<()> {
     svc.store.upsert_acl_policy(
         "deployer",
         "",
-        r#"[{"resources": ["job"], "actions": ["read", "write"]}]"#,
+        r#"[{"resources": ["job"], "namespaces": ["*"], "actions": ["read", "write"]}]"#,
     )?;
     svc.store.upsert_acl_policy(
         "platform",
         "",
-        r#"[{"resources": ["job"], "actions": ["read", "write"], "host": true}]"#,
+        r#"[{"resources": ["job"], "namespaces": ["*"], "actions": ["read", "write"], "host": true}]"#,
     )?;
     let mint = |policy: &str| {
         authenticator
@@ -2444,6 +2545,7 @@ async fn host_level_jobs_need_the_host_grant_test() -> R<()> {
         async move {
             svc.run_job(req(
                 RunJobRequest {
+                    namespace: Default::default(),
                     parsed_jobspec: spec,
                     submissions: vec![],
                     priority: None,
@@ -2516,7 +2618,7 @@ async fn band_scoped_policy_gates_the_priority_a_job_may_claim() -> R<()> {
     svc.store.upsert_acl_policy(
         "band-limited",
         "",
-        r#"[{"resources": ["job"], "actions": ["read", "write"],
+        r#"[{"resources": ["job"], "namespaces": ["*"], "actions": ["read", "write"],
              "bands": ["high", "elevated", "normal", "low", "background"]}]"#,
     )?;
     let (_, secret) = authenticator
@@ -2551,6 +2653,7 @@ async fn band_scoped_policy_gates_the_priority_a_job_may_claim() -> R<()> {
         async move {
             svc.run_job(req(
                 RunJobRequest {
+                    namespace: Default::default(),
                     parsed_jobspec: spec,
                     submissions: vec![],
                     priority: None,
@@ -2617,7 +2720,7 @@ async fn band_scoped_policy_gates_the_priority_a_job_may_claim() -> R<()> {
     svc.store.upsert_acl_policy(
         "band-limited-template",
         "",
-        r#"[{"resources": ["job"], "actions": ["read", "write"],
+        r#"[{"resources": ["job"], "namespaces": ["*"], "actions": ["read", "write"],
              "bands": ["high", "normal"], "templates": ["band-escalation"]},
             {"resources": ["template"], "actions": ["read"],
              "templates": ["band-escalation"]}]"#,
@@ -2634,6 +2737,7 @@ async fn band_scoped_policy_gates_the_priority_a_job_may_claim() -> R<()> {
     let status = svc
         .run_job_template(req(
             RunJobTemplateRequest {
+                namespace: Default::default(),
                 name: "band-escalation".into(),
                 version: None,
                 variables_json: "{}".into(),
@@ -2652,7 +2756,7 @@ async fn band_scoped_policy_gates_the_priority_a_job_may_claim() -> R<()> {
     svc.store.upsert_acl_policy(
         "band-unrestricted",
         "",
-        r#"[{"resources": ["job"], "actions": ["read", "write"]}]"#,
+        r#"[{"resources": ["job"], "namespaces": ["*"], "actions": ["read", "write"]}]"#,
     )?;
     let (_, open_secret) = authenticator
         .mint_token(
@@ -2744,7 +2848,7 @@ async fn kv_backed_ingress_cert_needs_kv_read_on_the_path() -> R<()> {
     svc.store.upsert_acl_policy(
         "deployer",
         "",
-        r#"[{"resources": ["job"], "actions": ["read", "write"]}]"#,
+        r#"[{"resources": ["job"], "namespaces": ["*"], "actions": ["read", "write"]}]"#,
     )?;
     svc.store.upsert_acl_policy(
         "cert-reader",
@@ -2780,6 +2884,7 @@ async fn kv_backed_ingress_cert_needs_kv_read_on_the_path() -> R<()> {
         async move {
             svc.run_job(req(
                 RunJobRequest {
+                    namespace: Default::default(),
                     parsed_jobspec: jobspec.to_string(),
                     submissions: Vec::new(),
                     priority: None,
@@ -2818,7 +2923,7 @@ async fn upstream_credential_needs_kv_read_on_the_path() -> R<()> {
     svc.store.upsert_acl_policy(
         "deployer",
         "",
-        r#"[{"resources": ["job"], "actions": ["read", "write"]}]"#,
+        r#"[{"resources": ["job"], "namespaces": ["*"], "actions": ["read", "write"]}]"#,
     )?;
     svc.store.upsert_acl_policy(
         "secret-reader",
@@ -2859,6 +2964,7 @@ async fn upstream_credential_needs_kv_read_on_the_path() -> R<()> {
         async move {
             svc.run_job(req(
                 RunJobRequest {
+                    namespace: Default::default(),
                     parsed_jobspec: jobspec.to_string(),
                     submissions: Vec::new(),
                     priority: None,
@@ -2941,7 +3047,7 @@ async fn node_lookups_check_before_fetch() -> R<()> {
     let (_, secret) = token_with_rules(
         &svc,
         "jobs-only",
-        r#"[{"resources": ["job"], "actions": ["read", "write"]}]"#,
+        r#"[{"resources": ["job"], "namespaces": ["*"], "actions": ["read", "write"]}]"#,
     )?;
     let missing = "no-such-node".to_string();
     let results = [
@@ -3022,7 +3128,7 @@ async fn jobless_volume_delete_requires_cluster_wide_job_write() -> R<()> {
     let (_, scoped) = token_with_rules(
         &svc,
         "acl-jobs-writer",
-        r#"[{"resources": ["job"], "actions": ["write"], "names": ["acl-*"]}]"#,
+        r#"[{"resources": ["job"], "namespaces": ["*"], "actions": ["write"], "names": ["acl-*"]}]"#,
     )?;
     let status = svc
         .delete_volume(delete(&scoped))
@@ -3038,7 +3144,7 @@ async fn jobless_volume_delete_requires_cluster_wide_job_write() -> R<()> {
     let (_, cluster) = token_with_rules(
         &svc,
         "all-jobs-writer",
-        r#"[{"resources": ["job"], "actions": ["write"]}]"#,
+        r#"[{"resources": ["job"], "namespaces": ["*"], "actions": ["write"]}]"#,
     )?;
     svc.delete_volume(delete(&cluster)).await?;
     Ok(())
@@ -3085,7 +3191,7 @@ async fn stream_events_closes_when_its_token_is_revoked() -> R<()> {
 #[tokio::test]
 async fn idempotency_keys_are_scoped_to_operation_and_caller() -> R<()> {
     let (svc, _, _) = setup_enabled()?;
-    let rules = r#"[{"resources": ["job"], "actions": ["read", "write"]}]"#;
+    let rules = r#"[{"resources": ["job"], "namespaces": ["*"], "actions": ["read", "write"]}]"#;
     let (_, alice) = token_with_rules(&svc, "alice-jobs", rules)?;
     let (_, bob) = token_with_rules(&svc, "bob-jobs", rules)?;
     let stop = |secret: &str| {
@@ -3198,7 +3304,7 @@ async fn anonymous_policy_grants_tokenless_access() -> R<()> {
     svc.store.upsert_acl_policy(
         "anonymous",
         "migration ramp",
-        r#"[{"resources": ["job"], "actions": ["read"]}]"#,
+        r#"[{"resources": ["job"], "namespaces": ["*"], "actions": ["read"]}]"#,
     )?;
 
     call_endpoint(&svc, &fixtures, "ListJobs", None)
@@ -3511,7 +3617,7 @@ async fn memory_suspend_needs_snapshot_write() -> R<()> {
     svc.store.upsert_acl_policy(
         "job-writer",
         "",
-        r#"[{"resources": ["job"], "actions": ["read", "write"]}]"#,
+        r#"[{"resources": ["job"], "namespaces": ["*"], "actions": ["read", "write"]}]"#,
     )?;
     let (_, secret) = authenticator
         .mint_token(
@@ -3553,7 +3659,7 @@ async fn fork_and_create_from_snapshot_need_snapshot_grants() -> R<()> {
     svc.store.upsert_acl_policy(
         "job-writer",
         "",
-        r#"[{"resources": ["job"], "actions": ["read", "write"]}]"#,
+        r#"[{"resources": ["job"], "namespaces": ["*"], "actions": ["read", "write"]}]"#,
     )?;
     let (_, secret) = authenticator
         .mint_token(
@@ -3591,5 +3697,759 @@ async fn fork_and_create_from_snapshot_need_snapshot_grants() -> R<()> {
         .await
         .expect_err("a create from a snapshot needs snapshot:read");
     assert_eq!(status.code(), Code::PermissionDenied);
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Namespaces (docs/namespaces.md)
+// ---------------------------------------------------------------------------
+
+fn run_request(spec: &str, namespace: Option<&str>, token: &str) -> Request<RunJobRequest> {
+    req(
+        RunJobRequest {
+            parsed_jobspec: spec.to_string(),
+            namespace: namespace.map(str::to_string),
+            ..Default::default()
+        },
+        Some(token),
+    )
+}
+
+/// A spec that validates without locally built plugin dylibs and is not
+/// host-level (the built-in `container` runtime, as `template_source`), in
+/// `namespace` when given.
+fn namespaced_jobspec(name: &str, namespace: Option<&str>) -> String {
+    let mut spec = serde_json::json!({
+        "name": name,
+        "tasks": [{
+            "name": "main",
+            "runtime": "container",
+            "count": 1,
+            "config": { "image": "alpine", "command": ["echo", "ok"] },
+            "resources": {},
+            "constraints": {},
+        }],
+    });
+    if let Some(namespace) = namespace {
+        spec["namespace"] = serde_json::json!(namespace);
+    }
+    spec.to_string()
+}
+
+async fn create_namespaces(svc: &ManagerDaemonService, secret: &str, names: &[&str]) -> R<()> {
+    for name in names {
+        svc.apply_namespace(req(
+            ApplyNamespaceRequest {
+                namespace: Some(Namespace {
+                    name: name.to_string(),
+                    ..Default::default()
+                }),
+                dry_run: false,
+            },
+            Some(secret),
+        ))
+        .await?;
+    }
+    Ok(())
+}
+
+/// Scenario 1 and 2 of the plan: two namespaces hold a job of the same name,
+/// and a token scoped to one cannot see, stop or destroy the other's — with
+/// or without asking for every namespace.
+#[tokio::test]
+async fn a_namespace_scoped_token_stays_inside_its_namespaces() -> R<()> {
+    let (svc, _, management) = setup_enabled()?;
+    create_namespaces(&svc, &management, &["payments-prod", "checkout-prod"]).await?;
+    for namespace in ["payments-prod", "checkout-prod"] {
+        svc.run_job(run_request(
+            &namespaced_jobspec("web", None),
+            Some(namespace),
+            &management,
+        ))
+        .await?;
+    }
+    // Same name, two namespaces, two jobs.
+    let all = svc
+        .list_jobs(req(
+            ListJobsRequest {
+                namespaces: vec!["*".into()],
+                ..Default::default()
+            },
+            Some(&management),
+        ))
+        .await?
+        .into_inner();
+    let ids: BTreeSet<_> = all.jobs.iter().map(|job| job.id.clone()).collect();
+    assert!(ids.contains("payments-prod/web") && ids.contains("checkout-prod/web"));
+    let payments_web = all
+        .jobs
+        .iter()
+        .find(|job| job.id == "payments-prod/web")
+        .expect("payments-prod/web");
+    assert_eq!(payments_web.name, "web");
+    assert_eq!(payments_web.namespace, "payments-prod");
+
+    let (_, team) = token_with_rules(
+        &svc,
+        "payments-team",
+        r#"[{"resources": ["job"], "actions": ["read", "write"], "namespaces": ["payments-*"]}]"#,
+    )?;
+
+    // Every namespace it may read, and nothing else — `*` widens what is
+    // considered, never what is visible.
+    for selection in [
+        vec!["*".to_string()],
+        vec!["payments-prod,checkout-prod".to_string()],
+    ] {
+        let listed = svc
+            .list_jobs(req(
+                ListJobsRequest {
+                    namespaces: selection,
+                    ..Default::default()
+                },
+                Some(&team),
+            ))
+            .await?
+            .into_inner();
+        let ids: Vec<_> = listed.jobs.iter().map(|job| job.id.as_str()).collect();
+        assert_eq!(ids, vec!["payments-prod/web"], "{ids:?}");
+    }
+    // The default selection is `default`, and the reply says where the
+    // caller's jobs are instead of looking empty.
+    let default = svc
+        .list_jobs(req(ListJobsRequest::default(), Some(&team)))
+        .await?
+        .into_inner();
+    assert!(default.jobs.is_empty());
+    assert_eq!(default.elsewhere_count, 1);
+    assert_eq!(default.elsewhere_namespaces, 1);
+
+    svc.get_job_info(req(
+        GetJobInfoRequest {
+            name: "payments-prod/web".into(),
+        },
+        Some(&team),
+    ))
+    .await?;
+    for (rpc, result) in [
+        (
+            "GetJobInfo",
+            svc.get_job_info(req(
+                GetJobInfoRequest {
+                    name: "checkout-prod/web".into(),
+                },
+                Some(&team),
+            ))
+            .await
+            .map(|_| ()),
+        ),
+        (
+            "StopJob",
+            svc.stop_job(req(
+                StopJobRequest {
+                    name: "checkout-prod/web".into(),
+                    ..Default::default()
+                },
+                Some(&team),
+            ))
+            .await
+            .map(|_| ()),
+        ),
+        (
+            "DestroyJob",
+            svc.destroy_job(req(
+                DestroyJobRequest {
+                    name: "checkout-prod/web".into(),
+                    ..Default::default()
+                },
+                Some(&team),
+            ))
+            .await
+            .map(|_| ()),
+        ),
+        (
+            "RunJob",
+            svc.run_job(run_request(
+                &namespaced_jobspec("api", None),
+                Some("checkout-prod"),
+                &team,
+            ))
+            .await
+            .map(|_| ()),
+        ),
+    ] {
+        let status = result.expect_err(rpc);
+        assert_eq!(
+            status.code(),
+            Code::PermissionDenied,
+            "{rpc}: {}",
+            status.message()
+        );
+    }
+    // Its own namespace works end to end.
+    svc.run_job(run_request(
+        &namespaced_jobspec("api", None),
+        Some("payments-prod"),
+        &team,
+    ))
+    .await?;
+    Ok(())
+}
+
+/// The spec's namespace and the request's must agree, authorization runs
+/// against the resolved one (Nomad's CVE-2024-10975 was a spec field
+/// overriding an authorized request field), and namespaces are never
+/// created implicitly.
+#[tokio::test]
+async fn submit_resolves_the_namespace_server_side() -> R<()> {
+    let (svc, _, management) = setup_enabled()?;
+    create_namespaces(&svc, &management, &["dev", "prod"]).await?;
+    let (_, dev_only) = token_with_rules(
+        &svc,
+        "dev-only",
+        r#"[{"resources": ["job"], "actions": ["write"], "namespaces": ["dev"]}]"#,
+    )?;
+
+    let conflict = svc
+        .run_job(run_request(
+            &namespaced_jobspec("api", Some("prod")),
+            Some("dev"),
+            &dev_only,
+        ))
+        .await
+        .expect_err("a spec/request conflict is rejected");
+    assert_eq!(conflict.code(), Code::InvalidArgument);
+    assert!(
+        conflict
+            .message()
+            .contains("jobspec declares namespace 'prod' but the request names 'dev'"),
+        "{}",
+        conflict.message()
+    );
+
+    // The spec's namespace is what is authorized when the request names none.
+    let denied = svc
+        .run_job(run_request(
+            &namespaced_jobspec("api", Some("prod")),
+            None,
+            &dev_only,
+        ))
+        .await
+        .expect_err("a dev token may not write into prod via the spec");
+    assert_eq!(denied.code(), Code::PermissionDenied);
+
+    svc.run_job(run_request(
+        &namespaced_jobspec("api", Some("dev")),
+        Some("dev"),
+        &dev_only,
+    ))
+    .await?;
+
+    let missing = svc
+        .run_job(run_request(
+            &namespaced_jobspec("api", None),
+            Some("does-not-exist"),
+            &management,
+        ))
+        .await
+        .expect_err("a missing namespace is refused");
+    assert_eq!(missing.code(), Code::NotFound);
+    assert!(
+        missing
+            .message()
+            .contains("namespace 'does-not-exist' does not exist"),
+        "{}",
+        missing.message()
+    );
+    // A caller with no grant there learns nothing about whether it exists.
+    let probe = svc
+        .run_job(run_request(
+            &namespaced_jobspec("api", None),
+            Some("does-not-exist"),
+            &dev_only,
+        ))
+        .await
+        .expect_err("probe");
+    assert_eq!(probe.code(), Code::PermissionDenied);
+    Ok(())
+}
+
+/// Namespace creation is delegable by glob, listing is per item, and a
+/// cascade delete needs job:write as well as namespace:write.
+#[tokio::test]
+async fn namespace_administration_is_delegable_and_cascades_need_job_write() -> R<()> {
+    let (svc, _, management) = setup_enabled()?;
+    let (_, lead) = token_with_rules(
+        &svc,
+        "payments-lead",
+        r#"[{"resources": ["namespace"], "actions": ["read", "write"], "namespaces": ["payments-*"]}]"#,
+    )?;
+    create_namespaces(&svc, &lead, &["payments-loadtest"]).await?;
+    let denied = svc
+        .apply_namespace(req(
+            ApplyNamespaceRequest {
+                namespace: Some(Namespace {
+                    name: "checkout-prod".into(),
+                    ..Default::default()
+                }),
+                dry_run: false,
+            },
+            Some(&lead),
+        ))
+        .await
+        .expect_err("outside its glob");
+    assert_eq!(denied.code(), Code::PermissionDenied);
+
+    create_namespaces(&svc, &management, &["checkout-prod"]).await?;
+    let visible: Vec<_> = svc
+        .list_namespaces(req(ListNamespacesRequest::default(), Some(&lead)))
+        .await?
+        .into_inner()
+        .namespaces
+        .into_iter()
+        .map(|namespace| namespace.name)
+        .collect();
+    assert_eq!(visible, vec!["payments-loadtest".to_string()]);
+    let who = svc
+        .who_am_i(req(WhoAmIRequest::default(), Some(&lead)))
+        .await?
+        .into_inner();
+    assert_eq!(
+        who.readable_namespaces,
+        vec!["payments-loadtest".to_string()]
+    );
+
+    // A job lands in it; deleting without --cascade is refused and says why.
+    svc.run_job(run_request(
+        &namespaced_jobspec("soak", None),
+        Some("payments-loadtest"),
+        &management,
+    ))
+    .await?;
+    let refused = svc
+        .delete_namespace(req(
+            DeleteNamespaceRequest {
+                name: "payments-loadtest".into(),
+                ..Default::default()
+            },
+            Some(&lead),
+        ))
+        .await
+        .expect_err("not empty");
+    assert_eq!(refused.code(), Code::FailedPrecondition);
+    assert!(
+        refused.message().contains("is not empty: 1 job"),
+        "{}",
+        refused.message()
+    );
+    // A cascade would destroy a job the lead cannot otherwise touch.
+    let cascade = svc
+        .delete_namespace(req(
+            DeleteNamespaceRequest {
+                name: "payments-loadtest".into(),
+                cascade: true,
+                ..Default::default()
+            },
+            Some(&lead),
+        ))
+        .await
+        .expect_err("cascade without job:write");
+    assert_eq!(cascade.code(), Code::PermissionDenied);
+
+    // The dry run lists the contents; the management cascade empties it.
+    let dry = svc
+        .delete_namespace(req(
+            DeleteNamespaceRequest {
+                name: "payments-loadtest".into(),
+                dry_run: true,
+                ..Default::default()
+            },
+            Some(&lead),
+        ))
+        .await?
+        .into_inner();
+    assert_eq!(
+        dry.contents.expect("contents").jobs,
+        vec!["payments-loadtest/soak".to_string()]
+    );
+    let deleted = svc
+        .delete_namespace(req(
+            DeleteNamespaceRequest {
+                name: "payments-loadtest".into(),
+                cascade: true,
+                ..Default::default()
+            },
+            Some(&management),
+        ))
+        .await?
+        .into_inner();
+    assert!(deleted.deleted);
+    assert!(
+        deleted
+            .steps
+            .iter()
+            .any(|step| step == "Destroyed payments-loadtest/soak"),
+        "{:?}",
+        deleted.steps
+    );
+    let gone = svc
+        .get_namespace(req(
+            GetNamespaceRequest {
+                name: "payments-loadtest".into(),
+            },
+            Some(&management),
+        ))
+        .await
+        .expect_err("deleted");
+    assert_eq!(gone.code(), Code::NotFound);
+
+    let default = svc
+        .delete_namespace(req(
+            DeleteNamespaceRequest {
+                name: "default".into(),
+                ..Default::default()
+            },
+            Some(&management),
+        ))
+        .await
+        .expect_err("default stays");
+    assert_eq!(default.code(), Code::FailedPrecondition);
+    Ok(())
+}
+
+/// ACL rules must say their namespace reach, so a policy written for one
+/// namespace never silently reaches the next one created.
+#[tokio::test]
+async fn policies_must_name_their_namespaces() -> R<()> {
+    let (svc, _, management) = setup_enabled()?;
+    let status = svc
+        .upsert_acl_policy(req(
+            UpsertAclPolicyRequest {
+                name: "implicit".into(),
+                description: String::new(),
+                rules_json: r#"[{"resources": ["job"], "actions": ["read"]}]"#.into(),
+            },
+            Some(&management),
+        ))
+        .await
+        .expect_err("a job rule without namespaces");
+    assert_eq!(status.code(), Code::InvalidArgument);
+    assert!(
+        status
+            .message()
+            .contains("must say which namespaces it covers"),
+        "{}",
+        status.message()
+    );
+    Ok(())
+}
+
+/// A namespace tenant reads its own events without operator:read, and only
+/// its own: other namespaces' job events and cluster events are left out,
+/// and a namespace filter narrows but never widens that.
+#[tokio::test]
+async fn a_tenant_reads_only_its_own_namespaces_events() -> R<()> {
+    let (svc, _, management) = setup_enabled()?;
+    create_namespaces(&svc, &management, &["payments-prod", "checkout-prod"]).await?;
+    for namespace in ["payments-prod", "checkout-prod"] {
+        svc.run_job(run_request(
+            &namespaced_jobspec("web", None),
+            Some(namespace),
+            &management,
+        ))
+        .await?;
+    }
+    let (_, team) = token_with_rules(
+        &svc,
+        "payments-reader",
+        r#"[{"resources": ["job"], "actions": ["read"], "namespaces": ["payments-*"]}]"#,
+    )?;
+    let operator = svc
+        .list_events(req(ListEventsRequest::default(), Some(&management)))
+        .await?
+        .into_inner();
+    assert!(operator
+        .events
+        .iter()
+        .any(|event| event.namespace == "checkout-prod"));
+
+    for namespaces in [
+        vec![],
+        vec!["*".to_string()],
+        vec!["checkout-prod".to_string()],
+    ] {
+        let events = svc
+            .list_events(req(
+                ListEventsRequest {
+                    namespaces: namespaces.clone(),
+                    ..Default::default()
+                },
+                Some(&team),
+            ))
+            .await?
+            .into_inner()
+            .events;
+        assert!(
+            events
+                .iter()
+                .all(|event| event.namespace == "payments-prod"),
+            "{namespaces:?}: {:?}",
+            events
+                .iter()
+                .map(|event| (&event.kind, &event.namespace))
+                .collect::<Vec<_>>()
+        );
+        if namespaces != vec!["checkout-prod".to_string()] {
+            assert!(!events.is_empty(), "{namespaces:?}");
+        }
+    }
+
+    // A token with neither operator:read nor any job:read is still refused.
+    let (_, nothing) = token_with_rules(
+        &svc,
+        "kv-only",
+        r#"[{"resources": ["kv"], "actions": ["read"]}]"#,
+    )?;
+    let status = svc
+        .list_events(req(ListEventsRequest::default(), Some(&nothing)))
+        .await
+        .expect_err("no grant");
+    assert_eq!(status.code(), Code::PermissionDenied);
+    Ok(())
+}
+
+/// Phase 4: a namespace policy is written at acl privilege, refuses a
+/// submit outside its runtimes and over its aggregate quota, and shows the
+/// tenant its effective limits through `GetNamespace` without `acl:read`.
+#[tokio::test]
+async fn namespace_policies_govern_admission_and_show_tenants_their_limits() -> R<()> {
+    let (svc, _, management) = setup_enabled()?;
+    create_namespaces(&svc, &management, &["payments-prod", "payments-qa"]).await?;
+    let (_, team) = token_with_rules(
+        &svc,
+        "payments-team",
+        r#"[{"resources": ["job", "namespace"], "actions": ["read", "write"], "namespaces": ["payments-*"]}]"#,
+    )?;
+    let policy = serde_json::json!({
+        "name": "payments",
+        "namespaces": ["payments-*"],
+        "quota": { "normal": { "cpu": 1500 } },
+        "runtimes": ["container"],
+    })
+    .to_string();
+
+    // A namespace writer cannot raise its own limits.
+    let status = svc
+        .apply_namespace_policy(req(
+            ApplyNamespacePolicyRequest {
+                object_json: policy.clone(),
+                ..Default::default()
+            },
+            Some(&team),
+        ))
+        .await
+        .expect_err("needs acl:write");
+    assert_eq!(status.code(), Code::PermissionDenied);
+    svc.apply_namespace_policy(req(
+        ApplyNamespacePolicyRequest {
+            object_json: policy,
+            ..Default::default()
+        },
+        Some(&management),
+    ))
+    .await?;
+
+    let spec = |name: &str, runtime: &str, count: u32| {
+        serde_json::json!({
+            "name": name,
+            "tasks": [{
+                "name": "main",
+                "runtime": runtime,
+                "count": count,
+                "config": { "image": "alpine", "command": ["echo", "ok"] },
+                "resources": { "cpu": 500, "memory": 64 },
+                "constraints": {},
+            }],
+        })
+        .to_string()
+    };
+    svc.run_job(run_request(
+        &spec("web", "container", 2),
+        Some("payments-prod"),
+        &team,
+    ))
+    .await?;
+    // 1000 of 1500 used in prod; qa shares the cap.
+    let status = svc
+        .run_job(run_request(
+            &spec("load", "container", 2),
+            Some("payments-qa"),
+            &team,
+        ))
+        .await
+        .expect_err("over the aggregate quota");
+    assert_eq!(status.code(), Code::FailedPrecondition);
+    assert!(
+        status
+            .message()
+            .contains("caps band 'normal' at 1500 MHz CPU across payments-*"),
+        "{}",
+        status.message()
+    );
+    let status = svc
+        .run_job(run_request(
+            &spec("tool", "sandbox", 1),
+            Some("payments-qa"),
+            &team,
+        ))
+        .await
+        .expect_err("runtime not allowed");
+    assert_eq!(status.code(), Code::FailedPrecondition);
+    assert!(
+        status.message().contains("allows runtimes [container]"),
+        "{}",
+        status.message()
+    );
+
+    // The tenant reads its limits and the aggregate without acl:read.
+    let reply = svc
+        .get_namespace(req(
+            GetNamespaceRequest {
+                name: "payments-qa".into(),
+            },
+            Some(&team),
+        ))
+        .await?
+        .into_inner();
+    assert!(reply.reaching_rules.is_empty(), "rule names need acl:read");
+    let governing = reply.policies.first().expect("one policy governs it");
+    assert_eq!(
+        governing.policy.as_ref().map(|p| p.name.as_str()),
+        Some("payments")
+    );
+    let normal = governing
+        .usage
+        .iter()
+        .find(|usage| usage.band == "normal")
+        .expect("normal band usage");
+    assert_eq!(
+        normal.cpu, 1000.0,
+        "prod's declared demand counts toward qa's cap"
+    );
+    assert!(svc
+        .list_namespace_policies(req(ListNamespacePoliciesRequest::default(), Some(&team)))
+        .await
+        .is_err());
+
+    // The dry run of a tighter policy names what it would have refused.
+    let reply = svc
+        .apply_namespace_policy(req(
+            ApplyNamespacePolicyRequest {
+                object_json: serde_json::json!({
+                    "name": "payments",
+                    "namespaces": ["payments-*"],
+                    "maxJobs": 0,
+                    "runtimes": ["sandbox"],
+                })
+                .to_string(),
+                dry_run: true,
+                ..Default::default()
+            },
+            Some(&management),
+        ))
+        .await?
+        .into_inner();
+    let rules: BTreeSet<_> = reply.violations.iter().map(|v| v.rule.clone()).collect();
+    assert!(
+        rules.contains("maxJobs") && rules.contains("runtimes"),
+        "{rules:?}"
+    );
+    assert!(reply
+        .violations
+        .iter()
+        .any(|v| v.job_id == "payments-prod/web" && v.rule == "runtimes"));
+    Ok(())
+}
+
+/// The plan's error surfaces: a not-found names where else the caller can
+/// see a job of that name (and only there), a denial names where the token
+/// can act, and an ACL rule naming a namespace that does not exist warns.
+#[tokio::test]
+async fn namespace_errors_say_where_to_look_without_leaking() -> R<()> {
+    let (svc, _, management) = setup_enabled()?;
+    create_namespaces(&svc, &management, &["payments-prod", "secret-team"]).await?;
+    for namespace in ["payments-prod", "secret-team"] {
+        svc.run_job(run_request(
+            &namespaced_jobspec("api", None),
+            Some(namespace),
+            &management,
+        ))
+        .await?;
+    }
+    let (_, team) = token_with_rules(
+        &svc,
+        "payments-team",
+        r#"[{"resources": ["job"], "actions": ["read", "write"], "namespaces": ["payments-*", "default"]}]"#,
+    )?;
+
+    let status = svc
+        .get_job_info(req(GetJobInfoRequest { name: "api".into() }, Some(&team)))
+        .await
+        .expect_err("no api in default");
+    assert_eq!(status.code(), Code::NotFound);
+    assert!(
+        status
+            .message()
+            .contains("not found in namespace 'default'"),
+        "{}",
+        status.message()
+    );
+    assert!(
+        status
+            .message()
+            .contains("exists in namespace 'payments-prod'"),
+        "{}",
+        status.message()
+    );
+    assert!(
+        !status.message().contains("secret-team"),
+        "the hint names only readable namespaces: {}",
+        status.message()
+    );
+
+    let status = svc
+        .stop_job(req(
+            StopJobRequest {
+                name: "secret-team/api".into(),
+                ..Default::default()
+            },
+            Some(&team),
+        ))
+        .await
+        .expect_err("no grant there");
+    assert_eq!(status.code(), Code::PermissionDenied);
+    assert!(
+        status
+            .message()
+            .contains("this token can write job in default, payments-*"),
+        "{}",
+        status.message()
+    );
+
+    let reply = svc
+        .upsert_acl_policy(req(
+            UpsertAclPolicyRequest {
+                name: "typo".into(),
+                description: String::new(),
+                rules_json: r#"[{"resources": ["job"], "actions": ["read"], "namespaces": ["payments-prdo", "payments-*"]}]"#.into(),
+            },
+            Some(&management),
+        ))
+        .await?
+        .into_inner();
+    assert_eq!(
+        reply.warnings,
+        vec!["rule 0 names namespace 'payments-prdo', which does not exist".to_string()]
+    );
     Ok(())
 }

@@ -249,7 +249,11 @@ impl Cluster {
         let instance = self.store().get_instance(&id)?.context("instance")?;
         assert_eq!(
             asked.manifest_object,
-            format!("manifests/{JOB}/{}/{TASK}/{id}.json", instance.group),
+            // The namespace is always a segment, `default` included.
+            format!(
+                "manifests/default/{JOB}/{}/{TASK}/{id}.json",
+                instance.group
+            ),
             "the manager names where the archive manifest goes"
         );
         // The worker's half (`run_publish`): the parts, sealed under the

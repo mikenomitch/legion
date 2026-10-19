@@ -1418,6 +1418,23 @@ pub mod drafts {
         }))
     }
 
+    /// A namespace was created or updated (docs/namespaces.md).
+    pub fn namespace_applied(name: &str, created: bool) -> EventDraft {
+        let (kind, verb) = if created {
+            ("namespace.created", "created")
+        } else {
+            ("namespace.updated", "updated")
+        };
+        EventDraft::info(kind, format!("Namespace {name} {verb}"))
+            .meta(json!({ "namespace": name }))
+    }
+
+    /// A namespace was deleted.
+    pub fn namespace_deleted(name: &str) -> EventDraft {
+        EventDraft::info("namespace.deleted", format!("Namespace {name} deleted"))
+            .meta(json!({ "namespace": name }))
+    }
+
     /// A network policy object was deleted.
     pub fn net_policy_deleted(name: &str) -> EventDraft {
         EventDraft::info(
@@ -2546,6 +2563,14 @@ impl EventRecorder<'_> {
 
     pub fn net_policy_deleted(self, name: &str) {
         self.emit(drafts::net_policy_deleted(name));
+    }
+
+    pub fn namespace_applied(self, name: &str, created: bool) {
+        self.emit(drafts::namespace_applied(name, created));
+    }
+
+    pub fn namespace_deleted(self, name: &str) {
+        self.emit(drafts::namespace_deleted(name));
     }
 
     pub fn volume_mounted(self, volume: &crate::structs::Volume, node_id: &str, path: &str) {

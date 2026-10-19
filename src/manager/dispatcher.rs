@@ -775,6 +775,7 @@ fn inject_provisional_env(config: &mut Value, claim_id: &str, instance: Option<&
     // claim's own identity replaces it, and none is left behind without one.
     for key in [
         "LEGION_INSTANCE_ID",
+        "LEGION_INSTANCE_KEY",
         "LEGION_INSTANCE_MODE",
         "LEGION_INSTANCE_SLOT",
     ] {
@@ -784,6 +785,13 @@ fn inject_provisional_env(config: &mut Value, claim_id: &str, instance: Option<&
         env.insert(
             "LEGION_INSTANCE_ID".to_string(),
             Value::String(instance.instance_id.clone()),
+        );
+        // The id without its namespace: what a caller named the instance.
+        env.insert(
+            "LEGION_INSTANCE_KEY".to_string(),
+            Value::String(
+                crate::structs::namespace::instance_key(&instance.instance_id).to_string(),
+            ),
         );
         env.insert(
             "LEGION_INSTANCE_MODE".to_string(),
@@ -953,6 +961,13 @@ fn inject_runtime_env(config: &mut Value, allocation: &Allocation, instance: Opt
         env.insert(
             "LEGION_INSTANCE_ID".to_string(),
             Value::String(instance.instance_id.clone()),
+        );
+        // The id without its namespace: what a caller named the instance.
+        env.insert(
+            "LEGION_INSTANCE_KEY".to_string(),
+            Value::String(
+                crate::structs::namespace::instance_key(&instance.instance_id).to_string(),
+            ),
         );
         env.insert(
             "LEGION_INSTANCE_MODE".to_string(),

@@ -105,7 +105,9 @@ If you declare the same variable yourself, your value wins:
 | Variable | Meaning |
 | --- | --- |
 | `LEGION_ALLOC_ID` | Allocation ID (churns on each placement). |
-| `LEGION_JOB_ID` | Job ID. |
+| `LEGION_JOB_ID` | Canonical job id: the bare name in `default`, `namespace/name` elsewhere ([Namespaces](namespaces.md)). |
+| `LEGION_JOB_NAME` | The job's bare name. |
+| `LEGION_NAMESPACE` | The job's namespace (`default` included), so a `legion` command run in the task defaults to it. |
 | `LEGION_TASK_NAME` | Task name. |
 | `LEGION_PORT_<LABEL>` | Assigned host port for the named port. |
 | `LEGION_PORT_TO_<LABEL>` | Declared in-task target port (when `to` is set). |
@@ -115,8 +117,9 @@ If you declare the same variable yourself, your value wins:
 | `LEGION_UPSTREAM_PORT_<SERVICE>` | Just the local port of that upstream. |
 
 Labels are uppercased, with non-alphanumeric characters mapped to `_` (`http-2`
-becomes `HTTP_2`). Upstream service names follow the same rule (`user-db`
-becomes `LEGION_UPSTREAM_USER_DB`). A server binds its dynamic port with, for
+becomes `HTTP_2`). Upstream keys follow the same rule (`user-db` becomes
+`LEGION_UPSTREAM_USER_DB`, and the cross-namespace key `auth.shared` becomes
+`LEGION_UPSTREAM_AUTH_SHARED`). A server binds its dynamic port with, for
 example, `python3 -m http.server $LEGION_PORT_HTTP`.
 
 A task only receives endpoints for services it asked for. Its environment
@@ -170,6 +173,27 @@ overrides the strategy for that one upstream.
 
 Upstream ports are per allocation, like host ports. A `count = 3` client task
 gets three independent listeners on three distinct ports.
+
+### Namespaces
+
+A service lives in its job's [namespace](namespaces.md), and an upstream
+resolves in the consumer's own namespace: `{ service = "db" }` is the `db` of
+the namespace the task runs in, never another tenant's. Reaching into another
+namespace is written on both sides:
+
+```nickel
+# the consumer names where it is reaching (or writes service = "shared/auth")
+connect = { upstreams = [{ service = "auth", namespace = "shared" }] },
+
+# the target, in shared, admits the consumer by qualified id or glob
+service = { name = "auth", port = 8443, allow = ["checkout-prod/api", "payments-*/api"] },
+```
+
+The crossing upstream's key is `auth.shared`: it names
+`LEGION_UPSTREAM_AUTH_SHARED` and the DNS name `auth.shared.svc.legion`. A
+service reference on the CLI and API is canonical like a job id
+(`shared/auth`; bare in `default`), and `legion service list` takes `-n`
+(names or globs) and `-A`.
 
 ### Balancing strategies
 
@@ -288,13 +312,17 @@ A service can name the jobs allowed to reach it through connect:
 ```nickel
 service = {
     port = "http",
-    allow = ["gateway", "api"],   # job ids; absent or ["*"] = every job
+    allow = ["gateway", "api"],   # job globs; absent or ["*"] = every job in this namespace
 },
 ```
 
-- Entries are job ids (a job's `name`), matched against the consuming
-  allocation's job.
-- Absent or `["*"]` means every job may connect. This is the default.
+- Entries are job globs matched against the consuming allocation's job. A bare
+  entry (`"gateway"`, `"web-*"`) matches jobs in the service's **own**
+  namespace; `"checkout-prod/api"` or `"payments-*/api"` admits jobs in other
+  namespaces, and `"*/*"` admits every job everywhere.
+- Absent or `["*"]` means every job in the service's own namespace may
+  connect. This is the default; a consumer in another namespace needs an
+  entry that names its namespace.
 - Enforcement happens in the endpoint feed. A denied consumer's forwarder gets
   an empty list, so its connections are accepted and closed. There is no error
   code and no partial list. When a client sees only immediate closes, run
@@ -320,8 +348,11 @@ and restrict callers with `requireIdentity`. See
 
 These are checked at submit, and by `legion job validate <spec>` before you submit:
 
-- Upstream `service` is non-empty, with no duplicate upstream services in one
-  task.
+- Upstream `service` is non-empty, with no duplicate upstream keys in one
+  task (`auth` and `auth` in `shared` are different keys).
+- An upstream's `namespace`, or the qualifier of a `namespace/service`
+  reference, is a namespace name; when both are written they agree; an
+  external (`to`) destination sets no `namespace`.
 - `localPort` is greater than 0, with no duplicates and no collision with a
   static port declared in the same task's `network.ports` (including one
   declared by the `service.port` number shorthand).
@@ -405,7 +436,8 @@ names and VIPs (`LEGION_DNS`, `LEGION_UPSTREAM_HOST_*`,
 ## Querying: CLI and API
 
 ```bash
-legion service list                  # all services + healthy/total counts
+legion service list                  # services in the active namespace + healthy/total counts
+legion service list -A               # every namespace you can read
 legion service resolve web           # healthy endpoints (table)
 legion service resolve web -j        # JSON (scriptable)
 legion service resolve web --all     # include unhealthy, with status detail

@@ -731,6 +731,7 @@ async fn submit_one(
     job: &PreparedJob,
 ) -> Result<SubmitReply, String> {
     let request = tonic::Request::new(RunJobRequest {
+        namespace: Default::default(),
         // The rig renders jobspecs to JSON up front (translate.py), which is
         // already the `parsed_jobspec` the manager consumes — the same string
         // `render_jobspec()` produces for a `.json` path in src/cmd/job.rs.

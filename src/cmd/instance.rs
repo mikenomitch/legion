@@ -445,15 +445,26 @@ pub fn config() -> Command {
         .subcommand_required(true)
         .arg_required_else_help(true)
         .subcommand(create_cmd)
-        .subcommand(stop_cmd)
-        .subcommand(start_cmd)
-        .subcommand(suspend_cmd)
-        .subcommand(fork_cmd)
-        .subcommand(destroy_cmd)
+        .subcommand(names_instance(stop_cmd))
+        .subcommand(names_instance(start_cmd))
+        .subcommand(names_instance(suspend_cmd))
+        .subcommand(names_instance(fork_cmd))
+        .subcommand(names_instance(destroy_cmd))
         .subcommand(promote_cmd)
-        .subcommand(replace_cmd)
+        .subcommand(names_instance(replace_cmd))
         .subcommand(list_cmd)
-        .subcommand(get_cmd)
+        .subcommand(names_instance(get_cmd))
+}
+
+/// `-n` for a subcommand that names an existing instance by `id`, which
+/// resolves in it (`user-42 -n payments` is `payments/user-42`). Where `-n`
+/// is taken (`fork --count`), only `--namespace`.
+fn names_instance(command: Command) -> Command {
+    let short_taken = command
+        .get_arguments()
+        .any(|arg| arg.get_short() == Some('n'));
+    let flag = crate::cmd::helpers::namespace_flag();
+    command.arg(if short_taken { flag.short(None) } else { flag })
 }
 
 #[instrument(skip_all)]
@@ -478,8 +489,9 @@ async fn create_instance(arg_matches: &ArgMatches) -> R<()> {
     let format = OutputFormat::from_matches(arg_matches);
     let job = arg_matches
         .get_one::<String>("job")
-        .context("Must provide job")?
-        .clone();
+        .map(|job| crate::cmd::helpers::job_ref(arg_matches, job))
+        .transpose()?
+        .context("Must provide job")?;
     let group = arg_matches.get_one::<String>("group").cloned();
     let task = arg_matches.get_one::<String>("task").cloned();
     let idempotency_key = arg_matches.get_one::<String>("idempotency-key").cloned();
@@ -582,10 +594,7 @@ async fn create_instance(arg_matches: &ArgMatches) -> R<()> {
 #[instrument(skip_all)]
 async fn fork_instance(arg_matches: &ArgMatches) -> R<()> {
     let format = OutputFormat::from_matches(arg_matches);
-    let id = arg_matches
-        .get_one::<String>("id")
-        .context("Must provide id")?
-        .clone();
+    let id = crate::cmd::helpers::required_instance_arg(arg_matches, "id")?;
     let request = tonic::Request::new(ForkInstanceRequest {
         instance_id: id.clone(),
         count: arg_matches.get_one::<u32>("count").copied().unwrap_or(1),
@@ -741,10 +750,7 @@ async fn promote_instance(arg_matches: &ArgMatches) -> R<()> {
 #[instrument(skip_all)]
 async fn stop_instance(arg_matches: &ArgMatches) -> R<()> {
     let format = OutputFormat::from_matches(arg_matches);
-    let id = arg_matches
-        .get_one::<String>("id")
-        .context("Must provide id")?
-        .clone();
+    let id = crate::cmd::helpers::required_instance_arg(arg_matches, "id")?;
     let request = tonic::Request::new(StopInstanceRequest {
         instance_id: id,
         idempotency_key: arg_matches.get_one::<String>("idempotency-key").cloned(),
@@ -772,10 +778,7 @@ async fn stop_instance(arg_matches: &ArgMatches) -> R<()> {
 #[instrument(skip_all)]
 async fn start_instance(arg_matches: &ArgMatches) -> R<()> {
     let format = OutputFormat::from_matches(arg_matches);
-    let id = arg_matches
-        .get_one::<String>("id")
-        .context("Must provide id")?
-        .clone();
+    let id = crate::cmd::helpers::required_instance_arg(arg_matches, "id")?;
     let request = tonic::Request::new(StartInstanceRequest {
         instance_id: id.clone(),
         idempotency_key: arg_matches.get_one::<String>("idempotency-key").cloned(),
@@ -867,10 +870,7 @@ async fn start_instance(arg_matches: &ArgMatches) -> R<()> {
 #[instrument(skip_all)]
 async fn suspend_instance(arg_matches: &ArgMatches) -> R<()> {
     let format = OutputFormat::from_matches(arg_matches);
-    let id = arg_matches
-        .get_one::<String>("id")
-        .context("Must provide id")?
-        .clone();
+    let id = crate::cmd::helpers::required_instance_arg(arg_matches, "id")?;
     let request = tonic::Request::new(SuspendInstanceRequest {
         instance_id: id.clone(),
         checkpoint: arg_matches.get_one::<String>("checkpoint").cloned(),
@@ -1014,10 +1014,7 @@ async fn wait_for_instance(
 #[instrument(skip_all)]
 async fn destroy_instance(arg_matches: &ArgMatches) -> R<()> {
     let format = OutputFormat::from_matches(arg_matches);
-    let id = arg_matches
-        .get_one::<String>("id")
-        .context("Must provide id")?
-        .clone();
+    let id = crate::cmd::helpers::required_instance_arg(arg_matches, "id")?;
     let request = tonic::Request::new(DestroyInstanceRequest {
         instance_id: id,
         idempotency_key: arg_matches.get_one::<String>("idempotency-key").cloned(),
@@ -1045,10 +1042,7 @@ async fn destroy_instance(arg_matches: &ArgMatches) -> R<()> {
 #[instrument(skip_all)]
 async fn replace_instance(arg_matches: &ArgMatches) -> R<()> {
     let format = OutputFormat::from_matches(arg_matches);
-    let id = arg_matches
-        .get_one::<String>("id")
-        .context("Must provide id")?
-        .clone();
+    let id = crate::cmd::helpers::required_instance_arg(arg_matches, "id")?;
     let request = tonic::Request::new(ReplaceInstanceRequest {
         instance_id: id,
         idempotency_key: arg_matches.get_one::<String>("idempotency-key").cloned(),
@@ -1078,8 +1072,9 @@ async fn list_instances(arg_matches: &ArgMatches) -> R<()> {
     let format = OutputFormat::from_matches(arg_matches);
     let job = arg_matches
         .get_one::<String>("job")
-        .context("Must provide job")?
-        .clone();
+        .map(|job| crate::cmd::helpers::job_ref(arg_matches, job))
+        .transpose()?
+        .context("Must provide job")?;
     let include_idle = arg_matches.get_flag("include-idle");
     let request = tonic::Request::new(ListInstancesRequest {
         job_id: job,
@@ -1161,10 +1156,7 @@ async fn list_instances(arg_matches: &ArgMatches) -> R<()> {
 #[instrument(skip_all)]
 async fn get_instance(arg_matches: &ArgMatches) -> R<()> {
     let format = OutputFormat::from_matches(arg_matches);
-    let id = arg_matches
-        .get_one::<String>("id")
-        .context("Must provide id")?
-        .clone();
+    let id = crate::cmd::helpers::required_instance_arg(arg_matches, "id")?;
     let request = tonic::Request::new(GetInstanceRequest { instance_id: id });
 
     let mut client = connect_manager_client().await?;

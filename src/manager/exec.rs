@@ -421,9 +421,15 @@ pub fn new_exec_key(
     let jobs = request.jobs.trim();
     if jobs.is_empty() {
         return Err(Status::invalid_argument(
-            "jobs is required: a glob over the job names this key's tickets may reach, \
-             e.g. agents-*",
+            "jobs is required: a glob over the jobs this key's tickets may reach, e.g. \
+             agents-* (in default) or agents/* (every job in namespace agents)",
         ));
+    }
+    if jobs.matches('/').count() > 1 {
+        return Err(Status::invalid_argument(format!(
+            "jobs {jobs:?} is not a job pattern: write name-glob (jobs in default) or \
+             namespace-glob/name-glob"
+        )));
     }
     crate::structs::exec_ticket::validate_p256_public_key(&request.public_key_pem)
         .map_err(|err| Status::invalid_argument(format!("{err:#}")))?;

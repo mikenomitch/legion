@@ -178,6 +178,7 @@ impl Cluster {
         Ok(self
             .runtime
             .block_on(self.svc.plan_job(Request::new(PlanJobRequest {
+                namespace: Default::default(),
                 parsed_jobspec: serde_json::to_string(job)?,
             })))?
             .into_inner())

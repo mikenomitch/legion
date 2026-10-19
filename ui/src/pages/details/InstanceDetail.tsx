@@ -45,6 +45,7 @@ import { LARGE_LISTING, SESSION_COPY, isSession, jobInstancesHref } from '../../
 import { mayReadSnapshots, restoreBlocker } from '../../utils/snapshots'
 import { statusTone } from '../../utils/status'
 import { fetchNodeUsage, formatCores, formatIdle, formatMiB, heldLabel, percentOf, reservationLabel } from '../../utils/usage'
+import { jobIdFromParams, jobPath } from '../../utils/namespaces'
 
 /*
  * One stateful instance (docs/stateful-workloads.md,
@@ -120,7 +121,7 @@ function InstanceDetailContent() {
   const params = useParams()
   const navigate = useNavigate()
   const instanceId = createMemo(() => decodeURIComponent(params.instanceId))
-  const routeJob = createMemo(() => decodeURIComponent(params.id))
+  const routeJob = createMemo(() => jobIdFromParams({ namespace: decodeURIComponent(params.namespace), name: decodeURIComponent(params.name) }))
   const tick = usePoll()
   const slowTick = usePoll(INDEX_POLL_INTERVAL_MS)
 
@@ -359,13 +360,13 @@ function InstanceDetailContent() {
                   ],
                   [
                     'Task',
-                    <A href={`/jobs/${encodeURIComponent(jobId())}/tasks/${encodeURIComponent(instance()!.task)}`} class={linkClass}>
+                    <A href={`${jobPath(jobId())}/tasks/${encodeURIComponent(instance()!.task)}`} class={linkClass}>
                       {instance()!.task}
                     </A>,
                   ],
                   [
                     'Job',
-                    <A href={`/jobs/${encodeURIComponent(jobId())}`} class={linkClass}>
+                    <A href={`${jobPath(jobId())}`} class={linkClass}>
                       {jobId()}
                     </A>,
                   ],
@@ -478,7 +479,7 @@ function InstanceDetailContent() {
                       <Show when={stop().preemptorJob}>
                         <span class="text-xs text-faint">
                           for{' '}
-                          <A href={`/jobs/${encodeURIComponent(stop().preemptorJob)}`} class="text-muted hover:text-brass-strong">
+                          <A href={`${jobPath(stop().preemptorJob)}`} class="text-muted hover:text-brass-strong">
                             {stop().preemptorJob}
                           </A>
                         </span>
@@ -574,7 +575,7 @@ function InstanceDetailContent() {
                 </Show>
                 <p class="border-t border-line px-4 py-2.5 text-xs text-faint">
                   Take, name, warm, and delete snapshots in the{' '}
-                  <A href={`/jobs/${encodeURIComponent(jobId())}`} class={linkClass}>
+                  <A href={`${jobPath(jobId())}`} class={linkClass}>
                     job's Snapshots card
                   </A>{' '}
                   or with <code class="rounded bg-surface2 px-1 font-mono">legion snapshot</code>.
@@ -648,11 +649,11 @@ function Header(props: { instance: InstanceInfo; row: () => InstanceRow; actions
       subtitle={
         <>
           Task{' '}
-          <A href={`/jobs/${encodeURIComponent(props.instance.jobId)}/tasks/${encodeURIComponent(props.instance.task)}`} class={linkClass}>
+          <A href={`${jobPath(props.instance.jobId)}/tasks/${encodeURIComponent(props.instance.task)}`} class={linkClass}>
             {props.instance.task}
           </A>{' '}
           of job{' '}
-          <A href={`/jobs/${encodeURIComponent(props.instance.jobId)}`} class={linkClass}>
+          <A href={`${jobPath(props.instance.jobId)}`} class={linkClass}>
             {props.instance.jobId}
           </A>
           <Show when={props.instance.group}>
@@ -1109,7 +1110,7 @@ function NotLoaded(props: { state: Loading; job: string; feed: ReturnType<typeof
                 : 'It may have been destroyed along with its job, or the id is mistyped. Keyed ids are never reused while their job exists.'
             }
           >
-            <A href={`/jobs/${encodeURIComponent(props.job)}`} class={cx(linkClass, 'mt-2 text-sm')}>
+            <A href={`${jobPath(props.job)}`} class={cx(linkClass, 'mt-2 text-sm')}>
               Back to {props.job}
             </A>
           </EmptyState>

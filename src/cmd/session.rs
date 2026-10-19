@@ -155,7 +155,8 @@ async fn nodes(matches: &ArgMatches) -> R<()> {
     let format = OutputFormat::from_matches(matches);
     let job_id = matches
         .get_one::<String>("job")
-        .cloned()
+        .map(|job| crate::cmd::helpers::job_ref(matches, job))
+        .transpose()?
         .unwrap_or_default();
     let mut client = connect_manager_client().await?;
     let reply = output::resolve(
@@ -334,7 +335,8 @@ async fn start(matches: &ArgMatches) -> R<()> {
                 ticket: ticket(matches),
                 job_id: matches
                     .get_one::<String>("job")
-                    .cloned()
+                    .map(|job| crate::cmd::helpers::job_ref(matches, job))
+                    .transpose()?
                     .unwrap_or_default(),
                 task_name: matches
                     .get_one::<String>("task")

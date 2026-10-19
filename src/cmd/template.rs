@@ -5,7 +5,9 @@
 //! version, `run` renders one with `--var` values and submits the result as
 //! a job, and `render` is the dry-run twin of `run`.
 
-use crate::cmd::helpers::{connect_manager_client, json_flag, print_table};
+use crate::cmd::helpers::{
+    active_namespace, connect_manager_client, json_flag, namespace_flag, print_table,
+};
 use crate::cmd::job::{
     asap_flag, idempotency_arg, priority_arg, priority_from_matches, timeout_arg, wait_flag,
     wait_for_convergence, wait_timeout,
@@ -99,6 +101,7 @@ pub fn config() -> Command {
                 .arg(name_arg.clone())
                 .arg(version_arg.clone())
                 .args(var_args.clone())
+                .arg(namespace_flag())
                 .arg(json_flag()),
         )
         .subcommand(
@@ -119,6 +122,7 @@ pub fn config() -> Command {
                 .arg(idempotency_arg())
                 .arg(wait_flag())
                 .arg(timeout_arg())
+                .arg(namespace_flag())
                 .arg(json_flag()),
         )
         .subcommand(
@@ -420,6 +424,7 @@ async fn render_template(matches: &ArgMatches) -> R<()> {
                 name: required_name(matches),
                 version: matches.get_one::<u32>("version").copied(),
                 variables_json,
+                namespace: active_namespace(matches),
             }))
             .await,
     )?;
@@ -454,6 +459,7 @@ async fn run_template(matches: &ArgMatches) -> R<()> {
                 priority: priority_from_matches(matches),
                 force_reschedule: matches.get_flag("force-reschedule"),
                 idempotency_key: matches.get_one::<String>("idempotency-key").cloned(),
+                namespace: active_namespace(matches),
             }))
             .await,
     )?;

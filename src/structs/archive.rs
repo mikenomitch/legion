@@ -16,7 +16,10 @@
 //! }
 //! ```
 //!
-//! It lives at `<contentStore.url>/manifests/<job>/<group>/<task>/<id>.json`.
+//! It lives at
+//! `<contentStore.url>/manifests/<namespace>/<job>/<group>/<task>/<id>.json`.
+//! The namespace segment is always written (`default` included), so one
+//! job's prefix is never a prefix of another namespace's.
 
 use serde::{Deserialize, Serialize};
 
@@ -30,21 +33,27 @@ pub const ARCHIVE_MANIFEST_VERSION: u32 = 1;
 pub const ARCHIVE_PREFIX: &str = "manifests";
 
 /// The object name of an instance's archive manifest, relative to its
-/// `contentStore` root.
+/// `contentStore` root. `job_id` is the canonical id; the object name
+/// spells its namespace out, `default` included.
 pub fn archive_object_name(job_id: &str, group: &str, task: &str, instance_id: &str) -> String {
-    format!("{ARCHIVE_PREFIX}/{job_id}/{group}/{task}/{instance_id}.json")
+    // The namespace is already a segment, so the file is named by the key.
+    let key = crate::structs::namespace::instance_key(instance_id);
+    format!("{}{group}/{task}/{key}.json", archive_job_prefix(job_id))
 }
 
-/// The prefix every archive manifest of `job_id` lives under.
+/// The prefix every archive manifest of `job_id` lives under:
+/// `manifests/<namespace>/<job>/`.
 pub fn archive_job_prefix(job_id: &str) -> String {
-    format!("{ARCHIVE_PREFIX}/{job_id}/")
+    let (namespace, name) = crate::structs::namespace::split_job_id(job_id);
+    format!("{ARCHIVE_PREFIX}/{namespace}/{name}/")
 }
 
-/// `(job, group, task, instance id)` from an archive object name, as
-/// [`archive_object_name`] builds it. `None` for anything else.
+/// `(canonical job id, group, task, canonical instance id)` from an archive object
+/// name, as [`archive_object_name`] builds it. `None` for anything else.
 pub fn parse_archive_object_name(name: &str) -> Option<(String, String, String, String)> {
     let rest = name.strip_prefix(ARCHIVE_PREFIX)?.strip_prefix('/')?;
     let mut parts = rest.split('/');
+    let namespace = parts.next()?;
     let job = parts.next()?;
     let group = parts.next()?;
     let task = parts.next()?;
@@ -53,10 +62,15 @@ pub fn parse_archive_object_name(name: &str) -> Option<(String, String, String, 
         return None;
     }
     let id = file.strip_suffix(".json")?;
-    if [job, group, task, id].iter().any(|part| part.is_empty()) {
+    if [namespace, job, group, task, id]
+        .iter()
+        .any(|part| part.is_empty())
+    {
         return None;
     }
-    Some((job.into(), group.into(), task.into(), id.into()))
+    let job = crate::structs::namespace::job_id(namespace, job);
+    let id = crate::structs::namespace::instance_id(namespace, id);
+    Some((job, group.into(), task.into(), id))
 }
 
 /// What the manager hands the worker to write beside the published
@@ -213,8 +227,25 @@ mod archive_test {
     #[test]
     fn object_names_parse_back_test() {
         let name = archive_object_name("agents", "g", "workspace", "workspace-x");
-        assert_eq!(name, "manifests/agents/g/workspace/workspace-x.json");
+        assert_eq!(
+            name,
+            "manifests/default/agents/g/workspace/workspace-x.json"
+        );
         assert!(name.starts_with(&archive_job_prefix("agents")));
+        // A default job's prefix never covers a namespace of the same name.
+        let namespaced = archive_object_name("agents/api", "g", "t", "t-1");
+        assert_eq!(namespaced, "manifests/agents/api/g/t/t-1.json");
+        assert!(!namespaced.starts_with(&archive_job_prefix("agents")));
+        assert_eq!(
+            parse_archive_object_name(&namespaced).map(|(job, ..)| job),
+            Some("agents/api".to_string())
+        );
+        let keyed = archive_object_name("agents/api", "g", "t", "agents/user-42");
+        assert_eq!(keyed, "manifests/agents/api/g/t/user-42.json");
+        assert_eq!(
+            parse_archive_object_name(&keyed).map(|(_, _, _, id)| id),
+            Some("agents/user-42".to_string())
+        );
         assert_eq!(
             parse_archive_object_name(&name),
             Some((
@@ -224,7 +255,10 @@ mod archive_test {
                 "workspace-x".into()
             ))
         );
-        assert_eq!(parse_archive_object_name("manifests/agents/g/x.json"), None);
+        assert_eq!(
+            parse_archive_object_name("manifests/default/agents/g/x.json"),
+            None
+        );
         assert_eq!(parse_archive_object_name("objects/agents/g/t/x.json"), None);
     }
 }

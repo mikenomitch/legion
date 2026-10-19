@@ -1,5 +1,13 @@
 {
     name = "maximal-demo",
+    # The namespace the job lives in (docs/namespaces.md). Optional: unset
+    # means the request's namespace (`-n`, else $LEGION_NAMESPACE), else
+    # `default`. Writing it pins the job there; a request naming a different
+    # namespace is refused rather than silently resolved. `name` may instead
+    # be qualified (`payments-prod/maximal-demo`); the two must agree. The
+    # namespace must exist (`legion namespace create`), and the job's id is
+    # then `<namespace>/<name>` (bare in `default`).
+    namespace = "default",
     version = 1,
     # How important this job is, relative to everything else on the cluster
     # (docs/preemption-and-eviction.md). One of, most important first:
@@ -253,12 +261,15 @@
                 port = "http",      # label from network.ports; or a number/'dynamic' to declare inline
                 tags = ["v1", "public"],
                 meta = { protocol = "http" },
-                # Connect intentions (see docs/service-discovery.md): job ids
-                # allowed to reach this service through a `connect` upstream.
-                # Omit the field (or use ["*"]) to allow every job. Denied
+                # Connect intentions (see docs/service-discovery.md): job
+                # globs allowed to reach this service through a `connect`
+                # upstream. A bare entry matches jobs in this job's own
+                # namespace; `ns/job` (globs on either side, `payments-*/api`)
+                # admits a consumer in another namespace. Omit the field (or
+                # use ["*"]) to allow every job in this namespace. Denied
                 # consumers simply get an empty endpoint list; enforcement is
                 # control-plane + forwarder, not cryptographic identity.
-                allow = ["gateway", "maximal-demo"],
+                allow = ["gateway", "maximal-demo", "checkout-*/api"],
             },
             # Services this task dials, each via a node-local loopback
             # forwarder that load-balances across the upstream's healthy
@@ -278,6 +289,13 @@
                     # random | least_conn | local_first (same-node endpoints
                     # first, widening when none is healthy locally).
                     { service = "search", balance = "least_conn" },
+                    # Reaching a service in another namespace is explicit,
+                    # and the target must admit this job with a qualified
+                    # `allow` entry (`"default/maximal-demo"`). The key, env
+                    # vars and DNS name become `<service>.<namespace>`:
+                    # LEGION_UPSTREAM_AUTH_SHARED, auth.shared.svc.legion.
+                    # `service = "shared/auth"` is the same thing.
+                    { service = "auth", namespace = "shared" },
                     # HTTP framing and traffic management on a service
                     # upstream (docs/network-handlers.md): a per-request
                     # deadline, bounded retries (idempotent methods only by

@@ -3,11 +3,13 @@ import { ErrorBoundary, For, Show, createEffect, createMemo, createResource, cre
 import Breadcrumbs, { buildCrumbs, isKnownSection } from './components/Breadcrumbs'
 import { AclBanner } from './components/AclBanner'
 import { ConnectionGate } from './components/ConnectionGate'
+import { HeaderNamespaceControl } from './components/NamespaceSwitcher'
 import { lazyPage } from './components/LazyPage'
 import { ShortcutsHelp } from './components/ShortcutsHelp'
 import { Button, Dot, Icon, JumpHint, Kbd, PageHeader, RelativeTime, cx, type IconName } from './components/ui'
 import { managerClient } from './grpcClient'
 import { ROUTE_RESOURCE, canRead, isAnonymous } from './utils/acl'
+import { isMultiNamespace } from './utils/namespaces'
 import { commandPaletteIndexItems } from './utils/commandPalette'
 import {
   connectionStatus,
@@ -45,6 +47,8 @@ import VolumeDetail from './pages/details/VolumeDetail'
 import TaskDetail from './pages/details/TaskDetail'
 import Homepage from './pages/Homepage'
 import Jobs from './pages/Jobs'
+import Namespaces from './pages/Namespaces'
+import NamespaceDetail from './pages/details/NamespaceDetail'
 import KeyValue from './pages/KeyValue'
 import Manager from './pages/Manager'
 import Nodes from './pages/Nodes'
@@ -95,7 +99,7 @@ type CommandPaletteItem = {
 
 type SidebarNode = SidebarItem | SidebarSection
 
-const detailRoutes = new Set(['jobs', 'nodes', 'manager', 'rollouts', 'services', 'templates', 'volumes', 'allocations'])
+const detailRoutes = new Set(['jobs', 'nodes', 'manager', 'rollouts', 'services', 'templates', 'volumes', 'allocations', 'namespaces'])
 
 // The section a detail URL belongs to, as the ⌘K "Recent" group names it.
 const RECENT_KINDS: Record<string, string> = {
@@ -115,6 +119,9 @@ const RECENT_KINDS: Record<string, string> = {
 // links to login. A caller who IS authenticated only sees what their rules
 // allow. Cosmetic — the manager enforces regardless.
 const isNavVisible = (path: string): boolean => {
+  // Namespaces are listed per item: anyone who reaches more than one sees
+  // the page, even without a `namespace:read` rule.
+  if (path === '/namespaces' && isMultiNamespace()) return true
   const resource = ROUTE_RESOURCE[path]
   if (!resource) return true
   return canRead(resource) || isAnonymous()
@@ -286,6 +293,13 @@ const Layout = (props: RouteSectionProps) => {
         items: [
           { kind: 'item', label: 'KV Store', path: '/kv', title: 'KV Store', copy: 'Browse and edit key/value entries.', icon: 'database' },
           { kind: 'item', label: 'Access', path: '/access', title: 'Access', copy: 'Identity, tokens, policies, and login.', icon: 'shieldCheck' },
+        ],
+      },
+      {
+        kind: 'section',
+        heading: 'Governance',
+        items: [
+          { kind: 'item', label: 'Namespaces', path: '/namespaces', title: 'Namespaces', copy: 'Name and permission scopes, who reaches each one, and the policies that govern them. Not an isolation boundary.', icon: 'boxes' },
         ],
       },
       {
@@ -701,12 +715,19 @@ const Layout = (props: RouteSectionProps) => {
         const segments = (pathname.replace(/\/+$/, '') || '/').split('/').filter(Boolean)
         const kind = segments.length >= 2 ? RECENT_KINDS[segments[0]] : undefined
         if (!kind) return
-        const id = decodePathSegment(segments[1])
-        if (segments[0] === 'jobs' && segments[2] === 'specs') return
-        if (segments[0] === 'jobs' && segments[2] === 'tasks' && segments[3]) {
-          recordRecent({ href: pathname, label: `${decodePathSegment(segments[3])} · ${id}`, kind: 'Tasks' })
+        if (segments[0] === 'jobs') {
+          // `/jobs/<namespace>/<name>[/tasks/<task>]`, labelled by the
+          // qualified id so two namespaces' `web` stay tellable apart.
+          if (segments.length < 3) return
+          const job = `${decodePathSegment(segments[1])}/${decodePathSegment(segments[2])}`
+          if (segments[3] === 'tasks' && segments[4]) {
+            recordRecent({ href: pathname, label: `${decodePathSegment(segments[4])} · ${job}`, kind: 'Tasks' })
+            return
+          }
+          if (segments.length === 3) recordRecent({ href: pathname, label: job, kind })
           return
         }
+        const id = decodePathSegment(segments[1])
         if (segments.length > 2) return
         recordRecent({ href: pathname, label: segments[0] === 'rollouts' ? `Rollout #${id}` : id, kind })
       },
@@ -748,6 +769,7 @@ const Layout = (props: RouteSectionProps) => {
     return {
       title,
       subtitle: topLevel.copy,
+      path: topLevelPath,
     }
   })
 
@@ -1122,7 +1144,11 @@ const Layout = (props: RouteSectionProps) => {
           </Show>
           <main class="flex-1 min-w-0 px-4 py-6 md:px-8">
             <Show when={!isDetailRoute() && !isUnknownRoute() && !isUnlistedPage()}>
-              <PageHeader title={pageMeta().title} subtitle={pageMeta().subtitle} />
+              <PageHeader
+                title={pageMeta().title}
+                subtitle={pageMeta().subtitle}
+                actions={<HeaderNamespaceControl path={pageMeta().path} />}
+              />
             </Show>
             <ConnectionGate>
               <RouteErrorBoundary>{props.children}</RouteErrorBoundary>
@@ -1146,16 +1172,18 @@ const AppRoutes = () => {
       <Route path="/jobs" component={Jobs} />
       <Route path="/templates" component={Templates} />
       <Route path="/templates/:name" component={TemplateDetail} />
-      <Route path="/jobs/:id" component={JobDetail} />
-      <Route path="/jobs/:id/tasks/:taskName" component={TaskDetail} />
-      <Route path="/jobs/:id/specs/:configId" component={JobSpecDetail} />
-      <Route path="/jobs/:id/instances/:instanceId" component={InstanceDetail} />
+      <Route path="/jobs/:namespace/:name" component={JobDetail} />
+      <Route path="/jobs/:namespace/:name/tasks/:taskName" component={TaskDetail} />
+      <Route path="/jobs/:namespace/:name/specs/:configId" component={JobSpecDetail} />
+      <Route path="/jobs/:namespace/:name/instances/:instanceId" component={InstanceDetail} />
       <Route path="/allocations/:id" component={AllocationDetail} />
       <Route path="/services" component={Services} />
-      <Route path="/services/:name" component={ServiceDetail} />
+      <Route path="/services/:namespace/:name" component={ServiceDetail} />
       <Route path="/network" component={Network} />
       <Route path="/volumes" component={Volumes} />
       <Route path="/volumes/:id" component={VolumeDetail} />
+      <Route path="/namespaces" component={Namespaces} />
+      <Route path="/namespaces/:name" component={NamespaceDetail} />
       <Route path="/deployments" component={() => <Navigate href="/rollouts" />} />
       <Route path="/rollouts" component={Rollouts} />
       <Route path="/rollouts/:id" component={RolloutDetail} />
