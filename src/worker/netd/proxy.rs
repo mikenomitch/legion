@@ -3,9 +3,8 @@
 //! A gated workload's namespace has loopback and Legion's listeners, nothing
 //! else — so the only way out for traffic that is not a declared upstream is
 //! this proxy, at `127.0.0.1:1080` inside the namespace, named by
-//! `HTTP_PROXY` / `HTTPS_PROXY` / `ALL_PROXY` / `LEGION_EGRESS_PROXY`. It
-//! speaks the three things the long tail of tools speak (HTTP parsed by
-//! hyper, SOCKS5 by hand — it is a dozen bytes):
+//! `HTTP_PROXY` / `HTTPS_PROXY` / `ALL_PROXY` / `LEGION_EGRESS_PROXY`, all
+//! `http://`. It speaks the two forms of an HTTP proxy, parsed by hyper:
 //!
 //! - **HTTP `CONNECT host:port`** — TLS and anything else opaque. Policy is
 //!   judged at connect time (host, port); an allowed tunnel is spliced.
@@ -14,11 +13,8 @@
 //!   request on the client's connection — kept alive or pipelined — gets its
 //!   own verdict, and goes upstream in origin form on a connection of its
 //!   own.
-//! - **SOCKS5 CONNECT** (no auth) — for tools that prefer `ALL_PROXY`.
-//!   Domain-name targets are judged by name; IPv4/IPv6 targets by address.
 //!
-//! Every denial is a `403` (HTTP) or a SOCKS `connection not allowed` reply,
-//! recorded for the heartbeat with the deciding rule, exactly like a refused
+//! Every denial is a `403`, recorded for the heartbeat with the deciding rule, exactly like a refused
 //! upstream dial. Every accepted connection is tracked in the activity
 //! ledger (`super::activity`), so idle detection sees an open egress
 //! connection and its bytes as they move, not only when the splice ends. Dialing happens from the host namespace — the worker's —
@@ -621,7 +617,7 @@ fn pipeline(proxy: &Proxy) -> Arc<handlers::Pipeline> {
     proxy.pipelines.get(policy.as_deref(), "egress", None, &[])
 }
 
-/// The hops at `connect` (`CONNECT`, SOCKS5), with the connect-time facts.
+/// The hops at `connect` (`CONNECT`), with the connect-time facts.
 async fn hops(proxy: &Arc<Proxy>, facts: &HopFacts<'_>) -> HopOutcome {
     pipeline(proxy).run_connect(&proxy.context, facts).await
 }
@@ -657,26 +653,11 @@ async fn dial_proxy_target(
     Some(stream)
 }
 
-async fn handle<S>(mut client: S, peer: Option<SocketAddr>, proxy: Arc<Proxy>)
+async fn handle<S>(client: S, peer: Option<SocketAddr>, proxy: Arc<Proxy>)
 where
     S: SpliceStream + Send + 'static,
 {
-    // The first byte says which protocol the client speaks; it is handed
-    // back to the handler in front of the stream.
-    let mut first = [0u8; 1];
-    let n = match client.read(&mut first).await {
-        Ok(n) => n,
-        Err(_) => return,
-    };
-    if n == 0 {
-        return;
-    }
-    let client = Prefixed::new(first.to_vec(), client);
-    if first[0] == 0x05 {
-        handle_socks5(client, peer, proxy).await
-    } else {
-        handle_http(client, peer, proxy).await
-    }
+    handle_http(client, peer, proxy).await
 }
 
 // ---------------------------------------------------------------------------
@@ -1490,177 +1471,6 @@ async fn splice<S>(
 /// stream: always the portable copy.
 impl SpliceStream for TokioIo<hyper::upgrade::Upgraded> {}
 
-// ---------------------------------------------------------------------------
-// SOCKS5 CONNECT
-// ---------------------------------------------------------------------------
-
-async fn handle_socks5<S>(mut client: S, peer: Option<SocketAddr>, proxy: Arc<Proxy>)
-where
-    S: SpliceStream + Send + 'static,
-{
-    // Greeting: VER NMETHODS METHODS...
-    let mut hdr = [0u8; 2];
-    if client.read_exact(&mut hdr).await.is_err() || hdr[0] != 0x05 {
-        return;
-    }
-    let mut methods = vec![0u8; usize::from(hdr[1])];
-    if client.read_exact(&mut methods).await.is_err() {
-        return;
-    }
-    // No authentication.
-    if client.write_all(&[0x05, 0x00]).await.is_err() {
-        return;
-    }
-    // Request: VER CMD RSV ATYP DST.ADDR DST.PORT
-    let mut req = [0u8; 4];
-    if client.read_exact(&mut req).await.is_err() || req[0] != 0x05 {
-        return;
-    }
-    if req[1] != 0x01 {
-        // Only CONNECT; BIND and UDP ASSOCIATE are the UDP phase.
-        let _ = client
-            .write_all(&[0x05, 0x07, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
-            .await;
-        return;
-    }
-    let (host, ip): (String, Option<IpAddr>) = match req[3] {
-        0x01 => {
-            let mut a = [0u8; 4];
-            if client.read_exact(&mut a).await.is_err() {
-                return;
-            }
-            let ip = IpAddr::V4(Ipv4Addr::from(a));
-            (ip.to_string(), Some(ip))
-        }
-        0x03 => {
-            let mut len = [0u8; 1];
-            if client.read_exact(&mut len).await.is_err() {
-                return;
-            }
-            let mut name = vec![0u8; usize::from(len[0])];
-            if client.read_exact(&mut name).await.is_err() {
-                return;
-            }
-            (String::from_utf8_lossy(&name).to_ascii_lowercase(), None)
-        }
-        0x04 => {
-            let mut a = [0u8; 16];
-            if client.read_exact(&mut a).await.is_err() {
-                return;
-            }
-            let ip = IpAddr::V6(std::net::Ipv6Addr::from(a));
-            (ip.to_string(), Some(ip))
-        }
-        _ => {
-            let _ = client
-                .write_all(&[0x05, 0x08, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
-                .await;
-            return;
-        }
-    };
-    let mut port_bytes = [0u8; 2];
-    if client.read_exact(&mut port_bytes).await.is_err() {
-        return;
-    }
-    let port = u16::from_be_bytes(port_bytes);
-    let destination = format!("{host}:{port}");
-    let addrs = match egress::judge(
-        &proxy.context,
-        proxy.allocation_id,
-        proxy.gated,
-        false,
-        &host,
-        port,
-        None,
-    )
-    .await
-    {
-        Ok(addrs) => addrs,
-        Err(Denial { source, reason }) => {
-            net_metrics::connection("egress", PROTOCOL_TCP, "deny");
-            proxy
-                .context
-                .edges()
-                .record_denied(proxy.allocation_id, &host, PROTOCOL_TCP);
-            proxy.context.record_denial(
-                proxy.allocation_id,
-                "egress",
-                PROTOCOL_TCP,
-                &destination,
-                &source,
-                reason.as_deref(),
-                "",
-                "",
-            );
-            // 0x02: connection not allowed by ruleset.
-            let _ = client
-                .write_all(&[0x05, 0x02, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
-                .await;
-            return;
-        }
-    };
-    let ip = addrs.first().map(|addr| addr.ip()).or(ip);
-    let hop_facts = HopFacts {
-        allocation_id: proxy.allocation_id,
-        direction: "egress",
-        protocol: PROTOCOL_TCP,
-        destination: &destination,
-        host: Some(&host),
-        ip,
-        port,
-        ..Default::default()
-    };
-    let upstream = match hops(&proxy, &hop_facts).await {
-        HopOutcome::Allow => dial(&addrs).await,
-        HopOutcome::Deny { source, reason } => {
-            net_metrics::connection("egress", PROTOCOL_TCP, "deny");
-            proxy
-                .context
-                .edges()
-                .record_denied(proxy.allocation_id, &host, PROTOCOL_TCP);
-            proxy.context.record_denial(
-                proxy.allocation_id,
-                "egress",
-                PROTOCOL_TCP,
-                &destination,
-                &source,
-                reason.as_deref(),
-                "",
-                "",
-            );
-            let _ = client
-                .write_all(&[0x05, 0x02, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
-                .await;
-            return;
-        }
-        HopOutcome::Proxy(target) => dial_proxy_target(&proxy, &target, &hop_facts, peer).await,
-    };
-    let Some(upstream) = upstream else {
-        net_metrics::connection("egress", PROTOCOL_TCP, "error");
-        proxy
-            .context
-            .edges()
-            .record_connection(proxy.allocation_id, &host, None, false);
-        let _ = client
-            .write_all(&[0x05, 0x05, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
-            .await;
-        return;
-    };
-    if client
-        .write_all(&[0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
-        .await
-        .is_err()
-    {
-        return;
-    }
-    net_metrics::connection("egress", PROTOCOL_TCP, "allow");
-    proxy
-        .context
-        .edges()
-        .record_connection(proxy.allocation_id, &host, None, true);
-    splice(&proxy, &host, client, upstream, &[]).await;
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2044,7 +1854,7 @@ mod tests {
         (proxies, context, addr)
     }
 
-    /// A `proxy` handler takes the flow: CONNECT and SOCKS5 tunnels start
+    /// A `proxy` handler takes the flow: CONNECT tunnels start
     /// at the filter with a PROXY v2 header naming the workload and the
     /// destination; an absolute-URI request reaches it in absolute form
     /// with `Legion-*` headers.
@@ -2113,32 +1923,11 @@ mod tests {
         );
         assert!(text.contains("legion-allocation: 5"), "{text}");
 
-        // SOCKS5 CONNECT by name.
-        let mut stream = TcpStream::connect(addr).await.unwrap();
-        stream.write_all(&[0x05, 0x01, 0x00]).await.unwrap();
-        let mut greet = [0u8; 2];
-        stream.read_exact(&mut greet).await.unwrap();
-        let name = b"api.example";
-        let mut req = vec![0x05, 0x01, 0x00, 0x03, name.len() as u8];
-        req.extend_from_slice(name);
-        req.extend_from_slice(&443u16.to_be_bytes());
-        stream.write_all(&req).await.unwrap();
-        let mut reply = [0u8; 10];
-        stream.read_exact(&mut reply).await.unwrap();
-        assert_eq!(reply[1], 0x00, "socks connect succeeded");
-        stream
-            .write_all(b"GET /z HTTP/1.1\r\nHost: api.example\r\n\r\n")
-            .await
-            .unwrap();
-        let mut out = Vec::new();
-        let _ = tokio::time::timeout(Duration::from_secs(3), stream.read_to_end(&mut out)).await;
-        assert!(String::from_utf8_lossy(&out).contains("destination=api.example:443"));
-
         let statuses = context.handler_statuses(5);
         assert_eq!(statuses.len(), 1);
         assert_eq!(statuses[0].handler, "proxy");
         assert!(statuses[0].healthy);
-        assert_eq!(statuses[0].calls, 3);
+        assert_eq!(statuses[0].calls, 2);
     }
 
     /// A proxy handler with no endpoints fails the chain closed (or open
@@ -2559,47 +2348,6 @@ mod tests {
         assert!(response.contains("200 OK"), "{response}");
     }
 
-    #[tokio::test]
-    async fn socks5_connect_is_judged_by_name() {
-        let origin_port = origin().await;
-        let (_proxies, _denials, addr) =
-            proxies_with(&["127.0.0.1"], guard_opening(&[origin_port]), None).await;
-
-        let mut stream = TcpStream::connect(addr).await.unwrap();
-        stream.write_all(&[0x05, 0x01, 0x00]).await.unwrap();
-        let mut reply = [0u8; 2];
-        stream.read_exact(&mut reply).await.unwrap();
-        assert_eq!(reply, [0x05, 0x00]);
-        // CONNECT 127.0.0.1:<origin> by IPv4.
-        let mut req = vec![0x05, 0x01, 0x00, 0x01, 127, 0, 0, 1];
-        req.extend_from_slice(&origin_port.to_be_bytes());
-        stream.write_all(&req).await.unwrap();
-        let mut reply = [0u8; 10];
-        stream.read_exact(&mut reply).await.unwrap();
-        assert_eq!(reply[1], 0x00, "granted");
-        stream
-            .write_all(b"GET /via-socks HTTP/1.1\r\nHost: x\r\n\r\n")
-            .await
-            .unwrap();
-        let mut out = Vec::new();
-        let _ = tokio::time::timeout(Duration::from_secs(3), stream.read_to_end(&mut out)).await;
-        assert!(String::from_utf8_lossy(&out).contains("saw GET /via-socks"));
-
-        // A domain name the policy does not allow is refused with 0x02.
-        let mut stream = TcpStream::connect(addr).await.unwrap();
-        stream.write_all(&[0x05, 0x01, 0x00]).await.unwrap();
-        let mut reply = [0u8; 2];
-        stream.read_exact(&mut reply).await.unwrap();
-        let name = b"evil.example";
-        let mut req = vec![0x05, 0x01, 0x00, 0x03, name.len() as u8];
-        req.extend_from_slice(name);
-        req.extend_from_slice(&443u16.to_be_bytes());
-        stream.write_all(&req).await.unwrap();
-        let mut reply = [0u8; 10];
-        stream.read_exact(&mut reply).await.unwrap();
-        assert_eq!(reply[1], 0x02, "connection not allowed by ruleset");
-    }
-
     // -----------------------------------------------------------------
     // The host guard (worker-plane-auth plan §6.11)
     // -----------------------------------------------------------------
@@ -2610,23 +2358,6 @@ mod tests {
             format!("CONNECT {target} HTTP/1.1\r\nHost: {target}\r\n\r\n").as_bytes(),
         )
         .await
-    }
-
-    async fn socks_reply(addr: SocketAddr, atyp: u8, address: &[u8], port: u16) -> u8 {
-        let mut stream = TcpStream::connect(addr).await.unwrap();
-        stream.write_all(&[0x05, 0x01, 0x00]).await.unwrap();
-        let mut hello = [0u8; 2];
-        stream.read_exact(&mut hello).await.unwrap();
-        let mut req = vec![0x05, 0x01, 0x00, atyp];
-        if atyp == 0x03 {
-            req.push(address.len() as u8);
-        }
-        req.extend_from_slice(address);
-        req.extend_from_slice(&port.to_be_bytes());
-        stream.write_all(&req).await.unwrap();
-        let mut reply = [0u8; 10];
-        stream.read_exact(&mut reply).await.unwrap();
-        reply[1]
     }
 
     fn assert_guard_denied(response: &str, what: &str) {
@@ -2643,20 +2374,20 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn every_default_class_is_refused_on_all_three_paths_test() {
+    async fn every_default_class_is_refused_on_both_proxy_paths_test() {
         // Policy allows everything: the guard sits below it.
         let guard = guard_opening(&[]);
         guard.set_node_addrs(vec!["10.0.1.7".parse().unwrap()]);
         let (_proxies, denials, addr) = proxies_with(&["*"], guard, None).await;
-        for (target, connect) in [
-            ("127.0.0.1", "127.0.0.1:4747"),
-            ("::1", "[::1]:4747"),
-            ("::ffff:127.0.0.1", "[::ffff:127.0.0.1]:4848"),
-            ("0.0.0.0", "0.0.0.0:4848"),
-            ("10.0.1.7", "10.0.1.7:4848"),
-            ("169.254.169.254", "169.254.169.254:80"),
-            ("fd00:ec2::254", "[fd00:ec2::254]:80"),
-            ("100.100.100.200", "100.100.100.200:80"),
+        for connect in [
+            "127.0.0.1:4747",
+            "[::1]:4747",
+            "[::ffff:127.0.0.1]:4848",
+            "0.0.0.0:4848",
+            "10.0.1.7:4848",
+            "169.254.169.254:80",
+            "[fd00:ec2::254]:80",
+            "100.100.100.200:80",
         ] {
             assert_guard_denied(&connect_status(addr, connect).await, connect);
             let absolute = raw(
@@ -2666,13 +2397,6 @@ mod tests {
             )
             .await;
             assert_guard_denied(&absolute, &format!("GET {connect}"));
-            let ip: IpAddr = target.parse().unwrap();
-            let port: u16 = connect.rsplit(':').next().unwrap().parse().unwrap();
-            let code = match ip {
-                IpAddr::V4(v4) => socks_reply(addr, 0x01, &v4.octets(), port).await,
-                IpAddr::V6(v6) => socks_reply(addr, 0x04, &v6.octets(), port).await,
-            };
-            assert_eq!(code, 0x02, "SOCKS {target} must be refused by the ruleset");
         }
         let drained = denials.drain();
         assert!(!drained.is_empty());
@@ -2705,10 +2429,6 @@ mod tests {
         assert!(
             response.contains("instance-data.test resolves to 169.254.169.254 (link-local)"),
             "{response}"
-        );
-        assert_eq!(
-            socks_reply(addr, 0x03, b"instance-data.test", 80).await,
-            0x02
         );
     }
 

@@ -633,7 +633,7 @@ chain (`egress.handlers`, `ingress.handlers`, on a task or a policy object)
 or on one upstream (`connect.upstreams[].handlers`). They run in order after
 the rules have allowed the flow, with the chain's handlers first, then the
 upstream's. Every path runs the same list: an L4 upstream, an HTTP-mode
-upstream, the gated proxy (`CONNECT`, SOCKS5, and absolute-URI requests), and
+upstream, the gated proxy (`CONNECT` and absolute-URI requests), and
 ingress.
 
 A handler is written as its kind, with the kind's settings inside it:
@@ -727,7 +727,7 @@ The connection closes (or the request gets a `403` that names the hop in
 `legion net policy show` names the hop.
 
 **Where it runs.** On L4 paths (an upstream splice, the gated egress proxy's
-`CONNECT`/SOCKS, an ingress splice), the webhook is called at connect time
+`CONNECT`, an ingress splice), the webhook is called at connect time
 with the connect-time facts. In HTTP mode it is called per request with the
 request head: once per new (identity, destination, method, path), then from
 the cache.
@@ -738,7 +738,7 @@ A `proxy` hop takes over the flow. Legion dials the proxy, hands it the
 connection along with everything it needs to decide or filter, and then
 splices:
 
-- **TCP** (an L4 upstream, `CONNECT`, SOCKS5, an ingress splice): the
+- **TCP** (an L4 upstream, `CONNECT`, an ingress splice): the
   connection starts with a **PROXY protocol v2** header. It carries the
   source and destination addresses, plus these Legion TLVs: `0xE0`
   identity, `0xE1` the original destination as `host:port` (or the task's
@@ -1062,7 +1062,8 @@ Both cases are set because tools disagree: curl ignores upper-case
 variables on Node 22.21 and 24.5 or later. Older Node ignores it, and so has
 no route out.
 
-The proxy supports three protocols:
+The proxy is an HTTP proxy, and every proxy variable names it as
+`http://`. It takes both forms:
 
 - HTTP `CONNECT`, for TLS and other opaque traffic, checked by host and port.
 - Absolute-URI plain HTTP, also checked by the request head and forwarded in
@@ -1070,18 +1071,20 @@ The proxy supports three protocols:
   connection to the proxy open or pipeline requests on it: each request is
   checked on its own, so a request behind an allowed one is never let
   through unchecked.
-- SOCKS5 `CONNECT`, with domain-name targets checked by name.
+
+There is no SOCKS listener: Legion never sets a `socks5://` proxy, and a
+client configured for one gets no answer.
 
 Nothing is added to traffic through the proxy. In particular, a
 [credential](#credential-injection) is only injected on a declared
 `https://` upstream, never into a `CONNECT` tunnel, which the node cannot
 read. Point a client that needs one at its upstream, not the proxy.
 
-Every denial is a `403` with `Legion-Denied-By` (or a SOCKS "connection not
-allowed") and a `net.denied` event. **A tool that ignores the proxy
-variables has no route and fails.** That failure is how the policy is
-enforced. Transparent capture (a TUN inside the namespace so unmodified tools
-work) is not implemented.
+Every denial is a `403` with `Legion-Denied-By` and a `net.denied` event.
+**On a node without the [kernel classifier](#the-kernel-classifier), a tool
+that ignores the proxy variables has no route and fails.** That failure is
+how the policy is enforced. With the classifier, its `connect()` is captured
+transparently and judged the same way.
 
 Three fail-closed rules apply only to gated allocations. Every listener
 denies while the allocation's policy has not arrived (`policy-pending`), and
@@ -1322,8 +1325,8 @@ address they map.
 **Where it applies.** Every connection the datapath dials to a destination
 the allocation named:
 
-- the gated egress proxy, on all three paths (HTTP `CONNECT`, absolute-URI
-  HTTP, SOCKS5);
+- the gated egress proxy, on both paths (HTTP `CONNECT` and absolute-URI
+  HTTP);
 - external upstreams (`to = "tcp://…"`, `tls://`, `http://`, `https://`), in
   L4 and HTTP mode;
 - `proxy` handler targets, on egress and ingress. A handler that points at

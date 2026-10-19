@@ -75,7 +75,7 @@ gated egress proxy, ingress listeners) lives in `src/worker/netd/` and
   `spawn_accept_loop`. Outbound TCP from the datapath goes through
   `netd::listen::dial_tcp`.
 - Protocols come from libraries where one fits: hyper for HTTP, hickory-proto
-  for DNS messages, rustls for TLS. PROXY protocol v2, SOCKS5, and the VMM's
+  for DNS messages, rustls for TLS. PROXY protocol v2 and the VMM's
   vsock `CONNECT` handshake are small and written by hand.
 
 ## Object Storage Conventions

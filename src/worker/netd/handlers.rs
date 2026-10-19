@@ -8,7 +8,7 @@
 //! see:
 //!
 //! - **connect** — an L4 upstream splice, the gated proxy's `CONNECT` and
-//!   SOCKS5, an L4 ingress splice: [`Pipeline::run_connect`] with the
+//!   an L4 ingress splice: [`Pipeline::run_connect`] with the
 //!   connect-time facts.
 //! - **request** — an HTTP-mode upstream, an absolute-URI request through the
 //!   gated proxy, HTTP-mode ingress: [`Pipeline::run_request`] with the
