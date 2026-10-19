@@ -2344,18 +2344,19 @@ async fn heartbeat_tick(
         // A gated allocation whose capture is not ready has no network: say
         // so in its health, so rollouts and `doctor` see it rather than a
         // task that looks fine and cannot reach anything.
+        // A capture that recovers puts the allocation's own health back.
         {
             let mut manager = task_manager.lock().expect("task manager");
             for status in &net_status {
-                if status.mode == crate::structs::netpolicy::MODE_GATED
-                    && !status.capture_ready
-                    && manager.has_allocation(status.allocation_id)
+                if status.mode != crate::structs::netpolicy::MODE_GATED
+                    || !manager.has_allocation(status.allocation_id)
                 {
-                    manager.set_allocation_health(
-                        status.allocation_id,
-                        false,
-                        format!("net_capture_unavailable: {}", status.problems.join("; ")),
-                    );
+                    continue;
+                }
+                if status.capture_ready {
+                    manager.mark_net_capture_ready(status.allocation_id);
+                } else {
+                    manager.mark_net_capture_unavailable(status.allocation_id, &status.problems);
                 }
             }
         }

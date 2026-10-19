@@ -87,7 +87,7 @@ impl Eval {
         } else {
             let node = Node {
                 id: node_id.clone(),
-                status: "ready".into(),
+                status: "active".into(),
                 pool: "default".into(),
                 availability: "available".into(),
                 last_heartbeat,

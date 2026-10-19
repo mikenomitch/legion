@@ -78,7 +78,9 @@ used by:
   fullstack /tasks/api/kvInjections/env/DB_PASSWORD
 ```
 
-`--json` prints the entry only. Use `GetKv` directly for `references`.
+`--json` puts the same list in `data.references`, beside the entry's own
+fields (`jobId` and `jsonPointer` per reference, `[]` when nothing reads the
+key).
 
 ### In the UI
 

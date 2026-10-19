@@ -48,7 +48,7 @@ export const pendingOpLabel = (op: string | undefined): string | undefined => {
  * Stop causes the platform chose, which the instance row calls out. A user
  * stop, a rollout, or a suspend is expected and stays quiet.
  */
-const PLATFORM_STOPS = new Set(['node_pressure', 'preempted', 'node_lost', 'drain', 'reschedule'])
+const PLATFORM_STOPS = new Set(['failed', 'node_pressure', 'preempted', 'node_lost', 'drain', 'reschedule'])
 
 export const isPlatformStop = (stop: InstanceStop | undefined): stop is InstanceStop =>
   stop !== undefined && PLATFORM_STOPS.has(stop.cause)
@@ -83,6 +83,7 @@ export const stopCauseTone = (cause: string): Tone => {
     case 'node_pressure':
     case 'node_lost':
       return 'warn'
+    case 'failed':
     case 'preempted':
       return 'danger'
     default:

@@ -364,12 +364,12 @@ How to use it:
         budget that fails (or stops) just the instance is the likely shape
         (`Store::remove_failed_allocation` in
         `src/storage/store/reschedule_holds.rs`).
-  - [ ] **A worker-reported failure leaves no `last_stop` on the
-        instance.** The failure path removes the allocation with
-        `StopCause::Unknown`, which records no `last_stop`, so once the
-        reschedule hold lapses the instance row no longer says why its last
-        allocation ended. A `failed` stop cause carrying the reason would
-        close it (`remove_allocation_row_tx`).
+  - [x] **A worker-reported failure leaves no `last_stop` on the
+        instance** (fixed 2026-10-19). The failure path now stops with a new
+        `failed` cause and records `Failed on node <node>: <reason>` as the
+        instance's `last_stop`
+        ([graceful-stop.md](../docs/graceful-stop.md#the-causes),
+        [calls 73](calls/launch-spot-check-fixes-plan_calls.md)).
   - [ ] **Scheduler benchmark numbers for the reschedule holds.** The
         holds add one indexed `reschedule_hold` read per `Reschedule` plan
         and a subquery to the keyed binder's ordering. AGENTS.md asks for
@@ -377,14 +377,12 @@ How to use it:
         were not taken in the change that added them. (The pinned-storage
         disk exemption that followed was measured: `scheduler_speed` and
         `restore` unchanged within noise.)
-  - [ ] **The disk-fit check may read the wrong disk.** The kitchen-sink
-        fingerprint writes `disk_available_space` once per disk it lists, so
-        the node reports whichever disk came last (`/boot/efi` on some
-        hosts), not the one holding the worker's volumes
-        (`src/worker/node_check/node_checkers/kitchen_sink.rs`). It may be
-        why the rig's sc-wkr-1 failed the check for a 2G volume while 12%
-        reserved (unconfirmed: a full root disk would do the same). Report
-        the free space of the disk holding the state dir instead.
+  - [x] **The disk-fit check may read the wrong disk** (fixed 2026-10-19).
+        The fingerprint's top-level `disk_*` keys now describe the mount
+        holding the worker state dir, where allocations and `local-dir`
+        volumes live, not whichever disk was listed last
+        ([calls 74](calls/launch-spot-check-fixes-plan_calls.md)). Whether it
+        explains sc-wkr-1's 2G refusal is still unconfirmed on the rig.
   - [ ] **A rollout's replacement skips the previous version's backoff.**
         A hold is keyed by job config, so when an instance fails on the old
         version and a rollout then places the new one, the new version's
@@ -396,15 +394,14 @@ How to use it:
         events.** The recovery rebuilds the read model and resyncs work
         streams, but blocked evals waiting on the freed capacity wait for the
         next capacity event (`Store::project_committed_changeset`).
-  - [ ] **Followers never publish a config snapshot.** P2-12 fixed the
-        Managers page roster, but a manager still writes its config row only
-        when it leads the control lane (`upsert_manager_config` in
-        `src/manager/daemon.rs`), so a manager that has never led has no
-        config page and shows `—` in the Config column. Fix by forwarding
-        the write to the leader (`ForwardableLaneWrite`) from every manager
-        at startup. Rows written before P2-12 under the old `host:port` key
-        linger until the store is reset
-        ([calls](calls/managers-page-raft-members_calls.md) 3).
+  - [x] **Followers never publish a config snapshot** (fixed 2026-10-19).
+        A manager that does not lead the control lane forwards its config
+        row to the leader at startup (`ForwardableLaneWrite::UpsertManagerConfig`),
+        retried in the background while the cluster elects
+        ([ui-architecture.md](../docs/ui-architecture.md),
+        [calls 75](calls/launch-spot-check-fixes-plan_calls.md)). Rows written
+        before P2-12 under the old `host:port` key still linger until the
+        store is reset ([calls](calls/managers-page-raft-members_calls.md) 3).
   - [ ] **Capability-aware placement.** A task that adds capabilities places
         like any other and fails at start on a node whose
         `container.allowCaps` refuses them; authors pin such tasks by pool
@@ -426,8 +423,10 @@ How to use it:
         remainder of a partial plan still waits for the free-triggered
         capacity pass (`capacity_waiters`), so there are two retry paths and
         `job info` shows `blocked` only when nothing placed (calls 21).
-  - [ ] **A `legion_leader_forwards_total` metric** for follower-to-leader
-        write forwarding (calls 3).
+  - [x] **A `legion_leader_forwards_total` metric** for follower-to-leader
+        write forwarding (calls 3). Shipped 2026-10-19 as
+        `legion_leader_forwards_total{lane,op,outcome}`
+        ([metrics.md](../docs/metrics.md#raft)).
   - [ ] **Terminal batch reports are not persisted.** A worker restarted
         between a batch exit and the heartbeat that reports it cannot know
         the exit status, so the completed step is rescheduled and runs again.
@@ -456,12 +455,18 @@ How to use it:
         a TLS-intercepting proxy (`rustls-tls-native-roots` would). On
         macOS the pull happens inside the task process, so a pull failure is
         reported as an exit with stderr rather than a staging failure.
-  - [ ] **Supplementary groups from the image's `/etc/group` are not
-        applied** in Linux containers.
+  - [x] **Supplementary groups from the image's `/etc/group` are not
+        applied** in Linux containers (fixed 2026-10-19): `additionalGids`
+        as runc sets them, for implicit users only
+        ([task-runtime-container.md](../docs/task-runtime-container.md),
+        [calls 76](calls/launch-spot-check-fixes-plan_calls.md)).
   - [ ] **Event metadata keys are still mixed case**; the camelCase rule now
         covers API messages and CLI envelopes, not event metadata.
   - [ ] **The https CA default (`configs/tls/rootca.pem`) is relative to the
-        working directory**, like the manager config path was.
+        working directory**, like the manager config path was. What should
+        replace it (the platform's roots, a file under `~/.legion`, or no
+        default) is the CLI TLS question under Auth, TLS & security ("TLS
+        for the CLI and UI is autoconfigured"), so it waits on that plan.
   - [ ] **Not verified on real hardware**: cgroup v2 resource enforcement
         turning on (P1-1), and the worker-plane throughput cost of TLS
         dispatch at 1,000 nodes.
@@ -954,12 +959,6 @@ How to use it:
       that survives a double leadership flap can settle an eval a new
       leader already requeued and re-claimed — narrow, pre-existing, and
       widened slightly by batching (audit finding, 2026-08-06).
-- [ ] **`run_dispatch_future` has no `Send` bound** (`dispatcher.rs:408`),
-      so holding a `MutexGuard` across an `.await` inside
-      `dispatch_allocations` would **compile**. It does not happen today —
-      the per-allocation loop is entirely synchronous and the awaits come
-      after it — but this is the one spot on the plan path where the type
-      system is not enforcing the invariant. Latent, not a live bug.
 - [x] **Stop the coalescer polling for its handoff.** A submitter that lost
       the commit lock slept 1 ms on its reply channel and re-contended, so
       the lock sat free until some waiter's next tick and every waiter
@@ -1328,13 +1327,6 @@ How to use it:
       colocation works within one job spec
       ([scheduler/policy.rs](../src/manager/scheduler/policy.rs)); cross-job
       placement doesn't exist.
-- [ ] Node-level builtin resource overrides are silently ignored —
-      `ResourcePool::from_node` skips any builtin name, so `resources: { cpu: 40000 }`
-      in a worker config disappears without a warning
-      ([#143](https://github.com/mikenomitch/legion/pull/143)). Open questions: does
-      an override replace the fingerprinted value or act as a second ceiling, and
-      how does it compose with `reservedResources`? Either way an ignored key
-      should warn or fail validation.
 - [ ] Fix the slowest bits of the scheduler using the benchmarks in
       [docs/testing-and-benchmarks.md](../docs/testing-and-benchmarks.md).
       Candidate construction is index-served
@@ -1737,8 +1729,10 @@ How to use it:
         `LIVENESS_MASS_DISRUPTION_FRACTION` (`src/constants.rs:109`), so
         the full storm fires unsuppressed — by design; these fixes are
         what make that affordable.
-  - [ ] **`mark_node_ready` writes `status = "ready"`, which every liveness
-        query filters out.** `mark_node_ready_apply`
+  - [x] **`mark_node_ready` writes `status = "ready"`, which every liveness
+        query filters out.** Fixed 2026-10-19: it writes `active`. The
+        heartbeat recovery keeps its own composite, which also counts the
+        recovery and re-observes the node in the liveness tracker. `mark_node_ready_apply`
         (`src/storage/store.rs`) sets `"ready"` rather than `"active"`, so a
         node recovered through it drops out of `active_node_liveness_rows`,
         out of `legion_nodes{status="active"}`, and out of the liveness scan
@@ -1938,16 +1932,16 @@ How to use it:
       `volume delete --force`) can still direct a placement; later
       reconciliation covers it. Low severity, same pass.
 - [ ] Let a node override its builtin resource capacity (`cpu`, `memory`, `cores`)
-    - `ResourcePool::from_node` skips builtin names when reading a node's
-      `resources` block, so `resources: { cpu: 40000 }` in a worker config is
-      silently ignored rather than applied or rejected. Capacity can only come
+    - A builtin name in a worker type's `resources` block now fails manager
+      startup (2026-10-19, Done under Scheduling,
+      [calls](calls/node-resource-overrides_calls.md)) instead of being
+      skipped by `ResourcePool::from_node`. Capacity can only come
       from the fingerprint today, which leaves no escape hatch when a platform
       fingerprints badly (see the Apple Silicon CPU frequency case) and no way
       to deliberately under- or over-subscribe a node.
     - Decide whether an override replaces the fingerprint or is a separate
-      ceiling, and how it composes with `reservedResources`. Whichever way it
-      lands, an ignored key should warn or fail validation instead of passing
-      silently.
+      ceiling, and how it composes with `reservedResources`, then lift the
+      startup refusal for the keys it covers.
 - [ ] **Fresh plans overcommit while the old config still runs (audit SC7).**
       Apply counts the replaced job's allocations as free, and the old config
       is removed only after apply. Deliberate today (resubmitting a job that
@@ -2061,21 +2055,6 @@ Plans: [task-runtime-plugins](../docs/task-runtime-plugins.md).
         heartbeat path. Binding listeners from the mirror alone is not enough,
         because the policy is what lets traffic through: carry the policy
         assignment on the delta.
-- [ ] **A `net_capture_unavailable` health sticks on a task without checks.**
-      `heartbeat_tick` sets it when a gated allocation's capture is not ready,
-      and nothing sets health back when capture recovers: only the health
-      monitor writes healthy, and a task without checks is written healthy
-      once, at start. The namespace-ordering fix removed the common trigger
-      (the first beat binding before the namespace existed), but a transient
-      bind failure still leaves the task reported unhealthy.
-- [ ] **A failed `boot` check at start counts at once.** The first check runs
-      the moment the task starts (`tokio::time::interval`'s first tick), and
-      `boot_grace_time` only applies to `health` checks, so a `boot` check with
-      `unhealthy_after_count = 1` (as in `configs/jobs/maximal.ncl`) marks the
-      task unhealthy before it could have bound its port
-      (`src/worker/task_health.rs`, the failure branch of the monitor loop).
-      Give boot checks a grace, or start their cadence one `every` late now
-      that startup probes catch the early pass.
 - [ ] **The worker state file is rewritten whole on every start.**
       `persist_state` serializes every allocation (pretty JSON with full task
       configs), reads `/proc` for each pid, and fsyncs, under the task-manager
@@ -2450,9 +2429,10 @@ Plans: [task-runtime-plugins](../docs/task-runtime-plugins.md).
         tests used a static JWKS and never hit it. Verification now runs in
         `spawn_blocking` and the fetch on its own thread
         ([calls entry 10](calls/sandbox-exec-plan_calls.md#10-exec-tickets-share-the-boot-ticket-jwks-cache-and-verification-runs-off-the-async-runtime)).
-  - [ ] Found while building Phase 2: `legion ledger -j` prints a bare
+  - [x] Found while building Phase 2: `legion ledger -j` prints a bare
         array, not the standard `{ok, data}` envelope AGENTS.md requires
-        (`src/cmd/ledger.rs`).
+        (`src/cmd/ledger.rs`). Fixed 2026-10-19: `data` is the array, and
+        RPC failures use the error envelope.
   - [x] Phase 3: delegated minting keys. `CreateExecKey`, `ListExecKeys`,
         `DeleteExecKey` (`acl:write` / `acl:read`, idempotency keys), the
         `exec_key` control-lane table, keys delivered to workers by version
@@ -4181,8 +4161,6 @@ Plan: [auth-acl-plan.md](plans/auth-acl-plan.md) · docs: [auth-and-acls.md](../
 - [ ] An upstream-authority mode (a locally held intermediate from Vault or
       AWS Private CA), or native Vault/AWS PCA providers, if `exec` signing
       latency shows at scale ([cluster-CA plan §11](plans/cluster-ca-provider-plan.md)).
-- [ ] `legion keyring provider test` has no capability-catalog entry
-      ([cluster-CA calls #14](calls/cluster-ca-provider-plan_calls.md)).
 
 ## Observability
 
@@ -4461,9 +4439,6 @@ From [ui-task-and-template-redesign-plan.md](plans/ui-task-and-template-redesign
       exist yet (the request carries no template attribute), so their Review
       cannot tell "creates" from "updates" and cannot follow the rollout
       ([calls entry 10](calls/ui-task-and-template-redesign-plan_calls.md))
-- [ ] `Store::get_submissions_for_config` has no `ORDER BY`; the UI now finds
-      the spec by name, but any other "first JSON submission" consumer has the
-      same latent bug ([calls entry 5](calls/ui-task-and-template-redesign-plan_calls.md))
 - [ ] Template catalog and authoring views: usage counts, jobs behind the
       latest version, version-to-version source diff
 
@@ -4478,8 +4453,6 @@ Deferred from [operator-ui-gaps-plan.md](plans/operator-ui-gaps-plan.md):
 - [ ] `GetAllocation` RPC (job-scoped) so the allocation page works for tokens
       without `node:read`; today it reads the whole ledger
       ([calls 4](calls/operator-ui-gaps-plan_calls.md#4-the-allocation-page-reads-the-ledger-instead-of-a-new-getallocation-rpc))
-- [ ] `legion kv get --json` omits `GetKvReply.references`; only the text
-      output prints `used by:`
 - [ ] The instance event filter scans the bounded journal with `json_extract`;
       an indexed `scheduler_event.instance_id` column if the journal bound ever
       grows ([calls 3](calls/operator-ui-gaps-plan_calls.md#3-the-instance-event-filter-reads-metadata-not-a-new-column))
@@ -4509,11 +4482,11 @@ Deferred from [operator-ui-gaps-plan.md](plans/operator-ui-gaps-plan.md):
         `job_config_id`, so check whether the failing allocations ran a
         different config than 1272 and whether `job_config_unwanted_reason`
         let a superseded config through.
-  - [ ] **Layer extraction applies directory modes as it goes.** A layer
-        whose directory is read-only (`0555`) and has entries after it fails
-        for a worker that is not root. Root bypasses the mode, so the Linux
-        worker is unaffected. Deferring directory modes to the end of a
-        layer, as `tar::Archive::unpack` does, would fix it.
+  - [x] **Layer extraction applies directory modes as it goes** (fixed
+        2026-10-19). Directory modes now land once the layer is done, deepest
+        first, as `tar::Archive::unpack` does
+        ([calls 77](calls/launch-spot-check-fixes-plan_calls.md)). Across
+        layers a read-only directory still refuses a non-root worker.
   - [ ] **Pressure evictions still loop forever by default** (sandbox spot
         check, 2026-10-12). `move_count` is unlimited, so the move delay only
         slows the loop; the exponential move backoff (`move_backoff` in
@@ -4525,10 +4498,9 @@ Deferred from [operator-ui-gaps-plan.md](plans/operator-ui-gaps-plan.md):
         builds `task_running` from the candidate nodes' rows, not the fleet,
         so `disruption.minAvailable` can bind tighter than documented when a
         task runs on nodes outside the pass.
-  - [ ] **Storage tests need a higher fd limit.** Under the default 1024 on a
-        32-core box, about ten `storage::` tests fail "unable to open
-        database file". They pass with `ulimit -n 65536`. Note it in
-        `docs/testing-and-benchmarks.md` or lower the per-test fd use.
+  - [x] **Storage tests need a higher fd limit** (documented 2026-10-19 in
+        [testing-and-benchmarks.md](../docs/testing-and-benchmarks.md#running-tests);
+        the per-test fd use is unchanged).
   - [ ] **Re-verify on the rig:** the microVM clean stop (volume writes
         survive `instance stop`) and image pulls after a leader failover.
         Both fixes are unit-tested only. Also two local managers on
@@ -4581,23 +4553,6 @@ Deferred from [operator-ui-gaps-plan.md](plans/operator-ui-gaps-plan.md):
       is the evidence: throughput peaks near 128 in flight and *falls* to
       607 jobs/sec at 1,024, which is what a serialized commit looks like
       from the client side.
-- [ ] **`a_task_that_ignores_its_stop_signal_is_killed_at_the_deadline` is
-      flaky under parallel load.** Passes alone and in most full runs, fails
-      intermittently in `cargo test --all` (seen 2026-08-04). Its own comment
-      claims "a zero grace window is already expired, so the very first reap
-      takes it — no sleeping, no flakiness", but it spawns a real process and
-      asserts a reap deadline, so a loaded machine can reap before the child
-      is scheduled. Not caused by the plan-apply work — `src/worker/task_manager.rs`
-      is untouched by it. Make the assertion independent of the child actually
-      having started, or gate on an observed start.
-- [ ] **`simulated_fleet_feeds_the_worker_metric_registry` asserts a
-      process-global gauge.** `tests/worker_simulation.rs` checks
-      `simulated_nodes >= 4` while the binary's other tests run fleets of
-      their own, so another fleet shutting down can pull the gauge under 4.
-      Failed once in a full local run (2026-10-12, PR #31, which does not
-      touch the simulator) and passed three reruns. Its counters are
-      already asserted as deltas; read the gauge from this fleet, or
-      serialize the tests that run fleets.
 - [ ] **`acked_write_survives_any_single_node_loss` is bimodally flaky on
       small hosts.** Seen 2026-08-07 on a 4-core shared VM, debug build:
       either the whole test completes in ~1s or a round's survivors never
@@ -4618,16 +4573,6 @@ Deferred from [operator-ui-gaps-plan.md](plans/operator-ui-gaps-plan.md):
       `cafbe80` at 2/3 passing and the branch at 1/4, with the base
       failure identical to the branch's, so still environmental. It was
       also the one failure the full suite produced that night.
-- [ ] **`teardown.sh` silently aborts when run non-interactively, leaving the
-      whole rig billing.** It prompts `read -r -p "Destroy the entire benchmark
-      rig?"` unless `--yes` is passed. Under `nohup ... < /dev/null` (how any
-      unattended teardown runs) `read` gets EOF and returns non-zero, and
-      `set -e` kills the script *before* it prints "aborted" — so the log ends
-      on a successful-looking S3 sync line and every instance stays up. Hit
-      tonight: teardown appeared to succeed twice while the full rig kept
-      running. Fix: detect a non-tty and either default to proceeding or fail
-      loudly, never exit silently on a confirmation prompt. Audit the other
-      rig scripts for the same `set -e` + `read` shape.
 - [x] **Bake the operator box's toolchain into an AMI.** Standing the box up
       installed build-essential, protoc, clang, terraform, AWS CLI v2 and
       rustup in user-data on every launch: `cloud-init analyze blame` measured
@@ -5071,6 +5016,16 @@ docs: [scheduler-and-eval-loop.md](../docs/scheduler-and-eval-loop.md), [jobs-ta
       [calls](calls/adaptive-scheduler-concurrency-plan_calls.md),
       [docs/adaptive-scheduler-concurrency.md](../docs/adaptive-scheduler-concurrency.md).
       Phase 0 (measurement) was skipped and phases 4–5 are open items above.
+- [x] **A builtin name in a worker type's `resources` fails manager startup**
+      (2026-10-19). `resources = { cpu = 40000 }` used to vanish without a
+      word, because `ResourcePool::from_node` skips builtin names; it now
+      names the keys and points at `reservedResources` and `maxAllocations`
+      ([resource-enforcement.md](../docs/resource-enforcement.md),
+      [calls](calls/node-resource-overrides_calls.md)). The override itself
+      is still open ("Let a node override its builtin resource capacity").
+- [x] **`run_dispatch_future` requires a `Send` future** (2026-10-19), so a
+      `MutexGuard` held across an `.await` on the dispatch path no longer
+      compiles.
 
 ## Task runtimes
 
@@ -5279,6 +5234,15 @@ docs: [task-runtime-plugins.md](../docs/task-runtime-plugins.md)
     step, ordered strictly behind the reap so a cgroup is never removed while
     it still holds a live process
     ([calls 19](calls/container-runtime-exec-and-signals-plan_calls.md)).
+- [x] **A `net_capture_unavailable` health no longer sticks** (2026-10-19).
+      When a gated allocation's capture recovers, the worker puts back the
+      health it had before, unless a check result was written since; a task
+      without checks used to read unhealthy for good.
+- [x] **A `boot` check's failure in its first `every` is not counted**
+      (2026-10-19), so `unhealthy_after_count = 1` no longer fails a task on
+      the check that runs the instant it starts. Early passes still count
+      ([jobs-tasks-and-scheduling.md](../docs/jobs-tasks-and-scheduling.md#startup-probing),
+      [calls 6](calls/task-start-critical-path-plan_calls.md)).
 
 ## Artifacts
 
@@ -5744,6 +5708,9 @@ docs: [task-runtime-plugins.md](../docs/task-runtime-plugins.md)
       `RotateMeshCa` (S5), stream re-auth (S7). See the
       [audit](architecture-audit-2026-10-09.md) and
       [auth-and-acls.md](../docs/auth-and-acls.md).
+- [x] **`legion keyring provider test` and `legion keyring root-key
+      generate` are in the capability catalog** (2026-10-19,
+      [cluster-CA calls #14](calls/cluster-ca-provider-plan_calls.md)).
 
 ## Exec & actions
 
@@ -5926,6 +5893,13 @@ docs: [task-runtime-plugins.md](../docs/task-runtime-plugins.md)
       [service-discovery](../docs/service-discovery.md#public-addresses),
       [rollouts](../docs/rollouts.md#a-newer-version-supersedes-a-running-rollout),
       [ui-architecture](../docs/ui-architecture.md)).
+- [x] **`Store::get_submissions_for_config` orders its rows** (2026-10-19):
+      primary first, then submission order, so every "first submission"
+      consumer gets the file the submitter named (`GetJobSpecReply.submissions`
+      proto comment, [calls entry 5](calls/ui-task-and-template-redesign-plan_calls.md)).
+- [x] **`legion kv get --json` carries `references`** beside the entry's
+      fields (2026-10-19, [kv-store.md](../docs/kv-store.md#which-jobs-read-a-key),
+      [calls 9](calls/operator-ui-gaps-plan_calls.md)).
 
 ## Pre-launch spot check (2026-10-11)
 
@@ -6238,3 +6212,20 @@ Found on the live AWS rig (3 raft managers, 2 workers).
       `job.kv_render_refused` event names the key; a resubmit checks it
       against the submitter ([calls #21](calls/security-gap-closure-plan_calls.md),
       [docs](../docs/kv-store.md)).
+
+## Cross-cutting
+
+- [x] **`teardown.sh` with no terminal refuses loudly** (2026-10-19). Under
+      `nohup ... < /dev/null` its confirmation `read` hit EOF and `set -e`
+      ended the script silently with the rig still billing. It now exits 2
+      and says to pass `--yes`; it was the only rig script with a `read`
+      prompt ([benchmarks/aws/README.md](../benchmarks/aws/README.md),
+      [calls 42](calls/aws-comparative-benchmark-plan_calls.md)).
+- [x] **`simulated_fleet_feeds_the_worker_metric_registry` no longer races
+      other fleets** (2026-10-19): the fleet tests in
+      `tests/worker_simulation.rs` take turns, because launching a fleet
+      resets the process-global `legion_worker_simulated_nodes` gauge.
+- [x] **`a_task_that_ignores_its_stop_signal_is_killed_at_the_deadline` waits
+      for its trap** before stopping the task (found fixed 2026-10-19: the
+      shell writes a marker once `trap '' TERM` is in place, so a signal can
+      no longer land before it).

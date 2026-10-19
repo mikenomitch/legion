@@ -35,6 +35,17 @@ Primary command:
 
 Run the tests for any Rust change. Docs-only and frontend-only changes are the usual exception.
 
+The suite opens many SQLite files at once: every test store holds a write
+connection and a read pool, and the test harness runs one test per core. On
+a many-core machine the common default of 1,024 open files per process is
+not enough, and about ten `storage::` tests fail with `unable to open
+database file`. Raise the limit for the shell that runs the tests:
+
+```bash
+ulimit -n 65536
+cargo test --all --locked
+```
+
 ## Benchmark Coverage
 
 Benchmark code lives under `benchmarks/`:

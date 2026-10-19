@@ -216,6 +216,22 @@ pub async fn run_manager_with(
         .await?;
     } else {
         info!("Skipping control-lane startup writes on raft non-leader manager");
+        // Except this manager's own config row, which only this manager can
+        // write: it forwards to the control lane's leader, retried in the
+        // background while the cluster elects one, so a manager that never
+        // leads still shows its config on the Managers page.
+        let store = store.clone();
+        let full_config = full_config.clone();
+        let node_id = manager_node_id.clone();
+        tokio::spawn(async move {
+            let published = startup_write("publish manager config through the leader", || async {
+                store.upsert_manager_config(&node_id, &full_config)
+            })
+            .await;
+            if let Err(err) = published {
+                warn!(error = ?err, "Failed publishing this manager's config row");
+            }
+        });
     }
     if is_scheduler_leader {
         if let Err(err) = store.prune_rollouts() {
@@ -3675,6 +3691,11 @@ async fn load_initial_data(store: &Store, config: &ManagerConfig) -> R<()> {
             .map(serde_json::to_string)
             .transpose()?
             .unwrap_or_else(|| "{}".to_string());
+
+        if let Some(resources) = wcp.resources.as_ref() {
+            crate::resources::validate_node_resources(resources)
+                .with_context(|| format!("invalid resources in worker config {path_str}"))?;
+        }
 
         // Fail fast on malformed fetch and content settings (bad humantime /
         // byte-size strings) at manager startup, not on the worker.

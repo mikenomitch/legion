@@ -1889,3 +1889,110 @@ use, if they ignore the warning.
 machine (`--run-worker`, a laptop cluster), so refusing would break a valid
 setup to prevent a likely mistake.
 
+## 73. A worker-reported failure stops with a new `failed` cause, and its reason is the instance's `last_stop`
+
+*Workstream: Task lifecycle. Follow-up, 2026-10-19.*
+
+**The call.** The failure-report path removes the allocation with
+`StopCause::Failed` (wire `failed`) instead of `Unknown`, and records the
+instance's `last_stop` as `Failed on node <node>: <reason>`, the reason cut to
+one line of 400 characters as the reschedule hold already does. The cause
+also reaches the stop notice, the `allocation.stopping` and
+`allocation.removed` events, and the gang-loss event.
+
+```text
+$ legion instance get web/7 -j | jq .data.lastStop
+{ "cause": "failed", "detail": "Failed on node sc-wkr-2: exit status 1 / Error: listen EADDRINUSE", ... }
+```
+
+**Alternatives.** Keep `Unknown` and attach only the explanation, so
+`last_stop` reads `cause: unknown` with a failure sentence; or keep the
+generic `Reschedule` cause.
+
+**Trade-off.** One more word in a stable wire vocabulary, which an older
+worker reads as `unknown` (its parser maps unrecognized causes there), and a
+failure now writes a stop notice row like every other cause.
+
+**Why.** Ease. `unknown` was documented as "most often the failure path",
+which made the one cause an operator most needs to tell apart the least
+specific one, and the UI now flags `failed` rows like other platform stops.
+
+## 74. The disk-fit fingerprint reads the disk holding the worker's state dir
+
+*Workstream: Scheduler. Follow-up, 2026-10-19.*
+
+**The call.** The kitchen-sink fingerprint's top-level `disk_total_space`,
+`disk_available_space`, and `disk_is_removable` describe the mount whose
+path is the longest component prefix of the worker state file's directory
+(`LEGION_WORKER_STATE_PATH`'s parent, else `<dataDir>/workers/default`, its
+nearest existing ancestor, symlinks resolved). Allocations and `local-dir`
+volumes live beside that file. A host where no listed mount matches falls
+back to the last disk, as before.
+
+**Alternatives.** Report the largest disk, or the sum of all disks; add a
+worker config field naming the volume disk.
+
+**Trade-off.** A worker whose `volumes/` sits on another mount than its
+state file (a bind mount under the data dir) is still judged by the state
+file's disk.
+
+**Why.** Simplicity. The volume root is derived from the state file's
+directory, so that disk is the one the check means; a config field would be
+a new surface for a case nobody has.
+
+## 75. A follower publishes its config row through the control lane's leader, in the background
+
+*Workstream: Manager availability. Follow-up, 2026-10-19.*
+
+**The call.** `upsert_manager_config` forwards to the control lane's leader
+(`ForwardableLaneWrite::UpsertManagerConfig`, the config already serialized,
+so the row is byte-for-byte what its manager wrote). A manager that does not
+lead the control lane at startup spawns the write and retries it on the
+startup-write budget while the cluster elects; it does not hold startup for
+it.
+
+**Alternatives.** Have the leader write every member's row from what each
+member reports; or block a follower's startup until the row lands.
+
+**Trade-off.** A follower that cannot reach a leader within the startup
+budget has no row until it next wins leadership (the watcher that re-runs
+leader writes), or restarts.
+
+**Why.** Simplicity. Only the manager knows its own config, and the forward
+path already exists for writes whose origin cannot lead.
+
+## 76. Supplementary groups follow runc: implicit users only, root included
+
+*Workstream: Linux containers. Follow-up, 2026-10-19.*
+
+**The call.** A container process gets `additionalGids` from every image
+`/etc/group` line whose member list names the user, when the user was given
+in the implicit form: a name, a uid with a passwd entry, or no `USER`
+(root). `user:group` gets exactly that group, and a bare uid with no passwd
+entry gets none. The primary gid and repeats are left out.
+
+**Alternatives.** Supplementary groups for `user:group` too; none for root.
+
+**Trade-off.** An image that relied on running without its groups (none
+known) changes behavior.
+
+**Why.** Ease. It is what `docker run` does (runc's `GetExecUser`), so an
+image behaves the same under Legion as on a laptop.
+
+## 77. Directory modes land at the end of each layer, not at the end of the image
+
+*Workstream: Linux containers. Follow-up, 2026-10-19.*
+
+**The call.** Layer extraction creates each directory entry writable,
+writes the layer's other entries, and applies the directories' recorded
+modes deepest first once the layer is done, as `tar::Archive::unpack` does.
+
+**Alternatives.** Defer every directory mode to the end of the whole image.
+
+**Trade-off.** A non-root worker still cannot write a later layer's entries
+into a directory an earlier layer made read-only.
+
+**Why.** Simplicity. Every layer stays a self-contained step, and the
+cross-layer case needs a read-only directory that a later layer then writes
+into, which no image in use has; root, the Linux worker's normal user,
+bypasses the mode either way.

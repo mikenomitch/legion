@@ -1,4 +1,5 @@
-use crate::cmd::helpers::{connect_manager_client, friendly_status, json_flag};
+use crate::cmd::helpers::{connect_manager_client, json_flag};
+use crate::cmd::output::{self, OutputFormat};
 use crate::prelude::*;
 use crate::structs::{Allocation, GetLedgerRequest, LedgerEntry, Node};
 use serde::Serialize;
@@ -75,12 +76,14 @@ pub fn config() -> Command {
 
 #[instrument(skip_all)]
 pub async fn handle(matches: &ArgMatches) -> R<()> {
+    let format = OutputFormat::from_matches(matches);
     let mut client = connect_manager_client().await?;
     let request = tonic::Request::new(GetLedgerRequest {});
-    let response = client
-        .get_ledger(request)
-        .await
-        .map_err(|status| friendly_status("failed to request ledger state", status))?;
+    let response = output::resolve(
+        format,
+        "failed to request ledger state",
+        client.get_ledger(request).await,
+    )?;
     let ledger_nodes = response.into_inner().nodes;
 
     let ledger: Vec<LedgerEntry> = ledger_nodes
@@ -88,12 +91,9 @@ pub async fn handle(matches: &ArgMatches) -> R<()> {
         .map(|node| node.into_entry())
         .collect::<R<Vec<_>>>()?;
 
-    if matches.get_flag("json") {
+    if format.is_json() {
         let json_entries: Vec<LedgerJsonEntry> = ledger.iter().map(LedgerJsonEntry::from).collect();
-        println!(
-            "{}",
-            serde_json::to_string(&json_entries).context("failed to serialize ledger to JSON")?
-        );
+        output::print_success(&json_entries);
     } else if ledger.is_empty() {
         println!("No nodes registered in the ledger.");
     } else {

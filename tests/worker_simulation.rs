@@ -21,6 +21,14 @@ use tempfile::TempDir;
 
 const DEADLINE: Duration = Duration::from_secs(30);
 
+/// The worker metric registry is process-global, and launching a fleet
+/// resets its gauges (`legion_worker_simulated_nodes` to 0, the target to
+/// the new count), as it should in a process that runs one fleet. The tests
+/// here share one process, so each holds this for its fleet's lifetime;
+/// otherwise a fleet launched by another test can pull the gauge under what
+/// this one registered.
+static ONE_FLEET_AT_A_TIME: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 fn setup_store(dir: &TempDir) -> R<Store> {
     let config = ManagerConfigFull {
         store_path: dir
@@ -128,6 +136,7 @@ async fn launch_fleet(
 
 #[tokio::test(flavor = "multi_thread")]
 async fn simulated_fleet_registers_schedules_and_acks() -> R<()> {
+    let _fleet_slot = ONE_FLEET_AT_A_TIME.lock().await;
     let dir = TempDir::new()?;
     let store = setup_store(&dir)?;
     let (manager_addr, _manager) = serve_manager(&store).await?;
@@ -231,6 +240,7 @@ async fn simulated_fleet_registers_schedules_and_acks() -> R<()> {
 /// concurrently, so absolute values are not this test's to own.
 #[tokio::test(flavor = "multi_thread")]
 async fn simulated_fleet_feeds_the_worker_metric_registry() -> R<()> {
+    let _fleet_slot = ONE_FLEET_AT_A_TIME.lock().await;
     let dir = TempDir::new()?;
     let store = setup_store(&dir)?;
     let (manager_addr, _manager) = serve_manager(&store).await?;
@@ -287,6 +297,7 @@ async fn simulated_fleet_feeds_the_worker_metric_registry() -> R<()> {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn stub_worker_accepts_dispatch_and_rejects_everything_else() -> R<()> {
+    let _fleet_slot = ONE_FLEET_AT_A_TIME.lock().await;
     let dir = TempDir::new()?;
     let store = setup_store(&dir)?;
     let (manager_addr, _manager) = serve_manager(&store).await?;

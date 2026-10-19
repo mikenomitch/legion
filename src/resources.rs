@@ -313,6 +313,20 @@ fn parse_required_custom_resources(resources: Option<&Value>) -> R<HashSet<Strin
 mod tests {
     use super::*;
 
+    #[test]
+    fn a_worker_type_may_not_override_builtin_resources_test() {
+        validate_node_resources(&json!({ "gpu": 2, "license": "x" })).expect("custom only");
+        validate_node_resources(&json!({})).expect("empty");
+
+        let err = validate_node_resources(&json!({ "gpu": 2, "cpu": 40000, "memory": 1 }))
+            .expect_err("builtin names are refused")
+            .to_string();
+        assert!(err.contains("cpu, memory"), "{err}");
+        assert!(err.contains("reservedResources"), "{err}");
+
+        assert!(validate_node_resources(&json!([1])).is_err());
+    }
+
     mod suspended_hold_test {
         use super::*;
         use crate::structs::suspend::SuspendReserve;
@@ -1519,4 +1533,31 @@ fn config_value<'a>(attrs: &'a Map<String, Value>, keys: &[&str]) -> Option<&'a 
 
 pub(crate) fn is_builtin_resource(name: &str) -> bool {
     matches!(name, "memory" | "cpu" | "cores" | "allocations")
+}
+
+/// Reject a worker type's `resources` block that names a builtin resource.
+/// The node's `memory`, `cpu`, and `cores` come from its fingerprint and
+/// `allocations` from `maxAllocations`, so [`ResourcePool::from_node`] skips
+/// a builtin key: `resources = { cpu = 40000 }` would vanish without a word.
+/// Called when the manager loads its worker configs, so the mistake fails
+/// startup instead of quietly scheduling against the fingerprint.
+pub(crate) fn validate_node_resources(resources: &Value) -> R<()> {
+    let Some(custom) = resources.as_object() else {
+        bail!("resources must be an object of custom resource names to amounts");
+    };
+    let mut builtin: Vec<&str> = custom
+        .keys()
+        .map(String::as_str)
+        .filter(|name| is_builtin_resource(name))
+        .collect();
+    if builtin.is_empty() {
+        return Ok(());
+    }
+    builtin.sort_unstable();
+    bail!(
+        "resources may only declare custom resources, but it names {}. A node's memory, \
+         cpu, and cores come from its fingerprint and cannot be overridden here; use \
+         reservedResources to hold capacity back, and maxAllocations to cap allocations",
+        builtin.join(", ")
+    )
 }

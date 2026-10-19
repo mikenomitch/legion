@@ -70,6 +70,11 @@ pub enum StopCause {
     /// policy restarts or fails the whole gang, or the gang waited past its
     /// `placementTimeout` and the job failed.
     Gang,
+    /// The allocation failed: its task exited unsuccessfully or failed its
+    /// health checks, the worker reported it, and the manager removed it to
+    /// reschedule (or, with the move budget spent, to fail the job). The
+    /// instance's `last_stop` carries the worker's failure reason.
+    Failed,
     /// No cause was recorded for this stop.
     ///
     /// This is a legitimate steady-state value, not only a bug: stop causes
@@ -97,6 +102,7 @@ impl StopCause {
             StopCause::Restore => "restore",
             StopCause::Suspended => "suspended",
             StopCause::Gang => "gang",
+            StopCause::Failed => "failed",
             StopCause::Unknown => "unknown",
         }
     }
@@ -119,6 +125,7 @@ impl StopCause {
             "restore" => StopCause::Restore,
             "suspended" => StopCause::Suspended,
             "gang" => StopCause::Gang,
+            "failed" => StopCause::Failed,
             _ => StopCause::Unknown,
         }
     }

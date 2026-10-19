@@ -290,7 +290,7 @@ fn exec_session_benchmark() {
         let _ = cli(&["job", "run", job.to_str().expect("utf-8")]);
         let ledger: serde_json::Value =
             serde_json::from_slice(&cli(&["ledger", "-j"]).stdout).unwrap_or_default();
-        let found = ledger.as_array().and_then(|entries| {
+        let found = ledger["data"].as_array().and_then(|entries| {
             entries
                 .iter()
                 .flat_map(|entry| entry["allocations"].as_array().cloned().unwrap_or_default())

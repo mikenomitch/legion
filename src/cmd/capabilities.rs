@@ -826,6 +826,27 @@ pub fn catalog() -> Vec<Capability> {
             read_only_safe: false,
         },
         Capability {
+            name: "keyring.root_key_generate",
+            cli: "legion keyring root-key generate",
+            grpc: None,
+            summary: "Print a new base64 root key line for the file or env provider. Runs \
+                 locally; nothing on the cluster changes until the key is installed and \
+                 `keyring root-key rewrap` runs.",
+            mutates: false,
+            read_only_safe: true,
+        },
+        Capability {
+            name: "keyring.provider.test",
+            cli: "legion keyring provider test [--timeout D] -- <COMMAND...>",
+            grpc: None,
+            summary: "Conformance-test an exec root-key provider before pointing a manager at \
+                 it: describe, a wrap/unwrap round trip, a tampered ciphertext refused, and \
+                 randomized wrapping. Runs locally; never touches the cluster, but the \
+                 command really calls its KMS.",
+            mutates: false,
+            read_only_safe: false,
+        },
+        Capability {
             name: "keyring.reset",
             cli: "legion keyring reset --i-understand-encrypted-values-will-be-lost",
             grpc: Some("Manager/ResetKeyring"),

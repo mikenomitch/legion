@@ -480,6 +480,11 @@ healthy within about a second of its port opening.
   command whose cost Legion can't know, so it keeps its cadence. A readiness
   check never changes the allocation's health, so it isn't probed either.
 - A `health` check waits for the `boot` checks, probes included.
+- A `boot` check's first cadence run happens the moment the task starts,
+  before most workloads have bound their port. A failure in the first
+  `every` after a start or restart is not counted (or the first
+  `boot_grace_time`, if that is longer), so `unhealthy_after_count = 1` does
+  not fail the task on that first run. A pass in that window still counts.
 - Once a check passes, probing stops until the task restarts.
 
 `legion_task_start_stage_seconds{stage="health"}` ([metrics.md](metrics.md))

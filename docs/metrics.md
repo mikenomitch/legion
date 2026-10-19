@@ -746,6 +746,16 @@ these families can tell you which is the case.
 - **`legion_raft_pipeline_depth{lane}`** (gauge): ops queued to a lane's
   pipeline thread and not yet started. Sustained depth above 1 means writes
   on that lane are waiting in line behind each other.
+- **`legion_leader_forwards_total{lane,op,outcome}`** (counter): store
+  writes this manager forwarded to the lane's leader because it does not
+  lead the lane, by `outcome`: `ok` (the leader executed it) or `failed` (no
+  leader known, unreachable, the target lost leadership too, or the op
+  failed there; the caller sees the original not-the-leader error). Only
+  writes that cannot wait for a leader forward: worker heartbeats and health
+  reports, failure and completion reports, and a follower's own config row.
+  A steady `ok` rate on a follower is normal (workers heartbeat to whichever
+  manager they dialed); a `failed` rate means those reports are not landing.
+  Recorded on the forwarding manager.
 
 The gauge series refresh on the node-status-checker tick, on leaders and
 followers alike. The histograms and the op counter are recorded at the
