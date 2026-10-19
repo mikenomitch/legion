@@ -21,6 +21,12 @@ change how the spec is produced and who is allowed to submit it.
   It also decides what this job may displace when the cluster is full, and
   what may displace it. See
   [preemption-and-eviction.md](preemption-and-eviction.md).
+- `namespace`: the [namespace](namespaces.md) the job lives in. Optional:
+  unset means the request's (`-n`, else `$LEGION_NAMESPACE`), else `default`.
+  `name` may instead be qualified (`payments-prod/web`). The job's id is
+  `namespace/name`, or the bare name in `default`; a [namespace
+  policy](namespaces.md#namespace-policies) may restrict its pools, runtimes,
+  host volumes and quota.
 
 Task names:
 
@@ -28,7 +34,8 @@ Task names:
 - list tasks default to `task-<n>` unless they set `name`
 
 Job, group, and task names may use only `A-Z`, `a-z`, `0-9`, `.`, `_`, and
-`-`, are 1 to 128 characters, and may not start with `.`. A task's name is a
+`-`, are 1 to 128 characters, and may not start with `.`. A job name's one
+`/` separates its namespace, which is a DNS label. A task's name is a
 directory on every worker that runs it (`allocs/<allocation>/<task>/`), so a
 name that is a path, or `.`/`..`, is refused at submit:
 
@@ -480,6 +487,11 @@ healthy within about a second of its port opening.
   command whose cost Legion can't know, so it keeps its cadence. A readiness
   check never changes the allocation's health, so it isn't probed either.
 - A `health` check waits for the `boot` checks, probes included.
+- A `boot` check's first cadence run happens the moment the task starts,
+  before most workloads have bound their port. A failure in the first
+  `every` after a start or restart is not counted (or the first
+  `boot_grace_time`, if that is longer), so `unhealthy_after_count = 1` does
+  not fail the task on that first run. A pass in that window still counts.
 - Once a check passes, probing stops until the task restarts.
 
 `legion_task_start_stage_seconds{stage="health"}` ([metrics.md](metrics.md))

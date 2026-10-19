@@ -265,7 +265,7 @@ replaced:
 - **Config**: `acl { enabled, auditOnly, loginTtl, jwksRefreshInterval,
   authMethods[] }` following the `Config`/`ConfigFull` pattern; example in
   `configs/manager.jsonnet`.
-- **Tests**: `tests/acl_endpoints.rs` — a table classifying **every** Manager
+- **Tests**: `tests/integration/acl_endpoints.rs` — a table classifying **every** Manager
   RPC, a proto-parsing guard that fails when a new RPC lacks coverage, a
   deny/allow matrix over all endpoints (anonymous denied / management passes
   / disabled passes), and end-to-end scenarios (job-name scoping, KV path

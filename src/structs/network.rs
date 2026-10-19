@@ -707,12 +707,15 @@ pub struct ServiceConfig {
     /// placement.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mesh: Option<bool>,
-    /// Who may call the service. A bare entry is a job id glob (`web`,
-    /// `agent-*`); an entry with colons is a workload identity glob over
-    /// `<region>:<job>:<group>:<task>` (`*:billing:*:worker`). Empty (the
-    /// default) or `["*"]` means everyone. Always enforced by the endpoint
-    /// feed (a consumer not on the list gets no endpoints); on a mesh
-    /// service, also at the receiving node against the verified caller.
+    /// Connect intentions: the jobs allowed to reach this service. Empty (the
+    /// default) or `["*"]` means every job in the service's own namespace; a
+    /// bare entry (`gateway`, `web-*`) names jobs in that same namespace;
+    /// reaching across namespaces takes a qualified entry —
+    /// `checkout-prod/api`, `payments-*/api`, `*/*` — so a crossing is always
+    /// written on the side being reached (docs/namespaces.md). Always
+    /// enforced by the endpoint feed (a consumer not on the list gets no
+    /// endpoints); on a mesh service, also by the receiving node against the
+    /// verified caller's job.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub allow: Vec<String>,
 }
@@ -729,11 +732,10 @@ impl ServiceConfig {
         }
     }
 
-    /// Whether the workload `identity` (`<region>:<job>:<group>:<task>`)
-    /// may call this service. Empty `allow` (the default) or a `"*"` entry
-    /// allows everyone.
-    pub fn allows(&self, identity: &str) -> bool {
-        allow_permits(&self.allow, identity)
+    /// Whether `consumer` (a canonical job id) may connect to this service,
+    /// declared by job `owner`. See [`allow_permits`].
+    pub fn allows_job(&self, owner: &str, consumer: &str) -> bool {
+        allow_permits(&self.allow, owner, consumer)
     }
 
     /// `service.meta` flattened to strings for transport (the wire type is a
@@ -762,53 +764,37 @@ pub fn workload_subject(job_id: &str, group: &str, task_name: &str) -> String {
     )
 }
 
-/// One `service.allow` check, shared by the endpoint feed and the receiving
-/// node so the two never disagree. An empty list or a `"*"` entry permits
-/// everyone. A bare entry is a job glob, so `web` and `*:web:*:*` are the
-/// same rule; an entry with colons globs each of the four parts. An
-/// `identity` that is not a four-part workload subject (a node peer that
-/// named no workload) matches no entry.
-pub fn allow_permits(allow: &[String], identity: &str) -> bool {
-    use crate::structs::netpolicy::glob_matches;
-    if allow.is_empty() || allow.iter().any(|entry| entry == "*") {
-        return true;
-    }
-    let parts: Vec<&str> = identity.split(':').collect();
-    if parts.len() != 4 {
-        return false;
-    }
-    allow.iter().any(|entry| {
-        let entry = entry.trim();
-        if entry.contains(':') {
-            let globs: Vec<&str> = entry.split(':').collect();
-            globs.len() == 4
-                && globs
-                    .iter()
-                    .zip(&parts)
-                    .all(|(glob, part)| glob_matches(glob, part))
-        } else {
-            glob_matches(entry, parts[1])
-        }
-    })
+/// The job id a workload identity subject (`<region>:<job>:<group>:<task>`)
+/// names, or `None` for a peer that named no workload (`node:<id>`).
+pub fn identity_job(identity: &str) -> Option<&str> {
+    let mut parts = identity.split(':');
+    let job = parts.nth(1)?;
+    (parts.count() == 2 && !job.is_empty()).then_some(job)
 }
 
-/// Validate one `service.allow` entry's shape.
-fn validate_allow_entry(task_name: &str, entry: &str) -> R<()> {
-    let entry = entry.trim();
-    if entry.is_empty() {
-        bail!("task {task_name} service.allow entries must not be empty");
+/// Shared intention check so the catalog projection and `ServiceConfig` agree.
+///
+/// `owner` is the job that declares the service and `consumer` the job
+/// dialing it, both canonical ids. An empty list or a `"*"` entry permits
+/// every consumer in the owner's namespace; a bare entry is a job-name glob
+/// in that namespace; a qualified entry (`ns-glob/name-glob`) is the only way
+/// to admit a consumer from another namespace — the target-side half of a
+/// crossing whose consumer-side half is the upstream's `namespace`.
+pub fn allow_permits(allow: &[String], owner: &str, consumer: &str) -> bool {
+    use crate::structs::acl::glob_match;
+    use crate::structs::namespace::split_job_id;
+    let (owner_namespace, _) = split_job_id(owner);
+    let (consumer_namespace, consumer_name) = split_job_id(consumer);
+    let same_namespace = owner_namespace == consumer_namespace;
+    if allow.is_empty() {
+        return same_namespace;
     }
-    if entry.contains(':') {
-        let parts: Vec<&str> = entry.split(':').collect();
-        if parts.len() != 4 || parts.iter().any(|part| part.is_empty()) {
-            bail!(
-                "task {task_name} service.allow entry '{entry}': an identity glob has four parts, \
-                 <region>:<job>:<group>:<task> (e.g. *:billing:*:worker). A bare entry is a job \
-                 id glob (e.g. web or agent-*)"
-            );
+    allow.iter().any(|entry| match entry.split_once('/') {
+        Some((namespace, name)) => {
+            glob_match(namespace, consumer_namespace) && glob_match(name, consumer_name)
         }
-    }
-    Ok(())
+        None => same_namespace && glob_match(entry, consumer_name),
+    })
 }
 
 /// Task-level `connect` block: the services this task dials through node-local
@@ -882,8 +868,16 @@ pub struct ConnectTemplate {
 pub struct UpstreamConfig {
     /// A catalog service name or an external URL (see above).
     pub to: String,
-    /// The key (`LEGION_UPSTREAM_<NAME>`): defaults to the service name;
-    /// required for an external destination.
+    /// The namespace the catalog service `to` names lives in, when it is not
+    /// the consumer's own (docs/namespaces.md, "Crossing a namespace"). The
+    /// service must admit the consumer with a qualified `allow` entry, so a
+    /// crossing is written on both sides. Not allowed on an external
+    /// destination.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub namespace: Option<String>,
+    /// The key (`LEGION_UPSTREAM_<NAME>`): defaults to the service name
+    /// (`<service>.<namespace>` across a namespace); required for an
+    /// external destination.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
     /// Pin the canonical port, and also bind `127.0.0.1:<port>`.
@@ -1076,6 +1070,26 @@ fn is_header_token(name: &str) -> bool {
         })
 }
 
+/// Validate where a service upstream points: `namespace` is a namespace
+/// name, and only a catalog service has one.
+fn validate_upstream_namespace(task_name: &str, upstream: &UpstreamConfig) -> R<()> {
+    let Some(namespace) = upstream.namespace.as_deref() else {
+        return Ok(());
+    };
+    let what = format!(
+        "task {task_name} connect.upstreams entry '{}'",
+        upstream.key()
+    );
+    if upstream.is_external() {
+        bail!(
+            "{what} sets namespace on an external destination; namespace names where a catalog \
+             service lives"
+        );
+    }
+    crate::structs::namespace::validate_namespace_name(namespace.trim())
+        .map_err(|err| anyhow!("{what} namespace: {err}"))
+}
+
 /// Validate one upstream's `credentials`: only on an external `https://`
 /// upstream, a valid non-reserved header named at most once, a provider.
 fn validate_upstream_credentials(task_name: &str, upstream: &UpstreamConfig) -> R<()> {
@@ -1202,13 +1216,42 @@ impl UpstreamConfig {
     }
 
     /// The key this upstream is known by: `name` when given, else the
-    /// service name. It is what `LEGION_UPSTREAM_<KEY>` and
-    /// `AllocUpstream.key` carry.
+    /// service, written `<service>.<namespace>` when the upstream crosses
+    /// into another namespace. It is what `LEGION_UPSTREAM_<KEY>`,
+    /// `<key>.svc.legion`, and `AllocUpstream.key` carry, so a crossing stays
+    /// visible wherever the task uses it.
     pub fn key(&self) -> String {
         match self.name.as_deref() {
             Some(name) if !name.trim().is_empty() => name.trim().to_string(),
-            _ => self.service().unwrap_or_default(),
+            _ => {
+                let service = self.service().unwrap_or_default();
+                match self.target_namespace() {
+                    Some(namespace) => format!("{service}.{namespace}"),
+                    None => service,
+                }
+            }
         }
+    }
+
+    /// The namespace this upstream names for its service, if any. `None`
+    /// means the consumer's own namespace.
+    pub fn target_namespace(&self) -> Option<&str> {
+        self.namespace
+            .as_deref()
+            .map(str::trim)
+            .filter(|namespace| !namespace.is_empty())
+    }
+
+    /// The canonical service reference this upstream dials from
+    /// `consumer_job`: the named namespace, else the consumer's own. A bare
+    /// service never resolves across a namespace boundary. `None` for an
+    /// external destination.
+    pub fn service_ref(&self, consumer_job: &str) -> Option<String> {
+        let service = self.service()?;
+        let namespace = self
+            .target_namespace()
+            .unwrap_or_else(|| crate::structs::namespace::job_namespace(consumer_job));
+        Some(crate::structs::namespace::job_id(namespace, &service))
     }
 
     /// Whether the datapath parses HTTP on this upstream: its scheme says so.
@@ -2112,7 +2155,17 @@ pub fn validate_task_connect(
 ) -> R<()> {
     if let Some(service_config) = service {
         for entry in &service_config.allow {
-            validate_allow_entry(task_name, entry)?;
+            let entry = entry.trim();
+            if entry.is_empty() {
+                bail!("task {task_name} service.allow entries must not be empty");
+            }
+            if entry.contains(':') {
+                bail!(
+                    "task {task_name} service.allow entry '{entry}' names a workload identity; \
+                     allow names jobs (`web`, `payments-*/api`). Match a caller's task with an \
+                     ingress `identity` rule"
+                );
+            }
         }
     }
 
@@ -2153,6 +2206,7 @@ pub fn validate_task_connect(
         if !keys.insert(key.clone()) {
             bail!("task {task_name} connect.upstreams declares '{key}' more than once");
         }
+        validate_upstream_namespace(task_name, upstream)?;
         if let Some(http) = upstream.http.as_ref() {
             if !destination.is_http() {
                 bail!(
@@ -3142,8 +3196,8 @@ mod tests {
         let svc: ServiceConfig =
             serde_json::from_value(json!({ "port": "http", "allow": ["gateway"] }))?;
         validate_task_connect("api", Some(&network), Some(&connect_config), Some(&svc))?;
-        assert!(svc.allows("global:gateway:web:web"));
-        assert!(!svc.allows("global:other:web:web"));
+        assert!(svc.allows_job("web", "gateway"));
+        assert!(!svc.allows_job("web", "other"));
         Ok(())
     }
 
@@ -3156,6 +3210,68 @@ mod tests {
             "{err}"
         );
         assert!(err.to_string().contains("task api"), "{err}");
+    }
+
+    #[test]
+    fn crossing_upstreams_key_by_service_and_namespace() {
+        let config = connect(json!([
+            { "to": "redis" },
+            { "to": "auth", "namespace": "shared" },
+            { "to": "http://billing", "namespace": "shared" },
+            { "to": "ledger", "namespace": "shared", "name": "books" },
+        ]));
+        let keys: Vec<String> = config.upstreams.iter().map(|u| u.key()).collect();
+        assert_eq!(keys, ["redis", "auth.shared", "billing.shared", "books"]);
+        let refs: Vec<String> = config
+            .upstreams
+            .iter()
+            .map(|u| u.service_ref("checkout/api").unwrap())
+            .collect();
+        assert_eq!(
+            refs,
+            [
+                "checkout/redis",
+                "shared/auth",
+                "shared/billing",
+                "shared/ledger"
+            ]
+        );
+        // A bare service from `default` stays in `default`; a crossing into
+        // `default` is the bare id.
+        assert_eq!(config.upstreams[0].service_ref("api").unwrap(), "redis");
+        let into_default = connect(json!([{ "to": "auth", "namespace": "default" }]));
+        assert_eq!(
+            into_default.upstreams[0]
+                .service_ref("checkout/api")
+                .unwrap(),
+            "auth"
+        );
+        assert!(validate_task_connect("api", None, Some(&config), None).is_ok());
+    }
+
+    #[test]
+    fn validate_connect_rejects_bad_or_conflicting_upstream_namespaces() {
+        for (upstreams, expect) in [
+            (
+                json!([{ "to": "auth", "namespace": "Shared" }]),
+                "namespace",
+            ),
+            (
+                json!([{ "name": "x", "to": "https://example.com", "namespace": "shared" }]),
+                "external destination",
+            ),
+        ] {
+            let err = validate_task_connect("api", None, Some(&connect(upstreams)), None)
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains(expect), "{expect}: {err}");
+        }
+        // Two upstreams for the same service in two namespaces are distinct.
+        let both = connect(json!([
+            { "to": "auth" },
+            { "to": "auth", "namespace": "shared" },
+        ]));
+        assert!(validate_task_connect("api", None, Some(&both), None).is_ok());
     }
 
     #[test]
@@ -3605,43 +3721,37 @@ mod tests {
     }
 
     #[test]
-    fn allow_wildcard_and_absent_allow_permit_everyone() {
+    fn allow_wildcard_and_absent_allow_permit_everyone_in_the_namespace() {
         let open: ServiceConfig =
             serde_json::from_value(json!({ "port": "http" })).expect("service config");
-        assert!(open.allows("global:anyone:g:t"));
+        assert!(open.allows_job("web", "anyone"));
         let wildcard: ServiceConfig =
             serde_json::from_value(json!({ "port": "http", "allow": ["*"] }))
                 .expect("service config");
-        assert!(wildcard.allows("global:anyone:g:t"));
-        assert!(allow_permits(&[], "node:n1"));
+        assert!(wildcard.allows_job("web", "anyone"));
+        assert!(allow_permits(&[], "web", "anyone"));
+        // ...but never across a namespace.
+        assert!(!allow_permits(&[], "prod/web", "dev/api"));
+        assert!(!allow_permits(&["*".into()], "prod/web", "dev/api"));
+        assert!(allow_permits(&[], "prod/web", "prod/api"));
     }
 
-    /// One grammar: a bare entry is a job glob, a colon entry globs the
-    /// four parts of `<region>:<job>:<group>:<task>`, so `web` and
-    /// `*:web:*:*` are the same rule. A peer that names no workload matches
-    /// nothing on a closed list.
     #[test]
-    fn allow_grammar_matches_jobs_and_identities_test() {
-        let allow =
-            |entries: &[&str]| -> Vec<String> { entries.iter().map(|e| e.to_string()).collect() };
-        let id = "global:agent-7:sandbox:runner";
-        assert!(allow_permits(&allow(&["agent-*"]), id));
-        assert!(allow_permits(&allow(&["*:agent-7:*:*"]), id));
-        assert!(allow_permits(&allow(&["*:*:sandbox:runner"]), id));
-        assert!(!allow_permits(&allow(&["*:*:sandbox:other"]), id));
-        assert!(!allow_permits(&allow(&["web"]), id));
-        assert!(!allow_permits(&allow(&["agent-*"]), "node:n1"));
-        assert_eq!(
-            allow_permits(&allow(&["web"]), "global:web:g:t"),
-            allow_permits(&allow(&["*:web:*:*"]), "global:web:g:t")
-        );
-        // Shape: an identity glob has exactly four non-empty parts.
-        for bad in ["a:b", "a:b:c:d:e", "*:web::*"] {
-            let svc: ServiceConfig =
-                serde_json::from_value(json!({ "port": "http", "allow": [bad] })).unwrap();
-            let err = validate_task_connect("api", None, None, Some(&svc)).unwrap_err();
-            assert!(err.to_string().contains("four parts"), "{bad}: {err}");
-        }
+    fn crossing_a_namespace_needs_a_qualified_intention() {
+        let allow = vec!["gateway".to_string(), "payments-*/api".to_string()];
+        assert!(allow_permits(&allow, "shared/auth", "shared/gateway"));
+        assert!(!allow_permits(
+            &allow,
+            "shared/auth",
+            "payments-prod/gateway"
+        ));
+        assert!(allow_permits(&allow, "shared/auth", "payments-prod/api"));
+        assert!(!allow_permits(&allow, "shared/auth", "checkout-prod/api"));
+        // `*/*` admits everyone everywhere.
+        assert!(allow_permits(&["*/*".into()], "shared/auth", "dev/x"));
+        // A bare entry still means the owner's namespace, and globs.
+        assert!(allow_permits(&["web-*".into()], "web", "web-2"));
+        assert!(!allow_permits(&["web".into()], "prod/x", "web"));
     }
 
     /// `service.mesh` and a port's own `tls` are exclusive, sources are

@@ -63,7 +63,9 @@ Optional `telemetry` block in the manager config:
 - `enabled` (default `true`): master switch for the listener.
 - `port` (default `server.port + 2`): the listener binds this port on
   `server.host`. The `+ 2` convention leaves `server.port + 1` for the exec
-  WebSocket listener.
+  WebSocket listener. A port another process holds fails the manager's
+  startup (`failed to bind the telemetry listener on ...`), the same as
+  the gRPC port, rather than leaving a manager up with no probes.
 
 ## Metric families
 
@@ -212,9 +214,9 @@ See [adaptive-scheduler-concurrency.md](adaptive-scheduler-concurrency.md).
   worker claimed a non-planning eval (today `job_stop`) instead of the queue
   head. This counts the one cross-class priority inversion the admission gate
   introduces.
-- **`legion_preemptions_total{pool, band}`** (counter): allocations evicted
-  by scheduler preemption, labeled by the victim's node pool and its
-  priority band. Alert on the rate. Preemption of production-adjacent bands
+- **`legion_preemptions_total{pool, band, namespace}`** (counter):
+  allocations evicted by scheduler preemption, labeled by the victim's node
+  pool, its priority band, and its job's [namespace](namespaces.md). Alert on the rate. Preemption of production-adjacent bands
   should be rare. A rising rate in a `low` band is a capacity signal, and
   usually not an incident ([preemption-and-eviction.md](preemption-and-eviction.md)).
 - **`legion_preemption_plans_total{outcome}`** (counter): preemption passes
@@ -366,6 +368,32 @@ instrument.
   from still stored `unavailable` and returned it to the scheduling pool
   (a half-applied recovery; see docs/node-liveness.md). `marked_lost` minus
   this is the fleet's net loss. A flapping fleet moves both.
+
+### Namespaces
+
+Workload families by [namespace](namespaces.md). The gauges refresh on the
+node-status-checker tick (`workerCheckSeconds`) and carry a series for every
+existing namespace, so an emptied namespace reads `0` instead of its last
+value. Past 256 namespaces a family folds the rest into `"other"`, like every
+family, so the per-namespace numbers stop being exact.
+
+- **`legion_namespace_jobs{namespace}`** (gauge): registered jobs, any state.
+- **`legion_namespace_allocations{namespace}`** (gauge): live allocations
+  (not `complete` or `failed`) of the namespace's jobs.
+- **`legion_namespace_reserved_cpu_mhz{namespace}`** (gauge): CPU in MHz
+  reserved by those allocations (`resources.cpu` after
+  `taskResourceDefaults`).
+- **`legion_namespace_reserved_memory_bytes{namespace}`** (gauge): memory
+  reserved by those allocations.
+- **`legion_job_submits_total{namespace}`** (counter): job submissions the
+  manager accepted (`RunJob` and `RunJobTemplate`; deduplicated retries and
+  refused submits excluded).
+
+The reserved gauges are live reservations. A [namespace
+policy](namespaces.md#namespace-policies)'s quota is checked against
+*charged* usage instead, which also counts demand a job has declared but not
+yet placed (`legion namespace get` shows it), so the gauges can read lower
+while admitted work is still placing.
 
 ### Node usage
 
@@ -744,6 +772,16 @@ these families can tell you which is the case.
 - **`legion_raft_pipeline_depth{lane}`** (gauge): ops queued to a lane's
   pipeline thread and not yet started. Sustained depth above 1 means writes
   on that lane are waiting in line behind each other.
+- **`legion_leader_forwards_total{lane,op,outcome}`** (counter): store
+  writes this manager forwarded to the lane's leader because it does not
+  lead the lane, by `outcome`: `ok` (the leader executed it) or `failed` (no
+  leader known, unreachable, the target lost leadership too, or the op
+  failed there; the caller sees the original not-the-leader error). Only
+  writes that cannot wait for a leader forward: worker heartbeats and health
+  reports, failure and completion reports, and a follower's own config row.
+  A steady `ok` rate on a follower is normal (workers heartbeat to whichever
+  manager they dialed); a `failed` rate means those reports are not landing.
+  Recorded on the forwarding manager.
 
 The gauge series refresh on the node-status-checker tick, on leaders and
 followers alike. The histograms and the op counter are recorded at the

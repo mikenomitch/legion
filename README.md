@@ -40,7 +40,8 @@ still be happy with at fifty thousand nodes.
   [service mesh with mTLS](docs/network-handlers.md), a
   [versioned KV store](docs/kv-store.md) with
   [encryption at rest](docs/kv-encryption.md),
-  [rollouts](docs/rollouts.md), [ACLs](docs/auth-and-acls.md),
+  [rollouts](docs/rollouts.md), [ACLs](docs/auth-and-acls.md) with
+  [namespaces](docs/namespaces.md),
   [workload identity (OIDC)](docs/workload-identity.md), and a [web UI](#web-ui).
 - **Readable job specs.** [Nickel](docs/configuration-language.md) gives you
   types, imports, and functions for DRY specs. You don't need YAML or Helm
@@ -414,6 +415,9 @@ start:
   [Network Handlers](docs/network-handlers.md) ·
   [Network Plugins](docs/network-plugins.md) · [KV Store](docs/kv-store.md) ·
   [Exec & Actions](docs/exec-and-actions.md) · [The Cluster CA](docs/cluster-ca.md)
+- **Sharing a cluster:** [Namespaces](docs/namespaces.md) ·
+  [Auth & ACLs](docs/auth-and-acls.md) ·
+  [Workload Identity](docs/workload-identity.md)
 - **Operating a cluster:** [Running Raft](docs/raft-operations.md) ·
   [Upgrades](docs/upgrades.md) · [Data Directory](docs/data-directory.md) ·
   [Logging](docs/logging.md) ·

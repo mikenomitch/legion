@@ -986,7 +986,7 @@ mod tests {
     fn store_dir() -> PathBuf {
         tempfile::Builder::new()
             .prefix("legion-keyring-store-")
-            .tempdir()
+            .tempdir_in(crate::test_scratch::root())
             .expect("tempdir")
             .keep()
     }

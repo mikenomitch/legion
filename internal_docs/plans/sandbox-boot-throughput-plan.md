@@ -151,7 +151,7 @@ Everything else changes defaults and behavior, not surface:
 - Unit tests for each change (the vsock readiness probe, `two_choices`,
   the least-full fallback, single-flight tag resolution, the credential
   fingerprint, the cgroup shim, `/proc` start times against `sysinfo`).
-- `tests/session_integration.rs` and `tests/edge_boot_integration.rs`.
+- `tests/integration/session_integration.rs` and `tests/integration/edge_boot_integration.rs`.
 - Measurements: `tests/session_index_scale_measure.rs` (index memory and
   heartbeat cost at a million sessions), `pick_cost_measure` (router pick
   per placement and fleet size), and the AWS rig

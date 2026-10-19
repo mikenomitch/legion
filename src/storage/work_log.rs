@@ -393,9 +393,16 @@ impl WorkLog {
         }
     }
 
-    /// Take what the next message must carry, clearing it from the log.
-    pub fn take_pending(log: &NodeWorkLog) -> PendingWork {
+    /// Take what the next message must carry, clearing it from the log, for
+    /// the stream attached as `session`. A superseded stream takes nothing:
+    /// its sender can still be between its `is_current` check and this call
+    /// when a reconnect attaches, and taking the resync that attach queued
+    /// would send the new stream's opening message down the dead one.
+    pub fn take_pending(log: &NodeWorkLog, session: u64) -> PendingWork {
         let mut state = log.lock();
+        if state.session != session {
+            return PendingWork::Nothing;
+        }
         if state.resync {
             state.resync = false;
             state.dirty.clear();
@@ -552,7 +559,7 @@ mod work_log_test {
         let attached = log.attach("n1", 0, 0);
         assert!(attached.replay.is_empty());
         assert!(matches!(
-            WorkLog::take_pending(&attached.log),
+            WorkLog::take_pending(&attached.log, attached.session),
             PendingWork::Resync
         ));
         let first = log
@@ -567,7 +574,8 @@ mod work_log_test {
         assert_eq!((first.seq, first.resync), (1, true));
 
         log.note_changes([("n1", 2), ("n2", 9)]);
-        let PendingWork::Changed(changed) = WorkLog::take_pending(&attached.log) else {
+        let PendingWork::Changed(changed) = WorkLog::take_pending(&attached.log, attached.session)
+        else {
             panic!("a change on the node is pending");
         };
         assert_eq!(changed.into_iter().collect::<Vec<_>>(), vec![2]);
@@ -605,7 +613,7 @@ mod work_log_test {
     fn a_reconnect_in_the_same_epoch_replays_what_was_not_acked() {
         let log = WorkLog::new();
         let attached = log.attach("n1", 0, 0);
-        let _ = WorkLog::take_pending(&attached.log);
+        let _ = WorkLog::take_pending(&attached.log, attached.session);
         log.commit_message(
             &attached.log,
             true,
@@ -637,17 +645,38 @@ mod work_log_test {
             vec![3]
         );
         assert!(matches!(
-            WorkLog::take_pending(&again.log),
+            WorkLog::take_pending(&again.log, again.session),
             PendingWork::Nothing
         ));
         assert!(log.streaming("n1"));
+    }
+
+    /// A reconnect that lands while the old stream's sender is about to
+    /// build a message: the old session must not take the resync the new
+    /// attach queued, or the new stream never gets its opening message.
+    #[test]
+    fn a_superseded_session_takes_nothing() {
+        let log = WorkLog::new();
+        let old = log.attach("n1", 0, 0);
+        let _ = WorkLog::take_pending(&old.log, old.session);
+        log.commit_message(&old.log, true, vec![payload(1)], Vec::new(), Vec::new());
+
+        let new = log.attach("n1", 0, 0);
+        assert!(matches!(
+            WorkLog::take_pending(&old.log, old.session),
+            PendingWork::Nothing
+        ));
+        assert!(matches!(
+            WorkLog::take_pending(&new.log, new.session),
+            PendingWork::Resync
+        ));
     }
 
     #[test]
     fn another_epoch_a_gap_or_a_regression_resyncs() {
         let log = WorkLog::new();
         let attached = log.attach("n1", 0, 0);
-        let _ = WorkLog::take_pending(&attached.log);
+        let _ = WorkLog::take_pending(&attached.log, attached.session);
         for id in 1..=3 {
             log.commit_message(
                 &attached.log,
@@ -662,13 +691,13 @@ mod work_log_test {
         let other = log.attach("n1", log.epoch().wrapping_add(1), 3);
         assert!(other.replay.is_empty());
         assert!(matches!(
-            WorkLog::take_pending(&other.log),
+            WorkLog::take_pending(&other.log, other.session),
             PendingWork::Resync
         ));
         // Ahead of the manager.
         let ahead = log.attach("n1", log.epoch(), 99);
         assert!(matches!(
-            WorkLog::take_pending(&ahead.log),
+            WorkLog::take_pending(&ahead.log, ahead.session),
             PendingWork::Resync
         ));
         // Behind what was pruned: messages 1..=3 were acked and dropped.
@@ -676,7 +705,7 @@ mod work_log_test {
         log.ack(&ahead.log, log.epoch(), 4);
         let behind = log.attach("n1", log.epoch(), 1);
         assert!(matches!(
-            WorkLog::take_pending(&behind.log),
+            WorkLog::take_pending(&behind.log, behind.session),
             PendingWork::Resync
         ));
     }
@@ -685,7 +714,7 @@ mod work_log_test {
     fn a_heartbeat_digest_mismatch_resyncs_only_once_nothing_is_in_flight() {
         let log = WorkLog::new();
         let attached = log.attach("n1", 0, 0);
-        let _ = WorkLog::take_pending(&attached.log);
+        let _ = WorkLog::take_pending(&attached.log, attached.session);
         log.commit_message(
             &attached.log,
             true,
@@ -722,7 +751,7 @@ mod work_log_test {
         };
         assert!(log.check_heartbeat("n1", &drifted).resync);
         assert!(matches!(
-            WorkLog::take_pending(&attached.log),
+            WorkLog::take_pending(&attached.log, attached.session),
             PendingWork::Resync
         ));
         // Another epoch, or no stream: the full desired set as today.
@@ -758,7 +787,7 @@ mod work_log_test {
             WorkLog::take_checkpoint_work(&attached.log),
             "a new stream reads the node's outstanding checkpoint work"
         );
-        let _ = WorkLog::take_pending(&attached.log);
+        let _ = WorkLog::take_pending(&attached.log, attached.session);
         let opening = WorkLog::unpushed_checkpoints(&attached.log, vec![request("s1", "capture")]);
         let first = log
             .commit_message(&attached.log, true, Vec::new(), Vec::new(), opening)

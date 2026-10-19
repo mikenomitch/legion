@@ -577,7 +577,7 @@ the mesh's "drain-before-SIGTERM" item (TODO) needs anyway.
     will not: this is *conditional* enforcement inside an existing endpoint, so
     dropping the check leaves the suite green. Needs an explicit test (a
     non-privileged token submitting `critical` gets PermissionDenied) living
-    next to the endpoint table in `tests/acl_endpoints.rs`.
+    next to the endpoint table in `tests/integration/acl_endpoints.rs`.
 
   `high` and below stay open by default: the band only becomes a privilege
   where a policy says so. This subsumes Phase 4's band caps, so Open Question
@@ -742,7 +742,7 @@ Proto (`proto/legion.proto`, every field documented publicly per repo rule):
   task_name, count, band, kill_after }`.
 - No new RPCs, so `every_manager_rpc_is_classified` needs no new rows. It
   will NOT catch a dropped band check either — that check is conditional
-  enforcement inside existing endpoints — so `tests/acl_endpoints.rs` gains
+  enforcement inside existing endpoints — so `tests/integration/acl_endpoints.rs` gains
   explicit band cases (non-privileged token + `critical` → PermissionDenied,
   on RunJob *and* on the update and template-render paths).
 - `AclRule` += `bands` selector (+ `has_scope_selectors`), and the band
@@ -929,7 +929,7 @@ Regression:
   after normal feasibility fails), and event staging stays on the
   in-transaction path. Per AGENTS.md intent, scheduler changes ship with
   the before/after numbers.
-- `cargo test --test acl_endpoints` after merge (standing rule).
+- `cargo test --test integration acl_endpoints::` after merge (standing rule).
 
 ## Rollout and Backward Compatibility
 

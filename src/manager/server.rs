@@ -125,6 +125,8 @@ mod checkpoint_support;
 mod fork_rpcs;
 mod make_room;
 mod material_rpcs;
+mod namespace_policy_rpcs;
+mod namespace_rpcs;
 mod node_content_rpcs;
 mod plugin_rpcs;
 mod session_rpcs;
@@ -1127,8 +1129,137 @@ fn instance_volume_pin_detail(store: &Store, instance: &Instance) -> Option<Stri
     ))
 }
 
+/// The namespace an event belongs to: its job's, or (for a `namespace.*`
+/// lifecycle event) the namespace in its metadata. `None` for cluster
+/// events.
+fn event_namespace(event: &SchedulerEventRecord) -> Option<String> {
+    if let Some(job_id) = event.job_id.as_deref().filter(|id| !id.is_empty()) {
+        return Some(crate::structs::namespace::job_namespace(job_id).to_string());
+    }
+    if event.kind.starts_with("namespace.") {
+        return serde_json::from_str::<Value>(&event.metadata_json)
+            .ok()
+            .and_then(|meta| meta.get("namespace")?.as_str().map(str::to_string));
+    }
+    None
+}
+
+/// Who an event feed is for (docs/namespaces.md, "Events"): an operator sees
+/// everything; a namespace tenant sees the events of the jobs it may read
+/// and the lifecycle events of the namespaces it reaches. The same check
+/// runs on every listed, replayed and streamed event, so `*` never takes a
+/// separate path around it (Nomad's CVE-2025-0937 was one).
+#[derive(Clone)]
+enum EventAudience {
+    Operator,
+    Tenant(AclIdentity),
+}
+
+/// A request's namespace narrowing of an event feed: `None` when it named
+/// none (every event the audience sees).
+fn event_namespace_filter(
+    namespaces: &[String],
+) -> Result<Option<crate::structs::namespace::NamespaceSelection>, Status> {
+    if namespaces.iter().all(|selector| selector.trim().is_empty()) {
+        return Ok(None);
+    }
+    crate::structs::namespace::NamespaceSelection::parse(namespaces)
+        .map(Some)
+        .map_err(Status::invalid_argument)
+}
+
+/// The namespace selection of a list request that may also name a job: a
+/// named job pins its own namespace, so the selection applies only without
+/// one (`None`). Empty selectors mean `default`, as for ListJobs.
+fn list_namespace_selection(
+    job_id: Option<&str>,
+    namespaces: &[String],
+) -> Result<Option<crate::structs::namespace::NamespaceSelection>, Status> {
+    if job_id.is_some_and(|job| !job.trim().is_empty()) {
+        return Ok(None);
+    }
+    crate::structs::namespace::NamespaceSelection::parse(namespaces)
+        .map(Some)
+        .map_err(Status::invalid_argument)
+}
+
+/// An event feed's whole visibility rule: who it is for, narrowed by the
+/// request's namespace filter.
+#[derive(Clone)]
+struct EventFeed {
+    audience: EventAudience,
+    namespaces: Option<crate::structs::namespace::NamespaceSelection>,
+}
+
+impl EventFeed {
+    fn sees(&self, event: &SchedulerEventRecord) -> bool {
+        self.audience.sees(event)
+            && match &self.namespaces {
+                None => true,
+                Some(selection) => event_namespace(event).is_some_and(|ns| selection.matches(&ns)),
+            }
+    }
+
+    fn still_allowed(&self, identity: &AclIdentity) -> Result<(), Status> {
+        self.audience.still_allowed(identity)
+    }
+}
+
+impl EventAudience {
+    /// The audience `identity` may open a feed as, or the ACL error.
+    fn for_identity(identity: &AclIdentity) -> Result<Self, Status> {
+        if identity.allows(AclResource::Operator, AclAction::Read, &AclScope::none()) {
+            return Ok(EventAudience::Operator);
+        }
+        if identity.allows(AclResource::Job, AclAction::Read, &AclScope::any()) {
+            return Ok(EventAudience::Tenant(identity.clone()));
+        }
+        acl::enforce(
+            identity,
+            AclResource::Operator,
+            AclAction::Read,
+            &AclScope::none(),
+        )?;
+        Ok(EventAudience::Operator)
+    }
+
+    fn sees(&self, event: &SchedulerEventRecord) -> bool {
+        match self {
+            EventAudience::Operator => true,
+            EventAudience::Tenant(identity) => match event.job_id.as_deref() {
+                Some(job_id) if !job_id.is_empty() => {
+                    identity.allows(AclResource::Job, AclAction::Read, &AclScope::job(job_id))
+                }
+                _ => event_namespace(event)
+                    .is_some_and(|namespace| identity.reaches_namespace(&namespace)),
+            },
+        }
+    }
+
+    /// Whether `identity` (re-authenticated mid-stream) may still receive
+    /// this feed.
+    fn still_allowed(&self, identity: &AclIdentity) -> Result<(), Status> {
+        match self {
+            EventAudience::Operator => acl::enforce(
+                identity,
+                AclResource::Operator,
+                AclAction::Read,
+                &AclScope::none(),
+            ),
+            EventAudience::Tenant(_) => acl::enforce(
+                identity,
+                AclResource::Job,
+                AclAction::Read,
+                &AclScope::any(),
+            ),
+        }
+    }
+}
+
 fn map_scheduler_event(event: SchedulerEventRecord) -> SchedulerEvent {
+    let namespace = event_namespace(&event).unwrap_or_default();
     SchedulerEvent {
+        namespace,
         id: event.id,
         kind: event.kind,
         level: event.level,
@@ -1692,6 +1823,11 @@ pub struct ManagerDaemonService {
     pub auth: Arc<Authenticator>,
     /// Externally reachable manager address embedded in join tokens.
     pub advertise_addr: String,
+    /// Set when `advertise_addr` is a loopback address derived from a
+    /// wildcard bind, so remote workers cannot use the join tokens it mints
+    /// (`ServerConfigFull::loopback_join_address_warning`). Returned with
+    /// every token as `CreateJoinTokenReply.warning`.
+    join_address_warning: Option<String>,
     /// This manager's identity: its raft node id under raft, else the
     /// listener's `host:port`. Keys its config row and names it in
     /// `ListManagers`. Empty when unset (tests, embedding), in which case
@@ -1799,6 +1935,7 @@ impl ManagerDaemonService {
             store,
             auth,
             advertise_addr: DEF_MANAGER_ADDRESS.to_string(),
+            join_address_warning: None,
             manager_id: String::new(),
             allocation_failures: Arc::new(Mutex::new(AllocationFailureTracker::default())),
             workload_identity: None,
@@ -1966,7 +2103,7 @@ impl ManagerDaemonService {
     /// Every user-facing endpoint must call this (or `authenticate_acl` +
     /// `acl::enforce` when the scope is only known after parsing the request
     /// body) before doing any work. See AGENTS.md and
-    /// `tests/acl_endpoints.rs`, which fails when an endpoint is missing
+    /// `tests/integration/acl_endpoints.rs`, which fails when an endpoint is missing
     /// coverage.
     fn check_acl<T>(
         &self,
@@ -2077,6 +2214,7 @@ impl ManagerDaemonService {
     /// guard, task validation, artifact admission, persistence (with
     /// provenance), status clears, KV-ref bookkeeping, keyed-instance
     /// seeding, and rollout/eval enqueueing.
+    #[allow(clippy::too_many_arguments)]
     fn submit_rendered_job(
         &self,
         identity: &AclIdentity,
@@ -2088,6 +2226,8 @@ impl ManagerDaemonService {
         priority: Option<i64>,
         force_reschedule: bool,
         template: Option<&JobTemplateProvenance>,
+        // The request's namespace (`-n`); resolved against the jobspec's own.
+        namespace: Option<&str>,
     ) -> Result<SubmittedJob, Status> {
         if !subs.iter().any(|sub| sub.path == "job.rendered.json") {
             subs.push(Submission {
@@ -2102,6 +2242,9 @@ impl ManagerDaemonService {
                 error!("Error parsing jobspec: {:?}", e);
                 Status::invalid_argument(format!("Error parsing jobspec: {e}"))
             })?;
+        // The namespace is resolved before anything is scoped: every check
+        // below runs against `config.name`, which is now the canonical id.
+        let namespace = self.admit_job_namespace(&mut config, js, namespace)?;
         // On the spec-changing write path the template attribute is only ever
         // the template the submission is going through — never the job's
         // stored provenance (that would let a template-scoped identity push
@@ -2150,6 +2293,14 @@ impl ManagerDaemonService {
             }
         })?;
 
+        // After authorization, so a caller with no grant in the namespace
+        // cannot learn whether it exists.
+        self.ensure_namespace_exists(&namespace)?;
+        // Namespace policies: runtimes, pools and host volumes here (a
+        // policy's default pool lands in the stored config); quota and
+        // `maxJobs` inside the store's submit entry.
+        self.admit_namespace_policies(&mut config)?;
+
         if let Some(template) = template {
             self.enforce_template_collision_guard(identity, &config.name, template)?;
         }
@@ -2192,6 +2343,9 @@ impl ManagerDaemonService {
             None => self.store.handle_job_submit(&config, &subs),
         }
         .map_err(|e| map_store_error("Error running job", e))?;
+        crate::manager::telemetry::metrics()
+            .job_submits_total
+            .inc(&[&namespace]);
 
         // Resubmitting revives a previously stopped job: clear the stopped
         // status so the instance-management RPCs accept it again. Stopped
@@ -2440,8 +2594,15 @@ impl ManagerDaemonService {
             }));
         }
 
-        let submitted =
-            self.submit_rendered_job(identity, &js, subs, priority, inner.force_reschedule, None)?;
+        let submitted = self.submit_rendered_job(
+            identity,
+            &js,
+            subs,
+            priority,
+            inner.force_reschedule,
+            None,
+            inner.namespace.as_deref(),
+        )?;
 
         let message = submitted.message_with_warnings();
         // The lookup above only catches a duplicate that arrived after the
@@ -2506,7 +2667,6 @@ impl ManagerDaemonService {
         crate::structs::network::tcp_upstream_http_chain_warnings(config, |task| {
             let facts = crate::structs::netpolicy::NetSelectorFacts {
                 node_pool: None,
-                namespace: String::new(),
                 runtime: task.runtime.clone(),
                 job: config.name.clone(),
                 labels: task
@@ -2532,7 +2692,6 @@ impl ManagerDaemonService {
         crate::structs::network::gated_egress_warnings(config, |task| {
             let facts = crate::structs::netpolicy::NetSelectorFacts {
                 node_pool: None,
-                namespace: String::new(),
                 runtime: task.runtime.clone(),
                 job: config.name.clone(),
                 labels: task
@@ -2776,6 +2935,73 @@ impl ManagerDaemonService {
         Err(Status::permission_denied(message))
     }
 
+    /// A registration's `workerFleet` claim, checked against its grant. The
+    /// claim decides which certificate `IssueNodeCertificate` signs (a fleet
+    /// certificate names every node of the fleet) and which name managers
+    /// verify when they dial the node, so a node may not simply say it
+    /// belongs to a fleet: a join token's worker type must grant the fleet
+    /// (`worker_type_grants_fleet`), and a node token keeps the fleet the
+    /// node joined with.
+    fn enforce_fleet_claim(
+        &self,
+        grant: &RegistrationGrant,
+        node_id: &str,
+        config_attrs: &str,
+    ) -> Result<(), Status> {
+        let Some(fleet) = crate::manager::worker_plane::claimed_fleet(config_attrs) else {
+            return Ok(());
+        };
+        let refusal = match grant {
+            RegistrationGrant::Unrestricted => None,
+            RegistrationGrant::JoinToken { record, .. } => {
+                let worker_type = self
+                    .store
+                    .get_worker_type(record.worker_type.clone())
+                    .map_err(|e| map_store_error("Error loading worker type", e))?;
+                (!crate::manager::worker_plane::worker_type_grants_fleet(&worker_type, &fleet))
+                    .then(|| {
+                        format!(
+                            "node {node_id:?} registers as part of fleet {fleet:?}, which its \
+                             worker type {:?} does not grant\n\
+                             Hint: a fleet is for the worker simulator; set `attributes = {{ \
+                             workerFleet = \"{fleet}\" }}` (or a glob such as \"sim-*\") on \
+                             worker type {:?}",
+                            record.worker_type, record.worker_type
+                        )
+                    })
+            }
+            RegistrationGrant::Node(_) => {
+                let registered = self
+                    .store
+                    .get_node(node_id)
+                    .ok()
+                    .and_then(|node| crate::manager::worker_plane::worker_fleet(&node));
+                (registered.as_deref() != Some(fleet.as_str())).then(|| {
+                    format!(
+                        "node {node_id:?} joined as part of fleet {:?}; its node token may not \
+                         re-register it as part of fleet {fleet:?}. Present a join token whose \
+                         worker type grants that fleet",
+                        registered.unwrap_or_default()
+                    )
+                })
+            }
+        };
+        let Some(message) = refusal else {
+            return Ok(());
+        };
+        if self.auth.audit_only {
+            warn!(
+                target: "acl_audit",
+                resource = "worker-plane",
+                action = "register",
+                enforced = false,
+                "fleet claim outside its grant (audit-only): {message}"
+            );
+            return Ok(());
+        }
+        Err(Status::permission_denied(message))
+    }
+
     /// Scope check against a rollout's job, used by rollout endpoints that
     /// only carry a numeric rollout ID.
     fn enforce_rollout_job(
@@ -2851,6 +3077,11 @@ impl ManagerDaemonService {
     }
 
     /// Sets the address join tokens point workers at.
+    pub fn with_join_address_warning(mut self, warning: Option<String>) -> Self {
+        self.join_address_warning = warning;
+        self
+    }
+
     pub fn with_advertise_addr(mut self, advertise_addr: impl Into<String>) -> Self {
         self.advertise_addr = advertise_addr.into();
         self
@@ -3877,6 +4108,35 @@ fn reconcile_kv_changes(store: &Store, changes: &[(String, bool)]) -> Result<(),
             MissingKvBehavior::KeepExisting,
         )
         .map_err(|e| map_store_error("Error applying kv references", e))?;
+
+        // A re-render may only read keys the job already names. Submitting
+        // checked `kv:read` on every key the job named against the
+        // submitter, but a `templateKv` template is edited by whoever can
+        // write its key, and a lookup the edit adds was never checked against
+        // anyone. Keep the job on its last render (nothing is stored, so the
+        // new key's value goes nowhere) and say why; a resubmit checks the
+        // new keys against whoever submits it.
+        let named: HashSet<&str> = job_refs
+            .iter()
+            .map(|reference| reference.kv_key.as_str())
+            .collect();
+        let mut unnamed: Vec<String> = injection_refs
+            .iter()
+            .filter(|reference| !named.contains(reference.key.as_str()))
+            .map(|reference| reference.key.clone())
+            .collect();
+        if !unnamed.is_empty() {
+            unnamed.sort();
+            unnamed.dedup();
+            warn!(
+                job_id = %job_id,
+                keys = ?unnamed,
+                "A KV change made the job's templates read keys it never named; keeping its last render"
+            );
+            store.events().job_kv_render_refused(&job_id, &unnamed);
+            continue;
+        }
+
         let submissions = store
             .get_submissions_for_config(&job_config_id)
             .map_err(|e| map_store_error("Error loading job submissions", e))?;
@@ -4380,8 +4640,10 @@ impl Manager for ManagerDaemonService {
             .await
             .map_err(template_eval_status)?;
 
-        let (config, kv_refs) = resolve_jobspec_kv_references(&self.store, &rendered)
+        let (mut config, kv_refs) = resolve_jobspec_kv_references(&self.store, &rendered)
             .map_err(|e| Status::invalid_argument(format!("rendered jobspec is invalid: {e}")))?;
+        let namespace =
+            self.admit_job_namespace(&mut config, &rendered, inner.namespace.as_deref())?;
         acl::enforce(
             &identity,
             AclResource::Job,
@@ -4391,6 +4653,7 @@ impl Manager for ManagerDaemonService {
             // submit that follows it.
             &AclScope::job_via_template(&config.name, &template.name).with_band(config.priority),
         )?;
+        self.ensure_namespace_exists(&namespace)?;
         enforce_kv_reference_read(&identity, &kv_refs)?;
         enforce_kv_artifact_read(&identity, &config)?;
         validate_job_config(&config).map_err(|e| {
@@ -4484,6 +4747,7 @@ impl Manager for ManagerDaemonService {
                 priority,
                 inner.force_reschedule,
                 Some(&provenance),
+                inner.namespace.as_deref(),
             )?;
             info!(
                 template = %template.name,
@@ -4521,7 +4785,7 @@ impl Manager for ManagerDaemonService {
         &self,
         request: Request<GetJobInfoRequest>,
     ) -> Result<Response<GetJobInfoReply>, Status> {
-        self.check_acl(
+        let identity = self.check_acl(
             &request,
             AclResource::Job,
             AclAction::Read,
@@ -4529,10 +4793,9 @@ impl Manager for ManagerDaemonService {
         )?;
         let name = request.into_inner().name;
 
-        let mut job = self
-            .store
-            .get_job_with_status(&name)
-            .map_err(|e| map_store_error("Error getting job", e))?;
+        let mut job = self.store.get_job_with_status(&name).map_err(|e| {
+            self.job_lookup_error(&identity, &name, map_store_error("Error getting job", e))
+        })?;
         self.store
             .overlay_blocked_jobs(std::slice::from_mut(&mut job))
             .map_err(|e| map_store_error("Error loading blocked evals", e))?;
@@ -4577,12 +4840,15 @@ impl Manager for ManagerDaemonService {
             .eq_ignore_ascii_case("desc");
         let (page, page_size) = parse_page(request.page, request.page_size);
 
+        let selection = list_namespace_selection(job_id, &request.namespaces)?;
         let mut rollouts = self
             .store
             .list_rollouts(job_id, request.active_only)
             .map_err(|e| map_store_error("Error listing rollouts", e))?;
         rollouts.retain(|rollout| {
-            identity.allows(
+            selection.as_ref().is_none_or(|selection| {
+                selection.matches(crate::structs::namespace::job_namespace(&rollout.job_id))
+            }) && identity.allows(
                 AclResource::Job,
                 AclAction::Read,
                 &AclScope::job(&rollout.job_id),
@@ -4705,13 +4971,13 @@ impl Manager for ManagerDaemonService {
         &self,
         request: Request<ListEventsRequest>,
     ) -> Result<Response<ListEventsReply>, Status> {
-        self.check_acl(
-            &request,
-            AclResource::Operator,
-            AclAction::Read,
-            AclScope::none(),
-        )?;
+        let identity = self.authenticate_acl(&request)?;
+        let audience = EventAudience::for_identity(&identity)?;
         let request = request.into_inner();
+        let audience = EventFeed {
+            audience,
+            namespaces: event_namespace_filter(&request.namespaces)?,
+        };
         let filter = SchedulerEventFilter {
             instance_id: normalize_event_filter_value(request.instance_id),
             allocation_id: request.allocation_id,
@@ -4735,7 +5001,11 @@ impl Manager for ManagerDaemonService {
             .map_err(|e| map_store_error("Error reading latest scheduler event id", e))?;
 
         Ok(Response::new(ListEventsReply {
-            events: events.into_iter().map(map_scheduler_event).collect(),
+            events: events
+                .into_iter()
+                .filter(|event| audience.sees(event))
+                .map(map_scheduler_event)
+                .collect(),
             latest_id,
         }))
     }
@@ -5023,14 +5293,15 @@ impl Manager for ManagerDaemonService {
         &self,
         request: Request<StreamEventsRequest>,
     ) -> Result<Response<Self::StreamEventsStream>, Status> {
-        self.check_acl(
-            &request,
-            AclResource::Operator,
-            AclAction::Read,
-            AclScope::none(),
-        )?;
+        let identity = self.authenticate_acl(&request)?;
+        let audience = EventAudience::for_identity(&identity)?;
         let credential = self.stream_credential(&request);
         let request = request.into_inner();
+        // One predicate for replayed and live events alike.
+        let audience = EventFeed {
+            audience,
+            namespaces: event_namespace_filter(&request.namespaces)?,
+        };
         let filter = SchedulerEventFilter {
             instance_id: normalize_event_filter_value(request.instance_id),
             allocation_id: request.allocation_id,
@@ -5053,7 +5324,7 @@ impl Manager for ManagerDaemonService {
         tokio::spawn(async move {
             let mut last_sent = match filter.after_id {
                 Some(after_id) => {
-                    match replay_journal_events(&store, &filter, after_id, &tx).await {
+                    match replay_journal_events(&store, &filter, &audience, after_id, &tx).await {
                         Ok(cursor) => cursor,
                         Err(StreamSendStopped) => return,
                     }
@@ -5072,14 +5343,9 @@ impl Manager for ManagerDaemonService {
                 let received = tokio::select! {
                     received = live.recv() => received,
                     _ = reauth.tick() => {
-                        let still_allowed = credential.reauthenticate(&store).and_then(|identity| {
-                            acl::enforce(
-                                &identity,
-                                AclResource::Operator,
-                                AclAction::Read,
-                                &AclScope::none(),
-                            )
-                        });
+                        let still_allowed = credential
+                            .reauthenticate(&store)
+                            .and_then(|identity| audience.still_allowed(&identity));
                         if let Err(status) = still_allowed {
                             let _ = tx.send(Err(status)).await;
                             return;
@@ -5101,7 +5367,11 @@ impl Manager for ManagerDaemonService {
                         };
                         if event.id <= last_sent
                             || !filter.matches_with(&event, allocation_instance)
+                            || !audience.sees(&event)
                         {
+                            // Advance past an event this audience may not see,
+                            // so a lag backfill does not replay it either.
+                            last_sent = last_sent.max(event.id);
                             continue;
                         }
                         last_sent = event.id;
@@ -5111,7 +5381,9 @@ impl Manager for ManagerDaemonService {
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
                         debug!(skipped, "StreamEvents subscriber lagged; backfilling");
-                        match replay_journal_events(&store, &filter, last_sent, &tx).await {
+                        match replay_journal_events(&store, &filter, &audience, last_sent, &tx)
+                            .await
+                        {
                             Ok(cursor) => last_sent = cursor.max(last_sent),
                             Err(StreamSendStopped) => return,
                         }
@@ -5173,22 +5445,26 @@ impl Manager for ManagerDaemonService {
         // job-name scope is enforced after the jobspec parses.
         let identity =
             self.check_acl(&request, AclResource::Job, AclAction::Read, AclScope::any())?;
-        let jobspec = request.into_inner().parsed_jobspec;
+        let inner = request.into_inner();
+        let jobspec = inner.parsed_jobspec;
         if jobspec.trim().is_empty() {
             return Err(Status::invalid_argument("Plan request missing jobspec"));
         }
 
-        let (config, kv_refs) =
+        let (mut config, kv_refs) =
             resolve_jobspec_kv_references(&self.store, &jobspec).map_err(|e| {
                 error!("Error parsing jobspec for plan: {:?}", e);
                 Status::invalid_argument(format!("Error parsing jobspec: {e}"))
             })?;
+        let namespace =
+            self.admit_job_namespace(&mut config, &jobspec, inner.namespace.as_deref())?;
         acl::enforce(
             &identity,
             AclResource::Job,
             AclAction::Read,
             &AclScope::job(&config.name),
         )?;
+        self.ensure_namespace_exists(&namespace)?;
         // The plan compares the KV-rendered config with the stored one
         // (`same_content`), so it needs the reads a submit would.
         enforce_kv_reference_read(&identity, &kv_refs)?;
@@ -5197,6 +5473,12 @@ impl Manager for ManagerDaemonService {
             .store
             .normalize_job_config(&config)
             .map_err(|e| map_store_error("Error normalizing jobspec", e))?;
+        // A plan refuses what the submit would: namespace policies, static
+        // rules and quota alike.
+        self.admit_namespace_policies(&mut config)?;
+        self.store
+            .check_namespace_admission(&config)
+            .map_err(|e| map_store_error("Namespace policy refused the job", e))?;
         validate_job_config(&config).map_err(|e| {
             error!("Error validating task configs: {:?}", e);
             Status::invalid_argument(format!("Error validating task configs: {e}"))
@@ -5421,7 +5703,7 @@ impl Manager for ManagerDaemonService {
         &self,
         request: Request<GetJobSpecRequest>,
     ) -> Result<Response<GetJobSpecReply>, Status> {
-        self.check_acl(
+        let identity = self.check_acl(
             &request,
             AclResource::Job,
             AclAction::Read,
@@ -5436,7 +5718,11 @@ impl Manager for ManagerDaemonService {
         {
             Some(config) => config,
             None => {
-                return Err(Status::not_found("Job config not found"));
+                return Err(self.job_lookup_error(
+                    &identity,
+                    &name,
+                    Status::not_found("Job config not found"),
+                ));
             }
         };
 
@@ -5514,6 +5800,69 @@ impl Manager for ManagerDaemonService {
         Ok(Response::new(ListJobSpecHistoryReply { items }))
     }
 
+    // === NAMESPACES (docs/namespaces.md) ===
+    // The handlers live in `namespace_rpcs`; each enforces `namespace` ACLs
+    // itself (ListNamespaces filters per item).
+
+    async fn list_namespaces(
+        &self,
+        request: Request<crate::structs::ListNamespacesRequest>,
+    ) -> Result<Response<crate::structs::ListNamespacesReply>, Status> {
+        self.list_namespaces_rpc(request).await
+    }
+
+    async fn get_namespace(
+        &self,
+        request: Request<crate::structs::GetNamespaceRequest>,
+    ) -> Result<Response<crate::structs::GetNamespaceReply>, Status> {
+        self.get_namespace_rpc(request).await
+    }
+
+    async fn apply_namespace(
+        &self,
+        request: Request<crate::structs::ApplyNamespaceRequest>,
+    ) -> Result<Response<crate::structs::ApplyNamespaceReply>, Status> {
+        self.apply_namespace_rpc(request).await
+    }
+
+    async fn delete_namespace(
+        &self,
+        request: Request<crate::structs::DeleteNamespaceRequest>,
+    ) -> Result<Response<crate::structs::DeleteNamespaceReply>, Status> {
+        self.delete_namespace_rpc(request).await
+    }
+
+    // Namespace policies live in `namespace_policy_rpcs`; each handler
+    // enforces `acl:read` / `acl:write` itself.
+
+    async fn list_namespace_policies(
+        &self,
+        request: Request<crate::structs::ListNamespacePoliciesRequest>,
+    ) -> Result<Response<crate::structs::ListNamespacePoliciesReply>, Status> {
+        self.list_namespace_policies_rpc(request).await
+    }
+
+    async fn get_namespace_policy(
+        &self,
+        request: Request<crate::structs::GetNamespacePolicyRequest>,
+    ) -> Result<Response<crate::structs::GetNamespacePolicyReply>, Status> {
+        self.get_namespace_policy_rpc(request).await
+    }
+
+    async fn apply_namespace_policy(
+        &self,
+        request: Request<crate::structs::ApplyNamespacePolicyRequest>,
+    ) -> Result<Response<crate::structs::ApplyNamespacePolicyReply>, Status> {
+        self.apply_namespace_policy_rpc(request).await
+    }
+
+    async fn delete_namespace_policy(
+        &self,
+        request: Request<crate::structs::DeleteNamespacePolicyRequest>,
+    ) -> Result<Response<crate::structs::DeleteNamespacePolicyReply>, Status> {
+        self.delete_namespace_policy_rpc(request).await
+    }
+
     #[instrument(skip_all)]
     async fn list_jobs(
         &self,
@@ -5522,6 +5871,8 @@ impl Manager for ManagerDaemonService {
         let identity =
             self.check_acl(&request, AclResource::Job, AclAction::Read, AclScope::any())?;
         let request = request.into_inner();
+        let selection = crate::structs::namespace::NamespaceSelection::parse(&request.namespaces)
+            .map_err(Status::invalid_argument)?;
         let query = normalize_query(request.query);
         let sort_by = request.sort_by.unwrap_or_else(|| "updated_at".to_string());
         let sort_desc = request
@@ -5554,13 +5905,27 @@ impl Manager for ManagerDaemonService {
                 .map_err(|e| map_store_error("Error loading job provenance", e))?
         };
         jobs.retain(|job| {
-            let scope = AclScope::job(&job.name).with_template(
+            let scope = AclScope::job(&job.id).with_template(
                 provenance
-                    .get(&job.name)
+                    .get(&job.id)
                     .map(|provenance| provenance.name.clone()),
             );
             identity.allows(AclResource::Job, AclAction::Read, &scope)
         });
+        // The namespace selection narrows what is listed, never what the
+        // caller may see: it runs after the per-item ACL filter, so `*` is
+        // exactly "every job you could read one namespace at a time". What it
+        // leaves out is counted, so an empty list can say where the jobs are.
+        let (selected, elsewhere): (Vec<_>, Vec<_>) = jobs
+            .into_iter()
+            .partition(|job| selection.matches(&job.namespace));
+        let mut jobs = selected;
+        let elsewhere_count = elsewhere.len() as u32;
+        let elsewhere_namespaces = elsewhere
+            .iter()
+            .map(|job| job.namespace.as_str())
+            .collect::<std::collections::BTreeSet<_>>()
+            .len() as u32;
 
         if let Some(query) = query {
             jobs.retain(|job| {
@@ -5613,6 +5978,8 @@ impl Manager for ManagerDaemonService {
             page: page as u32,
             page_size: page_size as u32,
             status_counts,
+            elsewhere_count,
+            elsewhere_namespaces,
         }))
     }
 
@@ -5654,7 +6021,9 @@ impl Manager for ManagerDaemonService {
         let job_config_id = self
             .store
             .get_job_config(&name)
-            .map_err(|e| map_store_error("Error stopping job", e))?
+            .map_err(|e| {
+                self.job_lookup_error(&identity, &name, map_store_error("Error stopping job", e))
+            })?
             .id();
 
         let _ = self
@@ -5773,6 +6142,21 @@ impl Manager for ManagerDaemonService {
             )
         } else {
             let count = inner.count.unwrap_or_default();
+            // Scale-out is new demand: a namespace policy's quota sees the
+            // job at its new count. Scale-in is never refused.
+            if count > previous {
+                let mut scaled = config.clone();
+                if let Some(task) = scaled
+                    .tasks
+                    .iter_mut()
+                    .find(|task| task.group == task_group && task.name == task_name)
+                {
+                    task.count.num = count;
+                }
+                self.store
+                    .check_namespace_admission(&scaled)
+                    .map_err(|e| map_store_error("Namespace policy refused the scale", e))?;
+            }
             // The ECS rule (docs/autoscaling.md): scale-out applies during
             // a rollout, scale-in defers until it finishes.
             let active_rollout = self
@@ -5944,10 +6328,9 @@ impl Manager for ManagerDaemonService {
             }));
         }
 
-        let _ = self
-            .store
-            .destroy_job(&name)
-            .map_err(|e| map_store_error("Error deleting job", e))?;
+        let _ = self.store.destroy_job(&name).map_err(|e| {
+            self.job_lookup_error(&identity, &name, map_store_error("Error deleting job", e))
+        })?;
 
         // TODO: Conditionalize
         let message = format!("Destroyed {}", name);
@@ -6051,6 +6434,13 @@ impl Manager for ManagerDaemonService {
         // an unnamed session through the session router and writes nothing
         // to the replicated store. A name makes it an ordinary keyed
         // instance, durable from birth, unless the task refuses names.
+        let unnamed_session =
+            crate::structs::session::is_session_task(task) && requested_id.is_none();
+        if !unnamed_session {
+            self.store
+                .check_namespace_quota_growth(&config.name, config.priority, &task.resources, 1)
+                .map_err(|e| map_store_error("Namespace policy refused the instance", e))?;
+        }
         if crate::structs::session::is_session_task(task) {
             if requested_id.is_none() {
                 return self.create_session(&identity, &inner, &config, task).await;
@@ -6253,6 +6643,10 @@ impl Manager for ManagerDaemonService {
                 )));
             }
         }
+        let creating = inner.instance_ids.len() as u32 + inner.count;
+        self.store
+            .check_namespace_quota_growth(&config.name, config.priority, &task.resources, creating)
+            .map_err(|e| map_store_error("Namespace policy refused the instances", e))?;
 
         // Phase 6: restore every instance from a snapshot.
         let seed = inner
@@ -6511,7 +6905,7 @@ impl Manager for ManagerDaemonService {
             if job.status == "stopped" {
                 return Err(Status::failed_precondition(format!(
                     "job {} is stopped; run the job first, then start its instances",
-                    job.name
+                    job.id
                 )));
             }
             let recorded =
@@ -7213,6 +7607,7 @@ impl Manager for ManagerDaemonService {
         let identity =
             self.check_acl(&request, AclResource::Job, AclAction::Read, AclScope::any())?;
         let inner = request.into_inner();
+        let selection = list_namespace_selection(inner.job_id.as_deref(), &inner.namespaces)?;
         let filter = crate::storage::store::VolumeFilter {
             job_id: non_empty(inner.job_id),
             node_id: non_empty(inner.node_id),
@@ -7240,6 +7635,13 @@ impl Manager for ManagerDaemonService {
             .into_iter()
             .filter(|volume| {
                 include_destroyed || volume.state != crate::structs::VolumeState::Destroyed
+            })
+            .filter(|volume| match (&selection, volume.job_id.as_deref()) {
+                (None, _) => true,
+                (Some(selection), Some(job_id)) => {
+                    selection.matches(crate::structs::namespace::job_namespace(job_id))
+                }
+                (Some(selection), None) => selection.is_exactly("*"),
             })
             .filter(|volume| match volume.job_id.as_deref() {
                 Some(job_id) => {
@@ -7672,7 +8074,8 @@ impl Manager for ManagerDaemonService {
         }
         // The certificate's names come from the authenticated caller, never
         // from the CSR. A fleet certificate (the simulator) needs the node to
-        // have registered as part of that fleet.
+        // have registered as part of that fleet, which registration admits
+        // only when the node's worker type grants it (`enforce_fleet_claim`).
         let subject = if req.fleet.is_empty() {
             crate::manager::mesh_ca::CsrSubject::Node(req.node_id.clone())
         } else {
@@ -7825,14 +8228,12 @@ impl Manager for ManagerDaemonService {
                 .map_err(|e| map_store_error("Error updating node heartbeat", e))?;
         }
 
-        if let Err(err) = handle_failed_allocations(
+        let retry_failed_allocations = handle_failed_allocations(
             &self.store,
             &self.allocation_failures,
             &id,
             &req.failed_allocations,
-        ) {
-            error!(node_id = %id, error = ?err, "Error handling failed allocations");
-        }
+        );
         let retry_terminated_allocations =
             handle_terminated_allocations(&self.store, &id, &req.terminated_allocations);
         if let Err(err) =
@@ -8095,6 +8496,7 @@ impl Manager for ManagerDaemonService {
             session_resync,
             stop_sessions,
             retry_terminated_allocations,
+            retry_failed_allocations,
             envelope_resizes,
         };
 
@@ -8281,6 +8683,7 @@ impl Manager for ManagerDaemonService {
         let request = request.into_inner();
         let node_id = request.name.clone();
         self.enforce_registration_grant(&grant, None, Some((&node_id, &request.pool)))?;
+        self.enforce_fleet_claim(&grant, &node_id, &request.config_attrs)?;
 
         // Protocol-version handshake (see docs/upgrades.md): accept workers
         // at or below our protocol version, warn on pre-versioning workers
@@ -10110,8 +10513,10 @@ impl Manager for ManagerDaemonService {
         &self,
         request: Request<ListServiceEdgesRequest>,
     ) -> Result<Response<ListServiceEdgesReply>, Status> {
-        // Like the catalog, a projection over jobs and allocations: job:read.
-        self.check_acl(&request, AclResource::Job, AclAction::Read, AclScope::any())?;
+        // Like the catalog, a projection over jobs and allocations: job:read,
+        // filtered per edge below.
+        let identity =
+            self.check_acl(&request, AclResource::Job, AclAction::Read, AclScope::any())?;
         let req = request.into_inner();
         let window_secs = if req.window_secs == 0 {
             300
@@ -10154,28 +10559,37 @@ impl Manager for ManagerDaemonService {
             }
         }
 
-        // Declared edges, and the allow verdict for every edge.
-        let allow_by_service: HashMap<String, Vec<String>> = self
+        // Declared edges, and the allow verdict for every edge. Keyed by the
+        // canonical service reference, with the declaring job alongside, so
+        // the verdict is the namespace-aware one the endpoint feed applies.
+        let allow_by_service: HashMap<String, (String, Vec<String>)> = self
             .store
             .declared_services()
             .map_err(|e| map_store_error("Error listing declared services", e))?
             .into_iter()
-            .map(|s| (s.service, s.allow))
+            .map(|s| {
+                let namespace = crate::structs::namespace::job_namespace(&s.job_id).to_string();
+                (
+                    crate::structs::namespace::job_id(&namespace, &s.service),
+                    (s.job_id, s.allow),
+                )
+            })
             .collect();
         let consumers = self
             .store
             .declared_consumers()
             .map_err(|e| map_store_error("Error listing declared consumers", e))?;
-        // A caller's group, for its identity subject: from its declaration.
-        // An observed caller that declares nothing is judged as the default
-        // group.
-        let groups: HashMap<(String, String), String> = consumers
-            .iter()
-            .map(|c| ((c.job_id.clone(), c.task_name.clone()), c.group.clone()))
-            .collect();
+        // An edge names the upstream by its key (an alias, or
+        // `service.namespace` for a crossing); the declaration says which
+        // service that key dials.
+        let mut targets: HashMap<(String, String), String> = HashMap::new();
         for consumer in consumers {
             for upstream in &consumer.upstreams {
-                let service = upstream.key().to_string();
+                let service = upstream.key();
+                let target = upstream
+                    .service_ref(&consumer.job_id)
+                    .unwrap_or_else(|| service.clone());
+                targets.insert((consumer.job_id.clone(), service.clone()), target);
                 // Tagged observed edges for the same (caller, service) are
                 // declared too.
                 let mut any = false;
@@ -10206,16 +10620,19 @@ impl Manager for ManagerDaemonService {
             }
         }
         let secs = f64::from(window_secs);
-        for ((job, task, service, _), edge) in edges.iter_mut() {
-            if let Some(allow) = allow_by_service.get(service) {
-                let group = groups
-                    .get(&(job.clone(), task.clone()))
-                    .cloned()
-                    .unwrap_or_else(crate::structs::default_task_group);
-                edge.allowed = crate::structs::allow_permits(
-                    allow,
-                    &crate::structs::workload_subject(job, &group, task),
-                );
+        for ((job, _, service, _), edge) in edges.iter_mut() {
+            let target = targets
+                .get(&(job.clone(), service.clone()))
+                .cloned()
+                .unwrap_or_else(|| {
+                    crate::structs::namespace::qualify_in(
+                        crate::structs::namespace::job_namespace(job),
+                        service,
+                    )
+                });
+            edge.target = target.clone();
+            if let Some((owner, allow)) = allow_by_service.get(&target) {
+                edge.allowed = crate::structs::allow_permits(allow, owner, job);
             }
             edge.rps = edge.requests as f64 / secs;
             edge.error_rate = if edge.requests + edge.errors > 0 {
@@ -10228,9 +10645,23 @@ impl Manager for ManagerDaemonService {
             }
         }
         let filter = req.service.trim();
+        // Per item, like the catalog: an edge is shown to a caller that may
+        // read the calling job.
         let mut out: Vec<ServiceEdge> = edges
             .into_values()
-            .filter(|edge| filter.is_empty() || edge.service == filter || edge.caller_job == filter)
+            .filter(|edge| {
+                filter.is_empty()
+                    || edge.target == filter
+                    || edge.service == filter
+                    || edge.caller_job == filter
+            })
+            .filter(|edge| {
+                identity.allows(
+                    AclResource::Job,
+                    AclAction::Read,
+                    &AclScope::job(&edge.caller_job),
+                )
+            })
             .collect();
         out.sort_by(|a, b| {
             a.service
@@ -10249,8 +10680,18 @@ impl Manager for ManagerDaemonService {
         &self,
         request: Request<ListServicesRequest>,
     ) -> Result<Response<ListServicesReply>, Status> {
-        // Services are a projection over jobs/allocations, so job:read governs.
-        self.check_acl(&request, AclResource::Job, AclAction::Read, AclScope::any())?;
+        // Services are a projection over jobs/allocations, so job:read governs,
+        // per item: a caller sees the services (and endpoint addresses) of the
+        // jobs it may read, and nothing of anyone else's.
+        let identity =
+            self.check_acl(&request, AclResource::Job, AclAction::Read, AclScope::any())?;
+        let req = request.into_inner();
+        let selection = crate::structs::namespace::NamespaceSelection::parse(&req.namespaces)
+            .map_err(Status::invalid_argument)?;
+        let visible = |job_id: &str| {
+            selection.matches(crate::structs::namespace::job_namespace(job_id))
+                && identity.allows(AclResource::Job, AclAction::Read, &AclScope::job(job_id))
+        };
         let endpoints = self
             .store
             .service_endpoints(None)
@@ -10260,12 +10701,22 @@ impl Manager for ManagerDaemonService {
             .declared_services()
             .map_err(|e| map_store_error("Error listing declared services", e))?;
 
+        // Keyed by the canonical service reference (`ns/name`, or the bare
+        // name in `default`): two namespaces' `web` are two services.
         let mut summaries: std::collections::BTreeMap<String, ServiceSummary> =
             std::collections::BTreeMap::new();
         for entry in declared {
+            if !visible(&entry.job_id) {
+                continue;
+            }
+            let namespace = crate::structs::namespace::job_namespace(&entry.job_id).to_string();
             summaries
-                .entry(entry.service.clone())
+                .entry(crate::structs::namespace::job_id(
+                    &namespace,
+                    &entry.service,
+                ))
                 .or_insert(ServiceSummary {
+                    namespace,
                     service: entry.service,
                     job_id: entry.job_id,
                     task_name: entry.task_name,
@@ -10280,9 +10731,17 @@ impl Manager for ManagerDaemonService {
                 });
         }
         for endpoint in endpoints {
+            if !visible(&endpoint.job_id) {
+                continue;
+            }
+            let namespace = crate::structs::namespace::job_namespace(&endpoint.job_id).to_string();
             let summary = summaries
-                .entry(endpoint.service.clone())
+                .entry(crate::structs::namespace::job_id(
+                    &namespace,
+                    &endpoint.service,
+                ))
                 .or_insert(ServiceSummary {
+                    namespace,
                     service: endpoint.service.clone(),
                     job_id: endpoint.job_id.clone(),
                     task_name: endpoint.task_name.clone(),
@@ -10308,18 +10767,30 @@ impl Manager for ManagerDaemonService {
         &self,
         request: Request<ResolveServiceRequest>,
     ) -> Result<Response<ResolveServiceReply>, Status> {
-        // Services are a projection over jobs/allocations, so job:read governs.
-        self.check_acl(&request, AclResource::Job, AclAction::Read, AclScope::any())?;
+        // Services are a projection over jobs/allocations, so job:read governs,
+        // per endpoint (see ListServices).
+        let identity =
+            self.check_acl(&request, AclResource::Job, AclAction::Read, AclScope::any())?;
         let req = request.into_inner();
+        let service = crate::structs::namespace::resolve_job_ref(&req.service, None)
+            .map_err(Status::invalid_argument)?;
         let endpoints = self
             .store
-            .service_endpoints(Some(&req.service))
+            .service_endpoints(Some(&service))
             .map_err(|e| map_store_error("Error resolving service", e))?;
 
         let endpoints = endpoints
             .into_iter()
             .filter(|endpoint| req.include_unhealthy || endpoint.healthy)
+            .filter(|endpoint| {
+                identity.allows(
+                    AclResource::Job,
+                    AclAction::Read,
+                    &AclScope::job(&endpoint.job_id),
+                )
+            })
             .map(|endpoint| ServiceEndpoint {
+                namespace: crate::structs::namespace::job_namespace(&endpoint.job_id).to_string(),
                 service: endpoint.service,
                 job_id: endpoint.job_id,
                 task_name: endpoint.task_name,
@@ -10803,6 +11274,7 @@ impl Manager for ManagerDaemonService {
             expires_at: identity.expires_at.clone(),
             accessor_id: identity.accessor_id.clone(),
             rules_json: identity.effective_rules_json(),
+            readable_namespaces: self.readable_namespaces(&identity),
         }))
     }
 
@@ -10844,8 +11316,33 @@ impl Manager for ManagerDaemonService {
             .store
             .upsert_acl_policy(&req.name, &req.description, &req.rules_json)
             .map_err(|e| map_store_error("Error saving ACL policy", e))?;
+        // An exact namespace that does not exist is probably a typo, but may
+        // be one created next: warn, never refuse. Globs never warn.
+        let existing: std::collections::BTreeSet<String> = self
+            .store
+            .list_namespaces()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|record| record.namespace.name)
+            .collect();
+        let warnings = crate::structs::acl::parse_rules(&req.rules_json)
+            .unwrap_or_default()
+            .iter()
+            .enumerate()
+            .flat_map(|(index, rule)| {
+                rule.namespaces
+                    .iter()
+                    .flatten()
+                    .filter(|name| !name.contains('*') && !existing.contains(*name))
+                    .map(move |name| {
+                        format!("rule {index} names namespace '{name}', which does not exist")
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect();
         Ok(Response::new(UpsertAclPolicyReply {
             policy: Some(policy),
+            warnings,
         }))
     }
 
@@ -11185,9 +11682,13 @@ impl Manager for ManagerDaemonService {
             &req.description,
         )?;
         info!(id = %info.id, worker_type = %info.worker_type, "Join token created");
+        if let Some(warning) = &self.join_address_warning {
+            warn!(id = %info.id, "Join token names a loopback manager address: {warning}");
+        }
         Ok(Response::new(CreateJoinTokenReply {
             info: Some(info),
             token,
+            warning: self.join_address_warning.clone().unwrap_or_default(),
         }))
     }
 
@@ -11339,6 +11840,19 @@ impl Manager for ManagerDaemonService {
         let ttl = humantime::parse_duration(&ttl)
             .map_err(|e| Status::invalid_argument(format!("invalid ttl `{ttl}`: {e}")))?;
 
+        // The ticket's instance (or prefix) may be a key: qualified in the
+        // job's namespace, its claim is the canonical id a node compares a
+        // StartClaim against.
+        let mut req = req;
+        let namespace = crate::structs::namespace::job_namespace(&req.job).to_string();
+        if !req.instance_id.trim().is_empty() {
+            req.instance_id =
+                crate::structs::namespace::qualify_instance_in(&namespace, req.instance_id.trim());
+        }
+        if !req.instance_prefix.trim().is_empty() && !req.instance_prefix.contains('/') {
+            req.instance_prefix =
+                crate::structs::namespace::job_id(&namespace, req.instance_prefix.trim());
+        }
         let minted = match req.scope.trim() {
             "" | "boot" => {
                 self.mint_boot_ticket(state, &identity, &req, &job_config_id, &task, ttl)?
@@ -11710,7 +12224,9 @@ fn request_fingerprint(request: &impl serde::Serialize) -> String {
 fn volume_write_scope(volume: &crate::structs::volume::Volume) -> AclScope {
     match volume.job_id.as_deref() {
         Some(job_id) => AclScope::job(job_id),
-        None => AclScope::none(),
+        // A volume no job owns belongs to no namespace: it takes a job rule
+        // that reaches every namespace and names no job.
+        None => AclScope::unowned(),
     }
 }
 
@@ -11741,6 +12257,7 @@ struct StreamSendStopped;
 async fn replay_journal_events(
     store: &Store,
     filter: &SchedulerEventFilter,
+    audience: &EventFeed,
     after_id: i64,
     tx: &tokio::sync::mpsc::Sender<Result<SchedulerEvent, Status>>,
 ) -> Result<i64, StreamSendStopped> {
@@ -11767,6 +12284,9 @@ async fn replay_journal_events(
         let batch_len = batch.len();
         for event in batch {
             cursor = cursor.max(event.id);
+            if !audience.sees(&event) {
+                continue;
+            }
             if tx.send(Ok(map_scheduler_event(event))).await.is_err() {
                 return Err(StreamSendStopped);
             }
@@ -12118,13 +12638,31 @@ fn handle_failed_allocations(
     failure_tracker: &Arc<Mutex<AllocationFailureTracker>>,
     node_id: &str,
     failed: &[FailedAllocation],
-) -> R<()> {
+) -> Vec<i64> {
     let mut freed_capacity = false;
+    // Reports this manager could not record, handed back for the worker to
+    // send again (`HeartbeatReply.retry_failed_allocations`). A worker sends
+    // a failure once, so a report lost here left the allocation placed on a
+    // node that had already torn it down, and nothing replaced it.
+    let mut retry = Vec::new();
     for failure in failed {
         let allocation_id = failure.allocation_id;
         let allocation_context = {
             let mut tracker = failure_tracker.lock().expect("allocation failure tracker");
-            tracker.context_for_allocation(store, allocation_id)?
+            tracker.context_for_allocation(store, allocation_id)
+        };
+        let allocation_context = match allocation_context {
+            Ok(context) => context,
+            Err(error) => {
+                warn!(
+                    allocation_id,
+                    node_id,
+                    error = %format!("{error:#}"),
+                    "Failed to read a failed allocation; asking the worker to report it again"
+                );
+                retry.push(allocation_id);
+                continue;
+            }
         };
 
         let Some(context) = allocation_context else {
@@ -12146,15 +12684,38 @@ fn handle_failed_allocations(
 
         // The removal, the move budget's verdict, and (when the replacement
         // is deferred) the hold the planner honors commit together.
-        let removal = store.remove_failed_allocation(
+        // The reason becomes the instance's `last_stop`, so the row still
+        // says why once the reschedule hold has lapsed.
+        let explanation = crate::storage::store::StopExplanation {
+            detail: format!(
+                "Failed on node {node_id}: {}",
+                crate::storage::store::summarize_reason(&failure.reason, 400)
+            ),
+            hint: String::new(),
+        };
+        let removal = match store.remove_failed_allocation(
             allocation_id,
-            StopCause::Unknown,
-            None,
+            StopCause::Failed,
+            Some(explanation),
             FailedMove {
                 policy: (&context.on_unhealthy).into(),
                 reason: failure.reason.clone(),
             },
-        )?;
+        ) {
+            Ok(removal) => removal,
+            // The write could not reach the lane leader (a forward to a
+            // leader that just stepped down, say): nothing was recorded.
+            Err(error) => {
+                warn!(
+                    allocation_id,
+                    node_id,
+                    error = %format!("{error:#}"),
+                    "Failed to record an allocation failure; asking the worker to report it again"
+                );
+                retry.push(allocation_id);
+                continue;
+            }
+        };
         failure_tracker
             .lock()
             .expect("allocation failure tracker")
@@ -12200,7 +12761,7 @@ fn handle_failed_allocations(
         let gang = gang_member_lost(
             store,
             &removal.allocation,
-            StopCause::Unknown,
+            StopCause::Failed,
             matches!(removal.verdict, MoveVerdict::Exhausted { .. }),
         );
         apply_move_verdict(store, &removal, node_id, gang.as_ref());
@@ -12213,7 +12774,7 @@ fn handle_failed_allocations(
     if freed_capacity {
         store.request_capacity_reconcile_if_waiting();
     }
-    Ok(())
+    retry
 }
 
 /// Maps a template evaluation error to a gRPC status: a full evaluation
@@ -12867,7 +13428,6 @@ impl ManagerDaemonService {
                 };
             let facts = NetSelectorFacts {
                 node_pool: node_pool.clone(),
-                namespace: String::new(),
                 runtime: allocation.task_runtime.clone(),
                 job: allocation.job_id.clone(),
                 labels: network
@@ -12968,7 +13528,6 @@ impl ManagerDaemonService {
         };
         let facts = crate::structs::netpolicy::NetSelectorFacts {
             node_pool: (!node_pool.trim().is_empty()).then(|| node_pool.trim().to_string()),
-            namespace: String::new(),
             runtime: task.runtime.clone(),
             job: job_id.to_string(),
             labels: task
@@ -13045,18 +13604,27 @@ impl ManagerDaemonService {
         }
         let mut resolved: HashMap<String, Vec<crate::structs::ServiceEndpointRow>> = HashMap::new();
         let mut out = Vec::new();
-        for (allocation_id, service, caller) in wanted {
-            if !resolved.contains_key(&service) {
+        for (allocation_id, service, job_id) in wanted {
+            // A handler's `service` resolves like an upstream: in the
+            // allocation's own namespace unless it is qualified.
+            let target = crate::structs::namespace::qualify_in(
+                crate::structs::namespace::job_namespace(&job_id),
+                &service,
+            );
+            if !resolved.contains_key(&target) {
                 let rows = self
                     .store
-                    .service_endpoints(Some(&service))
+                    .service_endpoints(Some(&target))
                     .unwrap_or_default();
-                resolved.insert(service.clone(), rows);
+                resolved.insert(target.clone(), rows);
             }
-            let endpoints = resolved[&service]
+            let endpoints = resolved[&target]
                 .iter()
-                .filter(|row| row.healthy && crate::structs::allow_permits(&row.allow, &caller))
+                .filter(|row| {
+                    row.healthy && crate::structs::allow_permits(&row.allow, &row.job_id, &job_id)
+                })
                 .map(|row| ServiceEndpoint {
+                    namespace: crate::structs::namespace::job_namespace(&row.job_id).to_string(),
                     service: row.service.clone(),
                     job_id: row.job_id.clone(),
                     task_name: row.task_name.clone(),
@@ -13249,7 +13817,6 @@ impl ManagerDaemonService {
             };
             let facts = NetSelectorFacts {
                 node_pool: pool,
-                namespace: String::new(),
                 runtime: task.runtime.clone(),
                 job: allocation.job_id.clone(),
                 labels: task
@@ -13300,6 +13867,7 @@ fn merge_net_policies(
         ingress: network.and_then(|n| n.ingress.as_ref()),
         mesh: service.and_then(|s| s.mesh),
         callers: service.map(|s| s.allow.as_slice()).unwrap_or_default(),
+        owner: &facts.job,
     };
     let effective = merge_policies(&matching, inline);
     let matched = effective
@@ -13707,15 +14275,16 @@ fn build_upstream_endpoints(
                 }
             };
         for upstream in &connect.upstreams {
-            // External upstreams dial a fixed destination; the worker reads it
-            // off `AllocUpstream.to` and needs no endpoint feed.
-            let Some(service) = upstream.service() else {
+            // The service lives in the consumer's own namespace unless the
+            // upstream names another (docs/namespaces.md): a bare name never
+            // resolves across a namespace boundary. External upstreams dial a
+            // fixed destination and need no endpoint feed.
+            let Some(target) = upstream.service_ref(&allocation.job_id) else {
                 continue;
             };
-            let caller = allocation_subject(allocation);
-            let key = (service.clone(), caller.clone());
+            let key = (target.clone(), allocation.job_id.clone());
             if !resolved.contains_key(&key) {
-                let rows = match store.service_endpoints(Some(&service)) {
+                let rows = match store.service_endpoints(Some(&target)) {
                     Ok(rows) => rows,
                     Err(err) => {
                         // Same reasoning as the corrupt-payload arm above:
@@ -13724,7 +14293,7 @@ fn build_upstream_endpoints(
                         // stall this node's reconciliation entirely.
                         warn!(
                             allocation_id = allocation.allocation_id,
-                            service = %service,
+                            service = %target,
                             error = ?err,
                             "Skipping upstream endpoints; service lookup failed"
                         );
@@ -13733,8 +14302,17 @@ fn build_upstream_endpoints(
                 };
                 let endpoints = rows
                     .into_iter()
-                    .filter(|row| row.healthy && crate::structs::allow_permits(&row.allow, &caller))
+                    .filter(|row| {
+                        row.healthy
+                            && crate::structs::allow_permits(
+                                &row.allow,
+                                &row.job_id,
+                                &allocation.job_id,
+                            )
+                    })
                     .map(|row| ServiceEndpoint {
+                        namespace: crate::structs::namespace::job_namespace(&row.job_id)
+                            .to_string(),
                         service: row.service,
                         job_id: row.job_id,
                         task_name: row.task_name,
@@ -13756,12 +14334,12 @@ fn build_upstream_endpoints(
             let endpoints = resolved.get(&key).cloned().unwrap_or_default();
             debug!(
                 allocation_id = allocation.allocation_id,
-                service = %service,
+                service = %target,
                 endpoints = endpoints.len(),
                 "Resolved upstream endpoints"
             );
-            // Named by the upstream's key, which is how the node's listener
-            // is known (a `name` can alias the service).
+            // The worker keys its listeners by the upstream's key (the alias,
+            // or `service.namespace` for a crossing), not the catalog name.
             upstreams.push(crate::structs::UpstreamEndpoints {
                 allocation_id: allocation.allocation_id,
                 service: upstream.key(),
@@ -14000,7 +14578,7 @@ mod tests {
     fn setup_store() -> R<Store> {
         let store_dir = Builder::new()
             .prefix("legion-manager-server-")
-            .tempdir()
+            .tempdir_in(crate::test_scratch::root())
             .context("error creating temp store directory")?
             .keep();
         let store_config = ManagerConfigFull {
@@ -14553,7 +15131,7 @@ mod tests {
             "runtime": "container",
             "config": { "image": "alpine", "command": ["sleep", "1"] },
             "network": { "mode": "host", "ports": [{ "name": "http" }] },
-            "service": { "port": "http", "mesh": true, "allow": ["web", "*:ops:*:shell"] },
+            "service": { "port": "http", "mesh": true, "allow": ["web", "ops-*/tools"] },
         }))?;
         store.handle_job_submit(
             &JobConfig {
@@ -14590,7 +15168,8 @@ mod tests {
             denied.reason
         );
         assert_eq!(test("global:web:web:web").await?.verdict, "allow");
-        assert_eq!(test("global:ops:tools:shell").await?.verdict, "allow");
+        assert_eq!(test("global:ops-1/tools:g:shell").await?.verdict, "allow");
+        assert_eq!(test("global:ops-1/web:g:t").await?.verdict, "deny");
         Ok(())
     }
 
@@ -14672,7 +15251,7 @@ mod tests {
         // The token verifies against the issuer and carries claims derived
         // from the scheduling record — not from anything the caller sent.
         let claims = state.verify(&reply.token, "sts.amazonaws.com")?;
-        assert_eq!(claims["sub"], json!("auto:wi-job:default:api"));
+        assert_eq!(claims["sub"], json!("auto:default:wi-job:default:api"));
         assert_eq!(claims["aud"], json!(["sts.amazonaws.com"]));
         assert_eq!(claims["legion.io/job"], json!("wi-job"));
         assert_eq!(claims["legion.io/task"], json!("api"));
@@ -15585,6 +16164,7 @@ mod tests {
 
         manager
             .run_job(Request::new(RunJobRequest {
+                namespace: Default::default(),
                 parsed_jobspec: jobspec,
                 submissions: vec![submission()],
                 priority: None,
@@ -15665,6 +16245,7 @@ mod tests {
 
         manager
             .run_job(Request::new(RunJobRequest {
+                namespace: Default::default(),
                 parsed_jobspec: jobspec,
                 submissions: vec![submission()],
                 priority: None,
@@ -15724,6 +16305,7 @@ mod tests {
 
         manager
             .run_job(Request::new(RunJobRequest {
+                namespace: Default::default(),
                 parsed_jobspec: jobspec,
                 submissions: vec![submission()],
                 priority: None,
@@ -15779,6 +16361,7 @@ mod tests {
     async fn run_jobspec(manager: &ManagerDaemonService, jobspec: Value) -> Result<(), Status> {
         manager
             .run_job(Request::new(RunJobRequest {
+                namespace: Default::default(),
                 parsed_jobspec: jobspec.to_string(),
                 submissions: vec![submission()],
                 priority: None,
@@ -16303,6 +16886,83 @@ mod tests {
         assert_eq!(
             task_env_value(&store, "kv-template-kv", 0, "BANNER")?,
             "v2=world"
+        );
+        Ok(())
+    }
+
+    /// `kv:read` is checked against the submitter for every key a job names.
+    /// A `templateKv` template is edited by whoever can write its key, so an
+    /// edit that adds a lookup must not render that key's value into the
+    /// job: the job keeps its last render and a `job.kv_render_refused`
+    /// event names the key. Edits that stay within the named keys still
+    /// re-render.
+    #[tokio::test]
+    async fn a_template_edit_cannot_add_a_key_the_job_never_named() -> R<()> {
+        let store = setup_store()?;
+        let manager = ManagerDaemonService::new(store.clone());
+
+        put_kv_entry(&manager, "ui/banner", "hello").await?;
+        put_kv_entry(&manager, "secrets/db", "hunter2").await?;
+        put_kv_entry(&manager, "templates/banner", "msg={{ kv \"ui/banner\" }}").await?;
+        let jobspec = json!({
+            "name": "kv-template-escalation",
+            "task": {
+                "runtime": "exec",
+                "kv": { "watch": true, "onChange": "restart", "onDelete": "fail" },
+                "env": [
+                    {
+                        "name": "BANNER",
+                        "value": { "templateKv": "templates/banner" }
+                    }
+                ],
+                "config": { "command": ["echo", "hi"] }
+            }
+        });
+        run_jobspec(&manager, jobspec).await?;
+
+        // The edit reaches for a key the submitter never named.
+        put_kv_entry(
+            &manager,
+            "templates/banner",
+            "msg={{ kv \"ui/banner\" }} {{ kv \"secrets/db\" }}",
+        )
+        .await?;
+        assert_eq!(
+            task_env_value(&store, "kv-template-escalation", 0, "BANNER")?,
+            "msg=hello",
+            "the job keeps its last render"
+        );
+        assert_eq!(
+            evals_of_kind(&store, "kv-template-escalation", "job_update")?,
+            0
+        );
+        let config = serde_json::to_string(&store.get_job_config("kv-template-escalation")?)?;
+        assert!(
+            !config.contains("hunter2"),
+            "the unnamed key's value is stored nowhere"
+        );
+        let keys: Vec<String> = store
+            .job_kv_references_for_job("kv-template-escalation")?
+            .into_iter()
+            .map(|reference| reference.kv_key)
+            .collect();
+        assert!(!keys.iter().any(|key| key == "secrets/db"));
+        let refused = store.list_scheduler_events(&SchedulerEventFilter {
+            kind: Some("job.kv_render_refused".into()),
+            ..Default::default()
+        })?;
+        assert_eq!(refused.len(), 1);
+        assert!(
+            refused[0].message.contains("secrets/db"),
+            "{}",
+            refused[0].message
+        );
+
+        // An edit within the named keys still re-renders.
+        put_kv_entry(&manager, "templates/banner", "v2={{ kv \"ui/banner\" }}").await?;
+        assert_eq!(
+            task_env_value(&store, "kv-template-escalation", 0, "BANNER")?,
+            "v2=hello"
         );
         Ok(())
     }
@@ -17213,6 +17873,7 @@ mod tests {
 
         manager
             .run_job(Request::new(RunJobRequest {
+                namespace: Default::default(),
                 parsed_jobspec: jobspec,
                 submissions: vec![submission()],
                 priority: None,
@@ -17443,7 +18104,7 @@ mod tests {
                 reason: "boom".into(),
                 artifact_states: None,
             }],
-        )?;
+        );
         // The reschedule is enqueued from a spawned thread, so poll rather
         // than sleep a fixed 10ms, which flaked under a loaded machine.
         // The freed capacity can also queue a capacity pass (`node_join`), in
@@ -17466,6 +18127,91 @@ mod tests {
         assert_eq!(eval.job_config_id, job_config_id);
         assert_eq!(eval.node_name, "node-a");
 
+        Ok(())
+    }
+
+    /// A join token minted while the manager derives a loopback address from
+    /// a wildcard bind carries a warning naming the fix; one minted with a
+    /// chosen address does not.
+    #[tokio::test]
+    async fn a_loopback_join_token_from_a_wildcard_bind_carries_a_warning() -> R<()> {
+        let request = || {
+            Request::new(CreateJoinTokenRequest {
+                worker_type: "default".into(),
+                ttl: Some("1h".into()),
+                description: "warning test".into(),
+            })
+        };
+        let warning = crate::structs::ServerConfigFull {
+            port: 4747,
+            host: "0.0.0.0".into(),
+            ..Default::default()
+        }
+        .loopback_join_address_warning();
+        let manager = ManagerDaemonService::new(setup_store()?)
+            .with_advertise_addr("http://127.0.0.1:4747")
+            .with_join_address_warning(warning);
+        let reply = manager.create_join_token(request()).await?.into_inner();
+        assert!(
+            reply.warning.contains("server.advertiseAddr"),
+            "{}",
+            reply.warning
+        );
+        assert!(!reply.token.is_empty(), "the token is still minted");
+
+        let manager = ManagerDaemonService::new(setup_store()?)
+            .with_advertise_addr("http://10.0.1.5:4747")
+            .with_join_address_warning(None);
+        let reply = manager.create_join_token(request()).await?.into_inner();
+        assert!(reply.warning.is_empty(), "{}", reply.warning);
+        Ok(())
+    }
+
+    /// A failure report the manager cannot record (here, a raft write with
+    /// no pipeline to take it; on the rig, a forward to a leader that had
+    /// just stepped down) is handed back for the worker to send again,
+    /// instead of being logged and lost with the allocation left placed.
+    /// Once recorded, a repeat is not asked for again.
+    #[test]
+    fn an_unrecorded_failure_report_is_handed_back_for_a_retry() -> R<()> {
+        let store = setup_store()?;
+        insert_node(&store, "node-a")?;
+        let job = JobConfig {
+            priority: Default::default(),
+            rollout: None,
+            rollout_by_group: Default::default(),
+            name: "job".into(),
+            tasks: vec![TaskConfig::new("task", "noop")],
+            version: None,
+        };
+        store.handle_job_submit(&job, &[submission()])?;
+        let job_config_id = store.get_job_config(&job.name)?.id();
+        let task_id = store.get_task_configs_for_job_config(&job_config_id)?[0].0;
+        let allocation = store.place_alloc("node-a", task_id)?;
+        let report = [FailedAllocation {
+            allocation_id: allocation.id,
+            reason: "boom".into(),
+            artifact_states: None,
+        }];
+        let tracker = Arc::new(Mutex::new(AllocationFailureTracker::default()));
+
+        store.set_raft_mode(true);
+        let retry = handle_failed_allocations(&store, &tracker, "node-a", &report);
+        store.set_raft_mode(false);
+        assert_eq!(retry, vec![allocation.id]);
+        assert!(
+            store.get_allocation_by_id(allocation.id)?.is_some(),
+            "nothing was recorded"
+        );
+
+        let retry = handle_failed_allocations(&store, &tracker, "node-a", &report);
+        assert!(retry.is_empty(), "{retry:?}");
+        assert!(store.get_allocation_by_id(allocation.id)?.is_none());
+        let retry = handle_failed_allocations(&store, &tracker, "node-a", &report);
+        assert!(
+            retry.is_empty(),
+            "a repeat of a recorded failure is not retried"
+        );
         Ok(())
     }
 
@@ -17521,7 +18267,7 @@ mod tests {
                     reason: "artifact staging failed: 404\nsecond line".into(),
                     artifact_states: None,
                 }],
-            )?;
+            );
             failed.push(allocation.id);
         }
 
@@ -17600,7 +18346,7 @@ mod tests {
                 reason: "boom".into(),
                 artifact_states: None,
             }],
-        )?;
+        );
         let events = deferred_events(&store, "flaky")?;
         assert_eq!(events.len(), 5);
         assert_eq!(events[4]["attempt"], 1);
@@ -17652,7 +18398,7 @@ mod tests {
                 reason: "artifact staging failed: 404".into(),
                 artifact_states: None,
             }],
-        )?;
+        );
         let waiting = store.get_instance("user-a")?.context("instance")?;
         assert_eq!(waiting.state, InstanceState::Rescheduling);
         let events = deferred_events(&store, job_id)?;
@@ -17976,7 +18722,7 @@ mod tests {
                 reason: "artifact staging failed: 404".into(),
                 artifact_states: Some(artifact_states),
             }],
-        )?;
+        );
 
         let events = store.list_scheduler_events(&SchedulerEventFilter {
             kind: Some("artifact.failed".into()),
@@ -18028,7 +18774,7 @@ mod tests {
                 reason: "spoofed".into(),
                 artifact_states: None,
             }],
-        )?;
+        );
         std::thread::sleep(Duration::from_millis(10));
 
         assert!(store.get_allocation_by_id(allocation.id)?.is_some());
@@ -18757,6 +19503,7 @@ mod tests {
         insert_node(&store, "node-a")?;
         let reply = manager
             .run_job(Request::new(RunJobRequest {
+                namespace: Default::default(),
                 parsed_jobspec: json!({
                     "name": "off-runtime",
                     "task": { "runtime": "exec", "config": { "command": ["true"] } }
@@ -18790,6 +19537,7 @@ mod tests {
         .to_string();
         let run = || {
             manager.run_job(Request::new(RunJobRequest {
+                namespace: Default::default(),
                 parsed_jobspec: jobspec.clone(),
                 submissions: vec![submission()],
                 priority: None,
@@ -19601,18 +20349,19 @@ mod tests {
             audit_only: false,
         };
         let exec_host = identity(json!([
-            { "resources": ["exec"], "actions": ["write"], "names": ["shell"], "host": true }
+            { "resources": ["exec"], "namespaces": ["*"], "actions": ["write"], "names": ["shell"], "host": true }
         ]));
         let exec_no_host = identity(json!([
-            { "resources": ["exec"], "actions": ["write"], "names": ["shell"] }
+            { "resources": ["exec"], "namespaces": ["*"], "actions": ["write"], "names": ["shell"] }
         ]));
         let action_only = identity(json!([
-            { "resources": ["action"], "actions": ["write"], "names": ["shell"], "actionNames": ["flush"] }
+            { "resources": ["action"], "namespaces": ["*"], "actions": ["write"], "names": ["shell"], "actionNames": ["flush"] }
         ]));
         let other_job = identity(json!([
-            { "resources": ["exec"], "actions": ["write"], "names": ["other"], "host": true }
+            { "resources": ["exec"], "namespaces": ["*"], "actions": ["write"], "names": ["other"], "host": true }
         ]));
-        let reader = identity(json!([{ "resources": ["job"], "actions": ["read"] }]));
+        let reader =
+            identity(json!([{ "resources": ["job"], "namespaces": ["*"], "actions": ["read"] }]));
 
         let command = MintExecTicketRequest {
             allocation_id: alloc.id,

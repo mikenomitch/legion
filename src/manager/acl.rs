@@ -804,6 +804,25 @@ pub fn enforce(
             action.as_str(),
         )));
     }
+    // Where the token CAN act, from its own rules: the denial names no
+    // target (a scope derived from a lookup would leak it), only the
+    // caller's reach.
+    let reach = if resource.is_namespaced() && scope.namespace.is_some() {
+        identity.namespaces_granting(resource, action)
+    } else {
+        Vec::new()
+    };
+    if !reach.is_empty() {
+        return Err(Status::permission_denied(format!(
+            "permission denied: {}:{} requires a policy granting it in this namespace
+             Hint: this token can {} {} in {}",
+            resource.as_str(),
+            action.as_str(),
+            action.as_str(),
+            resource.as_str(),
+            reach.join(", "),
+        )));
+    }
     Err(Status::permission_denied(format!(
         "permission denied: {}:{} requires a policy granting it",
         resource.as_str(),
@@ -852,7 +871,7 @@ mod authenticator_test {
     fn setup_store() -> R<Store> {
         let store_dir = Builder::new()
             .prefix("legion-acl-auth-")
-            .tempdir()
+            .tempdir_in(crate::test_scratch::root())
             .context("Error creating temp store directory")?
             .keep();
         let store_config = ManagerConfigFull {
@@ -907,7 +926,7 @@ mod authenticator_test {
         store.upsert_acl_policy(
             ANONYMOUS_POLICY,
             "migration policy",
-            r#"[{"resources": ["job"], "actions": ["read"]}]"#,
+            r#"[{"resources": ["job"], "namespaces": ["*"], "actions": ["read"]}]"#,
         )?;
         let identity = auth.authenticate(&MetadataMap::new(), &store)?;
         assert!(identity.allows(AclResource::Job, AclAction::Read, &AclScope::any()));
@@ -1018,7 +1037,7 @@ mod authenticator_test {
         store.upsert_acl_policy(
             "readers",
             "",
-            r#"[{"resources": ["job"], "actions": ["read"]}]"#,
+            r#"[{"resources": ["job"], "namespaces": ["*"], "actions": ["read"]}]"#,
         )?;
         store.upsert_acl_user(
             "alice",
@@ -1069,7 +1088,7 @@ mod authenticator_test {
         store.upsert_acl_policy(
             "readers",
             "",
-            r#"[{"resources": ["job"], "actions": ["read"]}]"#,
+            r#"[{"resources": ["job"], "namespaces": ["*"], "actions": ["read"]}]"#,
         )?;
         store.upsert_acl_user("alice", Some(&hash_password("pw")?), &["readers".into()])?;
 
@@ -1290,7 +1309,7 @@ mod authenticator_test {
         store.upsert_acl_policy(
             "base",
             "",
-            r#"[{"resources": ["job"], "actions": ["read"]}]"#,
+            r#"[{"resources": ["job"], "namespaces": ["*"], "actions": ["read"]}]"#,
         )?;
 
         let (auth, token) = hs256_authenticator_and_jwt(json!({
@@ -1364,7 +1383,7 @@ mod authenticator_test {
         store.upsert_acl_policy(
             "base",
             "",
-            r#"[{"resources": ["job"], "actions": ["read"]}]"#,
+            r#"[{"resources": ["job"], "namespaces": ["*"], "actions": ["read"]}]"#,
         )?;
 
         let (auth, token) = hs256_authenticator_and_jwt(json!({
@@ -1425,7 +1444,7 @@ mod authenticator_test {
         store.upsert_acl_policy(
             "readers",
             "",
-            r#"[{"resources": ["job"], "actions": ["read"]}]"#,
+            r#"[{"resources": ["job"], "namespaces": ["*"], "actions": ["read"]}]"#,
         )?;
 
         let mut auth = enabled_authenticator();

@@ -267,7 +267,8 @@ dispatch time, so they are present at process start for `exec` and
 | Variable | When | Meaning |
 | --- | --- | --- |
 | `LEGION_ALLOC_ID` | **all** tasks (stateless too) | Current allocation id. Changes with each placement. |
-| `LEGION_INSTANCE_ID` | stateful tasks | Stable instance id. Survives reschedules. |
+| `LEGION_INSTANCE_ID` | stateful tasks | Stable, canonical instance id (`payments-prod/user-42`; bare in `default`). Survives reschedules. |
+| `LEGION_INSTANCE_KEY` | stateful tasks | The id without its namespace (`user-42`): what a caller named the instance. |
 | `LEGION_INSTANCE_MODE` | stateful tasks | `slot`, `keyed`, or `session` (an unnamed [session](session-mode.md)). |
 | `LEGION_INSTANCE_SLOT` | slot mode only | Ordinal slot index `0..count-1`. |
 | `LEGION_STORAGE_DIR` | tasks with `stateful.storage` | The instance volume's path. See [volumes.md](volumes.md#how-path-works-per-task-runtime) for why exec and container tasks get different values. |
@@ -741,10 +742,13 @@ Resubmitting a stopped job (`job run`) clears the job's stopped status, but it
   create can't ask the server to mint ids (`--count`). Without it (the
   default), the server creates an id when the request omits one. A valid
   caller-supplied id is always used either way.
-- Ids are unique across the whole cluster and **never recycled for the
-  lifetime of the job that owns them**. Creating an id that matches any
-  existing instance row, in this job or another one, is rejected
-  (`AlreadyExists`). That includes a `stopped` instance or a `terminated`
+- An id you choose is a **key, qualified by the job's
+  [namespace](namespaces.md#instances)** exactly as job ids are: `user-42` in
+  `default`, `payments-prod/user-42` in `payments-prod`. Ids are unique within
+  a namespace (two namespaces may each hold `user-42`) and **never recycled
+  for the lifetime of the job that owns them**. Creating an id that matches
+  any existing instance row of the namespace, in this job or another one, is
+  rejected (`AlreadyExists`). That includes a `stopped` instance or a `terminated`
   tombstone. So a dead sandbox's identity (and its WI `sub`) can never
   be given to a new one while the job exists. Destroying the whole job (`job
   destroy`) clears its instance history, since rows are deleted with the job
@@ -803,7 +807,7 @@ and replace every live instance's allocation with one on the new config.
 ### Inspecting an instance in the UI
 
 Instance ids on the job page link to an instance page,
-`/jobs/<job>/instances/<id>`. It covers state, the current allocation and
+`/jobs/<namespace>/<job>/instances/<id>`. It covers state, the current allocation and
 node, storage, lineage, last stop, usage, the instance's snapshots, the
 instance actions, and a timeline of every event about the instance and the
 allocations that ran it. `legion events list --instance <id>` gives the same

@@ -3,6 +3,7 @@ import { allows, jobScope } from './acl'
 import type { JobTask } from './jobspec'
 import { memorySnapshotBlocker } from './jobspec'
 import type { Tone } from './status'
+import { jobPath } from './namespaces'
 
 /*
  * Instance lifecycle vocabulary for suspend, resume, fork, stop, and start
@@ -48,7 +49,7 @@ export const pendingOpLabel = (op: string | undefined): string | undefined => {
  * Stop causes the platform chose, which the instance row calls out. A user
  * stop, a rollout, or a suspend is expected and stays quiet.
  */
-const PLATFORM_STOPS = new Set(['node_pressure', 'preempted', 'node_lost', 'drain', 'reschedule'])
+const PLATFORM_STOPS = new Set(['failed', 'node_pressure', 'preempted', 'node_lost', 'drain', 'reschedule'])
 
 export const isPlatformStop = (stop: InstanceStop | undefined): stop is InstanceStop =>
   stop !== undefined && PLATFORM_STOPS.has(stop.cause)
@@ -83,6 +84,7 @@ export const stopCauseTone = (cause: string): Tone => {
     case 'node_pressure':
     case 'node_lost':
       return 'warn'
+    case 'failed':
     case 'preempted':
       return 'danger'
     default:
@@ -237,7 +239,7 @@ export const startBlocker = (instance: InstanceInfo, jobName: string): string | 
 
 /** The instance's own page. */
 export const instanceHref = (jobId: string, instanceId: string): string =>
-  `/jobs/${encodeURIComponent(jobId)}/instances/${encodeURIComponent(instanceId)}`
+  `${jobPath(jobId)}/instances/${encodeURIComponent(instanceId)}`
 
 /**
  * The volume id inside a storage handle. A handle is `{plugin}/{volume_id}`;

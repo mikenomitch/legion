@@ -84,6 +84,7 @@ import {
 } from '../../utils/usage'
 import { shortVolumeId, volumePinsPlacement, volumeStateTone } from '../../utils/volumes'
 import { ENVELOPE_COPY, envelopeServes, sessionsPerEnvelope } from '../../utils/sessions'
+import { jobIdOf, jobNamespace, jobPath, servicePath } from '../../utils/namespaces'
 
 /*
  * One allocation: one placement of one task of one job version on one worker.
@@ -116,7 +117,7 @@ const valueOf = <T,>(resource: Resource<T>): T | undefined => (resource.error ==
 
 const scrollToSection = (id: string) => document.getElementById(id)?.scrollIntoView({ behavior: 'smooth', block: 'start' })
 
-const jobHref = (job: string) => `/jobs/${encodeURIComponent(job)}`
+const jobHref = (job: string) => `${jobPath(job)}`
 const taskHref = (job: string, task: string) => `${jobHref(job)}/tasks/${encodeURIComponent(task)}`
 const instanceHref = (job: string, instance: string) => `${jobHref(job)}/instances/${encodeURIComponent(instance)}`
 const nodeHref = (node: string) => `/nodes/${encodeURIComponent(node)}`
@@ -563,7 +564,13 @@ function AllocationDetailContent() {
     retainOnError(
       async ([service]: readonly [string, number]) => ({
         service,
-        endpoints: (await orAbsent(managerClient.resolveService({ service, includeUnhealthy: true }), undefined))?.endpoints ?? [],
+        endpoints:
+          (
+            await orAbsent(
+              managerClient.resolveService({ service: jobIdOf(jobNamespace(jobId() ?? ''), service), includeUnhealthy: true }),
+              undefined,
+            )
+          )?.endpoints ?? [],
       }),
       ([service]) => service,
     ),
@@ -1199,7 +1206,7 @@ function AllocationDetailContent() {
                           Service{' '}
                           <A
                             class="normal-case tracking-normal text-brass-strong hover:underline"
-                            href={`/services/${encodeURIComponent(taskSpec()!.service!.name ?? taskSpec()!.name)}`}
+                            href={servicePath(jobNamespace(jobId() ?? ''), taskSpec()!.service!.name ?? taskSpec()!.name)}
                           >
                             {taskSpec()!.service!.name ?? taskSpec()!.name}
                           </A>

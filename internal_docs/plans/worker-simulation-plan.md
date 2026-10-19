@@ -2,7 +2,7 @@
 
 **Status: SHIPPED** — all three phases landed together (engine +
 campaign knobs + docs, 2026-07-30): `src/worker/simulate.rs`, CLI flags
-on `start worker`, `tests/worker_simulation.rs`,
+on `start worker`, `tests/integration/worker_simulation.rs`,
 `docs/worker-simulation.md`. Deliberately deferred: nothing from the
 plan; the open questions resolved as leaned (one pre-register, no
 kill-percent RPC).
@@ -25,7 +25,7 @@ paying a tokio runtime, its own gRPC channel, a fingerprint pass, a
 worker gRPC server, and a state directory (`src/worker/daemon.rs:125-289`
 starts all of it unconditionally). Hundreds per host is realistic;
 thousands is not. Benchmark code that inserts `NodeMsg` rows directly
-(`tests/benchmark_support/mod.rs:257-280`) bypasses the wire entirely, so
+(`tests/integration/benchmark_support/mod.rs:257-280`) bypasses the wire entirely, so
 it cannot exercise registration, heartbeat pressure, or liveness — the
 exact things the AWS campaign must measure.
 
@@ -72,7 +72,7 @@ existing `node list` output where sim nodes are visible.
   gRPC channels: pre-register, register, heartbeat, health-check report,
   allocation acks — the full worker-plane wire surface.
 - Fingerprints come from a profile file reusing the benchmark
-  `node_profiles` schema (`tests/benchmark_support/mod.rs:47-60`).
+  `node_profiles` schema (`tests/integration/benchmark_support/mod.rs:47-60`).
 - Dispatched allocations are accepted and acknowledged after a
   configurable delay (default: next heartbeat), and dropped when the
   manager stops desiring them. No task executes.
@@ -131,9 +131,9 @@ existing `node list` output where sim nodes are visible.
   `Unauthenticated` heartbeats trigger re-registration
   (`src/worker/daemon.rs:444-455`).
 - Benchmark profile schema: `NodeProfile { name, count, memory_gb,
-  cpus, attrs }` (`tests/benchmark_support/mod.rs:47-60`), fingerprint
+  cpus, attrs }` (`tests/integration/benchmark_support/mod.rs:47-60`), fingerprint
   shape `{ memory_total, cpus: { "cpu-N": { frequency } } }`
-  (`tests/benchmark_support/mod.rs:235-244`).
+  (`tests/integration/benchmark_support/mod.rs:235-244`).
 
 ## Proposed design
 
@@ -240,7 +240,7 @@ that sim nodes exercise the same manager paths as real ones.
   distribution of N (exact totals, largest-remainder rounding, 1-node
   and N<profiles edge cases); deterministic naming; ack bookkeeping
   (desired → acked after ready-after, undesired → dropped).
-- **Integration** (`tests/worker_simulation.rs`): serve a real
+- **Integration** (`tests/integration/worker_simulation.rs`): serve a real
   `ManagerDaemonService` (`src/manager/server.rs:1005`, ACLs disabled)
   over tonic on a loopback port; run a sim fleet against it; assert
   every node registers with profile-correct fingerprints and

@@ -601,7 +601,7 @@ the `build_upstream_endpoints` fast path, preserved.
 
 **ACL.** A new `AclResource::Net`, scoped by pool and namespace, so a pool's
 admin can set posture for their pool without cluster-wide write. `GetNetPolicy`
-is worker-plane. Every RPC lands in `tests/acl_endpoints.rs`.
+is worker-plane. Every RPC lands in `tests/integration/acl_endpoints.rs`.
 
 **Bootstrap.** `network.seedPolicies` in `configs/manager.ncl`, applied once
 at cluster init, so a fresh cluster is not open in the window before the first

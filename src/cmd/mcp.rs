@@ -104,6 +104,80 @@ fn job_list_schema() -> Value {
     })
 }
 
+fn namespace_name_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": { "name": { "type": "string", "description": "Namespace name." } },
+        "required": ["name"],
+        "additionalProperties": false
+    })
+}
+
+fn namespace_apply_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "name": { "type": "string", "description": "Namespace name (DNS label)." },
+            "description": { "type": "string" },
+            "meta": { "type": "object", "additionalProperties": { "type": "string" } },
+            "dry_run": { "type": "boolean", "description": "Validate and report reaching ACL rules without writing." }
+        },
+        "required": ["name"],
+        "additionalProperties": false
+    })
+}
+
+fn namespace_delete_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "name": { "type": "string", "description": "Namespace name." },
+            "cascade": { "type": "boolean", "description": "Stop and destroy everything in it first." },
+            "dry_run": { "type": "boolean", "description": "List what it holds without deleting." },
+            "idempotency_key": { "type": "string" }
+        },
+        "required": ["name"],
+        "additionalProperties": false
+    })
+}
+
+fn namespace_policy_name_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": { "name": { "type": "string", "description": "Namespace policy name." } },
+        "required": ["name"],
+        "additionalProperties": false
+    })
+}
+
+fn namespace_policy_apply_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "policy": {
+                "type": "object",
+                "description": "The policy object: { name, description?, namespaces: [glob], quota?: { <band>: { cpu? (MHz), memory? (MiB or \"64Gi\"), cores? } }, maxJobs?, maxNamespaces?, pools?: { allowed?: [glob], default? }, runtimes?: [glob], hostVolumes?: [glob] }. An unset allowlist allows everything; an empty one allows nothing."
+            },
+            "dry_run": { "type": "boolean", "description": "Validate and list what the policy would have refused among existing jobs and counts, without writing." },
+            "idempotency_key": { "type": "string" }
+        },
+        "required": ["policy"],
+        "additionalProperties": false
+    })
+}
+
+fn namespace_policy_delete_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "name": { "type": "string", "description": "Namespace policy name." },
+            "idempotency_key": { "type": "string" }
+        },
+        "required": ["name"],
+        "additionalProperties": false
+    })
+}
+
 fn name_arg_schema() -> Value {
     json!({
         "type": "object",
@@ -128,6 +202,54 @@ fn tool_defs() -> Vec<ToolDef> {
             description: "List jobs and their status, optionally only those in one status. The reply's statusCounts gives the per-status totals.",
             input_schema: job_list_schema,
             mutates: false,
+        },
+        ToolDef {
+            name: "legion_namespace_list",
+            description: "List the namespaces this token can see, with job counts. A namespace is a name and permission scope, not an isolation boundary.",
+            input_schema: empty_schema,
+            mutates: false,
+        },
+        ToolDef {
+            name: "legion_namespace_get",
+            description: "Show one namespace: what it holds by kind and, for tokens with acl:read, the ACL rules that reach it.",
+            input_schema: namespace_name_schema,
+            mutates: false,
+        },
+        ToolDef {
+            name: "legion_namespace_apply",
+            description: "Create a namespace, or update its description and meta. Names are DNS labels (lowercase letters, digits, '-'; at most 63). Set dry_run to see the ACL rules that would reach it without creating it.",
+            input_schema: namespace_apply_schema,
+            mutates: true,
+        },
+        ToolDef {
+            name: "legion_namespace_delete",
+            description: "Delete a namespace. Refused while it holds jobs, volumes or snapshots unless cascade is set, which stops and destroys them first (synchronously). dry_run lists the contents without deleting.",
+            input_schema: namespace_delete_schema,
+            mutates: true,
+        },
+        ToolDef {
+            name: "legion_namespace_policy_list",
+            description: "List namespace policies (needs acl:read). A policy selects namespaces by glob and governs their jobs: an aggregate quota per priority band across every matching namespace, maxJobs, maxNamespaces, allowed/default pools, allowed runtimes and host volumes. A tenant sees the limits that bind it in legion_namespace_get instead.",
+            input_schema: empty_schema,
+            mutates: false,
+        },
+        ToolDef {
+            name: "legion_namespace_policy_get",
+            description: "Show one namespace policy with its charged usage, in total and per matching namespace (needs acl:read). A job is charged, per band, the larger of what its spec declares and what its live allocations reserve.",
+            input_schema: namespace_policy_name_schema,
+            mutates: false,
+        },
+        ToolDef {
+            name: "legion_namespace_policy_apply",
+            description: "Create or replace a namespace policy (needs acl:write). Checks run at admission (submit, scale-out, instance create, namespace create) and never evict admitted work. Set dry_run first: it lists what the policy would have refused among existing jobs and counts.",
+            input_schema: namespace_policy_apply_schema,
+            mutates: true,
+        },
+        ToolDef {
+            name: "legion_namespace_policy_delete",
+            description: "Delete a namespace policy (needs acl:write).",
+            input_schema: namespace_policy_delete_schema,
+            mutates: true,
         },
         ToolDef {
             name: "legion_job_info",
@@ -541,7 +663,8 @@ fn tool_defs() -> Vec<ToolDef> {
                     "node_id": { "type": "string", "description": "Filter by exact node ID." },
                     "level": { "type": "string", "enum": ["info", "warn", "error"], "description": "Filter by severity." },
                     "instance_id": { "type": "string", "description": "Only events about this stateful instance: suspends, resumes, forks, snapshots, and its allocations' placements and failures." },
-                    "allocation_id": { "type": "integer", "description": "Filter by exact allocation ID." }
+                    "allocation_id": { "type": "integer", "description": "Filter by exact allocation ID." },
+                    "namespaces": { "type": "array", "items": { "type": "string" }, "description": "Only events of these namespaces (names or `*`-globs); omit for every event this token can see, cluster events included." }
                 },
                 "additionalProperties": false
             }),
@@ -1136,7 +1259,7 @@ fn tool_defs() -> Vec<ToolDef> {
             input_schema: || json!({
                 "type": "object",
                 "properties": {
-                    "jobs": { "type": "string", "description": "Glob over job names, e.g. agents-*." },
+                    "jobs": { "type": "string", "description": "Job pattern: agents-* (names in default) or agents/* (namespace-glob/name-glob). * alone never crosses a namespace." },
                     "public_key_pem": { "type": "string", "description": "P-256 public key, SPKI PEM." },
                     "name": { "type": "string", "description": "A label for people." },
                     "max_ttl": { "type": "string", "description": "Ceiling on a ticket's redeem window. Default exec.tickets.maxTtl." },
@@ -1252,7 +1375,7 @@ fn tools_list_result(allow_write: bool) -> Value {
             json!({
                 "name": tool.name,
                 "description": tool.description,
-                "inputSchema": (tool.input_schema)(),
+                "inputSchema": tool_schema(&tool),
             })
         })
         .collect::<Vec<_>>();
@@ -1291,29 +1414,133 @@ async fn dispatch_tool(name: &str, args: Value) -> Result<Value, String> {
         "legion_job_plan" => {
             let parsed_jobspec = str_arg(&args, "spec_json")?;
             let mut client = connect().await?;
-            grpc(client.plan_job(PlanJobRequest { parsed_jobspec })).await
+            grpc(client.plan_job(PlanJobRequest {
+                parsed_jobspec,
+                namespace: opt_str_arg(&args, "namespace"),
+            }))
+            .await
         }
         "legion_job_list" => {
             let status = opt_str_arg(&args, "status");
+            let namespaces = namespaces_arg(&args);
             let mut client = connect().await?;
             grpc(client.list_jobs(ListJobsRequest {
                 status,
+                namespaces,
                 ..Default::default()
             }))
             .await
         }
-        "legion_job_info" => {
+        "legion_namespace_list" => {
+            let mut client = connect().await?;
+            grpc(client.list_namespaces(crate::structs::ListNamespacesRequest {})).await
+        }
+        "legion_namespace_get" => {
             let name = str_arg(&args, "name")?;
+            let mut client = connect().await?;
+            grpc(client.get_namespace(crate::structs::GetNamespaceRequest { name })).await
+        }
+        "legion_namespace_apply" => {
+            let name = str_arg(&args, "name")?;
+            let meta = args
+                .get("meta")
+                .and_then(Value::as_object)
+                .map(|meta| {
+                    meta.iter()
+                        .filter_map(|(key, value)| {
+                            value.as_str().map(|value| (key.clone(), value.to_string()))
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            let mut client = connect().await?;
+            grpc(
+                client.apply_namespace(crate::structs::ApplyNamespaceRequest {
+                    namespace: Some(crate::structs::Namespace {
+                        name,
+                        description: opt_str_arg(&args, "description").unwrap_or_default(),
+                        meta,
+                        ..Default::default()
+                    }),
+                    dry_run: args
+                        .get("dry_run")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false),
+                }),
+            )
+            .await
+        }
+        "legion_namespace_delete" => {
+            let name = str_arg(&args, "name")?;
+            let mut client = connect().await?;
+            grpc(
+                client.delete_namespace(crate::structs::DeleteNamespaceRequest {
+                    name,
+                    cascade: args
+                        .get("cascade")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false),
+                    dry_run: args
+                        .get("dry_run")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false),
+                    idempotency_key: opt_str_arg(&args, "idempotency_key"),
+                }),
+            )
+            .await
+        }
+        "legion_namespace_policy_list" => {
+            let mut client = connect().await?;
+            grpc(client.list_namespace_policies(crate::structs::ListNamespacePoliciesRequest {}))
+                .await
+        }
+        "legion_namespace_policy_get" => {
+            let name = str_arg(&args, "name")?;
+            let mut client = connect().await?;
+            grpc(client.get_namespace_policy(crate::structs::GetNamespacePolicyRequest { name }))
+                .await
+        }
+        "legion_namespace_policy_apply" => {
+            let policy = args
+                .get("policy")
+                .filter(|policy| policy.is_object())
+                .ok_or_else(|| "missing object argument: policy".to_string())?;
+            let mut client = connect().await?;
+            grpc(
+                client.apply_namespace_policy(crate::structs::ApplyNamespacePolicyRequest {
+                    object_json: policy.to_string(),
+                    dry_run: args
+                        .get("dry_run")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false),
+                    idempotency_key: opt_str_arg(&args, "idempotency_key"),
+                }),
+            )
+            .await
+        }
+        "legion_namespace_policy_delete" => {
+            let name = str_arg(&args, "name")?;
+            let mut client = connect().await?;
+            grpc(
+                client.delete_namespace_policy(crate::structs::DeleteNamespacePolicyRequest {
+                    name,
+                    idempotency_key: opt_str_arg(&args, "idempotency_key"),
+                }),
+            )
+            .await
+        }
+        "legion_job_info" => {
+            let name = job_arg(&args, "name")?;
             let mut client = connect().await?;
             grpc(client.get_job_info(GetJobInfoRequest { name })).await
         }
         "legion_job_spec" => {
-            let name = str_arg(&args, "name")?;
+            let name = job_arg(&args, "name")?;
             let mut client = connect().await?;
             grpc(client.get_job_spec(GetJobSpecRequest { name })).await
         }
         "legion_rollout_list" => {
-            let job_id = opt_str_arg(&args, "job_id");
+            let job_id = opt_job_arg(&args, "job_id")?;
             let active_only = args
                 .get("active_only")
                 .and_then(Value::as_bool)
@@ -1322,6 +1549,7 @@ async fn dispatch_tool(name: &str, args: Value) -> Result<Value, String> {
             grpc(client.list_rollouts(ListRolloutsRequest {
                 job_id,
                 active_only,
+                namespaces: namespaces_arg(&args),
                 ..Default::default()
             }))
             .await
@@ -1447,7 +1675,7 @@ async fn dispatch_tool(name: &str, args: Value) -> Result<Value, String> {
             let mut client = connect().await?;
             grpc(
                 client.issue_boot_ticket(crate::structs::IssueBootTicketRequest {
-                    job: str_arg(&args, "job")?,
+                    job: job_arg(&args, "job")?,
                     task: str_arg(&args, "task")?,
                     pool: str_arg(&args, "pool")?,
                     instance_id: opt_str_arg(&args, "instance_id").unwrap_or_default(),
@@ -1466,7 +1694,7 @@ async fn dispatch_tool(name: &str, args: Value) -> Result<Value, String> {
             let mut client = connect().await?;
             grpc(
                 client.list_boot_tickets(crate::structs::ListBootTicketsRequest {
-                    job: opt_str_arg(&args, "job").unwrap_or_default(),
+                    job: opt_job_arg(&args, "job")?.unwrap_or_default(),
                 }),
             )
             .await
@@ -1483,12 +1711,12 @@ async fn dispatch_tool(name: &str, args: Value) -> Result<Value, String> {
             grpc(client.who_am_i(crate::structs::WhoAmIRequest {})).await
         }
         "legion_action_list" => {
-            let job = str_arg(&args, "job")?;
+            let job = job_arg(&args, "job")?;
             let mut client = connect().await?;
             grpc(client.list_job_actions(ListJobActionsRequest { job })).await
         }
         "legion_action_run" => {
-            let job = str_arg(&args, "job")?;
+            let job = job_arg(&args, "job")?;
             let action = str_arg(&args, "action")?;
             let params: std::collections::HashMap<String, String> = args
                 .get("params")
@@ -1500,7 +1728,7 @@ async fn dispatch_tool(name: &str, args: Value) -> Result<Value, String> {
                 })
                 .unwrap_or_default();
             let mut client = connect().await?;
-            let instance_id = opt_str_arg(&args, "instance_id").unwrap_or_default();
+            let instance_id = opt_instance_arg(&args, "instance_id")?.unwrap_or_default();
             let allocation_id = match args.get("allocation_id").and_then(Value::as_i64) {
                 Some(id) => id,
                 None if !instance_id.is_empty() => 0,
@@ -1539,7 +1767,7 @@ async fn dispatch_tool(name: &str, args: Value) -> Result<Value, String> {
                         .collect()
                 })
                 .unwrap_or_default();
-            let instance_id = opt_str_arg(&args, "instance_id").unwrap_or_default();
+            let instance_id = opt_instance_arg(&args, "instance_id")?.unwrap_or_default();
             let allocation_id = args
                 .get("allocation_id")
                 .and_then(Value::as_i64)
@@ -1592,7 +1820,7 @@ async fn dispatch_tool(name: &str, args: Value) -> Result<Value, String> {
             .await
         }
         "legion_exec_run" => {
-            let instance_id = opt_str_arg(&args, "instance_id").unwrap_or_default();
+            let instance_id = opt_instance_arg(&args, "instance_id")?.unwrap_or_default();
             let allocation_id = match args.get("allocation_id").and_then(Value::as_i64) {
                 Some(id) => id,
                 None if !instance_id.is_empty() => 0,
@@ -1626,7 +1854,7 @@ async fn dispatch_tool(name: &str, args: Value) -> Result<Value, String> {
             run_exec_oneshot(&mut client, start).await
         }
         "legion_instance_list" => {
-            let job_id = str_arg(&args, "job_id")?;
+            let job_id = job_arg(&args, "job_id")?;
             let group = opt_str_arg(&args, "group");
             let include_idle = args
                 .get("include_idle")
@@ -1656,7 +1884,7 @@ async fn dispatch_tool(name: &str, args: Value) -> Result<Value, String> {
             .await
         }
         "legion_instance_get" => {
-            let instance_id = str_arg(&args, "instance_id")?;
+            let instance_id = instance_arg(&args, "instance_id")?;
             let mut client = connect().await?;
             grpc(client.get_instance(GetInstanceRequest { instance_id })).await
         }
@@ -1664,10 +1892,11 @@ async fn dispatch_tool(name: &str, args: Value) -> Result<Value, String> {
             let mut client = connect().await?;
             grpc(
                 client.list_volumes(ListVolumesRequest {
-                    job_id: opt_str_arg(&args, "job_id"),
+                    namespaces: namespaces_arg(&args),
+                    job_id: opt_job_arg(&args, "job_id")?,
                     node_id: opt_str_arg(&args, "node_id"),
                     driver: opt_str_arg(&args, "driver"),
-                    instance_id: opt_str_arg(&args, "instance_id"),
+                    instance_id: opt_instance_arg(&args, "instance_id")?,
                     state: opt_str_arg(&args, "state"),
                     include_destroyed: args
                         .get("include_destroyed")
@@ -1700,8 +1929,9 @@ async fn dispatch_tool(name: &str, args: Value) -> Result<Value, String> {
         "legion_snapshot_list" => {
             let mut client = connect().await?;
             grpc(client.list_snapshots(crate::structs::ListSnapshotsRequest {
-                job_id: opt_str_arg(&args, "job_id"),
-                instance_id: opt_str_arg(&args, "instance_id"),
+                namespaces: namespaces_arg(&args),
+                job_id: opt_job_arg(&args, "job_id")?,
+                instance_id: opt_instance_arg(&args, "instance_id")?,
                 state: opt_str_arg(&args, "state"),
             }))
             .await
@@ -1711,12 +1941,12 @@ async fn dispatch_tool(name: &str, args: Value) -> Result<Value, String> {
             let mut client = connect().await?;
             grpc(client.get_snapshot(crate::structs::GetSnapshotRequest {
                 snapshot,
-                job_id: opt_str_arg(&args, "job_id"),
+                job_id: opt_job_arg(&args, "job_id")?,
             }))
             .await
         }
         "legion_snapshot_create" => {
-            let instance_id = str_arg(&args, "instance_id")?;
+            let instance_id = instance_arg(&args, "instance_id")?;
             let mut client = connect().await?;
             grpc(
                 client.create_snapshot(crate::structs::CreateSnapshotRequest {
@@ -1748,7 +1978,7 @@ async fn dispatch_tool(name: &str, args: Value) -> Result<Value, String> {
             let mut client = connect().await?;
             grpc(client.warm_snapshot(crate::structs::WarmSnapshotRequest {
                 snapshot,
-                job_id: opt_str_arg(&args, "job_id"),
+                job_id: opt_job_arg(&args, "job_id")?,
                 constraints,
                 idempotency_key: opt_str_arg(&args, "idempotency_key"),
             }))
@@ -1766,7 +1996,7 @@ async fn dispatch_tool(name: &str, args: Value) -> Result<Value, String> {
             .await
         }
         "legion_snapshot_restore" => {
-            let instance_id = str_arg(&args, "instance_id")?;
+            let instance_id = instance_arg(&args, "instance_id")?;
             let snapshot = str_arg(&args, "snapshot")?;
             let mut client = connect().await?;
             grpc(
@@ -1779,7 +2009,7 @@ async fn dispatch_tool(name: &str, args: Value) -> Result<Value, String> {
             .await
         }
         "legion_instance_create" => {
-            let job_id = str_arg(&args, "job_id")?;
+            let job_id = job_arg(&args, "job_id")?;
             let group = opt_str_arg(&args, "group");
             let task = opt_str_arg(&args, "task");
             let instance_id = opt_str_arg(&args, "instance_id");
@@ -1832,7 +2062,7 @@ async fn dispatch_tool(name: &str, args: Value) -> Result<Value, String> {
             }
         }
         "legion_session_nodes" => {
-            let job_id = str_arg(&args, "job_id")?;
+            let job_id = job_arg(&args, "job_id")?;
             let task_name = opt_str_arg(&args, "task").unwrap_or_default();
             let mut client = connect().await?;
             grpc(
@@ -1856,7 +2086,7 @@ async fn dispatch_tool(name: &str, args: Value) -> Result<Value, String> {
             .await
         }
         "legion_instance_stop" => {
-            let instance_id = str_arg(&args, "instance_id")?;
+            let instance_id = instance_arg(&args, "instance_id")?;
             let idempotency_key = opt_str_arg(&args, "idempotency_key");
             let mut client = connect().await?;
             grpc(client.stop_instance(StopInstanceRequest {
@@ -1866,7 +2096,7 @@ async fn dispatch_tool(name: &str, args: Value) -> Result<Value, String> {
             .await
         }
         "legion_instance_start" => {
-            let instance_id = str_arg(&args, "instance_id")?;
+            let instance_id = instance_arg(&args, "instance_id")?;
             let idempotency_key = opt_str_arg(&args, "idempotency_key");
             let cold = args
                 .get("cold")
@@ -1886,7 +2116,7 @@ async fn dispatch_tool(name: &str, args: Value) -> Result<Value, String> {
             .await
         }
         "legion_instance_suspend" => {
-            let instance_id = str_arg(&args, "instance_id")?;
+            let instance_id = instance_arg(&args, "instance_id")?;
             let checkpoint = opt_str_arg(&args, "checkpoint");
             let idempotency_key = opt_str_arg(&args, "idempotency_key");
             let mut client = connect().await?;
@@ -1898,7 +2128,7 @@ async fn dispatch_tool(name: &str, args: Value) -> Result<Value, String> {
             .await
         }
         "legion_instance_fork" => {
-            let instance_id = str_arg(&args, "instance_id")?;
+            let instance_id = instance_arg(&args, "instance_id")?;
             let count = args.get("count").and_then(Value::as_u64).unwrap_or(1) as u32;
             let spread = args.get("spread").and_then(Value::as_bool).unwrap_or(false);
             let mut client = connect().await?;
@@ -1912,7 +2142,7 @@ async fn dispatch_tool(name: &str, args: Value) -> Result<Value, String> {
             .await
         }
         "legion_snapshot_alias_set" => {
-            let job_id = str_arg(&args, "job_id")?;
+            let job_id = job_arg(&args, "job_id")?;
             let name = str_arg(&args, "name")?;
             let snapshot = str_arg(&args, "snapshot")?;
             let mut client = connect().await?;
@@ -1925,7 +2155,7 @@ async fn dispatch_tool(name: &str, args: Value) -> Result<Value, String> {
             .await
         }
         "legion_instance_destroy" => {
-            let instance_id = str_arg(&args, "instance_id")?;
+            let instance_id = instance_arg(&args, "instance_id")?;
             let idempotency_key = opt_str_arg(&args, "idempotency_key");
             let mut client = connect().await?;
             grpc(client.destroy_instance(DestroyInstanceRequest {
@@ -1935,7 +2165,7 @@ async fn dispatch_tool(name: &str, args: Value) -> Result<Value, String> {
             .await
         }
         "legion_instance_replace" => {
-            let instance_id = str_arg(&args, "instance_id")?;
+            let instance_id = instance_arg(&args, "instance_id")?;
             let idempotency_key = opt_str_arg(&args, "idempotency_key");
             let mut client = connect().await?;
             grpc(client.replace_instance(ReplaceInstanceRequest {
@@ -1952,17 +2182,28 @@ async fn dispatch_tool(name: &str, args: Value) -> Result<Value, String> {
                     .and_then(Value::as_u64)
                     .map(|limit| limit.min(u32::MAX as u64) as u32),
                 kind: opt_str_arg(&args, "kind"),
-                job_id: opt_str_arg(&args, "job_id"),
+                job_id: opt_job_arg(&args, "job_id")?,
                 node_id: opt_str_arg(&args, "node_id"),
                 level: opt_str_arg(&args, "level"),
-                instance_id: opt_str_arg(&args, "instance_id"),
+                instance_id: opt_instance_arg(&args, "instance_id")?,
                 allocation_id: args.get("allocation_id").and_then(Value::as_i64),
+                namespaces: args
+                    .get("namespaces")
+                    .and_then(Value::as_array)
+                    .map(|items| {
+                        items
+                            .iter()
+                            .filter_map(Value::as_str)
+                            .map(str::to_string)
+                            .collect()
+                    })
+                    .unwrap_or_default(),
             };
             let mut client = connect().await?;
             grpc(client.list_events(request)).await
         }
         "legion_job_logs" => {
-            let job = opt_str_arg(&args, "name").unwrap_or_default();
+            let job = opt_job_arg(&args, "name")?.unwrap_or_default();
             let allocation_id = args.get("allocation_id").and_then(Value::as_i64);
             if job.is_empty() && allocation_id.is_none() {
                 return Err("provide a job name or allocation_id".to_string());
@@ -1988,7 +2229,18 @@ async fn dispatch_tool(name: &str, args: Value) -> Result<Value, String> {
         }
         "legion_service_list" => {
             let mut client = connect().await?;
-            grpc(client.list_services(ListServicesRequest {})).await
+            let namespaces = args
+                .get("namespaces")
+                .and_then(Value::as_array)
+                .map(|items| {
+                    items
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .map(str::to_string)
+                        .collect()
+                })
+                .unwrap_or_else(|| vec!["*".to_string()]);
+            grpc(client.list_services(ListServicesRequest { namespaces })).await
         }
         "legion_service_edges" => {
             let service = args
@@ -2012,7 +2264,7 @@ async fn dispatch_tool(name: &str, args: Value) -> Result<Value, String> {
             grpc(client.list_net_policies(ListNetPoliciesRequest {})).await
         }
         "legion_net_policy_show" => {
-            let job_id = str_arg(&args, "job")?;
+            let job_id = job_arg(&args, "job")?;
             let task_name = args
                 .get("task")
                 .and_then(Value::as_str)
@@ -2032,7 +2284,7 @@ async fn dispatch_tool(name: &str, args: Value) -> Result<Value, String> {
             .await
         }
         "legion_net_policy_test" => {
-            let job_id = str_arg(&args, "job")?;
+            let job_id = job_arg(&args, "job")?;
             let get = |key: &str| {
                 args.get(key)
                     .and_then(Value::as_str)
@@ -2053,7 +2305,7 @@ async fn dispatch_tool(name: &str, args: Value) -> Result<Value, String> {
             .await
         }
         "legion_net_doctor" => {
-            let job_id = str_arg(&args, "job")?;
+            let job_id = job_arg(&args, "job")?;
             let get = |key: &str| {
                 args.get(key)
                     .and_then(Value::as_str)
@@ -2245,6 +2497,7 @@ async fn dispatch_tool(name: &str, args: Value) -> Result<Value, String> {
                 name,
                 version: opt_u32_arg(&args, "version"),
                 variables_json: variables_arg(&args),
+                namespace: opt_str_arg(&args, "namespace"),
             }))
             .await
         }
@@ -2263,6 +2516,7 @@ async fn dispatch_tool(name: &str, args: Value) -> Result<Value, String> {
                 priority: None,
                 force_reschedule,
                 idempotency_key,
+                namespace: opt_str_arg(&args, "namespace"),
             }))
             .await
         }
@@ -2295,11 +2549,12 @@ async fn dispatch_tool(name: &str, args: Value) -> Result<Value, String> {
                 priority: None,
                 force_reschedule,
                 idempotency_key,
+                namespace: opt_str_arg(&args, "namespace"),
             }))
             .await
         }
         "legion_job_stop" => {
-            let name = str_arg(&args, "name")?;
+            let name = job_arg(&args, "name")?;
             let idempotency_key = opt_str_arg(&args, "idempotency_key");
             let mut client = connect().await?;
             grpc(client.stop_job(StopJobRequest {
@@ -2310,7 +2565,7 @@ async fn dispatch_tool(name: &str, args: Value) -> Result<Value, String> {
             .await
         }
         "legion_job_scale" => {
-            let name = str_arg(&args, "name")?;
+            let name = job_arg(&args, "name")?;
             let count = args
                 .get("count")
                 .and_then(|value| value.as_u64())
@@ -2332,13 +2587,13 @@ async fn dispatch_tool(name: &str, args: Value) -> Result<Value, String> {
             .await
         }
         "legion_job_scale_status" => {
-            let name = str_arg(&args, "name")?;
+            let name = job_arg(&args, "name")?;
             let mut client = connect().await?;
             grpc(client.get_job_scale_status(crate::structs::GetJobScaleStatusRequest { name }))
                 .await
         }
         "legion_job_destroy" => {
-            let name = str_arg(&args, "name")?;
+            let name = job_arg(&args, "name")?;
             let idempotency_key = opt_str_arg(&args, "idempotency_key");
             let mut client = connect().await?;
             grpc(client.destroy_job(DestroyJobRequest {
@@ -2513,6 +2768,126 @@ fn opt_str_arg(args: &Value, key: &str) -> Option<String> {
         .and_then(Value::as_str)
         .filter(|value| !value.is_empty())
         .map(str::to_string)
+}
+
+/// A job argument resolved against the tool's optional `namespace`
+/// argument: `web` (in `namespace`, else `default`) or `payments-prod/web`.
+fn job_arg(args: &Value, key: &str) -> Result<String, String> {
+    let raw = str_arg(args, key)?;
+    crate::structs::namespace::resolve_job_ref(&raw, opt_str_arg(args, "namespace").as_deref())
+}
+
+/// An instance argument resolved like a job argument: `user-42` (in
+/// `namespace`, else the namespace of a qualified `job`, else `default`),
+/// `payments/user-42`, or a minted id as written.
+fn instance_arg(args: &Value, key: &str) -> Result<String, String> {
+    let raw = str_arg(args, key)?;
+    let active = opt_str_arg(args, "namespace").or_else(|| {
+        ["job", "job_id"].iter().find_map(|job| {
+            opt_str_arg(args, job).and_then(|job| {
+                job.split_once('/')
+                    .map(|(namespace, _)| namespace.to_string())
+            })
+        })
+    });
+    crate::structs::namespace::resolve_instance_ref(&raw, active.as_deref())
+}
+
+fn opt_instance_arg(args: &Value, key: &str) -> Result<Option<String>, String> {
+    match opt_str_arg(args, key) {
+        Some(_) => instance_arg(args, key).map(Some),
+        None => Ok(None),
+    }
+}
+
+fn opt_job_arg(args: &Value, key: &str) -> Result<Option<String>, String> {
+    match opt_str_arg(args, key) {
+        Some(raw) => crate::structs::namespace::resolve_job_ref(
+            &raw,
+            opt_str_arg(args, "namespace").as_deref(),
+        )
+        .map(Some),
+        None => Ok(None),
+    }
+}
+
+/// The `namespaces` array argument of a list tool (empty means `default`).
+fn namespaces_arg(args: &Value) -> Vec<String> {
+    args.get("namespaces")
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// List tools that take a `namespaces` selection.
+const NAMESPACE_LIST_TOOLS: &[&str] = &[
+    "legion_job_list",
+    "legion_rollout_list",
+    "legion_volume_list",
+    "legion_snapshot_list",
+];
+
+/// Tools whose `name` argument is a job (the rest use `job` / `job_id`).
+const JOB_NAME_TOOLS: &[&str] = &[
+    "legion_job_info",
+    "legion_job_logs",
+    "legion_job_spec",
+    "legion_job_stop",
+    "legion_job_scale",
+    "legion_job_scale_status",
+    "legion_job_destroy",
+];
+
+/// Tools that submit a spec into a namespace.
+const SPEC_NAMESPACE_TOOLS: &[&str] = &[
+    "legion_job_run",
+    "legion_job_plan",
+    "legion_template_render",
+    "legion_template_run",
+];
+
+/// A tool's input schema, with the namespace arguments every job-addressing
+/// tool takes (docs/namespaces.md): `namespace` on tools that name one job
+/// or submit one spec, `namespaces` on the job list.
+fn tool_schema(tool: &ToolDef) -> Value {
+    let mut schema = (tool.input_schema)();
+    let Some(properties) = schema.get_mut("properties").and_then(Value::as_object_mut) else {
+        return schema;
+    };
+    if NAMESPACE_LIST_TOOLS.contains(&tool.name) {
+        properties.insert(
+            "namespaces".into(),
+            json!({
+                "type": "array",
+                "items": { "type": "string" },
+                "description": "Namespaces to list: names or `*`-globs. Omit for `default`; [\"*\"] for every namespace this token can read. Ignored when a job is named."
+            }),
+        );
+        if tool.name == "legion_job_list" {
+            return schema;
+        }
+    }
+    let names_a_job = JOB_NAME_TOOLS.contains(&tool.name)
+        || SPEC_NAMESPACE_TOOLS.contains(&tool.name)
+        || properties.contains_key("job")
+        || properties.contains_key("job_id")
+        || properties.contains_key("instance_id");
+    if names_a_job && !properties.contains_key("namespace") {
+        properties.insert(
+            "namespace".into(),
+            json!({
+                "type": "string",
+                "description": "Namespace the job or instance lives in (default `default`). A job or instance argument may instead be qualified, `namespace/name`; the two must agree. Minted instance ids are cluster-unique and never qualified."
+            }),
+        );
+    }
+    schema
 }
 
 fn opt_u32_arg(args: &Value, key: &str) -> Option<u32> {

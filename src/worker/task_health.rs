@@ -355,8 +355,7 @@ async fn run_health_monitor(
 
                 let now = Instant::now();
                 if !result.ok {
-                    if matches!(result.check_type, TaskCheckType::Health)
-                        && now.duration_since(start_time) < check_state.runtime.boot_grace_time {
+                    if now.duration_since(start_time) < uncounted_after_start(&check_state.runtime) {
                         continue;
                     }
 
@@ -405,6 +404,22 @@ async fn run_health_monitor(
                 }
             }
         }
+    }
+}
+
+/// How long after a (re)start a failed result of this check is not counted.
+///
+/// A `health` check gets its `boot_grace_time`. A `boot` check gets one
+/// `every`: its first tick fires the moment the task starts, before the
+/// workload could have bound its port, so with `unhealthy_after_count = 1`
+/// that tick alone used to mark the task unhealthy. A pass in that window
+/// still counts (startup probes catch an early one); only the failure is
+/// forgiven. A readiness check never changes health, so it gets nothing.
+fn uncounted_after_start(runtime: &CheckRuntime) -> Duration {
+    match runtime.check.check_type {
+        TaskCheckType::Health => runtime.boot_grace_time,
+        TaskCheckType::Boot => runtime.check.every.max(runtime.boot_grace_time),
+        TaskCheckType::Readiness => Duration::ZERO,
     }
 }
 
@@ -574,5 +589,41 @@ fn run_exec_check(runtime: &CheckRuntime) -> Result<(), String> {
         Ok(())
     } else {
         Err(format!("exec check failed with status {status}"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn runtime(check_type: &str, every: &str, boot_grace_time: Duration) -> CheckRuntime {
+        let check: TaskCheck = serde_json::from_value(serde_json::json!({
+            "type": check_type,
+            "kind": "tcp",
+            "port": 8080,
+            "every": every,
+        }))
+        .expect("check");
+        CheckRuntime {
+            name: check.default_name(),
+            check,
+            boot_grace_time,
+            resolved_port: Some(8080),
+        }
+    }
+
+    #[test]
+    fn a_boot_check_failure_in_its_first_every_is_not_counted_test() {
+        // The first boot tick runs at start; one `every` covers it.
+        let boot = runtime("boot", "5s", Duration::ZERO);
+        assert_eq!(uncounted_after_start(&boot), Duration::from_secs(5));
+        // A longer explicit grace wins.
+        let boot = runtime("boot", "5s", Duration::from_secs(30));
+        assert_eq!(uncounted_after_start(&boot), Duration::from_secs(30));
+        // Health checks keep exactly their boot grace.
+        let health = runtime("health", "5s", Duration::from_secs(1));
+        assert_eq!(uncounted_after_start(&health), Duration::from_secs(1));
+        let readiness = runtime("readiness", "5s", Duration::from_secs(1));
+        assert_eq!(uncounted_after_start(&readiness), Duration::ZERO);
     }
 }

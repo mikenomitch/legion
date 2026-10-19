@@ -2243,6 +2243,18 @@ async fn start_heartbeats(
     }
 }
 
+/// A failure report as the task manager queues it, from the copy a
+/// heartbeat sent.
+fn failure_report(
+    failure: crate::structs::FailedAllocation,
+) -> crate::worker::task_manager::FailedAllocationReport {
+    crate::worker::task_manager::FailedAllocationReport {
+        allocation_id: failure.allocation_id,
+        reason: failure.reason,
+        artifact_states: failure.artifact_states,
+    }
+}
+
 /// One heartbeat round-trip: report running/failed allocations, then
 /// reconcile against the manager's desired set.
 // Same reason as `start_heartbeats`: each per-heartbeat subsystem is threaded
@@ -2440,18 +2452,19 @@ async fn heartbeat_tick(
         // A gated allocation whose capture is not ready has no network: say
         // so in its health, so rollouts and `doctor` see it rather than a
         // task that looks fine and cannot reach anything.
+        // A capture that recovers puts the allocation's own health back.
         {
             let mut manager = task_manager.lock().expect("task manager");
             for status in &net_status {
-                if status.mode == crate::structs::netpolicy::MODE_GATED
-                    && !status.capture_ready
-                    && manager.has_allocation(status.allocation_id)
+                if status.mode != crate::structs::netpolicy::MODE_GATED
+                    || !manager.has_allocation(status.allocation_id)
                 {
-                    manager.set_allocation_health(
-                        status.allocation_id,
-                        false,
-                        format!("net_capture_unavailable: {}", status.problems.join("; ")),
-                    );
+                    continue;
+                }
+                if status.capture_ready {
+                    manager.mark_net_capture_ready(status.allocation_id);
+                } else {
+                    manager.mark_net_capture_unavailable(status.allocation_id, &status.problems);
                 }
             }
         }
@@ -2565,9 +2578,7 @@ async fn heartbeat_tick(
                 // connection: put them back so the next successful
                 // heartbeat still tells the manager about them.
                 let mut manager = task_manager.lock().expect("task manager");
-                for failure in failures_for_redrive {
-                    manager.record_failure(failure.allocation_id, failure.reason);
-                }
+                manager.requeue_failures(failures_for_redrive.into_iter().map(failure_report));
                 // Same for terminal outcomes: a batch task's completion lost
                 // to a dead connection would leave the job "running" forever.
                 manager.requeue_terminations(terminations_for_redrive);
@@ -2598,14 +2609,26 @@ async fn heartbeat_tick(
         let mut reply = response.into_inner();
         served_interval = reply.next_interval_seconds;
         // Terminal reports the manager answered but could not record go out
-        // again next beat: a batch task's dependents wait on them.
-        task_manager
-            .lock()
-            .expect("task manager")
-            .requeue_unrecorded_terminations(
+        // again next beat: a batch task's dependents wait on them. So do
+        // failure reports: nothing replaces a failed allocation until one is
+        // recorded.
+        {
+            let mut manager = task_manager.lock().expect("task manager");
+            manager.requeue_unrecorded_terminations(
                 terminations_for_redrive,
                 &reply.retry_terminated_allocations,
             );
+            manager.requeue_failures(
+                failures_for_redrive
+                    .into_iter()
+                    .filter(|failure| {
+                        reply
+                            .retry_failed_allocations
+                            .contains(&failure.allocation_id)
+                    })
+                    .map(failure_report),
+            );
+        }
         // Before the reconcile below reads this reply's desired set: an
         // answer is newer than any payload a lagging replica built.
         if !reply.envelope_resizes.is_empty() {

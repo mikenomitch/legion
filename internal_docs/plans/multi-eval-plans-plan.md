@@ -268,8 +268,8 @@ into the one it took.
   for a submit's, an update's, and a no-op reschedule's eval, on both
   topologies.
 - **Regression**: `tests/raft_lifecycle_ops.rs` (idle keyed lifecycle,
-  unchanged at 8), `tests/blocked_evals.rs`, `tests/eval_loop.rs`,
-  `tests/plan_contention.rs`, and the full suite.
+  unchanged at 8), `tests/integration/blocked_evals.rs`, `tests/integration/eval_loop.rs`,
+  `tests/integration/plan_contention.rs`, and the full suite.
 - **Load**: `legion-loadgen --mode instances` against a release manager,
   before and after, with the lane metrics (§12).
 

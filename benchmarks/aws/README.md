@@ -108,9 +108,13 @@ scripts/bootstrap-operator-box.sh start
 Two teardowns, in this order:
 
 ```bash
-scripts/bootstrap-operator-box.sh ssh 'cd ~/legion/benchmarks/aws && scripts/teardown.sh'
+scripts/bootstrap-operator-box.sh ssh 'cd ~/legion/benchmarks/aws && scripts/teardown.sh --yes'
 scripts/bootstrap-operator-box.sh destroy
 ```
+
+`teardown.sh` asks before destroying anything. With no terminal to ask on
+(a command over `ssh`, `nohup`, `< /dev/null`) it refuses with exit 2 and
+says so, rather than guessing, so an unattended teardown needs `--yes`.
 
 `destroy` warns if rig instances are still up, because the box holds the
 only copy of their terraform state.
@@ -407,8 +411,8 @@ cargo bench --bench scheduler_bench -- candidate_construction
 cargo bench --bench scheduler_bench -- plan_under_fill
 LEGION_BENCH_SCALING_NODES=1000,10000,50000 cargo bench --bench scheduler_bench -- plan_fleet_scaling
 cargo bench --bench eval_critical_path_bench
-cargo test --release --test plan_contention -- --ignored --nocapture
-LEGION_BENCH_BACKENDS=local_disk,raft1,raft3 cargo test --release --test scheduler_scale_benchmark -- --ignored --nocapture
+cargo test --release --test integration plan_contention:: -- --ignored --nocapture
+LEGION_BENCH_BACKENDS=local_disk,raft1,raft3 cargo test --release --test integration scheduler_scale_benchmark:: -- --ignored --nocapture
 ```
 
 **Signal:** plan time grows no faster than linearly in nodes. Contention
@@ -426,7 +430,7 @@ one commit, and how many raft entries each lifecycle step takes.
 **Tool and command:**
 
 ```bash
-cargo test --release --test raft_perf_smoke --locked -- --ignored --nocapture
+cargo test --release --test integration raft_perf_smoke:: --locked -- --ignored --nocapture
 cargo test --release --test raft_lifecycle_ops -- --nocapture       # entries per keyed lifecycle stage, asserted exactly
 benchmarks/aws/experiments/heartbeat-commit-probe.sh                 # on the 3-manager rig
 ```
@@ -450,7 +454,7 @@ with a large desired set per node.
 **Tool and command:**
 
 ```bash
-LEGION_MEASURE_STREAM_ALLOCS=10000 cargo test --release --test work_stream -- a_streaming_heartbeat --nocapture
+LEGION_MEASURE_STREAM_ALLOCS=10000 cargo test --release --test integration work_stream::a_streaming_heartbeat -- --nocapture
 ```
 
 On a live cluster, read `legion_dispatch_send_seconds` with a simulated
@@ -468,7 +472,7 @@ degrades past that.
 
 ```bash
 LEGION_HEARTBEAT_NODES=1000,5000,10000 LEGION_HEARTBEAT_THREADS=8 LEGION_HEARTBEAT_SECONDS=10 \
-  cargo test --release --test heartbeat_scale_benchmark -- --ignored --nocapture
+  cargo test --release --test integration heartbeat_scale_benchmark:: -- --ignored --nocapture
 legion start worker $TOKEN --simulate 2000 --register-rate 200     # a live manager
 ```
 
@@ -481,7 +485,7 @@ many nodes it can carry; also record `legion_heartbeats_total`,
 **Bar:** the sustainable-nodes estimate exceeds the target fleet size with
 headroom. With 1,000 allocations per node (the dense-sandbox case), the
 cost of one steady beat comes from
-`LEGION_MEASURE_HEARTBEAT_ALLOCS=1000,10000 cargo test --release --test instance_scale_measure -- --ignored --nocapture`.
+`LEGION_MEASURE_HEARTBEAT_ALLOCS=1000,10000 cargo test --release --test integration instance_scale_measure:: -- --ignored --nocapture`.
 
 ### 5. ListInstances and session listing at large counts
 
@@ -492,8 +496,8 @@ creates/s, suspended rows, and churn of unnamed instances) is measured
 in-process:
 
 ```bash
-LEGION_MEASURE_INSTANCES=100000,1000000 cargo test --release --test instance_scale_measure -- --ignored --nocapture
-LEGION_MEASURE_SUSPENDED=50000 LEGION_MEASURE_CHURN=1000000 cargo test --release --test instance_scale_measure -- --ignored --nocapture
+LEGION_MEASURE_INSTANCES=100000,1000000 cargo test --release --test integration instance_scale_measure:: -- --ignored --nocapture
+LEGION_MEASURE_SUSPENDED=50000 LEGION_MEASURE_CHURN=1000000 cargo test --release --test integration instance_scale_measure:: -- --ignored --nocapture
 ```
 
 For list latency, hold instances resident on a simulated fleet with the
@@ -526,7 +530,7 @@ message limit at around 20k sessions per node.
 **Tool and command:**
 
 ```bash
-cargo test --release --test session_integration -- session_start_latency_measure --ignored --nocapture
+cargo test --release --test integration session_integration::session_start_latency_measure -- --ignored --nocapture
 ```
 
 That covers the control plane's share: pick a node, send the start, and

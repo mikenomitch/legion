@@ -7,6 +7,8 @@ import type { SchedulerEvent } from '../gen/legion_pb'
 import { managerClient } from '../grpcClient'
 import { Badge, Button, Dot, EmptyState, Icon, RelativeTime, SectionCard, cx, inputClass, selectClass } from '../components/ui'
 import { statusTone, type Tone } from '../utils/status'
+import { jobPath } from '../utils/namespaces'
+import { ALL_NAMESPACES, selectionIncludes, useNamespaceSelection } from '../components/NamespaceSwitcher'
 
 const MAX_BUFFERED_EVENTS = 750
 const RECONNECT_DELAY_MS = 2000
@@ -27,6 +29,7 @@ const eventCategory = (kind: string): string => kind.split('.')[0] ?? kind
 
 function EventsContent() {
   const [events, setEvents] = createSignal<SchedulerEvent[]>([])
+  const selection = useNamespaceSelection()
   const [pendingWhilePaused, setPendingWhilePaused] = createSignal<SchedulerEvent[]>([])
   const [paused, setPaused] = createSignal(false)
   const [connection, setConnection] = createSignal<ConnectionState>('connecting')
@@ -108,8 +111,14 @@ function EventsContent() {
     const category = categoryFilter()
     const level = levelFilter()
     const query = search().trim().toLowerCase()
+    // The All view shows cluster events too; a namespace selection shows only
+    // events about its namespaces' jobs. The manager already filtered to
+    // what this identity may see.
+    const namespaces = selection()
+    const everything = namespaces.length === 1 && namespaces[0] === ALL_NAMESPACES
 
     const matches = events().filter((event) => {
+      if (!everything && !(event.namespace && selectionIncludes(namespaces, event.namespace))) return false
       if (category !== 'all' && eventCategory(event.kind) !== category) return false
       if (level !== 'all' && event.level !== level) return false
       if (query) {
@@ -210,7 +219,7 @@ function EventsContent() {
                     <span class="min-w-0 flex-1 truncate text-ink">{event.message}</span>
                     <Show when={event.jobId}>
                       <A
-                        href={`/jobs/${encodeURIComponent(event.jobId!)}`}
+                        href={`${jobPath(event.jobId!)}`}
                         class="rounded bg-surface2 px-1.5 py-0.5 font-mono text-2xs text-muted hover:text-brass-strong"
                         onClick={(clickEvent) => clickEvent.stopPropagation()}
                       >

@@ -457,6 +457,95 @@ pub fn output_with_timeout(
     })
 }
 
+/// Runs an external helper once the way Legion's `exec` providers do (the
+/// KV root key, the cluster CA): one JSON document on stdin, one JSON
+/// document read from stdout, killed after `timeout`. A non-zero exit, a
+/// timeout, or anything but JSON on stdout is an error naming `what` and the
+/// program, with the helper's stderr.
+pub fn run_json_command(
+    what: &str,
+    command: &[String],
+    request: &serde_json::Value,
+    timeout: std::time::Duration,
+) -> R<serde_json::Value> {
+    use anyhow::{anyhow, bail, Context};
+    use std::io::{Read, Write};
+    use std::process::{Command, Stdio};
+
+    let program = command
+        .first()
+        .ok_or_else(|| anyhow!("the {what} has an empty command"))?;
+    let mut child = Command::new(program)
+        .args(&command[1..])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .with_context(|| format!("failed starting {what} `{program}`"))?;
+    {
+        let mut stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| anyhow!("{what} stdin unavailable"))?;
+        // A helper that exits without reading its request closes the pipe
+        // first; its exit status below is the error worth reporting, not
+        // the broken pipe.
+        let written = stdin
+            .write_all(request.to_string().as_bytes())
+            .and_then(|()| stdin.write_all(b"\n"));
+        match written {
+            Ok(()) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::BrokenPipe => {}
+            Err(err) => return Err(err.into()),
+        }
+    }
+    let mut stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| anyhow!("{what} stdout unavailable"))?;
+    let mut stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| anyhow!("{what} stderr unavailable"))?;
+    let out_reader = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        let _ = stdout.read_to_end(&mut buf);
+        buf
+    });
+    let err_reader = std::thread::spawn(move || {
+        let mut buf = String::new();
+        let _ = stderr.read_to_string(&mut buf);
+        buf
+    });
+    let deadline = std::time::Instant::now() + timeout;
+    let status = loop {
+        if let Some(status) = child.try_wait()? {
+            break status;
+        }
+        if std::time::Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            bail!(
+                "{what} `{program}` did not answer within {}",
+                humantime::format_duration(timeout)
+            );
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    };
+    let stdout = out_reader.join().unwrap_or_default();
+    let stderr = err_reader.join().unwrap_or_default();
+    if !status.success() {
+        bail!("{what} `{program}` exited with {status}: {}", stderr.trim());
+    }
+    let reply: serde_json::Value = serde_json::from_slice(&stdout).with_context(|| {
+        format!(
+            "{what} `{program}` printed something other than a JSON object: {}",
+            String::from_utf8_lossy(&stdout).trim()
+        )
+    })?;
+    Ok(reply)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -605,93 +694,4 @@ mod tests {
             build.join("plugins")
         );
     }
-}
-
-/// Runs an external helper once the way Legion's `exec` providers do (the
-/// KV root key, the cluster CA): one JSON document on stdin, one JSON
-/// document read from stdout, killed after `timeout`. A non-zero exit, a
-/// timeout, or anything but JSON on stdout is an error naming `what` and the
-/// program, with the helper's stderr.
-pub fn run_json_command(
-    what: &str,
-    command: &[String],
-    request: &serde_json::Value,
-    timeout: std::time::Duration,
-) -> R<serde_json::Value> {
-    use anyhow::{anyhow, bail, Context};
-    use std::io::{Read, Write};
-    use std::process::{Command, Stdio};
-
-    let program = command
-        .first()
-        .ok_or_else(|| anyhow!("the {what} has an empty command"))?;
-    let mut child = Command::new(program)
-        .args(&command[1..])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .with_context(|| format!("failed starting {what} `{program}`"))?;
-    {
-        let mut stdin = child
-            .stdin
-            .take()
-            .ok_or_else(|| anyhow!("{what} stdin unavailable"))?;
-        // A helper that exits without reading its request closes the pipe
-        // first; its exit status below is the error worth reporting, not
-        // the broken pipe.
-        let written = stdin
-            .write_all(request.to_string().as_bytes())
-            .and_then(|()| stdin.write_all(b"\n"));
-        match written {
-            Ok(()) => {}
-            Err(err) if err.kind() == std::io::ErrorKind::BrokenPipe => {}
-            Err(err) => return Err(err.into()),
-        }
-    }
-    let mut stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| anyhow!("{what} stdout unavailable"))?;
-    let mut stderr = child
-        .stderr
-        .take()
-        .ok_or_else(|| anyhow!("{what} stderr unavailable"))?;
-    let out_reader = std::thread::spawn(move || {
-        let mut buf = Vec::new();
-        let _ = stdout.read_to_end(&mut buf);
-        buf
-    });
-    let err_reader = std::thread::spawn(move || {
-        let mut buf = String::new();
-        let _ = stderr.read_to_string(&mut buf);
-        buf
-    });
-    let deadline = std::time::Instant::now() + timeout;
-    let status = loop {
-        if let Some(status) = child.try_wait()? {
-            break status;
-        }
-        if std::time::Instant::now() >= deadline {
-            let _ = child.kill();
-            let _ = child.wait();
-            bail!(
-                "{what} `{program}` did not answer within {}",
-                humantime::format_duration(timeout)
-            );
-        }
-        std::thread::sleep(std::time::Duration::from_millis(10));
-    };
-    let stdout = out_reader.join().unwrap_or_default();
-    let stderr = err_reader.join().unwrap_or_default();
-    if !status.success() {
-        bail!("{what} `{program}` exited with {status}: {}", stderr.trim());
-    }
-    let reply: serde_json::Value = serde_json::from_slice(&stdout).with_context(|| {
-        format!(
-            "{what} `{program}` printed something other than a JSON object: {}",
-            String::from_utf8_lossy(&stdout).trim()
-        )
-    })?;
-    Ok(reply)
 }

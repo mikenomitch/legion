@@ -20,7 +20,7 @@ It is available from the CLI, the MCP server, the UI, and raw gRPC.
 | `eval.blocked` | warn | An eval's plan found no room, so the eval waits blocked instead of failing. Metadata carries the blocking `key` (`class:pool=...`, `node:<id>`, `escaped`) and the `detail` (task, cpu, memory, message, and for a [gang](gang-scheduling.md) short of its quorum a `gang` report: desired, min, running, placeable, eligible nodes). See [Blocked evals](scheduler-and-eval-loop.md#blocked-evals). |
 | `eval.unblocked` | info | A blocked eval is back in the pending queue. Metadata carries the `key` and the `cause`: `register`, `node`, `ready`, `freed` (capacity on the node the event names), `missed` (capacity appeared while the eval was still running, so it never blocked), `startup`, or `timeout` (a [gang](gang-scheduling.md#placement-timeout) past its `placementTimeout`, woken for its last attempt). |
 | `allocation.placed` | info | A plan was applied. One event per apply, with placement details in metadata, including `candidateRank` per placement (0 = first choice) and a `fallbacks` count. |
-| `allocation.removed` | info/warn | Allocations were removed (job stop/update: info, node loss: warn). Metadata carries `cause`: `stop`, `update`, `drain`, `reschedule`, `destroy`, `node_lost`, `scale_in`, `preempted`, `node_pressure`, `restore`, or `suspended`. It is omitted when no cause was recorded. See [Graceful Stop](graceful-stop.md). |
+| `allocation.removed` | info/warn | Allocations were removed (job stop/update: info, node loss: warn). Metadata carries `cause`: `stop`, `update`, `drain`, `reschedule`, `destroy`, `node_lost`, `scale_in`, `preempted`, `node_pressure`, `restore`, `suspended`, `gang`, or `failed`. It is omitted when no cause was recorded. See [Graceful Stop](graceful-stop.md). |
 | `allocation.stopping` | info | Allocations entered their grace window. Metadata carries `cause`, `maxGraceSeconds`, and per-allocation `graceSeconds`. The window is the manager's expectation. The worker's clock starts when it delivers the signal. See [Graceful Stop](graceful-stop.md). |
 | `allocation.preempted` | warn | Allocations were displaced to make room for higher-band work. Metadata carries the victim's `band` plus `preemptorJob` and `preemptorBand`, which link the victim to the preemptor. One event per victim job. See [Preemption and Eviction](preemption-and-eviction.md). |
 | `allocation.preempt_planned` | info | `preemption.mode = "observe"` only: the victim selection ran and committed nothing. Metadata lists the `victims` enforce mode would have taken. |
@@ -72,6 +72,7 @@ It is available from the CLI, the MCP server, the UI, and raw gRPC.
 | `job.gang_member_lost` | info/warn | A [gang](gang-scheduling.md#when-a-member-is-lost) member was lost (it failed, its node was lost or drained, or memory pressure evicted it), and what that did to the gang. Info when the member is replaced alone; warn for a restart or a failed job. Metadata: `task`, `allocationId`, `cause`, `action` (`replace`, `restart`, `fail`), `running` (members still running after the loss), `min` (the quorum), `stopped` (allocations the action stopped). |
 | `job.gang_timeout` | error | A gang did not reach its quorum within its [`placementTimeout`](gang-scheduling.md#placement-timeout), so its job was failed and any members still running were stopped. Metadata: `task`, `placementTimeoutSeconds`, `waitedSeconds`, `stopped`. |
 | `job.failed` | error | A job was marked failed (for example, move limit exceeded, which `allocation.reschedule_exhausted` explains). |
+| `job.kv_render_refused` | warn | A watched KV change re-rendered a job's `templateKv` template into lookups of keys the job did not name when it was submitted, so the job kept its last render ([KV store](kv-store.md)). Metadata: `keys`, the keys it would have read. Resubmitting the job checks them against the submitter. |
 | `scale.applied` | info | A count override was applied ([Scaling Jobs](autoscaling.md)). Previous and new counts, source, and reason are in metadata. |
 | `scale.deferred` | info | A scale-in was recorded but deferred until the active rollout completes. |
 | `scale.reset` | info | An override was dropped (an explicit `--reset`, or a resubmit that changed the spec count and reclaimed ownership). |
@@ -91,8 +92,11 @@ Each event carries:
 - `id`: increasing, but sparse (see
   [cursors](#cursor-based-polling-cli-and-mcp)).
 - `kind` and `level` (`info`/`warn`/`error`).
-- Optional scope IDs: `job_id`, `node_id`, `eval_id`, `allocation_id`,
-  `rollout_id`.
+- Optional scope IDs: `job_id` (canonical: `namespace/name`, bare in
+  `default`), `node_id`, `eval_id`, `allocation_id`, `rollout_id`.
+- `namespace`: the job's [namespace](namespaces.md) for an event about a job;
+  empty for cluster events (nodes, raft, the scheduler). Namespace writes emit
+  `namespace.applied` and `namespace.deleted`.
 - A human-readable `message`.
 - `metadata_json`: a JSON object with kind-specific detail.
 - `created_at`: an RFC3339 timestamp.
@@ -110,6 +114,17 @@ legion events list --kind eval --job demo --level warn --limit 50 --json
 legion events follow
 legion events follow --kind rollout --json   # NDJSON: one envelope per line
 ```
+
+`-n/--namespace` keeps only events about those namespaces' jobs (names or
+globs, comma-separated: `legion events follow -n 'payments-*'`). Without it
+you see every event you may see, cluster events included; `--job` resolves
+in `-n` or `$LEGION_NAMESPACE` like any job argument.
+
+**Who may read events.** `operator:read` sees every event. A caller without
+it but with `job:read` in some namespaces reads those namespaces' events
+through the same list and stream, filtered per item; cluster events need
+`operator:read`. A stream re-checks the caller's grants on its interval, so a
+revoked grant ends it.
 
 `--kind` matches exactly or by category prefix. For example, `--kind eval`
 matches `eval.enqueued`, `eval.completed`, `eval.failed`, `eval.requeued`,
@@ -181,7 +196,7 @@ The **Events** page (Cluster → Events) tails `StreamEvents` over gRPC-Web. It
 reconnects and resumes automatically, and it offers client-side filtering by
 category, level, and text, pause and resume, and expandable per-event metadata.
 
-The instance page (`/jobs/<job>/instances/<id>`) and the allocation page
+The instance page (`/jobs/<namespace>/<job>/instances/<id>`) and the allocation page
 (`/allocations/<id>`) each show a timeline of just their own events, using the
 `instance_id` and `allocation_id` filters. Like the Events page, they need
 `operator:read`. Without it they say so and show the rest of the page.

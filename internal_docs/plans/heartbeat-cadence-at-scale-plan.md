@@ -9,7 +9,7 @@ public page is [`docs/heartbeat-cadence-and-scale.md`](../../docs/heartbeat-cade
 simulated nodes against a control plane measured at `R ~= 80`, adaptive on
 versus off) has **not** been run — it needs the shared rig. Correctness is
 covered by unit tests over the pure controller and decision functions and by
-integration tests on the `tests/raft_lanes.rs` harness; the scale claim is
+integration tests on the `tests/integration/raft_lanes.rs` harness; the scale claim is
 argued, not measured. Phase 3's failover grace is owned by
 [`liveness-off-the-raft-path-plan.md`](liveness-off-the-raft-path-plan.md),
 which shipped it.
@@ -575,7 +575,7 @@ not fixing.
 
 **Cost to build.** Small-to-moderate: the metrics from §6.1, a debounced
 warn on an existing loop, one new RPC + CLI verb + capabilities entry +
-MCP tool + `tests/acl_endpoints.rs` row (`node`/`read`/`any`).
+MCP tool + `tests/integration/acl_endpoints.rs` row (`node`/`read`/`any`).
 
 **Verdict: ship it, and it is the last line of defense even after (c).**
 An adaptive controller that has hit its `maxInterval` ceiling needs
@@ -845,7 +845,7 @@ validation above, which is a new *check* on an existing field.
 **Capabilities / MCP:** `node cadence` gets a `catalog()` entry
 (`read_only_safe: true`, `mutates: false`) and an MCP tool, per the
 agent-readiness rule. `GetHeartbeatCadence` gets its
-`tests/acl_endpoints.rs` row: `AclResource::Node`, `AclAction::Read`,
+`tests/integration/acl_endpoints.rs` row: `AclResource::Node`, `AclAction::Read`,
 `AclScope::any()`.
 
 ---
@@ -917,12 +917,12 @@ sharp edge, and they are worth having even if phase 4 never ships.
   `raft_lanes.rs` status-lane suites, and the
   `metrics_endpoint.rs` heartbeat-counter test all stay green unchanged —
   the default path must be bit-for-bit identical.
-- `tests/acl_endpoints.rs` gains the `GetHeartbeatCadence` row; the
+- `tests/integration/acl_endpoints.rs` gains the `GetHeartbeatCadence` row; the
   `every_manager_rpc_is_classified` test must pass without adding an
   `Open` classification.
 
 **Scale / regression.** The heartbeat benchmark
-(`tests/heartbeat_scale_benchmark.rs`) gains a cadence-collapse case:
+(`tests/integration/heartbeat_scale_benchmark.rs`) gains a cadence-collapse case:
 ramp the simulated fleet past the control plane's `R` and assert
 **zero** nodes marked lost with adaptive on, versus the reproduced
 collapse with it off. That assertion is the whole plan in one test.

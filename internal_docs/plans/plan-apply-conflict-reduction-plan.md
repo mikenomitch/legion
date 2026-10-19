@@ -262,7 +262,7 @@ how an existing submission is interpreted at apply.
 ## 10. Testing plan
 
 - `concurrent_plans_cannot_oversubscribe_a_node` and
-  `tests/raft_apply_roundtrip.rs` pass **unmodified** — the load-bearing
+  `tests/integration/raft_apply_roundtrip.rs` pass **unmodified** — the load-bearing
   safety regression.
 - New: an epoch-dirty candidate that still fits binds via pass 2; an
   epoch-dirty candidate that is full rejects *with a capacity reason*; a

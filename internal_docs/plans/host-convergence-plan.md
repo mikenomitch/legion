@@ -320,7 +320,7 @@ Host mutation is a genuinely new power and gets its own vocabulary:
 - New `src/task_plugins/converge/` (runtime, resource types, providers).
 - Storage: `converge_result` table keyed by allocation + resource; node
   `availability` gains `configuring`.
-- ACL: `AclResource::Host`, pool-scoped, plus `tests/acl_endpoints.rs` entries for
+- ACL: `AclResource::Host`, pool-scoped, plus `tests/integration/acl_endpoints.rs` entries for
   the new RPC.
 - `configs/jobs/maximal.jsonnet`: `nodeConfig` block and a `converge` task.
 
@@ -360,7 +360,7 @@ nothing is enabled by accident; the full ACL resource lands here.
 - Why-run parity: for every resource type, why-run's verdict must match what a
   real run then does — a property test with the fixture from the idempotence
   suite.
-- ACL: `tests/acl_endpoints.rs` entry for `PlanConverge`; a test that a converge
+- ACL: `tests/integration/acl_endpoints.rs` entry for `PlanConverge`; a test that a converge
   job is rejected without `host:write`, and on a worker that has not opted in.
 - Failure semantics: `onError: abort` stops at the first failure and reports the
   rest as `skipped`; `continue` reports all.

@@ -9,15 +9,20 @@ depth.
 `init_tracing()` / `init_tracing_with_options()` (`src/tracing_util.rs`)
 configure the `tracing_subscriber` stack:
 
-- Pretty console logs (stdout, or stderr for stdio protocol servers like
-  `legion mcp serve`).
-- JSON file logs, daily rolling under `./logs/events.log.<date>`.
+- Pretty console logs. Servers (every `legion start` subcommand, and
+  `legion join`) write them to stdout. Every other command, `legion mcp
+  serve` included, writes them to stderr, so stdout carries only the
+  command's output: a `--json` envelope parses as-is, and the MCP stream
+  stays clean.
+- JSON file logs, daily rolling under `./logs/events.log.<date>`, for
+  servers only. A one-shot command writes no files.
 - `EnvFilter` from the environment (default `info`). You control log verbosity
   with standard `RUST_LOG`-style tracing filters.
 - With `--o11y`, an extra JSON span layer (span new/close events) writes
   daily-rolling files under `./traces/spans.json.<date>`.
 
-Old files are pruned at startup: Legion keeps 7 days of `./logs` and 3 days of
+`./logs` and `./traces` are relative to the server's working directory. Old
+files are pruned at startup: Legion keeps 7 days of `./logs` and 3 days of
 `./traces`.
 
 **A server never waits on its log readers.** On `legion start manager` and
@@ -35,7 +40,8 @@ for about 57 seconds and was marked lost, and the burst fell to 8 starts a
 second. With the buffer, the same burst ran at 293 starts a second and the
 worker stayed up. Under backpressure a server keeps its heartbeats and
 loses log lines instead. Neither the console nor the file log guarantees
-every line. Short CLI commands still write to the console directly.
+every line. Short CLI commands still write to the console (stderr)
+directly.
 
 ## OTLP Trace Export (OpenTelemetry)
 

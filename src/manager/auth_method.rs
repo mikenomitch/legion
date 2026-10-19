@@ -1162,7 +1162,7 @@ mod auth_method_test {
     fn webhook_store() -> Store {
         let dir = tempfile::Builder::new()
             .prefix("legion-webhook-")
-            .tempdir()
+            .tempdir_in(crate::test_scratch::root())
             .expect("tempdir")
             .keep();
         Store::start_storage(&crate::structs::ManagerConfigFull {
@@ -1324,7 +1324,7 @@ mod auth_method_test {
             .validate_bearer(&token)
             .expect("method interprets JWT")
             .expect("token verifies");
-        assert_eq!(verified.principal, "auto:api:web:server");
+        assert_eq!(verified.principal, "auto:default:api:web:server");
         assert_eq!(verified.policies, vec!["kv-reader"]);
 
         // A token minted for a foreign audience (a normal federation token) is

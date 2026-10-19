@@ -1081,6 +1081,12 @@ struct TaskPlan<'a> {
     base_eligible: Vec<&'a Node>,
     distinct_tracker: Option<DistinctTracker>,
     index_usage: TaskIndexUsage,
+    /// Set when the task id is not a stored `task_config` row: a dry run of
+    /// an unsubmitted config numbers its tasks by position
+    /// ([`Scheduler::tasks_for_plan`]), so its volume and restore pins are
+    /// looked up by this job id and the task's group and name instead.
+    /// Looked up by the positional id, they were another job's pins.
+    positional_job_id: Option<String>,
 }
 
 impl TaskPlan<'_> {
@@ -1717,6 +1723,7 @@ impl<'a> Scheduler<'a> {
             // A preview keeps all-or-nothing: it reports the first replica
             // that would not fit as the plan's error.
             false,
+            None,
             PreemptorContext {
                 job: &preemptor.0,
                 band: preemptor.1,
@@ -1916,6 +1923,8 @@ impl<'a> Scheduler<'a> {
             mode,
             None,
             false,
+            // Positional ids (`tasks_for_plan`): pins are found by name.
+            Some(&job_config.name),
             PreemptorContext {
                 job: &job_config.name,
                 band: job_config.priority,
@@ -2134,6 +2143,7 @@ impl<'a> Scheduler<'a> {
             mode.clone(),
             task_targets,
             true,
+            None,
             PreemptorContext {
                 job: &preemptor_job,
                 band: preemptor_band,
@@ -2523,6 +2533,7 @@ impl<'a> Scheduler<'a> {
         mode: PlanMode,
         task_targets: Option<&HashMap<i64, u32>>,
         applying: bool,
+        positional_job_id: Option<&str>,
         preemptor: PreemptorContext<'_>,
     ) -> R<BuiltPlan> {
         tasks.sort_by_key(|a| a.0);
@@ -2761,6 +2772,7 @@ impl<'a> Scheduler<'a> {
                 index_armed,
                 in_multi_task_group,
                 &parsed_filters,
+                positional_job_id,
             )?;
 
             let base_eligible = plan.base_eligible.clone();
@@ -3432,6 +3444,7 @@ impl<'a> Scheduler<'a> {
         index_armed: bool,
         in_multi_task_group: bool,
         parsed_filters: &HashMap<i64, Arc<(ConstraintSet, PermitSet)>>,
+        positional_job_id: Option<&str>,
     ) -> R<TaskPlan<'b>> {
         let task_resources =
             resource_policy.normalize_task_resources(&task_config.resources, true)?;
@@ -3530,6 +3543,7 @@ impl<'a> Scheduler<'a> {
             base_eligible,
             distinct_tracker,
             index_usage,
+            positional_job_id: positional_job_id.map(str::to_owned),
         })
     }
 
@@ -3596,9 +3610,15 @@ impl<'a> Scheduler<'a> {
         // order; the allocation binder independently prefers the instance whose
         // volume is pinned to the node an allocation landed on, so the two
         // agree even if their orderings differ (see docs/volumes.md).
-        let mut pins: std::collections::VecDeque<(String, String)> = self
-            .store
-            .pinned_placements_for_task(task_id)
+        let mut pins: std::collections::VecDeque<(String, String)> =
+            match plan.positional_job_id.as_deref() {
+                None => self.store.pinned_placements_for_task(task_id),
+                Some(job_id) => self.store.pinned_placements_for_task_named(
+                    job_id,
+                    &task_config.group,
+                    &task_config.name,
+                ),
+            }
             .unwrap_or_else(|err| {
                 warn!(task_id, error = ?err, "Failed loading volume pins; placing unpinned");
                 Vec::new()
@@ -3617,12 +3637,18 @@ impl<'a> Scheduler<'a> {
             .as_ref()
             .is_some_and(|stateful| stateful.mode == crate::structs::InstanceMode::Keyed)
         {
-            self.store
-                .restore_pins_for_task(task_id)
-                .unwrap_or_else(|err| {
-                    warn!(task_id, error = ?err, "Failed loading restore pins; placing unpinned");
-                    Vec::new()
-                })
+            match plan.positional_job_id.as_deref() {
+                None => self.store.restore_pins_for_task(task_id),
+                Some(job_id) => self.store.restore_pins_for_task_named(
+                    job_id,
+                    &task_config.group,
+                    &task_config.name,
+                ),
+            }
+            .unwrap_or_else(|err| {
+                warn!(task_id, error = ?err, "Failed loading restore pins; placing unpinned");
+                Vec::new()
+            })
         } else {
             Vec::new()
         };
@@ -6335,7 +6361,7 @@ mod tests {
     fn store_path() -> R<String> {
         let store_dir = Builder::new()
             .prefix("khepri-scheduler-")
-            .tempdir()
+            .tempdir_in(crate::test_scratch::root())
             .context("Error creating temp store directory")?
             .keep();
 

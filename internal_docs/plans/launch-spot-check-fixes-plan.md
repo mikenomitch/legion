@@ -145,7 +145,7 @@ report's reading) and what changed. Tests named here fail on the old code.
   `PROTOCOL_VERSION` is 3. Tests: `tests/worker_plane.rs`.
   > **Update:** the worker-plane-auth plan's full implementation replaced
   > this first cut when the branches merged (its calls entry 45). The class
-  > table and its tests now live in `tests/worker_plane_classes.rs`.
+  > table and its tests now live in `tests/integration/worker_plane_classes.rs`.
 - **Found along the way.** Speculative edge-boot dispatch read
   `protocolVersion` from the wrong attribute map and never fired for real
   workers; it now does, for the first time.

@@ -87,7 +87,7 @@ impl Eval {
         } else {
             let node = Node {
                 id: node_id.clone(),
-                status: "ready".into(),
+                status: "active".into(),
                 pool: "default".into(),
                 availability: "available".into(),
                 last_heartbeat,
@@ -833,7 +833,7 @@ mod tests {
     fn setup_store() -> R<Store> {
         let store_dir = Builder::new()
             .prefix("legion-eval-")
-            .tempdir()
+            .tempdir_in(crate::test_scratch::root())
             .context("error creating temp store directory")?
             .keep();
         let store_config = ManagerConfigFull {
@@ -863,7 +863,7 @@ mod tests {
     fn max_plan_conflict_retries_respects_scheduler_settings() -> R<()> {
         let store_dir = Builder::new()
             .prefix("legion-eval-")
-            .tempdir()
+            .tempdir_in(crate::test_scratch::root())
             .context("error creating temp store directory")?
             .keep();
         let store_config = ManagerConfigFull {
@@ -938,7 +938,7 @@ mod tests {
     fn plan_conflict_requeue_delay_respects_scheduler_settings() -> R<()> {
         let store_dir = Builder::new()
             .prefix("legion-eval-")
-            .tempdir()
+            .tempdir_in(crate::test_scratch::root())
             .context("error creating temp store directory")?
             .keep();
         let store_config = ManagerConfigFull {

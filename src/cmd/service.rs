@@ -12,7 +12,10 @@
 //! Every subcommand takes `--json`/`-j` and emits the standard
 //! [`crate::cmd::output`] envelope so agents never have to scrape prose.
 
-use crate::cmd::helpers::{connect_manager_client, json_flag, AuthedManagerClient};
+use crate::cmd::helpers::{
+    connect_manager_client, job_ref, json_flag, list_namespace_flags, lists_many_namespaces,
+    namespace_flag, namespace_selection, AuthedManagerClient,
+};
 use crate::cmd::output::{self, CliError, OutputFormat};
 use crate::prelude::*;
 use crate::structs::{
@@ -68,7 +71,8 @@ pub fn config() -> Command {
         .arg_required_else_help(true)
         .subcommand(
             Command::new("list")
-                .about("Lists all declared services with endpoint health counts")
+                .about("Lists declared services with endpoint health counts")
+                .args(list_namespace_flags())
                 .arg(json_flag()),
         )
         .subcommand(
@@ -76,7 +80,7 @@ pub fn config() -> Command {
                 .about("Resolves a service to its healthy endpoint addresses")
                 .arg(
                     Arg::new("service")
-                        .help("Service name to resolve")
+                        .help("Service to resolve: `name`, or `namespace/name`")
                         .required(true),
                 )
                 .arg(
@@ -91,6 +95,7 @@ pub fn config() -> Command {
                         .action(ArgAction::SetTrue)
                         .help("Print a single randomly picked endpoint address:port (scripts)"),
                 )
+                .arg(namespace_flag())
                 .arg(json_flag()),
         )
         .subcommand(
@@ -113,6 +118,7 @@ pub fn config() -> Command {
                         .help("Service name to diagnose")
                         .required(true),
                 )
+                .arg(namespace_flag())
                 .arg(json_flag()),
         )
 }
@@ -307,7 +313,9 @@ async fn list(matches: &ArgMatches) -> R<()> {
         format,
         "failed to list services",
         client
-            .list_services(tonic::Request::new(ListServicesRequest {}))
+            .list_services(tonic::Request::new(ListServicesRequest {
+                namespaces: namespace_selection(matches),
+            }))
             .await,
     )?
     .into_inner()
@@ -324,8 +332,13 @@ async fn list(matches: &ArgMatches) -> R<()> {
         return Ok(());
     }
 
+    let many = lists_many_namespaces(matches);
     let rows = services.into_iter().map(|service| ServiceRow {
-        service: service.service,
+        service: if many {
+            crate::structs::namespace::job_id(&service.namespace, &service.service)
+        } else {
+            service.service
+        },
         job: service.job_id,
         task: service.task_name,
         healthy: format!("{}/{}", service.healthy_count, service.total_count),
@@ -366,9 +379,12 @@ fn pick_one(endpoints: &[ServiceEndpoint]) -> Option<&ServiceEndpoint> {
 
 async fn resolve(matches: &ArgMatches) -> R<()> {
     let format = OutputFormat::from_matches(matches);
-    let service = matches
-        .get_one::<String>("service")
-        .context("service name required")?;
+    let service = &job_ref(
+        matches,
+        matches
+            .get_one::<String>("service")
+            .context("service name required")?,
+    )?;
     let include_unhealthy = matches.get_flag("all");
     let mut client = connect_manager_client().await?;
     let endpoints = fetch_endpoints(&mut client, service, include_unhealthy, format).await?;
@@ -495,16 +511,22 @@ struct Diagnosis {
 
 async fn doctor(matches: &ArgMatches) -> R<()> {
     let format = OutputFormat::from_matches(matches);
-    let service = matches
-        .get_one::<String>("service")
-        .context("service name required")?;
+    let service = &job_ref(
+        matches,
+        matches
+            .get_one::<String>("service")
+            .context("service name required")?,
+    )?;
+    let (namespace, service_name) = crate::structs::namespace::split_job_id(service);
 
     let mut client = connect_manager_client().await?;
     let services = output::resolve(
         format,
         "failed to list services",
         client
-            .list_services(tonic::Request::new(ListServicesRequest {}))
+            .list_services(tonic::Request::new(ListServicesRequest {
+                namespaces: vec![namespace.to_string()],
+            }))
             .await,
     )?
     .into_inner()
@@ -513,7 +535,7 @@ async fn doctor(matches: &ArgMatches) -> R<()> {
     // Only reach for endpoints once the service is known to exist — an
     // undeclared service is diagnosed from the summary list alone. Intentions
     // ride along on the summary, so the whole report needs only `job:read`.
-    let (endpoints, allow) = match services.iter().find(|entry| entry.service == *service) {
+    let (endpoints, allow) = match services.iter().find(|entry| entry.service == service_name) {
         Some(summary) => {
             let allow = summary.allow.clone();
             let endpoints = fetch_endpoints(&mut client, service, true, format).await?;
@@ -791,6 +813,7 @@ mod tests {
 
     fn summary(service: &str, job: &str, task: &str) -> ServiceSummary {
         ServiceSummary {
+            namespace: Default::default(),
             service: service.to_string(),
             job_id: job.to_string(),
             task_name: task.to_string(),
@@ -804,6 +827,7 @@ mod tests {
 
     fn endpoint(alloc: i64, port: u32, healthy: bool, health_status: &str) -> ServiceEndpoint {
         ServiceEndpoint {
+            namespace: Default::default(),
             service: "web".to_string(),
             job_id: "api".to_string(),
             task_name: "web".to_string(),

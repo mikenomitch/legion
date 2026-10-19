@@ -444,6 +444,8 @@ impl ManagerDaemonService {
             .map(|state| state.parse::<SnapshotState>())
             .transpose()
             .map_err(Status::invalid_argument)?;
+        let selection =
+            super::list_namespace_selection(inner.job_id.as_deref(), &inner.namespaces)?;
         let filter = SnapshotFilter {
             job_id: inner.job_id.filter(|value| !value.trim().is_empty()),
             instance_id: inner.instance_id.filter(|value| !value.trim().is_empty()),
@@ -455,7 +457,9 @@ impl ManagerDaemonService {
             .map_err(|e| map_store_error("Error listing snapshots", e))?
             .into_iter()
             .filter(|snapshot| {
-                identity.allows(
+                selection.as_ref().is_none_or(|selection| {
+                    selection.matches(crate::structs::namespace::job_namespace(&snapshot.job_id))
+                }) && identity.allows(
                     AclResource::Snapshot,
                     AclAction::Read,
                     &AclScope::job(&snapshot.job_id),

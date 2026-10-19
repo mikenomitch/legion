@@ -47,6 +47,7 @@ use tokio::runtime::Runtime;
 use legion::structs::UpstreamHttpConfig;
 use legion::worker::balance::{balancer, balancer_names, Endpoint};
 use legion::worker::forwarder::{UpstreamForwarder, UpstreamSpec};
+use legion::worker::netd::attach::Attachment;
 
 const MESSAGE: usize = 100;
 const BULK_BYTES: u64 = 64 * 1024 * 1024;
@@ -170,7 +171,7 @@ async fn forwarder(backends: &[String], balance: &str, http: bool) -> u16 {
         ca: None,
         vip: None,
         canonical_port: None,
-        attachment: legion::worker::netd::attach::Attachment::Host,
+        attachment: Attachment::Host,
     };
     forwarder.sync(std::slice::from_ref(&spec)).await;
     let endpoints = backends

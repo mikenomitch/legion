@@ -79,15 +79,16 @@ pub fn parse_file_mode(raw: &str) -> R<u32> {
 }
 
 /// Placeholders allowed in a `sub` template that are present on every workload.
-const STABLE_SUB_FIELDS: &[&str] = &["region", "job", "group", "task"];
+const STABLE_SUB_FIELDS: &[&str] = &["region", "namespace", "job", "group", "task"];
 
 /// Placeholders allowed in a `sub` template only for stateful tasks.
 const STATEFUL_SUB_FIELDS: &[&str] = &["instance", "slot"];
 
-/// The cluster-default `sub` template. Mirrors Nomad's composed subject minus
-/// the namespace segment Legion lacks: stable across reschedules, per-task
-/// least privilege.
-pub const DEFAULT_SUB_TEMPLATE: &str = "{region}:{job}:{group}:{task}";
+/// The cluster-default `sub` template. Mirrors Nomad's composed subject:
+/// stable across reschedules, per-task least privilege, and distinct across
+/// namespaces — `prod/web` and `dev/web` must never mint the same subject,
+/// or an IdP trust policy written for one would accept the other.
+pub const DEFAULT_SUB_TEMPLATE: &str = "{region}:{namespace}:{job}:{group}:{task}";
 
 /// What happens when an identity's token is re-issued before expiry. Mirrors
 /// the existing reconcile-action vocabulary rather than inventing a new one.
@@ -537,14 +538,16 @@ pub fn validate_sub_template(template: &str, stateful: bool) -> R<()> {
         }
     }
 
-    // Uniqueness floor: dropping below job+group+task granularity collapses
-    // distinct workloads into one shared identity. Hard reject (see plan open
-    // question #1 — we chose the strict rail).
-    for required in ["job", "group", "task"] {
+    // Uniqueness floor: dropping below namespace+job+group+task granularity
+    // collapses distinct workloads into one shared identity — and without
+    // `{namespace}`, two namespaces' `web` jobs mint the same subject, so an
+    // IdP trust policy written for one accepts the other. Hard reject (see
+    // plan open question #1 — we chose the strict rail; docs/namespaces.md).
+    for required in ["namespace", "job", "group", "task"] {
         if !placeholders.iter().any(|p| p == required) {
             bail!(
                 "sub template {template:?} drops {{{required}}}; templates must keep at least \
-                 job+group+task granularity so distinct workloads stay distinct"
+                 namespace+job+group+task granularity so distinct workloads stay distinct"
             );
         }
     }
@@ -553,7 +556,7 @@ pub fn validate_sub_template(template: &str, stateful: bool) -> R<()> {
 }
 
 /// The set of characters that act as *separators between two adjacent
-/// placeholders* in a template. For the default `{region}:{job}:{group}:{task}`
+/// placeholders* in a template. For the default `{region}:{namespace}:{job}:{group}:{task}`
 /// this is `{':'}`; for `legion/{job}/{task}` it is `{'/'}`. A prefix/suffix
 /// literal (a placeholder on only one side) is a fixed constant and cannot
 /// cause a collision, so its characters are excluded.
@@ -638,6 +641,9 @@ pub struct SigningKeyRecord {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorkloadIdentityClaims {
     pub region: String,
+    /// The workload's canonical job id (`ns/name`, or the bare name in
+    /// `default`). The `{job}` placeholder and the `legion.io/job` claim are
+    /// its bare name; `{namespace}` and `legion.io/namespace` its namespace.
     pub job: String,
     pub group: String,
     pub task: String,
@@ -660,12 +666,29 @@ pub const EPOCH_CLAIM: &str = "legion.io/epoch";
 pub const INSTANCE_CLAIM: &str = "legion.io/instance";
 
 impl WorkloadIdentityClaims {
-    /// Build the default OIDC `sub` claim. Mirrors Nomad's composed subject
-    /// (minus the namespace segment Legion lacks): stable across reschedules,
-    /// per-task least privilege. Deliberately omits alloc_id/node_id (they
-    /// churn → no stable policy); those ride along as `legion.io/*` claims.
+    /// The workload's namespace (docs/namespaces.md).
+    pub fn namespace(&self) -> &str {
+        crate::structs::namespace::job_namespace(&self.job)
+    }
+
+    /// The workload's job name, without its namespace.
+    pub fn job_name(&self) -> &str {
+        crate::structs::namespace::job_name(&self.job)
+    }
+
+    /// Build the default OIDC `sub` claim. Mirrors Nomad's composed subject:
+    /// stable across reschedules, per-task least privilege, distinct across
+    /// namespaces. Deliberately omits alloc_id/node_id (they churn → no
+    /// stable policy); those ride along as `legion.io/*` claims.
     pub fn subject(&self) -> String {
-        format!("{}:{}:{}:{}", self.region, self.job, self.group, self.task)
+        format!(
+            "{}:{}:{}:{}:{}",
+            self.region,
+            self.namespace(),
+            self.job_name(),
+            self.group,
+            self.task
+        )
     }
 
     /// Whether these claims describe a stateful instance.
@@ -678,7 +701,8 @@ impl WorkloadIdentityClaims {
     fn field(&self, name: &str) -> Option<String> {
         match name {
             "region" => Some(self.region.clone()),
-            "job" => Some(self.job.clone()),
+            "namespace" => Some(self.namespace().to_string()),
+            "job" => Some(self.job_name().to_string()),
             "group" => Some(self.group.clone()),
             "task" => Some(self.task.clone()),
             "instance" => self.instance.clone(),
@@ -739,7 +763,14 @@ impl WorkloadIdentityClaims {
     pub fn legion_claims(&self) -> BTreeMap<String, String> {
         let mut claims = BTreeMap::new();
         claims.insert(format!("{LEGION_CLAIM_PREFIX}region"), self.region.clone());
-        claims.insert(format!("{LEGION_CLAIM_PREFIX}job"), self.job.clone());
+        claims.insert(
+            format!("{LEGION_CLAIM_PREFIX}namespace"),
+            self.namespace().to_string(),
+        );
+        claims.insert(
+            format!("{LEGION_CLAIM_PREFIX}job"),
+            self.job_name().to_string(),
+        );
         claims.insert(format!("{LEGION_CLAIM_PREFIX}group"), self.group.clone());
         claims.insert(format!("{LEGION_CLAIM_PREFIX}task"), self.task.clone());
         claims.insert(format!("{LEGION_CLAIM_PREFIX}node"), self.node_id.clone());
@@ -946,8 +977,33 @@ mod tests {
     }
 
     #[test]
+    fn subjects_differ_across_namespaces_for_the_same_job_name() {
+        let prod = WorkloadIdentityClaims {
+            job: "prod/api".into(),
+            ..claims()
+        };
+        let dev = WorkloadIdentityClaims {
+            job: "dev/api".into(),
+            ..claims()
+        };
+        assert_eq!(prod.subject(), "auto:prod:api:web:server");
+        assert_ne!(prod.subject(), dev.subject());
+        assert_eq!(prod.subject_for(None).unwrap(), prod.subject());
+        let claims = prod.legion_claims();
+        assert_eq!(claims["legion.io/namespace"], "prod");
+        assert_eq!(claims["legion.io/job"], "api");
+    }
+
+    #[test]
+    fn sub_templates_must_keep_the_namespace() {
+        let err = validate_sub_template("{region}:{job}:{group}:{task}", false).unwrap_err();
+        assert!(err.to_string().contains("drops {namespace}"), "{err}");
+        validate_sub_template(DEFAULT_SUB_TEMPLATE, false).unwrap();
+    }
+
+    #[test]
     fn default_subject_matches_nomad_shape() {
-        assert_eq!(claims().subject(), "auto:api:web:server");
+        assert_eq!(claims().subject(), "auto:default:api:web:server");
     }
 
     #[test]
@@ -996,14 +1052,17 @@ mod tests {
     fn render_rejects_unavailable_stateful_field() {
         // instance is unset on a stateless workload.
         let err = claims()
-            .render_subject("{job}:{group}:{task}:{instance}")
+            .render_subject("{namespace}:{job}:{group}:{task}:{instance}")
             .unwrap_err();
         assert!(err.to_string().contains("instance"));
     }
 
     #[test]
     fn subject_for_falls_back_to_default() {
-        assert_eq!(claims().subject_for(None).unwrap(), "auto:api:web:server");
+        assert_eq!(
+            claims().subject_for(None).unwrap(),
+            "auto:default:api:web:server"
+        );
     }
 
     // --- sub template admission validation ---
@@ -1048,7 +1107,7 @@ mod tests {
 
     #[test]
     fn validate_template_gates_instance_on_stateful() {
-        let t = "{job}:{group}:{task}:{instance}";
+        let t = "{namespace}:{job}:{group}:{task}:{instance}";
         assert!(validate_sub_template(t, false).is_err());
         validate_sub_template(t, true).unwrap();
     }
@@ -1344,8 +1403,10 @@ mod tests {
             .render_subject("legion/{job}/{group}/{task}")
             .unwrap();
         assert_eq!(s, "legion/api/web/server");
+        // A job id's `/` is the namespace separator, never part of `{job}`;
+        // a group name carrying the template's separator still collides.
         let c = WorkloadIdentityClaims {
-            job: "a/b".into(),
+            group: "a/b".into(),
             ..claims()
         };
         let err = c.render_subject("legion/{job}/{group}/{task}").unwrap_err();

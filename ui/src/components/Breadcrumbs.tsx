@@ -24,6 +24,7 @@ const sectionLabels: Record<string, string> = {
   'state-explorer': 'State Explorer',
   observability: 'Observability',
   testing: 'Testing',
+  namespaces: 'Namespaces',
   oidc: 'Single sign-on',
   deployments: 'Rollouts',
 }
@@ -82,19 +83,24 @@ const labelForSegment = (segments: readonly string[], index: number): string => 
   if (previous === 'instances') return decoded
   if (previous === 'allocations') return `#${decoded}`
 
-  if (segments[0] === 'jobs' && index === 2 && JOB_SECTIONS.has(current)) return JOB_SECTIONS.get(current)!
+  // `/jobs/<namespace>/<name>/<section>/<item>`: the namespace, the job,
+  // then the job's sections.
+  if (segments[0] === 'jobs' && index === 3 && JOB_SECTIONS.has(current)) return JOB_SECTIONS.get(current)!
+  if (segments[0] === 'jobs' && index === 2) return decoded
   if (sectionLabels[current]) return sectionLabels[current]
 
   return titleCase(decoded)
 }
 
-// Where an intermediate crumb leads: its own path, the job page for a job's
-// tasks, specs, or instances (`/jobs/web/instances` has no page), and
+// Where an intermediate crumb leads: its own path, the namespace's job
+// list for a job's namespace segment, the job page for a job's tasks,
+// specs, or instances (`/jobs/default/web/instances` has no page), and
 // nowhere for a section without an index (`/allocations`).
 const crumbHref = (segments: readonly string[], index: number, path: string): string | undefined => {
   if (unlinkedSegments.has(segments[index])) return undefined
   if (index === 0 && DETAIL_ONLY_SECTIONS.has(segments[0])) return undefined
-  if (segments[0] === 'jobs' && index === 2 && JOB_SECTIONS.has(segments[2])) return `/jobs/${segments[1]}`
+  if (segments[0] === 'jobs' && index === 1) return `/jobs?ns=${segments[1]}`
+  if (segments[0] === 'jobs' && index === 3 && JOB_SECTIONS.has(segments[3])) return `/jobs/${segments[1]}/${segments[2]}`
   return path
 }
 

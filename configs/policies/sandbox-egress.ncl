@@ -18,9 +18,9 @@
     # an empty selector matches every task on the cluster.
     selector = {
         nodePools = ["untrusted"],   # node.pool (globs allowed)
-        namespaces = ["default"],    # every job is in `default` (no user namespaces)
+        namespaces = ["agents-*"],   # namespace globs (docs/namespaces.md)
         runtimes = ["sandbox"],
-        jobs = ["agent-*"],          # job id globs
+        jobs = ["agent-*"],          # globs over the job's bare name
         labels = { tier = "free" },  # task network.labels that must all match
     },
 

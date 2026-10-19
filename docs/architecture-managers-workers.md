@@ -73,7 +73,9 @@ The worker simulator (`legion start worker --simulate N`) serves its whole
 fleet from one listener with one fleet certificate
 (`<prefix>.fleet.legion`), issued through the first simulated node to
 register. Its nodes carry the `workerFleet` attribute, and managers verify
-the fleet's name for them.
+the fleet's name for them. The worker type a fleet joins with must grant
+the fleet ([worker-simulation.md](worker-simulation.md)), so a real node
+cannot claim one.
 
 If a manager cannot reach a worker, the worker keeps running work (heartbeat
 replies carry its allocations), but exec, logs, and restart fail with a
@@ -426,9 +428,9 @@ listener and no setting that turns one on.
   A node's certificate is signed by the same CA, but it is not a manager
   certificate: the role in the URI SAN is what the worker checks. A request
   that presents a non-manager certificate is refused outright, never treated
-  as a ticket holder. `tests/worker_plane_classes.rs` parses the proto and
+  as a ticket holder. `tests/integration/worker_plane_classes.rs` parses the proto and
   fails the build when a `Worker` RPC has no class, the same way
-  `tests/acl_endpoints.rs` guards the `Manager` service.
+  `tests/integration/acl_endpoints.rs` guards the `Manager` service.
 
   ```console
   $ grpcurl -cacert ca.pem 10.0.1.7:4848 legion.Worker/GetTaskLogs

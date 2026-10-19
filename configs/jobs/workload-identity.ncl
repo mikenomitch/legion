@@ -68,7 +68,7 @@
           # sub = auto:workload-identity-demo:default:replica:<instance-id>
           # The manager must list this shape in
           # workloadIdentity.allowedSubTemplates.
-          subTemplate = "{region}:{job}:{group}:{task}:{instance}",
+          subTemplate = "{region}:{namespace}:{job}:{group}:{task}:{instance}",
           file = {
             path = "/var/run/legion/identity/replica-aws/token",
             mode = "0400",

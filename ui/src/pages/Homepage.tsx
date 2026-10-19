@@ -7,6 +7,7 @@ import { asDisplay, heartbeatFreshnessHint } from '../utils/format'
 import { summarizeHealthChecks } from '../utils/health'
 import { statusTone, type Tone } from '../utils/status'
 import { retainOnError, swallowDenied, usePoll } from '../utils/polling'
+import { jobPath } from '../utils/namespaces'
 
 const eventTone = (level: string): Tone => (statusTone(level) === 'info' ? 'neutral' : statusTone(level))
 
@@ -29,14 +30,14 @@ function HomepageContent() {
   const [rollouts] = createResource(
     () => tick() + 1,
     retainOnError(
-      swallowDenied(async () => (await managerClient.listRollouts({ activeOnly: true, page: 1, pageSize: 20 })).rollouts, []),
+      swallowDenied(async () => (await managerClient.listRollouts({ activeOnly: true, page: 1, pageSize: 20, namespaces: ['*'] })).rollouts, []),
       () => 'rollouts',
     ),
   )
   const [services] = createResource(
     () => tick() + 1,
     retainOnError(
-      swallowDenied(async () => (await managerClient.listServices({})).services, []),
+      swallowDenied(async () => (await managerClient.listServices({ namespaces: ['*'] })).services, []),
       () => 'services',
     ),
   )
@@ -246,7 +247,7 @@ function HomepageContent() {
                             {event.kind}
                             <Show when={event.jobId}>
                               {' · '}
-                              <A href={`/jobs/${encodeURIComponent(event.jobId!)}`} class="hover:text-brass-strong">{event.jobId}</A>
+                              <A href={`${jobPath(event.jobId!)}`} class="hover:text-brass-strong">{event.jobId}</A>
                             </Show>
                             <Show when={event.nodeId}>
                               {' · '}
@@ -296,7 +297,7 @@ function HomepageContent() {
                             </Show>
                           </td>
                           <td class={tdClass}>
-                            <A href={`/jobs/${encodeURIComponent(allocation.jobId)}`} class="font-medium hover:text-brass-strong">
+                            <A href={`${jobPath(allocation.jobId)}`} class="font-medium hover:text-brass-strong">
                               {allocation.jobId}
                             </A>
                           </td>

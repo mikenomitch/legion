@@ -371,8 +371,12 @@ legion volume delete 9f2c8a1b… --force
 ```
 
 Volume commands authorize under the `job` resource, scoped to the volume's
-job. A volume no job owns can only be deleted with cluster-wide `job:write`
-(a rule with no `names` or `namespaces` selector).
+job, and so to its job's [namespace](namespaces.md): every volume row is
+created by a job and carries that job's canonical id. A volume no job owns
+(a legacy row) belongs to no namespace and can only be deleted with a `job:write`
+rule that reaches every namespace (`namespaces = ["*"]`, no `names`).
+`legion volume list` lists `default` unless given `-n` (names or globs) or
+`-A`; `--job` pins the job's own namespace.
 
 Every command takes `-j`/`--json` and emits the standard envelope. The same
 operations are exposed over MCP as `legion_volume_list`, `legion_volume_get`,

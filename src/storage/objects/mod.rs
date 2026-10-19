@@ -763,9 +763,7 @@ mod objects_test {
             endpoint: None,
             origin: "contentStore.auth.kv".into(),
         });
-        let err = open(&url, &keys, &OpenOptions::default())
-            .err()
-            .expect("refused");
+        let err = open(&url, &keys, &OpenOptions::default()).expect_err("refused");
         assert!(err.to_string().contains("s3:// stores only"), "{err}");
         Ok(())
     }

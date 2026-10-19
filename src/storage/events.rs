@@ -1002,6 +1002,23 @@ pub mod drafts {
         EventDraft::error("job.failed", format!("Job {job_id} marked failed")).job(job_id)
     }
 
+    /// `job.kv_render_refused` — a watched KV change re-rendered the job's
+    /// templates into lookups of keys the job never named, so the job keeps
+    /// its last render (docs/kv-store.md, the `templateKv` paragraphs).
+    pub fn job_kv_render_refused(job_id: &str, keys: &[String]) -> EventDraft {
+        EventDraft::warn(
+            "job.kv_render_refused",
+            format!(
+                "Job {job_id} kept its last render: a KV change made its templates read {}, \
+                 which the job did not name when it was submitted; resubmit the job to \
+                 read them",
+                keys.join(", ")
+            ),
+        )
+        .job(job_id)
+        .meta(json!({ "keys": keys }))
+    }
+
     /// `job.gang_timeout` — a gang did not reach its quorum within its
     /// `placementTimeout`, so its job was failed and any survivors stopped
     /// (docs/gang-scheduling.md, "Placement timeout").
@@ -1399,6 +1416,23 @@ pub mod drafts {
             "priority": priority,
             "affectedAllocations": affected,
         }))
+    }
+
+    /// A namespace was created or updated (docs/namespaces.md).
+    pub fn namespace_applied(name: &str, created: bool) -> EventDraft {
+        let (kind, verb) = if created {
+            ("namespace.created", "created")
+        } else {
+            ("namespace.updated", "updated")
+        };
+        EventDraft::info(kind, format!("Namespace {name} {verb}"))
+            .meta(json!({ "namespace": name }))
+    }
+
+    /// A namespace was deleted.
+    pub fn namespace_deleted(name: &str) -> EventDraft {
+        EventDraft::info("namespace.deleted", format!("Namespace {name} deleted"))
+            .meta(json!({ "namespace": name }))
     }
 
     /// A network policy object was deleted.
@@ -2411,6 +2445,10 @@ impl EventRecorder<'_> {
         self.emit(drafts::job_failed(job_id));
     }
 
+    pub fn job_kv_render_refused(self, job_id: &str, keys: &[String]) {
+        self.emit(drafts::job_kv_render_refused(job_id, keys));
+    }
+
     pub fn job_gang_member_lost(
         self,
         lost: &Allocation,
@@ -2551,6 +2589,14 @@ impl EventRecorder<'_> {
 
     pub fn net_plugin_deleted(self, name: &str) {
         self.emit(drafts::net_plugin_deleted(name));
+    }
+
+    pub fn namespace_applied(self, name: &str, created: bool) {
+        self.emit(drafts::namespace_applied(name, created));
+    }
+
+    pub fn namespace_deleted(self, name: &str) {
+        self.emit(drafts::namespace_deleted(name));
     }
 
     pub fn volume_mounted(self, volume: &crate::structs::Volume, node_id: &str, path: &str) {

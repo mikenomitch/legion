@@ -90,6 +90,10 @@ pub const STDERR_TAIL_MAX_CHARS: usize = 400;
 /// How far back from the end of `stderr.log` the tail is looked for.
 const STDERR_TAIL_READ_BYTES: u64 = 4096;
 
+/// Health status prefix for a gated allocation whose network capture is not
+/// ready ([`WorkerTaskManager::mark_net_capture_unavailable`]).
+pub const NET_CAPTURE_UNAVAILABLE: &str = "net_capture_unavailable";
+
 impl TaskExit {
     /// Human-readable rendering of the exit status, used in worker logs and
     /// the terminal report. Never includes task output.
@@ -766,6 +770,9 @@ pub struct WorkerTaskManager {
     task_configs: HashMap<i64, TaskConfig>,
     health_monitors: HashMap<i64, HealthMonitorHandle>,
     allocation_health: HashMap<i64, AllocationHealth>,
+    /// The health a gated allocation had before its network capture went
+    /// missing ([`NET_CAPTURE_UNAVAILABLE`]), put back when capture recovers.
+    net_capture_masked: HashMap<i64, AllocationHealth>,
     failed: Vec<FailedAllocationReport>,
     /// Terminal (non-failure) outcomes owed to the manager on the next
     /// heartbeat.
@@ -1015,6 +1022,7 @@ impl WorkerTaskManager {
             task_configs: HashMap::new(),
             health_monitors: HashMap::new(),
             allocation_health: HashMap::new(),
+            net_capture_masked: HashMap::new(),
             failed: Vec::new(),
             terminated_reports: Vec::new(),
             terminated: HashMap::new(),
@@ -2186,6 +2194,15 @@ impl WorkerTaskManager {
 
     /// Put drained terminal reports back after a failed heartbeat, so a dead
     /// connection cannot swallow a batch task's completion.
+    /// Put back failure reports a heartbeat did not get recorded: the
+    /// connection died, or the manager answered but could not record them
+    /// (`HeartbeatReply.retry_failed_allocations`). The allocation was torn
+    /// down when it failed, so only the report goes back; the teardown does
+    /// not run again, and the report keeps its artifact states.
+    pub fn requeue_failures(&mut self, reports: impl IntoIterator<Item = FailedAllocationReport>) {
+        self.failed.extend(reports);
+    }
+
     pub fn requeue_terminations(&mut self, reports: Vec<TerminatedAllocationReport>) {
         self.terminated_reports.extend(reports);
     }
@@ -2527,6 +2544,43 @@ impl WorkerTaskManager {
                 artifact_states: None,
             },
         );
+    }
+
+    /// Report a gated allocation's network capture as not ready: it has no
+    /// network, so its health says so (rollouts and `doctor` see it), and the
+    /// health it had is kept for [`Self::mark_net_capture_ready`].
+    pub fn mark_net_capture_unavailable(&mut self, allocation_id: i64, problems: &[String]) {
+        let allocation_health = &self.allocation_health;
+        self.net_capture_masked
+            .retain(|id, _| allocation_health.contains_key(id));
+        if let Some(prior) = self.allocation_health.get(&allocation_id) {
+            if !prior.status.starts_with(NET_CAPTURE_UNAVAILABLE) {
+                self.net_capture_masked.insert(allocation_id, prior.clone());
+            }
+        }
+        self.set_allocation_health(
+            allocation_id,
+            false,
+            format!("{NET_CAPTURE_UNAVAILABLE}: {}", problems.join("; ")),
+        );
+    }
+
+    /// The capture is ready again: put back the health the allocation had
+    /// before [`Self::mark_net_capture_unavailable`]. Only the health
+    /// monitor writes health again on its own, and a task without checks is
+    /// written healthy once, at start, so without this it would read
+    /// unhealthy for good. A health result written since wins.
+    pub fn mark_net_capture_ready(&mut self, allocation_id: i64) {
+        let Some(prior) = self.net_capture_masked.remove(&allocation_id) else {
+            return;
+        };
+        let still_masked = self
+            .allocation_health
+            .get(&allocation_id)
+            .is_some_and(|health| health.status.starts_with(NET_CAPTURE_UNAVAILABLE));
+        if still_masked {
+            self.allocation_health.insert(allocation_id, prior);
+        }
     }
 
     /// Stops allocations the manager no longer wants and returns the new
@@ -11011,6 +11065,38 @@ mod tests {
     }
 
     #[test]
+    fn a_recovered_net_capture_puts_the_health_back_test() {
+        let temp_dir = TempDir::new().expect("tempdir");
+        let mut manager = manager_in(&temp_dir);
+        manager.set_allocation_health(7, true, "healthy (no checks configured)");
+
+        manager.mark_net_capture_unavailable(7, &["no namespace yet".to_string()]);
+        manager.mark_net_capture_unavailable(7, &["still none".to_string()]);
+        let masked = manager.allocation_health.get(&7).expect("health").clone();
+        assert!(!masked.healthy);
+        assert!(
+            masked.status.starts_with(NET_CAPTURE_UNAVAILABLE),
+            "{masked:?}"
+        );
+
+        // Recovery restores what the task had before the first mask, not
+        // the second mask's marker.
+        manager.mark_net_capture_ready(7);
+        let health = manager.allocation_health.get(&7).expect("health");
+        assert!(health.healthy);
+        assert_eq!(health.status, "healthy (no checks configured)");
+
+        // A check result written while masked wins over the old health.
+        manager.mark_net_capture_unavailable(7, &[]);
+        manager.set_allocation_health(7, false, "http failed: connection refused");
+        manager.mark_net_capture_ready(7);
+        assert_eq!(
+            manager.allocation_health.get(&7).expect("health").status,
+            "http failed: connection refused"
+        );
+    }
+
+    #[test]
     fn allocation_health_snapshot_sorted() -> R<()> {
         let temp_dir = TempDir::new()?;
         let state_store = WorkerStateStore::new(temp_dir.path().join("worker_state.json"));
@@ -11136,6 +11222,30 @@ mod tests {
         assert!(manager
             .self_fence_expired_allocations(Duration::from_secs(60))
             .is_empty());
+        Ok(())
+    }
+
+    /// A failure report the manager hands back goes out again as it was
+    /// first sent, artifact states included, and the allocation's teardown
+    /// does not run a second time (it is already gone).
+    #[test]
+    fn a_requeued_failure_report_is_sent_again_unchanged() -> R<()> {
+        let temp_dir = TempDir::new()?;
+        let state_store = WorkerStateStore::new(temp_dir.path().join("worker_state.json"));
+        let mut manager = WorkerTaskManager::with_state_store(state_store);
+        insert_running_allocation(&mut manager, 4, None);
+        manager.record_failure(4, "boom");
+        let mut sent = manager.drain_failures();
+        assert_eq!(sent.len(), 1);
+        sent[0].artifact_states = Some("[]".into());
+
+        manager.requeue_failures(sent);
+        let again = manager.drain_failures();
+        assert_eq!(again.len(), 1);
+        assert_eq!(again[0].allocation_id, 4);
+        assert_eq!(again[0].reason, "boom");
+        assert_eq!(again[0].artifact_states.as_deref(), Some("[]"));
+        assert!(manager.drain_failures().is_empty(), "sent once per requeue");
         Ok(())
     }
 

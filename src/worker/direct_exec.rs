@@ -215,7 +215,7 @@ impl ExecTicketVerifier {
         if claims.sub != format!("key:{kid}") {
             bail!("a ticket signed by exec key {kid} must carry sub = key:{kid}");
         }
-        if !crate::structs::acl::glob_match(&key.jobs, &claims.job) {
+        if !crate::structs::namespace::job_pattern_matches(&key.jobs, &claims.job) {
             bail!(
                 "exec key {kid} mints tickets for jobs matching {}, not {}",
                 key.jobs,

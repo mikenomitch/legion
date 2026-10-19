@@ -2094,6 +2094,39 @@ fn migration_list() -> Vec<M<'static>> {
         DROP INDEX IF EXISTS idx_gang_member_job;
         DROP TABLE IF EXISTS gang_member;",
         ),
+        // Namespaces (docs/namespaces.md): the name scope, permission scope
+        // and policy anchor jobs live in. `default` always exists and cannot
+        // be deleted. A job's namespace is part of its id (`ns/name`, or the
+        // bare name in `default`), so no job-keyed table changes shape.
+        // `meta` is free-form JSON (`{"owner": "payments"}`) Legion never
+        // reads. Control lane, like the jobs it scopes.
+        M::up(
+            "CREATE TABLE IF NOT EXISTS namespace (
+            name STRING PRIMARY KEY,
+            description STRING NOT NULL DEFAULT '',
+            meta TEXT NOT NULL DEFAULT '{}',
+            created_at STRING NOT NULL,
+            updated_at STRING NOT NULL
+        );
+        INSERT OR IGNORE INTO namespace (name, description, meta, created_at, updated_at)
+            VALUES ('default', 'The default namespace', '{}',
+                    strftime('%Y-%m-%dT%H:%M:%SZ', 'now'), strftime('%Y-%m-%dT%H:%M:%SZ', 'now'));",
+        )
+        .down("DROP TABLE IF EXISTS namespace;"),
+        // Namespace policies (docs/namespaces.md, "Namespace policies"):
+        // cluster objects that select namespaces by glob and carry quota,
+        // counts and allowlists. `object` is the normalized policy as JSON.
+        // Control lane with `job` and `namespace`, so admission reads them
+        // inside the write it guards.
+        M::up(
+            "CREATE TABLE IF NOT EXISTS namespace_policy (
+            name STRING PRIMARY KEY,
+            object TEXT NOT NULL,
+            created_at STRING NOT NULL,
+            updated_at STRING NOT NULL
+        );",
+        )
+        .down("DROP TABLE IF EXISTS namespace_policy;"),
         // Network plugin objects (`legion net plugin`, docs/network-plugins.md):
         // the canonical JSON of a `NetPluginObject`. `revision` is the value
         // of `net_plugin_meta.generation` after the write that stored the
@@ -2202,9 +2235,12 @@ mod migrations_test {
             }
             Ok(false)
         };
+        // One connection stepped forward a version at a time: rebuilding
+        // from scratch per version made this walk quadratic in the number
+        // of migrations (6-35 s per test in a debug build).
         let mut pre_rename_version = None;
+        let mut probe = Connection::open_in_memory()?;
         for version in 1..=latest as usize {
-            let mut probe = Connection::open_in_memory()?;
             migrations.to_version(&mut probe, version)?;
             if has_kind_column(&probe)? {
                 pre_rename_version = Some(version);
@@ -2273,8 +2309,8 @@ mod migrations_test {
         // pre-rebuild schema. Searching (like the rename tests above) keeps
         // this valid as migrations are appended after the rebuild.
         let mut pre_version = None;
+        let mut walk = Connection::open_in_memory()?;
         for version in 1..=latest {
-            let mut walk = Connection::open_in_memory()?;
             migrations.to_version(&mut walk, version)?;
             if jsonb_count(&walk)? > 0 {
                 pre_version = Some(version);
@@ -2504,8 +2540,8 @@ mod migrations_test {
             Ok(false)
         };
         let mut pre_column_version = None;
+        let mut probe = Connection::open_in_memory()?;
         for version in 1..=latest {
-            let mut probe = Connection::open_in_memory()?;
             migrations.to_version(&mut probe, version)?;
             if !has_updated_at(&probe)? {
                 pre_column_version = Some(version);

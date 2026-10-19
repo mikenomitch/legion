@@ -259,7 +259,7 @@ change) and the `raft.pipelineDepth` setting.
   breaks the partial index's implication fails the build.
   `keyed_binding_skips_parked_instances_and_rebinds_across_configs` pins
   the semantics the rewrite keeps. The existing keyed binding tests,
-  `tests/raft_lifecycle_ops.rs` (entry counts), and `tests/raft_seam.rs`
+  `tests/raft_lifecycle_ops.rs` (entry counts), and `tests/integration/raft_seam.rs`
   run unchanged. The `keyed_bind` group in `benchmarks/micro/scheduler_bench.rs`
   measures one keyed placement against a resident population.
 - Phase 2: a forced-speculation mode for the test suite, with the

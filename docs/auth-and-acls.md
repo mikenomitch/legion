@@ -28,7 +28,7 @@ legion job run configs/jobs/demo.ncl
 
 # 3. Create a policy and a narrower token for everyone and everything else.
 legion acl policy apply dev-team --rules '[
-  {"resources": ["job"],  "actions": ["read", "write"], "names": ["dev-*"]},
+  {"resources": ["job"],  "actions": ["read", "write"], "namespaces": ["default"], "names": ["dev-*"]},
   {"resources": ["kv"],   "actions": ["read", "write"], "paths": ["dev/*"]},
   {"resources": ["node"], "actions": ["read"]}
 ]'
@@ -115,12 +115,13 @@ reports `aclEnabled: false`.
 | `operator` | raft, manager configs, observability | status/history/logs | raft commands, raft join tokens |
 | `acl` | tokens, policies, users, delegated exec keys | list/get | create/update/delete |
 | `exec` | exec into a running allocation | n/a | open a session, or mint an exec ticket for one (`host = true` for host-level runtimes) |
-| `action` | run declared actions on an allocation | n/a | run an action (scope with `action_names`) |
+| `action` | run declared actions on an allocation | n/a | run an action (scope with `actionNames`) |
 | `template` | job templates | list/inspect | publish versions, delete (scope with `templates`) |
 | `scale` | task count overrides ([Scaling Jobs](autoscaling.md)) | scale status | `job scale` / reset (scope by job name). Separate from `job:write`, so a principal can resize without redeploy rights. |
 | `boot` | boot tickets ([Edge Boot](edge-boot.md)) | list outstanding tickets | mint a ticket (scope by job name). Separate from `job:write` for the same reason as `scale`: a platform's ticket minter can authorize individual starts without the right to redeploy the fleet. |
 | `net` | network policy and plugin objects ([Network Handlers](network-handlers.md), [Network Plugins](network-plugins.md)) | list policies, show or test a job's effective policy (scope by job name); list, describe, and read the status of plugins | apply or delete a policy. Scope with `pools`, which is matched against the policy's own `selector.nodePools`, so a pool's admin can set posture for their pool without cluster-wide write. Apply or delete a plugin: a `usableBy = "policies"` plugin's `nodePools` scope it the same way; a cluster-wide one, or any `usableBy = "jobs"` plugin, needs unscoped write. |
 | `snapshot` | instance snapshots ([Suspend and Resume](suspend-and-resume.md)) | list, inspect, warm a published one onto nodes, restore an instance from one, and create instances from one (restore and create also need `job:write`) | create (including `--publish`), delete, and name snapshots, suspend with a memory checkpoint, and fork (fork also needs `job:write`) (scope by job name and namespace) |
+| `namespace` | namespace objects ([Namespaces](namespaces.md)) | get a namespace (listing is per item: any allow in a namespace shows it) | create, update, and delete namespaces whose names match (scope with `namespaces`). A cascade delete also needs `job:write` there. |
 
 Actions are `read` and `write`. `write` does not imply `read`, so grant both.
 Grant `state:read` sparingly, since it can read every table in the state
@@ -178,7 +179,7 @@ A policy is a named JSON array of rules:
 
 ```nickel
 [
-  { resources = ["job"],  actions = ["read", "write"], names = ["web-*"] },
+  { resources = ["job"],  actions = ["read", "write"], namespaces = ["default"], names = ["web-*"] },
   { resources = ["kv"],   actions = ["read"],          paths = ["team-a/*"] },
   { resources = ["node"], actions = ["read"],          pools = ["gpu-*"] },
   # explicit deny always wins, across all attached policies:
@@ -188,12 +189,19 @@ A policy is a named JSON array of rules:
 
 - `resources` / `actions` accept `*`.
 - `effect` is `allow` (default) or `deny`.
-- Scope selectors narrow a rule with `*`-globs: `names` (job names),
-  `namespaces` (Legion has no user-defined namespaces, so every job is in
-  `default`), `pools`
+- Scope selectors narrow a rule with `*`-globs: `namespaces`
+  ([Namespaces](namespaces.md)), `names` (bare job names), `pools`
   (node pools), `paths` (KV keys), `actionNames` (declared actions),
   `templates` (job-template names), and `bands` (job priority bands). A rule
   with a selector only matches requests carrying that attribute.
+- **A rule over a namespaced resource** (`job`, `exec`, `action`, `scale`,
+  `boot`, `snapshot`, `namespace`) **must carry `namespaces`**, and a rule
+  over only cluster-scoped resources (`node`, `kv`, `state`, `operator`,
+  `acl`, `template`, `net`) must not. `namespaces = ["*"]` covers every
+  namespace, including ones created later. A rule mixing the two kinds is
+  refused, as is an empty selector; `resources = ["*"]` rules and deny rules
+  are exempt. A rule naming an exact namespace that does not exist yet is
+  accepted with a warning. See [Namespaces, ACLs](namespaces.md#acls).
 - List endpoints filter to what the caller can read: a token scoped to
   `paths = ["team-a/*"]` sees only `team-a/` keys in `legion kv list`.
 
@@ -205,7 +213,7 @@ never matches a request that lacks that attribute. So a `job` rule carrying
 ```nickel
 [
   { resources = ["template"], actions = ["read"], templates = ["render"] },
-  { resources = ["job"], actions = ["read", "write"], templates = ["render"] },
+  { resources = ["job"], actions = ["read", "write"], namespaces = ["default"], templates = ["render"] },
 ]
 ```
 
@@ -223,10 +231,10 @@ selector on `job` rules to control this:
 ```nickel
 [
   # owners of prod-* jobs may claim anything, including the never-preempted top band
-  { resources = ["job"], actions = ["write"], names = ["prod-*"],
+  { resources = ["job"], actions = ["write"], namespaces = ["default"], names = ["prod-*"],
     bands = ["critical", "high", "elevated", "normal", "low", "background"] },
   # everyone else tops out at `high`
-  { resources = ["job"], actions = ["read", "write"],
+  { resources = ["job"], actions = ["read", "write"], namespaces = ["default"],
     bands = ["high", "elevated", "normal", "low", "background"] },
 ]
 ```
@@ -273,9 +281,9 @@ flag `exec` rules use for exec into host-level runtimes:
 
 ```nickel
 # Deploy containers and sandboxes, but nothing that runs on the host:
-{ resources = ["job"], actions = ["write"], names = ["team-a-*"] },
+{ resources = ["job"], actions = ["write"], namespaces = ["default"], names = ["team-a-*"] },
 # Platform admins may deploy host-level jobs too:
-{ resources = ["job"], actions = ["write"], names = ["*"], host = true },
+{ resources = ["job"], actions = ["write"], namespaces = ["default"], names = ["*"], host = true },
 ```
 
 A refusal names the task and why, and only when the host grant is what is
@@ -318,15 +326,42 @@ $ legion job run web.ncl
 error: permission denied: ... (the jobspec reads kv secrets/db-password; the submitter needs kv read on it)
 ```
 
-The check is made when the job is submitted. A key a template stored in KV
-(`templateKv`) is re-read when it changes, and a later edit to that template
-can name a key the submitter could not read, so `kv:write` on a
-`templateKv` key is as sensitive as `kv:read` on what it may name.
+The check is made when the job is submitted. A template stored in KV
+(`templateKv`) is re-read when it changes, but a re-render may only read
+keys the job already names: an edit that adds a lookup is not rendered, the
+job keeps its last render, and a `job.kv_render_refused` event names the
+new keys. Resubmitting the job checks them against whoever submits it.
+`kv:write` on a `templateKv` key still decides what the job renders from
+the keys it names.
+
+#### Namespaces
+
+Jobs, and everything scoped by a job, live in [namespaces](namespaces.md).
+A team's whole policy is usually one glob:
+
+```nickel
+[
+  { resources = ["job", "exec", "action", "scale", "snapshot"], actions = ["read", "write"],
+    namespaces = ["payments-*"] },
+  # Delegated creation: payments may create and delete payments-* namespaces.
+  { resources = ["namespace"], actions = ["read", "write"], namespaces = ["payments-*"] },
+]
+```
+
+`names` then narrows by the job's bare name inside those namespaces.
+`ListNamespaces` shows a namespace to anyone holding any allow there, and
+`WhoAmI` reports the set as `readable_namespaces`. A denial on a namespaced
+resource names where the token can act (`Hint: this token can write job in
+payments-*`), read off the caller's own rules; it never names the target, so
+a denial cannot confirm that something exists. Namespace policies (quota,
+pools, runtimes) are written with `acl:write`, not `namespace:write`, so a
+namespace's writer cannot raise its own limits.
 
 Manage policies with `legion acl policy apply|list|get|delete`. A policy file
 is Nickel (`.ncl`) or JSON (`.json`), read by the same rules as every other
 Legion config (see [Configuration Language](configuration-language.md)). It
-can be a bare rules array or `{description, rules}`.
+can be a bare rules array or `{description, rules}`. `apply` prints a
+warning for each rule naming an exact namespace that does not exist yet.
 
 ### Tokens
 
@@ -502,7 +537,13 @@ secret, so the worker needs no other configuration. The manager stores only
 a hash of the secret. List and revoke join tokens with
 `legion join-token list|delete` or from the UI's Access → Worker Join tab.
 Set `server.advertiseAddr` when workers reach the manager at a different
-address than it binds.
+address than it binds. A manager bound to every interface (`host =
+"0.0.0.0"`) with no `advertiseAddr` puts `127.0.0.1` in its join tokens,
+which no other machine can use: the worker dials its own loopback and
+retries, and nothing on the manager looks wrong. The manager warns about it
+at startup and with every token it mints in that state (`legion join-token
+create` prints the warning on stderr, and `--json` carries it as
+`data.warning`).
 
 Workers get their attributes from their worker type's template (pool,
 attributes, and resources from `workerConfigPath`) plus worker-side
@@ -551,6 +592,12 @@ When ACLs are enforced:
   day, long enough to bring the hosts up) and revoke them once the fleet has
   joined. Restarts do not need them. Treat the node token file like the
   node's private key: it lets its holder act as that node.
+- A registration that claims a simulator fleet (the `workerFleet`
+  attribute, which earns one certificate for every node of the fleet) is
+  refused with `PermissionDenied` unless the join token's worker type grants
+  that fleet in its own `workerFleet` attribute, and a node token cannot
+  move its node to another fleet
+  ([worker-simulation.md](worker-simulation.md)).
 - A node's certificate is issued for `<label>.node.legion`. A name that is
   already a plain DNS label (lowercase letters, digits, single `-`) is its
   own label; any other name (`ip-10-0-1-7.ec2.internal`, `Node_1`) gets a
@@ -695,7 +742,8 @@ a version with it: a manager from before it cannot talk to one after.
 
 `legion acl whoami` (CLI), `WhoAmI` (gRPC), the UI Access page, and the
 `legion_acl_whoami` MCP tool all report whether ACLs are enabled, how the
-caller was authenticated, and which policies apply. Start here when
+caller was authenticated, which policies apply, and which namespaces the
+caller can read (`readable_namespaces`). Start here when
 debugging a `PermissionDenied`.
 
 ### Recovery

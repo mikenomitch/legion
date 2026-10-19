@@ -330,7 +330,7 @@ management registration still mints and rotates.
   persist each new token.
 - **Trade-off.** A leaked node token is not invalidated by the node's next
   restart; revocation is by removing the node (or resetting ACLs). Behavior
-  change in `tests/acl_endpoints.rs` (`re-registration rotates the node token`
+  change in `tests/integration/acl_endpoints.rs` (`re-registration rotates the node token`
   for node-token registrations is gone).
 - **Why.** Simplicity and robustness: with rotation, a crash between the
   manager's commit and the worker's fsync leaves the worker holding a revoked
@@ -1821,3 +1821,178 @@ could not have helped: it only looks at the pinned node.
 **Why.** Ease. On the rig the generic message pointed at capacity on the
 wrong node. The read model is what placement uses, so the reason matches
 what the scheduler saw even when the stored row disagrees (spot-check P0-6).
+
+## 70. A failure report the manager cannot record is handed back, but only for an error
+
+*Workstream: Task lifecycle. Follow-up, 2026-10-18.*
+
+**The call.** `HeartbeatReply.retry_failed_allocations` lists the failure
+reports a manager could not record: reading the allocation or the removal
+write failed (a forward to a lane leader that had just stepped down, seen on
+the rig). The worker re-queues exactly those reports, artifact states
+included, without running the teardown again. A report for an allocation
+the manager has no row for is not retried, unlike a terminal report.
+
+**Alternatives.** Retry "not found" too, as `retry_terminated_allocations`
+does for a heartbeat that lands on a replica that has not applied the
+placement yet.
+
+**Trade-off.** A failure reported to a lagging replica within the placement's
+replication window is still dropped. A failure comes after a start, long
+after the placement applied everywhere, so the window is much smaller than a
+fast batch exit's; and the worker removes a failed allocation at once, so
+the "stop once the node no longer holds it" bound terminal reports use does
+not exist here. Retrying "not found" would resend a report for an
+allocation that was removed for good on every heartbeat, forever.
+
+**Why.** Simplicity. The bug was a failed write, and a failed write is the
+one case where the manager knows the report did not land.
+
+## 71. One-shot commands log to stderr and write no files
+
+*Workstream: CLI and diagnostics. Follow-up, 2026-10-18.*
+
+**The call.** Servers (every `legion start` subcommand, and `legion join`)
+keep their console on stdout and their JSON file logs under `./logs`. Every
+other command, `mcp serve` included, sends its console to stderr at the same
+default level (`info`) and creates no `./logs` or `./traces`. `start gateway`
+also keeps SIGPIPE ignored now: its copy loop `splice`s into client sockets,
+which raises SIGPIPE when a client hangs up, and the closed-pipe fix had
+restored the default disposition for it.
+
+**Alternatives.** Default one-shot commands to `warn`, so a human sees fewer
+trace lines.
+
+**Trade-off.** A one-shot command's `info` lines still print, now on stderr.
+
+**Why.** Ease. Moving them off stdout fixes `--json` for agents without
+hiding anything a command reports through `info!`; the level can change
+separately.
+
+## 72. A loopback join-token address from a wildcard bind warns, it does not refuse
+
+*Workstream: Manager availability. Follow-up, 2026-10-18.*
+
+**The call.** A manager bound to `0.0.0.0` or `::` with no
+`server.advertiseAddr` logs a warning at startup, and `CreateJoinToken`
+returns it with every token (`CreateJoinTokenReply.warning`; `legion
+join-token create` prints it on stderr, `--json` carries `data.warning`,
+the UI's join form shows it). A manager bound to one address, loopback
+included, gets no warning.
+
+**Alternatives.** Refuse to mint the token in that state.
+
+**Trade-off.** An operator can still hand out a token no other machine can
+use, if they ignore the warning.
+
+**Why.** Ease. The same token is right for a worker on the manager's own
+machine (`--run-worker`, a laptop cluster), so refusing would break a valid
+setup to prevent a likely mistake.
+
+## 73. A worker-reported failure stops with a new `failed` cause, and its reason is the instance's `last_stop`
+
+*Workstream: Task lifecycle. Follow-up, 2026-10-19.*
+
+**The call.** The failure-report path removes the allocation with
+`StopCause::Failed` (wire `failed`) instead of `Unknown`, and records the
+instance's `last_stop` as `Failed on node <node>: <reason>`, the reason cut to
+one line of 400 characters as the reschedule hold already does. The cause
+also reaches the stop notice, the `allocation.stopping` and
+`allocation.removed` events, and the gang-loss event.
+
+```text
+$ legion instance get web/7 -j | jq .data.lastStop
+{ "cause": "failed", "detail": "Failed on node sc-wkr-2: exit status 1 / Error: listen EADDRINUSE", ... }
+```
+
+**Alternatives.** Keep `Unknown` and attach only the explanation, so
+`last_stop` reads `cause: unknown` with a failure sentence; or keep the
+generic `Reschedule` cause.
+
+**Trade-off.** One more word in a stable wire vocabulary, which an older
+worker reads as `unknown` (its parser maps unrecognized causes there), and a
+failure now writes a stop notice row like every other cause.
+
+**Why.** Ease. `unknown` was documented as "most often the failure path",
+which made the one cause an operator most needs to tell apart the least
+specific one, and the UI now flags `failed` rows like other platform stops.
+
+## 74. The disk-fit fingerprint reads the disk holding the worker's state dir
+
+*Workstream: Scheduler. Follow-up, 2026-10-19.*
+
+**The call.** The kitchen-sink fingerprint's top-level `disk_total_space`,
+`disk_available_space`, and `disk_is_removable` describe the mount whose
+path is the longest component prefix of the worker state file's directory
+(`LEGION_WORKER_STATE_PATH`'s parent, else `<dataDir>/workers/default`, its
+nearest existing ancestor, symlinks resolved). Allocations and `local-dir`
+volumes live beside that file. A host where no listed mount matches falls
+back to the last disk, as before.
+
+**Alternatives.** Report the largest disk, or the sum of all disks; add a
+worker config field naming the volume disk.
+
+**Trade-off.** A worker whose `volumes/` sits on another mount than its
+state file (a bind mount under the data dir) is still judged by the state
+file's disk.
+
+**Why.** Simplicity. The volume root is derived from the state file's
+directory, so that disk is the one the check means; a config field would be
+a new surface for a case nobody has.
+
+## 75. A follower publishes its config row through the control lane's leader, in the background
+
+*Workstream: Manager availability. Follow-up, 2026-10-19.*
+
+**The call.** `upsert_manager_config` forwards to the control lane's leader
+(`ForwardableLaneWrite::UpsertManagerConfig`, the config already serialized,
+so the row is byte-for-byte what its manager wrote). A manager that does not
+lead the control lane at startup spawns the write and retries it on the
+startup-write budget while the cluster elects; it does not hold startup for
+it.
+
+**Alternatives.** Have the leader write every member's row from what each
+member reports; or block a follower's startup until the row lands.
+
+**Trade-off.** A follower that cannot reach a leader within the startup
+budget has no row until it next wins leadership (the watcher that re-runs
+leader writes), or restarts.
+
+**Why.** Simplicity. Only the manager knows its own config, and the forward
+path already exists for writes whose origin cannot lead.
+
+## 76. Supplementary groups follow runc: implicit users only, root included
+
+*Workstream: Linux containers. Follow-up, 2026-10-19.*
+
+**The call.** A container process gets `additionalGids` from every image
+`/etc/group` line whose member list names the user, when the user was given
+in the implicit form: a name, a uid with a passwd entry, or no `USER`
+(root). `user:group` gets exactly that group, and a bare uid with no passwd
+entry gets none. The primary gid and repeats are left out.
+
+**Alternatives.** Supplementary groups for `user:group` too; none for root.
+
+**Trade-off.** An image that relied on running without its groups (none
+known) changes behavior.
+
+**Why.** Ease. It is what `docker run` does (runc's `GetExecUser`), so an
+image behaves the same under Legion as on a laptop.
+
+## 77. Directory modes land at the end of each layer, not at the end of the image
+
+*Workstream: Linux containers. Follow-up, 2026-10-19.*
+
+**The call.** Layer extraction creates each directory entry writable,
+writes the layer's other entries, and applies the directories' recorded
+modes deepest first once the layer is done, as `tar::Archive::unpack` does.
+
+**Alternatives.** Defer every directory mode to the end of the whole image.
+
+**Trade-off.** A non-root worker still cannot write a later layer's entries
+into a directory an earlier layer made read-only.
+
+**Why.** Simplicity. Every layer stays a self-contained step, and the
+cross-layer case needs a read-only directory that a later layer then writes
+into, which no image in use has; root, the Linux worker's normal user,
+bypasses the mode either way.

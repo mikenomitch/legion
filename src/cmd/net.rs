@@ -929,9 +929,9 @@ async fn delete(matches: &ArgMatches) -> R<()> {
     Ok(())
 }
 
-fn job_scope_args(matches: &ArgMatches) -> (String, String, String) {
-    (
-        matches.get_one::<String>("job").expect("required").clone(),
+fn job_scope_args(matches: &ArgMatches) -> R<(String, String, String)> {
+    Ok((
+        crate::cmd::helpers::required_job_arg(matches, "job")?,
         matches
             .get_one::<String>("task")
             .cloned()
@@ -940,12 +940,12 @@ fn job_scope_args(matches: &ArgMatches) -> (String, String, String) {
             .get_one::<String>("pool")
             .cloned()
             .unwrap_or_default(),
-    )
+    ))
 }
 
 async fn show(matches: &ArgMatches) -> R<()> {
     let format = OutputFormat::from_matches(matches);
-    let (job_id, task_name, node_pool) = job_scope_args(matches);
+    let (job_id, task_name, node_pool) = job_scope_args(matches)?;
     let mut client = connect_manager_client().await?;
     let reply = output::resolve(
         format,
@@ -1121,7 +1121,7 @@ fn print_effective(
 
 async fn test(matches: &ArgMatches) -> R<()> {
     let format = OutputFormat::from_matches(matches);
-    let (job_id, task_name, node_pool) = job_scope_args(matches);
+    let (job_id, task_name, node_pool) = job_scope_args(matches)?;
     let get = |key: &str| matches.get_one::<String>(key).cloned().unwrap_or_default();
     let (to, from) = (get("to"), get("from"));
     if to.is_empty() && from.is_empty() {
@@ -1569,7 +1569,7 @@ pub(crate) fn doctor_verdict(steps: &[DoctorStep]) -> &'static str {
 
 async fn doctor(matches: &ArgMatches) -> R<()> {
     let format = OutputFormat::from_matches(matches);
-    let (job_id, task_name, node_pool) = job_scope_args(matches);
+    let (job_id, task_name, node_pool) = job_scope_args(matches)?;
     let mut client = connect_manager_client().await?;
     let reply = output::resolve(
         format,

@@ -10,6 +10,7 @@ import { formatDate } from '../../utils/format'
 import { retainOnError, usePoll } from '../../utils/polling'
 import { isRolloutDone } from '../../utils/status'
 import { artifactProgressPercent, parseArtifactStates } from '../../utils/jobspec'
+import { jobPath } from '../../utils/namespaces'
 
 const logLevelTone = (level: string) => {
   const normalized = level.toLowerCase()
@@ -98,16 +99,16 @@ function RolloutDetailContent() {
                 subtitle={
                   <>
                     Job{' '}
-                    <A href={`/jobs/${encodeURIComponent(rollout().jobId)}`} class={linkClass}>
+                    <A href={`${jobPath(rollout().jobId)}`} class={linkClass}>
                       {rollout().jobId}
                     </A>
                     <span class="mx-2 text-faint">·</span>
                     <span class="font-mono text-xs">
-                      <A class="hover:text-brass-strong" href={`/jobs/${encodeURIComponent(rollout().jobId)}/specs/${encodeURIComponent(rollout().fromJobConfigId || '')}`}>
+                      <A class="hover:text-brass-strong" href={`${jobPath(rollout().jobId)}/specs/${encodeURIComponent(rollout().fromJobConfigId || '')}`}>
                         {rollout().fromJobConfigId || '—'}
                       </A>
                       {' → '}
-                      <A class="hover:text-brass-strong" href={`/jobs/${encodeURIComponent(rollout().jobId)}/specs/${encodeURIComponent(rollout().toJobConfigId)}`}>
+                      <A class="hover:text-brass-strong" href={`${jobPath(rollout().jobId)}/specs/${encodeURIComponent(rollout().toJobConfigId)}`}>
                         {rollout().toJobConfigId}
                       </A>
                     </span>
@@ -162,7 +163,7 @@ function RolloutDetailContent() {
                                 <Show when={allocation.taskName}>
                                   <A
                                     class="text-muted hover:text-brass-strong"
-                                    href={`/jobs/${encodeURIComponent(rollout().jobId)}/tasks/${encodeURIComponent(allocation.taskName)}`}
+                                    href={`${jobPath(rollout().jobId)}/tasks/${encodeURIComponent(allocation.taskName)}`}
                                   >
                                     {allocation.taskName}
                                   </A>

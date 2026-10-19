@@ -852,8 +852,8 @@ struct AppliedEvictions {
     /// `allocation.preempted` events, staged in the transaction and
     /// published after it commits.
     events: Vec<SchedulerEventRecord>,
-    /// `(pool, band, count)` rows for `legion_preemptions_total`.
-    metric_rows: Vec<(String, String, u64)>,
+    /// `(pool, band, namespace, count)` rows for `legion_preemptions_total`.
+    metric_rows: Vec<(String, String, String, u64)>,
 }
 
 /// What a heartbeat from a given node costs.
@@ -2377,7 +2377,7 @@ impl Store {
     /// from this node fails as unreachable before dialing. Paired with
     /// dropping the node's inbound transport listener this fully isolates
     /// the node from its peers — the in-process equivalent of yanking its
-    /// network cable (`tests/raft_durability.rs`). Errors on non-raft
+    /// network cable (`tests/integration/raft_durability.rs`). Errors on non-raft
     /// backends and before the raft engine has started.
     pub fn raft_set_outbound_blocked(&self, blocked: bool) -> R<()> {
         self.persistence_driver
@@ -2899,7 +2899,15 @@ impl Store {
             // is defensive: surface what actually happened.
             return Err(original);
         };
-        match driver.forward_lane_write(&op) {
+        let forwarded = driver.forward_lane_write(&op);
+        crate::manager::telemetry::metrics()
+            .leader_forwards_total
+            .inc(&[
+                op.lane().wire_name(),
+                op.op_name(),
+                if forwarded.is_ok() { "ok" } else { "failed" },
+            ]);
+        match forwarded {
             Ok(value) => {
                 debug!(
                     op = op.op_name(),
@@ -5034,7 +5042,7 @@ impl Store {
     /// fast path, its re-run-singly fallback, and the
     /// `plan_apply_coalescing: false` path. Exactly the pre-D5 operation.
     /// The two formats propose under their own op names — the raft log (and
-    /// the lane classification in `tests/raft_seam.rs`) says which walk ran.
+    /// the lane classification in `tests/integration/raft_seam.rs`) says which walk ran.
     fn submit_and_apply_plan_replicated(&self, request: PlanApplyRequest) -> R<PlanApplyReply> {
         match request.placements {
             PlanPlacements::Nodes(_) => {
@@ -6165,8 +6173,10 @@ impl Store {
         }
         if !preempted.victims.is_empty() {
             let metrics = crate::manager::telemetry::metrics();
-            for (pool, band, count) in preempted.metric_rows {
-                metrics.preemptions_total.inc_by(&[&pool, &band], count);
+            for (pool, band, namespace, count) in preempted.metric_rows {
+                metrics
+                    .preemptions_total
+                    .inc_by(&[&pool, &band, &namespace], count);
             }
             metrics.preemption_plans_total.inc(&["placed"]);
         }
@@ -6646,9 +6656,9 @@ impl Store {
             }
         }
 
-        // Metric rows, keyed by the victim's pool and band — the two axes an
-        // operator slices preemption rate by.
-        let mut metric_counts: BTreeMap<(String, String), u64> = BTreeMap::new();
+        // Metric rows, keyed by the victim's pool, band and namespace — the
+        // axes an operator slices preemption rate by.
+        let mut metric_counts: BTreeMap<(String, String, String), u64> = BTreeMap::new();
         for victim in &victims {
             let pool: String = tx
                 .query_row(
@@ -6663,7 +6673,8 @@ impl Store {
                 .find(|eviction| eviction.allocation_id == victim.id)
                 .map(|eviction| eviction.band.clone())
                 .unwrap_or_else(|| Band::default().as_str().to_string());
-            *metric_counts.entry((pool, band)).or_default() += 1;
+            let namespace = crate::structs::namespace::job_namespace(&victim.job_id).to_string();
+            *metric_counts.entry((pool, band, namespace)).or_default() += 1;
         }
 
         Ok(AppliedEvictions {
@@ -6671,7 +6682,7 @@ impl Store {
             events,
             metric_rows: metric_counts
                 .into_iter()
-                .map(|((pool, band), count)| (pool, band, count))
+                .map(|((pool, band, namespace), count)| (pool, band, namespace, count))
                 .collect(),
         })
     }
@@ -6892,9 +6903,13 @@ impl Store {
 
     fn job_from_row(&self, row: &Row<'_>) -> Result<Job, rusqlite::Error> {
         let created_at: i64 = row.get(3)?;
+        let id: String = row.get(0)?;
+        let (namespace, name) = crate::structs::namespace::split_job_id(&id);
+        let (namespace, name) = (namespace.to_string(), name.to_string());
         let job = Job {
-            id: row.get(0)?,
-            name: row.get(1)?,
+            id,
+            name,
+            namespace,
             status: row.get(2)?,
             created_at,
             // NULL only for a row the backfill deliberately skipped (a
@@ -7426,23 +7441,43 @@ impl Store {
     // MANAGER CONFIG
     //
 
+    /// Publish this manager's config row (the Managers page's Config
+    /// column). Forwards to the control lane's leader when this manager does
+    /// not lead it, so a manager that has never led still has a row.
     #[instrument(err, skip_all)]
     pub fn upsert_manager_config(&self, node_id: &str, config: &ManagerConfigFull) -> R<()> {
+        let config_json = to_string_pretty(config)?;
+        match self.upsert_manager_config_local(node_id, &config_json) {
+            Err(err) if crate::storage::raft::driver::NotRaftLeader::in_chain(&err) => self
+                .forward_after_rejection::<()>(
+                    crate::storage::raft::forward::ForwardableLaneWrite::UpsertManagerConfig {
+                        node_id: node_id.to_owned(),
+                        config_json,
+                    },
+                    err,
+                ),
+            other => other,
+        }
+    }
+
+    /// [`Self::upsert_manager_config`], non-forwarding (also the
+    /// `ForwardLaneWrite` executor's entry point). Takes the config already
+    /// serialized, so a forwarded row is byte-for-byte what its manager wrote.
+    pub(crate) fn upsert_manager_config_local(&self, node_id: &str, config_json: &str) -> R<()> {
         let node_id = node_id.to_owned();
-        let config = config.clone();
+        let config_json = config_json.to_owned();
         self.replicated(Lane::Control, "upsert_manager_config", move |s| {
-            s.upsert_manager_config_apply(&node_id, &config)
+            s.upsert_manager_config_apply(&node_id, &config_json)
         })
     }
 
-    fn upsert_manager_config_apply(&self, node_id: &str, config: &ManagerConfigFull) -> R<()> {
+    fn upsert_manager_config_apply(&self, node_id: &str, config_json: &str) -> R<()> {
         let fmt = format_description!(
             "[year]-[month]-[day] [hour]:[minute]:[second] [offset_hour \
                  sign:mandatory]:[offset_minute]:[offset_second]"
         );
 
         let timestamp_now = OffsetDateTime::now_utc().format(fmt)?;
-        let config_json = to_string_pretty(config)?;
 
         let conn = self.write_connection()?;
 
@@ -7555,7 +7590,10 @@ impl Store {
 
         let params = named_params! {
             ":id": id,
-            ":status": "ready",
+            // `active`, the status every liveness query matches. This once
+            // wrote `ready`, which dropped a node recovered here out of the
+            // liveness scan and out of `legion_nodes{status="active"}`.
+            ":status": "active",
             ":last_heartbeat": last_heartbeat,
         };
 
@@ -7807,7 +7845,7 @@ impl Store {
     /// and see only COMMITTED state, so a reconcile composed into the same
     /// capture as the eviction could not observe the eviction and placed
     /// nothing (latent raft-mode bug, exposed by
-    /// tests/raft_ownership_guard.rs). Sequencing the ops lets each read
+    /// tests/integration/raft_ownership_guard.rs). Sequencing the ops lets each read
     /// its predecessor's committed effects. A failed reconcile queues its
     /// own `job_reschedule` retry
     /// ([`Self::reconcile_job_configs_or_requeue`]), because a re-run of
@@ -8479,12 +8517,10 @@ impl Store {
                 // construction: a node transitions twice per outage, not
                 // thirty times a minute.
                 //
-                // Deliberately NOT `mark_node_ready`: that writes status
-                // `"ready"`, which every liveness query filters out (they all
-                // match `"active"`), so recovering through it would drop the
-                // node out of the liveness scan and out of
-                // `legion_nodes{status="active"}`. This is the same composite
-                // shape with the correct status value.
+                // Not `mark_node_ready`: the same status-then-control
+                // composite, but a recovery from `lost` flips availability
+                // back only if the loss changed it, counts the recovery, and
+                // re-observes the node in the in-memory liveness tracker.
                 self.update_node_heartbeat_forwarding(id.clone())?;
                 self.restore_availability_after_loss(&id);
                 self.liveness.observe(&id);
@@ -10575,6 +10611,14 @@ impl Store {
                 was_update = true;
             }
         }
+        // Namespace policy quota and job count, inside this entry so racing
+        // submits serialize. An unchanged resubmit returned above: a job
+        // that was admitted stays admitted.
+        crate::storage::namespace_policy_store::enforce_admission_on(
+            tx,
+            &self.resource_policy,
+            &config,
+        )?;
 
         let now = OffsetDateTime::now_utc().unix_timestamp();
 
@@ -12729,7 +12773,8 @@ impl Store {
         SELECT jcs.path, jcs.is_primary, s.content
         FROM submission s
         INNER JOIN job_config_submission jcs ON jcs.submission_hash = s.hash
-        WHERE jcs.job_config_id = ?;
+        WHERE jcs.job_config_id = ?
+        ORDER BY jcs.is_primary DESC, jcs.id;
 "#;
         let mut stmt = conn.prepare(sql)?;
         let subs = Self::collect_rows(stmt.query_map([job_config_id], |row| {
@@ -13207,21 +13252,29 @@ impl Store {
     /// in-task `to`, else its static host port — so a consumer's VIP can
     /// listen on the number the service is known by. `None` when the service
     /// is not (yet) submitted or declares only a dynamic port with no `to`.
-    fn declared_service_port(&self, tx: &Connection, service: &str) -> R<Option<u16>> {
+    /// The port a service declares, by its canonical reference
+    /// (`name` in `default`, else `namespace/name`): the newest task config
+    /// in that namespace advertising it.
+    fn declared_service_port(&self, tx: &Connection, service_ref: &str) -> R<Option<u16>> {
+        let (namespace, service) = crate::structs::namespace::split_job_id(service_ref);
         let mut stmt = tx.prepare_cached(
-            "SELECT network, service FROM task_config
+            "SELECT network, service, job_id FROM task_config
              WHERE service IS NOT NULL AND json_valid(service)
                AND COALESCE(json_extract(service, '$.name'), name) = ?
-             ORDER BY id DESC LIMIT 1;",
+             ORDER BY id DESC;",
         )?;
-        let row = stmt
-            .query_row([service], |row| {
-                Ok((
-                    row.get::<_, Option<String>>(0)?,
-                    row.get::<_, Option<String>>(1)?,
-                ))
-            })
-            .optional()?;
+        let mut rows = stmt.query([service])?;
+        let mut row = None;
+        while let Some(candidate) = rows.next()? {
+            let job_id: String = candidate.get(2)?;
+            if crate::structs::namespace::job_namespace(&job_id) == namespace {
+                row = Some((
+                    candidate.get::<_, Option<String>>(0)?,
+                    candidate.get::<_, Option<String>>(1)?,
+                ));
+                break;
+            }
+        }
         let Some((network_raw, service_raw)) = row else {
             return Ok(None);
         };
@@ -13299,7 +13352,6 @@ impl Store {
             .optional()?;
         let facts = crate::structs::netpolicy::NetSelectorFacts {
             node_pool: pool,
-            namespace: String::new(),
             runtime,
             job: job_id,
             labels: network.map(|n| n.labels.clone()).unwrap_or_default(),
@@ -13360,7 +13412,6 @@ impl Store {
                     .optional()?;
                 let facts = crate::structs::netpolicy::NetSelectorFacts {
                     node_pool: pool,
-                    namespace: String::new(),
                     runtime,
                     job: job_id,
                     labels: network.map(|n| n.labels.clone()).unwrap_or_default(),
@@ -13489,7 +13540,6 @@ impl Store {
                 .optional()?;
             let facts = crate::structs::netpolicy::NetSelectorFacts {
                 node_pool: pool,
-                namespace: String::new(),
                 runtime: runtime.clone(),
                 job: job_id,
                 labels: network.map(|n| n.labels.clone()).unwrap_or_default(),
@@ -13648,14 +13698,14 @@ impl Store {
             }
             let mut service_ports: HashMap<String, u16> = HashMap::new();
             if let Some(connect) = connect.as_ref() {
+                let consumer_job: String = tx
+                    .prepare_cached("SELECT job_id FROM task_config WHERE id = ?;")?
+                    .query_row([task_id], |row| row.get(0))?;
                 for upstream in &connect.upstreams {
-                    if upstream.is_external() {
-                        continue;
-                    }
-                    let Some(service) = upstream.service() else {
+                    let Some(target) = upstream.service_ref(&consumer_job) else {
                         continue;
                     };
-                    if let Some(port) = self.declared_service_port(tx, &service)? {
+                    if let Some(port) = self.declared_service_port(tx, &target)? {
                         service_ports.insert(upstream.key(), port);
                     }
                 }
@@ -15160,6 +15210,12 @@ impl Store {
     /// JSON (they cannot match a name anyway, and one hand-corrupted row must
     /// not take down every consumer's endpoint feed); the unfiltered form
     /// still surfaces them as an error.
+    ///
+    /// The filter is a canonical service reference: `web` for the service
+    /// in `default`, `payments-prod/web` for one in another namespace
+    /// (docs/namespaces.md). A service is identified by its namespace and
+    /// name, so two namespaces' `web` are two services: the name is seeked
+    /// in SQL and the namespace — the declaring job's — checked per row.
     pub fn service_endpoints(
         &self,
         service_filter: Option<&str>,
@@ -15167,8 +15223,10 @@ impl Store {
         let conn = self.read_connection()?;
         let sql = Self::service_endpoints_sql(service_filter.is_some());
         let mut stmt = conn.prepare(&sql)?;
+        let filter = service_filter.map(crate::structs::namespace::split_job_id);
+        let name_filter = filter.map(|(_, name)| name);
 
-        let rows = stmt.query_map(params_from_iter(service_filter.iter()), |row| {
+        let rows = stmt.query_map(params_from_iter(name_filter.iter()), |row| {
             Ok((
                 row.get::<_, String>(0)?,
                 row.get::<_, String>(1)?,
@@ -15197,6 +15255,11 @@ impl Store {
                 node_status,
                 node_config_attrs,
             ) = row?;
+            if let Some((namespace, _)) = filter {
+                if crate::structs::namespace::job_namespace(&job_id) != namespace {
+                    continue;
+                }
+            }
 
             let service: crate::structs::ServiceConfig = from_str(&service_raw)
                 .with_context(|| format!("invalid stored service config for task {task_name}"))?;
@@ -15616,10 +15679,17 @@ impl Store {
         }
         // `count.per` places `count` per attribute value, so the total is not
         // known here: every replica that was placed has finished, which is
-        // the best available answer.
+        // the best available answer. A `legion job scale` override laid over
+        // this spec count is the count to cover (`effective_task_count`):
+        // read against the spec, a batch task scaled below it never reached
+        // `success` and its dependents never started.
         let (count, per): (i64, Option<String>) = tx
             .query_row(
-                "SELECT count, count_per FROM task_config WHERE id = ?1;",
+                "SELECT COALESCE(ts.count, tc.count), tc.count_per FROM task_config tc \
+                 LEFT JOIN task_scale ts \
+                   ON ts.job_id = tc.job_id AND ts.task_group = tc.group_name \
+                  AND ts.task_name = tc.name AND ts.base_count = tc.count \
+                 WHERE tc.id = ?1;",
                 [task_config_id],
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
@@ -16709,6 +16779,24 @@ impl Store {
         Ok(instance)
     }
 
+    /// The instance promoted from session `session_id`, if one was. A
+    /// session's id is minted and cluster-unique, so this finds a named
+    /// promotion without knowing the namespace its new key was qualified in.
+    pub fn instance_promoted_from(&self, session_id: &str) -> R<Option<Instance>> {
+        let conn = self.read_connection()?;
+        let instance = conn
+            .query_row(
+                &format!(
+                    "SELECT {} FROM instance WHERE promoted_from = ? LIMIT 1;",
+                    crate::storage::queries::INSTANCE_SELECT_ATTRS
+                ),
+                [session_id],
+                |row| self.instance_from_row(row),
+            )
+            .optional()?;
+        Ok(instance)
+    }
+
     /// Whether an instance row exists (live, stopped, or a tombstone), read
     /// through the write connection. Only meaningful inside an op body,
     /// where it sees rows that this op and its group-commit batch-mates
@@ -17132,7 +17220,15 @@ impl Store {
         requested_id: Option<&str>,
     ) -> R<String> {
         let now = Self::now_rfc3339()?;
-        let instance_id = match requested_id {
+        // A caller's key is qualified by the job's namespace, so keys and
+        // their tombstones are unique per namespace, not cluster-wide.
+        let qualified = requested_id.map(|key| {
+            crate::structs::namespace::qualify_instance_in(
+                crate::structs::namespace::job_namespace(job_id),
+                key,
+            )
+        });
+        let instance_id = match qualified.as_deref() {
             Some(id) => {
                 if Self::instance_id_exists_tx(tx, id)? {
                     bail!(StorageError::Conflict {
@@ -17271,9 +17367,11 @@ impl Store {
     /// RunJob seeding half; see the field docs on
     /// [`crate::structs::StatefulConfig::initial_instances`]).
     ///
-    /// Ids that have never existed are created as `pending` keyed rows; ids
-    /// that already exist in ANY state — live, stopped, or a terminated
-    /// tombstone, even under another job — are skipped silently
+    /// Each id is a key, qualified by the job's namespace
+    /// ([`crate::structs::namespace::instance_id`]). Ids that have never
+    /// existed are created as `pending` keyed rows; ids that already exist in
+    /// ANY state — live, stopped, or a terminated tombstone, even under
+    /// another job of the namespace — are skipped silently
     /// (`INSERT OR IGNORE`), so resubmits are idempotent and a deliberately
     /// destroyed id is never resurrected. Returns the ids actually created
     /// by this call.
@@ -17337,7 +17435,9 @@ impl Store {
         let mut conn = self.write_connection()?;
         let tx = Self::write_tx(&mut conn)?;
         let mut created = Vec::new();
-        for id in ids {
+        let namespace = crate::structs::namespace::job_namespace(job_id);
+        for key in ids {
+            let id = crate::structs::namespace::qualify_instance_in(namespace, key);
             let inserted = tx.execute(
                 "INSERT OR IGNORE INTO instance (instance_id, job_id, group_name, task_name, \
                  mode, state, slot_index, current_alloc_id, storage_handle, created_at, \
@@ -17346,7 +17446,7 @@ impl Store {
                 params![id, job_id, group, task_name, now],
             )?;
             if inserted > 0 {
-                created.push(id.clone());
+                created.push(id);
             }
         }
         tx.commit()?;
@@ -19497,6 +19597,7 @@ impl Store {
                 message: "sql must not be empty".to_string(),
             }));
         }
+        self.refuse_trailing_statements(trimmed)?;
 
         let statement_type = Self::sqlite_statement_type(trimmed);
         if !allow_write && !Self::is_read_only_statement(&statement_type) {
@@ -19585,6 +19686,24 @@ impl Store {
         self.replicated(Lane::Control, "query_state_store", move |s| {
             s.query_state_store_apply(&sql, &statement_type)
         })
+    }
+
+    /// Refuse SQL holding more than one statement. `prepare` and `execute`
+    /// compile the first statement and silently drop the rest, so
+    /// `SELECT 1; SELECT 2` answered only the first, and an `--allow-write`
+    /// batch ran only its first write while reporting success. The
+    /// read-only gate also classifies the first statement alone. A trailing
+    /// comment or whitespace is not a statement and passes.
+    fn refuse_trailing_statements(&self, sql: &str) -> R<()> {
+        let conn = self.read_connection()?;
+        let mut batch = rusqlite::Batch::new(&conn, sql);
+        batch.next().map_err(Self::user_sql_error)?;
+        // Any further statement is refused, even one that does not compile:
+        // the caller's mistake is sending two.
+        if !matches!(batch.next(), Ok(None)) {
+            return Err(Self::user_sql_error(rusqlite::Error::MultipleStatement));
+        }
+        Ok(())
     }
 
     fn query_state_store_apply(&self, sql: &str, statement_type: &str) -> R<StateStoreQueryResult> {
@@ -20969,6 +21088,38 @@ impl Store {
         Self::collect_rows(rows)
     }
 
+    /// [`Self::pinned_placements_for_task`] for a task named by job, group,
+    /// and name rather than a stored id. A dry-run plan of an unsubmitted
+    /// config has no task ids, yet a resubmit of a stateful job still places
+    /// onto its instances' pinned volumes.
+    pub fn pinned_placements_for_task_named(
+        &self,
+        job_id: &str,
+        group_name: &str,
+        task_name: &str,
+    ) -> R<Vec<(String, String)>> {
+        let conn = self.read_connection()?;
+        let mut stmt = conn.prepare_cached(
+            "SELECT instance.instance_id, volume.node_id \
+             FROM instance \
+             INNER JOIN volume ON volume.instance_id = instance.instance_id \
+             WHERE instance.job_id = ?1 \
+             AND instance.group_name = ?2 \
+             AND instance.task_name = ?3 \
+             AND instance.state IN ('pending', 'rescheduling') \
+             AND instance.current_alloc_id IS NULL \
+             AND instance.storage_handle = volume.driver || '/' || volume.volume_id \
+             AND volume.node_local = 1 \
+             AND volume.node_id IS NOT NULL \
+             AND volume.state IN ('pending', 'created') \
+             ORDER BY instance.slot_index ASC, instance.instance_id ASC;",
+        )?;
+        let rows = stmt.query_map(params![job_id, group_name, task_name], |row| {
+            Ok((row.get(0)?, row.get(1)?))
+        })?;
+        Self::collect_rows(rows)
+    }
+
     /// The node a specific instance's volume is pinned to, if any. Used by the
     /// allocation binder to pair an allocation with the instance whose data
     /// already lives on the node it landed on.
@@ -21458,7 +21609,7 @@ mod tests {
     fn setup_store() -> R<Store> {
         let store_dir = Builder::new()
             .prefix("khepri-store-")
-            .tempdir()
+            .tempdir_in(crate::test_scratch::root())
             .context("Error creating temp store directory")?
             .keep();
 
@@ -27105,6 +27256,78 @@ mod tests {
         Ok(())
     }
 
+    /// `legion job scale` on a batch task: the task is done when the
+    /// SCALED count has exited, not the spec count. Read against the spec,
+    /// a `count = 3` task scaled to 2 never reached `success`, so every
+    /// `success` dependent stayed held.
+    #[test]
+    fn a_scaled_down_batch_task_succeeds_at_its_scaled_count_test() -> R<()> {
+        let store = setup_store()?;
+        let mut node = make_node_msg("node-a", "ready");
+        node.dynamic_attrs = json!({ "protocolVersion": 2 }).to_string();
+        store.insert_node(node)?;
+
+        let job = JobConfig {
+            priority: Default::default(),
+            rollout: None,
+            rollout_by_group: Default::default(),
+            name: "scaled-batch".into(),
+            tasks: vec![TaskConfig {
+                lifecycle: TaskLifecycle::Batch,
+                count: TaskCount::new(3),
+                ..TaskConfig::new("prep", "exec")
+            }],
+            version: None,
+        };
+        store.handle_job_submit(
+            &job,
+            &[Submission {
+                path: "job.ncl".into(),
+                content: "job".into(),
+                is_primary: true,
+            }],
+        )?;
+        store.set_task_scale_override(
+            "scaled-batch",
+            "default",
+            "prep",
+            2,
+            3,
+            "operator",
+            "test",
+            "t",
+        )?;
+        let job_config_id = store.get_job_config(&job.name)?.id();
+        let prep_id = task_id_for(&store, "prep", &job.name)?;
+
+        let scheduler = Scheduler::new(&store)?;
+        let outcome = scheduler.plan_and_apply(&job_config_id, PlanMode::Fresh)?;
+        store.update_task_statuses_for_allocations(&outcome.allocations)?;
+        assert_eq!(
+            outcome.allocations.len(),
+            2,
+            "the plan places the scaled count"
+        );
+
+        store.complete_allocation(outcome.allocations[0].id, true)?;
+        assert_eq!(
+            store
+                .task_statuses_for_job_config(&job_config_id)?
+                .get(&prep_id),
+            Some(&TaskStatusState::Running),
+            "one of two replicas exited"
+        );
+        store.complete_allocation(outcome.allocations[1].id, true)?;
+        assert_eq!(
+            store
+                .task_statuses_for_job_config(&job_config_id)?
+                .get(&prep_id),
+            Some(&TaskStatusState::Success),
+            "both scaled replicas exited, so the task is done"
+        );
+        Ok(())
+    }
+
     /// The status GetJobInfo/ListJobs report follows the workload: a service
     /// with a placed allocation is `running`, a batch job reads `pending`
     /// until placed, `running` while its process runs, and `complete` once
@@ -28376,7 +28599,7 @@ mod tests {
     fn allocation_ids_are_never_reused_after_removal_or_restart() -> R<()> {
         let store_dir = Builder::new()
             .prefix("khepri-store-ids-")
-            .tempdir()
+            .tempdir_in(crate::test_scratch::root())
             .context("Error creating temp store directory")?
             .keep();
         let mut config = ManagerConfigFull {
@@ -29185,6 +29408,59 @@ mod tests {
         let minted_two = store.create_keyed_instance(job_id, "default", "sandbox", None)?;
         assert_ne!(minted.instance_id, minted_two.instance_id);
         assert!(store.get_instance("user-a")?.context("tombstone")?.named);
+        Ok(())
+    }
+
+    /// Keys are qualified by the job's namespace: the same key in two
+    /// namespaces is two instances, and a tombstone blocks only its own.
+    #[test]
+    fn keyed_instance_ids_are_unique_per_namespace() -> R<()> {
+        let store = setup_store()?;
+        submit_job(&store, "web", vec![stateful_keyed_task("sandbox", true)])?;
+        submit_job(
+            &store,
+            "payments/web",
+            vec![stateful_keyed_task("sandbox", true)],
+        )?;
+
+        let plain = store.create_keyed_instance("web", "default", "sandbox", Some("user-a"))?;
+        assert_eq!(plain.instance_id, "user-a");
+        let qualified =
+            store.create_keyed_instance("payments/web", "default", "sandbox", Some("user-a"))?;
+        assert_eq!(qualified.instance_id, "payments/user-a");
+        assert_eq!(qualified.job_id, "payments/web");
+
+        let err = store
+            .create_keyed_instance("payments/web", "default", "sandbox", Some("user-a"))
+            .expect_err("a key repeats only once per namespace");
+        assert!(matches!(
+            StorageError::from_anyhow(&err),
+            Some(StorageError::Conflict { .. })
+        ));
+        // Already-canonical input is not qualified twice.
+        let err = store
+            .create_keyed_instance(
+                "payments/web",
+                "default",
+                "sandbox",
+                Some("payments/user-a"),
+            )
+            .expect_err("the same instance");
+        assert!(format!("{err:#}").contains("payments/user-a"), "{err:#}");
+
+        // Minted ids stay bare in every namespace.
+        let minted = store.create_keyed_instance("payments/web", "default", "sandbox", None)?;
+        assert!(crate::structs::is_minted_instance_id(&minted.instance_id));
+        assert!(!minted.instance_id.contains('/'));
+
+        // Seeds qualify the same way.
+        let seeded = store.seed_keyed_instances(
+            "payments/web",
+            "default",
+            "sandbox",
+            &["user-b".to_string(), "user-a".to_string()],
+        )?;
+        assert_eq!(seeded, vec!["payments/user-b".to_string()]);
         Ok(())
     }
 
@@ -30488,12 +30764,33 @@ mod tests {
     }
 
     #[test]
+    fn a_node_marked_ready_is_back_in_the_liveness_scan_test() -> R<()> {
+        // `mark_node_ready` once wrote status `ready`, which every liveness
+        // query filters out, so a node recovered through it vanished from
+        // the scan that would notice it going quiet again.
+        let store = setup_store()?;
+        store.insert_node(make_node_msg("node-a", "lost"))?;
+        assert!(store.active_node_liveness_rows()?.is_empty());
+
+        store.mark_node_ready("node-a", "2026-01-01T00:00:00Z")?;
+
+        assert_eq!(store.get_node("node-a")?.status, "active");
+        let live: Vec<String> = store
+            .active_node_liveness_rows()?
+            .into_iter()
+            .map(|row| row.id)
+            .collect();
+        assert_eq!(live, vec!["node-a".to_string()]);
+        Ok(())
+    }
+
+    #[test]
     fn apply_projects_read_model_and_event_side_effects() -> R<()> {
         let src = setup_store()?;
         let dst = setup_store()?;
         // Identical seed state on both replicas (same rows, same rowids).
-        src.insert_node(make_node_msg("node-a", "active"))?;
-        dst.insert_node(make_node_msg("node-a", "active"))?;
+        src.insert_node(make_node_msg("node-a", "lost"))?;
+        dst.insert_node(make_node_msg("node-a", "lost"))?;
 
         let mut src_events = src.subscribe_events();
         let mut dst_events = dst.subscribe_events();
@@ -30507,18 +30804,18 @@ mod tests {
         // rows themselves rolled back on the proposer.
         assert!(src_events.try_recv().is_err(), "no event before commit");
         let src_node = src.get_node("node-a")?;
-        assert_eq!(src_node.status, "active", "node row rolled back");
+        assert_eq!(src_node.status, "lost", "node row rolled back");
         let cached = src.cached_nodes()?;
-        assert_eq!(cached[0].status, "active", "read model not touched");
+        assert_eq!(cached[0].status, "lost", "read model not touched");
 
         raft_capture::apply_changeset(&dst, &changeset)?;
 
         // Data applied...
-        assert_eq!(dst.get_node("node-a")?.status, "ready");
+        assert_eq!(dst.get_node("node-a")?.status, "active");
         // ...read model projected from the changeset...
         let dst_cached = dst.cached_nodes()?;
         assert_eq!(dst_cached.len(), 1);
-        assert_eq!(dst_cached[0].status, "ready");
+        assert_eq!(dst_cached[0].status, "active");
         assert_eq!(dst_cached[0].last_heartbeat, "2026-01-01T00:00:00Z");
         // ...and the staged events broadcast at apply time, in id order.
         let kinds: Vec<String> = std::iter::from_fn(|| dst_events.try_recv().ok())
@@ -30539,11 +30836,11 @@ mod tests {
 
         let src = setup_store()?;
         let dst = setup_store()?;
-        src.insert_node(make_node_msg("node-a", "active"))?;
-        dst.insert_node(make_node_msg("node-a", "active"))?;
+        src.insert_node(make_node_msg("node-a", "lost"))?;
+        dst.insert_node(make_node_msg("node-a", "lost"))?;
         let attached = dst.work_log().attach("node-a", 0, 0);
         assert!(matches!(
-            WorkLog::take_pending(&attached.log),
+            WorkLog::take_pending(&attached.log, attached.session),
             PendingWork::Resync
         ));
 
@@ -30558,14 +30855,17 @@ mod tests {
             "the injected failure fired"
         );
 
-        assert_eq!(dst.get_node("node-a")?.status, "ready", "rows applied");
+        assert_eq!(dst.get_node("node-a")?.status, "active", "rows applied");
         assert_eq!(
             dst.cached_nodes()?[0].status,
-            "ready",
+            "active",
             "read model rebuilt from the committed rows"
         );
         assert!(
-            matches!(WorkLog::take_pending(&attached.log), PendingWork::Resync),
+            matches!(
+                WorkLog::take_pending(&attached.log, attached.session),
+                PendingWork::Resync
+            ),
             "streaming workers are resynced"
         );
         Ok(())
@@ -31481,6 +31781,49 @@ mod tests {
             );
             assert!(format!("{err:#}").contains(needle), "{sql}: {err:#}");
         }
+        Ok(())
+    }
+
+    /// `state query` ran only the first of several statements and dropped
+    /// the rest without a word, on the read path and the `--allow-write`
+    /// path alike. A second statement is now refused before anything runs.
+    #[test]
+    fn a_state_query_with_two_statements_is_refused_test() -> R<()> {
+        let store = setup_store()?;
+        store.query_state_store("CREATE TABLE two_statements (v TEXT);", true)?;
+        for (sql, allow_write) in [
+            ("SELECT 1; SELECT 2", false),
+            ("SELECT 1; DELETE FROM two_statements", false),
+            ("SELECT 1; not even sql", false),
+            (
+                "INSERT INTO two_statements VALUES ('a'); INSERT INTO two_statements VALUES ('b')",
+                true,
+            ),
+        ] {
+            let err = store
+                .query_state_store(sql, allow_write)
+                .err()
+                .with_context(|| format!("{sql} should be refused"))?;
+            assert!(
+                matches!(
+                    StorageError::from_anyhow(&err),
+                    Some(StorageError::InvalidInput { .. })
+                ),
+                "{sql}: {err:#}"
+            );
+            assert!(
+                format!("{err:#}").contains("more than one statement"),
+                "{sql}: {err:#}"
+            );
+        }
+        // Nothing from the refused write batch ran.
+        let count = store.query_state_store("SELECT COUNT(*) AS n FROM two_statements", false)?;
+        assert_eq!(count.rows[0].json, r#"{"n":0}"#);
+
+        // One statement with a trailing semicolon, whitespace, or comment is
+        // still one statement.
+        store.query_state_store("SELECT 1;  ", false)?;
+        store.query_state_store("SELECT 1; -- trailing comment", false)?;
         Ok(())
     }
 

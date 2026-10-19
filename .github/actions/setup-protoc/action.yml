@@ -1,0 +1,24 @@
+name: Set up protoc
+description: >-
+  Install a pinned protoc release (binary plus well-known-type includes) into
+  /usr/local. Replaces `apt-get update && apt-get install protobuf-compiler`,
+  which spent 20-40s per job refreshing package lists for one binary.
+
+runs:
+  using: composite
+  steps:
+    # 21.12 is protoc 3.21.12, the version Ubuntu 24.04's protobuf-compiler
+    # package ships, so the generated code matches what contributors get from
+    # their distro. Verified against the checksum below.
+    - name: Install protoc
+      shell: bash
+      env:
+        PROTOC_VERSION: "21.12"
+        PROTOC_SHA256: 3a4c1e5f2516c639d3079b1586e703fc7bcfa2136d58bda24d1d54f949c315e8
+      run: |
+        curl -sSL -o "$RUNNER_TEMP/protoc.zip" \
+          "https://github.com/protocolbuffers/protobuf/releases/download/v${PROTOC_VERSION}/protoc-${PROTOC_VERSION}-linux-x86_64.zip"
+        echo "${PROTOC_SHA256}  $RUNNER_TEMP/protoc.zip" | sha256sum -c -
+        sudo unzip -q -o "$RUNNER_TEMP/protoc.zip" -d /usr/local bin/protoc 'include/*'
+        sudo chmod +x /usr/local/bin/protoc
+        protoc --version

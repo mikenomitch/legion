@@ -90,7 +90,7 @@ We want Legion to be **faster and more scalable than Nomad/K8s** (per [`README.m
 | Idempotency | AGENTS.md / `Store::idempotency_*` | Mutating RPCs carry `idempotency_key`; commands must dedupe on apply (replay-safety). |
 | Read model cache | [`src/storage/store.rs:105`](../../src/storage/store.rs) | In-memory `SchedulingReadModel` already decouples scheduler reads from the write DB — the natural projection point for a multi-lane read view. |
 | Raft tests | [`src/storage/persistence.rs:714`](../../src/storage/persistence.rs) | 3 unit tests; **no** integration/multi-node/fault/perf tests anywhere. |
-| Perf harness | [`tests/scheduler_benchmark_slo.rs`](../../tests/scheduler_benchmark_slo.rs), [`benchmarks/micro/`](../../benchmarks/micro) | SLO test reads `min_evals_per_sec`, `max_p99_latency_ms`, `max_conflict_rejection_rate`, `min_correctness_ratio`; `scheduler_bench` + `eval_critical_path_bench` exist. Reuse these as the multi-raft perf gate. |
+| Perf harness | [`tests/integration/scheduler_benchmark_slo.rs`](../../tests/integration/scheduler_benchmark_slo.rs), [`benchmarks/micro/`](../../benchmarks/micro) | SLO test reads `min_evals_per_sec`, `max_p99_latency_ms`, `max_conflict_rejection_rate`, `min_correctness_ratio`; `scheduler_bench` + `eval_critical_path_bench` exist. Reuse these as the multi-raft perf gate. |
 
 **Bottom line:** the operator-facing Raft surface (RPC/CLI/UI/history/config/join-token) already exists and is good. What's missing is the *engine* underneath it and the *partitioning* on top of it.
 
@@ -417,7 +417,7 @@ Extend the existing [`ui/src/pages/Raft.tsx`](../../ui/src/pages/Raft.tsx) (and 
 
 An optional control loop that closes the observe→diagnose→act loop, modeled on Legion's existing eval loop. **Default `advisory`** (recommends only); `auto` is opt-in.
 
-- **Loop:** sample metrics (T3) → diagnose → generate a candidate change → *advisory:* surface it (T4); *auto:* apply it within guardrails → watch the SLO window → **keep if better, auto-revert if worse**. The verification anchor is the existing [`tests/scheduler_benchmark_slo.rs`](../../tests/scheduler_benchmark_slo.rs) metric set (`max_p99_latency_ms`, `min_evals_per_sec`, `max_conflict_rejection_rate`).
+- **Loop:** sample metrics (T3) → diagnose → generate a candidate change → *advisory:* surface it (T4); *auto:* apply it within guardrails → watch the SLO window → **keep if better, auto-revert if worse**. The verification anchor is the existing [`tests/integration/scheduler_benchmark_slo.rs`](../../tests/integration/scheduler_benchmark_slo.rs) metric set (`max_p99_latency_ms`, `min_evals_per_sec`, `max_conflict_rejection_rate`).
 - **Safe action set (eligible for `auto`):** rebalance lane leadership, adjust membership width, trigger snapshots, toggle `replicateRawHealth`, and *recommend* restart-only knob changes for the next rolling restart. **Never auto:** election-timeout tightening, voter removal below safety, or anything membership-affecting during instability.
 - **Guardrails:** hysteresis + a cool-down (`maxChangesPerHour`), require SLO headroom before acting, **freeze during election churn / partition / ongoing membership change**, one change at a time, and a full audit trail in `raft history` with `actor=autopilot` and the before/after metrics that justified it. Everything it does is visible and explainable in the same L2 format a human would get.
 
@@ -521,7 +521,7 @@ cargo build --all
 cargo test --all --locked
 ```
 
-Plus the phase's **targeted** suite (named per phase below) and, for P7, the **performance SLO** (`tests/scheduler_benchmark_slo.rs` must still pass, and the lane-isolation benchmark must hit target). If any gate command fails, the workflow re-enters the phase (loop-until-green) rather than advancing — and surfaces a diagnosis if it stalls after several rounds.
+Plus the phase's **targeted** suite (named per phase below) and, for P7, the **performance SLO** (`tests/integration/scheduler_benchmark_slo.rs` must still pass, and the lane-isolation benchmark must hit target). If any gate command fails, the workflow re-enters the phase (loop-until-green) rather than advancing — and surfaces a diagnosis if it stalls after several rounds.
 
 ### Rerun / resume contract
 
@@ -574,7 +574,7 @@ Make `raft` actually replicate, with a single group, before partitioning. This d
 - [ ] Verify epoch-CAS interplay: cross-lane lag → epoch conflict + retry, never a bad placement.
 
 **Exit criteria:** an integration test schedules against a control-lane config update and confirms either read-after-commit or a clean epoch-rejection+retry (never divergence).
-**Targeted verify:** `tests/raft_cross_lane.rs` + existing `tests/scheduler_integration.rs` green.
+**Targeted verify:** `tests/raft_cross_lane.rs` + existing `tests/integration/scheduler_integration.rs` green.
 
 ### Phase 4 — Per-lane snapshots, compaction, recovery
 
@@ -583,7 +583,7 @@ Make `raft` actually replicate, with a single group, before partitioning. This d
 - [ ] Crash/restart recovery: install snapshot then replay tail.
 
 **Exit criteria:** kill -9 a node mid-write, restart → it catches up via snapshot+log and converges (content hash matches peers); a lagging follower is caught up by install-snapshot.
-**Targeted verify:** `tests/raft_snapshot_recovery.rs`.
+**Targeted verify:** `tests/integration/raft_snapshot_recovery.rs`.
 
 ### Phase 5 — Real membership / election / join *(replace the simulation)*
 
@@ -592,7 +592,7 @@ Make `raft` actually replicate, with a single group, before partitioning. This d
 - [ ] Keep `RaftHistoryEvent` audit trail wired to real state transitions.
 
 **Exit criteria:** a new node joins via token and becomes a voter in all lanes; leader transfer/step-down/election reflect *real* openraft state (not simulated counters); membership changes survive restart.
-**Targeted verify:** `tests/raft_membership.rs` (3→5 node growth, removal, transfer).
+**Targeted verify:** `tests/integration/raft_membership.rs` (3→5 node growth, removal, transfer).
 
 ### Phase 6 — Default-on multi-raft + ergonomics
 
@@ -608,10 +608,10 @@ Make `raft` actually replicate, with a single group, before partitioning. This d
 
 - [ ] Lane-isolation benchmark: saturate control lane (100k job/instance creates) **and** status lane (heartbeat flood) while measuring **scheduler-lane** apply latency/throughput.
 - [ ] Compare `topology=single` vs `topology=lanes`; the lane mode must show the isolation win (target: scheduler-lane p99 stays within SLO under load; document the speedup multiple actually achieved).
-- [ ] Batching/pipelining tuning per lane (openraft `Config` per lane); keep `tests/scheduler_benchmark_slo.rs` green.
+- [ ] Batching/pipelining tuning per lane (openraft `Config` per lane); keep `tests/integration/scheduler_benchmark_slo.rs` green.
 
 **Exit criteria:** `scheduler_benchmark_slo` passes; lane-isolation bench shows scheduler-lane latency under cross-lane load within target (and materially better than single-group); results recorded in `docs/multi-raft.md` and `benchmarks/`.
-**Targeted verify:** `cargo test --test scheduler_benchmark_slo --locked`; `cargo bench --bench scheduler_bench`; new `benchmarks/micro/multi_raft_lane_isolation.rs`.
+**Targeted verify:** `cargo test --test integration scheduler_benchmark_slo:: --locked`; `cargo bench --bench scheduler_bench`; new `benchmarks/micro/multi_raft_lane_isolation.rs`.
 
 ### Phase 8 — *(Optional, flagged)* scheduler-lane key-range sharding
 
@@ -656,7 +656,7 @@ Make `raft` actually replicate, with a single group, before partitioning. This d
 - [ ] Safe action set (leader rebalance, membership width, snapshot trigger, `replicateRawHealth`, restart-knob *recommendations*); guardrails (hysteresis, `maxChangesPerHour`, freeze during instability, SLO headroom); audit in `raft history` (`actor=autopilot` + before/after metrics) + auto-rollback on regression.
 
 **Exit criteria:** `advisory` surfaces the same recommendation a human would pick; `auto` applies a safe change under a synthetic bottleneck, **and auto-reverts when an injected regression breaches the SLO**; never acts during simulated election churn/partition; every action is explainable in L2 form in history.
-**Targeted verify:** `tests/raft_autopilot.rs` (apply-then-keep and regress-then-revert paths) + `tests/scheduler_benchmark_slo.rs` green with autopilot enabled.
+**Targeted verify:** `tests/raft_autopilot.rs` (apply-then-keep and regress-then-revert paths) + `tests/integration/scheduler_benchmark_slo.rs` green with autopilot enabled.
 
 ---
 
@@ -688,7 +688,7 @@ Make `raft` actually replicate, with a single group, before partitioning. This d
 - **Determinism under churn**: N nodes, randomized op stream → identical SQLite content hash on all (P0/P2). This is the headline correctness invariant; run it in CI.
 
 ### Performance / regression
-- `tests/scheduler_benchmark_slo.rs` must stay green throughout (existing SLOs: `min_evals_per_sec`, `max_p99_latency_ms`, `max_conflict_rejection_rate`, `min_correctness_ratio`).
+- `tests/integration/scheduler_benchmark_slo.rs` must stay green throughout (existing SLOs: `min_evals_per_sec`, `max_p99_latency_ms`, `max_conflict_rejection_rate`, `min_correctness_ratio`).
 - `benchmarks/micro/multi_raft_lane_isolation.rs` — scheduler-lane latency under control+status saturation, `single` vs `lanes` (P7).
 - Regression: `local_disk`/`streaming` paths unchanged (entire existing suite green every phase).
 
@@ -701,7 +701,7 @@ For each correctness claim (determinism, lane isolation, idempotency, no-bypass)
 
 Mirroring the source tweet's framing — *the scheduler is never blocked*:
 
-- **Scheduler-lane apply p99** stays within `max_p99_latency_ms` (from `tests/scheduler_benchmark_slo.rs`) **while** the control lane absorbs a 100k-create burst and the status lane absorbs a heartbeat flood.
+- **Scheduler-lane apply p99** stays within `max_p99_latency_ms` (from `tests/integration/scheduler_benchmark_slo.rs`) **while** the control lane absorbs a 100k-create burst and the status lane absorbs a heartbeat flood.
 - **Lane-isolation speedup**: scheduler-lane throughput under cross-lane load in `topology=lanes` must be **materially higher** than `topology=single` on the same workload; record the measured multiple (the tweet reports ~12× for sandbox creates — our number will differ; the *requirement* is a large, documented win, not a specific constant).
 - **No correctness regression**: `min_correctness_ratio` and `max_conflict_rejection_rate` SLOs hold.
 - **Connection efficiency**: multi-raft uses a single inter-manager connection pool (lane count does not multiply connections).
@@ -752,7 +752,7 @@ Mirroring the source tweet's framing — *the scheduler is never blocked*:
 - The **previously-simulated operator commands** (election, transfer, step-down, membership, join-token) drive **real openraft state**, per lane, with the audit history intact.
 - **Snapshots/compaction/recovery** work per lane: a crashed node rejoins and converges; a lagging follower is caught up by install-snapshot.
 - **Ergonomics preserved**: one config block, one join token enrolls all lanes, one aggregate `raft status` line (with `--per-lane` detail), `--json` envelopes and capability catalog updated.
-- **No regression** for `local_disk`/`streaming`: the full existing test suite stays green; `tests/scheduler_benchmark_slo.rs` passes at every phase.
+- **No regression** for `local_disk`/`streaming`: the full existing test suite stays green; `tests/integration/scheduler_benchmark_slo.rs` passes at every phase.
 - **Missing tests added**: apply round-trip, multi-group, cross-lane, snapshot/recovery, membership, partition/fault-injection, determinism-under-churn, and the lane-isolation benchmark all exist and pass.
 - **Docs updated**: `docs/multi-raft.md` added; `raft-operations.md`, `state-store.md`, `persistence-plan.md`, `README.md` reflect the real, multi-raft, default-on backend.
 - **Tunable at scale**: per-lane + global `tuning` profiles and cluster-shape knobs (`voters`, `leaderBalancing`) let an operator change a bottlenecked lane, the leader balance, and the worker-fan-in response; `raft tuning` shows the effective value and its source; restart-vs-hot is documented per knob.

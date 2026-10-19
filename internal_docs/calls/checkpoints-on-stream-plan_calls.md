@@ -57,7 +57,7 @@ allocation failure (which the manager must see after the restore report, so
 it does not reschedule onto the same checkpoint), terminations, and health.
 A separate path would race those and need its own ordering rules, its own
 redrive on failure, an ACL classification, and an entry in
-`tests/acl_endpoints.rs`. Waking the heartbeat gets ordering, redrive, and
+`tests/integration/acl_endpoints.rs`. Waking the heartbeat gets ordering, redrive, and
 auth for free, and it is the mechanism the stream already uses to run a
 reconcile early. Plan Phase 2 keeps (b) as the fallback if early beats ever
 show up as load.

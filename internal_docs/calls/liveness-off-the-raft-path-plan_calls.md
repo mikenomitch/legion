@@ -40,7 +40,7 @@ replicated one. (c) **Gossip/SWIM**, Consul's model.
   word in an operator's vocabulary that was not there before.
 - Soft state is harder to reason about than replicated state. A bug in the
   liveness table is invisible to the content-hash convergence checks that
-  `tests/raft_lanes.rs` uses to prove everything else correct.
+  `tests/integration/raft_lanes.rs` uses to prove everything else correct.
 - Under a standing lane split, detection now depends on a digest RPC path
   (entry 12) that does not exist today, with its own partial-failure story.
 
@@ -526,14 +526,14 @@ rather than the prose.
 **Call.** The digest RPC is added to the existing authenticated manager-plane
 `RaftTransport` service (`src/storage/raft/server.rs:70`), alongside
 `ForwardLaneWrite`. It takes no ACL resource/action/scope and no row in
-`tests/acl_endpoints.rs`.
+`tests/integration/acl_endpoints.rs`.
 
 **Alternative.** Put it on the `Manager` service with an ACL row
 (`AclResource::Node` / `AclAction::Write` / worker-plane-style enforcement),
 which is what `AGENTS.md`'s "every Manager gRPC endpoint must enforce ACLs"
 rule would produce if the message lived there.
 
-**Trade-off.** `tests/acl_endpoints.rs::every_manager_rpc_is_classified`
+**Trade-off.** `tests/integration/acl_endpoints.rs::every_manager_rpc_is_classified`
 parses `proto/legion.proto` for `Manager` RPCs and fails the build on an
 unclassified one. Putting the digest outside that service puts it outside
 that safety net, so a future mistake here — a second manager-plane RPC that
@@ -673,7 +673,7 @@ also already carries process-local soft state that is neither persisted nor
 replicated — the two coalescers, `node_health_orphan_candidates` — so this is
 the established shape rather than a new one. Options (a) and (b) both mean
 threading a second handle through code that has no manager service at all,
-including `tests/raft_lanes.rs` and every embedded use of `Store`.
+including `tests/integration/raft_lanes.rs` and every embedded use of `Store`.
 
 ---
 

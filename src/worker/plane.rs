@@ -12,7 +12,7 @@
 //!   holders have none; a certificate that is presented must chain to the
 //!   cluster CA or the handshake fails.
 //! - [`Caller`] and the per-RPC checks: which caller classes each `Worker`
-//!   RPC admits. The table `tests/worker_plane_classes.rs` checks against the
+//!   RPC admits. The table `tests/integration/worker_plane_classes.rs` checks against the
 //!   proto is the source of truth.
 //! - [`advertise_address`]: what the worker tells managers to dial.
 
@@ -811,7 +811,7 @@ mod plane_test {
         assert!(!foreign.has_certificate());
 
         // A manager naming a CA the bundle lacks asks for a refresh.
-        assert!(reloaded.needs_refresh(Some(&[other_pin.clone()])));
+        assert!(reloaded.needs_refresh(Some(std::slice::from_ref(&other_pin))));
         Ok(())
     }
 
@@ -836,7 +836,7 @@ mod plane_test {
         identity.install(&cert_pem, &ca_a, expires)?;
 
         // Unchanged: no refresh.
-        assert!(!identity.needs_refresh(Some(&[pin_a.clone()])));
+        assert!(!identity.needs_refresh(Some(std::slice::from_ref(&pin_a))));
         // A CA added to the bundle: refresh, to learn it before it signs.
         assert!(identity.needs_refresh(Some(&[pin_a.clone(), pin_b.clone()])));
         // The anchor moved to a CA the bundle already holds: refresh, so
@@ -845,7 +845,7 @@ mod plane_test {
         assert!(!identity.needs_refresh(Some(&[pin_a.clone(), pin_b.clone()])));
         assert!(identity.needs_refresh(Some(&[pin_b.clone(), pin_a.clone()])));
         // A CA removed from the bundle: refresh, to stop trusting it.
-        assert!(identity.needs_refresh(Some(&[pin_a.clone()])));
+        assert!(identity.needs_refresh(Some(std::slice::from_ref(&pin_a))));
         // No news from the manager: nothing to compare.
         assert!(!identity.needs_refresh(Some(&[])));
         assert!(!identity.needs_refresh(None));

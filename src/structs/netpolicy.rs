@@ -104,9 +104,6 @@ pub const SOURCE_SERVICE_ALLOW: &str = "service/allow";
 /// a policy change by more than this.
 pub const MAX_AUTHZ_CACHE: &str = "5m";
 
-/// Namespace every job lives in until namespaces land.
-pub const DEFAULT_NAMESPACE: &str = "default";
-
 // ---------------------------------------------------------------------------
 // Policy objects
 // ---------------------------------------------------------------------------
@@ -120,14 +117,16 @@ pub struct NetSelector {
     /// `node.pool` globs. Real today (`daemon.rs` registration field).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub node_pools: Vec<String>,
-    /// Namespace globs. Every job is in `default` until namespaces land, so a
-    /// selector written now keeps working when they do.
+    /// Namespace globs, matched against the namespace of the task's job
+    /// (docs/namespaces.md).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub namespaces: Vec<String>,
     /// Task runtime names (`sandbox`, `container`, `exec`, ...).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub runtimes: Vec<String>,
-    /// Job id globs (`agent-*`), the same style as `AclRule.names`.
+    /// Job name globs (`agent-*`), the same style as `AclRule.names`:
+    /// matched against the bare job name, so pair it with `namespaces` to
+    /// pick a job in one namespace.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub jobs: Vec<String>,
     /// Task `network.labels` that must all be present with these values.
@@ -140,8 +139,9 @@ pub struct NetSelector {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct NetSelectorFacts {
     pub node_pool: Option<String>,
-    pub namespace: String,
     pub runtime: String,
+    /// The task's canonical job id; its namespace and bare name are what the
+    /// `namespaces` and `jobs` selectors match.
     pub job: String,
     pub labels: BTreeMap<String, String>,
 }
@@ -161,11 +161,7 @@ impl NetSelector {
                 .node_pool
                 .as_deref()
                 .is_some_and(|pool| self.node_pools.iter().any(|glob| glob_matches(glob, pool)));
-        let namespace = if facts.namespace.is_empty() {
-            DEFAULT_NAMESPACE
-        } else {
-            facts.namespace.as_str()
-        };
+        let (namespace, job_name) = crate::structs::namespace::split_job_id(&facts.job);
         let ns_ok = self.namespaces.is_empty()
             || self
                 .namespaces
@@ -177,7 +173,7 @@ impl NetSelector {
                 .iter()
                 .any(|runtime| runtime.eq_ignore_ascii_case(&facts.runtime));
         let job_ok =
-            self.jobs.is_empty() || self.jobs.iter().any(|glob| glob_matches(glob, &facts.job));
+            self.jobs.is_empty() || self.jobs.iter().any(|glob| glob_matches(glob, job_name));
         let labels_ok = self
             .labels
             .iter()
@@ -674,9 +670,9 @@ pub struct EffectiveChain {
     pub protocol: String,
     pub policy: String,
     pub access_log: bool,
-    /// Ingress on a `service.mesh = true` service with a closed
-    /// `service.allow`: the verified callers the mesh port admits, checked
-    /// before any rule.
+    /// Ingress on a `service.mesh = true` service whose `service.allow` is
+    /// not `*/*`: the verified callers the mesh port admits, checked before
+    /// any rule.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub callers: Option<EffectiveCallers>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -689,9 +685,12 @@ pub struct EffectiveChain {
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct EffectiveCallers {
-    /// The service's `allow` entries, as written: bare job globs and
-    /// `<region>:<job>:<group>:<task>` identity globs.
+    /// The service's `allow` entries, as written: job globs, bare (the
+    /// service's own namespace) or `ns/job`.
     pub allow: Vec<String>,
+    /// The job that declares the service, whose namespace a bare entry
+    /// (and an empty list) means.
+    pub owner: String,
     /// Always [`SOURCE_SERVICE_ALLOW`].
     pub source: String,
 }
@@ -702,15 +701,17 @@ impl EffectiveChain {
     }
 
     /// Whether a verified mesh caller may reach the service: always, without
-    /// a `callers` check; otherwise only a workload identity the service's
-    /// `allow` names. A node identity (`node:<id>`, a peer that named no
+    /// a `callers` check; otherwise only when the job its workload identity
+    /// names passes the service's `allow` (the same rule the endpoint feed
+    /// applies). A node identity (`node:<id>`, a peer that named no
     /// workload) or no identity is refused.
     pub fn callers_permit(&self, identity: Option<&str>) -> bool {
+        use crate::structs::network::{allow_permits, identity_job};
         match &self.callers {
             None => true,
-            Some(callers) => identity.is_some_and(|identity| {
-                crate::structs::network::allow_permits(&callers.allow, identity)
-            }),
+            Some(callers) => identity
+                .and_then(identity_job)
+                .is_some_and(|job| allow_permits(&callers.allow, &callers.owner, job)),
         }
     }
 
@@ -785,8 +786,10 @@ pub struct InlinePolicy<'a> {
     /// The task's `service.mesh`.
     pub mesh: Option<bool>,
     /// The task's `service.allow`: compiled into the ingress chain's
-    /// `callers` when the effective mesh is on and the list is closed.
+    /// `callers` when the effective mesh is on and the list is not `*/*`.
     pub callers: &'a [String],
+    /// The task's canonical job id, which owns `callers`.
+    pub owner: &'a str,
 }
 
 /// Merge the policies matching one task into what the datapath runs.
@@ -869,7 +872,9 @@ pub fn merge_policies(matching: &[NetPolicyObject], inline: InlinePolicy<'_>) ->
     // The service's own callers, on the mesh only: without it no peer is
     // verified at the receiving node, so the endpoint feed is the only
     // enforcement (and `service doctor` says so).
-    let open = inline.callers.is_empty() || inline.callers.iter().any(|entry| entry == "*");
+    // An empty list still closes the service to other namespaces, so only
+    // `*/*` leaves nothing to check.
+    let open = inline.callers.iter().any(|entry| entry.trim() == "*/*");
     if out.mesh == Some(true) && !open {
         let chain = out.ingress.get_or_insert_with(|| EffectiveChain {
             protocol: PROTOCOL_TCP.to_string(),
@@ -881,6 +886,7 @@ pub fn merge_policies(matching: &[NetPolicyObject], inline: InlinePolicy<'_>) ->
         });
         chain.callers = Some(EffectiveCallers {
             allow: inline.callers.to_vec(),
+            owner: inline.owner.to_string(),
             source: SOURCE_SERVICE_ALLOW.to_string(),
         });
     }
@@ -1540,16 +1546,19 @@ mod tests {
     }
 
     /// On a mesh service, `service.allow` becomes the ingress chain's first
-    /// check, sourced `service/allow`; open lists and non-mesh services add
-    /// nothing.
+    /// check, sourced `service/allow`, judged by the verified caller's job
+    /// with the endpoint feed's own rules. Only `*/*` and non-mesh services
+    /// add nothing: an empty list still closes the service to other
+    /// namespaces.
     #[test]
     fn service_allow_compiles_to_callers_on_mesh_services_test() {
-        let allow = vec!["web".to_string(), "*:billing:*:worker".to_string()];
+        let allow = vec!["web".to_string(), "payments-*/api".to_string()];
         let merged = merge_policies(
             &[],
             InlinePolicy {
                 mesh: Some(true),
                 callers: &allow,
+                owner: "shared/auth",
                 ..Default::default()
             },
         );
@@ -1559,15 +1568,30 @@ mod tests {
             .and_then(|c| c.callers.as_ref())
             .unwrap();
         assert_eq!(callers.allow, allow);
+        assert_eq!(callers.owner, "shared/auth");
         assert_eq!(callers.source, SOURCE_SERVICE_ALLOW);
         let chain = merged.ingress.as_ref().unwrap();
-        assert!(chain.callers_permit(Some("global:web:web:web")));
-        assert!(chain.callers_permit(Some("global:billing:jobs:worker")));
-        assert!(!chain.callers_permit(Some("global:other:other:other")));
+        assert!(chain.callers_permit(Some("auto:shared/web:web:web")));
+        assert!(chain.callers_permit(Some("auto:payments-eu/api:g:main")));
+        assert!(!chain.callers_permit(Some("auto:other/web:web:web")));
+        assert!(!chain.callers_permit(Some("auto:shared/other:g:t")));
         assert!(!chain.callers_permit(Some("node:n1")));
         assert!(!chain.callers_permit(None));
 
-        let open = vec!["*".to_string()];
+        // An empty list admits the service's own namespace only.
+        let merged = merge_policies(
+            &[],
+            InlinePolicy {
+                mesh: Some(true),
+                owner: "web",
+                ..Default::default()
+            },
+        );
+        let chain = merged.ingress.as_ref().unwrap();
+        assert!(chain.callers_permit(Some("auto:api:g:t")));
+        assert!(!chain.callers_permit(Some("auto:prod/api:g:t")));
+
+        let open = vec!["*/*".to_string()];
         for (mesh, callers) in [(Some(true), &open), (Some(false), &allow), (None, &allow)] {
             let merged = merge_policies(
                 &[],
@@ -1761,7 +1785,6 @@ mod tests {
         .unwrap();
         let mut facts = NetSelectorFacts {
             node_pool: Some("edge-eu".into()),
-            namespace: String::new(),
             runtime: "sandbox".into(),
             job: "agent-42".into(),
             labels: [("tier".to_string(), "free".to_string())]

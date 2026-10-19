@@ -135,7 +135,7 @@ pub(crate) enum Owner {
 /// it does not compile^W pass CI.
 ///
 /// Lane assignments follow plan §7-C2 and the existing `Store::replicated`
-/// lane classification (tests/raft_seam.rs).
+/// lane classification (tests/integration/raft_seam.rs).
 const TABLE_OWNERS: &[(&str, Owner)] = &[
     // ── control lane: operator/user intent ───────────────────────────────
     ("job", Owner::Lane(Lane::Control)),
@@ -175,6 +175,13 @@ const TABLE_OWNERS: &[(&str, Owner)] = &[
     // Network plugin objects (docs/network-plugins.md): like policy objects.
     ("net_plugin", Owner::Lane(Lane::Control)),
     ("net_plugin_meta", Owner::Lane(Lane::Control)),
+    // Namespaces (docs/namespaces.md): operator intent, written by
+    // ApplyNamespace/DeleteNamespace. Control lane with `job`, so the
+    // "delete only if empty" check and the delete are one entry.
+    ("namespace", Owner::Lane(Lane::Control)),
+    // Namespace policies: cluster governance objects, read by admission
+    // inside the control-lane submit and namespace-create entries.
+    ("namespace_policy", Owner::Lane(Lane::Control)),
     ("net_mesh_ca", Owner::Lane(Lane::Control)),
     // The leader's view of the cluster CA (docs/cluster-ca.md): written
     // when the control-lane leader's provider reports a new CA.
@@ -575,7 +582,7 @@ mod tests {
     fn setup_store() -> R<Store> {
         let dir = tempfile::Builder::new()
             .prefix("khepri-raft-ownership-")
-            .tempdir()
+            .tempdir_in(crate::test_scratch::root())
             .context("Error creating temp store directory")?
             .keep();
         let config = ManagerConfigFull {

@@ -105,7 +105,9 @@ If you declare the same variable yourself, your value wins:
 | Variable | Meaning |
 | --- | --- |
 | `LEGION_ALLOC_ID` | Allocation ID (churns on each placement). |
-| `LEGION_JOB_ID` | Job ID. |
+| `LEGION_JOB_ID` | Canonical job id: the bare name in `default`, `namespace/name` elsewhere ([Namespaces](namespaces.md)). |
+| `LEGION_JOB_NAME` | The job's bare name. |
+| `LEGION_NAMESPACE` | The job's namespace (`default` included), so a `legion` command run in the task defaults to it. |
 | `LEGION_TASK_NAME` | Task name. |
 | `LEGION_PORT_<LABEL>` | Assigned host port for the named port. |
 | `LEGION_PORT_TO_<LABEL>` | Declared in-task target port (when `to` is set). |
@@ -117,7 +119,8 @@ If you declare the same variable yourself, your value wins:
 
 Labels are uppercased, with non-alphanumeric characters mapped to `_` (`http-2`
 becomes `HTTP_2`). Upstream keys follow the same rule (`user-db` becomes
-`LEGION_UPSTREAM_USER_DB`). A server binds its dynamic port with, for
+`LEGION_UPSTREAM_USER_DB`, and the cross-namespace key `auth.shared` becomes
+`LEGION_UPSTREAM_AUTH_SHARED`). A server binds its dynamic port with, for
 example, `python3 -m http.server $LEGION_PORT_HTTP`.
 
 A task only receives endpoints for services it asked for. Its environment
@@ -204,6 +207,27 @@ that speaks HTTP, and the scheme is what says so:
 task api connect.upstreams entry 'db' to = "db" is reached over L4, but it has
 an http block. Hint: write to = "http://db" if it speaks HTTP
 ```
+
+### Namespaces
+
+A service lives in its job's [namespace](namespaces.md), and an upstream
+resolves in the consumer's own namespace: `{ to = "db" }` is the `db` of
+the namespace the task runs in, never another tenant's. Reaching into another
+namespace is written on both sides:
+
+```nickel
+# the consumer names where it is reaching
+connect = { upstreams = [{ to = "auth", namespace = "shared" }] },
+
+# the target, in shared, admits the consumer by qualified id or glob
+service = { name = "auth", port = 8443, allow = ["checkout-prod/api", "payments-*/api"] },
+```
+
+The crossing upstream's key is `auth.shared`: it names
+`LEGION_UPSTREAM_AUTH_SHARED` and the DNS name `auth.shared.svc.legion`. A
+service reference on the CLI and API is canonical like a job id
+(`shared/auth`; bare in `default`), and `legion service list` takes `-n`
+(names or globs) and `-A`.
 
 ### Balancing strategies
 
@@ -323,27 +347,35 @@ A service names who may call it, in one list:
 service = {
     port = "http",
     mesh = true,
-    allow = ["web", "agent-*", "*:billing:*:worker"],
+    allow = ["gateway", "api", "payments-*/api"],   # job globs; absent or ["*"] = every job in this namespace
 },
 ```
 
-- **One grammar.** A bare entry is a job id glob (`web`, `agent-*`). An
-  entry with colons is a workload identity glob over
-  `<region>:<job>:<group>:<task>` (`*:billing:*:worker`), each part globbed
-  on its own. Both match the same identity string, so `web` and `*:web:*:*`
-  are the same rule. An identity glob has exactly four non-empty parts; the
-  submit error says so.
-- **Absent or `["*"]` means everyone.** This is the default.
-- **Always enforced in the endpoint feed.** The manager matches each
-  consuming allocation's identity against the list, and a caller that is not
-  on it gets an empty endpoint list, so its connections are accepted and
-  closed. There is no error code and no partial list.
+- **Entries are job globs** matched against the consuming allocation's job.
+  A bare entry (`"gateway"`, `"web-*"`) matches jobs in the service's
+  **own** namespace; `"checkout-prod/api"` or `"payments-*/api"` admits jobs
+  in other namespaces, and `"*/*"` admits every job everywhere. An entry
+  with colons is refused at submit: `allow` names jobs, and a caller's task
+  is matched with an ingress `identity` rule instead.
+- **Absent or `["*"]` means every job in the service's own namespace.** This
+  is the default; a consumer in another namespace needs an entry that names
+  its namespace.
+- **Always enforced in the endpoint feed.** A denied consumer's forwarder
+  gets an empty list, so its connections are accepted and closed. There is
+  no error code and no partial list. The list comes back on `ListServices`
+  (`ServiceSummary.allow`), so `legion service doctor <svc>` can tell "no
+  healthy endpoints" apart from "your job is not on the list" with only
+  `job:read`.
 - **Enforced on the wire with the mesh.** On a `mesh = true` service the
   list also compiles into the service's ingress chain as its first check,
-  with the source `service/allow`. A verified caller outside it is refused
-  at the receiving node, and a `net.denied` event names the caller
+  with the source `service/allow`. The receiving node takes the job from the
+  verified caller's identity and applies the same rules; a caller outside
+  the list is refused, and a `net.denied` event names it
   ([The mesh](network-handlers.md#the-mesh)). `legion net policy show`
   prints the check.
+- **Intentions don't affect the catalog.** `legion service list|resolve` and
+  the `ListServices`/`ResolveService` RPCs still show the service to anyone
+  whose ACLs permit the read.
 - **Without the mesh there is no verified caller** at the receiving node, so
   the endpoint feed is the only enforcement. It governs what Legion's own
   connect path hands out; it does not stop a task that already knows a
@@ -373,7 +405,9 @@ These are checked at submit, and by `legion job validate <spec>` before you subm
 
 - Upstream `to` is a catalog service name or an external URL (see the table
   above), an external one has a `name`, and no key is declared twice in one
-  task.
+  task (`auth` and `auth` in `shared` are different keys).
+- An upstream's `namespace` is a namespace name, and only a catalog service
+  has one.
 - An `http` block, a body-reading handler, or credentials need an upstream
   whose `to` speaks HTTP.
 - `port` is greater than 0, with no duplicates and no collision with a
@@ -461,7 +495,8 @@ it; on macOS it is a loopback port. See [Platform notes](#platform-notes).
 ## Querying: CLI and API
 
 ```bash
-legion service list                  # all services + healthy/total counts
+legion service list                  # services in the active namespace + healthy/total counts
+legion service list -A               # every namespace you can read
 legion service resolve web           # healthy endpoints (table)
 legion service resolve web -j        # JSON (scriptable)
 legion service resolve web --all     # include unhealthy, with status detail

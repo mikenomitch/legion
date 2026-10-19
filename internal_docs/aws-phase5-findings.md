@@ -111,7 +111,7 @@ node pools (all `default`), the head-jitter tie-break (uniform in code and
 in tests), available-nodes cache staleness on registration (invalidation
 verified on both the direct and the projection path), and the
 capture->apply->projection path itself (a single-voter raft repro at 100
-and at 300 nodes spreads perfectly; `tests/spread_under_raft.rs` pins it).
+and at 300 nodes spreads perfectly; `tests/integration/spread_under_raft.rs` pins it).
 
 What localized it: `plan_submission` rows from the replacement window carry
 their candidate lists, and every candidate in every sampled plan is
@@ -172,7 +172,7 @@ measured a WORST-CASE loss, and the 86 s / 6 ms numbers held.
    because `count: 50` lifts the budget to 400, above its 300-node fleet,
    so it never truncated. The cut inside a tied cell is now a uniform
    sample of the cell (`scheduling_index::truncate_within_boundary_cell`,
-   calls entry 14); `tests/index_truncation_spread.rs` is the rig shape
+   calls entry 14); `tests/integration/index_truncation_spread.rs` is the rig shape
    at 1/8 scale (4 slices x 150 identical nodes, 40 jobs x 4, spread) and
    on the old code places 104/56/0/0 across the four slices; fixed, it
    places 49/30/43/38; a release binary with four `--simulate 150` slices

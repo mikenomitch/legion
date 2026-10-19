@@ -56,7 +56,7 @@ run before writing this plan. Load-bearing facts:
   `src/storage/migrations.rs`) — a precondition for the design in §A2.
 - Tests are **in-process** (no subprocess, no network): storage tests call
   `Store::start_storage`, service tests call `Manager` trait methods directly.
-  The perf gate is `tests/scheduler_benchmark_slo.rs` + `benchmarks/scheduler/slo.json`.
+  The perf gate is `tests/integration/scheduler_benchmark_slo.rs` + `benchmarks/scheduler/slo.json`.
 
 ### Observability / operations (what's real vs. what docs claim)
 
@@ -255,15 +255,15 @@ with `topology: "lanes"` implemented and tested as **experimental**:
 
 | Phase | Content | Targeted verification |
 | --- | --- | --- |
-| **A-0 capture layer** ✅ | rusqlite `session` feature; savepoint conversion of all tx sites; `replicated()` seam + `Lane` classification of every mutating method (exhaustiveness test); suppression hooks; `local_disk` behavior unchanged | `tests/raft_changeset_capture.rs` (capture/rollback/apply, nested savepoints, rowid fidelity, PK-required edge), `tests/raft_seam.rs`; full existing suite green |
-| **A-1 engine** ✅ | `src/storage/raft/`: type config, sqlite log store, state machine (changeset apply + read-model/event projection), `RaftTransport` proto + network, `MultiRaftDriver`, single topology (lanes scaffolded, refused at start — JC-17) | `tests/raft_apply_roundtrip.rs` (1- and 3-node in-process), determinism content-hash in `tests/raft_durability.rs` |
-| **A-2 lifecycle** ✅ | bootstrap-from-existing-DB, join-token → learner → voter, real operator commands, non-leader rejection + hint, config extensions, daemon wiring, leader-only scheduling loops | `tests/raft_membership.rs`, `tests/raft_upgrade_bootstrap.rs` (multigroup bring-up is deferred with lanes — JC-17) |
-| **A-3 durability** ✅ | snapshots + compaction + install, crash/restart recovery, `state backup`/`--restore-from`, adversarial-review fixes (JC-18..22) | `tests/raft_snapshot_recovery.rs` (compaction, restart, laggard snapshot catch-up, backup/restore), `tests/raft_durability.rs` (leader loss, minority partition, any-single-node loss), `tests/raft_cascade_delete.rs`, `tests/raft_perf_smoke.rs` |
+| **A-0 capture layer** ✅ | rusqlite `session` feature; savepoint conversion of all tx sites; `replicated()` seam + `Lane` classification of every mutating method (exhaustiveness test); suppression hooks; `local_disk` behavior unchanged | `tests/integration/raft_changeset_capture.rs` (capture/rollback/apply, nested savepoints, rowid fidelity, PK-required edge), `tests/integration/raft_seam.rs`; full existing suite green |
+| **A-1 engine** ✅ | `src/storage/raft/`: type config, sqlite log store, state machine (changeset apply + read-model/event projection), `RaftTransport` proto + network, `MultiRaftDriver`, single topology (lanes scaffolded, refused at start — JC-17) | `tests/integration/raft_apply_roundtrip.rs` (1- and 3-node in-process), determinism content-hash in `tests/integration/raft_durability.rs` |
+| **A-2 lifecycle** ✅ | bootstrap-from-existing-DB, join-token → learner → voter, real operator commands, non-leader rejection + hint, config extensions, daemon wiring, leader-only scheduling loops | `tests/integration/raft_membership.rs`, `tests/integration/raft_upgrade_bootstrap.rs` (multigroup bring-up is deferred with lanes — JC-17) |
+| **A-3 durability** ✅ | snapshots + compaction + install, crash/restart recovery, `state backup`/`--restore-from`, adversarial-review fixes (JC-18..22) | `tests/integration/raft_snapshot_recovery.rs` (compaction, restart, laggard snapshot catch-up, backup/restore), `tests/integration/raft_durability.rs` (leader loss, minority partition, any-single-node loss), `tests/integration/raft_cascade_delete.rs`, `tests/integration/raft_perf_smoke.rs` |
 | **A-4 surfaces & docs** ✅ | CLI/UI real status (+ per-lane), capabilities/MCP catalog, `docs/multi-raft.md`, updates to `raft-operations.md`, `state-store.md`, `persistence-plan.md`, `upgrades.md`, `README.md`, TASK-LIST | capability-catalog test; docs review pass |
 
 Universal gate after every phase: `cargo fmt --all -- --check`,
 `cargo clippy --all -- -D warnings`, `cargo build --all`,
-`cargo test --all --locked`, plus `cargo test --test scheduler_benchmark_slo
+`cargo test --all --locked`, plus `cargo test --test integration scheduler_benchmark_slo::
 --locked -- --ignored` at A-3/A-4 (SLO must not regress; it runs on
 `local_disk`, which A-0 keeps byte-identical).
 
@@ -334,9 +334,9 @@ Universal gate after every phase: `cargo fmt --all -- --check`,
 
 | Phase | Content | Targeted verification |
 | --- | --- | --- |
-| **B-0 drain** ✅ | store method + eval + RPC + CLI + capabilities + events | `tests/node_drain.rs` (cordon excludes from placement; drain evicts + reschedules elsewhere; uncordon restores; idempotency; ACL entry) |
+| **B-0 drain** ✅ | store method + eval + RPC + CLI + capabilities + events | `tests/integration/node_drain.rs` (cordon excludes from placement; drain evicts + reschedules elsewhere; uncordon restores; idempotency; ACL entry) |
 | **B-1 version handshake** ✅ | proto fields, register/reply, reject/warn logic, ledger surfacing, `docs/upgrades.md` | unit tests for compat matrix; register round-trip test |
-| **B-2 metrics + probes** ✅ | telemetry config, listener, registry, instrumentation points, `/healthz` `/readyz` (`legion_raft_*` series deferred — JC-25) | `tests/metrics_endpoint.rs` (scrape parses; counters move; readyz flips with store health) |
+| **B-2 metrics + probes** ✅ | telemetry config, listener, registry, instrumentation points, `/healthz` `/readyz` (`legion_raft_*` series deferred — JC-25) | `tests/integration/metrics_endpoint.rs` (scrape parses; counters move; readyz flips with store health) |
 | **B-3 docs** ✅ | observability.md rewrite, TASK-LIST refresh, NEXT_UP.md | link/consistency pass |
 
 Same universal gate after each phase. B runs **before** A's store surgery to
@@ -490,8 +490,8 @@ where safety demands:
 | --- | --- | --- |
 | **C-0 foundations** ✅ | ownership map + capture-time guard + commutative class (per-table OMIT) + local pruning; eval-queue local-write seam + failover regeneration test | ownership guard unit tests; eval failover test |
 | **C-1 node split** ✅ | `node_health` migration + store/read-model/hydration/reader updates (JC-30/31) | full suite (readers behave identically); node lifecycle tests green; `node_health_row_lifecycle_across_the_split` |
-| **C-2 composite split** ✅ | control/status ops stop writing foreign lanes inline (wrapper composites + eval-mediated reschedule tails, JC-32..35); cross-lane FK removal migration; rollout lane consolidation (rollout/rollout_event → scheduler); `OWNERSHIP_GUARD_ENFORCES` flipped to true (guard errors in every topology) | `tests/raft_ownership_guard.rs` (representative ops from every store domain through a raft-mode store, enforcement on); full suite green |
-| **C-3 lanes engine** ✅ | per-lane table-scoped snapshots (JC-37); start-time refusal removed — lanes brings up three groups with per-lane snapshot policy/compaction; apply-side index-skip guard added (JC-38); lane-named leader hints + per-lane status summary (JC-39); daemon leader-gating per lane (JC-40); lanes config example | `tests/raft_lanes.rs` battery (bring-up/per-lane writes, independent elections, lane-scoped snapshot catch-up, cross-lane race convergence); lane snapshot unit tests in `state_machine.rs`/`ownership.rs` |
+| **C-2 composite split** ✅ | control/status ops stop writing foreign lanes inline (wrapper composites + eval-mediated reschedule tails, JC-32..35); cross-lane FK removal migration; rollout lane consolidation (rollout/rollout_event → scheduler); `OWNERSHIP_GUARD_ENFORCES` flipped to true (guard errors in every topology) | `tests/integration/raft_ownership_guard.rs` (representative ops from every store domain through a raft-mode store, enforcement on); full suite green |
+| **C-3 lanes engine** ✅ | per-lane table-scoped snapshots (JC-37); start-time refusal removed — lanes brings up three groups with per-lane snapshot policy/compaction; apply-side index-skip guard added (JC-38); lane-named leader hints + per-lane status summary (JC-39); daemon leader-gating per lane (JC-40); lanes config example | `tests/integration/raft_lanes.rs` battery (bring-up/per-lane writes, independent elections, lane-scoped snapshot catch-up, cross-lane race convergence); lane snapshot unit tests in `state_machine.rs`/`ownership.rs` |
 | **C-4 voter checks** | config knob, status quorum lines, membership warnings/guards, metrics, docs | voter-parity unit + CLI tests |
 | **C-5 verify + ship** | skeptic pass on lanes claims → harden → docs (multi-raft.md lanes section, default decision) → full gate | gate + skeptic verdicts resolved |
 
@@ -612,7 +612,7 @@ loss is finding #1. So the worker plane gets the plan's follow-up #4
 
 ### D4. Verification
 
-- `tests/raft_lanes.rs::lanes_that_settle_on_different_leaders_stay_correct`
+- `tests/integration/raft_lanes.rs::lanes_that_settle_on_different_leaders_stay_correct`
   updated to the new contract: submit **succeeds** on the control leader
   under a standing scheduler split, reconcilers complete the halves on the
   lane leaders, and the healed cluster converges byte-identically.
@@ -861,7 +861,7 @@ split has no home on ANY node until leadership converges — a submit fails on
 the control leader (scheduler half) and on the scheduler leader (control half)
 — and the RPC-level submit tail's eval enqueue is recovered by
 `regenerate_scheduling_evals` on the scheduler lane's leader (JC-41's safety
-net, exercised by `tests/raft_lanes.rs::lanes_that_settle_on_different_leaders_stay_correct`).
+net, exercised by `tests/integration/raft_lanes.rs::lanes_that_settle_on_different_leaders_stay_correct`).
 `/readyz` (`telemetry::raft_readiness_failure`) fails while per-lane leaders
 DISAGREE for longer than a 10s grace measured from `election_epoch_ms` — brief
 post-election convergence stays 200, a standing split does not, and the body
@@ -873,7 +873,7 @@ is a SETTLED voter on every lane before reporting success. `remove-member`'s
 quorum-feasibility guard evaluates EVERY lane and refuses outright if the
 removing node does not lead every lane.
 
-Proofs: `tests/raft_lanes.rs` (e1) convergence after a deliberate split, where
+Proofs: `tests/integration/raft_lanes.rs` (e1) convergence after a deliberate split, where
 the anchor demonstrably CAN win, plus a bound on the campaigns it took; (e2)
 after the all-lane leader is killed, every lane elects a surviving leader
 (required) and co-location is accepted either way (best effort) with the
@@ -926,17 +926,17 @@ scheduler-lane table is an ownership violation, so `job destroy` would
 fail); dangling references terminate rather than spin — `prune_stale_evals`
 drops superseded/missing configs, and anything else fails in its handler
 into the terminal `failed` status, which the claim query never selects
-(`tests/eval_regen_failover.rs::evals_for_vanished_scopes_terminate_
+(`tests/integration/eval_regen_failover.rs::evals_for_vanished_scopes_terminate_
 instead_of_spinning`). The reconciler's over-execution finding is fixed by
 the replicated `node.drain_evict` intent column: `set_node_availability`
 persists whether the operator asked for eviction and clears it whenever
 availability leaves `drained`, so a cordon-only node never gets a
-`node_drain` eval (`tests/node_drain.rs::cordon_only_nodes_are_never_
+`node_drain` eval (`tests/integration/node_drain.rs::cordon_only_nodes_are_never_
 evicted_by_reconciliation`); the CLI/RPC surface is unchanged. Proofs:
-`tests/raft_eval_failover.rs` (3-node cluster — acknowledged `job stop`
+`tests/integration/raft_eval_failover.rs` (3-node cluster — acknowledged `job stop`
 completes and a mid-flight rollout continues after the leader dies, with
 followers holding the eval rows and the eval-inclusive hash converging) and
-`tests/eval_regen_failover.rs` (the demoted reconciler).
+`tests/integration/eval_regen_failover.rs` (the demoted reconciler).
 
 **JC-42 — Event IDs must be globally unique, not `MAX(id)+1`.** The JC-28
 commutative class assumed insert-only tables have globally unique PKs.
@@ -1263,7 +1263,7 @@ already record every cascaded child row exactly as the leader's SQL
 produced it; re-firing `ON DELETE CASCADE` at apply would delete children
 early and abort the quorum-committed entry forever
 (`SQLITE_CHANGESET_NOTFOUND`), permanently bricking the store on a routine
-`job destroy`. Adversarial finding; regression `tests/raft_cascade_delete.rs`.
+`job destroy`. Adversarial finding; regression `tests/integration/raft_cascade_delete.rs`.
 
 **JC-19 — Captures and applies are mutually exclusive under the global
 capture mutex.** An apply interleaving with an open capture savepoint
@@ -1286,7 +1286,7 @@ by log replay alone would silently miss the entire adopted baseline. A
 fresh bootstrap forces a whole-DB snapshot as the log's base and purges
 the log to it, making snapshot install (which carries the full DB) the
 necessary catch-up path for blank joiners. Regression
-`tests/raft_upgrade_bootstrap.rs`.
+`tests/integration/raft_upgrade_bootstrap.rs`.
 
 **JC-22 — Cluster identity is stamped and double-starts are locked out.**
 The state DB is stamped with the secret-derived cluster id at first engine
@@ -1331,7 +1331,7 @@ re-bootstrap refusal, since the fresh node derives a different cluster id.
 Fix: `restore_from_backup` clears `raft_cluster` alongside `raft_applied`
 — an explicit `--restore-from` *means* "seed a fresh cluster from these
 contents", so the accidental-wipe protection does not apply to it (the
-guard still fires on every non-restore path; `tests/raft_upgrade_bootstrap.rs`
+guard still fires on every non-restore path; `tests/integration/raft_upgrade_bootstrap.rs`
 unchanged and green). `state_content_hash` correspondingly excludes
 `raft_cluster` (node-local, never replicated) so replica-convergence
 fingerprints compare only replicated content.

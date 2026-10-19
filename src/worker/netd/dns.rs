@@ -404,18 +404,29 @@ fn truncated(response: &[u8]) -> bool {
 }
 
 /// Strip the zone from a name in it: `db.svc.legion` → `db`, bare `db` →
-/// `db`; anything else → `None`.
+/// `db`, and the cross-namespace form `auth.shared.svc.legion` →
+/// `auth.shared` (an upstream's key when it names another namespace);
+/// anything else → `None`.
 fn zone_key(name: &str) -> Option<String> {
     let name = name.trim_end_matches('.');
     if let Some(key) = name.strip_suffix(&format!(".{SVC_ZONE}")) {
-        if !key.is_empty() && !key.contains('.') {
-            return Some(key.to_string());
+        // `_<key>._tcp[.<namespace>].svc.legion` (SRV convention).
+        if let Some((service, rest)) = key
+            .strip_prefix('_')
+            .and_then(|rest| rest.split_once("._tcp"))
+        {
+            return match rest.strip_prefix('.') {
+                _ if service.is_empty() || service.contains('.') => None,
+                None if rest.is_empty() => Some(service.to_string()),
+                Some(namespace) if !namespace.is_empty() && !namespace.contains('.') => {
+                    Some(format!("{service}.{namespace}"))
+                }
+                _ => None,
+            };
         }
-        // `_<key>._tcp.svc.legion` (SRV convention).
-        if let Some(rest) = key.strip_suffix("._tcp") {
-            if let Some(key) = rest.strip_prefix('_') {
-                return Some(key.to_string());
-            }
+        let labels: Vec<&str> = key.split('.').collect();
+        if labels.len() <= 2 && labels.iter().all(|label| !label.is_empty()) {
+            return Some(key.to_string());
         }
         return None;
     }
@@ -688,7 +699,16 @@ mod tests {
         assert_eq!(zone_key("db").as_deref(), Some("db"));
         assert_eq!(zone_key("_db._tcp.svc.legion").as_deref(), Some("db"));
         assert_eq!(zone_key("api.github.com"), None);
-        assert_eq!(zone_key("a.b.svc.legion"), None);
+        assert_eq!(
+            zone_key("auth.shared.svc.legion").as_deref(),
+            Some("auth.shared")
+        );
+        assert_eq!(
+            zone_key("_auth._tcp.shared.svc.legion").as_deref(),
+            Some("auth.shared")
+        );
+        assert_eq!(zone_key("a.b.c.svc.legion"), None);
+        assert_eq!(zone_key("a..svc.legion"), None);
 
         let response = respond(
             &asked,

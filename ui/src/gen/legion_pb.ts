@@ -596,6 +596,13 @@ export class WorkerRegisterRequest extends Message<WorkerRegisterRequest> {
   /**
    * JSON object string of node configuration attributes.
    *
+   * `workerFleet` (set by the worker simulator) is checked against the
+   * credential: with ACLs enforced, a join token's worker type must grant
+   * the fleet through its own `workerFleet` attribute (an exact name or a
+   * `*` glob such as `sim-*`), and a node token may not change the fleet
+   * its node joined with. Either refusal is `PERMISSION_DENIED`; audit-only
+   * mode logs it and allows it.
+   *
    * @generated from field: string config_attrs = 3;
    */
   configAttrs = "";
@@ -944,6 +951,18 @@ export class RunJobRequest extends Message<RunJobRequest> {
    */
   idempotencyKey?: string;
 
+  /**
+   * Namespace to submit into (`legion job run -n`). The jobspec may name
+   * one too (`namespace = "prod"`): when both are set and differ the
+   * request is INVALID_ARGUMENT rather than one winning, and authorization
+   * runs against the resolved namespace, never the request field alone.
+   * Neither set means `default`. The namespace must exist (NOT_FOUND
+   * otherwise; namespaces are never created implicitly).
+   *
+   * @generated from field: optional string namespace = 6;
+   */
+  namespace?: string;
+
   constructor(data?: PartialMessage<RunJobRequest>) {
     super();
     proto3.util.initPartial(data, this);
@@ -957,6 +976,7 @@ export class RunJobRequest extends Message<RunJobRequest> {
     { no: 3, name: "priority", kind: "scalar", T: 3 /* ScalarType.INT64 */, opt: true },
     { no: 4, name: "force_reschedule", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
     { no: 5, name: "idempotency_key", kind: "scalar", T: 9 /* ScalarType.STRING */, opt: true },
+    { no: 6, name: "namespace", kind: "scalar", T: 9 /* ScalarType.STRING */, opt: true },
   ]);
 
   static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): RunJobRequest {
@@ -1812,6 +1832,14 @@ export class RenderJobTemplateRequest extends Message<RenderJobTemplateRequest> 
    */
   variablesJson = "";
 
+  /**
+   * Namespace to render for (see RunJobTemplateRequest.namespace); scopes
+   * the ACL check and the rendered job's id.
+   *
+   * @generated from field: optional string namespace = 4;
+   */
+  namespace?: string;
+
   constructor(data?: PartialMessage<RenderJobTemplateRequest>) {
     super();
     proto3.util.initPartial(data, this);
@@ -1823,6 +1851,7 @@ export class RenderJobTemplateRequest extends Message<RenderJobTemplateRequest> 
     { no: 1, name: "name", kind: "scalar", T: 9 /* ScalarType.STRING */ },
     { no: 2, name: "version", kind: "scalar", T: 13 /* ScalarType.UINT32 */, opt: true },
     { no: 3, name: "variables_json", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 4, name: "namespace", kind: "scalar", T: 9 /* ScalarType.STRING */, opt: true },
   ]);
 
   static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): RenderJobTemplateRequest {
@@ -1942,6 +1971,16 @@ export class RunJobTemplateRequest extends Message<RunJobTemplateRequest> {
    */
   idempotencyKey?: string;
 
+  /**
+   * Namespace the rendered job lands in. Templates are cluster objects
+   * (docs/job-templates.md); running one into a namespace is a `job:write`
+   * there, scoped by the `templates` selector. Resolved against a
+   * `namespace` the template renders exactly as RunJobRequest.namespace is.
+   *
+   * @generated from field: optional string namespace = 7;
+   */
+  namespace?: string;
+
   constructor(data?: PartialMessage<RunJobTemplateRequest>) {
     super();
     proto3.util.initPartial(data, this);
@@ -1956,6 +1995,7 @@ export class RunJobTemplateRequest extends Message<RunJobTemplateRequest> {
     { no: 4, name: "priority", kind: "scalar", T: 3 /* ScalarType.INT64 */, opt: true },
     { no: 5, name: "force_reschedule", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
     { no: 6, name: "idempotency_key", kind: "scalar", T: 9 /* ScalarType.STRING */, opt: true },
+    { no: 7, name: "namespace", kind: "scalar", T: 9 /* ScalarType.STRING */, opt: true },
   ]);
 
   static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): RunJobTemplateRequest {
@@ -2200,6 +2240,16 @@ export class ListRolloutsRequest extends Message<ListRolloutsRequest> {
    */
   pageSize?: number;
 
+  /**
+   * Namespaces to list: names or `*`-globs; `["*"]` for every namespace the
+   * caller can read. Empty means `default`. Ignored when `job_id` is set,
+   * since a job names its own namespace. Items are still filtered by
+   * `job:read`, so `*` widens what is considered, never what is visible.
+   *
+   * @generated from field: repeated string namespaces = 8;
+   */
+  namespaces: string[] = [];
+
   constructor(data?: PartialMessage<ListRolloutsRequest>) {
     super();
     proto3.util.initPartial(data, this);
@@ -2215,6 +2265,7 @@ export class ListRolloutsRequest extends Message<ListRolloutsRequest> {
     { no: 5, name: "sort_order", kind: "scalar", T: 9 /* ScalarType.STRING */, opt: true },
     { no: 6, name: "page", kind: "scalar", T: 13 /* ScalarType.UINT32 */, opt: true },
     { no: 7, name: "page_size", kind: "scalar", T: 13 /* ScalarType.UINT32 */, opt: true },
+    { no: 8, name: "namespaces", kind: "scalar", T: 9 /* ScalarType.STRING */, repeated: true },
   ]);
 
   static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): ListRolloutsRequest {
@@ -3342,6 +3393,8 @@ export class GetJobSpecReply extends Message<GetJobSpecReply> {
    * Source submissions associated with the job config, exactly as the
    * submitter sent them (usually Nickel source, not JSON). Read these to show
    * what was typed; read `rendered_jobspec` to learn what the job is.
+   * Ordered primary first (`is_primary`), then in the order they were
+   * submitted, so the first entry is the file the submitter named.
    *
    * @generated from field: repeated legion.Submission submissions = 2;
    */
@@ -3553,6 +3606,14 @@ export class PlanJobRequest extends Message<PlanJobRequest> {
    */
   parsedJobspec = "";
 
+  /**
+   * Namespace to plan into; resolved against the jobspec's own `namespace`
+   * exactly as RunJobRequest.namespace is.
+   *
+   * @generated from field: optional string namespace = 2;
+   */
+  namespace?: string;
+
   constructor(data?: PartialMessage<PlanJobRequest>) {
     super();
     proto3.util.initPartial(data, this);
@@ -3562,6 +3623,7 @@ export class PlanJobRequest extends Message<PlanJobRequest> {
   static readonly typeName = "legion.PlanJobRequest";
   static readonly fields: FieldList = proto3.util.newFieldList(() => [
     { no: 1, name: "parsed_jobspec", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 2, name: "namespace", kind: "scalar", T: 9 /* ScalarType.STRING */, opt: true },
   ]);
 
   static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): PlanJobRequest {
@@ -4787,9 +4849,12 @@ export class CreateInstanceRequest extends Message<CreateInstanceRequest> {
   /**
    * Optional caller-supplied instance key.
    *
-   * Must match `[A-Za-z0-9._-]{1,128}` and must not collide with any
-   * existing instance id of any job — including Terminated tombstones
-   * (destroyed ids are never reusable). Required when the task sets
+   * Must match `[A-Za-z0-9._-]{1,128}`. The stored id is the key qualified
+   * by the job's namespace, exactly as job ids are: `user-42` in `default`,
+   * `payments/user-42` in `payments` (reply `instance_id`). It must not
+   * collide with any existing instance id of the namespace — including
+   * Terminated tombstones (destroyed ids are never reusable); another
+   * namespace's `user-42` is a different instance. Required when the task sets
    * `stateful.requireId: true`. Optional otherwise (the server mints an id
    * when absent). A valid explicit key is always honored.
    *
@@ -4854,9 +4919,12 @@ export class CreateInstanceRequest extends Message<CreateInstanceRequest> {
  */
 export class CreateInstanceReply extends Message<CreateInstanceReply> {
   /**
-   * The created instance's stable id (caller-supplied or server-minted).
-   * This is the value the task sees as `LEGION_INSTANCE_ID` and the key its
-   * storage handle and workload identity bind to.
+   * The created instance's stable, canonical id: the caller's key qualified
+   * by the job's namespace (`payments/user-42`; bare in `default`), or a
+   * server-minted id, which is cluster-unique and never qualified. Every
+   * instance RPC takes this form. This is the value the task sees as
+   * `LEGION_INSTANCE_ID` (the key alone is `LEGION_INSTANCE_KEY`) and the id
+   * its storage handle and workload identity bind to.
    *
    * @generated from field: string instance_id = 1;
    */
@@ -7386,7 +7454,8 @@ export class PromoteInstanceReply extends Message<PromoteInstanceReply> {
  */
 export class GetInstanceRequest extends Message<GetInstanceRequest> {
   /**
-   * Stable instance id to fetch.
+   * Canonical instance id to fetch (`payments/user-42`, bare in `default`,
+   * or a minted id). Clients resolve `-n` / `LEGION_NAMESPACE` into it.
    *
    * @generated from field: string instance_id = 1;
    */
@@ -7901,6 +7970,14 @@ export class ListSnapshotsRequest extends Message<ListSnapshotsRequest> {
    */
   state?: string;
 
+  /**
+   * Namespaces to list (see `ListRolloutsRequest.namespaces`): empty means
+   * `default`, `["*"]` every namespace; ignored when `job_id` is set.
+   *
+   * @generated from field: repeated string namespaces = 4;
+   */
+  namespaces: string[] = [];
+
   constructor(data?: PartialMessage<ListSnapshotsRequest>) {
     super();
     proto3.util.initPartial(data, this);
@@ -7912,6 +7989,7 @@ export class ListSnapshotsRequest extends Message<ListSnapshotsRequest> {
     { no: 1, name: "job_id", kind: "scalar", T: 9 /* ScalarType.STRING */, opt: true },
     { no: 2, name: "instance_id", kind: "scalar", T: 9 /* ScalarType.STRING */, opt: true },
     { no: 3, name: "state", kind: "scalar", T: 9 /* ScalarType.STRING */, opt: true },
+    { no: 4, name: "namespaces", kind: "scalar", T: 9 /* ScalarType.STRING */, repeated: true },
   ]);
 
   static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): ListSnapshotsRequest {
@@ -9572,6 +9650,15 @@ export class ListVolumesRequest extends Message<ListVolumesRequest> {
    */
   includeDestroyed = false;
 
+  /**
+   * Namespaces to list (see `ListRolloutsRequest.namespaces`): empty means
+   * `default`, `["*"]` every namespace; ignored when `job_id` is set. A
+   * volume no job owns is listed only under `*`.
+   *
+   * @generated from field: repeated string namespaces = 7;
+   */
+  namespaces: string[] = [];
+
   constructor(data?: PartialMessage<ListVolumesRequest>) {
     super();
     proto3.util.initPartial(data, this);
@@ -9586,6 +9673,7 @@ export class ListVolumesRequest extends Message<ListVolumesRequest> {
     { no: 4, name: "instance_id", kind: "scalar", T: 9 /* ScalarType.STRING */, opt: true },
     { no: 5, name: "state", kind: "scalar", T: 9 /* ScalarType.STRING */, opt: true },
     { no: 6, name: "include_destroyed", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
+    { no: 7, name: "namespaces", kind: "scalar", T: 9 /* ScalarType.STRING */, repeated: true },
   ]);
 
   static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): ListVolumesRequest {
@@ -10113,6 +10201,16 @@ export class ListJobsRequest extends Message<ListJobsRequest> {
    */
   status?: string;
 
+  /**
+   * Namespaces to list: names or `*`-globs (`payments-*`), each entry
+   * optionally a comma-separated list. Empty means `default`; `["*"]` means
+   * every namespace. Whatever the selection, only jobs the caller may read
+   * are returned — `*` widens what is considered, never what is visible.
+   *
+   * @generated from field: repeated string namespaces = 7;
+   */
+  namespaces: string[] = [];
+
   constructor(data?: PartialMessage<ListJobsRequest>) {
     super();
     proto3.util.initPartial(data, this);
@@ -10127,6 +10225,7 @@ export class ListJobsRequest extends Message<ListJobsRequest> {
     { no: 4, name: "page", kind: "scalar", T: 13 /* ScalarType.UINT32 */, opt: true },
     { no: 5, name: "page_size", kind: "scalar", T: 13 /* ScalarType.UINT32 */, opt: true },
     { no: 6, name: "status", kind: "scalar", T: 9 /* ScalarType.STRING */, opt: true },
+    { no: 7, name: "namespaces", kind: "scalar", T: 9 /* ScalarType.STRING */, repeated: true },
   ]);
 
   static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): ListJobsRequest {
@@ -10153,14 +10252,15 @@ export class ListJobsRequest extends Message<ListJobsRequest> {
  */
 export class Job extends Message<Job> {
   /**
-   * Job ID.
+   * Canonical job id: `namespace/name`, or the bare name for a job in the
+   * `default` namespace. Every field that names a job accepts it.
    *
    * @generated from field: string id = 1;
    */
   id = "";
 
   /**
-   * Job name.
+   * Job name, without the namespace.
    *
    * @generated from field: string name = 2;
    */
@@ -10264,6 +10364,14 @@ export class Job extends Message<Job> {
    */
   rescheduleBackoffs: RescheduleBackoff[] = [];
 
+  /**
+   * The namespace the job lives in (docs/namespaces.md). `default` for a
+   * job whose `id` has no namespace segment.
+   *
+   * @generated from field: string namespace = 9;
+   */
+  namespace = "";
+
   constructor(data?: PartialMessage<Job>) {
     super();
     proto3.util.initPartial(data, this);
@@ -10280,6 +10388,7 @@ export class Job extends Message<Job> {
     { no: 6, name: "priority", kind: "scalar", T: 9 /* ScalarType.STRING */ },
     { no: 7, name: "blocked", kind: "message", T: JobBlocked, opt: true },
     { no: 8, name: "reschedule_backoffs", kind: "message", T: RescheduleBackoff, repeated: true },
+    { no: 9, name: "namespace", kind: "scalar", T: 9 /* ScalarType.STRING */ },
   ]);
 
   static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): Job {
@@ -10442,6 +10551,21 @@ export class ListJobsReply extends Message<ListJobsReply> {
    */
   pageSize = 0;
 
+  /**
+   * Jobs the caller may read in namespaces the request did NOT select, and
+   * how many namespaces they are spread over — so an empty list can say
+   * "14 jobs in 2 other namespaces you can read; use -A" instead of
+   * looking like the jobs are gone. Zero when the request selected `*`.
+   *
+   * @generated from field: uint32 elsewhere_count = 6;
+   */
+  elsewhereCount = 0;
+
+  /**
+   * @generated from field: uint32 elsewhere_namespaces = 7;
+   */
+  elsewhereNamespaces = 0;
+
   constructor(data?: PartialMessage<ListJobsReply>) {
     super();
     proto3.util.initPartial(data, this);
@@ -10455,6 +10579,8 @@ export class ListJobsReply extends Message<ListJobsReply> {
     { no: 2, name: "total_count", kind: "scalar", T: 13 /* ScalarType.UINT32 */ },
     { no: 3, name: "page", kind: "scalar", T: 13 /* ScalarType.UINT32 */ },
     { no: 4, name: "page_size", kind: "scalar", T: 13 /* ScalarType.UINT32 */ },
+    { no: 6, name: "elsewhere_count", kind: "scalar", T: 13 /* ScalarType.UINT32 */ },
+    { no: 7, name: "elsewhere_namespaces", kind: "scalar", T: 13 /* ScalarType.UINT32 */ },
   ]);
 
   static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): ListJobsReply {
@@ -13912,6 +14038,25 @@ export class HeartbeatReply extends Message<HeartbeatReply> {
   retryTerminatedAllocations: bigint[] = [];
 
   /**
+   * Allocation ids from the request's `failed_allocations` that this
+   * manager could not record, so the worker must send them again on its
+   * next heartbeat. A failure is reported once, and the worker has already
+   * torn the allocation down: dropping the report leaves the allocation
+   * placed on a node that no longer runs it, and nothing replaces it.
+   *
+   * A report is listed when reading the allocation or recording the
+   * failure failed (the write could not reach the lane leader, say). A
+   * report for an allocation this manager has no row for, one already
+   * removed, or one from a node that does not own the allocation is never
+   * listed.
+   *
+   * Default: empty list.
+   *
+   * @generated from field: repeated int64 retry_failed_allocations = 24;
+   */
+  retryFailedAllocations: bigint[] = [];
+
+  /**
    * The cluster's workload-identity issuer: the `iss` every token and
    * ticket the managers sign carries (docs/workload-identity.md, "Issuer").
    * A worker checks boot, session, and exec tickets against this value, not
@@ -13982,6 +14127,7 @@ export class HeartbeatReply extends Message<HeartbeatReply> {
     { no: 18, name: "session_resync", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
     { no: 19, name: "stop_sessions", kind: "scalar", T: 9 /* ScalarType.STRING */, repeated: true },
     { no: 20, name: "retry_terminated_allocations", kind: "scalar", T: 3 /* ScalarType.INT64 */, repeated: true },
+    { no: 24, name: "retry_failed_allocations", kind: "scalar", T: 3 /* ScalarType.INT64 */, repeated: true },
     { no: 21, name: "workload_identity_issuer", kind: "scalar", T: 9 /* ScalarType.STRING */ },
     { no: 22, name: "envelope_resizes", kind: "message", T: EnvelopeResizeResult, repeated: true },
     { no: 23, name: "cluster_ca_pins", kind: "scalar", T: 9 /* ScalarType.STRING */, repeated: true },
@@ -15995,7 +16141,7 @@ export class InstanceStop extends Message<InstanceStop> {
    * The stop cause, in the vocabulary of stop notices
    * (docs/graceful-stop.md): `stop`, `update`, `drain`, `reschedule`,
    * `destroy`, `node_lost`, `scale_in`, `preempted`, `node_pressure`,
-   * `restore`, `suspended`.
+   * `restore`, `suspended`, `gang`, `failed`.
    *
    * @generated from field: string cause = 1;
    */
@@ -16004,7 +16150,10 @@ export class InstanceStop extends Message<InstanceStop> {
   /**
    * A sentence saying what happened. For `node_pressure` this is the
    * worker's own detail sentence, with the step and the numbers (the same
-   * text as the `node.pressure` event). Otherwise a sentence built from the
+   * text as the `node.pressure` event). For `failed` it names the node and
+   * the worker's failure reason (an exit status, a failed check, a stderr
+   * tail), cut to one line of at most 400 characters; the full reason is on
+   * the `allocation.failed` event. Otherwise a sentence built from the
    * cause.
    *
    * @generated from field: string detail = 2;
@@ -20823,12 +20972,21 @@ export class GetKvLockReply extends Message<GetKvLockReply> {
 }
 
 /**
- * Request payload for ListServices. Currently no filters; all declared
- * services are returned.
+ * Request payload for ListServices.
  *
  * @generated from message legion.ListServicesRequest
  */
 export class ListServicesRequest extends Message<ListServicesRequest> {
+  /**
+   * Namespaces to list services from: names or `*`-globs (docs/
+   * namespaces.md), as ListJobsRequest.namespaces: empty means `default`,
+   * `["*"]` every namespace the caller can read. A service is identified by
+   * its namespace and name, so two namespaces' `web` are two entries.
+   *
+   * @generated from field: repeated string namespaces = 1;
+   */
+  namespaces: string[] = [];
+
   constructor(data?: PartialMessage<ListServicesRequest>) {
     super();
     proto3.util.initPartial(data, this);
@@ -20837,6 +20995,7 @@ export class ListServicesRequest extends Message<ListServicesRequest> {
   static readonly runtime: typeof proto3 = proto3;
   static readonly typeName = "legion.ListServicesRequest";
   static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "namespaces", kind: "scalar", T: 9 /* ScalarType.STRING */, repeated: true },
   ]);
 
   static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): ListServicesRequest {
@@ -20934,9 +21093,20 @@ export class ServiceSummary extends Message<ServiceSummary> {
    * consumer resolves to nothing — `legion service doctor` prints this list —
    * without needing state-store access to the underlying task config.
    *
+   * A bare entry (or `*`) admits jobs in the service's own namespace only;
+   * a qualified entry (`checkout-prod/api`, `payments-*\/api`, `*\/*`) admits
+   * jobs from another (docs/namespaces.md, "Crossing a namespace").
+   *
    * @generated from field: repeated string allow = 8;
    */
   allow: string[] = [];
+
+  /**
+   * The namespace the service lives in: its declaring job's.
+   *
+   * @generated from field: string namespace = 9;
+   */
+  namespace = "";
 
   constructor(data?: PartialMessage<ServiceSummary>) {
     super();
@@ -20954,6 +21124,7 @@ export class ServiceSummary extends Message<ServiceSummary> {
     { no: 6, name: "tags", kind: "scalar", T: 9 /* ScalarType.STRING */, repeated: true },
     { no: 7, name: "meta", kind: "map", K: 9 /* ScalarType.STRING */, V: {kind: "scalar", T: 9 /* ScalarType.STRING */} },
     { no: 8, name: "allow", kind: "scalar", T: 9 /* ScalarType.STRING */, repeated: true },
+    { no: 9, name: "namespace", kind: "scalar", T: 9 /* ScalarType.STRING */ },
   ]);
 
   static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): ServiceSummary {
@@ -21022,8 +21193,10 @@ export class ListServicesReply extends Message<ListServicesReply> {
  */
 export class ResolveServiceRequest extends Message<ResolveServiceRequest> {
   /**
-   * Service name to resolve. Matches `service.name` (defaulting to the task
-   * name) on stored task configs.
+   * Service to resolve: `web` for the service in the `default` namespace,
+   * `payments-prod/web` for one in another. Matches `service.name`
+   * (defaulting to the task name) on stored task configs in that namespace.
+   * Only endpoints of jobs the caller may read are returned.
    *
    * @generated from field: string service = 1;
    */
@@ -21191,6 +21364,13 @@ export class ServiceEndpoint extends Message<ServiceEndpoint> {
    */
   publicAddress = "";
 
+  /**
+   * The namespace the endpoint's service lives in (its job's).
+   *
+   * @generated from field: string namespace = 15;
+   */
+  namespace = "";
+
   constructor(data?: PartialMessage<ServiceEndpoint>) {
     super();
     proto3.util.initPartial(data, this);
@@ -21213,6 +21393,7 @@ export class ServiceEndpoint extends Message<ServiceEndpoint> {
     { no: 12, name: "port_label", kind: "scalar", T: 9 /* ScalarType.STRING */ },
     { no: 13, name: "mesh_tls", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
     { no: 14, name: "public_address", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 15, name: "namespace", kind: "scalar", T: 9 /* ScalarType.STRING */ },
   ]);
 
   static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): ServiceEndpoint {
@@ -21239,7 +21420,9 @@ export class ServiceEndpoint extends Message<ServiceEndpoint> {
  */
 export class ListServiceEdgesRequest extends Message<ListServiceEdgesRequest> {
   /**
-   * Only edges into (or out of) this service; empty for the whole graph.
+   * Only edges into (or out of) this service or job; empty for the whole
+   * graph. Matches an edge's `target` (the canonical service, e.g.
+   * `payments-prod/api`), its `service` key, or its `caller_job`.
    *
    * @generated from field: string service = 1;
    */
@@ -21394,6 +21577,16 @@ export class ServiceEdge extends Message<ServiceEdge> {
    */
   lastSeenUnix = protoInt64.zero;
 
+  /**
+   * The canonical service `service` resolves to (`payments-prod/api`, bare
+   * in `default`): `service` is the caller's upstream key (an alias, or
+   * `api.payments-prod` for a crossing), this is the catalog entry it
+   * dials. Equal to `service` for an external upstream.
+   *
+   * @generated from field: string target = 18;
+   */
+  target = "";
+
   constructor(data?: PartialMessage<ServiceEdge>) {
     super();
     proto3.util.initPartial(data, this);
@@ -21419,6 +21612,7 @@ export class ServiceEdge extends Message<ServiceEdge> {
     { no: 15, name: "rps", kind: "scalar", T: 1 /* ScalarType.DOUBLE */ },
     { no: 16, name: "error_rate", kind: "scalar", T: 1 /* ScalarType.DOUBLE */ },
     { no: 17, name: "last_seen_unix", kind: "scalar", T: 3 /* ScalarType.INT64 */ },
+    { no: 18, name: "target", kind: "scalar", T: 9 /* ScalarType.STRING */ },
   ]);
 
   static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): ServiceEdge {
@@ -22722,6 +22916,15 @@ export class SchedulerEvent extends Message<SchedulerEvent> {
    */
   createdAt = "";
 
+  /**
+   * The namespace the event belongs to: its job's, or the namespace a
+   * `namespace.*` lifecycle event is about. Empty for cluster events
+   * (nodes, raft, the scheduler).
+   *
+   * @generated from field: string namespace = 12;
+   */
+  namespace = "";
+
   constructor(data?: PartialMessage<SchedulerEvent>) {
     super();
     proto3.util.initPartial(data, this);
@@ -22741,6 +22944,7 @@ export class SchedulerEvent extends Message<SchedulerEvent> {
     { no: 9, name: "message", kind: "scalar", T: 9 /* ScalarType.STRING */ },
     { no: 10, name: "metadata_json", kind: "scalar", T: 9 /* ScalarType.STRING */ },
     { no: 11, name: "created_at", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 12, name: "namespace", kind: "scalar", T: 9 /* ScalarType.STRING */ },
   ]);
 
   static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): SchedulerEvent {
@@ -22855,6 +23059,16 @@ export class ListEventsRequest extends Message<ListEventsRequest> {
    */
   allocationId?: bigint;
 
+  /**
+   * Optional namespace filter: names or `*`-globs (docs/namespaces.md).
+   * Keeps only events whose `namespace` matches, so cluster events (which
+   * have none) are left out. Empty means no namespace filter — every event
+   * the caller may see. Narrows what is visible, never widens it.
+   *
+   * @generated from field: repeated string namespaces = 9;
+   */
+  namespaces: string[] = [];
+
   constructor(data?: PartialMessage<ListEventsRequest>) {
     super();
     proto3.util.initPartial(data, this);
@@ -22871,6 +23085,7 @@ export class ListEventsRequest extends Message<ListEventsRequest> {
     { no: 6, name: "level", kind: "scalar", T: 9 /* ScalarType.STRING */, opt: true },
     { no: 7, name: "instance_id", kind: "scalar", T: 9 /* ScalarType.STRING */, opt: true },
     { no: 8, name: "allocation_id", kind: "scalar", T: 3 /* ScalarType.INT64 */, opt: true },
+    { no: 9, name: "namespaces", kind: "scalar", T: 9 /* ScalarType.STRING */, repeated: true },
   ]);
 
   static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): ListEventsRequest {
@@ -23006,6 +23221,14 @@ export class StreamEventsRequest extends Message<StreamEventsRequest> {
    */
   allocationId?: bigint;
 
+  /**
+   * Optional namespace filter. Same semantics as
+   * `ListEventsRequest.namespaces`.
+   *
+   * @generated from field: repeated string namespaces = 8;
+   */
+  namespaces: string[] = [];
+
   constructor(data?: PartialMessage<StreamEventsRequest>) {
     super();
     proto3.util.initPartial(data, this);
@@ -23021,6 +23244,7 @@ export class StreamEventsRequest extends Message<StreamEventsRequest> {
     { no: 5, name: "level", kind: "scalar", T: 9 /* ScalarType.STRING */, opt: true },
     { no: 6, name: "instance_id", kind: "scalar", T: 9 /* ScalarType.STRING */, opt: true },
     { no: 7, name: "allocation_id", kind: "scalar", T: 3 /* ScalarType.INT64 */, opt: true },
+    { no: 8, name: "namespaces", kind: "scalar", T: 9 /* ScalarType.STRING */, repeated: true },
   ]);
 
   static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): StreamEventsRequest {
@@ -24944,8 +25168,9 @@ export class ExecKey extends Message<ExecKey> {
   name = "";
 
   /**
-   * Glob over job names the key's tickets may open sessions in,
-   * e.g. `"agents-*"`.
+   * Job pattern the key's tickets may open sessions in: a name glob
+   * (`"agents-*"`, jobs in `default`) or `namespace-glob/name-glob`
+   * (`"agents/*"`). See `CreateExecKeyRequest.jobs`.
    *
    * @generated from field: string jobs = 3;
    */
@@ -25035,7 +25260,11 @@ export class CreateExecKeyRequest extends Message<CreateExecKeyRequest> {
   name = "";
 
   /**
-   * Glob over job names, e.g. `"agents-*"`. Required.
+   * Job pattern the key's tickets may reach. Required. `"agents-*"`
+   * matches jobs in the `default` namespace only; `"agents/*"` or
+   * `"agents-*\/web*"` is `namespace-glob/name-glob`, so reaching into a
+   * namespace is written into the pattern and `*` alone never crosses
+   * one. More than one `/` is InvalidArgument.
    *
    * @generated from field: string jobs = 2;
    */
@@ -26737,6 +26966,16 @@ export class WhoAmIReply extends Message<WhoAmIReply> {
    */
   rulesJson?: string;
 
+  /**
+   * Namespaces the caller holds any allow in (the same rule ListNamespaces
+   * filters by), so a client can pick a default and decide whether to show
+   * a namespace switcher without probing. Management tokens and disabled
+   * ACLs list every namespace.
+   *
+   * @generated from field: repeated string readable_namespaces = 10;
+   */
+  readableNamespaces: string[] = [];
+
   constructor(data?: PartialMessage<WhoAmIReply>) {
     super();
     proto3.util.initPartial(data, this);
@@ -26754,6 +26993,7 @@ export class WhoAmIReply extends Message<WhoAmIReply> {
     { no: 7, name: "expires_at", kind: "scalar", T: 9 /* ScalarType.STRING */, opt: true },
     { no: 8, name: "accessor_id", kind: "scalar", T: 9 /* ScalarType.STRING */, opt: true },
     { no: 9, name: "rules_json", kind: "scalar", T: 9 /* ScalarType.STRING */, opt: true },
+    { no: 10, name: "readable_namespaces", kind: "scalar", T: 9 /* ScalarType.STRING */, repeated: true },
   ]);
 
   static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): WhoAmIReply {
@@ -27148,6 +27388,17 @@ export class UpsertAclPolicyReply extends Message<UpsertAclPolicyReply> {
    */
   policy?: AclPolicy;
 
+  /**
+   * Advisories that did not stop the write, e.g. a rule naming an exact
+   * namespace that does not exist yet (`rule 0 names namespace
+   * 'payments-prdo', which does not exist`). Policies are often written
+   * before the namespaces they name, so this never refuses; globs never
+   * warn.
+   *
+   * @generated from field: repeated string warnings = 2;
+   */
+  warnings: string[] = [];
+
   constructor(data?: PartialMessage<UpsertAclPolicyReply>) {
     super();
     proto3.util.initPartial(data, this);
@@ -27157,6 +27408,7 @@ export class UpsertAclPolicyReply extends Message<UpsertAclPolicyReply> {
   static readonly typeName = "legion.UpsertAclPolicyReply";
   static readonly fields: FieldList = proto3.util.newFieldList(() => [
     { no: 1, name: "policy", kind: "message", T: AclPolicy },
+    { no: 2, name: "warnings", kind: "scalar", T: 9 /* ScalarType.STRING */, repeated: true },
   ]);
 
   static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): UpsertAclPolicyReply {
@@ -28314,6 +28566,21 @@ export class CreateJoinTokenReply extends Message<CreateJoinTokenReply> {
    */
   token = "";
 
+  /**
+   * Set when the token is unusable from another machine: the manager binds
+   * every interface (`server.host` is `0.0.0.0` or `::`) but has no
+   * `server.advertiseAddr`, so the address it embeds is loopback. A remote
+   * worker would dial its own loopback and retry forever, and nothing on the
+   * manager would look wrong. The text names the embedded address and the
+   * setting that fixes it. The token is still valid for a worker on the
+   * manager's own machine.
+   *
+   * Default: empty (the embedded address is the one the operator chose).
+   *
+   * @generated from field: string warning = 3;
+   */
+  warning = "";
+
   constructor(data?: PartialMessage<CreateJoinTokenReply>) {
     super();
     proto3.util.initPartial(data, this);
@@ -28324,6 +28591,7 @@ export class CreateJoinTokenReply extends Message<CreateJoinTokenReply> {
   static readonly fields: FieldList = proto3.util.newFieldList(() => [
     { no: 1, name: "info", kind: "message", T: JoinTokenInfo },
     { no: 2, name: "token", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 3, name: "warning", kind: "scalar", T: 9 /* ScalarType.STRING */ },
   ]);
 
   static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): CreateJoinTokenReply {
@@ -28894,6 +29162,11 @@ export class IssueBootTicketRequest extends Message<IssueBootTicketRequest> {
    *   it is compromised.
    *
    * Both empty is rejected for stateful tasks.
+   *
+   * Either may be written as a key (`user-42`, `user-`): it is qualified in
+   * `job`'s namespace (`payments/user-42`), exactly as instance ids are
+   * (docs/namespaces.md, "Instances"). The ticket carries the canonical
+   * form, and that is the `StartClaimRequest.instance_id` a node accepts.
    *
    * @generated from field: string instance_id = 4;
    */
@@ -32666,6 +32939,1418 @@ export class NetHandlerStatus extends Message<NetHandlerStatus> {
 
   static equals(a: NetHandlerStatus | PlainMessage<NetHandlerStatus> | undefined, b: NetHandlerStatus | PlainMessage<NetHandlerStatus> | undefined): boolean {
     return proto3.util.equals(NetHandlerStatus, a, b);
+  }
+}
+
+/**
+ * A namespace: the name scope, permission scope and policy anchor jobs live
+ * in. NOT an isolation boundary — it moves no workload onto other machines,
+ * networks or kernels (node pools, `gated` networking and the `sandbox`
+ * runtime do that). See docs/namespaces.md, "What a namespace isolates".
+ *
+ * @generated from message legion.Namespace
+ */
+export class Namespace extends Message<Namespace> {
+  /**
+   * DNS-label name: lowercase letters, digits and `-`, at most 63
+   * characters. Immutable; `default` always exists.
+   *
+   * @generated from field: string name = 1;
+   */
+  name = "";
+
+  /**
+   * Free-form description.
+   *
+   * @generated from field: string description = 2;
+   */
+  description = "";
+
+  /**
+   * Free-form metadata (`owner`, `slack`, ...). Legion never reads it.
+   *
+   * @generated from field: map<string, string> meta = 3;
+   */
+  meta: { [key: string]: string } = {};
+
+  /**
+   * RFC3339 creation time. Empty on a dry-run reply for a new namespace.
+   *
+   * @generated from field: string created_at = 4;
+   */
+  createdAt = "";
+
+  /**
+   * RFC3339 time of the last description/meta change.
+   *
+   * @generated from field: string updated_at = 5;
+   */
+  updatedAt = "";
+
+  /**
+   * What the namespace holds, by kind. Populated by ListNamespaces and
+   * GetNamespace.
+   *
+   * @generated from field: legion.NamespaceCounts counts = 6;
+   */
+  counts?: NamespaceCounts;
+
+  constructor(data?: PartialMessage<Namespace>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.Namespace";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "name", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 2, name: "description", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 3, name: "meta", kind: "map", K: 9 /* ScalarType.STRING */, V: {kind: "scalar", T: 9 /* ScalarType.STRING */} },
+    { no: 4, name: "created_at", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 5, name: "updated_at", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 6, name: "counts", kind: "message", T: NamespaceCounts },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): Namespace {
+    return new Namespace().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): Namespace {
+    return new Namespace().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): Namespace {
+    return new Namespace().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: Namespace | PlainMessage<Namespace> | undefined, b: Namespace | PlainMessage<Namespace> | undefined): boolean {
+    return proto3.util.equals(Namespace, a, b);
+  }
+}
+
+/**
+ * Object counts in a namespace, by kind.
+ *
+ * @generated from message legion.NamespaceCounts
+ */
+export class NamespaceCounts extends Message<NamespaceCounts> {
+  /**
+   * Jobs in any state (stopped and failed included).
+   *
+   * @generated from field: uint32 jobs = 1;
+   */
+  jobs = 0;
+
+  /**
+   * Volumes owned by a job in the namespace.
+   *
+   * @generated from field: uint32 volumes = 2;
+   */
+  volumes = 0;
+
+  /**
+   * Snapshots of a job in the namespace.
+   *
+   * @generated from field: uint32 snapshots = 3;
+   */
+  snapshots = 0;
+
+  constructor(data?: PartialMessage<NamespaceCounts>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.NamespaceCounts";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "jobs", kind: "scalar", T: 13 /* ScalarType.UINT32 */ },
+    { no: 2, name: "volumes", kind: "scalar", T: 13 /* ScalarType.UINT32 */ },
+    { no: 3, name: "snapshots", kind: "scalar", T: 13 /* ScalarType.UINT32 */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): NamespaceCounts {
+    return new NamespaceCounts().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): NamespaceCounts {
+    return new NamespaceCounts().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): NamespaceCounts {
+    return new NamespaceCounts().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: NamespaceCounts | PlainMessage<NamespaceCounts> | undefined, b: NamespaceCounts | PlainMessage<NamespaceCounts> | undefined): boolean {
+    return proto3.util.equals(NamespaceCounts, a, b);
+  }
+}
+
+/**
+ * What a namespace holds, by id.
+ *
+ * @generated from message legion.NamespaceContents
+ */
+export class NamespaceContents extends Message<NamespaceContents> {
+  /**
+   * Canonical job ids (`ns/name`).
+   *
+   * @generated from field: repeated string jobs = 1;
+   */
+  jobs: string[] = [];
+
+  /**
+   * Volume ids.
+   *
+   * @generated from field: repeated string volumes = 2;
+   */
+  volumes: string[] = [];
+
+  /**
+   * Snapshot ids.
+   *
+   * @generated from field: repeated string snapshots = 3;
+   */
+  snapshots: string[] = [];
+
+  constructor(data?: PartialMessage<NamespaceContents>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.NamespaceContents";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "jobs", kind: "scalar", T: 9 /* ScalarType.STRING */, repeated: true },
+    { no: 2, name: "volumes", kind: "scalar", T: 9 /* ScalarType.STRING */, repeated: true },
+    { no: 3, name: "snapshots", kind: "scalar", T: 9 /* ScalarType.STRING */, repeated: true },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): NamespaceContents {
+    return new NamespaceContents().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): NamespaceContents {
+    return new NamespaceContents().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): NamespaceContents {
+    return new NamespaceContents().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: NamespaceContents | PlainMessage<NamespaceContents> | undefined, b: NamespaceContents | PlainMessage<NamespaceContents> | undefined): boolean {
+    return proto3.util.equals(NamespaceContents, a, b);
+  }
+}
+
+/**
+ * One ACL policy rule that reaches a namespace: an allow rule over a
+ * namespaced resource whose `namespaces` selector matches it (or a `*`
+ * resource rule with no selector). The blast-radius report shown when a
+ * namespace is created.
+ *
+ * @generated from message legion.NamespaceReach
+ */
+export class NamespaceReach extends Message<NamespaceReach> {
+  /**
+   * ACL policy name.
+   *
+   * @generated from field: string policy = 1;
+   */
+  policy = "";
+
+  /**
+   * Index of the rule inside the policy.
+   *
+   * @generated from field: uint32 rule_index = 2;
+   */
+  ruleIndex = 0;
+
+  /**
+   * `resource:action` pairs the rule grants, e.g. `job:read`, `job:write`.
+   *
+   * @generated from field: repeated string grants = 3;
+   */
+  grants: string[] = [];
+
+  /**
+   * The rule's `namespaces` selector as written; empty for a `*` resource
+   * rule without one (which reaches every namespace).
+   *
+   * @generated from field: repeated string namespaces = 4;
+   */
+  namespaces: string[] = [];
+
+  constructor(data?: PartialMessage<NamespaceReach>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.NamespaceReach";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "policy", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 2, name: "rule_index", kind: "scalar", T: 13 /* ScalarType.UINT32 */ },
+    { no: 3, name: "grants", kind: "scalar", T: 9 /* ScalarType.STRING */, repeated: true },
+    { no: 4, name: "namespaces", kind: "scalar", T: 9 /* ScalarType.STRING */, repeated: true },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): NamespaceReach {
+    return new NamespaceReach().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): NamespaceReach {
+    return new NamespaceReach().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): NamespaceReach {
+    return new NamespaceReach().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: NamespaceReach | PlainMessage<NamespaceReach> | undefined, b: NamespaceReach | PlainMessage<NamespaceReach> | undefined): boolean {
+    return proto3.util.equals(NamespaceReach, a, b);
+  }
+}
+
+/**
+ * Request payload for ListNamespaces.
+ *
+ * @generated from message legion.ListNamespacesRequest
+ */
+export class ListNamespacesRequest extends Message<ListNamespacesRequest> {
+  constructor(data?: PartialMessage<ListNamespacesRequest>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.ListNamespacesRequest";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): ListNamespacesRequest {
+    return new ListNamespacesRequest().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): ListNamespacesRequest {
+    return new ListNamespacesRequest().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): ListNamespacesRequest {
+    return new ListNamespacesRequest().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: ListNamespacesRequest | PlainMessage<ListNamespacesRequest> | undefined, b: ListNamespacesRequest | PlainMessage<ListNamespacesRequest> | undefined): boolean {
+    return proto3.util.equals(ListNamespacesRequest, a, b);
+  }
+}
+
+/**
+ * Reply payload for ListNamespaces.
+ *
+ * @generated from message legion.ListNamespacesReply
+ */
+export class ListNamespacesReply extends Message<ListNamespacesReply> {
+  /**
+   * Namespaces the caller can see, by name.
+   *
+   * @generated from field: repeated legion.Namespace namespaces = 1;
+   */
+  namespaces: Namespace[] = [];
+
+  constructor(data?: PartialMessage<ListNamespacesReply>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.ListNamespacesReply";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "namespaces", kind: "message", T: Namespace, repeated: true },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): ListNamespacesReply {
+    return new ListNamespacesReply().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): ListNamespacesReply {
+    return new ListNamespacesReply().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): ListNamespacesReply {
+    return new ListNamespacesReply().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: ListNamespacesReply | PlainMessage<ListNamespacesReply> | undefined, b: ListNamespacesReply | PlainMessage<ListNamespacesReply> | undefined): boolean {
+    return proto3.util.equals(ListNamespacesReply, a, b);
+  }
+}
+
+/**
+ * Request payload for GetNamespace.
+ *
+ * @generated from message legion.GetNamespaceRequest
+ */
+export class GetNamespaceRequest extends Message<GetNamespaceRequest> {
+  /**
+   * @generated from field: string name = 1;
+   */
+  name = "";
+
+  constructor(data?: PartialMessage<GetNamespaceRequest>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.GetNamespaceRequest";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "name", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): GetNamespaceRequest {
+    return new GetNamespaceRequest().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): GetNamespaceRequest {
+    return new GetNamespaceRequest().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): GetNamespaceRequest {
+    return new GetNamespaceRequest().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: GetNamespaceRequest | PlainMessage<GetNamespaceRequest> | undefined, b: GetNamespaceRequest | PlainMessage<GetNamespaceRequest> | undefined): boolean {
+    return proto3.util.equals(GetNamespaceRequest, a, b);
+  }
+}
+
+/**
+ * Reply payload for GetNamespace.
+ *
+ * @generated from message legion.GetNamespaceReply
+ */
+export class GetNamespaceReply extends Message<GetNamespaceReply> {
+  /**
+   * @generated from field: legion.Namespace namespace = 1;
+   */
+  namespace?: Namespace;
+
+  /**
+   * The ACL policy rules that reach this namespace. Only filled for callers
+   * holding `acl:read` (it names policies); empty otherwise.
+   *
+   * @generated from field: repeated legion.NamespaceReach reaching_rules = 2;
+   */
+  reachingRules: NamespaceReach[] = [];
+
+  /**
+   * What the namespace's jobs are charged, per band (see `BandUsage`): the
+   * figure every quota governing it is checked against.
+   *
+   * @generated from field: repeated legion.BandUsage usage = 3;
+   */
+  usage: BandUsage[] = [];
+
+  /**
+   * The namespace policies governing it, each with the aggregate it is
+   * checked against. Shown to any caller with `namespace:read`, so a tenant
+   * sees its effective limits without `acl:read`.
+   *
+   * @generated from field: repeated legion.NamespacePolicyStatus policies = 4;
+   */
+  policies: NamespacePolicyStatus[] = [];
+
+  constructor(data?: PartialMessage<GetNamespaceReply>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.GetNamespaceReply";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "namespace", kind: "message", T: Namespace },
+    { no: 2, name: "reaching_rules", kind: "message", T: NamespaceReach, repeated: true },
+    { no: 3, name: "usage", kind: "message", T: BandUsage, repeated: true },
+    { no: 4, name: "policies", kind: "message", T: NamespacePolicyStatus, repeated: true },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): GetNamespaceReply {
+    return new GetNamespaceReply().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): GetNamespaceReply {
+    return new GetNamespaceReply().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): GetNamespaceReply {
+    return new GetNamespaceReply().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: GetNamespaceReply | PlainMessage<GetNamespaceReply> | undefined, b: GetNamespaceReply | PlainMessage<GetNamespaceReply> | undefined): boolean {
+    return proto3.util.equals(GetNamespaceReply, a, b);
+  }
+}
+
+/**
+ * Request payload for ApplyNamespace.
+ *
+ * @generated from message legion.ApplyNamespaceRequest
+ */
+export class ApplyNamespaceRequest extends Message<ApplyNamespaceRequest> {
+  /**
+   * The namespace to create or update. `created_at`, `updated_at` and
+   * `counts` are ignored.
+   *
+   * @generated from field: legion.Namespace namespace = 1;
+   */
+  namespace?: Namespace;
+
+  /**
+   * When set, validate and report the policies that would reach it, but
+   * write nothing.
+   *
+   * @generated from field: bool dry_run = 2;
+   */
+  dryRun = false;
+
+  constructor(data?: PartialMessage<ApplyNamespaceRequest>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.ApplyNamespaceRequest";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "namespace", kind: "message", T: Namespace },
+    { no: 2, name: "dry_run", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): ApplyNamespaceRequest {
+    return new ApplyNamespaceRequest().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): ApplyNamespaceRequest {
+    return new ApplyNamespaceRequest().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): ApplyNamespaceRequest {
+    return new ApplyNamespaceRequest().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: ApplyNamespaceRequest | PlainMessage<ApplyNamespaceRequest> | undefined, b: ApplyNamespaceRequest | PlainMessage<ApplyNamespaceRequest> | undefined): boolean {
+    return proto3.util.equals(ApplyNamespaceRequest, a, b);
+  }
+}
+
+/**
+ * Reply payload for ApplyNamespace.
+ *
+ * @generated from message legion.ApplyNamespaceReply
+ */
+export class ApplyNamespaceReply extends Message<ApplyNamespaceReply> {
+  /**
+   * The stored namespace; on a dry run, what would be stored.
+   *
+   * @generated from field: legion.Namespace namespace = 1;
+   */
+  namespace?: Namespace;
+
+  /**
+   * True when this call created the namespace (or, on a dry run, would).
+   *
+   * @generated from field: bool created = 2;
+   */
+  created = false;
+
+  /**
+   * The ACL policy rules that reach the namespace — on creation, the
+   * grants that take effect the moment it exists, including through
+   * selectors like `["*"]` written long before. Only filled for callers
+   * holding `acl:read`.
+   *
+   * @generated from field: repeated legion.NamespaceReach reaching_rules = 3;
+   */
+  reachingRules: NamespaceReach[] = [];
+
+  constructor(data?: PartialMessage<ApplyNamespaceReply>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.ApplyNamespaceReply";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "namespace", kind: "message", T: Namespace },
+    { no: 2, name: "created", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
+    { no: 3, name: "reaching_rules", kind: "message", T: NamespaceReach, repeated: true },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): ApplyNamespaceReply {
+    return new ApplyNamespaceReply().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): ApplyNamespaceReply {
+    return new ApplyNamespaceReply().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): ApplyNamespaceReply {
+    return new ApplyNamespaceReply().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: ApplyNamespaceReply | PlainMessage<ApplyNamespaceReply> | undefined, b: ApplyNamespaceReply | PlainMessage<ApplyNamespaceReply> | undefined): boolean {
+    return proto3.util.equals(ApplyNamespaceReply, a, b);
+  }
+}
+
+/**
+ * Request payload for DeleteNamespace.
+ *
+ * @generated from message legion.DeleteNamespaceRequest
+ */
+export class DeleteNamespaceRequest extends Message<DeleteNamespaceRequest> {
+  /**
+   * @generated from field: string name = 1;
+   */
+  name = "";
+
+  /**
+   * Stop and destroy everything in the namespace first, then delete it.
+   *
+   * @generated from field: bool cascade = 2;
+   */
+  cascade = false;
+
+  /**
+   * Report what would be deleted (and, for a non-empty namespace without
+   * `cascade`, why it would be refused) without changing anything.
+   *
+   * @generated from field: bool dry_run = 3;
+   */
+  dryRun = false;
+
+  /**
+   * Optional idempotency key; see RunJobRequest.idempotency_key.
+   *
+   * @generated from field: optional string idempotency_key = 4;
+   */
+  idempotencyKey?: string;
+
+  constructor(data?: PartialMessage<DeleteNamespaceRequest>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.DeleteNamespaceRequest";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "name", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 2, name: "cascade", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
+    { no: 3, name: "dry_run", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
+    { no: 4, name: "idempotency_key", kind: "scalar", T: 9 /* ScalarType.STRING */, opt: true },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): DeleteNamespaceRequest {
+    return new DeleteNamespaceRequest().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): DeleteNamespaceRequest {
+    return new DeleteNamespaceRequest().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): DeleteNamespaceRequest {
+    return new DeleteNamespaceRequest().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: DeleteNamespaceRequest | PlainMessage<DeleteNamespaceRequest> | undefined, b: DeleteNamespaceRequest | PlainMessage<DeleteNamespaceRequest> | undefined): boolean {
+    return proto3.util.equals(DeleteNamespaceRequest, a, b);
+  }
+}
+
+/**
+ * Reply payload for DeleteNamespace.
+ *
+ * @generated from message legion.DeleteNamespaceReply
+ */
+export class DeleteNamespaceReply extends Message<DeleteNamespaceReply> {
+  /**
+   * True when the namespace was deleted (false on a dry run).
+   *
+   * @generated from field: bool deleted = 1;
+   */
+  deleted = false;
+
+  /**
+   * On a dry run, what the namespace holds; after a cascade, what was
+   * removed.
+   *
+   * @generated from field: legion.NamespaceContents contents = 2;
+   */
+  contents?: NamespaceContents;
+
+  /**
+   * Human-readable cascade steps, in order (`Stopped payments-old/web`).
+   *
+   * @generated from field: repeated string steps = 3;
+   */
+  steps: string[] = [];
+
+  /**
+   * True when this reply was replayed from an earlier request with the same
+   * `idempotency_key`.
+   *
+   * @generated from field: bool deduplicated = 4;
+   */
+  deduplicated = false;
+
+  constructor(data?: PartialMessage<DeleteNamespaceReply>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.DeleteNamespaceReply";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "deleted", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
+    { no: 2, name: "contents", kind: "message", T: NamespaceContents },
+    { no: 3, name: "steps", kind: "scalar", T: 9 /* ScalarType.STRING */, repeated: true },
+    { no: 4, name: "deduplicated", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): DeleteNamespaceReply {
+    return new DeleteNamespaceReply().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): DeleteNamespaceReply {
+    return new DeleteNamespaceReply().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): DeleteNamespaceReply {
+    return new DeleteNamespaceReply().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: DeleteNamespaceReply | PlainMessage<DeleteNamespaceReply> | undefined, b: DeleteNamespaceReply | PlainMessage<DeleteNamespaceReply> | undefined): boolean {
+    return proto3.util.equals(DeleteNamespaceReply, a, b);
+  }
+}
+
+/**
+ * One priority band's charged reservations (docs/namespaces.md, "How quota
+ * is charged"): per job, the larger of what its spec declares (effective
+ * count times reservation, for count-driven tasks) and what its live
+ * allocations reserve, summed.
+ *
+ * @generated from message legion.BandUsage
+ */
+export class BandUsage extends Message<BandUsage> {
+  /**
+   * `critical`, `high`, `elevated`, `normal`, `low` or `background`.
+   *
+   * @generated from field: string band = 1;
+   */
+  band = "";
+
+  /**
+   * CPU in MHz.
+   *
+   * @generated from field: double cpu = 2;
+   */
+  cpu = 0;
+
+  /**
+   * Memory in MiB.
+   *
+   * @generated from field: double memory = 3;
+   */
+  memory = 0;
+
+  /**
+   * Exclusive cores.
+   *
+   * @generated from field: double cores = 4;
+   */
+  cores = 0;
+
+  /**
+   * Live allocations (not `complete` or `failed`) in the band.
+   *
+   * @generated from field: uint64 allocations = 5;
+   */
+  allocations = protoInt64.zero;
+
+  constructor(data?: PartialMessage<BandUsage>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.BandUsage";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "band", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 2, name: "cpu", kind: "scalar", T: 1 /* ScalarType.DOUBLE */ },
+    { no: 3, name: "memory", kind: "scalar", T: 1 /* ScalarType.DOUBLE */ },
+    { no: 4, name: "cores", kind: "scalar", T: 1 /* ScalarType.DOUBLE */ },
+    { no: 5, name: "allocations", kind: "scalar", T: 4 /* ScalarType.UINT64 */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): BandUsage {
+    return new BandUsage().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): BandUsage {
+    return new BandUsage().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): BandUsage {
+    return new BandUsage().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: BandUsage | PlainMessage<BandUsage> | undefined, b: BandUsage | PlainMessage<BandUsage> | undefined): boolean {
+    return proto3.util.equals(BandUsage, a, b);
+  }
+}
+
+/**
+ * A namespace policy as stored.
+ *
+ * @generated from message legion.NamespacePolicy
+ */
+export class NamespacePolicy extends Message<NamespacePolicy> {
+  /**
+   * Unique name: letters, digits, `-`, `_` and `.`.
+   *
+   * @generated from field: string name = 1;
+   */
+  name = "";
+
+  /**
+   * The namespace globs the policy governs, as stored (sorted).
+   *
+   * @generated from field: repeated string namespaces = 2;
+   */
+  namespaces: string[] = [];
+
+  /**
+   * The whole object as normalized JSON, exactly as `legion namespace
+   * policy apply -f` reads it: `name`, `description`, `namespaces`,
+   * `quota` (band -> `{ cpu (MHz), memory (MiB), cores }`), `maxJobs`,
+   * `maxNamespaces`, `pools { allowed, default }`, `runtimes`,
+   * `hostVolumes`. An unset allowlist allows everything; an empty one
+   * allows nothing. Memory written as a size (`"128Gi"`) is stored as MiB.
+   *
+   * @generated from field: string object_json = 3;
+   */
+  objectJson = "";
+
+  /**
+   * Free-form description from the object.
+   *
+   * @generated from field: string description = 4;
+   */
+  description = "";
+
+  /**
+   * RFC3339 creation and last-update times. Empty on a dry run of a new
+   * policy.
+   *
+   * @generated from field: string created_at = 5;
+   */
+  createdAt = "";
+
+  /**
+   * @generated from field: string updated_at = 6;
+   */
+  updatedAt = "";
+
+  constructor(data?: PartialMessage<NamespacePolicy>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.NamespacePolicy";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "name", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 2, name: "namespaces", kind: "scalar", T: 9 /* ScalarType.STRING */, repeated: true },
+    { no: 3, name: "object_json", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 4, name: "description", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 5, name: "created_at", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 6, name: "updated_at", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): NamespacePolicy {
+    return new NamespacePolicy().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): NamespacePolicy {
+    return new NamespacePolicy().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): NamespacePolicy {
+    return new NamespacePolicy().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: NamespacePolicy | PlainMessage<NamespacePolicy> | undefined, b: NamespacePolicy | PlainMessage<NamespacePolicy> | undefined): boolean {
+    return proto3.util.equals(NamespacePolicy, a, b);
+  }
+}
+
+/**
+ * One policy governing a namespace, with the aggregate it is checked
+ * against: summed over every namespace the policy matches, which may
+ * include namespaces the caller cannot read (only totals are shown).
+ *
+ * @generated from message legion.NamespacePolicyStatus
+ */
+export class NamespacePolicyStatus extends Message<NamespacePolicyStatus> {
+  /**
+   * @generated from field: legion.NamespacePolicy policy = 1;
+   */
+  policy?: NamespacePolicy;
+
+  /**
+   * Charged usage per band across every matching namespace.
+   *
+   * @generated from field: repeated legion.BandUsage usage = 2;
+   */
+  usage: BandUsage[] = [];
+
+  /**
+   * Jobs across every matching namespace (the `maxJobs` figure).
+   *
+   * @generated from field: uint64 jobs = 3;
+   */
+  jobs = protoInt64.zero;
+
+  /**
+   * Namespaces the policy matches (the `maxNamespaces` figure).
+   *
+   * @generated from field: uint64 namespaces = 4;
+   */
+  namespaces = protoInt64.zero;
+
+  constructor(data?: PartialMessage<NamespacePolicyStatus>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.NamespacePolicyStatus";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "policy", kind: "message", T: NamespacePolicy },
+    { no: 2, name: "usage", kind: "message", T: BandUsage, repeated: true },
+    { no: 3, name: "jobs", kind: "scalar", T: 4 /* ScalarType.UINT64 */ },
+    { no: 4, name: "namespaces", kind: "scalar", T: 4 /* ScalarType.UINT64 */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): NamespacePolicyStatus {
+    return new NamespacePolicyStatus().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): NamespacePolicyStatus {
+    return new NamespacePolicyStatus().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): NamespacePolicyStatus {
+    return new NamespacePolicyStatus().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: NamespacePolicyStatus | PlainMessage<NamespacePolicyStatus> | undefined, b: NamespacePolicyStatus | PlainMessage<NamespacePolicyStatus> | undefined): boolean {
+    return proto3.util.equals(NamespacePolicyStatus, a, b);
+  }
+}
+
+/**
+ * Request payload for ListNamespacePolicies.
+ *
+ * @generated from message legion.ListNamespacePoliciesRequest
+ */
+export class ListNamespacePoliciesRequest extends Message<ListNamespacePoliciesRequest> {
+  constructor(data?: PartialMessage<ListNamespacePoliciesRequest>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.ListNamespacePoliciesRequest";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): ListNamespacePoliciesRequest {
+    return new ListNamespacePoliciesRequest().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): ListNamespacePoliciesRequest {
+    return new ListNamespacePoliciesRequest().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): ListNamespacePoliciesRequest {
+    return new ListNamespacePoliciesRequest().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: ListNamespacePoliciesRequest | PlainMessage<ListNamespacePoliciesRequest> | undefined, b: ListNamespacePoliciesRequest | PlainMessage<ListNamespacePoliciesRequest> | undefined): boolean {
+    return proto3.util.equals(ListNamespacePoliciesRequest, a, b);
+  }
+}
+
+/**
+ * Reply payload for ListNamespacePolicies.
+ *
+ * @generated from message legion.ListNamespacePoliciesReply
+ */
+export class ListNamespacePoliciesReply extends Message<ListNamespacePoliciesReply> {
+  /**
+   * Every policy, by name.
+   *
+   * @generated from field: repeated legion.NamespacePolicy policies = 1;
+   */
+  policies: NamespacePolicy[] = [];
+
+  constructor(data?: PartialMessage<ListNamespacePoliciesReply>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.ListNamespacePoliciesReply";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "policies", kind: "message", T: NamespacePolicy, repeated: true },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): ListNamespacePoliciesReply {
+    return new ListNamespacePoliciesReply().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): ListNamespacePoliciesReply {
+    return new ListNamespacePoliciesReply().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): ListNamespacePoliciesReply {
+    return new ListNamespacePoliciesReply().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: ListNamespacePoliciesReply | PlainMessage<ListNamespacePoliciesReply> | undefined, b: ListNamespacePoliciesReply | PlainMessage<ListNamespacePoliciesReply> | undefined): boolean {
+    return proto3.util.equals(ListNamespacePoliciesReply, a, b);
+  }
+}
+
+/**
+ * Request payload for GetNamespacePolicy.
+ *
+ * @generated from message legion.GetNamespacePolicyRequest
+ */
+export class GetNamespacePolicyRequest extends Message<GetNamespacePolicyRequest> {
+  /**
+   * The policy name.
+   *
+   * @generated from field: string name = 1;
+   */
+  name = "";
+
+  constructor(data?: PartialMessage<GetNamespacePolicyRequest>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.GetNamespacePolicyRequest";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "name", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): GetNamespacePolicyRequest {
+    return new GetNamespacePolicyRequest().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): GetNamespacePolicyRequest {
+    return new GetNamespacePolicyRequest().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): GetNamespacePolicyRequest {
+    return new GetNamespacePolicyRequest().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: GetNamespacePolicyRequest | PlainMessage<GetNamespacePolicyRequest> | undefined, b: GetNamespacePolicyRequest | PlainMessage<GetNamespacePolicyRequest> | undefined): boolean {
+    return proto3.util.equals(GetNamespacePolicyRequest, a, b);
+  }
+}
+
+/**
+ * Reply payload for GetNamespacePolicy.
+ *
+ * @generated from message legion.GetNamespacePolicyReply
+ */
+export class GetNamespacePolicyReply extends Message<GetNamespacePolicyReply> {
+  /**
+   * The policy with its aggregate usage.
+   *
+   * @generated from field: legion.NamespacePolicyStatus status = 1;
+   */
+  status?: NamespacePolicyStatus;
+
+  /**
+   * Charged usage of each existing namespace the policy matches, by name:
+   * the breakdown of `status.usage`.
+   *
+   * @generated from field: map<string, legion.NamespaceBandUsages> by_namespace = 2;
+   */
+  byNamespace: { [key: string]: NamespaceBandUsages } = {};
+
+  constructor(data?: PartialMessage<GetNamespacePolicyReply>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.GetNamespacePolicyReply";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "status", kind: "message", T: NamespacePolicyStatus },
+    { no: 2, name: "by_namespace", kind: "map", K: 9 /* ScalarType.STRING */, V: {kind: "message", T: NamespaceBandUsages} },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): GetNamespacePolicyReply {
+    return new GetNamespacePolicyReply().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): GetNamespacePolicyReply {
+    return new GetNamespacePolicyReply().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): GetNamespacePolicyReply {
+    return new GetNamespacePolicyReply().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: GetNamespacePolicyReply | PlainMessage<GetNamespacePolicyReply> | undefined, b: GetNamespacePolicyReply | PlainMessage<GetNamespacePolicyReply> | undefined): boolean {
+    return proto3.util.equals(GetNamespacePolicyReply, a, b);
+  }
+}
+
+/**
+ * A list of band usages, for map values.
+ *
+ * @generated from message legion.NamespaceBandUsages
+ */
+export class NamespaceBandUsages extends Message<NamespaceBandUsages> {
+  /**
+   * @generated from field: repeated legion.BandUsage usage = 1;
+   */
+  usage: BandUsage[] = [];
+
+  constructor(data?: PartialMessage<NamespaceBandUsages>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.NamespaceBandUsages";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "usage", kind: "message", T: BandUsage, repeated: true },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): NamespaceBandUsages {
+    return new NamespaceBandUsages().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): NamespaceBandUsages {
+    return new NamespaceBandUsages().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): NamespaceBandUsages {
+    return new NamespaceBandUsages().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: NamespaceBandUsages | PlainMessage<NamespaceBandUsages> | undefined, b: NamespaceBandUsages | PlainMessage<NamespaceBandUsages> | undefined): boolean {
+    return proto3.util.equals(NamespaceBandUsages, a, b);
+  }
+}
+
+/**
+ * Request payload for ApplyNamespacePolicy.
+ *
+ * @generated from message legion.ApplyNamespacePolicyRequest
+ */
+export class ApplyNamespacePolicyRequest extends Message<ApplyNamespacePolicyRequest> {
+  /**
+   * The policy object as JSON (Nickel evaluated to JSON by the CLI). See
+   * `NamespacePolicy.object_json` for the fields.
+   *
+   * @generated from field: string object_json = 1;
+   */
+  objectJson = "";
+
+  /**
+   * When set, validate and report `violations` without writing.
+   *
+   * @generated from field: bool dry_run = 2;
+   */
+  dryRun = false;
+
+  /**
+   * Optional idempotency key. See `RunJobRequest.idempotency_key`.
+   *
+   * @generated from field: optional string idempotency_key = 3;
+   */
+  idempotencyKey?: string;
+
+  constructor(data?: PartialMessage<ApplyNamespacePolicyRequest>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.ApplyNamespacePolicyRequest";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "object_json", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 2, name: "dry_run", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
+    { no: 3, name: "idempotency_key", kind: "scalar", T: 9 /* ScalarType.STRING */, opt: true },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): ApplyNamespacePolicyRequest {
+    return new ApplyNamespacePolicyRequest().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): ApplyNamespacePolicyRequest {
+    return new ApplyNamespacePolicyRequest().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): ApplyNamespacePolicyRequest {
+    return new ApplyNamespacePolicyRequest().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: ApplyNamespacePolicyRequest | PlainMessage<ApplyNamespacePolicyRequest> | undefined, b: ApplyNamespacePolicyRequest | PlainMessage<ApplyNamespacePolicyRequest> | undefined): boolean {
+    return proto3.util.equals(ApplyNamespacePolicyRequest, a, b);
+  }
+}
+
+/**
+ * One thing a policy would have refused, reported by a dry run.
+ *
+ * @generated from message legion.NamespacePolicyViolation
+ */
+export class NamespacePolicyViolation extends Message<NamespacePolicyViolation> {
+  /**
+   * The namespace it concerns.
+   *
+   * @generated from field: string namespace = 1;
+   */
+  namespace = "";
+
+  /**
+   * The job it concerns; empty for a count (`maxJobs`, `maxNamespaces`) or
+   * quota total.
+   *
+   * @generated from field: string job_id = 2;
+   */
+  jobId = "";
+
+  /**
+   * Which rule: `runtimes`, `pools`, `hostVolumes`, `quota`, `maxJobs`,
+   * `maxNamespaces`.
+   *
+   * @generated from field: string rule = 3;
+   */
+  rule = "";
+
+  /**
+   * The refusal message admission would have returned.
+   *
+   * @generated from field: string message = 4;
+   */
+  message = "";
+
+  constructor(data?: PartialMessage<NamespacePolicyViolation>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.NamespacePolicyViolation";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "namespace", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 2, name: "job_id", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 3, name: "rule", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 4, name: "message", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): NamespacePolicyViolation {
+    return new NamespacePolicyViolation().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): NamespacePolicyViolation {
+    return new NamespacePolicyViolation().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): NamespacePolicyViolation {
+    return new NamespacePolicyViolation().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: NamespacePolicyViolation | PlainMessage<NamespacePolicyViolation> | undefined, b: NamespacePolicyViolation | PlainMessage<NamespacePolicyViolation> | undefined): boolean {
+    return proto3.util.equals(NamespacePolicyViolation, a, b);
+  }
+}
+
+/**
+ * Reply payload for ApplyNamespacePolicy.
+ *
+ * @generated from message legion.ApplyNamespacePolicyReply
+ */
+export class ApplyNamespacePolicyReply extends Message<ApplyNamespacePolicyReply> {
+  /**
+   * The stored policy; on a dry run, what would be stored.
+   *
+   * @generated from field: legion.NamespacePolicy policy = 1;
+   */
+  policy?: NamespacePolicy;
+
+  /**
+   * True when this call created the policy (or, on a dry run, would).
+   *
+   * @generated from field: bool created = 2;
+   */
+  created = false;
+
+  /**
+   * On a dry run, what the policy would have refused among existing jobs
+   * and counts. Always empty on a write.
+   *
+   * @generated from field: repeated legion.NamespacePolicyViolation violations = 3;
+   */
+  violations: NamespacePolicyViolation[] = [];
+
+  /**
+   * True when this reply was replayed from an earlier request with the same
+   * `idempotency_key`.
+   *
+   * @generated from field: bool deduplicated = 4;
+   */
+  deduplicated = false;
+
+  constructor(data?: PartialMessage<ApplyNamespacePolicyReply>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.ApplyNamespacePolicyReply";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "policy", kind: "message", T: NamespacePolicy },
+    { no: 2, name: "created", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
+    { no: 3, name: "violations", kind: "message", T: NamespacePolicyViolation, repeated: true },
+    { no: 4, name: "deduplicated", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): ApplyNamespacePolicyReply {
+    return new ApplyNamespacePolicyReply().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): ApplyNamespacePolicyReply {
+    return new ApplyNamespacePolicyReply().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): ApplyNamespacePolicyReply {
+    return new ApplyNamespacePolicyReply().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: ApplyNamespacePolicyReply | PlainMessage<ApplyNamespacePolicyReply> | undefined, b: ApplyNamespacePolicyReply | PlainMessage<ApplyNamespacePolicyReply> | undefined): boolean {
+    return proto3.util.equals(ApplyNamespacePolicyReply, a, b);
+  }
+}
+
+/**
+ * Request payload for DeleteNamespacePolicy.
+ *
+ * @generated from message legion.DeleteNamespacePolicyRequest
+ */
+export class DeleteNamespacePolicyRequest extends Message<DeleteNamespacePolicyRequest> {
+  /**
+   * The policy name.
+   *
+   * @generated from field: string name = 1;
+   */
+  name = "";
+
+  /**
+   * Optional idempotency key. See `RunJobRequest.idempotency_key`.
+   *
+   * @generated from field: optional string idempotency_key = 2;
+   */
+  idempotencyKey?: string;
+
+  constructor(data?: PartialMessage<DeleteNamespacePolicyRequest>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.DeleteNamespacePolicyRequest";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "name", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 2, name: "idempotency_key", kind: "scalar", T: 9 /* ScalarType.STRING */, opt: true },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): DeleteNamespacePolicyRequest {
+    return new DeleteNamespacePolicyRequest().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): DeleteNamespacePolicyRequest {
+    return new DeleteNamespacePolicyRequest().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): DeleteNamespacePolicyRequest {
+    return new DeleteNamespacePolicyRequest().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: DeleteNamespacePolicyRequest | PlainMessage<DeleteNamespacePolicyRequest> | undefined, b: DeleteNamespacePolicyRequest | PlainMessage<DeleteNamespacePolicyRequest> | undefined): boolean {
+    return proto3.util.equals(DeleteNamespacePolicyRequest, a, b);
+  }
+}
+
+/**
+ * Reply payload for DeleteNamespacePolicy.
+ *
+ * @generated from message legion.DeleteNamespacePolicyReply
+ */
+export class DeleteNamespacePolicyReply extends Message<DeleteNamespacePolicyReply> {
+  /**
+   * True when the policy was deleted.
+   *
+   * @generated from field: bool deleted = 1;
+   */
+  deleted = false;
+
+  /**
+   * True when this reply was replayed from an earlier request with the same
+   * `idempotency_key`.
+   *
+   * @generated from field: bool deduplicated = 2;
+   */
+  deduplicated = false;
+
+  constructor(data?: PartialMessage<DeleteNamespacePolicyReply>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.DeleteNamespacePolicyReply";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "deleted", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
+    { no: 2, name: "deduplicated", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): DeleteNamespacePolicyReply {
+    return new DeleteNamespacePolicyReply().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): DeleteNamespacePolicyReply {
+    return new DeleteNamespacePolicyReply().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): DeleteNamespacePolicyReply {
+    return new DeleteNamespacePolicyReply().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: DeleteNamespacePolicyReply | PlainMessage<DeleteNamespacePolicyReply> | undefined, b: DeleteNamespacePolicyReply | PlainMessage<DeleteNamespacePolicyReply> | undefined): boolean {
+    return proto3.util.equals(DeleteNamespacePolicyReply, a, b);
   }
 }
 

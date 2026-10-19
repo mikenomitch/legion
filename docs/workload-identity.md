@@ -35,7 +35,8 @@ A workload identity token is an ES256-signed JWT. Standard claims:
 | `kid` (header) | Signing-key id, so verifiers pick the right JWKS entry. |
 
 The token also carries separate Legion claims, so providers that can match
-any claim don't have to parse `sub`: `legion.io/region`, `legion.io/job`,
+any claim don't have to parse `sub`: `legion.io/region`, `legion.io/namespace`,
+`legion.io/job` (the bare name),
 `legion.io/group`, `legion.io/task`, `legion.io/node`, `legion.io/alloc` (and
 `legion.io/instance` / `legion.io/slot` for stateful workloads). A stateful
 workload's token also carries `legion.io/epoch`, the instance's identity
@@ -47,11 +48,13 @@ epoch, which Legion uses to retire tokens copied into a fork or snapshot (see
 The default subject is:
 
 ```
-sub = <region>:<job>:<group>:<task>      e.g.  auto:api:web:server
+sub = <region>:<namespace>:<job>:<group>:<task>      e.g.  auto:default:api:web:server
 ```
 
-This matches Nomad. The subject stays stable across reschedules and gives
-each task its own least-privilege identity. `alloc_id` and `node_id` are not
+`<job>` is the job's bare name and `<namespace>` its namespace, so two
+namespaces' `api` never share a subject ([Namespaces](namespaces.md)). This
+matches Nomad's composed subject. The subject stays stable across reschedules
+and gives each task its own least-privilege identity. `alloc_id` and `node_id` are not
 in `sub`, because they change often and no stable policy could match them.
 They are included as `legion.io/*` claims instead.
 
@@ -72,20 +75,22 @@ error: task replica: identity "aws" sets subTemplate "{region}:{group}:{job}:{ta
 ```
 
 Two templates can render the same subject for two different workloads. With
-`job:write` on a job called `web` alone, `{region}:{group}:{job}:{task}` for
-group `api` and task `server` renders `auto:api:web:server`, which is the
-default subject of job `api`'s group `web`. AWS trust policies match nothing
+`job:write` on a job called `web` alone, `{region}:{namespace}:{group}:{job}:{task}`
+for group `api` and task `server` renders `auto:default:api:web:server`, which
+is the default subject of job `api`'s group `web`. AWS trust policies match nothing
 but `sub`, so which subject shapes exist is the operator's decision. Every
 template, the allowed ones included, must pass these rules (an invalid entry
 stops the manager from starting):
 
-- **Allow-list only.** Allowed: `{region}`, `{job}`, `{group}`, `{task}`, and
-  `{instance}`/`{slot}` (stateful tasks only). Unknown placeholders are rejected.
+- **Allow-list only.** Allowed: `{region}`, `{namespace}`, `{job}`, `{group}`,
+  `{task}`, and `{instance}`/`{slot}` (stateful tasks only). Unknown
+  placeholders are rejected.
 - **`{alloc}`/`{node}` are forbidden in `sub`.** They change often and would
   break identity that is stable across reschedules. They stay claims-only.
-- **Minimum uniqueness.** A template must keep at least `{job}`, `{group}`, and
-  `{task}`, so distinct workloads stay distinct. Templates without them are
-  rejected.
+- **Minimum uniqueness.** A template must keep at least `{namespace}`,
+  `{job}`, `{group}`, and `{task}`, so distinct workloads stay distinct.
+  Templates without them are rejected; dropping `{namespace}` would let two
+  namespaces' `web` mint the same subject for different tenants.
 - **Non-empty render.** A literal-only or empty-rendering template is rejected.
 
 ## Job-spec API
@@ -811,7 +816,7 @@ and, where supported, other claims.
   "Condition": {
     "StringEquals": {
       "manager.example.com:4747:aud": "sts.amazonaws.com",
-      "manager.example.com:4747:sub": "auto:api:web:server"
+      "manager.example.com:4747:sub": "auto:default:api:web:server"
     }
   }
 }

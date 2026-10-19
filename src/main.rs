@@ -13,28 +13,26 @@ async fn main() -> R<()> {
                 Some(("manager", args)) | Some(("worker", args)) if args.get_flag("o11y")
             )
     );
-    // The MCP server speaks JSON-RPC on stdout, so console logs must go to
-    // stderr to avoid corrupting the protocol stream.
     let mcp_mode = matches!(matches.subcommand(), Some(("mcp", _)));
-    // OTLP trace export is limited to long-running servers.
-    let server_mode = matches!(
-        matches.subcommand(),
-        Some(("start", sub_matches))
-            if matches!(
-                sub_matches.subcommand(),
-                Some(("manager", _)) | Some(("worker", _))
-            )
-    );
-    init_tracing_with_options(enable_o11y, mcp_mode, server_mode)?;
+    // Servers: every `start` subcommand (manager, worker, gateway) and
+    // `join`, which runs a worker. They log to stdout, where journald or a
+    // container runtime reads it, keep JSON file logs, and may export OTLP.
+    let server_mode = matches!(matches.subcommand_name(), Some("start" | "join"));
+    // Everything else logs to stderr and writes no files: a one-shot
+    // command's stdout is its output (`--json` envelopes among it), and the
+    // MCP server's stdout is the JSON-RPC stream.
+    init_tracing_with_options(enable_o11y, !server_mode, server_mode)?;
 
     // Long-running processes keep Rust's default of ignoring SIGPIPE, so a
-    // peer hanging up surfaces as an EPIPE error they can handle. Every other
-    // command is a one-shot CLI whose stdout may be piped into `head`.
+    // peer hanging up surfaces as an EPIPE error they can handle. That
+    // includes the gateway: its copy loop `splice`s into client sockets,
+    // which raises SIGPIPE when the client has gone. Every other command is
+    // a one-shot CLI whose stdout may be piped into `head`.
     let long_running = server_mode
         || mcp_mode
         || matches!(
             matches.subcommand_name(),
-            Some("join" | "guest-agent" | "guest-resume")
+            Some("guest-agent" | "guest-resume")
         );
     if !long_running {
         restore_default_sigpipe();
@@ -46,6 +44,7 @@ async fn main() -> R<()> {
         Some(("docs", sub_matches)) => cmd::docs::handle(sub_matches).await?,
         Some(("start", sub_matches)) => cmd::start::handle(sub_matches).await?,
         Some(("job", sub_matches)) => cmd::job::handle(sub_matches).await?,
+        Some(("namespace", sub_matches)) => cmd::namespace::handle(sub_matches).await?,
         Some(("template", sub_matches)) => cmd::template::handle(sub_matches).await?,
         Some(("instance", sub_matches)) => cmd::instance::handle(sub_matches).await?,
         Some(("node", sub_matches)) => cmd::node::handle(sub_matches).await?,

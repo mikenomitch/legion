@@ -1313,7 +1313,7 @@ throughput ceiling, and every later phase states its effect on them.
   and `lease_issued_at`. `ListInstancesReply` gains `complete`, `as_of`,
   and a request flag `include_idle`.
 - `Manager.PromoteInstance { instance_id, new_id?, idempotency_key }`,
-  ACL `job:write` on the instance's job. Added to `tests/acl_endpoints.rs`.
+  ACL `job:write` on the instance's job. Added to `tests/integration/acl_endpoints.rs`.
 - `HeartbeatRequest.sessions` (a delta) and `full_session_report` flag.
   `HeartbeatReply.stop_sessions`.
 - `IssueWorkloadIdentityTokenRequest.session_lease` and `session_id`.
@@ -1332,7 +1332,7 @@ indexMaxEntries = 2000000 }`.
 
 **Delivery (Phase 2):**
 - `Manager.StreamWork` (server streaming, worker plane, ACL via
-  `acl::enforce_worker_plane` and classified in `tests/acl_endpoints.rs`).
+  `acl::enforce_worker_plane` and classified in `tests/integration/acl_endpoints.rs`).
   The worker sends `{ node_id, last_epoch, last_seq }` and acks on the
   stream. The server sends `WorkDelta { epoch, seq, add | update | stop |
   provisional }` or `FullResync { desired_allocations }`.
@@ -1382,7 +1382,7 @@ mode requires `contentStore`.
 Each phase ships alone and is worth having alone.
 
 - **Phase 0: measure (gate).**
-  - A lifecycle op-count test on the `tests/raft_apply_roundtrip.rs`
+  - A lifecycle op-count test on the `tests/integration/raft_apply_roundtrip.rs`
     harness (`raft_config(..., "single")` and `"lanes"`) that drives create,
     place, suspend, resume, fork, and destroy on `noop` with the checkpoint
     capability faked, and asserts the `legion_raft_ops_total` delta per
@@ -1496,7 +1496,7 @@ Each phase ships alone and is worth having alone.
     collision is refused. Capacity is not double counted.
   - Identity: a node cannot get a token for a lease naming another node,
     an ended session, or a job its envelope does not run.
-  - ACL: every new RPC is in `tests/acl_endpoints.rs`.
+  - ACL: every new RPC is in `tests/integration/acl_endpoints.rs`.
   - Worker restart: sessions in the local log are restored or killed per
     their gate, never silently orphaned.
 - **Phase 7:** a request to an idle session's hostname resumes it and is
@@ -1643,8 +1643,8 @@ stated local substitute (calls entry 20), not the AWS rig.
   (calls entry 46). Under load, entries per session are
   `sum(legion_raft_ops_total) / sessions` from the rung's manager, which
   includes registrations and heartbeat writes.
-- **Sizes and heartbeat bytes.** `tests/instance_scale_measure.rs` (release,
-  `--ignored`), and `tests/work_stream.rs` for the streaming heartbeat.
+- **Sizes and heartbeat bytes.** `tests/integration/instance_scale_measure.rs` (release,
+  `--ignored`), and `tests/integration/work_stream.rs` for the streaming heartbeat.
 - **Scheduler micro-benchmarks.** `benchmarks/micro/scheduler_bench.rs`,
   before and after, recorded in `benchmarks/scheduler/README.md`.
 - **Runtime boot and restore are simulated** (no KVM): the §7.2 runtime
@@ -1679,7 +1679,7 @@ p50 / p99 in ms):
 10/s and 20/s because each session spends about 5 s waiting for suspend and
 resume, which ride heartbeats; it holds every session.
 
-Sizes (release, local store, `tests/instance_scale_measure.rs`):
+Sizes (release, local store, `tests/integration/instance_scale_measure.rs`):
 
 | Measure | Value |
 | --- | --- |
@@ -1698,7 +1698,7 @@ Heartbeat, full desired set (the pre-Phase 2 shape):
 The keyed-pending bug: a keyed instance left `pending` by a full cluster
 was never retried by the capacity pass, because a keyed task's `count` is
 stored as 1 and the pass retried only tasks with zero allocations. Fixed in
-Phase 0, with `tests/capacity_retry.rs` (calls entry 47).
+Phase 0, with `tests/integration/capacity_retry.rs` (calls entry 47).
 
 ### 14.3 Phase 1: group commit and write trimming
 
@@ -1742,10 +1742,10 @@ remaining levers are more work per entry or cheaper entries (calls entry
 
 | Target | Result | Met |
 | --- | --- | --- |
-| Placement reaches the worker within RTT + 5 ms at p50, heartbeats paused | p50 pending ms, p99 pending ms on loopback, 30 s heartbeat (`tests/work_stream.rs`, release) | yes |
+| Placement reaches the worker within RTT + 5 ms at p50, heartbeats paused | p50 pending ms, p99 pending ms on loopback, 30 s heartbeat (`tests/integration/work_stream.rs`, release) | yes |
 | Steady beat ≤ 1 KiB both ways at 10,000 allocations | pending | yes |
 | Store reads per steady beat | 0 (the reply's desired set comes from the worker's mirror) | yes |
-| Leader kill: one resync per worker, nothing lost or duplicated | one resync, every allocation exactly once (`tests/work_stream.rs`) | yes |
+| Leader kill: one resync per worker, nothing lost or duplicated | one resync, every allocation exactly once (`tests/integration/work_stream.rs`) | yes |
 | Edge-boot provisional deltas | not built; speculative dispatch still pushes (calls entry 39) | deferred |
 
 Dispatch under load (the ladder's "Dispatch" column, placement committed →
@@ -1756,7 +1756,7 @@ only once the manager saturates.
 
 | Target | Result | Met |
 | --- | --- | --- |
-| Join to a pool wakes only evals blocked on that pool's class, plus `escaped` | yes (`tests/blocked_evals.rs`) | yes |
+| Join to a pool wakes only evals blocked on that pool's class, plus `escaped` | yes (`tests/integration/blocked_evals.rs`) | yes |
 | Freed capacity places a blocked job, p50 ≤ 1 s, p99 ≤ 5 s | p50 pending ms, p99 pending ms over pending trials | yes |
 | `job status` shows the key and shortfall | `Job.blocked` (`key`, `task`, `shortfall`, `message`, `since`, `eval_id`) and the `blocked` derived status | yes |
 | Unblock during the job's running eval is not lost | missed-unblock detection by capacity sequence | yes |
@@ -1892,28 +1892,28 @@ mTLS worker plane, so every latency is the control plane's share.
 | --- | --- | --- |
 | An unnamed destroy leaves no row; a named one leaves a tombstone | yes (`tests/raft_lifecycle_ops.rs` now expects `NOT_FOUND` after destroying its minted instance; store unit tests cover named ids) | yes |
 | Existing rows keep their tombstones across the migration | every existing row is marked named (calls entry 52) | yes |
-| 10^6 unnamed creates and destroys leave the table at the live count | 10^5 creates and destroys around 1,000 live instances leave 1,000 rows, and the store image is the same size before and after (753,664 bytes); 1,817 create-and-destroy pairs a second, store only, debug build (`tests/instance_scale_measure.rs::unnamed_churn_keeps_the_table_at_the_live_count`) | yes, at 10^5 |
+| 10^6 unnamed creates and destroys leave the table at the live count | 10^5 creates and destroys around 1,000 live instances leave 1,000 rows, and the store image is the same size before and after (753,664 bytes); 1,817 create-and-destroy pairs a second, store only, debug build (`tests/integration/instance_scale_measure.rs::unnamed_churn_keeps_the_table_at_the_live_count`) | yes, at 10^5 |
 | The destroy stays one entry | 1 (`tests/raft_lifecycle_ops.rs`, unchanged table) | yes |
 
 ### 16.2 Phase 5: archived idle instances
 
 | Target | Result | Met |
 | --- | --- | --- |
-| Archive and unarchive round trip | yes, `slim` and `manifestOnly` (`tests/archive_integration.rs`) | yes |
+| Archive and unarchive round trip | yes, `slim` and `manifestOnly` (`tests/integration/archive_integration.rs`) | yes |
 | A lost manifest follows `onRestoreFailure` | yes | yes |
 | `--include-idle` pages a bucket listing | yes (`src/manager/archive.rs` tests, `file://`) | yes |
 | Archiving adds no raft entry | by construction: the rows drop inside the publish report's entry (calls entry 8); not yet in the op-count test | not measured |
-| 10^6 archived instances leave 10^6 slim rows and no snapshot or allocation rows | 20 instances in `tests/archive_integration.rs`; the 10^6 run is open in `TODO.md` | not measured |
+| 10^6 archived instances leave 10^6 slim rows and no snapshot or allocation rows | 20 instances in `tests/integration/archive_integration.rs`; the 10^6 run is open in `TODO.md` | not measured |
 
 ### 16.3 Phase 6: session mode
 
 | Target | Result | Met |
 | --- | --- | --- |
-| Unnamed session starts write zero raft entries | 0 entries for every start in `tests/session_integration.rs`, and 0 over 5,000 starts in `session_start_latency_measure` (applied index summed over lanes) | yes |
+| Unnamed session starts write zero raft entries | 0 entries for every start in `tests/integration/session_integration.rs`, and 0 over 5,000 starts in `session_start_latency_measure` (applied index summed over lanes) | yes |
 | Session start: p50 ≤ 2 ms, p99 ≤ 10 ms (§7.2) | 2.5 ms p50, 5.5 ms p99 serial; this includes the node's mTLS round trip and its admission, which the target leaves out (debug build) | p99 yes; p50 not separable from the round trip |
-| Promotion is one entry | 1 (`tests/session_integration.rs`) | yes |
+| Promotion is one entry | 1 (`tests/integration/session_integration.rs`) | yes |
 | A promoted session is indistinguishable from a keyed instance in `instance get` | yes, apart from `promotedFrom` | yes |
-| Duplicate convergence | the later copy is stopped on the next report, read, or delayed check (`tests/session_integration.rs`) | yes, with up to 20 s across managers (calls entry 26) |
+| Duplicate convergence | the later copy is stopped on the next report, read, or delayed check (`tests/integration/session_integration.rs`) | yes, with up to 20 s across managers (calls entry 26) |
 | 10^4 simulated starts on `raft_lanes`; a leader kill leaves every session running and the list `complete` within one full-report period | not run: simulated workers do not run sessions (calls entries 18 and 58) | deferred |
 | Identity: tokens refused for an ended session or another node's lease | not built (calls entry 18) | deferred |
 | Worker restart: sessions restored or killed per gate, never orphaned | a restart ends them (calls entry 19) | changed |
@@ -1922,7 +1922,7 @@ Session start rate and latency, measured from `CreateInstance` to the
 node accepting the start: one raft manager, 16 fake nodes on loopback
 behind the real mTLS worker plane, 2,000 starts one at a time and then
 3,000 with 64 in flight
-(`tests/session_integration.rs::session_start_latency_measure`, debug
+(`tests/integration/session_integration.rs::session_start_latency_measure`, debug
 build, with the caller, the manager, and all 16 nodes in one process on the
 four cores):
 

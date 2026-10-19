@@ -788,7 +788,8 @@ pub struct Metrics {
     pub scheduler_concurrency_adjustments_total: Arc<CounterVec>,
     /// `legion_scheduler_admission_skips_total`
     pub scheduler_admission_skips_total: Arc<Counter>,
-    /// `legion_preemptions_total{pool,band}` — victims actually evicted.
+    /// `legion_preemptions_total{pool,band,namespace}` — victims actually
+    /// evicted.
     pub preemptions_total: Arc<CounterVec>,
     /// `legion_preemption_plans_total{outcome}` — preemption passes that
     /// reached a decision: `placed`, `observe`, or `no_victims`.
@@ -851,6 +852,19 @@ pub struct Metrics {
     pub envelope_resizes_total: Arc<CounterVec>,
     /// `legion_allocations`
     pub allocations: Arc<Gauge>,
+    /// `legion_namespace_jobs{namespace}` (docs/metrics.md, "Namespaces")
+    pub namespace_jobs: Arc<GaugeVec>,
+    /// `legion_namespace_allocations{namespace}` (docs/metrics.md,
+    /// "Namespaces")
+    pub namespace_allocations: Arc<GaugeVec>,
+    /// `legion_namespace_reserved_cpu_mhz{namespace}` (docs/metrics.md,
+    /// "Namespaces")
+    pub namespace_reserved_cpu_mhz: Arc<GaugeVec>,
+    /// `legion_namespace_reserved_memory_bytes{namespace}` (docs/metrics.md,
+    /// "Namespaces")
+    pub namespace_reserved_memory_bytes: Arc<GaugeVec>,
+    /// `legion_job_submits_total{namespace}` (docs/metrics.md, "Namespaces")
+    pub job_submits_total: Arc<CounterVec>,
     /// `legion_store_write_lock_wait_seconds`
     pub store_write_lock_wait_seconds: Arc<Histogram>,
     /// `legion_store_read_lock_wait_seconds`
@@ -939,6 +953,9 @@ pub struct Metrics {
     pub nodes_marked_lost_total: Arc<Counter>,
     /// `legion_nodes_recovered_total{path}`
     pub nodes_recovered_total: Arc<CounterVec>,
+    /// `legion_leader_forwards_total{lane,op,outcome}` (docs/metrics.md,
+    /// "Raft")
+    pub leader_forwards_total: Arc<CounterVec>,
     /// `legion_read_model_drift_repaired_total{source}`
     pub read_model_drift_repaired_total: Arc<CounterVec>,
     /// `legion_read_model_external_writes_total`
@@ -1172,8 +1189,8 @@ impl Metrics {
         let preemptions_total = Arc::new(CounterVec {
             meta: FamilyMeta {
                 name: "legion_preemptions_total",
-                help: "Allocations evicted by scheduler preemption, by the victim's node pool and priority band.",
-                labels: &["pool", "band"],
+                help: "Allocations evicted by scheduler preemption, by the victim's node pool, priority band, and namespace.",
+                labels: &["pool", "band", "namespace"],
             },
             series: Series::new(),
         });
@@ -1373,6 +1390,38 @@ impl Metrics {
                 labels: &[],
             },
             cell: GaugeCell::default(),
+        });
+        let namespace_gauge = |name: &'static str, help: &'static str| {
+            Arc::new(GaugeVec {
+                meta: FamilyMeta {
+                    name,
+                    help,
+                    labels: &["namespace"],
+                },
+                series: Series::new(),
+            })
+        };
+        let namespace_jobs =
+            namespace_gauge("legion_namespace_jobs", "Registered jobs, by namespace.");
+        let namespace_allocations = namespace_gauge(
+            "legion_namespace_allocations",
+            "Live allocations (not complete or failed), by their job's namespace.",
+        );
+        let namespace_reserved_cpu_mhz = namespace_gauge(
+            "legion_namespace_reserved_cpu_mhz",
+            "CPU in MHz reserved by live allocations, by namespace: what a namespace policy quota is charged against.",
+        );
+        let namespace_reserved_memory_bytes = namespace_gauge(
+            "legion_namespace_reserved_memory_bytes",
+            "Memory in bytes reserved by live allocations, by namespace.",
+        );
+        let job_submits_total = Arc::new(CounterVec {
+            meta: FamilyMeta {
+                name: "legion_job_submits_total",
+                help: "Job submissions the manager accepted (RunJob and RunJobTemplate, deduplicated retries excluded), by namespace.",
+                labels: &["namespace"],
+            },
+            series: Series::new(),
         });
         let store_write_lock_wait_seconds = Arc::new(Histogram {
             meta: FamilyMeta {
@@ -1751,6 +1800,15 @@ impl Metrics {
             series: Series::new(),
         });
 
+        let leader_forwards_total = Arc::new(CounterVec {
+            meta: FamilyMeta {
+                name: "legion_leader_forwards_total",
+                help: "Store writes this manager forwarded to the lane's leader because it does not lead the lane (worker heartbeats, failure reports, and other worker-plane writes that land on a follower), by lane, op, and outcome: 'ok' (the leader executed it) or 'failed' (no leader known, unreachable, the target lost leadership, or the op failed there).",
+                labels: &["lane", "op", "outcome"],
+            },
+            series: Series::new(),
+        });
+
         // Read-model coherence (docs/state-store.md).
         let read_model_drift_repaired_total = Arc::new(CounterVec {
             meta: FamilyMeta {
@@ -1834,6 +1892,7 @@ impl Metrics {
             Arc::clone(&heartbeat_sustainable_nodes) as Arc<dyn RenderMetric>,
             Arc::clone(&nodes_marked_lost_total) as Arc<dyn RenderMetric>,
             Arc::clone(&nodes_recovered_total) as Arc<dyn RenderMetric>,
+            Arc::clone(&leader_forwards_total) as Arc<dyn RenderMetric>,
             Arc::clone(&read_model_drift_repaired_total) as Arc<dyn RenderMetric>,
             Arc::clone(&read_model_external_writes_total) as Arc<dyn RenderMetric>,
             Arc::clone(&liveness_tracked_nodes) as Arc<dyn RenderMetric>,
@@ -1844,6 +1903,11 @@ impl Metrics {
             Arc::clone(&liveness_loss_suppressed_total) as Arc<dyn RenderMetric>,
             Arc::clone(&liveness_checkpoint_seconds) as Arc<dyn RenderMetric>,
             Arc::clone(&allocations) as Arc<dyn RenderMetric>,
+            Arc::clone(&namespace_jobs) as Arc<dyn RenderMetric>,
+            Arc::clone(&namespace_allocations) as Arc<dyn RenderMetric>,
+            Arc::clone(&namespace_reserved_cpu_mhz) as Arc<dyn RenderMetric>,
+            Arc::clone(&namespace_reserved_memory_bytes) as Arc<dyn RenderMetric>,
+            Arc::clone(&job_submits_total) as Arc<dyn RenderMetric>,
             Arc::clone(&eval_queue_depth) as Arc<dyn RenderMetric>,
             Arc::clone(&evals_processed_total) as Arc<dyn RenderMetric>,
             Arc::clone(&grpc_in_flight) as Arc<dyn RenderMetric>,
@@ -1984,6 +2048,11 @@ impl Metrics {
             session_stops_total,
             session_promotions_total,
             allocations,
+            namespace_jobs,
+            namespace_allocations,
+            namespace_reserved_cpu_mhz,
+            namespace_reserved_memory_bytes,
+            job_submits_total,
             store_write_lock_wait_seconds,
             store_read_lock_wait_seconds,
             store_coalesce_batch_size,
@@ -2028,6 +2097,7 @@ impl Metrics {
             heartbeat_sustainable_nodes,
             nodes_marked_lost_total,
             nodes_recovered_total,
+            leader_forwards_total,
             read_model_drift_repaired_total,
             read_model_external_writes_total,
             liveness_tracked_nodes,
@@ -2752,14 +2822,27 @@ pub struct TelemetryState {
 /// Content type for the Prometheus text exposition format.
 pub const METRICS_CONTENT_TYPE: &str = "text/plain; version=0.0.4";
 
-/// Run the telemetry listener until the process exits. Bound on its own port
-/// (`server.port + 2` by convention; `telemetry.port` overrides).
-pub async fn serve_telemetry(addr: SocketAddr, state: TelemetryState) -> R<()> {
-    let listener = tokio::net::TcpListener::bind(addr)
-        .await
-        .with_context(|| format!("failed to bind telemetry listener on {addr}"))?;
+/// Start the telemetry listener on its own port (`server.port + 2` by
+/// convention; `telemetry.port` overrides) and serve it in the background
+/// until the process exits.
+///
+/// The port is bound before this returns, so a port conflict fails the
+/// manager's startup instead of leaving a manager up with no `/metrics` and
+/// no health probes, which an orchestrator reads as a dead manager.
+pub async fn start_telemetry(addr: SocketAddr, state: TelemetryState) -> R<()> {
+    let listener = tokio::net::TcpListener::bind(addr).await.with_context(|| {
+        format!(
+            "failed to bind the telemetry listener on {addr}; free the port, set \
+             telemetry.port, or set telemetry.enabled = false"
+        )
+    })?;
     info!(%addr, "Telemetry listener started (/metrics, /healthz, /readyz)");
-    serve_telemetry_on(listener, state).await
+    tokio::spawn(async move {
+        if let Err(err) = serve_telemetry_on(listener, state).await {
+            tracing::error!(error = ?err, "telemetry listener exited");
+        }
+    });
+    Ok(())
 }
 
 /// Serve telemetry on an already-bound listener (tests bind port 0 and read
@@ -3494,6 +3577,11 @@ mod tests {
         let out = render();
         for family in [
             "legion_allocations",
+            "legion_namespace_jobs",
+            "legion_namespace_allocations",
+            "legion_namespace_reserved_cpu_mhz",
+            "legion_namespace_reserved_memory_bytes",
+            "legion_job_submits_total",
             "legion_eval_queue_depth",
             "legion_evals_processed_total",
             "legion_grpc_in_flight",

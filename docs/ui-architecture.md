@@ -62,11 +62,13 @@ Routes in `App.tsx`:
 
 - `/` overview dashboard (KPI stat cards, active rollouts, workers, recent
   scheduler activity, allocations)
-- `/jobs` (+ `/jobs/:id`, `/jobs/:id/tasks/:taskName`, `/jobs/:id/specs/:configId`,
-  `/jobs/:id/instances/:instanceId`)
+- `/jobs` (+ `/jobs/:namespace/:name`, `/jobs/:namespace/:name/tasks/:taskName`,
+  `/jobs/:namespace/:name/specs/:configId`, `/jobs/:namespace/:name/instances/:instanceId`;
+  the namespace is always a path segment, `default` included, and lists take `?ns=`)
 - `/allocations/:id` (no index page; every allocation id in the UI links here)
 - `/templates` (+ `/templates/:name`)
-- `/services` (+ `/services/:name`)
+- `/services` (+ `/services/:namespace/:name`)
+- `/namespaces` (+ `/namespaces/:name`)
 - `/rollouts` (+ `/rollouts/:id`). `/deployments` redirects here.
 - `/nodes` (+ `/nodes/:id`)
 - `/manager` (+ `/manager/:id`)
@@ -303,10 +305,11 @@ the Access page reports it instead.
   the probe error on hover), the member's term and applied index with its
   lag behind the furthest member, and when its config snapshot was written.
   A warning names how many members did not answer. Outside raft the table
-  has one row. The manager name links to its config page only when it has
-  a snapshot: a manager writes one when it leads the control lane, so a
-  manager that has never led shows `—`. The page used to list the config
-  table itself, which showed only managers that had led.
+  has one row. The manager name links to its config page when it has a
+  snapshot. Every manager writes one at startup, a follower through the
+  control lane's leader, so `—` means the manager has not reached a leader
+  since it started (or its row predates the member-name key). The page used
+  to list the config table itself, which showed only managers that had led.
   `pages/details/ManagerNodeDetail.tsx`
   renders the published config as an at-a-glance summary, feature tiles
   (exec, telemetry, ACLs, workload identity, KV encryption, edge boot,
@@ -315,7 +318,7 @@ the Access page reports it instead.
   everywhere (including **Copy JSON** and the raw view), and the store's
   `YYYY-MM-DD HH:MM:SS +HH:MM:SS` timestamps parse
   (`utils/managerTime.ts`).
-- `pages/details/InstanceDetail.tsx` (`/jobs/:id/instances/:instanceId`): one
+- `pages/details/InstanceDetail.tsx` (`/jobs/:namespace/:name/instances/:instanceId`): one
   stateful instance from `GetInstance`. It shows state, current allocation
   and node, storage, fork lineage, last stop and cold boot, usage against the
   reservation, checkpoint and what it can checkpoint now, the shared
@@ -355,7 +358,7 @@ the Access page reports it instead.
 
 Discovery shows up in three places, all reading the same projection:
 
-- **Services** (`/services`, `/services/:name`): the catalog, per-endpoint
+- **Services** (`/services`, `/services/:namespace/:name`): the catalog, per-endpoint
   health, and the doctor-style diagnosis.
 - **Job detail**: a Services card with each declared service's endpoints, and
   Health/Ports columns on the allocation table.
@@ -398,7 +401,7 @@ Storage shows up wherever you'd ask "where is my data"
 
 ## Task Page
 
-`/jobs/:id/tasks/:taskName` answers "is this task healthy, and if not, which
+`/jobs/:namespace/:name/tasks/:taskName` answers "is this task healthy, and if not, which
 instance and why" first, and keeps configuration on its own tab. The header
 carries the live status, an `N/M healthy` badge, and **Logs** / **Open shell**
 buttons.
@@ -415,7 +418,7 @@ The tab is in the URL: `?tab=overview|logs|actions|spec` (default
 id, opens Actions). `?alloc=<allocation id>` picks the allocation the Logs and
 Actions tabs start on, and `?action=<name>|shell` picks the Actions list
 entry. A row's **Logs** / **Shell** buttons set them, so a link can land on
-one allocation's logs (`/jobs/web/tasks/api?tab=logs&alloc=4219`) or a shell
+one allocation's logs (`/jobs/default/web/tasks/api?tab=logs&alloc=4219`) or a shell
 in it (`?tab=actions&action=shell&alloc=4219`). Tab changes replace the history
 entry rather than adding one.
 
@@ -704,6 +707,32 @@ Two rules keep restricted identities from breaking the app:
   conditional around the outlet.
 
 All of this is cosmetic. The manager is the only enforcement point.
+
+## Namespaces
+
+[Namespaces](namespaces.md) reach the UI three ways, all in
+`utils/namespaces.ts` and `components/NamespaceSwitcher.tsx`:
+
+- **Paths and links.** `jobPath(id)` and `servicePath(namespace, name)` build
+  every job and service link, always with the namespace segment
+  (`/jobs/default/web`), and `jobIdFromParams` turns a route back into the
+  canonical id the RPCs take. No component formats a job URL by hand.
+- **The selection.** `useNamespaceSelection()` reads `?ns=` (names or globs,
+  comma-separated), defaulting to `*` for an identity whose
+  `WhoAmI.readable_namespaces` holds several and to its one namespace
+  otherwise. Jobs, Services, Rollouts and Volumes send it as the list RPC's
+  `namespaces`; Events filters its stream by `event.namespace`, showing
+  cluster events only under All.
+- **The header.** The layout's `PageHeader` renders `HeaderNamespaceControl`
+  for the current top-level path: the switcher on namespaced list pages, a
+  `cluster-scoped` tag on cluster pages, and nothing at all, beyond a badge,
+  for a single-namespace identity. Detail pages render
+  `DetailNamespaceSwitcher`, which navigates to the chosen namespace's list.
+
+The ACL mirror's `jobScope(id)` splits the canonical id into `namespace` and
+`name`, matching the manager's `AclScope::job`, and an allow rule over
+namespaced resources without `namespaces` matches `default` only, as on the
+manager.
 
 ## Stateful Workloads
 

@@ -1,5 +1,13 @@
 {
     name = "maximal-demo",
+    # The namespace the job lives in (docs/namespaces.md). Optional: unset
+    # means the request's namespace (`-n`, else $LEGION_NAMESPACE), else
+    # `default`. Writing it pins the job there; a request naming a different
+    # namespace is refused rather than silently resolved. `name` may instead
+    # be qualified (`payments-prod/maximal-demo`); the two must agree. The
+    # namespace must exist (`legion namespace create`), and the job's id is
+    # then `<namespace>/<name>` (bare in `default`).
+    namespace = "default",
     version = 1,
     # How important this job is, relative to everything else on the cluster
     # (docs/preemption-and-eviction.md). One of, most important first:
@@ -269,14 +277,16 @@
                 # client dialing the port directly is refused at the
                 # handshake. A policy object can impose or default it.
                 mesh = true,
-                # Who may call the service (docs/service-discovery.md): a
-                # bare entry is a job id glob, an entry with colons globs
-                # <region>:<job>:<group>:<task>. Omit the field (or use
-                # ["*"]) to allow everyone. Always enforced by the endpoint
-                # feed (others get no endpoints); with mesh = true also at
-                # the receiving node, against the verified caller
-                # (Legion-Denied-By: service/allow).
-                allow = ["gateway", "maximal-demo", "*:ops:*:shell"],
+                # Connect intentions (see docs/service-discovery.md): job
+                # globs allowed to reach this service through a `connect`
+                # upstream. A bare entry matches jobs in this job's own
+                # namespace; `ns/job` (globs on either side, `payments-*/api`)
+                # admits a consumer in another namespace. Omit the field (or
+                # use ["*"]) to allow every job in this namespace. Always
+                # enforced by the endpoint feed (others get no endpoints);
+                # with mesh = true also at the receiving node, against the
+                # verified caller's job (Legion-Denied-By: service/allow).
+                allow = ["gateway", "maximal-demo", "checkout-*/api"],
             },
             # Services this task dials, each through the node's forwarder,
             # which load-balances across the upstream's healthy endpoints.
@@ -301,6 +311,12 @@
                     # connections) | local_first (same-node endpoints first,
                     # widening when none is healthy locally).
                     { to = "search", balance = "least_conn" },
+                    # Reaching a service in another namespace is explicit,
+                    # and the target must admit this job with a qualified
+                    # `allow` entry (`"default/maximal-demo"`). The key, env
+                    # vars and DNS name become `<service>.<namespace>`:
+                    # LEGION_UPSTREAM_AUTH_SHARED, auth.shared.svc.legion.
+                    { to = "auth", namespace = "shared" },
                     # An HTTP service upstream (docs/network-handlers.md):
                     # a per-request deadline, bounded retries (idempotent
                     # methods only by default), and a canary split by service
@@ -1093,7 +1109,7 @@
             # the guest agent listens on $LEGION_UPSTREAM_API and on the
             # VIP api.svc.legion resolves to, and relays to the node's
             # upstream listener over vsock ("Sandboxes"). Submit refuses a
-            # localPort of 1080 or 53 here (the agent's proxy and resolver).
+            # port of 1080 or 53 here (the agent's proxy and resolver).
             # A sandbox that is not gated cannot reach its upstreams.
             connect = {
                 upstreams = [{ to = "api" }],

@@ -427,7 +427,7 @@ What differs from Linux:
   Apple containers instead of stalling the worker's heartbeat.
 
 The end-to-end test for this loop is
-`cargo test --test apple_container_idle -- --ignored`. It needs the
+`cargo test --test integration apple_container_idle:: -- --ignored`. It needs the
 `container` CLI and starts its service when it is down.
 
 ### Under memory pressure
@@ -1047,7 +1047,7 @@ Hint: set suspend.durability = "store" so the checkpoint is published to the wor
 
 1. The suspend and the publish run exactly as in [What happens](#what-happens).
 2. Once every part is uploaded, the node writes an **archive manifest** to
-   `<contentStore.url>/manifests/<job>/<group>/<task>/<instance>.json`: the
+   `<contentStore.url>/manifests/<namespace>/<job>/<group>/<task>/<instance>.json`: the
    checkpoint's manifest, plus the instance's identity (its id, job, task,
    when it was created and suspended, the fork it came from, and its identity
    epoch).
@@ -1067,7 +1067,7 @@ as `(archived)`:
 $ legion instance get user-42 -j
 {"ok":true,"data":{"instance":{"instanceId":"user-42","state":"suspended",
  "checkpointId":"snap-5b10e2c7a9d04f31","archived":true,
- "manifestUrl":"s3://legion-content-usw2/manifests/workspaces/main/workspace/user-42.json", ...}}}
+ "manifestUrl":"s3://legion-content-usw2/manifests/default/workspaces/main/workspace/user-42.json", ...}}}
 ```
 
 #### Resuming an archived instance
@@ -1089,7 +1089,7 @@ exactly as for a lost checkpoint: `cold` boots fresh, `fail` leaves the
 instance suspended with the reason in its detail:
 
 ```text
-instance user-42 cannot resume: checkpoint snap-5b10e2c7a9d04f31 is archived and its manifest s3://legion-content-usw2/manifests/workspaces/main/workspace/user-42.json could not be read (the manifest does not exist)
+instance user-42 cannot resume: checkpoint snap-5b10e2c7a9d04f31 is archived and its manifest s3://legion-content-usw2/manifests/default/workspaces/main/workspace/user-42.json could not be read (the manifest does not exist)
 ```
 
 #### Listing archived instances
@@ -1100,7 +1100,7 @@ other. `manifestOnly` instances live only in the bucket, and
 
 ```console
 $ legion instance list workspaces --include-idle --idle-page-size 500 -j
-{"ok":true,"data":{"instances":[...],"nextIdlePageToken":"0:manifests/workspaces/main/workspace/workspace-7k2q..."}}
+{"ok":true,"data":{"instances":[...],"nextIdlePageToken":"0:manifests/default/workspaces/main/workspace/workspace-7k2q..."}}
 $ legion instance list workspaces --include-idle --idle-page-token '0:manifests/...' -j
 ```
 
@@ -1186,7 +1186,8 @@ See [workload identity on sandboxes](workload-identity.md#sandboxes).
   rest of the [stop-cause vocabulary](graceful-stop.md)), a sentence, the
   allocation and node, and when. A memory pressure eviction carries the
   worker's own detail and hint, the same text as its `node.pressure` event,
-  so a job-scoped token without `operator:read` still sees it. The manager
+  so a job-scoped token without `operator:read` still sees it. A failure
+  the worker reported (`failed`) carries the node and the failure reason. The manager
   writes it in the same transaction that removes the allocation, and each
   later stop replaces it.
 - **What can it checkpoint right now?** For an `active` instance,
@@ -1216,7 +1217,7 @@ snapshots, plus placements and failures of the allocations that ran it (see
 [Event Stream](event-stream.md#events-about-one-instance-or-one-allocation)).
 
 In the UI, every instance id on the job page's Instances table opens the
-instance page (`/jobs/<job>/instances/<id>`). It shows:
+instance page (`/jobs/<namespace>/<job>/instances/<id>`). It shows:
 
 - the state, mode, slot, current allocation and node, storage volume, and
   fork lineage (forked from, and the forks of this instance);

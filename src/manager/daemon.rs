@@ -216,6 +216,22 @@ pub async fn run_manager_with(
         .await?;
     } else {
         info!("Skipping control-lane startup writes on raft non-leader manager");
+        // Except this manager's own config row, which only this manager can
+        // write: it forwards to the control lane's leader, retried in the
+        // background while the cluster elects one, so a manager that never
+        // leads still shows its config on the Managers page.
+        let store = store.clone();
+        let full_config = full_config.clone();
+        let node_id = manager_node_id.clone();
+        tokio::spawn(async move {
+            let published = startup_write("publish manager config through the leader", || async {
+                store.upsert_manager_config(&node_id, &full_config)
+            })
+            .await;
+            if let Err(err) = published {
+                warn!(error = ?err, "Failed publishing this manager's config row");
+            }
+        });
     }
     if is_scheduler_leader {
         if let Err(err) = store.prune_rollouts() {
@@ -587,6 +603,10 @@ pub async fn run_manager_with(
         diverged_since_ms: std::sync::Arc::new(std::sync::atomic::AtomicI64::new(0)),
     };
 
+    if let Some(warning) = full_config.server.loopback_join_address_warning() {
+        warn!("{warning}");
+    }
+
     // Follower-side forwarding of rejected writes to the raft leader
     // (docs/raft-operations.md, "Writes on any manager").
     let leader_forward = crate::manager::leader_forward::LeaderForwardLayer::new(store.clone());
@@ -595,6 +615,7 @@ pub async fn run_manager_with(
         .with_kv_debounce(Duration::from_millis(full_config.kv_debounce_ms))
         .with_authenticator(authenticator)
         .with_advertise_addr(full_config.server.advertised_address())
+        .with_join_address_warning(full_config.server.loopback_join_address_warning())
         .with_manager_id(manager_node_id.clone());
 
     let addr: std::net::SocketAddr =
@@ -613,14 +634,7 @@ pub async fn run_manager_with(
         )
         .parse()?;
         let exec_ws_tls = crate::manager::exec_ws::tls_acceptor(&full_config.server.tls)?;
-        tokio::spawn(async move {
-            if let Err(err) =
-                crate::manager::exec_ws::serve_exec_ws(exec_ws_addr, exec_ws_state, exec_ws_tls)
-                    .await
-            {
-                tracing::error!(error = ?err, "exec ws listener exited");
-            }
-        });
+        crate::manager::exec_ws::start_exec_ws(exec_ws_addr, exec_ws_state, exec_ws_tls).await?;
     } else {
         info!(
             "Exec is disabled (exec.enabled=false); ExecAllocation and the exec WebSocket are off"
@@ -636,13 +650,7 @@ pub async fn run_manager_with(
             .unwrap_or(full_config.server.port + 2);
         let telemetry_addr: std::net::SocketAddr =
             format!("{}:{}", full_config.server.host, telemetry_port).parse()?;
-        tokio::spawn(async move {
-            if let Err(err) =
-                crate::manager::telemetry::serve_telemetry(telemetry_addr, telemetry_state).await
-            {
-                tracing::error!(error = ?err, "telemetry listener exited");
-            }
-        });
+        crate::manager::telemetry::start_telemetry(telemetry_addr, telemetry_state).await?;
     } else {
         info!(
             "Telemetry is disabled (telemetry.enabled=false); /metrics and health probes are off"
@@ -668,6 +676,10 @@ pub async fn run_manager_with(
             "Starting manager: TLS for workers (cluster certificate), plaintext for the CLI and UI"
         );
     }
+    // Registered before the listener binds: a client can connect as soon as
+    // the socket listens, and a SIGTERM sent then must be heard, not take
+    // the default action and kill the manager mid-startup.
+    let mut shutdown_signals = ShutdownSignals::register();
     let api_listener = tokio::net::TcpListener::bind(addr)
         .await
         .with_context(|| format!("manager gRPC server on {addr} failed to bind"))?;
@@ -833,7 +845,7 @@ pub async fn run_manager_with(
             shutdown_persistence(&store_for_shutdown).await;
             return Err(err);
         }
-        signal = shutdown_signal() => signal,
+        signal = shutdown_signals.recv() => signal,
     };
 
     // Graceful shutdown (SIGTERM/SIGINT). Each step is bounded, so a stuck
@@ -850,7 +862,7 @@ pub async fn run_manager_with(
                 );
             }
         }
-        second = shutdown_signal() => {
+        second = shutdown_signals.recv() => {
             warn!(signal = second, "Second shutdown signal; exiting now");
             background.abort();
             return Ok(());
@@ -869,7 +881,7 @@ pub async fn run_manager_with(
                     );
                 }
             }
-            second = shutdown_signal() => {
+            second = shutdown_signals.recv() => {
                 warn!(signal = second, "Second shutdown signal; exiting now");
                 background.abort();
                 return Ok(());
@@ -931,34 +943,65 @@ const IN_PROCESS_WORKER_STOP_TIMEOUT: Duration = Duration::from_secs(120);
 /// this stays under Kubernetes' default 30s termination grace period.
 const SHUTDOWN_PERSISTENCE_TIMEOUT: Duration = Duration::from_secs(15);
 
-/// Resolves with the signal's name on SIGTERM or SIGINT (Ctrl-C).
-async fn shutdown_signal() -> &'static str {
-    let ctrl_c = async {
-        if let Err(err) = tokio::signal::ctrl_c().await {
-            // Without a handler this arm must never fire; SIGTERM still works.
-            warn!(error = ?err, "Failed installing the SIGINT handler");
-            std::future::pending::<()>().await;
-        }
-    };
+/// The manager's SIGTERM and SIGINT (Ctrl-C) handlers. Registering one
+/// replaces the signal's default action (exit), so they are registered
+/// before anything can observe the manager serving.
+struct ShutdownSignals {
     #[cfg(unix)]
-    {
-        use tokio::signal::unix::{signal, SignalKind};
-        match signal(SignalKind::terminate()) {
-            Ok(mut term) => tokio::select! {
-                _ = term.recv() => "SIGTERM",
-                _ = ctrl_c => "SIGINT",
-            },
-            Err(err) => {
-                warn!(error = ?err, "Failed installing the SIGTERM handler");
-                ctrl_c.await;
-                "SIGINT"
+    term: Option<tokio::signal::unix::Signal>,
+    #[cfg(unix)]
+    interrupt: Option<tokio::signal::unix::Signal>,
+}
+
+impl ShutdownSignals {
+    fn register() -> Self {
+        #[cfg(unix)]
+        {
+            use tokio::signal::unix::{signal, SignalKind};
+            let register = |kind: SignalKind, name: &str| match signal(kind) {
+                Ok(handler) => Some(handler),
+                Err(err) => {
+                    warn!(error = ?err, "Failed installing the {name} handler");
+                    None
+                }
+            };
+            Self {
+                term: register(SignalKind::terminate(), "SIGTERM"),
+                interrupt: register(SignalKind::interrupt(), "SIGINT"),
             }
         }
+        #[cfg(not(unix))]
+        {
+            Self {}
+        }
     }
-    #[cfg(not(unix))]
-    {
-        ctrl_c.await;
-        "SIGINT"
+
+    /// Resolves with the signal's name on the next SIGTERM or SIGINT. A
+    /// handler that failed to install never fires; the other still works.
+    async fn recv(&mut self) -> &'static str {
+        #[cfg(unix)]
+        {
+            async fn next(handler: &mut Option<tokio::signal::unix::Signal>) {
+                match handler {
+                    Some(handler) => {
+                        handler.recv().await;
+                    }
+                    None => std::future::pending().await,
+                }
+            }
+            tokio::select! {
+                _ = next(&mut self.term) => "SIGTERM",
+                _ = next(&mut self.interrupt) => "SIGINT",
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            if let Err(err) = tokio::signal::ctrl_c().await {
+                warn!(error = ?err, "Failed installing the SIGINT handler");
+                std::future::pending::<()>().await;
+            }
+            "SIGINT"
+        }
     }
 }
 
@@ -2044,6 +2087,40 @@ fn refresh_cluster_gauges(store: &Store) {
         Ok(count) => telemetry.allocations.set(count),
         Err(err) => debug!(error = ?err, "Failed refreshing allocation gauge"),
     }
+    match store.namespace_usage() {
+        Ok(usage) => {
+            // Every namespace that exists gets a series, so an emptied one
+            // reads 0 rather than going stale at its last value.
+            let mut names: std::collections::BTreeSet<String> = usage.keys().cloned().collect();
+            if let Ok(namespaces) = store.list_namespaces() {
+                names.extend(namespaces.into_iter().map(|record| record.namespace.name));
+            }
+            let gauge = |read: &dyn Fn(&crate::storage::namespace_store::NamespaceUsage) -> i64| {
+                names
+                    .iter()
+                    .map(|name| {
+                        let value = usage.get(name).map(read).unwrap_or(0);
+                        (vec![name.clone()], value)
+                    })
+                    .collect::<Vec<_>>()
+            };
+            telemetry
+                .namespace_jobs
+                .set_all(&gauge(&|usage| usage.jobs as i64));
+            telemetry
+                .namespace_allocations
+                .set_all(&gauge(&|usage| usage.total().allocations as i64));
+            telemetry
+                .namespace_reserved_cpu_mhz
+                .set_all(&gauge(&|usage| usage.total().cpu as i64));
+            telemetry
+                .namespace_reserved_memory_bytes
+                .set_all(&gauge(&|usage| {
+                    (usage.total().memory * 1024.0 * 1024.0) as i64
+                }));
+        }
+        Err(err) => debug!(error = ?err, "Failed refreshing namespace gauges"),
+    }
     // The read model's view of the fleet next to the DB's (`legion_nodes`
     // above): a persistent gap between the two is a truncated planning
     // universe, which previously took sampling plan_submission rows at rig
@@ -2109,7 +2186,7 @@ fn refresh_cluster_gauges(store: &Store) {
 /// lost on the tick that discovers it.
 ///
 /// Public for the heartbeat scale benchmark
-/// (`tests/heartbeat_scale_benchmark.rs`), which times one liveness pass; not
+/// (`tests/integration/heartbeat_scale_benchmark.rs`), which times one liveness pass; not
 /// part of any stable API.
 pub fn liveness_snapshot(
     store: &Store,
@@ -2637,7 +2714,7 @@ async fn start_eval_loop(store: Store, max_threads: usize) -> R<()> {
     // process startup. The eval queue is REPLICATED (plan §7-C2, JC-41), so
     // a newly elected leader already HOLDS the failed leader's pending work
     // — that is what makes an acknowledged `job stop` or a mid-flight
-    // rollout survive (tests/raft_eval_failover.rs). What the new leader
+    // rollout survive (tests/integration/raft_eval_failover.rs). What the new leader
     // still has to do on acquisition is (1) drop rows a later replicated
     // write superseded (`prune_stale_evals`), (2) requeue evals the old
     // leader had CLAIMED but not completed — they are `in_flight` in
@@ -3684,6 +3761,11 @@ async fn load_initial_data(store: &Store, config: &ManagerConfig) -> R<()> {
             .transpose()?
             .unwrap_or_else(|| "{}".to_string());
 
+        if let Some(resources) = wcp.resources.as_ref() {
+            crate::resources::validate_node_resources(resources)
+                .with_context(|| format!("invalid resources in worker config {path_str}"))?;
+        }
+
         // Fail fast on malformed fetch and content settings (bad humantime /
         // byte-size strings) at manager startup, not on the worker.
         if let Some(config) = wcp.artifacts.as_ref() {
@@ -4166,7 +4248,7 @@ mod tests {
     fn setup_store() -> R<Store> {
         let store_dir = Builder::new()
             .prefix("legion-agent-store-")
-            .tempdir()
+            .tempdir_in(crate::test_scratch::root())
             .context("Error creating temp store directory")?
             .keep();
 

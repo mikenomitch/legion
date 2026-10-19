@@ -445,7 +445,7 @@ instance (a hard pin or a floating published restore), that instance's id
 (`PlannedAllocation.instance_id`). The id rides the format-2
 `plan_submission` placements JSON (`instance_id`, omitted when absent), and
 the apply passes it to the keyed binder as the instance to bind, the way an
-edge-boot ratification does. `tests/published_resume_integration.rs`
+edge-boot ratification does. `tests/integration/published_resume_integration.rs`
 (`restores_with_different_compat_in_one_plan_bind_their_own_nodes`) shows
 the crossing it fixes.
 
@@ -2305,7 +2305,7 @@ volumes, multi-task groups). Before, a restore from a `local` snapshot (and
 a node-local `stateful.storage` pin) failed placement on any fleet large
 enough to arm the index whenever its pinned node fell outside the cut,
 with the misleading "node ..., which is unavailable".
-`tests/restore_placement_indexed.rs` covers it.
+`tests/integration/restore_placement_indexed.rs` covers it.
 
 **Alternatives.** Keep truncating and add the pinned nodes back into the
 cut list. Or disable truncation only when the task has pins right now (a

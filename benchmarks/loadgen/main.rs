@@ -415,7 +415,8 @@ fn cli() -> Command {
         .arg(Arg::new("join-token").long("join-token").help(
             "instances mode, required with --simulate: a `legion join-token create` \
                      token for the embedded fleet (sets its worker type and secret, \
-                     overriding --worker-type, and pins the cluster CA)",
+                     overriding --worker-type, and pins the cluster CA); the worker \
+                     type must grant the fleet (`attributes = { workerFleet = \"lg-*\" }`)",
         ))
         .arg(Arg::new("advertise-addr").long("advertise-addr").help(
             "instances mode: host the manager dials to push work to the embedded \
@@ -730,6 +731,7 @@ async fn submit_one(
     job: &PreparedJob,
 ) -> Result<SubmitReply, String> {
     let request = tonic::Request::new(RunJobRequest {
+        namespace: Default::default(),
         // The rig renders jobspecs to JSON up front (translate.py), which is
         // already the `parsed_jobspec` the manager consumes — the same string
         // `render_jobspec()` produces for a `.json` path in src/cmd/job.rs.

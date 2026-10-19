@@ -1,6 +1,13 @@
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let proto_file = "proto/legion.proto";
 
+    // Explicit rerun triggers replace Cargo's default of re-running on any
+    // change in the package.
+    println!("cargo:rerun-if-changed=build.rs");
+    println!("cargo:rerun-if-env-changed=LEGION_SKIP_PLUGIN_BUILD");
+    println!("cargo:rerun-if-env-changed=LEGION_BUILD_PLUGINS");
+    println!("cargo:rerun-if-env-changed=LEGION_PLUGIN_DIR");
+
     let skip_plugins = std::env::var("LEGION_SKIP_PLUGIN_BUILD").is_ok();
     let build_plugins = std::env::var("LEGION_BUILD_PLUGINS").is_ok();
     let plugin_root = std::env::var("LEGION_PLUGIN_DIR").unwrap_or_else(|_| "plugins".into());
@@ -15,7 +22,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // hand-built envelopes, and (through this) every API message the CLI
         // `--json` and MCP tools print. Enums and oneof variants keep their
         // names; map keys are data and are never renamed.
-        .message_attribute(".", "#[serde(rename_all = \"camelCase\")]")
+        //
+        // `default`: a field missing from the JSON takes its proto3 default,
+        // as it does on the wire. Proto messages are persisted as JSON (the
+        // worker's state files among them), so without it a field added to a
+        // message made every file written before it unreadable (`missing
+        // field envelopeResources` reading `netd_state.json` after a worker
+        // upgrade). Messages only: serde rejects a container `default` on
+        // the enums and oneofs `type_attribute(".")` also reaches.
+        .message_attribute(".", "#[serde(rename_all = \"camelCase\", default)]")
         .type_attribute("Job", "#[derive(tabled::Tabled)]")
         .type_attribute("Submission", "#[derive(tabled::Tabled)]")
         // A checkpoint part key must never reach a log line or a JSON dump:
@@ -34,7 +49,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // `-j` output and `job info`.
         .field_attribute("legion.Job.blocked", "#[tabled(skip)]")
         .field_attribute("legion.Job.reschedule_backoffs", "#[tabled(skip)]")
-        .compile_protos(&[proto_file], &["."])
+        // The include path doubles as tonic-build's `rerun-if-changed`
+        // watch. With "." that watch was the whole repository: editing a doc,
+        // a UI file, or anything else re-ran this script and rebuilt the
+        // crate, and every no-op build walked `ui/node_modules` to find out.
+        .compile_protos(&[proto_file], &["proto"])
         .unwrap_or_else(|e| panic!("protobuf compile error: {e}"));
 
     // tonic_build::compile_protos("proto/legion.proto")?;

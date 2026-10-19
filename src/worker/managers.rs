@@ -414,7 +414,10 @@ mod tests {
         // through the token's pin, recorded for A only: it covers B too.
         let store = crate::storage::store::Store::start_storage(
             &crate::structs::config::ManagerConfigFull {
-                store_path: tempfile::tempdir()?.keep().display().to_string(),
+                store_path: tempfile::tempdir_in(crate::test_scratch::root())?
+                    .keep()
+                    .display()
+                    .to_string(),
                 ..Default::default()
             },
         )?;
@@ -463,7 +466,10 @@ mod tests {
 
         let store = crate::storage::store::Store::start_storage(
             &crate::structs::config::ManagerConfigFull {
-                store_path: tempfile::tempdir()?.keep().display().to_string(),
+                store_path: tempfile::tempdir_in(crate::test_scratch::root())?
+                    .keep()
+                    .display()
+                    .to_string(),
                 ..Default::default()
             },
         )?;

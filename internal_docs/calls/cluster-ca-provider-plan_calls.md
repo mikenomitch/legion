@@ -73,7 +73,7 @@ no check.
 request.** As first built, the leader wrote the record from the agreement
 check itself, which every signature runs, so the first request that signed
 anything after a start (a session start dialing its node, say) carried a
-raft write. `tests/session_integration.rs` caught it: "a session start writes
+raft write. `tests/integration/session_integration.rs` caught it: "a session start writes
 no raft entry" saw one more entry. The check is now read-only on every path;
 `ClusterCa::record` writes the leader's view from the manager's certificate
 refresher (at start, then every minute) and after a rotation. The cost is a

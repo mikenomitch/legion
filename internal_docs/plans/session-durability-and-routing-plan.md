@@ -807,7 +807,7 @@ then, every session-sized write stays off raft.
   ids may not take either (breaking, per `AGENTS.md`).
 - **Proto, manager:** `ListSessionNodes(ListSessionNodesRequest) →
   ListSessionNodesReply` (read-only, `job:read`, in
-  `tests/acl_endpoints.rs`, the capability catalog, and MCP as
+  `tests/integration/acl_endpoints.rs`, the capability catalog, and MCP as
   `legion_session_nodes`). `CreateBootTicketRequest.scope` gains
   `session`.
 - **Proto, worker plane:** `Worker.StartSession`, `Worker.StopSession`
@@ -879,7 +879,7 @@ then, every session-sized write stays off raft.
   burst; a burst past the pool answers `RESOURCE_EXHAUSTED`, not a pile of
   threads.
 - **Phase 2:** a worker-restart integration test in
-  `tests/session_integration.rs` (fake node over the real worker plane,
+  `tests/integration/session_integration.rs` (fake node over the real worker plane,
   restarted mid-run): sessions adopted, ended processes dropped, full
   report on first beat. Unit tests for the log's group commit and recovery
   from a truncated WAL; a full report of 50,000 sessions crosses the

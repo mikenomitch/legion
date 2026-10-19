@@ -205,7 +205,7 @@ per-job or per-tenant; the report is cluster-wide operational state.
 `:269` `get_heartbeat_cadence`) is backed by one RPC
 (`GetHeartbeatCadence`, `proto/legion.proto:482`, handler
 `src/manager/server.rs:5242`), classified `node:read` in
-`tests/acl_endpoints.rs:96`, exposed as MCP tool `legion_node_cadence`
+`tests/integration/acl_endpoints.rs:96`, exposed as MCP tool `legion_node_cadence`
 (`src/cmd/mcp.rs:257`, dispatch `:834`), and catalogued at
 `src/cmd/capabilities.rs:359`. It prints a table, emits the envelope under
 `--json`, and refuses to guess on a manager that does not own the subsystem.
@@ -530,7 +530,7 @@ string doc_anchor; }`.
 
 **ACL.** `self.check_acl(&request, AclResource::Operator, AclAction::Read,
 AclScope::any())?` as the handler's first line, plus the entry in
-`tests/acl_endpoints.rs` `endpoint_table` and a request builder — the
+`tests/integration/acl_endpoints.rs` `endpoint_table` and a request builder — the
 `every_manager_rpc_is_classified` test fails the build otherwise.
 
 **Structs.** New `src/manager/diagnose.rs`: a `SchedulerSnapshot` (plain data,
@@ -600,7 +600,7 @@ signatures undiagnosable, a test fails.
 manager path, `sample_seconds = 0`, and a snapshot where a counter *decreased*
 (manager restart mid-sample) which must not produce negative rates.
 
-**Integration** — `tests/acl_endpoints.rs` (mandatory: the classification test
+**Integration** — `tests/integration/acl_endpoints.rs` (mandatory: the classification test
 fails the build without it); an unauthenticated call returns `PermissionDenied`;
 the MCP tool appears in `tools/list` **without** `--allow-write`; the
 capabilities unit test.
@@ -686,7 +686,7 @@ path, so `cargo bench --bench scheduler_bench` on base and change goes in the PR
   field and a direction; a reviewer can check this by reading the fixtures.
 - All seven detectors present; the healthy-cluster fixture puts every one in
   `passed` with evidence.
-- `tests/acl_endpoints.rs` passes with the new endpoint classified; an
+- `tests/integration/acl_endpoints.rs` passes with the new endpoint classified; an
   unauthenticated call is denied.
 - `legion_scheduler_diagnose` is listed by `mcp serve` without `--allow-write`,
   and absent from no listing.

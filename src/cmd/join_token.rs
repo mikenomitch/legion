@@ -111,13 +111,20 @@ async fn create(arg_matches: &ArgMatches) -> R<()> {
     let info = reply.info.unwrap_or_default();
 
     if format.is_json() {
-        output::print_success(&json!({
+        let mut data = json!({
             "id": info.id,
             "token": reply.token,
             "workerType": info.worker_type,
             "expiresAt": info.expires_at,
-        }));
+        });
+        if !reply.warning.is_empty() {
+            data["warning"] = json!(reply.warning);
+        }
+        output::print_success(&data);
     } else {
+        if !reply.warning.is_empty() {
+            eprintln!("Warning: {}\n", reply.warning);
+        }
         println!("Join token created (id {}).\n", info.id);
         println!("Run this on the worker host:\n");
         println!("  legion join {}\n", reply.token);

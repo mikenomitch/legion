@@ -26,14 +26,18 @@ pub fn init_tracing(enable_o11y: bool) -> R<()> {
 /// Initialize tracing, optionally routing the human-readable console layer to
 /// stderr instead of stdout.
 ///
-/// Routing to stderr is required for stdio protocol servers (for example
-/// `legion mcp serve`), where stdout is reserved for protocol messages and any
-/// stray log line would corrupt the stream.
+/// Routing to stderr is required wherever stdout carries output: a one-shot
+/// command's result (its `--json` envelope above all) and stdio protocol
+/// servers (for example `legion mcp serve`), where any stray log line would
+/// corrupt the stream.
 ///
-/// When `server_mode` is set and OTLP export is configured via the standard
-/// OpenTelemetry environment variables (see [`crate::otel`]), Legion's own spans
-/// are also exported over OTLP/HTTP. OTLP export is limited to long-running
-/// servers so short-lived CLI invocations do not spin up an exporter.
+/// `server_mode` is for long-running servers. Only they keep JSON file logs
+/// under `./logs` (and, with `enable_o11y`, spans under `./traces`): a
+/// one-shot command wrote both directories into whatever directory it ran
+/// in. When OTLP export is configured via the standard OpenTelemetry
+/// environment variables (see [`crate::otel`]), a server's own spans are also
+/// exported over OTLP/HTTP; short-lived CLI invocations do not spin up an
+/// exporter.
 #[instrument(skip_all)]
 pub fn init_tracing_with_options(
     enable_o11y: bool,
@@ -65,19 +69,27 @@ pub fn init_tracing_with_options(
     };
     let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
 
-    std::fs::create_dir_all("./logs")?;
-    std::fs::create_dir_all("./traces")?;
-    prune_dir("./logs", LOG_RETENTION_DAYS)?;
-    prune_dir("./traces", TRACE_RETENTION_DAYS)?;
+    let mut log_guard = None;
+    let file_log_layer = if server_mode {
+        std::fs::create_dir_all("./logs")?;
+        std::fs::create_dir_all("./traces")?;
+        prune_dir("./logs", LOG_RETENTION_DAYS)?;
+        prune_dir("./traces", TRACE_RETENTION_DAYS)?;
 
-    let file_appender = rolling::daily("./logs", "events.log");
-    let (file_appender, log_guard) = tracing_appender::non_blocking(file_appender);
-    let file_log_layer = tracing_subscriber::fmt::layer()
-        .json()
-        .with_writer(file_appender);
+        let file_appender = rolling::daily("./logs", "events.log");
+        let (file_appender, guard) = tracing_appender::non_blocking(file_appender);
+        log_guard = Some(guard);
+        Some(
+            tracing_subscriber::fmt::layer()
+                .json()
+                .with_writer(file_appender),
+        )
+    } else {
+        None
+    };
 
     let mut trace_guard_opt = None;
-    let trace_layer = if enable_o11y {
+    let trace_layer = if enable_o11y && server_mode {
         let trace_appender = rolling::daily("./traces", "spans.json");
         let (trace_appender, trace_guard) = tracing_appender::non_blocking(trace_appender);
         trace_guard_opt = Some(trace_guard);
@@ -118,11 +130,13 @@ pub fn init_tracing_with_options(
         .with(trace_layer)
         .with(otlp_layer);
 
-    APPENDER_GUARDS
-        .get_or_init(|| Mutex::new(Vec::new()))
-        .lock()
-        .expect("appender guard lock")
-        .push(log_guard);
+    if let Some(guard) = log_guard {
+        APPENDER_GUARDS
+            .get_or_init(|| Mutex::new(Vec::new()))
+            .lock()
+            .expect("appender guard lock")
+            .push(guard);
+    }
     if let Some(guard) = console_guard {
         APPENDER_GUARDS
             .get_or_init(|| Mutex::new(Vec::new()))

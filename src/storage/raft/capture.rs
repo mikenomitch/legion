@@ -1,6 +1,6 @@
 //! Thread-local capture/apply context and the changeset capture/apply
 //! primitives (plan §2, JC-12..15; mechanism validated by
-//! `tests/raft_changeset_capture.rs`).
+//! `tests/integration/raft_changeset_capture.rs`).
 //!
 //! A mutation in raft mode runs on a lane's pipeline thread as:
 //! global capture mutex -> `SAVEPOINT legion_capture` + session attach ->
@@ -833,7 +833,7 @@ mod tests {
     fn setup_store() -> R<Store> {
         let dir = tempfile::Builder::new()
             .prefix("khepri-raft-capture-")
-            .tempdir()
+            .tempdir_in(crate::test_scratch::root())
             .context("Error creating temp store directory")?
             .keep();
         let mut config = ManagerConfigFull {

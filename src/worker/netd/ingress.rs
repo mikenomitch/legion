@@ -839,13 +839,14 @@ mod tests {
         }))
         .unwrap();
         chain.normalize_and_validate("ingress").unwrap();
-        let allow = vec!["web".to_string(), "*:ops:*:*".to_string()];
+        let allow = vec!["web".to_string(), "ops".to_string()];
         let effective = merge_policies(
             &[],
             InlinePolicy {
                 ingress: Some(&chain),
                 mesh: Some(true),
                 callers: &allow,
+                owner: "svc",
                 ..Default::default()
             },
         );

@@ -221,7 +221,7 @@ asked. New fields: `GetJobSpecReply.rendered_jobspec`,
   (SQL and the stream's `matches_with` agree)
 - `storage::store::tests::list_kv_keys_omits_values`
 - `storage::store::tests::service_endpoints_carry_the_node_public_address`
-- `tests/acl_endpoints.rs` covers the changed KV requests.
+- `tests/integration/acl_endpoints.rs` covers the changed KV requests.
 - UI: `tsc`, and Playwright renders against mocked RPCs for the new pages.
 
 ## 9. Rollout

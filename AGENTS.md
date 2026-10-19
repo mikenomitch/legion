@@ -24,6 +24,17 @@
 
 ## Testing Guidelines
 - Use Rust `#[cfg(test)]` unit tests near code; integration data in `tests/`.
+- **Integration tests are modules of one binary, `tests/integration/main.rs`.**
+  Add a new file as `tests/integration/<name>.rs` plus a `mod <name>;` line,
+  not as a new top-level `tests/*.rs` (each of those links a separate
+  ~200 MB binary). Run one with `cargo test --test integration <name>::`.
+  Only a test that needs its own process (exact global-metric deltas, the
+  scheduler's concurrency gate, a `#[global_allocator]`) gets its own
+  `tests/*.rs`. See "Test Layout" in `docs/testing-and-benchmarks.md`.
+- A test directory that must outlive its `TempDir` guard goes under the
+  scratch root (`tempdir_in(crate::test_scratch::root())` in `src/`,
+  `tempdir_in(crate::support::scratch_root())` in `tests/integration/`)
+  before `keep()`, so it is removed when the test process exits.
 - Name tests descriptively with `_test` modules/functions.
 - Run full suite via `cargo test --all --locked`; avoid mutating shared fixtures.
 - Always run Rust tests unless the change only touches the front end or documentation.
@@ -78,11 +89,11 @@ Every Manager gRPC endpoint must enforce ACLs. When you add an RPC:
   the lookup and enforce the precise scope after it — otherwise
   credential-less callers can probe resource existence via NotFound vs
   PermissionDenied.
-- **Add the endpoint to `tests/acl_endpoints.rs`** (`endpoint_table` + a
+- **Add the endpoint to `tests/integration/acl_endpoints.rs`** (`endpoint_table` + a
   request builder). The `every_manager_rpc_is_classified` test parses
   `proto/legion.proto` and fails the build if a Manager RPC has no ACL
   coverage entry, so this is not optional.
-- **After merging branches**, re-run `cargo test --test acl_endpoints`:
+- **After merging branches**, re-run `cargo test --test integration acl_endpoints::`:
   endpoints written on a branch that predates (or ran parallel to) the ACL
   system arrive without checks, and this suite is what catches them. Add the
   missing `check_acl` calls in the handlers; never silence the test by

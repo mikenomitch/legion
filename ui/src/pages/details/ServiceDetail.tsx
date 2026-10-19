@@ -19,6 +19,7 @@ import { ServiceEdgesTable } from '../../components/ServiceGraph'
 import { managerClient } from '../../grpcClient'
 import { retainOnError, usePoll } from '../../utils/polling'
 import { diagnoseService, type DiagnosisLevel } from '../../utils/services'
+import { jobIdOf, jobNamespace, jobPath } from '../../utils/namespaces'
 
 const stepIcon: Record<DiagnosisLevel, 'check' | 'x' | 'alertTriangle'> = {
   ok: 'check',
@@ -34,27 +35,30 @@ const stepClass: Record<DiagnosisLevel, string> = {
 
 function ServiceDetailContent() {
   const params = useParams()
+  const serviceNamespace = createMemo(() => decodeURIComponent(params.namespace))
   const serviceName = createMemo(() => decodeURIComponent(params.name))
+  // The canonical reference the service RPCs take: bare in `default`.
+  const serviceRef = createMemo(() => jobIdOf(serviceNamespace(), serviceName()))
   const [onlyHealthy, setOnlyHealthy] = createSignal(false)
   const tick = usePoll()
 
   // Always resolve with unhealthy included: this page exists to explain why an
   // endpoint is missing, and filtering happens client-side.
   const [data] = createResource(
-    () => [serviceName(), tick()] as const,
+    () => [serviceRef(), tick()] as const,
     retainOnError(
       async ([name]: readonly [string, number]) => {
         const [list, resolved, graph] = await Promise.all([
-          managerClient.listServices({}),
+          managerClient.listServices({ namespaces: [jobNamespace(name)] }),
           managerClient.resolveService({ service: name, includeUnhealthy: true }),
           managerClient.listServiceEdges({ service: name, windowSecs: 300 }).catch(() => undefined),
         ])
         return {
-          summary: list.services.find((entry) => entry.service === name),
+          summary: list.services.find((entry) => jobIdOf(entry.namespace, entry.service) === name),
           endpoints: resolved.endpoints,
           // Callers into this service; a job:read token that cannot see the
           // graph simply gets no callers section.
-          edges: graph?.edges.filter((edge) => edge.service === name) ?? [],
+          edges: graph?.edges.filter((edge) => edge.target === name) ?? [],
           windowSecs: Number(graph?.windowSecs ?? 300),
         }
       },
@@ -104,12 +108,12 @@ function ServiceDetailContent() {
                   Declared by task{' '}
                   <A
                     class={linkClass}
-                    href={`/jobs/${encodeURIComponent(data()!.summary!.jobId)}/tasks/${encodeURIComponent(data()!.summary!.taskName)}`}
+                    href={`${jobPath(data()!.summary!.jobId)}/tasks/${encodeURIComponent(data()!.summary!.taskName)}`}
                   >
                     {data()!.summary!.taskName}
                   </A>{' '}
                   in job{' '}
-                  <A class={linkClass} href={`/jobs/${encodeURIComponent(data()!.summary!.jobId)}`}>
+                  <A class={linkClass} href={`${jobPath(data()!.summary!.jobId)}`}>
                     {data()!.summary!.jobId}
                   </A>
                 </>

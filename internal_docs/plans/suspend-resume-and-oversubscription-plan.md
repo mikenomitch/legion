@@ -1195,7 +1195,7 @@ used by a non-agent workload somewhere in §3.
   `HeartbeatReply` gains `suspend_allocations` and `checkpoint_requests`
   (live checkpoints for fork and manual snapshots).
 - `TaskAllocation` gains `restore` (manifest + identity payload).
-- Every new RPC goes into `tests/acl_endpoints.rs`, `catalog()` in
+- Every new RPC goes into `tests/integration/acl_endpoints.rs`, `catalog()` in
   `src/cmd/capabilities.rs`, and MCP tools in `src/cmd/mcp.rs`
   (`legion_instance_suspend`, `legion_instance_fork`,
   `legion_snapshot_*`, `legion_node_usage`).
@@ -1409,7 +1409,7 @@ Phase 4](../suspend-resume-linux-verification.md#phase-4))
 - Identity: a restored guest's token names the new allocation id.
 - `acl_endpoints` covers every new RPC.
 
-Phase 4 shipped with these as `tests/suspend_integration.rs` (the manager
+Phase 4 shipped with these as `tests/integration/suspend_integration.rs` (the manager
 side, against a simulated worker), `an_exec_disk_suspend_cold_boots_on_its_retained_volume`
 and `a_suspend_that_cannot_capture_leaves_the_task_running` in the worker (a
 real `exec` task), `a_restored_guest_gets_a_token_naming_the_new_allocation`
@@ -1454,7 +1454,7 @@ Phase 5 shipped with these as `src/worker/idle.rs` (one test per signal, the
 quiet-connection pair, the `cpuBelow` scaling, the idle-since tracker),
 `idle_since_follows_the_policys_signals` in the usage sampler,
 `an_idle_instance_suspends_after_its_window_and_a_busy_one_never_does` and
-the local-suspension tests in `tests/suspend_integration.rs` (manager side,
+the local-suspension tests in `tests/integration/suspend_integration.rs` (manager side,
 fake usage and simulated reports),
 `opted_in_instances_are_suspended_most_idle_first_before_evict_bursting` in
 `src/worker/pressure.rs` (a fake node), a pressure suspend of a real `exec`
@@ -1472,7 +1472,7 @@ question 3 is answered by calls entry 31, and §7's
 - Idempotent fork: the same key twice yields one set of forks.
 
 Phase 6 shipped with the manager half end to end against a simulated worker
-(`tests/fork_integration.rs`: three forks wait for the checkpoint and run as
+(`tests/integration/fork_integration.rs`: three forks wait for the checkpoint and run as
 distinct instances with their own allocations and volumes, idempotent retry,
 never-recycled ids, a failed capture, the refusals, named snapshots, and
 `onRestoreFailure`), a real `exec` disk fork with three `local-dir` clones
@@ -1494,7 +1494,7 @@ RNG.
 
 Phase 7a shipped with the location index, publisher, and score tests above
 (`src/storage/content_index.rs`, `src/worker/content_report.rs`,
-`src/content_publish.rs`, `tests/content_locality.rs`, and
+`src/content_publish.rs`, `tests/integration/content_locality.rs`, and
 `placement_prefers_the_node_holding_the_content` in the scheduler). The
 published-resume test is 7b. The `scheduler_bench` `locality` group measures
 content present and absent. One `plan_only` of 100 placements (4 tasks x 25), bin_pack, half the fleet
@@ -1516,13 +1516,13 @@ a shared machine under load from another session, so treat them as a smoke
 test, not the PR's evidence.
 
 Phase 7b shipped the published-resume test as
-`tests/published_resume_integration.rs` (suspend on A with `durability =
+`tests/integration/published_resume_integration.rs` (suspend on A with `durability =
 "store"`, publish, remove A or mark it lost, resume on B; locality prefers
 the node holding the parts; `compat` filters every candidate; warm), the
 worker transport for real with the `file` publisher
 (`a_published_snapshot_restores_on_a_node_that_never_held_it`,
 `warm_fetches_published_parts_into_the_store_once` in
-`src/worker/task_manager.rs`), and `tests/restore_placement_indexed.rs` for
+`src/worker/task_manager.rs`), and `tests/integration/restore_placement_indexed.rs` for
 the truncation fix (calls entry 88). It added a `restore` group to
 `scheduler_bench`: 25 keyed instances restoring from their own `local`
 snapshots (`local_pinned`) or `published` ones (`published_floating`, compat

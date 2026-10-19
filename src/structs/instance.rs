@@ -255,6 +255,7 @@ impl InstanceLastStop {
                  or the gang timed out waiting to place."
                     .to_string()
             }
+            StopCause::Failed => format!("Failed on node {node_id}."),
             StopCause::Unknown => "Stopped.".to_string(),
         };
         Self {

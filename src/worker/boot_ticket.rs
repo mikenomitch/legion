@@ -930,7 +930,7 @@ mod boot_ticket_test {
         use crate::manager::workload_identity::{default_issuer, WorkloadIdentityState};
         let store_dir = tempfile::Builder::new()
             .prefix("legion-boot-ticket-cluster-")
-            .tempdir()?
+            .tempdir_in(crate::test_scratch::root())?
             .keep();
         let store =
             crate::storage::store::Store::start_storage(&crate::structs::ManagerConfigFull {

@@ -278,7 +278,7 @@ Code recon the design leans on (details verified against the tree):
   utilization client-side (`NodeDeepView.tsx` `buildResourceUsage`).
 - **ACLs**: 8 closed resources (`job|node|kv|state|operator|acl|exec|action`,
   `src/structs/acl.rs:19-58`), read/write actions, job/pool/path scopes.
-  `tests/acl_endpoints.rs` fails the build on any unclassified RPC.
+  `tests/integration/acl_endpoints.rs` fails the build on any unclassified RPC.
 
 ## 6. Proposed design
 
@@ -339,7 +339,7 @@ Mechanics:
 - ACL: new resource **`scale`** (read/write, job-name scope). `job:write` does
   not imply `scale:write` and vice versa — the whole point is granting an
   autoscaler (or a teammate) the right to resize without the right to
-  redeploy. Both new RPCs get `tests/acl_endpoints.rs` entries.
+  redeploy. Both new RPCs get `tests/integration/acl_endpoints.rs` entries.
 
 ### 6.2 Ownership: overrides vs resubmits vs rollouts
 
@@ -729,7 +729,7 @@ path, in order of trust required:
 - The split-out agent's recommended policy is least-privilege:
   `scale:write` + `job:read` + `node:read` (+ `node:write` and `state:read`
   only if it runs node groups / uses SQL reads). Explicitly not `job:write`.
-- Every new RPC is classified in `tests/acl_endpoints.rs`; the build enforces
+- Every new RPC is classified in `tests/integration/acl_endpoints.rs`; the build enforces
   it.
 
 ## 7. Proto, struct, config, and persistence changes
@@ -836,7 +836,7 @@ versa.
   `exec` provider incl. drain-then-terminate ordering and `ForgetNode`;
   provider timeout/failure emits events and never strands a draining node
   (uncordon on abort).
-- **Regression gates**: every new RPC in `tests/acl_endpoints.rs`; capability
+- **Regression gates**: every new RPC in `tests/integration/acl_endpoints.rs`; capability
   catalog test (`mutates` flags); scheduler benchmarks before/after the
   effective-count accessor (it sits on the hot path — AGENTS.md scheduler
   rule).

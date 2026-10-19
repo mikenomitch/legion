@@ -213,10 +213,18 @@ harness = false
 # `build-and-upload.sh` build it explicitly.
 [lib]
 name = "legion"
+# The library has no doc tests. Leaving the pass on still runs rustdoc over the
+# whole crate on every `cargo test` to find none. Set this back to `true` when
+# the first runnable example lands in a doc comment.
+doctest = false
 
 [[bin]]
 name = "legion"
 path = "src/main.rs"
+# `src/main.rs` only dispatches into the library and has no tests of its own;
+# without this, `cargo test` links a second full copy of the binary to run
+# zero tests. Integration tests still get `CARGO_BIN_EXE_legion`.
+test = false
 
 [[bin]]
 name = "legion-loadgen"
@@ -226,6 +234,27 @@ required-features = ["loadgen"]
 [features]
 # Builds the `legion-loadgen` bin above. No effect on the `legion` binary.
 loadgen = []
+
+# Local and test builds. At full debuginfo every test binary carries DWARF for
+# all ~520 crates in the tree, and the target dir grows by gigabytes per
+# binary. Line tables keep file:line in panic backtraces for Legion's own
+# code; dependencies get none. To step through with variables in a debugger,
+# build with `CARGO_PROFILE_DEV_DEBUG=2`. The test profile inherits all of
+# this from dev.
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+debug = false
+
+# The bundled SQLite is C code that every store-backed test runs through:
+# each one opens a fresh store and applies every migration. At -O0 that
+# setup dominated the unit-test suite; optimizing this one crate cuts about a
+# quarter of the suite's CPU time, for one slower compile of a single C file.
+# Optimizing every dependency bought ~10% more and doubled the clean
+# dependency build, so the rest stay at -O0.
+[profile.dev.package.libsqlite3-sys]
+opt-level = 3
 
 # Profile for shipped binaries: `cargo build --profile dist`.
 #
