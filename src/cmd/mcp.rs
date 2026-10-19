@@ -141,6 +141,43 @@ fn namespace_delete_schema() -> Value {
     })
 }
 
+fn namespace_policy_name_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": { "name": { "type": "string", "description": "Namespace policy name." } },
+        "required": ["name"],
+        "additionalProperties": false
+    })
+}
+
+fn namespace_policy_apply_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "policy": {
+                "type": "object",
+                "description": "The policy object: { name, description?, namespaces: [glob], quota?: { <band>: { cpu? (MHz), memory? (MiB or \"64Gi\"), cores? } }, maxJobs?, maxNamespaces?, pools?: { allowed?: [glob], default? }, runtimes?: [glob], hostVolumes?: [glob] }. An unset allowlist allows everything; an empty one allows nothing."
+            },
+            "dry_run": { "type": "boolean", "description": "Validate and list what the policy would have refused among existing jobs and counts, without writing." },
+            "idempotency_key": { "type": "string" }
+        },
+        "required": ["policy"],
+        "additionalProperties": false
+    })
+}
+
+fn namespace_policy_delete_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "name": { "type": "string", "description": "Namespace policy name." },
+            "idempotency_key": { "type": "string" }
+        },
+        "required": ["name"],
+        "additionalProperties": false
+    })
+}
+
 fn name_arg_schema() -> Value {
     json!({
         "type": "object",
@@ -188,6 +225,30 @@ fn tool_defs() -> Vec<ToolDef> {
             name: "legion_namespace_delete",
             description: "Delete a namespace. Refused while it holds jobs, volumes or snapshots unless cascade is set, which stops and destroys them first (synchronously). dry_run lists the contents without deleting.",
             input_schema: namespace_delete_schema,
+            mutates: true,
+        },
+        ToolDef {
+            name: "legion_namespace_policy_list",
+            description: "List namespace policies (needs acl:read). A policy selects namespaces by glob and governs their jobs: an aggregate quota per priority band across every matching namespace, maxJobs, maxNamespaces, allowed/default pools, allowed runtimes and host volumes. A tenant sees the limits that bind it in legion_namespace_get instead.",
+            input_schema: empty_schema,
+            mutates: false,
+        },
+        ToolDef {
+            name: "legion_namespace_policy_get",
+            description: "Show one namespace policy with its charged usage, in total and per matching namespace (needs acl:read). A job is charged, per band, the larger of what its spec declares and what its live allocations reserve.",
+            input_schema: namespace_policy_name_schema,
+            mutates: false,
+        },
+        ToolDef {
+            name: "legion_namespace_policy_apply",
+            description: "Create or replace a namespace policy (needs acl:write). Checks run at admission (submit, scale-out, instance create, namespace create) and never evict admitted work. Set dry_run first: it lists what the policy would have refused among existing jobs and counts.",
+            input_schema: namespace_policy_apply_schema,
+            mutates: true,
+        },
+        ToolDef {
+            name: "legion_namespace_policy_delete",
+            description: "Delete a namespace policy (needs acl:write).",
+            input_schema: namespace_policy_delete_schema,
             mutates: true,
         },
         ToolDef {
@@ -1368,6 +1429,46 @@ async fn dispatch_tool(name: &str, args: Value) -> Result<Value, String> {
                         .get("dry_run")
                         .and_then(Value::as_bool)
                         .unwrap_or(false),
+                    idempotency_key: opt_str_arg(&args, "idempotency_key"),
+                }),
+            )
+            .await
+        }
+        "legion_namespace_policy_list" => {
+            let mut client = connect().await?;
+            grpc(client.list_namespace_policies(crate::structs::ListNamespacePoliciesRequest {}))
+                .await
+        }
+        "legion_namespace_policy_get" => {
+            let name = str_arg(&args, "name")?;
+            let mut client = connect().await?;
+            grpc(client.get_namespace_policy(crate::structs::GetNamespacePolicyRequest { name }))
+                .await
+        }
+        "legion_namespace_policy_apply" => {
+            let policy = args
+                .get("policy")
+                .filter(|policy| policy.is_object())
+                .ok_or_else(|| "missing object argument: policy".to_string())?;
+            let mut client = connect().await?;
+            grpc(
+                client.apply_namespace_policy(crate::structs::ApplyNamespacePolicyRequest {
+                    object_json: policy.to_string(),
+                    dry_run: args
+                        .get("dry_run")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false),
+                    idempotency_key: opt_str_arg(&args, "idempotency_key"),
+                }),
+            )
+            .await
+        }
+        "legion_namespace_policy_delete" => {
+            let name = str_arg(&args, "name")?;
+            let mut client = connect().await?;
+            grpc(
+                client.delete_namespace_policy(crate::structs::DeleteNamespacePolicyRequest {
+                    name,
                     idempotency_key: opt_str_arg(&args, "idempotency_key"),
                 }),
             )

@@ -2113,6 +2113,20 @@ fn migration_list() -> Vec<M<'static>> {
                     strftime('%Y-%m-%dT%H:%M:%SZ', 'now'), strftime('%Y-%m-%dT%H:%M:%SZ', 'now'));",
         )
         .down("DROP TABLE IF EXISTS namespace;"),
+        // Namespace policies (docs/namespaces.md, "Namespace policies"):
+        // cluster objects that select namespaces by glob and carry quota,
+        // counts and allowlists. `object` is the normalized policy as JSON.
+        // Control lane with `job` and `namespace`, so admission reads them
+        // inside the write it guards.
+        M::up(
+            "CREATE TABLE IF NOT EXISTS namespace_policy (
+            name STRING PRIMARY KEY,
+            object TEXT NOT NULL,
+            created_at STRING NOT NULL,
+            updated_at STRING NOT NULL
+        );",
+        )
+        .down("DROP TABLE IF EXISTS namespace_policy;"),
     ]
 }
 

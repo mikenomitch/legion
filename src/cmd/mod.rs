@@ -22,6 +22,7 @@ pub mod ledger;
 pub mod login;
 pub mod mcp;
 pub mod namespace;
+pub mod namespace_policy;
 pub mod net;
 pub mod node;
 pub mod oidc;

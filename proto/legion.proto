@@ -165,6 +165,47 @@ service Manager {
   // workloads the caller could not otherwise touch.
   rpc DeleteNamespace (DeleteNamespaceRequest) returns (DeleteNamespaceReply);
 
+  // --- Namespace policies (docs/namespaces.md, "Namespace policies") ---
+  //
+  // A namespace policy is a cluster object that selects namespaces by glob
+  // and governs the jobs in them: an aggregate quota per priority band
+  // across EVERY matching namespace, a job count, a namespace count,
+  // allowed and default node pools, allowed runtimes, and allowed host
+  // volumes. Every policy matching a namespace applies; quotas are checked
+  // independently and allowlists intersect, so a second policy can only
+  // narrow. Checks run at admission (job submit, `job scale`, instance
+  // create, namespace create), never in placement, and never evict or
+  // re-judge work that was already admitted. Policies are governance, so
+  // they sit at ACL-policy privilege: a namespace writer cannot raise its
+  // own limits.
+
+  // Lists every namespace policy.
+  //
+  // ACL: `acl:read`.
+  rpc ListNamespacePolicies (ListNamespacePoliciesRequest) returns (ListNamespacePoliciesReply);
+
+  // Returns one namespace policy, with each matching namespace's charged
+  // usage. NOT_FOUND when none has the name.
+  //
+  // ACL: `acl:read`.
+  rpc GetNamespacePolicy (GetNamespacePolicyRequest) returns (GetNamespacePolicyReply);
+
+  // Creates or replaces a namespace policy. The object is validated
+  // (namespace globs, band names, non-negative limits, a default pool
+  // inside the allowed pools) and stored normalized. With `dry_run`, writes
+  // nothing and reports, as `violations`, every existing job and count the
+  // policy would have refused had it been in force: the preview of what it
+  // will refuse next. A stored policy never evicts or rejects a job already
+  // admitted.
+  //
+  // ACL: `acl:write`.
+  rpc ApplyNamespacePolicy (ApplyNamespacePolicyRequest) returns (ApplyNamespacePolicyReply);
+
+  // Deletes a namespace policy. NOT_FOUND when none has the name.
+  //
+  // ACL: `acl:write`.
+  rpc DeleteNamespacePolicy (DeleteNamespacePolicyRequest) returns (DeleteNamespacePolicyReply);
+
   // === JOB TEMPLATES ===
   //
   // Job templates are cluster-resident, immutably versioned Nickel
@@ -12811,6 +12852,15 @@ message GetNamespaceReply {
   // The ACL policy rules that reach this namespace. Only filled for callers
   // holding `acl:read` (it names policies); empty otherwise.
   repeated NamespaceReach reaching_rules = 2;
+
+  // What the namespace's jobs are charged, per band (see `BandUsage`): the
+  // figure every quota governing it is checked against.
+  repeated BandUsage usage = 3;
+
+  // The namespace policies governing it, each with the aggregate it is
+  // checked against. Shown to any caller with `namespace:read`, so a tenant
+  // sees its effective limits without `acl:read`.
+  repeated NamespacePolicyStatus policies = 4;
 }
 
 // Request payload for ApplyNamespace.
@@ -12869,4 +12919,162 @@ message DeleteNamespaceReply {
   // True when this reply was replayed from an earlier request with the same
   // `idempotency_key`.
   bool deduplicated = 4;
+}
+
+// One priority band's charged reservations (docs/namespaces.md, "How quota
+// is charged"): per job, the larger of what its spec declares (effective
+// count times reservation, for count-driven tasks) and what its live
+// allocations reserve, summed.
+message BandUsage {
+  // `critical`, `high`, `elevated`, `normal`, `low` or `background`.
+  string band = 1;
+
+  // CPU in MHz.
+  double cpu = 2;
+
+  // Memory in MiB.
+  double memory = 3;
+
+  // Exclusive cores.
+  double cores = 4;
+
+  // Live allocations (not `complete` or `failed`) in the band.
+  uint64 allocations = 5;
+}
+
+// A namespace policy as stored.
+message NamespacePolicy {
+  // Unique name: letters, digits, `-`, `_` and `.`.
+  string name = 1;
+
+  // The namespace globs the policy governs, as stored (sorted).
+  repeated string namespaces = 2;
+
+  // The whole object as normalized JSON, exactly as `legion namespace
+  // policy apply -f` reads it: `name`, `description`, `namespaces`,
+  // `quota` (band -> `{ cpu (MHz), memory (MiB), cores }`), `maxJobs`,
+  // `maxNamespaces`, `pools { allowed, default }`, `runtimes`,
+  // `hostVolumes`. An unset allowlist allows everything; an empty one
+  // allows nothing. Memory written as a size (`"128Gi"`) is stored as MiB.
+  string object_json = 3;
+
+  // Free-form description from the object.
+  string description = 4;
+
+  // RFC3339 creation and last-update times. Empty on a dry run of a new
+  // policy.
+  string created_at = 5;
+  string updated_at = 6;
+}
+
+// One policy governing a namespace, with the aggregate it is checked
+// against: summed over every namespace the policy matches, which may
+// include namespaces the caller cannot read (only totals are shown).
+message NamespacePolicyStatus {
+  NamespacePolicy policy = 1;
+
+  // Charged usage per band across every matching namespace.
+  repeated BandUsage usage = 2;
+
+  // Jobs across every matching namespace (the `maxJobs` figure).
+  uint64 jobs = 3;
+
+  // Namespaces the policy matches (the `maxNamespaces` figure).
+  uint64 namespaces = 4;
+}
+
+// Request payload for ListNamespacePolicies.
+message ListNamespacePoliciesRequest {}
+
+// Reply payload for ListNamespacePolicies.
+message ListNamespacePoliciesReply {
+  // Every policy, by name.
+  repeated NamespacePolicy policies = 1;
+}
+
+// Request payload for GetNamespacePolicy.
+message GetNamespacePolicyRequest {
+  // The policy name.
+  string name = 1;
+}
+
+// Reply payload for GetNamespacePolicy.
+message GetNamespacePolicyReply {
+  // The policy with its aggregate usage.
+  NamespacePolicyStatus status = 1;
+
+  // Charged usage of each existing namespace the policy matches, by name:
+  // the breakdown of `status.usage`.
+  map<string, NamespaceBandUsages> by_namespace = 2;
+}
+
+// A list of band usages, for map values.
+message NamespaceBandUsages {
+  repeated BandUsage usage = 1;
+}
+
+// Request payload for ApplyNamespacePolicy.
+message ApplyNamespacePolicyRequest {
+  // The policy object as JSON (Nickel evaluated to JSON by the CLI). See
+  // `NamespacePolicy.object_json` for the fields.
+  string object_json = 1;
+
+  // When set, validate and report `violations` without writing.
+  bool dry_run = 2;
+
+  // Optional idempotency key. See `RunJobRequest.idempotency_key`.
+  optional string idempotency_key = 3;
+}
+
+// One thing a policy would have refused, reported by a dry run.
+message NamespacePolicyViolation {
+  // The namespace it concerns.
+  string namespace = 1;
+
+  // The job it concerns; empty for a count (`maxJobs`, `maxNamespaces`) or
+  // quota total.
+  string job_id = 2;
+
+  // Which rule: `runtimes`, `pools`, `hostVolumes`, `quota`, `maxJobs`,
+  // `maxNamespaces`.
+  string rule = 3;
+
+  // The refusal message admission would have returned.
+  string message = 4;
+}
+
+// Reply payload for ApplyNamespacePolicy.
+message ApplyNamespacePolicyReply {
+  // The stored policy; on a dry run, what would be stored.
+  NamespacePolicy policy = 1;
+
+  // True when this call created the policy (or, on a dry run, would).
+  bool created = 2;
+
+  // On a dry run, what the policy would have refused among existing jobs
+  // and counts. Always empty on a write.
+  repeated NamespacePolicyViolation violations = 3;
+
+  // True when this reply was replayed from an earlier request with the same
+  // `idempotency_key`.
+  bool deduplicated = 4;
+}
+
+// Request payload for DeleteNamespacePolicy.
+message DeleteNamespacePolicyRequest {
+  // The policy name.
+  string name = 1;
+
+  // Optional idempotency key. See `RunJobRequest.idempotency_key`.
+  optional string idempotency_key = 2;
+}
+
+// Reply payload for DeleteNamespacePolicy.
+message DeleteNamespacePolicyReply {
+  // True when the policy was deleted.
+  bool deleted = 1;
+
+  // True when this reply was replayed from an earlier request with the same
+  // `idempotency_key`.
+  bool deduplicated = 2;
 }

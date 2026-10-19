@@ -237,9 +237,12 @@ impl ManagerDaemonService {
             } else {
                 Vec::new()
             };
+        let (usage, policies) = self.namespace_policy_statuses(&name)?;
         Ok(Response::new(GetNamespaceReply {
             namespace: Some(record_to_proto(&record, Some(counts_of(&contents)))),
             reaching_rules,
+            usage,
+            policies,
         }))
     }
 

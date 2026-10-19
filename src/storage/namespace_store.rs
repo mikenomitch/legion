@@ -82,11 +82,32 @@ pub struct Reservation {
 }
 
 impl Reservation {
-    fn add(&mut self, other: &Reservation) {
+    pub(crate) fn add(&mut self, other: &Reservation) {
         self.cpu += other.cpu;
         self.memory += other.memory;
         self.cores += other.cores;
         self.allocations += other.allocations;
+    }
+
+    /// `count` of these.
+    pub(crate) fn times(&self, count: u32) -> Reservation {
+        let n = f64::from(count);
+        Reservation {
+            cpu: self.cpu * n,
+            memory: self.memory * n,
+            cores: self.cores * n,
+            allocations: self.allocations * u64::from(count),
+        }
+    }
+
+    /// Dimension by dimension, the larger of the two.
+    pub(crate) fn max_with(&self, other: &Reservation) -> Reservation {
+        Reservation {
+            cpu: self.cpu.max(other.cpu),
+            memory: self.memory.max(other.memory),
+            cores: self.cores.max(other.cores),
+            allocations: self.allocations.max(other.allocations),
+        }
     }
 }
 
@@ -202,6 +223,10 @@ impl Store {
             .is_some();
         if !existed {
             validate_new_namespace_name(&namespace.name).map_err(invalid_input)?;
+            crate::storage::namespace_policy_store::enforce_namespace_count_on(
+                &conn,
+                &namespace.name,
+            )?;
         }
         let now = OffsetDateTime::now_utc().format(&Rfc3339)?;
         let meta = serde_json::to_string(&namespace.meta)?;

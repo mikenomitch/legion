@@ -10609,6 +10609,14 @@ impl Store {
                 was_update = true;
             }
         }
+        // Namespace policy quota and job count, inside this entry so racing
+        // submits serialize. An unchanged resubmit returned above: a job
+        // that was admitted stays admitted.
+        crate::storage::namespace_policy_store::enforce_admission_on(
+            tx,
+            &self.resource_policy,
+            &config,
+        )?;
 
         let now = OffsetDateTime::now_utc().unix_timestamp();
 

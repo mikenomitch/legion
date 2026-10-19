@@ -121,6 +121,7 @@ use tonic::{Request, Response, Status, Streaming};
 mod checkpoint_support;
 mod fork_rpcs;
 mod make_room;
+mod namespace_policy_rpcs;
 mod namespace_rpcs;
 mod node_content_rpcs;
 mod session_rpcs;
@@ -2270,6 +2271,10 @@ impl ManagerDaemonService {
         // After authorization, so a caller with no grant in the namespace
         // cannot learn whether it exists.
         self.ensure_namespace_exists(&namespace)?;
+        // Namespace policies: runtimes, pools and host volumes here (a
+        // policy's default pool lands in the stored config); quota and
+        // `maxJobs` inside the store's submit entry.
+        self.admit_namespace_policies(&mut config)?;
 
         if let Some(template) = template {
             self.enforce_template_collision_guard(identity, &config.name, template)?;
@@ -5415,6 +5420,12 @@ impl Manager for ManagerDaemonService {
             .store
             .normalize_job_config(&config)
             .map_err(|e| map_store_error("Error normalizing jobspec", e))?;
+        // A plan refuses what the submit would: namespace policies, static
+        // rules and quota alike.
+        self.admit_namespace_policies(&mut config)?;
+        self.store
+            .check_namespace_admission(&config)
+            .map_err(|e| map_store_error("Namespace policy refused the job", e))?;
         validate_job_config(&config).map_err(|e| {
             error!("Error validating task configs: {:?}", e);
             Status::invalid_argument(format!("Error validating task configs: {e}"))
@@ -5763,6 +5774,37 @@ impl Manager for ManagerDaemonService {
         self.delete_namespace_rpc(request).await
     }
 
+    // Namespace policies live in `namespace_policy_rpcs`; each handler
+    // enforces `acl:read` / `acl:write` itself.
+
+    async fn list_namespace_policies(
+        &self,
+        request: Request<crate::structs::ListNamespacePoliciesRequest>,
+    ) -> Result<Response<crate::structs::ListNamespacePoliciesReply>, Status> {
+        self.list_namespace_policies_rpc(request).await
+    }
+
+    async fn get_namespace_policy(
+        &self,
+        request: Request<crate::structs::GetNamespacePolicyRequest>,
+    ) -> Result<Response<crate::structs::GetNamespacePolicyReply>, Status> {
+        self.get_namespace_policy_rpc(request).await
+    }
+
+    async fn apply_namespace_policy(
+        &self,
+        request: Request<crate::structs::ApplyNamespacePolicyRequest>,
+    ) -> Result<Response<crate::structs::ApplyNamespacePolicyReply>, Status> {
+        self.apply_namespace_policy_rpc(request).await
+    }
+
+    async fn delete_namespace_policy(
+        &self,
+        request: Request<crate::structs::DeleteNamespacePolicyRequest>,
+    ) -> Result<Response<crate::structs::DeleteNamespacePolicyReply>, Status> {
+        self.delete_namespace_policy_rpc(request).await
+    }
+
     #[instrument(skip_all)]
     async fn list_jobs(
         &self,
@@ -6040,6 +6082,21 @@ impl Manager for ManagerDaemonService {
             )
         } else {
             let count = inner.count.unwrap_or_default();
+            // Scale-out is new demand: a namespace policy's quota sees the
+            // job at its new count. Scale-in is never refused.
+            if count > previous {
+                let mut scaled = config.clone();
+                if let Some(task) = scaled
+                    .tasks
+                    .iter_mut()
+                    .find(|task| task.group == task_group && task.name == task_name)
+                {
+                    task.count.num = count;
+                }
+                self.store
+                    .check_namespace_admission(&scaled)
+                    .map_err(|e| map_store_error("Namespace policy refused the scale", e))?;
+            }
             // The ECS rule (docs/autoscaling.md): scale-out applies during
             // a rollout, scale-in defers until it finishes.
             let active_rollout = self
@@ -6318,6 +6375,13 @@ impl Manager for ManagerDaemonService {
         // an unnamed session through the session router and writes nothing
         // to the replicated store. A name makes it an ordinary keyed
         // instance, durable from birth, unless the task refuses names.
+        let unnamed_session =
+            crate::structs::session::is_session_task(task) && requested_id.is_none();
+        if !unnamed_session {
+            self.store
+                .check_namespace_quota_growth(&config.name, config.priority, &task.resources, 1)
+                .map_err(|e| map_store_error("Namespace policy refused the instance", e))?;
+        }
         if crate::structs::session::is_session_task(task) {
             if requested_id.is_none() {
                 return self.create_session(&identity, &inner, &config, task).await;
@@ -6520,6 +6584,10 @@ impl Manager for ManagerDaemonService {
                 )));
             }
         }
+        let creating = inner.instance_ids.len() as u32 + inner.count;
+        self.store
+            .check_namespace_quota_growth(&config.name, config.priority, &task.resources, creating)
+            .map_err(|e| map_store_error("Namespace policy refused the instances", e))?;
 
         // Phase 6: restore every instance from a snapshot.
         let seed = inner

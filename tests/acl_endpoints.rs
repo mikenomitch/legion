@@ -101,6 +101,11 @@ fn endpoint_table() -> Vec<(&'static str, Plane)> {
         ("GetNamespace", Plane::Protected("namespace:read")),
         ("ApplyNamespace", Plane::Protected("namespace:write")),
         ("DeleteNamespace", Plane::Protected("namespace:write")),
+        // Namespace policies are governance: ACL-policy privilege.
+        ("ListNamespacePolicies", Plane::Protected("acl:read")),
+        ("GetNamespacePolicy", Plane::Protected("acl:read")),
+        ("ApplyNamespacePolicy", Plane::Protected("acl:write")),
+        ("DeleteNamespacePolicy", Plane::Protected("acl:write")),
         ("UpsertJobTemplate", Plane::Protected("template:write")),
         ("ListJobTemplates", Plane::Protected("template:read")),
         ("GetJobTemplate", Plane::Protected("template:read")),
@@ -611,6 +616,39 @@ async fn call_endpoint(
             .delete_namespace(req(
                 DeleteNamespaceRequest {
                     name: DELETABLE_NAMESPACE.into(),
+                    ..Default::default()
+                },
+                token,
+            ))
+            .await
+            .map(|_| ()),
+        "ListNamespacePolicies" => svc
+            .list_namespace_policies(req(ListNamespacePoliciesRequest::default(), token))
+            .await
+            .map(|_| ()),
+        "GetNamespacePolicy" => svc
+            .get_namespace_policy(req(
+                GetNamespacePolicyRequest {
+                    name: "acl-namespace-policy".into(),
+                },
+                token,
+            ))
+            .await
+            .map(|_| ()),
+        "ApplyNamespacePolicy" => svc
+            .apply_namespace_policy(req(
+                ApplyNamespacePolicyRequest {
+                    object_json: r#"{"name":"acl-namespace-policy","namespaces":["acl-*"],"maxJobs":100}"#.into(),
+                    ..Default::default()
+                },
+                token,
+            ))
+            .await
+            .map(|_| ()),
+        "DeleteNamespacePolicy" => svc
+            .delete_namespace_policy(req(
+                DeleteNamespacePolicyRequest {
+                    name: "acl-namespace-policy-deletable".into(),
                     ..Default::default()
                 },
                 token,
@@ -1547,6 +1585,14 @@ fn seed_fixtures(store: &Store) -> R<Fixtures> {
             name: name.into(),
             ..Default::default()
         })?;
+    }
+    for name in ["acl-namespace-policy", "acl-namespace-policy-deletable"] {
+        store.apply_namespace_policy(
+            legion::structs::namespace_policy::NamespacePolicy::from_json(
+                &serde_json::json!({ "name": name, "namespaces": ["acl-*"] }).to_string(),
+            )
+            .map_err(|err| anyhow!(err))?,
+        )?;
     }
 
     store.upsert_job_template_version(
@@ -4169,5 +4215,158 @@ async fn a_tenant_reads_only_its_own_namespaces_events() -> R<()> {
         .await
         .expect_err("no grant");
     assert_eq!(status.code(), Code::PermissionDenied);
+    Ok(())
+}
+
+/// Phase 4: a namespace policy is written at acl privilege, refuses a
+/// submit outside its runtimes and over its aggregate quota, and shows the
+/// tenant its effective limits through `GetNamespace` without `acl:read`.
+#[tokio::test]
+async fn namespace_policies_govern_admission_and_show_tenants_their_limits() -> R<()> {
+    let (svc, _, management) = setup_enabled()?;
+    create_namespaces(&svc, &management, &["payments-prod", "payments-qa"]).await?;
+    let (_, team) = token_with_rules(
+        &svc,
+        "payments-team",
+        r#"[{"resources": ["job", "namespace"], "actions": ["read", "write"], "namespaces": ["payments-*"]}]"#,
+    )?;
+    let policy = serde_json::json!({
+        "name": "payments",
+        "namespaces": ["payments-*"],
+        "quota": { "normal": { "cpu": 1500 } },
+        "runtimes": ["container"],
+    })
+    .to_string();
+
+    // A namespace writer cannot raise its own limits.
+    let status = svc
+        .apply_namespace_policy(req(
+            ApplyNamespacePolicyRequest {
+                object_json: policy.clone(),
+                ..Default::default()
+            },
+            Some(&team),
+        ))
+        .await
+        .expect_err("needs acl:write");
+    assert_eq!(status.code(), Code::PermissionDenied);
+    svc.apply_namespace_policy(req(
+        ApplyNamespacePolicyRequest {
+            object_json: policy,
+            ..Default::default()
+        },
+        Some(&management),
+    ))
+    .await?;
+
+    let spec = |name: &str, runtime: &str, count: u32| {
+        serde_json::json!({
+            "name": name,
+            "tasks": [{
+                "name": "main",
+                "runtime": runtime,
+                "count": count,
+                "config": { "image": "alpine", "command": ["echo", "ok"] },
+                "resources": { "cpu": 500, "memory": 64 },
+                "constraints": {},
+            }],
+        })
+        .to_string()
+    };
+    svc.run_job(run_request(
+        &spec("web", "container", 2),
+        Some("payments-prod"),
+        &team,
+    ))
+    .await?;
+    // 1000 of 1500 used in prod; qa shares the cap.
+    let status = svc
+        .run_job(run_request(
+            &spec("load", "container", 2),
+            Some("payments-qa"),
+            &team,
+        ))
+        .await
+        .expect_err("over the aggregate quota");
+    assert_eq!(status.code(), Code::FailedPrecondition);
+    assert!(
+        status
+            .message()
+            .contains("caps band 'normal' at 1500 MHz CPU across payments-*"),
+        "{}",
+        status.message()
+    );
+    let status = svc
+        .run_job(run_request(
+            &spec("tool", "sandbox", 1),
+            Some("payments-qa"),
+            &team,
+        ))
+        .await
+        .expect_err("runtime not allowed");
+    assert_eq!(status.code(), Code::FailedPrecondition);
+    assert!(
+        status.message().contains("allows runtimes [container]"),
+        "{}",
+        status.message()
+    );
+
+    // The tenant reads its limits and the aggregate without acl:read.
+    let reply = svc
+        .get_namespace(req(
+            GetNamespaceRequest {
+                name: "payments-qa".into(),
+            },
+            Some(&team),
+        ))
+        .await?
+        .into_inner();
+    assert!(reply.reaching_rules.is_empty(), "rule names need acl:read");
+    let governing = reply.policies.first().expect("one policy governs it");
+    assert_eq!(
+        governing.policy.as_ref().map(|p| p.name.as_str()),
+        Some("payments")
+    );
+    let normal = governing
+        .usage
+        .iter()
+        .find(|usage| usage.band == "normal")
+        .expect("normal band usage");
+    assert_eq!(
+        normal.cpu, 1000.0,
+        "prod's declared demand counts toward qa's cap"
+    );
+    assert!(svc
+        .list_namespace_policies(req(ListNamespacePoliciesRequest::default(), Some(&team)))
+        .await
+        .is_err());
+
+    // The dry run of a tighter policy names what it would have refused.
+    let reply = svc
+        .apply_namespace_policy(req(
+            ApplyNamespacePolicyRequest {
+                object_json: serde_json::json!({
+                    "name": "payments",
+                    "namespaces": ["payments-*"],
+                    "maxJobs": 0,
+                    "runtimes": ["sandbox"],
+                })
+                .to_string(),
+                dry_run: true,
+                ..Default::default()
+            },
+            Some(&management),
+        ))
+        .await?
+        .into_inner();
+    let rules: BTreeSet<_> = reply.violations.iter().map(|v| v.rule.clone()).collect();
+    assert!(
+        rules.contains("maxJobs") && rules.contains("runtimes"),
+        "{rules:?}"
+    );
+    assert!(reply
+        .violations
+        .iter()
+        .any(|v| v.job_id == "payments-prod/web" && v.rule == "runtimes"));
     Ok(())
 }

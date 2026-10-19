@@ -121,6 +121,38 @@ pub fn catalog() -> Vec<Capability> {
             mutates: true,
             read_only_safe: false,
         },
+        Capability {
+            name: "namespace.policy.list",
+            cli: "legion namespace policy list",
+            grpc: Some("Manager/ListNamespacePolicies"),
+            summary: "List namespace policies: quota, counts, pools, runtimes and host volumes over namespace globs. Needs acl:read.",
+            mutates: false,
+            read_only_safe: true,
+        },
+        Capability {
+            name: "namespace.policy.get",
+            cli: "legion namespace policy get <POLICY>",
+            grpc: Some("Manager/GetNamespacePolicy"),
+            summary: "Show one namespace policy with its limits and charged usage across every namespace it matches. Needs acl:read.",
+            mutates: false,
+            read_only_safe: true,
+        },
+        Capability {
+            name: "namespace.policy.apply",
+            cli: "legion namespace policy apply -f <FILE> [--dry-run]",
+            grpc: Some("Manager/ApplyNamespacePolicy"),
+            summary: "Create or replace a namespace policy. --dry-run lists what it would have refused among existing jobs and counts. Needs acl:write.",
+            mutates: true,
+            read_only_safe: false,
+        },
+        Capability {
+            name: "namespace.policy.delete",
+            cli: "legion namespace policy delete <POLICY>",
+            grpc: Some("Manager/DeleteNamespacePolicy"),
+            summary: "Delete a namespace policy. Needs acl:write.",
+            mutates: true,
+            read_only_safe: false,
+        },
         // --- Jobs: write ---
         Capability {
             name: "job.run",

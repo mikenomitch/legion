@@ -104,6 +104,7 @@ pub fn config() -> Command {
                 .arg(dry_run_flag("Validate without writing"))
                 .arg(json_flag()),
         )
+        .subcommand(crate::cmd::namespace_policy::config())
         .subcommand(
             Command::new("delete")
                 .about(
@@ -142,6 +143,7 @@ pub async fn handle(matches: &ArgMatches) -> R<()> {
         Some(("create", sub)) => create(sub).await,
         Some(("apply", sub)) => apply(sub).await,
         Some(("delete", sub)) => delete(sub).await,
+        Some(("policy", sub)) => crate::cmd::namespace_policy::handle(sub).await,
         _ => unreachable!("subcommand_required"),
     }
 }
@@ -250,6 +252,14 @@ async fn get(matches: &ArgMatches) -> R<()> {
     if format.is_json() {
         let mut data = namespace_json(&namespace);
         data["reachingRules"] = reach_json(&reply.reaching_rules);
+        data["usage"] = crate::cmd::namespace_policy::usage_json(&reply.usage);
+        data["policies"] = Value::Array(
+            reply
+                .policies
+                .iter()
+                .map(crate::cmd::namespace_policy::status_json)
+                .collect(),
+        );
         output::print_success(&data);
         return Ok(());
     }
@@ -266,6 +276,16 @@ async fn get(matches: &ArgMatches) -> R<()> {
     meta.sort();
     for (key, value) in meta {
         println!("  {key}={value}");
+    }
+    if !reply.usage.is_empty() || !reply.policies.is_empty() {
+        println!("\nCharged usage:");
+        crate::cmd::namespace_policy::print_usage(&reply.usage);
+    }
+    if !reply.policies.is_empty() {
+        println!("\nNamespace policies governing it (usage across every namespace they match):");
+        for status in &reply.policies {
+            crate::cmd::namespace_policy::print_status(status, "  ");
+        }
     }
     print_reach(&reply.reaching_rules, "ACL rules that reach it:");
     Ok(())
