@@ -478,8 +478,9 @@ async fn create_instance(arg_matches: &ArgMatches) -> R<()> {
     let format = OutputFormat::from_matches(arg_matches);
     let job = arg_matches
         .get_one::<String>("job")
-        .context("Must provide job")?
-        .clone();
+        .map(|job| crate::cmd::helpers::job_ref(arg_matches, job))
+        .transpose()?
+        .context("Must provide job")?;
     let group = arg_matches.get_one::<String>("group").cloned();
     let task = arg_matches.get_one::<String>("task").cloned();
     let idempotency_key = arg_matches.get_one::<String>("idempotency-key").cloned();
@@ -1078,8 +1079,9 @@ async fn list_instances(arg_matches: &ArgMatches) -> R<()> {
     let format = OutputFormat::from_matches(arg_matches);
     let job = arg_matches
         .get_one::<String>("job")
-        .context("Must provide job")?
-        .clone();
+        .map(|job| crate::cmd::helpers::job_ref(arg_matches, job))
+        .transpose()?
+        .context("Must provide job")?;
     let include_idle = arg_matches.get_flag("include-idle");
     let request = tonic::Request::new(ListInstancesRequest {
         job_id: job,

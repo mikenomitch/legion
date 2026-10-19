@@ -590,7 +590,7 @@ async fn list(matches: &ArgMatches) -> R<()> {
         "failed to list snapshots",
         client
             .list_snapshots(tonic::Request::new(ListSnapshotsRequest {
-                job_id: matches.get_one::<String>("job").cloned(),
+                job_id: crate::cmd::helpers::job_arg(matches, "job")?,
                 instance_id: matches.get_one::<String>("instance").cloned(),
                 state: matches.get_one::<String>("state").cloned(),
             }))
@@ -628,7 +628,7 @@ async fn get(matches: &ArgMatches) -> R<()> {
                     .get_one::<String>("snapshot")
                     .context("snapshot")?
                     .clone(),
-                job_id: matches.get_one::<String>("job").cloned(),
+                job_id: crate::cmd::helpers::job_arg(matches, "job")?,
             }))
             .await,
     )?
@@ -855,7 +855,7 @@ async fn warm(matches: &ArgMatches) -> R<()> {
                     .get_one::<String>("snapshot")
                     .context("snapshot")?
                     .clone(),
-                job_id: matches.get_one::<String>("job").cloned(),
+                job_id: crate::cmd::helpers::job_arg(matches, "job")?,
                 constraints: matches
                     .get_many::<String>("constraint")
                     .map(|values| values.cloned().collect())

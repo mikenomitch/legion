@@ -227,7 +227,7 @@ async fn resolve_allocation(
             )
         });
     }
-    let Some(job) = matches.get_one::<String>("job") else {
+    let Some(job) = &crate::cmd::helpers::job_arg(matches, "job")? else {
         return Err(output::fail_local(
             format,
             CliError::local(

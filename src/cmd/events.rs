@@ -14,12 +14,22 @@ use crate::cmd::output::{self, OutputFormat};
 use crate::prelude::*;
 use crate::structs::{ListEventsRequest, SchedulerEvent, StreamEventsRequest};
 
-fn filter_args() -> [Arg; 6] {
+fn filter_args() -> [Arg; 7] {
     [
+        Arg::new("namespace")
+            .long("namespace")
+            .short('n')
+            .value_name("NAMESPACES")
+            .help(
+                "Only events of these namespaces: names or globs, comma-separated (default: every \
+                 event you can see, cluster events included)",
+            ),
         Arg::new("kind")
             .long("kind")
             .help("Filter by event kind, exact or category prefix (e.g. 'eval' matches eval.*)"),
-        Arg::new("job").long("job").help("Filter by exact job ID"),
+        Arg::new("job")
+            .long("job")
+            .help("Filter by job (`name` or `namespace/name`)"),
         Arg::new("node")
             .long("node")
             .help("Filter by exact node ID"),
@@ -90,7 +100,14 @@ async fn list_events(matches: &ArgMatches) -> R<()> {
         after_id: matches.get_one::<i64>("after-id").copied(),
         limit: matches.get_one::<u32>("limit").copied(),
         kind: opt_string(matches, "kind"),
-        job_id: opt_string(matches, "job"),
+        job_id: crate::cmd::helpers::job_arg(matches, "job")?,
+        // Only an explicit -n narrows the feed: $LEGION_NAMESPACE resolves
+        // `--job`, but an event feed is an operator view by default.
+        namespaces: matches
+            .get_one::<String>("namespace")
+            .cloned()
+            .into_iter()
+            .collect(),
         node_id: opt_string(matches, "node"),
         level: opt_string(matches, "level"),
         instance_id: opt_string(matches, "instance"),
@@ -131,7 +148,14 @@ async fn follow_events(matches: &ArgMatches) -> R<()> {
     let request = StreamEventsRequest {
         after_id: matches.get_one::<i64>("after-id").copied(),
         kind: opt_string(matches, "kind"),
-        job_id: opt_string(matches, "job"),
+        job_id: crate::cmd::helpers::job_arg(matches, "job")?,
+        // Only an explicit -n narrows the feed: $LEGION_NAMESPACE resolves
+        // `--job`, but an event feed is an operator view by default.
+        namespaces: matches
+            .get_one::<String>("namespace")
+            .cloned()
+            .into_iter()
+            .collect(),
         node_id: opt_string(matches, "node"),
         level: opt_string(matches, "level"),
         instance_id: opt_string(matches, "instance"),
@@ -260,6 +284,7 @@ mod tests {
     #[test]
     fn event_line_includes_scopes_and_message() {
         let event = SchedulerEvent {
+            namespace: Default::default(),
             id: 7,
             kind: "allocation.placed".into(),
             level: "info".into(),

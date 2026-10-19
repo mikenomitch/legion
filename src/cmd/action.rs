@@ -81,7 +81,7 @@ pub async fn handle(matches: &ArgMatches) -> R<()> {
 }
 
 async fn list(matches: &ArgMatches) -> R<()> {
-    let job = matches.get_one::<String>("job").expect("required");
+    let job = &crate::cmd::helpers::required_job_arg(matches, "job")?;
     let format = OutputFormat::from_matches(matches);
     let mut client = connect_manager_client().await?;
     let reply = output::resolve(
@@ -136,7 +136,7 @@ async fn list(matches: &ArgMatches) -> R<()> {
 }
 
 async fn run(matches: &ArgMatches) -> R<()> {
-    let job = matches.get_one::<String>("job").expect("required").clone();
+    let job = crate::cmd::helpers::required_job_arg(matches, "job")?;
     let action = matches
         .get_one::<String>("action")
         .expect("required")

@@ -229,7 +229,7 @@ async fn sign_cmd(matches: &ArgMatches) -> R<()> {
         allocation_id: arg("alloc")
             .parse()
             .context("--alloc must be an allocation id")?,
-        job: arg("job"),
+        job: crate::cmd::helpers::job_arg(matches, "job")?.unwrap_or_default(),
         task: arg("task"),
         instance: matches.get_one::<String>("instance").cloned(),
         argv: matches

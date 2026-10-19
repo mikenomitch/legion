@@ -1123,8 +1123,122 @@ fn instance_volume_pin_detail(store: &Store, instance: &Instance) -> Option<Stri
     ))
 }
 
+/// The namespace an event belongs to: its job's, or (for a `namespace.*`
+/// lifecycle event) the namespace in its metadata. `None` for cluster
+/// events.
+fn event_namespace(event: &SchedulerEventRecord) -> Option<String> {
+    if let Some(job_id) = event.job_id.as_deref().filter(|id| !id.is_empty()) {
+        return Some(crate::structs::namespace::job_namespace(job_id).to_string());
+    }
+    if event.kind.starts_with("namespace.") {
+        return serde_json::from_str::<Value>(&event.metadata_json)
+            .ok()
+            .and_then(|meta| meta.get("namespace")?.as_str().map(str::to_string));
+    }
+    None
+}
+
+/// Who an event feed is for (docs/namespaces.md, "Events"): an operator sees
+/// everything; a namespace tenant sees the events of the jobs it may read
+/// and the lifecycle events of the namespaces it reaches. The same check
+/// runs on every listed, replayed and streamed event, so `*` never takes a
+/// separate path around it (Nomad's CVE-2025-0937 was one).
+#[derive(Clone)]
+enum EventAudience {
+    Operator,
+    Tenant(AclIdentity),
+}
+
+/// A request's namespace narrowing of an event feed: `None` when it named
+/// none (every event the audience sees).
+fn event_namespace_filter(
+    namespaces: &[String],
+) -> Result<Option<crate::structs::namespace::NamespaceSelection>, Status> {
+    if namespaces.iter().all(|selector| selector.trim().is_empty()) {
+        return Ok(None);
+    }
+    crate::structs::namespace::NamespaceSelection::parse(namespaces)
+        .map(Some)
+        .map_err(Status::invalid_argument)
+}
+
+/// An event feed's whole visibility rule: who it is for, narrowed by the
+/// request's namespace filter.
+#[derive(Clone)]
+struct EventFeed {
+    audience: EventAudience,
+    namespaces: Option<crate::structs::namespace::NamespaceSelection>,
+}
+
+impl EventFeed {
+    fn sees(&self, event: &SchedulerEventRecord) -> bool {
+        self.audience.sees(event)
+            && match &self.namespaces {
+                None => true,
+                Some(selection) => event_namespace(event).is_some_and(|ns| selection.matches(&ns)),
+            }
+    }
+
+    fn still_allowed(&self, identity: &AclIdentity) -> Result<(), Status> {
+        self.audience.still_allowed(identity)
+    }
+}
+
+impl EventAudience {
+    /// The audience `identity` may open a feed as, or the ACL error.
+    fn for_identity(identity: &AclIdentity) -> Result<Self, Status> {
+        if identity.allows(AclResource::Operator, AclAction::Read, &AclScope::none()) {
+            return Ok(EventAudience::Operator);
+        }
+        if identity.allows(AclResource::Job, AclAction::Read, &AclScope::any()) {
+            return Ok(EventAudience::Tenant(identity.clone()));
+        }
+        acl::enforce(
+            identity,
+            AclResource::Operator,
+            AclAction::Read,
+            &AclScope::none(),
+        )?;
+        Ok(EventAudience::Operator)
+    }
+
+    fn sees(&self, event: &SchedulerEventRecord) -> bool {
+        match self {
+            EventAudience::Operator => true,
+            EventAudience::Tenant(identity) => match event.job_id.as_deref() {
+                Some(job_id) if !job_id.is_empty() => {
+                    identity.allows(AclResource::Job, AclAction::Read, &AclScope::job(job_id))
+                }
+                _ => event_namespace(event)
+                    .is_some_and(|namespace| identity.reaches_namespace(&namespace)),
+            },
+        }
+    }
+
+    /// Whether `identity` (re-authenticated mid-stream) may still receive
+    /// this feed.
+    fn still_allowed(&self, identity: &AclIdentity) -> Result<(), Status> {
+        match self {
+            EventAudience::Operator => acl::enforce(
+                identity,
+                AclResource::Operator,
+                AclAction::Read,
+                &AclScope::none(),
+            ),
+            EventAudience::Tenant(_) => acl::enforce(
+                identity,
+                AclResource::Job,
+                AclAction::Read,
+                &AclScope::any(),
+            ),
+        }
+    }
+}
+
 fn map_scheduler_event(event: SchedulerEventRecord) -> SchedulerEvent {
+    let namespace = event_namespace(&event).unwrap_or_default();
     SchedulerEvent {
+        namespace,
         id: event.id,
         kind: event.kind,
         level: event.level,
@@ -4796,13 +4910,13 @@ impl Manager for ManagerDaemonService {
         &self,
         request: Request<ListEventsRequest>,
     ) -> Result<Response<ListEventsReply>, Status> {
-        self.check_acl(
-            &request,
-            AclResource::Operator,
-            AclAction::Read,
-            AclScope::none(),
-        )?;
+        let identity = self.authenticate_acl(&request)?;
+        let audience = EventAudience::for_identity(&identity)?;
         let request = request.into_inner();
+        let audience = EventFeed {
+            audience,
+            namespaces: event_namespace_filter(&request.namespaces)?,
+        };
         let filter = SchedulerEventFilter {
             instance_id: normalize_event_filter_value(request.instance_id),
             allocation_id: request.allocation_id,
@@ -4826,7 +4940,11 @@ impl Manager for ManagerDaemonService {
             .map_err(|e| map_store_error("Error reading latest scheduler event id", e))?;
 
         Ok(Response::new(ListEventsReply {
-            events: events.into_iter().map(map_scheduler_event).collect(),
+            events: events
+                .into_iter()
+                .filter(|event| audience.sees(event))
+                .map(map_scheduler_event)
+                .collect(),
             latest_id,
         }))
     }
@@ -5114,14 +5232,15 @@ impl Manager for ManagerDaemonService {
         &self,
         request: Request<StreamEventsRequest>,
     ) -> Result<Response<Self::StreamEventsStream>, Status> {
-        self.check_acl(
-            &request,
-            AclResource::Operator,
-            AclAction::Read,
-            AclScope::none(),
-        )?;
+        let identity = self.authenticate_acl(&request)?;
+        let audience = EventAudience::for_identity(&identity)?;
         let credential = self.stream_credential(&request);
         let request = request.into_inner();
+        // One predicate for replayed and live events alike.
+        let audience = EventFeed {
+            audience,
+            namespaces: event_namespace_filter(&request.namespaces)?,
+        };
         let filter = SchedulerEventFilter {
             instance_id: normalize_event_filter_value(request.instance_id),
             allocation_id: request.allocation_id,
@@ -5144,7 +5263,7 @@ impl Manager for ManagerDaemonService {
         tokio::spawn(async move {
             let mut last_sent = match filter.after_id {
                 Some(after_id) => {
-                    match replay_journal_events(&store, &filter, after_id, &tx).await {
+                    match replay_journal_events(&store, &filter, &audience, after_id, &tx).await {
                         Ok(cursor) => cursor,
                         Err(StreamSendStopped) => return,
                     }
@@ -5163,14 +5282,9 @@ impl Manager for ManagerDaemonService {
                 let received = tokio::select! {
                     received = live.recv() => received,
                     _ = reauth.tick() => {
-                        let still_allowed = credential.reauthenticate(&store).and_then(|identity| {
-                            acl::enforce(
-                                &identity,
-                                AclResource::Operator,
-                                AclAction::Read,
-                                &AclScope::none(),
-                            )
-                        });
+                        let still_allowed = credential
+                            .reauthenticate(&store)
+                            .and_then(|identity| audience.still_allowed(&identity));
                         if let Err(status) = still_allowed {
                             let _ = tx.send(Err(status)).await;
                             return;
@@ -5192,7 +5306,11 @@ impl Manager for ManagerDaemonService {
                         };
                         if event.id <= last_sent
                             || !filter.matches_with(&event, allocation_instance)
+                            || !audience.sees(&event)
                         {
+                            // Advance past an event this audience may not see,
+                            // so a lag backfill does not replay it either.
+                            last_sent = last_sent.max(event.id);
                             continue;
                         }
                         last_sent = event.id;
@@ -5202,7 +5320,9 @@ impl Manager for ManagerDaemonService {
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
                         debug!(skipped, "StreamEvents subscriber lagged; backfilling");
-                        match replay_journal_events(&store, &filter, last_sent, &tx).await {
+                        match replay_journal_events(&store, &filter, &audience, last_sent, &tx)
+                            .await
+                        {
                             Ok(cursor) => last_sent = cursor.max(last_sent),
                             Err(StreamSendStopped) => return,
                         }
@@ -12104,6 +12224,7 @@ struct StreamSendStopped;
 async fn replay_journal_events(
     store: &Store,
     filter: &SchedulerEventFilter,
+    audience: &EventFeed,
     after_id: i64,
     tx: &tokio::sync::mpsc::Sender<Result<SchedulerEvent, Status>>,
 ) -> Result<i64, StreamSendStopped> {
@@ -12130,6 +12251,9 @@ async fn replay_journal_events(
         let batch_len = batch.len();
         for event in batch {
             cursor = cursor.max(event.id);
+            if !audience.sees(&event) {
+                continue;
+            }
             if tx.send(Ok(map_scheduler_event(event))).await.is_err() {
                 return Err(StreamSendStopped);
             }

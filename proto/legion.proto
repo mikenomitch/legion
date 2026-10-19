@@ -1967,6 +1967,13 @@ service Manager {
   // allocations placed/removed/failed, node lifecycle changes, job lifecycle
   // changes, and rollout activity. Results are ordered oldest-to-newest and
   // support cursor-based polling via `after_id`.
+  //
+  // ACL: `operator:read` sees every event. A caller without it but with
+  // `job:read` somewhere (a namespace tenant) sees only the events of jobs
+  // it may read, plus the lifecycle events of namespaces it reaches
+  // (docs/namespaces.md); cluster events (nodes, raft, the scheduler) and
+  // other tenants' events are left out, so a page may hold fewer than
+  // `limit` events. Neither kind of caller can widen this with a filter.
   rpc ListEvents (ListEventsRequest) returns (ListEventsReply);
 
   // Streams scheduler events as they happen (server-streaming).
@@ -1975,9 +1982,12 @@ service Manager {
   // replayed first, then the live feed continues seamlessly. Clients that
   // disconnect can resume without gaps by passing the last event ID they saw.
   //
-  // ACL: `operator:read`, re-checked every 30 seconds while the stream runs.
-  // Once the token is revoked or expired, or its policies no longer grant
-  // `operator:read`, the stream ends with that auth error.
+  // ACL: as ListEvents — `operator:read` for the whole feed, or `job:read`
+  // for the events of the jobs the caller may read — re-checked every 30
+  // seconds while the stream runs, against the same filter every event
+  // passes. Once the token is revoked or expired, or its policies no longer
+  // grant what the stream was opened with, the stream ends with that auth
+  // error.
   rpc StreamEvents (StreamEventsRequest) returns (stream SchedulerEvent);
 
   // Lists user-saved State Explorer query snippets.
@@ -9590,6 +9600,11 @@ message SchedulerEvent {
 
   // RFC3339 timestamp when the event was recorded.
   string created_at = 11;
+
+  // The namespace the event belongs to: its job's, or the namespace a
+  // `namespace.*` lifecycle event is about. Empty for cluster events
+  // (nodes, raft, the scheduler).
+  string namespace = 12;
 }
 
 // Request payload for ListEvents.
@@ -9650,6 +9665,12 @@ message ListEventsRequest {
   // 20 allocations, so a batch of more than 20 matches only for those 20. `allocation.removed` events name no allocation ids and never
   // match.
   optional int64 allocation_id = 8;
+
+  // Optional namespace filter: names or `*`-globs (docs/namespaces.md).
+  // Keeps only events whose `namespace` matches, so cluster events (which
+  // have none) are left out. Empty means no namespace filter — every event
+  // the caller may see. Narrows what is visible, never widens it.
+  repeated string namespaces = 9;
 }
 
 // Reply payload for ListEvents.
@@ -9695,6 +9716,10 @@ message StreamEventsRequest {
   // Optional allocation filter. Same semantics as
   // `ListEventsRequest.allocation_id`.
   optional int64 allocation_id = 7;
+
+  // Optional namespace filter. Same semantics as
+  // `ListEventsRequest.namespaces`.
+  repeated string namespaces = 8;
 }
 
 // Internal eval queue item.

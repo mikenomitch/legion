@@ -206,7 +206,7 @@ pub async fn handle(matches: &ArgMatches) -> R<()> {
 async fn list(matches: &ArgMatches) -> R<()> {
     let format = OutputFormat::from_matches(matches);
     let request = tonic::Request::new(ListVolumesRequest {
-        job_id: matches.get_one::<String>("job").cloned(),
+        job_id: crate::cmd::helpers::job_arg(matches, "job")?,
         node_id: matches.get_one::<String>("node").cloned(),
         driver: matches.get_one::<String>("driver").cloned(),
         instance_id: matches.get_one::<String>("instance").cloned(),

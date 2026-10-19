@@ -4097,3 +4097,77 @@ async fn policies_must_name_their_namespaces() -> R<()> {
     );
     Ok(())
 }
+
+/// A namespace tenant reads its own events without operator:read, and only
+/// its own: other namespaces' job events and cluster events are left out,
+/// and a namespace filter narrows but never widens that.
+#[tokio::test]
+async fn a_tenant_reads_only_its_own_namespaces_events() -> R<()> {
+    let (svc, _, management) = setup_enabled()?;
+    create_namespaces(&svc, &management, &["payments-prod", "checkout-prod"]).await?;
+    for namespace in ["payments-prod", "checkout-prod"] {
+        svc.run_job(run_request(
+            &namespaced_jobspec("web", None),
+            Some(namespace),
+            &management,
+        ))
+        .await?;
+    }
+    let (_, team) = token_with_rules(
+        &svc,
+        "payments-reader",
+        r#"[{"resources": ["job"], "actions": ["read"], "namespaces": ["payments-*"]}]"#,
+    )?;
+    let operator = svc
+        .list_events(req(ListEventsRequest::default(), Some(&management)))
+        .await?
+        .into_inner();
+    assert!(operator
+        .events
+        .iter()
+        .any(|event| event.namespace == "checkout-prod"));
+
+    for namespaces in [
+        vec![],
+        vec!["*".to_string()],
+        vec!["checkout-prod".to_string()],
+    ] {
+        let events = svc
+            .list_events(req(
+                ListEventsRequest {
+                    namespaces: namespaces.clone(),
+                    ..Default::default()
+                },
+                Some(&team),
+            ))
+            .await?
+            .into_inner()
+            .events;
+        assert!(
+            events
+                .iter()
+                .all(|event| event.namespace == "payments-prod"),
+            "{namespaces:?}: {:?}",
+            events
+                .iter()
+                .map(|event| (&event.kind, &event.namespace))
+                .collect::<Vec<_>>()
+        );
+        if namespaces != vec!["checkout-prod".to_string()] {
+            assert!(!events.is_empty(), "{namespaces:?}");
+        }
+    }
+
+    // A token with neither operator:read nor any job:read is still refused.
+    let (_, nothing) = token_with_rules(
+        &svc,
+        "kv-only",
+        r#"[{"resources": ["kv"], "actions": ["read"]}]"#,
+    )?;
+    let status = svc
+        .list_events(req(ListEventsRequest::default(), Some(&nothing)))
+        .await
+        .expect_err("no grant");
+    assert_eq!(status.code(), Code::PermissionDenied);
+    Ok(())
+}

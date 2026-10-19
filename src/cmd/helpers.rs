@@ -457,6 +457,57 @@ pub fn job_ref(matches: &ArgMatches, raw: &str) -> R<String> {
     )
 }
 
+/// The job argument `key` resolved against the active namespace (see
+/// [`job_ref`]), when it was given.
+pub fn job_arg(matches: &ArgMatches, key: &str) -> R<Option<String>> {
+    match matches.try_get_one::<String>(key).ok().flatten() {
+        Some(raw) => job_ref(matches, raw).map(Some),
+        None => Ok(None),
+    }
+}
+
+/// [`job_arg`] for a required argument.
+pub fn required_job_arg(matches: &ArgMatches, key: &str) -> R<String> {
+    job_arg(matches, key)?.with_context(|| format!("missing required argument {key}"))
+}
+
+/// Attaches `-n/--namespace` to every subcommand that takes a `job`
+/// argument and does not already define `namespace`, so a command that acts
+/// on a job always resolves it in a namespace, and one that does not never
+/// accepts the flag. Where `-n` is already taken (`--count` on `instance
+/// fork`), only `--namespace` is added.
+pub fn with_namespace_flags(command: Command) -> Command {
+    let takes_job = command
+        .get_arguments()
+        .any(|arg| matches!(arg.get_id().as_str(), "job" | "job-id" | "job_id"));
+    let has_namespace = command
+        .get_arguments()
+        .any(|arg| arg.get_id().as_str() == "namespace");
+    let short_taken = command
+        .get_arguments()
+        .any(|arg| arg.get_short() == Some('n'));
+    let mut command = command;
+    if takes_job && !has_namespace {
+        let flag = if short_taken {
+            Arg::new("namespace")
+                .long("namespace")
+                .value_name("NAMESPACE")
+                .help("Namespace to act in (default: $LEGION_NAMESPACE, else `default`)")
+        } else {
+            namespace_flag()
+        };
+        command = command.arg(flag);
+    }
+    let names: Vec<String> = command
+        .get_subcommands()
+        .map(|sub| sub.get_name().to_string())
+        .collect();
+    for name in names {
+        command = command.mut_subcommand(name, with_namespace_flags);
+    }
+    command
+}
+
 /// The namespace selection a list command sends: `["*"]` for `-A`, the
 /// `-n` value (or `LEGION_NAMESPACE`) otherwise, empty (= `default`) when
 /// neither is set.

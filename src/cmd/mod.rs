@@ -43,6 +43,10 @@ use crate::prelude::*;
 /// `main.rs` so tests can walk it — every command must accept `--json`
 /// (AGENTS.md, "Agent-Friendly Contributions"; see `tests` below).
 pub fn cli() -> Command {
+    helpers::with_namespace_flags(base_cli())
+}
+
+fn base_cli() -> Command {
     Command::new("legion")
         .about("A simple, extensible, fast orchestrator")
         .bin_name("legion")
@@ -126,6 +130,53 @@ mod tests {
         for sub in subcommands {
             walk(sub, &path, missing);
         }
+    }
+
+    /// The namespace flag goes exactly where a namespace means something: on
+    /// commands that act on a job, never on cluster-scoped ones, where it
+    /// would look like a scope and silently be ignored (kubectl#1413).
+    #[test]
+    fn namespace_flags_only_on_namespaced_commands() {
+        let cli = cli();
+        cli.clone().debug_assert();
+        let find = |path: &[&str]| -> Command {
+            let mut command = cli.clone();
+            for name in path {
+                command = command
+                    .find_subcommand(name)
+                    .unwrap_or_else(|| panic!("no subcommand {name}"))
+                    .clone();
+            }
+            command
+        };
+        let has_namespace = |command: &Command| {
+            command
+                .get_arguments()
+                .any(|arg| arg.get_id() == "namespace")
+        };
+        for path in [
+            &["job", "run"][..],
+            &["job", "info"],
+            &["job", "list"],
+            &["instance", "list"],
+            &["snapshot", "list"],
+            &["service", "resolve"],
+            &["net", "policy", "show"],
+        ] {
+            assert!(has_namespace(&find(path)), "{path:?} should take -n");
+        }
+        for path in [
+            &["node", "list"][..],
+            &["acl", "policy", "list"],
+            &["kv", "get"],
+            &["namespace", "list"],
+        ] {
+            assert!(!has_namespace(&find(path)), "{path:?} must not take -n");
+        }
+        assert!(cli
+            .clone()
+            .try_get_matches_from(["legion", "node", "list", "-n", "prod"])
+            .is_err());
     }
 
     /// AGENTS.md: "Every CLI command must accept `--json`/`-j`". This walks

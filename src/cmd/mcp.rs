@@ -602,7 +602,8 @@ fn tool_defs() -> Vec<ToolDef> {
                     "node_id": { "type": "string", "description": "Filter by exact node ID." },
                     "level": { "type": "string", "enum": ["info", "warn", "error"], "description": "Filter by severity." },
                     "instance_id": { "type": "string", "description": "Only events about this stateful instance: suspends, resumes, forks, snapshots, and its allocations' placements and failures." },
-                    "allocation_id": { "type": "integer", "description": "Filter by exact allocation ID." }
+                    "allocation_id": { "type": "integer", "description": "Filter by exact allocation ID." },
+                    "namespaces": { "type": "array", "items": { "type": "string" }, "description": "Only events of these namespaces (names or `*`-globs); omit for every event this token can see, cluster events included." }
                 },
                 "additionalProperties": false
             }),
@@ -2027,12 +2028,23 @@ async fn dispatch_tool(name: &str, args: Value) -> Result<Value, String> {
                 level: opt_str_arg(&args, "level"),
                 instance_id: opt_str_arg(&args, "instance_id"),
                 allocation_id: args.get("allocation_id").and_then(Value::as_i64),
+                namespaces: args
+                    .get("namespaces")
+                    .and_then(Value::as_array)
+                    .map(|items| {
+                        items
+                            .iter()
+                            .filter_map(Value::as_str)
+                            .map(str::to_string)
+                            .collect()
+                    })
+                    .unwrap_or_default(),
             };
             let mut client = connect().await?;
             grpc(client.list_events(request)).await
         }
         "legion_job_logs" => {
-            let job = opt_str_arg(&args, "name").unwrap_or_default();
+            let job = opt_job_arg(&args, "name")?.unwrap_or_default();
             let allocation_id = args.get("allocation_id").and_then(Value::as_i64);
             if job.is_empty() && allocation_id.is_none() {
                 return Err("provide a job name or allocation_id".to_string());
@@ -2538,6 +2550,7 @@ fn opt_job_arg(args: &Value, key: &str) -> Result<Option<String>, String> {
 /// Tools whose `name` argument is a job (the rest use `job` / `job_id`).
 const JOB_NAME_TOOLS: &[&str] = &[
     "legion_job_info",
+    "legion_job_logs",
     "legion_job_spec",
     "legion_job_stop",
     "legion_job_scale",
