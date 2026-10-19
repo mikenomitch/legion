@@ -596,6 +596,13 @@ export class WorkerRegisterRequest extends Message<WorkerRegisterRequest> {
   /**
    * JSON object string of node configuration attributes.
    *
+   * `workerFleet` (set by the worker simulator) is checked against the
+   * credential: with ACLs enforced, a join token's worker type must grant
+   * the fleet through its own `workerFleet` attribute (an exact name or a
+   * `*` glob such as `sim-*`), and a node token may not change the fleet
+   * its node joined with. Either refusal is `PERMISSION_DENIED`; audit-only
+   * mode logs it and allows it.
+   *
    * @generated from field: string config_attrs = 3;
    */
   configAttrs = "";
@@ -14138,6 +14145,25 @@ export class HeartbeatReply extends Message<HeartbeatReply> {
   retryTerminatedAllocations: bigint[] = [];
 
   /**
+   * Allocation ids from the request's `failed_allocations` that this
+   * manager could not record, so the worker must send them again on its
+   * next heartbeat. A failure is reported once, and the worker has already
+   * torn the allocation down: dropping the report leaves the allocation
+   * placed on a node that no longer runs it, and nothing replaces it.
+   *
+   * A report is listed when reading the allocation or recording the
+   * failure failed (the write could not reach the lane leader, say). A
+   * report for an allocation this manager has no row for, one already
+   * removed, or one from a node that does not own the allocation is never
+   * listed.
+   *
+   * Default: empty list.
+   *
+   * @generated from field: repeated int64 retry_failed_allocations = 24;
+   */
+  retryFailedAllocations: bigint[] = [];
+
+  /**
    * The cluster's workload-identity issuer: the `iss` every token and
    * ticket the managers sign carries (docs/workload-identity.md, "Issuer").
    * A worker checks boot, session, and exec tickets against this value, not
@@ -14208,6 +14234,7 @@ export class HeartbeatReply extends Message<HeartbeatReply> {
     { no: 18, name: "session_resync", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
     { no: 19, name: "stop_sessions", kind: "scalar", T: 9 /* ScalarType.STRING */, repeated: true },
     { no: 20, name: "retry_terminated_allocations", kind: "scalar", T: 3 /* ScalarType.INT64 */, repeated: true },
+    { no: 24, name: "retry_failed_allocations", kind: "scalar", T: 3 /* ScalarType.INT64 */, repeated: true },
     { no: 21, name: "workload_identity_issuer", kind: "scalar", T: 9 /* ScalarType.STRING */ },
     { no: 22, name: "envelope_resizes", kind: "message", T: EnvelopeResizeResult, repeated: true },
     { no: 23, name: "cluster_ca_pins", kind: "scalar", T: 9 /* ScalarType.STRING */, repeated: true },
@@ -28509,6 +28536,21 @@ export class CreateJoinTokenReply extends Message<CreateJoinTokenReply> {
    */
   token = "";
 
+  /**
+   * Set when the token is unusable from another machine: the manager binds
+   * every interface (`server.host` is `0.0.0.0` or `::`) but has no
+   * `server.advertiseAddr`, so the address it embeds is loopback. A remote
+   * worker would dial its own loopback and retry forever, and nothing on the
+   * manager would look wrong. The text names the embedded address and the
+   * setting that fixes it. The token is still valid for a worker on the
+   * manager's own machine.
+   *
+   * Default: empty (the embedded address is the one the operator chose).
+   *
+   * @generated from field: string warning = 3;
+   */
+  warning = "";
+
   constructor(data?: PartialMessage<CreateJoinTokenReply>) {
     super();
     proto3.util.initPartial(data, this);
@@ -28519,6 +28561,7 @@ export class CreateJoinTokenReply extends Message<CreateJoinTokenReply> {
   static readonly fields: FieldList = proto3.util.newFieldList(() => [
     { no: 1, name: "info", kind: "message", T: JoinTokenInfo },
     { no: 2, name: "token", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 3, name: "warning", kind: "scalar", T: 9 /* ScalarType.STRING */ },
   ]);
 
   static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): CreateJoinTokenReply {

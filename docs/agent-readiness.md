@@ -132,7 +132,9 @@ Tool errors come back in-band (`result.isError = true` with a text payload),
 following MCP convention. Transport and protocol errors use JSON-RPC `error`.
 
 The transport sends one JSON message per line. In MCP mode Legion routes all
-console logs to stderr, so stdout carries only the protocol stream.
+console logs to stderr, so stdout carries only the protocol stream. Every
+other one-shot command does the same, so a `--json` envelope on stdout is
+never interleaved with log lines.
 
 ### Reading a node's last heartbeat honestly
 

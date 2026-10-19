@@ -378,3 +378,27 @@ async fn readyz_returns_503_when_raft_leader_is_unknown() -> R<()> {
 
     Ok(())
 }
+
+/// A telemetry port another process holds fails the manager's startup. The
+/// listener used to bind inside a spawned task and only log the failure, so
+/// the manager came up with no `/metrics` and no health probes.
+#[tokio::test]
+async fn a_telemetry_port_that_is_taken_fails_startup() -> R<()> {
+    let taken = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let addr = taken.local_addr()?;
+    let err = telemetry::start_telemetry(
+        addr,
+        TelemetryState {
+            store: setup_store()?,
+            raft_required: false,
+            diverged_since_ms: std::sync::Arc::new(std::sync::atomic::AtomicI64::new(0)),
+        },
+    )
+    .await
+    .expect_err("the port is taken");
+    assert!(
+        format!("{err:#}").contains("failed to bind the telemetry listener"),
+        "{err:#}"
+    );
+    Ok(())
+}

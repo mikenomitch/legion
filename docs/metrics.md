@@ -63,7 +63,9 @@ Optional `telemetry` block in the manager config:
 - `enabled` (default `true`): master switch for the listener.
 - `port` (default `server.port + 2`): the listener binds this port on
   `server.host`. The `+ 2` convention leaves `server.port + 1` for the exec
-  WebSocket listener.
+  WebSocket listener. A port another process holds fails the manager's
+  startup (`failed to bind the telemetry listener on ...`), the same as
+  the gRPC port, rather than leaving a manager up with no probes.
 
 ## Metric families
 

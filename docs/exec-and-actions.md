@@ -420,7 +420,9 @@ UI   ──WebSocket /v1/exec/ws───────┘        (proxies frames)
   [direct exec](#direct-exec), where the mint reply names the worker and the
   ticket carries what the manager authorized.
 - The WebSocket listener runs on the manager port + 1, because tonic's gRPC
-  server doesn't perform HTTP upgrades. Browsers can't set WebSocket request
+  server doesn't perform HTTP upgrades. If that port is taken, the manager
+  fails to start (`failed to bind the exec WebSocket listener on ...`);
+  free the port or set `exec.enabled = false`. Browsers can't set WebSocket request
   headers, so they authenticate with the bearer token carried in the first
   frame. The handshake's `Origin` must be loopback or listed in
   `server.allowedOrigins` ([UI Architecture](ui-architecture.md#allowed-browser-origins)),

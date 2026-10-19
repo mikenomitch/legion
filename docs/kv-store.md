@@ -214,6 +214,16 @@ reconciliation. The result lands in the task config the worker receives (the
 key itself and every key the template looks up, so a change to either triggers
 the entry's policy.
 
+An edit to a `templateKv` template may not reach a key the job did not name
+when it was submitted. Submitting checks `kv:read` on every key against the
+submitter ([Auth and ACLs](auth-and-acls.md)), and the template's writer is
+not the submitter, so an edit that adds a lookup is not rendered: the job
+keeps its last render, nothing about the new key is stored, and a
+`job.kv_render_refused` warning event names the key. Resubmit the job
+(`legion job run`) to add it; the submit checks the new key against you.
+Edits that only rearrange the keys the job already names re-render as
+usual.
+
 If a required key is missing at submit time, the submit fails with
 `kv entry <key> not found`. Legion never admits a job with unresolvable
 references.

@@ -1687,6 +1687,11 @@ pub struct ManagerDaemonService {
     pub auth: Arc<Authenticator>,
     /// Externally reachable manager address embedded in join tokens.
     pub advertise_addr: String,
+    /// Set when `advertise_addr` is a loopback address derived from a
+    /// wildcard bind, so remote workers cannot use the join tokens it mints
+    /// (`ServerConfigFull::loopback_join_address_warning`). Returned with
+    /// every token as `CreateJoinTokenReply.warning`.
+    join_address_warning: Option<String>,
     /// This manager's identity: its raft node id under raft, else the
     /// listener's `host:port`. Keys its config row and names it in
     /// `ListManagers`. Empty when unset (tests, embedding), in which case
@@ -1791,6 +1796,7 @@ impl ManagerDaemonService {
             store,
             auth,
             advertise_addr: DEF_MANAGER_ADDRESS.to_string(),
+            join_address_warning: None,
             manager_id: String::new(),
             allocation_failures: Arc::new(Mutex::new(AllocationFailureTracker::default())),
             workload_identity: None,
@@ -2740,6 +2746,73 @@ impl ManagerDaemonService {
         Err(Status::permission_denied(message))
     }
 
+    /// A registration's `workerFleet` claim, checked against its grant. The
+    /// claim decides which certificate `IssueNodeCertificate` signs (a fleet
+    /// certificate names every node of the fleet) and which name managers
+    /// verify when they dial the node, so a node may not simply say it
+    /// belongs to a fleet: a join token's worker type must grant the fleet
+    /// (`worker_type_grants_fleet`), and a node token keeps the fleet the
+    /// node joined with.
+    fn enforce_fleet_claim(
+        &self,
+        grant: &RegistrationGrant,
+        node_id: &str,
+        config_attrs: &str,
+    ) -> Result<(), Status> {
+        let Some(fleet) = crate::manager::worker_plane::claimed_fleet(config_attrs) else {
+            return Ok(());
+        };
+        let refusal = match grant {
+            RegistrationGrant::Unrestricted => None,
+            RegistrationGrant::JoinToken { record, .. } => {
+                let worker_type = self
+                    .store
+                    .get_worker_type(record.worker_type.clone())
+                    .map_err(|e| map_store_error("Error loading worker type", e))?;
+                (!crate::manager::worker_plane::worker_type_grants_fleet(&worker_type, &fleet))
+                    .then(|| {
+                        format!(
+                            "node {node_id:?} registers as part of fleet {fleet:?}, which its \
+                             worker type {:?} does not grant\n\
+                             Hint: a fleet is for the worker simulator; set `attributes = {{ \
+                             workerFleet = \"{fleet}\" }}` (or a glob such as \"sim-*\") on \
+                             worker type {:?}",
+                            record.worker_type, record.worker_type
+                        )
+                    })
+            }
+            RegistrationGrant::Node(_) => {
+                let registered = self
+                    .store
+                    .get_node(node_id)
+                    .ok()
+                    .and_then(|node| crate::manager::worker_plane::worker_fleet(&node));
+                (registered.as_deref() != Some(fleet.as_str())).then(|| {
+                    format!(
+                        "node {node_id:?} joined as part of fleet {:?}; its node token may not \
+                         re-register it as part of fleet {fleet:?}. Present a join token whose \
+                         worker type grants that fleet",
+                        registered.unwrap_or_default()
+                    )
+                })
+            }
+        };
+        let Some(message) = refusal else {
+            return Ok(());
+        };
+        if self.auth.audit_only {
+            warn!(
+                target: "acl_audit",
+                resource = "worker-plane",
+                action = "register",
+                enforced = false,
+                "fleet claim outside its grant (audit-only): {message}"
+            );
+            return Ok(());
+        }
+        Err(Status::permission_denied(message))
+    }
+
     /// Scope check against a rollout's job, used by rollout endpoints that
     /// only carry a numeric rollout ID.
     fn enforce_rollout_job(
@@ -2815,6 +2888,11 @@ impl ManagerDaemonService {
     }
 
     /// Sets the address join tokens point workers at.
+    pub fn with_join_address_warning(mut self, warning: Option<String>) -> Self {
+        self.join_address_warning = warning;
+        self
+    }
+
     pub fn with_advertise_addr(mut self, advertise_addr: impl Into<String>) -> Self {
         self.advertise_addr = advertise_addr.into();
         self
@@ -3841,6 +3919,35 @@ fn reconcile_kv_changes(store: &Store, changes: &[(String, bool)]) -> Result<(),
             MissingKvBehavior::KeepExisting,
         )
         .map_err(|e| map_store_error("Error applying kv references", e))?;
+
+        // A re-render may only read keys the job already names. Submitting
+        // checked `kv:read` on every key the job named against the
+        // submitter, but a `templateKv` template is edited by whoever can
+        // write its key, and a lookup the edit adds was never checked against
+        // anyone. Keep the job on its last render (nothing is stored, so the
+        // new key's value goes nowhere) and say why; a resubmit checks the
+        // new keys against whoever submits it.
+        let named: HashSet<&str> = job_refs
+            .iter()
+            .map(|reference| reference.kv_key.as_str())
+            .collect();
+        let mut unnamed: Vec<String> = injection_refs
+            .iter()
+            .filter(|reference| !named.contains(reference.key.as_str()))
+            .map(|reference| reference.key.clone())
+            .collect();
+        if !unnamed.is_empty() {
+            unnamed.sort();
+            unnamed.dedup();
+            warn!(
+                job_id = %job_id,
+                keys = ?unnamed,
+                "A KV change made the job's templates read keys it never named; keeping its last render"
+            );
+            store.events().job_kv_render_refused(&job_id, &unnamed);
+            continue;
+        }
+
         let submissions = store
             .get_submissions_for_config(&job_config_id)
             .map_err(|e| map_store_error("Error loading job submissions", e))?;
@@ -7635,7 +7742,8 @@ impl Manager for ManagerDaemonService {
         }
         // The certificate's names come from the authenticated caller, never
         // from the CSR. A fleet certificate (the simulator) needs the node to
-        // have registered as part of that fleet.
+        // have registered as part of that fleet, which registration admits
+        // only when the node's worker type grants it (`enforce_fleet_claim`).
         let subject = if req.fleet.is_empty() {
             crate::manager::mesh_ca::CsrSubject::Node(req.node_id.clone())
         } else {
@@ -7788,14 +7896,12 @@ impl Manager for ManagerDaemonService {
                 .map_err(|e| map_store_error("Error updating node heartbeat", e))?;
         }
 
-        if let Err(err) = handle_failed_allocations(
+        let retry_failed_allocations = handle_failed_allocations(
             &self.store,
             &self.allocation_failures,
             &id,
             &req.failed_allocations,
-        ) {
-            error!(node_id = %id, error = ?err, "Error handling failed allocations");
-        }
+        );
         let retry_terminated_allocations =
             handle_terminated_allocations(&self.store, &id, &req.terminated_allocations);
         if let Err(err) =
@@ -8057,6 +8163,7 @@ impl Manager for ManagerDaemonService {
             session_resync,
             stop_sessions,
             retry_terminated_allocations,
+            retry_failed_allocations,
             envelope_resizes,
         };
 
@@ -8243,6 +8350,7 @@ impl Manager for ManagerDaemonService {
         let request = request.into_inner();
         let node_id = request.name.clone();
         self.enforce_registration_grant(&grant, None, Some((&node_id, &request.pool)))?;
+        self.enforce_fleet_claim(&grant, &node_id, &request.config_attrs)?;
 
         // Protocol-version handshake (see docs/upgrades.md): accept workers
         // at or below our protocol version, warn on pre-versioning workers
@@ -11296,9 +11404,13 @@ impl Manager for ManagerDaemonService {
             &req.description,
         )?;
         info!(id = %info.id, worker_type = %info.worker_type, "Join token created");
+        if let Some(warning) = &self.join_address_warning {
+            warn!(id = %info.id, "Join token names a loopback manager address: {warning}");
+        }
         Ok(Response::new(CreateJoinTokenReply {
             info: Some(info),
             token,
+            warning: self.join_address_warning.clone().unwrap_or_default(),
         }))
     }
 
@@ -12229,13 +12341,31 @@ fn handle_failed_allocations(
     failure_tracker: &Arc<Mutex<AllocationFailureTracker>>,
     node_id: &str,
     failed: &[FailedAllocation],
-) -> R<()> {
+) -> Vec<i64> {
     let mut freed_capacity = false;
+    // Reports this manager could not record, handed back for the worker to
+    // send again (`HeartbeatReply.retry_failed_allocations`). A worker sends
+    // a failure once, so a report lost here left the allocation placed on a
+    // node that had already torn it down, and nothing replaced it.
+    let mut retry = Vec::new();
     for failure in failed {
         let allocation_id = failure.allocation_id;
         let allocation_context = {
             let mut tracker = failure_tracker.lock().expect("allocation failure tracker");
-            tracker.context_for_allocation(store, allocation_id)?
+            tracker.context_for_allocation(store, allocation_id)
+        };
+        let allocation_context = match allocation_context {
+            Ok(context) => context,
+            Err(error) => {
+                warn!(
+                    allocation_id,
+                    node_id,
+                    error = %format!("{error:#}"),
+                    "Failed to read a failed allocation; asking the worker to report it again"
+                );
+                retry.push(allocation_id);
+                continue;
+            }
         };
 
         let Some(context) = allocation_context else {
@@ -12257,7 +12387,7 @@ fn handle_failed_allocations(
 
         // The removal, the move budget's verdict, and (when the replacement
         // is deferred) the hold the planner honors commit together.
-        let removal = store.remove_failed_allocation(
+        let removal = match store.remove_failed_allocation(
             allocation_id,
             StopCause::Unknown,
             None,
@@ -12265,7 +12395,21 @@ fn handle_failed_allocations(
                 policy: (&context.on_unhealthy).into(),
                 reason: failure.reason.clone(),
             },
-        )?;
+        ) {
+            Ok(removal) => removal,
+            // The write could not reach the lane leader (a forward to a
+            // leader that just stepped down, say): nothing was recorded.
+            Err(error) => {
+                warn!(
+                    allocation_id,
+                    node_id,
+                    error = %format!("{error:#}"),
+                    "Failed to record an allocation failure; asking the worker to report it again"
+                );
+                retry.push(allocation_id);
+                continue;
+            }
+        };
         failure_tracker
             .lock()
             .expect("allocation failure tracker")
@@ -12324,7 +12468,7 @@ fn handle_failed_allocations(
     if freed_capacity {
         store.request_capacity_reconcile_if_waiting();
     }
-    Ok(())
+    retry
 }
 
 /// Maps a template evaluation error to a gRPC status: a full evaluation
@@ -16400,6 +16544,83 @@ mod tests {
         Ok(())
     }
 
+    /// `kv:read` is checked against the submitter for every key a job names.
+    /// A `templateKv` template is edited by whoever can write its key, so an
+    /// edit that adds a lookup must not render that key's value into the
+    /// job: the job keeps its last render and a `job.kv_render_refused`
+    /// event names the key. Edits that stay within the named keys still
+    /// re-render.
+    #[tokio::test]
+    async fn a_template_edit_cannot_add_a_key_the_job_never_named() -> R<()> {
+        let store = setup_store()?;
+        let manager = ManagerDaemonService::new(store.clone());
+
+        put_kv_entry(&manager, "ui/banner", "hello").await?;
+        put_kv_entry(&manager, "secrets/db", "hunter2").await?;
+        put_kv_entry(&manager, "templates/banner", "msg={{ kv \"ui/banner\" }}").await?;
+        let jobspec = json!({
+            "name": "kv-template-escalation",
+            "task": {
+                "runtime": "exec",
+                "kv": { "watch": true, "onChange": "restart", "onDelete": "fail" },
+                "env": [
+                    {
+                        "name": "BANNER",
+                        "value": { "templateKv": "templates/banner" }
+                    }
+                ],
+                "config": { "command": ["echo", "hi"] }
+            }
+        });
+        run_jobspec(&manager, jobspec).await?;
+
+        // The edit reaches for a key the submitter never named.
+        put_kv_entry(
+            &manager,
+            "templates/banner",
+            "msg={{ kv \"ui/banner\" }} {{ kv \"secrets/db\" }}",
+        )
+        .await?;
+        assert_eq!(
+            task_env_value(&store, "kv-template-escalation", 0, "BANNER")?,
+            "msg=hello",
+            "the job keeps its last render"
+        );
+        assert_eq!(
+            evals_of_kind(&store, "kv-template-escalation", "job_update")?,
+            0
+        );
+        let config = serde_json::to_string(&store.get_job_config("kv-template-escalation")?)?;
+        assert!(
+            !config.contains("hunter2"),
+            "the unnamed key's value is stored nowhere"
+        );
+        let keys: Vec<String> = store
+            .job_kv_references_for_job("kv-template-escalation")?
+            .into_iter()
+            .map(|reference| reference.kv_key)
+            .collect();
+        assert!(!keys.iter().any(|key| key == "secrets/db"));
+        let refused = store.list_scheduler_events(&SchedulerEventFilter {
+            kind: Some("job.kv_render_refused".into()),
+            ..Default::default()
+        })?;
+        assert_eq!(refused.len(), 1);
+        assert!(
+            refused[0].message.contains("secrets/db"),
+            "{}",
+            refused[0].message
+        );
+
+        // An edit within the named keys still re-renders.
+        put_kv_entry(&manager, "templates/banner", "v2={{ kv \"ui/banner\" }}").await?;
+        assert_eq!(
+            task_env_value(&store, "kv-template-escalation", 0, "BANNER")?,
+            "v2=hello"
+        );
+        Ok(())
+    }
+
     #[tokio::test]
     async fn kv_put_only_affects_tasks_watching_the_key() -> R<()> {
         let store = setup_store()?;
@@ -17427,7 +17648,7 @@ mod tests {
                 reason: "boom".into(),
                 artifact_states: None,
             }],
-        )?;
+        );
         // The reschedule is enqueued from a spawned thread, so poll rather
         // than sleep a fixed 10ms, which flaked under a loaded machine.
         // The freed capacity can also queue a capacity pass (`node_join`), in
@@ -17450,6 +17671,91 @@ mod tests {
         assert_eq!(eval.job_config_id, job_config_id);
         assert_eq!(eval.node_name, "node-a");
 
+        Ok(())
+    }
+
+    /// A join token minted while the manager derives a loopback address from
+    /// a wildcard bind carries a warning naming the fix; one minted with a
+    /// chosen address does not.
+    #[tokio::test]
+    async fn a_loopback_join_token_from_a_wildcard_bind_carries_a_warning() -> R<()> {
+        let request = || {
+            Request::new(CreateJoinTokenRequest {
+                worker_type: "default".into(),
+                ttl: Some("1h".into()),
+                description: "warning test".into(),
+            })
+        };
+        let warning = crate::structs::ServerConfigFull {
+            port: 4747,
+            host: "0.0.0.0".into(),
+            ..Default::default()
+        }
+        .loopback_join_address_warning();
+        let manager = ManagerDaemonService::new(setup_store()?)
+            .with_advertise_addr("http://127.0.0.1:4747")
+            .with_join_address_warning(warning);
+        let reply = manager.create_join_token(request()).await?.into_inner();
+        assert!(
+            reply.warning.contains("server.advertiseAddr"),
+            "{}",
+            reply.warning
+        );
+        assert!(!reply.token.is_empty(), "the token is still minted");
+
+        let manager = ManagerDaemonService::new(setup_store()?)
+            .with_advertise_addr("http://10.0.1.5:4747")
+            .with_join_address_warning(None);
+        let reply = manager.create_join_token(request()).await?.into_inner();
+        assert!(reply.warning.is_empty(), "{}", reply.warning);
+        Ok(())
+    }
+
+    /// A failure report the manager cannot record (here, a raft write with
+    /// no pipeline to take it; on the rig, a forward to a leader that had
+    /// just stepped down) is handed back for the worker to send again,
+    /// instead of being logged and lost with the allocation left placed.
+    /// Once recorded, a repeat is not asked for again.
+    #[test]
+    fn an_unrecorded_failure_report_is_handed_back_for_a_retry() -> R<()> {
+        let store = setup_store()?;
+        insert_node(&store, "node-a")?;
+        let job = JobConfig {
+            priority: Default::default(),
+            rollout: None,
+            rollout_by_group: Default::default(),
+            name: "job".into(),
+            tasks: vec![TaskConfig::new("task", "noop")],
+            version: None,
+        };
+        store.handle_job_submit(&job, &[submission()])?;
+        let job_config_id = store.get_job_config(&job.name)?.id();
+        let task_id = store.get_task_configs_for_job_config(&job_config_id)?[0].0;
+        let allocation = store.place_alloc("node-a", task_id)?;
+        let report = [FailedAllocation {
+            allocation_id: allocation.id,
+            reason: "boom".into(),
+            artifact_states: None,
+        }];
+        let tracker = Arc::new(Mutex::new(AllocationFailureTracker::default()));
+
+        store.set_raft_mode(true);
+        let retry = handle_failed_allocations(&store, &tracker, "node-a", &report);
+        store.set_raft_mode(false);
+        assert_eq!(retry, vec![allocation.id]);
+        assert!(
+            store.get_allocation_by_id(allocation.id)?.is_some(),
+            "nothing was recorded"
+        );
+
+        let retry = handle_failed_allocations(&store, &tracker, "node-a", &report);
+        assert!(retry.is_empty(), "{retry:?}");
+        assert!(store.get_allocation_by_id(allocation.id)?.is_none());
+        let retry = handle_failed_allocations(&store, &tracker, "node-a", &report);
+        assert!(
+            retry.is_empty(),
+            "a repeat of a recorded failure is not retried"
+        );
         Ok(())
     }
 
@@ -17505,7 +17811,7 @@ mod tests {
                     reason: "artifact staging failed: 404\nsecond line".into(),
                     artifact_states: None,
                 }],
-            )?;
+            );
             failed.push(allocation.id);
         }
 
@@ -17584,7 +17890,7 @@ mod tests {
                 reason: "boom".into(),
                 artifact_states: None,
             }],
-        )?;
+        );
         let events = deferred_events(&store, "flaky")?;
         assert_eq!(events.len(), 5);
         assert_eq!(events[4]["attempt"], 1);
@@ -17636,7 +17942,7 @@ mod tests {
                 reason: "artifact staging failed: 404".into(),
                 artifact_states: None,
             }],
-        )?;
+        );
         let waiting = store.get_instance("user-a")?.context("instance")?;
         assert_eq!(waiting.state, InstanceState::Rescheduling);
         let events = deferred_events(&store, job_id)?;
@@ -17960,7 +18266,7 @@ mod tests {
                 reason: "artifact staging failed: 404".into(),
                 artifact_states: Some(artifact_states),
             }],
-        )?;
+        );
 
         let events = store.list_scheduler_events(&SchedulerEventFilter {
             kind: Some("artifact.failed".into()),
@@ -18012,7 +18318,7 @@ mod tests {
                 reason: "spoofed".into(),
                 artifact_states: None,
             }],
-        )?;
+        );
         std::thread::sleep(Duration::from_millis(10));
 
         assert!(store.get_allocation_by_id(allocation.id)?.is_some());

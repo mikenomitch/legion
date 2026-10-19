@@ -362,11 +362,14 @@ jobs: each session is a keyed instance that is created, runs for
 open-loop `--rate`. It embeds `--simulate N` simulated nodes with the
 checkpoint channel faked (the `--sim-checkpoints` fleet), so it needs only a
 manager and a join token for the fleet (`legion join-token create`; the
-token's CA pin is how the fleet verifies the manager):
+token's CA pin is how the fleet verifies the manager). The token's worker
+type must grant the fleet, whose name is the `--sim-name-prefix` (default
+`lg-<pid>`): give it `attributes = { workerFleet = "lg-*" }`
+([worker-simulation.md](worker-simulation.md)). Here that type is `sim`:
 
 ```bash
 legion-loadgen --mode instances --manager http://127.0.0.1:15747 \
-    --join-token "$(legion join-token create --type default -j | jq -r .data.token)" \
+    --join-token "$(legion join-token create --type sim -j | jq -r .data.token)" \
     --simulate 50 --sessions 2000 --rate 100 --hold-ms 2000
 ```
 

@@ -2713,14 +2713,27 @@ pub struct TelemetryState {
 /// Content type for the Prometheus text exposition format.
 pub const METRICS_CONTENT_TYPE: &str = "text/plain; version=0.0.4";
 
-/// Run the telemetry listener until the process exits. Bound on its own port
-/// (`server.port + 2` by convention; `telemetry.port` overrides).
-pub async fn serve_telemetry(addr: SocketAddr, state: TelemetryState) -> R<()> {
-    let listener = tokio::net::TcpListener::bind(addr)
-        .await
-        .with_context(|| format!("failed to bind telemetry listener on {addr}"))?;
+/// Start the telemetry listener on its own port (`server.port + 2` by
+/// convention; `telemetry.port` overrides) and serve it in the background
+/// until the process exits.
+///
+/// The port is bound before this returns, so a port conflict fails the
+/// manager's startup instead of leaving a manager up with no `/metrics` and
+/// no health probes, which an orchestrator reads as a dead manager.
+pub async fn start_telemetry(addr: SocketAddr, state: TelemetryState) -> R<()> {
+    let listener = tokio::net::TcpListener::bind(addr).await.with_context(|| {
+        format!(
+            "failed to bind the telemetry listener on {addr}; free the port, set \
+             telemetry.port, or set telemetry.enabled = false"
+        )
+    })?;
     info!(%addr, "Telemetry listener started (/metrics, /healthz, /readyz)");
-    serve_telemetry_on(listener, state).await
+    tokio::spawn(async move {
+        if let Err(err) = serve_telemetry_on(listener, state).await {
+            tracing::error!(error = ?err, "telemetry listener exited");
+        }
+    });
+    Ok(())
 }
 
 /// Serve telemetry on an already-bound listener (tests bind port 0 and read

@@ -88,19 +88,32 @@ pub fn tls_acceptor(tls: &TlsConfigFull) -> R<Option<TlsAcceptor>> {
     Ok(Some(TlsAcceptor::from(Arc::new(config))))
 }
 
-/// Run the exec WebSocket listener until the process exits. Bound on its own
-/// port (`server.port + 1` by convention). With `tls`, every connection is a
-/// TLS connection (`wss://`); without it, plaintext (`ws://`).
-pub async fn serve_exec_ws(
+/// Start the exec WebSocket listener on its own port (`server.port + 1` by
+/// convention) and serve it in the background until the process exits. With
+/// `tls`, every connection is a TLS connection (`wss://`); without it,
+/// plaintext (`ws://`).
+///
+/// The port is bound before this returns, so a port another process holds
+/// fails the manager's startup like the gRPC listener's does, instead of
+/// leaving a manager up whose exec WebSocket never listened.
+pub async fn start_exec_ws(
     addr: SocketAddr,
     state: ExecWsState,
     tls: Option<TlsAcceptor>,
 ) -> R<()> {
-    let listener = TcpListener::bind(addr)
-        .await
-        .with_context(|| format!("failed to bind exec ws listener on {addr}"))?;
+    let listener = TcpListener::bind(addr).await.with_context(|| {
+        format!(
+            "failed to bind the exec WebSocket listener on {addr} (server.port + 1); free \
+             the port, or set exec.enabled = false to run without it"
+        )
+    })?;
     info!(%addr, tls = tls.is_some(), "Exec WebSocket listener started");
-    serve_exec_ws_on(listener, state, tls).await
+    tokio::spawn(async move {
+        if let Err(err) = serve_exec_ws_on(listener, state, tls).await {
+            tracing::error!(error = ?err, "exec ws listener exited");
+        }
+    });
+    Ok(())
 }
 
 /// Accept loop over an already-bound listener.

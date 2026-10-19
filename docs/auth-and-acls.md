@@ -312,10 +312,13 @@ $ legion job run web.ncl
 error: permission denied: ... (the jobspec reads kv secrets/db-password; the submitter needs kv read on it)
 ```
 
-The check is made when the job is submitted. A key a template stored in KV
-(`templateKv`) is re-read when it changes, and a later edit to that template
-can name a key the submitter could not read, so `kv:write` on a
-`templateKv` key is as sensitive as `kv:read` on what it may name.
+The check is made when the job is submitted. A template stored in KV
+(`templateKv`) is re-read when it changes, but a re-render may only read
+keys the job already names: an edit that adds a lookup is not rendered, the
+job keeps its last render, and a `job.kv_render_refused` event names the
+new keys. Resubmitting the job checks them against whoever submits it.
+`kv:write` on a `templateKv` key still decides what the job renders from
+the keys it names.
 
 Manage policies with `legion acl policy apply|list|get|delete`. A policy file
 is Nickel (`.ncl`) or JSON (`.json`), read by the same rules as every other
@@ -496,7 +499,13 @@ secret, so the worker needs no other configuration. The manager stores only
 a hash of the secret. List and revoke join tokens with
 `legion join-token list|delete` or from the UI's Access → Worker Join tab.
 Set `server.advertiseAddr` when workers reach the manager at a different
-address than it binds.
+address than it binds. A manager bound to every interface (`host =
+"0.0.0.0"`) with no `advertiseAddr` puts `127.0.0.1` in its join tokens,
+which no other machine can use: the worker dials its own loopback and
+retries, and nothing on the manager looks wrong. The manager warns about it
+at startup and with every token it mints in that state (`legion join-token
+create` prints the warning on stderr, and `--json` carries it as
+`data.warning`).
 
 Workers get their attributes from their worker type's template (pool,
 attributes, and resources from `workerConfigPath`) plus worker-side
@@ -545,6 +554,12 @@ When ACLs are enforced:
   day, long enough to bring the hosts up) and revoke them once the fleet has
   joined. Restarts do not need them. Treat the node token file like the
   node's private key: it lets its holder act as that node.
+- A registration that claims a simulator fleet (the `workerFleet`
+  attribute, which earns one certificate for every node of the fleet) is
+  refused with `PermissionDenied` unless the join token's worker type grants
+  that fleet in its own `workerFleet` attribute, and a node token cannot
+  move its node to another fleet
+  ([worker-simulation.md](worker-simulation.md)).
 - A node's certificate is issued for `<label>.node.legion`. A name that is
   already a plain DNS label (lowercase letters, digits, single `-`) is its
   own label; any other name (`ip-10-0-1-7.ec2.internal`, `Node_1`) gets a

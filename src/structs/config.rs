@@ -2054,6 +2054,28 @@ impl ServerConfigFull {
         self.local_address()
     }
 
+    /// Why the join tokens this manager mints will strand remote workers,
+    /// when they will: it binds every interface (a wildcard `host`) yet has
+    /// no `advertiseAddr`, so the address it derives, and embeds in every
+    /// join token, is loopback. A worker on another machine decodes the
+    /// token, dials its own loopback, and retries forever while the manager
+    /// shows no error at all. A manager bound to one address (loopback
+    /// included) means it, and gets no warning.
+    pub fn loopback_join_address_warning(&self) -> Option<String> {
+        if self.advertise_addr.is_some() || !matches!(self.host.as_str(), "0.0.0.0" | "::") {
+            return None;
+        }
+        Some(format!(
+            "server.host is {} (every interface) but server.advertiseAddr is unset, so join \
+             tokens name {}: a worker on another machine dials its own loopback and never \
+             registers. Set server.advertiseAddr to an address workers can reach (for example \
+             \"http://10.0.1.5:{}\")",
+            self.host,
+            self.advertised_address(),
+            self.port
+        ))
+    }
+
     /// The address a CLI on the manager's own machine dials: scheme, host,
     /// and port, with a wildcard host as 127.0.0.1. Unlike
     /// [`Self::advertised_address`] it ignores `advertiseAddr`, which names
@@ -3353,6 +3375,35 @@ pub fn parse_byte_size(raw: &str) -> R<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A wildcard bind with no `advertiseAddr` puts loopback in every join
+    /// token, which strands any worker on another machine without an error
+    /// anywhere on the manager. That case, and only that case, warns.
+    #[test]
+    fn a_wildcard_bind_without_advertise_addr_warns_about_join_tokens_test() {
+        let server = |host: &str, advertise: Option<&str>| ServerConfigFull {
+            port: 4747,
+            host: host.into(),
+            advertise_addr: advertise.map(str::to_string),
+            ..Default::default()
+        };
+        let warning = server("0.0.0.0", None)
+            .loopback_join_address_warning()
+            .expect("wildcard bind, no advertiseAddr");
+        assert!(warning.contains("http://127.0.0.1:4747"), "{warning}");
+        assert!(warning.contains("server.advertiseAddr"), "{warning}");
+        assert!(server("::", None).loopback_join_address_warning().is_some());
+        assert!(server("0.0.0.0", Some("http://10.0.1.5:4747"))
+            .loopback_join_address_warning()
+            .is_none());
+        // Bound to one address on purpose: loopback means loopback.
+        assert!(server("127.0.0.1", None)
+            .loopback_join_address_warning()
+            .is_none());
+        assert!(server("10.0.1.5", None)
+            .loopback_join_address_warning()
+            .is_none());
+    }
 
     #[test]
     fn oversubscribe_and_memory_pressure_validate() {

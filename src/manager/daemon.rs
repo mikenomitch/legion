@@ -587,6 +587,10 @@ pub async fn run_manager_with(
         diverged_since_ms: std::sync::Arc::new(std::sync::atomic::AtomicI64::new(0)),
     };
 
+    if let Some(warning) = full_config.server.loopback_join_address_warning() {
+        warn!("{warning}");
+    }
+
     // Follower-side forwarding of rejected writes to the raft leader
     // (docs/raft-operations.md, "Writes on any manager").
     let leader_forward = crate::manager::leader_forward::LeaderForwardLayer::new(store.clone());
@@ -595,6 +599,7 @@ pub async fn run_manager_with(
         .with_kv_debounce(Duration::from_millis(full_config.kv_debounce_ms))
         .with_authenticator(authenticator)
         .with_advertise_addr(full_config.server.advertised_address())
+        .with_join_address_warning(full_config.server.loopback_join_address_warning())
         .with_manager_id(manager_node_id.clone());
 
     let addr: std::net::SocketAddr =
@@ -613,14 +618,7 @@ pub async fn run_manager_with(
         )
         .parse()?;
         let exec_ws_tls = crate::manager::exec_ws::tls_acceptor(&full_config.server.tls)?;
-        tokio::spawn(async move {
-            if let Err(err) =
-                crate::manager::exec_ws::serve_exec_ws(exec_ws_addr, exec_ws_state, exec_ws_tls)
-                    .await
-            {
-                tracing::error!(error = ?err, "exec ws listener exited");
-            }
-        });
+        crate::manager::exec_ws::start_exec_ws(exec_ws_addr, exec_ws_state, exec_ws_tls).await?;
     } else {
         info!(
             "Exec is disabled (exec.enabled=false); ExecAllocation and the exec WebSocket are off"
@@ -636,13 +634,7 @@ pub async fn run_manager_with(
             .unwrap_or(full_config.server.port + 2);
         let telemetry_addr: std::net::SocketAddr =
             format!("{}:{}", full_config.server.host, telemetry_port).parse()?;
-        tokio::spawn(async move {
-            if let Err(err) =
-                crate::manager::telemetry::serve_telemetry(telemetry_addr, telemetry_state).await
-            {
-                tracing::error!(error = ?err, "telemetry listener exited");
-            }
-        });
+        crate::manager::telemetry::start_telemetry(telemetry_addr, telemetry_state).await?;
     } else {
         info!(
             "Telemetry is disabled (telemetry.enabled=false); /metrics and health probes are off"

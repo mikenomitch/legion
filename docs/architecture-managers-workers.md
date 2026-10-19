@@ -73,7 +73,9 @@ The worker simulator (`legion start worker --simulate N`) serves its whole
 fleet from one listener with one fleet certificate
 (`<prefix>.fleet.legion`), issued through the first simulated node to
 register. Its nodes carry the `workerFleet` attribute, and managers verify
-the fleet's name for them.
+the fleet's name for them. The worker type a fleet joins with must grant
+the fleet ([worker-simulation.md](worker-simulation.md)), so a real node
+cannot claim one.
 
 If a manager cannot reach a worker, the worker keeps running work (heartbeat
 replies carry its allocations), but exec, logs, and restart fail with a

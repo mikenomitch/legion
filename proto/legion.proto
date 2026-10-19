@@ -36,6 +36,12 @@ service Manager {
   // but registering under the name of a node that is still live is
   // PERMISSION_DENIED unless the request also carries that node's own token
   // (a restart). See docs/auth-and-acls.md, "Worker nodes".
+  //
+  // A registration whose `config_attrs` claim a `workerFleet` (the worker
+  // simulator) is PERMISSION_DENIED unless the join token's worker type
+  // grants that fleet in its `workerFleet` attribute (a name, or a `*`
+  // glob), or, for a node-token re-registration, the node already belongs
+  // to that fleet. See docs/worker-simulation.md, "One fleet certificate".
   rpc WorkerRegister (WorkerRegisterRequest) returns (WorkerRegisterReply);
 
   // Submits or updates a job from a fully rendered jobspec.
@@ -1084,7 +1090,9 @@ service Manager {
   // which serves every simulated node from one listener: the certificate
   // then names the fleet (`<fleet>.fleet.legion`, `legion://fleet/<name>`)
   // instead of the node, and the caller's node must have registered with the
-  // `workerFleet` config attribute set to the same name.
+  // `workerFleet` config attribute set to the same name. Registration admits
+  // that attribute only when the node's worker type grants the fleet
+  // (WorkerRegister), so the fleet is the operator's choice, not the node's.
   //
   // The node's *workload* identities are never certificates: a dialing node
   // names the workload it forwards for in a PROXY protocol v2 TLV inside the
@@ -2298,6 +2306,13 @@ message WorkerRegisterRequest {
   string pool = 2;
 
   // JSON object string of node configuration attributes.
+  //
+  // `workerFleet` (set by the worker simulator) is checked against the
+  // credential: with ACLs enforced, a join token's worker type must grant
+  // the fleet through its own `workerFleet` attribute (an exact name or a
+  // `*` glob such as `sim-*`), and a node token may not change the fleet
+  // its node joined with. Either refusal is `PERMISSION_DENIED`; audit-only
+  // mode logs it and allows it.
   string config_attrs = 3;
 
   // JSON object string of node fingerprint attributes collected on worker.
@@ -6814,6 +6829,21 @@ message HeartbeatReply {
   // Default: empty list.
   repeated int64 retry_terminated_allocations = 20;
 
+  // Allocation ids from the request's `failed_allocations` that this
+  // manager could not record, so the worker must send them again on its
+  // next heartbeat. A failure is reported once, and the worker has already
+  // torn the allocation down: dropping the report leaves the allocation
+  // placed on a node that no longer runs it, and nothing replaces it.
+  //
+  // A report is listed when reading the allocation or recording the
+  // failure failed (the write could not reach the lane leader, say). A
+  // report for an allocation this manager has no row for, one already
+  // removed, or one from a node that does not own the allocation is never
+  // listed.
+  //
+  // Default: empty list.
+  repeated int64 retry_failed_allocations = 24;
+
   // The cluster's workload-identity issuer: the `iss` every token and
   // ticket the managers sign carries (docs/workload-identity.md, "Issuer").
   // A worker checks boot, session, and exec tickets against this value, not
@@ -11284,6 +11314,17 @@ message CreateJoinTokenReply {
   // address, the secret, and the worker type. Returned exactly once; the
   // manager stores only a hash of the embedded secret.
   string token = 2;
+
+  // Set when the token is unusable from another machine: the manager binds
+  // every interface (`server.host` is `0.0.0.0` or `::`) but has no
+  // `server.advertiseAddr`, so the address it embeds is loopback. A remote
+  // worker would dial its own loopback and retry forever, and nothing on the
+  // manager would look wrong. The text names the embedded address and the
+  // setting that fixes it. The token is still valid for a worker on the
+  // manager's own machine.
+  //
+  // Default: empty (the embedded address is the one the operator chose).
+  string warning = 3;
 }
 
 // Request payload for ListJoinTokens.

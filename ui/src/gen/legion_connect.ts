@@ -47,6 +47,12 @@ export const Manager = {
      * PERMISSION_DENIED unless the request also carries that node's own token
      * (a restart). See docs/auth-and-acls.md, "Worker nodes".
      *
+     * A registration whose `config_attrs` claim a `workerFleet` (the worker
+     * simulator) is PERMISSION_DENIED unless the join token's worker type
+     * grants that fleet in its `workerFleet` attribute (a name, or a `*`
+     * glob), or, for a node-token re-registration, the node already belongs
+     * to that fleet. See docs/worker-simulation.md, "One fleet certificate".
+     *
      * @generated from rpc legion.Manager.WorkerRegister
      */
     workerRegister: {
@@ -1474,7 +1480,9 @@ export const Manager = {
      * which serves every simulated node from one listener: the certificate
      * then names the fleet (`<fleet>.fleet.legion`, `legion://fleet/<name>`)
      * instead of the node, and the caller's node must have registered with the
-     * `workerFleet` config attribute set to the same name.
+     * `workerFleet` config attribute set to the same name. Registration admits
+     * that attribute only when the node's worker type grants the fleet
+     * (WorkerRegister), so the fleet is the operator's choice, not the node's.
      *
      * The node's *workload* identities are never certificates: a dialing node
      * names the workload it forwards for in a PROXY protocol v2 TLV inside the
