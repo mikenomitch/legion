@@ -182,11 +182,12 @@ the allocation.
 | `preempted` | Displaced to make room for higher-priority work ([preemption-and-eviction.md](preemption-and-eviction.md)). Includes a `preemptor` in the stop notice. |
 | `gang` | A member of the task's [gang](gang-scheduling.md) was lost and the gang restarts whole (`onMemberLoss = "restart"`), or the gang's job failed (`onMemberLoss = "fail"`, a spent move budget, or a `placementTimeout`). The survivors stop so the gang never runs short of its quorum. |
 | `node_pressure` | The node ran short of memory and its memory pressure response stopped this task, because it was bursting above its reservation (`evict-bursting`) or the node oversubscribes memory (`evict-reserved`). The worker writes this cause into the stop notice itself. See [resource-enforcement.md](resource-enforcement.md#memory-pressure). |
+| `failed` | The task exited unsuccessfully or failed its health checks, its worker reported it, and the manager removed the allocation to replace it (or, with the `onUnhealthy` move budget spent, to fail the job). A stateful instance's `last_stop` carries the worker's failure reason. |
 | `unknown` | No cause was recorded. See [Delivery guarantees](#delivery-guarantees). |
 
-`unknown` is a normal value, not just an error case. It most often comes from
-the worker failure-report path. A task that died on its own was never stopped
-by the platform, so there is no platform stop to explain.
+`unknown` is a normal value, not just an error case: a worker that reconciles
+before the notice reaches it, or a manager older than the cause it would
+send, stops with `unknown` rather than waiting.
 
 ## Where you can see it
 

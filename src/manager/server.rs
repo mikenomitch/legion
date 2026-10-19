@@ -12387,10 +12387,19 @@ fn handle_failed_allocations(
 
         // The removal, the move budget's verdict, and (when the replacement
         // is deferred) the hold the planner honors commit together.
+        // The reason becomes the instance's `last_stop`, so the row still
+        // says why once the reschedule hold has lapsed.
+        let explanation = crate::storage::store::StopExplanation {
+            detail: format!(
+                "Failed on node {node_id}: {}",
+                crate::storage::store::summarize_reason(&failure.reason, 400)
+            ),
+            hint: String::new(),
+        };
         let removal = match store.remove_failed_allocation(
             allocation_id,
-            StopCause::Unknown,
-            None,
+            StopCause::Failed,
+            Some(explanation),
             FailedMove {
                 policy: (&context.on_unhealthy).into(),
                 reason: failure.reason.clone(),
@@ -12455,7 +12464,7 @@ fn handle_failed_allocations(
         let gang = gang_member_lost(
             store,
             &removal.allocation,
-            StopCause::Unknown,
+            StopCause::Failed,
             matches!(removal.verdict, MoveVerdict::Exhausted { .. }),
         );
         apply_move_verdict(store, &removal, node_id, gang.as_ref());

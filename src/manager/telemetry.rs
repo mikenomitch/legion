@@ -939,6 +939,9 @@ pub struct Metrics {
     pub nodes_marked_lost_total: Arc<Counter>,
     /// `legion_nodes_recovered_total{path}`
     pub nodes_recovered_total: Arc<CounterVec>,
+    /// `legion_leader_forwards_total{lane,op,outcome}` (docs/metrics.md,
+    /// "Raft")
+    pub leader_forwards_total: Arc<CounterVec>,
     /// `legion_read_model_drift_repaired_total{source}`
     pub read_model_drift_repaired_total: Arc<CounterVec>,
     /// `legion_read_model_external_writes_total`
@@ -1751,6 +1754,15 @@ impl Metrics {
             series: Series::new(),
         });
 
+        let leader_forwards_total = Arc::new(CounterVec {
+            meta: FamilyMeta {
+                name: "legion_leader_forwards_total",
+                help: "Store writes this manager forwarded to the lane's leader because it does not lead the lane (worker heartbeats, failure reports, and other worker-plane writes that land on a follower), by lane, op, and outcome: 'ok' (the leader executed it) or 'failed' (no leader known, unreachable, the target lost leadership, or the op failed there).",
+                labels: &["lane", "op", "outcome"],
+            },
+            series: Series::new(),
+        });
+
         // Read-model coherence (docs/state-store.md).
         let read_model_drift_repaired_total = Arc::new(CounterVec {
             meta: FamilyMeta {
@@ -1834,6 +1846,7 @@ impl Metrics {
             Arc::clone(&heartbeat_sustainable_nodes) as Arc<dyn RenderMetric>,
             Arc::clone(&nodes_marked_lost_total) as Arc<dyn RenderMetric>,
             Arc::clone(&nodes_recovered_total) as Arc<dyn RenderMetric>,
+            Arc::clone(&leader_forwards_total) as Arc<dyn RenderMetric>,
             Arc::clone(&read_model_drift_repaired_total) as Arc<dyn RenderMetric>,
             Arc::clone(&read_model_external_writes_total) as Arc<dyn RenderMetric>,
             Arc::clone(&liveness_tracked_nodes) as Arc<dyn RenderMetric>,
@@ -2028,6 +2041,7 @@ impl Metrics {
             heartbeat_sustainable_nodes,
             nodes_marked_lost_total,
             nodes_recovered_total,
+            leader_forwards_total,
             read_model_drift_repaired_total,
             read_model_external_writes_total,
             liveness_tracked_nodes,

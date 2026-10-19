@@ -108,9 +108,13 @@ scripts/bootstrap-operator-box.sh start
 Two teardowns, in this order:
 
 ```bash
-scripts/bootstrap-operator-box.sh ssh 'cd ~/legion/benchmarks/aws && scripts/teardown.sh'
+scripts/bootstrap-operator-box.sh ssh 'cd ~/legion/benchmarks/aws && scripts/teardown.sh --yes'
 scripts/bootstrap-operator-box.sh destroy
 ```
+
+`teardown.sh` asks before destroying anything. With no terminal to ask on
+(a command over `ssh`, `nohup`, `< /dev/null`) it refuses with exit 2 and
+says so, rather than guessing, so an unattended teardown needs `--yes`.
 
 `destroy` warns if rig instances are still up, because the box holds the
 only copy of their terraform state.

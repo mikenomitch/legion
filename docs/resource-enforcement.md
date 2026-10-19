@@ -419,7 +419,12 @@ Node w-03 (ready)  usage sampled 4s ago
 ```
 
 - **Capacity** is the node's fingerprint minus its worker-type
-  `reservedResources`, the same number the scheduler packs against.
+  `reservedResources`, the same number the scheduler packs against. A
+  worker type cannot raise or replace the fingerprinted `memory`, `cpu`, or
+  `cores`: its `resources` block declares custom resources only, and the
+  manager refuses to start on a worker config whose `resources` names a
+  builtin (`cpu`, `memory`, `cores`, or `allocations`; cap allocations with
+  `maxAllocations`).
 - **Reserved** is the sum of every placed allocation's `resources` after
   defaults, plus what suspended instances keep held
   ([`suspend.reserve`](#suspended-instances)). Held rows

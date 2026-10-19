@@ -1186,7 +1186,8 @@ See [workload identity on sandboxes](workload-identity.md#sandboxes).
   rest of the [stop-cause vocabulary](graceful-stop.md)), a sentence, the
   allocation and node, and when. A memory pressure eviction carries the
   worker's own detail and hint, the same text as its `node.pressure` event,
-  so a job-scoped token without `operator:read` still sees it. The manager
+  so a job-scoped token without `operator:read` still sees it. A failure
+  the worker reported (`failed`) carries the node and the failure reason. The manager
   writes it in the same transaction that removes the allocation, and each
   later stop replaces it.
 - **What can it checkpoint right now?** For an `active` instance,

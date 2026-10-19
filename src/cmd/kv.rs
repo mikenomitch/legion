@@ -2,9 +2,10 @@ use crate::cmd::helpers::{connect_manager_client, json_flag, print_table};
 use crate::cmd::output::{self, CliError, OutputFormat};
 use crate::prelude::*;
 use crate::structs::{
-    DeleteKvRequest, GetKvRequest, KvEntry, KvValueType, ListKvRequest, PatchKvRequest,
-    PutKvRequest,
+    DeleteKvRequest, GetKvRequest, KvEntry, KvJobReference, KvValueType, ListKvRequest,
+    PatchKvRequest, PutKvRequest,
 };
+use serde::Serialize;
 use tabled::Tabled;
 
 pub fn config() -> Command {
@@ -279,14 +280,22 @@ async fn get_kv(key: &str, format: OutputFormat) -> R<()> {
         client.get_kv(tonic::Request::new(request)).await,
     )?;
     let reply = response.into_inner();
-    match reply.entry {
-        Some(entry) => print_entry(&entry, format)?,
+    let entry = match reply.entry {
+        Some(entry) => entry,
         // A missing key is a failure, in both formats: `{ok:false}` with
         // `NotFound` and a non-zero exit, so `legion kv get k || legion kv put
         // k v` does what it reads like (docs/kv-store.md).
         None => return Err(output::fail_local(format, missing_key_error(key))),
+    };
+    if format.is_json() {
+        output::print_success(&KvGetPrint {
+            entry,
+            references: reply.references,
+        });
+        return Ok(());
     }
-    if !format.is_json() && !reply.references.is_empty() {
+    print_entry(&entry, format)?;
+    if !reply.references.is_empty() {
         println!("used by:");
         for reference in &reply.references {
             println!("  {} {}", reference.job_id, reference.json_pointer);
@@ -294,6 +303,16 @@ async fn get_kv(key: &str, format: OutputFormat) -> R<()> {
     }
 
     Ok(())
+}
+
+/// `kv get --json` data: the entry's own fields, plus the jobs that read it
+/// (`GetKvReply.references`), which the text output prints as `used by:`.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct KvGetPrint {
+    #[serde(flatten)]
+    entry: KvEntry,
+    references: Vec<KvJobReference>,
 }
 
 /// The error `kv get` reports for a key with no entry.

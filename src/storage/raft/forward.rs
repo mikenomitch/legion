@@ -72,6 +72,13 @@ pub(crate) enum ForwardableLaneWrite {
     },
     /// `Store::mark_job_failed` — control lane.
     MarkJobFailed { job_id: String },
+    /// `Store::upsert_manager_config` — control lane. A manager that does
+    /// not lead the control lane publishes its own config row at startup
+    /// through the leader. The config travels already serialized.
+    UpsertManagerConfig {
+        node_id: String,
+        config_json: String,
+    },
     /// The decision half of `Store::gang_member_lost` — scheduler lane. A
     /// worker's failure report lost a gang member: the leader reads the
     /// gang's survivors from its own state (it is the decision, made where
@@ -199,7 +206,8 @@ impl ForwardableLaneWrite {
             | ForwardableLaneWrite::SetTaskStatus { .. }
             | ForwardableLaneWrite::EmitEvent { .. } => Lane::Status,
             ForwardableLaneWrite::SyncNodeAvailability { .. }
-            | ForwardableLaneWrite::MarkJobFailed { .. } => Lane::Control,
+            | ForwardableLaneWrite::MarkJobFailed { .. }
+            | ForwardableLaneWrite::UpsertManagerConfig { .. } => Lane::Control,
             ForwardableLaneWrite::RemoveAllocationById { .. }
             | ForwardableLaneWrite::GangMemberLost { .. }
             | ForwardableLaneWrite::RemoveFailedAllocation { .. }
@@ -227,6 +235,7 @@ impl ForwardableLaneWrite {
             }
             ForwardableLaneWrite::SyncNodeAvailability { .. } => "sync_node_availability",
             ForwardableLaneWrite::MarkJobFailed { .. } => "mark_job_failed",
+            ForwardableLaneWrite::UpsertManagerConfig { .. } => "upsert_manager_config",
             ForwardableLaneWrite::GangMemberLost { .. } => "gang_member_lost",
             ForwardableLaneWrite::RemoveAllocationById { .. } => "remove_allocation_by_id",
             ForwardableLaneWrite::RemoveFailedAllocation { .. } => "remove_failed_allocation",
@@ -302,6 +311,10 @@ pub(crate) fn execute(store: &Store, op: ForwardableLaneWrite) -> ForwardOutcome
         ForwardableLaneWrite::MarkJobFailed { job_id } => {
             done(store.mark_job_failed_local(&job_id))
         }
+        ForwardableLaneWrite::UpsertManagerConfig {
+            node_id,
+            config_json,
+        } => done(store.upsert_manager_config_local(&node_id, &config_json)),
         ForwardableLaneWrite::GangMemberLost {
             job_id,
             job_config_id,

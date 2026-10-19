@@ -494,9 +494,13 @@ fn deliver_ratification(store: &Store, allocation: &Allocation, claim: &Speculat
     })
 }
 
+/// `block_on` itself does not need `Send`; the bound is there so the type
+/// system refuses a `MutexGuard` (or any other `!Send` state) held across an
+/// `.await` on the dispatch path, which would stall every other dispatch on
+/// that lock while a worker RPC is in flight.
 fn run_dispatch_future<F>(future: F) -> R<()>
 where
-    F: std::future::Future<Output = R<()>>,
+    F: std::future::Future<Output = R<()>> + Send,
 {
     match tokio::runtime::Handle::try_current() {
         Ok(handle) => {

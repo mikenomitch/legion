@@ -297,10 +297,11 @@ fn first_node(cluster: &Cluster) -> Option<String> {
 }
 
 fn running_allocation(cluster: &Cluster, job: &str) -> Option<i64> {
-    // `legion ledger -j` prints a bare array of `{node, allocations}`.
+    // `legion ledger -j` prints `{ok, data}` with `data` an array of
+    // `{node, allocations}`.
     let out = cluster.cli(&["ledger", "-j"]);
     let ledger: serde_json::Value = serde_json::from_slice(&out.stdout).ok()?;
-    ledger
+    ledger["data"]
         .as_array()?
         .iter()
         .flat_map(|node| node["allocations"].as_array().cloned().unwrap_or_default())

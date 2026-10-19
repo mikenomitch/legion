@@ -2897,7 +2897,15 @@ impl Store {
             // is defensive: surface what actually happened.
             return Err(original);
         };
-        match driver.forward_lane_write(&op) {
+        let forwarded = driver.forward_lane_write(&op);
+        crate::manager::telemetry::metrics()
+            .leader_forwards_total
+            .inc(&[
+                op.lane().wire_name(),
+                op.op_name(),
+                if forwarded.is_ok() { "ok" } else { "failed" },
+            ]);
+        match forwarded {
             Ok(value) => {
                 debug!(
                     op = op.op_name(),
@@ -7424,23 +7432,43 @@ impl Store {
     // MANAGER CONFIG
     //
 
+    /// Publish this manager's config row (the Managers page's Config
+    /// column). Forwards to the control lane's leader when this manager does
+    /// not lead it, so a manager that has never led still has a row.
     #[instrument(err, skip_all)]
     pub fn upsert_manager_config(&self, node_id: &str, config: &ManagerConfigFull) -> R<()> {
+        let config_json = to_string_pretty(config)?;
+        match self.upsert_manager_config_local(node_id, &config_json) {
+            Err(err) if crate::storage::raft::driver::NotRaftLeader::in_chain(&err) => self
+                .forward_after_rejection::<()>(
+                    crate::storage::raft::forward::ForwardableLaneWrite::UpsertManagerConfig {
+                        node_id: node_id.to_owned(),
+                        config_json,
+                    },
+                    err,
+                ),
+            other => other,
+        }
+    }
+
+    /// [`Self::upsert_manager_config`], non-forwarding (also the
+    /// `ForwardLaneWrite` executor's entry point). Takes the config already
+    /// serialized, so a forwarded row is byte-for-byte what its manager wrote.
+    pub(crate) fn upsert_manager_config_local(&self, node_id: &str, config_json: &str) -> R<()> {
         let node_id = node_id.to_owned();
-        let config = config.clone();
+        let config_json = config_json.to_owned();
         self.replicated(Lane::Control, "upsert_manager_config", move |s| {
-            s.upsert_manager_config_apply(&node_id, &config)
+            s.upsert_manager_config_apply(&node_id, &config_json)
         })
     }
 
-    fn upsert_manager_config_apply(&self, node_id: &str, config: &ManagerConfigFull) -> R<()> {
+    fn upsert_manager_config_apply(&self, node_id: &str, config_json: &str) -> R<()> {
         let fmt = format_description!(
             "[year]-[month]-[day] [hour]:[minute]:[second] [offset_hour \
                  sign:mandatory]:[offset_minute]:[offset_second]"
         );
 
         let timestamp_now = OffsetDateTime::now_utc().format(fmt)?;
-        let config_json = to_string_pretty(config)?;
 
         let conn = self.write_connection()?;
 
@@ -7553,7 +7581,10 @@ impl Store {
 
         let params = named_params! {
             ":id": id,
-            ":status": "ready",
+            // `active`, the status every liveness query matches. This once
+            // wrote `ready`, which dropped a node recovered here out of the
+            // liveness scan and out of `legion_nodes{status="active"}`.
+            ":status": "active",
             ":last_heartbeat": last_heartbeat,
         };
 
@@ -8477,12 +8508,10 @@ impl Store {
                 // construction: a node transitions twice per outage, not
                 // thirty times a minute.
                 //
-                // Deliberately NOT `mark_node_ready`: that writes status
-                // `"ready"`, which every liveness query filters out (they all
-                // match `"active"`), so recovering through it would drop the
-                // node out of the liveness scan and out of
-                // `legion_nodes{status="active"}`. This is the same composite
-                // shape with the correct status value.
+                // Not `mark_node_ready`: the same status-then-control
+                // composite, but a recovery from `lost` flips availability
+                // back only if the loss changed it, counts the recovery, and
+                // re-observes the node in the in-memory liveness tracker.
                 self.update_node_heartbeat_forwarding(id.clone())?;
                 self.restore_availability_after_loss(&id);
                 self.liveness.observe(&id);
@@ -12727,7 +12756,8 @@ impl Store {
         SELECT jcs.path, jcs.is_primary, s.content
         FROM submission s
         INNER JOIN job_config_submission jcs ON jcs.submission_hash = s.hash
-        WHERE jcs.job_config_id = ?;
+        WHERE jcs.job_config_id = ?
+        ORDER BY jcs.is_primary DESC, jcs.id;
 "#;
         let mut stmt = conn.prepare(sql)?;
         let subs = Self::collect_rows(stmt.query_map([job_config_id], |row| {
@@ -30558,12 +30588,33 @@ mod tests {
     }
 
     #[test]
+    fn a_node_marked_ready_is_back_in_the_liveness_scan_test() -> R<()> {
+        // `mark_node_ready` once wrote status `ready`, which every liveness
+        // query filters out, so a node recovered through it vanished from
+        // the scan that would notice it going quiet again.
+        let store = setup_store()?;
+        store.insert_node(make_node_msg("node-a", "lost"))?;
+        assert!(store.active_node_liveness_rows()?.is_empty());
+
+        store.mark_node_ready("node-a", "2026-01-01T00:00:00Z")?;
+
+        assert_eq!(store.get_node("node-a")?.status, "active");
+        let live: Vec<String> = store
+            .active_node_liveness_rows()?
+            .into_iter()
+            .map(|row| row.id)
+            .collect();
+        assert_eq!(live, vec!["node-a".to_string()]);
+        Ok(())
+    }
+
+    #[test]
     fn apply_projects_read_model_and_event_side_effects() -> R<()> {
         let src = setup_store()?;
         let dst = setup_store()?;
         // Identical seed state on both replicas (same rows, same rowids).
-        src.insert_node(make_node_msg("node-a", "active"))?;
-        dst.insert_node(make_node_msg("node-a", "active"))?;
+        src.insert_node(make_node_msg("node-a", "lost"))?;
+        dst.insert_node(make_node_msg("node-a", "lost"))?;
 
         let mut src_events = src.subscribe_events();
         let mut dst_events = dst.subscribe_events();
@@ -30577,18 +30628,18 @@ mod tests {
         // rows themselves rolled back on the proposer.
         assert!(src_events.try_recv().is_err(), "no event before commit");
         let src_node = src.get_node("node-a")?;
-        assert_eq!(src_node.status, "active", "node row rolled back");
+        assert_eq!(src_node.status, "lost", "node row rolled back");
         let cached = src.cached_nodes()?;
-        assert_eq!(cached[0].status, "active", "read model not touched");
+        assert_eq!(cached[0].status, "lost", "read model not touched");
 
         raft_capture::apply_changeset(&dst, &changeset)?;
 
         // Data applied...
-        assert_eq!(dst.get_node("node-a")?.status, "ready");
+        assert_eq!(dst.get_node("node-a")?.status, "active");
         // ...read model projected from the changeset...
         let dst_cached = dst.cached_nodes()?;
         assert_eq!(dst_cached.len(), 1);
-        assert_eq!(dst_cached[0].status, "ready");
+        assert_eq!(dst_cached[0].status, "active");
         assert_eq!(dst_cached[0].last_heartbeat, "2026-01-01T00:00:00Z");
         // ...and the staged events broadcast at apply time, in id order.
         let kinds: Vec<String> = std::iter::from_fn(|| dst_events.try_recv().ok())
@@ -30609,8 +30660,8 @@ mod tests {
 
         let src = setup_store()?;
         let dst = setup_store()?;
-        src.insert_node(make_node_msg("node-a", "active"))?;
-        dst.insert_node(make_node_msg("node-a", "active"))?;
+        src.insert_node(make_node_msg("node-a", "lost"))?;
+        dst.insert_node(make_node_msg("node-a", "lost"))?;
         let attached = dst.work_log().attach("node-a", 0, 0);
         assert!(matches!(
             WorkLog::take_pending(&attached.log),
@@ -30628,10 +30679,10 @@ mod tests {
             "the injected failure fired"
         );
 
-        assert_eq!(dst.get_node("node-a")?.status, "ready", "rows applied");
+        assert_eq!(dst.get_node("node-a")?.status, "active", "rows applied");
         assert_eq!(
             dst.cached_nodes()?[0].status,
-            "ready",
+            "active",
             "read model rebuilt from the committed rows"
         );
         assert!(
