@@ -53,7 +53,13 @@ Even with `--allow-write`, `legion_state_query` stays read-only.
 | Tool | Mutates | Purpose |
 | --- | --- | --- |
 | `legion_capabilities` | no | List the operation catalog. |
-| `legion_job_list` | no | List jobs, optionally only those in one `status`. The reply's `statusCounts` gives per-status totals. |
+| `legion_job_list` | no | List jobs, optionally only those in one `status`. The reply's `statusCounts` gives per-status totals. `namespaces` selects names or globs (`["*"]` for every namespace this token can read; omitted means `default`), and `elsewhereCount` says how many jobs a narrow selection left out. |
+| `legion_namespace_list` | no | The [namespaces](namespaces.md) this token can see, with job counts. |
+| `legion_namespace_get` | no | One namespace: what it holds, its charged usage, the namespace policies governing it with each limit and aggregate, and (with `acl:read`) the ACL rules that reach it. |
+| `legion_namespace_apply` | yes | Create a namespace or update its description and meta. `dry_run` reports the ACL rules that would reach it. |
+| `legion_namespace_delete` | yes | Delete a namespace; refused while it holds anything unless `cascade`. `dry_run` lists the contents. Supports `idempotency_key`. |
+| `legion_namespace_policy_list` / `_get` | no | Namespace policies (quota, counts, pools, runtimes, host volumes); needs `acl:read`. |
+| `legion_namespace_policy_apply` / `_delete` | yes | Write a namespace policy (needs `acl:write`). Run `dry_run` first: it lists what the policy would have refused among existing jobs. |
 | `legion_job_info` | no | Inspect one job. A job whose placement found no room reports `status: blocked` with a `blocked` block: the key it waits on, the task, its per-placement shortfall, and the scheduler's message. It places on its own when capacity appears, so an agent should wait or add capacity, not resubmit ([Blocked evals](scheduler-and-eval-loop.md#blocked-evals)). For a [gang](gang-scheduling.md), `blocked.gang` says how many replicas fit (`placeable`, `running`) against the quorum it must place together (`min`), and, when it sets `placementTimeout`, when it gives up (`deadline`, Unix seconds): wait until then, or add capacity. A gang job past its deadline, or one whose `onMemberLoss` failed it, reports `status: failed` and places nothing until `legion job run`. |
 | `legion_job_spec` | no | Fetch a job's source submissions. |
 | `legion_job_schema` | no | JSON Schema for jobspecs + task runtimes. |
@@ -755,6 +761,18 @@ All client commands and the MCP server read:
 
 Both timeouts take a duration (`45s`, `2m`) or bare seconds, and `0` turns
 the timeout off.
+
+### Namespaces for agents
+
+Give an agent a token scoped to one namespace (`namespaces = ["agents-dev"]`
+on its rules) and set `LEGION_NAMESPACE` (or pass `namespace` to MCP tools).
+Everything it lists, submits and stops then stays inside that namespace, and a
+mistaken name cannot reach another team's job of the same name. Every tool
+that names a job or instance takes `namespace` and accepts a qualified
+`namespace/name`; replies carry canonical ids (`agents-dev/web`), which can be
+pasted back as-is. A not-found names the namespace that was searched and, when
+the token can read one holding the name, where it is; a denial names where the
+token can act. See [Namespaces](namespaces.md).
 
 ## Recommended agent workflow
 

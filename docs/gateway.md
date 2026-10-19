@@ -38,7 +38,7 @@ Start a gateway with a token that can read and start the job's instances
 (`LEGION_ADDR` and `LEGION_TOKEN` work as they do for the CLI):
 
 ```console
-$ legion acl policy apply gateway --rules '[{"resources": ["job"], "actions": ["read", "write"], "names": ["agents"]}]'
+$ legion acl policy apply gateway --rules '[{"resources": ["job"], "actions": ["read", "write"], "namespaces": ["default"], "names": ["agents"]}]'
 $ legion acl token create --name gateway --policy gateway
 $ export LEGION_ADDR=https://manager.internal:4747 LEGION_TOKEN=<secret>
 $ legion start gateway --listen 0.0.0.0:443 --domain sandboxes.example.com \

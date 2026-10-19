@@ -804,6 +804,25 @@ pub fn enforce(
             action.as_str(),
         )));
     }
+    // Where the token CAN act, from its own rules: the denial names no
+    // target (a scope derived from a lookup would leak it), only the
+    // caller's reach.
+    let reach = if resource.is_namespaced() && scope.namespace.is_some() {
+        identity.namespaces_granting(resource, action)
+    } else {
+        Vec::new()
+    };
+    if !reach.is_empty() {
+        return Err(Status::permission_denied(format!(
+            "permission denied: {}:{} requires a policy granting it in this namespace
+             Hint: this token can {} {} in {}",
+            resource.as_str(),
+            action.as_str(),
+            action.as_str(),
+            resource.as_str(),
+            reach.join(", "),
+        )));
+    }
     Err(Status::permission_denied(format!(
         "permission denied: {}:{} requires a policy granting it",
         resource.as_str(),

@@ -6,9 +6,11 @@ Plan: [`plans/namespaces-plan.md`](../plans/namespaces-plan.md).
 much of the system the decision constrains, how expensive it would be to
 reverse, and how visible it is to users. The entry number is its rank.
 
-These are the calls made while *writing* the plan. Nothing is implemented
-yet. Anything resolved during implementation, and every deviation from the
-plan, gets inserted here at its rank.
+Most entries were made while *writing* the plan. Entries marked
+**Implementation call** were made while building it (2026-10-19), each
+inserted at its rank; plan-time entries that implementation changed say
+**Revised** or **Reversed during implementation** and keep their original
+reasoning below the note.
 
 **Revision history.** The first set of calls was written on 2026-09-29. They
 were revised on 2026-10-18, after two changes:
@@ -34,6 +36,23 @@ an installed base that doesn't exist. And recon found that the plan's
 premise, "the foreign-key graph does not need to change", was false:
 `job.id` *is* the job name (`src/storage/store.rs:10545`), so every
 `job_id` column stores the bare name.
+
+**Revised during implementation** (2026-10-19). Two refinements, both
+visible on the wire:
+
+- **The canonical id omits `default/`.** A job in `default` keeps its bare
+  name (`web`); elsewhere it is `payments-prod/web`. A cluster that never
+  creates a namespace has exactly the ids, derived keys, and seal-key inputs
+  it had, which is what made call 18's refusal migration unnecessary.
+- **There are no separate `namespace` and `name` columns.** The namespace is
+  derived from the id by one total split (`split_job_id`: no `/` means
+  `default`), so nothing can store the two disagreeing. Authorization still
+  works on the split fields (`AclScope::job(id)` sets `namespace` and `name`),
+  never on string prefixes.
+
+The cost: a script that splits on `/` must read a bare id as `default`, and
+a path that wants the namespace as its own segment must split the id (call
+11).
 
 **Call.** `job.id` becomes `"{namespace}/{name}"`, minted at submit, with
 `namespace` and `name` also kept as their own columns. Every key derived
@@ -69,7 +88,7 @@ namespaces.
   plan rejects. It isn't, but only as long as nothing parses it for
   authorization (plan § 8.2), and that invariant has to be defended in
   review.
-- (b) would have kept rename possible. This call closes it (call 10).
+- (b) would have kept rename possible. This call closes it (call 17).
 
 **Why (simplicity and security).** Nomad shipped namespaces with client-side
 keys and paths that lacked them. It then fixed same-id volumes failing to
@@ -170,7 +189,7 @@ error: rule 2 (node:read) has a `namespaces` selector, but node is cluster-scope
 
 **Trade-off.** Every job policy now has to mention namespaces, including on
 a single-team cluster that will never have a second one:
-`namespaces = ["*"]` becomes boilerplate there. That cuts against call 14
+`namespaces = ["*"]` becomes boilerplate there. That cuts against call 23
 (a single-team cluster shouldn't have to learn the concept). It is accepted
 because the people writing ACL policies are the admin persona, the error
 teaches the fix in one line, and it is the exact moment tenancy matters.
@@ -192,7 +211,93 @@ removes a class of silent no-op rules for free. Today `namespaces` on a
 
 ---
 
-## 4. Services are namespaced in the same phase as jobs, and crossing is explicit at both ends
+## 4. A stored rule without `namespaces` reaches `default` only; `*`-resource and deny rules are exempt from the selector requirement
+
+**Implementation call** (2026-10-19), refining call 3.
+
+**Call.** Two refinements to the "a namespaced rule must name its
+namespaces" rule:
+
+- **Validation exemptions.** `resources = ["*"]` rules and deny rules may
+  omit `namespaces`. A rule mixing namespaced and cluster-scoped resources is
+  refused (split it), as is an empty selector:
+
+  ```text
+  rule 1 mixes namespaced resources (job) with cluster-scoped ones (node);
+  split it into two rules, one with a `namespaces` selector and one without
+  ```
+
+- **Evaluation of legacy rules.** An allow rule that names namespaced
+  resources explicitly but carries no `namespaces` (only a rule stored before
+  this release can, since validation refuses to write one) matches the
+  `default` namespace only. A `*`-resource rule and a deny rule without the
+  selector keep matching every namespace. The UI's ACL mirror implements the
+  same rule.
+
+**Alternatives.**
+
+- (a) Keep the engine's "a missing selector matches any value" for
+  `namespaces` too, and rely on validation for new rules.
+- (b) Refuse to start a manager whose stored policies hold such rules.
+- (c) Require `namespaces` on `*` rules and deny rules as well.
+
+**Trade-off.** The engine's one-sentence rule ("no selector matches any
+value") gains an exception for one selector. A legacy `job` rule that an
+operator expected to follow jobs into new namespaces does not, until it is
+re-applied with `namespaces = ["*"]`, and the upgrade note has to say so.
+
+**Why (security, then simplicity).** With (a), every policy written before
+namespaces (`job:write names = ["web-*"]`) silently widens to every namespace
+created since, which is exactly the "grant that follows the tenant around"
+the plan exists to prevent, delivered by an upgrade. (b) breaks every
+upgraded cluster at boot for a fix that can be applied lazily. Defaulting to
+`default` preserves what the rule meant when it was written, because every job
+lived there. (c) would force `namespaces = ["*"]` onto the admin's
+`{ resources = ["*"], actions = ["*"] }` rule, which already says "everything"
+as explicitly as anything can, and onto deny rules, where a missing selector
+can only make a denial broader.
+
+---
+
+## 5. Server job fields take the canonical id; only spec-bearing requests and list selectors carry a `namespace`
+
+**Implementation call** (2026-10-19). Deviates from plan § 11, which gave
+every request that names a job a `string namespace` field.
+
+**Call.** A job's canonical id is the bare name in `default` and
+`namespace/name` elsewhere, and every server field that names a job
+(`name`, `job_id`, `job`) takes it. Clients resolve `-n`,
+`LEGION_NAMESPACE`, and `ns/name` before calling. The only requests with a
+`namespace` field are those that carry a spec (`RunJob`, `PlanJob`,
+`RunJobTemplate`, `RenderJobTemplate`), where the server must reconcile it
+with the spec's own; lists take `repeated string namespaces`.
+
+```text
+GetJobInfo { name: "payments-prod/web" }      # not { name: "web", namespace: "payments-prod" }
+```
+
+**Alternatives.** (a) The plan's shape: a `namespace` field on every
+job-naming request, with the name field accepting either form and a shared
+server-side parser rejecting disagreement.
+
+**Trade-off.** API callers must compose the id themselves (`ns/name`, or the
+bare name in `default`), and a raw `grpcurl` user cannot just add a field.
+Canonical ids also omit `default/`, so a script splitting on `/` must treat
+a bare id as `default`.
+
+**Why (simplicity).** Dozens of RPCs name jobs. (a) adds a field and a
+disagreement rule to each, and every handler must remember to resolve before
+it scopes; one that forgets authorizes against the wrong namespace. With one
+id on the wire, the id a reply returns is the id the next request takes,
+authorization splits that one string the same way everywhere
+(`AclScope::job(id)`), and only the four requests that genuinely hold two
+sources of truth (spec and request) carry two fields. Omitting `default/`
+means a cluster that never creates a namespace has the same ids, keys, and
+paths it always had.
+
+---
+
+## 6. Services are namespaced in the same phase as jobs, and crossing is explicit at both ends
 
 **Call.** The earlier version deferred the namespaced catalog to Phase 3.
 Here it is part of Phase 1:
@@ -243,7 +348,50 @@ rather than six years later.
 
 ---
 
-## 5. `{namespace}` joins the workload-identity uniqueness floor and the default subject, with no pin-the-old-template option
+## 7. Quota charges the larger of declared and live reservations, inside the control-lane submit; there is no plan-apply re-check
+
+**Implementation call** (2026-10-19). Deviates from plan § 8.12, which
+checked quota at submit against usage and re-checked at plan apply so racing
+submits could not both squeeze under the cap.
+
+**Call.** Per band, a job is charged the larger of what it declares (for
+count-driven tasks of its current config, the effective count times the
+reservation) and what its live allocations reserve, dimension by dimension.
+The quota and `maxJobs` checks run inside the replicated control-lane write
+that stores the job, so racing submits serialize. A job never loses ground
+it holds: a resubmit that does not grow in a dimension passes it even over
+the cap.
+
+```console
+error: namespace policy 'payments' caps band 'high' at 64000 MHz CPU across payments, payments-*;
+       in use 61500 MHz CPU, this job adds 4000 MHz CPU
+```
+
+**Alternatives.**
+
+- (a) The plan: charge live allocations at submit, and re-check in the
+  scheduler's plan apply, refusing placements over the cap.
+- (b) Charge declared demand only.
+
+**Trade-off.** A job whose allocations are pending or failing still holds its
+declared quota. Keyed instances, per-node tasks, and the old version during
+a rollout are charged only once they run, so their admission is a pre-check
+(instance create, scale-out) that two racers can both pass. Each governed
+submit scans the cluster's jobs and live allocations inside the control-lane
+entry, linear in cluster size.
+
+**Why (performance, then simplicity).** (a) puts a namespace-usage
+computation on the plan-apply path, the scheduler's hottest write, for every
+placement in a governed namespace, and turns a quota refusal into a blocked
+eval the submitter never sees. Charging declared demand closes the race at
+admission instead, where Borg puts it ("quota-checking is part of admission
+control, not scheduling"), and where the user gets the error. (b) would let
+keyed and per-node work run uncharged; taking the max with live usage is
+what covers them.
+
+---
+
+## 8. `{namespace}` joins the workload-identity uniqueness floor and the default subject, with no pin-the-old-template option
 
 **Revised** (2026-10-18). The earlier version changed the default template
 in the phase that relaxed name uniqueness. Clusters that couldn't take the
@@ -287,14 +435,14 @@ integrations bind Vault and Consul roles on `nomad_namespace`
 
 ---
 
-## 6. Governance lives in namespace policies that select namespaces by glob and cap them in aggregate; priority bands stay in ACL rules
+## 9. Governance lives in namespace policies that select namespaces by glob and cap them in aggregate; priority bands stay in ACL rules
 
 **Reversed in part** (2026-10-18). The earlier version put quota,
 `allowedPools` and `allowedRuntimes` as fields **on the namespace object**.
 The research broke that twice:
 
 1. **Delegated creation dodges a per-namespace quota.** If `payments-*`
-   creation is delegated (call 7), a quota on `payments-prod` is escaped by
+   creation is delegated (call 12), a quota on `payments-prod` is escaped by
    creating `payments-prod2`. That is why OpenShift (ClusterResourceQuota),
    Rancher (project limits), Kiosk (AccountQuota) and HNC
    (HierarchicalResourceQuota) all added quotas spanning namespaces.
@@ -352,11 +500,68 @@ scheduling". It maps directly onto Legion's six bands.
 Bands stay in ACL rules because the band question is per principal ("the
 autoscaler may claim `high`, humans may not"). Moving them would recreate
 the `priority.maxBandByNamespace` config map that
-[preemption call 5](preemption-and-eviction-plan_calls.md) rejected.
+[preemption call 8](preemption-and-eviction-plan_calls.md) rejected.
 
 ---
 
-## 7. Namespace CRUD is a delegable ACL resource, and a cascade delete also needs `job:write`
+## 10. Instance keys are qualified by their job's namespace; minted ids stay bare
+
+**Implementation call** (2026-10-19). Plan § 8.2 made the instance primary
+key `"{namespace}/{instance_id}"`; this keeps that for keys and refines it.
+
+**Call.** A caller-chosen key is stored as its canonical id, `user-42` in
+`default` and `payments-prod/user-42` elsewhere, so keys and tombstones are
+unique per namespace. Server-minted ids (`<task>-<26 base32>`, node-tagged
+session ids) stay bare. The CLI and MCP resolve instance arguments like job
+arguments; a minted id is used as written. Tasks get `LEGION_INSTANCE_ID`
+(canonical) and `LEGION_INSTANCE_KEY` (the key).
+
+**Alternatives.** (a) Qualify every id, minted ones included. (b) Keep ids
+cluster-unique and only hide the collision message.
+
+**Trade-off.** Two forms of instance id exist (qualified keys, bare minted
+ids), and a client resolving a bare argument has to recognize the minted
+shape. `LEGION_INSTANCE_ID` now contains a `/` for namespaced keyed
+instances, which a workload using it as a file name must handle (hence
+`LEGION_INSTANCE_KEY`).
+
+**Why (security, then simplicity).** (b) leaves the cross-tenant existence
+oracle and name squatting in place: tenant B could learn that A holds
+`user-42`, or take `acme` first. (a) would rewrite every minted-id parser
+(session routing reads the node tag out of the id) for ids that are already
+unique by 130 random bits.
+
+---
+
+## 11. Content-store paths spell the namespace as its own segment, `default` included; the fence segment becomes `_fence`
+
+**Implementation call** (2026-10-19). Plan § 8.2 showed
+`manifests/payments-prod/web/...` and assumed the qualified id would carry the
+namespace into paths for free.
+
+**Call.** Archive and session manifests are written under
+`manifests/<namespace>/<job>/…` and `sessions/<namespace>/<job>/…`, with
+`default/` spelled out, and archive files are named by the instance key. The
+session fence prefix moves from `sessions/fence/` to `sessions/_fence/`.
+
+**Alternatives.** (a) Use the canonical id as written:
+`manifests/<job_id>/…`, which is `manifests/web/…` in `default` and
+`manifests/payments/web/…` elsewhere.
+
+**Trade-off.** Every existing archive and store-session manifest moves path,
+and an upgrade does not find the old ones (the upgrade note says to resume
+them first).
+
+**Why (correctness).** With (a), default job `web`'s listing prefix
+`manifests/web/` covers namespace `web`'s jobs (`manifests/web/api/…`), and a
+namespaced job's slot instance id adds a path segment that the parser
+rejected. A namespace named `fence` would likewise put its manifests under
+the fence lister's prefix; `_` is outside the namespace grammar, so no
+namespace can.
+
+---
+
+## 12. Namespace CRUD is a delegable ACL resource, and a cascade delete also needs `job:write`
 
 **Revised** (2026-10-18). The earlier entry argued only "not `operator`".
 The survey added the case for delegation and the escalation it must not
@@ -402,7 +607,7 @@ workloads you can't otherwise touch.
 
 ---
 
-## 8. Deletion refuses while non-empty; `--cascade` is synchronous and its final step is an atomic "delete if empty"; there is no `Terminating` state
+## 13. Deletion refuses while non-empty; `--cascade` is synchronous and its final step is an atomic "delete if empty"; there is no `Terminating` state
 
 **Revised** (2026-10-18). The earlier call is unchanged, with three
 additions:
@@ -453,7 +658,7 @@ success.
 
 ---
 
-## 9. A namespace conflict between the jobspec and the request is a server-side error
+## 14. A namespace conflict between the jobspec and the request is a server-side error
 
 **Revised** (2026-10-18). The earlier version stated this as CLI
 behavior. It is now a server rule, because the vulnerability it prevents was
@@ -492,7 +697,57 @@ every agent.
 
 ---
 
-## 10. No namespace rename and no job move, decided up front; name reuse after deletion is allowed but made visible
+## 15. An empty list selection means `default`, except for the event feed, where it means everything visible
+
+**Implementation call** (2026-10-19).
+
+**Call.** `ListJobs`, `ListServices`, `ListRollouts`, `ListVolumes` and
+`ListSnapshots` with an empty `namespaces` list only `default`; `["*"]` lists
+every namespace the caller can read; naming a job pins its namespace and
+ignores the selection. `ListEvents` and `StreamEvents` treat an empty
+selection as "every event you may see, cluster events included".
+
+**Alternatives.** (a) Empty means every readable namespace everywhere. (b)
+Empty means `default` for events too.
+
+**Trade-off.** Two meanings of "empty" exist. A raw API caller listing
+rollouts or volumes sees only `default` until it asks for more.
+
+**Why (simplicity).** Lists of namespaced objects follow the CLI's rule
+(`legion job list` shows the active namespace), so a script and a person get
+the same answer, and `elsewhere_count` says what was left out. Events are
+different in kind: most are cluster events (nodes, raft, the scheduler) that
+belong to no namespace, so a `default`-only feed would hide what an operator
+tails the feed for.
+
+---
+
+## 16. A crossing upstream is keyed `<service>.<namespace>`, so its env vars and DNS name show the crossing
+
+**Implementation call** (2026-10-19).
+
+**Call.** `{ service = "auth", namespace = "shared" }` (or `service =
+"shared/auth"`) has the key `auth.shared`: `LEGION_UPSTREAM_AUTH_SHARED`,
+`auth.shared.svc.legion`, and the SRV form `_auth._tcp.shared.svc.legion`.
+The node resolver accepts two labels under the zone. An alias (`name`) keeps
+overriding the key. The endpoint feed now carries the upstream key, which also
+fixes aliased service upstreams, whose feed was keyed by the catalog name the
+worker's listener never used.
+
+**Alternatives.** (a) Keep the bare service name as the key, so a crossing
+reads `LEGION_UPSTREAM_AUTH` and `auth.svc.legion`.
+
+**Trade-off.** One task cannot spell the same crossing two ways; the key is
+derived, and the DNS name is two labels where a same-namespace one is one.
+
+**Why (simplicity and safety).** With (a), a task could not hold both its
+own namespace's `auth` and `shared`'s `auth`, and nothing in the task's config
+would say that a name leaves its namespace. The two-label name is the
+crossing made visible where it is used, which is the plan's point (§ 8.7).
+
+---
+
+## 17. No namespace rename and no job move, decided up front; name reuse after deletion is allowed but made visible
 
 **Call.**
 
@@ -534,7 +789,16 @@ what names `payments-old`.
 
 ---
 
-## 11. No migration for pre-namespace data directories: the store refuses to upgrade and says so
+## 18. No migration for pre-namespace data directories: the store refuses to upgrade and says so
+
+**Reversed during implementation** (2026-10-19). There is no refusal and no
+rewrite. Because the canonical id leaves `default` jobs bare (call 1), an
+existing store's job ids, config ids, slot instance ids, volume claim ids and
+seal-key inputs are already the post-namespace values, so the only schema
+change is the `namespace` table with its `default` row. Two things do move,
+and the upgrade notes say so: content-store manifest paths (call 11) and
+how stored ACL rules without `namespaces` are read (call 4). The text
+below is the plan-time reasoning.
 
 **Call.** The schema migration that introduces namespaces refuses to run on
 a store that already holds jobs:
@@ -566,7 +830,34 @@ PR description says so.
 
 ---
 
-## 12. Job templates stay cluster-scoped submit channels; running one lands the job in a target namespace
+## 19. Runtimes, pools and host volumes are checked before the submit, and a policy's default pool is written into the stored config
+
+**Implementation call** (2026-10-19).
+
+**Call.** The static policy rules need only the jobspec, so they run in the
+submit handler before the store write; a task whose permit names no pool gets
+`pool = "<pools.default>"` written into its stored permit. Two governing
+policies with different defaults make such a task unadmittable. A permit
+using another operator for `pool` (`!=`, `matches`) is refused when a policy
+restricts pools. `job scale` out and instance create are quota pre-checks.
+
+**Alternatives.** (a) Evaluate pools at placement (a scheduler constraint
+derived from the policy). (b) Leave the default pool implicit, applied when
+the scheduler reads the permit.
+
+**Trade-off.** A policy change does not rewrite stored configs: a job keeps
+the default pool it was admitted with until resubmitted. A policy applied
+between the static check and the write is not seen by that submit.
+
+**Why (simplicity and performance).** Placement is unchanged (a non-goal of
+the plan), so no scheduler path learns about policies, and the stored spec
+says where a task runs, which `job spec` and `job plan` then show. Refusing
+an unprovable pool rule is the price of checking at admission rather than in
+placement.
+
+---
+
+## 20. Job templates stay cluster-scoped submit channels; running one lands the job in a target namespace
 
 **Reverses the earlier open-question lean.** The earlier plan leaned toward
 namespacing templates in Phase 4, with a special `shared` namespace for
@@ -600,7 +891,7 @@ cluster-scoped ones.
 
 ---
 
-## 13. The UI puts the namespace in detail-route paths and the switcher in the page header, with no legacy redirects
+## 21. The UI puts the namespace in detail-route paths and the switcher in the page header, with no legacy redirects
 
 **Revised** (2026-10-18). The earlier version kept `/jobs/:name` working
 through a redirect. There is no installed base of bookmarks, so it is
@@ -634,7 +925,39 @@ window lost the namespace three separate times (changelog 1.0.4, 1.5.0,
 
 ---
 
-## 14. Single-namespace identities never see tenancy UI at all
+## 22. Errors say where to look without leaking: a not-found names only readable namespaces, a denial names only the caller's reach
+
+**Implementation call** (2026-10-19).
+
+**Call.**
+
+```console
+error: job 'api' not found in namespace 'default'
+hint: a job named 'api' exists in namespace 'payments-prod'; retry with -n payments-prod
+
+error: permission denied: job:write requires a policy granting it in this namespace
+hint: this token can write job in payments-*
+```
+
+The not-found hint lists namespaces holding the name where the caller has
+`job:read`. The denial hint is read off the caller's own allow rules and never
+names the target.
+
+**Alternatives.** (a) The plan's denial text, `permission denied: job:write on
+checkout-prod/web`. (b) No hints.
+
+**Trade-off.** The denial no longer says which object was refused; the
+caller has to know what it asked for.
+
+**Why (security).** Many scopes are derived from a lookup (an instance's or
+rollout's owning job). Naming the target there would tell a caller which job
+owns an instance it cannot read, the existence oracle the "check before you
+fetch" rule exists to prevent. Hints built from what the caller can already
+see cost nothing in secrecy and answer the 3am question.
+
+---
+
+## 23. Single-namespace identities never see tenancy UI at all
 
 **Call.** If `readable_namespaces` has one entry, there is no switcher. The
 namespace appears as a static badge on detail headers and nowhere else.
@@ -658,7 +981,32 @@ identity must be a first-class test fixture, not an afterthought.
 
 ---
 
-## 15. KV stays path-scoped; namespaces do not own a KV subtree
+## 24. `LEGION_NAMESPACE` is a default that never conflicts with a jobspec; `-n` always does
+
+**Implementation call** (2026-10-19).
+
+**Call.** On spec-bearing commands, an explicit `-n` is always sent, so the
+manager refuses a jobspec that names a different namespace.
+`LEGION_NAMESPACE` is sent only when the jobspec names none. For job and
+instance arguments both resolve the same way.
+
+**Alternatives.** (a) Treat the environment variable exactly like `-n`.
+
+**Trade-off.** The env var and the flag behave differently on one class of
+command. Template `render` and `run` are the exception: the CLI cannot see a
+template's rendered spec before the manager does, so it sends
+`$LEGION_NAMESPACE` as the target like `-n`, and a template that names a
+different namespace is refused under an exported env var.
+
+**Why (simplicity).** A shell with `LEGION_NAMESPACE=dev` exported must still
+be able to `legion job run prod-api.ncl` whose spec says `namespace =
+"prod"`; kubectl's context namespace behaves this way. An explicit `-n` is
+the user's statement about this command, and a disagreement with the spec has
+no right winner.
+
+---
+
+## 25. KV stays path-scoped; namespaces do not own a KV subtree
 
 **Revised** (2026-10-18). The call is unchanged, and now has evidence from
 both incumbents.
@@ -694,7 +1042,7 @@ question.
 
 ---
 
-## 16. Qualified references are `namespace/name`, with no new job-name validation
+## 26. Qualified references are `namespace/name`, with no new job-name validation
 
 **Revised** (2026-10-18). The earlier version added job-name validation on
 the write path and grandfathered existing names that contain `/`. Recon
@@ -724,7 +1072,7 @@ fields makes it true for gRPC callers too.
 
 ---
 
-## 17. No persisted CLI namespace context; `-n` exists only on commands that act on namespaced things
+## 27. No persisted CLI namespace context; `-n` exists only on commands that act on namespaced things
 
 **Call.** The active namespace is `-n`, then `LEGION_NAMESPACE`, then
 `default`. There is no `legion namespace use` and no namespace stored in
@@ -756,3 +1104,67 @@ An env var dies with the shell, shows up in `env`, and never quietly follows
 you into a new terminal. (b) is kubectl's `get pv -n x | delete` footgun
 ([kubectl#1413](https://github.com/kubernetes/kubectl/issues/1413)), where a
 flag that looks like a scope is silently ignored.
+
+---
+
+## 28. Namespace metrics are new `legion_namespace_*` families labeled by namespace only; preemptions gain a label
+
+**Implementation call** (2026-10-19). Plan § 8.9 asked for a `namespace`
+label on every workload family.
+
+**Call.** New gauges `legion_namespace_jobs`, `_allocations`,
+`_reserved_cpu_mhz`, `_reserved_memory_bytes` and a `legion_job_submits_total`
+counter, each labeled `{namespace}`; `legion_preemptions_total` gains
+`namespace`. `legion_allocations` stays an unlabeled cluster total. There is
+no `band` label on the reserved gauges.
+
+**Alternatives.** (a) Relabel existing families (`legion_allocations{namespace}`).
+(b) Label the reserved gauges by `{namespace, band}`, matching the quota.
+
+**Trade-off.** Per-band usage is in `legion namespace get`, not in Prometheus;
+families that do not exist (placements) gained no label.
+
+**Why (performance).** Families cap at 256 label combinations. A
+`{namespace, band}` gauge folds into `"other"` past about 40 namespaces; a
+`{namespace}` one lasts to 256. Keeping `legion_allocations` unlabeled keeps
+every existing dashboard correct.
+
+---
+
+## 29. Unnamed sessions are not charged against quota
+
+**Implementation call** (2026-10-19).
+
+**Call.** An unnamed session writes nothing to the replicated store until
+promoted, so it is neither checked at creation nor charged. Named sessions
+and every other instance are.
+
+**Alternatives.** (a) A quota pre-check at session create against live usage.
+
+**Trade-off.** A namespace can exceed its quota with unnamed sessions; the
+public doc says so.
+
+**Why (performance).** The session path is built to start without touching
+the store; a pre-check there would read the cluster's jobs and allocations
+on every session start, and still charge nothing afterwards, so it would
+bound nothing.
+
+---
+
+## 30. Rollout, volume, snapshot and instance replies carry the canonical `job_id`, not separate `namespace` and `job_name` fields
+
+**Implementation call** (2026-10-19). Plan § 11 gave every reply with a
+`job_id` both fields.
+
+**Call.** `Job`, `ServiceSummary`, `ServiceEndpoint`, `SchedulerEvent` and
+`ServiceEdge.target` carry the namespace; the other replies carry only the
+canonical `job_id`.
+
+**Alternatives.** (a) Add `namespace` and `job_name` to every reply.
+
+**Trade-off.** A client splits the id at the first `/` (bare means
+`default`) for those replies.
+
+**Why (simplicity).** The id is already canonical and total to split; the
+fields would be derived data on a dozen messages, each one more place for the
+two to disagree.

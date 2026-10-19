@@ -124,6 +124,47 @@ impl ManagerDaemonService {
         }
     }
 
+    /// A job lookup's error, rewritten when it is NotFound to name the
+    /// namespace that was searched and, when jobs of that name exist in
+    /// other namespaces the caller may read, where they are. Only readable
+    /// namespaces are named, so the hint is no existence oracle.
+    pub(super) fn job_lookup_error(
+        &self,
+        identity: &AclIdentity,
+        job_id: &str,
+        status: Status,
+    ) -> Status {
+        if status.code() != tonic::Code::NotFound {
+            return status;
+        }
+        let namespace = crate::structs::namespace::job_namespace(job_id);
+        let name = job_name(job_id);
+        let mut elsewhere: Vec<String> = self
+            .store
+            .get_jobs()
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|job| job_name(&job.id) == name && job.id != job_id)
+            .filter(|job| {
+                identity.allows(AclResource::Job, AclAction::Read, &AclScope::job(&job.id))
+            })
+            .map(|job| crate::structs::namespace::job_namespace(&job.id).to_string())
+            .collect();
+        elsewhere.sort();
+        let message = format!("job '{name}' not found in namespace '{namespace}'");
+        match elsewhere.as_slice() {
+            [] => Status::not_found(message),
+            [one] => Status::not_found(format!(
+                "{message}\nHint: a job named '{name}' exists in namespace '{one}'; retry with \
+                 -n {one}"
+            )),
+            many => Status::not_found(format!(
+                "{message}\nHint: jobs named '{name}' exist in namespaces {}; pick one with -n",
+                many.join(", ")
+            )),
+        }
+    }
+
     /// The namespaces `identity` holds any allow in, by name (every
     /// namespace for a management identity).
     pub(super) fn readable_namespaces(&self, identity: &AclIdentity) -> Vec<String> {

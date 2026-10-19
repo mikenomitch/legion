@@ -2205,6 +2205,7 @@ impl ManagerDaemonService {
     /// guard, task validation, artifact admission, persistence (with
     /// provenance), status clears, KV-ref bookkeeping, keyed-instance
     /// seeding, and rollout/eval enqueueing.
+    #[allow(clippy::too_many_arguments)]
     fn submit_rendered_job(
         &self,
         identity: &AclIdentity,
@@ -4749,7 +4750,7 @@ impl Manager for ManagerDaemonService {
         &self,
         request: Request<GetJobInfoRequest>,
     ) -> Result<Response<GetJobInfoReply>, Status> {
-        self.check_acl(
+        let identity = self.check_acl(
             &request,
             AclResource::Job,
             AclAction::Read,
@@ -4757,10 +4758,9 @@ impl Manager for ManagerDaemonService {
         )?;
         let name = request.into_inner().name;
 
-        let mut job = self
-            .store
-            .get_job_with_status(&name)
-            .map_err(|e| map_store_error("Error getting job", e))?;
+        let mut job = self.store.get_job_with_status(&name).map_err(|e| {
+            self.job_lookup_error(&identity, &name, map_store_error("Error getting job", e))
+        })?;
         self.store
             .overlay_blocked_jobs(std::slice::from_mut(&mut job))
             .map_err(|e| map_store_error("Error loading blocked evals", e))?;
@@ -5667,7 +5667,7 @@ impl Manager for ManagerDaemonService {
         &self,
         request: Request<GetJobSpecRequest>,
     ) -> Result<Response<GetJobSpecReply>, Status> {
-        self.check_acl(
+        let identity = self.check_acl(
             &request,
             AclResource::Job,
             AclAction::Read,
@@ -5682,7 +5682,11 @@ impl Manager for ManagerDaemonService {
         {
             Some(config) => config,
             None => {
-                return Err(Status::not_found("Job config not found"));
+                return Err(self.job_lookup_error(
+                    &identity,
+                    &name,
+                    Status::not_found("Job config not found"),
+                ));
             }
         };
 
@@ -5981,7 +5985,9 @@ impl Manager for ManagerDaemonService {
         let job_config_id = self
             .store
             .get_job_config(&name)
-            .map_err(|e| map_store_error("Error stopping job", e))?
+            .map_err(|e| {
+                self.job_lookup_error(&identity, &name, map_store_error("Error stopping job", e))
+            })?
             .id();
 
         let _ = self
@@ -6286,10 +6292,9 @@ impl Manager for ManagerDaemonService {
             }));
         }
 
-        let _ = self
-            .store
-            .destroy_job(&name)
-            .map_err(|e| map_store_error("Error deleting job", e))?;
+        let _ = self.store.destroy_job(&name).map_err(|e| {
+            self.job_lookup_error(&identity, &name, map_store_error("Error deleting job", e))
+        })?;
 
         // TODO: Conditionalize
         let message = format!("Destroyed {}", name);
@@ -11439,8 +11444,33 @@ impl Manager for ManagerDaemonService {
             .store
             .upsert_acl_policy(&req.name, &req.description, &req.rules_json)
             .map_err(|e| map_store_error("Error saving ACL policy", e))?;
+        // An exact namespace that does not exist is probably a typo, but may
+        // be one created next: warn, never refuse. Globs never warn.
+        let existing: std::collections::BTreeSet<String> = self
+            .store
+            .list_namespaces()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|record| record.namespace.name)
+            .collect();
+        let warnings = crate::structs::acl::parse_rules(&req.rules_json)
+            .unwrap_or_default()
+            .iter()
+            .enumerate()
+            .flat_map(|(index, rule)| {
+                rule.namespaces
+                    .iter()
+                    .flatten()
+                    .filter(|name| !name.contains('*') && !existing.contains(*name))
+                    .map(move |name| {
+                        format!("rule {index} names namespace '{name}', which does not exist")
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect();
         Ok(Response::new(UpsertAclPolicyReply {
             policy: Some(policy),
+            warnings,
         }))
     }
 
@@ -15332,7 +15362,7 @@ mod tests {
         // The token verifies against the issuer and carries claims derived
         // from the scheduling record — not from anything the caller sent.
         let claims = state.verify(&reply.token, "sts.amazonaws.com")?;
-        assert_eq!(claims["sub"], json!("auto:wi-job:default:api"));
+        assert_eq!(claims["sub"], json!("auto:default:wi-job:default:api"));
         assert_eq!(claims["aud"], json!(["sts.amazonaws.com"]));
         assert_eq!(claims["legion.io/job"], json!("wi-job"));
         assert_eq!(claims["legion.io/task"], json!("api"));

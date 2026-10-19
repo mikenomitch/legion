@@ -149,7 +149,7 @@ pub async fn handle(matches: &ArgMatches) -> R<()> {
 }
 
 fn namespace_json(namespace: &Namespace) -> Value {
-    let counts = namespace.counts.clone().unwrap_or_default();
+    let counts = namespace.counts.unwrap_or_default();
     json!({
         "name": namespace.name,
         "description": namespace.description,
@@ -263,7 +263,7 @@ async fn get(matches: &ArgMatches) -> R<()> {
         output::print_success(&data);
         return Ok(());
     }
-    let counts = namespace.counts.clone().unwrap_or_default();
+    let counts = namespace.counts.unwrap_or_default();
     println!("{}", namespace.name);
     if !namespace.description.is_empty() {
         println!("  {}", namespace.description);

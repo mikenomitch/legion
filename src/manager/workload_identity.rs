@@ -1041,9 +1041,10 @@ impl WorkloadIdentityState {
     /// cluster default or one the operator allows
     /// (`workloadIdentity.allowedSubTemplates`). A job choosing a free-form
     /// template could render another workload's subject: with `job:write`
-    /// on `web` alone, `{region}:{group}:{job}:{task}` for group `api`, job
-    /// `web`, task `server` renders `auto:api:web:server`, the subject of job
-    /// `api`'s group `web`, and AWS trusts nothing but `sub`.
+    /// on `web` alone, `{region}:{namespace}:{group}:{job}:{task}` for group
+    /// `api`, job `web`, task `server` renders `auto:default:api:web:server`,
+    /// the subject of job `api`'s group `web`, and AWS trusts nothing but
+    /// `sub`.
     pub fn check_sub_template(&self, identity: &WorkloadIdentity) -> R<()> {
         let Some(template) = identity.sub_template.as_deref() else {
             return Ok(());

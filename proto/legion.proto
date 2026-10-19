@@ -11317,6 +11317,13 @@ message UpsertAclPolicyRequest {
 message UpsertAclPolicyReply {
   // The stored policy.
   AclPolicy policy = 1;
+
+  // Advisories that did not stop the write, e.g. a rule naming an exact
+  // namespace that does not exist yet (`rule 0 names namespace
+  // 'payments-prdo', which does not exist`). Policies are often written
+  // before the namespaces they name, so this never refuses; globs never
+  // warn.
+  repeated string warnings = 2;
 }
 
 // Request payload for GetAclPolicy.

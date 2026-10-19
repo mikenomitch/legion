@@ -1217,7 +1217,7 @@ snapshots, plus placements and failures of the allocations that ran it (see
 [Event Stream](event-stream.md#events-about-one-instance-or-one-allocation)).
 
 In the UI, every instance id on the job page's Instances table opens the
-instance page (`/jobs/<job>/instances/<id>`). It shows:
+instance page (`/jobs/<namespace>/<job>/instances/<id>`). It shows:
 
 - the state, mode, slot, current allocation and node, storage volume, and
   fork lineage (forked from, and the forks of this instance);

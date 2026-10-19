@@ -4085,40 +4085,48 @@ Plan: [kv-encryption-plan.md](plans/kv-encryption-plan.md) · docs: [kv-encrypti
 
 Plan: [auth-acl-plan.md](plans/auth-acl-plan.md) · docs: [auth-and-acls.md](../docs/auth-and-acls.md)
 
-- [ ] **Namespaces** — [plan](plans/namespaces-plan.md) (PLANNED, revised
-      2026-10-18 against a sourced K8s/Nomad survey) ·
-      [calls](calls/namespaces-plan_calls.md). Today namespaces are vocabulary
-      without values. The `namespaces` ACL selector globs correctly, but every
-      scope is stamped `"default"` (`src/structs/acl.rs:235`), so a policy
-      naming any other namespace silently grants nothing. A `net` rule with
-      `namespaces` matches nothing at all (`src/manager/server.rs:13518`).
-  - [ ] Phase 1 — namespaces are real. Ships as a PR stack:
-    - (a) The object, delegable CRUD over gRPC, CLI and MCP, the `namespace`
-      ACL resource, and the per-item namespace list. Rules over namespaced
-      resources must name `namespaces`
-      ([call 3](calls/namespaces-plan_calls.md)).
-    - (b) The qualified `namespace/name` job id
-      ([call 1](calls/namespaces-plan_calls.md)), per-namespace names and
-      instance ids, `-n`/`LEGION_NAMESPACE`/`-A`, and a server-side
-      spec/request conflict error. `{namespace}` joins the identity-subject
-      floor ([call 5](calls/namespaces-plan_calls.md)). Delete is refused
-      while non-empty, with a synchronous `--cascade`.
-    - (c) The service catalog keyed by namespace, same-namespace `connect`
-      and DNS, and per-item filtering on `ListServices`, `ResolveService` and
-      `ListServiceEdges` ([call 4](calls/namespaces-plan_calls.md)).
-    - (d) Namespace path segments in UI detail routes.
-  - [ ] Phase 2 — cross-namespace upstreams with target-side `allow`, the
-        `<svc>.<ns>.svc.legion` DNS form, tenant-readable events
-        (`list_events`/`stream_events` are `operator:read` all-or-nothing
-        today, `src/manager/server.rs:4666`), `namespace` metric labels,
-        exec keys over qualified ids, and namespaced standalone volumes.
-  - [ ] Phase 3 — UI: header switcher, All-namespaces view, Namespaces page,
-        and no tenancy UI for single-namespace identities.
-  - [ ] Phase 4 — governance as glob-selecting **namespace policies**:
-        aggregate per-band quota, `maxNamespaces`, allowed pools, runtimes
-        and host volumes, all checked at admission
-        ([call 6](calls/namespaces-plan_calls.md)). How usage is counted is
-        open (plan § 15).
+- [ ] **Namespaces, what is left** — [plan](plans/namespaces-plan.md)
+      (SHIPPED) · [calls](calls/namespaces-plan_calls.md) ·
+      [docs](../docs/namespaces.md). The four phases are in Done below. Open:
+  - [ ] **Quota admission scans the cluster.** Each submit into a namespace a
+        policy governs reads every job's current config and every live
+        allocation inside the control-lane write
+        (`src/storage/namespace_policy_store.rs`, `job_charges_on`), linear
+        in cluster size and on a serialized path. Keep per-namespace charge
+        counters (or filter the SQL to the governing globs) and measure with
+        a submit benchmark ([call 7](calls/namespaces-plan_calls.md)).
+  - [ ] **Scale-out and instance-create quota checks are pre-checks**, not
+        inside the write, so two racing scale-outs (or instance creates) can
+        both pass. Move them into the scheduler-lane write that applies the
+        scale or creates the instance ([call 7](calls/namespaces-plan_calls.md)).
+  - [ ] **Unnamed sessions are not charged against quota** and not checked
+        at creation ([call 29](calls/namespaces-plan_calls.md)). Needs a
+        charge that does not touch the store on the session path (the
+        session index's per-node report is the likely source).
+  - [ ] **Tenant-authored net policies.** Writing a net policy needs
+        cluster-wide `net:write`; letting a namespace's tenants write policy
+        for their own namespace needs proving that a selector's namespace
+        globs are covered by the writer's (glob subsumption). Deferred by
+        the plan (§ 8.7).
+  - [ ] **The not-found hint covers four RPCs** (`GetJobInfo`, `GetJobSpec`,
+        `StopJob`, `DestroyJob`; `job_lookup_error` in
+        `src/manager/server/namespace_rpcs.rs`). Extend it to the other
+        job-naming RPCs (scale, rollouts, instances, exec) as they surface a
+        bare NotFound.
+  - [ ] **UI: volume detail routes do not carry the namespace**
+        (`/volumes/:id`; volume ids are already unique), and the service
+        detail header does not show a namespace badge or the detail switcher
+        the job page has. Plan § 10.
+  - [ ] **Rollout, volume, snapshot and instance replies carry no
+        `namespace` / `job_name` fields**; clients split the canonical
+        `job_id` ([call 30](calls/namespaces-plan_calls.md)). Add them if a
+        client needs them.
+  - [ ] **Archive and session manifests written before namespaces are not
+        found** after the upgrade: their paths moved to
+        `manifests/<namespace>/…` and `sessions/<namespace>/…`, and the fence
+        prefix to `sessions/_fence/`
+        ([call 11](calls/namespaces-plan_calls.md)). No installed base needs
+        a reader for the old paths today; add one if that changes.
 - [ ] **Node caches serve private images to jobs without credentials for
       them.** A digest the node already holds is served "with no registry
       request". A tag whose registry lookup fails, auth failures included,
@@ -4974,18 +4982,18 @@ docs: [scheduler-and-eval-loop.md](../docs/scheduler-and-eval-loop.md), [jobs-ta
         rules (not `operator:write`), normalized before enforcement and
         covering the template-render path, with explicit cases in
         `tests/acl_endpoints.rs`. The selector composes with `namespaces`, so
-        per-namespace band caps need no second surface — but they are not
-        *live* until namespaces carry real values
-        ([namespaces-plan.md](plans/namespaces-plan.md)); today the selector
-        delivers band caps scoped by job name and principal only.
-        [docs](../docs/auth-and-acls.md)
+        per-namespace band caps need no second surface; they are live since
+        [namespaces](plans/namespaces-plan.md) shipped (2026-10-19), and a
+        namespace policy's quota caps how *much* of a band a group of
+        namespaces holds. [docs](../docs/auth-and-acls.md)
   - [x] Phase 3 — plan-atomic preemption. [docs](../docs/preemption-and-eviction.md)
   - [x] Phase 4's UI item — preemption history on the job page, the band badge
         on the job header, and the `priority` column in `job list`.
   - [x] At least think through fair-share policies — find the 80/20 rather than
         building a full hierarchical scheduler. The 80/20 is priority bands
-        plus per-namespace band caps via the `bands` ACL selector (the caps go
-        live when [namespaces](plans/namespaces-plan.md) ship);
+        plus per-namespace band caps via the `bands` ACL selector (live since
+        [namespaces](plans/namespaces-plan.md) shipped, with aggregate
+        per-band quota in namespace policies);
         fair-share/hierarchical queues stay an explicit non-goal (Kueue's
         policy-matrix issue history is the argument against).
 - [x] Ledger command — see every node and what's on it from the CLI
@@ -5745,6 +5753,43 @@ docs: [task-runtime-plugins.md](../docs/task-runtime-plugins.md)
 - [x] **`legion keyring provider test` and `legion keyring root-key
       generate` are in the capability catalog** (2026-10-19,
       [cluster-CA calls #14](calls/cluster-ca-provider-plan_calls.md)).
+- [x] **Namespaces** (2026-10-19) — [plan](plans/namespaces-plan.md) ·
+      [calls](calls/namespaces-plan_calls.md) ·
+      [docs](../docs/namespaces.md). Open follow-ups are in *Auth, TLS &
+      security* above.
+  - [x] Phase 1 — namespaces are real. The object with delegable CRUD over
+        gRPC, CLI and MCP (`legion namespace`), the `namespace` ACL resource,
+        the per-item namespace list, and `WhoAmI.readable_namespaces`. Rules
+        over namespaced resources must name `namespaces`; stored rules
+        without them reach `default` only (calls 3, 4). Canonical job ids
+        (`payments-prod/web`, bare in `default`), the jobspec `namespace`
+        field, the server-side spec/request conflict error, `-n` /
+        `LEGION_NAMESPACE` / `-A`, qualified references, and the not-found,
+        empty-list and denied hints (calls 1, 5, 22, 24). Instance keys
+        unique per namespace (call 10). `{namespace}` in the identity
+        subject, its floor and claim (call 8). Delete refused while
+        non-empty, with `--dry-run` and a synchronous `--cascade` (call 13).
+        The service catalog keyed by namespace, same-namespace `connect` and
+        DNS, qualified `allow`, per-item filtering on the service RPCs, and
+        real net-policy selector facts (call 6). UI path-segment routes,
+        `?ns=`, the namespace column and badge, and the ACL mirror caught up
+        (`boot`, `namespace`, `bands`, `host` on `job`).
+  - [x] Phase 2 — cross-namespace upstreams with target-side `allow`, the
+        `<svc>.<ns>.svc.legion` DNS form (call 16), tenant-readable events
+        with per-item filtering, namespace lifecycle events, namespace
+        metrics (call 28), exec-key patterns over qualified ids, and
+        namespaced content-store paths (call 11). Standalone volumes needed
+        no change: every volume row carries its job's id.
+  - [x] Phase 3 — the UI header switcher, the All-namespaces view (the
+        default for a multi-namespace identity), no tenancy UI for
+        single-namespace identities, cluster-scoped tags, the Governance →
+        Namespaces list and namespace page with usage, policies and reaching
+        ACL rules, and a target namespace when launching a template.
+  - [x] Phase 4 — namespace policies (`legion namespace policy`): aggregate
+        per-band quota charged as max(declared, live), `maxJobs`,
+        `maxNamespaces`, allowed and default pools, allowed runtimes and
+        host volumes, checked at admission with a `--dry-run` preview, and
+        usage in `legion namespace get` (calls 7, 9, 19).
 
 ## Exec & actions
 

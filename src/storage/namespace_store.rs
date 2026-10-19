@@ -331,12 +331,56 @@ fn namespace_contents_on(conn: &Connection, name: &str) -> R<NamespaceContents> 
     })
 }
 
+/// Live reservations per `(job id, band)`: allocations not yet `complete` or
+/// `failed`, summed in SQL. An allocation's `resources` is its task's,
+/// normalized at submit (`cpu`, `memory`, defaults applied), so the sums need
+/// no per-row parsing; `cores` may be a count or a list of core ids.
+pub(crate) fn live_reservations_on(
+    conn: &Connection,
+) -> R<BTreeMap<(String, String), Reservation>> {
+    let mut stmt = conn.prepare_cached(&format!(
+        "SELECT tc.job_id, jc.priority, COUNT(*),
+                COALESCE(SUM(CAST(json_extract(a.resources, '$.cpu') AS REAL)), 0),
+                COALESCE(SUM(CAST(json_extract(a.resources, '$.memory') AS REAL)), 0),
+                COALESCE(SUM(CASE json_type(a.resources, '$.cores')
+                    WHEN 'array' THEN json_array_length(a.resources, '$.cores')
+                    WHEN 'integer' THEN json_extract(a.resources, '$.cores')
+                    WHEN 'real' THEN json_extract(a.resources, '$.cores')
+                    ELSE 0 END), 0)
+         FROM allocation a
+         INNER JOIN task_config tc ON tc.id = a.task_config_id
+         INNER JOIN job_config jc ON jc.id = a.job_config_id
+         WHERE a.status NOT IN ('{}', '{}') AND json_valid(a.resources)
+         GROUP BY tc.job_id, jc.priority;",
+        crate::constants::ALLOCATION_STATUS_COMPLETE,
+        crate::constants::ALLOCATION_STATUS_FAILED,
+    ))?;
+    let rows = stmt.query_map([], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            Reservation {
+                allocations: row.get::<_, i64>(2)?.max(0) as u64,
+                cpu: row.get(3)?,
+                memory: row.get(4)?,
+                cores: row.get(5)?,
+            },
+        ))
+    })?;
+    let mut out: BTreeMap<(String, String), Reservation> = BTreeMap::new();
+    for row in rows {
+        let (job, band, reservation) = row?;
+        let band = crate::structs::Band::from_stored(&band)
+            .as_str()
+            .to_string();
+        out.entry((job, band)).or_default().add(&reservation);
+    }
+    Ok(out)
+}
+
 /// Every namespace's usage, keyed by namespace name. A namespace with no
 /// jobs is absent; callers treat absent as zero.
-pub(crate) fn namespace_usage_on(
-    conn: &Connection,
-    policy: &crate::resources::ResourcePolicy,
-) -> R<BTreeMap<String, NamespaceUsage>> {
+pub(crate) fn namespace_usage_on(conn: &Connection) -> R<BTreeMap<String, NamespaceUsage>> {
     use crate::structs::namespace::job_namespace;
     let mut usage: BTreeMap<String, NamespaceUsage> = BTreeMap::new();
     let mut jobs = conn.prepare_cached("SELECT id FROM job;")?;
@@ -346,50 +390,14 @@ pub(crate) fn namespace_usage_on(
             .or_default()
             .jobs += 1;
     }
-    let mut allocations = conn.prepare_cached(&format!(
-        "SELECT tc.job_id, jc.priority, a.resources FROM allocation a
-         INNER JOIN task_config tc ON tc.id = a.task_config_id
-         INNER JOIN job_config jc ON jc.id = a.job_config_id
-         WHERE a.status NOT IN ('{}', '{}');",
-        crate::constants::ALLOCATION_STATUS_COMPLETE,
-        crate::constants::ALLOCATION_STATUS_FAILED,
-    ))?;
-    let rows = allocations.query_map([], |row| {
-        Ok((
-            row.get::<_, String>(0)?,
-            row.get::<_, String>(1)?,
-            row.get::<_, serde_json::Value>(2)?,
-        ))
-    })?;
-    for row in rows {
-        let (job_id, band, resources) = row?;
-        // A row nothing can parse reserves nothing here; the scheduler's
-        // own walk is what warns about it.
-        let Ok(request) = policy
-            .normalize_task_resources(&resources, false)
-            .and_then(|normalized| crate::resources::ResourceRequest::from_value(&normalized))
-        else {
-            continue;
-        };
-        let band = crate::structs::Band::from_stored(&band)
-            .as_str()
-            .to_string();
+    for ((job_id, band), reservation) in live_reservations_on(conn)? {
         usage
             .entry(job_namespace(&job_id).to_string())
             .or_default()
             .bands
             .entry(band)
             .or_default()
-            .add(&Reservation {
-                cpu: request.amount("cpu").unwrap_or(0.0),
-                memory: request.amount("memory").unwrap_or(0.0),
-                cores: match request.values.get("cores") {
-                    Some(crate::resources::ResourceValue::Amount(cores)) => *cores,
-                    Some(crate::resources::ResourceValue::Items(cores)) => cores.len() as f64,
-                    None => 0.0,
-                },
-                allocations: 1,
-            });
+            .add(&reservation);
     }
     Ok(usage)
 }
@@ -400,7 +408,7 @@ impl Store {
     #[instrument(err, skip_all)]
     pub fn namespace_usage(&self) -> R<BTreeMap<String, NamespaceUsage>> {
         let conn = self.read_connection()?;
-        namespace_usage_on(&conn, &self.resource_policy)
+        namespace_usage_on(&conn)
     }
 }
 

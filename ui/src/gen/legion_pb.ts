@@ -27583,6 +27583,17 @@ export class UpsertAclPolicyReply extends Message<UpsertAclPolicyReply> {
    */
   policy?: AclPolicy;
 
+  /**
+   * Advisories that did not stop the write, e.g. a rule naming an exact
+   * namespace that does not exist yet (`rule 0 names namespace
+   * 'payments-prdo', which does not exist`). Policies are often written
+   * before the namespaces they name, so this never refuses; globs never
+   * warn.
+   *
+   * @generated from field: repeated string warnings = 2;
+   */
+  warnings: string[] = [];
+
   constructor(data?: PartialMessage<UpsertAclPolicyReply>) {
     super();
     proto3.util.initPartial(data, this);
@@ -27592,6 +27603,7 @@ export class UpsertAclPolicyReply extends Message<UpsertAclPolicyReply> {
   static readonly typeName = "legion.UpsertAclPolicyReply";
   static readonly fields: FieldList = proto3.util.newFieldList(() => [
     { no: 1, name: "policy", kind: "message", T: AclPolicy },
+    { no: 2, name: "warnings", kind: "scalar", T: 9 /* ScalarType.STRING */, repeated: true },
   ]);
 
   static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): UpsertAclPolicyReply {

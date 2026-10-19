@@ -492,7 +492,12 @@ fn rule_matches(
     {
         return false;
     }
-    selector_matches(&rule.namespaces, &scope.namespace)
+    scope
+        .namespace
+        .as_deref()
+        .map_or(rule.namespaces.is_none(), |namespace| {
+            namespace_selector_matches(rule, namespace)
+        })
         && selector_matches(&rule.names, &scope.name)
         && selector_matches(&rule.pools, &scope.pool)
         && selector_matches(&rule.paths, &scope.path)
@@ -544,7 +549,22 @@ pub fn rule_reaches_namespace(rule: &AclRule, namespace: &str) -> bool {
         .resources
         .iter()
         .any(|resource| resource == "*" || AclResource::namespaced().contains(&resource.as_str()));
-    namespaced && selector_matches(&rule.namespaces, &Some(namespace.to_string()))
+    namespaced && namespace_selector_matches(rule, namespace)
+}
+
+/// Whether a rule's `namespaces` selector matches `namespace`. An allow rule
+/// naming namespaced resources explicitly but no `namespaces` — one stored
+/// before namespaces existed, since validation now refuses to write one —
+/// reaches `default` only: that is what it meant when every job lived there,
+/// and it must not silently widen to every namespace created since. A `*`
+/// resource rule and a deny rule without the selector keep matching every
+/// namespace.
+fn namespace_selector_matches(rule: &AclRule, namespace: &str) -> bool {
+    match &rule.namespaces {
+        Some(patterns) => any_glob_matches(patterns, namespace),
+        None if rule.is_deny() || rule.resources.iter().any(|resource| resource == "*") => true,
+        None => namespace == crate::structs::namespace::DEFAULT_NAMESPACE,
+    }
 }
 
 /// Parses and validates a policy `rules_json` document.
@@ -741,6 +761,23 @@ impl AclIdentity {
             .any(|rule| rule_reaches_namespace(rule, namespace))
     }
 
+    /// The namespace selectors under which this identity's allow rules grant
+    /// `resource:action`, sorted: where it *can* act, for a denial's hint.
+    /// Read off the caller's own rules, so it names nothing the caller could
+    /// not read from its own policy.
+    pub fn namespaces_granting(&self, resource: AclResource, action: AclAction) -> Vec<String> {
+        let mut globs: Vec<String> = self
+            .rules
+            .iter()
+            .filter(|rule| !rule.is_deny() && rule_covers(rule, resource, action))
+            .filter_map(|rule| rule.namespaces.clone())
+            .flatten()
+            .collect();
+        globs.sort();
+        globs.dedup();
+        globs
+    }
+
     /// The identity's effective rules as JSON, for self-introspection
     /// (`WhoAmI.rules_json`). Management tokens (and disabled ACLs) report a
     /// single wildcard allow; identities with no rules report `None`.
@@ -778,6 +815,47 @@ mod acl_rules_test {
         assert!(!glob_match("a*b*c", "a-x-y-c"));
         // The CVE-2025-4922 lesson: exact patterns must not prefix-match.
         assert!(!glob_match("test-job", "test-job-2"));
+    }
+
+    /// A stored rule written before namespaces (no `namespaces`, which
+    /// validation would now refuse) keeps its old meaning, `default` only;
+    /// `*`-resource and deny rules without the selector reach everywhere.
+    #[test]
+    fn legacy_rules_without_namespaces_reach_default_only() {
+        let legacy: Vec<AclRule> = serde_json::from_str(
+            r#"[{"resources": ["job"], "actions": ["write"], "names": ["web*"]}]"#,
+        )
+        .unwrap();
+        let write = |rules: &[AclRule], id: &str| {
+            evaluate(
+                rules,
+                AclResource::Job,
+                AclAction::Write,
+                &AclScope::job(id),
+            )
+        };
+        assert!(write(&legacy, "web"));
+        assert!(
+            !write(&legacy, "payments/web"),
+            "never widens to a new namespace"
+        );
+        assert!(rule_reaches_namespace(&legacy[0], "default"));
+        assert!(!rule_reaches_namespace(&legacy[0], "payments"));
+
+        let everything: Vec<AclRule> =
+            serde_json::from_str(r#"[{"resources": ["*"], "actions": ["*"]}]"#).unwrap();
+        assert!(write(&everything, "payments/web"));
+
+        let mut denied = rules(
+            r#"[{"resources": ["job"], "actions": ["write"], "namespaces": ["*"]},
+                {"resources": ["job"], "actions": ["write"], "effect": "deny", "names": ["web"]}]"#,
+        );
+        assert!(
+            !write(&denied, "payments/web"),
+            "a selector-less deny denies everywhere"
+        );
+        denied.truncate(1);
+        assert!(write(&denied, "payments/web"));
     }
 
     #[test]

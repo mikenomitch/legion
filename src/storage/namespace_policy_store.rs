@@ -16,7 +16,8 @@
 //!   declares nothing. Keyed and per-node (`count.per`) tasks declare
 //!   nothing either: their cardinality is not in the spec.
 //! - *live*: the reservations of the job's allocations not yet `complete` or
-//!   `failed`, the same set the scheduler counts against node capacity.
+//!   `failed`, the same set the scheduler counts against node capacity,
+//!   summed in SQL (`live_reservations_on`).
 //!
 //! Declared demand is what closes the race: a job is charged from the
 //! moment it is admitted, not from the moment it places. Live allocations
@@ -93,7 +94,9 @@ fn count_driven(per: Option<&str>, stateful: Option<&crate::structs::StatefulCon
 }
 
 /// `(job, group, task) -> (override, base count)` for every applied scale.
-fn scale_overrides_on(conn: &Connection) -> R<BTreeMap<(String, String, String), (u32, u32)>> {
+type ScaleOverrides = BTreeMap<(String, String, String), (u32, u32)>;
+
+fn scale_overrides_on(conn: &Connection) -> R<ScaleOverrides> {
     let mut stmt = conn.prepare_cached(
         "SELECT job_id, task_group, task_name, count, base_count FROM task_scale
          WHERE count IS NOT NULL;",
@@ -108,7 +111,7 @@ fn scale_overrides_on(conn: &Connection) -> R<BTreeMap<(String, String, String),
 }
 
 fn effective_count(
-    overrides: &BTreeMap<(String, String, String), (u32, u32)>,
+    overrides: &ScaleOverrides,
     job: &str,
     group: &str,
     task: &str,
@@ -123,7 +126,7 @@ fn effective_count(
 /// The declared half of a config's charge (see the module docs).
 fn declared_for_config(
     config: &JobConfig,
-    overrides: &BTreeMap<(String, String, String), (u32, u32)>,
+    overrides: &ScaleOverrides,
     policy: &crate::resources::ResourcePolicy,
 ) -> BTreeMap<String, Reservation> {
     let band = config.priority.as_str().to_string();
@@ -196,36 +199,14 @@ pub(crate) fn job_charges_on(
                 .add(&each.times(count));
         }
     }
-    let mut live = conn.prepare_cached(&format!(
-        "SELECT tc.job_id, jc.priority, a.resources FROM allocation a
-         INNER JOIN task_config tc ON tc.id = a.task_config_id
-         INNER JOIN job_config jc ON jc.id = a.job_config_id
-         WHERE a.status NOT IN ('{}', '{}');",
-        crate::constants::ALLOCATION_STATUS_COMPLETE,
-        crate::constants::ALLOCATION_STATUS_FAILED,
-    ))?;
-    let rows = live.query_map([], |row| {
-        Ok((
-            row.get::<_, String>(0)?,
-            row.get::<_, String>(1)?,
-            row.get::<_, serde_json::Value>(2)?,
-        ))
-    })?;
-    for row in rows {
-        let (job, band, resources) = row?;
-        if let Some(mut each) = task_reservation(policy, &resources) {
-            each.allocations = 1;
-            let band = crate::structs::Band::from_stored(&band)
-                .as_str()
-                .to_string();
-            charges
-                .entry(job)
-                .or_default()
-                .live
-                .entry(band)
-                .or_default()
-                .add(&each);
-        }
+    for ((job, band), reservation) in crate::storage::namespace_store::live_reservations_on(conn)? {
+        charges
+            .entry(job)
+            .or_default()
+            .live
+            .entry(band)
+            .or_default()
+            .add(&reservation);
     }
     Ok(charges)
 }

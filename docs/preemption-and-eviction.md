@@ -60,7 +60,7 @@ rules. It sits alongside the existing `namespaces` / `names` / `pools` /
 `templates` selectors:
 
 ```json
-{"resources": ["job"], "actions": ["write"], "names": ["prod-*"],
+{"resources": ["job"], "actions": ["write"], "namespaces": ["default"], "names": ["prod-*"],
  "bands": ["critical", "high"]}
 ```
 
@@ -357,7 +357,8 @@ The event links each victim to its preemptor and back. A user who only sees
 
 **Metrics** ([metrics.md](metrics.md)):
 
-- `legion_preemptions_total{pool,band}`: victims evicted, by pool and band.
+- `legion_preemptions_total{pool,band,namespace}`: victims evicted, by pool,
+  band, and the victim's [namespace](namespaces.md).
 - `legion_preemption_plans_total{outcome}`: preemption passes that reached a
   decision. Outcomes are `placed` (victims evicted, preemptor placed),
   `observe` (the pass ran under `observe` mode and committed nothing), or

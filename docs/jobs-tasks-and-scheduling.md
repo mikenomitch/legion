@@ -21,6 +21,12 @@ change how the spec is produced and who is allowed to submit it.
   It also decides what this job may displace when the cluster is full, and
   what may displace it. See
   [preemption-and-eviction.md](preemption-and-eviction.md).
+- `namespace`: the [namespace](namespaces.md) the job lives in. Optional:
+  unset means the request's (`-n`, else `$LEGION_NAMESPACE`), else `default`.
+  `name` may instead be qualified (`payments-prod/web`). The job's id is
+  `namespace/name`, or the bare name in `default`; a [namespace
+  policy](namespaces.md#namespace-policies) may restrict its pools, runtimes,
+  host volumes and quota.
 
 Task names:
 
@@ -28,7 +34,8 @@ Task names:
 - list tasks default to `task-<n>` unless they set `name`
 
 Job, group, and task names may use only `A-Z`, `a-z`, `0-9`, `.`, `_`, and
-`-`, are 1 to 128 characters, and may not start with `.`. A task's name is a
+`-`, are 1 to 128 characters, and may not start with `.`. A job name's one
+`/` separates its namespace, which is a DNS label. A task's name is a
 directory on every worker that runs it (`allocs/<allocation>/<task>/`), so a
 name that is a path, or `.`/`..`, is refused at submit:
 

@@ -108,6 +108,19 @@ const selectorMatches = (selector: string[] | undefined, attr: string | undefine
   return selector.some((pattern) => globMatch(pattern, attr))
 }
 
+/*
+ * Mirrors acl.rs `namespace_selector_matches`: an allow rule naming
+ * namespaced resources explicitly but no `namespaces` (stored before
+ * namespaces existed) reaches `default` only; `*`-resource and deny rules
+ * without the selector match every namespace.
+ */
+const namespaceMatches = (rule: AclRule, namespace: string | undefined): boolean => {
+  if (namespace === undefined) return !rule.namespaces
+  if (rule.namespaces) return rule.namespaces.some((pattern) => globMatch(pattern, namespace))
+  if (rule.effect === 'deny' || rule.resources.includes('*')) return true
+  return namespace === DEFAULT_NAMESPACE
+}
+
 const hasScopeSelectors = (rule: AclRule): boolean =>
   Boolean(
     rule.namespaces ||
@@ -135,7 +148,7 @@ const ruleMatches = (
   // needs a rule that opts into `host`.
   if ((resource === 'exec' || resource === 'job') && scope.host && rule.host !== true) return false
   return (
-    selectorMatches(rule.namespaces, scope.namespace) &&
+    namespaceMatches(rule, scope.namespace) &&
     selectorMatches(rule.names, scope.name) &&
     selectorMatches(rule.pools, scope.pool) &&
     selectorMatches(rule.paths, scope.path) &&

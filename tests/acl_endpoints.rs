@@ -4370,3 +4370,86 @@ async fn namespace_policies_govern_admission_and_show_tenants_their_limits() -> 
         .any(|v| v.job_id == "payments-prod/web" && v.rule == "runtimes"));
     Ok(())
 }
+
+/// The plan's error surfaces: a not-found names where else the caller can
+/// see a job of that name (and only there), a denial names where the token
+/// can act, and an ACL rule naming a namespace that does not exist warns.
+#[tokio::test]
+async fn namespace_errors_say_where_to_look_without_leaking() -> R<()> {
+    let (svc, _, management) = setup_enabled()?;
+    create_namespaces(&svc, &management, &["payments-prod", "secret-team"]).await?;
+    for namespace in ["payments-prod", "secret-team"] {
+        svc.run_job(run_request(
+            &namespaced_jobspec("api", None),
+            Some(namespace),
+            &management,
+        ))
+        .await?;
+    }
+    let (_, team) = token_with_rules(
+        &svc,
+        "payments-team",
+        r#"[{"resources": ["job"], "actions": ["read", "write"], "namespaces": ["payments-*", "default"]}]"#,
+    )?;
+
+    let status = svc
+        .get_job_info(req(GetJobInfoRequest { name: "api".into() }, Some(&team)))
+        .await
+        .expect_err("no api in default");
+    assert_eq!(status.code(), Code::NotFound);
+    assert!(
+        status
+            .message()
+            .contains("not found in namespace 'default'"),
+        "{}",
+        status.message()
+    );
+    assert!(
+        status
+            .message()
+            .contains("exists in namespace 'payments-prod'"),
+        "{}",
+        status.message()
+    );
+    assert!(
+        !status.message().contains("secret-team"),
+        "the hint names only readable namespaces: {}",
+        status.message()
+    );
+
+    let status = svc
+        .stop_job(req(
+            StopJobRequest {
+                name: "secret-team/api".into(),
+                ..Default::default()
+            },
+            Some(&team),
+        ))
+        .await
+        .expect_err("no grant there");
+    assert_eq!(status.code(), Code::PermissionDenied);
+    assert!(
+        status
+            .message()
+            .contains("this token can write job in default, payments-*"),
+        "{}",
+        status.message()
+    );
+
+    let reply = svc
+        .upsert_acl_policy(req(
+            UpsertAclPolicyRequest {
+                name: "typo".into(),
+                description: String::new(),
+                rules_json: r#"[{"resources": ["job"], "actions": ["read"], "namespaces": ["payments-prdo", "payments-*"]}]"#.into(),
+            },
+            Some(&management),
+        ))
+        .await?
+        .into_inner();
+    assert_eq!(
+        reply.warnings,
+        vec!["rule 0 names namespace 'payments-prdo', which does not exist".to_string()]
+    );
+    Ok(())
+}

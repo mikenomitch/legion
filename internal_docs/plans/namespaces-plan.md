@@ -2,12 +2,42 @@
 
 > **Judgement calls:** [`calls/namespaces-plan_calls.md`](../calls/namespaces-plan_calls.md)
 
-**Status: PLANNED.** Nothing here is built. The ACL rule vocabulary already
-has a `namespaces` selector, and the scope struct already has a `namespace`
-field. Both are fed the constant `"default"` (`src/structs/acl.rs:235`), so
-today a namespace is vocabulary with no values. This plan makes namespaces
-real. It also says, with sources, which parts of Kubernetes' and Nomad's
+**Status: SHIPPED** (2026-10-19), all four phases, with the deviations
+below. The public page is [`docs/namespaces.md`](../../docs/namespaces.md);
+this plan stays as the record of why. Before it, the ACL rule vocabulary had
+a `namespaces` selector and the scope struct a `namespace` field, both fed
+the constant `"default"`, so a namespace was vocabulary with no values. The
+plan also says, with sources, which parts of Kubernetes' and Nomad's
 namespaces Legion is **not** copying.
+
+**Where the build differs from this text** (each is a call in the calls doc,
+which wins over the sections below):
+
+- **The canonical id is bare in `default`** (`web`, `payments-prod/web`), and
+  there are no separate `namespace`/`name` columns: the namespace is split
+  off the id (call 1). Consequently there is **no refusal migration**
+  (call 18): existing ids are already correct.
+- **Server job fields take the canonical id**; only spec-bearing requests
+  carry a `namespace` field, and lists take `namespaces` (call 5). Replies
+  other than `Job`, services and events carry no separate `namespace` /
+  `job_name` (call 30).
+- **A stored rule without `namespaces` reaches `default` only**, and `*`
+  resource and deny rules are exempt from the selector requirement (call 4).
+- **Quota charges max(declared, live)** inside the control-lane submit, with
+  no plan-apply re-check (call 7). Scale-out and instance create are
+  pre-checks; unnamed sessions are not charged (call 29).
+- **Content-store paths spell the namespace as a segment**, `default`
+  included, and the fence prefix is `sessions/_fence/` (call 11).
+- **Metrics** are new `legion_namespace_*` families plus a `namespace` label
+  on preemptions, not a label on every family (call 28).
+- **Standalone volumes** need no work: every volume row is created by a job
+  and carries its canonical id; a jobless (legacy) row is visible only under
+  `namespaces = ["*"]`.
+
+Still deferred, beyond the list below: per-namespace keyed instance ids for
+*minted* ids (they stay cluster-unique by randomness, call 10), and the
+`ValidateJob` / volume-create namespace fields (`job validate` checks a spec
+locally; volumes are created only by jobs).
 
 **Revised 2026-10-18.** The first version (2026-09-29) predates two things:
 
@@ -224,13 +254,13 @@ phase.
 | K8 | **Role/ClusterRole × RoleBinding/ClusterRoleBinding confuses people.** Three popular tools exist only to answer "who can do what, where". | [RBAC docs](https://kubernetes.io/docs/reference/access-authn-authz/rbac/); rakkess 1.4k★, rbac-lookup 983★, kubectl-who-can 922★. **Medium.** | One policy kind. A namespace is one selector on a rule (§ 8.5). |
 | K9 | **Rights inside a namespace escalate.** Whoever may create pods gets every service account's powers. Whoever may label their namespace can loosen Pod Security and NetworkPolicy. A service account can delete its own namespace ("I don't see anything to fix"). | [RBAC good practices](https://kubernetes.io/docs/concepts/security/rbac-good-practices/); [#134929](https://github.com/kubernetes/kubernetes/issues/134929); [KEP-2161](https://www.kubernetes.dev/resources/keps/2161/) added an immutable name label because the other labels are untrustworthy. **Strong.** | The namespace object carries nothing policy-bearing. Governance lives in objects a namespace writer cannot edit (§ 8.12). A cascade also needs `job:write` (§ 8.11). |
 | K10 | **Cross-namespace references create confused deputies.** Ingress can't route across namespaces (liggitt: "a prime source of privilege escalation"). Gateway API had to invent ReferenceGrant. | [CVE-2021-25740](https://discuss.kubernetes.io/t/security-advisory-cve-2021-25740-endpoint-endpointslice-permissions-allow-cross-namespace-forwarding/16700); [#17088](https://github.com/kubernetes/kubernetes/issues/17088) (106 👍); [ReferenceGrant](https://gateway-api.sigs.k8s.io/reference/api-types/referencegrant/). **Strong.** | Crossing is explicit at both ends: the consumer names the namespace, and the target's `allow` names the consumer (§ 8.7). |
-| K11 | **Secrets can't be shared across namespaces,** so copy-controllers proliferate. | [#70147](https://github.com/kubernetes/kubernetes/issues/70147) ClusterSecret (211 👍, closed unbuilt); reflector 1.7k★, replicator 1.1k★. **Strong.** | KV stays path-scoped, so sharing a path across namespaces is just a `paths` rule (§ 5, call 15). |
+| K11 | **Secrets can't be shared across namespaces,** so copy-controllers proliferate. | [#70147](https://github.com/kubernetes/kubernetes/issues/70147) ClusterSecret (211 👍, closed unbuilt); reflector 1.7k★, replicator 1.1k★. **Strong.** | KV stays path-scoped, so sharing a path across namespaces is just a `paths` rule (§ 5, call 25). |
 | K12 | **Quota is brittle.** It forces every pod to set requests, LimitRange backfills are non-deterministic, quotas are per namespace only, and the single quota object is a write hot spot. | [Quota docs](https://kubernetes.io/docs/concepts/policy/resource-quotas/); [LimitRange docs](https://kubernetes.io/docs/concepts/policy/limit-range/); [#67761](https://github.com/kubernetes/kubernetes/issues/67761) (409s on the quota object); OpenShift's ClusterResourceQuota, Rancher project limits, Kiosk AccountQuota and HNC HierarchicalResourceQuota all add cross-namespace totals. **Strong.** | Every Legion task already has a reservation (`taskResourceDefaults`, `docs/resource-enforcement.md:119`). Quota is an aggregate over a glob of namespaces, with counters rather than one hot row (§ 8.12). |
 | K13 | **Flat namespaces don't model organizations, and the hierarchy fixes died.** HNC was archived in April 2025. WG Multitenancy was archived in 2023. Kiosk was archived. Capsule and vcluster carry on. | [HNC repo](https://github.com/kubernetes-retired/hierarchical-namespaces); [community#7362](https://github.com/kubernetes/community/pull/7362); [Kiosk](https://github.com/loft-sh/kiosk); [Capsule](https://projectcapsule.dev/docs/overview/): "they have no hierarchy". **Strong.** | Flat names, plus globs and aggregate namespace policies. That is the one grouping level OpenShift, Rancher and Capsule each converged on, without a nesting model (§ 5). |
-| K14 | **Switching namespaces is painful, the current one is invisible, and `default` is a trap.** kubens has 20.0k★ and kube-ps1 3.8k★. In one real incident, an engineer deleted a prod namespace from the wrong context with "no contextual clues". | [kubectx](https://github.com/ahmetb/kubectx); [2i2c incident](https://2i2c.org/incident-reports/2025-08-12-leap-outage); [GKE best practices](https://cloud.google.com/blog/products/containers-kubernetes/kubernetes-best-practices-organizing-with-namespaces). **Strong.** | One env var, no persisted context, and every mutating command prints the qualified id it touched (§ 8.3, call 17). |
+| K14 | **Switching namespaces is painful, the current one is invisible, and `default` is a trap.** kubens has 20.0k★ and kube-ps1 3.8k★. In one real incident, an engineer deleted a prod namespace from the wrong context with "no contextual clues". | [kubectx](https://github.com/ahmetb/kubectx); [2i2c incident](https://2i2c.org/incident-reports/2025-08-12-leap-outage); [GKE best practices](https://cloud.google.com/blog/products/containers-kubernetes/kubernetes-best-practices-organizing-with-namespaces). **Strong.** | One env var, no persisted context, and every mutating command prints the qualified id it touched (§ 8.3, call 27). |
 | K15 | **Errors didn't say which namespace was searched** (until 2024), and you can't query a chosen set of namespaces. | [kubectl#1459](https://github.com/kubernetes/kubectl/issues/1459); [#52326](https://github.com/kubernetes/kubernetes/issues/52326) `-n a,b` (18 👍). **Medium.** | Every not-found names the namespace. List commands take names or globs, comma-separated (§ 8.3). |
 | K16 | **`-n` is silently ignored on cluster-scoped resources:** `get pv -n x \| delete` deletes every PV. | [kubectl#1413](https://github.com/kubernetes/kubectl/issues/1413); [SIG-CLI thread](https://groups.google.com/g/kubernetes-dev/c/y4Q20V3dyOk/m/vNbttyY-BgAJ). **Medium-strong.** | Cluster-scoped commands have no `-n` flag, so clap rejects it (§ 8.3). |
-| K17 | **No rename, no move.** | [#43867](https://github.com/kubernetes/kubernetes/issues/43867) (56 👍): "pretty hard, so I can't see us doing it". **Strong.** | The same, decided up front with the reason written down (call 10). |
+| K17 | **No rename, no move.** | [#43867](https://github.com/kubernetes/kubernetes/issues/43867) (56 👍): "pretty hard, so I can't see us doing it". **Strong.** | The same, decided up front with the reason written down (call 17). |
 | K18 | **Name limits bite in other layers.** Namespace plus pod name over 217 characters fails at the kubelet. A namespace named like a TLD shadows public DNS. | [#104288](https://github.com/kubernetes/kubernetes/issues/104288); [namespaces docs](https://kubernetes.io/docs/concepts/overview/working-with-objects/namespaces/). **Medium.** | Namespace names are DNS labels (≤ 63 characters). Legion's resolver answers only under `svc.legion`, so there is nothing to shadow. A longest-name test covers every path that embeds the qualified id (§ 13). |
 | K19 | **Every namespace needs its own copy of policy objects:** RoleBindings, a default-deny NetworkPolicy, quota, LimitRange, a default ServiceAccount. Tools exist mainly to stamp these out. | [Capsule](https://projectcapsule.dev/docs/overview/); [SIG-Scalability thresholds](https://github.com/kubernetes/community/blob/master/sig-scalability/configs-and-limits/thresholds.md). **Medium.** | A new namespace is one row. Policies are cluster documents that *select* namespaces by glob, so nothing is created per namespace. |
 
@@ -259,23 +289,23 @@ Enterprise. The flag is `-namespace`, the env var is `NOMAD_NAMESPACE`, and
 | N2 | **Objects can be created in a namespace that doesn't exist.** A stray `NOMAD_NAMESPACE` landed Terraform jobs in a "nonexistent namespace". | [#15379](https://github.com/hashicorp/nomad/issues/15379); [terraform-provider-nomad#267](https://github.com/hashicorp/terraform-provider-nomad/issues/267); [Discuss](https://discuss.hashicorp.com/t/job-is-in-nonexistent-namespace-isolation/40165) (634 views). **Strong.** | Writes into a missing namespace are refused in the handler, with the namespace named (§ 8.1). |
 | N3 | **"My jobs are gone."** The CLI defaults to `default`, and a token without `default` access gets a 403 from plain `nomad status`. A request to make `*` the default was declined because of the risk of accidental actions. | [Discuss 43052](https://discuss.hashicorp.com/t/nomad-cli-doesnt-show-running-jobs/43052) (1,248 views); [#11487](https://github.com/hashicorp/nomad/issues/11487). **Strong.** | `default` stays the default. The empty-list and not-found messages name the namespace and count what is hidden elsewhere, but only for namespaces the caller can read (§ 8.3). |
 | N4 | **Wildcard `*` support arrived one command at a time over about six years.** Read-job with `*` still returns 404 by design. | Changelog: 0.12.0 → 2.0.7; [#18831](https://github.com/hashicorp/nomad/issues/18831): `service info` "is missing the logic we do for other 'get' commands"; [#10667](https://github.com/hashicorp/nomad/issues/10667), [#7341](https://github.com/hashicorp/nomad/issues/7341) (open). **Strong.** | One shared resolver for namespace selection, and a test that parses the proto and fails if any list RPC lacks namespace selection (§ 13). |
-| N5 | **Jobspec `namespace` vs `-namespace` vs env var has no stated precedence.** That produced bugs and a CVE: CSI volumes created in unauthorized namespaces by putting the target namespace in the spec. | [`job run` docs](https://developer.hashicorp.com/nomad/commands/job/run); [#24039](https://github.com/hashicorp/nomad/issues/24039); [HCSEC-2024-27 / CVE-2024-10975](https://discuss.hashicorp.com/t/hcsec-2024-27-nomad-vulnerable-to-cross-namespace-volume-creation-abusing-csi-write-permission/71212). **Strong.** | A conflict is an error, enforced **server-side**, and authorization runs against the resolved namespace (§ 8.4, call 9). |
+| N5 | **Jobspec `namespace` vs `-namespace` vs env var has no stated precedence.** That produced bugs and a CVE: CSI volumes created in unauthorized namespaces by putting the target namespace in the spec. | [`job run` docs](https://developer.hashicorp.com/nomad/commands/job/run); [#24039](https://github.com/hashicorp/nomad/issues/24039); [HCSEC-2024-27 / CVE-2024-10975](https://discuss.hashicorp.com/t/hcsec-2024-27-nomad-vulnerable-to-cross-namespace-volume-creation-abusing-csi-write-permission/71212). **Strong.** | A conflict is an error, enforced **server-side**, and authorization runs against the resolved namespace (§ 8.4, call 14). |
 | N6 | **The event stream's wildcard bypassed namespace ACLs** (CVE-2025-0937, 1.0.0 through 1.9.5). Earlier, allocation reads leaked across namespaces (CVE-2019-16742). | [HCSEC-2025-02](https://discuss.hashicorp.com/t/hcsec-2025-02-nomad-vulnerable-to-event-stream-namespace-acl-policy-bypass-through-wildcard-namespace/73191); changelog. **Strong.** | `*` is never a separate authorization path. It widens the candidate set, and every item still passes the per-item filter. There is a test with a one-namespace token (§ 8.9, § 13). |
 | N7 | **The UI kept losing the namespace:** 404 on reload, exec windows (fixed three times), dispatch "Not Found". The all-namespaces default made the UI slow. | [#12022](https://github.com/hashicorp/nomad/issues/12022); [#11970](https://github.com/hashicorp/nomad/issues/11970) ("an unintended side-effect"); [Discuss 29028](https://discuss.hashicorp.com/t/when-executing-parameterized-job-with-namespace-applied-in-ui-not-found/29028); changelog. **Strong** (many issues, few reactions each). | The namespace is a path segment in every detail route, so navigation can't drop it. The All view paginates (§ 10). |
 | N8 | **One-namespace tokens break UI flows:** greyed-out buttons, an empty topology page. | [#23905](https://github.com/hashicorp/nomad/issues/23905); [#24334](https://github.com/hashicorp/nomad/issues/24334). **Strong.** | A one-namespace identity is a first-class UI test fixture (§ 13). |
 | N9 | **ACL glob precedence is "most specific wins", and the docs had it wrong.** Malformed blocks were silently accepted (CVE-2023-3072: an unlabeled block applied to a namespace literally named `policy`). | [ACL policy spec](https://developer.hashicorp.com/nomad/docs/other-specifications/acl-policy); [#20118](https://github.com/hashicorp/nomad/issues/20118); [#17908](https://github.com/hashicorp/nomad/issues/17908). **Strong.** | No precedence: the union of allows, with any matching deny winning (`src/structs/acl.rs:445-470`). Rules already `deny_unknown_fields` (`:119`). A rule that omits or misplaces `namespaces` is rejected (§ 8.5). |
-| N10 | **Only a management token can create namespaces.** | [#14003](https://github.com/hashicorp/nomad/issues/14003) (open, 5 👍); item 2 of [#18803](https://github.com/hashicorp/nomad/issues/18803). **Strong.** | A `namespace` ACL resource, delegable by glob (§ 8.5, call 7). |
+| N10 | **Only a management token can create namespaces.** | [#14003](https://github.com/hashicorp/nomad/issues/14003) (open, 5 👍); item 2 of [#18803](https://github.com/hashicorp/nomad/issues/18803). **Strong.** | A `namespace` ACL resource, delegable by glob (§ 8.5, call 12). |
 | N11 | **Workload-identity policies could only attach per job until 1.10.2.** The implicit policy lets any workload read every service registration ("seeing other teams' jobs can be a security issue"). | [#17181](https://github.com/hashicorp/nomad/issues/17181); [#19803](https://github.com/hashicorp/nomad/issues/19803). **Strong.** | Workload binding rules can match the namespace claim from Phase 1 (§ 8.8). |
 | N12 | **Delete safety was added piecemeal and kept breaking.** Deletion was allowed with CSI volumes present. A delete with variables returned 200 and failed in the FSM. Quota↔namespace cycles broke Terraform teardown. | [#19414](https://github.com/hashicorp/nomad/issues/19414); [#23672](https://github.com/hashicorp/nomad/issues/23672); changelog GH-13880, GH-23499. **Strong.** | One emptiness check over a single list of namespaced kinds, run in the same store write as the delete. Namespace policies select namespaces by glob, so there is no cycle (§ 8.11). |
 | N13 | **Client-side keys and paths lacked the namespace.** Same-id volumes in two namespaces failed to stage; the CSI expand path omitted the namespace. | Changelog GH-20532 (1.8.0), GH-25253 (1.9.8). **Strong.** | The qualified id is the storage key, so every key and path derived from a job id carries the namespace by construction (§ 8.2, call 1). |
-| N14 | **On Consul CE, same-named services from two Nomad namespaces merge into one,** and Enterprise maps namespaces through five levels of precedence. | [Discuss 16712](https://discuss.hashicorp.com/t/nomad-oss-namespace-and-service-discovery/16712): "a single service in consul with 2 instances"; [#14810](https://github.com/hashicorp/nomad/issues/14810). **Strong.** | One namespace concept across every subsystem, with no mapping fields. Services are namespaced in the same phase as jobs (§ 8.7, call 4). |
+| N14 | **On Consul CE, same-named services from two Nomad namespaces merge into one,** and Enterprise maps namespaces through five levels of precedence. | [Discuss 16712](https://discuss.hashicorp.com/t/nomad-oss-namespace-and-service-discovery/16712): "a single service in consul with 2 instances"; [#14810](https://github.com/hashicorp/nomad/issues/14810). **Strong.** | One namespace concept across every subsystem, with no mapping fields. Services are namespaced in the same phase as jobs (§ 8.7, call 6). |
 | N15 | **Cross-namespace service lookup is the most-upvoted namespace ask.** | [#14177](https://github.com/hashicorp/nomad/issues/14177) (open since 2022, 7 👍 9 ❤️): "I can't even begin this migration until template blocks are able to cross-resolve services"; [PR #28534](https://github.com/hashicorp/nomad/pull/28534); [HN](https://news.ycombinator.com/item?id=43817851). **Strong.** | Crossing is designed in from Phase 1 and shipped in Phase 2, explicit at both ends (§ 8.7). |
-| N16 | **Nothing can be shared across namespaces:** "No object in Nomad can be created with a wildcard namespace identifier." | [#28455](https://github.com/hashicorp/nomad/issues/28455) (closed, not planned); [Discuss 57557](https://discuss.hashicorp.com/t/create-global-variables-used-by-all-namespaces/57557). **Strong.** | KV and job templates stay cluster-scoped, so sharing them is the default and is governed by ACL selectors (§ 8.10, calls 12 and 15). |
+| N16 | **Nothing can be shared across namespaces:** "No object in Nomad can be created with a wildcard namespace identifier." | [#28455](https://github.com/hashicorp/nomad/issues/28455) (closed, not planned); [Discuss 57557](https://discuss.hashicorp.com/t/create-global-variables-used-by-all-namespaces/57557). **Strong.** | KV and job templates stay cluster-scoped, so sharing them is the default and is governed by ACL selectors (§ 8.10, calls 20 and 25). |
 | N17 | **There is no namespace topic in the event stream;** users poll. | [#10887](https://github.com/hashicorp/nomad/issues/10887). **Medium.** | Namespace lifecycle events (§ 8.9). |
 | N18 | **The namespace label is inconsistent across metrics,** and chargeback is do-it-yourself. | [#8638](https://github.com/hashicorp/nomad/issues/8638) (open since 2020); [Discuss 59870](https://discuss.hashicorp.com/t/is-there-any-way-to-calculate-the-cost-of-nomad-resources-per-namespace-per-job-etc/59870). **Medium.** | A `namespace` label on every workload family, plus a usage family per namespace (§ 8.9). |
 | N19 | **Node pools (1.6) had to be added because namespaces never controlled placement.** Before them, people abused datacenters. Namespace→pool rules are Enterprise. | [#11041](https://github.com/hashicorp/nomad/issues/11041): "I'm not a fan of (ab)using the datacenter for this purpose"; [1.6 blog](https://www.hashicorp.com/blog/nomad-1-6-adds-node-pools-ux-updates-and-more). **Strong.** | Legion has pools already. Allowed and default pools per namespace are Phase 4, checked at submit. |
 | N20 | **The driver allowlist went on the namespace, not into ACLs**, to avoid a "combinatorial explosion of capabilities". | [#11807](https://github.com/hashicorp/nomad/issues/11807). **Strong.** | Allowed runtimes are a namespace policy, not an ACL selector (§ 8.12). |
-| N21 | **No rename, no move.** | [Discuss 51981](https://discuss.hashicorp.com/t/namespace-renaming/51981) (unanswered). **Weak-moderate.** | The same, with the reason written down (call 10). |
+| N21 | **No rename, no move.** | [Discuss 51981](https://discuss.hashicorp.com/t/namespace-renaming/51981) (unanswered). **Weak-moderate.** | The same, with the reason written down (call 17). |
 | N22 | **IDs are global while names are per namespace.** Eval GET ignores the namespace you pass. | [#12919](https://github.com/hashicorp/nomad/issues/12919); [Discuss 67215](https://discuss.hashicorp.com/t/are-ids-unique-accross-all-namespaces/67215). **Moderate.** | Numeric ids (allocations, rollouts) stay global. Every lookup by id runs the coarse-then-precise check against the owning job's namespace (§ 8.5). |
 
 **Keep:** the name guarantee ("job names will not conflict"). Glob-matched
@@ -427,18 +457,18 @@ federation later. § 8.6 says which, and the public page says it first.
 - **No per-namespace RBAC objects.** No namespaced policies, no
   `Role`/`ClusterRole` split (K8). Policies stay cluster documents that
   *select* namespaces.
-- **No rename, no move** (K17, N21). Call 10 gives the reason.
+- **No rename, no move** (K17, N21). Call 17 gives the reason.
 - **No finalizers, no `Terminating`** (K2). Deletion is refused or done
   synchronously.
-- **No namespaced KV.** KV keeps its `paths` scoping (K11, N16, call 15).
+- **No namespaced KV.** KV keeps its `paths` scoping (K11, N16, call 25).
 - **Not a scheduling input.** Placement is unchanged in every phase. Phase 4
   checks allowed pools and quota at *admission* (Borg), and never in
   placement or scoring.
 - **No per-namespace scheduler isolation** (item 4 of N1). Eval queues stay
   shared, and priority bands govern contention.
-- **No migration of pre-namespace data directories** (call 11).
+- **No migration of pre-namespace data directories** (call 18).
 - **No persisted CLI namespace context.** There is no `namespace use`
-  (call 17).
+  (call 27).
 - **No tenant-authored net policies.** Net policies stay platform objects;
   their namespace selectors start matching real values in Phase 1, and
   delegating authorship is deferred (§ 8.7).
@@ -668,7 +698,7 @@ Rules:
   (§ 8.12, K9). So holding `namespace:write` on your own namespace grants
   exactly the power to describe it, create siblings within your glob, and
   delete it.
-- **No rename** (call 10).
+- **No rename** (call 17).
 - **Lifecycle is observable.** `namespace_created`, `namespace_updated` and
   `namespace_deleted` go on the event stream (N17).
 
@@ -780,7 +810,7 @@ an address you switch namespaces mid-session.
   own namespace, which is Kubernetes' in-cluster behavior, and a workload
   can label its own metrics.
 - **There is no persisted context.** No `legion namespace use`, no
-  `~/.legion/namespace` (call 17). `export LEGION_NAMESPACE=…` is the sticky
+  `~/.legion/namespace` (call 27). `export LEGION_NAMESPACE=…` is the sticky
   form: it lives as long as the shell and shows up in `env`.
 
 Agents get the same thing through MCP: every job tool takes an optional
@@ -828,7 +858,7 @@ reach.
 | --- | --- |
 | `job`, `exec`, `action`, `scale`, `boot`, `snapshot`, `namespace` | `node`, `kv`, `state`, `operator`, `acl`, `template`, `net` |
 
-`template` is cluster-scoped because templates are (call 12): a `template`
+`template` is cluster-scoped because templates are (call 20): a `template`
 rule governs who may write the template *object*. Submitting *through* a
 template is a `job` scope (`job_via_template`), so it is namespaced and
 carries the target namespace. `net` is cluster-scoped because net policies
@@ -893,7 +923,7 @@ This makes delegated creation a one-line rule:
 `{ resources = ["namespace"], actions = ["write"], namespaces = ["payments-*"] }`
 (N10). It is its own resource rather than part of `operator` for the
 reason `scale` and `boot` are: "may create a namespace" must not imply "may
-reconfigure raft" (call 7).
+reconfigure raft" (call 12).
 
 **Seeing namespaces** (K5). `ListNamespaces` returns a namespace when the
 caller holds *any* allow in it: `namespace:read`, or a read or write on any
@@ -1005,7 +1035,7 @@ written for one would accept the other's tokens.
   `subTemplate`, an `allowedSubTemplates` entry, or a per-identity
   `subTemplate` that drops it is rejected at config load or submit, with the
   same message shape as a dropped `{job}`. There is no "pin the old
-  template" escape hatch (call 5). The floor already hard-rejects a dropped
+  template" escape hatch (call 8). The floor already hard-rejects a dropped
   `{job}`, and dropping `{namespace}` is the same forgery.
 - Tokens carry a `legion.io/namespace` claim. Control-plane binding rules
   (`AclBindingRule`, `src/structs/config.rs:1503`) can match on it, so a
@@ -1041,7 +1071,7 @@ written for one would accept the other's tokens.
 | Job versions, rollouts, scale, snapshot aliases, boot/exec/session tickets, KV references, volume claims, seal and chunk keys, content-store manifests | keyed by the bare job id | inherit the namespace through the qualified id (§ 8.2) | 1 |
 | Keyed instances | `instance_id` unique cluster-wide | unique per namespace | 1 |
 | Idempotency records | per caller and operation, fingerprinted | unchanged; the namespace is part of the fingerprinted request, so reusing a key across namespaces is `InvalidInput` | — |
-| Job templates | cluster objects | **stay cluster objects** (call 12). `RunJobTemplate` takes a target namespace, and the collision guard becomes namespace-local, which confines today's oracle to namespaces the caller can submit into | 1 |
+| Job templates | cluster objects | **stay cluster objects** (call 20). `RunJobTemplate` takes a target namespace, and the collision guard becomes namespace-local, which confines today's oracle to namespaces the caller can submit into | 1 |
 | Standalone volumes (no owning job) | cluster-wide; deleting needs cluster-wide `job:write` (`docs/volumes.md:373`) | carry a namespace | 2 |
 | Exec keys | `jobs` glob over bare names, which crosses tenants (`src/manager/exec.rs:424`) | patterns match qualified ids (`payments-*/web`) | 2 |
 | Host volumes | any `job:write` holder can claim any name declared on a node | an allowlist per namespace policy (`hostVolumes`) | 4 |
@@ -1169,7 +1199,7 @@ namespaces by glob, the same shape net policies already have.
   same privilege adds no new escalation path. A namespace writer can't touch
   it. Tenants still see their *effective* limits and usage through
   `legion namespace get`, which needs only `namespace:read`.
-- **Bands stay in ACL rules** (call 6). The `bands` selector answers *who*
+- **Bands stay in ACL rules** (call 9). The `bands` selector answers *who*
   may claim `high`. The quota answers *how much* `high` a group of
   namespaces may hold. These are different questions, and the preemption
   work already rejected a second band vocabulary.
@@ -1248,7 +1278,7 @@ where Nomad's namespace bugs piled up (N7, N8).
   says so.
 - **"All namespaces" is a real selection,** and it paginates (N7: #11970).
   It is the default for an identity that can read more than one namespace.
-- **Single-namespace identities never see tenancy UI** (call 14). If
+- **Single-namespace identities never see tenancy UI** (call 23). If
   `readable_namespaces` has one entry, there is no switcher, just a static
   badge.
 - **Every detail header shows `payments-prod / web`,** with the namespace
@@ -1358,7 +1388,7 @@ CREATE INDEX idx_job_namespace ON job(namespace);
 
 - **The `namespace` table replicates on the control lane** like every other
   control-plane table. There is no new lane and nothing multi-raft-specific.
-- **No data migration** (call 11). The migration refuses to run on a store
+- **No data migration** (call 18). The migration refuses to run on a store
   that already holds jobs, and says what to do:
 
   ```text
@@ -1549,13 +1579,13 @@ everything lives in `default`, and `default` is the active namespace.
 **What breaks, for the PR descriptions:**
 
 1. **Pre-namespace data directories are refused.** Wipe and resubmit
-   (call 11).
+   (call 18).
 2. **Every ACL rule over a namespaced resource must name its namespaces.**
    Existing policies, the docs examples and the test fixtures are all
    rewritten (call 3).
 3. **Workload-identity subjects gain the namespace segment.** IdP trust
    policies that match on `sub` are rewritten, and a template without
-   `{namespace}` is rejected (call 5).
+   `{namespace}` is rejected (call 8).
 4. **Wire shape.** `job_id` fields carry qualified ids. UI detail routes
    change, with no redirects.
 5. **Instance ids are unique per namespace,** no longer cluster-wide.

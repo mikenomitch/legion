@@ -90,8 +90,11 @@ Each event carries:
 - `id`: increasing, but sparse (see
   [cursors](#cursor-based-polling-cli-and-mcp)).
 - `kind` and `level` (`info`/`warn`/`error`).
-- Optional scope IDs: `job_id`, `node_id`, `eval_id`, `allocation_id`,
-  `rollout_id`.
+- Optional scope IDs: `job_id` (canonical: `namespace/name`, bare in
+  `default`), `node_id`, `eval_id`, `allocation_id`, `rollout_id`.
+- `namespace`: the job's [namespace](namespaces.md) for an event about a job;
+  empty for cluster events (nodes, raft, the scheduler). Namespace writes emit
+  `namespace.applied` and `namespace.deleted`.
 - A human-readable `message`.
 - `metadata_json`: a JSON object with kind-specific detail.
 - `created_at`: an RFC3339 timestamp.
@@ -109,6 +112,17 @@ legion events list --kind eval --job demo --level warn --limit 50 --json
 legion events follow
 legion events follow --kind rollout --json   # NDJSON: one envelope per line
 ```
+
+`-n/--namespace` keeps only events about those namespaces' jobs (names or
+globs, comma-separated: `legion events follow -n 'payments-*'`). Without it
+you see every event you may see, cluster events included; `--job` resolves
+in `-n` or `$LEGION_NAMESPACE` like any job argument.
+
+**Who may read events.** `operator:read` sees every event. A caller without
+it but with `job:read` in some namespaces reads those namespaces' events
+through the same list and stream, filtered per item; cluster events need
+`operator:read`. A stream re-checks the caller's grants on its interval, so a
+revoked grant ends it.
 
 `--kind` matches exactly or by category prefix. For example, `--kind eval`
 matches `eval.enqueued`, `eval.completed`, `eval.failed`, `eval.requeued`,
@@ -180,7 +194,7 @@ The **Events** page (Cluster → Events) tails `StreamEvents` over gRPC-Web. It
 reconnects and resumes automatically, and it offers client-side filtering by
 category, level, and text, pause and resume, and expandable per-event metadata.
 
-The instance page (`/jobs/<job>/instances/<id>`) and the allocation page
+The instance page (`/jobs/<namespace>/<job>/instances/<id>`) and the allocation page
 (`/allocations/<id>`) each show a timeline of just their own events, using the
 `instance_id` and `allocation_id` filters. Like the Events page, they need
 `operator:read`. Without it they say so and show the rest of the page.
