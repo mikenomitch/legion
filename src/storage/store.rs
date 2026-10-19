@@ -16718,6 +16718,24 @@ impl Store {
         Ok(instance)
     }
 
+    /// The instance promoted from session `session_id`, if one was. A
+    /// session's id is minted and cluster-unique, so this finds a named
+    /// promotion without knowing the namespace its new key was qualified in.
+    pub fn instance_promoted_from(&self, session_id: &str) -> R<Option<Instance>> {
+        let conn = self.read_connection()?;
+        let instance = conn
+            .query_row(
+                &format!(
+                    "SELECT {} FROM instance WHERE promoted_from = ? LIMIT 1;",
+                    crate::storage::queries::INSTANCE_SELECT_ATTRS
+                ),
+                [session_id],
+                |row| self.instance_from_row(row),
+            )
+            .optional()?;
+        Ok(instance)
+    }
+
     /// Whether an instance row exists (live, stopped, or a tombstone), read
     /// through the write connection. Only meaningful inside an op body,
     /// where it sees rows that this op and its group-commit batch-mates
@@ -17141,7 +17159,15 @@ impl Store {
         requested_id: Option<&str>,
     ) -> R<String> {
         let now = Self::now_rfc3339()?;
-        let instance_id = match requested_id {
+        // A caller's key is qualified by the job's namespace, so keys and
+        // their tombstones are unique per namespace, not cluster-wide.
+        let qualified = requested_id.map(|key| {
+            crate::structs::namespace::qualify_instance_in(
+                crate::structs::namespace::job_namespace(job_id),
+                key,
+            )
+        });
+        let instance_id = match qualified.as_deref() {
             Some(id) => {
                 if Self::instance_id_exists_tx(tx, id)? {
                     bail!(StorageError::Conflict {
@@ -17280,9 +17306,11 @@ impl Store {
     /// RunJob seeding half; see the field docs on
     /// [`crate::structs::StatefulConfig::initial_instances`]).
     ///
-    /// Ids that have never existed are created as `pending` keyed rows; ids
-    /// that already exist in ANY state — live, stopped, or a terminated
-    /// tombstone, even under another job — are skipped silently
+    /// Each id is a key, qualified by the job's namespace
+    /// ([`crate::structs::namespace::instance_id`]). Ids that have never
+    /// existed are created as `pending` keyed rows; ids that already exist in
+    /// ANY state — live, stopped, or a terminated tombstone, even under
+    /// another job of the namespace — are skipped silently
     /// (`INSERT OR IGNORE`), so resubmits are idempotent and a deliberately
     /// destroyed id is never resurrected. Returns the ids actually created
     /// by this call.
@@ -17346,7 +17374,9 @@ impl Store {
         let mut conn = self.write_connection()?;
         let tx = Self::write_tx(&mut conn)?;
         let mut created = Vec::new();
-        for id in ids {
+        let namespace = crate::structs::namespace::job_namespace(job_id);
+        for key in ids {
+            let id = crate::structs::namespace::qualify_instance_in(namespace, key);
             let inserted = tx.execute(
                 "INSERT OR IGNORE INTO instance (instance_id, job_id, group_name, task_name, \
                  mode, state, slot_index, current_alloc_id, storage_handle, created_at, \
@@ -17355,7 +17385,7 @@ impl Store {
                 params![id, job_id, group, task_name, now],
             )?;
             if inserted > 0 {
-                created.push(id.clone());
+                created.push(id);
             }
         }
         tx.commit()?;
@@ -29315,6 +29345,59 @@ mod tests {
         let minted_two = store.create_keyed_instance(job_id, "default", "sandbox", None)?;
         assert_ne!(minted.instance_id, minted_two.instance_id);
         assert!(store.get_instance("user-a")?.context("tombstone")?.named);
+        Ok(())
+    }
+
+    /// Keys are qualified by the job's namespace: the same key in two
+    /// namespaces is two instances, and a tombstone blocks only its own.
+    #[test]
+    fn keyed_instance_ids_are_unique_per_namespace() -> R<()> {
+        let store = setup_store()?;
+        submit_job(&store, "web", vec![stateful_keyed_task("sandbox", true)])?;
+        submit_job(
+            &store,
+            "payments/web",
+            vec![stateful_keyed_task("sandbox", true)],
+        )?;
+
+        let plain = store.create_keyed_instance("web", "default", "sandbox", Some("user-a"))?;
+        assert_eq!(plain.instance_id, "user-a");
+        let qualified =
+            store.create_keyed_instance("payments/web", "default", "sandbox", Some("user-a"))?;
+        assert_eq!(qualified.instance_id, "payments/user-a");
+        assert_eq!(qualified.job_id, "payments/web");
+
+        let err = store
+            .create_keyed_instance("payments/web", "default", "sandbox", Some("user-a"))
+            .expect_err("a key repeats only once per namespace");
+        assert!(matches!(
+            StorageError::from_anyhow(&err),
+            Some(StorageError::Conflict { .. })
+        ));
+        // Already-canonical input is not qualified twice.
+        let err = store
+            .create_keyed_instance(
+                "payments/web",
+                "default",
+                "sandbox",
+                Some("payments/user-a"),
+            )
+            .expect_err("the same instance");
+        assert!(format!("{err:#}").contains("payments/user-a"), "{err:#}");
+
+        // Minted ids stay bare in every namespace.
+        let minted = store.create_keyed_instance("payments/web", "default", "sandbox", None)?;
+        assert!(crate::structs::is_minted_instance_id(&minted.instance_id));
+        assert!(!minted.instance_id.contains('/'));
+
+        // Seeds qualify the same way.
+        let seeded = store.seed_keyed_instances(
+            "payments/web",
+            "default",
+            "sandbox",
+            &["user-b".to_string(), "user-a".to_string()],
+        )?;
+        assert_eq!(seeded, vec!["payments/user-b".to_string()]);
         Ok(())
     }
 

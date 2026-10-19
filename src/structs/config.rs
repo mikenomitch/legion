@@ -3258,7 +3258,7 @@ pub struct WorkerArtifactsPayload {
 #[serde(rename_all = "camelCase")]
 pub struct WorkerSessionsConfig {
     /// How often the node lists its fence prefix in the `contentStore`
-    /// (`sessions/fence/<node>/`) and stops the copies of `store` sessions
+    /// (`sessions/_fence/<node>/`) and stops the copies of `store` sessions
     /// that moved away from it (default `30s`, at least `1s`). One `LIST`
     /// per interval per node.
     #[serde(default, skip_serializing_if = "Option::is_none")]

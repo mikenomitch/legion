@@ -1047,7 +1047,7 @@ Hint: set suspend.durability = "store" so the checkpoint is published to the wor
 
 1. The suspend and the publish run exactly as in [What happens](#what-happens).
 2. Once every part is uploaded, the node writes an **archive manifest** to
-   `<contentStore.url>/manifests/<job>/<group>/<task>/<instance>.json`: the
+   `<contentStore.url>/manifests/<namespace>/<job>/<group>/<task>/<instance>.json`: the
    checkpoint's manifest, plus the instance's identity (its id, job, task,
    when it was created and suspended, the fork it came from, and its identity
    epoch).
@@ -1067,7 +1067,7 @@ as `(archived)`:
 $ legion instance get user-42 -j
 {"ok":true,"data":{"instance":{"instanceId":"user-42","state":"suspended",
  "checkpointId":"snap-5b10e2c7a9d04f31","archived":true,
- "manifestUrl":"s3://legion-content-usw2/manifests/workspaces/main/workspace/user-42.json", ...}}}
+ "manifestUrl":"s3://legion-content-usw2/manifests/default/workspaces/main/workspace/user-42.json", ...}}}
 ```
 
 #### Resuming an archived instance
@@ -1089,7 +1089,7 @@ exactly as for a lost checkpoint: `cold` boots fresh, `fail` leaves the
 instance suspended with the reason in its detail:
 
 ```text
-instance user-42 cannot resume: checkpoint snap-5b10e2c7a9d04f31 is archived and its manifest s3://legion-content-usw2/manifests/workspaces/main/workspace/user-42.json could not be read (the manifest does not exist)
+instance user-42 cannot resume: checkpoint snap-5b10e2c7a9d04f31 is archived and its manifest s3://legion-content-usw2/manifests/default/workspaces/main/workspace/user-42.json could not be read (the manifest does not exist)
 ```
 
 #### Listing archived instances
@@ -1100,7 +1100,7 @@ other. `manifestOnly` instances live only in the bucket, and
 
 ```console
 $ legion instance list workspaces --include-idle --idle-page-size 500 -j
-{"ok":true,"data":{"instances":[...],"nextIdlePageToken":"0:manifests/workspaces/main/workspace/workspace-7k2q..."}}
+{"ok":true,"data":{"instances":[...],"nextIdlePageToken":"0:manifests/default/workspaces/main/workspace/workspace-7k2q..."}}
 $ legion instance list workspaces --include-idle --idle-page-token '0:manifests/...' -j
 ```
 

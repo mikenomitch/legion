@@ -1571,7 +1571,7 @@ async fn dispatch_tool(name: &str, args: Value) -> Result<Value, String> {
                 })
                 .unwrap_or_default();
             let mut client = connect().await?;
-            let instance_id = opt_str_arg(&args, "instance_id").unwrap_or_default();
+            let instance_id = opt_instance_arg(&args, "instance_id")?.unwrap_or_default();
             let allocation_id = match args.get("allocation_id").and_then(Value::as_i64) {
                 Some(id) => id,
                 None if !instance_id.is_empty() => 0,
@@ -1610,7 +1610,7 @@ async fn dispatch_tool(name: &str, args: Value) -> Result<Value, String> {
                         .collect()
                 })
                 .unwrap_or_default();
-            let instance_id = opt_str_arg(&args, "instance_id").unwrap_or_default();
+            let instance_id = opt_instance_arg(&args, "instance_id")?.unwrap_or_default();
             let allocation_id = args
                 .get("allocation_id")
                 .and_then(Value::as_i64)
@@ -1663,7 +1663,7 @@ async fn dispatch_tool(name: &str, args: Value) -> Result<Value, String> {
             .await
         }
         "legion_exec_run" => {
-            let instance_id = opt_str_arg(&args, "instance_id").unwrap_or_default();
+            let instance_id = opt_instance_arg(&args, "instance_id")?.unwrap_or_default();
             let allocation_id = match args.get("allocation_id").and_then(Value::as_i64) {
                 Some(id) => id,
                 None if !instance_id.is_empty() => 0,
@@ -1727,7 +1727,7 @@ async fn dispatch_tool(name: &str, args: Value) -> Result<Value, String> {
             .await
         }
         "legion_instance_get" => {
-            let instance_id = str_arg(&args, "instance_id")?;
+            let instance_id = instance_arg(&args, "instance_id")?;
             let mut client = connect().await?;
             grpc(client.get_instance(GetInstanceRequest { instance_id })).await
         }
@@ -1738,7 +1738,7 @@ async fn dispatch_tool(name: &str, args: Value) -> Result<Value, String> {
                     job_id: opt_job_arg(&args, "job_id")?,
                     node_id: opt_str_arg(&args, "node_id"),
                     driver: opt_str_arg(&args, "driver"),
-                    instance_id: opt_str_arg(&args, "instance_id"),
+                    instance_id: opt_instance_arg(&args, "instance_id")?,
                     state: opt_str_arg(&args, "state"),
                     include_destroyed: args
                         .get("include_destroyed")
@@ -1772,7 +1772,7 @@ async fn dispatch_tool(name: &str, args: Value) -> Result<Value, String> {
             let mut client = connect().await?;
             grpc(client.list_snapshots(crate::structs::ListSnapshotsRequest {
                 job_id: opt_job_arg(&args, "job_id")?,
-                instance_id: opt_str_arg(&args, "instance_id"),
+                instance_id: opt_instance_arg(&args, "instance_id")?,
                 state: opt_str_arg(&args, "state"),
             }))
             .await
@@ -1787,7 +1787,7 @@ async fn dispatch_tool(name: &str, args: Value) -> Result<Value, String> {
             .await
         }
         "legion_snapshot_create" => {
-            let instance_id = str_arg(&args, "instance_id")?;
+            let instance_id = instance_arg(&args, "instance_id")?;
             let mut client = connect().await?;
             grpc(
                 client.create_snapshot(crate::structs::CreateSnapshotRequest {
@@ -1837,7 +1837,7 @@ async fn dispatch_tool(name: &str, args: Value) -> Result<Value, String> {
             .await
         }
         "legion_snapshot_restore" => {
-            let instance_id = str_arg(&args, "instance_id")?;
+            let instance_id = instance_arg(&args, "instance_id")?;
             let snapshot = str_arg(&args, "snapshot")?;
             let mut client = connect().await?;
             grpc(
@@ -1927,7 +1927,7 @@ async fn dispatch_tool(name: &str, args: Value) -> Result<Value, String> {
             .await
         }
         "legion_instance_stop" => {
-            let instance_id = str_arg(&args, "instance_id")?;
+            let instance_id = instance_arg(&args, "instance_id")?;
             let idempotency_key = opt_str_arg(&args, "idempotency_key");
             let mut client = connect().await?;
             grpc(client.stop_instance(StopInstanceRequest {
@@ -1937,7 +1937,7 @@ async fn dispatch_tool(name: &str, args: Value) -> Result<Value, String> {
             .await
         }
         "legion_instance_start" => {
-            let instance_id = str_arg(&args, "instance_id")?;
+            let instance_id = instance_arg(&args, "instance_id")?;
             let idempotency_key = opt_str_arg(&args, "idempotency_key");
             let cold = args
                 .get("cold")
@@ -1957,7 +1957,7 @@ async fn dispatch_tool(name: &str, args: Value) -> Result<Value, String> {
             .await
         }
         "legion_instance_suspend" => {
-            let instance_id = str_arg(&args, "instance_id")?;
+            let instance_id = instance_arg(&args, "instance_id")?;
             let checkpoint = opt_str_arg(&args, "checkpoint");
             let idempotency_key = opt_str_arg(&args, "idempotency_key");
             let mut client = connect().await?;
@@ -1969,7 +1969,7 @@ async fn dispatch_tool(name: &str, args: Value) -> Result<Value, String> {
             .await
         }
         "legion_instance_fork" => {
-            let instance_id = str_arg(&args, "instance_id")?;
+            let instance_id = instance_arg(&args, "instance_id")?;
             let count = args.get("count").and_then(Value::as_u64).unwrap_or(1) as u32;
             let spread = args.get("spread").and_then(Value::as_bool).unwrap_or(false);
             let mut client = connect().await?;
@@ -1996,7 +1996,7 @@ async fn dispatch_tool(name: &str, args: Value) -> Result<Value, String> {
             .await
         }
         "legion_instance_destroy" => {
-            let instance_id = str_arg(&args, "instance_id")?;
+            let instance_id = instance_arg(&args, "instance_id")?;
             let idempotency_key = opt_str_arg(&args, "idempotency_key");
             let mut client = connect().await?;
             grpc(client.destroy_instance(DestroyInstanceRequest {
@@ -2006,7 +2006,7 @@ async fn dispatch_tool(name: &str, args: Value) -> Result<Value, String> {
             .await
         }
         "legion_instance_replace" => {
-            let instance_id = str_arg(&args, "instance_id")?;
+            let instance_id = instance_arg(&args, "instance_id")?;
             let idempotency_key = opt_str_arg(&args, "idempotency_key");
             let mut client = connect().await?;
             grpc(client.replace_instance(ReplaceInstanceRequest {
@@ -2026,7 +2026,7 @@ async fn dispatch_tool(name: &str, args: Value) -> Result<Value, String> {
                 job_id: opt_job_arg(&args, "job_id")?,
                 node_id: opt_str_arg(&args, "node_id"),
                 level: opt_str_arg(&args, "level"),
-                instance_id: opt_str_arg(&args, "instance_id"),
+                instance_id: opt_instance_arg(&args, "instance_id")?,
                 allocation_id: args.get("allocation_id").and_then(Value::as_i64),
                 namespaces: args
                     .get("namespaces")
@@ -2536,6 +2536,29 @@ fn job_arg(args: &Value, key: &str) -> Result<String, String> {
     crate::structs::namespace::resolve_job_ref(&raw, opt_str_arg(args, "namespace").as_deref())
 }
 
+/// An instance argument resolved like a job argument: `user-42` (in
+/// `namespace`, else the namespace of a qualified `job`, else `default`),
+/// `payments/user-42`, or a minted id as written.
+fn instance_arg(args: &Value, key: &str) -> Result<String, String> {
+    let raw = str_arg(args, key)?;
+    let active = opt_str_arg(args, "namespace").or_else(|| {
+        ["job", "job_id"].iter().find_map(|job| {
+            opt_str_arg(args, job).and_then(|job| {
+                job.split_once('/')
+                    .map(|(namespace, _)| namespace.to_string())
+            })
+        })
+    });
+    crate::structs::namespace::resolve_instance_ref(&raw, active.as_deref())
+}
+
+fn opt_instance_arg(args: &Value, key: &str) -> Result<Option<String>, String> {
+    match opt_str_arg(args, key) {
+        Some(_) => instance_arg(args, key).map(Some),
+        None => Ok(None),
+    }
+}
+
 fn opt_job_arg(args: &Value, key: &str) -> Result<Option<String>, String> {
     match opt_str_arg(args, key) {
         Some(raw) => crate::structs::namespace::resolve_job_ref(
@@ -2588,13 +2611,14 @@ fn tool_schema(tool: &ToolDef) -> Value {
     let names_a_job = JOB_NAME_TOOLS.contains(&tool.name)
         || SPEC_NAMESPACE_TOOLS.contains(&tool.name)
         || properties.contains_key("job")
-        || properties.contains_key("job_id");
-    if names_a_job {
+        || properties.contains_key("job_id")
+        || properties.contains_key("instance_id");
+    if names_a_job && !properties.contains_key("namespace") {
         properties.insert(
             "namespace".into(),
             json!({
                 "type": "string",
-                "description": "Namespace the job lives in (default `default`). A job argument may instead be qualified, `namespace/name`; the two must agree."
+                "description": "Namespace the job or instance lives in (default `default`). A job or instance argument may instead be qualified, `namespace/name`; the two must agree. Minted instance ids are cluster-unique and never qualified."
             }),
         );
     }

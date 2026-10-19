@@ -123,7 +123,19 @@ pub fn ratify(
     {
         None
     } else {
-        if let Err(err) = crate::structs::instance::validate_keyed_instance_id(claim.instance_id) {
+        // The id is canonical: its key qualified by the job's namespace.
+        let (namespace, key) = crate::structs::namespace::split_job_id(claim.instance_id);
+        if namespace != crate::structs::namespace::job_namespace(&job_id) {
+            return Ok(Verdict::refuse(
+                RefusalReason::UnknownTarget,
+                format!(
+                    "instance id {:?} names namespace {namespace}, but job {job_id} is in {}",
+                    claim.instance_id,
+                    crate::structs::namespace::job_namespace(&job_id)
+                ),
+            ));
+        }
+        if let Err(err) = crate::structs::instance::validate_keyed_instance_id(key) {
             return Ok(Verdict::refuse(
                 RefusalReason::UnknownTarget,
                 format!("instance id {:?} is invalid: {err}", claim.instance_id),

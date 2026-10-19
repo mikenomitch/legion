@@ -6,7 +6,7 @@
 //! keeps one small JSON document in its node's `contentStore`:
 //!
 //! ```text
-//! <contentStore.url>/sessions/<job>/<id-prefix>/<id>.json
+//! <contentStore.url>/sessions/<namespace>/<job>/<id-prefix>/<id>.json
 //! ```
 //!
 //! The path is derived from the job and the session id alone, so any node
@@ -30,7 +30,7 @@
 //!   was superseded, and ends itself.
 //!
 //! A move also leaves a **fence marker** for the old node at
-//! `<contentStore.url>/sessions/fence/<old node>/<id>`, holding the
+//! `<contentStore.url>/sessions/_fence/<old node>/<id>`, holding the
 //! generation it superseded. Every node lists its own fence prefix every
 //! `sessions.fenceListEvery` and stops any listed session at or below that
 //! generation (mechanism 2).
@@ -57,8 +57,10 @@ pub const MANIFEST_VERSION: u32 = 1;
 /// Every session manifest and fence marker lives under this prefix.
 pub const SESSIONS_PREFIX: &str = "sessions";
 
-/// Fence markers live under `sessions/fence/<node>/`.
-pub const FENCE_SEGMENT: &str = "fence";
+/// Fence markers live under `sessions/_fence/<node>/`. The underscore keeps
+/// the segment out of the namespace grammar, so no namespace's manifests
+/// can land under a fence prefix.
+pub const FENCE_SEGMENT: &str = "_fence";
 
 /// What a session manifest says the session is doing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -141,10 +143,14 @@ pub fn id_prefix(session_id: &str) -> String {
     }
 }
 
-/// The manifest's object name under the content store's root.
+/// The manifest's object name under the content store's root:
+/// `sessions/<namespace>/<job>/<xx>/<id>.json`, the namespace spelled out
+/// (`default` included) so one job's objects never sit under another
+/// namespace's prefix.
 pub fn manifest_object(job_id: &str, session_id: &str) -> String {
+    let (namespace, name) = crate::structs::namespace::split_job_id(job_id);
     format!(
-        "{SESSIONS_PREFIX}/{job_id}/{}/{session_id}.json",
+        "{SESSIONS_PREFIX}/{namespace}/{name}/{}/{session_id}.json",
         id_prefix(session_id)
     )
 }
@@ -1096,13 +1102,18 @@ mod session_manifest_test {
     fn manifests_live_at_a_path_derived_from_the_job_and_id_test() {
         assert_eq!(
             manifest_object("agents", "workspace-q4n7c2rd.7k2qd9x4m1b8c3rj5t0v6wye2h"),
-            "sessions/agents/7k/workspace-q4n7c2rd.7k2qd9x4m1b8c3rj5t0v6wye2h.json"
+            "sessions/default/agents/7k/workspace-q4n7c2rd.7k2qd9x4m1b8c3rj5t0v6wye2h.json"
         );
         assert_eq!(
             manifest_object("agents", "my-task-Q4N7C2RD9X"),
-            "sessions/agents/q4/my-task-Q4N7C2RD9X.json"
+            "sessions/default/agents/q4/my-task-Q4N7C2RD9X.json"
         );
-        assert_eq!(fence_object("w-17", "ws-1"), "sessions/fence/w-17/ws-1");
+        assert_eq!(fence_object("w-17", "ws-1"), "sessions/_fence/w-17/ws-1");
+        assert_eq!(
+            manifest_object("fence/w-17", "my-task-Q4N7C2RD9X"),
+            "sessions/fence/w-17/q4/my-task-Q4N7C2RD9X.json",
+            "a namespace named fence stays clear of the fence markers"
+        );
     }
 
     #[test]
@@ -1313,7 +1324,7 @@ mod session_manifest_test {
         assert_eq!(markers.len(), 1);
         assert_eq!(
             backend.url_for(&manifest_object("agents", "ws-1")),
-            "s3://bucket/prefix/sessions/agents/1/ws-1.json"
+            "s3://bucket/prefix/sessions/default/agents/1/ws-1.json"
         );
         Ok(())
     }

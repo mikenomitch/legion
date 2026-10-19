@@ -434,15 +434,15 @@ mod archive_test {
                 .map(|(name, _)| name.as_str())
                 .collect::<Vec<_>>(),
             vec![
-                "manifests/agents/g/t/t-1.json",
-                "manifests/agents/g/t/t-2.json"
+                "manifests/default/agents/g/t/t-1.json",
+                "manifests/default/agents/g/t/t-2.json"
             ]
         );
         let (rest, more) = list_names(
             &store,
             &root,
             &archive_job_prefix("agents"),
-            "manifests/agents/g/t/t-2.json",
+            "manifests/default/agents/g/t/t-2.json",
             2,
         )
         .await?;

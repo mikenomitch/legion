@@ -209,7 +209,7 @@ async fn list(matches: &ArgMatches) -> R<()> {
         job_id: crate::cmd::helpers::job_arg(matches, "job")?,
         node_id: matches.get_one::<String>("node").cloned(),
         driver: matches.get_one::<String>("driver").cloned(),
-        instance_id: matches.get_one::<String>("instance").cloned(),
+        instance_id: crate::cmd::helpers::instance_arg(matches, "instance")?,
         state: matches.get_one::<String>("state").cloned(),
         include_destroyed: matches.get_flag("all"),
     });

@@ -712,11 +712,24 @@ impl ManagerDaemonService {
         } else {
             new_id
         };
-        if let Some(instance) = self
-            .store
-            .get_instance(promoted_id)
-            .map_err(|e| map_store_error("Error loading instance", e))?
-        {
+        // A new name is qualified by the session's namespace, which is not
+        // known yet; the session's own (minted, cluster-unique) id finds a
+        // named promotion wherever it landed.
+        // A taken name is refused by the promotion itself, in the right
+        // namespace.
+        let existing = if new_id.is_empty() {
+            self.store.get_instance(promoted_id)
+        } else {
+            self.store
+                .instance_promoted_from(&inner.instance_id)
+                .map(|found| {
+                    found.filter(|instance| {
+                        crate::structs::namespace::instance_key(&instance.instance_id) == new_id
+                    })
+                })
+        }
+        .map_err(|e| map_store_error("Error loading instance", e))?;
+        if let Some(instance) = existing {
             acl::enforce(
                 &identity,
                 AclResource::Job,

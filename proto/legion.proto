@@ -3612,9 +3612,12 @@ message CreateInstanceRequest {
 
   // Optional caller-supplied instance key.
   //
-  // Must match `[A-Za-z0-9._-]{1,128}` and must not collide with any
-  // existing instance id of any job — including Terminated tombstones
-  // (destroyed ids are never reusable). Required when the task sets
+  // Must match `[A-Za-z0-9._-]{1,128}`. The stored id is the key qualified
+  // by the job's namespace, exactly as job ids are: `user-42` in `default`,
+  // `payments/user-42` in `payments` (reply `instance_id`). It must not
+  // collide with any existing instance id of the namespace — including
+  // Terminated tombstones (destroyed ids are never reusable); another
+  // namespace's `user-42` is a different instance. Required when the task sets
   // `stateful.requireId: true`. Optional otherwise (the server mints an id
   // when absent). A valid explicit key is always honored.
   optional string instance_id = 4;
@@ -3631,9 +3634,12 @@ message CreateInstanceRequest {
 
 // Reply payload for CreateInstance.
 message CreateInstanceReply {
-  // The created instance's stable id (caller-supplied or server-minted).
-  // This is the value the task sees as `LEGION_INSTANCE_ID` and the key its
-  // storage handle and workload identity bind to.
+  // The created instance's stable, canonical id: the caller's key qualified
+  // by the job's namespace (`payments/user-42`; bare in `default`), or a
+  // server-minted id, which is cluster-unique and never qualified. Every
+  // instance RPC takes this form. This is the value the task sees as
+  // `LEGION_INSTANCE_ID` (the key alone is `LEGION_INSTANCE_KEY`) and the id
+  // its storage handle and workload identity bind to.
   string instance_id = 1;
 
   // True when replayed from a recorded result for the request's
@@ -4540,7 +4546,8 @@ message PromoteInstanceReply {
 
 // Request payload for GetInstance.
 message GetInstanceRequest {
-  // Stable instance id to fetch.
+  // Canonical instance id to fetch (`payments/user-42`, bare in `default`,
+  // or a minted id). Clients resolve `-n` / `LEGION_NAMESPACE` into it.
   string instance_id = 1;
 }
 
@@ -11722,6 +11729,11 @@ message IssueBootTicketRequest {
   //   it is compromised.
   //
   // Both empty is rejected for stateful tasks.
+  //
+  // Either may be written as a key (`user-42`, `user-`): it is qualified in
+  // `job`'s namespace (`payments/user-42`), exactly as instance ids are
+  // (docs/namespaces.md, "Instances"). The ticket carries the canonical
+  // form, and that is the `StartClaimRequest.instance_id` a node accepts.
   string instance_id = 4;
   string instance_prefix = 5;
 

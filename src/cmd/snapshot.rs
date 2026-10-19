@@ -466,10 +466,7 @@ fn print_snapshot(snapshot: &SnapshotInfo) {
 
 async fn create(matches: &ArgMatches) -> R<()> {
     let format = OutputFormat::from_matches(matches);
-    let instance = matches
-        .get_one::<String>("instance")
-        .context("instance id")?
-        .clone();
+    let instance = crate::cmd::helpers::required_instance_arg(matches, "instance")?;
     let kind = if matches.get_flag("memory") {
         "memory"
     } else {
@@ -591,7 +588,7 @@ async fn list(matches: &ArgMatches) -> R<()> {
         client
             .list_snapshots(tonic::Request::new(ListSnapshotsRequest {
                 job_id: crate::cmd::helpers::job_arg(matches, "job")?,
-                instance_id: matches.get_one::<String>("instance").cloned(),
+                instance_id: crate::cmd::helpers::instance_arg(matches, "instance")?,
                 state: matches.get_one::<String>("state").cloned(),
             }))
             .await,
@@ -723,10 +720,7 @@ async fn restore_outcome(
 
 async fn restore(matches: &ArgMatches) -> R<()> {
     let format = OutputFormat::from_matches(matches);
-    let instance_id = matches
-        .get_one::<String>("instance")
-        .context("instance id")?
-        .clone();
+    let instance_id = crate::cmd::helpers::required_instance_arg(matches, "instance")?;
     let mut client = connect_manager_client().await?;
     // The event cursor before the restore, so `--wait` reads this restore's
     // outcome and never an earlier one of the same snapshot.

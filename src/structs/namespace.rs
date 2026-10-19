@@ -163,6 +163,54 @@ pub fn qualify_in(namespace: &str, reference: &str) -> String {
     }
 }
 
+/// The canonical id of an instance a caller names `key` in a job of
+/// `namespace`: qualified exactly like a job id (the key in `default`,
+/// `namespace/key` elsewhere), so caller-chosen keys — and their
+/// never-recycled tombstones — are unique per namespace. A server-minted id
+/// is cluster-unique by construction and stays bare.
+pub fn instance_id(namespace: &str, key: &str) -> String {
+    if crate::structs::is_minted_instance_id(key) {
+        return key.to_string();
+    }
+    job_id(namespace, key)
+}
+
+/// [`instance_id`] for a value that may already be canonical: an id with a
+/// `/` is kept as written, anything else is a key qualified in
+/// `namespace`. For internal paths that hand over either form; a caller's
+/// input goes through [`resolve_instance_ref`] instead.
+pub fn qualify_instance_in(namespace: &str, id: &str) -> String {
+    if id.contains('/') {
+        id.to_string()
+    } else {
+        instance_id(namespace, id)
+    }
+}
+
+/// The key of a canonical instance id: what follows the namespace.
+pub fn instance_key(id: &str) -> &str {
+    job_name(id)
+}
+
+/// Resolves a user-typed instance reference to a canonical instance id, the
+/// way [`resolve_job_ref`] resolves jobs: `namespace/key` as written, a
+/// minted id as written, else the key qualified in `active` (`default` when
+/// `None`).
+pub fn resolve_instance_ref(input: &str, active: Option<&str>) -> Result<String, String> {
+    let input = input.trim();
+    if input.contains('/') {
+        return resolve_job_ref(input, active);
+    }
+    if input.is_empty() {
+        return Err("instance id must not be empty".into());
+    }
+    let namespace = active
+        .filter(|active| !active.is_empty())
+        .unwrap_or(DEFAULT_NAMESPACE);
+    validate_namespace_name(namespace)?;
+    Ok(instance_id(namespace, input))
+}
+
 /// Whether a job pattern matches a canonical job id. A pattern with a `/`
 /// is `namespace-glob/name-glob` (`payments-*/web*`); one without matches
 /// names in `default` only. So `*` never reaches into another namespace,
@@ -293,6 +341,28 @@ impl NamespaceSelection {
 #[cfg(test)]
 mod namespace_test {
     use super::*;
+
+    #[test]
+    fn instance_ids_qualify_keys_but_not_minted_ids() {
+        assert_eq!(instance_id("default", "user-42"), "user-42");
+        assert_eq!(instance_id("payments", "user-42"), "payments/user-42");
+        let minted = crate::structs::mint_instance_id("workspace");
+        assert_eq!(instance_id("payments", &minted), minted);
+        assert_eq!(instance_key("payments/user-42"), "user-42");
+        assert_eq!(
+            resolve_instance_ref("user-42", Some("payments")).unwrap(),
+            "payments/user-42"
+        );
+        assert_eq!(
+            resolve_instance_ref("payments/user-42", None).unwrap(),
+            "payments/user-42"
+        );
+        assert_eq!(
+            resolve_instance_ref(&minted, Some("payments")).unwrap(),
+            minted
+        );
+        assert!(resolve_instance_ref("other/user-42", Some("payments")).is_err());
+    }
 
     #[test]
     fn job_patterns_cross_a_namespace_only_when_they_say_so() {

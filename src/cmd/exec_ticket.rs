@@ -231,7 +231,7 @@ async fn sign_cmd(matches: &ArgMatches) -> R<()> {
             .context("--alloc must be an allocation id")?,
         job: crate::cmd::helpers::job_arg(matches, "job")?.unwrap_or_default(),
         task: arg("task"),
-        instance: matches.get_one::<String>("instance").cloned(),
+        instance: crate::cmd::helpers::instance_arg(matches, "instance")?,
         argv: matches
             .get_many::<String>("command")
             .map(|values| values.cloned().collect()),
@@ -284,10 +284,7 @@ async fn mint_cmd(matches: &ArgMatches) -> R<()> {
             .with_context(|| format!("invalid allocation id `{raw}`"))?,
         None => 0,
     };
-    let instance_id = matches
-        .get_one::<String>("instance")
-        .cloned()
-        .unwrap_or_default();
+    let instance_id = crate::cmd::helpers::instance_arg(matches, "instance")?.unwrap_or_default();
     if allocation_id == 0 && instance_id.is_empty() {
         bail!("name the session's target: an allocation id or --instance <id>");
     }

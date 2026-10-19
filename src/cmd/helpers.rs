@@ -471,15 +471,59 @@ pub fn required_job_arg(matches: &ArgMatches, key: &str) -> R<String> {
     job_arg(matches, key)?.with_context(|| format!("missing required argument {key}"))
 }
 
-/// Attaches `-n/--namespace` to every subcommand that takes a `job`
-/// argument and does not already define `namespace`, so a command that acts
-/// on a job always resolves it in a namespace, and one that does not never
-/// accepts the flag. Where `-n` is already taken (`--count` on `instance
-/// fork`), only `--namespace` is added.
+/// Resolves a typed instance reference (`user-42`, `payments/user-42`, or a
+/// minted id) against the active namespace to the canonical instance id the
+/// API takes (see `crate::structs::namespace::resolve_instance_ref`).
+pub fn instance_ref(matches: &ArgMatches, raw: &str) -> R<String> {
+    let format = crate::cmd::output::OutputFormat::from_matches(matches);
+    // Beside a qualified job (`--job payments/web`), a bare key lives in
+    // that job's namespace.
+    let active = active_namespace(matches).or_else(|| {
+        NAMESPACED_REF_ARGS[..3].iter().find_map(|key| {
+            let job = matches.try_get_one::<String>(key).ok().flatten()?;
+            job.split_once('/')
+                .map(|(namespace, _)| namespace.to_string())
+        })
+    });
+    crate::structs::namespace::resolve_instance_ref(raw, active.as_deref()).map_err(|message| {
+        crate::cmd::output::fail_local(
+            format,
+            crate::cmd::output::CliError::local(
+                "invalid_instance_ref",
+                message,
+                Some("name an instance as `id` or `namespace/id`"),
+            ),
+        )
+    })
+}
+
+/// The instance argument `key` resolved against the active namespace (see
+/// [`instance_ref`]), when it was given.
+pub fn instance_arg(matches: &ArgMatches, key: &str) -> R<Option<String>> {
+    match matches.try_get_one::<String>(key).ok().flatten() {
+        Some(raw) => instance_ref(matches, raw).map(Some),
+        None => Ok(None),
+    }
+}
+
+/// [`instance_arg`] for a required argument.
+pub fn required_instance_arg(matches: &ArgMatches, key: &str) -> R<String> {
+    instance_arg(matches, key)?.with_context(|| format!("missing required argument {key}"))
+}
+
+/// Argument ids that name a job or an instance: a command taking one gets
+/// `-n` from [`with_namespace_flags`].
+const NAMESPACED_REF_ARGS: &[&str] = &["job", "job-id", "job_id", "instance", "instance-id"];
+
+/// Attaches `-n/--namespace` to every subcommand that takes a `job` or
+/// `instance` argument and does not already define `namespace`, so a
+/// command that acts on one always resolves it in a namespace, and one that
+/// does not never accepts the flag. Where `-n` is already taken (`--count`
+/// on `instance fork`), only `--namespace` is added.
 pub fn with_namespace_flags(command: Command) -> Command {
     let takes_job = command
         .get_arguments()
-        .any(|arg| matches!(arg.get_id().as_str(), "job" | "job-id" | "job_id"));
+        .any(|arg| NAMESPACED_REF_ARGS.contains(&arg.get_id().as_str()));
     let has_namespace = command
         .get_arguments()
         .any(|arg| arg.get_id().as_str() == "namespace");

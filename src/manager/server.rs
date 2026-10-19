@@ -11836,6 +11836,19 @@ impl Manager for ManagerDaemonService {
         let ttl = humantime::parse_duration(&ttl)
             .map_err(|e| Status::invalid_argument(format!("invalid ttl `{ttl}`: {e}")))?;
 
+        // The ticket's instance (or prefix) may be a key: qualified in the
+        // job's namespace, its claim is the canonical id a node compares a
+        // StartClaim against.
+        let mut req = req;
+        let namespace = crate::structs::namespace::job_namespace(&req.job).to_string();
+        if !req.instance_id.trim().is_empty() {
+            req.instance_id =
+                crate::structs::namespace::qualify_instance_in(&namespace, req.instance_id.trim());
+        }
+        if !req.instance_prefix.trim().is_empty() && !req.instance_prefix.contains('/') {
+            req.instance_prefix =
+                crate::structs::namespace::job_id(&namespace, req.instance_prefix.trim());
+        }
         let minted = match req.scope.trim() {
             "" | "boot" => {
                 self.mint_boot_ticket(state, &identity, &req, &job_config_id, &task, ttl)?

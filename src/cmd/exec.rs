@@ -139,10 +139,7 @@ pub async fn handle(matches: &ArgMatches) -> R<()> {
 
     let mut client = connect_manager_client().await?;
 
-    let instance_id = matches
-        .get_one::<String>("instance")
-        .cloned()
-        .unwrap_or_default();
+    let instance_id = crate::cmd::helpers::instance_arg(matches, "instance")?.unwrap_or_default();
     let allocation_id = if instance_id.is_empty() {
         resolve_allocation(&mut client, matches, format).await?
     } else {

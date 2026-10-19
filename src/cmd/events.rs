@@ -110,7 +110,7 @@ async fn list_events(matches: &ArgMatches) -> R<()> {
             .collect(),
         node_id: opt_string(matches, "node"),
         level: opt_string(matches, "level"),
-        instance_id: opt_string(matches, "instance"),
+        instance_id: crate::cmd::helpers::instance_arg(matches, "instance")?,
         allocation_id: matches.get_one::<i64>("allocation").copied(),
     };
 
@@ -158,7 +158,7 @@ async fn follow_events(matches: &ArgMatches) -> R<()> {
             .collect(),
         node_id: opt_string(matches, "node"),
         level: opt_string(matches, "level"),
-        instance_id: opt_string(matches, "instance"),
+        instance_id: crate::cmd::helpers::instance_arg(matches, "instance")?,
         allocation_id: matches.get_one::<i64>("allocation").copied(),
     };
 
