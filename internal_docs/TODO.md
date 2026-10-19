@@ -2107,7 +2107,19 @@ Plans: [task-runtime-plugins](../docs/task-runtime-plugins.md).
       `sd_notify`-compatible readiness socket, `WatchdogSec`-style pings, and
       socket activation via pre-bound fds
       ([plan §8 phase 4](plans/host-process-supervision-plan.md))
-- [ ] A **WASM** runtime
+- [ ] A **WASM** runtime: run a WASI command module (`wasm32-wasip1`) as a
+      task. The embedding layer it needs is shared with the network plugins
+      and ready in [`src/wasm/`](../src/wasm/mod.rs): the engine, a memory cap
+      that names a refusal, failure descriptions, guest-memory helpers, a
+      WASI preview1 shim with real `args`/`environ` and pluggable
+      stdout/stderr (`WasiHost`), and module fetching by URL and checksum
+      through the artifact stager. Still to decide and build, in a plan:
+      the task surface (`runtime = "wasm"`, `config.module`), a CPU budget
+      for a whole run in place of a plugin's per-callback fuel, preopened
+      directories (the shim has no filesystem), networking (none, or the
+      gated datapath's proxy over a host function), and whether an
+      interpreter is fast enough for tasks or a task wants wasmtime beside
+      the plugin's wasmi.
 - [ ] A **`converge`** runtime — idempotent host resources (package, file,
       template, directory, user, service, mount) with per-resource
       `unchanged | changed | failed` reporting, i.e. the Chef-replacement shape —

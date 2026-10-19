@@ -575,7 +575,7 @@ mod netplugin_test {
                 .unwrap_or_else(|err| panic!("{}: {err}", path.display()));
             let module = root.join(format!("tests/netplugins/{}.wasm", object.name));
             if let Ok(bytes) = std::fs::read(&module) {
-                crate::worker::netd::plugins::verify_checksum(&bytes, &object.module.checksum)
+                crate::wasm::module::verify_checksum(&bytes, &object.module.checksum)
                     .unwrap_or_else(|err| panic!("{}: {err}", path.display()));
             }
             seen += 1;

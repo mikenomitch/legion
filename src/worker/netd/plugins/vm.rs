@@ -14,25 +14,17 @@
 
 use super::abi::{self, buffer, map, status, stream, Pairs};
 use crate::prelude::*;
+use crate::wasm::memory::{read, read_string, write, write_u32};
+use crate::wasm::wasi::{Output, WasiHost};
+use crate::wasm::{describe_failure, engine, MemoryCap};
 
 use std::collections::BTreeMap;
 use std::collections::HashSet;
-use std::sync::OnceLock;
 use std::time::{Duration, Instant};
-use wasmi::{Caller, Engine, Extern, Linker, Module, Store, TrapCode, Val, ValType};
+use wasmi::{Caller, Extern, Linker, Module, Store, Val, ValType};
 
 /// The root context's id; stream contexts count up from 2.
 pub const ROOT_CONTEXT: u32 = 1;
-
-/// The node's one engine: fuel metering on, everything else wasmi's default.
-pub fn engine() -> &'static Engine {
-    static ENGINE: OnceLock<Engine> = OnceLock::new();
-    ENGINE.get_or_init(|| {
-        let mut config = wasmi::Config::default();
-        config.consume_fuel(true);
-        Engine::new(&config)
-    })
-}
 
 /// The proxy-wasm ABI version a module exports.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -273,49 +265,6 @@ impl std::fmt::Debug for Scope {
     }
 }
 
-/// Memory cap for one instance. It remembers that it refused, so the trap
-/// that follows (the module's allocator gives up) reads as the limit it is.
-struct MemoryCap {
-    max: usize,
-    refused: bool,
-}
-
-impl wasmi::ResourceLimiter for MemoryCap {
-    fn memory_growing(
-        &mut self,
-        _current: usize,
-        desired: usize,
-        _maximum: Option<usize>,
-    ) -> Result<bool, wasmi_core::LimiterError> {
-        if desired > self.max {
-            self.refused = true;
-            return Ok(false);
-        }
-        Ok(true)
-    }
-
-    fn table_growing(
-        &mut self,
-        _current: usize,
-        desired: usize,
-        _maximum: Option<usize>,
-    ) -> Result<bool, wasmi_core::LimiterError> {
-        Ok(desired <= 100_000)
-    }
-
-    fn instances(&self) -> usize {
-        1
-    }
-
-    fn tables(&self) -> usize {
-        4
-    }
-
-    fn memories(&self) -> usize {
-        1
-    }
-}
-
 /// The store's data: the scope, the context the current callback is for,
 /// and the instance's bookkeeping.
 pub struct HostState {
@@ -323,6 +272,23 @@ pub struct HostState {
     pub scope: Arc<Scope>,
     pub ctx: Option<ContextState>,
     next_token: u32,
+}
+
+impl WasiHost for HostState {
+    /// Standard output and error go to the plugin log, attributed to the
+    /// context whose callback wrote them.
+    fn wasi_output(&self, stream: Output, bytes: &[u8]) {
+        let message = String::from_utf8_lossy(bytes).trim_end().to_string();
+        if message.is_empty() {
+            return;
+        }
+        let line = LogLine {
+            level: if stream == Output::Stderr { 3 } else { 2 },
+            message,
+            context: self.ctx.as_ref().map(|c| c.id).unwrap_or(ROOT_CONTEXT),
+        };
+        (self.scope.log)(&self.scope, &line);
+    }
 }
 
 /// How one callback went.
@@ -377,10 +343,7 @@ impl Vm {
         let mut store = Store::new(
             engine(),
             HostState {
-                cap: MemoryCap {
-                    max: scope.memory_bytes,
-                    refused: false,
-                },
+                cap: MemoryCap::new(scope.memory_bytes),
                 scope: scope.clone(),
                 ctx: None,
                 next_token: 1,
@@ -601,7 +564,7 @@ impl Vm {
                 if metered && elapsed > deadline {
                     Err(format!(
                         "exceeded its {} deadline ({} µs)",
-                        humanize(deadline),
+                        crate::wasm::humanize(deadline),
                         elapsed.as_micros()
                     ))
                 } else {
@@ -613,21 +576,12 @@ impl Vm {
                 }
             }
             Err(err) => {
-                let message = if self.store.data().cap.refused {
-                    format!(
-                        "exceeded its memory limit ({} bytes)",
-                        self.store.data().scope.memory_bytes
-                    )
-                } else if err.as_trap_code() == Some(TrapCode::OutOfFuel) {
-                    format!(
-                        "exceeded its {} deadline (ran out of fuel)",
-                        humanize(self.store.data().scope.deadline)
-                    )
-                } else if let Some(code) = err.i32_exit_status() {
-                    format!("exited (proc_exit {code})")
-                } else {
-                    format!("trapped in {name}: {err}")
-                };
+                let message = describe_failure(
+                    &err,
+                    &self.store.data().cap,
+                    self.store.data().scope.deadline,
+                    name,
+                );
                 self.broken = Some(message.clone());
                 Err(message)
             }
@@ -644,52 +598,7 @@ impl Vm {
     }
 }
 
-fn humanize(duration: Duration) -> String {
-    if duration.as_millis() >= 1000 && duration.as_millis().is_multiple_of(1000) {
-        format!("{}s", duration.as_secs())
-    } else if duration.as_micros().is_multiple_of(1000) {
-        format!("{}ms", duration.as_millis())
-    } else {
-        format!("{}µs", duration.as_micros())
-    }
-}
-
 type HostCaller<'a> = Caller<'a, HostState>;
-
-fn memory(caller: &HostCaller<'_>) -> Result<wasmi::Memory, wasmi::Error> {
-    caller
-        .get_export("memory")
-        .and_then(Extern::into_memory)
-        .ok_or_else(|| wasmi::Error::new("the module exports no memory"))
-}
-
-fn read(caller: &HostCaller<'_>, ptr: i32, len: i32) -> Result<Vec<u8>, wasmi::Error> {
-    let (ptr, len) = (ptr as u32 as usize, len as u32 as usize);
-    let memory = memory(caller)?;
-    if ptr.saturating_add(len) > memory.data_size(caller) {
-        return Err(wasmi::Error::new("read outside the module's memory"));
-    }
-    let mut out = vec![0u8; len];
-    memory
-        .read(caller, ptr, &mut out)
-        .map_err(|_| wasmi::Error::new("read outside the module's memory"))?;
-    Ok(out)
-}
-
-fn read_string(caller: &HostCaller<'_>, ptr: i32, len: i32) -> Result<String, wasmi::Error> {
-    Ok(String::from_utf8_lossy(&read(caller, ptr, len)?).into_owned())
-}
-
-fn write(caller: &mut HostCaller<'_>, ptr: i32, data: &[u8]) -> Result<(), wasmi::Error> {
-    let memory = memory(caller)?;
-    memory
-        .write(caller, ptr as u32 as usize, data)
-        .map_err(|_| wasmi::Error::new("write outside the module's memory"))
-}
-
-fn write_u32(caller: &mut HostCaller<'_>, ptr: i32, value: u32) -> Result<(), wasmi::Error> {
-    write(caller, ptr, &value.to_le_bytes())
-}
 
 /// Copy `data` into memory the module allocates, and write the pointer and
 /// length to the return slots. Empty data returns a null pointer, which the
@@ -810,15 +719,6 @@ fn host_linker(module: &Module) -> Result<Linker<HostState>, String> {
             defined.insert(("env".to_string(), $name.to_string()));
         }};
     }
-    macro_rules! wasi {
-        ($name:literal, $func:expr) => {{
-            linker
-                .func_wrap("wasi_snapshot_preview1", $name, $func)
-                .map_err(|err| err.to_string())?;
-            defined.insert(("wasi_snapshot_preview1".to_string(), $name.to_string()));
-        }};
-    }
-
     env!("proxy_log", |caller: HostCaller<'_>,
                        level: i32,
                        ptr: i32,
@@ -1329,133 +1229,20 @@ fn host_linker(module: &Module) -> Result<Linker<HostState>, String> {
 
     // WASI, as much as a Rust or TinyGo module's runtime touches: no
     // filesystem, no environment, no arguments. Standard output and error go
-    // to the plugin log.
-    wasi!("fd_write", |mut caller: HostCaller<'_>,
-                       fd: i32,
-                       iovs: i32,
-                       count: i32,
-                       written_ptr: i32|
-     -> Result<i32, wasmi::Error> {
-        if fd != 1 && fd != 2 {
-            return Ok(8);
-        }
-        let mut text = Vec::new();
-        for i in 0..count.max(0) {
-            let iov = read(&caller, iovs + i * 8, 8)?;
-            let ptr = u32::from_le_bytes(iov[0..4].try_into().unwrap()) as i32;
-            let len = u32::from_le_bytes(iov[4..8].try_into().unwrap()) as i32;
-            text.extend(read(&caller, ptr, len)?);
-        }
-        write_u32(&mut caller, written_ptr, text.len() as u32)?;
-        let message = String::from_utf8_lossy(&text).trim_end().to_string();
-        if !message.is_empty() {
-            let state = caller.data();
-            let line = LogLine {
-                level: if fd == 2 { 3 } else { 2 },
-                message,
-                context: state.ctx.as_ref().map(|c| c.id).unwrap_or(ROOT_CONTEXT),
-            };
-            (state.scope.log)(&state.scope, &line);
-        }
-        Ok(0)
-    });
-    wasi!("environ_sizes_get", |mut caller: HostCaller<'_>,
-                                count_ptr: i32,
-                                size_ptr: i32|
-     -> Result<i32, wasmi::Error> {
-        write_u32(&mut caller, count_ptr, 0)?;
-        write_u32(&mut caller, size_ptr, 0)?;
-        Ok(0)
-    });
-    wasi!("environ_get", |_caller: HostCaller<'_>,
-                          _a: i32,
-                          _b: i32|
-     -> i32 { 0 });
-    wasi!("args_sizes_get", |mut caller: HostCaller<'_>,
-                             count_ptr: i32,
-                             size_ptr: i32|
-     -> Result<i32, wasmi::Error> {
-        write_u32(&mut caller, count_ptr, 0)?;
-        write_u32(&mut caller, size_ptr, 0)?;
-        Ok(0)
-    });
-    wasi!("args_get", |_caller: HostCaller<'_>,
-                       _a: i32,
-                       _b: i32|
-     -> i32 { 0 });
-    wasi!("clock_time_get", |mut caller: HostCaller<'_>,
-                             id: i32,
-                             _precision: i64,
-                             ptr: i32|
-     -> Result<i32, wasmi::Error> {
-        let now = if id == 0 {
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_nanos() as u64)
-                .unwrap_or_default()
-        } else {
-            monotonic_nanos()
-        };
-        write(&mut caller, ptr, &now.to_le_bytes())?;
-        Ok(0)
-    });
-    wasi!("random_get", |mut caller: HostCaller<'_>,
-                         ptr: i32,
-                         len: i32|
-     -> Result<i32, wasmi::Error> {
-        let mut bytes = vec![0u8; len.clamp(0, 65_536) as usize];
-        ring::rand::SecureRandom::fill(&ring::rand::SystemRandom::new(), &mut bytes)
-            .map_err(|_| wasmi::Error::new("no randomness"))?;
-        write(&mut caller, ptr, &bytes)?;
-        Ok(0)
-    });
-    wasi!("proc_exit", |_caller: HostCaller<'_>,
-                        code: i32|
-     -> Result<(), wasmi::Error> {
-        Err(wasmi::Error::i32_exit(code))
-    });
-    wasi!("sched_yield", |_caller: HostCaller<'_>| -> i32 { 0 });
-
+    // to the plugin log (`WasiHost for HostState`).
+    crate::wasm::wasi::link(&mut linker, &mut defined)?;
     // Everything else the module imports: a stub that answers
     // `Unimplemented` (env) or `ENOSYS` (WASI), and traps for any other
     // module, so an unused import never stops a module from loading.
-    for import in module.imports() {
-        let key = (import.module().to_string(), import.name().to_string());
-        if defined.contains(&key) {
-            continue;
-        }
-        let wasmi::ExternType::Func(ty) = import.ty() else {
-            return Err(format!(
-                "the module imports {}.{}, which is not a function; a plugin may import only \
-                 functions",
-                key.0, key.1
-            ));
-        };
-        let ty = ty.clone();
-        let answer = match key.0.as_str() {
-            "env" => Some(status::UNIMPLEMENTED as i64),
-            "wasi_snapshot_preview1" => Some(52),
-            _ => None,
-        };
-        let label = format!("{}.{}", key.0, key.1);
-        linker
-            .func_new(&key.0, &key.1, ty, move |_caller, _params, results| {
-                let Some(answer) = answer else {
-                    return Err(wasmi::Error::new(format!(
-                        "called {label}, which this host does not provide"
-                    )));
-                };
-                for result in results.iter_mut() {
-                    *result = match result {
-                        Val::I64(_) => Val::I64(answer),
-                        _ => Val::I32(answer as i32),
-                    };
-                }
-                Ok(())
-            })
-            .map_err(|err| err.to_string())?;
-        defined.insert(key);
-    }
+    crate::wasm::wasi::stub_unknown_imports(
+        &mut linker,
+        module,
+        &mut defined,
+        &[
+            ("env", status::UNIMPLEMENTED as i64),
+            (crate::wasm::wasi::MODULE, crate::wasm::wasi::ENOSYS as i64),
+        ],
+    )?;
     Ok(linker)
 }
 
@@ -1476,9 +1263,4 @@ fn edit_map(
     edit(pairs);
     mark_changed(ctx, map_type);
     Ok(status::OK)
-}
-
-fn monotonic_nanos() -> u64 {
-    static START: OnceLock<Instant> = OnceLock::new();
-    START.get_or_init(Instant::now).elapsed().as_nanos() as u64
 }

@@ -794,9 +794,10 @@ async fn run_worker_with_manager(join: WorkerJoin, name_override: Option<&str>) 
         .with_host_guard(host_guard.clone())
         // Network plugin modules come through the artifact stager into the
         // node content store (docs/network-plugins.md).
-        .with_plugin_loader(Arc::new(crate::worker::netd::plugins::StagerLoader(
-            task_manager.lock().expect("task manager").stager_handle(),
-        )))
+        .with_plugin_loader(Arc::new(crate::wasm::module::StagerLoader {
+            stager: task_manager.lock().expect("task manager").stager_handle(),
+            label: "net plugin module",
+        }))
         .with_kernel(
             (kernel_guard == crate::worker::netd::kernel_guard::Availability::Active).then(|| {
                 kernel_guard_base(

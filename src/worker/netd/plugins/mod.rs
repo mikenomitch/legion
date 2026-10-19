@@ -24,6 +24,7 @@ pub mod vm;
 use crate::prelude::*;
 use crate::structs::netplugin::{NetPluginObject, PluginConfig};
 use crate::structs::NetPluginNodeStatus;
+use crate::wasm::module::ModuleLoader;
 use vm::{Compiled, PluginMetrics, Scope, SharedData, Vm};
 
 use std::collections::{BTreeMap, HashSet, VecDeque};
@@ -40,58 +41,6 @@ const LOG_LINES_PER_SECOND: u64 = 100;
 /// Plugin signing keys by (plugin, credential), with the version held.
 type CredentialStore =
     Arc<Mutex<HashMap<(String, String), (i64, crate::worker::forwarder::SecretValue)>>>;
-
-/// Fetches a module's bytes, checked against its checksum. Blocking.
-pub trait ModuleLoader: Send + Sync {
-    fn load(&self, source: &str, checksum: &str) -> Result<Vec<u8>, String>;
-}
-
-/// Reads `file://` and plain paths: the loader `legion net plugin test` and
-/// the tests use.
-pub struct FileLoader;
-
-impl ModuleLoader for FileLoader {
-    fn load(&self, source: &str, checksum: &str) -> Result<Vec<u8>, String> {
-        let path = source.strip_prefix("file://").unwrap_or(source);
-        let bytes = std::fs::read(path).map_err(|err| format!("reading {path}: {err}"))?;
-        verify_checksum(&bytes, checksum)?;
-        Ok(bytes)
-    }
-}
-
-/// Fetches through the worker's artifact stager into the node content store,
-/// so a module is downloaded once per node and survives restarts.
-pub struct StagerLoader(pub Arc<crate::artifacts::stage::ArtifactStager>);
-
-impl ModuleLoader for StagerLoader {
-    fn load(&self, source: &str, checksum: &str) -> Result<Vec<u8>, String> {
-        let mut spec = crate::structs::artifact::ArtifactSpec::from_source(source);
-        spec.checksum = Some(checksum.to_string());
-        let fetched = self
-            .0
-            .fetch_into_store(
-                &spec,
-                crate::content_store::ContentClass::Artifacts,
-                crate::content_store::PutOptions::default().label("net plugin module"),
-            )
-            .map_err(|err| format!("{err:#}"))?;
-        let bytes = std::fs::read(&fetched.entry.path)
-            .map_err(|err| format!("reading the stored module: {err}"))?;
-        verify_checksum(&bytes, checksum)?;
-        Ok(bytes)
-    }
-}
-
-pub fn verify_checksum(bytes: &[u8], checksum: &str) -> Result<(), String> {
-    use sha2::Digest;
-    let got = format!("sha256:{:x}", sha2::Sha256::digest(bytes));
-    if !checksum.eq_ignore_ascii_case(&got) {
-        return Err(format!(
-            "module checksum mismatch: expected {checksum}, got {got}"
-        ));
-    }
-    Ok(())
-}
 
 /// Where a plugin's module stands on this node.
 #[derive(Debug, Clone)]
@@ -894,12 +843,5 @@ mod plugins_test {
         stats.record(Duration::from_micros(1), Some("boom"));
         assert_eq!(stats.errors.load(Ordering::Relaxed), 1);
         assert_eq!(stats.last_error(), "boom");
-    }
-
-    #[test]
-    fn checksums_are_verified_test() {
-        let sum = "sha256:2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824";
-        verify_checksum(b"hello", sum).unwrap();
-        assert!(verify_checksum(b"hellp", sum).is_err());
     }
 }

@@ -10,6 +10,10 @@ This page lists the conventions used across the Legion codebase.
 - Shared structs and schema-facing types live under `src/structs/`.
 - CLI surface is under `src/cmd/`.
 - Task runtime implementations are under `src/task_plugins/`.
+- Embedding WASM is under `src/wasm/`: the engine, limits, failure
+  descriptions, guest memory, the WASI preview1 shim, and module fetching.
+  An embedder (the datapath's proxy-wasm host in `src/worker/netd/plugins/`)
+  brings its own ABI on top.
 - Plugin crates live under `plugins/<kind>/<name>/`.
 
 ## Naming and Style

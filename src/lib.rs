@@ -35,4 +35,5 @@ pub(crate) mod test_scratch;
 pub mod tracing_util;
 pub mod util;
 pub mod volumes;
+pub mod wasm;
 pub mod worker;

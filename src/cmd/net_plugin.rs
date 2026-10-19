@@ -200,7 +200,7 @@ async fn fetch_module(object: &NetPluginObject) -> R<Vec<u8>> {
             crate::structs::artifact::redact_source(source)
         );
     };
-    crate::worker::netd::plugins::verify_checksum(&bytes, &object.module.checksum)
+    crate::wasm::module::verify_checksum(&bytes, &object.module.checksum)
         .map_err(|err| anyhow!(err))?;
     Ok(bytes)
 }

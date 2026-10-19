@@ -927,7 +927,7 @@ impl ForwarderContext {
     /// Fetch plugin modules with `loader` (the worker's artifact stager).
     pub fn with_plugin_loader(
         mut self,
-        loader: Arc<dyn crate::worker::netd::plugins::ModuleLoader>,
+        loader: Arc<dyn crate::wasm::module::ModuleLoader>,
     ) -> Self {
         self.plugins = Arc::new(crate::worker::netd::plugins::PluginHost::new(Some(loader)));
         self
