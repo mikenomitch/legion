@@ -7,7 +7,8 @@
 > managers' system workers), not as an in-core loop, and it gains
 > JSON-RPC plugins, UI extensions, and a different `autoscale` default. Which
 > of this plan's calls stand is tabled in
-> [autoscaler-v2-plan_calls.md](../calls/autoscaler-v2-plan_calls.md) entry 16.
+> the ledger at the end of
+> [autoscaler-v2-plan_calls.md](../calls/autoscaler-v2-plan_calls.md#ledger-what-stands-from-the-superseded-plans-calls).
 > The text below is kept unedited as history.
 
 **Status (historical): IN EXECUTION.** Phase 1 (`legion job scale` + count overrides —

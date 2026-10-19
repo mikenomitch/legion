@@ -54,9 +54,13 @@ other job.
 - Every manager runs an in-process worker by default: worker type and pool
   `legion-system`, attribute `legion.role = "manager"`.
 - It accepts only the `legion-system` namespace.
-- Its capacity is a fixed lend (1 CPU / 1 GiB by default), not the host.
+- Its capacity is a fixed lend (1 CPU / 1 GiB by default), not the host,
+  enforced by `cpu.max` and `memory.max` on the system worker's cgroup
+  parent.
 - `systemWorker.enabled = false` turns it off. `--run-worker` keeps its old
-  meaning by widening `namespaces` to `["*"]`.
+  meaning by widening `namespaces` to `["*", "legion-*"]` and dropping the
+  cap. App placement keys on `legion.role = "manager"`, not the pool, so
+  apps still land on a `--run-worker` manager.
 
 **Alternatives.**
 - (a) Off by default: apps run on workers, and managers stay pure.
@@ -65,8 +69,9 @@ other job.
 **Trade-off.**
 - Managers spend real CPU and memory on apps by default.
 - An app bug (a hot loop, a leak up to its limit) shares a host with raft.
-  Per-allocation enforcement bounds it to the lend on Linux. On macOS there
-  are no cgroups, so only the advertised capacity bounds it.
+  The cgroup parent's `cpu.max` and `memory.max` bound it to the lend on
+  Linux, even though per-allocation `cpu.weight` lets apps burst. On macOS
+  there are no cgroups, so only the advertised capacity bounds it.
 - It changes the default for every new cluster.
 
 **Why (simplicity and correctness).** Three properties hold only on
@@ -87,9 +92,11 @@ nodes for these same reasons.
 **Call.**
 - The reserved `legion` identity gains `permissions` (inline rules) and
   `policies` (names).
-- On every submit, the manager checks that the submitting token holds each
-  requested rule. Glob coverage is decided by string-matching the requested
-  pattern against the held globs, and deny rules force `acl:write`.
+- On every path that stores a job config (`RunJob`, `RunJobTemplate`), the
+  manager checks that the submitting token holds each requested rule. Glob
+  coverage is decided by string-matching the requested pattern against the
+  held globs. Reserved prefixes are covered only by held patterns with the
+  same prefix (entry 5), and deny rules force `acl:write`.
 - Grants are stored per config version, with the granting principal, and
   listed and revoked with `legion acl grants`.
 - Apps use the same check at `app install` and `upgrade`.
@@ -131,7 +138,82 @@ It lets the jobspec be the whole story ("this job needs X") with no
 privilege gained. Re-checking on every submit is what stops someone with
 `job:write` on an app's namespace from laundering its grant by editing it.
 
-## 4. UI extensions are declarative views first, sandboxed pages second, and never in-origin JavaScript (reverses old autoscaler-plan entry 13)
+## 4. Apps run unprivileged, and changing an app's code needs its whole grant
+
+**Call.**
+- Tasks in reserved namespaces may not run as root: exec tasks need a
+  non-root `user` (bundled apps get `systemWorker.appUser`, default
+  `nobody`), and privileged containers are refused.
+- `app install`, `app upgrade`, and any `app config set` that changes a
+  manifest-declared code field (the autoscaler's plugin sources) re-run the
+  grant check against the caller.
+- The install prompt states that the app runs its own code on the managers.
+
+```
+gitops 0.2.0 runs its own code (1 artifact) on your managers, as user nobody,
+in legion-system, and asks for: ...
+```
+
+**Alternatives.**
+- (a) Let apps run as root, like any exec task today
+  (`docs/task-runtime-exec.md`: no `user` means root), and trust the
+  installer.
+- (b) Require containers or sandboxes for every app.
+- (c) Treat `app:write` as plain configuration access, with no grant check
+  on config.
+
+**Trade-off.**
+- Bundled apps need a usable unprivileged user on every manager host
+  (`nobody` almost always exists, but the binary must be executable by
+  it).
+- An app that genuinely needs root, such as a future network controller,
+  can't be an app in `legion-system` as designed.
+- Operators with `app:write` but not the app's grant can still change
+  settings, but can't add plugins.
+
+**Why (security boundary).**
+- **Against (a).** Root on a manager reads raft state and the data
+  directory, and can delete the host-guard table and escape its cgroup.
+  "Install an app" would silently mean "hand out cluster root".
+- **Against (b).** It needs a container runtime on every manager, and would
+  stop `legion:self` (entry 10) from working.
+- **Against (c).** It makes `app:write` on the autoscaler a path to
+  `node:write`, by adding a plugin that runs with the app's grant.
+
+Running unprivileged keeps the blast radius of an app at its grant. The
+code-field rule keeps the grant at what the person changing the code
+already holds.
+
+## 5. Reserved `legion-*` namespaces and the `legion/` KV prefix are not matched by `*`
+
+**Call.** In ACL namespace selectors, a glob matches a reserved namespace
+only if the pattern itself starts with `legion-`. `namespaces = ["*"]` covers
+every tenant namespace, but not `legion-system`. The same rule reserves the
+`legion/` KV prefix (app leases and state). It applies three ways:
+- in rule evaluation;
+- in node-side `namespaces` lists;
+- in grant coverage, where a held `*` does not cover a requested `legion-*`.
+
+**Alternatives.**
+- (a) Plain glob semantics, and document "don't give tenants `*`".
+- (b) A separate ACL resource for system jobs.
+
+**Trade-off.** A special case in glob matching. An operator who really means
+"everything" writes `["*", "legion-*"]`, and the policy doc must say so
+prominently.
+
+**Why (security boundary).** Tenant-admin policies written as
+`namespaces = ["*"]` are common and reasonable. Under plain globs, they
+would grant `exec:write` into the autoscaler's task, which holds a socket
+authenticated as the autoscaler. That is `node:write` and cluster-wide
+`scale:write` by the side door. Broad `kv:write` would likewise let a tenant
+take the autoscaler's shard leases. And without the rule in grant coverage,
+the same tenant admin could grant a job of their own `exec:write` on
+`legion-*` and get the side door back. (b) duplicates every namespaced resource.
+The "dotfiles skip `*`" rule is familiar from every shell, and it removes
+nothing anyone has today, because no `legion-*` namespace exists yet.
+
+## 6. UI extensions are declarative views first, sandboxed pages second, and never in-origin JavaScript (reverses old autoscaler-plan entry 13)
 
 **Call.**
 - **Tier 1** (Phase A4). Apps return JSON views built from a closed set of
@@ -170,18 +252,21 @@ privilege gained. Re-checking on every submit is what stops someone with
   the reverse proxy shipped first.
 
 Declarative views are rendered by Legion's own components, so they match the
-theme. Being data, they also render in the terminal and over MCP (entry 7),
+theme. Being data, they also render in the terminal and over MCP (entry 9),
 which no JavaScript plugin model gives. The autoscaler and GitOps both fit
 in tier 1, which suggests most operational apps do. Tier 2 is the safety
 valve for the rest.
 
-## 5. Inside a task, Legion is reached through a per-allocation API socket the worker provides
+## 7. Inside a task, Legion is reached through a per-allocation API socket the worker provides
 
 **Call.** An allocation with the `legion` identity gets
 `$LEGION_SECRETS_DIR/legion.sock`, and `LEGION_ADDR` is set to its
 `unix://` path. The worker proxies gRPC from it to the managers, attaching
-the allocation's current identity token, and handles failover and TLS. The
-token file is still written for clients that can't use a socket.
+the allocation's current identity token, and handles failover and TLS. It
+accepts a connection only if the peer's cgroup (`SO_PEERCRED`) is inside
+the allocation's own leaf. The token file is still written for clients that
+can't use a socket, with its path in `LEGION_IDENTITY_TOKEN_FILE`. That is
+not `LEGION_TOKEN_FILE`, which `legion login` writes to.
 
 **Alternatives.**
 - (a) **Kubernetes-style ambient env.** Inject a reachable manager address,
@@ -204,14 +289,15 @@ sockets to the manager's ports whenever the manager shares the node
 a policy hole to every manager.
 
 The socket is the allocation's own resource, so it clears both. The worker
-knows exactly which allocation owns which socket, so attribution is exact.
-No token ever has to sit in the task's environment.
+checks which allocation the connecting process belongs to, not just who
+can open the path (tasks can share a uid), so attribution is exact. No
+token ever has to sit in the task's environment.
 
 This is Nomad's Task API, which exists for the same reasons. Choosing
 (a) would have meant documenting `hostGuard.allow` holes for the default
 deployment.
 
-## 6. Nodes restrict namespaces from the node side, not through permits or namespace policies
+## 8. Nodes restrict namespaces from the node side, not through permits or namespace policies
 
 **Call.** Worker types gain `namespaces = [...]`. The scheduler's candidate
 filter, and the blocked-eval wake match, refuse a job whose namespace the
@@ -242,7 +328,7 @@ worker type, and also gives operators dedicated nodes for any namespace
 (`ci-*` on CI hosts). That is independently useful, which is how a phase
 ships alone.
 
-## 7. App views and actions go through manager RPCs, authorized as the viewer before anything reaches the app
+## 9. App views and actions go through manager RPCs, authorized as the viewer before anything reaches the app
 
 **Call.** The SPA, the CLI, and MCP call `GetAppView` and `InvokeAppAction`
 on the manager. The manager:
@@ -253,7 +339,11 @@ on the manager. The manager:
    `Legion-Viewer` JWT;
 4. records actions as `app.action` events.
 
-Apps never authorize viewers themselves.
+Apps never authorize viewers themselves. They do have to **verify** the
+assertion on every request (the app framework does it, and
+`legion app test` checks it), and act only on the context it names. The UI
+port is never a catalog service. Actions may only sit in slots that have a
+context to check (`job`, `task`, `node`).
 
 **Alternatives.**
 - (a) Argo CD's model: the browser calls the app backend via a proxy, and
@@ -263,6 +353,11 @@ Apps never authorize viewers themselves.
 
 **Trade-off.**
 - Every panel load costs a manager hop plus a tunnel hop.
+- A third-party app that skips assertion verification can be driven
+  directly by any workload that can reach its port. Not advertising the
+  port narrows that, `legion app test` catches it, and the app framework
+  makes skipping it take effort, but it remains the app author's
+  obligation.
 - The manager carries app traffic.
 - Permissions are only as fine-grained as one resource/action per view or
   action. An app that needs per-row authorization must still check the
@@ -276,29 +371,7 @@ authors never thought about it. The same RPC serving the SPA, the CLI
 (`legion app view`), and MCP (`legion_app_view`) gives agents parity with
 humans for free (AGENTS.md: agent-friendly surfaces).
 
-## 8. Reserved `legion-*` namespaces are not matched by `*` in ACL rules
-
-**Call.** In ACL namespace selectors, a glob matches a reserved namespace
-only if the pattern itself starts with `legion-`. `namespaces = ["*"]` covers
-every tenant namespace, but not `legion-system`.
-
-**Alternatives.**
-- (a) Plain glob semantics, and document "don't give tenants `*`".
-- (b) A separate ACL resource for system jobs.
-
-**Trade-off.** A special case in glob matching. An operator who really means
-"everything" writes `["*", "legion-*"]`, and the policy doc must say so
-prominently.
-
-**Why (security boundary).** Tenant-admin policies written as
-`namespaces = ["*"]` are common and reasonable. Under plain globs, they
-would grant `exec:write` into the autoscaler's task, which holds a socket
-authenticated as the autoscaler. That is `node:write` and cluster-wide
-`scale:write` by the side door. (b) duplicates every namespaced resource.
-The "dotfiles skip `*`" rule is familiar from every shell, and it removes
-nothing anyone has today, because no `legion-*` namespace exists yet.
-
-## 9. Bundled apps run the node's own binary (`command = "legion:self"`)
+## 10. Bundled apps run the node's own binary (`command = "legion:self"`)
 
 **Call.** The exec runtime resolves `legion:self` to the worker's own
 executable, so the autoscaler is `legion app run autoscaler` from the same
@@ -321,11 +394,13 @@ already running there. (a) needs a release host and per-arch checksums in the
 manifest. (b) needs a container runtime on every manager. Third-party apps
 use (a) or (b) like any job.
 
-## 10. App config lives on the app record, and any change is a rollout
+## 11. App config lives on the app record, and any change is a rollout
 
 **Call.** `legion app config set` validates against the manifest's Nickel
 contract, stores the config on the record, and the reconciler resubmits the
-job with the config rendered as a file. There is no live reload.
+job with the config rendered as a file. There is no live reload. A change to
+a manifest-declared code field (plugin sources) re-runs the grant check
+against the caller (entry 4).
 
 **Alternatives.**
 - (a) Store config in KV and render it with the shipped KV-reactive file
@@ -345,7 +420,7 @@ period.
   change behaving differently.
 - (b) asks every app author to write watch logic.
 
-## 11. Manager-config `apps` settings apply only when the cluster is first seeded
+## 12. Manager-config `apps` settings apply only when the cluster is first seeded
 
 **Call.** `apps = { autoscaler = { enabled = false } }` in manager config is
 read once, when the first Control leader seeds app records on an empty
@@ -369,3 +444,26 @@ GitOps managing apps eventually.
 
 Seed-only gives a deterministic day-one choice and a single source of truth
 afterwards.
+## 13. Bundled apps' grants are recorded by bootstrap, and skip the escalation check
+
+**Call.** When the first Control leader seeds records for the apps compiled
+into the binary, their manifests' permissions are recorded as granted by
+`legion:bootstrap`. No principal is checked, because no human is
+submitting. This is the only grant that bypasses the check, and only
+manifests embedded in the binary can use it.
+
+**Alternatives.**
+- (a) Require the first operator to approve the autoscaler's grant
+  (`legion app approve autoscaler`) before it runs.
+- (b) Seed bundled apps disabled.
+
+**Trade-off.** A fresh cluster runs a process holding `node:write` and
+cluster-wide `scale:write` that nobody explicitly approved. Its trust rests
+on being part of the same binary the operator chose to run.
+
+**Why (simplicity).** (a) and (b) both break "it's just there" on day one,
+which is the omakase promise. And the binary is already trusted with far
+more than this grant: it *is* the manager. An operator who doesn't want the
+autoscaler seeds it disabled (`apps = { autoscaler = { enabled = false } }`)
+or runs `legion app disable`.
+

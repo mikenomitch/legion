@@ -6,7 +6,8 @@ ordered by project impact, highest first, and an entry's number is its
 rank.** These are design-time calls. Implementation inserts its own at
 their rank. The superseded plan's calls
 ([autoscaler-plan_calls.md](autoscaler-plan_calls.md)) still govern the
-shipped Phase 0 surface. Entry 16 maps which of them stand.
+shipped Phase 0 surface. The [ledger](#ledger-what-stands-from-the-superseded-plans-calls)
+at the end maps which of them stand.
 
 The substrate calls (where apps run, how they authenticate, how they reach
 the UI) are in [legion-apps-plan_calls.md](legion-apps-plan_calls.md).
@@ -214,10 +215,11 @@ detail. There is no separate "reason" code path.
   happened.
 - (b) A user-orderable pipeline, or safeguard plugins.
 
-**Trade-off.** The order is fixed and opinionated. For example, step
-limits apply *before* bounds, so a bound change takes effect at the step
-rate, never as a jump. Some combinations can't be expressed: you can't let
-a schedule bypass the step limit.
+**Trade-off.** The order is fixed and opinionated. For example, bounds apply
+*after* the step limit. A raised floor (a schedule's 08:00 `min = 10`, a
+resubmit with a higher `count`) or a lowered `max` therefore takes effect at
+once, as a jump the step limit can't pace. Some combinations can't be
+expressed: you can't rate-limit a schedule's arrival.
 
 **Why (simplicity).** The user's two asks, "flexible safeguards" and "know
 what scaled and why", turn out to be one mechanism. A fixed order means an
@@ -337,9 +339,14 @@ one hour in memory, and serves `GetScalingInputs`.
 - (c) Workers push usage to the autoscaler directly.
 
 **Trade-off.**
-- After a leader change, inputs are empty for a few seconds, and the
-  one-hour simulation buffer is lost (the cold-start guard holds scale-in;
-  `scaling simulate` has less history).
+- After a status-lane leader change, inputs are empty until every peer's
+  full resync arrives, about one interval. The missing-data hold covers
+  that: nothing scales in, and the app's own stabilization windows survive
+  because they live in the app. The one-hour simulation buffer is lost, so
+  `scaling simulate` has less history.
+- Rollups are keyed per (node, target), not per target, so the payload grows
+  with how widely targets spread across nodes. That is the price of never
+  double-counting a node that switches managers.
 - The data is only as fresh as the 10s report interval.
 - One more payload rides the digest.
 
@@ -358,10 +365,15 @@ rollups are bounded by the number of targets, not allocations.
 
 ## 10. Every autoscaler write is compare-and-set; overlapping leases are tolerated, not prevented
 
-**Call.** `ScaleTask.expected_version` must match the `task_scale` row
-version the decision was computed from, or the write is refused with
-`FAILED_PRECONDITION`, and the app re-reads and re-evaluates. Shard leases
-are KV locks with no fencing.
+**Call.**
+- `ScaleTask.expected_version` must match the `task_scale` row version the
+  decision was computed from, or the write is refused with
+  `FAILED_PRECONDITION`, and the app re-reads and re-evaluates.
+- Node and external targets, whose effects happen outside Legion, first
+  record an action intent (`RecordScalingAction`) with CAS on the policy's
+  action version. Only the winner calls the plugin.
+- Versions are raft log indexes, so they never repeat.
+- Shard leases stay KV locks with no fencing.
 
 **Alternatives.**
 - (a) Add fencing tokens (a lock generation) to KV locks and check them on
@@ -375,11 +387,18 @@ autoscaler waste an evaluation.
 **Why (simplicity).**
 - **(a)** It is a general KV feature, and it fences only autoscaler against
   autoscaler.
-- **(b)** It is wrong exactly when it matters: during failover.
+- **(b)** It is wrong exactly when it matters: during failover. For node
+  targets, a double write means two ASG resizes or two drains of
+  different victims.
 
 CAS on the thing being written also fences autoscaler against human. It
 closes the race where an incident responder's `job scale` is overwritten
-by an evaluation that started a second earlier, with one integer column.
+by an evaluation that started a second earlier, with one integer column. The
+intent row gives external side effects the same guarantee: the replicated
+write is the fence, and the plugin call only follows it. Using the raft
+index instead of a per-row counter closes the ABA case. Phase 0's
+arbitration deletes and recreates override rows, which would otherwise
+reset a counter to a value a stale writer still holds.
 
 ## 11. The app scales out by sharding policies across replicas
 
@@ -408,8 +427,9 @@ rebalancing proportional and make "add replicas" the only scaling knob.
 
 **Call.** Every applied change (autoscaler or human) writes a
 `scale_history` row with the decision, in the override's transaction,
-capped at 200 per target. An evaluation that held is kept only in the app's
-memory, plus the per-target state in the manager's cached
+capped at 200 per target. So does every "would scale" decision of a
+`dry-run` policy, with `applied = false`. An evaluation that held is kept
+only in the app's memory, plus the per-target state in the manager's cached
 `ReportScalingStatus`.
 
 **Alternatives.**
@@ -423,7 +443,9 @@ available.
 
 **Why (performance).** Evaluations happen every 15s per policy, and storing
 them is raft write amplification for data that is almost always "within
-tolerance". Actions are rare and are what audits ask about. The events
+tolerance". Actions are rare and are what audits ask about. Dry-run "would"
+decisions are exactly as rare, and they are the record a team reads before
+trusting a policy (scenario S2), so they get the same treatment. The events
 journal is best-effort by design, so it can't be the record.
 
 ## 13. `autoscale` on a task in a multi-task group scales the whole group
@@ -484,17 +506,70 @@ group") is the product, and `scaling = true` reads like a statement about
 the job rather than a switch. The field never shipped, so renaming costs
 nothing.
 
-## 16. Ledger: what stands from the superseded plan's calls
+## 16. The bundled autoscaler holds `node:write` and cluster-wide `scale:write` in one grant
 
-The superseded plan's calls are not rewritten (`plans/README.md`). Here is
-where each one lands now:
+**Call.** The autoscaler's manifest requests one fixed permission set,
+including `node:write` (drain, forget, join tokens), whether or not the
+cluster has node-group policies.
+
+**Alternatives.**
+- (a) **Optional permission groups** in the manifest, granted only when
+  enabled. For example a `nodes` group the operator turns on when applying
+  the first node-group policy.
+- (b) **Two apps**, `autoscaler` and `node-autoscaler`, each with its own
+  grant.
+
+**Trade-off.** A cluster that never autoscales nodes still runs a process
+that holds `node:write`. Its compromise (through a plugin bug, say) could
+drain nodes.
+
+**Why (simplicity).**
+- **Against (a).** It adds a grant state machine to every app, and a second
+  approval step exactly when an operator is applying their first node
+  policy.
+- **Against (b).** It doubles the processes, and splits one pipeline and
+  one status surface in two.
+- **The real mitigations are elsewhere.** Plugins are operator-installed
+  (entry 4), and node-group policies need `operator:write` to create. App
+  config changes that add plugin code re-check the grant against the
+  caller (apps calls entry 4). We'd revisit if a third-party app needs
+  optional groups for its own reasons.
+
+## 17. A `step` limit is the larger of its percent and replica halves, and writing `step` replaces both
+
+**Call.** `step = { percent, replicas }` allows the larger of the two per
+`every`. Writing `step` replaces the default record, and an omitted half is
+0.
+
+**Alternatives.**
+- (a) The smaller of the two.
+- (b) HPA's explicit `selectPolicy: Max|Min` over a list of policies.
+- (c) Merge a partial `step` with the defaults.
+
+**Trade-off.** "Larger" lets small services move quickly (+4 on a
+2-replica service is +200%). A user who writes only `replicas = 2` might
+expect the percent default to survive, and it doesn't.
+
+**Why (simplicity).**
+- **"Larger".** Small services need an absolute floor on movement, and big
+  ones need a proportional one. One fixed rule covers both, without HPA's
+  list-plus-selector.
+- **Replacing the record.** Merging (c) makes `step = { replicas = 2 }` mean
+  "2 or 100%", which silently does nothing. Replacing makes what you wrote
+  the whole limit.
+
+## Ledger: what stands from the superseded plan's calls
+
+The superseded plan's calls are not rewritten (`plans/README.md`). This is
+a map, not a judgement call, so it is unnumbered. Here is where each one
+lands now:
 
 | Old entry | Status | Note |
 | --- | --- | --- |
 | 1. Desired count is a separate owned record | **Stands** | Phase 0, the foundation of everything here |
 | 2. Manager subsystem first, job second | **Reversed** | entry 1 |
 | 3. Declarative policies; logic waits for WASM | **Reversed in mechanism, kept in spirit** | entry 3 (logic now runs out of process in the app, not in the manager) and entry 4 |
-| 4. Resubmit ownership via `base_count` | **Stands** | §6.3: `count` now also feeds `min` |
+| 4. Resubmit ownership via `base_count` | **Split** | rule 2 (no policy: `base_count` arbitrates) stands. Rule 1 changes: `count` is the default `min`, not an initial value only, and submit arbitration keeps and clamps the override for autoscaled tasks (plan §6.3, entry 2) |
 | 5. `task_scale` on Control | **Stands** | the new tables join it there |
 | 6. Scale-out applies, scale-in defers during rollouts | **Stands** | enforced by `ScaleTask`, so the app can't bypass it |
 | 7. `pending_count` promotion | **Stands** | |
@@ -503,7 +578,7 @@ where each one lands now:
 | 10. Own `scale` ACL resource | **Stands** | the app's grant uses it |
 | 11. Usage on the heartbeat's status write, windows in evaluator memory | **Reversed (storage), kept (windows)** | entry 9 |
 | 12. `min` defaults to 1, `min = 0` needs a wake signal | **Split** | the default changed (entry 2); the wake rule stands |
-| 13. First-party UI pages, link-only extensions | **Reversed** | apps calls entry 4 |
+| 13. First-party UI pages, link-only extensions | **Reversed** | apps calls entry 6 |
 | 14. Refuse keyed and `count.per` | **Stands** | |
 | 15. Scaling doesn't move `updated_at` | **Stands** | |
 | 16. `scale_in` stop cause | **Stands** | autoscaler scale-ins report it too |

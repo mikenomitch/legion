@@ -8,7 +8,7 @@ scale`, count overrides, the `scale` ACL resource) shipped on 2026-07-30 and
 is still accurate. This plan treats it as **Phase 0** and builds on it
 unchanged. Everything after that phase is redesigned here. The old calls doc
 ([autoscaler-plan_calls.md](../calls/autoscaler-plan_calls.md)) still governs
-the shipped surface. [Calls entry 16](../calls/autoscaler-v2-plan_calls.md)
+the shipped surface. [The ledger in the new calls doc](../calls/autoscaler-v2-plan_calls.md#ledger-what-stands-from-the-superseded-plans-calls)
 lists which of its entries this plan keeps and which it reverses.
 
 The autoscaler is the first **Legion app**. It runs on the substrate
@@ -173,7 +173,8 @@ acting, and many teams run it that way for weeks before they trust it.
 
 **Cluster operator**
 - When work can't place because the cluster is full, I want machines added
-  for me from the pool I configured, so nobody gets paged to run `join`.
+  for me from the pool I configured, so nobody gets paged to add a machine
+  by hand.
 - When machines sit empty overnight, I want them drained and returned, a few
   at a time and never below a floor, so the bill follows usage without risk.
 - When my machines come from something Legion doesn't know about (an ASG,
@@ -217,8 +218,9 @@ cloud or metrics system)
 **S1: one word.** A team adds `autoscale = true` to their `web` task, which
 has `count = 2` and `resources.cpu = 500`. Legion holds average CPU near 70%
 of the reservation, between 2 and 8 replicas. It scales out within a minute
-of a spike, at most doubling per minute. It scales in slowly, at most 10% per
-minute after five quiet minutes. It never scales in while a rollout is
+of a spike, adding at most 100% or 4 replicas per minute, whichever is
+larger. It scales in slowly: after five quiet minutes, it removes at most 10%
+or 1 replica per minute, whichever is larger. It never scales in while a rollout is
 running or while metrics are missing. `legion scaling explain web` says why
 the service is at 6 right now.
 
@@ -241,7 +243,7 @@ join with a pre-minted token and the group's attributes. Overnight, nodes
 that have been empty for 10 minutes are drained and terminated, at most 10%
 at a time, never below `min`, and removed from `legion node list`.
 
-**S5: 3am.** `web` went from 6 to 30. The responder runs
+**S5: 3am.** `web` (bounds 6..40) went from 6 to 30. The responder runs
 `legion scaling history web`. The record says CPU went to 0.96 because a
 deploy doubled per-request work. They run
 `legion job scale web --count 12 --for 2h --reason "bad deploy, rolling back"`,
@@ -321,10 +323,13 @@ Code recon, verified against the tree on 2026-10-19.
   (`src/structs/eval.rs:410-438`).
 - Events: `scale.applied`, `scale.deferred`, and `scale.reset`
   (`src/storage/events.rs:1105-1177`).
-- **Bug found during recon:** `GetJobScaleStatus` computes
+- **Hardening found during recon:** `GetJobScaleStatus` computes
   `override_count.unwrap_or(spec)` without the `base_count` filter that
-  `effective_task_count` applies (`server.rs:6250`). Status can then report
-  a stale override as effective. Fixed in Phase 1 here.
+  `effective_task_count` applies (`server.rs:6250`). Today this can't be
+  reached through the API, because submit arbitration deletes a mismatched
+  override in the same transaction (`store.rs:10838-10850`). Pins and the
+  autoscale-aware arbitration (§6.3) add new override states, so Phase 1
+  routes status through `effective_task_count` as well.
 
 **Jobspec shape.** A job is a flat list of tasks, and each task has a
 `group` string (default `"default"`, `src/structs/job.rs:122`). There are no
@@ -351,7 +356,7 @@ multi-task group, this plan scales the group's tasks together (§6.3).
   folded into per-minute buckets for 15 minutes, in memory
   (`server.rs:8339`).
 - Edges are recorded on the **caller** side, so traffic from outside Legion
-  into an advertised port is not an edge (`docs/network-handlers.md:1578`).
+  into an advertised port is not an edge (`docs/network-handlers.md:1583`).
 
 **Liveness digest.** Every manager that does not lead the status lane sends
 the leader one RPC per second with the node ids it heard from
@@ -361,7 +366,7 @@ Phase 1 uses to roll usage up.
 
 **Pending work.**
 - The planner reports unplaced replicas in memory
-  (`PlanOutcome.unplaced`, `src/manager/scheduler.rs:356`).
+  (`PlanOutcome.unplaced`, `src/manager/scheduler.rs:369`).
 - Blocked evals exist only when *nothing* placed. They store one key and one
   per-placement shortfall (`src/manager/blocked.rs:43-84`), with keys
   `class:pool=…`, `node:<id>`, and `escaped`.
@@ -379,7 +384,7 @@ Phase 1 uses to roll usage up.
   (`src/structs/session.rs:410`).
 
 **Nodes.**
-- Drain: `SetNodeAvailability` (`proto:1480`) evicts stateless allocations
+- Drain: `SetNodeAvailability` (`proto:1511`) evicts stateless allocations
   immediately and protects stateful ones through `onLost`. It has no
   deadline and no "drained" signal.
 - Join tokens: `CreateJoinToken {worker_type, ttl, description}` are
@@ -423,7 +428,7 @@ override row.
                 ┌──────────────────────── manager (any) ─────────────────────────┐
   jobspec       │ RunJob ── validates `autoscale` ── task_config row               │
   autoscale=…  ─┤ ScalingPolicy objects (Control)   scale_history (Control)       │
-  scaling apply │ ScaleTask (+expected, +decision) ── task_scale (Control)        │
+  scaling apply │ ScaleTask (+expected_version, +decision) ── task_scale (Control)        │
                 │ GetScalingInputs ◀── usage/edge rollups (status-lane leader)    │
                 │ GetCapacityDemand ── simulate pending work on node templates    │
                 │ WatchScalingPolicies (stream)        ForgetNode                 │
@@ -558,6 +563,17 @@ entry 13).
 present, the policy owns the live count, and resubmits never reset it.
 `count` feeds `min` (unless `min` is explicit) and the starting count.
 
+This needs a change to the shipped arbitration. Today, a resubmit whose spec
+count differs from `base_count` deletes the override
+(`store.rs:10838-10850`), so the live count would fall back to `count`. For
+autoscaled tasks, `handle_job_submit_apply` instead keeps the override,
+updates its `base_count`, and clamps it into the new `[min, max]` in the same
+transaction. Raising `count` from 2 to 4 therefore lifts a task at 3 to 4
+at once and leaves a task at 6 alone. Lowering `count` only lowers the
+floor, and the autoscaler brings the count down at the scale-in rate. When
+`autoscale` is removed in a resubmit, Phase 0's rule applies again on that
+same submit.
+
 ### 6.4 The full policy surface
 
 Everything beyond `true` is optional, and every field has the default
@@ -581,9 +597,9 @@ autoscale = {
       activation = 1,                # wakes the task from zero (§6.12)
     },
     {
-      name = "p95",
+      name = "latency",
       source = "legion",
-      query = "service.latency_ms.p95",   # internal callers only (§6.7)
+      query = "service.latency_ms.mean",  # internal callers only (§6.7)
       strategy = { name = "threshold", steps = [
         { above = 250, add = 2 },
         { above = 500, add = 4 },
@@ -600,7 +616,7 @@ autoscale = {
   schedule = [
     { cron = "0 8 * * 1-5", for = "10h", min = 10, timezone = "America/New_York" },
   ],
-  onMissing = "hold",                # hold (default) | scale-out-only
+  onMissing = "hold",                # hold (default) | ignore
   mode = "dry-run",                  # enforce (default) | dry-run
 }
 ```
@@ -616,6 +632,14 @@ autoscale = {
 - **`step`** is the larger of `percent` of the current count and
   `replicas`, per `every` window. It is a rolling window: the evaluator sums
   the changes it applied in the last `every` and allows only the remainder.
+  Writing `step` replaces the whole default record, and a half you leave out
+  is 0. So `step = { replicas = 2 }` means exactly 2, not "2 or 100%".
+- **`onMissing`.** With `hold`, the default, nothing scales *in* while any
+  check has no data. Checks that do have data may still scale out. With
+  `ignore`, a check with no data is dropped for that evaluation, and the
+  remaining checks decide in both directions. Use `ignore` for a check that
+  is optional by nature, such as a latency guard on a service with no
+  callers at night.
 
 ### 6.5 Safeguards: an explicit, self-reporting pipeline
 
@@ -629,7 +653,7 @@ observability needs no separate code path (calls entry 5).
             (per strategy)                                   (per direction)
    ──▶ bounds (min/max, schedule) ──▶ cluster guards ──▶ pin / pause ──▶ mode ──▶ write
                                        (quota, capacity,                  (dry-run
-                                        rollout rule)                      records only)
+                                        rollout rule)                      records "would")
 ```
 
 | Stage | Default | Records, when it changes the number |
@@ -640,11 +664,11 @@ observability needs no separate code path (calls entry 5).
 | **cold start** | after the app (re)starts, no scale-in until one `down.stabilize` window of samples exists | `held: collecting 5m of history after restart` |
 | **stabilize** | up 0s, down 5m. Scale-in uses the *highest* recommendation in the window | `stabilized: 5m max is 6` |
 | **step** | up max(+100%, +4)/min, down max(−10%, −1)/min | `rate-limited 7 → 6 (up ≤ 4/min; +2 used)` |
-| **bounds** | `min = count`, `max = 4 × count`, with schedule overrides | `clamped to max 8` (`scale.limited` on first hit) |
+| **bounds** | `min = count`, `max = 4 × count`, with schedule overrides. Bounds sit *after* the step limit on purpose: a raised floor (a schedule's 08:00 `min = 10`, or a resubmit with a higher `count`) applies at once, and so does a lowered `max`. The step limit only paces signal-driven change | `clamped to max 8` (`scale.limited` on first hit) |
 | **quota** | the namespace's quota headroom for the job's band | `limited by namespace quota payments-prod (normal: 12/12 cpu)` |
 | **capacity** | do not raise the count while more than half of the last scale-out is still unplaced, *unless* a node-group policy can host it | `held: 3 replicas unplaced, no node group fits` |
 | **rollout** | scale-in waits for an active rollout to finish (Phase 0; ScaleTask defers it) | `deferred until rollout web-7 completes` |
-| **pin / pause** | a pin replaces the result; a pause skips the write | `pinned at 12 by alice until 05:10` |
+| **pin / pause** | a pin replaces the result, and may exceed `max` (an operator's explicit override; the note says so). A pause skips the write, and `ScaleTask` also refuses `source = autoscaler` writes to a paused target on the server | `pinned at 12 by alice until 05:10` |
 | **flap guard** | 3 direction changes in 10 minutes holds scale-in for `2 × down.stabilize` and emits `scale.flapping` once | `held: flapping (3 reversals in 10m)` |
 | **mode** | `enforce` | `dry-run: would scale 4 → 6` |
 
@@ -665,7 +689,10 @@ should end on its own. When a forgotten pin expires, the default scale-in
 rate brings the count down gently instead of all at once.
 
 **Pause.** `legion scaling pause [target | --all] --for 1h --reason …` is
-stored on the Control lane and is visible on every status surface.
+stored on the Control lane and is visible on every status surface. It is
+enforced in two places: the app skips paused targets, and `ScaleTask` and
+the node-action intents (§6.9) refuse autoscaler writes to a paused target.
+A pause therefore holds even against an app that is misbehaving.
 `legion scaling resume` undoes it. `--all` is the cluster-wide kill switch.
 `legion app disable autoscaler` is the hard stop.
 
@@ -679,6 +706,9 @@ Three records, each with a different lifetime.
    transaction as the override. History is capped per target (default 200
    rows) and covers humans too, so "who changed this and why" has one
    answer.
+   A `dry-run` policy's "would scale" decisions are written to the same
+   table with `applied = false`. They are as rare as real actions, and
+   they are what lets S2 read a week of what the policy would have done.
 2. **Evaluations that held are live, not stored.** The app keeps the last
    evaluation per target and a short ring of recent ones in memory. They are
    served by the app's view API (UI, CLI, MCP), and as a summary cached on
@@ -766,18 +796,27 @@ it returns:
 
 **How the data gets to one place** (calls entry 9):
 
-- Every manager pre-aggregates the reports *it* received into per-target
-  rollups: sums, counts, maxima, and a small fixed-bucket histogram of
-  per-replica utilization.
-- Every 10 seconds (the report interval) it sends only the changed rollups
+- Every manager pre-aggregates the reports *it* received into rollups keyed
+  by **(node, target)**: sums, counts, maxima, and a small fixed-bucket
+  histogram of per-replica utilization, stamped with the report's sample
+  time.
+- Every 10 seconds (the report interval) it sends the rollups that changed
   to the status-lane leader, on the existing digest RPC.
-- The leader merges them across managers, tracks freshness per manager, and
-  keeps one hour of 10-second rollups per target in memory. That buffer is
-  what `scaling simulate` replays.
-- Size is bounded by targets, not allocations: 10,000 autoscaled tasks is
-  about 400 KB per manager per 10 seconds.
-- Nothing touches raft. After a leader failover the buffer is empty, which
-  the cold-start guard already covers (§6.5).
+- The leader keeps the newest rollup per (node, target), whichever manager
+  sent it. A node that switches managers is therefore never counted twice:
+  the newer sample replaces the older one. The leader then sums per target,
+  and keeps one hour of 10-second per-target totals in memory. That buffer
+  is what `scaling simulate` replays.
+- Size is bounded by (node, target) pairs, roughly one small row per
+  autoscaled allocation group on a node, never by raw samples. For 10,000
+  autoscaled tasks averaging 3 nodes each, that is about 1.2 MB per manager
+  per 10 seconds, and the delta encoding sends much less in steady state.
+- Nothing touches raft. A manager that newly takes the status lane asks
+  every peer for a **full** resync (not a delta) on its first digest, so
+  steady targets don't stay invisible. Until the resync lands, about one
+  interval, targets read as missing data, and the missing-data hold (§6.5)
+  covers it. The app's own stabilization windows live in the app, so they
+  survive a manager failover. Only `scaling simulate` loses history.
 
 The **`legion` source** exposes a fixed, documented vocabulary over these
 inputs. A fixed vocabulary is supportable; arbitrary SQL in a policy would
@@ -940,13 +979,29 @@ enabled by default and needs nothing configured (apps plan §6.3).
   (`…/shards/<n>`) up to `ceil(64 / live members)`, rebalancing as members
   come and go. Both kinds of lease are KV locks with a 15s TTL.
   `legion app set autoscaler --replicas 3` is the whole procedure.
+  The `legion/` KV prefix is reserved the same way `legion-*` namespaces
+  are (apps plan §6.2): a `paths = ["*"]` rule doesn't reach it. So a
+  tenant with broad `kv:write` can't take or starve shards.
 - **No duplicate actions.** KV locks have no fencing token
   (`store.rs:19343`), so two replicas can briefly both believe they own a
-  shard. That is harmless because every write is **compare-and-set**:
-  `ScaleTask.expected` names the override row version the decision was
-  computed from, and a stale writer gets `FAILED_PRECONDITION`, re-reads,
-  and re-evaluates. The same check stops the autoscaler from overwriting a
-  human's scale made a second earlier (calls entry 10).
+  shard. Every write the app makes is therefore **compare-and-set** against
+  replicated state, so a stale owner loses (calls entry 10):
+  - **Task targets.** `ScaleTask.expected_version` names the override
+    version the decision was computed from. A stale writer gets
+    `FAILED_PRECONDITION`, re-reads, and re-evaluates. The same check stops
+    the autoscaler from overwriting a human's scale made a second earlier.
+  - **Node and external targets**, whose side effects happen outside
+    Legion. Before calling `target/scale`, choosing drain victims, or calling
+    `target/terminate`, the app records an **action intent**
+    (`RecordScalingAction`: policy, desired count or victim ids, decision
+    id) with CAS on the policy's action version. Only the winner of that
+    write calls the plugin. The loser sees the intent and adopts it as
+    in-flight state. Intents carry their outcome when the plugin call
+    returns. An intent left open by a crashed replica is reconciled from
+    `target/status` by the next owner before it acts.
+  - **Versions never repeat.** They are the raft log index of the row's last
+    write, not a per-row counter. Arbitration deleting and recreating an
+    override (Phase 0) therefore can't produce an ABA match.
 - **Reads are batched and pushed.** Policies come from
   `WatchScalingPolicies`, a stream filtered by shard: changes arrive
   immediately, and there is no polling. Inputs come from one
@@ -1104,12 +1159,27 @@ ships nothing for it.
   - `node:read,write` (drain, forget, join tokens);
   - `kv:read,write` on `legion/apps/autoscaler/*` (leases).
 
-  It does **not** get `job:write`: it can resize, not redeploy.
+  It does **not** get `job:write`: it can resize, not redeploy. It does get
+  `node:write`, even on clusters with no node-group policies. The calls doc
+  (entry 16) explains why the grant is not split by feature.
 - **Standalone policies.**
   - A task or external-target policy needs `scale:write` in its namespace.
-  - A node-group policy is cluster-scoped and needs `node:write` *and*
-    `scale:write`, so a capacity owner can be distinct from a job owner.
+  - A node-group policy is cluster-scoped. It needs `node:write`, which is
+    cluster-scoped and has no namespace to name, and `operator:write`,
+    because it can add and remove machines. A job owner with broad
+    `scale:write` therefore cannot create one.
   - Plugin use is gated by the plugin's `namespaces` allowlist.
+- **Pause scope.** Pausing one target needs `scale:write` on that target's
+  namespace. `--all` and node-group pauses need `operator:write`.
+- **App-plane RPCs.** `ReportScalingStatus` and `RecordScalingAction` are
+  marked `// ACL: app-plane`. They accept only the autoscaler app's own
+  workload identity (principal `legion:<legion-system/autoscaler sub>`),
+  the same way worker-plane RPCs accept only worker credentials. A human
+  with `scale:write` can't forge the app's status or intents.
+- **`ForgetNode`** revokes the node's token in the same write, so an
+  instance whose termination failed cannot re-register under the old
+  identity. It would have to join again with a new token, and the node
+  group's `max_uses` join token is already spent.
 - **Every new RPC** gets a row in `tests/integration/acl_endpoints.rs`:
 
   | RPC | ACL |
@@ -1119,9 +1189,9 @@ ships nothing for it.
   | `WatchScalingPolicies` | `scale:read` |
   | `ApplyScalingPolicy`, `DeleteScalingPolicy` | as above |
   | `ListScalingPolicies` | `scale:read`, filtered |
-  | `ReportScalingStatus` | `scale:write` |
-  | `GetScalingStatus` | `scale:read` |
-  | `PauseScaling` | `scale:write` |
+  | `ReportScalingStatus`, `RecordScalingAction` | app-plane (the autoscaler's identity only) |
+  | `GetScalingStatus`, `GetScaleHistory` | `scale:read`, filtered |
+  | `PauseScaling` | `scale:write` on the target; `operator:write` for `--all` and node groups |
   | `ForgetNode` | `node:write` |
 
   Coarse checks come first, then the precise scope, so a probe cannot tell
@@ -1175,8 +1245,9 @@ ships nothing for it.
   - `GetScalingInputs`, `GetCapacityDemand`, `WatchScalingPolicies`
     (server stream);
   - `ApplyScalingPolicy`, `DeleteScalingPolicy`, `ListScalingPolicies`;
-  - `ReportScalingStatus`, `GetScalingStatus`, `GetScaleHistory`;
-  - `PauseScaling`, `ForgetNode`.
+  - `ReportScalingStatus`, `RecordScalingAction` (app-plane),
+    `GetScalingStatus`, `GetScaleHistory`;
+  - `PauseScaling`, `ForgetNode` (also revokes the node token).
 - `CreateJoinTokenRequest` `+ optional uint32 max_uses`,
   `map<string,string> attributes`.
 - `RegisterWorker` `+ map<string,string> join_attributes` (from `--attr`).
@@ -1198,7 +1269,13 @@ ships nothing for it.
   Pins live on `task_scale` as `pin_until`, `pin_min`, and `pin_max`
   columns, so `effective_task_count` stays the single reader and the
   scheduler needs no new lookup.
-- `task_scale.version`, bumped on every write, is the CAS token.
+- `task_scale.version` is the CAS token: the raft log index of the row's
+  last write, so it never repeats across a delete and recreate.
+- `scaling_action` (policy, action version, kind, desired or victim ids,
+  decision id, state, outcome) holds the node and external intents (§6.9).
+- `scale_history` gains `applied` (false for dry-run "would" rows).
+- `handle_job_submit_apply` gains the autoscale-aware arbitration from §6.3:
+  keep the override, rebase `base_count`, and clamp into the new bounds.
 - `validate_job_config` gains autoscale validation:
   - `min ≤ count ≤ max`;
   - the min-zero wake rule;
@@ -1229,9 +1306,8 @@ with a hand-written identity binding, with no change to the engine.
 1. **Cluster-wide inputs.**
    - Per-target usage and edge rollups on the digest;
      `GetScalingInputs`.
-   - Request-vs-usage in `legion job info`, `legion job usage`, and the
-     job page.
-   - The `GetJobScaleStatus` base-count fix.
+   - Request-vs-usage in `legion job info` and the job page.
+   - `GetJobScaleStatus` reads through `effective_task_count` (hardening).
 
    *Alone:* "how busy is my job" has one answer on any manager.
 2. **Task autoscaling MVP as the bundled app.**
@@ -1244,7 +1320,8 @@ with a hand-written identity binding, with no change to the engine.
      pins on `job scale`.
    - Events, `dry-run` mode, MCP read tools.
 
-   *Alone:* S1, S2 (minus the external check), and S5.
+   *Alone:* S1 and S5, plus S2's bounds, step limits, and dry-run week.
+   S2's business-hours floor needs schedules (Phase 3).
 3. **Full policies.**
    - `checks`; the `prometheus` and `http` sources; the `per-replica`,
      `threshold`, `pass-through`, and `fixed` strategies.
@@ -1252,7 +1329,7 @@ with a hand-written identity binding, with no change to the engine.
    - `min = 0` with activation and its validation.
    - `legion scaling simulate` over the rollup buffer and CSV.
 
-   *Alone:* S3.
+   *Alone:* S3, and S2 in full.
 4. **External plugins and standalone policies.**
    - The JSON-RPC protocol over stdio and HTTP; plugin install through app
      config (artifacts).
@@ -1284,54 +1361,87 @@ vertical strategies, and WASM strategies.
 
 ## 9. Testing plan
 
-- **Pipeline unit tests (Phase 2), table-driven:**
+Grouped by the phase that adds them. Every phase also runs the regression
+gates at the end.
+
+**Phase 1: inputs**
+- Rollup merge across three managers with one stale.
+- A node switching managers is counted once (the newest per-(node, target)
+  sample wins).
+- After a status-lane leader change, the full resync arrives, and inputs
+  read as missing data until it does.
+- Size bounds; MHz conversion; `cores` reservations.
+- `GetJobScaleStatus` agrees with `effective_task_count` for every
+  override state, including pins.
+
+**Phase 2: engine and task autoscaling**
+- Pipeline unit tests, table-driven:
   - every stage's pass and change behavior;
   - the HPA formula and tolerance band;
   - the warmup rule (0% up, 100% down);
-  - missing-data holds, the cold-start hold, and the flap guard;
-  - rolling `step` windows, including both directions within one window;
-  - bounds and schedules (with time zones);
-  - the pin and pause precedence matrix.
-- **Engine simulation tests.** A deterministic clock plus synthetic series
+  - missing-data holds, `onMissing = ignore`, the cold-start hold, and the
+    flap guard;
+  - rolling `step` windows, including both directions within one window,
+    and a partial `step` record zeroing the other half;
+  - bounds after step (a raised floor applies at once);
+  - the pin and pause precedence matrix, including a pin above `max`.
+- Engine simulation tests. A deterministic clock plus synthetic series
   (ramp, spike, sawtooth, a dropped source) are run through the same code
-  path as `legion scaling simulate`. The tests assert the decision sequence
-  and assert that no oscillation exceeds the flap guard. The S1–S3 numbers
-  in §3 become golden tests.
-- **Store and RPC:**
-  - CAS conflicts (two writers, human vs autoscaler);
-  - `scale_history` cap and ordering;
+  path `legion scaling simulate` will use. They assert the decision
+  sequence, and assert that no oscillation exceeds the flap guard. S1's
+  numbers become golden tests.
+- Store and RPC:
+  - CAS conflicts: two writers, and human vs autoscaler;
+  - version tokens survive a delete and recreate without repeating;
+  - `scale_history` cap, ordering, and dry-run rows;
   - pins expiring through `effective_task_count`;
   - `ScaleTask` deferral during rollouts with `source = autoscaler`;
-  - group targets writing every member in one transaction.
-- **Rollups:**
-  - merge across three managers with one stale;
-  - failover emptiness and cold-start;
-  - size bounds;
-  - MHz conversion and `cores` reservations.
-- **Integration** (`tests/integration/autoscaler.rs`, one module in the
-  shared binary, using worker simulation for fake usage):
+  - server-side refusal of autoscaler writes to a paused target;
+  - group targets writing every member in one transaction;
+  - the autoscale-aware submit arbitration (raise count, lower count,
+    remove `autoscale`), as a matrix next to Phase 0's.
+- Integration (`tests/integration/autoscaler.rs`, one module in the shared
+  binary, using worker simulation for fake usage):
   - S1 end to end: load ramps, the count rises, the count falls after the
     window;
   - the app on the manager's system worker with zero workers;
-  - app death: `scaling status` reports NOT RUNNING and nothing scales;
-  - two replicas sharded with a forced lease overlap: exactly one write
-    lands;
-  - a tenant policy naming an uninstalled plugin, or one outside its
-    namespace allowlist: rejected;
-  - node groups against a scripted `exec` provider from zero, including
-    `joinTimeout`, drain → terminate → forget ordering, drain-deadline
-    abort, and the never-victim protections.
-- **Plugin protocol.** The conformance suite (`scaling plugin test`) runs
-  in CI against the example plugins: crash and restart, a timeout, a
-  malformed reply, a schema-invalid policy config.
-- **Regression gates.**
-  - `acl_endpoints::every_manager_rpc_is_classified` for each new RPC.
-  - The capability-catalog test (`mutates` flags).
-  - Heartbeat-path benchmarks before and after the rollups.
-  - `GetCapacityDemand` reuses scheduler feasibility functions but is not
-    on the placement path. Any refactor that touches `is_permitted` or
-    candidate filtering ships with `scheduler_bench` before/after numbers
-    (AGENTS.md).
+  - app death: `scaling status` reports NOT RUNNING, and nothing scales;
+  - `ReportScalingStatus` from a non-app token is refused.
+
+**Phase 3: full policies**
+- Each built-in strategy's math, with schedule time zones and DST.
+- `min = 0` validation and the activation path.
+- `scaling simulate` over the live rollup buffer matches the decisions the
+  engine made over the same hour.
+
+**Phase 4: plugins and standalone policies**
+- The conformance suite (`scaling plugin test`) runs in CI against the
+  example plugins: crash and restart, a timeout, a malformed reply, a
+  schema-invalid policy config.
+- A tenant policy naming an uninstalled plugin, or one outside its
+  namespace allowlist, is rejected at apply.
+
+**Phase 5: nodes**
+- Node groups against a scripted `exec` provider from zero, including:
+  - `joinTimeout`;
+  - drain → terminate → forget ordering, and the drain-deadline abort;
+  - the never-victim protections;
+  - `ForgetNode` revoking the node token.
+- Two app replicas with a forced lease overlap: exactly one action intent
+  wins, and exactly one `target/scale` call reaches the provider.
+
+**Phase 7: sharding**
+- Rebalance after a replica is killed.
+- Exactly one `ScaleTask` lands per decision under a lease overlap.
+- The 10,000-policy load run.
+
+**Regression gates (every phase)**
+- `acl_endpoints::every_manager_rpc_is_classified` for each new RPC.
+- The capability-catalog test (`mutates` flags).
+- Heartbeat-path benchmarks before and after the rollups (Phase 1).
+- `GetCapacityDemand` reuses scheduler feasibility functions but is not on
+  the placement path. Any refactor that touches `is_permitted` or candidate
+  filtering ships with `scheduler_bench` before/after numbers (AGENTS.md).
 
 ## 10. Rollout and compatibility
 
@@ -1389,9 +1499,9 @@ vertical strategies, and WASM strategies.
 ## 12. Acceptance criteria
 
 - **P1.** `GetScalingInputs` returns the same per-task CPU for a job whose
-  allocations heartbeat to three different managers, on every manager.
-  Usage is visible in `legion job info` and the job page. The
-  `GetJobScaleStatus` stale-override case is covered by a test.
+  allocations heartbeat to three different managers, on every manager. A
+  node switching managers mid-test is not double-counted. Usage is visible
+  in `legion job info` and the job page.
 - **P2.**
   - The S1 jobspec, unchanged, holds a CPU-loaded task within the
     tolerance band through a ramp, scales out within one minute, and

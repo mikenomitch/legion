@@ -4271,13 +4271,16 @@ plan.
         reserved `legion-*` namespaces), node-side `namespaces` restriction on
         worker types (scheduler filter + blocked-eval wake), and a default-on
         system worker in each manager (capped lend, pool `legion-system`,
-        `legion.role = manager`), with `--run-worker` reshaped as
-        `namespaces = ["*"]`
+        `legion.role = manager`, `cpu.max`/`memory.max` on its cgroup parent),
+        with `--run-worker` reshaped as `namespaces = ["*", "legion-*"]`;
+        the `legion/` KV prefix reserved the same way; no root exec tasks or
+        privileged containers in reserved namespaces
   - [ ] A2: `identities[].permissions` / `policies` on the `legion` identity,
         granted at submit only up to what the submitter holds; per-version
         grants with `legion acl grants list|revoke`; a per-allocation API
-        socket (`LEGION_ADDR=unix://…`) proxied by the worker with the
-        allocation's identity; rewrite `configs/jobs/cert-renewer.ncl` on it
+        socket (`LEGION_ADDR=unix://…`, `SO_PEERCRED` plus cgroup check)
+        proxied by the worker with the allocation's identity; the grant check
+        on `RunJobTemplate` too; rewrite `configs/jobs/cert-renewer.ncl` on it
   - [ ] A3: app manifests and records, the Control-leader reconciler,
         `legion:self` for bundled apps, seeding, `legion app
         list|status|install|upgrade|config|set|enable|disable|uninstall`
@@ -4287,7 +4290,10 @@ plan.
         `legion app view` and `legion_app_view`
   - [ ] A5: UI tier 2, sandboxed single-file pages with a postMessage bridge
         (RPC allowlist, viewer identity, strict CSP)
-  - [ ] A6: install apps from the registry (waits on the registry plan)
+  - [ ] Deferred: install apps from a registry (waits on a registry plan
+        that doesn't exist yet), tenant-owned apps, and pre-approved
+        per-namespace grants, so GitOps needn't hold the union of what its
+        jobs request (plan §6.7, §11)
 
 - [ ] **Autoscaler**: [plan](plans/autoscaler-v2-plan.md) (PLANNED) ·
       [calls](calls/autoscaler-v2-plan_calls.md). Supersedes
@@ -4336,10 +4342,14 @@ plan.
   - [ ] Phase 6: autoscaler UI as app extensions (needs apps A4)
   - [ ] Phase 7: sharded replicas (shard leases, rebalancing) and a
         10,000-policy load test
-  - [ ] **Bug:** `GetJobScaleStatus` reports `override_count.unwrap_or(spec)`
-        without the `base_count` filter `effective_task_count` applies
-        (`src/manager/server.rs:6250`), so it can show a stale override as
-        effective. Found during v2 recon; fixed in v2 Phase 1.
+  - [ ] **Hardening:** `GetJobScaleStatus` reports
+        `override_count.unwrap_or(spec)` without the `base_count` filter that
+        `effective_task_count` applies (`src/manager/server.rs:6250`). This
+        can't be reached today, because submit arbitration deletes a
+        mismatched override in the same transaction
+        (`store.rs:10838-10850`). Pins and autoscale-aware arbitration add
+        new override states, so v2 Phase 1 routes status through
+        `effective_task_count`.
   - [ ] Deferred from v2 (plan §4, §8): waking a `service` from zero on
         the first request (needs the gateway to route to services),
         `service.concurrency` once netd attributes ingress requests, keyed
