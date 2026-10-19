@@ -10526,8 +10526,9 @@ message ExecKey {
   string id = 1;
   // A label for people, e.g. `"agents-platform"`.
   string name = 2;
-  // Glob over job names the key's tickets may open sessions in,
-  // e.g. `"agents-*"`.
+  // Job pattern the key's tickets may open sessions in: a name glob
+  // (`"agents-*"`, jobs in `default`) or `namespace-glob/name-glob`
+  // (`"agents/*"`). See `CreateExecKeyRequest.jobs`.
   string jobs = 3;
   // The ES256 (P-256) public key, SPKI PEM.
   string public_key_pem = 4;
@@ -10545,7 +10546,11 @@ message ExecKey {
 message CreateExecKeyRequest {
   // A label for people. Optional.
   string name = 1;
-  // Glob over job names, e.g. `"agents-*"`. Required.
+  // Job pattern the key's tickets may reach. Required. `"agents-*"`
+  // matches jobs in the `default` namespace only; `"agents/*"` or
+  // `"agents-*/web*"` is `namespace-glob/name-glob`, so reaching into a
+  // namespace is written into the pattern and `*` alone never crosses
+  // one. More than one `/` is InvalidArgument.
   string jobs = 2;
   // The ES256 (P-256) public key, SPKI PEM (`openssl ec -pubout`). Required.
   string public_key_pem = 3;

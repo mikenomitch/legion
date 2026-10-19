@@ -788,7 +788,8 @@ pub struct Metrics {
     pub scheduler_concurrency_adjustments_total: Arc<CounterVec>,
     /// `legion_scheduler_admission_skips_total`
     pub scheduler_admission_skips_total: Arc<Counter>,
-    /// `legion_preemptions_total{pool,band}` — victims actually evicted.
+    /// `legion_preemptions_total{pool,band,namespace}` — victims actually
+    /// evicted.
     pub preemptions_total: Arc<CounterVec>,
     /// `legion_preemption_plans_total{outcome}` — preemption passes that
     /// reached a decision: `placed`, `observe`, or `no_victims`.
@@ -851,6 +852,19 @@ pub struct Metrics {
     pub envelope_resizes_total: Arc<CounterVec>,
     /// `legion_allocations`
     pub allocations: Arc<Gauge>,
+    /// `legion_namespace_jobs{namespace}` (docs/metrics.md, "Namespaces")
+    pub namespace_jobs: Arc<GaugeVec>,
+    /// `legion_namespace_allocations{namespace}` (docs/metrics.md,
+    /// "Namespaces")
+    pub namespace_allocations: Arc<GaugeVec>,
+    /// `legion_namespace_reserved_cpu_mhz{namespace}` (docs/metrics.md,
+    /// "Namespaces")
+    pub namespace_reserved_cpu_mhz: Arc<GaugeVec>,
+    /// `legion_namespace_reserved_memory_bytes{namespace}` (docs/metrics.md,
+    /// "Namespaces")
+    pub namespace_reserved_memory_bytes: Arc<GaugeVec>,
+    /// `legion_job_submits_total{namespace}` (docs/metrics.md, "Namespaces")
+    pub job_submits_total: Arc<CounterVec>,
     /// `legion_store_write_lock_wait_seconds`
     pub store_write_lock_wait_seconds: Arc<Histogram>,
     /// `legion_store_read_lock_wait_seconds`
@@ -1175,8 +1189,8 @@ impl Metrics {
         let preemptions_total = Arc::new(CounterVec {
             meta: FamilyMeta {
                 name: "legion_preemptions_total",
-                help: "Allocations evicted by scheduler preemption, by the victim's node pool and priority band.",
-                labels: &["pool", "band"],
+                help: "Allocations evicted by scheduler preemption, by the victim's node pool, priority band, and namespace.",
+                labels: &["pool", "band", "namespace"],
             },
             series: Series::new(),
         });
@@ -1376,6 +1390,38 @@ impl Metrics {
                 labels: &[],
             },
             cell: GaugeCell::default(),
+        });
+        let namespace_gauge = |name: &'static str, help: &'static str| {
+            Arc::new(GaugeVec {
+                meta: FamilyMeta {
+                    name,
+                    help,
+                    labels: &["namespace"],
+                },
+                series: Series::new(),
+            })
+        };
+        let namespace_jobs =
+            namespace_gauge("legion_namespace_jobs", "Registered jobs, by namespace.");
+        let namespace_allocations = namespace_gauge(
+            "legion_namespace_allocations",
+            "Live allocations (not complete or failed), by their job's namespace.",
+        );
+        let namespace_reserved_cpu_mhz = namespace_gauge(
+            "legion_namespace_reserved_cpu_mhz",
+            "CPU in MHz reserved by live allocations, by namespace: what a namespace policy quota is charged against.",
+        );
+        let namespace_reserved_memory_bytes = namespace_gauge(
+            "legion_namespace_reserved_memory_bytes",
+            "Memory in bytes reserved by live allocations, by namespace.",
+        );
+        let job_submits_total = Arc::new(CounterVec {
+            meta: FamilyMeta {
+                name: "legion_job_submits_total",
+                help: "Job submissions the manager accepted (RunJob and RunJobTemplate, deduplicated retries excluded), by namespace.",
+                labels: &["namespace"],
+            },
+            series: Series::new(),
         });
         let store_write_lock_wait_seconds = Arc::new(Histogram {
             meta: FamilyMeta {
@@ -1857,6 +1903,11 @@ impl Metrics {
             Arc::clone(&liveness_loss_suppressed_total) as Arc<dyn RenderMetric>,
             Arc::clone(&liveness_checkpoint_seconds) as Arc<dyn RenderMetric>,
             Arc::clone(&allocations) as Arc<dyn RenderMetric>,
+            Arc::clone(&namespace_jobs) as Arc<dyn RenderMetric>,
+            Arc::clone(&namespace_allocations) as Arc<dyn RenderMetric>,
+            Arc::clone(&namespace_reserved_cpu_mhz) as Arc<dyn RenderMetric>,
+            Arc::clone(&namespace_reserved_memory_bytes) as Arc<dyn RenderMetric>,
+            Arc::clone(&job_submits_total) as Arc<dyn RenderMetric>,
             Arc::clone(&eval_queue_depth) as Arc<dyn RenderMetric>,
             Arc::clone(&evals_processed_total) as Arc<dyn RenderMetric>,
             Arc::clone(&grpc_in_flight) as Arc<dyn RenderMetric>,
@@ -1997,6 +2048,11 @@ impl Metrics {
             session_stops_total,
             session_promotions_total,
             allocations,
+            namespace_jobs,
+            namespace_allocations,
+            namespace_reserved_cpu_mhz,
+            namespace_reserved_memory_bytes,
+            job_submits_total,
             store_write_lock_wait_seconds,
             store_read_lock_wait_seconds,
             store_coalesce_batch_size,
@@ -3482,6 +3538,11 @@ mod tests {
         let out = render();
         for family in [
             "legion_allocations",
+            "legion_namespace_jobs",
+            "legion_namespace_allocations",
+            "legion_namespace_reserved_cpu_mhz",
+            "legion_namespace_reserved_memory_bytes",
+            "legion_job_submits_total",
             "legion_eval_queue_depth",
             "legion_evals_processed_total",
             "legion_grpc_in_flight",

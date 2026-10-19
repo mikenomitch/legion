@@ -163,6 +163,21 @@ pub fn qualify_in(namespace: &str, reference: &str) -> String {
     }
 }
 
+/// Whether a job pattern matches a canonical job id. A pattern with a `/`
+/// is `namespace-glob/name-glob` (`payments-*/web*`); one without matches
+/// names in `default` only. So `*` never reaches into another namespace,
+/// and crossing one is written into the pattern.
+pub fn job_pattern_matches(pattern: &str, id: &str) -> bool {
+    let (namespace, name) = split_job_id(id);
+    match pattern.split_once('/') {
+        Some((namespace_glob, name_glob)) => {
+            crate::structs::acl::glob_match(namespace_glob, namespace)
+                && crate::structs::acl::glob_match(name_glob, name)
+        }
+        None => namespace == DEFAULT_NAMESPACE && crate::structs::acl::glob_match(pattern, name),
+    }
+}
+
 /// Resolves a user-typed job reference to a canonical job id.
 ///
 /// `input` is either a bare name (resolved in `active`, or `default` when
@@ -278,6 +293,24 @@ impl NamespaceSelection {
 #[cfg(test)]
 mod namespace_test {
     use super::*;
+
+    #[test]
+    fn job_patterns_cross_a_namespace_only_when_they_say_so() {
+        assert!(job_pattern_matches("agents-*", "agents-1"));
+        assert!(!job_pattern_matches("agents-*", "payments/agents-1"));
+        assert!(!job_pattern_matches("*", "payments/web"));
+        assert!(job_pattern_matches(
+            "payments-*/web*",
+            "payments-prod/web-2"
+        ));
+        assert!(!job_pattern_matches("payments-*/web*", "payments-prod/api"));
+        assert!(job_pattern_matches("*/*", "payments/web"));
+        assert!(
+            job_pattern_matches("*/*", "web"),
+            "default is a namespace too"
+        );
+        assert!(job_pattern_matches("default/web", "web"));
+    }
 
     #[test]
     fn namespace_grammar_is_a_dns_label() {

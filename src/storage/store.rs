@@ -850,8 +850,8 @@ struct AppliedEvictions {
     /// `allocation.preempted` events, staged in the transaction and
     /// published after it commits.
     events: Vec<SchedulerEventRecord>,
-    /// `(pool, band, count)` rows for `legion_preemptions_total`.
-    metric_rows: Vec<(String, String, u64)>,
+    /// `(pool, band, namespace, count)` rows for `legion_preemptions_total`.
+    metric_rows: Vec<(String, String, String, u64)>,
 }
 
 /// What a heartbeat from a given node costs.
@@ -6171,8 +6171,10 @@ impl Store {
         }
         if !preempted.victims.is_empty() {
             let metrics = crate::manager::telemetry::metrics();
-            for (pool, band, count) in preempted.metric_rows {
-                metrics.preemptions_total.inc_by(&[&pool, &band], count);
+            for (pool, band, namespace, count) in preempted.metric_rows {
+                metrics
+                    .preemptions_total
+                    .inc_by(&[&pool, &band, &namespace], count);
             }
             metrics.preemption_plans_total.inc(&["placed"]);
         }
@@ -6652,9 +6654,9 @@ impl Store {
             }
         }
 
-        // Metric rows, keyed by the victim's pool and band — the two axes an
-        // operator slices preemption rate by.
-        let mut metric_counts: BTreeMap<(String, String), u64> = BTreeMap::new();
+        // Metric rows, keyed by the victim's pool, band and namespace — the
+        // axes an operator slices preemption rate by.
+        let mut metric_counts: BTreeMap<(String, String, String), u64> = BTreeMap::new();
         for victim in &victims {
             let pool: String = tx
                 .query_row(
@@ -6669,7 +6671,8 @@ impl Store {
                 .find(|eviction| eviction.allocation_id == victim.id)
                 .map(|eviction| eviction.band.clone())
                 .unwrap_or_else(|| Band::default().as_str().to_string());
-            *metric_counts.entry((pool, band)).or_default() += 1;
+            let namespace = crate::structs::namespace::job_namespace(&victim.job_id).to_string();
+            *metric_counts.entry((pool, band, namespace)).or_default() += 1;
         }
 
         Ok(AppliedEvictions {
@@ -6677,7 +6680,7 @@ impl Store {
             events,
             metric_rows: metric_counts
                 .into_iter()
-                .map(|((pool, band), count)| (pool, band, count))
+                .map(|((pool, band, namespace), count)| (pool, band, namespace, count))
                 .collect(),
         })
     }
@@ -13239,21 +13242,29 @@ impl Store {
     /// in-task `to`, else its static host port — so a consumer's VIP can
     /// listen on the number the service is known by. `None` when the service
     /// is not (yet) submitted or declares only a dynamic port with no `to`.
-    fn declared_service_port(&self, tx: &Connection, service: &str) -> R<Option<u16>> {
+    /// The port a service declares, by its canonical reference
+    /// (`name` in `default`, else `namespace/name`): the newest task config
+    /// in that namespace advertising it.
+    fn declared_service_port(&self, tx: &Connection, service_ref: &str) -> R<Option<u16>> {
+        let (namespace, service) = crate::structs::namespace::split_job_id(service_ref);
         let mut stmt = tx.prepare_cached(
-            "SELECT network, service FROM task_config
+            "SELECT network, service, job_id FROM task_config
              WHERE service IS NOT NULL AND json_valid(service)
                AND COALESCE(json_extract(service, '$.name'), name) = ?
-             ORDER BY id DESC LIMIT 1;",
+             ORDER BY id DESC;",
         )?;
-        let row = stmt
-            .query_row([service], |row| {
-                Ok((
-                    row.get::<_, Option<String>>(0)?,
-                    row.get::<_, Option<String>>(1)?,
-                ))
-            })
-            .optional()?;
+        let mut rows = stmt.query([service])?;
+        let mut row = None;
+        while let Some(candidate) = rows.next()? {
+            let job_id: String = candidate.get(2)?;
+            if crate::structs::namespace::job_namespace(&job_id) == namespace {
+                row = Some((
+                    candidate.get::<_, Option<String>>(0)?,
+                    candidate.get::<_, Option<String>>(1)?,
+                ));
+                break;
+            }
+        }
         let Some((network_raw, service_raw)) = row else {
             return Ok(None);
         };
@@ -13641,11 +13652,15 @@ impl Store {
             }
             let mut service_ports: HashMap<String, u16> = HashMap::new();
             if let Some(connect) = connect.as_ref() {
+                let consumer_job: String = tx
+                    .prepare_cached("SELECT job_id FROM task_config WHERE id = ?;")?
+                    .query_row([task_id], |row| row.get(0))?;
                 for upstream in &connect.upstreams {
                     if upstream.is_external() {
                         continue;
                     }
-                    if let Some(port) = self.declared_service_port(tx, &upstream.service)? {
+                    let target = upstream.service_ref(&consumer_job);
+                    if let Some(port) = self.declared_service_port(tx, &target)? {
                         service_ports.insert(upstream.key().to_string(), port);
                     }
                 }

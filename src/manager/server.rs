@@ -2317,6 +2317,9 @@ impl ManagerDaemonService {
             None => self.store.handle_job_submit(&config, &subs),
         }
         .map_err(|e| map_store_error("Error running job", e))?;
+        crate::manager::telemetry::metrics()
+            .job_submits_total
+            .inc(&[&namespace]);
 
         // Resubmitting revives a previously stopped job: clear the stopped
         // status so the instance-management RPCs accept it again. Stopped
@@ -10603,9 +10606,17 @@ impl Manager for ManagerDaemonService {
             .store
             .declared_consumers()
             .map_err(|e| map_store_error("Error listing declared consumers", e))?;
+        // An edge names the upstream by its key (an alias, or
+        // `service.namespace` for a crossing); the declaration says which
+        // service that key dials.
+        let mut targets: HashMap<(String, String), String> = HashMap::new();
         for consumer in consumers {
             for upstream in &consumer.upstreams {
                 let service = upstream.key().to_string();
+                targets.insert(
+                    (consumer.job_id.clone(), service.clone()),
+                    upstream.service_ref(&consumer.job_id),
+                );
                 // Tagged observed edges for the same (caller, service) are
                 // declared too.
                 let mut any = false;
@@ -10637,10 +10648,15 @@ impl Manager for ManagerDaemonService {
         }
         let secs = f64::from(window_secs);
         for ((job, _, service, _), edge) in edges.iter_mut() {
-            let target = crate::structs::namespace::qualify_in(
-                crate::structs::namespace::job_namespace(job),
-                service,
-            );
+            let target = targets
+                .get(&(job.clone(), service.clone()))
+                .cloned()
+                .unwrap_or_else(|| {
+                    crate::structs::namespace::qualify_in(
+                        crate::structs::namespace::job_namespace(job),
+                        service,
+                    )
+                });
             if let Some((owner, allow)) = allow_by_service.get(&target) {
                 edge.allowed = crate::structs::allow_permits(allow, owner, job);
             }
@@ -14240,22 +14256,6 @@ fn parse_test_target(
     (Some(host.to_ascii_lowercase()), ip, port, None)
 }
 
-/// The canonical service reference an upstream dials from `consumer_job`:
-/// the upstream's `namespace` when set, else the service's qualified
-/// namespace, else the consumer's own.
-fn upstream_service_ref(upstream: &crate::structs::UpstreamConfig, consumer_job: &str) -> String {
-    let consumer_namespace = crate::structs::namespace::job_namespace(consumer_job);
-    match upstream
-        .namespace
-        .as_deref()
-        .map(str::trim)
-        .filter(|namespace| !namespace.is_empty())
-    {
-        Some(namespace) => crate::structs::namespace::qualify_in(namespace, &upstream.service),
-        None => crate::structs::namespace::qualify_in(consumer_namespace, &upstream.service),
-    }
-}
-
 fn build_upstream_endpoints(
     store: &Store,
     desired: &[crate::structs::TaskAllocation],
@@ -14300,7 +14300,7 @@ fn build_upstream_endpoints(
             // The service lives in the consumer's own namespace unless the
             // upstream names another (docs/namespaces.md): a bare name never
             // resolves across a namespace boundary.
-            let target = upstream_service_ref(upstream, &allocation.job_id);
+            let target = upstream.service_ref(&allocation.job_id);
             let key = (target.clone(), allocation.job_id.clone());
             if !resolved.contains_key(&key) {
                 let rows = match store.service_endpoints(Some(&target)) {
@@ -14357,9 +14357,11 @@ fn build_upstream_endpoints(
                 endpoints = endpoints.len(),
                 "Resolved upstream endpoints"
             );
+            // The worker keys its listeners by the upstream's key (the alias,
+            // or `service.namespace` for a crossing), not the catalog name.
             upstreams.push(crate::structs::UpstreamEndpoints {
                 allocation_id: allocation.allocation_id,
-                service: upstream.service.clone(),
+                service: upstream.key().into_owned(),
                 endpoints,
                 for_handler: false,
             });

@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 use serde::{Deserialize, Serialize};
@@ -850,6 +851,41 @@ fn is_header_token(name: &str) -> bool {
         })
 }
 
+/// Validate where a service upstream points: `namespace` and a qualified
+/// `service` are namespace names, and when both are written they agree.
+fn validate_upstream_namespace(task_name: &str, upstream: &UpstreamConfig) -> R<()> {
+    let what = format!(
+        "task {task_name} connect.upstreams entry '{}'",
+        upstream.service
+    );
+    let field = upstream
+        .namespace
+        .as_deref()
+        .map(str::trim)
+        .filter(|namespace| !namespace.is_empty());
+    let qualifier = upstream
+        .service
+        .split_once('/')
+        .map(|(namespace, _)| namespace);
+    for namespace in field.iter().chain(qualifier.iter()) {
+        crate::structs::namespace::validate_namespace_name(namespace)
+            .map_err(|err| anyhow!("{what} namespace: {err}"))?;
+    }
+    if let (Some(field), Some(qualifier)) = (field, qualifier) {
+        if field != qualifier {
+            bail!(
+                "{what} names namespace '{qualifier}' in service and '{field}' in namespace; \
+                 write one of them"
+            );
+        }
+    }
+    let name = upstream.service_name();
+    if name.is_empty() || name.contains('/') {
+        bail!("{what}: service must be a name or namespace/name");
+    }
+    Ok(())
+}
+
 /// Validate one upstream's `credentials`: only on an external `https://`
 /// upstream, a valid non-reserved header named at most once, a provider.
 fn validate_upstream_credentials(task_name: &str, upstream: &UpstreamConfig) -> R<()> {
@@ -960,13 +996,47 @@ impl UpstreamConfig {
         self.to.as_deref().is_some_and(|to| !to.trim().is_empty())
     }
 
-    /// The key this upstream is known by: `name` when given, else `service`.
-    /// It is what `LEGION_UPSTREAM_<KEY>` and `AllocUpstream.service` carry.
-    pub fn key(&self) -> &str {
+    /// The key this upstream is known by: `name` when given, else the
+    /// service, written `<service>.<namespace>` when the upstream crosses
+    /// into another namespace. It is what `LEGION_UPSTREAM_<KEY>`,
+    /// `<key>.svc.legion`, and `AllocUpstream.service` carry, so a crossing
+    /// stays visible wherever the task uses it.
+    pub fn key(&self) -> Cow<'_, str> {
         match self.name.as_deref() {
-            Some(name) if !name.trim().is_empty() => name,
-            _ => self.service.as_str(),
+            Some(name) if !name.trim().is_empty() => Cow::Borrowed(name),
+            _ => match self.target_namespace() {
+                Some(namespace) => Cow::Owned(format!("{}.{namespace}", self.service_name())),
+                None => Cow::Borrowed(self.service.as_str()),
+            },
         }
+    }
+
+    /// The namespace this upstream names for its service, if any: the
+    /// `namespace` field, else the qualifier of a `namespace/service`
+    /// reference. `None` means the consumer's own namespace.
+    pub fn target_namespace(&self) -> Option<&str> {
+        self.namespace
+            .as_deref()
+            .map(str::trim)
+            .filter(|namespace| !namespace.is_empty())
+            .or_else(|| self.service.split_once('/').map(|(namespace, _)| namespace))
+    }
+
+    /// The service's bare name, without a `namespace/` qualifier.
+    pub fn service_name(&self) -> &str {
+        self.service
+            .split_once('/')
+            .map_or(self.service.as_str(), |(_, name)| name)
+    }
+
+    /// The canonical service reference this upstream dials from
+    /// `consumer_job`: the named namespace, else the consumer's own. A bare
+    /// service never resolves across a namespace boundary.
+    pub fn service_ref(&self, consumer_job: &str) -> String {
+        let namespace = self
+            .target_namespace()
+            .unwrap_or_else(|| crate::structs::namespace::job_namespace(consumer_job));
+        crate::structs::namespace::job_id(namespace, self.service_name())
     }
 
     /// Whether the datapath parses HTTP on this upstream.
@@ -1550,7 +1620,7 @@ pub fn assign_allocation_ports_full(
             if !taken.insert(local_port) {
                 return Err(anyhow::Error::new(StaticPortInUse::for_upstream(
                     local_port,
-                    upstream.key(),
+                    &upstream.key(),
                 )));
             }
             assigned_upstreams.push(AllocUpstream {
@@ -1633,7 +1703,7 @@ pub fn assign_allocation_ports_full(
             }
             let canonical_port = upstream
                 .local_port
-                .or_else(|| service_ports.get(key).copied())
+                .or_else(|| service_ports.get(key.as_ref()).copied())
                 .or_else(|| {
                     upstream
                         .to
@@ -1835,7 +1905,7 @@ pub fn validate_task_connect(
         }
     }
 
-    let mut services: HashSet<&str> = HashSet::new();
+    let mut services: HashSet<Cow<'_, str>> = HashSet::new();
     let mut local_ports: HashSet<u16> = HashSet::new();
     for upstream in &connect_config.upstreams {
         let has_service = !upstream.service.trim().is_empty();
@@ -1866,7 +1936,14 @@ pub fn validate_task_connect(
                     },
                 )?;
             }
-            (true, false) => {}
+            (true, false) => validate_upstream_namespace(task_name, upstream)?,
+        }
+        if upstream.is_external() && upstream.namespace.is_some() {
+            bail!(
+                "task {task_name} connect.upstreams entry '{}' sets namespace on an external \
+                 destination; namespace names where a catalog service lives",
+                upstream.key()
+            );
         }
         if !services.insert(upstream.key()) {
             bail!(
@@ -1875,7 +1952,7 @@ pub fn validate_task_connect(
             );
         }
         if let Some(http) = upstream.http.as_ref() {
-            validate_upstream_http(task_name, upstream.key(), http)?;
+            validate_upstream_http(task_name, &upstream.key(), http)?;
         }
         validate_upstream_credentials(task_name, upstream)?;
         for (index, handler) in upstream.handlers.iter().enumerate() {
@@ -2858,6 +2935,75 @@ mod tests {
             "{err}"
         );
         assert!(err.to_string().contains("task api"), "{err}");
+    }
+
+    #[test]
+    fn crossing_upstreams_key_by_service_and_namespace() {
+        let config = connect(json!([
+            { "service": "redis" },
+            { "service": "auth", "namespace": "shared" },
+            { "service": "shared/billing" },
+            { "service": "ledger", "namespace": "shared", "name": "books" },
+        ]));
+        let keys: Vec<String> = config
+            .upstreams
+            .iter()
+            .map(|u| u.key().into_owned())
+            .collect();
+        assert_eq!(keys, ["redis", "auth.shared", "billing.shared", "books"]);
+        let refs: Vec<String> = config
+            .upstreams
+            .iter()
+            .map(|u| u.service_ref("checkout/api"))
+            .collect();
+        assert_eq!(
+            refs,
+            [
+                "checkout/redis",
+                "shared/auth",
+                "shared/billing",
+                "shared/ledger"
+            ]
+        );
+        // A bare service from `default` stays in `default`; a crossing into
+        // `default` is the bare id.
+        assert_eq!(config.upstreams[0].service_ref("api"), "redis");
+        let into_default = connect(json!([{ "service": "auth", "namespace": "default" }]));
+        assert_eq!(
+            into_default.upstreams[0].service_ref("checkout/api"),
+            "auth"
+        );
+        assert!(validate_task_connect("api", None, Some(&config), None).is_ok());
+    }
+
+    #[test]
+    fn validate_connect_rejects_bad_or_conflicting_upstream_namespaces() {
+        for (upstreams, expect) in [
+            (
+                json!([{ "service": "auth", "namespace": "Shared" }]),
+                "namespace",
+            ),
+            (json!([{ "service": "a/b/c" }]), "namespace/name"),
+            (
+                json!([{ "service": "shared/auth", "namespace": "other" }]),
+                "write one of them",
+            ),
+            (
+                json!([{ "name": "x", "to": "https://example.com", "namespace": "shared" }]),
+                "external destination",
+            ),
+        ] {
+            let err = validate_task_connect("api", None, Some(&connect(upstreams)), None)
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains(expect), "{expect}: {err}");
+        }
+        // Two upstreams for the same service in two namespaces are distinct.
+        let both = connect(json!([
+            { "service": "auth" },
+            { "service": "auth", "namespace": "shared" },
+        ]));
+        assert!(validate_task_connect("api", None, Some(&both), None).is_ok());
     }
 
     #[test]

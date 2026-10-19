@@ -2087,6 +2087,40 @@ fn refresh_cluster_gauges(store: &Store) {
         Ok(count) => telemetry.allocations.set(count),
         Err(err) => debug!(error = ?err, "Failed refreshing allocation gauge"),
     }
+    match store.namespace_usage() {
+        Ok(usage) => {
+            // Every namespace that exists gets a series, so an emptied one
+            // reads 0 rather than going stale at its last value.
+            let mut names: std::collections::BTreeSet<String> = usage.keys().cloned().collect();
+            if let Ok(namespaces) = store.list_namespaces() {
+                names.extend(namespaces.into_iter().map(|record| record.namespace.name));
+            }
+            let gauge = |read: &dyn Fn(&crate::storage::namespace_store::NamespaceUsage) -> i64| {
+                names
+                    .iter()
+                    .map(|name| {
+                        let value = usage.get(name).map(read).unwrap_or(0);
+                        (vec![name.clone()], value)
+                    })
+                    .collect::<Vec<_>>()
+            };
+            telemetry
+                .namespace_jobs
+                .set_all(&gauge(&|usage| usage.jobs as i64));
+            telemetry
+                .namespace_allocations
+                .set_all(&gauge(&|usage| usage.total().allocations as i64));
+            telemetry
+                .namespace_reserved_cpu_mhz
+                .set_all(&gauge(&|usage| usage.total().cpu as i64));
+            telemetry
+                .namespace_reserved_memory_bytes
+                .set_all(&gauge(&|usage| {
+                    (usage.total().memory * 1024.0 * 1024.0) as i64
+                }));
+        }
+        Err(err) => debug!(error = ?err, "Failed refreshing namespace gauges"),
+    }
     // The read model's view of the fleet next to the DB's (`legion_nodes`
     // above): a persistent gap between the two is a truncated planning
     // universe, which previously took sampling plan_submission rows at rig

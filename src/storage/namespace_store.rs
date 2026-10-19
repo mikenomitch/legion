@@ -15,6 +15,7 @@ use crate::storage::store::Store;
 use crate::storage::Lane;
 use crate::structs::namespace::{validate_new_namespace_name, Namespace, DEFAULT_NAMESPACE};
 use serde::Serialize;
+use std::collections::BTreeMap;
 
 use rusqlite::{params, Connection, OptionalExtension, Row};
 use time::format_description::well_known::Rfc3339;
@@ -60,6 +61,62 @@ impl NamespaceContents {
             }
         }
         parts.join(", ")
+    }
+}
+
+/// What live allocations reserve, in one priority band: the unit a
+/// namespace policy's quota is charged in and the
+/// `legion_namespace_reserved_*` gauges show. A live allocation is any not
+/// yet `complete` or `failed`, the same set the scheduler counts against a
+/// node's capacity.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Reservation {
+    /// CPU in MHz (`resources.cpu`, after `taskResourceDefaults`).
+    pub cpu: f64,
+    /// Memory in MiB.
+    pub memory: f64,
+    /// Exclusive cores (`resources.cores`).
+    pub cores: f64,
+    pub allocations: u64,
+}
+
+impl Reservation {
+    fn add(&mut self, other: &Reservation) {
+        self.cpu += other.cpu;
+        self.memory += other.memory;
+        self.cores += other.cores;
+        self.allocations += other.allocations;
+    }
+}
+
+/// One namespace's footprint: its registered jobs and its live
+/// reservations by band.
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NamespaceUsage {
+    pub jobs: u64,
+    /// Keyed by band name (`high`, `normal`, ...); a band with no live
+    /// allocation is absent.
+    pub bands: BTreeMap<String, Reservation>,
+}
+
+impl NamespaceUsage {
+    /// Every band summed.
+    pub fn total(&self) -> Reservation {
+        let mut total = Reservation::default();
+        for reservation in self.bands.values() {
+            total.add(reservation);
+        }
+        total
+    }
+
+    /// Fold another namespace's usage in (a policy's aggregate).
+    pub fn absorb(&mut self, other: &NamespaceUsage) {
+        self.jobs += other.jobs;
+        for (band, reservation) in &other.bands {
+            self.bands.entry(band.clone()).or_default().add(reservation);
+        }
     }
 }
 
@@ -249,6 +306,79 @@ fn namespace_contents_on(conn: &Connection, name: &str) -> R<NamespaceContents> 
     })
 }
 
+/// Every namespace's usage, keyed by namespace name. A namespace with no
+/// jobs is absent; callers treat absent as zero.
+pub(crate) fn namespace_usage_on(
+    conn: &Connection,
+    policy: &crate::resources::ResourcePolicy,
+) -> R<BTreeMap<String, NamespaceUsage>> {
+    use crate::structs::namespace::job_namespace;
+    let mut usage: BTreeMap<String, NamespaceUsage> = BTreeMap::new();
+    let mut jobs = conn.prepare_cached("SELECT id FROM job;")?;
+    for id in jobs.query_map([], |row| row.get::<_, String>(0))? {
+        usage
+            .entry(job_namespace(&id?).to_string())
+            .or_default()
+            .jobs += 1;
+    }
+    let mut allocations = conn.prepare_cached(&format!(
+        "SELECT tc.job_id, jc.priority, a.resources FROM allocation a
+         INNER JOIN task_config tc ON tc.id = a.task_config_id
+         INNER JOIN job_config jc ON jc.id = a.job_config_id
+         WHERE a.status NOT IN ('{}', '{}');",
+        crate::constants::ALLOCATION_STATUS_COMPLETE,
+        crate::constants::ALLOCATION_STATUS_FAILED,
+    ))?;
+    let rows = allocations.query_map([], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, serde_json::Value>(2)?,
+        ))
+    })?;
+    for row in rows {
+        let (job_id, band, resources) = row?;
+        // A row nothing can parse reserves nothing here; the scheduler's
+        // own walk is what warns about it.
+        let Ok(request) = policy
+            .normalize_task_resources(&resources, false)
+            .and_then(|normalized| crate::resources::ResourceRequest::from_value(&normalized))
+        else {
+            continue;
+        };
+        let band = crate::structs::Band::from_stored(&band)
+            .as_str()
+            .to_string();
+        usage
+            .entry(job_namespace(&job_id).to_string())
+            .or_default()
+            .bands
+            .entry(band)
+            .or_default()
+            .add(&Reservation {
+                cpu: request.amount("cpu").unwrap_or(0.0),
+                memory: request.amount("memory").unwrap_or(0.0),
+                cores: match request.values.get("cores") {
+                    Some(crate::resources::ResourceValue::Amount(cores)) => *cores,
+                    Some(crate::resources::ResourceValue::Items(cores)) => cores.len() as f64,
+                    None => 0.0,
+                },
+                allocations: 1,
+            });
+    }
+    Ok(usage)
+}
+
+impl Store {
+    /// Every namespace's jobs and live reservations by band
+    /// ([`NamespaceUsage`]).
+    #[instrument(err, skip_all)]
+    pub fn namespace_usage(&self) -> R<BTreeMap<String, NamespaceUsage>> {
+        let conn = self.read_connection()?;
+        namespace_usage_on(&conn, &self.resource_policy)
+    }
+}
+
 fn invalid_input(message: String) -> anyhow::Error {
     anyhow::Error::new(StorageError::InvalidInput { message })
 }
@@ -287,6 +417,59 @@ mod namespace_store_test {
             rollout_by_group: Default::default(),
             version: None,
         }
+    }
+
+    #[test]
+    fn usage_counts_jobs_and_charges_live_allocations_by_band() -> R<()> {
+        let store = setup_store()?;
+        store.insert_node(crate::structs::NodeMsg {
+            id: "node-a".into(),
+            pool: "default".into(),
+            status: "ready".into(),
+            availability: "available".into(),
+            config_attrs: "{}".into(),
+            fingerprint_attrs: "{}".into(),
+            dynamic_attrs: "{}".into(),
+            health_checks: "{}".into(),
+            last_heartbeat: "2023-01-01 00:00:00 +00:00:00".into(),
+            heartbeat_source: String::new(),
+        })?;
+        store.apply_namespace(Namespace {
+            name: "prod".into(),
+            ..Default::default()
+        })?;
+        let mut web = job("prod/web");
+        web.tasks[0].resources = serde_json::json!({ "cpu": 500, "memory": 256 });
+        web.priority = crate::structs::Band::High;
+        store.handle_job_submit(&web, &[])?;
+        store.handle_job_submit(&job("prod/batch"), &[])?;
+        store.handle_job_submit(&job("web"), &[])?;
+        let task_id: i64 = store.read_connection()?.query_row(
+            "SELECT id FROM task_config WHERE job_id = 'prod/web';",
+            [],
+            |row| row.get(0),
+        )?;
+        store.apply_allocation_plan(&[
+            ("node-a".to_string(), task_id),
+            ("node-a".to_string(), task_id),
+        ])?;
+
+        let usage = store.namespace_usage()?;
+        let prod = &usage["prod"];
+        assert_eq!(prod.jobs, 2);
+        let high = prod.bands["high"];
+        assert_eq!(
+            (high.cpu, high.memory, high.allocations),
+            (1000.0, 512.0, 2)
+        );
+        assert!(
+            !prod.bands.contains_key("normal"),
+            "no live normal allocations"
+        );
+        assert_eq!(prod.total().allocations, 2);
+        assert_eq!(usage["default"].jobs, 1);
+        assert!(usage["default"].bands.is_empty());
+        Ok(())
     }
 
     #[test]

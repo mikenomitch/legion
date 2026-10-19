@@ -1133,7 +1133,7 @@ fn tool_defs() -> Vec<ToolDef> {
             input_schema: || json!({
                 "type": "object",
                 "properties": {
-                    "jobs": { "type": "string", "description": "Glob over job names, e.g. agents-*." },
+                    "jobs": { "type": "string", "description": "Job pattern: agents-* (names in default) or agents/* (namespace-glob/name-glob). * alone never crosses a namespace." },
                     "public_key_pem": { "type": "string", "description": "P-256 public key, SPKI PEM." },
                     "name": { "type": "string", "description": "A label for people." },
                     "max_ttl": { "type": "string", "description": "Ceiling on a ticket's redeem window. Default exec.tickets.maxTtl." },
