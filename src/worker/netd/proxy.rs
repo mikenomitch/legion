@@ -1474,10 +1474,10 @@ impl SpliceStream for TokioIo<hyper::upgrade::Upgraded> {}
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tokio::io::AsyncReadExt;
     use crate::structs::netpolicy::{merge_policies, InlinePolicy, NetPolicyObject};
     use crate::structs::AllocNetPolicy;
     use crate::worker::netd::{Denials, NetPolicyCache};
+    use tokio::io::AsyncReadExt;
     use tokio::net::TcpListener;
 
     async fn origin() -> u16 {

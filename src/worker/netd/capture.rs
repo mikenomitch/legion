@@ -224,18 +224,24 @@ impl HostCapture {
                     debug!(%peer, "Capture listener: no original destination; closing");
                     return;
                 };
-                let proxy = proxies
-                    .lock()
-                    .unwrap_or_else(|p| p.into_inner())
-                    .entry(allocation_id)
-                    .or_insert_with(|| {
-                        crate::worker::netd::proxy::CaptureProxy::new(
-                            allocation_id,
-                            false,
-                            context.clone(),
-                        )
-                    })
-                    .clone();
+                let proxy = {
+                    let mut proxies = proxies.lock().unwrap_or_else(|p| p.into_inner());
+                    if !proxies.contains_key(&allocation_id) {
+                        // A new allocation: drop the state of ones this
+                        // node no longer runs, so the map tracks the live set.
+                        proxies.retain(|id, _| context.identity_string_for(*id).is_some());
+                    }
+                    proxies
+                        .entry(allocation_id)
+                        .or_insert_with(|| {
+                            crate::worker::netd::proxy::CaptureProxy::new(
+                                allocation_id,
+                                false,
+                                context.clone(),
+                            )
+                        })
+                        .clone()
+                };
                 let client = context.activity().track(allocation_id, client);
                 crate::worker::netd::proxy::serve_captured(proxy, client, Some(peer), original)
                     .await;

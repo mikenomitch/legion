@@ -351,6 +351,13 @@ pub struct KernelGuardRuntime {
     applied: Option<Vec<std::net::IpAddr>>,
 }
 
+/// The kernel classifier a Linux worker hands [`ForwarderContext::with_kernel`];
+/// other platforms have none.
+#[cfg(target_os = "linux")]
+pub type KernelClassifier = crate::worker::netd::kernel::runtime::KernelNet;
+#[cfg(not(target_os = "linux"))]
+pub type KernelClassifier = ();
+
 /// How the host guard (and, with eBPF, the egress chain) is enforced in
 /// the kernel.
 pub enum KernelBackend {
@@ -463,70 +470,49 @@ impl ForwarderContext {
         lock(&self.gated_captures).get(&allocation_id).copied()
     }
 
-    /// Runs the kernel host guard with `base` (its ports and operator
-    /// entries) on `nftables`; the allocations come from each heartbeat.
-    pub fn with_kernel_guard(
-        mut self,
-        base: crate::worker::netd::kernel_guard::GuardTable,
+    /// The kernel backend the worker probed for, when `base` (the host
+    /// guard's table) is set at all: the classifier when it loaded, else the
+    /// `nftables` guard.
+    pub fn with_kernel(
+        self,
+        base: Option<crate::worker::netd::kernel_guard::GuardTable>,
+        classifier: Option<KernelClassifier>,
     ) -> Self {
-        self.kernel_guard = Some(Mutex::new(KernelGuardRuntime {
-            base,
-            backend: KernelBackend::Nft(Default::default()),
-            kernel_status: HashMap::new(),
-            applied: None,
-        }));
-        self
+        let Some(base) = base else {
+            return self;
+        };
+        #[cfg(target_os = "linux")]
+        if let Some(net) = classifier {
+            return self.with_kernel_classifier(base, net);
+        }
+        #[cfg(not(target_os = "linux"))]
+        let _ = classifier;
+        self.with_kernel_backend(base, KernelBackend::Nft(Default::default()))
     }
 
     /// Runs the kernel classifier (`netd::kernel`) with `base`: the guard,
     /// host-mode egress chains, DNS capture, and the capture redirect.
     #[cfg(target_os = "linux")]
     pub fn with_kernel_classifier(
-        mut self,
+        self,
         base: crate::worker::netd::kernel_guard::GuardTable,
         net: crate::worker::netd::kernel::runtime::KernelNet,
     ) -> Self {
+        self.with_kernel_backend(base, KernelBackend::Ebpf(Box::new(net)))
+    }
+
+    fn with_kernel_backend(
+        mut self,
+        base: crate::worker::netd::kernel_guard::GuardTable,
+        backend: KernelBackend,
+    ) -> Self {
         self.kernel_guard = Some(Mutex::new(KernelGuardRuntime {
             base,
-            backend: KernelBackend::Ebpf(Box::new(net)),
+            backend,
             kernel_status: HashMap::new(),
             applied: None,
         }));
         self
-    }
-
-    /// The kernel backend the worker probed for: the classifier when it
-    /// loaded, else the `nftables` guard when `base` is set.
-    #[cfg(target_os = "linux")]
-    pub fn with_kernel(
-        self,
-        base: Option<crate::worker::netd::kernel_guard::GuardTable>,
-        classifier: Option<crate::worker::netd::kernel::runtime::KernelNet>,
-    ) -> Self {
-        match (base, classifier) {
-            (Some(base), Some(net)) => self.with_kernel_classifier(base, net),
-            (base, _) => self.with_kernel_guard_if(base),
-        }
-    }
-
-    #[cfg(not(target_os = "linux"))]
-    pub fn with_kernel(
-        self,
-        base: Option<crate::worker::netd::kernel_guard::GuardTable>,
-        _classifier: Option<()>,
-    ) -> Self {
-        self.with_kernel_guard_if(base)
-    }
-
-    /// [`Self::with_kernel_guard`] when `base` is set.
-    pub fn with_kernel_guard_if(
-        self,
-        base: Option<crate::worker::netd::kernel_guard::GuardTable>,
-    ) -> Self {
-        match base {
-            Some(base) => self.with_kernel_guard(base),
-            None => self,
-        }
     }
 
     /// Whether this node runs the kernel host guard.
