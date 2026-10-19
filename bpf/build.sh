@@ -4,9 +4,9 @@
 # result differs from the committed object (`bpf/build.sh --check`).
 #
 # Needs clang with the bpf target and the kernel's asm/types.h
-# (linux-libc-dev). linux/bpf.h is vendored in include/ (copied from Ubuntu's
-# linux-libc-dev 6.8.0-147) so a distro header update cannot change the
-# object's debug info and fail the check. The programs use only stable UAPI
+# (linux-libc-dev). The part of linux/bpf.h the program uses is vendored in
+# include/ (copied from Ubuntu's linux-libc-dev 6.8.0-147) so a distro header
+# update cannot change the object's debug info and fail the check. The programs use only stable UAPI
 # context fields, so the object loads on any kernel with the features
 # `netKernel` probes for.
 set -eu
