@@ -141,10 +141,10 @@ pub fn proxy_specs(desired: &[TaskAllocation], alloc_root: &Path) -> Vec<ProxySp
         .filter_map(|allocation| {
             let network = network_of(allocation)?;
             let attachment = Attachment::of(allocation, &network, alloc_root);
-            attachment.is_gated().then_some(ProxySpec {
+            attachment.is_gated().then(|| ProxySpec {
                 allocation_id: allocation.allocation_id,
+                listen: attachment.egress_proxy(),
                 attachment,
-                listen: None,
             })
         })
         .collect()
@@ -447,7 +447,10 @@ pub fn net_status(
                     "egress proxy is not bound on the guest's vsock socket {}",
                     guest_socket(scratch, crate::worker::netd::proxy::PROXY_PORT).display()
                 ),
-                None => "egress proxy is not bound inside the namespace".into(),
+                None => match attachment.egress_proxy() {
+                    Some(addr) => format!("egress proxy is not bound on {addr}"),
+                    None => "egress proxy is not bound inside the namespace".into(),
+                },
             });
         }
         if upstreams.len() < expected_upstreams {

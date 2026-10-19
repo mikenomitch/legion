@@ -526,6 +526,31 @@ pub fn node_supports_vip_blocks(node_os: Option<&str>) -> bool {
     node_os.is_some_and(|os| os.eq_ignore_ascii_case("linux"))
 }
 
+/// Whether a gated task on a node with this `os` fingerprint is confined
+/// rather than namespaced: macOS has no network namespaces, so its runtime
+/// keeps the task on the node's loopback instead (Seatbelt for `exec`, pf for
+/// an Apple container VM; internal_docs/plans/macos-gated-plan.md).
+pub fn node_confines_gated(node_os: Option<&str>) -> bool {
+    node_os.is_some_and(|os| os.eq_ignore_ascii_case("macos"))
+}
+
+/// The egress proxy address of a confined allocation: the first dynamic
+/// port that neither another allocation on the node (`used`) nor this one
+/// (`ports`, `upstreams`) holds, on the node's loopback.
+pub fn assign_confined_proxy(
+    used: &HashSet<u16>,
+    ports: &[AllocPort],
+    upstreams: &[AllocUpstream],
+) -> R<String> {
+    let mut taken = used.clone();
+    taken.extend(ports.iter().map(|port| port.host_port));
+    taken.extend(ports.iter().filter_map(|port| port.private_port));
+    taken.extend(upstreams.iter().filter_map(|upstream| upstream.local_port));
+    let mut cursor = DYNAMIC_PORT_MIN;
+    let port = next_dynamic_port(&mut cursor, &mut taken, "a confined egress proxy")?;
+    Ok(format!("{GATED_PROXY_ADDR}:{port}"))
+}
+
 /// Pick the next free VIP block (`127.42.<b>`) on a node.
 pub fn next_vip_block(used_blocks: &HashSet<String>) -> R<String> {
     for b in 0..=VIP_BLOCK_MAX {
@@ -1512,9 +1537,45 @@ pub struct AllocNetwork {
     /// (treated as `host`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mode: Option<String>,
+    /// A gated allocation on a node with no network namespaces (macOS):
+    /// where its egress proxy listens on the node's loopback
+    /// (`127.0.0.1:<port>`, assigned at placement). Its presence is what
+    /// makes the allocation *confined* rather than namespaced
+    /// (internal_docs/plans/macos-gated-plan.md §6.2).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub egress_proxy: Option<String>,
 }
 
 impl AllocNetwork {
+    /// Whether the allocation is gated without a namespace: its listeners
+    /// are on the node's loopback and its runtime confines it (Seatbelt for
+    /// `exec`, pf for an Apple container VM).
+    pub fn is_confined(&self) -> bool {
+        self.is_gated() && self.egress_proxy.is_some()
+    }
+
+    /// The node-loopback ports a confined task may reach: its egress proxy
+    /// and its upstreams' loopback ports. Its Seatbelt profile or pf rules
+    /// allow these and nothing else.
+    pub fn confined_ports(&self) -> Vec<u16> {
+        let proxy = self
+            .egress_proxy
+            .as_deref()
+            .and_then(|addr| addr.parse::<std::net::SocketAddr>().ok())
+            .map(|addr| addr.port());
+        let mut ports: Vec<u16> = proxy
+            .into_iter()
+            .chain(
+                self.upstreams
+                    .iter()
+                    .filter_map(|upstream| upstream.local_port),
+            )
+            .collect();
+        ports.sort_unstable();
+        ports.dedup();
+        ports
+    }
+
     /// Whether any port terminates mesh mTLS (the node needs its mesh
     /// certificate before the port can serve).
     pub fn serves_mesh(&self) -> bool {
@@ -1568,7 +1629,10 @@ impl AllocNetwork {
             // HTTP_PROXY for plain HTTP, and apt reads only lower case.
             // NODE_USE_ENV_PROXY makes Node's built-in fetch and http honor
             // them (Node 22.21 and 24.5 or later; older Node ignores it).
-            let proxy = format!("http://{GATED_PROXY_ADDR}:{GATED_PROXY_PORT}");
+            let proxy = match self.egress_proxy.as_deref() {
+                Some(addr) => format!("http://{addr}"),
+                None => format!("http://{GATED_PROXY_ADDR}:{GATED_PROXY_PORT}"),
+            };
             let no_proxy = format!("localhost,127.0.0.0/8,{SVC_ZONE}");
             pairs.push(("LEGION_EGRESS_PROXY".to_string(), proxy.clone()));
             pairs.push(("LEGION_NETWORK_MODE".to_string(), "gated".to_string()));
@@ -2653,6 +2717,7 @@ mod tests {
             vip_block: None,
             resolver: None,
             mode: None,
+            egress_proxy: None,
         };
 
         let pairs = network.env_pairs();
@@ -3142,6 +3207,7 @@ mod tests {
             vip_block: None,
             resolver: None,
             mode: None,
+            egress_proxy: None,
         };
 
         let lookup: std::collections::HashMap<_, _> = network.env_pairs().into_iter().collect();

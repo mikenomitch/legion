@@ -116,6 +116,10 @@ the kernel and disks, though, so the Legion-specific machinery does not apply:
   A block volume fails at start, because Legion has no VMM to attach it to.
 - Exec is available here through `container exec`. A microVM takes exec
   through its guest agent instead ([Exec](#exec)).
+- `network.mode = "gated"` runs the VM on Legion's `legion-gated` network,
+  where `pf` lets it reach only its own egress proxy and upstreams on the Mac
+  ([Gated mode on macOS](network-handlers.md#gated-mode-on-macos); macOS 26 or
+  later, worker running as root, not yet verified on macOS hardware).
 
 Every dev-mode start logs a warning, so you won't mistake it for a microVM.
 File and tree artifacts are not copied into a dev-mode sandbox either. Only the

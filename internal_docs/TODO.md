@@ -3829,6 +3829,60 @@ Datapath performance). Deferred, by name:
       with tens of thousands of concurrent bulk flows
       ([calls #6](calls/datapath-performance-plan_calls.md)).
 
+
+### macOS gated networking
+
+[plan](plans/macos-gated-plan.md) · [calls](calls/macos-gated-plan_calls.md)
+· docs: [network-handlers.md § Gated mode on macOS](../docs/network-handlers.md#gated-mode-on-macos)
+
+- [ ] **Phase 4: run it on macOS hardware.** Phases 1–3 are implemented and
+      unit-tested on Linux only. On a macOS 26 machine with a root worker, run
+      the plan's three scenarios (§3): a confined `exec` task's direct dial
+      gets `EPERM` and its proxied request the policy's answer; a confined
+      `container` reaches its upstream and not `1.1.1.1`; a non-root worker
+      fails the start with its message. Settle the plan's open questions
+      (rdr to `127.0.0.1` without forwarding, vmnet's resolver, IPv6).
+- [ ] **`auto` resolves to `gated` for `container` and `sandbox` on macOS 26**,
+      once phase 4 passes (calls entry 1).
+- [ ] **Upstreams from ungated Apple containers.** `LEGION_UPSTREAM_*` names
+      `127.0.0.1`, the VM's own loopback, so a host-mode Apple container
+      cannot reach its upstreams (found while planning this; also on main).
+      The same per-VM `rdr`, without the block, fixes it on the `default`
+      network, but needs a root worker (plan §6.6).
+- [ ] **DNS for confined tasks**, if a real tool needs to resolve before it
+      proxies (calls entry 5).
+- [ ] **A configurable gated subnet** for Macs that already use
+      `192.168.239.0/24` (calls entry 4).
+
+### Datapath simplification candidates not taken
+
+From the deletion survey on PR #51. Each removes code but changes behavior
+or needs a decision:
+
+- [ ] **Drop the `nftables` host guard and keep only eBPF** (~730 lines):
+      nodes whose kernel cannot load the classifier (no ringbuf or sockops,
+      kernels before ~5.8) would lose the kernel floor for host-mode tasks;
+      mesh interfaces plan §11 Q4 leans keep.
+- [ ] **Drop `legion_sign` and plugin credentials** (~300 lines), if no
+      plugin needs to sign with a key it never sees.
+- [ ] **Drop `legion net plugin new`** (~190 lines); `tests/netplugins/*`
+      already serve as templates.
+- [ ] **Drop the gated in-namespace capture listener on `:1081`** (~200
+      lines), back to the explicit-proxy model for gated tasks.
+- [ ] **One store for held material on the worker** (~120 lines, no
+      behavior change): credentials, TLS material and plugin credentials each
+      repeat version / set / error / retain.
+- [ ] **Share HTTP plumbing between the gated proxy's absolute-URI path and
+      `netd::http`** (~120 lines, no behavior change): two `denied_response`,
+      access-log, `answer_locally` and header-rewrite copies, whose 403
+      bodies already differ.
+- [ ] **Remove the policy-less forwarder path** (~70 lines, tests only):
+      `ForwarderContext`'s `Option` fields exist only for
+      `UpstreamForwarder::new()` in tests.
+- [ ] **Collapse the port-assignment wrappers** in `structs/network.rs`
+      (~25 lines net, test-only wrappers around
+      `assign_allocation_ports_full`).
+
 ## Persistence & cluster operations
 
 Plans: [persistence-plan.md](plans/persistence-plan.md), [multi-raft-persistence-plan.md](plans/multi-raft-persistence-plan.md), [manager-workload-identity-plan.md](plans/manager-workload-identity-plan.md) · docs: [state-store.md](../docs/state-store.md), [raft-operations.md](../docs/raft-operations.md), [persistence-streaming.md](../docs/persistence-streaming.md)
@@ -5650,6 +5704,29 @@ findings: [kernel-classifier-findings.md](kernel-classifier-findings.md)
 - [x] Phase 8 of the handlers plan (sandboxed WASM handlers) and the
       service-discovery plan's "sandboxed WASM middleware filters on the L7
       path": both shipped as Track B's plugins.
+
+- [x] **macOS gated networking, phases 1–3.** A gated allocation on a macOS
+      node is confined: an egress proxy port of its own
+      (`AllocNetwork.egressProxy`), twins for every port, the datapath's
+      `Attachment::Confined` failing closed; `exec` under a Seatbelt profile;
+      Apple `container` VMs (`container`, dev-mode `sandbox`) on the
+      `legion-gated` network under a `pf` anchor. Unit-tested on Linux;
+      phase 4 (macOS hardware) is open above.
+      [plan](plans/macos-gated-plan.md) ·
+      [docs](../docs/network-handlers.md#gated-mode-on-macos)
+- [x] **Datapath simplification.** One egress judge (`netd::egress`) for
+      the gated proxy, capture, and external upstreams, which also fixed a
+      gated allocation's HTTP-mode upstream serving before its policy
+      arrived (fail-open, also on main) and HTTP-mode upstreams ignoring
+      CIDR rules on resolved addresses; SOCKS5 dropped from the gated proxy;
+      the vendored `linux/bpf.h` cut to the 272 lines the classifier uses;
+      dead code, the `MaterialProvider` trait, the rule `match` alias,
+      `net plugin new --lang`, and three kernel builders removed; the host
+      capture listener prunes state for gone allocations.
+- [x] **A shared WASM embedding layer** (`src/wasm/`): engine, memory cap,
+      failure descriptions, guest memory, a WASI preview1 shim with real
+      `args`/`environ`, and module fetching, so a `wasm` task runtime reuses
+      what the network plugins run on (open item under Task runtimes).
 
 ## Stateful workloads & volumes
 

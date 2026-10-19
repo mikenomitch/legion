@@ -1428,3 +1428,104 @@ The public doc says ticks never fire.
 SDK-built modules exercise the real proxy-wasm Rust SDK, which WAT would
 not. `configs/netplugins/read-only-free-tier.ncl` pins the example's
 checksum, and a test checks it against the file.
+
+---
+
+## 56. `service.allow` keeps one grammar: the namespaces one
+
+Made when `main`'s namespaces merged into this branch.
+
+**Call.**
+- `allow` takes `main`'s namespace-aware job globs:
+  - bare entries mean the service's own namespace;
+  - `ns/job` entries cross into another namespace;
+  - `*/*` admits everyone.
+- The mesh's on-the-wire check takes the job from the verified caller's
+  identity (`auto:<job>:<group>:<task>`) and applies the same rule.
+- This branch's four-part identity globs in `allow` (`*:billing:*:worker`)
+  are gone. A submit that writes one gets an error pointing at ingress
+  `identity` rules.
+
+**Alternatives.**
+- Keep both grammars side by side: job globs, plus colon entries over
+  identities.
+- Make the mesh check identity-only and the feed job-only.
+
+**Trade-off.** `allow` can no longer admit one task of a job. That needs an
+ingress `identity` rule, which is a second place to look.
+
+**Why (simplicity).** One list with two grammars, two matchers, and two
+answers for "is this caller allowed" is the drift S4 removed. The feed and
+the wire now agree by construction, and the namespace rules (empty means
+own namespace) apply to both. The mesh check also compiles for every mesh
+service except `*/*`, because an empty list no longer means everyone.
+
+```
+task api service.allow entry '*:ops:*:shell' names a workload identity; allow names jobs
+(`web`, `payments-*/api`). Match a caller's task with an ingress `identity` rule
+```
+
+---
+
+## 57. A namespace crossing is the `namespace` field, never a qualified `to`
+
+**Call.**
+- `{ to = "auth", namespace = "shared" }` crosses into `shared`.
+- `main`'s qualified `service = "shared/auth"` has no `to` equivalent.
+
+**Alternatives.** Accept `to = "shared/auth"` as well.
+
+**Trade-off.** One more field to write than the qualified form needed.
+
+**Why (simplicity).** `to` is a service name or a URL, and
+`http://shared/auth` already reads as a URL path. A qualified form would
+work for L4 upstreams and break for HTTP ones. One spelling works for every
+scheme.
+
+---
+
+## 58. SOCKS5 removed from the gated proxy
+
+Made in the simplification pass.
+
+**Call.** The gated egress proxy speaks HTTP `CONNECT` and absolute-URI
+requests only.
+
+**Alternatives.** Keep SOCKS5 `CONNECT`.
+
+**Trade-off.** A client someone points at `socks5://127.0.0.1:1080` by hand
+gets no answer.
+
+**Why (simplicity).**
+- Every proxy variable Legion sets is `http://`.
+- The guest agent relays bytes, not protocols.
+- Transparent capture covers tools that ignore the variables.
+
+SOCKS5 was a second way out with its own parser, reply codes, and a test leg
+in every proxy test: about 280 lines for a path nothing configured.
+
+---
+
+## 59. The WASM embedding layer lives at the crate root, interpreter included
+
+**Call.** `src/wasm/` holds what any embedder needs:
+- the engine and memory cap;
+- failure descriptions and guest memory;
+- the WASI shim, which now takes real `args` and `environ`;
+- module fetching.
+
+The proxy-wasm host keeps only its ABI.
+
+**Alternatives.**
+- Leave it inside `netd::plugins` until a task runtime exists.
+- Abstract over engines (wasmi and wasmtime) now.
+
+**Trade-off.**
+- A small move with no second embedder yet.
+- A task runtime that wants wasmtime's speed would still add an engine
+  beside this one.
+
+**Why (extensibility).** The next embedder (a `wasm` task runtime, in
+TODO) reuses fetching, limits, WASI, and failure text without depending on
+the datapath. An engine abstraction with one implementation would be the
+shape the simplification pass just deleted elsewhere.

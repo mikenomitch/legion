@@ -132,6 +132,7 @@ When one is required and what goes in it:
 | [service-mesh-plan.md](plans/service-mesh-plan.md) | **authoritative for the mesh**; shipped M1–M10 (policy, HTTP mode, name-is-config, gated, ingress, handlers, mTLS, graph, sandbox vsock, templates) with two named deferrals — unifies the SD §8 follow-on with the handlers plan |
 | [network-handlers-plan.md](plans/network-handlers-plan.md) | shipped as phases of service-mesh-plan (policy objects, `gated` mode, handlers); the `legion netd` process split is the deferred piece |
 | [datapath-performance-plan.md](plans/datapath-performance-plan.md) | shipped: HTTP-mode pooling, `splice(2)` for bulk L4 on Linux, `least_latency` as the default strategy, the per-byte `legion_net_bytes_total` fix, `net_bench`; kTLS and multiplexed mesh tunnels deferred |
+| [macos-gated-plan.md](plans/macos-gated-plan.md) | in execution: phases 1–3 (placement, the confined datapath, Seatbelt for `exec`, `pf` for Apple `container` VMs) implemented and unit-tested; phase 4, running it on macOS hardware, is open, so `auto` stays `host` on macOS |
 | [mesh-interfaces-plan.md](plans/mesh-interfaces-plan.md) | shipped. Phase 0 fixed chain `dlp`/`log` and chain `onError`. Surface: one typed handler pipeline (S1), one upstream `to` whose scheme is its protocol (S2), `service.mesh` and TLS on ports (S3), one caller list (S4), one material source grammar and `FetchDatapathMaterial` (S5), and the removed knobs (S6). Datapath: the eBPF kernel classifier (A0–A3; host-mode egress enforced at `connect()`, transparent capture) and WASM plugins on proxy-wasm (B1–B3; `legion net plugin`). Deferred: `oci://` modules, streamed request bodies, plugin UI, see TODO |
 | [nickel-config-language-plan.md](plans/nickel-config-language-plan.md) | shipped (2026-08-03; jsonnet removed, no compat shim) |
 | [scheduler-performance-plan.md](plans/scheduler-performance-plan.md) | in execution |
@@ -261,6 +262,7 @@ by project impact. The full template and a worked example:
 - [managers-page-raft-members_calls.md](calls/managers-page-raft-members_calls.md)
 - [manager-reverse-proxy-plan_calls.md](calls/manager-reverse-proxy-plan_calls.md)
 - [manager-workload-identity-plan_calls.md](calls/manager-workload-identity-plan_calls.md)
+- [macos-gated-plan_calls.md](calls/macos-gated-plan_calls.md)
 - [mesh-interfaces-plan_calls.md](calls/mesh-interfaces-plan_calls.md)
 - [multi-cluster-federation-plan_calls.md](calls/multi-cluster-federation-plan_calls.md)
 - [multi-raft-persistence-plan_calls.md](calls/multi-raft-persistence-plan_calls.md)

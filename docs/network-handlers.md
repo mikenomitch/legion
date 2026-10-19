@@ -1094,6 +1094,60 @@ ones the policy allows. So for gated `container` and `exec` tasks, the `boot`
 gate is enforced, unlike the advisory gate in host networking. And a gated
 allocation that nothing allows is denied, below.
 
+### Gated mode on macOS
+
+macOS has no network namespaces, so a gated task there is **confined**
+instead: same jobspec, same meaning ("the datapath is the only way out"),
+different mechanism. Only an explicit `network.mode = "gated"` takes this
+path; `auto` stays `host` on macOS.
+
+> **Status.** Implemented, with every command it runs built by functions
+> that are unit-tested, but **not yet run on macOS hardware**. Treat it as a
+> preview, and report what you find
+> (internal_docs/plans/macos-gated-plan.md tracks the verification).
+
+At placement a confined allocation gets an **egress proxy port** of its own
+on the node's loopback (`AllocNetwork.egressProxy`), and its proxy variables
+name it (`HTTPS_PROXY=http://127.0.0.1:<port>`). Every declared port gets a
+private twin, so the datapath fronts it. The proxy and upstreams fail closed
+exactly as in a namespace: `policy-pending` until the policy arrives, `gate`
+while the boot gate is shut, `gated-default` when nothing allows the
+destination. What keeps the task on those listeners depends on the runtime:
+
+| Runtime | Confinement | Needs |
+| --- | --- | --- |
+| `exec` | runs as `/usr/bin/sandbox-exec -p <profile> <command>`. The Seatbelt profile allows outbound connections only to the allocation's own listener ports on `localhost` (its proxy and its upstreams), denies the `mDNSResponder` socket, and allows binds on the loopback only | `/usr/bin/sandbox-exec` |
+| `container`, dev-mode `sandbox` (Apple `container`) | runs on Legion's Apple container network `legion-gated` (`192.168.239.0/24`). A `pf` anchor, `com.apple/legion`, drops every packet from that subnet except an `rdr pass` from each VM's address to its own ports on the gateway (`192.168.239.1`), which lands on the allocation's listeners on the Mac's `127.0.0.1`. The VM's `LEGION_UPSTREAM_*` and proxy variables name the gateway | macOS 26 or later (`container network create`), and a worker running as root (`pfctl`) |
+
+The `pf` block is loaded before a VM starts, and a VM's own `rdr` follows
+once `container inspect` reports its address, so a VM is confined from its
+first packet. The anchor is flushed and `pf`'s reference released when the
+last confined VM stops. No system file is edited: macOS's stock
+`/etc/pf.conf` already evaluates `com.apple/*` anchors.
+
+**Failures are start failures, never a fall back:**
+
+```
+allocation 41 is network.mode = "gated" but /usr/bin/sandbox-exec is missing, so it cannot be confined on macOS
+allocation 42: gated Apple containers need the worker to run as root to load the pf rules that confine them
+allocation 43: gated Apple containers need macOS 26 or later (container network create failed: …)
+```
+
+**Limits:**
+
+- **No DNS.** A confined task cannot resolve names itself: proxy-aware tools
+  send the name to the proxy, as a gated Linux task without upstreams does.
+  `localhost` by name fails inside a confined `exec` task (macOS resolves it
+  through `mDNSResponder`); the env vars use `127.0.0.1`.
+- **No transparent capture.** A tool that ignores the proxy variables has no
+  route out.
+- **A fixed subnet.** `192.168.239.0/24` is not configurable yet; a Mac that
+  already uses it for something else conflicts.
+- **Ungated Apple containers still cannot reach their upstreams.**
+  `LEGION_UPSTREAM_*` names `127.0.0.1`, which is the VM's own loopback.
+- **`sandbox-exec` is deprecated by Apple.** If it disappears, a confined
+  `exec` task fails to start, saying so.
+
 ### Default deny
 
 **Gated means nothing leaves unless a rule says so.** A gated allocation
@@ -1290,8 +1344,8 @@ capture are not implemented.
 
 Requirements and limits:
 
-- Linux only. macOS has no network namespaces, so `gated` is rejected at
-  start there with that reason.
+- Namespaces are Linux only. On macOS, `gated` is enforced another way
+  ([Gated mode on macOS](#gated-mode-on-macos)).
 - The worker needs `CAP_SYS_ADMIN`. It already does, for `exec` hardening's
   mount namespace and for running the OCI runtime.
 - IPv4 loopback only inside the namespace.
@@ -1966,8 +2020,11 @@ This section lists what that covers and what it does not.
   host-mode task's policy stays cooperative, but the
   [kernel guard](#the-host-guard-in-the-kernel) keeps it off the node's
   Legion ports, the metadata service, and other allocations' listeners where
-  it runs. On macOS, egress stays cooperative, and
-  there are no VIPs, per-allocation resolvers, or gated namespaces. A gated
+  it runs. On macOS, a host-mode task's egress stays cooperative, there are
+  no VIPs or per-allocation resolvers, and a `gated` task is confined by
+  Seatbelt or `pf` instead of a namespace
+  ([Gated mode on macOS](#gated-mode-on-macos), not yet verified on macOS
+  hardware). A gated
   `sandbox` is captured over vsock, upstreams included. That path is
   implemented and unit-tested but not exercised on a real VMM in CI. A
   TAP-wired or loopback-only sandbox cannot reach its upstreams. `auto`

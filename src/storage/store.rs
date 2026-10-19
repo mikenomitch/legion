@@ -13621,7 +13621,12 @@ impl Store {
         // sandbox is reached over vsock instead, so it gets neither here.
         let runtime = self.task_runtime(tx, task_id)?;
         let sandbox = runtime.as_deref() == Some("sandbox");
-        let gated_namespace = gated && !sandbox;
+        // A gated task on a node without network namespaces (macOS) is
+        // confined instead: its listeners are on the node's loopback and its
+        // runtime keeps it there (internal_docs/plans/macos-gated-plan.md).
+        let confined = gated
+            && crate::structs::network::node_confines_gated(self.node_os(tx, node_id)?.as_deref());
+        let gated_namespace = gated && !sandbox && !confined;
         // A host-mode task whose egress chain the kernel classifier enforces
         // needs a resolver of its own: its answers teach the kernel which
         // addresses a host rule allows (plan §6.A.4, open question 5). A
@@ -13634,7 +13639,7 @@ impl Store {
             && crate::structs::network::node_supports_vip_blocks(
                 self.node_os(tx, node_id)?.as_deref(),
             );
-        if !has_ports && !has_upstreams && !wants_resolver {
+        if !has_ports && !has_upstreams && !wants_resolver && !confined {
             // No ports and no upstreams: the row carries a network only when
             // a mode other than `host` applies (the task asked for `gated`,
             // the node defaults it, or a required policy imposes it), so
@@ -13666,11 +13671,19 @@ impl Store {
             let existing: crate::structs::AllocNetwork = from_str(&raw)
                 .with_context(|| format!("invalid stored allocation network on node {node_id}"))?;
             used.extend(existing.ports.iter().map(|port| port.host_port));
-            // A host-mode ingress twin is a host port too; a gated one lives
-            // in the allocation's own namespace and takes nothing here.
-            if !existing.is_gated() {
+            // A host-mode (or confined) ingress twin is a host port too; a
+            // gated one lives in the allocation's own namespace and takes
+            // nothing here. So does a confined allocation's egress proxy.
+            if !existing.is_gated() || existing.is_confined() {
                 used.extend(existing.ports.iter().filter_map(|port| port.private_port));
             }
+            used.extend(
+                existing
+                    .egress_proxy
+                    .as_deref()
+                    .and_then(|addr| addr.parse::<std::net::SocketAddr>().ok())
+                    .map(|addr| addr.port()),
+            );
             used.extend(
                 existing
                     .upstreams
@@ -13732,8 +13745,9 @@ impl Store {
             &service_ports,
             vip_block.as_deref(),
             // A gated namespace has no other way in: every declared port
-            // gets an ingress listener, chain or not (plan §6.12).
-            has_ingress || gated_namespace,
+            // gets an ingress listener, chain or not (plan §6.12). A confined
+            // task is fronted the same way, with its twins on the host.
+            has_ingress || gated_namespace || confined,
             gated_namespace,
             // A sandbox's upstreams are relayed over vsock ports keyed by a
             // loopback port number, so each keeps one.
@@ -13757,6 +13771,10 @@ impl Store {
                 port.mesh = port.tls.is_none();
             }
         }
+        let egress_proxy = confined
+            .then(|| crate::structs::network::assign_confined_proxy(&used, &ports, &upstreams))
+            .transpose()
+            .with_context(|| format!("failed to assign ports on node {node_id}"))?;
         Ok(Some(crate::structs::AllocNetwork {
             address,
             ports,
@@ -13764,6 +13782,7 @@ impl Store {
             vip_block,
             resolver,
             mode,
+            egress_proxy,
         }))
     }
 
@@ -31952,6 +31971,77 @@ mod tests {
         assert!(vip_block("linux-node")?.is_some());
         assert_eq!(vip_block("mac-node")?, None);
         assert_eq!(vip_block("bare-node")?, None);
+        Ok(())
+    }
+
+    /// A gated task on a macOS node is confined, not namespaced: it gets
+    /// an egress proxy port of its own, host-port twins for every port, and
+    /// no resolver; two of them never share a port. On Linux the same task
+    /// gets a namespace and none of that.
+    #[test]
+    fn a_gated_task_on_macos_is_confined_with_its_own_proxy_port_test() -> R<()> {
+        let store = setup_store()?;
+        let node = |id: &str, os: &str| {
+            let mut node = make_node_msg(id, "ready");
+            node.fingerprint_attrs = json!({ "os": os }).to_string();
+            node
+        };
+        store.insert_node(node("mac-node", "macos"))?;
+        store.insert_node(node("linux-node", "linux"))?;
+        let mut task = connect_task("api", json!([{ "to": "db" }]));
+        task.network = Some(serde_json::from_value(json!({
+            "mode": "gated",
+            "ports": [{ "name": "http" }],
+        }))?);
+        submit_service_job(&store, "svc-confined", vec![task])?;
+        let task_id = task_id_for(&store, "api", "svc-confined")?;
+
+        let first = store
+            .place_alloc("mac-node", task_id)?
+            .network
+            .context("a gated allocation has a network")?;
+        assert!(first.is_confined(), "{first:?}");
+        let proxy: std::net::SocketAddr = first.egress_proxy.as_deref().unwrap().parse()?;
+        assert_eq!(proxy.ip().to_string(), "127.0.0.1");
+        assert_eq!(first.resolver, None);
+        let twin = first.port("http").and_then(|port| port.private_port);
+        assert!(twin.is_some(), "every port is fronted: {first:?}");
+        let upstream = first
+            .upstream("db")
+            .and_then(|upstream| upstream.local_port);
+        let mut confined = first.confined_ports();
+        confined.sort_unstable();
+        let mut expected = vec![proxy.port(), upstream.unwrap()];
+        expected.sort_unstable();
+        assert_eq!(confined, expected);
+        let env: HashMap<String, String> = first.env_pairs().into_iter().collect();
+        assert_eq!(env["HTTPS_PROXY"], format!("http://{proxy}"));
+
+        let second = store
+            .place_alloc("mac-node", task_id)?
+            .network
+            .context("a gated allocation has a network")?;
+        let taken: HashSet<u16> = [
+            Some(proxy.port()),
+            first.port("http").map(|p| p.host_port),
+            twin,
+            upstream,
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
+        let second_proxy: std::net::SocketAddr = second.egress_proxy.as_deref().unwrap().parse()?;
+        assert!(
+            !taken.contains(&second_proxy.port()),
+            "{taken:?} {second:?}"
+        );
+
+        let linux = store
+            .place_alloc("linux-node", task_id)?
+            .network
+            .context("a gated allocation has a network")?;
+        assert!(linux.is_gated() && !linux.is_confined(), "{linux:?}");
+        assert_eq!(linux.egress_proxy, None);
         Ok(())
     }
 

@@ -589,8 +589,21 @@ impl TaskPlugin for ExecTaskPlugin {
             "Starting exec task"
         );
 
-        let mut cmd = Command::new(program);
-        cmd.args(args);
+        // A gated task on macOS has no namespace: Seatbelt keeps it on its
+        // own datapath listeners instead (internal_docs/plans/macos-gated-plan.md).
+        let (program, args) = match allocation.network.as_ref().filter(|n| n.is_confined()) {
+            Some(network) => {
+                crate::task_plugins::confine::require_seatbelt(allocation.id)?;
+                crate::task_plugins::confine::seatbelt_command(
+                    program,
+                    args,
+                    &network.confined_ports(),
+                )
+            }
+            None => (program.clone(), args.to_vec()),
+        };
+        let mut cmd = Command::new(&program);
+        cmd.args(&args);
         // cwd defaults to the private task directory when the spec sets none.
         match config.cwd.as_deref() {
             Some(cwd) => {

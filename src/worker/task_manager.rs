@@ -10765,6 +10765,7 @@ mod tests {
                 vip_block: None,
                 resolver: None,
                 mode: None,
+                egress_proxy: None,
             }),
             ..alloc()
         };

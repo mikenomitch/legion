@@ -769,9 +769,13 @@ resolver. A host-mode container can reach the node, other allocations'
 listeners, and the cloud metadata service, so keep it for trusted images.
 
 On macOS, `auto` stays `host`: Apple `container` already runs each container
-in its own VM on its own network, and macOS has no network namespaces. The
-full model, the fail-closed rules, and the limits are in
-[Network Handlers](network-handlers.md#gated-mode).
+in its own VM on its own network, and macOS has no network namespaces. An
+explicit `gated` runs the VM on Legion's `legion-gated` network, where `pf`
+lets it reach only its own egress proxy and upstreams on the Mac (macOS 26
+or later, worker running as root;
+[Gated mode on macOS](network-handlers.md#gated-mode-on-macos), not yet
+verified on macOS hardware). The full model, the fail-closed rules, and the
+limits are in [Network Handlers](network-handlers.md#gated-mode).
 
 ## Security
 

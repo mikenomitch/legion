@@ -1632,8 +1632,10 @@ impl SandboxTaskPlugin {
             }
             _ => None,
         };
-        let mut cmd = Command::new("container");
-        cmd.args(build_apple_launch(
+        // A gated sandbox on macOS runs on the gated network, where pf keeps
+        // it on its own datapath ports (internal_docs/plans/macos-gated-plan.md).
+        let gated_network = crate::task_plugins::confine::prepare_vm(allocation, env.iter_mut())?;
+        let mut args = build_apple_launch(
             &name,
             // What stale-container cleanup checks before it removes anything.
             &apple_container::ownership_labels(allocation),
@@ -1641,7 +1643,13 @@ impl SandboxTaskPlugin {
             &env,
             &instance.volumes,
             identity_dir.as_deref(),
-        ));
+        );
+        if let Some(network) = gated_network {
+            args.splice(2..2, network);
+            crate::task_plugins::confine::admit_when_ready(allocation.id, name.clone());
+        }
+        let mut cmd = Command::new("container");
+        cmd.args(args);
         Ok(cmd)
     }
 
@@ -2403,6 +2411,7 @@ impl TaskPlugin for SandboxTaskPlugin {
         }
 
         reap_task_process(allocation.id, &task.name, instance, "sandbox");
+        crate::task_plugins::confine::release_vm(allocation);
         // Whatever the VMM left behind (a helper it forked, a dev-mode
         // container init) is still in the allocation's cgroup.
         if let Some(assignment) = instance.resource_assignment.as_ref() {

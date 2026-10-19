@@ -63,7 +63,8 @@ pub struct ProxySpec {
     /// the edge-boot gate is shut; [`Attachment::Host`] binds in the host
     /// namespace (tests, and cooperative mode on hosts without namespaces).
     pub attachment: Attachment,
-    /// Bind here instead of `127.0.0.1:1080` (tests).
+    /// Bind here instead of `127.0.0.1:1080`: a confined allocation's
+    /// assigned port on the node's loopback (and tests).
     pub listen: Option<SocketAddr>,
 }
 
@@ -1558,6 +1559,64 @@ mod tests {
             .await;
         let addr = proxies.address(5).expect("proxy bound");
         (proxies, denials, addr)
+    }
+
+    /// A confined allocation (gated on macOS) gets its proxy on the node's
+    /// loopback at its own port, and it fails closed like a namespaced one:
+    /// `policy-pending` until the policy arrives, then the policy decides.
+    #[tokio::test]
+    async fn a_confined_proxy_fails_closed_until_its_policy_arrives_test() {
+        let cache = Arc::new(NetPolicyCache::new());
+        let denials = Arc::new(Denials::new());
+        let context = Arc::new(ForwarderContext::new(cache.clone(), denials.clone()));
+        let proxies = Arc::new(EgressProxies::new(context));
+        let free = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let proxy: SocketAddr = free.local_addr().unwrap();
+        drop(free);
+        proxies
+            .sync(&[ProxySpec {
+                allocation_id: 6,
+                listen: Some(proxy),
+                attachment: Attachment::Confined { proxy },
+            }])
+            .await;
+        assert_eq!(proxies.address(6), Some(proxy));
+
+        let pending = raw(
+            proxy,
+            b"CONNECT example.com:443 HTTP/1.1\r\nHost: example.com\r\n\r\n",
+        )
+        .await;
+        assert!(pending.starts_with("HTTP/1.1 403"), "{pending}");
+        assert!(
+            pending
+                .to_ascii_lowercase()
+                .contains("legion-denied-by: policy-pending"),
+            "{pending}"
+        );
+
+        let mut object: NetPolicyObject = serde_json::from_value(json!({
+            "name": "p", "enforcement": "require", "egress": { "allow": ["pypi.org"] }
+        }))
+        .unwrap();
+        object.normalize_and_validate().unwrap();
+        let policy = merge_policies(&[object], InlinePolicy::default());
+        let hash = policy.hash.clone();
+        cache.apply_assignments(&[AllocNetPolicy {
+            allocation_id: 6,
+            policy_hash: hash.clone(),
+        }]);
+        cache.insert_body(&hash, policy).unwrap();
+        let denied = raw(
+            proxy,
+            b"CONNECT example.com:443 HTTP/1.1\r\nHost: example.com\r\n\r\n",
+        )
+        .await;
+        assert!(denied.starts_with("HTTP/1.1 403"), "{denied}");
+        assert!(
+            !denied.to_ascii_lowercase().contains("policy-pending"),
+            "{denied}"
+        );
     }
 
     /// Send one request and read until the proxy closes. The proxy keeps a
