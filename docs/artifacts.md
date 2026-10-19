@@ -221,9 +221,9 @@ expand to the destination directory.
 
 | Scheme | Fetcher notes |
 | --- | --- |
-| `https://` / `http://` | Streaming download (no whole-body buffering), basic/bearer/headers credentials, redirect limit (5), Content-Length checked against the size cap before streaming. Plain `http` is **not** in the default scheme allowlist. |
-| `file://` | Copies a local file or directory tree. For dev workflows and artifacts pre-provisioned on the node. |
-| `git` | `git::https://github.com/acme/repo?ref=v1.2.0` (go-getter style) or `git://…`. Shallow clone (depth 1). `ref=` takes a branch, tag, or full 40-hex commit SHA (full SHAs are fetched as exact objects). The `.git` directory is stripped, so tasks get a clean worktree. Credentials are injected through `GIT_CONFIG_*` environment variables (an `http.extraHeader` Authorization header), never argv. `resolve()` uses `git ls-remote` to pin refs to commit SHAs. |
+| `https://` / `http://` | Streaming download (no whole-body buffering), basic/bearer/headers credentials, redirect limit (5), Content-Length checked against the size cap before streaming. Every address the fetch connects to, redirects included, is checked by the worker's host guard ([below](#what-the-host-guard-checks)). Credentials are sent to the source's own origin only, never along a redirect to another one, and an `https` source may not redirect to plain `http`. Plain `http` is **not** in the default scheme allowlist. |
+| `file://` | Copies a local file or directory tree. For dev workflows and artifacts pre-provisioned on the node. The worker reads it as root, so a task with a `file://` artifact (or a `file://` `image`) is [host-level](auth-and-acls.md#host-level-jobs): submitting it needs a `job:write` rule with `host = true`. |
+| `git` | `git::https://github.com/acme/repo?ref=v1.2.0` (go-getter style) or `git://…`. Shallow clone (depth 1). `ref=` takes a branch, tag, or full 40-hex commit SHA (full SHAs are fetched as exact objects). The `.git` directory is stripped, so tasks get a clean worktree. Credentials are injected through `GIT_CONFIG_*` environment variables (an `http.extraHeader` Authorization header), never argv. Git may speak only the source URL's own transport (`https`, `http`, `ssh`, `git`, or `file`); `ext::` and `fd::` are refused. A `git::file://` repository is host-level, like `file://`. `resolve()` uses `git ls-remote` to pin refs to commit SHAs. |
 | `s3://` | Backed by `object_store`. Works with any S3-compatible endpoint (AWS, MinIO, R2, GCS interop). Region and endpoint come from the credential object or from query params (`s3://bucket/key?endpoint=https://minio.internal:9000&region=auto`). Query params win. With neither naming a region, the bucket is addressed in `us-east-1`, whatever the worker's `AWS_REGION` says, so a jobspec artifact resolves the same on every node. Anonymous fetches skip request signing (public buckets). A KV credential signs exactly as written: the worker's own `AWS_*` key variables (an `AWS_SESSION_TOKEN` included) never mix into it. The worker's other `AWS_*` store settings (`AWS_ENDPOINT`, `AWS_ALLOW_HTTP`, server-side encryption, proxy options) do apply. |
 | `oci://` | Built on the `oci-client` crate. Anonymous, basic, or bearer registry auth. Tags resolve to manifest digests for pinning. Without `mediaType`, the image is written to disk as an **OCI layout**, which is what image-consuming runtimes pass to their OCI runtime. It is staged under `.oci/<name>/` unless `dest` is set. With `mediaType`, only matching ORAS layers are pulled. Each is named by its `org.opencontainers.image.title` annotation (sanitized to a basename, with the digest hex as fallback). Blob sizes are checked against the size cap before any blob downloads. `?protocol=http` enables plain-HTTP registries for dev and test. |
 
@@ -269,6 +269,11 @@ Cluster matchers may use `kv` or `nodeIdentity`, which are both
 cluster-scoped. They can never use a task identity. Task identities are a
 per-task security boundary, and attaching one cluster-wide would weaken it.
 
+A spec that names `auth.kv` itself needs `kv:read` on that path, and one that
+names `auth.nodeIdentity` itself is [host-level](auth-and-acls.md#host-level-jobs)
+(below). Matchers need neither: they are the operator's choice of which
+sources get which credential.
+
 > **Matchers are applied at admission.** The manager evaluates
 > `artifacts.auth` when a job is submitted and stores the effective auth on
 > the normalized artifact list (annotated `authOrigin = "cluster"`). So
@@ -301,16 +306,21 @@ single `legion kv put`. The next fetch picks up the new value, including
 restarts and reschedules of existing jobs. You don't need to edit or
 re-submit the job.
 
-> **⚠️ KV ACL caveat.** KV ACLs (`kv` rules scoped by `paths`, see
-> [auth-and-acls.md](auth-and-acls.md)) govern the KV RPCs, but they do not
-> apply to artifact credentials. Admission does not check the submitter's
-> `kv` read rights for `auth.kv`, and `GetArtifactCredential` is a
-> worker-plane RPC that serves any path to an authenticated worker. So any
-> job may point `auth.kv` at **any** KV path, or use a cluster matcher that
-> does. Anyone with job-submit access can read every credential stored in
-> KV by staging an artifact with it. This matches the trust model for
-> `$path/key` jobspec references. Plan your KV namespace and job-write
-> grants with this in mind.
+**Who can use a credential.** Naming a KV path in `auth.kv` is reading it:
+the fetch sends the value to the source, so `job run`, `job plan`, and
+template runs need `kv:read` on the path, on top of `job:write`:
+
+```console
+$ legion job run fetch.ncl
+error: permission denied: ... (task fetch artifact https://example.com/tool.tgz names auth.kv secrets/ci-pull; the submitter needs kv read on it)
+```
+
+A path a cluster matcher fills in needs no grant. On the worker side,
+`GetArtifactCredential` gives a node only the paths named by an allocation
+placed on it, by the task of a live [boot ticket](edge-boot.md) for its pool
+(a node stages those before the allocation exists), or by its pool's
+`contentStore`. A node asking for any other path gets `NotFound`, decided
+before the value is read, so it learns nothing about which paths exist.
 
 ### Workload-identity auth (pending)
 
@@ -329,6 +339,11 @@ token to stores that trust Legion's issuer. It says either "Legion task
 >   credential. This works for sources that accept bearer auth (`https`,
 >   `oci`, `git`). `s3://` sources reject it, because the S3 fetcher needs an
 >   AWS credential and Legion does not exchange tokens for STS credentials.
+>   The token is the worker node's own credential, sent to whatever source
+>   the artifact names, so a task that sets `auth.nodeIdentity` itself is
+>   [host-level](auth-and-acls.md#host-level-jobs). Route sources to a node
+>   identity with a cluster matcher instead to make it available to every
+>   job.
 > - **Task `identity` does not work yet.** The spec field and admission
 >   validation exist, but the worker does not request task tokens for
 >   artifact fetches. A fetch using `identity` fails with an error
@@ -354,6 +369,27 @@ token to stores that trust Legion's issuer. It says either "Legion task
 - `allowedSchemes` is enforced at admission **and** on the worker
   (`artifacts.fetch.allowedSchemes`).
 
+### What the host guard checks
+
+The worker fetches an artifact as root, from a source the job chose, and the
+response lands in the task directory. So an `http(s)` fetch is checked by the
+worker's [host guard](network-handlers.md#the-host-guard), the same one the
+datapath uses: each hop's host is resolved, every address is judged, and the
+connection goes only to addresses that pass. Loopback, link-local (which
+includes `169.254.169.254`), cloud metadata, this node's own addresses, and
+`hostGuard.deny` ranges are refused unless a `hostGuard.allow` entry opens
+that address and port:
+
+```console
+staging failed: http://169.254.169.254/latest/meta-data/: the host guard refuses 169.254.169.254 (link-local); an artifact may not be fetched from it unless the worker's hostGuard.allow opens 169.254.169.254:80
+```
+
+To serve artifacts from the node itself (a dev setup on `localhost`), add an
+allow entry for that port to the worker type's `hostGuard.allow`.
+An `s3://` source's `endpoint` is judged the same way before the fetch, but
+the S3 client resolves it again, so the check is not pinned to the address
+it judged. **Git and OCI fetches are not checked.** A `git::` or `oci://`
+source on an internal address is fetched and staged like any other.
 ## Pinning: `resolve = "pin"` vs `'always'`
 
 Mutable references (OCI tags and git branches or tags) default to
@@ -403,9 +439,11 @@ plugin's `prepare()`/`start()`:
    bytes and fails the attempt, so corrupt bytes never reach the task
    directory.
 4. Archives unpack with path-traversal protection and a decompressed-size
-   budget. Absolute entry paths, `..` escapes, and symlink or hardlink
-   targets that escape the extraction root are all rejected. Recognized
-   formats: `.tar.gz`, `.tgz`, `.tar`, and bare `.gz`.
+   budget. Absolute entry paths, `..` escapes, and symlink targets that
+   escape the extraction root are rejected, every entry is resolved inside
+   the root on disk (so an earlier entry cannot redirect a later one), and
+   hard links are refused outright. Recognized formats: `.tar.gz`, `.tgz`,
+   `.tar`, and bare `.gz`.
 5. Content moves into `dest`. A collision with an existing file is an error,
    not an overwrite. The temp area is always cleaned up.
 6. The task starts with `${artifact.<name>}` interpolated and

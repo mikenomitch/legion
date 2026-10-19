@@ -1231,3 +1231,20 @@ stated subject is the cadence ladder itself.
   rig's trust domain inside a disk image and give every future operator
   box the same key. The bake epilogue removes the host keys and runs
   `cloud-init clean` for the same reason.
+
+## 42. `teardown.sh` with no terminal refuses loudly instead of guessing
+
+*Follow-up, 2026-10-19.*
+
+**The call.** Without `--yes`, `teardown.sh` checks for a terminal on stdin.
+With none (`nohup`, `< /dev/null`, a command over `ssh`) it prints that it is
+not destroying the rig and why, and exits 2. The README's unattended
+teardown passes `--yes`.
+
+**Alternatives.** Proceed without asking when there is no terminal.
+
+**Trade-off.** An unattended teardown still needs the flag; forgetting it
+fails rather than tears down.
+
+**Why.** Simplicity. The bug was a silent exit that left the rig billing;
+a loud refusal fixes that without making a destroy happen on a guess.

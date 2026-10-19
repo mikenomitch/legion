@@ -177,7 +177,7 @@ mod tests {
         let parsed = parse_artifact_source(&source)?;
         let limits = FetchLimits {
             max_bytes: 100,
-            deadline: None,
+            ..FetchLimits::default()
         };
         let err = FileFetcher::new()
             .fetch(&request(&parsed, &limits, &source), &mut sink)

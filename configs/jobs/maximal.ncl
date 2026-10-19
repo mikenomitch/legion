@@ -70,6 +70,13 @@
         prep = {
             replacement = "createFirst",
         },
+        # A gang's replicas place and replace as one unit, so its group's
+        # rollout must resolve to a single step: a canary of half a gang is
+        # a broken gang (docs/gang-scheduling.md). This overrides the global
+        # percentSteps above; validation rejects any multi-step mode here.
+        trainer = {
+            percentSteps = [100],
+        },
     },
     tasks = [
         {
@@ -1168,6 +1175,69 @@
             },
             constraints = {
                 os = "macos",
+            },
+            affinities = {
+                region = "us-west",
+            },
+        },
+        {
+            name = "trainer",
+            runtime = "exec",
+            # A gang has its group to itself: a multi-task group already
+            # places all of its tasks together on one node, so validation
+            # rejects `gang` on a task that shares one.
+            group = "trainer",
+            count = 4,
+            # All-or-nothing placement for this task's replicas
+            # (docs/gang-scheduling.md). `gang = true` means every replica
+            # places in one plan or none does: a gang that does not fit
+            # places NOTHING (nor do the job's other tasks in that pass),
+            # holds no capacity while it waits, and its eval blocks until a
+            # node that could help has room. A running gang that loses
+            # members tops them all up together, and preemption never takes
+            # it below its quorum.
+            #
+            # The long form lowers the quorum for elastic workloads: place
+            # once `min` replicas fit together, and add the rest as room
+            # appears. `min` must be 1..=count; `min = count` is `true`.
+            # Not combinable with count.per or keyed stateful tasks, and the
+            # group's rollout must replace it in one step (see
+            # rolloutByGroup.trainer above).
+            gang = {
+                min = 3,
+                # How long the gang may wait for its quorum before the job
+                # fails (stopping any members already running). Counted from
+                # the first time the gang came up short, not per retry.
+                # Unset: wait indefinitely. At least 1s.
+                placementTimeout = "30m",
+                # What a lost member (failed, node lost, drained, evicted)
+                # does to the rest when it leaves fewer than `min` running:
+                #   "restart" (default) stops the survivors and places the
+                #             whole gang again, together, once their stop
+                #             grace has passed;
+                #   "replace" keeps the survivors and places the missing
+                #             members together once they fit;
+                #   "fail"    fails the job and stops every member.
+                # A loss that leaves the quorum running is always replaced
+                # alone. Restarts after a failure spend on_unhealthy's move
+                # budget; once it is spent the job fails.
+                onMemberLoss = "restart",
+            },
+            # Every member starts with LEGION_GANG_RANK (0..count-1),
+            # LEGION_GANG_SIZE, LEGION_GANG_MIN, and LEGION_GANG_LEADER_ADDR
+            # (rank 0's node), fixed when it is placed: what a rendezvous
+            # such as torchrun needs. Members start as their workers get
+            # them; the rendezvous is where they meet. A gang's
+            # speculativeStart is capped at `stage`.
+            config = {
+                command = ["sleep", "3600"],
+            },
+            resources = {
+                cpu = 500,
+                memory = 512,
+            },
+            constraints = {
+                os = "linux",
             },
             affinities = {
                 region = "us-west",

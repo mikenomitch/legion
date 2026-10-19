@@ -557,6 +557,13 @@ member that cannot fit fails the plan. `legion job plan` also keeps
 all-or-nothing, so a dry run reports the first replica that would not fit as
 its error.
 
+A task that sets [`gang`](gang-scheduling.md) opts out of partial placement:
+when one of its replicas does not fit and fewer than its quorum (`gang.min`,
+else the whole count) would run, the plan places nothing at all, for any task
+of the job, and blocks. Above the quorum the rest of the gang is ordinary
+unplaced work. A dry run reports a gang that would wait in
+`PlanJobReply.gang_reports` rather than as an error.
+
 ### Static ports
 
 A task that declares a static port (`network.ports[].static`, or an upstream
@@ -821,7 +828,14 @@ for a task:
   memory;
 - the node holding an instance's node-local storage, or a resume's
   checkpoint, is unavailable;
-- the cluster has no schedulable node at all.
+- the cluster has no schedulable node at all;
+- a [gang](gang-scheduling.md) task cannot reach its quorum. The plan then
+  places nothing, and the eval blocks under the key of the gang's first
+  missing replica, with the gang's report in its detail. A gang that sets
+  `placementTimeout` is also woken by the clock: the scheduler-lane leader
+  wakes its blocked eval (cause `timeout`) once the deadline passes, and if
+  the quorum still does not fit, the eval fails the job instead of blocking
+  again ([Placement timeout](gang-scheduling.md#placement-timeout)).
 
 One placement waits on the clock instead of blocking: preemption that could
 make room, but only once its victims age past `preemption.victimExemptAge`.

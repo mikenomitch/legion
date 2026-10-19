@@ -90,6 +90,10 @@ pub const STDERR_TAIL_MAX_CHARS: usize = 400;
 /// How far back from the end of `stderr.log` the tail is looked for.
 const STDERR_TAIL_READ_BYTES: u64 = 4096;
 
+/// Health status prefix for a gated allocation whose network capture is not
+/// ready ([`WorkerTaskManager::mark_net_capture_unavailable`]).
+pub const NET_CAPTURE_UNAVAILABLE: &str = "net_capture_unavailable";
+
 impl TaskExit {
     /// Human-readable rendering of the exit status, used in worker logs and
     /// the terminal report. Never includes task output.
@@ -766,6 +770,9 @@ pub struct WorkerTaskManager {
     task_configs: HashMap<i64, TaskConfig>,
     health_monitors: HashMap<i64, HealthMonitorHandle>,
     allocation_health: HashMap<i64, AllocationHealth>,
+    /// The health a gated allocation had before its network capture went
+    /// missing ([`NET_CAPTURE_UNAVAILABLE`]), put back when capture recovers.
+    net_capture_masked: HashMap<i64, AllocationHealth>,
     failed: Vec<FailedAllocationReport>,
     /// Terminal (non-failure) outcomes owed to the manager on the next
     /// heartbeat.
@@ -1015,6 +1022,7 @@ impl WorkerTaskManager {
             task_configs: HashMap::new(),
             health_monitors: HashMap::new(),
             allocation_health: HashMap::new(),
+            net_capture_masked: HashMap::new(),
             failed: Vec::new(),
             terminated_reports: Vec::new(),
             terminated: HashMap::new(),
@@ -1399,11 +1407,13 @@ impl WorkerTaskManager {
         config: WorkerArtifactFetchConfigFull,
         credentials: Box<dyn CredentialSource>,
         content_store_target: Option<crate::content_publish::ContentStoreTarget>,
+        egress: Option<Arc<crate::structs::host_guard::HostGuard>>,
     ) {
         self.stager = Arc::new(
             ArtifactStager::new(config, credentials)
                 .with_content_store(self.content_store.clone())
-                .with_content_store_target(content_store_target),
+                .with_content_store_target(content_store_target)
+                .with_egress_guard(egress),
         );
     }
 
@@ -1834,18 +1844,21 @@ impl WorkerTaskManager {
                     continue;
                 }
             }
-            let host_path = match root {
-                Some(root) => match crate::task_plugins::resolve_task_dir_destination(root, path) {
-                    Ok(relative) => task_dir.join(relative),
-                    Err(err) => {
-                        warn!(allocation_id, path, error = %err, "Skipping live KV file");
-                        continue;
-                    }
-                },
-                None => PathBuf::from(path),
-            };
             let bits = crate::task_plugins::injected_file_mode(mode);
-            if let Err(err) = crate::worker::identity::write_token_file(&host_path, content, bits) {
+            let written = match crate::task_plugins::task_file_target(root, path) {
+                // Rewritten while the task runs, in a directory it can write.
+                Ok(crate::task_plugins::TaskFileTarget::BelowTaskDir(relative)) => {
+                    crate::util::write_file_beneath(&task_dir, &relative, content.as_bytes(), bits)
+                }
+                Ok(crate::task_plugins::TaskFileTarget::Host(host_path)) => {
+                    crate::worker::identity::write_token_file(&host_path, content, bits)
+                }
+                Err(err) => {
+                    warn!(allocation_id, path, error = %err, "Skipping live KV file");
+                    continue;
+                }
+            };
+            if let Err(err) = written {
                 warn!(allocation_id, path, error = ?err, "Failed to rewrite live KV file");
                 continue;
             }
@@ -2181,6 +2194,15 @@ impl WorkerTaskManager {
 
     /// Put drained terminal reports back after a failed heartbeat, so a dead
     /// connection cannot swallow a batch task's completion.
+    /// Put back failure reports a heartbeat did not get recorded: the
+    /// connection died, or the manager answered but could not record them
+    /// (`HeartbeatReply.retry_failed_allocations`). The allocation was torn
+    /// down when it failed, so only the report goes back; the teardown does
+    /// not run again, and the report keeps its artifact states.
+    pub fn requeue_failures(&mut self, reports: impl IntoIterator<Item = FailedAllocationReport>) {
+        self.failed.extend(reports);
+    }
+
     pub fn requeue_terminations(&mut self, reports: Vec<TerminatedAllocationReport>) {
         self.terminated_reports.extend(reports);
     }
@@ -2226,31 +2248,36 @@ impl WorkerTaskManager {
         self.alloc_root.join(allocation_id.to_string())
     }
 
-    /// Where an allocation's declared file destinations land on the host,
-    /// for a runtime that mounts its task directory somewhere else.
+    /// Where an allocation's declared file destinations land on the host.
     ///
-    /// `Some((in_task_root, host_task_dir))` for such a runtime (the
-    /// `container` runtime's `/legion/task`), `None` for one whose filesystem
+    /// `(Some(in_task_root), host_task_dir)` for a runtime that mounts its
+    /// task directory somewhere else (the `container` runtime's
+    /// `/legion/task`), and `(None, host_task_dir)` for one whose filesystem
     /// *is* the host's (`exec`), where a declared absolute path is already
-    /// the real path. Used by identity delivery, which writes token files
-    /// before the task starts and must put them where the workload will
-    /// actually look.
+    /// the real path and a relative one is below the task directory. `None`
+    /// only when the runtime does not load. Used by identity delivery, which
+    /// writes token files before the task starts and must put them where the
+    /// workload will actually look.
     pub fn file_delivery_base(
         &mut self,
         allocation_id: i64,
         task_name: &str,
         runtime: &str,
-    ) -> Option<(&'static str, PathBuf)> {
+    ) -> Option<(Option<&'static str>, PathBuf)> {
         if self.registry.load_plugin(runtime, false).is_err() {
             return None;
         }
         let plugin = self.registry.plugin(runtime)?;
-        let root = plugin.file_delivery_root()?;
-        let mut host = self.alloc_dir(allocation_id).join(task_name);
+        let mut host = task_dir_in(&self.alloc_dir(allocation_id), task_name);
+        let Some(root) = plugin.file_delivery_root() else {
+            // The host's own filesystem: an absolute path is the real path,
+            // and a relative one is below the task directory.
+            return Some((None, host));
+        };
         if let Some(subdir) = plugin.file_delivery_host_subdir() {
             host.push(subdir);
         }
-        Some((root, host))
+        Some((Some(root), host))
     }
 
     /// Root of per-allocation directories (`<state>/allocs/`).
@@ -2266,7 +2293,7 @@ impl WorkerTaskManager {
     /// The host task directory (`allocs/<alloc>/<task>/`), whether or not
     /// the task has started yet.
     pub fn task_dir_for(&self, allocation_id: i64, task_name: &str) -> PathBuf {
-        self.alloc_dir(allocation_id).join(task_name)
+        task_dir_in(&self.alloc_dir(allocation_id), task_name)
     }
 
     fn cleanup_alloc_dir(&self, allocation_id: i64) {
@@ -2293,7 +2320,16 @@ impl WorkerTaskManager {
     /// pre-wired with dirs and the `LEGION_ALLOC_DIR`/`LEGION_TASK_DIR` env.
     fn prepare_instance(&self, allocation: &Allocation, task: &TaskConfig) -> R<TaskInstance> {
         let alloc_dir = self.alloc_dir(allocation.id);
-        let task_dir = alloc_dir.join(&task.name);
+        // Admission already restricts task names; this is the worker's own
+        // check, because it runs as root and the name becomes a path.
+        if !crate::structs::job::is_safe_path_component(&task.name) {
+            bail!(
+                "task name {:?} is not a single path component; refusing to create its \
+                 directory",
+                task.name
+            );
+        }
+        let task_dir = task_dir_in(&alloc_dir, &task.name);
         std::fs::create_dir_all(&task_dir)
             .with_context(|| format!("create task directory {}", task_dir.display()))?;
         // The alloc dir is the isolation boundary between allocations sharing
@@ -2508,6 +2544,43 @@ impl WorkerTaskManager {
                 artifact_states: None,
             },
         );
+    }
+
+    /// Report a gated allocation's network capture as not ready: it has no
+    /// network, so its health says so (rollouts and `doctor` see it), and the
+    /// health it had is kept for [`Self::mark_net_capture_ready`].
+    pub fn mark_net_capture_unavailable(&mut self, allocation_id: i64, problems: &[String]) {
+        let allocation_health = &self.allocation_health;
+        self.net_capture_masked
+            .retain(|id, _| allocation_health.contains_key(id));
+        if let Some(prior) = self.allocation_health.get(&allocation_id) {
+            if !prior.status.starts_with(NET_CAPTURE_UNAVAILABLE) {
+                self.net_capture_masked.insert(allocation_id, prior.clone());
+            }
+        }
+        self.set_allocation_health(
+            allocation_id,
+            false,
+            format!("{NET_CAPTURE_UNAVAILABLE}: {}", problems.join("; ")),
+        );
+    }
+
+    /// The capture is ready again: put back the health the allocation had
+    /// before [`Self::mark_net_capture_unavailable`]. Only the health
+    /// monitor writes health again on its own, and a task without checks is
+    /// written healthy once, at start, so without this it would read
+    /// unhealthy for good. A health result written since wins.
+    pub fn mark_net_capture_ready(&mut self, allocation_id: i64) {
+        let Some(prior) = self.net_capture_masked.remove(&allocation_id) else {
+            return;
+        };
+        let still_masked = self
+            .allocation_health
+            .get(&allocation_id)
+            .is_some_and(|health| health.status.starts_with(NET_CAPTURE_UNAVAILABLE));
+        if still_masked {
+            self.allocation_health.insert(allocation_id, prior);
+        }
     }
 
     /// Stops allocations the manager no longer wants and returns the new
@@ -5971,6 +6044,18 @@ const REMOVING_DIR: &str = ".removing";
 /// Rename `dir` into `alloc_root`'s removal area and queue it for a
 /// background thread to delete. False when the rename failed, and the
 /// caller removes it in place.
+/// A task's directory under its allocation directory. A name that is not one
+/// safe path component (admission refuses those) maps to a name admission
+/// can never produce, so the root worker never reads, writes, or removes a
+/// path outside the allocation on a task name's say-so.
+fn task_dir_in(alloc_dir: &std::path::Path, task_name: &str) -> PathBuf {
+    if crate::structs::job::is_safe_path_component(task_name) {
+        alloc_dir.join(task_name)
+    } else {
+        alloc_dir.join("!invalid-task-name")
+    }
+}
+
 fn remove_dir_later(alloc_root: &std::path::Path, dir: &std::path::Path) -> bool {
     static JANITOR: std::sync::OnceLock<std::sync::mpsc::Sender<PathBuf>> =
         std::sync::OnceLock::new();
@@ -7408,6 +7493,7 @@ mod tests {
         manager.configure_artifacts(
             crate::structs::WorkerArtifactFetchConfigFull::default(),
             Box::new(crate::artifacts::AnonymousCredentials),
+            None,
             None,
         );
         Ok(Arc::new(Mutex::new(manager)))
@@ -10976,6 +11062,38 @@ mod tests {
     }
 
     #[test]
+    fn a_recovered_net_capture_puts_the_health_back_test() {
+        let temp_dir = TempDir::new().expect("tempdir");
+        let mut manager = manager_in(&temp_dir);
+        manager.set_allocation_health(7, true, "healthy (no checks configured)");
+
+        manager.mark_net_capture_unavailable(7, &["no namespace yet".to_string()]);
+        manager.mark_net_capture_unavailable(7, &["still none".to_string()]);
+        let masked = manager.allocation_health.get(&7).expect("health").clone();
+        assert!(!masked.healthy);
+        assert!(
+            masked.status.starts_with(NET_CAPTURE_UNAVAILABLE),
+            "{masked:?}"
+        );
+
+        // Recovery restores what the task had before the first mask, not
+        // the second mask's marker.
+        manager.mark_net_capture_ready(7);
+        let health = manager.allocation_health.get(&7).expect("health");
+        assert!(health.healthy);
+        assert_eq!(health.status, "healthy (no checks configured)");
+
+        // A check result written while masked wins over the old health.
+        manager.mark_net_capture_unavailable(7, &[]);
+        manager.set_allocation_health(7, false, "http failed: connection refused");
+        manager.mark_net_capture_ready(7);
+        assert_eq!(
+            manager.allocation_health.get(&7).expect("health").status,
+            "http failed: connection refused"
+        );
+    }
+
+    #[test]
     fn allocation_health_snapshot_sorted() -> R<()> {
         let temp_dir = TempDir::new()?;
         let state_store = WorkerStateStore::new(temp_dir.path().join("worker_state.json"));
@@ -11101,6 +11219,30 @@ mod tests {
         assert!(manager
             .self_fence_expired_allocations(Duration::from_secs(60))
             .is_empty());
+        Ok(())
+    }
+
+    /// A failure report the manager hands back goes out again as it was
+    /// first sent, artifact states included, and the allocation's teardown
+    /// does not run a second time (it is already gone).
+    #[test]
+    fn a_requeued_failure_report_is_sent_again_unchanged() -> R<()> {
+        let temp_dir = TempDir::new()?;
+        let state_store = WorkerStateStore::new(temp_dir.path().join("worker_state.json"));
+        let mut manager = WorkerTaskManager::with_state_store(state_store);
+        insert_running_allocation(&mut manager, 4, None);
+        manager.record_failure(4, "boom");
+        let mut sent = manager.drain_failures();
+        assert_eq!(sent.len(), 1);
+        sent[0].artifact_states = Some("[]".into());
+
+        manager.requeue_failures(sent);
+        let again = manager.drain_failures();
+        assert_eq!(again.len(), 1);
+        assert_eq!(again[0].allocation_id, 4);
+        assert_eq!(again[0].reason, "boom");
+        assert_eq!(again[0].artifact_states.as_deref(), Some("[]"));
+        assert!(manager.drain_failures().is_empty(), "sent once per requeue");
         Ok(())
     }
 
@@ -11571,6 +11713,7 @@ mod tests {
                 ..Default::default()
             },
             Box::new(crate::artifacts::AnonymousCredentials),
+            None,
             None,
         );
         let source = temp_dir.path().join("tool.sh");

@@ -596,6 +596,13 @@ export class WorkerRegisterRequest extends Message<WorkerRegisterRequest> {
   /**
    * JSON object string of node configuration attributes.
    *
+   * `workerFleet` (set by the worker simulator) is checked against the
+   * credential: with ACLs enforced, a join token's worker type must grant
+   * the fleet through its own `workerFleet` attribute (an exact name or a
+   * `*` glob such as `sim-*`), and a node token may not change the fleet
+   * its node joined with. Either refusal is `PERMISSION_DENIED`; audit-only
+   * mode logs it and allows it.
+   *
    * @generated from field: string config_attrs = 3;
    */
   configAttrs = "";
@@ -934,9 +941,11 @@ export class RunJobRequest extends Message<RunJobRequest> {
    * Keys are scoped to the RPC and to the caller (the ACL token's accessor
    * ID, or the principal for JWT and anonymous callers): the same key on a
    * different RPC, or from a different caller, is a new request and never
-   * replays another caller's reply. The key does not cover the request body.
-   * Records are kept for 24 hours, then pruned; a retry after that is applied
-   * again. Every other RPC's `idempotency_key` follows these rules.
+   * replays another caller's reply. The key also covers the request: the same
+   * key with different arguments fails with INVALID_ARGUMENT instead of
+   * replaying the first reply. Records are kept for 24 hours, then pruned; a
+   * retry after that is applied again. Every other RPC's `idempotency_key`
+   * follows these rules.
    *
    * @generated from field: optional string idempotency_key = 5;
    */
@@ -3340,6 +3349,8 @@ export class GetJobSpecReply extends Message<GetJobSpecReply> {
    * Source submissions associated with the job config, exactly as the
    * submitter sent them (usually Nickel source, not JSON). Read these to show
    * what was typed; read `rendered_jobspec` to learn what the job is.
+   * Ordered primary first (`is_primary`), then in the order they were
+   * submitted, so the first entry is the file the submitter named.
    *
    * @generated from field: repeated legion.Submission submissions = 2;
    */
@@ -3668,6 +3679,25 @@ export class PlanJobReply extends Message<PlanJobReply> {
    */
   warnings: string[] = [];
 
+  /**
+   * One report per task that sets `gang` (docs/gang-scheduling.md), in task
+   * order: whether its quorum would place right now, and if not, how far it
+   * got and why the first missing replica did not fit.
+   *
+   * A gang that would not reach its quorum is not an error. The reply then
+   * succeeds with `allocations` empty (a gang short of its quorum places
+   * nothing, and neither does the rest of its job), the report's
+   * `would_place` false, and `message` saying the job would wait: a submit
+   * would block its eval until the whole quorum fits. A dry run of a job
+   * without `gang` still fails when a replica does not fit, as before.
+   *
+   * Like the rest of the reply, this is a plan against a snapshot, not a
+   * reservation.
+   *
+   * @generated from field: repeated legion.GangReport gang_reports = 9;
+   */
+  gangReports: GangReport[] = [];
+
   constructor(data?: PartialMessage<PlanJobReply>) {
     super();
     proto3.util.initPartial(data, this);
@@ -3684,6 +3714,7 @@ export class PlanJobReply extends Message<PlanJobReply> {
     { no: 6, name: "preemptions", kind: "message", T: PlannedPreemption, repeated: true },
     { no: 7, name: "preemption_mode", kind: "scalar", T: 9 /* ScalarType.STRING */ },
     { no: 8, name: "warnings", kind: "scalar", T: 9 /* ScalarType.STRING */, repeated: true },
+    { no: 9, name: "gang_reports", kind: "message", T: GangReport, repeated: true },
   ]);
 
   static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): PlanJobReply {
@@ -3700,6 +3731,157 @@ export class PlanJobReply extends Message<PlanJobReply> {
 
   static equals(a: PlanJobReply | PlainMessage<PlanJobReply> | undefined, b: PlanJobReply | PlainMessage<PlanJobReply> | undefined): boolean {
     return proto3.util.equals(PlanJobReply, a, b);
+  }
+}
+
+/**
+ * How one gang task fared in one plan (docs/gang-scheduling.md). The same
+ * shape is `PlanJobReply.gang_reports` for a dry run and `JobBlocked.gang`
+ * for a gang that is waiting, so a client reads one set of fields either way.
+ *
+ * @generated from message legion.GangReport
+ */
+export class GangReport extends Message<GangReport> {
+  /**
+   * The gang task's name.
+   *
+   * @generated from field: string task = 1;
+   */
+  task = "";
+
+  /**
+   * The task's desired replica count in this plan: its `count`, after a
+   * `job scale` override or a rollout's target.
+   *
+   * @generated from field: uint32 desired = 2;
+   */
+  desired = 0;
+
+  /**
+   * The quorum: how many replicas must run together. `gang.min` when set,
+   * else `desired`; never above `desired`.
+   *
+   * @generated from field: uint32 min = 3;
+   */
+  min = 0;
+
+  /**
+   * Replicas of the task already running. 0 for a fresh placement (a submit,
+   * a restart, a dry run); non-zero when the plan tops up a running gang that
+   * lost members.
+   *
+   * @generated from field: uint32 running = 4;
+   */
+  running = 0;
+
+  /**
+   * Replicas the plan could place before the first one that did not fit.
+   * Replicas place one at a time, best node first, so this is how many fit in
+   * the order the scheduler would place them.
+   *
+   * @generated from field: uint32 placeable = 5;
+   */
+  placeable = 0;
+
+  /**
+   * True when `running + placeable` reaches `min`: the plan places the
+   * quorum (and any further replicas that fit). False when it does not: the
+   * plan places nothing at all, and the job waits.
+   *
+   * @generated from field: bool would_place = 6;
+   */
+  wouldPlace = false;
+
+  /**
+   * Schedulable nodes whose constraints, permit, and volume drivers accept
+   * the task, whether or not they have room. 0 points at the jobspec (a
+   * constraint no node satisfies) rather than at capacity.
+   *
+   * @generated from field: uint32 eligible_nodes = 7;
+   */
+  eligibleNodes = 0;
+
+  /**
+   * Schedulable nodes the plan considered.
+   *
+   * @generated from field: uint32 nodes = 8;
+   */
+  nodes = 0;
+
+  /**
+   * Why the first replica that did not fit did not, in the scheduler's words
+   * (capacity, a static port, disk, a pinned node, preemption's diagnosis).
+   * Empty when every replica fit.
+   *
+   * @generated from field: string reason = 9;
+   */
+  reason = "";
+
+  /**
+   * The gang's `placementTimeout` in seconds: how long it may wait, short of
+   * its quorum, before its job is failed. 0 when it waits indefinitely (the
+   * default).
+   *
+   * @generated from field: uint64 placement_timeout_seconds = 10;
+   */
+  placementTimeoutSeconds = protoInt64.zero;
+
+  /**
+   * `JobBlocked.gang` only: when this wait began, as Unix seconds — the first
+   * time the gang blocked short of its quorum, kept across every later
+   * re-plan that blocked again. A successful plan, a stop, or a restart ends
+   * the wait. 0 in a dry run.
+   *
+   * @generated from field: int64 waiting_since = 11;
+   */
+  waitingSince = protoInt64.zero;
+
+  /**
+   * `JobBlocked.gang` only: when the wait times out (`waiting_since` plus
+   * `placement_timeout_seconds`), as Unix seconds. If the gang is still short
+   * then, its job is failed and every allocation of it stops. 0 when the gang
+   * has no placement timeout, and in a dry run.
+   *
+   * @generated from field: int64 deadline = 12;
+   */
+  deadline = protoInt64.zero;
+
+  constructor(data?: PartialMessage<GangReport>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.GangReport";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "task", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 2, name: "desired", kind: "scalar", T: 13 /* ScalarType.UINT32 */ },
+    { no: 3, name: "min", kind: "scalar", T: 13 /* ScalarType.UINT32 */ },
+    { no: 4, name: "running", kind: "scalar", T: 13 /* ScalarType.UINT32 */ },
+    { no: 5, name: "placeable", kind: "scalar", T: 13 /* ScalarType.UINT32 */ },
+    { no: 6, name: "would_place", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
+    { no: 7, name: "eligible_nodes", kind: "scalar", T: 13 /* ScalarType.UINT32 */ },
+    { no: 8, name: "nodes", kind: "scalar", T: 13 /* ScalarType.UINT32 */ },
+    { no: 9, name: "reason", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 10, name: "placement_timeout_seconds", kind: "scalar", T: 4 /* ScalarType.UINT64 */ },
+    { no: 11, name: "waiting_since", kind: "scalar", T: 3 /* ScalarType.INT64 */ },
+    { no: 12, name: "deadline", kind: "scalar", T: 3 /* ScalarType.INT64 */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): GangReport {
+    return new GangReport().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): GangReport {
+    return new GangReport().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): GangReport {
+    return new GangReport().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: GangReport | PlainMessage<GangReport> | undefined, b: GangReport | PlainMessage<GangReport> | undefined): boolean {
+    return proto3.util.equals(GangReport, a, b);
   }
 }
 
@@ -10180,6 +10362,16 @@ export class JobBlocked extends Message<JobBlocked> {
    */
   evalId = "";
 
+  /**
+   * Set when the task that could not place is a gang
+   * (docs/gang-scheduling.md): how many of its replicas fit at the last
+   * attempt, against the quorum it must place together. `would_place` is
+   * always false here. Unset for every other task.
+   *
+   * @generated from field: legion.GangReport gang = 7;
+   */
+  gang?: GangReport;
+
   constructor(data?: PartialMessage<JobBlocked>) {
     super();
     proto3.util.initPartial(data, this);
@@ -10194,6 +10386,7 @@ export class JobBlocked extends Message<JobBlocked> {
     { no: 4, name: "message", kind: "scalar", T: 9 /* ScalarType.STRING */ },
     { no: 5, name: "since", kind: "scalar", T: 3 /* ScalarType.INT64 */ },
     { no: 6, name: "eval_id", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 7, name: "gang", kind: "message", T: GangReport },
   ]);
 
   static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): JobBlocked {
@@ -13954,6 +14147,25 @@ export class HeartbeatReply extends Message<HeartbeatReply> {
   retryTerminatedAllocations: bigint[] = [];
 
   /**
+   * Allocation ids from the request's `failed_allocations` that this
+   * manager could not record, so the worker must send them again on its
+   * next heartbeat. A failure is reported once, and the worker has already
+   * torn the allocation down: dropping the report leaves the allocation
+   * placed on a node that no longer runs it, and nothing replaces it.
+   *
+   * A report is listed when reading the allocation or recording the
+   * failure failed (the write could not reach the lane leader, say). A
+   * report for an allocation this manager has no row for, one already
+   * removed, or one from a node that does not own the allocation is never
+   * listed.
+   *
+   * Default: empty list.
+   *
+   * @generated from field: repeated int64 retry_failed_allocations = 24;
+   */
+  retryFailedAllocations: bigint[] = [];
+
+  /**
    * The cluster's workload-identity issuer: the `iss` every token and
    * ticket the managers sign carries (docs/workload-identity.md, "Issuer").
    * A worker checks boot, session, and exec tickets against this value, not
@@ -14024,6 +14236,7 @@ export class HeartbeatReply extends Message<HeartbeatReply> {
     { no: 18, name: "session_resync", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
     { no: 19, name: "stop_sessions", kind: "scalar", T: 9 /* ScalarType.STRING */, repeated: true },
     { no: 20, name: "retry_terminated_allocations", kind: "scalar", T: 3 /* ScalarType.INT64 */, repeated: true },
+    { no: 24, name: "retry_failed_allocations", kind: "scalar", T: 3 /* ScalarType.INT64 */, repeated: true },
     { no: 21, name: "workload_identity_issuer", kind: "scalar", T: 9 /* ScalarType.STRING */ },
     { no: 22, name: "envelope_resizes", kind: "message", T: EnvelopeResizeResult, repeated: true },
     { no: 23, name: "cluster_ca_pins", kind: "scalar", T: 9 /* ScalarType.STRING */, repeated: true },
@@ -16035,7 +16248,7 @@ export class InstanceStop extends Message<InstanceStop> {
    * The stop cause, in the vocabulary of stop notices
    * (docs/graceful-stop.md): `stop`, `update`, `drain`, `reschedule`,
    * `destroy`, `node_lost`, `scale_in`, `preempted`, `node_pressure`,
-   * `restore`, `suspended`.
+   * `restore`, `suspended`, `gang`, `failed`.
    *
    * @generated from field: string cause = 1;
    */
@@ -16044,7 +16257,10 @@ export class InstanceStop extends Message<InstanceStop> {
   /**
    * A sentence saying what happened. For `node_pressure` this is the
    * worker's own detail sentence, with the step and the numbers (the same
-   * text as the `node.pressure` event). Otherwise a sentence built from the
+   * text as the `node.pressure` event). For `failed` it names the node and
+   * the worker's failure reason (an exit status, a failed check, a stderr
+   * tail), cut to one line of at most 400 characters; the full reason is on
+   * the `allocation.failed` event. Otherwise a sentence built from the
    * cause.
    *
    * @generated from field: string detail = 2;
@@ -28325,6 +28541,21 @@ export class CreateJoinTokenReply extends Message<CreateJoinTokenReply> {
    */
   token = "";
 
+  /**
+   * Set when the token is unusable from another machine: the manager binds
+   * every interface (`server.host` is `0.0.0.0` or `::`) but has no
+   * `server.advertiseAddr`, so the address it embeds is loopback. A remote
+   * worker would dial its own loopback and retry forever, and nothing on the
+   * manager would look wrong. The text names the embedded address and the
+   * setting that fixes it. The token is still valid for a worker on the
+   * manager's own machine.
+   *
+   * Default: empty (the embedded address is the one the operator chose).
+   *
+   * @generated from field: string warning = 3;
+   */
+  warning = "";
+
   constructor(data?: PartialMessage<CreateJoinTokenReply>) {
     super();
     proto3.util.initPartial(data, this);
@@ -28335,6 +28566,7 @@ export class CreateJoinTokenReply extends Message<CreateJoinTokenReply> {
   static readonly fields: FieldList = proto3.util.newFieldList(() => [
     { no: 1, name: "info", kind: "message", T: JoinTokenInfo },
     { no: 2, name: "token", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 3, name: "warning", kind: "scalar", T: 9 /* ScalarType.STRING */ },
   ]);
 
   static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): CreateJoinTokenReply {
@@ -28886,7 +29118,9 @@ export class IssueBootTicketRequest extends Message<IssueBootTicketRequest> {
    * Exact job config id the ticket authorizes. Optional: when empty the
    * manager pins the job's current config at mint time and returns it in the
    * reply. A ticket NEVER means "latest" — pinning at mint is what keeps a
-   * redeploy from silently widening what a live ticket can start.
+   * redeploy from silently widening what a live ticket can start. When set,
+   * it must be a config of `job` (the job `boot:write` was checked against);
+   * another job's config is NOT_FOUND.
    *
    * @generated from field: string job_config_id = 3;
    */
@@ -29359,11 +29593,11 @@ export class RatifyClaimRequest extends Message<RatifyClaimRequest> {
   gate = GateLevel.GATE_OFF;
 
   /**
-   * Boot ticket that authorized the start, for edge-originated claims. The
-   * manager re-verifies it (nodes are honest but not trusted to be the only
-   * holder) and spends its `jti` when the ticket is single-use. Empty for
-   * manager-originated claims, which were authorized by the submit that
-   * produced them.
+   * Boot ticket that authorized the start. Required: a claim without one is
+   * refused `TICKET_INVALID`. The manager re-verifies it (nodes are honest
+   * but not trusted to be the only holder), refuses it unless it names this
+   * claim's `job_config_id` and `task_name` with a gate at least `gate`, and
+   * spends its `jti` when the ticket is single-use.
    *
    * @generated from field: string ticket = 7;
    */

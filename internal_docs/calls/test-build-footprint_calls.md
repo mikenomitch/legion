@@ -8,10 +8,10 @@ Entries are ranked by project impact, highest first; the number is the rank.
 
 ## 1. Integration tests are modules of one binary; four files stay separate
 
-Sixty-two of the 66 `tests/*.rs` files moved into `tests/integration/` as
+Sixty-three of the 67 `tests/*.rs` files moved into `tests/integration/` as
 modules of `main.rs`. Each file had been its own ~200 MB binary linking all of
 Legion, so the merge took integration binaries from 12.9 GB to 1.1 GB and
-replaced 66 links per library change with one.
+replaced 67 links per library change with one.
 
 ```sh
 # before

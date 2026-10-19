@@ -102,6 +102,10 @@ impl TestNode {
             .build()
             .expect("transport runtime");
         let service = self.store().raft_transport_server();
+        let transport_tls = self
+            .store()
+            .raft_transport_tls()
+            .expect("raft engine started");
         let addr: SocketAddr = format!("127.0.0.1:{}", self.port).parse().unwrap();
         let name = self.name;
         rt.spawn(async move {
@@ -109,7 +113,9 @@ impl TestNode {
             socket.set_reuseaddr(true).expect("reuseaddr");
             socket.bind(addr).expect("bind transport port");
             let listener = socket.listen(64).expect("listen");
-            let incoming = tokio_stream::wrappers::TcpListenerStream::new(listener);
+            let incoming = transport_tls
+                .incoming(listener)
+                .expect("raft transport listener");
             if let Err(err) = tonic::transport::Server::builder()
                 .add_service(service)
                 .serve_with_incoming(incoming)

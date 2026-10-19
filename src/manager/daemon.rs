@@ -62,6 +62,10 @@ pub const IDEMPOTENCY_KEY_TTL: Duration = Duration::from_secs(24 * 60 * 60);
 /// How often the control-lane leader prunes idempotency records older than
 /// `IDEMPOTENCY_KEY_TTL`, so records live between 24 and 25 hours.
 const IDEMPOTENCY_PRUNE_INTERVAL: Duration = Duration::from_secs(60 * 60);
+
+/// How often the scheduler-lane leader drops expired boot tickets. A ticket
+/// lives minutes; the rows only need to stay bounded.
+const BOOT_TICKET_PRUNE_INTERVAL: Duration = Duration::from_secs(60 * 60);
 // Base delay before re-running an eval whose handler hit a foreign-lane
 // NotRaftLeader rejection (divergent lane leadership) — long enough for the
 // engine's JC-40 lane-convergence loop (or an election) to move leadership,
@@ -212,6 +216,22 @@ pub async fn run_manager_with(
         .await?;
     } else {
         info!("Skipping control-lane startup writes on raft non-leader manager");
+        // Except this manager's own config row, which only this manager can
+        // write: it forwards to the control lane's leader, retried in the
+        // background while the cluster elects one, so a manager that never
+        // leads still shows its config on the Managers page.
+        let store = store.clone();
+        let full_config = full_config.clone();
+        let node_id = manager_node_id.clone();
+        tokio::spawn(async move {
+            let published = startup_write("publish manager config through the leader", || async {
+                store.upsert_manager_config(&node_id, &full_config)
+            })
+            .await;
+            if let Err(err) = published {
+                warn!(error = ?err, "Failed publishing this manager's config row");
+            }
+        });
     }
     if is_scheduler_leader {
         if let Err(err) = store.prune_rollouts() {
@@ -390,30 +410,6 @@ pub async fn run_manager_with(
                 refresh_authenticator.refresh_auth_methods().await;
             }
         });
-        // Keep credential tables tidy: expired tokens are already rejected at
-        // authentication time, pruning just removes the rows. The delete is a
-        // replicated control-lane write, so only the control-lane leader
-        // prunes: at startup or on acquiring leadership, then hourly.
-        let prune_store = store.clone();
-        tokio::spawn(async move {
-            let mut last_prune: Option<std::time::Instant> = None;
-            loop {
-                if !prune_store.is_raft_leader(crate::storage::Lane::Control) {
-                    // Forget the schedule so a later leadership win prunes at once.
-                    last_prune = None;
-                } else if last_prune.is_none_or(|at| at.elapsed() >= CREDENTIAL_PRUNE_INTERVAL) {
-                    last_prune = Some(std::time::Instant::now());
-                    match prune_store.prune_expired_credentials() {
-                        Ok((acl_tokens, join_tokens)) if acl_tokens + join_tokens > 0 => {
-                            info!(acl_tokens, join_tokens, "Pruned expired credentials");
-                        }
-                        Ok(_) => {}
-                        Err(err) => warn!(error = ?err, "Failed pruning expired credentials"),
-                    }
-                }
-                tokio::time::sleep(LEADER_POLL_INTERVAL).await;
-            }
-        });
     } else {
         warn!(
             "ACLs are disabled (acl.enabled = false or --no-acl): every API caller, \
@@ -438,6 +434,51 @@ pub async fn run_manager_with(
                 Ok(0) => {}
                 Ok(pruned) => info!(pruned, "Pruned expired idempotency records"),
                 Err(err) => warn!(error = ?err, "Failed pruning idempotency records"),
+            }
+        }
+    });
+
+    // Keep credential tables tidy: expired tokens are already rejected at
+    // authentication time, pruning just removes the rows. With ACLs on or
+    // off, since join tokens are minted either way. The delete is a
+    // replicated control-lane write, so only the control-lane leader
+    // prunes: at startup or on acquiring leadership, then hourly.
+    let prune_store = store.clone();
+    tokio::spawn(async move {
+        let mut last_prune: Option<std::time::Instant> = None;
+        loop {
+            if !prune_store.is_raft_leader(crate::storage::Lane::Control) {
+                // Forget the schedule so a later leadership win prunes at once.
+                last_prune = None;
+            } else if last_prune.is_none_or(|at| at.elapsed() >= CREDENTIAL_PRUNE_INTERVAL) {
+                last_prune = Some(std::time::Instant::now());
+                match prune_store.prune_expired_credentials() {
+                    Ok((acl_tokens, join_tokens)) if acl_tokens + join_tokens > 0 => {
+                        info!(acl_tokens, join_tokens, "Pruned expired credentials");
+                    }
+                    Ok(_) => {}
+                    Err(err) => warn!(error = ?err, "Failed pruning expired credentials"),
+                }
+            }
+            tokio::time::sleep(LEADER_POLL_INTERVAL).await;
+        }
+    });
+
+    // Expired boot tickets can never be redeemed, but their rows were kept
+    // forever (docs/edge-boot.md). Scheduler-lane leader only: the delete is
+    // a replicated write on that lane.
+    let boot_ticket_store = store.clone();
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(BOOT_TICKET_PRUNE_INTERVAL).await;
+            if !boot_ticket_store.is_raft_leader(crate::storage::Lane::Scheduler) {
+                continue;
+            }
+            let now = OffsetDateTime::now_utc().unix_timestamp();
+            match boot_ticket_store.prune_expired_boot_tickets(now) {
+                Ok(0) => {}
+                Ok(pruned) => info!(pruned, "Pruned expired boot tickets"),
+                Err(err) => warn!(error = ?err, "Failed pruning expired boot tickets"),
             }
         }
     });
@@ -562,6 +603,10 @@ pub async fn run_manager_with(
         diverged_since_ms: std::sync::Arc::new(std::sync::atomic::AtomicI64::new(0)),
     };
 
+    if let Some(warning) = full_config.server.loopback_join_address_warning() {
+        warn!("{warning}");
+    }
+
     // Follower-side forwarding of rejected writes to the raft leader
     // (docs/raft-operations.md, "Writes on any manager").
     let leader_forward = crate::manager::leader_forward::LeaderForwardLayer::new(store.clone());
@@ -570,6 +615,7 @@ pub async fn run_manager_with(
         .with_kv_debounce(Duration::from_millis(full_config.kv_debounce_ms))
         .with_authenticator(authenticator)
         .with_advertise_addr(full_config.server.advertised_address())
+        .with_join_address_warning(full_config.server.loopback_join_address_warning())
         .with_manager_id(manager_node_id.clone());
 
     let addr: std::net::SocketAddr =
@@ -588,14 +634,7 @@ pub async fn run_manager_with(
         )
         .parse()?;
         let exec_ws_tls = crate::manager::exec_ws::tls_acceptor(&full_config.server.tls)?;
-        tokio::spawn(async move {
-            if let Err(err) =
-                crate::manager::exec_ws::serve_exec_ws(exec_ws_addr, exec_ws_state, exec_ws_tls)
-                    .await
-            {
-                tracing::error!(error = ?err, "exec ws listener exited");
-            }
-        });
+        crate::manager::exec_ws::start_exec_ws(exec_ws_addr, exec_ws_state, exec_ws_tls).await?;
     } else {
         info!(
             "Exec is disabled (exec.enabled=false); ExecAllocation and the exec WebSocket are off"
@@ -611,13 +650,7 @@ pub async fn run_manager_with(
             .unwrap_or(full_config.server.port + 2);
         let telemetry_addr: std::net::SocketAddr =
             format!("{}:{}", full_config.server.host, telemetry_port).parse()?;
-        tokio::spawn(async move {
-            if let Err(err) =
-                crate::manager::telemetry::serve_telemetry(telemetry_addr, telemetry_state).await
-            {
-                tracing::error!(error = ?err, "telemetry listener exited");
-            }
-        });
+        crate::manager::telemetry::start_telemetry(telemetry_addr, telemetry_state).await?;
     } else {
         info!(
             "Telemetry is disabled (telemetry.enabled=false); /metrics and health probes are off"
@@ -643,6 +676,10 @@ pub async fn run_manager_with(
             "Starting manager: TLS for workers (cluster certificate), plaintext for the CLI and UI"
         );
     }
+    // Registered before the listener binds: a client can connect as soon as
+    // the socket listens, and a SIGTERM sent then must be heard, not take
+    // the default action and kill the manager mid-startup.
+    let mut shutdown_signals = ShutdownSignals::register();
     let api_listener = tokio::net::TcpListener::bind(addr)
         .await
         .with_context(|| format!("manager gRPC server on {addr} failed to bind"))?;
@@ -808,7 +845,7 @@ pub async fn run_manager_with(
             shutdown_persistence(&store_for_shutdown).await;
             return Err(err);
         }
-        signal = shutdown_signal() => signal,
+        signal = shutdown_signals.recv() => signal,
     };
 
     // Graceful shutdown (SIGTERM/SIGINT). Each step is bounded, so a stuck
@@ -825,7 +862,7 @@ pub async fn run_manager_with(
                 );
             }
         }
-        second = shutdown_signal() => {
+        second = shutdown_signals.recv() => {
             warn!(signal = second, "Second shutdown signal; exiting now");
             background.abort();
             return Ok(());
@@ -844,7 +881,7 @@ pub async fn run_manager_with(
                     );
                 }
             }
-            second = shutdown_signal() => {
+            second = shutdown_signals.recv() => {
                 warn!(signal = second, "Second shutdown signal; exiting now");
                 background.abort();
                 return Ok(());
@@ -906,34 +943,65 @@ const IN_PROCESS_WORKER_STOP_TIMEOUT: Duration = Duration::from_secs(120);
 /// this stays under Kubernetes' default 30s termination grace period.
 const SHUTDOWN_PERSISTENCE_TIMEOUT: Duration = Duration::from_secs(15);
 
-/// Resolves with the signal's name on SIGTERM or SIGINT (Ctrl-C).
-async fn shutdown_signal() -> &'static str {
-    let ctrl_c = async {
-        if let Err(err) = tokio::signal::ctrl_c().await {
-            // Without a handler this arm must never fire; SIGTERM still works.
-            warn!(error = ?err, "Failed installing the SIGINT handler");
-            std::future::pending::<()>().await;
-        }
-    };
+/// The manager's SIGTERM and SIGINT (Ctrl-C) handlers. Registering one
+/// replaces the signal's default action (exit), so they are registered
+/// before anything can observe the manager serving.
+struct ShutdownSignals {
     #[cfg(unix)]
-    {
-        use tokio::signal::unix::{signal, SignalKind};
-        match signal(SignalKind::terminate()) {
-            Ok(mut term) => tokio::select! {
-                _ = term.recv() => "SIGTERM",
-                _ = ctrl_c => "SIGINT",
-            },
-            Err(err) => {
-                warn!(error = ?err, "Failed installing the SIGTERM handler");
-                ctrl_c.await;
-                "SIGINT"
+    term: Option<tokio::signal::unix::Signal>,
+    #[cfg(unix)]
+    interrupt: Option<tokio::signal::unix::Signal>,
+}
+
+impl ShutdownSignals {
+    fn register() -> Self {
+        #[cfg(unix)]
+        {
+            use tokio::signal::unix::{signal, SignalKind};
+            let register = |kind: SignalKind, name: &str| match signal(kind) {
+                Ok(handler) => Some(handler),
+                Err(err) => {
+                    warn!(error = ?err, "Failed installing the {name} handler");
+                    None
+                }
+            };
+            Self {
+                term: register(SignalKind::terminate(), "SIGTERM"),
+                interrupt: register(SignalKind::interrupt(), "SIGINT"),
             }
         }
+        #[cfg(not(unix))]
+        {
+            Self {}
+        }
     }
-    #[cfg(not(unix))]
-    {
-        ctrl_c.await;
-        "SIGINT"
+
+    /// Resolves with the signal's name on the next SIGTERM or SIGINT. A
+    /// handler that failed to install never fires; the other still works.
+    async fn recv(&mut self) -> &'static str {
+        #[cfg(unix)]
+        {
+            async fn next(handler: &mut Option<tokio::signal::unix::Signal>) {
+                match handler {
+                    Some(handler) => {
+                        handler.recv().await;
+                    }
+                    None => std::future::pending().await,
+                }
+            }
+            tokio::select! {
+                _ = next(&mut self.term) => "SIGTERM",
+                _ = next(&mut self.interrupt) => "SIGINT",
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            if let Err(err) = tokio::signal::ctrl_c().await {
+                warn!(error = ?err, "Failed installing the SIGINT handler");
+                std::future::pending::<()>().await;
+            }
+            "SIGINT"
+        }
     }
 }
 
@@ -1431,7 +1499,11 @@ pub fn manager_incoming(
     keep_manager_server_cert(store.clone(), cluster.clone());
     let tls_only = operator.is_some();
     let config = crate::cluster_tls::server_config(
-        Arc::new(crate::cluster_tls::ManagerServerCerts { cluster, operator }),
+        Arc::new(crate::cluster_tls::ManagerServerCerts {
+            cluster,
+            operator,
+            raft: store.raft_transport_tls().map(|tls| tls.server_key()),
+        }),
         None,
         true,
     )?;
@@ -3473,6 +3545,32 @@ pub fn resolve_claimed_eval(store: &Store, worker_id: usize, eval: &Eval) -> Eva
                     )),
                 };
             }
+            // A gang still short of its quorum past its `placementTimeout`
+            // fails its job instead of waiting again
+            // (docs/gang-scheduling.md, "Placement timeout").
+            if let Some(report) = blocked.detail.get("gang") {
+                match store.time_out_gang(eval, report) {
+                    Ok(Some(message)) => {
+                        clear_not_leader_attempts(&eval.id);
+                        return EvalCompletion::Finished {
+                            succeeded: false,
+                            event: drafts::eval_failed(
+                                eval,
+                                &anyhow::anyhow!(message),
+                                started.elapsed(),
+                            ),
+                        };
+                    }
+                    Ok(None) => {}
+                    // The job stays blocked and the next attempt re-checks;
+                    // a timeout that cannot be applied must not be lost.
+                    Err(err) => warn!(
+                        eval_id = %eval.id,
+                        error = %format!("{err:#}"),
+                        "Failed to apply a gang placement timeout; blocking again"
+                    ),
+                }
+            }
             warn!(
                 worker_id,
                 eval_id = %eval.id,
@@ -3534,6 +3632,15 @@ fn spawn_blocked_eval_waker(store: &Store) {
                 // The events stay unhandled, so the next pass retries them.
                 Ok(Err(err)) => warn!(error = ?err, "Blocked-eval wake pass failed"),
                 Err(err) => warn!(error = ?err, "Blocked-eval wake pass panicked"),
+            }
+            // Gangs past their `placementTimeout` get one more plan, which
+            // fails the job if they are still short. At most a second late:
+            // this loop runs at least every BLOCKED_WAKE_FALLBACK.
+            let timer_store = store.clone();
+            match tokio::task::spawn_blocking(move || timer_store.wake_timed_out_gangs()).await {
+                Ok(Ok(_)) => {}
+                Ok(Err(err)) => warn!(error = ?err, "Gang placement timeout pass failed"),
+                Err(err) => warn!(error = ?err, "Gang placement timeout pass panicked"),
             }
         }
     });
@@ -3619,6 +3726,11 @@ async fn load_initial_data(store: &Store, config: &ManagerConfig) -> R<()> {
             .map(serde_json::to_string)
             .transpose()?
             .unwrap_or_else(|| "{}".to_string());
+
+        if let Some(resources) = wcp.resources.as_ref() {
+            crate::resources::validate_node_resources(resources)
+                .with_context(|| format!("invalid resources in worker config {path_str}"))?;
+        }
 
         // Fail fast on malformed fetch and content settings (bad humantime /
         // byte-size strings) at manager startup, not on the worker.

@@ -86,7 +86,11 @@ A low-level OCI runtime can't fetch an image, so Legion fetches and converts it
    - the image's working dir and user. Named users and groups resolve against
      the extracted rootfs's `/etc/passwd` and `/etc/group`, and `HOME` comes
      from the passwd entry when the env doesn't set it. Names that can't be
-     resolved fall back to root with a warning.
+     resolved fall back to root with a warning. As in Docker, the process
+     also gets every `/etc/group` group that lists the user by name, when
+     the user is given in the implicit form (a name, a uid with a passwd
+     entry, or no `USER` at all, which is root); `user:group` sets exactly
+     that one group.
    - the allocation's network namespace when it runs gated (the default; see
      [Networking](#networking-gated-by-default-on-linux)), with a generated
      `resolv.conf` pointing at its resolver. With `network.mode = "host"`, the
@@ -1014,6 +1018,4 @@ only its changed layers.
 - Only the image's `USER` can reopen `/dev/stdout` and `/dev/stderr` by path;
   a process that switched to another user inside the container gets `EACCES`
   (see [Stdout and stderr](#stdout-and-stderr)).
-- Supplementary groups from the image's `/etc/group` are not applied to the
-  process; it runs with the resolved uid and gid only.
 - Health checks still run through the worker health monitor.

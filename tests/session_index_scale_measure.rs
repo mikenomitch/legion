@@ -96,8 +96,8 @@ fn measure(nodes: usize, per_node: usize) {
     let rounds = 3;
     let started = Instant::now();
     for round in 0..rounds {
-        for node in 0..nodes {
-            let base = epochs[node];
+        for (node, epoch) in epochs.iter_mut().enumerate() {
+            let base = *epoch;
             let fresh = per_node + round * 2;
             let report = SessionReport {
                 epoch: base + 1,
@@ -110,7 +110,7 @@ fn measure(nodes: usize, per_node: usize) {
                 ],
             };
             index.ingest(&format!("node-{node:05}"), &report, now);
-            epochs[node] = base + 1;
+            *epoch = base + 1;
         }
     }
     let beats = (nodes * rounds) as f64;

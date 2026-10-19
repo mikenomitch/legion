@@ -581,13 +581,12 @@ fn materialize_task_files(files: &[ContainerInjectedFile], instance: &TaskInstan
         let relative =
             crate::task_plugins::resolve_task_dir_destination(TASK_DIR_MOUNT, &file.path)
                 .map_err(|err| anyhow!("declared file path {err}"))?;
-        let destination = task_dir.join(relative);
-        crate::worker::identity::write_token_file(
-            &destination,
-            &file.content,
+        crate::util::write_file_beneath(
+            task_dir,
+            &relative,
+            file.content.as_bytes(),
             crate::task_plugins::injected_file_mode(file.mode.as_deref()),
-        )
-        .with_context(|| format!("write {}", destination.display()))?;
+        )?;
     }
     Ok(())
 }

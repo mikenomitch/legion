@@ -1696,6 +1696,12 @@ pub struct WorkloadIdentityConfig {
     pub rotation_age: Option<String>,
     /// Cluster-default `sub` template; per-identity `subTemplate` overrides it.
     pub sub_template: Option<String>,
+    /// The other `sub` templates a job's identity may name in its own
+    /// `subTemplate`. Empty (the default) means a job may name only the
+    /// cluster default: two templates can render the same subject for two
+    /// different workloads, so which shapes exist is the operator's call.
+    #[serde(default)]
+    pub allowed_sub_templates: Option<Vec<String>>,
     /// Identities issued to worker nodes rather than tasks (artifact system
     /// plan §6). Referenced by `auth.nodeIdentity` and cluster artifact-auth
     /// matchers.
@@ -1720,6 +1726,8 @@ pub struct WorkloadIdentityConfigFull {
     pub default_ttl: String,
     pub rotation_age: String,
     pub sub_template: String,
+    #[serde(default)]
+    pub allowed_sub_templates: Vec<String>,
     #[serde(default)]
     pub node_identities: Vec<NodeIdentityConfig>,
     #[serde(default)]
@@ -1756,6 +1764,7 @@ impl Default for WorkloadIdentityConfigFull {
             default_ttl: DEF_WORKLOAD_IDENTITY_TTL.into(),
             rotation_age: DEF_WORKLOAD_IDENTITY_ROTATION_AGE.into(),
             sub_template: crate::structs::workload_identity::DEFAULT_SUB_TEMPLATE.into(),
+            allowed_sub_templates: Vec::new(),
             node_identities: Vec::new(),
             control_plane_bindings: Vec::new(),
         }
@@ -1772,6 +1781,7 @@ impl From<WorkloadIdentityConfigFull> for WorkloadIdentityConfig {
             default_ttl: Some(val.default_ttl),
             rotation_age: Some(val.rotation_age),
             sub_template: Some(val.sub_template),
+            allowed_sub_templates: Some(val.allowed_sub_templates),
             node_identities: Some(val.node_identities),
             control_plane_bindings: Some(val.control_plane_bindings),
         }
@@ -1789,6 +1799,10 @@ impl WorkloadIdentityConfig {
             default_ttl: self.default_ttl.clone().unwrap_or(d.default_ttl),
             rotation_age: self.rotation_age.clone().unwrap_or(d.rotation_age),
             sub_template: self.sub_template.clone().unwrap_or(d.sub_template),
+            allowed_sub_templates: self
+                .allowed_sub_templates
+                .clone()
+                .unwrap_or(d.allowed_sub_templates),
             node_identities: self.node_identities.clone().unwrap_or(d.node_identities),
             control_plane_bindings: self
                 .control_plane_bindings
@@ -2038,6 +2052,28 @@ impl ServerConfigFull {
             return addr.clone();
         }
         self.local_address()
+    }
+
+    /// Why the join tokens this manager mints will strand remote workers,
+    /// when they will: it binds every interface (a wildcard `host`) yet has
+    /// no `advertiseAddr`, so the address it derives, and embeds in every
+    /// join token, is loopback. A worker on another machine decodes the
+    /// token, dials its own loopback, and retries forever while the manager
+    /// shows no error at all. A manager bound to one address (loopback
+    /// included) means it, and gets no warning.
+    pub fn loopback_join_address_warning(&self) -> Option<String> {
+        if self.advertise_addr.is_some() || !matches!(self.host.as_str(), "0.0.0.0" | "::") {
+            return None;
+        }
+        Some(format!(
+            "server.host is {} (every interface) but server.advertiseAddr is unset, so join \
+             tokens name {}: a worker on another machine dials its own loopback and never \
+             registers. Set server.advertiseAddr to an address workers can reach (for example \
+             \"http://10.0.1.5:{}\")",
+            self.host,
+            self.advertised_address(),
+            self.port
+        ))
     }
 
     /// The address a CLI on the manager's own machine dials: scheme, host,
@@ -3339,6 +3375,35 @@ pub fn parse_byte_size(raw: &str) -> R<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A wildcard bind with no `advertiseAddr` puts loopback in every join
+    /// token, which strands any worker on another machine without an error
+    /// anywhere on the manager. That case, and only that case, warns.
+    #[test]
+    fn a_wildcard_bind_without_advertise_addr_warns_about_join_tokens_test() {
+        let server = |host: &str, advertise: Option<&str>| ServerConfigFull {
+            port: 4747,
+            host: host.into(),
+            advertise_addr: advertise.map(str::to_string),
+            ..Default::default()
+        };
+        let warning = server("0.0.0.0", None)
+            .loopback_join_address_warning()
+            .expect("wildcard bind, no advertiseAddr");
+        assert!(warning.contains("http://127.0.0.1:4747"), "{warning}");
+        assert!(warning.contains("server.advertiseAddr"), "{warning}");
+        assert!(server("::", None).loopback_join_address_warning().is_some());
+        assert!(server("0.0.0.0", Some("http://10.0.1.5:4747"))
+            .loopback_join_address_warning()
+            .is_none());
+        // Bound to one address on purpose: loopback means loopback.
+        assert!(server("127.0.0.1", None)
+            .loopback_join_address_warning()
+            .is_none());
+        assert!(server("10.0.1.5", None)
+            .loopback_join_address_warning()
+            .is_none());
+    }
 
     #[test]
     fn oversubscribe_and_memory_pressure_validate() {

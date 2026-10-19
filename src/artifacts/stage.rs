@@ -252,7 +252,7 @@ pub fn looks_like_archive(name: &str) -> bool {
 }
 
 /// Validates that an archive entry path stays inside the extraction root.
-fn safe_entry_path(root: &Path, entry_path: &Path) -> R<PathBuf> {
+fn safe_entry_path(entry_path: &Path) -> R<()> {
     let mut depth: i64 = 0;
     for component in entry_path.components() {
         match component {
@@ -275,7 +275,7 @@ fn safe_entry_path(root: &Path, entry_path: &Path) -> R<PathBuf> {
             }
         }
     }
-    Ok(root.join(entry_path))
+    Ok(())
 }
 
 /// Validates a symlink target: relative targets may not escape the extraction
@@ -364,10 +364,16 @@ fn unpack_tar<RD: Read>(reader: RD, dest_dir: &Path, size_budget: u64) -> R<()> 
     for entry in archive.entries().context("read tar entries")? {
         let mut entry = entry.context("read tar entry")?;
         let entry_path = entry.path().context("tar entry path")?.into_owned();
-        let target = safe_entry_path(dest_dir, &entry_path)?;
+        safe_entry_path(&entry_path)?;
 
         let entry_type = entry.header().entry_type();
-        if entry_type.is_symlink() || entry_type.is_hard_link() {
+        if entry_type.is_hard_link() {
+            bail!(
+                "archive entry {} is a hard link, which artifacts do not support",
+                entry_path.display()
+            );
+        }
+        if entry_type.is_symlink() {
             let link_target = entry
                 .link_name()
                 .context("tar link name")?
@@ -381,12 +387,18 @@ fn unpack_tar<RD: Read>(reader: RD, dest_dir: &Path, size_budget: u64) -> R<()> 
             bail!("decompressed artifact exceeds maxArtifactSize ({size_budget} bytes)");
         }
 
-        if let Some(parent) = target.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        entry
-            .unpack(&target)
+        // `unpack_in` resolves the entry against `dest_dir` on disk and
+        // refuses one whose parent is not inside it, so the textual checks
+        // above are not the only guard.
+        let unpacked = entry
+            .unpack_in(dest_dir)
             .with_context(|| format!("unpack tar entry {}", entry_path.display()))?;
+        if !unpacked {
+            bail!(
+                "archive entry {} resolves outside the extraction root",
+                entry_path.display()
+            );
+        }
     }
     Ok(())
 }
@@ -412,6 +424,8 @@ pub struct ArtifactStager {
     /// This worker's `contentStore`, when it has one. Published snapshot
     /// parts under its URL are fetched with its credential.
     content_store_target: Option<ContentStoreTarget>,
+    /// The worker's host guard, for every fetch ([`FetchLimits::egress`]).
+    egress: Option<Arc<crate::structs::host_guard::HostGuard>>,
     /// Opens the store a published part's URL is in
     /// ([`crate::content_publish::sealed_objects_for_url`]; a stand-in in
     /// tests).
@@ -463,6 +477,7 @@ impl ArtifactStager {
             credentials,
             content: None,
             content_store_target: None,
+            egress: None,
             sealed_stores: Box::new(crate::content_publish::sealed_objects_for_url),
             inflight: Mutex::new(HashSet::new()),
             inflight_done: Condvar::new(),
@@ -481,6 +496,16 @@ impl ArtifactStager {
     /// ([`ArtifactStager::fetch_sealed_into_store`]).
     pub fn with_content_store_target(mut self, target: Option<ContentStoreTarget>) -> Self {
         self.content_store_target = target;
+        self
+    }
+
+    /// Judge every address a fetch connects to with the worker's host guard
+    /// ([`FetchLimits::egress`]).
+    pub fn with_egress_guard(
+        mut self,
+        guard: Option<Arc<crate::structs::host_guard::HostGuard>>,
+    ) -> Self {
+        self.egress = guard;
         self
     }
 
@@ -710,6 +735,7 @@ impl ArtifactStager {
         let limits = FetchLimits {
             max_bytes: self.config.max_artifact_size_bytes,
             deadline: Some(deadline),
+            egress: self.egress.clone(),
         };
 
         let mut last_err: Option<anyhow::Error> = None;
@@ -1075,6 +1101,7 @@ impl ArtifactStager {
         let limits = FetchLimits {
             max_bytes: self.config.max_artifact_size_bytes,
             deadline: Some(deadline),
+            egress: self.egress.clone(),
         };
         let mut last_err: Option<anyhow::Error> = None;
         let mut tried = 0;
@@ -1498,12 +1525,25 @@ fn relative_to_task_dir(task_dir: &Path, path: &Path) -> R<String> {
     Ok(relative.to_string_lossy().into_owned())
 }
 
-fn join_task_dir(task_dir: &Path, relative: &str) -> PathBuf {
-    if relative == "." {
-        task_dir.to_path_buf()
-    } else {
-        task_dir.join(relative)
+/// A path the staged manifest names, for reuse after a restart. The
+/// manifest is in the task directory, which the task can rewrite, so the
+/// path must be relative, climb nowhere, and pass through no symlink below
+/// the task directory; anything else re-stages instead of trusting it.
+fn reused_task_path(task_dir: &Path, relative: &str) -> Option<PathBuf> {
+    let mut path = task_dir.to_path_buf();
+    for component in Path::new(relative).components() {
+        match component {
+            Component::CurDir => {}
+            Component::Normal(part) => {
+                path.push(part);
+                if fs::symlink_metadata(&path).ok()?.file_type().is_symlink() {
+                    return None;
+                }
+            }
+            _ => return None,
+        }
     }
+    Some(path)
 }
 
 fn write_staged_manifest(task_dir: &Path, fingerprint: &str, staged: &[StagedArtifact]) -> R<()> {
@@ -1580,14 +1620,14 @@ fn try_reuse_staged(
     for record in manifest.artifacts {
         let payload = match record.payload {
             StagedRecordPayload::File { path } => {
-                let path = join_task_dir(task_dir, &path);
+                let path = reused_task_path(task_dir, &path)?;
                 if !path.is_file() {
                     return None;
                 }
                 StagedPayload::File { path }
             }
             StagedRecordPayload::Tree { dir } => {
-                let dir = join_task_dir(task_dir, &dir);
+                let dir = reused_task_path(task_dir, &dir)?;
                 if !dir.is_dir() {
                     return None;
                 }
@@ -1597,7 +1637,7 @@ fn try_reuse_staged(
                 oci_layout,
                 reference,
             } => {
-                let oci_layout = join_task_dir(task_dir, &oci_layout);
+                let oci_layout = reused_task_path(task_dir, &oci_layout)?;
                 if !oci_layout.is_dir() {
                     return None;
                 }
@@ -1611,11 +1651,11 @@ fn try_reuse_staged(
                 files,
                 media_type,
             } => {
-                let dir = join_task_dir(task_dir, &dir);
+                let dir = reused_task_path(task_dir, &dir)?;
                 let files: Vec<PathBuf> = files
                     .iter()
-                    .map(|file| join_task_dir(task_dir, file))
-                    .collect();
+                    .map(|file| reused_task_path(task_dir, file))
+                    .collect::<Option<_>>()?;
                 if !dir.is_dir() || files.iter().any(|file| !file.is_file()) {
                     return None;
                 }
@@ -1780,6 +1820,30 @@ mod tests {
         fs::write(&archive, bytes)?;
         let err = unpack_archive(&archive, &dir.path().join("out2"), 1024 * 1024).unwrap_err();
         assert!(err.to_string().contains("absolute"), "{err}");
+        Ok(())
+    }
+
+    /// Hard links are refused outright: the root worker extracts, and a hard
+    /// link names an existing inode rather than new content.
+    #[test]
+    fn unpack_rejects_hard_links_test() -> R<()> {
+        let dir = tempdir()?;
+        let mut builder = tar::Builder::new(flate2::write::GzEncoder::new(
+            Vec::new(),
+            flate2::Compression::default(),
+        ));
+        let mut header = tar::Header::new_gnu();
+        header.set_entry_type(tar::EntryType::Link);
+        header.set_size(0);
+        header.set_cksum();
+        builder.append_link(&mut header, "copy", "original")?;
+        let bytes = builder.into_inner()?.finish()?;
+        let archive = dir.path().join("hardlink.tar.gz");
+        fs::write(&archive, bytes)?;
+
+        let err = unpack_archive(&archive, &dir.path().join("out"), 1024 * 1024).unwrap_err();
+        assert!(err.to_string().contains("hard link"), "{err}");
+        assert!(!dir.path().join("out/copy").exists());
         Ok(())
     }
 

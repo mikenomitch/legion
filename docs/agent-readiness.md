@@ -54,7 +54,7 @@ Even with `--allow-write`, `legion_state_query` stays read-only.
 | --- | --- | --- |
 | `legion_capabilities` | no | List the operation catalog. |
 | `legion_job_list` | no | List jobs, optionally only those in one `status`. The reply's `statusCounts` gives per-status totals. |
-| `legion_job_info` | no | Inspect one job. A job whose placement found no room reports `status: blocked` with a `blocked` block: the key it waits on, the task, its per-placement shortfall, and the scheduler's message. It places on its own when capacity appears, so an agent should wait or add capacity, not resubmit ([Blocked evals](scheduler-and-eval-loop.md#blocked-evals)). |
+| `legion_job_info` | no | Inspect one job. A job whose placement found no room reports `status: blocked` with a `blocked` block: the key it waits on, the task, its per-placement shortfall, and the scheduler's message. It places on its own when capacity appears, so an agent should wait or add capacity, not resubmit ([Blocked evals](scheduler-and-eval-loop.md#blocked-evals)). For a [gang](gang-scheduling.md), `blocked.gang` says how many replicas fit (`placeable`, `running`) against the quorum it must place together (`min`), and, when it sets `placementTimeout`, when it gives up (`deadline`, Unix seconds): wait until then, or add capacity. A gang job past its deadline, or one whose `onMemberLoss` failed it, reports `status: failed` and places nothing until `legion job run`. |
 | `legion_job_spec` | no | Fetch a job's source submissions. |
 | `legion_job_schema` | no | JSON Schema for jobspecs + task runtimes. |
 | `legion_job_validate` | no | Validate a rendered jobspec (JSON). |
@@ -132,7 +132,9 @@ Tool errors come back in-band (`result.isError = true` with a text payload),
 following MCP convention. Transport and protocol errors use JSON-RPC `error`.
 
 The transport sends one JSON message per line. In MCP mode Legion routes all
-console logs to stderr, so stdout carries only the protocol stream.
+console logs to stderr, so stdout carries only the protocol stream. Every
+other one-shot command does the same, so a `--json` envelope on stdout is
+never interleaved with log lines.
 
 ### Reading a node's last heartbeat honestly
 
@@ -447,9 +449,12 @@ A key is scoped to one operation and one caller:
   ACL token (by accessor ID), or the principal for JWT and anonymous callers.
   One caller can never read another's recorded reply. With ACLs disabled,
   every caller is the same caller.
-- The key does not cover the request body. Retrying a key with different
-  arguments (another job name, say) replays the first reply. Use a fresh key
-  per intended change.
+- The key covers the request. A key names one request: retrying it with
+  different arguments (another job name, say) fails with `INVALID_ARGUMENT`
+  ("this idempotency key was first used with different request arguments")
+  instead of replaying the first reply, so a retry loop that changed its
+  request never believes the change was made. Use a fresh key per intended
+  change, and retry with the exact same request.
 
 Records are kept for 24 hours, then pruned by the manager (the control-lane
 leader in raft mode) within the following hour. A retry after that runs the
@@ -767,6 +772,13 @@ the timeout off.
    - `preemptions`: every allocation the submit would displace, with its job,
      task, band, and grace window
      ([preemption-and-eviction.md](preemption-and-eviction.md)).
+   - `gangReports`: per task that sets `gang`, whether its quorum fits right
+     now (`wouldPlace`), and if not how far it got (`placeable` of `min`,
+     `eligibleNodes` of `nodes`) and why. `wouldPlace: false` is not an error:
+     the reply succeeds with no allocations, and a submit would wait, blocked
+     and holding nothing, until the gang fits, or until its
+     `placementTimeoutSeconds` runs out and the job fails
+     ([gang-scheduling.md](gang-scheduling.md)).
 
    `preemptionMode` tells you whether that list is empty because nothing would
    be displaced or because preemption is off. Ask for confirmation when

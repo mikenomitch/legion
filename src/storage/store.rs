@@ -34,6 +34,13 @@ mod job_status_ops;
 // Reschedule backoff: the failed-allocation removal op, its holds, and the
 // move history they double as.
 mod reschedule_holds;
+// Gang waits: when a gang started waiting for its quorum, and its
+// `placementTimeout`.
+mod gang_waits;
+// Gang member losses: what a lost member does to the rest of its gang.
+mod gang_losses;
+// Gang members: each gang allocation's rank, size, and leader address.
+mod gang_members;
 use crate::storage::persistence::{
     build_persistence_driver, PersistenceDriver, PersistenceRole, PersistenceStatus,
     RaftHistoryEvent, RaftStatus,
@@ -41,6 +48,9 @@ use crate::storage::persistence::{
 use crate::storage::raft::{capture, ReplicatedOp, ReplicationHandle};
 use crate::storage::Lane;
 pub use fork_ops::{alias_target_problem, AliasOutcome, ForkCreated};
+pub use gang_losses::GangLoss;
+pub use gang_members::GangMember;
+pub use gang_waits::GangWait;
 pub use job_status_ops::{derive_job_status, JobStatusFacts, TaskStatusFact};
 pub use keyring_ops::{KeyringInit, KeyringReset, RewrapBatch, RewrapRun, RootKeyRewrap};
 pub use reschedule_holds::{
@@ -819,6 +829,9 @@ pub struct PreemptionVictimRow {
     /// resolve against.
     pub task_count: u32,
     pub disruption_json: Option<String>,
+    /// The task's `gang` block: its quorum is a floor preemption never
+    /// crosses, like `disruption.minAvailable` (docs/gang-scheduling.md).
+    pub gang_json: Option<String>,
     pub stop_json: Option<String>,
     /// The owning job config's priority band.
     pub band: Band,
@@ -1882,16 +1895,19 @@ const EVENT_ID_SEQ_BITS: u32 = 18;
 
 // NOTE: This will become a general interface for all storage backends
 
-/// Columns `QueryStateStore` reads as NULL: private key material and password
-/// hashes. Raw SQL is a `state:read` capability, and a holder of these could
-/// forge workload-identity JWTs and boot tickets (`signing_key`), mint mesh
-/// certificates (`net_mesh_ca`), or crack user passwords offline (`acl_user`).
-/// The manager reads these through its own code paths, never through
-/// `query_state_store`.
+/// Columns `QueryStateStore` reads as NULL: private key material, password
+/// hashes, and recorded replies. Raw SQL is a `state:read` capability, and a
+/// holder of these could forge workload-identity JWTs and boot tickets
+/// (`signing_key`), mint mesh certificates (`net_mesh_ca`), crack user
+/// passwords offline (`acl_user`), or redeem a live boot ticket, which a
+/// keyed `IssueBootTicket` records whole so a retry gets the same ticket back
+/// (`idempotency_record`). The manager reads these through its own code
+/// paths, never through `query_state_store`.
 pub const STATE_QUERY_REDACTED_COLUMNS: &[(&str, &str)] = &[
     ("signing_key", "private_key_pem"),
     ("net_mesh_ca", "key_pem"),
     ("acl_user", "password_hash"),
+    ("idempotency_record", "response_message"),
 ];
 
 /// Installs a SQLite authorizer that reads every redacted column as NULL for
@@ -2281,6 +2297,18 @@ impl Store {
             .as_any()
             .downcast_ref::<crate::storage::raft::driver::MultiRaftDriver>()
             .and_then(|driver| driver.peer_channel(host_port))
+    }
+
+    /// The TLS identity this manager's raft transport speaks to its peers
+    /// with ([`crate::cluster_tls::RaftTransportTls`]). `None` outside raft
+    /// mode or before the engine starts. The manager's listener presents it
+    /// to a client asking for `raft.legion`; a process that serves the raft
+    /// transport on its own listener uses [`crate::cluster_tls::RaftTransportTls::incoming`].
+    pub fn raft_transport_tls(&self) -> Option<Arc<crate::cluster_tls::RaftTransportTls>> {
+        self.persistence_driver
+            .as_any()
+            .downcast_ref::<crate::storage::raft::driver::MultiRaftDriver>()
+            .and_then(|driver| driver.transport_tls())
     }
 
     /// Whether this manager leads every raft lane (always true outside raft
@@ -2869,7 +2897,15 @@ impl Store {
             // is defensive: surface what actually happened.
             return Err(original);
         };
-        match driver.forward_lane_write(&op) {
+        let forwarded = driver.forward_lane_write(&op);
+        crate::manager::telemetry::metrics()
+            .leader_forwards_total
+            .inc(&[
+                op.lane().wire_name(),
+                op.op_name(),
+                if forwarded.is_ok() { "ok" } else { "failed" },
+            ]);
+        match forwarded {
             Ok(value) => {
                 debug!(
                     op = op.op_name(),
@@ -3337,7 +3373,7 @@ impl Store {
 
         let mut task_stmt = conn.prepare(
             r#"
-            SELECT id, name, runtime, count, count_per, group_name, lifecycle, schedule, depends_on, config, resources, constraints, permit, affinities, checks, on_unhealthy, kv_injections, job_config_id, identities, stateful, artifacts, network, service, actions, volumes, connect, restart, stop, disruption, speculative_start, snapshots, suspend
+            SELECT id, name, runtime, count, count_per, group_name, lifecycle, schedule, depends_on, config, resources, constraints, permit, affinities, checks, on_unhealthy, kv_injections, job_config_id, identities, stateful, artifacts, network, service, actions, volumes, connect, restart, stop, disruption, speculative_start, snapshots, suspend, gang
             FROM task_config;
             "#,
         )?;
@@ -3358,6 +3394,7 @@ impl Store {
                 speculative_start: parse_json_column(29, row.get(29)?)?,
                 snapshots: parse_json_column(30, row.get(30)?)?,
                 suspend: parse_json_column(31, row.get(31)?)?,
+                gang: parse_json_column(32, row.get(32)?)?,
                 name: row.get(1)?,
                 runtime: row.get(2)?,
                 count: TaskCount {
@@ -4431,7 +4468,8 @@ impl Store {
                     EXISTS( \
                         SELECT 1 FROM volume v \
                         WHERE v.instance_id = a.instance_id AND v.node_local = 1 \
-                    ) AS node_pinned \
+                    ) AS node_pinned, \
+                    tc.gang \
              FROM allocation a \
              INNER JOIN task_config tc ON tc.id = a.task_config_id \
              INNER JOIN job_config jc ON jc.id = a.job_config_id \
@@ -4455,6 +4493,7 @@ impl Store {
                     stop_json: row.get(10)?,
                     band: Band::from_stored(&row.get::<_, String>(11)?),
                     node_pinned: row.get::<_, i64>(12)? != 0,
+                    gang_json: row.get(13)?,
                 })
             })?)?;
         Ok(rows)
@@ -7328,6 +7367,7 @@ impl Store {
             speculative_start: parse_json_column(30, row.get(30)?)?,
             snapshots: parse_json_column(31, row.get(31)?)?,
             suspend: parse_json_column(32, row.get(32)?)?,
+            gang: parse_json_column(33, row.get(33)?)?,
         };
 
         Ok(task_config)
@@ -7392,23 +7432,43 @@ impl Store {
     // MANAGER CONFIG
     //
 
+    /// Publish this manager's config row (the Managers page's Config
+    /// column). Forwards to the control lane's leader when this manager does
+    /// not lead it, so a manager that has never led still has a row.
     #[instrument(err, skip_all)]
     pub fn upsert_manager_config(&self, node_id: &str, config: &ManagerConfigFull) -> R<()> {
+        let config_json = to_string_pretty(config)?;
+        match self.upsert_manager_config_local(node_id, &config_json) {
+            Err(err) if crate::storage::raft::driver::NotRaftLeader::in_chain(&err) => self
+                .forward_after_rejection::<()>(
+                    crate::storage::raft::forward::ForwardableLaneWrite::UpsertManagerConfig {
+                        node_id: node_id.to_owned(),
+                        config_json,
+                    },
+                    err,
+                ),
+            other => other,
+        }
+    }
+
+    /// [`Self::upsert_manager_config`], non-forwarding (also the
+    /// `ForwardLaneWrite` executor's entry point). Takes the config already
+    /// serialized, so a forwarded row is byte-for-byte what its manager wrote.
+    pub(crate) fn upsert_manager_config_local(&self, node_id: &str, config_json: &str) -> R<()> {
         let node_id = node_id.to_owned();
-        let config = config.clone();
+        let config_json = config_json.to_owned();
         self.replicated(Lane::Control, "upsert_manager_config", move |s| {
-            s.upsert_manager_config_apply(&node_id, &config)
+            s.upsert_manager_config_apply(&node_id, &config_json)
         })
     }
 
-    fn upsert_manager_config_apply(&self, node_id: &str, config: &ManagerConfigFull) -> R<()> {
+    fn upsert_manager_config_apply(&self, node_id: &str, config_json: &str) -> R<()> {
         let fmt = format_description!(
             "[year]-[month]-[day] [hour]:[minute]:[second] [offset_hour \
                  sign:mandatory]:[offset_minute]:[offset_second]"
         );
 
         let timestamp_now = OffsetDateTime::now_utc().format(fmt)?;
-        let config_json = to_string_pretty(config)?;
 
         let conn = self.write_connection()?;
 
@@ -7521,7 +7581,10 @@ impl Store {
 
         let params = named_params! {
             ":id": id,
-            ":status": "ready",
+            // `active`, the status every liveness query matches. This once
+            // wrote `ready`, which dropped a node recovered here out of the
+            // liveness scan and out of `legion_nodes{status="active"}`.
+            ":status": "active",
             ":last_heartbeat": last_heartbeat,
         };
 
@@ -7807,6 +7870,8 @@ impl Store {
 
         let evicted = removable.len();
         let affected_job_configs = self.remove_allocations(&removable, StopCause::Drain)?;
+        let affected_job_configs =
+            self.gang_members_lost_on_node(&removable, StopCause::Drain, affected_job_configs);
         let reconciled = self.reconcile_job_configs_or_requeue(affected_job_configs);
 
         self.events().node_drained(node_id, evicted, held);
@@ -8443,12 +8508,10 @@ impl Store {
                 // construction: a node transitions twice per outage, not
                 // thirty times a minute.
                 //
-                // Deliberately NOT `mark_node_ready`: that writes status
-                // `"ready"`, which every liveness query filters out (they all
-                // match `"active"`), so recovering through it would drop the
-                // node out of the liveness scan and out of
-                // `legion_nodes{status="active"}`. This is the same composite
-                // shape with the correct status value.
+                // Not `mark_node_ready`: the same status-then-control
+                // composite, but a recovery from `lost` flips availability
+                // back only if the loss changed it, counts the recovery, and
+                // re-observes the node in the in-memory liveness tracker.
                 self.update_node_heartbeat_forwarding(id.clone())?;
                 self.restore_availability_after_loss(&id);
                 self.liveness.observe(&id);
@@ -9533,6 +9596,8 @@ impl Store {
         )?;
         tx.execute("DELETE FROM instance WHERE job_id = ?1;", [job_id])?;
         tx.execute("DELETE FROM reschedule_hold WHERE job_id = ?1;", [job_id])?;
+        Self::delete_gang_waits_for_job_tx(&tx, job_id)?;
+        Self::delete_gang_members_for_job_tx(&tx, job_id)?;
         Self::destroy_job_snapshots_tx(&tx, job_id)?;
         tx.execute("DELETE FROM rollout_event WHERE job_id = ?1;", [job_id])?;
         tx.execute("DELETE FROM rollout WHERE job_id = ?1;", [job_id])?;
@@ -9885,6 +9950,26 @@ impl Store {
         };
         if status == "stopped" {
             return Ok(Some(format!("job {job_id} is stopped")));
+        }
+        // A failed gang job stays down until `job run` restarts it (which
+        // clears the status first): its gang was failed as a unit (a
+        // placement timeout, an `onMemberLoss: fail`, or a member that ran
+        // out of moves), and a stray reschedule placing it again would undo
+        // exactly that (docs/gang-scheduling.md). Other failed jobs keep
+        // planning, as before.
+        if status == "failed" {
+            let gang: bool = conn
+                .prepare_cached(
+                    "SELECT EXISTS (
+                         SELECT 1 FROM task_config WHERE job_config_id = ?1 AND gang IS NOT NULL
+                     );",
+                )?
+                .query_row([job_config_id], |row| row.get(0))?;
+            if gang {
+                return Ok(Some(format!(
+                    "job {job_id} failed as a gang; `legion job run` restarts it"
+                )));
+            }
         }
         let Some(latest) = latest else {
             return Ok(None);
@@ -10639,6 +10724,7 @@ impl Store {
                 .map(serde_json::to_string)
                 .transpose()?;
             let suspend = t.suspend.as_ref().map(serde_json::to_string).transpose()?;
+            let gang = t.gang.as_ref().map(serde_json::to_string).transpose()?;
             let schedule = t.schedule.as_ref().map(ToString::to_string);
             let task_params = named_params! {
                 ":name": t.name,
@@ -10673,6 +10759,7 @@ impl Store {
                 ":speculative_start": speculative_start,
                 ":snapshots": snapshots,
                 ":suspend": suspend,
+                ":gang": gang,
             };
 
             let task_id: i64 = tx.query_row(&INSERT_TASK, task_params, |row| row.get(0))?;
@@ -12669,7 +12756,8 @@ impl Store {
         SELECT jcs.path, jcs.is_primary, s.content
         FROM submission s
         INNER JOIN job_config_submission jcs ON jcs.submission_hash = s.hash
-        WHERE jcs.job_config_id = ?;
+        WHERE jcs.job_config_id = ?
+        ORDER BY jcs.is_primary DESC, jcs.id;
 "#;
         let mut stmt = conn.prepare(sql)?;
         let subs = Self::collect_rows(stmt.query_map([job_config_id], |row| {
@@ -13655,6 +13743,8 @@ impl Store {
             )?
             .execute(params![allocation.id, now, instance_id])?;
         }
+        // A gang member's rank, like a slot, is bound with the row.
+        self.assign_gang_member_tx(tx, &allocation)?;
 
         Ok(allocation)
     }
@@ -15499,10 +15589,17 @@ impl Store {
         }
         // `count.per` places `count` per attribute value, so the total is not
         // known here: every replica that was placed has finished, which is
-        // the best available answer.
+        // the best available answer. A `legion job scale` override laid over
+        // this spec count is the count to cover (`effective_task_count`):
+        // read against the spec, a batch task scaled below it never reached
+        // `success` and its dependents never started.
         let (count, per): (i64, Option<String>) = tx
             .query_row(
-                "SELECT count, count_per FROM task_config WHERE id = ?1;",
+                "SELECT COALESCE(ts.count, tc.count), tc.count_per FROM task_config tc \
+                 LEFT JOIN task_scale ts \
+                   ON ts.job_id = tc.job_id AND ts.task_group = tc.group_name \
+                  AND ts.task_name = tc.name AND ts.base_count = tc.count \
+                 WHERE tc.id = ?1;",
                 [task_config_id],
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
@@ -16410,6 +16507,8 @@ impl Store {
         }
 
         let affected_job_configs = self.remove_allocations(&removable, StopCause::NodeLost)?;
+        let affected_job_configs =
+            self.gang_members_lost_on_node(&removable, StopCause::NodeLost, affected_job_configs);
         self.reconcile_job_configs_or_requeue(affected_job_configs)
     }
 
@@ -19378,6 +19477,7 @@ impl Store {
                 message: "sql must not be empty".to_string(),
             }));
         }
+        self.refuse_trailing_statements(trimmed)?;
 
         let statement_type = Self::sqlite_statement_type(trimmed);
         if !allow_write && !Self::is_read_only_statement(&statement_type) {
@@ -19466,6 +19566,24 @@ impl Store {
         self.replicated(Lane::Control, "query_state_store", move |s| {
             s.query_state_store_apply(&sql, &statement_type)
         })
+    }
+
+    /// Refuse SQL holding more than one statement. `prepare` and `execute`
+    /// compile the first statement and silently drop the rest, so
+    /// `SELECT 1; SELECT 2` answered only the first, and an `--allow-write`
+    /// batch ran only its first write while reporting success. The
+    /// read-only gate also classifies the first statement alone. A trailing
+    /// comment or whitespace is not a statement and passes.
+    fn refuse_trailing_statements(&self, sql: &str) -> R<()> {
+        let conn = self.read_connection()?;
+        let mut batch = rusqlite::Batch::new(&conn, sql);
+        batch.next().map_err(Self::user_sql_error)?;
+        // Any further statement is refused, even one that does not compile:
+        // the caller's mistake is sending two.
+        if !matches!(batch.next(), Ok(None)) {
+            return Err(Self::user_sql_error(rusqlite::Error::MultipleStatement));
+        }
+        Ok(())
     }
 
     fn query_state_store_apply(&self, sql: &str, statement_type: &str) -> R<StateStoreQueryResult> {
@@ -19613,7 +19731,8 @@ impl Store {
     /// Returns `Some(response_message)` when a request with this key was already
     /// applied, allowing the caller to replay the prior outcome instead of
     /// re-applying. An empty key disables deduplication and always returns
-    /// `None`.
+    /// `None`. A key whose record was made for a different request (the
+    /// fingerprint after its last `#` differs) is an `InvalidInput` error.
     pub fn idempotency_lookup(&self, key: &str) -> R<Option<String>> {
         let key = key.trim();
         if key.is_empty() {
@@ -19627,7 +19746,39 @@ impl Store {
                 |row| row.get::<_, String>(0),
             )
             .optional()?;
-        Ok(result)
+        if result.is_some() {
+            return Ok(result);
+        }
+        // A key carrying a request fingerprint after its last `#`: the same
+        // key recorded with another fingerprint was first used for a
+        // different request, and replaying (or re-running) either one would
+        // misreport what happened.
+        if let Some((base, fingerprint)) = key.rsplit_once('#') {
+            // `$` sorts right after `#`, so the range is "starts with
+            // `base#`" with no wildcard characters to escape, and the byte
+            // length pins the rest to one fingerprint (a key of its own may
+            // contain `#`: `a` must not match a recorded `a#b`).
+            let reused = conn
+                .query_row(
+                    "SELECT 1 FROM idempotency_record \
+                     WHERE key > ?1 AND key < ?2 AND length(CAST(key AS BLOB)) = ?3 LIMIT 1;",
+                    rusqlite::params![format!("{base}#"), format!("{base}$"), key.len() as i64],
+                    |_| Ok(()),
+                )
+                .optional()?
+                .is_some()
+                && !fingerprint.is_empty();
+            if reused {
+                return Err(StorageError::InvalidInput {
+                    message: "this idempotency key was first used with different request \
+                              arguments; a key names one request, so use a new key for a \
+                              different one"
+                        .into(),
+                }
+                .into());
+            }
+        }
+        Ok(None)
     }
 
     /// Record the response for an idempotency `key`.
@@ -20817,6 +20968,38 @@ impl Store {
         Self::collect_rows(rows)
     }
 
+    /// [`Self::pinned_placements_for_task`] for a task named by job, group,
+    /// and name rather than a stored id. A dry-run plan of an unsubmitted
+    /// config has no task ids, yet a resubmit of a stateful job still places
+    /// onto its instances' pinned volumes.
+    pub fn pinned_placements_for_task_named(
+        &self,
+        job_id: &str,
+        group_name: &str,
+        task_name: &str,
+    ) -> R<Vec<(String, String)>> {
+        let conn = self.read_connection()?;
+        let mut stmt = conn.prepare_cached(
+            "SELECT instance.instance_id, volume.node_id \
+             FROM instance \
+             INNER JOIN volume ON volume.instance_id = instance.instance_id \
+             WHERE instance.job_id = ?1 \
+             AND instance.group_name = ?2 \
+             AND instance.task_name = ?3 \
+             AND instance.state IN ('pending', 'rescheduling') \
+             AND instance.current_alloc_id IS NULL \
+             AND instance.storage_handle = volume.driver || '/' || volume.volume_id \
+             AND volume.node_local = 1 \
+             AND volume.node_id IS NOT NULL \
+             AND volume.state IN ('pending', 'created') \
+             ORDER BY instance.slot_index ASC, instance.instance_id ASC;",
+        )?;
+        let rows = stmt.query_map(params![job_id, group_name, task_name], |row| {
+            Ok((row.get(0)?, row.get(1)?))
+        })?;
+        Self::collect_rows(rows)
+    }
+
     /// The node a specific instance's volume is pinned to, if any. Used by the
     /// allocation binder to pair an allocation with the instance whose data
     /// already lives on the node it landed on.
@@ -21000,6 +21183,10 @@ fn mint_storage_handle(driver: &str) -> String {
 /// loopback ports and the task with no env — silently, and permanently.
 fn task_schedule_equivalent(left: &TaskConfig, right: &TaskConfig) -> bool {
     left.count == right.count
+        // Turning a gang on or off, or moving its quorum, changes how the
+        // replicas must be placed, so the job re-plans under the new rule
+        // instead of carrying a partial set across.
+        && left.gang == right.gang
         && left.schedule == right.schedule
         && left.resources == right.resources
         && left.constraints == right.constraints
@@ -21343,6 +21530,21 @@ mod tests {
             store.idempotency_lookup("k1")?.as_deref(),
             Some("Job submit success")
         );
+
+        // A fingerprinted key replays only the request it was recorded for.
+        assert!(store.idempotency_record("run_job/3:acc/k#00aa", "run_job", "first")?);
+        assert_eq!(
+            store.idempotency_lookup("run_job/3:acc/k#00aa")?.as_deref(),
+            Some("first")
+        );
+        let err = store
+            .idempotency_lookup("run_job/3:acc/k#00bb")
+            .expect_err("same key, different request");
+        assert!(err.to_string().contains("different request"), "{err:#}");
+        // A key that merely starts like a recorded one (a key may contain
+        // `#`) is a different key, not a reuse.
+        assert!(store.idempotency_record("run_job/3:acc/a#b#00aa", "run_job", "ab")?);
+        assert_eq!(store.idempotency_lookup("run_job/3:acc/a#00cc")?, None);
 
         // Empty key disables deduplication entirely.
         assert_eq!(store.idempotency_lookup("")?, None);
@@ -26932,6 +27134,78 @@ mod tests {
         Ok(())
     }
 
+    /// `legion job scale` on a batch task: the task is done when the
+    /// SCALED count has exited, not the spec count. Read against the spec,
+    /// a `count = 3` task scaled to 2 never reached `success`, so every
+    /// `success` dependent stayed held.
+    #[test]
+    fn a_scaled_down_batch_task_succeeds_at_its_scaled_count_test() -> R<()> {
+        let store = setup_store()?;
+        let mut node = make_node_msg("node-a", "ready");
+        node.dynamic_attrs = json!({ "protocolVersion": 2 }).to_string();
+        store.insert_node(node)?;
+
+        let job = JobConfig {
+            priority: Default::default(),
+            rollout: None,
+            rollout_by_group: Default::default(),
+            name: "scaled-batch".into(),
+            tasks: vec![TaskConfig {
+                lifecycle: TaskLifecycle::Batch,
+                count: TaskCount::new(3),
+                ..TaskConfig::new("prep", "exec")
+            }],
+            version: None,
+        };
+        store.handle_job_submit(
+            &job,
+            &[Submission {
+                path: "job.ncl".into(),
+                content: "job".into(),
+                is_primary: true,
+            }],
+        )?;
+        store.set_task_scale_override(
+            "scaled-batch",
+            "default",
+            "prep",
+            2,
+            3,
+            "operator",
+            "test",
+            "t",
+        )?;
+        let job_config_id = store.get_job_config(&job.name)?.id();
+        let prep_id = task_id_for(&store, "prep", &job.name)?;
+
+        let scheduler = Scheduler::new(&store)?;
+        let outcome = scheduler.plan_and_apply(&job_config_id, PlanMode::Fresh)?;
+        store.update_task_statuses_for_allocations(&outcome.allocations)?;
+        assert_eq!(
+            outcome.allocations.len(),
+            2,
+            "the plan places the scaled count"
+        );
+
+        store.complete_allocation(outcome.allocations[0].id, true)?;
+        assert_eq!(
+            store
+                .task_statuses_for_job_config(&job_config_id)?
+                .get(&prep_id),
+            Some(&TaskStatusState::Running),
+            "one of two replicas exited"
+        );
+        store.complete_allocation(outcome.allocations[1].id, true)?;
+        assert_eq!(
+            store
+                .task_statuses_for_job_config(&job_config_id)?
+                .get(&prep_id),
+            Some(&TaskStatusState::Success),
+            "both scaled replicas exited, so the task is done"
+        );
+        Ok(())
+    }
+
     /// The status GetJobInfo/ListJobs report follows the workload: a service
     /// with a placed allocation is `running`, a batch job reads `pending`
     /// until placed, `running` while its process runs, and `complete` once
@@ -30314,12 +30588,33 @@ mod tests {
     }
 
     #[test]
+    fn a_node_marked_ready_is_back_in_the_liveness_scan_test() -> R<()> {
+        // `mark_node_ready` once wrote status `ready`, which every liveness
+        // query filters out, so a node recovered through it vanished from
+        // the scan that would notice it going quiet again.
+        let store = setup_store()?;
+        store.insert_node(make_node_msg("node-a", "lost"))?;
+        assert!(store.active_node_liveness_rows()?.is_empty());
+
+        store.mark_node_ready("node-a", "2026-01-01T00:00:00Z")?;
+
+        assert_eq!(store.get_node("node-a")?.status, "active");
+        let live: Vec<String> = store
+            .active_node_liveness_rows()?
+            .into_iter()
+            .map(|row| row.id)
+            .collect();
+        assert_eq!(live, vec!["node-a".to_string()]);
+        Ok(())
+    }
+
+    #[test]
     fn apply_projects_read_model_and_event_side_effects() -> R<()> {
         let src = setup_store()?;
         let dst = setup_store()?;
         // Identical seed state on both replicas (same rows, same rowids).
-        src.insert_node(make_node_msg("node-a", "active"))?;
-        dst.insert_node(make_node_msg("node-a", "active"))?;
+        src.insert_node(make_node_msg("node-a", "lost"))?;
+        dst.insert_node(make_node_msg("node-a", "lost"))?;
 
         let mut src_events = src.subscribe_events();
         let mut dst_events = dst.subscribe_events();
@@ -30333,18 +30628,18 @@ mod tests {
         // rows themselves rolled back on the proposer.
         assert!(src_events.try_recv().is_err(), "no event before commit");
         let src_node = src.get_node("node-a")?;
-        assert_eq!(src_node.status, "active", "node row rolled back");
+        assert_eq!(src_node.status, "lost", "node row rolled back");
         let cached = src.cached_nodes()?;
-        assert_eq!(cached[0].status, "active", "read model not touched");
+        assert_eq!(cached[0].status, "lost", "read model not touched");
 
         raft_capture::apply_changeset(&dst, &changeset)?;
 
         // Data applied...
-        assert_eq!(dst.get_node("node-a")?.status, "ready");
+        assert_eq!(dst.get_node("node-a")?.status, "active");
         // ...read model projected from the changeset...
         let dst_cached = dst.cached_nodes()?;
         assert_eq!(dst_cached.len(), 1);
-        assert_eq!(dst_cached[0].status, "ready");
+        assert_eq!(dst_cached[0].status, "active");
         assert_eq!(dst_cached[0].last_heartbeat, "2026-01-01T00:00:00Z");
         // ...and the staged events broadcast at apply time, in id order.
         let kinds: Vec<String> = std::iter::from_fn(|| dst_events.try_recv().ok())
@@ -30365,8 +30660,8 @@ mod tests {
 
         let src = setup_store()?;
         let dst = setup_store()?;
-        src.insert_node(make_node_msg("node-a", "active"))?;
-        dst.insert_node(make_node_msg("node-a", "active"))?;
+        src.insert_node(make_node_msg("node-a", "lost"))?;
+        dst.insert_node(make_node_msg("node-a", "lost"))?;
         let attached = dst.work_log().attach("node-a", 0, 0);
         assert!(matches!(
             WorkLog::take_pending(&attached.log, attached.session),
@@ -30384,10 +30679,10 @@ mod tests {
             "the injected failure fired"
         );
 
-        assert_eq!(dst.get_node("node-a")?.status, "ready", "rows applied");
+        assert_eq!(dst.get_node("node-a")?.status, "active", "rows applied");
         assert_eq!(
             dst.cached_nodes()?[0].status,
-            "ready",
+            "active",
             "read model rebuilt from the committed rows"
         );
         assert!(
@@ -31310,6 +31605,49 @@ mod tests {
             );
             assert!(format!("{err:#}").contains(needle), "{sql}: {err:#}");
         }
+        Ok(())
+    }
+
+    /// `state query` ran only the first of several statements and dropped
+    /// the rest without a word, on the read path and the `--allow-write`
+    /// path alike. A second statement is now refused before anything runs.
+    #[test]
+    fn a_state_query_with_two_statements_is_refused_test() -> R<()> {
+        let store = setup_store()?;
+        store.query_state_store("CREATE TABLE two_statements (v TEXT);", true)?;
+        for (sql, allow_write) in [
+            ("SELECT 1; SELECT 2", false),
+            ("SELECT 1; DELETE FROM two_statements", false),
+            ("SELECT 1; not even sql", false),
+            (
+                "INSERT INTO two_statements VALUES ('a'); INSERT INTO two_statements VALUES ('b')",
+                true,
+            ),
+        ] {
+            let err = store
+                .query_state_store(sql, allow_write)
+                .err()
+                .with_context(|| format!("{sql} should be refused"))?;
+            assert!(
+                matches!(
+                    StorageError::from_anyhow(&err),
+                    Some(StorageError::InvalidInput { .. })
+                ),
+                "{sql}: {err:#}"
+            );
+            assert!(
+                format!("{err:#}").contains("more than one statement"),
+                "{sql}: {err:#}"
+            );
+        }
+        // Nothing from the refused write batch ran.
+        let count = store.query_state_store("SELECT COUNT(*) AS n FROM two_statements", false)?;
+        assert_eq!(count.rows[0].json, r#"{"n":0}"#);
+
+        // One statement with a trailing semicolon, whitespace, or comment is
+        // still one statement.
+        store.query_state_store("SELECT 1;  ", false)?;
+        store.query_state_store("SELECT 1; -- trailing comment", false)?;
         Ok(())
     }
 

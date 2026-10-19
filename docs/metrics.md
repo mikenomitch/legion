@@ -63,7 +63,9 @@ Optional `telemetry` block in the manager config:
 - `enabled` (default `true`): master switch for the listener.
 - `port` (default `server.port + 2`): the listener binds this port on
   `server.host`. The `+ 2` convention leaves `server.port + 1` for the exec
-  WebSocket listener.
+  WebSocket listener. A port another process holds fails the manager's
+  startup (`failed to bind the telemetry listener on ...`), the same as
+  the gRPC port, rather than leaving a manager up with no probes.
 
 ## Metric families
 
@@ -154,11 +156,25 @@ neighbor rules a cause in or out, and which knob to turn), see
   scheduler-lane leader's wake pass, so it reads 0 on other managers and is
   refreshed when a capacity event arrives. A rising `class` count is a
   capacity signal for that class; `escaped` means no node was schedulable.
+- **`legion_gang_blocked_jobs`** (gauge): jobs whose blocked eval is a
+  [gang](gang-scheduling.md) short of its quorum. A waiting gang holds
+  nothing, so smaller jobs can keep taking the capacity it waits for; a value
+  that stays up while the cluster churns is that starvation. Set by the
+  scheduler-lane leader's wake pass, like `legion_evals_blocked`.
+- **`legion_gang_outcomes_total{outcome}`** (counter): what happened to
+  gangs that lost a member or waited too long: `replace` (the member was
+  replaced alone, or the survivors kept running for a `replace` top-up),
+  `restart` (the survivors stopped so the whole gang re-places), `fail` (the
+  job failed: `onMemberLoss = "fail"` or the move budget ran out), and
+  `timeout` (the gang did not reach its quorum within `placementTimeout`).
+  A rising `restart` rate is a gang whose members keep dying; see
+  [When a member is lost](gang-scheduling.md#when-a-member-is-lost).
 - **`legion_evals_unblocked_total{event}`** (counter): blocked evals returned
   to the pending queue, by what woke them: `register`, `node` (pool,
   availability, or attributes changed), `ready`, `freed` (allocations left a
   node), `missed` (capacity appeared while the eval ran, so it never
-  blocked), or `startup`.
+  blocked), `startup`, or `timeout` (a gang past its `placementTimeout`,
+  woken for its last attempt).
 - **`legion_blocked_wait_seconds`** (histogram): how long a blocked eval
   waited, from the entry that blocked it to the one that woke it. Buckets run
   from 100 ms to an hour.
@@ -730,6 +746,16 @@ these families can tell you which is the case.
 - **`legion_raft_pipeline_depth{lane}`** (gauge): ops queued to a lane's
   pipeline thread and not yet started. Sustained depth above 1 means writes
   on that lane are waiting in line behind each other.
+- **`legion_leader_forwards_total{lane,op,outcome}`** (counter): store
+  writes this manager forwarded to the lane's leader because it does not
+  lead the lane, by `outcome`: `ok` (the leader executed it) or `failed` (no
+  leader known, unreachable, the target lost leadership too, or the op
+  failed there; the caller sees the original not-the-leader error). Only
+  writes that cannot wait for a leader forward: worker heartbeats and health
+  reports, failure and completion reports, and a follower's own config row.
+  A steady `ok` rate on a follower is normal (workers heartbeat to whichever
+  manager they dialed); a `failed` rate means those reports are not landing.
+  Recorded on the forwarding manager.
 
 The gauge series refresh on the node-status-checker tick, on leaders and
 followers alike. The histograms and the op counter are recorded at the

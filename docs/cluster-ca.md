@@ -10,6 +10,15 @@ to each other:
 | manager client | `legion://manager/<id>` | managers dialing the worker plane |
 | manager server | `manager.legion`, `legion://manager/<id>` | workers dialing a manager (port 4747) |
 
+`<node>` and `<fleet>` are DNS labels made from the name: a name that already
+is a plain label (`node-1`) is used as is, and any other name
+(`ip-10-0-1-7.ec2.internal`, `Node_1`) becomes a readable prefix, `--`, and
+16 hex digits of its SHA-256, so two names never share a certificate name
+([auth-and-acls.md](auth-and-acls.md#worker-nodes-join-tokens-and-node-tokens)).
+Managers talk to each other with a separate identity derived from the
+cluster secret, not one this CA issues
+([Managers reach each other over TLS](auth-and-acls.md#managers-reach-each-other-over-tls)).
+
 Every join token pins this CA (`caHash`), and every holder verifies peers
 against its trust bundle. The certificate's *role* comes from its URI SAN,
 so "signed by our CA" is never enough on its own

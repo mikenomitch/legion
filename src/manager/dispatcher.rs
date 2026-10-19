@@ -107,6 +107,7 @@ pub fn dispatch_allocations(store: &Store, allocations: &[Allocation]) -> R<()> 
             store.volume_mounts_for_allocation(&allocation.job_id, task, instance.as_ref())?;
         let mut task_allocation =
             build_task_allocation(task, allocation, instance.as_ref(), &volumes)?;
+        attach_gang_env(store, task, allocation, &mut task_allocation)?;
         if let Some(tasks) = task_cache.get(&allocation.job_config_id) {
             let session_task = attach_session_task_spec(
                 &mut task_allocation,
@@ -477,6 +478,7 @@ fn deliver_ratification(store: &Store, allocation: &Allocation, claim: &Speculat
     // here on this is a normal allocation, and the node replaces the payload
     // it staged with before starting anything.
     let mut payload = build_task_allocation(&task, allocation, instance.as_ref(), &volumes)?;
+    attach_gang_env(store, &task, allocation, &mut payload)?;
     payload.provisional = Some(provisional);
 
     run_dispatch_future(async {
@@ -492,9 +494,13 @@ fn deliver_ratification(store: &Store, allocation: &Allocation, claim: &Speculat
     })
 }
 
+/// `block_on` itself does not need `Send`; the bound is there so the type
+/// system refuses a `MutexGuard` (or any other `!Send` state) held across an
+/// `.await` on the dispatch path, which would stall every other dispatch on
+/// that lock while a worker RPC is in flight.
 fn run_dispatch_future<F>(future: F) -> R<()>
 where
-    F: std::future::Future<Output = R<()>>,
+    F: std::future::Future<Output = R<()>> + Send,
 {
     match tokio::runtime::Handle::try_current() {
         Ok(handle) => {
@@ -814,6 +820,16 @@ pub fn effective_gate(task: &TaskConfig, declared: Gate) -> (Gate, Option<String
     if declared <= Gate::Stage {
         return (declared, None);
     }
+    if task.gang.is_some() {
+        return (
+            Gate::Stage,
+            Some(format!(
+                "task `{}` is a gang, whose members' ranks are assigned when the placement \
+                 commits; gates above `stage` would boot it without them",
+                task.name
+            )),
+        );
+    }
     let declares_ports = task
         .network
         .as_ref()
@@ -949,6 +965,50 @@ fn inject_runtime_env(config: &mut Value, allocation: &Allocation, instance: Opt
             );
         }
     }
+}
+
+/// Add a gang member's identity to its payload's env
+/// (docs/gang-scheduling.md, "Starting together"): `LEGION_GANG_RANK`,
+/// `LEGION_GANG_SIZE`, `LEGION_GANG_MIN`, and `LEGION_GANG_LEADER_ADDR` when
+/// rank 0's address is known. They come from the member's `gang_member` row,
+/// fixed when it was placed, so every copy of the payload (a push, the
+/// heartbeat's desired set, the work stream, a ratification) carries the same
+/// values, and a running member is never updated, which would restart it.
+/// Like the variables above, they win over user-declared keys. Free for a
+/// task that is not a gang.
+pub fn attach_gang_env(
+    store: &Store,
+    task: &TaskConfig,
+    allocation: &Allocation,
+    payload: &mut TaskAllocation,
+) -> R<()> {
+    if task.gang.is_none() {
+        return Ok(());
+    }
+    let Some(member) = store.gang_member(allocation.id)? else {
+        return Ok(());
+    };
+    let mut config: Value = serde_json::from_str(&payload.task_config)?;
+    let Some(env) = config
+        .as_object_mut()
+        .map(|config| {
+            config
+                .entry("env")
+                .or_insert_with(|| Value::Object(Default::default()))
+        })
+        .and_then(Value::as_object_mut)
+    else {
+        warn!(
+            allocation_id = allocation.id,
+            "Task config env is not an object; skipping gang env injection"
+        );
+        return Ok(());
+    };
+    for (key, value) in member.env() {
+        env.insert(key.to_string(), Value::String(value));
+    }
+    payload.task_config = serde_json::to_string(&config)?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1378,6 +1438,20 @@ mod tests {
         assert!(reason.expect("reason").contains("network ports"));
         assert_eq!(resolved_speculative_start(&task)?.mode, Gate::Stage);
         Ok(())
+    }
+
+    #[test]
+    fn a_gang_caps_the_gate_at_stage() {
+        // A member's rank is assigned with its allocation row, so a member
+        // booted before the commit could not know it.
+        let task = TaskConfig {
+            speculative_start: speculative("boot"),
+            gang: Some(crate::structs::GangConfig::default()),
+            ..TaskConfig::new("trainer", "exec")
+        };
+        let (gate, reason) = effective_gate(&task, Gate::Boot);
+        assert_eq!(gate, Gate::Stage);
+        assert!(reason.expect("reason").contains("is a gang"));
     }
 
     #[test]

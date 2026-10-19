@@ -129,14 +129,15 @@ store, including ACL metadata. What it cannot read:
 - KV values. Those are stored encrypted
   ([KV Encryption at Rest](kv-encryption.md)), so raw SQL sees ciphertext. A
   `kv` rule scoped by `paths` is the only way to read a value. That includes
-  handing a value to the datapath: a job or net policy whose ingress chain
-  sets `tls.certFrom = { kv = "<path>" }` needs `kv:read` on that path, on top
-  of `job:write` or `net:write`
-  ([Certificates from KV](network-handlers.md#certificates-from-kv)).
-- Private keys and password hashes. `signing_key.private_key_pem` (the
-  workload-identity and boot-ticket signing keys), `net_mesh_ca.key_pem` (the
-  built-in cluster CA key), and `acl_user.password_hash` always read as
-  `NULL` through raw SQL, however the query reaches them. A `WHERE` clause on
+  naming one in a job or net policy, which hands it to the task or the
+  datapath ([KV references in a job](#kv-references-in-a-job)).
+- Private keys, password hashes, and recorded replies.
+  `signing_key.private_key_pem` (the workload-identity and boot-ticket
+  signing keys), `net_mesh_ca.key_pem` (the built-in cluster CA key),
+  `acl_user.password_hash`, and `idempotency_record.response_message` (a
+  keyed `boot-ticket create` records the whole ticket, so a retry gets it
+  back) always read as `NULL` through raw SQL, however the query reaches
+  them. A `WHERE` clause on
   them matches nothing, and `INSERT ... SELECT` copies `NULL`. With a `file`
   or `exec` [cluster CA provider](cluster-ca.md), the CA key is not in the
   store at all.
@@ -261,6 +262,9 @@ flag `exec` rules use for exec into host-level runtimes:
 | `container` | `network.mode = "host"`, `security.userNamespace = false`, or `security.seccomp = "unconfined"` |
 | `sandbox` | `hypervisor = "dev"` (a container standing in for a VM, not a security boundary) |
 | a runtime plugin other than `noop` | always: Legion cannot vouch for its isolation |
+| any runtime | an `exec` health check: the worker runs its command on the host |
+| any runtime | an artifact or `image` is a `file://` source or a `git::file://` repository: the worker copies node files into the task as root |
+| any runtime | an artifact sets `auth.nodeIdentity`: the fetch presents the worker node's own credential to the source ([Artifacts](artifacts.md#workload-identity-auth-pending)) |
 
 ```nickel
 # Deploy containers and sandboxes, but nothing that runs on the host:
@@ -285,6 +289,36 @@ and stopping a job that already exists don't change what runs, so they need
 only `job:write`. A stored `require` policy that imposes `mode = "host"`
 makes every job it matches host-level; writing one needs `net:write`, which
 is already an admin grant.
+
+#### KV references in a job
+
+Naming a KV key in a job is reading it: the value reaches the task (or the
+datapath, or an artifact source), so submitting the job needs `kv:read` on
+the key, on top of `job:write`. That covers every place a job can name one:
+
+- `$path/key` values anywhere in the spec,
+- `kvInjections` env and files, the `{{ kv "…" }}` lookups in their
+  templates, and a `templateKv` pointer,
+- an artifact's `auth.kv` (a path filled in by a cluster `artifacts.auth`
+  matcher needs no grant),
+- `tls.certFrom = { kv }` on an ingress chain and
+  `connect.upstreams[].credentials`.
+
+`job run`, `job plan`, and template renders and runs check it before anything
+is placed:
+
+```console
+$ legion job run web.ncl
+error: permission denied: ... (the jobspec reads kv secrets/db-password; the submitter needs kv read on it)
+```
+
+The check is made when the job is submitted. A template stored in KV
+(`templateKv`) is re-read when it changes, but a re-render may only read
+keys the job already names: an edit that adds a lookup is not rendered, the
+job keeps its last render, and a `job.kv_render_refused` event names the
+new keys. Resubmitting the job checks them against whoever submits it.
+`kv:write` on a `templateKv` key still decides what the job renders from
+the keys it names.
 
 Manage policies with `legion acl policy apply|list|get|delete`. A policy file
 is Nickel (`.ncl`) or JSON (`.json`), read by the same rules as every other
@@ -385,6 +419,14 @@ logs always show how an identity was established. Built-in methods:
   credentials, 403 = verified but denied). Webhooks are only called at login,
   never on every request.
 
+A `jwt` method verified by keys (`jwksUrl`, `jwksJson`) and every `oidc`
+method must set `boundAudiences`, or the manager refuses to start: an issuer
+mints tokens for many services, and without an audience any of them would
+log in here. An `oidc` method's `oidcClientId` is its audience when
+`boundAudiences` is unset. `jwksUrl` and `issuer` must be `https://` unless
+they point at loopback. `hmacSecret` methods are exempt from the audience
+rule, since only the secret's holder can mint for them.
+
 When you embed Legion as a library, you can also register custom identity
 sources through the same `AuthMethod` interface
 (`Authenticator::register_method`). See [docs/plugin-system.md](plugin-system.md).
@@ -457,7 +499,13 @@ secret, so the worker needs no other configuration. The manager stores only
 a hash of the secret. List and revoke join tokens with
 `legion join-token list|delete` or from the UI's Access → Worker Join tab.
 Set `server.advertiseAddr` when workers reach the manager at a different
-address than it binds.
+address than it binds. A manager bound to every interface (`host =
+"0.0.0.0"`) with no `advertiseAddr` puts `127.0.0.1` in its join tokens,
+which no other machine can use: the worker dials its own loopback and
+retries, and nothing on the manager looks wrong. The manager warns about it
+at startup and with every token it mints in that state (`legion join-token
+create` prints the warning on stderr, and `--json` carries it as
+`data.warning`).
 
 Workers get their attributes from their worker type's template (pool,
 attributes, and resources from `workerConfigPath`) plus worker-side
@@ -495,12 +543,28 @@ When ACLs are enforced:
   worker discards it and registers with its join secret. If that is gone
   too, the worker exits with `Unauthenticated: unknown or revoked join
   token`; mint a new join token for that host and run `legion join` again.
-- A join token admits any node name, including the name of a node that is
-  already registered. Treat join secrets like node credentials: give them
-  short TTLs (minutes to a day, long enough to bring the hosts up) and
-  revoke them once the fleet has joined. Restarts do not need them. Treat
-  the node token file like the node's private key: it lets its holder act as
-  that node.
+- A join token introduces a new node, or rejoins one whose node has gone
+  `lost` (a host that lost its disk). It cannot take over a node that is
+  still live: that registration fails with `PermissionDenied`, naming the
+  node and its status, unless the request also carries that node's own
+  token (a restart). Every node of a worker type holds the same join secret,
+  so without this any of them could register as a running peer. A
+  compromised worker can still claim the name of a node that is down. Treat
+  join secrets like node credentials: give them short TTLs (minutes to a
+  day, long enough to bring the hosts up) and revoke them once the fleet has
+  joined. Restarts do not need them. Treat the node token file like the
+  node's private key: it lets its holder act as that node.
+- A registration that claims a simulator fleet (the `workerFleet`
+  attribute, which earns one certificate for every node of the fleet) is
+  refused with `PermissionDenied` unless the join token's worker type grants
+  that fleet in its own `workerFleet` attribute, and a node token cannot
+  move its node to another fleet
+  ([worker-simulation.md](worker-simulation.md)).
+- A node's certificate is issued for `<label>.node.legion`. A name that is
+  already a plain DNS label (lowercase letters, digits, single `-`) is its
+  own label; any other name (`ip-10-0-1-7.ec2.internal`, `Node_1`) gets a
+  readable prefix and `--` plus 16 hex digits of the name's SHA-256, so two
+  different names never share a certificate name.
 - In `auditOnly` mode, workers without join tokens are admitted but logged,
   and so are the worker-type, pool, and node-id mismatches above. The two
   identity-token issuers refuse a foreign node id even in audit-only mode.
@@ -623,8 +687,18 @@ the JWKS that boot and exec tickets are verified against all ride it.
 - A join token keeps the address the manager advertises, `http://` or
   `https://`. The worker dials TLS to that host and port either way.
 
-Raft traffic between managers is not covered: it stays plaintext on the
-managers' network.
+#### Managers reach each other over TLS
+
+Raft traffic between managers (the log, snapshots, joins, and the writes and
+requests a follower forwards to the leader, which carry the caller's
+token) rides TLS on the same API port. Every manager derives one key from the
+cluster secret it already holds (a joining manager gets the secret in its
+raft join token) and answers the name `raft.legion` with it; a peer accepts
+that key and nothing else, so a manager that answers proves it holds the
+secret before the secret is sent. The secret in each request still
+authenticates the caller. This works whether or not `server.tls` is on, and
+needs no certificates from the operator. Every manager of a cluster must run
+a version with it: a manager from before it cannot talk to one after.
 
 ### Introspection
 

@@ -764,6 +764,10 @@ pub struct Metrics {
     pub eval_conflict_requeues_total: Arc<Counter>,
     /// `legion_evals_blocked{key_kind}`
     pub evals_blocked: Arc<GaugeVec>,
+    /// `legion_gang_blocked_jobs`
+    pub gang_blocked_jobs: Arc<Gauge>,
+    /// `legion_gang_outcomes_total{outcome}`
+    pub gang_outcomes_total: Arc<CounterVec>,
     /// `legion_evals_unblocked_total{event}`
     pub evals_unblocked_total: Arc<CounterVec>,
     /// `legion_blocked_wait_seconds`
@@ -935,6 +939,9 @@ pub struct Metrics {
     pub nodes_marked_lost_total: Arc<Counter>,
     /// `legion_nodes_recovered_total{path}`
     pub nodes_recovered_total: Arc<CounterVec>,
+    /// `legion_leader_forwards_total{lane,op,outcome}` (docs/metrics.md,
+    /// "Raft")
+    pub leader_forwards_total: Arc<CounterVec>,
     /// `legion_read_model_drift_repaired_total{source}`
     pub read_model_drift_repaired_total: Arc<CounterVec>,
     /// `legion_read_model_external_writes_total`
@@ -1062,6 +1069,22 @@ impl Metrics {
                 name: "legion_evals_blocked",
                 help: "Evals waiting blocked on capacity, by the kind of key they wait under: `class` (a pool and pinned attributes), `node` (a resume pinned to the node holding its checkpoint), `escaped` (no schedulable node at all). Set by the scheduler-lane leader's wake pass; zero elsewhere.",
                 labels: &["key_kind"],
+            },
+            series: Series::new(),
+        });
+        let gang_blocked_jobs = Arc::new(Gauge {
+            meta: FamilyMeta {
+                name: "legion_gang_blocked_jobs",
+                help: "Jobs whose blocked eval is a gang short of its quorum (docs/gang-scheduling.md): a waiting gang holds nothing, so a gang can wait behind smaller jobs that keep taking freed capacity. A value that stays up is the starvation signal. Set by the scheduler-lane leader's wake pass; zero elsewhere.",
+                labels: &[],
+            },
+            cell: GaugeCell::default(),
+        });
+        let gang_outcomes_total = Arc::new(CounterVec {
+            meta: FamilyMeta {
+                name: "legion_gang_outcomes_total",
+                help: "Gang lifecycle decisions (docs/gang-scheduling.md), by outcome: `timeout` (a gang did not reach its quorum within placementTimeout and its job failed), `replace` (a member was lost and is replaced alone), `restart` (a member was lost and the whole gang stops to be placed again), `fail` (a member was lost and the gang's job failed). Counted on the manager that made the decision.",
+                labels: &["outcome"],
             },
             series: Series::new(),
         });
@@ -1731,6 +1754,15 @@ impl Metrics {
             series: Series::new(),
         });
 
+        let leader_forwards_total = Arc::new(CounterVec {
+            meta: FamilyMeta {
+                name: "legion_leader_forwards_total",
+                help: "Store writes this manager forwarded to the lane's leader because it does not lead the lane (worker heartbeats, failure reports, and other worker-plane writes that land on a follower), by lane, op, and outcome: 'ok' (the leader executed it) or 'failed' (no leader known, unreachable, the target lost leadership, or the op failed there).",
+                labels: &["lane", "op", "outcome"],
+            },
+            series: Series::new(),
+        });
+
         // Read-model coherence (docs/state-store.md).
         let read_model_drift_repaired_total = Arc::new(CounterVec {
             meta: FamilyMeta {
@@ -1814,6 +1846,7 @@ impl Metrics {
             Arc::clone(&heartbeat_sustainable_nodes) as Arc<dyn RenderMetric>,
             Arc::clone(&nodes_marked_lost_total) as Arc<dyn RenderMetric>,
             Arc::clone(&nodes_recovered_total) as Arc<dyn RenderMetric>,
+            Arc::clone(&leader_forwards_total) as Arc<dyn RenderMetric>,
             Arc::clone(&read_model_drift_repaired_total) as Arc<dyn RenderMetric>,
             Arc::clone(&read_model_external_writes_total) as Arc<dyn RenderMetric>,
             Arc::clone(&liveness_tracked_nodes) as Arc<dyn RenderMetric>,
@@ -1853,6 +1886,8 @@ impl Metrics {
             Arc::clone(&envelope_resizes_total) as Arc<dyn RenderMetric>,
             Arc::clone(&eval_conflict_requeues_total) as Arc<dyn RenderMetric>,
             Arc::clone(&evals_blocked) as Arc<dyn RenderMetric>,
+            Arc::clone(&gang_blocked_jobs) as Arc<dyn RenderMetric>,
+            Arc::clone(&gang_outcomes_total) as Arc<dyn RenderMetric>,
             Arc::clone(&evals_unblocked_total) as Arc<dyn RenderMetric>,
             Arc::clone(&blocked_wait_seconds) as Arc<dyn RenderMetric>,
             Arc::clone(&plan_apply_total) as Arc<dyn RenderMetric>,
@@ -1925,6 +1960,8 @@ impl Metrics {
             scheduler_plan_candidate_rank,
             eval_conflict_requeues_total,
             evals_blocked,
+            gang_blocked_jobs,
+            gang_outcomes_total,
             evals_unblocked_total,
             blocked_wait_seconds,
             scheduler_concurrency_limit,
@@ -2004,6 +2041,7 @@ impl Metrics {
             heartbeat_sustainable_nodes,
             nodes_marked_lost_total,
             nodes_recovered_total,
+            leader_forwards_total,
             read_model_drift_repaired_total,
             read_model_external_writes_total,
             liveness_tracked_nodes,
@@ -2689,14 +2727,27 @@ pub struct TelemetryState {
 /// Content type for the Prometheus text exposition format.
 pub const METRICS_CONTENT_TYPE: &str = "text/plain; version=0.0.4";
 
-/// Run the telemetry listener until the process exits. Bound on its own port
-/// (`server.port + 2` by convention; `telemetry.port` overrides).
-pub async fn serve_telemetry(addr: SocketAddr, state: TelemetryState) -> R<()> {
-    let listener = tokio::net::TcpListener::bind(addr)
-        .await
-        .with_context(|| format!("failed to bind telemetry listener on {addr}"))?;
+/// Start the telemetry listener on its own port (`server.port + 2` by
+/// convention; `telemetry.port` overrides) and serve it in the background
+/// until the process exits.
+///
+/// The port is bound before this returns, so a port conflict fails the
+/// manager's startup instead of leaving a manager up with no `/metrics` and
+/// no health probes, which an orchestrator reads as a dead manager.
+pub async fn start_telemetry(addr: SocketAddr, state: TelemetryState) -> R<()> {
+    let listener = tokio::net::TcpListener::bind(addr).await.with_context(|| {
+        format!(
+            "failed to bind the telemetry listener on {addr}; free the port, set \
+             telemetry.port, or set telemetry.enabled = false"
+        )
+    })?;
     info!(%addr, "Telemetry listener started (/metrics, /healthz, /readyz)");
-    serve_telemetry_on(listener, state).await
+    tokio::spawn(async move {
+        if let Err(err) = serve_telemetry_on(listener, state).await {
+            tracing::error!(error = ?err, "telemetry listener exited");
+        }
+    });
+    Ok(())
 }
 
 /// Serve telemetry on an already-bound listener (tests bind port 0 and read

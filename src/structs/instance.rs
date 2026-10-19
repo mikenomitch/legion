@@ -250,6 +250,12 @@ impl InstanceLastStop {
             }
             StopCause::Restore => "Replaced to roll back to a snapshot.".to_string(),
             StopCause::Suspended => "Suspended with its state checkpointed.".to_string(),
+            StopCause::Gang => {
+                "Stopped with the rest of its gang: another member was lost or failed, \
+                 or the gang timed out waiting to place."
+                    .to_string()
+            }
+            StopCause::Failed => format!("Failed on node {node_id}."),
             StopCause::Unknown => "Stopped.".to_string(),
         };
         Self {

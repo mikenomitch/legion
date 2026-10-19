@@ -68,7 +68,7 @@ pub fn catalog() -> Vec<Capability> {
             name: "job.plan",
             cli: "legion job plan <PATH>",
             grpc: Some("Manager/PlanJob"),
-            summary: "Dry-run: preview which nodes allocations would land on, and which running allocations the submit would preempt.",
+            summary: "Dry-run: preview which nodes allocations would land on, which running allocations the submit would preempt, and whether each gang would reach its quorum.",
             mutates: false,
             read_only_safe: true,
         },
@@ -823,6 +823,27 @@ pub fn catalog() -> Vec<Capability> {
             grpc: Some("Manager/RewrapRootKey"),
             summary: "Re-wrap every data key under the current root key (completes a root key rotation).",
             mutates: true,
+            read_only_safe: false,
+        },
+        Capability {
+            name: "keyring.root_key_generate",
+            cli: "legion keyring root-key generate",
+            grpc: None,
+            summary: "Print a new base64 root key line for the file or env provider. Runs \
+                 locally; nothing on the cluster changes until the key is installed and \
+                 `keyring root-key rewrap` runs.",
+            mutates: false,
+            read_only_safe: true,
+        },
+        Capability {
+            name: "keyring.provider.test",
+            cli: "legion keyring provider test [--timeout D] -- <COMMAND...>",
+            grpc: None,
+            summary: "Conformance-test an exec root-key provider before pointing a manager at \
+                 it: describe, a wrap/unwrap round trip, a tampered ciphertext refused, and \
+                 randomized wrapping. Runs locally; never touches the cluster, but the \
+                 command really calls its KMS.",
+            mutates: false,
             read_only_safe: false,
         },
         Capability {

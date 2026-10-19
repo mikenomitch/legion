@@ -2039,6 +2039,61 @@ fn migration_list() -> Vec<M<'static>> {
         );",
         )
         .down("DROP TABLE IF EXISTS cluster_ca_record;"),
+        // Gang scheduling (docs/gang-scheduling.md): `task_config.gang` is the
+        // task's `gang` block, `true` or `{"min":N}`, NULL when the task is
+        // not a gang. Appended at the end, since raft changesets bind columns
+        // by position. Control lane, like the rest of `task_config`.
+        M::up("ALTER TABLE task_config ADD COLUMN gang TEXT;").down(""),
+        // Gang waits (docs/gang-scheduling.md, "Placement timeout"): one row
+        // per job config whose gang is waiting for its quorum. `since_unix`
+        // is when it first blocked, kept as it blocks again; `deadline_unix`
+        // is `since_unix` plus the gang's `placementTimeout`, NULL when it
+        // waits indefinitely. Written in the entry that blocks the gang's
+        // eval, deleted when a plan reaches the quorum, the job stops,
+        // restarts, or is destroyed, or the timeout fires. Scheduler lane,
+        // like `eval`.
+        M::up(
+            "CREATE TABLE IF NOT EXISTS gang_wait (
+            job_config_id STRING PRIMARY KEY,
+            job_id STRING NOT NULL,
+            task_name STRING NOT NULL,
+            since_unix INTEGER NOT NULL,
+            deadline_unix INTEGER
+        );
+        CREATE INDEX IF NOT EXISTS idx_gang_wait_job ON gang_wait(job_id);
+        CREATE INDEX IF NOT EXISTS idx_gang_wait_deadline ON gang_wait(deadline_unix);",
+        )
+        .down(
+            "DROP INDEX IF EXISTS idx_gang_wait_deadline;
+        DROP INDEX IF EXISTS idx_gang_wait_job;
+        DROP TABLE IF EXISTS gang_wait;",
+        ),
+        // Gang members (docs/gang-scheduling.md, "Starting together"): one
+        // row per allocation of a gang task, written with the allocation
+        // row. `rank` is the lowest rank no live member of the task holds;
+        // `size`, `quorum`, and `leader_address` (rank 0's address) are
+        // fixed at placement, because a payload that changed would restart
+        // the running member. Rows of removed allocations are pruned when
+        // the task places again, and with the job on destroy. Scheduler
+        // lane, like `allocation`.
+        M::up(
+            "CREATE TABLE IF NOT EXISTS gang_member (
+            allocation_id INTEGER PRIMARY KEY,
+            job_id STRING NOT NULL,
+            job_config_id STRING NOT NULL,
+            rank INTEGER NOT NULL,
+            size INTEGER NOT NULL,
+            quorum INTEGER NOT NULL,
+            leader_address STRING
+        );
+        CREATE INDEX IF NOT EXISTS idx_gang_member_job ON gang_member(job_id);
+        CREATE INDEX IF NOT EXISTS idx_gang_member_job_config ON gang_member(job_config_id);",
+        )
+        .down(
+            "DROP INDEX IF EXISTS idx_gang_member_job_config;
+        DROP INDEX IF EXISTS idx_gang_member_job;
+        DROP TABLE IF EXISTS gang_member;",
+        ),
     ]
 }
 

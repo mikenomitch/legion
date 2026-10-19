@@ -479,6 +479,8 @@ async fn run_worker_with_manager(join: WorkerJoin, name_override: Option<&str>) 
         }
     }
     apply_container_env(&config.container);
+    // One host guard for the datapath and artifact fetches alike.
+    let host_guard = Arc::new(host_guard_for(&config.security));
     let sandbox_bridges = apply_sandbox_bridges_env(enforcement_config.sandbox.as_ref());
     crate::task_plugins::warn_if_no_static_guest_binary();
     let restored_allocations = {
@@ -503,6 +505,7 @@ async fn run_worker_with_manager(join: WorkerJoin, name_override: Option<&str>) 
                 credentials.clone(),
             )),
             content_store_target.clone(),
+            Some(host_guard.clone()),
         );
         manager.restore_allocations().unwrap_or_else(|err| {
             warn!(error = ?err, "Failed to restore persisted allocations");
@@ -767,7 +770,7 @@ async fn run_worker_with_manager(join: WorkerJoin, name_override: Option<&str>) 
             Arc::new(crate::worker::netd::Denials::new()),
         )
         .with_logs_base_dir(logs_base_dir.clone())
-        .with_host_guard(Arc::new(host_guard_for(&config.security)))
+        .with_host_guard(host_guard.clone())
         .with_kernel_guard_if(
             (kernel_guard == crate::worker::netd::kernel_guard::Availability::Active).then(|| {
                 kernel_guard_base(
@@ -2134,6 +2137,18 @@ async fn start_heartbeats(
     }
 }
 
+/// A failure report as the task manager queues it, from the copy a
+/// heartbeat sent.
+fn failure_report(
+    failure: crate::structs::FailedAllocation,
+) -> crate::worker::task_manager::FailedAllocationReport {
+    crate::worker::task_manager::FailedAllocationReport {
+        allocation_id: failure.allocation_id,
+        reason: failure.reason,
+        artifact_states: failure.artifact_states,
+    }
+}
+
 /// One heartbeat round-trip: report running/failed allocations, then
 /// reconcile against the manager's desired set.
 // Same reason as `start_heartbeats`: each per-heartbeat subsystem is threaded
@@ -2329,18 +2344,19 @@ async fn heartbeat_tick(
         // A gated allocation whose capture is not ready has no network: say
         // so in its health, so rollouts and `doctor` see it rather than a
         // task that looks fine and cannot reach anything.
+        // A capture that recovers puts the allocation's own health back.
         {
             let mut manager = task_manager.lock().expect("task manager");
             for status in &net_status {
-                if status.mode == crate::structs::netpolicy::MODE_GATED
-                    && !status.capture_ready
-                    && manager.has_allocation(status.allocation_id)
+                if status.mode != crate::structs::netpolicy::MODE_GATED
+                    || !manager.has_allocation(status.allocation_id)
                 {
-                    manager.set_allocation_health(
-                        status.allocation_id,
-                        false,
-                        format!("net_capture_unavailable: {}", status.problems.join("; ")),
-                    );
+                    continue;
+                }
+                if status.capture_ready {
+                    manager.mark_net_capture_ready(status.allocation_id);
+                } else {
+                    manager.mark_net_capture_unavailable(status.allocation_id, &status.problems);
                 }
             }
         }
@@ -2453,9 +2469,7 @@ async fn heartbeat_tick(
                 // connection: put them back so the next successful
                 // heartbeat still tells the manager about them.
                 let mut manager = task_manager.lock().expect("task manager");
-                for failure in failures_for_redrive {
-                    manager.record_failure(failure.allocation_id, failure.reason);
-                }
+                manager.requeue_failures(failures_for_redrive.into_iter().map(failure_report));
                 // Same for terminal outcomes: a batch task's completion lost
                 // to a dead connection would leave the job "running" forever.
                 manager.requeue_terminations(terminations_for_redrive);
@@ -2486,14 +2500,26 @@ async fn heartbeat_tick(
         let mut reply = response.into_inner();
         served_interval = reply.next_interval_seconds;
         // Terminal reports the manager answered but could not record go out
-        // again next beat: a batch task's dependents wait on them.
-        task_manager
-            .lock()
-            .expect("task manager")
-            .requeue_unrecorded_terminations(
+        // again next beat: a batch task's dependents wait on them. So do
+        // failure reports: nothing replaces a failed allocation until one is
+        // recorded.
+        {
+            let mut manager = task_manager.lock().expect("task manager");
+            manager.requeue_unrecorded_terminations(
                 terminations_for_redrive,
                 &reply.retry_terminated_allocations,
             );
+            manager.requeue_failures(
+                failures_for_redrive
+                    .into_iter()
+                    .filter(|failure| {
+                        reply
+                            .retry_failed_allocations
+                            .contains(&failure.allocation_id)
+                    })
+                    .map(failure_report),
+            );
+        }
         // Before the reconcile below reads this reply's desired set: an
         // answer is newer than any payload a lagging replica built.
         if !reply.envelope_resizes.is_empty() {
@@ -2966,10 +2992,7 @@ async fn apply_templates(task_manager: &Arc<Mutex<WorkerTaskManager>>, reply: &H
             (running, (base, task_dir))
         };
         let (delivery, task_dir) = base;
-        let (in_task_root, host_task_dir) = match delivery {
-            Some((root, dir)) => (Some(root), dir),
-            None => (None, task_dir),
-        };
+        let (in_task_root, host_task_dir) = delivery.unwrap_or((None, task_dir));
         let mut env: std::collections::BTreeMap<String, String> = network
             .as_ref()
             .map(|n| n.env_pairs().into_iter().collect())
@@ -3955,7 +3978,7 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
         let addr = format!("http://127.0.0.1:{}", listener.local_addr()?.port());
         let service = crate::structs::manager_server::ManagerServer::new(
-            crate::manager::server::ManagerDaemonService::with_acl(store, auth),
+            crate::manager::server::ManagerDaemonService::with_acl(store.clone(), auth),
         );
         tokio::spawn(async move {
             let incoming = tokio_stream::wrappers::TcpListenerStream::new(listener);
@@ -4004,13 +4027,24 @@ mod tests {
         register_self(client.clone(), &payload, &restarted).await?;
         assert_eq!(state.load_node_token().as_deref(), Some(token.as_str()));
 
-        // A refused node token falls back to a valid join token, which
-        // mints and persists a replacement.
+        // A refused node token falls back to the join token, which may not
+        // take over the node while it is live (the node token is what proves
+        // a restart)...
         state.save_node_token("lgn_not_a_real_token")?;
         let fallback = Arc::new(WorkerCredentials::with_join_secret(Some(join_secret)));
         assert!(fallback.restore_from(&state));
         fallback.persist_to(state.clone());
         pre_register_self(client.clone(), "default".into(), &fallback).await?;
+        let err = register_self(client.clone(), &payload, &fallback)
+            .await
+            .expect_err("a join token may not take over a live node");
+        assert!(
+            format!("{err:#}").contains("registered and live"),
+            "{err:#}"
+        );
+        // ...and rejoins it, minting and persisting a replacement, once the
+        // node has gone lost.
+        store.mark_node_lost("w1")?;
         register_self(client.clone(), &payload, &fallback).await?;
         let replaced = state.load_node_token().context("replacement persisted")?;
         assert_ne!(replaced, "lgn_not_a_real_token");

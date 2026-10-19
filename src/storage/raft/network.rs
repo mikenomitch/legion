@@ -34,7 +34,7 @@ use openraft::raft::{
 use openraft::BasicNode;
 use serde::de::DeserializeOwned;
 use serde::Serialize;
-use tonic::transport::{Channel, Endpoint};
+use tonic::transport::Channel;
 use tonic::Code;
 
 use crate::storage::raft::types::{node_addr_host_port, TypeConfig};
@@ -118,9 +118,11 @@ impl From<WireInstallSnapshotRequest> for InstallSnapshotRequest<TypeConfig> {
 /// which is exactly what [`RaftNetworkFactory::new_client`]'s contract asks
 /// for ("should not create a connection but rather a client that will
 /// connect when required").
-#[derive(Default)]
 pub(crate) struct ChannelPool {
     channels: Mutex<HashMap<String, Channel>>,
+    /// TLS to peer managers ([`crate::cluster_tls::RaftTransportTls`]):
+    /// every channel in the pool speaks it.
+    tls: Arc<crate::cluster_tls::RaftTransportTls>,
     /// Schema version each peer last advertised on a transport reply
     /// (`x-legion-schema-version`, see `migrations::schema_version`). The
     /// leader hears from every follower on each AppendEntries round, so this
@@ -139,8 +141,18 @@ pub(crate) struct ChannelPool {
 }
 
 impl ChannelPool {
-    pub(crate) fn new() -> Self {
-        Self::default()
+    pub(crate) fn new(tls: Arc<crate::cluster_tls::RaftTransportTls>) -> Self {
+        Self {
+            channels: Mutex::default(),
+            tls,
+            schema_versions: Mutex::default(),
+            outbound_blocked: AtomicBool::default(),
+        }
+    }
+
+    /// The TLS identity the pool dials with.
+    pub(crate) fn tls(&self) -> &Arc<crate::cluster_tls::RaftTransportTls> {
+        &self.tls
     }
 
     /// Blocks/unblocks every outbound raft RPC through this pool (see the
@@ -183,7 +195,7 @@ impl ChannelPool {
     /// Fails only on a malformed address. Crate-visible: the driver's
     /// lane-write forwarding (plan §8, D2) dials the lane leader through
     /// the same pool.
-    pub(crate) fn get(&self, host_port: &str) -> Result<Channel, tonic::transport::Error> {
+    pub(crate) fn get(&self, host_port: &str) -> anyhow::Result<Channel> {
         let mut channels = self
             .channels
             .lock()
@@ -191,10 +203,9 @@ impl ChannelPool {
         if let Some(channel) = channels.get(host_port) {
             return Ok(channel.clone());
         }
-        // Plaintext h2c on the manager plane, consistent with the cluster's
-        // current transport posture; TLS upgrades with the tracked
-        // worker-mTLS follow-up (plan JC-7).
-        let channel = Endpoint::from_shared(format!("http://{host_port}"))?.connect_lazy();
+        // TLS to the peer's `raft.legion` identity: the raft log, the
+        // cluster secret, and forwarded callers' tokens all ride here.
+        let channel = self.tls.channel(host_port)?;
         channels.insert(host_port.to_string(), channel.clone());
         Ok(channel)
     }
@@ -295,7 +306,9 @@ impl RaftTransportNetwork {
             .get(&self.host_port)
             // A malformed advertise address will not fix itself on immediate
             // retry: back off.
-            .map_err(|e| RPCError::Unreachable(Unreachable::new(&e)))?;
+            .map_err(|e| {
+                RPCError::Unreachable(Unreachable::new(&std::io::Error::other(format!("{e:#}"))))
+            })?;
         let mut client = RaftTransportClient::new(channel)
             .max_decoding_message_size(RAFT_MAX_MESSAGE_BYTES)
             .max_encoding_message_size(RAFT_MAX_MESSAGE_BYTES);

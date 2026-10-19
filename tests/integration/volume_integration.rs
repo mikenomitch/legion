@@ -7,6 +7,7 @@
 //! `legion volume plugin test`), which runs against built-ins and exec plugins
 //! alike.
 
+use legion::manager::scheduler::{PlanMode, Scheduler};
 use legion::prelude::{json, Context, R};
 use legion::storage::store::{Store, VolumeFilter};
 use legion::structs::{
@@ -285,6 +286,63 @@ fn a_pinned_instance_awaiting_placement_reports_its_node() -> R<()> {
     let pins = cluster.store.pinned_placements_for_task(task_id)?;
     assert_eq!(pins.len(), 1, "the awaiting instance is pinned");
     assert_eq!(pins[0].1, NODE_A);
+    Ok(())
+}
+
+/// A dry-run plan of a job that was never submitted numbers its tasks 1, 2,
+/// ... by position. Its volume pins used to be looked up by that number, so
+/// the preview picked up whichever stored task had the same id: here `db`'s
+/// pin to node-a, which a `web` task held to node-b could never take, and
+/// the preview failed. Pins of an unsubmitted config are found by job and
+/// task name instead, and a resubmit preview still sees its own.
+#[test]
+fn a_dry_run_plan_never_reads_another_jobs_volume_pins() -> R<()> {
+    let mut cluster = Cluster::new()?;
+    cluster.add_node(NODE_A)?;
+    cluster.submit(stateful_job("db", 1, "local-dir", None))?;
+    let volume = cluster.volumes()?.remove(0);
+    cluster.report_mounted(&volume.volume_id, NODE_A, true)?;
+    cluster.store.remove_allocs_for_node(NODE_A)?;
+    cluster.add_node(NODE_B)?;
+    let db_task_id = cluster
+        .store
+        .get_task_configs_for_job_config(cluster.job_config_ids.get("db").context("job")?)?
+        .first()
+        .map(|(id, _)| *id)
+        .context("task config")?;
+    assert_eq!(
+        db_task_id, 1,
+        "the positional id of the preview's first task must collide with db's"
+    );
+    assert_eq!(
+        cluster.store.pinned_placements_for_task(db_task_id)?.len(),
+        1
+    );
+
+    let web = JobConfig {
+        priority: Default::default(),
+        name: "web".to_string(),
+        tasks: vec![TaskConfig {
+            config: json!({ "command": ["sleep", "60"] }),
+            constraints: json!({ "node_id": NODE_B }),
+            ..TaskConfig::new("web", "exec")
+        }],
+        rollout: None,
+        rollout_by_group: Default::default(),
+        version: None,
+    };
+    let scheduler = Scheduler::new(&cluster.store)?;
+    let preview = scheduler.plan_for_config(&web, PlanMode::Fresh, None)?;
+    assert_eq!(preview.allocations.len(), 1);
+    assert_eq!(preview.allocations[0].node_id, NODE_B);
+
+    // A resubmit preview of `db` itself (positional ids again) still honors
+    // its own instance's pin.
+    let mut db = stateful_job("db", 1, "local-dir", None);
+    db.tasks[0].config = json!({ "command": ["sleep", "120"] });
+    let preview = scheduler.plan_for_config(&db, PlanMode::Fresh, Some("db"))?;
+    assert_eq!(preview.allocations.len(), 1);
+    assert_eq!(preview.allocations[0].node_id, NODE_A);
     Ok(())
 }
 

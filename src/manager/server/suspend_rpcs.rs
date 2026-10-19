@@ -273,6 +273,7 @@ impl ManagerDaemonService {
             &identity,
             "suspend_instance",
             inner.idempotency_key.as_deref(),
+            &inner,
         );
         if let Some(recorded) = self
             .store

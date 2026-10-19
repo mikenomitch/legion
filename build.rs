@@ -22,7 +22,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // hand-built envelopes, and (through this) every API message the CLI
         // `--json` and MCP tools print. Enums and oneof variants keep their
         // names; map keys are data and are never renamed.
-        .message_attribute(".", "#[serde(rename_all = \"camelCase\")]")
+        //
+        // `default`: a field missing from the JSON takes its proto3 default,
+        // as it does on the wire. Proto messages are persisted as JSON (the
+        // worker's state files among them), so without it a field added to a
+        // message made every file written before it unreadable (`missing
+        // field envelopeResources` reading `netd_state.json` after a worker
+        // upgrade). Messages only: serde rejects a container `default` on
+        // the enums and oneofs `type_attribute(".")` also reaches.
+        .message_attribute(".", "#[serde(rename_all = \"camelCase\", default)]")
         .type_attribute("Job", "#[derive(tabled::Tabled)]")
         .type_attribute("Submission", "#[derive(tabled::Tabled)]")
         // A checkpoint part key must never reach a log line or a JSON dump:

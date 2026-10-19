@@ -415,7 +415,8 @@ fn cli() -> Command {
         .arg(Arg::new("join-token").long("join-token").help(
             "instances mode, required with --simulate: a `legion join-token create` \
                      token for the embedded fleet (sets its worker type and secret, \
-                     overriding --worker-type, and pins the cluster CA)",
+                     overriding --worker-type, and pins the cluster CA); the worker \
+                     type must grant the fleet (`attributes = { workerFleet = \"lg-*\" }`)",
         ))
         .arg(Arg::new("advertise-addr").long("advertise-addr").help(
             "instances mode: host the manager dials to push work to the embedded \

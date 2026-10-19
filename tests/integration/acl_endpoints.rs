@@ -1787,9 +1787,10 @@ async fn worker_join_flow_with_acls_enabled() -> R<()> {
         .expect_err("node tokens must not grant API access");
     assert_eq!(status.code(), Code::PermissionDenied);
 
-    // Re-registering rotates the node token; the old one stops working.
-    let re_registered = svc
-        .worker_register(req(
+    // The join secret alone may not take over the live node's name: every
+    // node of the worker type holds that secret.
+    let re_register = |bearer: Option<&str>| {
+        req(
             WorkerRegisterRequest {
                 name: "joined-worker".into(),
                 pool: "default".into(),
@@ -1799,8 +1800,24 @@ async fn worker_join_flow_with_acls_enabled() -> R<()> {
                 join_token: Some(join_token.secret.clone()),
                 ..Default::default()
             },
-            None,
-        ))
+            bearer,
+        )
+    };
+    let takeover = svc
+        .worker_register(re_register(None))
+        .await
+        .expect_err("a join token must not take over a live node");
+    assert_eq!(
+        takeover.code(),
+        Code::PermissionDenied,
+        "{}",
+        takeover.message()
+    );
+
+    // With the node's own token alongside, re-registering rotates it; the
+    // old one stops working.
+    let re_registered = svc
+        .worker_register(re_register(Some(&node_token)))
         .await?
         .into_inner();
     let rotated = re_registered
@@ -1896,6 +1913,96 @@ async fn worker_join_flow_with_acls_enabled() -> R<()> {
 /// admits its pinned worker type and pool. Without this, one compromised node
 /// could re-register as a peer (rotating away the peer's token) or heartbeat,
 /// report health, and ratify claims in its name.
+/// A fleet certificate names every node of the fleet, so the fleet comes
+/// from the operator's worker type: a join token's worker type must grant
+/// the `workerFleet` a registration claims, and a node token cannot move
+/// its node to another fleet. Before, any node could claim any fleet and
+/// get its certificate.
+#[tokio::test]
+async fn a_fleet_claim_needs_a_worker_type_grant() -> R<()> {
+    let (svc, _, management_secret) = setup_enabled()?;
+    let join_secret = |worker_type: &'static str| {
+        let svc = &svc;
+        let management_secret = management_secret.clone();
+        async move {
+            let created = svc
+                .create_join_token(req(
+                    CreateJoinTokenRequest {
+                        worker_type: worker_type.into(),
+                        ttl: Some("1h".into()),
+                        description: "fleet test".into(),
+                    },
+                    Some(&management_secret),
+                ))
+                .await?
+                .into_inner();
+            R::Ok(legion::structs::token::JoinToken::decode(&created.token)?.secret)
+        }
+    };
+    let register = |name: &str, fleet: &str, join_token: Option<String>, bearer: Option<&str>| {
+        req(
+            WorkerRegisterRequest {
+                name: name.into(),
+                pool: "default".into(),
+                config_attrs: serde_json::json!({ "workerFleet": fleet }).to_string(),
+                fingerprint_attrs: "{}".into(),
+                health_checks: "[]".into(),
+                join_token,
+                ..Default::default()
+            },
+            bearer,
+        )
+    };
+
+    // `default` grants no fleet.
+    let refused = svc
+        .worker_register(register(
+            "sim-a-web-0",
+            "sim-a",
+            Some(join_secret("default").await?),
+            None,
+        ))
+        .await
+        .expect_err("a worker type without workerFleet grants no fleet");
+    assert_eq!(refused.code(), Code::PermissionDenied);
+    assert!(
+        refused.message().contains("does not grant"),
+        "{}",
+        refused.message()
+    );
+
+    // A simulator worker type grants `sim-*`.
+    svc.store.insert_worker_type(&WorkerConfig {
+        name: "sims".into(),
+        pool: "default".into(),
+        attributes: [("workerFleet".to_string(), "sim-*".to_string())].into(),
+        ..WorkerConfig::default()
+    })?;
+    let sims = join_secret("sims").await?;
+    let refused = svc
+        .worker_register(register("prod-0", "prod", Some(sims.clone()), None))
+        .await
+        .expect_err("the glob does not cover `prod`");
+    assert_eq!(refused.code(), Code::PermissionDenied);
+    let node_token = svc
+        .worker_register(register("sim-a-web-0", "sim-a", Some(sims), None))
+        .await?
+        .into_inner()
+        .node_token
+        .expect("registration mints a node token");
+
+    // The node's own token re-registers it in its fleet, but not in another.
+    let moved = svc
+        .worker_register(register("sim-a-web-0", "sim-b", None, Some(&node_token)))
+        .await
+        .expect_err("a node token keeps the node's fleet");
+    assert_eq!(moved.code(), Code::PermissionDenied);
+    svc.worker_register(register("sim-a-web-0", "sim-a", None, Some(&node_token)))
+        .await
+        .expect("re-registering in the same fleet");
+    Ok(())
+}
+
 #[tokio::test]
 async fn worker_plane_binds_node_ids_to_the_caller() -> R<()> {
     let (svc, fixtures, management_secret) = setup_enabled()?;

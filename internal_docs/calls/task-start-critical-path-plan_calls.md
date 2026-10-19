@@ -111,3 +111,23 @@ before it was removed on the same beat.
 **Why (simplicity).** One place creates namespaces, and it now runs before
 everything that needs them. Teaching four listener types to create namespaces
 would spread the namespace lifecycle across the datapath.
+
+## 6. A `boot` check's failures in its first `every` are not counted
+
+*Follow-up, 2026-10-19.*
+
+**The call.** A `boot` check's failed result is not counted until one
+`every` (or the check's `boot_grace_time`, if longer) has passed since the
+task started or restarted. A pass in that window still counts. `health`
+checks keep exactly their `boot_grace_time`.
+
+**Alternatives.** Start a boot check's cadence one `every` late (the shape
+the TODO suggested); apply `boot_grace_time` to boot checks with its current
+default of zero.
+
+**Trade-off.** A task that really is broken from the first instant reports
+unhealthy one `every` later than before.
+
+**Why.** Ease. A late cadence would also delay an `exec` boot check's first
+pass by one `every` (those are not startup-probed), and a zero default grace
+fixes nothing; forgiving only the early failure keeps every early pass.

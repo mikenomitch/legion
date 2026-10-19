@@ -40,6 +40,7 @@ mod eval_loop;
 mod eval_regen_failover;
 mod exec_session_benchmark;
 mod fork_integration;
+mod gang_scheduling;
 mod gated_container_default;
 mod gated_sandbox_default;
 mod heartbeat_scale_benchmark;

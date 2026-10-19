@@ -1109,15 +1109,16 @@ impl MultiRaftDriver {
     /// its `connect_lazy` channels hide connection state, and the probe
     /// exists precisely to observe it.
     fn probe_member_reachable(engine: &Engine, host_port: &str) -> bool {
-        let Ok(endpoint) = tonic::transport::Endpoint::from_shared(format!("http://{host_port}"))
-        else {
-            return false;
-        };
-        let endpoint = endpoint
-            .connect_timeout(MEMBER_PROBE_TIMEOUT)
-            .timeout(MEMBER_PROBE_TIMEOUT);
-        Self::block_on_engine(engine, async move { endpoint.connect().await.is_ok() })
-            .unwrap_or(false)
+        let tls = engine.pool.tls().clone();
+        let host_port = host_port.to_string();
+        Self::block_on_engine(engine, async move {
+            // TCP and the TLS handshake: a peer that answers holds the
+            // cluster's raft identity.
+            tokio::time::timeout(MEMBER_PROBE_TIMEOUT, tls.connect(&host_port))
+                .await
+                .is_ok_and(|connected| connected.is_ok())
+        })
+        .unwrap_or(false)
     }
 
     /// One lane's membership change, bounded by
@@ -1324,6 +1325,11 @@ impl MultiRaftDriver {
     /// spawns its connection task (see `forward_lane_write`).
     pub(crate) fn peer_channel(&self, host_port: &str) -> Option<tonic::transport::Channel> {
         self.engine.get()?.pool.get(host_port).ok()
+    }
+
+    /// The raft transport's TLS identity, once the engine has started.
+    pub(crate) fn transport_tls(&self) -> Option<Arc<crate::cluster_tls::RaftTransportTls>> {
+        Some(self.engine.get()?.pool.tls().clone())
     }
 
     /// Every raft member's advertised `host:port` (voters and learners of
@@ -1734,14 +1740,8 @@ fn persist_cluster_secret(path: &Path, secret: &str) -> R<()> {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("failed creating {}", parent.display()))?;
     }
-    std::fs::write(path, secret)
-        .with_context(|| format!("failed persisting cluster secret to {}", path.display()))?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
-    }
-    Ok(())
+    crate::util::write_private_file(path, secret.as_bytes())
+        .with_context(|| format!("failed persisting cluster secret to {}", path.display()))
 }
 
 /// Cluster id derived from the shared secret: every node that shares the
@@ -2231,12 +2231,17 @@ async fn join_cluster_loop(
 ) {
     use crate::structs::raft_transport_client::RaftTransportClient;
 
-    let endpoint = match tonic::transport::Endpoint::from_shared(format!("http://{leader_addr}")) {
-        Ok(endpoint) => endpoint,
+    // TLS to the leader's raft identity, which this manager derives from the
+    // cluster secret its join token carried: the token is checked, and the
+    // root key bundle comes back, over it.
+    let channel = match crate::cluster_tls::RaftTransportTls::from_cluster_secret(&cluster_secret)
+        .and_then(|tls| tls.channel(&leader_addr))
+    {
+        Ok(channel) => channel,
         Err(e) => {
             error!(
                 leader = %leader_addr,
-                "Join token carries an undialable leader address: {e}"
+                "Join token carries an undialable leader address: {e:#}"
             );
             return;
         }
@@ -2245,7 +2250,6 @@ async fn join_cluster_loop(
         error!("Cluster secret is not valid ascii metadata; cannot join");
         return;
     };
-    let channel = endpoint.connect_lazy();
     let mut attempt: u32 = 0;
     loop {
         attempt += 1;
@@ -3700,7 +3704,10 @@ impl PersistenceDriver for MultiRaftDriver {
             .context("invalid openraft config")?,
         );
 
-        let pool = Arc::new(ChannelPool::new());
+        let transport_tls =
+            crate::cluster_tls::RaftTransportTls::from_cluster_secret(&cluster_secret)
+                .context("derive the raft transport TLS identity")?;
+        let pool = Arc::new(ChannelPool::new(transport_tls));
         // Detached clone: shares DB/read-model/event channels with the real
         // store but holds no back-reference to this driver or the
         // replication handle (see module docs on shutdown).

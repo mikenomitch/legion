@@ -689,13 +689,16 @@ fn raft_manager(
 
     let transport = runtime();
     let raft_service = store.raft_transport_server();
+    let transport_tls = store.raft_transport_tls().expect("raft engine started");
     let addr: SocketAddr = format!("127.0.0.1:{port}").parse()?;
     transport.spawn(async move {
         let socket = tokio::net::TcpSocket::new_v4().expect("socket");
         socket.set_reuseaddr(true).expect("reuseaddr");
         socket.bind(addr).expect("bind transport port");
         let listener = socket.listen(64).expect("listen");
-        let incoming = tokio_stream::wrappers::TcpListenerStream::new(listener);
+        let incoming = transport_tls
+            .incoming(listener)
+            .expect("raft transport listener");
         let _ = tonic::transport::Server::builder()
             .add_service(raft_service)
             .serve_with_incoming(incoming)

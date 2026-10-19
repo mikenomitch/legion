@@ -112,7 +112,10 @@ sandboxes.
   [`noop` example](plugins/tasks/noop/src/lib.rs) is under 100 lines.
 - **Any kind of workload.** Long-running services, batch jobs, sidecars, and
   [stateful workloads](docs/stateful-workloads.md) with stable identity and
-  [volumes](docs/volumes.md).
+  [volumes](docs/volumes.md). Distributed jobs set
+  [`gang`](docs/gang-scheduling.md) so their replicas place all at once or
+  wait, holding nothing, until they can, and restart together when one is
+  lost.
 - **A built-in DAG system.** Tasks declare `dependsOn` to form a
   [dependency graph](docs/jobs-tasks-and-scheduling.md), gated on another
   task starting, completing, or succeeding. Dependencies can span groups
@@ -343,15 +346,18 @@ Don't run Legion where untrusted workloads share a host with other work, or
 on a network you don't trust. Known gaps:
 
 - **`exec` tasks run on the host, as root unless they set a `user`.**
-  They share the host's network. On Linux with cgroup v2 and `nft`,
-  the [kernel host guard](docs/network-handlers.md#the-host-guard-in-the-kernel)
+  They share the host's network. Submitting one needs a `job:write` rule
+  with `host = true` ([host-level jobs](docs/auth-and-acls.md#host-level-jobs)),
+  because whoever can deploy one is root on every node it lands on. On Linux
+  with cgroup v2 and `nft`, the
+  [kernel host guard](docs/network-handlers.md#the-host-guard-in-the-kernel)
   keeps them off Legion's ports, the cloud metadata service, and other
   allocations' listeners, but a root task can remove it. Run untrusted code
   in `container` or `sandbox`, never `exec`.
-- **Raft traffic between managers is plaintext.** Workers reach managers over
-  TLS pinned to the cluster CA, and managers reach workers over mutual TLS,
-  but peer managers talk to each other in the clear. Keep managers on a
-  network you trust.
+- **Git and OCI artifact fetches are not checked by the host guard.** HTTP
+  fetches are, redirects included, but a `git::` or `oci://` source on an
+  internal address is fetched by the worker and lands in the task directory
+  ([Artifacts](docs/artifacts.md#what-the-host-guard-checks)).
 - **Revoking access to a direct exec session takes up to a heartbeat.**
   Deleting the token or delegated key behind a
   [direct exec](docs/exec-and-actions.md#direct-exec) session closes it on
@@ -374,7 +380,6 @@ add:
 - **Submission middleware.** Modify or gate job submissions.
 - **Something akin to Kubernetes controllers.** Extend Legion with your own
   reconcile loops.
-- **Gang scheduling.** Place a group of tasks all at once or not at all.
 - **More runtimes.** WASM or remote serverless workloads, for example.
 - **Namespaces, multi-cluster federation, and Windows support.**
 
@@ -393,6 +398,7 @@ start:
 - **Running workloads:** [Task Runtimes](docs/task-runtime-plugins.md) ·
   [Artifacts](docs/artifacts.md) · [Rollouts](docs/rollouts.md) ·
   [Scaling Jobs](docs/autoscaling.md) ·
+  [Gang Scheduling](docs/gang-scheduling.md) ·
   [Task Supervision](docs/task-supervision.md) ·
   [Resource Enforcement](docs/resource-enforcement.md)
 - **Sandboxes:** [Sandbox Runtime](docs/task-runtime-sandbox.md) ·

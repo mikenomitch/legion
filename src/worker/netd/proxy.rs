@@ -1812,7 +1812,7 @@ mod tests {
         proxies.sync(&specs).await;
         let forks = &specs[1..];
         for fork in forks {
-            let socket = &socket_of(&fork);
+            let socket = &socket_of(fork);
             let response = get_via(socket, origin_port, "/ok/work").await;
             assert!(response.contains("200 OK"), "{response}");
             let response = get_via(socket, origin_port, "/secret").await;
@@ -1834,7 +1834,7 @@ mod tests {
         proxies.sync(forks).await;
         assert!(!proxies.is_running(7));
         for fork in forks {
-            let response = get_via(&socket_of(&fork), origin_port, "/ok/after").await;
+            let response = get_via(&socket_of(fork), origin_port, "/ok/after").await;
             assert!(response.contains("200 OK"), "{response}");
         }
         assert!(context

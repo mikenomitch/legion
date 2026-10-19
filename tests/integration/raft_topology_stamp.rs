@@ -185,6 +185,7 @@ fn joiner_with_a_mismatched_topology_is_rejected() -> R<()> {
 
     // Serve only the RaftTransport service, as the other raft tests do.
     let service = store.raft_transport_server();
+    let transport_tls = store.raft_transport_tls().expect("raft engine started");
     let addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
     let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
     let server = rt.spawn(async move {
@@ -192,7 +193,9 @@ fn joiner_with_a_mismatched_topology_is_rejected() -> R<()> {
         socket.set_reuseaddr(true).expect("reuseaddr");
         socket.bind(addr).expect("bind transport port");
         let listener = socket.listen(64).expect("listen");
-        let incoming = tokio_stream::wrappers::TcpListenerStream::new(listener);
+        let incoming = transport_tls
+            .incoming(listener)
+            .expect("raft transport listener");
         let _ = tonic::transport::Server::builder()
             .add_service(service)
             .serve_with_incoming_shutdown(incoming, async {
@@ -215,9 +218,10 @@ fn joiner_with_a_mismatched_topology_is_rejected() -> R<()> {
     let voters_before = store.raft_status().context("raft status")?.voters;
 
     let status = rt.block_on(async {
-        let channel = tonic::transport::Endpoint::from_shared(format!("http://127.0.0.1:{port}"))
-            .expect("endpoint")
-            .connect_lazy();
+        // Over TLS to the raft identity, as a real joiner dials.
+        let channel = legion::cluster_tls::RaftTransportTls::from_cluster_secret(&secret)
+            .and_then(|tls| tls.channel(&format!("127.0.0.1:{port}")))
+            .expect("raft channel");
         let mut client = legion::structs::raft_transport_client::RaftTransportClient::new(channel);
         let mut request = tonic::Request::new(JoinRaftClusterRequest {
             join_token: token,

@@ -391,7 +391,7 @@ impl TemplateEngine {
                 continue;
             }
             if changed {
-                if let Err(err) = write_atomic(&path, &content) {
+                if let Err(err) = write_rendered(host_task_dir, &path, &content) {
                     problems.push(format!(
                         "template {}: write {}: {err:#}",
                         template.name,
@@ -468,6 +468,19 @@ impl TemplateEngine {
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .retain(|id, _| live.contains(id));
+    }
+}
+
+/// Write a rendered template. Below the task directory, which the task can
+/// write while the worker re-renders into it, nothing on the way is followed
+/// ([`crate::util::write_file_beneath`]); elsewhere (an `exec` task's
+/// absolute destination) the path is written as given.
+fn write_rendered(host_task_dir: &Path, path: &Path, content: &str) -> R<()> {
+    match path.strip_prefix(host_task_dir) {
+        Ok(relative) => {
+            crate::util::write_file_beneath(host_task_dir, relative, content.as_bytes(), 0o644)
+        }
+        Err(_) => write_atomic(path, content),
     }
 }
 

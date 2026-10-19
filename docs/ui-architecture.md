@@ -303,10 +303,11 @@ the Access page reports it instead.
   the probe error on hover), the member's term and applied index with its
   lag behind the furthest member, and when its config snapshot was written.
   A warning names how many members did not answer. Outside raft the table
-  has one row. The manager name links to its config page only when it has
-  a snapshot: a manager writes one when it leads the control lane, so a
-  manager that has never led shows `—`. The page used to list the config
-  table itself, which showed only managers that had led.
+  has one row. The manager name links to its config page when it has a
+  snapshot. Every manager writes one at startup, a follower through the
+  control lane's leader, so `—` means the manager has not reached a leader
+  since it started (or its row predates the member-name key). The page used
+  to list the config table itself, which showed only managers that had led.
   `pages/details/ManagerNodeDetail.tsx`
   renders the published config as an at-a-glance summary, feature tiles
   (exec, telemetry, ACLs, workload identity, KV encryption, edge boot,

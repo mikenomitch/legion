@@ -78,7 +78,9 @@ used by:
   fullstack /tasks/api/kvInjections/env/DB_PASSWORD
 ```
 
-`--json` prints the entry only. Use `GetKv` directly for `references`.
+`--json` puts the same list in `data.references`, beside the entry's own
+fields (`jobId` and `jsonPointer` per reference, `[]` when nothing reads the
+key).
 
 ### In the UI
 
@@ -213,6 +215,16 @@ reconciliation. The result lands in the task config the worker receives (the
 `env` map or the `files[]` array). A `templateKv` source tracks the template
 key itself and every key the template looks up, so a change to either triggers
 the entry's policy.
+
+An edit to a `templateKv` template may not reach a key the job did not name
+when it was submitted. Submitting checks `kv:read` on every key against the
+submitter ([Auth and ACLs](auth-and-acls.md)), and the template's writer is
+not the submitter, so an edit that adds a lookup is not rendered: the job
+keeps its last render, nothing about the new key is stored, and a
+`job.kv_render_refused` warning event names the key. Resubmit the job
+(`legion job run`) to add it; the submit checks the new key against you.
+Edits that only rearrange the keys the job already names re-render as
+usual.
 
 If a required key is missing at submit time, the submit fails with
 `kv entry <key> not found`. Legion never admits a job with unresolvable
@@ -428,6 +440,20 @@ same way while the container runs (see
 [Live file updates](#live-file-updates)). Without `update`, a re-render only
 reaches the container when the allocation restarts or is replaced. See
 [docs/task-runtime-container.md](task-runtime-container.md).
+
+`exec` file paths: an absolute `path` is that path on the host, and a
+relative one resolves against the task's directory (`LEGION_TASK_DIR`). A
+`..` that climbs out of the task directory is refused.
+
+Files below the task directory are written without following symbolic
+links, at the first write and at every rewrite: the task can change its own
+directory while it runs, and the worker writes as root. A link anywhere on
+the path makes that write fail (the allocation's status names the file),
+rather than land wherever the link points. Only a `mode`'s permission bits
+apply there: a setuid, setgid, or sticky bit is dropped.
+
+Naming a key in a job, here or anywhere else, needs `kv:read` on it
+([KV references in a job](auth-and-acls.md#kv-references-in-a-job)).
 
 ### Env precedence
 

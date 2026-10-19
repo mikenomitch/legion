@@ -404,7 +404,10 @@ impl Authenticator {
             )
             .await
             .map_err(|e| e.to_status())?;
-        let ttl = self.effective_login_ttl(requested_ttl, method.login_token_ttl())?;
+        let mut ttl = self.effective_login_ttl(requested_ttl, method.login_token_ttl())?;
+        if method.clamps_to_credential_expiry() {
+            ttl = ttl.min(remaining_lifetime(verified.expires_at.as_deref())?);
+        }
         self.mint_token(
             store,
             &format!("{method_name}:{}", verified.principal),
@@ -808,6 +811,20 @@ pub fn enforce(
     )))
 }
 
+/// How long a presented credential has left, from its RFC 3339 expiry. A
+/// credential that names none, or has already expired, cannot back a token.
+fn remaining_lifetime(expires_at: Option<&str>) -> Result<Duration, Status> {
+    let expires_at = expires_at
+        .and_then(|raw| OffsetDateTime::parse(raw, &Rfc3339).ok())
+        .ok_or_else(|| {
+            Status::unauthenticated("the identity token names no expiry, so it cannot back a login")
+        })?;
+    Duration::try_from(expires_at - OffsetDateTime::now_utc())
+        .ok()
+        .filter(|left| !left.is_zero())
+        .ok_or_else(|| Status::unauthenticated("the identity token has expired"))
+}
+
 #[cfg(test)]
 mod authenticator_test {
     use super::*;
@@ -815,6 +832,22 @@ mod authenticator_test {
     use crate::structs::{AclConfig, ManagerConfigFull};
     use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
     use tempfile::Builder;
+
+    /// A workload-identity login lasts no longer than the identity token it
+    /// was minted from, and an expired or expiry-less token backs nothing.
+    #[test]
+    fn workload_logins_end_with_their_identity_token_test() {
+        let in_ten_minutes = (OffsetDateTime::now_utc() + time::Duration::minutes(10))
+            .format(&Rfc3339)
+            .unwrap();
+        let left = remaining_lifetime(Some(&in_ten_minutes)).expect("live token");
+        assert!(left <= Duration::from_secs(600) && left > Duration::from_secs(590));
+        let an_hour_ago = (OffsetDateTime::now_utc() - time::Duration::hours(1))
+            .format(&Rfc3339)
+            .unwrap();
+        assert!(remaining_lifetime(Some(&an_hour_ago)).is_err());
+        assert!(remaining_lifetime(None).is_err());
+    }
 
     fn setup_store() -> R<Store> {
         let store_dir = Builder::new()

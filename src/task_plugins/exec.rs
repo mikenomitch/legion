@@ -254,6 +254,63 @@ struct LandlockOptions {
 struct UserSpec {
     uid: u32,
     gid: u32,
+    identity: TaskIdentity,
+}
+
+/// A task user's passwd name, home, and shell, for its `USER`, `LOGNAME`,
+/// `HOME`, and `SHELL`.
+#[derive(Clone, Debug, Default)]
+struct TaskIdentity {
+    name: String,
+    home: String,
+    shell: String,
+}
+
+/// The variables an `exec` task (and a session into one) takes from the
+/// worker's own environment, plus every `LC_*`. Nothing else crosses: the
+/// worker's environment can hold a `LEGION_TOKEN`, cloud credentials, or a
+/// `RUST_LOG`, and every host-mode task used to inherit all of it. An
+/// allowlist fails closed where Nomad's exec driver keeps a denylist.
+const INHERITED_ENV: &[&str] = &["PATH", "LANG", "LANGUAGE", "TZ"];
+
+/// The environment for a command the worker runs on the host as itself
+/// (an `exec` health check): the same allowlist an `exec` task without a
+/// `user` starts from.
+pub(crate) fn host_command_env() -> std::collections::BTreeMap<String, String> {
+    base_task_env(std::env::vars(), None)
+}
+
+/// The `PATH` a task gets when the worker has none.
+const DEFAULT_TASK_PATH: &str = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
+
+/// The environment an `exec` task starts from, before Legion's allocation
+/// env and the task's own: [`INHERITED_ENV`] and `LC_*` from the worker,
+/// and `HOME`, `USER`, `LOGNAME`, and `SHELL` for the user it runs as (the
+/// worker's own when it sets no `user`).
+fn base_task_env(
+    worker_env: impl IntoIterator<Item = (String, String)>,
+    user: Option<&TaskIdentity>,
+) -> std::collections::BTreeMap<String, String> {
+    let identity_vars = ["HOME", "USER", "LOGNAME", "SHELL"];
+    let mut env = std::collections::BTreeMap::new();
+    let runs_as_worker = user.is_none();
+    for (key, value) in worker_env {
+        let inherited = INHERITED_ENV.contains(&key.as_str())
+            || key.starts_with("LC_")
+            || (runs_as_worker && identity_vars.contains(&key.as_str()));
+        if inherited {
+            env.insert(key, value);
+        }
+    }
+    env.entry("PATH".to_string())
+        .or_insert_with(|| DEFAULT_TASK_PATH.to_string());
+    if let Some(user) = user {
+        env.insert("HOME".into(), user.home.clone());
+        env.insert("USER".into(), user.name.clone());
+        env.insert("LOGNAME".into(), user.name.clone());
+        env.insert("SHELL".into(), user.shell.clone());
+    }
+    env
 }
 
 #[derive(Default)]
@@ -386,9 +443,11 @@ impl TaskPlugin for ExecTaskPlugin {
         // `LEGION_PORT_*` / `LEGION_ADDR_*`, upstreams), then worker-injected
         // env (task dir, artifacts, volumes, identities), then the task's own.
         // A session without the first layer could not find the task's ports.
-        let mut env = crate::task_plugins::allocation_env(allocation, task)
-            .into_iter()
-            .collect::<std::collections::BTreeMap<_, _>>();
+        // The session runs as the worker (a sibling host process), so it
+        // starts from the worker's identity, with the same allowlist a task
+        // gets: never the worker's whole environment.
+        let mut env = base_task_env(std::env::vars(), None);
+        env.extend(crate::task_plugins::allocation_env(allocation, task));
         env.extend(instance.extra_env.clone());
         for (k, v) in &config.env {
             env.insert(k.clone(), v.clone());
@@ -398,6 +457,7 @@ impl TaskPlugin for ExecTaskPlugin {
             env.entry(k).or_insert(v);
         }
         opts.env = env;
+        opts.clear_env = true;
 
         if opts.cwd.is_none() {
             opts.cwd = config
@@ -500,11 +560,26 @@ impl TaskPlugin for ExecTaskPlugin {
         // `onChange = "update"` rewrite uses, so a reader never sees a torn
         // file and a key is never briefly readable at the umask.
         for file in &config.files {
-            crate::worker::identity::write_token_file(
-                std::path::Path::new(&file.path),
-                &file.content,
-                crate::task_plugins::injected_file_mode(file.mode.as_deref()),
-            )?;
+            let mode = crate::task_plugins::injected_file_mode(file.mode.as_deref());
+            match crate::task_plugins::task_file_target(None, &file.path)
+                .map_err(|err| anyhow!("file {err}"))?
+            {
+                crate::task_plugins::TaskFileTarget::BelowTaskDir(relative) => {
+                    let task_dir = instance
+                        .task_dir
+                        .as_ref()
+                        .context("exec task declares a relative file but has no task directory")?;
+                    crate::util::write_file_beneath(
+                        task_dir,
+                        &relative,
+                        file.content.as_bytes(),
+                        mode,
+                    )?;
+                }
+                crate::task_plugins::TaskFileTarget::Host(path) => {
+                    crate::worker::identity::write_token_file(&path, &file.content, mode)?;
+                }
+            }
         }
 
         info!(
@@ -562,9 +637,16 @@ impl TaskPlugin for ExecTaskPlugin {
             }
         }
 
-        // Legion-provided env first (allocation identity/ports, then
+        // Only the allowlisted part of the worker's environment, then
+        // Legion-provided env (allocation identity/ports, then
         // worker-injected LEGION_TASK_DIR/LEGION_ARTIFACT_*), so explicit
         // task env can override on collision.
+        #[cfg(unix)]
+        let identity = config.user_spec()?.map(|user| user.identity);
+        #[cfg(not(unix))]
+        let identity: Option<TaskIdentity> = None;
+        cmd.env_clear();
+        cmd.envs(base_task_env(std::env::vars(), identity.as_ref()));
         cmd.envs(crate::task_plugins::allocation_env(allocation, task));
         if !instance.extra_env.is_empty() {
             cmd.envs(&instance.extra_env);
@@ -896,15 +978,75 @@ fn lookup_user(value: &str) -> R<UserSpec> {
     }
     // SAFETY: passwd has been checked as non-null.
     let passwd = unsafe { *passwd };
+    let field = |ptr: *const libc::c_char| {
+        if ptr.is_null() {
+            String::new()
+        } else {
+            // SAFETY: a non-null passwd string field is NUL-terminated.
+            unsafe { std::ffi::CStr::from_ptr(ptr) }
+                .to_string_lossy()
+                .into_owned()
+        }
+    };
     Ok(UserSpec {
         uid: passwd.pw_uid,
         gid: passwd.pw_gid,
+        identity: TaskIdentity {
+            name: field(passwd.pw_name),
+            home: field(passwd.pw_dir),
+            shell: field(passwd.pw_shell),
+        },
     })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A task starts from the allowlisted part of the worker's environment:
+    /// credentials and worker settings stay behind, and a task with a `user`
+    /// gets that user's identity rather than the worker's.
+    #[test]
+    fn exec_tasks_inherit_only_the_allowlisted_environment_test() {
+        let worker = [
+            ("PATH", "/opt/bin:/usr/bin"),
+            ("LANG", "C.UTF-8"),
+            ("LC_ALL", "C.UTF-8"),
+            ("HOME", "/root"),
+            ("USER", "root"),
+            ("LEGION_TOKEN", "lgn_secret"),
+            ("AWS_SECRET_ACCESS_KEY", "secret"),
+            ("RUST_LOG", "debug"),
+        ]
+        .map(|(k, v)| (k.to_string(), v.to_string()));
+
+        let env = base_task_env(worker.clone(), None);
+        assert_eq!(
+            env.get("PATH").map(String::as_str),
+            Some("/opt/bin:/usr/bin")
+        );
+        assert_eq!(env.get("LC_ALL").map(String::as_str), Some("C.UTF-8"));
+        assert_eq!(env.get("HOME").map(String::as_str), Some("/root"));
+        for leaked in ["LEGION_TOKEN", "AWS_SECRET_ACCESS_KEY", "RUST_LOG"] {
+            assert!(
+                !env.contains_key(leaked),
+                "{leaked} must not reach the task"
+            );
+        }
+
+        let nobody = TaskIdentity {
+            name: "nobody".into(),
+            home: "/nonexistent".into(),
+            shell: "/usr/sbin/nologin".into(),
+        };
+        let env = base_task_env(worker, Some(&nobody));
+        assert_eq!(env.get("HOME").map(String::as_str), Some("/nonexistent"));
+        assert_eq!(env.get("USER").map(String::as_str), Some("nobody"));
+        assert_eq!(env.get("LOGNAME").map(String::as_str), Some("nobody"));
+
+        let env = base_task_env(Vec::new(), None);
+        assert_eq!(env.get("PATH").map(String::as_str), Some(DEFAULT_TASK_PATH));
+    }
 
     #[test]
     fn linux_options_parse_from_exec_config() -> R<()> {

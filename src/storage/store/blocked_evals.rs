@@ -102,7 +102,16 @@ impl BlockedEval {
                 .map(|at| at.unix_timestamp())
                 .unwrap_or_default(),
             eval_id: self.id.clone(),
+            gang: self.gang().map(|report| report.to_proto()),
         }
+    }
+
+    /// The gang report a gang that could not reach its quorum blocked with
+    /// (docs/gang-scheduling.md); `None` for every other blocked eval.
+    pub fn gang(&self) -> Option<crate::manager::scheduler::GangReport> {
+        self.detail
+            .get("gang")
+            .and_then(crate::manager::scheduler::GangReport::from_json)
     }
 }
 
@@ -331,7 +340,9 @@ impl Store {
     }
 
     /// Write a handled eval `blocked` (inside the settle's write), replacing
-    /// any older blocked eval of the same job.
+    /// any older blocked eval of the same job. A gang short of its quorum
+    /// also starts (or keeps) its wait clock (`store/gang_waits.rs`), and its
+    /// detail records when the wait began and when it times out.
     pub(crate) fn write_blocked_eval(
         &self,
         eval_id: &str,
@@ -341,6 +352,34 @@ impl Store {
     ) -> R<()> {
         let mut conn: MutexGuard<'_, Connection> = self.write_connection()?;
         let tx = Self::write_tx(&mut conn)?;
+        let mut detail = detail.clone();
+        if let Some(gang) = detail.get("gang").filter(|gang| gang.is_object()) {
+            let identity: Option<(String, String)> = tx
+                .prepare_cached("SELECT job_id, job_config_id FROM eval WHERE id = ?1;")?
+                .query_row([eval_id], |row| {
+                    Ok((
+                        row.get::<_, Option<String>>(0)?.unwrap_or_default(),
+                        row.get::<_, Option<String>>(1)?.unwrap_or_default(),
+                    ))
+                })
+                .optional()?;
+            if let Some((job_id, job_config_id)) =
+                identity.filter(|(job_id, config)| !job_id.is_empty() && !config.is_empty())
+            {
+                let task = gang
+                    .get("task")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string();
+                let timeout = gang
+                    .get("placementTimeoutSeconds")
+                    .and_then(Value::as_u64)
+                    .filter(|secs| *secs > 0);
+                let wait = Self::note_gang_wait_tx(&tx, &job_config_id, &job_id, &task, timeout)?;
+                detail["gang"]["waitingSince"] = json!(wait.since_unix);
+                detail["gang"]["deadline"] = json!(wait.deadline_unix.unwrap_or(0));
+            }
+        }
         tx.prepare_cached(
             "DELETE FROM eval
              WHERE status = 'blocked' AND id != ?1
@@ -356,7 +395,7 @@ impl Store {
         .execute(params![
             eval_id,
             key,
-            serde_json::to_string(detail)?,
+            serde_json::to_string(&detail)?,
             Self::sortable_now()?
         ])?;
         let staged = self.stage_event_locked(&tx, event);
@@ -366,13 +405,20 @@ impl Store {
     }
 
     /// A job's evals settled its desired state: its blocked eval, if any, is
-    /// waiting for nothing.
+    /// waiting for nothing, and neither is a gang of its config — a plan that
+    /// left a gang short of its quorum fails its eval instead, so a
+    /// successful one ends the gang's wait (`store/gang_waits.rs`).
     pub(crate) fn delete_job_blocked_evals_tx(conn: &Connection, eval_id: &str) -> R<()> {
         conn.prepare_cached(
             "DELETE FROM eval
              WHERE status = 'blocked' AND id != ?1
                AND COALESCE(job_id, '') != ''
                AND job_id = (SELECT job_id FROM eval WHERE id = ?1);",
+        )?
+        .execute([eval_id])?;
+        conn.prepare_cached(
+            "DELETE FROM gang_wait
+             WHERE job_config_id = (SELECT job_config_id FROM eval WHERE id = ?1);",
         )?
         .execute([eval_id])?;
         Ok(())
@@ -436,7 +482,8 @@ impl Store {
             }
         }
         self.lock_capacity_events().processed = upto;
-        self.publish_blocked_gauge(&blocked, woken.len());
+        let woken_ids: HashSet<&str> = woken.iter().map(|(eval, _, _)| eval.id.as_str()).collect();
+        self.publish_blocked_gauge(&blocked, &woken_ids);
         Ok(woken.len())
     }
 
@@ -472,9 +519,9 @@ impl Store {
         Ok(blocked.len())
     }
 
-    /// `legion_evals_blocked{key_kind}` after a pass that woke some of
-    /// `blocked`.
-    fn publish_blocked_gauge(&self, blocked: &[BlockedEval], woken: usize) {
+    /// `legion_evals_blocked{key_kind}` and `legion_gang_blocked_jobs` after a
+    /// pass that woke `woken` of `blocked`.
+    fn publish_blocked_gauge(&self, blocked: &[BlockedEval], woken: &HashSet<&str>) {
         let mut counts: BTreeMap<&'static str, i64> = [("class", 0), ("node", 0), ("escaped", 0)]
             .into_iter()
             .collect();
@@ -482,7 +529,7 @@ impl Store {
             *counts.entry(key_kind(&eval.key)).or_default() += 1;
         }
         // The woken ones are pending now; a later pass recounts exactly.
-        let mut remaining = woken as i64;
+        let mut remaining = woken.len() as i64;
         for count in counts.values_mut() {
             let take = remaining.min(*count);
             *count -= take;
@@ -492,9 +539,17 @@ impl Store {
         for (kind, count) in counts {
             gauge.set(&[kind], count);
         }
+        // The gangs still blocked after this pass.
+        let gangs = blocked
+            .iter()
+            .filter(|eval| !woken.contains(eval.id.as_str()) && eval.gang().is_some())
+            .count();
+        crate::manager::telemetry::metrics()
+            .gang_blocked_jobs
+            .set(gangs as i64);
     }
 
-    fn unblock_evals_apply(
+    pub(super) fn unblock_evals_apply(
         &self,
         wakes: Vec<(String, String, String, &'static str, String)>,
     ) -> R<()> {

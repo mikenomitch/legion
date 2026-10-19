@@ -27,6 +27,15 @@ Task names:
 - map keys become task names
 - list tasks default to `task-<n>` unless they set `name`
 
+Job, group, and task names may use only `A-Z`, `a-z`, `0-9`, `.`, `_`, and
+`-`, are 1 to 128 characters, and may not start with `.`. A task's name is a
+directory on every worker that runs it (`allocs/<allocation>/<task>/`), so a
+name that is a path, or `.`/`..`, is refused at submit:
+
+```console
+error: Error validating task configs: task name "../web" may only contain [A-Za-z0-9._-] and may not start with "." (the name becomes a directory on every worker that runs it)
+```
+
 ## Task Fields That Affect Placement
 
 Important `TaskConfig` fields:
@@ -39,6 +48,13 @@ Important `TaskConfig` fields:
 - `count`:
   - integer count
   - or `{ num, per }` for per-attribute placement
+- `gang`: `true` or `{ min, placementTimeout, onMemberLoss }`. The task's
+  replicas place all together (or at least `min` of them together) or not at
+  all, and a gang that does not fit waits, blocked and holding nothing,
+  instead of placing what fits. `placementTimeout` fails the job if the wait
+  runs too long, and a lost member restarts the whole gang (or, with
+  `onMemberLoss`, is replaced alone or fails the job). See
+  [Gang Scheduling](gang-scheduling.md).
 - `group`: task grouping for rollouts and automatic anti-affinity
 - `runtime`: task-runtime plugin (`exec`, `container`, etc.)
 - `resources`: normalized by the manager's `ResourcePolicy`
@@ -422,6 +438,15 @@ When the unhealthy threshold is reached:
 1. Restart locally if `on_unhealthy.restart_count/restart_period/restart_delay` allows it.
 2. If restarts are exhausted, record an allocation failure.
 
+Check types are `tcp` and `http` (dialed by the worker on loopback, at the
+task's port) and `exec`. An `exec` check's command runs **on the host**, as
+the worker's user, whatever the task's runtime: it is not run inside a
+container or sandbox. So a task with an `exec` check is
+[host-level](auth-and-acls.md#host-level-jobs), and submitting it needs a
+`job:write` rule with `host = true`. The command gets the same allowlisted
+environment an `exec` task gets ([Exec runtime](task-runtime-exec.md)), not
+the worker's own.
+
 Health checks start when the task starts, including tasks that stage
 artifacts first (every container image when `containerImageDesugar` is on).
 They never start for a task whose staging failed: that allocation fails with
@@ -455,6 +480,11 @@ healthy within about a second of its port opening.
   command whose cost Legion can't know, so it keeps its cadence. A readiness
   check never changes the allocation's health, so it isn't probed either.
 - A `health` check waits for the `boot` checks, probes included.
+- A `boot` check's first cadence run happens the moment the task starts,
+  before most workloads have bound their port. A failure in the first
+  `every` after a start or restart is not counted (or the first
+  `boot_grace_time`, if that is longer), so `unhealthy_after_count = 1` does
+  not fail the task on that first run. A pass in that window still counts.
 - Once a check passes, probing stops until the task restarts.
 
 `legion_task_start_stage_seconds{stage="health"}` ([metrics.md](metrics.md))

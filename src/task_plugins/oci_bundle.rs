@@ -884,6 +884,12 @@ fn extract_layer_as(
     archive.set_preserve_ownerships(false);
     archive.set_overwrite(true);
 
+    // Directory modes are applied once the layer is done, as
+    // `tar::Archive::unpack` does: a read-only directory (`0555`) with
+    // entries after it would otherwise refuse them to a worker that is not
+    // root (root bypasses the mode).
+    let mut dir_modes: Vec<(PathBuf, u32)> = Vec::new();
+
     for entry in archive.entries()? {
         let mut entry = entry?;
         let path = entry.path()?.into_owned();
@@ -913,7 +919,8 @@ fn extract_layer_as(
 
         // Read before unpacking: the PAX records sit in the header, and the
         // entry's data is consumed by the unpack.
-        let owner = (preserve_owners || shift.is_some()).then(|| EntryOwner::of(entry.header()));
+        let mut owner =
+            (preserve_owners || shift.is_some()).then(|| EntryOwner::of(entry.header()));
         let xattrs = if preserve_owners {
             entry_xattrs(&mut entry)
         } else {
@@ -941,6 +948,16 @@ fn extract_layer_as(
                     source.strip_prefix(rootfs).unwrap_or(&source).display()
                 )
             })?;
+        } else if kind.is_dir() {
+            std::fs::create_dir_all(&target)
+                .with_context(|| format!("create {}", rel.display()))?;
+            if let Ok(mode) = entry.header().mode() {
+                dir_modes.push((target.clone(), mode & 0o7777));
+            }
+            // The deferred chmod below sets the setgid bit too.
+            if let Some(owner) = owner.as_mut() {
+                owner.mode = None;
+            }
         } else {
             // The parent is resolved and inside the rootfs, so the plain
             // `unpack` is safe here. It applies the mode.
@@ -968,6 +985,23 @@ fn extract_layer_as(
         if !xattrs.is_empty() {
             // After the chown, which would clear `security.capability`.
             apply_xattrs(&target, &xattrs);
+        }
+    }
+    // Deepest first, so no chmod has to traverse a directory already closed.
+    // A directory a later entry replaced with another kind keeps that kind.
+    for (dir, mode) in dir_modes.into_iter().rev() {
+        if !std::fs::symlink_metadata(&dir).is_ok_and(|meta| meta.file_type().is_dir()) {
+            continue;
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(mode))
+                .with_context(|| format!("chmod {}", dir.display()))?;
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = mode;
         }
     }
     Ok(())
@@ -1264,6 +1298,11 @@ struct ResolvedUser {
     uid: u32,
     gid: u32,
     home: Option<String>,
+    /// Supplementary groups: every `etc/group` entry that lists the user by
+    /// name, as Docker (runc's `GetExecUser`) applies them. Only in the
+    /// implicit form (`name` or a uid with a passwd entry): `user:group`
+    /// names the groups outright, and gets none.
+    additional_gids: Vec<u32>,
 }
 
 /// Resolves the image config's `User` (`uid`, `uid:gid`, `name`, `name:group`)
@@ -1271,13 +1310,12 @@ struct ResolvedUser {
 /// inside the rootfs; a name that resolves nowhere falls back to root with a
 /// warning (matching the previous behavior, but no longer silently).
 fn resolve_user(rootfs: &Path, user: Option<&str>) -> ResolvedUser {
-    let root = ResolvedUser {
-        uid: 0,
-        gid: 0,
-        home: None,
+    let root = || ResolvedUser {
+        additional_gids: lookup_member_gids(rootfs, "root", 0),
+        ..ResolvedUser::default()
     };
     let Some(user) = user else {
-        return root;
+        return root();
     };
     let (user_part, group_part) = match user.split_once(':') {
         Some((u, g)) => (u, Some(g)),
@@ -1297,7 +1335,7 @@ fn resolve_user(rootfs: &Path, user: Option<&str>) -> ResolvedUser {
                 user,
                 "image user not found in rootfs /etc/passwd; running as root"
             );
-            return root;
+            return root();
         }
     };
 
@@ -1317,8 +1355,17 @@ fn resolve_user(rootfs: &Path, user: Option<&str>) -> ResolvedUser {
         },
         None => passwd_gid.unwrap_or(uid),
     };
+    let additional_gids = match (&passwd_entry, group_part) {
+        (Some(entry), None) => lookup_member_gids(rootfs, &entry.name, gid),
+        _ => Vec::new(),
+    };
 
-    ResolvedUser { uid, gid, home }
+    ResolvedUser {
+        uid,
+        gid,
+        home,
+        additional_gids,
+    }
 }
 
 struct PasswdEntry {
@@ -1351,6 +1398,31 @@ fn lookup_group(rootfs: &Path, group: &str) -> Option<u32> {
         let fields: Vec<&str> = line.split(':').collect();
         (*fields.first()? == group).then(|| fields.get(2)?.parse().ok())?
     })
+}
+
+/// The gids of every `etc/group` entry whose member list names `user`, in
+/// file order, without `primary_gid` or repeats.
+fn lookup_member_gids(rootfs: &Path, user: &str, primary_gid: u32) -> Vec<u32> {
+    let Ok(content) = std::fs::read_to_string(rootfs.join("etc/group")) else {
+        return Vec::new();
+    };
+    let mut gids = Vec::new();
+    for line in content.lines() {
+        let fields: Vec<&str> = line.split(':').collect();
+        let (Some(gid), Some(members)) = (fields.get(2), fields.get(3)) else {
+            continue;
+        };
+        let Ok(gid) = gid.parse::<u32>() else {
+            continue;
+        };
+        if gid != primary_gid
+            && !gids.contains(&gid)
+            && members.split(',').any(|member| member.trim() == user)
+        {
+            gids.push(gid);
+        }
+    }
+    gids
 }
 
 /// Read-only bind mounts of the host's DNS/hosts files, when they exist. The
@@ -1670,6 +1742,9 @@ fn build_spec(
             ]
         }
     });
+    if !user.additional_gids.is_empty() {
+        spec["process"]["user"]["additionalGids"] = json!(user.additional_gids);
+    }
 
     // Explicit cgroupfs form (`legion/share/legion-<alloc>`), so an operator
     // can find a task's cgroup by allocation id and the share/reserve split
@@ -1917,7 +1992,8 @@ mod tests {
             ResolvedUser {
                 uid: 0,
                 gid: 0,
-                home: None
+                home: None,
+                additional_gids: vec![],
             }
         );
         // Named user resolves uid/gid/home from passwd.
@@ -1926,7 +2002,8 @@ mod tests {
             ResolvedUser {
                 uid: 70,
                 gid: 70,
-                home: Some("/var/lib/postgresql".into())
+                home: Some("/var/lib/postgresql".into()),
+                additional_gids: vec![],
             }
         );
         // Numeric uid with a passwd entry picks up its gid and home.
@@ -1935,7 +2012,8 @@ mod tests {
             ResolvedUser {
                 uid: 70,
                 gid: 70,
-                home: Some("/var/lib/postgresql".into())
+                home: Some("/var/lib/postgresql".into()),
+                additional_gids: vec![],
             }
         );
         // Numeric uid without a passwd entry is used as-is.
@@ -1944,7 +2022,8 @@ mod tests {
             ResolvedUser {
                 uid: 1234,
                 gid: 1234,
-                home: None
+                home: None,
+                additional_gids: vec![],
             }
         );
         // user:group with a named group resolves via /etc/group.
@@ -1953,7 +2032,8 @@ mod tests {
             ResolvedUser {
                 uid: 70,
                 gid: 50,
-                home: Some("/var/lib/postgresql".into())
+                home: Some("/var/lib/postgresql".into()),
+                additional_gids: vec![],
             }
         );
         // uid:gid stays numeric.
@@ -1962,7 +2042,8 @@ mod tests {
             ResolvedUser {
                 uid: 1000,
                 gid: 2000,
-                home: None
+                home: None,
+                additional_gids: vec![],
             }
         );
         // Unknown name falls back to root.
@@ -1971,9 +2052,47 @@ mod tests {
             ResolvedUser {
                 uid: 0,
                 gid: 0,
-                home: None
+                home: None,
+                additional_gids: vec![],
             }
         );
+    }
+
+    #[test]
+    fn a_named_user_gets_the_groups_that_list_it_test() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(dir.path().join("etc")).expect("etc");
+        std::fs::write(
+            dir.path().join("etc/passwd"),
+            "root:x:0:0:root:/root:/bin/sh\napp:x:1000:1000::/home/app:/bin/sh\n",
+        )
+        .expect("passwd");
+        std::fs::write(
+            dir.path().join("etc/group"),
+            "root:x:0:root\nbin:x:1:root,bin\napp:x:1000:app\nwww-data:x:33:nginx,app\n\
+             docker:x:999:app\nbroken-line\nstaff:x:50:\n",
+        )
+        .expect("group");
+        let root = dir.path();
+
+        // Implicit form, by name or by a uid with a passwd entry: every group
+        // that lists the user, minus its primary group.
+        assert_eq!(
+            resolve_user(root, Some("app")).additional_gids,
+            vec![33, 999]
+        );
+        assert_eq!(
+            resolve_user(root, Some("1000")).additional_gids,
+            vec![33, 999]
+        );
+        // No user is root, which images list in groups too (Docker's
+        // `groups=0(root),1(bin),...`).
+        assert_eq!(resolve_user(root, None).additional_gids, vec![1]);
+        // `user:group` names the groups outright; a bare uid has no name.
+        assert!(resolve_user(root, Some("app:staff"))
+            .additional_gids
+            .is_empty());
+        assert!(resolve_user(root, Some("4242")).additional_gids.is_empty());
     }
 
     #[test]
@@ -1989,6 +2108,7 @@ mod tests {
             uid: 1000,
             gid: 1000,
             home: Some("/home/app".to_string()),
+            ..ResolvedUser::default()
         };
         let mut task_env = HashMap::new();
         task_env.insert("MODE".to_string(), "test".to_string());
@@ -2072,6 +2192,7 @@ mod tests {
                 uid: 0,
                 gid: 0,
                 home: None,
+                ..ResolvedUser::default()
             },
             &BundleContext {
                 hostname: "legion-42",
@@ -2181,6 +2302,7 @@ mod tests {
                 uid: 0,
                 gid: 0,
                 home: None,
+                ..ResolvedUser::default()
             },
             &BundleContext {
                 hostname: "legion-42",
@@ -2247,6 +2369,7 @@ mod tests {
             uid: 70,
             gid: 70,
             home: Some("/var/lib/postgresql".to_string()),
+            ..ResolvedUser::default()
         };
         let spec = build_spec(
             &["true".to_string()],
@@ -2791,6 +2914,38 @@ mod tests {
         let data = std::fs::metadata(rootfs.join("var/cache/nginx/data"))?;
         assert_eq!(data.uid(), me);
         assert_eq!(data.mode() & 0o777, 0o640);
+        Ok(())
+    }
+
+    /// A read-only directory with entries after it in the same layer: its
+    /// mode lands once the layer is done, so a worker that is not root can
+    /// still write the entries (root would bypass the mode either way).
+    #[test]
+    fn a_read_only_directory_takes_its_mode_after_its_entries_test() -> R<()> {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir()?;
+        let blob = dir.path().join("layer.tar");
+        let mut builder = tar::Builder::new(std::fs::File::create(&blob)?);
+        let mut header = tar::Header::new_gnu();
+        header.set_entry_type(tar::EntryType::Directory);
+        header.set_mode(0o555);
+        header.set_size(0);
+        builder.append_data(&mut header, "srv/", std::io::empty())?;
+        let mut header = tar::Header::new_gnu();
+        header.set_mode(0o644);
+        header.set_size(2);
+        builder.append_data(&mut header, "srv/index", &b"ok"[..])?;
+        builder.finish()?;
+        drop(builder);
+
+        let rootfs = dir.path().join("rootfs");
+        std::fs::create_dir_all(&rootfs)?;
+        extract_layer_as(&blob, &rootfs, false, None)?;
+        assert_eq!(std::fs::read(rootfs.join("srv/index"))?, b"ok");
+        let mode = std::fs::metadata(rootfs.join("srv"))?.permissions().mode();
+        assert_eq!(mode & 0o777, 0o555);
+        // Let the tempdir clean up after a non-root run.
+        std::fs::set_permissions(rootfs.join("srv"), std::fs::Permissions::from_mode(0o755))?;
         Ok(())
     }
 
