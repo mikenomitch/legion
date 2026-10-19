@@ -1163,6 +1163,21 @@ fn event_namespace_filter(
         .map_err(Status::invalid_argument)
 }
 
+/// The namespace selection of a list request that may also name a job: a
+/// named job pins its own namespace, so the selection applies only without
+/// one (`None`). Empty selectors mean `default`, as for ListJobs.
+fn list_namespace_selection(
+    job_id: Option<&str>,
+    namespaces: &[String],
+) -> Result<Option<crate::structs::namespace::NamespaceSelection>, Status> {
+    if job_id.is_some_and(|job| !job.trim().is_empty()) {
+        return Ok(None);
+    }
+    crate::structs::namespace::NamespaceSelection::parse(namespaces)
+        .map(Some)
+        .map_err(Status::invalid_argument)
+}
+
 /// An event feed's whole visibility rule: who it is for, narrowed by the
 /// request's namespace filter.
 #[derive(Clone)]
@@ -4790,12 +4805,15 @@ impl Manager for ManagerDaemonService {
             .eq_ignore_ascii_case("desc");
         let (page, page_size) = parse_page(request.page, request.page_size);
 
+        let selection = list_namespace_selection(job_id, &request.namespaces)?;
         let mut rollouts = self
             .store
             .list_rollouts(job_id, request.active_only)
             .map_err(|e| map_store_error("Error listing rollouts", e))?;
         rollouts.retain(|rollout| {
-            identity.allows(
+            selection.as_ref().is_none_or(|selection| {
+                selection.matches(crate::structs::namespace::job_namespace(&rollout.job_id))
+            }) && identity.allows(
                 AclResource::Job,
                 AclAction::Read,
                 &AclScope::job(&rollout.job_id),
@@ -7548,6 +7566,7 @@ impl Manager for ManagerDaemonService {
         let identity =
             self.check_acl(&request, AclResource::Job, AclAction::Read, AclScope::any())?;
         let inner = request.into_inner();
+        let selection = list_namespace_selection(inner.job_id.as_deref(), &inner.namespaces)?;
         let filter = crate::storage::store::VolumeFilter {
             job_id: non_empty(inner.job_id),
             node_id: non_empty(inner.node_id),
@@ -7575,6 +7594,13 @@ impl Manager for ManagerDaemonService {
             .into_iter()
             .filter(|volume| {
                 include_destroyed || volume.state != crate::structs::VolumeState::Destroyed
+            })
+            .filter(|volume| match (&selection, volume.job_id.as_deref()) {
+                (None, _) => true,
+                (Some(selection), Some(job_id)) => {
+                    selection.matches(crate::structs::namespace::job_namespace(job_id))
+                }
+                (Some(selection), None) => selection.is_exactly("*"),
             })
             .filter(|volume| match volume.job_id.as_deref() {
                 Some(job_id) => {
@@ -10681,10 +10707,12 @@ impl Manager for ManagerDaemonService {
         for consumer in consumers {
             for upstream in &consumer.upstreams {
                 let service = upstream.key().to_string();
-                targets.insert(
-                    (consumer.job_id.clone(), service.clone()),
-                    upstream.service_ref(&consumer.job_id),
-                );
+                let target = if upstream.is_external() {
+                    service.clone()
+                } else {
+                    upstream.service_ref(&consumer.job_id)
+                };
+                targets.insert((consumer.job_id.clone(), service.clone()), target);
                 // Tagged observed edges for the same (caller, service) are
                 // declared too.
                 let mut any = false;
@@ -10725,6 +10753,7 @@ impl Manager for ManagerDaemonService {
                         service,
                     )
                 });
+            edge.target = target.clone();
             if let Some((owner, allow)) = allow_by_service.get(&target) {
                 edge.allowed = crate::structs::allow_permits(allow, owner, job);
             }
@@ -10743,7 +10772,12 @@ impl Manager for ManagerDaemonService {
         // read the calling job.
         let mut out: Vec<ServiceEdge> = edges
             .into_values()
-            .filter(|edge| filter.is_empty() || edge.service == filter || edge.caller_job == filter)
+            .filter(|edge| {
+                filter.is_empty()
+                    || edge.target == filter
+                    || edge.service == filter
+                    || edge.caller_job == filter
+            })
             .filter(|edge| {
                 identity.allows(
                     AclResource::Job,

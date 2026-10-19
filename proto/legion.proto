@@ -2919,6 +2919,12 @@ message ListRolloutsRequest {
   //
   // Default: `20`.
   optional uint32 page_size = 7;
+
+  // Namespaces to list: names or `*`-globs; `["*"]` for every namespace the
+  // caller can read. Empty means `default`. Ignored when `job_id` is set,
+  // since a job names its own namespace. Items are still filtered by
+  // `job:read`, so `*` widens what is considered, never what is visible.
+  repeated string namespaces = 8;
 }
 
 // Rollout record.
@@ -4776,6 +4782,10 @@ message ListSnapshotsRequest {
   // Optional exact-match state filter (`capturing`, `local`, `published`,
   // `failed`, `deleting`, `lost`).
   optional string state = 3;
+
+  // Namespaces to list (see `ListRolloutsRequest.namespaces`): empty means
+  // `default`, `["*"]` every namespace; ignored when `job_id` is set.
+  repeated string namespaces = 4;
 }
 
 // Reply payload for ListSnapshots.
@@ -5331,6 +5341,11 @@ message ListVolumesRequest {
   // default, so a destroyed instance's volume drops out of the list once its
   // reclaim is confirmed. `legion volume list --all` sets it.
   bool include_destroyed = 6;
+
+  // Namespaces to list (see `ListRolloutsRequest.namespaces`): empty means
+  // `default`, `["*"]` every namespace; ignored when `job_id` is set. A
+  // volume no job owns is listed only under `*`.
+  repeated string namespaces = 7;
 }
 
 // Reply payload for ListVolumes.
@@ -9274,7 +9289,9 @@ message ServiceEndpoint {
 
 // Request payload for ListServiceEdges.
 message ListServiceEdgesRequest {
-  // Only edges into (or out of) this service; empty for the whole graph.
+  // Only edges into (or out of) this service or job; empty for the whole
+  // graph. Matches an edge's `target` (the canonical service, e.g.
+  // `payments-prod/api`), its `service` key, or its `caller_job`.
   string service = 1;
 
   // Window the observed counters are summed over, seconds. Default 300,
@@ -9321,6 +9338,12 @@ message ServiceEdge {
   // When the manager last folded a sample for this edge, Unix seconds; 0 for
   // a declared-only edge.
   int64 last_seen_unix = 17;
+
+  // The canonical service `service` resolves to (`payments-prod/api`, bare
+  // in `default`): `service` is the caller's upstream key (an alias, or
+  // `api.payments-prod` for a crossing), this is the catalog entry it
+  // dials. Equal to `service` for an external upstream.
+  string target = 18;
 }
 
 // Reply payload for ListServiceEdges.

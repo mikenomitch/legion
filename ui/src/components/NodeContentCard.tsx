@@ -5,6 +5,7 @@ import { formatBytes } from '../utils/format'
 import { percentOf, fillTone, type ContentBudget } from '../utils/usage'
 import { snapshotLabel, snapshotStateTone } from '../utils/snapshots'
 import { Badge, Meter, MonoBadge, SectionCard, TableShell, cx, tableClass, tdClass, thClass, theadClass, trHoverClass } from './ui'
+import { jobPath } from '../utils/namespaces'
 
 /*
  * The worker page's "Content and locality" card, from GetNodeContent: what
@@ -115,7 +116,7 @@ export function NodeContentCard(props: { content: GetNodeContentReply; budgets?:
                           </Show>
                         </td>
                         <td class={tdClass}>
-                          <A href={`/jobs/${encodeURIComponent(snapshot().jobId)}`} class="font-medium hover:text-brass-strong">
+                          <A href={`${jobPath(snapshot().jobId)}`} class="font-medium hover:text-brass-strong">
                             {snapshot().jobId}
                           </A>
                         </td>

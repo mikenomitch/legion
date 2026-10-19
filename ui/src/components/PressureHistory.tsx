@@ -5,6 +5,7 @@ import { instanceMeta, newestFirst, pressureMeta, snapshotMeta } from '../utils/
 import { formatBytes } from '../utils/format'
 import { PressureSteps } from './NodeUsagePanel'
 import { RelativeTime, SectionCard } from './ui'
+import { jobPath } from '../utils/namespaces'
 
 /*
  * What a node's memory pressure response did, from `node.pressure` events.
@@ -59,7 +60,7 @@ export function PressureHistoryCard(props: { events: readonly SchedulerEvent[]; 
                     {(instance) => <span class="font-mono text-xs text-muted" title="Stateful instance">{instance()}</span>}
                   </Show>
                   <Show when={props.scope === 'node' && event.jobId}>
-                    <A href={`/jobs/${encodeURIComponent(event.jobId!)}`} class="font-medium hover:text-brass-strong">
+                    <A href={`${jobPath(event.jobId!)}`} class="font-medium hover:text-brass-strong">
                       {event.jobId}
                     </A>
                   </Show>

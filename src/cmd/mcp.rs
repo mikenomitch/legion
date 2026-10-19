@@ -1357,17 +1357,7 @@ async fn dispatch_tool(name: &str, args: Value) -> Result<Value, String> {
         }
         "legion_job_list" => {
             let status = opt_str_arg(&args, "status");
-            let namespaces = args
-                .get("namespaces")
-                .and_then(Value::as_array)
-                .map(|items| {
-                    items
-                        .iter()
-                        .filter_map(Value::as_str)
-                        .map(str::to_string)
-                        .collect()
-                })
-                .unwrap_or_default();
+            let namespaces = namespaces_arg(&args);
             let mut client = connect().await?;
             grpc(client.list_jobs(ListJobsRequest {
                 status,
@@ -1494,6 +1484,7 @@ async fn dispatch_tool(name: &str, args: Value) -> Result<Value, String> {
             grpc(client.list_rollouts(ListRolloutsRequest {
                 job_id,
                 active_only,
+                namespaces: namespaces_arg(&args),
                 ..Default::default()
             }))
             .await
@@ -1836,6 +1827,7 @@ async fn dispatch_tool(name: &str, args: Value) -> Result<Value, String> {
             let mut client = connect().await?;
             grpc(
                 client.list_volumes(ListVolumesRequest {
+                    namespaces: namespaces_arg(&args),
                     job_id: opt_job_arg(&args, "job_id")?,
                     node_id: opt_str_arg(&args, "node_id"),
                     driver: opt_str_arg(&args, "driver"),
@@ -1872,6 +1864,7 @@ async fn dispatch_tool(name: &str, args: Value) -> Result<Value, String> {
         "legion_snapshot_list" => {
             let mut client = connect().await?;
             grpc(client.list_snapshots(crate::structs::ListSnapshotsRequest {
+                namespaces: namespaces_arg(&args),
                 job_id: opt_job_arg(&args, "job_id")?,
                 instance_id: opt_instance_arg(&args, "instance_id")?,
                 state: opt_str_arg(&args, "state"),
@@ -2671,6 +2664,28 @@ fn opt_job_arg(args: &Value, key: &str) -> Result<Option<String>, String> {
     }
 }
 
+/// The `namespaces` array argument of a list tool (empty means `default`).
+fn namespaces_arg(args: &Value) -> Vec<String> {
+    args.get("namespaces")
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// List tools that take a `namespaces` selection.
+const NAMESPACE_LIST_TOOLS: &[&str] = &[
+    "legion_job_list",
+    "legion_rollout_list",
+    "legion_volume_list",
+    "legion_snapshot_list",
+];
+
 /// Tools whose `name` argument is a job (the rest use `job` / `job_id`).
 const JOB_NAME_TOOLS: &[&str] = &[
     "legion_job_info",
@@ -2698,16 +2713,18 @@ fn tool_schema(tool: &ToolDef) -> Value {
     let Some(properties) = schema.get_mut("properties").and_then(Value::as_object_mut) else {
         return schema;
     };
-    if tool.name == "legion_job_list" {
+    if NAMESPACE_LIST_TOOLS.contains(&tool.name) {
         properties.insert(
             "namespaces".into(),
             json!({
                 "type": "array",
                 "items": { "type": "string" },
-                "description": "Namespaces to list: names or `*`-globs. Omit for `default`; [\"*\"] for every namespace this token can read."
+                "description": "Namespaces to list: names or `*`-globs. Omit for `default`; [\"*\"] for every namespace this token can read. Ignored when a job is named."
             }),
         );
-        return schema;
+        if tool.name == "legion_job_list" {
+            return schema;
+        }
     }
     let names_a_job = JOB_NAME_TOOLS.contains(&tool.name)
         || SPEC_NAMESPACE_TOOLS.contains(&tool.name)

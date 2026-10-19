@@ -15,6 +15,7 @@
  *   what nav-level gating uses
  */
 import { managerIdentity } from './connection'
+import { DEFAULT_NAMESPACE, splitJobId } from './namespaces'
 
 export type AclResource =
   | 'job'
@@ -31,6 +32,10 @@ export type AclResource =
   // Snapshots of instances, scoped by job like `job`. `snapshot:write` on a
   // job is as strong as reading its memory (docs/auth-and-acls.md).
   | 'snapshot'
+  // Boot tickets, scoped by job like `scale`.
+  | 'boot'
+  // Namespace objects themselves; `write` creates and deletes them.
+  | 'namespace'
 
 export type AclActionKind = 'read' | 'write'
 
@@ -44,6 +49,7 @@ export type AclRule = {
   paths?: string[]
   actionNames?: string[]
   templates?: string[]
+  bands?: string[]
   host?: boolean
 }
 
@@ -55,17 +61,24 @@ export type AclScope = {
   path?: string
   actionName?: string
   template?: string
+  band?: string
   host?: boolean
 }
 
-// Jobs all live in the implicit default namespace today (see acl.rs).
-export const DEFAULT_NAMESPACE = 'default'
+export { DEFAULT_NAMESPACE }
 
-export const jobScope = (name: string, template?: string): AclScope => ({
-  namespace: DEFAULT_NAMESPACE,
-  name,
-  template,
-})
+/**
+ * The scope of a job, from its canonical id (`payments-prod/web`, or the
+ * bare `web` in `default`): the namespace and the bare name are separate
+ * attributes, matched by a rule's `namespaces` and `names` selectors.
+ */
+export const jobScope = (id: string, template?: string): AclScope => {
+  const { namespace, name } = splitJobId(id)
+  return { namespace, name, template }
+}
+
+/** The scope of a namespace object itself (`namespace:read|write`). */
+export const namespaceScope = (namespace: string): AclScope => ({ namespace, name: namespace })
 
 const globMatch = (pattern: string, value: string): boolean => {
   const parts = pattern.split('*')
@@ -97,7 +110,13 @@ const selectorMatches = (selector: string[] | undefined, attr: string | undefine
 
 const hasScopeSelectors = (rule: AclRule): boolean =>
   Boolean(
-    rule.namespaces || rule.names || rule.pools || rule.paths || rule.actionNames || rule.templates,
+    rule.namespaces ||
+      rule.names ||
+      rule.pools ||
+      rule.paths ||
+      rule.actionNames ||
+      rule.templates ||
+      rule.bands,
   )
 
 const ruleCovers = (rule: AclRule, resource: AclResource, action: AclActionKind): boolean =>
@@ -112,14 +131,17 @@ const ruleMatches = (
 ): boolean => {
   if (!ruleCovers(rule, resource, action)) return false
   if (scope.any) return true
-  if (resource === 'exec' && scope.host && rule.host !== true) return false
+  // A host-level target (an exec into one, or submitting a job with one)
+  // needs a rule that opts into `host`.
+  if ((resource === 'exec' || resource === 'job') && scope.host && rule.host !== true) return false
   return (
     selectorMatches(rule.namespaces, scope.namespace) &&
     selectorMatches(rule.names, scope.name) &&
     selectorMatches(rule.pools, scope.pool) &&
     selectorMatches(rule.paths, scope.path) &&
     selectorMatches(rule.actionNames, scope.actionName) &&
-    selectorMatches(rule.templates, scope.template)
+    selectorMatches(rule.templates, scope.template) &&
+    selectorMatches(rule.bands, scope.band)
   )
 }
 
@@ -202,6 +224,7 @@ export const ROUTE_RESOURCE: Record<string, AclResource> = {
   '/observability': 'operator',
   '/kv': 'kv',
   '/state-explorer': 'state',
+  '/namespaces': 'namespace',
 }
 
 /** Nav-level check: could the identity read any instance of `resource`? */

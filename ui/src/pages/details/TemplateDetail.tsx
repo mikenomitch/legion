@@ -55,6 +55,7 @@ import { canonicalJson, diffLines, type DiffLine, type LineDiff } from '../../ut
 import { formatDate } from '../../utils/format'
 import { retainOnError, usePoll } from '../../utils/polling'
 import { dotToneClasses, isRolloutDone, statusTone } from '../../utils/status'
+import { isMultiNamespace, jobPath, readableNamespaces } from '../../utils/namespaces'
 
 // A ConnectError's `message` carries a `[code]` prefix; the raw message is
 // what the manager actually said, which is what belongs in a form error.
@@ -937,6 +938,10 @@ function TemplateDetailContent() {
   const [reviewing, setReviewing] = createSignal(false)
   const [launching, setLaunching] = createSignal(false)
   const [launched, setLaunched] = createSignal<LaunchResult | null>(null)
+  // The namespace the rendered job lands in; empty lets the template decide
+  // (its own `namespace`, else `default`). A template that names one and a
+  // different choice here is refused by the manager, not silently resolved.
+  const [targetNamespace, setTargetNamespace] = createSignal('')
   const [flowError, setFlowError] = createSignal('')
   // Bumped whenever the inputs change, so a render that resolves after the
   // user has moved on is dropped instead of overwriting newer state.
@@ -970,6 +975,7 @@ function TemplateDetailContent() {
         name: current.name,
         version: current.version,
         variablesJson,
+        namespace: targetNamespace() || undefined,
       })
       if (token !== reviewToken) return
       // Both lookups at once: an existing job needs its spec anyway, and for
@@ -1016,6 +1022,7 @@ function TemplateDetailContent() {
         version: reviewed.version,
         variablesJson: reviewed.variablesJson,
         forceReschedule: false,
+        namespace: targetNamespace() || undefined,
       })
       setLaunched({
         message: reply.message,
@@ -1266,22 +1273,35 @@ function TemplateDetailContent() {
                               title="Variables"
                               description="Validated against the declared types when the manager renders the template."
                               actions={
-                                <Show when={(data()?.versions.length ?? 0) > 1}>
-                                  <select
-                                    class={selectClass}
-                                    aria-label="Template version"
-                                    value={version() === undefined ? 'latest' : String(version())}
-                                    onChange={(event) => {
-                                      const raw = event.currentTarget.value
-                                      setVersion(raw === 'latest' ? undefined : Number(raw))
-                                    }}
-                                  >
-                                    <option value="latest">Latest (v{data()?.versions[0]?.version ?? current().latestVersion})</option>
-                                    <For each={data()?.versions ?? []}>
-                                      {(info) => <option value={String(info.version)}>v{info.version} · {formatDate(info.createdAt)}</option>}
-                                    </For>
-                                  </select>
-                                </Show>
+                                <>
+                                  <Show when={isMultiNamespace()}>
+                                    <select
+                                      class={selectClass}
+                                      aria-label="Target namespace"
+                                      value={targetNamespace()}
+                                      onChange={(event) => setTargetNamespace(event.currentTarget.value)}
+                                    >
+                                      <option value="">Namespace: as the template says</option>
+                                      <For each={readableNamespaces()}>{(namespace) => <option value={namespace}>Namespace: {namespace}</option>}</For>
+                                    </select>
+                                  </Show>
+                                  <Show when={(data()?.versions.length ?? 0) > 1}>
+                                    <select
+                                      class={selectClass}
+                                      aria-label="Template version"
+                                      value={version() === undefined ? 'latest' : String(version())}
+                                      onChange={(event) => {
+                                        const raw = event.currentTarget.value
+                                        setVersion(raw === 'latest' ? undefined : Number(raw))
+                                      }}
+                                    >
+                                      <option value="latest">Latest (v{data()?.versions[0]?.version ?? current().latestVersion})</option>
+                                      <For each={data()?.versions ?? []}>
+                                        {(info) => <option value={String(info.version)}>v{info.version} · {formatDate(info.createdAt)}</option>}
+                                      </For>
+                                    </select>
+                                  </Show>
+                                </>
                               }
                             >
                               <Show
@@ -1412,7 +1432,7 @@ function TemplateDetailContent() {
                             const outcome = () => result().message.split('\n')[0]
                             const expectsRollout = () => /rollout/i.test(outcome())
                             const unchanged = () => /unchanged/i.test(outcome())
-                            const jobHref = () => `/jobs/${encodeURIComponent(result().jobName)}`
+                            const jobHref = () => `${jobPath(result().jobName)}`
                             return (
                               <div class="space-y-5">
                                 <Note tone="ok">

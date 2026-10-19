@@ -179,6 +179,7 @@ pub fn config() -> Command {
                         "Filter by state: capturing, local, published, failed, deleting, lost",
                     ),
                 )
+                .args(crate::cmd::helpers::list_namespace_flags())
                 .arg(json_flag()),
         )
         .subcommand(
@@ -587,6 +588,7 @@ async fn list(matches: &ArgMatches) -> R<()> {
         "failed to list snapshots",
         client
             .list_snapshots(tonic::Request::new(ListSnapshotsRequest {
+                namespaces: crate::cmd::helpers::namespace_selection(matches),
                 job_id: crate::cmd::helpers::job_arg(matches, "job")?,
                 instance_id: crate::cmd::helpers::instance_arg(matches, "instance")?,
                 state: matches.get_one::<String>("state").cloned(),

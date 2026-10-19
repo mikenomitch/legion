@@ -103,6 +103,7 @@ pub fn config() -> Command {
                         .action(ArgAction::SetTrue)
                         .help("Include destroyed volumes (tombstones of reclaimed storage)"),
                 )
+                .args(crate::cmd::helpers::list_namespace_flags())
                 .arg(json_flag()),
         )
         .subcommand(
@@ -206,6 +207,7 @@ pub async fn handle(matches: &ArgMatches) -> R<()> {
 async fn list(matches: &ArgMatches) -> R<()> {
     let format = OutputFormat::from_matches(matches);
     let request = tonic::Request::new(ListVolumesRequest {
+        namespaces: crate::cmd::helpers::namespace_selection(matches),
         job_id: crate::cmd::helpers::job_arg(matches, "job")?,
         node_id: matches.get_one::<String>("node").cloned(),
         driver: matches.get_one::<String>("driver").cloned(),

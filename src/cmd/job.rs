@@ -252,7 +252,7 @@ pub fn config() -> Command {
                 .value_name("JOB")
                 .help("Filter rollouts by job (`name` or `namespace/name`)"),
         )
-        .arg(namespace_flag())
+        .args(list_namespace_flags())
         .arg(
             Arg::new("active")
                 .long("active")
@@ -2357,6 +2357,7 @@ async fn list_rollouts(arg_matches: &ArgMatches) -> R<()> {
     let request = tonic::Request::new(ListRolloutsRequest {
         job_id,
         active_only,
+        namespaces: crate::cmd::helpers::namespace_selection(arg_matches),
         ..Default::default()
     });
     let response = output::resolve(
