@@ -676,6 +676,10 @@ pub async fn run_manager_with(
             "Starting manager: TLS for workers (cluster certificate), plaintext for the CLI and UI"
         );
     }
+    // Registered before the listener binds: a client can connect as soon as
+    // the socket listens, and a SIGTERM sent then must be heard, not take
+    // the default action and kill the manager mid-startup.
+    let mut shutdown_signals = ShutdownSignals::register();
     let api_listener = tokio::net::TcpListener::bind(addr)
         .await
         .with_context(|| format!("manager gRPC server on {addr} failed to bind"))?;
@@ -841,7 +845,7 @@ pub async fn run_manager_with(
             shutdown_persistence(&store_for_shutdown).await;
             return Err(err);
         }
-        signal = shutdown_signal() => signal,
+        signal = shutdown_signals.recv() => signal,
     };
 
     // Graceful shutdown (SIGTERM/SIGINT). Each step is bounded, so a stuck
@@ -858,7 +862,7 @@ pub async fn run_manager_with(
                 );
             }
         }
-        second = shutdown_signal() => {
+        second = shutdown_signals.recv() => {
             warn!(signal = second, "Second shutdown signal; exiting now");
             background.abort();
             return Ok(());
@@ -877,7 +881,7 @@ pub async fn run_manager_with(
                     );
                 }
             }
-            second = shutdown_signal() => {
+            second = shutdown_signals.recv() => {
                 warn!(signal = second, "Second shutdown signal; exiting now");
                 background.abort();
                 return Ok(());
@@ -939,34 +943,65 @@ const IN_PROCESS_WORKER_STOP_TIMEOUT: Duration = Duration::from_secs(120);
 /// this stays under Kubernetes' default 30s termination grace period.
 const SHUTDOWN_PERSISTENCE_TIMEOUT: Duration = Duration::from_secs(15);
 
-/// Resolves with the signal's name on SIGTERM or SIGINT (Ctrl-C).
-async fn shutdown_signal() -> &'static str {
-    let ctrl_c = async {
-        if let Err(err) = tokio::signal::ctrl_c().await {
-            // Without a handler this arm must never fire; SIGTERM still works.
-            warn!(error = ?err, "Failed installing the SIGINT handler");
-            std::future::pending::<()>().await;
-        }
-    };
+/// The manager's SIGTERM and SIGINT (Ctrl-C) handlers. Registering one
+/// replaces the signal's default action (exit), so they are registered
+/// before anything can observe the manager serving.
+struct ShutdownSignals {
     #[cfg(unix)]
-    {
-        use tokio::signal::unix::{signal, SignalKind};
-        match signal(SignalKind::terminate()) {
-            Ok(mut term) => tokio::select! {
-                _ = term.recv() => "SIGTERM",
-                _ = ctrl_c => "SIGINT",
-            },
-            Err(err) => {
-                warn!(error = ?err, "Failed installing the SIGTERM handler");
-                ctrl_c.await;
-                "SIGINT"
+    term: Option<tokio::signal::unix::Signal>,
+    #[cfg(unix)]
+    interrupt: Option<tokio::signal::unix::Signal>,
+}
+
+impl ShutdownSignals {
+    fn register() -> Self {
+        #[cfg(unix)]
+        {
+            use tokio::signal::unix::{signal, SignalKind};
+            let register = |kind: SignalKind, name: &str| match signal(kind) {
+                Ok(handler) => Some(handler),
+                Err(err) => {
+                    warn!(error = ?err, "Failed installing the {name} handler");
+                    None
+                }
+            };
+            Self {
+                term: register(SignalKind::terminate(), "SIGTERM"),
+                interrupt: register(SignalKind::interrupt(), "SIGINT"),
             }
         }
+        #[cfg(not(unix))]
+        {
+            Self {}
+        }
     }
-    #[cfg(not(unix))]
-    {
-        ctrl_c.await;
-        "SIGINT"
+
+    /// Resolves with the signal's name on the next SIGTERM or SIGINT. A
+    /// handler that failed to install never fires; the other still works.
+    async fn recv(&mut self) -> &'static str {
+        #[cfg(unix)]
+        {
+            async fn next(handler: &mut Option<tokio::signal::unix::Signal>) {
+                match handler {
+                    Some(handler) => {
+                        handler.recv().await;
+                    }
+                    None => std::future::pending().await,
+                }
+            }
+            tokio::select! {
+                _ = next(&mut self.term) => "SIGTERM",
+                _ = next(&mut self.interrupt) => "SIGINT",
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            if let Err(err) = tokio::signal::ctrl_c().await {
+                warn!(error = ?err, "Failed installing the SIGINT handler");
+                std::future::pending::<()>().await;
+            }
+            "SIGINT"
+        }
     }
 }
 

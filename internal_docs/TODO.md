@@ -6224,6 +6224,13 @@ Found on the live AWS rig (3 raft managers, 2 workers).
       other fleets** (2026-10-19): the fleet tests in
       `tests/worker_simulation.rs` take turns, because launching a fleet
       resets the process-global `legion_worker_simulated_nodes` gauge.
+- [x] **A SIGTERM during manager startup no longer kills the manager**
+      (2026-10-19). The SIGTERM/SIGINT handlers were registered only once
+      startup finished, after the gRPC listener bound, so a signal sent once
+      the port answered took the default action (exit 143). Seen as a
+      `manager_exits_cleanly_on_sigterm_test` failure on CI; a tight
+      connect-then-signal loop failed 15 of 20 runs before the fix and none
+      after.
 - [x] **`a_task_that_ignores_its_stop_signal_is_killed_at_the_deadline` waits
       for its trap** before stopping the task (found fixed 2026-10-19: the
       shell writes a marker once `trap '' TERM` is in place, so a signal can
