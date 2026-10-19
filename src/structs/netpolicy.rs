@@ -332,9 +332,8 @@ pub struct ChainConfig {
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct RuleConfig {
-    /// Written `when` (`match` is a Nickel keyword; it is still accepted as
-    /// an alias for JSON callers).
-    #[serde(rename = "when", alias = "match", default)]
+    /// Written `when` (`match` is a Nickel keyword).
+    #[serde(rename = "when", default)]
     pub matcher: RuleMatch,
     /// `allow` or `deny`.
     pub action: String,
@@ -1021,9 +1020,6 @@ pub enum Verdict {
 }
 
 impl Verdict {
-    pub fn is_allow(&self) -> bool {
-        matches!(self, Verdict::Allow)
-    }
     pub fn as_str(&self) -> &'static str {
         match self {
             Verdict::Allow => "allow",
@@ -1618,9 +1614,9 @@ mod tests {
             "protocol": "http",
             "policy": "deny",
             "rules": [
-                { "match": { "host": "*.pypi.org" }, "action": "allow" },
-                { "match": { "host": "api.github.com", "path": "/repos/**" }, "action": "allow" },
-                { "match": { "cidr": "10.0.0.0/8" }, "action": "deny", "reason": "internal" }
+                { "when": { "host": "*.pypi.org" }, "action": "allow" },
+                { "when": { "host": "api.github.com", "path": "/repos/**" }, "action": "allow" },
+                { "when": { "cidr": "10.0.0.0/8" }, "action": "deny", "reason": "internal" }
             ]
         }));
         let allow = evaluate_connect(
@@ -1667,8 +1663,8 @@ mod tests {
             "protocol": "http",
             "policy": "deny",
             "rules": [
-                { "match": { "header": { "Authorization": "*" } }, "action": "deny", "reason": "no creds" },
-                { "match": { "host": "api.github.com", "path": "/repos/**", "method": ["get"] }, "action": "allow" }
+                { "when": { "header": { "Authorization": "*" } }, "action": "deny", "reason": "no creds" },
+                { "when": { "host": "api.github.com", "path": "/repos/**", "method": ["get"] }, "action": "allow" }
             ]
         }));
         let headers = vec![("authorization".to_string(), "Bearer x".to_string())];
@@ -1727,7 +1723,7 @@ mod tests {
             "org",
             "require",
             10,
-            json!({ "rules": [{ "match": { "host": "bad.example" }, "action": "deny" }] }),
+            json!({ "rules": [{ "when": { "host": "bad.example" }, "action": "deny" }] }),
         );
         let req_high = policy(
             "sec",

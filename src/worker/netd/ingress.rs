@@ -754,8 +754,8 @@ mod tests {
         let effective = policy(json!({
             "protocol": "http", "policy": "deny",
             "rules": [
-                { "match": { "path": "/admin/**" }, "action": "deny", "reason": "not externally reachable" },
-                { "match": { "cidr": "127.0.0.0/8", "path": "/public/**" }, "action": "allow" }
+                { "when": { "path": "/admin/**" }, "action": "deny", "reason": "not externally reachable" },
+                { "when": { "cidr": "127.0.0.0/8", "path": "/public/**" }, "action": "allow" }
             ]
         }));
         let hash = effective.hash.clone();
@@ -1308,7 +1308,7 @@ mod tests {
                     43,
                     json!({
                         "protocol": "http", "policy": "deny",
-                        "rules": [{ "match": { "path": "/public/**" }, "action": "allow" }]
+                        "rules": [{ "when": { "path": "/public/**" }, "action": "allow" }]
                     }),
                 ),
             ],

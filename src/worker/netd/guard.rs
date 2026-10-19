@@ -129,15 +129,6 @@ pub async fn dial_guarded(
         .map_err(|err| err.to_string())
 }
 
-/// `host:port` text for an address list, for denial records.
-pub fn display_addrs(addrs: &[SocketAddr]) -> String {
-    addrs
-        .iter()
-        .map(SocketAddr::to_string)
-        .collect::<Vec<_>>()
-        .join(",")
-}
-
 #[cfg(test)]
 pub mod test_support {
     //! A resolver tests program by name, and that counts its calls.

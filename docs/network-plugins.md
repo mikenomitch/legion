@@ -506,7 +506,7 @@ most: it runs a callback per body chunk and sends the body chunked.
 ## CLI and MCP
 
 ```bash
-legion net plugin new <name> [--lang rust] [--dir <dir>]        # scaffold a crate and its object file
+legion net plugin new <name> [--dir <dir>]                      # scaffold a Rust crate and its object file
 legion net plugin test <module.wasm|name> --request 'METHOD URL' \
     [--header k=v] [--body <text|@file>] [--label k=v] [--job <id>] \
     [--config <json|@file>] [--object <file.ncl>] [--stages s1,s2] \

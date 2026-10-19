@@ -1079,7 +1079,7 @@ pub fn catalog() -> Vec<Capability> {
         },
         Capability {
             name: "net.plugin.new",
-            cli: "legion net plugin new <NAME> [--lang rust] [--dir <DIR>]",
+            cli: "legion net plugin new <NAME> [--dir <DIR>]",
             grpc: None,
             summary: "Scaffold a WASM network plugin crate (proxy-wasm Rust SDK) and its object \
                  file. Local only.",

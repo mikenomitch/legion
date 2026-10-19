@@ -2155,9 +2155,9 @@ mod integration {
                 "protocol": "http",
                 "policy": "deny",
                 "rules": [
-                    { "match": { "path": "/ok/**" }, "action": "allow" },
-                    { "match": { "path": "/flaky" }, "action": "allow" },
-                    { "match": { "path": "/secret" }, "action": "deny", "reason": "not for you" }
+                    { "when": { "path": "/ok/**" }, "action": "allow" },
+                    { "when": { "path": "/flaky" }, "action": "allow" },
+                    { "when": { "path": "/secret" }, "action": "deny", "reason": "not for you" }
                 ]
             }
         }))

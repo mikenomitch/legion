@@ -8,10 +8,10 @@
 //!    itself declares for that ref (its ports' `tls`, as placed, or its
 //!    task's `connect` block), after checking the allocation is placed on
 //!    the calling node. A ref nothing on the node declares gets an error.
-//! 2. **The provider.** One [`MaterialProvider`] per kind of source reads the
-//!    value: `kv`, `identity`, and `policy` (a body by content hash). A new
-//!    secret store is one provider plus one `Source` variant, with no new RPC
-//!    and no netd change.
+//! 2. **The read.** One `match` in [`ManagerDaemonService::read_declared`]
+//!    reads the value: `kv`, `identity`, a policy body by content hash, and a
+//!    plugin object. A new secret store is one arm there plus one `Source`
+//!    variant, with no new RPC and no netd change.
 //!
 //! Values are secrets: they are never logged, only their sources.
 
@@ -46,129 +46,6 @@ pub(crate) struct ProviderInput<'a> {
     pub name: &'a str,
     /// The version the node holds (0 for none).
     pub have_version: i64,
-}
-
-/// Reads one kind of source for the manager.
-pub(crate) trait MaterialProvider: Sync {
-    /// The source kind this provider reads, as the jobspec names it (`kv`,
-    /// `identity`), or `policy` for content-addressed policy bodies.
-    fn name(&self) -> &'static str;
-
-    fn read(&self, service: &ManagerDaemonService, input: &ProviderInput<'_>) -> ProviderRead;
-}
-
-/// Every provider. A `Source` kind the node fetches (not `file`) must have
-/// one here; `providers_cover_every_fetched_source_test` checks it.
-pub(crate) const PROVIDERS: &[&dyn MaterialProvider] = &[
-    &KvProvider,
-    &IdentityProvider,
-    &PolicyProvider,
-    &PluginProvider,
-];
-
-pub(crate) fn provider(name: &str) -> Option<&'static dyn MaterialProvider> {
-    PROVIDERS.iter().copied().find(|p| p.name() == name)
-}
-
-fn source_provider_name(source: &Source) -> &'static str {
-    match source.kind() {
-        SourceKind::Kv => "kv",
-        SourceKind::Identity => "identity",
-        SourceKind::File => "file",
-    }
-}
-
-/// `kv`: a KV entry, versioned by its KV version.
-pub(crate) struct KvProvider;
-
-impl MaterialProvider for KvProvider {
-    fn name(&self) -> &'static str {
-        "kv"
-    }
-
-    fn read(&self, service: &ManagerDaemonService, input: &ProviderInput<'_>) -> ProviderRead {
-        let path = input.name;
-        match service.store.get_kv(path) {
-            Ok(Some(entry)) if entry.version == input.have_version => ProviderRead::Unchanged {
-                version: entry.version,
-            },
-            Ok(Some(entry)) => ProviderRead::Value {
-                value: entry.value,
-                version: entry.version,
-            },
-            Ok(None) => ProviderRead::Absent(format!("kv {path} not found")),
-            Err(err) => {
-                warn!(kv_path = %path, error = ?err, "Failed reading datapath material from KV");
-                ProviderRead::Failed(format!("kv {path} could not be read"))
-            }
-        }
-    }
-}
-
-/// `identity`: the allocation's task identity of that name, minted exactly
-/// as `IssueWorkloadIdentityToken` would. The version is the token's expiry
-/// in unix seconds; the token the node holds stays until less than half the
-/// identity's TTL remains, so a steady node mints about twice per TTL.
-pub(crate) struct IdentityProvider;
-
-impl MaterialProvider for IdentityProvider {
-    fn name(&self) -> &'static str {
-        "identity"
-    }
-
-    fn read(&self, service: &ManagerDaemonService, input: &ProviderInput<'_>) -> ProviderRead {
-        service.mint_material_identity(input)
-    }
-}
-
-/// `policy`: a merged policy body by its content hash, as JSON. A hash names
-/// its body forever, so a body is never `Unchanged`; the node only asks for
-/// hashes it holds no body for.
-pub(crate) struct PolicyProvider;
-
-impl MaterialProvider for PolicyProvider {
-    fn name(&self) -> &'static str {
-        "policy"
-    }
-
-    fn read(&self, service: &ManagerDaemonService, input: &ProviderInput<'_>) -> ProviderRead {
-        match service.cached_policy(input.name) {
-            Some(policy) => ProviderRead::Value {
-                value: serde_json::to_string(&policy).unwrap_or_default(),
-                version: 0,
-            },
-            None => ProviderRead::Absent(format!("no policy body for hash {}", input.name)),
-        }
-    }
-}
-
-/// `plugin`: a network plugin object by name, as JSON, versioned by its
-/// revision.
-pub(crate) struct PluginProvider;
-
-impl MaterialProvider for PluginProvider {
-    fn name(&self) -> &'static str {
-        "plugin"
-    }
-
-    fn read(&self, service: &ManagerDaemonService, input: &ProviderInput<'_>) -> ProviderRead {
-        match service.store.get_net_plugin(input.name) {
-            Ok(Some(record)) if record.revision as i64 == input.have_version => {
-                ProviderRead::Unchanged {
-                    version: record.revision as i64,
-                }
-            }
-            Ok(Some(record)) => ProviderRead::Value {
-                value: serde_json::to_string(&record.object).unwrap_or_default(),
-                version: record.revision as i64,
-            },
-            Ok(None) => ProviderRead::Absent(format!("no net plugin named {}", input.name)),
-            Err(err) => {
-                warn!(plugin = %input.name, error = ?err, "Failed reading a net plugin for a node");
-                ProviderRead::Failed(format!("net plugin {} could not be read", input.name))
-            }
-        }
-    }
 }
 
 /// How a resolved value is checked before it goes on the wire.
@@ -352,14 +229,14 @@ impl ManagerDaemonService {
                 return out;
             }
         };
-        let (provider_name, name, check) = match &declared {
+        let (name, check) = match &declared {
             Declared::Policy(hash) => {
                 out.source = format!("policy {hash}");
-                ("policy", hash.clone(), ValueCheck::Raw)
+                (hash.clone(), ValueCheck::Raw)
             }
-            Declared::Plugin(name) => {
-                out.source = format!("net plugin {name}");
-                ("plugin", name.clone(), ValueCheck::Raw)
+            Declared::Plugin(record) => {
+                out.source = format!("net plugin {}", record.object.name);
+                (record.object.name.clone(), ValueCheck::Raw)
             }
             Declared::Source(source, check) => {
                 out.source = source.to_string();
@@ -367,22 +244,15 @@ impl ManagerDaemonService {
                     .kv_path()
                     .or(source.identity_name())
                     .unwrap_or_default();
-                (source_provider_name(source), name.to_string(), *check)
+                (name.to_string(), *check)
             }
-        };
-        let Some(provider) = provider(provider_name) else {
-            out.error = format!(
-                "{} is read by the node, not fetched from the manager",
-                out.source
-            );
-            return out;
         };
         let input = ProviderInput {
             allocation_id: wanted.allocation_id,
             name: &name,
             have_version: wanted.version,
         };
-        let mut read = provider.read(self, &input);
+        let mut read = self.read_declared(&declared, &input);
         // A policy cache miss after a failover or restart: recompute from the
         // node's desired set, which is what produced the hash, and retry.
         if matches!(declared, Declared::Policy(_))
@@ -390,7 +260,7 @@ impl ManagerDaemonService {
             && view.loaded.is_none()
         {
             let _ = view.declarations();
-            read = provider.read(self, &input);
+            read = self.read_declared(&declared, &input);
         }
         let label = out.source.clone();
         fill(&mut out, read, |value| check.apply(&label, value));
@@ -537,7 +407,7 @@ impl ManagerDaemonService {
                     )));
                 }
                 if wanted.kind == MATERIAL_PLUGIN {
-                    return Ok(Declared::Plugin(name.to_string()));
+                    return Ok(Declared::Plugin(record));
                 }
                 let credential = wanted.part.trim();
                 let source = record
@@ -560,6 +430,59 @@ impl ManagerDaemonService {
                 ),
                 absent: false,
             }),
+        }
+    }
+
+    /// Reads one declared material: a KV entry (versioned by its KV
+    /// version), a minted identity token (versioned by its expiry), a
+    /// policy body by content hash (a hash names its body forever, so it is
+    /// never `Unchanged`), or a plugin object (versioned by its revision).
+    /// A `file` source is read by the node itself.
+    fn read_declared(&self, declared: &Declared, input: &ProviderInput<'_>) -> ProviderRead {
+        match declared {
+            Declared::Policy(hash) => match self.cached_policy(hash) {
+                Some(policy) => ProviderRead::Value {
+                    value: serde_json::to_string(&policy).unwrap_or_default(),
+                    version: 0,
+                },
+                None => ProviderRead::Absent(format!("no policy body for hash {hash}")),
+            },
+            Declared::Plugin(record) => {
+                let version = record.revision as i64;
+                if version == input.have_version {
+                    ProviderRead::Unchanged { version }
+                } else {
+                    ProviderRead::Value {
+                        value: serde_json::to_string(&record.object).unwrap_or_default(),
+                        version,
+                    }
+                }
+            }
+            Declared::Source(source, _) => match source.kind() {
+                SourceKind::Kv => {
+                    let path = input.name;
+                    match self.store.get_kv(path) {
+                        Ok(Some(entry)) if entry.version == input.have_version => {
+                            ProviderRead::Unchanged {
+                                version: entry.version,
+                            }
+                        }
+                        Ok(Some(entry)) => ProviderRead::Value {
+                            value: entry.value,
+                            version: entry.version,
+                        },
+                        Ok(None) => ProviderRead::Absent(format!("kv {path} not found")),
+                        Err(err) => {
+                            warn!(kv_path = %path, error = ?err, "Failed reading datapath material from KV");
+                            ProviderRead::Failed(format!("kv {path} could not be read"))
+                        }
+                    }
+                }
+                SourceKind::Identity => self.mint_material_identity(input),
+                SourceKind::File => ProviderRead::Failed(format!(
+                    "{source} is read by the node, not fetched from the manager"
+                )),
+            },
         }
     }
 
@@ -681,7 +604,7 @@ impl ManagerDaemonService {
 /// What a ref's declaration names.
 enum Declared {
     Policy(String),
-    Plugin(String),
+    Plugin(crate::storage::netplugin_store::NetPluginRecord),
     Source(Source, ValueCheck),
 }
 
@@ -714,28 +637,6 @@ fn fill(
 #[cfg(test)]
 mod material_rpcs_test {
     use super::*;
-
-    #[test]
-    fn providers_cover_every_fetched_source_test() {
-        let mut names: Vec<_> = PROVIDERS.iter().map(|p| p.name()).collect();
-        names.sort_unstable();
-        let before = names.len();
-        names.dedup();
-        assert_eq!(before, names.len(), "two providers share a name");
-        for source in [
-            Source::Kv("a".into()),
-            Source::Identity("a".into()),
-            Source::File(crate::structs::source::FileSource::Path("/a".into())),
-        ] {
-            let has = provider(source_provider_name(&source)).is_some();
-            assert_eq!(
-                has,
-                source.is_fetched(),
-                "{source}: a fetched source needs a provider, and a file source must not have one"
-            );
-        }
-        assert!(provider("policy").is_some());
-    }
 
     #[test]
     fn header_values_are_checked_test() {

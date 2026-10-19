@@ -100,11 +100,6 @@ pub struct HandlerEntry {
 }
 
 impl HandlerEntry {
-    /// Whether the kind can do anything on a path that does not parse HTTP.
-    pub fn runs_on_l4(&self) -> bool {
-        self.stages.contains(&Stage::Connect)
-    }
-
     /// Whether every stage it acts at needs HTTP.
     pub fn needs_http(&self) -> bool {
         self.stages.iter().all(|stage| stage.needs_http())

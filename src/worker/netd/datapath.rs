@@ -287,11 +287,6 @@ impl Netd {
         self.forwarder.context().kernel_guard_active()
     }
 
-    /// Whether the node holds a mesh certificate.
-    pub fn has_mesh_identity(&self) -> bool {
-        self.forwarder.context().mesh_identity().is_some()
-    }
-
     /// Save the datapath's inputs when they differ from the last save. Off
     /// the heartbeat path (a blocking task), owner-only, atomic. Secrets —
     /// credentials, KV-held certificates, the mesh key — are never saved.

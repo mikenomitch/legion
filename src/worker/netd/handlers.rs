@@ -427,50 +427,9 @@ impl Pipeline {
         HopOutcome::Allow
     }
 
-    /// Run the hops at `request`, with the request head in `facts`.
-    pub async fn run_request(
-        &self,
-        context: &Arc<ForwarderContext>,
-        facts: &HopFacts<'_>,
-    ) -> HopOutcome {
-        for hop in &self.hops {
-            match hop.on_request(context, facts).await {
-                HopOutcome::Allow => {}
-                decided => return decided,
-            }
-        }
-        HopOutcome::Allow
-    }
-
     /// Whether any hop reads the request body.
     pub fn reads_body(&self) -> bool {
         self.hops.iter().any(|hop| hop.body_cap().is_some())
-    }
-
-    /// The most any body-reading hop wants buffered.
-    pub fn body_cap(&self) -> u64 {
-        self.hops
-            .iter()
-            .filter_map(|hop| hop.body_cap())
-            .max()
-            .unwrap_or(DEFAULT_DLP_MAX_BYTES)
-    }
-
-    /// Run the body hops: `Some((source, reason))` to deny.
-    pub fn check_body(&self, body: &[u8]) -> Option<(String, String)> {
-        self.hops.iter().find_map(|hop| {
-            hop.on_body(body)
-                .map(|reason| (hop.source().to_string(), reason))
-        })
-    }
-
-    /// When the body could not be buffered (over the cap, or the client went
-    /// away): the first body hop that fails closed, which decides the denial.
-    pub fn body_unreadable_denied_by(&self) -> Option<String> {
-        self.hops
-            .iter()
-            .find(|hop| hop.body_cap().is_some() && !hop.fails_open())
-            .map(|hop| hop.source().to_string())
     }
 }
 
@@ -1266,28 +1225,45 @@ mod tests {
         );
     }
 
-    #[test]
-    fn body_hops_run_in_order_and_cap_the_buffer_test() {
-        let pipeline = chain_pipeline(vec![
+    #[tokio::test]
+    async fn body_hops_run_in_order_and_cap_the_buffer_test() {
+        let pipeline = Arc::new(chain_pipeline(vec![
             hop(json!({ "dlp": { "patterns": ["sk-[a-z]{4,}"], "maxBytes": 16 } })),
             hop(json!({ "dlp": { "patterns": ["AKIA"], "maxBytes": 64 }, "onError": "allow" })),
-        ]);
+        ]));
         assert!(pipeline.reads_body());
-        assert_eq!(pipeline.body_cap(), 64);
-        assert_eq!(pipeline.check_body(b"hello"), None);
-        assert_eq!(
-            pipeline.check_body(b"x sk-abcd").map(|(s, _)| s),
-            Some("policy/p#0".to_string())
-        );
+        let context = context();
+        let facts = HopFacts {
+            allocation_id: 1,
+            direction: "egress",
+            protocol: "http",
+            destination: "api.example:443",
+            ..Default::default()
+        };
+        let body = |text: &[u8]| {
+            let pipeline = pipeline.clone();
+            let context = context.clone();
+            let text = bytes::Bytes::copy_from_slice(text);
+            let facts = facts.clone();
+            async move {
+                let mut exchange = pipeline.exchange(&context, &facts);
+                assert_eq!(exchange.body_cap(), 64);
+                assert_eq!(
+                    exchange.body_unreadable_denied_by().as_deref(),
+                    Some("policy/p#0")
+                );
+                let mut text = text;
+                match exchange.body(&mut text).await {
+                    ExchangeOutcome::Continue => None,
+                    ExchangeOutcome::Deny { source, .. } => Some(source),
+                    other => panic!("{other:?}"),
+                }
+            }
+        };
+        assert_eq!(body(b"hello").await, None);
+        assert_eq!(body(b"x sk-abcd").await.as_deref(), Some("policy/p#0"));
         // Over the first hop's cap, which fails closed.
-        assert_eq!(
-            pipeline.check_body(&[b'a'; 32]).map(|(s, _)| s),
-            Some("policy/p#0".to_string())
-        );
-        assert_eq!(
-            pipeline.body_unreadable_denied_by().as_deref(),
-            Some("policy/p#0")
-        );
+        assert_eq!(body(&[b'a'; 32]).await.as_deref(), Some("policy/p#0"));
     }
 
     #[test]

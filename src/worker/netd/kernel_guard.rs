@@ -565,7 +565,7 @@ table inet legion_host_guard {
             { "metainfo": { "json_schema_version": 1 } },
             { "rule": { "family": "inet", "table": TABLE, "chain": "alloc_88213",
                 "comment": DROP_METADATA,
-                "expr": [ { "match": {} }, { "counter": { "packets": 3, "bytes": 180 } }, { "drop": null } ] } },
+                "expr": [ { "when": {} }, { "counter": { "packets": 3, "bytes": 180 } }, { "drop": null } ] } },
             { "rule": { "family": "inet", "table": TABLE, "chain": "alloc_88213",
                 "comment": DROP_METADATA,
                 "expr": [ { "counter": { "packets": 1, "bytes": 80 } } ] } },

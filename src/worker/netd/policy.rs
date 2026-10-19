@@ -9,10 +9,7 @@
 //! allocation the reply no longer lists loses its policy on that reply.
 
 use crate::prelude::*;
-use crate::structs::netpolicy::{
-    evaluate_connect, evaluate_request, ConnectFacts, EffectiveChain, EffectivePolicy,
-    RequestFacts, Verdict,
-};
+use crate::structs::netpolicy::{evaluate_connect, ConnectFacts, EffectivePolicy, Verdict};
 use crate::structs::{AllocNetPolicy, NetDenial};
 
 use std::collections::{BTreeMap, HashSet};
@@ -240,11 +237,6 @@ pub fn ingress_connect_verdict(
         Some(chain) => evaluate_connect(chain, facts),
         None => Verdict::Allow,
     }
-}
-
-/// Evaluate an HTTP request head against a chain.
-pub fn request_verdict(chain: &EffectiveChain, facts: &RequestFacts<'_>) -> Verdict {
-    evaluate_request(chain, facts)
 }
 
 /// Key a denial folds under.

@@ -57,17 +57,6 @@ pub mod metric {
     pub const HISTOGRAM: i32 = 2;
 }
 
-/// `LogLevel`, as `tracing` sees it.
-pub fn log_level(level: i32) -> tracing::Level {
-    match level {
-        0 => tracing::Level::TRACE,
-        1 => tracing::Level::DEBUG,
-        2 => tracing::Level::INFO,
-        3 => tracing::Level::WARN,
-        _ => tracing::Level::ERROR,
-    }
-}
-
 pub fn log_level_name(level: i32) -> &'static str {
     match level {
         0 => "trace",

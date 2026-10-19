@@ -671,10 +671,6 @@ impl PortTls {
         }
         Ok(())
     }
-
-    pub fn is_mutual(&self) -> bool {
-        self.clients.is_some()
-    }
 }
 
 /// `service.port` accepts either a named `network.ports` label, a literal port

@@ -41,7 +41,7 @@ use hyper_util::rt::TokioIo;
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::time::Duration;
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::task::JoinHandle;
 
@@ -1474,6 +1474,7 @@ impl SpliceStream for TokioIo<hyper::upgrade::Upgraded> {}
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::io::AsyncReadExt;
     use crate::structs::netpolicy::{merge_policies, InlinePolicy, NetPolicyObject};
     use crate::structs::AllocNetPolicy;
     use crate::worker::netd::{Denials, NetPolicyCache};

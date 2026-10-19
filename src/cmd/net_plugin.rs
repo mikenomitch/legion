@@ -30,15 +30,8 @@ pub fn config() -> Command {
         .subcommand_required(true)
         .subcommand(
             Command::new("new")
-                .about("Scaffold a plugin crate and its object file")
+                .about("Scaffold a plugin crate (the proxy-wasm Rust SDK) and its object file")
                 .arg(Arg::new("name").required(true).help("Plugin name"))
-                .arg(
-                    Arg::new("lang")
-                        .long("lang")
-                        .default_value("rust")
-                        .value_parser(["rust"])
-                        .help("Plugin language (the proxy-wasm Rust SDK)"),
-                )
                 .arg(
                     Arg::new("dir")
                         .long("dir")
