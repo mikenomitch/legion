@@ -98,7 +98,9 @@ When one is required and what goes in it:
 | [adaptive-scheduler-concurrency-plan.md](plans/adaptive-scheduler-concurrency-plan.md) | in execution (phases 1–3 shipped 2026-08-04, default `observe`); its motivating "4 beats 16" measurement was retracted the next day ([aws-phase4-findings.md](aws-phase4-findings.md)), so phase 0 now has to find a conflict-bound cell before phase 4's default flip can be argued |
 | [artifact-system-plan.md](plans/artifact-system-plan.md) | shipped |
 | [artifact-cache-and-prewarm-plan.md](plans/artifact-cache-and-prewarm-plan.md) | in execution (Phase 1 partly shipped as the node content store, Phase 3 partly as suspend plan Phase 7a) |
-| [autoscaler-plan.md](plans/autoscaler-plan.md) | planned |
+| [autoscaler-plan.md](plans/autoscaler-plan.md) | **superseded** by autoscaler-v2-plan; its Phase 1 (`legion job scale`, count overrides) shipped 2026-07-30 and is v2's Phase 0 |
+| [autoscaler-v2-plan.md](plans/autoscaler-v2-plan.md) | planned (2026-10-19): the autoscaler as a Legion app; `autoscale = true` defaults, a self-reporting safeguard pipeline, JSON-RPC source/strategy/target plugins, cluster-wide usage rollups, node groups from simulated pending demand, sharded replicas. Service wake from zero, keyed/`count.per` scaling, vertical and predictive scaling deferred |
+| [legion-apps-plan.md](plans/legion-apps-plan.md) | planned (2026-10-19): the substrate for ecosystem apps (autoscaler, GitOps): the `legion-system` namespace, node-side namespace restrictions, a default-on system worker in each manager, jobspec-declared permissions granted up to the submitter's, a per-allocation API socket, app manifests and lifecycle, and declarative UI extensions (sandboxed pages second). Registry installs and tenant apps deferred |
 | [auth-acl-plan.md](plans/auth-acl-plan.md) | phases 1–4 executed |
 | [container-runtime-exec-and-signals-plan.md](plans/container-runtime-exec-and-signals-plan.md) | shipped (all seven phases, 2026-07-31) |
 | [exec-and-actions-plan.md](plans/exec-and-actions-plan.md) | shipped (all five phases) |
@@ -206,6 +208,8 @@ by project impact. The full template and a worked example:
 - [artifact-system-plan_calls.md](calls/artifact-system-plan_calls.md)
 - [artifact-cache-and-prewarm-plan_calls.md](calls/artifact-cache-and-prewarm-plan_calls.md)
 - [autoscaler-plan_calls.md](calls/autoscaler-plan_calls.md)
+- [autoscaler-v2-plan_calls.md](calls/autoscaler-v2-plan_calls.md)
+- [legion-apps-plan_calls.md](calls/legion-apps-plan_calls.md)
 - [auth-acl-plan_calls.md](calls/auth-acl-plan_calls.md)
 - [aws-comparative-benchmark-plan_calls.md](calls/aws-comparative-benchmark-plan_calls.md)
 - [bounded-candidate-scoring-plan_calls.md](calls/bounded-candidate-scoring-plan_calls.md)

@@ -1251,8 +1251,12 @@ How to use it:
           same way it caps scheduling. Fix it once, under "Make plan-commit
           cost flat in fleet size" in Scheduling & placement, and make the
           load test show how much of ratify latency is commit time.
-- [ ] Worker groups + taint/toleration equivalent. Node pools exist as an ACL
-      and config concept but nothing scheduling-side consumes them.
+- [ ] Worker groups + taint/toleration equivalent. Pools already act as
+      taints: a node's pool must be matched by the task's `permit`, with an
+      implicit `pool=default` (`src/constraints.rs:114-175`). What's missing
+      is a soft (prefer-not) form, and a restriction the job can't opt into
+      itself. The node-side `namespaces` restriction is
+      [legion-apps](plans/legion-apps-plan.md) A1.
 - [ ] Preemption follow-ups — the feature shipped
       ([plan](plans/preemption-and-eviction-plan.md) ·
       [docs](../docs/preemption-and-eviction.md)); these are what it left open.
@@ -3628,8 +3632,8 @@ worker:
       `legion_net_doctor` walk policy → mode → per-allocation node status
       (`NetAllocStatus` on the heartbeat; shown under **Datapath** in the
       UI's task Network section). Not done: the autoscaler's wake-on-request
-      hook (the listener exists; the scale-from-zero signal is the
-      autoscaler plan's), PROXY protocol v2 to the task (M7), persisting the
+      hook (the listener exists; autoscaler-v2 §6.12 reserves the
+      `ScaleTask` source `wake` for the gateway once it routes to services), PROXY protocol v2 to the task (M7), persisting the
       drain/grace sets across a worker restart (a restart mid-window
       signals at restore, as grace already did).
 - [x] Phase 6 / M7 — external handlers and mTLS (2026-09-02): `authz`
@@ -3792,6 +3796,12 @@ Datapath performance). Deferred, by name:
 
 Plans: [persistence-plan.md](plans/persistence-plan.md), [multi-raft-persistence-plan.md](plans/multi-raft-persistence-plan.md), [manager-workload-identity-plan.md](plans/manager-workload-identity-plan.md) · docs: [state-store.md](../docs/state-store.md), [raft-operations.md](../docs/raft-operations.md), [persistence-streaming.md](../docs/persistence-streaming.md)
 
+- [ ] **Nodes can't be removed, and lost nodes are never garbage-collected.**
+      `Store::remove_node` (`src/storage/store.rs:7940`) has no RPC or CLI
+      caller, and `mark_nodes_as_lost` leaves rows forever. `ForgetNode` /
+      `legion node forget` land with autoscaler-v2 Phase 5 (node scale-in
+      needs them). A `node.gcAfter` option for lost nodes (lean: default off)
+      is separate ([autoscaler-v2-plan.md](plans/autoscaler-v2-plan.md) §11).
 - [ ] **A manager with no raft leader holds a read instead of failing it.**
       In the AWS spot check, with the leader's raft core dead, `legion job
       list` hung with no reply. The CLI now gives up at its 30s request
@@ -4043,7 +4053,8 @@ Plans: [persistence-plan.md](plans/persistence-plan.md), [multi-raft-persistence
 - [ ] **Sysbatch** — run once on every node
 - [ ] **System job** — N per X (1 per metal, 2 per region, …). Is this really a
       job type, or just a richer `count`? (`count: {num: 1, per: "id"}`
-      approximates it today but does not converge newly joined nodes.)
+      approximates it today, and the capacity pass converges newly joined
+      nodes onto it: `docs/jobs-tasks-and-scheduling.md` § Node Added.)
 
 ## KV & secrets
 
@@ -4217,9 +4228,11 @@ docs: [observability.md](../docs/observability.md), [logging.md](../docs/logging
       under backpressure leaves no trace. Expose `tracing-appender`'s
       dropped-line count as a metric, or log a summary line when lines were
       dropped ([calls #3](calls/sandbox-boot-throughput-plan_calls.md)).
-- [ ] Worker per-task runtime metrics (CPU/memory usage per allocation) —
-      also wanted by autoscaler phase 2, which collects usage via
-      heartbeats; build together.
+- [ ] Worker per-task runtime metrics (CPU/memory usage per allocation).
+      Per-allocation sampling now exists (`UsageReport` on the heartbeat,
+      [resource-enforcement.md](../docs/resource-enforcement.md#measuring-usage)).
+      The cluster-wide per-task view is
+      [autoscaler-v2](plans/autoscaler-v2-plan.md) Phase 1; build them together.
 
 ## Templates, registry & packaging
 
@@ -4244,12 +4257,44 @@ The Pack/Helm equivalent. Job templates are in flight on
 
 ## Ecosystem apps (the omakase experience)
 
-Each of these should run inside the core binary *and* be splittable into its own
-job, so day 1 is simple and day N is performant. Each needs its own plan.
+Each of these runs as a **Legion app**: an ordinary job in the reserved
+`legion-system` namespace, hosted by default on the managers' system workers,
+with permissions it declares and UI it registers. Bundled apps ship in the
+binary, so day 1 needs no setup, and moving one to workers or giving it more
+replicas is one command on day N. The shared substrate is
+[legion-apps-plan.md](plans/legion-apps-plan.md); each app still needs its own
+plan.
 
-- [ ] **Autoscaler** — [plan](plans/autoscaler-plan.md) (IN EXECUTION) ·
-      [calls](calls/autoscaler-plan_calls.md)
-  - [x] Phase 1 — `legion job scale` (2026-07-30,
+- [ ] **Legion apps substrate**: [plan](plans/legion-apps-plan.md) (PLANNED) ·
+      [calls](calls/legion-apps-plan_calls.md)
+  - [ ] A1: the `legion-system` namespace (bootstrapped, `*` globs skip
+        reserved `legion-*` namespaces), node-side `namespaces` restriction on
+        worker types (scheduler filter + blocked-eval wake), and a default-on
+        system worker in each manager (capped lend, pool `legion-system`,
+        `legion.role = manager`), with `--run-worker` reshaped as
+        `namespaces = ["*"]`
+  - [ ] A2: `identities[].permissions` / `policies` on the `legion` identity,
+        granted at submit only up to what the submitter holds; per-version
+        grants with `legion acl grants list|revoke`; a per-allocation API
+        socket (`LEGION_ADDR=unix://…`) proxied by the worker with the
+        allocation's identity; rewrite `configs/jobs/cert-renewer.ncl` on it
+  - [ ] A3: app manifests and records, the Control-leader reconciler,
+        `legion:self` for bundled apps, seeding, `legion app
+        list|status|install|upgrade|config|set|enable|disable|uninstall`
+  - [ ] A4: UI tier 1, declarative views in `nav`/`overview`/`job`/`task`/`node`
+        slots, served by `GetAppView`/`InvokeAppAction` (authorized as the
+        viewer, forwarded with a signed viewer assertion), plus
+        `legion app view` and `legion_app_view`
+  - [ ] A5: UI tier 2, sandboxed single-file pages with a postMessage bridge
+        (RPC allowlist, viewer identity, strict CSP)
+  - [ ] A6: install apps from the registry (waits on the registry plan)
+
+- [ ] **Autoscaler**: [plan](plans/autoscaler-v2-plan.md) (PLANNED) ·
+      [calls](calls/autoscaler-v2-plan_calls.md). Supersedes
+      [autoscaler-plan.md](plans/autoscaler-plan.md) ·
+      [calls](calls/autoscaler-plan_calls.md), whose Phase 1 shipped and is
+      v2's Phase 0.
+  - [x] Phase 0 (old plan's Phase 1): `legion job scale` (2026-07-30,
         [docs/autoscaling.md](../docs/autoscaling.md)): `task_scale` count
         overrides outside the job version (control-lane; see calls #5),
         effective counts in every desired-count reader (scheduler plans,
@@ -4266,18 +4311,40 @@ job, so day 1 is simple and day N is performant. Each needs its own plan.
         covers the deny side), and regenerating `ui/src/gen/legion_pb.ts`
         (no UI surface consumes the new RPCs yet; run the ui/README
         protoc command when the scaling panel is built).
-  - [ ] Phase 2 — per-allocation CPU/memory usage collection (heartbeat →
-        `allocation_health`), request-vs-usage in CLI/UI
-  - [ ] Phase 3 — task autoscaler MVP: `scaling { min, max, target }` block,
-        in-manager leader-gated evaluator, damping, scale-status surface
-  - [ ] Phase 4 — full `checks` form, Prometheus source, `per-replica`
-        strategy, activation-gated `min: 0`, `headroom`
-  - [ ] Phase 5 — escape-to-job: `legion autoscaler agent`, control-plane
-        identity policy, KV-lock leadership, `LEGION_MANAGER_ADDR` injection
-  - [ ] Phase 6 — node autoscaling: placement-shortfall signal, node groups,
-        exec-ABI providers, drain-based scale-in, `ForgetNode` RPC
-  - [ ] Phase 7 — dylib `metrics`/`strategies` plugin kinds, `ui.link` Apps
-        sidebar section
+  - [ ] Phase 1: cluster-wide scaling inputs. Per-target usage and edge
+        rollups on the liveness digest, merged by the status-lane leader,
+        `GetScalingInputs`, request-vs-usage in `legion job info` and the job
+        page. Usage is sampled per allocation today, but it lives only on the
+        manager that received the heartbeat.
+  - [ ] Phase 2: task autoscaling MVP as the bundled app (needs apps A1–A3).
+        `autoscale = true` and its expansion in `job plan`, the safeguard
+        pipeline, compare-and-set `ScaleTask`, `scale_history`, pins
+        (`job scale --for/--min/--max/--release`), `legion scaling
+        status|explain|history|pause|resume`, `dry-run`, events, MCP read tools
+  - [ ] Phase 3: full policies. `checks`, `prometheus`/`http` sources, the
+        `per-replica`/`threshold`/`pass-through`/`fixed` strategies,
+        schedules, `headroom`, activation-gated `min = 0`, `legion scaling
+        simulate`
+  - [ ] Phase 4: external plugins (JSON-RPC over stdio or HTTP) installed
+        through app config, the `exec`/`noop` targets, `legion scaling plugin
+        test`, the SDK and example plugins, and standalone `ScalingPolicy`
+        objects for external targets
+  - [ ] Phase 5: node autoscaling. `GetCapacityDemand` (pending work
+        simulated on node-group templates), join tokens with `max_uses` and
+        `attributes`, `legion join --attr`, drain → terminate → `ForgetNode`
+        with budgets and protections, and a first-party `aws-asg` plugin
+  - [ ] Phase 6: autoscaler UI as app extensions (needs apps A4)
+  - [ ] Phase 7: sharded replicas (shard leases, rebalancing) and a
+        10,000-policy load test
+  - [ ] **Bug:** `GetJobScaleStatus` reports `override_count.unwrap_or(spec)`
+        without the `base_count` filter `effective_task_count` applies
+        (`src/manager/server.rs:6250`), so it can show a stale override as
+        effective. Found during v2 recon; fixed in v2 Phase 1.
+  - [ ] Deferred from v2 (plan §4, §8): waking a `service` from zero on
+        the first request (needs the gateway to route to services),
+        `service.concurrency` once netd attributes ingress requests, keyed
+        and `count.per` autoscaling, consolidation, predictive and vertical
+        strategies, WASM strategies.
 - [ ] Ingress proxy / load balancer (also listed under *Networking*)
 - [ ] GitOps helper — deploy to git, job updates automatically
 - [ ] Cert manager (also listed under *Auth, TLS & security*)
@@ -4297,8 +4364,10 @@ artifacts, volumes, node checks. Still to build:
 - [ ] Allocation-setup plugins (pre-fetch an image, snapshot, or data set)
 - [ ] Task-group-setup plugins
 - [ ] Logging plugins (log sinks exist, but not as loadable plugins)
-- [ ] Eval hooks — react to cluster events from inside Legion, with the option to
-      break out into a job (this is roughly how the autoscaler would work)
+- [ ] Eval hooks: react to cluster events from inside Legion, with the option to
+      break out into a job. Legion apps are the job half
+      ([legion-apps-plan.md](plans/legion-apps-plan.md)). An app can watch the
+      event stream through its local API socket.
 - [ ] Pluggable node statuses for degradation (disk pressure, network pressure, …)
 - [ ] Pluggable configuration language?
 - [ ] **A stable plugin ABI (audit M6).** Loads are now refused on a build
