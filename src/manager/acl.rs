@@ -907,7 +907,7 @@ mod authenticator_test {
         store.upsert_acl_policy(
             ANONYMOUS_POLICY,
             "migration policy",
-            r#"[{"resources": ["job"], "actions": ["read"]}]"#,
+            r#"[{"resources": ["job"], "namespaces": ["*"], "actions": ["read"]}]"#,
         )?;
         let identity = auth.authenticate(&MetadataMap::new(), &store)?;
         assert!(identity.allows(AclResource::Job, AclAction::Read, &AclScope::any()));
@@ -1018,7 +1018,7 @@ mod authenticator_test {
         store.upsert_acl_policy(
             "readers",
             "",
-            r#"[{"resources": ["job"], "actions": ["read"]}]"#,
+            r#"[{"resources": ["job"], "namespaces": ["*"], "actions": ["read"]}]"#,
         )?;
         store.upsert_acl_user(
             "alice",
@@ -1069,7 +1069,7 @@ mod authenticator_test {
         store.upsert_acl_policy(
             "readers",
             "",
-            r#"[{"resources": ["job"], "actions": ["read"]}]"#,
+            r#"[{"resources": ["job"], "namespaces": ["*"], "actions": ["read"]}]"#,
         )?;
         store.upsert_acl_user("alice", Some(&hash_password("pw")?), &["readers".into()])?;
 
@@ -1290,7 +1290,7 @@ mod authenticator_test {
         store.upsert_acl_policy(
             "base",
             "",
-            r#"[{"resources": ["job"], "actions": ["read"]}]"#,
+            r#"[{"resources": ["job"], "namespaces": ["*"], "actions": ["read"]}]"#,
         )?;
 
         let (auth, token) = hs256_authenticator_and_jwt(json!({
@@ -1364,7 +1364,7 @@ mod authenticator_test {
         store.upsert_acl_policy(
             "base",
             "",
-            r#"[{"resources": ["job"], "actions": ["read"]}]"#,
+            r#"[{"resources": ["job"], "namespaces": ["*"], "actions": ["read"]}]"#,
         )?;
 
         let (auth, token) = hs256_authenticator_and_jwt(json!({
@@ -1425,7 +1425,7 @@ mod authenticator_test {
         store.upsert_acl_policy(
             "readers",
             "",
-            r#"[{"resources": ["job"], "actions": ["read"]}]"#,
+            r#"[{"resources": ["job"], "namespaces": ["*"], "actions": ["read"]}]"#,
         )?;
 
         let mut auth = enabled_authenticator();

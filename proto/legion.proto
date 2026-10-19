@@ -112,6 +112,59 @@ service Manager {
   // Lists jobs known by the manager.
   rpc ListJobs (ListJobsRequest) returns (ListJobsReply);
 
+  // === NAMESPACES ===
+  //
+  // A namespace is the name scope, permission scope and policy anchor that
+  // jobs live in (docs/namespaces.md). It is NOT an isolation boundary: two
+  // namespaces may each hold a job called `web`, an ACL rule's `namespaces`
+  // selector confines a token to some of them, and a namespace policy caps
+  // what a group of them may use — but creating a namespace moves no
+  // workload onto other machines, networks or kernels. Node pools,
+  // `network.mode = "gated"` and the `sandbox` runtime do that.
+  //
+  // `default` always exists and cannot be deleted. A job's namespace is part
+  // of its id: `payments-prod/web`, or the bare name `web` for a job in
+  // `default`. Every field that names a job accepts either form.
+
+  // Lists the namespaces the caller can see: those where it holds any allow
+  // (`namespace:read`, or a read or write on any namespaced resource there).
+  // A caller that can see none receives an empty list, not an error.
+  //
+  // ACL: per-item; the list itself is open to any authenticated caller.
+  rpc ListNamespaces (ListNamespacesRequest) returns (ListNamespacesReply);
+
+  // Returns one namespace with what it holds, by kind. NOT_FOUND when it
+  // does not exist.
+  //
+  // ACL: `namespace:read` on the namespace.
+  rpc GetNamespace (GetNamespaceRequest) returns (GetNamespaceReply);
+
+  // Creates a namespace, or updates an existing one's description and meta.
+  // The name is a DNS label (lowercase letters, digits and `-`, starting and
+  // ending alphanumeric, at most 63 characters); the `legion-` prefix is
+  // reserved. Namespaces cannot be renamed. With `dry_run`, validates and
+  // reports which ACL policies would reach the namespace without writing.
+  //
+  // ACL: `namespace:write` on the namespace's name, so a rule with
+  // `namespaces = ["payments-*"]` lets its holder create payments
+  // environments and nothing else.
+  rpc ApplyNamespace (ApplyNamespaceRequest) returns (ApplyNamespaceReply);
+
+  // Deletes a namespace. Refused with FAILED_PRECONDITION while it holds
+  // anything (jobs in any state, volumes, snapshots), naming what is in the
+  // way by kind. With `cascade`, stops and destroys every job, then deletes
+  // its volumes and snapshots, then the namespace — synchronously, in that
+  // order, reporting each step. There is no `Terminating` state: a cascade
+  // that fails halfway leaves the namespace present and the call re-runnable,
+  // and the final delete is one conditional write, so a submit that races in
+  // makes it refuse rather than succeed falsely. `default` cannot be deleted.
+  //
+  // ACL: `namespace:write` on the namespace; a cascade additionally needs
+  // `job:write` there (and `snapshot:write` when it holds snapshots), so the
+  // right to delete an environment is never a back door to destroying
+  // workloads the caller could not otherwise touch.
+  rpc DeleteNamespace (DeleteNamespaceRequest) returns (DeleteNamespaceReply);
+
   // === JOB TEMPLATES ===
   //
   // Job templates are cluster-resident, immutably versioned Nickel
@@ -2484,6 +2537,14 @@ message RunJobRequest {
   // retry after that is applied again. Every other RPC's `idempotency_key`
   // follows these rules.
   optional string idempotency_key = 5;
+
+  // Namespace to submit into (`legion job run -n`). The jobspec may name
+  // one too (`namespace = "prod"`): when both are set and differ the
+  // request is INVALID_ARGUMENT rather than one winning, and authorization
+  // runs against the resolved namespace, never the request field alone.
+  // Neither set means `default`. The namespace must exist (NOT_FOUND
+  // otherwise; namespaces are never created implicitly).
+  optional string namespace = 6;
 }
 
 // Reply payload for RunJob.
@@ -2695,6 +2756,10 @@ message RenderJobTemplateRequest {
   // against the declared types; strings are leniently coerced (`"48"`
   // satisfies a `number`). At most 64 KiB.
   string variables_json = 3;
+
+  // Namespace to render for (see RunJobTemplateRequest.namespace); scopes
+  // the ACL check and the rendered job's id.
+  optional string namespace = 4;
 }
 
 // Reply payload for RenderJobTemplate.
@@ -2728,6 +2793,12 @@ message RunJobTemplateRequest {
 
   // Optional idempotency key (see RunJobRequest.idempotency_key).
   optional string idempotency_key = 6;
+
+  // Namespace the rendered job lands in. Templates are cluster objects
+  // (docs/job-templates.md); running one into a namespace is a `job:write`
+  // there, scoped by the `templates` selector. Resolved against a
+  // `namespace` the template renders exactly as RunJobRequest.namespace is.
+  optional string namespace = 7;
 }
 
 // Reply payload for RunJobTemplate.
@@ -3121,6 +3192,10 @@ message ListJobSpecHistoryReply {
 message PlanJobRequest {
   // Fully rendered jobspec JSON to plan.
   string parsed_jobspec = 1;
+
+  // Namespace to plan into; resolved against the jobspec's own `namespace`
+  // exactly as RunJobRequest.namespace is.
+  optional string namespace = 2;
 }
 
 // Reply payload for PlanJob.
@@ -5335,14 +5410,21 @@ message ListJobsRequest {
   // Applied after `query` and before paging, so `total_count` reflects the
   // filtered set. Omit or leave empty to return every status.
   optional string status = 6;
+
+  // Namespaces to list: names or `*`-globs (`payments-*`), each entry
+  // optionally a comma-separated list. Empty means `default`; `["*"]` means
+  // every namespace. Whatever the selection, only jobs the caller may read
+  // are returned — `*` widens what is considered, never what is visible.
+  repeated string namespaces = 7;
 }
 
 // Job metadata record.
 message Job {
-  // Job ID.
+  // Canonical job id: `namespace/name`, or the bare name for a job in the
+  // `default` namespace. Every field that names a job accepts it.
   string id = 1;
 
-  // Job name.
+  // Job name, without the namespace.
   string name = 2;
 
   // Job status, derived from the job's workload each time it is read. First
@@ -5418,6 +5500,10 @@ message Job {
   // job and places them now. Set by GetJobInfo only; ListJobs leaves it
   // empty.
   repeated RescheduleBackoff reschedule_backoffs = 8;
+
+  // The namespace the job lives in (docs/namespaces.md). `default` for a
+  // job whose `id` has no namespace segment.
+  string namespace = 9;
 }
 
 // What a blocked job waits for.
@@ -5473,6 +5559,13 @@ message ListJobsReply {
 
   // Page size used to produce this reply.
   uint32 page_size = 4;
+
+  // Jobs the caller may read in namespaces the request did NOT select, and
+  // how many namespaces they are spread over — so an empty list can say
+  // "14 jobs in 2 other namespaces you can read; use -A" instead of
+  // looking like the jobs are gone. Zero when the request selected `*`.
+  uint32 elsewhere_count = 6;
+  uint32 elsewhere_namespaces = 7;
 }
 
 // Request payload for IssueWorkloadIdentityToken.
@@ -8973,9 +9066,13 @@ message GetKvLockReply {
   optional KvLock lock = 1;
 }
 
-// Request payload for ListServices. Currently no filters; all declared
-// services are returned.
+// Request payload for ListServices.
 message ListServicesRequest {
+  // Namespaces to list services from: names or `*`-globs (docs/
+  // namespaces.md), as ListJobsRequest.namespaces: empty means `default`,
+  // `["*"]` every namespace the caller can read. A service is identified by
+  // its namespace and name, so two namespaces' `web` are two entries.
+  repeated string namespaces = 1;
 }
 
 // Aggregate view of one declared service.
@@ -9018,7 +9115,14 @@ message ServiceSummary {
   // Reported here so a read-only caller (`job:read`) can explain why its
   // consumer resolves to nothing — `legion service doctor` prints this list —
   // without needing state-store access to the underlying task config.
+  //
+  // A bare entry (or `*`) admits jobs in the service's own namespace only;
+  // a qualified entry (`checkout-prod/api`, `payments-*/api`, `*/*`) admits
+  // jobs from another (docs/namespaces.md, "Crossing a namespace").
   repeated string allow = 8;
+
+  // The namespace the service lives in: its declaring job's.
+  string namespace = 9;
 }
 
 // Reply payload for ListServices.
@@ -9030,8 +9134,10 @@ message ListServicesReply {
 
 // Request payload for ResolveService.
 message ResolveServiceRequest {
-  // Service name to resolve. Matches `service.name` (defaulting to the task
-  // name) on stored task configs.
+  // Service to resolve: `web` for the service in the `default` namespace,
+  // `payments-prod/web` for one in another. Matches `service.name`
+  // (defaulting to the task name) on stored task configs in that namespace.
+  // Only endpoints of jobs the caller may read are returned.
   string service = 1;
 
   // When true, endpoints failing (or missing) health are also returned, with
@@ -9103,6 +9209,9 @@ message ServiceEndpoint {
   // the cluster dials it, and it does not open the port — the node's
   // firewall or security group must still allow the traffic.
   string public_address = 14;
+
+  // The namespace the endpoint's service lives in (its job's).
+  string namespace = 15;
 }
 
 // Request payload for ListServiceEdges.
@@ -10988,6 +11097,12 @@ message WhoAmIReply {
   // report `[{"resources":["*"],"actions":["*"]}]`. Unset for anonymous
   // callers with no anonymous policy.
   optional string rules_json = 9;
+
+  // Namespaces the caller holds any allow in (the same rule ListNamespaces
+  // filters by), so a client can pick a default and decide whether to show
+  // a namespace switcher without probing. Management tokens and disabled
+  // ACLs list every namespace.
+  repeated string readable_namespaces = 10;
 }
 
 // Request payload for Login.
@@ -12558,4 +12673,158 @@ message NetHandlerStatus {
   // Calls and failures since the worker started.
   uint64 calls = 6;
   uint64 errors = 7;
+}
+
+// ---------------------------------------------------------------------------
+// Namespaces (docs/namespaces.md)
+// ---------------------------------------------------------------------------
+
+// A namespace: the name scope, permission scope and policy anchor jobs live
+// in. NOT an isolation boundary — it moves no workload onto other machines,
+// networks or kernels (node pools, `gated` networking and the `sandbox`
+// runtime do that). See docs/namespaces.md, "What a namespace isolates".
+message Namespace {
+  // DNS-label name: lowercase letters, digits and `-`, at most 63
+  // characters. Immutable; `default` always exists.
+  string name = 1;
+
+  // Free-form description.
+  string description = 2;
+
+  // Free-form metadata (`owner`, `slack`, ...). Legion never reads it.
+  map<string, string> meta = 3;
+
+  // RFC3339 creation time. Empty on a dry-run reply for a new namespace.
+  string created_at = 4;
+
+  // RFC3339 time of the last description/meta change.
+  string updated_at = 5;
+
+  // What the namespace holds, by kind. Populated by ListNamespaces and
+  // GetNamespace.
+  NamespaceCounts counts = 6;
+}
+
+// Object counts in a namespace, by kind.
+message NamespaceCounts {
+  // Jobs in any state (stopped and failed included).
+  uint32 jobs = 1;
+
+  // Volumes owned by a job in the namespace.
+  uint32 volumes = 2;
+
+  // Snapshots of a job in the namespace.
+  uint32 snapshots = 3;
+}
+
+// What a namespace holds, by id.
+message NamespaceContents {
+  // Canonical job ids (`ns/name`).
+  repeated string jobs = 1;
+
+  // Volume ids.
+  repeated string volumes = 2;
+
+  // Snapshot ids.
+  repeated string snapshots = 3;
+}
+
+// One ACL policy rule that reaches a namespace: an allow rule over a
+// namespaced resource whose `namespaces` selector matches it (or a `*`
+// resource rule with no selector). The blast-radius report shown when a
+// namespace is created.
+message NamespaceReach {
+  // ACL policy name.
+  string policy = 1;
+
+  // Index of the rule inside the policy.
+  uint32 rule_index = 2;
+
+  // `resource:action` pairs the rule grants, e.g. `job:read`, `job:write`.
+  repeated string grants = 3;
+
+  // The rule's `namespaces` selector as written; empty for a `*` resource
+  // rule without one (which reaches every namespace).
+  repeated string namespaces = 4;
+}
+
+// Request payload for ListNamespaces.
+message ListNamespacesRequest {}
+
+// Reply payload for ListNamespaces.
+message ListNamespacesReply {
+  // Namespaces the caller can see, by name.
+  repeated Namespace namespaces = 1;
+}
+
+// Request payload for GetNamespace.
+message GetNamespaceRequest {
+  string name = 1;
+}
+
+// Reply payload for GetNamespace.
+message GetNamespaceReply {
+  Namespace namespace = 1;
+
+  // The ACL policy rules that reach this namespace. Only filled for callers
+  // holding `acl:read` (it names policies); empty otherwise.
+  repeated NamespaceReach reaching_rules = 2;
+}
+
+// Request payload for ApplyNamespace.
+message ApplyNamespaceRequest {
+  // The namespace to create or update. `created_at`, `updated_at` and
+  // `counts` are ignored.
+  Namespace namespace = 1;
+
+  // When set, validate and report the policies that would reach it, but
+  // write nothing.
+  bool dry_run = 2;
+}
+
+// Reply payload for ApplyNamespace.
+message ApplyNamespaceReply {
+  // The stored namespace; on a dry run, what would be stored.
+  Namespace namespace = 1;
+
+  // True when this call created the namespace (or, on a dry run, would).
+  bool created = 2;
+
+  // The ACL policy rules that reach the namespace — on creation, the
+  // grants that take effect the moment it exists, including through
+  // selectors like `["*"]` written long before. Only filled for callers
+  // holding `acl:read`.
+  repeated NamespaceReach reaching_rules = 3;
+}
+
+// Request payload for DeleteNamespace.
+message DeleteNamespaceRequest {
+  string name = 1;
+
+  // Stop and destroy everything in the namespace first, then delete it.
+  bool cascade = 2;
+
+  // Report what would be deleted (and, for a non-empty namespace without
+  // `cascade`, why it would be refused) without changing anything.
+  bool dry_run = 3;
+
+  // Optional idempotency key; see RunJobRequest.idempotency_key.
+  optional string idempotency_key = 4;
+}
+
+// Reply payload for DeleteNamespace.
+message DeleteNamespaceReply {
+  // True when the namespace was deleted (false on a dry run).
+  bool deleted = 1;
+
+  // On a dry run, what the namespace holds; after a cascade, what was
+  // removed.
+  NamespaceContents contents = 2;
+
+  // Human-readable cascade steps, in order (`Stopped payments-old/web`).
+  repeated string steps = 3;
+
+  // True when this reply was replayed from an earlier request with the same
+  // `idempotency_key`.
+  bool deduplicated = 4;
 }

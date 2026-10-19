@@ -3,15 +3,18 @@ use std::vec;
 
 use clap::value_parser;
 
-use crate::cmd::helpers::{connect_manager_client, friendly_status, json_flag, print_table};
+use crate::cmd::helpers::{
+    active_namespace, connect_manager_client, friendly_status, job_ref, json_flag,
+    list_namespace_flags, lists_many_namespaces, namespace_flag, namespace_selection, print_table,
+};
 use crate::cmd::output::{self, CliError, OutputFormat};
 use crate::prelude::*;
 use crate::structs::{
     AdvanceRolloutRequest, DestroyJobRequest, GetAllocationLogsRequest, GetJobInfoRequest,
     GetJobScaleStatusRequest, GetJobSpecRequest, GetKvRequest, GetRolloutStatusRequest, JobConfig,
-    JobPlanPrint, JobPrint, KvEntry, KvValueType, ListJobsRequest, ListRolloutEventsRequest,
-    ListRolloutsRequest, PlanJobRequest, RunJobRequest, ScaleTaskRequest, StopJobRequest,
-    Submission,
+    JobPlanPrint, JobPrint, JobPrintNamespaced, KvEntry, KvValueType, ListJobsRequest,
+    ListRolloutEventsRequest, ListRolloutsRequest, PlanJobRequest, RunJobRequest, ScaleTaskRequest,
+    StopJobRequest, Submission,
 };
 use crate::task_plugins::{builtin_task_plugin_schemas, validate_job_config};
 use serde::Serialize;
@@ -40,6 +43,7 @@ pub fn config() -> Command {
         .arg(idempotency_arg())
         .arg(wait_flag())
         .arg(timeout_arg())
+        .arg(namespace_flag())
         .arg(json_flag())
         .args(config_var_args());
 
@@ -53,6 +57,7 @@ pub fn config() -> Command {
         .arg(priority_arg())
         .arg(asap_flag())
         .arg(idempotency_arg())
+        .arg(namespace_flag())
         .arg(json_flag());
 
     let scale_cmd = Command::new("scale")
@@ -96,6 +101,7 @@ pub fn config() -> Command {
                 .help("Audit note recorded on the override and in the event stream"),
         )
         .arg(idempotency_arg())
+        .arg(namespace_flag())
         .arg(json_flag());
 
     let destroy_cmd = Command::new("destroy")
@@ -108,6 +114,7 @@ pub fn config() -> Command {
         .arg(priority_arg())
         .arg(asap_flag())
         .arg(idempotency_arg())
+        .arg(namespace_flag())
         .arg(json_flag());
 
     let validate_cmd = Command::new("validate")
@@ -135,6 +142,7 @@ pub fn config() -> Command {
                 .required(true),
         )
         .arg(timeout_arg())
+        .arg(namespace_flag())
         .arg(json_flag());
 
     let info_cmd = Command::new("info")
@@ -145,6 +153,7 @@ pub fn config() -> Command {
                 .help("Name of the job to inspect")
                 .required(true),
         )
+        .arg(namespace_flag())
         .arg(json_flag());
 
     let plan_cmd = Command::new("plan")
@@ -156,6 +165,7 @@ pub fn config() -> Command {
                 .required(true)
                 .value_hint(ValueHint::AnyPath),
         )
+        .arg(namespace_flag())
         .arg(json_flag())
         .args(config_var_args());
 
@@ -166,6 +176,7 @@ pub fn config() -> Command {
                 .value_name("NAME")
                 .help("Name of the job to fetch the spec for"),
         )
+        .arg(namespace_flag())
         .arg(json_flag());
 
     let list_cmd = Command::new("list")
@@ -176,6 +187,7 @@ pub fn config() -> Command {
                 .value_name("STATUS")
                 .help("Only jobs with this exact status: running, pending, failed, scheduled, complete, suspended, idle, or stopped"),
         )
+        .args(list_namespace_flags())
         .arg(json_flag());
 
     let logs_cmd = Command::new("logs")
@@ -229,6 +241,7 @@ pub fn config() -> Command {
                 )
                 .action(ArgAction::SetTrue),
         )
+        .arg(namespace_flag())
         .arg(json_flag());
 
     let rollout_list_cmd = Command::new("list")
@@ -237,8 +250,9 @@ pub fn config() -> Command {
             Arg::new("job")
                 .long("job")
                 .value_name("JOB")
-                .help("Filter rollouts by job id"),
+                .help("Filter rollouts by job (`name` or `namespace/name`)"),
         )
+        .arg(namespace_flag())
         .arg(
             Arg::new("active")
                 .long("active")
@@ -325,6 +339,36 @@ pub fn config() -> Command {
         .subcommand(destroy_cmd)
         .subcommand(logs_cmd)
         .subcommand(rollout_cmd)
+}
+
+/// The namespace a spec-bearing request (`job run`, `job plan`) sends.
+///
+/// An explicit `-n` always goes, so the manager can reject it when the
+/// jobspec declares a different namespace. `LEGION_NAMESPACE` is a default,
+/// like kubectl's context namespace: it applies only when the jobspec names
+/// no namespace of its own, and never conflicts with one.
+pub(crate) fn spec_request_namespace(matches: &ArgMatches, rendered: &str) -> Option<String> {
+    if let Some(flag) = matches
+        .try_get_one::<String>("namespace")
+        .ok()
+        .flatten()
+        .map(|namespace| namespace.trim().to_string())
+        .filter(|namespace| !namespace.is_empty())
+    {
+        return Some(flag);
+    }
+    let declares = serde_json::from_str::<Value>(rendered).is_ok_and(|spec| {
+        spec.get("namespace").is_some()
+            || spec
+                .get("name")
+                .and_then(Value::as_str)
+                .is_some_and(|name| name.contains('/'))
+    });
+    if declares {
+        None
+    } else {
+        active_namespace(matches)
+    }
 }
 
 /// Optional idempotency key for mutating job operations. When supplied, the
@@ -478,9 +522,12 @@ pub(crate) async fn wait_for_convergence(
 #[instrument(skip_all)]
 async fn wait_job(arg_matches: &ArgMatches) -> R<()> {
     let format = OutputFormat::from_matches(arg_matches);
-    let job_name = arg_matches
-        .get_one::<String>("name")
-        .context("missing job name")?;
+    let job_name = &job_ref(
+        arg_matches,
+        arg_matches
+            .get_one::<String>("name")
+            .context("missing job name")?,
+    )?;
     let timeout = wait_timeout(arg_matches);
     let mut client = connect_manager_client().await?;
 
@@ -1167,7 +1214,10 @@ struct RolloutPrint {
 #[instrument(skip_all)]
 async fn job_logs(arg_matches: &ArgMatches) -> R<()> {
     let format = OutputFormat::from_matches(arg_matches);
-    let name = arg_matches.get_one::<String>("name").cloned();
+    let name = arg_matches
+        .get_one::<String>("name")
+        .map(|name| job_ref(arg_matches, name))
+        .transpose()?;
     let allocation_id = arg_matches.get_one::<i64>("allocation").copied();
     let stream = arg_matches
         .get_one::<String>("stream")
@@ -1754,14 +1804,17 @@ mod tests {
 async fn stop_job(arg_matches: &ArgMatches) -> R<()> {
     let format = OutputFormat::from_matches(arg_matches);
     let mut client = connect_manager_client().await?;
-    let job_name = arg_matches
-        .get_one::<String>("name")
-        .map_or("demo", String::as_str);
+    let job_name = job_ref(
+        arg_matches,
+        arg_matches
+            .get_one::<String>("name")
+            .map_or("demo", String::as_str),
+    )?;
     let priority = priority_from_matches(arg_matches);
     let idempotency_key = arg_matches.get_one::<String>("idempotency-key").cloned();
 
     let request = tonic::Request::new(StopJobRequest {
-        name: job_name.to_owned(),
+        name: job_name,
         priority,
         idempotency_key,
     });
@@ -1788,10 +1841,12 @@ async fn stop_job(arg_matches: &ArgMatches) -> R<()> {
 async fn scale_job(arg_matches: &ArgMatches) -> R<()> {
     let format = OutputFormat::from_matches(arg_matches);
     let mut client = connect_manager_client().await?;
-    let job_name = arg_matches
-        .get_one::<String>("name")
-        .context("job name is required")?
-        .clone();
+    let job_name = job_ref(
+        arg_matches,
+        arg_matches
+            .get_one::<String>("name")
+            .context("job name is required")?,
+    )?;
     let count = arg_matches.get_one::<u32>("count").copied();
     let reset = arg_matches.get_flag("reset");
 
@@ -1881,13 +1936,14 @@ async fn get_job_spec(arg_matches: &ArgMatches) -> R<()> {
     let format = OutputFormat::from_matches(arg_matches);
 
     let mut client = connect_manager_client().await?;
-    let job_name = arg_matches
-        .get_one::<String>("name")
-        .map_or("demo", String::as_str);
+    let job_name = job_ref(
+        arg_matches,
+        arg_matches
+            .get_one::<String>("name")
+            .map_or("demo", String::as_str),
+    )?;
 
-    let request = tonic::Request::new(GetJobSpecRequest {
-        name: job_name.to_owned(),
-    });
+    let request = tonic::Request::new(GetJobSpecRequest { name: job_name });
 
     let response = output::resolve(
         format,
@@ -1915,14 +1971,17 @@ async fn get_job_spec(arg_matches: &ArgMatches) -> R<()> {
 async fn destroy_job(arg_matches: &ArgMatches) -> R<()> {
     let format = OutputFormat::from_matches(arg_matches);
     let mut client = connect_manager_client().await?;
-    let job_name = arg_matches
-        .get_one::<String>("name")
-        .map_or("demo", String::as_str);
+    let job_name = job_ref(
+        arg_matches,
+        arg_matches
+            .get_one::<String>("name")
+            .map_or("demo", String::as_str),
+    )?;
     let priority = priority_from_matches(arg_matches);
     let idempotency_key = arg_matches.get_one::<String>("idempotency-key").cloned();
 
     let request = tonic::Request::new(DestroyJobRequest {
-        name: job_name.to_owned(),
+        name: job_name,
         priority,
         idempotency_key,
     });
@@ -1959,8 +2018,10 @@ async fn plan_job(arg_matches: &ArgMatches) -> R<()> {
     let resolved = resolve_jobspec_source_async(path).await?;
     let (rendered, _submissions) = render_jobspec(&resolved.path, &vars)?;
 
+    let namespace = spec_request_namespace(arg_matches, &rendered);
     let request = tonic::Request::new(PlanJobRequest {
         parsed_jobspec: rendered,
+        namespace,
     });
 
     let response = output::resolve(format, "failed to plan job", client.plan_job(request).await)?;
@@ -2180,9 +2241,15 @@ async fn run_job(arg_matches: &ArgMatches) -> R<()> {
     let resolved = resolve_jobspec_source_async(job_path).await?;
     let (rendered, submissions) = render_jobspec(&resolved.path, &vars)?;
 
-    // Capture the job name so we can optionally wait for convergence below.
+    let namespace = spec_request_namespace(arg_matches, &rendered);
+    // Capture the job's canonical id so we can optionally wait for
+    // convergence below.
     let job_name = serde_json::from_str::<JobConfig>(&rendered)
-        .map(|config| config.name)
+        .map(|config| {
+            let (declared, name) = crate::structs::namespace::split_job_id(&config.name);
+            let namespace = namespace.as_deref().unwrap_or(declared);
+            crate::structs::namespace::job_id(namespace, name)
+        })
         .ok();
 
     let request = tonic::Request::new(RunJobRequest {
@@ -2191,6 +2258,7 @@ async fn run_job(arg_matches: &ArgMatches) -> R<()> {
         priority,
         force_reschedule: arg_matches.get_flag("force-reschedule"),
         idempotency_key,
+        namespace,
     });
 
     let reply =
@@ -2229,8 +2297,10 @@ async fn list_jobs(arg_matches: &ArgMatches) -> R<()> {
     let format = OutputFormat::from_matches(arg_matches);
 
     let mut client = connect_manager_client().await?;
+    let namespaces = namespace_selection(arg_matches);
     let request = tonic::Request::new(ListJobsRequest {
         status: arg_matches.get_one::<String>("status").cloned(),
+        namespaces: namespaces.clone(),
         ..Default::default()
     });
     let response = output::resolve(
@@ -2238,10 +2308,34 @@ async fn list_jobs(arg_matches: &ArgMatches) -> R<()> {
         "failed to list jobs",
         client.list_jobs(request).await,
     )?;
-    let jobs_list = response.into_inner().jobs;
+    let reply = response.into_inner();
+    let jobs_list = reply.jobs;
 
     if format.is_json() {
         print_json(&jobs_list);
+        return Ok(());
+    }
+    if jobs_list.is_empty() {
+        let selected = if namespaces.is_empty() {
+            "namespace 'default'".to_string()
+        } else {
+            format!("namespace {}", namespaces.join(","))
+        };
+        if reply.elsewhere_count > 0 {
+            // The jobs are not gone; they are somewhere this list did not
+            // look (Nomad's most-asked namespace question).
+            println!(
+                "No jobs in {selected}. {} job(s) in {} other namespace(s) you can read; use -A.",
+                reply.elsewhere_count, reply.elsewhere_namespaces
+            );
+        } else {
+            println!("No jobs in {selected}.");
+        }
+        return Ok(());
+    }
+    if lists_many_namespaces(arg_matches) {
+        let printable: Vec<JobPrintNamespaced> = jobs_list.into_iter().map(Into::into).collect();
+        print_table(printable);
     } else {
         let printable_jobs: Vec<JobPrint> = jobs_list.into_iter().map(Into::into).collect();
         print_table(printable_jobs);
@@ -2254,7 +2348,10 @@ async fn list_jobs(arg_matches: &ArgMatches) -> R<()> {
 async fn list_rollouts(arg_matches: &ArgMatches) -> R<()> {
     let format = OutputFormat::from_matches(arg_matches);
     let active_only = arg_matches.get_flag("active");
-    let job_id = arg_matches.get_one::<String>("job").cloned();
+    let job_id = arg_matches
+        .get_one::<String>("job")
+        .map(|job| job_ref(arg_matches, job))
+        .transpose()?;
 
     let mut client = connect_manager_client().await?;
     let request = tonic::Request::new(ListRolloutsRequest {
@@ -2548,10 +2645,11 @@ async fn get_info(arg_matches: &ArgMatches) -> R<()> {
     let format = OutputFormat::from_matches(arg_matches);
 
     let mut client = connect_manager_client().await?;
-    let job_name = arg_matches.get_one::<String>("name").context("need name")?;
-    let request = tonic::Request::new(GetJobInfoRequest {
-        name: job_name.to_owned(),
-    });
+    let job_name = job_ref(
+        arg_matches,
+        arg_matches.get_one::<String>("name").context("need name")?,
+    )?;
+    let request = tonic::Request::new(GetJobInfoRequest { name: job_name });
     let response = output::resolve(
         format,
         "failed to fetch job info",

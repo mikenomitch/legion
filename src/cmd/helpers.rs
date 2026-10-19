@@ -390,6 +390,97 @@ pub fn json_flag() -> Arg {
         .action(ArgAction::SetTrue)
 }
 
+/// `-n/--namespace`: the namespace a command acts in (docs/namespaces.md).
+/// Attached only to commands that act on namespaced things, so on a
+/// cluster-scoped command (`legion node list -n prod`) it is a parse error
+/// rather than a flag that looks like a scope and is silently ignored.
+pub fn namespace_flag() -> Arg {
+    Arg::new("namespace")
+        .long("namespace")
+        .short('n')
+        .value_name("NAMESPACE")
+        .help("Namespace to act in (default: $LEGION_NAMESPACE, else `default`)")
+}
+
+/// `-n` and `-A` for list commands: `-n` takes names or `*`-globs,
+/// comma-separated (`-n 'payments-*,shared'`); `-A` lists every namespace
+/// the caller can read.
+pub fn list_namespace_flags() -> [Arg; 2] {
+    [
+        Arg::new("namespace")
+            .long("namespace")
+            .short('n')
+            .value_name("NAMESPACES")
+            .help(
+                "Namespaces to list: names or globs, comma-separated (default: \
+                 $LEGION_NAMESPACE, else `default`)",
+            ),
+        Arg::new("all-namespaces")
+            .long("all-namespaces")
+            .short('A')
+            .action(ArgAction::SetTrue)
+            .conflicts_with("namespace")
+            .help("List every namespace you can read"),
+    ]
+}
+
+/// The active namespace: `-n`, else `LEGION_NAMESPACE`, else `None`
+/// (which every caller treats as `default`). Safe on commands that do not
+/// define `-n`.
+pub fn active_namespace(matches: &ArgMatches) -> Option<String> {
+    matches
+        .try_get_one::<String>("namespace")
+        .ok()
+        .flatten()
+        .cloned()
+        .or_else(|| std::env::var(crate::structs::namespace::NAMESPACE_ENV).ok())
+        .map(|namespace| namespace.trim().to_string())
+        .filter(|namespace| !namespace.is_empty())
+}
+
+/// Resolves a typed job reference (`web`, or `payments-prod/web`) against
+/// the active namespace to the canonical id the API takes. A qualified name
+/// that disagrees with `-n` fails here, through the output envelope.
+pub fn job_ref(matches: &ArgMatches, raw: &str) -> R<String> {
+    let format = crate::cmd::output::OutputFormat::from_matches(matches);
+    crate::structs::namespace::resolve_job_ref(raw, active_namespace(matches).as_deref()).map_err(
+        |message| {
+            crate::cmd::output::fail_local(
+                format,
+                crate::cmd::output::CliError::local(
+                    "invalid_job_ref",
+                    message,
+                    Some("name a job as `name` or `namespace/name`"),
+                ),
+            )
+        },
+    )
+}
+
+/// The namespace selection a list command sends: `["*"]` for `-A`, the
+/// `-n` value (or `LEGION_NAMESPACE`) otherwise, empty (= `default`) when
+/// neither is set.
+pub fn namespace_selection(matches: &ArgMatches) -> Vec<String> {
+    if matches
+        .try_get_one::<bool>("all-namespaces")
+        .ok()
+        .flatten()
+        .copied()
+        .unwrap_or(false)
+    {
+        return vec!["*".into()];
+    }
+    active_namespace(matches).into_iter().collect()
+}
+
+/// Whether a list command was asked for more than one namespace, so its
+/// table should carry a NAMESPACE column.
+pub fn lists_many_namespaces(matches: &ArgMatches) -> bool {
+    namespace_selection(matches)
+        .iter()
+        .any(|selector| selector.contains('*') || selector.contains(','))
+}
+
 /// Split a server message into its text and the actionable hint it carries
 /// on a final `\nHint: ...` line, when it carries one. Servers put a hint in
 /// the message when the fix is specific to the failure (for example

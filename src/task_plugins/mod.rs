@@ -124,14 +124,25 @@ pub fn spawn_task_process(cmd: &mut Command) -> R<Child> {
     cmd.spawn().context("Failed to spawn task process")
 }
 
-/// Legion-provided environment for a task: allocation identity, any assigned
+/// Legion-provided environment for a task: allocation identity (alloc id,
+/// job id, job name, namespace, task name), any assigned
 /// ports (`LEGION_PORT_*`, `LEGION_ADDR_*`, ...) and any declared upstreams
 /// (`LEGION_UPSTREAM_*`, `LEGION_UPSTREAM_PORT_*`). Task plugins apply these
 /// before user-declared env so user values win on key conflicts.
 pub fn allocation_env(allocation: &Allocation, task: &TaskConfig) -> Vec<(String, String)> {
+    let (namespace, job_name) = crate::structs::namespace::split_job_id(&allocation.job_id);
     let mut pairs = vec![
         ("LEGION_ALLOC_ID".to_string(), allocation.id.to_string()),
+        // The canonical job id (`ns/name`, or the bare name in `default`),
+        // plus its two halves, so a workload can label its own metrics and
+        // logs, and a `legion` CLI run inside the task defaults to the
+        // task's own namespace (docs/namespaces.md).
         ("LEGION_JOB_ID".to_string(), allocation.job_id.clone()),
+        ("LEGION_JOB_NAME".to_string(), job_name.to_string()),
+        (
+            crate::structs::namespace::NAMESPACE_ENV.to_string(),
+            namespace.to_string(),
+        ),
         ("LEGION_TASK_NAME".to_string(), task.name.clone()),
     ];
     if let Some(network) = allocation.network.as_ref() {
@@ -1227,7 +1238,13 @@ fn validate_gang_groups(config: &JobConfig) -> R<()> {
 #[instrument(err, skip_all)]
 pub fn validate_job_config(config: &JobConfig) -> R<()> {
     use crate::structs::job::validate_object_name;
-    validate_object_name("job name", &config.name)?;
+    // `config.name` is the canonical job id: the namespace is validated
+    // where it is resolved, and the name part is what becomes a path
+    // component and a subject segment.
+    let (namespace, job_name) = crate::structs::namespace::split_job_id(&config.name);
+    crate::structs::namespace::validate_namespace_name(namespace)
+        .map_err(|e| anyhow!("job name {:?}: {e}", config.name))?;
+    validate_object_name("job name", job_name)?;
     let mut registry = TaskPluginRegistry::new();
     for task in &config.tasks {
         validate_object_name("task name", &task.name)?;

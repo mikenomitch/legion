@@ -1372,7 +1372,7 @@ mod tests {
         let jwks = iss.jwks();
 
         let decoded = verify_via_jwks(&jwks, &issued.token, "sts.amazonaws.com", iss.issuer_url());
-        assert_eq!(decoded["sub"], json!("auto:api:web:server"));
+        assert_eq!(decoded["sub"], json!("auto:default:api:web:server"));
         assert_eq!(decoded["iss"], json!(iss.issuer_url()));
         assert_eq!(decoded["legion.io/alloc"], json!("alloc-42"));
         assert_eq!(decoded["aud"], json!(["sts.amazonaws.com"]));
@@ -1478,7 +1478,7 @@ mod tests {
         let issued = iss.issue(&claims(), &id, now()).unwrap();
         let decoded = iss.verify(&issued.token, "sts.amazonaws.com").unwrap();
         // Derived values win; the forged extra claims are dropped.
-        assert_eq!(decoded["sub"], json!("auto:api:web:server"));
+        assert_eq!(decoded["sub"], json!("auto:default:api:web:server"));
         assert_eq!(decoded["legion.io/job"], json!("api"));
         assert_eq!(decoded["iss"], json!(iss.issuer_url()));
     }
@@ -1731,8 +1731,11 @@ mod tests {
 
         // The instance-keyed sub template now renders, and the legion claims
         // carry the stable instance key.
-        let sub = derived.render_subject("{region}:{job}:{group}:{task}:{instance}")?;
-        assert_eq!(sub, "auto:claims-job:default:db:claims-job-default-0");
+        let sub = derived.render_subject("{region}:{namespace}:{job}:{group}:{task}:{instance}")?;
+        assert_eq!(
+            sub,
+            "auto:default:claims-job:default:db:claims-job-default-0"
+        );
         let legion = derived.legion_claims();
         assert_eq!(
             legion.get("legion.io/instance").map(String::as_str),
@@ -1784,7 +1787,7 @@ mod tests {
         let second = store_issuer(&store);
         assert_eq!(second.active_key().unwrap().kid, first_kid);
         let decoded = second.verify(&issued.token, "sts.amazonaws.com")?;
-        assert_eq!(decoded["sub"], json!("auto:api:web:server"));
+        assert_eq!(decoded["sub"], json!("auto:default:api:web:server"));
 
         // No duplicate key was generated.
         assert_eq!(store.list_signing_keys()?.len(), 1);
@@ -1865,7 +1868,7 @@ mod tests {
         let config = WorkloadIdentityConfigFull {
             enabled: true,
             issuer: Some("https://manager.example.com:4747".into()),
-            sub_template: "{job}:{group}:{task}:{alloc}".into(),
+            sub_template: "{namespace}:{job}:{group}:{task}:{alloc}".into(),
             ..Default::default()
         };
         let err =
@@ -1883,7 +1886,9 @@ mod tests {
         let config = WorkloadIdentityConfigFull {
             enabled: true,
             issuer: Some("https://manager.example.com:4747".into()),
-            allowed_sub_templates: vec!["{region}:{job}:{group}:{task}:{instance}".into()],
+            allowed_sub_templates: vec![
+                "{region}:{namespace}:{job}:{group}:{task}:{instance}".into()
+            ],
             ..Default::default()
         };
         let state =
@@ -1895,7 +1900,7 @@ mod tests {
         state.check_sub_template(&with_template(None))?;
         state.check_sub_template(&with_template(Some(&config.sub_template)))?;
         state.check_sub_template(&with_template(Some(
-            "{region}:{job}:{group}:{task}:{instance}",
+            "{region}:{namespace}:{job}:{group}:{task}:{instance}",
         )))?;
         // Reordered fields: renders another workload's default subject.
         let reordered = with_template(Some("{region}:{group}:{job}:{task}"));
@@ -1928,7 +1933,7 @@ mod tests {
         let config = WorkloadIdentityConfigFull {
             enabled: true,
             issuer: Some("https://manager.example.com:4747".into()),
-            sub_template: "{region}/{job}/{group}/{task}".into(),
+            sub_template: "{region}/{namespace}/{job}/{group}/{task}".into(),
             ..Default::default()
         };
         WorkloadIdentityState::initialize(&store, &config, "http://127.0.0.1:4747", now())?;

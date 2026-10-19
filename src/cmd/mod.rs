@@ -21,6 +21,7 @@ pub mod kv;
 pub mod ledger;
 pub mod login;
 pub mod mcp;
+pub mod namespace;
 pub mod net;
 pub mod node;
 pub mod oidc;
@@ -53,6 +54,7 @@ pub fn cli() -> Command {
         .subcommand(mcp::config())
         .subcommand(docs::config())
         .subcommand(job::config())
+        .subcommand(namespace::config())
         .subcommand(template::config())
         .subcommand(instance::config())
         .subcommand(node::config())

@@ -303,7 +303,7 @@ impl ManagerDaemonService {
             .get_jobs()
             .map_err(|e| map_store_error("Error loading jobs", e))?;
         for job in jobs {
-            let Ok(config) = self.store.get_job_config(&job.name) else {
+            let Ok(config) = self.store.get_job_config(&job.id) else {
                 continue;
             };
             let found = config.tasks.iter().find(|task| {
@@ -316,9 +316,9 @@ impl ManagerDaemonService {
                     identity,
                     AclResource::Job,
                     AclAction::Write,
-                    &AclScope::job(&job.name),
+                    &AclScope::job(&job.id),
                 )?;
-                return Ok(Some((job.name.clone(), task.clone())));
+                return Ok(Some((job.id.clone(), task.clone())));
             }
         }
         Ok(None)

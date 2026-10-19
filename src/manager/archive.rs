@@ -204,7 +204,7 @@ fn manifest_only_candidates(store: &Store, instance_id: &str) -> Vec<(String, St
     }
     let mut candidates = Vec::new();
     for job in store.get_jobs().unwrap_or_default() {
-        let Ok(config) = store.get_job_config(&job.name) else {
+        let Ok(config) = store.get_job_config(&job.id) else {
             continue;
         };
         for task in &config.tasks {
@@ -218,7 +218,7 @@ fn manifest_only_candidates(store: &Store, instance_id: &str) -> Vec<(String, St
                 .and_then(|suspend| suspend.resolve().ok())
                 .is_some_and(|resolved| resolved.durability == SnapshotDurability::Store);
             if keyed && published && crate::structs::is_minted_for_task(instance_id, &task.name) {
-                candidates.push((job.name.clone(), task.group.clone(), task.name.clone()));
+                candidates.push((job.id.clone(), task.group.clone(), task.name.clone()));
             }
         }
     }

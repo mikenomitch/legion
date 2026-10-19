@@ -571,10 +571,14 @@ pub struct ServiceConfig {
     pub tags: Vec<String>,
     #[serde(default, skip_serializing_if = "Map::is_empty")]
     pub meta: Map<String, Value>,
-    /// Connect intentions: job ids allowed to reach this service through an
-    /// upstream. Empty (the default) or `["*"]` means every job may connect.
-    /// A denied consumer simply receives an empty endpoint list — enforcement
-    /// is control-plane + forwarder, not cryptographic identity.
+    /// Connect intentions: the jobs allowed to reach this service through an
+    /// upstream. Empty (the default) or `["*"]` means every job in the
+    /// service's own namespace; a bare entry (`gateway`, `web-*`) names jobs
+    /// in that same namespace; reaching across namespaces takes a qualified
+    /// entry — `checkout-prod/api`, `payments-*/api`, `*/*` — so a crossing
+    /// is always written on the side being reached (docs/namespaces.md). A
+    /// denied consumer simply receives an empty endpoint list — enforcement is
+    /// control-plane + forwarder, not cryptographic identity.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub allow: Vec<String>,
 }
@@ -591,11 +595,10 @@ impl ServiceConfig {
         }
     }
 
-    /// Whether `job_id` may connect to this service. Empty `allow` (the
-    /// default) or a `"*"` entry allows everyone, preserving pre-connect
-    /// behavior for services that declare no intentions.
-    pub fn allows_job(&self, job_id: &str) -> bool {
-        allow_permits(&self.allow, job_id)
+    /// Whether `consumer` (a canonical job id) may connect to this service,
+    /// declared by job `owner`. See [`allow_permits`].
+    pub fn allows_job(&self, owner: &str, consumer: &str) -> bool {
+        allow_permits(&self.allow, owner, consumer)
     }
 
     /// `service.meta` flattened to strings for transport (the wire type is a
@@ -615,10 +618,29 @@ impl ServiceConfig {
     }
 }
 
-/// Shared intention check so the catalog projection and `ServiceConfig` agree:
-/// an empty list or a `"*"` entry permits every consumer.
-pub fn allow_permits(allow: &[String], job_id: &str) -> bool {
-    allow.is_empty() || allow.iter().any(|entry| entry == "*" || entry == job_id)
+/// Shared intention check so the catalog projection and `ServiceConfig` agree.
+///
+/// `owner` is the job that declares the service and `consumer` the job
+/// dialing it, both canonical ids. An empty list or a `"*"` entry permits
+/// every consumer in the owner's namespace; a bare entry is a job-name glob
+/// in that namespace; a qualified entry (`ns-glob/name-glob`) is the only way
+/// to admit a consumer from another namespace — the target-side half of a
+/// crossing whose consumer-side half is the upstream's `namespace`.
+pub fn allow_permits(allow: &[String], owner: &str, consumer: &str) -> bool {
+    use crate::structs::acl::glob_match;
+    use crate::structs::namespace::split_job_id;
+    let (owner_namespace, _) = split_job_id(owner);
+    let (consumer_namespace, consumer_name) = split_job_id(consumer);
+    let same_namespace = owner_namespace == consumer_namespace;
+    if allow.is_empty() {
+        return same_namespace;
+    }
+    allow.iter().any(|entry| match entry.split_once('/') {
+        Some((namespace, name)) => {
+            glob_match(namespace, consumer_namespace) && glob_match(name, consumer_name)
+        }
+        None => same_namespace && glob_match(entry, consumer_name),
+    })
 }
 
 /// Task-level `connect` block: the services this task dials through node-local
@@ -688,6 +710,13 @@ pub struct ConnectTemplate {
 pub struct UpstreamConfig {
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub service: String,
+    /// The namespace `service` lives in, when it is not the consumer's own
+    /// (docs/namespaces.md, "Crossing a namespace"). The service must admit
+    /// the consumer with a qualified `allow` entry, so a crossing is written
+    /// on both sides. `service` may instead be qualified (`shared/auth`);
+    /// the two must agree.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub namespace: Option<String>,
     /// Key for an external upstream (`LEGION_UPSTREAM_<NAME>`); optional
     /// alias for a service upstream.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2815,8 +2844,8 @@ mod tests {
         let svc: ServiceConfig =
             serde_json::from_value(json!({ "port": "http", "allow": ["gateway"] }))?;
         validate_task_connect("api", Some(&network), Some(&connect_config), Some(&svc))?;
-        assert!(svc.allows_job("gateway"));
-        assert!(!svc.allows_job("other"));
+        assert!(svc.allows_job("web", "gateway"));
+        assert!(!svc.allows_job("web", "other"));
         Ok(())
     }
 
@@ -3163,14 +3192,36 @@ mod tests {
     }
 
     #[test]
-    fn allow_wildcard_and_absent_allow_permit_everyone() {
+    fn allow_wildcard_and_absent_allow_permit_everyone_in_the_namespace() {
         let open: ServiceConfig =
             serde_json::from_value(json!({ "port": "http" })).expect("service config");
-        assert!(open.allows_job("anyone"));
+        assert!(open.allows_job("web", "anyone"));
         let wildcard: ServiceConfig =
             serde_json::from_value(json!({ "port": "http", "allow": ["*"] }))
                 .expect("service config");
-        assert!(wildcard.allows_job("anyone"));
-        assert!(allow_permits(&[], "anyone"));
+        assert!(wildcard.allows_job("web", "anyone"));
+        assert!(allow_permits(&[], "web", "anyone"));
+        // ...but never across a namespace.
+        assert!(!allow_permits(&[], "prod/web", "dev/api"));
+        assert!(!allow_permits(&["*".into()], "prod/web", "dev/api"));
+        assert!(allow_permits(&[], "prod/web", "prod/api"));
+    }
+
+    #[test]
+    fn crossing_a_namespace_needs_a_qualified_intention() {
+        let allow = vec!["gateway".to_string(), "payments-*/api".to_string()];
+        assert!(allow_permits(&allow, "shared/auth", "shared/gateway"));
+        assert!(!allow_permits(
+            &allow,
+            "shared/auth",
+            "payments-prod/gateway"
+        ));
+        assert!(allow_permits(&allow, "shared/auth", "payments-prod/api"));
+        assert!(!allow_permits(&allow, "shared/auth", "checkout-prod/api"));
+        // `*/*` admits everyone everywhere.
+        assert!(allow_permits(&["*/*".into()], "shared/auth", "dev/x"));
+        // A bare entry still means the owner's namespace, and globs.
+        assert!(allow_permits(&["web-*".into()], "web", "web-2"));
+        assert!(!allow_permits(&["web".into()], "prod/x", "web"));
     }
 }

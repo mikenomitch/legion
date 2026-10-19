@@ -113,9 +113,6 @@ pub const DEFAULT_HANDLER_TIMEOUT: &str = "2s";
 /// a policy change by more than this.
 pub const MAX_AUTHZ_CACHE: &str = "5m";
 
-/// Namespace every job lives in until namespaces land.
-pub const DEFAULT_NAMESPACE: &str = "default";
-
 // ---------------------------------------------------------------------------
 // Policy objects
 // ---------------------------------------------------------------------------
@@ -129,14 +126,16 @@ pub struct NetSelector {
     /// `node.pool` globs. Real today (`daemon.rs` registration field).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub node_pools: Vec<String>,
-    /// Namespace globs. Every job is in `default` until namespaces land, so a
-    /// selector written now keeps working when they do.
+    /// Namespace globs, matched against the namespace of the task's job
+    /// (docs/namespaces.md).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub namespaces: Vec<String>,
     /// Task runtime names (`sandbox`, `container`, `exec`, ...).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub runtimes: Vec<String>,
-    /// Job id globs (`agent-*`), the same style as `AclRule.names`.
+    /// Job name globs (`agent-*`), the same style as `AclRule.names`:
+    /// matched against the bare job name, so pair it with `namespaces` to
+    /// pick a job in one namespace.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub jobs: Vec<String>,
     /// Task `network.labels` that must all be present with these values.
@@ -149,8 +148,9 @@ pub struct NetSelector {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct NetSelectorFacts {
     pub node_pool: Option<String>,
-    pub namespace: String,
     pub runtime: String,
+    /// The task's canonical job id; its namespace and bare name are what the
+    /// `namespaces` and `jobs` selectors match.
     pub job: String,
     pub labels: BTreeMap<String, String>,
 }
@@ -170,11 +170,7 @@ impl NetSelector {
                 .node_pool
                 .as_deref()
                 .is_some_and(|pool| self.node_pools.iter().any(|glob| glob_matches(glob, pool)));
-        let namespace = if facts.namespace.is_empty() {
-            DEFAULT_NAMESPACE
-        } else {
-            facts.namespace.as_str()
-        };
+        let (namespace, job_name) = crate::structs::namespace::split_job_id(&facts.job);
         let ns_ok = self.namespaces.is_empty()
             || self
                 .namespaces
@@ -186,7 +182,7 @@ impl NetSelector {
                 .iter()
                 .any(|runtime| runtime.eq_ignore_ascii_case(&facts.runtime));
         let job_ok =
-            self.jobs.is_empty() || self.jobs.iter().any(|glob| glob_matches(glob, &facts.job));
+            self.jobs.is_empty() || self.jobs.iter().any(|glob| glob_matches(glob, job_name));
         let labels_ok = self
             .labels
             .iter()
@@ -1957,7 +1953,6 @@ mod tests {
         .unwrap();
         let mut facts = NetSelectorFacts {
             node_pool: Some("edge-eu".into()),
-            namespace: String::new(),
             runtime: "sandbox".into(),
             job: "agent-42".into(),
             labels: [("tier".to_string(), "free".to_string())]

@@ -6898,9 +6898,13 @@ impl Store {
 
     fn job_from_row(&self, row: &Row<'_>) -> Result<Job, rusqlite::Error> {
         let created_at: i64 = row.get(3)?;
+        let id: String = row.get(0)?;
+        let (namespace, name) = crate::structs::namespace::split_job_id(&id);
+        let (namespace, name) = (namespace.to_string(), name.to_string());
         let job = Job {
-            id: row.get(0)?,
-            name: row.get(1)?,
+            id,
+            name,
+            namespace,
             status: row.get(2)?,
             created_at,
             // NULL only for a row the backfill deliberately skipped (a
@@ -13305,7 +13309,6 @@ impl Store {
             .optional()?;
         let facts = crate::structs::netpolicy::NetSelectorFacts {
             node_pool: pool,
-            namespace: String::new(),
             runtime,
             job: job_id,
             labels: network.map(|n| n.labels.clone()).unwrap_or_default(),
@@ -13349,7 +13352,6 @@ impl Store {
                     .optional()?;
                 let facts = crate::structs::netpolicy::NetSelectorFacts {
                     node_pool: pool,
-                    namespace: String::new(),
                     runtime,
                     job: job_id,
                     labels: network.map(|n| n.labels.clone()).unwrap_or_default(),
@@ -13495,7 +13497,6 @@ impl Store {
                 .optional()?;
             let facts = crate::structs::netpolicy::NetSelectorFacts {
                 node_pool: pool,
-                namespace: String::new(),
                 runtime: runtime.clone(),
                 job: job_id,
                 labels: network.map(|n| n.labels.clone()).unwrap_or_default(),
@@ -15138,6 +15139,12 @@ impl Store {
     /// JSON (they cannot match a name anyway, and one hand-corrupted row must
     /// not take down every consumer's endpoint feed); the unfiltered form
     /// still surfaces them as an error.
+    ///
+    /// The filter is a canonical service reference: `web` for the service
+    /// in `default`, `payments-prod/web` for one in another namespace
+    /// (docs/namespaces.md). A service is identified by its namespace and
+    /// name, so two namespaces' `web` are two services: the name is seeked
+    /// in SQL and the namespace — the declaring job's — checked per row.
     pub fn service_endpoints(
         &self,
         service_filter: Option<&str>,
@@ -15145,8 +15152,10 @@ impl Store {
         let conn = self.read_connection()?;
         let sql = Self::service_endpoints_sql(service_filter.is_some());
         let mut stmt = conn.prepare(&sql)?;
+        let filter = service_filter.map(crate::structs::namespace::split_job_id);
+        let name_filter = filter.map(|(_, name)| name);
 
-        let rows = stmt.query_map(params_from_iter(service_filter.iter()), |row| {
+        let rows = stmt.query_map(params_from_iter(name_filter.iter()), |row| {
             Ok((
                 row.get::<_, String>(0)?,
                 row.get::<_, String>(1)?,
@@ -15175,6 +15184,11 @@ impl Store {
                 node_status,
                 node_config_attrs,
             ) = row?;
+            if let Some((namespace, _)) = filter {
+                if crate::structs::namespace::job_namespace(&job_id) != namespace {
+                    continue;
+                }
+            }
 
             let service: crate::structs::ServiceConfig = from_str(&service_raw)
                 .with_context(|| format!("invalid stored service config for task {task_name}"))?;

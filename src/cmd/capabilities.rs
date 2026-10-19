@@ -42,9 +42,9 @@ pub fn catalog() -> Vec<Capability> {
         // --- Jobs: read ---
         Capability {
             name: "job.list",
-            cli: "legion job list [--status STATUS]",
+            cli: "legion job list [--status STATUS] [-n NAMESPACES | -A]",
             grpc: Some("Manager/ListJobs"),
-            summary: "List all jobs and their status, optionally filtered to one status.",
+            summary: "List jobs and their status in the active namespace (or -n globs, or -A for every namespace you can read), optionally filtered to one status.",
             mutates: false,
             read_only_safe: true,
         },
@@ -87,6 +87,39 @@ pub fn catalog() -> Vec<Capability> {
             summary: "Emit the JSON Schema for jobspecs and built-in task runtimes.",
             mutates: false,
             read_only_safe: true,
+        },
+        // --- Namespaces (docs/namespaces.md) ---
+        Capability {
+            name: "namespace.list",
+            cli: "legion namespace list",
+            grpc: Some("Manager/ListNamespaces"),
+            summary: "List the namespaces this token can see, with job counts.",
+            mutates: false,
+            read_only_safe: true,
+        },
+        Capability {
+            name: "namespace.get",
+            cli: "legion namespace get <NAME>",
+            grpc: Some("Manager/GetNamespace"),
+            summary: "Show one namespace, what it holds by kind, and (with acl:read) the ACL rules that reach it.",
+            mutates: false,
+            read_only_safe: true,
+        },
+        Capability {
+            name: "namespace.apply",
+            cli: "legion namespace create <NAME> | legion namespace apply -f <FILE>",
+            grpc: Some("Manager/ApplyNamespace"),
+            summary: "Create a namespace or update its description and meta. --dry-run reports the ACL rules that would reach it.",
+            mutates: true,
+            read_only_safe: false,
+        },
+        Capability {
+            name: "namespace.delete",
+            cli: "legion namespace delete <NAME> [--cascade] [--dry-run]",
+            grpc: Some("Manager/DeleteNamespace"),
+            summary: "Delete a namespace. Refused while it holds anything; --cascade stops and destroys its contents first. --dry-run lists them.",
+            mutates: true,
+            read_only_safe: false,
         },
         // --- Jobs: write ---
         Capability {

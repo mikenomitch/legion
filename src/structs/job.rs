@@ -60,6 +60,39 @@ impl From<Job> for JobPrint {
     }
 }
 
+/// The job table for a list that spans namespaces (`legion job list -A`):
+/// [`JobPrint`] with a leading NAMESPACE column. A single-namespace list
+/// keeps the narrower table, so a single-team cluster never sees one.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Tabled)]
+#[serde(rename_all = "camelCase")]
+pub struct JobPrintNamespaced {
+    pub namespace: String,
+    pub name: String,
+    pub status: String,
+    pub priority: String,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+impl From<Job> for JobPrintNamespaced {
+    fn from(job: Job) -> Self {
+        let namespace = if job.namespace.is_empty() {
+            crate::structs::namespace::job_namespace(&job.id).to_string()
+        } else {
+            job.namespace.clone()
+        };
+        let print = JobPrint::from(job);
+        JobPrintNamespaced {
+            namespace,
+            name: print.name,
+            status: print.status,
+            priority: print.priority,
+            created_at: print.created_at,
+            updated_at: print.updated_at,
+        }
+    }
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone, Tabled)]
 #[serde(rename_all = "camelCase")]
 pub struct JobPlanPrint {
@@ -2317,6 +2350,9 @@ pub struct TaskKvInjections {
 
 #[derive(Serialize, Debug, Clone, PartialEq)]
 pub struct JobConfig {
+    /// The job's canonical id: `namespace/name`, or the bare name for a job
+    /// in `default` (`structs::namespace`). The jobspec spells it as `name`
+    /// plus an optional `namespace`; parsing folds the two together.
     pub name: String,
     pub tasks: Vec<TaskConfig>,
     /// How important this job is, relative to everything else on the
@@ -2335,6 +2371,12 @@ pub struct JobConfig {
 #[serde(rename_all = "camelCase")]
 struct JobConfigInput {
     name: String,
+    /// The namespace the job lives in (docs/namespaces.md). Optional; the
+    /// submit path resolves it against the request's namespace. Folded into
+    /// `JobConfig.name`, which holds the canonical job id (`ns/name`, or the
+    /// bare name in `default`).
+    #[serde(default)]
+    namespace: Option<String>,
     #[serde(default)]
     tasks: Option<TaskConfigList>,
     #[serde(default)]
@@ -2625,8 +2667,14 @@ impl<'de> Deserialize<'de> for JobConfig {
             Some(raw) => Band::parse(raw).map_err(D::Error::custom)?,
         };
 
+        // `name` may itself be qualified (`prod/web`, the form every reply
+        // prints); a qualified name that disagrees with `namespace` is an
+        // error, never a precedence rule.
+        let name =
+            crate::structs::namespace::resolve_job_ref(&input.name, input.namespace.as_deref())
+                .map_err(|err| D::Error::custom(format!("jobspec: {err}")))?;
         let mut config = JobConfig {
-            name: input.name,
+            name,
             tasks,
             priority,
             rollout: input.rollout,
