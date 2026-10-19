@@ -44,6 +44,7 @@ async fn main() -> R<()> {
         Some(("docs", sub_matches)) => cmd::docs::handle(sub_matches).await?,
         Some(("start", sub_matches)) => cmd::start::handle(sub_matches).await?,
         Some(("job", sub_matches)) => cmd::job::handle(sub_matches).await?,
+        Some(("namespace", sub_matches)) => cmd::namespace::handle(sub_matches).await?,
         Some(("template", sub_matches)) => cmd::template::handle(sub_matches).await?,
         Some(("instance", sub_matches)) => cmd::instance::handle(sub_matches).await?,
         Some(("node", sub_matches)) => cmd::node::handle(sub_matches).await?,

@@ -24,6 +24,7 @@ import {
 } from '../utils/usage'
 import { formatBytes } from '../utils/format'
 import { Badge, Dot, Meter, MonoBadge, RelativeTime, SectionCard, TableShell, cx, tableClass, tdClass, thClass, theadClass, trHoverClass } from './ui'
+import { jobPath } from '../utils/namespaces'
 
 /*
  * The worker page's Usage card, built from one GetNodeUsage reply: capacity
@@ -124,7 +125,7 @@ function AllocationLink(props: { allocation: NodeAllocationUsage }) {
   return (
     <span class="inline-flex flex-wrap items-center gap-1.5">
       <span class="font-mono text-xs">#{String(props.allocation.allocationId)}</span>
-      <A class="font-medium hover:text-brass-strong" href={`/jobs/${encodeURIComponent(props.allocation.jobId)}`}>
+      <A class="font-medium hover:text-brass-strong" href={`${jobPath(props.allocation.jobId)}`}>
         {props.allocation.jobId}
       </A>
     </span>

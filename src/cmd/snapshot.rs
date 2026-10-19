@@ -179,6 +179,7 @@ pub fn config() -> Command {
                         "Filter by state: capturing, local, published, failed, deleting, lost",
                     ),
                 )
+                .args(crate::cmd::helpers::list_namespace_flags())
                 .arg(json_flag()),
         )
         .subcommand(
@@ -466,10 +467,7 @@ fn print_snapshot(snapshot: &SnapshotInfo) {
 
 async fn create(matches: &ArgMatches) -> R<()> {
     let format = OutputFormat::from_matches(matches);
-    let instance = matches
-        .get_one::<String>("instance")
-        .context("instance id")?
-        .clone();
+    let instance = crate::cmd::helpers::required_instance_arg(matches, "instance")?;
     let kind = if matches.get_flag("memory") {
         "memory"
     } else {
@@ -590,8 +588,9 @@ async fn list(matches: &ArgMatches) -> R<()> {
         "failed to list snapshots",
         client
             .list_snapshots(tonic::Request::new(ListSnapshotsRequest {
-                job_id: matches.get_one::<String>("job").cloned(),
-                instance_id: matches.get_one::<String>("instance").cloned(),
+                namespaces: crate::cmd::helpers::namespace_selection(matches),
+                job_id: crate::cmd::helpers::job_arg(matches, "job")?,
+                instance_id: crate::cmd::helpers::instance_arg(matches, "instance")?,
                 state: matches.get_one::<String>("state").cloned(),
             }))
             .await,
@@ -628,7 +627,7 @@ async fn get(matches: &ArgMatches) -> R<()> {
                     .get_one::<String>("snapshot")
                     .context("snapshot")?
                     .clone(),
-                job_id: matches.get_one::<String>("job").cloned(),
+                job_id: crate::cmd::helpers::job_arg(matches, "job")?,
             }))
             .await,
     )?
@@ -723,10 +722,7 @@ async fn restore_outcome(
 
 async fn restore(matches: &ArgMatches) -> R<()> {
     let format = OutputFormat::from_matches(matches);
-    let instance_id = matches
-        .get_one::<String>("instance")
-        .context("instance id")?
-        .clone();
+    let instance_id = crate::cmd::helpers::required_instance_arg(matches, "instance")?;
     let mut client = connect_manager_client().await?;
     // The event cursor before the restore, so `--wait` reads this restore's
     // outcome and never an earlier one of the same snapshot.
@@ -855,7 +851,7 @@ async fn warm(matches: &ArgMatches) -> R<()> {
                     .get_one::<String>("snapshot")
                     .context("snapshot")?
                     .clone(),
-                job_id: matches.get_one::<String>("job").cloned(),
+                job_id: crate::cmd::helpers::job_arg(matches, "job")?,
                 constraints: matches
                     .get_many::<String>("constraint")
                     .map(|values| values.cloned().collect())

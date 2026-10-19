@@ -242,6 +242,7 @@ pub async fn run(opts: InstancesOptions) -> Result<Value> {
         clients[0]
             .clone()
             .run_job(tonic::Request::new(RunJobRequest {
+                namespace: Default::default(),
                 parsed_jobspec: spec.clone(),
                 submissions: vec![Submission {
                     path: format!("{}.json", opts.job),

@@ -241,6 +241,53 @@ impl DistinctTracker {
     }
 }
 
+/// What a task's permit says about its node pool, for admission checks
+/// that must know where a task may land (namespace policies).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PermitPool {
+    /// No `pool` rule: the implicit `pool = "default"`.
+    Implicit,
+    /// Exactly one pool, by plain `=` rules.
+    Exact(String),
+    /// A pool rule with another operator (`!=`, `matches`, ...), or rules
+    /// naming different pools: not provable from the spec alone.
+    Other,
+}
+
+/// Read a permit's pool requirement (see [`PermitPool`]).
+pub fn permit_pool(permit: &Value) -> R<PermitPool> {
+    let rules = parse_rules(permit, false)?;
+    let mut exact: Option<String> = None;
+    for rule in rules.iter().filter(|rule| rule.key == "pool") {
+        let value = match (&rule.operator, rule.value.as_ref().and_then(Value::as_str)) {
+            (Operator::Eq, Some(value)) => value,
+            _ => return Ok(PermitPool::Other),
+        };
+        match &exact {
+            Some(seen) if seen != value => return Ok(PermitPool::Other),
+            _ => exact = Some(value.to_string()),
+        }
+    }
+    Ok(exact.map_or(PermitPool::Implicit, PermitPool::Exact))
+}
+
+/// `permit` with a `pool = <pool>` rule added, in the permit's own form.
+pub fn with_permit_pool(permit: &Value, pool: &str) -> Value {
+    match permit {
+        Value::Array(items) => {
+            let mut items = items.clone();
+            items.push(serde_json::json!({ "key": "pool", "value": pool }));
+            Value::Array(items)
+        }
+        Value::Object(map) => {
+            let mut map = map.clone();
+            map.insert("pool".into(), Value::String(pool.to_string()));
+            Value::Object(map)
+        }
+        _ => serde_json::json!({ "pool": pool }),
+    }
+}
+
 fn parse_rules(value: &Value, allow_multiplier: bool) -> R<Vec<Rule>> {
     match value {
         Value::Null => Ok(Vec::new()),

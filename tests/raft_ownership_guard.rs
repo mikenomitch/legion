@@ -160,7 +160,7 @@ fn control_domain_ops_pass_the_ownership_guard() -> R<()> {
     store.upsert_acl_policy(
         "guard-policy",
         "guard",
-        r#"[{"resources": ["job"], "actions": ["read"]}]"#,
+        r#"[{"resources": ["job"], "namespaces": ["*"], "actions": ["read"]}]"#,
     )?;
     store.upsert_acl_user(
         "guard-user",

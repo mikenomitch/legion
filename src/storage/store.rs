@@ -850,8 +850,8 @@ struct AppliedEvictions {
     /// `allocation.preempted` events, staged in the transaction and
     /// published after it commits.
     events: Vec<SchedulerEventRecord>,
-    /// `(pool, band, count)` rows for `legion_preemptions_total`.
-    metric_rows: Vec<(String, String, u64)>,
+    /// `(pool, band, namespace, count)` rows for `legion_preemptions_total`.
+    metric_rows: Vec<(String, String, String, u64)>,
 }
 
 /// What a heartbeat from a given node costs.
@@ -6171,8 +6171,10 @@ impl Store {
         }
         if !preempted.victims.is_empty() {
             let metrics = crate::manager::telemetry::metrics();
-            for (pool, band, count) in preempted.metric_rows {
-                metrics.preemptions_total.inc_by(&[&pool, &band], count);
+            for (pool, band, namespace, count) in preempted.metric_rows {
+                metrics
+                    .preemptions_total
+                    .inc_by(&[&pool, &band, &namespace], count);
             }
             metrics.preemption_plans_total.inc(&["placed"]);
         }
@@ -6652,9 +6654,9 @@ impl Store {
             }
         }
 
-        // Metric rows, keyed by the victim's pool and band — the two axes an
-        // operator slices preemption rate by.
-        let mut metric_counts: BTreeMap<(String, String), u64> = BTreeMap::new();
+        // Metric rows, keyed by the victim's pool, band and namespace — the
+        // axes an operator slices preemption rate by.
+        let mut metric_counts: BTreeMap<(String, String, String), u64> = BTreeMap::new();
         for victim in &victims {
             let pool: String = tx
                 .query_row(
@@ -6669,7 +6671,8 @@ impl Store {
                 .find(|eviction| eviction.allocation_id == victim.id)
                 .map(|eviction| eviction.band.clone())
                 .unwrap_or_else(|| Band::default().as_str().to_string());
-            *metric_counts.entry((pool, band)).or_default() += 1;
+            let namespace = crate::structs::namespace::job_namespace(&victim.job_id).to_string();
+            *metric_counts.entry((pool, band, namespace)).or_default() += 1;
         }
 
         Ok(AppliedEvictions {
@@ -6677,7 +6680,7 @@ impl Store {
             events,
             metric_rows: metric_counts
                 .into_iter()
-                .map(|((pool, band), count)| (pool, band, count))
+                .map(|((pool, band, namespace), count)| (pool, band, namespace, count))
                 .collect(),
         })
     }
@@ -6898,9 +6901,13 @@ impl Store {
 
     fn job_from_row(&self, row: &Row<'_>) -> Result<Job, rusqlite::Error> {
         let created_at: i64 = row.get(3)?;
+        let id: String = row.get(0)?;
+        let (namespace, name) = crate::structs::namespace::split_job_id(&id);
+        let (namespace, name) = (namespace.to_string(), name.to_string());
         let job = Job {
-            id: row.get(0)?,
-            name: row.get(1)?,
+            id,
+            name,
+            namespace,
             status: row.get(2)?,
             created_at,
             // NULL only for a row the backfill deliberately skipped (a
@@ -10602,6 +10609,14 @@ impl Store {
                 was_update = true;
             }
         }
+        // Namespace policy quota and job count, inside this entry so racing
+        // submits serialize. An unchanged resubmit returned above: a job
+        // that was admitted stays admitted.
+        crate::storage::namespace_policy_store::enforce_admission_on(
+            tx,
+            &self.resource_policy,
+            &config,
+        )?;
 
         let now = OffsetDateTime::now_utc().unix_timestamp();
 
@@ -13235,21 +13250,29 @@ impl Store {
     /// in-task `to`, else its static host port — so a consumer's VIP can
     /// listen on the number the service is known by. `None` when the service
     /// is not (yet) submitted or declares only a dynamic port with no `to`.
-    fn declared_service_port(&self, tx: &Connection, service: &str) -> R<Option<u16>> {
+    /// The port a service declares, by its canonical reference
+    /// (`name` in `default`, else `namespace/name`): the newest task config
+    /// in that namespace advertising it.
+    fn declared_service_port(&self, tx: &Connection, service_ref: &str) -> R<Option<u16>> {
+        let (namespace, service) = crate::structs::namespace::split_job_id(service_ref);
         let mut stmt = tx.prepare_cached(
-            "SELECT network, service FROM task_config
+            "SELECT network, service, job_id FROM task_config
              WHERE service IS NOT NULL AND json_valid(service)
                AND COALESCE(json_extract(service, '$.name'), name) = ?
-             ORDER BY id DESC LIMIT 1;",
+             ORDER BY id DESC;",
         )?;
-        let row = stmt
-            .query_row([service], |row| {
-                Ok((
-                    row.get::<_, Option<String>>(0)?,
-                    row.get::<_, Option<String>>(1)?,
-                ))
-            })
-            .optional()?;
+        let mut rows = stmt.query([service])?;
+        let mut row = None;
+        while let Some(candidate) = rows.next()? {
+            let job_id: String = candidate.get(2)?;
+            if crate::structs::namespace::job_namespace(&job_id) == namespace {
+                row = Some((
+                    candidate.get::<_, Option<String>>(0)?,
+                    candidate.get::<_, Option<String>>(1)?,
+                ));
+                break;
+            }
+        }
         let Some((network_raw, service_raw)) = row else {
             return Ok(None);
         };
@@ -13305,7 +13328,6 @@ impl Store {
             .optional()?;
         let facts = crate::structs::netpolicy::NetSelectorFacts {
             node_pool: pool,
-            namespace: String::new(),
             runtime,
             job: job_id,
             labels: network.map(|n| n.labels.clone()).unwrap_or_default(),
@@ -13349,7 +13371,6 @@ impl Store {
                     .optional()?;
                 let facts = crate::structs::netpolicy::NetSelectorFacts {
                     node_pool: pool,
-                    namespace: String::new(),
                     runtime,
                     job: job_id,
                     labels: network.map(|n| n.labels.clone()).unwrap_or_default(),
@@ -13495,7 +13516,6 @@ impl Store {
                 .optional()?;
             let facts = crate::structs::netpolicy::NetSelectorFacts {
                 node_pool: pool,
-                namespace: String::new(),
                 runtime: runtime.clone(),
                 job: job_id,
                 labels: network.map(|n| n.labels.clone()).unwrap_or_default(),
@@ -13640,11 +13660,15 @@ impl Store {
             }
             let mut service_ports: HashMap<String, u16> = HashMap::new();
             if let Some(connect) = connect.as_ref() {
+                let consumer_job: String = tx
+                    .prepare_cached("SELECT job_id FROM task_config WHERE id = ?;")?
+                    .query_row([task_id], |row| row.get(0))?;
                 for upstream in &connect.upstreams {
                     if upstream.is_external() {
                         continue;
                     }
-                    if let Some(port) = self.declared_service_port(tx, &upstream.service)? {
+                    let target = upstream.service_ref(&consumer_job);
+                    if let Some(port) = self.declared_service_port(tx, &target)? {
                         service_ports.insert(upstream.key().to_string(), port);
                     }
                 }
@@ -15138,6 +15162,12 @@ impl Store {
     /// JSON (they cannot match a name anyway, and one hand-corrupted row must
     /// not take down every consumer's endpoint feed); the unfiltered form
     /// still surfaces them as an error.
+    ///
+    /// The filter is a canonical service reference: `web` for the service
+    /// in `default`, `payments-prod/web` for one in another namespace
+    /// (docs/namespaces.md). A service is identified by its namespace and
+    /// name, so two namespaces' `web` are two services: the name is seeked
+    /// in SQL and the namespace — the declaring job's — checked per row.
     pub fn service_endpoints(
         &self,
         service_filter: Option<&str>,
@@ -15145,8 +15175,10 @@ impl Store {
         let conn = self.read_connection()?;
         let sql = Self::service_endpoints_sql(service_filter.is_some());
         let mut stmt = conn.prepare(&sql)?;
+        let filter = service_filter.map(crate::structs::namespace::split_job_id);
+        let name_filter = filter.map(|(_, name)| name);
 
-        let rows = stmt.query_map(params_from_iter(service_filter.iter()), |row| {
+        let rows = stmt.query_map(params_from_iter(name_filter.iter()), |row| {
             Ok((
                 row.get::<_, String>(0)?,
                 row.get::<_, String>(1)?,
@@ -15175,6 +15207,11 @@ impl Store {
                 node_status,
                 node_config_attrs,
             ) = row?;
+            if let Some((namespace, _)) = filter {
+                if crate::structs::namespace::job_namespace(&job_id) != namespace {
+                    continue;
+                }
+            }
 
             let service: crate::structs::ServiceConfig = from_str(&service_raw)
                 .with_context(|| format!("invalid stored service config for task {task_name}"))?;
@@ -16689,6 +16726,24 @@ impl Store {
         Ok(instance)
     }
 
+    /// The instance promoted from session `session_id`, if one was. A
+    /// session's id is minted and cluster-unique, so this finds a named
+    /// promotion without knowing the namespace its new key was qualified in.
+    pub fn instance_promoted_from(&self, session_id: &str) -> R<Option<Instance>> {
+        let conn = self.read_connection()?;
+        let instance = conn
+            .query_row(
+                &format!(
+                    "SELECT {} FROM instance WHERE promoted_from = ? LIMIT 1;",
+                    crate::storage::queries::INSTANCE_SELECT_ATTRS
+                ),
+                [session_id],
+                |row| self.instance_from_row(row),
+            )
+            .optional()?;
+        Ok(instance)
+    }
+
     /// Whether an instance row exists (live, stopped, or a tombstone), read
     /// through the write connection. Only meaningful inside an op body,
     /// where it sees rows that this op and its group-commit batch-mates
@@ -17112,7 +17167,15 @@ impl Store {
         requested_id: Option<&str>,
     ) -> R<String> {
         let now = Self::now_rfc3339()?;
-        let instance_id = match requested_id {
+        // A caller's key is qualified by the job's namespace, so keys and
+        // their tombstones are unique per namespace, not cluster-wide.
+        let qualified = requested_id.map(|key| {
+            crate::structs::namespace::qualify_instance_in(
+                crate::structs::namespace::job_namespace(job_id),
+                key,
+            )
+        });
+        let instance_id = match qualified.as_deref() {
             Some(id) => {
                 if Self::instance_id_exists_tx(tx, id)? {
                     bail!(StorageError::Conflict {
@@ -17251,9 +17314,11 @@ impl Store {
     /// RunJob seeding half; see the field docs on
     /// [`crate::structs::StatefulConfig::initial_instances`]).
     ///
-    /// Ids that have never existed are created as `pending` keyed rows; ids
-    /// that already exist in ANY state — live, stopped, or a terminated
-    /// tombstone, even under another job — are skipped silently
+    /// Each id is a key, qualified by the job's namespace
+    /// ([`crate::structs::namespace::instance_id`]). Ids that have never
+    /// existed are created as `pending` keyed rows; ids that already exist in
+    /// ANY state — live, stopped, or a terminated tombstone, even under
+    /// another job of the namespace — are skipped silently
     /// (`INSERT OR IGNORE`), so resubmits are idempotent and a deliberately
     /// destroyed id is never resurrected. Returns the ids actually created
     /// by this call.
@@ -17317,7 +17382,9 @@ impl Store {
         let mut conn = self.write_connection()?;
         let tx = Self::write_tx(&mut conn)?;
         let mut created = Vec::new();
-        for id in ids {
+        let namespace = crate::structs::namespace::job_namespace(job_id);
+        for key in ids {
+            let id = crate::structs::namespace::qualify_instance_in(namespace, key);
             let inserted = tx.execute(
                 "INSERT OR IGNORE INTO instance (instance_id, job_id, group_name, task_name, \
                  mode, state, slot_index, current_alloc_id, storage_handle, created_at, \
@@ -17326,7 +17393,7 @@ impl Store {
                 params![id, job_id, group, task_name, now],
             )?;
             if inserted > 0 {
-                created.push(id.clone());
+                created.push(id);
             }
         }
         tx.commit()?;
@@ -29286,6 +29353,59 @@ mod tests {
         let minted_two = store.create_keyed_instance(job_id, "default", "sandbox", None)?;
         assert_ne!(minted.instance_id, minted_two.instance_id);
         assert!(store.get_instance("user-a")?.context("tombstone")?.named);
+        Ok(())
+    }
+
+    /// Keys are qualified by the job's namespace: the same key in two
+    /// namespaces is two instances, and a tombstone blocks only its own.
+    #[test]
+    fn keyed_instance_ids_are_unique_per_namespace() -> R<()> {
+        let store = setup_store()?;
+        submit_job(&store, "web", vec![stateful_keyed_task("sandbox", true)])?;
+        submit_job(
+            &store,
+            "payments/web",
+            vec![stateful_keyed_task("sandbox", true)],
+        )?;
+
+        let plain = store.create_keyed_instance("web", "default", "sandbox", Some("user-a"))?;
+        assert_eq!(plain.instance_id, "user-a");
+        let qualified =
+            store.create_keyed_instance("payments/web", "default", "sandbox", Some("user-a"))?;
+        assert_eq!(qualified.instance_id, "payments/user-a");
+        assert_eq!(qualified.job_id, "payments/web");
+
+        let err = store
+            .create_keyed_instance("payments/web", "default", "sandbox", Some("user-a"))
+            .expect_err("a key repeats only once per namespace");
+        assert!(matches!(
+            StorageError::from_anyhow(&err),
+            Some(StorageError::Conflict { .. })
+        ));
+        // Already-canonical input is not qualified twice.
+        let err = store
+            .create_keyed_instance(
+                "payments/web",
+                "default",
+                "sandbox",
+                Some("payments/user-a"),
+            )
+            .expect_err("the same instance");
+        assert!(format!("{err:#}").contains("payments/user-a"), "{err:#}");
+
+        // Minted ids stay bare in every namespace.
+        let minted = store.create_keyed_instance("payments/web", "default", "sandbox", None)?;
+        assert!(crate::structs::is_minted_instance_id(&minted.instance_id));
+        assert!(!minted.instance_id.contains('/'));
+
+        // Seeds qualify the same way.
+        let seeded = store.seed_keyed_instances(
+            "payments/web",
+            "default",
+            "sandbox",
+            &["user-b".to_string(), "user-a".to_string()],
+        )?;
+        assert_eq!(seeded, vec!["payments/user-b".to_string()]);
         Ok(())
     }
 

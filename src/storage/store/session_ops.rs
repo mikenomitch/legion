@@ -50,10 +50,14 @@ impl Store {
     fn promote_session_apply(&self, promote: &PromoteSession) -> R<PromotedSession> {
         let mut conn = self.write_connection()?;
         let tx = Self::write_tx(&mut conn)?;
-        let instance_id = promote
-            .new_id
-            .clone()
-            .unwrap_or_else(|| promote.session_id.clone());
+        // A new name is a key in the session's namespace, like any other.
+        let instance_id = match promote.new_id.as_deref() {
+            Some(key) => crate::structs::namespace::qualify_instance_in(
+                crate::structs::namespace::job_namespace(&promote.job_id),
+                key,
+            ),
+            None => promote.session_id.clone(),
+        };
         let named = promote.new_id.is_some();
         if Self::instance_id_exists_tx(&tx, &instance_id)? {
             bail!(StorageError::Conflict {

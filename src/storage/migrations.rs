@@ -2094,6 +2094,39 @@ fn migration_list() -> Vec<M<'static>> {
         DROP INDEX IF EXISTS idx_gang_member_job;
         DROP TABLE IF EXISTS gang_member;",
         ),
+        // Namespaces (docs/namespaces.md): the name scope, permission scope
+        // and policy anchor jobs live in. `default` always exists and cannot
+        // be deleted. A job's namespace is part of its id (`ns/name`, or the
+        // bare name in `default`), so no job-keyed table changes shape.
+        // `meta` is free-form JSON (`{"owner": "payments"}`) Legion never
+        // reads. Control lane, like the jobs it scopes.
+        M::up(
+            "CREATE TABLE IF NOT EXISTS namespace (
+            name STRING PRIMARY KEY,
+            description STRING NOT NULL DEFAULT '',
+            meta TEXT NOT NULL DEFAULT '{}',
+            created_at STRING NOT NULL,
+            updated_at STRING NOT NULL
+        );
+        INSERT OR IGNORE INTO namespace (name, description, meta, created_at, updated_at)
+            VALUES ('default', 'The default namespace', '{}',
+                    strftime('%Y-%m-%dT%H:%M:%SZ', 'now'), strftime('%Y-%m-%dT%H:%M:%SZ', 'now'));",
+        )
+        .down("DROP TABLE IF EXISTS namespace;"),
+        // Namespace policies (docs/namespaces.md, "Namespace policies"):
+        // cluster objects that select namespaces by glob and carry quota,
+        // counts and allowlists. `object` is the normalized policy as JSON.
+        // Control lane with `job` and `namespace`, so admission reads them
+        // inside the write it guards.
+        M::up(
+            "CREATE TABLE IF NOT EXISTS namespace_policy (
+            name STRING PRIMARY KEY,
+            object TEXT NOT NULL,
+            created_at STRING NOT NULL,
+            updated_at STRING NOT NULL
+        );",
+        )
+        .down("DROP TABLE IF EXISTS namespace_policy;"),
     ]
 }
 

@@ -4,6 +4,7 @@ import type { ServiceEndpoint } from '../gen/legion_pb'
 import type { AllocNetwork } from '../utils/allocations'
 import { PUBLIC_ADDRESS_HINT, endpointAddress, endpointUrl, isPrivateHost } from '../utils/services'
 import { Badge, CopyButton, EmptyState, Icon, StatusBadge, TableShell, cx, tableClass, tdClass, thClass, theadClass, trHoverClass } from './ui'
+import { jobPath } from '../utils/namespaces'
 
 /**
  * The address of one endpoint: a link when the browser can open it, the bare
@@ -112,7 +113,7 @@ export function ServiceEndpointsTable(props: {
                     <td class={tdClass}>
                       <A
                         class="text-muted hover:text-brass-strong"
-                        href={`/jobs/${encodeURIComponent(endpoint.jobId)}/tasks/${encodeURIComponent(endpoint.taskName)}`}
+                        href={`${jobPath(endpoint.jobId)}/tasks/${encodeURIComponent(endpoint.taskName)}`}
                       >
                         {endpoint.taskName}
                       </A>

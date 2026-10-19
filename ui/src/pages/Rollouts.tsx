@@ -5,6 +5,7 @@ import { checkboxClass } from '../components/ui'
 import { managerClient } from '../grpcClient'
 import { debounced } from '../utils/debounce'
 import { INDEX_POLL_INTERVAL_MS, retainOnError, swallowDenied, usePoll } from '../utils/polling'
+import { useNamespaceSelection } from '../components/NamespaceSwitcher'
 
 const isActiveStatus = (status: string) => !['completed', 'failed', 'cancelled', 'completed_incomplete'].includes(status.toLowerCase())
 
@@ -17,8 +18,9 @@ function RolloutsContent() {
   const [activeOnly, setActiveOnly] = createSignal(false)
   const tick = usePoll(INDEX_POLL_INTERVAL_MS)
 
+  const selection = useNamespaceSelection()
   createEffect(() => {
-    search(); sort(); activeOnly(); setPage(1)
+    search(); sort(); activeOnly(); selection(); setPage(1)
   })
 
   // node:read garnish; degrade for job-scoped tokens (see Jobs.tsx).
@@ -40,13 +42,21 @@ function RolloutsContent() {
   })
 
   const [data] = createResource(
-    () => ({ search: searchQuery(), sort: sort(), page: page(), pageSize: pageSize(), activeOnly: activeOnly(), tick: tick() }),
+    () => ({ search: searchQuery(), sort: sort(), page: page(), pageSize: pageSize(), activeOnly: activeOnly(), namespaces: selection(), tick: tick() }),
     retainOnError(
-      async (input: { search: string; sort: string; page: number; pageSize: number; activeOnly: boolean; tick: number }) => {
+      async (input: { search: string; sort: string; page: number; pageSize: number; activeOnly: boolean; namespaces: string[]; tick: number }) => {
         const [sortBy, sortOrder] = input.sort.split(':')
-        return managerClient.listRollouts({ query: input.search, sortBy, sortOrder, page: input.page, pageSize: input.pageSize, activeOnly: input.activeOnly })
+        return managerClient.listRollouts({
+          query: input.search,
+          sortBy,
+          sortOrder,
+          page: input.page,
+          pageSize: input.pageSize,
+          activeOnly: input.activeOnly,
+          namespaces: input.namespaces,
+        })
       },
-      (input) => `${input.search}|${input.sort}|${input.page}|${input.pageSize}|${input.activeOnly}`,
+      (input) => `${input.search}|${input.sort}|${input.page}|${input.pageSize}|${input.activeOnly}|${input.namespaces.join(',')}`,
     ),
   )
 

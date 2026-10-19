@@ -1192,6 +1192,10 @@ pub fn resume_identity(
         .or_else(|| allocation.instance_id.clone());
     if let Some(instance_id) = instance_id.as_deref() {
         env.insert("LEGION_INSTANCE_ID".into(), instance_id.to_string());
+        env.insert(
+            "LEGION_INSTANCE_KEY".into(),
+            crate::structs::namespace::instance_key(instance_id).to_string(),
+        );
     }
     crate::structs::checkpoint::ResumeIdentity {
         alloc_id: allocation.id,

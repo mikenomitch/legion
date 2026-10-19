@@ -329,11 +329,17 @@ async fn policy_apply(arg_matches: &ArgMatches) -> R<()> {
             }))
             .await,
     )?;
-    let policy = response.into_inner().policy.unwrap_or_default();
+    let reply = response.into_inner();
+    let policy = reply.policy.unwrap_or_default();
 
     if format.is_json() {
-        output::print_success(&policy_json(&policy));
+        let mut data = policy_json(&policy);
+        data["warnings"] = json!(reply.warnings);
+        output::print_success(&data);
     } else {
+        for warning in &reply.warnings {
+            eprintln!("warning: {warning}");
+        }
         println!("Applied ACL policy `{}`", policy.name);
     }
     Ok(())

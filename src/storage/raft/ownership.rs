@@ -172,6 +172,13 @@ const TABLE_OWNERS: &[(&str, Owner)] = &[
     // bumped inside the same replicated write.
     ("net_policy", Owner::Lane(Lane::Control)),
     ("net_policy_meta", Owner::Lane(Lane::Control)),
+    // Namespaces (docs/namespaces.md): operator intent, written by
+    // ApplyNamespace/DeleteNamespace. Control lane with `job`, so the
+    // "delete only if empty" check and the delete are one entry.
+    ("namespace", Owner::Lane(Lane::Control)),
+    // Namespace policies: cluster governance objects, read by admission
+    // inside the control-lane submit and namespace-create entries.
+    ("namespace_policy", Owner::Lane(Lane::Control)),
     ("net_mesh_ca", Owner::Lane(Lane::Control)),
     // The leader's view of the cluster CA (docs/cluster-ca.md): written
     // when the control-lane leader's provider reports a new CA.

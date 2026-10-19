@@ -37,6 +37,8 @@ import {
   sessionsOnNodes,
 } from '../../utils/sessions'
 import { bytesToMiB, fetchAllocationUsageByNode, formatIdle, formatMiB, reservationLabel } from '../../utils/usage'
+import { jobIdFromParams, jobIdOf, jobNamespace, jobPath, servicePath } from '../../utils/namespaces'
+import { DetailNamespaceSwitcher } from '../../components/NamespaceSwitcher'
 
 // Allocation rows the job page renders per "Show more".
 const ALLOCATION_PAGE = 200
@@ -56,7 +58,7 @@ const JOB_STATUS_HINTS: Record<string, string> = {
 function JobDetailContent() {
   const params = useParams()
   const navigate = useNavigate()
-  const jobName = createMemo(() => decodeURIComponent(params.id))
+  const jobName = createMemo(() => jobIdFromParams({ namespace: decodeURIComponent(params.namespace), name: decodeURIComponent(params.name) }))
   const [activeTab, setActiveTab] = createSignal<'overview' | 'spec' | 'logs'>('overview')
   const [actionMessage, setActionMessage] = createSignal('')
   const [actionFailed, setActionFailed] = createSignal(false)
@@ -77,7 +79,7 @@ function JobDetailContent() {
       managerClient.listRollouts({ jobId: name, activeOnly: false, page: 1, pageSize: 200 }),
       managerClient.getJobSpec({ name: name }),
       managerClient.listJobSpecHistory({ name: name }),
-      managerClient.listServices({}),
+      managerClient.listServices({ namespaces: [jobNamespace(name)] }),
       // Preemption history: what displaced this job's allocations, and when.
       // Best-effort — the event journal is bounded (~10k rows), so this is an
       // observability surface rather than an audit log, and a job whose
@@ -121,7 +123,7 @@ function JobDetailContent() {
       await Promise.all(
         jobServices.map((service) =>
           managerClient
-            .resolveService({ service: service.service, includeUnhealthy: true })
+            .resolveService({ service: jobIdOf(service.namespace, service.service), includeUnhealthy: true })
             .then((reply) => reply.endpoints)
             .catch(() => []),
         ),
@@ -407,7 +409,14 @@ function JobDetailContent() {
       <Show when={jobData()?.name === jobName()} fallback={<div class="py-6"><Spinner label="Loading job…" /></div>}>
         <div>
           <PageHeader
-            eyebrow="Job"
+            eyebrow={
+              <>
+                <A class="hover:text-brass-strong" href={`/jobs?ns=${encodeURIComponent(jobNamespace(jobName()))}`}>
+                  {jobNamespace(jobName())}
+                </A>
+                {' / '}Job
+              </>
+            }
             title={jobData()!.job?.name || jobData()!.job?.id}
             subtitle={
               <>
@@ -455,6 +464,7 @@ function JobDetailContent() {
             }
             actions={
               <>
+                <DetailNamespaceSwitcher namespace={jobNamespace(jobName())} listPath="/jobs" />
                 <Show when={isStoppable()}>
                   <ConfirmButton
                     label="Stop job"
@@ -564,7 +574,7 @@ function JobDetailContent() {
                                   runtime()?.statuses[0] ?? (statusLoading() ? 'loading' : session ? 'no envelopes' : 'not allocated')
                                 return (
                                   <A
-                                    href={`/jobs/${encodeURIComponent(jobName())}/tasks/${encodeURIComponent(task.name)}`}
+                                    href={`${jobPath(jobName())}/tasks/${encodeURIComponent(task.name)}`}
                                     class="group rounded-lg border border-line bg-surface p-3 transition-colors hover:border-brass/50 hover:bg-surface2/50"
                                   >
                                     <div class="flex items-start justify-between gap-2">
@@ -633,7 +643,7 @@ function JobDetailContent() {
                         return (
                           <div class="p-4">
                             <div class="mb-2.5 flex flex-wrap items-center gap-2">
-                              <A href={`/services/${encodeURIComponent(service.service)}`} class="font-medium text-ink hover:text-brass-strong">
+                              <A href={servicePath(service.namespace, service.service)} class="font-medium text-ink hover:text-brass-strong">
                                 {service.service}
                               </A>
                               <StatusBadge
@@ -779,7 +789,7 @@ function JobDetailContent() {
                                 <Show when={allocation.taskName} fallback={<span class="text-faint">—</span>}>
                                   <A
                                     class="text-muted hover:text-brass-strong"
-                                    href={`/jobs/${encodeURIComponent(jobName())}/tasks/${encodeURIComponent(allocation.taskName)}`}
+                                    href={`${jobPath(jobName())}/tasks/${encodeURIComponent(allocation.taskName)}`}
                                   >
                                     {allocation.taskName}
                                   </A>
@@ -803,7 +813,7 @@ function JobDetailContent() {
                               <td class={tdClass}>
                                 <Show when={allocation.instanceId} fallback={<span class="text-faint">—</span>}>
                                   <A
-                                    href={`/jobs/${encodeURIComponent(jobName())}/instances/${encodeURIComponent(allocation.instanceId!)}`}
+                                    href={`${jobPath(jobName())}/instances/${encodeURIComponent(allocation.instanceId!)}`}
                                     title={`Stateful instance ${allocation.instanceId}`}
                                   >
                                     <MonoBadge class="hover:border-brass/50">{allocation.instanceId}</MonoBadge>
@@ -839,7 +849,7 @@ function JobDetailContent() {
                                 <A class="text-muted hover:text-brass-strong" href={`/nodes/${encodeURIComponent(allocation.nodeId)}`}>{allocation.nodeId}</A>
                               </td>
                               <td class={tdClass}>
-                                <A class="font-mono text-xs text-muted hover:text-brass-strong" href={`/jobs/${encodeURIComponent(jobName())}/specs/${encodeURIComponent(allocation.jobConfigId)}`}>
+                                <A class="font-mono text-xs text-muted hover:text-brass-strong" href={`${jobPath(jobName())}/specs/${encodeURIComponent(allocation.jobConfigId)}`}>
                                   {allocation.jobConfigId}
                                 </A>
                               </td>
@@ -891,9 +901,9 @@ function JobDetailContent() {
                               <td class={tdClass}><StatusBadge status={rollout.status} /></td>
                               <td class={tdClass}>
                                 <span class="inline-flex flex-wrap items-center gap-1.5 font-mono text-xs text-muted">
-                                  <A class="hover:text-brass-strong" href={`/jobs/${encodeURIComponent(jobName())}/specs/${encodeURIComponent(rollout.fromJobConfigId || '')}`}>{rollout.fromJobConfigId || '—'}</A>
+                                  <A class="hover:text-brass-strong" href={`${jobPath(jobName())}/specs/${encodeURIComponent(rollout.fromJobConfigId || '')}`}>{rollout.fromJobConfigId || '—'}</A>
                                   <span class="text-faint">→</span>
-                                  <A class="hover:text-brass-strong" href={`/jobs/${encodeURIComponent(jobName())}/specs/${encodeURIComponent(rollout.toJobConfigId)}`}>{rollout.toJobConfigId}</A>
+                                  <A class="hover:text-brass-strong" href={`${jobPath(jobName())}/specs/${encodeURIComponent(rollout.toJobConfigId)}`}>{rollout.toJobConfigId}</A>
                                 </span>
                               </td>
                               <td class={tdClass + ' whitespace-nowrap text-right text-xs text-faint'}><RelativeTime value={rollout.updatedAt} /></td>
@@ -954,7 +964,7 @@ function JobDetailContent() {
                                 <td class={tdClass}>
                                   <Show when={meta.preemptorJob} fallback={<span class="text-faint">—</span>}>
                                     {(job) => (
-                                      <A href={`/jobs/${encodeURIComponent(job())}`} class="font-medium hover:text-brass-strong">
+                                      <A href={`${jobPath(job())}`} class="font-medium hover:text-brass-strong">
                                         {job()}
                                       </A>
                                     )}
@@ -1008,7 +1018,7 @@ function JobDetailContent() {
                           {(item) => (
                             <tr class={trHoverClass}>
                               <td class={tdClass}>
-                                <A href={`/jobs/${encodeURIComponent(jobName())}/specs/${encodeURIComponent(item.configId)}`} class="font-mono text-xs font-medium hover:text-brass-strong">
+                                <A href={`${jobPath(jobName())}/specs/${encodeURIComponent(item.configId)}`} class="font-mono text-xs font-medium hover:text-brass-strong">
                                   {item.configId}
                                 </A>
                               </td>

@@ -260,9 +260,9 @@ task's next heartbeat, with no restart, rollout, or job edit.
     "priority" = 100,
     selector = {
         nodePools = ["untrusted"],       # node.pool globs
-        namespaces = ["default"],        # every job is in `default` (no user namespaces)
+        namespaces = ["agents-*"],       # namespace globs (docs/namespaces.md)
         runtimes = ["sandbox"],
-        jobs = ["agent-*"],              # job id globs
+        jobs = ["agent-*"],              # globs over the job's bare name
         labels = { tier = "free" },      # task network.labels that must all match
     },
     enforcement = "require",             # require | default
@@ -541,7 +541,10 @@ to its macOS ones. In that block:
 
 - **`.1` is the allocation's resolver**, exported as `LEGION_DNS`. It answers
   `<key>.svc.legion` (and bare `<key>`, through the `svc.legion` search
-  domain) with that allocation's upstream VIP. SRV records carry the port.
+  domain) with that allocation's upstream VIP. An upstream that crosses into
+  another [namespace](namespaces.md#services-and-the-mesh) is keyed
+  `<service>.<namespace>`, so it answers `auth.shared.svc.legion` (and the SRV
+  form `_auth._tcp.shared.svc.legion`). SRV records carry the port.
   Other names are forwarded to the host's resolvers after the egress policy
   has checked the name. A host the policy would deny gets `NXDOMAIN` in one
   round trip and a `net.denied` event (`protocol: dns`), instead of a
@@ -1725,5 +1728,7 @@ This section lists what that covers and what it does not.
   or when the node should add a credential the task never holds
   ([Credential injection](#credential-injection)): both work because the
   task speaks plaintext to the node and the node opens TLS itself.
-- **Legion has no job namespaces.** Every job is in `default`, so
-  `selector.namespaces` either matches every job or none.
+- **Net policies are cluster objects.** `selector.namespaces` matches each
+  task's real [namespace](namespaces.md), but writing a policy needs a
+  cluster-wide `net:write`: a namespace's tenants cannot author policy for
+  their own namespace.

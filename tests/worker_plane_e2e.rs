@@ -425,7 +425,7 @@ fn direct_exec_runs_on_the_worker_and_ends_when_its_token_is_revoked_test() {
         "apply",
         "direct-exec",
         "--rules",
-        r#"[{"resources":["exec"],"actions":["write"],"names":["direct"],"host":true},{"resources":["job"],"actions":["read"]}]"#,
+        r#"[{"resources":["exec"], "namespaces": ["*"],"actions":["write"],"names":["direct"],"host":true},{"resources":["job"], "namespaces": ["*"],"actions":["read"]}]"#,
     ]);
     assert_eq!(policy["ok"], true, "{policy}");
     let token = cluster.cli_json(&[

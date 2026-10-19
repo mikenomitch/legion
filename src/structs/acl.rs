@@ -11,6 +11,8 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::structs::namespace::split_job_id;
+
 /// Resource types ACL rules can cover.
 ///
 /// Deliberately a short, closed list: every gRPC endpoint maps onto exactly
@@ -66,6 +68,13 @@ pub enum AclResource {
     /// included: `snapshot:write` on a job is equivalent to reading its
     /// in-memory secrets, which `job:write` alone should not grant.
     Snapshot,
+    /// Namespace objects (`legion namespace`, docs/namespaces.md): `read`
+    /// fetches one, `write` creates, updates and deletes namespaces whose
+    /// names match the rule's `namespaces` selector — so a team lead can be
+    /// handed `payments-*` without being a cluster administrator. Separate
+    /// from `operator` for the reason `scale` and `boot` are: "may create a
+    /// namespace" must not imply "may reconfigure raft".
+    Namespace,
 }
 
 impl AclResource {
@@ -84,14 +93,47 @@ impl AclResource {
             AclResource::Boot => "boot",
             AclResource::Net => "net",
             AclResource::Snapshot => "snapshot",
+            AclResource::Namespace => "namespace",
         }
     }
 
     pub fn all() -> &'static [&'static str] {
         &[
-            "job", "node", "kv", "state", "operator", "acl", "exec", "action", "template", "scale",
-            "boot", "net", "snapshot",
+            "job",
+            "node",
+            "kv",
+            "state",
+            "operator",
+            "acl",
+            "exec",
+            "action",
+            "template",
+            "scale",
+            "boot",
+            "net",
+            "snapshot",
+            "namespace",
         ]
+    }
+
+    /// Resources whose scopes always carry a namespace. An allow rule naming
+    /// one of these must say which namespaces it covers (see
+    /// [`parse_rules`]); the rest are cluster-scoped and never carry one.
+    pub fn namespaced() -> &'static [&'static str] {
+        &[
+            "job",
+            "exec",
+            "action",
+            "scale",
+            "boot",
+            "snapshot",
+            "namespace",
+        ]
+    }
+
+    /// Whether this resource's scopes carry a namespace.
+    pub fn is_namespaced(&self) -> bool {
+        Self::namespaced().contains(&self.as_str())
     }
 }
 
@@ -119,14 +161,20 @@ impl AclAction {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct AclRule {
     /// Resource types: `job`, `node`, `kv`, `state`, `operator`, `acl`,
-    /// `exec`, `action`, `template`, `scale`, `boot`, `net`, `snapshot`, `*`.
+    /// `exec`, `action`, `template`, `scale`, `boot`, `net`, `snapshot`,
+    /// `namespace`, `*`.
     pub resources: Vec<String>,
     /// Actions: `read`, `write`, `*`.
     pub actions: Vec<String>,
     /// `allow` (default) or `deny`. A matching deny overrides any allow.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub effect: Option<String>,
-    /// Glob selectors over job namespaces (jobs live in `default` today).
+    /// Glob selectors over namespaces. Required on allow rules that name a
+    /// namespaced resource (`job`, `exec`, `action`, `scale`, `boot`,
+    /// `snapshot`, `namespace`), and rejected on rules that name only
+    /// cluster-scoped ones: `["*"]` is how a rule says "every namespace,
+    /// including ones created later", so that reach is always written, never
+    /// implied by leaving the selector out (docs/namespaces.md).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub namespaces: Option<Vec<String>>,
     /// Glob selectors over job names.
@@ -232,9 +280,6 @@ pub struct AclScope {
     pub host: bool,
 }
 
-/// Namespace assigned to all jobs until Legion grows real namespaces.
-pub const DEFAULT_NAMESPACE: &str = "default";
-
 impl AclScope {
     /// Scope with no instance attributes (endpoints with nothing to select on).
     pub fn none() -> Self {
@@ -249,11 +294,35 @@ impl AclScope {
         }
     }
 
-    /// Scope for a job, in the implicit default namespace.
-    pub fn job(name: &str) -> Self {
+    /// Scope for a job, from its canonical id (`web` in `default`,
+    /// `payments-prod/web` elsewhere; see `structs::namespace`). The scope
+    /// carries the namespace and the *bare* name as separate attributes, so
+    /// a `names: ["web-*"]` rule means the same thing in every namespace.
+    pub fn job(job_id: &str) -> Self {
+        let (namespace, name) = split_job_id(job_id);
         AclScope {
-            namespace: Some(DEFAULT_NAMESPACE.to_string()),
+            namespace: Some(namespace.to_string()),
             name: Some(name.to_string()),
+            ..Default::default()
+        }
+    }
+
+    /// Scope for a job-kind object that no namespace owns (a volume created
+    /// with no job). It carries the namespace `*` — not a legal namespace
+    /// name, so it never collides with one — which only a rule whose
+    /// `namespaces` selector reaches every namespace (`["*"]`) matches: such
+    /// an object takes cluster-wide authority, exactly as before namespaces.
+    pub fn unowned() -> Self {
+        AclScope {
+            namespace: Some("*".to_string()),
+            ..Default::default()
+        }
+    }
+
+    /// Scope for a namespace object (namespace CRUD endpoints).
+    pub fn namespace(name: &str) -> Self {
+        AclScope {
+            namespace: Some(name.to_string()),
             ..Default::default()
         }
     }
@@ -274,23 +343,20 @@ impl AclScope {
         }
     }
 
-    /// Scope for an exec session into a job. `host` marks host-level kinds.
-    pub fn exec(job: &str, host: bool) -> Self {
+    /// Scope for an exec session into a job (by canonical id). `host` marks
+    /// host-level kinds.
+    pub fn exec(job_id: &str, host: bool) -> Self {
         AclScope {
-            namespace: Some(DEFAULT_NAMESPACE.to_string()),
-            name: Some(job.to_string()),
             host,
-            ..Default::default()
+            ..Self::job(job_id)
         }
     }
 
-    /// Scope for running an action on a job.
-    pub fn action(job: &str, action_name: &str) -> Self {
+    /// Scope for running an action on a job (by canonical id).
+    pub fn action(job_id: &str, action_name: &str) -> Self {
         AclScope {
-            namespace: Some(DEFAULT_NAMESPACE.to_string()),
-            name: Some(job.to_string()),
             action_name: Some(action_name.to_string()),
-            ..Default::default()
+            ..Self::job(job_id)
         }
     }
 
@@ -303,14 +369,13 @@ impl AclScope {
     }
 
     /// Scope for submitting a job through a template (RunJobTemplate /
-    /// RenderJobTemplate): the rendered job name plus the template it came
-    /// through, so both `names` and `templates` selectors apply.
-    pub fn job_via_template(job: &str, template: &str) -> Self {
+    /// RenderJobTemplate): the rendered job (by canonical id, so it carries
+    /// the target namespace) plus the template it came through, so the
+    /// `namespaces`, `names` and `templates` selectors all apply.
+    pub fn job_via_template(job_id: &str, template: &str) -> Self {
         AclScope {
-            namespace: Some(DEFAULT_NAMESPACE.to_string()),
-            name: Some(job.to_string()),
             template: Some(template.to_string()),
-            ..Default::default()
+            ..Self::job(job_id)
         }
     }
 
@@ -427,7 +492,12 @@ fn rule_matches(
     {
         return false;
     }
-    selector_matches(&rule.namespaces, &scope.namespace)
+    scope
+        .namespace
+        .as_deref()
+        .map_or(rule.namespaces.is_none(), |namespace| {
+            namespace_selector_matches(rule, namespace)
+        })
         && selector_matches(&rule.names, &scope.name)
         && selector_matches(&rule.pools, &scope.pool)
         && selector_matches(&rule.paths, &scope.path)
@@ -469,6 +539,34 @@ pub fn evaluate(
     allowed
 }
 
+/// Whether an allow rule grants anything inside `namespace` (see
+/// [`AclIdentity::reaches_namespace`]). Deny rules reach nothing.
+pub fn rule_reaches_namespace(rule: &AclRule, namespace: &str) -> bool {
+    if rule.is_deny() {
+        return false;
+    }
+    let namespaced = rule
+        .resources
+        .iter()
+        .any(|resource| resource == "*" || AclResource::namespaced().contains(&resource.as_str()));
+    namespaced && namespace_selector_matches(rule, namespace)
+}
+
+/// Whether a rule's `namespaces` selector matches `namespace`. An allow rule
+/// naming namespaced resources explicitly but no `namespaces` — one stored
+/// before namespaces existed, since validation now refuses to write one —
+/// reaches `default` only: that is what it meant when every job lived there,
+/// and it must not silently widen to every namespace created since. A `*`
+/// resource rule and a deny rule without the selector keep matching every
+/// namespace.
+fn namespace_selector_matches(rule: &AclRule, namespace: &str) -> bool {
+    match &rule.namespaces {
+        Some(patterns) => any_glob_matches(patterns, namespace),
+        None if rule.is_deny() || rule.resources.iter().any(|resource| resource == "*") => true,
+        None => namespace == crate::structs::namespace::DEFAULT_NAMESPACE,
+    }
+}
+
 /// Parses and validates a policy `rules_json` document.
 pub fn parse_rules(rules_json: &str) -> Result<Vec<AclRule>, String> {
     let rules: Vec<AclRule> = serde_json::from_str(rules_json)
@@ -503,9 +601,63 @@ pub fn parse_rules(rules_json: &str) -> Result<Vec<AclRule>, String> {
                 ));
             }
         }
+        validate_namespace_selector(i, rule)?;
     }
 
     Ok(rules)
+}
+
+/// The two namespace rules `parse_rules` enforces (docs/namespaces.md,
+/// "Writing policies"):
+///
+/// - An **allow** rule that names a namespaced resource must carry
+///   `namespaces`. "Every namespace, including future ones" is `["*"]`, so
+///   that reach is always something an admin wrote. Deny rules may omit it
+///   (deny everywhere): leaving a selector off a deny can only take access
+///   away. A `*` resource rule may omit it too — `resources = ["*"]` is
+///   already the explicit "everything".
+/// - A rule that names only cluster-scoped resources must not carry
+///   `namespaces`: their scopes never carry one, so the rule could never
+///   match. Mixing the two kinds in one rule is rejected for the same
+///   reason, with a hint to split it.
+fn validate_namespace_selector(index: usize, rule: &AclRule) -> Result<(), String> {
+    if rule.resources.iter().any(|resource| resource == "*") {
+        return Ok(());
+    }
+    let namespaced: Vec<&str> = rule
+        .resources
+        .iter()
+        .map(String::as_str)
+        .filter(|resource| AclResource::namespaced().contains(resource))
+        .collect();
+    let cluster: Vec<&str> = rule
+        .resources
+        .iter()
+        .map(String::as_str)
+        .filter(|resource| !AclResource::namespaced().contains(resource))
+        .collect();
+    if !namespaced.is_empty() && !cluster.is_empty() {
+        return Err(format!(
+            "rule {index} mixes namespaced resources ({}) with cluster-scoped ones ({});              split it into two rules, one with a `namespaces` selector and one without",
+            namespaced.join(", "),
+            cluster.join(", ")
+        ));
+    }
+    match (&rule.namespaces, namespaced.is_empty()) {
+        (Some(_), true) => Err(format!(
+            "rule {index} ({}) has a `namespaces` selector, but {} cluster-scoped, so the rule              could never match; remove the selector",
+            cluster.join(", "),
+            if cluster.len() == 1 { "it is" } else { "they are" }
+        )),
+        (None, false) if !rule.is_deny() => Err(format!(
+            "rule {index} ({}) must say which namespaces it covers: add              `namespaces = [\"default\"]` for one namespace, or `[\"*\"]` for every namespace,              including ones created later",
+            namespaced.join(", ")
+        )),
+        (Some(patterns), false) if patterns.is_empty() => Err(format!(
+            "rule {index}: `namespaces` must not be empty (use [\"*\"] for every namespace)"
+        )),
+        _ => Ok(()),
+    }
 }
 
 /// How a request was authenticated.
@@ -593,6 +745,39 @@ impl AclIdentity {
         evaluate(&self.rules, resource, action, scope)
     }
 
+    /// Whether this identity holds any allow in namespace `namespace`: the
+    /// rule `ListNamespaces` and `WhoAmI.readable_namespaces` filter by
+    /// (docs/namespaces.md, "Seeing namespaces"). True for management
+    /// identities. A rule reaches a namespace when it names a namespaced
+    /// resource (or `*`) and its `namespaces` selector matches — other
+    /// selectors are ignored, because a `names: ["web"]` grant still means
+    /// the caller has something to do there.
+    pub fn reaches_namespace(&self, namespace: &str) -> bool {
+        if self.is_management || self.audit_only {
+            return true;
+        }
+        self.rules
+            .iter()
+            .any(|rule| rule_reaches_namespace(rule, namespace))
+    }
+
+    /// The namespace selectors under which this identity's allow rules grant
+    /// `resource:action`, sorted: where it *can* act, for a denial's hint.
+    /// Read off the caller's own rules, so it names nothing the caller could
+    /// not read from its own policy.
+    pub fn namespaces_granting(&self, resource: AclResource, action: AclAction) -> Vec<String> {
+        let mut globs: Vec<String> = self
+            .rules
+            .iter()
+            .filter(|rule| !rule.is_deny() && rule_covers(rule, resource, action))
+            .filter_map(|rule| rule.namespaces.clone())
+            .flatten()
+            .collect();
+        globs.sort();
+        globs.dedup();
+        globs
+    }
+
     /// The identity's effective rules as JSON, for self-introspection
     /// (`WhoAmI.rules_json`). Management tokens (and disabled ACLs) report a
     /// single wildcard allow; identities with no rules report `None`.
@@ -632,6 +817,47 @@ mod acl_rules_test {
         assert!(!glob_match("test-job", "test-job-2"));
     }
 
+    /// A stored rule written before namespaces (no `namespaces`, which
+    /// validation would now refuse) keeps its old meaning, `default` only;
+    /// `*`-resource and deny rules without the selector reach everywhere.
+    #[test]
+    fn legacy_rules_without_namespaces_reach_default_only() {
+        let legacy: Vec<AclRule> = serde_json::from_str(
+            r#"[{"resources": ["job"], "actions": ["write"], "names": ["web*"]}]"#,
+        )
+        .unwrap();
+        let write = |rules: &[AclRule], id: &str| {
+            evaluate(
+                rules,
+                AclResource::Job,
+                AclAction::Write,
+                &AclScope::job(id),
+            )
+        };
+        assert!(write(&legacy, "web"));
+        assert!(
+            !write(&legacy, "payments/web"),
+            "never widens to a new namespace"
+        );
+        assert!(rule_reaches_namespace(&legacy[0], "default"));
+        assert!(!rule_reaches_namespace(&legacy[0], "payments"));
+
+        let everything: Vec<AclRule> =
+            serde_json::from_str(r#"[{"resources": ["*"], "actions": ["*"]}]"#).unwrap();
+        assert!(write(&everything, "payments/web"));
+
+        let mut denied = rules(
+            r#"[{"resources": ["job"], "actions": ["write"], "namespaces": ["*"]},
+                {"resources": ["job"], "actions": ["write"], "effect": "deny", "names": ["web"]}]"#,
+        );
+        assert!(
+            !write(&denied, "payments/web"),
+            "a selector-less deny denies everywhere"
+        );
+        denied.truncate(1);
+        assert!(write(&denied, "payments/web"));
+    }
+
     #[test]
     fn default_deny_with_no_rules() {
         assert!(!evaluate(
@@ -644,7 +870,7 @@ mod acl_rules_test {
 
     #[test]
     fn allow_rule_grants_only_listed_actions() {
-        let r = rules(r#"[{"resources": ["job"], "actions": ["read"]}]"#);
+        let r = rules(r#"[{"resources": ["job"], "actions": ["read"], "namespaces": ["*"]}]"#);
         assert!(evaluate(
             &r,
             AclResource::Job,
@@ -685,7 +911,7 @@ mod acl_rules_test {
     fn deny_overrides_allow() {
         let r = rules(
             r#"[
-                {"resources": ["job"], "actions": ["*"]},
+                {"resources": ["job"], "actions": ["*"], "namespaces": ["*"]},
                 {"resources": ["job"], "actions": ["write"], "effect": "deny"}
             ]"#,
         );
@@ -705,7 +931,9 @@ mod acl_rules_test {
 
     #[test]
     fn name_selector_scopes_job_access() {
-        let r = rules(r#"[{"resources": ["job"], "actions": ["write"], "names": ["web-*"]}]"#);
+        let r = rules(
+            r#"[{"resources": ["job"], "actions": ["write"], "namespaces": ["*"], "names": ["web-*"]}]"#,
+        );
         assert!(evaluate(
             &r,
             AclResource::Job,
@@ -719,7 +947,9 @@ mod acl_rules_test {
             &AclScope::job("db")
         ));
         // Exact-name policies must not leak onto longer names.
-        let exact = rules(r#"[{"resources": ["job"], "actions": ["write"], "names": ["web"]}]"#);
+        let exact = rules(
+            r#"[{"resources": ["job"], "actions": ["write"], "namespaces": ["*"], "names": ["web"]}]"#,
+        );
         assert!(!evaluate(
             &exact,
             AclResource::Job,
@@ -746,6 +976,194 @@ mod acl_rules_test {
             AclAction::Read,
             &AclScope::job("any")
         ));
+    }
+
+    #[test]
+    fn job_scopes_split_canonical_ids_into_namespace_and_bare_name() {
+        let scope = AclScope::job("payments-prod/web");
+        assert_eq!(scope.namespace.as_deref(), Some("payments-prod"));
+        assert_eq!(scope.name.as_deref(), Some("web"));
+        let default = AclScope::job("web");
+        assert_eq!(default.namespace.as_deref(), Some("default"));
+        assert_eq!(default.name.as_deref(), Some("web"));
+        let exec = AclScope::exec("prod/api", true);
+        assert_eq!(exec.namespace.as_deref(), Some("prod"));
+        assert!(exec.host);
+        let action = AclScope::action("prod/api", "flush");
+        assert_eq!(action.name.as_deref(), Some("api"));
+        assert_eq!(action.action_name.as_deref(), Some("flush"));
+        let via = AclScope::job_via_template("prod/render-1", "render");
+        assert_eq!(via.namespace.as_deref(), Some("prod"));
+        assert_eq!(via.template.as_deref(), Some("render"));
+    }
+
+    #[test]
+    fn namespace_selector_confines_a_rule_to_its_namespaces() {
+        let r = rules(
+            r#"[{"resources": ["job", "exec"], "actions": ["read", "write"],
+                 "namespaces": ["payments-*"]}]"#,
+        );
+        for (job, allowed) in [
+            ("payments-prod/web", true),
+            ("payments-dev/web", true),
+            ("checkout-prod/web", false),
+            ("web", false),
+        ] {
+            assert_eq!(
+                evaluate(&r, AclResource::Job, AclAction::Write, &AclScope::job(job)),
+                allowed,
+                "{job}"
+            );
+            assert_eq!(
+                evaluate(
+                    &r,
+                    AclResource::Exec,
+                    AclAction::Write,
+                    &AclScope::exec(job, false)
+                ),
+                allowed,
+                "{job}"
+            );
+        }
+        // `names` means the bare name in every namespace.
+        let named = rules(
+            r#"[{"resources": ["job"], "actions": ["read"], "namespaces": ["*"],
+                 "names": ["web"]}]"#,
+        );
+        assert!(evaluate(
+            &named,
+            AclResource::Job,
+            AclAction::Read,
+            &AclScope::job("prod/web")
+        ));
+        assert!(!evaluate(
+            &named,
+            AclResource::Job,
+            AclAction::Read,
+            &AclScope::job("prod/api")
+        ));
+    }
+
+    #[test]
+    fn a_namespaced_star_rule_never_reaches_cluster_scoped_resources() {
+        // A team admin's `*` rule, scoped to its namespaces, must not grant
+        // nodes, ACLs or KV: their scopes carry no namespace.
+        let r = rules(r#"[{"resources": ["*"], "actions": ["*"], "namespaces": ["team-*"]}]"#);
+        assert!(evaluate(
+            &r,
+            AclResource::Job,
+            AclAction::Write,
+            &AclScope::job("team-a/web")
+        ));
+        assert!(!evaluate(
+            &r,
+            AclResource::Acl,
+            AclAction::Write,
+            &AclScope::none()
+        ));
+        assert!(!evaluate(
+            &r,
+            AclResource::Node,
+            AclAction::Write,
+            &AclScope::pool("default")
+        ));
+        assert!(!evaluate(
+            &r,
+            AclResource::Kv,
+            AclAction::Read,
+            &AclScope::path("team-a/x")
+        ));
+    }
+
+    #[test]
+    fn unowned_objects_need_a_rule_that_reaches_every_namespace() {
+        let star = rules(r#"[{"resources": ["job"], "actions": ["write"], "namespaces": ["*"]}]"#);
+        assert!(evaluate(
+            &star,
+            AclResource::Job,
+            AclAction::Write,
+            &AclScope::unowned()
+        ));
+        let team =
+            rules(r#"[{"resources": ["job"], "actions": ["write"], "namespaces": ["team-*"]}]"#);
+        assert!(!evaluate(
+            &team,
+            AclResource::Job,
+            AclAction::Write,
+            &AclScope::unowned()
+        ));
+        let named = rules(
+            r#"[{"resources": ["job"], "actions": ["write"], "namespaces": ["*"], "names": ["acl-*"]}]"#,
+        );
+        assert!(!evaluate(
+            &named,
+            AclResource::Job,
+            AclAction::Write,
+            &AclScope::unowned()
+        ));
+    }
+
+    #[test]
+    fn deny_can_carve_namespaces_out_of_star() {
+        let r = rules(
+            r#"[
+                {"resources": ["job"], "actions": ["read"], "namespaces": ["*"]},
+                {"resources": ["job"], "actions": ["read"], "namespaces": ["legion-*"],
+                 "effect": "deny"}
+            ]"#,
+        );
+        assert!(evaluate(
+            &r,
+            AclResource::Job,
+            AclAction::Read,
+            &AclScope::job("prod/web")
+        ));
+        assert!(!evaluate(
+            &r,
+            AclResource::Job,
+            AclAction::Read,
+            &AclScope::job("legion-system/agent")
+        ));
+    }
+
+    #[test]
+    fn allow_rules_on_namespaced_resources_must_name_namespaces() {
+        let missing = parse_rules(r#"[{"resources": ["job"], "actions": ["write"]}]"#)
+            .expect_err("a job allow rule without namespaces is rejected");
+        assert!(missing.contains("must say which namespaces"), "{missing}");
+        assert!(missing.contains(r#"["*"]"#), "{missing}");
+        for resource in AclResource::namespaced() {
+            let json = format!(r#"[{{"resources": ["{resource}"], "actions": ["read"]}}]"#);
+            assert!(parse_rules(&json).is_err(), "{resource}");
+        }
+        // Deny rules and `*` resource rules may omit it.
+        assert!(
+            parse_rules(r#"[{"resources": ["job"], "actions": ["write"], "effect": "deny"}]"#)
+                .is_ok()
+        );
+        assert!(parse_rules(r#"[{"resources": ["*"], "actions": ["*"]}]"#).is_ok());
+        assert!(
+            parse_rules(r#"[{"resources": ["job"], "actions": ["read"], "namespaces": []}]"#)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn cluster_scoped_rules_reject_namespaces_and_mixed_rules_are_split() {
+        for resource in ["node", "kv", "state", "operator", "acl", "template", "net"] {
+            let json = format!(
+                r#"[{{"resources": ["{resource}"], "actions": ["read"], "namespaces": ["*"]}}]"#
+            );
+            let err = parse_rules(&json).expect_err(resource);
+            assert!(err.contains("could never match"), "{resource}: {err}");
+            let plain = format!(r#"[{{"resources": ["{resource}"], "actions": ["read"]}}]"#);
+            assert!(parse_rules(&plain).is_ok(), "{resource}");
+        }
+        let mixed = parse_rules(
+            r#"[{"resources": ["job", "node"], "actions": ["read"], "namespaces": ["*"]}]"#,
+        )
+        .expect_err("mixed rule");
+        assert!(mixed.contains("split it into two rules"), "{mixed}");
     }
 
     #[test]
@@ -812,7 +1230,9 @@ mod acl_rules_test {
 
     #[test]
     fn template_selector_on_job_rules_gates_submission_channel() {
-        let r = rules(r#"[{"resources": ["job"], "actions": ["write"], "templates": ["render"]}]"#);
+        let r = rules(
+            r#"[{"resources": ["job"], "actions": ["write"], "namespaces": ["*"], "templates": ["render"]}]"#,
+        );
         // Submitting through the template is allowed for any rendered name...
         assert!(evaluate(
             &r,
@@ -836,7 +1256,7 @@ mod acl_rules_test {
         ));
         // Composes with `names`: both selectors must match.
         let both = rules(
-            r#"[{"resources": ["job"], "actions": ["write"],
+            r#"[{"resources": ["job"], "actions": ["write"], "namespaces": ["*"],
                  "names": ["render-*"], "templates": ["render"]}]"#,
         );
         assert!(evaluate(
@@ -940,17 +1360,23 @@ mod acl_rules_test {
 
     #[test]
     fn parse_rejects_unknown_fields_resources_actions_and_effects() {
-        assert!(parse_rules(r#"[{"resources": ["job"], "actions": []}]"#).is_err());
+        assert!(
+            parse_rules(r#"[{"resources": ["job"], "namespaces": ["*"], "actions": []}]"#).is_err()
+        );
         assert!(parse_rules(r#"[{"resources": [], "actions": ["read"]}]"#).is_err());
         assert!(parse_rules(r#"[{"resources": ["jobs"], "actions": ["read"]}]"#).is_err());
-        assert!(parse_rules(r#"[{"resources": ["job"], "actions": ["execute"]}]"#).is_err());
+        assert!(parse_rules(
+            r#"[{"resources": ["job"], "namespaces": ["*"], "actions": ["execute"]}]"#
+        )
+        .is_err());
         assert!(
-            parse_rules(r#"[{"resources": ["job"], "actions": ["read"], "effect": "block"}]"#)
+            parse_rules(r#"[{"resources": ["job"], "namespaces": ["*"], "actions": ["read"], "effect": "block"}]"#)
                 .is_err()
         );
-        assert!(
-            parse_rules(r#"[{"resources": ["job"], "actions": ["read"], "typo": true}]"#).is_err()
-        );
+        assert!(parse_rules(
+            r#"[{"resources": ["job"], "namespaces": ["*"], "actions": ["read"], "typo": true}]"#
+        )
+        .is_err());
         assert!(parse_rules("not json").is_err());
         assert!(parse_rules(r#"[]"#)
             .expect("empty rule set is valid")

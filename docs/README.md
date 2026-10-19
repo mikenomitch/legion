@@ -129,6 +129,10 @@ Plans, roadmaps, to-do lists, and development notes live in
   outside the store, wrapped data keys inside it, rotation, backups, and
   what to do when a key is missing.
 - [Auth & ACLs](auth-and-acls.md): tokens, policies, scopes, and enforcement.
+- [Namespaces](namespaces.md): name and permission scopes for jobs (not an
+  isolation boundary), qualified ids, `-n`/`LEGION_NAMESPACE`, delegated
+  creation, crossing namespaces in the mesh, and namespace policies (aggregate
+  quota per band, counts, allowed pools, runtimes and host volumes).
 - [The Cluster CA](cluster-ca.md): the CA behind the worker plane, manager
   certificates, join tokens, and the mesh. Built in by default; or an
   intermediate from your own PKI (`file`) or an external signer such as

@@ -7,6 +7,8 @@ pub mod events;
 pub mod keyring;
 pub mod liveness;
 pub mod migrations;
+pub mod namespace_policy_store;
+pub mod namespace_store;
 pub mod netpolicy_store;
 pub mod objects;
 pub mod persistence;

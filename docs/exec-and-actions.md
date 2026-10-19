@@ -64,7 +64,7 @@ and pick **Open a shell** at the bottom of the list, or press **Open shell** in
 the header or **Shell** on an instance's row in the Overview. Pick the
 instance, type a command, and toggle *Interactive (tty)* if you want a shell.
 An embedded terminal (xterm.js) streams the session. A link can open it on one
-allocation: `/jobs/web/tasks/api?tab=actions&action=shell&alloc=4217`.
+allocation: `/jobs/default/web/tasks/api?tab=actions&action=shell&alloc=4217`.
 
 The allocation page (`/allocations/<id>`) has the same **Actions** panel
 aimed at that one allocation.
@@ -161,7 +161,7 @@ doesn't, `legion exec` fails fast with a clear error.
 
 | Kind | Exec | Interactive (tty) | Notes |
 | --- | --- | --- | --- |
-| `exec` | ✅ | ✅ | Runs a sibling host process with the task's env/cwd. Host-level, so it requires the `host` ACL grant. The env is the task's own, built the same way: Legion's allocation env (`LEGION_ALLOC_ID`, `LEGION_JOB_ID`, `LEGION_TASK_NAME`, `LEGION_PORT_*` / `LEGION_ADDR_*`, `LEGION_UPSTREAM_*`), then worker-injected env (`LEGION_TASK_DIR`, artifacts, volumes, identities), then the task's `env`. `TERM` is set for tty sessions unless the task sets it. Raw exec and actions get the same env. The process joins the cgroup the task runs in (the worker-created leaf when [resource enforcement](resource-enforcement.md) placed the task, or the task's explicit `config.cgroup`), so a session counts against the task's memory and CPU limits and is reaped with it on stop. A session that cannot join fails to start (exit 126 for a tty session) rather than running unconfined. It does not take the task's user, landlock, or hardening settings, and it stays in the host's network namespace, also for a `network.mode = "gated"` task. |
+| `exec` | ✅ | ✅ | Runs a sibling host process with the task's env/cwd. Host-level, so it requires the `host` ACL grant. The env is the task's own, built the same way: Legion's allocation env (`LEGION_ALLOC_ID`, `LEGION_JOB_ID`, `LEGION_JOB_NAME`, `LEGION_NAMESPACE`, `LEGION_TASK_NAME`, `LEGION_PORT_*` / `LEGION_ADDR_*`, `LEGION_UPSTREAM_*`), then worker-injected env (`LEGION_TASK_DIR`, artifacts, volumes, identities), then the task's `env`. `TERM` is set for tty sessions unless the task sets it. Raw exec and actions get the same env. The process joins the cgroup the task runs in (the worker-created leaf when [resource enforcement](resource-enforcement.md) placed the task, or the task's explicit `config.cgroup`), so a session counts against the task's memory and CPU limits and is reaped with it on stop. A session that cannot join fails to start (exit 126 for a tty session) rather than running unconfined. It does not take the task's user, landlock, or hardening settings, and it stays in the host's network namespace, also for a `network.mode = "gated"` task. |
 | `container` (Apple `container`) | ✅ | ✅ | `container exec` inside the container's namespaces (sandboxed). |
 | `container` (runc / crun) | ✅ | ✅ | `<runtime> exec` inside the container's namespaces (sandboxed). The process spec comes from the bundle Legion generated, so env, cwd, and user match the task. Only argv is replaced, and the exit status is the process's own. |
 | `sandbox` (microVM) | ✅ | ✅ | Through the guest agent's vsock listener (port 1100), as root in the guest with the task's environment ([task-runtime-sandbox.md § Exec](task-runtime-sandbox.md#exec)). A suspend or restore ends open sessions. |
@@ -196,13 +196,13 @@ Rule selectors:
 ```nickel
 [
   # Full shell into team-a's container jobs, but not host-level tasks:
-  { resources = ["exec"],   actions = ["write"], names = ["team-a-*"] },
+  { resources = ["exec"],   actions = ["write"], namespaces = ["default"], names = ["team-a-*"] },
   # Host-level exec too (admins):
-  { resources = ["exec"],   actions = ["write"], names = ["*"], host = true },
+  { resources = ["exec"],   actions = ["write"], namespaces = ["default"], names = ["*"], host = true },
   # On-call: may run only the curated actions on the web job, no raw shell:
-  { resources = ["action"], actions = ["write"], names = ["web"],
+  { resources = ["action"], actions = ["write"], namespaces = ["default"], names = ["web"],
     action_names = ["restart-*", "flush-cache"] },
-  { resources = ["job"],    actions = ["read"],  names = ["web"] },  # to discover them
+  { resources = ["job"],    actions = ["read"],  namespaces = ["default"], names = ["web"] },  # to discover them
 ]
 ```
 
@@ -318,7 +318,10 @@ A ticket signed by a key carries the key id as its JWT `kid` header and
 `sub = "key:<id>"`, and otherwise has the claims of a manager-minted ticket
 (audience `legion:exec`, ES256). Workers check it against the key:
 
-- the job matches the key's `jobs` glob;
+- the job matches the key's `jobs` pattern. A pattern without a `/`
+  (`agents-*`) matches jobs in the `default` [namespace](namespaces.md) only;
+  `agents/*` or `agents-*/workspace*` is `namespace-glob/name-glob`. `*` alone
+  never reaches into another namespace;
 - the redeem window (`exp - iat`) is within the key's `maxTtl`, and
   `legion.io/max_session` within its `maxSession`;
 - the target is not a host-level runtime. A key never opens a session in an

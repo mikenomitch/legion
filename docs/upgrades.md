@@ -351,6 +351,49 @@ shapes:
 - **Downgrading a worker** ends its running sessions: an older worker does
   not know them. Promote the sessions you need first.
 
+## Namespaces
+
+The release that added [namespaces](namespaces.md) changed these shapes. A
+cluster that never creates a namespace keeps every job in `default` under
+its bare name, so job ids, and every key derived from one, are unchanged for
+it.
+
+- **ACL policies must say their reach.** An allow rule over a namespaced
+  resource (`job`, `exec`, `action`, `scale`, `boot`, `snapshot`,
+  `namespace`) without `namespaces` is refused when the policy is written,
+  and so is `namespaces` on a rule over only cluster-scoped resources.
+  Policies stored before the upgrade are not rewritten: re-apply each one with
+  `namespaces = ["default"]` (what they meant) or `["*"]` (every namespace,
+  including future ones) before relying on them for namespaced jobs. Until
+  then a stored allow rule that names namespaced resources without
+  `namespaces` matches `default` jobs only, which is what it meant before:
+  it never widens to a namespace created later. A `resources = ["*"]` rule
+  and a deny rule without `namespaces` match every namespace.
+- **The default workload-identity subject gains `{namespace}`**:
+  `{region}:{namespace}:{job}:{group}:{task}` (`auto:default:api:web:server`).
+  Trust policies that match the old `auto:api:web:server` must be updated.
+  A configured `subTemplate` without `{namespace}` stops the manager from
+  starting; add it.
+- **Content-store paths spell the namespace out.** Archive manifests move
+  from `manifests/<job>/…` to `manifests/<namespace>/<job>/…`, session
+  manifests from `sessions/<job>/…` to `sessions/<namespace>/<job>/…`, and
+  fence markers from `sessions/fence/` to `sessions/_fence/`. Objects written
+  under the old paths are not found by the new release: resume the archived
+  instances and store sessions you need before upgrading.
+- **List RPCs default to `default`.** `ListJobs`, `ListServices`,
+  `ListRollouts`, `ListVolumes` and `ListSnapshots` with an empty `namespaces`
+  list only `default` (`["*"]` lists every readable namespace), unless a
+  request names a job.
+- **Service `allow` entries without a `/` match the service's own
+  namespace**, and an absent `allow` admits only its own namespace.
+- **Exec-key `jobs` patterns without a `/` match `default` only.**
+- **Endpoint feeds carry the upstream key**, so an aliased service upstream
+  (`{ name = "db", service = "postgres" }`) now receives endpoints; it did not
+  before.
+- **Downgrading a manager** past this release loses namespaces and namespace
+  policies (their tables are not read), and jobs in other namespaces keep
+  their qualified ids, which an older manager treats as plain names.
+
 ## Task-plugin ABI
 
 Task runtimes loaded from `plugins/tasks/<name>/` are **not** covered by

@@ -70,6 +70,7 @@ fn insert_node_with(store: &Store, id: &str, dynamic_attrs: serde_json::Value) -
 
 fn run_request(jobspec: String, name: &str) -> RunJobRequest {
     RunJobRequest {
+        namespace: Default::default(),
         parsed_jobspec: jobspec,
         submissions: vec![Submission {
             path: format!("{name}.ncl"),

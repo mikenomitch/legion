@@ -149,6 +149,15 @@ Every verb takes `--json`. `run` supports `--idempotency-key`,
 `--force-reschedule`, `--priority`/`--asap`, and `--wait`/`--timeout`, with
 the same behavior as `legion job run`.
 
+Templates are cluster objects; the job a run creates lands in a
+[namespace](namespaces.md). `render` and `run` take `-n` (or
+`$LEGION_NAMESPACE`) as the target. A template whose rendered spec names a
+namespace of its own may run without one, and is refused when the target
+disagrees, since the two have no right winner. Unlike `job run`, the CLI sends
+`$LEGION_NAMESPACE` as the target too: it cannot see what the template
+renders before the manager does. The UI's launch form offers a target
+namespace to identities that read several.
+
 Versions are immutable and start at 1. `create` on an existing name appends
 the next version and moves the latest pointer. Runs and renders use the
 latest version unless you pin one with `--version`. You can't delete
@@ -218,7 +227,7 @@ template, and can see and stop only the jobs it produces:
 ```nickel
 [
   { resources = ["template"], actions = ["read"], templates = ["render"] },
-  { resources = ["job"], actions = ["read", "write"], templates = ["render"] },
+  { resources = ["job"], actions = ["read", "write"], namespaces = ["default"], templates = ["render"] },
 ]
 ```
 
@@ -242,8 +251,8 @@ Other things to know:
   comes only from the template being run. A template-only account can't push
   arbitrary specs to a job just because its template once created it.
 - **The collision guard.** A template run fails with `FAILED_PRECONDITION`
-  if it would update an existing job whose latest config didn't come from the
-  same template. The exception is a caller who also holds plain `job:write`
+  if it would update an existing job (in the target namespace) whose latest
+  config didn't come from the same template. The exception is a caller who also holds plain `job:write`
   on that job name. Without this guard, a template whose rendered job name
   depends on user input would let a template-only account overwrite unrelated
   jobs. As extra protection, authors should also constrain rendered names
