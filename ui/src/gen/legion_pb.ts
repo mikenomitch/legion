@@ -3349,6 +3349,8 @@ export class GetJobSpecReply extends Message<GetJobSpecReply> {
    * Source submissions associated with the job config, exactly as the
    * submitter sent them (usually Nickel source, not JSON). Read these to show
    * what was typed; read `rendered_jobspec` to learn what the job is.
+   * Ordered primary first (`is_primary`), then in the order they were
+   * submitted, so the first entry is the file the submitter named.
    *
    * @generated from field: repeated legion.Submission submissions = 2;
    */
@@ -16246,7 +16248,7 @@ export class InstanceStop extends Message<InstanceStop> {
    * The stop cause, in the vocabulary of stop notices
    * (docs/graceful-stop.md): `stop`, `update`, `drain`, `reschedule`,
    * `destroy`, `node_lost`, `scale_in`, `preempted`, `node_pressure`,
-   * `restore`, `suspended`.
+   * `restore`, `suspended`, `gang`, `failed`.
    *
    * @generated from field: string cause = 1;
    */
@@ -16255,7 +16257,10 @@ export class InstanceStop extends Message<InstanceStop> {
   /**
    * A sentence saying what happened. For `node_pressure` this is the
    * worker's own detail sentence, with the step and the numbers (the same
-   * text as the `node.pressure` event). Otherwise a sentence built from the
+   * text as the `node.pressure` event). For `failed` it names the node and
+   * the worker's failure reason (an exit status, a failed check, a stderr
+   * tail), cut to one line of at most 400 characters; the full reason is on
+   * the `allocation.failed` event. Otherwise a sentence built from the
    * cause.
    *
    * @generated from field: string detail = 2;
