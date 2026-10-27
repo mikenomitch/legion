@@ -615,10 +615,9 @@ onto the new build, with no operator action.
 
 ## 15. App config lives on the app record, and any change is a rollout
 
-**Call.** `legion app config set` validates against the manifest's Nickel
-config schema (JSON Schema, like extension keys), stores the config on the
-record, and the reconciler resubmits the
-job with the config rendered as a file. There is no live reload. A change to
+**Call.** `legion app config set` validates against the manifest's config
+schema (JSON Schema, like extension keys), stores the config on the record,
+and the reconciler resubmits the job with the config rendered as a file. There is no live reload. A change to
 a manifest-declared code field (plugin sources) re-runs the grant check
 against the caller (entry 4).
 
