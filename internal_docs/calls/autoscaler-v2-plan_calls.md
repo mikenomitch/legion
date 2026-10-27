@@ -47,10 +47,10 @@ autoscaler  0.14.0   bundled  running  managers   1/1
 Running out of process is what makes the three plugin systems safe.
 User-supplied plugins crash or hang the app, never the manager, which
 dissolves the security argument the old plan used to keep logic out
-(entry 3).
+(entry 4).
 
 It also makes the autoscaler scale. A leader-only in-core loop can't be
-sharded, and an app can (entry 11).
+sharded, and an app can (entry 13).
 
 It upgrades and restarts independently, it dogfoods the public API (so
 agents get the same surface), and it is the first user of a substrate GitOps
@@ -116,7 +116,62 @@ The evidence that would revisit this: dry-run histories showing a large
 share of policies pinned at `max`, or memory-driven OOMs on autoscaled
 tasks.
 
-## 3. Plugins run inside the app and speak JSON-RPC 2.0 over stdio or HTTP (reverses old entries 3 and 9)
+## 3. Defaults layer field by field (built-in, cluster, namespace policy, task) and resolve live
+
+**Call.**
+- Every `autoscale` default can be overridden at three levels:
+  - the task (`autoscale = { … }`);
+  - the namespace (an `autoscale` record in a namespace policy);
+  - the cluster (`legion scaling defaults apply`).
+- A field set at one level wins over the levels below it, field by field,
+  including nested records (`step` replaces as a whole).
+- `min` and `max` take numbers or `"Nx"` multiples of `count`.
+- Signals are all or nothing.
+- The jobspec stores what the author wrote. The manager resolves the
+  effective policy live, whenever any level changes.
+- `scaling explain --policy` shows where every field came from.
+
+```console
+$ legion scaling defaults apply defaults.ncl      # { cpu = 0.6, max = "6x" }
+cluster scaling defaults: v4; 212 policies inherit a changed field, 0 invalid
+```
+
+**Alternatives.**
+- (a) **Per-task overrides only.** This is what the plan had before:
+  `autoscale = { max = 20 }`, with fixed built-ins.
+- (b) **Expand and freeze at submit.** Store the expanded record, so what a
+  job version says is exactly what runs.
+- (c) **Cluster defaults in the autoscaler's app config**
+  (`legion app config set autoscaler`).
+- (d) **Most-specific namespace policy wins** when several match.
+
+**Trade-off.**
+- A job's scaling behavior can change without its spec changing. That is
+  mitigated by the policy digest on every `scale_history` row, and by
+  provenance in `explain`, but `job inspect` alone no longer tells the whole
+  story.
+- A defaults change hits many policies at once. It is refused if it would
+  invalidate any, and `--dry-run` shows the blast radius, but a valid
+  change that is simply a bad idea lands everywhere.
+- Four levels to reason about.
+
+**Why (simplicity: "easily overridable" means override once, for many).**
+- **Against (a).** It makes an operator who disagrees with a built-in edit
+  every jobspec.
+- **Against (b).** It turns a cluster-wide retune ("scale-in is too eager")
+  into a mass resubmit.
+- **Against (c).** The defaults shape how *core* expands a core field.
+  Putting them in an app's config couples the two, restarts the app on
+  every change (apps calls entry 13), and gates defaults behind `app:write`
+  instead of the operator permission they deserve.
+- **Against (d).** It breaks namespace policies' deliberate "no precedence
+  to learn" rule. Conflicting fields fail the same way two `pools.default`
+  values already do.
+
+Live resolution, plus the digest, plus provenance, keeps one override in one
+place, and always answers "why is it 0.6?" in one command.
+
+## 4. Plugins run inside the app and speak JSON-RPC 2.0 over stdio or HTTP (reverses old entries 3 and 9)
 
 **Call.** All three kinds (sources, strategies, targets) share one protocol:
 newline-delimited JSON-RPC 2.0, the framing `legion mcp serve` already uses.
@@ -160,7 +215,7 @@ Old entry 3's security reasoning (no user logic in the manager) still
 holds. It is satisfied by placement now, because plugins run in the app's
 process tree, not by refusing plugins.
 
-## 4. Tenant policies name operator-installed plugins; they never carry a command or a URL
+## 5. Tenant policies name operator-installed plugins; they never carry a command or a URL
 
 **Call.** Plugins are installed in the autoscaler's app config, an
 operator-only surface. Each may carry a `namespaces` allowlist. Policies
@@ -196,7 +251,7 @@ problem to whoever gets that permission. By-name references keep the
 policy surface pure data, which is also what lets `scaling apply --dry-run`
 and `scaling simulate` stay safe to run.
 
-## 5. Safeguards are one fixed pipeline whose stages report what they changed
+## 6. Safeguards are one fixed pipeline whose stages report what they changed
 
 **Call.** Every decision passes the same ordered stages:
 
@@ -229,7 +284,7 @@ what actually happened, which is the failure mode of most autoscalers'
 "why" surfaces. Every safeguard the user named (rate up, floor down) is a
 stage. New ones insert as stages, which is the extension point.
 
-## 6. Node scale-up demand is computed by the manager, simulating the scheduler's own rules
+## 7. Node scale-up demand is computed by the manager, simulating the scheduler's own rules
 
 **Call.** `GetCapacityDemand` runs on a manager. It takes the jobs short of
 their effective count, builds a synthetic node per node-group template, and
@@ -265,7 +320,7 @@ nothing when unused, and keeps the plugin protocol scalar. Old entry 8's
 *signal* (pending work, not utilization) stands. Only *where it is
 computed* moves.
 
-## 7. Node-group and external-target policies are stored objects, not manager config or app-local files
+## 8. Node-group and external-target policies are stored objects, not manager config or app-local files
 
 **Call.** `legion scaling apply nodes.ncl` stores a versioned
 `ScalingPolicy` on the Control lane, gated by ACL. Jobspec `autoscale` blocks
@@ -291,7 +346,38 @@ A stored object is validated at apply, versioned, listable, and
 permissioned by namespace, the same as every other thing users
 `apply` in Legion.
 
-## 8. A manual scale on an autoscaled task is a time-boxed pin, and `--for` is required
+## 9. `autoscale` stays a first-class core field, not an `apps.autoscaler` extension block
+
+**Call.** The autoscaler's per-task policy is the core jobspec field
+`autoscale`, validated and resolved by the manager. It does not use the
+generic jobspec-extension mechanism that third-party apps use
+(apps calls entry 6).
+
+**Alternatives.** Express it as `apps.autoscaler = { … }`: dogfood the
+extension mechanism with the first app, keep autoscaling semantics out of
+core, and let a third-party autoscaler replace the bundled one with no core
+change.
+
+**Trade-off.**
+- Core carries the autoscale schema, its defaults, and its validation.
+- The first app doesn't exercise the extension mechanism, so GitOps or a
+  third-party app will be its first real user.
+- A replacement autoscaler would use its own `apps.<name>` block, not
+  `autoscale`.
+
+**Why (correctness).** Core behavior depends on this field:
+- submit arbitration over who owns the live count (plan §6.3);
+- the `--for` rule on manual scales;
+- in-place resubmits for `autoscale` and `count`;
+- the layered defaults (entry 3).
+
+Its submit errors need the task's runtime and count, and must be hard
+errors. Extension validation is best-effort by design (an unreachable app
+lets the submit through). The extension mechanism's main benefit is an app
+that versions apart from Legion, and that buys nothing for a bundled app
+that *is* the Legion binary.
+
+## 10. A manual scale on an autoscaled task is a time-boxed pin, and `--for` is required
 
 **Call.** `legion job scale web --count 12 --for 2h` pins the count, and
 `--min` / `--max` with `--for` override a single bound. The pipeline treats
@@ -325,7 +411,7 @@ error: web/default/web is autoscaled; a manual count needs --for (e.g. --for 1h)
 A required expiry forces the one decision that matters and guarantees
 autoscaling resumes on its own. The step limits make the resumption gentle.
 
-## 9. Usage reaches one place by rolling up on the liveness digest; nothing goes through raft (reverses old entry 11's storage)
+## 11. Usage reaches one place by rolling up on the liveness digest; nothing goes through raft (reverses old entry 11's storage)
 
 **Call.** Each manager aggregates the usage and edge reports it received
 into per-target rollups. Every 10s it sends the changed rollups to the
@@ -363,7 +449,7 @@ The digest already exists for the same "who heard what" problem (liveness),
 already costs managers × 1 RPC per interval regardless of fleet size, and
 rollups are bounded by the number of targets, not allocations.
 
-## 10. Every autoscaler write is compare-and-set; overlapping leases are tolerated, not prevented
+## 12. Every autoscaler write is compare-and-set; overlapping leases are tolerated, not prevented
 
 **Call.**
 - `ScaleTask.expected_version` must match the `task_scale` row version the
@@ -400,7 +486,7 @@ index instead of a per-row counter closes the ABA case. Phase 0's
 arbitration deletes and recreates override rows, which would otherwise
 reset a counter to a value a stale writer still holds.
 
-## 11. The app scales out by sharding policies across replicas
+## 13. The app scales out by sharding policies across replicas
 
 **Call.** Policies hash to 64 shards. Replicas hold membership and shard
 leases in KV and balance to `ceil(64 / members)`. `legion app set
@@ -423,7 +509,7 @@ queries per policy per tick, which active-standby can't spread. Namespace
 sharding skews badly on one big tenant. Hash shards with a fixed count keep
 rebalancing proportional and make "add replicas" the only scaling knob.
 
-## 12. Actions are durable in `scale_history`; holds live only in the app
+## 14. Actions are durable in `scale_history`; holds live only in the app
 
 **Call.** Every applied change (autoscaler or human) writes a
 `scale_history` row with the decision, in the override's transaction,
@@ -448,7 +534,7 @@ decisions are exactly as rare, and they are the record a team reads before
 trusting a policy (scenario S2), so they get the same treatment. The events
 journal is best-effort by design, so it can't be the record.
 
-## 13. `autoscale` on a task in a multi-task group scales the whole group
+## 15. `autoscale` on a task in a multi-task group scales the whole group
 
 **Call.** If the task's group has other tasks, the target is the group:
 every member moves to the same count in one write, and utilization is the
@@ -469,7 +555,7 @@ Legion the group is the co-placed unit. Scaling one member of an
 all-or-nothing group alone (a) produces groups that can't place. Group
 objects (b) are a jobspec redesign this plan has no business doing.
 
-## 14. Legion's core drains nodes; target plugins only start and stop instances
+## 16. Legion's core drains nodes; target plugins only start and stop instances
 
 **Call.** For node targets, the app selects victims, cordons and drains
 through `SetNodeAvailability`, waits, and only then calls
@@ -490,7 +576,7 @@ deadline) is Legion's to get right once, with one test suite. Repeating it
 per plugin is how the old plan's "never strand a draining node" acceptance
 criterion would fail in one plugin out of five.
 
-## 15. The jobspec field is `autoscale`, a boolean or a record
+## 17. The jobspec field is `autoscale`, a boolean or a record
 
 **Call.** `autoscale = true` or `autoscale = { … }`.
 
@@ -506,7 +592,7 @@ group") is the product, and `scaling = true` reads like a statement about
 the job rather than a switch. The field never shipped, so renaming costs
 nothing.
 
-## 16. The bundled autoscaler holds `node:write` and cluster-wide `scale:write` in one grant
+## 18. The bundled autoscaler holds `node:write` and cluster-wide `scale:write` in one grant
 
 **Call.** The autoscaler's manifest requests one fixed permission set,
 including `node:write` (drain, forget, join tokens), whether or not the
@@ -530,12 +616,12 @@ drain nodes.
 - **Against (b).** It doubles the processes, and splits one pipeline and
   one status surface in two.
 - **The real mitigations are elsewhere.** Plugins are operator-installed
-  (entry 4), and node-group policies need `operator:write` to create. App
+  (entry 5), and node-group policies need `operator:write` to create. App
   config changes that add plugin code re-check the grant against the
   caller (apps calls entry 4). We'd revisit if a third-party app needs
   optional groups for its own reasons.
 
-## 17. A `step` limit is the larger of its percent and replica halves, and writing `step` replaces both
+## 19. A `step` limit is the larger of its percent and replica halves, and writing `step` replaces both
 
 **Call.** `step = { percent, replicas }` allows the larger of the two per
 `every`. Writing `step` replaces the default record, and an omitted half is
@@ -568,17 +654,17 @@ lands now:
 | --- | --- | --- |
 | 1. Desired count is a separate owned record | **Stands** | Phase 0, the foundation of everything here |
 | 2. Manager subsystem first, job second | **Reversed** | entry 1 |
-| 3. Declarative policies; logic waits for WASM | **Reversed in mechanism, kept in spirit** | entry 3 (logic now runs out of process in the app, not in the manager) and entry 4 |
+| 3. Declarative policies; logic waits for WASM | **Reversed in mechanism, kept in spirit** | entry 4 (logic now runs out of process in the app, not in the manager) and entry 5 |
 | 4. Resubmit ownership via `base_count` | **Split** | rule 2 (no policy: `base_count` arbitrates) stands. Rule 1 changes: `count` is the default `min`, not an initial value only, and submit arbitration keeps and clamps the override for autoscaled tasks (plan §6.3, entry 2) |
 | 5. `task_scale` on Control | **Stands** | the new tables join it there |
 | 6. Scale-out applies, scale-in defers during rollouts | **Stands** | enforced by `ScaleTask`, so the app can't bypass it |
 | 7. `pending_count` promotion | **Stands** | |
-| 8. Node scale-up keys on unplaceable work | **Stands, moved** | entry 6 (computed by the manager) |
-| 9. Node providers speak the exec ABI | **Superseded** | entry 3 (JSON-RPC protocol; one-shot exec survives as the built-in `exec` target) |
+| 8. Node scale-up keys on unplaceable work | **Stands, moved** | entry 7 (computed by the manager) |
+| 9. Node providers speak the exec ABI | **Superseded** | entry 4 (JSON-RPC protocol; one-shot exec survives as the built-in `exec` target) |
 | 10. Own `scale` ACL resource | **Stands** | the app's grant uses it |
-| 11. Usage on the heartbeat's status write, windows in evaluator memory | **Reversed (storage), kept (windows)** | entry 9 |
+| 11. Usage on the heartbeat's status write, windows in evaluator memory | **Reversed (storage), kept (windows)** | entry 11 |
 | 12. `min` defaults to 1, `min = 0` needs a wake signal | **Split** | the default changed (entry 2); the wake rule stands |
-| 13. First-party UI pages, link-only extensions | **Reversed** | apps calls entry 6 |
+| 13. First-party UI pages, link-only extensions | **Reversed** | apps calls entry 8 |
 | 14. Refuse keyed and `count.per` | **Stands** | |
 | 15. Scaling doesn't move `updated_at` | **Stands** | |
 | 16. `scale_in` stop cause | **Stands** | autoscaler scale-ins report it too |

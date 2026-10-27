@@ -2,14 +2,15 @@
 
 > **Judgement calls:** [legion-apps-plan_calls.md](../calls/legion-apps-plan_calls.md)
 
-**Status: PLANNED** (written 2026-10-19). Nothing is built. It has five phases
-(§8), and each ships alone. The first consumer is the autoscaler
+**Status: PLANNED** (written 2026-10-19; jobspec extensions and strict
+unknown fields added 2026-10-27). Nothing is built. It has six phases (§8),
+and each ships alone. The first consumer is the autoscaler
 ([autoscaler-v2-plan.md](autoscaler-v2-plan.md)). GitOps is the second, and
-this plan checks the substrate against it (§6.7). Deliberately deferred:
+this plan checks the substrate against it (§6.8). Deliberately deferred:
 installing apps from a registry (it waits on the registry plan), apps owned
 by tenants in their own namespaces, and in-page JavaScript extensions that
 share the operator UI's origin. That last one is rejected, not deferred
-(calls entry 6).
+(calls entry 8).
 
 This plan replaces the ecosystem-app approach in the superseded
 [autoscaler-plan.md](autoscaler-plan.md) §6.6 and §6.8: the in-core loop
@@ -23,7 +24,7 @@ with a job as the escape hatch, and the link-only Apps sidebar.
 promise an omakase cluster: an autoscaler, GitOps, a cert manager, and an
 ingress, all simple on day one and splittable on day N. Each is a program
 that **manages the cluster** rather than serving users. Today every one of
-them hits the same five walls:
+them hits the same six walls:
 
 1. **No reliable place to run.**
    - Jobs land on workers. A workerless cluster has none, a full cluster has
@@ -70,6 +71,15 @@ them hits the same five walls:
      §6.4).
    - Every add-on would therefore need hand-written SPA pages in Legion's
      own repo, or a link out to a port the browser usually can't reach.
+6. **No way to give an app per-job settings.**
+   - A backup app needs to know which task to back up and how often. A DNS
+     app needs the hostname a job wants. The jobspec is where per-job intent
+     lives, but its schema belongs to core, so there is nowhere to put an
+     app's settings except a field core already knows.
+   - Worse, the parsers ignore keys they don't know. `TaskConfigInput`
+     (`src/structs/job.rs:2404-2406`) has no `deny_unknown_fields`. So a
+     typo like `autoscael = true`, or `autoscale = true` sent to a manager
+     that predates it, is accepted and silently dropped.
 
 ## 2. Prior art
 
@@ -108,6 +118,33 @@ them hits the same five walls:
   installer reviews and approves them at install time; an upgrade that asks
   for more needs re-approval. *Take:* the install prompt and the permission
   diff on upgrade.
+
+### How add-ons attach per-job settings
+
+- **Kubernetes** gives apps two tools.
+  - *Annotations* are a free-form string map with a prefix convention
+    (`cluster-autoscaler.kubernetes.io/safe-to-evict`). There is no
+    ceremony, nothing is validated, and a typo is silently inert.
+  - *CustomResourceDefinitions* carry an OpenAPI schema that the API server
+    enforces, plus admission webhooks for semantic checks. A webhook with
+    `failurePolicy: Fail` that goes down blocks every write it covers, a
+    lesson most operator teams learn once. CRDs are separate objects, so
+    per-workload settings live apart from the workload (an HPA next to its
+    Deployment).
+  - *Take:* a schema enforced by the core server, and a semantic hook that
+    fails open. *Reject:* free-form annotations as the main mechanism.
+- **Nomad** has `meta` string maps on job, group, and task. Tools read
+  conventions from them, and nothing validates them. **Docker labels** and
+  **Consul tags** (Traefik's `traefik.http.routers…`) are the same idea with
+  the same failure: stringly typed and unvalidated.
+- **Terraform providers** publish a schema per resource, and core validates
+  every block against it before the provider sees it. *Take:* the plugin
+  declares, and core enforces.
+- **Legion itself.** Task runtimes publish a JSON Schema for their `config`
+  block. Submit validates it with the `jsonschema` crate
+  (`src/task_plugins/mod.rs:2134`), and `legion job schema` merges the live
+  schemas so agents author against them (`docs/agent-readiness.md` §4).
+  *Take:* the same shape for apps.
 
 ### How add-ons get into the UI
 
@@ -151,6 +188,11 @@ them hits the same five walls:
 - When my code calls Legion, I want the CLI and client libraries inside the
   task to already be logged in and pointed at the cluster, so there is no
   token plumbing in my code.
+- When I mistype a field, I want the deploy to fail and say so, so a setting
+  I thought I'd turned on isn't silently ignored.
+- When I deploy a job before the add-on it configures is installed, or to a
+  cluster that's mid-upgrade, I want to push it anyway on purpose, so being
+  strict doesn't block a migration.
 
 **App author** (someone writing an add-on: the autoscaler, GitOps, or a
 third party)
@@ -160,6 +202,9 @@ third party)
 - When my add-on has state worth seeing, I want it to show up on the job and
   node pages where operators already look, without learning the SPA's
   framework or getting a PR into Legion.
+- When my add-on needs settings per job, I want job authors to write them in
+  the jobspec next to the job, checked at submit against a schema I publish,
+  so a mistake fails at deploy time instead of at 3am.
 
 **Security / platform admin**
 - When someone grants a job permissions, I want that to be impossible beyond
@@ -179,6 +224,8 @@ third party)
 - When I operate the cluster, I want every add-on view available as
   structured data through the CLI and MCP, so whatever a human sees on a
   panel, I can read too.
+- When I write a jobspec, I want one schema that already includes the
+  installed add-ons' settings, so I can write them correctly the first time.
 
 ### User scenarios
 
@@ -234,6 +281,9 @@ natively by the SPA from JSON the app returns.
    are available to the CLI and MCP.
 6. Bundled apps upgrade with the binary and report health as part of the
    cluster's.
+7. Apps add per-job settings to the jobspec as namespaced, schema-validated
+   blocks. Unknown fields stop being silently dropped, and a flag allows
+   them deliberately.
 
 **Non-goals**
 
@@ -243,11 +293,15 @@ natively by the SPA from JSON the app returns.
   it). Apps are cluster add-ons in `legion-system`. The manifest has a
   `namespace` field reserved for this.
 - **In-origin JavaScript plugins** (Headlamp style). Rejected, not deferred
-  (calls entry 6).
+  (calls entry 8).
 - **Serving the SPA from the manager.** Tier 1 and tier 2 both work with the
   SPA wherever it is served today.
 - **A general taints-and-tolerations system.** The node-side `namespaces`
   restriction is one targeted rule. Pools already act as taints.
+- **App-defined object kinds** (a CRD equivalent: standalone objects an app
+  defines, the way the autoscaler defines `ScalingPolicy` in core).
+  Per-job blocks cover per-job settings. An app that needs its own kind of
+  object waits for a second example (§11).
 
 ## 5. Background: what exists today
 
@@ -299,6 +353,18 @@ natively by the SPA from JSON the app returns.
   - The manager answers browsers only from loopback plus
     `server.allowedOrigins` (`docs/ui-architecture.md:754-783`).
   - There is no extension mechanism of any kind.
+- **Jobspec parsing.** `TaskConfigInput` and the job-level input
+  deserialize without `deny_unknown_fields` (`src/structs/job.rs:2404-2406`).
+  Unknown keys are dropped silently, except `kind`, which has a hand-written
+  error (`:2507-2521`). Task-runtime `config` blocks are validated against
+  the runtime's JSON Schema (`src/task_plugins/mod.rs:2134`), and
+  `legion job schema` serves the merged schema.
+- **In-place version moves.** A resubmit whose task configs are
+  schedule-equivalent (`task_schedule_equivalent`, `src/storage/store.rs:21251`:
+  count, gang, schedule, resources, constraints, permit, affinities,
+  connect) can move running allocations onto the new version without a
+  rollout (`migrate_allocations_to_job_config`). KV re-renders already use
+  that path (`src/manager/server.rs:4150-4180`).
 - **Worker-plane tunnel.** It is planned, not built:
   `Worker.ProxyTunnel` in the reverse-proxy plan (§6.2-6.6), which is the
   manager-to-allocation path a UI needs to reach an app's backend.
@@ -311,7 +377,8 @@ An **app** is three things:
 
 1. a **job** in the reserved `legion-system` namespace;
 2. a **grant**: the permissions the job's `legion` identity holds;
-3. **registrations**: UI slots, views, and actions.
+3. **registrations**: UI slots, views, and actions (§6.5), and jobspec
+   extensions (§6.6).
 
 A **manifest** declares all three, and an **app record** on the Control lane
 holds the installed manifest, the operator's settings, and the grant. The
@@ -384,7 +451,7 @@ added around the job, not inside the scheduler.
   artifacts) re-runs the grant check against the caller, the same as
   install. The install prompt says so plainly (§6.3).
 
-**Node-side namespace restriction** (calls entry 8). Worker types gain
+**Node-side namespace restriction** (calls entry 10). Worker types gain
 `namespaces`:
 
 ```nickel
@@ -477,7 +544,7 @@ policy with `pools.default = "legion-system"`, so a hand-written
 - The reconciler records a status: `running`, `degraded`, `pending (why)`,
   or `stopped`.
 
-**Bundled apps run the node's own binary** (calls entry 10).
+**Bundled apps run the node's own binary** (calls entry 12).
 `command = "legion:self"` is resolved by the exec runtime to the worker's
 own executable (`std::env::current_exe()`). The app is always the same
 build as the node that runs it: no artifact, no image, no registry, and it
@@ -519,7 +586,7 @@ $ legion app uninstall gitops         # stops the job, revokes the grant, drops 
   manifest's Nickel contract, and rendered into the job as a file
   (`$LEGION_APP_CONFIG`, JSON).
 - A config change resubmits the job. That is a normal rollout, so the job's
-  version history is the config's history (calls entry 11).
+  version history is the config's history (calls entry 13).
 - A config change that alters the code the app runs (manifest-declared
   `codeFields`: for the autoscaler, `plugins.*.source` and `plugins.*.url`)
   needs the caller to hold the app's whole grant, as `install` does. Other
@@ -597,9 +664,9 @@ stays approved until an `upgrade` changes it. Any *other* principal
 resubmitting an app job directly still faces the full check. Bundled apps'
 grants are recorded at seed time as granted by `legion:bootstrap`, the only
 grant that skips the check. It is limited to manifests compiled into the
-binary (calls entry 13).
+binary (calls entry 15).
 
-**Ambient: a local API socket** (calls entry 7).
+**Ambient: a local API socket** (calls entry 9).
 - Every allocation whose task declares the `legion` identity, which every
   app task does, gets a unix socket at `$LEGION_SECRETS_DIR/legion.sock`.
   The worker listens on it and proxies gRPC to the managers.
@@ -634,7 +701,7 @@ binary (calls entry 13).
 
 ### 6.5 UI extensions
 
-**Tier 1: declarative views** (calls entry 6). An app declares **slots** in
+**Tier 1: declarative views** (calls entry 8). An app declares **slots** in
 its manifest. The SPA renders the JSON **views** the app returns, with its
 own components:
 
@@ -688,7 +755,7 @@ An app may return `{ "hidden": true }` to say "nothing here for this job".
 ] }
 ```
 
-**One data path for the UI, CLI, and MCP** (calls entry 9).
+**One data path for the UI, CLI, and MCP** (calls entry 11).
 - `ListUiExtensions` returns the slots the viewer may see, filtered by
   `app:read`. `GetAppView {app, view, context}` and
   `InvokeAppAction {app, action, context, inputs, idempotency_key}` are
@@ -767,7 +834,209 @@ blocks: an editor, a graph, or a log viewer, for example.
   The page never sees a token. The only power it has is what the viewer
   has, narrowed again by its manifest.
 
-### 6.6 Health and visibility
+### 6.6 Jobspec extensions: apps add their own blocks
+
+An app that acts on jobs usually needs settings per job: what to back up and
+how often, which hostname to route, which repo a job came from. The natural
+home is the jobspec, next to the job it describes, versioned and reviewed
+with it. Each app gets **one namespaced block**, `apps.<app name>`, at the
+job level, the task level, or both. The app declares the block's schema in
+its manifest, and the manager enforces it (calls entry 6).
+
+```nickel
+{
+  name = "orders-db",
+  apps = {
+    uptime = { url = "https://orders.acme.dev/healthz", alert = "#payments-oncall" },  # job level
+  },
+  task = {
+    name = "postgres",
+    runtime = "container",
+    config = { image = "postgres:17" },
+    volumes = [ ... ],
+    apps = {
+      backup = { schedule = "0 3 * * *", keep = 14 },                                  # task level
+    },
+  },
+}
+```
+
+**Declaring an extension point.** In the manifest:
+
+```nickel
+extensions = {
+  task = {
+    description = "Back up this task's volume on a schedule.",
+    # JSON Schema (2020-12), written as a Nickel record. The same format task
+    # runtimes use for their `config` block.
+    schema = {
+      type = "object",
+      additionalProperties = false,
+      required = ["schedule"],
+      properties = {
+        schedule = { type = "string", description = "Cron expression, in UTC." },
+        keep     = { type = "integer", minimum = 1, default = 7, description = "Backups to retain." },
+        volume   = { type = "string", description = "Volume to back up. Defaults to the task's only volume." },
+      },
+    },
+    examples = [{ schedule = "0 3 * * *", keep = 14 }],
+    validate = true,      # also ask the app at submit, for checks a schema can't express (optional)
+    # requires = { resource = "net", action = "write" },   # extra permission to set this block (optional)
+  },
+  # job = { ... },        # a job-level block, declared the same way
+},
+```
+
+- The schema must describe an object, be at most 64 KiB, and use only local
+  `$ref`s (no remote fetches).
+- It is compiled once, at install or upgrade, with the `jsonschema` crate
+  that already validates runtime config. A schema that doesn't compile
+  fails the install, and so does an `example` that doesn't validate, so the
+  examples an app ships can't drift from its schema.
+- The block's key is the app's name, which is already unique in the
+  cluster, so two apps can't collide. Neither can an app and a future core
+  field, because core fields never live under `apps`.
+
+**At submit**, for each `apps.<name>` block, the manager:
+
+1. **Finds the owner.** It looks up the installed app `<name>` with an
+   extension at that level. If there is none, the submit fails, or with
+   `--allow-unknown-fields` the block is stored unvalidated (below).
+2. **Validates the shape, and fills defaults.** It applies the schema and
+   fills its `default`s, so the stored block is the expanded one, and
+   `legion job plan` prints it.
+3. **Checks `requires`**, if the app declared it, as the submitter, on the
+   job's namespace.
+4. **Asks the app**, if `validate = true`. It sends the expanded block and
+   its context to `POST /legion/v1/extensions/validate`, using the same
+   worker-plane forward and assertion as UI views (§6.5), with the
+   submitter as the viewer, and a 2-second budget. The app returns errors,
+   which reject the submit, or warnings, which pass through to the reply.
+   **If the app can't be reached, the submit succeeds with a warning.**
+   That is Kubernetes' failing-webhook lesson: a broken add-on must not
+   block deploys. The app checks the block again when it arrives through
+   its watch, and reports problems on its own status and views.
+5. **Stores the block** in the task or job config, stamped
+   `validated_by = <app>@<manifest digest>`.
+
+```
+error: orders-db: task postgres: apps.backup.keep: 0 is less than the minimum of 1
+error: orders-db: task postgres: apps.backup (backup app): volume 'logs' is not one of
+  this task's volumes (data)
+warning: orders-db: task postgres: apps.backup was not checked by the backup app
+  (unreachable); the schema check passed
+```
+
+**Changing only a block restarts nothing.** A resubmit whose only
+differences are in `apps` blocks still creates a job version, and it moves
+the running allocations onto it in place, through the path KV re-renders
+already use (`src/manager/server.rs:4150-4180`). There is no rollout. The
+app sees the new block through its watch.
+
+**How blocks reach the app.** `WatchAppExtensions { shards, shard_count }`
+is app-plane: it returns only the calling app's own blocks. It sends the
+current blocks first, then upserts and deletes of (job id, config version,
+level, group/task, namespace, block, validity). It shards by the same key
+hash as `WatchScalingPolicies` ([autoscaler-v2-plan.md](autoscaler-v2-plan.md)
+§6.9), so a sharded app needs only one lease scheme. Humans and agents see
+blocks in `legion job inspect` and `legion job info`, like any other field.
+
+**Discoverability.**
+- `legion job schema` (and `legion_job_schema` over MCP) merges every
+  installed app's extension schemas under `apps.<name>` at the right level,
+  the same way it already merges the live task-runtime config schemas. An
+  agent authoring a jobspec sees exactly what this cluster accepts.
+- `legion app extensions [app]` lists the extension points, with their
+  descriptions and examples.
+
+**Lifecycle.**
+- **Install and upgrade** register or replace the schema. The manager then
+  checks every stored block for that app against the new schema, including
+  blocks stored unvalidated under the flag, and reports the result in the
+  prompt:
+
+  ```
+  14 jobs carry apps.backup blocks; 2 fail this version's schema:
+    orders-db/postgres: apps.backup.keep: required property missing
+  ```
+
+  Failing blocks stay stored, are flagged `invalid` in `job info` and on the
+  app's watch (the app decides whether to act on them), and the next
+  resubmit of those jobs must conform.
+- **Disable** keeps the schema registered, so submits are still validated.
+  Nothing acts on the blocks while the app is off, and `job info` says
+  `app disabled`.
+- **Uninstall** lists the jobs carrying the app's blocks, and needs
+  `--force` if there are any. The blocks stay stored, flagged `orphaned`.
+  Resubmitting such a job fails unless the block is removed or
+  `--allow-unknown-fields` is passed.
+
+**Trust.** A block is an instruction, from whoever can submit the job, to an
+app that holds its own grant.
+- The app acts only on the job (and task) that carries the block. This is
+  the same context rule as for actions (§6.5): the app framework hands the
+  handler the job, not a free-form target, and schemas can't declare a
+  field that names a different job.
+- `requires` lets an app demand more than `job:write` from whoever sets its
+  block. A DNS app could require `net:write`, so a team that can deploy
+  can't also claim hostnames. It is checked on every submit that adds or
+  changes the block.
+- Blocks are visible to anyone with `job:read`, so they must never hold
+  secrets. Schemas should take KV paths instead, and the public doc says
+  so.
+- Schemas are data, compiled once. No app code runs in the manager on
+  submit; the only app code involved is the optional, time-boxed validate
+  call, which runs in the app.
+
+**Unknown fields are errors, unless you ask** (calls entry 7). Every key in
+a jobspec that neither core nor an installed app's extension knows becomes
+a submit error, with a suggestion, at the job level, the task level, and in
+core nested blocks:
+
+```
+error: web: task web: unknown field `autoscael` (did you mean `autoscale`?)
+error: orders-db: task postgres: apps.backup: no installed app named 'backup' declares a
+  task extension
+  hint: `legion app list` shows installed apps. Install backup, remove the block, or pass
+  --allow-unknown-fields to store it unvalidated
+```
+
+`--allow-unknown-fields` accepts the spec anyway. It is
+`allow_unknown_fields` on `RunJob`, `PlanJob`, `ValidateJob`, and
+`RunJobTemplate`, and a per-repo setting for GitOps.
+- **An unknown core field is dropped.** The manager has nowhere to put a
+  field it doesn't model. Each dropped field is listed in the reply's
+  `warnings` and recorded on the job version.
+- **An `apps.<name>` block for an app that isn't installed**, or doesn't
+  declare that level, **is stored unvalidated** and flagged `pending`. When
+  an app with that name and extension point is installed, it validates the
+  pending blocks (and its install prompt reports them), and from then on
+  they reach the app like any other block.
+- **A block for an installed app that fails its schema is still an error.**
+  The flag is about fields Legion doesn't know, not values it knows are
+  wrong.
+
+```console
+$ legion job run orders-db.ncl --allow-unknown-fields
+warning: task postgres: dropped unknown field `memoryMax2`
+warning: task postgres: stored apps.backup unvalidated (no app named 'backup' is installed)
+orders-db: submitted version 3
+$ legion job info orders-db
+...
+submitted with --allow-unknown-fields: dropped `memoryMax2`; apps.backup pending (no app 'backup')
+```
+
+The cases the flag exists for:
+- a jobspec written for a newer Legion, submitted mid-upgrade;
+- GitOps syncing a job before the app it configures is installed;
+- moving jobs between clusters that have different apps installed.
+
+Recording what was dropped or left pending on the version, and showing it in
+`job info`, keeps the escape hatch visible instead of habitual. A manager
+that predates this phase still drops unknown keys silently. That can't be
+fixed retroactively, and `docs/upgrades.md` will say so.
+
+### 6.7 Health and visibility
 
 - `legion app status` and the UI's Apps page show:
   - the record, the grant, and the job's derived status;
@@ -781,7 +1050,7 @@ blocks: an editor, a graph, or a log viewer, for example.
 - A stopped bundled app is a cluster-health finding (`legion doctor`, when
   it exists, and the UI's overview), not a silent absence.
 
-### 6.7 Checking the substrate against GitOps
+### 6.8 Checking the substrate against GitOps
 
 Before committing to this design, we checked it against the second app it
 must serve:
@@ -817,6 +1086,7 @@ must serve:
 | "Sync now" pressed by a viewer who may not deploy | §6.5 action permission `job:write` checked as the viewer, on that job |
 | Its repo credentials | config refers to KV paths; KV reads through its grant |
 | Upgrades with new permissions | §6.3 permission diff at `app upgrade` |
+| Mark the jobs it deployed, and where they came from | §6.6: GitOps adds a job-level `apps.gitops = { repo, path, commit }` block when it submits, and its Sync panel reads it |
 
 Nothing GitOps needs is autoscaler-specific, and nothing here is
 GitOps-specific. That is the test the substrate had to pass.
@@ -837,6 +1107,12 @@ pre-approved per namespace instead, so GitOps doesn't need the union.
   - `ListApps`, `GetApp`, `InstallApp`, `UpgradeApp`, `UninstallApp`,
     `SetAppEnabled`, `UpdateAppSettings`, `SetAppConfig`;
   - `ListUiExtensions`, `GetAppView`, `InvokeAppAction`;
+  - `WatchAppExtensions` (app-plane: only the caller's own blocks);
+  - `bool allow_unknown_fields` on `RunJob`, `PlanJob`, `ValidateJob`, and
+    `RunJobTemplate`, with dropped and pending fields reported in the
+    reply's `warnings`;
+  - the job and task messages gain the `apps` object; `GetJobSchema` merges
+    installed apps' extension schemas;
   - `ListGrants`, `RevokeGrant`;
   - `WorkloadIdentity` gains `repeated AclRule permissions` and
     `repeated string policies`;
@@ -866,6 +1142,18 @@ pre-approved per namespace instead, so GitOps doesn't need the union.
   - The system worker's capped cgroup parent (`cpu.max`, `memory.max`).
 - **Submit validation.** No root exec tasks and no privileged containers in
   reserved namespaces.
+- **Jobspec parsing (A6).**
+  - `deny_unknown_fields` on the job input, the task input, and core nested
+    blocks, with a did-you-mean error (closest known key by edit distance).
+  - Under `allow_unknown_fields`, unknown keys are collected rather than
+    failing the parse.
+  - A new `apps` object at job and task level. Each key is an app name, and
+    each value is a JSON object stored with `validated_by` and a state
+    (`valid`, `pending`, `invalid`, or `orphaned`).
+  - The job version records what the flag dropped or left pending.
+  - The in-place comparator treats a resubmit that differs only in `apps`
+    blocks as schedule-equivalent, so it takes the
+    `migrate_allocations_to_job_config` path.
 - **CLI and client.** `unix://` addresses; `legion app …`;
   `legion acl grants …`.
 - **Config.**
@@ -874,7 +1162,11 @@ pre-approved per namespace instead, so GitOps doesn't need the union.
   - Worker type `namespaces`.
   - `configs/jobs/maximal.ncl`: `identities[].permissions` and
     `identities[].policies`.
-  - `configs/apps/example-app.ncl`: a complete manifest with tier-1 UI.
+  - `configs/apps/example-app.ncl`: a complete manifest with tier-1 UI and
+    an `extensions` block.
+  - `configs/jobs/maximal.ncl`: an `apps` block at job and task level,
+    commented out, because it needs the named app installed and maximal
+    must submit on a bare cluster.
 - **UI.** An extension registry fetched at login, slot outlets on the job,
   task-row, node, overview, and sidebar surfaces, the block renderer, and
   (A5) the sandboxed page host with its bridge.
@@ -913,6 +1205,21 @@ pre-approved per namespace instead, so GitOps doesn't need the union.
     `legion_app_view`.
 - **A5: UI tier 2.** Sandboxed single-file pages, the bridge with an RPC
   allowlist and mutation confirmations, and the CSP wrapper.
+
+- **A6: jobspec extensions and strict fields.** Two halves:
+  - **Strict fields.** Unknown fields become submit errors with
+    suggestions, and `--allow-unknown-fields` is the escape hatch. This half
+    depends on nothing, and can ship first, even before A1.
+  - **Extensions.** Manifest `extensions`, the `apps` block, schema
+    validation and defaults, `requires`, the validate call (it needs A4's
+    forward; until then `validate = true` is accepted and skipped with a
+    warning), `WatchAppExtensions`, `job schema` merging, the
+    install/upgrade/uninstall lifecycle, and in-place version moves. Needs
+    A3.
+
+  *Alone:* typos and version skew stop being silent on day one, and third
+  parties can build apps that take per-job settings without changing
+  Legion.
 
 Deferred, not phased: installing from a registry
 (`legion app install @legion/gitops`). It waits on a registry plan that
@@ -961,7 +1268,7 @@ doesn't exist yet, and `install <url>` covers distribution until then.
 - An `app config set` that changes a code field is refused for an `app:write`
   token lacking the app's grant, and accepted otherwise.
 - Integration (`tests/integration/apps.rs`): scenario A on one manager with
-  zero workers, and the §6.7 GitOps-shaped manifest installed (prompt,
+  zero workers, and the §6.8 GitOps-shaped manifest installed (prompt,
   grant, reconciled job).
 
 **A4: UI tier 1**
@@ -980,6 +1287,31 @@ doesn't exist yet, and `install <url>` covers distribution until then.
 - A mutating call shows the confirmation.
 - The page cannot read `localStorage` or submit a form.
 
+**A6: jobspec extensions and strict fields**
+- Unknown fields:
+  - a job, task, or nested-block typo fails with the right suggestion;
+  - the `kind` error still reads as before;
+  - with the flag, core unknowns are dropped, listed in `warnings`, and
+    recorded on the version;
+  - an unknown app block is stored `pending`;
+  - a schema-invalid block for an installed app still fails.
+- Extensions:
+  - schema validation errors carry the JSON path, and defaults are filled
+    into the stored block;
+  - `requires` is enforced as the submitter;
+  - the validate call: an error rejects, a warning passes, and a timeout or
+    unreachable app accepts with a warning;
+  - a resubmit that changes only an `apps` block moves allocations in place
+    (same allocation ids, no rollout);
+  - `WatchAppExtensions` returns only the caller's own blocks, and refuses
+    other identities;
+  - `legion job schema` contains each installed extension;
+  - an install with a remote `$ref`, or with an example failing its own
+    schema, is refused;
+  - upgrade re-validation reports and flags failing blocks;
+  - installing an app picks up its `pending` blocks;
+  - uninstall needs `--force` and leaves blocks `orphaned`.
+
 ## 10. Rollout and compatibility
 
 - **New default:** managers run a system worker. A cluster that wants none
@@ -992,6 +1324,11 @@ doesn't exist yet, and `install <url>` covers distribution until then.
   with `namespaces = ["*", "legion-*"]` and no lend cap.
 - **Reserved namespaces are unprivileged.** No existing job lives in one, so
   nothing breaks. The rule is stated in `docs/namespaces.md`.
+- **Unknown jobspec fields become errors (A6).** This is the
+  widest-reaching break in the plan. Any spec carrying a stray or misspelled
+  key that is silently ignored today will fail to submit. The PR says so,
+  the error names the key and suggests a fix, and `--allow-unknown-fields`
+  restores today's behavior for anyone who needs time.
 - **`controlPlaneBindings`** keeps working. The cert-renewer example and
   `docs/workload-identity.md` move to `permissions`.
 - **Version skew.** An old worker doesn't provide the socket, so tasks
@@ -1000,8 +1337,8 @@ doesn't exist yet, and `install <url>` covers distribution until then.
   provides the socket.
 - **Docs, in the change that ships each phase:**
   - `docs/apps.md` (new): what an app is, the manifest reference, the
-    lifecycle, the trust model, writing an app, and the view-block
-    reference;
+    lifecycle, the trust model, writing an app, the view-block reference,
+    and the jobspec-extension reference;
   - `docs/workload-identity.md` (permissions, grants, the socket);
   - `docs/namespaces.md` (`legion-system`, node restrictions, the glob
     rule);
@@ -1009,7 +1346,10 @@ doesn't exist yet, and `install <url>` covers distribution until then.
   - `docs/ui-architecture.md` (extensions);
   - `docs/auth-and-acls.md` (the `app` resource, grants, the viewer
     assertion);
-  - `docs/agent-readiness.md` (`legion_app_*` tools);
+  - `docs/agent-readiness.md` (`legion_app_*` tools, extension schemas in
+    `job schema`, `allow_unknown_fields`);
+  - `docs/jobs-tasks-and-scheduling.md` (unknown fields, the flag, and the
+    `apps` block);
   - the `README.md` and `docs/README.md` indexes.
 
 ## 11. Open questions
@@ -1027,7 +1367,7 @@ doesn't exist yet, and `install <url>` covers distribution until then.
   script app)? Lean: yes. The CLI is a reasonable runtime for small apps,
   and it is the same binary the node already trusts.
 - **Pre-approved grants per namespace**, so an app like GitOps doesn't have
-  to hold the union of what its jobs request (§6.7). For example, a
+  to hold the union of what its jobs request (§6.8). For example, a
   namespace policy listing the permissions jobs in it may request without
   the submitter holding them. Lean: worth designing in the GitOps plan,
   since GitOps is the app that makes it necessary. The grant check here is
@@ -1036,6 +1376,15 @@ doesn't exist yet, and `install <url>` covers distribution until then.
   be blocked reliably today. Lean: accept and document the limit (§6.5).
   Revisit if browsers ship navigation-limiting CSP (the withdrawn
   `navigate-to`), or if fenced frames become usable for this.
+- **App-defined object kinds** (standalone, schema-validated objects an
+  app owns, like Kubernetes CRDs). Lean: wait. Per-job settings belong in
+  the job, and the one standalone kind needed so far (`ScalingPolicy`) is
+  core. If a second app needs its own kind, the extension machinery
+  (schemas in the manifest, validation in the manager, a watch stream)
+  generalizes to stored objects with little new design.
+- **Should GitOps set `--allow-unknown-fields` by default?** Lean: no. It
+  should be per repo and off by default, because GitOps is exactly where a
+  silently dropped field would go unnoticed longest.
 - **Does the app reconciler belong to a broader "managed jobs" concept**
   (jobs owned by a controller, edits reverted)? Lean: not until a second
   owner besides apps exists.
@@ -1059,7 +1408,7 @@ doesn't exist yet, and `install <url>` covers distribution until then.
 - **A3.**
   - `legion app list` on a fresh cluster shows the autoscaler running.
   - Upgrading the manager binary rolls it.
-  - Installing the §6.7 manifest shows the permission prompt and records
+  - Installing the §6.8 manifest shows the permission prompt and records
     the grant.
   - Editing `legion-system/gitops` directly is reverted.
 - **A4.**
@@ -1068,6 +1417,15 @@ doesn't exist yet, and `install <url>` covers distribution until then.
   - An action by a viewer without it is refused before the app sees a
     request.
   - The same view renders with `legion app view` and `legion_app_view`.
+- **A6.**
+  - `autoscael = true` fails to submit with `did you mean autoscale?`.
+  - The same spec with `--allow-unknown-fields` submits and reports the
+    drop in the reply and in `job info`.
+  - With a fake `backup` app installed, `apps.backup = { keep = 0 }` is
+    rejected with the JSON path, and `{ schedule = "0 3 * * *" }` is stored
+    with `keep = 7` filled in.
+  - Changing `keep` on a running job doesn't restart it.
+  - `legion job schema` shows `apps.backup` at task level.
 - **A5.** A tier-2 page can call an allowlisted RPC as the viewer, is
   refused a non-allowlisted one, and cannot read the SPA's token
   (Playwright).

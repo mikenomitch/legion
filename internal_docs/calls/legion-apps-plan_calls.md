@@ -176,7 +176,7 @@ in legion-system, and asks for: ...
   directory, and can delete the host-guard table and escape its cgroup.
   "Install an app" would silently mean "hand out cluster root".
 - **Against (b).** It needs a container runtime on every manager, and would
-  stop `legion:self` (entry 10) from working.
+  stop `legion:self` (entry 12) from working.
 - **Against (c).** It makes `app:write` on the autoscaler a path to
   `node:write`, by adding a plugin that runs with the app's grant.
 
@@ -213,7 +213,119 @@ the same tenant admin could grant a job of their own `exec:write` on
 The "dotfiles skip `*`" rule is familiar from every shell, and it removes
 nothing anyone has today, because no `legion-*` namespace exists yet.
 
-## 6. UI extensions are declarative views first, sandboxed pages second, and never in-origin JavaScript (reverses old autoscaler-plan entry 13)
+## 6. Apps extend the jobspec through one namespaced, schema-validated block each
+
+**Call.**
+- An app's manifest declares extension points: a JSON Schema for a block at
+  job and/or task level, optional `examples`, an optional `validate` call,
+  and an optional `requires` permission.
+- Job authors write `apps.<app name> = { … }`. The manager validates it at
+  submit, fills its defaults, and stores the expanded block.
+- The app receives its blocks through `WatchAppExtensions`.
+- A change to only an `apps` block moves allocations in place, with no
+  rollout.
+
+```nickel
+task = { name = "postgres", ..., apps = { backup = { schedule = "0 3 * * *", keep = 14 } } }
+```
+```
+error: orders-db: task postgres: apps.backup.keep: 0 is less than the minimum of 1
+```
+
+**Alternatives.**
+- (a) **Free-form `meta`.** Nomad's `meta`, Kubernetes annotations, Docker
+  labels: a string map apps read by convention.
+- (b) **App-defined object kinds** that reference jobs. This is Kubernetes'
+  CRD shape (an HPA next to its Deployment).
+- (c) **Nickel contracts evaluated by the manager**, my first sketch. They
+  are more expressive (cross-field checks, computed defaults), and Nickel
+  is already Legion's config language.
+- (d) **Top-level fields.** Let apps add fields anywhere, without the `apps`
+  namespace.
+
+**Trade-off.**
+- JSON Schema can't express most cross-field or cluster-aware checks.
+  Those go to the app's validate call, which is best-effort by design: an
+  unreachable app lets the submit through.
+- Whether a jobspec is valid now depends on which apps the cluster has
+  installed. The same file can pass on one cluster and fail on another
+  (mitigated by `--allow-unknown-fields` and by `job schema` showing the
+  cluster's own schema).
+- A block shares its job's lifecycle and visibility. It is versioned and
+  deleted with the job, and readable by anyone with `job:read`. Settings
+  that need their own lifecycle don't fit.
+
+**Why (extensibility, at a small simplicity cost).**
+- **Against (a).** It is the familiar failure: stringly typed, unvalidated,
+  and a typo is silently inert. That is the exact problem the strict-fields
+  half of this phase exists to fix.
+- **Against (b).** It splits one service's settings across files, and
+  needs object storage, ACLs, and lifecycle per kind. Per-job settings
+  belong with the job.
+- **Against (c).** It puts a Nickel evaluation, on the bounded 5-second
+  template threads (`docs/job-templates.md` § Rendering is sandboxed), in
+  the submit path of every job carrying a block. Its contracts can't be
+  exported to the JSON Schema that `legion job schema`, editors, and agents
+  consume.
+- **For JSON Schema.** It is exactly what task runtimes already do for
+  their `config` block (`src/task_plugins/mod.rs:2134`), so the mechanism,
+  the validator crate, and the schema merge already exist.
+- **Against (d).** It would let an app's field collide with a future core
+  field. The `apps.<name>` namespace makes that impossible, and makes it
+  obvious which app a setting talks to.
+
+## 7. Unknown jobspec fields are errors by default, and `--allow-unknown-fields` opts out
+
+**Call.**
+- Every unknown key in a jobspec fails the submit, with a did-you-mean
+  suggestion.
+- `--allow-unknown-fields` (`allow_unknown_fields` on the job RPCs) accepts
+  the spec anyway:
+  - unknown core fields are dropped and reported;
+  - `apps.<name>` blocks with no installed owner are stored unvalidated, as
+    `pending`, and validated when that app is installed;
+  - a block that fails an installed app's schema is still an error.
+- What the flag dropped or left pending is recorded on the job version and
+  shown in `job info`.
+
+```
+error: web: task web: unknown field `autoscael` (did you mean `autoscale`?)
+$ legion job run web.ncl --allow-unknown-fields
+warning: task web: dropped unknown field `autoscael`
+```
+
+**Alternatives.**
+- (a) Keep today's behavior: unknown keys are ignored
+  (`TaskConfigInput` has no `deny_unknown_fields`).
+- (b) Strict, with no escape hatch.
+- (c) Accept everything, with warnings.
+
+**Trade-off.**
+- A breaking change. Every spec carrying a stray key fails until it is
+  fixed or the flag is passed.
+- Under the flag, a dropped core field still loses intent, because Legion
+  can't store a field it doesn't model. Only app blocks are kept.
+- A flag used habitually (a GitOps repo that always sets it) gives back
+  most of what strictness buys. Recording drops on the version, and
+  showing them in `job info`, makes that visible, but doesn't prevent it.
+
+**Why (simplicity: what you wrote is what runs).**
+- **Against (a).** The silent drop is the worst failure in the system: it
+  reports success and does nothing. `autoscale = true` sent to a manager
+  that predates it would deploy without autoscaling, and nobody would know
+  until the traffic spike.
+- **Against (c).** Warnings in a reply nobody reads in CI are (a) with
+  extra steps.
+- **Against (b), the user's call.** There are real cases where submitting
+  anyway is right: a spec written for a newer Legion during an upgrade;
+  GitOps syncing a job before the app it configures is installed; moving
+  jobs between clusters with different apps. A deliberate, recorded flag
+  serves them without making the default unsafe.
+- **Keeping app blocks.** They are stored rather than dropped because they
+  have a future owner. Installing the app later picks them up with no
+  resubmit.
+
+## 8. UI extensions are declarative views first, sandboxed pages second, and never in-origin JavaScript (reverses old autoscaler-plan entry 13)
 
 **Call.**
 - **Tier 1** (Phase A4). Apps return JSON views built from a closed set of
@@ -252,12 +364,12 @@ nothing anyone has today, because no `legion-*` namespace exists yet.
   the reverse proxy shipped first.
 
 Declarative views are rendered by Legion's own components, so they match the
-theme. Being data, they also render in the terminal and over MCP (entry 9),
+theme. Being data, they also render in the terminal and over MCP (entry 11),
 which no JavaScript plugin model gives. The autoscaler and GitOps both fit
 in tier 1, which suggests most operational apps do. Tier 2 is the safety
 valve for the rest.
 
-## 7. Inside a task, Legion is reached through a per-allocation API socket the worker provides
+## 9. Inside a task, Legion is reached through a per-allocation API socket the worker provides
 
 **Call.** An allocation with the `legion` identity gets
 `$LEGION_SECRETS_DIR/legion.sock`, and `LEGION_ADDR` is set to its
@@ -297,7 +409,7 @@ This is Nomad's Task API, which exists for the same reasons. Choosing
 (a) would have meant documenting `hostGuard.allow` holes for the default
 deployment.
 
-## 8. Nodes restrict namespaces from the node side, not through permits or namespace policies
+## 10. Nodes restrict namespaces from the node side, not through permits or namespace policies
 
 **Call.** Worker types gain `namespaces = [...]`. The scheduler's candidate
 filter, and the blocked-eval wake match, refuse a job whose namespace the
@@ -328,7 +440,7 @@ worker type, and also gives operators dedicated nodes for any namespace
 (`ci-*` on CI hosts). That is independently useful, which is how a phase
 ships alone.
 
-## 9. App views and actions go through manager RPCs, authorized as the viewer before anything reaches the app
+## 11. App views and actions go through manager RPCs, authorized as the viewer before anything reaches the app
 
 **Call.** The SPA, the CLI, and MCP call `GetAppView` and `InvokeAppAction`
 on the manager. The manager:
@@ -371,7 +483,7 @@ authors never thought about it. The same RPC serving the SPA, the CLI
 (`legion app view`), and MCP (`legion_app_view`) gives agents parity with
 humans for free (AGENTS.md: agent-friendly surfaces).
 
-## 10. Bundled apps run the node's own binary (`command = "legion:self"`)
+## 12. Bundled apps run the node's own binary (`command = "legion:self"`)
 
 **Call.** The exec runtime resolves `legion:self` to the worker's own
 executable, so the autoscaler is `legion app run autoscaler` from the same
@@ -394,7 +506,7 @@ already running there. (a) needs a release host and per-arch checksums in the
 manifest. (b) needs a container runtime on every manager. Third-party apps
 use (a) or (b) like any job.
 
-## 11. App config lives on the app record, and any change is a rollout
+## 13. App config lives on the app record, and any change is a rollout
 
 **Call.** `legion app config set` validates against the manifest's Nickel
 contract, stores the config on the record, and the reconciler resubmits the
@@ -420,7 +532,7 @@ period.
   change behaving differently.
 - (b) asks every app author to write watch logic.
 
-## 12. Manager-config `apps` settings apply only when the cluster is first seeded
+## 14. Manager-config `apps` settings apply only when the cluster is first seeded
 
 **Call.** `apps = { autoscaler = { enabled = false } }` in manager config is
 read once, when the first Control leader seeds app records on an empty
@@ -444,7 +556,7 @@ GitOps managing apps eventually.
 
 Seed-only gives a deterministic day-one choice and a single source of truth
 afterwards.
-## 13. Bundled apps' grants are recorded by bootstrap, and skip the escalation check
+## 15. Bundled apps' grants are recorded by bootstrap, and skip the escalation check
 
 **Call.** When the first Control leader seeds records for the apps compiled
 into the binary, their manifests' permissions are recorded as granted by

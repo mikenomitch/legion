@@ -4290,6 +4290,18 @@ plan.
         `legion app view` and `legion_app_view`
   - [ ] A5: UI tier 2, sandboxed single-file pages with a postMessage bridge
         (RPC allowlist, viewer identity, strict CSP)
+  - [ ] A6: jobspec extensions and strict fields, in two halves.
+        (a) Unknown jobspec fields become submit errors with a
+        did-you-mean, and `--allow-unknown-fields` drops unknown core fields
+        and stores unknown `apps.<name>` blocks as `pending`. Today
+        `TaskConfigInput` ignores unknown keys (`src/structs/job.rs:2404`),
+        so a typo, or `autoscale` sent to an old manager, is silently
+        dropped. No dependency; can ship first.
+        (b) `apps.<name>` blocks at job and task level, validated against the
+        app's manifest-declared JSON Schema (the task-runtime schema
+        pattern), an optional validate call that fails open,
+        `WatchAppExtensions`, the merge into `job schema`, and in-place
+        version moves for block-only changes. Needs A3.
   - [ ] Deferred: install apps from a registry (waits on a registry plan
         that doesn't exist yet), tenant-owned apps, and pre-approved
         per-namespace grants, so GitOps needn't hold the union of what its
@@ -4323,7 +4335,11 @@ plan.
         page. Usage is sampled per allocation today, but it lives only on the
         manager that received the heartbeat.
   - [ ] Phase 2: task autoscaling MVP as the bundled app (needs apps A1–A3).
-        `autoscale = true` and its expansion in `job plan`, the safeguard
+        `autoscale = true` and its expansion in `job plan`; layered,
+        live-resolved defaults (cluster `legion scaling defaults`,
+        namespace-policy `autoscale`, the task), with provenance in
+        `scaling explain --policy`; in-place resubmits for `autoscale`/`count`
+        changes; the safeguard
         pipeline, compare-and-set `ScaleTask`, `scale_history`, pins
         (`job scale --for/--min/--max/--release`), `legion scaling
         status|explain|history|pause|resume`, `dry-run`, events, MCP read tools

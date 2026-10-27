@@ -463,7 +463,7 @@ compiling to the same internal `ScalingPolicy`:
 Standalone policies are new objects rather than manager config. Manager
 config differs per manager, and node groups belong to the cluster. They are
 not files on the autoscaler's disk either, which was Nomad's choice and
-keeps policies out of cluster state. So they are first-class (calls entry 7):
+keeps policies out of cluster state. So they are first-class (calls entry 8):
 
 ```console
 $ legion scaling apply nodes.ncl
@@ -478,7 +478,7 @@ workers-general                    nodes  -              enforce  1..20
 ### 6.3 `autoscale = true`, and exactly what it means
 
 The jobspec field is `autoscale`. It takes a boolean or a record (calls
-entry 15):
+entry 17):
 
 ```nickel
 {
@@ -492,13 +492,15 @@ entry 15):
 }
 ```
 
-`true` expands to this record, and `legion job plan` prints the expansion so
-nothing is hidden:
+`true` means "the defaults". The built-in defaults are below, and every
+one of them can be overridden per task, per namespace, or cluster-wide
+(next subsection). `legion job plan` prints the effective record, so nothing
+is hidden:
 
 ```nickel
 autoscale = {
-  min = 2,                          # = count
-  max = 8,                          # = 4 × count
+  min = 2,                          # "1x": 1 × count
+  max = 8,                          # "4x": 4 × count
   cpu = 0.7,                        # hold average CPU at 70% of the reservation
   up   = { stabilize = "0s", step = { percent = 100, replicas = 4 }, every = "1m" },
   down = { stabilize = "5m", step = { percent = 10,  replicas = 1 }, every = "1m" },
@@ -539,6 +541,93 @@ The calls doc defends each default. In short:
   burst above its reservation (`docs/resource-enforcement.md`); utilization
   above 1.0 is a valid reading and scales out.
 
+#### Overriding the defaults
+
+Every default can be overridden, one field at a time, at three levels. Each
+level takes the same record shape as `autoscale`. A field set at one level
+wins over every level below it, and a field left unset falls through
+(calls entry 3).
+
+| Level | Where | Who can set it | Typical use |
+| --- | --- | --- | --- |
+| task | `autoscale = { … }` in the jobspec | the job author | `autoscale = { max = 20 }` |
+| namespace | `autoscale = { … }` in a namespace policy | `acl:write` (namespace policies' existing gate) | prod namespaces scale in more slowly |
+| cluster | `legion scaling defaults apply defaults.ncl` | `operator:write` | every task targets 60% CPU |
+| built-in | the record above | Legion | |
+
+```nickel
+# defaults.ncl  —  legion scaling defaults apply defaults.ncl    (cluster)
+{ cpu = 0.6, max = "6x", down = { stabilize = "10m" } }
+
+# payments.ncl  —  legion namespace policy apply -f payments.ncl  (namespace)
+{
+  name = "payments",
+  namespaces = ["payments-*"],
+  autoscale = { down = { step = { replicas = 1 }, every = "2m" }, mode = "dry-run" },
+}
+
+# the jobspec  (task)
+autoscale = { max = 20 },
+```
+
+The rules:
+
+- **Field by field, including nested records.** `down = { stabilize = "10m" }`
+  keeps the default `down.step` and `down.every`. The one exception is a
+  `step` record, which replaces the whole `step` below it, both halves
+  (§6.4).
+- **`min` and `max` take a number or a multiple of `count`.** Write
+  `max = 20`, or `max = "6x"`. The built-ins are `min = "1x"` and
+  `max = "4x"`, so a cluster can change the ratio for every task without
+  knowing their counts.
+- **Signals are all or nothing.** If the task's record names no signal
+  (`cpu`, `memory`, or `checks`), the effective default signal applies: the
+  built-in `cpu = 0.7`, or whatever the cluster or namespace set. If it
+  names any, it gets exactly the ones it wrote, so
+  `autoscale = { checks = [lag] }` does not also scale on CPU. Defaults may
+  set `cpu` and `memory`, never `checks`, because checks name sources and
+  queries that only make sense for one task.
+- **Namespace policies keep their existing rule.** All matching policies
+  apply. Two that set the same field to different values make that field
+  unresolvable for tasks in the overlap, and the submit fails naming both
+  policies, exactly as two different `pools.default` do today
+  (`docs/namespaces.md` § Namespace policies). There is no precedence among
+  policies to learn.
+- **Defaults are resolved live, not frozen at submit.**
+  - The jobspec stores what the author wrote: `true`, or the sparse record.
+  - The manager recomputes the effective policy whenever any level
+    changes, and `WatchScalingPolicies` delivers the recomputed policy.
+  - So an operator who finds scale-in too eager everywhere changes one
+    cluster default, and every inheriting task follows, with no resubmits.
+  - Each `scale_history` row carries the effective policy's digest, so a
+    change in behavior traces back to the defaults change that caused it.
+- **A defaults change is checked against everything that inherits it.**
+  `scaling defaults apply` and `namespace policy apply` recompute every
+  affected policy first. If any would become invalid (a new cluster `min`
+  above some task's explicit `max`, say), the apply lists them and refuses.
+  With `--force`, those policies hold with status `invalid: <why>` until
+  fixed. `--dry-run` prints the diff of effective policies without writing.
+
+Where each value came from is always one command away:
+
+```console
+$ legion scaling explain payments-prod/api --policy
+payments-prod/api/default/api   effective policy 9c1e…
+  field            value          from
+  min              4              built-in ("1x" of count 4)
+  max              20             jobspec
+  cpu              0.6            cluster defaults
+  down.stabilize   10m            cluster defaults
+  down.step        1 replica      namespace policy payments
+  down.every       2m             namespace policy payments
+  up.*             (defaults)     built-in
+  mode             dry-run        namespace policy payments
+
+$ legion scaling defaults show -n payments-prod    # the same table without a task
+```
+
+#### What the default can't know
+
 What the default can't know, it says at submit:
 
 ```
@@ -557,7 +646,7 @@ then the sum of the group's usage over the sum of its reservations.
 Validation requires at most one task in the group to carry `autoscale`, and
 all of the group's tasks to share a count. That is the honest version of
 "autoscale a task group" in a jobspec that has no group objects (calls
-entry 13).
+entry 15).
 
 **Ownership** follows Phase 0's rule 1 (old calls entry 4): with `autoscale`
 present, the policy owns the live count, and resubmits never reset it.
@@ -574,10 +663,36 @@ floor, and the autoscaler brings the count down at the scale-in rate. When
 `autoscale` is removed in a resubmit, Phase 0's rule applies again on that
 same submit.
 
+**Editing the policy restarts nothing.** For an autoscaled task, a resubmit
+whose only differences are in `autoscale` and `count` creates a job version
+and moves the running allocations onto it in place. That is the path KV
+re-renders already use (`src/manager/server.rs:4150-4180`). Arbitration
+adjusts the live count in the same transaction. Without this rule, raising
+`max` would roll the service, because `count` is in the scheduling-relevant
+set (`task_schedule_equivalent`, `store.rs:21251`). Changing a cluster or
+namespace default touches no job at all.
+
+**Why `autoscale` is a core field, not an app extension.** Third-party apps
+attach per-job settings as `apps.<name>` blocks
+([legion-apps-plan.md](legion-apps-plan.md) §6.6), and the autoscaler could
+have used one (calls entry 9). It doesn't, because core behavior depends on
+the field:
+- submit arbitration (who owns the live count);
+- the `--for` rule on manual scales;
+- the in-place resubmit rule above;
+- the layered defaults;
+- submit errors that need the task's runtime and count.
+
+App-extension validation is best-effort by design: an unreachable app lets
+the submit through. These errors must be hard. And the bundled app is the
+same binary as the manager, so the extension mechanism's main benefit,
+versioning apart from Legion, buys nothing here.
+
 ### 6.4 The full policy surface
 
-Everything beyond `true` is optional, and every field has the default
-above.
+Everything beyond `true` is optional. A field you leave out takes its
+effective default: the built-in value above, or whatever the cluster or
+namespace overrode it to (§6.3).
 
 ```nickel
 autoscale = {
@@ -646,7 +761,7 @@ autoscale = {
 The user asked for safeguards that don't trade away simplicity. The answer
 is one fixed pipeline. Each stage either passes the number through or
 changes it and records why. The records *are* the explanation, so
-observability needs no separate code path (calls entry 5).
+observability needs no separate code path (calls entry 6).
 
 ```
  checks ──▶ recommendations ──▶ merge (max) ──▶ headroom ──▶ stabilize ──▶ step limit
@@ -672,7 +787,7 @@ observability needs no separate code path (calls entry 5).
 | **flap guard** | 3 direction changes in 10 minutes holds scale-in for `2 × down.stabilize` and emits `scale.flapping` once | `held: flapping (3 reversals in 10m)` |
 | **mode** | `enforce` | `dry-run: would scale 4 → 6` |
 
-**Manual scale on an autoscaled task is a pin, not a fight** (calls entry 8).
+**Manual scale on an autoscaled task is a pin, not a fight** (calls entry 10).
 Phase 0's `legion job scale` keeps working. On an autoscaled task it sets a
 time-boxed override that the pipeline treats as final:
 
@@ -794,7 +909,7 @@ it returns:
 - whether a rollout is active;
 - the current override row version, for compare-and-set.
 
-**How the data gets to one place** (calls entry 9):
+**How the data gets to one place** (calls entry 11):
 
 - Every manager pre-aggregates the reports *it* received into rollups keyed
   by **(node, target)**: sums, counts, maxima, and a small fixed-bucket
@@ -867,7 +982,7 @@ trait Target {         // "legion-task" (implicit), "exec", "noop", external ("a
   style, through `util::run_json_command`), and `noop` (decisions and
   events only).
 
-**External plugins speak JSON-RPC 2.0, over stdio or HTTP** (calls entry 3).
+**External plugins speak JSON-RPC 2.0, over stdio or HTTP** (calls entry 4).
 This is the same framing `legion mcp serve` already uses. The app spawns a
 `command` plugin once, keeps it running, restarts it with backoff if it
 dies, and applies a per-call timeout (default 10s for sources and
@@ -934,7 +1049,7 @@ fetches, checksums, and caches them into the app's task directory:
 ```
 
 **Policies reference plugins by name and never carry a command or a URL**
-(calls entry 4). Plugins run inside the app with the app's identity, which
+(calls entry 5). Plugins run inside the app with the app's identity, which
 can resize every job. A tenant who could name a command in their policy
 could run code as that identity. A tenant who could name a URL could aim
 the app's network position at internal endpoints (SSRF). The operator
@@ -973,7 +1088,7 @@ enabled by default and needs nothing configured (apps plan §6.3).
 - **Band** `critical`, so it is never preempted.
 - **One replica by default.** Losing it pauses scaling until the
   reschedule, and every surface says so (§6.6).
-- **Horizontal scale by sharding** (calls entry 11). Policies hash to 64
+- **Horizontal scale by sharding** (calls entry 13). Policies hash to 64
   shards. Each replica keeps a membership lease
   (`legion/apps/autoscaler/members/<alloc>`) and holds shard leases
   (`…/shards/<n>`) up to `ceil(64 / live members)`, rebalancing as members
@@ -985,7 +1100,7 @@ enabled by default and needs nothing configured (apps plan §6.3).
 - **No duplicate actions.** KV locks have no fencing token
   (`store.rs:19343`), so two replicas can briefly both believe they own a
   shard. Every write the app makes is therefore **compare-and-set** against
-  replicated state, so a stale owner loses (calls entry 10):
+  replicated state, so a stale owner loses (calls entry 12):
   - **Task targets.** `ScaleTask.expected_version` names the override
     version the decision was computed from. A stale writer gets
     `FAILED_PRECONDITION`, re-reads, and re-evaluates. The same check stops
@@ -1072,7 +1187,7 @@ A node-group policy is a standalone policy object:
 ```
 
 **Scale-up comes from pending work, simulated by the manager** (calls entry
-6). New RPC **`GetCapacityDemand`**:
+7). New RPC **`GetCapacityDemand`**:
 
 1. It takes the jobs short of their effective count (the capacity pass's
    SQL), plus blocked gangs and their quorum.
@@ -1161,7 +1276,7 @@ ships nothing for it.
 
   It does **not** get `job:write`: it can resize, not redeploy. It does get
   `node:write`, even on clusters with no node-group policies. The calls doc
-  (entry 16) explains why the grant is not split by feature.
+  (entry 18) explains why the grant is not split by feature.
 - **Standalone policies.**
   - A task or external-target policy needs `scale:write` in its namespace.
   - A node-group policy is cluster-scoped. It needs `node:write`, which is
@@ -1192,6 +1307,8 @@ ships nothing for it.
   | `ReportScalingStatus`, `RecordScalingAction` | app-plane (the autoscaler's identity only) |
   | `GetScalingStatus`, `GetScaleHistory` | `scale:read`, filtered |
   | `PauseScaling` | `scale:write` on the target; `operator:write` for `--all` and node groups |
+  | `ApplyScalingDefaults` | `operator:write` |
+  | `GetScalingDefaults` | `scale:read` |
   | `ForgetNode` | `node:write` |
 
   Coarse checks come first, then the precise scope, so a probe cannot tell
@@ -1245,6 +1362,9 @@ ships nothing for it.
   - `GetScalingInputs`, `GetCapacityDemand`, `WatchScalingPolicies`
     (server stream);
   - `ApplyScalingPolicy`, `DeleteScalingPolicy`, `ListScalingPolicies`;
+  - `ApplyScalingDefaults` (with `dry_run` and `force`, and an idempotency
+    key), `GetScalingDefaults` (effective defaults for a namespace, with
+    provenance);
   - `ReportScalingStatus`, `RecordScalingAction` (app-plane),
     `GetScalingStatus`, `GetScaleHistory`;
   - `PauseScaling`, `ForgetNode` (also revokes the node token).
@@ -1257,14 +1377,26 @@ ships nothing for it.
 **Structs / store**
 
 - `TaskConfig` `+ autoscale: Option<Autoscale>`, which is either a boolean or
-  a record (serde untagged, camelCase, schemars). It is persisted inside the
-  existing `task_config` JSON.
+  a record (serde untagged, camelCase, schemars). It is persisted **as
+  written** (not expanded) inside the existing `task_config` JSON. `min` and
+  `max` accept a number or an `"Nx"` multiple of `count`.
+- An effective-policy resolver in the manager (built-in, then cluster
+  defaults, then matching namespace policies, then the task). `job plan`,
+  `WatchScalingPolicies`, `scaling explain --policy`, and validation all use
+  it. It is re-run for inheriting policies when any level changes.
+- `NamespacePolicy` `+ autoscale` (the same record shape, with no `checks`),
+  using the existing all-policies-apply rule.
+- The in-place comparator: for autoscaled tasks, a resubmit that differs
+  only in `autoscale` and `count` takes the
+  `migrate_allocations_to_job_config` path.
 - New tables on the Control lane:
   - `scaling_policy` (name, namespace, version, spec JSON, created/updated
     by);
   - `scale_history` (target key, at, from, to, source, principal, summary,
     decision JSON; capped per target);
-  - `scaling_pause` (target or `*`, until, reason, principal).
+  - `scaling_pause` (target or `*`, until, reason, principal);
+  - `scaling_defaults` (one versioned row: the cluster-level record,
+    updated by, updated at).
 
   Pins live on `task_scale` as `pin_until`, `pin_min`, and `pin_max`
   columns, so `effective_task_count` stays the single reader and the
@@ -1273,7 +1405,8 @@ ships nothing for it.
   last write, so it never repeats across a delete and recreate.
 - `scaling_action` (policy, action version, kind, desired or victim ids,
   decision id, state, outcome) holds the node and external intents (§6.9).
-- `scale_history` gains `applied` (false for dry-run "would" rows).
+- `scale_history` gains `applied` (false for dry-run "would" rows) and
+  `policy_digest` (the effective policy the decision used).
 - `handle_job_submit_apply` gains the autoscale-aware arbitration from §6.3:
   keep the override, rebase `base_count`, and clamp into the new bounds.
 - `validate_job_config` gains autoscale validation:
@@ -1314,6 +1447,10 @@ with a hand-written identity binding, with no change to the engine.
    - The engine, with the `legion` source, `target-value`, and the
      `cpu`/`memory` shorthands.
    - `autoscale = true` and its expansion in `job plan`.
+   - Layered defaults (cluster `scaling defaults`, namespace-policy
+     `autoscale`, the task), resolved live, with provenance in
+     `scaling explain --policy`. In-place resubmits for `autoscale` and
+     `count` changes.
    - The full safeguard pipeline, compare-and-set writes, decisions in
      `scale_history`, `ReportScalingStatus`.
    - CLI: `legion scaling status | explain | history | pause | resume`;
@@ -1384,7 +1521,18 @@ gates at the end.
   - rolling `step` windows, including both directions within one window,
     and a partial `step` record zeroing the other half;
   - bounds after step (a raised floor applies at once);
-  - the pin and pause precedence matrix, including a pin above `max`.
+  - the pin and pause precedence matrix, including a pin above `max`;
+  - the defaults matrix:
+    - the precedence of built-in, cluster, namespace, and task;
+    - nested merges, and `step` replacing the record below it;
+    - `"Nx"` resolution against `count`;
+    - signals being all or nothing;
+    - two namespace policies setting one field differently, refused with
+      both named;
+    - a defaults change delivered live through `WatchScalingPolicies`;
+    - an invalidating defaults change refused, and with `--force` holding
+      the affected policies as `invalid`;
+    - provenance output naming the right level for every field.
 - Engine simulation tests. A deterministic clock plus synthetic series
   (ramp, spike, sawtooth, a dropped source) are run through the same code
   path `legion scaling simulate` will use. They assert the decision
@@ -1399,7 +1547,9 @@ gates at the end.
   - server-side refusal of autoscaler writes to a paused target;
   - group targets writing every member in one transaction;
   - the autoscale-aware submit arbitration (raise count, lower count,
-    remove `autoscale`), as a matrix next to Phase 0's.
+    remove `autoscale`), as a matrix next to Phase 0's;
+  - a resubmit changing only `autoscale` or `count` keeps the same
+    allocation ids, with no rollout.
 - Integration (`tests/integration/autoscaler.rs`, one module in the shared
   binary, using worker simulation for fake usage):
   - S1 end to end: load ramps, the count rises, the count falls after the
@@ -1511,6 +1661,12 @@ gates at the end.
     refused with the documented hint.
   - Killing the app shows NOT RUNNING within three intervals.
   - `--all` pause stops all writes.
+  - Overriding defaults:
+    - `autoscale = { max = 20 }` changes only `max`;
+    - one `scaling defaults apply` changes every inheriting task's effective
+      policy without a resubmit;
+    - `scaling explain --policy` names the source of every field;
+    - raising `max` in the jobspec doesn't restart the task.
 - **P3.** S3 sleeps at zero and wakes on lag. `min = 0` without activation
   fails validation with the documented message. `scaling simulate` over 1h
   of history matches the decisions the live engine made in that hour.
