@@ -673,9 +673,9 @@ set (`task_schedule_equivalent`, `store.rs:21251`). Changing a cluster or
 namespace default touches no job at all.
 
 **Why `autoscale` is a core field, not an app extension.** Third-party apps
-attach per-job settings as `apps.<name>` blocks
+declare their own jobspec keys at extension points
 ([legion-apps-plan.md](legion-apps-plan.md) §6.6), and the autoscaler could
-have used one (calls entry 9). It doesn't, because core behavior depends on
+have declared `autoscale` that way (calls entry 9). It doesn't, because core behavior depends on
 the field:
 - submit arbitration (who owns the live count);
 - the `--for` rule on manual scales;

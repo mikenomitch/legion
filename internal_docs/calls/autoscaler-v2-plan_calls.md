@@ -162,7 +162,7 @@ cluster scaling defaults: v4; 212 policies inherit a changed field, 0 invalid
   into a mass resubmit.
 - **Against (c).** The defaults shape how *core* expands a core field.
   Putting them in an app's config couples the two, restarts the app on
-  every change (apps calls entry 13), and gates defaults behind `app:write`
+  every change (apps calls entry 15), and gates defaults behind `app:write`
   instead of the operator permission they deserve.
 - **Against (d).** It breaks namespace policies' deliberate "no precedence
   to learn" rule. Conflicting fields fail the same way two `pools.default`
@@ -346,24 +346,26 @@ A stored object is validated at apply, versioned, listable, and
 permissioned by namespace, the same as every other thing users
 `apply` in Legion.
 
-## 9. `autoscale` stays a first-class core field, not an `apps.autoscaler` extension block
+## 9. `autoscale` stays a first-class core field, not a key the autoscaler app declares
 
 **Call.** The autoscaler's per-task policy is the core jobspec field
 `autoscale`, validated and resolved by the manager. It does not use the
 generic jobspec-extension mechanism that third-party apps use
 (apps calls entry 6).
 
-**Alternatives.** Express it as `apps.autoscaler = { … }`: dogfood the
-extension mechanism with the first app, keep autoscaling semantics out of
-core, and let a third-party autoscaler replace the bundled one with no core
-change.
+**Alternatives.** Have the bundled app declare `autoscale` as a task-level
+extension key. Since extension keys are written as natural top-level keys,
+the jobspec would look identical to users. This would dogfood the extension
+mechanism with the first app, keep autoscaling semantics out of core, and
+let a third-party autoscaler replace the bundled one with no core change.
 
 **Trade-off.**
 - Core carries the autoscale schema, its defaults, and its validation.
 - The first app doesn't exercise the extension mechanism, so GitOps or a
   third-party app will be its first real user.
-- A replacement autoscaler would use its own `apps.<name>` block, not
-  `autoscale`.
+- A replacement autoscaler can't claim `autoscale`, because it is a core
+  field and installs are refused on collision. It declares its own key
+  instead.
 
 **Why (correctness).** Core behavior depends on this field:
 - submit arbitration over who owns the live count (plan §6.3);

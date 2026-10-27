@@ -213,66 +213,93 @@ the same tenant admin could grant a job of their own `exec:write` on
 The "dotfiles skip `*`" rule is familiar from every shell, and it removes
 nothing anyone has today, because no `legion-*` namespace exists yet.
 
-## 6. Apps extend the jobspec through one namespaced, schema-validated block each
+## 6. Apps declare natural keys at fixed extension points, with `apps.<app>` as a qualified spelling that never collides (revised; the first draft was namespaced-only)
 
 **Call.**
-- An app's manifest declares extension points: a JSON Schema for a block at
-  job and/or task level, optional `examples`, an optional `validate` call,
-  and an optional `requires` permission.
-- Job authors write `apps.<app name> = { … }`. The manager validates it at
-  submit, fills its defaults, and stores the expanded block.
-- The app receives its blocks through `WatchAppExtensions`.
-- A change to only an `apps` block moves allocations in place, with no
-  rollout.
+- An app's manifest declares keys at extension points that core defines:
+  the job, a group (written on one of its tasks), a task, a volume entry, a
+  port entry, or a service.
+- Each key has a JSON Schema, optional `examples`, an optional `validate`
+  call that fails open, and an optional `requires` permission.
+- Job authors write the key where it belongs, and the manager validates it
+  at submit, fills its defaults, and stores the value by app.
+- Collisions are refused at install, against core fields and against other
+  apps; an operator can rename with `--key`. `apps.<app> = { … }` at the
+  same point is a qualified spelling that always works, including after a
+  later Legion release adds a core field with the same name.
+- The app receives its values through `WatchAppExtensions`. A change to
+  only extension values moves allocations in place, with no rollout.
 
 ```nickel
-task = { name = "postgres", ..., apps = { backup = { schedule = "0 3 * * *", keep = 14 } } }
+volumes = [{ name = "data", path = "/var/lib/postgresql", backup = { schedule = "0 3 * * *" } }]
 ```
 ```
-error: orders-db: task postgres: apps.backup.keep: 0 is less than the minimum of 1
+error: orders-db: task postgres: volume data: backup.keep: 0 is less than the minimum of 1
 ```
+
+**Revision.** The first draft of this entry (written the same day, never
+built) required every app setting to live in one namespaced block,
+`apps.<name>`, at job or task level only. It rejected top-level keys,
+alternative (d) below, because of collisions. The user asked for settings
+that "feel more natural", including keys on groups and elsewhere. The
+collision argument turned out to be answerable: install-time checks, the
+`--key` rename, and the qualified spelling as the permanent fallback. So
+this entry now records the reversal.
 
 **Alternatives.**
 - (a) **Free-form `meta`.** Nomad's `meta`, Kubernetes annotations, Docker
   labels: a string map apps read by convention.
 - (b) **App-defined object kinds** that reference jobs. This is Kubernetes'
   CRD shape (an HPA next to its Deployment).
-- (c) **Nickel contracts evaluated by the manager**, my first sketch. They
-  are more expressive (cross-field checks, computed defaults), and Nickel
-  is already Legion's config language.
-- (d) **Top-level fields.** Let apps add fields anywhere, without the `apps`
-  namespace.
+- (c) **Nickel contracts evaluated by the manager.** They are more
+  expressive (cross-field checks, computed defaults), and Nickel is already
+  Legion's config language.
+- (d) **Namespaced blocks only** (`apps.backup = { … }`), the first draft.
+  It is predictable and collision-free by construction.
+- (e) **Keys anywhere.** Let apps choose any path in the jobspec, not just
+  core-defined points.
 
 **Trade-off.**
-- JSON Schema can't express most cross-field or cluster-aware checks.
-  Those go to the app's validate call, which is best-effort by design: an
-  unreachable app lets the submit through.
-- Whether a jobspec is valid now depends on which apps the cluster has
-  installed. The same file can pass on one cluster and fail on another
-  (mitigated by `--allow-unknown-fields` and by `job schema` showing the
-  cluster's own schema).
-- A block shares its job's lifecycle and visibility. It is versioned and
-  deleted with the job, and readable by anyone with `job:read`. Settings
-  that need their own lifecycle don't fit.
+- **Collisions are now possible.** Install refuses them, but two clusters
+  with different apps owning `backup` read the same file differently. The
+  qualified spelling pins the owner when that matters.
+- **A future core field can shadow a key.** Specs using the short key then
+  fail with a pointer to the qualified spelling: a migration, though not a
+  silent one.
+- **Unknown keys are ambiguous.** Under the flag, an unknown key at an
+  extension point might be a typo or an uninstalled app's key, so it is
+  kept as pending rather than dropped (entry 7).
+- **JSON Schema** can't express most cross-field or cluster-aware checks.
+  Those go to the validate call, which is best-effort by design.
+- **Validity depends on the cluster.** Whether a jobspec is valid now
+  depends on which apps are installed (mitigated by
+  `--allow-unknown-fields`, and by `job schema` showing the cluster's own
+  schema).
+- **Values share their job's lifecycle and visibility.** Settings that need
+  their own lifecycle don't fit.
 
-**Why (extensibility, at a small simplicity cost).**
-- **Against (a).** It is the familiar failure: stringly typed, unvalidated,
-  and a typo is silently inert. That is the exact problem the strict-fields
-  half of this phase exists to fix.
+**Why (simplicity for the job author, extensibility for the app author).**
+- **For natural keys.** A setting that reads like part of the job, sitting
+  next to what it configures (a backup schedule on the volume it backs up,
+  a hostname on the port it routes), is easier to write and review than the
+  same setting parked under `apps` at task level.
+- **Against (d).** It reads as plumbing, and can't attach to a volume or a
+  port.
+- **Against (e).** It would make every core block a potential collision
+  site. Fixed points keep the promise small: core avoids new field names
+  only at those points, and checks them against known app keys.
+- **Against (a).** Stringly typed, unvalidated, and a typo is inert: the
+  exact problem entry 7 exists to fix.
 - **Against (b).** It splits one service's settings across files, and
-  needs object storage, ACLs, and lifecycle per kind. Per-job settings
-  belong with the job.
+  needs object storage, ACLs, and lifecycle per kind.
 - **Against (c).** It puts a Nickel evaluation, on the bounded 5-second
   template threads (`docs/job-templates.md` § Rendering is sandboxed), in
-  the submit path of every job carrying a block. Its contracts can't be
-  exported to the JSON Schema that `legion job schema`, editors, and agents
-  consume.
+  the submit path of every job carrying an extension. Its contracts can't
+  be exported to the JSON Schema that `legion job schema`, editors, and
+  agents consume.
 - **For JSON Schema.** It is exactly what task runtimes already do for
-  their `config` block (`src/task_plugins/mod.rs:2134`), so the mechanism,
-  the validator crate, and the schema merge already exist.
-- **Against (d).** It would let an app's field collide with a future core
-  field. The `apps.<name>` namespace makes that impossible, and makes it
-  obvious which app a setting talks to.
+  their `config` block (`src/task_plugins/mod.rs:2134`). Values are still
+  written in Nickel; only the evaluated result is checked.
 
 ## 7. Unknown jobspec fields are errors by default, and `--allow-unknown-fields` opts out
 
@@ -281,10 +308,10 @@ error: orders-db: task postgres: apps.backup.keep: 0 is less than the minimum of
   suggestion.
 - `--allow-unknown-fields` (`allow_unknown_fields` on the job RPCs) accepts
   the spec anyway:
-  - unknown core fields are dropped and reported;
-  - `apps.<name>` blocks with no installed owner are stored unvalidated, as
-    `pending`, and validated when that app is installed;
-  - a block that fails an installed app's schema is still an error.
+  - an unknown key at an extension point is kept, stored unvalidated as
+    `pending`, and adopted when an app declaring it is installed;
+  - an unknown key anywhere else is dropped and reported;
+  - a value that fails an installed app's schema is still an error.
 - What the flag dropped or left pending is recorded on the job version and
   shown in `job info`.
 
@@ -303,8 +330,10 @@ warning: task web: dropped unknown field `autoscael`
 **Trade-off.**
 - A breaking change. Every spec carrying a stray key fails until it is
   fixed or the flag is passed.
-- Under the flag, a dropped core field still loses intent, because Legion
-  can't store a field it doesn't model. Only app blocks are kept.
+- Under the flag, a key dropped from a non-extension block still loses
+  intent, because Legion can't store a field it doesn't model there. Keys
+  at extension points are kept, so a typo there lingers as an inert pending
+  value until someone notices it in `job info`.
 - A flag used habitually (a GitOps repo that always sets it) gives back
   most of what strictness buys. Recording drops on the version, and
   showing them in `job info`, makes that visible, but doesn't prevent it.
@@ -321,9 +350,10 @@ warning: task web: dropped unknown field `autoscael`
   GitOps syncing a job before the app it configures is installed; moving
   jobs between clusters with different apps. A deliberate, recorded flag
   serves them without making the default unsafe.
-- **Keeping app blocks.** They are stored rather than dropped because they
-  have a future owner. Installing the app later picks them up with no
-  resubmit.
+- **Keeping unknown keys at extension points.** They are stored rather
+  than dropped because they may have a future owner. Installing the app
+  later picks them up with no resubmit. Storing a typo is the cheaper
+  mistake.
 
 ## 8. UI extensions are declarative views first, sandboxed pages second, and never in-origin JavaScript (reverses old autoscaler-plan entry 13)
 
@@ -506,10 +536,88 @@ already running there. (a) needs a release host and per-arch checksums in the
 manifest. (b) needs a container runtime on every manager. Third-party apps
 use (a) or (b) like any job.
 
-## 13. App config lives on the app record, and any change is a rollout
+## 13. The reconciler is event-driven, compares a digest stamped on the job, and submits with an idempotency key
+
+**Call.**
+- The reconciler renders each app's job as a pure function of the app
+  record and the version marker, then compares the render's digest with a
+  `managedBy = { app, digest }` stamp on the job's latest version. Only the
+  reconciler's own submits set that stamp; any other submit clears it.
+- It submits with `idempotency_key = "app:<name>:<digest>"`.
+- It runs on events (record writes, changes to app jobs, leadership
+  acquisition, node version changes), plus a 60-second full pass, and
+  coalesces bursts.
+- A direct edit to an app's job is reverted within seconds, and the event
+  names who made it.
+
+**Alternatives.**
+- (a) Diff the rendered job against the stored job config, which is what
+  the first draft said.
+- (b) A fixed timer only (the addon-manager style).
+- (c) Refuse direct submits to app jobs instead of reverting them.
+
+**Trade-off.**
+- A new internal field on job versions, and its "cleared by any other
+  submit" rule must hold on every path that stores a job config.
+- Event plumbing to maintain.
+- Reverting means someone's direct edit appears to work for a few seconds
+  before it vanishes. The `job info` banner and the `app.reconciled` event
+  are the only signals.
+
+**Why (correctness and simplicity).**
+- **Against (a).** The stored config is normalized (defaults filled, fields
+  canonicalized), so a structural diff sees phantom changes and resubmits
+  forever.
+- **Against (b).** A timer alone either reacts slowly to `legion app config
+  set` or burns passes. Events make the common case immediate, and the
+  timer stays as the backstop.
+- **The idempotency key.** It is what makes a leader failover between
+  "submit" and "noticed it succeeded" harmless: the new leader's pass is
+  `deduplicated`.
+- **Against (c), for now.** Refusing is arguably clearer feedback, and
+  remains a reasonable later change. Reverting matches what operators of
+  Kubernetes' addon-manager expect, and keeps an admin's emergency hand
+  edit possible for the seconds it takes to notice. We'd switch to (c) if
+  reverted edits cause confusion in practice.
+
+## 14. Bundled apps upgrade once, after the last node they can run on, not when the leader upgrades
+
+**Call.** A bundled app's version marker is the oldest `buildVersion` among
+the ready nodes its placement allows. The render carries a
+`buildVersion version_matches ">=<marker>"` constraint. The app rolls when
+the marker moves, which is when the last eligible node runs the new build.
+
+**Alternatives.**
+- (a) Roll when the leader's own version changes (the first draft).
+- (b) Make it a manual step: `legion app upgrade autoscaler` after a
+  cluster upgrade.
+- (c) Ship bundled apps as versioned artifacts, decoupled from node builds.
+
+**Trade-off.**
+- One straggler node holds every bundled app on the older build, possibly
+  for a long time. That is within the version-skew policy, and status names
+  the straggler, but the app's version is no longer "the manager's
+  version", which is less obvious.
+- A new trigger (node version changes) for the reconciler.
+
+**Why (simplicity and correctness).**
+- **Against (a).** The app's code is whatever binary its node runs
+  (`legion:self`), so rolling when the leader upgrades restarts the app once
+  per upgraded manager. It can even land the "new" version on a manager
+  that hasn't upgraded yet, running old code under a new marker.
+- **Against (b).** It adds an operator step to every upgrade, and the
+  omakase goal forbids that.
+- **Against (c).** It gives up `legion:self`'s nothing-to-download property
+  (entry 12).
+
+The marker and the constraint give exactly one restart per upgrade, always
+onto the new build, with no operator action.
+
+## 15. App config lives on the app record, and any change is a rollout
 
 **Call.** `legion app config set` validates against the manifest's Nickel
-contract, stores the config on the record, and the reconciler resubmits the
+config schema (JSON Schema, like extension keys), stores the config on the
+record, and the reconciler resubmits the
 job with the config rendered as a file. There is no live reload. A change to
 a manifest-declared code field (plugin sources) re-runs the grant check
 against the caller (entry 4).
@@ -532,7 +640,7 @@ period.
   change behaving differently.
 - (b) asks every app author to write watch logic.
 
-## 14. Manager-config `apps` settings apply only when the cluster is first seeded
+## 16. Manager-config `apps` settings apply only when the cluster is first seeded
 
 **Call.** `apps = { autoscaler = { enabled = false } }` in manager config is
 read once, when the first Control leader seeds app records on an empty
@@ -556,7 +664,7 @@ GitOps managing apps eventually.
 
 Seed-only gives a deterministic day-one choice and a single source of truth
 afterwards.
-## 15. Bundled apps' grants are recorded by bootstrap, and skip the escalation check
+## 17. Bundled apps' grants are recorded by bootstrap, and skip the escalation check
 
 **Call.** When the first Control leader seeds records for the apps compiled
 into the binary, their manifests' permissions are recorded as granted by

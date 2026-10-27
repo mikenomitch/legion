@@ -4281,8 +4281,12 @@ plan.
         socket (`LEGION_ADDR=unix://…`, `SO_PEERCRED` plus cgroup check)
         proxied by the worker with the allocation's identity; the grant check
         on `RunJobTemplate` too; rewrite `configs/jobs/cert-renewer.ncl` on it
-  - [ ] A3: app manifests and records, the Control-leader reconciler,
-        `legion:self` for bundled apps, seeding, `legion app
+  - [ ] A3: app manifests and records; the Control-leader reconciler
+        (event-driven, a render digest stamped on the job as `managedBy`,
+        idempotency keys per digest, direct edits reverted); `legion:self`
+        for bundled apps, upgraded once after the last eligible node (the
+        oldest `buildVersion` as the marker, plus a `version_matches`
+        constraint); seeding; `legion app
         list|status|install|upgrade|config|set|enable|disable|uninstall`
   - [ ] A4: UI tier 1, declarative views in `nav`/`overview`/`job`/`task`/`node`
         slots, served by `GetAppView`/`InvokeAppAction` (authorized as the
@@ -4292,16 +4296,18 @@ plan.
         (RPC allowlist, viewer identity, strict CSP)
   - [ ] A6: jobspec extensions and strict fields, in two halves.
         (a) Unknown jobspec fields become submit errors with a
-        did-you-mean, and `--allow-unknown-fields` drops unknown core fields
-        and stores unknown `apps.<name>` blocks as `pending`. Today
+        did-you-mean, and `--allow-unknown-fields` keeps unknown keys at
+        extension points as `pending` and drops unknown keys elsewhere. Today
         `TaskConfigInput` ignores unknown keys (`src/structs/job.rs:2404`),
         so a typo, or `autoscale` sent to an old manager, is silently
         dropped. No dependency; can ship first.
-        (b) `apps.<name>` blocks at job and task level, validated against the
-        app's manifest-declared JSON Schema (the task-runtime schema
-        pattern), an optional validate call that fails open,
-        `WatchAppExtensions`, the merge into `job schema`, and in-place
-        version moves for block-only changes. Needs A3.
+        (b) Natural extension keys that apps declare at fixed points (job,
+        group via a task, task, volume, port, service), validated against the
+        app's JSON Schema (the task-runtime schema pattern). Collisions are
+        refused at install, `--key` renames, and `apps.<app>` is a qualified
+        spelling that never collides. Plus an optional validate call that
+        fails open, `WatchAppExtensions`, keys in `job schema`, and in-place
+        version moves for extension-only changes. Needs A3.
   - [ ] Deferred: install apps from a registry (waits on a registry plan
         that doesn't exist yet), tenant-owned apps, and pre-approved
         per-namespace grants, so GitOps needn't hold the union of what its
@@ -4647,7 +4653,10 @@ Deferred from [operator-ui-gaps-plan.md](plans/operator-ui-gaps-plan.md):
       `legion/jobspec.ncl` a spec could apply as a contract would move whole
       classes of error to evaluation time. Needs a generator from the same
       source as the JSON Schema or it drifts — deferred out of the
-      [Nickel migration](plans/nickel-config-language-plan.md).
+      [Nickel migration](plans/nickel-config-language-plan.md). Once apps
+      can declare jobspec extension keys
+      ([legion-apps-plan.md](plans/legion-apps-plan.md) §6.6), the generated
+      library should include the cluster's installed keys too.
 - [ ] **Decide whether `legion fmt` is worth the dependency.**
       `nickel-lang-core`'s `format` feature pulls in topiary + tree-sitter;
       today users format with the standalone `nickel` CLI. Deferred out of the
