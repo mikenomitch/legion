@@ -63,7 +63,9 @@ in-core loop existed to protect.
 
 ## 2. `autoscale = true` means: min = count, max = 4 × count, CPU at 70% of the reservation, fast up, slow down
 
-**Call.** The one-word form expands to:
+**Call.** The one-word form means the built-in defaults, which are below.
+Entry 3 lets a cluster or a namespace override them, except that an
+inherited `min` can never go below `count`:
 - bounds of `count..4×count`;
 - a single CPU target-value check at 0.7 of the reservation over a 1m
   window;
@@ -147,9 +149,23 @@ cluster scaling defaults: v4; 212 policies inherit a changed field, 0 invalid
 
 **Trade-off.**
 - A job's scaling behavior can change without its spec changing. That is
-  mitigated by the policy digest on every `scale_history` row, and by
-  provenance in `explain`, but `job inspect` alone no longer tells the whole
-  story.
+  mitigated by the policy digest on every `scale_history` row (each digest
+  resolves to a stored snapshot of the effective policy), and by provenance
+  in `explain`. But `job spec` alone no longer tells the whole story, and
+  rolling a job back to an older version doesn't restore the scaling
+  behavior it had then, because the defaults are today's.
+- **A departure for namespace policies.** Until now, they act only at
+  admission and write their results into the stored config: a policy's
+  `pools.default` becomes a `pool = "…"` permit, and is never re-judged
+  (`docs/namespaces.md` § When the checks run). `autoscale` defaults are the
+  first policy field resolved live. The difference is deliberate. A pool
+  decides placement, which must not shift under running work. A scaling
+  default tunes behavior that the autoscaler re-reads every tick anyway.
+  The public doc has to state it, because it breaks the rule readers will
+  expect.
+- **Inherited `min` is restricted.** A cluster or namespace can set `min`
+  only as a multiple of `count` of at least `"1x"`, so defaults can never
+  lower an HA floor that entry 2 protects.
 - A defaults change hits many policies at once. It is refused if it would
   invalidate any, and `--dry-run` shows the blast radius, but a valid
   change that is simply a bad idea lands everywhere.
@@ -351,7 +367,14 @@ permissioned by namespace, the same as every other thing users
 **Call.** The autoscaler's per-task policy is the core jobspec field
 `autoscale`, validated and resolved by the manager. It does not use the
 generic jobspec-extension mechanism that third-party apps use
-(apps calls entry 6).
+(apps calls entry 7). Users see it in core places:
+
+```
+$ legion app extensions autoscaler
+autoscaler declares no jobspec keys (autoscale is a core field: docs/autoscaling.md)
+error: replacement-autoscaler declares `autoscale` on tasks, which is a core field
+  hint: install it under another key: --key task.autoscale=ras
+```
 
 **Alternatives.** Have the bundled app declare `autoscale` as a task-level
 extension key. Since extension keys are written as natural top-level keys,
@@ -620,7 +643,7 @@ drain nodes.
 - **The real mitigations are elsewhere.** Plugins are operator-installed
   (entry 5), and node-group policies need `operator:write` to create. App
   config changes that add plugin code re-check the grant against the
-  caller (apps calls entry 4). We'd revisit if a third-party app needs
+  caller (apps calls entry 5). We'd revisit if a third-party app needs
   optional groups for its own reasons.
 
 ## 19. A `step` limit is the larger of its percent and replica halves, and writing `step` replaces both

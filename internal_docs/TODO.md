@@ -4283,10 +4283,11 @@ plan.
         on `RunJobTemplate` too; rewrite `configs/jobs/cert-renewer.ncl` on it
   - [ ] A3: app manifests and records; the Control-leader reconciler
         (event-driven, a render digest stamped on the job as `managedBy`,
-        idempotency keys per digest, direct edits reverted); `legion:self`
-        for bundled apps, upgraded once after the last eligible node (the
-        oldest `buildVersion` as the marker, plus a `version_matches`
-        constraint); seeding; `legion app
+        idempotency keys per digest and starting state, stopped jobs
+        restarted, direct edits reverted); `legion:self` for bundled apps,
+        rolled once the eligible nodes agree on a new (`buildVersion`,
+        `buildId`) build marker, with a `version_matches` constraint (workers
+        report a new `buildId`); seeding; `legion app
         list|status|install|upgrade|config|set|enable|disable|uninstall`
   - [ ] A4: UI tier 1, declarative views in `nav`/`overview`/`job`/`task`/`node`
         slots, served by `GetAppView`/`InvokeAppAction` (authorized as the
@@ -4300,18 +4301,26 @@ plan.
         extension points as `pending` and drops unknown keys elsewhere. Today
         `TaskConfigInput` ignores unknown keys (`src/structs/job.rs:2404`),
         so a typo, or `autoscale` sent to an old manager, is silently
-        dropped. No dependency; can ship first.
+        dropped. It needs a capture-then-validate parser (replacing
+        `deny_unknown_fields` on `VolumeSpec` and friends) and tasks parsed
+        by shape rather than through the untagged `TaskConfigList`. No
+        dependency; can ship first.
         (b) Natural extension keys that apps declare at fixed points (job,
         group via a task, task, volume, port, service), validated against the
         app's JSON Schema (the task-runtime schema pattern). Collisions are
         refused at install, `--key` renames, and `apps.<app>` is a qualified
         spelling that never collides. Plus an optional validate call that
-        fails open, `WatchAppExtensions`, keys in `job schema`, and in-place
-        version moves for extension-only changes. Needs A3.
+        fails open, `WatchAppExtensions`, a new `GetJobSchema` RPC (today
+        `job schema`/`job validate` are CLI-local), live schema defaults,
+        and in-place version moves for extension-only changes (a new check
+        in `run_job`'s `Updated` branch, which today always rolls out).
+        Needs A3.
   - [ ] Deferred: install apps from a registry (waits on a registry plan
         that doesn't exist yet), tenant-owned apps, and pre-approved
         per-namespace grants, so GitOps needn't hold the union of what its
-        jobs request (plan §6.7, §11)
+        jobs request (plan §6.8, §11); app-defined object kinds (a CRD
+        equivalent) and extension points beyond job, group, task, volume,
+        port, and service (plan §11)
 
 - [ ] **Autoscaler**: [plan](plans/autoscaler-v2-plan.md) (PLANNED) ·
       [calls](calls/autoscaler-v2-plan_calls.md). Supersedes

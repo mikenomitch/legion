@@ -2,8 +2,8 @@
 
 > **Judgement calls:** [legion-apps-plan_calls.md](../calls/legion-apps-plan_calls.md)
 
-**Status: PLANNED** (written 2026-10-19; jobspec extensions and strict
-unknown fields added 2026-10-27). Nothing is built. It has six phases (§8),
+**Status: PLANNED** (written 2026-10-19; reconciler and upgrade details,
+jobspec extensions, and strict unknown fields added 2026-10-27). Nothing is built. It has six phases (§8),
 and each ships alone. The first consumer is the autoscaler
 ([autoscaler-v2-plan.md](autoscaler-v2-plan.md)). GitOps is the second, and
 this plan checks the substrate against it (§6.8). Deliberately deferred:
@@ -142,8 +142,8 @@ them hits the same six walls:
   declares, and core enforces.
 - **Legion itself.** Task runtimes publish a JSON Schema for their `config`
   block. Submit validates it with the `jsonschema` crate
-  (`src/task_plugins/mod.rs:2134`), and `legion job schema` merges the live
-  schemas so agents author against them (`docs/agent-readiness.md` §4).
+  (`src/task_plugins/mod.rs:2134`), and `legion job schema` prints the
+  merged schema so agents author against it (`docs/agent-readiness.md` §4).
   *Take:* the same shape for apps.
 
 ### How add-ons get into the UI
@@ -300,7 +300,7 @@ natively by the SPA from JSON the app returns.
   restriction is one targeted rule. Pools already act as taints.
 - **App-defined object kinds** (a CRD equivalent: standalone objects an app
   defines, the way the autoscaler defines `ScalingPolicy` in core).
-  Per-job blocks cover per-job settings. An app that needs its own kind of
+  Extension keys cover per-job settings. An app that needs its own kind of
   object waits for a second example (§11).
 
 ## 5. Background: what exists today
@@ -353,18 +353,31 @@ natively by the SPA from JSON the app returns.
   - The manager answers browsers only from loopback plus
     `server.allowedOrigins` (`docs/ui-architecture.md:754-783`).
   - There is no extension mechanism of any kind.
-- **Jobspec parsing.** `TaskConfigInput` and the job-level input
-  deserialize without `deny_unknown_fields` (`src/structs/job.rs:2404-2406`).
-  Unknown keys are dropped silently, except `kind`, which has a hand-written
-  error (`:2507-2521`). Task-runtime `config` blocks are validated against
-  the runtime's JSON Schema (`src/task_plugins/mod.rs:2134`), and
-  `legion job schema` serves the merged schema.
-- **In-place version moves.** A resubmit whose task configs are
-  schedule-equivalent (`task_schedule_equivalent`, `src/storage/store.rs:21251`:
-  count, gang, schedule, resources, constraints, permit, affinities,
-  connect) can move running allocations onto the new version without a
-  rollout (`migrate_allocations_to_job_config`). KV re-renders already use
-  that path (`src/manager/server.rs:4150-4180`).
+- **Jobspec parsing.**
+  - The job input and `TaskConfigInput` deserialize without
+    `deny_unknown_fields` (`src/structs/job.rs:2404-2406`), so unknown keys
+    there are dropped silently. The exception is `kind`, which has a
+    hand-written error (`:2507-2521`).
+  - Several nested blocks already refuse unknown keys: `VolumeSpec`
+    (`:1777`), `StatefulConfig`, `StatefulStorageConfig`, `StopConfig`, and
+    `DisruptionConfig`.
+  - Tasks are parsed through an `#[serde(untagged)]` `TaskConfigList`
+    (`:2397`), which replaces a task's own parse error with serde's generic
+    untagged-enum message.
+  - Task-runtime `config` blocks are validated against the runtime's JSON
+    Schema with the `jsonschema` crate, version 0.17.1, which recompiles the
+    schema on every call (`src/task_plugins/mod.rs:2132-2134`).
+  - `legion job validate` and `legion job schema` run in the CLI, from
+    schemas compiled into the binary (`src/cmd/job.rs:550,666`). There is
+    no manager RPC for either.
+- **In-place version moves exist only for KV re-renders.** `run_job`'s
+  `Updated` branch always creates a rollout (`create_rollout_for_update`,
+  `src/manager/server.rs:2451-2462`). The KV re-render path is the one place
+  that moves running allocations onto a new version without a rollout. It
+  checks `job_configs_schedule_equivalent` (built on
+  `task_schedule_equivalent`, `src/storage/store.rs:21251`), then calls
+  `migrate_allocations_to_job_config`, which is a separate Scheduler-lane
+  write (`server.rs:4150-4180`).
 - **Worker-plane tunnel.** It is planned, not built:
   `Worker.ProxyTunnel` in the reverse-proxy plan (§6.2-6.6), which is the
   manager-to-allocation path a UI needs to reach an app's backend.
@@ -394,7 +407,8 @@ added around the job, not inside the scheduler.
 {
   name = "autoscaler",
   description = "Scales tasks and node groups from scaling policies.",
-  version = "%{legion.version}",          # bundled apps track the binary
+  # No `version`: a bundled app's version is the build marker its job was
+  # rendered for (§6.3). Third-party manifests set one.
   placement = "managers",                 # managers (default) | workers | any
   replicas = 1,
   job = {
@@ -429,14 +443,14 @@ added around the job, not inside the scheduler.
   like a shell's `*` skipping dotfiles. A tenant-admin policy written as
   `namespaces = ["*"]` therefore can't edit or exec into the autoscaler and
   borrow its identity. Management tokens bypass rules as always (calls
-  entry 5).
+  entry 6).
 - The same rule reserves the **`legion/` KV prefix**, where apps keep
   leases and state. A `paths = ["*"]` rule doesn't reach `legion/…`, only a
   pattern that starts with `legion/` does. Node-side `namespaces` lists
   (below) follow the rule too: `["*"]` on a node does not accept
   `legion-system`.
 
-**Apps run unprivileged** (calls entry 4).
+**Apps run unprivileged** (calls entry 5).
 - A task in a reserved namespace may not run as root. The reconciler sets
   `user` on bundled apps' exec tasks to `systemWorker.appUser` (default
   `nobody`). Submit refuses an exec task in `legion-system` without a
@@ -561,13 +575,33 @@ and handles one app at a time, with at most one submit in flight per app.
   It doesn't diff the rendered job against the stored one, because the
   stored config has defaults filled in and fields normalized, so a
   structural diff would find differences that aren't there.
-- **Submit exactly once.** The reconciler submits through the normal
-  `RunJob` path as `legion:app-reconciler`, carrying the grant recorded on
-  the app record (§6.4), with `idempotency_key = "app:<name>:<digest>"`.
-  If the leader dies between the write and noticing it succeeded, the next
-  leader's pass sends the same key and gets `deduplicated`, not a second
-  version. A disabled app's job is stopped the same way, with the key
-  `app:<name>:stop:<record version>`.
+
+  Which writes keep the stamp:
+  - the reconciler's own submits set it;
+  - a KV re-render of the app's job keeps it, because it re-renders the
+    same spec (`server.rs:4108`);
+  - `RunJob` and `RunJobTemplate` from any other principal clear it, and so
+    does any other path that stores a new job version.
+
+  The pass also checks the job's state, not just its spec. An enabled app
+  whose job was stopped (someone ran `legion job stop`) is resubmitted, and
+  a disabled app's running job is stopped.
+- **Submit exactly once per transition.** The reconciler submits through
+  the normal `RunJob` path as `legion:app-reconciler`, carrying the grant
+  recorded on the app record (§6.4), with
+  `idempotency_key = "app:<name>:<digest>:<from>"`.
+  - `<from>` is the state the transition starts from: the job's latest
+    version id, `none`, or `stopped-<version>`.
+  - If the leader dies between the write and noticing it succeeded, the
+    next leader's pass starts from the same state, sends the same key, and
+    gets `deduplicated`, not a second version.
+  - A *new* transition (reverting a direct edit, re-enabling within a day of
+    a disable) starts from a different state, so it gets a new key.
+  - The starting state has to be in the key because idempotency keys are
+    global and kept for 24 hours (`IDEMPOTENCY_KEY_TTL`,
+    `src/manager/daemon.rs:60`). A digest-only key would make the next
+    revert of an identical edit a no-op.
+  - Stopping a disabled app's job uses `app:<name>:stop:<from>`.
 - **Triggers.** It is event-driven, with a backstop timer:
   - a write to an app record (install, upgrade, config, settings, enable,
     disable);
@@ -575,8 +609,8 @@ and handles one app at a time, with at most one submit in flight per app.
     catches direct edits within seconds;
   - acquiring Control-lane leadership, after which the new leader runs a
     full pass;
-  - a node joining, leaving, or changing `buildVersion` among an app's
-    eligible nodes (the version marker below);
+  - a node joining, leaving, or changing `buildVersion` or `buildId` among
+    an app's eligible nodes (the build marker below);
   - a full pass every 60 seconds, in case an event was missed.
 
   Bursts coalesce: one pass per app at a time, and an event that arrives
@@ -610,31 +644,63 @@ own executable (`std::env::current_exe()`). The app is always the same
 build as the node that runs it: no artifact, no image, no registry, and it
 works offline. Third-party apps use artifacts or images like any job.
 
-**Upgrades roll a bundled app once, after the last node it can run on**
-(calls entry 14). Because the code is the node's binary, what matters is
-which build the app's allocations land on, not which build the leader
-runs.
-- The version marker in the render is **the oldest `buildVersion` among the
-  ready nodes the app's placement allows**. That is the dynamic attribute
-  every worker registers with (`src/manager/server.rs:8679-8686`). For
-  `placement = managers`, those nodes are the managers' own system
-  workers, so the marker is the oldest manager's build.
-- The render also carries the constraint
-  `{ key = "buildVersion", operator = "version_matches", value = ">=<marker>" }`.
+**Upgrades roll a bundled app once its nodes agree on a new build** (calls
+entry 14). A bundled app's code is the binary of the node it runs on, so the
+reconciler restarts it only when there is one new build to move to:
 
-The effects:
-- During a rolling upgrade, the marker doesn't move until the last eligible
-  node runs the new build. The app then rolls exactly once, onto the new
-  binary, instead of once per upgraded manager.
-- The constraint stops a rollout from placing the new version on a node
-  still running an older build.
-- A straggler node holds the marker back. The app keeps running the older
-  build, which the version-skew policy in `docs/upgrades.md` already
-  allows, and `legion app status` says why:
+- **The build.** Workers report `buildVersion` at registration
+  (`server.rs:8679-8686`). This plan adds `buildId`, a hash of the worker's
+  own executable computed at startup, because `buildVersion` is
+  `CARGO_PKG_VERSION` (`src/worker/daemon.rs:3598`, `0.1.0` today), which
+  doesn't change on a rebuild without a version bump.
+- **The build marker** is the (`buildVersion`, `buildId`) pair, defined
+  only when every ready node the app's placement allows reports the same
+  pair.
+  - For `placement = managers`, those nodes are the managers' own system
+    workers.
+  - Nodes reporting `unknown` or an unparsable version are left out of the
+    marker, and out of placement by the constraint below.
+- **While nodes disagree**, during an upgrade, the marker keeps its last
+  value. So a straggler holds it, and an older node joining later doesn't
+  move it backwards.
+- **When the eligible set is on one build again**, the marker moves to it,
+  and the reconciler rolls the app once. That covers a deliberate downgrade
+  of the whole set too.
+- **With no ready eligible node** (a fresh cluster, before its first
+  system worker registers), there is no marker yet. The app is pending
+  anyway.
+- **The render** carries
+  `{ key = "buildVersion", operator = "version_matches", value = ">=<marker version>" }`,
+  so a reschedule never lands the app on a node older than its marker.
+- **New bundled manifests.** A new build can change a bundled app's job,
+  permissions, keys, or config schema, because the manifest is compiled
+  into the binary.
+  - The reconciler adopts the new manifest only when the leader itself runs
+    the marker's build, since it can read only manifests compiled into its
+    own binary. Until then it renders from the manifest stored on the
+    record. For `placement = managers` the leader is one of the eligible
+    nodes, so this holds as soon as the marker moves. A `workers` app waits
+    for the leader to match.
+  - Permission changes in the new manifest are recorded as granted by
+    `legion:bootstrap`, like the seed (calls entry 17), and reported in the
+    `app.upgraded` event and in `legion app status`.
+  - Schema changes re-check stored values, as an install-time upgrade does
+    (§6.6).
 
-  ```
-  autoscaler  running  0.14.0  held: 2 eligible nodes still on 0.14.0 (wkr-7, wkr-9)
-  ```
+```
+autoscaler  running  0.14.0  upgrade waiting: 2 of 5 eligible nodes on 0.14.0 (wkr-7, wkr-9)
+```
+
+Limits, stated in the public doc:
+- **"Once" counts the reconciler's own restarts.** A manager restarting for
+  its upgrade still kills the allocations on its system worker, and the
+  scheduler places them again, possibly on a manager that hasn't upgraded
+  yet.
+- **Pre-releases.** `version_matches` uses semver requirements
+  (`src/constraints.rs`), under which a pre-release of a newer version
+  (`0.16.0-rc.1`) doesn't satisfy `>=0.15.0`. During a mixed window, such
+  nodes can't host the app. Once every eligible node is on the pre-release,
+  the marker moves to it and the constraint matches again.
 
 Third-party apps carry their version in their artifacts and get none of
 this, unless they use `legion:self` (§11).
@@ -679,7 +745,7 @@ $ legion app uninstall gitops         # stops the job, revokes the grant, drops 
   `codeFields`: for the autoscaler, `plugins.*.source` and `plugins.*.url`)
   needs the caller to hold the app's whole grant, as `install` does. Other
   config changes need only `app:write`. Without this rule, `app:write` on
-  the autoscaler would be a path to `node:write` (calls entry 4).
+  the autoscaler would be a path to `node:write` (calls entry 5).
 
 **RPCs.** `ListApps`, `GetApp`, `InstallApp`, `UpgradeApp`, `UninstallApp`,
 `SetAppEnabled`, `UpdateAppSettings`, and `SetAppConfig`. They are mutating
@@ -690,7 +756,7 @@ lists and shows, `app:write` changes. MCP: `legion_app_list` and
 
 ### 6.4 Identity: declared permissions, granted at submit, ambient inside the task
 
-**Declared on the job** (calls entry 3). The reserved `legion` identity
+**Declared on the job** (calls entry 4). The reserved `legion` identity
 gains `permissions` (inline ACL rules, in the same shape `legion acl policy
 apply` takes) and `policies` (names of existing policies):
 
@@ -929,7 +995,7 @@ how often, which hostname to route, which repo a job came from. The natural
 home is the jobspec, next to the thing it describes, versioned and reviewed
 with it. So apps declare **keys** at **extension points** in the jobspec,
 and job authors write them where they belong, like any other field (calls
-entry 6):
+entry 7):
 
 ```nickel
 {
@@ -979,8 +1045,8 @@ extensions = [
     point = "volume",
     key = "backup",            # what job authors write; defaults to the app's name
     description = "Back up this volume on a schedule.",
-    # JSON Schema (2020-12), written as a Nickel record: the format task
-    # runtimes use for their `config` block.
+    # JSON Schema (draft 7, the dialect schemars emits for task-runtime
+    # `config` schemas), written as a Nickel record.
     schema = {
       type = "object",
       additionalProperties = false,
@@ -998,13 +1064,20 @@ extensions = [
 ```
 
 - An app declares at most one key per point. An app with several settings
-  nests them in that key's record.
+  nests them in that key's record. `task` and `group` keys are both
+  written on a task, so they count as one point: an app declares at most
+  one of the two.
 - The schema must describe an object, be at most 64 KiB, and use only local
-  `$ref`s (no remote fetches).
+  `$ref`s.
 - It is compiled once, at install or upgrade, with the `jsonschema` crate
-  that already validates runtime config. A schema that doesn't compile fails
-  the install, and so does an `example` that doesn't validate, so the
-  examples an app ships can't drift from its schema.
+  that already validates runtime config, and cached by digest. The
+  compiler is configured with a resolver that refuses remote refs, because
+  the crate resolves them over HTTP by default.
+- A schema that doesn't compile fails the install, and so does an `example`
+  that doesn't validate, so the examples an app ships can't drift from its
+  schema.
+- The crate validates but doesn't fill `default`s. Legion fills them itself
+  (below).
 
 **Keys can't collide.** There are three rules, checked at install and at
 Legion upgrades:
@@ -1013,8 +1086,9 @@ Legion upgrades:
    core field at that point (`name`, `resources`, or `config` at `task`, for
    example) fails.
 2. **Against other apps.** Installing an app whose key another installed app
-   already declared at the same point fails, naming the owner. The operator
-   can install it under another key instead:
+   already declared at the same point fails, naming the owner. `task` and
+   `group` count as one point here. The operator can install it under
+   another key instead:
 
    ```console
    $ legion app install ./pgbackup.ncl
@@ -1029,20 +1103,36 @@ Legion upgrades:
    `{ name = "data", apps = { backup = { … } } }`. It always works.
    - If a Legion release adds a core field named like an app's key at that
      point, the core field wins. The manager logs the conflict at startup,
-     `legion app status` lists it, the release notes name it, and a submit
-     using the short key gets an error pointing at the qualified spelling.
+     `legion app status` lists it, and the release notes name it.
+   - The manager can't tell, from one submit, whether the author means the
+     new core field or the app's key. So a submit gets an error pointing at
+     the qualified spelling only when the job's previous version stored that
+     app's value under the short key. Every other submit takes the key as
+     the new core field.
    - Stored values are untouched, because they are stored by app, not by
      key.
    - To make this rare, Legion checks new field names against the keys of
      first-party apps (and, once it exists, the registry's).
 
-**Parsing.** The job, task, volume, port, and service inputs capture keys
-they don't know (a `#[serde(flatten)]` map) instead of ignoring them.
-- Each captured key is resolved against the extensions installed for that
-  point. A resolved value is validated, then stored **by app**
-  (`extensions[<app>]`), so a rename (rule 2) or a later collision (rule 3)
-  never orphans data.
-- `legion job inspect` prints each value under the key the author wrote.
+**Parsing.** Every jobspec input captures the keys it doesn't know in a
+`#[serde(flatten)]` map, and validation decides what to do with them.
+- **Why capture.** It replaces `deny_unknown_fields` where that exists
+  today. `VolumeSpec` refuses unknown keys now, so a volume `backup` key
+  needs the change. Serde can't combine `flatten` with
+  `deny_unknown_fields`, and reject-or-keep has to be decided per request
+  (`allow_unknown_fields`), not at compile time.
+- **At an extension point**, a captured key that matches an installed key
+  is validated, then stored **by app** (`extensions[<app>]`), so a rename
+  (rule 2) or a later collision (rule 3) never orphans data. Any other
+  captured key is an error, or pending under the flag.
+- **In other blocks**, every captured key is an error, or dropped under the
+  flag, so each unknown key has exactly one error path.
+- **Tasks are parsed by shape** (a list or a map) instead of through the
+  untagged `TaskConfigList`. That way a task's own error, with its
+  did-you-mean, reaches the user, not serde's generic untagged-enum
+  message.
+- `legion job spec` shows the submitted Nickel. `legion job info` shows
+  each value under the key the author wrote.
 
 **At submit**, for each extension value, the manager:
 
@@ -1050,11 +1140,15 @@ they don't know (a `#[serde(flatten)]` map) instead of ignoring them.
    qualified `apps.<app>`, at this point. If there is none, the submit
    fails, or with `--allow-unknown-fields` the value is stored as pending
    (below).
-2. **Validates the shape, and fills defaults.** It applies the schema and
-   fills its `default`s, so the stored value is the expanded one, and
-   `legion job plan` prints it.
+2. **Validates the shape.** It applies the schema with the schema's
+   defaults filled in. Values are **stored as written**. Defaults are filled
+   on read, from the app's current schema, so `legion job plan`,
+   `legion job info`, and the watch all show the effective value. An app
+   upgrade that changes a default then reaches every value that didn't set
+   it: the same live rule as `autoscale` defaults
+   ([autoscaler-v2-plan.md](autoscaler-v2-plan.md) §6.3).
 3. **Checks `requires`**, if the app declared it, as the submitter, on the
-   job's namespace.
+   job's namespace, when the value is new or changed.
 4. **Asks the app**, if `validate = true`. It sends the expanded value and
    its context to `POST /legion/v1/extensions/validate`, using the same
    worker-plane forward and assertion as UI views (§6.5), with the
@@ -1075,27 +1169,33 @@ warning: orders-db: task postgres: volume data: backup was not checked by the ba
 ```
 
 **Changing only extension values restarts nothing.** A resubmit whose only
-differences are extension values still creates a job version, and it moves
-the running allocations onto it in place, through the path KV re-renders
-already use (`src/manager/server.rs:4150-4180`). There is no rollout. The
-app sees the new value through its watch.
+differences are extension values still creates a job version. A new check
+in `run_job`'s `Updated` branch, which today always creates a rollout
+(`src/manager/server.rs:2451-2462`), sees that only extension values
+changed. It then moves the running allocations onto the new version
+synchronously, the way KV re-renders do (`server.rs:4150-4180`), instead of
+creating a rollout. The app sees the new value through its watch.
 
 **How values reach the app.** `WatchAppExtensions { shards, shard_count }`
 is app-plane: it returns only the calling app's own values. It sends the
 current values first, then upserts and deletes of (job id, config version,
-point, path, namespace, value, validity). The path names the group, task,
+point, path, namespace, value as written, effective value, validity). The path names the group, task,
 volume, port, or service. It shards by the same key hash as
 `WatchScalingPolicies` ([autoscaler-v2-plan.md](autoscaler-v2-plan.md)
 §6.9), so a sharded app needs only one lease scheme. Humans and agents see
-the values in `legion job inspect` and `legion job info`, like any other
+the values in `legion job spec` and `legion job info`, like any other
 field.
 
 **Discoverability.**
-- `legion job schema` (and `legion_job_schema` over MCP) adds each
-  installed key as a property at its point, described as, for example,
-  "from the backup app, 0.3.1". This is the same way it already merges the
-  live task-runtime config schemas. An agent authoring a jobspec sees
-  exactly what this cluster accepts.
+- A new `GetJobSchema` RPC (`job:read`) returns the cluster's jobspec
+  schema: the compiled-in core schema plus each installed key as a property
+  at its point, described as, for example, "from the backup app, 0.3.1".
+  - `legion job schema`, `legion job validate`, and `legion_job_schema`
+    use it when a manager is reachable. An agent authoring a jobspec then
+    sees exactly what this cluster accepts.
+  - Offline they fall back to the compiled-in schema, as today, and say
+    that installed keys weren't checked. That keeps
+    `job_schema_tool_runs_without_manager` true.
 - Did-you-mean suggestions include installed keys.
 - Nickel users get the same keys at evaluation time once the planned
   importable contract library for the jobspec (`legion/jobspec.ncl`,
@@ -1145,7 +1245,7 @@ the job, to an app that holds its own grant.
   submit; the only app code involved is the optional, time-boxed validate
   call, which runs in the app.
 
-**Unknown fields are errors, unless you ask** (calls entry 7). Every key
+**Unknown fields are errors, unless you ask** (calls entry 3). Every key
 that is neither a core field nor an installed app's key at that point
 becomes a submit error, with a suggestion drawn from both. This applies at
 the job level, the task level, and in every core nested block:
@@ -1159,8 +1259,8 @@ error: orders-db: task postgres: volume data: unknown field `backup`: not a volu
 ```
 
 `--allow-unknown-fields` accepts the spec anyway. It is
-`allow_unknown_fields` on `RunJob`, `PlanJob`, `ValidateJob`, and
-`RunJobTemplate`, and a per-repo setting for GitOps.
+`allow_unknown_fields` on `RunJob`, `PlanJob`, and `RunJobTemplate`, a flag
+on the CLI's `job validate`, and a per-repo setting for GitOps.
 - **An unknown key at an extension point is kept**, stored unvalidated as
   `pending`. Legion can't tell a typo there from the key of an app that
   isn't installed yet, so it loses neither. When an app declaring that key
@@ -1267,12 +1367,16 @@ pre-approved per namespace instead, so GitOps doesn't need the union.
   - `ListApps`, `GetApp`, `InstallApp`, `UpgradeApp`, `UninstallApp`,
     `SetAppEnabled`, `UpdateAppSettings`, `SetAppConfig`;
   - `ListUiExtensions`, `GetAppView`, `InvokeAppAction`;
-  - `WatchAppExtensions` (app-plane: only the caller's own blocks);
-  - `bool allow_unknown_fields` on `RunJob`, `PlanJob`, `ValidateJob`, and
+  - `WatchAppExtensions` (app-plane: only the caller's own values);
+  - `bool allow_unknown_fields` on `RunJob`, `PlanJob`, and
     `RunJobTemplate`, with dropped and pending fields reported in the
     reply's `warnings`;
   - the job, task, volume, port, and service messages carry extension
-    values; `GetJobSchema` adds installed keys at their points;
+    values;
+  - a new `GetJobSchema` RPC (`job:read`): the core schema plus installed
+    keys at their points;
+  - `WorkerRegisterRequest` gains `build_id`, stored as the `buildId`
+    dynamic attribute next to `buildVersion`;
   - `InstallApp` gains `key_overrides` (the `--key` rename);
   - `ListGrants`, `RevokeGrant`;
   - `WorkloadIdentity` gains `repeated AclRule permissions` and
@@ -1288,8 +1392,9 @@ pre-approved per namespace instead, so GitOps doesn't need the union.
   - an `app` table;
   - `job_grant` (job id, config version, rules JSON, granted by, at,
     revoked);
-  - a `managedBy { app, digest }` field on job versions, set only by the
-    reconciler's submits and cleared by any other;
+  - a `managedBy { app, digest }` field on job versions. It is set by the
+    reconciler's submits, kept by KV re-renders, and cleared by any other
+    write that stores a version;
   - reconciler status columns on `app` (last digest, last action, last
     error, the held version marker and its reason);
   - `node.namespaces` (JSON array).
@@ -1308,21 +1413,29 @@ pre-approved per namespace instead, so GitOps doesn't need the union.
 - **Submit validation.** No root exec tasks and no privileged containers in
   reserved namespaces.
 - **Jobspec parsing (A6).**
-  - `deny_unknown_fields` on the job input, the task input, and core nested
-    blocks, with a did-you-mean error (closest known key by edit distance).
-  - Under `allow_unknown_fields`, unknown keys are collected rather than
-    failing the parse.
-  - At the extension points (job, task, volume and port entries, service),
-    unknown keys are captured with `#[serde(flatten)]` and resolved against
-    the installed extensions. The qualified `apps` object is accepted at
-    each point.
+  - Unknown keys are submit errors with a did-you-mean (the closest known
+    key by edit distance, over core fields and installed keys).
+  - Every input captures unknown keys with `#[serde(flatten)]`, replacing
+    `deny_unknown_fields` on `VolumeSpec` and the other nested blocks that
+    have it. At extension points (job, task, volume and port entries,
+    service) captured keys resolve against the installed extensions, and
+    the qualified `apps` object is accepted. Elsewhere they are errors, or
+    dropped under the flag.
+  - Tasks parse by shape instead of through the untagged `TaskConfigList`,
+    so their errors reach the user.
+  - Extension schemas are compiled once and cached by digest, with remote
+    refs refused. Default-filling on read is Legion's own code.
   - Values are stored by app (`extensions[<app>]`), each with
     `validated_by` and a state (`valid`, `pending`, `invalid`, or
     `orphaned`).
   - The job version records what the flag dropped or left pending.
-  - The in-place comparator treats a resubmit that differs only in extension
-    values as schedule-equivalent, so it takes the
-    `migrate_allocations_to_job_config` path.
+  - A new predicate in `run_job`'s `Updated` branch
+    (`src/manager/server.rs:2451`), checked before
+    `create_rollout_for_update`. If every difference from the previous
+    version is in extension values, it moves the allocations synchronously
+    with `migrate_allocations_to_job_config`, as the KV path does, instead
+    of creating a rollout. `task_schedule_equivalent` is unchanged; it
+    keeps serving the `job_submit` eval and stale-config repair.
 - **CLI and client.** `unix://` addresses; `legion app …`;
   `legion acl grants …`.
 - **Config.**
@@ -1361,7 +1474,8 @@ pre-approved per namespace instead, so GitOps doesn't need the union.
   hard-coded address; `configs/jobs/cert-renewer.ncl` is rewritten as the
   example.
 - **A3: apps.**
-  - Manifests, records, the reconciler, `legion:self`, seeding.
+  - Manifests, records, the reconciler, `legion:self`, seeding, and the
+    build marker (which needs workers to report `buildId`).
   - `legion app` (install from a file or URL, upgrade with a permission
     diff, config, settings, enable/disable), app events and metrics, MCP
     read tools.
@@ -1388,8 +1502,8 @@ pre-approved per namespace instead, so GitOps doesn't need the union.
     - Schema validation and defaults, and `requires`.
     - The validate call. It needs A4's forward; until then,
       `validate = true` is accepted and skipped with a warning.
-    - `WatchAppExtensions`, keys in `job schema`, and did-you-mean over
-      installed keys.
+    - `WatchAppExtensions`; the `GetJobSchema` RPC behind `job schema` and
+      `job validate`; did-you-mean over installed keys.
     - The install, upgrade, and uninstall lifecycle, and in-place version
       moves.
 
@@ -1443,6 +1557,13 @@ doesn't exist yet, and `install <url>` covers distribution until then.
     the stored config was normalized;
   - a direct submit is reverted within one pass, and the event names who
     made it;
+  - the same direct edit made twice in a row is reverted both times (the
+    second revert starts from a different version, so it isn't
+    deduplicated);
+  - disable, then enable within an hour: the job runs again;
+  - a direct `legion job stop` of an enabled app's job is restarted;
+  - a KV re-render of an app's job keeps the `managedBy` stamp, and a
+    `RunJobTemplate` by another principal clears it;
   - a leader killed between the submit and recording it: the next leader's
     pass is `deduplicated`, and no second version appears;
   - a burst of record changes produces one submit per settled state;
@@ -1450,12 +1571,20 @@ doesn't exist yet, and `install <url>` covers distribution until then.
     retry until something changes;
   - disable stops the job, and uninstall revokes the grant;
   - a placement change re-renders permits and constraints.
-- Upgrade ordering, with simulated nodes reporting `buildVersion`:
-  - the marker is the oldest eligible ready build;
-  - a rolling upgrade of three managers restarts the app exactly once,
-    after the third;
-  - the constraint keeps the new version off an older node;
-  - a straggler holds the marker, and status names it.
+- Upgrade ordering, with simulated nodes reporting `buildVersion` and
+  `buildId`:
+  - the marker is defined only when the eligible ready nodes agree;
+  - a rolling upgrade of three managers produces exactly one reconciler
+    restart, after the third;
+  - a rebuild with an unchanged `buildVersion` and a new `buildId` rolls the
+    app;
+  - an older node joining later doesn't move the marker backwards;
+  - a node reporting `unknown` is left out of the marker and of placement;
+  - the constraint keeps a rescheduled app off an older node;
+  - a straggler holds the marker, and status names it;
+  - a new bundled manifest is adopted only when the leader runs the
+    marker's build, and its new permissions are recorded as bootstrap
+    grants.
 - An `app config set` that changes a code field is refused for an `app:write`
   token lacking the app's grant, and accepted otherwise.
 - Integration (`tests/integration/apps.rs`): scenario A on one manager with
@@ -1481,7 +1610,12 @@ doesn't exist yet, and `install <url>` covers distribution until then.
 **A6: jobspec extensions and strict fields**
 - Unknown fields:
   - a job, task, or nested-block typo fails with the right suggestion,
-    including an installed app key as the suggestion;
+    including an installed app key as the suggestion, and a task-level typo
+    shows the task's own error, not serde's untagged-enum message;
+  - a volume still rejects an unknown key that no app declares, after
+    `VolumeSpec` moves from `deny_unknown_fields` to capture;
+  - `legion job validate` offline checks core fields and says installed
+    keys weren't checked;
   - the `kind` error still reads as before;
   - with the flag, an unknown key at an extension point is kept `pending`,
     and an unknown key elsewhere is dropped and listed in `warnings`, both
@@ -1492,13 +1626,19 @@ doesn't exist yet, and `install <url>` covers distribution until then.
     resolves its keys, and a group key on two tasks of one group is
     refused;
   - the collision rules:
-    - install is refused over a core field or another app's key;
+    - install is refused over a core field or another app's key, and over
+      another app's `task` key for a `group` key of the same name;
     - `--key` renames, and the stored values follow the app, not the key;
     - the qualified `apps.<app>` spelling works at every point;
-    - a simulated new core field shadows the short key and points
-      submitters at the qualified spelling;
-  - schema validation errors carry the full path (task, volume, field), and
-    defaults are filled into the stored value;
+    - a simulated new core field: a job whose previous version used the
+      short key for the app gets the qualified-spelling error, and a new job
+      using the key gets the core field;
+  - schema validation errors carry the full path (task, volume, field);
+  - values are stored as written, defaults are filled on read, and an app
+    upgrade that changes a default changes the effective value of every
+    value that didn't set it;
+  - an install whose schema uses a remote `$ref` is refused without any
+    network request;
   - `requires` is enforced as the submitter;
   - the validate call: an error rejects, a warning passes, and a timeout or
     unreachable app accepts with a warning;
@@ -1624,19 +1764,20 @@ doesn't exist yet, and `install <url>` covers distribution until then.
   - An action by a viewer without it is refused before the app sees a
     request.
   - The same view renders with `legion app view` and `legion_app_view`.
-- **A6.**
-  - `autoscael = true` fails to submit with `did you mean autoscale?`.
-  - The same spec with `--allow-unknown-fields` submits and reports the
-    drop in the reply and in `job info`.
-  - With a fake `backup` app declaring a volume key, a volume with
-    `backup = { keep = 0 }` is rejected with the full path, and
-    `backup = { schedule = "0 3 * * *" }` is stored with `keep = 7` filled
-    in.
-  - The same value written as `apps = { backup = { … } }` is accepted.
-  - Changing `keep` on a running job doesn't restart it.
-  - `legion job schema` shows `backup` on volumes.
-  - Installing a second app that declares `backup` on volumes is refused,
-    and succeeds with `--key volume.backup=pgbackup`.
 - **A5.** A tier-2 page can call an allowlisted RPC as the viewer, is
   refused a non-allowlisted one, and cannot read the SPA's token
   (Playwright).
+- **A6.**
+  - `autoscael = true` fails to submit with `did you mean autoscale?`.
+  - The same spec with `--allow-unknown-fields` submits. Because a task is
+    an extension point, `autoscael` is kept as `pending`, and both the reply
+    and `job info` say so.
+  - With a fake `backup` app declaring a volume key, a volume with
+    `backup = { keep = 0 }` is rejected with the full path.
+    `backup = { schedule = "0 3 * * *" }` is stored as written, and
+    `job info` shows `keep = 7` filled in.
+  - The same value written as `apps = { backup = { … } }` is accepted.
+  - Changing `keep` on a running job doesn't restart it.
+  - `legion job schema`, against the cluster, shows `backup` on volumes.
+  - Installing a second app that declares `backup` on volumes is refused,
+    and succeeds with `--key volume.backup=pgbackup`.

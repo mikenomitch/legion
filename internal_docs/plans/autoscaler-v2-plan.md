@@ -2,7 +2,8 @@
 
 > **Judgement calls:** [autoscaler-v2-plan_calls.md](../calls/autoscaler-v2-plan_calls.md)
 
-**Status: PLANNED** (written 2026-10-19). This plan **supersedes**
+**Status: PLANNED** (written 2026-10-19; layered defaults, in-place policy
+edits, and the core-field rationale added 2026-10-27). This plan **supersedes**
 [autoscaler-plan.md](autoscaler-plan.md). That plan's Phase 1 (`legion job
 scale`, count overrides, the `scale` ACL resource) shipped on 2026-07-30 and
 is still accurate. This plan treats it as **Phase 0** and builds on it
@@ -580,6 +581,11 @@ The rules:
   `max = 20`, or `max = "6x"`. The built-ins are `min = "1x"` and
   `max = "4x"`, so a cluster can change the ratio for every task without
   knowing their counts.
+- **An inherited `min` can't lower the floor.** At the cluster and
+  namespace levels, `min` must be a multiple of `count` of at least `"1x"`.
+  Defaults can raise every task's floor, but never put an HA service below
+  the count its author wrote. Only the task itself can set `min` below
+  `count`.
 - **Signals are all or nothing.** If the task's record names no signal
   (`cpu`, `memory`, or `checks`), the effective default signal applies: the
   built-in `cpu = 0.7`, or whatever the cluster or namespace set. If it
@@ -599,8 +605,13 @@ The rules:
     changes, and `WatchScalingPolicies` delivers the recomputed policy.
   - So an operator who finds scale-in too eager everywhere changes one
     cluster default, and every inheriting task follows, with no resubmits.
-  - Each `scale_history` row carries the effective policy's digest, so a
-    change in behavior traces back to the defaults change that caused it.
+  - Each `scale_history` row carries the effective policy's digest. The
+    effective policy itself is stored once per digest
+    (`scaling_policy_snapshot`), so a digest always resolves to the exact
+    policy that made a decision. That holds even after the defaults or a
+    namespace policy change, and namespace policies keep no version
+    history of their own. A change in behavior thus traces back to the
+    defaults change that caused it.
 - **A defaults change is checked against everything that inherits it.**
   `scaling defaults apply` and `namespace policy apply` recompute every
   affected policy first. If any would become invalid (a new cluster `min`
@@ -664,13 +675,21 @@ floor, and the autoscaler brings the count down at the scale-in rate. When
 same submit.
 
 **Editing the policy restarts nothing.** For an autoscaled task, a resubmit
-whose only differences are in `autoscale` and `count` creates a job version
-and moves the running allocations onto it in place. That is the path KV
-re-renders already use (`src/manager/server.rs:4150-4180`). Arbitration
-adjusts the live count in the same transaction. Without this rule, raising
-`max` would roll the service, because `count` is in the scheduling-relevant
-set (`task_schedule_equivalent`, `store.rs:21251`). Changing a cluster or
-namespace default touches no job at all.
+whose only differences are in `autoscale` and `count` still creates a job
+version, and these steps follow:
+1. The submit's Control-lane transaction stores that version and adjusts
+   the override together (the arbitration above).
+2. A new check in `run_job`'s `Updated` branch sees that only those fields
+   changed. Today that branch always creates a rollout
+   (`src/manager/server.rs:2451-2462`).
+3. Instead of a rollout, it moves the running allocations onto the new
+   version synchronously with `migrate_allocations_to_job_config`, a
+   Scheduler-lane write, the way KV re-renders do (`server.rs:4150-4180`).
+
+`task_schedule_equivalent` (`store.rs:21251`) is not changed. It counts
+`count` as scheduling-relevant, and it keeps serving the `job_submit` eval
+and stale-config repair. Changing a cluster or namespace default touches no
+job at all.
 
 **Why `autoscale` is a core field, not an app extension.** Third-party apps
 declare their own jobspec keys at extension points
@@ -1386,9 +1405,11 @@ ships nothing for it.
   it. It is re-run for inheriting policies when any level changes.
 - `NamespacePolicy` `+ autoscale` (the same record shape, with no `checks`),
   using the existing all-policies-apply rule.
-- The in-place comparator: for autoscaled tasks, a resubmit that differs
-  only in `autoscale` and `count` takes the
-  `migrate_allocations_to_job_config` path.
+- A predicate in `run_job`'s `Updated` branch (`server.rs:2451`), checked
+  before `create_rollout_for_update`. For autoscaled tasks, a resubmit that
+  differs only in `autoscale` and `count` moves allocations synchronously
+  with `migrate_allocations_to_job_config`, instead of creating a rollout.
+  `task_schedule_equivalent` is unchanged.
 - New tables on the Control lane:
   - `scaling_policy` (name, namespace, version, spec JSON, created/updated
     by);
@@ -1407,6 +1428,9 @@ ships nothing for it.
   decision id, state, outcome) holds the node and external intents (§6.9).
 - `scale_history` gains `applied` (false for dry-run "would" rows) and
   `policy_digest` (the effective policy the decision used).
+- `scaling_policy_snapshot` (digest, effective policy JSON, first used at),
+  written when a new effective policy first appears, and pruned when no
+  `scale_history` row references it.
 - `handle_job_submit_apply` gains the autoscale-aware arbitration from §6.3:
   keep the override, rebase `base_count`, and clamp into the new bounds.
 - `validate_job_config` gains autoscale validation:
@@ -1532,7 +1556,11 @@ gates at the end.
     - a defaults change delivered live through `WatchScalingPolicies`;
     - an invalidating defaults change refused, and with `--force` holding
       the affected policies as `invalid`;
-    - provenance output naming the right level for every field.
+    - provenance output naming the right level for every field;
+    - a cluster or namespace `min` below `"1x"` (or a plain number)
+      refused at apply;
+    - a `scale_history` digest still resolving to its policy after the
+      namespace policy that shaped it has changed.
 - Engine simulation tests. A deterministic clock plus synthetic series
   (ramp, spike, sawtooth, a dropped source) are run through the same code
   path `legion scaling simulate` will use. They assert the decision
