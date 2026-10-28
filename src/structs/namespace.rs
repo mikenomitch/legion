@@ -31,9 +31,24 @@ pub const DEFAULT_NAMESPACE: &str = "default";
 /// Longest namespace name: one DNS label (`<svc>.<ns>.svc.legion`).
 pub const MAX_NAMESPACE_NAME_LEN: usize = 63;
 
-/// Prefix reserved for namespaces Legion itself may create, so a future
-/// built-in cannot collide with a tenant's.
+/// Prefix reserved for namespaces Legion itself creates, so a built-in
+/// cannot collide with a tenant's. Nobody can create one through the API,
+/// none can be deleted, ACL and namespace-policy globs reach one only when
+/// the pattern itself starts with this prefix
+/// ([`crate::structs::acl::namespace_glob_match`]), and tasks in one may not
+/// run privileged (docs/namespaces.md, "Reserved namespaces").
 pub const RESERVED_NAMESPACE_PREFIX: &str = "legion-";
+
+/// The namespace Legion's own operational jobs live in. The first manager to
+/// lead the control lane of an empty store creates it, together with the
+/// namespace policy of the same name that sends its jobs to the managers'
+/// system workers (`pools.default = "legion-system"`).
+pub const SYSTEM_NAMESPACE: &str = "legion-system";
+
+/// Whether `name` is in the reserved `legion-` space.
+pub fn is_reserved_namespace(name: &str) -> bool {
+    name.starts_with(RESERVED_NAMESPACE_PREFIX)
+}
 
 /// Env var a task receives naming its namespace, and the CLI's
 /// active-namespace default.
@@ -107,7 +122,7 @@ pub fn validate_namespace_name(name: &str) -> Result<(), String> {
 /// `legion-` prefix is reserved for system namespaces.
 pub fn validate_new_namespace_name(name: &str) -> Result<(), String> {
     validate_namespace_name(name)?;
-    if name.starts_with(RESERVED_NAMESPACE_PREFIX) {
+    if is_reserved_namespace(name) {
         return Err(format!(
             "namespace {name:?} uses the reserved prefix {RESERVED_NAMESPACE_PREFIX:?}"
         ));
@@ -406,6 +421,9 @@ mod namespace_test {
         assert!(validate_namespace_name("legion-system").is_ok());
         assert!(validate_new_namespace_name("legion-system").is_err());
         assert!(validate_new_namespace_name("legionnaire").is_ok());
+        assert!(is_reserved_namespace(SYSTEM_NAMESPACE));
+        assert!(!is_reserved_namespace("legionnaire"));
+        assert!(!is_reserved_namespace(DEFAULT_NAMESPACE));
     }
 
     #[test]

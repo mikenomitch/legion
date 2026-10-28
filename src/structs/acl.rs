@@ -11,7 +11,13 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::structs::namespace::split_job_id;
+use crate::structs::namespace::{split_job_id, RESERVED_NAMESPACE_PREFIX};
+
+/// The KV prefix reserved for Legion itself (app leases and state). Like the
+/// reserved `legion-` namespaces, a key under it is reached only by an allow
+/// rule whose `paths` pattern itself starts with `legion/` (see
+/// [`reserved_glob_match`]).
+pub const RESERVED_KV_PREFIX: &str = "legion/";
 
 /// Resource types ACL rules can cover.
 ///
@@ -439,6 +445,36 @@ pub fn glob_match(pattern: &str, value: &str) -> bool {
     true
 }
 
+/// [`glob_match`] with the reserved-prefix rule: a value that starts with
+/// `reserved` is matched only by a pattern that itself starts with
+/// `reserved`, the way a shell's `*` skips dotfiles. So `*` matches
+/// `payments-prod` but not `legion-system`, while `legion-*` and
+/// `legion-system` match it. Every other value is plain [`glob_match`].
+///
+/// The rule only ever narrows what a pattern matches. It keeps the broad
+/// grants operators write every day (`namespaces = ["*"]`,
+/// `paths = ["*"]`) from reaching what Legion runs for itself; reaching it
+/// takes a pattern that names the prefix (docs/namespaces.md, "Reserved
+/// namespaces").
+pub fn reserved_glob_match(pattern: &str, value: &str, reserved: &str) -> bool {
+    if value.starts_with(reserved) && !pattern.starts_with(reserved) {
+        return false;
+    }
+    glob_match(pattern, value)
+}
+
+/// [`reserved_glob_match`] for namespace names: `legion-*` is reserved.
+/// Used by ACL `namespaces` selectors, namespace-policy selectors, and the
+/// node-side `namespaces` restriction alike.
+pub fn namespace_glob_match(pattern: &str, namespace: &str) -> bool {
+    reserved_glob_match(pattern, namespace, RESERVED_NAMESPACE_PREFIX)
+}
+
+/// [`reserved_glob_match`] for KV keys: `legion/` is reserved.
+pub fn kv_path_glob_match(pattern: &str, path: &str) -> bool {
+    reserved_glob_match(pattern, path, RESERVED_KV_PREFIX)
+}
+
 fn any_glob_matches(patterns: &[String], value: &str) -> bool {
     patterns.iter().any(|p| glob_match(p, value))
 }
@@ -500,7 +536,7 @@ fn rule_matches(
         })
         && selector_matches(&rule.names, &scope.name)
         && selector_matches(&rule.pools, &scope.pool)
-        && selector_matches(&rule.paths, &scope.path)
+        && paths_selector_matches(rule, &scope.path)
         && selector_matches(&rule.action_names, &scope.action_name)
         && selector_matches(&rule.templates, &scope.template)
         && selector_matches(&rule.bands, &scope.band)
@@ -552,18 +588,48 @@ pub fn rule_reaches_namespace(rule: &AclRule, namespace: &str) -> bool {
     namespaced && namespace_selector_matches(rule, namespace)
 }
 
-/// Whether a rule's `namespaces` selector matches `namespace`. An allow rule
-/// naming namespaced resources explicitly but no `namespaces` — one stored
-/// before namespaces existed, since validation now refuses to write one —
-/// reaches `default` only: that is what it meant when every job lived there,
-/// and it must not silently widen to every namespace created since. A `*`
-/// resource rule and a deny rule without the selector keep matching every
-/// namespace.
+/// Whether a rule's `namespaces` selector matches `namespace`.
+///
+/// An allow rule's patterns follow the reserved-prefix rule
+/// ([`namespace_glob_match`]): `*` does not reach `legion-system`, only a
+/// pattern starting `legion-` does. A deny rule's patterns are plain globs,
+/// because the reserved rule exists to keep grants from reaching too far,
+/// and a deny that reached less would grant more.
+///
+/// Without the selector: an allow rule naming namespaced resources
+/// explicitly — one stored before namespaces existed, since validation now
+/// refuses to write one — reaches `default` only: that is what it meant
+/// when every job lived there, and it must not silently widen to every
+/// namespace created since. A `*` resource rule reaches what `*` reaches
+/// (every namespace but the reserved ones), and a deny rule every namespace.
 fn namespace_selector_matches(rule: &AclRule, namespace: &str) -> bool {
     match &rule.namespaces {
-        Some(patterns) => any_glob_matches(patterns, namespace),
-        None if rule.is_deny() || rule.resources.iter().any(|resource| resource == "*") => true,
+        Some(patterns) if rule.is_deny() => any_glob_matches(patterns, namespace),
+        Some(patterns) => patterns
+            .iter()
+            .any(|pattern| namespace_glob_match(pattern, namespace)),
+        None if rule.is_deny() => true,
+        None if rule.resources.iter().any(|resource| resource == "*") => {
+            namespace_glob_match("*", namespace)
+        }
         None => namespace == crate::structs::namespace::DEFAULT_NAMESPACE,
+    }
+}
+
+/// Whether a rule's `paths` selector accepts a KV key. Allow rules follow
+/// the reserved-prefix rule ([`kv_path_glob_match`]): a key under `legion/`
+/// is reached only by a pattern starting `legion/`, and an allow rule with
+/// no `paths` reaches what `*` reaches. Deny rules are plain globs, for the
+/// reason [`namespace_selector_matches`] gives. A scope without a key (every
+/// resource but `kv`) is decided by the generic selector rule.
+fn paths_selector_matches(rule: &AclRule, path: &Option<String>) -> bool {
+    match (&rule.paths, path.as_deref()) {
+        (_, None) => selector_matches(&rule.paths, path),
+        _ if rule.is_deny() => selector_matches(&rule.paths, path),
+        (None, Some(path)) => kv_path_glob_match("*", path),
+        (Some(patterns), Some(path)) => patterns
+            .iter()
+            .any(|pattern| kv_path_glob_match(pattern, path)),
     }
 }
 
@@ -815,6 +881,182 @@ mod acl_rules_test {
         assert!(!glob_match("a*b*c", "a-x-y-c"));
         // The CVE-2025-4922 lesson: exact patterns must not prefix-match.
         assert!(!glob_match("test-job", "test-job-2"));
+    }
+
+    /// `*` skips the reserved prefix the way a shell's `*` skips dotfiles;
+    /// a pattern that names the prefix reaches it.
+    #[test]
+    fn reserved_prefix_is_matched_only_by_patterns_that_name_it() {
+        assert!(namespace_glob_match("*", "payments-prod"));
+        assert!(!namespace_glob_match("*", "legion-system"));
+        assert!(!namespace_glob_match("l*", "legion-system"));
+        assert!(!namespace_glob_match("legion*", "legion-system"));
+        assert!(namespace_glob_match("legion-*", "legion-system"));
+        assert!(namespace_glob_match("legion-system", "legion-system"));
+        assert!(!namespace_glob_match("legion-*", "payments"));
+        // Only the prefix is reserved, not every name that starts alike.
+        assert!(namespace_glob_match("*", "legionnaire"));
+
+        assert!(kv_path_glob_match("*", "team-a/config"));
+        assert!(!kv_path_glob_match("*", "legion/apps/autoscaler/lease"));
+        assert!(!kv_path_glob_match(
+            "legion*",
+            "legion/apps/autoscaler/lease"
+        ));
+        assert!(kv_path_glob_match(
+            "legion/*",
+            "legion/apps/autoscaler/lease"
+        ));
+        assert!(kv_path_glob_match(
+            "legion/apps/autoscaler/*",
+            "legion/apps/autoscaler/lease"
+        ));
+        assert!(
+            kv_path_glob_match("*", "legion"),
+            "the bare word is no prefix"
+        );
+    }
+
+    /// A tenant admin's `namespaces = ["*"]` reaches every tenant namespace
+    /// but not `legion-system`, for every namespaced resource; naming the
+    /// prefix reaches it, and management tokens bypass rules as always.
+    #[test]
+    fn star_namespace_rules_do_not_reach_reserved_namespaces() {
+        let tenant_admin =
+            rules(r#"[{"resources": ["*"], "actions": ["*"], "namespaces": ["*"]}]"#);
+        for resource in [
+            AclResource::Job,
+            AclResource::Exec,
+            AclResource::Action,
+            AclResource::Scale,
+            AclResource::Snapshot,
+        ] {
+            assert!(evaluate(
+                &tenant_admin,
+                resource,
+                AclAction::Write,
+                &AclScope::job("payments/web")
+            ));
+            assert!(
+                !evaluate(
+                    &tenant_admin,
+                    resource,
+                    AclAction::Write,
+                    &AclScope::job("legion-system/autoscaler")
+                ),
+                "{resource:?}"
+            );
+        }
+        assert!(!evaluate(
+            &tenant_admin,
+            AclResource::Exec,
+            AclAction::Write,
+            &AclScope::exec("legion-system/autoscaler", false)
+        ));
+        let reaches: Vec<AclRule> = rules(
+            r#"[{"resources": ["job"], "actions": ["write"], "namespaces": ["*", "legion-*"]}]"#,
+        );
+        assert!(evaluate(
+            &reaches,
+            AclResource::Job,
+            AclAction::Write,
+            &AclScope::job("legion-system/autoscaler")
+        ));
+        // A `*` resource rule with no selector reaches what `*` reaches.
+        let everything = rules(r#"[{"resources": ["*"], "actions": ["*"]}]"#);
+        assert!(evaluate(
+            &everything,
+            AclResource::Job,
+            AclAction::Write,
+            &AclScope::job("payments/web")
+        ));
+        assert!(!evaluate(
+            &everything,
+            AclResource::Job,
+            AclAction::Write,
+            &AclScope::job("legion-system/autoscaler")
+        ));
+        let identity = AclIdentity {
+            rules: tenant_admin.clone(),
+            is_management: false,
+            ..AclIdentity::acl_disabled()
+        };
+        assert!(!identity.reaches_namespace("legion-system"));
+        assert!(identity.reaches_namespace("payments"));
+        let management = AclIdentity::acl_disabled();
+        assert!(management.allows(
+            AclResource::Exec,
+            AclAction::Write,
+            &AclScope::exec("legion-system/autoscaler", true)
+        ));
+    }
+
+    /// `paths = ["*"]`, and a KV rule with no `paths`, stop short of
+    /// `legion/`; a pattern starting `legion/` reaches it.
+    #[test]
+    fn star_kv_rules_do_not_reach_the_reserved_prefix() {
+        for broad in [
+            r#"[{"resources": ["kv"], "actions": ["read", "write"], "paths": ["*"]}]"#,
+            r#"[{"resources": ["kv"], "actions": ["read", "write"]}]"#,
+        ] {
+            let r = rules(broad);
+            assert!(evaluate(
+                &r,
+                AclResource::Kv,
+                AclAction::Write,
+                &AclScope::path("team-a/x")
+            ));
+            assert!(
+                !evaluate(
+                    &r,
+                    AclResource::Kv,
+                    AclAction::Write,
+                    &AclScope::path("legion/apps/autoscaler/lease")
+                ),
+                "{broad}"
+            );
+            // The list gate still passes; items under legion/ filter out.
+            assert!(evaluate(
+                &r,
+                AclResource::Kv,
+                AclAction::Read,
+                &AclScope::any()
+            ));
+        }
+        let named =
+            rules(r#"[{"resources": ["kv"], "actions": ["write"], "paths": ["legion/apps/*"]}]"#);
+        assert!(evaluate(
+            &named,
+            AclResource::Kv,
+            AclAction::Write,
+            &AclScope::path("legion/apps/autoscaler/lease")
+        ));
+    }
+
+    /// The reserved rule only narrows: a deny's patterns are plain globs, so
+    /// a deny on `*` still denies inside the reserved space.
+    #[test]
+    fn deny_rules_keep_plain_globs_over_reserved_names() {
+        let r = rules(
+            r#"[
+                {"resources": ["job"], "actions": ["read"], "namespaces": ["legion-*"]},
+                {"resources": ["job"], "actions": ["read"], "namespaces": ["*"], "effect": "deny"},
+                {"resources": ["kv"], "actions": ["read"], "paths": ["legion/*"]},
+                {"resources": ["kv"], "actions": ["read"], "paths": ["*"], "effect": "deny"}
+            ]"#,
+        );
+        assert!(!evaluate(
+            &r,
+            AclResource::Job,
+            AclAction::Read,
+            &AclScope::job("legion-system/autoscaler")
+        ));
+        assert!(!evaluate(
+            &r,
+            AclResource::Kv,
+            AclAction::Read,
+            &AclScope::path("legion/apps/x")
+        ));
     }
 
     /// A stored rule written before namespaces (no `namespaces`, which

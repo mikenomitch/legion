@@ -1288,6 +1288,7 @@ pub fn validate_job_config(config: &JobConfig) -> R<()> {
         )
         .map_err(|err| anyhow!(err))?;
         validate_gated_exec_user(task)?;
+        validate_reserved_namespace_task(task, namespace)?;
         if !task.artifacts.is_empty() {
             registry.load_plugin(&task.runtime, false)?;
             let plugin = registry
@@ -1841,6 +1842,61 @@ pub fn validate_gated_exec_user(task: &crate::structs::TaskConfig) -> R<()> {
     Ok(())
 }
 
+/// Tasks in a reserved namespace (`legion-system`) run unprivileged
+/// (docs/namespaces.md, "Reserved namespaces"). They run on the managers'
+/// system workers, where root could read the manager's data directory and
+/// raft state, delete the host guard's table, or leave its cgroup: "an app"
+/// would become "the cluster". So an `exec` task must name a non-root
+/// `user`, and a `container` may not opt out of the privilege floor
+/// (`security.userNamespace = false`, `security.seccomp = "unconfined"`).
+pub fn validate_reserved_namespace_task(
+    task: &crate::structs::TaskConfig,
+    namespace: &str,
+) -> R<()> {
+    if !crate::structs::namespace::is_reserved_namespace(namespace) {
+        return Ok(());
+    }
+    match task.runtime.as_str() {
+        "exec" => {
+            let user = task
+                .config
+                .get("user")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .unwrap_or_default();
+            if user.is_empty() || user == "root" || user == "0" {
+                bail!(
+                    "task {:?} runs as root, and tasks in namespace {namespace} may not: they run \
+                     on the managers' system workers, where root could read the manager's state \
+                     and leave its limits.\nHint: set user = \"nobody\" (or another \
+                     unprivileged user) in the task's config",
+                    task.name
+                );
+            }
+        }
+        "container" => {
+            let security = container::container_security(&task.config);
+            let opt_out = if !security.user_namespace {
+                Some("security.userNamespace = false, which makes container root host root")
+            } else if security.seccomp == container::SECCOMP_UNCONFINED {
+                Some("security.seccomp = \"unconfined\", which removes the syscall filter")
+            } else {
+                None
+            };
+            if let Some(opt_out) = opt_out {
+                bail!(
+                    "task {:?} sets {opt_out}, and tasks in namespace {namespace} may not run \
+                     privileged: they run on the managers' system workers.\nHint: remove the \
+                     setting",
+                    task.name
+                );
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
 /// Warnings for a container that opts out of the privilege floor
 /// (worker-plane-auth plan §6.14): each opt-out names its cost, because it
 /// makes container root host root or removes the syscall filter.
@@ -2159,6 +2215,53 @@ mod tests {
 
     fn task(value: serde_json::Value) -> crate::structs::TaskConfig {
         serde_json::from_value(value).expect("task config")
+    }
+
+    /// Reserved namespaces run unprivileged: no root exec task, no container
+    /// that opts out of the privilege floor. Elsewhere both are allowed.
+    #[test]
+    fn reserved_namespaces_refuse_privileged_tasks_test() {
+        let exec = |user: Option<&str>| {
+            let mut config = serde_json::json!({ "command": ["true"] });
+            if let Some(user) = user {
+                config["user"] = serde_json::json!(user);
+            }
+            task(serde_json::json!({ "name": "agent", "runtime": "exec", "config": config }))
+        };
+        for user in [None, Some("root"), Some("0"), Some(" ")] {
+            let err = validate_reserved_namespace_task(&exec(user), "legion-system")
+                .expect_err("root is refused");
+            assert!(err.to_string().contains("runs as root"), "{err}");
+            assert!(err.to_string().contains("legion-system"), "{err}");
+            validate_reserved_namespace_task(&exec(user), "default")
+                .expect("root is fine outside reserved namespaces");
+        }
+        validate_reserved_namespace_task(&exec(Some("nobody")), "legion-system")
+            .expect("an unprivileged user is fine");
+
+        let container = |security: serde_json::Value| {
+            task(serde_json::json!({
+                "name": "agent", "runtime": "container",
+                "config": { "image": "alpine", "command": ["true"], "security": security },
+            }))
+        };
+        for (security, says) in [
+            (
+                serde_json::json!({ "userNamespace": false }),
+                "userNamespace",
+            ),
+            (serde_json::json!({ "seccomp": "unconfined" }), "unconfined"),
+        ] {
+            let err =
+                validate_reserved_namespace_task(&container(security.clone()), "legion-system")
+                    .expect_err("a privileged container is refused");
+            assert!(err.to_string().contains(says), "{err}");
+            assert!(err.to_string().contains("may not run privileged"), "{err}");
+            validate_reserved_namespace_task(&container(security), "payments")
+                .expect("allowed outside reserved namespaces");
+        }
+        validate_reserved_namespace_task(&container(serde_json::json!({})), "legion-system")
+            .expect("the default floor is fine");
     }
 
     #[test]

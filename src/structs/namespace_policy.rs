@@ -22,7 +22,7 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
 
-use crate::structs::acl::glob_match;
+use crate::structs::acl::{glob_match, namespace_glob_match};
 use crate::structs::namespace::{job_namespace, validate_namespace_name};
 use crate::structs::{Band, JobConfig};
 
@@ -117,7 +117,7 @@ fn memory_mib<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Option<f64>,
 }
 
 /// A namespace glob: a namespace name in which `*` may stand for any run.
-fn validate_namespace_glob(glob: &str) -> Result<(), String> {
+pub(crate) fn validate_namespace_glob(glob: &str) -> Result<(), String> {
     if glob == "*" {
         return Ok(());
     }
@@ -225,11 +225,15 @@ impl NamespacePolicy {
         Ok(())
     }
 
-    /// Whether the policy governs `namespace`.
+    /// Whether the policy governs `namespace`. Selectors follow the ACL
+    /// reserved-prefix rule ([`namespace_glob_match`]): a `*` policy governs
+    /// every tenant namespace but not `legion-system`, so a tenant-wide
+    /// quota or default pool never lands on what Legion runs for itself. A
+    /// selector that starts with `legion-` governs reserved namespaces.
     pub fn matches(&self, namespace: &str) -> bool {
         self.namespaces
             .iter()
-            .any(|glob| glob_match(glob, namespace))
+            .any(|glob| namespace_glob_match(glob, namespace))
     }
 
     /// `payments, payments-*`, for messages.
@@ -529,5 +533,32 @@ mod namespace_policy_test {
         }))
         .unwrap()];
         admit_job(&policies, &mut web).unwrap();
+    }
+
+    /// A tenant-wide `*` policy never governs `legion-system`, so its default
+    /// pool cannot collide with the system namespace's own; a selector that
+    /// names the prefix does govern it.
+    #[test]
+    fn star_policies_skip_reserved_namespaces() {
+        let tenants = policy(json!({
+            "name": "tenants",
+            "namespaces": ["*"],
+            "pools": { "allowed": ["shared"], "default": "shared" },
+        }));
+        let system = policy(json!({
+            "name": "legion-system",
+            "namespaces": ["legion-system"],
+            "pools": { "default": "legion-system" },
+        }));
+        assert!(tenants.matches("payments"));
+        assert!(!tenants.matches("legion-system"));
+        assert!(
+            policy(json!({ "name": "all", "namespaces": ["*", "legion-*"] }))
+                .matches("legion-system")
+        );
+        let policies = vec![tenants, system];
+        let mut agent = job("legion-system/agent", "exec", json!({}));
+        admit_job(&policies, &mut agent).unwrap();
+        assert_eq!(agent.tasks[0].permit, json!({ "pool": "legion-system" }));
     }
 }

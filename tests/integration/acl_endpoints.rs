@@ -2884,6 +2884,120 @@ async fn kv_path_scoped_policy_limits_kv_access() -> R<()> {
     Ok(())
 }
 
+/// Reserved names are out of `*`'s reach (apps plan §6.2, calls entry 6): a
+/// tenant admin holding `namespaces = ["*"]` and `paths = ["*"]` deploys to
+/// every tenant namespace and writes every tenant key, but cannot run a job
+/// in `legion-system` or write under `legion/`. A rule that names the prefix
+/// reaches both, and even then a root exec task is refused there.
+#[tokio::test]
+async fn star_policies_do_not_reach_legion_system_or_legion_kv_test() -> R<()> {
+    let (svc, _fixtures, management) = setup_enabled()?;
+    let authenticator = svc.auth.clone();
+    assert!(svc.store.ensure_system_namespace()?);
+    svc.store
+        .apply_namespace(legion::structs::namespace::Namespace {
+            name: "payments".into(),
+            ..Default::default()
+        })?;
+    svc.store.upsert_acl_policy(
+        "tenant-admin",
+        "",
+        r#"[
+            {"resources": ["job", "exec", "scale"], "namespaces": ["*"], "actions": ["*"], "host": true},
+            {"resources": ["kv"], "actions": ["read", "write"], "paths": ["*"]}
+        ]"#,
+    )?;
+    svc.store.upsert_acl_policy(
+        "system-admin",
+        "",
+        r#"[
+            {"resources": ["job"], "namespaces": ["*", "legion-*"], "actions": ["*"], "host": true},
+            {"resources": ["kv"], "actions": ["read", "write"], "paths": ["*", "legion/*"]}
+        ]"#,
+    )?;
+    let mint = |policy: &str| {
+        authenticator
+            .mint_token(&svc.store, policy, "client", &[policy.into()], None)
+            .map(|(_, secret)| secret)
+            .map_err(|s| anyhow!(s.to_string()))
+    };
+    let tenant = mint("tenant-admin")?;
+    let system = mint("system-admin")?;
+    let run = |namespace: &str, task: serde_json::Value, secret: String| {
+        let svc = &svc;
+        let namespace = namespace.to_string();
+        async move {
+            svc.run_job(req(
+                RunJobRequest {
+                    namespace: Some(namespace),
+                    parsed_jobspec: serde_json::json!({ "name": "agent", "tasks": [task] })
+                        .to_string(),
+                    submissions: vec![],
+                    priority: None,
+                    force_reschedule: false,
+                    idempotency_key: None,
+                },
+                Some(&secret),
+            ))
+            .await
+        }
+    };
+    let task = serde_json::json!({
+        "name": "main", "runtime": "exec",
+        "config": { "command": ["sleep", "600"], "user": "nobody" },
+    });
+
+    run("payments", task.clone(), tenant.clone())
+        .await
+        .expect("`*` reaches a tenant namespace");
+    let status = run("legion-system", task.clone(), tenant.clone())
+        .await
+        .expect_err("`*` must not reach legion-system");
+    assert_eq!(status.code(), Code::PermissionDenied, "{status:?}");
+    run("legion-system", task.clone(), system.clone())
+        .await
+        .expect("a pattern starting legion- reaches it");
+
+    // Even with the right to deploy there, a root exec task is refused.
+    let mut root_exec = task.clone();
+    root_exec["config"]
+        .as_object_mut()
+        .expect("config")
+        .remove("user");
+    for secret in [system.clone(), management.clone()] {
+        let status = run("legion-system", root_exec.clone(), secret)
+            .await
+            .expect_err("a root exec task in legion-system");
+        assert_eq!(status.code(), Code::InvalidArgument, "{status:?}");
+        assert!(status.message().contains("runs as root"), "{status:?}");
+    }
+
+    let put = |key: &str, secret: &str| {
+        let svc = &svc;
+        let request = req(
+            PutKvRequest {
+                key: key.into(),
+                value: "v".into(),
+                value_type: KvValueType::String.into(),
+                ..Default::default()
+            },
+            Some(secret),
+        );
+        async move { svc.put_kv(request).await }
+    };
+    put("team-a/config", &tenant)
+        .await
+        .expect("`*` reaches tenant keys");
+    let status = put("legion/apps/autoscaler/lease", &tenant)
+        .await
+        .expect_err("`*` must not reach legion/");
+    assert_eq!(status.code(), Code::PermissionDenied, "{status:?}");
+    put("legion/apps/autoscaler/lease", &system)
+        .await
+        .expect("a pattern starting legion/ reaches it");
+    Ok(())
+}
+
 /// A port's `tls.cert = { kv }` (and `tls.clients.ca`, and an upstream's
 /// `ca`) hands a KV value to the datapath, so naming one in a job needs
 /// `kv:read` on that path: job-write access alone must not be a way to read
