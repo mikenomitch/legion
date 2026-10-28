@@ -672,6 +672,177 @@ expect the percent default to survive, and it doesn't.
   "2 or 100%", which silently does nothing. Replacing makes what you wrote
   the whole limit.
 
+## 20. Signals are all or nothing at every defaults level, not only the task's
+
+*Implementation, engine core (`src/autoscaler/defaults.rs`).*
+
+**Call.** If a level sets any signal (`cpu`, `memory`), its signals
+replace, rather than add to, the signals inherited from the levels below it.
+The plan stated this only for the task's own record; the engine applies it at
+the cluster and namespace levels too.
+
+```nickel
+# cluster defaults
+{ memory = 0.8 }   # effective default signal is now memory only, not cpu + memory
+```
+
+**Alternatives.** Merge `cpu` and `memory` field by field across levels, so
+a cluster default of `{ memory = 0.8 }` adds a memory target to the built-in
+CPU target.
+
+**Trade-off.** An operator who wants "CPU and memory" everywhere has to write
+both. A cluster-level `{ memory = 0.8 }` silently drops CPU scaling for every
+inheriting task, which `scaling explain --policy` shows but nothing warns
+about.
+
+**Why (simplicity).** One rule at every level is easier to hold in your head
+than "replace at the task, merge elsewhere", and it matches entry 3's
+all-or-nothing rule for the task.
+
+## 21. A namespace-policy conflict on a field is waived when the task sets that field
+
+*Implementation, engine core.*
+
+**Call.** Two namespace policies that set the same `autoscale` field to
+different values make that field unresolvable, but only for tasks that don't
+set the field themselves. A task that writes the field gets no error.
+
+**Alternatives.** Refuse every task in the overlap, whether or not it
+overrides the field.
+
+**Trade-off.** A conflicting pair of policies can sit unnoticed until the
+first task that relies on the default.
+
+**Why (simplicity).** It mirrors how two `pools.default` values behave today
+(only a task without a pool is unadmittable), and the error appears exactly
+where it can be fixed, with a hint to set the field on the task.
+
+## 22. `min ≤ count` is checked only for a jobspec `min`; `count ≤ max` always
+
+*Implementation, engine core.*
+
+**Call.** Validation rejects a task's own `min` above its `count`, but an
+inherited `min` (a multiple of at least `"1x"`) may resolve above `count`,
+and then raises the floor. `count ≤ max` is checked for every level.
+
+**Alternatives.** Apply `min ≤ count` at every level.
+
+**Trade-off.** None found. The rule is asymmetric, which the public doc must
+state.
+
+**Why (correctness).** Entry 3 promises that defaults can *raise* floors
+(`min = "2x"` cluster-wide). Checking `min ≤ count` for inherited values would
+make that impossible.
+
+## 23. Schedules use 5-field crontab with Legion's own time-zone and DST handling
+
+*Implementation, engine core (`src/autoscaler/schedule.rs`).*
+
+**Call.** `schedule[].cron` is standard 5-field crontab (`0 8 * * 1-5` means
+Monday to Friday). The engine translates it for the `cron` crate, which is
+seconds-first and numbers Sunday as 1, so the plan's `1-5` would otherwise
+have meant Sunday to Thursday. The engine evaluates windows in the
+schedule's IANA `timezone` (`chrono-tz`) with its own DST rules: a start that
+falls in a spring-forward gap uses the pre-gap offset, and a repeated
+fall-back hour opens the window once.
+
+**Alternatives.** Use the crate's syntax directly, the same as batch
+`schedule` does.
+
+**Trade-off.** Two cron dialects in one jobspec: a batch task's `schedule`
+is seconds-first; an autoscale `schedule` is crontab. There is also a new
+dependency (`chrono-tz`, 0.10.4, with `phf` 0.12.1).
+
+**Why (simplicity).** Operators write crontab from memory, and a schedule
+that silently ran on Sundays instead of Fridays is the worst kind of
+surprise.
+
+## 24. Warmup counts not-ready replicas at 0% for scale-out and at the target for scale-in
+
+*Implementation, engine core (`src/autoscaler/strategies.rs`).*
+
+**Call.** Not-ready replicas (`current − ready`) count as 0% busy when the
+strategy is deciding to scale out, and as exactly at target when it is
+deciding to scale in. That is the Kubernetes HPA rule.
+
+**Alternatives.** Count them as fully busy (utilization 1.0) for scale-in.
+
+**Trade-off.** Counting at target makes a warming fleet slightly more
+willing to scale in than counting at 100% would.
+
+**Why.** The plan names the HPA rule, and at-target avoids treating a
+warming replica as an overload signal.
+
+## 25. The step budget is a percent of the count at the window's start, with no refunds
+
+*Implementation, engine core (`src/autoscaler/pipeline.rs`).*
+
+**Call.** The step limit's percent half is taken of the count at the start
+of the rolling `every` window, rounded up for scale-out and down for
+scale-in. A change in the opposite direction does not give budget back.
+
+**Alternatives.** Percent of the current count, recomputed every evaluation.
+
+**Trade-off.** Slightly slower than the plan's prose suggests: in S1 the
+first scale-in lands at 9:50, not 10:00.
+
+**Why (safety).** A base that moves with the count lets a run of small
+evaluations compound past the intended rate. A fixed base per window makes
+"at most 10% per minute" literally true.
+
+## 26. Pause beats pin, and a schedule collision keeps the ceiling
+
+*Implementation, engine core.*
+
+**Call.** When a pause and a pin are both active, the pause wins and nothing
+is written. Schedules only ever raise `min` or lower `max`. When two
+overlapping schedule entries make `min > max`, the ceiling wins.
+
+**Alternatives.** Pin beats pause (the human's explicit count wins). Or the
+floor wins on a collision.
+
+**Trade-off.** An operator who pins during a cluster-wide pause sees the pin
+held until the pause ends.
+
+**Why (safety).** A pause is the kill switch, and a kill switch that a pin
+can override isn't one. Keeping the ceiling on a collision errs toward
+spending less.
+
+## 27. One `scale.limited` event per episode
+
+*Implementation, engine core.*
+
+**Call.** `scale.limited` is emitted once per episode, keyed by the stage
+that limited the count. A tick held for warmup or stabilization neither ends
+nor restarts the episode.
+
+**Alternatives.** Emit on every limited evaluation, or rate-limit by time.
+
+**Trade-off.** A long episode is one event, so its duration has to come from
+status, not the event stream.
+
+**Why (simplicity).** The event stream is capped and best-effort. One event
+per state change is the rule the plan sets (§6.6).
+
+## 28. Scale to zero follows KEDA: only activation checks vote at zero
+
+*Implementation, engine core.*
+
+**Call.**
+- At zero replicas, only checks with `activation` vote.
+- A target is idle (scaled to zero) only when every check reads below
+  activation.
+- Missing data is never idle.
+
+**Alternatives.** Let normal checks vote at zero, with their own thresholds.
+
+**Trade-off.** A policy must name an activation check to ever wake. That is
+already enforced by the `min = 0` validation (plan §6.12).
+
+**Why (correctness).** It is the 0↔1 versus 1↔N split the plan takes from
+KEDA. Treating missing data as idle would put a service to sleep because its
+metrics source had a blip.
+
 ## Ledger: what stands from the superseded plan's calls
 
 The superseded plan's calls are not rewritten (`plans/README.md`). This is
