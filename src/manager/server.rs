@@ -80,7 +80,7 @@ use crate::structs::{
     SetNodeAvailabilityReply, SetNodeAvailabilityRequest, StartInstanceReply, StartInstanceRequest,
     StopInstanceReply, StopInstanceRequest, StopJobReply, StopJobRequest, StopNotice,
     StopRolloutReply, StopRolloutRequest, StreamEventsRequest, Submission, TaskConfig,
-    TaskOnUnhealthyConfig, TaskScaleStatus, UpdateNodeDynamicReply, UpdateNodeDynamicRequest,
+    TaskOnUnhealthyConfig, UpdateNodeDynamicReply, UpdateNodeDynamicRequest,
     UpsertJobTemplateReply, UpsertJobTemplateRequest, UpsertSavedStateQueryReply,
     UpsertSavedStateQueryRequest, WorkerConfig, WorkerPreRegisterReply, WorkerPreRegisterRequest,
     WorkerRegisterReply, WorkerRegisterRequest,
@@ -129,6 +129,7 @@ mod namespace_policy_rpcs;
 mod namespace_rpcs;
 mod node_content_rpcs;
 mod plugin_rpcs;
+mod scaling_rpcs;
 mod session_rpcs;
 mod snapshot_rpcs;
 mod suspend_rpcs;
@@ -6268,30 +6269,10 @@ impl Manager for ManagerDaemonService {
             .store
             .task_scales_for_job(&name)
             .map_err(|e| map_store_error("Error loading scale state", e))?;
-
-        let tasks = config
-            .tasks
-            .iter()
-            .map(|task| {
-                let scale = scales
-                    .iter()
-                    .find(|scale| scale.task_group == task.group && scale.task_name == task.name);
-                let override_count = scale.and_then(|scale| scale.count);
-                TaskScaleStatus {
-                    task_group: task.group.clone(),
-                    task_name: task.name.clone(),
-                    spec_count: task.count.num,
-                    override_count,
-                    pending_count: scale.and_then(|scale| scale.pending_count),
-                    effective_count: override_count.unwrap_or(task.count.num),
-                    source: scale.map(|scale| scale.source.clone()).unwrap_or_default(),
-                    reason: scale.map(|scale| scale.reason.clone()).unwrap_or_default(),
-                    updated_at: scale
-                        .map(|scale| scale.updated_at.clone())
-                        .unwrap_or_default(),
-                }
-            })
-            .collect();
+        // Every effective count through `effective_task_count`, the accessor
+        // placement uses (autoscaler-v2 plan §5, Phase 0 hardening).
+        let tasks = scaling_rpcs::task_scale_statuses(&self.store, &name, &config, &scales)
+            .map_err(|e| map_store_error("Error reading scale state", e))?;
 
         Ok(Response::new(GetJobScaleStatusReply { tasks }))
     }

@@ -964,6 +964,17 @@ pub struct TaskScale {
     pub updated_at: String,
 }
 
+impl TaskScale {
+    /// Whether this override binds to a spec whose count is `spec_count`.
+    /// An override binds only to the spec count it was laid over
+    /// (`base_count`); submit arbitration clears mismatches, and this keeps
+    /// every reader honest about the ones it has not cleared yet. The one
+    /// rule behind [`Store::effective_task_count`] and `GetJobScaleStatus`.
+    pub fn binds_to(&self, spec_count: u32) -> bool {
+        self.base_count == spec_count
+    }
+}
+
 #[derive(Debug, Clone)]
 pub enum PlanApplyOutcome {
     Applied(AppliedPlan),
@@ -16067,7 +16078,7 @@ impl Store {
             // submit arbitration clears mismatches), and it keeps dry-run
             // plans over an EDITED spec honest about what a submit would
             // converge to.
-            .filter(|scale| scale.base_count == spec_count)
+            .filter(|scale| scale.binds_to(spec_count))
             .and_then(|scale| scale.count)
             .unwrap_or(spec_count))
     }
