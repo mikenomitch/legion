@@ -5786,3 +5786,559 @@ mod tests {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod unknown_fields_test {
+    //! Strict jobspec fields (docs/jobs-tasks-and-scheduling.md, "Unknown
+    //! fields"): a typo fails with a suggestion at every level, and
+    //! `allow_unknown_fields` keeps extension-point keys and drops the rest.
+
+    use super::*;
+    use crate::structs::network::{
+        ConnectConfig, ConnectTemplate, NetworkConfig, PortConfig, PortTls, ServiceConfig,
+        UpstreamConfig, UpstreamHttpConfig,
+    };
+    use crate::structs::spec_fields::{ExtensionPoint, SpecBlock, UnknownFieldEntry};
+    use serde_json::json;
+
+    fn strict_error(spec: Value) -> String {
+        match JobConfig::parse_submitted(spec, UnknownFieldMode::Reject) {
+            Ok(_) => panic!("a strict parse should have failed"),
+            Err(err) => format!("{err:#}"),
+        }
+    }
+
+    fn allowed(spec: Value) -> (JobConfig, UnknownFieldsRecord) {
+        JobConfig::parse_submitted(spec, UnknownFieldMode::Allow).expect("allowed parse")
+    }
+
+    fn entry(scope: &str, path: &str, point: Option<ExtensionPoint>) -> UnknownFieldEntry {
+        UnknownFieldEntry {
+            scope: scope.into(),
+            path: path.into(),
+            point,
+        }
+    }
+
+    #[test]
+    fn a_job_level_typo_fails_with_a_suggestion_test() {
+        let err = strict_error(json!({
+            "name": "web",
+            "prioritty": "high",
+            "task": { "runtime": "noop" }
+        }));
+        assert!(
+            err.contains("web: unknown field `prioritty` (did you mean `priority`?)"),
+            "{err}"
+        );
+        assert!(err.contains("\nHint: "), "{err}");
+        assert!(err.contains("--allow-unknown-fields"), "{err}");
+    }
+
+    /// The plan's acceptance case is `autoscael` suggesting `autoscale`.
+    /// `autoscale` is not a field yet (it lands with the autoscaler), so the
+    /// same transposition is exercised on `count`.
+    #[test]
+    fn a_task_level_typo_fails_with_a_suggestion_test() {
+        let err = strict_error(json!({
+            "name": "web",
+            "tasks": { "web": { "runtime": "noop", "cuont": 3 } }
+        }));
+        assert!(
+            err.contains("web: task web: unknown field `cuont` (did you mean `count`?)"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn nested_typos_name_their_path_and_suggest_test() {
+        let err = strict_error(json!({
+            "name": "web",
+            "rollout": { "stepStager": "5s" },
+            "task": {
+                "name": "web",
+                "runtime": "noop",
+                "stop": { "signall": "SIGINT" },
+                "stateful": { "storage": { "path": "/data", "retainOnStp": false } },
+                "volumes": [{ "name": "data", "readonly": true }],
+                "network": {
+                    "ports": [{
+                        "name": "http",
+                        "tls": { "cert": { "kv": "certs/web" }, "client": {} }
+                    }]
+                },
+                "checks": [{ "type": "health", "kind": "tcp", "port": 80, "evry": "5s" }],
+                "connect": {
+                    "upstreams": [{ "to": "http://search", "http": { "timout": "3s" } }]
+                },
+                "identities": [{ "name": "aws", "audience": ["sts"], "file": { "path": "/t", "mod": "0400" } }],
+                "dependsOn": [{ "task": "db", "conditon": "healthy" }],
+                "artifacts": [{ "source": "https://example.com/tool.tar.gz", "dset": "bin" }]
+            }
+        }));
+        for line in [
+            "web: unknown field `rollout.stepStager` (did you mean `rollout.stepStagger`?)",
+            "web: task web: unknown field `stop.signall` (did you mean `stop.signal`?)",
+            "web: task web: unknown field `stateful.storage.retainOnStp` (did you mean \
+             `stateful.storage.retainOnStop`?)",
+            "web: task web: volume data: unknown field `readonly` (did you mean `readOnly`?)",
+            "web: task web: port http: unknown field `tls.client` (did you mean `tls.clients`?)",
+            "web: task web: unknown field `checks[0].evry` (did you mean `checks[0].every`?)",
+            "web: task web: unknown field `connect.upstreams[0].http.timout` (did you mean \
+             `connect.upstreams[0].http.timeout`?)",
+            "web: task web: unknown field `identities[0].file.mod` (did you mean \
+             `identities[0].file.mode`?)",
+            "web: task web: unknown field `dependsOn[0].conditon` (did you mean \
+             `dependsOn[0].condition`?)",
+            "web: task web: unknown field `artifacts[0].dset` (did you mean `artifacts[0].dest`?)",
+        ] {
+            assert!(err.contains(line), "missing {line:?} in:\n{err}");
+        }
+    }
+
+    #[test]
+    fn a_volume_still_rejects_an_unknown_key_after_capture_test() {
+        // `VolumeSpec` used `deny_unknown_fields`; it now captures, and a
+        // strict submit still refuses the key, with the volume named.
+        let err = strict_error(json!({
+            "name": "orders-db",
+            "task": {
+                "name": "postgres",
+                "runtime": "noop",
+                "volumes": [{ "name": "data", "backup": { "schedule": "0 3 * * *" } }]
+            }
+        }));
+        assert!(
+            err.contains("orders-db: task postgres: volume data: unknown field `backup`"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn a_tasks_own_error_reaches_the_user_test() {
+        // A list task: the error names it and says what `count` takes, not
+        // serde's "did not match any variant of untagged enum".
+        let err = strict_error(json!({
+            "name": "web",
+            "tasks": [{ "name": "a", "runtime": "noop", "count": "three" }]
+        }));
+        assert!(
+            err.contains("tasks[0]: count must be a whole number"),
+            "{err}"
+        );
+        assert!(!err.contains("did not match any variant"), "{err}");
+
+        // A map task.
+        let err = strict_error(json!({
+            "name": "web",
+            "tasks": { "a": { "runtime": "noop", "lifecycle": "forever" } }
+        }));
+        assert!(err.contains("task a: unknown variant `forever`"), "{err}");
+        assert!(!err.contains("did not match any variant"), "{err}");
+
+        // The single-task shorthand.
+        let err = strict_error(json!({
+            "name": "web",
+            "task": { "runtime": "noop", "checks": "often" }
+        }));
+        assert!(err.starts_with("task: invalid type"), "{err}");
+
+        // A value shorthand parsed by hand stays strict and suggests.
+        let err = strict_error(json!({
+            "name": "web",
+            "task": { "runtime": "noop", "count": { "num": 2, "pre": "zone" } }
+        }));
+        assert!(
+            err.contains("unknown field `count.pre` (did you mean `count.per`?)"),
+            "{err}"
+        );
+        let err = strict_error(json!({
+            "name": "web",
+            "task": {
+                "runtime": "noop",
+                "lifecycle": "batch",
+                "schedule": { "every": "5m", "jitter": "1m" }
+            }
+        }));
+        assert!(err.contains("unknown field `schedule.jitter`"), "{err}");
+    }
+
+    #[test]
+    fn the_kind_error_reads_as_before_test() {
+        let spec = json!({ "name": "web", "task": { "kind": "exec" } });
+        let expected = "task task: unknown field `kind`, expected `runtime`. `kind` was renamed \
+                        to `runtime`; replace `kind: \"exec\"` with `runtime: \"exec\"` (see \
+                        docs/task-runtime-plugins.md)";
+        assert_eq!(strict_error(spec.clone()), expected);
+        // The flag is about keys Legion does not know; `kind` it knows.
+        let err = JobConfig::parse_submitted(spec.clone(), UnknownFieldMode::Allow)
+            .map(|_| ())
+            .unwrap_err();
+        assert_eq!(err.to_string(), expected);
+        let err = serde_json::from_value::<JobConfig>(spec).unwrap_err();
+        assert_eq!(err.to_string(), expected);
+    }
+
+    #[test]
+    fn allow_keeps_extension_point_keys_and_drops_the_rest_test() {
+        let (config, record) = allowed(json!({
+            "name": "orders-db",
+            "uptime": { "url": "https://orders.acme.dev/healthz" },
+            "rollout": { "stepStager": "5s" },
+            "tasks": {
+                "postgres": {
+                    "runtime": "noop",
+                    "autoscael": true,
+                    "stop": { "signall": "SIGINT" },
+                    "volumes": [{ "name": "data", "backup": { "schedule": "0 3 * * *" } }],
+                    "network": { "ports": [{ "name": "http", "dns": { "hostname": "orders" } }] },
+                    "service": { "port": "http", "uptime": true }
+                }
+            }
+        }));
+
+        // Kept, as written, on the block they were written on.
+        assert_eq!(
+            config.pending_extensions,
+            BTreeMap::from([(
+                "uptime".to_string(),
+                json!({ "url": "https://orders.acme.dev/healthz" })
+            )])
+        );
+        let task = &config.tasks[0];
+        assert_eq!(task.pending_extensions["autoscael"], json!(true));
+        assert_eq!(
+            task.volumes[0].pending_extensions["backup"],
+            json!({ "schedule": "0 3 * * *" })
+        );
+        let network = task.network.as_ref().expect("network");
+        assert_eq!(
+            network.ports[0].pending_extensions["dns"],
+            json!({ "hostname": "orders" })
+        );
+        let service = task.service.as_ref().expect("service");
+        assert_eq!(service.pending_extensions["uptime"], json!(true));
+
+        // Dropped, and nothing captured is left behind.
+        let stop = task.stop.as_ref().expect("stop");
+        assert!(stop.unknown_fields.is_empty());
+        assert_eq!(stop.signal, "SIGTERM");
+        assert!(config
+            .rollout
+            .as_ref()
+            .is_some_and(|rollout| rollout.unknown_fields.is_empty()));
+
+        assert_eq!(
+            record.dropped,
+            vec![
+                entry("", "rollout.stepStager", None),
+                entry("task postgres", "stop.signall", None),
+            ]
+        );
+        // Walk order: the job, then each task and its blocks in field order.
+        assert_eq!(
+            record.pending,
+            vec![
+                entry("", "uptime", Some(ExtensionPoint::Job)),
+                entry("task postgres", "autoscael", Some(ExtensionPoint::Task)),
+                entry(
+                    "task postgres: port http",
+                    "dns",
+                    Some(ExtensionPoint::Port)
+                ),
+                entry(
+                    "task postgres: service",
+                    "uptime",
+                    Some(ExtensionPoint::Service)
+                ),
+                entry(
+                    "task postgres: volume data",
+                    "backup",
+                    Some(ExtensionPoint::Volume)
+                ),
+            ]
+        );
+        let warnings = record.warnings();
+        assert_eq!(
+            warnings[0],
+            "dropped unknown field `rollout.stepStager`".to_string()
+        );
+        assert!(
+            warnings.contains(
+                &"task postgres: kept `autoscael` as pending (no installed app declares it)"
+                    .to_string()
+            ),
+            "{warnings:?}"
+        );
+    }
+
+    #[test]
+    fn a_known_but_invalid_value_fails_even_with_the_flag_test() {
+        let err = JobConfig::parse_submitted(
+            json!({ "name": "web", "task": { "runtime": "noop", "count": "three", "extra": 1 } }),
+            UnknownFieldMode::Allow,
+        )
+        .map(|_| ())
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("count must be a whole number"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn pending_maps_round_trip_and_hand_written_ones_are_refused_test() {
+        let (config, _) = allowed(json!({
+            "name": "web",
+            "uptime": true,
+            "rolloutByGroup": { "web": { "minHealthyTime": "10s" } },
+            "task": {
+                "name": "web",
+                "group": "web",
+                "runtime": "noop",
+                "autoscael": true,
+                "volumes": [{ "name": "data", "backup": true }]
+            }
+        }));
+        // Legion's own serialization parses back unchanged, pending maps and
+        // `rolloutByGroup` included (it used to serialize as
+        // `rollout_by_group`, which the parser ignored).
+        let stored = serde_json::to_value(&config).expect("serialize");
+        assert_eq!(stored["pendingExtensions"], json!({ "uptime": true }));
+        assert!(stored.get("rolloutByGroup").is_some(), "{stored}");
+        let back: JobConfig = serde_json::from_value(stored.clone()).expect("round trip");
+        assert_eq!(back, config);
+        assert!(back.is_same_as(&config));
+
+        // A strict submit of that JSON is refused: `pendingExtensions` is
+        // Legion's to write.
+        let err = strict_error(stored.clone());
+        assert!(
+            err.contains("web: `pendingExtensions` holds keys Legion kept"),
+            "{err}"
+        );
+        assert!(
+            err.contains("web: task web: `pendingExtensions` holds keys"),
+            "{err}"
+        );
+        // With the flag it is accepted, and reported as pending.
+        let (resubmitted, record) = allowed(stored);
+        assert_eq!(resubmitted, config);
+        assert_eq!(record.pending.len(), 3, "{record:?}");
+        assert!(record.dropped.is_empty());
+
+        // A pending-only change is a change.
+        let (changed, _) = allowed(json!({
+            "name": "web",
+            "uptime": false,
+            "rolloutByGroup": { "web": { "minHealthyTime": "10s" } },
+            "task": {
+                "name": "web",
+                "group": "web",
+                "runtime": "noop",
+                "autoscael": true,
+                "volumes": [{ "name": "data", "backup": true }]
+            }
+        }));
+        assert!(!changed.is_same_as(&config));
+    }
+
+    #[test]
+    fn plain_deserialization_is_strict_test() {
+        let err = serde_json::from_value::<JobConfig>(json!({
+            "name": "web",
+            "task": { "name": "web", "runtime": "noop", "stop": { "kill_after": "5s" } }
+        }))
+        .unwrap_err();
+        assert!(
+            err.to_string().contains(
+                "web: task web: unknown field `stop.kill_after` (did you mean `stop.killAfter`?)"
+            ),
+            "{err}"
+        );
+    }
+
+    fn serialized_keys<T: Serialize>(value: &T) -> Vec<String> {
+        match serde_json::to_value(value).expect("serialize") {
+            Value::Object(map) => map.keys().cloned().collect(),
+            _ => Vec::new(),
+        }
+    }
+
+    /// Every key a block serializes is in its suggestion list. Run over every
+    /// shipped example (maximal.ncl sets nearly every field), so a field
+    /// added to a struct and to maximal.ncl but not to the block's `FIELDS`
+    /// fails here instead of silently missing from did-you-mean.
+    #[test]
+    fn suggestion_lists_cover_every_serialized_field_test() {
+        fn cover<T: SpecBlock + Serialize>(block: &T, what: &str, seen: &mut BTreeSet<String>) {
+            for key in serialized_keys(block) {
+                if key == "pendingExtensions" {
+                    continue;
+                }
+                assert!(
+                    T::FIELDS.contains(&key.as_str()),
+                    "{what}: `{key}` is serialized but missing from FIELDS"
+                );
+                seen.insert(format!("{what}.{key}"));
+            }
+        }
+        fn cover_opt<T: SpecBlock + Serialize>(
+            block: Option<&T>,
+            what: &str,
+            seen: &mut BTreeSet<String>,
+        ) {
+            if let Some(block) = block {
+                cover(block, what, seen);
+            }
+        }
+
+        let jobs_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("configs")
+            .join("jobs");
+        let mut vars = serde_json::Map::new();
+        vars.insert("job_name".into(), Value::from("vars-default"));
+        vars.insert("task_runtime".into(), Value::from("exec"));
+        vars.insert("task_count".into(), Value::from(1));
+        vars.insert("message".into(), Value::from("hello"));
+        vars.insert("cpu".into(), Value::from(100));
+        let mut seen = BTreeSet::new();
+        for entry in std::fs::read_dir(&jobs_dir).expect("jobs dir") {
+            let path = entry.expect("entry").path();
+            if !crate::config_lang::is_config_file(&path) {
+                continue;
+            }
+            let vars = match crate::config_lang::format_for(&path) {
+                crate::config_lang::ConfigFormat::Json => None,
+                crate::config_lang::ConfigFormat::Nickel => Some(&vars),
+            };
+            let rendered = crate::config_lang::eval_file_with_vars(&path, vars)
+                .unwrap_or_else(|err| panic!("{} should evaluate: {err:#}", path.display()));
+            let config: JobConfig = serde_json::from_str(&rendered)
+                .unwrap_or_else(|err| panic!("{} should parse: {err}", path.display()));
+
+            cover_opt(config.rollout.as_ref(), "rollout", &mut seen);
+            if let Some(slots) = config.rollout.as_ref().and_then(|r| r.slots.as_ref()) {
+                cover(slots, "rollout.slots", &mut seen);
+            }
+            for rollout in config.rollout_by_group.values() {
+                cover(rollout, "rollout", &mut seen);
+            }
+            for task in &config.tasks {
+                for key in serialized_keys(task) {
+                    if key == "pendingExtensions" {
+                        continue;
+                    }
+                    assert!(
+                        TaskConfigInput::FIELDS.contains(&key.as_str()),
+                        "task: `{key}` is serialized but missing from FIELDS"
+                    );
+                }
+                for check in &task.checks {
+                    cover(check, "checks", &mut seen);
+                }
+                cover(&task.on_unhealthy, "onUnhealthy", &mut seen);
+                cover_opt(task.restart.as_ref(), "restart", &mut seen);
+                cover_opt(task.stop.as_ref(), "stop", &mut seen);
+                cover_opt(task.disruption.as_ref(), "disruption", &mut seen);
+                if let Some(kv) = task.kv_injections.as_ref() {
+                    cover(kv, "kvInjections", &mut seen);
+                    cover_opt(kv.kv.as_ref(), "kv", &mut seen);
+                    for env in &kv.env {
+                        cover(env, "env", &mut seen);
+                        cover(&env.value, "env.value", &mut seen);
+                        cover(&env.kv, "env.kv", &mut seen);
+                    }
+                    for file in &kv.files {
+                        cover(file, "files", &mut seen);
+                        cover(&file.file, "files.file", &mut seen);
+                        cover(&file.kv, "files.kv", &mut seen);
+                    }
+                }
+                if let Some(network) = task.network.as_ref() {
+                    cover::<NetworkConfig>(network, "network", &mut seen);
+                    for port in &network.ports {
+                        cover::<PortConfig>(port, "port", &mut seen);
+                        if let Some(tls) = port.tls.as_ref() {
+                            cover::<PortTls>(tls, "port.tls", &mut seen);
+                            cover_opt(tls.clients.as_ref(), "port.tls.clients", &mut seen);
+                        }
+                    }
+                }
+                cover_opt::<ServiceConfig>(task.service.as_ref(), "service", &mut seen);
+                if let Some(connect) = task.connect.as_ref() {
+                    cover::<ConnectConfig>(connect, "connect", &mut seen);
+                    for template in &connect.templates {
+                        cover::<ConnectTemplate>(template, "connect.templates", &mut seen);
+                    }
+                    for upstream in &connect.upstreams {
+                        cover::<UpstreamConfig>(upstream, "upstream", &mut seen);
+                        for credential in &upstream.credentials {
+                            cover(credential, "upstream.credentials", &mut seen);
+                        }
+                        if let Some(http) = upstream.http.as_ref() {
+                            cover::<UpstreamHttpConfig>(http, "upstream.http", &mut seen);
+                            cover_opt(http.retries.as_ref(), "upstream.http.retries", &mut seen);
+                            for split in &http.split {
+                                cover(split, "upstream.http.split", &mut seen);
+                            }
+                        }
+                    }
+                }
+                for identity in &task.identities {
+                    cover(identity, "identities", &mut seen);
+                    cover_opt(identity.file.as_ref(), "identities.file", &mut seen);
+                }
+                if let Some(stateful) = task.stateful.as_ref() {
+                    cover(stateful, "stateful", &mut seen);
+                    cover_opt(stateful.storage.as_ref(), "stateful.storage", &mut seen);
+                    cover_opt(stateful.on_lost.as_ref(), "stateful.onLost", &mut seen);
+                    cover_opt(stateful.envelope.as_ref(), "stateful.envelope", &mut seen);
+                    cover_opt(stateful.promote.as_ref(), "stateful.promote", &mut seen);
+                }
+                for volume in &task.volumes {
+                    cover(volume, "volumes", &mut seen);
+                }
+                for artifact in &task.artifacts {
+                    // `pinnedFrom`/`authOrigin` are written by admission,
+                    // never by hand, so they are not suggested.
+                    for key in serialized_keys(artifact) {
+                        assert!(
+                            ArtifactSpec::FIELDS.contains(&key.as_str())
+                                || key == "pinnedFrom"
+                                || key == "authOrigin",
+                            "artifacts: `{key}` is serialized but missing from FIELDS"
+                        );
+                    }
+                    cover_opt(artifact.auth.as_ref(), "artifacts.auth", &mut seen);
+                }
+                for action in &task.actions {
+                    cover(action, "actions", &mut seen);
+                    for param in &action.params {
+                        cover(param, "actions.params", &mut seen);
+                    }
+                }
+                cover_opt(
+                    task.speculative_start.as_ref(),
+                    "speculativeStart",
+                    &mut seen,
+                );
+                cover_opt(task.snapshots.as_ref(), "snapshots", &mut seen);
+                if let Some(suspend) = task.suspend.as_ref() {
+                    cover(suspend, "suspend", &mut seen);
+                    cover_opt(suspend.idle.as_ref(), "suspend.idle", &mut seen);
+                    cover_opt(suspend.wake.as_ref(), "suspend.wake", &mut seen);
+                }
+            }
+        }
+        // The examples really do exercise the nested blocks.
+        for key in [
+            "stop.signal",
+            "stateful.storage.path",
+            "volumes.name",
+            "port.name",
+        ] {
+            assert!(seen.contains(key), "no example sets {key}: {seen:?}");
+        }
+    }
+}

@@ -82,6 +82,7 @@ mod session_integration;
 mod snapshot_integration;
 mod spread_under_raft;
 mod suspend_integration;
+mod unknown_fields;
 mod volume_integration;
 mod wake_integration;
 mod work_stream;
