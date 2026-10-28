@@ -69,7 +69,6 @@ fn base_cli() -> Command {
         .subcommand(template::config())
         .subcommand(instance::config())
         .subcommand(node::config())
-        .subcommand(scaling::config())
         .subcommand(start::config())
         .subcommand(join_token::config())
         .subcommand(boot_ticket::config())
