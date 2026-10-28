@@ -56,7 +56,6 @@ async fn main() -> R<()> {
         Some(("template", sub_matches)) => cmd::template::handle(sub_matches).await?,
         Some(("instance", sub_matches)) => cmd::instance::handle(sub_matches).await?,
         Some(("node", sub_matches)) => cmd::node::handle(sub_matches).await?,
-        Some(("scaling", sub_matches)) => cmd::scaling::handle(sub_matches).await?,
         Some(("join-token", sub_matches)) => cmd::join_token::handle(sub_matches).await?,
         Some(("boot-ticket", sub_matches)) => cmd::boot_ticket::handle(sub_matches).await?,
         Some(("sandbox", sub_matches)) => cmd::sandbox::handle(sub_matches).await?,
