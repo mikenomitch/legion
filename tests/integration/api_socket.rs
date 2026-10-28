@@ -68,7 +68,10 @@ async fn manager() -> R<(String, String, String)> {
     Ok((address, admin, other))
 }
 
-async fn whoami(client: &mut ManagerClient<tonic::transport::Channel>, token: Option<&str>) -> R<String> {
+async fn whoami(
+    client: &mut ManagerClient<tonic::transport::Channel>,
+    token: Option<&str>,
+) -> R<String> {
     let mut request = tonic::Request::new(WhoAmIRequest {});
     if let Some(token) = token {
         request
@@ -96,7 +99,11 @@ async fn the_socket_proxies_calls_with_the_allocations_token_test() -> R<()> {
         .join("workers/legion-system-x8f2k1qz/allocs/1234567/a-task-with-a-long-name");
     std::fs::create_dir_all(&task_dir)?;
     let socket = serve(context, 1234567, &task_dir, Some(admin.clone()))?;
-    assert!(socket.path().as_os_str().len() > 108, "{}", socket.path().display());
+    assert!(
+        socket.path().as_os_str().len() > 108,
+        "{}",
+        socket.path().display()
+    );
     assert_eq!(socket.path(), task_dir.join("secrets/legion.sock"));
 
     let mut client = ManagerClient::new(unix_socket_channel(
@@ -197,17 +204,17 @@ fn another_allocations_process_is_refused_by_the_peer_cgroup_check_test() -> R<(
             );
             let out = Command::new("sh")
                 .args(["-c", &script])
-                .env(
-                    "LEGION_ADDR",
-                    format!("unix://{}", socket.path().display()),
-                )
+                .env("LEGION_ADDR", format!("unix://{}", socket.path().display()))
                 .env("LEGION_CONNECT_TIMEOUT", "3")
                 .env_remove("LEGION_TOKEN")
                 .output()?;
             Ok(out.status.success())
         };
         assert!(connect_from("share/legion-7")?, "its own leaf");
-        assert!(!connect_from("share/legion-8")?, "another allocation's leaf");
+        assert!(
+            !connect_from("share/legion-8")?,
+            "another allocation's leaf"
+        );
         Ok::<_, anyhow::Error>(())
     });
     for leaf in ["share/legion-7", "share/legion-8", "share", ""] {
@@ -407,7 +414,10 @@ $L kv put certs/result "addr=$LEGION_ADDR other=$other login=$login same=$same g
     let mut result = String::new();
     cluster.wait_for("the task to report through its socket", || {
         let got = cluster.cli_json(&["kv", "get", "certs/result"]);
-        result = got["data"]["value"].as_str().unwrap_or_default().to_string();
+        result = got["data"]["value"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
         !result.is_empty()
     });
     assert!(result.contains("addr=unix://"), "{result}");
