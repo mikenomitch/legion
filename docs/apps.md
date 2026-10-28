@@ -50,9 +50,13 @@ The **autoscaler** acts on every task with `autoscale` in its jobspec
 the cluster-wide scaling inputs once per interval, and writes counts through
 `ScaleTask`, reporting each evaluation back to the manager. Its grant is
 `scale:read` and `scale:write` in every namespace: it can resize, not
-redeploy. Its config takes `interval` (default `"15s"`) and `mode`
-(`"dry-run"` forces every policy into dry-run). When it stops reporting,
-`legion scaling status` says `NOT RUNNING`.
+redeploy. Its config takes `interval` (default `"15s"`), `mode`
+(`"dry-run"` forces every policy into dry-run), and `plugins`, the metric
+sources, strategies, and targets the operator installs for policies to name
+([autoscaling.md, "Plugins"](autoscaling.md#plugins)). Every plugin field but
+`namespaces` is a code field (an `exec` target's command and a source's
+address live in `config`): changing one changes what the app runs or
+reaches, so it needs the app's whole grant. When it stops reporting, `legion scaling status` says `NOT RUNNING`.
 
 **Installed apps** come from a manifest file or URL (`legion app install`).
 They carry their own `version`, run their own code (an artifact or an image,

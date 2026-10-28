@@ -256,7 +256,7 @@ async fn wait_for_evaluation(
 
 #[derive(Tabled)]
 struct ListRow {
-    #[tabled(rename = "NAME / TARGET")]
+    #[tabled(rename = "POLICY")]
     id: String,
     #[tabled(rename = "KIND")]
     kind: String,

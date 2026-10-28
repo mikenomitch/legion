@@ -440,6 +440,7 @@ start:
 - **Running workloads:** [Task Runtimes](docs/task-runtime-plugins.md) ·
   [Artifacts](docs/artifacts.md) · [Rollouts](docs/rollouts.md) ·
   [Autoscaling](docs/autoscaling.md) ·
+  [Autoscaling Plugins](docs/autoscaling-plugins.md) ·
   [Gang Scheduling](docs/gang-scheduling.md) ·
   [Task Supervision](docs/task-supervision.md) ·
   [Resource Enforcement](docs/resource-enforcement.md)

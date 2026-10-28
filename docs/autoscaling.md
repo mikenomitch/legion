@@ -13,8 +13,17 @@ Legion scales tasks two ways:
 
 Both read the same cluster-wide measurements, [scaling inputs](#scaling-inputs),
 and both write the same count override, so the scheduler, rollouts, and
-quotas see one desired count. Node autoscaling (adding and removing
-machines) is not built; see [Known limitations](#known-limitations).
+quotas see one desired count.
+
+Beyond Legion's own measurements, a policy can scale on a Prometheus query,
+an HTTP endpoint, or a [plugin](#plugins) the operator installs, and go to
+zero replicas when idle ([Scale to zero](#scale-to-zero)). Something that
+is not a Legion task (a render farm, a fleet of VMs) gets a
+[standalone policy](#standalone-policies) with a target plugin.
+`legion scaling simulate` runs any policy over the last hour of history
+before you submit it ([Simulating a policy](#simulating-a-policy)). Node
+autoscaling (adding and removing machines) is not run yet; see
+[Known limitations](#known-limitations).
 
 ## Task autoscaling
 
@@ -224,8 +233,9 @@ autoscale = {
   | `service.rps`, `service.errors` | requests and errors per second into the service the task backs (internal callers only) |
   | `service.latency_ms.mean`, `service.latency_ms.max` | its latency |
 
-  A `service.*` query needs a `service` block on the task. Any other source
-  name is refused at submit: `legion` is the only source in this version.
+  A `service.*` query needs a `service` block on the task. Other sources
+  (Prometheus, HTTP, plugins) are installed by the operator and named by
+  the check's `source`: see [Sources](#sources).
 - **Strategies** turn a check's reading into a desired count:
   `target-value` (`{ name = "target-value", target = 0.7 }`, the HPA formula
   `ceil(current x reading / target)` with the tolerance band and the warmup
@@ -233,9 +243,13 @@ autoscale = {
   (`{ value = 500 }`: `ceil(reading / value)`), `threshold`
   (`{ steps = [{ above, add }] }`: the current count plus the `add` of the
   highest step the reading exceeds), `pass-through` (the reading is the
-  count), and `fixed` (`{ value = N }`, reads nothing).
+  count), and `fixed` (`{ value = N }`, reads nothing). Any other `name` is
+  a strategy [plugin](#plugins) the operator installed; the rest of the
+  record is its config.
 - **Merge** is the maximum over checks with data. A `scaleIn = false` check
   counts only when it wants more than the current count.
+- **`activation`** (a number) on a check makes it one that can wake a
+  `min = 0` target, and put it to sleep ([Scale to zero](#scale-to-zero)).
 - **Schedules** are five-field crontab (`0 8 * * 1-5` is Monday to Friday at
   08:00) in an IANA `timezone` (default UTC), open for `for` (at most 7
   days). They only raise `min` or lower `max`; a schedule floor above the
@@ -252,16 +266,121 @@ error: web/default/web: autoscale needs measured usage, and runtime 'noop' does 
   `legion` query (task.unplaced, service.*), or remove autoscale
 error: web/default/web: count 2 is above autoscale.max = 1 (from jobspec). Hint: raise
   max in the task's autoscale record, or lower count
-error: web/default/web: autoscale.min = 0 (scale to zero) is not supported: nothing
-  could wake the task again. Hint: set min >= 1
+error: web/default/web: autoscale.min = 0 needs a check that can wake it from zero; 'cpu'
+  reads the task's own usage, which is empty at 0 replicas. Hint: add a check with
+  `activation` on an external source or a schedule, or set min >= 1
 ```
 
 Also refused: `autoscale` on a keyed stateful task, a `count.per` task, or a
 batch or scheduled task; two autoscaled tasks in one group, or group
 members with different counts; a gang task whose floor is below its
-quorum (`gang.min`); an unknown source or `legion` query; `activation`.
+quorum (`gang.min`); an unknown `legion` query; a source or strategy
+plugin that is not installed, or not open to the job's namespace
+([Sources](#sources)).
 Leaving `resources.cpu` unset is a warning, not an error: the task is then
 measured against the default reservation.
+
+### Sources
+
+A check reads one **source**. Four kinds exist:
+
+| Source | Installed | `query` is | Window |
+| --- | --- | --- | --- |
+| `legion` | always | one of the fixed vocabulary above | averaged by the autoscaler over the check's `window` |
+| a `prometheus` builtin | by the operator, `{ builtin = "prometheus", config = { address } }` | PromQL that returns one series (`sum(...)`, `max(...)`) | with a `window`, a range query over it (about 12 points) averaged; an instant query otherwise |
+| an `http` builtin | by the operator, `{ builtin = "http", config = { url } }` | a JSON pointer into the document at `url` (`/queue/depth`; empty: the document is the number) | averaged by the autoscaler, like `legion` |
+| a plugin | by the operator ([Plugins](#plugins)) | whatever the plugin defines | the plugin's `value` is taken as averaged; a `series` is averaged by the autoscaler |
+
+```nickel
+autoscale = {
+  min = 1,
+  max = 20,
+  checks = [{
+    name = "lag",
+    source = "team-prom",            # installed in the autoscaler's app config
+    query = "sum(kafka_consumergroup_lag{group=\"ingest\"})",
+    window = "2m",
+    strategy = { name = "per-replica", value = 500 },
+  }],
+}
+```
+
+A policy names a source; it never carries an address. The operator decides
+which sources exist and which namespaces may use each one
+([Plugins](#plugins)), so a submit naming a source that is not installed,
+or one closed to the job's namespace, is refused:
+
+```
+error: payments-prod/api/default/api: check 'lag' uses source 'team-prom', which is not
+  available to namespace payments-prod (allowed: analytics-*)
+error: web/default/web: check 'lag' uses source 'team-prom', which is not installed. Hint:
+  the operator installs plugins in the autoscaler's app config (`legion app config set
+  autoscaler`); no source plugin is installed for namespace default; the `legion` source
+  needs no install
+```
+
+`legion job validate` cannot see the installed plugins, so it checks
+everything else offline; `legion job plan` and `legion job run` check
+these too.
+
+Each distinct `(source, query, window)` is read once per evaluation, however
+many policies share it. A source that times out (10 seconds), errors, or
+returns no series makes the check **missing**: it votes nothing, and nothing
+scales in while it lasts (`onMissing = "hold"`). Its message is in `legion
+scaling explain` and a `scale.check_failed` event.
+
+### Scale to zero
+
+`min = 0` lets a target sleep at zero replicas. It needs a check that can
+wake it: a check with `activation`, on a source that has data at zero
+replicas (a queue, an external count), or a schedule with `min >= 1`. A
+policy without one is refused, because nothing could ever wake it:
+
+```
+error: web/default/web: autoscale.min = 0 needs a check that can wake it from zero; 'cpu'
+  reads the task's own usage, which is empty at 0 replicas. Hint: add a check with
+  `activation` on an external source or a schedule, or set min >= 1
+```
+
+```nickel
+autoscale = {
+  min = 0,
+  max = 30,
+  checks = [{
+    name = "lag",
+    source = "team-prom",
+    query = "sum(kafka_consumergroup_lag{group=\"ingest\"})",
+    strategy = { name = "per-replica", value = 500 },
+    activation = 1,           # above 1 queued message, the worker is awake
+  }],
+  down = { stabilize = "10m" },
+}
+```
+
+It follows KEDA's split:
+
+- **At zero, only activation checks vote.** When any reads above its
+  `activation`, the target wakes to what that check's strategy wants (at
+  least 1); the step limit and the bounds apply as for any scale-out. The
+  `cpu` and `memory` shorthands and other checks are silent at zero: there
+  is nothing to measure.
+- **From 1 up, every check votes** as usual.
+- **Going to sleep** uses the scale-in path: the target reaches zero only
+  when every activation check reads at or below its `activation`, through
+  the `down.stabilize` window and the scale-in step limit. Missing data is
+  never idle: a source that stops answering holds the count.
+- `count` is still the starting size, and must be at least 1; the target
+  sleeps once its activation checks say so.
+
+A task at zero has no allocations; `legion scaling status` shows it at
+`0` with its bounds. Nothing wakes a request-serving `service` on its first
+request: the gateway holds requests only for keyed instances
+([gateway.md](gateway.md)), so a `service` at zero refuses connections
+until a check wakes it. Wake it from a signal that exists while it sleeps
+(a queue, a schedule). Suspend and resume (`suspend.wake` on keyed
+instances, [suspend-and-resume.md](suspend-and-resume.md)) are a different
+mechanism for a different kind of task: keyed tasks cannot be autoscaled,
+so the two never meet.
 
 ### Groups
 
@@ -422,9 +541,65 @@ $ legion scaling history web
   bound or guard starts holding the count), `scale.flapping`, and
   `scale.check_failed` (a check lost its data) ([event-stream.md](event-stream.md)).
   There is no event per evaluation.
-- **MCP**: `legion_scaling_status`, `legion_scaling_explain`, and
-  `legion_scaling_history` (read-only), `legion_scaling_pause`
-  (write-gated) ([agent-readiness.md](agent-readiness.md)).
+- **MCP**: `legion_scaling_status`, `legion_scaling_explain`,
+  `legion_scaling_history`, and `legion_scaling_simulate` (read-only);
+  `legion_scaling_pause` and `legion_scaling_apply` (write-gated)
+  ([agent-readiness.md](agent-readiness.md)).
+
+### Simulating a policy
+
+`legion scaling simulate` runs a policy over recent history, or a CSV
+series, and prints the decisions it makes. Nothing is written.
+
+```console
+$ legion scaling simulate web                     # the live policy, last hour
+$ legion scaling simulate web.ncl --since 30m     # the policy you are about to submit
+$ legion scaling simulate web.ncl --series load.csv
+$ legion scaling simulate render-farm.ncl --series queue.csv   # a standalone policy
+
+$ legion scaling simulate web
+web/default/web: replay 360 evaluation(s) from 13:02 UTC to 14:02 UTC (history), policy 9c1e04aa61f2
+ TIME      | CHANGE | KIND    | SUMMARY
+-----------+--------+---------+--------------------------------------------------
+ 13:31 UTC | 4 → 6  | applied | cpu 0.91 vs 0.70 (4 ready)
+ 13:44 UTC | 6 → 5  | applied | cpu 0.41 vs 0.70 (6 ready); rate-limited from 4
+```
+
+- **The target** is a job (its live policy), a jobspec file (resolved with
+  `legion job plan`, so the layered defaults apply exactly as on submit), or
+  a standalone policy file (resolved with `legion scaling apply --dry-run`).
+- **History** is the hour of 10-second points the status-lane leader keeps
+  for each task ([Scaling inputs](#scaling-inputs)), with the task's count,
+  healthy and unplaced replicas, and the `legion` source's readings. Each
+  check's readings are averaged over its `window` the way the live
+  autoscaler averages them.
+- **Two modes.**
+  - `--replay` (the default for a job): the count is what the target really
+    had, and readiness comes from its real healthy replicas through the
+    warmup rule. The policy's own decisions spend the step limits when it
+    makes them, and every other change of the count (a person's scale, a
+    pin, the live autoscaler) when it is seen, as the live engine does. Run
+    against the live policy, a replay makes the decisions the live
+    autoscaler made in that hour (`legion scaling history`).
+  - `--follow` (the default for a file and for `--series`): the count moves
+    with the policy's own decisions, new replicas warm for `warmup`, and
+    over history the `legion` utilizations are rescaled to the simulated
+    count (the load is conserved: twice the replicas at half the
+    utilization). This answers "what would this policy have done?".
+- **The engine is warm** by default (one `down.stabilize` of samples behind
+  it); `--cold` simulates a fresh start, with its scale-in hold.
+- **CSV** (`--series`): a header with `time` (unix seconds or RFC 3339),
+  optional `ready` and `total`, and one column per check by name; an empty
+  cell is missing data. The readings are taken as the policy's (already
+  averaged).
+- `--all` shows every evaluation, held ones too, and `--json` the decisions
+  with every stage.
+
+What a simulation does not see: checks on sources other than `legion` over
+history (they read as missing; supply them with `--series`), plugin
+strategies (missing too), pins, pauses, rollouts, and the namespace quota.
+History covers at most the last hour, from when the answering manager took
+the status lane, and only tasks with usage or `autoscale`.
 
 ### Where it runs
 
@@ -438,7 +613,8 @@ identity being on by default makes available on a fresh cluster
 and `scale:write` in every namespace: it can resize, not redeploy.
 
 It watches policies (`WatchScalingPolicies`: a full set whenever a job,
-the defaults, or a namespace policy changes), reads every target's inputs
+a standalone policy, a pause, the defaults, a namespace policy, or its own
+app config changes), reads every target's inputs
 in one batched `GetScalingInputs` per interval, evaluates, writes, and
 reports (`ReportScalingStatus`, which is also its heartbeat). Its config
 (`legion app config set autoscaler -f config.ncl`):
@@ -447,6 +623,7 @@ reports (`ReportScalingStatus`, which is also its heartbeat). Its config
 | --- | --- | --- |
 | `interval` | `"15s"` | How often every policy is evaluated. |
 | `mode` | `"enforce"` | `"dry-run"` forces every policy into dry-run: a cluster-wide trial. |
+| `plugins` | `{}` | The installed sources, strategies, and targets beyond the built-ins ([Plugins](#plugins)). |
 
 **When the app is gone, the manager says so.** With no report for three of
 the app's intervals, `legion scaling status` reads
@@ -455,6 +632,156 @@ active, 0 allocation(s) placed): nothing is being autoscaled`, and every
 target reads `stale`. A disabled app reads `disabled`. Nothing scales while
 the app is down; nothing else is affected.
 
+## Plugins
+
+Sources, strategies, and targets beyond the built-ins are **plugins**:
+programs (or URLs) that speak a small JSON-RPC protocol, `legion-scaling/1`.
+Writing one is in [autoscaling-plugins.md](autoscaling-plugins.md).
+
+**The operator installs them** in the autoscaler's app config:
+
+```nickel
+# legion app config set autoscaler -f autoscaler.ncl
+{
+  plugins = {
+    team-prom = {
+      builtin = "prometheus",
+      config = { address = "http://prometheus.internal:9090" },
+      namespaces = ["payments-*"],      # only policies in these namespaces
+    },
+    calendar = {
+      source = "https://example.com/calendar-strategy-0.1.0.tar.gz",
+      checksum = "sha256:9f1c…",
+      command = ["python3", "calendar_strategy.py"],
+      config = { windows = [{ start = "02:00", end = "03:30" }] },
+    },
+    forecast = { url = "http://forecast.internal:8080/rpc" },
+  },
+}
+```
+
+| Field | Meaning |
+| --- | --- |
+| `builtin` | `prometheus`, `http` (sources), `exec`, `noop` (targets) |
+| `source` | an artifact URL; the app's job fetches it into its task directory at `code/plugins/<name>/` (archives unpacked) |
+| `checksum` | `sha256:<hex>` of the artifact |
+| `command` | the program and its arguments; with `source`, relative paths resolve in the plugin's directory. Default `./<name>` |
+| `url` | a plugin served over HTTP: each request is a POST |
+| `config` | the plugin's own settings, sent once at start (addresses, regions, request headers). Stored as written: anyone with `app:read` on the autoscaler can read it |
+| `namespaces` | names or `*`-globs of the namespaces whose policies may use it; default every namespace |
+
+Exactly one of `builtin`, `source`/`command`, or `url`. A plugin may not be
+named `legion`, `noop`, or after a built-in strategy. A config with a
+mistake (an unknown builtin, a missing `address`, a bad checksum) is
+refused by `legion app config set`. Changing the plugins re-renders the
+app's job, which restarts it. Every plugin field but `namespaces` is a code
+field (`source`, `command`, `url`, `builtin`, and `config`, which holds an
+`exec` target's command and a source's address): changing one changes what
+the app runs or reaches, so it needs the app's whole grant
+([apps.md](apps.md)).
+
+**Policies name plugins**: a check's `source`, a strategy's `name`, a
+standalone policy's `target.plugin`. A policy never carries a command or a
+URL. That is the trust boundary:
+
+- Plugins run inside the autoscaler, with its identity, which can resize
+  every job. A tenant who could name a command could run code as that
+  identity; one who could name a URL could aim the autoscaler's network
+  position at internal endpoints. Tenants supply only data: a query, a
+  target value, a config record checked against the plugin's schema.
+- **A shared source answers any query its tenants write.** A tenant's
+  Prometheus query runs against everything that Prometheus can see; its
+  only output is a number that moves their own count, but it is a side
+  channel. Give each tenant group its own source (with `namespaces`) if
+  their metrics must not mix.
+
+**At run time** the autoscaler starts each program plugin on first use and
+keeps it running, with a 10-second timeout per call (120 seconds for
+targets), restarts with backoff when it crashes or times out, and logs
+calls with credentials redacted. Before a policy's config reaches a plugin
+it is checked against the plugin's `policyConfigSchema`; a policy that
+fails it, or that uses a plugin as a kind it does not implement, is held
+`invalid`, with the reason in `legion scaling explain` and a
+`scale.check_failed` event. A plugin that is not answering makes its checks
+missing data (a source, a strategy) or its target `error`.
+
+## Standalone policies
+
+A policy whose target is not a Legion task is its own object: `legion
+scaling apply` stores it, versioned, on the Control lane, and the
+autoscaler runs it next to the task policies.
+
+```nickel
+# legion scaling apply render-farm.ncl
+{
+  name = "render-farm",
+  namespace = "media",                 # default: -n, else `default`
+  description = "GPU render workers",
+  target = { plugin = "render-exec", config = { pool = "gpu" } },
+  min = 0,
+  max = 50,
+  checks = [{
+    name = "queue", source = "team-prom", query = "sum(render_queue_depth)",
+    strategy = { name = "per-replica", value = 10 }, activation = 0,
+  }],
+  down = { stabilize = "10m" },
+  mode = "dry-run",
+}
+```
+
+```console
+$ legion scaling apply render-farm.ncl --dry-run
+scaling policy media/render-farm: would be created; dry run, nothing written
+$ legion scaling apply render-farm.ncl --wait
+scaling policy media/render-farm: created (v1)
+autoscaler: dry-run: queue 120 / 10 per replica
+$ legion scaling list -n media
+ POLICY                 | KIND     | NAMESPACE | MODE    | BOUNDS | TARGET
+------------------------+----------+-----------+---------+--------+--------------------
+ media/encode/default/x | task     | media     | enforce | 2..8   | job media/encode
+ media/render-farm      | external | media     | dry-run | 0..50  | plugin render-exec
+$ legion scaling explain render-farm -n media --standalone
+$ legion scaling history render-farm -n media --standalone
+$ legion scaling pause render-farm -n media --standalone --for 1h
+$ legion scaling delete render-farm -n media
+```
+
+- **The record** is the `autoscale` record (checks, `up`, `down`, `headroom`,
+  `warmup`, `tolerance`, `window`, `schedule`, `onMissing`, `mode`) plus
+  `name`, `namespace`, `description`, and `target`. `min`, `max`, and
+  `checks` are required: `min` and `max` are replica counts (there is no
+  `count` for `"Nx"`), and `cpu`, `memory`, and `legion` queries read a
+  task's own usage, which an external target has none of. The fields it
+  leaves out take the layered defaults like a task's (cluster defaults,
+  then the namespace's policies), live.
+- **The target** is a target plugin: `noop` (built in: it records
+  decisions and events and changes nothing), an `exec` builtin, or an
+  installed plugin. `target.config` is passed to it as data. Each
+  evaluation asks the target for its count (`target/status`); a change is
+  recorded in the policy's history first (so a pause refuses it on the
+  server) and then made (`target/scale`). A failed `target/scale` adds a
+  `failed` history row and reports `error`.
+- **`--dry-run`** validates, resolves, and diffs against the stored version
+  (`max: 10 -> 20`) without writing. Applying an unchanged file writes
+  nothing and keeps the version. **`--wait`** waits until the autoscaler
+  has evaluated the new version and reports what it found: the plugin's
+  kind and schema are checked only there.
+- **History, pauses, status** work as for tasks, with `--standalone` on
+  `explain`, `history`, `pause`, and `resume` naming the policy instead of
+  a job. `legion scaling status` lists standalone policies with tasks
+  (kind `external`). `pause --all` covers them too. Deleting a policy
+  deletes its pause; its history stays until the cap ages it out.
+- **Node groups** (`target = { nodes = … }`) are standalone policies too,
+  cluster-scoped, needing `operator:write` and `node:write`. They are not
+  run yet: `scaling apply` refuses one, and `legion scaling demand -f`
+  sizes it ([Capacity demand](#capacity-demand)).
+
+The `exec` builtin runs one command per operation, volume-driver style: the
+operation (`status`, `scale`) appended to the command (a script's `$1`), a JSON request on
+stdin (`{ "apiVersion": 1, "op": "scale", "policy": "media/render-farm",
+"config": { "pool": "gpu" }, "desired": 9, "decision": "d-81f3a2c0" }`), and
+a JSON reply on stdout (`status` answers `{ "count": 7, "ready": 7 }`). The
+command comes from the app config, never the policy.
 ## Scaling by hand
 
 `legion job scale` changes how many copies of a task run. It does not create a
@@ -854,12 +1181,22 @@ a job without the right to redeploy it. See [auth-and-acls.md](auth-and-acls.md)
 | --- | --- |
 | `ScaleTask` (`legion job scale`) | `scale:write` on the job |
 | `GetJobScaleStatus`, `GetScalingInputs` | `scale:read` on the job |
-| `WatchScalingPolicies` | `scale:read`; jobs outside the grant are left out |
-| `GetScalingStatus`, `GetScaleHistory` | `scale:read` on the job(s) |
-| `PauseScaling` | `scale:write` on the job; `operator:write` for `--all` |
+| `WatchScalingPolicies` | `scale:read`; jobs and policies outside the grant are left out |
+| `GetScalingStatus`, `GetScaleHistory` | `scale:read` on the job(s) or the standalone policy |
+| `PauseScaling` | `scale:write` on the job or the standalone policy; `operator:write` for `--all` |
+| `ApplyScalingPolicy` (`legion scaling apply`) | `scale:write` on the policy's namespace and name; a node group: `operator:write` and `node:write` |
+| `DeleteScalingPolicy` | `scale:write` on the policy, checked before the lookup |
+| `ListScalingPolicies` | `scale:read`; policies outside the grant are left out |
 | `GetScalingDefaults` | `scale:read` on the namespace |
 | `ApplyScalingDefaults` | `operator:write` |
 | `ReportScalingStatus`, `RecordScalingAction` | app-plane: only the bundled autoscaler's own identity (or a management token) |
+
+A standalone policy is scoped like a job of the same name in its
+namespace: a rule with `names = ["render-*"]` on `scale` covers the
+`render-farm` policy. Using a plugin is not an ACL: the plugin's
+`namespaces` allowlist in the autoscaler's app config decides which
+namespaces' policies may name it ([Plugins](#plugins)), and installing one
+is changing that app config ([apps.md](apps.md)).
 
 The app-plane RPCs accept a credential only when its job grant belongs to an
 allocation of `legion-system/autoscaler`, so a person with `scale:write`
@@ -874,8 +1211,13 @@ is trusted, as everywhere else.
 - Events: `scale.applied`, `scale.deferred`, `scale.reset`,
   `scale.pinned`, `scale.paused`, `scale.resumed`, `scale.limited`,
   `scale.flapping`, and `scale.check_failed` in the event stream
-  ([event-stream.md](event-stream.md)). The event journal is capped and
-  best-effort; the durable record is the history.
+  ([event-stream.md](event-stream.md)). A standalone policy's events carry
+  `policy` in their metadata instead of a job. The event journal is capped
+  and best-effort; the durable record is the history.
+- The autoscaler's own log: `Scaling plugin started` (name, version,
+  kinds) on every start of a plugin program, `Scaling plugin call failed`
+  on a timeout, crash, or malformed reply, and each call at `debug` with
+  credentials redacted (`legion app logs autoscaler`).
 - `legion scaling status | explain | history` and `legion job scale <name>`
   (see above).
 - `legion_scaling_rollup_syncs_total{outcome}` counts each manager's rollup
@@ -927,6 +1269,25 @@ is trusted, as everywhere else.
   `failed_precondition` envelope with the leader hint. `GetScalingInputs`,
   `GetScalingStatus`, and `ReportScalingStatus` are answered by the
   status-lane leader the same way.
+- **A check reads `missing data` with a plugin's message**: the source timed
+  out (10 seconds), answered an error, or returned no data; a Prometheus
+  query that returns several series says so (`the query returned 3 series;
+  a check needs one number. Hint: aggregate it, as in sum(...) or
+  max(...)`), and an `http` source names the JSON pointer
+  that found nothing. Nothing scales in while it lasts.
+- **A policy reads `invalid` naming a plugin**: the plugin is not installed
+  (the app config changed after the submit), is closed to the namespace,
+  does not implement the kind the policy uses, or the policy's config does
+  not match the plugin's `policyConfigSchema`. `legion scaling explain`
+  prints which.
+- **A plugin that keeps failing**: it is restarted with backoff (up to a
+  minute between starts); its last stderr lines are in the error. Test it
+  with `legion scaling plugin test`.
+- **A standalone policy reads `error`**: its target's `target/status` or
+  `target/scale` failed. A failed scale is a `failed` row in `legion scaling
+  history --standalone NAME`; the next evaluation asks the target again.
+- **`legion scaling apply` refuses a node group** (`failed_precondition`):
+  node-group policies are not run in this version.
 - **Inputs that read `missing` for a task that is running**: its runtime
   reports no usage (`noop`, third-party runtimes), its workers have
   `resourceEnforcement` off, or the manager its workers report to cannot
@@ -935,15 +1296,27 @@ is trusted, as everywhere else.
 
 ## Known limitations
 
-- **One metric source.** Checks read the `legion` source only. Prometheus
-  and HTTP sources, external plugins, and standalone scaling policies for
-  other targets are not built.
-- **No scale to zero.** `min = 0` is refused, and so is `activation`.
+- **No wake on request.** A `min = 0` service wakes only from a check (a
+  queue, a schedule); its first request is refused, not held, while it is
+  at zero.
+- **Plugins run inside the autoscaler.** They share its single process and
+  its identity's network position; a slow plugin delays the evaluations
+  that use it (each call is bounded by its timeout). Calls to one program
+  plugin are serialized.
+- **Simulation sees only Legion's history.** Over history, checks on other
+  sources and plugin strategies read as missing (supply them with
+  `--series`), and pins, pauses, rollouts, and quotas are not replayed.
+- **The `noop` target keeps its count in the autoscaler's memory**: it
+  restarts at the policy's `min`.
+- **No secret references in plugin config.** A Prometheus `Authorization`
+  header or a plugin's API key in the app config is stored as written and
+  readable with `app:read` on the autoscaler; the autoscaler redacts it
+  from its own logs only.
 - **No node autoscaling.** A scale-out that does not fit waits for capacity
   like any other placement. `GetCapacityDemand` (`legion scaling demand`)
   reports how many nodes of a given shape would host it, and join tokens
   take `max_uses` and `attributes` for node groups, but nothing acts on
-  that demand yet.
+  that demand yet: `legion scaling apply` refuses a node-group policy.
 - **Governed runtimes only.** CPU and memory come from `exec`, `container`,
   and `sandbox` tasks on workers with resource enforcement on.
 - **Requests count internal callers only**

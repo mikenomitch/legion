@@ -17,7 +17,8 @@ Install it in the autoscaler's app config, then name it from a policy:
 
 Inside a window (from `lead` before `start` until `end`, UTC) it wants
 `replicas`; outside it wants 0, which a `scaleIn = false` check never
-counts, so other checks decide.
+counts, so other checks decide. A window may cross midnight (`22:00` to
+`02:00`), and one that ends where it starts lasts all day.
 """
 
 import datetime

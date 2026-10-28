@@ -40,7 +40,10 @@ pub fn plugin_command() -> Command {
                         .trailing_var_arg(true)
                         .allow_hyphen_values(true)
                         .value_name("COMMAND | URL")
-                        .help("The plugin program and its arguments, or an http(s):// URL"),
+                        .help(
+                            "The plugin program and its arguments, or an http(s):// URL. Put \
+                             the options first: everything from the command on is its own",
+                        ),
                 )
                 .arg(
                     Arg::new("config")

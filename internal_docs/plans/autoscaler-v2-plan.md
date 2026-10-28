@@ -10,9 +10,16 @@ pauses, history, `legion scaling`, workload identity on by default) shipped
 2026-10-28, and so did Phase 5a, node autoscaling's substrate (join tokens
 with `max_uses` and `attributes`, `legion join --attr`, `ForgetNode`,
 `GetCapacityDemand`, and the pure node-group engine; calls entries 51-62).
-Phases 3, 4, 5b, 6 and 7 are in progress. Phase 2 also runs the engine's
-`checks`, strategies, and schedules on the `legion` source (calls entry 38),
-so Phase 3 is the external sources, scale to zero, and `scaling simulate`. (Written 2026-10-19; layered defaults, in-place policy edits, and
+Phase 3 (the `prometheus` and `http` sources, scale to zero with
+`activation`, `legion scaling simulate` replaying the hour of history the
+manager keeps) and Phase 4 (the `legion-scaling/1` plugin protocol, plugins
+installed through the autoscaler's app config, the `exec` and `noop`
+targets, standalone `ScalingPolicy` objects with `legion scaling
+apply|list|delete`, `legion scaling plugin test`, the Rust SDK and example
+plugins) shipped 2026-10-28 (calls entries 63-81). Phases 5b, 6 and 7 are in
+progress. Deliberately left from 3 and 4: `wake = "on-request"` (entry 73),
+node-group policies at `scaling apply` (refused until 5b, entry 69), and
+per-plugin concurrency (entry 67). (Written 2026-10-19; layered defaults, in-place policy edits, and
 the core-field rationale added 2026-10-27.) This plan **supersedes**
 [autoscaler-plan.md](autoscaler-plan.md). That plan's Phase 1 (`legion job
 scale`, count overrides, the `scale` ACL resource) shipped on 2026-07-30 and

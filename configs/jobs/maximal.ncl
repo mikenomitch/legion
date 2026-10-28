@@ -1333,8 +1333,12 @@
                 max = "2x",
                 cpu = 0.65,             # hold CPU at 65% of the reservation
                 memory = 0.8,           # and memory at 80%
-                # Explicit checks on the `legion` source; the largest
-                # desired count wins.
+                # Explicit checks; the largest desired count wins. `source`
+                # is `legion` (Legion's own measurements) or a source the
+                # operator installed in the autoscaler's app config
+                # (prometheus, http, a plugin: docs/autoscaling.md,
+                # "Sources"); a strategy `name` that is not built in names
+                # an installed strategy plugin.
                 checks = [
                     {
                         name = "backlog",
@@ -1343,6 +1347,10 @@
                         window = "2m",
                         strategy = { name = "threshold", steps = [{ above = 0, add = 1 }] },
                         scaleIn = false,  # may push up, never pull down
+                        # With min = 0: above this reading the task wakes
+                        # from zero; at or below it on every activation
+                        # check, it may sleep ("Scale to zero").
+                        activation = 0,
                     },
                 ],
                 up = { stabilize = "30s", step = { replicas = 2 }, every = "1m" },

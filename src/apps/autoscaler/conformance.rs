@@ -155,7 +155,7 @@ pub async fn run(endpoint: Endpoint, options: SuiteOptions) -> SuiteReport {
     } else {
         options.config.clone()
     };
-    let mut transport = Transport::new("conformance", endpoint, config);
+    let mut transport = Transport::new("conformance", endpoint, config).quiet();
     if let Some(timeout) = options.timeout {
         transport = transport.with_timeout(timeout);
     }

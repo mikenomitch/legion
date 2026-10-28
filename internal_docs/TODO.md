@@ -4472,7 +4472,7 @@ plan.
         equivalent) and extension points beyond job, group, task, volume,
         port, and service (plan §11)
 
-- [ ] **Autoscaler** (v2 plan, merged in [#57](https://github.com/mikenomitch/legion/pull/57)): [plan](plans/autoscaler-v2-plan.md) (IN EXECUTION; Phase 2 in Done, Phase 5a below) ·
+- [ ] **Autoscaler** (v2 plan, merged in [#57](https://github.com/mikenomitch/legion/pull/57)): [plan](plans/autoscaler-v2-plan.md) (IN EXECUTION; Phases 2, 3 and 4 in Done, Phase 5a below) ·
       [calls](calls/autoscaler-v2-plan_calls.md). Supersedes
       [autoscaler-plan.md](plans/autoscaler-plan.md) ·
       [calls](calls/autoscaler-plan_calls.md), whose Phase 1 shipped and is
@@ -4540,14 +4540,40 @@ plan.
     - [ ] **Cluster scaling defaults keep no version history**: only the
           current record and its version; a history row's digest still
           resolves to the exact policy through `scaling_policy_snapshot`.
-  - [ ] Phase 3: full policies. The `prometheus` and `http` sources (the
-        engine's `checks`, strategies, schedules, `headroom`, `scaleIn`,
-        and `onMissing` already run on the `legion` source), activation-gated
-        `min = 0` and its validation, `legion scaling simulate`
-  - [ ] Phase 4: external plugins (JSON-RPC over stdio or HTTP) installed
-        through app config, the `exec`/`noop` targets, `legion scaling plugin
-        test`, the SDK and example plugins, and standalone `ScalingPolicy`
-        objects for external targets
+  - [x] Phase 3: full policies (2026-10-28; in Done, under *Ecosystem
+        apps*): the `prometheus` and `http` sources, activation-gated
+        `min = 0`, `legion scaling simulate` ([calls 65, 72-74](calls/autoscaler-v2-plan_calls.md)).
+  - [x] Phase 4: external plugins and standalone policies (2026-10-28; in
+        Done, under *Ecosystem apps*; [calls 63-64, 66-71, 75-81](calls/autoscaler-v2-plan_calls.md)).
+  - [ ] Phase 3 and 4 follow-ups, found while building them:
+    - [ ] **One request at a time per plugin program**: a slow strategy
+          serializes every policy that uses it; add a per-plugin
+          `concurrency` setting with request multiplexing
+          ([calls 67](calls/autoscaler-v2-plan_calls.md)).
+    - [ ] **`app config set autoscaler` does not list the policies a plugin
+          change breaks**: removing a plugin, or narrowing its `namespaces`,
+          turns the policies that use it `invalid` at the next push instead
+          of being refused or warned about, as `scaling defaults apply`
+          does ([calls 70](calls/autoscaler-v2-plan_calls.md)).
+    - [ ] **No secret references in plugin config**: a Prometheus
+          `Authorization` header or an API key sits in the app config as
+          written, readable with `app:read` (docs/autoscaling.md, "Known
+          limitations"); needs a reference into the KV store or a secret
+          mechanism for app config.
+    - [ ] **Simulation sees only Legion's own history**: checks on other
+          sources and plugin strategies read as missing over history, and
+          pins, pauses, rollouts and quotas are not replayed
+          (`autoscaler::simulate`); recording external readings in the
+          history would close it.
+    - [ ] **History counts cost a store read per autoscaled job per 10s**
+          on the status-lane leader (`autoscaled_replica_counts`), and
+          history points hold `f32`s, so replay parity is exact only while
+          readings survive that precision; measure at Phase 7's 10,000
+          policies.
+    - [ ] **No metrics for plugin calls** (latency, failures, restarts per
+          plugin); only the app's logs carry them.
+    - [ ] **The `noop` target keeps its count in memory** and restarts at
+          `min` ([calls 77](calls/autoscaler-v2-plan_calls.md)).
   - [ ] Phase 5: node autoscaling.
     - [x] Phase 5a, the substrate (2026-10-28,
           [docs/autoscaling.md](../docs/autoscaling.md#capacity-demand),
@@ -4565,8 +4591,9 @@ plan.
           execute the engine's intents through `RecordScalingAction` and a
           `scaling_action` table with compare-and-set; `node:write` back in
           the app's grant ([calls 44](calls/autoscaler-v2-plan_calls.md));
-          `scaling apply|list|delete` for node-group policies; the
-          `aws-asg` plugin (needs Phase 4's protocol)
+          lift `ApplyScalingPolicy`'s node-group refusal and store them in
+          `scaling_policy` (kind `nodes`; [calls 69](calls/autoscaler-v2-plan_calls.md));
+          the `aws-asg` plugin on the Phase 4 protocol and SDK
     - [ ] Phase 5b engine inputs: a real fits-elsewhere simulation for
           `underutilized` scale-in, the `disruption.minAvailable`
           computation, and the provider-id cross-check against the
@@ -6240,6 +6267,64 @@ findings: [kernel-classifier-findings.md](kernel-classifier-findings.md)
         resubmits, CAS and `--all` pause, dry-run, live defaults, NOT
         RUNNING, and the real binary's app on a fresh cluster)
 
+- [x] **Autoscaler Phase 3: external sources, scale to zero, simulate**
+      (2026-10-28, [plan](plans/autoscaler-v2-plan.md) §6.5, §6.12, §8 ·
+      [calls 65, 72-74](calls/autoscaler-v2-plan_calls.md) · docs:
+      [autoscaling.md](../docs/autoscaling.md#sources),
+      [agent-readiness.md](../docs/agent-readiness.md))
+  - [x] The `prometheus` source (instant query, or a range over the
+        check's window, averaged) and the `http` source (GET, a JSON
+        pointer), installed in the autoscaler's app config with a
+        `namespaces` allowlist; each distinct `(source, query, window)` read
+        once per evaluation
+  - [x] `min = 0` with `activation`: the wake rule at submit, idle through
+        the scale-in path, waking from zero on an activation check
+  - [x] History points carry desired, healthy and unplaced counts;
+        `legion scaling simulate` (replay and follow, warm or cold, CSV
+        series, standalone policy files), MCP `legion_scaling_simulate`
+  - [x] Tests: source unit tests and fake Prometheus/HTTP servers, the
+        scale-to-zero cycle, and the acceptance test that a replay of the
+        live policy matches the live engine's decisions
+        (`tests/integration/autoscaler.rs`)
+  - Deferred: `wake = "on-request"` (in *Deferred from v2* above)
+
+- [x] **Autoscaler Phase 4: plugins and standalone policies** (2026-10-28,
+      [plan](plans/autoscaler-v2-plan.md) §6.2, §6.7, §6.13, §8 ·
+      [calls 63-64, 66-71, 75-81](calls/autoscaler-v2-plan_calls.md) ·
+      docs: [autoscaling.md](../docs/autoscaling.md#plugins),
+      [autoscaling-plugins.md](../docs/autoscaling-plugins.md),
+      [apps.md](../docs/apps.md), [auth-and-acls.md](../docs/auth-and-acls.md),
+      [event-stream.md](../docs/event-stream.md),
+      [agent-readiness.md](../docs/agent-readiness.md))
+  - [x] The `legion-scaling/1` protocol (JSON-RPC 2.0 over stdio or HTTP
+        POST): `initialize` with `policyConfigSchema`, `source/query`,
+        `strategy/recommend`, `target/status|scale|terminate`; timeouts
+        (10s, 120s for targets), restart with backoff, redacted call logs
+  - [x] Plugins installed through the autoscaler's app config (`builtin`,
+        `source`+`checksum`+`command`, `command`, `url`; `config`,
+        `namespaces`; code fields), checked at submit and apply against the
+        install and the allowlist; strategy plugins by name
+  - [x] The `exec` and `noop` targets
+  - [x] Standalone policies: the Control-lane `scaling_policy` table,
+        `ApplyScalingPolicy` (dry run with diff, idempotency),
+        `DeleteScalingPolicy`, `ListScalingPolicies`, served on
+        `WatchScalingPolicies`; status, history, pause and events by
+        `policy`; CLI `legion scaling apply [--dry-run] [--wait]|list|
+        delete` and `--standalone` on `explain|history|pause|resume`;
+        MCP `legion_scaling_apply`; capability entries; ACL rows
+  - [x] `legion scaling plugin test`, the conformance suite
+  - [x] The Rust SDK crate `legion-scaling-plugin` and example plugins
+        (Python strategy, Go source and target, Rust strategy) in
+        `examples/scaling-plugins/`
+  - [x] Tests: protocol, host and builtin unit tests;
+        `tests/integration/scaling_plugins.rs` (conformance of every
+        example and of broken fixtures, the built-in sources, a Python
+        strategy installed through app config driving a task, a standalone
+        `exec` policy applied, run, paused and deleted); ACL scoping in
+        `acl_endpoints.rs`; `configs/scaling/` examples validated
+  - Deferred: node-group policies at `scaling apply` (Phase 5b), per-plugin
+    concurrency (follow-ups above)
+
 - [x] **Legion apps A1: places to run** (2026-10-28,
       [plan](plans/legion-apps-plan.md) §8 ·
       [calls](calls/legion-apps-plan_calls.md) · docs:
@@ -6970,6 +7055,13 @@ Found on the live AWS rig (3 raft managers, 2 workers).
       instead of the whole repository, so editing a doc no longer rebuilds
       the crate; the empty doc-test pass and `legion` bin unit-test target
       switched off.
+- [x] **Raft-entry-count tests read the applied marker** (2026-10-28).
+      `session_integration`'s promotion and unnamed-session checks,
+      `tests/raft_job_eval_ops.rs` and `tests/raft_lifecycle_ops.rs` counted
+      entries from openraft's metrics, which lag the apply under load and
+      read one extra or one short. They now sum each lane's `raft_applied`
+      marker (`Store::raft_applied_entries`), which moves in the apply's
+      own transaction.
 - [x] **CI dependency cache, cancellation, and pinned protoc.**
       `Swatinem/rust-cache` on the Rust jobs, saved from `main` (CI now also
       runs on pushes to `main`); superseded PR runs cancelled; `protoc` from

@@ -5725,8 +5725,8 @@ message ScalingPolicySummary {
   // Why the policy is invalid.
   string error = 8;
 
-  // What it scales: `web/default/web` for a task, `plugin render-exec` for
-  // an external target.
+  // What it scales: `job web` for a task's (or group's) policy, `plugin
+  // render-exec` for an external target.
   string target = 9;
 
   // A standalone policy's version; 0 for a task (its job has versions).

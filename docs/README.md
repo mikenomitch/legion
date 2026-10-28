@@ -88,8 +88,14 @@ Plans, roadmaps, to-do lists, and development notes live in
 - [Rollout Strategy Plugins](rollout-strategy-plugins.md)
 - [Autoscaling](autoscaling.md): `autoscale = true` on a task, layered
   defaults (task, namespace, cluster), the safeguard pipeline, pins and
-  pauses, `legion scaling status|explain|history`; and `legion job scale`,
-  which sets count overrides without a new version or rollout.
+  pauses, `legion scaling status|explain|history`; Prometheus, HTTP, and
+  plugin sources, scale to zero, `legion scaling simulate`, and standalone
+  policies for external targets (`legion scaling apply`); and `legion job
+  scale`, which sets count overrides without a new version or rollout.
+- [Writing Autoscaling Plugins](autoscaling-plugins.md): the
+  `legion-scaling/1` JSON-RPC protocol for sources, strategies, and
+  targets, `legion scaling plugin test`, the Rust SDK, and the example
+  plugins.
 - [Graceful Stop](graceful-stop.md): the signal, grace period, and SIGKILL
   sequence every platform-initiated stop uses, the machine-readable stop
   notice, and why an allocation was removed.

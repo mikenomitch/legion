@@ -437,4 +437,32 @@ mod tests {
             "{err}"
         );
     }
+
+    /// The examples in `configs/scaling/` evaluate and validate: the app
+    /// config against the bundled autoscaler's schema and as a catalog, the
+    /// render farm as an external policy whose plugins that catalog opens
+    /// to `media`, and the scripted node group as a node-group policy.
+    #[test]
+    fn the_example_configs_validate_test() {
+        let file = |name: &str| -> Value {
+            let path = format!("{}/configs/scaling/{name}", env!("CARGO_MANIFEST_DIR"));
+            let rendered = crate::config_lang::eval_file(&path).expect("the example evaluates");
+            serde_json::from_str(&rendered).expect("JSON")
+        };
+        let config = file("autoscaler-app-config.ncl");
+        let manifest = crate::apps::bundled_manifest("autoscaler").expect("bundled");
+        crate::structs::app::validate_app_config(manifest, &config).expect("valid app config");
+        let catalog = PluginCatalog::from_app_config(&config).expect("a catalog");
+
+        let StandaloneSpec::External(render) =
+            parse(&file("render-farm.ncl"), "default").expect("render-farm parses")
+        else {
+            panic!("an external policy");
+        };
+        assert_eq!(render.namespace, "media");
+        check_external(&render, &catalog).expect("its plugins are open to media");
+
+        let nodes = parse(&file("nodes-exec.ncl"), "default").expect("nodes-exec parses");
+        assert_eq!(nodes.kind(), PolicyKind::Nodes);
+    }
 }

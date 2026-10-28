@@ -1535,6 +1535,410 @@ provider id at join.
 **Why (simplicity).** Node groups must not depend on the ACL mode, and only
 the provider knows which instance ids are real.
 
+## 63. The manager checks that a plugin is installed and open; only the autoscaler checks its kind and schema
+
+*Implementation, Phase 4 (`autoscaler::plugins::PluginCatalog::check_use`,
+`manager::autoscale::check_plugin_use`, `apps::autoscaler::host::PluginHost::check`).*
+
+**Call.** Submit (`job run`, `job plan`) and `scaling apply` refuse a policy
+that names a plugin the autoscaler's app config does not install, or one
+whose `namespaces` allowlist does not open it to the policy's namespace.
+Whether the plugin implements the kind the policy uses, and whether the
+policy's config matches its `policyConfigSchema`, is known only from the
+plugin's `initialize`, so the autoscaler checks those at evaluation and
+reports the policy `invalid`. `scaling apply --wait` waits for that verdict.
+
+```
+$ legion scaling apply render-farm.ncl --wait
+scaling policy media/render-farm: created (v1)
+Error: the autoscaler found scaling policy media/render-farm invalid: the config
+  for plugin render does not match its policyConfigSchema: "pool" is a required property
+```
+
+**Alternatives.**
+- (a) The manager starts every plugin itself to read its handshake, and
+  checks everything at submit.
+- (b) Check nothing at submit; let the autoscaler report every problem.
+
+**Trade-off.** A policy can be stored and still be invalid; the error
+arrives one evaluation later (`--wait`, `scaling explain`, a
+`scale.check_failed` event), not as the submit's error.
+
+**Why (security boundary, simplicity).** (a) would run operator-installed
+code inside the manager, the thing entry 4 keeps plugins out of, and it
+would need the artifacts the app's job fetches. (b) would let a tenant name
+a plugin closed to their namespace and learn about it only from status.
+The install and allowlist checks need only the stored app config, so they
+stay synchronous where the security boundary is.
+
+## 64. A standalone policy is scoped like a job of the same name in its namespace
+
+*Implementation, Phase 4 (`scaling_policy_rpcs.rs`).*
+
+**Call.** `ApplyScalingPolicy`, `DeleteScalingPolicy`, and the policy forms
+of `PauseScaling`, `GetScalingStatus`, and `GetScaleHistory` check `scale`
+on `AclScope::job("<namespace>/<name>")`. A node-group policy needs
+`operator:write` and `node:write` instead, and no `scale` grant.
+
+```json
+[{ "resources": ["scale"], "namespaces": ["media"], "names": ["web*"], "actions": ["write"] }]
+```
+
+covers the job `media/web` and the policy `media/web-batch` alike.
+
+**Alternatives.**
+- (a) A new ACL resource, `scaling-policy`.
+- (b) A new scope attribute (`policy`) on the `scale` resource.
+
+**Trade-off.** A `names` rule cannot tell a job from a policy of the same
+name: granting `scale` on `render` grants both.
+
+**Why (simplicity).** The `scale` resource already means "resize rights
+without redeploy rights", which is what applying a policy is. Reusing the
+job scope keeps the ACL vocabulary and every existing grant meaningful;
+names collide only when an operator chooses colliding names.
+
+## 65. Simulation replays the counts the manager recorded, and the live engine spends its step budget on changes it did not make
+
+*Implementation, Phase 3 (`manager::scaling_inputs::autoscaled_replica_counts`,
+`autoscaler::simulate`, `autoscaler::signals`; acceptance test
+`simulate_over_history_matches_the_live_decisions_test`).*
+
+**Call.**
+- Each 10-second history point of an autoscaled task carries its desired,
+  healthy, and unplaced counts, read on the status-lane leader once per
+  rollup tick.
+- `scaling simulate JOB` defaults to **replay**: the count is the recorded
+  one, readiness comes from the recorded healthy count through the warmup
+  rule, and the policy's own decisions spend the step budget when made.
+- The live engine and the replay treat every other count change (a
+  person's scale, a pin) the same way: it spends the step budget when it is
+  first observed. The readiness and window code is one module both use.
+
+```console
+$ legion scaling simulate web
+web/default/web: replay 240 evaluation(s) from 13:02 UTC to 14:02 UTC (history), ...
+```
+
+**Alternatives.**
+- (a) Simulate from the usage history alone, with the policy's own count
+  (follow) as the only mode.
+- (b) Reconstruct the counts from `scale_history` rows.
+
+**Trade-off.** One store read per autoscaled job per 10 seconds on the
+leader, and three more numbers per history point. The live engine now
+counts a person's scale-out against its own step budget for that window.
+
+**Why (correctness).** The acceptance criterion is that the live policy,
+replayed, makes the decisions the autoscaler made. That is only possible
+when the simulator sees what the engine saw. (a) diverges as soon as the
+real count differs from the policy's (a pin, a rollout); (b) misses changes
+that never wrote history (an operator's resubmit). Counting others' changes
+against the budget matches what `PolicyState` already documented, and is
+what lets replay agree with live.
+
+## 66. A target's change is recorded before it is made
+
+*Implementation, Phase 4 (`apps::autoscaler::Engine::evaluate_standalone`,
+`RecordScalingAction` kinds `scale` and `failed`).*
+
+**Call.** For a standalone policy the autoscaler first calls
+`RecordScalingAction { kind = "scale", policy }`, which the manager refuses
+while a pause covers the policy, then calls the plugin's `target/scale`. A
+failed call adds a `failed` history row and reports `error`.
+
+**Alternatives.** Call the plugin, then record what happened.
+
+**Trade-off.** A change can be recorded and not made (the call fails after
+the row is written; the `failed` row follows it). Plugins must make
+`target/scale` idempotent, which the protocol already requires.
+
+**Why (security, correctness).** It puts the pause on the server for
+targets Legion does not own, as `ScaleTask` does for tasks: a misbehaving
+or stale autoscaler cannot scale a paused target. And the durable record
+never misses a change that happened.
+
+## 67. One request at a time per plugin program, and an error reply is a healthy plugin
+
+*Implementation, Phase 4 (`apps::autoscaler::rpc::Transport`).*
+
+**Call.**
+- A program plugin gets one request at a time; the next waits for the
+  answer.
+- A call that times out (10 seconds; 120 for targets) kills the process
+  group, and the next call restarts it: at once the first time, then after
+  1, 2, 4, … up to 60 seconds while failures continue.
+- A JSON-RPC error answer is not a failure: the plugin is healthy, the check
+  reads missing (or the target reports `error`).
+
+**Alternatives.** Pipeline concurrent requests by `id`; restart on every
+error answer.
+
+**Trade-off.** A slow program plugin serializes every policy that uses it:
+1,000 policies on one 100 ms strategy take 100 seconds a pass. (Each
+distinct source query is asked once per evaluation, which bounds this for
+sources.)
+
+**Why (extensibility).** A plugin author can write a single-threaded loop
+in any language and be correct; a late answer can never be read as the
+reply to the next request, because the process that owed it is gone.
+Concurrency is a follow-up (a per-plugin `concurrency` setting) once a real
+plugin needs it.
+
+## 68. Every plugin field but `namespaces` is a code field
+
+*Implementation, Phase 4 (`src/apps/bundled/autoscaler.ncl` `codeFields`).*
+
+**Call.** `source` (an artifact), `command`, `url`, `builtin`, and `config`
+are code fields of the autoscaler's app config; only `namespaces` is plain
+config.
+
+**Alternatives.** Only `source`, `command`, and `url`.
+
+**Trade-off.** Changing a Prometheus address or an `exec` target's
+command needs the app's whole grant, not just `app config` rights.
+
+**Why (security boundary).** `config` holds an `exec` target's command and
+a source's address, so it decides what the app runs and where it sends its
+requests, just as `command` and `url` do.
+
+## 69. `scaling apply` refuses a node-group policy until node groups run
+
+*Implementation, Phase 4 (deviates from plan §8's Phase 4, which stores
+node-group policies).*
+
+**Call.** A policy with `target = { nodes = … }` parses and passes its ACL
+check, then is refused with `failed_precondition`, naming `legion scaling
+demand -f` as what sizes it today.
+
+**Alternatives.** Store it inert, listed with a `not run` state.
+
+**Trade-off.** An operator cannot stage node-group policies ahead of
+Phase 5b.
+
+**Why (simplicity).** A stored policy that does nothing reads as working;
+the refusal says what exists instead. Phase 5b removes the refusal, and
+the parser, ACL rule, and table already take the shape.
+
+## 70. Removing a plugin from the app config is not refused; the policies that use it go `invalid`
+
+*Implementation, Phase 4.*
+
+**Call.** `legion app config set autoscaler` validates the plugins it
+installs, but does not check the policies that name them. A policy whose
+plugin is removed or closed to its namespace reads `invalid` from the next
+policy push (the watch fingerprint includes the app's config).
+
+**Alternatives.** Refuse a config change that would invalidate a stored
+policy or a running job's, as `scaling defaults apply` does (`--force` to
+override).
+
+**Trade-off.** An operator can break tenants' policies in one command; the
+damage shows in `scaling status` rather than at the change.
+
+**Why (simplicity).** The app config is the generic apps surface, which
+has no hook for an app to refuse its own config change on cluster state.
+The failure is safe: an invalid policy holds its count. Listing affected
+policies on `app config set` is a follow-up.
+
+## 71. Standalone policies reuse the task tables, keyed `policy:<id>`
+
+*Implementation, Phase 4 (`storage::store::scaling_policy_ops`,
+`manager::autoscale::policy_target_key`).*
+
+**Call.** The new `scaling_policy` table (Control lane) holds only the
+stored spec and its version. History, pauses, and status reuse the task
+tables with the target key `policy:<namespace>/<name>`, an empty group and
+task. Their RPCs take a `policy` field next to `job`.
+
+**Alternatives.** Separate history, pause, and status tables per kind.
+
+**Trade-off.** The task tables' `job_id` column holds a non-job key for
+these rows, which every reader of them must recognize.
+
+**Why (simplicity).** History caps, pause precedence, status staleness and
+events all work unchanged; `pause --all` covers policies for free.
+
+## 72. Prometheus averages the window itself, with a range query
+
+*Implementation, Phase 3 (`apps::autoscaler::builtins::PrometheusSource`).*
+
+**Call.** A `prometheus` check with a `window` reads
+`/api/v1/query_range` over it with a step of a twelfth of the window (at
+least 1s) and averages the points; the reading is marked as already
+windowed, so the engine does not average it again. A zero window reads an
+instant query. An `http` source returns one number per read, which the
+engine averages like a `legion` reading.
+
+**Alternatives.** Instant queries only, averaged by the engine.
+
+**Trade-off.** A range query is heavier on Prometheus than an instant one.
+
+**Why (correctness).** The window is full from the first evaluation, after
+an autoscaler restart too, and it is the window the user's Prometheus
+dashboards show; engine-side averaging would start empty and see only one
+point per 15 seconds.
+
+## 73. Scale to zero keeps `count >= 1`, and a service does not wake on a request
+
+*Implementation, Phase 3.*
+
+**Call.** With `min = 0`, `count` is still the starting size and must be at
+least 1; the task sleeps once its activation checks go quiet. Waking on a
+first request (`wake = "on-request"`) is not built: a service at zero
+refuses connections until a check wakes it.
+
+```
+error: web/default/web: count = 0 with autoscale; count is the starting size (with min = 0 the
+  task sleeps once its activation checks go quiet). Hint: set count >= 1
+```
+
+**Alternatives.** Accept `count = 0`; hold requests at the gateway for a
+service at zero.
+
+**Trade-off.** A queue worker deployed before its queue fills runs one
+replica until the down window passes. Request-driven services cannot scale
+to zero yet.
+
+**Why (simplicity).** A submit that starts nothing reads as broken. Holding
+requests needs a gateway hook that today exists only for keyed instances;
+it is deferred with the rest of `wake` (TODO).
+
+## 74. Following a policy over history conserves the load
+
+*Implementation, Phase 3 (`SimOptions::conserve_load`).*
+
+**Call.** In follow mode over history, a `legion` utilization reading is
+rescaled from the recorded count to the simulated count: twice the
+replicas at half the utilization. Other readings (queue depth, request
+rate) are used as recorded.
+
+**Alternatives.** Use the recorded utilization unchanged.
+
+**Trade-off.** It assumes load is shared evenly and does not change with
+the replica count, which is wrong for a latency check.
+
+**Why (correctness).** Without it, a policy that would have scaled out
+keeps seeing the recorded (overloaded) utilization and scales out forever.
+
+## 75. Any strategy name that is not built in names a strategy plugin
+
+*Implementation, Phase 4 (`autoscaler::strategies::StrategyConfig::Plugin`).*
+
+**Call.** `strategy = { name = "calendar", replicas = 6 }` names the
+installed plugin `calendar`; the rest of the record is its config, checked
+against its schema by the autoscaler. A plugin strategy with no `query`
+gets `reading = null`.
+
+**Alternatives.** A separate field: `strategy = { plugin = "calendar",
+config = { … } }`.
+
+**Trade-off.** A misspelled built-in (`per_replica`) reads as an
+uninstalled plugin; the submit error names the built-ins to catch that.
+
+**Why (simplicity).** One shape for every strategy, so swapping a built-in
+for a plugin is a one-word change.
+
+## 76. The `exec` target runs one command per operation
+
+*Implementation, Phase 4 (`apps::autoscaler::builtins::ExecTarget`).*
+
+**Call.** The `exec` builtin runs its command with the operation (`status`,
+`scale`) appended as the last argument (a script's `$1`) and `{ apiVersion = 1, op, policy, config,
+desired, decision }` on stdin, reading JSON from stdout, the volume-driver
+convention (`util::run_json_command`).
+
+**Alternatives.** A persistent process speaking the full protocol.
+
+**Trade-off.** A process per call, fine at a target's cadence (one status
+call per evaluation) and the reason sources are not offered this way.
+
+**Why (simplicity).** A shell script is the operator's existing tool for
+"start more of these"; it needs no JSON-RPC loop.
+
+## 77. The `noop` target keeps its count in the autoscaler's memory
+
+*Implementation, Phase 4.*
+
+**Call.** `target = { plugin = "noop" }` records decisions and events and
+holds its count in the app, starting at the policy's `min`.
+
+**Alternatives.** Persist the count in the store.
+
+**Trade-off.** An app restart resets a noop target to `min`.
+
+**Why (simplicity).** `noop` exists to try a policy's signals without a
+target; its count is the policy's own state, and the history keeps every
+decision.
+
+## 78. `ApplyScalingPolicy` reads its scope from the body; nothing is looked up first
+
+*Implementation, Phase 4.*
+
+**Call.** The handler authenticates, parses the policy, then checks the
+precise scope (entry 64). `DeleteScalingPolicy` gates coarsely, then checks
+the precise scope before the lookup.
+
+**Alternatives.** A coarse `scale:write` check before parsing.
+
+**Trade-off.** An anonymous caller with a malformed body gets the parse
+error, not `Unauthenticated` (a well-formed one gets `Unauthenticated`).
+
+**Why (correctness).** A coarse `scale:write` gate would refuse an operator
+holding `operator:write` and `node:write` but no `scale` grant, the exact
+principal a node-group policy is for. Nothing is fetched before the check,
+so there is nothing to probe.
+
+## 79. `--standalone NAME` names a policy on `explain`, `history`, `pause`, and `resume`
+
+*Implementation, Phase 4 (`src/cmd/scaling.rs`).*
+
+**Call.** The existing commands take `--standalone` to read their argument
+as a standalone policy's name (`-n` for its namespace).
+
+**Alternatives.** A `policy/` prefix on the argument; separate `scaling
+policy explain|history|…` commands.
+
+**Trade-off.** One more flag to know, and a policy and a job with the same
+name need it to be told apart.
+
+**Why (simplicity).** The commands mean the same thing for both kinds; a
+flag is discoverable in `--help`, a prefix is not.
+
+## 80. `scaling plugin test` takes its options before the command
+
+*Implementation, Phase 4 (`src/cmd/scaling_plugin.rs`).*
+
+**Call.** Everything from the first positional argument on is the plugin's
+own command line:
+`legion scaling plugin test --config '{…}' python3 strategy.py --verbose`.
+
+**Alternatives.** Require `--` before the command.
+
+**Trade-off.** An option written after the command goes to the plugin.
+
+**Why (simplicity).** Plugins take flags of their own (`--http`); this
+passes them through untouched without a separator to remember.
+
+## 81. The Rust SDK is a workspace crate that does not depend on Legion; the example tests skip without their toolchains
+
+*Implementation, Phase 4 (`examples/scaling-plugins/`).*
+
+**Call.** `legion-scaling-plugin` is a workspace member depending only on
+`serde`/`serde_json`, so `cargo test --all` tests it and builds its example.
+The Python example's conformance test needs `python3`; the Go example's
+needs `go` (standard library only, no network); the Rust example's needs the
+example binary `cargo test --all` builds. Each skips with a message when its
+toolchain or binary is absent.
+
+**Alternatives.** Publish the SDK separately; require every toolchain in CI.
+
+**Trade-off.** A run without Go skips the Go example silently apart from a
+line on stderr.
+
+**Why (extensibility).** A plugin should compile without Legion's build, and
+CI must not need the network.
+
 ## Ledger: what stands from the superseded plan's calls
 
 The superseded plan's calls are not rewritten (`plans/README.md`). This is

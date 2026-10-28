@@ -363,6 +363,9 @@ pub struct Transport {
     /// Overrides every method's timeout (the conformance suite's
     /// `--timeout`).
     timeout_override: Option<Duration>,
+    /// Starts and failures log at `debug` instead of `info`/`warn`: the
+    /// conformance suite reports them itself, and provokes some on purpose.
+    quiet: bool,
 }
 
 impl Transport {
@@ -377,12 +380,19 @@ impl Transport {
             stderr: Arc::new(std::sync::Mutex::new(VecDeque::new())),
             http: reqwest::Client::new(),
             timeout_override: None,
+            quiet: false,
         }
     }
 
     /// Use `timeout` for every method instead of the protocol defaults.
     pub fn with_timeout(mut self, timeout: Duration) -> Self {
         self.timeout_override = Some(timeout);
+        self
+    }
+
+    /// Log starts and failed calls at `debug` (the conformance suite).
+    pub fn quiet(mut self) -> Self {
+        self.quiet = true;
         self
     }
 
@@ -558,13 +568,17 @@ impl Transport {
         };
         match PluginInfo::parse(&result) {
             Ok(info) => {
-                info!(
-                    plugin = %self.name,
-                    name = %info.name,
-                    version = %info.version,
-                    kinds = ?info.kinds,
-                    "Scaling plugin started"
-                );
+                if self.quiet {
+                    debug!(plugin = %self.name, name = %info.name, "Scaling plugin started");
+                } else {
+                    info!(
+                        plugin = %self.name,
+                        name = %info.name,
+                        version = %info.version,
+                        kinds = ?info.kinds,
+                        "Scaling plugin started"
+                    );
+                }
                 state.info = Some(info);
                 Ok(())
             }
@@ -717,7 +731,11 @@ impl Transport {
                 Err(err)
             }
             Err(err) => {
-                warn!(plugin = %self.name, method, "Scaling plugin call failed: {err}");
+                if self.quiet {
+                    debug!(plugin = %self.name, method, "Scaling plugin call failed: {err}");
+                } else {
+                    warn!(plugin = %self.name, method, "Scaling plugin call failed: {err}");
+                }
                 self.fail(&mut state, err.to_string()).await;
                 Err(err)
             }

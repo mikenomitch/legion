@@ -161,7 +161,7 @@ fn task_summary(target: &TargetPolicy) -> ScalingPolicySummary {
         max,
         state,
         error,
-        target: target.label(),
+        target: format!("job {}", target.job_id),
         version: 0,
         summary,
         ..Default::default()
