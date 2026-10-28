@@ -31543,6 +31543,7 @@ export class SetAppConfigReply extends Message<SetAppConfigReply> {
  * - `job`: `namespace` (default `default`) and `job`;
  * - `task`: `namespace`, `job`, `task`, and `group` when the task has one;
  * - `node`: `node`.
+ *
  * Any other field set for the slot is InvalidArgument.
  *
  * @generated from message legion.AppViewContext

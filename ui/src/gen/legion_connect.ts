@@ -3455,6 +3455,7 @@ export const Manager = {
      *   who may see it;
      * - without `context`, on any scope ("does the caller hold it
      *   anywhere?"), which is what the sidebar and overview need at login.
+     *
      * An entry without a permission needs only `app:read` on its app.
      *
      * Nothing is forwarded to any app: this answers from the installed
@@ -3843,6 +3844,7 @@ export const Worker = {
      * - the method is GET or POST, the path starts with `/legion/v1/`, only
      *   the `legion-viewer`, `content-type`, and `accept` headers pass, and
      *   the body is at most 256 KiB.
+     *
      * It then dials the port the way the ingress datapath does (loopback,
      * inside the task's network namespace when it is gated; a sandbox guest
      * over vsock or its bridge address), never a caller-named address, sends
