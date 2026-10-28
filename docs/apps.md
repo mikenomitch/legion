@@ -556,3 +556,8 @@ Every command but `run` takes `--json`. The MCP server exposes
   legion-system/<app>` removes it.
 - **A worker hashes its executable at startup** for its build id: under a
   second for a release binary, longer for a debug build.
+- **Stopping a manager leaves its app processes running.** Like any task,
+  an app on a manager's system worker outlives the worker on purpose, and
+  the manager's next start re-adopts it. To take a manager down for good,
+  drain its system worker first (`legion node drain <node>`), or `legion
+  app disable` the app.

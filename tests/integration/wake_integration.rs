@@ -310,6 +310,9 @@ impl Control for InProcess {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_request_resumes_a_suspended_instance_and_is_answered() -> R<()> {
+    // The instance's port is the first of the dynamic range, which another
+    // test's real cluster may be holding.
+    let _ports = crate::support::DYNAMIC_PORT_GATE.lock().await;
     let cluster = Arc::new(Cluster::new()?);
     cluster.add_node()?;
     cluster.submit(job())?;

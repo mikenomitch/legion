@@ -47,9 +47,21 @@ impl Cluster {
     /// manager. So a start that lost either bind is retried on new ports:
     /// the manager exits when it cannot bind its API port, and its worker
     /// logs `Address already in use` when it cannot bind the worker port.
+    /// Start a cluster with the bundled autoscaler off: it is not under
+    /// test here, and it would hold a port from the dynamic range.
     pub(crate) fn start(run_worker: bool) -> Cluster {
+        Self::start_cluster(run_worker, false)
+    }
+
+    /// Start a cluster that seeds and runs the bundled autoscaler, as a
+    /// fresh cluster does. Hold `support::DYNAMIC_PORT_GATE`.
+    pub(crate) fn start_with_autoscaler(run_worker: bool) -> Cluster {
+        Self::start_cluster(run_worker, true)
+    }
+
+    fn start_cluster(run_worker: bool, autoscaler: bool) -> Cluster {
         for attempt in 1..=3 {
-            let cluster = Self::spawn(run_worker);
+            let cluster = Self::spawn(run_worker, autoscaler);
             let deadline = Instant::now() + Duration::from_secs(90);
             loop {
                 let lost_a_bind = std::fs::read_to_string(cluster.dir.path().join("manager.log"))
@@ -104,7 +116,7 @@ impl Cluster {
             .filter(|id| !id.is_empty())
     }
 
-    fn spawn(run_worker: bool) -> Cluster {
+    fn spawn(run_worker: bool, autoscaler: bool) -> Cluster {
         let dir = tempfile::Builder::new()
             .prefix("legion-system-worker-")
             .tempdir_in(crate::support::scratch_root())
@@ -119,6 +131,7 @@ impl Cluster {
             // Under --run-worker the block is unused: the flag's worker binds
             // LEGION_WORKER_PORT, as it always has.
             "systemWorker": { "port": worker_port },
+            "apps": { "autoscaler": { "enabled": autoscaler } },
         });
         let config_path = dir.path().join("manager.json");
         std::fs::write(&config_path, config.to_string()).expect("write config");
@@ -145,11 +158,6 @@ impl Cluster {
             .spawn()
             .expect("spawn manager");
         Cluster { dir, port, manager }
-    }
-
-    /// The cluster's directory: its store, data dir, and log.
-    pub(crate) fn dir(&self) -> &std::path::Path {
-        self.dir.path()
     }
 
     fn token_file(&self) -> PathBuf {
@@ -249,6 +257,7 @@ impl Drop for Cluster {
             }
             std::thread::sleep(Duration::from_millis(100));
         }
+        crate::support::kill_task_processes_under(self.dir.path());
     }
 }
 

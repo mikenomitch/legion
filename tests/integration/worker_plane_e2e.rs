@@ -108,6 +108,7 @@ impl Drop for Cluster {
             }
             std::thread::sleep(Duration::from_millis(100));
         }
+        crate::support::kill_task_processes_under(self.dir.path());
     }
 }
 
@@ -126,6 +127,8 @@ fn start_with(dir: tempfile::TempDir, extra: serde_json::Value, workers: &Path) 
         "workerConfigPath": workers.to_str().expect("utf-8"),
         "telemetry": { "enabled": false },
         "taskResourceDefaults": { "cpu": 0, "memory": 0, "allocations": 100 },
+        // The bundled autoscaler is not under test here (apps.rs runs it).
+        "apps": { "autoscaler": { "enabled": false } },
     });
     for (key, value) in extra.as_object().expect("object") {
         config[key] = value.clone();

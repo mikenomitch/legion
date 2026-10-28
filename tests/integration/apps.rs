@@ -1243,54 +1243,6 @@ async fn app_reads_filter_by_name_test() -> R<()> {
 /// own binary (`legion:self`). The worker reports its build id, the app's
 /// job carries the build marker, and `job info` says the job is managed.
 ///
-/// Stops the autoscaler when the test ends, pass or fail. A worker that
-/// stops leaves its tasks running (a restarted worker re-adopts them), so
-/// without this the app would outlive the cluster and keep holding its port:
-/// disable the app, wait for its process to exit, and kill it if it has not.
-#[cfg(unix)]
-struct StopAutoscalerOnDrop<'a> {
-    cluster: &'a crate::system_worker::Cluster,
-}
-
-#[cfg(unix)]
-impl Drop for StopAutoscalerOnDrop<'_> {
-    fn drop(&mut self) {
-        let _ = self.cluster.cli(&["app", "disable", "autoscaler"]);
-        let dir = self.cluster.dir();
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
-        while !task_processes_under(dir).is_empty() && std::time::Instant::now() < deadline {
-            std::thread::sleep(std::time::Duration::from_millis(250));
-        }
-        for pid in task_processes_under(dir) {
-            // SAFETY: plain kill(2) on a task process this test started.
-            unsafe { libc::kill(pid, libc::SIGKILL) };
-        }
-    }
-}
-
-/// The task processes a cluster under `dir` started: their
-/// `LEGION_ALLOC_DIR` is inside it (Linux; elsewhere, none are found).
-#[cfg(unix)]
-fn task_processes_under(dir: &std::path::Path) -> Vec<libc::pid_t> {
-    use std::os::unix::ffi::OsStrExt;
-    let Ok(entries) = std::fs::read_dir("/proc") else {
-        return Vec::new();
-    };
-    entries
-        .filter_map(|entry| {
-            let pid: libc::pid_t = entry.ok()?.file_name().to_str()?.parse().ok()?;
-            let environ = std::fs::read(format!("/proc/{pid}/environ")).ok()?;
-            environ
-                .split(|byte| *byte == 0)
-                .filter_map(|var| var.strip_prefix(b"LEGION_ALLOC_DIR="))
-                .any(|value| {
-                    std::path::Path::new(std::ffi::OsStr::from_bytes(value)).starts_with(dir)
-                })
-                .then_some(pid)
-        })
-        .collect()
-}
-
 /// An exec task in `legion-system` runs as `nobody`, which takes a worker
 /// that can switch users: run unprivileged, the test checks the placement
 /// instead of the process.
@@ -1300,10 +1252,10 @@ fn fresh_cluster_runs_the_autoscaler_on_the_system_worker_test() {
     let _serial = crate::system_worker::SERIAL
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let cluster = crate::system_worker::Cluster::start(false);
+    // The autoscaler binds a port from the dynamic range.
+    let _ports = crate::support::DYNAMIC_PORT_GATE.blocking_lock();
+    let cluster = crate::system_worker::Cluster::start_with_autoscaler(false);
     let node = cluster.first_node_id().expect("start waited for the node");
-    // Dropped before `cluster`.
-    let _stop = StopAutoscalerOnDrop { cluster: &cluster };
     // SAFETY: geteuid has no preconditions.
     let privileged = unsafe { libc::geteuid() } == 0;
     let autoscaler = |list: &Value| -> Option<Value> {

@@ -79,6 +79,22 @@ in the system temp dir is never removed; at ~1.7 MB per store, a full run
 used to leave over a gigabyte behind. A run killed before it exits (Ctrl-C)
 still leaves its one `legion-tests-*` root in `$TMPDIR`.
 
+### Real clusters and their task processes
+
+A test that starts the real `legion` binary with a worker (the system
+worker included) starts real task processes, and a worker that stops
+leaves its tasks running on purpose: the next start re-adopts them. Such a
+test's teardown, after the manager has exited, calls
+`crate::support::kill_task_processes_under(dir)` for the cluster's
+directory, which kills every process whose `LEGION_ALLOC_DIR` is inside it
+(Linux; the scratch root's exit hook does the same as a backstop). A fresh
+cluster also seeds and runs the bundled autoscaler on its system worker,
+holding a port from the worker's range; a test that does not exercise it
+turns it off with `"apps": { "autoscaler": { "enabled": false } }` in the
+manager config. Every cluster in the binary hands out the same dynamic
+ports (from 20000), so a test that binds one, or runs a task that does,
+holds `crate::support::DYNAMIC_PORT_GATE`.
+
 ### Notable integration tests
 
 - `config_jobs`
