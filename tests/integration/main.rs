@@ -35,6 +35,7 @@ mod apps;
 mod archive_integration;
 mod artifact_staging_integration;
 mod autoscaler;
+mod autoscaler_ui;
 mod blocked_evals;
 mod capacity_demand;
 mod capacity_retry;

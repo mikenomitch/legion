@@ -114,6 +114,10 @@ async fn run_body(mut context: AppContext) -> R<()> {
         legion = context.legion_addr().is_some(),
         "The autoscaler app is running"
     );
+    // Registered first, so the views answer "starting" rather than "no such
+    // view" until the app reaches Legion.
+    let ui = crate::apps::autoscaler_ui::AutoscalerUi::new(now_ms());
+    crate::apps::autoscaler_ui::register(context.ui(), ui.clone());
     let client = loop {
         match context.client().await {
             Ok(client) => break client,
@@ -128,7 +132,10 @@ async fn run_body(mut context: AppContext) -> R<()> {
             }
         }
     };
-    let engine = Engine::new(client, options.clone(), now_ms());
+    let engine = Engine::new(client.clone(), options.clone(), now_ms());
+    // The views read the engine's last hour of evaluations, and call
+    // Legion as the app (docs/autoscaling.md, "In the UI").
+    ui.connect(client, engine.evaluations());
     let watch = engine.spawn_watch();
     context.set_health(true, "ok: evaluating");
     let mut ticker = tokio::time::interval(options.interval);
@@ -238,6 +245,8 @@ pub struct Engine {
     /// decisions, so when another manager takes over the status board
     /// (which starts empty), the next report sends every decision again.
     served_by: Option<String>,
+    /// The last hour of every target's evaluations, for the job panel.
+    log: std::sync::Arc<crate::apps::autoscaler_ui::EvaluationLog>,
 }
 
 /// What one tick did, for tests and the app's health detail.
@@ -436,7 +445,13 @@ impl Engine {
             policies: std::sync::Arc::new(RwLock::new(None)),
             targets: HashMap::new(),
             served_by: None,
+            log: Default::default(),
         }
+    }
+
+    /// The engine's last hour of evaluations, which the UI views draw.
+    pub fn evaluations(&self) -> std::sync::Arc<crate::apps::autoscaler_ui::EvaluationLog> {
+        self.log.clone()
     }
 
     /// Keep the policy cache current from `WatchScalingPolicies`,
@@ -516,6 +531,7 @@ impl Engine {
             .map(|p| (p.job_id.clone(), p.task_group.clone(), p.task_name.clone()))
             .collect();
         self.targets.retain(|key, _| live.contains(key));
+        self.log.retain(&live);
 
         // Parse the valid policies; report the invalid ones as held.
         let mut valid: Vec<(&ScalingPolicy, EffectivePolicy)> = Vec::new();
@@ -896,6 +912,17 @@ impl Engine {
                 }
             }
         }
+
+        self.log.record(
+            &key.0,
+            &key.1,
+            &key.2,
+            effective,
+            &decision,
+            current,
+            decision.to,
+            now_ms,
+        );
 
         // The full decision only when it changed (ignoring its time).
         let mut stable = decision.clone();

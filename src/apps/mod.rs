@@ -26,6 +26,7 @@
 //! below, and seeded on clusters by the first Control leader.
 
 pub mod autoscaler;
+pub mod autoscaler_ui;
 pub mod ui;
 
 use crate::prelude::*;
@@ -193,6 +194,11 @@ impl AppContext {
         Fut: Future<Output = R<String>> + Send + 'static,
     {
         self.ui.page(name, handler);
+    }
+
+    /// The registry the app's views, actions, and pages are served from.
+    pub fn ui(&self) -> &ui::UiRegistry {
+        &self.ui
     }
 
     /// The app's name.
@@ -600,9 +606,11 @@ mod tests {
         }
     }
 
-    /// The autoscaler asks for exactly what it calls: policies and inputs
-    /// (`scale:read`) and count writes (`scale:write`). Its reports are
-    /// app-plane and need no rule (autoscaler-v2 calls entry 37).
+    /// The autoscaler asks for exactly what it calls: policies, inputs,
+    /// status, and history (`scale:read`), count writes and pauses
+    /// (`scale:write`), and nodes and their capacity demand for the
+    /// node-group panel (`node:read`). Its reports are app-plane and need no
+    /// rule (autoscaler-v2 calls entry 37).
     #[test]
     fn the_autoscaler_manifest_asks_for_what_it_calls() {
         let manifest = bundled_manifest("autoscaler").expect("bundled");
@@ -611,8 +619,34 @@ mod tests {
             rules,
             json!([
                 { "resources": ["scale"], "actions": ["read", "write"], "namespaces": ["*"] },
+                { "resources": ["node"], "actions": ["read"] },
             ])
         );
+        // Its UI: a sidebar page, a job panel, task badges, a node panel,
+        // and three actions, each behind the permission it reads or writes.
+        let ui = manifest.ui_spec().expect("the ui block parses");
+        assert_eq!(
+            ui.slots(),
+            vec![
+                crate::structs::app_ui::Slot::Nav,
+                crate::structs::app_ui::Slot::Job,
+                crate::structs::app_ui::Slot::Task,
+                crate::structs::app_ui::Slot::Node
+            ]
+        );
+        let actions: Vec<(&str, bool)> = ui
+            .actions
+            .iter()
+            .map(|action| (action.name.as_str(), action.mutating()))
+            .collect();
+        assert_eq!(
+            actions,
+            vec![("pause", true), ("resume", true), ("release", true)]
+        );
+        assert!(ui
+            .entries(crate::structs::app_ui::Slot::Nav)
+            .iter()
+            .all(|entry| entry.permission.is_some()));
         assert_eq!(manifest.placement, crate::structs::app::Placement::Managers);
         assert_eq!(manifest.job["priority"], "critical");
         assert!(is_bundled("autoscaler"));
