@@ -76,6 +76,13 @@ use std::time::Duration;
 
 /// `VMADDR_CID_HOST`: the host as seen from a guest.
 pub const HOST_CID: u32 = 2;
+/// Host vsock port the worker's park listener answers on: the agent relays
+/// each connection to [`PARK_SOCKET`] here (docs/park.md). Refused at
+/// submit as an upstream's port on a gated sandbox that parks.
+pub const PARK_PORT: u32 = 1090;
+/// The park socket inside the guest, `$LEGION_PARK_SOCKET` for a sandbox
+/// task with `suspend.park`.
+pub const PARK_SOCKET: &str = "/legion/park.sock";
 /// Guest ports the host datapath listens on.
 pub const PROXY_PORT: u32 = 1080;
 pub const DNS_PORT: u32 = 53;
@@ -101,6 +108,20 @@ impl HostStream for UnixStream {
     }
 }
 
+/// A guest client's end of a relay, so [`Relays`] can track TCP clients
+/// (the proxy, upstreams) and unix ones (the park socket) alike.
+impl HostStream for TcpStream {
+    fn split(&self) -> io::Result<Box<dyn HostStream>> {
+        Ok(Box::new(self.try_clone()?))
+    }
+    fn shutdown_write(&self) -> io::Result<()> {
+        self.shutdown(std::net::Shutdown::Write)
+    }
+    fn shutdown_both(&self) -> io::Result<()> {
+        self.shutdown(std::net::Shutdown::Both)
+    }
+}
+
 /// The relays the agent holds open right now, so a restore can close them
 /// all at once (see the module docs).
 #[derive(Default)]
@@ -111,7 +132,7 @@ pub struct Relays {
 
 /// Handles on both ends of one relay, kept only to shut them down.
 struct OpenRelay {
-    client: TcpStream,
+    client: Box<dyn HostStream>,
     host: Box<dyn HostStream>,
 }
 
@@ -124,9 +145,9 @@ impl Relays {
 
     /// Track a relay. `None` when a handle cannot be duplicated, in which
     /// case the relay still runs, untracked.
-    fn register(&self, client: &TcpStream, host: &dyn HostStream) -> Option<u64> {
+    fn register(&self, client: &dyn HostStream, host: &dyn HostStream) -> Option<u64> {
         let relay = OpenRelay {
-            client: client.try_clone().ok()?,
+            client: client.split().ok()?,
             host: host.split().ok()?,
         };
         let id = self.next.fetch_add(1, Ordering::Relaxed);
@@ -151,7 +172,7 @@ impl Relays {
     pub fn close_all(&self) -> usize {
         let open: Vec<OpenRelay> = self.lock().drain().map(|(_, relay)| relay).collect();
         for relay in &open {
-            let _ = relay.client.shutdown(std::net::Shutdown::Both);
+            let _ = relay.client.shutdown_both();
             let _ = relay.host.shutdown_both();
         }
         open.len()
@@ -708,6 +729,77 @@ fn relay_tcp(
     }
 }
 
+/// The park relay (docs/park.md): a unix socket in the guest at `path`,
+/// each connection relayed byte for byte to host vsock port `port`, where
+/// the worker answers the park protocol. It runs apart from the gated
+/// relays: a TAP or `none` sandbox with `suspend.park` runs it too, and it
+/// is the one host port such a guest can dial. Relays are tracked in
+/// `relays`, so a restore closes the ones its capture left dead.
+pub fn serve_park(
+    path: &std::path::Path,
+    dial: Arc<dyn HostDial>,
+    port: u32,
+    relays: Arc<Relays>,
+) -> io::Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let _ = std::fs::remove_file(path);
+    let listener = UnixListener::bind(path)?;
+    // Whichever user the workload runs as inside the guest.
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o666))?;
+    }
+    thread::Builder::new()
+        .name("legion-guest-park".into())
+        .spawn(move || {
+            for accepted in listener.incoming() {
+                let Ok(mut client) = accepted else {
+                    thread::sleep(Duration::from_millis(50));
+                    continue;
+                };
+                let dial = dial.clone();
+                let relays = relays.clone();
+                let _ = thread::Builder::new()
+                    .name("legion-guest-park-relay".into())
+                    .spawn(move || {
+                        let host = match dial.dial(port) {
+                            Ok(host) => host,
+                            Err(err) => {
+                                // The client speaks the park protocol: answer
+                                // in it rather than closing on it.
+                                let reply = serde_json::json!({
+                                    "ok": false,
+                                    "error": {
+                                        "code": "Unavailable",
+                                        "message": format!(
+                                            "the node's park listener on vsock port {port} is \
+                                             unreachable: {err}"
+                                        ),
+                                        "retryable": true,
+                                    },
+                                });
+                                let _ = client.write_all(format!("{reply}\n").as_bytes());
+                                // Half-close and drain what the client sent:
+                                // closing over unread bytes resets the
+                                // connection, and the client would lose the
+                                // answer.
+                                let _ = client.shutdown(std::net::Shutdown::Write);
+                                let _ = client.set_read_timeout(Some(Duration::from_secs(1)));
+                                let _ = io::copy(&mut client, &mut io::sink());
+                                return;
+                            }
+                        };
+                        let id = relays.register(&client, &*host);
+                        relay_streams(Box::new(client), host);
+                        relays.finish(id);
+                    });
+            }
+        })?;
+    Ok(())
+}
+
 /// Copy both directions until both sides are done.
 fn relay_pair(client: TcpStream, host: Box<dyn HostStream>) {
     let _ = client.set_nodelay(true);
@@ -722,6 +814,22 @@ fn relay_pair(client: TcpStream, host: Box<dyn HostStream>) {
     });
     let _ = io::copy(&mut host_read, &mut client_write);
     let _ = client_write.shutdown(std::net::Shutdown::Write);
+    let _ = up.join();
+}
+
+/// [`relay_pair`] for any client stream (the park socket's unix clients).
+fn relay_streams(client: Box<dyn HostStream>, host: Box<dyn HostStream>) {
+    let (Ok(mut client_read), Ok(mut host_write)) = (client.split(), host.split()) else {
+        return;
+    };
+    let mut client_write = client;
+    let mut host_read = host;
+    let up = thread::spawn(move || {
+        let _ = io::copy(&mut client_read, &mut host_write);
+        let _ = host_write.shutdown_write();
+    });
+    let _ = io::copy(&mut host_read, &mut client_write);
+    let _ = client_write.shutdown_write();
     let _ = up.join();
 }
 
@@ -813,6 +921,82 @@ mod tests {
             }
         });
         base
+    }
+
+    /// The park socket in the guest reaches the node's park listener on
+    /// host vsock port 1090, byte for byte, both ways; a restore closes a
+    /// park connection the capture left open.
+    #[test]
+    fn park_relays_a_guest_unix_socket_to_the_host_port() -> io::Result<()> {
+        let dir = tempfile::TempDir::new()?;
+        let base = dir.path().join("vsock.sock");
+        let host = UnixListener::bind(host_socket_path(&base, PARK_PORT))?;
+        thread::spawn(move || {
+            for stream in host.incoming().flatten() {
+                thread::spawn(move || {
+                    let mut lines = std::io::BufReader::new(stream.try_clone().unwrap());
+                    let mut stream = stream;
+                    let mut line = String::new();
+                    while std::io::BufRead::read_line(&mut lines, &mut line).unwrap_or(0) > 0 {
+                        let reply = format!("{{\"ok\":true,\"echo\":\"{}\"}}\n", line.trim());
+                        if stream.write_all(reply.as_bytes()).is_err() {
+                            return;
+                        }
+                        line.clear();
+                    }
+                });
+            }
+        });
+        let relays = Arc::new(Relays::default());
+        let socket = dir.path().join("guest").join("park.sock");
+        serve_park(
+            &socket,
+            Arc::new(UnixDial { base }),
+            PARK_PORT,
+            relays.clone(),
+        )?;
+
+        let mut client = UnixStream::connect(&socket)?;
+        client.write_all(b"park ci\nstatus\n")?;
+        let mut reader = std::io::BufReader::new(client.try_clone()?);
+        let mut first = String::new();
+        std::io::BufRead::read_line(&mut reader, &mut first)?;
+        assert_eq!(first, "{\"ok\":true,\"echo\":\"park ci\"}\n");
+        let mut second = String::new();
+        std::io::BufRead::read_line(&mut reader, &mut second)?;
+        assert_eq!(second, "{\"ok\":true,\"echo\":\"status\"}\n");
+
+        // Still open: a restore closes it, and the client sees the end.
+        wait_until("the park relay is tracked", || relays.open_count() == 1);
+        assert_eq!(relays.close_all(), 1);
+        let mut rest = String::new();
+        assert_eq!(reader.read_to_string(&mut rest)?, 0);
+        Ok(())
+    }
+
+    /// With nothing listening on the host, the client gets an answer in
+    /// the park protocol, not a silent close.
+    #[test]
+    fn park_answers_when_the_host_is_unreachable() -> io::Result<()> {
+        let dir = tempfile::TempDir::new()?;
+        let socket = dir.path().join("park.sock");
+        serve_park(
+            &socket,
+            Arc::new(UnixDial {
+                base: dir.path().join("missing.sock"),
+            }),
+            PARK_PORT,
+            Arc::new(Relays::default()),
+        )?;
+        let mut client = UnixStream::connect(&socket)?;
+        client.write_all(b"status\n")?;
+        let mut reply = String::new();
+        client.read_to_string(&mut reply)?;
+        let reply: serde_json::Value = serde_json::from_str(reply.trim()).expect("JSON");
+        assert_eq!(reply["ok"], false);
+        assert_eq!(reply["error"]["code"], "Unavailable");
+        assert_eq!(reply["error"]["retryable"], true);
+        Ok(())
     }
 
     #[test]

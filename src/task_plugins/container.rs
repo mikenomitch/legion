@@ -523,6 +523,8 @@ const TASK_DIR_MOUNT: &str = crate::constants::CONTAINER_TASK_DIR;
 /// isolating runtimes) to the rest of the worker's env:
 ///
 /// - `LEGION_TASK_DIR` becomes [`TASK_DIR_MOUNT`];
+/// - `LEGION_PARK_SOCKET` (`<task dir>/park.sock`) has the host task-dir
+///   prefix swapped for it, like an artifact;
 /// - `LEGION_ARTIFACT_<NAME>` has the host task-dir prefix swapped for it;
 /// - `LEGION_ALLOC_DIR` is withheld — the alloc dir is *not* mounted, and
 ///   pointing env at an invisible path is the bug this translation exists to
@@ -540,6 +542,14 @@ fn translated_worker_env(instance: &TaskInstance) -> Vec<(String, String)> {
         }
         if key == "LEGION_TASK_DIR" {
             translated.push((key.clone(), TASK_DIR_MOUNT.to_string()));
+            continue;
+        }
+        // The park socket sits in the task dir (docs/park.md), so the mount
+        // carries it; only the path changes.
+        if key == crate::worker::park::PARK_SOCKET_ENV {
+            if let Some(in_task) = task_dir.and_then(|dir| translate_task_path(dir, value)) {
+                translated.push((key.clone(), in_task));
+            }
             continue;
         }
         if let Some(name) = key.strip_prefix("LEGION_ARTIFACT_") {
@@ -2595,11 +2605,20 @@ mod tests {
                 ),
                 ("LEGION_VOLUME_DATA".to_string(), "/data".to_string()),
                 ("LEGION_STORAGE_DIR".to_string(), "/workspace".to_string()),
+                (
+                    "LEGION_PARK_SOCKET".to_string(),
+                    format!("{}/park.sock", task_dir.display()),
+                ),
             ]),
             ..TaskInstance::default()
         };
 
         let env: HashMap<String, String> = translated_worker_env(&instance).into_iter().collect();
+        assert_eq!(
+            env.get("LEGION_PARK_SOCKET").map(String::as_str),
+            Some("/legion/task/park.sock"),
+            "the park socket rides the task-dir mount"
+        );
         assert_eq!(
             env.get("LEGION_TASK_DIR").map(String::as_str),
             Some("/legion/task")

@@ -18,8 +18,9 @@
 //! - **restores**: the restore payload of each allocation started from a
 //!   snapshot, and its outcome once known, re-sent while the manager keeps
 //!   attaching the payload.
-//! - **local suspensions**: captures the memory pressure response's
-//!   `suspend` step took on its own ([`run_local_suspension`]). The manager
+//! - **local suspensions**: captures the node took on its own, for the
+//!   memory pressure response's `suspend` step or a park whose deadline
+//!   passed ([`run_local_suspension_for`]). The manager
 //!   never asked, so it never re-asks: the worker re-sends each report until
 //!   the manager drops the allocation from the desired set, which is how it
 //!   says the suspend is applied (or that the instance moved on and the
@@ -210,6 +211,7 @@ impl CheckpointState {
             local_suspension: false,
             pause_ms: 0,
             manifest_url: String::new(),
+            local_suspension_reason: String::new(),
         };
         report_ready(&report);
         self.restore_outcomes.insert(allocation_id, report.clone());
@@ -309,6 +311,7 @@ pub fn run_capture(
         local_suspension: false,
         pause_ms: 0,
         manifest_url: String::new(),
+        local_suspension_reason: String::new(),
     };
     match outcome {
         Ok((manifest, pause_ms)) => {
@@ -549,29 +552,70 @@ fn release_owner_pins(store: &ContentStore, owner: &PinOwner) -> Vec<String> {
     errors
 }
 
+/// Why a node suspends an allocation on its own, with no request from the
+/// manager.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LocalSuspendCause {
+    /// The memory pressure response's `suspend` step
+    /// (docs/resource-enforcement.md, "Memory pressure").
+    Pressure,
+    /// The workload parked itself on its park socket and the park's
+    /// deadline passed (docs/park.md), with the checkpoint kind it asked
+    /// for, if it named one.
+    Park { kind: Option<SnapshotKind> },
+}
+
+impl LocalSuspendCause {
+    /// The reason the report carries, and the manager stores as the
+    /// instance's `suspend_reason`.
+    pub fn reason(&self) -> &'static str {
+        match self {
+            LocalSuspendCause::Pressure => crate::structs::suspend::SUSPEND_REASON_PRESSURE,
+            LocalSuspendCause::Park { .. } => crate::structs::suspend::SUSPEND_REASON_PARK,
+        }
+    }
+}
+
 /// The `suspend` pressure step's capture (docs/resource-enforcement.md,
-/// "Memory pressure"): checkpoint and stop `allocation_id` with no request
-/// from the manager, under a snapshot id minted here, and queue the report
-/// as a local suspension. Returns the snapshot id.
+/// "Memory pressure"): [`run_local_suspension_for`] with
+/// [`LocalSuspendCause::Pressure`].
+pub fn run_local_suspension(
+    manager: &Arc<Mutex<WorkerTaskManager>>,
+    allocation_id: i64,
+) -> R<String> {
+    run_local_suspension_for(manager, allocation_id, LocalSuspendCause::Pressure)
+}
+
+/// Checkpoint and stop `allocation_id` with no request from the manager,
+/// under a snapshot id minted here, and queue the report as a local
+/// suspension carrying `cause`'s reason. Returns the snapshot id.
 ///
 /// The same capture a SuspendInstance runs ([`capture_for_suspend`]), so a
 /// failure leaves the task running. The allocation is held out of relaunch
 /// from the start (the manager still lists it until the report lands) and
 /// released again if the capture fails.
-pub fn run_local_suspension(
+pub fn run_local_suspension_for(
     manager: &Arc<Mutex<WorkerTaskManager>>,
     allocation_id: i64,
+    cause: LocalSuspendCause,
 ) -> R<String> {
-    let kind = {
+    // `allocation_id` is the id the manager knows, which the report
+    // carries; the worker's own maps are keyed by the local key, which
+    // differs for a ratified edge start.
+    let (kind, local) = {
         let mut guard = manager.lock().expect("task manager");
-        let kind = guard.local_suspend_kind(allocation_id)?;
-        guard.hold_out_of_relaunch(allocation_id);
-        kind
+        let local = guard.local_key(allocation_id);
+        let kind = match cause {
+            LocalSuspendCause::Park { kind: Some(kind) } => kind,
+            _ => guard.local_suspend_kind(local)?,
+        };
+        guard.hold_out_of_relaunch(local);
+        (kind, local)
     };
     let request = CheckpointRequest {
         snapshot_id: crate::structs::snapshot::new_snapshot_id(),
         op: "capture".into(),
-        allocation_id,
+        allocation_id: local,
         kind: kind.as_str().to_string(),
         then: AfterCheckpoint::Stop.as_str().to_string(),
         purpose: "suspend".into(),
@@ -595,14 +639,16 @@ pub fn run_local_suspension(
                 // no running workload whose pause matters.
                 pause_ms: 0,
                 manifest_url: String::new(),
+                local_suspension_reason: cause.reason().to_string(),
             };
             info!(
                 snapshot_id = %request.snapshot_id,
                 allocation_id,
                 kind = kind.as_str(),
+                reason = cause.reason(),
                 total_bytes = report.total_bytes,
                 duration_ms = report.duration_ms,
-                "Suspended for memory pressure"
+                "Suspended on the node's own decision"
             );
             manager
                 .lock()
@@ -615,7 +661,7 @@ pub fn run_local_suspension(
             manager
                 .lock()
                 .expect("task manager")
-                .release_relaunch_hold(allocation_id);
+                .release_relaunch_hold(local);
             Err(err)
         }
     }
@@ -768,6 +814,7 @@ pub fn run_delete(
         local_suspension: false,
         pause_ms: 0,
         manifest_url: String::new(),
+        local_suspension_reason: String::new(),
     }
 }
 
@@ -807,6 +854,7 @@ pub fn run_publish(
         local_suspension: false,
         pause_ms: 0,
         manifest_url: String::new(),
+        local_suspension_reason: String::new(),
     };
     match outcome {
         Ok((manifest, uploaded, manifest_url)) => {
@@ -1029,6 +1077,7 @@ pub fn run_warm(
         local_suspension: false,
         pause_ms: 0,
         manifest_url: String::new(),
+        local_suspension_reason: String::new(),
     };
     match outcome {
         Ok(fetched) => {
@@ -1147,6 +1196,7 @@ pub fn run_request(manager: &Arc<Mutex<WorkerTaskManager>>, request: &Checkpoint
             local_suspension: false,
             pause_ms: 0,
             manifest_url: String::new(),
+            local_suspension_reason: String::new(),
         },
     };
     manager
