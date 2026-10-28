@@ -27,6 +27,7 @@ import {
   type TabItem,
 } from '../../components/ui'
 import LogViewer from '../../components/LogViewer'
+import { AppPanels } from '../../components/apps/AppSlot'
 import { managerClient } from '../../grpcClient'
 import { INDEX_POLL_INTERVAL_MS, retainOnError, usePoll } from '../../utils/polling'
 import { EffectivePolicyView, parseEffectivePolicy } from '../../components/NetPolicyView'
@@ -605,6 +606,7 @@ function TaskDetailContent() {
           <Switch>
             <Match when={activeTab() === 'overview'}>
               <div class="space-y-4" role="tabpanel" aria-label="Overview">
+                <AppPanels slot="task" job={jobName()} task={taskName()} group={data()!.taskSpec?.group} />
                 {/* Session mode (docs/session-mode.md): the task's sessions are
                     not allocations, and its envelope task's allocations run
                     nothing. Say so before the allocation cards below. */}

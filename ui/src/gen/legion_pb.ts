@@ -27030,6 +27030,203 @@ export class ListJobActionsReply extends Message<ListJobActionsReply> {
 }
 
 /**
+ * One HTTP header of a forwarded app request or answer.
+ *
+ * @generated from message legion.AppHttpHeader
+ */
+export class AppHttpHeader extends Message<AppHttpHeader> {
+  /**
+   * The header's name, lowercase.
+   *
+   * @generated from field: string name = 1;
+   */
+  name = "";
+
+  /**
+   * Its value.
+   *
+   * @generated from field: string value = 2;
+   */
+  value = "";
+
+  constructor(data?: PartialMessage<AppHttpHeader>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.AppHttpHeader";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "name", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 2, name: "value", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): AppHttpHeader {
+    return new AppHttpHeader().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): AppHttpHeader {
+    return new AppHttpHeader().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): AppHttpHeader {
+    return new AppHttpHeader().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: AppHttpHeader | PlainMessage<AppHttpHeader> | undefined, b: AppHttpHeader | PlainMessage<AppHttpHeader> | undefined): boolean {
+    return proto3.util.equals(AppHttpHeader, a, b);
+  }
+}
+
+/**
+ * Request payload for Worker.ForwardAppRequest.
+ *
+ * @generated from message legion.ForwardAppRequestRequest
+ */
+export class ForwardAppRequestRequest extends Message<ForwardAppRequestRequest> {
+  /**
+   * The app allocation to deliver to (the manager's id).
+   *
+   * @generated from field: int64 allocation_id = 1;
+   */
+  allocationId = protoInt64.zero;
+
+  /**
+   * The job the manager expects it to run (`legion-system/<app>`); the
+   * worker refuses an allocation running anything else.
+   *
+   * @generated from field: string job_id = 2;
+   */
+  jobId = "";
+
+  /**
+   * The port label (`network.ports[].name`) to deliver to: the manifest's
+   * `ui.port`.
+   *
+   * @generated from field: string port = 3;
+   */
+  port = "";
+
+  /**
+   * `GET` or `POST`.
+   *
+   * @generated from field: string method = 4;
+   */
+  method = "";
+
+  /**
+   * The path and query, starting `/legion/v1/`.
+   *
+   * @generated from field: string path = 5;
+   */
+  path = "";
+
+  /**
+   * Headers: `legion-viewer`, `content-type`, `accept`; others are dropped.
+   *
+   * @generated from field: repeated legion.AppHttpHeader headers = 6;
+   */
+  headers: AppHttpHeader[] = [];
+
+  /**
+   * The body (POST), at most 256 KiB.
+   *
+   * @generated from field: bytes body = 7;
+   */
+  body = new Uint8Array(0);
+
+  constructor(data?: PartialMessage<ForwardAppRequestRequest>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.ForwardAppRequestRequest";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "allocation_id", kind: "scalar", T: 3 /* ScalarType.INT64 */ },
+    { no: 2, name: "job_id", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 3, name: "port", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 4, name: "method", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 5, name: "path", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 6, name: "headers", kind: "message", T: AppHttpHeader, repeated: true },
+    { no: 7, name: "body", kind: "scalar", T: 12 /* ScalarType.BYTES */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): ForwardAppRequestRequest {
+    return new ForwardAppRequestRequest().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): ForwardAppRequestRequest {
+    return new ForwardAppRequestRequest().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): ForwardAppRequestRequest {
+    return new ForwardAppRequestRequest().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: ForwardAppRequestRequest | PlainMessage<ForwardAppRequestRequest> | undefined, b: ForwardAppRequestRequest | PlainMessage<ForwardAppRequestRequest> | undefined): boolean {
+    return proto3.util.equals(ForwardAppRequestRequest, a, b);
+  }
+}
+
+/**
+ * Response payload for Worker.ForwardAppRequest.
+ *
+ * @generated from message legion.ForwardAppRequestReply
+ */
+export class ForwardAppRequestReply extends Message<ForwardAppRequestReply> {
+  /**
+   * The app's HTTP status.
+   *
+   * @generated from field: uint32 status = 1;
+   */
+  status = 0;
+
+  /**
+   * Its `content-type`.
+   *
+   * @generated from field: string content_type = 2;
+   */
+  contentType = "";
+
+  /**
+   * Its body, at most 1 MiB.
+   *
+   * @generated from field: bytes body = 3;
+   */
+  body = new Uint8Array(0);
+
+  constructor(data?: PartialMessage<ForwardAppRequestReply>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.ForwardAppRequestReply";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "status", kind: "scalar", T: 13 /* ScalarType.UINT32 */ },
+    { no: 2, name: "content_type", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 3, name: "body", kind: "scalar", T: 12 /* ScalarType.BYTES */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): ForwardAppRequestReply {
+    return new ForwardAppRequestReply().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): ForwardAppRequestReply {
+    return new ForwardAppRequestReply().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): ForwardAppRequestReply {
+    return new ForwardAppRequestReply().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: ForwardAppRequestReply | PlainMessage<ForwardAppRequestReply> | undefined, b: ForwardAppRequestReply | PlainMessage<ForwardAppRequestReply> | undefined): boolean {
+    return proto3.util.equals(ForwardAppRequestReply, a, b);
+  }
+}
+
+/**
  * Selects which captured stream(s) to read for a task.
  *
  * Used by both `Worker.GetTaskLogs` and `Manager.GetAllocationLogs`.
@@ -31334,6 +31531,755 @@ export class SetAppConfigReply extends Message<SetAppConfigReply> {
 
   static equals(a: SetAppConfigReply | PlainMessage<SetAppConfigReply> | undefined, b: SetAppConfigReply | PlainMessage<SetAppConfigReply> | undefined): boolean {
     return proto3.util.equals(SetAppConfigReply, a, b);
+  }
+}
+
+/**
+ * Where an app view or action is shown, and what it is about. The manager
+ * checks a declared permission on this context, and the viewer assertion
+ * carries it to the app exactly as the request does. Which fields a slot
+ * takes:
+ * - `nav`, `overview`: none;
+ * - `job`: `namespace` (default `default`) and `job`;
+ * - `task`: `namespace`, `job`, `task`, and `group` when the task has one;
+ * - `node`: `node`.
+ * Any other field set for the slot is InvalidArgument.
+ *
+ * @generated from message legion.AppViewContext
+ */
+export class AppViewContext extends Message<AppViewContext> {
+  /**
+   * `nav`, `overview`, `job`, `task`, or `node`.
+   *
+   * @generated from field: string slot = 1;
+   */
+  slot = "";
+
+  /**
+   * The job's namespace (`job` and `task`).
+   *
+   * @generated from field: string namespace = 2;
+   */
+  namespace = "";
+
+  /**
+   * The job's bare name, or its canonical id `namespace/name` (split into
+   * `namespace` and `job` on the way in).
+   *
+   * @generated from field: string job = 3;
+   */
+  job = "";
+
+  /**
+   * The task's group (`task`, optional).
+   *
+   * @generated from field: string group = 4;
+   */
+  group = "";
+
+  /**
+   * The task's name (`task`).
+   *
+   * @generated from field: string task = 5;
+   */
+  task = "";
+
+  /**
+   * The node's id (`node`).
+   *
+   * @generated from field: string node = 6;
+   */
+  node = "";
+
+  constructor(data?: PartialMessage<AppViewContext>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.AppViewContext";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "slot", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 2, name: "namespace", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 3, name: "job", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 4, name: "group", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 5, name: "task", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 6, name: "node", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): AppViewContext {
+    return new AppViewContext().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): AppViewContext {
+    return new AppViewContext().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): AppViewContext {
+    return new AppViewContext().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: AppViewContext | PlainMessage<AppViewContext> | undefined, b: AppViewContext | PlainMessage<AppViewContext> | undefined): boolean {
+    return proto3.util.equals(AppViewContext, a, b);
+  }
+}
+
+/**
+ * A permission a UI extension or action declares: an ACL resource and
+ * action, checked as the viewer.
+ *
+ * @generated from message legion.UiPermission
+ */
+export class UiPermission extends Message<UiPermission> {
+  /**
+   * An ACL resource: `job`, `scale`, `node`, ...
+   *
+   * @generated from field: string resource = 1;
+   */
+  resource = "";
+
+  /**
+   * `read` or `write`.
+   *
+   * @generated from field: string action = 2;
+   */
+  action = "";
+
+  constructor(data?: PartialMessage<UiPermission>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.UiPermission";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "resource", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 2, name: "action", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): UiPermission {
+    return new UiPermission().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): UiPermission {
+    return new UiPermission().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): UiPermission {
+    return new UiPermission().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: UiPermission | PlainMessage<UiPermission> | undefined, b: UiPermission | PlainMessage<UiPermission> | undefined): boolean {
+    return proto3.util.equals(UiPermission, a, b);
+  }
+}
+
+/**
+ * One UI registration the caller may see.
+ *
+ * @generated from message legion.UiExtension
+ */
+export class UiExtension extends Message<UiExtension> {
+  /**
+   * The app that registers it.
+   *
+   * @generated from field: string app = 1;
+   */
+  app = "";
+
+  /**
+   * `nav`, `overview`, `job`, `task`, or `node`.
+   *
+   * @generated from field: string slot = 2;
+   */
+  slot = "";
+
+  /**
+   * The page's, card's, or panel's title (the sidebar label for `nav`).
+   * Empty for a task entry that only shows a badge.
+   *
+   * @generated from field: string title = 3;
+   */
+  title = "";
+
+  /**
+   * The sidebar icon name (`nav`); the SPA uses a default for one it does
+   * not know.
+   *
+   * @generated from field: string icon = 4;
+   */
+  icon = "";
+
+  /**
+   * The view to fetch with GetAppView. Empty for a task entry that only
+   * shows a badge.
+   *
+   * @generated from field: string view = 5;
+   */
+  view = "";
+
+  /**
+   * For `task`: the view whose `badge` the task row shows.
+   *
+   * @generated from field: string badge = 6;
+   */
+  badge = "";
+
+  /**
+   * The permission the entry declares, when it declares one.
+   *
+   * @generated from field: legion.UiPermission permission = 7;
+   */
+  permission?: UiPermission;
+
+  /**
+   * How often the SPA re-fetches the app's views, in seconds (the
+   * manifest's `ui.refresh`); 0 means on page load and on demand only.
+   *
+   * @generated from field: uint32 refresh_seconds = 8;
+   */
+  refreshSeconds = 0;
+
+  /**
+   * The app's one-line description.
+   *
+   * @generated from field: string app_description = 9;
+   */
+  appDescription = "";
+
+  constructor(data?: PartialMessage<UiExtension>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.UiExtension";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "app", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 2, name: "slot", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 3, name: "title", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 4, name: "icon", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 5, name: "view", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 6, name: "badge", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 7, name: "permission", kind: "message", T: UiPermission },
+    { no: 8, name: "refresh_seconds", kind: "scalar", T: 13 /* ScalarType.UINT32 */ },
+    { no: 9, name: "app_description", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): UiExtension {
+    return new UiExtension().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): UiExtension {
+    return new UiExtension().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): UiExtension {
+    return new UiExtension().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: UiExtension | PlainMessage<UiExtension> | undefined, b: UiExtension | PlainMessage<UiExtension> | undefined): boolean {
+    return proto3.util.equals(UiExtension, a, b);
+  }
+}
+
+/**
+ * Request payload for ListUiExtensions.
+ *
+ * @generated from message legion.ListUiExtensionsRequest
+ */
+export class ListUiExtensionsRequest extends Message<ListUiExtensionsRequest> {
+  /**
+   * Only this slot's entries; empty for every slot.
+   *
+   * @generated from field: string slot = 1;
+   */
+  slot = "";
+
+  /**
+   * When set, entries are filtered by their permission on this context;
+   * `context.slot` must equal `slot`.
+   *
+   * @generated from field: legion.AppViewContext context = 2;
+   */
+  context?: AppViewContext;
+
+  /**
+   * Only this app's entries; empty for every app.
+   *
+   * @generated from field: string app = 3;
+   */
+  app = "";
+
+  constructor(data?: PartialMessage<ListUiExtensionsRequest>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.ListUiExtensionsRequest";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "slot", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 2, name: "context", kind: "message", T: AppViewContext },
+    { no: 3, name: "app", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): ListUiExtensionsRequest {
+    return new ListUiExtensionsRequest().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): ListUiExtensionsRequest {
+    return new ListUiExtensionsRequest().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): ListUiExtensionsRequest {
+    return new ListUiExtensionsRequest().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: ListUiExtensionsRequest | PlainMessage<ListUiExtensionsRequest> | undefined, b: ListUiExtensionsRequest | PlainMessage<ListUiExtensionsRequest> | undefined): boolean {
+    return proto3.util.equals(ListUiExtensionsRequest, a, b);
+  }
+}
+
+/**
+ * Response payload for ListUiExtensions.
+ *
+ * @generated from message legion.ListUiExtensionsReply
+ */
+export class ListUiExtensionsReply extends Message<ListUiExtensionsReply> {
+  /**
+   * The entries, by app name, then slot, then declaration order.
+   *
+   * @generated from field: repeated legion.UiExtension extensions = 1;
+   */
+  extensions: UiExtension[] = [];
+
+  constructor(data?: PartialMessage<ListUiExtensionsReply>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.ListUiExtensionsReply";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "extensions", kind: "message", T: UiExtension, repeated: true },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): ListUiExtensionsReply {
+    return new ListUiExtensionsReply().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): ListUiExtensionsReply {
+    return new ListUiExtensionsReply().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): ListUiExtensionsReply {
+    return new ListUiExtensionsReply().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: ListUiExtensionsReply | PlainMessage<ListUiExtensionsReply> | undefined, b: ListUiExtensionsReply | PlainMessage<ListUiExtensionsReply> | undefined): boolean {
+    return proto3.util.equals(ListUiExtensionsReply, a, b);
+  }
+}
+
+/**
+ * Request payload for GetAppView.
+ *
+ * @generated from message legion.GetAppViewRequest
+ */
+export class GetAppViewRequest extends Message<GetAppViewRequest> {
+  /**
+   * The app's name.
+   *
+   * @generated from field: string app = 1;
+   */
+  app = "";
+
+  /**
+   * The view's name. Empty picks the first entry the caller may see in the
+   * context's slot (its view, or a task entry's badge view).
+   *
+   * @generated from field: string view = 2;
+   */
+  view = "";
+
+  /**
+   * Where the view is shown. Required (its `slot` at least).
+   *
+   * @generated from field: legion.AppViewContext context = 3;
+   */
+  context?: AppViewContext;
+
+  constructor(data?: PartialMessage<GetAppViewRequest>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.GetAppViewRequest";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "app", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 2, name: "view", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 3, name: "context", kind: "message", T: AppViewContext },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): GetAppViewRequest {
+    return new GetAppViewRequest().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): GetAppViewRequest {
+    return new GetAppViewRequest().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): GetAppViewRequest {
+    return new GetAppViewRequest().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: GetAppViewRequest | PlainMessage<GetAppViewRequest> | undefined, b: GetAppViewRequest | PlainMessage<GetAppViewRequest> | undefined): boolean {
+    return proto3.util.equals(GetAppViewRequest, a, b);
+  }
+}
+
+/**
+ * An action a view's `actions` block offers: its declaration, and whether
+ * the caller may invoke it on this context.
+ *
+ * @generated from message legion.AppActionInfo
+ */
+export class AppActionInfo extends Message<AppActionInfo> {
+  /**
+   * The action's name, for InvokeAppAction.
+   *
+   * @generated from field: string name = 1;
+   */
+  name = "";
+
+  /**
+   * Its title, the default button label.
+   *
+   * @generated from field: string title = 2;
+   */
+  title = "";
+
+  /**
+   * The confirmation to show, with `{job}` and the other context
+   * placeholders filled in. Empty when none is needed: a `write` action
+   * always has one (its own, or "<title>?").
+   *
+   * @generated from field: string confirm = 3;
+   */
+  confirm = "";
+
+  /**
+   * The declared inputs, as a JSON object keyed by input name:
+   * `{ "for": { "type": "duration", "default": "1h" } }`. Types are
+   * `string`, `number`, `duration`, `enum` (with `values`), and `boolean`.
+   *
+   * @generated from field: string inputs_json = 4;
+   */
+  inputsJson = "";
+
+  /**
+   * The permission InvokeAppAction checks as the caller.
+   *
+   * @generated from field: legion.UiPermission permission = 5;
+   */
+  permission?: UiPermission;
+
+  /**
+   * Whether the caller holds it on this context. The SPA disables the
+   * button otherwise; the check runs again on invocation.
+   *
+   * @generated from field: bool allowed = 6;
+   */
+  allowed = false;
+
+  /**
+   * Whether the action is a `write`.
+   *
+   * @generated from field: bool mutating = 7;
+   */
+  mutating = false;
+
+  constructor(data?: PartialMessage<AppActionInfo>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.AppActionInfo";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "name", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 2, name: "title", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 3, name: "confirm", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 4, name: "inputs_json", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 5, name: "permission", kind: "message", T: UiPermission },
+    { no: 6, name: "allowed", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
+    { no: 7, name: "mutating", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): AppActionInfo {
+    return new AppActionInfo().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): AppActionInfo {
+    return new AppActionInfo().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): AppActionInfo {
+    return new AppActionInfo().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: AppActionInfo | PlainMessage<AppActionInfo> | undefined, b: AppActionInfo | PlainMessage<AppActionInfo> | undefined): boolean {
+    return proto3.util.equals(AppActionInfo, a, b);
+  }
+}
+
+/**
+ * Response payload for GetAppView.
+ *
+ * @generated from message legion.GetAppViewReply
+ */
+export class GetAppViewReply extends Message<GetAppViewReply> {
+  /**
+   * The app's name.
+   *
+   * @generated from field: string app = 1;
+   */
+  app = "";
+
+  /**
+   * The view that was rendered.
+   *
+   * @generated from field: string view = 2;
+   */
+  view = "";
+
+  /**
+   * The context, normalized (namespace filled in, `ns/job` split).
+   *
+   * @generated from field: legion.AppViewContext context = 3;
+   */
+  context?: AppViewContext;
+
+  /**
+   * The view document, validated, as JSON: `{ "view": "legion-view/1",
+   * "title"?, "badge"?, "hidden"?, "blocks": [...] }` (docs/apps.md, "The
+   * view schema").
+   *
+   * @generated from field: string view_json = 4;
+   */
+  viewJson = "";
+
+  /**
+   * The entry's title; the document's own `title` overrides it.
+   *
+   * @generated from field: string title = 5;
+   */
+  title = "";
+
+  /**
+   * The actions the document's `actions` blocks reference.
+   *
+   * @generated from field: repeated legion.AppActionInfo actions = 6;
+   */
+  actions: AppActionInfo[] = [];
+
+  /**
+   * The app's `ui.refresh`, in seconds; 0 for none.
+   *
+   * @generated from field: uint32 refresh_seconds = 7;
+   */
+  refreshSeconds = 0;
+
+  /**
+   * The allocation that answered.
+   *
+   * @generated from field: int64 allocation_id = 8;
+   */
+  allocationId = protoInt64.zero;
+
+  /**
+   * The node it runs on.
+   *
+   * @generated from field: string node_id = 9;
+   */
+  nodeId = "";
+
+  constructor(data?: PartialMessage<GetAppViewReply>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.GetAppViewReply";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "app", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 2, name: "view", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 3, name: "context", kind: "message", T: AppViewContext },
+    { no: 4, name: "view_json", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 5, name: "title", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 6, name: "actions", kind: "message", T: AppActionInfo, repeated: true },
+    { no: 7, name: "refresh_seconds", kind: "scalar", T: 13 /* ScalarType.UINT32 */ },
+    { no: 8, name: "allocation_id", kind: "scalar", T: 3 /* ScalarType.INT64 */ },
+    { no: 9, name: "node_id", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): GetAppViewReply {
+    return new GetAppViewReply().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): GetAppViewReply {
+    return new GetAppViewReply().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): GetAppViewReply {
+    return new GetAppViewReply().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: GetAppViewReply | PlainMessage<GetAppViewReply> | undefined, b: GetAppViewReply | PlainMessage<GetAppViewReply> | undefined): boolean {
+    return proto3.util.equals(GetAppViewReply, a, b);
+  }
+}
+
+/**
+ * Request payload for InvokeAppAction.
+ *
+ * @generated from message legion.InvokeAppActionRequest
+ */
+export class InvokeAppActionRequest extends Message<InvokeAppActionRequest> {
+  /**
+   * The app's name.
+   *
+   * @generated from field: string app = 1;
+   */
+  app = "";
+
+  /**
+   * The action's name (`ui.actions[].name`).
+   *
+   * @generated from field: string action = 2;
+   */
+  action = "";
+
+  /**
+   * Where it was pressed: a `job`, `task`, or `node` context.
+   *
+   * @generated from field: legion.AppViewContext context = 3;
+   */
+  context?: AppViewContext;
+
+  /**
+   * The inputs, as a JSON object; empty or `{}` for the defaults.
+   *
+   * @generated from field: string inputs_json = 4;
+   */
+  inputsJson = "";
+
+  /**
+   * Optional client key for retry-safe submission: a repeated key from the
+   * same caller with the same arguments returns the first successful
+   * reply with `deduplicated` set, and the app sees one request.
+   *
+   * @generated from field: optional string idempotency_key = 5;
+   */
+  idempotencyKey?: string;
+
+  constructor(data?: PartialMessage<InvokeAppActionRequest>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.InvokeAppActionRequest";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "app", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 2, name: "action", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 3, name: "context", kind: "message", T: AppViewContext },
+    { no: 4, name: "inputs_json", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 5, name: "idempotency_key", kind: "scalar", T: 9 /* ScalarType.STRING */, opt: true },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): InvokeAppActionRequest {
+    return new InvokeAppActionRequest().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): InvokeAppActionRequest {
+    return new InvokeAppActionRequest().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): InvokeAppActionRequest {
+    return new InvokeAppActionRequest().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: InvokeAppActionRequest | PlainMessage<InvokeAppActionRequest> | undefined, b: InvokeAppActionRequest | PlainMessage<InvokeAppActionRequest> | undefined): boolean {
+    return proto3.util.equals(InvokeAppActionRequest, a, b);
+  }
+}
+
+/**
+ * Response payload for InvokeAppAction.
+ *
+ * @generated from message legion.InvokeAppActionReply
+ */
+export class InvokeAppActionReply extends Message<InvokeAppActionReply> {
+  /**
+   * What the app says happened.
+   *
+   * @generated from field: string message = 1;
+   */
+  message = "";
+
+  /**
+   * A refreshed view the app returned, validated, as JSON; empty when it
+   * returned none.
+   *
+   * @generated from field: string view_json = 2;
+   */
+  viewJson = "";
+
+  /**
+   * True when `idempotency_key` matched an earlier call.
+   *
+   * @generated from field: bool deduplicated = 3;
+   */
+  deduplicated = false;
+
+  /**
+   * The inputs the action ran with, defaults filled in, as JSON.
+   *
+   * @generated from field: string inputs_json = 4;
+   */
+  inputsJson = "";
+
+  constructor(data?: PartialMessage<InvokeAppActionReply>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.InvokeAppActionReply";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "message", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 2, name: "view_json", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 3, name: "deduplicated", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
+    { no: 4, name: "inputs_json", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): InvokeAppActionReply {
+    return new InvokeAppActionReply().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): InvokeAppActionReply {
+    return new InvokeAppActionReply().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): InvokeAppActionReply {
+    return new InvokeAppActionReply().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: InvokeAppActionReply | PlainMessage<InvokeAppActionReply> | undefined, b: InvokeAppActionReply | PlainMessage<InvokeAppActionReply> | undefined): boolean {
+    return proto3.util.equals(InvokeAppActionReply, a, b);
   }
 }
 

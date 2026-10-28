@@ -6,7 +6,7 @@ import { ConnectionGate } from './components/ConnectionGate'
 import { HeaderNamespaceControl } from './components/NamespaceSwitcher'
 import { lazyPage } from './components/LazyPage'
 import { ShortcutsHelp } from './components/ShortcutsHelp'
-import { Button, Dot, Icon, JumpHint, Kbd, PageHeader, RelativeTime, cx, type IconName } from './components/ui'
+import { Button, Dot, Icon, JumpHint, Kbd, PageHeader, RelativeTime, cx, hasIcon, type IconName } from './components/ui'
 import { managerClient } from './grpcClient'
 import { ROUTE_RESOURCE, canRead, isAnonymous } from './utils/acl'
 import { isMultiNamespace } from './utils/namespaces'
@@ -60,6 +60,8 @@ import Volumes from './pages/Volumes'
 import Raft from './pages/Raft'
 import Templates from './pages/Templates'
 import TemplateDetail from './pages/details/TemplateDetail'
+import AppPage from './pages/AppPage'
+import { appPagePath, uiExtensions } from './utils/appViews'
 
 // The developer tools carry the heaviest code (the API Explorer ships the
 // generated proto sources as text for its docs), so they load on first
@@ -99,7 +101,7 @@ type CommandPaletteItem = {
 
 type SidebarNode = SidebarItem | SidebarSection
 
-const detailRoutes = new Set(['jobs', 'nodes', 'manager', 'rollouts', 'services', 'templates', 'volumes', 'allocations', 'namespaces'])
+const detailRoutes = new Set(['jobs', 'nodes', 'manager', 'rollouts', 'services', 'templates', 'volumes', 'allocations', 'namespaces', 'apps'])
 
 // The section a detail URL belongs to, as the ⌘K "Recent" group names it.
 const RECENT_KINDS: Record<string, string> = {
@@ -311,6 +313,24 @@ const Layout = (props: RouteSectionProps) => {
         ],
       },
     ]
+
+    // Installed apps' pages (the `nav` slot; docs/apps.md, "Views and
+    // actions"): one item per page the viewer may see, between the cluster
+    // and the system sections.
+    const appItems: SidebarItem[] = uiExtensions()
+      .filter((entry) => entry.slot === 'nav' && entry.view)
+      .map((entry) => ({
+        kind: 'item',
+        label: entry.title,
+        path: appPagePath(entry.app, entry.view),
+        title: entry.title,
+        copy: entry.appDescription || `From the ${entry.app} app.`,
+        icon: hasIcon(entry.icon) ? entry.icon : 'boxes',
+      }))
+    if (appItems.length > 0) {
+      const system = base.findIndex((item) => item.kind === 'section' && item.heading === 'System')
+      base.splice(system < 0 ? base.length : system, 0, { kind: 'section', heading: 'Apps', items: appItems })
+    }
 
     if (o11yStatus()?.o11yEnabled) {
       const developer = base.find((item) => item.kind === 'section' && item.heading === 'Developer') as SidebarSection | undefined
@@ -1177,6 +1197,7 @@ const AppRoutes = () => {
       <Route path="/jobs/:namespace/:name/specs/:configId" component={JobSpecDetail} />
       <Route path="/jobs/:namespace/:name/instances/:instanceId" component={InstanceDetail} />
       <Route path="/allocations/:id" component={AllocationDetail} />
+      <Route path="/apps/:app/:view" component={AppPage} />
       <Route path="/services" component={Services} />
       <Route path="/services/:namespace/:name" component={ServiceDetail} />
       <Route path="/network" component={Network} />

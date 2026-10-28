@@ -11,12 +11,16 @@ export function getStoredToken(): string | null {
   return localStorage.getItem(TOKEN_STORAGE_KEY)
 }
 
+/** Dispatched on `window` whenever the stored token changes. */
+export const TOKEN_CHANGED_EVENT = 'legion-token-changed'
+
 export function setStoredToken(token: string | null) {
   if (token && token.trim().length > 0) {
     localStorage.setItem(TOKEN_STORAGE_KEY, token.trim())
   } else {
     localStorage.removeItem(TOKEN_STORAGE_KEY)
   }
+  if (typeof window !== 'undefined') window.dispatchEvent(new Event(TOKEN_CHANGED_EVENT))
 }
 
 // Attach the stored ACL token (if any) to every request. With ACLs disabled
