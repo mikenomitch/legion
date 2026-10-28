@@ -359,3 +359,425 @@ cloud-hypervisor or Firecracker microVM. What burst reuses unchanged:
   the worker or through `LEGION_GUEST_BINARY`
   ([sandbox doc](../../docs/task-runtime-sandbox.md#the-guest-agent)).
   `legion-isolate` is found the same way.
+
+## 6. The decision space
+
+(Pending: the option-by-option analysis of the engine, languages, process
+and thread model, memory, start path, async and yielding, ceding memory,
+instance lifetime, host API, security, limits, burst, and observability.
+It lands once the research it rests on is in.)
+
+## 7. The surface
+
+### 7.1 The jobspec
+
+An isolate task is a session task on the `isolate` runtime. Everything
+under `config` is new; `stateful`, `resources`, `connect`, `network`, and
+`suspend` mean what they mean today.
+
+```nickel
+{
+  name = "code-runner",
+  tasks = [{
+    name = "run",
+    runtime = "isolate",
+    config = {
+      # What runs: a built-in image ("js", "python") or a component.
+      image = "python",
+      # entry = "main.py",           # pre-initialized at stage time; omit
+      #                               # for dynamic code (RunIsolate)
+      # module = { source = "oci://ghcr.io/acme/handler:1.4", sha256 = "..." },
+      lifetime = "request",           # "request" (default) | "tenant" | "session"
+      limits = {
+        cpu = "100ms",                # CPU per invocation (turns summed)
+        wall = "30s",                 # wall clock per invocation
+        memory = "128MiB",            # linear memory cap per isolate
+        output = "1MiB",              # stdout + stderr returned per run
+      },
+      cordon = "namespace",           # "namespace" (default) | "job" | "shared"
+      burst = {
+        on = ["requested", "unsupported", "limits"],
+        replay = "before-egress",     # "never" | "before-egress" | "always"
+        sandbox = {                   # a `sandbox` runtime config, unchanged
+          image = "python:3.13-slim",
+          vcpus = 1,
+        },
+        resources = { cpu = 1000, memory = 1024 },          # per VM
+        envelope = { resources = { cpu = 8000, memory = 16384 },
+                     max = { cpu = 32000, memory = 65536 } }, # per node
+      },
+    },
+    # The admission charge per isolate: what the node assumes one costs.
+    # The hard cap is config.limits.memory. See §6.11.
+    resources = { cpu = 5, memory = 2 },
+    stateful = {
+      mode = "session",
+      envelope = { resources = { cpu = 16000, memory = 32768 } },
+    },
+    connect = {
+      upstreams = [{
+        name = "openai",
+        to = "https://api.openai.com",
+        credentials = [{ header = "Authorization", prefix = "Bearer ",
+                         from = { kv = "secrets/openai" } }],
+      }],
+    },
+  }],
+}
+```
+
+What submit checks, with the errors it gives:
+
+```text
+[isolate] code-runner/run: runtime "isolate" needs stateful.mode = "session" (isolates are node-owned and never written to the store; see docs/task-runtime-isolate.md)
+[isolate] code-runner/run: config.limits.memory 8GiB is above this cluster's isolate maximum 4GiB (worker isolate.maxMemory); burst to a VM for more
+[isolate] code-runner/run: config.burst.on includes "limits" but config.burst.sandbox is not set
+[isolate] code-runner/run: config.cordon = "shared" is refused by namespace policy 'tenants' (isolateCordons = ["namespace", "job"])
+```
+
+An HTTP handler declares a port, and ingress dispatches into the host
+without a TCP hop:
+
+```nickel
+network = { ports = [{ name = "http" }] },
+```
+
+### 7.2 The CLI
+
+```console
+$ legion isolate run code-runner --file snippet.py -j
+{"ok":true,"data":{"tier":"isolate","node":"w-17","exit":0,
+ "stdout":"42\n","stderr":"","cpuMs":3.1,"wallMs":4.0,"burst":null,
+ "deduplicated":false}}
+
+$ legion isolate run code-runner --file transcode.py --idempotency-key t-81 -j
+{"ok":true,"data":{"tier":"vm","node":"w-17","exit":0,"stdout":"done\n",
+ "burst":{"reason":"unsupported","detail":"subprocess.run: processes are not available in an isolate",
+          "replayed":true,"vmMs":231},"cpuMs":1.2,"wallMs":1890,"deduplicated":false}}
+
+$ legion isolate run code-runner --file loop.py -j
+{"ok":false,"error":{"code":"isolate_limit",
+ "message":"isolate exceeded its 100ms CPU limit (100.4ms) and burst.on does not include \"limits\"",
+ "hint":"raise config.limits.cpu, or add \"limits\" to config.burst.on to rerun it in a VM",
+ "retryable":false}}
+
+$ legion isolate stats code-runner -j
+{"ok":true,"data":{"task":"run","nodes":[
+  {"node":"w-17","resident":48213,"active":312,"pagedOut":20114,"hibernated":391022,
+   "invocationsPerSec":8410,"cpuSecondsPerSec":11.2,"burstsPerMin":14,
+   "cordon":"default","hostRssBytes":21474836480}]}}
+
+$ legion isolate validate code-runner --file snippet.py -j   # pre-flight only
+{"ok":true,"data":{"tier":"isolate","imports":["json","csv"],"reason":null}}
+```
+
+`run` also takes `--source -` (stdin), `--input` (JSON handed to the
+entry point), `--tier auto|isolate|vm` (default `auto`), `--node` with
+`--ticket` for an edge call, and `--session <id>` to run in an existing
+session isolate. `validate` runs only the pre-flight check (§6.12) and
+never executes code.
+
+### 7.3 The RPCs
+
+- **`Manager.RunIsolate`** (`job:write` on the job). The manager's session
+  router picks a node with envelope room, exactly as for an unnamed
+  session create, and forwards. Nothing is written.
+- **`Worker.RunIsolate`** on the worker-plane port with a session ticket,
+  for edge callers with no manager on the path (the edge start's shape).
+- **`Worker.GetIsolateStats`** and the heartbeat's per-task aggregates
+  behind `legion isolate stats`.
+
+`RunIsolateRequest`: `job_id`, `task_name`, `source` or `input`,
+`tier`, `session_id`, `idempotency_key`, `wait_timeout`. `RunIsolateResponse`:
+`tier`, `node_id`, `exit`, `stdout`, `stderr` (bounded by
+`limits.output`, with `truncated`), `result` (JSON the entry returned),
+`cpu_ms`, `wall_ms`, `burst { reason, detail, replayed, vm_ms }`,
+`deduplicated`. Idempotency is per node, as for edge session starts: the
+key derives an invocation id, and the node keeps the reply for 10 minutes.
+
+### 7.4 The guest's world
+
+The interface a component is written against, in WIT. Imports a world
+does not use are not linked, so a component that imports something the
+host does not provide fails at deploy, not at the call.
+
+```wit
+package legion:isolate@0.1.0;
+
+interface vm {
+  resource machine {
+    exec: func(argv: list<string>, stdin: list<u8>, timeout-ms: u32)
+          -> result<exec-result, error>;
+    put: func(path: string, bytes: list<u8>) -> result<_, error>;
+    get: func(path: string) -> result<list<u8>, error>;
+    fetch: func(port: u16, request: outgoing-request) -> result<incoming-response, error>;
+  }
+  acquire: func(profile: option<string>) -> result<machine, error>;
+}
+
+world handler {
+  import wasi:clocks/monotonic-clock@0.2.0;   // frozen within a turn
+  import wasi:clocks/wall-clock@0.2.0;        // coarsened to 1 ms
+  import wasi:random/random@0.2.0;
+  import wasi:cli/environment@0.2.0;          // the task's env
+  import wasi:cli/stdout@0.2.0;               // to the task's log, and the run's reply
+  import wasi:cli/stderr@0.2.0;
+  import wasi:filesystem/types@0.2.0;         // in-memory scratch, counted in the memory cap
+  import wasi:http/outgoing-handler@0.2.0;    // through the node egress datapath
+  import legion:isolate/state;                // tenant- or session-scoped bytes
+  import legion:isolate/vm;                   // burst
+  export wasi:http/incoming-handler@0.2.0;    // or wasi:cli/run for commands
+}
+```
+
+The same world exists in its WASI 0.3 form (async functions on the
+stackless ABI) once the toolchains it needs support it (§6.6).
+
+### 7.5 Agents
+
+- An MCP tool `isolate_run` (`mutates: true`, so behind `--allow-write`)
+  and `isolate_validate` (read-only), wrapping the RPCs.
+- `catalog()` entries in `src/cmd/capabilities.rs` for `isolate run`
+  (`mutates: true`, `read_only_safe: false`), `isolate validate`, and
+  `isolate stats`.
+- `docs/agent-readiness.md` gains the isolate surface, including the
+  per-node idempotency rule.
+
+## 8. The control plane (kept small on purpose)
+
+Isolates add no placement model. An `isolate` task is a session task:
+
+1. **Envelopes reserve the room.** Submit generates `<task>-envelope` as
+   for any session task. The envelope stays a reservation and runs
+   nothing; the cordon host is node infrastructure, started by the worker
+   when the first envelope that needs it lands, and its cgroup's
+   `memory.max` and `cpu.weight` are the sum of the envelopes it serves.
+   Burst generates a second session task, `<task>-burst`, on the `sandbox`
+   runtime, with `burst.envelope` as its (elastic) envelope.
+2. **Routing is the session router's.** `RunIsolate` and HTTP ingress go
+   to any node with envelope room, picked by `stateful.placement`. A
+   session isolate's id carries its node tag, so a later call goes
+   straight to its node, through the router, the gateway, or an edge
+   caller.
+3. **Starting an isolate takes no launch slot.** The launch pool bounds VM
+   boots. An isolate start is admitted against the envelope by the host
+   itself, and the host's own concurrency limits apply (§6.11). A burst VM
+   takes a launch slot like any sandbox session.
+4. **Nothing per isolate leaves the node.** The heartbeat carries one
+   aggregate per isolate task (`resident`, `active`, `paged_out`,
+   `hibernated`, invocation and CPU counters, bursts, refusals), folded by
+   the manager like usage. A session isolate is not in the managers'
+   session index; `legion isolate get <id>` asks the node its tag names.
+5. **Hibernated session isolates follow session sleep rules.**
+   `suspend.durability = "local"` keeps the hibernation file on the node;
+   `"store"` publishes it and writes a session manifest, so the session can
+   wake on another node.
+
+What the managers never see: an isolate's start, end, invocation,
+page-out, or hibernation.
+
+## 9. Proto, struct, config, and persistence changes
+
+- **Proto.** `Manager.RunIsolate`, `Worker.RunIsolate`,
+  `Worker.GetIsolateStats`, `IsolateTaskStats` on the heartbeat's usage
+  report, and the request/response messages in §7.3, each with full public
+  proto comments.
+- **Job config.** `config` for the `isolate` runtime (§7.1), validated by
+  the runtime's schema. New fields go into `configs/jobs/maximal.ncl` with
+  the runtime.
+- **Namespace policy.** `isolateCordons` (allowed cordon kinds) next to
+  `runtimes`.
+- **Worker config.** An `isolate` block: `binary` (default: beside the
+  worker, then `LEGION_ISOLATE_BINARY`), `maxMemory` (per isolate, default
+  4 GiB), `slotsPerHost`, `shards` (default: cores in the host's cpuset),
+  `epoch` (default `1ms`), `slice` (default `5ms`),
+  `hibernation = { dir, budget }`, `cordonBoundary = "process" | "vm"`.
+- **Persistence.** None in the store. On the node: the compiled-module
+  cache under the content store (keyed by module digest, engine version,
+  and CPU feature set), and hibernation files under
+  `<worker state dir>/isolates/`. Session isolates in `store` durability
+  reuse session manifests.
+- **Struct.** `IsolateTaskConfig`, `IsolateLimits`, `IsolateBurstConfig`,
+  `IsolateStats` in `src/structs/`.
+
+## 10. Target numbers per phase
+
+Targets assume a 16-vCPU, 64 GiB x86-64 node with 4-level paging and
+MPK, and are replaced by Phase 0's measurements.
+
+| Phase | Start p50 | Resident per node | Waiting cost | Burst |
+| --- | --- | --- | --- | --- |
+| 0: measure | measured per image | measured bytes per idle isolate per image | measured fiber vs stackless | measured cold boot |
+| 1: isolate runtime, one job per host | ≤ 20 µs (component) | ≥ 2×10^4 (guard-page slots) | one fiber per in-flight call | none |
+| 2: shared hosts, cordons | unchanged | unchanged per host, any mix of jobs | unchanged | none |
+| 3: images and dynamic code | ≤ 300 µs JS pre-init, ≤ 1 ms JS dynamic, ≤ 5 ms Python | ≥ 500 JS per GiB | unchanged | none |
+| 4: sessions and memory tiers | wake from page-out ≤ 200 µs, from hibernation ≤ 2 ms | ≥ 10^5 resident, ≥ 10^6 hibernated | no stack for stackless guests | none |
+| 5: burst | unchanged | unchanged | unchanged | ≤ 250 ms cold, ≤ 50 ms warm (needs scaling Phase 8) |
+| 6: density and hardening | unchanged | ≥ 2×10^5 resident (MPK striping) | unchanged | unchanged |
+
+## 11. Implementation phases
+
+Each phase ships on its own and is useful on its own.
+
+- **Phase 0: measure before building.** A spike binary, not merged into
+  the worker, on the AWS rig's instance types (nested and metal): wasmtime
+  pooling instantiation p50/p99 for a Rust component, the StarlingMonkey
+  and QuickJS images, and CPython; private memory per idle instance per
+  image; slots per process with guard pages, with MPK striping, and with
+  small reservations; epoch-check overhead on a CPU benchmark; fiber
+  versus stackless suspend and resume; V8 isolate creation and floor
+  through `rusty_v8` for the same JS, so the Phase 7 call rests on our own
+  numbers; `legion-isolate` binary size with and without Cranelift. Output:
+  a findings doc and §4/§10 rewritten to measured numbers.
+- **Phase 1: the `isolate` runtime, one job per host.** `legion-isolate`
+  (host and `compile` subcommand), one host per (job, node) envelope, the
+  shard model, pooling allocator with copy-on-write images, epoch
+  preemption, limits, `wasi:cli/run` commands and `wasi:http` handlers
+  from precompiled components, request lifetime, logs, egress through the
+  worker datapath with PROXY v2 attribution, ingress dispatch, `isolate
+  run`/`validate`/`stats`, the RPCs, catalog and MCP entries, and the
+  public page `docs/task-runtime-isolate.md`. Closes the TODO "WASM
+  runtime" item.
+- **Phase 2: shared hosts and cordons.** Many jobs per host by cordon
+  policy, per-job admission and per-tenant fair scheduling inside a host,
+  the host's seccomp allowlist, Landlock, empty network namespace, and
+  user namespace, namespace policy `isolateCordons`, and the kill switch
+  (§13).
+- **Phase 3: images and dynamic code.** The `js` and `python` images,
+  stage-time pre-initialization of `entry`, dynamic snippets through
+  `RunIsolate`, the tiered compile pipeline for dynamic Wasm, and the
+  pre-flight import check.
+- **Phase 4: session isolates and memory tiers.** `lifetime = "tenant" |
+  "session"`, the stackless async world, page-out and hibernation,
+  host-held connections, gateway wake, `durability = "store"` through
+  session manifests, and the memory-pressure step.
+- **Phase 5: burst.** `legion:isolate/vm`, the generated `<task>-burst`
+  task, replay before egress, the per-code-hash burst memo, and warm
+  restores once scaling Phase 8 lands.
+- **Phase 6: density and hardening.** MPK striping, small-reservation
+  slots, 5-level paging where the kernel offers it, `cordonBoundary =
+  "vm"`, SELinux `execmem` denial for hosts, perf-counter quarantine, and
+  the Spectre-mode knobs.
+- **Phase 7 (conditional): a V8 engine** for JS tenants, built only when
+  Phase 3's telemetry shows the trigger in calls entry 1.
+- **Phase 8 (research): continuation migration**, resuming a hibernated
+  isolate inside a VM-hosted `legion-isolate` with the full filesystem and
+  process capabilities (§6.12, model C).
+
+## 12. Testing plan
+
+- **Unit (Phase 1+).** Limits arithmetic and trap classification
+  (`describe_failure`'s successor for wasmtime traps, epoch deadlines,
+  memory refusals); admission against an envelope with the cap and the
+  charge distinct; the shard scheduler's fairness (deficit round robin
+  across tenants under a synthetic load, asserting CPU shares within 5%);
+  idempotent invocation ids; the egress attribution header round trip.
+- **Integration (`tests/integration/isolate.rs`, one module of the shared
+  binary).** A component answers HTTP through ingress; a component's
+  outbound request reaches an upstream with an injected credential the
+  guest never sees; CPU, wall, memory, and output limits each produce
+  their error envelope; a host process killed mid-invocation fails its
+  in-flight runs with a retryable error and the worker restarts it; a job
+  in one cordon cannot be scheduled into another's host; `RunIsolate`
+  through the manager and at the edge with a ticket; the ACL table entry
+  for every new Manager RPC in `tests/integration/acl_endpoints.rs`.
+- **Confinement (Phase 2).** A test build of the host with a hook that
+  attempts each forbidden syscall (`socket`, `openat` outside the cache,
+  `execve`, `ptrace`, anonymous `PROT_EXEC`) and asserts the kill; the
+  host's network namespace has no interface.
+- **Guest-escape regression corpus.** Known-bad modules (out-of-bounds
+  loads at every width, table index masking cases, the CVE-2023-26489
+  reproduction) run against every engine upgrade in CI.
+- **Fuzzing.** `cargo fuzz` targets for each host function's argument
+  decoding and for the WIT boundary, run nightly.
+- **Benchmarks.** `benchmarks/micro/isolate_bench.rs`: instantiate per
+  image, turn switch, page-out and wake, hibernate and wake, egress round
+  trip through the worker. Scheduler-style before/after numbers in every
+  PR that touches the host's hot path.
+- **Density campaign (Phase 4, 6).** An AWS run that fills a node with
+  session isolates to its memory budget and reports resident, paged, and
+  hibernated counts, wake latencies, and host RSS per isolate.
+- **Burst (Phase 5).** Ignored-by-default KVM tests: `vm.acquire` and exec,
+  replay before egress, refusal of replay after egress, burst memo.
+
+## 13. Rollout and backward compatibility
+
+- **New surface only.** No existing job, runtime, or default changes.
+  Network plugins keep wasmi.
+- **Default on where it can run.** The runtime loads on a worker that finds
+  `legion-isolate` beside it (or through `LEGION_ISOLATE_BINARY`), as the
+  sandbox runtime loads where it finds `legion-guest`. A worker without the
+  binary does not advertise the `isolates` capability, so envelopes are
+  not placed there. A namespace policy keeps namespaces off the tier
+  (`runtimes`) or limits cordon kinds (`isolateCordons`).
+- **The kill switch.** `legion operator isolate disable [--namespace N]`
+  sets a replicated flag that workers read on the heartbeat: new
+  invocations are refused with `isolate_disabled` (retryable), or burst
+  when `burst.on` includes `"requested"`, and running hosts drain within
+  `limits.wall`. `enable` reverses it. This is the CVE response.
+- **Engine upgrades.** The compiled-module cache is keyed by engine
+  version, so a new `legion-isolate` recompiles on first use per node;
+  Phase 1 adds a prefetch that compiles a job's module for the new version
+  before the old host drains. Hibernation files record the engine version
+  and image digest; a mismatch wakes the isolate fresh with an `onResume`
+  notice rather than restoring incompatible memory.
+- **Breaking changes.** None; there is no installed base of isolates.
+
+## 14. Open questions
+
+1. **StarlingMonkey or QuickJS for the default `js` image?** Lean:
+   StarlingMonkey for Web API compatibility and weval's speed, with QuickJS
+   as `js-small` if Phase 0 shows its idle footprint is several times
+   smaller. Phase 0 decides.
+2. **Shared pool envelopes for many small jobs.** A FaaS platform with one
+   Legion job per customer cannot afford an envelope per job per node.
+   Lean: a namespace-level isolate envelope that every isolate task in the
+   namespace draws from, with per-job quota from namespace policy; its own
+   plan after Phase 2.
+3. **UDS framing or a shared-memory ring between host and worker?** Lean:
+   HTTP/2 over a socketpair first; a ring only if the worker's CPU per
+   egress request exceeds 20 µs at the target rate.
+4. **Python packages with native code.** Lean: curated images
+   (`python-data` with numpy and pandas built for WASI) when Phase 3 finds
+   working builds, and burst for everything else; never a package
+   installer in the isolate.
+5. **Should session isolates ever appear in the managers' index?** Lean:
+   no; revisit only if a platform needs cluster-wide listing and can name
+   the count.
+6. **Hyperlight micro-VMs as the cordon boundary instead of a microVM per
+   cordon.** Lean: revisit at Phase 6 if Hyperlight's Linux/KVM support
+   and host-call model are stable.
+7. **Per-tenant memory enforcement inside a shared host.** The kernel's
+   memory controller is per process, so per-job memory inside a shared
+   host is enforced by the host's own accounting, with the cordon's cgroup
+   as the backstop. Lean: accept, state it in the public doc, and keep
+   `cordon = "job"` for jobs that need the kernel to enforce their
+   envelope.
+
+## 15. Acceptance criteria
+
+- **Phase 0:** a findings doc with the measurements listed in §11, and §4
+  and §10 rewritten to them, with a calls entry for any target dropped.
+- **Phase 1:** `legion isolate run` of a Rust component returns in under
+  2 ms end to end on one node; `isolate_bench` shows instantiation at or
+  under the Phase 0 target; an outbound request carries an injected
+  credential the guest never read; every limit has its error envelope;
+  `docs/task-runtime-isolate.md` exists and stands alone.
+- **Phase 2:** two jobs in the same namespace share one host process and
+  two namespaces do not; the confinement test kills the host on each
+  forbidden syscall; `isolate disable` refuses new runs within one
+  heartbeat.
+- **Phase 3:** `isolate run --file x.js` and `--file x.py` meet the §10
+  start targets; a dynamic Wasm module runs on its first call through the
+  baseline tier and later calls use the optimized artifact.
+- **Phase 4:** a node holds the §10 resident and hibernated counts in the
+  density campaign; a hibernated session isolate wakes within target and
+  keeps its state; an isolate awaiting a 20 s upstream holds no thread
+  (shard thread count constant under 10^4 concurrent awaits).
+- **Phase 5:** `vm.acquire` returns a machine that runs `exec`; a snippet
+  calling a subprocess replays in a VM when it made no egress and fails
+  with `isolate_unsupported` when it did; a burst VM reaches the same
+  upstream with the same injected credential.
+- **Phase 6:** slots per host with MPK striping at least 5× the guard-page
+  layout's, measured; `cordonBoundary = "vm"` runs a cordon host inside a
+  microVM end to end.
