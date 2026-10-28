@@ -25,7 +25,7 @@ use crate::structs::{
 /// A standalone policy, resolved.
 pub(super) enum Resolved {
     /// An external target's effective policy.
-    External(ResolvedPolicy),
+    External(Box<ResolvedPolicy>),
     /// A node group's, every default filled.
     Nodes(Box<EffectiveNodeGroup>),
 }
@@ -89,7 +89,12 @@ impl LoadedPolicy {
             }
             Ok(StandaloneSpec::Nodes(policy)) => (
                 policy.target.nodes.plugin.clone(),
-                policy.target.nodes.config.clone().unwrap_or_else(|| json!({})),
+                policy
+                    .target
+                    .nodes
+                    .config
+                    .clone()
+                    .unwrap_or_else(|| json!({})),
             ),
             Err(_) => (String::new(), json!({})),
         }
@@ -98,7 +103,7 @@ impl LoadedPolicy {
     /// The external policy's resolution (provenance, diffs).
     pub fn external(&self) -> Option<&ResolvedPolicy> {
         match &self.resolved {
-            Ok(Resolved::External(resolved)) => Some(resolved),
+            Ok(Resolved::External(resolved)) => Some(resolved.as_ref()),
             _ => None,
         }
     }
@@ -117,9 +122,9 @@ pub(super) fn load_policy(row: ScalingPolicyRow, layers: &AutoscaleLayers) -> Lo
             standalone::parse(&spec, namespace)
         });
     let resolved = match &spec {
-        Ok(StandaloneSpec::External(policy)) => {
-            layers.resolve_standalone(policy).map(Resolved::External)
-        }
+        Ok(StandaloneSpec::External(policy)) => layers
+            .resolve_standalone(policy)
+            .map(|resolved| Resolved::External(Box::new(resolved))),
         Ok(StandaloneSpec::Nodes(policy)) => layers
             .resolve_node_group(policy)
             .map(|group| Resolved::Nodes(Box::new(group))),
@@ -503,14 +508,16 @@ impl ManagerDaemonService {
         let layers = AutoscaleLayers::load(&self.store)
             .map_err(|e| map_store_error("Error loading scaling defaults", e))?;
         let resolved = match &parsed {
-            StandaloneSpec::External(policy) => {
-                layers.resolve_standalone(policy).map(Resolved::External)
-            }
+            StandaloneSpec::External(policy) => layers
+                .resolve_standalone(policy)
+                .map(|resolved| Resolved::External(Box::new(resolved))),
             StandaloneSpec::Nodes(policy) => layers
                 .resolve_node_group(policy)
                 .map(|group| Resolved::Nodes(Box::new(group))),
         }
-        .map_err(|err| Status::invalid_argument(format!("Error validating scaling policy: {err}")))?;
+        .map_err(|err| {
+            Status::invalid_argument(format!("Error validating scaling policy: {err}"))
+        })?;
         let current = self
             .store
             .scaling_policy(&namespace, &name)

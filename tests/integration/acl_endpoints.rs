@@ -3667,7 +3667,8 @@ async fn kv_path_scoped_policy_limits_kv_access() -> R<()> {
 
     // With include_locks: the unexpired locks it may read, never their ids.
     for key in ["team/leader", "secret/leader"] {
-        svc.store.acquire_kv_lock(key, None, Some("alloc-1"), 60, false)?;
+        svc.store
+            .acquire_kv_lock(key, None, Some("alloc-1"), 60, false)?;
     }
     let reply = svc
         .list_kv(req(
@@ -3683,7 +3684,13 @@ async fn kv_path_scoped_policy_limits_kv_access() -> R<()> {
     let locks: Vec<(&str, &str, Option<&str>)> = reply
         .locks
         .iter()
-        .map(|lock| (lock.key.as_str(), lock.lock_id.as_str(), lock.owner.as_deref()))
+        .map(|lock| {
+            (
+                lock.key.as_str(),
+                lock.lock_id.as_str(),
+                lock.owner.as_deref(),
+            )
+        })
         .collect();
     assert_eq!(locks, vec![("team/leader", "", Some("alloc-1"))]);
     Ok(())

@@ -209,6 +209,124 @@ async fn the_rust_sdk_example_passes_the_conformance_suite_test() -> R<()> {
     Ok(())
 }
 
+/// The first-party `aws-asg` plugin passes the conformance suite as a node
+/// target against a mock of the AWS API (no AWS involved). It is its own
+/// crate (`plugins/scaling/aws-asg/`), built by `LEGION_BUILD_PLUGINS=1
+/// cargo build` or its CI job; a run that did not build it skips.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_aws_asg_plugin_passes_the_conformance_suite_test() -> R<()> {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let Some(binary) = ["release", "debug"]
+        .iter()
+        .map(|profile| {
+            root.join("target/plugin-build/scaling/aws-asg")
+                .join(profile)
+                .join("aws-asg")
+        })
+        .find(|binary| binary.exists())
+    else {
+        eprintln!("the aws-asg plugin is not built (LEGION_BUILD_PLUGINS=1 cargo build): skipping");
+        return Ok(());
+    };
+    let groups = std::fs::read_to_string(
+        root.join("plugins/scaling/aws-asg/fixtures/describe-auto-scaling-groups.xml"),
+    )?;
+    // A mock AWS: DescribeAutoScalingGroups answers the recorded group;
+    // every other call (SetDesiredCapacity, Terminate…) succeeds.
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let endpoint = format!("http://{}", listener.local_addr()?);
+    let actions = Arc::new(Mutex::new(Vec::<String>::new()));
+    let seen = actions.clone();
+    let server = tokio::spawn(async move {
+        loop {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                return;
+            };
+            let groups = groups.clone();
+            let seen = seen.clone();
+            tokio::spawn(async move {
+                let mut request = Vec::new();
+                let mut buf = [0u8; 8192];
+                // Read the headers, then the body by its content-length.
+                loop {
+                    let Ok(n) = stream.read(&mut buf).await else {
+                        return;
+                    };
+                    if n == 0 {
+                        return;
+                    }
+                    request.extend_from_slice(&buf[..n]);
+                    let text = String::from_utf8_lossy(&request).to_string();
+                    if let Some(end) = text.find("\r\n\r\n") {
+                        let length = text[..end]
+                            .lines()
+                            .find_map(|line| {
+                                let (name, value) = line.split_once(':')?;
+                                name.eq_ignore_ascii_case("content-length")
+                                    .then(|| value.trim().parse::<usize>().ok())?
+                            })
+                            .unwrap_or(0);
+                        if request.len() >= end + 4 + length {
+                            break;
+                        }
+                    }
+                }
+                let text = String::from_utf8_lossy(&request).to_string();
+                let action = text
+                    .split_once("\r\n\r\n")
+                    .map(|(_, body)| body)
+                    .unwrap_or_default()
+                    .split('&')
+                    .find_map(|part| part.strip_prefix("Action="))
+                    .unwrap_or("?")
+                    .to_string();
+                seen.lock().expect("lock").push(action.clone());
+                let body = if action == "DescribeAutoScalingGroups" {
+                    groups
+                } else {
+                    "<Response><ResponseMetadata><RequestId>r</RequestId></ResponseMetadata></Response>"
+                        .to_string()
+                };
+                let reply = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: text/xml\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = stream.write_all(reply.as_bytes()).await;
+            });
+        }
+    });
+    let report = conformance::run(
+        Endpoint::Command {
+            argv: vec![
+                "env".into(),
+                "AWS_ACCESS_KEY_ID=AKIDEXAMPLE".into(),
+                "AWS_SECRET_ACCESS_KEY=wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY".into(),
+                binary.display().to_string(),
+            ],
+            dir: None,
+        },
+        SuiteOptions {
+            config: json!({ "region": "us-east-1", "endpoint": endpoint, "imds": false }),
+            policy_config: json!({ "asg": "legion-workers" }),
+            ..Default::default()
+        },
+    )
+    .await;
+    server.abort();
+    assert!(report.passed, "{:#?}", report.checks);
+    let plugin = report.plugin.as_ref().expect("handshake");
+    assert_eq!(plugin.kinds, vec!["target".to_string()]);
+    assert!(plugin.nodes && plugin.has_schema);
+    let actions = actions.lock().expect("lock").clone();
+    assert!(
+        actions
+            .iter()
+            .any(|action| action == "DescribeAutoScalingGroups"),
+        "{actions:?}"
+    );
+    Ok(())
+}
+
 /// A plugin that is broken in each documented way fails the check that
 /// names it: a timeout, a malformed reply, a crash it does not survive.
 #[tokio::test(flavor = "multi_thread")]

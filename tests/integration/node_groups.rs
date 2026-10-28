@@ -116,7 +116,12 @@ impl Provider {
     pub(crate) fn instances(&self) -> R<Vec<String>> {
         Ok(self.state()?["instances"]
             .as_array()
-            .map(|items| items.iter().filter_map(|i| i.as_str().map(str::to_string)).collect())
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(|i| i.as_str().map(str::to_string))
+                    .collect()
+            })
             .unwrap_or_default())
     }
 
@@ -125,7 +130,10 @@ impl Provider {
         if !path.exists() {
             return Ok(Vec::new());
         }
-        Ok(std::fs::read_to_string(path)?.lines().map(str::to_string).collect())
+        Ok(std::fs::read_to_string(path)?
+            .lines()
+            .map(str::to_string)
+            .collect())
     }
 }
 
@@ -253,7 +261,14 @@ async fn a_node_group_grows_from_zero_and_drains_empty_nodes_test() -> R<()> {
     let report = engine.tick(at).await;
     assert!(report.errors.is_empty(), "{:?}", report.errors);
     assert_eq!(provider.state()?["desired"], 3, "{report:?}");
-    assert_eq!(provider.calls()?.iter().filter(|c| c.starts_with("scale")).count(), 1);
+    assert_eq!(
+        provider
+            .calls()?
+            .iter()
+            .filter(|c| c.starts_with("scale"))
+            .count(),
+        1
+    );
 
     // The machines join, with the group's attribute and their ids.
     let joined = boot(&mut h, &provider).await?;
@@ -277,7 +292,14 @@ async fn a_node_group_grows_from_zero_and_drains_empty_nodes_test() -> R<()> {
         assert!(report.errors.is_empty(), "{:?}", report.errors);
         h.drain_evals()?;
     }
-    assert_eq!(provider.calls()?.iter().filter(|c| c.starts_with("scale")).count(), 1);
+    assert_eq!(
+        provider
+            .calls()?
+            .iter()
+            .filter(|c| c.starts_with("scale"))
+            .count(),
+        1
+    );
 
     // A legion-system allocation on one member: never a victim.
     let protected = joined[0].clone();
@@ -331,7 +353,10 @@ async fn a_node_group_grows_from_zero_and_drains_empty_nodes_test() -> R<()> {
     }
     watch.abort();
     assert_eq!(gone_at.len(), 2, "{gone_at:?}");
-    assert!(!gone_at.contains_key(&protected), "the legion-system node stays");
+    assert!(
+        !gone_at.contains_key(&protected),
+        "the legion-system node stays"
+    );
     assert!(node_ids(&mut h).await?.contains(&protected));
     let times: Vec<i64> = gone_at.values().copied().collect();
     assert!(

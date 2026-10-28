@@ -675,11 +675,7 @@ impl Engine {
                     .unwrap_or_default();
                 let request = WatchScalingPoliciesRequest {
                     namespaces: Vec::new(),
-                    shard_count: if owned.shards.is_some() {
-                        SHARDS
-                    } else {
-                        0
-                    },
+                    shard_count: if owned.shards.is_some() { SHARDS } else { 0 },
                     shards: owned.list(),
                     deltas: true,
                 };
@@ -714,6 +710,16 @@ impl Engine {
                                         generation = set.generation,
                                         "Scaling policies updated"
                                     );
+                                    let more = set.more;
+                                    if staging.is_none() && !set.full && !more {
+                                        // A whole delta: apply it in place.
+                                        if let Ok(mut cache) = policies.write() {
+                                            cache
+                                                .get_or_insert_with(PolicyCache::default)
+                                                .apply(set);
+                                        }
+                                        continue;
+                                    }
                                     let mut next = match staging.take() {
                                         Some(staged) => staged,
                                         None if set.full => PolicyCache::default(),
@@ -723,7 +729,6 @@ impl Engine {
                                             .and_then(|cache| cache.clone())
                                             .unwrap_or_default(),
                                     };
-                                    let more = set.more;
                                     next.apply(set);
                                     if more {
                                         staging = Some(next);

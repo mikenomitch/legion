@@ -55,7 +55,10 @@ fn disjoint_cover(owned: &[Ownership]) -> Result<(), String> {
         }
     }
     if seen.len() != SHARDS as usize {
-        return Err(format!("{} of {SHARDS} shards owned: {owned:?}", seen.len()));
+        return Err(format!(
+            "{} of {SHARDS} shards owned: {owned:?}",
+            seen.len()
+        ));
     }
     Ok(())
 }
@@ -83,9 +86,11 @@ async fn replicas_split_the_shards_and_rebalance_when_one_dies_test() -> R<()> {
         }
         // ceil(64 / 3) = 22 each at most: 22, 22 and 20.
         if disjoint_cover(&owned).is_ok()
-            && owned
-                .iter()
-                .all(|o| o.shards.as_ref().is_some_and(|s| (20..=22).contains(&s.len())))
+            && owned.iter().all(|o| {
+                o.shards
+                    .as_ref()
+                    .is_some_and(|s| (20..=22).contains(&s.len()))
+            })
         {
             break owned;
         }
@@ -111,7 +116,10 @@ async fn replicas_split_the_shards_and_rebalance_when_one_dies_test() -> R<()> {
         );
         tokio::time::sleep(TIMING.renew).await;
     };
-    eprintln!("rebalanced {rebalanced:?} after the kill (lease TTL {:?})", TIMING.ttl);
+    eprintln!(
+        "rebalanced {rebalanced:?} after the kill (lease TTL {:?})",
+        TIMING.ttl
+    );
     // The dead replica's leases expire after one TTL; the survivors take
     // its shards on their next round (KV TTLs round to whole seconds).
     assert!(
@@ -158,10 +166,18 @@ async fn an_overlap_lands_one_scale_task_per_decision_test() -> R<()> {
         .collect();
     assert!(!writes.is_empty(), "{history:?}");
     let decisions: BTreeSet<&str> = writes.iter().map(|w| w.decision_id.as_str()).collect();
-    assert_eq!(decisions.len(), writes.len(), "a decision landed twice: {writes:?}");
+    assert_eq!(
+        decisions.len(),
+        writes.len(),
+        "a decision landed twice: {writes:?}"
+    );
     // Every write moved on from the one before: none repeated a count.
     for pair in writes.windows(2) {
-        assert_ne!((pair[0].from, pair[0].to), (pair[1].from, pair[1].to), "{writes:?}");
+        assert_ne!(
+            (pair[0].from, pair[0].to),
+            (pair[1].from, pair[1].to),
+            "{writes:?}"
+        );
     }
     Ok(())
 }
@@ -216,7 +232,11 @@ async fn an_overlap_calls_the_provider_once_per_decision_test() -> R<()> {
     watch_a.abort();
     watch_b.abort();
     assert_eq!(
-        provider.calls()?.iter().filter(|c| c.starts_with("scale")).count(),
+        provider
+            .calls()?
+            .iter()
+            .filter(|c| c.starts_with("scale"))
+            .count(),
         1
     );
     let history = h
@@ -231,7 +251,10 @@ async fn an_overlap_calls_the_provider_once_per_decision_test() -> R<()> {
         .into_inner()
         .entries;
     assert_eq!(
-        history.iter().filter(|entry| entry.kind == "scaled").count(),
+        history
+            .iter()
+            .filter(|entry| entry.kind == "scaled")
+            .count(),
         1,
         "{history:?}"
     );
@@ -324,9 +347,10 @@ async fn the_policy_watch_sends_deltas_for_its_shards_test() -> R<()> {
         .into_inner();
     let set = next_set(&mut filtered).await?;
     assert!(set.policies.iter().any(|p| p.job_id == a.job_id), "{set:?}");
-    assert!(set.policies.iter().all(|p| {
-        shard_of(&task_key(&p.job_id, &p.task_group, &p.task_name), SHARDS) == shard
-    }));
+    assert!(set
+        .policies
+        .iter()
+        .all(|p| { shard_of(&task_key(&p.job_id, &p.task_group, &p.task_name), SHARDS) == shard }));
     // A shard out of range is refused.
     let status = h
         .client

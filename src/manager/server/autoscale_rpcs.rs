@@ -26,9 +26,9 @@ use crate::structs::{
     GetScalingStatusReply, GetScalingStatusRequest, PauseScalingReply, PauseScalingRequest,
     RecordScalingActionReply, RecordScalingActionRequest, ReportScalingStatusReply,
     ReportScalingStatusRequest, ScaleDecision, ScaleHistoryEntry, ScalePin, ScalingActionIntent,
-    ScalingAppReplica, ScalingAppStatus,
-    ScalingPauseInfo, ScalingPolicy, ScalingPolicyChange, ScalingPolicySet, ScalingProvenanceRow,
-    ScalingTargetStatus, StandaloneScalingPolicy, WatchScalingPoliciesRequest,
+    ScalingAppReplica, ScalingAppStatus, ScalingPauseInfo, ScalingPolicy, ScalingPolicyChange,
+    ScalingPolicySet, ScalingProvenanceRow, ScalingTargetStatus, StandaloneScalingPolicy,
+    WatchScalingPoliciesRequest,
 };
 
 /// The bundled autoscaler app's name; its job is `legion-system/autoscaler`.
@@ -178,11 +178,11 @@ fn check_decision(decision: &ScaleDecision) -> Result<(), Status> {
     }
     let digest = match serde_json::from_str::<EffectivePolicy>(&decision.policy_json) {
         Ok(policy) => policy.digest(),
-        Err(err) => serde_json::from_str::<crate::autoscaler::EffectiveNodeGroup>(
-            &decision.policy_json,
-        )
-        .map(|group| group.digest())
-        .map_err(|_| Status::invalid_argument(format!("decision.policy_json: {err}")))?,
+        Err(err) => {
+            serde_json::from_str::<crate::autoscaler::EffectiveNodeGroup>(&decision.policy_json)
+                .map(|group| group.digest())
+                .map_err(|_| Status::invalid_argument(format!("decision.policy_json: {err}")))?
+        }
     };
     if digest != decision.policy_digest {
         return Err(Status::invalid_argument(format!(
@@ -933,7 +933,7 @@ impl ManagerDaemonService {
                         &policy.task_name,
                     );
                     if in_shards(&key) {
-                        entries.insert(key, WatchEntry::Task(policy));
+                        entries.insert(key, WatchEntry::Task(Box::new(policy)));
                     }
                 }
                 for policy in standalone {
@@ -941,7 +941,10 @@ impl ManagerDaemonService {
                         &policy.kind,
                         &policy.id,
                     )) {
-                        entries.insert(policy_target_key(&policy.id), WatchEntry::Standalone(policy));
+                        entries.insert(
+                            policy_target_key(&policy.id),
+                            WatchEntry::Standalone(Box::new(policy)),
+                        );
                     }
                 }
                 let Some((full, policies, standalone, removed)) =
@@ -1437,7 +1440,10 @@ impl ManagerDaemonService {
             });
         }
         for node in &intent.cordon {
-            rows.push(step("drain", format!("drain {}: {}", node.node, intent.summary)));
+            rows.push(step(
+                "drain",
+                format!("drain {}: {}", node.node, intent.summary),
+            ));
         }
         for node in &intent.terminate {
             rows.push(step(
@@ -1446,10 +1452,16 @@ impl ManagerDaemonService {
             ));
         }
         for node in &intent.forget {
-            rows.push(step("forget", format!("forget {node}: its instance is gone")));
+            rows.push(step(
+                "forget",
+                format!("forget {node}: its instance is gone"),
+            ));
         }
         for node in &intent.uncordon {
-            rows.push(step("uncordon", format!("uncordon {node}: drain abandoned")));
+            rows.push(step(
+                "uncordon",
+                format!("uncordon {node}: drain abandoned"),
+            ));
         }
         let intent_json = serde_json::to_string(&intent)
             .map_err(|err| Status::internal(format!("encoding the intent: {err}")))?;
@@ -1706,7 +1718,11 @@ impl ManagerDaemonService {
             .map(|row| history_proto(row, None, false));
         let board = self.store.scaling_status();
         let entry = board.target(&key, "", "");
-        let facts = policy.resolved.as_ref().ok().map(|resolved| resolved.facts());
+        let facts = policy
+            .resolved
+            .as_ref()
+            .ok()
+            .map(|resolved| resolved.facts());
         let error = policy.resolved.as_ref().err().cloned().unwrap_or_default();
         let (state, current, want, evaluated, summary, decision) = match (&facts, &entry) {
             (None, _) => ("invalid".to_string(), 0, 0, 0, error.clone(), String::new()),
@@ -2348,9 +2364,18 @@ fn changed_fields(before: &ResolvedPolicy, after: &ResolvedPolicy) -> Vec<String
 /// One entry of the watch, by the key a delta names it with.
 #[derive(Debug, Clone, PartialEq)]
 enum WatchEntry {
-    Task(ScalingPolicy),
-    Standalone(StandaloneScalingPolicy),
+    Task(Box<ScalingPolicy>),
+    Standalone(Box<StandaloneScalingPolicy>),
 }
+
+/// One watch message's contents: whether it is the full set, the task
+/// policies and standalone policies it carries, and the keys removed.
+type WatchMessage = (
+    bool,
+    Vec<ScalingPolicy>,
+    Vec<StandaloneScalingPolicy>,
+    Vec<String>,
+);
 
 /// What a watch sends next: the full set, or what changed since the last
 /// message (`None`: nothing changed).
@@ -2358,7 +2383,7 @@ fn watch_message(
     last: Option<&BTreeMap<String, WatchEntry>>,
     now: &BTreeMap<String, WatchEntry>,
     deltas: bool,
-) -> Option<(bool, Vec<ScalingPolicy>, Vec<StandaloneScalingPolicy>, Vec<String>)> {
+) -> Option<WatchMessage> {
     // Sorted as the full set always was: tasks by job, group, task;
     // standalone policies by namespace and name.
     let split = |entries: &mut dyn Iterator<Item = &WatchEntry>| {
@@ -2366,8 +2391,8 @@ fn watch_message(
         let mut standalone: Vec<StandaloneScalingPolicy> = Vec::new();
         for entry in entries {
             match entry {
-                WatchEntry::Task(policy) => tasks.push(policy.clone()),
-                WatchEntry::Standalone(policy) => standalone.push(policy.clone()),
+                WatchEntry::Task(policy) => tasks.push(policy.as_ref().clone()),
+                WatchEntry::Standalone(policy) => standalone.push(policy.as_ref().clone()),
             }
         }
         tasks.sort_by(|a, b| {
@@ -2454,13 +2479,13 @@ mod watch_tests {
     use super::*;
 
     fn task(job: &str, digest: &str) -> WatchEntry {
-        WatchEntry::Task(ScalingPolicy {
+        WatchEntry::Task(Box::new(ScalingPolicy {
             job_id: job.into(),
             task_group: "default".into(),
             task_name: "web".into(),
             digest: digest.into(),
             ..Default::default()
-        })
+        }))
     }
 
     /// Without deltas every message is the whole set; with them, only what
@@ -2504,11 +2529,22 @@ mod watch_tests {
         let parts = watch_parts(true, policies.clone(), Vec::new(), vec!["x".into()], true);
         let shape: Vec<(bool, usize, usize, bool)> = parts
             .iter()
-            .map(|part| (part.full, part.policies.len(), part.removed.len(), part.more))
+            .map(|part| {
+                (
+                    part.full,
+                    part.policies.len(),
+                    part.removed.len(),
+                    part.more,
+                )
+            })
             .collect();
         assert_eq!(
             shape,
-            vec![(true, 1000, 1, true), (false, 1000, 0, true), (false, 500, 0, false)]
+            vec![
+                (true, 1000, 1, true),
+                (false, 1000, 0, true),
+                (false, 500, 0, false)
+            ]
         );
         let whole = watch_parts(true, policies, Vec::new(), Vec::new(), false);
         assert_eq!(whole.len(), 1);

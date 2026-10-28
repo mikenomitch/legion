@@ -2410,9 +2410,18 @@ mod tests {
         }
         // Standalone scaling policies (autoscaler Phases 3 and 4) arrived
         // on a branch that predated the allowlist.
-        assert_eq!(page_rpc_kind("ApplyScalingPolicy"), Some(PageRpcKind::Write));
-        assert_eq!(page_rpc_kind("DeleteScalingPolicy"), Some(PageRpcKind::Write));
-        assert_eq!(page_rpc_kind("ListScalingPolicies"), Some(PageRpcKind::Read));
+        assert_eq!(
+            page_rpc_kind("ApplyScalingPolicy"),
+            Some(PageRpcKind::Write)
+        );
+        assert_eq!(
+            page_rpc_kind("DeleteScalingPolicy"),
+            Some(PageRpcKind::Write)
+        );
+        assert_eq!(
+            page_rpc_kind("ListScalingPolicies"),
+            Some(PageRpcKind::Read)
+        );
         for refused in [
             "CreateAclToken",
             "StreamEvents",

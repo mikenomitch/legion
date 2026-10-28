@@ -113,12 +113,17 @@ async fn one_replica_sustains_ten_thousand_task_policies_test() -> R<()> {
     for tick in 0..6 {
         let at = T0 + tick * TICK_MS;
         let heartbeat = Instant::now();
-        h.report_all(|job| if hot(job) { 1.6 } else { 0.5 }, at).await?;
+        h.report_all(|job| if hot(job) { 1.6 } else { 0.5 }, at)
+            .await?;
         let heartbeats = heartbeat.elapsed();
         let begun = Instant::now();
         let report = engine.tick(at).await;
         let took = begun.elapsed();
-        assert!(report.errors.is_empty(), "tick {tick}: {:?}", report.errors.first());
+        assert!(
+            report.errors.is_empty(),
+            "tick {tick}: {:?}",
+            report.errors.first()
+        );
         assert_eq!(report.evaluated, count);
         eprintln!(
             "load: tick {tick}: {count} policies evaluated in {took:.2?} \

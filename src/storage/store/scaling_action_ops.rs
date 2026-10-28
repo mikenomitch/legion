@@ -101,8 +101,9 @@ impl Store {
     /// Every action row.
     pub fn scaling_actions(&self) -> R<Vec<ScalingActionRow>> {
         let conn = self.read_connection()?;
-        let mut stmt =
-            conn.prepare_cached(&format!("SELECT {COLUMNS} FROM scaling_action ORDER BY policy;"))?;
+        let mut stmt = conn.prepare_cached(&format!(
+            "SELECT {COLUMNS} FROM scaling_action ORDER BY policy;"
+        ))?;
         let rows = stmt.query_map([], from_row)?;
         Self::collect_rows(rows)
     }
@@ -266,15 +267,32 @@ mod tests {
     #[test]
     fn intents_are_compare_and_set_test() -> R<()> {
         let (_dir, store) = store()?;
-        let ActionWrite::Won(first) =
-            store.open_scaling_action("workers", 0, "{}", "alloc-1", "app", 10, vec![scaled(0, 3)])?
+        let ActionWrite::Won(first) = store.open_scaling_action(
+            "workers",
+            0,
+            "{}",
+            "alloc-1",
+            "app",
+            10,
+            vec![scaled(0, 3)],
+        )?
         else {
             panic!("the first intent wins");
         };
-        assert_eq!((first.state.as_str(), first.owner.as_str()), ("open", "alloc-1"));
+        assert_eq!(
+            (first.state.as_str(), first.owner.as_str()),
+            ("open", "alloc-1")
+        );
         // The second replica read version 0 too: it loses, and sees the row.
-        let lost =
-            store.open_scaling_action("workers", 0, "{}", "alloc-2", "app", 11, vec![scaled(0, 3)])?;
+        let lost = store.open_scaling_action(
+            "workers",
+            0,
+            "{}",
+            "alloc-2",
+            "app",
+            11,
+            vec![scaled(0, 3)],
+        )?;
         assert_eq!(lost, ActionWrite::Lost(Some(first.clone())));
         // One history row: the winner's.
         let key = crate::manager::autoscale::policy_target_key("workers");
@@ -284,17 +302,38 @@ mod tests {
 
         // Closing names the version; a stale close loses.
         assert!(matches!(
-            store.close_scaling_action("workers", first.version + 100, "succeeded", "", "app", 12, vec![])?,
+            store.close_scaling_action(
+                "workers",
+                first.version + 100,
+                "succeeded",
+                "",
+                "app",
+                12,
+                vec![]
+            )?,
             ActionWrite::Lost(Some(_))
         ));
-        let ActionWrite::Won(closed) =
-            store.close_scaling_action("workers", first.version, "succeeded", "", "app", 12, vec![])?
+        let ActionWrite::Won(closed) = store.close_scaling_action(
+            "workers",
+            first.version,
+            "succeeded",
+            "",
+            "app",
+            12,
+            vec![],
+        )?
         else {
             panic!("the owner's close wins");
         };
         assert!(closed.version > first.version);
-        assert_eq!((closed.state.as_str(), closed.closed_ms), ("succeeded", Some(12)));
-        assert_eq!(store.scaling_action_fingerprint()?, (1, closed.version as i64));
+        assert_eq!(
+            (closed.state.as_str(), closed.closed_ms),
+            ("succeeded", Some(12))
+        );
+        assert_eq!(
+            store.scaling_action_fingerprint()?,
+            (1, closed.version as i64)
+        );
 
         // The policy's delete takes its action row with it.
         store.put_scaling_policy("", "workers", "nodes", "{}", "", "op", 13)?;

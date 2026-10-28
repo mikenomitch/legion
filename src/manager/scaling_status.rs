@@ -162,7 +162,12 @@ impl ScalingStatusBoard {
         report.targets.len() as u32
     }
 
-    fn record_target(inner: &mut Inner, instance: &str, target: &ScalingTargetReport, now: Instant) {
+    fn record_target(
+        inner: &mut Inner,
+        instance: &str,
+        target: &ScalingTargetReport,
+        now: Instant,
+    ) {
         let key = key(&target.job_id, &target.task_group, &target.task_name);
         let decision_json = if target.decision_json.is_empty() {
             inner
@@ -201,7 +206,11 @@ impl ScalingStatusBoard {
     /// Every replica that reported within the retention, newest first.
     pub fn replicas(&self) -> Vec<AppReport> {
         let mut apps: Vec<AppReport> = self.lock().apps.values().cloned().collect();
-        apps.sort_by(|a, b| b.received.cmp(&a.received).then(a.instance.cmp(&b.instance)));
+        apps.sort_by(|a, b| {
+            b.received
+                .cmp(&a.received)
+                .then(a.instance.cmp(&b.instance))
+        });
         apps
     }
 
@@ -341,19 +350,35 @@ mod tests {
         );
         let replicas = board.replicas();
         assert_eq!(
-            replicas.iter().map(|r| r.instance.as_str()).collect::<Vec<_>>(),
+            replicas
+                .iter()
+                .map(|r| r.instance.as_str())
+                .collect::<Vec<_>>(),
             vec!["alloc-2", "alloc-1"]
         );
         assert_eq!(replicas[1].shards, vec![1, 2]);
-        assert_eq!(board.target("web", "default", "web").expect("web").instance, "alloc-1");
-        assert_eq!(board.target("api", "default", "web").expect("api").instance, "alloc-2");
+        assert_eq!(
+            board.target("web", "default", "web").expect("web").instance,
+            "alloc-1"
+        );
+        assert_eq!(
+            board.target("api", "default", "web").expect("api").instance,
+            "alloc-2"
+        );
         // alloc-1 went quiet: still running on alloc-2's reports.
         let later = start + Duration::from_secs(50);
         assert!(!replicas[1].fresh(later, board.interval()));
         assert_eq!(board.liveness(later, None), AppLiveness::Running);
         // A target moves to the replica that reports it next.
-        board.record(&from("alloc-2", vec![1, 2, 3], vec![target("{}")]), later, 3);
-        assert_eq!(board.target("web", "default", "web").expect("web").instance, "alloc-2");
+        board.record(
+            &from("alloc-2", vec![1, 2, 3], vec![target("{}")]),
+            later,
+            3,
+        );
+        assert_eq!(
+            board.target("web", "default", "web").expect("web").instance,
+            "alloc-2"
+        );
         assert_eq!(
             board.liveness(later + Duration::from_secs(45), None),
             AppLiveness::NotRunning

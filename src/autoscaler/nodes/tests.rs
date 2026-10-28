@@ -961,8 +961,7 @@ fn an_unverified_provider_id_protects_the_node_test() {
     let policy = group();
     let mut state = NodeGroupState::default();
     let mut stranger = node("b");
-    stranger.provider_problem =
-        Some("the provider does not list its instance i-b".to_string());
+    stranger.provider_problem = Some("the provider does not list its instance i-b".to_string());
     let o = scale_in_obs(vec![busy("a"), stranger]);
     decide(&policy, &mut state, &o, min(0), &no_fit);
     let later = decide(&policy, &mut state, &o, min(10), &no_fit);

@@ -2,7 +2,8 @@
 
 > **Judgement calls:** [autoscaler-v2-plan_calls.md](../calls/autoscaler-v2-plan_calls.md)
 
-**Status: IN EXECUTION.** Phase 1 (cluster-wide scaling inputs), the
+**Status: SHIPPED** (every phase, 2026-10-28; the deferred items below
+stay open in `internal_docs/TODO.md`). Phase 1 (cluster-wide scaling inputs), the
 engine core (`src/autoscaler/`: spec, layered defaults, strategies,
 schedules, pipeline, simulator), and Phase 2 (task autoscaling as the
 bundled app: `autoscale`, live layered defaults, in-place resubmits, pins,
@@ -23,11 +24,20 @@ groups run by the app: node-group `ScalingPolicy` objects, compare-and-set
 action intents in `scaling_action`, drain → terminate → `ForgetNode`, a
 join token per scale-up, the provider-id cross-check, minAvailable and
 fits-elsewhere from `GetCapacityDemand`, and the first-party `aws-asg`
-plugin; calls entries 85-94). Phase 7 is in progress. Deliberately left
-from 3 and 4: `wake = "on-request"` (entry 73) and per-plugin concurrency
-(entry 67). Left from 5b: consolidation (moving work off a node that is
-not underutilized), forgetting lost nodes automatically, and static ports
-in the fits-elsewhere simulation (entry 90). (Written 2026-10-19; layered defaults, in-place policy edits, and
+plugin; calls entries 85-94), and Phase 7 (sharded replicas: 64 shards,
+membership and shard leases as KV locks under `legion/apps/autoscaler/`,
+rebalancing, `WatchScalingPolicies` deltas and shard filter, per-plugin
+`concurrency` caps, the status board per replica, and the 10,000-policy
+load test in docs/benchmarks.md; calls entries 95-102). Deliberately left
+from 3 and 4: `wake = "on-request"` (entry 73), and multiplexing a program
+plugin's requests (entry 67; Phase 7 caps calls but a program stays at
+one). Left from 5b: consolidation (moving work off a node that is not
+underutilized), forgetting lost nodes automatically, and static ports in
+the fits-elsewhere simulation (entry 90). Left from 7: handing a shard's
+windows over with it (the new owner holds scale-in for one
+`down.stabilize`), a watch that resolves only the changed policies (the
+manager still re-resolves every policy per change, entry 98), and a load
+run on a real cluster (entry 101). (Written 2026-10-19; layered defaults, in-place policy edits, and
 the core-field rationale added 2026-10-27.) This plan **supersedes**
 [autoscaler-plan.md](autoscaler-plan.md). That plan's Phase 1 (`legion job
 scale`, count overrides, the `scale` ACL resource) shipped on 2026-07-30 and

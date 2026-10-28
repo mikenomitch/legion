@@ -22,7 +22,8 @@ use crate::storage::acl_store::{JoinTokenRecord, JoinTokenUse};
 use crate::structs::{
     check_join_attributes, CapacityRefusal, ForgetNodeReply, ForgetNodeRequest,
     GetCapacityDemandReply, GetCapacityDemandRequest, JoinAttrSource, NodeGroupAllocation,
-    NodeGroupDemand, NodeGroupMember, PendingCapacity, TemplateRefusal, UnfittableCapacity, JOIN_ATTR, RESERVED_ATTR_PREFIX,
+    NodeGroupDemand, NodeGroupMember, PendingCapacity, TemplateRefusal, UnfittableCapacity,
+    JOIN_ATTR, RESERVED_ATTR_PREFIX,
 };
 use std::collections::BTreeMap;
 

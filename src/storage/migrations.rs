@@ -2374,6 +2374,13 @@ fn migration_list() -> Vec<M<'static>> {
         );",
         )
         .down("DROP TABLE IF EXISTS scaling_action;"),
+        // A job's tasks across config versions (`WHERE tc.job_id = ?`): the
+        // autoscaler's batched inputs read every autoscaled job's replicas
+        // this way, which without it scanned every task config per job
+        // (quadratic at 10,000 jobs; docs/benchmarks.md, "The autoscaler at
+        // 10,000 policies").
+        M::up("CREATE INDEX IF NOT EXISTS idx_task_config_job_id ON task_config(job_id);")
+            .down("DROP INDEX IF EXISTS idx_task_config_job_id;"),
     ]
 }
 

@@ -4631,6 +4631,14 @@ plan.
   - [ ] **A shard that moves loses its windows**: the new owner holds
         scale-in for one `down.stabilize` while they refill; handing the
         windows over with the shard is open
+  - [ ] **`GetScalingInputs` reads the store per job** (about 0.7 ms each
+        in a release build): it is 7 of the 7.7 seconds a 10,000-policy
+        tick takes (docs/benchmarks.md); one batched read across jobs would
+        give a single replica much more headroom
+  - [ ] **A replica's status report is one request**: ~11 MB at 10,000
+        targets with every decision changed, under the manager's 64 MiB
+        limit; splitting it into parts (as the policy watch's `more` does)
+        would lift the ~50,000-targets-per-replica ceiling
   - [ ] **The load test is in process** (calls 101): a run on the AWS rig,
         with the app on a manager's system worker and real workers'
         heartbeats, is open
@@ -6340,7 +6348,10 @@ findings: [kernel-classifier-findings.md](kernel-classifier-findings.md)
   - [x] Tests: rebalance after a replica dies, one `ScaleTask` and one
         `target/scale` per decision under a forced overlap, the delta and
         shard-filtered watch, and the opt-in 10,000-policy load test with
-        its numbers in docs/benchmarks.md
+        its numbers in docs/benchmarks.md (7.7s median tick, release build)
+  - [x] Found by the load test: an index on `task_config(job_id)` (the
+        batched inputs scanned every task config per job), and the policy
+        watch's first set split into parts under gRPC's 4 MiB limit
 - [x] **Autoscaler Phase 5b: node groups run by the autoscaler app**
       (2026-10-28, [plan](plans/autoscaler-v2-plan.md) §6.9, §6.11, §8 ·
       [calls 85-94](calls/autoscaler-v2-plan_calls.md) · docs:

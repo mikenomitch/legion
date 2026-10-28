@@ -628,46 +628,46 @@ async fn explain(matches: &ArgMatches) -> R<()> {
             println!();
             print_node_decision(&decision);
         } else {
-        match serde_json::from_str::<Decision>(&target.decision_json) {
-            Ok(decision) => {
-                println!();
-                let checks: Vec<CheckRow> = decision
-                    .checks
-                    .iter()
-                    .map(|check| CheckRow {
-                        check: check.name.clone(),
-                        input: check.detail.clone(),
-                        wants: check
-                            .desired
-                            .map_or("-".to_string(), |desired| desired.to_string()),
-                    })
-                    .collect();
-                if !checks.is_empty() {
-                    print_table(checks);
+            match serde_json::from_str::<Decision>(&target.decision_json) {
+                Ok(decision) => {
+                    println!();
+                    let checks: Vec<CheckRow> = decision
+                        .checks
+                        .iter()
+                        .map(|check| CheckRow {
+                            check: check.name.clone(),
+                            input: check.detail.clone(),
+                            wants: check
+                                .desired
+                                .map_or("-".to_string(), |desired| desired.to_string()),
+                        })
+                        .collect();
+                    if !checks.is_empty() {
+                        print_table(checks);
+                    }
+                    // The history row of this decision, when it acted.
+                    let decision_id = target
+                        .last_change
+                        .as_ref()
+                        .filter(|change| {
+                            change.from == decision.from
+                                && change.to == decision.to
+                                && change.at_unix_ms >= decision.at_ms
+                        })
+                        .map(|change| change.decision_id.as_str())
+                        .unwrap_or_default();
+                    print_table(stage_rows(&decision, decision_id));
                 }
-                // The history row of this decision, when it acted.
-                let decision_id = target
-                    .last_change
-                    .as_ref()
-                    .filter(|change| {
-                        change.from == decision.from
-                            && change.to == decision.to
-                            && change.at_unix_ms >= decision.at_ms
-                    })
-                    .map(|change| change.decision_id.as_str())
-                    .unwrap_or_default();
-                print_table(stage_rows(&decision, decision_id));
+                Err(_) => println!(
+                    "  no evaluation yet ({}): {}",
+                    target.state,
+                    if target.summary.is_empty() {
+                        "the autoscaler has not reported this task"
+                    } else {
+                        &target.summary
+                    }
+                ),
             }
-            Err(_) => println!(
-                "  no evaluation yet ({}): {}",
-                target.state,
-                if target.summary.is_empty() {
-                    "the autoscaler has not reported this task"
-                } else {
-                    &target.summary
-                }
-            ),
-        }
         }
         if show_policy {
             println!(
@@ -714,7 +714,10 @@ fn print_node_decision(decision: &NodeDecision) {
         println!("  scale-in: {} ({})", victim.node, victim.reason);
     }
     for protected in &decision.protected {
-        println!("  never a victim: {} ({})", protected.node, protected.protection);
+        println!(
+            "  never a victim: {} ({})",
+            protected.node, protected.protection
+        );
     }
     if !decision.intents.is_empty() {
         let actions: Vec<String> = decision

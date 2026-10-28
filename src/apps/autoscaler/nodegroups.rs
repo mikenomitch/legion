@@ -136,13 +136,15 @@ fn node_view(
 ) -> NodeView {
     let provider_id = (!member.provider_id.is_empty()).then(|| member.provider_id.clone());
     let problem = match (&provider_id, provider) {
-        (None, _) => Some("it joined without legion.provider-id, so it cannot be terminated".to_string()),
+        (None, _) => {
+            Some("it joined without legion.provider-id, so it cannot be terminated".to_string())
+        }
         (Some(id), _) if duplicates.contains(id) => Some(format!(
             "another member also claims legion.provider-id {id}"
         )),
-        (Some(id), Some((status, true))) if !status.instances.contains(id) => Some(format!(
-            "the provider does not list its instance {id}"
-        )),
+        (Some(id), Some((status, true))) if !status.instances.contains(id) => {
+            Some(format!("the provider does not list its instance {id}"))
+        }
         _ => None,
     };
     NodeView {
@@ -222,13 +224,19 @@ fn group_demand(demand: &NodeGroupDemand) -> GroupDemand {
 }
 
 /// The intent a decision carries out, with the drains it leaves in flight.
-fn intent_of(decision: &NodeDecision, decision_id: &str, state: &NodeGroupState) -> ScalingActionIntent {
+fn intent_of(
+    decision: &NodeDecision,
+    decision_id: &str,
+    state: &NodeGroupState,
+) -> ScalingActionIntent {
     let mut intent = ScalingActionIntent {
         decision_id: decision_id.to_string(),
         from: decision.from,
         summary: decision.summary.clone(),
-        drains_json: serde_json::to_string(&state.drains().filter(|d| !d.finished()).collect::<Vec<_>>())
-            .unwrap_or_else(|_| "[]".to_string()),
+        drains_json: serde_json::to_string(
+            &state.drains().filter(|d| !d.finished()).collect::<Vec<_>>(),
+        )
+        .unwrap_or_else(|_| "[]".to_string()),
         ..Default::default()
     };
     let provider = |node: &str| {
@@ -326,7 +334,10 @@ impl Engine {
         now_ms: i64,
         report: &mut TickReport,
     ) -> Vec<ScalingTargetReport> {
-        let live: BTreeSet<&str> = groups.iter().map(|(policy, _)| policy.id.as_str()).collect();
+        let live: BTreeSet<&str> = groups
+            .iter()
+            .map(|(policy, _)| policy.id.as_str())
+            .collect();
         self.groups.retain(|id, _| live.contains(id.as_str()));
         let mut out = Vec::new();
         if groups.is_empty() {
@@ -349,9 +360,13 @@ impl Engine {
                 runtime.adopt(action, &me);
             }
             let base = node_report(policy);
-            match host.check_node_target(&effective.plugin, &effective.config).await {
+            match host
+                .check_node_target(&effective.plugin, &effective.config)
+                .await
+            {
                 Err(Problem::Invalid(err)) => {
-                    let mut held = plain_report(base, "invalid", 0, &format!("target: {err}"), now_ms);
+                    let mut held =
+                        plain_report(base, "invalid", 0, &format!("target: {err}"), now_ms);
                     if runtime.invalid.as_deref() != Some(err.as_str()) {
                         held.events.push(ScalingEventFlag {
                             kind: "check_failed".to_string(),
@@ -365,7 +380,13 @@ impl Engine {
                 }
                 Err(Problem::Unavailable(err)) => {
                     report.errors.push(format!("{}: {err}", policy.id));
-                    out.push(plain_report(base, "error", 0, &format!("target: {err}"), now_ms));
+                    out.push(plain_report(
+                        base,
+                        "error",
+                        0,
+                        &format!("target: {err}"),
+                        now_ms,
+                    ));
                     continue;
                 }
                 Ok(()) => runtime.invalid = None,
@@ -406,7 +427,13 @@ impl Engine {
                 let why = format!("reading capacity demand: {}", status.message());
                 report.errors.push(why.clone());
                 for p in &prepared {
-                    out.push(plain_report(node_report(p.policy), "error", 0, &why, now_ms));
+                    out.push(plain_report(
+                        node_report(p.policy),
+                        "error",
+                        0,
+                        &why,
+                        now_ms,
+                    ));
                 }
                 return out;
             }
@@ -427,13 +454,12 @@ impl Engine {
                 } else if held >= p.effective.max {
                     Some(format!("at max {}", p.effective.max))
                 } else {
-                    runtime
-                        .state
-                        .backoff_until(now_ms)
-                        .map(|until| format!(
+                    runtime.state.backoff_until(now_ms).map(|until| {
+                        format!(
                             "backing off after a join timeout until {}",
                             crate::cmd::scaling::clock(until)
-                        ))
+                        )
+                    })
                 };
                 ExpanderOption {
                     group: p.effective.name.clone(),
@@ -447,7 +473,17 @@ impl Engine {
         // 4. Each group.
         for (p, group) in prepared.iter().zip(demand.groups) {
             let target_report = self
-                .evaluate_node_group(p.policy, p.effective, p.status.as_ref(), p.status_error.as_deref(), &group, &choice.chosen, &choice.summary, now_ms, report)
+                .evaluate_node_group(
+                    p.policy,
+                    p.effective,
+                    p.status.as_ref(),
+                    p.status_error.as_deref(),
+                    &group,
+                    &choice.chosen,
+                    &choice.summary,
+                    now_ms,
+                    report,
+                )
                 .await;
             out.push(target_report);
         }
@@ -490,7 +526,11 @@ impl Engine {
         let fits: HashMap<String, bool> = group
             .members
             .iter()
-            .filter_map(|member| member.fits_elsewhere.map(|fits| (member.node_id.clone(), fits)))
+            .filter_map(|member| {
+                member
+                    .fits_elsewhere
+                    .map(|fits| (member.node_id.clone(), fits))
+            })
             .collect();
         let runtime = self.groups.entry(policy.id.clone()).or_default();
         runtime.joined = group.members.len() as u32;
@@ -509,9 +549,18 @@ impl Engine {
                 let summary = format!(
                     "waiting for {}'s action {} to finish",
                     open.owner,
-                    open.intent.as_ref().map(|i| i.decision_id.as_str()).unwrap_or("-")
+                    open.intent
+                        .as_ref()
+                        .map(|i| i.decision_id.as_str())
+                        .unwrap_or("-")
                 );
-                return plain_report(base, "held", provider.as_ref().map_or(runtime.joined, |p| p.desired), &summary, now_ms);
+                return plain_report(
+                    base,
+                    "held",
+                    provider.as_ref().map_or(runtime.joined, |p| p.desired),
+                    &summary,
+                    now_ms,
+                );
             }
             let seen = match (&provider, open.intent.as_ref().and_then(|i| i.desired)) {
                 (Some(provider), Some(desired)) => format!(
@@ -542,9 +591,11 @@ impl Engine {
                     }
                     runtime.open = None;
                 }
-                Err(status) => report
-                    .errors
-                    .push(format!("{}: reconciling an open intent: {}", policy.id, status.message())),
+                Err(status) => report.errors.push(format!(
+                    "{}: reconciling an open intent: {}",
+                    policy.id,
+                    status.message()
+                )),
             }
         }
 
@@ -580,16 +631,18 @@ impl Engine {
                 DrainObservation {
                     exists: member.is_some(),
                     cordoned: member.is_some_and(|m| m.availability != "available"),
-                    occupied_by: member.map_or(0, |m| {
-                        nodes_occupying(m)
-                    }),
+                    occupied_by: member.map_or(0, nodes_occupying),
                     terminated,
                 },
             );
         }
-        let decision = decide(&effective, &mut runtime.state, &obs, now_ms, &|node: &NodeView| {
-            fits.get(&node.id).copied().unwrap_or(false)
-        });
+        let decision = decide(
+            &effective,
+            &mut runtime.state,
+            &obs,
+            now_ms,
+            &|node: &NodeView| fits.get(&node.id).copied().unwrap_or(false),
+        );
         let decision_id = super::decision_id(&super::standalone_key(&policy.id), now_ms);
         let mut events: Vec<ScalingEventFlag> = decision.flags.iter().map(flag_event).collect();
         if group.nodes > 0 && !runtime.pending_flagged {
@@ -623,7 +676,15 @@ impl Engine {
         // forget, uncordon) whatever this evaluation decided.
         if !decision.intents.is_empty() {
             match self
-                .act_node_group(policy, &effective, &decision, &scale_decision, before, now_ms, report)
+                .act_node_group(
+                    policy,
+                    &effective,
+                    &decision,
+                    &scale_decision,
+                    before,
+                    now_ms,
+                    report,
+                )
                 .await
             {
                 Ok(note) => {
@@ -643,7 +704,12 @@ impl Engine {
                     "{}>{}:{}",
                     decision.from,
                     decision.to,
-                    decision.victims.iter().map(|v| v.node.as_str()).collect::<Vec<_>>().join(",")
+                    decision
+                        .victims
+                        .iter()
+                        .map(|v| v.node.as_str())
+                        .collect::<Vec<_>>()
+                        .join(",")
                 );
                 let runtime = self.groups.get_mut(&policy.id).expect("inserted above");
                 if runtime.last_would.as_deref() != Some(key.as_str()) {
@@ -751,8 +817,15 @@ impl Engine {
             if let Some(action) = &won.action {
                 runtime.adopt(action, &me);
             }
-            let owner = won.action.as_ref().map(|a| a.owner.clone()).unwrap_or_default();
-            return Err(("held", format!("{owner} acted on this group first; following its intent")));
+            let owner = won
+                .action
+                .as_ref()
+                .map(|a| a.owner.clone())
+                .unwrap_or_default();
+            return Err((
+                "held",
+                format!("{owner} acted on this group first; following its intent"),
+            ));
         }
         if let Some(action) = &won.action {
             runtime.action_version = action.version;
@@ -764,7 +837,10 @@ impl Engine {
             match action {
                 NodeIntent::SetDesired { count } => {
                     let new_nodes = count.saturating_sub(decision.from).max(1);
-                    let token = match self.mint_join_token(effective, new_nodes, &scale_decision.id).await {
+                    let token = match self
+                        .mint_join_token(effective, new_nodes, &scale_decision.id)
+                        .await
+                    {
                         Ok(token) => token,
                         Err(err) => {
                             failures.push(err);
@@ -776,7 +852,14 @@ impl Engine {
                         "attributes": effective.member_attributes(),
                     });
                     match host
-                        .scale_nodes(&effective.plugin, &policy.id, &effective.config, *count, &scale_decision.id, join)
+                        .scale_nodes(
+                            &effective.plugin,
+                            &policy.id,
+                            &effective.config,
+                            *count,
+                            &scale_decision.id,
+                            join,
+                        )
                         .await
                     {
                         Ok(()) => {
@@ -825,7 +908,13 @@ impl Engine {
                         continue;
                     };
                     if let Err(err) = host
-                        .terminate(&effective.plugin, &policy.id, &effective.config, std::slice::from_ref(id), &scale_decision.id)
+                        .terminate(
+                            &effective.plugin,
+                            &policy.id,
+                            &effective.config,
+                            std::slice::from_ref(id),
+                            &scale_decision.id,
+                        )
                         .await
                     {
                         failures.push(format!("target/terminate {id} ({node}): {err}"));
@@ -855,7 +944,12 @@ impl Engine {
                 kind: "outcome".to_string(),
                 policy: policy.id.clone(),
                 expected_action_version: version,
-                outcome: if failures.is_empty() { "succeeded" } else { "failed" }.to_string(),
+                outcome: if failures.is_empty() {
+                    "succeeded"
+                } else {
+                    "failed"
+                }
+                .to_string(),
                 detail: failures.join("; "),
                 instance: me,
                 ..Default::default()
@@ -878,7 +972,9 @@ impl Engine {
         if failures.is_empty() {
             Ok(None)
         } else {
-            report.errors.extend(failures.iter().map(|f| format!("{}: {f}", policy.id)));
+            report
+                .errors
+                .extend(failures.iter().map(|f| format!("{}: {f}", policy.id)));
             if scaled {
                 Ok(Some(failures.join("; ")))
             } else {
@@ -968,7 +1064,10 @@ mod tests {
         );
         let provider = provider_of(&listed);
         assert_eq!(provider.desired, 3);
-        assert_eq!(provider.instances, vec!["i-1".to_string(), "i-3".to_string()]);
+        assert_eq!(
+            provider.instances,
+            vec!["i-1".to_string(), "i-3".to_string()]
+        );
         assert!(lists_instances(&listed));
         assert!(!lists_instances(&status(2, json!([]))));
         assert!(lists_instances(&status(0, json!([]))));
@@ -1063,6 +1162,9 @@ mod tests {
             outcome: "aborted".into(),
             detail: "uncordoned".into(),
         });
-        assert_eq!((flag.kind.as_str(), flag.outcome.as_str()), ("scale_in", "aborted"));
+        assert_eq!(
+            (flag.kind.as_str(), flag.outcome.as_str()),
+            ("scale_in", "aborted")
+        );
     }
 }

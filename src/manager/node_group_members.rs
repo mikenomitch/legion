@@ -109,7 +109,8 @@ pub fn members(store: &Store, group: &str, fit_check: bool) -> R<Vec<Member>> {
 
     let mut out = Vec::with_capacity(nodes.len());
     for node in &nodes {
-        let here: Vec<&NodeAllocationRow> = rows.iter().filter(|row| row.node_id == node.id).collect();
+        let here: Vec<&NodeAllocationRow> =
+            rows.iter().filter(|row| row.node_id == node.id).collect();
         let mut allocations = Vec::with_capacity(here.len());
         let (mut used_cpu, mut used_memory) = (0.0, 0.0);
         for row in &here {
@@ -159,7 +160,12 @@ pub fn members(store: &Store, group: &str, fit_check: bool) -> R<Vec<Member>> {
                         .as_ref()
                         .map(|disruption| disruption.min_available_for(count))
                         .unwrap_or(0)
-                        .max(task.gang.as_ref().map(|gang| gang.preemption_floor()).unwrap_or(0));
+                        .max(
+                            task.gang
+                                .as_ref()
+                                .map(|gang| gang.preemption_floor())
+                                .unwrap_or(0),
+                        );
                     floors.insert(key.clone(), floor);
                     floor
                 }
@@ -170,9 +176,9 @@ pub fn members(store: &Store, group: &str, fit_check: bool) -> R<Vec<Member>> {
                     .iter()
                     .filter(|other| {
                         other.job_id == row.job_id
-                            && tasks.get(&other.task_config_id).is_some_and(|t| {
-                                t.group == task.group && t.name == task.name
-                            })
+                            && tasks
+                                .get(&other.task_config_id)
+                                .is_some_and(|t| t.group == task.group && t.name == task.name)
                     })
                     .count() as u32;
                 (live.saturating_sub(on_here) < floor).then(|| {

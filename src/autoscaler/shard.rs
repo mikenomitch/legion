@@ -66,11 +66,18 @@ mod tests {
         );
         let mut counts = vec![0u32; SHARDS as usize];
         for n in 0..10_000 {
-            counts[shard_of(&task_key(&format!("job-{n}"), "default", "web"), SHARDS) as usize] += 1;
+            counts[shard_of(&task_key(&format!("job-{n}"), "default", "web"), SHARDS) as usize] +=
+                1;
         }
         // 10,000 keys over 64 shards: about 156 each.
-        assert!(counts.iter().all(|count| (100..220).contains(count)), "{counts:?}");
+        assert!(
+            counts.iter().all(|count| (100..220).contains(count)),
+            "{counts:?}"
+        );
         assert_eq!(standalone_key("nodes", "a"), standalone_key("nodes", "b"));
-        assert_eq!(standalone_key("external", "media/render"), "policy:media/render");
+        assert_eq!(
+            standalone_key("external", "media/render"),
+            "policy:media/render"
+        );
     }
 }

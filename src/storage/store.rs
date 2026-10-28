@@ -85,8 +85,8 @@ pub use reschedule_holds::{
     move_backoff, summarize_reason, FailedMove, FailedRemoval, MovePolicy, MoveVerdict,
     RescheduleHold, MOVE_DELAY_MAX,
 };
-pub use scaling_ops::{ScalingAllocRow, ScalingReplicaRow};
 pub use scaling_action_ops::{ActionHistory, ActionWrite, ScalingActionRow};
+pub use scaling_ops::{ScalingAllocRow, ScalingReplicaRow};
 pub use scaling_policy_ops::{PutScalingPolicy, ScalingPolicyRow};
 pub use session_ops::{PromoteSession, PromotedSession};
 pub use snapshot_ops::{

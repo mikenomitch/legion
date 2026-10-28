@@ -2425,7 +2425,10 @@ docs/benchmarks.md).*
 in-process manager, heartbeats usage for every allocation, and times one
 engine's evaluation ticks (inputs, decisions, report) with the built-in
 `legion` source. It is an opt-in test (`--ignored`), and the published
-numbers say which build and machine produced them.
+numbers say which build and machine produced them: a release build on one
+4-core VM, 7.7 seconds a tick (median) against the 15-second interval. A
+debug build misses the interval (13.6 seconds median), so the page names
+the build.
 
 **Alternatives.** A real cluster run on the AWS rig.
 

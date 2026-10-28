@@ -34,6 +34,11 @@ the comparison fair.
   4-vCPU workers booted 160 in 2.3 seconds, with no write to the replicated
   store. That rig and its projections are in [Sandboxes at
   scale](sandboxes-at-scale.md#measured-on-aws), not on this page.
+- **One autoscaler replica keeps up with 10,000 policies.** It evaluated
+  10,000 autoscaled tasks in 7.7 seconds a tick (median; 10.4 at worst,
+  with 1,000 of them scaling out), inside the 15-second default interval
+  ([below](#the-autoscaler-at-10000-policies); an in-process run on one
+  machine).
 
 ## The rig
 
@@ -367,6 +372,59 @@ Most of the time before the first replacement is failure detection, set by
 the heartbeat interval above, which grows with the fleet. Once the nodes
 are declared lost, Legion replaces the 10k-node orphans at roughly 400
 allocations/sec.
+
+## The autoscaler at 10,000 policies
+
+Can one autoscaler replica keep up with 10,000 autoscaled tasks at the
+default 15-second interval, with the built-in `legion` source? The opt-in
+load test (`tests/integration/autoscaler_load.rs`) submits 10,000 jobs, one
+autoscaled task each, to an in-process manager with 100 simulated nodes,
+heartbeats CPU usage for every allocation (every tenth job runs hot, so
+about 1,000 policies scale out), and times one autoscaler engine through
+six evaluation ticks.
+
+| Tick | Whole tick | Inputs | Decisions and writes | Report | Scaled out |
+| ---- | ---------- | ------ | -------------------- | ------ | ---------- |
+| 0    | 10.04s     | 6.90s  | 3.06s                | 65ms   | 1,000      |
+| 1    | 7.53s      | 7.23s  | 233ms                | 52ms   | 0          |
+| 2    | 7.48s      | 7.22s  | 215ms                | 26ms   | 0          |
+| 3    | 10.42s     | 7.21s  | 3.14s                | 47ms   | 1,000      |
+| 4    | 7.46s      | 7.18s  | 212ms                | 38ms   | 0          |
+| 5    | 7.67s      | 7.41s  | 207ms                | 26ms   | 0          |
+
+**One replica keeps up:** the median tick is 7.7 seconds and the worst
+10.4 seconds, inside the 15-second interval. Ticks 0 and 3 are the ones
+where the hot jobs scale out (the step limit holds them in between).
+
+- **inputs** is reading every target's replicas, usage, pins, pauses and
+  override version: ten batched `GetScalingInputs` calls of 1,000 targets.
+  It dominates (about 0.7 ms per job, the manager's store reads), and it
+  is the manager's work, not the app's: batching those reads across jobs
+  is the next step if a single replica needs more headroom.
+- **decisions** is every policy's safeguard pipeline and the writes it
+  makes: 1,000 compare-and-set `ScaleTask` writes on the ticks where the
+  hot jobs scale out, none on the others.
+- **report** is one `ReportScalingStatus` with every target's evaluation.
+- The first policy set arrived in 6.4 seconds: 10,000 policies, 4.2 MiB
+  in 10 messages of at most 1,000 policies (the largest 425 KiB).
+
+Setup: a release build (`cargo test --release`) on
+one 4-core Intel Xeon (2.1 GHz) VM with 15 GiB of memory, 2026-10-28. The
+same run in a debug build takes 13.6 seconds a tick (median; worst 18.3),
+which is why the number above is a release build. The manager, its store
+(SQLite on local disk), and the engine share one process, so there is no
+network between them, and the manager carries no other load (no real
+workers, no placement beyond the scale-outs). The numbers bound the
+autoscaler's own cost; a cluster adds the network and the manager's other
+work. Run it yourself:
+
+```bash
+cargo test --release --test integration autoscaler_load:: -- --ignored --nocapture
+```
+
+The first run of this test found `GetScalingInputs` reading every task
+config in the cluster for each job (no index on a task config's job); with
+the index the inputs read went from 22 seconds to 10 in a debug build.
 
 ## Methodology
 

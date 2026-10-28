@@ -5843,6 +5843,28 @@ export class NodeGroupTemplate extends Message<NodeGroupTemplate> {
    */
   upcoming = 0;
 
+  /**
+   * Also describe the group's members: every node whose `legion.nodegroup`
+   * attribute is this template's name, with what node scale-in needs to
+   * know about it (`NodeGroupDemand.members`). The autoscaler sets it; a
+   * sizing question (`legion scaling demand`) leaves it off. Members are
+   * listed only in pools the caller has `node:read` on.
+   *
+   * @generated from field: bool members = 7;
+   */
+  members = false;
+
+  /**
+   * With `members`: for each live, schedulable member whose reserved share
+   * (the larger of CPU and memory) is under 50%, simulate whether every
+   * allocation on it would fit on the group's other live, schedulable
+   * members, with the demand's own feasibility rules
+   * (`NodeGroupMember.fits_elsewhere`). For `down.when = "underutilized"`.
+   *
+   * @generated from field: bool fit_check = 8;
+   */
+  fitCheck = false;
+
   constructor(data?: PartialMessage<NodeGroupTemplate>) {
     super();
     proto3.util.initPartial(data, this);
@@ -5857,6 +5879,8 @@ export class NodeGroupTemplate extends Message<NodeGroupTemplate> {
     { no: 4, name: "shape", kind: "message", T: NodeGroupShape },
     { no: 5, name: "like_node", kind: "scalar", T: 9 /* ScalarType.STRING */, opt: true },
     { no: 6, name: "upcoming", kind: "scalar", T: 13 /* ScalarType.UINT32 */ },
+    { no: 7, name: "members", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
+    { no: 8, name: "fit_check", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
   ]);
 
   static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): NodeGroupTemplate {
@@ -6151,6 +6175,13 @@ export class NodeGroupDemand extends Message<NodeGroupDemand> {
    */
   nodeAttributesJson = "";
 
+  /**
+   * With the template's `members`: the group's members, by node id.
+   *
+   * @generated from field: repeated legion.NodeGroupMember members = 12;
+   */
+  members: NodeGroupMember[] = [];
+
   constructor(data?: PartialMessage<NodeGroupDemand>) {
     super();
     proto3.util.initPartial(data, this);
@@ -6170,6 +6201,7 @@ export class NodeGroupDemand extends Message<NodeGroupDemand> {
     { no: 9, name: "refusals", kind: "message", T: CapacityRefusal, repeated: true },
     { no: 10, name: "node_pool", kind: "scalar", T: 9 /* ScalarType.STRING */ },
     { no: 11, name: "node_attributes_json", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 12, name: "members", kind: "message", T: NodeGroupMember, repeated: true },
   ]);
 
   static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): NodeGroupDemand {
@@ -6186,6 +6218,249 @@ export class NodeGroupDemand extends Message<NodeGroupDemand> {
 
   static equals(a: NodeGroupDemand | PlainMessage<NodeGroupDemand> | undefined, b: NodeGroupDemand | PlainMessage<NodeGroupDemand> | undefined): boolean {
     return proto3.util.equals(NodeGroupDemand, a, b);
+  }
+}
+
+/**
+ * One member of a node group, as node scale-in sees it.
+ *
+ * @generated from message legion.NodeGroupMember
+ */
+export class NodeGroupMember extends Message<NodeGroupMember> {
+  /**
+   * The node id.
+   *
+   * @generated from field: string node_id = 1;
+   */
+  nodeId = "";
+
+  /**
+   * Its status (`active`, `lost`, …).
+   *
+   * @generated from field: string status = 2;
+   */
+  status = "";
+
+  /**
+   * Its availability (`available`, or `drained` when cordoned).
+   *
+   * @generated from field: string availability = 3;
+   */
+  availability = "";
+
+  /**
+   * Its `legion.provider-id` (the instance it runs on), when it joined
+   * with one.
+   *
+   * @generated from field: string provider_id = 4;
+   */
+  providerId = "";
+
+  /**
+   * Its `legion.scale-in` attribute (`never` protects it).
+   *
+   * @generated from field: string scale_in = 5;
+   */
+  scaleIn = "";
+
+  /**
+   * Reserved CPU over allocatable CPU, 0 to 1 (0 when unbounded).
+   *
+   * @generated from field: double reserved_cpu = 6;
+   */
+  reservedCpu = 0;
+
+  /**
+   * Reserved memory over allocatable memory, 0 to 1 (0 when unbounded).
+   *
+   * @generated from field: double reserved_memory = 7;
+   */
+  reservedMemory = 0;
+
+  /**
+   * Its allocations.
+   *
+   * @generated from field: repeated legion.NodeGroupAllocation allocations = 8;
+   */
+  allocations: NodeGroupAllocation[] = [];
+
+  /**
+   * With `fit_check`, for an underutilized member: whether every
+   * allocation on it fits on the group's other members. Unset when not
+   * simulated.
+   *
+   * @generated from field: optional bool fits_elsewhere = 9;
+   */
+  fitsElsewhere?: boolean;
+
+  /**
+   * Why it does not fit, or `fits on w-2, w-5`.
+   *
+   * @generated from field: string fit_detail = 10;
+   */
+  fitDetail = "";
+
+  constructor(data?: PartialMessage<NodeGroupMember>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.NodeGroupMember";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "node_id", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 2, name: "status", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 3, name: "availability", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 4, name: "provider_id", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 5, name: "scale_in", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 6, name: "reserved_cpu", kind: "scalar", T: 1 /* ScalarType.DOUBLE */ },
+    { no: 7, name: "reserved_memory", kind: "scalar", T: 1 /* ScalarType.DOUBLE */ },
+    { no: 8, name: "allocations", kind: "message", T: NodeGroupAllocation, repeated: true },
+    { no: 9, name: "fits_elsewhere", kind: "scalar", T: 8 /* ScalarType.BOOL */, opt: true },
+    { no: 10, name: "fit_detail", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): NodeGroupMember {
+    return new NodeGroupMember().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): NodeGroupMember {
+    return new NodeGroupMember().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): NodeGroupMember {
+    return new NodeGroupMember().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: NodeGroupMember | PlainMessage<NodeGroupMember> | undefined, b: NodeGroupMember | PlainMessage<NodeGroupMember> | undefined): boolean {
+    return proto3.util.equals(NodeGroupMember, a, b);
+  }
+}
+
+/**
+ * One allocation on a node-group member.
+ *
+ * @generated from message legion.NodeGroupAllocation
+ */
+export class NodeGroupAllocation extends Message<NodeGroupAllocation> {
+  /**
+   * The allocation id.
+   *
+   * @generated from field: int64 allocation_id = 1;
+   */
+  allocationId = protoInt64.zero;
+
+  /**
+   * Its job (empty when `redacted`).
+   *
+   * @generated from field: string job_id = 2;
+   */
+  jobId = "";
+
+  /**
+   * Its job's namespace (`legion-system` makes the node never a victim).
+   *
+   * @generated from field: string namespace = 3;
+   */
+  namespace = "";
+
+  /**
+   * Its task group (empty when `redacted`).
+   *
+   * @generated from field: string task_group = 4;
+   */
+  taskGroup = "";
+
+  /**
+   * Its task (empty when `redacted`).
+   *
+   * @generated from field: string task_name = 5;
+   */
+  taskName = "";
+
+  /**
+   * `work`, `session-envelope` (one per node; with no live sessions it
+   * does not keep the node from being empty), or `per-node` (a
+   * `count.per = "id"` task: one per node by design).
+   *
+   * @generated from field: string kind = 6;
+   */
+  kind = "";
+
+  /**
+   * For a session envelope: the live sessions in it.
+   *
+   * @generated from field: uint32 sessions = 7;
+   */
+  sessions = 0;
+
+  /**
+   * It holds stateful node-local storage: its data lives on this machine.
+   *
+   * @generated from field: bool node_local_storage = 8;
+   */
+  nodeLocalStorage = false;
+
+  /**
+   * Draining this node now would take its task below its
+   * `disruption.minAvailable` (or a gang below its quorum): the task's
+   * live allocations, less the ones on this node, would be under the
+   * floor.
+   *
+   * @generated from field: bool breaks_min_available = 9;
+   */
+  breaksMinAvailable = false;
+
+  /**
+   * With `breaks_min_available`: `web/web has 3 live, 2 on this node,
+   * minAvailable 2`.
+   *
+   * @generated from field: string min_available_detail = 10;
+   */
+  minAvailableDetail = "";
+
+  /**
+   * The job is outside the caller's `job:read`: its names are left out.
+   *
+   * @generated from field: bool redacted = 11;
+   */
+  redacted = false;
+
+  constructor(data?: PartialMessage<NodeGroupAllocation>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.NodeGroupAllocation";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "allocation_id", kind: "scalar", T: 3 /* ScalarType.INT64 */ },
+    { no: 2, name: "job_id", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 3, name: "namespace", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 4, name: "task_group", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 5, name: "task_name", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 6, name: "kind", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 7, name: "sessions", kind: "scalar", T: 13 /* ScalarType.UINT32 */ },
+    { no: 8, name: "node_local_storage", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
+    { no: 9, name: "breaks_min_available", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
+    { no: 10, name: "min_available_detail", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 11, name: "redacted", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): NodeGroupAllocation {
+    return new NodeGroupAllocation().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): NodeGroupAllocation {
+    return new NodeGroupAllocation().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): NodeGroupAllocation {
+    return new NodeGroupAllocation().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: NodeGroupAllocation | PlainMessage<NodeGroupAllocation> | undefined, b: NodeGroupAllocation | PlainMessage<NodeGroupAllocation> | undefined): boolean {
+    return proto3.util.equals(NodeGroupAllocation, a, b);
   }
 }
 
@@ -7285,6 +7560,32 @@ export class WatchScalingPoliciesRequest extends Message<WatchScalingPoliciesReq
    */
   namespaces: string[] = [];
 
+  /**
+   * How many shards policies hash to (the autoscaler uses 64). 0, the
+   * default, sends every policy; with a count, `shards` names which to send.
+   *
+   * @generated from field: uint32 shard_count = 2;
+   */
+  shardCount = 0;
+
+  /**
+   * The shards to send, each below `shard_count`. Ignored when
+   * `shard_count` is 0. Empty with a `shard_count` sends nothing but empty
+   * sets (a replica that holds no shard yet).
+   *
+   * @generated from field: repeated uint32 shards = 3;
+   */
+  shards: number[] = [];
+
+  /**
+   * Send changes, not full sets, after the first message (see
+   * `ScalingPolicySet.full` and `removed`). Default `false`: every message
+   * is the full set.
+   *
+   * @generated from field: bool deltas = 4;
+   */
+  deltas = false;
+
   constructor(data?: PartialMessage<WatchScalingPoliciesRequest>) {
     super();
     proto3.util.initPartial(data, this);
@@ -7294,6 +7595,9 @@ export class WatchScalingPoliciesRequest extends Message<WatchScalingPoliciesReq
   static readonly typeName = "legion.WatchScalingPoliciesRequest";
   static readonly fields: FieldList = proto3.util.newFieldList(() => [
     { no: 1, name: "namespaces", kind: "scalar", T: 9 /* ScalarType.STRING */, repeated: true },
+    { no: 2, name: "shard_count", kind: "scalar", T: 13 /* ScalarType.UINT32 */ },
+    { no: 3, name: "shards", kind: "scalar", T: 13 /* ScalarType.UINT32 */, repeated: true },
+    { no: 4, name: "deltas", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
   ]);
 
   static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): WatchScalingPoliciesRequest {
@@ -7359,6 +7663,38 @@ export class ScalingPolicySet extends Message<ScalingPolicySet> {
    */
   standalone: StandaloneScalingPolicy[] = [];
 
+  /**
+   * Whether this message is the full set (always, without `deltas`; the
+   * first message, with them). When false, `policies` and `standalone` hold
+   * only the policies that are new or changed since the previous message,
+   * and `removed` the ones that are gone.
+   *
+   * @generated from field: bool full = 6;
+   */
+  full = false;
+
+  /**
+   * With `deltas`, the keys of policies gone since the previous message
+   * (their job stopped, their task lost `autoscale`, the policy was
+   * deleted, or it left the requested shards): `<job id>/<group>/<task>`
+   * for a task, `policy:<id>` for a standalone policy. Always empty in a
+   * full set.
+   *
+   * @generated from field: repeated string removed = 7;
+   */
+  removed: string[] = [];
+
+  /**
+   * With `deltas`, a change larger than 1,000 policies is split across
+   * messages: every message but the last of a change has `more = true`
+   * (the first carries `full` and `removed`). Apply them all before acting
+   * on any, so a consumer never acts on half a set. Always false without
+   * `deltas`, where every message is one whole set.
+   *
+   * @generated from field: bool more = 8;
+   */
+  more = false;
+
   constructor(data?: PartialMessage<ScalingPolicySet>) {
     super();
     proto3.util.initPartial(data, this);
@@ -7372,6 +7708,9 @@ export class ScalingPolicySet extends Message<ScalingPolicySet> {
     { no: 3, name: "resolved_at_unix_ms", kind: "scalar", T: 3 /* ScalarType.INT64 */ },
     { no: 4, name: "defaults_version", kind: "scalar", T: 4 /* ScalarType.UINT64 */ },
     { no: 5, name: "standalone", kind: "message", T: StandaloneScalingPolicy, repeated: true },
+    { no: 6, name: "full", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
+    { no: 7, name: "removed", kind: "scalar", T: 9 /* ScalarType.STRING */, repeated: true },
+    { no: 8, name: "more", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
   ]);
 
   static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): ScalingPolicySet {
@@ -7994,6 +8333,23 @@ export class ReportScalingStatusRequest extends Message<ReportScalingStatusReque
    */
   version = "";
 
+  /**
+   * The shards this replica evaluated (docs/autoscaling.md, "Replicas").
+   * Empty: every shard (a lone replica, which holds them all with one
+   * lease).
+   *
+   * @generated from field: repeated uint32 shards = 6;
+   */
+  shards: number[] = [];
+
+  /**
+   * How many shards policies hash to (64); 0 from a replica that does not
+   * shard.
+   *
+   * @generated from field: uint32 shard_count = 7;
+   */
+  shardCount = 0;
+
   constructor(data?: PartialMessage<ReportScalingStatusRequest>) {
     super();
     proto3.util.initPartial(data, this);
@@ -8007,6 +8363,8 @@ export class ReportScalingStatusRequest extends Message<ReportScalingStatusReque
     { no: 3, name: "mode", kind: "scalar", T: 9 /* ScalarType.STRING */ },
     { no: 4, name: "targets", kind: "message", T: ScalingTargetReport, repeated: true },
     { no: 5, name: "version", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 6, name: "shards", kind: "scalar", T: 13 /* ScalarType.UINT32 */, repeated: true },
+    { no: 7, name: "shard_count", kind: "scalar", T: 13 /* ScalarType.UINT32 */ },
   ]);
 
   static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): ReportScalingStatusRequest {
@@ -8062,6 +8420,7 @@ export class ScalingTargetReport extends Message<ScalingTargetReport> {
    * - `deferred`: a scale-in waits for a rollout;
    * - `pinned`, `paused`: an operator holds the target;
    * - `dry-run`: the policy would have changed the count;
+   * - `draining`: a node group is draining members (scale-in in flight);
    * - `missing-data`: no check has data;
    * - `invalid`: the policy does not resolve;
    * - `error`: the evaluation or write failed (the summary says why).
@@ -8176,7 +8535,11 @@ export class ScalingTargetReport extends Message<ScalingTargetReport> {
 export class ScalingEventFlag extends Message<ScalingEventFlag> {
   /**
    * `limited` (`scale.limited`), `flapping` (`scale.flapping`), or
-   * `check_failed` (`scale.check_failed`).
+   * `check_failed` (`scale.check_failed`); for a node group also `pending`
+   * (`nodegroup.pending`: waiting work needs new nodes of the group),
+   * `join_timeout` (`nodegroup.join_timeout`: nodes asked for did not join
+   * within `up.joinTimeout`), or `scale_in` (`nodegroup.scale_in`: a drain
+   * finished, see `outcome`).
    *
    * @generated from field: string kind = 1;
    */
@@ -8189,6 +8552,15 @@ export class ScalingEventFlag extends Message<ScalingEventFlag> {
    */
   message = "";
 
+  /**
+   * For `scale_in`: `completed` (the node was terminated and forgotten) or
+   * `aborted` (the drain outlived `down.drainDeadline`, was uncordoned by
+   * someone else, or the group was paused; the node was uncordoned).
+   *
+   * @generated from field: string outcome = 3;
+   */
+  outcome = "";
+
   constructor(data?: PartialMessage<ScalingEventFlag>) {
     super();
     proto3.util.initPartial(data, this);
@@ -8199,6 +8571,7 @@ export class ScalingEventFlag extends Message<ScalingEventFlag> {
   static readonly fields: FieldList = proto3.util.newFieldList(() => [
     { no: 1, name: "kind", kind: "scalar", T: 9 /* ScalarType.STRING */ },
     { no: 2, name: "message", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 3, name: "outcome", kind: "scalar", T: 9 /* ScalarType.STRING */ },
   ]);
 
   static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): ScalingEventFlag {
@@ -8274,7 +8647,7 @@ export class ReportScalingStatusReply extends Message<ReportScalingStatusReply> 
  */
 export class RecordScalingActionRequest extends Message<RecordScalingActionRequest> {
   /**
-   * Canonical job id.
+   * Canonical job id (a `would` row for a task target).
    *
    * @generated from field: string job_id = 1;
    */
@@ -8296,37 +8669,53 @@ export class RecordScalingActionRequest extends Message<RecordScalingActionReque
 
   /**
    * The action:
-   * - `would`: a dry-run policy's decision (`applied = false`);
-   * - `scale`: a standalone policy's change, recorded before the app calls
-   *   the target plugin. Refused with FAILED_PRECONDITION while a pause
-   *   covers the policy, so a pause holds even against a misbehaving app.
-   *   Written as a `scaled` row and a `scale.applied` event;
-   * - `failed`: the target plugin refused or failed the `scale` just
-   *   recorded (`applied = false`, the error in the decision's summary).
+   * - `would`: a dry-run policy's decision, recorded as a history row with
+   *   `applied = false` (`legion scaling history` shows what the policy
+   *   would have done). Names a task (`job_id`, `task_group`, `task_name`)
+   *   or a standalone policy (`policy`), with `from`, `to` and `decision`.
+   * - `intent`: open an action intent on a standalone policy before the
+   *   app acts on its target (calls `target/scale`, starts a drain, calls
+   *   `target/terminate`, forgets a node). Needs `policy`, `intent` and
+   *   `expected_action_version`; written only when the policy's action row
+   *   is still at that version (compare-and-set), so of two autoscaler
+   *   replicas whose leases overlap exactly one wins and acts (`won`), and
+   *   the other reads the winner's intent from `action` instead. Refused
+   *   with FAILED_PRECONDITION while a pause covers the policy, when the
+   *   intent changes the count (`desired`) or starts a drain (`cordon`):
+   *   a pause holds even against a misbehaving app. Drains already past
+   *   their drain step (terminate, forget) and aborts (uncordon) go on
+   *   under a pause. Written with the intent's history rows (`scaled`,
+   *   `drain`, `terminate`, `forget`, `uncordon`) and a `scale.applied`
+   *   event for a count change.
+   * - `outcome`: close the open intent at `expected_action_version` with
+   *   `outcome` (`succeeded`, `failed`, or `reconciled`, for an intent a
+   *   crashed replica left open) and `detail`. Compare-and-set like
+   *   `intent`. A `failed` outcome of an intent that changed the count
+   *   writes a `failed` history row.
    *
-   * `scale` and `failed` need `policy`; task targets change their count
-   * through ScaleTask. Other kinds are refused.
+   * Other kinds are refused with INVALID_ARGUMENT. A task target changes
+   * its count through ScaleTask, never here.
    *
    * @generated from field: string kind = 4;
    */
   kind = "";
 
   /**
-   * The count when decided.
+   * `would`: the count when decided.
    *
    * @generated from field: uint32 from = 5;
    */
   from = 0;
 
   /**
-   * The count the policy would have written, or wrote.
+   * `would`: the count the policy would have written.
    *
    * @generated from field: uint32 to = 6;
    */
   to = 0;
 
   /**
-   * The decision.
+   * The decision (`would`, and the history rows of an `intent`).
    *
    * @generated from field: legion.ScaleDecision decision = 7;
    */
@@ -8334,10 +8723,49 @@ export class RecordScalingActionRequest extends Message<RecordScalingActionReque
 
   /**
    * A standalone policy's canonical id, instead of a job, group and task.
+   * Required for `intent` and `outcome`.
    *
    * @generated from field: string policy = 8;
    */
   policy = "";
+
+  /**
+   * `intent` and `outcome`: the version of the policy's action row the
+   * app last read (from WatchScalingPolicies, or the last
+   * RecordScalingAction reply); 0 when the policy has none yet.
+   *
+   * @generated from field: uint64 expected_action_version = 9;
+   */
+  expectedActionVersion = protoInt64.zero;
+
+  /**
+   * `intent`: what the app is about to do.
+   *
+   * @generated from field: legion.ScalingActionIntent intent = 10;
+   */
+  intent?: ScalingActionIntent;
+
+  /**
+   * `outcome`: `succeeded`, `failed`, or `reconciled`.
+   *
+   * @generated from field: string outcome = 11;
+   */
+  outcome = "";
+
+  /**
+   * `outcome`: what happened, for people (a plugin's error, or what the
+   * target's status showed when reconciling).
+   *
+   * @generated from field: string detail = 12;
+   */
+  detail = "";
+
+  /**
+   * The app instance writing (shown as the action's `owner`).
+   *
+   * @generated from field: string instance = 13;
+   */
+  instance = "";
 
   constructor(data?: PartialMessage<RecordScalingActionRequest>) {
     super();
@@ -8355,6 +8783,11 @@ export class RecordScalingActionRequest extends Message<RecordScalingActionReque
     { no: 6, name: "to", kind: "scalar", T: 13 /* ScalarType.UINT32 */ },
     { no: 7, name: "decision", kind: "message", T: ScaleDecision },
     { no: 8, name: "policy", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 9, name: "expected_action_version", kind: "scalar", T: 4 /* ScalarType.UINT64 */ },
+    { no: 10, name: "intent", kind: "message", T: ScalingActionIntent },
+    { no: 11, name: "outcome", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 12, name: "detail", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 13, name: "instance", kind: "scalar", T: 9 /* ScalarType.STRING */ },
   ]);
 
   static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): RecordScalingActionRequest {
@@ -8375,17 +8808,292 @@ export class RecordScalingActionRequest extends Message<RecordScalingActionReque
 }
 
 /**
+ * What the autoscaler is about to do to a standalone policy's target: the
+ * payload of an action intent.
+ *
+ * @generated from message legion.ScalingActionIntent
+ */
+export class ScalingActionIntent extends Message<ScalingActionIntent> {
+  /**
+   * The decision's id (`legion scaling history` shows it).
+   *
+   * @generated from field: string decision_id = 1;
+   */
+  decisionId = "";
+
+  /**
+   * The target's count when decided.
+   *
+   * @generated from field: uint32 from = 2;
+   */
+  from = 0;
+
+  /**
+   * `target/scale` to this count, when the intent changes it.
+   *
+   * @generated from field: optional uint32 desired = 3;
+   */
+  desired?: number;
+
+  /**
+   * Node groups: members to cordon and drain (scale-in victims).
+   *
+   * @generated from field: repeated legion.ScalingActionNode cordon = 4;
+   */
+  cordon: ScalingActionNode[] = [];
+
+  /**
+   * Node groups: members whose instances `target/terminate` stops.
+   *
+   * @generated from field: repeated legion.ScalingActionNode terminate = 5;
+   */
+  terminate: ScalingActionNode[] = [];
+
+  /**
+   * Node groups: members `ForgetNode` removes (their instances are gone).
+   *
+   * @generated from field: repeated string forget = 6;
+   */
+  forget: string[] = [];
+
+  /**
+   * Node groups: members to uncordon (an aborted drain).
+   *
+   * @generated from field: repeated string uncordon = 7;
+   */
+  uncordon: string[] = [];
+
+  /**
+   * The decision in one line.
+   *
+   * @generated from field: string summary = 8;
+   */
+  summary = "";
+
+  /**
+   * Node groups: every drain in flight once this intent is carried out,
+   * as the engine's JSON (node, provider id, start, phase). A replica that
+   * takes the group over resumes them from here.
+   *
+   * @generated from field: string drains_json = 9;
+   */
+  drainsJson = "";
+
+  constructor(data?: PartialMessage<ScalingActionIntent>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.ScalingActionIntent";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "decision_id", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 2, name: "from", kind: "scalar", T: 13 /* ScalarType.UINT32 */ },
+    { no: 3, name: "desired", kind: "scalar", T: 13 /* ScalarType.UINT32 */, opt: true },
+    { no: 4, name: "cordon", kind: "message", T: ScalingActionNode, repeated: true },
+    { no: 5, name: "terminate", kind: "message", T: ScalingActionNode, repeated: true },
+    { no: 6, name: "forget", kind: "scalar", T: 9 /* ScalarType.STRING */, repeated: true },
+    { no: 7, name: "uncordon", kind: "scalar", T: 9 /* ScalarType.STRING */, repeated: true },
+    { no: 8, name: "summary", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 9, name: "drains_json", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): ScalingActionIntent {
+    return new ScalingActionIntent().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): ScalingActionIntent {
+    return new ScalingActionIntent().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): ScalingActionIntent {
+    return new ScalingActionIntent().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: ScalingActionIntent | PlainMessage<ScalingActionIntent> | undefined, b: ScalingActionIntent | PlainMessage<ScalingActionIntent> | undefined): boolean {
+    return proto3.util.equals(ScalingActionIntent, a, b);
+  }
+}
+
+/**
+ * One node in an action intent.
+ *
+ * @generated from message legion.ScalingActionNode
+ */
+export class ScalingActionNode extends Message<ScalingActionNode> {
+  /**
+   * The node id.
+   *
+   * @generated from field: string node = 1;
+   */
+  node = "";
+
+  /**
+   * Its `legion.provider-id`, what `target/terminate` takes.
+   *
+   * @generated from field: string provider_id = 2;
+   */
+  providerId = "";
+
+  constructor(data?: PartialMessage<ScalingActionNode>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.ScalingActionNode";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "node", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 2, name: "provider_id", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): ScalingActionNode {
+    return new ScalingActionNode().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): ScalingActionNode {
+    return new ScalingActionNode().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): ScalingActionNode {
+    return new ScalingActionNode().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: ScalingActionNode | PlainMessage<ScalingActionNode> | undefined, b: ScalingActionNode | PlainMessage<ScalingActionNode> | undefined): boolean {
+    return proto3.util.equals(ScalingActionNode, a, b);
+  }
+}
+
+/**
+ * A standalone policy's action row: its latest action intent and how it
+ * ended.
+ *
+ * @generated from message legion.ScalingAction
+ */
+export class ScalingAction extends Message<ScalingAction> {
+  /**
+   * The policy's canonical id.
+   *
+   * @generated from field: string policy = 1;
+   */
+  policy = "";
+
+  /**
+   * The row's version: the compare-and-set token the next intent or
+   * outcome names. Never repeats.
+   *
+   * @generated from field: uint64 version = 2;
+   */
+  version = protoInt64.zero;
+
+  /**
+   * `open` (the intent was written and its outcome is not in yet),
+   * `succeeded`, `failed`, or `reconciled`.
+   *
+   * @generated from field: string state = 3;
+   */
+  state = "";
+
+  /**
+   * The intent.
+   *
+   * @generated from field: legion.ScalingActionIntent intent = 4;
+   */
+  intent?: ScalingActionIntent;
+
+  /**
+   * The app instance that opened it.
+   *
+   * @generated from field: string owner = 5;
+   */
+  owner = "";
+
+  /**
+   * When it was opened, unix ms.
+   *
+   * @generated from field: int64 opened_at_unix_ms = 6;
+   */
+  openedAtUnixMs = protoInt64.zero;
+
+  /**
+   * When it was closed, unix ms; 0 while open.
+   *
+   * @generated from field: int64 closed_at_unix_ms = 7;
+   */
+  closedAtUnixMs = protoInt64.zero;
+
+  /**
+   * What closing it said.
+   *
+   * @generated from field: string detail = 8;
+   */
+  detail = "";
+
+  constructor(data?: PartialMessage<ScalingAction>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.ScalingAction";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "policy", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 2, name: "version", kind: "scalar", T: 4 /* ScalarType.UINT64 */ },
+    { no: 3, name: "state", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 4, name: "intent", kind: "message", T: ScalingActionIntent },
+    { no: 5, name: "owner", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 6, name: "opened_at_unix_ms", kind: "scalar", T: 3 /* ScalarType.INT64 */ },
+    { no: 7, name: "closed_at_unix_ms", kind: "scalar", T: 3 /* ScalarType.INT64 */ },
+    { no: 8, name: "detail", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): ScalingAction {
+    return new ScalingAction().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): ScalingAction {
+    return new ScalingAction().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): ScalingAction {
+    return new ScalingAction().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: ScalingAction | PlainMessage<ScalingAction> | undefined, b: ScalingAction | PlainMessage<ScalingAction> | undefined): boolean {
+    return proto3.util.equals(ScalingAction, a, b);
+  }
+}
+
+/**
  * Reply payload for RecordScalingAction.
  *
  * @generated from message legion.RecordScalingActionReply
  */
 export class RecordScalingActionReply extends Message<RecordScalingActionReply> {
   /**
-   * The history row written.
+   * The history row written (`would`; the first of an intent's rows; 0
+   * when none was).
    *
    * @generated from field: uint64 history_id = 1;
    */
   historyId = protoInt64.zero;
+
+  /**
+   * `intent` and `outcome`: whether this write won the compare-and-set.
+   * False: the action row had moved past `expected_action_version`;
+   * nothing was written, and `action` is the row as it is.
+   *
+   * @generated from field: bool won = 2;
+   */
+  won = false;
+
+  /**
+   * `intent` and `outcome`: the policy's action row after the call (unset
+   * when the policy has none).
+   *
+   * @generated from field: legion.ScalingAction action = 3;
+   */
+  action?: ScalingAction;
 
   constructor(data?: PartialMessage<RecordScalingActionReply>) {
     super();
@@ -8396,6 +9104,8 @@ export class RecordScalingActionReply extends Message<RecordScalingActionReply> 
   static readonly typeName = "legion.RecordScalingActionReply";
   static readonly fields: FieldList = proto3.util.newFieldList(() => [
     { no: 1, name: "history_id", kind: "scalar", T: 4 /* ScalarType.UINT64 */ },
+    { no: 2, name: "won", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
+    { no: 3, name: "action", kind: "message", T: ScalingAction },
   ]);
 
   static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): RecordScalingActionReply {
@@ -8618,6 +9328,18 @@ export class ScalingAppStatus extends Message<ScalingAppStatus> {
    */
   pausedAll?: ScalingPauseInfo;
 
+  /**
+   * Every replica that reported in the last hour, newest report first. The
+   * app is `running` while any of them reported within three of the app's
+   * intervals (the newest report's: a replica replaced by a config change
+   * does not linger as running on its old interval); `instance`,
+   * `interval_seconds`, `mode` and `last_report_unix_ms` above are the
+   * newest report's.
+   *
+   * @generated from field: repeated legion.ScalingAppReplica replicas = 9;
+   */
+  replicas: ScalingAppReplica[] = [];
+
   constructor(data?: PartialMessage<ScalingAppStatus>) {
     super();
     proto3.util.initPartial(data, this);
@@ -8634,6 +9356,7 @@ export class ScalingAppStatus extends Message<ScalingAppStatus> {
     { no: 6, name: "mode", kind: "scalar", T: 9 /* ScalarType.STRING */ },
     { no: 7, name: "served_by", kind: "scalar", T: 9 /* ScalarType.STRING */ },
     { no: 8, name: "paused_all", kind: "message", T: ScalingPauseInfo },
+    { no: 9, name: "replicas", kind: "message", T: ScalingAppReplica, repeated: true },
   ]);
 
   static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): ScalingAppStatus {
@@ -8650,6 +9373,114 @@ export class ScalingAppStatus extends Message<ScalingAppStatus> {
 
   static equals(a: ScalingAppStatus | PlainMessage<ScalingAppStatus> | undefined, b: ScalingAppStatus | PlainMessage<ScalingAppStatus> | undefined): boolean {
     return proto3.util.equals(ScalingAppStatus, a, b);
+  }
+}
+
+/**
+ * One replica of the autoscaler app, as its last report shows it.
+ *
+ * @generated from message legion.ScalingAppReplica
+ */
+export class ScalingAppReplica extends Message<ScalingAppReplica> {
+  /**
+   * The replica (its allocation, `alloc 41`).
+   *
+   * @generated from field: string instance = 1;
+   */
+  instance = "";
+
+  /**
+   * When its last report arrived, unix milliseconds.
+   *
+   * @generated from field: int64 last_report_unix_ms = 2;
+   */
+  lastReportUnixMs = protoInt64.zero;
+
+  /**
+   * Its evaluation interval, seconds.
+   *
+   * @generated from field: uint32 interval_seconds = 3;
+   */
+  intervalSeconds = 0;
+
+  /**
+   * Its app-wide mode: `enforce` or `dry-run`.
+   *
+   * @generated from field: string mode = 4;
+   */
+  mode = "";
+
+  /**
+   * Its build.
+   *
+   * @generated from field: string version = 5;
+   */
+  version = "";
+
+  /**
+   * The shards it holds; empty means every shard.
+   *
+   * @generated from field: repeated uint32 shards = 6;
+   */
+  shards: number[] = [];
+
+  /**
+   * How many shards policies hash to (64); 0 from a replica that does not
+   * shard.
+   *
+   * @generated from field: uint32 shard_count = 7;
+   */
+  shardCount = 0;
+
+  /**
+   * The targets in its last report.
+   *
+   * @generated from field: uint32 targets = 8;
+   */
+  targets = 0;
+
+  /**
+   * `running` when it reported within three of the app's intervals,
+   * `stale` otherwise (it died, or lost its leases and stopped reporting; its
+   * shards move to the others within a lease TTL).
+   *
+   * @generated from field: string state = 9;
+   */
+  state = "";
+
+  constructor(data?: PartialMessage<ScalingAppReplica>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.ScalingAppReplica";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "instance", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 2, name: "last_report_unix_ms", kind: "scalar", T: 3 /* ScalarType.INT64 */ },
+    { no: 3, name: "interval_seconds", kind: "scalar", T: 13 /* ScalarType.UINT32 */ },
+    { no: 4, name: "mode", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 5, name: "version", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 6, name: "shards", kind: "scalar", T: 13 /* ScalarType.UINT32 */, repeated: true },
+    { no: 7, name: "shard_count", kind: "scalar", T: 13 /* ScalarType.UINT32 */ },
+    { no: 8, name: "targets", kind: "scalar", T: 13 /* ScalarType.UINT32 */ },
+    { no: 9, name: "state", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): ScalingAppReplica {
+    return new ScalingAppReplica().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): ScalingAppReplica {
+    return new ScalingAppReplica().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): ScalingAppReplica {
+    return new ScalingAppReplica().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: ScalingAppReplica | PlainMessage<ScalingAppReplica> | undefined, b: ScalingAppReplica | PlainMessage<ScalingAppReplica> | undefined): boolean {
+    return proto3.util.equals(ScalingAppReplica, a, b);
   }
 }
 
@@ -8827,12 +9658,23 @@ export class ScalingTargetStatus extends Message<ScalingTargetStatus> {
   policyId = "";
 
   /**
-   * `task`, `group` (a task's whole group moves together), or `external`
-   * (a standalone policy's target plugin).
+   * `task`, `group` (a task's whole group moves together), `external`
+   * (a standalone policy's target plugin), or `nodes` (a node group:
+   * `now` is the count its provider holds, and `decision_json` is the node
+   * group's decision, with its victims and protected members).
    *
    * @generated from field: string kind = 24;
    */
   kind = "";
+
+  /**
+   * The autoscaler replica whose report this is (`alloc 41`): the one that
+   * holds the target's shard (docs/autoscaling.md, "Replicas"). Empty when
+   * no replica has reported the target.
+   *
+   * @generated from field: string instance = 25;
+   */
+  instance = "";
 
   constructor(data?: PartialMessage<ScalingTargetStatus>) {
     super();
@@ -8866,6 +9708,7 @@ export class ScalingTargetStatus extends Message<ScalingTargetStatus> {
     { no: 22, name: "policy_summary", kind: "scalar", T: 9 /* ScalarType.STRING */ },
     { no: 23, name: "policy_id", kind: "scalar", T: 9 /* ScalarType.STRING */ },
     { no: 24, name: "kind", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 25, name: "instance", kind: "scalar", T: 9 /* ScalarType.STRING */ },
   ]);
 
   static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): ScalingTargetStatus {
@@ -9773,14 +10616,15 @@ export class ScalingPolicySummary extends Message<ScalingPolicySummary> {
   id = "";
 
   /**
-   * `task`, `group` (a task's whole group moves together), or `external`.
+   * `task`, `group` (a task's whole group moves together), `external`, or
+   * `nodes` (a node group).
    *
    * @generated from field: string kind = 2;
    */
   kind = "";
 
   /**
-   * The namespace.
+   * The namespace (empty for a node group).
    *
    * @generated from field: string namespace = 3;
    */
@@ -9941,7 +10785,8 @@ export class StandaloneScalingPolicy extends Message<StandaloneScalingPolicy> {
   name = "";
 
   /**
-   * `external`.
+   * `external` (a target plugin), or `nodes` (a node group, whose
+   * namespace is empty: it belongs to the cluster).
    *
    * @generated from field: string kind = 4;
    */
@@ -9979,8 +10824,10 @@ export class StandaloneScalingPolicy extends Message<StandaloneScalingPolicy> {
   digest = "";
 
   /**
-   * The effective policy as canonical JSON (the shape of
-   * `ScalingPolicy.policy_json`). Empty when invalid.
+   * The effective policy as canonical JSON: the shape of
+   * `ScalingPolicy.policy_json` for an external target, the node group's
+   * effective record (every default filled) for a node group. Empty when
+   * invalid.
    *
    * @generated from field: string policy_json = 9;
    */
@@ -10015,6 +10862,15 @@ export class StandaloneScalingPolicy extends Message<StandaloneScalingPolicy> {
    */
   summary = "";
 
+  /**
+   * The policy's action row (RecordScalingAction): its version, which the
+   * next intent names, and the latest intent with the drains a node group
+   * has in flight. Unset before the first intent.
+   *
+   * @generated from field: legion.ScalingAction action = 14;
+   */
+  action?: ScalingAction;
+
   constructor(data?: PartialMessage<StandaloneScalingPolicy>) {
     super();
     proto3.util.initPartial(data, this);
@@ -10036,6 +10892,7 @@ export class StandaloneScalingPolicy extends Message<StandaloneScalingPolicy> {
     { no: 11, name: "target_config_json", kind: "scalar", T: 9 /* ScalarType.STRING */ },
     { no: 12, name: "pause", kind: "message", T: ScalingPauseInfo },
     { no: 13, name: "summary", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 14, name: "action", kind: "message", T: ScalingAction },
   ]);
 
   static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): StandaloneScalingPolicy {
@@ -25745,7 +26602,8 @@ export class KvJobReference extends Message<KvJobReference> {
  */
 export class ListKvRequest extends Message<ListKvRequest> {
   /**
-   * Prefix filter; entries with keys beginning with this prefix are returned.
+   * Prefix filter; entries (and, with `include_locks`, locks) with keys
+   * beginning with this prefix are returned.
    *
    * Default empty string matches all keys.
    *
@@ -25767,6 +26625,18 @@ export class ListKvRequest extends Message<ListKvRequest> {
    */
   includeValues = false;
 
+  /**
+   * Also return the unexpired locks under `prefix` in `locks`, filtered by
+   * `kv:read` like the entries. A listed lock's `lock_id` is left empty:
+   * it is the holder's secret (whoever has it can renew or release the
+   * lock), so only the holder, which got it from AcquireKvLock, knows it.
+   * Default `false`. The autoscaler's replicas read their shard leases
+   * this way (docs/autoscaling.md, "Replicas").
+   *
+   * @generated from field: bool include_locks = 3;
+   */
+  includeLocks = false;
+
   constructor(data?: PartialMessage<ListKvRequest>) {
     super();
     proto3.util.initPartial(data, this);
@@ -25777,6 +26647,7 @@ export class ListKvRequest extends Message<ListKvRequest> {
   static readonly fields: FieldList = proto3.util.newFieldList(() => [
     { no: 1, name: "prefix", kind: "scalar", T: 9 /* ScalarType.STRING */ },
     { no: 2, name: "include_values", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
+    { no: 3, name: "include_locks", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
   ]);
 
   static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): ListKvRequest {
@@ -25809,6 +26680,15 @@ export class ListKvReply extends Message<ListKvReply> {
    */
   entries: KvEntry[] = [];
 
+  /**
+   * With `include_locks`, the unexpired locks under the prefix, by key,
+   * each with its `owner`, `acquired_at` and `expires_at` and an empty
+   * `lock_id`. A lock's key need not have an entry.
+   *
+   * @generated from field: repeated legion.KvLock locks = 2;
+   */
+  locks: KvLock[] = [];
+
   constructor(data?: PartialMessage<ListKvReply>) {
     super();
     proto3.util.initPartial(data, this);
@@ -25818,6 +26698,7 @@ export class ListKvReply extends Message<ListKvReply> {
   static readonly typeName = "legion.ListKvReply";
   static readonly fields: FieldList = proto3.util.newFieldList(() => [
     { no: 1, name: "entries", kind: "message", T: KvEntry, repeated: true },
+    { no: 2, name: "locks", kind: "message", T: KvLock, repeated: true },
   ]);
 
   static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): ListKvReply {

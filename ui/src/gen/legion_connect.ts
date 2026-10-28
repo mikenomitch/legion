@@ -299,15 +299,30 @@ export const Manager = {
      * against the layered defaults and the plugins installed in the
      * autoscaler's app config.
      *
-     * The first message is the full set. A new full set follows whenever any
-     * input changes: a job with `autoscale` is submitted, stopped, or
-     * destroyed; a standalone policy is applied or deleted, or its pause
+     * The first message is the full set. Another follows whenever any input
+     * changes: a job with `autoscale` is submitted, stopped, or destroyed; a
+     * standalone policy is applied or deleted, or its pause or action row
      * changes; the cluster's scaling defaults change; a namespace policy's
-     * `autoscale` changes; the autoscaler's plugins change. Each message replaces the previous one; a consumer
-     * never merges. The manager checks for changes about once a second and
-     * sends nothing while nothing changed, so an idle stream costs one small
-     * read per second on the answering manager. Any manager answers: policies
-     * are computed from replicated state.
+     * `autoscale` changes; the autoscaler's plugins change. Without `deltas`
+     * each message is the full set again and replaces the previous one. With
+     * `deltas`, every later message carries only what changed (`full =
+     * false`): new or changed policies, and the keys of removed ones in
+     * `removed`; the consumer merges them into what it holds. With `deltas`,
+     * a change of more than 1,000 policies (the first set of a large
+     * cluster) is split into messages of at most 1,000, all but the last
+     * marked `more`, so no message nears gRPC's 4 MiB default limit. The manager
+     * checks for changes about once a second and sends nothing while nothing
+     * changed, so an idle stream costs one small read per second on the
+     * answering manager. Any manager answers: policies are computed from
+     * replicated state.
+     *
+     * With `shard_count` and `shards`, only the policies in those shards are
+     * sent (docs/autoscaling.md, "Replicas"): a policy's shard is FNV-1a
+     * (64-bit) of its key modulo `shard_count`, where the key is
+     * `<job id>/<group>/<task>` for an autoscaled task, `policy:<id>` for an
+     * external-target standalone policy, and `nodegroups` for every node
+     * group. An autoscaler replica watches the shards it holds a lease on, and
+     * starts a new watch when they change.
      *
      * A policy that no longer resolves (a defaults change applied with
      * `force`, two namespace policies that disagree, or a plugin it names
@@ -391,11 +406,20 @@ export const Manager = {
       kind: MethodKind.Unary,
     },
     /**
-     * Records an autoscaler action that is not a count write. Today that is
-     * a `dry-run` policy's "would" decision: a `scale_history` row with
-     * `applied = false`, so `legion scaling history` shows what the policy
-     * would have done. Node-group and external-target action intents will
-     * use the same RPC.
+     * Records an autoscaler action that is not a task's count write:
+     *
+     * - a `dry-run` policy's "would" decision (`kind = "would"`): a
+     *   `scale_history` row with `applied = false`, so `legion scaling
+     *   history` shows what the policy would have done;
+     * - an **action intent** on a standalone policy (`kind = "intent"`),
+     *   written before the app acts on a target outside Legion (calls
+     *   `target/scale` or `target/terminate`, drains or forgets a node-group
+     *   member), and its **outcome** (`kind = "outcome"`) once it has. Both are
+     *   compare-and-set on the policy's action version, so when two autoscaler
+     *   replicas' shard leases overlap, exactly one of them acts on each
+     *   decision (docs/autoscaling.md, "No duplicate actions"). The reply says
+     *   whether the write won, and carries the policy's action row either
+     *   way.
      *
      * ACL: app-plane, like ReportScalingStatus.
      *
@@ -419,8 +443,15 @@ export const Manager = {
      * Answered by the status-lane leader, which holds the app's reports (other
      * managers forward). Works with the app down, and says so.
      *
+     * Standalone policies are listed after the tasks; node groups (kind
+     * `nodes`) are listed whatever namespaces are asked for, since they have
+     * none. With several autoscaler replicas (docs/autoscaling.md,
+     * "Replicas"), each target's entry is the newest report of it, from the
+     * replica that owns it.
+     *
      * ACL: `scale:read`, gated before any lookup; targets of jobs outside the
      * caller's grant are left out (a request naming such a job is refused).
+     * Node groups need `node:read`.
      *
      * @generated from rpc legion.Manager.GetScalingStatus
      */
@@ -434,9 +465,12 @@ export const Manager = {
      * Lists the durable record of scaling changes for a job, newest first:
      * every count write (by people and by the autoscaler, applied or
      * deferred), pins and releases, and a `dry-run` policy's "would" rows.
-     * History is capped at 200 rows per task.
+     * History is capped at 200 rows per task. A standalone policy's history
+     * (`policy`) also has its action intents' rows: `scaled`, `failed`, and
+     * for a node group `drain`, `terminate`, `forget`, and `uncordon`.
      *
-     * ACL: `scale:read` on the job.
+     * ACL: `scale:read` on the job, or on the standalone policy; a node
+     * group's with `node:read`.
      *
      * @generated from rpc legion.Manager.GetScaleHistory
      */
@@ -454,9 +488,14 @@ export const Manager = {
      * writes to them, so a pause holds even against a misbehaving app. People
      * can still scale a paused task by hand.
      *
-     * ACL: `scale:write` on the job (or the standalone policy, gated with a
-     * coarse check before its lookup); `operator:write` for `all`.
-     * Retry-safe with `idempotency_key`.
+     * A node group (`policy` naming one) is paused like a standalone policy:
+     * its count holds, no drain starts, and drains that have not reached
+     * terminate are abandoned (their nodes uncordoned).
+     *
+     * ACL: `scale:write` on the job (or the standalone policy); a node group
+     * needs `operator:write` and `node:write`; `all` needs `operator:write`.
+     * A standalone policy is gated before its lookup with either grant, so a
+     * caller cannot probe for policies. Retry-safe with `idempotency_key`.
      *
      * @generated from rpc legion.Manager.PauseScaling
      */
@@ -485,18 +524,22 @@ export const Manager = {
      * when it next evaluates the policy, which reports `invalid` with the
      * reason (`legion scaling apply --wait` waits for that report).
      *
-     * A node-group policy (`target = { nodes = … }`) is parsed and validated,
-     * and refused with FAILED_PRECONDITION: node groups are not run in this
-     * version.
+     * A node-group policy (`target = { nodes = … }`; docs/autoscaling.md,
+     * "Node groups") is cluster-scoped: it is stored with no namespace, its id
+     * is its bare name, and it must name a target plugin that is installed
+     * (whether that plugin declares the `nodes` capability is checked by the
+     * autoscaler). Its name may not be the name of a policy in the `default`
+     * namespace, nor the reverse (ALREADY_EXISTS): both are addressed by the
+     * bare name.
      *
      * `dry_run` validates and returns the diff against the stored version
      * without writing. Applying an unchanged policy writes nothing and keeps
      * its version.
      *
      * ACL: `scale:write` on the policy's namespace and name (the scope a job
-     * of that name would have), gated with a coarse `scale:write` before the
-     * body is parsed. A node-group policy needs `operator:write` and
-     * `node:write`. Retry-safe with `idempotency_key`.
+     * of that name would have), checked once the body is parsed and before
+     * anything is looked up. A node-group policy needs `operator:write` and
+     * `node:write`, and no `scale` grant. Retry-safe with `idempotency_key`.
      *
      * @generated from rpc legion.Manager.ApplyScalingPolicy
      */
@@ -512,10 +555,15 @@ export const Manager = {
      * (or the policy's name is reused) ages it out. Deleting a policy that
      * does not exist is NOT_FOUND.
      *
-     * ACL: a coarse `scale:write` before the lookup, then `scale:write` on the
-     * policy (`operator:write` and `node:write` for a node group), so a
-     * caller cannot tell an existing policy from a missing one. Retry-safe
-     * with `idempotency_key`: a replayed delete reports `deduplicated`.
+     * `name` is `namespace/name`, or a bare name: the `default` namespace's
+     * policy of that name, else the node group of that name.
+     *
+     * ACL: before the lookup, `scale:write` on the policy's namespace and
+     * name, or `operator:write` and `node:write` (the node-group grant);
+     * after it, the grant the policy's kind needs. Node groups are looked up
+     * only for a caller holding the node-group grant, so a caller cannot tell
+     * an existing policy from a missing one. Retry-safe with
+     * `idempotency_key`: a replayed delete reports `deduplicated`.
      *
      * @generated from rpc legion.Manager.DeleteScalingPolicy
      */
@@ -528,12 +576,13 @@ export const Manager = {
     /**
      * Lists scaling policies in the namespaces asked for (`legion scaling
      * list`): every autoscaled task (kind `task`, or `group` for a multi-task
-     * group) and every standalone policy (kind `external`), with its mode,
-     * bounds, and whether it resolves. Any manager answers: policies are
-     * computed from replicated state.
+     * group), every standalone policy (kind `external`), and every node group
+     * (kind `nodes`, listed whatever namespaces are asked for: it has none),
+     * with its mode, bounds, and whether it resolves. Any manager answers:
+     * policies are computed from replicated state.
      *
      * ACL: `scale:read`, gated with `AclScope::any()`; entries outside the
-     * caller's grant are left out.
+     * caller's grant are left out. Node groups need `node:read`.
      *
      * @generated from rpc legion.Manager.ListScalingPolicies
      */
@@ -576,6 +625,13 @@ export const Manager = {
      * on existing nodes are not modelled, so it can over-ask by a node. It is
      * a point-in-time read on whichever manager answers, computed off the
      * scheduler's path; nothing is written.
+     *
+     * With a template's `members`, the reply also describes the group's
+     * current members for node scale-in: each node's provider id, its
+     * `legion.scale-in` tag, its reserved share, and its allocations with
+     * what makes a node never a victim (a `legion-system` job, node-local
+     * storage, a `disruption.minAvailable` the drain would break), and with
+     * `fit_check` whether an underutilized member's work fits on the others.
      *
      * ACL: `node:read`, gated before anything is read, then on each
      * template's pool. Node counts cover all pending work, but a pending or
@@ -2914,7 +2970,11 @@ export const Manager = {
       kind: MethodKind.Unary,
     },
     /**
-     * Lists KV entries by prefix.
+     * Lists KV entries by prefix, and with `include_locks` the unexpired
+     * locks under it (owners and expiries, never their lock ids).
+     *
+     * ACL: `kv:read`, gated before anything is read; entries and locks whose
+     * keys the caller cannot read are left out.
      *
      * @generated from rpc legion.Manager.ListKv
      */

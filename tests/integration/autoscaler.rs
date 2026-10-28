@@ -117,10 +117,15 @@ impl Harness {
         let addr = format!("http://127.0.0.1:{}", listener.local_addr()?.port());
         let incoming = legion::manager::daemon::manager_incoming(&store, listener, None)?;
         let server = tokio::spawn(async move {
-            let _ = tonic::transport::Server::builder()
-                .add_service(ManagerServer::new(service))
-                .serve_with_incoming(incoming)
-                .await;
+            let _ =
+                tonic::transport::Server::builder()
+                    // As the daemon serves it: a 10,000-target status report
+                    // with every decision is ~11 MB.
+                    .add_service(ManagerServer::new(service).max_decoding_message_size(
+                        legion::manager::daemon::MANAGER_MAX_DECODE_BYTES,
+                    ))
+                    .serve_with_incoming(incoming)
+                    .await;
         });
         let client = connect_manager_client_at(
             &addr,
@@ -248,7 +253,8 @@ impl Harness {
                             .iter()
                             .map(|(id, utilization)| AllocationUsage {
                                 allocation_id: *id,
-                                cpu_millicores: (utilization * 20.0 / 2400.0 * 1000.0).round() as u64,
+                                cpu_millicores: (utilization * 20.0 / 2400.0 * 1000.0).round()
+                                    as u64,
                                 memory_current_bytes: 8 * MIB,
                                 ..Default::default()
                             })

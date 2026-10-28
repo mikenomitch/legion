@@ -934,6 +934,9 @@ mod tests {
             .contains("not a node target"));
         let missing = catalog.check_node_target("gce").unwrap_err();
         assert!(missing.contains("not installed"), "{missing}");
-        assert!(missing.contains("installed: aws-asg, scripted"), "{missing}");
+        assert!(
+            missing.contains("installed: aws-asg, scripted"),
+            "{missing}"
+        );
     }
 }

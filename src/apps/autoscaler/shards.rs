@@ -226,7 +226,9 @@ impl Default for Ownership {
 impl Ownership {
     /// Whether this replica evaluates `shard`.
     pub fn owns(&self, shard: u32) -> bool {
-        self.shards.as_ref().is_none_or(|shards| shards.contains(&shard))
+        self.shards
+            .as_ref()
+            .is_none_or(|shards| shards.contains(&shard))
     }
 
     /// The shard list a watch or a report names (empty: all).
@@ -314,7 +316,11 @@ impl Shards {
             }
             Err(status) => {
                 if self.held.remove(key).is_some() {
-                    warn!(lease = key, "Lost an autoscaler lease: {}", status.message());
+                    warn!(
+                        lease = key,
+                        "Lost an autoscaler lease: {}",
+                        status.message()
+                    );
                 } else {
                     debug!(lease = key, "Lease not taken: {}", status.message());
                 }
@@ -410,8 +416,7 @@ impl Shards {
                 .map(|(shard, _)| *shard)
                 .collect();
             return self.publish(
-                (!others.is_empty())
-                    .then(|| (0..SHARDS).filter(|s| !others.contains(s)).collect()),
+                (!others.is_empty()).then(|| (0..SHARDS).filter(|s| !others.contains(s)).collect()),
                 members,
             );
         }
@@ -497,7 +502,10 @@ mod tests {
 
     /// Simulate replicas taking turns until nothing changes; returns who
     /// holds what.
-    fn converge(names: &[&str], mut state: BTreeMap<String, (BTreeSet<u32>, bool)>) -> BTreeMap<String, (BTreeSet<u32>, bool)> {
+    fn converge(
+        names: &[&str],
+        mut state: BTreeMap<String, (BTreeSet<u32>, bool)>,
+    ) -> BTreeMap<String, (BTreeSet<u32>, bool)> {
         for _ in 0..20 {
             let before = state.clone();
             for name in names {
@@ -551,7 +559,12 @@ mod tests {
         assert_eq!(plan.target, SHARDS);
         // A lone replica that held shards one by one gives them up for `all`.
         let held: BTreeSet<u32> = [1, 2].into_iter().collect();
-        let plan = super::plan("a", &view(&["a"], &[(1, "a"), (2, "a")], None), &held, false);
+        let plan = super::plan(
+            "a",
+            &view(&["a"], &[(1, "a"), (2, "a")], None),
+            &held,
+            false,
+        );
         assert_eq!(plan.release, vec![1, 2]);
         // Someone else's `all` (a departed replica's, not yet expired):
         // wait for it.
@@ -587,11 +600,21 @@ mod tests {
 
     #[test]
     fn a_replica_waits_while_another_holds_everything_test() {
-        let plan = plan("b", &view(&["a", "b"], &[], Some("a")), &BTreeSet::new(), false);
+        let plan = plan(
+            "b",
+            &view(&["a", "b"], &[], Some("a")),
+            &BTreeSet::new(),
+            false,
+        );
         assert!(plan.acquire.is_empty() && !plan.hold_all);
         assert_eq!(plan.target, 32);
         // The holder of `all` takes its share, then lets `all` go.
-        let plan = super::plan("a", &view(&["a", "b"], &[], Some("a")), &BTreeSet::new(), true);
+        let plan = super::plan(
+            "a",
+            &view(&["a", "b"], &[], Some("a")),
+            &BTreeSet::new(),
+            true,
+        );
         assert_eq!(plan.acquire.len(), 32);
         assert!(plan.release_all);
     }
@@ -601,7 +624,10 @@ mod tests {
         assert_eq!(lease_id("alloc 41"), "alloc-41");
         assert_eq!(lease_id("web-1.local"), "web-1.local");
         assert_eq!(lease_id("  "), "autoscaler");
-        assert_eq!(member_key("alloc-41"), "legion/apps/autoscaler/members/alloc-41");
+        assert_eq!(
+            member_key("alloc-41"),
+            "legion/apps/autoscaler/members/alloc-41"
+        );
     }
 
     /// The leases live under the reserved `legion/` prefix: a tenant's
@@ -612,7 +638,10 @@ mod tests {
         for key in [member_key("alloc-1"), shard_key(7), ALL.to_string()] {
             assert!(key.starts_with(LEASE_PREFIX));
             assert!(!kv_path_glob_match("*", &key), "{key}");
-            assert!(kv_path_glob_match("legion/apps/autoscaler/*", &key), "{key}");
+            assert!(
+                kv_path_glob_match("legion/apps/autoscaler/*", &key),
+                "{key}"
+            );
         }
     }
 

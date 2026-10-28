@@ -679,8 +679,9 @@ changes whenever a job, a standalone policy, a pause, the defaults, a
 namespace policy, or its own app config changes), reads every target's
 inputs in one batched `GetScalingInputs` per 1,000 targets per interval,
 evaluates, writes, and reports (`ReportScalingStatus`, which is also its
-heartbeat). One replica evaluates 10,000 task policies in @@TICK@@ per
-tick ([benchmarks.md](benchmarks.md#the-autoscaler-at-10000-policies));
+heartbeat). One replica evaluated 10,000 task policies in about 7.7
+seconds a tick in our in-process run, inside the 15-second default
+([benchmarks.md](benchmarks.md#the-autoscaler-at-10000-policies));
 more replicas split the policies between them ([Replicas](#replicas)). Its
 config (`legion app config set autoscaler -f config.ncl`):
 
@@ -716,7 +717,8 @@ group that could host the same work). Each replica holds **leases**, KV
 locks under `legion/apps/autoscaler/` with a 15-second TTL renewed every 5
 seconds, and evaluates only the shards it holds:
 
-- `members/<instance>`: one per live replica;
+- `members/<replica>`: one per live replica (`members/alloc-41` for
+  `alloc 41`);
 - `shards/all`: a lone replica holds this one lease for every shard, so
   the default costs two lease writes per renewal, not 65;
 - `shards/<n>`: with several replicas, each holds up to `ceil(64 / live)`,
@@ -745,7 +747,11 @@ reported for three intervals.
 The app's grant includes `kv` read and write on `legion/apps/autoscaler/*`
 for the leases. Keys under `legion/` are reserved: a tenant's `paths =
 ["*"]` rule does not reach them, so no one else can take or starve the
-autoscaler's shards.
+autoscaler's shards. `ListKv` with `include_locks` shows who holds which
+lease and until when ([kv-store.md](kv-store.md#locking-model)).
+
+Every replica caps its calls to each plugin (`concurrency`, [Plugins](#plugins)),
+so three replicas ask one Prometheus at most three times the cap at once.
 
 ## Plugins
 
@@ -1636,6 +1642,11 @@ is trusted, as everywhere else.
   shard moves to another replica, the windows of its policies start empty:
   no scale-in for one `down.stabilize`, and the averaging windows refill.
   While no replica runs nothing scales, and the UI panels say so.
+- **One replica's report is one request.** A tick's `ReportScalingStatus`
+  carries every target the replica evaluated, with each changed decision in
+  full: about 11 MB for 10,000 targets whose decisions all changed, against
+  the manager's 64 MiB request limit. Past roughly 50,000 targets on one
+  replica, add replicas.
 - **A replica that dies holds its shards for one lease TTL** (15 seconds),
   plus up to one renewal (5 seconds) before another replica takes them;
   their policies are not evaluated meanwhile.

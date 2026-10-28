@@ -112,6 +112,15 @@ holds `crate::support::DYNAMIC_PORT_GATE`.
   - eval ordering and eval-driven ledger reconciliation behavior.
 - `rollout_integration`
   - rollout progression behavior (auto/manual/create-first/destroy-first, etc).
+- `node_groups`
+  - a node group grows from zero for pending work through a scripted `exec`
+    provider, its machines join with the group's token, and empty members
+    are drained, terminated, and forgotten one `down.every` apart, never the
+    one a `legion-system` allocation protects.
+- `autoscaler_shards`
+  - several autoscaler replicas split the 64 shards and rebalance after one
+    dies; two forced to overlap land one `ScaleTask` and one `target/scale`
+    per decision; the policy watch sends deltas for the shards asked.
 
 ## Running Tests
 
@@ -405,6 +414,21 @@ LEGION_BENCH_BACKENDS=local_disk,raft1 LEGION_HEARTBEAT_NODES=1000,5000 \
 
   Knobs: `LEGION_HEARTBEAT_THREADS` (default 8) and
   `LEGION_HEARTBEAT_SECONDS` (measurement window per cell, default 3).
+
+- The autoscaler at 10,000 policies (`tests/integration/autoscaler_load.rs`):
+  10,000 autoscaled jobs on an in-process manager, usage heartbeats for every
+  allocation, and one autoscaler engine timed over six evaluation ticks
+  (reading inputs, deciding and writing, reporting), plus the first
+  `WatchScalingPolicies` set. `LEGION_AUTOSCALER_LOAD_POLICIES` changes the
+  count. The published numbers are in
+  [benchmarks.md](benchmarks.md#the-autoscaler-at-10000-policies):
+
+```bash
+cargo test --release --test integration autoscaler_load:: -- --ignored --nocapture
+```
+
+  Publish release-build numbers: a debug build spends about twice as long
+  in the manager's store reads.
 
 Recorded results live in `benchmarks/scheduler/README.md`, with the host
 and build profile noted alongside every table.

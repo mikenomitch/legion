@@ -164,7 +164,13 @@ struct StoreFacts {
 
 /// The replica counts, desired count, and reservation of every task of one
 /// job the selection names.
-fn store_facts(store: &Store, selection: &JobSelection) -> R<Vec<Result<StoreFacts, String>>> {
+/// `pauses` is every scaling pause ([`Store::scaling_pauses`]), read once
+/// per call rather than once per job.
+fn store_facts(
+    store: &Store,
+    selection: &JobSelection,
+    pauses: &[crate::storage::store::PauseRow],
+) -> R<Vec<Result<StoreFacts, String>>> {
     let Some(config) = store.get_job_config_optional(&selection.job)? else {
         return Ok(vec![Err("job not found".to_string())]);
     };
@@ -198,7 +204,6 @@ fn store_facts(store: &Store, selection: &JobSelection) -> R<Vec<Result<StoreFac
     let replicas = store.scaling_replica_rows(job_id)?;
     let rollout_active = !store.list_rollouts(Some(job_id), true)?.is_empty();
     let scales = store.task_scales_for_job(job_id)?;
-    let pauses = store.scaling_pauses()?;
     let now_ms = super::autoscale_rpcs::now_unix_ms();
     let namespace = crate::structs::namespace::job_namespace(job_id);
     let mut out = Vec::with_capacity(tasks.len());
@@ -265,7 +270,7 @@ fn store_facts(store: &Store, selection: &JobSelection) -> R<Vec<Result<StoreFac
                     .filter(|pin| pin.active(now_ms))
                     .map(super::autoscale_rpcs::pin_proto),
                 pause: crate::storage::store::covering_pause(
-                    &pauses,
+                    pauses,
                     job_id,
                     &task.group,
                     &task.name,
@@ -293,7 +298,8 @@ pub(crate) fn scaling_replica_counts(
         group: None,
         task: None,
     };
-    Ok(store_facts(store, &selection)?
+    let pauses = store.scaling_pauses()?;
+    Ok(store_facts(store, &selection, &pauses)?
         .into_iter()
         .flatten()
         .map(|facts| {
@@ -428,8 +434,12 @@ impl ManagerDaemonService {
 
         // Store reads first, then one short hold of the merged view.
         let mut resolved: Vec<Result<StoreFacts, ScalingInputs>> = Vec::new();
+        let pauses = self
+            .store
+            .scaling_pauses()
+            .map_err(|e| map_store_error("Error reading scaling inputs", e))?;
         for selection in &selections {
-            let facts = store_facts(&self.store, selection)
+            let facts = store_facts(&self.store, selection, &pauses)
                 .map_err(|e| map_store_error("Error reading scaling inputs", e))?;
             for fact in facts {
                 resolved.push(fact.map_err(|error| selection.error_entry(error)));

@@ -1017,7 +1017,13 @@ async fn node_view(ui: &AutoscalerUi, context: &ViewContext) -> R<AppView> {
             None
         }
     };
-    Ok(render_node(&node, &group, &members, demand, policy.as_ref()))
+    Ok(render_node(
+        &node,
+        &group,
+        &members,
+        demand,
+        policy.as_ref(),
+    ))
 }
 
 /// The node group's policy state, as blocks.
@@ -1245,7 +1251,9 @@ fn render_node(
         empty: None,
     }));
     match policy {
-        Some(policy) => blocks.splice(1..1, policy_blocks(group, policy)).for_each(drop),
+        Some(policy) => blocks
+            .splice(1..1, policy_blocks(group, policy))
+            .for_each(drop),
         None => blocks.push(Block::Notice(NoticeBlock {
             tone: Tone::Info,
             title: None,
@@ -1609,7 +1617,12 @@ mod tests {
         let view = render_node(&one, "general", &members, demand(), None);
         valid(&view, Slot::Node);
         let text = serde_json::to_string(&view).unwrap();
-        for needle in ["jt-1", "i-0abc", "/nodes/w-2", "No node-group policy runs general"] {
+        for needle in [
+            "jt-1",
+            "i-0abc",
+            "/nodes/w-2",
+            "No node-group policy runs general",
+        ] {
             assert!(text.contains(needle), "{needle}: {text}");
         }
 
