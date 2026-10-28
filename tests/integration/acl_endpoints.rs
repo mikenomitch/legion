@@ -2955,7 +2955,9 @@ async fn star_policies_do_not_reach_legion_system_or_legion_kv_test() -> R<()> {
         .expect_err("`*` must not reach legion-system");
     assert_eq!(status.code(), Code::PermissionDenied, "{status:?}");
     assert!(
-        status.message().contains("does not reach reserved `legion-*`"),
+        status
+            .message()
+            .contains("does not reach reserved `legion-*`"),
         "the denial says why: {status:?}"
     );
     run("legion-system", task.clone(), system.clone())

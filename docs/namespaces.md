@@ -262,7 +262,9 @@ managers' [system workers](architecture-managers-workers.md#the-system-worker).
   Hint: set user = "nobody" (or another unprivileged user) in the task's config
   ```
 
-  `legion job validate` applies the same check before anything is sent.
+  `legion job validate` applies the same check offline when the jobspec
+  names its namespace (`namespace = "legion-system"`); the manager applies
+  it on every submit.
 
 ## Nodes that accept only some namespaces
 
