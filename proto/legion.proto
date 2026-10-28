@@ -2382,6 +2382,22 @@ message WorkerConfig {
   //
   // Default: empty string (the default guard, no overrides).
   string security = 15;
+
+  // The namespaces whose jobs nodes of this type accept (worker-type config
+  // `namespaces`), as names or `*`-globs: `["ci-*"]`, `["legion-system"]`.
+  // The worker records the list on its node as the `namespaces` config
+  // attribute, and the scheduler refuses to place a job whose namespace no
+  // entry matches, whatever the job's `permit` says: it is a restriction of
+  // the node, not a toleration a job can write. The blocked-eval wake pass
+  // applies the same check, so a restricted node never wakes a job it would
+  // refuse. Globs follow the reserved-prefix rule: `*` matches every
+  // namespace except reserved `legion-*` ones, which only a pattern that
+  // itself starts with `legion-` matches. See docs/namespaces.md, "Nodes
+  // that accept only some namespaces".
+  //
+  // Default: empty (the node accepts every namespace, reserved ones
+  // included).
+  repeated string namespaces = 16;
 }
 
 // Reply payload for WorkerPreRegister.

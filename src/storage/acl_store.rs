@@ -56,8 +56,10 @@ impl AclTokenRecord {
     }
 }
 
-/// Full join token row, including the secret hash. Never leaves the manager.
-#[derive(Debug, Clone)]
+/// Full join token row, including the secret hash. Never leaves the
+/// managers (a follower forwards a manager's own in-process worker's row to
+/// the control leader, `ForwardableLaneWrite::InsertJoinToken`).
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct JoinTokenRecord {
     pub id: String,
     pub secret_hash: String,
@@ -443,6 +445,23 @@ impl Store {
         self.replicated(Lane::Control, "insert_join_token", move |s| {
             s.insert_join_token_apply(&record)
         })
+    }
+
+    /// [`Self::insert_join_token`], forwarded to the control lane's leader
+    /// when this manager does not lead it. Only for the token a manager
+    /// mints for its own in-process worker: a follower must be able to start
+    /// its system worker, and nothing else would ever write that row.
+    pub fn insert_join_token_forwarding(&self, record: &JoinTokenRecord) -> R<()> {
+        match self.insert_join_token(record) {
+            Err(err) if crate::storage::raft::driver::NotRaftLeader::in_chain(&err) => self
+                .forward_after_rejection::<()>(
+                    crate::storage::raft::forward::ForwardableLaneWrite::InsertJoinToken {
+                        record: record.clone(),
+                    },
+                    err,
+                ),
+            other => other,
+        }
     }
 
     fn insert_join_token_apply(&self, record: &JoinTokenRecord) -> R<()> {

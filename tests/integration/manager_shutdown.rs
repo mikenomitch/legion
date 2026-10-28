@@ -28,6 +28,9 @@ fn manager_exits_cleanly_on_sigterm_test() {
         "storePath": dir.path().join("store").to_str().expect("utf-8 path"),
         "exec": { "enabled": false },
         "telemetry": { "enabled": false },
+        // No system worker: it would bind a worker port nobody reserved
+        // (tests/integration/system_worker.rs covers its shutdown).
+        "systemWorker": { "enabled": false },
     });
     std::fs::write(&config_path, config.to_string()).expect("write config");
 

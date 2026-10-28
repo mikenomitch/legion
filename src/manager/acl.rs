@@ -505,6 +505,34 @@ impl Authenticator {
         ttl: Option<Duration>,
         description: &str,
     ) -> Result<(JoinTokenInfo, String), Status> {
+        self.mint_join_token_with(store, advertise_addr, worker_type, ttl, description, false)
+    }
+
+    /// [`Self::mint_join_token`] for a manager's own in-process worker: on a
+    /// raft follower the token's row is forwarded to the control lane's
+    /// leader (`ForwardLaneWrite`) instead of failing, so every manager can
+    /// start its system worker, not only the leader. Client RPCs keep the
+    /// non-forwarding mint, and follow the leader hint as before.
+    pub fn mint_local_worker_join_token(
+        &self,
+        store: &Store,
+        advertise_addr: &str,
+        worker_type: &str,
+        ttl: Option<Duration>,
+        description: &str,
+    ) -> Result<(JoinTokenInfo, String), Status> {
+        self.mint_join_token_with(store, advertise_addr, worker_type, ttl, description, true)
+    }
+
+    fn mint_join_token_with(
+        &self,
+        store: &Store,
+        advertise_addr: &str,
+        worker_type: &str,
+        ttl: Option<Duration>,
+        description: &str,
+        forward_to_leader: bool,
+    ) -> Result<(JoinTokenInfo, String), Status> {
         let now = OffsetDateTime::now_utc();
         let secret = format!("{JOIN_SECRET_PREFIX}{}", random_hex(24));
         let expires_at = match ttl {
@@ -549,9 +577,12 @@ impl Authenticator {
                     format!("the cluster CA is unavailable, so a join token can't pin it: {e}"),
                 )
             })?;
-        store
-            .insert_join_token(&record)
-            .map_err(internal_acl_error)?;
+        if forward_to_leader {
+            store.insert_join_token_forwarding(&record)
+        } else {
+            store.insert_join_token(&record)
+        }
+        .map_err(internal_acl_error)?;
         let composite = JoinToken::new(advertise_addr, secret, worker_type, ca_hash)
             .encode()
             .map_err(|e| Status::internal(format!("failed to encode join token: {e:#}")))?;

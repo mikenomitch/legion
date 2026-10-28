@@ -233,6 +233,45 @@ pub struct WorkerJoin {
     /// stops and returns rather than exiting the process under the
     /// manager's own drain.
     pub in_process: bool,
+    /// What the manager imposes on its in-process worker over its worker
+    /// type's stored config. `None` for every standalone worker.
+    pub local: Option<LocalWorkerSettings>,
+}
+
+/// What a manager imposes on its in-process worker over the config its
+/// worker type stores: the system worker's namespaces, lend, cgroup parent
+/// and port (docs/architecture-managers-workers.md, "The system worker"),
+/// or `--run-worker`'s wider namespaces. Worker types are cluster-wide and
+/// these are each manager's own, so they ride here rather than in the
+/// stored type.
+#[derive(Debug, Clone, Default)]
+pub struct LocalWorkerSettings {
+    /// Replaces the type's `namespaces`.
+    pub namespaces: Option<Vec<String>>,
+    /// Added to the type's `attributes` (`legion.role = "manager"`).
+    pub attributes: HashMap<String, String>,
+    /// The lend: advertised as the node's whole capacity (the `capacity`
+    /// attribute), and, where the node enforces, written as its cgroup
+    /// parent's `cpu.max` and `memory.max`.
+    pub lend: Option<crate::structs::SystemWorkerResources>,
+    /// Replaces the type's `resourceEnforcement.cgroupParent`, so the
+    /// worker's allocations, and the ceiling above them, live apart from a
+    /// standalone worker's on the same host.
+    pub cgroup_parent: Option<String>,
+    /// The worker plane port, instead of `LEGION_WORKER_PORT` or 4848.
+    pub port: Option<u16>,
+}
+
+impl LocalWorkerSettings {
+    /// Apply the settings that live in the pre-registration config.
+    fn apply_to(&self, config: &mut WorkerConfig) {
+        if let Some(namespaces) = &self.namespaces {
+            config.namespaces = namespaces.clone();
+        }
+        for (key, value) in &self.attributes {
+            config.attributes.insert(key.clone(), value.clone());
+        }
+    }
 }
 
 #[instrument(err, skip_all)]
@@ -251,6 +290,7 @@ pub async fn run_worker(
             ca_pin: Some(join_token.ca_hash),
             advertise_addr: advertise_addr.map(str::to_string),
             in_process: false,
+            local: None,
         },
         name_override,
     )
@@ -285,8 +325,13 @@ async fn run_worker_with_manager(join: WorkerJoin, name_override: Option<&str>) 
         ca_pin,
         advertise_addr,
         in_process,
+        local,
     } = join;
-    let server_port = worker_server_port();
+    let server_port = local
+        .as_ref()
+        .and_then(|local| local.port)
+        .map(u64::from)
+        .unwrap_or_else(worker_server_port);
     let bind = crate::worker::plane::bind_address(server_port)?;
     let advertised = crate::worker::plane::advertise_address(
         &manager_addr,
@@ -354,7 +399,10 @@ async fn run_worker_with_manager(join: WorkerJoin, name_override: Option<&str>) 
     // cluster). Heartbeats keep it current.
     crate::worker::boot_ticket::cluster_issuer()
         .learn(&pre_register_reply.workload_identity_issuer);
-    let config = pre_register_reply.config.context("No config found")?;
+    let mut config = pre_register_reply.config.context("No config found")?;
+    if let Some(local) = &local {
+        local.apply_to(&mut config);
+    }
 
     let name = resolve_worker_name(name_override, config.name_prefix.clone())?;
     let state_path = WorkerStateStore::path_for_worker(&name);
@@ -450,8 +498,11 @@ async fn run_worker_with_manager(join: WorkerJoin, name_override: Option<&str>) 
     // Task runtimes run in-process as dylibs and take no config of their own,
     // so cross-cutting worker settings reach them through the environment —
     // the same channel `sandbox` uses for LEGION_SANDBOX_KERNEL.
-    let enforcement_config =
-        usable_resource_enforcement(parse_resource_enforcement(&config.resource_enforcement));
+    let mut enforcement_config = parse_resource_enforcement(&config.resource_enforcement);
+    if let Some(parent) = local.as_ref().and_then(|local| local.cgroup_parent.clone()) {
+        enforcement_config.cgroup_parent = parent;
+    }
+    let enforcement_config = usable_resource_enforcement(enforcement_config);
     apply_resource_enforcement_env(&enforcement_config);
     // The kernel classifier (mesh interfaces plan §6.A) where the node can
     // run it: the host guard, host-mode egress chains, and DNS capture, in
@@ -508,6 +559,9 @@ async fn run_worker_with_manager(join: WorkerJoin, name_override: Option<&str>) 
         // set, so enforcement never turned on. The governor logs whether it
         // really enforces (and why not, when it cannot).
         manager.configure_resource_enforcement(&enforcement_config);
+        if let Some(lend) = local.as_ref().and_then(|local| local.lend) {
+            cap_to_lend(&mut manager, lend, &enforcement_config.cgroup_parent);
+        }
         manager.load_builtin_plugins();
         manager.configure_volumes(&name, host_volumes);
         // Before `configure_artifacts`, which hands the store to the stager.
@@ -667,6 +721,22 @@ async fn run_worker_with_manager(join: WorkerJoin, name_override: Option<&str>) 
     let mut config_attrs = Map::new();
     for (key, value) in config.attributes {
         config_attrs.insert(key, Value::String(value));
+    }
+    // The namespaces this node accepts: the scheduler refuses every other
+    // namespace's jobs here, whatever their permit says.
+    if !config.namespaces.is_empty() {
+        config_attrs.insert(
+            crate::constraints::NODE_NAMESPACES_ATTR.into(),
+            json!(config.namespaces),
+        );
+    }
+    // A system worker offers its manager's lend, not the host. No `cores`:
+    // the lend is a share of the host's CPUs, not whole ones to pin.
+    if let Some(lend) = local.as_ref().and_then(|local| local.lend) {
+        config_attrs.insert(
+            crate::resources::CAPACITY_ATTR.into(),
+            json!({ "cpu": lend.cpu, "memory": lend.memory, "cores": 0 }),
+        );
     }
     let resources = serde_json::from_str(&config.resources).unwrap_or_else(|_| json!({}));
     let reserved_resources =
@@ -1653,6 +1723,37 @@ fn parse_resource_enforcement(raw: &str) -> crate::structs::WorkerResourceEnforc
             warn!(error = ?err, "Invalid worker resourceEnforcement config; using the defaults");
             crate::structs::WorkerResourceEnforcementConfig::default()
         }
+    }
+}
+
+/// Cap a manager's system worker at the manager's lend, on its cgroup
+/// parent, and say what happened: the ceiling the kernel now holds it to,
+/// or that the lend is only the capacity it advertises (macOS, no cgroup
+/// v2, enforcement off or refused).
+fn cap_to_lend(
+    manager: &mut WorkerTaskManager,
+    lend: crate::structs::SystemWorkerResources,
+    cgroup_parent: &str,
+) {
+    let limits = crate::worker::resources::ParentLimits {
+        cpu_mhz: lend.cpu,
+        memory_mib: lend.memory,
+    };
+    match manager.cap_cgroup_parent(limits) {
+        Ok((cpu_max, memory_max)) => info!(
+            cgroup_parent,
+            cpu_max = %cpu_max,
+            memory_max = %memory_max,
+            "System worker capped at the manager's lend: its allocations together use at most \
+             this much of the host"
+        ),
+        Err(err) => warn!(
+            reason = %format!("{err:#}"),
+            cpu_mhz = lend.cpu,
+            memory_mib = lend.memory,
+            "System worker's lend is advertised capacity only: the scheduler places no more \
+             than it here, but nothing in the kernel caps what its allocations use"
+        ),
     }
 }
 

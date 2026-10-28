@@ -1511,6 +1511,16 @@ impl WorkerTaskManager {
         self.resources.enabled()
     }
 
+    /// Cap everything this worker runs at `limits`, on its cgroup parent
+    /// (a manager's system worker and its lend). See
+    /// [`NodeResourceGovernor::apply_parent_limits`].
+    pub fn cap_cgroup_parent(
+        &mut self,
+        limits: crate::worker::resources::ParentLimits,
+    ) -> R<(String, String)> {
+        self.resources.apply_parent_limits(limits)
+    }
+
     pub fn load_builtin_plugins(&mut self) {
         load_builtin_plugins_into(&mut self.registry);
     }

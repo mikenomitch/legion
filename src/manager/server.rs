@@ -8660,6 +8660,7 @@ impl Manager for ManagerDaemonService {
             edge_boot: worker_config.edge_boot,
             security: worker_config.security,
             container: worker_config.container,
+            namespaces: worker_config.namespaces,
         };
 
         let reply = WorkerPreRegisterReply {
@@ -20279,6 +20280,89 @@ mod tests {
             })))
             .expect_err("unknown instance");
         assert_eq!(status.code(), tonic::Code::NotFound);
+        Ok(())
+    }
+
+    /// A tenant admin's `exec` grant on `namespaces = ["*"]` does not reach
+    /// an app's allocation in `legion-system`, so it cannot borrow the app's
+    /// identity through a shell; a grant naming `legion-*` does
+    /// (docs/namespaces.md, "Reserved namespaces").
+    #[tokio::test]
+    async fn star_exec_grants_do_not_reach_legion_system_test() -> R<()> {
+        use crate::structs::acl::{AclIdentity, AclRule, AclSource};
+        let store = setup_store()?;
+        store.ensure_system_namespace()?;
+        let manager = ManagerDaemonService::new(store.clone());
+        for name in ["legion-system/agent", "shell"] {
+            run_jobspec(
+                &manager,
+                json!({
+                    "name": name,
+                    "task": {
+                        "name": "main",
+                        "runtime": "exec",
+                        "config": { "command": ["sleep", "600"], "user": "nobody" },
+                    }
+                }),
+            )
+            .await?;
+        }
+        store.insert_node(NodeMsg {
+            id: "node-1".into(),
+            pool: "default".into(),
+            status: "active".into(),
+            availability: "available".into(),
+            config_attrs: json!({ "workerAddress": "https://10.0.3.17:4848" }).to_string(),
+            fingerprint_attrs: "{}".into(),
+            dynamic_attrs: json!({
+                "protocolVersion": crate::manager::worker_plane::MIN_WORKER_PLANE_PROTOCOL
+            })
+            .to_string(),
+            health_checks: "{}".into(),
+            last_heartbeat: "2023-01-01 00:00:00 +00:00:00".into(),
+            heartbeat_source: String::new(),
+        })?;
+        let alloc_of = |job: &str| -> R<i64> {
+            let config = store.get_job_config(job)?.id();
+            let (task_id, _) = store
+                .get_task_configs_for_job_config(&config)?
+                .into_iter()
+                .next()
+                .context("task config")?;
+            Ok(store.place_alloc("node-1", task_id)?.id)
+        };
+        let system_alloc = alloc_of("legion-system/agent")?;
+        let tenant_alloc = alloc_of("shell")?;
+        let identity = |namespaces: Value| AclIdentity {
+            principal: "tester".into(),
+            accessor_id: Some("acc-1".into()),
+            is_management: false,
+            is_worker: false,
+            policies: vec!["p".into()],
+            rules: serde_json::from_value::<Vec<AclRule>>(json!([{
+                "resources": ["exec"], "namespaces": namespaces,
+                "actions": ["write"], "host": true
+            }]))
+            .expect("rules"),
+            source: AclSource::Token,
+            expires_at: None,
+            audit_only: false,
+        };
+        let start = |allocation_id: i64| crate::structs::ExecStart {
+            allocation_id,
+            command: vec!["/bin/sh".into()],
+            ..Default::default()
+        };
+        let tenant_admin = identity(json!(["*"]));
+        crate::manager::exec::resolve_for_test(&store, &tenant_admin, &start(tenant_alloc))
+            .expect("`*` reaches a tenant job");
+        let status =
+            crate::manager::exec::resolve_for_test(&store, &tenant_admin, &start(system_alloc))
+                .expect_err("`*` must not reach legion-system");
+        assert_eq!(status.code(), tonic::Code::PermissionDenied);
+        let operator = identity(json!(["*", "legion-*"]));
+        crate::manager::exec::resolve_for_test(&store, &operator, &start(system_alloc))
+            .expect("a pattern naming legion- reaches it");
         Ok(())
     }
 

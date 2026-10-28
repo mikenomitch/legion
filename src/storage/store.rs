@@ -2885,7 +2885,7 @@ impl Store {
     /// real execution failure on the leader, which propagates as itself —
     /// callers' tolerance logic sees exactly the surface it saw before
     /// forwarding existed, plus successes it could not have had.
-    fn forward_after_rejection<T: serde::de::DeserializeOwned>(
+    pub(crate) fn forward_after_rejection<T: serde::de::DeserializeOwned>(
         &self,
         op: crate::storage::raft::forward::ForwardableLaneWrite,
         original: anyhow::Error,
@@ -7158,6 +7158,13 @@ impl Store {
             edge_boot: row.get(12)?,
             container: row.get(13)?,
             security: row.get(14)?,
+            namespaces: row
+                .get::<_, String>(15)?
+                .split(',')
+                .map(str::trim)
+                .filter(|pattern| !pattern.is_empty())
+                .map(str::to_string)
+                .collect(),
         })
     }
 
@@ -9235,6 +9242,7 @@ impl Store {
             ":edge_boot": config.edge_boot,
             ":container": config.container,
             ":security": config.security,
+            ":namespaces": config.namespaces.join(","),
         };
 
         let config = conn.query_row(&INSERT_WORKER_TYPE, params, |row| {
@@ -14690,14 +14698,14 @@ impl Store {
         tx: &Connection,
         task_id: i64,
     ) -> R<AllocationConstraintState> {
-        let (constraints, permit): (Value, Value) = tx.query_row(
-            "SELECT constraints, permit FROM task_config WHERE id = ?;",
+        let (constraints, permit, job_id): (Value, Value, String) = tx.query_row(
+            "SELECT constraints, permit, job_id FROM task_config WHERE id = ?;",
             [task_id],
-            |row| Ok((row.get(0)?, row.get(1)?)),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )?;
         let constraint_set = ConstraintSet::new(&constraints)
             .with_context(|| format!("Failed to parse constraints for task {task_id}"))?;
-        let permit_set = PermitSet::new(&permit)
+        let permit_set = PermitSet::new(&permit, crate::structs::namespace::job_namespace(&job_id))
             .with_context(|| format!("Failed to parse permit for task {task_id}"))?;
         let distinct_keys = constraint_set.distinct_keys();
         let distinct = if distinct_keys.is_empty() {
@@ -14727,16 +14735,17 @@ impl Store {
     }
 
     fn load_allocation_task_state(&self, tx: &Connection, task_id: i64) -> R<AllocationTaskState> {
-        let (job_config_id, resources, constraints, permit, network_raw, connect_raw): (
+        let (job_config_id, resources, constraints, permit, network_raw, connect_raw, job_id): (
             String,
             Value,
             Value,
             Value,
             Option<String>,
             Option<String>,
+            String,
         ) = tx
             .prepare_cached(
-                "SELECT job_config_id, resources, constraints, permit, network, connect FROM task_config WHERE id = ?;",
+                "SELECT job_config_id, resources, constraints, permit, network, connect, job_id FROM task_config WHERE id = ?;",
             )?
             .query_row([task_id], |row| {
                 Ok((
@@ -14746,12 +14755,13 @@ impl Store {
                     row.get(3)?,
                     row.get(4)?,
                     row.get(5)?,
+                    row.get(6)?,
                 ))
             })?;
 
         let constraint_set = ConstraintSet::new(&constraints)
             .with_context(|| format!("Failed to parse constraints for task {task_id}"))?;
-        let permit_set = PermitSet::new(&permit)
+        let permit_set = PermitSet::new(&permit, crate::structs::namespace::job_namespace(&job_id))
             .with_context(|| format!("Failed to parse permit for task {task_id}"))?;
         let distinct_keys = constraint_set.distinct_keys();
         let distinct = if distinct_keys.is_empty() {
@@ -22671,6 +22681,7 @@ mod tests {
             max_allocations: None,
             artifacts: String::new(),
             heartbeat_seconds: Some(5),
+            namespaces: vec!["ci-*".to_string(), "legion-system".to_string()],
         };
 
         let returned_config = store.insert_worker_type(&worker_config)?;
@@ -22681,6 +22692,7 @@ mod tests {
         assert_eq!(returned_config.pool, worker_config.pool);
         assert_eq!(returned_config.heartbeat_seconds, Some(5));
         assert_eq!(returned_config.container, "");
+        assert_eq!(returned_config.namespaces, worker_config.namespaces);
 
         // The `container` payload (capability allowlist) round-trips, and
         // an update replaces it.
@@ -22726,12 +22738,14 @@ mod tests {
             max_allocations: None,
             artifacts: String::new(),
             heartbeat_seconds: None,
+            namespaces: vec![],
         };
 
         store.insert_worker_type(&worker_config)?;
 
         let returned_config = store.get_worker_type(worker_config.name.clone())?;
         assert!(returned_config.additional_node_checks.is_empty());
+        assert!(returned_config.namespaces.is_empty(), "every namespace");
         assert_eq!(returned_config.heartbeat_seconds, None);
 
         Ok(())

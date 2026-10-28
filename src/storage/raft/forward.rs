@@ -79,6 +79,13 @@ pub(crate) enum ForwardableLaneWrite {
         node_id: String,
         config_json: String,
     },
+    /// `Store::insert_join_token` — control lane. Only the join token a
+    /// manager mints for its own in-process (system) worker at startup is
+    /// forwarded, so a follower can start that worker; a client's
+    /// `CreateJoinToken` follows the leader hint instead.
+    InsertJoinToken {
+        record: crate::storage::acl_store::JoinTokenRecord,
+    },
     /// The decision half of `Store::gang_member_lost` — scheduler lane. A
     /// worker's failure report lost a gang member: the leader reads the
     /// gang's survivors from its own state (it is the decision, made where
@@ -207,7 +214,8 @@ impl ForwardableLaneWrite {
             | ForwardableLaneWrite::EmitEvent { .. } => Lane::Status,
             ForwardableLaneWrite::SyncNodeAvailability { .. }
             | ForwardableLaneWrite::MarkJobFailed { .. }
-            | ForwardableLaneWrite::UpsertManagerConfig { .. } => Lane::Control,
+            | ForwardableLaneWrite::UpsertManagerConfig { .. }
+            | ForwardableLaneWrite::InsertJoinToken { .. } => Lane::Control,
             ForwardableLaneWrite::RemoveAllocationById { .. }
             | ForwardableLaneWrite::GangMemberLost { .. }
             | ForwardableLaneWrite::RemoveFailedAllocation { .. }
@@ -236,6 +244,7 @@ impl ForwardableLaneWrite {
             ForwardableLaneWrite::SyncNodeAvailability { .. } => "sync_node_availability",
             ForwardableLaneWrite::MarkJobFailed { .. } => "mark_job_failed",
             ForwardableLaneWrite::UpsertManagerConfig { .. } => "upsert_manager_config",
+            ForwardableLaneWrite::InsertJoinToken { .. } => "insert_join_token",
             ForwardableLaneWrite::GangMemberLost { .. } => "gang_member_lost",
             ForwardableLaneWrite::RemoveAllocationById { .. } => "remove_allocation_by_id",
             ForwardableLaneWrite::RemoveFailedAllocation { .. } => "remove_failed_allocation",
@@ -315,6 +324,7 @@ pub(crate) fn execute(store: &Store, op: ForwardableLaneWrite) -> ForwardOutcome
             node_id,
             config_json,
         } => done(store.upsert_manager_config_local(&node_id, &config_json)),
+        ForwardableLaneWrite::InsertJoinToken { record } => done(store.insert_join_token(&record)),
         ForwardableLaneWrite::GangMemberLost {
             job_id,
             job_config_id,

@@ -640,6 +640,29 @@ mod tests {
         Ok(())
     }
 
+    /// A system worker offers its manager's lend, not the host: `capacity`
+    /// caps the fingerprint, including an unknown (infinite) CPU figure, and
+    /// leaves what it does not name alone.
+    #[test]
+    fn capacity_attr_caps_the_fingerprint() -> R<()> {
+        let mut node = node_with_fingerprint(json!({
+            "memory_total": "34359738368",
+            "cpus": { "cpu-1": { "frequency": "4" }, "cpu-2": { "frequency": "4" } },
+        }));
+        node.config_attrs = json!({ "capacity": { "cpu": 1000, "memory": 1024, "cores": 0 } });
+        let pool = ResourcePool::from_node(&node)?;
+        assert_eq!(pool.amount("cpu"), Some(1000.0));
+        assert_eq!(pool.amount("memory"), Some(1024.0));
+        assert_eq!(pool.amount("cores"), Some(0.0));
+
+        // A ceiling above the host changes nothing; an absent one, nothing.
+        node.config_attrs = json!({ "capacity": { "memory": 1048576 } });
+        let pool = ResourcePool::from_node(&node)?;
+        assert_eq!(pool.amount("memory"), Some(32.0 * 1024.0));
+        assert_eq!(pool.amount("cores"), Some(2.0));
+        Ok(())
+    }
+
     #[test]
     fn absent_cpu_fingerprint_is_unknown() -> R<()> {
         let cpu = fingerprint_cpu(&node_with_fingerprint(json!({ "cpus": {} })))?;
@@ -929,6 +952,24 @@ impl ResourcePool {
         // attribute map each time showed up in the 20k-node leader profile.
         let no_attrs = Map::new();
         let config_attrs = node.config_attrs.as_object().unwrap_or(&no_attrs);
+
+        // A node may offer the scheduler less than its fingerprint: a
+        // manager's system worker advertises only what the manager lends to
+        // Legion's own jobs (`systemWorker.resources`), whatever the host
+        // has. A ceiling, applied before `reservedResources` and
+        // oversubscription, so it caps the physical figure they start from.
+        if let Some(ceiling) =
+            config_value(config_attrs, &[CAPACITY_ATTR]).and_then(Value::as_object)
+        {
+            for name in ["memory", "cpu", "cores"] {
+                let limit = ceiling.get(name).and_then(Value::as_f64);
+                if let (Some(limit), Some(ResourceValue::Amount(have))) =
+                    (limit, values.get_mut(name))
+                {
+                    *have = have.min(limit.max(0.0));
+                }
+            }
+        }
 
         let max_allocations = config_value(config_attrs, &["maxAllocations", "max_allocations"])
             .and_then(|value| value.as_f64());
@@ -1530,6 +1571,13 @@ fn fingerprint_cpu(node: &Node) -> R<CpuFingerprint> {
 fn config_value<'a>(attrs: &'a Map<String, Value>, keys: &[&str]) -> Option<&'a Value> {
     keys.iter().find_map(|key| attrs.get(*key))
 }
+
+/// The node config attribute that caps the node's schedulable `memory`
+/// (MiB), `cpu` (MHz) and `cores` below its fingerprint:
+/// `{"cpu": 1000, "memory": 1024, "cores": 0}`. Set by a manager's system
+/// worker, whose capacity is the manager's lend (`systemWorker.resources`),
+/// not the host's. A dimension it leaves out is uncapped.
+pub const CAPACITY_ATTR: &str = "capacity";
 
 pub(crate) fn is_builtin_resource(name: &str) -> bool {
     matches!(name, "memory" | "cpu" | "cores" | "allocations")

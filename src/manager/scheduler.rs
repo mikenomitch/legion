@@ -886,10 +886,14 @@ impl PreemptionPass {
     /// not place should not have to discover from a troubleshooting guide
     /// that preemption was off, or that a floor held. The message names
     /// whichever of those actually happened.
-    fn no_placement_error(&self, task_config: &TaskConfig) -> String {
+    fn no_placement_error(&self, task_config: &TaskConfig, restricted: Option<&str>) -> String {
         let base = format!(
-            "Failed to place task {}: no available nodes matching constraints, permit, or resources",
-            task_config.name
+            "Failed to place task {}: no available nodes matching constraints, permit, or \
+             resources{}",
+            task_config.name,
+            restricted
+                .map(|restricted| format!("; {restricted}"))
+                .unwrap_or_default()
         );
         if !self.preemptor_band.can_preempt() {
             return format!(
@@ -2625,6 +2629,9 @@ impl<'a> Scheduler<'a> {
         let mut group_filters: HashMap<String, Vec<Arc<(ConstraintSet, PermitSet)>>> =
             HashMap::new();
         let mut parsed_filters: HashMap<i64, Arc<(ConstraintSet, PermitSet)>> = HashMap::new();
+        // Every task of the plan belongs to one job, so one namespace: the
+        // one node-side `namespaces` restrictions are checked against.
+        let namespace = crate::structs::namespace::job_namespace(preemptor.job);
         let mut task_group_map: HashMap<i64, (String, Option<String>)> = HashMap::new();
         let mut task_id_to_group: HashMap<i64, String> = HashMap::new();
         let task_name_to_id: HashMap<String, i64> = all_tasks
@@ -2658,7 +2665,7 @@ impl<'a> Scheduler<'a> {
                     format!("Failed to parse constraints for task {}", task_config.name)
                 })?;
             distinct_keys_by_task.insert(*task_id, constraint_set.distinct_keys());
-            let permit_set = PermitSet::new(&task_config.permit)
+            let permit_set = PermitSet::new(&task_config.permit, namespace)
                 .with_context(|| format!("Failed to parse permit for task {}", task_config.name))?;
             let filters = Arc::new((constraint_set, permit_set));
             group_filters
@@ -2772,6 +2779,7 @@ impl<'a> Scheduler<'a> {
                 index_armed,
                 in_multi_task_group,
                 &parsed_filters,
+                namespace,
                 positional_job_id,
             )?;
 
@@ -3444,6 +3452,7 @@ impl<'a> Scheduler<'a> {
         index_armed: bool,
         in_multi_task_group: bool,
         parsed_filters: &HashMap<i64, Arc<(ConstraintSet, PermitSet)>>,
+        namespace: &str,
         positional_job_id: Option<&str>,
     ) -> R<TaskPlan<'b>> {
         let task_resources =
@@ -3458,7 +3467,7 @@ impl<'a> Scheduler<'a> {
                 ConstraintSet::new(&task_config.constraints).with_context(|| {
                     format!("Failed to parse constraints for task {}", task_config.name)
                 })?,
-                PermitSet::new(&task_config.permit).with_context(|| {
+                PermitSet::new(&task_config.permit, namespace).with_context(|| {
                     format!("Failed to parse permit for task {}", task_config.name)
                 })?,
             )),
@@ -3918,7 +3927,16 @@ impl<'a> Scheduler<'a> {
                             )
                         )
                     }
-                    (None, _) => preemption.no_placement_error(task_config),
+                    (None, _) => preemption.no_placement_error(
+                        task_config,
+                        namespace_restriction_note(
+                            node_lookup.as_slice(),
+                            &plan.filters.0,
+                            &plan.filters.1,
+                            &task_config.required_volume_drivers(),
+                        )
+                        .as_deref(),
+                    ),
                 };
                 let pinned_node = next_pin.map(|(_, node_id)| node_id.as_str());
                 let blocked = crate::manager::blocked::PlacementBlocked::for_task(
@@ -5847,6 +5865,52 @@ impl<'a> Scheduler<'a> {
     }
 }
 
+/// When nodes the task could otherwise use turn away its job's namespace,
+/// say which, for the "could not place" message: `3 nodes accept only
+/// namespaces [legion-system]`, one clause per distinct list. `None` when no
+/// node was refused for its namespace alone. Only built on the failure path,
+/// so its O(nodes) walk never costs a plan that placed.
+fn namespace_restriction_note(
+    nodes: &[Arc<Node>],
+    constraint_set: &ConstraintSet,
+    permit_set: &PermitSet,
+    required_drivers: &std::collections::BTreeSet<String>,
+) -> Option<String> {
+    let mut refused: std::collections::BTreeMap<String, usize> = Default::default();
+    for node in nodes {
+        if crate::constraints::accepts_namespace(node, permit_set.namespace())
+            || !constraint_set.is_satisfied(node, None)
+            || !permit_set.permits_restrictions(node)
+            || !node_provides_volume_drivers(node, required_drivers)
+        {
+            continue;
+        }
+        let list = crate::constraints::node_namespaces(node)
+            .unwrap_or_default()
+            .join(", ");
+        *refused.entry(list).or_default() += 1;
+    }
+    if refused.is_empty() {
+        return None;
+    }
+    Some(
+        refused
+            .into_iter()
+            .map(|(list, count)| {
+                format!(
+                    "{count} {} only namespaces [{list}]",
+                    if count == 1 {
+                        "node accepts"
+                    } else {
+                        "nodes accept"
+                    }
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("; "),
+    )
+}
+
 /// Whether a node advertises every driver in `required`, and reports each as
 /// usable. An installed-but-unavailable driver (no `mount` binary, no declared
 /// host volumes) is treated as absent — it cannot serve a mount either way, and
@@ -6489,7 +6553,7 @@ mod tests {
             ]),
         ] {
             let constraint_set = ConstraintSet::new(&constraints)?;
-            let permit_set = PermitSet::new(&Value::Null)?;
+            let permit_set = PermitSet::new(&Value::Null, "default")?;
             let scan = Scheduler::scan_base_eligible(
                 node_refs(nodes),
                 &constraint_set,

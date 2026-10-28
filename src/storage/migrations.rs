@@ -2148,6 +2148,13 @@ fn migration_list() -> Vec<M<'static>> {
         INSERT OR IGNORE INTO net_plugin_meta (id, generation) VALUES (1, 0);",
         )
         .down("DROP TABLE IF EXISTS net_plugin; DROP TABLE IF EXISTS net_plugin_meta;"),
+        // Worker-type `namespaces` (docs/namespaces.md, "Nodes that accept
+        // only some namespaces"): the namespaces whose jobs the type's nodes
+        // accept, comma-joined like `additional_node_checks` (namespace
+        // names and globs never hold a comma). Empty on every existing row,
+        // which reads as "every namespace". Control lane, like the rest of
+        // `worker_type`.
+        M::up("ALTER TABLE worker_type ADD COLUMN namespaces TEXT NOT NULL DEFAULT '';").down(""),
     ]
 }
 

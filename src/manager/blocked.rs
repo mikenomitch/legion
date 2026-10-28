@@ -22,11 +22,13 @@
 //!   node at all). Any capacity anywhere wakes it.
 //!
 //! The wake match is exact rather than by key string: the pass re-runs the
-//! blocked task's own constraint and permit checks against the node whose
-//! capacity changed, so operators the key cannot spell (`>`, `matches`,
+//! blocked task's own constraint and permit checks, and the node's
+//! namespace restriction against the task's job, on the node whose capacity
+//! changed, so operators the key cannot spell (`>`, `matches`,
 //! `version_matches`, `contains`) still wake only on nodes that satisfy
-//! them. Capacity is not checked — the plan that runs next decides whether
-//! the room is enough.
+//! them, and a node that accepts only other namespaces wakes nothing.
+//! Capacity is not checked — the plan that runs next decides whether the
+//! room is enough.
 
 use crate::constraints::{ConstraintSet, PermitSet};
 use crate::prelude::*;
@@ -118,13 +120,10 @@ pub fn blocking_key(task: &TaskConfig, pinned_node: Option<&str>) -> String {
     }
     // The permit's `=` pool (the implicit `default` included); a pool rule
     // with another operator spells no single pool, and the key says so.
-    let pool = PermitSet::new(&task.permit)
-        .ok()
-        .and_then(|permit| {
-            permit.pool_binding().map(|value| match value {
-                Value::String(text) => text.clone(),
-                other => other.to_string(),
-            })
+    let pool = crate::constraints::permit_pool_binding(&task.permit)
+        .map(|value| match value {
+            Value::String(text) => text,
+            other => other.to_string(),
         })
         .unwrap_or_else(|| "*".to_string());
     let mut parts = vec![format!("pool={pool}")];
@@ -164,9 +163,12 @@ pub fn key_kind(key: &str) -> &'static str {
 
 /// Whether capacity appearing on `node` could help a blocked eval with this
 /// key and detail: the node is the pinned one, or the task's own constraints
-/// and permit accept it. `task` is `None` when the blocked task's config is
+/// and permit accept it and the node accepts the namespace of its job
+/// (`job_id`, canonical). A node restricted to other namespaces never wakes
+/// the eval, whatever its pool, because the plan that ran next could not
+/// place there either. `task` is `None` when the blocked task's config is
 /// gone, which matches anything (the plan that runs next will find out).
-pub fn node_could_help(key: &str, task: Option<&TaskConfig>, node: &Node) -> bool {
+pub fn node_could_help(key: &str, task: Option<&TaskConfig>, job_id: &str, node: &Node) -> bool {
     if key == ESCAPED_KEY {
         return true;
     }
@@ -176,7 +178,8 @@ pub fn node_could_help(key: &str, task: Option<&TaskConfig>, node: &Node) -> boo
     let Some(task) = task else {
         return true;
     };
-    let permitted = PermitSet::new(&task.permit)
+    let namespace = crate::structs::namespace::job_namespace(job_id);
+    let permitted = PermitSet::new(&task.permit, namespace)
         .map(|permit| permit.is_permitted(node))
         .unwrap_or(true);
     let constrained = ConstraintSet::new(&task.constraints)
@@ -235,32 +238,69 @@ mod blocked_test {
         assert!(node_could_help(
             &key,
             Some(&agents),
+            "agents",
             &node("a", "agents", "x86_64")
         ));
         assert!(!node_could_help(
             &key,
             Some(&agents),
+            "agents",
             &node("b", "default", "x86_64")
         ));
         assert!(!node_could_help(
             &key,
             Some(&agents),
+            "agents",
             &node("c", "agents", "aarch64")
         ));
         // Pinned resumes wait for their node only.
         assert!(node_could_help(
             "node:a",
             None,
+            "agents",
             &node("a", "default", "x86_64")
         ));
         assert!(!node_could_help(
             "node:a",
             None,
+            "agents",
             &node("b", "default", "x86_64")
         ));
         // Escaped wakes on anything, and so does a task whose config is gone.
-        assert!(node_could_help(ESCAPED_KEY, None, &node("z", "x", "y")));
-        assert!(node_could_help(&key, None, &node("z", "x", "y")));
+        assert!(node_could_help(
+            ESCAPED_KEY,
+            None,
+            "agents",
+            &node("z", "x", "y")
+        ));
+        assert!(node_could_help(&key, None, "agents", &node("z", "x", "y")));
+    }
+
+    /// A node restricted to other namespaces never wakes the eval, even in
+    /// the pool the task permits: the plan could not place there either.
+    #[test]
+    fn nodes_that_refuse_the_namespace_do_not_wake() {
+        let task = task(json!({ "pool": "legion-system" }), json!({}));
+        let key = blocking_key(&task, None);
+        let mut system = node("m1", "legion-system", "x86_64");
+        system.config_attrs = json!({ "namespaces": ["legion-system"] });
+        assert!(!node_could_help(&key, Some(&task), "web", &system));
+        assert!(!node_could_help(&key, Some(&task), "payments/web", &system));
+        assert!(node_could_help(
+            &key,
+            Some(&task),
+            "legion-system/agent",
+            &system
+        ));
+        // `["*"]` does not reach legion-system.
+        system.config_attrs = json!({ "namespaces": ["*"] });
+        assert!(!node_could_help(
+            &key,
+            Some(&task),
+            "legion-system/agent",
+            &system
+        ));
+        assert!(node_could_help(&key, Some(&task), "payments/web", &system));
     }
 
     #[test]

@@ -28,6 +28,26 @@
   # (docs/metrics.md). Enabled by default; binds server.port + 2 (4749 here)
   # unless `port` is set. Set `enabled = false` to turn the listener off.
   # telemetry = { enabled = true, port = 4749 },
+  # The system worker (docs/architecture-managers-workers.md, "The system
+  # worker"): every manager runs one in-process worker for Legion's own jobs,
+  # the ones in the reserved legion-system namespace. These are the defaults:
+  # write nothing to get them, or `enabled = false` to keep this manager free
+  # of allocations. `legion start manager --run-worker` runs a worker for
+  # every namespace instead, in the default pool, and ignores this block.
+  systemWorker = {
+    enabled = true,
+    # Namespaces it accepts. Globs skip reserved `legion-*` names, so
+    # "everything" is ["*", "legion-*"].
+    namespaces = ["legion-system"],
+    # What this manager lends its system worker, in MHz and MiB: the node's
+    # whole capacity as the scheduler sees it and, on Linux with cgroup v2,
+    # the cpu.max / memory.max of its `legion-system` cgroup parent.
+    resources = { cpu = 1000, memory = 1024 },
+    # The unprivileged user Legion's bundled apps run as.
+    appUser = "nobody",
+    # Its worker plane port. A standalone worker on this host keeps 4848.
+    port = 4849,
+  },
   # Edge boot (docs/edge-boot.md): boot tickets and edge-initiated starts.
   # OFF BY DEFAULT, and turning it on is an explicit security decision — it
   # grants nodes the ability to start work on a capability, growing a
