@@ -18,7 +18,14 @@ default) the manager registers one built-in worker type, `default`, in pool
 instead; a configured directory that does not exist stops the manager at
 startup with an error naming it. The repo's `configs/manager.ncl` sets
 `workerConfigPath = "./configs/workers/"`, so it is meant to be run from a
-checkout.
+checkout. Either way the manager also registers the built-in
+`legion-system` type its [system
+worker](architecture-managers-workers.md#the-system-worker) joins as (the
+manager config's `systemWorker` block configures that worker); a worker
+config may not declare a type of that name. A worker config's `namespaces`
+list reserves its nodes for some namespaces
+([`configs/workers/ci.ncl`](../configs/workers/ci.ncl),
+[namespaces.md](namespaces.md#nodes-that-accept-only-some-namespaces)).
 | ACL policies | `legion acl policy create -f` | see [Auth & ACLs](auth-and-acls.md) |
 | Job templates | `legion template create -f` | [`configs/templates/render.ncl`](../configs/templates/render.ncl) |
 

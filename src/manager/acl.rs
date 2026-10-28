@@ -846,19 +846,45 @@ pub fn enforce(
     if !reach.is_empty() {
         return Err(Status::permission_denied(format!(
             "permission denied: {}:{} requires a policy granting it in this namespace
-             Hint: this token can {} {} in {}",
+             Hint: this token can {} {} in {}{}",
             resource.as_str(),
             action.as_str(),
             action.as_str(),
             resource.as_str(),
             reach.join(", "),
+            reserved_hint(scope),
         )));
     }
     Err(Status::permission_denied(format!(
-        "permission denied: {}:{} requires a policy granting it",
+        "permission denied: {}:{} requires a policy granting it{}",
         resource.as_str(),
         action.as_str(),
+        reserved_hint(scope),
     )))
+}
+
+/// The extra hint for a denial inside a reserved name: a `legion-*`
+/// namespace or a key under `legion/`, which a token's `*` does not reach
+/// (docs/namespaces.md, "Reserved namespaces"). It names only the rule, not
+/// the target, which the caller already sent.
+fn reserved_hint(scope: &AclScope) -> &'static str {
+    if scope
+        .namespace
+        .as_deref()
+        .is_some_and(crate::structs::namespace::is_reserved_namespace)
+    {
+        "\nHint: `*` does not reach reserved `legion-*` namespaces; a rule must name them, \
+         as `namespaces = [\"legion-system\"]` or `[\"*\", \"legion-*\"]`"
+    } else if scope
+        .path
+        .as_deref()
+        .is_some_and(|path| path.starts_with(crate::structs::acl::RESERVED_KV_PREFIX))
+    {
+        "\nHint: `*` does not reach keys under the reserved `legion/` prefix; a rule must \
+         name it, as `paths = [\"legion/*\"]`"
+    } else {
+        ""
+    }
 }
 
 /// How long a presented credential has left, from its RFC 3339 expiry. A

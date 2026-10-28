@@ -11,6 +11,10 @@ A Legion cluster has one or more managers and one or more workers. By default it
   - Persists cluster state in local SQLite (`.legion/store.sqlite` by default, movable with `LEGION_DATA_DIR`. See [data-directory.md](data-directory.md)).
   - Exposes the main gRPC API on `:4747`. Join tokens are minted here through
     the authenticated `CreateJoinToken` RPC.
+  - Runs a [system worker](#the-system-worker) in its own process by
+    default: a small, capped worker that accepts only Legion's own jobs (the
+    `legion-system` namespace), so a cluster with no workers joined still has
+    somewhere to run them.
 - Worker:
   - Registers itself with the manager (with a join token when ACLs are
     enforced) and receives a per-node credential for subsequent calls.
@@ -27,12 +31,14 @@ A Legion cluster has one or more managers and one or more workers. By default it
 | `4747` (`server.port`) | each manager | workers, the CLI, the UI, other managers (raft) | gRPC; always TLS for workers, TLS for everyone with `server.tls` |
 | `4748`, `4749` | each manager | browsers (exec WebSocket), Prometheus (`/metrics`) | HTTP |
 | `4848` (`LEGION_WORKER_PORT`) | each worker | managers; edge routers (`StartClaim`) | gRPC over mutual TLS, always |
+| `4849` (`systemWorker.port`) | each manager's [system worker](#the-system-worker) | managers | gRPC over mutual TLS, always |
 | task ports | each worker | other nodes (service mesh, `connect` upstreams), clients | the task's own |
 
 Both directions must be open for a multi-host cluster: workers dial managers
 on 4747, and **managers dial workers on 4848**. Allow 4848 from every
 manager (and from edge routers if you use [edge boot](edge-boot.md)). Nothing
-else needs it.
+else needs it. With several managers, allow 4849 between managers too: each
+dials the others' system workers.
 
 The worker plane is reachable by default and safe to expose because it is
 mutual TLS with per-RPC caller classes: only a manager certificate can call
@@ -109,8 +115,10 @@ The manager's `persistence.type` decides how its state survives a manager failur
   `workloadIdentity.enabled`, and only on the primary manager in HA setups). See
   [docs/workload-identity.md](workload-identity.md).
 - With ACLs enabled: JWKS refresh and expired-credential pruning loops.
-- Optional in-process worker (`--run-worker`). When ACLs are enforced, the
-  manager issues its own join token for it.
+- The in-process worker: the [system worker](#the-system-worker) by default,
+  `--run-worker`'s worker instead when the flag is given, or none with
+  `systemWorker.enabled = false`. When ACLs are enforced, the manager issues
+  its own join token for it.
 - `--no-acl` turns ACLs off for that run, overriding `acl.enabled`. It is for
   throwaway local clusters only. See
   [docs/auth-and-acls.md](auth-and-acls.md#turning-acls-off).
@@ -297,7 +305,7 @@ systemd's `LoadCredential=join-token:/etc/legion/join-token` with
 `--token-file ${CREDENTIALS_DIRECTORY}/join-token` works too, and keeps the
 file out of the unit's own filesystem view.
 
-The in-process worker of `legion start manager --run-worker` shares the
+The in-process worker (the system worker, or `--run-worker`'s) shares the
 manager's process, so it stops when the manager does and the manager waits
 for it (session checkpoints first) before exiting. On Linux its tasks
 outlive it and the next start re-adopts them, the same as a standalone
@@ -359,6 +367,102 @@ Measured throughput per backend and fleet size lives in
 For sizing a control plane to a fleet (the `R x I` formula, the table, and
 how to measure), see
 [heartbeat-cadence-and-scale.md](heartbeat-cadence-and-scale.md).
+
+## The system worker
+
+Every manager runs one in-process worker for Legion's own operational jobs
+by default. A single manager with no workers joined can therefore run them,
+they keep running when every worker is full, and they are never on a node a
+cluster's own scale-in might drain. One per manager, so they fail over
+across managers.
+
+```nickel
+# configs/manager.ncl: these are the defaults; write nothing to get them
+systemWorker = {
+  enabled = true,
+  namespaces = ["legion-system"],
+  resources = { cpu = 1000, memory = 1024 },   # MHz and MiB the manager lends
+  appUser = "nobody",
+  port = 4849,
+},
+```
+
+| Field | Default | Meaning |
+| --- | --- | --- |
+| `enabled` | `true` | Run it. `false` keeps the manager free of allocations; jobs in `legion-system` then need a worker whose type accepts that namespace |
+| `namespaces` | `["legion-system"]` | The namespaces it accepts, as names or globs ([node restrictions](namespaces.md#nodes-that-accept-only-some-namespaces)). `*` skips reserved names, so "everything" is `["*", "legion-*"]` |
+| `resources` | `{ cpu = 1000, memory = 1024 }` | The lend, in MHz and MiB: the node's whole capacity as the scheduler sees it, and its kernel ceiling where the node can enforce one |
+| `appUser` | `"nobody"` | The unprivileged user Legion's bundled apps run as. Must not be root. Reserved for those apps: no shipped feature reads it yet |
+| `port` | `4849` | Its worker plane port |
+
+What the manager registers:
+
+- **Worker type and pool `legion-system`.** The type is built in: every
+  manager's store has it, whatever any one manager's config says, and a
+  worker config file may not declare a type of that name. Nodes get ids
+  like `legion-system-x8f2k1qz`.
+- **`namespaces = ["legion-system"]`** (the configured list), recorded on
+  the node, so no job from another namespace lands there whatever its
+  permit says. The pool keeps away every job that does not permit it, too.
+  A job in `legion-system` whose permit names no pool goes there through
+  the `legion-system` namespace policy (`pools.default = "legion-system"`,
+  [Reserved namespaces](namespaces.md#reserved-namespaces)).
+- **Attribute `legion.role = "manager"`**, so a job can be constrained to
+  managers' workers (`constraints = { "legion.role" = "manager" }`).
+- **Capacity: the lend, not the host.** The node's `capacity` attribute caps
+  its schedulable CPU and memory at `resources`, and offers no exclusive
+  `cores` (the lend is a share of the host's CPUs, not whole ones to pin).
+  `legion node usage` shows the lend as the node's capacity.
+- **A kernel ceiling, where the node can carry one.** On Linux with cgroup
+  v2 and resource enforcement, its allocations live under their own cgroup
+  parent, `legion-system/`, whose `cpu.max` and `memory.max` are the lend.
+  Each allocation's own `cpu.weight` lets it burst within the lend, never
+  past it, so raft and the manager keep the rest of the host. CPU MHz become
+  a quota over the host's clock (1000 MHz on a 2.5 GHz host is 40% of one
+  CPU); on a host that reports no plausible clock, 1000 MHz counts as one
+  CPU. The worker logs the ceiling it wrote:
+
+  ```text
+  INFO System worker capped at the manager's lend: its allocations together use
+  at most this much of the host cgroup_parent=legion-system cpu_max=40000 100000
+  memory_max=1073741824
+  ```
+
+  Where it cannot (macOS, no cgroup v2, enforcement off, or the kernel
+  refuses), the lend is advertised capacity only, and it says so:
+
+  ```text
+  WARN System worker's lend is advertised capacity only: the scheduler places no
+  more than it here, but nothing in the kernel caps what its allocations use
+  ```
+- **Its own port and state.** It listens on `systemWorker.port` (4849) and
+  keeps its state in `<data dir>/system-worker/`, apart from a standalone
+  worker's `<data dir>/workers/`, so `legion join` on a manager's own host
+  (a laptop, a small cluster) gets a node of its own instead of the system
+  worker's id.
+- **On every manager, leader or not.** A follower forwards the join token it
+  mints for its system worker to the control lane's leader; while the
+  cluster has no leader it retries, and the system worker starts once one is
+  elected.
+
+**`--run-worker` keeps its meaning**, "this manager also runs everything":
+its worker joins worker type and pool `default` with
+`namespaces = ["*", "legion-*"]` (every namespace, reserved ones included),
+no lend cap, `LEGION_WORKER_PORT` (4848), and `<data dir>/workers/`, as
+before. It still carries `legion.role = "manager"`. It replaces the system
+worker for that run, and runs even with `systemWorker.enabled = false`.
+
+Known limitations:
+
+- **One host guard table per host.** On Linux the kernel host guard is one
+  `nftables` table, and the eBPF classifier one pin directory, per host. A
+  manager's system worker and a standalone worker on the same Linux host
+  each rewrite them with their own allocations; run a standalone worker on
+  a manager's host only where that does not matter (a development box), or
+  turn the system worker off there.
+- **The lend is fixed**, not a share of the host.
+- **Bundled apps are not built yet.** The system worker runs whatever is
+  submitted to `legion-system`; nothing is submitted there automatically.
 
 ## Manager <-> Worker Communication
 

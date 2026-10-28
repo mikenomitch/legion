@@ -2954,6 +2954,10 @@ async fn star_policies_do_not_reach_legion_system_or_legion_kv_test() -> R<()> {
         .await
         .expect_err("`*` must not reach legion-system");
     assert_eq!(status.code(), Code::PermissionDenied, "{status:?}");
+    assert!(
+        status.message().contains("does not reach reserved `legion-*`"),
+        "the denial says why: {status:?}"
+    );
     run("legion-system", task.clone(), system.clone())
         .await
         .expect("a pattern starting legion- reaches it");
@@ -2992,6 +2996,10 @@ async fn star_policies_do_not_reach_legion_system_or_legion_kv_test() -> R<()> {
         .await
         .expect_err("`*` must not reach legion/");
     assert_eq!(status.code(), Code::PermissionDenied, "{status:?}");
+    assert!(
+        status.message().contains("reserved `legion/` prefix"),
+        "the denial says why: {status:?}"
+    );
     put("legion/apps/autoscaler/lease", &system)
         .await
         .expect("a pattern starting legion/ reaches it");

@@ -230,6 +230,13 @@ The cgroup path is predictable: `legion/share/legion-<alloc>` or
 `legion/reserve/legion-<alloc>`. You can find a task's cgroup by allocation ID
 and see the share/reserve split in the hierarchy.
 
+A manager's [system worker](architecture-managers-workers.md#the-system-worker)
+builds the same tree under its own parent, `legion-system/`, and writes the
+manager's lend (`systemWorker.resources`) on that parent as `cpu.max` and
+`memory.max`. Its allocations burst within the lend by `cpu.weight`, but
+never past it together, and a standalone worker on the same host keeps its
+own `legion/` tree. The system worker also offers no exclusive `cores`.
+
 ### Exclusivity scope
 
 The fence covers every runtime that opts in, which today means `container`,

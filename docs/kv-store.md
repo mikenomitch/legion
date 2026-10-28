@@ -20,6 +20,13 @@ Primary objects:
   - `key`, `lock_id`, optional owner
   - acquired/expiry timestamps
 
+**The `legion/` prefix is reserved** for Legion's own jobs (leases and
+state). An ACL `paths` glob reaches a key under it only when the pattern
+itself starts with `legion/`: `paths = ["*"]`, and a `kv` rule with no
+`paths`, stop short of it ([Auth & ACLs](auth-and-acls.md#policies)). Nothing
+stops a token that does hold `legion/*` from writing there, so keep tenant
+keys out of it.
+
 ## Encryption at rest
 
 The manager encrypts values before they reach the store. It uses AES-256-GCM

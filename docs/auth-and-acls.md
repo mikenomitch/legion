@@ -204,6 +204,18 @@ A policy is a named JSON array of rules:
   accepted with a warning. See [Namespaces, ACLs](namespaces.md#acls).
 - List endpoints filter to what the caller can read: a token scoped to
   `paths = ["team-a/*"]` sees only `team-a/` keys in `legion kv list`.
+- **Reserved names skip `*`.** In an allow rule, a `namespaces` glob reaches
+  a reserved `legion-*` namespace (Legion's own `legion-system`) only when
+  the pattern itself starts with `legion-`, and a `paths` glob reaches a key
+  under `legion/` only when it starts with `legion/`, the way a shell's `*`
+  skips dotfiles. A rule with no `paths`, and a `resources = ["*"]` rule with
+  no `namespaces`, reach what `*` reaches. So `namespaces = ["*"]` and
+  `paths = ["*"]` cover every tenant namespace and key but not what Legion
+  runs for itself; "everything" is `["*", "legion-*"]` and
+  `["*", "legion/*"]`. Deny rules keep plain globs (a deny on `*` still
+  denies inside `legion-system`), and management tokens bypass rules. A
+  denial inside a reserved name says so in its hint. See [Namespaces,
+  Reserved namespaces](namespaces.md#reserved-namespaces).
 
 **Restricting an account to specific job templates.** A rule with a selector
 never matches a request that lacks that attribute. So a `job` rule carrying
@@ -348,7 +360,11 @@ A team's whole policy is usually one glob:
 ]
 ```
 
-`names` then narrows by the job's bare name inside those namespaces.
+`names` then narrows by the job's bare name inside those namespaces. A
+tenant admin's `namespaces = ["*"]` does not reach `legion-system`: a token
+that could submit to or exec into Legion's own jobs could borrow the
+credentials they run with, so that reach is always written out
+(`["*", "legion-*"]`).
 `ListNamespaces` shows a namespace to anyone holding any allow there, and
 `WhoAmI` reports the set as `readable_namespaces`. A denial on a namespaced
 resource names where the token can act (`Hint: this token can write job in
