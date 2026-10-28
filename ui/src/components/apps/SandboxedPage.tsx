@@ -249,6 +249,7 @@ export function SandboxedPage(props: { app: string; page: string; onTitle?: (tit
     window.addEventListener('message', onMessage)
     // Tell the page when the SPA's theme changes.
     const observer = new MutationObserver(() => {
+      if (closed()) return
       frame?.contentWindow?.postMessage({ legion: BRIDGE_PROTOCOL, event: 'theme', theme: currentTheme() }, '*')
     })
     observer.observe(document.documentElement, { attributes: true, attributeFilter: ['class'] })

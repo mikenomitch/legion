@@ -23,10 +23,10 @@ use super::*;
 use crate::storage::app_store::AppUiAllocation;
 use crate::structs::app::AppRecord;
 use crate::structs::app_ui::{
-    inputs_digest, page_context, page_rpc_kind, resolve_inputs, validate_view,
-    validate_view_value, ActionDecl, AppView, AssertionKind, AssertionScope, PageRpcKind, Slot,
-    SlotEntry, UiPermission, UiSpec, ViewContext, ViewerAssertion, ACTION_PATH_PREFIX,
-    ASSERTION_CLAIM, ASSERTION_TTL_SECS, MAX_PAGE_BYTES, VIEWER_HEADER, VIEW_PATH_PREFIX,
+    inputs_digest, page_context, page_rpc_kind, resolve_inputs, validate_view, validate_view_value,
+    ActionDecl, AppView, AssertionKind, AssertionScope, PageRpcKind, Slot, SlotEntry, UiPermission,
+    UiSpec, ViewContext, ViewerAssertion, ACTION_PATH_PREFIX, ASSERTION_CLAIM, ASSERTION_TTL_SECS,
+    MAX_PAGE_BYTES, VIEWER_HEADER, VIEW_PATH_PREFIX,
 };
 use crate::structs::{
     AppActionInfo, AppHttpHeader, AppPageRpc, AppViewContext, ForwardAppRequestReply,
@@ -606,7 +606,15 @@ impl ManagerDaemonService {
         let token = self.sign_viewer_assertion(&identity, &assertion)?;
         let path = format!("{VIEW_PATH_PREFIX}{}?{}", resolved.view, context.to_query());
         let (reply, allocation) = self
-            .forward_to_app(&record, &ui, "GET", path, token, Vec::new(), "application/json")
+            .forward_to_app(
+                &record,
+                &ui,
+                "GET",
+                path,
+                token,
+                Vec::new(),
+                "application/json",
+            )
             .await?;
         let what = format!("view {:?}", resolved.view);
         if !(200..300).contains(&reply.status) {

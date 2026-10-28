@@ -236,7 +236,11 @@ impl Fixture {
         Ok(serde_json::from_str(&reply.view_json).expect("view json"))
     }
 
-    async fn act(&self, action: &str, inputs: Value) -> Result<InvokeAppActionReply, tonic::Status> {
+    async fn act(
+        &self,
+        action: &str,
+        inputs: Value,
+    ) -> Result<InvokeAppActionReply, tonic::Status> {
         self.svc
             .invoke_app_action(req(
                 InvokeAppActionRequest {
@@ -392,10 +396,15 @@ async fn fixture() -> R<Fixture> {
     );
     assert_eq!(reconciler.seed()?, vec![APP.to_string()]);
     let outcome = reconciler.reconcile_app(APP).await;
-    assert!(matches!(outcome, PassOutcome::Submitted { .. }), "{outcome:?}");
+    assert!(
+        matches!(outcome, PassOutcome::Submitted { .. }),
+        "{outcome:?}"
+    );
     fx.drain_evals()?;
     anyhow::ensure!(
-        !fx.store.app_ui_allocations("legion-system/autoscaler")?.is_empty(),
+        !fx.store
+            .app_ui_allocations("legion-system/autoscaler")?
+            .is_empty(),
         "the autoscaler's job should be placed"
     );
 
@@ -420,7 +429,10 @@ async fn fixture() -> R<Fixture> {
     // report is app-plane), and the views read with exactly the app's grant.
     let manifest = legion::apps::bundled_manifest(APP).context("bundled")?;
     let grant = fx
-        .token("autoscaler-grant", serde_json::to_value(&manifest.permissions)?)
+        .token(
+            "autoscaler-grant",
+            serde_json::to_value(&manifest.permissions)?,
+        )
         .await?;
     let views_client = connect_manager_client_with_token(&fx.addr, &grant, timeouts())?;
     let mut engine_client = connect_manager_client_with_token(&fx.addr, &fx.admin, timeouts())?;
@@ -470,7 +482,10 @@ async fn the_job_page_shows_the_autoscaling_panel_test() -> R<()> {
         .into_inner()
         .extensions;
     assert_eq!(listed.len(), 1, "{listed:?}");
-    assert_eq!((listed[0].app.as_str(), listed[0].title.as_str()), (APP, "Autoscaling"));
+    assert_eq!(
+        (listed[0].app.as_str(), listed[0].title.as_str()),
+        (APP, "Autoscaling")
+    );
     assert_eq!(listed[0].refresh_seconds, 10);
 
     let panel = fx.job_panel(&fx.admin, "web").await?;
@@ -586,7 +601,10 @@ async fn the_sidebar_page_and_the_node_group_panel_test() -> R<()> {
     let page = fx.view(&fx.admin, "policies", nav.clone()).await?;
     let page: Value = serde_json::from_str(&page.view_json)?;
     assert!(texts(&page).contains("/jobs/default/web"), "{page}");
-    assert!(!texts(&page).contains("db/db"), "db is not autoscaled: {page}");
+    assert!(
+        !texts(&page).contains("db/db"),
+        "db is not autoscaled: {page}"
+    );
 
     // A viewer with scale:read only in team-* namespaces sees the page, but
     // no row from `default`.
@@ -616,7 +634,12 @@ async fn the_sidebar_page_and_the_node_group_panel_test() -> R<()> {
     let panel = fx.view(&fx.admin, "node", node("n1")).await?;
     let panel: Value = serde_json::from_str(&panel.view_json)?;
     assert_eq!(panel["title"], "Node group general", "{panel}");
-    for needle in ["jt-general", "i-0abc", "/nodes/n1", "does not scale node groups"] {
+    for needle in [
+        "jt-general",
+        "i-0abc",
+        "/nodes/n1",
+        "does not scale node groups",
+    ] {
         assert!(texts(&panel).contains(needle), "{needle}: {panel}");
     }
     let none = fx.view(&fx.admin, "node", node("n0")).await?;
@@ -660,7 +683,10 @@ async fn pause_resume_and_release_act_on_the_panels_job_test() -> R<()> {
 
     let refused = fx.act("release", json!({})).await.unwrap_err();
     assert_eq!(refused.code(), Code::FailedPrecondition, "{refused}");
-    assert!(refused.message().contains("nothing to release"), "{refused}");
+    assert!(
+        refused.message().contains("nothing to release"),
+        "{refused}"
+    );
 
     fx.svc
         .scale_task(req(

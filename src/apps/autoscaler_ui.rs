@@ -45,8 +45,8 @@ use crate::structs::app_ui::{
 use crate::structs::{
     GetCapacityDemandRequest, GetNodeRequest, GetNodesRequest, GetScaleHistoryRequest,
     GetScalingStatusReply, GetScalingStatusRequest, NodeGroupTemplate, NodeMsg,
-    PauseScalingRequest, ScaleHistoryEntry, ScaleTaskRequest, ScalingTargetStatus,
-    JOIN_ATTR, NODEGROUP_ATTR, PROVIDER_ID_ATTR, SCALE_IN_ATTR,
+    PauseScalingRequest, ScaleHistoryEntry, ScaleTaskRequest, ScalingTargetStatus, JOIN_ATTR,
+    NODEGROUP_ATTR, PROVIDER_ID_ATTR, SCALE_IN_ATTR,
 };
 
 /// How much of its evaluations the app keeps per target.
@@ -630,7 +630,10 @@ fn render_job(
     }
     blocks.push(Block::Timeline(TimelineBlock {
         title: Some("Decisions".to_string()),
-        items: history.iter().map(|entry| history_item(entry, many)).collect(),
+        items: history
+            .iter()
+            .map(|entry| history_item(entry, many))
+            .collect(),
     }));
     let mut buttons = Vec::new();
     if !paused {
@@ -673,8 +676,7 @@ async fn task_badge(ui: &AutoscalerUi, context: &ViewContext) -> R<AppView> {
     };
     let target = status.targets.iter().find(|target| {
         (context.group.is_empty() || target.task_group == context.group)
-            && (target.task_name == context.task
-                || target.members.iter().any(|member| *member == context.task))
+            && (target.task_name == context.task || target.members.contains(&context.task))
     });
     Ok(match target {
         Some(target) => {
@@ -1087,13 +1089,7 @@ fn render_node(node: &NodeMsg, group: &str, members: &[NodeMsg], demand: R<Deman
             text: format!("{err:#}"),
         })),
     }
-    blocks.insert(
-        0,
-        Block::KeyValue(KeyValueBlock {
-            title: None,
-            items,
-        }),
-    );
+    blocks.insert(0, Block::KeyValue(KeyValueBlock { title: None, items }));
     blocks.insert(
         1,
         Block::Stats(StatsBlock {
@@ -1242,7 +1238,9 @@ async fn run_action(ui: &AutoscalerUi, request: ActionRequest) -> R<ActionOutcom
                 .filter(|target| target.pin.is_some())
                 .collect();
             if pinned.is_empty() {
-                return Err(Refused(format!("no task of {job} is pinned: nothing to release")).into());
+                return Err(
+                    Refused(format!("no task of {job} is pinned: nothing to release")).into(),
+                );
             }
             let mut said = Vec::new();
             for target in pinned {
@@ -1406,10 +1404,19 @@ mod tests {
             by: "bob".into(),
             reason: "launch".into(),
         });
-        let view = render_job("web", &status(vec![held]), &[], &EvaluationLog::default(), 0);
+        let view = render_job(
+            "web",
+            &status(vec![held]),
+            &[],
+            &EvaluationLog::default(),
+            0,
+        );
         valid(&view, Slot::Job);
         let text = serde_json::to_string(&view).unwrap();
-        assert!(text.contains("\"resume\"") && text.contains("\"release\""), "{text}");
+        assert!(
+            text.contains("\"resume\"") && text.contains("\"release\""),
+            "{text}"
+        );
         assert!(!text.contains("\"pause\""), "{text}");
         assert!(text.contains("at 5 by bob"), "{text}");
         assert!(text.contains("No evaluations of web yet"), "{text}");

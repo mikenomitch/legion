@@ -36,8 +36,8 @@ use legion::manager::workload_identity::WorkloadIdentityState;
 use legion::storage::store::Store;
 use legion::structs::app::BuildMarker;
 use legion::structs::app_ui::{
-    page_context, AssertionKind, AssertionScope, ViewerAssertion, APP_PAGE_HEADER,
-    ASSERTION_CLAIM, MAX_PAGE_BYTES,
+    page_context, AssertionKind, AssertionScope, ViewerAssertion, APP_PAGE_HEADER, ASSERTION_CLAIM,
+    MAX_PAGE_BYTES,
 };
 use legion::structs::manager_client::ManagerClient;
 use legion::structs::manager_server::{Manager, ManagerServer};
@@ -347,7 +347,9 @@ async fn fixture() -> R<Fixture> {
         )?;
     }
     assert!(
-        !fx.store.app_ui_allocations("legion-system/fake")?.is_empty(),
+        !fx.store
+            .app_ui_allocations("legion-system/fake")?
+            .is_empty(),
         "the fake app's job should be placed"
     );
     Ok(fx)
@@ -391,7 +393,9 @@ async fn a_page_is_listed_and_fetched_as_the_viewer_test() -> R<()> {
         .await?
         .into_inner();
     assert!(
-        reply.html.contains(&format!("<p id=who>{}</p>", who.principal)),
+        reply
+            .html
+            .contains(&format!("<p id=who>{}</p>", who.principal)),
         "the app saw the viewer: {}",
         reply.html
     );
@@ -453,7 +457,11 @@ async fn a_viewer_without_the_page_permission_gets_no_forward_test() -> R<()> {
 #[tokio::test(flavor = "multi_thread")]
 async fn the_manager_refuses_answers_that_are_not_pages_test() -> R<()> {
     let fx = fixture().await?;
-    fx.canned(200, "application/json", b"{\"view\":\"legion-view/1\"}".to_vec());
+    fx.canned(
+        200,
+        "application/json",
+        b"{\"view\":\"legion-view/1\"}".to_vec(),
+    );
     let err = fx.page(&fx.admin, "graph").await.unwrap_err();
     assert_eq!(err.code(), Code::FailedPrecondition, "{err}");
     assert!(err.message().contains("text/html"), "{err}");
@@ -463,7 +471,11 @@ async fn the_manager_refuses_answers_that_are_not_pages_test() -> R<()> {
     fx.canned(200, "text/html; charset=utf-8", vec![0xff, 0xfe, 0x00]);
     let err = fx.page(&fx.admin, "graph").await.unwrap_err();
     assert!(err.message().contains("UTF-8"), "{err}");
-    fx.canned(403, "application/json", b"{\"error\":\"bad assertion\"}".to_vec());
+    fx.canned(
+        403,
+        "application/json",
+        b"{\"error\":\"bad assertion\"}".to_vec(),
+    );
     let err = fx.page(&fx.admin, "graph").await.unwrap_err();
     assert_eq!(err.code(), Code::FailedPrecondition, "{err}");
     assert!(
@@ -598,7 +610,10 @@ async fn bridged_calls_are_held_to_the_page_allowlist_test() -> R<()> {
         let refused = client.list_jobs(list(Some(page))).await.unwrap_err();
         assert_eq!(refused.code(), Code::PermissionDenied, "{page}: {refused}");
     }
-    let refused = client.list_jobs(list(Some("fake/console"))).await.unwrap_err();
+    let refused = client
+        .list_jobs(list(Some("fake/console")))
+        .await
+        .unwrap_err();
     assert!(
         refused.message().contains("not in the page's `rpcs`"),
         "{refused}"
@@ -634,21 +649,19 @@ async fn bridged_calls_are_held_to_the_page_allowlist_test() -> R<()> {
         ))
         .await?;
     let refused = client
-        .stop_job(
-            {
-                let mut request = req(
-                    StopJobRequest {
-                        name: "web".into(),
-                        ..Default::default()
-                    },
-                    &fx.admin,
-                );
-                request
-                    .metadata_mut()
-                    .insert(APP_PAGE_HEADER, "fake/console".parse().expect("ascii"));
-                request
-            },
-        )
+        .stop_job({
+            let mut request = req(
+                StopJobRequest {
+                    name: "web".into(),
+                    ..Default::default()
+                },
+                &fx.admin,
+            );
+            request
+                .metadata_mut()
+                .insert(APP_PAGE_HEADER, "fake/console".parse().expect("ascii"));
+            request
+        })
         .await
         .unwrap_err();
     assert_eq!(refused.code(), Code::PermissionDenied, "{refused}");

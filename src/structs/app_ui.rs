@@ -563,10 +563,19 @@ pub fn page_rpc_refusal(method: &str) -> String {
             "is how the SPA draws apps; a page reaches its own app's views and actions with \
              legion.view and legion.action"
         }
-        "WorkerPreRegister" | "WorkerRegister" | "Heartbeat" | "HealthCheck"
-        | "FetchDatapathMaterial" | "IssueWorkloadIdentityToken" | "IssueNodeIdentityToken"
-        | "IssueNodeCertificate" | "GetArtifactCredential" | "RatifyClaim"
-        | "UpdateNodeDynamic" | "GetHeartbeatCadence" | "ReportScalingStatus"
+        "WorkerPreRegister"
+        | "WorkerRegister"
+        | "Heartbeat"
+        | "HealthCheck"
+        | "FetchDatapathMaterial"
+        | "IssueWorkloadIdentityToken"
+        | "IssueNodeIdentityToken"
+        | "IssueNodeCertificate"
+        | "GetArtifactCredential"
+        | "RatifyClaim"
+        | "UpdateNodeDynamic"
+        | "GetHeartbeatCadence"
+        | "ReportScalingStatus"
         | "RecordScalingAction" => "is called by workers and apps, not by people",
         _ => {
             "is not a Manager RPC a page may call (name one like `GetJobInfo`, as \
@@ -1320,10 +1329,9 @@ pub fn assertion_mismatch(
             Some("the assertion's inputs digest does not match the request's inputs".into())
         }
         (AssertionKind::View | AssertionKind::Page, _, None) => None,
-        (AssertionKind::View | AssertionKind::Page, _, Some(_)) => Some(format!(
-            "a {} assertion carries no inputs",
-            kind.as_str()
-        )),
+        (AssertionKind::View | AssertionKind::Page, _, Some(_)) => {
+            Some(format!("a {} assertion carries no inputs", kind.as_str()))
+        }
     }
 }
 
@@ -2282,7 +2290,10 @@ mod tests {
         assert_eq!(console.bundle_path(), "/legion/v1/pages/console");
         assert!(console.allows_rpc("GetJobInfo") && console.allows_rpc("StopJob"));
         assert!(!console.allows_rpc("DestroyJob"), "not listed");
-        assert_eq!(ui.page("graph").unwrap().bundle_path(), "/legion/v1/graph.html");
+        assert_eq!(
+            ui.page("graph").unwrap().bundle_path(),
+            "/legion/v1/graph.html"
+        );
         assert_eq!(page_rpc_kind("StopJob"), Some(PageRpcKind::Write));
         assert_eq!(page_rpc_kind("GetJobInfo"), Some(PageRpcKind::Read));
         // `RestoreInstance` needs only snapshot:read, but it creates an
@@ -2294,25 +2305,49 @@ mod tests {
                 .and_then(|ui| ui.validate(&ports))
                 .expect_err("invalid")
         };
-        assert!(bad(json!({ "name": "c", "title": "C", "rpcs": ["CreateAclToken"] }))
-            .contains("credential"));
-        assert!(bad(json!({ "name": "c", "title": "C", "rpcs": ["StreamEvents"] }))
-            .contains("unary"));
-        assert!(bad(json!({ "name": "c", "title": "C", "rpcs": ["GetAppView"] }))
-            .contains("legion.view"));
-        assert!(bad(json!({ "name": "c", "title": "C", "rpcs": ["Heartbeat"] }))
-            .contains("workers"));
-        assert!(bad(json!({ "name": "c", "title": "C", "rpcs": ["DropTables"] }))
-            .contains("not a Manager RPC"));
-        assert!(bad(json!({ "name": "c", "title": "C", "rpcs": ["GetJobInfo", "GetJobInfo"] }))
-            .contains("twice"));
+        assert!(
+            bad(json!({ "name": "c", "title": "C", "rpcs": ["CreateAclToken"] }))
+                .contains("credential")
+        );
+        assert!(
+            bad(json!({ "name": "c", "title": "C", "rpcs": ["StreamEvents"] })).contains("unary")
+        );
+        assert!(
+            bad(json!({ "name": "c", "title": "C", "rpcs": ["GetAppView"] }))
+                .contains("legion.view")
+        );
+        assert!(
+            bad(json!({ "name": "c", "title": "C", "rpcs": ["Heartbeat"] })).contains("workers")
+        );
+        assert!(
+            bad(json!({ "name": "c", "title": "C", "rpcs": ["DropTables"] }))
+                .contains("not a Manager RPC")
+        );
+        assert!(
+            bad(json!({ "name": "c", "title": "C", "rpcs": ["GetJobInfo", "GetJobInfo"] }))
+                .contains("twice")
+        );
         assert!(bad(json!({ "name": "Console", "title": "C" })).contains("page name"));
         assert!(bad(json!({ "name": "c", "title": " " })).contains("title"));
-        assert!(bad(json!({ "name": "c", "title": "C", "bundle": "/admin" })).contains("/legion/v1/"));
-        assert!(bad(json!({ "name": "c", "title": "C", "bundle": "/legion/v1/../x" })).contains("plain path"));
-        assert!(bad(json!({ "name": "c", "title": "C", "bundle": "/legion/v1/p?x=1" })).contains("plain path"));
-        assert!(bad(json!({ "name": "c", "title": "C", "bundle": "/legion/v1/views/x" })).contains("views"));
-        assert!(UiSpec::parse(&json!({ "pages": [{ "name": "c", "title": "C", "html": "<b>" }] })).is_err());
+        assert!(
+            bad(json!({ "name": "c", "title": "C", "bundle": "/admin" })).contains("/legion/v1/")
+        );
+        assert!(
+            bad(json!({ "name": "c", "title": "C", "bundle": "/legion/v1/../x" }))
+                .contains("plain path")
+        );
+        assert!(
+            bad(json!({ "name": "c", "title": "C", "bundle": "/legion/v1/p?x=1" }))
+                .contains("plain path")
+        );
+        assert!(
+            bad(json!({ "name": "c", "title": "C", "bundle": "/legion/v1/views/x" }))
+                .contains("views")
+        );
+        assert!(
+            UiSpec::parse(&json!({ "pages": [{ "name": "c", "title": "C", "html": "<b>" }] }))
+                .is_err()
+        );
         let twice = UiSpec::parse(&json!({ "pages": [
             { "name": "c", "title": "C" }, { "name": "c", "title": "D" } ] }))
         .unwrap()
@@ -2352,7 +2387,11 @@ mod tests {
                 }
             }
         }
-        assert!(declarations.len() > 100, "parsed {} RPCs", declarations.len());
+        assert!(
+            declarations.len() > 100,
+            "parsed {} RPCs",
+            declarations.len()
+        );
         for (method, _) in PAGE_RPCS {
             let declaration = declarations
                 .get(*method)
@@ -2366,7 +2405,13 @@ mod tests {
                 "{method} is both allowed and refused"
             );
         }
-        for refused in ["CreateAclToken", "StreamEvents", "GetAppView", "Heartbeat", "ResetKeyring"] {
+        for refused in [
+            "CreateAclToken",
+            "StreamEvents",
+            "GetAppView",
+            "Heartbeat",
+            "ResetKeyring",
+        ] {
             assert!(declarations.contains_key(refused), "{refused}");
             assert!(page_rpc_kind(refused).is_none(), "{refused}");
         }

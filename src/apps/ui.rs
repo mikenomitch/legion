@@ -1166,12 +1166,21 @@ mod tests {
     async fn pages_need_a_page_assertion() {
         let issuer = issuer();
         let server = server(&issuer);
-        server.registry.page("console", |request: PageRequest| async move {
-            Ok(format!("<p>hello {}</p>", request.viewer.principal))
-        });
+        server
+            .registry
+            .page("console", |request: PageRequest| async move {
+                Ok(format!("<p>hello {}</p>", request.viewer.principal))
+            });
         let mut claim = assertion(AssertionKind::Page, "console", None);
         claim.context = page_context();
-        let token = sign(&issuer, "app:fake", Some(&claim), "va_p", 1_000_090, 1_000_150);
+        let token = sign(
+            &issuer,
+            "app:fake",
+            Some(&claim),
+            "va_p",
+            1_000_090,
+            1_000_150,
+        );
         let page = server
             .handle_at("GET", "/legion/v1/pages/console", Some(&token), b"", NOW)
             .await;
@@ -1183,7 +1192,13 @@ mod tests {
             .await;
         assert_eq!(other.status, 403, "{:?}", other.body);
         let query = server
-            .handle_at("GET", "/legion/v1/pages/console?slot=job", Some(&token), b"", NOW)
+            .handle_at(
+                "GET",
+                "/legion/v1/pages/console?slot=job",
+                Some(&token),
+                b"",
+                NOW,
+            )
             .await;
         assert_eq!(query.status, 400, "{:?}", query.body);
         // A view assertion does not fetch a page.
