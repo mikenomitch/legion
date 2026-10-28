@@ -8,6 +8,7 @@
 #![allow(clippy::double_must_use)]
 
 pub mod artifacts;
+pub mod autoscaler;
 pub mod certs;
 pub mod checkpoint_chunks;
 pub mod checkpoint_seal;
