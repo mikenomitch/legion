@@ -706,6 +706,22 @@ export class WorkerRegisterRequest extends Message<WorkerRegisterRequest> {
    */
   capabilities: string[] = [];
 
+  /**
+   * A hash of the worker's own executable, computed once at startup (the
+   * first 16 bytes of its SHA-256, as hex). Recorded into the node's
+   * `dynamic_attrs` as `buildId`, next to `buildVersion`. `buildVersion` is
+   * the package version, which a rebuild without a version bump does not
+   * change; together they are the build the app reconciler rolls bundled
+   * apps on (docs/apps.md, "Upgrades"): an app's build marker moves only
+   * when every ready node its placement allows reports the same pair.
+   *
+   * Default: empty (a worker that predates it). Such a node is left out of
+   * every bundled app's build marker.
+   *
+   * @generated from field: string build_id = 10;
+   */
+  buildId = "";
+
   constructor(data?: PartialMessage<WorkerRegisterRequest>) {
     super();
     proto3.util.initPartial(data, this);
@@ -723,6 +739,7 @@ export class WorkerRegisterRequest extends Message<WorkerRegisterRequest> {
     { no: 7, name: "build_version", kind: "scalar", T: 9 /* ScalarType.STRING */ },
     { no: 8, name: "protocol_version", kind: "scalar", T: 13 /* ScalarType.UINT32 */ },
     { no: 9, name: "capabilities", kind: "scalar", T: 9 /* ScalarType.STRING */, repeated: true },
+    { no: 10, name: "build_id", kind: "scalar", T: 9 /* ScalarType.STRING */ },
   ]);
 
   static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): WorkerRegisterRequest {
@@ -2165,6 +2182,17 @@ export class GetJobInfoReply extends Message<GetJobInfoReply> {
    */
   template?: JobTemplateProvenance;
 
+  /**
+   * Set when the job's latest version was submitted by the app reconciler:
+   * the job belongs to an app (docs/apps.md), and the reconciler reverts
+   * any direct edit to it within seconds. Unset for every other job, and
+   * for an app's job whose latest version someone else submitted (the edit
+   * the reconciler is about to revert).
+   *
+   * @generated from field: optional legion.ManagedByInfo managed_by = 3;
+   */
+  managedBy?: ManagedByInfo;
+
   constructor(data?: PartialMessage<GetJobInfoReply>) {
     super();
     proto3.util.initPartial(data, this);
@@ -2175,6 +2203,7 @@ export class GetJobInfoReply extends Message<GetJobInfoReply> {
   static readonly fields: FieldList = proto3.util.newFieldList(() => [
     { no: 1, name: "job", kind: "message", T: Job },
     { no: 2, name: "template", kind: "message", T: JobTemplateProvenance, opt: true },
+    { no: 3, name: "managed_by", kind: "message", T: ManagedByInfo, opt: true },
   ]);
 
   static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): GetJobInfoReply {
@@ -2191,6 +2220,57 @@ export class GetJobInfoReply extends Message<GetJobInfoReply> {
 
   static equals(a: GetJobInfoReply | PlainMessage<GetJobInfoReply> | undefined, b: GetJobInfoReply | PlainMessage<GetJobInfoReply> | undefined): boolean {
     return proto3.util.equals(GetJobInfoReply, a, b);
+  }
+}
+
+/**
+ * The app that manages a job (GetJobInfoReply.managed_by).
+ *
+ * @generated from message legion.ManagedByInfo
+ */
+export class ManagedByInfo extends Message<ManagedByInfo> {
+  /**
+   * The app's name (`legion app status <app>`).
+   *
+   * @generated from field: string app = 1;
+   */
+  app = "";
+
+  /**
+   * The digest of the render the reconciler submitted. The reconciler
+   * compares it with the digest of a fresh render of the app record; a
+   * difference resubmits the job.
+   *
+   * @generated from field: string digest = 2;
+   */
+  digest = "";
+
+  constructor(data?: PartialMessage<ManagedByInfo>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.ManagedByInfo";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "app", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 2, name: "digest", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): ManagedByInfo {
+    return new ManagedByInfo().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): ManagedByInfo {
+    return new ManagedByInfo().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): ManagedByInfo {
+    return new ManagedByInfo().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: ManagedByInfo | PlainMessage<ManagedByInfo> | undefined, b: ManagedByInfo | PlainMessage<ManagedByInfo> | undefined): boolean {
+    return proto3.util.equals(ManagedByInfo, a, b);
   }
 }
 
@@ -29573,6 +29653,1457 @@ export class RevokeGrantReply extends Message<RevokeGrantReply> {
 
   static equals(a: RevokeGrantReply | PlainMessage<RevokeGrantReply> | undefined, b: RevokeGrantReply | PlainMessage<RevokeGrantReply> | undefined): boolean {
     return proto3.util.equals(RevokeGrantReply, a, b);
+  }
+}
+
+/**
+ * Request payload for ListApps.
+ *
+ * @generated from message legion.ListAppsRequest
+ */
+export class ListAppsRequest extends Message<ListAppsRequest> {
+  constructor(data?: PartialMessage<ListAppsRequest>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.ListAppsRequest";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): ListAppsRequest {
+    return new ListAppsRequest().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): ListAppsRequest {
+    return new ListAppsRequest().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): ListAppsRequest {
+    return new ListAppsRequest().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: ListAppsRequest | PlainMessage<ListAppsRequest> | undefined, b: ListAppsRequest | PlainMessage<ListAppsRequest> | undefined): boolean {
+    return proto3.util.equals(ListAppsRequest, a, b);
+  }
+}
+
+/**
+ * Reply payload for ListApps.
+ *
+ * @generated from message legion.ListAppsReply
+ */
+export class ListAppsReply extends Message<ListAppsReply> {
+  /**
+   * Installed apps the caller may read, by name.
+   *
+   * @generated from field: repeated legion.App apps = 1;
+   */
+  apps: App[] = [];
+
+  constructor(data?: PartialMessage<ListAppsReply>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.ListAppsReply";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "apps", kind: "message", T: App, repeated: true },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): ListAppsReply {
+    return new ListAppsReply().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): ListAppsReply {
+    return new ListAppsReply().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): ListAppsReply {
+    return new ListAppsReply().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: ListAppsReply | PlainMessage<ListAppsReply> | undefined, b: ListAppsReply | PlainMessage<ListAppsReply> | undefined): boolean {
+    return proto3.util.equals(ListAppsReply, a, b);
+  }
+}
+
+/**
+ * An app's settings (`legion app set`).
+ *
+ * @generated from message legion.AppSettingsInfo
+ */
+export class AppSettingsInfo extends Message<AppSettingsInfo> {
+  /**
+   * Copies of each task. 1-32.
+   *
+   * @generated from field: uint32 replicas = 1;
+   */
+  replicas = 0;
+
+  /**
+   * `managers`, `workers`, or `any` (docs/apps.md, "Placement").
+   *
+   * @generated from field: string placement = 2;
+   */
+  placement = "";
+
+  /**
+   * CPU (MHz) for each task, overriding the manifest. Unset keeps the
+   * manifest's.
+   *
+   * @generated from field: optional uint64 cpu = 3;
+   */
+  cpu?: bigint;
+
+  /**
+   * Memory (MiB) for each task, overriding the manifest.
+   *
+   * @generated from field: optional uint64 memory = 4;
+   */
+  memory?: bigint;
+
+  /**
+   * The worker pool for `workers` and `any` placement. Unset is `default`.
+   *
+   * @generated from field: optional string pool = 5;
+   */
+  pool?: string;
+
+  constructor(data?: PartialMessage<AppSettingsInfo>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.AppSettingsInfo";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "replicas", kind: "scalar", T: 13 /* ScalarType.UINT32 */ },
+    { no: 2, name: "placement", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 3, name: "cpu", kind: "scalar", T: 4 /* ScalarType.UINT64 */, opt: true },
+    { no: 4, name: "memory", kind: "scalar", T: 4 /* ScalarType.UINT64 */, opt: true },
+    { no: 5, name: "pool", kind: "scalar", T: 9 /* ScalarType.STRING */, opt: true },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): AppSettingsInfo {
+    return new AppSettingsInfo().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): AppSettingsInfo {
+    return new AppSettingsInfo().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): AppSettingsInfo {
+    return new AppSettingsInfo().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: AppSettingsInfo | PlainMessage<AppSettingsInfo> | undefined, b: AppSettingsInfo | PlainMessage<AppSettingsInfo> | undefined): boolean {
+    return proto3.util.equals(AppSettingsInfo, a, b);
+  }
+}
+
+/**
+ * What an app's `legion` identity was granted.
+ *
+ * @generated from message legion.AppGrantInfo
+ */
+export class AppGrantInfo extends Message<AppGrantInfo> {
+  /**
+   * The granted rules, as a JSON array in the shape `legion acl policy
+   * apply` takes.
+   *
+   * @generated from field: string rules_json = 1;
+   */
+  rulesJson = "";
+
+  /**
+   * Who approved them: the installer (`userpass:alice`), or
+   * `legion:bootstrap` for a bundled app's seed.
+   *
+   * @generated from field: string granted_by = 2;
+   */
+  grantedBy = "";
+
+  /**
+   * When (RFC3339).
+   *
+   * @generated from field: string granted_at = 3;
+   */
+  grantedAt = "";
+
+  constructor(data?: PartialMessage<AppGrantInfo>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.AppGrantInfo";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "rules_json", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 2, name: "granted_by", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 3, name: "granted_at", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): AppGrantInfo {
+    return new AppGrantInfo().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): AppGrantInfo {
+    return new AppGrantInfo().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): AppGrantInfo {
+    return new AppGrantInfo().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: AppGrantInfo | PlainMessage<AppGrantInfo> | undefined, b: AppGrantInfo | PlainMessage<AppGrantInfo> | undefined): boolean {
+    return proto3.util.equals(AppGrantInfo, a, b);
+  }
+}
+
+/**
+ * The app reconciler's view of an app.
+ *
+ * @generated from message legion.AppReconcileInfo
+ */
+export class AppReconcileInfo extends Message<AppReconcileInfo> {
+  /**
+   * The digest of the last render the reconciler submitted or found.
+   *
+   * @generated from field: string last_digest = 1;
+   */
+  lastDigest = "";
+
+  /**
+   * What its last pass did: `created the job`, `reverted a direct edit by
+   * userpass:alice`, `stopped (app disabled)`.
+   *
+   * @generated from field: string last_action = 2;
+   */
+  lastAction = "";
+
+  /**
+   * Its last error, empty after a success.
+   *
+   * @generated from field: string last_error = 3;
+   */
+  lastError = "";
+
+  /**
+   * When the last action or error was recorded (RFC3339).
+   *
+   * @generated from field: string last_at = 4;
+   */
+  lastAt = "";
+
+  /**
+   * The build marker a bundled app's job is rendered for
+   * (`<buildVersion>+<buildId>`), empty for installed apps and before any
+   * eligible node reported its build.
+   *
+   * @generated from field: string build_marker = 5;
+   */
+  buildMarker = "";
+
+  /**
+   * What the app waits for, when anything: `upgrade waiting: 2 of 3
+   * eligible nodes on 0.15.0 (waiting for mgr-3)`.
+   *
+   * @generated from field: string marker_reason = 6;
+   */
+  markerReason = "";
+
+  /**
+   * The digest stamped on the job's latest version (`managedBy`). Empty
+   * when the latest version was submitted by someone else.
+   *
+   * @generated from field: string job_digest = 7;
+   */
+  jobDigest = "";
+
+  constructor(data?: PartialMessage<AppReconcileInfo>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.AppReconcileInfo";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "last_digest", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 2, name: "last_action", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 3, name: "last_error", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 4, name: "last_at", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 5, name: "build_marker", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 6, name: "marker_reason", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 7, name: "job_digest", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): AppReconcileInfo {
+    return new AppReconcileInfo().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): AppReconcileInfo {
+    return new AppReconcileInfo().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): AppReconcileInfo {
+    return new AppReconcileInfo().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: AppReconcileInfo | PlainMessage<AppReconcileInfo> | undefined, b: AppReconcileInfo | PlainMessage<AppReconcileInfo> | undefined): boolean {
+    return proto3.util.equals(AppReconcileInfo, a, b);
+  }
+}
+
+/**
+ * An installed app.
+ *
+ * @generated from message legion.App
+ */
+export class App extends Message<App> {
+  /**
+   * The app's name; its job is `legion-system/<name>`.
+   *
+   * @generated from field: string name = 1;
+   */
+  name = "";
+
+  /**
+   * The manifest's description.
+   *
+   * @generated from field: string description = 2;
+   */
+  description = "";
+
+  /**
+   * The manifest's version, or a bundled app's build marker version.
+   *
+   * @generated from field: string version = 3;
+   */
+  version = "";
+
+  /**
+   * `bundled`, `file`, or `url`.
+   *
+   * @generated from field: string source = 4;
+   */
+  source = "";
+
+  /**
+   * The file or URL the manifest was installed from; empty for bundled
+   * apps.
+   *
+   * @generated from field: string source_ref = 5;
+   */
+  sourceRef = "";
+
+  /**
+   * Whether the app should run.
+   *
+   * @generated from field: bool enabled = 6;
+   */
+  enabled = false;
+
+  /**
+   * @generated from field: legion.AppSettingsInfo settings = 7;
+   */
+  settings?: AppSettingsInfo;
+
+  /**
+   * `running`, `degraded`, `pending`, or `stopped`.
+   *
+   * @generated from field: string status = 8;
+   */
+  status = "";
+
+  /**
+   * Why, when the status needs one: `2/3 running`, `reconcile failing:
+   * ...`, `waiting for an eligible node to report its build`.
+   *
+   * @generated from field: string status_detail = 9;
+   */
+  statusDetail = "";
+
+  /**
+   * The app's job (`legion-system/<name>`).
+   *
+   * @generated from field: string job_id = 10;
+   */
+  jobId = "";
+
+  /**
+   * Allocations running.
+   *
+   * @generated from field: uint32 running = 11;
+   */
+  running = 0;
+
+  /**
+   * Allocations the app should run: replicas times tasks, 0 when disabled.
+   *
+   * @generated from field: uint32 desired = 12;
+   */
+  desired = 0;
+
+  /**
+   * The digest of the stored manifest.
+   *
+   * @generated from field: string manifest_digest = 13;
+   */
+  manifestDigest = "";
+
+  /**
+   * The stored manifest, as JSON.
+   *
+   * @generated from field: string manifest_json = 14;
+   */
+  manifestJson = "";
+
+  /**
+   * The app's config, as JSON.
+   *
+   * @generated from field: string config_json = 15;
+   */
+  configJson = "";
+
+  /**
+   * @generated from field: legion.AppGrantInfo grant = 16;
+   */
+  grant?: AppGrantInfo;
+
+  /**
+   * Who installed it.
+   *
+   * @generated from field: string installed_by = 17;
+   */
+  installedBy = "";
+
+  /**
+   * When it was installed, and last changed (RFC3339).
+   *
+   * @generated from field: string installed_at = 18;
+   */
+  installedAt = "";
+
+  /**
+   * @generated from field: string updated_at = 19;
+   */
+  updatedAt = "";
+
+  /**
+   * @generated from field: legion.AppReconcileInfo reconcile = 20;
+   */
+  reconcile?: AppReconcileInfo;
+
+  /**
+   * The UI slots the manifest registers (`nav`, `job`, ...).
+   *
+   * @generated from field: repeated string ui_slots = 21;
+   */
+  uiSlots: string[] = [];
+
+  /**
+   * Things an operator should know: no system worker on its managers,
+   * workload identity off (the app has no Legion credentials).
+   *
+   * @generated from field: repeated string notes = 22;
+   */
+  notes: string[] = [];
+
+  /**
+   * The nodes running it.
+   *
+   * @generated from field: repeated string running_on = 23;
+   */
+  runningOn: string[] = [];
+
+  constructor(data?: PartialMessage<App>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.App";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "name", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 2, name: "description", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 3, name: "version", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 4, name: "source", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 5, name: "source_ref", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 6, name: "enabled", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
+    { no: 7, name: "settings", kind: "message", T: AppSettingsInfo },
+    { no: 8, name: "status", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 9, name: "status_detail", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 10, name: "job_id", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 11, name: "running", kind: "scalar", T: 13 /* ScalarType.UINT32 */ },
+    { no: 12, name: "desired", kind: "scalar", T: 13 /* ScalarType.UINT32 */ },
+    { no: 13, name: "manifest_digest", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 14, name: "manifest_json", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 15, name: "config_json", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 16, name: "grant", kind: "message", T: AppGrantInfo },
+    { no: 17, name: "installed_by", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 18, name: "installed_at", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 19, name: "updated_at", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 20, name: "reconcile", kind: "message", T: AppReconcileInfo },
+    { no: 21, name: "ui_slots", kind: "scalar", T: 9 /* ScalarType.STRING */, repeated: true },
+    { no: 22, name: "notes", kind: "scalar", T: 9 /* ScalarType.STRING */, repeated: true },
+    { no: 23, name: "running_on", kind: "scalar", T: 9 /* ScalarType.STRING */, repeated: true },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): App {
+    return new App().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): App {
+    return new App().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): App {
+    return new App().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: App | PlainMessage<App> | undefined, b: App | PlainMessage<App> | undefined): boolean {
+    return proto3.util.equals(App, a, b);
+  }
+}
+
+/**
+ * Request payload for GetApp.
+ *
+ * @generated from message legion.GetAppRequest
+ */
+export class GetAppRequest extends Message<GetAppRequest> {
+  /**
+   * The app's name.
+   *
+   * @generated from field: string name = 1;
+   */
+  name = "";
+
+  constructor(data?: PartialMessage<GetAppRequest>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.GetAppRequest";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "name", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): GetAppRequest {
+    return new GetAppRequest().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): GetAppRequest {
+    return new GetAppRequest().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): GetAppRequest {
+    return new GetAppRequest().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: GetAppRequest | PlainMessage<GetAppRequest> | undefined, b: GetAppRequest | PlainMessage<GetAppRequest> | undefined): boolean {
+    return proto3.util.equals(GetAppRequest, a, b);
+  }
+}
+
+/**
+ * Reply payload for GetApp.
+ *
+ * @generated from message legion.GetAppReply
+ */
+export class GetAppReply extends Message<GetAppReply> {
+  /**
+   * @generated from field: legion.App app = 1;
+   */
+  app?: App;
+
+  constructor(data?: PartialMessage<GetAppReply>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.GetAppReply";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "app", kind: "message", T: App },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): GetAppReply {
+    return new GetAppReply().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): GetAppReply {
+    return new GetAppReply().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): GetAppReply {
+    return new GetAppReply().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: GetAppReply | PlainMessage<GetAppReply> | undefined, b: GetAppReply | PlainMessage<GetAppReply> | undefined): boolean {
+    return proto3.util.equals(GetAppReply, a, b);
+  }
+}
+
+/**
+ * Request payload for InstallApp.
+ *
+ * @generated from message legion.InstallAppRequest
+ */
+export class InstallAppRequest extends Message<InstallAppRequest> {
+  /**
+   * The manifest, as JSON (the CLI evaluates a Nickel manifest first).
+   *
+   * @generated from field: string manifest_json = 1;
+   */
+  manifestJson = "";
+
+  /**
+   * `file` or `url`: where the manifest came from.
+   *
+   * @generated from field: string source = 2;
+   */
+  source = "";
+
+  /**
+   * The path or URL, recorded for `legion app status`.
+   *
+   * @generated from field: string source_ref = 3;
+   */
+  sourceRef = "";
+
+  /**
+   * Validate and check the grant, and return the prompt, without
+   * installing.
+   *
+   * @generated from field: bool dry_run = 4;
+   */
+  dryRun = false;
+
+  /**
+   * The initial config, as JSON. Unset installs the manifest's default.
+   *
+   * @generated from field: optional string config_json = 5;
+   */
+  configJson?: string;
+
+  /**
+   * Optional key to dedupe retries; a repeat returns the first reply with
+   * `deduplicated = true`.
+   *
+   * @generated from field: optional string idempotency_key = 6;
+   */
+  idempotencyKey?: string;
+
+  constructor(data?: PartialMessage<InstallAppRequest>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.InstallAppRequest";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "manifest_json", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 2, name: "source", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 3, name: "source_ref", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 4, name: "dry_run", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
+    { no: 5, name: "config_json", kind: "scalar", T: 9 /* ScalarType.STRING */, opt: true },
+    { no: 6, name: "idempotency_key", kind: "scalar", T: 9 /* ScalarType.STRING */, opt: true },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): InstallAppRequest {
+    return new InstallAppRequest().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): InstallAppRequest {
+    return new InstallAppRequest().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): InstallAppRequest {
+    return new InstallAppRequest().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: InstallAppRequest | PlainMessage<InstallAppRequest> | undefined, b: InstallAppRequest | PlainMessage<InstallAppRequest> | undefined): boolean {
+    return proto3.util.equals(InstallAppRequest, a, b);
+  }
+}
+
+/**
+ * Reply payload for InstallApp.
+ *
+ * @generated from message legion.InstallAppReply
+ */
+export class InstallAppReply extends Message<InstallAppReply> {
+  /**
+   * The installed app (on a dry run, the record it would be).
+   *
+   * @generated from field: legion.App app = 1;
+   */
+  app?: App;
+
+  /**
+   * Human-readable status message.
+   *
+   * @generated from field: string message = 2;
+   */
+  message = "";
+
+  /**
+   * True when `idempotency_key` matched an earlier call.
+   *
+   * @generated from field: bool deduplicated = 3;
+   */
+  deduplicated = false;
+
+  /**
+   * The install prompt: what the app runs, where, as whom, what it asks
+   * for, and its UI, one line each.
+   *
+   * @generated from field: repeated string prompt = 4;
+   */
+  prompt: string[] = [];
+
+  /**
+   * On a dry run, the first permission the caller does not hold, worded as
+   * the refusal would be; empty when the caller holds them all.
+   *
+   * @generated from field: string uncovered = 5;
+   */
+  uncovered = "";
+
+  constructor(data?: PartialMessage<InstallAppReply>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.InstallAppReply";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "app", kind: "message", T: App },
+    { no: 2, name: "message", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 3, name: "deduplicated", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
+    { no: 4, name: "prompt", kind: "scalar", T: 9 /* ScalarType.STRING */, repeated: true },
+    { no: 5, name: "uncovered", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): InstallAppReply {
+    return new InstallAppReply().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): InstallAppReply {
+    return new InstallAppReply().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): InstallAppReply {
+    return new InstallAppReply().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: InstallAppReply | PlainMessage<InstallAppReply> | undefined, b: InstallAppReply | PlainMessage<InstallAppReply> | undefined): boolean {
+    return proto3.util.equals(InstallAppReply, a, b);
+  }
+}
+
+/**
+ * Request payload for UpgradeApp.
+ *
+ * @generated from message legion.UpgradeAppRequest
+ */
+export class UpgradeAppRequest extends Message<UpgradeAppRequest> {
+  /**
+   * The app to upgrade.
+   *
+   * @generated from field: string name = 1;
+   */
+  name = "";
+
+  /**
+   * The new manifest, as JSON. Its `name` must be the app's.
+   *
+   * @generated from field: string manifest_json = 2;
+   */
+  manifestJson = "";
+
+  /**
+   * The path or URL it came from.
+   *
+   * @generated from field: string source_ref = 3;
+   */
+  sourceRef = "";
+
+  /**
+   * Approve permissions the new manifest adds. Without it, an upgrade that
+   * adds any changes nothing and returns the diff.
+   *
+   * @generated from field: bool approve = 4;
+   */
+  approve = false;
+
+  /**
+   * Show the diff and the prompt without upgrading.
+   *
+   * @generated from field: bool dry_run = 5;
+   */
+  dryRun = false;
+
+  /**
+   * Optional key to dedupe retries.
+   *
+   * @generated from field: optional string idempotency_key = 6;
+   */
+  idempotencyKey?: string;
+
+  /**
+   * The config to run the new manifest with, as JSON. Unset keeps the
+   * stored config, which must then match the new manifest's schema.
+   *
+   * @generated from field: optional string config_json = 7;
+   */
+  configJson?: string;
+
+  constructor(data?: PartialMessage<UpgradeAppRequest>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.UpgradeAppRequest";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "name", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 2, name: "manifest_json", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 3, name: "source_ref", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 4, name: "approve", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
+    { no: 5, name: "dry_run", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
+    { no: 6, name: "idempotency_key", kind: "scalar", T: 9 /* ScalarType.STRING */, opt: true },
+    { no: 7, name: "config_json", kind: "scalar", T: 9 /* ScalarType.STRING */, opt: true },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): UpgradeAppRequest {
+    return new UpgradeAppRequest().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): UpgradeAppRequest {
+    return new UpgradeAppRequest().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): UpgradeAppRequest {
+    return new UpgradeAppRequest().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: UpgradeAppRequest | PlainMessage<UpgradeAppRequest> | undefined, b: UpgradeAppRequest | PlainMessage<UpgradeAppRequest> | undefined): boolean {
+    return proto3.util.equals(UpgradeAppRequest, a, b);
+  }
+}
+
+/**
+ * How an upgrade changes an app's grant.
+ *
+ * @generated from message legion.PermissionDiff
+ */
+export class PermissionDiff extends Message<PermissionDiff> {
+  /**
+   * Rules the new manifest adds, as a JSON array.
+   *
+   * @generated from field: string added_json = 1;
+   */
+  addedJson = "";
+
+  /**
+   * Rules it drops.
+   *
+   * @generated from field: string removed_json = 2;
+   */
+  removedJson = "";
+
+  /**
+   * Rules both have.
+   *
+   * @generated from field: string unchanged_json = 3;
+   */
+  unchangedJson = "";
+
+  constructor(data?: PartialMessage<PermissionDiff>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.PermissionDiff";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "added_json", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 2, name: "removed_json", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 3, name: "unchanged_json", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): PermissionDiff {
+    return new PermissionDiff().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): PermissionDiff {
+    return new PermissionDiff().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): PermissionDiff {
+    return new PermissionDiff().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: PermissionDiff | PlainMessage<PermissionDiff> | undefined, b: PermissionDiff | PlainMessage<PermissionDiff> | undefined): boolean {
+    return proto3.util.equals(PermissionDiff, a, b);
+  }
+}
+
+/**
+ * Reply payload for UpgradeApp.
+ *
+ * @generated from message legion.UpgradeAppReply
+ */
+export class UpgradeAppReply extends Message<UpgradeAppReply> {
+  /**
+   * The app after the call (unchanged when `upgraded` is false).
+   *
+   * @generated from field: legion.App app = 1;
+   */
+  app?: App;
+
+  /**
+   * @generated from field: legion.PermissionDiff diff = 2;
+   */
+  diff?: PermissionDiff;
+
+  /**
+   * Whether the manifest was replaced.
+   *
+   * @generated from field: bool upgraded = 3;
+   */
+  upgraded = false;
+
+  /**
+   * Human-readable status message; says why when `upgraded` is false.
+   *
+   * @generated from field: string message = 4;
+   */
+  message = "";
+
+  /**
+   * True when `idempotency_key` matched an earlier call.
+   *
+   * @generated from field: bool deduplicated = 5;
+   */
+  deduplicated = false;
+
+  /**
+   * The new manifest's install prompt.
+   *
+   * @generated from field: repeated string prompt = 6;
+   */
+  prompt: string[] = [];
+
+  constructor(data?: PartialMessage<UpgradeAppReply>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.UpgradeAppReply";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "app", kind: "message", T: App },
+    { no: 2, name: "diff", kind: "message", T: PermissionDiff },
+    { no: 3, name: "upgraded", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
+    { no: 4, name: "message", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 5, name: "deduplicated", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
+    { no: 6, name: "prompt", kind: "scalar", T: 9 /* ScalarType.STRING */, repeated: true },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): UpgradeAppReply {
+    return new UpgradeAppReply().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): UpgradeAppReply {
+    return new UpgradeAppReply().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): UpgradeAppReply {
+    return new UpgradeAppReply().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: UpgradeAppReply | PlainMessage<UpgradeAppReply> | undefined, b: UpgradeAppReply | PlainMessage<UpgradeAppReply> | undefined): boolean {
+    return proto3.util.equals(UpgradeAppReply, a, b);
+  }
+}
+
+/**
+ * Request payload for UninstallApp.
+ *
+ * @generated from message legion.UninstallAppRequest
+ */
+export class UninstallAppRequest extends Message<UninstallAppRequest> {
+  /**
+   * @generated from field: string name = 1;
+   */
+  name = "";
+
+  /**
+   * Optional key to dedupe retries.
+   *
+   * @generated from field: optional string idempotency_key = 2;
+   */
+  idempotencyKey?: string;
+
+  constructor(data?: PartialMessage<UninstallAppRequest>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.UninstallAppRequest";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "name", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 2, name: "idempotency_key", kind: "scalar", T: 9 /* ScalarType.STRING */, opt: true },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): UninstallAppRequest {
+    return new UninstallAppRequest().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): UninstallAppRequest {
+    return new UninstallAppRequest().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): UninstallAppRequest {
+    return new UninstallAppRequest().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: UninstallAppRequest | PlainMessage<UninstallAppRequest> | undefined, b: UninstallAppRequest | PlainMessage<UninstallAppRequest> | undefined): boolean {
+    return proto3.util.equals(UninstallAppRequest, a, b);
+  }
+}
+
+/**
+ * Reply payload for UninstallApp.
+ *
+ * @generated from message legion.UninstallAppReply
+ */
+export class UninstallAppReply extends Message<UninstallAppReply> {
+  /**
+   * Human-readable status message.
+   *
+   * @generated from field: string message = 1;
+   */
+  message = "";
+
+  /**
+   * How many job grants were revoked.
+   *
+   * @generated from field: uint32 revoked_grants = 2;
+   */
+  revokedGrants = 0;
+
+  /**
+   * True when `idempotency_key` matched an earlier call.
+   *
+   * @generated from field: bool deduplicated = 3;
+   */
+  deduplicated = false;
+
+  constructor(data?: PartialMessage<UninstallAppReply>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.UninstallAppReply";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "message", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 2, name: "revoked_grants", kind: "scalar", T: 13 /* ScalarType.UINT32 */ },
+    { no: 3, name: "deduplicated", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): UninstallAppReply {
+    return new UninstallAppReply().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): UninstallAppReply {
+    return new UninstallAppReply().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): UninstallAppReply {
+    return new UninstallAppReply().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: UninstallAppReply | PlainMessage<UninstallAppReply> | undefined, b: UninstallAppReply | PlainMessage<UninstallAppReply> | undefined): boolean {
+    return proto3.util.equals(UninstallAppReply, a, b);
+  }
+}
+
+/**
+ * Request payload for SetAppEnabled.
+ *
+ * @generated from message legion.SetAppEnabledRequest
+ */
+export class SetAppEnabledRequest extends Message<SetAppEnabledRequest> {
+  /**
+   * @generated from field: string name = 1;
+   */
+  name = "";
+
+  /**
+   * True runs the app; false stops its job and keeps everything else.
+   *
+   * @generated from field: bool enabled = 2;
+   */
+  enabled = false;
+
+  /**
+   * Optional key to dedupe retries.
+   *
+   * @generated from field: optional string idempotency_key = 3;
+   */
+  idempotencyKey?: string;
+
+  constructor(data?: PartialMessage<SetAppEnabledRequest>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.SetAppEnabledRequest";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "name", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 2, name: "enabled", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
+    { no: 3, name: "idempotency_key", kind: "scalar", T: 9 /* ScalarType.STRING */, opt: true },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): SetAppEnabledRequest {
+    return new SetAppEnabledRequest().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): SetAppEnabledRequest {
+    return new SetAppEnabledRequest().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): SetAppEnabledRequest {
+    return new SetAppEnabledRequest().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: SetAppEnabledRequest | PlainMessage<SetAppEnabledRequest> | undefined, b: SetAppEnabledRequest | PlainMessage<SetAppEnabledRequest> | undefined): boolean {
+    return proto3.util.equals(SetAppEnabledRequest, a, b);
+  }
+}
+
+/**
+ * Reply payload for SetAppEnabled.
+ *
+ * @generated from message legion.SetAppEnabledReply
+ */
+export class SetAppEnabledReply extends Message<SetAppEnabledReply> {
+  /**
+   * @generated from field: legion.App app = 1;
+   */
+  app?: App;
+
+  /**
+   * Human-readable status message.
+   *
+   * @generated from field: string message = 2;
+   */
+  message = "";
+
+  /**
+   * True when `idempotency_key` matched an earlier call.
+   *
+   * @generated from field: bool deduplicated = 3;
+   */
+  deduplicated = false;
+
+  constructor(data?: PartialMessage<SetAppEnabledReply>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.SetAppEnabledReply";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "app", kind: "message", T: App },
+    { no: 2, name: "message", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 3, name: "deduplicated", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): SetAppEnabledReply {
+    return new SetAppEnabledReply().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): SetAppEnabledReply {
+    return new SetAppEnabledReply().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): SetAppEnabledReply {
+    return new SetAppEnabledReply().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: SetAppEnabledReply | PlainMessage<SetAppEnabledReply> | undefined, b: SetAppEnabledReply | PlainMessage<SetAppEnabledReply> | undefined): boolean {
+    return proto3.util.equals(SetAppEnabledReply, a, b);
+  }
+}
+
+/**
+ * Request payload for UpdateAppSettings. Unset fields keep their value.
+ *
+ * @generated from message legion.UpdateAppSettingsRequest
+ */
+export class UpdateAppSettingsRequest extends Message<UpdateAppSettingsRequest> {
+  /**
+   * @generated from field: string name = 1;
+   */
+  name = "";
+
+  /**
+   * @generated from field: optional uint32 replicas = 2;
+   */
+  replicas?: number;
+
+  /**
+   * `managers`, `workers`, or `any`.
+   *
+   * @generated from field: optional string placement = 3;
+   */
+  placement?: string;
+
+  /**
+   * CPU (MHz) per task; 0 clears the override.
+   *
+   * @generated from field: optional uint64 cpu = 4;
+   */
+  cpu?: bigint;
+
+  /**
+   * Memory (MiB) per task; 0 clears the override.
+   *
+   * @generated from field: optional uint64 memory = 5;
+   */
+  memory?: bigint;
+
+  /**
+   * The worker pool for `workers` and `any` placement; empty clears it.
+   *
+   * @generated from field: optional string pool = 6;
+   */
+  pool?: string;
+
+  /**
+   * Optional key to dedupe retries.
+   *
+   * @generated from field: optional string idempotency_key = 7;
+   */
+  idempotencyKey?: string;
+
+  constructor(data?: PartialMessage<UpdateAppSettingsRequest>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.UpdateAppSettingsRequest";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "name", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 2, name: "replicas", kind: "scalar", T: 13 /* ScalarType.UINT32 */, opt: true },
+    { no: 3, name: "placement", kind: "scalar", T: 9 /* ScalarType.STRING */, opt: true },
+    { no: 4, name: "cpu", kind: "scalar", T: 4 /* ScalarType.UINT64 */, opt: true },
+    { no: 5, name: "memory", kind: "scalar", T: 4 /* ScalarType.UINT64 */, opt: true },
+    { no: 6, name: "pool", kind: "scalar", T: 9 /* ScalarType.STRING */, opt: true },
+    { no: 7, name: "idempotency_key", kind: "scalar", T: 9 /* ScalarType.STRING */, opt: true },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): UpdateAppSettingsRequest {
+    return new UpdateAppSettingsRequest().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): UpdateAppSettingsRequest {
+    return new UpdateAppSettingsRequest().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): UpdateAppSettingsRequest {
+    return new UpdateAppSettingsRequest().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: UpdateAppSettingsRequest | PlainMessage<UpdateAppSettingsRequest> | undefined, b: UpdateAppSettingsRequest | PlainMessage<UpdateAppSettingsRequest> | undefined): boolean {
+    return proto3.util.equals(UpdateAppSettingsRequest, a, b);
+  }
+}
+
+/**
+ * Reply payload for UpdateAppSettings.
+ *
+ * @generated from message legion.UpdateAppSettingsReply
+ */
+export class UpdateAppSettingsReply extends Message<UpdateAppSettingsReply> {
+  /**
+   * @generated from field: legion.App app = 1;
+   */
+  app?: App;
+
+  /**
+   * Human-readable status message: what changed.
+   *
+   * @generated from field: string message = 2;
+   */
+  message = "";
+
+  /**
+   * True when `idempotency_key` matched an earlier call.
+   *
+   * @generated from field: bool deduplicated = 3;
+   */
+  deduplicated = false;
+
+  constructor(data?: PartialMessage<UpdateAppSettingsReply>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.UpdateAppSettingsReply";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "app", kind: "message", T: App },
+    { no: 2, name: "message", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 3, name: "deduplicated", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): UpdateAppSettingsReply {
+    return new UpdateAppSettingsReply().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): UpdateAppSettingsReply {
+    return new UpdateAppSettingsReply().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): UpdateAppSettingsReply {
+    return new UpdateAppSettingsReply().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: UpdateAppSettingsReply | PlainMessage<UpdateAppSettingsReply> | undefined, b: UpdateAppSettingsReply | PlainMessage<UpdateAppSettingsReply> | undefined): boolean {
+    return proto3.util.equals(UpdateAppSettingsReply, a, b);
+  }
+}
+
+/**
+ * Request payload for SetAppConfig.
+ *
+ * @generated from message legion.SetAppConfigRequest
+ */
+export class SetAppConfigRequest extends Message<SetAppConfigRequest> {
+  /**
+   * @generated from field: string name = 1;
+   */
+  name = "";
+
+  /**
+   * The whole new config, as JSON.
+   *
+   * @generated from field: string config_json = 2;
+   */
+  configJson = "";
+
+  /**
+   * Optional key to dedupe retries.
+   *
+   * @generated from field: optional string idempotency_key = 3;
+   */
+  idempotencyKey?: string;
+
+  constructor(data?: PartialMessage<SetAppConfigRequest>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.SetAppConfigRequest";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "name", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 2, name: "config_json", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 3, name: "idempotency_key", kind: "scalar", T: 9 /* ScalarType.STRING */, opt: true },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): SetAppConfigRequest {
+    return new SetAppConfigRequest().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): SetAppConfigRequest {
+    return new SetAppConfigRequest().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): SetAppConfigRequest {
+    return new SetAppConfigRequest().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: SetAppConfigRequest | PlainMessage<SetAppConfigRequest> | undefined, b: SetAppConfigRequest | PlainMessage<SetAppConfigRequest> | undefined): boolean {
+    return proto3.util.equals(SetAppConfigRequest, a, b);
+  }
+}
+
+/**
+ * Reply payload for SetAppConfig.
+ *
+ * @generated from message legion.SetAppConfigReply
+ */
+export class SetAppConfigReply extends Message<SetAppConfigReply> {
+  /**
+   * @generated from field: legion.App app = 1;
+   */
+  app?: App;
+
+  /**
+   * Human-readable status message.
+   *
+   * @generated from field: string message = 2;
+   */
+  message = "";
+
+  /**
+   * The code fields the change touched (concrete JSON pointers); the
+   * caller's grant was checked when any did.
+   *
+   * @generated from field: repeated string code_fields_changed = 3;
+   */
+  codeFieldsChanged: string[] = [];
+
+  /**
+   * True when `idempotency_key` matched an earlier call.
+   *
+   * @generated from field: bool deduplicated = 4;
+   */
+  deduplicated = false;
+
+  constructor(data?: PartialMessage<SetAppConfigReply>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.SetAppConfigReply";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "app", kind: "message", T: App },
+    { no: 2, name: "message", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 3, name: "code_fields_changed", kind: "scalar", T: 9 /* ScalarType.STRING */, repeated: true },
+    { no: 4, name: "deduplicated", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): SetAppConfigReply {
+    return new SetAppConfigReply().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): SetAppConfigReply {
+    return new SetAppConfigReply().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): SetAppConfigReply {
+    return new SetAppConfigReply().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: SetAppConfigReply | PlainMessage<SetAppConfigReply> | undefined, b: SetAppConfigReply | PlainMessage<SetAppConfigReply> | undefined): boolean {
+    return proto3.util.equals(SetAppConfigReply, a, b);
   }
 }
 

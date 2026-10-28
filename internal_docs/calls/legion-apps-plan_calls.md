@@ -4,9 +4,9 @@ Decisions made while designing
 [`plans/legion-apps-plan.md`](../plans/legion-apps-plan.md). **Entries are
 ordered by project impact, highest first, and an entry's number is its
 rank.** Entries 1-17 are design-time calls. Implementation calls start at
-18 (phase A1, entries 18-28) and continue at 29 (phase A2, entries 29-41),
-appended after the design calls, since none outranks them; each phase's
-entries are ranked among themselves.
+18 (phase A1, entries 18-28) and continue at 29 (phase A2, entries 29-41)
+and 42 (phase A3, entries 42-57), appended after the design calls, since
+none outranks them; each phase's entries are ranked among themselves.
 Autoscaler-specific calls are in
 [autoscaler-v2-plan_calls.md](autoscaler-v2-plan_calls.md).
 
@@ -1312,3 +1312,307 @@ fields would fork the representation.
 
 **Why (simplicity).** Identities have always been JSON on the wire; the new
 fields follow.
+
+## 42. The reconciler submits as an identity that holds exactly the app's recorded grant, plus `job:write` on the app's job (A3)
+
+**Call.** "Reconciler submits are checked against the recorded grant"
+(plan §6.4) is implemented by what the reconciler *is*, not by a bypass: its
+submits go through the ordinary submit path as an `AclIdentity` named
+`legion:app-reconciler` whose rules are the app record's granted allow rules
+plus `{ job, read+write, namespaces = ["legion-system"], names = [<app>],
+host = true }`. The unchanged grant check then compares the render's
+`legion` identity with those rules; the version's job grant is recorded as
+`<granter> (app <name>)`.
+
+```console
+$ legion acl grants list --job legion-system/gitops
+ legion-system/gitops | 3 | job:read,write in team-* ... | userpass:alice (app gitops) | ...
+```
+
+**Alternatives.**
+- (a) Submit with a management identity and skip `enforce_identity_grants`
+  for app jobs.
+- (b) A `GrantSource` that records the app's grant without any check.
+
+**Trade-off.** A manifest whose job reads KV (a template, a `$` reference)
+or KV-authenticated artifacts needs `kv:read` on those keys in its own
+`permissions`, because every other admission check also runs against this
+identity; such an app shows `reconcile refused` until its manifest asks for
+them (documented).
+
+**Why (security boundary, then simplicity).** (a) and (b) each add a path
+that skips a check, and every later admission check would have to remember
+the exemption. Holding exactly the grant means the reconciler can submit
+only what the app was granted, on only its own job, through the one path
+everything else uses; a render that asked for more than the recorded grant
+(a bug in adoption, say) is refused like anyone's.
+
+## 43. Bundled apps cannot be uninstalled, so seeding is "insert each bundled app that has no record" (A3)
+
+**Call.** `UninstallApp` refuses a bundled app (`FailedPrecondition`:
+"disable it instead"). Seeding inserts a record for every bundled app that
+has none, on every Control leadership acquisition, with `ON CONFLICT DO
+NOTHING`; the `apps` seed block applies only to that insert.
+
+**Alternatives.**
+- (a) Seed only on an empty store (entry 23's "the namespace was missing"
+  condition), and let bundled apps be uninstalled.
+- (b) Allow uninstall, and remember seeded names in a tombstone table.
+
+**Trade-off.** An operator who never wants the autoscaler keeps a disabled
+record of it. A bundled app added in a later release is seeded on an
+existing cluster the first time a leader runs that release (with its
+permissions granted by `legion:bootstrap` then, not at cluster birth).
+
+**Why (simplicity).** With no uninstall, "missing" only ever means "never
+seeded", so no marker is needed and seeding stays idempotent across leaders.
+(a) would never seed a bundled app added after the cluster's first day.
+(b) adds a table to remember a decision `disable` already expresses.
+
+## 44. `buildId` hashes the whole executable once per process, and `sha2` is optimized in dev builds (A3)
+
+**Call.** `util::build_id()` is the first 16 bytes of the SHA-256 of
+`current_exe()`, computed once on a blocking thread before the worker's
+first registration (and by the manager for its own build). `Cargo.toml`
+builds `sha2` at `opt-level = 3` in the dev profile.
+
+**Alternatives.**
+- (a) A build id baked in at compile time by `build.rs`.
+- (b) The executable's size and mtime.
+- (c) A hash of a sample of the file.
+
+**Trade-off.** Startup reads the whole binary: well under a second for the
+26 MB release build, about a second for a 400 MB debug build (tens of
+seconds at `-O0`, hence the profile override). Two nodes running the same
+bytes from different paths agree, which is the point.
+
+**Why (correctness).** (a) is stale whenever cargo skips the build script,
+which it does on most rebuilds, so a rebuild would not roll the app. (b)
+makes identical binaries copied at different times disagree, so the marker
+would never settle across nodes. (c) can miss a small change of equal
+length.
+
+## 45. The build marker is in the bundled app's environment, so a new marker is a new job version (A3)
+
+**Call.** A bundled app's render carries `LEGION_APP_BUILD =
+<buildVersion>+<buildId>` in every task's env, besides the `version_matches
+>=<version>` constraint.
+
+**Alternatives.** The constraint alone, as the plan writes it.
+
+**Trade-off.** One more variable in the task's environment.
+
+**Why (correctness).** A rebuild without a version bump changes `buildId`
+but not the constraint, so the render would be byte-identical, the submit
+would be `Unchanged`, and the app would keep running the old binary: exactly
+the case `buildId` exists for (entry 14). The env makes the rolled job
+differ, and gives the app its own build for logs.
+
+## 46. Only `codeFields` entries marked `artifact = true` become artifacts (A3, deviates from plan §6.3)
+
+**Call.** A `codeFields` entry is a JSON pointer (`"/plugins/*/url"`), or `{
+pointer, artifact = true }`. Every code field needs the app's grant to
+change; only artifact entries' string values are rendered as artifacts
+(into `code/<path>/`, with a sibling `checksum` as the checksum).
+
+```nickel
+codeFields = [{ pointer = "/plugins/*/source", artifact = true }, "/plugins/*/url"],
+```
+
+**Alternatives.** Render every URL-valued code field as an artifact (the
+plan's "plugin sources become artifacts", read literally).
+
+**Trade-off.** One more shape in the manifest.
+
+**Why (correctness).** The autoscaler's two code fields are different
+kinds: `source` is a binary to fetch, `url` is an HTTP endpoint the app
+calls. Fetching the endpoint as an artifact would fail staging, or fetch
+something that is not code.
+
+## 47. `managedBy` and the submitter live in the version's `meta`, and an unchanged reconciler submit stamps the version in place (A3)
+
+**Call.** The stamp is `job_config.meta.managedBy` (beside
+`jobTemplate`), and every principal's submit records `meta.submittedBy`,
+which names the editor in `reverted a direct edit by <who>`. A KV re-render
+copies the previous version's stamp; any other submit leaves it out. When a
+reconciler submit is `Unchanged` (a direct edit left the job byte-identical
+to the render) it writes the stamp onto the latest version.
+
+**Alternatives.** A `managed_by` column on `job_config` with a migration;
+leaving an unchanged version unstamped.
+
+**Trade-off.** The stamp is not queryable by SQL index (one JSON read per
+app per pass).
+
+**Why (simplicity, then correctness).** Provenance already lives in `meta`,
+which every version write builds; a column would touch every
+`INSERT_JOB_CONFIG` caller. Without the in-place stamp, a job a direct edit
+left equal to the render compares unequal forever, and the reconciler would
+resubmit on every pass.
+
+## 48. Status is derived when read, from the record, the job, and its allocations (A3)
+
+**Call.** `running`, `degraded`, `pending (why)`, and `stopped` are computed
+by `GetApp`/`ListApps` (and the metric) from the record's enabled flag and
+last error, the job's latest version and state, its running allocations
+against replicas times tasks, and the scheduler's blocked message. The
+record stores only the reconciler's last action, error, digest, and marker.
+
+**Alternatives.** Store a status column the reconciler maintains.
+
+**Trade-off.** Each read costs a few store reads per app.
+
+**Why (correctness).** Allocation state changes without a reconcile pass
+(a crash, a placement); a stored status would lag it by up to a minute and
+need a write per change.
+
+## 49. A reconciler idempotency key is `deduplicated` only when the job shows its submit took (A3)
+
+**Call.** The reconciler's keys are stored unscoped (`app-reconciler/app:<name>:<digest>:<from>`).
+A hit counts as deduplicated only when the job's latest version carries the
+digest and is not stopped; otherwise the reconciler submits anyway.
+
+**Alternatives.** Trust the key alone, as `RunJob` does.
+
+**Trade-off.** None found: a resubmit of the same render is `Unchanged`, so
+it never adds a version.
+
+**Why (correctness).** `<from>` is `none` for every lifetime of a job that
+was destroyed, and version ids repeat after a destroy, so within the key's
+24 hours a stale key could otherwise silence a needed resubmit. The stamp
+check is what makes the key safe; the key only reports what happened.
+
+## 50. An upgrade checks the whole new manifest against the caller, and needs approval only when it adds permissions (A3)
+
+**Call.** `UpgradeApp` runs the grant check for every permission of the new
+manifest (not just the added ones), refuses without `approve` only when the
+diff adds rules, and takes an optional `config_json` for a schema change the
+stored config no longer matches.
+
+**Alternatives.** Check only the added rules; always require approval.
+
+**Trade-off.** Upgrading needs as much access as installing did.
+
+**Why (security boundary).** A new manifest is new code holding the whole
+grant (entry 5), so the upgrader must hold all of it. An upgrade that only
+narrows the grant asks nothing new, so a prompt would be noise.
+
+## 51. Uninstall disables, stops, revokes, then deletes, and leaves the stopped job (A3)
+
+**Call.** `UninstallApp` first writes the record disabled, then stops the
+job, revokes its grants, and deletes the record; the stopped job stays in
+`legion-system` until someone destroys it.
+
+**Alternatives.** Delete the record first; destroy the job too.
+
+**Trade-off.** A stopped job left behind for the operator to remove.
+
+**Why (correctness).** Deleting first races the reconciler (a pass between
+the delete and the stop finds nothing to do, and one between a stop and the
+delete restarts the job); disabling first makes every interleaving stop it,
+and a retry after a failure finds the record and finishes. Destroying would
+erase the job's version history, which is the app's config history
+(entry 15).
+
+## 52. The config file reaches the task through the jobspec's `files`, and the worker resolves `LEGION_APP_CONFIG` (A3)
+
+**Call.** The render adds `{ path = "legion-app-config.json", content, mode
+= "0400" }` to each `exec` and `container` task's `config.files`, and
+`LEGION_APP_CONFIG = "legion-app-config.json"`; the worker rewrites that
+relative value to the task's own view of the task directory before start,
+whether or not workload identity is on. Other runtimes get no config file.
+
+**Alternatives.** A new task-level field the worker materializes; the
+config inline in an env var.
+
+**Trade-off.** Sandbox apps have no config file (documented); the file is
+part of the stored job, so the config is readable by whoever can read the
+job.
+
+**Why (simplicity).** `files` already writes into the task directory
+atomically and is chowned with it; one small rewrite makes the path right
+for both runtimes. App config is settings, not secrets (secrets go in KV
+under the app's grant), so riding in the job is fine and gives config
+history for free.
+
+## 53. A refused submit parks on (record `updated_at`, render digest) (A3)
+
+**Call.** `InvalidArgument`, `PermissionDenied`, `ResourceExhausted`,
+`AlreadyExists`, `OutOfRange`, and any `FailedPrecondition` but
+not-the-leader are refusals: the app shows `reconcile refused: …` and passes
+are skipped until the record's `updated_at` or the render's digest (which
+includes the build marker) changes. Everything else backs off 5s→5m.
+
+**Alternatives.** Retry refusals on the backoff timer too.
+
+**Trade-off.** A refusal caused by something outside the app (a namespace
+quota, a deleted policy) needs a write to the app (`legion app enable`) to
+retry once fixed (documented).
+
+**Why (performance).** A permanent error retried on a timer spins raft
+writes and events forever; the plan asks it to wait for a relevant change.
+
+## 54. The straggler status names the nodes behind the newest build (A3, rewords plan §6.3)
+
+**Call.** While eligible nodes disagree: `upgrade waiting: 2 of 3 eligible
+nodes on 0.15.0 (waiting for mgr-3)`, where the version is the newest build
+present and the names are the nodes not on it (five at most, then "and N
+more").
+
+**Alternatives.** The plan's example, `2 of 5 eligible nodes on 0.14.0
+(wkr-7, wkr-9)`, which reads as either the old or the new set.
+
+**Trade-off.** None found.
+
+**Why (simplicity).** The operator's question is "which nodes do I still
+have to upgrade?"; naming them after "waiting for" answers it without
+knowing which build the app runs.
+
+## 55. Exec tasks get `systemWorker.appUser` only when the manifest names no user, from the leading manager's config (A3)
+
+**Call.** The render sets `user` on an `exec` task that has none, to the
+leader's `systemWorker.appUser`; a manifest that names a (non-root) user
+keeps it.
+
+**Alternatives.** Force `appUser` on every exec task; record `appUser` on
+the app record at install.
+
+**Trade-off.** Managers that disagree on `appUser` render different jobs,
+so a leadership change resubmits the app (documented: keep it the same on
+every manager).
+
+**Why (simplicity).** `appUser` is a fact about hosts (the user must exist
+there), so it belongs to manager config, not the record; forcing it would
+break an app that needs its own unprivileged user.
+
+## 56. Workload identity stays off by default, so apps hold no credentials until it is turned on (A3, defers a default)
+
+**Call.** A3 does not change `workloadIdentity.enabled` (default false).
+Apps run and report healthy without it, but their `legion` identity gets no
+token or socket; `legion app status` notes it, and the docs say so.
+
+**Alternatives.** Turn workload identity on by default in A3.
+
+**Trade-off.** The autoscaler's Phase 2 needs it on to call Legion; until
+the default changes, a fresh cluster's autoscaler cannot act.
+
+**Why (scope).** Turning it on is a cluster-wide default change (an issuer
+URL, a signing key, JWKS endpoints) with its own plan-level questions; A3's
+apps work either way. Recorded as a TODO item for the autoscaler's Phase 2.
+
+## 57. `legion app config get` prints JSON, and the bundled manifest is evaluated Nickel with a list `command` (A3, deviates from plan §6.1, §6.3)
+
+**Call.** `config get` prints the config as JSON (valid input to `config
+set`), not Nickel. The bundled manifest is a Nickel file compiled into the
+binary and evaluated once per process (imports refused); its exec task is
+`command = ["legion:self", "app", "run", "autoscaler"]`, the exec runtime's
+shape, not the plan's `command`/`args` pair.
+
+**Alternatives.** A JSON-to-Nickel printer; a JSON bundled manifest.
+
+**Trade-off.** `config get` output is not idiomatic Nickel.
+
+**Why (simplicity).** No JSON-to-Nickel printer exists, and JSON is valid
+input for every Nickel-reading command. Keeping the bundled manifest in
+Nickel keeps it reviewable next to the docs, and a unit test evaluates and
+validates it.

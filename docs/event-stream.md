@@ -38,6 +38,13 @@ It is available from the CLI, the MCP server, the UI, and raw gRPC.
 | `net.policy_deleted` | info | A network policy object was deleted. |
 | `net.plugin_applied` | info | A network plugin object was created or replaced (`legion net plugin apply`). Metadata names it, its revision, and the module checksum. See [Network Plugins](network-plugins.md). |
 | `net.plugin_deleted` | info | A network plugin object was deleted. |
+| `app.installed` | info | An [app](apps.md) was installed (`legion app install`), or a bundled app seeded by the first Control leader (`by legion:bootstrap`). Metadata carries `app`, `version`, `source`, and `by`. App events are scoped to the app's job (`legion-system/<app>`). |
+| `app.upgraded` | info | An app's manifest was replaced: by `legion app upgrade`, or, for a bundled app, by the manifest of the build its nodes moved to. Metadata carries `from`, `to`, `permissionsAdded`, `permissionsRemoved`, and `by`. |
+| `app.uninstalled` | info | An app was uninstalled: its job stopped and its grants revoked (`revokedGrants`). |
+| `app.enabled` / `app.disabled` | info | An app was enabled or disabled (`by`). |
+| `app.config_changed` | info | An app's config was replaced. `codeFields` lists the code fields the change touched, for which the caller's grant was checked. |
+| `app.reconciled` | info | The app reconciler changed an app's job. `action` says what: `created the job`, `config changed`, `settings changed (…)`, `upgraded 0.2.0 → 0.3.0`, `reverted a direct edit by <principal>`, `started the job, which was stopped`, `stopped (app disabled)`. Metadata also carries the render's `digest`. |
+| `app.reconcile_failed` | warn | The reconciler could not bring an app's job in line with its record. `refused: true` is a submit the manager refused (validation, grant, quota), which waits for the next change to the app; otherwise it retries with backoff, and the event repeats at most every 10 minutes. |
 | `volume.mounted` | info | A worker materialized a [volume](volumes.md) at a host path. For a node-local volume, this is also when its instance becomes pinned to that node. |
 | `volume.failed` | warn | A driver operation failed (mount/unmount/destroy). The detail is also recorded on the volume row, so `legion volume get` explains a stuck volume. |
 | `volume.reclaiming` | info | A volume's instance no longer references it, so its storage is queued for the driver's `destroy`. |

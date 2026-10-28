@@ -395,6 +395,15 @@ policy](namespaces.md#namespace-policies)'s quota is checked against
 yet placed (`legion namespace get` shows it), so the gauges can read lower
 while admitted work is still placing.
 
+### Apps
+
+- **`legion_apps{status}`** (gauge): installed [apps](apps.md) by status,
+  `running`, `degraded`, `pending`, or `stopped`, as `legion app list`
+  derives it. Set by the control-lane leader's app reconciler after each
+  pass (at least once a minute); zero on other managers. A `stopped` or
+  `degraded` count is worth an alert: a bundled app (the autoscaler) that is
+  not running is a cluster-health finding, not a silent absence.
+
 ### Node usage
 
 Per-node gauges from the usage reports workers with

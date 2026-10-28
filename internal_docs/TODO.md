@@ -4360,8 +4360,8 @@ replicas is one command on day N. The shared substrate is
 [legion-apps-plan.md](plans/legion-apps-plan.md); each app still needs its own
 plan.
 
-- [ ] **Legion apps substrate**: [plan](plans/legion-apps-plan.md) (IN EXECUTION; A1 and A2
-      shipped, in Done) · [calls](calls/legion-apps-plan_calls.md)
+- [ ] **Legion apps substrate**: [plan](plans/legion-apps-plan.md) (IN EXECUTION; A1, A2
+      and A3 shipped, in Done) · [calls](calls/legion-apps-plan_calls.md)
   - [ ] A1 follow-ups, found while building it:
     - [ ] **A manager's system worker and a standalone worker on one Linux
           host overwrite each other's host guard.** The kernel host guard is
@@ -4410,14 +4410,34 @@ plan.
           that leave out a selector a held rule names. Decide whether a
           normalizing pass is worth it once apps hit it
           ([calls entry 30](calls/legion-apps-plan_calls.md)).
-  - [ ] A3: app manifests and records; the Control-leader reconciler
-        (event-driven, a render digest stamped on the job as `managedBy`,
-        idempotency keys per digest and starting state, stopped jobs
-        restarted, direct edits reverted); `legion:self` for bundled apps,
-        rolled once the eligible nodes agree on a new (`buildVersion`,
-        `buildId`) build marker, with a `version_matches` constraint (workers
-        report a new `buildId`); seeding; `legion app
-        list|status|install|upgrade|config|set|enable|disable|uninstall`
+  - [ ] A3 follow-ups, found while building it:
+    - [ ] **Apps hold no credentials on a default cluster.** Workload
+          identity is off by default, so an app's `legion` identity gets no
+          token or API socket; `legion app status` notes it. The autoscaler's
+          Phase 2 needs it on: decide whether workload identity becomes a
+          default, or apps get a credential another way
+          ([calls entry 56](calls/legion-apps-plan_calls.md),
+          [docs](../docs/apps.md#limitations)).
+    - [ ] **A stopped bundled app is not yet a cluster-health finding**
+          (plan §6.7): no `legion doctor` exists and the UI has no Apps
+          page or overview card. `legion_apps{status}` and `legion app list`
+          show it today.
+    - [ ] **An app's own health view** (plan §6.7, a manifest-declared
+          `health` view) waits on A4's views; status comes from the job's
+          allocations and checks.
+    - [ ] **Sandbox apps get no config file**: only `exec` and `container`
+          tasks have `$LEGION_APP_CONFIG`
+          ([calls entry 52](calls/legion-apps-plan_calls.md)).
+    - [ ] **A manifest whose job reads KV needs `kv:read` in its own
+          `permissions`**, because the reconciler's submit is checked as the
+          recorded grant; otherwise the app shows `reconcile refused`
+          ([calls entry 42](calls/legion-apps-plan_calls.md)).
+    - [ ] **Reconcile backoff is leader-local**: a new Control leader
+          retries a failing or parked app once, then backs off from scratch.
+    - [ ] **`legion app config get` prints JSON, not Nickel**
+          ([calls entry 57](calls/legion-apps-plan_calls.md)).
+    - [ ] **The UI does not know apps yet**: `ui/src/gen` has the new RPCs,
+          but no page uses them (A4 builds the UI side).
   - [ ] A4: UI tier 1, declarative views in `nav`/`overview`/`job`/`task`/`node`
         slots, served by `GetAppView`/`InvokeAppAction` (authorized as the
         viewer, forwarded with a signed viewer assertion), plus
@@ -6188,6 +6208,47 @@ findings: [kernel-classifier-findings.md](kernel-classifier-findings.md)
         `legion login` never writes over the identity token file
   - [x] `configs/jobs/cert-renewer.ncl` rewritten on `permissions` and the
         socket: no manager-config binding, no hard-coded address
+- [x] **Legion apps A3: apps** (2026-10-28,
+      [plan](plans/legion-apps-plan.md) §6.1-§6.3, §8 ·
+      [calls 42-57](calls/legion-apps-plan_calls.md) · docs:
+      [apps.md](../docs/apps.md),
+      [auth-and-acls.md](../docs/auth-and-acls.md#app-grants),
+      [event-stream.md](../docs/event-stream.md),
+      [metrics.md](../docs/metrics.md#apps))
+  - [x] App manifests (Nickel or JSON, unknown fields refused; JSON Schema
+        draft 7 config with local refs only; `codeFields`), and Control-lane
+        app records with the grant, settings, config, and the reconciler's
+        status; `configs/apps/example-app.ncl`
+  - [x] The app reconciler on the Control leader: renders each app's job
+        (placement table, replicas, `appUser`, the `legion` identity with
+        the recorded grant, the config file, code-field artifacts), stamps
+        `managedBy = { app, digest }` (kept by KV re-renders, cleared by any
+        other submit), resubmits on drift or a stopped job, stops disabled
+        apps, keys submits `app:<name>:<digest>:<from>`, coalesces bursts,
+        backs off 5s-5m, parks refusals until the next change; triggers on
+        app writes, job and node events, leadership, and a 60s full pass
+  - [x] `legion:self` in the exec runtime, and `legion app run` (config,
+        `/healthz`, signals) with the bundled `autoscaler` app (its engine
+        is Phase 2 of the autoscaler plan)
+  - [x] Workers report `buildId` (a hash of their executable); bundled apps
+        roll once their eligible nodes agree on a (`buildVersion`,
+        `buildId`) marker, with a `version_matches` constraint and a
+        straggler status; new bundled manifests adopted only when the leader
+        runs the marker's build, their permissions granted by
+        `legion:bootstrap`
+  - [x] Seeding of bundled apps by the first Control leader, with the
+        manager config's seed-only `apps` block
+  - [x] The `app` ACL resource (`names` selector); `ListApps`, `GetApp`,
+        `InstallApp`, `UpgradeApp` (permission diff, approval),
+        `UninstallApp`, `SetAppEnabled`, `UpdateAppSettings`, `SetAppConfig`
+        (code-field changes need the grant), idempotency keys on every write
+  - [x] `legion app list|status|logs|config get|set|schema|set|enable|
+        disable|install|upgrade|uninstall|run`, install from a file or URL
+        with the permission prompt; the `job info` banner for managed jobs
+  - [x] App events (`app.installed|upgraded|uninstalled|enabled|disabled|
+        config_changed|reconciled|reconcile_failed`), `legion_apps{status}`,
+        the `legion_app_list` and `legion_app_status` MCP tools, capability
+        entries
 
 ## Auth & ACLs
 

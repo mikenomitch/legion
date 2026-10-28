@@ -122,6 +122,7 @@ reports `aclEnabled: false`.
 | `net` | network policy and plugin objects ([Network Handlers](network-handlers.md), [Network Plugins](network-plugins.md)) | list policies, show or test a job's effective policy (scope by job name); list, describe, and read the status of plugins | apply or delete a policy. Scope with `pools`, which is matched against the policy's own `selector.nodePools`, so a pool's admin can set posture for their pool without cluster-wide write. Apply or delete a plugin: a `usableBy = "policies"` plugin's `nodePools` scope it the same way; a cluster-wide one, or any `usableBy = "jobs"` plugin, needs unscoped write. |
 | `snapshot` | instance snapshots ([Suspend and Resume](suspend-and-resume.md)) | list, inspect, warm a published one onto nodes, restore an instance from one, and create instances from one (restore and create also need `job:write`) | create (including `--publish`), delete, and name snapshots, suspend with a memory checkpoint, and fork (fork also needs `job:write`) (scope by job name and namespace) |
 | `namespace` | namespace objects ([Namespaces](namespaces.md)) | get a namespace (listing is per item: any allow in a namespace shows it) | create, update, and delete namespaces whose names match (scope with `namespaces`). A cascade delete also needs `job:write` there. |
+| `app` | [apps](apps.md): Legion's add-ons | list and show apps (scope with `names`, matched against app names) | install, upgrade, uninstall, enable, disable, and change settings and config. Installing and upgrading also need every permission the manifest asks for, and a config change that touches a code field needs the app's whole grant: `app:write` alone never hands out an app's grant. Cluster-scoped. |
 
 Actions are `read` and `write`. `write` does not imply `read`, so grant both.
 Grant `state:read` sparingly, since it can read every table in the state
@@ -197,7 +198,7 @@ A policy is a named JSON array of rules:
 - **A rule over a namespaced resource** (`job`, `exec`, `action`, `scale`,
   `boot`, `snapshot`, `namespace`) **must carry `namespaces`**, and a rule
   over only cluster-scoped resources (`node`, `kv`, `state`, `operator`,
-  `acl`, `template`, `net`) must not. `namespaces = ["*"]` covers every
+  `acl`, `template`, `net`, `app`) must not. `namespaces = ["*"]` covers every
   namespace, including ones created later. A rule mixing the two kinds is
   refused, as is an empty selector; `resources = ["*"]` rules and deny rules
   are exempt. A rule naming an exact namespace that does not exist yet is
@@ -456,6 +457,24 @@ next request, including ACL tokens minted from its identity with `legion login
 copy. The next submit of the job by someone who holds the access grants it
 again. A grant outlives the granter's own access, as in Kubernetes RBAC:
 revoke it when that matters.
+
+### App grants
+
+An [app](apps.md)'s job carries a grant the same way a job does, through the
+`permissions` of its `legion` identity, but the grant is recorded on the app
+record when the app is installed or upgraded, and checked against whoever
+does it (`InstallApp`, `UpgradeApp`), with the coverage rules above. The app
+reconciler's submits of the app's job are then checked against that recorded
+grant, so they keep working after the installer's own access changes; anyone
+else submitting the app's job directly still needs everything it asks for. A
+`SetAppConfig` that changes one of the manifest's code fields re-runs the
+check against the caller. Bundled apps' grants are recorded at seed time by
+`legion:bootstrap`, the one grant that is not checked against a person.
+
+```text
+Error: app gitops 0.2.0 asks for job:write in team-*, which your token does not hold
+Hint: have someone who holds it do this, or ask for it to be granted to you
+```
 
 ### Tokens
 

@@ -3,7 +3,7 @@
 /* eslint-disable */
 // @ts-nocheck
 
-import { AcquireKvLockReply, AcquireKvLockRequest, AdvanceRolloutReply, AdvanceRolloutRequest, ApplyNamespacePolicyReply, ApplyNamespacePolicyRequest, ApplyNamespaceReply, ApplyNamespaceRequest, CreateAclTokenReply, CreateAclTokenRequest, CreateExecKeyReply, CreateExecKeyRequest, CreateInstanceReply, CreateInstanceRequest, CreateInstancesReply, CreateInstancesRequest, CreateJoinTokenReply, CreateJoinTokenRequest, CreateSnapshotReply, CreateSnapshotRequest, DeleteAclPolicyReply, DeleteAclPolicyRequest, DeleteAclTokenReply, DeleteAclTokenRequest, DeleteAclUserReply, DeleteAclUserRequest, DeleteExecKeyReply, DeleteExecKeyRequest, DeleteJobTemplateReply, DeleteJobTemplateRequest, DeleteJoinTokenReply, DeleteJoinTokenRequest, DeleteKvReply, DeleteKvRequest, DeleteNamespacePolicyReply, DeleteNamespacePolicyRequest, DeleteNamespaceReply, DeleteNamespaceRequest, DeleteNetPluginReply, DeleteNetPluginRequest, DeleteNetPolicyReply, DeleteNetPolicyRequest, DeleteSavedStateQueryReply, DeleteSavedStateQueryRequest, DeleteSnapshotAliasReply, DeleteSnapshotAliasRequest, DeleteSnapshotReply, DeleteSnapshotRequest, DeleteVolumeReply, DeleteVolumeRequest, DestroyInstanceReply, DestroyInstanceRequest, DestroyJobReply, DestroyJobRequest, ExecClientFrame, ExecServerFrame, FetchDatapathMaterialReply, FetchDatapathMaterialRequest, FetchRootKeyReply, FetchRootKeyRequest, ForkInstanceReply, ForkInstanceRequest, GetAclPolicyReply, GetAclPolicyRequest, GetAllocationLogsReply, GetAllocationLogsRequest, GetArtifactCredentialReply, GetArtifactCredentialRequest, GetAuthMethodsReply, GetAuthMethodsRequest, GetHeartbeatCadenceReply, GetHeartbeatCadenceRequest, GetInstanceReply, GetInstanceRequest, GetJobInfoReply, GetJobInfoRequest, GetJobScaleStatusReply, GetJobScaleStatusRequest, GetJobSpecByConfigRequest, GetJobSpecReply, GetJobSpecRequest, GetJobTemplateReply, GetJobTemplateRequest, GetKeyringStatusReply, GetKeyringStatusRequest, GetKvLockReply, GetKvLockRequest, GetKvReply, GetKvRequest, GetLedgerReply, GetLedgerRequest, GetManagerConfigsReply, GetManagerConfigsRequest, GetMeshCaReply, GetMeshCaRequest, GetNamespacePolicyReply, GetNamespacePolicyRequest, GetNamespaceReply, GetNamespaceRequest, GetNetPluginReply, GetNetPluginRequest, GetNetPluginStatusReply, GetNetPluginStatusRequest, GetNetPolicyObjectReply, GetNetPolicyObjectRequest, GetNodeContentReply, GetNodeContentRequest, GetNodeReply, GetNodeRequest, GetNodesReply, GetNodesRequest, GetNodeUsageReply, GetNodeUsageRequest, GetObservabilityReply, GetObservabilityRequest, GetRaftJoinTokenReply, GetRaftJoinTokenRequest, GetRaftStatusReply, GetRaftStatusRequest, GetRolloutReply, GetRolloutRequest, GetRolloutStatusReply, GetRolloutStatusRequest, GetScalingInputsReply, GetScalingInputsRequest, GetSchedulerConcurrencyReply, GetSchedulerConcurrencyRequest, GetSessionReply, GetSessionRequest, GetSnapshotReply, GetSnapshotRequest, GetStateBackupReply, GetStateBackupRequest, GetStateStoreSchemaReply, GetStateStoreSchemaRequest, GetTaskLogsReply, GetTaskLogsRequest, GetVolumeReply, GetVolumeRequest, HealthCheckReply, HealthCheckRequest, HeartbeatReply, HeartbeatRequest, IssueBootTicketReply, IssueBootTicketRequest, IssueNodeCertificateReply, IssueNodeCertificateRequest, IssueNodeIdentityTokenReply, IssueNodeIdentityTokenRequest, IssueRaftCommandReply, IssueRaftCommandRequest, IssueWorkloadIdentityTokenReply, IssueWorkloadIdentityTokenRequest, JoinRaftClusterReply, JoinRaftClusterRequest, ListAclPoliciesReply, ListAclPoliciesRequest, ListAclTokensReply, ListAclTokensRequest, ListAclUsersReply, ListAclUsersRequest, ListBootTicketsReply, ListBootTicketsRequest, ListEventsReply, ListEventsRequest, ListExecKeysReply, ListExecKeysRequest, ListGrantsReply, ListGrantsRequest, ListInstancesReply, ListInstancesRequest, ListJobActionsReply, ListJobActionsRequest, ListJobSpecHistoryReply, ListJobSpecHistoryRequest, ListJobsReply, ListJobsRequest, ListJobTemplatesReply, ListJobTemplatesRequest, ListJoinTokensReply, ListJoinTokensRequest, ListKvReply, ListKvRequest, ListManagersReply, ListManagersRequest, ListNamespacePoliciesReply, ListNamespacePoliciesRequest, ListNamespacesReply, ListNamespacesRequest, ListNetPluginsReply, ListNetPluginsRequest, ListNetPoliciesReply, ListNetPoliciesRequest, ListNodeUsageReply, ListNodeUsageRequest, ListRaftHistoryReply, ListRaftHistoryRequest, ListRolloutEventsReply, ListRolloutEventsRequest, ListRolloutsReply, ListRolloutsRequest, ListSavedStateQueriesReply, ListSavedStateQueriesRequest, ListServiceEdgesReply, ListServiceEdgesRequest, ListServicesReply, ListServicesRequest, ListSessionNodesReply, ListSessionNodesRequest, ListSnapshotsReply, ListSnapshotsRequest, ListVolumeDriversReply, ListVolumeDriversRequest, ListVolumesReply, ListVolumesRequest, LoginReply, LoginRequest, MintExecTicketReply, MintExecTicketRequest, NodeLivenessDigestReply, NodeLivenessDigestRequest, PatchKvReply, PatchKvRequest, PlanJobReply, PlanJobRequest, PostWorkReply, PostWorkRequest, ProbeReply, ProbeRequest, PromoteInstanceReply, PromoteInstanceRequest, PutKvReply, PutKvRequest, QuerySessionsReply, QuerySessionsRequest, QueryStateStoreReply, QueryStateStoreRequest, RaftLaneReply, RaftLaneRequest, RatifyClaimReply, RatifyClaimRequest, ReleaseKvLockReply, ReleaseKvLockRequest, RenderJobTemplateReply, RenderJobTemplateRequest, RenewKvLockReply, RenewKvLockRequest, ReplaceInstanceReply, ReplaceInstanceRequest, ResetKeyringReply, ResetKeyringRequest, ResolveServiceReply, ResolveServiceRequest, RestartWorkerReply, RestartWorkerRequest, RestoreInstanceReply, RestoreInstanceRequest, ResumeSessionReply, ResumeSessionRequest, RevokeGrantReply, RevokeGrantRequest, RewrapKvReply, RewrapKvRequest, RewrapRootKeyReply, RewrapRootKeyRequest, RotateDataKeyReply, RotateDataKeyRequest, RotateMeshCaReply, RotateMeshCaRequest, RunJobReply, RunJobRequest, RunJobTemplateReply, RunJobTemplateRequest, ScaleTaskReply, ScaleTaskRequest, SchedulerEvent, SetNodeAvailabilityReply, SetNodeAvailabilityRequest, SetSnapshotAliasReply, SetSnapshotAliasRequest, ShowNetPolicyReply, ShowNetPolicyRequest, StartClaimReply, StartClaimRequest, StartInstanceReply, StartInstanceRequest, StartSessionReply, StartSessionRequest, StopInstanceReply, StopInstanceRequest, StopJobReply, StopJobRequest, StopRolloutReply, StopRolloutRequest, StopSessionReply, StopSessionRequest, StopSessionsReply, StopSessionsRequest, StreamEventsRequest, StreamWorkReply, StreamWorkRequest, SuspendInstanceReply, SuspendInstanceRequest, SuspendSessionsReply, SuspendSessionsRequest, TestNetPolicyReply, TestNetPolicyRequest, TriggerElectionReply, TriggerElectionRequest, UpdateNodeDynamicReply, UpdateNodeDynamicRequest, UpsertAclPolicyReply, UpsertAclPolicyRequest, UpsertAclUserReply, UpsertAclUserRequest, UpsertJobTemplateReply, UpsertJobTemplateRequest, UpsertNetPluginReply, UpsertNetPluginRequest, UpsertNetPolicyReply, UpsertNetPolicyRequest, UpsertSavedStateQueryReply, UpsertSavedStateQueryRequest, WarmSnapshotReply, WarmSnapshotRequest, WhoAmIReply, WhoAmIRequest, WorkerPreRegisterReply, WorkerPreRegisterRequest, WorkerRegisterReply, WorkerRegisterRequest } from "./legion_pb.js";
+import { AcquireKvLockReply, AcquireKvLockRequest, AdvanceRolloutReply, AdvanceRolloutRequest, ApplyNamespacePolicyReply, ApplyNamespacePolicyRequest, ApplyNamespaceReply, ApplyNamespaceRequest, CreateAclTokenReply, CreateAclTokenRequest, CreateExecKeyReply, CreateExecKeyRequest, CreateInstanceReply, CreateInstanceRequest, CreateInstancesReply, CreateInstancesRequest, CreateJoinTokenReply, CreateJoinTokenRequest, CreateSnapshotReply, CreateSnapshotRequest, DeleteAclPolicyReply, DeleteAclPolicyRequest, DeleteAclTokenReply, DeleteAclTokenRequest, DeleteAclUserReply, DeleteAclUserRequest, DeleteExecKeyReply, DeleteExecKeyRequest, DeleteJobTemplateReply, DeleteJobTemplateRequest, DeleteJoinTokenReply, DeleteJoinTokenRequest, DeleteKvReply, DeleteKvRequest, DeleteNamespacePolicyReply, DeleteNamespacePolicyRequest, DeleteNamespaceReply, DeleteNamespaceRequest, DeleteNetPluginReply, DeleteNetPluginRequest, DeleteNetPolicyReply, DeleteNetPolicyRequest, DeleteSavedStateQueryReply, DeleteSavedStateQueryRequest, DeleteSnapshotAliasReply, DeleteSnapshotAliasRequest, DeleteSnapshotReply, DeleteSnapshotRequest, DeleteVolumeReply, DeleteVolumeRequest, DestroyInstanceReply, DestroyInstanceRequest, DestroyJobReply, DestroyJobRequest, ExecClientFrame, ExecServerFrame, FetchDatapathMaterialReply, FetchDatapathMaterialRequest, FetchRootKeyReply, FetchRootKeyRequest, ForkInstanceReply, ForkInstanceRequest, GetAclPolicyReply, GetAclPolicyRequest, GetAllocationLogsReply, GetAllocationLogsRequest, GetAppReply, GetAppRequest, GetArtifactCredentialReply, GetArtifactCredentialRequest, GetAuthMethodsReply, GetAuthMethodsRequest, GetHeartbeatCadenceReply, GetHeartbeatCadenceRequest, GetInstanceReply, GetInstanceRequest, GetJobInfoReply, GetJobInfoRequest, GetJobScaleStatusReply, GetJobScaleStatusRequest, GetJobSpecByConfigRequest, GetJobSpecReply, GetJobSpecRequest, GetJobTemplateReply, GetJobTemplateRequest, GetKeyringStatusReply, GetKeyringStatusRequest, GetKvLockReply, GetKvLockRequest, GetKvReply, GetKvRequest, GetLedgerReply, GetLedgerRequest, GetManagerConfigsReply, GetManagerConfigsRequest, GetMeshCaReply, GetMeshCaRequest, GetNamespacePolicyReply, GetNamespacePolicyRequest, GetNamespaceReply, GetNamespaceRequest, GetNetPluginReply, GetNetPluginRequest, GetNetPluginStatusReply, GetNetPluginStatusRequest, GetNetPolicyObjectReply, GetNetPolicyObjectRequest, GetNodeContentReply, GetNodeContentRequest, GetNodeReply, GetNodeRequest, GetNodesReply, GetNodesRequest, GetNodeUsageReply, GetNodeUsageRequest, GetObservabilityReply, GetObservabilityRequest, GetRaftJoinTokenReply, GetRaftJoinTokenRequest, GetRaftStatusReply, GetRaftStatusRequest, GetRolloutReply, GetRolloutRequest, GetRolloutStatusReply, GetRolloutStatusRequest, GetScalingInputsReply, GetScalingInputsRequest, GetSchedulerConcurrencyReply, GetSchedulerConcurrencyRequest, GetSessionReply, GetSessionRequest, GetSnapshotReply, GetSnapshotRequest, GetStateBackupReply, GetStateBackupRequest, GetStateStoreSchemaReply, GetStateStoreSchemaRequest, GetTaskLogsReply, GetTaskLogsRequest, GetVolumeReply, GetVolumeRequest, HealthCheckReply, HealthCheckRequest, HeartbeatReply, HeartbeatRequest, InstallAppReply, InstallAppRequest, IssueBootTicketReply, IssueBootTicketRequest, IssueNodeCertificateReply, IssueNodeCertificateRequest, IssueNodeIdentityTokenReply, IssueNodeIdentityTokenRequest, IssueRaftCommandReply, IssueRaftCommandRequest, IssueWorkloadIdentityTokenReply, IssueWorkloadIdentityTokenRequest, JoinRaftClusterReply, JoinRaftClusterRequest, ListAclPoliciesReply, ListAclPoliciesRequest, ListAclTokensReply, ListAclTokensRequest, ListAclUsersReply, ListAclUsersRequest, ListAppsReply, ListAppsRequest, ListBootTicketsReply, ListBootTicketsRequest, ListEventsReply, ListEventsRequest, ListExecKeysReply, ListExecKeysRequest, ListGrantsReply, ListGrantsRequest, ListInstancesReply, ListInstancesRequest, ListJobActionsReply, ListJobActionsRequest, ListJobSpecHistoryReply, ListJobSpecHistoryRequest, ListJobsReply, ListJobsRequest, ListJobTemplatesReply, ListJobTemplatesRequest, ListJoinTokensReply, ListJoinTokensRequest, ListKvReply, ListKvRequest, ListManagersReply, ListManagersRequest, ListNamespacePoliciesReply, ListNamespacePoliciesRequest, ListNamespacesReply, ListNamespacesRequest, ListNetPluginsReply, ListNetPluginsRequest, ListNetPoliciesReply, ListNetPoliciesRequest, ListNodeUsageReply, ListNodeUsageRequest, ListRaftHistoryReply, ListRaftHistoryRequest, ListRolloutEventsReply, ListRolloutEventsRequest, ListRolloutsReply, ListRolloutsRequest, ListSavedStateQueriesReply, ListSavedStateQueriesRequest, ListServiceEdgesReply, ListServiceEdgesRequest, ListServicesReply, ListServicesRequest, ListSessionNodesReply, ListSessionNodesRequest, ListSnapshotsReply, ListSnapshotsRequest, ListVolumeDriversReply, ListVolumeDriversRequest, ListVolumesReply, ListVolumesRequest, LoginReply, LoginRequest, MintExecTicketReply, MintExecTicketRequest, NodeLivenessDigestReply, NodeLivenessDigestRequest, PatchKvReply, PatchKvRequest, PlanJobReply, PlanJobRequest, PostWorkReply, PostWorkRequest, ProbeReply, ProbeRequest, PromoteInstanceReply, PromoteInstanceRequest, PutKvReply, PutKvRequest, QuerySessionsReply, QuerySessionsRequest, QueryStateStoreReply, QueryStateStoreRequest, RaftLaneReply, RaftLaneRequest, RatifyClaimReply, RatifyClaimRequest, ReleaseKvLockReply, ReleaseKvLockRequest, RenderJobTemplateReply, RenderJobTemplateRequest, RenewKvLockReply, RenewKvLockRequest, ReplaceInstanceReply, ReplaceInstanceRequest, ResetKeyringReply, ResetKeyringRequest, ResolveServiceReply, ResolveServiceRequest, RestartWorkerReply, RestartWorkerRequest, RestoreInstanceReply, RestoreInstanceRequest, ResumeSessionReply, ResumeSessionRequest, RevokeGrantReply, RevokeGrantRequest, RewrapKvReply, RewrapKvRequest, RewrapRootKeyReply, RewrapRootKeyRequest, RotateDataKeyReply, RotateDataKeyRequest, RotateMeshCaReply, RotateMeshCaRequest, RunJobReply, RunJobRequest, RunJobTemplateReply, RunJobTemplateRequest, ScaleTaskReply, ScaleTaskRequest, SchedulerEvent, SetAppConfigReply, SetAppConfigRequest, SetAppEnabledReply, SetAppEnabledRequest, SetNodeAvailabilityReply, SetNodeAvailabilityRequest, SetSnapshotAliasReply, SetSnapshotAliasRequest, ShowNetPolicyReply, ShowNetPolicyRequest, StartClaimReply, StartClaimRequest, StartInstanceReply, StartInstanceRequest, StartSessionReply, StartSessionRequest, StopInstanceReply, StopInstanceRequest, StopJobReply, StopJobRequest, StopRolloutReply, StopRolloutRequest, StopSessionReply, StopSessionRequest, StopSessionsReply, StopSessionsRequest, StreamEventsRequest, StreamWorkReply, StreamWorkRequest, SuspendInstanceReply, SuspendInstanceRequest, SuspendSessionsReply, SuspendSessionsRequest, TestNetPolicyReply, TestNetPolicyRequest, TriggerElectionReply, TriggerElectionRequest, UninstallAppReply, UninstallAppRequest, UpdateAppSettingsReply, UpdateAppSettingsRequest, UpdateNodeDynamicReply, UpdateNodeDynamicRequest, UpgradeAppReply, UpgradeAppRequest, UpsertAclPolicyReply, UpsertAclPolicyRequest, UpsertAclUserReply, UpsertAclUserRequest, UpsertJobTemplateReply, UpsertJobTemplateRequest, UpsertNetPluginReply, UpsertNetPluginRequest, UpsertNetPolicyReply, UpsertNetPolicyRequest, UpsertSavedStateQueryReply, UpsertSavedStateQueryRequest, WarmSnapshotReply, WarmSnapshotRequest, WhoAmIReply, WhoAmIRequest, WorkerPreRegisterReply, WorkerPreRegisterRequest, WorkerRegisterReply, WorkerRegisterRequest } from "./legion_pb.js";
 import { MethodKind } from "@bufbuild/protobuf";
 
 /**
@@ -3259,6 +3259,185 @@ export const Manager = {
       name: "RevokeGrant",
       I: RevokeGrantRequest,
       O: RevokeGrantReply,
+      kind: MethodKind.Unary,
+    },
+    /**
+     * Lists installed apps (docs/apps.md): each app's record, settings, grant,
+     * status, and where it runs. Requires `app:read`; the list is filtered to
+     * the apps the caller may read (`names` selector).
+     *
+     * An app is a job in the reserved `legion-system` namespace, a grant (what
+     * that job's `legion` identity may do), and registrations. Its status is
+     * derived when it is read: `stopped` (disabled), `degraded` (the
+     * reconciler's last pass failed, or fewer replicas run than asked for),
+     * `pending` (nothing runs yet, with why), or `running`.
+     *
+     * @generated from rpc legion.Manager.ListApps
+     */
+    listApps: {
+      name: "ListApps",
+      I: ListAppsRequest,
+      O: ListAppsReply,
+      kind: MethodKind.Unary,
+    },
+    /**
+     * Shows one app: everything ListApps reports, plus its manifest, config,
+     * and the reconciler's last action, error, and build marker. Requires
+     * `app:read` on the app.
+     *
+     * Errors:
+     * - NotFound: no app of that name is installed.
+     *
+     * @generated from rpc legion.Manager.GetApp
+     */
+    getApp: {
+      name: "GetApp",
+      I: GetAppRequest,
+      O: GetAppReply,
+      kind: MethodKind.Unary,
+    },
+    /**
+     * Installs an app from a manifest (`legion app install <file|url>`).
+     * Requires `app:write` on the app's name, and every permission the
+     * manifest asks for: the same grant check a job submit runs (docs/
+     * workload-identity.md, "Permissions"), against the installer. The grant
+     * is recorded on the app record in the installer's name, and the app
+     * reconciler then submits the app's job in `legion-system`.
+     *
+     * `dry_run` validates the manifest and the installer's coverage and
+     * returns the prompt (`prompt`) without installing, which is how the CLI
+     * shows what the app runs, where, as whom, and with what grant before it
+     * asks. A dry run that the grant check would refuse still answers, with
+     * the refusal in `uncovered`.
+     *
+     * Retry-safe: a repeated `idempotency_key` returns the first reply with
+     * `deduplicated` set.
+     *
+     * Errors:
+     * - InvalidArgument: the manifest does not parse or validate (unknown
+     *   fields, a bad name, a missing `version`, a config schema that does
+     *   not compile or has a remote `$ref`, a default that fails it, a job
+     *   fragment that does not parse), or `config_json` fails the schema.
+     * - PermissionDenied: the caller lacks `app:write`, or a permission the
+     *   manifest asks for.
+     * - AlreadyExists: an app of that name is installed (use UpgradeApp).
+     * - FailedPrecondition: the name is a bundled app's.
+     *
+     * @generated from rpc legion.Manager.InstallApp
+     */
+    installApp: {
+      name: "InstallApp",
+      I: InstallAppRequest,
+      O: InstallAppReply,
+      kind: MethodKind.Unary,
+    },
+    /**
+     * Replaces an installed app's manifest (`legion app upgrade`). Requires
+     * `app:write` and, because a new manifest changes the code the app runs,
+     * every permission the new manifest asks for, checked against the caller
+     * as at install.
+     *
+     * The reply carries the permission diff. When the new manifest asks for a
+     * permission the recorded grant does not hold, nothing changes unless
+     * `approve` is set: the reply has `upgraded = false` and the diff, so the
+     * CLI can ask. A manifest that only keeps or drops permissions upgrades
+     * without `approve`. The stored config is checked against the new
+     * schema; a config that no longer matches refuses the upgrade.
+     *
+     * Retry-safe with `idempotency_key`.
+     *
+     * Errors:
+     * - NotFound: no app of that name.
+     * - InvalidArgument: the manifest is invalid, names another app, or the
+     *   stored config fails its schema.
+     * - PermissionDenied: the caller lacks `app:write` or a permission.
+     * - FailedPrecondition: the app is bundled (bundled apps upgrade with the
+     *   binary).
+     *
+     * @generated from rpc legion.Manager.UpgradeApp
+     */
+    upgradeApp: {
+      name: "UpgradeApp",
+      I: UpgradeAppRequest,
+      O: UpgradeAppReply,
+      kind: MethodKind.Unary,
+    },
+    /**
+     * Uninstalls an app (`legion app uninstall`): stops its job, revokes the
+     * job's grants, and deletes the record. The stopped job stays in
+     * `legion-system` until someone destroys it. Requires `app:write`.
+     *
+     * Retry-safe with `idempotency_key`; uninstalling an app that is not
+     * installed is NotFound.
+     *
+     * Errors:
+     * - FailedPrecondition: the app is bundled; disable it instead.
+     *
+     * @generated from rpc legion.Manager.UninstallApp
+     */
+    uninstallApp: {
+      name: "UninstallApp",
+      I: UninstallAppRequest,
+      O: UninstallAppReply,
+      kind: MethodKind.Unary,
+    },
+    /**
+     * Enables or disables an app (`legion app enable|disable`). Disabling
+     * stops the app's job and keeps its record, config, and grant; enabling
+     * runs it again. Requires `app:write`. Setting the state an app already
+     * has is a write too: it retries a reconcile the last failure parked.
+     *
+     * Retry-safe with `idempotency_key`.
+     *
+     * @generated from rpc legion.Manager.SetAppEnabled
+     */
+    setAppEnabled: {
+      name: "SetAppEnabled",
+      I: SetAppEnabledRequest,
+      O: SetAppEnabledReply,
+      kind: MethodKind.Unary,
+    },
+    /**
+     * Changes an app's settings (`legion app set`): replicas, placement, the
+     * pool for worker placement, and CPU and memory per task. The reconciler
+     * re-renders the job and rolls it. Requires `app:write`.
+     *
+     * Retry-safe with `idempotency_key`.
+     *
+     * Errors:
+     * - InvalidArgument: replicas outside 1-32, an unknown placement, a pool
+     *   with `managers` placement, a zero resource.
+     *
+     * @generated from rpc legion.Manager.UpdateAppSettings
+     */
+    updateAppSettings: {
+      name: "UpdateAppSettings",
+      I: UpdateAppSettingsRequest,
+      O: UpdateAppSettingsReply,
+      kind: MethodKind.Unary,
+    },
+    /**
+     * Replaces an app's config (`legion app config set`), validated against
+     * the manifest's config schema. The reconciler renders it into the job as
+     * a file (`$LEGION_APP_CONFIG`) and rolls the job: the job's version
+     * history is the config's history. Requires `app:write`; a change to any
+     * of the manifest's `codeFields` (plugin sources, endpoints the app runs)
+     * also requires every permission of the app's recorded grant, as install
+     * does, so `app:write` is never a path to the app's grant.
+     *
+     * Retry-safe with `idempotency_key`.
+     *
+     * Errors:
+     * - InvalidArgument: `config_json` is not JSON or fails the schema.
+     * - PermissionDenied: a code field changed and the caller does not hold
+     *   the app's grant.
+     *
+     * @generated from rpc legion.Manager.SetAppConfig
+     */
+    setAppConfig: {
+      name: "SetAppConfig",
+      I: SetAppConfigRequest,
+      O: SetAppConfigReply,
       kind: MethodKind.Unary,
     },
     /**

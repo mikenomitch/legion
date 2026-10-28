@@ -142,6 +142,11 @@ Plans, roadmaps, to-do lists, and development notes live in
   intermediate from your own PKI (`file`) or an external signer such as
   Vault PKI (`exec`), with every certificate checked, managers checked for
   agreement, and rotation per provider.
+- [Apps](apps.md): Legion's add-ons as jobs in `legion-system` with a granted
+  identity, kept running by the app reconciler. Covers the manifest,
+  placement on the managers' system workers, install and upgrade with a
+  permission prompt, config and code fields, how direct edits are reverted,
+  bundled apps rolling with the build, and `legion app`.
 - [Workload Identity (OIDC)](workload-identity.md): short-lived, verifiable task
   identity for external providers.
 - [Exec & Actions](exec-and-actions.md): running commands inside a workload,

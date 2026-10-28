@@ -371,7 +371,8 @@ how to measure), see
 ## The system worker
 
 Every manager runs one in-process worker for Legion's own operational jobs
-by default. A single manager with no workers joined can therefore run them,
+by default: the [apps](apps.md) with `placement = "managers"`, the bundled
+autoscaler among them. A single manager with no workers joined can therefore run them,
 they keep running when every worker is full, and they are never on a node a
 cluster's own scale-in might drain. One per manager, so they fail over
 across managers.
@@ -392,7 +393,7 @@ systemWorker = {
 | `enabled` | `true` | Run it. `false` keeps the manager free of allocations; jobs in `legion-system` then need a worker whose type accepts that namespace |
 | `namespaces` | `["legion-system"]` | The namespaces it accepts, as names or globs ([node restrictions](namespaces.md#nodes-that-accept-only-some-namespaces)). `*` skips reserved names, so "everything" is `["*", "legion-*"]` |
 | `resources` | `{ cpu = 1000, memory = 1024 }` | The lend, in MHz and MiB: the node's whole capacity as the scheduler sees it, and its kernel ceiling where the node can enforce one |
-| `appUser` | `"nobody"` | The unprivileged user Legion's bundled apps run as. Must not be root. Reserved for those apps: no shipped feature reads it yet |
+| `appUser` | `"nobody"` | The unprivileged user [apps](apps.md)' `exec` tasks run as when their manifest names none. Must not be root. Keep it the same on every manager: the leading manager's value is rendered into the apps' jobs |
 | `port` | `4849` | Its worker plane port |
 
 What the manager registers:

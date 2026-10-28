@@ -21,8 +21,19 @@ registration-pinned node `namespaces` and `legion.role`; docs:
 29-41 record where A2 differs: a token resolves its grant through a
 `grant:alloc/<id>` reference (entry 29), grants are per task (entry 33),
 registration pins from the token for in-process workers (entry 32), and
-sandboxes get the token file but no socket yet (entry 37). A3-A6 are not
-built. It has six phases (§8),
+sandboxes get the token file but no socket yet (entry 37). **A3 shipped
+2026-10-28** (app manifests and Control-lane records; the app reconciler
+with the `managedBy` digest stamp, per-transition idempotency keys, revert
+of direct edits, restart of stopped jobs, backoff and parked refusals;
+`legion:self`; the build marker from a new worker-reported `buildId`;
+seeding with the `apps` block; the `app` ACL resource, eight RPCs,
+`legion app`, app events, `legion_apps{status}`, and the MCP read tools;
+docs: [apps.md](../../docs/apps.md)). Calls entries 42-57 record where A3
+differs: the reconciler submits as an identity holding exactly the recorded
+grant (entry 42), bundled apps cannot be uninstalled (entry 43), only
+`artifact = true` code fields become artifacts (entry 46), and workload
+identity stays off by default, so apps hold no credentials until it is on
+(entry 56). A4-A6 are not built. It has six phases (§8),
 and each ships alone. The first consumer is the autoscaler
 ([autoscaler-v2-plan.md](autoscaler-v2-plan.md)). GitOps is the second, and
 this plan checks the substrate against it (§6.8). Deliberately deferred:

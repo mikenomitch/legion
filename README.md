@@ -44,6 +44,8 @@ still be happy with at fifty thousand nodes.
   [rollouts](docs/rollouts.md), [ACLs](docs/auth-and-acls.md) on by default,
   [namespaces](docs/namespaces.md) with per-team quotas,
   [workload identity (OIDC)](docs/workload-identity.md), and a [web UI](#web-ui).
+  Add-ons run as [apps](docs/apps.md): jobs on the managers that Legion keeps
+  running, each with a grant it shows you before you install it.
 - **Readable job specs.** [Nickel](docs/configuration-language.md) gives you
   types, imports, and functions for DRY specs. You don't need YAML or Helm
   charts.

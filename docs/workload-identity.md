@@ -972,6 +972,11 @@ granted `kv:write certs/*` keeps it after the person who submitted it loses
 it, until someone revokes the grant or resubmits the job without that access
 (which is refused).
 
+[Apps](apps.md) use the same mechanism: an app's manifest lists the
+`permissions` its job's `legion` identity asks for, the check runs against
+whoever installs or upgrades the app, and the app reconciler renders the
+recorded grant into the app's job ([App grants](auth-and-acls.md#app-grants)).
+
 ### The API socket
 
 Every allocation whose task declares the `legion` identity gets a unix socket

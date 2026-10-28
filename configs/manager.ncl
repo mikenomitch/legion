@@ -48,6 +48,21 @@
     # Its worker plane port. A standalone worker on this host keeps 4848.
     port = 4849,
   },
+  # Seed-time settings for the apps bundled with Legion (docs/apps.md,
+  # "Seeding"), by app name. Read ONLY when the first Control leader seeds an
+  # app's record on a new cluster; after that `legion app` is the interface,
+  # and a manager that finds this block for an existing app logs that it was
+  # not applied. Leave it out to seed every bundled app enabled, with its
+  # manifest's defaults.
+  #
+  # apps = {
+  #   autoscaler = {
+  #     enabled = false,          # seed it disabled (`legion app enable` later)
+  #     placement = "managers",   # managers | workers | any
+  #     replicas = 1,
+  #     config = { plugins = {} },  # validated against its config schema
+  #   },
+  # },
   # Edge boot (docs/edge-boot.md): boot tickets and edge-initiated starts.
   # OFF BY DEFAULT, and turning it on is an explicit security decision — it
   # grants nodes the ability to start work on a capability, growing a
