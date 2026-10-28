@@ -30,12 +30,15 @@ const WAIT_DEFAULT: Duration = Duration::from_secs(60);
 /// `legion scaling apply`.
 pub fn apply_command() -> Command {
     Command::new("apply")
-        .about("Create or update a standalone scaling policy from a Nickel or JSON file")
+        .about("Create or update a standalone scaling policy or a node group from a Nickel or JSON file")
         .long_about(
             "A standalone policy scales something that is not a Legion task, through a target \
              plugin installed in the autoscaler's app config (or the built-in noop target). \
              The file is the jobspec autoscale record plus name, namespace, description and \
-             target = { plugin, config }, with min, max and checks required.",
+             target = { plugin, config }, with min, max and checks required. A node group \
+             (target = { nodes = { pool, workerType, shape, plugin, config } }, with max \
+             required) is cluster-scoped and needs operator:write and node:write \
+             (docs/autoscaling.md, \"Node groups\").",
         )
         .arg(
             Arg::new("file")
@@ -88,7 +91,7 @@ pub fn list_command() -> Command {
 /// `legion scaling delete`.
 pub fn delete_command() -> Command {
     Command::new("delete")
-        .about("Delete a standalone scaling policy")
+        .about("Delete a standalone scaling policy or a node group")
         .arg(
             Arg::new("name")
                 .required(true)

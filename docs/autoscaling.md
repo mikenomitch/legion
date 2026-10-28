@@ -21,9 +21,11 @@ zero replicas when idle ([Scale to zero](#scale-to-zero)). Something that
 is not a Legion task (a render farm, a fleet of VMs) gets a
 [standalone policy](#standalone-policies) with a target plugin.
 `legion scaling simulate` runs any policy over the last hour of history
-before you submit it ([Simulating a policy](#simulating-a-policy)). Node
-autoscaling (adding and removing machines) is not run yet; see
-[Known limitations](#known-limitations).
+before you submit it ([Simulating a policy](#simulating-a-policy)).
+Machines themselves scale as [node groups](#node-groups): a pool of
+workers a provider (an AWS Auto Scaling group, a script) starts when work
+is waiting that they could host, and Legion drains, terminates, and forgets
+when they sit empty.
 
 ## Task autoscaling
 
@@ -667,8 +669,9 @@ joined), and needs nothing configured: it reaches Legion through its
 allocation's API socket as its own workload identity, which workload
 identity being on by default makes available on a fresh cluster
 ([workload-identity.md](workload-identity.md)). Its grant is `scale:read`
-and `scale:write` in every namespace, and `node:read` for its node-group
-panel: it can resize, not redeploy.
+and `scale:write` and `job:read` in every namespace, and `node:read` and
+`node:write` for node groups (join tokens, drains, forgetting nodes): it
+can resize, and read jobs, but not redeploy.
 
 It watches policies (`WatchScalingPolicies`: a full set whenever a job,
 a standalone policy, a pause, the defaults, a namespace policy, or its own
@@ -682,6 +685,7 @@ reports (`ReportScalingStatus`, which is also its heartbeat). Its config
 | `interval` | `"15s"` | How often every policy is evaluated. |
 | `mode` | `"enforce"` | `"dry-run"` forces every policy into dry-run: a cluster-wide trial. |
 | `plugins` | `{}` | The installed sources, strategies, and targets beyond the built-ins ([Plugins](#plugins)). |
+| `identities` | `[]` | Workload identities its job gets beside its own `legion` one, as a task's `identities` ([workload-identity.md](workload-identity.md)): a token whose audience a cloud trusts, which a plugin exchanges for credentials (the `aws-asg` plugin's `webIdentityTokenFile`). Changing it needs the app's whole grant. |
 
 **When the app is gone, the manager says so.** With no report for three of
 the app's intervals, `legion scaling status` reads
@@ -816,9 +820,11 @@ $ legion scaling delete render-farm -n media
   decisions and events and changes nothing), an `exec` builtin, or an
   installed plugin. `target.config` is passed to it as data. Each
   evaluation asks the target for its count (`target/status`); a change is
-  recorded in the policy's history first (so a pause refuses it on the
-  server) and then made (`target/scale`). A failed `target/scale` adds a
-  `failed` history row and reports `error`.
+  recorded first as an action intent on the policy (so a pause refuses it
+  on the server, and two autoscaler replicas cannot both make it: [No
+  duplicate actions](#no-duplicate-actions)), then made (`target/scale`),
+  then closed with its outcome. A failed `target/scale` adds a `failed`
+  history row and reports `error`.
 - **`--dry-run`** validates, resolves, and diffs against the stored version
   (`max: 10 -> 20`) without writing. Applying an unchanged file writes
   nothing and keeps the version. **`--wait`** waits until the autoscaler
@@ -830,16 +836,157 @@ $ legion scaling delete render-farm -n media
   (kind `external`). `pause --all` covers them too. Deleting a policy
   deletes its pause; its history stays until the cap ages it out.
 - **Node groups** (`target = { nodes = … }`) are standalone policies too,
-  cluster-scoped, needing `operator:write` and `node:write`. They are not
-  run yet: `scaling apply` refuses one, and `legion scaling demand -f`
-  sizes it ([Capacity demand](#capacity-demand)).
+  cluster-scoped, needing `operator:write` and `node:write`
+  ([Node groups](#node-groups)).
 
 The `exec` builtin runs one command per operation, volume-driver style: the
-operation (`status`, `scale`) appended to the command (a script's `$1`), a JSON request on
+operation (`status`, `scale`, and for a node group `terminate`) appended to
+the command (a script's `$1`), a JSON request on
 stdin (`{ "apiVersion": 1, "op": "scale", "policy": "media/render-farm",
 "config": { "pool": "gpu" }, "desired": 9, "decision": "d-81f3a2c0" }`), and
 a JSON reply on stdout (`status` answers `{ "count": 7, "ready": 7 }`). The
 command comes from the app config, never the policy.
+## Node groups
+
+A **node group** is a pool plus a template: machines a provider (an AWS
+Auto Scaling group, a script, a cloud API) starts and stops, that join
+Legion as workers carrying `legion.nodegroup = <name>`. The autoscaler grows
+a group when work is waiting that its nodes could host, and shrinks it by
+draining, terminating, and forgetting members that sit empty.
+
+```nickel
+# nodes.ncl  —  legion scaling apply nodes.ncl
+{
+  name = "workers-general",
+  target = {
+    nodes = {
+      pool = "default",
+      workerType = "default",
+      # What a member looks like before one has joined (to scale from zero).
+      shape = { cpu = 8000, memory = 16384, attributes = { arch = "amd64" } },
+      plugin = "aws-asg",
+      config = { asg = "legion-workers", joinTokenParameter = "/legion/workers-general/join" },
+    },
+  },
+  min = 0,
+  max = 20,
+  up   = { step = { percent = 100, replicas = 5 }, every = "2m", joinTimeout = "10m" },
+  down = { when = "empty", for = "10m", step = { percent = 10, replicas = 1 },
+           every = "5m", drainDeadline = "10m" },
+}
+```
+
+```console
+$ legion scaling apply nodes.ncl
+scaling policy workers-general: created (v4)
+$ legion scaling status
+ TARGET           | KIND  | NOW | WANT | BOUNDS | MODE    | STATE    | LAST
+------------------+-------+-----+------+--------+---------+----------+----------------------------
+ workers-general  | nodes | 3   | 5    | 0..20  | enforce | scaled   | 3 → 5 4s ago (autoscaler)
+$ legion scaling explain workers-general --standalone
+$ legion scaling history workers-general --standalone
+$ legion scaling pause workers-general --standalone --for 1h
+$ legion scaling delete workers-general
+```
+
+A node group is **cluster-scoped**: it has no namespace, and applying,
+deleting, or pausing one needs `operator:write` and `node:write` (a job
+owner with broad `scale:write` cannot add machines). Its name may not be
+the name of a standalone policy in the `default` namespace, and the reverse:
+both are addressed by the bare name. It is listed, and its status and
+history read, with `node:read`.
+
+| Field | Default | Meaning |
+| --- | --- | --- |
+| `name` | (required) | Lowercase letters, digits, `-`; at most 63. Every member carries it as `legion.nodegroup`. |
+| `target.nodes.pool` | the worker type's | The pool members join. |
+| `target.nodes.workerType` | `default` | The worker type members join as (the join token's type). |
+| `target.nodes.shape` | none | `cpu` (MHz), `memory` (MiB), `cores`, `attributes`, `resources`, `maxAllocations` of a member: needed to scale from zero. Once a member has joined, its observed capacity is the template. |
+| `target.nodes.plugin` | (required) | A target plugin that declares the `nodes` capability: `aws-asg`, or the `exec` builtin. |
+| `target.nodes.config` | `{}` | The plugin's per-group settings, checked against its schema. |
+| `min` / `max` | `0` / (required) | The group's floor and ceiling. A floor applies at once. |
+| `up.step` / `up.every` | `{ percent = 100, replicas = 5 }` / `"2m"` | At most this many nodes added per window (the larger half). |
+| `up.joinTimeout` | `"10m"` | How long new nodes have to join before the group backs off for one timeout. |
+| `down.when` | `"empty"` | `empty`, or `underutilized` (under 50% reserved, and every allocation fits on the other members). |
+| `down.for` | `"10m"` | How long a node must qualify before it is a victim. |
+| `down.step` / `down.every` | `{ percent = 10, replicas = 1 }` / `"5m"` | At most this many drains started per window. |
+| `down.drainDeadline` | `"10m"` | A drain that outlives it is abandoned: the node is uncordoned. |
+| `expander` | `"least-waste"` | How groups that could host the same work compete. |
+| `mode` | `"enforce"` | `dry-run` records what it would do (`legion scaling history`). |
+
+### Scale-up
+
+Every evaluation reads, in one `GetCapacityDemand` call for every group,
+how many nodes of each group's template the waiting work needs
+([Capacity demand](#capacity-demand)), net of the nodes already asked for
+that have not joined. The **expander** picks one group per evaluation
+(least waste: the group whose new nodes would sit least idle), the step
+limit and `max` cap the count, and the autoscaler:
+
+1. mints a join token for the group: `max_uses` set to the nodes it is
+   adding, `legion.nodegroup = <name>` (and the shape's attributes) stamped
+   on every node that joins with it, expiring after twice `joinTimeout`;
+2. calls the plugin's `target/scale` with the new count and
+   `join = { token, attributes }`. The plugin hands the token to the new
+   machines (`aws-asg` writes it to an SSM parameter their user data reads);
+3. each machine joins with `legion join --token-file … --attr
+   legion.provider-id=$(instance-id)`.
+
+Nodes that have not joined within `joinTimeout` are reported
+(`nodegroup.join_timeout`), the group backs off for one `joinTimeout`, and
+the count the provider holds is taken from its status. A provider whose
+count was changed by someone else is followed, not fought.
+
+### Scale-in
+
+A member is a **victim** once it has been empty (or, with `underutilized`,
+under half reserved, with every allocation fitting on the other members by
+the scheduler's own rules) for `down.for`. Per-node `count.per = "id"`
+allocations and session envelopes with no live sessions do not make a node
+busy. A node is **never** a victim when it:
+
+- runs a `legion-system` allocation (the autoscaler itself, placed on
+  workers);
+- holds stateful node-local storage;
+- is tagged `legion.scale-in = "never"`;
+- would take a task below its `disruption.minAvailable` (or a gang below
+  its quorum) if drained;
+- has no `legion.provider-id`, shares one with another member, or names an
+  instance the provider does not list: terminating it would stop no
+  machine, or the wrong one.
+
+At most `down.step` victims start per `down.every`, never taking the group
+below `min`, and never while the group is growing, has waiting work it
+could host, or waits for a scale-up to join. Each victim is then:
+
+1. **cordoned and drained** (`SetNodeAvailability`, evict);
+2. once empty, **terminated** (`target/terminate` with its provider id;
+   asked again every 2 minutes until the provider stops listing it);
+3. **forgotten** (`ForgetNode`, which also revokes its node token, so a
+   machine whose termination failed cannot come back under its old
+   identity).
+
+A drain that outlives `drainDeadline`, or that someone uncordons, is
+abandoned: the node is uncordoned and `nodegroup.scale_in` says
+`aborted`. A pause aborts drains that have not reached terminate.
+
+### No duplicate actions
+
+Everything a node group does outside Legion is recorded first. Before the
+autoscaler calls `target/scale`, starts a drain, calls `target/terminate`,
+or forgets a node, it opens an **action intent** on the group
+(`RecordScalingAction`, compare-and-set on the group's action version): the
+count it is asking for, the nodes it is draining, terminating, and
+forgetting, and every drain in flight. Only the writer whose version still
+matches acts; two autoscaler replicas whose leases overlap cannot both
+resize the group or drain different victims. When the calls return, the
+intent is closed with its outcome. An intent left open by a replica that
+died is closed as `reconciled` by the next owner once it is older than any
+target call can take, after checking the provider's status, and the drains
+it recorded are resumed. `legion scaling history workers-general
+--standalone` shows each step: `scaled`, `drain`, `terminate`, `forget`,
+`uncordon`, and `failed`.
+
 ## Scaling by hand
 
 `legion job scale` changes how many copies of a task run. It does not create a
@@ -1199,6 +1346,16 @@ is the caller's job.
   number of new nodes of these shapes will place them.
 - `awaiting_scheduler`, and `truncated` when the pending work is larger than
   one call simulates (20,000 replicas; node counts are then a floor).
+- With a template's `members` (the autoscaler sets it), per group the
+  members: every node whose `legion.nodegroup` is the template's name, with
+  its provider id, `legion.scale-in` tag, reserved CPU and memory share,
+  and each allocation's kind (work, a session envelope with its live
+  sessions, a per-node `count.per` task), node-local storage, and whether
+  draining the node would take the task below its `disruption.minAvailable`
+  (or a gang below its quorum). With `fit_check`, each live member under
+  half reserved also says whether its allocations fit on the group's other
+  live members (`fits_elsewhere`, packed by the same rules, onto their free
+  capacity), which is what `down.when = "underutilized"` needs.
 
 The same read is the MCP tool `legion_scaling_demand` (read-only).
 
@@ -1222,11 +1379,12 @@ and counts them in `awaiting_scheduler_redacted`.
 - A task group with one short member is sized as if the group's short tasks
   move together, which is what a group placement needs.
 - It is a point-in-time read with no memory: a caller that wants
-  stabilization keeps it.
-- Nothing calls it on a schedule yet. The node-group policy shape and its
-  decision engine exist as a library (`src/autoscaler/nodes.rs`); running node
-  groups (minting tokens, calling a provider, draining and forgetting nodes)
-  is not built.
+  stabilization keeps it (the autoscaler does, for its [node
+  groups](#node-groups)).
+- The fits-elsewhere simulation does not know which static ports the other
+  members' allocations hold, so it can call a node's work movable when a
+  port would clash; the scheduler still enforces ports when the drained
+  work is placed.
 
 ## Access control
 
@@ -1240,11 +1398,11 @@ a job without the right to redeploy it. See [auth-and-acls.md](auth-and-acls.md)
 | `ScaleTask` (`legion job scale`) | `scale:write` on the job |
 | `GetJobScaleStatus`, `GetScalingInputs` | `scale:read` on the job |
 | `WatchScalingPolicies` | `scale:read`; jobs and policies outside the grant are left out |
-| `GetScalingStatus`, `GetScaleHistory` | `scale:read` on the job(s) or the standalone policy |
-| `PauseScaling` | `scale:write` on the job or the standalone policy; `operator:write` for `--all` |
+| `GetScalingStatus`, `GetScaleHistory` | `scale:read` on the job(s) or the standalone policy; `node:read` for a node group |
+| `PauseScaling` | `scale:write` on the job or the standalone policy; `operator:write` and `node:write` for a node group; `operator:write` for `--all` |
 | `ApplyScalingPolicy` (`legion scaling apply`) | `scale:write` on the policy's namespace and name; a node group: `operator:write` and `node:write` |
-| `DeleteScalingPolicy` | `scale:write` on the policy, checked before the lookup |
-| `ListScalingPolicies` | `scale:read`; policies outside the grant are left out |
+| `DeleteScalingPolicy` | `scale:write` on the policy (`operator:write` and `node:write` for a node group), checked before the lookup |
+| `ListScalingPolicies` | `scale:read`; policies outside the grant are left out, and node groups need `node:read` |
 | `GetScalingDefaults` | `scale:read` on the namespace |
 | `ApplyScalingDefaults` | `operator:write` |
 | `ReportScalingStatus`, `RecordScalingAction` | app-plane: only the bundled autoscaler's own identity (or a management token) |
@@ -1272,7 +1430,11 @@ is trusted, as everywhere else.
   `scale.pinned`, `scale.paused`, `scale.resumed`, `scale.limited`,
   `scale.flapping`, and `scale.check_failed` in the event stream
   ([event-stream.md](event-stream.md)). A standalone policy's events carry
-  `policy` in their metadata instead of a job. The event journal is capped
+  `policy` in their metadata instead of a job. A node group adds
+  `nodegroup.pending` (waiting work needs its nodes, once per episode),
+  `nodegroup.join_timeout` (nodes asked for did not join), and
+  `nodegroup.scale_in` (a drain finished: `outcome` is `completed` or
+  `aborted`), with `group` in their metadata. The event journal is capped
   and best-effort; the durable record is the history.
 - The autoscaler's own log: `Scaling plugin started` (name, version,
   kinds) on every start of a plugin program, `Scaling plugin call failed`
@@ -1346,8 +1508,30 @@ is trusted, as everywhere else.
 - **A standalone policy reads `error`**: its target's `target/status` or
   `target/scale` failed. A failed scale is a `failed` row in `legion scaling
   history --standalone NAME`; the next evaluation asks the target again.
-- **`legion scaling apply` refuses a node group** (`failed_precondition`):
-  node-group policies are not run in this version.
+- **A node group reads `invalid`**: its plugin is `noop` or a source, is
+  not installed, does not declare `capabilities.nodes`, or its
+  `target.nodes.config` does not match the plugin's schema. `legion scaling
+  explain NAME --standalone` prints which.
+- **A node group grows, but nodes never join**: after `up.joinTimeout` it
+  reports `nodegroup.join_timeout` and backs off for one `joinTimeout`.
+  Check that the machines got the join token (`aws-asg`:
+  `joinTokenParameter`, and the instance role's `ssm:GetParameter`), that
+  they reach a manager, and that they pass `--attr
+  legion.provider-id=<instance id>`. A token is spent after the nodes it
+  was minted for (`max_uses`); a machine that boots later needs the next
+  scale-up's.
+- **A node that should go stays**: `legion scaling explain NAME
+  --standalone` lists `never a victim` with the rule (a `legion-system`
+  allocation, node-local storage, `legion.scale-in = "never"`,
+  `disruption.minAvailable`, or a provider id the provider does not list),
+  or why scale-in held (the group is growing or has waiting work it could
+  host, or a scale-up has not joined).
+- **A drain reads `aborted`**: its node was not empty within
+  `down.drainDeadline` (work that cannot be placed elsewhere), someone
+  uncordoned it, or the group was paused; the node is uncordoned.
+- **A node group reads `held` naming another replica**: an autoscaler
+  replica's action intent is open (another replica's lease overlapped, or a
+  replica died mid-call); it is closed as `reconciled` after 150 seconds.
 - **Inputs that read `missing` for a task that is running**: its runtime
   reports no usage (`noop`, third-party runtimes), its workers have
   `resourceEnforcement` off, or the manager its workers report to cannot
@@ -1372,11 +1556,14 @@ is trusted, as everywhere else.
   header or a plugin's API key in the app config is stored as written and
   readable with `app:read` on the autoscaler; the autoscaler redacts it
   from its own logs only.
-- **No node autoscaling.** A scale-out that does not fit waits for capacity
-  like any other placement. `GetCapacityDemand` (`legion scaling demand`)
-  reports how many nodes of a given shape would host it, and join tokens
-  take `max_uses` and `attributes` for node groups, but nothing acts on
-  that demand yet: `legion scaling apply` refuses a node-group policy.
+- **Node groups grow for work the scheduler already failed to place**, by
+  the demand's estimate (first fit, which can over-ask by a node), one
+  group per evaluation. There is no consolidation (moving work to empty
+  a node that is not underutilized), and lost nodes are not forgotten
+  automatically (`legion node forget`).
+- **A node group's scale-in clocks live in the autoscaler's memory**: after
+  a restart a node must be seen empty for a whole `down.for` again.
+  Drains in flight survive in the group's action row.
 - **Governed runtimes only.** CPU and memory come from `exec`, `container`,
   and `sandbox` tasks on workers with resource enforcement on.
 - **Requests count internal callers only**

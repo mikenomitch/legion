@@ -4486,7 +4486,7 @@ plan.
         equivalent) and extension points beyond job, group, task, volume,
         port, and service (plan §11)
 
-- [ ] **Autoscaler** (v2 plan, merged in [#57](https://github.com/mikenomitch/legion/pull/57)): [plan](plans/autoscaler-v2-plan.md) (IN EXECUTION; Phases 2, 3 and 4 in Done, Phase 5a below) ·
+- [ ] **Autoscaler** (v2 plan, merged in [#57](https://github.com/mikenomitch/legion/pull/57)): [plan](plans/autoscaler-v2-plan.md) (IN EXECUTION; Phases 2, 3, 4, 5b and 6 in Done, Phase 5a below) ·
       [calls](calls/autoscaler-v2-plan_calls.md). Supersedes
       [autoscaler-plan.md](plans/autoscaler-plan.md) ·
       [calls](calls/autoscaler-plan_calls.md), whose Phase 1 shipped and is
@@ -4597,27 +4597,31 @@ plan.
           templates with the scheduler's feasibility functions), and the
           pure node-group engine (`src/autoscaler/nodes.rs`: spec, victims
           and protections, budgets, the drain state machine, least-waste)
-    - [ ] Phase 5b: run node-group policies in the autoscaler app: mint
-          group tokens, call the provider's `target/scale|status|terminate`,
-          execute the engine's intents through `RecordScalingAction` and a
-          `scaling_action` table with compare-and-set; `node:write` back in
-          the app's grant ([calls 44](calls/autoscaler-v2-plan_calls.md));
-          lift `ApplyScalingPolicy`'s node-group refusal and store them in
-          `scaling_policy` (kind `nodes`; [calls 69](calls/autoscaler-v2-plan_calls.md));
-          the `aws-asg` plugin on the Phase 4 protocol and SDK
-    - [ ] Phase 5b engine inputs: a real fits-elsewhere simulation for
-          `underutilized` scale-in, the `disruption.minAvailable`
-          computation, and the provider-id cross-check against the
-          provider's status ([calls 62](calls/autoscaler-v2-plan_calls.md));
-          `PauseScaling` for node groups; `nodegroup.join_timeout` and
-          `nodegroup.scale_in` events
+    - [x] Phase 5b: node groups run by the autoscaler app (2026-10-28; in
+          Done)
     - [ ] Lost-node GC: forgetting nodes that stayed lost past a deadline
-          (`legion node forget` is the manual path today)
+          (`legion node forget` is the manual path today; a node group's
+          lost member is never a scale-in victim, so it lingers until
+          forgotten by hand)
+    - [ ] **The fits-elsewhere simulation ignores static ports** held on
+          the other members, and the minAvailable check is per node (two
+          victims of one task in one evaluation are not summed); the
+          scheduler still enforces both when the drained work is placed
+          ([calls 90](calls/autoscaler-v2-plan_calls.md))
+    - [ ] **A node group's scale-in clocks are in the app's memory**: after
+          a restart a member must be seen empty for a whole `down.for`
+          again (drains in flight survive in the action row)
+    - [ ] **Consolidation**: moving work off a node that is not
+          underutilized to empty it; node groups only scale in nodes that
+          are empty or whose work fits elsewhere today
+    - [ ] **The `aws-asg` plugin has no release artifact**: operators build
+          it (`cargo build --release` in `plugins/scaling/aws-asg/`) and
+          host the tarball themselves; publishing it with Legion's
+          releases is open
   - [x] Phase 6: the autoscaler's UI as app views (2026-10-28; in Done)
   - [ ] Phase 6 follow-ups: the job panel's series is the app's in-memory
         evaluation log, empty after a restart and per replica
-        ([calls 82](calls/autoscaler-v2-plan_calls.md)); the node-group
-        panel shows node-group policy state only once Phase 5b runs them
+        ([calls 82](calls/autoscaler-v2-plan_calls.md))
   - [ ] Phase 7: sharded replicas (shard leases, rebalancing) and a
         10,000-policy load test
   - [x] **Hardening:** `GetJobScaleStatus` reports through
@@ -6303,6 +6307,41 @@ findings: [kernel-classifier-findings.md](kernel-classifier-findings.md)
         (`tests/integration/autoscaler.rs`)
   - Deferred: `wake = "on-request"` (in *Deferred from v2* above)
 
+- [x] **Autoscaler Phase 5b: node groups run by the autoscaler app**
+      (2026-10-28, [plan](plans/autoscaler-v2-plan.md) §6.9, §6.11, §8 ·
+      [calls 85-94](calls/autoscaler-v2-plan_calls.md) · docs:
+      [autoscaling.md](../docs/autoscaling.md#node-groups),
+      [autoscaling-plugins.md](../docs/autoscaling-plugins.md#node-group-targets),
+      [apps.md](../docs/apps.md), [event-stream.md](../docs/event-stream.md),
+      [auth-and-acls.md](../docs/auth-and-acls.md),
+      [agent-readiness.md](../docs/agent-readiness.md))
+  - [x] Node-group `ScalingPolicy` objects (`kind = nodes`, cluster-scoped)
+        through `legion scaling apply|list|delete|explain|history|pause`;
+        `operator:write` and `node:write` to write, `node:read` to read; a
+        bare name shared with `default`'s policies is refused
+        ([calls 91](calls/autoscaler-v2-plan_calls.md); lifts
+        [calls 69](calls/autoscaler-v2-plan_calls.md))
+  - [x] The app runs them: one `GetCapacityDemand` per evaluation with every
+        group's members, `nodes::decide` and the drain machine, a join
+        token per scale-up (`max_uses`, `legion.nodegroup`, TTL twice
+        `joinTimeout`), `target/scale` with `join`, drain → `target/terminate`
+        → `ForgetNode`, the join-timeout backoff, and the
+        `nodegroup.pending|join_timeout|scale_in` events
+        ([calls 92, 94](calls/autoscaler-v2-plan_calls.md))
+  - [x] Compare-and-set action intents: `RecordScalingAction` `intent` /
+        `outcome` on a Control-lane `scaling_action` row per policy (external
+        targets too), refused while paused, reconciled after 150 seconds
+        ([calls 85-87](calls/autoscaler-v2-plan_calls.md))
+  - [x] The deferred engine inputs: the fits-elsewhere simulation,
+        `disruption.minAvailable` (and gang quorum), and the provider-id
+        cross-check ([calls 88-90](calls/autoscaler-v2-plan_calls.md))
+  - [x] `PluginHost.terminate`, `capabilities.nodes` required of a node
+        target, `exec` target `terminate`, the node-group panel's policy state
+  - [x] The first-party `aws-asg` plugin (`plugins/scaling/aws-asg/`):
+        SigV4 by hand, STS web identity / IMDSv2 / environment credentials,
+        the join token through SSM, tests against AWS's published vectors and
+        a mock AWS ([calls 93](calls/autoscaler-v2-plan_calls.md)); the app's
+        `identities` config for keyless credentials
 - [x] **Autoscaler Phase 6: the autoscaler's UI as app views** (2026-10-28,
       [plan](plans/autoscaler-v2-plan.md) §6.14, §8 ·
       [calls 82-84](calls/autoscaler-v2-plan_calls.md) · docs:

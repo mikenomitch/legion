@@ -16,8 +16,11 @@
 //!   may read (`Viewer::sees_namespace`, from the viewer's `scale:read`
 //!   namespaces), with the app's own health.
 //! - **`node`**: the node-group panel on a node's page: the group its join
-//!   token put it in, the group's members in its pool, and how many nodes
-//!   like it the pending work would need. Hidden for a node in no group.
+//!   token put it in, the group's policy state (mode, bounds, the count the
+//!   provider holds and the count wanted, the last evaluation, drains and
+//!   protected members), the group's members in its pool, and how many
+//!   nodes like it the pending work would need. Hidden for a node in no
+//!   group.
 //!
 //! The manager has already checked the viewer's declared permission
 //! (`scale:read` on the job, `node:read` on the node's pool) before any of
@@ -993,10 +996,110 @@ async fn node_view(ui: &AutoscalerUi, context: &ViewContext) -> R<AppView> {
         .filter(|member| node_group(member).as_deref() == Some(group.as_str()))
         .collect();
     let demand = demand(ui, &mut client, &group, &node.id).await;
-    Ok(render_node(&node, &group, &members, demand))
+    // The group's policy, as the autoscaler last reported it.
+    let policy = match client
+        .get_scaling_status(GetScalingStatusRequest {
+            policy: group.clone(),
+            detail: true,
+            ..Default::default()
+        })
+        .await
+    {
+        Ok(reply) => reply
+            .into_inner()
+            .targets
+            .into_iter()
+            .find(|target| target.kind == "nodes"),
+        Err(status) => {
+            if status.code() != tonic::Code::NotFound {
+                debug!(group = %group, "Reading the node group's status: {}", status.message());
+            }
+            None
+        }
+    };
+    Ok(render_node(&node, &group, &members, demand, policy.as_ref()))
 }
 
-fn render_node(node: &NodeMsg, group: &str, members: &[NodeMsg], demand: R<Demand>) -> AppView {
+/// The node group's policy state, as blocks.
+fn policy_blocks(group: &str, policy: &ScalingTargetStatus) -> Vec<Block> {
+    let mut items = vec![
+        KeyValueItem {
+            key: "Policy".to_string(),
+            value: format!("{} ({})", policy.policy_summary, policy.mode),
+            tone: None,
+            route: None,
+        },
+        KeyValueItem {
+            key: "Nodes".to_string(),
+            value: format!(
+                "{} held, {} wanted, bounds {}..{}",
+                policy.now, policy.want, policy.min, policy.max
+            ),
+            tone: None,
+            route: None,
+        },
+        KeyValueItem {
+            key: "State".to_string(),
+            value: policy.state.clone(),
+            tone: Some(state_tone(&policy.state)),
+            route: None,
+        },
+    ];
+    if !policy.summary.is_empty() {
+        items.push(KeyValueItem {
+            key: "Last evaluation".to_string(),
+            value: policy.summary.clone(),
+            tone: None,
+            route: None,
+        });
+    }
+    let mut blocks = vec![Block::KeyValue(KeyValueBlock {
+        title: Some(format!("Autoscaling {group}")),
+        items,
+    })];
+    if let Some(pause) = &policy.pause {
+        blocks.push(Block::Notice(NoticeBlock {
+            tone: Tone::Warn,
+            title: Some("Paused".to_string()),
+            text: format!(
+                "paused by {}{}: no node is added and no drain starts",
+                pause.by,
+                until(pause.until_unix_ms)
+            ),
+        }));
+    }
+    if let Ok(decision) =
+        serde_json::from_str::<crate::autoscaler::nodes::NodeDecision>(&policy.decision_json)
+    {
+        let mut lines: Vec<String> = decision
+            .victims
+            .iter()
+            .map(|victim| format!("draining {} ({})", victim.node, victim.reason))
+            .collect();
+        lines.extend(
+            decision
+                .protected
+                .iter()
+                .map(|p| format!("{} is never a victim: {}", p.node, p.protection)),
+        );
+        if !lines.is_empty() {
+            blocks.push(Block::Notice(NoticeBlock {
+                tone: Tone::Info,
+                title: Some("Scale-in".to_string()),
+                text: lines.join("; "),
+            }));
+        }
+    }
+    blocks
+}
+
+fn render_node(
+    node: &NodeMsg,
+    group: &str,
+    members: &[NodeMsg],
+    demand: R<Demand>,
+    policy: Option<&ScalingTargetStatus>,
+) -> AppView {
     let attrs = attributes(node);
     let text = |key: &str| attrs.get(key).and_then(Value::as_str).map(str::to_string);
     let token = attrs
@@ -1141,15 +1244,19 @@ fn render_node(node: &NodeMsg, group: &str, members: &[NodeMsg], demand: R<Deman
         rows,
         empty: None,
     }));
-    blocks.push(Block::Notice(NoticeBlock {
-        tone: Tone::Info,
-        title: None,
-        text: format!(
-            "Legion does not scale node groups yet: nothing adds or removes nodes in {group} on \
-             its own. The demand above is what `legion scaling demand --like-node {}` reports.",
-            node.id
-        ),
-    }));
+    match policy {
+        Some(policy) => blocks.splice(1..1, policy_blocks(group, policy)).for_each(drop),
+        None => blocks.push(Block::Notice(NoticeBlock {
+            tone: Tone::Info,
+            title: None,
+            text: format!(
+                "No node-group policy runs {group}: nothing adds or removes its nodes on its \
+                 own. `legion scaling apply` a policy named {group} to scale it. The demand \
+                 above is what `legion scaling demand --like-node {}` reports.",
+                node.id
+            ),
+        })),
+    }
     let mut view = AppView::new(blocks);
     view.title = Some(format!("Node group {group}"));
     view
@@ -1490,21 +1597,52 @@ mod tests {
         let one = node("w-1", Some("general"));
         assert_eq!(node_group(&one).as_deref(), Some("general"));
         assert!(node_group(&node("w-3", None)).is_none());
-        let view = render_node(
-            &one,
-            "general",
-            &[one.clone(), node("w-2", Some("general"))],
+        let demand = || {
             Ok(Demand {
                 nodes: 2,
                 replicas: 7,
                 pending: 9,
                 unfittable: 2,
-            }),
-        );
+            })
+        };
+        let members = [one.clone(), node("w-2", Some("general"))];
+        let view = render_node(&one, "general", &members, demand(), None);
         valid(&view, Slot::Node);
         let text = serde_json::to_string(&view).unwrap();
-        for needle in ["jt-1", "i-0abc", "/nodes/w-2", "does not scale node groups"] {
+        for needle in ["jt-1", "i-0abc", "/nodes/w-2", "No node-group policy runs general"] {
             assert!(text.contains(needle), "{needle}: {text}");
         }
+
+        // With a policy: its state, and why a member is kept.
+        let decision = json!({
+            "atMs": 1, "from": 3, "to": 3, "kind": "held", "stages": [], "victims": [],
+            "protected": [{ "node": "w-1", "protection": { "rule": "system-allocation", "job": "legion-system/autoscaler" } }],
+            "intents": [], "flags": [], "summary": "steady at 3",
+        });
+        let status = ScalingTargetStatus {
+            policy_id: "general".into(),
+            kind: "nodes".into(),
+            mode: "enforce".into(),
+            now: 3,
+            want: 3,
+            min: 1,
+            max: 10,
+            state: "ok".into(),
+            summary: "steady at 3".into(),
+            policy_summary: "nodes 1..10 via aws-asg".into(),
+            decision_json: decision.to_string(),
+            ..Default::default()
+        };
+        let view = render_node(&one, "general", &members, demand(), Some(&status));
+        valid(&view, Slot::Node);
+        let text = serde_json::to_string(&view).unwrap();
+        for needle in [
+            "Autoscaling general",
+            "3 held, 3 wanted, bounds 1..10",
+            "w-1 is never a victim: runs legion-system job legion-system/autoscaler",
+        ] {
+            assert!(text.contains(needle), "{needle}: {text}");
+        }
+        assert!(!text.contains("No node-group policy"), "{text}");
     }
 }

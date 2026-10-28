@@ -13,18 +13,19 @@
 //! - `demand`: how many nodes of each node-group template the pending work
 //!   needs ([`crate::cmd::scaling_demand`]);
 //! - `apply` / `list` / `delete`: standalone policies, for targets that are
-//!   not Legion tasks ([`crate::cmd::scaling_policy`]);
+//!   not Legion tasks, and node groups ([`crate::cmd::scaling_policy`]);
 //! - `simulate`: a policy over the last hour of history or a CSV series
 //!   ([`crate::cmd::scaling_simulate`]);
 //! - `plugin test`: the scaling-plugin conformance suite
 //!   ([`crate::cmd::scaling_plugin`]).
 //!
 //! `explain`, `history`, `pause` and `resume` take `--standalone` to name a
-//! standalone policy instead of a job.
+//! standalone policy (or a node group) instead of a job.
 //!
 //! Every subcommand takes `--json`/`-j` and emits the standard
 //! [`crate::cmd::output`] envelope.
 
+use crate::autoscaler::nodes::{NodeDecision, NodeIntent};
 use crate::autoscaler::{Decision, Stage};
 use crate::cmd::helpers::{
     active_namespace, connect_manager_client, json_flag, list_namespace_flags, namespace_flag,
@@ -76,7 +77,7 @@ fn standalone_arg() -> Arg {
         .long("standalone")
         .action(ArgAction::SetTrue)
         .conflicts_with_all(["group", "task"])
-        .help("NAME is a standalone policy (legion scaling apply), not a job")
+        .help("NAME is a standalone policy or a node group (legion scaling apply), not a job")
 }
 
 /// The standalone policy the command names, when `--standalone` is set.
@@ -562,7 +563,9 @@ async fn explain(matches: &ArgMatches) -> R<()> {
         println!(
             "{}   {}   {}   now {}   bounds {}..{}   evaluated {}",
             label(target),
-            if !target.policy_id.is_empty() {
+            if target.kind == "nodes" {
+                "node group".to_string()
+            } else if !target.policy_id.is_empty() {
                 "standalone policy".to_string()
             } else if target.members.len() > 1 {
                 format!("group ({})", target.members.join(", "))
@@ -618,6 +621,13 @@ async fn explain(matches: &ArgMatches) -> R<()> {
                 }
             );
         }
+        let node_decision = (target.kind == "nodes")
+            .then(|| serde_json::from_str::<NodeDecision>(&target.decision_json).ok())
+            .flatten();
+        if let Some(decision) = node_decision {
+            println!();
+            print_node_decision(&decision);
+        } else {
         match serde_json::from_str::<Decision>(&target.decision_json) {
             Ok(decision) => {
                 println!();
@@ -658,6 +668,7 @@ async fn explain(matches: &ArgMatches) -> R<()> {
                 }
             ),
         }
+        }
         if show_policy {
             println!(
                 "\n  effective policy {}",
@@ -681,6 +692,48 @@ async fn explain(matches: &ArgMatches) -> R<()> {
     }
     println!("{}", app_line(&app));
     Ok(())
+}
+
+/// `legion scaling explain` for a node group: the stages, the victims and
+/// protected members, and what the last evaluation did.
+fn print_node_decision(decision: &NodeDecision) {
+    let rows: Vec<StageRow> = decision
+        .stages
+        .iter()
+        .filter(|note| note.changed() || !note.note.is_empty())
+        .map(|note| StageRow {
+            stage: note.stage.to_string(),
+            result: note.after.to_string(),
+            note: note.note.clone(),
+        })
+        .collect();
+    if !rows.is_empty() {
+        print_table(rows);
+    }
+    for victim in &decision.victims {
+        println!("  scale-in: {} ({})", victim.node, victim.reason);
+    }
+    for protected in &decision.protected {
+        println!("  never a victim: {} ({})", protected.node, protected.protection);
+    }
+    if !decision.intents.is_empty() {
+        let actions: Vec<String> = decision
+            .intents
+            .iter()
+            .map(|intent| match intent {
+                NodeIntent::SetDesired { count } => format!("target/scale to {count}"),
+                NodeIntent::Cordon { node } => format!("drain {node}"),
+                NodeIntent::Uncordon { node } => format!("uncordon {node}"),
+                NodeIntent::Terminate { node, provider_id } => format!(
+                    "terminate {node} ({})",
+                    provider_id.as_deref().unwrap_or("no provider id")
+                ),
+                NodeIntent::Forget { node } => format!("forget {node}"),
+            })
+            .collect();
+        println!("  actions: {}", actions.join(", "));
+    }
+    println!("  {}", decision.summary);
 }
 
 #[derive(Tabled)]

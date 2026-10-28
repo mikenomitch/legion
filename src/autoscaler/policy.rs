@@ -441,7 +441,8 @@ mod tests {
     /// The examples in `configs/scaling/` evaluate and validate: the app
     /// config against the bundled autoscaler's schema and as a catalog, the
     /// render farm as an external policy whose plugins that catalog opens
-    /// to `media`, and the scripted node group as a node-group policy.
+    /// to `media`, and the node groups as node-group policies whose node
+    /// targets that catalog installs.
     #[test]
     fn the_example_configs_validate_test() {
         let file = |name: &str| -> Value {
@@ -462,7 +463,15 @@ mod tests {
         assert_eq!(render.namespace, "media");
         check_external(&render, &catalog).expect("its plugins are open to media");
 
-        let nodes = parse(&file("nodes-exec.ncl"), "default").expect("nodes-exec parses");
-        assert_eq!(nodes.kind(), PolicyKind::Nodes);
+        for name in ["nodes-exec.ncl", "nodes-aws.ncl"] {
+            let StandaloneSpec::Nodes(group) = parse(&file(name), "default").expect("parses")
+            else {
+                panic!("{name}: a node group");
+            };
+            let group = group.resolve().expect("resolves");
+            catalog
+                .check_node_target(&group.plugin)
+                .expect("the example installs its node target");
+        }
     }
 }

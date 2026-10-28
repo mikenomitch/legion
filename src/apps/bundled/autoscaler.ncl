@@ -33,14 +33,16 @@
   },
   # Exactly what the app calls: WatchScalingPolicies, GetScalingInputs,
   # GetScalingStatus, and GetScaleHistory (scale:read); ScaleTask and
-  # PauseScaling (scale:write); and, for the node-group panel, GetNode,
-  # GetNodes, and GetCapacityDemand (node:read). ReportScalingStatus and
+  # PauseScaling (scale:write); for node groups, GetCapacityDemand, GetNode
+  # and GetNodes (node:read), CreateJoinToken, SetNodeAvailability and
+  # ForgetNode (node:write), and the job names on a member (job:read; it
+  # can read jobs, not change them). ReportScalingStatus and
   # RecordScalingAction are app-plane: the manager accepts them from this
-  # app's identity alone, with no rule needed. Node-group scaling and
-  # sharding add node:write and kv rules when the app calls those APIs.
+  # app's identity alone, with no rule needed.
   permissions = [
     { resources = ["scale"], actions = ["read", "write"], namespaces = ["*"] },
-    { resources = ["node"], actions = ["read"] },
+    { resources = ["job"], actions = ["read"], namespaces = ["*"] },
+    { resources = ["node"], actions = ["read", "write"] },
   ],
   # The autoscaler's UI, as declarative views the SPA, `legion app view`,
   # and `legion_app_view` render (docs/autoscaling.md, "In the UI"). Each
@@ -88,6 +90,11 @@
           type = "string",
           description = "How often every policy is evaluated, as a duration (\"15s\", the default). The app counts as not running after three intervals without a report.",
         },
+        identities = {
+          type = "array",
+          description = "Workload identities the app's job gets beside its own `legion` one, as a task's `identities` (docs/workload-identity.md): a token whose audience a cloud trusts, for a plugin to exchange for credentials (`aws-asg`'s webIdentityTokenFile), so no access keys appear anywhere.",
+          items = { type = "object" },
+        },
         mode = {
           type = "string",
           enum = ["enforce", "dry-run"],
@@ -130,13 +137,15 @@
   # What the app runs: a plugin's source is fetched as an artifact of the
   # app's job, a command is a program it starts, a URL plugin is code it
   # calls with its grant, and a builtin's config names a command (exec) or
-  # an address it reads with that grant. Changing any of them needs the
-  # app's whole grant.
+  # an address it reads with that grant; and the identities its job holds.
+  # Changing any of them needs the app's whole grant.
   codeFields = [
     { pointer = "/plugins/*/source", artifact = true },
     "/plugins/*/command",
     "/plugins/*/url",
     # An `exec` target's command: a program the app runs.
     "/plugins/*/config/command",
+    # A credential the app's job holds: who it can act as elsewhere.
+    "/identities",
   ],
 }

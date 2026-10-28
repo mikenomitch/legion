@@ -1026,6 +1026,107 @@ pub fn simulate(
     }
 }
 
+/// Whether the work of `rows` (the movable allocations of one node, each
+/// row's `pending` the replicas to move) fits on `targets` (other nodes,
+/// each with the capacity it has free), first fit decreasing with the
+/// demand's own rules: the permit and pool, namespaces, constraints,
+/// volume drivers, resources, `distinct` (seeded from each task's other
+/// nodes), and a gang moving whole. `Ok` names the nodes the work would
+/// land on; `Err` says what does not fit. Static ports already claimed on
+/// a target are not known here, so a port clash is not caught (the
+/// scheduler's own placement still is).
+pub fn fit_on(
+    rows: &[PendingTaskRow],
+    targets: &[(Node, ResourcePool)],
+    policy: &ResourcePolicy,
+    nodes: &HashMap<String, Node>,
+) -> Result<Vec<String>, String> {
+    if targets.is_empty() {
+        return if rows.iter().any(|row| row.pending > 0) {
+            Err("the group has no other live member to move it to".to_string())
+        } else {
+            Ok(Vec::new())
+        };
+    }
+    let mut units = pending_units(rows, policy, nodes);
+    let templates: Vec<Template> = targets
+        .iter()
+        .map(|(node, _)| Template {
+            name: node.id.clone(),
+            node: node.clone(),
+            upcoming: 0,
+        })
+        .collect();
+    let mut sims: Vec<SimNode> = targets
+        .iter()
+        .enumerate()
+        .map(|(index, (_, free))| SimNode {
+            template: index,
+            free: free.clone(),
+            ports: HashSet::new(),
+        })
+        .collect();
+    let mut order: Vec<usize> = (0..units.len()).collect();
+    if let Some(reference) = empty_pool(&templates[0].node) {
+        order.sort_by(|a, b| {
+            dominant_share(&units[*b], &reference)
+                .total_cmp(&dominant_share(&units[*a], &reference))
+                .then(a.cmp(b))
+        });
+    }
+    let mut trackers: Vec<Vec<Option<DistinctTracker>>> = units
+        .iter_mut()
+        .map(|unit| {
+            unit.members
+                .iter_mut()
+                .map(|member| member.distinct.take())
+                .collect()
+        })
+        .collect();
+    let mut used = BTreeSet::new();
+    for u in order {
+        let unit = &units[u];
+        if unit.pending == 0 {
+            continue;
+        }
+        let label = format!("{} ({})", unit.job_id, unit.group);
+        if let Some(invalid) = &unit.invalid {
+            return Err(format!("{label}: {invalid}"));
+        }
+        let fits_statically: Vec<bool> = templates
+            .iter()
+            .map(|template| static_check(unit, &template.node).is_ok())
+            .collect();
+        if !fits_statically.iter().any(|ok| *ok) {
+            let why = templates
+                .iter()
+                .find_map(|template| static_check(unit, &template.node).err())
+                .map(|(rule, detail)| format!("{}: {detail}", rule.as_str()))
+                .unwrap_or_default();
+            return Err(format!("{label} may run on no other member ({why})"));
+        }
+        let placed = pack(
+            unit,
+            unit.pending,
+            unit.gang_needed.is_some(),
+            &mut sims,
+            &mut trackers[u],
+            &templates,
+            &|t| fits_statically[t],
+            None,
+        );
+        if (placed.len() as u32) < unit.pending {
+            return Err(format!(
+                "{label}: {} of {} replica(s) find no room on the other members",
+                unit.pending - placed.len() as u32,
+                unit.pending
+            ));
+        }
+        used.extend(placed.into_iter().map(|t| templates[t].name.clone()));
+    }
+    Ok(used.into_iter().collect())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1303,5 +1404,37 @@ mod tests {
         );
         assert!(report.truncated);
         assert_eq!(report.groups[0].replicas, MAX_SIMULATED_REPLICAS);
+    }
+
+    /// The fits-elsewhere simulation packs a node's work onto the other
+    /// members' free capacity, by the same rules as the demand.
+    #[test]
+    fn work_fits_elsewhere_only_where_there_is_room_test() {
+        let member = |name: &str, cpu: u64, memory: u64| {
+            let node = template(name, shape(cpu, memory), 0).node;
+            let pool = ResourcePool::from_node(&node).expect("pool");
+            (node, pool)
+        };
+        // Two replicas of 2000 MHz to move; a peer with 4800 MHz free
+        // takes both.
+        let work = vec![row("web", task("web", 2000, 512), 4, 2)];
+        let roomy = vec![member("w-2", 4800, 8192)];
+        assert_eq!(
+            fit_on(&work, &roomy, &policy(), &HashMap::new()),
+            Ok(vec!["w-2~new".to_string()])
+        );
+        // With 3000 MHz free only one fits.
+        let tight = vec![member("w-2", 3000, 8192)];
+        let err = fit_on(&work, &tight, &policy(), &HashMap::new()).unwrap_err();
+        assert!(err.contains("1 of 2 replica(s) find no room"), "{err}");
+        // Spread over two peers.
+        let two = vec![member("w-2", 3000, 8192), member("w-3", 3000, 8192)];
+        assert_eq!(
+            fit_on(&work, &two, &policy(), &HashMap::new()).map(|nodes| nodes.len()),
+            Ok(2)
+        );
+        // No peer at all: nothing to move to.
+        assert!(fit_on(&work, &[], &policy(), &HashMap::new()).is_err());
+        assert_eq!(fit_on(&[], &[], &policy(), &HashMap::new()), Ok(Vec::new()));
     }
 }

@@ -455,6 +455,107 @@ impl PluginHost {
         }
     }
 
+    /// Check that `target` can run a node group: a target that declares
+    /// `capabilities.nodes` (the `exec` builtin does, `noop` does not), with
+    /// `config` matching its schema.
+    pub async fn check_node_target(&self, target: &str, config: &Value) -> Result<(), Problem> {
+        if target == NOOP_TARGET {
+            return Err(Problem::Invalid(format!(
+                "the {NOOP_TARGET} target starts no machines, so it cannot run a node group. \
+                 Hint: install a node target (aws-asg, or the exec builtin)"
+            )));
+        }
+        self.check(target, Kind::Target, config).await?;
+        match self.loaded(target).map_err(Problem::Unavailable)? {
+            Loaded::External(transport) => {
+                let info = transport
+                    .info()
+                    .await
+                    .map_err(|err| Problem::Unavailable(call_error(target, "initialize", err)))?;
+                if info.nodes {
+                    Ok(())
+                } else {
+                    Err(Problem::Invalid(format!(
+                        "plugin {target} is a target, but does not declare capabilities.nodes: \
+                         it cannot terminate a node group's members"
+                    )))
+                }
+            }
+            Loaded::Exec(_) => Ok(()),
+            _ => Err(Problem::Invalid(format!(
+                "plugin {target} cannot run a node group: it is not a node target"
+            ))),
+        }
+    }
+
+    /// `target/scale` for a node group: the count, and `join` (the group's
+    /// join token and the attributes it stamps), which only a node target
+    /// receives.
+    pub async fn scale_nodes(
+        &self,
+        target: &str,
+        policy: &str,
+        config: &Value,
+        desired: u32,
+        decision: &str,
+        join: Value,
+    ) -> Result<(), String> {
+        let request = json!({
+            "policy": policy, "config": config, "desired": desired,
+            "decision": decision, "join": join,
+        });
+        match self.loaded(target)? {
+            Loaded::Exec(exec) => exec
+                .run("scale", request)
+                .await
+                .map(|_| ())
+                .map_err(|err| format!("plugin {target}: scale: {err}")),
+            Loaded::External(transport) => {
+                self.check_node_target(target, config)
+                    .await
+                    .map_err(|problem| problem.to_string())?;
+                transport
+                    .call("target/scale", request)
+                    .await
+                    .map(|_| ())
+                    .map_err(|err| call_error(target, "target/scale", err))
+            }
+            _ => Err(format!("plugin {target} is not a node target")),
+        }
+    }
+
+    /// `target/terminate`: stop the instances `ids` (provider ids) of a node
+    /// group.
+    pub async fn terminate(
+        &self,
+        target: &str,
+        policy: &str,
+        config: &Value,
+        ids: &[String],
+        decision: &str,
+    ) -> Result<(), String> {
+        let request =
+            json!({ "policy": policy, "config": config, "ids": ids, "decision": decision });
+        match self.loaded(target)? {
+            Loaded::Exec(exec) => exec
+                .run("terminate", request)
+                .await
+                .map(|_| ())
+                .map_err(|err| format!("plugin {target}: terminate: {err}")),
+            Loaded::External(transport) => {
+                self.check_node_target(target, config)
+                    .await
+                    .map_err(|problem| problem.to_string())?;
+                transport
+                    .call("target/terminate", request)
+                    .await
+                    .map(|_| ())
+                    .map_err(|err| call_error(target, "target/terminate", err))
+            }
+            _ => Err(format!("plugin {target} is not a node target")),
+        }
+    }
+
     /// Whether every call uses one test timeout.
     pub fn timeout_override(&self) -> Option<Duration> {
         self.timeout_override
@@ -656,5 +757,61 @@ mod tests {
                 dir: None,
             })
         );
+    }
+
+    /// A node group's target must declare `nodes` (the `exec` builtin
+    /// does, `noop` and sources do not); `target/scale` carries the join
+    /// token and `target/terminate` the provider ids.
+    #[tokio::test]
+    async fn node_targets_are_checked_and_get_the_join_and_the_ids_test() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let script = dir.path().join("nodes.sh");
+        std::fs::write(
+            &script,
+            "#!/bin/sh\nread -r request\necho \"$request\" > \"$(dirname \"$0\")/$1\"\necho '{}'\n",
+        )
+        .expect("write");
+        let catalog = PluginCatalog::from_app_config(&json!({ "plugins": {
+            "nodes": { "builtin": "exec", "config": { "command": ["sh", script.display().to_string()] } },
+            "prom": { "builtin": "prometheus", "config": { "address": "http://127.0.0.1:9" } },
+        } }))
+        .unwrap();
+        let host = PluginHost::new(catalog, None);
+        assert_eq!(host.check_node_target("nodes", &json!({})).await, Ok(()));
+        for (name, invalid) in [("noop", true), ("prom", true), ("missing", false)] {
+            match host.check_node_target(name, &json!({})).await {
+                Err(Problem::Invalid(_)) if invalid => {}
+                Err(Problem::Unavailable(_)) if !invalid => {}
+                other => panic!("{name}: {other:?}"),
+            }
+        }
+        host.scale_nodes(
+            "nodes",
+            "workers",
+            &json!({ "pool": "a" }),
+            3,
+            "d-1",
+            json!({ "token": "jt-secret", "attributes": { "legion.nodegroup": "workers" } }),
+        )
+        .await
+        .unwrap();
+        let scale: Value =
+            serde_json::from_str(&std::fs::read_to_string(dir.path().join("scale")).unwrap())
+                .unwrap();
+        assert_eq!(scale["desired"], 3);
+        assert_eq!(scale["join"]["token"], "jt-secret");
+        assert_eq!(scale["join"]["attributes"]["legion.nodegroup"], "workers");
+        host.terminate("nodes", "workers", &json!({}), &["i-1".to_string()], "d-2")
+            .await
+            .unwrap();
+        let terminate: Value =
+            serde_json::from_str(&std::fs::read_to_string(dir.path().join("terminate")).unwrap())
+                .unwrap();
+        assert_eq!(terminate["ids"], json!(["i-1"]));
+        assert_eq!(terminate["op"], "terminate");
+        assert_eq!(terminate["decision"], "d-2");
+        // The join token never reaches a trace.
+        let redacted = super::super::rpc::redact(&scale);
+        assert_eq!(redacted["join"], "<redacted>");
     }
 }

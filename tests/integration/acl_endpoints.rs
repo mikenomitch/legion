@@ -3024,10 +3024,18 @@ async fn standalone_policies_are_scoped_like_jobs_test() -> R<()> {
     let ids: Vec<&str> = listed.policies.iter().map(|p| p.id.as_str()).collect();
     assert_eq!(ids, vec!["render"]);
 
-    // A node group is cluster-scoped: broad scale:write is not enough.
+    // A node group is cluster-scoped: broad scale:write is not enough. Its
+    // target must be an installed node target (the `exec` builtin here).
+    let manifest = legion::apps::bundled_manifest("autoscaler")
+        .ok_or_else(|| anyhow!("the bundled autoscaler"))?;
+    let mut record = legion::manager::apps::seed_record(manifest, None);
+    record.config = serde_json::json!({ "plugins": { "machines": {
+        "builtin": "exec", "config": { "command": ["/bin/true"] },
+    } } });
+    svc.store.seed_app(record)?;
     let nodes = serde_json::json!({
         "name": "workers",
-        "target": { "nodes": { "pool": "default", "plugin": "aws-asg" } },
+        "target": { "nodes": { "pool": "default", "plugin": "machines" } },
         "min": 1,
         "max": 3,
     })
@@ -3047,12 +3055,94 @@ async fn standalone_policies_are_scoped_like_jobs_test() -> R<()> {
         .await
         .expect_err("node groups need operator:write");
     assert_eq!(status.code(), Code::PermissionDenied, "{status:?}");
-    // With the grant it passes the ACL and is refused as not run yet.
-    let status = svc
+    // With the grant it passes the ACL (a dry run writes nothing).
+    let dry = svc
         .apply_scaling_policy(node_request(&management))
         .await
-        .expect_err("node groups run from Phase 5b");
-    assert_eq!(status.code(), Code::FailedPrecondition, "{status:?}");
+        .map_err(|s| anyhow!(s.to_string()))?
+        .into_inner();
+    assert_eq!((dry.kind.as_str(), dry.id.as_str()), ("nodes", "workers"));
+
+    // An operator with operator:write and node:write, and no scale grant,
+    // runs node groups: apply, pause, delete.
+    svc.store.upsert_acl_policy(
+        "node-operator",
+        "",
+        r#"[{"resources": ["operator"], "actions": ["write"]},
+            {"resources": ["node"], "actions": ["read", "write"]}]"#,
+    )?;
+    let (_, operator) = svc
+        .auth
+        .clone()
+        .mint_token(
+            &svc.store,
+            "nodes",
+            "client",
+            &["node-operator".into()],
+            None,
+        )
+        .map_err(|s| anyhow!(s.to_string()))?;
+    svc.apply_scaling_policy(req(
+        ApplyScalingPolicyRequest {
+            spec_json: nodes.clone(),
+            ..Default::default()
+        },
+        Some(&operator),
+    ))
+    .await
+    .map_err(|s| anyhow!(s.to_string()))?;
+    // The render scaler neither sees it nor may touch it; a missing node
+    // group reads the same to it.
+    let listed = svc
+        .list_scaling_policies(req(ListScalingPoliciesRequest::default(), Some(&secret)))
+        .await
+        .map_err(|s| anyhow!(s.to_string()))?
+        .into_inner();
+    assert!(listed.policies.iter().all(|p| p.kind != "nodes"));
+    for name in ["workers", "no-such-group"] {
+        let status = svc
+            .pause_scaling(req(
+                PauseScalingRequest {
+                    policy: name.into(),
+                    ..Default::default()
+                },
+                Some(&secret),
+            ))
+            .await
+            .expect_err("node groups need the node-group grant");
+        assert_eq!(status.code(), Code::PermissionDenied, "{name}: {status:?}");
+    }
+    svc.pause_scaling(req(
+        PauseScalingRequest {
+            policy: "workers".into(),
+            reason: "maintenance".into(),
+            ..Default::default()
+        },
+        Some(&operator),
+    ))
+    .await
+    .map_err(|s| anyhow!(s.to_string()))?;
+    // A bare name is taken: an external policy in `default` may not reuse it.
+    let clash = svc
+        .apply_scaling_policy(req(
+            ApplyScalingPolicyRequest {
+                spec_json: standalone_policy_spec("workers"),
+                ..Default::default()
+            },
+            Some(&management),
+        ))
+        .await
+        .expect_err("the name is the node group's");
+    assert_eq!(clash.code(), Code::AlreadyExists, "{clash:?}");
+    svc.delete_scaling_policy(req(
+        DeleteScalingPolicyRequest {
+            name: "workers".into(),
+            ..Default::default()
+        },
+        Some(&operator),
+    ))
+    .await
+    .map_err(|s| anyhow!(s.to_string()))?;
 
     svc.delete_scaling_policy(req(
         DeleteScalingPolicyRequest {

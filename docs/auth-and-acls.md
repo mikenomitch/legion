@@ -478,7 +478,9 @@ Hint: have someone who holds it do this, or ask for it to be granted to you
 
 **The app plane.** Two RPCs are for the bundled autoscaler alone:
 `ReportScalingStatus` (its heartbeat and per-task state) and
-`RecordScalingAction` (a dry-run policy's "would" rows). They take no ACL
+`RecordScalingAction` (a dry-run policy's "would" rows, and the
+compare-and-set action intents and outcomes of a standalone policy or a
+node group, which a pause refuses). They take no ACL
 rule; instead they accept only a credential whose job grant belongs to an
 allocation of `legion-system/autoscaler` (its `legion` token, or an ACL token
 minted from it), or a management token. Anyone else gets `PermissionDenied`

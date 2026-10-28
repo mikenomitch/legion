@@ -2356,6 +2356,24 @@ fn migration_list() -> Vec<M<'static>> {
         );",
         )
         .down("DROP TABLE IF EXISTS scaling_policy;"),
+        // Action intents for targets outside Legion (`RecordScalingAction`;
+        // autoscaler v2 plan §6.9, calls entry 12): one row per standalone
+        // policy, compare-and-set on `version`, a value of the
+        // `scaling_action` counter in `scaling_counter`. Control lane.
+        M::up(
+            "CREATE TABLE IF NOT EXISTS scaling_action (
+            policy TEXT PRIMARY KEY,
+            version INTEGER NOT NULL,
+            state TEXT NOT NULL,
+            intent TEXT NOT NULL,
+            owner TEXT NOT NULL DEFAULT '',
+            principal TEXT NOT NULL DEFAULT '',
+            opened_ms INTEGER NOT NULL,
+            closed_ms INTEGER,
+            detail TEXT NOT NULL DEFAULT ''
+        );",
+        )
+        .down("DROP TABLE IF EXISTS scaling_action;"),
     ]
 }
 

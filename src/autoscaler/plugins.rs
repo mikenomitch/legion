@@ -594,6 +594,50 @@ impl PluginCatalog {
         Ok(())
     }
 
+    /// Check a node group may name `name` as its target: it is installed,
+    /// and it is (or may be) a node target. A node group belongs to the
+    /// cluster, so a plugin's `namespaces` allowlist does not apply to it;
+    /// whether an external plugin declares `capabilities.nodes` is checked
+    /// by the autoscaler when it starts it.
+    pub fn check_node_target(&self, name: &str) -> Result<(), String> {
+        if name == NOOP_TARGET {
+            return Err(format!(
+                "target.nodes.plugin = {NOOP_TARGET:?} starts no machines, so it cannot run a \
+                 node group. Hint: install a node target (aws-asg, or the exec builtin) in the \
+                 autoscaler's app config"
+            ));
+        }
+        let Some(entry) = self.entries.get(name) else {
+            let targets: Vec<&str> = self
+                .entries
+                .values()
+                .filter(|entry| match &entry.install {
+                    Install::Builtin(builtin) => *builtin == Builtin::Exec,
+                    _ => true,
+                })
+                .map(|entry| entry.name.as_str())
+                .collect();
+            return Err(format!(
+                "target.nodes.plugin names {name:?}, which is not installed. Hint: the \
+                 operator installs plugins in the autoscaler's app config (`legion app config \
+                 set autoscaler`); {}",
+                if targets.is_empty() {
+                    "no node target is installed".to_string()
+                } else {
+                    format!("installed: {}", targets.join(", "))
+                }
+            ));
+        };
+        match &entry.install {
+            Install::Builtin(Builtin::Exec) => Ok(()),
+            Install::Builtin(builtin) => Err(format!(
+                "target.nodes.plugin names {name:?}, the built-in {}, which is not a node target",
+                builtin.as_str()
+            )),
+            _ => Ok(()),
+        }
+    }
+
     /// A short digest of the catalog, so a policy stream notices an install
     /// or a removal.
     pub fn fingerprint(&self) -> String {
@@ -796,5 +840,32 @@ mod tests {
         let two = catalog(json!({ "q": { "builtin": "noop", "namespaces": ["a"] } }))?;
         assert_ne!(one.fingerprint(), two.fingerprint());
         Ok(())
+    }
+
+    /// A node group names an installed node target: the `exec` builtin or
+    /// an external plugin, never `noop` or a source, whatever the plugin's
+    /// namespaces (a node group has none).
+    #[test]
+    fn node_groups_name_node_targets_test() {
+        let catalog = PluginCatalog::from_app_config(&json!({ "plugins": {
+            "scripted": { "builtin": "exec", "config": { "command": ["/bin/true"] },
+                          "namespaces": ["media"] },
+            "aws-asg": { "command": ["/opt/aws-asg"] },
+            "prom": { "builtin": "prometheus", "config": { "address": "http://p:9090" } },
+        } }))
+        .unwrap();
+        assert_eq!(catalog.check_node_target("scripted"), Ok(()));
+        assert_eq!(catalog.check_node_target("aws-asg"), Ok(()));
+        assert!(catalog
+            .check_node_target("noop")
+            .unwrap_err()
+            .contains("starts no machines"));
+        assert!(catalog
+            .check_node_target("prom")
+            .unwrap_err()
+            .contains("not a node target"));
+        let missing = catalog.check_node_target("gce").unwrap_err();
+        assert!(missing.contains("not installed"), "{missing}");
+        assert!(missing.contains("installed: aws-asg, scripted"), "{missing}");
     }
 }

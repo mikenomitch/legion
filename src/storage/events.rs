@@ -1282,6 +1282,50 @@ pub mod drafts {
         })))
     }
 
+    /// `nodegroup.pending`, `nodegroup.join_timeout`, or `nodegroup.scale_in`
+    /// for a node group, as its autoscaler reported it (`outcome`:
+    /// `completed` or `aborted`, for a scale-in).
+    pub fn nodegroup_flag(
+        kind: &str,
+        group: &str,
+        message: &str,
+        outcome: &str,
+    ) -> Option<EventDraft> {
+        let (kind, warn, text) = match kind {
+            "pending" => (
+                "nodegroup.pending",
+                false,
+                format!("Node group {group}: {message}"),
+            ),
+            "join_timeout" => (
+                "nodegroup.join_timeout",
+                true,
+                format!("Node group {group}: {message}"),
+            ),
+            "scale_in" => (
+                "nodegroup.scale_in",
+                outcome == "aborted",
+                format!("Node group {group}: scale-in {outcome}: {message}"),
+            ),
+            _ => return None,
+        };
+        let draft = if warn {
+            EventDraft::warn(kind, text)
+        } else {
+            EventDraft::info(kind, text)
+        };
+        let mut meta = json!({
+            "group": group,
+            "policy": group,
+            "message": message,
+            "source": "autoscaler",
+        });
+        if !outcome.is_empty() {
+            meta["outcome"] = json!(outcome);
+        }
+        Some(draft.meta(meta))
+    }
+
     /// `scale.applied` for a standalone scaling policy: the autoscaler is
     /// about to move its target from `previous` to `count`.
     pub fn scale_policy_applied(
@@ -2862,6 +2906,12 @@ impl EventRecorder<'_> {
 
     pub fn scale_policy_flag(self, kind: &str, policy: &str, message: &str) {
         if let Some(draft) = drafts::scale_policy_flag(kind, policy, message) {
+            self.emit(draft);
+        }
+    }
+
+    pub fn nodegroup_flag(self, kind: &str, group: &str, message: &str, outcome: &str) {
+        if let Some(draft) = drafts::nodegroup_flag(kind, group, message, outcome) {
             self.emit(draft);
         }
     }

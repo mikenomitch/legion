@@ -87,6 +87,27 @@ jobs:
       - name: Run cargo clippy
         run: cargo clippy --all --all-features --locked -- -D warnings -A dead_code -A unused_variables
 
+  # The first-party `aws-asg` scaling plugin is a crate of its own, outside the
+  # workspace (docs/autoscaling-plugins.md, "The aws-asg plugin"), so
+  # `cargo test --all` does not reach it. Its tests need no AWS: SigV4 against
+  # AWS's published examples, recorded responses, and a local mock of the API.
+  aws-asg-plugin:
+    name: aws-asg Plugin
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Test and lint
+        working-directory: plugins/scaling/aws-asg
+        run: |
+          cargo test --locked
+          cargo clippy --locked --all-targets -- -D warnings
+
   # Mixed-version managers, workers, and CLIs exchange proto messages during a
   # rolling upgrade (docs/upgrades.md), so a wire-incompatible change to
   # proto/legion.proto must be deliberate. This compares the PR's proto with the

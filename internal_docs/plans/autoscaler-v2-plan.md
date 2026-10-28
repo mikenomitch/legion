@@ -18,10 +18,16 @@ targets, standalone `ScalingPolicy` objects with `legion scaling
 apply|list|delete`, `legion scaling plugin test`, the Rust SDK and example
 plugins) shipped 2026-10-28 (calls entries 63-81), and so did Phase 6 (the
 autoscaler's UI as app views: the Autoscaling page, the job panel, the task
-badge, the node-group panel; calls entries 82-84). Phases 5b and 7 are in
-progress. Deliberately left from 3 and 4: `wake = "on-request"` (entry 73),
-node-group policies at `scaling apply` (refused until 5b, entry 69), and
-per-plugin concurrency (entry 67). (Written 2026-10-19; layered defaults, in-place policy edits, and
+badge, the node-group panel; calls entries 82-84), and Phase 5b (node
+groups run by the app: node-group `ScalingPolicy` objects, compare-and-set
+action intents in `scaling_action`, drain → terminate → `ForgetNode`, a
+join token per scale-up, the provider-id cross-check, minAvailable and
+fits-elsewhere from `GetCapacityDemand`, and the first-party `aws-asg`
+plugin; calls entries 85-94). Phase 7 is in progress. Deliberately left
+from 3 and 4: `wake = "on-request"` (entry 73) and per-plugin concurrency
+(entry 67). Left from 5b: consolidation (moving work off a node that is
+not underutilized), forgetting lost nodes automatically, and static ports
+in the fits-elsewhere simulation (entry 90). (Written 2026-10-19; layered defaults, in-place policy edits, and
 the core-field rationale added 2026-10-27.) This plan **supersedes**
 [autoscaler-plan.md](autoscaler-plan.md). That plan's Phase 1 (`legion job
 scale`, count overrides, the `scale` ACL resource) shipped on 2026-07-30 and

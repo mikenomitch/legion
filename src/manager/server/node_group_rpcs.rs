@@ -21,8 +21,8 @@ use crate::manager::capacity_demand::{self, Template, TemplateSpec};
 use crate::storage::acl_store::{JoinTokenRecord, JoinTokenUse};
 use crate::structs::{
     check_join_attributes, CapacityRefusal, ForgetNodeReply, ForgetNodeRequest,
-    GetCapacityDemandReply, GetCapacityDemandRequest, JoinAttrSource, NodeGroupDemand,
-    PendingCapacity, TemplateRefusal, UnfittableCapacity, JOIN_ATTR, RESERVED_ATTR_PREFIX,
+    GetCapacityDemandReply, GetCapacityDemandRequest, JoinAttrSource, NodeGroupAllocation,
+    NodeGroupDemand, NodeGroupMember, PendingCapacity, TemplateRefusal, UnfittableCapacity, JOIN_ATTR, RESERVED_ATTR_PREFIX,
 };
 use std::collections::BTreeMap;
 
@@ -354,7 +354,10 @@ impl ManagerDaemonService {
         }
         let mut seen = std::collections::HashSet::new();
         let mut templates = Vec::with_capacity(req.templates.len());
+        // Per template: (describe members, simulate fits).
+        let mut member_asks: Vec<(bool, bool)> = Vec::with_capacity(req.templates.len());
         for template in req.templates {
+            member_asks.push((template.members, template.members && template.fit_check));
             let name = template.name.trim().to_string();
             if name.is_empty() {
                 return Err(Status::invalid_argument("every template needs a name"));
@@ -449,6 +452,30 @@ impl ManagerDaemonService {
         }
 
         let store = self.store.clone();
+        let members = {
+            let store = store.clone();
+            let asks: Vec<(String, bool, bool)> = templates
+                .iter()
+                .zip(&member_asks)
+                .map(|(template, (members, fits))| (template.name.clone(), *members, *fits))
+                .collect();
+            tokio::task::spawn_blocking(
+                move || -> R<Vec<Vec<crate::manager::node_group_members::Member>>> {
+                    asks.iter()
+                        .map(|(name, members, fits)| {
+                            if *members {
+                                crate::manager::node_group_members::members(&store, name, *fits)
+                            } else {
+                                Ok(Vec::new())
+                            }
+                        })
+                        .collect()
+                },
+            )
+            .await
+            .map_err(|e| Status::internal(format!("reading node-group members failed: {e}")))?
+            .map_err(|e| map_store_error("Error reading node-group members", e))?
+        };
         let simulated = {
             let templates = templates.clone();
             tokio::task::spawn_blocking(move || -> R<capacity_demand::DemandReport> {
@@ -521,7 +548,8 @@ impl ManagerDaemonService {
             .groups
             .iter()
             .zip(&templates)
-            .map(|(group, template)| NodeGroupDemand {
+            .zip(&members)
+            .map(|((group, template), members)| NodeGroupDemand {
                 name: group.name.clone(),
                 nodes: group.nodes,
                 replicas: group.replicas,
@@ -542,6 +570,17 @@ impl ManagerDaemonService {
                     .collect(),
                 node_pool: template.node.pool.clone(),
                 node_attributes_json: template.node.config_attrs.to_string(),
+                members: members
+                    .iter()
+                    .filter(|member| {
+                        identity.allows(
+                            AclResource::Node,
+                            AclAction::Read,
+                            &AclScope::pool(&member.node.pool),
+                        )
+                    })
+                    .map(|member| self.member_proto(&identity, member))
+                    .collect(),
             })
             .collect();
         let unfittable = simulated
@@ -581,6 +620,71 @@ impl ManagerDaemonService {
                 .format(&time::format_description::well_known::Rfc3339)
                 .unwrap_or_default(),
         }))
+    }
+
+    /// One node-group member as `GetCapacityDemand` reports it: job names
+    /// only where the caller has `job:read`.
+    fn member_proto(
+        &self,
+        identity: &AclIdentity,
+        member: &crate::manager::node_group_members::Member,
+    ) -> NodeGroupMember {
+        NodeGroupMember {
+            node_id: member.node.id.clone(),
+            status: member.node.status.clone(),
+            availability: member.node.availability.clone(),
+            provider_id: member.provider_id.clone().unwrap_or_default(),
+            scale_in: member.scale_in.clone().unwrap_or_default(),
+            reserved_cpu: member.reserved_cpu,
+            reserved_memory: member.reserved_memory,
+            allocations: member
+                .allocations
+                .iter()
+                .map(|allocation| {
+                    let readable = identity.allows(
+                        AclResource::Job,
+                        AclAction::Read,
+                        &self.job_read_scope(&allocation.job_id),
+                    );
+                    NodeGroupAllocation {
+                        allocation_id: allocation.id,
+                        job_id: if readable {
+                            allocation.job_id.clone()
+                        } else {
+                            String::new()
+                        },
+                        namespace: allocation.namespace.clone(),
+                        task_group: if readable {
+                            allocation.group.clone()
+                        } else {
+                            String::new()
+                        },
+                        task_name: if readable {
+                            allocation.task.clone()
+                        } else {
+                            String::new()
+                        },
+                        kind: allocation.kind.to_string(),
+                        sessions: allocation.sessions,
+                        node_local_storage: allocation.node_local_storage,
+                        breaks_min_available: allocation.min_available.is_some(),
+                        min_available_detail: if readable {
+                            allocation.min_available.clone().unwrap_or_default()
+                        } else {
+                            String::new()
+                        },
+                        redacted: !readable,
+                    }
+                })
+                .collect(),
+            fits_elsewhere: member.fits.as_ref().map(Result::is_ok),
+            fit_detail: match &member.fits {
+                Some(Ok(nodes)) if nodes.is_empty() => "nothing to move".to_string(),
+                Some(Ok(nodes)) => format!("fits on {}", nodes.join(", ")),
+                Some(Err(why)) => why.clone(),
+                None => String::new(),
+            },
+        }
     }
 
     /// `CreateJoinToken`'s `max_uses` and `attributes`, checked.

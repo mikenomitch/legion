@@ -182,6 +182,7 @@ fn template_from_value(value: Value) -> R<NodeGroupTemplate> {
             shape: Some(proto_shape(&effective.shape)?),
             like_node: None,
             upcoming: 0,
+            ..Default::default()
         });
     }
     let template: TemplateFile =
@@ -195,6 +196,7 @@ fn template_from_value(value: Value) -> R<NodeGroupTemplate> {
         shape: Some(proto_shape(&shape)?),
         like_node: template.like_node,
         upcoming: template.upcoming,
+        ..Default::default()
     })
 }
 
@@ -253,6 +255,7 @@ fn template_from_flags(matches: &ArgMatches) -> R<NodeGroupTemplate> {
         shape: Some(proto_shape(&shape)?),
         like_node: matches.get_one::<String>("like-node").cloned(),
         upcoming: matches.get_one::<u32>("upcoming").copied().unwrap_or(0),
+        ..Default::default()
     })
 }
 

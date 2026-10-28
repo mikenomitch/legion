@@ -151,10 +151,97 @@ should only add capacity can answer 0 outside its window.
 - `target/terminate` (`params.ids`, provider ids) stops specific members.
   It belongs to node-group targets (`capabilities.nodes = true`), whose
   `target/scale` also carries `join = { token, attributes }`: the join
-  token new members register with, a secret never to log. This version of
-  Legion does not run node-group policies, so the autoscaler sends neither;
-  `legion scaling plugin test` exercises `target/terminate` for a plugin
-  that declares `nodes`.
+  token new members register with, a secret never to log. See [Node-group
+  targets](#node-group-targets).
+
+## Node-group targets
+
+A target that runs a node group declares `capabilities.nodes = true` in its
+`initialize` answer. The autoscaler refuses to run a node group on a target
+that does not (the policy reads `invalid`), and the built-in `noop` target
+does not; the `exec` builtin does. A node target:
+
+- **`target/status`** returns `count` (the instances the provider holds,
+  its desired count) and `members`: one `{ "id": "<provider id>", "state":
+  "running" }` per instance. `id` is what a member joins with as
+  `legion.provider-id`; the autoscaler cross-checks it, and never drains a
+  node whose provider id the provider does not list (or that two nodes
+  claim). A `state` of `terminated`, `terminating`, `shutting-down`,
+  `stopping`, or `stopped` counts as gone. Listing members is what lets the
+  autoscaler confirm a termination and forget the node; a target that lists
+  none (and holds a count above 0) has its members' provider ids taken on
+  trust.
+- **`target/scale`** receives `join = { "token": "<join token>",
+  "attributes": { "legion.nodegroup": "workers-general", … } }` with every
+  scale-up. The token admits exactly the nodes being added (`max_uses`) and
+  stamps the attributes on them; it is a secret, never to be logged. The
+  plugin's job is to hand it to the new machines, which run `legion join
+  --token-file … --attr legion.provider-id=<their instance id>`. A
+  node-group scale is only ever upwards: scale-in terminates chosen
+  members instead of lowering the count.
+- **`target/terminate`** receives `ids` (provider ids) and `decision`,
+  and stops exactly those instances, lowering the provider's count with
+  them. It must be idempotent: an instance already gone is success. It is
+  only called for a member Legion has drained.
+
+## The `aws-asg` plugin
+
+[`plugins/scaling/aws-asg/`](../plugins/scaling/aws-asg/) is Legion's
+first-party node target for AWS Auto Scaling groups.
+It is its own program (`cargo build --release` in that directory, or
+`LEGION_BUILD_PLUGINS=1 cargo build` from the root), outside Legion's
+workspace, with no AWS SDK: SigV4 is written out, over the HTTP client
+Legion already uses.
+
+| Method | AWS call |
+| --- | --- |
+| `target/status` | `DescribeAutoScalingGroups`: `count` is `DesiredCapacity`, ready members are `InService` and healthy, every instance is a member |
+| `target/scale` | `ssm:PutParameter` (the join token, as a `SecureString`, when `joinTokenParameter` is set), then `SetDesiredCapacity` |
+| `target/terminate` | `TerminateInstanceInAutoScalingGroup` with `ShouldDecrementDesiredCapacity`, per instance |
+
+Install it in the autoscaler's app config, and name it from a node group:
+
+```nickel
+# legion app config set autoscaler -f autoscaler.ncl
+{ plugins = { aws-asg = {
+    source = "https://…/aws-asg-linux-amd64.tar.gz", checksum = "sha256:…",
+    config = {
+      region = "us-east-1",
+      # Credentials without keys: the app's second workload identity, exchanged
+      # with STS (AssumeRoleWithWebIdentity).
+      webIdentityTokenFile = "/secrets/aws/token",
+      roleArn = "arn:aws:iam::123456789012:role/legion-autoscaler",
+    },
+} } }
+```
+
+| Plugin config | Default | Meaning |
+| --- | --- | --- |
+| `region` | `AWS_REGION` | The group's region. |
+| `webIdentityTokenFile`, `roleArn` | none | A web identity token to exchange for the role's credentials with STS `AssumeRoleWithWebIdentity` (read fresh at each refresh). |
+| `roleSessionName` | `legion-aws-asg` | The STS session name. |
+| `imds` | `true` | Fall back to the EC2 instance profile (IMDSv2). |
+| `endpoint`, `ssmEndpoint`, `stsEndpoint`, `imdsEndpoint` | AWS's | Other endpoints (a VPC endpoint, or a test double). |
+
+Without `webIdentityTokenFile`, credentials come from the standard
+environment (`AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY`/`AWS_SESSION_TOKEN`,
+or `AWS_WEB_IDENTITY_TOKEN_FILE` with `AWS_ROLE_ARN`), then the instance
+profile. Temporary credentials are refreshed five minutes before they
+expire.
+
+| Policy config (`target.nodes.config`) | Meaning |
+| --- | --- |
+| `asg` | The Auto Scaling group's name (required). |
+| `joinTokenParameter` | An SSM parameter the plugin writes the group's join token to before each scale-up. The launch template's user data reads it (`aws ssm get-parameter --with-decryption`) and runs `legion join`. Without it, new instances need a token from elsewhere. |
+| `honorCooldown` | Pass `HonorCooldown` to `SetDesiredCapacity` (default `false`: the autoscaler paces itself). |
+
+The role needs `autoscaling:DescribeAutoScalingGroups`,
+`autoscaling:SetDesiredCapacity`,
+`autoscaling:TerminateInstanceInAutoScalingGroup`, and `ssm:PutParameter`
+on the parameter (with `kms:Encrypt` on its key). Instances need
+`ssm:GetParameter` on it. Its unit tests check the signing against AWS's
+published SigV4 examples and the parsing against recorded responses, and
+drive the whole plugin against a local mock of the AWS API; none need AWS.
 
 ## Errors, timeouts, restarts
 

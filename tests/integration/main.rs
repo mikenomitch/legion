@@ -61,6 +61,7 @@ mod metrics_endpoint;
 mod namespace_restrictions;
 mod node_drain;
 mod node_forget;
+mod node_groups;
 mod node_liveness;
 mod node_pressure;
 mod node_usage;

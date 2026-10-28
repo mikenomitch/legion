@@ -1173,7 +1173,8 @@ pub struct RenderedApp {
 /// - placement becomes the permit and the constraints or affinity (§6.2);
 /// - `settings.resources` overrides each task's CPU and memory;
 /// - exec tasks with no `user` run as `systemWorker.appUser`;
-/// - the `legion` identity carries the recorded grant;
+/// - the `legion` identity carries the recorded grant, and the config's
+///   `identities` (when its schema has them) join it;
 /// - the config is a file in the task directory, named by
 ///   `$LEGION_APP_CONFIG` (exec and container tasks);
 /// - artifact code fields become artifacts;
@@ -1289,6 +1290,24 @@ pub fn render_app_job(record: &AppRecord, ctx: RenderContext<'_>) -> Result<Rend
                     "name": legion,
                     "permissions": grant_rules.clone(),
                 })),
+            }
+            // Identities the app's config adds beside the reserved one (the
+            // autoscaler's `identities`: a token for a cloud's STS, say).
+            // The job's own validation holds them to the identity rules.
+            for extra in record
+                .config
+                .get("identities")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+            {
+                let name = extra.get("name").and_then(Value::as_str);
+                let taken = identities
+                    .iter()
+                    .any(|identity| identity.get("name").and_then(Value::as_str) == name);
+                if name.is_some_and(|name| name != legion) && !taken {
+                    identities.push(extra.clone());
+                }
             }
         }
 
@@ -1734,6 +1753,30 @@ mod app_tests {
         );
         // The render is a job RunJob takes.
         serde_json::from_value::<crate::structs::JobConfig>(job.clone()).expect("parses");
+    }
+
+    /// An app's config may add identities beside the reserved `legion` one
+    /// (the autoscaler's cloud credentials); it cannot replace that one.
+    #[test]
+    fn config_identities_join_the_legion_identity() {
+        let mut record = record(manifest(json!({})));
+        record.config = json!({ "identities": [
+            { "name": "aws", "audience": ["sts.amazonaws.com"], "ttl": "15m",
+              "file": { "path": "secrets/aws.token" } },
+            { "name": "legion", "audience": ["evil"] },
+        ] });
+        let rendered = render_app_job(&record, NO_MARKER).expect("renders");
+        let identities = rendered.jobspec["task"]["identities"]
+            .as_array()
+            .expect("identities")
+            .clone();
+        assert_eq!(identities.len(), 2, "{identities:?}");
+        assert_eq!(identities[0]["name"], "legion");
+        assert!(identities[0].get("audience").is_none());
+        assert_eq!(identities[1]["name"], "aws");
+        assert_eq!(identities[1]["file"]["path"], "secrets/aws.token");
+        serde_json::from_value::<crate::structs::JobConfig>(rendered.jobspec.clone())
+            .expect("parses");
     }
 
     #[test]

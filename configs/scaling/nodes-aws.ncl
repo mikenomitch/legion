@@ -1,13 +1,25 @@
-# A node-group policy (docs/autoscaling.md, "Capacity demand").
+# A node group on AWS (docs/autoscaling.md, "Node groups";
+# docs/autoscaling-plugins.md, "The aws-asg plugin").
 #
-# Today this file sizes the group: `legion scaling demand -f
-# configs/scaling/nodes-aws.ncl` reports how many nodes of this shape the
-# work the scheduler could not place needs. Running the group (minting its
-# join tokens, asking the provider for machines, draining and forgetting
-# them) is not built yet.
+#   legion scaling apply configs/scaling/nodes-aws.ncl
 #
-# Every field but `name`, `target` and `max` is optional; the values below
-# other than those are the defaults, written out.
+# The autoscaler grows the Auto Scaling group `legion-workers` when work is
+# waiting that its nodes could host, and drains, terminates, and forgets
+# members that sit empty. It needs the `aws-asg` plugin installed in its app
+# config (see configs/scaling/autoscaler-app-config.ncl), whose credentials
+# come from the app's workload identity, never from this file.
+#
+# New instances join with the token the plugin writes to
+# `joinTokenParameter` before each scale-up; their launch template's user
+# data runs, for example:
+#
+#   token=$(aws ssm get-parameter --with-decryption \
+#     --name /legion/workers-general/join --query Parameter.Value --output text)
+#   legion join "$token" --attr legion.provider-id=$(ec2-metadata -i | cut -d' ' -f2)
+#
+# A node group is cluster-scoped: applying it needs operator:write and
+# node:write. Every field but `name`, `target` and `max` is optional; the
+# values below other than those are the defaults, written out.
 {
   name = "workers-general",
   target = {
@@ -21,7 +33,10 @@
       shape = { cpu = 8000, memory = 16384, attributes = { arch = "amd64" } },
       # The target plugin that starts and stops machines, and its settings.
       plugin = "aws-asg",
-      config = { asg = "legion-workers" },
+      config = {
+        asg = "legion-workers",
+        joinTokenParameter = "/legion/workers-general/join",
+      },
     },
   },
   min = 0,

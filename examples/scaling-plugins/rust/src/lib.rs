@@ -265,8 +265,10 @@ pub struct ScaleRequest {
     /// idempotent.
     #[serde(default)]
     pub decision: String,
-    /// For node targets: the join token and attributes new members join
-    /// with. A secret: never log it.
+    /// For node targets: `{ "token": …, "attributes": { … } }`, the join
+    /// token new members register with (`legion join --token-file`) and the
+    /// attributes it stamps on them (`legion.nodegroup`). The token admits
+    /// exactly the members this scale adds. A secret: never log it.
     #[serde(default)]
     pub join: Option<Value>,
 }
@@ -283,6 +285,11 @@ pub struct TerminateRequest {
     pub config: Value,
     /// The provider ids of the members to stop.
     pub ids: Vec<String>,
+    /// The decision's id, as `legion scaling history` shows it. A
+    /// terminate may be sent again after a restart: an instance already
+    /// gone is success.
+    #[serde(default)]
+    pub decision: String,
 }
 
 /// A JSON-RPC error: what a method returns when it cannot answer.

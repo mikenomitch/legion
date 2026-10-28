@@ -9,8 +9,8 @@
 //! - **Versions** are values of the `scaling_policy` counter in
 //!   `scaling_counter`: they never repeat, across a delete and a recreate.
 //!   Applying the same spec again writes nothing and keeps the version.
-//! - **Delete** removes the policy's pause with it. Its history stays,
-//!   capped like a task's.
+//! - **Delete** removes the policy's pause and its action row with it.
+//!   Its history stays, capped like a task's.
 
 use rusqlite::{params, Connection, OptionalExtension, Row};
 
@@ -189,6 +189,7 @@ impl Store {
                 )?;
                 let key = crate::manager::autoscale::policy_target_key(&row.id());
                 tx.execute("DELETE FROM scaling_pause WHERE job_id = ?1;", [&key])?;
+                tx.execute("DELETE FROM scaling_action WHERE policy = ?1;", [row.id()])?;
             }
             tx.commit()?;
             Ok(current)

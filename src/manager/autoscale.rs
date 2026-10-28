@@ -212,6 +212,22 @@ impl AutoscaleLayers {
         Ok(resolved)
     }
 
+    /// Resolve a node group: its own defaults (a node group inherits none
+    /// of the task layers), and a target plugin that is installed and may
+    /// run node groups.
+    pub fn resolve_node_group(
+        &self,
+        policy: &crate::autoscaler::nodes::NodeGroupPolicy,
+    ) -> Result<crate::autoscaler::nodes::EffectiveNodeGroup, String> {
+        let group = policy.resolve()?;
+        if let Some(catalog) = &self.plugins {
+            catalog
+                .check_node_target(&group.plugin)
+                .map_err(|err| format!("{}: {err}", group.name))?;
+        }
+        Ok(group)
+    }
+
     /// Resolve a standalone external policy against these layers: its
     /// record over the cluster defaults and its namespace's policies, with
     /// `min` standing in for the `count` a task would have (both bounds are

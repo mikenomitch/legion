@@ -52,16 +52,21 @@ They upgrade with the binary ([Upgrades](#upgrades-of-bundled-apps)).
 The **autoscaler** acts on every task with `autoscale` in its jobspec
 ([autoscaling.md](autoscaling.md)): it watches the effective policies, reads
 the cluster-wide scaling inputs once per interval, and writes counts through
-`ScaleTask`, reporting each evaluation back to the manager. Its grant is
-`scale:read` and `scale:write` in every namespace, and `node:read` for its
-node-group panel: it can resize, not redeploy. Its config takes `interval`
-(default `"15s"`), `mode` (`"dry-run"` forces every policy into dry-run),
-and `plugins`, the metric sources, strategies, and targets the operator
-installs for policies to name
-([autoscaling.md, "Plugins"](autoscaling.md#plugins)). A plugin's `source`,
-`command`, and `url`, and an `exec` target's `config.command`, are code
-fields: changing one changes the code the app runs, so it needs the app's
-whole grant. A built-in source's `config` (its address) and `namespaces`
+`ScaleTask`, reporting each evaluation back to the manager. It also runs
+[node groups](autoscaling.md#node-groups): it asks a provider for nodes,
+mints their join tokens, and drains, terminates, and forgets the nodes it
+scales in. Its grant is `scale:read` and `scale:write` in every namespace,
+`job:read` (to read what a drain would move), and `node:read` and
+`node:write` (node groups): it can resize, drain, and forget nodes, not
+redeploy. Its config takes `interval` (default `"15s"`), `mode`
+(`"dry-run"` forces every policy into dry-run), `plugins`, the metric
+sources, strategies, and targets the operator installs for policies to
+name ([autoscaling.md, "Plugins"](autoscaling.md#plugins)), and
+`identities`, extra workload identities for its task (a cloud provider's
+web identity token, so a node target needs no stored keys). A plugin's
+`source`, `command`, and `url`, an `exec` target's `config.command`, and
+`identities` are code fields: changing one changes the code the app runs
+(or the credentials it holds), so it needs the app's whole grant. A built-in source's `config` (its address) and `namespaces`
 need only `app:write`. When it stops reporting, `legion scaling status`
 says `NOT RUNNING`. Its UI is built from app views: an Autoscaling page in
 the sidebar, a panel on every autoscaled job's page, a badge on each

@@ -229,11 +229,20 @@ service Manager {
   // disabled every caller is trusted, as everywhere else.
   rpc ReportScalingStatus (ReportScalingStatusRequest) returns (ReportScalingStatusReply);
 
-  // Records an autoscaler action that is not a count write. Today that is
-  // a `dry-run` policy's "would" decision: a `scale_history` row with
-  // `applied = false`, so `legion scaling history` shows what the policy
-  // would have done. Node-group and external-target action intents will
-  // use the same RPC.
+  // Records an autoscaler action that is not a task's count write:
+  //
+  // - a `dry-run` policy's "would" decision (`kind = "would"`): a
+  //   `scale_history` row with `applied = false`, so `legion scaling
+  //   history` shows what the policy would have done;
+  // - an **action intent** on a standalone policy (`kind = "intent"`),
+  //   written before the app acts on a target outside Legion (calls
+  //   `target/scale` or `target/terminate`, drains or forgets a node-group
+  //   member), and its **outcome** (`kind = "outcome"`) once it has. Both are
+  //   compare-and-set on the policy's action version, so when two autoscaler
+  //   replicas' shard leases overlap, exactly one of them acts on each
+  //   decision (docs/autoscaling.md, "No duplicate actions"). The reply says
+  //   whether the write won, and carries the policy's action row either
+  //   way.
   //
   // ACL: app-plane, like ReportScalingStatus.
   rpc RecordScalingAction (RecordScalingActionRequest) returns (RecordScalingActionReply);
@@ -249,16 +258,26 @@ service Manager {
   // Answered by the status-lane leader, which holds the app's reports (other
   // managers forward). Works with the app down, and says so.
   //
+  // Standalone policies are listed after the tasks; node groups (kind
+  // `nodes`) are listed whatever namespaces are asked for, since they have
+  // none. With several autoscaler replicas (docs/autoscaling.md,
+  // "Replicas"), each target's entry is the newest report of it, from the
+  // replica that owns it.
+  //
   // ACL: `scale:read`, gated before any lookup; targets of jobs outside the
   // caller's grant are left out (a request naming such a job is refused).
+  // Node groups need `node:read`.
   rpc GetScalingStatus (GetScalingStatusRequest) returns (GetScalingStatusReply);
 
   // Lists the durable record of scaling changes for a job, newest first:
   // every count write (by people and by the autoscaler, applied or
   // deferred), pins and releases, and a `dry-run` policy's "would" rows.
-  // History is capped at 200 rows per task.
+  // History is capped at 200 rows per task. A standalone policy's history
+  // (`policy`) also has its action intents' rows: `scaled`, `failed`, and
+  // for a node group `drain`, `terminate`, `forget`, and `uncordon`.
   //
-  // ACL: `scale:read` on the job.
+  // ACL: `scale:read` on the job, or on the standalone policy; a node
+  // group's with `node:read`.
   rpc GetScaleHistory (GetScaleHistoryRequest) returns (GetScaleHistoryReply);
 
   // Pauses autoscaling for one task, every autoscaled task of one job, one
@@ -268,9 +287,14 @@ service Manager {
   // writes to them, so a pause holds even against a misbehaving app. People
   // can still scale a paused task by hand.
   //
-  // ACL: `scale:write` on the job (or the standalone policy, gated with a
-  // coarse check before its lookup); `operator:write` for `all`.
-  // Retry-safe with `idempotency_key`.
+  // A node group (`policy` naming one) is paused like a standalone policy:
+  // its count holds, no drain starts, and drains that have not reached
+  // terminate are abandoned (their nodes uncordoned).
+  //
+  // ACL: `scale:write` on the job (or the standalone policy); a node group
+  // needs `operator:write` and `node:write`; `all` needs `operator:write`.
+  // A standalone policy is gated before its lookup with either grant, so a
+  // caller cannot probe for policies. Retry-safe with `idempotency_key`.
   rpc PauseScaling (PauseScalingRequest) returns (PauseScalingReply);
 
   // Creates or replaces a standalone scaling policy (`legion scaling
@@ -291,18 +315,22 @@ service Manager {
   // when it next evaluates the policy, which reports `invalid` with the
   // reason (`legion scaling apply --wait` waits for that report).
   //
-  // A node-group policy (`target = { nodes = … }`) is parsed and validated,
-  // and refused with FAILED_PRECONDITION: node groups are not run in this
-  // version.
+  // A node-group policy (`target = { nodes = … }`; docs/autoscaling.md,
+  // "Node groups") is cluster-scoped: it is stored with no namespace, its id
+  // is its bare name, and it must name a target plugin that is installed
+  // (whether that plugin declares the `nodes` capability is checked by the
+  // autoscaler). Its name may not be the name of a policy in the `default`
+  // namespace, nor the reverse (ALREADY_EXISTS): both are addressed by the
+  // bare name.
   //
   // `dry_run` validates and returns the diff against the stored version
   // without writing. Applying an unchanged policy writes nothing and keeps
   // its version.
   //
   // ACL: `scale:write` on the policy's namespace and name (the scope a job
-  // of that name would have), gated with a coarse `scale:write` before the
-  // body is parsed. A node-group policy needs `operator:write` and
-  // `node:write`. Retry-safe with `idempotency_key`.
+  // of that name would have), checked once the body is parsed and before
+  // anything is looked up. A node-group policy needs `operator:write` and
+  // `node:write`, and no `scale` grant. Retry-safe with `idempotency_key`.
   rpc ApplyScalingPolicy (ApplyScalingPolicyRequest) returns (ApplyScalingPolicyReply);
 
   // Deletes a standalone scaling policy. The autoscaler stops evaluating it
@@ -310,20 +338,26 @@ service Manager {
   // (or the policy's name is reused) ages it out. Deleting a policy that
   // does not exist is NOT_FOUND.
   //
-  // ACL: a coarse `scale:write` before the lookup, then `scale:write` on the
-  // policy (`operator:write` and `node:write` for a node group), so a
-  // caller cannot tell an existing policy from a missing one. Retry-safe
-  // with `idempotency_key`: a replayed delete reports `deduplicated`.
+  // `name` is `namespace/name`, or a bare name: the `default` namespace's
+  // policy of that name, else the node group of that name.
+  //
+  // ACL: before the lookup, `scale:write` on the policy's namespace and
+  // name, or `operator:write` and `node:write` (the node-group grant);
+  // after it, the grant the policy's kind needs. Node groups are looked up
+  // only for a caller holding the node-group grant, so a caller cannot tell
+  // an existing policy from a missing one. Retry-safe with
+  // `idempotency_key`: a replayed delete reports `deduplicated`.
   rpc DeleteScalingPolicy (DeleteScalingPolicyRequest) returns (DeleteScalingPolicyReply);
 
   // Lists scaling policies in the namespaces asked for (`legion scaling
   // list`): every autoscaled task (kind `task`, or `group` for a multi-task
-  // group) and every standalone policy (kind `external`), with its mode,
-  // bounds, and whether it resolves. Any manager answers: policies are
-  // computed from replicated state.
+  // group), every standalone policy (kind `external`), and every node group
+  // (kind `nodes`, listed whatever namespaces are asked for: it has none),
+  // with its mode, bounds, and whether it resolves. Any manager answers:
+  // policies are computed from replicated state.
   //
   // ACL: `scale:read`, gated with `AclScope::any()`; entries outside the
-  // caller's grant are left out.
+  // caller's grant are left out. Node groups need `node:read`.
   rpc ListScalingPolicies (ListScalingPoliciesRequest) returns (ListScalingPoliciesReply);
 
   // How many nodes of each node-group template the pending work needs
@@ -358,6 +392,13 @@ service Manager {
   // on existing nodes are not modelled, so it can over-ask by a node. It is
   // a point-in-time read on whichever manager answers, computed off the
   // scheduler's path; nothing is written.
+  //
+  // With a template's `members`, the reply also describes the group's
+  // current members for node scale-in: each node's provider id, its
+  // `legion.scale-in` tag, its reserved share, and its allocations with
+  // what makes a node never a victim (a `legion-system` job, node-local
+  // storage, a `disruption.minAvailable` the drain would break), and with
+  // `fit_check` whether an underutilized member's work fits on the others.
   //
   // ACL: `node:read`, gated before anything is read, then on each
   // template's pool. Node counts cover all pending work, but a pending or
@@ -4667,6 +4708,20 @@ message NodeGroupTemplate {
   // work before any template is sized, so a group that was just asked to
   // grow is not asked again for the same replicas. Default: 0.
   uint32 upcoming = 6;
+
+  // Also describe the group's members: every node whose `legion.nodegroup`
+  // attribute is this template's name, with what node scale-in needs to
+  // know about it (`NodeGroupDemand.members`). The autoscaler sets it; a
+  // sizing question (`legion scaling demand`) leaves it off. Members are
+  // listed only in pools the caller has `node:read` on.
+  bool members = 7;
+
+  // With `members`: for each live, schedulable member whose reserved share
+  // (the larger of CPU and memory) is under 50%, simulate whether every
+  // allocation on it would fit on the group's other live, schedulable
+  // members, with the demand's own feasibility rules
+  // (`NodeGroupMember.fits_elsewhere`). For `down.when = "underutilized"`.
+  bool fit_check = 8;
 }
 
 // A member's size and attributes, as `GetCapacityDemand` builds its node.
@@ -4770,6 +4825,87 @@ message NodeGroupDemand {
 
   // The synthetic node's config attributes, as a JSON object.
   string node_attributes_json = 11;
+
+  // With the template's `members`: the group's members, by node id.
+  repeated NodeGroupMember members = 12;
+}
+
+// One member of a node group, as node scale-in sees it.
+message NodeGroupMember {
+  // The node id.
+  string node_id = 1;
+
+  // Its status (`active`, `lost`, …).
+  string status = 2;
+
+  // Its availability (`available`, or `drained` when cordoned).
+  string availability = 3;
+
+  // Its `legion.provider-id` (the instance it runs on), when it joined
+  // with one.
+  string provider_id = 4;
+
+  // Its `legion.scale-in` attribute (`never` protects it).
+  string scale_in = 5;
+
+  // Reserved CPU over allocatable CPU, 0 to 1 (0 when unbounded).
+  double reserved_cpu = 6;
+
+  // Reserved memory over allocatable memory, 0 to 1 (0 when unbounded).
+  double reserved_memory = 7;
+
+  // Its allocations.
+  repeated NodeGroupAllocation allocations = 8;
+
+  // With `fit_check`, for an underutilized member: whether every
+  // allocation on it fits on the group's other members. Unset when not
+  // simulated.
+  optional bool fits_elsewhere = 9;
+
+  // Why it does not fit, or `fits on w-2, w-5`.
+  string fit_detail = 10;
+}
+
+// One allocation on a node-group member.
+message NodeGroupAllocation {
+  // The allocation id.
+  int64 allocation_id = 1;
+
+  // Its job (empty when `redacted`).
+  string job_id = 2;
+
+  // Its job's namespace (`legion-system` makes the node never a victim).
+  string namespace = 3;
+
+  // Its task group (empty when `redacted`).
+  string task_group = 4;
+
+  // Its task (empty when `redacted`).
+  string task_name = 5;
+
+  // `work`, `session-envelope` (one per node; with no live sessions it
+  // does not keep the node from being empty), or `per-node` (a
+  // `count.per = "id"` task: one per node by design).
+  string kind = 6;
+
+  // For a session envelope: the live sessions in it.
+  uint32 sessions = 7;
+
+  // It holds stateful node-local storage: its data lives on this machine.
+  bool node_local_storage = 8;
+
+  // Draining this node now would take its task below its
+  // `disruption.minAvailable` (or a gang below its quorum): the task's
+  // live allocations, less the ones on this node, would be under the
+  // floor.
+  bool breaks_min_available = 9;
+
+  // With `breaks_min_available`: `web/web has 3 live, 2 on this node,
+  // minAvailable 2`.
+  string min_available_detail = 10;
+
+  // The job is outside the caller's `job:read`: its names are left out.
+  bool redacted = 11;
 }
 
 // Why a template cannot host some pending replicas.
@@ -5353,6 +5489,7 @@ message ScalingTargetReport {
   // - `deferred`: a scale-in waits for a rollout;
   // - `pinned`, `paused`: an operator holds the target;
   // - `dry-run`: the policy would have changed the count;
+  // - `draining`: a node group is draining members (scale-in in flight);
   // - `missing-data`: no check has data;
   // - `invalid`: the policy does not resolve;
   // - `error`: the evaluation or write failed (the summary says why).
@@ -5389,11 +5526,20 @@ message ScalingTargetReport {
 // event.
 message ScalingEventFlag {
   // `limited` (`scale.limited`), `flapping` (`scale.flapping`), or
-  // `check_failed` (`scale.check_failed`).
+  // `check_failed` (`scale.check_failed`); for a node group also `pending`
+  // (`nodegroup.pending`: waiting work needs new nodes of the group),
+  // `join_timeout` (`nodegroup.join_timeout`: nodes asked for did not join
+  // within `up.joinTimeout`), or `scale_in` (`nodegroup.scale_in`: a drain
+  // finished, see `outcome`).
   string kind = 1;
 
   // What happened, for people.
   string message = 2;
+
+  // For `scale_in`: `completed` (the node was terminated and forgotten) or
+  // `aborted` (the drain outlived `down.drainDeadline`, was uncordoned by
+  // someone else, or the group was paused; the node was uncordoned).
+  string outcome = 3;
 }
 
 // Reply payload for ReportScalingStatus.
@@ -5407,7 +5553,7 @@ message ReportScalingStatusReply {
 
 // Request payload for RecordScalingAction.
 message RecordScalingActionRequest {
-  // Canonical job id.
+  // Canonical job id (a `would` row for a task target).
   string job_id = 1;
 
   // Task group.
@@ -5417,35 +5563,152 @@ message RecordScalingActionRequest {
   string task_name = 3;
 
   // The action:
-  // - `would`: a dry-run policy's decision (`applied = false`);
-  // - `scale`: a standalone policy's change, recorded before the app calls
-  //   the target plugin. Refused with FAILED_PRECONDITION while a pause
-  //   covers the policy, so a pause holds even against a misbehaving app.
-  //   Written as a `scaled` row and a `scale.applied` event;
-  // - `failed`: the target plugin refused or failed the `scale` just
-  //   recorded (`applied = false`, the error in the decision's summary).
+  // - `would`: a dry-run policy's decision, recorded as a history row with
+  //   `applied = false` (`legion scaling history` shows what the policy
+  //   would have done). Names a task (`job_id`, `task_group`, `task_name`)
+  //   or a standalone policy (`policy`), with `from`, `to` and `decision`.
+  // - `intent`: open an action intent on a standalone policy before the
+  //   app acts on its target (calls `target/scale`, starts a drain, calls
+  //   `target/terminate`, forgets a node). Needs `policy`, `intent` and
+  //   `expected_action_version`; written only when the policy's action row
+  //   is still at that version (compare-and-set), so of two autoscaler
+  //   replicas whose leases overlap exactly one wins and acts (`won`), and
+  //   the other reads the winner's intent from `action` instead. Refused
+  //   with FAILED_PRECONDITION while a pause covers the policy, when the
+  //   intent changes the count (`desired`) or starts a drain (`cordon`):
+  //   a pause holds even against a misbehaving app. Drains already past
+  //   their drain step (terminate, forget) and aborts (uncordon) go on
+  //   under a pause. Written with the intent's history rows (`scaled`,
+  //   `drain`, `terminate`, `forget`, `uncordon`) and a `scale.applied`
+  //   event for a count change.
+  // - `outcome`: close the open intent at `expected_action_version` with
+  //   `outcome` (`succeeded`, `failed`, or `reconciled`, for an intent a
+  //   crashed replica left open) and `detail`. Compare-and-set like
+  //   `intent`. A `failed` outcome of an intent that changed the count
+  //   writes a `failed` history row.
   //
-  // `scale` and `failed` need `policy`; task targets change their count
-  // through ScaleTask. Other kinds are refused.
+  // Other kinds are refused with INVALID_ARGUMENT. A task target changes
+  // its count through ScaleTask, never here.
   string kind = 4;
 
-  // The count when decided.
+  // `would`: the count when decided.
   uint32 from = 5;
 
-  // The count the policy would have written, or wrote.
+  // `would`: the count the policy would have written.
   uint32 to = 6;
 
-  // The decision.
+  // The decision (`would`, and the history rows of an `intent`).
   ScaleDecision decision = 7;
 
   // A standalone policy's canonical id, instead of a job, group and task.
+  // Required for `intent` and `outcome`.
   string policy = 8;
+
+  // `intent` and `outcome`: the version of the policy's action row the
+  // app last read (from WatchScalingPolicies, or the last
+  // RecordScalingAction reply); 0 when the policy has none yet.
+  uint64 expected_action_version = 9;
+
+  // `intent`: what the app is about to do.
+  ScalingActionIntent intent = 10;
+
+  // `outcome`: `succeeded`, `failed`, or `reconciled`.
+  string outcome = 11;
+
+  // `outcome`: what happened, for people (a plugin's error, or what the
+  // target's status showed when reconciling).
+  string detail = 12;
+
+  // The app instance writing (shown as the action's `owner`).
+  string instance = 13;
+}
+
+// What the autoscaler is about to do to a standalone policy's target: the
+// payload of an action intent.
+message ScalingActionIntent {
+  // The decision's id (`legion scaling history` shows it).
+  string decision_id = 1;
+
+  // The target's count when decided.
+  uint32 from = 2;
+
+  // `target/scale` to this count, when the intent changes it.
+  optional uint32 desired = 3;
+
+  // Node groups: members to cordon and drain (scale-in victims).
+  repeated ScalingActionNode cordon = 4;
+
+  // Node groups: members whose instances `target/terminate` stops.
+  repeated ScalingActionNode terminate = 5;
+
+  // Node groups: members `ForgetNode` removes (their instances are gone).
+  repeated string forget = 6;
+
+  // Node groups: members to uncordon (an aborted drain).
+  repeated string uncordon = 7;
+
+  // The decision in one line.
+  string summary = 8;
+
+  // Node groups: every drain in flight once this intent is carried out,
+  // as the engine's JSON (node, provider id, start, phase). A replica that
+  // takes the group over resumes them from here.
+  string drains_json = 9;
+}
+
+// One node in an action intent.
+message ScalingActionNode {
+  // The node id.
+  string node = 1;
+
+  // Its `legion.provider-id`, what `target/terminate` takes.
+  string provider_id = 2;
+}
+
+// A standalone policy's action row: its latest action intent and how it
+// ended.
+message ScalingAction {
+  // The policy's canonical id.
+  string policy = 1;
+
+  // The row's version: the compare-and-set token the next intent or
+  // outcome names. Never repeats.
+  uint64 version = 2;
+
+  // `open` (the intent was written and its outcome is not in yet),
+  // `succeeded`, `failed`, or `reconciled`.
+  string state = 3;
+
+  // The intent.
+  ScalingActionIntent intent = 4;
+
+  // The app instance that opened it.
+  string owner = 5;
+
+  // When it was opened, unix ms.
+  int64 opened_at_unix_ms = 6;
+
+  // When it was closed, unix ms; 0 while open.
+  int64 closed_at_unix_ms = 7;
+
+  // What closing it said.
+  string detail = 8;
 }
 
 // Reply payload for RecordScalingAction.
 message RecordScalingActionReply {
-  // The history row written.
+  // The history row written (`would`; the first of an intent's rows; 0
+  // when none was).
   uint64 history_id = 1;
+
+  // `intent` and `outcome`: whether this write won the compare-and-set.
+  // False: the action row had moved past `expected_action_version`;
+  // nothing was written, and `action` is the row as it is.
+  bool won = 2;
+
+  // `intent` and `outcome`: the policy's action row after the call (unset
+  // when the policy has none).
+  ScalingAction action = 3;
 }
 
 // Request payload for GetScalingStatus.
@@ -5593,8 +5856,10 @@ message ScalingTargetStatus {
   // is the effective policy's provenance, above.)
   string policy_id = 23;
 
-  // `task`, `group` (a task's whole group moves together), or `external`
-  // (a standalone policy's target plugin).
+  // `task`, `group` (a task's whole group moves together), `external`
+  // (a standalone policy's target plugin), or `nodes` (a node group:
+  // `now` is the count its provider holds, and `decision_json` is the node
+  // group's decision, with its victims and protected members).
   string kind = 24;
 }
 
@@ -5842,10 +6107,11 @@ message ScalingPolicySummary {
   // id (`namespace/name`, or `name` in `default`) for a standalone policy.
   string id = 1;
 
-  // `task`, `group` (a task's whole group moves together), or `external`.
+  // `task`, `group` (a task's whole group moves together), `external`, or
+  // `nodes` (a node group).
   string kind = 2;
 
-  // The namespace.
+  // The namespace (empty for a node group).
   string namespace = 3;
 
   // The effective mode: `enforce` or `dry-run`. Empty when invalid.
@@ -5897,7 +6163,8 @@ message StandaloneScalingPolicy {
   // Its name.
   string name = 3;
 
-  // `external`.
+  // `external` (a target plugin), or `nodes` (a node group, whose
+  // namespace is empty: it belongs to the cluster).
   string kind = 4;
 
   // The stored version.
@@ -5915,8 +6182,10 @@ message StandaloneScalingPolicy {
   // The effective policy's digest.
   string digest = 8;
 
-  // The effective policy as canonical JSON (the shape of
-  // `ScalingPolicy.policy_json`). Empty when invalid.
+  // The effective policy as canonical JSON: the shape of
+  // `ScalingPolicy.policy_json` for an external target, the node group's
+  // effective record (every default filled) for a node group. Empty when
+  // invalid.
   string policy_json = 9;
 
   // The target plugin.
@@ -5931,6 +6200,11 @@ message StandaloneScalingPolicy {
 
   // The policy in one line.
   string summary = 13;
+
+  // The policy's action row (RecordScalingAction): its version, which the
+  // next intent names, and the latest intent with the drains a node group
+  // has in flight. Unset before the first intent.
+  ScalingAction action = 14;
 }
 
 // Request payload for DestroyJob.

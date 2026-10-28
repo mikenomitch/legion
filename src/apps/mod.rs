@@ -608,9 +608,11 @@ mod tests {
 
     /// The autoscaler asks for exactly what it calls: policies, inputs,
     /// status, and history (`scale:read`), count writes and pauses
-    /// (`scale:write`), and nodes and their capacity demand for the
-    /// node-group panel (`node:read`). Its reports are app-plane and need no
-    /// rule (autoscaler-v2 calls entry 37).
+    /// (`scale:write`), the jobs on a node group's members (`job:read`),
+    /// and nodes, their capacity demand, join tokens, drains, and forgets
+    /// for node groups (`node:read`, `node:write`). Its reports and action
+    /// intents are app-plane and need no rule (autoscaler-v2 calls entry
+    /// 37).
     #[test]
     fn the_autoscaler_manifest_asks_for_what_it_calls() {
         let manifest = bundled_manifest("autoscaler").expect("bundled");
@@ -619,7 +621,8 @@ mod tests {
             rules,
             json!([
                 { "resources": ["scale"], "actions": ["read", "write"], "namespaces": ["*"] },
-                { "resources": ["node"], "actions": ["read"] },
+                { "resources": ["job"], "actions": ["read"], "namespaces": ["*"] },
+                { "resources": ["node"], "actions": ["read", "write"] },
             ])
         );
         // Its UI: a sidebar page, a job panel, task badges, a node panel,

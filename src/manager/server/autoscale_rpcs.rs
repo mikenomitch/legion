@@ -2,8 +2,9 @@
 //! §6.6, §6.13): the scale write with pins and compare-and-set
 //! (`ScaleTask`), the policy stream (`WatchScalingPolicies`), the cluster's
 //! scaling defaults, the app-plane reports (`ReportScalingStatus`,
-//! `RecordScalingAction`), and the read and pause surface people use
-//! (`GetScalingStatus`, `GetScaleHistory`, `PauseScaling`).
+//! `RecordScalingAction` and its action intents), and the read and pause
+//! surface people use (`GetScalingStatus`, `GetScaleHistory`,
+//! `PauseScaling`), for task targets, standalone policies, and node groups.
 
 use super::*;
 use crate::autoscaler::defaults::ResolvedPolicy;
@@ -14,15 +15,16 @@ use crate::manager::autoscale::{
 };
 use crate::manager::scaling_status::AppLiveness;
 use crate::storage::store::{
-    covering_pause, HistoryRow, NewHistory, PauseRow, ScaleWrite, ScaleWriteOp, TaskScale,
-    TaskScalePin, PAUSE_ANY,
+    covering_pause, ActionHistory, ActionWrite, HistoryRow, NewHistory, PauseRow, ScaleWrite,
+    ScaleWriteOp, TaskScale, TaskScalePin, PAUSE_ANY,
 };
 use crate::structs::{
     ApplyScalingDefaultsReply, ApplyScalingDefaultsRequest, GetScaleHistoryReply,
     GetScaleHistoryRequest, GetScalingDefaultsReply, GetScalingDefaultsRequest,
     GetScalingStatusReply, GetScalingStatusRequest, PauseScalingReply, PauseScalingRequest,
     RecordScalingActionReply, RecordScalingActionRequest, ReportScalingStatusReply,
-    ReportScalingStatusRequest, ScaleDecision, ScaleHistoryEntry, ScalePin, ScalingAppStatus,
+    ReportScalingStatusRequest, ScaleDecision, ScaleHistoryEntry, ScalePin, ScalingActionIntent,
+    ScalingAppStatus,
     ScalingPauseInfo, ScalingPolicy, ScalingPolicyChange, ScalingPolicySet, ScalingProvenanceRow,
     ScalingTargetStatus, StandaloneScalingPolicy, WatchScalingPoliciesRequest,
 };
@@ -166,14 +168,20 @@ fn policy_proto(target: &TargetPolicy) -> ScalingPolicy {
 }
 
 /// Verify a decision's policy hashes to its digest, so a history digest
-/// always names the policy it claims.
+/// always names the policy it claims. The policy is a task's or an external
+/// target's effective policy, or a node group's.
 fn check_decision(decision: &ScaleDecision) -> Result<(), Status> {
     if decision.policy_json.is_empty() {
         return Ok(());
     }
-    let policy: EffectivePolicy = serde_json::from_str(&decision.policy_json)
-        .map_err(|err| Status::invalid_argument(format!("decision.policy_json: {err}")))?;
-    let digest = policy.digest();
+    let digest = match serde_json::from_str::<EffectivePolicy>(&decision.policy_json) {
+        Ok(policy) => policy.digest(),
+        Err(err) => serde_json::from_str::<crate::autoscaler::EffectiveNodeGroup>(
+            &decision.policy_json,
+        )
+        .map(|group| group.digest())
+        .map_err(|_| Status::invalid_argument(format!("decision.policy_json: {err}")))?,
+    };
     if digest != decision.policy_digest {
         return Err(Status::invalid_argument(format!(
             "decision.policy_digest {} does not match policy_json (which hashes to {digest})",
@@ -812,12 +820,13 @@ impl ManagerDaemonService {
                     let policies = store.namespace_policy_fingerprint()?;
                     let standalone = store.scaling_policy_fingerprint()?;
                     let pauses = store.scaling_pause_fingerprint()?;
+                    let actions = store.scaling_action_fingerprint()?;
                     let plugins = store
                         .get_app(crate::manager::autoscale::AUTOSCALER_APP)?
                         .map(|record| record.updated_at)
                         .unwrap_or_default();
                     Ok(format!(
-                        "{configs:?}|{defaults}|{policies:?}|{standalone:?}|{pauses:?}|{plugins}"
+                        "{configs:?}|{defaults}|{policies:?}|{standalone:?}|{pauses:?}|{actions:?}|{plugins}"
                     ))
                 })();
                 let probe = match probe {
@@ -856,26 +865,38 @@ impl ManagerDaemonService {
                     .map(policy_proto)
                     .collect();
                 let pauses = store.scaling_pauses().unwrap_or_default();
+                let actions = store.scaling_actions().unwrap_or_default();
                 let now_ms = now_unix_ms();
                 let standalone: Vec<StandaloneScalingPolicy> =
                     match super::scaling_policy_rpcs::load_policies(&store, &layers) {
                         Ok(loaded) => loaded
                             .iter()
                             .filter(|policy| {
-                                namespaces.as_ref().is_none_or(|selection| {
-                                    selection.matches(&policy.row.namespace)
-                                })
+                                // A node group has no namespace: any
+                                // selection includes it.
+                                policy.is_nodes()
+                                    || namespaces.as_ref().is_none_or(|selection| {
+                                        selection.matches(&policy.row.namespace)
+                                    })
                             })
                             .filter(|policy| {
-                                identity.allows(
-                                    AclResource::Scale,
-                                    AclAction::Read,
-                                    &AclScope::job(&policy.id()),
-                                )
+                                if policy.is_nodes() {
+                                    identity.allows(
+                                        AclResource::Node,
+                                        AclAction::Read,
+                                        &AclScope::any(),
+                                    )
+                                } else {
+                                    identity.allows(
+                                        AclResource::Scale,
+                                        AclAction::Read,
+                                        &AclScope::job(&policy.id()),
+                                    )
+                                }
                             })
                             .map(|policy| {
                                 super::scaling_policy_rpcs::standalone_proto(
-                                    policy, &pauses, now_ms,
+                                    policy, &pauses, &actions, now_ms,
                                 )
                             })
                             .collect(),
@@ -1015,17 +1036,16 @@ impl ManagerDaemonService {
             };
             let after = next.resolve_standalone(spec);
             let before_digest = policy
-                .resolved
-                .as_ref()
+                .external()
                 .map(|resolved| resolved.digest.clone())
                 .unwrap_or_default();
             let (after_digest, error, fields) = match &after {
                 Ok(resolved) => (
                     resolved.digest.clone(),
                     String::new(),
-                    match &policy.resolved {
-                        Ok(before) => changed_fields(before, resolved),
-                        Err(_) => Vec::new(),
+                    match policy.external() {
+                        Some(before) => changed_fields(before, resolved),
+                        None => Vec::new(),
                     },
                 ),
                 Err(err) => (String::new(), err.clone(), Vec::new()),
@@ -1219,6 +1239,13 @@ impl ManagerDaemonService {
                         &target.task_name,
                         &flag.message,
                     );
+                } else if matches!(flag.kind.as_str(), "pending" | "join_timeout" | "scale_in") {
+                    self.store.events().nodegroup_flag(
+                        &flag.kind,
+                        &target.policy,
+                        &flag.message,
+                        &flag.outcome,
+                    );
                 } else {
                     self.store.events().scale_policy_flag(
                         &flag.kind,
@@ -1238,6 +1265,7 @@ impl ManagerDaemonService {
     }
 
     // ACL: app-plane (the autoscaler app's own identity, or management).
+    #[instrument(skip_all, fields(kind = %request.get_ref().kind, policy = %request.get_ref().policy))]
     pub(super) async fn record_scaling_action_rpc(
         &self,
         request: Request<RecordScalingActionRequest>,
@@ -1245,26 +1273,27 @@ impl ManagerDaemonService {
         let identity = self.enforce_app_plane(&request)?;
         let inner = request.into_inner();
         let policy = inner.policy.trim().to_string();
+        let now_ms = now_unix_ms();
         match inner.kind.as_str() {
             "would" => {}
-            "scale" | "failed" if !policy.is_empty() => {}
-            "scale" | "failed" => {
+            "intent" | "outcome" if policy.is_empty() => {
                 return Err(Status::invalid_argument(format!(
-                    "a `{}` action names a standalone policy (`policy`); a task's count \
-                     changes through ScaleTask",
+                    "an `{}` names a standalone policy (`policy`); a task's count changes \
+                     through ScaleTask",
                     inner.kind
                 )))
             }
+            "intent" => return self.open_intent(&identity, inner, policy, now_ms),
+            "outcome" => return self.close_intent(&identity, inner, policy, now_ms),
             other => {
                 return Err(Status::invalid_argument(format!(
-                    "unknown action kind '{other}': use would (a dry-run decision), or scale or \
-                     failed (a standalone policy's target)"
+                    "unknown action kind '{other}': use would (a dry-run decision), intent \
+                     (before acting on a standalone policy's target), or outcome (after)"
                 )))
             }
         }
         let decision = inner.decision.unwrap_or_default();
         check_decision(&decision)?;
-        let now_ms = now_unix_ms();
         let (job_id, task_group, task_name) = if policy.is_empty() {
             (
                 inner.job_id.clone(),
@@ -1273,26 +1302,6 @@ impl ManagerDaemonService {
             )
         } else {
             (policy_target_key(&policy), String::new(), String::new())
-        };
-        if inner.kind == "scale" {
-            // A pause holds even against a misbehaving app.
-            let pauses = self
-                .store
-                .scaling_pauses()
-                .map_err(|e| map_store_error("Error loading pauses", e))?;
-            if let Some(pause) = covering_pause(&pauses, &job_id, "", "", now_ms) {
-                return Err(Status::failed_precondition(format!(
-                    "scaling policy {policy} is paused ({} by {}): the autoscaler may not scale \
-                     it. Hint: `legion scaling resume`",
-                    pause.scope(),
-                    pause.principal
-                )));
-            }
-        }
-        let (kind, applied) = match inner.kind.as_str() {
-            "scale" => ("scaled", true),
-            "failed" => ("failed", false),
-            _ => ("would", false),
         };
         let history_id = self
             .store
@@ -1305,21 +1314,209 @@ impl ManagerDaemonService {
                 inner.to,
                 "autoscaler",
                 &identity.principal,
-                kind,
-                applied,
+                "would",
+                false,
                 new_history(Some(&decision)),
             )
             .map_err(|e| map_store_error("Error recording scaling action", e))?;
-        if kind == "scaled" {
-            self.store.events().scale_policy_applied(
-                &policy,
-                inner.from,
-                inner.to,
-                &decision.summary,
-            );
-        }
         Ok(Response::new(RecordScalingActionReply {
             history_id: history_id.max(0) as u64,
+            won: false,
+            action: None,
+        }))
+    }
+
+    /// `RecordScalingAction` `intent`: compare-and-set a policy's action
+    /// row, with the intent's history rows.
+    fn open_intent(
+        &self,
+        identity: &AclIdentity,
+        inner: RecordScalingActionRequest,
+        policy: String,
+        now_ms: i64,
+    ) -> Result<Response<RecordScalingActionReply>, Status> {
+        let intent = inner
+            .intent
+            .ok_or_else(|| Status::invalid_argument("an `intent` carries `intent`"))?;
+        let decision = inner.decision.unwrap_or_default();
+        check_decision(&decision)?;
+        let (namespace, name) = crate::structs::namespace::split_job_id(&policy);
+        let exists = self
+            .store
+            .scaling_policy(namespace, name)
+            .map_err(|e| map_store_error("Error reading scaling policy", e))?
+            .is_some()
+            || (!policy.contains('/')
+                && self
+                    .store
+                    .scaling_policy("", &policy)
+                    .map_err(|e| map_store_error("Error reading scaling policy", e))?
+                    .is_some());
+        if !exists {
+            return Err(Status::not_found(format!(
+                "scaling policy {policy} not found"
+            )));
+        }
+        let key = policy_target_key(&policy);
+        if intent.desired.is_some() || !intent.cordon.is_empty() {
+            // A pause holds even against a misbehaving app: no new count,
+            // no new drain. Drains past their drain step go on.
+            let pauses = self
+                .store
+                .scaling_pauses()
+                .map_err(|e| map_store_error("Error loading pauses", e))?;
+            if let Some(pause) = covering_pause(&pauses, &key, "", "", now_ms) {
+                return Err(Status::failed_precondition(format!(
+                    "scaling policy {policy} is paused ({} by {}): the autoscaler may not scale \
+                     it. Hint: `legion scaling resume`",
+                    pause.scope(),
+                    pause.principal
+                )));
+            }
+        }
+        let history = new_history(Some(&decision));
+        let step = |kind: &str, what: String| ActionHistory {
+            from: intent.from,
+            to: intent.from,
+            kind: kind.to_string(),
+            applied: true,
+            history: NewHistory {
+                summary: what,
+                ..history.clone()
+            },
+        };
+        let mut rows = Vec::new();
+        if let Some(desired) = intent.desired {
+            rows.push(ActionHistory {
+                from: intent.from,
+                to: desired,
+                kind: "scaled".to_string(),
+                applied: true,
+                history: history.clone(),
+            });
+        }
+        for node in &intent.cordon {
+            rows.push(step("drain", format!("drain {}: {}", node.node, intent.summary)));
+        }
+        for node in &intent.terminate {
+            rows.push(step(
+                "terminate",
+                format!("terminate {} (instance {})", node.node, node.provider_id),
+            ));
+        }
+        for node in &intent.forget {
+            rows.push(step("forget", format!("forget {node}: its instance is gone")));
+        }
+        for node in &intent.uncordon {
+            rows.push(step("uncordon", format!("uncordon {node}: drain abandoned")));
+        }
+        let intent_json = serde_json::to_string(&intent)
+            .map_err(|err| Status::internal(format!("encoding the intent: {err}")))?;
+        let written = self
+            .store
+            .open_scaling_action(
+                &policy,
+                inner.expected_action_version,
+                &intent_json,
+                &inner.instance,
+                &identity.principal,
+                now_ms,
+                rows,
+            )
+            .map_err(|e| map_store_error("Error recording the action intent", e))?;
+        Ok(Response::new(match written {
+            ActionWrite::Won(row) => {
+                if let Some(desired) = intent.desired {
+                    self.store.events().scale_policy_applied(
+                        &policy,
+                        intent.from,
+                        desired,
+                        &decision.summary,
+                    );
+                }
+                info!(
+                    policy = %policy,
+                    version = row.version,
+                    owner = %row.owner,
+                    "Scaling action intent opened"
+                );
+                RecordScalingActionReply {
+                    history_id: 0,
+                    won: true,
+                    action: Some(super::scaling_policy_rpcs::action_proto(&row)),
+                }
+            }
+            ActionWrite::Lost(row) => {
+                debug!(policy = %policy, expected = inner.expected_action_version, "Scaling action intent lost the compare-and-set");
+                RecordScalingActionReply {
+                    history_id: 0,
+                    won: false,
+                    action: row.as_ref().map(super::scaling_policy_rpcs::action_proto),
+                }
+            }
+        }))
+    }
+
+    /// `RecordScalingAction` `outcome`: close the open intent.
+    fn close_intent(
+        &self,
+        identity: &AclIdentity,
+        inner: RecordScalingActionRequest,
+        policy: String,
+        now_ms: i64,
+    ) -> Result<Response<RecordScalingActionReply>, Status> {
+        let outcome = inner.outcome.trim();
+        if !matches!(outcome, "succeeded" | "failed" | "reconciled") {
+            return Err(Status::invalid_argument(format!(
+                "outcome {outcome:?}: use succeeded, failed, or reconciled"
+            )));
+        }
+        let current = self
+            .store
+            .scaling_action(&policy)
+            .map_err(|e| map_store_error("Error reading the action intent", e))?;
+        let mut rows = Vec::new();
+        if outcome == "failed" {
+            if let Some(intent) = current
+                .as_ref()
+                .filter(|row| row.version == inner.expected_action_version)
+                .and_then(|row| serde_json::from_str::<ScalingActionIntent>(&row.intent).ok())
+            {
+                if let Some(desired) = intent.desired {
+                    rows.push(ActionHistory {
+                        from: intent.from,
+                        to: desired,
+                        kind: "failed".to_string(),
+                        applied: false,
+                        history: NewHistory {
+                            summary: format!("target/scale to {desired} failed: {}", inner.detail),
+                            decision_id: intent.decision_id.clone(),
+                            ..Default::default()
+                        },
+                    });
+                }
+            }
+        }
+        let written = self
+            .store
+            .close_scaling_action(
+                &policy,
+                inner.expected_action_version,
+                outcome,
+                &inner.detail,
+                &identity.principal,
+                now_ms,
+                rows,
+            )
+            .map_err(|e| map_store_error("Error recording the action outcome", e))?;
+        let (won, row) = match written {
+            ActionWrite::Won(row) => (true, Some(row)),
+            ActionWrite::Lost(row) => (false, row),
+        };
+        Ok(Response::new(RecordScalingActionReply {
+            history_id: 0,
+            won,
+            action: row.as_ref().map(super::scaling_policy_rpcs::action_proto),
         }))
     }
 
@@ -1351,12 +1548,7 @@ impl ManagerDaemonService {
             )?;
         }
         if !policy.is_empty() {
-            acl::enforce(
-                &identity,
-                AclResource::Scale,
-                AclAction::Read,
-                &AclScope::job(&policy),
-            )?;
+            self.gate_policy_ref(&identity, &policy, false)?;
         }
         self.store
             .require_lane_leader(crate::storage::Lane::Status, "GetScalingStatus")
@@ -1426,11 +1618,11 @@ impl ManagerDaemonService {
                     continue;
                 }
                 if let Some(selection) = namespaces.as_ref() {
-                    if !selection.matches(&standalone.row.namespace) {
+                    if !standalone.is_nodes() && !selection.matches(&standalone.row.namespace) {
                         continue;
                     }
                 }
-                if !identity.allows(AclResource::Scale, AclAction::Read, &AclScope::job(&id)) {
+                if !self.may_read_policy(&identity, &standalone.row.kind, &id) {
                     continue;
                 }
                 found = true;
@@ -1473,28 +1665,11 @@ impl ManagerDaemonService {
             .map(|row| history_proto(row, None, false));
         let board = self.store.scaling_status();
         let entry = board.target(&key, "", "");
-        let (mode, min, max, digest, error, policy_summary) = match &policy.resolved {
-            Ok(resolved) => (
-                resolved.policy.mode.to_string(),
-                resolved.policy.min,
-                resolved.policy.max,
-                resolved.digest.clone(),
-                String::new(),
-                summary_line(&resolved.policy),
-            ),
-            Err(err) => (
-                String::new(),
-                0,
-                0,
-                String::new(),
-                err.clone(),
-                format!("invalid: {err}"),
-            ),
-        };
-        let (state, current, want, evaluated, summary, decision) = match (&policy.resolved, &entry)
-        {
-            (Err(_), _) => ("invalid".to_string(), 0, 0, 0, error.clone(), String::new()),
-            (Ok(_), Some(entry)) if board.is_stale(entry.received, now) => (
+        let facts = policy.resolved.as_ref().ok().map(|resolved| resolved.facts());
+        let error = policy.resolved.as_ref().err().cloned().unwrap_or_default();
+        let (state, current, want, evaluated, summary, decision) = match (&facts, &entry) {
+            (None, _) => ("invalid".to_string(), 0, 0, 0, error.clone(), String::new()),
+            (Some(_), Some(entry)) if board.is_stale(entry.received, now) => (
                 "stale".to_string(),
                 entry.current,
                 entry.current,
@@ -1502,7 +1677,7 @@ impl ManagerDaemonService {
                 entry.summary.clone(),
                 entry.decision_json.clone(),
             ),
-            (Ok(_), Some(entry)) => (
+            (Some(_), Some(entry)) => (
                 entry.state.clone(),
                 entry.current,
                 entry.want,
@@ -1510,7 +1685,7 @@ impl ManagerDaemonService {
                 entry.summary.clone(),
                 entry.decision_json.clone(),
             ),
-            (Ok(_), None) => (
+            (Some(_), None) => (
                 "not-evaluated".to_string(),
                 0,
                 0,
@@ -1519,29 +1694,35 @@ impl ManagerDaemonService {
                 String::new(),
             ),
         };
-        let (policy_rows, policy_json) = match (&policy.resolved, detail) {
-            (Ok(resolved), true) => (provenance_proto(resolved), resolved.policy.canonical_json()),
+        let (policy_rows, policy_json) = match (policy.external(), &facts, detail) {
+            (Some(resolved), _, true) => {
+                (provenance_proto(resolved), resolved.policy.canonical_json())
+            }
+            (None, Some(facts), true) => (Vec::new(), facts.policy_json.clone()),
             _ => (Vec::new(), String::new()),
         };
         Ok(ScalingTargetStatus {
-            mode,
+            mode: facts.as_ref().map(|f| f.mode.clone()).unwrap_or_default(),
             now: current,
             want,
-            min,
-            max,
+            min: facts.as_ref().map_or(0, |f| f.min),
+            max: facts.as_ref().map_or(0, |f| f.max),
             state,
             last_evaluation_unix_ms: evaluated,
             summary,
             last_change,
             pause,
-            policy_digest: digest,
-            error,
+            policy_digest: facts.as_ref().map(|f| f.digest.clone()).unwrap_or_default(),
             decision_json: if detail { decision } else { String::new() },
             policy: policy_rows,
             policy_json,
-            policy_summary,
+            policy_summary: match &facts {
+                Some(facts) => facts.summary.clone(),
+                None => format!("invalid: {error}"),
+            },
+            error,
             policy_id: id,
-            kind: "external".to_string(),
+            kind: policy.row.kind.clone(),
             ..Default::default()
         })
     }
@@ -1757,18 +1938,39 @@ impl ManagerDaemonService {
         }
     }
 
-    // ACL: scale:read on the job, or on the standalone policy.
+    // ACL: scale:read on the job, or on the standalone policy; a node
+    // group's with node:read. A policy is gated with either grant before
+    // its lookup, then held to its kind's.
     pub(super) async fn get_scale_history_rpc(
         &self,
         request: Request<GetScaleHistoryRequest>,
     ) -> Result<Response<GetScaleHistoryReply>, Status> {
         let policy = request.get_ref().policy.trim().to_string();
-        let scope = if policy.is_empty() {
-            self.job_read_scope(&request.get_ref().job)
+        if policy.is_empty() {
+            let scope = self.job_read_scope(&request.get_ref().job);
+            self.check_acl(&request, AclResource::Scale, AclAction::Read, scope)?;
         } else {
-            AclScope::job(&policy)
-        };
-        self.check_acl(&request, AclResource::Scale, AclAction::Read, scope)?;
+            let identity = self.authenticate_acl(&request)?;
+            self.gate_policy_ref(&identity, &policy, false)?;
+            if !identity.allows(AclResource::Scale, AclAction::Read, &AclScope::job(&policy)) {
+                // Only the node-group grant let it through: the policy must
+                // be a node group.
+                let node_group = !policy.contains('/')
+                    && self
+                        .store
+                        .scaling_policy("", &policy)
+                        .map_err(|e| map_store_error("Error reading scaling policy", e))?
+                        .is_some();
+                if !node_group {
+                    acl::enforce(
+                        &identity,
+                        AclResource::Scale,
+                        AclAction::Read,
+                        &AclScope::job(&policy),
+                    )?;
+                }
+            }
+        }
         let mut req = request.into_inner();
         if !policy.is_empty() {
             req.job = policy_target_key(&policy);
@@ -1823,13 +2025,12 @@ impl ManagerDaemonService {
                 AclScope::none(),
             )?
         } else if !policy.is_empty() {
-            // The policy's scope needs no lookup: its id names it.
-            self.check_acl(
-                &request,
-                AclResource::Scale,
-                AclAction::Write,
-                AclScope::job(&policy),
-            )?
+            // Gated before the lookup with either grant (an external
+            // policy's, or the node-group grant); held to its kind's once
+            // the policy is found.
+            let identity = self.authenticate_acl(&request)?;
+            self.gate_policy_ref(&identity, &policy, true)?;
+            identity
         } else {
             let job = request.get_ref().job.trim().to_string();
             if job.is_empty() {
@@ -1871,23 +2072,25 @@ impl ManagerDaemonService {
                 "the whole cluster".to_string(),
             )
         } else if !policy.is_empty() {
-            let (namespace, name) = crate::structs::namespace::split_job_id(&policy);
-            if self
-                .store
-                .scaling_policy(namespace, name)
-                .map_err(|e| map_store_error("Error reading scaling policy", e))?
-                .is_none()
-            {
-                return Err(Status::not_found(format!(
-                    "scaling policy {policy} not found. Hint: `legion scaling list` shows the \
-                     policies"
-                )));
-            }
+            let row = self
+                .find_policy(&policy, "", self.may_write_node_groups(&identity))?
+                .ok_or_else(|| {
+                    Status::not_found(format!(
+                        "scaling policy {policy} not found. Hint: `legion scaling list` shows \
+                         the policies"
+                    ))
+                })?;
+            let id = row.id();
+            self.enforce_policy_write(&identity, &row.kind, &id)?;
             (
-                policy_target_key(&policy),
+                policy_target_key(&id),
                 String::new(),
                 String::new(),
-                format!("scaling policy {policy}"),
+                if row.kind == "nodes" {
+                    format!("node group {id}")
+                } else {
+                    format!("scaling policy {id}")
+                },
             )
         } else {
             let job = inner.job.trim().to_string();

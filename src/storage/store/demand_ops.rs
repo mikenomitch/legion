@@ -199,4 +199,91 @@ impl Store {
         }
         Ok(out)
     }
+
+    /// Every allocation on `node_ids`, with what a node group's member view
+    /// needs (`crate::manager::node_group_members`): its job, config, task,
+    /// reservation, and whether its instance holds a node-local volume.
+    pub fn allocations_on_nodes(&self, node_ids: &[&str]) -> R<Vec<NodeAllocationRow>> {
+        if node_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let placeholders = std::iter::repeat_n("?", node_ids.len())
+            .collect::<Vec<_>>()
+            .join(",");
+        let sql = format!(
+            "SELECT a.id, a.node_id, tc.job_id, a.job_config_id, a.task_config_id, a.resources, \
+                    EXISTS( \
+                        SELECT 1 FROM volume v \
+                        WHERE v.instance_id = a.instance_id AND v.node_local = 1 \
+                    ) \
+             FROM allocation a \
+             INNER JOIN task_config tc ON tc.id = a.task_config_id \
+             WHERE a.node_id IN ({placeholders}) \
+             ORDER BY a.node_id, a.id;"
+        );
+        let conn = self.read_connection()?;
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map(params_from_iter(node_ids.iter()), |row| {
+            Ok(NodeAllocationRow {
+                id: row.get(0)?,
+                node_id: row.get(1)?,
+                job_id: row.get(2)?,
+                job_config_id: row.get(3)?,
+                task_config_id: row.get(4)?,
+                resources: row.get(5)?,
+                node_local: row.get::<_, i64>(6)? != 0,
+            })
+        })?;
+        Self::collect_rows(rows)
+    }
+
+    /// Where every task of `job_ids` has allocations, across config
+    /// versions: `(job, group, task)` -> the nodes, one entry per
+    /// allocation.
+    pub fn task_allocation_nodes(
+        &self,
+        job_ids: &[String],
+    ) -> R<HashMap<(String, String, String), Vec<String>>> {
+        let mut out: HashMap<(String, String, String), Vec<String>> = HashMap::new();
+        if job_ids.is_empty() {
+            return Ok(out);
+        }
+        let conn = self.read_connection()?;
+        let mut stmt = conn.prepare_cached(
+            "SELECT tc.job_id, tc.group_name, tc.name, a.node_id \
+             FROM allocation a \
+             INNER JOIN task_config tc ON tc.id = a.task_config_id \
+             WHERE tc.job_id = ?1;",
+        )?;
+        for job in job_ids {
+            let rows = stmt.query_map([job], |row| {
+                Ok((
+                    (
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                    ),
+                    row.get::<_, String>(3)?,
+                ))
+            })?;
+            for (key, node) in Self::collect_rows(rows)? {
+                out.entry(key).or_default().push(node);
+            }
+        }
+        Ok(out)
+    }
+}
+
+/// One allocation on a node-group member ([`Store::allocations_on_nodes`]).
+#[derive(Debug, Clone, PartialEq)]
+pub struct NodeAllocationRow {
+    pub id: i64,
+    pub node_id: String,
+    pub job_id: String,
+    pub job_config_id: String,
+    pub task_config_id: i64,
+    /// What it reserves, as stored.
+    pub resources: Value,
+    /// Its instance holds a node-local volume.
+    pub node_local: bool,
 }

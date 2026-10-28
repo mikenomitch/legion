@@ -57,6 +57,8 @@ mod scaling_ops;
 mod autoscale_ops;
 // Standalone scaling policies (`legion scaling apply`).
 mod scaling_policy_ops;
+// Their action intents (`RecordScalingAction`), compare-and-set.
+mod scaling_action_ops;
 // GetCapacityDemand's pending work, and ForgetNode (autoscaler v2 plan
 // §6.11).
 mod demand_ops;
@@ -71,7 +73,7 @@ pub use autoscale_ops::{
     covering_pause, HistoryRow, NewHistory, PauseRow, ScaleWrite, ScaleWriteOp, ScaleWriteOutcome,
     ScalingDefaultsRow, HISTORY_CAP, PAUSE_ANY, TASK_SCALE_COUNTER,
 };
-pub use demand_ops::{PendingTaskRow, PendingWork};
+pub use demand_ops::{NodeAllocationRow, PendingTaskRow, PendingWork};
 pub use forget_ops::ForgetOutcome;
 pub use fork_ops::{alias_target_problem, AliasOutcome, ForkCreated};
 pub use gang_losses::GangLoss;
@@ -84,6 +86,7 @@ pub use reschedule_holds::{
     RescheduleHold, MOVE_DELAY_MAX,
 };
 pub use scaling_ops::{ScalingAllocRow, ScalingReplicaRow};
+pub use scaling_action_ops::{ActionHistory, ActionWrite, ScalingActionRow};
 pub use scaling_policy_ops::{PutScalingPolicy, ScalingPolicyRow};
 pub use session_ops::{PromoteSession, PromotedSession};
 pub use snapshot_ops::{

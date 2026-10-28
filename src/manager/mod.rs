@@ -9,6 +9,7 @@ pub mod blocked;
 pub mod bootstrap_token;
 pub mod cadence;
 pub(crate) mod capacity_demand;
+pub(crate) mod node_group_members;
 pub mod cluster_ca;
 pub mod concurrency;
 pub mod daemon;

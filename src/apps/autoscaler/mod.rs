@@ -24,19 +24,26 @@
 //!    its desired count first.
 //! 4. A task's change is written with `ScaleTask` (`source = "autoscaler"`,
 //!    compare-and-set on the version it read, the decision attached). A
-//!    standalone policy's change is recorded first (`RecordScalingAction`
-//!    `scale`, which a pause refuses on the server), then made with
-//!    `target/scale`. A dry-run change is recorded with
-//!    `RecordScalingAction` `would`, and every evaluation is reported with
-//!    one `ReportScalingStatus`, which is also the app's heartbeat.
+//!    standalone policy's change is an **action intent** first
+//!    (`RecordScalingAction` `intent`, compare-and-set on the policy's
+//!    action version, which a pause refuses on the server), then made with
+//!    `target/scale`, then closed with its outcome. A dry-run change is
+//!    recorded with `RecordScalingAction` `would`, and every evaluation is
+//!    reported with one `ReportScalingStatus`, which is also the app's
+//!    heartbeat.
+//! 5. Node groups ([`nodegroups`]) run after the task and external
+//!    policies: one `GetCapacityDemand` for every group, the expander, the
+//!    node-group engine, and one action intent per acting group.
 //!
 //! Module map: [`rpc`] (the JSON-RPC transports), [`host`] (every installed
 //! plugin, ready to call), [`builtins`] (`prometheus`, `http`, `exec`,
-//! `noop`), [`conformance`] (`legion scaling plugin test`).
+//! `noop`), [`conformance`] (`legion scaling plugin test`), [`nodegroups`]
+//! (node groups).
 
 pub mod builtins;
 pub mod conformance;
 pub mod host;
+pub mod nodegroups;
 pub mod rpc;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -51,15 +58,15 @@ use crate::autoscaler::plugins::PluginCatalog;
 use crate::autoscaler::signals::{Readiness, Windows};
 use crate::autoscaler::strategies::StrategyConfig;
 use crate::autoscaler::{
-    evaluate, CapacityGuard, Decision, DecisionKind, EffectivePolicy, Flag, Guards, Mode,
-    Observation, Pause, Pin, PluginRecommendation, PolicyState, Reading, Stage,
+    evaluate, CapacityGuard, Decision, DecisionKind, EffectiveNodeGroup, EffectivePolicy, Flag,
+    Guards, Mode, Observation, Pause, Pin, PluginRecommendation, PolicyState, Reading, Stage,
 };
 use crate::cmd::helpers::AuthedManagerClient;
 use crate::prelude::*;
 use crate::structs::{
     GetScalingInputsRequest, RecordScalingActionRequest, ReportScalingStatusRequest, ScaleDecision,
-    ScaleTaskRequest, ScalingEventFlag, ScalingInputs, ScalingPauseInfo, ScalingPolicy,
-    ScalingTargetReport, ScalingTargetSelector, StandaloneScalingPolicy,
+    ScaleTaskRequest, ScalingActionIntent, ScalingEventFlag, ScalingInputs, ScalingPauseInfo,
+    ScalingPolicy, ScalingTargetReport, ScalingTargetSelector, StandaloneScalingPolicy,
     WatchScalingPoliciesRequest,
 };
 use host::{PluginHost, RecommendCall, SourceCall, SourceReading};
@@ -233,6 +240,9 @@ struct TargetState {
     /// Why the policy was invalid at the last evaluation (for one
     /// `scale.check_failed` per episode).
     invalid: Option<String>,
+    /// A standalone policy's action version, as last seen (the
+    /// compare-and-set token of its next intent).
+    action_version: u64,
 }
 
 impl TargetState {
@@ -246,6 +256,7 @@ impl TargetState {
             windows: Windows::default(),
             expected: None,
             invalid: None,
+            action_version: 0,
         }
     }
 
@@ -282,6 +293,8 @@ pub struct Engine {
     served_by: Option<String>,
     /// The last hour of every target's evaluations, for the job panel.
     log: Arc<crate::apps::autoscaler_ui::EvaluationLog>,
+    /// What the engine keeps per node group between ticks.
+    groups: HashMap<String, nodegroups::GroupRuntime>,
 }
 
 /// What one tick did, for tests and the app's health detail.
@@ -531,6 +544,7 @@ impl Engine {
             host: Arc::new(host),
             served_by: None,
             log: Default::default(),
+            groups: HashMap::new(),
         }
     }
 
@@ -668,6 +682,7 @@ impl Engine {
             }
         }
         let mut standalone: Vec<(&StandaloneScalingPolicy, EffectivePolicy)> = Vec::new();
+        let mut node_groups: Vec<(&StandaloneScalingPolicy, EffectiveNodeGroup)> = Vec::new();
         for policy in &cache.standalone {
             if policy.state != "ok" {
                 reports.push(plain_report(
@@ -677,6 +692,19 @@ impl Engine {
                     &policy.error,
                     now_ms,
                 ));
+                continue;
+            }
+            if policy.kind == "nodes" {
+                match serde_json::from_str::<EffectiveNodeGroup>(&policy.policy_json) {
+                    Ok(group) => node_groups.push((policy, group)),
+                    Err(err) => reports.push(plain_report(
+                        standalone_report(policy),
+                        "error",
+                        0,
+                        &format!("the node group does not parse in this build: {err}"),
+                        now_ms,
+                    )),
+                }
                 continue;
             }
             match serde_json::from_str::<EffectivePolicy>(&policy.policy_json) {
@@ -873,6 +901,12 @@ impl Engine {
             report.evaluated += 1;
             reports.push(target_report);
         }
+
+        let group_reports = self
+            .evaluate_node_groups(&node_groups, now_ms, &mut report)
+            .await;
+        report.evaluated += group_reports.len();
+        reports.extend(group_reports);
 
         for target in &reports {
             let label = if target.policy.is_empty() {
@@ -1086,6 +1120,7 @@ impl Engine {
                 held.events.push(ScalingEventFlag {
                     kind: "check_failed".to_string(),
                     message: why.clone(),
+                    outcome: String::new(),
                 });
             }
             state.invalid = Some(why);
@@ -1104,6 +1139,7 @@ impl Engine {
                 Flag::Limited { reason } => ScalingEventFlag {
                     kind: "limited".to_string(),
                     message: reason.clone(),
+                    outcome: String::new(),
                 },
                 Flag::Flapping {
                     reversals,
@@ -1114,6 +1150,7 @@ impl Engine {
                         "flapping: {reversals} direction changes in 10m; scale-in held until {}",
                         crate::cmd::scaling::clock(*until_ms)
                     ),
+                    outcome: String::new(),
                 },
             })
             .collect();
@@ -1131,6 +1168,7 @@ impl Engine {
             events.push(ScalingEventFlag {
                 kind: "check_failed".to_string(),
                 message: format!("check {} has {}", check.name, check.detail),
+                outcome: String::new(),
             });
         }
         state.missing = missing;
@@ -1249,7 +1287,8 @@ impl Engine {
                         from: decision.from,
                         to: decision.to,
                         decision: Some(scale_decision),
-                        policy: String::new(),
+                        instance: self.options.instance.clone(),
+                        ..Default::default()
                     };
                     match self.client.record_scaling_action(request).await {
                         Ok(_) => {
@@ -1311,6 +1350,7 @@ impl Engine {
                         held.events.push(ScalingEventFlag {
                             kind: "check_failed".to_string(),
                             message: format!("target: {err}"),
+                            outcome: String::new(),
                         });
                         state.invalid = Some(err);
                     }
@@ -1350,21 +1390,34 @@ impl Engine {
             };
         match decision.kind {
             DecisionKind::Applied => {
-                // Recorded before the call, so a pause refuses it on the
-                // server, and the history shows what was asked even if the
-                // target then fails.
-                let recorded = self
+                // An intent first: a pause refuses it on the server, and of
+                // two replicas whose leases overlap only one wins the
+                // compare-and-set and calls the target.
+                let known = policy.action.as_ref().map_or(0, |action| action.version);
+                let expected = {
+                    let state = self.targets.get_mut(&key).expect("decided above");
+                    state.action_version = state.action_version.max(known);
+                    state.action_version
+                };
+                let opened = self
                     .client
                     .record_scaling_action(RecordScalingActionRequest {
-                        kind: "scale".to_string(),
-                        from: decision.from,
-                        to: decision.to,
-                        decision: Some(scale_decision.clone()),
+                        kind: "intent".to_string(),
                         policy: policy.id.clone(),
+                        expected_action_version: expected,
+                        intent: Some(ScalingActionIntent {
+                            decision_id: scale_decision.id.clone(),
+                            from: decision.from,
+                            desired: Some(decision.to),
+                            summary: decision.summary.clone(),
+                            ..Default::default()
+                        }),
+                        decision: Some(scale_decision.clone()),
+                        instance: self.options.instance.clone(),
                         ..Default::default()
                     })
                     .await;
-                match recorded {
+                let won = match opened {
                     Err(status) => {
                         let held = status.code() == tonic::Code::FailedPrecondition;
                         target_report.state = if held { "held" } else { "error" }.to_string();
@@ -1372,49 +1425,86 @@ impl Engine {
                         target_report.want = decision.from;
                         decision.to = decision.from;
                         report.errors.push(target_report.summary.clone());
+                        None
                     }
-                    Ok(_) => {
-                        let scaled = host
-                            .scale(
-                                &policy.target_plugin,
-                                &policy.id,
-                                &config,
-                                decision.to,
-                                &scale_decision.id,
-                            )
-                            .await;
+                    Ok(reply) => {
+                        let reply = reply.into_inner();
                         let state = self.targets.get_mut(&key).expect("decided above");
-                        match scaled {
-                            Ok(()) => {
-                                state.policy_state.record_applied(
-                                    now_ms,
-                                    decision.from,
-                                    decision.to,
-                                );
-                                state.expected = Some(decision.to);
-                                report.scaled += 1;
+                        if let Some(action) = &reply.action {
+                            state.action_version = action.version;
+                        }
+                        if reply.won {
+                            Some(state.action_version)
+                        } else {
+                            // Another replica acted on this policy first.
+                            target_report.state = "held".to_string();
+                            target_report.summary = format!(
+                                "{} acted on this policy first; following its intent",
+                                reply
+                                    .action
+                                    .as_ref()
+                                    .map(|action| action.owner.as_str())
+                                    .unwrap_or("another replica")
+                            );
+                            target_report.want = decision.from;
+                            decision.to = decision.from;
+                            None
+                        }
+                    }
+                };
+                if let Some(version) = won {
+                    let scaled = host
+                        .scale(
+                            &policy.target_plugin,
+                            &policy.id,
+                            &config,
+                            decision.to,
+                            &scale_decision.id,
+                        )
+                        .await;
+                    let (outcome, detail) = match &scaled {
+                        Ok(()) => ("succeeded", String::new()),
+                        Err(err) => ("failed", err.clone()),
+                    };
+                    let closed = self
+                        .client
+                        .record_scaling_action(RecordScalingActionRequest {
+                            kind: "outcome".to_string(),
+                            policy: policy.id.clone(),
+                            expected_action_version: version,
+                            outcome: outcome.to_string(),
+                            detail,
+                            instance: self.options.instance.clone(),
+                            ..Default::default()
+                        })
+                        .await;
+                    let state = self.targets.get_mut(&key).expect("decided above");
+                    match closed {
+                        Ok(reply) => {
+                            if let Some(action) = reply.into_inner().action {
+                                state.action_version = action.version;
                             }
-                            Err(err) => {
-                                target_report.state = "error".to_string();
-                                target_report.summary = format!("target/scale failed: {err}");
-                                target_report.want = decision.from;
-                                report.errors.push(format!("{}: {err}", policy.id));
-                                let mut failed = scale_decision.clone();
-                                failed.summary =
-                                    format!("target/scale to {} failed: {err}", decision.to);
-                                let _ = self
-                                    .client
-                                    .record_scaling_action(RecordScalingActionRequest {
-                                        kind: "failed".to_string(),
-                                        from: decision.from,
-                                        to: decision.to,
-                                        decision: Some(failed),
-                                        policy: policy.id.clone(),
-                                        ..Default::default()
-                                    })
-                                    .await;
-                                decision.to = decision.from;
-                            }
+                        }
+                        Err(status) => report.errors.push(format!(
+                            "{}: closing the intent: {}",
+                            policy.id,
+                            status.message()
+                        )),
+                    }
+                    match scaled {
+                        Ok(()) => {
+                            state
+                                .policy_state
+                                .record_applied(now_ms, decision.from, decision.to);
+                            state.expected = Some(decision.to);
+                            report.scaled += 1;
+                        }
+                        Err(err) => {
+                            target_report.state = "error".to_string();
+                            target_report.summary = format!("target/scale failed: {err}");
+                            target_report.want = decision.from;
+                            report.errors.push(format!("{}: {err}", policy.id));
+                            decision.to = decision.from;
                         }
                     }
                 }

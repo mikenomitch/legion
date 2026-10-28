@@ -383,6 +383,83 @@ impl EffectiveNodeGroup {
         attributes.insert(NODEGROUP_ATTR.to_string(), self.name.clone());
         attributes
     }
+
+    /// The effective record as canonical JSON (field order fixed, maps
+    /// sorted, durations as text).
+    pub fn canonical_json(&self) -> String {
+        serde_json::to_string(self).expect("an effective node group should serialize")
+    }
+
+    /// The hex SHA-256 of [`Self::canonical_json`]: the digest each history
+    /// row of the group carries.
+    pub fn digest(&self) -> String {
+        use sha2::{Digest, Sha256};
+        Sha256::digest(self.canonical_json().as_bytes())
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect()
+    }
+
+    /// The group in one line: `nodes 0..20 via aws-asg, up 100% or 5 nodes
+    /// per 2m, down when empty for 10m, enforce`.
+    pub fn summary(&self) -> String {
+        format!(
+            "nodes {}..{} via {}, up {} per {}, down when {} for {}, {}",
+            self.min,
+            self.max,
+            self.plugin,
+            step_text(self.up.step),
+            format_duration(self.up.every),
+            self.down.when,
+            format_duration(self.down.for_),
+            self.mode
+        )
+    }
+}
+
+/// `field: old -> new` for every field of the effective record that
+/// differs (`legion scaling apply --dry-run`'s diff for a node group).
+pub fn changed_fields(before: &EffectiveNodeGroup, after: &EffectiveNodeGroup) -> Vec<String> {
+    fn flatten(prefix: &str, value: &Value, out: &mut BTreeMap<String, String>) {
+        match value {
+            Value::Object(map) => {
+                for (key, value) in map {
+                    let path = if prefix.is_empty() {
+                        key.clone()
+                    } else {
+                        format!("{prefix}.{key}")
+                    };
+                    flatten(&path, value, out);
+                }
+            }
+            other => {
+                out.insert(prefix.to_string(), other.to_string());
+            }
+        }
+    }
+    let (mut old, mut new) = (BTreeMap::new(), BTreeMap::new());
+    flatten(
+        "",
+        &serde_json::to_value(before).unwrap_or(Value::Null),
+        &mut old,
+    );
+    flatten(
+        "",
+        &serde_json::to_value(after).unwrap_or(Value::Null),
+        &mut new,
+    );
+    let fields: std::collections::BTreeSet<&String> = old.keys().chain(new.keys()).collect();
+    fields
+        .into_iter()
+        .filter(|field| old.get(*field) != new.get(*field))
+        .map(|field| {
+            format!(
+                "{field}: {} -> {}",
+                old.get(field).map(String::as_str).unwrap_or("-"),
+                new.get(field).map(String::as_str).unwrap_or("-")
+            )
+        })
+        .collect()
 }
 
 fn step_of(spec: &Option<StepSpec>, default: Step) -> Step {
@@ -861,6 +938,11 @@ pub struct NodeView {
     /// Reserved memory over allocatable memory, 0 to 1.
     #[serde(default)]
     pub reserved_memory: f64,
+    /// Why its `legion.provider-id` cannot be trusted to name its machine
+    /// (none, shared with another member, or not an instance the provider
+    /// lists), when it cannot: such a node is never a victim.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_problem: Option<String>,
 }
 
 impl NodeView {
@@ -904,6 +986,9 @@ impl NodeView {
                 task: allocation.task.clone(),
             });
         }
+        if let Some(why) = &self.provider_problem {
+            return Some(Protection::ProviderId { why: why.clone() });
+        }
         None
     }
 }
@@ -935,6 +1020,13 @@ pub enum Protection {
         /// The task.
         task: String,
     },
+    /// Its `legion.provider-id` cannot be trusted to name its machine, so
+    /// terminating it could stop the wrong one, or none (the provider-id
+    /// cross-check against `target/status`).
+    ProviderId {
+        /// Why.
+        why: String,
+    },
 }
 
 impl fmt::Display for Protection {
@@ -951,6 +1043,7 @@ impl fmt::Display for Protection {
                 f,
                 "draining it would take {job}/{task} below disruption.minAvailable"
             ),
+            Protection::ProviderId { why } => f.write_str(why),
         }
     }
 }
@@ -1298,6 +1391,17 @@ impl NodeGroupState {
     /// Adopt a drain an earlier owner started (from its action intent).
     pub fn adopt_drain(&mut self, drain: Drain) {
         self.drains.insert(drain.node.clone(), drain);
+    }
+
+    /// Replace the drains in flight with `drains`: what the group's action
+    /// row recorded, when another replica acted on the group (a lost
+    /// compare-and-set, or a takeover). Finished ones are dropped.
+    pub fn replace_drains(&mut self, drains: Vec<Drain>) {
+        self.drains = drains
+            .into_iter()
+            .filter(|drain| !drain.finished())
+            .map(|drain| (drain.node.clone(), drain))
+            .collect();
     }
 
     /// The drains in flight (and finished ones not yet pruned).

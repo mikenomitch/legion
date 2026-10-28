@@ -951,3 +951,76 @@ fn decide_moves_drains_and_a_pause_aborts_them_test() {
         NodeFlag::ScaleIn { outcome, detail, .. } if outcome == "aborted" && detail.contains("paused")
     )));
 }
+
+// ── Phase 5b: the provider-id cross-check, adopted drains, digests ──────
+
+/// A member whose provider id the provider does not vouch for is never a
+/// victim, and the rule says why.
+#[test]
+fn an_unverified_provider_id_protects_the_node_test() {
+    let policy = group();
+    let mut state = NodeGroupState::default();
+    let mut stranger = node("b");
+    stranger.provider_problem =
+        Some("the provider does not list its instance i-b".to_string());
+    let o = scale_in_obs(vec![busy("a"), stranger]);
+    decide(&policy, &mut state, &o, min(0), &no_fit);
+    let later = decide(&policy, &mut state, &o, min(10), &no_fit);
+    assert!(later.victims.is_empty(), "{later:?}");
+    assert_eq!(later.protected.len(), 1);
+    assert_eq!(
+        later.protected[0].protection.to_string(),
+        "the provider does not list its instance i-b"
+    );
+}
+
+/// Drains another replica recorded replace this one's; finished ones are
+/// dropped.
+#[test]
+fn drains_from_an_action_row_replace_the_ones_in_flight_test() {
+    let mut state = NodeGroupState::default();
+    state.adopt_drain(drain());
+    let mut done = drain();
+    done.node = "c".into();
+    done.phase = DrainPhase::Done;
+    let mut terminating = drain();
+    terminating.node = "d".into();
+    terminating.phase = DrainPhase::Terminating {
+        asked_at_ms: min(1),
+    };
+    state.replace_drains(vec![done, terminating.clone()]);
+    let drains: Vec<&Drain> = state.drains().collect();
+    assert_eq!(drains, vec![&terminating]);
+    // The JSON an intent carries round-trips.
+    let json = serde_json::to_string(&vec![terminating.clone()]).unwrap();
+    let back: Vec<Drain> = serde_json::from_str(&json).unwrap();
+    assert_eq!(back, vec![terminating]);
+}
+
+/// The effective record's digest is stable and changes with any field; the
+/// dry-run diff names the fields.
+#[test]
+fn a_node_group_digests_and_diffs_by_field_test() {
+    let before = group();
+    assert_eq!(before.digest(), group().digest());
+    assert_eq!(before.digest().len(), 64);
+    let after = policy(json!({
+        "name": "workers",
+        "target": { "nodes": { "plugin": "exec", "shape": { "cpu": 8000, "memory": 16384 } } },
+        "min": 1,
+        "max": 30,
+        "down": { "for": "20m" },
+    }));
+    assert_ne!(before.digest(), after.digest());
+    assert_eq!(
+        changed_fields(&before, &after),
+        vec![
+            "down.for: \"10m\" -> \"20m\"".to_string(),
+            "max: 20 -> 30".to_string()
+        ]
+    );
+    assert_eq!(
+        before.summary(),
+        "nodes 1..20 via exec, up 100% or 5 nodes per 2m, down when empty for 10m, enforce"
+    );
+}

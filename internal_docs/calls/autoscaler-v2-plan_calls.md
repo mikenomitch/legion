@@ -1731,6 +1731,9 @@ Phase 5b.
 the refusal says what exists instead. Phase 5b removes the refusal, and
 the parser, ACL rule, and table already take the shape.
 
+*Superseded by Phase 5b:* the refusal is gone, and `scaling apply` stores
+and runs node groups (entries 85-94).
+
 ## 70. Removing a plugin from the app config is not refused; the policies that use it go `invalid`
 
 *Implementation, Phase 4.*
@@ -2008,6 +2011,280 @@ every policy).
 
 **Why (security).** Without the permission the assertion carries no
 namespaces to filter by.
+
+## 85. A node group's action intents are one compare-and-set row per policy, carrying its drains
+
+*Implementation, Phase 5b (`scaling_action`, `Store::open_scaling_action`,
+`apps::autoscaler::nodegroups`).*
+
+**Call.** Each standalone policy has one `scaling_action` row: a version
+(from the `scaling_action` counter), the latest intent, its state (`open`,
+`succeeded`, `failed`, `reconciled`), and its owner. One acting evaluation
+opens **one** intent covering everything it does that tick (the new
+count, the victims to drain, the members to terminate, forget, or
+uncordon) and the drains left in flight afterwards (`drains_json`), then
+closes it with the outcome. Both writes are compare-and-set on the version.
+
+```console
+$ legion scaling history workers-general --standalone
+ TIME           | TASK            | CHANGE | BY         | SUMMARY
+----------------+-----------------+--------+------------+-----------------------------------------
+ 10-28 14:02:15 | workers-general | -      | autoscaler | forget w-i-2: its instance is gone
+ 10-28 14:00:15 | workers-general | -      | autoscaler | terminate w-i-2 (instance i-2)
+ 10-28 13:58:00 | workers-general | -      | autoscaler | drain w-i-2: scale-in: w-i-2 empty for 1m
+ 10-28 13:41:30 | workers-general | 0 → 3  | autoscaler | pending work needs 3 nodes (6 replicas)
+```
+
+**Alternatives.**
+- (a) One row per action (a drain, a terminate), each with its own CAS.
+- (b) A separate `node_group_drain` table, plus intents for the provider
+  calls only.
+
+**Trade-off.** A tick's actions win or lose together: a replica that loses
+the race for one drain loses the whole tick, and acts again next tick from
+the winner's state. Two writes per acting tick per group, even for a tick
+that only forgets a node.
+
+**Why (simplicity, correctness).** Everything a new owner needs to resume a
+group (which nodes are draining, since when, at which step) is in one row
+it can read from the policy stream; there is no second table to keep in
+step with the first, and no order in which partial writes could leave a
+drain recorded but its terminate not. (a) would let two replicas each win
+a different victim's drain in the same overlap, which is the double action
+calls entry 12 exists to prevent.
+
+## 86. `RecordScalingAction` takes `intent` and `outcome`; external targets use them too
+
+*Implementation, Phase 5b (reshapes Phase 4's `scale` and `failed`, calls
+entry 66).*
+
+**Call.** The action kinds are `would` (unchanged), `intent` (CAS-open an
+intent: `policy`, `expected_action_version`, `intent`), and `outcome`
+(CAS-close it: `succeeded`, `failed`, `reconciled`). The reply says whether
+the write `won` and carries the action row either way. An external
+target's scale is an intent with `desired` and nothing else; `scale` and
+`failed` are gone.
+
+**Alternatives.** Keep `scale`/`failed` for external targets and add the
+intents for node groups only.
+
+**Trade-off.** A breaking change to an app-plane RPC (no installed base;
+AGENTS.md says break it). An external policy's scale now costs two writes
+(intent, outcome) instead of one or two.
+
+**Why (correctness).** Two replicas overlapping on an external target would
+otherwise both call `target/scale`; the plan's no-duplicate rule is for
+"node and external targets" alike. One mechanism, one set of history rows,
+one place a pause is enforced (an intent that changes the count or starts a
+drain is refused while paused).
+
+## 87. A replica that loses the race restores its state and follows the winner; an open intent is reconciled after 150 seconds of its own clock
+
+*Implementation, Phase 5b (`nodegroups::GroupRuntime::adopt`,
+`RECONCILE_AFTER_MS`).*
+
+**Call.** The engine decides on a copy of its per-group state's
+predecessor: a lost CAS (or a pause refusal) puts the state back as it was
+before the decision, then adopts the winner's version and drains. An intent
+another replica left `open` is waited for (the group reports `held`,
+"waiting for alloc-41's action d-… to finish") until this replica has
+seen it open for 150 seconds by its own clock (the longest target call,
+120 seconds, plus a tick); then it is closed `reconciled` with what
+`target/status` shows, and the group goes on from the provider's count and
+the recorded drains.
+
+**Alternatives.** Reconcile at once; compare the intent's `opened_at` with
+the local clock; check whether the owner's membership lease is live.
+
+**Trade-off.** A replica that died mid-call delays its group by up to 150
+seconds. A replica that is alive but slower than 150 seconds per call can
+have its intent reconciled under it; its outcome write then loses, which is
+harmless (the call was idempotent and the next owner re-reads the
+provider).
+
+**Why (correctness).** Reconciling at once would let a second replica act
+on a group while the first is still inside `target/scale` with stale
+status. A replica's own clock measures how long *it* has seen the intent
+open, which is immune to clock skew between hosts (and to the virtual
+clocks the tests run).
+
+## 88. The provider-id cross-check protects a node instead of failing the group
+
+*Implementation, Phase 5b (`NodeView.provider_problem`,
+`Protection::ProviderId`; resolves calls entry 62's open half).*
+
+**Call.** A member is never a scale-in victim when it has no
+`legion.provider-id`, shares one with another member, or names an instance
+the provider's `target/status` does not list. A provider that lists no
+members (and holds a count above zero) has its members' ids taken on trust.
+The rule shows in `explain` like the other protections: `never a victim:
+w-7 (its provider id i-0abc is not an instance the provider lists)`.
+
+**Alternatives.** Terminate by the id anyway; refuse registration of a
+duplicate id; hold the whole group invalid.
+
+**Trade-off.** A misconfigured member is never reclaimed by the autoscaler
+(an operator forgets it by hand); a provider that cannot list instances
+gets no protection from a host that lies about its id.
+
+**Why (security).** `--attr legion.provider-id` is the one reserved
+attribute a host sets for itself, so it is the one a compromised or
+misconfigured host can forge; terminating by it unchecked would let one
+host aim scale-in at another machine. Refusing registration would need the
+provider's view inside the join path.
+
+## 89. Members, protections, and the fits-elsewhere simulation come from `GetCapacityDemand`
+
+*Implementation, Phase 5b (`NodeGroupTemplate.members`, `fit_check`;
+`manager::node_group_members`, `capacity_demand::fit_on`).*
+
+**Call.** The autoscaler asks one `GetCapacityDemand` per evaluation with
+every group's template and `members = true`: the manager answers, per
+group, each member's status, provider id, `legion.scale-in`, reserved
+share, and allocations with their kind (work, session envelope with its
+live sessions, per-node), node-local storage, and whether draining the node
+would break the task's `disruption.minAvailable` (or a gang's quorum). With
+`fit_check` (`down.when = "underutilized"`), each live member under half
+reserved is packed onto the other live members' free capacity with the
+demand's own rules.
+
+**Alternatives.** The app assembles members from `GetNodes`,
+`ListNodeUsage` and job configs, and simulates fits itself.
+
+**Trade-off.** `GetCapacityDemand` grows a second job; a member's view
+costs the manager a read of its allocations and their task configs per
+evaluation (one query per group, one per distinct job config).
+
+**Why (performance, correctness).** One read per evaluation, computed where
+the data is, by the same packer the demand uses: the app cannot disagree
+with the manager about what fits, and needs no reach into job configs. The
+minAvailable floor is the one preemption already honors (the stricter of
+`minAvailable` against the effective count and a gang's quorum).
+
+## 90. The fits-elsewhere simulation does not see static ports already in use, and minAvailable is per node
+
+*Implementation, Phase 5b.*
+
+**Call.** `fit_on` packs a member's allocations onto the others' free
+CPU, memory and custom resources with the permit, namespace, constraint,
+volume-driver and `distinct` rules, but does not know which static ports
+the targets' allocations already hold. The minAvailable check asks, per
+node, whether the task's live allocations less this node's fall under the
+floor; two victims of one task in one evaluation are not summed.
+
+**Alternatives.** Load every target's allocations' ports; sum victims.
+
+**Trade-off.** An underutilized node whose work needs a static port held
+elsewhere can be chosen; its drain then leaves that replica pending until
+the scheduler finds room (and the group's scale-in holds while it is
+pending). The default scale-in budget is one node per five minutes, so a
+second victim of the same task in one evaluation is rare.
+
+**Why (simplicity).** The scheduler's own placement still enforces ports
+and floors on the evicted work; the simulation only has to be right about
+capacity, which is what makes a node underutilized.
+
+## 91. A node group shares the bare-name space with `default`'s policies, and is read with `node:read`
+
+*Implementation, Phase 5b (`ManagerDaemonService::find_policy`,
+`gate_policy_ref`).*
+
+**Call.** A node group's id is its bare name, as is an external policy's in
+`default`, so `scaling apply` refuses a name the other kind holds
+(`ALREADY_EXISTS`). A bare reference finds the `default` policy, then the
+node group. Node groups are listed, watched, and read (status, history)
+with `node:read`, and written, deleted, and paused with `operator:write`
+and `node:write`. Before a lookup, the gate admits a caller who could act
+on either kind; node groups are looked up only for a caller who may see
+them.
+
+**Alternatives.** A `nodes/` prefix on node-group ids; `--nodes` on every
+command.
+
+**Trade-off.** One name cannot be both; a caller with `scale:write` on
+`default` and none on nodes cannot learn a node group exists (it reads
+not found).
+
+**Why (simplicity).** `legion scaling explain workers-general
+--standalone` reads the way the policy was written, with nothing new to
+type, and the history and pause keys (`policy:<id>`) stay as Phase 4 made
+them.
+
+## 92. One join token per scale-up, minted after the intent wins
+
+*Implementation, Phase 5b (`Engine::mint_join_token`).*
+
+**Call.** Each scale-up mints a token with `max_uses` = the nodes it adds,
+`legion.nodegroup` and the shape's attributes stamped, a TTL of twice
+`up.joinTimeout`, and the decision in its description; it is minted only
+after the intent wins, and passed to `target/scale` as `join`.
+
+**Alternatives.** One long-lived token per group, rotated.
+
+**Trade-off.** A token row per scale-up (pruned when expired); a machine
+that boots after the TTL cannot join (it has missed the join timeout
+anyway).
+
+**Why (security).** A leaked token admits at most the nodes of one
+scale-up, for twenty minutes, and a lost race mints nothing.
+
+## 93. The `aws-asg` plugin is a crate of its own with SigV4 written out, and hands the token over through SSM
+
+*Implementation, Phase 5b (`plugins/scaling/aws-asg/`).*
+
+**Call.** The plugin lives with the first-party plugins
+(`plugins/scaling/aws-asg/`), outside Legion's workspace (as `plugins/` is),
+with its own lockfile and no AWS SDK: SigV4, the Query API, STS
+`AssumeRoleWithWebIdentity` and IMDSv2 are written against `reqwest` and
+`sha2`, which Legion already builds. The join token reaches new instances
+through an SSM `SecureString` parameter the policy names
+(`joinTokenParameter`), written before `SetDesiredCapacity`. Its tests
+(SigV4 against AWS's published examples, recorded responses, the whole
+plugin against a local mock AWS) run in its own CI job.
+
+```nickel
+target = { nodes = { plugin = "aws-asg",
+  config = { asg = "legion-workers", joinTokenParameter = "/legion/workers-general/join" } } }
+```
+
+**Alternatives.**
+- (a) The AWS SDK crates (not in `Cargo.lock`; well over a hundred new
+  crates).
+- (b) A workspace member.
+- (c) Deliver the token in a new launch-template version's user data, or in
+  instance tags.
+
+**Trade-off.** Our own SigV4 to maintain (about 200 lines, tested against
+the published vectors); a second dependency (SSM) for the token; its tests
+are not part of `cargo test --all`.
+
+**Why (simplicity, security).** (a) would more than double the build for
+one plugin. (b) would put a plugin's dependency choices in Legion's lock.
+A launch-template version per scale-up (c) is slow and rate-limited, and
+tags are readable by anything that can describe instances; an SSM
+`SecureString` is encrypted and readable only by the instance role the
+operator grants.
+
+## 94. The app's grant gains `node:write` and `job:read`
+
+*Implementation, Phase 5b (`src/apps/bundled/autoscaler.ncl`; carries out
+calls entry 18 as entry 44 deferred it).*
+
+**Call.** The manifest's permissions are now `scale` read and write in
+every namespace, `node` read and write, and `job` read in every namespace:
+`node:write` to mint group join tokens, drain, and forget; `job:read` so
+`GetCapacityDemand` names the jobs on a member (a `legion-system`
+allocation's job in a protection), not just counts them.
+
+**Alternatives.** Run node groups with redacted job names (namespaces
+still decide protections).
+
+**Trade-off.** The app can read every job's spec; it still cannot change
+one.
+
+**Why (simplicity).** `explain` and the events say *which* job holds a node
+(`runs legion-system job autoscaler`), which is what an operator needs to
+act on a protection.
 
 ## Ledger: what stands from the superseded plan's calls
 

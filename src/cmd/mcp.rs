@@ -1122,7 +1122,7 @@ fn tool_defs() -> Vec<ToolDef> {
         },
         ToolDef {
             name: "legion_scaling_explain",
-            description: "Why an autoscaled task (or a standalone policy, with `policy`) is at its count, as structured data: the last evaluation's checks (reading, desired) and every safeguard stage (before, after, note), the effective policy with the level each field came from (built-in, cluster defaults, namespace policy, jobspec), pins, and pauses. Read-only.",
+            description: "Why an autoscaled task (or a standalone policy or node group, with `policy`) is at its count, as structured data: the last evaluation's checks (reading, desired) and every safeguard stage (before, after, note), the effective policy with the level each field came from (built-in, cluster defaults, namespace policy, jobspec), pins, and pauses. Read-only.",
             input_schema: || json!({
                 "type": "object",
                 "properties": {
@@ -1194,7 +1194,7 @@ fn tool_defs() -> Vec<ToolDef> {
         },
         ToolDef {
             name: "legion_scaling_apply",
-            description: "Create or update a standalone scaling policy (docs/autoscaling.md, \"Standalone policies\"): a policy for a target that is not a Legion task, through a target plugin installed in the autoscaler's app config (or the built-in `noop`). `spec` is the jobspec `autoscale` record plus name, namespace, description and target = { plugin, config }, with min, max and checks required. dry_run=true validates and returns the diff without writing. Needs scale:write on the policy's namespace. Mutating.",
+            description: "Create or update a standalone scaling policy (docs/autoscaling.md, \"Standalone policies\"): a policy for a target that is not a Legion task, through a target plugin installed in the autoscaler's app config (or the built-in `noop`). `spec` is the jobspec `autoscale` record plus name, namespace, description and target = { plugin, config }, with min, max and checks required; or a node group (docs/autoscaling.md, \"Node groups\"): name, target = { nodes = { pool, workerType, shape, plugin, config } }, min, max, up, down, which is cluster-scoped. dry_run=true validates and returns the diff without writing. Needs scale:write on the policy's namespace; a node group needs operator:write and node:write. Mutating.",
             input_schema: || json!({
                 "type": "object",
                 "properties": {
@@ -3329,6 +3329,7 @@ fn demand_templates(args: &Value) -> Result<Vec<crate::structs::NodeGroupTemplat
                 }),
                 like_node: opt_str_arg(item, "like_node"),
                 upcoming: u32_of("upcoming").unwrap_or(0),
+                ..Default::default()
             })
         })
         .collect()

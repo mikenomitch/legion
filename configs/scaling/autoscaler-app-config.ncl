@@ -43,5 +43,33 @@
     },
     # A plugin served by its own Legion service, reached over HTTP.
     forecast = { url = "http://forecast.internal:8080/rpc" },
+    # Node groups (nodes-aws.ncl): the first-party AWS Auto Scaling target
+    # (plugins/scaling/aws-asg). Its credentials come from the `aws`
+    # identity below, exchanged with STS: no access keys anywhere.
+    aws-asg = {
+      source = "https://example.com/legion/aws-asg-0.1.0-linux-amd64.tar.gz",
+      checksum = "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+      config = {
+        region = "us-east-1",
+        webIdentityTokenFile = "$LEGION_TASK_DIR/secrets/aws.token",
+        roleArn = "arn:aws:iam::123456789012:role/legion-autoscaler",
+      },
+    },
+    # A scripted node provider (nodes-exec.ncl).
+    scripted = {
+      builtin = "exec",
+      config = { command = ["/opt/legion/nodes.sh"] },
+    },
   },
+  # A token the autoscaler's job holds for AWS STS (an IAM OIDC provider for
+  # this cluster's issuer, and a role trusting it, are the AWS side:
+  # docs/workload-identity.md, "AWS").
+  identities = [
+    {
+      name = "aws",
+      audience = ["sts.amazonaws.com"],
+      ttl = "15m",
+      file = { path = "secrets/aws.token" },
+    },
+  ],
 }
