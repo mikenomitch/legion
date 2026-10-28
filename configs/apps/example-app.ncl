@@ -125,21 +125,55 @@
     ],
   },
 
-  # Jobspec keys the app adds (apps plan §6.6). Stored; resolved by a later
-  # release.
+  # Jobspec keys the app adds (docs/apps.md, "Jobspec extensions"): one key
+  # per extension point (job, group, task, volume, port, service; `task`
+  # and `group` count as one). Job authors write them where they belong
+  # (configs/apps/example-app-job.ncl), or as `apps.gitops` at the same
+  # point. Each value is checked against its schema at submit, stored as
+  # written, and read back with the schema's defaults filled; the app reads
+  # its values with WatchAppExtensions. Install refuses a key that is a core
+  # field at its point or another installed app's key there (rename it with
+  # `legion app install --key job.gitops=<key>`), a schema with a remote
+  # $ref, and an example that fails its own schema.
   extensions = [
     {
       point = "job",
       key = "gitops",
-      description = "Where this job came from.",
+      description = "Where this job came from, and whether gitops keeps it in sync.",
       schema = {
         type = "object",
+        additionalProperties = false,
+        required = ["repo", "path"],
         properties = {
-          repo = { type = "string" },
-          path = { type = "string" },
-          commit = { type = "string" },
+          repo = { type = "string", description = "The repository URL." },
+          path = { type = "string", description = "The jobspec's path in the repository." },
+          commit = { type = "string", description = "The commit last synced." },
+          autoSync = { type = "boolean", default = true, description = "Sync on every push." },
         },
       },
+      examples = [{ repo = "https://github.com/acme/deploy", path = "jobs/storefront.ncl" }],
+      # Also ask the app at submit (`POST /legion/v1/extensions/validate`):
+      # is the path in the repository? Fails open: an app that cannot answer
+      # within 2 seconds lets the submit through with a warning.
+      validate = true,
+    },
+    {
+      # Written on one task of a group; applies to the whole group.
+      point = "group",
+      key = "syncWave",
+      description = "The wave this group syncs in; lower waves sync first.",
+      schema = {
+        type = "object",
+        additionalProperties = false,
+        properties = {
+          wave = { type = "integer", minimum = 0, default = 0 },
+        },
+      },
+      examples = [{ wave = 1 }],
+      # Setting or changing the value needs more than job:write: the
+      # submitter must also hold this permission on the job, checked when
+      # the value is new or changed.
+      requires = { resource = "template", action = "write" },
     },
   ],
 

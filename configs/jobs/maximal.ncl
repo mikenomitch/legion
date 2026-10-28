@@ -9,6 +9,19 @@
     # then `<namespace>/<name>` (bare in `default`).
     namespace = "default",
     version = 1,
+    # Jobspec extensions (docs/apps.md, "Jobspec extensions"): keys that
+    # installed apps add at the job, a group (written on one of its tasks),
+    # a task, a volume, a port, or a service. They are commented out here
+    # because each needs its app installed (`legion app extensions` lists
+    # this cluster's keys), and this file must submit on a bare cluster. The
+    # one at the job level, for an app that declares `uptime` on jobs:
+    #
+    #   uptime = { url = "https://maximal.acme.dev/healthz", alert = "#oncall" },
+    #
+    # Every key also has a qualified spelling, `apps.<app>`, that no core
+    # field can ever take:
+    #
+    #   apps = { uptime = { url = "https://maximal.acme.dev/healthz" } },
     # How important this job is, relative to everything else on the cluster
     # (docs/preemption-and-eviction.md). One of, most important first:
     #
@@ -151,6 +164,10 @@
                     retainOnStop = true,
                 },
             },
+            # An extension key on a task, or on its group (written on one
+            # task of the group, applying to the whole group), for an
+            # installed app that declares it (docs/apps.md):
+            #   tier = { level = "gold" },
             # Claims on storage that exists independently of any instance —
             # an operator's host path, an NFS export, scratch space (see
             # docs/volumes.md). Unlike stateful.storage these are shared, are
@@ -165,6 +182,9 @@
                     params = { name = "models" },
                     path = "/models",
                     readOnly = true,
+                    # An extension key on a volume, for an installed app that
+                    # declares `backup` on volumes (docs/apps.md):
+                    #   backup = { schedule = "0 3 * * *", keep = 14 },
                 },
             ],
             config = {
@@ -190,6 +210,9 @@
                     # 8080 inside the task's namespace. Host: dynamic host
                     # port (macOS publishes it to 8080).
                     { name = "http", to = 8080 },
+                    # An extension key on a port, for an installed app that
+                    # declares `dns` on ports:
+                    #   { name = "http", to = 8080, dns = { hostname = "maximal.acme.dev" } },
                     { name = "metrics", static = 9090 },  # fixed host port
                     # TLS the node terminates on this port with a certificate
                     # that is not the mesh's (docs/network-handlers.md, "TLS
@@ -287,6 +310,9 @@
                 # with mesh = true also at the receiving node, against the
                 # verified caller's job (Legion-Denied-By: service/allow).
                 allow = ["gateway", "maximal-demo", "checkout-*/api"],
+                # An extension key on a service, for an installed app that
+                # declares `probe` on services:
+                #   probe = { path = "/healthz" },
             },
             # Services this task dials, each through the node's forwarder,
             # which load-balances across the upstream's healthy endpoints.

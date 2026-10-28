@@ -43,20 +43,45 @@ name that is a path, or `.`/`..`, is refused at submit:
 error: Error validating task configs: task name "../web" may only contain [A-Za-z0-9._-] and may not start with "." (the name becomes a directory on every worker that runs it)
 ```
 
+## Extension Keys
+
+Installed [apps](apps.md#jobspec-extensions) add their own keys to the
+jobspec, at fixed **extension points**: the job's top level, a group (written
+on one of its tasks), a task, a `volumes` entry, a `network.ports` entry, and
+a task's `service` block. You write them where they belong, like any other
+field:
+
+```nickel
+volumes = [{ name = "data", backup = { schedule = "0 3 * * *", keep = 14 } }]
+```
+
+Each key has a JSON Schema the submit checks the value against, with the
+schema's defaults filled in; the version stores the value as written, by the
+app that owns it, and `legion job info` shows it with its defaults and its
+state. Every key also has a qualified spelling, `apps.<app> = { … }` at the
+same point, which never collides with a core field. `legion app extensions`
+lists the keys this cluster's apps add, and `legion job schema` has them at
+their points. A resubmit that changes only extension values moves the job's
+allocations to the new version in place, with no rollout. The whole story,
+from declaring a key to the app reading its values, is in
+[Apps: Jobspec extensions](apps.md#jobspec-extensions).
+
 ## Unknown Fields
 
-Every key in a jobspec must be one Legion knows. A key it does not know fails
+Every key in a jobspec must be one Legion knows: a core field, or a key an
+installed app declares at that extension point. A key it does not know fails
 the submit, whether it sits at the top of the jobspec, in a task, or in any
 nested block (`stop`, `stateful.storage`, `network.ports[]`, `rollout`, and
 so on). The error names each key with its path and, when a known key is close,
-suggests it:
+suggests it, installed apps' keys included:
 
 ```console
 $ legion job run web.ncl
 Error: failed to run job: Error parsing jobspec: web: task web: unknown field `cuont` (did you mean `count`?)
 web: task web: unknown field `stop.signall` (did you mean `stop.signal`?)
-web: task web: volume data: unknown field `backup` [code=InvalidArgument]
-Hint: fix or remove each field above. To submit anyway, pass --allow-unknown-fields (`allow_unknown_fields` on the RPC): keys on the job, a task, a volume, a port, or a service are kept as pending, and the rest are dropped
+web: task web: volume data: unknown field `bakup` (did you mean `backup`, the backup app's key?)
+web: task web: volume data: unknown field `snapshot`: not a volume field, and no installed app declares a `snapshot` key on volumes [code=InvalidArgument]
+Hint: fix or remove each field above (`legion app extensions` lists the keys installed apps add). To submit anyway, pass --allow-unknown-fields (`allow_unknown_fields` on the RPC): keys on the job, a task, a volume, a port, or a service are kept as pending, and the rest are dropped
 ```
 
 The path reads from the job down: `task web` and `volume data` name the
@@ -65,6 +90,18 @@ inside it. Every unknown key is listed at once, so one round of fixes is
 enough. A suggestion is the known key within an edit distance of a third of
 the typed key's length, ignoring case, `_`, and `-` (`kill_after` suggests
 `killAfter`); there is none when nothing is that close.
+
+**Whether a key is known depends on the cluster.** A key an installed app
+declares is known on that cluster and unknown on one without the app.
+`legion job validate` asks a manager which keys are installed and checks
+values against their schemas; with no manager reachable it checks core
+fields only, and reports each key at an extension point as not checked
+(`installedKeys: unchecked` in its JSON).
+
+A value for an installed app's key that fails the key's schema is an error
+too, with its full path (`orders-db: task postgres: volume data:
+backup.keep: 0 is less than the minimum of 1`), and `--allow-unknown-fields`
+does not excuse it.
 
 This exists because the alternative is a silent failure. Before, a misspelled
 key was accepted and ignored: `autoscael = true` deployed a job without
@@ -87,7 +124,7 @@ the MCP `legion_job_run`, `legion_job_plan`, `legion_job_validate`, and
 key is handled by where it sits:
 
 - **On an extension point, it is kept.** The extension points are the places
-  where apps will declare their own keys, so a key there may belong to an app
+  where apps declare their own keys, so a key there may belong to an app
   that is not installed yet:
 
   | Point | Where the key is written |
@@ -98,9 +135,16 @@ key is handled by where it sits:
   | port | an entry in a task's `network.ports` |
   | service | a task's `service` block |
 
-  The key and its value are stored as written, unvalidated, in that block's
+  (A `group` key is written on a task, so it is kept on the task.) The key
+  and its value are stored as written, unvalidated, in that block's
   `pendingExtensions` map, and travel with every version whose spec still
-  carries them. Nothing in Legion acts on a pending value.
+  carries them. Nothing in Legion acts on a pending value until an app that
+  declares the key at that point is installed: the app then **adopts** it
+  (its install prompt lists the values it adopts), and `legion job info`
+  shows it as that app's, checked against its schema. A pending value for a
+  key whose app declares `requires` stays pending until the job is
+  resubmitted by someone who holds the permission. `apps.<app>` for an app
+  that is not installed is kept the same way.
 - **Anywhere else, it is dropped.** Inside `stop`, `rollout`, a check, and
   so on, no app can ever own a key, so the version does not carry it.
 
@@ -147,9 +191,9 @@ entries are accepted as pending.
   and the hand-parsed shorthands `count = { num, per }`, `gang = { … }`, and
   `schedule = { cron | every }` check their own keys. An unknown key in any of
   them is an error with or without the flag.
-- **A pending-only change is a new version.** Adding, changing, or removing a
-  pending key changes what was submitted, so the resubmit creates a new
-  version and a rollout, like any other spec change.
+- **A pending-only change is a new version**, but not a rollout: like a
+  change to installed apps' extension values, it moves the job's
+  allocations to the new version in place.
 - **The record describes the submit that created the version.** Resubmitting
   a spec that renders to the same config is `unchanged` and keeps the existing
   version and its record, even when the resubmit no longer carries the keys
@@ -158,9 +202,13 @@ entries are accepted as pending.
   forward but no record.
 - **`legion template render` has no flag.** It renders the way a strict
   `template run` would.
-- **No app can claim a pending key yet.** Installing an app that declares a
-  key will validate and adopt matching pending values once apps can declare
-  jobspec keys; until then pending values stay inert.
+- **Adoption does not rewrite the version.** An adopted pending value is
+  reported as its app's, but stays stored as pending until the job is
+  resubmitted; if the app is uninstalled, it reads as pending again.
+- **An orphaned value blocks a strict resubmit.** When an app is uninstalled
+  (with `--force`), its stored values stay, flagged `orphaned`, and the
+  job's next submit fails on the key until it is removed or
+  `--allow-unknown-fields` keeps it pending.
 - **An older manager drops unknown keys silently**, and ignores
   `allow_unknown_fields`; see [upgrades.md](upgrades.md#strict-jobspec-fields).
 
