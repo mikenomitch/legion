@@ -311,6 +311,7 @@ fn job(runtime: &str, suspend: Option<SuspendConfig>) -> JobConfig {
         rollout_by_group: Default::default(),
         version: None,
         pending_extensions: Default::default(),
+        extensions: Default::default(),
     }
 }
 

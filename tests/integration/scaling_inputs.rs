@@ -65,6 +65,7 @@ fn job(name: &str, tasks: Vec<serde_json::Value>) -> R<JobConfig> {
             .collect::<Result<_, _>>()?,
         version: None,
         pending_extensions: Default::default(),
+        extensions: Default::default(),
     })
 }
 

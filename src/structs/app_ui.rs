@@ -1226,6 +1226,11 @@ pub enum AssertionKind {
     /// A sandboxed page's bundle (`ui.pages`). Its context is always the
     /// `nav` slot's: pages live in the sidebar.
     Page,
+    /// A submit asking the app to check its jobspec extension values
+    /// (`POST /legion/v1/extensions/validate`; docs/apps.md, "Jobspec
+    /// extensions"). Its context is the job's (`job` slot), its viewer the
+    /// submitter, and its inputs digest is the request body's.
+    Validate,
 }
 
 impl AssertionKind {
@@ -1234,6 +1239,7 @@ impl AssertionKind {
             AssertionKind::View => "view",
             AssertionKind::Action => "action",
             AssertionKind::Page => "page",
+            AssertionKind::Validate => "validate",
         }
     }
 }
@@ -1322,10 +1328,12 @@ pub fn assertion_mismatch(
         );
     }
     match (kind, inputs, &assertion.inputs) {
-        (AssertionKind::Action, Some(inputs), Some(digest)) if inputs_digest(inputs) == *digest => {
+        (AssertionKind::Action | AssertionKind::Validate, Some(inputs), Some(digest))
+            if inputs_digest(inputs) == *digest =>
+        {
             None
         }
-        (AssertionKind::Action, _, _) => {
+        (AssertionKind::Action | AssertionKind::Validate, _, _) => {
             Some("the assertion's inputs digest does not match the request's inputs".into())
         }
         (AssertionKind::View | AssertionKind::Page, _, None) => None,

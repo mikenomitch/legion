@@ -522,6 +522,7 @@ mod namespace_store_test {
             rollout_by_group: Default::default(),
             version: None,
             pending_extensions: Default::default(),
+            extensions: Default::default(),
         }
     }
 

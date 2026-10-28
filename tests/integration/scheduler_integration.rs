@@ -608,6 +608,7 @@ fn job_alpha() -> JobConfig {
         )],
         version: None,
         pending_extensions: Default::default(),
+        extensions: Default::default(),
     }
 }
 
@@ -626,6 +627,7 @@ fn job_bravo() -> JobConfig {
         )],
         version: None,
         pending_extensions: Default::default(),
+        extensions: Default::default(),
     }
 }
 
@@ -644,6 +646,7 @@ fn job_charlie() -> JobConfig {
         )],
         version: None,
         pending_extensions: Default::default(),
+        extensions: Default::default(),
     }
 }
 
@@ -662,6 +665,7 @@ fn job_delta() -> JobConfig {
         )],
         version: None,
         pending_extensions: Default::default(),
+        extensions: Default::default(),
     }
 }
 
@@ -680,6 +684,7 @@ fn job_echo() -> JobConfig {
         )],
         version: None,
         pending_extensions: Default::default(),
+        extensions: Default::default(),
     }
 }
 
@@ -698,6 +703,7 @@ fn job_foxtrot() -> JobConfig {
         )],
         version: None,
         pending_extensions: Default::default(),
+        extensions: Default::default(),
     }
 }
 
@@ -719,6 +725,7 @@ fn job_golf() -> JobConfig {
         )],
         version: None,
         pending_extensions: Default::default(),
+        extensions: Default::default(),
     }
 }
 
@@ -737,6 +744,7 @@ fn job_hotel() -> JobConfig {
         )],
         version: None,
         pending_extensions: Default::default(),
+        extensions: Default::default(),
     }
 }
 
@@ -755,6 +763,7 @@ fn job_india() -> JobConfig {
         )],
         version: None,
         pending_extensions: Default::default(),
+        extensions: Default::default(),
     }
 }
 
@@ -773,6 +782,7 @@ fn job_resubmit_config(message: &str, count: u32, node_id: &str) -> JobConfig {
         }],
         version: None,
         pending_extensions: Default::default(),
+        extensions: Default::default(),
     }
 }
 
@@ -791,6 +801,7 @@ fn job_score_load() -> JobConfig {
         )],
         version: None,
         pending_extensions: Default::default(),
+        extensions: Default::default(),
     }
 }
 
@@ -809,6 +820,7 @@ fn job_score_target() -> JobConfig {
         )],
         version: None,
         pending_extensions: Default::default(),
+        extensions: Default::default(),
     }
 }
 
@@ -1012,6 +1024,7 @@ fn scheduler_count_per_attribute_reschedules_by_group() -> R<()> {
         }],
         version: None,
         pending_extensions: Default::default(),
+        extensions: Default::default(),
     };
 
     cluster.submit_job(job)?;
@@ -1079,6 +1092,7 @@ fn scheduler_count_per_id_scales_with_node_changes() -> R<()> {
         }],
         version: None,
         pending_extensions: Default::default(),
+        extensions: Default::default(),
     };
 
     cluster.submit_job(job)?;
@@ -1159,6 +1173,7 @@ fn scheduler_multi_job_churn_constraints_and_count_per_reschedule() -> R<()> {
         }],
         version: None,
         pending_extensions: Default::default(),
+        extensions: Default::default(),
     };
 
     let constrained_job = JobConfig {
@@ -1174,6 +1189,7 @@ fn scheduler_multi_job_churn_constraints_and_count_per_reschedule() -> R<()> {
         }],
         version: None,
         pending_extensions: Default::default(),
+        extensions: Default::default(),
     };
 
     cluster.submit_job(regional_job)?;

@@ -2461,6 +2461,7 @@ mod tests {
             }],
             version: None,
             pending_extensions: Default::default(),
+            extensions: Default::default(),
         };
         store.handle_job_submit(&v1, &[submission()])?;
         let v1_id = store.get_job_config(&v1.name)?.id();
@@ -2482,6 +2483,7 @@ mod tests {
             }],
             version: None,
             pending_extensions: Default::default(),
+            extensions: Default::default(),
         };
         store.handle_job_submit(&v2, &[submission()])?;
         let v2_id = store.get_job_config(&v2.name)?.id();
@@ -2531,6 +2533,7 @@ mod tests {
             }],
             version: None,
             pending_extensions: Default::default(),
+            extensions: Default::default(),
         };
         store.handle_job_submit(&v1, &[submission()])?;
         let v1_id = store.get_job_config(&v1.name)?.id();
@@ -2552,6 +2555,7 @@ mod tests {
             }],
             version: None,
             pending_extensions: Default::default(),
+            extensions: Default::default(),
         };
         store.handle_job_submit(&v2, &[submission()])?;
         let v2_id = store.get_job_config(&v2.name)?.id();
@@ -2600,6 +2604,7 @@ mod tests {
             }],
             version: None,
             pending_extensions: Default::default(),
+            extensions: Default::default(),
         };
         store.handle_job_submit(&job, &[submission()])?;
         let job_config_id = store.get_job_config(&job.name)?.id();
@@ -2682,6 +2687,7 @@ mod tests {
             }],
             version: None,
             pending_extensions: Default::default(),
+            extensions: Default::default(),
         };
         store.handle_job_submit(&v1, &[submission()])?;
         let v1_id = store.get_job_config(&v1.name)?.id();
@@ -2701,6 +2707,7 @@ mod tests {
             }],
             version: None,
             pending_extensions: Default::default(),
+            extensions: Default::default(),
         };
         store.handle_job_submit(&v2, &[submission()])?;
         let v2_id = store.get_job_config(&v2.name)?.id();
@@ -2763,6 +2770,7 @@ mod tests {
             ],
             version: None,
             pending_extensions: Default::default(),
+            extensions: Default::default(),
         }
     }
 
@@ -2979,6 +2987,7 @@ mod tests {
             }],
             version: None,
             pending_extensions: Default::default(),
+            extensions: Default::default(),
         }
     }
 
@@ -3060,6 +3069,7 @@ mod tests {
                         }],
                         version: None,
                         pending_extensions: Default::default(),
+                        extensions: Default::default(),
                     };
                     store.handle_job_submit(&filler, &[submission()])?;
                     let filler_id = store.get_job_config("filler")?.id();

@@ -28,7 +28,11 @@ use std::collections::BTreeMap;
 use std::fmt;
 
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{Map, Value};
+
+use crate::structs::extensions::{
+    point_plural, ExtensionPath, ExtensionRegistry, ExtensionValue, InstalledKey, APPS_KEY,
+};
 
 /// Keys a jobspec block did not recognize, captured at parse with
 /// `#[serde(flatten)]`. Empty after a submit's [`FieldWalk`]: every key in it
@@ -44,14 +48,18 @@ pub type PendingExtensions = BTreeMap<String, Value>;
 /// The spelling of the pending map in a jobspec and a stored config.
 pub const PENDING_EXTENSIONS_KEY: &str = "pendingExtensions";
 
-/// A place in the jobspec where keys Legion does not know are kept, not
-/// dropped, under `allow_unknown_fields`: the places apps will declare their
-/// own keys (internal_docs/plans/legion-apps-plan.md §6.6).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+/// A place in the jobspec where installed apps declare their own keys
+/// (internal_docs/plans/legion-apps-plan.md §6.6; `crate::structs::extensions`),
+/// and where keys Legion does not know are kept, not dropped, under
+/// `allow_unknown_fields`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ExtensionPoint {
     /// The top level of the jobspec.
     Job,
+    /// A group: declared by an app, but written on one task of the group
+    /// (the jobspec has no group objects). No jobspec block is this point.
+    Group,
     /// A task.
     Task,
     /// An entry in a task's `volumes`.
@@ -67,6 +75,7 @@ impl ExtensionPoint {
     pub fn as_str(self) -> &'static str {
         match self {
             ExtensionPoint::Job => "job",
+            ExtensionPoint::Group => "group",
             ExtensionPoint::Task => "task",
             ExtensionPoint::Volume => "volume",
             ExtensionPoint::Port => "port",
@@ -142,12 +151,17 @@ pub struct UnknownFieldsRecord {
     /// Keys elsewhere, dropped.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub dropped: Vec<UnknownFieldEntry>,
+    /// Keys at extension points that an offline check (`legion job
+    /// validate` with no manager reachable) could not resolve: they may be
+    /// keys installed apps add. Never set by a manager.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unchecked: Vec<UnknownFieldEntry>,
 }
 
 impl UnknownFieldsRecord {
     /// True when the flag neither kept nor dropped anything.
     pub fn is_empty(&self) -> bool {
-        self.pending.is_empty() && self.dropped.is_empty()
+        self.pending.is_empty() && self.dropped.is_empty() && self.unchecked.is_empty()
     }
 
     /// One warning line per key, in the words `legion job run` prints after
@@ -168,7 +182,15 @@ impl UnknownFieldsRecord {
                 entry.path
             )
         });
-        dropped.chain(pending).collect()
+        let unchecked = self.unchecked.iter().map(|entry| {
+            format!(
+                "{}`{}` was not checked: it is not a core field, and no manager was reachable \
+                 to say whether an installed app declares it",
+                entry.scope_prefix(),
+                entry.path
+            )
+        });
+        dropped.chain(pending).chain(unchecked).collect()
     }
 
     /// The `legion job info` line, after `submitted with
@@ -234,17 +256,24 @@ impl From<&crate::structs::UnknownFieldsRecord> for UnknownFieldsRecord {
         UnknownFieldsRecord {
             pending: record.pending.iter().map(entry).collect(),
             dropped: record.dropped.iter().map(entry).collect(),
+            unchecked: Vec::new(),
         }
     }
 }
 
-/// A jobspec carried keys Legion does not know, and the request did not
-/// allow them. One line per key, then a hint.
+/// A jobspec carried keys Legion does not know and the request did not
+/// allow them, or values for installed apps' keys that fail their schemas.
+/// One line per problem, then a hint.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UnknownFieldsError {
     /// `web: task web: unknown field `autoscael` (did you mean
-    /// `autoscale`?)`, one per key.
+    /// `autoscale`?)`, one per key, then one per invalid extension value
+    /// (`orders-db: task postgres: volume data: backup.keep: 0 is less than
+    /// the minimum of 1`).
     pub lines: Vec<String>,
+    /// Whether any line is an unknown key (the hint offers the flag only
+    /// then: it never excuses an invalid value).
+    pub unknown_keys: bool,
 }
 
 impl fmt::Display for UnknownFieldsError {
@@ -252,11 +281,19 @@ impl fmt::Display for UnknownFieldsError {
         f.write_str(&self.lines.join("\n"))?;
         // `\nHint: ` is what the CLI's `split_hint` lifts into the error
         // envelope's `hint`.
-        f.write_str(
-            "\nHint: fix or remove each field above. To submit anyway, pass \
-             --allow-unknown-fields (`allow_unknown_fields` on the RPC): keys on the job, a \
-             task, a volume, a port, or a service are kept as pending, and the rest are dropped",
-        )
+        if self.unknown_keys {
+            f.write_str(
+                "\nHint: fix or remove each field above (`legion app extensions` lists the keys \
+                 installed apps add). To submit anyway, pass --allow-unknown-fields \
+                 (`allow_unknown_fields` on the RPC): keys on the job, a task, a volume, a port, \
+                 or a service are kept as pending, and the rest are dropped",
+            )
+        } else {
+            f.write_str(
+                "\nHint: fix each value above against its app's schema (`legion app extensions` \
+                 shows them, `legion job schema` has them at their points)",
+            )
+        }
     }
 }
 
@@ -288,42 +325,121 @@ pub(crate) trait SpecBlock {
     fn walk_children(&mut self, _walk: &mut FieldWalk) {}
 }
 
+/// How a walk treats keys at extension points that no core field takes.
+#[derive(Clone, Copy)]
+pub enum ExtensionCheck<'r> {
+    /// Resolve them against the keys installed apps declare (a manager's
+    /// submit; `legion job validate` with a manager reachable). A key no
+    /// installed app declares is unknown.
+    Installed(&'r ExtensionRegistry),
+    /// No registry to ask (`legion job validate` offline): they are
+    /// reported as unchecked, not as errors.
+    Offline,
+}
+
+/// A named scope the walk enters: how errors name the place (`task web:
+/// volume data: ...`) and where an extension value found there sits.
+pub(crate) enum Scope {
+    /// A task, with its group.
+    Task { name: String, group: String },
+    /// A `volumes` entry.
+    Volume(String),
+    /// A `network.ports` entry.
+    Port(String),
+    /// A task's `service` block, with the name it advertises under (the
+    /// task's name when it sets none) and whether the block names it.
+    Service { name: String, named: bool },
+    /// Any other labelled scope.
+    #[allow(dead_code)]
+    Label(String),
+}
+
+impl Scope {
+    fn label(&self) -> String {
+        match self {
+            Scope::Task { name, .. } => format!("task {name}"),
+            Scope::Volume(name) => format!("volume {name}"),
+            Scope::Port(name) => format!("port {name}"),
+            Scope::Service { name, named: true } => format!("service {name}"),
+            Scope::Service { named: false, .. } => "service".to_string(),
+            Scope::Label(label) => label.clone(),
+        }
+    }
+
+    fn enter(&self, at: &mut ExtensionPath) {
+        match self {
+            Scope::Task { name, group } => {
+                at.task = name.clone();
+                at.group = group.clone();
+            }
+            Scope::Volume(name) => at.volume = name.clone(),
+            Scope::Port(name) => at.port = name.clone(),
+            Scope::Service { name, .. } => at.service = name.clone(),
+            Scope::Label(_) => {}
+        }
+    }
+}
+
 /// The pass that decides what each captured key means for one request.
-pub(crate) struct FieldWalk {
+pub(crate) struct FieldWalk<'r> {
     mode: UnknownFieldMode,
     /// Whether a block may arrive with `pendingExtensions` already filled: a
     /// stored config being read back, or a submit under the flag (which
     /// round-trips a config exported with its pending keys). A strict submit
     /// may not, because Legion writes that map, people do not.
     accept_pending: bool,
+    /// How keys at extension points resolve; `None` for a stored config,
+    /// which never carries one (its values are already resolved).
+    extensions: Option<ExtensionCheck<'r>>,
     scope: Vec<String>,
     path: Vec<String>,
+    /// Where the walk is, for the extension values it resolves.
+    at: ExtensionPath,
+    /// Unknown keys.
     errors: Vec<String>,
+    /// Extension values that fail their app's schema, and other problems
+    /// the flag never excuses.
+    value_errors: Vec<String>,
     record: UnknownFieldsRecord,
+    resolved: Vec<ExtensionValue>,
 }
 
-impl FieldWalk {
+impl<'r> FieldWalk<'r> {
     /// A walk over a jobspec someone submitted.
-    pub(crate) fn submitted(mode: UnknownFieldMode) -> Self {
-        Self::new(mode, mode == UnknownFieldMode::Allow)
+    pub(crate) fn submitted(mode: UnknownFieldMode, extensions: ExtensionCheck<'r>) -> Self {
+        Self::new(mode, mode == UnknownFieldMode::Allow, Some(extensions))
     }
 
     /// A walk over a config Legion serialized itself (a stored version read
     /// back, a KV re-render): unknown keys are still errors, and stored
     /// pending maps are accepted.
     pub(crate) fn stored() -> Self {
-        Self::new(UnknownFieldMode::Reject, true)
+        Self::new(UnknownFieldMode::Reject, true, None)
     }
 
-    fn new(mode: UnknownFieldMode, accept_pending: bool) -> Self {
+    fn new(
+        mode: UnknownFieldMode,
+        accept_pending: bool,
+        extensions: Option<ExtensionCheck<'r>>,
+    ) -> Self {
         FieldWalk {
             mode,
             accept_pending,
+            extensions,
             scope: Vec::new(),
             path: Vec::new(),
+            at: ExtensionPath::default(),
             errors: Vec::new(),
+            value_errors: Vec::new(),
             record: UnknownFieldsRecord::default(),
+            resolved: Vec::new(),
         }
+    }
+
+    /// Whether this walk reads a stored config (whose resolved extension
+    /// values it accepts as they are).
+    pub(crate) fn is_stored(&self) -> bool {
+        self.extensions.is_none()
     }
 
     /// The jobspec's top-level block.
@@ -361,13 +477,16 @@ impl FieldWalk {
 
     /// A block that opens a named scope, `task web` or `volume data`: its
     /// errors read `task web: volume data: unknown field ...` rather than
-    /// `volumes[0].x`.
-    pub(crate) fn scoped<B: SpecBlock>(&mut self, label: String, block: &mut B) {
+    /// `volumes[0].x`, and extension values found in it carry its name.
+    pub(crate) fn scoped<B: SpecBlock>(&mut self, scope: Scope, block: &mut B) {
         let outer = std::mem::take(&mut self.path);
-        self.scope.push(label);
+        let outer_at = self.at.clone();
+        scope.enter(&mut self.at);
+        self.scope.push(scope.label());
         self.visit(block);
         self.scope.pop();
         self.path = outer;
+        self.at = outer_at;
     }
 
     fn visit<B: SpecBlock>(&mut self, block: &mut B) {
@@ -398,33 +517,209 @@ impl FieldWalk {
         }
         let captured = std::mem::take(block.unknown_fields_mut());
         for (key, value) in captured {
-            let path = self.dotted(&key);
-            match self.mode {
-                UnknownFieldMode::Reject => {
-                    let hint = suggest(&key, B::FIELDS)
-                        .map(|known| format!(" (did you mean `{}`?)", self.dotted(known)))
-                        .unwrap_or_default();
-                    self.errors
-                        .push(format!("{}unknown field `{path}`{hint}", prefix(&scope)));
-                }
-                UnknownFieldMode::Allow => match (point, block.pending_extensions_mut()) {
-                    (Some(point), Some(pending)) => {
-                        pending.insert(key, value);
-                        self.record.pending.push(UnknownFieldEntry {
-                            scope: scope.clone(),
-                            path,
-                            point: Some(point),
-                        });
-                    }
-                    _ => self.record.dropped.push(UnknownFieldEntry {
+            // Keys directly on an extension point may be installed apps'.
+            let (Some(point), Some(check)) = (point, self.extensions) else {
+                self.unknown::<B>(&scope, point, key, value, &[], block);
+                continue;
+            };
+            match check {
+                ExtensionCheck::Offline => {
+                    self.record.unchecked.push(UnknownFieldEntry {
                         scope: scope.clone(),
-                        path,
-                        point: None,
-                    }),
-                },
+                        path: self.dotted(&key),
+                        point: Some(point),
+                    });
+                }
+                ExtensionCheck::Installed(registry) => {
+                    if key == APPS_KEY {
+                        self.qualified::<B>(&scope, point, value, registry, block);
+                    } else if registry.is_simulated_core(point, &key) {
+                        // A simulated new core field: serde would have
+                        // consumed the key, so the walk never sees it.
+                    } else if let Some(installed) = registry.owner_of(point, &key) {
+                        self.resolve(&scope, installed, key, value);
+                    } else {
+                        let candidates: Vec<(String, Option<String>)> = registry
+                            .keys_at(point)
+                            .into_iter()
+                            .map(|installed| (installed.key.clone(), Some(installed.app.clone())))
+                            .collect();
+                        self.unknown::<B>(&scope, Some(point), key, value, &candidates, block);
+                    }
+                }
             }
         }
         block.walk_children(self);
+    }
+
+    /// `apps = { <app> = { … } }`: each app's value under the qualified
+    /// spelling.
+    fn qualified<B: SpecBlock>(
+        &mut self,
+        scope: &str,
+        point: ExtensionPoint,
+        value: Value,
+        registry: &ExtensionRegistry,
+        block: &mut B,
+    ) {
+        let Value::Object(apps) = value else {
+            self.value_errors.push(format!(
+                "{}`{APPS_KEY}` holds installed apps' keys in their qualified spelling, one \
+                 record per app (`{APPS_KEY} = {{ backup = {{ … }} }}`)",
+                prefix(scope)
+            ));
+            return;
+        };
+        for (app, value) in apps {
+            let written = format!("{APPS_KEY}.{app}");
+            match registry.for_app(&app, point) {
+                Some(installed) => self.resolve(scope, installed, written, value),
+                None => {
+                    let path = self.dotted(&written);
+                    let why = if registry.has_app(&app) {
+                        format!("the {app} app declares no key on {}", point_plural(point))
+                    } else {
+                        format!("no app named {app} is installed")
+                    };
+                    match self.mode {
+                        UnknownFieldMode::Reject => {
+                            self.errors
+                                .push(format!("{}unknown field `{path}`: {why}", prefix(scope)));
+                        }
+                        UnknownFieldMode::Allow => {
+                            if let Some(pending) = block.pending_extensions_mut() {
+                                let apps = pending
+                                    .entry(APPS_KEY.to_string())
+                                    .or_insert_with(|| Value::Object(Map::new()));
+                                if let Some(apps) = apps.as_object_mut() {
+                                    apps.insert(app.clone(), value);
+                                }
+                            }
+                            self.record.pending.push(UnknownFieldEntry {
+                                scope: scope.to_string(),
+                                path,
+                                point: Some(point),
+                            });
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Check a value an installed key owns, and keep it as written.
+    fn resolve(&mut self, scope: &str, installed: &InstalledKey, written: String, value: Value) {
+        let at = match installed.decl.point {
+            ExtensionPoint::Job => ExtensionPath::default(),
+            ExtensionPoint::Group | ExtensionPoint::Task => ExtensionPath {
+                group: self.at.group.clone(),
+                task: self.at.task.clone(),
+                ..Default::default()
+            },
+            _ => self.at.clone(),
+        };
+        if let Some(other) = self.resolved.iter().find(|resolved| {
+            resolved.app == installed.app
+                && resolved.point == installed.decl.point
+                && resolved.path == at
+        }) {
+            self.value_errors.push(format!(
+                "{}`{}` and `{written}` both set {}'s key; write one",
+                prefix(scope),
+                other.key,
+                installed.owner()
+            ));
+            return;
+        }
+        if let Err(errors) = installed.check(&value) {
+            for error in errors {
+                self.value_errors.push(format!(
+                    "{}{}",
+                    prefix(scope),
+                    crate::structs::extensions::prefixed(&self.dotted(&written), &error)
+                ));
+            }
+            return;
+        }
+        self.resolved.push(ExtensionValue {
+            app: installed.app.clone(),
+            point: installed.decl.point,
+            path: at,
+            key: written,
+            value,
+            validated_by: installed.validated_by(),
+        });
+    }
+
+    /// A key nothing takes: an error, or under the flag pending (at an
+    /// extension point) or dropped.
+    fn unknown<B: SpecBlock>(
+        &mut self,
+        scope: &str,
+        point: Option<ExtensionPoint>,
+        key: String,
+        value: Value,
+        installed: &[(String, Option<String>)],
+        block: &mut B,
+    ) {
+        let path = self.dotted(&key);
+        match self.mode {
+            UnknownFieldMode::Reject => {
+                let mut candidates: Vec<(String, Option<String>)> = B::FIELDS
+                    .iter()
+                    .map(|field| (field.to_string(), None))
+                    .collect();
+                if point.is_some() {
+                    candidates.push((APPS_KEY.to_string(), None));
+                }
+                candidates.extend(installed.iter().cloned());
+                let names: Vec<&str> = candidates.iter().map(|(name, _)| name.as_str()).collect();
+                let line = match suggest_owned(&key, &names) {
+                    Some(index) => {
+                        let (known, app) = &candidates[index];
+                        let owner = app
+                            .as_ref()
+                            .map(|app| format!(", the {app} app's key"))
+                            .unwrap_or_default();
+                        format!(
+                            "unknown field `{path}` (did you mean `{}`{owner}?)",
+                            self.dotted(known)
+                        )
+                    }
+                    // At an extension point on a manager, say both checks
+                    // came up empty.
+                    None => match (point, self.extensions) {
+                        (Some(point), Some(ExtensionCheck::Installed(_)))
+                            if self.path.is_empty() =>
+                        {
+                            format!(
+                                "unknown field `{path}`: not a {} field, and no installed app \
+                                 declares a `{key}` key on {}",
+                                point.as_str(),
+                                point_plural(point)
+                            )
+                        }
+                        _ => format!("unknown field `{path}`"),
+                    },
+                };
+                self.errors.push(format!("{}{line}", prefix(scope)));
+            }
+            UnknownFieldMode::Allow => match (point, block.pending_extensions_mut()) {
+                (Some(point), Some(pending)) => {
+                    pending.insert(key, value);
+                    self.record.pending.push(UnknownFieldEntry {
+                        scope: scope.to_string(),
+                        path,
+                        point: Some(point),
+                    });
+                }
+                _ => self.record.dropped.push(UnknownFieldEntry {
+                    scope: scope.to_string(),
+                    path,
+                    point: None,
+                }),
+            },
+        }
     }
 
     /// `key`, under the current dotted path.
@@ -436,17 +731,54 @@ impl FieldWalk {
         }
     }
 
-    /// The outcome: the record of what was kept and dropped, or, when the
-    /// request did not allow unknown keys and there were some, an error
-    /// naming each one. `job` prefixes every error line, the way the plan's
-    /// examples read (`web: task web: unknown field ...`).
-    pub(crate) fn finish(self, job: &str) -> Result<UnknownFieldsRecord, UnknownFieldsError> {
-        if self.errors.is_empty() {
-            return Ok(self.record);
+    /// A group key is written on one task of its group (apps plan §6.6):
+    /// the same app's group key on two tasks of one group is an error.
+    fn check_group_keys(&mut self) {
+        let mut seen: BTreeMap<(String, String), String> = BTreeMap::new();
+        let mut lines = Vec::new();
+        for value in self
+            .resolved
+            .iter()
+            .filter(|value| value.point == ExtensionPoint::Group)
+        {
+            if let Some(first) = seen.insert(
+                (value.app.clone(), value.path.group.clone()),
+                value.path.task.clone(),
+            ) {
+                lines.push(format!(
+                    "group {}: the {} app's group key is set on tasks {first} and {}; a group key \
+                     applies to the whole group, so write it on one task of the group",
+                    value.path.group, value.app, value.path.task
+                ));
+            }
         }
+        self.value_errors.extend(lines);
+    }
+
+    /// Record a problem the flag never excuses (a group key on two tasks of
+    /// one group, a hand-written `extensions` list).
+    pub(crate) fn value_error(&mut self, line: String) {
+        self.value_errors.push(line);
+    }
+
+    /// The outcome: the record of what was kept and dropped and the
+    /// extension values resolved, or, when the request did not allow
+    /// unknown keys and there were some (or a value failed its schema), an
+    /// error naming each one. `job` prefixes every error line, the way the
+    /// plan's examples read (`web: task web: unknown field ...`).
+    pub(crate) fn finish(
+        mut self,
+        job: &str,
+    ) -> Result<(UnknownFieldsRecord, Vec<ExtensionValue>), UnknownFieldsError> {
+        self.check_group_keys();
+        if self.errors.is_empty() && self.value_errors.is_empty() {
+            return Ok((self.record, self.resolved));
+        }
+        let unknown_keys = !self.errors.is_empty();
         let lines = self
             .errors
             .into_iter()
+            .chain(self.value_errors)
             .map(|line| {
                 if job.is_empty() {
                     line
@@ -455,7 +787,10 @@ impl FieldWalk {
                 }
             })
             .collect();
-        Err(UnknownFieldsError { lines })
+        Err(UnknownFieldsError {
+            lines,
+            unknown_keys,
+        })
     }
 }
 
@@ -484,6 +819,23 @@ pub fn suggest(key: &str, fields: &[&'static str]) -> Option<&'static str> {
         .filter(|(distance, _)| *distance <= limit)
         .min_by_key(|(distance, _)| *distance)
         .map(|(_, field)| field)
+}
+
+/// [`suggest`] over names that are not `'static` (installed apps' keys):
+/// the index of the closest one.
+pub fn suggest_owned(key: &str, fields: &[&str]) -> Option<usize> {
+    let wanted = normalize(key);
+    if wanted.is_empty() {
+        return None;
+    }
+    let limit = (wanted.chars().count() / 3).max(1);
+    fields
+        .iter()
+        .enumerate()
+        .map(|(index, field)| (strsim::osa_distance(&wanted, &normalize(field)), index))
+        .filter(|(distance, _)| *distance <= limit)
+        .min_by_key(|(distance, _)| *distance)
+        .map(|(_, index)| index)
 }
 
 fn normalize(key: &str) -> String {
@@ -558,6 +910,10 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    /// No apps installed.
+    static NONE: std::sync::LazyLock<ExtensionRegistry> =
+        std::sync::LazyLock::new(ExtensionRegistry::empty);
+
     #[derive(Default)]
     struct Leaf {
         unknown_fields: UnknownFields,
@@ -608,9 +964,10 @@ mod tests {
     #[test]
     fn reject_names_each_key_with_its_path_and_suggestion_test() {
         let mut point = point_with(&[("nmae", json!("x"))], &[("signall", json!("TERM"))]);
-        let mut walk = FieldWalk::submitted(UnknownFieldMode::Reject);
-        walk.scoped("task web".into(), &mut Leaf::default());
-        walk.scoped("volume data".into(), &mut point);
+        let mut walk =
+            FieldWalk::submitted(UnknownFieldMode::Reject, ExtensionCheck::Installed(&NONE));
+        walk.scoped(Scope::Label("task web".into()), &mut Leaf::default());
+        walk.scoped(Scope::Volume("data".into()), &mut point);
         let err = walk.finish("web").unwrap_err();
         assert_eq!(
             err.lines,
@@ -629,9 +986,10 @@ mod tests {
             &[("backup", json!({ "keep": 3 }))],
             &[("signall", json!("TERM"))],
         );
-        let mut walk = FieldWalk::submitted(UnknownFieldMode::Allow);
-        walk.scoped("volume data".into(), &mut point);
-        let record = walk.finish("web").expect("allowed");
+        let mut walk =
+            FieldWalk::submitted(UnknownFieldMode::Allow, ExtensionCheck::Installed(&NONE));
+        walk.scoped(Scope::Volume("data".into()), &mut point);
+        let (record, _) = walk.finish("web").expect("allowed");
         assert_eq!(point.pending_extensions["backup"], json!({ "keep": 3 }));
         assert!(point.unknown_fields.is_empty());
         assert!(point.leaf.unknown_fields.is_empty());
@@ -671,8 +1029,9 @@ mod tests {
         point
             .pending_extensions
             .insert("backup".into(), json!(true));
-        let mut walk = FieldWalk::submitted(UnknownFieldMode::Reject);
-        walk.scoped("volume data".into(), &mut point);
+        let mut walk =
+            FieldWalk::submitted(UnknownFieldMode::Reject, ExtensionCheck::Installed(&NONE));
+        walk.scoped(Scope::Volume("data".into()), &mut point);
         let err = walk.finish("web").unwrap_err();
         assert!(
             err.lines[0].contains("`pendingExtensions` holds keys"),
@@ -683,10 +1042,10 @@ mod tests {
         // flag keeps (and reports) it.
         for mut walk in [
             FieldWalk::stored(),
-            FieldWalk::submitted(UnknownFieldMode::Allow),
+            FieldWalk::submitted(UnknownFieldMode::Allow, ExtensionCheck::Installed(&NONE)),
         ] {
-            walk.scoped("volume data".into(), &mut point);
-            let record = walk.finish("web").expect("accepted");
+            walk.scoped(Scope::Volume("data".into()), &mut point);
+            let (record, _) = walk.finish("web").expect("accepted");
             assert_eq!(record.pending.len(), 1);
         }
     }

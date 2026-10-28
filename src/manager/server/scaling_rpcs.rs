@@ -488,6 +488,7 @@ mod tests {
             }],
             version: None,
             pending_extensions: Default::default(),
+            extensions: Default::default(),
         }
     }
 

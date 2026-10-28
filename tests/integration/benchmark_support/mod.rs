@@ -317,6 +317,7 @@ pub fn submit_jobs(store: &Store, scenario: &SchedulerScenario) -> anyhow::Resul
                 rollout_by_group: Default::default(),
                 version: None,
                 pending_extensions: Default::default(),
+                extensions: Default::default(),
             };
             store.handle_job_submit(&job, std::slice::from_ref(&submission))?;
             ids.push(store.get_job_config(&job.name)?.id());

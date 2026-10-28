@@ -293,31 +293,30 @@ impl ManagerDaemonService {
     }
 
     /// For a resubmit that changed only `autoscale` and autoscaled tasks'
-    /// `count` (`in_place_change`), move the running allocations to the new
-    /// version instead of rolling out (plan §6.3). Only when no rollout is in
-    /// flight and every allocation runs the previous version; otherwise
-    /// `false`, and the update rolls out as usual.
-    pub(super) fn update_autoscale_in_place(
+    /// `count`, or only installed apps' jobspec extension values
+    /// (`classify_in_place`), move the running allocations to the new
+    /// version instead of rolling out (autoscaler-v2 plan §6.3; apps plan
+    /// §6.6). Only when no rollout is in flight and every allocation runs
+    /// the previous version; otherwise `None`, and the update rolls out as
+    /// usual.
+    pub(super) fn update_in_place(
         &self,
         config: &JobConfig,
         job_config_id: &str,
-    ) -> Result<bool, Status> {
-        if !config.tasks.iter().any(is_autoscaled) {
-            return Ok(false);
-        }
+    ) -> Result<Option<crate::manager::autoscale::InPlaceChange>, Status> {
         let Some(previous_id) = self
             .store
             .previous_job_config_id(job_config_id)
             .map_err(|e| map_store_error("Error loading previous job config", e))?
         else {
-            return Ok(false);
+            return Ok(None);
         };
         let Some(previous) = self
             .store
             .get_job_config_by_id_optional(&previous_id)
             .map_err(|e| map_store_error("Error loading previous job config", e))?
         else {
-            return Ok(false);
+            return Ok(None);
         };
         // Compare the stored versions: the store normalizes what it keeps
         // (resource defaults, say), so the request's config is not what the
@@ -327,17 +326,17 @@ impl ManagerDaemonService {
             .get_job_config_by_id_optional(job_config_id)
             .map_err(|e| map_store_error("Error loading job config", e))?
         else {
-            return Ok(false);
+            return Ok(None);
         };
-        if !crate::manager::autoscale::in_place_change(&previous, &next) {
-            return Ok(false);
-        }
+        let Some(change) = crate::manager::autoscale::classify_in_place(&previous, &next) else {
+            return Ok(None);
+        };
         let rollouts = self
             .store
             .list_rollouts(Some(&config.name), true)
             .map_err(|e| map_store_error("Error checking rollouts", e))?;
         if !rollouts.is_empty() {
-            return Ok(false);
+            return Ok(None);
         }
         let allocations = self
             .store
@@ -347,7 +346,7 @@ impl ManagerDaemonService {
             .iter()
             .any(|allocation| allocation.job_config_id != previous_id)
         {
-            return Ok(false);
+            return Ok(None);
         }
         let moved = self
             .store
@@ -357,9 +356,11 @@ impl ManagerDaemonService {
             job_id = %config.name,
             job_config_id,
             allocations = moved.len(),
-            "Autoscale-only update applied in place"
+            autoscale = change.autoscale,
+            extensions = change.extensions,
+            "Update applied in place"
         );
-        Ok(true)
+        Ok(Some(change))
     }
 
     /// The autoscaled tasks a namespace policy's `autoscale` (as applied,

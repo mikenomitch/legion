@@ -124,6 +124,7 @@ fn job(name: &str, band: Band, count: u32, resources: serde_json::Value) -> JobC
         }],
         version: None,
         pending_extensions: Default::default(),
+        extensions: Default::default(),
     }
 }
 

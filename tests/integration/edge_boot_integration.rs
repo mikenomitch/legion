@@ -101,6 +101,7 @@ fn submit(store: &Store) -> R<String> {
         tasks: vec![sandbox_task()],
         version: None,
         pending_extensions: Default::default(),
+        extensions: Default::default(),
     };
     store.handle_job_submit(
         &config,

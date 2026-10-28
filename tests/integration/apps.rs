@@ -844,6 +844,7 @@ async fn a_third_party_app_installs_reconciles_and_uninstalls_test() -> R<()> {
             UninstallAppRequest {
                 name: "gitops".into(),
                 idempotency_key: None,
+                force: false,
             },
             &fx.admin,
         ))
@@ -880,6 +881,7 @@ async fn a_third_party_app_installs_reconciles_and_uninstalls_test() -> R<()> {
             UninstallAppRequest {
                 name: "autoscaler".into(),
                 idempotency_key: None,
+                force: false,
             },
             &fx.admin,
         ))

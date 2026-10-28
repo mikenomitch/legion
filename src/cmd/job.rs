@@ -18,7 +18,7 @@ use crate::structs::{
     ListRolloutEventsRequest, ListRolloutsRequest, PlanJobRequest, RunJobRequest, ScaleTaskRequest,
     StopJobRequest, Submission,
 };
-use crate::task_plugins::{builtin_task_plugin_schemas, validate_job_config};
+use crate::task_plugins::validate_job_config;
 use serde::Serialize;
 use tabled::Tabled;
 use tempfile::TempDir;
@@ -604,8 +604,25 @@ async fn validate_job(arg_matches: &ArgMatches) -> R<()> {
 
     // Parse the rendered jobspec into a JobConfig, with the same unknown-key
     // rules the manager applies to the submit (`--allow-unknown-fields`).
+    // Keys installed apps add are checked against their schemas when a
+    // manager says which are installed; offline they are reported as not
+    // checked.
     let mode = UnknownFieldMode::from_allow(arg_matches.get_flag("allow-unknown-fields"));
-    let (config, unknown_fields) = match JobConfig::parse_submitted_str(&rendered, mode) {
+    let cluster = cluster_job_schema().await;
+    let registry = cluster.as_ref().ok().map(|reply| {
+        crate::structs::extensions::ExtensionRegistry::from_keys(
+            reply
+                .extensions
+                .iter()
+                .filter_map(|key| crate::structs::extensions::InstalledKey::from_proto(key).ok())
+                .collect(),
+        )
+    });
+    let check = match registry.as_ref() {
+        Some(registry) => crate::structs::spec_fields::ExtensionCheck::Installed(registry),
+        None => crate::structs::spec_fields::ExtensionCheck::Offline,
+    };
+    let (config, unknown_fields) = match JobConfig::parse_submitted_str(&rendered, mode, check) {
         Ok(parsed) => parsed,
         Err(err) => {
             let text = format!("jobspec is not a valid job configuration: {err:#}");
@@ -651,6 +668,33 @@ async fn validate_job(arg_matches: &ArgMatches) -> R<()> {
     // Unknown keys the flag kept or dropped come first: a dropped key is
     // intent the submit would lose.
     let mut warnings = unknown_fields.warnings();
+    if let Some(registry) = registry.as_ref() {
+        // What only a submit checks: `requires` (as the submitter) and the
+        // apps' own validate calls.
+        let deferred: Vec<String> = config
+            .extensions
+            .iter()
+            .filter_map(|value| {
+                let installed = registry.for_value(&value.app, value.point)?;
+                let mut checks = Vec::new();
+                if let Some(requires) = &installed.decl.requires {
+                    checks.push(format!("that you hold {}", requires.label()));
+                }
+                if installed.decl.validate {
+                    checks.push(format!("the {} app's own check", value.app));
+                }
+                (!checks.is_empty()).then(|| {
+                    format!(
+                        "{}{}: {} are checked at submit",
+                        value.path.scope(value.point),
+                        value.key,
+                        checks.join(" and ")
+                    )
+                })
+            })
+            .collect();
+        warnings.extend(deferred);
+    }
     warnings.extend(speculative_start_warnings(&config));
     // Valid settings that will not do what the author most likely expects
     // (an idle signal a microVM cannot see, an identity refresh that reboots
@@ -677,6 +721,10 @@ async fn validate_job(arg_matches: &ArgMatches) -> R<()> {
             "groups": groups.iter().collect::<Vec<_>>(),
             "warnings": warnings,
             "unknownFields": unknown_fields,
+            // `checked` when a manager said which keys apps add; `unchecked`
+            // offline, when keys at extension points could not be resolved.
+            "installedKeys": if registry.is_some() { "checked" } else { "unchecked" },
+            "extensions": config.extensions,
         }));
     } else {
         println!(
@@ -688,9 +736,113 @@ async fn validate_job(arg_matches: &ArgMatches) -> R<()> {
         for warning in &warnings {
             println!("warning: {warning}");
         }
+        if let Err(why) = &cluster {
+            println!(
+                "note: core fields only; keys installed apps add were not checked (no manager \
+                 answered: {why})"
+            );
+        }
     }
 
     Ok(())
+}
+
+/// One extension value as `job info -j` shows it: the proto, with its JSON
+/// strings parsed.
+fn extension_value_json(value: &crate::structs::JobExtensionValue) -> Value {
+    let mut json = serde_json::to_value(value).unwrap_or(Value::Null);
+    if let Some(object) = json.as_object_mut() {
+        for (raw, parsed) in [("valueJson", "value"), ("effectiveJson", "effective")] {
+            let value = object
+                .remove(raw)
+                .and_then(|text| {
+                    text.as_str()
+                        .and_then(|text| serde_json::from_str(text).ok())
+                })
+                .unwrap_or(Value::Null);
+            object.insert(parsed.into(), value);
+        }
+    }
+    json
+}
+
+/// `volume data on task postgres: backup = {...} (backup app; valid)`.
+fn extension_value_line(value: &crate::structs::JobExtensionValue) -> String {
+    let path = value.path.clone().unwrap_or_default();
+    let mut place = Vec::new();
+    if value.point == "group" {
+        place.push(format!("group {} (on task {})", path.group, path.task));
+    } else if !path.task.is_empty() {
+        place.push(format!("task {}", path.task));
+    }
+    for (label, name) in [
+        ("volume", &path.volume),
+        ("port", &path.port),
+        ("service", &path.service),
+    ] {
+        if !name.is_empty() {
+            place.push(format!("{label} {name}"));
+        }
+    }
+    let place = if place.is_empty() {
+        "job".to_string()
+    } else {
+        place.join(": ")
+    };
+    let owner = if value.app.is_empty() {
+        value.state.clone()
+    } else {
+        format!("{} app; {}", value.app, value.state)
+    };
+    let detail = if value.detail.is_empty() {
+        String::new()
+    } else {
+        format!(": {}", value.detail)
+    };
+    format!(
+        "{place}: {} = {} ({owner}{detail})",
+        value.key, value.effective_json
+    )
+}
+
+/// The cluster's jobspec schema and installed keys (`GetJobSchema`), when a
+/// manager answers within a few seconds; otherwise why not.
+pub(crate) async fn cluster_job_schema() -> Result<crate::structs::GetJobSchemaReply, String> {
+    let fetch = async {
+        let mut client = connect_manager_client()
+            .await
+            .map_err(|err| format!("{err:#}"))?;
+        client
+            .get_job_schema(crate::structs::GetJobSchemaRequest {})
+            .await
+            .map(tonic::Response::into_inner)
+            .map_err(|status| status.message().to_string())
+    };
+    tokio::time::timeout(std::time::Duration::from_secs(5), fetch)
+        .await
+        .unwrap_or_else(|_| Err("the manager did not answer within 5s".to_string()))
+}
+
+/// The jobspec schema this CLI can see: the cluster's (with installed apps'
+/// keys) when a manager is reachable, else the compiled-in one, marked as
+/// such in `$comment`.
+pub(crate) async fn jobspec_schema_for_cli() -> (Value, Option<String>) {
+    match cluster_job_schema().await {
+        Ok(reply) => match serde_json::from_str::<Value>(&reply.schema_json) {
+            Ok(schema) => (schema, None),
+            Err(err) => offline_schema(format!("the manager's schema is not JSON: {err}")),
+        },
+        Err(why) => offline_schema(why),
+    }
+}
+
+fn offline_schema(why: String) -> (Value, Option<String>) {
+    let mut schema = build_jobspec_schema();
+    schema["$comment"] = json!(format!(
+        "The compiled-in jobspec schema: keys installed apps add are not included (no manager \
+         answered: {why})."
+    ));
+    (schema, Some(why))
 }
 
 /// Gate downgrades this jobspec would take at admission, as human-readable
@@ -716,7 +868,13 @@ fn speculative_start_warnings(config: &JobConfig) -> Vec<String> {
 #[instrument(skip_all)]
 async fn job_schema(arg_matches: &ArgMatches) -> R<()> {
     let format = OutputFormat::from_matches(arg_matches);
-    let schema = build_jobspec_schema();
+    let (schema, offline) = jobspec_schema_for_cli().await;
+    if let Some(why) = offline {
+        eprintln!(
+            "note: the compiled-in schema; keys installed apps add are not included (no manager \
+             answered: {why})"
+        );
+    }
 
     if format.is_json() {
         output::print_success(&schema);
@@ -726,197 +884,10 @@ async fn job_schema(arg_matches: &ArgMatches) -> R<()> {
     Ok(())
 }
 
-/// Assemble the jobspec JSON Schema: a documented top-level envelope plus the
-/// live, per-runtime task config schemas derived from the built-in plugins.
+/// The compiled-in jobspec JSON Schema (`crate::structs::job_schema`):
+/// what `legion job schema` prints when no manager is reachable.
 pub(crate) fn build_jobspec_schema() -> Value {
-    let mut task_runtimes = serde_json::Map::new();
-    for plugin in builtin_task_plugin_schemas() {
-        task_runtimes.insert(plugin.name, plugin.schema);
-    }
-
-    let mut schema = jobspec_schema_envelope();
-    // `autoscale`: generated from the type the parser uses, with its
-    // definitions moved beside the task's.
-    let mut autoscale = crate::autoscaler::AutoscaleSpec::json_schema_value();
-    if let Some(definitions) = autoscale
-        .as_object_mut()
-        .and_then(|object| object.remove("definitions"))
-    {
-        if let (Some(defs), Value::Object(definitions)) =
-            (schema["$defs"].as_object_mut(), definitions)
-        {
-            for (name, definition) in definitions {
-                defs.insert(name, definition);
-            }
-        }
-    }
-    if let Some(object) = autoscale.as_object_mut() {
-        object.remove("$schema");
-        object.remove("title");
-        object.insert(
-            "description".into(),
-            json!(
-                "Task autoscaling (docs/autoscaling.md): `true` for the effective defaults \
-                   (min = count, max = 4 x count, CPU at 70% of the reservation), or a record \
-                   overriding some of them. Not on keyed, `count.per`, or batch tasks; at most \
-                   one task per group."
-            ),
-        );
-    }
-    let text = serde_json::to_string(&autoscale)
-        .unwrap_or_default()
-        .replace("#/definitions/", "#/$defs/");
-    schema["$defs"]["task"]["properties"]["autoscale"] =
-        serde_json::from_str(&text).unwrap_or(Value::Null);
-    schema["taskRuntimes"] = Value::Object(task_runtimes);
-    schema
-}
-
-fn jobspec_schema_envelope() -> Value {
-    json!({
-        "$schema": "http://json-schema.org/draft-07/schema#",
-        "title": "Legion Jobspec",
-        "description": "A Legion job specification (the JSON a Nickel jobspec renders to). \
-            A job has a name and one or more tasks (use `task` for a single task or `tasks` for many). \
-            Each task's `config` object is validated against the schema for its `runtime` under `taskRuntimes`.",
-        "type": "object",
-        "required": ["name"],
-        "properties": {
-            "name": { "type": "string", "description": "Unique job name." },
-            "task": { "$ref": "#/$defs/task", "description": "A single task (shorthand for tasks: [task])." },
-            "tasks": { "type": "array", "items": { "$ref": "#/$defs/task" }, "description": "List of tasks." },
-            "version": { "type": "integer", "description": "Optional jobspec version." },
-            "priority": {
-                "type": "string",
-                "enum": ["critical", "high", "elevated", "normal", "low", "background"],
-                "default": "normal",
-                "description": "Priority band, most important first. Orders the eval queue AND governs preemption: an allocation is only ever displaced by a job in a STRICTLY higher band, never a peer. Choosing a band below `normal` is the consent to be displaced. Claiming a band may require an ACL `bands` grant. See docs/preemption-and-eviction.md."
-            },
-            "rollout": { "$ref": "#/$defs/rollout", "description": "Default rollout strategy for the job." },
-            "rolloutByGroup": {
-                "type": "object",
-                "additionalProperties": { "$ref": "#/$defs/rollout" },
-                "description": "Per-group rollout overrides keyed by group name."
-            }
-        },
-        "$defs": {
-            "task": {
-                "type": "object",
-                "required": ["runtime"],
-                "properties": {
-                    "name": { "type": "string", "description": "Task name (unique within the job)." },
-                    "runtime": { "type": "string", "description": "Task runtime plugin that runs this task (e.g. exec, container, noop)." },
-                    "group": { "type": "string", "description": "Task group; tasks in a group are placed together." },
-                    "lifecycle": { "type": "string", "enum": ["service", "batch", "sidecar"], "description": "Task lifecycle." },
-                    "count": {
-                        "description": "Number of instances, or {num, per} for spread placement.",
-                        "oneOf": [
-                            { "type": "integer", "minimum": 0 },
-                            { "type": "object", "required": ["num", "per"], "properties": {
-                                "num": { "type": "integer" },
-                                "per": { "type": "string" }
-                            }}
-                        ]
-                    },
-                    "config": { "type": "object", "description": "Runtime-specific config; validated against taskRuntimes[runtime]." },
-                    "dependsOn": {
-                        "type": "array",
-                        "items": { "type": "object", "required": ["task"], "properties": {
-                            "task": { "type": "string" },
-                            "condition": { "type": "string", "enum": ["running", "healthy", "complete", "success"] }
-                        }},
-                        "description": "Task dependencies that gate start."
-                    },
-                    "schedule": { "description": "Batch-only schedule (cron string or {every: duration})." },
-                    "stop": {
-                        "type": "object",
-                        "description": "How the platform terminates this task, for every cause (job stop, rollout replacement, drain, reschedule, scale-in, preemption). See docs/graceful-stop.md.",
-                        "properties": {
-                            "signal": {
-                                "type": "string",
-                                "enum": ["SIGTERM", "SIGINT", "SIGQUIT", "SIGHUP", "SIGUSR1", "SIGUSR2"],
-                                "default": "SIGTERM",
-                                "description": "Notice signal, sent to the task's process group. SIGKILL is deliberately not offered: it is the end of the ladder, not a notice."
-                            },
-                            "killAfter": {
-                                "type": "string",
-                                "default": "30s",
-                                "description": "Grace between the signal and SIGKILL, e.g. \"30s\". Capped at 5m — grace may slow a drain, never wedge one."
-                            }
-                        }
-                    },
-                    "disruption": {
-                        "type": "object",
-                        "description": "Floor on how many of this task's allocations VOLUNTARY disruption (preemption) may leave running. Does not bind drain, node loss or job stop. See docs/preemption-and-eviction.md.",
-                        "properties": {
-                            "minAvailable": {
-                                "description": "Absolute count (2) or percent of count (\"50%\", rounded up). Default 0.",
-                                "oneOf": [
-                                    { "type": "integer", "minimum": 0 },
-                                    { "type": "string" }
-                                ]
-                            }
-                        }
-                    },
-                    "gang": {
-                        "description": "All-or-nothing placement for this task's replicas. `true`: every replica places in one plan or none does, and a gang that does not fit places nothing (nor do the job's other tasks in that pass), holds no capacity, and waits blocked until a node that could help has room. `{ min: N }` places once N replicas fit together and adds the rest as room appears; `placementTimeout` bounds the wait and `onMemberLoss` says what a lost member does to the rest. Not combinable with count.per or keyed stateful tasks; the task must have its group to itself, and that group's rollout must replace it in one step. See docs/gang-scheduling.md.",
-                        "oneOf": [
-                            { "type": "boolean" },
-                            {
-                                "type": "object",
-                                "additionalProperties": false,
-                                "properties": {
-                                    "min": {
-                                        "type": "integer",
-                                        "minimum": 1,
-                                        "description": "Quorum: replicas that must place together, 1..=count. Default: the whole count."
-                                    },
-                                    "placementTimeout": {
-                                        "type": ["string", "integer"],
-                                        "description": "How long the gang may wait for its quorum before its job fails (any members already running stop), as a duration (`\"30m\"`) or seconds. Counted from the first time the gang came up short. At least 1s. Default: unset, wait indefinitely."
-                                    },
-                                    "onMemberLoss": {
-                                        "type": "string",
-                                        "enum": ["restart", "replace", "fail"],
-                                        "description": "What a lost member does to the rest when it leaves fewer than the quorum running. `restart` (default): stop the survivors and place the whole gang again once their stop grace has passed. `replace`: keep the survivors and place the missing members together once they fit. `fail`: fail the job and stop every member. A loss that leaves the quorum running is replaced alone. Restarts after a failure spend on_unhealthy's move budget; once it is spent the job fails."
-                                    }
-                                }
-                            }
-                        ]
-                    },
-                    "speculativeStart": {
-                        "type": "object",
-                        "description": "How far a node may get on a start for this task BEFORE the placement is durable. Absent = off, today's behavior. A task declaring network ports, connect upstreams, or storage whose driver cannot fence a concurrent attach is downgraded to `stage` (reported by `job validate`). See docs/edge-boot.md.",
-                        "properties": {
-                            "mode": {
-                                "type": "string",
-                                "enum": ["off", "stage", "boot", "serve"],
-                                "description": "off (default) = no speculation. stage = fetch artifacts and build the root disk, do not start. boot = also boot, with the network held shut. serve = also open the network; the only mode where a workload that loses its race may already have had externally visible side effects."
-                            },
-                            "ratifyTimeout": {
-                                "type": "string",
-                                "description": "Lease: unratified work is killed at expiry, unconditionally. Default 5s, capped at 2m."
-                            },
-                            "onRefused": {
-                                "type": "string",
-                                "enum": ["kill", "stop"],
-                                "description": "What to do when ratification is refused. kill (default) is a hard destroy; stop runs the normal graceful-stop ladder."
-                            }
-                        }
-                    }
-                }
-            },
-            "rollout": {
-                "type": "object",
-                "properties": {
-                    "strategy": { "type": "string", "description": "Rollout strategy name (e.g. default)." },
-                    "maxParallel": { "type": "integer", "description": "Max allocations updated in parallel." },
-                    "autoPromote": { "type": "boolean", "description": "Advance automatically between steps." }
-                }
-            }
-        },
-        "taskRuntimes": {}
-    })
+    crate::structs::job_schema::core_jobspec_schema()
 }
 
 pub(crate) fn priority_arg() -> Arg {
@@ -2186,6 +2157,12 @@ async fn plan_job(arg_matches: &ArgMatches) -> R<()> {
         for warning in &reply.warnings {
             println!("warning: {warning}");
         }
+        if !reply.extensions.is_empty() {
+            println!("jobspec extensions:");
+            for value in &reply.extensions {
+                println!("  {}", extension_value_line(value));
+            }
+        }
         // One line per placement that carries fallback candidates: the
         // ranked list the apply walk may bind instead of the first choice
         // under contention (docs/late-binding-plan-apply.md). Quiet when
@@ -2392,13 +2369,17 @@ async fn run_job(arg_matches: &ArgMatches) -> R<()> {
     let namespace = spec_request_namespace(arg_matches, &rendered);
     // Capture the job's canonical id so we can optionally wait for
     // convergence below.
-    let job_name = JobConfig::parse_submitted_str(&rendered, UnknownFieldMode::Allow)
-        .map(|(config, _)| {
-            let (declared, name) = crate::structs::namespace::split_job_id(&config.name);
-            let namespace = namespace.as_deref().unwrap_or(declared);
-            crate::structs::namespace::job_id(namespace, name)
-        })
-        .ok();
+    let job_name = JobConfig::parse_submitted_str(
+        &rendered,
+        UnknownFieldMode::Allow,
+        crate::structs::spec_fields::ExtensionCheck::Offline,
+    )
+    .map(|(config, _)| {
+        let (declared, name) = crate::structs::namespace::split_job_id(&config.name);
+        let namespace = namespace.as_deref().unwrap_or(declared);
+        crate::structs::namespace::job_id(namespace, name)
+    })
+    .ok();
 
     let request = tonic::Request::new(RunJobRequest {
         parsed_jobspec: rendered,
@@ -2975,6 +2956,14 @@ async fn get_info(arg_matches: &ArgMatches) -> R<()> {
             if let Some(record) = reply.unknown_fields.as_ref() {
                 object.insert("unknownFields".into(), serde_json::to_value(record)?);
             }
+            // `extensions` when the job sets installed apps' jobspec keys
+            // (or keeps pending ones), as they read now.
+            if !reply.extensions.is_empty() {
+                object.insert(
+                    "extensions".into(),
+                    Value::Array(reply.extensions.iter().map(extension_value_json).collect()),
+                );
+            }
         }
         print_json(&value);
     } else {
@@ -3002,6 +2991,14 @@ async fn get_info(arg_matches: &ArgMatches) -> R<()> {
                 "submitted with --allow-unknown-fields: {}",
                 record.summary()
             );
+        }
+        // Installed apps' values (docs/apps.md, "Jobspec extensions"), under
+        // the key the author wrote, with their state now.
+        if !reply.extensions.is_empty() {
+            println!("jobspec extensions:");
+            for value in &reply.extensions {
+                println!("  {}", extension_value_line(value));
+            }
         }
         if let Some(usage) = usage.as_deref().filter(|usage| !usage.is_empty()) {
             println!();

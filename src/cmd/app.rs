@@ -223,6 +223,16 @@ pub fn config() -> Command {
                 )
                 .arg(yes_flag("Grant and install without asking"))
                 .arg(
+                    Arg::new("key")
+                        .long("key")
+                        .value_name("POINT.KEY=NEW")
+                        .action(ArgAction::Append)
+                        .help(
+                            "Install a jobspec key under another name, when another app owns it \
+                             (volume.backup=pgbackup); job authors then write the new key",
+                        ),
+                )
+                .arg(
                     Arg::new("dry-run")
                         .long("dry-run")
                         .action(ArgAction::SetTrue)
@@ -266,7 +276,29 @@ pub fn config() -> Command {
             Command::new("uninstall")
                 .about("Uninstall an app: stop its job, revoke its grant, drop its record")
                 .arg(name_arg())
+                .arg(
+                    Arg::new("force")
+                        .long("force")
+                        .action(ArgAction::SetTrue)
+                        .help(
+                            "Uninstall even though jobs set its jobspec keys; their values stay \
+                             stored, flagged orphaned",
+                        ),
+                )
                 .arg(idempotency_arg())
+                .arg(json_flag()),
+        )
+        .subcommand(
+            Command::new("extensions")
+                .about(
+                    "List the jobspec keys installed apps add: each key's point, owner, \
+                     description, and examples",
+                )
+                .arg(
+                    Arg::new("name")
+                        .value_name("APP")
+                        .help("Only this app's keys"),
+                )
                 .arg(json_flag()),
         )
         .subcommand(crate::cmd::app_view::command())
@@ -311,6 +343,7 @@ pub async fn handle(matches: &ArgMatches) -> R<()> {
         Some(("install", sub)) => install(sub).await,
         Some(("upgrade", sub)) => upgrade(sub).await,
         Some(("uninstall", sub)) => uninstall(sub).await,
+        Some(("extensions", sub)) => extensions(sub).await,
         Some(("view", sub)) => crate::cmd::app_view::handle(sub).await,
         Some(("run", sub)) => {
             crate::apps::run_app(
@@ -347,6 +380,20 @@ pub(crate) fn app_json(app: &App) -> Value {
         object.insert("config".into(), parse_json_field(&app.config_json));
         object.remove("manifestJson");
         object.remove("configJson");
+        if let Some(keys) = object
+            .get_mut("extensionKeys")
+            .and_then(Value::as_array_mut)
+        {
+            for key in keys.iter_mut().filter_map(Value::as_object_mut) {
+                for (raw, parsed) in [("schemaJson", "schema"), ("examplesJson", "examples")] {
+                    let value = key
+                        .remove(raw)
+                        .and_then(|value| value.as_str().map(parse_json_field))
+                        .unwrap_or(Value::Null);
+                    key.insert(parsed.into(), value);
+                }
+            }
+        }
         if let Some(grant) = object.get_mut("grant").and_then(Value::as_object_mut) {
             let rules = grant
                 .get("rulesJson")
@@ -528,6 +575,14 @@ async fn status(matches: &ArgMatches) -> R<()> {
     }
     if !app.ui_slots.is_empty() {
         println!("  UI:         {}", app.ui_slots.join(", "));
+    }
+    if !app.extension_keys.is_empty() {
+        let keys: Vec<String> = app
+            .extension_keys
+            .iter()
+            .map(|key| format!("{} on {}", key.key, key.point))
+            .collect();
+        println!("  Jobspec:    {}", keys.join(", "));
     }
     for note in &app.notes {
         println!("  Note:       {note}");
@@ -803,6 +858,10 @@ async fn install(matches: &ArgMatches) -> R<()> {
     let dry_run = matches.get_flag("dry-run");
     let yes = matches.get_flag("yes");
     let mut client = connect_manager_client().await?;
+    let keys: Vec<String> = matches
+        .get_many::<String>("key")
+        .map(|keys| keys.cloned().collect())
+        .unwrap_or_default();
     let request = |dry_run: bool| InstallAppRequest {
         manifest_json: manifest_json.clone(),
         source: kind.clone(),
@@ -810,6 +869,7 @@ async fn install(matches: &ArgMatches) -> R<()> {
         dry_run,
         config_json: config_json.clone(),
         idempotency_key: matches.get_one::<String>("idempotency-key").cloned(),
+        keys: keys.clone(),
     };
     let preview = output::resolve(
         format,
@@ -1019,6 +1079,7 @@ async fn uninstall(matches: &ArgMatches) -> R<()> {
             .uninstall_app(UninstallAppRequest {
                 name: name_of(matches),
                 idempotency_key: matches.get_one::<String>("idempotency-key").cloned(),
+                force: matches.get_flag("force"),
             })
             .await,
     )?
@@ -1028,9 +1089,103 @@ async fn uninstall(matches: &ArgMatches) -> R<()> {
             "message": reply.message,
             "revokedGrants": reply.revoked_grants,
             "deduplicated": reply.deduplicated,
+            "orphanedJobs": reply.orphaned_jobs,
         }));
     } else {
         println!("{}", reply.message);
+    }
+    Ok(())
+}
+
+/// `legion app extensions [app]`: every jobspec key installed apps add.
+async fn extensions(matches: &ArgMatches) -> R<()> {
+    let format = OutputFormat::from_matches(matches);
+    let only = matches
+        .get_one::<String>("name")
+        .map(|name| name.trim().to_string());
+    let mut client = connect_manager_client().await?;
+    let apps = match &only {
+        Some(name) => vec![output::resolve(
+            format,
+            "get app",
+            client.get_app(GetAppRequest { name: name.clone() }).await,
+        )?
+        .into_inner()
+        .app
+        .unwrap_or_default()],
+        None => {
+            output::resolve(
+                format,
+                "list apps",
+                client.list_apps(ListAppsRequest::default()).await,
+            )?
+            .into_inner()
+            .apps
+        }
+    };
+    let keys: Vec<&crate::structs::AppExtensionKey> = apps
+        .iter()
+        .flat_map(|app| app.extension_keys.iter())
+        .collect();
+    if format.is_json() {
+        let keys: Vec<Value> = apps
+            .iter()
+            .flat_map(|app| {
+                app_json(app)
+                    .get("extensionKeys")
+                    .and_then(Value::as_array)
+                    .cloned()
+                    .unwrap_or_default()
+            })
+            .collect();
+        output::print_success(&json!({ "keys": keys }));
+        return Ok(());
+    }
+    if keys.is_empty() {
+        println!("No installed app adds jobspec keys.");
+        return Ok(());
+    }
+    for key in keys {
+        let mut flags = Vec::new();
+        if key.validate {
+            flags.push("the app also checks values at submit".to_string());
+        }
+        if !key.requires.is_empty() {
+            flags.push(format!("setting it requires {}", key.requires));
+        }
+        if !key.app_enabled {
+            flags.push("app disabled".to_string());
+        }
+        let renamed = if key.declared_key != key.key {
+            format!(" (declared `{}`)", key.declared_key)
+        } else {
+            String::new()
+        };
+        println!(
+            "{} on {}  ({} app {}){renamed}",
+            key.key, key.point, key.app, key.app_version
+        );
+        if !key.description.is_empty() {
+            println!("  {}", key.description);
+        }
+        if key.point == "group" {
+            println!("  Written on one task of a group; applies to the whole group.");
+        }
+        if key.shadowed {
+            println!(
+                "  `{}` is now a core field at this point: write `apps.{}` instead.",
+                key.key, key.app
+            );
+        } else {
+            println!("  Also written `apps.{}`.", key.app);
+        }
+        if !flags.is_empty() {
+            println!("  {}", flags.join("; "));
+        }
+        let examples = parse_json_field(&key.examples_json);
+        for example in examples.as_array().into_iter().flatten() {
+            println!("  e.g. {} = {example}", key.key);
+        }
     }
     Ok(())
 }

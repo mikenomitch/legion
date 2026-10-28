@@ -575,6 +575,7 @@ fn test_job(name: &str, count: u32) -> JobConfig {
         tasks: vec![task],
         version: None,
         pending_extensions: Default::default(),
+        extensions: Default::default(),
     }
 }
 

@@ -71,6 +71,7 @@ fn job(name: &str, msg: &str, count: u32) -> JobConfig {
         }],
         version: None,
         pending_extensions: Default::default(),
+        extensions: Default::default(),
     }
 }
 

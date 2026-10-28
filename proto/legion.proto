@@ -48,6 +48,23 @@ service Manager {
   //
   // Depending on current state, this may create a new job config, create a rollout,
   // and enqueue reconciliation work.
+  //
+  // Jobspec extensions (docs/apps.md, "Jobspec extensions"): a key an
+  // installed app declares at an extension point (the job, a group written
+  // on one of its tasks, a task, a volume, a port, a service), or written
+  // `apps.<app>` there, is checked against the key's JSON Schema with its
+  // defaults filled, and stored as written, by app. A value that fails the
+  // schema is INVALID_ARGUMENT naming its full path, `allow_unknown_fields`
+  // or not. A value that is new or changed since the job's previous version,
+  // for a key that declares `requires`, needs that permission as the caller
+  // on the job (PERMISSION_DENIED otherwise). A key that declares `validate`
+  // makes the manager ask its app first (`POST
+  // /legion/v1/extensions/validate`, 2 seconds per app): the app's errors
+  // are INVALID_ARGUMENT, its warnings land in `RunJobReply.warnings`, and
+  // an app that cannot answer lets the submit through with a warning. A
+  // resubmit whose only differences are extension values (or pending keys)
+  // creates a version but no rollout: the running allocations move to it in
+  // place.
   rpc RunJob (RunJobRequest) returns (RunJobReply);
 
   // Returns the submitted source files (submissions) associated with the latest job config.
@@ -85,6 +102,26 @@ service Manager {
 
   // Computes a placement plan for a jobspec without mutating cluster state.
   rpc PlanJob (PlanJobRequest) returns (PlanJobReply);
+
+  // Returns this cluster's jobspec schema (JSON Schema, draft 7): the
+  // compiled-in core schema plus each key an installed app adds to the
+  // jobspec (docs/apps.md, "Jobspec extensions"), as a property at its
+  // extension point, described as "From the backup app, 0.3.1: …", and
+  // under that point's `apps` record in its qualified spelling
+  // (`apps.<app>`). `legion job schema`, `legion job validate`, and the
+  // `legion_job_schema` MCP tool use it when a manager is reachable, so an
+  // agent authoring a jobspec sees exactly what this cluster accepts;
+  // offline they fall back to the compiled-in schema and say that installed
+  // keys were not included.
+  //
+  // `extensions` lists the same keys structurally, with each key's own
+  // schema, so a client can check values against them the way a submit
+  // does (`legion job validate` does).
+  //
+  // Requires `job:read` (any scope): the schema says what a jobspec may
+  // contain, nothing about any job. Disabled apps' keys are included: a
+  // disabled app's keys are still validated at submit.
+  rpc GetJobSchema (GetJobSchemaRequest) returns (GetJobSchemaReply);
 
   // Marks a job as stopped and enqueues stop reconciliation.
   rpc StopJob (StopJobRequest) returns (StopJobReply);
@@ -2452,15 +2489,30 @@ service Manager {
   // Retry-safe: a repeated `idempotency_key` returns the first reply with
   // `deduplicated` set.
   //
+  // Jobspec keys (`extensions`; docs/apps.md, "Jobspec extensions"): each
+  // declaration is checked (one key per point, `task` and `group` as one; an
+  // object schema of at most 64 KiB with only local `$ref`s, compiled with a
+  // resolver that refuses every other ref, so nothing is fetched; examples
+  // that pass it), and so are the collision rules: a key that is a core
+  // field at its point is refused, and so is one another installed app
+  // declares there (`keys` installs it under another name). The prompt
+  // reports what the app's keys would do to stored values: the pending
+  // values (kept under `allow_unknown_fields`) it adopts, and how they fare
+  // against its schemas.
+  //
   // Errors:
   // - InvalidArgument: the manifest does not parse or validate (unknown
   //   fields, a bad name, a missing `version`, a config schema that does
   //   not compile or has a remote `$ref`, a default that fails it, a job
-  //   fragment that does not parse), or `config_json` fails the schema.
+  //   fragment that does not parse, an extension declaration that breaks a
+  //   rule above, a key that is a core field), `config_json` fails the
+  //   schema, or `keys` names a key the manifest does not declare.
   // - PermissionDenied: the caller lacks `app:write`, or a permission the
   //   manifest asks for.
   // - AlreadyExists: an app of that name is installed (use UpgradeApp).
-  // - FailedPrecondition: the name is a bundled app's.
+  // - FailedPrecondition: the name is a bundled app's, or one of its
+  //   jobspec keys is another installed app's at that point (the message
+  //   names the owner and the `--key` rename).
   rpc InstallApp (InstallAppRequest) returns (InstallAppReply);
 
   // Replaces an installed app's manifest (`legion app upgrade`). Requires
@@ -2474,6 +2526,12 @@ service Manager {
   // CLI can ask. A manifest that only keeps or drops permissions upgrades
   // without `approve`. The stored config is checked against the new
   // schema; a config that no longer matches refuses the upgrade.
+  //
+  // The new manifest's jobspec keys replace the installed ones, with the
+  // install-time checks (a key the installed version already declared may
+  // stay even if a newer Legion made it a core field). The prompt reports
+  // every stored value of the app's keys checked against the new schemas;
+  // values that fail stay stored and read as `invalid`.
   //
   // Retry-safe with `idempotency_key`.
   //
@@ -2490,11 +2548,16 @@ service Manager {
   // job's grants, and deletes the record. The stopped job stays in
   // `legion-system` until someone destroys it. Requires `app:write`.
   //
+  // While any job sets the app's jobspec keys, uninstalling needs `force`;
+  // the values stay stored, read as `orphaned`, and are listed in
+  // `orphaned_jobs`.
+  //
   // Retry-safe with `idempotency_key`; uninstalling an app that is not
   // installed is NotFound.
   //
   // Errors:
-  // - FailedPrecondition: the app is bundled; disable it instead.
+  // - FailedPrecondition: the app is bundled (disable it instead), or jobs
+  //   set its jobspec keys and `force` is not set (the message lists them).
   rpc UninstallApp (UninstallAppRequest) returns (UninstallAppReply);
 
   // Enables or disables an app (`legion app enable|disable`). Disabling
@@ -2531,6 +2594,48 @@ service Manager {
   // - PermissionDenied: a code field changed and the caller does not hold
   //   the app's grant.
   rpc SetAppConfig (SetAppConfigRequest) returns (SetAppConfigReply);
+
+  // Streams the calling app's jobspec extension values (docs/apps.md,
+  // "Jobspec extensions"; apps plan §6.6, "How values reach the app"): every
+  // value, in every job, that the app's keys own, wherever in the job it is
+  // written, with the effective value (the app's current schema defaults
+  // filled) and its validity against that schema.
+  //
+  // The first message has `snapshot` set and carries every current value.
+  // Each later message carries what changed since the previous one: upserts
+  // (a new value, a changed value, a new job version, a value whose
+  // validity changed after an app upgrade) and deletes (a value removed by
+  // a resubmit, or its job destroyed). The manager checks for changes about
+  // once a second and sends nothing while nothing changed. Any manager
+  // answers: values are read from replicated state.
+  //
+  // A value is included whatever its job's status (`job_status` says it);
+  // `invalid` values are included too, flagged, and the app decides whether
+  // to act on them. A pending value (kept under `--allow-unknown-fields`
+  // before the app was installed) that the app's key claims is included
+  // with `adopted` set, unless the key declares `requires`: then it stays
+  // pending until a submit by someone holding the permission.
+  //
+  // `shard_count` and `shards` split the values across an app's replicas:
+  // a value belongs to shard `shard_of(job_id, shard_count)` (the first
+  // eight bytes of SHA-256 of the canonical job id, big-endian, modulo the
+  // count), the same key hash the autoscaler shards its policies by.
+  //
+  // ACL: app-plane. Only an app's own workload identity may call it (its
+  // `legion` token, through the API socket or as a bearer token, or an ACL
+  // token minted from it with `legion login --method legion`), and it
+  // returns only that app's values: `app` must be empty or name the caller.
+  // A management token may name any installed `app`. Re-checks the
+  // caller's credential periodically, like StreamEvents.
+  //
+  // Errors:
+  // - Unauthenticated: no credential.
+  // - PermissionDenied: the caller is not an app's workload identity (or
+  //   names another app).
+  // - InvalidArgument: a shard outside `shard_count`, or a management
+  //   caller that names no app.
+  // - NotFound: `app` is not installed.
+  rpc WatchAppExtensions (WatchAppExtensionsRequest) returns (stream AppExtensionEvent);
 
   // Lists the UI extensions installed apps register (docs/apps.md, "Views
   // and actions"; docs/ui-architecture.md, "App extensions"): the pages,
@@ -3187,21 +3292,27 @@ message RunJobRequest {
   // most likely meant: `web: task web: unknown field `cuont` (did you mean
   // `count`?)`.
   //
+  // A key an installed app declares at that point is not unknown: it is
+  // checked against the app's schema (see RunJob), and a suggestion can be
+  // one (`did you mean `backup`, the backup app's key?`).
+  //
   // When `true`:
   // - a key directly on an extension point (the job's top level, a task, an
   //   entry in a task's `volumes`, an entry in `network.ports`, or a task's
-  //   `service` block) is kept, unvalidated, in that block's
-  //   `pendingExtensions` map, and stored with the version. Nothing acts on
-  //   it. These are the places where apps will declare their own keys, so a
-  //   key there may belong to an app that is not installed yet;
+  //   `service` block) that no installed app declares is kept, unvalidated,
+  //   in that block's `pendingExtensions` map, and stored with the version.
+  //   These are the places where apps declare their own keys, so a key there
+  //   may belong to an app that is not installed yet: installing one that
+  //   declares it adopts the value (`GetJobInfoReply.extensions`);
   // - a key anywhere else is dropped;
   // - each kept or dropped key is listed in `RunJobReply.warnings`, and the
   //   set is recorded on the job config version this request creates
   //   (`GetJobInfoReply.unknown_fields`, `legion job info`).
   //
   // The flag is about keys Legion does not know. A value Legion knows is
-  // wrong (a bad type, an out-of-range number, an unknown runtime) is still
-  // an error. It does not relax blocks that are strict on their own: the
+  // wrong (a bad type, an out-of-range number, an unknown runtime, a value
+  // that fails an installed app's key's schema) is still an error. It does
+  // not relax blocks that are strict on their own: the
   // network policy blocks (`network.egress`, `network.ingress`, an
   // upstream's `handlers`), value sources (`{ kv = … }`), the runtime's
   // `config`, and the `count`, `gang`, and `schedule` shorthands.
@@ -3544,6 +3655,72 @@ message GetJobInfoReply {
   // that renders to the same config is `unchanged` and leaves it in place,
   // even when the resubmit no longer carries the dropped keys.
   optional UnknownFieldsRecord unknown_fields = 4;
+
+  // The job's values for installed apps' jobspec keys (docs/apps.md,
+  // "Jobspec extensions"), as they read now: every value the latest
+  // version stores, with its effective value and its state against the
+  // apps installed now, then every pending key (kept under
+  // `--allow-unknown-fields`), adopted by an installed app that declares
+  // it or still pending. Values are visible to anyone with `job:read`, so
+  // they never hold secrets.
+  repeated JobExtensionValue extensions = 5;
+}
+
+// Where a jobspec extension value is written: the group and task for a
+// task-level point and every point below it, then the volume, port, or
+// service. All empty for the job point.
+message ExtensionPath {
+  string group = 1;
+  string task = 2;
+  string volume = 3;
+  string port = 4;
+  string service = 5;
+}
+
+// One of a job's values for an installed app's jobspec key, as it reads
+// now (GetJobInfoReply.extensions).
+message JobExtensionValue {
+  // The app that owns it: the app whose key stored it, or the installed app
+  // that claims a pending value. Empty for a pending value no app claims.
+  string app = 1;
+
+  // The extension point the app declared: `job`, `group`, `task`, `volume`,
+  // `port`, or `service`. A `group` value is written on one task of its
+  // group (`path.task`).
+  string point = 2;
+
+  ExtensionPath path = 3;
+
+  // The key as the jobspec wrote it: `backup`, or `apps.backup`.
+  string key = 4;
+
+  // The value as written, as JSON.
+  string value_json = 5;
+
+  // The value with the owning app's current schema defaults filled, as
+  // JSON (the value as written when no installed app owns it).
+  string effective_json = 6;
+
+  // `valid` (passes the app's current schema), `invalid` (fails it: an app
+  // upgrade tightened the schema; the job's next submit must conform),
+  // `pending` (kept under `--allow-unknown-fields`, and no installed app
+  // claims it, or the one that does declares `requires`), or `orphaned`
+  // (its app was uninstalled, or no longer declares a key at this point;
+  // resubmitting the job fails unless the key is removed or
+  // `--allow-unknown-fields` is passed).
+  string state = 7;
+
+  // Why it is invalid, pending, or orphaned; `app disabled` when its app is
+  // disabled (nothing acts on the value meanwhile); `adopted from pending`.
+  string detail = 8;
+
+  // `<app>@<manifest digest>`: the manifest whose schema checked it at
+  // submit. Empty for pending values.
+  string validated_by = 9;
+
+  // A pending value an installed app claims (adopted when the app was
+  // installed).
+  bool adopted = 10;
 }
 
 // The app that manages a job (GetJobInfoReply.managed_by).
@@ -4041,6 +4218,14 @@ message PlanJobReply {
   // policy as the cluster's current defaults resolve it, so nothing about
   // `autoscale = true` is hidden (docs/autoscaling.md).
   repeated AutoscalePlan autoscale = 10;
+
+  // The jobspec's values for installed apps' keys (docs/apps.md, "Jobspec
+  // extensions"), each with its effective value (the app's current schema
+  // defaults filled), and its pending keys, as GetJobInfoReply.extensions
+  // reports them. A value that fails its schema fails the plan instead.
+  // The plan does not check a key's `requires` or ask the app; a submit
+  // does.
+  repeated JobExtensionValue extensions = 11;
 }
 
 // The effective autoscaling policy of one task in a plan.
@@ -13776,6 +13961,152 @@ message App {
 
   // The nodes running it.
   repeated string running_on = 23;
+
+  // The jobspec keys the app adds (docs/apps.md, "Jobspec extensions"),
+  // with renames applied: `legion app extensions` lists them.
+  repeated AppExtensionKey extension_keys = 24;
+}
+
+// One jobspec key an installed app adds (App.extension_keys,
+// GetJobSchemaReply.extensions).
+message AppExtensionKey {
+  // The app that declares it, and its version (`bundled` apps report their
+  // build's).
+  string app = 1;
+  string app_version = 2;
+
+  // The digest of the app's manifest: what `validated_by` stamps name.
+  string manifest_digest = 3;
+
+  // Whether the app is enabled. A disabled app's keys are still validated
+  // at submit; nothing acts on the values while it is off.
+  bool app_enabled = 4;
+
+  // `job`, `group`, `task`, `volume`, `port`, or `service`. A `group` key
+  // is written on one task of the group and applies to the whole group.
+  string point = 5;
+
+  // What job authors write at the point: the declared key, or the
+  // operator's rename (`legion app install --key`). Every key can also be
+  // written in its qualified spelling, `apps.<app>`.
+  string key = 6;
+
+  // The key the manifest declares.
+  string declared_key = 7;
+
+  string description = 8;
+
+  // The value's JSON Schema (draft 7), as JSON.
+  string schema_json = 9;
+
+  // The manifest's example values, as a JSON array; each passes the
+  // schema.
+  string examples_json = 10;
+
+  // Whether a submit also asks the app (`POST
+  // /legion/v1/extensions/validate`), failing open when it cannot answer.
+  bool validate = 11;
+
+  // A permission whoever sets or changes the value must hold on the job
+  // (`net:write`), beyond `job:write`; empty when none.
+  string requires = 12;
+
+  // A core field of the same name now exists at the point (a Legion
+  // release added it): the core field wins, and job authors write the
+  // app's values as `apps.<app>`.
+  bool shadowed = 13;
+}
+
+// Request payload for GetJobSchema.
+message GetJobSchemaRequest {}
+
+// Reply payload for GetJobSchema.
+message GetJobSchemaReply {
+  // The cluster's jobspec JSON Schema (draft 7), as JSON: the core schema
+  // with every installed app's keys at their points.
+  string schema_json = 1;
+
+  // The installed keys, one per app and point.
+  repeated AppExtensionKey extensions = 2;
+}
+
+// Request payload for WatchAppExtensions.
+message WatchAppExtensionsRequest {
+  // The shards to watch, each below `shard_count`. Empty watches every
+  // shard.
+  repeated uint32 shards = 1;
+
+  // How many shards values split into. 0 (or 1) means one shard: every
+  // value.
+  uint32 shard_count = 2;
+
+  // The app whose values to watch: empty (or the caller's own name) for an
+  // app's identity; required for a management token.
+  string app = 3;
+}
+
+// One message of WatchAppExtensions.
+message AppExtensionEvent {
+  // True for the first message: `upserts` is every current value, and a
+  // consumer replaces whatever it held.
+  bool snapshot = 1;
+
+  // Values that are new or changed since the previous message.
+  repeated AppExtensionValue upserts = 2;
+
+  // Values that are gone since the previous message.
+  repeated AppExtensionValueRef deletes = 3;
+
+  // Increases by one with every message on this stream.
+  uint64 generation = 4;
+}
+
+// One of the calling app's values, in one job.
+message AppExtensionValue {
+  // The job's canonical id, its namespace, the version the value comes
+  // from, and the job's status.
+  string job_id = 1;
+  string namespace = 2;
+  uint32 config_version = 3;
+  string job_status = 4;
+
+  // The point the app declared (`group` keys are written on a task).
+  string point = 5;
+
+  // Where in the job: the group and task, then the volume, port, or
+  // service. The app acts only on what carries the value.
+  ExtensionPath path = 6;
+
+  // The key as written (`backup` or `apps.backup`).
+  string key = 7;
+
+  // The value as written, and with the app's current schema defaults
+  // filled, as JSON.
+  string value_json = 8;
+  string effective_json = 9;
+
+  // `valid` or `invalid` against the app's current schema; `detail` says
+  // why for `invalid`.
+  string state = 10;
+  string detail = 11;
+
+  // `<app>@<manifest digest>` that checked it at submit (empty for an
+  // adopted pending value, which no submit checked).
+  string validated_by = 12;
+
+  // A value kept pending under `--allow-unknown-fields` before the app was
+  // installed, which the app's key claims.
+  bool adopted = 13;
+
+  // The shard the value belongs to (0 when the stream is not sharded).
+  uint32 shard = 14;
+}
+
+// Identifies a value WatchAppExtensions no longer reports.
+message AppExtensionValueRef {
+  string job_id = 1;
+  string point = 2;
+  ExtensionPath path = 3;
 }
 
 // Request payload for GetApp.
@@ -13810,6 +14141,13 @@ message InstallAppRequest {
   // Optional key to dedupe retries; a repeat returns the first reply with
   // `deduplicated = true`.
   optional string idempotency_key = 6;
+
+  // Jobspec keys to install under another name, `<point>.<declared
+  // key>=<key>` (`--key volume.backup=pgbackup`): how an operator installs
+  // an app whose key another installed app already owns at that point. Job
+  // authors then write the new key; stored values belong to the app, not
+  // the key.
+  repeated string keys = 7;
 }
 
 // Reply payload for InstallApp.
@@ -13824,7 +14162,9 @@ message InstallAppReply {
   bool deduplicated = 3;
 
   // The install prompt: what the app runs, where, as whom, what it asks
-  // for, and its UI, one line each.
+  // for, and its UI, one line each; then, for an app with jobspec keys, how
+  // the stored values its keys own fare against its schemas, and the
+  // pending values it adopts.
   repeated string prompt = 4;
 
   // On a dry run, the first permission the caller does not hold, worded as
@@ -13886,7 +14226,9 @@ message UpgradeAppReply {
   // True when `idempotency_key` matched an earlier call.
   bool deduplicated = 5;
 
-  // The new manifest's install prompt.
+  // The new manifest's install prompt, then, for an app with jobspec keys,
+  // every stored value of its keys checked against the new schemas (`14
+  // jobs set backup on volumes; 2 fail this version's schema: …`).
   repeated string prompt = 6;
 }
 
@@ -13896,6 +14238,11 @@ message UninstallAppRequest {
 
   // Optional key to dedupe retries.
   optional string idempotency_key = 2;
+
+  // Uninstall even though jobs set the app's jobspec keys. Their values
+  // stay stored, flagged `orphaned`; resubmitting such a job fails unless
+  // the key is removed or `--allow-unknown-fields` is passed.
+  bool force = 3;
 }
 
 // Reply payload for UninstallApp.
@@ -13908,6 +14255,10 @@ message UninstallAppReply {
 
   // True when `idempotency_key` matched an earlier call.
   bool deduplicated = 3;
+
+  // The jobs whose values for the app's keys are now orphaned (with
+  // `force`).
+  repeated string orphaned_jobs = 4;
 }
 
 // Request payload for SetAppEnabled.

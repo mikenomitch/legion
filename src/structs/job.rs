@@ -14,10 +14,11 @@ use tracing::warn;
 
 use super::artifact::{validate_task_artifacts, ArtifactSpec};
 use super::band::Band;
+use super::extensions::{ExtensionRegistry, ExtensionValue, APPS_KEY, EXTENSIONS_KEY};
 use super::instance::InstanceMode;
 use super::spec_fields::{
-    extension_point, spec_block, ExtensionPoint, FieldWalk, PendingExtensions, UnknownFieldMode,
-    UnknownFields, UnknownFieldsRecord,
+    extension_point, spec_block, ExtensionCheck, ExtensionPoint, FieldWalk, PendingExtensions,
+    Scope, UnknownFieldMode, UnknownFields, UnknownFieldsRecord,
 };
 use super::workload_identity::WorkloadIdentity;
 use super::{Job, PlannedAllocation, Submission};
@@ -2518,6 +2519,14 @@ pub struct JobConfig {
         skip_serializing_if = "BTreeMap::is_empty"
     )]
     pub pending_extensions: PendingExtensions,
+    /// Values for installed apps' jobspec keys, at every point of the job,
+    /// resolved at submit to the app that owns each and kept as written
+    /// (`structs::extensions`; docs/apps.md, "Jobspec extensions"). Their
+    /// defaults are filled, and their validity decided, when they are read.
+    /// A change to these alone moves the job's allocations to the new
+    /// version in place.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub extensions: Vec<ExtensionValue>,
 }
 
 #[derive(Deserialize)]
@@ -2547,6 +2556,10 @@ struct JobConfigInput {
     version: Option<u32>,
     #[serde(default)]
     pending_extensions: PendingExtensions,
+    /// A stored config's resolved extension values. Legion writes these; a
+    /// submit carrying them is refused.
+    #[serde(default)]
+    extensions: Vec<ExtensionValue>,
     #[serde(flatten)]
     unknown_fields: UnknownFields,
 }
@@ -2568,23 +2581,26 @@ extension_point!(
         walk.opt("rollout", this.rollout.as_mut());
         walk.map("rolloutByGroup", &mut this.rollout_by_group);
         if let Some(task) = this.task.as_mut() {
-            let label = task.name.clone().unwrap_or_else(|| "task".to_string());
-            walk.scoped(format!("task {label}"), task);
+            let name = task.name.clone().unwrap_or_else(|| "task".to_string());
+            let group = task.group.clone();
+            walk.scoped(Scope::Task { name, group }, task);
         }
         match this.tasks.as_mut() {
             Some(TaskConfigList::List(tasks)) => {
                 for (index, task) in tasks.iter_mut().enumerate() {
-                    let label = task
+                    let name = task
                         .name
                         .clone()
                         .unwrap_or_else(|| format!("task-{}", index + 1));
-                    walk.scoped(format!("task {label}"), task);
+                    let group = task.group.clone();
+                    walk.scoped(Scope::Task { name, group }, task);
                 }
             }
             Some(TaskConfigList::Map(tasks)) => {
                 for (key, task) in tasks.iter_mut() {
-                    let label = task.name.clone().unwrap_or_else(|| key.clone());
-                    walk.scoped(format!("task {label}"), task);
+                    let name = task.name.clone().unwrap_or_else(|| key.clone());
+                    let group = task.group.clone();
+                    walk.scoped(Scope::Task { name, group }, task);
                 }
             }
             None => {}
@@ -2648,6 +2664,38 @@ impl<'de> Deserialize<'de> for TaskConfigList {
 
         deserializer.deserialize_any(ShapeVisitor)
     }
+}
+
+/// Every key a jobspec block at `point` consumes as a core field, aliases
+/// and misplacement traps included: what an app's extension key may not be
+/// (apps plan §6.6, collision rule 1). A `group` key is written on a task,
+/// so it is checked against the task's fields. `apps`, `pendingExtensions`,
+/// and `extensions` are reserved at every point.
+pub fn core_field_names(point: ExtensionPoint) -> Vec<&'static str> {
+    use crate::structs::spec_fields::SpecBlock;
+    let (fields, extra): (&[&'static str], &[&'static str]) = match point {
+        ExtensionPoint::Job => (
+            <JobConfigInput as SpecBlock>::FIELDS,
+            &["pendingExtensions", "extensions", "apps"],
+        ),
+        ExtensionPoint::Task | ExtensionPoint::Group => (
+            <TaskConfigInput as SpecBlock>::FIELDS,
+            &["kind", "onLost", "options", "pendingExtensions", "apps"],
+        ),
+        ExtensionPoint::Volume => (
+            <VolumeSpec as SpecBlock>::FIELDS,
+            &["pendingExtensions", "apps"],
+        ),
+        ExtensionPoint::Port => (
+            <crate::structs::network::PortConfig as SpecBlock>::FIELDS,
+            &["staticPort", "pendingExtensions", "apps"],
+        ),
+        ExtensionPoint::Service => (
+            <crate::structs::network::ServiceConfig as SpecBlock>::FIELDS,
+            &["pendingExtensions", "apps"],
+        ),
+    };
+    fields.iter().chain(extra.iter()).copied().collect()
 }
 
 /// The single-`task` shorthand, with its errors naming it.
@@ -2809,17 +2857,20 @@ extension_point!(
         walk.opt("kvInjections", this.kv_injections.as_mut());
         walk.opt("network", this.network.as_mut());
         if let Some(service) = this.service.as_mut() {
-            let label = match service.name.as_deref() {
-                Some(name) => format!("service {name}"),
-                None => "service".to_string(),
+            let scope = match service.name.clone() {
+                Some(name) => Scope::Service { name, named: true },
+                None => Scope::Service {
+                    name: this.name.clone().unwrap_or_default(),
+                    named: false,
+                },
             };
-            walk.scoped(label, service);
+            walk.scoped(scope, service);
         }
         walk.opt("connect", this.connect.as_mut());
         walk.list("identities", &mut this.identities);
         walk.opt("stateful", this.stateful.as_mut());
         for volume in this.volumes.iter_mut() {
-            walk.scoped(format!("volume {}", volume.name), volume);
+            walk.scoped(Scope::Volume(volume.name.clone()), volume);
         }
         walk.list("artifacts", &mut this.artifacts);
         walk.list("actions", &mut this.actions);
@@ -3006,7 +3057,18 @@ fn job_config_from_input(
     mut walk: FieldWalk,
 ) -> Result<(JobConfig, UnknownFieldsRecord), String> {
     walk.root(&mut input);
-    let record = walk.finish(&input.name).map_err(|err| err.to_string())?;
+    let stored = walk.is_stored();
+    if !stored && !input.extensions.is_empty() {
+        walk.value_error(format!(
+            "`{EXTENSIONS_KEY}` holds the values Legion resolved for installed apps' keys, and is \
+             not written by hand: write each key where it belongs, or as `{APPS_KEY}.<app>`"
+        ));
+    }
+    let (record, resolved) = walk.finish(&input.name).map_err(|err| err.to_string())?;
+    let mut extensions = if stored { input.extensions } else { resolved };
+    extensions.sort_by(|a, b| {
+        (&a.app, a.point, &a.path, &a.key).cmp(&(&b.app, b.point, &b.path, &b.key))
+    });
 
     let tasks = match (input.tasks, input.task) {
         (Some(_), Some(_)) => return Err("jobspec must define only one of task or tasks".into()),
@@ -3033,6 +3095,7 @@ fn job_config_from_input(
         rollout_by_group: input.rollout_by_group,
         version: input.version,
         pending_extensions: input.pending_extensions,
+        extensions,
     };
     // Session tasks become a keyed task plus a generated envelope task
     // here, at parse, so validation, storage, and every reader see one
@@ -3075,17 +3138,37 @@ impl JobConfig {
         value: Value,
         mode: UnknownFieldMode,
     ) -> R<(JobConfig, UnknownFieldsRecord)> {
-        let input: JobConfigInput = serde_json::from_value(value)?;
-        job_config_from_input(input, FieldWalk::submitted(mode)).map_err(|err| anyhow!(err))
+        Self::parse_submitted_with(
+            value,
+            mode,
+            ExtensionCheck::Installed(&ExtensionRegistry::empty()),
+        )
     }
 
-    /// [`Self::parse_submitted`] on JSON text.
+    /// [`Self::parse_submitted`], resolving keys at extension points as
+    /// `extensions` says: against the keys installed apps declare (a
+    /// manager's submit), or not at all (`legion job validate` offline,
+    /// which reports them as unchecked). A resolved value is checked against
+    /// its app's schema, and one that fails is an error whatever `mode`.
+    pub fn parse_submitted_with(
+        value: Value,
+        mode: UnknownFieldMode,
+        extensions: ExtensionCheck<'_>,
+    ) -> R<(JobConfig, UnknownFieldsRecord)> {
+        let input: JobConfigInput = serde_json::from_value(value)?;
+        job_config_from_input(input, FieldWalk::submitted(mode, extensions))
+            .map_err(|err| anyhow!(err))
+    }
+
+    /// [`Self::parse_submitted_with`] on JSON text.
     pub fn parse_submitted_str(
         text: &str,
         mode: UnknownFieldMode,
+        extensions: ExtensionCheck<'_>,
     ) -> R<(JobConfig, UnknownFieldsRecord)> {
         let input: JobConfigInput = serde_json::from_str(text)?;
-        job_config_from_input(input, FieldWalk::submitted(mode)).map_err(|err| anyhow!(err))
+        job_config_from_input(input, FieldWalk::submitted(mode, extensions))
+            .map_err(|err| anyhow!(err))
     }
 
     /// Normalize spec shorthands (currently the `service.port` inline port
@@ -3110,6 +3193,9 @@ impl JobConfig {
             // Pending keys are part of what was submitted: dropping or
             // changing one is a new version, or it would be lost.
             && self.pending_extensions == other.pending_extensions
+            // So are installed apps' values (a change to them alone is a
+            // new version that moves allocations in place).
+            && self.extensions == other.extensions
     }
 
     pub fn id(&self) -> String {

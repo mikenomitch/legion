@@ -2763,6 +2763,7 @@ mod tests {
             tasks: vec![task],
             version: None,
             pending_extensions: Default::default(),
+            extensions: Default::default(),
         };
         let noop = |name: &str| TaskConfig::new(name, "noop");
         for bad in [
@@ -2816,6 +2817,7 @@ mod tests {
             ],
             version: None,
             pending_extensions: Default::default(),
+            extensions: Default::default(),
         };
 
         let err = validate_job_config(&config).unwrap_err();
@@ -2877,6 +2879,7 @@ mod tests {
             }],
             version: None,
             pending_extensions: Default::default(),
+            extensions: Default::default(),
         };
 
         let err = validate_job_config(&config).unwrap_err();
@@ -2898,6 +2901,7 @@ mod tests {
             }],
             version: None,
             pending_extensions: Default::default(),
+            extensions: Default::default(),
         };
 
         let err = validate_job_config(&config).unwrap_err();
@@ -2927,6 +2931,7 @@ mod tests {
             }],
             version: None,
             pending_extensions: Default::default(),
+            extensions: Default::default(),
         };
         let err = validate_job_config(&config(json!({ "mode": "tap", "tap": "tap0" })))
             .expect_err("a hand-named TAP");
@@ -2958,6 +2963,7 @@ mod tests {
             }],
             version: None,
             pending_extensions: Default::default(),
+            extensions: Default::default(),
         };
 
         validate_job_config(&config)?;
@@ -2980,6 +2986,7 @@ mod tests {
             }],
             version: None,
             pending_extensions: Default::default(),
+            extensions: Default::default(),
         };
 
         let err = validate_job_config(&config).expect_err("unknown strategy should fail");
@@ -3019,6 +3026,7 @@ mod tests {
             tasks: vec![stateful_slot_task()],
             version: None,
             pending_extensions: Default::default(),
+            extensions: Default::default(),
         };
 
         let err = validate_job_config(&config)
@@ -3043,6 +3051,7 @@ mod tests {
             tasks: vec![stateful_slot_task()],
             version: None,
             pending_extensions: Default::default(),
+            extensions: Default::default(),
         };
         validate_job_config(&config)?;
 
@@ -3055,6 +3064,7 @@ mod tests {
             tasks: vec![stateful_slot_task()],
             version: None,
             pending_extensions: Default::default(),
+            extensions: Default::default(),
         };
         validate_job_config(&no_rollout)?;
         Ok(())
@@ -3081,6 +3091,7 @@ mod tests {
             tasks: vec![stateful_slot_task()],
             version: None,
             pending_extensions: Default::default(),
+            extensions: Default::default(),
         };
         validate_job_config(&config)
     }
@@ -3102,6 +3113,7 @@ mod tests {
             }],
             version: None,
             pending_extensions: Default::default(),
+            extensions: Default::default(),
         };
         let err = validate_job_config(&config).expect_err("slots on a stateless group");
         assert!(
@@ -3136,6 +3148,7 @@ mod tests {
             }],
             version: None,
             pending_extensions: Default::default(),
+            extensions: Default::default(),
         };
         let err = validate_job_config(&keyed).expect_err("slots on a keyed group");
         assert!(err.to_string().contains("slot-mode stateful task"));
@@ -3155,6 +3168,7 @@ mod tests {
             tasks: vec![stateful_slot_task()],
             version: None,
             pending_extensions: Default::default(),
+            extensions: Default::default(),
         };
         let err = validate_job_config(&config).expect_err("updateFrom >= count");
         assert!(
@@ -3185,6 +3199,7 @@ mod tests {
             ],
             version: None,
             pending_extensions: Default::default(),
+            extensions: Default::default(),
         };
         let err = validate_job_config(&config).expect_err("global slots over a stateless group");
         assert!(
@@ -3214,6 +3229,7 @@ mod tests {
             ],
             version: None,
             pending_extensions: Default::default(),
+            extensions: Default::default(),
         };
         validate_job_config(&scoped).expect("group-scoped slots block is valid");
     }
@@ -3481,6 +3497,7 @@ mod tests {
             tasks: vec![task],
             version: None,
             pending_extensions: Default::default(),
+            extensions: Default::default(),
         }
     }
 
@@ -3844,6 +3861,7 @@ mod tests {
             tasks,
             version: None,
             pending_extensions: Default::default(),
+            extensions: Default::default(),
         }
     }
 

@@ -266,13 +266,13 @@ fn tool_defs() -> Vec<ToolDef> {
         },
         ToolDef {
             name: "legion_job_schema",
-            description: "Get the JSON Schema for jobspecs and built-in task runtimes. Use this before authoring a jobspec.",
+            description: "Get this cluster's jobspec JSON Schema: the core fields and built-in task runtimes, plus each key installed apps add at its point (job, task, volume, port, service; `apps.<app>` is the qualified spelling). Without a reachable manager it is the compiled-in schema, and `$comment` says installed keys are not included. Use this before authoring a jobspec.",
             input_schema: empty_schema,
             mutates: false,
         },
         ToolDef {
             name: "legion_job_validate",
-            description: "Validate a rendered jobspec (JSON) without submitting it. An unknown key is an error that names its path and the closest known key (`web: task web: unknown field `cuont` (did you mean `count`?)`); fix it, or pass `allow_unknown_fields` to see what a submit with the flag would keep and drop.",
+            description: "Validate a rendered jobspec (JSON) without submitting it. An unknown key is an error that names its path and the closest known key (`web: task web: unknown field `cuont` (did you mean `count`?)`), installed apps' keys included; fix it, or pass `allow_unknown_fields` to see what a submit with the flag would keep and drop. Values for installed apps' keys are checked against their schemas when a manager answers (`installedKeys: checked`); offline, keys at extension points are reported as not checked (`installedKeys: unchecked`).",
             input_schema: || json!({
                 "type": "object",
                 "properties": {
@@ -1587,8 +1587,8 @@ async fn dispatch_tool(name: &str, args: Value) -> Result<Value, String> {
             Ok(serde_json::to_value(crate::cmd::capabilities::catalog())
                 .map_err(|e| e.to_string())?)
         }
-        "legion_job_schema" => Ok(crate::cmd::job::build_jobspec_schema()),
-        "legion_job_validate" => validate_tool(args),
+        "legion_job_schema" => Ok(crate::cmd::job::jobspec_schema_for_cli().await.0),
+        "legion_job_validate" => validate_tool(args).await,
         "legion_job_plan" => {
             let parsed_jobspec = str_arg(&args, "spec_json")?;
             let mut client = connect().await?;
@@ -3018,13 +3018,35 @@ fn allow_unknown_fields_arg(args: &Value) -> bool {
         .unwrap_or(false)
 }
 
-/// Validate a rendered jobspec locally (no manager required), with the
-/// unknown-key rules a submit applies.
-fn validate_tool(args: Value) -> Result<Value, String> {
+/// Validate a rendered jobspec without submitting it, with the unknown-key
+/// rules a submit applies. Installed apps' keys are checked against their
+/// schemas when a manager answers; offline they are reported as unchecked.
+async fn validate_tool(args: Value) -> Result<Value, String> {
     let spec_json = str_arg(&args, "spec_json")?;
     let mode =
         crate::structs::spec_fields::UnknownFieldMode::from_allow(allow_unknown_fields_arg(&args));
-    let (config, unknown_fields) = JobConfig::parse_submitted_str(&spec_json, mode)
+    // Parse first: a spec that is not JSON needs no manager to say so.
+    serde_json::from_str::<Value>(&spec_json)
+        .map_err(|e| format!("jobspec is not a valid job configuration: {e}"))?;
+    let registry = crate::cmd::job::cluster_job_schema()
+        .await
+        .ok()
+        .map(|reply| {
+            crate::structs::extensions::ExtensionRegistry::from_keys(
+                reply
+                    .extensions
+                    .iter()
+                    .filter_map(|key| {
+                        crate::structs::extensions::InstalledKey::from_proto(key).ok()
+                    })
+                    .collect(),
+            )
+        });
+    let check = match registry.as_ref() {
+        Some(registry) => crate::structs::spec_fields::ExtensionCheck::Installed(registry),
+        None => crate::structs::spec_fields::ExtensionCheck::Offline,
+    };
+    let (config, unknown_fields) = JobConfig::parse_submitted_str(&spec_json, mode, check)
         .map_err(|e| format!("jobspec is not a valid job configuration: {e:#}"))?;
     validate_job_config(&config).map_err(|e| format!("jobspec failed validation: {e}"))?;
     Ok(json!({
@@ -3033,6 +3055,8 @@ fn validate_tool(args: Value) -> Result<Value, String> {
         "tasks": config.tasks.len(),
         "warnings": unknown_fields.warnings(),
         "unknownFields": unknown_fields,
+        "installedKeys": if registry.is_some() { "checked" } else { "unchecked" },
+        "extensions": config.extensions,
     }))
 }
 

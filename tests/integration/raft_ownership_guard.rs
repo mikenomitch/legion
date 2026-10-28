@@ -81,6 +81,7 @@ fn test_job(name: &str) -> JobConfig {
         tasks: vec![task],
         version: None,
         pending_extensions: Default::default(),
+        extensions: Default::default(),
     }
 }
 
@@ -348,6 +349,7 @@ fn worker_exit_report_ops_pass_the_ownership_guard() -> R<()> {
         tasks: vec![step("fetch"), validate],
         version: None,
         pending_extensions: Default::default(),
+        extensions: Default::default(),
     };
     let outcome = store.handle_job_submit(&job, &[submission("guard-dag")])?;
     let job_config_id = outcome.job_config_id().to_string();
