@@ -41,7 +41,70 @@ struct Cluster {
 }
 
 impl Cluster {
+    /// A manager on fresh ports. A port picked free can be taken again
+    /// before the manager binds it (by another test, or another process on
+    /// a shared machine), and the CLI would then talk to someone else's
+    /// manager. So a start that lost either bind is retried on new ports:
+    /// the manager exits when it cannot bind its API port, and its worker
+    /// logs `Address already in use` when it cannot bind the worker port.
     fn start(run_worker: bool) -> Cluster {
+        for attempt in 1..=3 {
+            let cluster = Self::spawn(run_worker);
+            let deadline = Instant::now() + Duration::from_secs(90);
+            loop {
+                let lost_a_bind = std::fs::read_to_string(cluster.dir.path().join("manager.log"))
+                    .unwrap_or_default()
+                    .contains("Address already in use");
+                if lost_a_bind || Instant::now() > deadline {
+                    break;
+                }
+                if TcpStream::connect(("127.0.0.1", cluster.port)).is_ok() {
+                    // Listening, but whose? Ours is still running a moment
+                    // later; one that lost its bind has exited by then.
+                    std::thread::sleep(Duration::from_secs(1));
+                    let mut cluster = cluster;
+                    if cluster.manager.try_wait().ok().flatten().is_some() {
+                        break;
+                    }
+                    // Then its worker: registered, or lost its own bind.
+                    if cluster.wait_registered() {
+                        return cluster;
+                    }
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(250));
+            }
+            eprintln!("system_worker: start attempt {attempt} lost a port bind; retrying");
+        }
+        panic!("the manager could not bind its ports in three attempts");
+    }
+
+    /// Wait for the in-process worker to register: `true` once a node is
+    /// listed, `false` when the worker lost its port bind (the caller
+    /// retries). Anything else times out with the log tail.
+    fn wait_registered(&self) -> bool {
+        let mut lost = false;
+        self.wait_for("the in-process worker to register", || {
+            lost = std::fs::read_to_string(self.dir.path().join("manager.log"))
+                .unwrap_or_default()
+                .contains("Address already in use");
+            lost || self.first_node_id().is_some()
+        });
+        !lost
+    }
+
+    fn first_node_id(&self) -> Option<String> {
+        let nodes = self.cli_json(&["node", "list"]);
+        nodes["data"]
+            .as_array()
+            .or_else(|| nodes["data"]["nodes"].as_array())
+            .and_then(|nodes| nodes.first())
+            .and_then(|node| node["id"].as_str())
+            .map(str::to_string)
+            .filter(|id| !id.is_empty())
+    }
+
+    fn spawn(run_worker: bool) -> Cluster {
         let dir = tempfile::Builder::new()
             .prefix("legion-system-worker-")
             .tempdir_in(crate::support::scratch_root())
@@ -81,11 +144,7 @@ impl Cluster {
             .stderr(log)
             .spawn()
             .expect("spawn manager");
-        let cluster = Cluster { dir, port, manager };
-        cluster.wait_for("the manager to listen", || {
-            TcpStream::connect(("127.0.0.1", port)).is_ok()
-        });
-        cluster
+        Cluster { dir, port, manager }
     }
 
     fn token_file(&self) -> PathBuf {
@@ -140,21 +199,10 @@ impl Cluster {
         }
     }
 
-    /// The single registered node, once it is there: `node info`'s data.
+    /// The single registered node (`start` waited for it): `node info`'s
+    /// data.
     fn the_node(&self) -> serde_json::Value {
-        let mut id = String::new();
-        self.wait_for("the in-process worker to register", || {
-            let nodes = self.cli_json(&["node", "list"]);
-            let Some(first) = nodes["data"]
-                .as_array()
-                .or_else(|| nodes["data"]["nodes"].as_array())
-                .and_then(|nodes| nodes.first())
-            else {
-                return false;
-            };
-            id = first["id"].as_str().unwrap_or_default().to_string();
-            !id.is_empty()
-        });
+        let id = self.first_node_id().expect("start waited for the node");
         let info = self.cli_json(&["node", "info", &id]);
         assert_eq!(info["ok"], true, "{info}");
         info["data"].clone()
