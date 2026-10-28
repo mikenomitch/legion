@@ -4472,7 +4472,7 @@ plan.
         equivalent) and extension points beyond job, group, task, volume,
         port, and service (plan §11)
 
-- [ ] **Autoscaler** (v2 plan, merged in [#57](https://github.com/mikenomitch/legion/pull/57)): [plan](plans/autoscaler-v2-plan.md) (IN EXECUTION; Phase 2 in Done) ·
+- [ ] **Autoscaler** (v2 plan, merged in [#57](https://github.com/mikenomitch/legion/pull/57)): [plan](plans/autoscaler-v2-plan.md) (IN EXECUTION; Phase 2 in Done, Phase 5a below) ·
       [calls](calls/autoscaler-v2-plan_calls.md). Supersedes
       [autoscaler-plan.md](plans/autoscaler-plan.md) ·
       [calls](calls/autoscaler-plan_calls.md), whose Phase 1 shipped and is
@@ -4548,10 +4548,33 @@ plan.
         through app config, the `exec`/`noop` targets, `legion scaling plugin
         test`, the SDK and example plugins, and standalone `ScalingPolicy`
         objects for external targets
-  - [ ] Phase 5: node autoscaling. `GetCapacityDemand` (pending work
-        simulated on node-group templates), join tokens with `max_uses` and
-        `attributes`, `legion join --attr`, drain → terminate → `ForgetNode`
-        with budgets and protections, and a first-party `aws-asg` plugin
+  - [ ] Phase 5: node autoscaling.
+    - [x] Phase 5a, the substrate (2026-10-28,
+          [docs/autoscaling.md](../docs/autoscaling.md#capacity-demand),
+          [architecture-managers-workers.md](../docs/architecture-managers-workers.md),
+          [calls 51-62](calls/autoscaler-v2-plan_calls.md)): join tokens
+          with `max_uses` and `attributes`, `legion join --attr`
+          (`legion.provider-id`), `ForgetNode` and `legion node forget`
+          (revokes the node token), `GetCapacityDemand` and
+          `legion scaling demand` (pending work packed onto node-group
+          templates with the scheduler's feasibility functions), and the
+          pure node-group engine (`src/autoscaler/nodes.rs`: spec, victims
+          and protections, budgets, the drain state machine, least-waste)
+    - [ ] Phase 5b: run node-group policies in the autoscaler app: mint
+          group tokens, call the provider's `target/scale|status|terminate`,
+          execute the engine's intents through `RecordScalingAction` and a
+          `scaling_action` table with compare-and-set; `node:write` back in
+          the app's grant ([calls 44](calls/autoscaler-v2-plan_calls.md));
+          `scaling apply|list|delete` for node-group policies; the
+          `aws-asg` plugin (needs Phase 4's protocol)
+    - [ ] Phase 5b engine inputs: a real fits-elsewhere simulation for
+          `underutilized` scale-in, the `disruption.minAvailable`
+          computation, and the provider-id cross-check against the
+          provider's status ([calls 62](calls/autoscaler-v2-plan_calls.md));
+          `PauseScaling` for node groups; `nodegroup.join_timeout` and
+          `nodegroup.scale_in` events
+    - [ ] Lost-node GC: forgetting nodes that stayed lost past a deadline
+          (`legion node forget` is the manual path today)
   - [ ] Phase 6: autoscaler UI as app extensions (needs apps A4)
   - [ ] Phase 7: sharded replicas (shard leases, rebalancing) and a
         10,000-policy load test

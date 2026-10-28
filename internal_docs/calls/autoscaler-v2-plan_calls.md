@@ -1294,6 +1294,247 @@ the mean.
 **Why (simplicity).** The inputs carry counts, not per-replica times, and
 the warmup rule only needs to damp a fresh scale-out.
 
+## 51. Join attributes: the token beats `--attr`, which beats the worker type; hosts may set only `legion.provider-id` under `legion.*`
+
+*Implementation, Phase 5a.*
+
+**Call.** A node's attributes merge the join token's `attributes` over the
+host's `--attr`, over its worker type's. Keys under `legion.` are reserved:
+a host may set only the per-host `legion.provider-id`; a token may set
+`legion.nodegroup` and other `legion.*` keys; nobody may set
+`legion.role`, `legion.join`, or keys Legion reads as node structure
+(`namespaces`, `resources`, `capacity`, ...). A bad `--attr` fails the
+join with InvalidArgument.
+
+```console
+$ legion join-token create --max-uses 5 --attr legion.nodegroup=workers-general
+$ legion join --token-file token --attr legion.provider-id=i-0abc --attr rack=r7
+```
+
+`--attr legion.nodegroup=…` on the host is refused with InvalidArgument.
+
+**Alternatives.** Let the host's `--attr` win over the token; a fixed list
+of reserved keys instead of a reserved prefix.
+
+**Trade-off.** Worker operators can't override a token's attributes, and a
+new per-host `legion.*` key needs a code change to allow.
+
+**Why (security).** A node-group token has to vouch for
+`legion.nodegroup`, and node autoscaling decides what to drain and
+terminate by it. A booting host must not be able to join a group it
+wasn't minted for.
+
+## 52. `max_uses` counts distinct new nodes, consumed atomically as the join's last step
+
+*Implementation, Phase 5a.*
+
+**Call.** A use is spent only when a token introduces a node that didn't
+exist: re-registering the same node (matched through its recorded
+`legion.join.token`) is free, and a forgotten node coming back counts as
+new. The counter is consumed with a conditional
+`UPDATE … WHERE uses < max_uses` immediately before the node row is
+inserted; if it can't be consumed, the join is refused.
+
+```console
+$ legion join-token list
+ID        USES  ATTRIBUTES
+jt-7f3a   3/5   legion.nodegroup=workers-general
+```
+
+**Alternatives.** Count every registration; consume the use when the token
+is first presented.
+
+**Trade-off.** Two brand-new hosts racing for the last use under the same
+name can see one refused although both started.
+
+**Why (simplicity).** Worker restarts must not burn a group's budget, and
+failing closed at the last use is the safe direction for a token that
+creates capacity someone pays for.
+
+## 53. ForgetNode refuses a node that holds anything; `--force` takes the lost-node path
+
+*Implementation, Phase 5a.*
+
+**Call.** `legion node forget` refuses a node with any allocation
+(including held stateful ones), one that is live and schedulable, or one
+holding node-local volumes. A cordoned, empty node can be forgotten even
+while it still heartbeats, so an autoscaler can forget an instance it just
+terminated. `--force` skips the guard and removes the node the way a lost
+node is handled: allocations become `NodeLost`, gang members lost,
+snapshots lost, then the node row and its worker token go in one Control
+write.
+
+**Alternatives.** Forget only dead nodes; a soft delete that hides the
+record.
+
+**Trade-off.** `--force` on a live node strands its running processes until
+the worker notices its token is revoked.
+
+**Why (safety).** The default can't lose work; the forced path reuses the
+one tested lost-node path rather than inventing a second.
+
+## 54. Pending work is only what the scheduler already failed to place
+
+*Implementation, Phase 5a.*
+
+**Call.** `GetCapacityDemand` counts unplaced replicas of active jobs'
+latest configs (across versions) and keyed instances with no allocation.
+It leaves out jobs whose eval is still pending or in flight (listed as
+`awaiting_scheduler`), `count.per`, cron, and finished batch tasks, and it
+does not subtract free room on existing nodes.
+
+**Alternatives.** Simulate the whole cluster: pending work against existing
+nodes first, then templates.
+
+**Trade-off.** A rollout waiting for surge room shows no demand, and the
+answer can over-ask by a node because existing free room isn't modelled.
+
+**Why (simplicity).** Work the scheduler hasn't tried yet may fit on what
+exists; counting it would provision nodes the next eval doesn't need.
+Over-asking by one node is bounded by `step` and corrected by scale-in.
+
+## 55. The synthetic node is the worker type plus the shape, through the existing resource model
+
+*Implementation, Phase 5a.*
+
+**Call.** Each template becomes a synthetic node built from its worker type
+(pool, namespaces, attributes, resources), then the shape applied through
+the existing `capacity` ceiling attribute, plus `legion.nodegroup`.
+`like_node` copies a real member instead; a shape can only lower its
+limits. Feasibility runs through `ResourcePool::from_node` and the
+scheduler's own checks; two scheduler functions (`task_static_ports`,
+`node_provides_volume_drivers`) became `pub(crate)` for it.
+
+**Alternatives.** A separate resource model for templates; duplicating the
+two functions.
+
+**Trade-off.** A shape can't describe a node larger than its worker type
+allows, only smaller.
+
+**Why (correctness).** The demand answer can't disagree with the scheduler
+when it uses the scheduler's code. `scheduler_bench` before/after
+(`candidate_construction`, ms, indexes off/on): 1000 4.12→4.02 / 3.54→3.76;
+5000 17.61→17.60 / 8.94→8.97; 10000 36.50→35.77 / 13.07→12.82 — noise.
+
+## 56. Unreadable pending entries are redacted, not dropped
+
+*Implementation, Phase 5a.*
+
+**Call.** `GetCapacityDemand` needs `node:read` (per template pool). A
+pending or unfittable entry for a job the caller can't read keeps its
+counts and failing rule, with empty names and `redacted = true`.
+
+**Alternatives.** Drop entries the caller can't read; require `job:read`
+on every job.
+
+**Trade-off.** A `node:read` caller learns that some unreadable work exists
+and how big it is.
+
+**Why (correctness).** Node totals must cover all pending work, or a
+narrowly scoped autoscaler would under-provision.
+
+## 57. Templates are answered independently, and a task group packs as one unit
+
+*Implementation, Phase 5a.*
+
+**Call.** Each template is answered as "if only this group grew"; only
+`upcoming` nodes absorb pending work across all templates first. The
+engine's expander then picks one group per tick (least-waste, the only
+expander built). A task group's tasks pack as one unit sized by their sum;
+a gang packs atomically.
+
+**Alternatives.** A joint optimisation across templates.
+
+**Trade-off.** Mixed shapes can need one more tick to converge than an
+optimiser would.
+
+**Why (simplicity).** Predictable answers that match the Cluster
+Autoscaler's expander model, and how the scheduler places groups.
+
+## 58. Scale-in never lowers the provider's desired count; it terminates chosen nodes
+
+*Implementation, Phase 5a.*
+
+**Call.** The node-group engine scales in only by draining and terminating
+specific victims; it never sets a smaller desired count and lets the
+provider pick. Above `max` it holds. Scale-in holds while the group is
+growing, has demand, or has a scale-up pending; pause aborts drains still
+in the draining stage (uncordoning them). A 60s cordon grace and a 2m
+terminate retry are built in.
+
+**Alternatives.** Lower the desired count and let the provider choose.
+
+**Trade-off.** Every provider plugin must support terminating a named
+instance.
+
+**Why (safety).** Only Legion knows which nodes are empty and safe to
+remove; a provider choosing would kill a busy node.
+
+## 59. `legion-system` allocations protect a node, except per-node system ones
+
+*Implementation, Phase 5a.*
+
+**Call.** A node running a `legion-system` allocation is never a scale-in
+victim, unless that allocation is a per-node (`count.per`) system task,
+which every node has.
+
+**Alternatives.** Protect every node with any system allocation.
+
+**Trade-off.** A per-node system task is stopped when its node goes.
+
+**Why (correctness).** Otherwise a per-node system app would pin every node
+and scale-in could never happen.
+
+## 60. Node-group engine defaults
+
+*Implementation, Phase 5a.*
+
+**Call.** `max` is required and `min` defaults to 0. Up: step
+`{ percent = 100, replicas = 5 }` every 2m, `joinTimeout = "10m"`. Down:
+`when = "empty"` for 10m, step `{ percent = 10, replicas = 1 }` every 5m,
+`drainDeadline = "10m"`; `underutilized` means under 50% reserved. A
+`mode` field gives node groups a dry run.
+
+**Alternatives.** No default `max` (unbounded growth); scale-in on by
+`underutilized`.
+
+**Trade-off.** Groups grow by at most 5 nodes per 2 minutes until tuned.
+
+**Why (safety).** A node group spends money; the defaults bound the spend
+and remove only nodes that are provably empty.
+
+## 61. Capacity-demand simulation is capped at 20,000 replicas
+
+*Implementation, Phase 5a.*
+
+**Call.** The simulation packs at most 20,000 pending replicas and sets
+`truncated` past that; packing keeps a start cursor per template so
+first-fit stays near-linear.
+
+**Alternatives.** No cap; paging.
+
+**Trade-off.** A larger backlog is under-counted until it drains below the
+cap; `truncated` says so.
+
+**Why (performance).** The RPC runs on whichever manager answers, and must
+stay cheap enough to call every tick.
+
+## 62. Tokens are enforced even with ACLs off, and provider ids are not yet unique
+
+*Implementation, Phase 5a.*
+
+**Call.** `max_uses` and token attributes apply whenever a presented token
+resolves, ACLs on or off. Uniqueness of `legion.provider-id` across nodes is
+not enforced; Phase 5b cross-checks it against the provider's status.
+
+**Alternatives.** Skip token limits with ACLs off; refuse a duplicate
+provider id at join.
+
+**Trade-off.** Two nodes can claim one instance id until Phase 5b.
+
+**Why (simplicity).** Node groups must not depend on the ACL mode, and only
+the provider knows which instance ids are real.
+
 ## Ledger: what stands from the superseded plan's calls
 
 The superseded plan's calls are not rewritten (`plans/README.md`). This is

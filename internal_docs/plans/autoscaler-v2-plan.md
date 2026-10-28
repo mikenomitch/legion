@@ -7,7 +7,10 @@ engine core (`src/autoscaler/`: spec, layered defaults, strategies,
 schedules, pipeline, simulator), and Phase 2 (task autoscaling as the
 bundled app: `autoscale`, live layered defaults, in-place resubmits, pins,
 pauses, history, `legion scaling`, workload identity on by default) shipped
-2026-10-28; Phases 3–7 are in progress. Phase 2 also runs the engine's
+2026-10-28, and so did Phase 5a, node autoscaling's substrate (join tokens
+with `max_uses` and `attributes`, `legion join --attr`, `ForgetNode`,
+`GetCapacityDemand`, and the pure node-group engine; calls entries 51-62).
+Phases 3, 4, 5b, 6 and 7 are in progress. Phase 2 also runs the engine's
 `checks`, strategies, and schedules on the `legion` source (calls entry 38),
 so Phase 3 is the external sources, scale to zero, and `scaling simulate`. (Written 2026-10-19; layered defaults, in-place policy edits, and
 the core-field rationale added 2026-10-27.) This plan **supersedes**
