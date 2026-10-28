@@ -110,8 +110,12 @@ Even with `--allow-write`, `legion_state_query` stays read-only.
 | `legion_template_render` | no | Dry-run a template: validate variables and return the rendered jobspec without submitting. |
 | `legion_job_run` | **yes** | Submit/update a job from rendered JSON. `allow_unknown_fields` accepts keys Legion does not know, as `--allow-unknown-fields` does; the reply's `warnings` lists each one kept or dropped. |
 | `legion_job_stop` | **yes** | Stop a job. |
-| `legion_job_scale` | **yes** | Change a task's count without a new job version or rollout ([autoscaling.md](autoscaling.md)). Supports `idempotency_key`. |
-| `legion_job_scale_status` | no | Per-task spec vs override vs effective counts. The effective count is the one placement converges to: an override laid over a different spec count does not bind and is not reported. |
+| `legion_job_scale` | **yes** | Change a task's count without a new job version or rollout ([autoscaling.md](autoscaling.md)). On an autoscaled task a count is a time-boxed pin and needs `for` (refused otherwise, with a hint); `min`/`max` with `for` pin a floor or ceiling; `release` ends a pin. Supports `idempotency_key`. |
+| `legion_job_scale_status` | no | Per-task spec vs override vs effective counts. The effective count is the one placement converges to: an override laid over a different spec count does not bind and is not reported. For an autoscaled task, also its policy in one line, its pin and pause, and the autoscaler's state. |
+| `legion_scaling_status` | no | Task autoscaling ([autoscaling.md](autoscaling.md)): every autoscaled task's `now`, `want`, bounds, mode, and `state` (`ok`, `scaled`, `held`, `limited`, `deferred`, `pinned`, `paused`, `dry-run`, `missing-data`, `invalid`, `stale`, `not-evaluated`), its last change, and `app.state` (`running`, `not-running`, `starting`, `disabled`). An agent should treat `not-running` as "nothing is scaling", and `stale` as "this target's numbers are old". |
+| `legion_scaling_explain` | no | Why an autoscaled task is at its count, as data: the last evaluation's checks (reading, desired) and every safeguard stage (`before`, `after`, `note`), and the effective policy with each field's origin (`built-in`, `cluster defaults`, `namespace policy <name>`, `jobspec`). Read this before changing a policy. |
+| `legion_scaling_history` | no | The durable record of a job's count changes, newest first: source (`operator`, `autoscaler`), principal, from/to, the one-line why, and dry-run rows (`kind = would`, `applied = false`). |
+| `legion_scaling_pause` | **yes** | Pause (or `resume=true`) autoscaling for a job, a task, or the cluster (`all`, needs `operator:write`), optionally `for` a duration. Supports `idempotency_key`. Prefer a pause over fighting the autoscaler with `legion_job_scale`; on an autoscaled task a manual count needs `for` anyway (a pin). |
 | `legion_job_destroy` | **yes** | Destroy a job. |
 | `legion_template_run` | **yes** | Render a template with variables and submit the job (supports `idempotency_key` and `allow_unknown_fields`). |
 | `legion_template_upsert` | **yes** | Store Nickel as the next immutable version of a template. |
@@ -487,6 +491,8 @@ legion job destroy demo     --idempotency-key destroy-demo-001
 legion instance create sandbox-demo --id user-42 --idempotency-key sbx-user-42
 legion instance destroy user-42     --idempotency-key destroy-user-42
 legion snapshot create user-42 --name before-refactor --idempotency-key snap-user-42-001
+legion scaling pause web --for 1h  --idempotency-key pause-web-001
+legion scaling defaults apply defaults.ncl --idempotency-key defaults-v3
 ```
 
 The manager records the first outcome for a key and replays it for any later

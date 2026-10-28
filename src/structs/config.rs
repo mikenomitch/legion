@@ -1946,7 +1946,15 @@ fn parse_humantime_or(raw: &str, fallback: &str) -> Duration {
 impl Default for WorkloadIdentityConfigFull {
     fn default() -> Self {
         WorkloadIdentityConfigFull {
-            enabled: false,
+            // On by default: Legion's own `legion` identity (apps such as
+            // the autoscaler, jobs that call Legion through their API
+            // socket) needs the issuer, and the defaults need no operator
+            // input: the issuer is cluster-internal, the first signing key
+            // is generated and replicated at first boot, and the discovery
+            // and JWKS routes publish only public keys. Federating with an
+            // outside provider still takes an explicit public `issuer`
+            // (docs/workload-identity.md).
+            enabled: true,
             issuer: None,
             jwks_path: DEF_WORKLOAD_IDENTITY_JWKS_PATH.into(),
             signing_alg: "ES256".into(),

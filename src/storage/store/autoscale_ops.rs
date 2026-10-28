@@ -19,7 +19,6 @@
 //!   (`scaling_defaults`, one row).
 
 use super::*;
-use crate::storage::store::TaskScalePin;
 
 /// The counter behind `task_scale.version`.
 pub const TASK_SCALE_COUNTER: &str = "task_scale";
@@ -226,7 +225,7 @@ impl Store {
         task_group: &str,
         task_name: &str,
     ) -> R<Option<TaskScale>> {
-        Ok(conn
+        let row = conn
             .prepare_cached(concat!(
                 "SELECT ",
                 task_scale_columns!(),
@@ -236,7 +235,8 @@ impl Store {
                 params![job_id, task_group, task_name],
                 Self::task_scale_from_row,
             )
-            .optional()?)
+            .optional()?;
+        Ok(row)
     }
 
     fn pauses_tx(conn: &Connection) -> R<Vec<PauseRow>> {
@@ -665,13 +665,14 @@ impl Store {
     /// The effective policy a history digest names, if it is still kept.
     pub fn scaling_policy_snapshot(&self, digest: &str) -> R<Option<String>> {
         let conn = self.read_connection()?;
-        Ok(conn
+        let policy = conn
             .query_row(
                 "SELECT policy FROM scaling_policy_snapshot WHERE digest = ?1;",
                 [digest],
                 |row| row.get(0),
             )
-            .optional()?)
+            .optional()?;
+        Ok(policy)
     }
 
     /// Every pause, expired ones included (they are inert, and a resume or a
@@ -746,7 +747,7 @@ impl Store {
     /// The cluster's scaling defaults, if any were ever applied.
     pub fn scaling_defaults(&self) -> R<Option<ScalingDefaultsRow>> {
         let conn = self.read_connection()?;
-        Ok(conn
+        let row = conn
             .query_row(
                 "SELECT record, version, updated_by, updated_at FROM scaling_defaults WHERE id = 1;",
                 [],
@@ -759,7 +760,8 @@ impl Store {
                     })
                 },
             )
-            .optional()?)
+            .optional()?;
+        Ok(row)
     }
 
     /// Replace the cluster's scaling defaults. Returns the new version.
@@ -794,6 +796,21 @@ impl Store {
         ))?;
         let rows = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
         Self::collect_rows(rows)
+    }
+
+    /// The job an allocation belongs to (any status), if the allocation
+    /// still exists. How the app-plane gate recognizes the autoscaler's own
+    /// identity from its grant reference.
+    pub fn allocation_job_id(&self, allocation_id: i64) -> R<Option<String>> {
+        let conn = self.read_connection()?;
+        let job = conn
+            .prepare_cached(
+                "SELECT tc.job_id FROM allocation a \
+                 INNER JOIN task_config tc ON tc.id = a.task_config_id WHERE a.id = ?1;",
+            )?
+            .query_row([allocation_id], |row| row.get(0))
+            .optional()?;
+        Ok(job)
     }
 
     /// A cheap fingerprint of the namespace policies: their count and newest

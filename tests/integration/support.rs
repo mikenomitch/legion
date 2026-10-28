@@ -74,33 +74,40 @@ extern "C" fn remove_scratch_root() {
 /// test and keep holding their ports. Linux only (it reads `/proc`); a no-op
 /// elsewhere.
 pub fn kill_task_processes_under(dir: &Path) {
+    for pid in task_processes_under(dir) {
+        // SAFETY: plain kill(2) on a task process this test started.
+        unsafe { libc::kill(pid, libc::SIGKILL) };
+    }
+}
+
+/// The task processes a test cluster under `dir` started: those whose
+/// `LEGION_ALLOC_DIR` is inside it (Linux; elsewhere, none are found).
+pub fn task_processes_under(dir: &Path) -> Vec<libc::pid_t> {
     #[cfg(target_os = "linux")]
     {
         use std::os::unix::ffi::OsStrExt;
         let Ok(entries) = std::fs::read_dir("/proc") else {
-            return;
+            return Vec::new();
         };
-        for entry in entries.flatten() {
-            let Some(pid) = entry
-                .file_name()
-                .to_str()
-                .and_then(|name| name.parse::<libc::pid_t>().ok())
-            else {
-                continue;
-            };
-            let Ok(environ) = std::fs::read(format!("/proc/{pid}/environ")) else {
-                continue;
-            };
-            let started_here = environ
-                .split(|byte| *byte == 0)
-                .filter_map(|var| var.strip_prefix(b"LEGION_ALLOC_DIR="))
-                .any(|value| Path::new(std::ffi::OsStr::from_bytes(value)).starts_with(dir));
-            if started_here {
-                // SAFETY: plain kill(2) on a task process this test started.
-                unsafe { libc::kill(pid, libc::SIGKILL) };
-            }
-        }
+        entries
+            .flatten()
+            .filter_map(|entry| {
+                let pid = entry
+                    .file_name()
+                    .to_str()
+                    .and_then(|name| name.parse::<libc::pid_t>().ok())?;
+                let environ = std::fs::read(format!("/proc/{pid}/environ")).ok()?;
+                environ
+                    .split(|byte| *byte == 0)
+                    .filter_map(|var| var.strip_prefix(b"LEGION_ALLOC_DIR="))
+                    .any(|value| Path::new(std::ffi::OsStr::from_bytes(value)).starts_with(dir))
+                    .then_some(pid)
+            })
+            .collect()
     }
     #[cfg(not(target_os = "linux"))]
-    let _ = dir;
+    {
+        let _ = dir;
+        Vec::new()
+    }
 }

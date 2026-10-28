@@ -31,6 +31,22 @@ pub(crate) fn task_scale_statuses(
     config: &JobConfig,
     scales: &[TaskScale],
 ) -> R<Vec<TaskScaleStatus>> {
+    let now_ms = super::autoscale_rpcs::now_unix_ms();
+    let autoscaled = config
+        .tasks
+        .iter()
+        .any(crate::manager::autoscale::is_autoscaled);
+    let layers = if autoscaled {
+        Some(crate::manager::autoscale::AutoscaleLayers::load(store)?)
+    } else {
+        None
+    };
+    let pauses = if autoscaled {
+        store.scaling_pauses()?
+    } else {
+        Vec::new()
+    };
+    let board = store.scaling_status();
     config
         .tasks
         .iter()
@@ -41,7 +57,52 @@ pub(crate) fn task_scale_statuses(
                 .find(|scale| scale.task_group == task.group && scale.task_name == task.name);
             let effective_count =
                 store.effective_task_count(job_id, &task.group, &task.name, spec_count)?;
+            let is_autoscaled = crate::manager::autoscale::is_autoscaled(task);
+            let policy_summary = match (is_autoscaled, layers.as_ref()) {
+                (true, Some(layers)) => match layers.resolve(job_id, task) {
+                    Ok(Some(resolved)) => {
+                        crate::manager::autoscale::summary_line(&resolved.policy)
+                    }
+                    Ok(None) => String::new(),
+                    Err(err) => format!("invalid: {err}"),
+                },
+                _ => String::new(),
+            };
+            let entry = is_autoscaled
+                .then(|| board.target(job_id, &task.group, &task.name))
+                .flatten();
+            let state = match (&entry, is_autoscaled) {
+                (_, false) => String::new(),
+                (Some(entry), true) if board.is_stale(entry.received, std::time::Instant::now()) => {
+                    "stale".to_string()
+                }
+                (Some(entry), true) => entry.state.clone(),
+                (None, true) => "not-evaluated".to_string(),
+            };
             Ok(TaskScaleStatus {
+                autoscaled: is_autoscaled,
+                policy_summary,
+                pin: scale
+                    .and_then(|scale| scale.pin.as_ref())
+                    .filter(|pin| pin.active(now_ms))
+                    .map(super::autoscale_rpcs::pin_proto),
+                pause: is_autoscaled
+                    .then(|| {
+                        crate::storage::store::covering_pause(
+                            &pauses,
+                            job_id,
+                            &task.group,
+                            &task.name,
+                            now_ms,
+                        )
+                        .map(super::autoscale_rpcs::pause_proto)
+                    })
+                    .flatten(),
+                last_evaluation_unix_ms: entry
+                    .as_ref()
+                    .map_or(0, |entry| entry.evaluated_at_unix_ms),
+                state,
+                version: scale.map_or(0, |scale| scale.version),
                 task_group: task.group.clone(),
                 task_name: task.name.clone(),
                 spec_count,
@@ -134,6 +195,9 @@ fn store_facts(store: &Store, selection: &JobSelection) -> R<Vec<Result<StoreFac
         .is_some_and(|flag| flag == "stopped" || flag == "failed");
     let replicas = store.scaling_replica_rows(job_id)?;
     let rollout_active = !store.list_rollouts(Some(job_id), true)?.is_empty();
+    let scales = store.task_scales_for_job(job_id)?;
+    let pauses = store.scaling_pauses()?;
+    let now_ms = super::autoscale_rpcs::now_unix_ms();
     let namespace = crate::structs::namespace::job_namespace(job_id);
     let mut out = Vec::with_capacity(tasks.len());
     for task in tasks {
@@ -141,6 +205,9 @@ fn store_facts(store: &Store, selection: &JobSelection) -> R<Vec<Result<StoreFac
             .iter()
             .filter(|row| row.task_group == task.group && row.task_name == task.name)
             .collect();
+        let scale = scales
+            .iter()
+            .find(|scale| scale.task_group == task.group && scale.task_name == task.name);
         let placed = mine.len() as u32;
         let ready = mine.iter().filter(|row| row.healthy).count() as u32;
         let keyed = task
@@ -190,6 +257,19 @@ fn store_facts(store: &Store, selection: &JobSelection) -> R<Vec<Result<StoreFac
                     cores: amount("cores"),
                     memory_mib: amount("memory"),
                 }),
+                override_version: scale.map_or(0, |scale| scale.version),
+                pin: scale
+                    .and_then(|scale| scale.pin.as_ref())
+                    .filter(|pin| pin.active(now_ms))
+                    .map(super::autoscale_rpcs::pin_proto),
+                pause: crate::storage::store::covering_pause(
+                    &pauses,
+                    job_id,
+                    &task.group,
+                    &task.name,
+                    now_ms,
+                )
+                .map(super::autoscale_rpcs::pause_proto),
                 ..Default::default()
             },
             key: TargetKey::new(job_id, &task.group, &task.name),

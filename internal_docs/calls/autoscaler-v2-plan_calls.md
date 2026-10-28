@@ -987,6 +987,313 @@ draft had.
 **Why (simplicity).** One place to look, and the change is additive to an
 output that agents already parse.
 
+## 37. Workload identity is on by default, so the autoscaler holds credentials on a fresh cluster
+
+*Implementation, Phase 2 (`WorkloadIdentityConfigFull::default`; closes apps
+calls entry 56's deferral).*
+
+**Call.** `workloadIdentity.enabled` now defaults to `true`. A fresh cluster
+runs the in-process issuer: its first signing key is generated and
+replicated at first boot, the `legion` control-plane auth method is
+registered, the discovery and JWKS routes are served, and every task that
+declares the `legion` identity (every app) gets a token and an API socket.
+`enabled = false` remains the opt-out.
+
+```nickel
+# manager.ncl — nothing to set; to opt out:
+workloadIdentity = { enabled = false }
+```
+
+**Alternatives.**
+- (b) Split the flag: the reserved `legion` identity (Legion talking to
+  itself) always on, while identities with an outside `audience`, and the
+  public discovery and JWKS routes, stay behind `enabled`.
+- Leave it off, and have the apps reconciler turn it on per app (impossible:
+  it is process-wide state built at startup).
+
+**Trade-off.**
+- Every new manager serves two unauthenticated JSON routes (public keys
+  only) and runs a key-rotation loop (one Control write a day).
+- A job can now declare an identity for an outside audience on a fresh
+  cluster and get a token whose `iss` is the cluster-internal default
+  (`https://manager.legion`, or a single manager's advertised address),
+  which a cloud provider will not trust. Federation still needs an explicit
+  public `issuer`, as before.
+- Direct exec, edge boot tickets, and material identity work out of the box
+  too, which they did not before.
+
+**Why (simplicity).** Enabling needs no operator input: the issuer URL has a
+correct in-cluster default, the key is generated and replicated by the
+Control leader, and the JWKS only publishes public keys. (b) would give one
+flag two meanings and two code paths for one issuer, to protect a surface
+that is already harmless. AGENTS.md asks for the default that is right for a
+new cluster, and the plan's promise is that `autoscale = true` works on one.
+
+## 38. Phase 2 runs everything the engine implements on the `legion` source
+
+*Implementation, Phase 2 (`crate::manager::autoscale::validate_static`;
+deviates from the plan's phase split, §8).*
+
+**Call.** A Phase 2 jobspec may use every field the engine core runs:
+`checks` (on the `legion` source, with its fixed query vocabulary), all five
+strategies, `schedule`, `headroom`, `scaleIn = false`, and `onMissing`.
+Refused at submit: any other source, a `legion` query outside the
+vocabulary, a `service.*` query on a task without a `service` block,
+`min = 0`, and `activation`.
+
+```
+error: web/default/web: autoscale.checks[0] (lag): unknown source 'team-prom'. Hint:
+  the only source in this version is `legion`, which reads task.cpu.utilization, ...
+```
+
+**Alternatives.** Accept only the Phase 2 surface the plan names (`cpu`,
+`memory`, bounds, `up`/`down`, `warmup`, `tolerance`, `window`, `mode`), and
+refuse `checks`, `schedule`, `headroom`, `scaleIn`, and `onMissing` until
+Phase 3.
+
+**Trade-off.** More surface ships before its Phase 3 acceptance tests (S2's
+business-hours floor, S3); those fields rest on the engine's unit tests and
+the app's mapping of the `legion` vocabulary.
+
+**Why (simplicity).** The engine already evaluates them, and the only new
+code is the vocabulary mapping. Refusing them would have added validation
+code to remove later and an error users would hit for no reason. Phase 3
+reduces to the external sources, scale to zero, and `scaling simulate`.
+
+## 39. Window averages are kept by the app, by its own clock
+
+*Implementation, Phase 2 (`src/apps/autoscaler.rs`, `TargetState::windowed`).*
+
+**Call.** A check's `window` (default `1m`) is the mean of the readings the
+app took inside it, timestamped by the app's clock. `GetScalingInputs` is
+read with `history_seconds = 0`.
+
+**Alternatives.** Average the manager's 10-second rollup history for the
+window (`history_seconds = window`), which the inputs RPC already serves.
+
+**Trade-off.** At a 15s interval a 1m window holds four readings rather than
+six, and an app restart starts the window empty (the cold-start hold covers
+scale-in).
+
+**Why (correctness).** The history is stamped by the status-lane leader's
+clock and restarts empty on a takeover; the stabilization and step windows
+live in the app (plan §6.9). One clock for every window keeps them
+consistent, and makes the engine's decisions reproducible from the
+readings it saw (the simulator and the tests drive that clock).
+
+## 40. The app-plane gate recognizes the autoscaler by its grant reference, and admits management tokens
+
+*Implementation, Phase 2 (`ManagerDaemonService::is_autoscaler_identity`).*
+
+**Call.** `ReportScalingStatus` and `RecordScalingAction` accept a caller
+whose policies include a job-grant reference (`grant:alloc/<id>`) to an
+allocation of `legion-system/autoscaler`, which both a bearer `legion` token
+and an ACL token minted from one with `legion login --method legion`
+carry; or a management token. `ScaleTask`'s `source = "autoscaler"` is
+honored on the same test, and from anyone else the write is recorded as
+`operator` rather than refused.
+
+**Alternatives.**
+- Match the principal `legion:<sub>` against the subject the cluster's
+  `subTemplate` would render for the app.
+- Refuse management tokens too, and refuse a forged `source` outright.
+
+**Trade-off.** An operator with a management token can post status as the
+app (they can also disable it). A person who claims `source = autoscaler`
+gets an `operator` write, which on an autoscaled task is then refused for
+lacking `--for`, rather than a dedicated error.
+
+**Why (security, simplicity).** The grant reference is signed by the
+manager and names the allocation, so it cannot be forged and survives a
+custom `subTemplate`. Admitting management mirrors the worker plane and
+keeps the ACL test matrix uniform.
+
+## 41. Versions are a Control-lane counter, not the raft log index
+
+*Implementation, Phase 2 (`scaling_counter`, `Store::next_scaling_counter_tx`;
+deviates from plan §6.9 and §7).*
+
+**Call.** `task_scale.version` is the next value of the `task_scale` counter
+in the `scaling_counter` table, taken in the same transaction as the write.
+
+**Alternatives.** The raft log index of the row's last write, as the plan
+says.
+
+**Trade-off.** One extra row update per write.
+
+**Why (correctness).** A replicated op's body runs on the leader before its
+entry is appended, so the index is not known while the row is written, and a
+single local-disk manager has no log at all. A counter in the same
+transaction keeps the property the plan wanted: versions never repeat across
+a delete and recreate, on every persistence backend.
+
+## 42. A pin is a floor and a ceiling on the override row, applied when it is written
+
+*Implementation, Phase 2 (`task_scale.pin_until_ms/pin_min/pin_max`).*
+
+**Call.** `legion job scale web --count 12 --for 2h` writes the count 12 and
+pins floor and ceiling at 12; `--min`/`--max` pin one side and move the
+count into range at once. `effective_task_count` is unchanged: the count is
+already where the pin wants it. The server refuses autoscaler writes to a
+count pin and outside a pinned range; when the pin expires the count stays
+and the autoscaler takes over at its normal rate.
+
+**Alternatives.** Store the pinned count separately and have
+`effective_task_count` (and the SQL that reads `task_scale.count` directly)
+prefer it while the pin lasts.
+
+**Trade-off.** An expired pin leaves the count where the pin put it, rather
+than snapping back to what the autoscaler last chose.
+
+**Why (simplicity, safety).** The scheduler's reads, quota, and slot
+retirement stay untouched, and "a forgotten pin comes down gently" (plan
+§6.5) is exactly the behavior the scale-in rate gives.
+
+## 43. A dry-run policy records each distinct "would" once, through `RecordScalingAction`
+
+*Implementation, Phase 2.*
+
+**Call.** `RecordScalingAction` ships with one kind, `would`: a dry-run
+decision's history row (`applied = false`). The app records a would-change
+only when its `from -> to` differs from the last one it recorded for the
+target.
+
+**Alternatives.** Write a row on every evaluation that would act; or carry
+would-rows on `ReportScalingStatus`.
+
+**Trade-off.** A dry-run policy that keeps wanting the same change shows
+one row, not one per tick, so a week of "would" history reads as the
+changes the policy would have made, not how long it wanted them.
+
+**Why (simplicity).** A dry-run count never moves, so per-tick rows would
+fill the 200-row cap in under an hour. The RPC the plan reserves for action
+intents (§6.9) is the natural home for an action that is not a count write.
+
+## 44. The autoscaler's grant is exactly what Phase 2 calls: `scale:read` and `scale:write`
+
+*Implementation, Phase 2 (`src/apps/bundled/autoscaler.ncl`; defers calls
+entry 18 until node groups ship).*
+
+**Call.** The bundled manifest asks for `scale` read and write in every
+namespace and nothing else. The app-plane RPCs need no rule.
+
+**Alternatives.** Keep the plan's full grant (`job:read`, `node:read/write`,
+`kv` on `legion/apps/autoscaler/*`) from day one, as entry 18 argues.
+
+**Trade-off.** Phases 5 and 7 change the manifest's permissions, which a
+bundled app's upgrade grants through `legion:bootstrap` (apps calls).
+
+**Why (security).** Entry 18 is about not splitting the grant by *feature
+use* on one build; a build that never calls node or KV APIs has no reason
+to hold them.
+
+## 45. Status lives on the status-lane leader; NOT RUNNING after three of the app's intervals
+
+*Implementation, Phase 2 (`crate::manager::scaling_status`).*
+
+**Call.** `ReportScalingStatus` and `GetScalingStatus` are answered by the
+status-lane leader (others forward), which keeps the newest report per
+target in memory. The app counts as running while a report arrived within
+three of the intervals it reports; a manager that has held the board for
+less than three default intervals with no report says `starting`.
+
+**Alternatives.** Replicate the app's heartbeat (a Control write per tick),
+or let any manager hold what it received.
+
+**Trade-off.** A status-lane takeover shows `starting` and then
+`not-evaluated` targets until the app's next report.
+
+**Why (performance).** A tick's report is the app's heartbeat; replicating
+it would put a raft write on every interval for state that is stale an
+interval later, which is the rule usage rollups already follow.
+
+## 46. `WatchScalingPolicies` sends the full set on change, checking a fingerprint each second
+
+*Implementation, Phase 2.*
+
+**Call.** The stream checks a cheap fingerprint (the autoscaled jobs' latest
+config ids, the defaults' version, the namespace policies' count and newest
+update) once a second; on a change it resolves every policy and sends the
+whole set if it differs from the last one sent.
+
+**Alternatives.** Deltas; event-driven recompute from the store's event
+bus; shard filters (plan §6.9).
+
+**Trade-off.** A full set per change, and up to a second of delay. At
+thousands of policies a change re-sends all of them.
+
+**Why (simplicity).** One replacement message is trivially correct for one
+replica; deltas and shard filters arrive with sharding (Phase 7), which is
+where their cost pays.
+
+## 47. An in-place resubmit needs no rollout in flight and every allocation on the previous version
+
+*Implementation, Phase 2 (`update_autoscale_in_place`).*
+
+**Call.** The in-place path (§6.3) runs only when the job has no active
+rollout and every allocation belongs to the previous config; otherwise the
+autoscale-only change rolls out as before.
+
+**Alternatives.** Migrate the previous version's allocations even mid-rollout.
+
+**Trade-off.** Editing `autoscale` during a rollout restarts the rollout.
+
+**Why (correctness).** `migrate_allocations_to_job_config` moves one
+version's allocations; mid-rollout the older version's would be stranded
+under a rollout whose target version was just superseded.
+
+## 48. The quota stage is the write's admission check
+
+*Implementation, Phase 2.*
+
+**Call.** The app passes no quota headroom to the engine. A scale-out the
+namespace quota cannot admit is refused by `ScaleTask` (its Phase 0
+admission check), and the target reports `held` with the quota's message.
+
+**Alternatives.** Compute each target's quota headroom per tick and feed the
+engine's quota stage, so it scales to exactly what fits.
+
+**Trade-off.** Near the quota a target holds instead of filling the last
+few replicas, and the state reads `held` rather than `limited`.
+
+**Why (simplicity).** Headroom per band needs the namespace's whole charge,
+which `GetScalingInputs` does not carry; the refusal is already correct and
+explained. Listed as a follow-up.
+
+## 49. A pause without `--for` holds until resumed, and pauses have three scopes
+
+*Implementation, Phase 2.*
+
+**Call.** `legion scaling pause` takes a task, a job (every autoscaled task
+in it), or `--all`. `--for` is optional; without it the pause holds until
+`legion scaling resume` at the same scope.
+
+**Alternatives.** Require `--for`, as pins do.
+
+**Trade-off.** A forgotten pause holds forever (but shows on every status
+surface).
+
+**Why (simplicity).** A pause is the kill switch: an operator in an incident
+should not have to guess a duration. Pins require `--for` because a pin
+changes the count, and a pause does not.
+
+## 50. Warmup comes from rises in the ready count
+
+*Implementation, Phase 2.*
+
+**Call.** The app counts a replica as warming for `warmup` after the task's
+ready count rose, newest rises dropping first when replicas leave.
+Utilization is still the mean over every replica that reports usage.
+
+**Alternatives.** Per-replica ready times in `GetScalingInputs`.
+
+**Trade-off.** A replica that turns healthy at the same moment another
+leaves is not seen as warming, and a warming replica's usage still enters
+the mean.
+
+**Why (simplicity).** The inputs carry counts, not per-replica times, and
+the warmup rule only needs to damp a fresh scale-out.
+
 ## Ledger: what stands from the superseded plan's calls
 
 The superseded plan's calls are not rewritten (`plans/README.md`). This is

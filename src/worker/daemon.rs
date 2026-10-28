@@ -1393,7 +1393,7 @@ fn build_jwks_verifier(
     if issuer.get().is_empty() {
         warn!(
             "The manager reported no workload-identity issuer (is workloadIdentity.enabled \
-             false?); boot, session, and exec tickets are refused until one does"
+             set to false?); boot, session, and exec tickets are refused until one does"
         );
     }
     // The JWKS rides the same pinned TLS as every other manager call: keys

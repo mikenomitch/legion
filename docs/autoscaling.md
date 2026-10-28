@@ -1,14 +1,466 @@
-# Scaling Jobs
+# Autoscaling
+
+Legion scales tasks two ways:
+
+- **Automatically**: put `autoscale = true` on a task, and the bundled
+  autoscaler holds its CPU near 70% of its reservation, between its `count`
+  and four times its `count`, scaling out fast and in slowly. Every default
+  can be overridden per task, per namespace, or cluster-wide, and every
+  change can be explained ([Task autoscaling](#task-autoscaling)).
+- **By hand**: `legion job scale web --count 6` changes a task's count
+  without a new job version or a rollout ([Scaling by hand](#scaling-by-hand)).
+  On an autoscaled task the same command is a time-boxed pin.
+
+Both read the same cluster-wide measurements, [scaling inputs](#scaling-inputs),
+and both write the same count override, so the scheduler, rollouts, and
+quotas see one desired count. Node autoscaling (adding and removing
+machines) is not built; see [Known limitations](#known-limitations).
+
+## Task autoscaling
+
+### One word
+
+```nickel
+{
+  name = "web",
+  task = {
+    name = "web",
+    runtime = "exec",
+    count = 2,                          # with autoscale: the floor
+    config = { command = ["./web"] },
+    resources = { cpu = 500, memory = 512 },
+    autoscale = true,
+  },
+}
+```
+
+`autoscale = true` means "the effective defaults". `legion job plan` prints
+exactly what that is for this task, so nothing is hidden:
+
+```console
+$ legion job plan web.ncl
+...
+autoscale web/default/web:
+  hold cpu at 70% of 500MHz per replica, 1m average over ready replicas
+  bounds 2..8 (min = count, max = 4 × count)
+  up:   immediately, at most +100% or +4 per minute (whichever is larger)
+  down: after 5m below target, at most −10% or −1 per minute (whichever is larger)
+  warmup 30s, tolerance ±10%, enforce
+```
+
+`legion job plan -j` carries the same in `autoscale[]`: the effective record,
+these lines, and where every field came from.
+
+With load, the count rises within one evaluation (15 seconds), at most
+doubling, or adding four, per minute. When the load falls, nothing happens
+for five minutes; then the count falls by one replica (or 10%, whichever is
+larger) per minute, never below `count`. It never scales in while a rollout
+runs, while measurements are missing, or in the first five minutes after the
+autoscaler starts.
+
+### The built-in defaults
+
+| Field | Default | Why |
+| --- | --- | --- |
+| `min` | `"1x"` (the task's `count`) | The count you wrote is the floor: autoscaling only ever adds capacity unless you lower `min` yourself, so a three-replica HA service never drops to one because traffic was quiet. |
+| `max` | `"4x"` | Absorbs a 4x spike without letting a runaway signal spend the cluster. Hitting it emits `scale.limited`. |
+| `cpu` | `0.7` | Hold mean CPU over ready replicas at 70% of the reservation, the number the scheduler packs on. A task with `cores = N` is measured against N x 1000 millicores. CPU above the reservation is a valid reading (it is a weight) and scales out. |
+| `memory` | unset | Memory often does not fall when load falls (caches, heaps), so a memory check would hold scale-in. Opt in with `memory = 0.8`. |
+| `up` | `{ stabilize = "0s", step = { percent = 100, replicas = 4 }, every = "1m" }` | React at once to load. |
+| `down` | `{ stabilize = "5m", step = { percent = 10, replicas = 1 }, every = "1m" }` | Scale in only after five quiet minutes, slowly. |
+| `headroom` | `0` | Replicas added on top of what the checks want. |
+| `warmup` | `"30s"` | A replica that just became healthy is warming: for scale-out it counts as idle, for scale-in as exactly at target (the Kubernetes HPA rule). |
+| `tolerance` | `0.1` | Within ±10% of the target, nothing moves. |
+| `window` | `"1m"` | The averaging window of the `cpu` and `memory` readings. |
+| `schedule` | none | Time windows that raise the floor or lower the ceiling. |
+| `onMissing` | `"hold"` | A check without data blocks scale-in; checks with data may still scale out. |
+| `mode` | `"enforce"` | `"dry-run"` records what it would do and changes nothing. |
+
+### Overriding the defaults
+
+Every field can be overridden at three levels, each with the same record
+shape. A field set at a level wins over every level below it; a field left
+unset falls through.
+
+| Level | Where | Who can set it |
+| --- | --- | --- |
+| task | `autoscale = { … }` in the jobspec | the job author (`job:write`) |
+| namespace | `autoscale = { … }` in a namespace policy | `acl:write` (namespace policies' gate) |
+| cluster | `legion scaling defaults apply defaults.ncl` | `operator:write` |
+| built-in | the table above | Legion |
+
+```nickel
+# defaults.ncl — legion scaling defaults apply defaults.ncl       (cluster)
+{ cpu = 0.6, max = "6x", down = { stabilize = "10m" } }
+
+# payments.ncl — legion namespace policy apply -f payments.ncl    (namespace)
+{
+  name = "payments",
+  namespaces = ["payments-*"],
+  autoscale = { down = { step = { replicas = 1 }, every = "2m" }, mode = "dry-run" },
+}
+
+# the jobspec                                                      (task)
+autoscale = { max = 20 },
+```
+
+The rules:
+
+- **Field by field, including nested records.** `down = { stabilize = "10m" }`
+  keeps the inherited `down.step` and `down.every`. The exception is a
+  `step` record: writing `step` replaces the whole inherited `step`, and a
+  half you leave out is 0. `step = { replicas = 2 }` means exactly 2 per
+  window, not "2 or 100%".
+- **`min` and `max` take a count or a multiple of `count`.** `max = 20`, or
+  `max = "6x"`. Multiples round up (`"1.5x"` of 3 is 5).
+- **An inherited `min` cannot lower the floor.** At the cluster and
+  namespace levels, `min` must be a multiple of at least `"1x"`. Defaults
+  may raise every task's floor (`min = "2x"`), never put a task below the
+  count its author wrote. Only the task itself may set `min` below `count`.
+  So `min <= count` is checked only for a task's own `min`, while
+  `count <= max` is checked whatever level `max` came from.
+- **Signals are all or nothing, at every level.** `cpu`, `memory`, and
+  `checks` move as one unit: the highest level that names any of them
+  supplies all of them. A cluster default of `{ memory = 0.8 }` makes memory
+  the only default signal (it does not add memory to CPU); a task with
+  `autoscale = { checks = [...] }` does not also scale on CPU. Defaults may
+  set `cpu` and `memory`, never `checks`.
+- **Namespace policies have no precedence among themselves.** Every policy
+  governing a namespace applies. Two that set one field to different values
+  leave that field unresolvable for tasks that do not set it themselves:
+  their submit fails naming both policies, and a task already running holds
+  as `invalid`.
+- **Defaults are resolved live.** The jobspec stores what you wrote (`true`,
+  or the sparse record). Change a cluster default or a namespace policy and
+  every inheriting task's effective policy changes, with no resubmit.
+- **A change is checked against everything that inherits it.**
+  `legion scaling defaults apply` and `legion namespace policy apply` resolve
+  every affected policy first. If any would become invalid (a cluster `min`
+  above some task's ceiling, say), the apply is refused and lists them;
+  `--dry-run` shows the same report and writes nothing. With `--force` the
+  change applies and those tasks hold with state `invalid: <why>` until
+  fixed.
+
+```console
+$ legion scaling defaults apply defaults.ncl --dry-run
+scaling defaults: dry run, nothing written (v2); 3 policies would change, 0 invalid
+ TARGET               | CHANGE
+----------------------+----------------
+ web/default/web      | max, cpu, down.stabilize
+ ...
+$ legion scaling defaults get -n payments-prod
+cluster defaults v3 (by alice, 2026-10-28T14:00:00Z): {"cpu":0.6,"down":{"stabilize":"10m"},"max":"6x"}
+namespace policies with autoscale for payments-prod: payments
+effective defaults for namespace payments-prod:
+ FIELD          | VALUE                    | FROM
+----------------+--------------------------+-------------------------
+ min            | 1x                       | built-in
+ max            | 6x                       | cluster defaults
+ cpu            | 0.6                      | cluster defaults
+ down.step      | 1 replica                | namespace policy payments
+ ...
+```
+
+Where each value of one task's policy came from is one command away:
+
+```console
+$ legion scaling explain payments-prod/api --policy
+...
+  effective policy 9c1e04b2d6aa
+ FIELD          | VALUE                   | FROM
+----------------+-------------------------+--------------------------
+ min            | 4 ("1x" of count 4)     | built-in
+ max            | 20                      | jobspec
+ cpu            | 0.6                     | cluster defaults
+ down.stabilize | 10m                     | cluster defaults
+ down.step      | 1 replica               | namespace policy payments
+ down.every     | 2m                      | namespace policy payments
+ mode           | dry-run                 | namespace policy payments
+```
+
+### The full policy surface
+
+Everything beyond `true` is optional; a field left out takes its effective
+default.
+
+```nickel
+autoscale = {
+  min = 4,
+  max = 16,                # or "4x"
+  cpu = 0.65,              # hold mean CPU at 65% of the reservation
+  memory = 0.8,            # and memory at 80% (off by default)
+  checks = [               # explicit checks; the largest desired count wins
+    {
+      name = "backlog",
+      source = "legion",
+      query = "task.unplaced",
+      window = "2m",
+      strategy = { name = "threshold", steps = [{ above = 0, add = 1 }] },
+      scaleIn = false,     # may push the count up, never pull it down
+    },
+  ],
+  up   = { stabilize = "30s", step = { replicas = 2 }, every = "1m" },
+  down = { stabilize = "10m", step = { replicas = 1 }, every = "2m" },
+  headroom = 1,            # add N replicas after the merge
+  warmup = "45s",
+  tolerance = 0.1,
+  window = "2m",
+  schedule = [             # raise the floor (or lower the ceiling) in a window
+    { cron = "0 8 * * 1-5", for = "10h", min = 10, timezone = "America/New_York" },
+  ],
+  onMissing = "hold",      # hold (default) | ignore
+  mode = "dry-run",        # enforce (default) | dry-run
+}
+```
+
+- **Checks** read the `legion` source, Legion's own measurements
+  ([Scaling inputs](#scaling-inputs)), through a fixed vocabulary:
+
+  | Query | Meaning |
+  | --- | --- |
+  | `task.cpu.utilization` | mean CPU over ready replicas, as a fraction of the reservation (what `cpu` uses) |
+  | `task.memory.utilization` | the same for memory (what `memory` uses) |
+  | `task.unplaced` | replicas the scheduler could not place |
+  | `service.rps`, `service.errors` | requests and errors per second into the service the task backs (internal callers only) |
+  | `service.latency_ms.mean`, `service.latency_ms.max` | its latency |
+
+  A `service.*` query needs a `service` block on the task. Any other source
+  name is refused at submit: `legion` is the only source in this version.
+- **Strategies** turn a check's reading into a desired count:
+  `target-value` (`{ name = "target-value", target = 0.7 }`, the HPA formula
+  `ceil(current x reading / target)` with the tolerance band and the warmup
+  rule; the `cpu`/`memory` shorthands use it), `per-replica`
+  (`{ value = 500 }`: `ceil(reading / value)`), `threshold`
+  (`{ steps = [{ above, add }] }`: the current count plus the `add` of the
+  highest step the reading exceeds), `pass-through` (the reading is the
+  count), and `fixed` (`{ value = N }`, reads nothing).
+- **Merge** is the maximum over checks with data. A `scaleIn = false` check
+  counts only when it wants more than the current count.
+- **Schedules** are five-field crontab (`0 8 * * 1-5` is Monday to Friday at
+  08:00) in an IANA `timezone` (default UTC), open for `for` (at most 7
+  days). They only raise `min` or lower `max`; a schedule floor above the
+  ceiling yields to the ceiling.
+- **`onMissing`**: `hold` (the default) blocks scale-in while any check has
+  no data; `ignore` drops a check without data for that evaluation.
+
+**Checked at submit** (`legion job run`, `legion job plan`, and offline in
+`legion job validate`), each error naming the task and the fix:
+
+```
+error: web/default/web: autoscale needs measured usage, and runtime 'noop' does not
+  report it. Hint: only exec, container, sandbox report usage; use checks on another
+  `legion` query (task.unplaced, service.*), or remove autoscale
+error: web/default/web: count 2 is above autoscale.max = 1 (from jobspec). Hint: raise
+  max in the task's autoscale record, or lower count
+error: web/default/web: autoscale.min = 0 (scale to zero) is not supported: nothing
+  could wake the task again. Hint: set min >= 1
+```
+
+Also refused: `autoscale` on a keyed stateful task, a `count.per` task, or a
+batch or scheduled task; two autoscaled tasks in one group, or group
+members with different counts; a gang task whose floor is below its
+quorum (`gang.min`); an unknown source or `legion` query; `activation`.
+Leaving `resources.cpu` unset is a warning, not an error: the task is then
+measured against the default reservation.
+
+### Groups
+
+If `autoscale` is set on a task whose group has other tasks, the policy
+targets the whole group: every task in it moves to the same count in one
+write, because the group is what gets placed together. Utilization is then
+the group's usage over the group's reservations. At most one task per group
+may carry `autoscale`, and the group's tasks must share a count. `legion
+scaling status` shows such a target as kind `group`.
+
+### Who owns the count
+
+With `autoscale`, the policy owns the live count:
+
+- **`count` is the floor and the starting size.** Raising `count` from 2 to
+  4 in a resubmit lifts a task the autoscaler has at 3 to 4 at once (the
+  submit moves it into the new bounds in the same write) and leaves one at
+  6 alone. Lowering `count` only lowers the floor; the autoscaler brings
+  the count down at its scale-in rate.
+- **Resubmits never reset the count.** The override is kept and rebased onto
+  the new spec. Removing `autoscale` returns the task to the manual rule
+  ([Ownership](#ownership-overrides-vs-resubmits)) on that same submit.
+- **Editing the policy restarts nothing.** A resubmit whose only changes are
+  in `autoscale`, and in the `count` of autoscaled tasks, still creates a
+  job version, but the running allocations move to it in place instead of a
+  rollout: `Job updated in place: only autoscale (and autoscaled counts)
+  changed, so nothing restarts`. This needs no rollout in flight and every
+  allocation on the previous version; otherwise it rolls out as usual.
+- **A manual count is a pin.** `legion job scale web --count 12` on an
+  autoscaled task is refused unless it says how long
+  ([Pins](#pins-a-manual-scale-on-an-autoscaled-task)).
+
+### How it decides
+
+Every evaluation runs one fixed pipeline. Each stage passes the number on or
+changes it and says why; those notes are what `legion scaling explain`
+prints.
+
+| Stage | What it does |
+| --- | --- |
+| checks | each check's strategy turns its reading (averaged over its window) into a desired count. A check without data contributes nothing. Warming replicas count as idle for scale-out and as at target for scale-in. |
+| merge | the maximum over checks with data |
+| headroom | adds `headroom` replicas |
+| stabilize | scale-out takes the lowest recommendation in `up.stabilize`, scale-in the highest in `down.stabilize` |
+| hold | holds scale-in: for one `down.stabilize` after the autoscaler starts (`collecting 5m of history after restart`), while a check has no data (`onMissing = "hold"`), and after flapping (3 direction changes in 10 minutes hold scale-in for twice `down.stabilize`) |
+| step | the larger of `percent` of the count at the start of the `every` window and `replicas`, minus what was already applied in that direction in the window |
+| bounds | clamps into `min..max`, with open schedule windows. After the step limit on purpose: a raised floor or a lowered ceiling applies at once |
+| capacity | holds scale-out while more than half of the last scale-out is still unplaced |
+| rollout | defers scale-in while a rollout runs (scale-out still applies) |
+| pin | a pin replaces the result, or bounds it |
+| pause | a pause keeps the count |
+| mode | `dry-run` turns a change into a "would" |
+
+The write itself is a `ScaleTask` with the decision attached,
+compare-and-set against the override version the evaluation read: if anyone
+changed the count since (a person, or a second autoscaler replica), the
+write is refused and the next evaluation re-reads. A namespace quota is
+enforced by that write: a scale-out the quota cannot admit is refused, and
+the target reports `held` with the quota's message.
+
+### Pins: a manual scale on an autoscaled task
+
+A person's count on an autoscaled task is a time-boxed pin, not a fight with
+the autoscaler:
+
+```console
+$ legion job scale web --count 12 --for 2h --reason "bad deploy"
+web/default/web: 6 -> 12; autoscaling pinned until 05:10 UTC (legion job scale web --release)
+$ legion job scale web --min 10 --for 1h     # pin only the floor; still autoscaled above it
+$ legion job scale web --max 4 --for 30m     # or only the ceiling
+$ legion job scale web --release             # end the pin now
+```
+
+- `--for` is required on an autoscaled task. Without it the command is
+  refused with a hint (`add --for, as in legion job scale web --count 12
+  --for 1h, or remove autoscale from the job to own the count by hand`). A
+  pin ends on its own; when it does, the count stays where it is and the
+  autoscaler takes over at its normal rate, so a forgotten pin comes down
+  gently.
+- A count pin may exceed `max`: it is an operator's explicit override.
+- `--min`/`--max` move the count into the pinned range at once.
+- `--for` on a task without `autoscale` is refused: its count is yours
+  anyway.
+- The server enforces pins: the autoscaler's writes to a count-pinned task
+  are refused, and its writes outside a pinned floor or ceiling too.
+
+### Pauses
+
+```console
+$ legion scaling pause web --for 1h --reason "incident 4411"
+paused autoscaling for web (every autoscaled task) until 15:10 UTC
+$ legion scaling pause --all --reason "freeze"        # the cluster-wide kill switch
+$ legion scaling resume web
+$ legion scaling resume --all
+```
+
+A pause covers a task (`--group`/`--task`), a job, or the whole cluster.
+Without `--for` it holds until resumed. It is replicated state, enforced in
+two places: the autoscaler skips paused targets (state `paused`), and
+`ScaleTask` refuses autoscaler writes to them, so a pause holds even
+against a misbehaving app. People can still scale a paused task by hand.
+`--all` needs `operator:write`; a job's pause needs `scale:write` on it.
+`legion app disable autoscaler` stops the app altogether.
+
+### Seeing what it did, and why
+
+```console
+$ legion scaling status
+ TARGET           | KIND | NOW | WANT | BOUNDS | MODE    | STATE   | LAST
+------------------+------+-----+------+--------+---------+---------+---------------------------
+ web/default/web  | task | 6   | 6    | 2..8   | enforce | ok      | 4 → 6 2m ago (autoscaler)
+ api/default/api  | task | 4   | 4    | 4..16  | dry-run | dry-run | would 4 → 7 1m ago
+autoscaler: running (alloc 42), last evaluation 3s ago
+
+$ legion scaling explain web
+web/default/web   task   enforce   now 6   bounds 2..8   evaluated 4s ago
+
+ CHECK | INPUT                     | WANTS
+-------+---------------------------+-------
+ cpu   | 0.91 vs 0.70 (4 ready)    | 6
+
+ STAGE     | RESULT | NOTE
+-----------+--------+---------------------------------
+ merge     | 6      | cpu wants 6
+ stabilize | 6      | up: no window
+ step      | 6      | up ≤ +4 per 1m; +0 used
+ bounds    | 6      | 2..8
+ decision  | 4 → 6  | applied 14:02:25 (d-81f3a2c4)
+autoscaler: running (alloc 42), last evaluation 4s ago
+
+$ legion scaling history web
+ TIME           | TASK        | CHANGE  | BY         | SUMMARY
+----------------+-------------+---------+------------+----------------------------------------------
+ 10-28 14:02:25 | default/web | 4 → 6   | autoscaler | cpu 0.91 vs 0.70 (4 ready)
+ 10-28 13:31:02 | default/web | 5 → 4   | autoscaler | cpu 0.41 vs 0.70 (5 ready); rate-limited from 2
+ 10-28 12:58:40 | default/web | 2 → 5   | alice      | launch traffic
+```
+
+- **States** (`legion scaling status`, `explain`): `ok` (where the policy
+  wants it), `scaled` (this evaluation changed the count), `held` (a
+  stabilization window, the step limit, a hold, or a refused write held a
+  change), `limited` (a bound or the capacity guard), `deferred` (a
+  scale-in waits for a rollout), `pinned`, `paused`, `dry-run`,
+  `missing-data`, `invalid` (the policy does not resolve), `error`, `stale`
+  (no evaluation in three of the app's intervals), and `not-evaluated`.
+- **History** is durable: every count write, by people and the autoscaler,
+  applied or deferred; pins and releases; and a dry-run policy's "would"
+  rows (`applied = false`, one per distinct change, not one per
+  evaluation). It is capped at 200 rows per task. Each autoscaler row
+  carries the digest of the effective policy that decided, and the manager
+  keeps that policy, so `legion scaling history -j` shows the exact policy
+  even after the defaults that shaped it changed.
+- **Evaluations that held are not stored**: the last one per task is in the
+  status-lane leader's memory, which `status` and `explain` read.
+- **Events**: `scale.applied` (with `source = autoscaler` and the decision's
+  summary), `scale.deferred`, `scale.reset`, `scale.pinned`,
+  `scale.paused`, `scale.resumed`, `scale.limited` (once per episode, when a
+  bound or guard starts holding the count), `scale.flapping`, and
+  `scale.check_failed` (a check lost its data) ([event-stream.md](event-stream.md)).
+  There is no event per evaluation.
+- **MCP**: `legion_scaling_status`, `legion_scaling_explain`, and
+  `legion_scaling_history` (read-only), `legion_scaling_pause`
+  (write-gated) ([agent-readiness.md](agent-readiness.md)).
+
+### Where it runs
+
+The autoscaler is the bundled app `autoscaler`, the job
+`legion-system/autoscaler` ([apps.md](apps.md)). It is enabled on every new
+cluster, runs on the managers' system workers (so it runs with no worker
+joined), and needs nothing configured: it reaches Legion through its
+allocation's API socket as its own workload identity, which workload
+identity being on by default makes available on a fresh cluster
+([workload-identity.md](workload-identity.md)). Its grant is `scale:read`
+and `scale:write` in every namespace: it can resize, not redeploy.
+
+It watches policies (`WatchScalingPolicies`: a full set whenever a job,
+the defaults, or a namespace policy changes), reads every target's inputs
+in one batched `GetScalingInputs` per interval, evaluates, writes, and
+reports (`ReportScalingStatus`, which is also its heartbeat). Its config
+(`legion app config set autoscaler -f config.ncl`):
+
+| Field | Default | Meaning |
+| --- | --- | --- |
+| `interval` | `"15s"` | How often every policy is evaluated. |
+| `mode` | `"enforce"` | `"dry-run"` forces every policy into dry-run: a cluster-wide trial. |
+
+**When the app is gone, the manager says so.** With no report for three of
+the app's intervals, `legion scaling status` reads
+`autoscaler: NOT RUNNING since 14:05 UTC (app job legion-system/autoscaler:
+active, 0 allocation(s) placed): nothing is being autoscaled`, and every
+target reads `stale`. A disabled app reads `disabled`. Nothing scales while
+the app is down; nothing else is affected.
+
+## Scaling by hand
 
 `legion job scale` changes how many copies of a task run. It does not create a
-new job version or start a rollout. This is the manual half of autoscaling.
-The inputs an automatic half needs are collected too: `GetScalingInputs`
-(and `legion job info`) reports every task's replicas, measured CPU and memory
-against its reservation, and service traffic, cluster-wide
-([Scaling inputs](#scaling-inputs)). The `scaling` policy block that acts on
-them, and node autoscaling, are not built yet.
+new job version or start a rollout.
 
-## Why it exists
+### Why it exists
 
 Editing `count` in a jobspec and resubmitting is a deploy. It creates a new
 job config version, cancels any in-flight rollout, and starts a fresh one. If
@@ -17,7 +469,7 @@ new version and a deployment. `job scale` instead writes a **count override**,
 a separate record layered over the spec, and reconciles the running
 allocations to match it.
 
-## The surface
+### The surface
 
 ```
 $ legion job scale web --count 6 --reason "launch traffic"
@@ -31,7 +483,11 @@ $ legion job scale multi --task api --count 3   # disambiguate multi-task jobs
 
 - `--task` / `--group` are optional when the job has exactly one scalable
   task (the common case). If it has several, the error lists the candidates.
-- `--reason` is recorded on the override and in the event stream.
+  Naming any task of a group whose task is autoscaled targets the group.
+- `--reason` is recorded on the override, in the history, and in the event
+  stream.
+- `--for`, `--min`, `--max`, and `--release` are for autoscaled tasks
+  ([Pins](#pins-a-manual-scale-on-an-autoscaled-task)).
 - `--json` / `-j` emits the standard envelope. `--idempotency-key` makes the
   RPC retry-safe (`deduplicated = true` on replay).
 - The same operation is available over gRPC (`ScaleTask`) and MCP
@@ -40,12 +496,13 @@ $ legion job scale multi --task api --count 3   # disambiguate multi-task jobs
   ([UI architecture](ui-architecture.md)).
 
 `legion job scale <name>` (no `--count`) shows the effective count per
-task: `web/default/web: count 6 (spec 2, scaled by operator)`.
+task: `web/default/web: count 6 (spec 2, scaled by operator)`, and for an
+autoscaled task its policy, pin, and pause.
 `legion job info` shows each task's ready and placed replicas, how many could
 not be placed, and its measured usage against its reservation
 ([Scaling inputs](#scaling-inputs)).
 
-## Semantics
+### Semantics
 
 The **effective desired count** is the override if one exists and binds to
 the current spec (see [Ownership](#ownership-overrides-vs-resubmits)),
@@ -61,13 +518,15 @@ stateful retirement, rollout group plans, quota, `GetJobScaleStatus`, and
   `stateful.storage.retainOnScaleIn`). Stateless tasks lose their newest
   allocations first.
 - **Keyed stateful tasks** are rejected because they have no count. Use the
-  instance API instead. Tasks with `count = { per = ... }` are also rejected
-  in v1.
+  instance API instead. Tasks with `count = { per = ... }` are also rejected.
+- Every write gets a new **version**, a cluster-wide counter that never
+  repeats; `ScaleTaskRequest.expected_version` makes a write
+  compare-and-set against it.
 
 ### Ownership: overrides vs resubmits
 
-An override records the spec count it was laid over (`base_count`). When you
-resubmit the job:
+For a task without `autoscale`, an override records the spec count it was
+laid over (`base_count`). When you resubmit the job:
 
 - If the new spec count **equals** `base_count`, you didn't touch count, so
   the override survives the deploy.
@@ -78,7 +537,7 @@ resubmit the job:
 So your scale sticks across deploys, and editing the spec still does what it
 says. This is a simplified version of Kubernetes' scale-subresource field
 ownership. It avoids Nomad's behavior of silently resetting count on
-resubmit.
+resubmit. An autoscaled task follows [its own rule](#who-owns-the-count).
 
 ### Rollout interaction
 
@@ -93,15 +552,18 @@ $ legion job scale web --count 2
 deferred: rollout web-7 is in progress; scale-in to 2 applies when it completes
 ```
 
+The autoscaler follows the same rule, and its own pipeline defers scale-in
+during a rollout before it ever writes.
+
 A resubmit that only changes `count` (with no override involved) still
-creates a new version and a rollout. Spec changes make versions, and
-`job scale` doesn't.
+creates a new version and a rollout, unless the task is autoscaled. Spec
+changes make versions, and `job scale` doesn't.
 
 For the same reason, scaling does **not** change the job's `updated_at`. The
 jobs list's "Updated" column only tracks spec submissions and status
 transitions (see [jobs-tasks-and-scheduling.md](jobs-tasks-and-scheduling.md)).
-Scale activity shows up elsewhere: the `scale.applied`, `scale.deferred`, and
-`scale.reset` events, and the override's timestamp in
+Scale activity shows up elsewhere: the events, the history
+(`legion scaling history`), and the override's timestamp in
 `legion job scale <name>`.
 
 ## Scaling inputs
@@ -240,16 +702,34 @@ by job name). `job:write` does not imply `scale = "write"`, and the reverse is
 also true. This lets you give an autoscaler or a teammate the right to resize
 a job without the right to redeploy it. See [auth-and-acls.md](auth-and-acls.md).
 
+| RPC | ACL |
+| --- | --- |
+| `ScaleTask` (`legion job scale`) | `scale:write` on the job |
+| `GetJobScaleStatus`, `GetScalingInputs` | `scale:read` on the job |
+| `WatchScalingPolicies` | `scale:read`; jobs outside the grant are left out |
+| `GetScalingStatus`, `GetScaleHistory` | `scale:read` on the job(s) |
+| `PauseScaling` | `scale:write` on the job; `operator:write` for `--all` |
+| `GetScalingDefaults` | `scale:read` on the namespace |
+| `ApplyScalingDefaults` | `operator:write` |
+| `ReportScalingStatus`, `RecordScalingAction` | app-plane: only the bundled autoscaler's own identity (or a management token) |
+
+The app-plane RPCs accept a credential only when its job grant belongs to an
+allocation of `legion-system/autoscaler`, so a person with `scale:write`
+cannot forge the app's status or its dry-run records. Likewise
+`ScaleTask`'s `source = "autoscaler"` is honored only from that identity;
+from anyone else the write is recorded as `operator` (and is then a pin on
+an autoscaled task, which needs `--for`). With ACLs disabled every caller
+is trusted, as everywhere else.
+
 ## Observability
 
-- Events: `scale.applied`, `scale.deferred`, and `scale.reset` in the event
-  stream ([event-stream.md](event-stream.md)). Each carries the previous and
-  new counts, source, and reason. (`scale.clamped` will arrive later, along
-  with the policy block's min/max.)
-- The override row itself (principal, reason, timestamp) is the durable
-  record. The event journal is capped and best-effort.
-- `legion job scale <name>` with no `--count` prints the current override,
-  spec count, and effective count.
+- Events: `scale.applied`, `scale.deferred`, `scale.reset`,
+  `scale.pinned`, `scale.paused`, `scale.resumed`, `scale.limited`,
+  `scale.flapping`, and `scale.check_failed` in the event stream
+  ([event-stream.md](event-stream.md)). The event journal is capped and
+  best-effort; the durable record is the history.
+- `legion scaling status | explain | history` and `legion job scale <name>`
+  (see above).
 - `legion_scaling_rollup_syncs_total{outcome}` counts each manager's rollup
   ticks (`local` on the status-lane leader, `ok`, `resync`, `error`
   elsewhere), and `legion_scaling_rollup_rows{kind}` the rollups it built
@@ -265,41 +745,73 @@ a job without the right to redeploy it. See [auth-and-acls.md](auth-and-acls.md)
 
 - **Unknown job / task**: `not_found` / `invalid_argument`, listing the
   candidates.
-- **Keyed or `count.per` task**: `invalid_argument` with the reason.
+- **Keyed or `count.per` task**: `invalid_argument` with the reason (and
+  `autoscale` on one is refused at submit).
+- **A manual count on an autoscaled task without `--for`**:
+  `failed_precondition` with the pin hint.
 - **No capacity for the new count**: the `job_scale` eval places what fits,
   and the override stays. The rest is placed when capacity appears: a worker
   registering or a node being uncordoned queues a capacity pass that
   reschedules jobs short of their count
   ([jobs-tasks-and-scheduling.md](jobs-tasks-and-scheduling.md#node-added)).
-  Capacity freed by other jobs stopping does not trigger it.
+  Capacity freed by other jobs stopping does not trigger it. While more than
+  half of its last scale-out is unplaced, the autoscaler holds further
+  scale-out (`limited`).
+- **The autoscaler is not running**: `legion scaling status` says `NOT
+  RUNNING` and since when, with the app job's state. Check `legion app
+  status autoscaler`: a disabled app, no node in pool `legion-system` (the
+  system worker turned off), or no credentials (`workloadIdentity.enabled =
+  false` on the managers leaves the app with no way to reach Legion; its
+  health says `idle: cannot reach Legion`).
+- **A policy reads `invalid`**: a defaults change applied with `--force`, or
+  two namespace policies that disagree. `legion scaling explain` prints the
+  reason; fix the task or the defaults.
+- **A target reads `missing-data`**: its runtime reports no usage, or the
+  rollups are stale; see the scaling inputs failure modes below. Nothing
+  scales in while it lasts (scale-out on other checks still can).
+- **A write reads `held` with `write refused: version conflict`**: someone
+  else changed the count between the read and the write; the next
+  evaluation re-reads. `paused` or `pinned` in the message: a pause or a pin
+  arrived in between.
 - **Manager is not the scheduler-lane leader**: the manager forwards the
   request to the leader and returns its answer. Only when that leader cannot
   be reached does the caller get the standard retryable
-  `failed_precondition` envelope with the leader hint.
-- **`GetScalingInputs` on a manager that does not lead the status lane**: the
-  same forwarding, to the status-lane leader. If it cannot be reached, the
-  caller gets the retryable `failed_precondition` with the leader hint, and
-  `legion job info` prints the job without its usage table.
+  `failed_precondition` envelope with the leader hint. `GetScalingInputs`,
+  `GetScalingStatus`, and `ReportScalingStatus` are answered by the
+  status-lane leader the same way.
 - **Inputs that read `missing` for a task that is running**: its runtime
   reports no usage (`noop`, third-party runtimes), its workers have
   `resourceEnforcement` off, or the manager its workers report to cannot
   reach the status-lane leader. `legion_scaling_rollup_syncs_total{outcome="error"}`
   rising on that manager says which.
 
-## Known limitations (v1)
+## Known limitations
 
-- There is no `scaling` policy block yet. This is the manual surface, plus
-  the inputs (`GetScalingInputs`) an automatic one will read. Nothing acts on
-  those inputs yet.
+- **One metric source.** Checks read the `legion` source only. Prometheus
+  and HTTP sources, external plugins, and standalone scaling policies for
+  other targets are not built.
+- **No scale to zero.** `min = 0` is refused, and so is `activation`.
+- **No node autoscaling.** A scale-out that does not fit waits for capacity
+  like any other placement.
+- **Governed runtimes only.** CPU and memory come from `exec`, `container`,
+  and `sandbox` tasks on workers with resource enforcement on.
+- **Requests count internal callers only**
+  ([Requests count internal callers only](#requests-count-internal-callers-only)),
+  and there is no in-flight request (concurrency) signal.
+- **The quota guard is the write.** A scale-out the namespace quota cannot
+  admit is refused by `ScaleTask` rather than capped ahead of time, so the
+  target reports `held` with the quota's message instead of scaling to
+  exactly what fits.
+- **One autoscaler replica.** When it restarts, its windows start empty: no
+  scale-in for one `down.stabilize`, and the averaging windows refill.
+  While it is down nothing scales.
+- **Status lives in memory.** The last evaluation of each target, and the
+  app's heartbeat, are held by the status-lane leader. A takeover starts
+  empty and shows `starting`, then fills on the app's next report.
+- **Group targets share one count.** A group's tasks cannot be autoscaled
+  separately.
 - Scaling inputs are held in the status-lane leader's memory. A takeover
   starts them empty for up to 10 seconds and starts the hour of history
   afresh. History is kept for at most 4096 tasks; past that, a task still
   has current inputs but no history.
-- Request rate, errors, and latency count only callers inside Legion that go
-  through the datapath ([Requests count internal callers only](#requests-count-internal-callers-only)).
-  There is no in-flight request (concurrency) signal.
-- There are no pause/pin semantics. `--reset` is the only way to return
-  ownership to the spec.
 - `count.per` tasks cannot be scaled.
-- Scale status is computed from store state. There is no evaluator status
-  RPC yet (it arrives with the autoscaler).

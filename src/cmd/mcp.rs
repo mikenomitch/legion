@@ -14,7 +14,7 @@
 //! ## Safety
 //!
 //! By default only read-only / introspection tools are exposed. Mutating tools
-//! (`legion_job_run`, `legion_job_stop`, `legion_job_scale`,
+//! (`legion_job_run`, `legion_job_stop`, `legion_job_scale`, `legion_scaling_pause`,
 //! `legion_job_destroy`, `legion_instance_create`, `legion_instance_stop`,
 //! `legion_instance_start`, `legion_instance_promote`,
 //! `legion_instance_destroy`) are gated behind `--allow-write`, mirroring the
@@ -156,9 +156,10 @@ fn namespace_policy_apply_schema() -> Value {
         "properties": {
             "policy": {
                 "type": "object",
-                "description": "The policy object: { name, description?, namespaces: [glob], quota?: { <band>: { cpu? (MHz), memory? (MiB or \"64Gi\"), cores? } }, maxJobs?, maxNamespaces?, pools?: { allowed?: [glob], default? }, runtimes?: [glob], hostVolumes?: [glob] }. An unset allowlist allows everything; an empty one allows nothing."
+                "description": "The policy object: { name, description?, namespaces: [glob], quota?: { <band>: { cpu? (MHz), memory? (MiB or \"64Gi\"), cores? } }, maxJobs?, maxNamespaces?, pools?: { allowed?: [glob], default? }, runtimes?: [glob], hostVolumes?: [glob], autoscale?: { the jobspec autoscale record without checks; min must be a multiple of count of at least \"1x\" } }. An unset allowlist allows everything; an empty one allows nothing."
             },
-            "dry_run": { "type": "boolean", "description": "Validate and list what the policy would have refused among existing jobs and counts, without writing." },
+            "dry_run": { "type": "boolean", "description": "Validate and list what the policy would have refused among existing jobs and counts (and autoscaled tasks whose policy it would invalidate), without writing." },
+            "force": { "type": "boolean", "description": "Apply even when the policy's autoscale leaves some autoscaled tasks' policies invalid; they are held until fixed." },
             "idempotency_key": { "type": "string" }
         },
         "required": ["policy"],
@@ -1009,7 +1010,7 @@ fn tool_defs() -> Vec<ToolDef> {
         },
         ToolDef {
             name: "legion_job_scale",
-            description: "Change a task's count without a new job version or rollout (count override; docs/autoscaling.md). Pass count for a target, or reset=true to return ownership to the spec. Mutating.",
+            description: "Change a task's count without a new job version or rollout (count override; docs/autoscaling.md). Pass count for a target, or reset=true to return ownership to the spec. On an autoscaled task a count is a time-boxed pin and needs `for`; min/max with `for` pin a floor or ceiling; release=true ends a pin. Mutating.",
             input_schema: || json!({
                 "type": "object",
                 "properties": {
@@ -1019,6 +1020,10 @@ fn tool_defs() -> Vec<ToolDef> {
                     "group": { "type": "string", "description": "Task group, when the job has more than one scalable task." },
                     "task": { "type": "string", "description": "Task name, when the job has more than one scalable task." },
                     "reason": { "type": "string", "description": "Audit note recorded with the override." },
+                    "for": { "type": "string", "description": "On an autoscaled task: pin the count (or min/max) for this long, e.g. \"2h\". Required with count on an autoscaled task." },
+                    "min": { "type": "integer", "minimum": 0, "description": "With for: pin a floor on an autoscaled task (still autoscaled above it)." },
+                    "max": { "type": "integer", "minimum": 0, "description": "With for: pin a ceiling on an autoscaled task." },
+                    "release": { "type": "boolean", "description": "End an autoscaled task's pin; autoscaling resumes from the current count." },
                     "idempotency_key": { "type": "string", "description": "Optional key to dedupe retries." }
                 },
                 "required": ["name"],
@@ -1031,6 +1036,69 @@ fn tool_defs() -> Vec<ToolDef> {
             description: "Per-task spec vs override vs effective counts for a job (read-only).",
             input_schema: name_arg_schema,
             mutates: false,
+        },
+        ToolDef {
+            name: "legion_scaling_status",
+            description: "Task autoscaling status (docs/autoscaling.md): every autoscaled task's count (`now`), what the autoscaler wants, bounds, mode, state (ok, scaled, held, limited, deferred, pinned, paused, dry-run, missing-data, invalid, stale, not-evaluated), its pin and pause, the last change, and whether the autoscaler app is running (`app.state`: running, not-running, starting, disabled). Pass job for one job, or namespaces (names or globs) to list. Read-only.",
+            input_schema: || json!({
+                "type": "object",
+                "properties": {
+                    "job": { "type": "string", "description": "Only this job." },
+                    "namespaces": { "type": "array", "items": { "type": "string" }, "description": "Namespaces to list (names or globs); default `default`." }
+                },
+                "additionalProperties": false
+            }),
+            mutates: false,
+        },
+        ToolDef {
+            name: "legion_scaling_explain",
+            description: "Why an autoscaled task is at its count, as structured data: the last evaluation's checks (reading, desired) and every safeguard stage (before, after, note), the effective policy with the level each field came from (built-in, cluster defaults, namespace policy, jobspec), pins, and pauses. Read-only.",
+            input_schema: || json!({
+                "type": "object",
+                "properties": {
+                    "job": { "type": "string", "description": "Job name." },
+                    "group": { "type": "string", "description": "Task group, when the job has several autoscaled tasks." },
+                    "task": { "type": "string", "description": "Task name, when the job has several autoscaled tasks." }
+                },
+                "required": ["job"],
+                "additionalProperties": false
+            }),
+            mutates: false,
+        },
+        ToolDef {
+            name: "legion_scaling_history",
+            description: "The durable record of a job's count changes, newest first: who (operator or autoscaler), from and to, the one-line why, the policy digest, and dry-run \"would\" rows (`applied = false`). Read-only.",
+            input_schema: || json!({
+                "type": "object",
+                "properties": {
+                    "job": { "type": "string", "description": "Job name." },
+                    "group": { "type": "string" },
+                    "task": { "type": "string" },
+                    "limit": { "type": "integer", "minimum": 1, "maximum": 1000, "description": "Rows (default 50)." }
+                },
+                "required": ["job"],
+                "additionalProperties": false
+            }),
+            mutates: false,
+        },
+        ToolDef {
+            name: "legion_scaling_pause",
+            description: "Pause (or with resume=true, resume) task autoscaling for a job, one of its tasks, or the whole cluster (all=true, needs operator:write), optionally for a duration. While paused the server refuses the autoscaler's writes; people can still scale by hand. Mutating.",
+            input_schema: || json!({
+                "type": "object",
+                "properties": {
+                    "job": { "type": "string", "description": "Job name; omit with all=true." },
+                    "group": { "type": "string" },
+                    "task": { "type": "string" },
+                    "all": { "type": "boolean", "description": "Every autoscaled task in the cluster." },
+                    "for": { "type": "string", "description": "How long, e.g. \"1h\"; default until resumed." },
+                    "reason": { "type": "string", "description": "Why, shown on every status surface." },
+                    "resume": { "type": "boolean", "description": "Lift the pause at this scope instead." },
+                    "idempotency_key": { "type": "string", "description": "Optional key to dedupe retries." }
+                },
+                "additionalProperties": false
+            }),
+            mutates: true,
         },
         ToolDef {
             name: "legion_job_destroy",
@@ -1555,6 +1623,7 @@ async fn dispatch_tool(name: &str, args: Value) -> Result<Value, String> {
                         .and_then(Value::as_bool)
                         .unwrap_or(false),
                     idempotency_key: opt_str_arg(&args, "idempotency_key"),
+                    force: args.get("force").and_then(Value::as_bool).unwrap_or(false),
                 }),
             )
             .await
@@ -2674,6 +2743,16 @@ async fn dispatch_tool(name: &str, args: Value) -> Result<Value, String> {
                 .get("reset")
                 .and_then(|value| value.as_bool())
                 .unwrap_or(false);
+            let pin_for_seconds = match opt_str_arg(&args, "for") {
+                Some(text) => Some(
+                    humantime::parse_duration(text.trim())
+                        .map_err(|err| format!("for {text:?}: {err} (write it like 2h)"))?
+                        .as_secs()
+                        .max(1),
+                ),
+                None => None,
+            };
+            let bound = |key: &str| args.get(key).and_then(Value::as_u64).map(|n| n as u32);
             let mut client = connect().await?;
             grpc(client.scale_task(crate::structs::ScaleTaskRequest {
                 name,
@@ -2682,6 +2761,100 @@ async fn dispatch_tool(name: &str, args: Value) -> Result<Value, String> {
                 count,
                 reset,
                 reason: opt_str_arg(&args, "reason"),
+                idempotency_key: opt_str_arg(&args, "idempotency_key"),
+                pin_for_seconds,
+                min: bound("min"),
+                max: bound("max"),
+                release: args.get("release").and_then(Value::as_bool).unwrap_or(false),
+                ..Default::default()
+            }))
+            .await
+        }
+        "legion_scaling_status" => {
+            let job = opt_str_arg(&args, "job").unwrap_or_default();
+            let namespaces = args
+                .get("namespaces")
+                .and_then(Value::as_array)
+                .map(|list| {
+                    list.iter()
+                        .filter_map(Value::as_str)
+                        .map(str::to_string)
+                        .collect()
+                })
+                .unwrap_or_default();
+            let mut client = connect().await?;
+            grpc(client.get_scaling_status(crate::structs::GetScalingStatusRequest {
+                job,
+                namespaces,
+                ..Default::default()
+            }))
+            .await
+        }
+        "legion_scaling_explain" => {
+            let job = job_arg(&args, "job")?;
+            let mut client = connect().await?;
+            let mut value = grpc(client.get_scaling_status(crate::structs::GetScalingStatusRequest {
+                job,
+                task_group: opt_str_arg(&args, "group"),
+                task_name: opt_str_arg(&args, "task"),
+                detail: true,
+                ..Default::default()
+            }))
+            .await?;
+            // The decision and policy travel as JSON text; hand them over
+            // as structured data.
+            if let Some(targets) = value.get_mut("targets").and_then(Value::as_array_mut) {
+                for target in targets {
+                    if let Value::Object(object) = target {
+                        for (text, key) in [("decisionJson", "decision"), ("policyJson", "effectivePolicy")] {
+                            let parsed = object
+                                .remove(text)
+                                .and_then(|raw| raw.as_str().and_then(|raw| serde_json::from_str::<Value>(raw).ok()))
+                                .unwrap_or(Value::Null);
+                            object.insert(key.to_string(), parsed);
+                        }
+                    }
+                }
+            }
+            Ok(value)
+        }
+        "legion_scaling_history" => {
+            let job = job_arg(&args, "job")?;
+            let mut client = connect().await?;
+            grpc(client.get_scale_history(crate::structs::GetScaleHistoryRequest {
+                job,
+                task_group: opt_str_arg(&args, "group"),
+                task_name: opt_str_arg(&args, "task"),
+                limit: args.get("limit").and_then(Value::as_u64).unwrap_or(0) as u32,
+                detail: false,
+            }))
+            .await
+        }
+        "legion_scaling_pause" => {
+            let all = args.get("all").and_then(Value::as_bool).unwrap_or(false);
+            let job = if all {
+                String::new()
+            } else {
+                job_arg(&args, "job")?
+            };
+            let for_seconds = match opt_str_arg(&args, "for") {
+                Some(text) => Some(
+                    humantime::parse_duration(text.trim())
+                        .map_err(|err| format!("for {text:?}: {err} (write it like 1h)"))?
+                        .as_secs()
+                        .max(1),
+                ),
+                None => None,
+            };
+            let mut client = connect().await?;
+            grpc(client.pause_scaling(crate::structs::PauseScalingRequest {
+                job,
+                task_group: opt_str_arg(&args, "group"),
+                task_name: opt_str_arg(&args, "task"),
+                all,
+                for_seconds,
+                reason: opt_str_arg(&args, "reason").unwrap_or_default(),
+                resume: args.get("resume").and_then(Value::as_bool).unwrap_or(false),
                 idempotency_key: opt_str_arg(&args, "idempotency_key"),
             }))
             .await

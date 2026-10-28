@@ -56,8 +56,8 @@ mod scaling_ops;
 // history, pauses, the cluster's scaling defaults, policy snapshots.
 mod autoscale_ops;
 pub use autoscale_ops::{
-    HistoryRow, NewHistory, PauseRow, ScaleWrite, ScaleWriteOp, ScaleWriteOutcome,
-    ScalingDefaultsRow, TASK_SCALE_COUNTER,
+    covering_pause, HistoryRow, NewHistory, PauseRow, ScaleWrite, ScaleWriteOp,
+    ScaleWriteOutcome, ScalingDefaultsRow, HISTORY_CAP, PAUSE_ANY, TASK_SCALE_COUNTER,
 };
 use crate::storage::persistence::{
     build_persistence_driver, PersistenceDriver, PersistenceRole, PersistenceStatus,

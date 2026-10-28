@@ -31,6 +31,7 @@ pub mod oidc;
 pub mod output;
 pub mod raft;
 pub mod sandbox;
+pub mod scaling;
 pub mod scheduler;
 pub mod service;
 pub mod session;
@@ -61,6 +62,7 @@ fn base_cli() -> Command {
         .subcommand(mcp::config())
         .subcommand(docs::config())
         .subcommand(job::config())
+        .subcommand(scaling::config())
         .subcommand(app::config())
         .subcommand(namespace::config())
         .subcommand(template::config())

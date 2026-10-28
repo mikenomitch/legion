@@ -80,6 +80,15 @@ pub fn config() -> Command {
                         .value_hint(ValueHint::FilePath),
                 )
                 .arg(
+                    Arg::new("force")
+                        .long("force")
+                        .action(ArgAction::SetTrue)
+                        .help(
+                            "Apply even when the policy's autoscale leaves some autoscaled \
+                             tasks' policies invalid; they are held until fixed",
+                        ),
+                )
+                .arg(
                     Arg::new("dry-run")
                         .long("dry-run")
                         .action(ArgAction::SetTrue)
@@ -343,6 +352,7 @@ async fn apply(matches: &ArgMatches) -> R<()> {
                 object_json: text,
                 dry_run,
                 idempotency_key: matches.get_one::<String>("idempotency-key").cloned(),
+                force: matches.get_flag("force"),
             })
             .await,
     )?

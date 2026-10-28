@@ -1199,6 +1199,12 @@
             name = "container",
             count = 1,
             runtime = "container",
+            # Task autoscaling (docs/autoscaling.md). `true` takes the
+            # effective defaults: the built-ins (min = count, max = 4 x
+            # count, CPU held at 70% of the reservation, fast up, slow down)
+            # as the cluster's scaling defaults and namespace policies
+            # override them. `legion job plan` prints the expansion.
+            autoscale = true,
             config = {
                 image = "alpine:latest",
                 command = ["echo", "hello", "from", "container"],
@@ -1318,6 +1324,39 @@
             },
             affinities = {
                 region = "us-west",
+            },
+            # Every autoscale field (docs/autoscaling.md, "The full policy
+            # surface"); each one left out takes its effective default. On a
+            # gang, `min` must hold the quorum (gang.min).
+            autoscale = {
+                min = 4,                # a count, or a multiple of count ("1x")
+                max = "2x",
+                cpu = 0.65,             # hold CPU at 65% of the reservation
+                memory = 0.8,           # and memory at 80%
+                # Explicit checks on the `legion` source; the largest
+                # desired count wins.
+                checks = [
+                    {
+                        name = "backlog",
+                        source = "legion",
+                        query = "task.unplaced",
+                        window = "2m",
+                        strategy = { name = "threshold", steps = [{ above = 0, add = 1 }] },
+                        scaleIn = false,  # may push up, never pull down
+                    },
+                ],
+                up = { stabilize = "30s", step = { replicas = 2 }, every = "1m" },
+                down = { stabilize = "10m", step = { percent = 10, replicas = 1 }, every = "2m" },
+                headroom = 0,
+                warmup = "45s",
+                tolerance = 0.1,
+                window = "2m",
+                # Raise the floor on weekday mornings, New York time.
+                schedule = [
+                    { cron = "0 8 * * 1-5", for = "10h", min = 6, timezone = "America/New_York" },
+                ],
+                onMissing = "hold",     # hold (default) | ignore
+                mode = "dry-run",       # enforce (default) | dry-run
             },
         },
     ],

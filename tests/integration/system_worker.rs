@@ -160,6 +160,11 @@ impl Cluster {
         Cluster { dir, port, manager }
     }
 
+    /// The cluster's directory (its store, logs, and task directories).
+    pub(crate) fn dir(&self) -> &std::path::Path {
+        self.dir.path()
+    }
+
     fn token_file(&self) -> PathBuf {
         self.dir.path().join("home").join(".legion").join("token")
     }

@@ -4411,13 +4411,11 @@ plan.
           normalizing pass is worth it once apps hit it
           ([calls entry 30](calls/legion-apps-plan_calls.md)).
   - [ ] A3 follow-ups, found while building it:
-    - [ ] **Apps hold no credentials on a default cluster.** Workload
-          identity is off by default, so an app's `legion` identity gets no
-          token or API socket; `legion app status` notes it. The autoscaler's
-          Phase 2 needs it on: decide whether workload identity becomes a
-          default, or apps get a credential another way
-          ([calls entry 56](calls/legion-apps-plan_calls.md),
-          [docs](../docs/apps.md#limitations)).
+    - [x] **Apps hold no credentials on a default cluster.** Closed by
+          autoscaler-v2 Phase 2: workload identity is on by default
+          ([autoscaler calls 37](calls/autoscaler-v2-plan_calls.md),
+          [docs](../docs/workload-identity.md#manager-configuration)); in
+          Done under *Workload identity*.
     - [ ] **A stopped bundled app is not yet a cluster-health finding**
           (plan §6.7): no `legion doctor` exists and the UI has no Apps
           page or overview card. `legion_apps{status}` and `legion app list`
@@ -4474,7 +4472,7 @@ plan.
         equivalent) and extension points beyond job, group, task, volume,
         port, and service (plan §11)
 
-- [ ] **Autoscaler** (v2 plan, merged in [#57](https://github.com/mikenomitch/legion/pull/57)): [plan](plans/autoscaler-v2-plan.md) (PLANNED) ·
+- [ ] **Autoscaler** (v2 plan, merged in [#57](https://github.com/mikenomitch/legion/pull/57)): [plan](plans/autoscaler-v2-plan.md) (IN EXECUTION; Phase 2 in Done) ·
       [calls](calls/autoscaler-v2-plan_calls.md). Supersedes
       [autoscaler-plan.md](plans/autoscaler-plan.md) ·
       [calls](calls/autoscaler-plan_calls.md), whose Phase 1 shipped and is
@@ -4512,19 +4510,40 @@ plan.
         (5-field crontab, IANA time zones via `chrono-tz`), the safeguard
         pipeline, and the simulator; pure and unit-tested, not yet wired to
         the jobspec or an app. Calls 20–28.
-  - [ ] Phase 2: task autoscaling MVP as the bundled app (needs apps A1–A3).
-        `autoscale = true` and its expansion in `job plan`; layered,
-        live-resolved defaults (cluster `legion scaling defaults`,
-        namespace-policy `autoscale`, the task), with provenance in
-        `scaling explain --policy`; in-place resubmits for `autoscale`/`count`
-        changes; the safeguard
-        pipeline, compare-and-set `ScaleTask`, `scale_history`, pins
-        (`job scale --for/--min/--max/--release`), `legion scaling
-        status|explain|history|pause|resume`, `dry-run`, events, MCP read tools
-  - [ ] Phase 3: full policies. `checks`, `prometheus`/`http` sources, the
-        `per-replica`/`threshold`/`pass-through`/`fixed` strategies,
-        schedules, `headroom`, activation-gated `min = 0`, `legion scaling
-        simulate`
+  - [x] Phase 2: task autoscaling MVP as the bundled app (2026-10-28; in
+        Done, under *Ecosystem apps*). It also runs `checks` on the `legion`
+        source, every built-in strategy, schedules, `headroom`, `scaleIn`,
+        and `onMissing` ([calls 38](calls/autoscaler-v2-plan_calls.md)).
+  - [ ] Phase 2 follow-ups, found while building it:
+    - [ ] **The quota stage is the write's refusal**: the app passes the
+          engine no quota headroom, so near a namespace quota a target holds
+          (`held`, with the quota's message) instead of filling to exactly
+          what fits ([calls 48](calls/autoscaler-v2-plan_calls.md)).
+    - [ ] **No `/metrics` on the app** (plan §6.6:
+          `legion_autoscaler_evaluations_total{result}`,
+          `..._actions_total{direction,source}`, `..._desired{target}`) and
+          no per-evaluation span fields beyond the tick's.
+    - [ ] **Warmup is derived from rises in the ready count**, not
+          per-replica ready times, and a warming replica's usage still
+          enters the mean ([calls 50](calls/autoscaler-v2-plan_calls.md));
+          `GetScalingInputs` could carry per-replica ready times.
+    - [ ] **`WatchScalingPolicies` re-resolves and re-sends every policy on
+          any change** (a 1s fingerprint poll, no deltas, no shard filter;
+          [calls 46](calls/autoscaler-v2-plan_calls.md)). Fine at hundreds;
+          Phase 7 needs deltas and shards.
+    - [ ] **An `autoscale` edit during a rollout restarts the rollout**
+          instead of applying in place
+          ([calls 47](calls/autoscaler-v2-plan_calls.md)).
+    - [ ] **The UI shows nothing of autoscaling**: the regenerated client
+          has the new RPCs; the job page's Scale card does not use them
+          (Phase 6 builds the panels as app extensions).
+    - [ ] **Cluster scaling defaults keep no version history**: only the
+          current record and its version; a history row's digest still
+          resolves to the exact policy through `scaling_policy_snapshot`.
+  - [ ] Phase 3: full policies. The `prometheus` and `http` sources (the
+        engine's `checks`, strategies, schedules, `headroom`, `scaleIn`,
+        and `onMissing` already run on the `legion` source), activation-gated
+        `min = 0` and its validation, `legion scaling simulate`
   - [ ] Phase 4: external plugins (JSON-RPC over stdio or HTTP) installed
         through app config, the `exec`/`noop` targets, `legion scaling plugin
         test`, the SDK and example plugins, and standalone `ScalingPolicy`
@@ -4536,14 +4555,9 @@ plan.
   - [ ] Phase 6: autoscaler UI as app extensions (needs apps A4)
   - [ ] Phase 7: sharded replicas (shard leases, rebalancing) and a
         10,000-policy load test
-  - [ ] **Hardening:** `GetJobScaleStatus` reports
-        `override_count.unwrap_or(spec)` without the `base_count` filter that
-        `effective_task_count` applies (`src/manager/server.rs:6250`). This
-        can't be reached today, because submit arbitration deletes a
-        mismatched override in the same transaction
-        (`store.rs:10838-10850`). Pins and autoscale-aware arbitration add
-        new override states, so v2 Phase 1 routes status through
-        `effective_task_count`.
+  - [x] **Hardening:** `GetJobScaleStatus` reports through
+        `effective_task_count` (done in Phase 1), which pins and the
+        autoscale-aware arbitration (Phase 2) rely on.
   - [ ] Deferred from v2 (plan §4, §8): waking a `service` from zero on
         the first request (needs the gateway to route to services),
         `service.concurrency` once netd attributes ingress requests, keyed
@@ -6152,8 +6166,56 @@ findings: [kernel-classifier-findings.md](kernel-classifier-findings.md)
       [docs](../docs/workload-identity.md#forks-and-snapshots)). Offline
       verifiers (AWS, GCP, Vault) cannot see the epoch, and login-minted ACL
       tokens are still open (Task runtimes, Phase 6 follow-ups).
+- [x] Workload identity on by default (2026-10-28,
+      [autoscaler calls 37](calls/autoscaler-v2-plan_calls.md) ·
+      [docs](../docs/workload-identity.md#manager-configuration)): the
+      issuer, its first key, the `legion` control-plane method, and the
+      discovery/JWKS routes need no configuration, so apps and API sockets
+      hold credentials on a fresh cluster; `enabled = false` opts out.
+      Federation still needs an explicit public `issuer`.
 
 ## Ecosystem apps
+
+- [x] **Autoscaler Phase 2: task autoscaling as the bundled app**
+      (2026-10-28, [plan](plans/autoscaler-v2-plan.md) §6.3-§6.6, §8 ·
+      [calls 37-50](calls/autoscaler-v2-plan_calls.md) · docs:
+      [autoscaling.md](../docs/autoscaling.md),
+      [apps.md](../docs/apps.md),
+      [agent-readiness.md](../docs/agent-readiness.md),
+      [event-stream.md](../docs/event-stream.md))
+  - [x] The `autoscale` jobspec field (core, in `FIELDS`, stored as written,
+        JSON schema, `maximal.ncl`), validated at submit (bounds against
+        `count`, usage-capable runtime, groups, gang quorum, keyed,
+        `count.per`, batch, sources and the `legion` vocabulary; `min = 0`
+        refused); `legion job plan` prints the effective record and summary
+  - [x] Layered defaults resolved live: `ApplyScalingDefaults` (dry run,
+        force, idempotency) / `GetScalingDefaults` with provenance,
+        namespace-policy `autoscale` (with `--force` on `namespace policy
+        apply`), `scaling_policy_snapshot` so history digests resolve
+  - [x] In-place resubmits for `autoscale`/`count` changes, and the
+        autoscale-aware submit arbitration (keep, rebase, clamp)
+  - [x] `ScaleTask` gains compare-and-set versions (a Control counter),
+        decisions, `source`, pins (`--for/--min/--max/--release`), group
+        targets in one write, server-side pause and pin refusals;
+        `scale_history` (capped, `applied`, digests) and `scaling_pause`
+  - [x] `WatchScalingPolicies`, `ReportScalingStatus` and
+        `RecordScalingAction` (app-plane), `GetScalingStatus` (NOT RUNNING
+        after three intervals), `GetScaleHistory`, `PauseScaling`; ACL rows
+        in `acl_endpoints.rs`
+  - [x] The bundled app's engine loop: watch, batched inputs, the full
+        safeguard pipeline, CAS writes, dry-run "would" rows, events
+        (`scale.limited|flapping|check_failed|pinned|paused|resumed`); its
+        grant trimmed to `scale:read/write`; app config `interval`, `mode`
+  - [x] Workload identity on by default (see *Workload identity*)
+  - [x] CLI `legion scaling status|explain [--policy]|history|pause|resume|
+        defaults get|apply`, capability entries, MCP `legion_scaling_status`,
+        `legion_scaling_explain`, `legion_scaling_history`,
+        `legion_scaling_pause`
+  - [x] Tests: store (CAS, versions across delete/recreate, history cap,
+        pauses and pins, group writes), resolution and validation tables,
+        `tests/integration/autoscaler.rs` (S1 end to end, in-place
+        resubmits, CAS and `--all` pause, dry-run, live defaults, NOT
+        RUNNING, and the real binary's app on a fresh cluster)
 
 - [x] **Legion apps A1: places to run** (2026-10-28,
       [plan](plans/legion-apps-plan.md) §8 ·

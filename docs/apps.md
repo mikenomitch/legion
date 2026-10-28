@@ -45,6 +45,15 @@ always the same build as the node that runs it, with nothing to download.
 Bundled apps can be disabled, configured, and moved, but not uninstalled.
 They upgrade with the binary ([Upgrades](#upgrades-of-bundled-apps)).
 
+The **autoscaler** acts on every task with `autoscale` in its jobspec
+([autoscaling.md](autoscaling.md)): it watches the effective policies, reads
+the cluster-wide scaling inputs once per interval, and writes counts through
+`ScaleTask`, reporting each evaluation back to the manager. Its grant is
+`scale:read` and `scale:write` in every namespace: it can resize, not
+redeploy. Its config takes `interval` (default `"15s"`) and `mode`
+(`"dry-run"` forces every policy into dry-run). When it stops reporting,
+`legion scaling status` says `NOT RUNNING`.
+
 **Installed apps** come from a manifest file or URL (`legion app install`).
 They carry their own `version`, run their own code (an artifact or an image,
 like any job), and can be upgraded and uninstalled.
@@ -246,11 +255,11 @@ value at one of the manifest's `codeFields` (for the autoscaler, a plugin's
 `source` or `url`) changes what code runs with the app's grant. It needs the
 caller to hold every permission of the app's recorded grant, as installing
 does; other config changes need only `app:write`. Without this, `app:write`
-on the autoscaler would be a path to `node:write`.
+on the autoscaler would be a path to `scale:write` in every namespace.
 
 ```text
 Error: changing app autoscaler's code (/plugins/aws/source) runs code with its grant, which asks for
-node:write, which your token does not hold
+scale:write in *, which your token does not hold
 ```
 
 ### Settings, enable, disable
@@ -530,11 +539,11 @@ Every command but `run` takes `--json`. The MCP server exposes
   record; `legion app list` shows the UI slots. Rendering panels and pages,
   and resolving jobspec keys, come in later releases.
 - **Without workload identity, an app cannot reach Legion.** Workload
-  identity is off by default (`workloadIdentity.enabled = false`). An app
-  then runs, but its `legion` identity gets no token and no API socket, so
-  it holds no credentials; `legion app status` notes it.
-- **The autoscaler does not scale yet.** The bundled `autoscaler` runs and
-  reports healthy, and logs that its engine is not wired in this build.
+  identity is on by default; a manager configured with
+  `workloadIdentity.enabled = false` runs apps whose `legion` identity gets
+  no token and no API socket, so they hold no credentials; `legion app
+  status` notes it, and the autoscaler's health says `idle: cannot reach
+  Legion`.
 - **The config file reaches `exec` and `container` tasks only.** A sandbox
   task gets `LEGION_APP_NAME` but no config file.
 - **No registry.** `install` takes a file or a URL.

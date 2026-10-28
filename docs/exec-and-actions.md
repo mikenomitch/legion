@@ -351,7 +351,7 @@ ceilings short.
 ```nickel
 # configs/manager.ncl
 {
-  workloadIdentity = { enabled = true },
+  # Tickets are signed by the workload-identity issuer, on by default.
   exec = { tickets = { defaultTtl = "60s", maxTtl = "10m", maxSession = "1h" } },
 }
 ```

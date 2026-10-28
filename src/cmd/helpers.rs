@@ -76,6 +76,7 @@ const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const UNBOUNDED_METHODS: &[&str] = &[
     "ExecAllocation",
     "StreamEvents",
+    "WatchScalingPolicies",
     "GetStateBackup",
     "RewrapKv",
 ];

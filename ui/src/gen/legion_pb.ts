@@ -4082,6 +4082,15 @@ export class PlanJobReply extends Message<PlanJobReply> {
    */
   gangReports: GangReport[] = [];
 
+  /**
+   * One entry per task with `autoscale`, in task order: its effective
+   * policy as the cluster's current defaults resolve it, so nothing about
+   * `autoscale = true` is hidden (docs/autoscaling.md).
+   *
+   * @generated from field: repeated legion.AutoscalePlan autoscale = 10;
+   */
+  autoscale: AutoscalePlan[] = [];
+
   constructor(data?: PartialMessage<PlanJobReply>) {
     super();
     proto3.util.initPartial(data, this);
@@ -4099,6 +4108,7 @@ export class PlanJobReply extends Message<PlanJobReply> {
     { no: 7, name: "preemption_mode", kind: "scalar", T: 9 /* ScalarType.STRING */ },
     { no: 8, name: "warnings", kind: "scalar", T: 9 /* ScalarType.STRING */, repeated: true },
     { no: 9, name: "gang_reports", kind: "message", T: GangReport, repeated: true },
+    { no: 10, name: "autoscale", kind: "message", T: AutoscalePlan, repeated: true },
   ]);
 
   static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): PlanJobReply {
@@ -4115,6 +4125,82 @@ export class PlanJobReply extends Message<PlanJobReply> {
 
   static equals(a: PlanJobReply | PlainMessage<PlanJobReply> | undefined, b: PlanJobReply | PlainMessage<PlanJobReply> | undefined): boolean {
     return proto3.util.equals(PlanJobReply, a, b);
+  }
+}
+
+/**
+ * The effective autoscaling policy of one task in a plan.
+ *
+ * @generated from message legion.AutoscalePlan
+ */
+export class AutoscalePlan extends Message<AutoscalePlan> {
+  /**
+   * `job/group/task`.
+   *
+   * @generated from field: string target = 1;
+   */
+  target = "";
+
+  /**
+   * The effective record (JSON), with bounds as written (`"4x"`) and every
+   * default filled.
+   *
+   * @generated from field: string effective_json = 2;
+   */
+  effectiveJson = "";
+
+  /**
+   * The human summary, one line each:
+   * `hold cpu at 70% of 500MHz per replica, 1m average over ready replicas`,
+   * `bounds 2..8 (min = count, max = 4 x count)`, `up: ...`, `down: ...`.
+   *
+   * @generated from field: repeated string summary = 3;
+   */
+  summary: string[] = [];
+
+  /**
+   * Every field with the level it came from.
+   *
+   * @generated from field: repeated legion.ScalingProvenanceRow provenance = 4;
+   */
+  provenance: ScalingProvenanceRow[] = [];
+
+  /**
+   * The effective policy's digest.
+   *
+   * @generated from field: string digest = 5;
+   */
+  digest = "";
+
+  constructor(data?: PartialMessage<AutoscalePlan>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.AutoscalePlan";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "target", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 2, name: "effective_json", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 3, name: "summary", kind: "scalar", T: 9 /* ScalarType.STRING */, repeated: true },
+    { no: 4, name: "provenance", kind: "message", T: ScalingProvenanceRow, repeated: true },
+    { no: 5, name: "digest", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): AutoscalePlan {
+    return new AutoscalePlan().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): AutoscalePlan {
+    return new AutoscalePlan().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): AutoscalePlan {
+    return new AutoscalePlan().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: AutoscalePlan | PlainMessage<AutoscalePlan> | undefined, b: AutoscalePlan | PlainMessage<AutoscalePlan> | undefined): boolean {
+    return proto3.util.equals(AutoscalePlan, a, b);
   }
 }
 
@@ -4745,6 +4831,74 @@ export class ScaleTaskRequest extends Message<ScaleTaskRequest> {
    */
   idempotencyKey?: string;
 
+  /**
+   * Compare-and-set: apply only when the task's override row is at exactly
+   * this version, else fail with FAILED_PRECONDITION
+   * (`version conflict: ...`) and change nothing. 0 means "no override row
+   * exists". Read the current version from `ScalingInputs.override_version`
+   * or `TaskScaleStatus.version`. A version is a cluster-wide counter
+   * stamped on every write of the row, so it never repeats, even after the
+   * row is deleted and recreated. Unset: no check (a person's write).
+   *
+   * @generated from field: optional uint64 expected_version = 8;
+   */
+  expectedVersion?: bigint;
+
+  /**
+   * Why the count changed, as the autoscaler decided it: recorded in the
+   * task's scale history with the write. Optional for people.
+   *
+   * @generated from field: legion.ScaleDecision decision = 9;
+   */
+  decision?: ScaleDecision;
+
+  /**
+   * Who is writing: `operator` (the default, also for an empty string),
+   * `autoscaler`, or `wake`. `autoscaler` and `wake` are honored only from
+   * the bundled autoscaler's own identity (or a management token); from
+   * any other caller the write is treated as `operator`. An `autoscaler`
+   * write is refused while the task is paused or pinned to a count, and
+   * must stay within a pinned floor or ceiling.
+   *
+   * @generated from field: string source = 10;
+   */
+  source = "";
+
+  /**
+   * Pin: hold the result for this many seconds. With `count` it pins the
+   * count; with `min` and/or `max` it pins a floor and/or ceiling the
+   * autoscaler stays within. Required for a person's count on an
+   * autoscaled task; refused on a task without `autoscale`.
+   *
+   * @generated from field: optional uint64 pin_for_seconds = 11;
+   */
+  pinForSeconds?: bigint;
+
+  /**
+   * A pinned floor (with `pin_for_seconds`). The count is raised to it at
+   * once when below.
+   *
+   * @generated from field: optional uint32 min = 12;
+   */
+  min?: number;
+
+  /**
+   * A pinned ceiling (with `pin_for_seconds`). The count is lowered to it at
+   * once when above.
+   *
+   * @generated from field: optional uint32 max = 13;
+   */
+  max?: number;
+
+  /**
+   * End the task's pin now and leave the count where it is: the autoscaler
+   * takes over again at its normal rate. Mutually exclusive with `count`,
+   * `reset`, `min`, and `max`.
+   *
+   * @generated from field: bool release = 14;
+   */
+  release = false;
+
   constructor(data?: PartialMessage<ScaleTaskRequest>) {
     super();
     proto3.util.initPartial(data, this);
@@ -4760,6 +4914,13 @@ export class ScaleTaskRequest extends Message<ScaleTaskRequest> {
     { no: 5, name: "reset", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
     { no: 6, name: "reason", kind: "scalar", T: 9 /* ScalarType.STRING */, opt: true },
     { no: 7, name: "idempotency_key", kind: "scalar", T: 9 /* ScalarType.STRING */, opt: true },
+    { no: 8, name: "expected_version", kind: "scalar", T: 4 /* ScalarType.UINT64 */, opt: true },
+    { no: 9, name: "decision", kind: "message", T: ScaleDecision },
+    { no: 10, name: "source", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 11, name: "pin_for_seconds", kind: "scalar", T: 4 /* ScalarType.UINT64 */, opt: true },
+    { no: 12, name: "min", kind: "scalar", T: 13 /* ScalarType.UINT32 */, opt: true },
+    { no: 13, name: "max", kind: "scalar", T: 13 /* ScalarType.UINT32 */, opt: true },
+    { no: 14, name: "release", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
   ]);
 
   static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): ScaleTaskRequest {
@@ -4780,6 +4941,94 @@ export class ScaleTaskRequest extends Message<ScaleTaskRequest> {
 }
 
 /**
+ * Why a count changed (ScaleTask, RecordScalingAction), as the autoscaler
+ * recorded it. Stored with the task's scale history row.
+ *
+ * @generated from message legion.ScaleDecision
+ */
+export class ScaleDecision extends Message<ScaleDecision> {
+  /**
+   * An id for the decision, unique per target (`d-` and hex), named in
+   * events and `legion scaling explain`.
+   *
+   * @generated from field: string id = 1;
+   */
+  id = "";
+
+  /**
+   * The one-line why: `cpu 0.91 vs 0.70 (4 ready); rate-limited from 7`.
+   *
+   * @generated from field: string summary = 2;
+   */
+  summary = "";
+
+  /**
+   * The digest of the effective policy that decided (hex SHA-256 of
+   * `policy_json`). The manager keeps that policy once per digest, so a
+   * history row's digest always resolves to the exact policy, even after
+   * the defaults that shaped it change.
+   *
+   * @generated from field: string policy_digest = 3;
+   */
+  policyDigest = "";
+
+  /**
+   * The effective policy as canonical JSON. Must hash to `policy_digest`,
+   * else the write is refused.
+   *
+   * @generated from field: string policy_json = 4;
+   */
+  policyJson = "";
+
+  /**
+   * The full decision as the engine made it (JSON): each check's reading
+   * and recommendation, and every pipeline stage's before, after, and note.
+   *
+   * @generated from field: string detail_json = 5;
+   */
+  detailJson = "";
+
+  /**
+   * When the decision was made, unix milliseconds.
+   *
+   * @generated from field: int64 evaluated_at_unix_ms = 6;
+   */
+  evaluatedAtUnixMs = protoInt64.zero;
+
+  constructor(data?: PartialMessage<ScaleDecision>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.ScaleDecision";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "id", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 2, name: "summary", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 3, name: "policy_digest", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 4, name: "policy_json", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 5, name: "detail_json", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 6, name: "evaluated_at_unix_ms", kind: "scalar", T: 3 /* ScalarType.INT64 */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): ScaleDecision {
+    return new ScaleDecision().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): ScaleDecision {
+    return new ScaleDecision().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): ScaleDecision {
+    return new ScaleDecision().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: ScaleDecision | PlainMessage<ScaleDecision> | undefined, b: ScaleDecision | PlainMessage<ScaleDecision> | undefined): boolean {
+    return proto3.util.equals(ScaleDecision, a, b);
+  }
+}
+
+/**
  * Reply payload for ScaleTask.
  *
  * @generated from message legion.ScaleTaskReply
@@ -4787,9 +5036,11 @@ export class ScaleTaskRequest extends Message<ScaleTaskRequest> {
 export class ScaleTaskReply extends Message<ScaleTaskReply> {
   /**
    * Human-readable outcome, e.g.
-   * `"web/default/web: 4 -> 6 (spec count 2; override active)"` or the
+   * `"web/default/web: 4 -> 6 (spec count 2; override active)"`, the
    * deferral notice
-   * `"deferred: rollout web-7 is in progress; scale-in to 2 applies when it completes"`.
+   * `"deferred: rollout web-7 is in progress; scale-in to 2 applies when it completes"`,
+   * or for a pin
+   * `"web/default/web: 6 -> 12; autoscaling pinned until 05:10 UTC (legion job scale web --release)"`.
    *
    * @generated from field: string message = 1;
    */
@@ -4811,6 +5062,23 @@ export class ScaleTaskReply extends Message<ScaleTaskReply> {
    */
   deferred = false;
 
+  /**
+   * The override row's version after this write (the next write's
+   * `expected_version`). 0 when the row was removed (`reset`) or the reply
+   * is a replay.
+   *
+   * @generated from field: uint64 version = 4;
+   */
+  version = protoInt64.zero;
+
+  /**
+   * When the pin set by this write expires, unix milliseconds. Unset when
+   * the write set no pin.
+   *
+   * @generated from field: optional int64 pinned_until_unix_ms = 5;
+   */
+  pinnedUntilUnixMs?: bigint;
+
   constructor(data?: PartialMessage<ScaleTaskReply>) {
     super();
     proto3.util.initPartial(data, this);
@@ -4822,6 +5090,8 @@ export class ScaleTaskReply extends Message<ScaleTaskReply> {
     { no: 1, name: "message", kind: "scalar", T: 9 /* ScalarType.STRING */ },
     { no: 2, name: "deduplicated", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
     { no: 3, name: "deferred", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
+    { no: 4, name: "version", kind: "scalar", T: 4 /* ScalarType.UINT64 */ },
+    { no: 5, name: "pinned_until_unix_ms", kind: "scalar", T: 3 /* ScalarType.INT64 */, opt: true },
   ]);
 
   static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): ScaleTaskReply {
@@ -4938,8 +5208,7 @@ export class TaskScaleStatus extends Message<TaskScaleStatus> {
   effectiveCount = 0;
 
   /**
-   * Who set the override: `operator` today; `autoscaler` when the policy
-   * evaluator ships.
+   * Who set the override: `operator`, `autoscaler`, or `wake`.
    *
    * @generated from field: string source = 7;
    */
@@ -4960,6 +5229,62 @@ export class TaskScaleStatus extends Message<TaskScaleStatus> {
    */
   updatedAt = "";
 
+  /**
+   * Whether the task has `autoscale` in its latest spec: the autoscaler owns
+   * its count, and a person's count is a pin.
+   *
+   * @generated from field: bool autoscaled = 10;
+   */
+  autoscaled = false;
+
+  /**
+   * For an autoscaled task, its effective policy in one line
+   * (`2..8, cpu 70%, enforce`), or `invalid: <why>` when it does not
+   * resolve. Empty otherwise.
+   *
+   * @generated from field: string policy_summary = 11;
+   */
+  policySummary = "";
+
+  /**
+   * The active pin, if any.
+   *
+   * @generated from field: legion.ScalePin pin = 12;
+   */
+  pin?: ScalePin;
+
+  /**
+   * The pause that covers this task, if any (its own, its job's, or the
+   * cluster-wide one).
+   *
+   * @generated from field: legion.ScalingPauseInfo pause = 13;
+   */
+  pause?: ScalingPauseInfo;
+
+  /**
+   * When the autoscaler last evaluated the task, unix milliseconds; 0 when
+   * it has not (since the status-lane leader started).
+   *
+   * @generated from field: int64 last_evaluation_unix_ms = 14;
+   */
+  lastEvaluationUnixMs = protoInt64.zero;
+
+  /**
+   * The autoscaler's last word on the task (see `ScalingTargetStatus.state`);
+   * empty for a task without `autoscale`.
+   *
+   * @generated from field: string state = 15;
+   */
+  state = "";
+
+  /**
+   * The override row's version (`ScaleTaskRequest.expected_version`); 0
+   * when no row exists.
+   *
+   * @generated from field: uint64 version = 16;
+   */
+  version = protoInt64.zero;
+
   constructor(data?: PartialMessage<TaskScaleStatus>) {
     super();
     proto3.util.initPartial(data, this);
@@ -4977,6 +5302,13 @@ export class TaskScaleStatus extends Message<TaskScaleStatus> {
     { no: 7, name: "source", kind: "scalar", T: 9 /* ScalarType.STRING */ },
     { no: 8, name: "reason", kind: "scalar", T: 9 /* ScalarType.STRING */ },
     { no: 9, name: "updated_at", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 10, name: "autoscaled", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
+    { no: 11, name: "policy_summary", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 12, name: "pin", kind: "message", T: ScalePin },
+    { no: 13, name: "pause", kind: "message", T: ScalingPauseInfo },
+    { no: 14, name: "last_evaluation_unix_ms", kind: "scalar", T: 3 /* ScalarType.INT64 */ },
+    { no: 15, name: "state", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 16, name: "version", kind: "scalar", T: 4 /* ScalarType.UINT64 */ },
   ]);
 
   static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): TaskScaleStatus {
@@ -4993,6 +5325,154 @@ export class TaskScaleStatus extends Message<TaskScaleStatus> {
 
   static equals(a: TaskScaleStatus | PlainMessage<TaskScaleStatus> | undefined, b: TaskScaleStatus | PlainMessage<TaskScaleStatus> | undefined): boolean {
     return proto3.util.equals(TaskScaleStatus, a, b);
+  }
+}
+
+/**
+ * A time-boxed pin on an autoscaled task (`legion job scale --for`).
+ * `min == max` pins the count.
+ *
+ * @generated from message legion.ScalePin
+ */
+export class ScalePin extends Message<ScalePin> {
+  /**
+   * When the pin ends, unix milliseconds.
+   *
+   * @generated from field: int64 until_unix_ms = 1;
+   */
+  untilUnixMs = protoInt64.zero;
+
+  /**
+   * The pinned floor, if any.
+   *
+   * @generated from field: optional uint32 min = 2;
+   */
+  min?: number;
+
+  /**
+   * The pinned ceiling, if any.
+   *
+   * @generated from field: optional uint32 max = 3;
+   */
+  max?: number;
+
+  /**
+   * Who pinned (the token's principal).
+   *
+   * @generated from field: string by = 4;
+   */
+  by = "";
+
+  /**
+   * The reason given.
+   *
+   * @generated from field: string reason = 5;
+   */
+  reason = "";
+
+  constructor(data?: PartialMessage<ScalePin>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.ScalePin";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "until_unix_ms", kind: "scalar", T: 3 /* ScalarType.INT64 */ },
+    { no: 2, name: "min", kind: "scalar", T: 13 /* ScalarType.UINT32 */, opt: true },
+    { no: 3, name: "max", kind: "scalar", T: 13 /* ScalarType.UINT32 */, opt: true },
+    { no: 4, name: "by", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 5, name: "reason", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): ScalePin {
+    return new ScalePin().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): ScalePin {
+    return new ScalePin().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): ScalePin {
+    return new ScalePin().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: ScalePin | PlainMessage<ScalePin> | undefined, b: ScalePin | PlainMessage<ScalePin> | undefined): boolean {
+    return proto3.util.equals(ScalePin, a, b);
+  }
+}
+
+/**
+ * A pause covering a target (`legion scaling pause`).
+ *
+ * @generated from message legion.ScalingPauseInfo
+ */
+export class ScalingPauseInfo extends Message<ScalingPauseInfo> {
+  /**
+   * What the pause covers: `all` (cluster-wide), `job`, or `task`.
+   *
+   * @generated from field: string scope = 1;
+   */
+  scope = "";
+
+  /**
+   * When the pause ends, unix milliseconds; unset holds until
+   * `legion scaling resume`.
+   *
+   * @generated from field: optional int64 until_unix_ms = 2;
+   */
+  untilUnixMs?: bigint;
+
+  /**
+   * Who paused.
+   *
+   * @generated from field: string by = 3;
+   */
+  by = "";
+
+  /**
+   * The reason given.
+   *
+   * @generated from field: string reason = 4;
+   */
+  reason = "";
+
+  /**
+   * When the pause was set, unix milliseconds.
+   *
+   * @generated from field: int64 since_unix_ms = 5;
+   */
+  sinceUnixMs = protoInt64.zero;
+
+  constructor(data?: PartialMessage<ScalingPauseInfo>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.ScalingPauseInfo";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "scope", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 2, name: "until_unix_ms", kind: "scalar", T: 3 /* ScalarType.INT64 */, opt: true },
+    { no: 3, name: "by", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 4, name: "reason", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 5, name: "since_unix_ms", kind: "scalar", T: 3 /* ScalarType.INT64 */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): ScalingPauseInfo {
+    return new ScalingPauseInfo().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): ScalingPauseInfo {
+    return new ScalingPauseInfo().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): ScalingPauseInfo {
+    return new ScalingPauseInfo().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: ScalingPauseInfo | PlainMessage<ScalingPauseInfo> | undefined, b: ScalingPauseInfo | PlainMessage<ScalingPauseInfo> | undefined): boolean {
+    return proto3.util.equals(ScalingPauseInfo, a, b);
   }
 }
 
@@ -5372,6 +5852,28 @@ export class ScalingInputs extends Message<ScalingInputs> {
    */
   history: ScalingInputsPoint[] = [];
 
+  /**
+   * The task's override row version, for a compare-and-set ScaleTask
+   * (`ScaleTaskRequest.expected_version`); 0 when no row exists.
+   *
+   * @generated from field: uint64 override_version = 17;
+   */
+  overrideVersion = protoInt64.zero;
+
+  /**
+   * The task's active pin, if any.
+   *
+   * @generated from field: legion.ScalePin pin = 18;
+   */
+  pin?: ScalePin;
+
+  /**
+   * The pause that covers the task, if any.
+   *
+   * @generated from field: legion.ScalingPauseInfo pause = 19;
+   */
+  pause?: ScalingPauseInfo;
+
   constructor(data?: PartialMessage<ScalingInputs>) {
     super();
     proto3.util.initPartial(data, this);
@@ -5396,6 +5898,9 @@ export class ScalingInputs extends Message<ScalingInputs> {
     { no: 14, name: "requests", kind: "message", T: ScalingRequestInputs, opt: true },
     { no: 15, name: "freshness", kind: "message", T: ScalingDataFreshness },
     { no: 16, name: "history", kind: "message", T: ScalingInputsPoint, repeated: true },
+    { no: 17, name: "override_version", kind: "scalar", T: 4 /* ScalarType.UINT64 */ },
+    { no: 18, name: "pin", kind: "message", T: ScalePin },
+    { no: 19, name: "pause", kind: "message", T: ScalingPauseInfo },
   ]);
 
   static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): ScalingInputs {
@@ -5943,6 +6448,1992 @@ export class ScalingInputsPoint extends Message<ScalingInputsPoint> {
 
   static equals(a: ScalingInputsPoint | PlainMessage<ScalingInputsPoint> | undefined, b: ScalingInputsPoint | PlainMessage<ScalingInputsPoint> | undefined): boolean {
     return proto3.util.equals(ScalingInputsPoint, a, b);
+  }
+}
+
+/**
+ * Request payload for WatchScalingPolicies.
+ *
+ * @generated from message legion.WatchScalingPoliciesRequest
+ */
+export class WatchScalingPoliciesRequest extends Message<WatchScalingPoliciesRequest> {
+  /**
+   * Namespaces to watch, as names or `*`-globs. Empty means every namespace
+   * the caller can read, which is what the autoscaler asks for. Jobs the
+   * caller lacks `scale:read` on are always left out.
+   *
+   * @generated from field: repeated string namespaces = 1;
+   */
+  namespaces: string[] = [];
+
+  constructor(data?: PartialMessage<WatchScalingPoliciesRequest>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.WatchScalingPoliciesRequest";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "namespaces", kind: "scalar", T: 9 /* ScalarType.STRING */, repeated: true },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): WatchScalingPoliciesRequest {
+    return new WatchScalingPoliciesRequest().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): WatchScalingPoliciesRequest {
+    return new WatchScalingPoliciesRequest().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): WatchScalingPoliciesRequest {
+    return new WatchScalingPoliciesRequest().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: WatchScalingPoliciesRequest | PlainMessage<WatchScalingPoliciesRequest> | undefined, b: WatchScalingPoliciesRequest | PlainMessage<WatchScalingPoliciesRequest> | undefined): boolean {
+    return proto3.util.equals(WatchScalingPoliciesRequest, a, b);
+  }
+}
+
+/**
+ * One message of WatchScalingPolicies: the complete set of effective task
+ * policies at one moment. Each message replaces the previous one.
+ *
+ * @generated from message legion.ScalingPolicySet
+ */
+export class ScalingPolicySet extends Message<ScalingPolicySet> {
+  /**
+   * Every autoscaled task of every running job in scope, sorted by job id,
+   * group, task.
+   *
+   * @generated from field: repeated legion.ScalingPolicy policies = 1;
+   */
+  policies: ScalingPolicy[] = [];
+
+  /**
+   * Increases by one with every message on this stream.
+   *
+   * @generated from field: uint64 generation = 2;
+   */
+  generation = protoInt64.zero;
+
+  /**
+   * When the set was resolved, unix milliseconds (the answering manager's
+   * clock).
+   *
+   * @generated from field: int64 resolved_at_unix_ms = 3;
+   */
+  resolvedAtUnixMs = protoInt64.zero;
+
+  /**
+   * The version of the cluster's scaling defaults the set was resolved
+   * against (0: none set).
+   *
+   * @generated from field: uint64 defaults_version = 4;
+   */
+  defaultsVersion = protoInt64.zero;
+
+  constructor(data?: PartialMessage<ScalingPolicySet>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.ScalingPolicySet";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "policies", kind: "message", T: ScalingPolicy, repeated: true },
+    { no: 2, name: "generation", kind: "scalar", T: 4 /* ScalarType.UINT64 */ },
+    { no: 3, name: "resolved_at_unix_ms", kind: "scalar", T: 3 /* ScalarType.INT64 */ },
+    { no: 4, name: "defaults_version", kind: "scalar", T: 4 /* ScalarType.UINT64 */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): ScalingPolicySet {
+    return new ScalingPolicySet().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): ScalingPolicySet {
+    return new ScalingPolicySet().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): ScalingPolicySet {
+    return new ScalingPolicySet().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: ScalingPolicySet | PlainMessage<ScalingPolicySet> | undefined, b: ScalingPolicySet | PlainMessage<ScalingPolicySet> | undefined): boolean {
+    return proto3.util.equals(ScalingPolicySet, a, b);
+  }
+}
+
+/**
+ * One autoscaled task's effective policy.
+ *
+ * The policy targets the task, or its whole group when the group has other
+ * tasks: then `members` lists every task of the group, all of which move to
+ * the same count in one ScaleTask write, and utilization is the group's
+ * summed usage over its summed reservations.
+ *
+ * @generated from message legion.ScalingPolicy
+ */
+export class ScalingPolicy extends Message<ScalingPolicy> {
+  /**
+   * Canonical job id.
+   *
+   * @generated from field: string job_id = 1;
+   */
+  jobId = "";
+
+  /**
+   * Task group.
+   *
+   * @generated from field: string task_group = 2;
+   */
+  taskGroup = "";
+
+  /**
+   * The task that carries `autoscale`.
+   *
+   * @generated from field: string task_name = 3;
+   */
+  taskName = "";
+
+  /**
+   * Every task the policy moves: just `task_name`, or every task of the
+   * group, in spec order.
+   *
+   * @generated from field: repeated string members = 4;
+   */
+  members: string[] = [];
+
+  /**
+   * The task's spec `count` (the default floor).
+   *
+   * @generated from field: uint32 count = 5;
+   */
+  count = 0;
+
+  /**
+   * `ok`, or `invalid` when the policy does not resolve against the
+   * current defaults (see `error`); an invalid policy is held, never acted
+   * on.
+   *
+   * @generated from field: string state = 6;
+   */
+  state = "";
+
+  /**
+   * Why the policy is invalid; empty when `state = "ok"`.
+   *
+   * @generated from field: string error = 7;
+   */
+  error = "";
+
+  /**
+   * The digest of the effective policy (hex SHA-256 of `policy_json`).
+   *
+   * @generated from field: string digest = 8;
+   */
+  digest = "";
+
+  /**
+   * The effective policy as canonical JSON: every default filled, every
+   * `"Nx"` bound resolved (`min`, `max`, `cpu`, `memory`, `checks`, `up`,
+   * `down`, `headroom`, `warmup`, `tolerance`, `window`, `schedule`,
+   * `onMissing`, `mode`). Empty when invalid.
+   *
+   * @generated from field: string policy_json = 9;
+   */
+  policyJson = "";
+
+  /**
+   * The policy in one line: `2..8, cpu 70%, enforce`.
+   *
+   * @generated from field: string summary = 10;
+   */
+  summary = "";
+
+  /**
+   * The task's runtime (whether it reports usage is the runtime's).
+   *
+   * @generated from field: string runtime = 11;
+   */
+  runtime = "";
+
+  constructor(data?: PartialMessage<ScalingPolicy>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.ScalingPolicy";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "job_id", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 2, name: "task_group", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 3, name: "task_name", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 4, name: "members", kind: "scalar", T: 9 /* ScalarType.STRING */, repeated: true },
+    { no: 5, name: "count", kind: "scalar", T: 13 /* ScalarType.UINT32 */ },
+    { no: 6, name: "state", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 7, name: "error", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 8, name: "digest", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 9, name: "policy_json", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 10, name: "summary", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 11, name: "runtime", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): ScalingPolicy {
+    return new ScalingPolicy().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): ScalingPolicy {
+    return new ScalingPolicy().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): ScalingPolicy {
+    return new ScalingPolicy().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: ScalingPolicy | PlainMessage<ScalingPolicy> | undefined, b: ScalingPolicy | PlainMessage<ScalingPolicy> | undefined): boolean {
+    return proto3.util.equals(ScalingPolicy, a, b);
+  }
+}
+
+/**
+ * Request payload for ApplyScalingDefaults.
+ *
+ * @generated from message legion.ApplyScalingDefaultsRequest
+ */
+export class ApplyScalingDefaultsRequest extends Message<ApplyScalingDefaultsRequest> {
+  /**
+   * The cluster-level record as JSON (the CLI evaluates a Nickel file to
+   * it): the jobspec `autoscale` record without `checks`, e.g.
+   * `{"cpu": 0.6, "max": "6x", "down": {"stabilize": "10m"}}`. `{}` clears
+   * every cluster default, so the built-ins apply.
+   *
+   * @generated from field: string defaults_json = 1;
+   */
+  defaultsJson = "";
+
+  /**
+   * Validate and report the effect on every inheriting policy; write
+   * nothing.
+   *
+   * @generated from field: bool dry_run = 2;
+   */
+  dryRun = false;
+
+  /**
+   * Apply even when some inheriting policies would become invalid; they
+   * are then held `invalid` until fixed.
+   *
+   * @generated from field: bool force = 3;
+   */
+  force = false;
+
+  /**
+   * Optional idempotency key. See `RunJobRequest.idempotency_key`.
+   *
+   * @generated from field: optional string idempotency_key = 4;
+   */
+  idempotencyKey?: string;
+
+  constructor(data?: PartialMessage<ApplyScalingDefaultsRequest>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.ApplyScalingDefaultsRequest";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "defaults_json", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 2, name: "dry_run", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
+    { no: 3, name: "force", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
+    { no: 4, name: "idempotency_key", kind: "scalar", T: 9 /* ScalarType.STRING */, opt: true },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): ApplyScalingDefaultsRequest {
+    return new ApplyScalingDefaultsRequest().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): ApplyScalingDefaultsRequest {
+    return new ApplyScalingDefaultsRequest().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): ApplyScalingDefaultsRequest {
+    return new ApplyScalingDefaultsRequest().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: ApplyScalingDefaultsRequest | PlainMessage<ApplyScalingDefaultsRequest> | undefined, b: ApplyScalingDefaultsRequest | PlainMessage<ApplyScalingDefaultsRequest> | undefined): boolean {
+    return proto3.util.equals(ApplyScalingDefaultsRequest, a, b);
+  }
+}
+
+/**
+ * Reply payload for ApplyScalingDefaults.
+ *
+ * @generated from message legion.ApplyScalingDefaultsReply
+ */
+export class ApplyScalingDefaultsReply extends Message<ApplyScalingDefaultsReply> {
+  /**
+   * Human-readable outcome:
+   * `scaling defaults: v3 applied; 4 policies changed, 0 invalid`.
+   *
+   * @generated from field: string message = 1;
+   */
+  message = "";
+
+  /**
+   * Whether the defaults were written (false for a dry run, an unchanged
+   * record, or a refusal reported as a dry run).
+   *
+   * @generated from field: bool applied = 2;
+   */
+  applied = false;
+
+  /**
+   * The defaults' version after the call.
+   *
+   * @generated from field: uint64 version = 3;
+   */
+  version = protoInt64.zero;
+
+  /**
+   * Every autoscaled task whose effective policy changes, or becomes
+   * invalid.
+   *
+   * @generated from field: repeated legion.ScalingPolicyChange changes = 4;
+   */
+  changes: ScalingPolicyChange[] = [];
+
+  /**
+   * How many of `changes` are invalid under the new defaults.
+   *
+   * @generated from field: uint32 invalid = 5;
+   */
+  invalid = 0;
+
+  /**
+   * True when replayed from a recorded result for the request's
+   * `idempotency_key` rather than applied fresh.
+   *
+   * @generated from field: bool deduplicated = 6;
+   */
+  deduplicated = false;
+
+  constructor(data?: PartialMessage<ApplyScalingDefaultsReply>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.ApplyScalingDefaultsReply";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "message", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 2, name: "applied", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
+    { no: 3, name: "version", kind: "scalar", T: 4 /* ScalarType.UINT64 */ },
+    { no: 4, name: "changes", kind: "message", T: ScalingPolicyChange, repeated: true },
+    { no: 5, name: "invalid", kind: "scalar", T: 13 /* ScalarType.UINT32 */ },
+    { no: 6, name: "deduplicated", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): ApplyScalingDefaultsReply {
+    return new ApplyScalingDefaultsReply().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): ApplyScalingDefaultsReply {
+    return new ApplyScalingDefaultsReply().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): ApplyScalingDefaultsReply {
+    return new ApplyScalingDefaultsReply().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: ApplyScalingDefaultsReply | PlainMessage<ApplyScalingDefaultsReply> | undefined, b: ApplyScalingDefaultsReply | PlainMessage<ApplyScalingDefaultsReply> | undefined): boolean {
+    return proto3.util.equals(ApplyScalingDefaultsReply, a, b);
+  }
+}
+
+/**
+ * How one task's effective policy changes under new defaults.
+ *
+ * @generated from message legion.ScalingPolicyChange
+ */
+export class ScalingPolicyChange extends Message<ScalingPolicyChange> {
+  /**
+   * `job/group/task`.
+   *
+   * @generated from field: string target = 1;
+   */
+  target = "";
+
+  /**
+   * The effective policy's digest before the change (empty if it was
+   * already invalid).
+   *
+   * @generated from field: string before_digest = 2;
+   */
+  beforeDigest = "";
+
+  /**
+   * The digest after (empty if it becomes invalid).
+   *
+   * @generated from field: string after_digest = 3;
+   */
+  afterDigest = "";
+
+  /**
+   * Why it becomes invalid; empty when it stays valid.
+   *
+   * @generated from field: string error = 4;
+   */
+  error = "";
+
+  /**
+   * The field paths whose effective value changes (`max`, `down.stabilize`).
+   *
+   * @generated from field: repeated string fields = 5;
+   */
+  fields: string[] = [];
+
+  constructor(data?: PartialMessage<ScalingPolicyChange>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.ScalingPolicyChange";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "target", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 2, name: "before_digest", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 3, name: "after_digest", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 4, name: "error", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 5, name: "fields", kind: "scalar", T: 9 /* ScalarType.STRING */, repeated: true },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): ScalingPolicyChange {
+    return new ScalingPolicyChange().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): ScalingPolicyChange {
+    return new ScalingPolicyChange().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): ScalingPolicyChange {
+    return new ScalingPolicyChange().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: ScalingPolicyChange | PlainMessage<ScalingPolicyChange> | undefined, b: ScalingPolicyChange | PlainMessage<ScalingPolicyChange> | undefined): boolean {
+    return proto3.util.equals(ScalingPolicyChange, a, b);
+  }
+}
+
+/**
+ * Request payload for GetScalingDefaults.
+ *
+ * @generated from message legion.GetScalingDefaultsRequest
+ */
+export class GetScalingDefaultsRequest extends Message<GetScalingDefaultsRequest> {
+  /**
+   * The namespace whose effective defaults to report. Empty means `default`.
+   *
+   * @generated from field: string namespace = 1;
+   */
+  namespace = "";
+
+  constructor(data?: PartialMessage<GetScalingDefaultsRequest>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.GetScalingDefaultsRequest";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "namespace", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): GetScalingDefaultsRequest {
+    return new GetScalingDefaultsRequest().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): GetScalingDefaultsRequest {
+    return new GetScalingDefaultsRequest().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): GetScalingDefaultsRequest {
+    return new GetScalingDefaultsRequest().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: GetScalingDefaultsRequest | PlainMessage<GetScalingDefaultsRequest> | undefined, b: GetScalingDefaultsRequest | PlainMessage<GetScalingDefaultsRequest> | undefined): boolean {
+    return proto3.util.equals(GetScalingDefaultsRequest, a, b);
+  }
+}
+
+/**
+ * Reply payload for GetScalingDefaults.
+ *
+ * @generated from message legion.GetScalingDefaultsReply
+ */
+export class GetScalingDefaultsReply extends Message<GetScalingDefaultsReply> {
+  /**
+   * The cluster-level record as written (JSON); `{}` when none is set.
+   *
+   * @generated from field: string cluster_json = 1;
+   */
+  clusterJson = "";
+
+  /**
+   * The cluster defaults' version; 0 when none was ever applied.
+   *
+   * @generated from field: uint64 version = 2;
+   */
+  version = protoInt64.zero;
+
+  /**
+   * Who applied the current cluster defaults.
+   *
+   * @generated from field: string updated_by = 3;
+   */
+  updatedBy = "";
+
+  /**
+   * When, RFC 3339.
+   *
+   * @generated from field: string updated_at = 4;
+   */
+  updatedAt = "";
+
+  /**
+   * The namespace the effective rows are for.
+   *
+   * @generated from field: string namespace = 5;
+   */
+  namespace = "";
+
+  /**
+   * The effective defaults for `namespace`, one row per field, with the
+   * level each value came from. Bounds are shown as written (`"1x"`).
+   *
+   * @generated from field: repeated legion.ScalingProvenanceRow effective = 6;
+   */
+  effective: ScalingProvenanceRow[] = [];
+
+  /**
+   * Set when the namespace's defaults do not resolve: two namespace
+   * policies set one field differently. `effective` is then empty.
+   *
+   * @generated from field: string error = 7;
+   */
+  error = "";
+
+  /**
+   * The namespace policies governing `namespace` that set `autoscale`.
+   *
+   * @generated from field: repeated string policies = 8;
+   */
+  policies: string[] = [];
+
+  constructor(data?: PartialMessage<GetScalingDefaultsReply>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.GetScalingDefaultsReply";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "cluster_json", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 2, name: "version", kind: "scalar", T: 4 /* ScalarType.UINT64 */ },
+    { no: 3, name: "updated_by", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 4, name: "updated_at", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 5, name: "namespace", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 6, name: "effective", kind: "message", T: ScalingProvenanceRow, repeated: true },
+    { no: 7, name: "error", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 8, name: "policies", kind: "scalar", T: 9 /* ScalarType.STRING */, repeated: true },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): GetScalingDefaultsReply {
+    return new GetScalingDefaultsReply().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): GetScalingDefaultsReply {
+    return new GetScalingDefaultsReply().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): GetScalingDefaultsReply {
+    return new GetScalingDefaultsReply().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: GetScalingDefaultsReply | PlainMessage<GetScalingDefaultsReply> | undefined, b: GetScalingDefaultsReply | PlainMessage<GetScalingDefaultsReply> | undefined): boolean {
+    return proto3.util.equals(GetScalingDefaultsReply, a, b);
+  }
+}
+
+/**
+ * One field of an effective policy or defaults, and where it came from.
+ *
+ * @generated from message legion.ScalingProvenanceRow
+ */
+export class ScalingProvenanceRow extends Message<ScalingProvenanceRow> {
+  /**
+   * The field path (`min`, `cpu`, `down.step`, `onMissing`).
+   *
+   * @generated from field: string field = 1;
+   */
+  field = "";
+
+  /**
+   * The effective value, for people (`4 ("1x" of count 4)`, `10m`).
+   *
+   * @generated from field: string value = 2;
+   */
+  value = "";
+
+  /**
+   * `built-in`, `cluster defaults`, `namespace policy <name>`, or
+   * `jobspec`.
+   *
+   * @generated from field: string origin = 3;
+   */
+  origin = "";
+
+  constructor(data?: PartialMessage<ScalingProvenanceRow>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.ScalingProvenanceRow";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "field", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 2, name: "value", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 3, name: "origin", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): ScalingProvenanceRow {
+    return new ScalingProvenanceRow().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): ScalingProvenanceRow {
+    return new ScalingProvenanceRow().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): ScalingProvenanceRow {
+    return new ScalingProvenanceRow().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: ScalingProvenanceRow | PlainMessage<ScalingProvenanceRow> | undefined, b: ScalingProvenanceRow | PlainMessage<ScalingProvenanceRow> | undefined): boolean {
+    return proto3.util.equals(ScalingProvenanceRow, a, b);
+  }
+}
+
+/**
+ * Request payload for ReportScalingStatus.
+ *
+ * @generated from message legion.ReportScalingStatusRequest
+ */
+export class ReportScalingStatusRequest extends Message<ReportScalingStatusRequest> {
+  /**
+   * The reporting app instance (its allocation id, or a name), shown by
+   * `legion scaling status`.
+   *
+   * @generated from field: string instance = 1;
+   */
+  instance = "";
+
+  /**
+   * The app's evaluation interval in seconds. The app counts as NOT
+   * RUNNING once no report has arrived for three intervals.
+   *
+   * @generated from field: uint32 interval_seconds = 2;
+   */
+  intervalSeconds = 0;
+
+  /**
+   * The app-wide mode: `enforce`, or `dry-run` when the app's config forces
+   * every policy to dry-run.
+   *
+   * @generated from field: string mode = 3;
+   */
+  mode = "";
+
+  /**
+   * The last evaluation of every target the app evaluated this tick.
+   *
+   * @generated from field: repeated legion.ScalingTargetReport targets = 4;
+   */
+  targets: ScalingTargetReport[] = [];
+
+  /**
+   * The app's build (its `legion` version).
+   *
+   * @generated from field: string version = 5;
+   */
+  version = "";
+
+  constructor(data?: PartialMessage<ReportScalingStatusRequest>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.ReportScalingStatusRequest";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "instance", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 2, name: "interval_seconds", kind: "scalar", T: 13 /* ScalarType.UINT32 */ },
+    { no: 3, name: "mode", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 4, name: "targets", kind: "message", T: ScalingTargetReport, repeated: true },
+    { no: 5, name: "version", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): ReportScalingStatusRequest {
+    return new ReportScalingStatusRequest().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): ReportScalingStatusRequest {
+    return new ReportScalingStatusRequest().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): ReportScalingStatusRequest {
+    return new ReportScalingStatusRequest().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: ReportScalingStatusRequest | PlainMessage<ReportScalingStatusRequest> | undefined, b: ReportScalingStatusRequest | PlainMessage<ReportScalingStatusRequest> | undefined): boolean {
+    return proto3.util.equals(ReportScalingStatusRequest, a, b);
+  }
+}
+
+/**
+ * The autoscaler's last evaluation of one target.
+ *
+ * @generated from message legion.ScalingTargetReport
+ */
+export class ScalingTargetReport extends Message<ScalingTargetReport> {
+  /**
+   * Canonical job id.
+   *
+   * @generated from field: string job_id = 1;
+   */
+  jobId = "";
+
+  /**
+   * Task group.
+   *
+   * @generated from field: string task_group = 2;
+   */
+  taskGroup = "";
+
+  /**
+   * The task that carries `autoscale`.
+   *
+   * @generated from field: string task_name = 3;
+   */
+  taskName = "";
+
+  /**
+   * The outcome in one word:
+   * - `ok`: the count is where the policy wants it;
+   * - `scaled`: this evaluation changed the count;
+   * - `held`: a safeguard held a change back (the summary says which);
+   * - `limited`: a bound, quota, or capacity limited the count;
+   * - `deferred`: a scale-in waits for a rollout;
+   * - `pinned`, `paused`: an operator holds the target;
+   * - `dry-run`: the policy would have changed the count;
+   * - `missing-data`: no check has data;
+   * - `invalid`: the policy does not resolve;
+   * - `error`: the evaluation or write failed (the summary says why).
+   *
+   * @generated from field: string state = 4;
+   */
+  state = "";
+
+  /**
+   * The count when evaluated.
+   *
+   * @generated from field: uint32 current = 5;
+   */
+  current = 0;
+
+  /**
+   * The count the policy wants after every safeguard.
+   *
+   * @generated from field: uint32 want = 6;
+   */
+  want = 0;
+
+  /**
+   * When evaluated, unix milliseconds.
+   *
+   * @generated from field: int64 evaluated_at_unix_ms = 7;
+   */
+  evaluatedAtUnixMs = protoInt64.zero;
+
+  /**
+   * The one-line why.
+   *
+   * @generated from field: string summary = 8;
+   */
+  summary = "";
+
+  /**
+   * The full decision (JSON: checks and stages). Empty when it is
+   * unchanged since the previous report; the manager keeps the last one.
+   *
+   * @generated from field: string decision_json = 9;
+   */
+  decisionJson = "";
+
+  /**
+   * The digest of the effective policy evaluated.
+   *
+   * @generated from field: string policy_digest = 10;
+   */
+  policyDigest = "";
+
+  /**
+   * State changes worth an event, at most one of each kind per episode.
+   *
+   * @generated from field: repeated legion.ScalingEventFlag events = 11;
+   */
+  events: ScalingEventFlag[] = [];
+
+  constructor(data?: PartialMessage<ScalingTargetReport>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.ScalingTargetReport";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "job_id", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 2, name: "task_group", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 3, name: "task_name", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 4, name: "state", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 5, name: "current", kind: "scalar", T: 13 /* ScalarType.UINT32 */ },
+    { no: 6, name: "want", kind: "scalar", T: 13 /* ScalarType.UINT32 */ },
+    { no: 7, name: "evaluated_at_unix_ms", kind: "scalar", T: 3 /* ScalarType.INT64 */ },
+    { no: 8, name: "summary", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 9, name: "decision_json", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 10, name: "policy_digest", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 11, name: "events", kind: "message", T: ScalingEventFlag, repeated: true },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): ScalingTargetReport {
+    return new ScalingTargetReport().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): ScalingTargetReport {
+    return new ScalingTargetReport().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): ScalingTargetReport {
+    return new ScalingTargetReport().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: ScalingTargetReport | PlainMessage<ScalingTargetReport> | undefined, b: ScalingTargetReport | PlainMessage<ScalingTargetReport> | undefined): boolean {
+    return proto3.util.equals(ScalingTargetReport, a, b);
+  }
+}
+
+/**
+ * A state change the autoscaler reports for the manager to record as an
+ * event.
+ *
+ * @generated from message legion.ScalingEventFlag
+ */
+export class ScalingEventFlag extends Message<ScalingEventFlag> {
+  /**
+   * `limited` (`scale.limited`), `flapping` (`scale.flapping`), or
+   * `check_failed` (`scale.check_failed`).
+   *
+   * @generated from field: string kind = 1;
+   */
+  kind = "";
+
+  /**
+   * What happened, for people.
+   *
+   * @generated from field: string message = 2;
+   */
+  message = "";
+
+  constructor(data?: PartialMessage<ScalingEventFlag>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.ScalingEventFlag";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "kind", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 2, name: "message", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): ScalingEventFlag {
+    return new ScalingEventFlag().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): ScalingEventFlag {
+    return new ScalingEventFlag().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): ScalingEventFlag {
+    return new ScalingEventFlag().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: ScalingEventFlag | PlainMessage<ScalingEventFlag> | undefined, b: ScalingEventFlag | PlainMessage<ScalingEventFlag> | undefined): boolean {
+    return proto3.util.equals(ScalingEventFlag, a, b);
+  }
+}
+
+/**
+ * Reply payload for ReportScalingStatus.
+ *
+ * @generated from message legion.ReportScalingStatusReply
+ */
+export class ReportScalingStatusReply extends Message<ReportScalingStatusReply> {
+  /**
+   * Targets accepted.
+   *
+   * @generated from field: uint32 accepted = 1;
+   */
+  accepted = 0;
+
+  /**
+   * The manager that holds the report (raft node id, or `local`).
+   *
+   * @generated from field: string served_by = 2;
+   */
+  servedBy = "";
+
+  constructor(data?: PartialMessage<ReportScalingStatusReply>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.ReportScalingStatusReply";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "accepted", kind: "scalar", T: 13 /* ScalarType.UINT32 */ },
+    { no: 2, name: "served_by", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): ReportScalingStatusReply {
+    return new ReportScalingStatusReply().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): ReportScalingStatusReply {
+    return new ReportScalingStatusReply().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): ReportScalingStatusReply {
+    return new ReportScalingStatusReply().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: ReportScalingStatusReply | PlainMessage<ReportScalingStatusReply> | undefined, b: ReportScalingStatusReply | PlainMessage<ReportScalingStatusReply> | undefined): boolean {
+    return proto3.util.equals(ReportScalingStatusReply, a, b);
+  }
+}
+
+/**
+ * Request payload for RecordScalingAction.
+ *
+ * @generated from message legion.RecordScalingActionRequest
+ */
+export class RecordScalingActionRequest extends Message<RecordScalingActionRequest> {
+  /**
+   * Canonical job id.
+   *
+   * @generated from field: string job_id = 1;
+   */
+  jobId = "";
+
+  /**
+   * Task group.
+   *
+   * @generated from field: string task_group = 2;
+   */
+  taskGroup = "";
+
+  /**
+   * Task name.
+   *
+   * @generated from field: string task_name = 3;
+   */
+  taskName = "";
+
+  /**
+   * The action: `would` (a dry-run policy's decision). Other kinds are
+   * refused.
+   *
+   * @generated from field: string kind = 4;
+   */
+  kind = "";
+
+  /**
+   * The count when decided.
+   *
+   * @generated from field: uint32 from = 5;
+   */
+  from = 0;
+
+  /**
+   * The count the policy would have written.
+   *
+   * @generated from field: uint32 to = 6;
+   */
+  to = 0;
+
+  /**
+   * The decision.
+   *
+   * @generated from field: legion.ScaleDecision decision = 7;
+   */
+  decision?: ScaleDecision;
+
+  constructor(data?: PartialMessage<RecordScalingActionRequest>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.RecordScalingActionRequest";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "job_id", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 2, name: "task_group", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 3, name: "task_name", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 4, name: "kind", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 5, name: "from", kind: "scalar", T: 13 /* ScalarType.UINT32 */ },
+    { no: 6, name: "to", kind: "scalar", T: 13 /* ScalarType.UINT32 */ },
+    { no: 7, name: "decision", kind: "message", T: ScaleDecision },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): RecordScalingActionRequest {
+    return new RecordScalingActionRequest().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): RecordScalingActionRequest {
+    return new RecordScalingActionRequest().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): RecordScalingActionRequest {
+    return new RecordScalingActionRequest().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: RecordScalingActionRequest | PlainMessage<RecordScalingActionRequest> | undefined, b: RecordScalingActionRequest | PlainMessage<RecordScalingActionRequest> | undefined): boolean {
+    return proto3.util.equals(RecordScalingActionRequest, a, b);
+  }
+}
+
+/**
+ * Reply payload for RecordScalingAction.
+ *
+ * @generated from message legion.RecordScalingActionReply
+ */
+export class RecordScalingActionReply extends Message<RecordScalingActionReply> {
+  /**
+   * The history row written.
+   *
+   * @generated from field: uint64 history_id = 1;
+   */
+  historyId = protoInt64.zero;
+
+  constructor(data?: PartialMessage<RecordScalingActionReply>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.RecordScalingActionReply";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "history_id", kind: "scalar", T: 4 /* ScalarType.UINT64 */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): RecordScalingActionReply {
+    return new RecordScalingActionReply().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): RecordScalingActionReply {
+    return new RecordScalingActionReply().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): RecordScalingActionReply {
+    return new RecordScalingActionReply().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: RecordScalingActionReply | PlainMessage<RecordScalingActionReply> | undefined, b: RecordScalingActionReply | PlainMessage<RecordScalingActionReply> | undefined): boolean {
+    return proto3.util.equals(RecordScalingActionReply, a, b);
+  }
+}
+
+/**
+ * Request payload for GetScalingStatus.
+ *
+ * @generated from message legion.GetScalingStatusRequest
+ */
+export class GetScalingStatusRequest extends Message<GetScalingStatusRequest> {
+  /**
+   * Namespaces to list, as names or `*`-globs. Empty means `default`
+   * (or the namespace of `job`, when set).
+   *
+   * @generated from field: repeated string namespaces = 1;
+   */
+  namespaces: string[] = [];
+
+  /**
+   * Only this job's targets.
+   *
+   * @generated from field: string job = 2;
+   */
+  job = "";
+
+  /**
+   * With `job`: only targets in this group.
+   *
+   * @generated from field: optional string task_group = 3;
+   */
+  taskGroup?: string;
+
+  /**
+   * With `job`: only this task's target.
+   *
+   * @generated from field: optional string task_name = 4;
+   */
+  taskName?: string;
+
+  /**
+   * Include each target's full last decision and its effective policy with
+   * provenance (`legion scaling explain`).
+   *
+   * @generated from field: bool detail = 5;
+   */
+  detail = false;
+
+  constructor(data?: PartialMessage<GetScalingStatusRequest>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.GetScalingStatusRequest";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "namespaces", kind: "scalar", T: 9 /* ScalarType.STRING */, repeated: true },
+    { no: 2, name: "job", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 3, name: "task_group", kind: "scalar", T: 9 /* ScalarType.STRING */, opt: true },
+    { no: 4, name: "task_name", kind: "scalar", T: 9 /* ScalarType.STRING */, opt: true },
+    { no: 5, name: "detail", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): GetScalingStatusRequest {
+    return new GetScalingStatusRequest().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): GetScalingStatusRequest {
+    return new GetScalingStatusRequest().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): GetScalingStatusRequest {
+    return new GetScalingStatusRequest().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: GetScalingStatusRequest | PlainMessage<GetScalingStatusRequest> | undefined, b: GetScalingStatusRequest | PlainMessage<GetScalingStatusRequest> | undefined): boolean {
+    return proto3.util.equals(GetScalingStatusRequest, a, b);
+  }
+}
+
+/**
+ * Reply payload for GetScalingStatus.
+ *
+ * @generated from message legion.GetScalingStatusReply
+ */
+export class GetScalingStatusReply extends Message<GetScalingStatusReply> {
+  /**
+   * The autoscaler app, as the reports show it.
+   *
+   * @generated from field: legion.ScalingAppStatus app = 1;
+   */
+  app?: ScalingAppStatus;
+
+  /**
+   * One entry per autoscaled task in scope, sorted by job, group, task.
+   *
+   * @generated from field: repeated legion.ScalingTargetStatus targets = 2;
+   */
+  targets: ScalingTargetStatus[] = [];
+
+  constructor(data?: PartialMessage<GetScalingStatusReply>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.GetScalingStatusReply";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "app", kind: "message", T: ScalingAppStatus },
+    { no: 2, name: "targets", kind: "message", T: ScalingTargetStatus, repeated: true },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): GetScalingStatusReply {
+    return new GetScalingStatusReply().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): GetScalingStatusReply {
+    return new GetScalingStatusReply().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): GetScalingStatusReply {
+    return new GetScalingStatusReply().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: GetScalingStatusReply | PlainMessage<GetScalingStatusReply> | undefined, b: GetScalingStatusReply | PlainMessage<GetScalingStatusReply> | undefined): boolean {
+    return proto3.util.equals(GetScalingStatusReply, a, b);
+  }
+}
+
+/**
+ * Whether the autoscaler is running.
+ *
+ * @generated from message legion.ScalingAppStatus
+ */
+export class ScalingAppStatus extends Message<ScalingAppStatus> {
+  /**
+   * - `running`: a report arrived within three of the app's intervals;
+   * - `not-running`: none did (`message` says since when, and what the
+   *   app's job is doing);
+   * - `starting`: the answering manager took the status lane too recently
+   *   to tell;
+   * - `disabled`: the app is disabled (`legion app disable autoscaler`).
+   *
+   * @generated from field: string state = 1;
+   */
+  state = "";
+
+  /**
+   * For people: `running 1/1 (alloc 42), last evaluation 3s ago`, or
+   * `NOT RUNNING since 14:05 UTC (app job legion-system/autoscaler pending:
+   * no node in pool legion-system)`.
+   *
+   * @generated from field: string message = 2;
+   */
+  message = "";
+
+  /**
+   * When the last report arrived, unix milliseconds; 0 for none.
+   *
+   * @generated from field: int64 last_report_unix_ms = 3;
+   */
+  lastReportUnixMs = protoInt64.zero;
+
+  /**
+   * The app's reported interval, seconds.
+   *
+   * @generated from field: uint32 interval_seconds = 4;
+   */
+  intervalSeconds = 0;
+
+  /**
+   * The reporting instance.
+   *
+   * @generated from field: string instance = 5;
+   */
+  instance = "";
+
+  /**
+   * The app-wide mode it reported.
+   *
+   * @generated from field: string mode = 6;
+   */
+  mode = "";
+
+  /**
+   * The manager that answered (the status-lane leader).
+   *
+   * @generated from field: string served_by = 7;
+   */
+  servedBy = "";
+
+  /**
+   * The cluster-wide pause, if one is active.
+   *
+   * @generated from field: legion.ScalingPauseInfo paused_all = 8;
+   */
+  pausedAll?: ScalingPauseInfo;
+
+  constructor(data?: PartialMessage<ScalingAppStatus>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.ScalingAppStatus";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "state", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 2, name: "message", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 3, name: "last_report_unix_ms", kind: "scalar", T: 3 /* ScalarType.INT64 */ },
+    { no: 4, name: "interval_seconds", kind: "scalar", T: 13 /* ScalarType.UINT32 */ },
+    { no: 5, name: "instance", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 6, name: "mode", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 7, name: "served_by", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 8, name: "paused_all", kind: "message", T: ScalingPauseInfo },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): ScalingAppStatus {
+    return new ScalingAppStatus().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): ScalingAppStatus {
+    return new ScalingAppStatus().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): ScalingAppStatus {
+    return new ScalingAppStatus().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: ScalingAppStatus | PlainMessage<ScalingAppStatus> | undefined, b: ScalingAppStatus | PlainMessage<ScalingAppStatus> | undefined): boolean {
+    return proto3.util.equals(ScalingAppStatus, a, b);
+  }
+}
+
+/**
+ * One autoscaled task's live state.
+ *
+ * @generated from message legion.ScalingTargetStatus
+ */
+export class ScalingTargetStatus extends Message<ScalingTargetStatus> {
+  /**
+   * Canonical job id.
+   *
+   * @generated from field: string job_id = 1;
+   */
+  jobId = "";
+
+  /**
+   * Task group.
+   *
+   * @generated from field: string task_group = 2;
+   */
+  taskGroup = "";
+
+  /**
+   * The task that carries `autoscale`.
+   *
+   * @generated from field: string task_name = 3;
+   */
+  taskName = "";
+
+  /**
+   * Every task the policy moves (see `ScalingPolicy.members`).
+   *
+   * @generated from field: repeated string members = 4;
+   */
+  members: string[] = [];
+
+  /**
+   * The effective mode: `enforce` or `dry-run`.
+   *
+   * @generated from field: string mode = 5;
+   */
+  mode = "";
+
+  /**
+   * The effective count now.
+   *
+   * @generated from field: uint32 now = 6;
+   */
+  now = 0;
+
+  /**
+   * What the autoscaler wanted at its last evaluation (= `now` when it held
+   * or has not evaluated).
+   *
+   * @generated from field: uint32 want = 7;
+   */
+  want = 0;
+
+  /**
+   * The effective floor.
+   *
+   * @generated from field: uint32 min = 8;
+   */
+  min = 0;
+
+  /**
+   * The effective ceiling.
+   *
+   * @generated from field: uint32 max = 9;
+   */
+  max = 0;
+
+  /**
+   * The last evaluation's state (see `ScalingTargetReport.state`), or:
+   * `stale` when the last evaluation is older than three of the app's
+   * intervals, `not-evaluated` when there is none, `invalid` when the policy
+   * does not resolve.
+   *
+   * @generated from field: string state = 10;
+   */
+  state = "";
+
+  /**
+   * When last evaluated, unix milliseconds; 0 for never.
+   *
+   * @generated from field: int64 last_evaluation_unix_ms = 11;
+   */
+  lastEvaluationUnixMs = protoInt64.zero;
+
+  /**
+   * The last evaluation's one-line why.
+   *
+   * @generated from field: string summary = 12;
+   */
+  summary = "";
+
+  /**
+   * The newest scale-history row, if any.
+   *
+   * @generated from field: legion.ScaleHistoryEntry last_change = 13;
+   */
+  lastChange?: ScaleHistoryEntry;
+
+  /**
+   * The active pin, if any.
+   *
+   * @generated from field: legion.ScalePin pin = 14;
+   */
+  pin?: ScalePin;
+
+  /**
+   * The pause covering the target, if any.
+   *
+   * @generated from field: legion.ScalingPauseInfo pause = 15;
+   */
+  pause?: ScalingPauseInfo;
+
+  /**
+   * The effective policy's digest.
+   *
+   * @generated from field: string policy_digest = 16;
+   */
+  policyDigest = "";
+
+  /**
+   * Why the policy is invalid, when it is.
+   *
+   * @generated from field: string error = 17;
+   */
+  error = "";
+
+  /**
+   * With `detail`: the last evaluation's full decision (JSON).
+   *
+   * @generated from field: string decision_json = 18;
+   */
+  decisionJson = "";
+
+  /**
+   * With `detail`: the effective policy, field by field, with origins.
+   *
+   * @generated from field: repeated legion.ScalingProvenanceRow policy = 19;
+   */
+  policy: ScalingProvenanceRow[] = [];
+
+  /**
+   * With `detail`: the effective policy as JSON.
+   *
+   * @generated from field: string policy_json = 20;
+   */
+  policyJson = "";
+
+  /**
+   * The override row's version.
+   *
+   * @generated from field: uint64 version = 21;
+   */
+  version = protoInt64.zero;
+
+  /**
+   * The policy in one line (`2..8, cpu 70%, enforce`).
+   *
+   * @generated from field: string policy_summary = 22;
+   */
+  policySummary = "";
+
+  constructor(data?: PartialMessage<ScalingTargetStatus>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.ScalingTargetStatus";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "job_id", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 2, name: "task_group", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 3, name: "task_name", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 4, name: "members", kind: "scalar", T: 9 /* ScalarType.STRING */, repeated: true },
+    { no: 5, name: "mode", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 6, name: "now", kind: "scalar", T: 13 /* ScalarType.UINT32 */ },
+    { no: 7, name: "want", kind: "scalar", T: 13 /* ScalarType.UINT32 */ },
+    { no: 8, name: "min", kind: "scalar", T: 13 /* ScalarType.UINT32 */ },
+    { no: 9, name: "max", kind: "scalar", T: 13 /* ScalarType.UINT32 */ },
+    { no: 10, name: "state", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 11, name: "last_evaluation_unix_ms", kind: "scalar", T: 3 /* ScalarType.INT64 */ },
+    { no: 12, name: "summary", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 13, name: "last_change", kind: "message", T: ScaleHistoryEntry },
+    { no: 14, name: "pin", kind: "message", T: ScalePin },
+    { no: 15, name: "pause", kind: "message", T: ScalingPauseInfo },
+    { no: 16, name: "policy_digest", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 17, name: "error", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 18, name: "decision_json", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 19, name: "policy", kind: "message", T: ScalingProvenanceRow, repeated: true },
+    { no: 20, name: "policy_json", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 21, name: "version", kind: "scalar", T: 4 /* ScalarType.UINT64 */ },
+    { no: 22, name: "policy_summary", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): ScalingTargetStatus {
+    return new ScalingTargetStatus().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): ScalingTargetStatus {
+    return new ScalingTargetStatus().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): ScalingTargetStatus {
+    return new ScalingTargetStatus().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: ScalingTargetStatus | PlainMessage<ScalingTargetStatus> | undefined, b: ScalingTargetStatus | PlainMessage<ScalingTargetStatus> | undefined): boolean {
+    return proto3.util.equals(ScalingTargetStatus, a, b);
+  }
+}
+
+/**
+ * Request payload for GetScaleHistory.
+ *
+ * @generated from message legion.GetScaleHistoryRequest
+ */
+export class GetScaleHistoryRequest extends Message<GetScaleHistoryRequest> {
+  /**
+   * Job name.
+   *
+   * @generated from field: string job = 1;
+   */
+  job = "";
+
+  /**
+   * Only rows for tasks in this group.
+   *
+   * @generated from field: optional string task_group = 2;
+   */
+  taskGroup?: string;
+
+  /**
+   * Only rows for this task.
+   *
+   * @generated from field: optional string task_name = 3;
+   */
+  taskName?: string;
+
+  /**
+   * At most this many rows, newest first. 0 means 50; at most 1000.
+   *
+   * @generated from field: uint32 limit = 4;
+   */
+  limit = 0;
+
+  /**
+   * Include each row's full decision and the effective policy its digest
+   * resolves to.
+   *
+   * @generated from field: bool detail = 5;
+   */
+  detail = false;
+
+  constructor(data?: PartialMessage<GetScaleHistoryRequest>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.GetScaleHistoryRequest";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "job", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 2, name: "task_group", kind: "scalar", T: 9 /* ScalarType.STRING */, opt: true },
+    { no: 3, name: "task_name", kind: "scalar", T: 9 /* ScalarType.STRING */, opt: true },
+    { no: 4, name: "limit", kind: "scalar", T: 13 /* ScalarType.UINT32 */ },
+    { no: 5, name: "detail", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): GetScaleHistoryRequest {
+    return new GetScaleHistoryRequest().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): GetScaleHistoryRequest {
+    return new GetScaleHistoryRequest().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): GetScaleHistoryRequest {
+    return new GetScaleHistoryRequest().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: GetScaleHistoryRequest | PlainMessage<GetScaleHistoryRequest> | undefined, b: GetScaleHistoryRequest | PlainMessage<GetScaleHistoryRequest> | undefined): boolean {
+    return proto3.util.equals(GetScaleHistoryRequest, a, b);
+  }
+}
+
+/**
+ * Reply payload for GetScaleHistory.
+ *
+ * @generated from message legion.GetScaleHistoryReply
+ */
+export class GetScaleHistoryReply extends Message<GetScaleHistoryReply> {
+  /**
+   * Newest first.
+   *
+   * @generated from field: repeated legion.ScaleHistoryEntry entries = 1;
+   */
+  entries: ScaleHistoryEntry[] = [];
+
+  constructor(data?: PartialMessage<GetScaleHistoryReply>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.GetScaleHistoryReply";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "entries", kind: "message", T: ScaleHistoryEntry, repeated: true },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): GetScaleHistoryReply {
+    return new GetScaleHistoryReply().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): GetScaleHistoryReply {
+    return new GetScaleHistoryReply().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): GetScaleHistoryReply {
+    return new GetScaleHistoryReply().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: GetScaleHistoryReply | PlainMessage<GetScaleHistoryReply> | undefined, b: GetScaleHistoryReply | PlainMessage<GetScaleHistoryReply> | undefined): boolean {
+    return proto3.util.equals(GetScaleHistoryReply, a, b);
+  }
+}
+
+/**
+ * One durable scaling record.
+ *
+ * @generated from message legion.ScaleHistoryEntry
+ */
+export class ScaleHistoryEntry extends Message<ScaleHistoryEntry> {
+  /**
+   * Row id, increasing.
+   *
+   * @generated from field: uint64 id = 1;
+   */
+  id = protoInt64.zero;
+
+  /**
+   * Canonical job id.
+   *
+   * @generated from field: string job_id = 2;
+   */
+  jobId = "";
+
+  /**
+   * Task group.
+   *
+   * @generated from field: string task_group = 3;
+   */
+  taskGroup = "";
+
+  /**
+   * Task name.
+   *
+   * @generated from field: string task_name = 4;
+   */
+  taskName = "";
+
+  /**
+   * When, unix milliseconds.
+   *
+   * @generated from field: int64 at_unix_ms = 5;
+   */
+  atUnixMs = protoInt64.zero;
+
+  /**
+   * The count before.
+   *
+   * @generated from field: uint32 from = 6;
+   */
+  from = 0;
+
+  /**
+   * The count after (or the count a `would` row wanted).
+   *
+   * @generated from field: uint32 to = 7;
+   */
+  to = 0;
+
+  /**
+   * `operator`, `autoscaler`, or `wake`.
+   *
+   * @generated from field: string source = 8;
+   */
+  source = "";
+
+  /**
+   * Who wrote it (the token's principal).
+   *
+   * @generated from field: string principal = 9;
+   */
+  principal = "";
+
+  /**
+   * The one-line why (the decision's summary, or a person's reason).
+   *
+   * @generated from field: string summary = 10;
+   */
+  summary = "";
+
+  /**
+   * Whether the count actually changed: false for `would` and `deferred`
+   * rows.
+   *
+   * @generated from field: bool applied = 11;
+   */
+  applied = false;
+
+  /**
+   * `scaled`, `deferred` (a scale-in waiting for a rollout), `would` (a
+   * dry-run decision), `pinned`, `released`, or `reset`.
+   *
+   * @generated from field: string kind = 12;
+   */
+  kind = "";
+
+  /**
+   * The digest of the effective policy that decided; empty for people.
+   *
+   * @generated from field: string policy_digest = 13;
+   */
+  policyDigest = "";
+
+  /**
+   * With `detail`: the decision (JSON).
+   *
+   * @generated from field: string decision_json = 14;
+   */
+  decisionJson = "";
+
+  /**
+   * With `detail`: the effective policy the digest resolves to (JSON).
+   *
+   * @generated from field: string policy_json = 15;
+   */
+  policyJson = "";
+
+  /**
+   * The decision's id, if any.
+   *
+   * @generated from field: string decision_id = 16;
+   */
+  decisionId = "";
+
+  constructor(data?: PartialMessage<ScaleHistoryEntry>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.ScaleHistoryEntry";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "id", kind: "scalar", T: 4 /* ScalarType.UINT64 */ },
+    { no: 2, name: "job_id", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 3, name: "task_group", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 4, name: "task_name", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 5, name: "at_unix_ms", kind: "scalar", T: 3 /* ScalarType.INT64 */ },
+    { no: 6, name: "from", kind: "scalar", T: 13 /* ScalarType.UINT32 */ },
+    { no: 7, name: "to", kind: "scalar", T: 13 /* ScalarType.UINT32 */ },
+    { no: 8, name: "source", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 9, name: "principal", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 10, name: "summary", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 11, name: "applied", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
+    { no: 12, name: "kind", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 13, name: "policy_digest", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 14, name: "decision_json", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 15, name: "policy_json", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 16, name: "decision_id", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): ScaleHistoryEntry {
+    return new ScaleHistoryEntry().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): ScaleHistoryEntry {
+    return new ScaleHistoryEntry().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): ScaleHistoryEntry {
+    return new ScaleHistoryEntry().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: ScaleHistoryEntry | PlainMessage<ScaleHistoryEntry> | undefined, b: ScaleHistoryEntry | PlainMessage<ScaleHistoryEntry> | undefined): boolean {
+    return proto3.util.equals(ScaleHistoryEntry, a, b);
+  }
+}
+
+/**
+ * Request payload for PauseScaling.
+ *
+ * @generated from message legion.PauseScalingRequest
+ */
+export class PauseScalingRequest extends Message<PauseScalingRequest> {
+  /**
+   * The job to pause (or resume). Empty with `all`.
+   *
+   * @generated from field: string job = 1;
+   */
+  job = "";
+
+  /**
+   * Narrow to the autoscaled task of this group.
+   *
+   * @generated from field: optional string task_group = 2;
+   */
+  taskGroup?: string;
+
+  /**
+   * Narrow to this task.
+   *
+   * @generated from field: optional string task_name = 3;
+   */
+  taskName?: string;
+
+  /**
+   * Pause (or resume) the whole cluster: the kill switch.
+   *
+   * @generated from field: bool all = 4;
+   */
+  all = false;
+
+  /**
+   * Pause for this many seconds; unset holds until resumed.
+   *
+   * @generated from field: optional uint64 for_seconds = 5;
+   */
+  forSeconds?: bigint;
+
+  /**
+   * Why, shown on every status surface.
+   *
+   * @generated from field: string reason = 6;
+   */
+  reason = "";
+
+  /**
+   * Resume instead: remove the pause at this scope.
+   *
+   * @generated from field: bool resume = 7;
+   */
+  resume = false;
+
+  /**
+   * Optional idempotency key. See `RunJobRequest.idempotency_key`.
+   *
+   * @generated from field: optional string idempotency_key = 8;
+   */
+  idempotencyKey?: string;
+
+  constructor(data?: PartialMessage<PauseScalingRequest>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.PauseScalingRequest";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "job", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 2, name: "task_group", kind: "scalar", T: 9 /* ScalarType.STRING */, opt: true },
+    { no: 3, name: "task_name", kind: "scalar", T: 9 /* ScalarType.STRING */, opt: true },
+    { no: 4, name: "all", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
+    { no: 5, name: "for_seconds", kind: "scalar", T: 4 /* ScalarType.UINT64 */, opt: true },
+    { no: 6, name: "reason", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 7, name: "resume", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
+    { no: 8, name: "idempotency_key", kind: "scalar", T: 9 /* ScalarType.STRING */, opt: true },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): PauseScalingRequest {
+    return new PauseScalingRequest().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): PauseScalingRequest {
+    return new PauseScalingRequest().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): PauseScalingRequest {
+    return new PauseScalingRequest().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: PauseScalingRequest | PlainMessage<PauseScalingRequest> | undefined, b: PauseScalingRequest | PlainMessage<PauseScalingRequest> | undefined): boolean {
+    return proto3.util.equals(PauseScalingRequest, a, b);
+  }
+}
+
+/**
+ * Reply payload for PauseScaling.
+ *
+ * @generated from message legion.PauseScalingReply
+ */
+export class PauseScalingReply extends Message<PauseScalingReply> {
+  /**
+   * Human-readable outcome: `paused web (every autoscaled task) until
+   * 15:10 UTC`, `resumed autoscaling cluster-wide`.
+   *
+   * @generated from field: string message = 1;
+   */
+  message = "";
+
+  /**
+   * True when replayed from a recorded result for the request's
+   * `idempotency_key`.
+   *
+   * @generated from field: bool deduplicated = 2;
+   */
+  deduplicated = false;
+
+  /**
+   * When the pause ends, unix milliseconds; unset for "until resumed" and
+   * for a resume.
+   *
+   * @generated from field: optional int64 until_unix_ms = 3;
+   */
+  untilUnixMs?: bigint;
+
+  constructor(data?: PartialMessage<PauseScalingReply>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.PauseScalingReply";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "message", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 2, name: "deduplicated", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
+    { no: 3, name: "until_unix_ms", kind: "scalar", T: 3 /* ScalarType.INT64 */, opt: true },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): PauseScalingReply {
+    return new PauseScalingReply().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): PauseScalingReply {
+    return new PauseScalingReply().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): PauseScalingReply {
+    return new PauseScalingReply().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: PauseScalingReply | PlainMessage<PauseScalingReply> | undefined, b: PauseScalingReply | PlainMessage<PauseScalingReply> | undefined): boolean {
+    return proto3.util.equals(PauseScalingReply, a, b);
   }
 }
 
@@ -37490,6 +39981,16 @@ export class ApplyNamespacePolicyRequest extends Message<ApplyNamespacePolicyReq
    */
   idempotencyKey?: string;
 
+  /**
+   * Apply even when the policy's `autoscale` would leave some autoscaled
+   * task's effective policy invalid (docs/autoscaling.md). Without it such
+   * an apply is refused with FAILED_PRECONDITION naming the tasks; with it
+   * those tasks' policies are held `invalid` until fixed.
+   *
+   * @generated from field: bool force = 4;
+   */
+  force = false;
+
   constructor(data?: PartialMessage<ApplyNamespacePolicyRequest>) {
     super();
     proto3.util.initPartial(data, this);
@@ -37501,6 +40002,7 @@ export class ApplyNamespacePolicyRequest extends Message<ApplyNamespacePolicyReq
     { no: 1, name: "object_json", kind: "scalar", T: 9 /* ScalarType.STRING */ },
     { no: 2, name: "dry_run", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
     { no: 3, name: "idempotency_key", kind: "scalar", T: 9 /* ScalarType.STRING */, opt: true },
+    { no: 4, name: "force", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
   ]);
 
   static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): ApplyNamespacePolicyRequest {
@@ -37543,7 +40045,8 @@ export class NamespacePolicyViolation extends Message<NamespacePolicyViolation> 
 
   /**
    * Which rule: `runtimes`, `pools`, `hostVolumes`, `quota`, `maxJobs`,
-   * `maxNamespaces`.
+   * `maxNamespaces`, or `autoscale` (an autoscaled task whose effective
+   * policy would no longer resolve).
    *
    * @generated from field: string rule = 3;
    */

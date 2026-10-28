@@ -59,6 +59,10 @@ enum Plane {
     /// token (heartbeats/health) when ACLs are enforced; anonymous callers
     /// are rejected as Unauthenticated.
     Worker,
+    /// App plane (`// ACL: app-plane`): only the bundled autoscaler's own
+    /// workload identity, or a management token; anonymous callers are
+    /// rejected as Unauthenticated, other tokens as PermissionDenied.
+    App,
 }
 
 struct Fixtures {
@@ -93,6 +97,18 @@ fn endpoint_table() -> Vec<(&'static str, Plane)> {
         ("ScaleTask", Plane::Protected("scale:write")),
         ("GetJobScaleStatus", Plane::Protected("scale:read")),
         ("GetScalingInputs", Plane::Protected("scale:read")),
+        // Task autoscaling (docs/autoscaling.md): the policy stream and the
+        // read surface are `scale:read`; pausing is `scale:write`
+        // (`operator:write` for `all`); the cluster's defaults are
+        // operator state. The app's reports are app-plane.
+        ("WatchScalingPolicies", Plane::Protected("scale:read")),
+        ("ApplyScalingDefaults", Plane::Protected("operator:write")),
+        ("GetScalingDefaults", Plane::Protected("scale:read")),
+        ("ReportScalingStatus", Plane::App),
+        ("RecordScalingAction", Plane::App),
+        ("GetScalingStatus", Plane::Protected("scale:read")),
+        ("GetScaleHistory", Plane::Protected("scale:read")),
+        ("PauseScaling", Plane::Protected("scale:write")),
         ("DestroyJob", Plane::Protected("job:write")),
         ("ListJobs", Plane::Protected("job:read")),
         // Namespaces (docs/namespaces.md). ListNamespaces filters per item
@@ -627,6 +643,82 @@ async fn call_endpoint(
                         job: JOB_NAME.into(),
                         ..Default::default()
                     }],
+                    ..Default::default()
+                },
+                token,
+            ))
+            .await
+            .map(|_| ()),
+        "WatchScalingPolicies" => svc
+            .watch_scaling_policies(req(WatchScalingPoliciesRequest::default(), token))
+            .await
+            .map(|_| ()),
+        "ApplyScalingDefaults" => svc
+            .apply_scaling_defaults(req(
+                ApplyScalingDefaultsRequest {
+                    defaults_json: r#"{"cpu":0.6}"#.into(),
+                    dry_run: true,
+                    ..Default::default()
+                },
+                token,
+            ))
+            .await
+            .map(|_| ()),
+        "GetScalingDefaults" => svc
+            .get_scaling_defaults(req(GetScalingDefaultsRequest::default(), token))
+            .await
+            .map(|_| ()),
+        "ReportScalingStatus" => svc
+            .report_scaling_status(req(
+                ReportScalingStatusRequest {
+                    instance: "acl-test".into(),
+                    interval_seconds: 15,
+                    ..Default::default()
+                },
+                token,
+            ))
+            .await
+            .map(|_| ()),
+        "RecordScalingAction" => svc
+            .record_scaling_action(req(
+                RecordScalingActionRequest {
+                    job_id: JOB_NAME.into(),
+                    task_group: "default".into(),
+                    task_name: "web".into(),
+                    kind: "would".into(),
+                    from: 1,
+                    to: 2,
+                    ..Default::default()
+                },
+                token,
+            ))
+            .await
+            .map(|_| ()),
+        "GetScalingStatus" => svc
+            .get_scaling_status(req(
+                GetScalingStatusRequest {
+                    job: JOB_NAME.into(),
+                    ..Default::default()
+                },
+                token,
+            ))
+            .await
+            .map(|_| ()),
+        "GetScaleHistory" => svc
+            .get_scale_history(req(
+                GetScaleHistoryRequest {
+                    job: JOB_NAME.into(),
+                    ..Default::default()
+                },
+                token,
+            ))
+            .await
+            .map(|_| ()),
+        "PauseScaling" => svc
+            .pause_scaling(req(
+                PauseScalingRequest {
+                    job: JOB_NAME.into(),
+                    for_seconds: Some(60),
                     ..Default::default()
                 },
                 token,
@@ -1972,9 +2064,10 @@ async fn anonymous_is_denied_on_every_protected_endpoint() -> R<()> {
                     status.message(),
                 );
             }
-            Plane::Worker => {
+            Plane::Worker | Plane::App => {
                 // Without a join token (registration) or node token
-                // (heartbeats), the worker plane rejects anonymous callers.
+                // (heartbeats), the worker plane rejects anonymous callers;
+                // without the autoscaler's identity, so does the app plane.
                 let status = result.expect_err(&format!(
                     "{method} must reject credential-less workers when ACLs are enabled"
                 ));
@@ -2666,6 +2759,51 @@ async fn unknown_token_is_unauthenticated() -> R<()> {
         .await
         .expect_err("unknown token must be rejected");
     assert_eq!(status.code(), Code::Unauthenticated);
+    Ok(())
+}
+
+/// The autoscaler's app-plane RPCs refuse every token but the app's own
+/// (and management), however much `scale` it holds: a person with
+/// `scale:write` cannot forge the app's status or its dry-run records. And
+/// the cluster-wide pause is `operator:write`, not `scale:write`.
+#[tokio::test]
+async fn app_plane_refuses_tokens_that_are_not_the_autoscaler_test() -> R<()> {
+    let (svc, fixtures, _) = setup_enabled()?;
+    let authenticator = svc.auth.clone();
+    svc.store.upsert_acl_policy(
+        "scaler",
+        "",
+        r#"[{"resources": ["scale"], "namespaces": ["*"], "actions": ["read", "write"]}]"#,
+    )?;
+    let (_, secret) = authenticator
+        .mint_token(&svc.store, "scaler", "client", &["scaler".into()], None)
+        .map_err(|s| anyhow!(s.to_string()))?;
+    for method in ["ReportScalingStatus", "RecordScalingAction"] {
+        let status = call_endpoint(&svc, &fixtures, method, Some(&secret))
+            .await
+            .expect_err("a scale:write token is not the autoscaler");
+        assert_eq!(status.code(), Code::PermissionDenied, "{method}: {}", status.message());
+    }
+    // Its own job's pause is fine; the cluster-wide one is not.
+    call_endpoint(&svc, &fixtures, "PauseScaling", Some(&secret))
+        .await
+        .expect("scale:write pauses a job");
+    let status = svc
+        .pause_scaling(req(
+            PauseScalingRequest {
+                all: true,
+                ..Default::default()
+            },
+            Some(&secret),
+        ))
+        .await
+        .expect_err("--all needs operator:write");
+    assert_eq!(status.code(), Code::PermissionDenied);
+    // Cluster defaults are operator state.
+    let status = call_endpoint(&svc, &fixtures, "ApplyScalingDefaults", Some(&secret))
+        .await
+        .expect_err("defaults need operator:write");
+    assert_eq!(status.code(), Code::PermissionDenied);
     Ok(())
 }
 

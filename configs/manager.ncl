@@ -22,7 +22,8 @@
   # exec = { enabled = true },
   # Direct exec tickets (`legion exec --direct`, `MintExecTicket`): how long a
   # ticket can be redeemed and how long its session may run. Signed with the
-  # workload-identity key, so `workloadIdentity.enabled` must be true to mint.
+  # workload-identity key (on by default; `workloadIdentity.enabled = false`
+  # turns tickets off with it).
   # exec = { tickets = { defaultTtl = "60s", maxTtl = "10m", maxSession = "1h" } },
   # Telemetry: Prometheus /metrics plus /healthz + /readyz probes
   # (docs/metrics.md). Enabled by default; binds server.port + 2 (4749 here)
@@ -68,7 +69,8 @@
   # grants nodes the ability to start work on a capability, growing a
   # compromised node's blast radius from "runs what it was given" to "runs
   # anything a live ticket names". Tickets are signed by the
-  # workload-identity issuer, so `workloadIdentity.enabled` must also be true.
+  # workload-identity issuer (on by default), so `workloadIdentity.enabled`
+  # must not be false.
   #
   # A job's own `speculativeStart` block does NOT need this switch: pre-commit
   # dispatch from the manager opens no new authorization surface.
@@ -279,7 +281,8 @@
     containerImageDesugar = false,
   },
   # Workload identity (OIDC issuer; see docs/workload-identity.md).
-  # Off by default. When enabled the manager signs short-lived per-task JWTs
+  # On by default: apps (the bundled autoscaler) and API sockets authenticate
+  # with Legion's own `legion` identity. The manager signs short-lived per-task JWTs
   # and serves the OIDC discovery document + JWKS over plain HTTP on the main
   # listener. `issuer` is the externally-published URL relying parties trust
   # (it must be reachable by AWS/GCP/Vault — typically via an HTTPS proxy).
@@ -290,7 +293,7 @@
   # tasks — referenced by artifact `auth.nodeIdentity` and cluster
   # artifact-auth matchers.
   # workloadIdentity = {
-  #   enabled = true,
+  #   enabled = true,          # the default; false turns workload identity off
   #   issuer = "https://manager.example.com:4747",
   #   jwksPath = "/.well-known/jwks.json",
   #   signingAlg = "ES256",

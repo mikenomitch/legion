@@ -173,9 +173,9 @@ impl AppContext {
     pub async fn client(&self) -> R<crate::cmd::helpers::AuthedManagerClient> {
         if self.legion_addr().is_none() {
             bail!(
-                "LEGION_ADDR is not set: the app has no way to reach Legion (turn on \
-                 workloadIdentity.enabled on the managers so its `legion` identity gets an API \
-                 socket)"
+                "LEGION_ADDR is not set: the app has no way to reach Legion (workload identity \
+                 is turned off on the managers, `workloadIdentity.enabled = false`, so its \
+                 `legion` identity gets no API socket)"
             );
         }
         crate::cmd::helpers::connect_manager_client().await
@@ -482,18 +482,17 @@ mod tests {
         }
     }
 
-    /// The autoscaler asks for exactly what the plan lists (§6.1).
+    /// The autoscaler asks for exactly what it calls: policies and inputs
+    /// (`scale:read`) and count writes (`scale:write`). Its reports are
+    /// app-plane and need no rule (autoscaler-v2 calls entry 37).
     #[test]
-    fn the_autoscaler_manifest_asks_for_the_planned_permissions() {
+    fn the_autoscaler_manifest_asks_for_what_it_calls() {
         let manifest = bundled_manifest("autoscaler").expect("bundled");
         let rules = serde_json::to_value(&manifest.permissions).expect("rules");
         assert_eq!(
             rules,
             json!([
                 { "resources": ["scale"], "actions": ["read", "write"], "namespaces": ["*"] },
-                { "resources": ["job"], "actions": ["read"], "namespaces": ["*"] },
-                { "resources": ["node"], "actions": ["read", "write"] },
-                { "resources": ["kv"], "actions": ["read", "write"], "paths": ["legion/apps/autoscaler/*"] },
             ])
         );
         assert_eq!(manifest.placement, crate::structs::app::Placement::Managers);

@@ -30,6 +30,7 @@ mod acl_endpoints;
 mod api_socket;
 mod apple_container_idle;
 mod apps;
+mod autoscaler;
 mod archive_integration;
 mod artifact_staging_integration;
 mod blocked_evals;

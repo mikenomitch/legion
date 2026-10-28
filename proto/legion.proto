@@ -15309,6 +15309,12 @@ message ApplyNamespacePolicyRequest {
 
   // Optional idempotency key. See `RunJobRequest.idempotency_key`.
   optional string idempotency_key = 3;
+
+  // Apply even when the policy's `autoscale` would leave some autoscaled
+  // task's effective policy invalid (docs/autoscaling.md). Without it such
+  // an apply is refused with FAILED_PRECONDITION naming the tasks; with it
+  // those tasks' policies are held `invalid` until fixed.
+  bool force = 4;
 }
 
 // One thing a policy would have refused, reported by a dry run.
@@ -15321,7 +15327,8 @@ message NamespacePolicyViolation {
   string job_id = 2;
 
   // Which rule: `runtimes`, `pools`, `hostVolumes`, `quota`, `maxJobs`,
-  // `maxNamespaces`.
+  // `maxNamespaces`, or `autoscale` (an autoscaled task whose effective
+  // policy would no longer resolve).
   string rule = 3;
 
   // The refusal message admission would have returned.

@@ -127,6 +127,7 @@ use tonic::{Request, Response, Status, Streaming};
 
 // Phase 6: ForkInstance, `from_snapshot` creates, and snapshot names.
 mod app_rpcs;
+mod autoscale_rpcs;
 mod checkpoint_support;
 mod fork_rpcs;
 mod make_room;
@@ -1876,8 +1877,8 @@ pub struct ManagerDaemonService {
     manager_id: String,
     allocation_failures: Arc<Mutex<AllocationFailureTracker>>,
     /// OIDC issuer state; `None` when `workloadIdentity.enabled` is false
-    /// (the default), in which case IssueWorkloadIdentityToken returns
-    /// FailedPrecondition.
+    /// (it is on by default), in which case IssueWorkloadIdentityToken
+    /// returns FailedPrecondition.
     workload_identity: Option<Arc<WorkloadIdentityState>>,
     /// Debounce window for KV-driven reconciliation (`kvDebounceMs` in the
     /// manager config). Zero reconciles synchronously inside the KV RPC.
@@ -2389,6 +2390,13 @@ impl ManagerDaemonService {
             error!("Error validating task configs: {:?}", e);
             Status::invalid_argument(format!("Error validating task configs: {e}"))
         })?;
+        // `autoscale` against the cluster's scaling defaults and namespace
+        // policies, as they stand now (docs/autoscaling.md).
+        let autoscale_warnings: Vec<String> = self
+            .validate_autoscale(&config)?
+            .into_iter()
+            .flat_map(|task| task.warnings)
+            .collect();
         self.validate_identity_sub_templates(&config)?;
         self.enforce_identity_grants(identity, &config)?;
         enforce_kv_tls_read(identity, &config.tasks)?;
@@ -2554,6 +2562,19 @@ impl ManagerDaemonService {
                 }
             }
             JobSubmitOutcome::Created { .. } => (Some("job_submit"), "Job submit success"),
+            JobSubmitOutcome::Updated { .. }
+                if self.update_autoscale_in_place(&config, &job_config_id)? =>
+            {
+                // Only `autoscale` and autoscaled tasks' `count` changed: the
+                // running allocations moved to the new version, and a
+                // `job_scale` eval converges the count (docs/autoscaling.md,
+                // "Editing the policy restarts nothing").
+                (
+                    Some("job_scale"),
+                    "Job updated in place: only autoscale (and autoscaled counts) changed, so \
+                     nothing restarts",
+                )
+            }
             JobSubmitOutcome::Updated { .. } => {
                 let previous_job_config_id = self
                     .store
@@ -2659,6 +2680,7 @@ impl ManagerDaemonService {
                 .warnings()
                 .into_iter()
                 .chain(self.band_submit_warnings(&config))
+                .chain(autoscale_warnings)
                 .chain(crate::task_plugins::resource_submit_warnings(&config))
                 .chain(crate::structs::suspend::sandbox_submit_warnings(&config))
                 .chain(self.gated_egress_submit_warnings(&config))
@@ -5417,9 +5439,10 @@ impl Manager for ManagerDaemonService {
         }
         let Some(state) = self.workload_identity.as_ref() else {
             return Err(Status::failed_precondition(
-                "exec tickets are signed by the workload-identity issuer, which is not enabled \
-                 on this manager\nHint: set workloadIdentity.enabled: true in the manager \
-                 config, or exec through the manager (drop --direct)",
+                "exec tickets are signed by the workload-identity issuer, which is turned off \
+                 on this manager (workloadIdentity.enabled = false)\nHint: remove that setting \
+                 (workload identity is on by default), or exec through the manager (drop \
+                 --direct)",
             ));
         };
         let store = self.store.clone();
@@ -5797,6 +5820,7 @@ impl Manager for ManagerDaemonService {
             error!("Error validating task configs: {:?}", e);
             Status::invalid_argument(format!("Error validating task configs: {e}"))
         })?;
+        let autoscale_plans = self.validate_autoscale(&config)?;
         self.validate_identity_sub_templates(&config)?;
         self.validate_job_volumes(&config).map_err(|e| {
             error!("Error validating volumes: {:?}", e);
@@ -6001,6 +6025,11 @@ impl Manager for ManagerDaemonService {
             warnings: unknown_fields
                 .warnings()
                 .into_iter()
+                .chain(
+                    autoscale_plans
+                        .iter()
+                        .flat_map(|task| task.warnings.iter().cloned()),
+                )
                 .chain(self.gated_egress_submit_warnings(&config))
                 .chain(self.tcp_upstream_submit_warnings(&config))
                 .chain(crate::task_plugins::container_security_warnings(&config))
@@ -6008,6 +6037,26 @@ impl Manager for ManagerDaemonService {
             gang_reports: gang_reports
                 .iter()
                 .map(crate::manager::scheduler::GangReport::to_proto)
+                .collect(),
+            autoscale: autoscale_plans
+                .iter()
+                .map(|task| crate::structs::AutoscalePlan {
+                    target: task.target.clone(),
+                    effective_json: serde_json::to_string(&task.resolved.record)
+                        .unwrap_or_default(),
+                    summary: task.summary.clone(),
+                    provenance: task
+                        .resolved
+                        .explain_rows()
+                        .into_iter()
+                        .map(|row| crate::structs::ScalingProvenanceRow {
+                            field: row.field,
+                            value: row.value,
+                            origin: row.origin.to_string(),
+                        })
+                        .collect(),
+                    digest: task.resolved.digest.clone(),
+                })
                 .collect(),
         };
 
@@ -6373,194 +6422,8 @@ impl Manager for ManagerDaemonService {
         &self,
         request: Request<ScaleTaskRequest>,
     ) -> Result<Response<ScaleTaskReply>, Status> {
-        // The whole point of the `scale` resource: resize rights without
-        // redeploy rights (docs/autoscaling.md, docs/auth-and-acls.md).
-        let ident = self.check_acl(
-            &request,
-            AclResource::Scale,
-            AclAction::Write,
-            self.job_read_scope(&request.get_ref().name),
-        )?;
-        let inner = request.into_inner();
-        let idempotency_key = scoped_idempotency_key(
-            &ident,
-            "scale_task",
-            inner.idempotency_key.as_deref(),
-            &inner,
-        );
-        let name = inner.name;
-
-        if let Some(message) = self
-            .store
-            .idempotency_lookup(&idempotency_key)
-            .map_err(|e| map_store_error("Error checking idempotency", e))?
-        {
-            return Ok(Response::new(ScaleTaskReply {
-                message,
-                deduplicated: true,
-                deferred: false,
-            }));
-        }
-
-        if inner.count.is_none() && !inner.reset {
-            return Err(Status::invalid_argument(
-                "provide count (the desired replicas) or reset (return the count to the spec)",
-            ));
-        }
-        if inner.count.is_some() && inner.reset {
-            return Err(Status::invalid_argument(
-                "count and reset are mutually exclusive",
-            ));
-        }
-
-        let config = keyed_job_config(&self.store, &name)?;
-        let task = resolve_scalable_task(
-            &config,
-            &name,
-            inner.task_group.as_deref(),
-            inner.task_name.as_deref(),
-        )?;
-        let (task_group, task_name, spec_count) =
-            (task.group.clone(), task.name.clone(), task.count.num);
-        let job_config_id = config.id();
-        let reason = inner.reason.unwrap_or_default();
-        let previous = self
-            .store
-            .effective_task_count(&name, &task_group, &task_name, spec_count)
-            .map_err(|e| map_store_error("Error reading scale state", e))?;
-
-        let (message, deferred) = if inner.reset {
-            let existed = self
-                .store
-                .clear_task_scale(&name, &task_group, &task_name)
-                .map_err(|e| map_store_error("Error resetting scale", e))?;
-            if existed {
-                self.store
-                    .events()
-                    .scale_reset(&name, &task_group, &task_name, "explicit reset");
-                self.store
-                    .enqueue_eval(
-                        "job_scale",
-                        Some(&name),
-                        Some(&job_config_id),
-                        None,
-                        Some(self.store.default_eval_priority),
-                    )
-                    .map_err(|e| map_store_error("Error enqueueing scale eval", e))?;
-            }
-            (
-                format!(
-                    "{}/{}/{}: {} -> {} (override dropped; spec owns the count)",
-                    name, task_group, task_name, previous, spec_count
-                ),
-                false,
-            )
-        } else {
-            let count = inner.count.unwrap_or_default();
-            // Scale-out is new demand: a namespace policy's quota sees the
-            // job at its new count. Scale-in is never refused.
-            if count > previous {
-                let mut scaled = config.clone();
-                if let Some(task) = scaled
-                    .tasks
-                    .iter_mut()
-                    .find(|task| task.group == task_group && task.name == task_name)
-                {
-                    task.count.num = count;
-                }
-                self.store
-                    .check_namespace_admission(&scaled)
-                    .map_err(|e| map_store_error("Namespace policy refused the scale", e))?;
-            }
-            // The ECS rule (docs/autoscaling.md): scale-out applies during
-            // a rollout, scale-in defers until it finishes.
-            let active_rollout = self
-                .store
-                .list_rollouts(Some(&name), true)
-                .map_err(|e| map_store_error("Error checking rollouts", e))?
-                .into_iter()
-                .next();
-            match active_rollout {
-                Some(rollout) if count < previous => {
-                    self.store
-                        .set_task_scale_pending(
-                            &name,
-                            &task_group,
-                            &task_name,
-                            count,
-                            spec_count,
-                            "operator",
-                            &reason,
-                            &ident.principal,
-                        )
-                        .map_err(|e| map_store_error("Error recording pending scale", e))?;
-                    self.store.events().scale_deferred(
-                        &name,
-                        &task_group,
-                        &task_name,
-                        count,
-                        rollout.id,
-                        "operator",
-                        &reason,
-                    );
-                    (
-                        format!(
-                            "deferred: rollout {} is in progress; scale-in to {} applies when it completes",
-                            rollout.id, count
-                        ),
-                        true,
-                    )
-                }
-                _ => {
-                    self.store
-                        .set_task_scale_override(
-                            &name,
-                            &task_group,
-                            &task_name,
-                            count,
-                            spec_count,
-                            "operator",
-                            &reason,
-                            &ident.principal,
-                        )
-                        .map_err(|e| map_store_error("Error applying scale", e))?;
-                    self.store.events().scale_applied(
-                        &name,
-                        &task_group,
-                        &task_name,
-                        Some(previous),
-                        count,
-                        "operator",
-                        &reason,
-                    );
-                    self.store
-                        .enqueue_eval(
-                            "job_scale",
-                            Some(&name),
-                            Some(&job_config_id),
-                            None,
-                            Some(self.store.default_eval_priority),
-                        )
-                        .map_err(|e| map_store_error("Error enqueueing scale eval", e))?;
-                    (
-                        format!(
-                            "{}/{}/{}: {} -> {} (spec count {}; override active)",
-                            name, task_group, task_name, previous, count, spec_count
-                        ),
-                        false,
-                    )
-                }
-            }
-        };
-
-        self.store
-            .idempotency_record(&idempotency_key, "scale_task", &message)
-            .map_err(|e| map_store_error("Error recording idempotency", e))?;
-        Ok(Response::new(ScaleTaskReply {
-            message,
-            deduplicated: false,
-            deferred,
-        }))
+        // ACL: scale:write (in the handler).
+        self.scale_task_rpc(request).await
     }
 
     #[instrument(skip_all)]
@@ -6596,6 +6459,73 @@ impl Manager for ManagerDaemonService {
         request: Request<crate::structs::GetScalingInputsRequest>,
     ) -> Result<Response<crate::structs::GetScalingInputsReply>, Status> {
         self.get_scaling_inputs_rpc(request).await
+    }
+
+    type WatchScalingPoliciesStream =
+        ReceiverStream<Result<crate::structs::ScalingPolicySet, Status>>;
+
+    // ACL: scale:read (in the handler).
+    async fn watch_scaling_policies(
+        &self,
+        request: Request<crate::structs::WatchScalingPoliciesRequest>,
+    ) -> Result<Response<Self::WatchScalingPoliciesStream>, Status> {
+        self.watch_scaling_policies_rpc(request).await
+    }
+
+    // ACL: operator:write (in the handler).
+    async fn apply_scaling_defaults(
+        &self,
+        request: Request<crate::structs::ApplyScalingDefaultsRequest>,
+    ) -> Result<Response<crate::structs::ApplyScalingDefaultsReply>, Status> {
+        self.apply_scaling_defaults_rpc(request).await
+    }
+
+    // ACL: scale:read on the namespace (in the handler).
+    async fn get_scaling_defaults(
+        &self,
+        request: Request<crate::structs::GetScalingDefaultsRequest>,
+    ) -> Result<Response<crate::structs::GetScalingDefaultsReply>, Status> {
+        self.get_scaling_defaults_rpc(request).await
+    }
+
+    // ACL: app-plane (in the handler).
+    async fn report_scaling_status(
+        &self,
+        request: Request<crate::structs::ReportScalingStatusRequest>,
+    ) -> Result<Response<crate::structs::ReportScalingStatusReply>, Status> {
+        self.report_scaling_status_rpc(request).await
+    }
+
+    // ACL: app-plane (in the handler).
+    async fn record_scaling_action(
+        &self,
+        request: Request<crate::structs::RecordScalingActionRequest>,
+    ) -> Result<Response<crate::structs::RecordScalingActionReply>, Status> {
+        self.record_scaling_action_rpc(request).await
+    }
+
+    // ACL: scale:read (in the handler).
+    async fn get_scaling_status(
+        &self,
+        request: Request<crate::structs::GetScalingStatusRequest>,
+    ) -> Result<Response<crate::structs::GetScalingStatusReply>, Status> {
+        self.get_scaling_status_rpc(request).await
+    }
+
+    // ACL: scale:read (in the handler).
+    async fn get_scale_history(
+        &self,
+        request: Request<crate::structs::GetScaleHistoryRequest>,
+    ) -> Result<Response<crate::structs::GetScaleHistoryReply>, Status> {
+        self.get_scale_history_rpc(request).await
+    }
+
+    // ACL: scale:write; operator:write for `all` (in the handler).
+    async fn pause_scaling(
+        &self,
+        request: Request<crate::structs::PauseScalingRequest>,
+    ) -> Result<Response<crate::structs::PauseScalingReply>, Status> {
+        self.pause_scaling_rpc(request).await
     }
 
     #[instrument(skip_all)]
@@ -8163,8 +8093,8 @@ impl Manager for ManagerDaemonService {
 
         let Some(state) = self.workload_identity.as_ref() else {
             return Err(Status::failed_precondition(
-                "workload identity is not enabled on this manager \
-                 (set workloadIdentity.enabled: true in the manager config)",
+                "workload identity is turned off on this manager \
+                 (workloadIdentity.enabled = false; it is on by default)",
             ));
         };
 
@@ -8434,8 +8364,8 @@ impl Manager for ManagerDaemonService {
 
         let Some(state) = self.workload_identity.as_ref() else {
             return Err(Status::failed_precondition(
-                "workload identity is not enabled on this manager \
-                 (set workloadIdentity.enabled: true in the manager config)",
+                "workload identity is turned off on this manager \
+                 (workloadIdentity.enabled = false; it is on by default)",
             ));
         };
 
@@ -12234,8 +12164,8 @@ impl Manager for ManagerDaemonService {
         }
         let Some(state) = self.workload_identity.as_ref() else {
             return Err(Status::failed_precondition(
-                "boot tickets are signed by the workload-identity issuer, which is not enabled \
-                 on this manager (set workloadIdentity.enabled: true)",
+                "boot tickets are signed by the workload-identity issuer, which is turned off \
+                 on this manager (workloadIdentity.enabled = false; it is on by default)",
             ));
         };
 

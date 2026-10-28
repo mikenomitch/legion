@@ -1408,6 +1408,9 @@ pub fn validate_job_config(config: &JobConfig) -> R<()> {
             }
         }
     }
+    // `autoscale`: the rules that need only the jobspec (the ones that need
+    // the cluster's scaling defaults run at submit, docs/autoscaling.md).
+    crate::manager::autoscale::validate_static(config)?;
     // Slot instance ids are derived from (job, group, slot), so two slot-mode
     // stateful tasks in one group would collide on instance identity.
     let mut slot_stateful_by_group: HashMap<&str, &str> = HashMap::new();

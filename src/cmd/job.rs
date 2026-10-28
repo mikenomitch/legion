@@ -103,6 +103,40 @@ pub fn config() -> Command {
                 .value_name("REASON")
                 .help("Audit note recorded on the override and in the event stream"),
         )
+        .arg(
+            Arg::new("for")
+                .long("for")
+                .value_name("DURATION")
+                .help(
+                    "Pin the count (or --min/--max) on an autoscaled task for this long, e.g. \
+                     2h; required for --count on an autoscaled task",
+                ),
+        )
+        .arg(
+            Arg::new("min")
+                .long("min")
+                .value_name("COUNT")
+                .value_parser(value_parser!(u32))
+                .requires("for")
+                .conflicts_with_all(["count", "reset"])
+                .help("Pin a floor on an autoscaled task (with --for); still autoscaled above it"),
+        )
+        .arg(
+            Arg::new("max")
+                .long("max")
+                .value_name("COUNT")
+                .value_parser(value_parser!(u32))
+                .requires("for")
+                .conflicts_with_all(["count", "reset"])
+                .help("Pin a ceiling on an autoscaled task (with --for)"),
+        )
+        .arg(
+            Arg::new("release")
+                .long("release")
+                .action(ArgAction::SetTrue)
+                .conflicts_with_all(["count", "reset", "for", "min", "max"])
+                .help("End an autoscaled task's pin now; autoscaling resumes from the current count"),
+        )
         .arg(idempotency_arg())
         .arg(namespace_flag())
         .arg(json_flag());
@@ -703,6 +737,43 @@ pub(crate) fn build_jobspec_schema() -> Value {
         task_runtimes.insert(plugin.name, plugin.schema);
     }
 
+    let mut schema = jobspec_schema_envelope();
+    // `autoscale`: generated from the type the parser uses, with its
+    // definitions moved beside the task's.
+    let mut autoscale = crate::autoscaler::AutoscaleSpec::json_schema_value();
+    if let Some(definitions) = autoscale
+        .as_object_mut()
+        .and_then(|object| object.remove("definitions"))
+    {
+        if let (Some(defs), Value::Object(definitions)) =
+            (schema["$defs"].as_object_mut(), definitions)
+        {
+            for (name, definition) in definitions {
+                defs.insert(name, definition);
+            }
+        }
+    }
+    if let Some(object) = autoscale.as_object_mut() {
+        object.remove("$schema");
+        object.remove("title");
+        object.insert(
+            "description".into(),
+            json!("Task autoscaling (docs/autoscaling.md): `true` for the effective defaults \
+                   (min = count, max = 4 x count, CPU at 70% of the reservation), or a record \
+                   overriding some of them. Not on keyed, `count.per`, or batch tasks; at most \
+                   one task per group."),
+        );
+    }
+    let text = serde_json::to_string(&autoscale)
+        .unwrap_or_default()
+        .replace("#/definitions/", "#/$defs/");
+    schema["$defs"]["task"]["properties"]["autoscale"] =
+        serde_json::from_str(&text).unwrap_or(Value::Null);
+    schema["taskRuntimes"] = Value::Object(task_runtimes);
+    schema
+}
+
+fn jobspec_schema_envelope() -> Value {
     json!({
         "$schema": "http://json-schema.org/draft-07/schema#",
         "title": "Legion Jobspec",
@@ -845,7 +916,7 @@ pub(crate) fn build_jobspec_schema() -> Value {
                 }
             }
         },
-        "taskRuntimes": task_runtimes
+        "taskRuntimes": {}
     })
 }
 
@@ -1869,8 +1940,20 @@ async fn scale_job(arg_matches: &ArgMatches) -> R<()> {
     )?;
     let count = arg_matches.get_one::<u32>("count").copied();
     let reset = arg_matches.get_flag("reset");
+    let release = arg_matches.get_flag("release");
+    let min = arg_matches.get_one::<u32>("min").copied();
+    let max = arg_matches.get_one::<u32>("max").copied();
+    let pin_for_seconds = match arg_matches.get_one::<String>("for") {
+        Some(text) => Some(
+            humantime::parse_duration(text.trim())
+                .map_err(|err| anyhow!("--for {text:?}: {err} (write it like 2h or 30m)"))?
+                .as_secs()
+                .max(1),
+        ),
+        None => None,
+    };
 
-    if count.is_none() && !reset {
+    if count.is_none() && !reset && !release && min.is_none() && max.is_none() {
         // Status mode.
         let request = tonic::Request::new(GetJobScaleStatusRequest {
             name: job_name.clone(),
@@ -1896,6 +1979,23 @@ async fn scale_job(arg_matches: &ArgMatches) -> R<()> {
                         "source": task.source,
                         "reason": task.reason,
                         "updatedAt": task.updated_at,
+                        "autoscaled": task.autoscaled,
+                        "policy": task.policy_summary,
+                        "state": task.state,
+                        "pin": task.pin.as_ref().map(|pin| json!({
+                            "untilUnixMs": pin.until_unix_ms,
+                            "min": pin.min,
+                            "max": pin.max,
+                            "by": pin.by,
+                            "reason": pin.reason,
+                        })),
+                        "paused": task.pause.as_ref().map(|pause| json!({
+                            "scope": pause.scope,
+                            "untilUnixMs": pause.until_unix_ms,
+                            "by": pause.by,
+                            "reason": pause.reason,
+                        })),
+                        "version": task.version,
                     })
                 })
                 .collect::<Vec<_>>() }));
@@ -1916,6 +2016,27 @@ async fn scale_job(arg_matches: &ArgMatches) -> R<()> {
                     line.push_str(&format!(", scale-in to {pending} pending"));
                 }
                 line.push(')');
+                if task.autoscaled {
+                    line.push_str(&format!("; autoscaled {}", task.policy_summary));
+                    if let Some(pin) = task.pin.as_ref() {
+                        line.push_str(&format!(
+                            "; pinned {} by {} until {}",
+                            match (pin.min, pin.max) {
+                                (Some(min), Some(max)) if min == max => format!("at {min}"),
+                                (min, max) => format!(
+                                    "to {}..{}",
+                                    min.map_or("-".to_string(), |n| n.to_string()),
+                                    max.map_or("-".to_string(), |n| n.to_string())
+                                ),
+                            },
+                            pin.by,
+                            crate::cmd::scaling::clock(pin.until_unix_ms)
+                        ));
+                    }
+                    if let Some(pause) = task.pause.as_ref() {
+                        line.push_str(&format!("; paused ({}) by {}", pause.scope, pause.by));
+                    }
+                }
                 println!("{line}");
             }
         }
@@ -1930,6 +2051,11 @@ async fn scale_job(arg_matches: &ArgMatches) -> R<()> {
         reset,
         reason: arg_matches.get_one::<String>("reason").cloned(),
         idempotency_key: arg_matches.get_one::<String>("idempotency-key").cloned(),
+        pin_for_seconds,
+        min,
+        max,
+        release,
+        ..Default::default()
     });
     let reply = output::resolve(
         format,
@@ -1943,6 +2069,8 @@ async fn scale_job(arg_matches: &ArgMatches) -> R<()> {
             "message": reply.message,
             "deduplicated": reply.deduplicated,
             "deferred": reply.deferred,
+            "version": reply.version,
+            "pinnedUntilUnixMs": reply.pinned_until_unix_ms,
         }));
     } else {
         println!("{}", reply.message);

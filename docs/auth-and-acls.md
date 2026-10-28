@@ -117,7 +117,7 @@ reports `aclEnabled: false`.
 | `exec` | exec into a running allocation | n/a | open a session, or mint an exec ticket for one (`host = true` for host-level runtimes) |
 | `action` | run declared actions on an allocation | n/a | run an action (scope with `actionNames`) |
 | `template` | job templates | list/inspect | publish versions, delete (scope with `templates`) |
-| `scale` | task count overrides ([Scaling Jobs](autoscaling.md)) | scale status, and the cluster-wide scaling inputs (`GetScalingInputs`: replicas, usage against reservations, service traffic) | `job scale` / reset (scope by job name). Separate from `job:write`, so a principal can resize without redeploy rights. |
+| `scale` | task count overrides and autoscaling ([Autoscaling](autoscaling.md)) | scale status, the cluster-wide scaling inputs (`GetScalingInputs`: replicas, usage against reservations, service traffic), autoscaling status, explanations and history, the effective policies (`WatchScalingPolicies`), and a namespace's scaling defaults | `job scale` / reset / pins, and pausing autoscaling for a job (scope by job name). Separate from `job:write`, so a principal can resize without redeploy rights. The cluster's scaling defaults and the cluster-wide pause need `operator:write`. |
 | `boot` | boot tickets ([Edge Boot](edge-boot.md)) | list outstanding tickets | mint a ticket (scope by job name). Separate from `job:write` for the same reason as `scale`: a platform's ticket minter can authorize individual starts without the right to redeploy the fleet. |
 | `net` | network policy and plugin objects ([Network Handlers](network-handlers.md), [Network Plugins](network-plugins.md)) | list policies, show or test a job's effective policy (scope by job name); list, describe, and read the status of plugins | apply or delete a policy. Scope with `pools`, which is matched against the policy's own `selector.nodePools`, so a pool's admin can set posture for their pool without cluster-wide write. Apply or delete a plugin: a `usableBy = "policies"` plugin's `nodePools` scope it the same way; a cluster-wide one, or any `usableBy = "jobs"` plugin, needs unscoped write. |
 | `snapshot` | instance snapshots ([Suspend and Resume](suspend-and-resume.md)) | list, inspect, warm a published one onto nodes, restore an instance from one, and create instances from one (restore and create also need `job:write`) | create (including `--publish`), delete, and name snapshots, suspend with a memory checkpoint, and fork (fork also needs `job:write`) (scope by job name and namespace) |
@@ -475,6 +475,16 @@ check against the caller. Bundled apps' grants are recorded at seed time by
 Error: app gitops 0.2.0 asks for job:write in team-*, which your token does not hold
 Hint: have someone who holds it do this, or ask for it to be granted to you
 ```
+
+**The app plane.** Two RPCs are for the bundled autoscaler alone:
+`ReportScalingStatus` (its heartbeat and per-task state) and
+`RecordScalingAction` (a dry-run policy's "would" rows). They take no ACL
+rule; instead they accept only a credential whose job grant belongs to an
+allocation of `legion-system/autoscaler` (its `legion` token, or an ACL token
+minted from it), or a management token. Anyone else gets `PermissionDenied`
+(`Unauthenticated` without a credential), so a principal with `scale:write`
+cannot forge the autoscaler's status. `ScaleTask`'s `source = "autoscaler"`
+is honored on the same test ([autoscaling.md](autoscaling.md#access-control)).
 
 ### Tokens
 

@@ -31,11 +31,13 @@
       ],
     },
   },
+  # Exactly what the app calls: WatchScalingPolicies and GetScalingInputs
+  # (scale:read) and ScaleTask (scale:write). ReportScalingStatus and
+  # RecordScalingAction are app-plane: the manager accepts them from this
+  # app's identity alone, with no rule needed. Node groups and sharding add
+  # node and kv rules when the app calls those APIs.
   permissions = [
     { resources = ["scale"], actions = ["read", "write"], namespaces = ["*"] },
-    { resources = ["job"], actions = ["read"], namespaces = ["*"] },
-    { resources = ["node"], actions = ["read", "write"] },
-    { resources = ["kv"], actions = ["read", "write"], paths = ["legion/apps/autoscaler/*"] },
   ],
   ui = { port = "api" },
   config = {
@@ -43,6 +45,15 @@
       type = "object",
       additionalProperties = false,
       properties = {
+        interval = {
+          type = "string",
+          description = "How often every policy is evaluated, as a duration (\"15s\", the default). The app counts as not running after three intervals without a report.",
+        },
+        mode = {
+          type = "string",
+          enum = ["enforce", "dry-run"],
+          description = "`dry-run` forces every policy into dry-run: decisions are recorded as \"would\" and nothing is scaled. Default `enforce`: each policy's own mode applies.",
+        },
         plugins = {
           type = "object",
           description = "External scaling plugins, by name. Policies name a plugin; they never carry a command or a URL.",

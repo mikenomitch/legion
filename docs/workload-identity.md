@@ -22,7 +22,9 @@ to integrate with common providers.
 > [API socket](#the-api-socket) with no setup. Not yet implemented:
 > task-scoped `auth.identity` for artifacts (it needs the fetching
 > allocation's id), and the API socket for sandboxes (they use the token
-> file). The feature is off by default.
+> file). The feature is on by default: the issuer and its first signing key
+> need no configuration, and federating with an outside provider takes an
+> explicit public `issuer`.
 
 ## The token
 
@@ -214,7 +216,7 @@ restart. See [docs/task-runtime-container.md](task-runtime-container.md).
 # manager.ncl
 {
   workloadIdentity = {
-    enabled = true,                              # default false
+    enabled = true,                              # the default; false turns it off
     issuer = "https://manager.example.com:4747", # public HTTPS issuer URL
     jwksPath = "/.well-known/jwks.json",            # must start with '/'
     signingAlg = "ES256",                           # only ES256 is supported
@@ -235,8 +237,20 @@ also fail boot instead of falling back to a default. To federate with a
 provider, you only need to set `enabled` and `issuer`. The rest have
 defaults.
 
-The feature is off by default. Enabling it doesn't affect existing jobs or the
-worker join-token flow.
+The feature is on by default, because Legion's own `legion` identity needs it:
+apps such as the bundled autoscaler, and any job that calls Legion through its
+[API socket](#the-api-socket), authenticate with it. Nothing has to be
+configured for that: the issuer defaults to a cluster-internal name
+([The issuer](#the-issuer)), the first signing key is generated and replicated
+at first boot ([Signing-key persistence](#signing-key-persistence-and-restart-semantics)),
+and the discovery and JWKS routes below publish only public keys. Federating
+with an outside provider (AWS, GCP, Vault) still needs `issuer` set to a URL
+that provider can reach.
+
+`enabled = false` turns the whole feature off: no issuer, no routes, no
+tokens for any identity (including `legion`), so apps and API sockets have no
+credentials, and direct exec, edge boot tickets, and the `identity` material
+provider are refused.
 
 ### Public endpoints (discovery + JWKS)
 
@@ -634,12 +648,11 @@ and per-allocation backing directory.
 
 ## Testing this locally in a basic way
 
-1. Enable workload identity in `configs/manager.ncl` (the block is there,
-   commented):
+1. Workload identity is on by default. To set an issuer, use the block in
+   `configs/manager.ncl` (there, commented):
 
    ```nickel
    workloadIdentity = {
-     enabled = true,
      # optional; a single local manager defaults to its own address
      # issuer = "https://manager.example.com:4747",
    },

@@ -572,6 +572,7 @@ purpose:
 | `pools.default` | The pool a task whose permit names none lands in (must be within `allowed`) |
 | `runtimes` | Allowed task runtimes, names or globs |
 | `hostVolumes` | Allowed host volumes (`driver = "host"`, by `params.name`), names or globs |
+| `autoscale` | Autoscaling defaults for every task in the matching namespaces: the jobspec `autoscale` record without `checks`, overriding the cluster's scaling defaults field by field, and live ([autoscaling.md](autoscaling.md#overriding-the-defaults)). Its `min` must be a multiple of `count` of at least `"1x"` |
 
 For `pools.allowed`, `runtimes` and `hostVolumes`, **unset allows
 everything and an empty list allows nothing.**
@@ -677,6 +678,13 @@ Had it been in force, it would have refused (admitted work keeps running):
   [runtimes] payments-prod/batch: namespace policy 'payments' allows runtimes [container, sandbox] in payments, payments-*; task main uses exec
   [maxJobs] payments, payments-*: 312 jobs across payments, payments-*, over maxJobs 300
 ```
+
+An `autoscale` record is checked against every autoscaled task it would
+govern: a change that would leave some task's effective policy invalid (two
+policies setting one field differently, a floor above a task's ceiling) is
+listed under `[autoscale]` by `--dry-run`, and refused by a plain apply.
+`--force` applies it anyway, and those tasks hold with state `invalid` until
+fixed ([autoscaling.md](autoscaling.md#overriding-the-defaults)).
 
 ```console
 $ legion namespace policy list
