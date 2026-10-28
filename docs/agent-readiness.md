@@ -63,7 +63,7 @@ Even with `--allow-write`, `legion_state_query` stays read-only.
 | `legion_job_info` | no | Inspect one job. A job whose placement found no room reports `status: blocked` with a `blocked` block: the key it waits on, the task, its per-placement shortfall, and the scheduler's message. It places on its own when capacity appears, so an agent should wait or add capacity, not resubmit ([Blocked evals](scheduler-and-eval-loop.md#blocked-evals)). For a [gang](gang-scheduling.md), `blocked.gang` says how many replicas fit (`placeable`, `running`) against the quorum it must place together (`min`), and, when it sets `placementTimeout`, when it gives up (`deadline`, Unix seconds): wait until then, or add capacity. A gang job past its deadline, or one whose `onMemberLoss` failed it, reports `status: failed` and places nothing until `legion job run`. |
 | `legion_job_spec` | no | Fetch a job's source submissions. |
 | `legion_job_schema` | no | JSON Schema for jobspecs + task runtimes. |
-| `legion_job_validate` | no | Validate a rendered jobspec (JSON). |
+| `legion_job_validate` | no | Validate a rendered jobspec (JSON). An unknown key is an error naming its path and the closest known key; `allow_unknown_fields` shows what a submit with the flag would keep and drop (`warnings`, `unknownFields`). |
 | `legion_rollout_list` | no | List rollouts. |
 | `legion_rollout_status` | no | Rollout progress + allocation health. |
 | `legion_instance_list` | no | List a job's stateful instances (slot + keyed), then its running [sessions](session-mode.md) (`mode: "session"`, `durable: false`) from the session index. The reply is `{ instances, nextIdlePageToken, complete, asOf }`: `complete: false` means some node that runs the job's sessions has not reported yet, so sessions may be missing. `include_idle: true` also lists instances [archived](suspend-and-resume.md#archiving-idle-instances) with `manifestOnly`, which have no row, from the bucket a page at a time (`idle_page_token`, `idle_page_size`); page until the token is empty, since a page can come back short. |
@@ -105,12 +105,12 @@ Even with `--allow-write`, `legion_state_query` stays read-only.
 | `legion_template_list` | no | List job templates (name, latest version, variable count). |
 | `legion_template_get` | no | One template version: declared variables, source, version history. |
 | `legion_template_render` | no | Dry-run a template: validate variables and return the rendered jobspec without submitting. |
-| `legion_job_run` | **yes** | Submit/update a job from rendered JSON. |
+| `legion_job_run` | **yes** | Submit/update a job from rendered JSON. `allow_unknown_fields` accepts keys Legion does not know, as `--allow-unknown-fields` does; the reply's `warnings` lists each one kept or dropped. |
 | `legion_job_stop` | **yes** | Stop a job. |
 | `legion_job_scale` | **yes** | Change a task's count without a new job version or rollout ([autoscaling.md](autoscaling.md)). Supports `idempotency_key`. |
 | `legion_job_scale_status` | no | Per-task spec vs override vs effective counts. |
 | `legion_job_destroy` | **yes** | Destroy a job. |
-| `legion_template_run` | **yes** | Render a template with variables and submit the job (supports `idempotency_key`). |
+| `legion_template_run` | **yes** | Render a template with variables and submit the job (supports `idempotency_key` and `allow_unknown_fields`). |
 | `legion_template_upsert` | **yes** | Store Nickel as the next immutable version of a template. |
 | `legion_template_delete` | **yes** | Delete a template and all of its versions (running jobs are unaffected). |
 | `legion_instance_create` | **yes** | Create a keyed-mode stateful instance (never-recycled id, supports `idempotency_key`). `from_snapshot` restores the new instance(s) from a snapshot of the job (an id or a name), on the snapshot's node, at most 64 per call. Needs `snapshot:read` too. On a [session task](session-mode.md), omitting `instance_id` starts an unnamed session with no raft write: the reply has `mode: "session"`, `durable: false`, and `nodeId`. Always pass `idempotency_key` there: the session id is derived from it, so a retry finds the same session. |
@@ -280,6 +280,29 @@ node runs gated by default and denies every outbound connection that nothing
 allows, so a task with no `network.egress` (and no policy object covering it)
 is warned about before its first `403 gated-default`. Each warning line ends
 with a `hint:` naming the fix.
+
+**Unknown keys are errors.** A key the jobspec does not know, at any level,
+fails `job validate`, `job plan`, and `job run` with `InvalidArgument`. The
+message lists every unknown key with its path and, when one is close, the
+known key it most likely meant; the envelope's `hint` says how to submit
+anyway:
+
+```json
+{ "ok": false, "error": { "code": "InvalidArgument",
+  "message": "failed to run job: Error parsing jobspec: web: task web: unknown field `cuont` (did you mean `count`?)",
+  "hint": "fix or remove each field above. To submit anyway, pass --allow-unknown-fields …",
+  "retryable": false } }
+```
+
+Fix the spec: the suggestion is usually the whole fix. `--allow-unknown-fields`
+(`allow_unknown_fields` on the RPCs and MCP tools) is for a key Legion cannot
+know yet, such as one meant for an app that is not installed: keys on the
+job, a task, a volume, a port, or a service are kept as pending, the rest are
+dropped, each one is a line in `warnings` (`job run`, `job plan`,
+`job validate`, `template run`), and the set is recorded on the version
+(`unknownFields` in `legion job info -j`). Don't set it by default; a spec
+that needs it should say why. See
+[Unknown Fields](jobs-tasks-and-scheduling.md#unknown-fields).
 
 ### Job templates: authoring by parameter instead of by spec
 
