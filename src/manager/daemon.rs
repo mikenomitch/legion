@@ -313,6 +313,7 @@ pub async fn run_manager_with(
     let store_copy_b = store.clone();
 
     let store_for_keyring = store.clone();
+    let store_for_rollups = store.clone();
 
     let store_for_shutdown = store.clone();
     let store_copy_c = store.clone();
@@ -697,6 +698,9 @@ pub async fn run_manager_with(
     // The idle sweep reads the usage table heartbeats fill, so it shares
     // the service's handle.
     let usage_for_idle_sweep = manager_node.usage_handle();
+    // The scaling-input rollup loop folds the same table (docs/autoscaling.md,
+    // "Scaling inputs").
+    let usage_for_rollups = manager_node.usage_handle();
     // A worker's full session report carries every session it holds (about
     // 200 bytes each); tonic's 4 MiB default would cap a node near 20,000
     // sessions. 64 MiB covers about 300,000 (session durability plan §6.5).
@@ -827,15 +831,25 @@ pub async fn run_manager_with(
         Ok::<(), anyhow::Error>(())
     };
     let keyring_fut = start_keyring_maintenance(store_for_keyring);
+    let rollup_manager_id = manager_node_id.clone();
+    let rollup_fut = async move {
+        crate::manager::scaling_inputs::run_rollup_loop(
+            store_for_rollups,
+            usage_for_rollups,
+            rollup_manager_id,
+        )
+        .await;
+    };
     // The background loops run as one task the daemon can abort: without an
     // API and raft transport they must not keep acting on the cluster.
     let background = tokio::spawn(async move {
-        let (checker, evals, concurrency, rotation, keyring) = join!(
+        let (checker, evals, concurrency, rotation, keyring, ()) = join!(
             node_checker_fut,
             eval_loop_fut,
             concurrency_fut,
             rotation_fut,
-            keyring_fut
+            keyring_fut,
+            rollup_fut
         );
         for (name, result) in [
             ("node status checker", checker),

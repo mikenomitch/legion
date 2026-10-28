@@ -410,6 +410,16 @@ goes into the state store: it changes every 10 seconds and is worthless after
 a restart, so a manager restart or failover shows no usage until the next
 report arrives.
 
+**Per node, ask the manager the node reports to; per task, ask any manager.**
+The per-node reply (`legion node usage`, below) is the raw report, held by
+the manager that received it. For the per-task view, every manager rolls its
+reports up per (node, task) every 10 seconds and sends them to the manager
+that leads the status lane, on the liveness digest. That manager merges them
+and serves `GetScalingInputs` (and the usage table in `legion job info`),
+and any other manager forwards the request to it, so the per-task numbers are
+cluster-wide wherever you ask. See
+[Scaling inputs](autoscaling.md#scaling-inputs).
+
 ### `legion node usage`
 
 ```console
@@ -489,9 +499,12 @@ Known gaps:
 - **Only governed allocations are measured.** Tasks on `noop` and on
   third-party plugins that haven't adopted enforcement show a reservation and
   no usage, and node `used` doesn't count them.
-- **Usage lives on the manager that received the heartbeat.** With several
-  managers, ask the one the node reports to. Another manager answers with
-  `usage_reported: false`.
+- **Per-node usage lives on the manager that received the heartbeat.** With
+  several managers, `legion node usage <node>` must reach the one the node
+  reports to; another manager answers with `usage_reported: false`. Per-task
+  usage is cluster-wide on every manager through `GetScalingInputs` and
+  `legion job info`, at 10-second rollup resolution
+  ([Scaling inputs](autoscaling.md#scaling-inputs)).
 - **A `sandbox` task's memory is the VMM's.** Guest pages the VMM touched stay
   charged even after the guest frees them, because there is no balloon or free
   page reporting yet.
@@ -725,7 +738,7 @@ Metrics: `legion_node_pressure_actions_total{node,step}` on the manager and
 | Submit warns: "sets resources.cpus = 1, which is 1 MHz, not 1 CPU(s)" | `cpu` and its alias `cpus` are in MHz, and the value reads like a CPU count | Declare `cpu` in MHz (`cpu = 1000`), or `cores` for whole CPUs |
 | Submit fails: "declares both resources.cores and resources.cpu" | Two CPU contracts on one task | Pick one |
 | Submit fails: "resources.cores together with config.cgroup" | Legion can't fence an `exec` task that names its own cgroup | Drop `cores`, or drop `cgroup` and let the worker place the task |
-| `legion node usage` says "no usage reported" | Enforcement is off on that worker, the worker predates usage reporting, no report has reached this manager since it started, or the node reports to another manager | Turn on `resourceEnforcement.enabled`, upgrade the worker, wait 10 seconds, or ask the manager the node reports to |
+| `legion node usage` says "no usage reported" | Enforcement is off on that worker, the worker predates usage reporting, no report has reached this manager since it started, or the node reports to another manager | Turn on `resourceEnforcement.enabled`, upgrade the worker, wait 10 seconds, or ask the manager the node reports to. `legion job info` shows the job's per-task usage from any manager |
 | `usage sampled` age keeps growing past 10s | The node stopped heartbeating, or stopped sending reports | Check `legion node list`. Reports older than 2 minutes are dropped and the node's gauges fall to zero |
 | A sandbox is OOM-killed with plenty of guest memory free | The VMM needs more than `sandbox.vmmOverheadMiB` | Raise `sandbox.vmmOverheadMiB` on that worker type |
 | Allocation fails: "failed to place task … within this node's resource limits: cgroup … does not delegate the … controller(s)" | A cgroup in Legion's hierarchy (`cgroupParent`, `share`, or `reserve`) could not put `cpuset`, `cpu`, and `memory` in its `cgroup.subtree_control`, usually because its parent doesn't offer them (`cgroup.controllers`) | The message prints both files. Delegate the missing controller from the parent cgroup down. Processes found sitting in `share` or `reserve` themselves are moved into a `stray` child first, since the kernel won't delegate from a cgroup that holds processes |
@@ -752,7 +765,9 @@ See [docs/task-runtime-exec.md](task-runtime-exec.md).
 ## Not implemented
 
 - **Usage-aware placement.** The scheduler packs on reservations times the
-  ratio, never on measured usage.
+  ratio, never on measured usage. Per-task usage is collected cluster-wide
+  ([Scaling inputs](autoscaling.md#scaling-inputs)), but nothing places or
+  scales on it yet.
 - **macOS.** Apple `container` has no CPU weight or pinning equivalent.
   `memory` and `cores` size the guest VM, and `cpu` (MHz) is used only for
   scheduling.

@@ -92,6 +92,7 @@ fn endpoint_table() -> Vec<(&'static str, Plane)> {
         // (docs/autoscaling.md): resize rights without redeploy rights.
         ("ScaleTask", Plane::Protected("scale:write")),
         ("GetJobScaleStatus", Plane::Protected("scale:read")),
+        ("GetScalingInputs", Plane::Protected("scale:read")),
         ("DestroyJob", Plane::Protected("job:write")),
         ("ListJobs", Plane::Protected("job:read")),
         // Namespaces (docs/namespaces.md). ListNamespaces filters per item
@@ -563,6 +564,19 @@ async fn call_endpoint(
             .get_job_scale_status(req(
                 GetJobScaleStatusRequest {
                     name: JOB_NAME.into(),
+                },
+                token,
+            ))
+            .await
+            .map(|_| ()),
+        "GetScalingInputs" => svc
+            .get_scaling_inputs(req(
+                GetScalingInputsRequest {
+                    targets: vec![ScalingTargetSelector {
+                        job: JOB_NAME.into(),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
                 },
                 token,
             ))
@@ -3348,6 +3362,80 @@ fn token_with_rules(svc: &ManagerDaemonService, name: &str, rules: &str) -> R<(S
         .mint_token(&svc.store, name, "client", &[name.into()], None)
         .map_err(|s| anyhow!(s.to_string()))?;
     Ok((info.accessor_id, secret))
+}
+
+/// GetScalingInputs gates before it fetches and filters listings: a caller
+/// with `scale:read` on one job reads that job, is refused (not told "job not
+/// found") for a job outside its grant, and sees only its job in a namespace
+/// listing; a caller with no `scale` grant at all is refused outright.
+#[tokio::test]
+async fn scaling_inputs_check_before_fetch_and_filter_listings() -> R<()> {
+    let (svc, _fixtures, _) = setup_enabled()?;
+    let (_, scoped) = token_with_rules(
+        &svc,
+        "scale-one-job",
+        &format!(
+            r#"[{{"resources": ["scale"], "namespaces": ["*"], "actions": ["read"], "names": ["{JOB_NAME}"]}}]"#
+        ),
+    )?;
+    let named = |job: &str| GetScalingInputsRequest {
+        targets: vec![ScalingTargetSelector {
+            job: job.into(),
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+
+    let reply = svc
+        .get_scaling_inputs(req(named(JOB_NAME), Some(&scoped)))
+        .await?
+        .into_inner();
+    assert!(!reply.inputs.is_empty());
+    assert!(reply
+        .inputs
+        .iter()
+        .all(|inputs| inputs.job_id == JOB_NAME && inputs.error.is_empty()));
+
+    let status = svc
+        .get_scaling_inputs(req(named("no-such-job"), Some(&scoped)))
+        .await
+        .expect_err("a job outside the grant is refused before any lookup");
+    assert_eq!(status.code(), Code::PermissionDenied);
+
+    let listing = svc
+        .get_scaling_inputs(req(
+            GetScalingInputsRequest {
+                namespaces: vec!["*".into()],
+                ..Default::default()
+            },
+            Some(&scoped),
+        ))
+        .await?
+        .into_inner();
+    assert!(
+        listing
+            .inputs
+            .iter()
+            .all(|inputs| inputs.job_id == JOB_NAME),
+        "a listing shows only jobs the caller may read, got {:?}",
+        listing
+            .inputs
+            .iter()
+            .map(|inputs| &inputs.job_id)
+            .collect::<Vec<_>>()
+    );
+
+    let (_, job_reader) = token_with_rules(
+        &svc,
+        "job-read-only",
+        r#"[{"resources": ["job"], "namespaces": ["*"], "actions": ["read"]}]"#,
+    )?;
+    let status = svc
+        .get_scaling_inputs(req(named(JOB_NAME), Some(&job_reader)))
+        .await
+        .expect_err("job:read is not scale:read");
+    assert_eq!(status.code(), Code::PermissionDenied);
+    Ok(())
 }
 
 /// Node lookups gate before they fetch: a caller with no node access gets

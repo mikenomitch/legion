@@ -324,15 +324,29 @@ impl RaftTransport for RaftTransportService {
                     .lane_leader_hint(crate::storage::Lane::Status)
                     .unwrap_or_default(),
                 served_interval_seconds: None,
+                rollup_resync: false,
             }));
         }
-        store
-            .liveness()
-            .observe_peer(&digest.observer_manager_id, digest.seen_node_ids);
+        // A rollup-only digest carries no node ids, and an empty list is not
+        // a liveness observation: replacing the peer's claimed set with
+        // nothing would drop its nodes' peer-gap protection.
+        if !digest.seen_node_ids.is_empty() {
+            store
+                .liveness()
+                .observe_peer(&digest.observer_manager_id, digest.seen_node_ids);
+        }
+        // Scaling-input rollups (docs/autoscaling.md, "Scaling inputs").
+        let rollup_resync = digest.rollups.as_ref().is_some_and(|sync| {
+            store
+                .scaling_rollups()
+                .apply_peer_sync(&digest.observer_manager_id, sync)
+                == crate::manager::scaling_inputs::SyncVerdict::Resync
+        });
         Ok(Response::new(NodeLivenessDigestReply {
             accepted: true,
             not_status_leader: false,
             leader_hint: String::new(),
+            rollup_resync,
             // The leader owns the cadence ladder; a follower relays this to
             // its own workers so adaptive cadence is not leader-only.
             served_interval_seconds: store

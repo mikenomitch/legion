@@ -139,6 +139,7 @@ Benchmark targets:
 - `benchmarks/micro/scheduler_bench.rs` (Criterion)
 - `benchmarks/micro/eval_critical_path_bench.rs` (Criterion)
 - `benchmarks/micro/net_bench.rs` (Criterion)
+- `benchmarks/micro/scaling_rollup_bench.rs` (Criterion)
 - `tests/integration/scheduler_benchmark_slo.rs` (scenario runner + SLO gate, CI)
 - `tests/integration/scheduler_scale_benchmark.rs` (scenario × persistence-backend
   matrix, manual)
@@ -283,6 +284,27 @@ What they measure:
   Datapath changes in `src/worker/forwarder.rs`, `src/worker/netd/`, or
   `src/worker/balance.rs` should report before/after numbers from this
   target. Run it on Linux for anything that touches the copy path.
+- `scaling_rollup_bench`: the cost of each step of the
+  [scaling-input rollups](autoscaling.md#scaling-inputs), at the plan's
+  sizing of about 10,000 tasks on 3 nodes each (33,330 replicas):
+  - `edge_record`: folding one heartbeat's service-graph samples into the
+    pending map, the only work the rollups add to the heartbeat path.
+  - `rollup_build`: one manager's 10-second fold of its nodes' latest reports
+    into per-(node, task) rollups.
+  - `sender_sync`: building the delta for a steady fleet (the empty
+    confirming sync) and for one where every rollup changed.
+  - `leader_merge`: the status-lane leader applying one peer's full sync and
+    a steady delta, and its 10-second history pass.
+  - `totals_read`: one task's sum across its nodes, per `GetScalingInputs`
+    target.
+
+  ```console
+  $ cargo bench --bench scaling_rollup_bench
+  ```
+
+  Everything but `edge_record` runs once per 10 seconds per manager, off the
+  heartbeat path. Changes to `src/manager/scaling_inputs.rs` should report
+  before/after numbers from this target.
 - `plan_contention`: N concurrent single-allocation submits against one
   pool, processed by real eval workers. It measures conflict rejections,
   requeues, fallback binds, dropped evals, and time until everything is
@@ -312,6 +334,7 @@ Run commands:
 
 - `cargo bench --bench scheduler_bench`
 - `cargo bench --bench eval_critical_path_bench`
+- `cargo bench --bench scaling_rollup_bench`
 - `cargo test --test integration scheduler_benchmark_slo:: -- --ignored --nocapture`
 - `cargo test --test integration plan_contention:: -- --ignored --nocapture`
 - Full backend matrix (use a release build for recorded numbers):

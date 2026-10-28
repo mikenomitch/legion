@@ -198,6 +198,18 @@ path. Liveness is process-local memory and the RPC is never used. A
 multi-manager `single`-topology cluster does use it: there the one raft leader
 owns liveness, and every follower a worker talks to sends it digests.
 
+**The digest also carries scaling-input rollups.** Every 10 seconds each
+manager that does not lead the status lane sends one more `ReportNodeLiveness`
+with no node ids and its usage and service-graph rollups, one per (node,
+task) ([Scaling inputs](autoscaling.md#scaling-inputs)). It rides its own
+call, so the 1-second liveness digest keeps its size and cadence, and a digest
+with no node ids leaves the leader's liveness state alone: it is not an
+observation that the manager heard from nobody. The rollups are
+delta-encoded. A leader that holds no state for the sender (it just took the
+lane) answers `rollup_resync`, and the sender replies at once with its full
+set. The cost is managers x 1 RPC every 10 seconds, sized by (node, task)
+pairs, not by fleet size or sample count.
+
 ### Peer-gap suppression
 
 If a peer manager's digests stop arriving, its nodes look silent to the
@@ -313,7 +325,7 @@ The manager refuses to start, naming the offending values, if:
 | --- | --- |
 | `legion_liveness_tracked_nodes` | Nodes in this manager's table. Equals `legion_nodes{status="active"}` on the owner and 0 elsewhere. |
 | `legion_liveness_responsible_seconds` | Seconds since this manager became responsible. Resets at every acquisition. |
-| `legion_liveness_digest_rpcs_total{outcome}` | `ok` / `not_leader` / `error` / `unimplemented`. |
+| `legion_liveness_digest_rpcs_total{outcome}` | `ok` / `not_leader` / `error` / `unimplemented`. Liveness digests only; rollup syncs count in `legion_scaling_rollup_syncs_total` ([metrics.md](metrics.md#scaling-inputs)). |
 | `legion_liveness_digest_nodes` | Node ids per digest. |
 | `legion_liveness_peer_stale{peer}` | Alert on this for a quiet peer manager. |
 | `legion_liveness_loss_suppressed_total{reason}` | `failover_grace` / `peer_digest_gap` / `mass_disruption`. |
@@ -375,6 +387,9 @@ meaning. The checkpoint writes it instead of every beat.
   decided from the ids plus the digest's own timestamp, at `digestInterval`
   resolution. The checkpoint is therefore coarser for nodes that dial a
   follower.
+- **Scaling-input rollups are leader-local too.** Like the liveness table,
+  the status-lane leader's merged rollups start empty after a takeover and
+  are whole again once every manager's resync lands, within 10 seconds.
 - **Liveness is not gossiped.** Per-node cost on the manager still grows
   linearly with fleet size. Gossip or SWIM would flatten that curve and is not
   implemented. It would replace only the input to the liveness table. The

@@ -206,6 +206,11 @@ name = "net_bench"
 path = "benchmarks/micro/net_bench.rs"
 harness = false
 
+[[bench]]
+name = "scaling_rollup_bench"
+path = "benchmarks/micro/scaling_rollup_bench.rs"
+harness = false
+
 # The AWS rig's native job submitter. Not part of the product: it exists
 # because the rig's per-job `legion job run` process spawn ceilinged at ~36-103
 # jobs/sec and was being reported as Legion's throughput. It links against this
