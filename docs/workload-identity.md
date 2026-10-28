@@ -868,8 +868,9 @@ Vault can bind arbitrary claims, so you rarely need a custom `subTemplate`.
 A task can authenticate to Legion itself with the reserved identity name
 `legion`. Declare it like any other identity, but **omit `audience`**. The
 manager owns it and always sets `aud` to the cluster issuer. Say what the job
-may do in Legion with `permissions`, and nothing else is needed: no manager
-config, no address, and no token handling in the task.
+may do in Legion with `permissions`, and, once workload identity is enabled,
+nothing else is needed: no other manager config, no address, and no token
+handling in the task.
 
 ```nickel
 identities = [{
