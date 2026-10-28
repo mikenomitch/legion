@@ -321,6 +321,7 @@ pub fn seed_record(
 pub fn seed_bundled_apps(
     store: &crate::storage::store::Store,
     seed: &BTreeMap<String, AppSeedConfig>,
+    build: &BuildMarker,
 ) -> R<Vec<String>> {
     let manifests = crate::apps::bundled_manifests()?;
     for name in seed.keys() {
@@ -355,7 +356,7 @@ pub fn seed_bundled_apps(
             );
             store.events().app_installed(
                 &manifest.name,
-                &crate::util::own_build().short(),
+                &build.short(),
                 "bundled",
                 BOOTSTRAP_PRINCIPAL,
             );
@@ -380,7 +381,7 @@ impl AppReconciler {
 
     /// Seed bundled apps (see [`seed_bundled_apps`]).
     pub fn seed(&self) -> R<Vec<String>> {
-        seed_bundled_apps(self.store(), &self.settings.seed)
+        seed_bundled_apps(self.store(), &self.settings.seed, &self.settings.own_build)
     }
 
     /// Reconcile every installed app once.
@@ -759,9 +760,10 @@ impl AppReconciler {
         let message = status
             .message()
             .lines()
-            .next()
-            .unwrap_or_default()
-            .to_string();
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .collect::<Vec<_>>()
+            .join(" ");
         let refused = is_refusal(status);
         let now = Instant::now();
         let runtime = self.runtime.entry(name.to_string()).or_default();
@@ -997,6 +999,20 @@ pub fn placement_label(settings: &AppSettings) -> String {
     }
 }
 
+/// Submit `rendered` for `record` exactly as the reconciler does, with
+/// idempotency key `key`: `(message, deduplicated)`. For tests that play a
+/// leader which dies after its submit lands.
+pub fn submit_rendered(
+    svc: &ManagerDaemonService,
+    record: &AppRecord,
+    rendered: &RenderedApp,
+    key: &str,
+) -> R<(String, bool)> {
+    crate::manager::server::run_blocking(|| svc.submit_app_job(record, rendered, key))
+        .map(|submit| (submit.message, submit.deduplicated))
+        .map_err(|status| anyhow!("{}", status.message()))
+}
+
 /// The rendered job of `record` as the reconciler would submit it now
 /// (`marker` for bundled apps), for tests and `legion app status`.
 pub fn render_for(
@@ -1010,6 +1026,92 @@ pub fn render_for(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn reconciler_over_a_store() -> R<(AppReconciler, crate::storage::store::Store)> {
+        let dir = tempfile::tempdir_in(crate::test_scratch::root())?.keep();
+        let store = crate::storage::store::Store::start_storage(
+            &crate::structs::config::ManagerConfigFull {
+                store_path: dir.to_str().context("utf-8")?.to_string(),
+                ..Default::default()
+            },
+        )?;
+        let svc = Arc::new(ManagerDaemonService::new(store.clone()));
+        let reconciler = AppReconciler::new(
+            svc,
+            ReconcilerSettings {
+                app_user: "nobody".into(),
+                seed: BTreeMap::new(),
+                own_build: BuildMarker {
+                    version: "0.1.0".into(),
+                    build_id: "a".into(),
+                },
+            },
+        );
+        Ok((reconciler, store))
+    }
+
+    /// A transient failure backs off (5s, then 10s), skips passes until the
+    /// retry is due unless the record changes, marks the app degraded, and
+    /// announces itself once per 10 minutes.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_failing_submit_backs_off() -> R<()> {
+        let (mut reconciler, store) = reconciler_over_a_store()?;
+        let manifest = crate::apps::bundled_manifest("autoscaler").context("bundled")?;
+        let record = seed_record(manifest, None);
+        store.seed_app(record.clone())?;
+        let unavailable = tonic::Status::unavailable("the store is busy");
+
+        let started = Instant::now();
+        let outcome = reconciler.failed(
+            "autoscaler",
+            &record,
+            &record.state,
+            record.state.clone(),
+            &unavailable,
+            "d",
+        );
+        assert_eq!(outcome, PassOutcome::Failed("the store is busy".into()));
+        let retry = reconciler.next_retry().context("a retry")?.0;
+        assert!(retry >= started + FIRST_BACKOFF && retry < started + 2 * FIRST_BACKOFF);
+        let stored = store.get_app("autoscaler")?.context("app")?;
+        assert_eq!(
+            stored.state.last_error,
+            "reconcile failing: the store is busy"
+        );
+
+        reconciler.failed(
+            "autoscaler",
+            &stored,
+            &stored.state,
+            stored.state.clone(),
+            &unavailable,
+            "d",
+        );
+        let retry = reconciler.next_retry().context("a retry")?.0;
+        assert!(retry >= started + 2 * FIRST_BACKOFF, "the backoff doubled");
+        let announced =
+            store.list_scheduler_events(&crate::storage::events::SchedulerEventFilter {
+                kind: Some("app.reconcile_failed".into()),
+                ..Default::default()
+            })?;
+        assert_eq!(announced.len(), 1, "announced once per 10 minutes");
+
+        // In backoff, with the record unchanged: skipped.
+        assert_eq!(
+            reconciler.reconcile_app("autoscaler").await,
+            PassOutcome::Skipped
+        );
+        // A record write is a new input: tried now (and, with no node to
+        // run on, it waits for a build marker).
+        let mut changed = stored.clone();
+        changed.updated_at = "later".into();
+        store.update_app(changed, &stored.updated_at)?;
+        assert!(matches!(
+            reconciler.reconcile_app("autoscaler").await,
+            PassOutcome::Waiting(_)
+        ));
+        Ok(())
+    }
 
     #[test]
     fn backoff_doubles_from_five_seconds_to_five_minutes() {

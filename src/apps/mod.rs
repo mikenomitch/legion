@@ -10,7 +10,7 @@
 //! - read the app's config from `$LEGION_APP_CONFIG` (the file the app
 //!   reconciler renders into the job, resolved by the worker to a path the
 //!   task can open);
-//! - serve the app's HTTP port (`$LEGION_ADDR_API`, the manifest's `api`
+//! - serve the app's HTTP port (`$LEGION_PORT_API`, the manifest's `api`
 //!   port) with `/healthz`, answering from the health the app body sets;
 //! - hand the body an [`AppContext`] that connects to Legion through
 //!   `LEGION_ADDR` (the allocation's API socket, authenticated as the app's
@@ -38,8 +38,7 @@ use std::time::Duration;
 /// on its own terms.
 pub const SHUTDOWN_GRACE: Duration = Duration::from_secs(10);
 
-/// The port name an app's HTTP listener binds (`$LEGION_ADDR_API`,
-/// `$LEGION_PORT_API`).
+/// The port name an app's HTTP listener binds (`$LEGION_PORT_API`).
 pub const APP_PORT_NAME: &str = "api";
 
 /// What an app body returns.
@@ -211,7 +210,7 @@ impl AppContext {
 /// `legion app run` arguments.
 #[derive(Debug, Clone, Default)]
 pub struct RunOptions {
-    /// Listen here instead of `$LEGION_ADDR_API`.
+    /// Listen here instead of `$LEGION_PORT_API`.
     pub listen: Option<String>,
     /// Read the config here instead of `$LEGION_APP_CONFIG`.
     pub config: Option<PathBuf>,
@@ -238,18 +237,19 @@ fn config_path(options: &RunOptions) -> Option<PathBuf> {
     }
 }
 
-/// The listen address: the option, else `$LEGION_ADDR_API`, else
-/// `127.0.0.1:$LEGION_PORT_API`, else an ephemeral loopback port.
+/// The listen address: the option, else every interface on
+/// `$LEGION_PORT_API` (the port to bind, as for any task's port: in a gated
+/// task it is inside the task's own namespace), else an ephemeral loopback
+/// port.
 fn listen_addr(options: &RunOptions) -> R<SocketAddr> {
     let port_env = APP_PORT_NAME.to_ascii_uppercase();
     let raw = options
         .listen
         .clone()
-        .or_else(|| std::env::var(format!("LEGION_ADDR_{port_env}")).ok())
         .or_else(|| {
             std::env::var(format!("LEGION_PORT_{port_env}"))
                 .ok()
-                .map(|port| format!("127.0.0.1:{}", port.trim()))
+                .map(|port| format!("0.0.0.0:{}", port.trim()))
         })
         .unwrap_or_else(|| "127.0.0.1:0".to_string());
     raw.trim()
@@ -316,7 +316,8 @@ pub async fn run_app(name: &str, options: RunOptions) -> R<()> {
     info!(
         app = name,
         %listen,
-        build = %crate::util::own_build().short(),
+        build = %std::env::var(crate::structs::app::APP_BUILD_ENV)
+            .unwrap_or_else(|_| env!("CARGO_PKG_VERSION").to_string()),
         legion = context.legion_addr().is_some(),
         "App started"
     );
@@ -463,7 +464,10 @@ mod tests {
                 state: Default::default(),
                 manifest: manifest.clone(),
             };
-            let marker = crate::util::own_build();
+            let marker = crate::structs::app::BuildMarker {
+                version: env!("CARGO_PKG_VERSION").to_string(),
+                build_id: "test".to_string(),
+            };
             let rendered = crate::structs::app::render_app_job(
                 &record,
                 crate::structs::app::RenderContext {

@@ -1986,6 +1986,21 @@ mod app_tests {
         );
     }
 
+    /// The shipped example manifest evaluates, validates, and renders.
+    #[test]
+    fn the_example_app_manifest_is_valid() {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/configs/apps/example-app.ncl");
+        let json = crate::config_lang::eval_file(path).expect("evaluates");
+        let manifest = AppManifest::from_json(&json).expect("parses");
+        manifest.validate(false).expect("valid");
+        assert_eq!(
+            manifest.ui_slots(),
+            vec!["nav".to_string(), "job".to_string()]
+        );
+        let rendered = render_app_job(&record(manifest), NO_MARKER).expect("renders");
+        serde_json::from_value::<crate::structs::JobConfig>(rendered.jobspec).expect("a jobspec");
+    }
+
     #[test]
     fn canonical_json_sorts_keys() {
         let a: Value = serde_json::from_str(r#"{"b":1,"a":{"d":2,"c":3}}"#).unwrap();

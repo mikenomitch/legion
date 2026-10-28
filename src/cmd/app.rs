@@ -280,7 +280,7 @@ pub fn config() -> Command {
                     Arg::new("listen")
                         .long("listen")
                         .value_name("ADDR")
-                        .help("Listen here instead of $LEGION_ADDR_API"),
+                        .help("Listen here instead of every interface on $LEGION_PORT_API"),
                 )
                 .arg(
                     Arg::new("config")

@@ -550,10 +550,7 @@ impl ManagerDaemonService {
             installed_by: identity.principal.clone(),
             installed_at: now.clone(),
             updated_at: now,
-            state: AppReconcileState {
-                pending_change: "installed".to_string(),
-                ..Default::default()
-            },
+            state: AppReconcileState::default(),
             manifest: manifest.clone(),
         };
         if inner.dry_run {

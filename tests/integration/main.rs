@@ -29,6 +29,7 @@ mod acl_default_on;
 mod acl_endpoints;
 mod api_socket;
 mod apple_container_idle;
+mod apps;
 mod archive_integration;
 mod artifact_staging_integration;
 mod blocked_evals;

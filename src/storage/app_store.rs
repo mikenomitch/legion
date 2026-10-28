@@ -49,7 +49,7 @@ impl AppJobVersion {
 /// An app job's allocations.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct AppJobAllocations {
-    /// Allocations reported running.
+    /// Allocations reported running and healthy.
     pub running: u32,
     /// Allocations not yet complete or failed (pending and running).
     pub live: u32,
@@ -318,8 +318,10 @@ impl Store {
     /// meta carries; `None` when the job does not exist.
     #[instrument(err, skip_all, fields(job_id))]
     pub fn app_job_version(&self, job_id: &str) -> R<Option<AppJobVersion>> {
+        /// The job's status, and its latest version's id, number, and meta.
+        type LatestVersionRow = (String, Option<String>, Option<i64>, Option<Value>);
         let conn = self.read_connection()?;
-        let row: Option<(String, Option<String>, Option<i64>, Option<Value>)> = conn
+        let row: Option<LatestVersionRow> = conn
             .query_row(
                 "SELECT j.status, jc.id, jc.version, jc.meta
                  FROM job j
@@ -359,25 +361,27 @@ impl Store {
             .and_then(|version| version.managed_by))
     }
 
-    /// Job `job_id`'s allocations across its versions: how many run, how
-    /// many are live, and where they run.
+    /// Job `job_id`'s allocations across its versions: how many run (their
+    /// latest health report says healthy, as the scaling inputs' `ready`
+    /// counts them), how many are live, and where the running ones are.
     #[instrument(err, skip_all, fields(job_id))]
     pub fn app_job_allocations(&self, job_id: &str) -> R<AppJobAllocations> {
         let conn = self.read_connection()?;
         let mut stmt = conn.prepare(
-            "SELECT a.status, a.node_id FROM allocation a
+            "SELECT COALESCE(ah.healthy, 0), a.node_id FROM allocation a
              INNER JOIN job_config jc ON jc.id = a.job_config_id
              INNER JOIN job j ON j.id = jc.job_id
+             LEFT JOIN allocation_health ah ON ah.allocation_id = a.id
              WHERE j.name = ?1 AND a.status NOT IN ('complete', 'failed');",
         )?;
         let rows = stmt.query_map([job_id], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
         })?;
         let mut counts = AppJobAllocations::default();
         for row in rows {
-            let (status, node) = row?;
+            let (healthy, node) = row?;
             counts.live += 1;
-            if status == "running" {
+            if healthy != 0 {
                 counts.running += 1;
                 if !counts.nodes.contains(&node) {
                     counts.nodes.push(node);

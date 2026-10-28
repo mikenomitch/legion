@@ -3082,6 +3082,20 @@ mod tests {
         assert!(names.contains(&"legion_job_logs"));
     }
 
+    /// The app read tools are listed without `--allow-write`
+    /// (docs/apps.md).
+    #[test]
+    fn app_tools_are_read_only() {
+        let names: Vec<&str> = available_tools(false).iter().map(|t| t.name).collect();
+        assert!(names.contains(&"legion_app_list"));
+        assert!(names.contains(&"legion_app_status"));
+        let status = tool_defs()
+            .into_iter()
+            .find(|tool| tool.name == "legion_app_status")
+            .expect("legion_app_status");
+        assert_eq!((status.input_schema)()["required"], json!(["app"]));
+    }
+
     #[test]
     fn service_discovery_tools_are_read_only() {
         let names: Vec<&str> = available_tools(false).iter().map(|t| t.name).collect();

@@ -25,7 +25,7 @@ use std::time::{Duration, Instant};
 
 /// One cluster of this module at a time: each is a whole manager plus a
 /// worker, and two at once on a loaded machine only add port races.
-static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+pub(crate) static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 fn free_port() -> u16 {
     TcpListener::bind("127.0.0.1:0")
@@ -34,7 +34,7 @@ fn free_port() -> u16 {
         .port()
 }
 
-struct Cluster {
+pub(crate) struct Cluster {
     dir: tempfile::TempDir,
     port: u16,
     manager: Child,
@@ -47,7 +47,7 @@ impl Cluster {
     /// manager. So a start that lost either bind is retried on new ports:
     /// the manager exits when it cannot bind its API port, and its worker
     /// logs `Address already in use` when it cannot bind the worker port.
-    fn start(run_worker: bool) -> Cluster {
+    pub(crate) fn start(run_worker: bool) -> Cluster {
         for attempt in 1..=3 {
             let cluster = Self::spawn(run_worker);
             let deadline = Instant::now() + Duration::from_secs(90);
@@ -93,7 +93,7 @@ impl Cluster {
         !lost
     }
 
-    fn first_node_id(&self) -> Option<String> {
+    pub(crate) fn first_node_id(&self) -> Option<String> {
         let nodes = self.cli_json(&["node", "list"]);
         nodes["data"]
             .as_array()
@@ -147,11 +147,16 @@ impl Cluster {
         Cluster { dir, port, manager }
     }
 
+    /// The cluster's directory: its store, data dir, and log.
+    pub(crate) fn dir(&self) -> &std::path::Path {
+        self.dir.path()
+    }
+
     fn token_file(&self) -> PathBuf {
         self.dir.path().join("home").join(".legion").join("token")
     }
 
-    fn cli(&self, args: &[&str]) -> Output {
+    pub(crate) fn cli(&self, args: &[&str]) -> Output {
         Command::new(env!("CARGO_BIN_EXE_legion"))
             .args(args)
             .env("LEGION_ADDR", format!("http://127.0.0.1:{}", self.port))
@@ -164,7 +169,7 @@ impl Cluster {
             .expect("run legion")
     }
 
-    fn cli_json(&self, args: &[&str]) -> serde_json::Value {
+    pub(crate) fn cli_json(&self, args: &[&str]) -> serde_json::Value {
         let mut with_json = args.to_vec();
         with_json.push("-j");
         let out = self.cli(&with_json);
@@ -183,7 +188,7 @@ impl Cluster {
         path.to_str().expect("utf-8").to_string()
     }
 
-    fn wait_for(&self, what: &str, mut ok: impl FnMut() -> bool) {
+    pub(crate) fn wait_for(&self, what: &str, mut ok: impl FnMut() -> bool) {
         let started = Instant::now();
         while !ok() {
             if started.elapsed() > Duration::from_secs(90) {
@@ -201,7 +206,7 @@ impl Cluster {
 
     /// The single registered node (`start` waited for it): `node info`'s
     /// data.
-    fn the_node(&self) -> serde_json::Value {
+    pub(crate) fn the_node(&self) -> serde_json::Value {
         let id = self.first_node_id().expect("start waited for the node");
         let info = self.cli_json(&["node", "info", &id]);
         assert_eq!(info["ok"], true, "{info}");
@@ -209,7 +214,7 @@ impl Cluster {
     }
 
     /// `node usage`'s data for `node`: its capacity and allocations.
-    fn usage(&self, node: &str) -> serde_json::Value {
+    pub(crate) fn usage(&self, node: &str) -> serde_json::Value {
         let usage = self.cli_json(&["node", "usage", node]);
         assert_eq!(usage["ok"], true, "{usage}");
         usage["data"].clone()
