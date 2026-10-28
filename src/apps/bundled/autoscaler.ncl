@@ -97,7 +97,7 @@
     { pointer = "/plugins/*/source", artifact = true },
     "/plugins/*/command",
     "/plugins/*/url",
-    "/plugins/*/builtin",
-    "/plugins/*/config",
+    # An `exec` target's command: a program the app runs.
+    "/plugins/*/config/command",
   ],
 }

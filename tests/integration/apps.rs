@@ -995,6 +995,24 @@ async fn a_code_field_change_needs_the_grant_test() -> R<()> {
         "{}",
         refused.message()
     );
+    // So is an `exec` target's command: a program the app would run.
+    let refused = fx
+        .set_config(
+            "autoscaler",
+            json!({ "plugins": {
+                "prom": { "builtin": "prometheus", "config": { "address": "http://p:9090" } },
+                "run": { "builtin": "exec", "config": { "command": ["/bin/sh", "-c", "id"] } },
+            } }),
+            &operator,
+        )
+        .await
+        .expect_err("an exec command is code");
+    assert_eq!(refused.code(), Code::PermissionDenied);
+    assert!(
+        refused.message().contains("/plugins/run/config/command"),
+        "{}",
+        refused.message()
+    );
     // Someone holding the grant (and app:write) may.
     let mut holder_rules = editor_rules();
     holder_rules

@@ -3,8 +3,9 @@
 #
 #   legion app config set autoscaler -f configs/scaling/autoscaler-app-config.ncl
 #
-# Only the operator sets this: every plugin field but `namespaces` is a code
-# field, so changing one needs the app's whole grant. Policies name a plugin and supply data
+# Only the operator sets this. A plugin's `source`, `command`, `url`, and an
+# `exec` target's `config.command` are code fields: changing one needs the
+# app's whole grant, not just `app:write`. Policies name a plugin and supply data
 # (a query, a target value, a config record); they never carry a command or
 # a URL. `namespaces` limits which namespaces' policies may use a plugin;
 # leave it out to allow every namespace.

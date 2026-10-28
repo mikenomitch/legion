@@ -1685,22 +1685,33 @@ reply to the next request, because the process that owed it is gone.
 Concurrency is a follow-up (a per-plugin `concurrency` setting) once a real
 plugin needs it.
 
-## 68. Every plugin field but `namespaces` is a code field
+## 68. A plugin's code fields are what it runs: `source`, `command`, `url`, and an `exec` target's `config.command`
 
-*Implementation, Phase 4 (`src/apps/bundled/autoscaler.ncl` `codeFields`).*
+*Implementation, Phase 4 (`src/apps/bundled/autoscaler.ncl` `codeFields`;
+extends the apps plan's `source` and `url`, §6.3).*
 
-**Call.** `source` (an artifact), `command`, `url`, `builtin`, and `config`
-are code fields of the autoscaler's app config; only `namespaces` is plain
-config.
+**Call.** Changing a plugin's `source` (an artifact), `command`, `url`, or
+an `exec` target's `config.command` needs the app's whole grant. A built-in
+source's `config` (a Prometheus `address`, an `http` `url`), `builtin`, and
+`namespaces` need only `app:write` on the autoscaler.
 
-**Alternatives.** Only `source`, `command`, and `url`.
+```text
+Error: changing app autoscaler's code (/plugins/render/config/command) runs code with its grant, ...
+```
 
-**Trade-off.** Changing a Prometheus address or an `exec` target's
-command needs the app's whole grant, not just `app config` rights.
+**Alternatives.**
+- (a) The apps plan's two fields only (`source`, `url`).
+- (b) Every plugin field but `namespaces`, `config` included.
 
-**Why (security boundary).** `config` holds an `exec` target's command and
-a source's address, so it decides what the app runs and where it sends its
-requests, just as `command` and `url` do.
+**Trade-off.** An `app:write` holder can point a built-in source at any
+address the autoscaler can reach, and read the number it returns in
+`scaling explain`: a narrow SSRF from the app's network position, open to
+operators only (tenants' policies never carry an address, entry 5).
+
+**Why (security boundary, simplicity).** (a) would let `app:write` run any
+program with the app's grant, through `command` or an `exec` target. (b)
+makes routine operator edits (a new Prometheus address) need the app's
+whole grant, which no operator role holds but the bootstrap one.
 
 ## 69. `scaling apply` refuses a node-group policy until node groups run
 

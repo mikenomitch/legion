@@ -674,11 +674,11 @@ Exactly one of `builtin`, `source`/`command`, or `url`. A plugin may not be
 named `legion`, `noop`, or after a built-in strategy. A config with a
 mistake (an unknown builtin, a missing `address`, a bad checksum) is
 refused by `legion app config set`. Changing the plugins re-renders the
-app's job, which restarts it. Every plugin field but `namespaces` is a code
-field (`source`, `command`, `url`, `builtin`, and `config`, which holds an
-`exec` target's command and a source's address): changing one changes what
-the app runs or reaches, so it needs the app's whole grant
-([apps.md](apps.md)).
+app's job, which restarts it. A plugin's `source`, `command`, and `url`, and
+an `exec` target's `config.command`, are code fields: changing one changes
+the code the app runs, so it needs the app's whole grant
+([apps.md](apps.md)). Other plugin settings, such as a built-in source's
+address, need only `app:write` on the autoscaler.
 
 **Policies name plugins**: a check's `source`, a strategy's `name`, a
 standalone policy's `target.plugin`. A policy never carries a command or a

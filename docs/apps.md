@@ -53,10 +53,11 @@ the cluster-wide scaling inputs once per interval, and writes counts through
 redeploy. Its config takes `interval` (default `"15s"`), `mode`
 (`"dry-run"` forces every policy into dry-run), and `plugins`, the metric
 sources, strategies, and targets the operator installs for policies to name
-([autoscaling.md, "Plugins"](autoscaling.md#plugins)). Every plugin field but
-`namespaces` is a code field (an `exec` target's command and a source's
-address live in `config`): changing one changes what the app runs or
-reaches, so it needs the app's whole grant. When it stops reporting, `legion scaling status` says `NOT RUNNING`.
+([autoscaling.md, "Plugins"](autoscaling.md#plugins)). A plugin's `source`,
+`command`, and `url`, and an `exec` target's `config.command`, are code
+fields: changing one changes the code the app runs, so it needs the app's
+whole grant. A built-in source's `config` (its address) and `namespaces`
+need only `app:write`. When it stops reporting, `legion scaling status` says `NOT RUNNING`.
 
 **Installed apps** come from a manifest file or URL (`legion app install`).
 They carry their own `version`, run their own code (an artifact or an image,
