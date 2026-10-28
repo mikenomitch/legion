@@ -390,6 +390,20 @@ pub fn json_flag() -> Arg {
         .action(ArgAction::SetTrue)
 }
 
+/// `--allow-unknown-fields`: accept a jobspec carrying keys Legion does not
+/// know, keeping the ones on extension points as pending and dropping the
+/// rest, each reported as a warning (docs/jobs-tasks-and-scheduling.md,
+/// "Unknown fields"). Without it, every unknown key is an error.
+pub fn allow_unknown_fields_flag() -> Arg {
+    Arg::new("allow-unknown-fields")
+        .long("allow-unknown-fields")
+        .help(
+            "Accept unknown jobspec keys: keep keys on the job, a task, a volume, a port, or a \
+             service as pending, drop the rest, and warn about each",
+        )
+        .action(ArgAction::SetTrue)
+}
+
 /// `-n/--namespace`: the namespace a command acts in (docs/namespaces.md).
 /// Attached only to commands that act on namespaced things, so on a
 /// cluster-scoped command (`legion node list -n prod`) it is a parse error

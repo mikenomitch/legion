@@ -295,6 +295,7 @@ mod tests {
             file: Some(WorkloadIdentityFile {
                 path: "/tmp/token".into(),
                 mode: None,
+                unknown_fields: Default::default(),
             }),
             ..Default::default()
         };

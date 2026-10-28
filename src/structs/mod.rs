@@ -28,6 +28,7 @@ pub mod node;
 pub mod session;
 pub mod snapshot;
 pub mod source;
+pub mod spec_fields;
 pub mod stop;
 pub mod suspend;
 pub mod token;

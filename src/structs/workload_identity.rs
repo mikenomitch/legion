@@ -114,6 +114,10 @@ pub struct WorkloadIdentityFile {
     /// Octal file mode string, e.g. "0400". Defaults applied at delivery time.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mode: Option<String>,
+    /// Keys this block did not recognize, captured for the submit's
+    /// unknown-field check (`structs::spec_fields`); empty once it ran.
+    #[serde(flatten)]
+    pub unknown_fields: crate::structs::spec_fields::UnknownFields,
 }
 
 /// One named workload identity declared on a task. Mirrors Nomad's `identity`
@@ -151,6 +155,10 @@ pub struct WorkloadIdentity {
     /// sometimes need different subject shapes per provider).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sub_template: Option<String>,
+    /// Keys this block did not recognize, captured for the submit's
+    /// unknown-field check (`structs::spec_fields`); empty once it ran.
+    #[serde(flatten)]
+    pub unknown_fields: crate::structs::spec_fields::UnknownFields,
 }
 
 impl WorkloadIdentity {
@@ -944,6 +952,26 @@ impl NodeIdentityClaims {
     }
 }
 
+// Unknown-field capture (`structs::spec_fields`).
+crate::structs::spec_fields::spec_block!(
+    WorkloadIdentity,
+    [
+        "name",
+        "audience",
+        "ttl",
+        "env",
+        "file",
+        "changeMode",
+        "changeSignal",
+        "extraClaims",
+        "subTemplate"
+    ],
+    |this, walk| {
+        walk.opt("file", this.file.as_mut());
+    }
+);
+crate::structs::spec_fields::spec_block!(WorkloadIdentityFile, ["path", "mode"]);
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -971,6 +999,7 @@ mod tests {
                 // shared delivery target (validate_identities rejects that).
                 path: format!("/var/run/legion/identity/{name}/token"),
                 mode: Some("0400".into()),
+                unknown_fields: Default::default(),
             }),
             ..Default::default()
         }
@@ -1280,6 +1309,7 @@ mod tests {
             file: Some(WorkloadIdentityFile {
                 path: "/var/run/legion/identity/legion/token".into(),
                 mode: Some("0400".into()),
+                unknown_fields: Default::default(),
             }),
             ..Default::default()
         };

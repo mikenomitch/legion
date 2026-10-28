@@ -1334,6 +1334,7 @@ mod tests {
             file: Some(WorkloadIdentityFile {
                 path: "/var/run/legion/identity/aws/token".into(),
                 mode: Some("0400".into()),
+                unknown_fields: Default::default(),
             }),
             ..Default::default()
         }
@@ -1537,6 +1538,7 @@ mod tests {
             file: Some(WorkloadIdentityFile {
                 path: "/var/run/legion/identity/legion/token".into(),
                 mode: None,
+                unknown_fields: Default::default(),
             }),
             ..Default::default()
         };
@@ -1667,6 +1669,7 @@ mod tests {
             name: "claims-job".into(),
             tasks: vec![task],
             version: None,
+            pending_extensions: Default::default(),
         };
         store.handle_job_submit(
             &job,
@@ -1719,6 +1722,7 @@ mod tests {
                 promote: None,
                 placement: None,
                 fence_after: None,
+                unknown_fields: Default::default(),
             }),
             ..TaskConfig::new("db", "noop")
         };
@@ -2268,6 +2272,7 @@ mod tests {
             file: Some(WorkloadIdentityFile {
                 path: "/run/legion/token".into(),
                 mode: None,
+                unknown_fields: Default::default(),
             }),
             ..Default::default()
         };

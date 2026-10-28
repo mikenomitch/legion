@@ -2604,6 +2604,39 @@ message RunJobRequest {
   // Neither set means `default`. The namespace must exist (NOT_FOUND
   // otherwise; namespaces are never created implicitly).
   optional string namespace = 6;
+
+  // Accept a jobspec that carries keys Legion does not know
+  // (`legion job run --allow-unknown-fields`).
+  //
+  // Default `false`: every unknown key, at the job level, in a task, or in
+  // any nested block, fails the request with INVALID_ARGUMENT. The message
+  // names each key with its path and, when one is close, the known key it
+  // most likely meant: `web: task web: unknown field `cuont` (did you mean
+  // `count`?)`.
+  //
+  // When `true`:
+  // - a key directly on an extension point (the job's top level, a task, an
+  //   entry in a task's `volumes`, an entry in `network.ports`, or a task's
+  //   `service` block) is kept, unvalidated, in that block's
+  //   `pendingExtensions` map, and stored with the version. Nothing acts on
+  //   it. These are the places where apps will declare their own keys, so a
+  //   key there may belong to an app that is not installed yet;
+  // - a key anywhere else is dropped;
+  // - each kept or dropped key is listed in `RunJobReply.warnings`, and the
+  //   set is recorded on the job config version this request creates
+  //   (`GetJobInfoReply.unknown_fields`, `legion job info`).
+  //
+  // The flag is about keys Legion does not know. A value Legion knows is
+  // wrong (a bad type, an out-of-range number, an unknown runtime) is still
+  // an error. It does not relax blocks that are strict on their own: the
+  // network policy blocks (`network.egress`, `network.ingress`, an
+  // upstream's `handlers`), value sources (`{ kv = … }`), the runtime's
+  // `config`, and the `count`, `gang`, and `schedule` shorthands.
+  //
+  // A resubmit with the same flag and spec is `unchanged` and keeps the
+  // record of the version it matched. A manager that predates this field
+  // ignores it and drops every unknown key silently.
+  bool allow_unknown_fields = 7;
 }
 
 // Reply payload for RunJob.
@@ -2639,6 +2672,21 @@ message RunJobReply {
   //
   // In both cases `message` describes the recorded outcome, not this request's.
   bool deduplicated = 2;
+
+  // Advisory lines, one per warning, without the `warning: ` prefix. The
+  // same lines are appended to `message`, each after `warning: `, for
+  // clients that print only the message.
+  //
+  // They start with every unknown key `allow_unknown_fields` kept or
+  // dropped, dropped keys first (`task web: dropped unknown field
+  // `stop.signall``, `task postgres: volume data: kept `backup` as pending
+  // (no installed app declares it)`), then the submit's other warnings: a
+  // priority band preemption cannot honor, `resources` a runtime cannot
+  // enforce as written, a gated task with no egress, and the like (the lines
+  // `PlanJobReply.warnings` carries).
+  //
+  // A `deduplicated` reply rebuilds this list from the recorded `message`.
+  repeated string warnings = 3;
 }
 
 // One declared job-template variable.
@@ -2858,6 +2906,14 @@ message RunJobTemplateRequest {
   // there, scoped by the `templates` selector. Resolved against a
   // `namespace` the template renders exactly as RunJobRequest.namespace is.
   optional string namespace = 7;
+
+  // Accept a rendered spec that carries keys Legion does not know
+  // (`legion template run --allow-unknown-fields`). Default `false`: every
+  // unknown key fails the run with INVALID_ARGUMENT. When `true`, keys on
+  // extension points are kept as pending and the rest are dropped, exactly
+  // as RunJobRequest.allow_unknown_fields describes, and each one is listed
+  // in `RunJobTemplateReply.warnings` and recorded on the version.
+  bool allow_unknown_fields = 8;
 }
 
 // Reply payload for RunJobTemplate.
@@ -2873,6 +2929,12 @@ message RunJobTemplateReply {
 
   // Job config ID produced (or matched, when unchanged) by this run.
   string job_config_id = 4;
+
+  // Advisory lines, one per warning, without the `warning: ` prefix: the
+  // same lines RunJobReply.warnings carries (unknown keys the run kept or
+  // dropped under `allow_unknown_fields` among them). Also appended to
+  // `message`, each after `warning: `.
+  repeated string warnings = 5;
 }
 
 // Request payload for GetJobInfo.
@@ -2891,6 +2953,45 @@ message GetJobInfoReply {
   // Template that rendered the job's latest config, when it was submitted
   // via RunJobTemplate. Unset for raw RunJob submissions.
   optional JobTemplateProvenance template = 2;
+
+  // What `allow_unknown_fields` kept and dropped when the job's latest
+  // config version was submitted. Unset when that submit kept and dropped
+  // nothing (every submit without the flag, and one with the flag whose
+  // spec had no unknown keys). `legion job info` prints it as
+  // `submitted with --allow-unknown-fields: dropped …; … pending`.
+  //
+  // It describes the submit that created the version. Resubmitting a spec
+  // that renders to the same config is `unchanged` and leaves it in place,
+  // even when the resubmit no longer carries the dropped keys.
+  optional UnknownFieldsRecord unknown_fields = 3;
+}
+
+// One jobspec key Legion did not know, as `allow_unknown_fields` handled it.
+message UnknownJobspecField {
+  // Where the key's block sits, as error messages name it: `task postgres`,
+  // `task postgres: volume data`, `task web: port http`. Empty for a key at
+  // the job's top level.
+  string scope = 1;
+
+  // The key, dotted from its scope: `backup`, `stop.signall`,
+  // `checks[0].everyy`.
+  string path = 2;
+
+  // For a kept key, the extension point it sits on: `job`, `task`,
+  // `volume`, `port`, or `service`. Empty for a dropped key.
+  string point = 3;
+}
+
+// The unknown keys one submit kept and dropped under
+// `allow_unknown_fields`, recorded on the job config version it created.
+message UnknownFieldsRecord {
+  // Keys on extension points, kept unvalidated in the block's
+  // `pendingExtensions` map. Nothing acts on them; they stay with every
+  // version whose spec still carries them.
+  repeated UnknownJobspecField pending = 1;
+
+  // Keys elsewhere, dropped: the version does not carry them.
+  repeated UnknownJobspecField dropped = 2;
 }
 
 // Request payload for ListRollouts.
@@ -3261,6 +3362,15 @@ message PlanJobRequest {
   // Namespace to plan into; resolved against the jobspec's own `namespace`
   // exactly as RunJobRequest.namespace is.
   optional string namespace = 2;
+
+  // Plan a jobspec that carries keys Legion does not know
+  // (`legion job plan --allow-unknown-fields`), as a submit with
+  // RunJobRequest.allow_unknown_fields would take it: keys on extension
+  // points kept as pending, the rest dropped, each listed in
+  // `PlanJobReply.warnings`. Default `false`: every unknown key fails the
+  // plan with INVALID_ARGUMENT, as it would fail the submit. Nothing is
+  // recorded; a plan stores nothing.
+  bool allow_unknown_fields = 3;
 }
 
 // Reply payload for PlanJob.
@@ -3314,6 +3424,11 @@ message PlanJobReply {
   // stored policy object covering it, whose outbound connections would all
   // be refused with `gated-default`. Each line ends with a `hint:` naming the
   // fix. Empty when there is nothing to say.
+  //
+  // Under `allow_unknown_fields`, the list starts with one line per unknown
+  // key the submit would drop (`task web: dropped unknown field
+  // `stop.signall``) or keep as pending (`task postgres: volume data: kept
+  // `backup` as pending (no installed app declares it)`).
   repeated string warnings = 8;
 
   // One report per task that sets `gang` (docs/gang-scheduling.md), in task

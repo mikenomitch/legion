@@ -183,6 +183,7 @@ fn sandbox_job() -> JobConfig {
             promote: None,
             placement: None,
             fence_after: None,
+            unknown_fields: Default::default(),
         }),
         suspend: Some(SuspendConfig {
             checkpoint: Some("memory".into()),
@@ -197,6 +198,7 @@ fn sandbox_job() -> JobConfig {
         rollout: None,
         rollout_by_group: Default::default(),
         version: None,
+        pending_extensions: Default::default(),
     }
 }
 

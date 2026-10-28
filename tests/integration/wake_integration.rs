@@ -161,11 +161,13 @@ fn job() -> JobConfig {
                 params: None,
                 retain_on_scale_in: None,
                 retain_on_stop: None,
+                unknown_fields: Default::default(),
             }),
             envelope: None,
             promote: None,
             placement: None,
             fence_after: None,
+            unknown_fields: Default::default(),
         }),
         network: Some(NetworkConfig {
             ports: vec![PortConfig {
@@ -173,6 +175,8 @@ fn job() -> JobConfig {
                 static_port: None,
                 to: None,
                 tls: None,
+                pending_extensions: Default::default(),
+                unknown_fields: Default::default(),
             }],
             ..Default::default()
         }),
@@ -180,6 +184,7 @@ fn job() -> JobConfig {
             wake: Some(WakeConfig {
                 port: "http".into(),
                 timeout: Some("15s".into()),
+                unknown_fields: Default::default(),
             }),
             ..Default::default()
         }),
@@ -192,6 +197,7 @@ fn job() -> JobConfig {
         rollout: None,
         rollout_by_group: Default::default(),
         version: None,
+        pending_extensions: Default::default(),
     }
 }
 

@@ -203,6 +203,7 @@ fn stateless_job(name: &str, count: u32, constraints: serde_json::Value) -> JobC
             ..TaskConfig::new(format!("{name}-task"), "service")
         }],
         version: None,
+        pending_extensions: Default::default(),
     }
 }
 

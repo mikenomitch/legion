@@ -506,6 +506,7 @@ mod tests {
             name: name.into(),
             tasks: vec![TaskConfig::new("web", "noop")],
             version: None,
+            pending_extensions: Default::default(),
         };
         store.handle_job_submit(
             &job,
@@ -618,6 +619,7 @@ mod tests {
                 ..TaskConfig::new("sandbox", "noop")
             }],
             version: None,
+            pending_extensions: Default::default(),
         };
         store.handle_job_submit(
             &job,

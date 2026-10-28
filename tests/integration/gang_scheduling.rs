@@ -63,6 +63,7 @@ fn job(name: &str, count: u32, gang: Option<GangConfig>) -> JobConfig {
         rollout: None,
         rollout_by_group: Default::default(),
         version: None,
+        pending_extensions: Default::default(),
     }
 }
 
@@ -180,6 +181,7 @@ impl Cluster {
             .block_on(self.svc.plan_job(Request::new(PlanJobRequest {
                 namespace: Default::default(),
                 parsed_jobspec: serde_json::to_string(job)?,
+                allow_unknown_fields: Default::default(),
             })))?
             .into_inner())
     }

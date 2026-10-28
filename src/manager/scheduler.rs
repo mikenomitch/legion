@@ -6589,6 +6589,7 @@ mod tests {
                 },
             ],
             version: None,
+            pending_extensions: Default::default(),
         };
 
         store.handle_job_submit(&job, &[dummy_submission()])?;
@@ -6645,6 +6646,7 @@ mod tests {
                 ..TaskConfig::new("batch", "noop")
             }],
             version: None,
+            pending_extensions: Default::default(),
         };
 
         store.handle_job_submit(&job, &[dummy_submission()])?;
@@ -6687,11 +6689,13 @@ mod tests {
                     path: "/var/lib/data".into(),
                     retain_on_scale_in: None,
                     retain_on_stop: None,
+                    unknown_fields: Default::default(),
                 }),
                 envelope: None,
                 promote: None,
                 placement: None,
                 fence_after: None,
+                unknown_fields: Default::default(),
             }),
             ..TaskConfig::new(name, "noop")
         }
@@ -6705,6 +6709,7 @@ mod tests {
             name: name.into(),
             tasks,
             version: None,
+            pending_extensions: Default::default(),
         };
         store.handle_job_submit(&job, &[dummy_submission()])?;
         Ok(store.get_job_config(name)?.id())
@@ -6973,11 +6978,13 @@ mod tests {
                     path: "/workspace".into(),
                     retain_on_scale_in: None,
                     retain_on_stop: None,
+                    unknown_fields: Default::default(),
                 }),
                 envelope: None,
                 promote: None,
                 placement: None,
                 fence_after: None,
+                unknown_fields: Default::default(),
             }),
             ..TaskConfig::new(name, "noop")
         }
@@ -7158,6 +7165,7 @@ mod tests {
                 ..TaskConfig::new("api", "noop")
             }],
             version: None,
+            pending_extensions: Default::default(),
         };
         store.handle_job_submit(&warm, &[dummy_submission()])?;
         let warm_id = store.get_job_config(&warm.name)?.id();
@@ -7178,6 +7186,7 @@ mod tests {
                 ..TaskConfig::new("api", "noop")
             }],
             version: None,
+            pending_extensions: Default::default(),
         };
         store.handle_job_submit(&job, &[dummy_submission()])?;
         let job_id = store.get_job_config(&job.name)?.id();
@@ -7220,6 +7229,7 @@ mod tests {
                 ..TaskConfig::new("api", "noop")
             }],
             version: None,
+            pending_extensions: Default::default(),
         };
         store.handle_job_submit(&job, &[dummy_submission()])?;
         let job_config_id = store.get_job_config(&job.name)?.id();
@@ -7270,6 +7280,7 @@ mod tests {
                 ..TaskConfig::new("api", "noop")
             }],
             version: None,
+            pending_extensions: Default::default(),
         };
 
         store.handle_job_submit(&job, &[dummy_submission()])?;
@@ -7314,6 +7325,7 @@ mod tests {
                 ..TaskConfig::new("api", "noop")
             }],
             version: None,
+            pending_extensions: Default::default(),
         };
 
         store.handle_job_submit(&job, &[dummy_submission()])?;
@@ -7374,6 +7386,7 @@ mod tests {
                 ..TaskConfig::new("db", "noop")
             }],
             version: None,
+            pending_extensions: Default::default(),
         };
 
         store.handle_job_submit(&job, &[dummy_submission()])?;
@@ -7407,6 +7420,7 @@ mod tests {
             name: "resched-exclude".into(),
             tasks: vec![TaskConfig::new("batch", "noop")],
             version: None,
+            pending_extensions: Default::default(),
         };
 
         store.handle_job_submit(&job, &[dummy_submission()])?;
@@ -7440,6 +7454,7 @@ mod tests {
                 ..TaskConfig::new("analytics", "noop")
             }],
             version: None,
+            pending_extensions: Default::default(),
         };
 
         store.handle_job_submit(&job, &[dummy_submission()])?;
@@ -7514,6 +7529,7 @@ mod tests {
                 ..TaskConfig::new("db", "noop")
             }],
             version: None,
+            pending_extensions: Default::default(),
         };
 
         store.handle_job_submit(&job, &[dummy_submission()])?;
@@ -7548,6 +7564,7 @@ mod tests {
                 ..TaskConfig::new("api", "noop")
             }],
             version: None,
+            pending_extensions: Default::default(),
         };
 
         store.handle_job_submit(&job, &[dummy_submission()])?;
@@ -7690,6 +7707,7 @@ mod tests {
                 ..TaskConfig::new("db", "noop")
             }],
             version: None,
+            pending_extensions: Default::default(),
         };
 
         store.handle_job_submit(&job, &[dummy_submission()])?;
@@ -7722,6 +7740,7 @@ mod tests {
                 ..TaskConfig::new("api", "noop")
             }],
             version: None,
+            pending_extensions: Default::default(),
         };
 
         store.handle_job_submit(&job, &[dummy_submission()])?;
@@ -7755,6 +7774,7 @@ mod tests {
                 ..TaskConfig::new("api", "noop")
             }],
             version: None,
+            pending_extensions: Default::default(),
         };
         store.handle_job_submit(&passing_job, &[dummy_submission()])?;
         let pass_job_config_id = store.get_job_config(&passing_job.name)?.id();
@@ -7775,6 +7795,7 @@ mod tests {
                 ..TaskConfig::new("api", "noop")
             }],
             version: None,
+            pending_extensions: Default::default(),
         };
         store.handle_job_submit(&failing_job, &[dummy_submission()])?;
         let fail_job_config_id = store.get_job_config(&failing_job.name)?.id();
@@ -7805,6 +7826,7 @@ mod tests {
             name: "permit-default".into(),
             tasks: vec![TaskConfig::new("api", "noop")],
             version: None,
+            pending_extensions: Default::default(),
         };
 
         store.handle_job_submit(&job, &[dummy_submission()])?;
@@ -7842,6 +7864,7 @@ mod tests {
                 ..TaskConfig::new("worker", "noop")
             }],
             version: None,
+            pending_extensions: Default::default(),
         };
 
         store.handle_job_submit(&job, &[dummy_submission()])?;
@@ -8011,6 +8034,7 @@ mod tests {
                 ..TaskConfig::new("worker", "noop")
             }],
             version: None,
+            pending_extensions: Default::default(),
         };
 
         store.handle_job_submit(&job, &[dummy_submission()])?;
@@ -8039,6 +8063,7 @@ mod tests {
             name: "background-load".into(),
             tasks: vec![TaskConfig::new("filler", "noop")],
             version: None,
+            pending_extensions: Default::default(),
         };
         store.handle_job_submit(&filler, &[dummy_submission()])?;
         let job_config_id = store.get_job_config(&filler.name)?.id();
@@ -8072,6 +8097,7 @@ mod tests {
                 name: "spread-considered".into(),
                 tasks: vec![TaskConfig::new("api", "noop")],
                 version: None,
+                pending_extensions: Default::default(),
             };
 
             store.handle_job_submit(&job, &[dummy_submission()])?;
@@ -8115,6 +8141,7 @@ mod tests {
                 name: "binpack-considered".into(),
                 tasks: vec![TaskConfig::new("worker", "noop")],
                 version: None,
+                pending_extensions: Default::default(),
             };
 
             store.handle_job_submit(&job, &[dummy_submission()])?;
@@ -8196,6 +8223,7 @@ mod tests {
                 },
             ],
             version: None,
+            pending_extensions: Default::default(),
         };
 
         store.handle_job_submit(&job, &[dummy_submission()])?;
@@ -8237,6 +8265,7 @@ mod tests {
                 },
             ],
             version: None,
+            pending_extensions: Default::default(),
         };
 
         store.handle_job_submit(&job, &[dummy_submission()])?;
@@ -8288,6 +8317,7 @@ mod tests {
                 },
             ],
             version: None,
+            pending_extensions: Default::default(),
         };
 
         store.handle_job_submit(&job, &[dummy_submission()])?;
@@ -8338,6 +8368,7 @@ mod tests {
                 },
             ],
             version: None,
+            pending_extensions: Default::default(),
         };
 
         store.handle_job_submit(&job, &[dummy_submission()])?;
@@ -8798,6 +8829,7 @@ mod tests {
                 ..TaskConfig::new("api", "noop")
             }],
             version: None,
+            pending_extensions: Default::default(),
         };
         let job_two = JobConfig {
             priority: Default::default(),
@@ -8822,6 +8854,7 @@ mod tests {
                 },
             ],
             version: None,
+            pending_extensions: Default::default(),
         };
 
         store.handle_job_submit(&job_one, &[dummy_submission()])?;
@@ -8892,6 +8925,7 @@ mod tests {
                 ..TaskConfig::new("api", "noop")
             }],
             version: None,
+            pending_extensions: Default::default(),
         };
 
         store.handle_job_submit(&job, &[dummy_submission()])?;
@@ -8930,6 +8964,7 @@ mod tests {
             name: "load-job".into(),
             tasks: vec![TaskConfig::new("load", "noop")],
             version: None,
+            pending_extensions: Default::default(),
         };
         store.handle_job_submit(&load_job, &[dummy_submission()])?;
         let load_job_config_id = store.get_job_config(&load_job.name)?.id();
@@ -8949,6 +8984,7 @@ mod tests {
                 ..TaskConfig::new("api", "noop")
             }],
             version: None,
+            pending_extensions: Default::default(),
         };
         store.handle_job_submit(&job, &[dummy_submission()])?;
         let job_config_id = store.get_job_config(&job.name)?.id();
@@ -8987,6 +9023,7 @@ mod tests {
                 },
             ],
             version: None,
+            pending_extensions: Default::default(),
         };
 
         store.handle_job_submit(&job, &[dummy_submission()])?;
@@ -9020,6 +9057,7 @@ mod tests {
                 ..TaskConfig::new("api", "noop")
             }],
             version: None,
+            pending_extensions: Default::default(),
         };
         store.handle_job_submit(&job, &[dummy_submission()])?;
         let job_config_id = store.get_job_config(&job.name)?.id();
@@ -9062,6 +9100,7 @@ mod tests {
                 ..TaskConfig::new("api", "noop")
             }],
             version: None,
+            pending_extensions: Default::default(),
         };
         store.handle_job_submit(&job, &[dummy_submission()])?;
         let job_config_id = store.get_job_config(&job.name)?.id();
@@ -9094,6 +9133,7 @@ mod tests {
                 ..TaskConfig::new("trainer", "noop")
             }],
             version: None,
+            pending_extensions: Default::default(),
         };
         store.handle_job_submit(&job, &[dummy_submission()])?;
         let job_config_id = store.get_job_config(&job.name)?.id();
@@ -9128,6 +9168,7 @@ mod tests {
                 ..TaskConfig::new("api", "noop")
             }],
             version: None,
+            pending_extensions: Default::default(),
         };
         store.handle_job_submit(&job, &[dummy_submission()])?;
         let job_config_id = store.get_job_config(&job.name)?.id();
@@ -9155,6 +9196,7 @@ mod tests {
                 ..TaskConfig::new("api", "noop")
             }],
             version: None,
+            pending_extensions: Default::default(),
         };
         store.handle_job_submit(&job, &[dummy_submission()])?;
         let job_config_id = store.get_job_config(&job.name)?.id();
@@ -9191,6 +9233,7 @@ mod tests {
                 },
             ],
             version: None,
+            pending_extensions: Default::default(),
         };
         store.handle_job_submit(&job, &[dummy_submission()])?;
         let job_config_id = store.get_job_config(&job.name)?.id();
@@ -9220,6 +9263,7 @@ mod tests {
                     ..TaskConfig::new("api", "noop")
                 }],
                 version: None,
+                pending_extensions: Default::default(),
             };
             store.handle_job_submit(&job, &[dummy_submission()])?;
             config_ids.push(store.get_job_config(name)?.id());
@@ -9560,7 +9604,10 @@ mod tests {
                     static_port: Some(port),
                     to: None,
                     tls: None,
+                    pending_extensions: Default::default(),
+                    unknown_fields: Default::default(),
                 }],
+                unknown_fields: Default::default(),
             }),
             ..TaskConfig::new(name, "noop")
         }
@@ -9799,6 +9846,7 @@ mod tests {
                 },
             ],
             version: None,
+            pending_extensions: Default::default(),
         };
         store.handle_job_submit(&job, &[dummy_submission()])?;
         let job_config_id = store.get_job_config(&job.name)?.id();
@@ -9834,6 +9882,7 @@ mod tests {
                 ..TaskConfig::new("api", "noop")
             }],
             version: None,
+            pending_extensions: Default::default(),
         };
         store.handle_job_submit(&v1, &[dummy_submission()])?;
         let v1_id = store.get_job_config(&v1.name)?.id();
@@ -9883,6 +9932,7 @@ mod tests {
                 ..TaskConfig::new("api", "noop")
             }],
             version: None,
+            pending_extensions: Default::default(),
         };
         store.handle_job_submit(&job, &[dummy_submission()])?;
         let job_config_id = store.get_job_config(&job.name)?.id();
@@ -9922,6 +9972,7 @@ mod tests {
                 ..TaskConfig::new("api", "noop")
             }],
             version: None,
+            pending_extensions: Default::default(),
         };
         store.handle_job_submit(&job, &[dummy_submission()])?;
         let job_config_id = store.get_job_config(&job.name)?.id();
@@ -9958,6 +10009,7 @@ mod tests {
                 ..TaskConfig::new("api", "noop")
             }],
             version: None,
+            pending_extensions: Default::default(),
         };
         store.handle_job_submit(&job, &[dummy_submission()])?;
         let job_config_id = store.get_job_config(&job.name)?.id();
@@ -10299,6 +10351,7 @@ mod tests {
                 ..TaskConfig::new("worker", "noop")
             }],
             version: None,
+            pending_extensions: Default::default(),
         };
         store.handle_job_submit(&job, &[dummy_submission()])?;
         Ok(store.get_job_config(name)?.id())
@@ -10467,6 +10520,7 @@ mod tests {
                 ..TaskConfig::new("vm", "noop")
             }],
             version: None,
+            pending_extensions: Default::default(),
         };
         let outcome = scheduler.plan_for_config(&claim, PlanMode::Fresh, None)?;
         assert_eq!(outcome.allocations.len(), 1, "the preview places the claim");
@@ -10577,6 +10631,7 @@ mod tests {
                     ..TaskConfig::new("worker", "noop")
                 }],
                 version: None,
+                pending_extensions: Default::default(),
             };
             store.handle_job_submit(&job, &[dummy_submission()])?;
             Ok(store.get_job_config(name)?.id())
@@ -10616,6 +10671,7 @@ mod tests {
             2,
             Some(crate::structs::DisruptionConfig {
                 min_available: Some(json!("50%")),
+                unknown_fields: Default::default(),
             }),
         )?;
         scheduler.plan_and_apply(&tool, PlanMode::Fresh)?;
@@ -11026,6 +11082,7 @@ mod tests {
                 ..TaskConfig::new("worker", "noop")
             }],
             version: None,
+            pending_extensions: Default::default(),
         };
         let preview = scheduler.plan_for_config(&candidate, PlanMode::Fresh, None)?;
         assert_eq!(preview.allocations.len(), 1);
@@ -11065,6 +11122,7 @@ mod tests {
                 ..TaskConfig::new("worker", "noop")
             }],
             version: None,
+            pending_extensions: Default::default(),
         }
     }
 

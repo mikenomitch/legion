@@ -1685,6 +1685,7 @@ mod edge_overload_test {
                 mode: Some("serve".into()),
                 ratify_timeout: Some("2s".into()),
                 on_refused: None,
+                unknown_fields: Default::default(),
             }),
             config: json!({ "command": ["sleep", "30"] }),
             resources: json!({ "memory": 64 }),

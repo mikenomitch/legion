@@ -1021,6 +1021,7 @@ mod tests {
                 ..TaskConfig::new("api", "service")
             }],
             version: None,
+            pending_extensions: Default::default(),
         };
         store.handle_job_submit(&job, std::slice::from_ref(&submission))?;
         let job_config_id = store.get_job_config("web")?.id();
@@ -1202,6 +1203,7 @@ mod tests {
             name: job_one_name.clone(),
             tasks: vec![job_one_task.clone()],
             version: None,
+            pending_extensions: Default::default(),
         };
         let job_one_subs = vec![Submission {
             path: "job-one".into(),
@@ -1256,6 +1258,7 @@ mod tests {
             name: job_two_name.clone(),
             tasks: vec![job_two_task.clone()],
             version: None,
+            pending_extensions: Default::default(),
         };
         let job_two_subs = vec![Submission {
             path: "job-two".into(),
@@ -1340,11 +1343,13 @@ mod tests {
                     path: "/var/lib/data".into(),
                     retain_on_scale_in: None,
                     retain_on_stop: None,
+                    unknown_fields: Default::default(),
                 }),
                 envelope: None,
                 promote: None,
                 placement: None,
                 fence_after: None,
+                unknown_fields: Default::default(),
             }),
             ..TaskConfig::new("db", "service")
         };
@@ -1355,6 +1360,7 @@ mod tests {
             name: job_name.clone(),
             tasks: vec![task],
             version: None,
+            pending_extensions: Default::default(),
         };
         store.handle_job_submit(
             &job_config,
@@ -1428,11 +1434,13 @@ mod tests {
                     path: "/workspace".into(),
                     retain_on_scale_in: None,
                     retain_on_stop: None,
+                    unknown_fields: Default::default(),
                 }),
                 envelope: None,
                 promote: None,
                 placement: None,
                 fence_after: None,
+                unknown_fields: Default::default(),
             }),
             ..TaskConfig::new("sandbox", "service")
         };
@@ -1443,6 +1451,7 @@ mod tests {
             name: job_name.clone(),
             tasks: vec![task],
             version: None,
+            pending_extensions: Default::default(),
         };
         let subs = vec![Submission {
             path: "job.ncl".into(),
@@ -1558,6 +1567,7 @@ mod tests {
             name: job_name.clone(),
             tasks: vec![task],
             version: None,
+            pending_extensions: Default::default(),
         };
         let job_subs = vec![Submission {
             path: "job.ncl".into(),
@@ -1719,15 +1729,18 @@ mod tests {
                         path: "/var/lib/postgresql/data".into(),
                         retain_on_scale_in: None,
                         retain_on_stop: None,
+                        unknown_fields: Default::default(),
                     }),
                     envelope: None,
                     promote: None,
                     placement: None,
                     fence_after: None,
+                    unknown_fields: Default::default(),
                 }),
                 ..TaskConfig::new("postgres", "service")
             }],
             version: None,
+            pending_extensions: Default::default(),
         }
     }
 
@@ -1744,6 +1757,7 @@ mod tests {
                 ..TaskConfig::new("fill", "service")
             }],
             version: None,
+            pending_extensions: Default::default(),
         };
         let placed = FailedReschedule::submit(store, &filler)?.allocations()?;
         assert_eq!(placed.len(), 1);
@@ -1909,6 +1923,7 @@ mod tests {
                 ..TaskConfig::new("api", "service")
             }],
             version: None,
+            pending_extensions: Default::default(),
         };
         for other_node_full in [false, true] {
             let store = setup_store()?;
@@ -1955,6 +1970,7 @@ mod tests {
             name: job_name.clone(),
             tasks: vec![base_task.clone()],
             version: None,
+            pending_extensions: Default::default(),
         };
         let job_subs = vec![Submission {
             path: "job.ncl".into(),
@@ -1993,6 +2009,7 @@ mod tests {
             name: job_name.clone(),
             tasks: vec![unchanged_task.clone()],
             version: None,
+            pending_extensions: Default::default(),
         };
         store.handle_job_submit(&unchanged_config, &job_subs)?;
         let unchanged_config_id = store.get_job_config(&job_name)?.id();
@@ -2025,6 +2042,7 @@ mod tests {
             name: job_name.clone(),
             tasks: vec![moved_task.clone()],
             version: None,
+            pending_extensions: Default::default(),
         };
         store.handle_job_submit(&moved_config, &job_subs)?;
         let moved_config_id = store.get_job_config(&job_name)?.id();
@@ -2057,6 +2075,7 @@ mod tests {
             name: job_name.clone(),
             tasks: vec![removed_task],
             version: None,
+            pending_extensions: Default::default(),
         };
         store.handle_job_submit(&removed_config, &job_subs)?;
         let removed_config_id = store.get_job_config(&job_name)?.id();
@@ -2087,6 +2106,7 @@ mod tests {
                 ..TaskConfig::new("web", "noop")
             }],
             version: None,
+            pending_extensions: Default::default(),
         }
     }
 

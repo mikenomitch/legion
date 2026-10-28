@@ -15,6 +15,10 @@ use tracing::warn;
 use super::artifact::{validate_task_artifacts, ArtifactSpec};
 use super::band::Band;
 use super::instance::InstanceMode;
+use super::spec_fields::{
+    extension_point, spec_block, ExtensionPoint, FieldWalk, PendingExtensions, UnknownFieldMode,
+    UnknownFields, UnknownFieldsRecord,
+};
 use super::workload_identity::WorkloadIdentity;
 use super::{Job, PlannedAllocation, Submission};
 
@@ -194,10 +198,32 @@ impl<'de> Deserialize<'de> for TaskSchedule {
     }
 }
 
+/// Refuse a key a hand-parsed value shorthand (`schedule`, `count`) does not
+/// know, with the closest known key as a suggestion. These shorthands have
+/// no capture map, so they are strict even under `allow_unknown_fields`.
+fn reject_unknown_keys(
+    what: &str,
+    map: &serde_json::Map<String, Value>,
+    known: &[&'static str],
+) -> Result<(), String> {
+    let Some(key) = map.keys().find(|key| !known.contains(&key.as_str())) else {
+        return Ok(());
+    };
+    let hint = crate::structs::spec_fields::suggest(key, known)
+        .map(|known| format!(" (did you mean `{what}.{known}`?)"))
+        .unwrap_or_default();
+    let expected: Vec<String> = known.iter().map(|key| format!("`{key}`")).collect();
+    Err(format!(
+        "unknown field `{what}.{key}`{hint}; {what} takes {}",
+        expected.join(" or ")
+    ))
+}
+
 fn parse_schedule_value(value: &Value) -> Result<TaskSchedule, String> {
     match value {
         Value::String(text) => parse_schedule_text(text),
         Value::Object(map) => {
+            reject_unknown_keys("schedule", map, &["cron", "every"])?;
             if let Some(cron_value) = map.get("cron") {
                 let cron_text = cron_value
                     .as_str()
@@ -263,13 +289,6 @@ impl TaskCount {
     }
 }
 
-#[derive(Deserialize)]
-#[serde(untagged)]
-enum TaskCountInput {
-    Number(u32),
-    Per { num: u32, per: String },
-}
-
 impl Default for TaskCount {
     fn default() -> Self {
         Self { num: 1, per: None }
@@ -302,14 +321,34 @@ impl Serialize for TaskCount {
     }
 }
 
+/// `count` is a whole number, or `{ num, per }` for spread placement.
+/// Parsed by hand rather than as an untagged enum, so a wrong shape says
+/// what `count` takes instead of "did not match any variant", and an
+/// unknown key in the object form is an error.
 impl<'de> Deserialize<'de> for TaskCount {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
         D: Deserializer<'de>,
     {
-        match TaskCountInput::deserialize(deserializer)? {
-            TaskCountInput::Number(num) => Ok(TaskCount::new(num)),
-            TaskCountInput::Per { num, per } => Ok(TaskCount::per(num, per)),
+        let expected = "count must be a whole number, or { num = <count>, per = \"<attribute>\" }";
+        let whole = |value: &Value| value.as_u64().and_then(|num| u32::try_from(num).ok());
+        match Value::deserialize(deserializer)? {
+            value @ Value::Number(_) => whole(&value)
+                .map(TaskCount::new)
+                .ok_or_else(|| D::Error::custom(format!("{expected}, got {value}"))),
+            Value::Object(map) => {
+                reject_unknown_keys("count", &map, &["num", "per"]).map_err(D::Error::custom)?;
+                let num = map.get("num").and_then(whole).ok_or_else(|| {
+                    D::Error::custom(format!(
+                        "{expected}: count.num is missing or not a whole number"
+                    ))
+                })?;
+                let per = map.get("per").and_then(Value::as_str).ok_or_else(|| {
+                    D::Error::custom(format!("{expected}: count.per is missing or not a string"))
+                })?;
+                Ok(TaskCount::per(num, per))
+            }
+            other => Err(D::Error::custom(format!("{expected}, got {other}"))),
         }
     }
 }
@@ -574,6 +613,10 @@ pub struct TaskCheck {
         serialize_with = "serialize_optional_duration"
     )]
     pub unhealthy_after_count_timespan: Option<Duration>,
+    /// Keys this block did not recognize, captured for the submit's
+    /// unknown-field check (`structs::spec_fields`); empty once it ran.
+    #[serde(flatten)]
+    pub unknown_fields: crate::structs::spec_fields::UnknownFields,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
@@ -607,6 +650,10 @@ pub struct TaskOnUnhealthyConfig {
         serialize_with = "serialize_duration"
     )]
     pub move_delay: Duration,
+    /// Keys this block did not recognize, captured for the submit's
+    /// unknown-field check (`structs::spec_fields`); empty once it ran.
+    #[serde(flatten)]
+    pub unknown_fields: crate::structs::spec_fields::UnknownFields,
 }
 
 /// What to do when a task's process exits (see
@@ -653,6 +700,10 @@ pub struct TaskRestartConfig {
     /// Exit codes counted as success. Default `[0]`.
     #[serde(default = "default_success_exit_codes")]
     pub success_exit_codes: Vec<i32>,
+    /// Keys this block did not recognize, captured for the submit's
+    /// unknown-field check (`structs::spec_fields`); empty once it ran.
+    #[serde(flatten)]
+    pub unknown_fields: crate::structs::spec_fields::UnknownFields,
 }
 
 impl Default for TaskRestartConfig {
@@ -661,6 +712,7 @@ impl Default for TaskRestartConfig {
             policy: None,
             delay: None,
             success_exit_codes: default_success_exit_codes(),
+            unknown_fields: Default::default(),
         }
     }
 }
@@ -674,6 +726,7 @@ impl Default for TaskOnUnhealthyConfig {
             move_count: None,
             move_period: default_move_period(),
             move_delay: default_move_delay(),
+            unknown_fields: Default::default(),
         }
     }
 }
@@ -748,6 +801,10 @@ pub struct RolloutSlotsConfig {
     /// `rollingUpdate.partition` analog.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub update_from: Option<u32>,
+    /// Keys this block did not recognize, captured for the submit's
+    /// unknown-field check (`structs::spec_fields`); empty once it ran.
+    #[serde(flatten)]
+    pub unknown_fields: crate::structs::spec_fields::UnknownFields,
 }
 
 impl RolloutSlotsConfig {
@@ -825,6 +882,10 @@ pub struct RolloutConfig {
     /// See [`RolloutSlotsConfig`] and docs/stateful-workloads.md.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub slots: Option<RolloutSlotsConfig>,
+    /// Keys this block did not recognize, captured for the submit's
+    /// unknown-field check (`structs::spec_fields`); empty once it ran.
+    #[serde(flatten)]
+    pub unknown_fields: crate::structs::spec_fields::UnknownFields,
 }
 
 impl RolloutConfig {
@@ -1029,7 +1090,7 @@ impl RolloutConfig {
 /// survive reschedules (see `docs/stateful-workloads.md`). Absent = today's
 /// stateless behavior; the feature is opt-in per task.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[serde(rename_all = "camelCase")]
 pub struct StatefulConfig {
     /// Instance id assignment mode: `slot` (fixed ordinal pool `0..count-1`,
     /// ids reused within the pool — the default) or `keyed` (created on demand
@@ -1108,6 +1169,10 @@ pub struct StatefulConfig {
     /// it still owns. A duration such as `"2m"` (the default).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fence_after: Option<String>,
+    /// Keys this block did not recognize, captured for the submit's
+    /// unknown-field check (`structs::spec_fields`); empty once it ran.
+    #[serde(flatten)]
+    pub unknown_fields: crate::structs::spec_fields::UnknownFields,
 }
 
 /// Default worker self-fence window for stateful tasks (see
@@ -1145,6 +1210,10 @@ pub struct StatefulOnLostConfig {
     /// before the worker has provably self-fenced.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub replace_after: Option<String>,
+    /// Keys this block did not recognize, captured for the submit's
+    /// unknown-field check (`structs::spec_fields`); empty once it ran.
+    #[serde(flatten)]
+    pub unknown_fields: crate::structs::spec_fields::UnknownFields,
 }
 
 /// Resolved manager-side replacement gate for allocations on a lost node.
@@ -1228,7 +1297,7 @@ impl StatefulConfig {
 /// the named plugin on whatever node the instance lands on (see
 /// `docs/volumes.md`).
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[serde(rename_all = "camelCase")]
 pub struct StatefulStorageConfig {
     /// Where the task sees the storage.
     ///
@@ -1271,6 +1340,10 @@ pub struct StatefulStorageConfig {
     /// (and handle) with the job, regardless of this flag.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub retain_on_stop: Option<bool>,
+    /// Keys this block did not recognize, captured for the submit's
+    /// unknown-field check (`structs::spec_fields`); empty once it ran.
+    #[serde(flatten)]
+    pub unknown_fields: crate::structs::spec_fields::UnknownFields,
 }
 
 /// The volume name a task's `stateful.storage` is exposed under
@@ -1316,6 +1389,8 @@ impl StatefulStorageConfig {
             params: self.params.clone(),
             path: Some(self.path.clone()),
             read_only: None,
+            pending_extensions: Default::default(),
+            unknown_fields: Default::default(),
         }
     }
 }
@@ -1352,7 +1427,7 @@ pub const STOP_SIGNALS: &[&str] = &[
 /// Absent means the defaults below, which are a deliberate behavior change
 /// from the pre-1b hard kill: every stop now signals first and waits.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[serde(rename_all = "camelCase")]
 pub struct StopConfig {
     /// The notice signal, delivered before the grace window opens. One of
     /// [`STOP_SIGNALS`]; default `SIGTERM`.
@@ -1379,6 +1454,10 @@ pub struct StopConfig {
         serialize_with = "serialize_optional_duration"
     )]
     pub drain: Option<Duration>,
+    /// Keys this block did not recognize, captured for the submit's
+    /// unknown-field check (`structs::spec_fields`); empty once it ran.
+    #[serde(flatten)]
+    pub unknown_fields: crate::structs::spec_fields::UnknownFields,
 }
 
 impl Default for StopConfig {
@@ -1387,6 +1466,7 @@ impl Default for StopConfig {
             signal: default_stop_signal(),
             kill_after: default_kill_after(),
             drain: None,
+            unknown_fields: Default::default(),
         }
     }
 }
@@ -1432,12 +1512,16 @@ impl StopConfig {
 /// cluster-wedge; a floor that only shrinks preemption's options can never
 /// wedge anything — the preemptor simply does not place.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Default)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[serde(rename_all = "camelCase")]
 pub struct DisruptionConfig {
     /// Absolute count (`2`) or percent of the task's count (`"50%"`).
     /// Default 0 — choosing a preemptible band donates the whole task.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub min_available: Option<Value>,
+    /// Keys this block did not recognize, captured for the submit's
+    /// unknown-field check (`structs::spec_fields`); empty once it ran.
+    #[serde(flatten)]
+    pub unknown_fields: crate::structs::spec_fields::UnknownFields,
 }
 
 impl DisruptionConfig {
@@ -1774,7 +1858,7 @@ pub fn volume_param_map(params: Option<&Value>) -> BTreeMap<String, Value> {
 /// several tasks may hold the same claim. Both compile to the same mount list
 /// on the wire and share one worker pipeline (see docs/volumes.md).
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[serde(rename_all = "camelCase")]
 pub struct VolumeSpec {
     /// Volume name within the task, `[A-Za-z0-9._-]{1,64}` and unique per
     /// task. Becomes `LEGION_VOLUME_<NAME>` in the task env.
@@ -1798,6 +1882,15 @@ pub struct VolumeSpec {
     /// nobody can write to is always a mistake).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub read_only: Option<bool>,
+    /// Keys this block did not recognize, captured for the submit's
+    /// unknown-field check (`structs::spec_fields`); empty once it ran.
+    #[serde(flatten)]
+    pub unknown_fields: crate::structs::spec_fields::UnknownFields,
+    /// Unknown keys kept on this extension point under
+    /// `allow_unknown_fields`, as written and unvalidated
+    /// (`structs::spec_fields`).
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub pending_extensions: crate::structs::spec_fields::PendingExtensions,
 }
 
 impl VolumeSpec {
@@ -1984,11 +2077,18 @@ pub struct TaskConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[tabled(skip)]
     pub suspend: Option<crate::structs::suspend::SuspendConfig>,
+    /// Unknown keys kept on this task under `allow_unknown_fields`, as
+    /// written and unvalidated (`structs::spec_fields`). Nothing acts on
+    /// them; `legion job info` lists them. Empty for every task submitted
+    /// without the flag.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    #[tabled(skip)]
+    pub pending_extensions: PendingExtensions,
 }
 
 /// A declared action: a named command template with typed parameters.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[serde(rename_all = "camelCase")]
 pub struct ActionSpec {
     /// Action name, `[a-z0-9-]{1,128}`, unique within its task.
     pub name: String,
@@ -2005,6 +2105,10 @@ pub struct ActionSpec {
     /// Optional wall-clock cap, e.g. `"60s"`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timeout: Option<String>,
+    /// Keys this block did not recognize, captured for the submit's
+    /// unknown-field check (`structs::spec_fields`); empty once it ran.
+    #[serde(flatten)]
+    pub unknown_fields: crate::structs::spec_fields::UnknownFields,
 }
 
 /// Parameter type for an action parameter.
@@ -2031,7 +2135,7 @@ impl ActionParamType {
 
 /// A typed, validated parameter of an action.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[serde(rename_all = "camelCase")]
 pub struct ActionParam {
     pub name: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
@@ -2058,6 +2162,10 @@ pub struct ActionParam {
     /// Redact the value in audit events and UI history.
     #[serde(default)]
     pub sensitive: bool,
+    /// Keys this block did not recognize, captured for the submit's
+    /// unknown-field check (`structs::spec_fields`); empty once it ran.
+    #[serde(flatten)]
+    pub unknown_fields: crate::structs::spec_fields::UnknownFields,
 }
 
 impl ActionParam {
@@ -2253,6 +2361,10 @@ pub struct KvInjectionPolicy {
     pub on_change: Option<KvInjectionAction>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub on_delete: Option<KvInjectionAction>,
+    /// Keys this block did not recognize, captured for the submit's
+    /// unknown-field check (`structs::spec_fields`); empty once it ran.
+    #[serde(flatten)]
+    pub unknown_fields: crate::structs::spec_fields::UnknownFields,
 }
 
 /// Fully-resolved KV policy for one injection edge after defaults and hard
@@ -2290,6 +2402,10 @@ pub struct KvTemplateSource {
     pub template: Option<String>,
     #[serde(default)]
     pub template_kv: Option<String>,
+    /// Keys this block did not recognize, captured for the submit's
+    /// unknown-field check (`structs::spec_fields`); empty once it ran.
+    #[serde(flatten)]
+    pub unknown_fields: crate::structs::spec_fields::UnknownFields,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Default)]
@@ -2299,6 +2415,10 @@ pub struct TaskKvEnvInjection {
     pub value: KvTemplateSource,
     #[serde(default)]
     pub kv: KvInjectionPolicy,
+    /// Keys this block did not recognize, captured for the submit's
+    /// unknown-field check (`structs::spec_fields`); empty once it ran.
+    #[serde(flatten)]
+    pub unknown_fields: crate::structs::spec_fields::UnknownFields,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Default)]
@@ -2320,6 +2440,10 @@ pub struct TaskKvFileInjection {
     /// reload at once.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub splay: Option<String>,
+    /// Keys this block did not recognize, captured for the submit's
+    /// unknown-field check (`structs::spec_fields`); empty once it ran.
+    #[serde(flatten)]
+    pub unknown_fields: crate::structs::spec_fields::UnknownFields,
 }
 
 /// The `liveUpdate` marker on a rendered `config.files` entry, written by the
@@ -2346,6 +2470,10 @@ pub struct TaskKvInjections {
     pub env: Vec<TaskKvEnvInjection>,
     #[serde(default)]
     pub files: Vec<TaskKvFileInjection>,
+    /// Keys this block did not recognize, captured for the submit's
+    /// unknown-field check (`structs::spec_fields`); empty once it ran.
+    #[serde(flatten)]
+    pub unknown_fields: crate::structs::spec_fields::UnknownFields,
 }
 
 #[derive(Serialize, Debug, Clone, PartialEq)]
@@ -2362,9 +2490,26 @@ pub struct JobConfig {
     pub priority: Band,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rollout: Option<RolloutConfig>,
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    // Serialized as the jobspec spells it, so a stored config re-parses with
+    // its group overrides (it used to serialize as `rollout_by_group`, which
+    // the parser silently ignored).
+    #[serde(
+        default,
+        rename = "rolloutByGroup",
+        skip_serializing_if = "BTreeMap::is_empty"
+    )]
     pub rollout_by_group: BTreeMap<String, RolloutConfig>,
     pub version: Option<u32>,
+    /// Unknown top-level keys kept under `allow_unknown_fields`, as written
+    /// and unvalidated (`structs::spec_fields`). Nothing acts on them;
+    /// `legion job info` lists them. Empty for every job submitted without
+    /// the flag.
+    #[serde(
+        default,
+        rename = "pendingExtensions",
+        skip_serializing_if = "BTreeMap::is_empty"
+    )]
+    pub pending_extensions: PendingExtensions,
 }
 
 #[derive(Deserialize)]
@@ -2379,7 +2524,7 @@ struct JobConfigInput {
     namespace: Option<String>,
     #[serde(default)]
     tasks: Option<TaskConfigList>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_single_task")]
     task: Option<TaskConfigInput>,
     /// `critical | high | elevated | normal | low | background`. Absent =
     /// `normal`. Deserialized as a raw string so an unknown band produces
@@ -2392,13 +2537,118 @@ struct JobConfigInput {
     #[serde(default)]
     rollout_by_group: BTreeMap<String, RolloutConfig>,
     version: Option<u32>,
+    #[serde(default)]
+    pending_extensions: PendingExtensions,
+    #[serde(flatten)]
+    unknown_fields: UnknownFields,
 }
 
-#[derive(Deserialize)]
-#[serde(untagged)]
+extension_point!(
+    JobConfigInput,
+    ExtensionPoint::Job,
+    [
+        "name",
+        "namespace",
+        "tasks",
+        "task",
+        "priority",
+        "rollout",
+        "rolloutByGroup",
+        "version"
+    ],
+    |this, walk| {
+        walk.opt("rollout", this.rollout.as_mut());
+        walk.map("rolloutByGroup", &mut this.rollout_by_group);
+        if let Some(task) = this.task.as_mut() {
+            let label = task.name.clone().unwrap_or_else(|| "task".to_string());
+            walk.scoped(format!("task {label}"), task);
+        }
+        match this.tasks.as_mut() {
+            Some(TaskConfigList::List(tasks)) => {
+                for (index, task) in tasks.iter_mut().enumerate() {
+                    let label = task
+                        .name
+                        .clone()
+                        .unwrap_or_else(|| format!("task-{}", index + 1));
+                    walk.scoped(format!("task {label}"), task);
+                }
+            }
+            Some(TaskConfigList::Map(tasks)) => {
+                for (key, task) in tasks.iter_mut() {
+                    let label = task.name.clone().unwrap_or_else(|| key.clone());
+                    walk.scoped(format!("task {label}"), task);
+                }
+            }
+            None => {}
+        }
+    }
+);
+
+/// `tasks`, parsed by its shape: a list of tasks, or a map of task name to
+/// task. Not an untagged enum: that would try both shapes and replace a
+/// task's own error (a wrong type, a bad value) with serde's generic "data
+/// did not match any variant". Each task's error names the task instead.
 enum TaskConfigList {
     List(Vec<TaskConfigInput>),
     Map(BTreeMap<String, TaskConfigInput>),
+}
+
+impl<'de> Deserialize<'de> for TaskConfigList {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct ShapeVisitor;
+
+        impl<'de> serde::de::Visitor<'de> for ShapeVisitor {
+            type Value = TaskConfigList;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+                formatter.write_str("a list of tasks, or a map of task name to task")
+            }
+
+            fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
+            where
+                A: serde::de::SeqAccess<'de>,
+            {
+                let mut tasks = Vec::new();
+                loop {
+                    match seq.next_element::<TaskConfigInput>() {
+                        Ok(Some(task)) => tasks.push(task),
+                        Ok(None) => return Ok(TaskConfigList::List(tasks)),
+                        Err(err) => {
+                            return Err(A::Error::custom(format!("tasks[{}]: {err}", tasks.len())))
+                        }
+                    }
+                }
+            }
+
+            fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+            where
+                A: serde::de::MapAccess<'de>,
+            {
+                let mut tasks = BTreeMap::new();
+                while let Some(name) = map.next_key::<String>()? {
+                    let task = map
+                        .next_value::<TaskConfigInput>()
+                        .map_err(|err| A::Error::custom(format!("task {name}: {err}")))?;
+                    tasks.insert(name, task);
+                }
+                Ok(TaskConfigList::Map(tasks))
+            }
+        }
+
+        deserializer.deserialize_any(ShapeVisitor)
+    }
+}
+
+/// The single-`task` shorthand, with its errors naming it.
+fn deserialize_single_task<'de, D>(deserializer: D) -> Result<Option<TaskConfigInput>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    Option::<TaskConfigInput>::deserialize(deserializer)
+        .map_err(|err| D::Error::custom(format!("task: {err}")))
 }
 
 #[derive(Deserialize)]
@@ -2485,18 +2735,105 @@ struct TaskConfigInput {
     snapshots: Option<crate::structs::snapshot::SnapshotsConfig>,
     #[serde(default)]
     suspend: Option<crate::structs::suspend::SuspendConfig>,
+    #[serde(default)]
+    pending_extensions: PendingExtensions,
+    #[serde(flatten)]
+    unknown_fields: UnknownFields,
 }
 
+extension_point!(
+    TaskConfigInput,
+    ExtensionPoint::Task,
+    [
+        "name",
+        "count",
+        "runtime",
+        "group",
+        "dependsOn",
+        "lifecycle",
+        "schedule",
+        "config",
+        "resources",
+        "constraints",
+        "permit",
+        "affinities",
+        "checks",
+        "onUnhealthy",
+        "restart",
+        "stop",
+        "disruption",
+        "gang",
+        "kv",
+        "env",
+        "files",
+        "kvInjections",
+        "network",
+        "service",
+        "connect",
+        "identities",
+        "stateful",
+        "volumes",
+        "artifacts",
+        "actions",
+        "speculativeStart",
+        "snapshots",
+        "suspend"
+    ],
+    |this, walk| {
+        for (index, dependency) in this.depends_on.iter_mut().enumerate() {
+            if let TaskDependencyInput::Detailed(detailed) = dependency {
+                walk.block(&format!("dependsOn[{index}]"), detailed);
+            }
+        }
+        walk.list("checks", &mut this.checks);
+        walk.opt("onUnhealthy", this.on_unhealthy.as_mut());
+        walk.opt("restart", this.restart.as_mut());
+        walk.opt("stop", this.stop.as_mut());
+        walk.opt("disruption", this.disruption.as_mut());
+        walk.opt("kv", this.kv.as_mut());
+        walk.list("env", &mut this.env);
+        walk.list("files", &mut this.files);
+        walk.opt("kvInjections", this.kv_injections.as_mut());
+        walk.opt("network", this.network.as_mut());
+        if let Some(service) = this.service.as_mut() {
+            let label = match service.name.as_deref() {
+                Some(name) => format!("service {name}"),
+                None => "service".to_string(),
+            };
+            walk.scoped(label, service);
+        }
+        walk.opt("connect", this.connect.as_mut());
+        walk.list("identities", &mut this.identities);
+        walk.opt("stateful", this.stateful.as_mut());
+        for volume in this.volumes.iter_mut() {
+            walk.scoped(format!("volume {}", volume.name), volume);
+        }
+        walk.list("artifacts", &mut this.artifacts);
+        walk.list("actions", &mut this.actions);
+        walk.opt("speculativeStart", this.speculative_start.as_mut());
+        walk.opt("snapshots", this.snapshots.as_mut());
+        walk.opt("suspend", this.suspend.as_mut());
+    }
+);
+
+/// A `dependsOn` entry: a task name, or `{ task, condition }`.
 #[derive(Deserialize)]
 #[serde(untagged)]
 enum TaskDependencyInput {
     Name(String),
-    Detailed {
-        task: String,
-        #[serde(default = "default_dependency_condition")]
-        condition: TaskDependencyCondition,
-    },
+    Detailed(TaskDependencyDetailed),
 }
+
+#[derive(Deserialize)]
+struct TaskDependencyDetailed {
+    task: String,
+    #[serde(default = "default_dependency_condition")]
+    condition: TaskDependencyCondition,
+    #[serde(flatten)]
+    unknown_fields: UnknownFields,
+}
+
+spec_block!(TaskDependencyDetailed, ["task", "condition"]);
 
 impl TaskConfigInput {
     fn into_task_config(self, name: String) -> Result<TaskConfig, String> {
@@ -2569,9 +2906,9 @@ impl TaskConfigInput {
                     task,
                     condition: default_dependency_condition(),
                 },
-                TaskDependencyInput::Detailed { task, condition } => {
-                    TaskDependency { task, condition }
-                }
+                TaskDependencyInput::Detailed(TaskDependencyDetailed {
+                    task, condition, ..
+                }) => TaskDependency { task, condition },
             })
             .collect();
         Ok(TaskConfig {
@@ -2606,12 +2943,14 @@ impl TaskConfigInput {
                     } else {
                         self.files
                     },
+                    unknown_fields: UnknownFields::new(),
                 }
             } else {
                 TaskKvInjections {
                     kv: self.kv,
                     env: self.env,
                     files: self.files,
+                    unknown_fields: UnknownFields::new(),
                 }
             }),
             network: self.network,
@@ -2625,6 +2964,7 @@ impl TaskConfigInput {
             speculative_start: self.speculative_start,
             snapshots: self.snapshots,
             suspend: self.suspend,
+            pending_extensions: self.pending_extensions,
         })
     }
 }
@@ -2643,54 +2983,96 @@ fn task_list_to_vec(configs: TaskConfigList) -> Result<Vec<TaskConfig>, String> 
     }
 }
 
+/// Check a parsed jobspec's unknown keys with `walk`, then build the config.
+/// Every way a `JobConfig` is parsed goes through here, so no path can
+/// accept a key it does not know without saying so.
+fn job_config_from_input(
+    mut input: JobConfigInput,
+    mut walk: FieldWalk,
+) -> Result<(JobConfig, UnknownFieldsRecord), String> {
+    walk.root(&mut input);
+    let record = walk.finish(&input.name).map_err(|err| err.to_string())?;
+
+    let tasks = match (input.tasks, input.task) {
+        (Some(_), Some(_)) => return Err("jobspec must define only one of task or tasks".into()),
+        (Some(tasks), None) => task_list_to_vec(tasks)?,
+        (None, Some(task)) => vec![task.into_task_config(String::from("task"))?],
+        (None, None) => return Err("jobspec must define at least one task".into()),
+    };
+
+    let priority = match input.priority.as_deref() {
+        None => Band::default(),
+        Some(raw) => Band::parse(raw)?,
+    };
+
+    // `name` may itself be qualified (`prod/web`, the form every reply
+    // prints); a qualified name that disagrees with `namespace` is an
+    // error, never a precedence rule.
+    let name = crate::structs::namespace::resolve_job_ref(&input.name, input.namespace.as_deref())
+        .map_err(|err| format!("jobspec: {err}"))?;
+    let mut config = JobConfig {
+        name,
+        tasks,
+        priority,
+        rollout: input.rollout,
+        rollout_by_group: input.rollout_by_group,
+        version: input.version,
+        pending_extensions: input.pending_extensions,
+    };
+    // Session tasks become a keyed task plus a generated envelope task
+    // here, at parse, so validation, storage, and every reader see one
+    // shape. Idempotent, so a stored config parses back unchanged.
+    crate::structs::session::normalize_session_tasks(&mut config)
+        .map_err(|err| format!("{err:#}"))?;
+    Ok((config, record))
+}
+
+/// Plain deserialization is strict: an unknown key anywhere in the spec is
+/// an error. It accepts a stored config's `pendingExtensions`, so a config
+/// Legion serialized parses back unchanged. A submit goes through
+/// [`JobConfig::parse_submitted`] instead, which honors the request's
+/// `allow_unknown_fields`.
 impl<'de> Deserialize<'de> for JobConfig {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
         D: Deserializer<'de>,
     {
         let input = JobConfigInput::deserialize(deserializer)?;
-        let tasks = match (input.tasks, input.task) {
-            (Some(_), Some(_)) => {
-                return Err(D::Error::custom(
-                    "jobspec must define only one of task or tasks",
-                ))
-            }
-            (Some(tasks), None) => task_list_to_vec(tasks).map_err(D::Error::custom)?,
-            (None, Some(task)) => vec![task
-                .into_task_config(String::from("task"))
-                .map_err(D::Error::custom)?],
-            (None, None) => return Err(D::Error::custom("jobspec must define at least one task")),
-        };
-
-        let priority = match input.priority.as_deref() {
-            None => Band::default(),
-            Some(raw) => Band::parse(raw).map_err(D::Error::custom)?,
-        };
-
-        // `name` may itself be qualified (`prod/web`, the form every reply
-        // prints); a qualified name that disagrees with `namespace` is an
-        // error, never a precedence rule.
-        let name =
-            crate::structs::namespace::resolve_job_ref(&input.name, input.namespace.as_deref())
-                .map_err(|err| D::Error::custom(format!("jobspec: {err}")))?;
-        let mut config = JobConfig {
-            name,
-            tasks,
-            priority,
-            rollout: input.rollout,
-            rollout_by_group: input.rollout_by_group,
-            version: input.version,
-        };
-        // Session tasks become a keyed task plus a generated envelope task
-        // here, at parse, so validation, storage, and every reader see one
-        // shape. Idempotent, so a stored config parses back unchanged.
-        crate::structs::session::normalize_session_tasks(&mut config)
-            .map_err(|err| D::Error::custom(format!("{err:#}")))?;
-        Ok(config)
+        job_config_from_input(input, FieldWalk::stored())
+            .map(|(config, _)| config)
+            .map_err(D::Error::custom)
     }
 }
 
 impl JobConfig {
+    /// Parse a rendered jobspec someone submitted (`RunJob`, `PlanJob`,
+    /// `RunJobTemplate`, `legion job validate`).
+    ///
+    /// With [`UnknownFieldMode::Reject`], every key the jobspec does not
+    /// know is an error naming its path and the closest known key. With
+    /// [`UnknownFieldMode::Allow`] (`allow_unknown_fields`), a key on an
+    /// extension point (the job, a task, a volume, a port, a service) is kept
+    /// in that block's `pendingExtensions`, a key anywhere else is dropped,
+    /// and the returned record says which. A value Legion knows is wrong is
+    /// an error either way. See docs/jobs-tasks-and-scheduling.md, "Unknown
+    /// fields".
+    pub fn parse_submitted(
+        value: Value,
+        mode: UnknownFieldMode,
+    ) -> R<(JobConfig, UnknownFieldsRecord)> {
+        let input: JobConfigInput = serde_json::from_value(value)?;
+        job_config_from_input(input, FieldWalk::submitted(mode)).map_err(|err| anyhow!(err))
+    }
+
+    /// [`Self::parse_submitted`] on JSON text.
+    pub fn parse_submitted_str(
+        text: &str,
+        mode: UnknownFieldMode,
+    ) -> R<(JobConfig, UnknownFieldsRecord)> {
+        let input: JobConfigInput = serde_json::from_str(text)?;
+        job_config_from_input(input, FieldWalk::submitted(mode)).map_err(|err| anyhow!(err))
+    }
+
     /// Normalize spec shorthands (currently the `service.port` inline port
     /// sugar) so stored configs are always in explicit form. Must run before
     /// validation and storage on every submit path.
@@ -2710,6 +3092,9 @@ impl JobConfig {
             && self.priority == other.priority
             && self.rollout == other.rollout
             && self.rollout_by_group == other.rollout_by_group
+            // Pending keys are part of what was submitted: dropping or
+            // changing one is a new version, or it would be lost.
+            && self.pending_extensions == other.pending_extensions
     }
 
     pub fn id(&self) -> String {
@@ -2828,6 +3213,7 @@ impl TaskConfig {
             volumes: Vec::new(),
             artifacts: Vec::new(),
             actions: Vec::new(),
+            pending_extensions: PendingExtensions::new(),
         }
     }
 
@@ -3563,6 +3949,155 @@ impl Submission {
     }
 }
 
+// Unknown-field capture (`structs::spec_fields`): the keys each block
+// accepts, for did-you-mean, and the blocks nested in it. `gang`, `count`,
+// and `schedule` are parsed by hand and refuse unknown keys on their own.
+
+spec_block!(
+    TaskCheck,
+    [
+        "type",
+        "name",
+        "kind",
+        "path",
+        "port",
+        "command",
+        "every",
+        "timeout",
+        "unhealthyAfterCount",
+        "bootGraceTime",
+        "unhealthyAfterCountTimespan"
+    ]
+);
+spec_block!(
+    TaskOnUnhealthyConfig,
+    [
+        "restartCount",
+        "restartPeriod",
+        "restartDelay",
+        "moveCount",
+        "movePeriod",
+        "moveDelay"
+    ]
+);
+spec_block!(TaskRestartConfig, ["policy", "delay", "successExitCodes"]);
+spec_block!(RolloutSlotsConfig, ["order", "updateFrom"]);
+spec_block!(
+    RolloutConfig,
+    [
+        "strategy",
+        "progression",
+        "replacement",
+        "inPlace",
+        "percentEachStep",
+        "countEachStep",
+        "percentSteps",
+        "countSteps",
+        "stepStagger",
+        "allocationStagger",
+        "minHealthyTime",
+        "healthyDeadline",
+        "ignoreHealthChecks",
+        "capacityBlockTimeout",
+        "onCapacityTimeout",
+        "rollbackOnFailure",
+        "onHealthDeadline",
+        "batchKillAfter",
+        "slots"
+    ],
+    |this, walk| {
+        walk.opt("slots", this.slots.as_mut());
+    }
+);
+spec_block!(
+    StatefulConfig,
+    [
+        "mode",
+        "requireId",
+        "initialInstances",
+        "storage",
+        "onLost",
+        "envelope",
+        "promote",
+        "placement",
+        "fenceAfter"
+    ],
+    |this, walk| {
+        walk.opt("storage", this.storage.as_mut());
+        walk.opt("onLost", this.on_lost.as_mut());
+        walk.opt("envelope", this.envelope.as_mut());
+        walk.opt("promote", this.promote.as_mut());
+    }
+);
+spec_block!(StatefulOnLostConfig, ["selfTerminateAfter", "replaceAfter"]);
+spec_block!(
+    StatefulStorageConfig,
+    [
+        "path",
+        "driver",
+        "mode",
+        "params",
+        "retainOnScaleIn",
+        "retainOnStop"
+    ]
+);
+spec_block!(StopConfig, ["signal", "killAfter", "drain"]);
+spec_block!(DisruptionConfig, ["minAvailable"]);
+extension_point!(
+    VolumeSpec,
+    ExtensionPoint::Volume,
+    ["name", "driver", "mode", "params", "path", "readOnly"]
+);
+spec_block!(
+    ActionSpec,
+    ["name", "description", "command", "params", "tty", "timeout"],
+    |this, walk| {
+        walk.list("params", &mut this.params);
+    }
+);
+spec_block!(
+    ActionParam,
+    [
+        "name",
+        "description",
+        "type",
+        "default",
+        "required",
+        "values",
+        "pattern",
+        "min",
+        "max",
+        "sensitive"
+    ]
+);
+spec_block!(KvInjectionPolicy, ["watch", "onChange", "onDelete"]);
+spec_block!(KvTemplateSource, ["template", "templateKv"]);
+spec_block!(TaskKvEnvInjection, ["name", "value", "kv"], |this, walk| {
+    walk.block("value", &mut this.value);
+    walk.block("kv", &mut this.kv);
+});
+spec_block!(
+    TaskKvFileInjection,
+    [
+        "path",
+        "mode",
+        "file",
+        "kv",
+        "changeMode",
+        "changeSignal",
+        "splay"
+    ],
+    |this, walk| {
+        walk.block("file", &mut this.file);
+        walk.block("kv", &mut this.kv);
+    }
+);
+spec_block!(TaskKvInjections, ["kv", "env", "files"], |this, walk| {
+    walk.opt("kv", this.kv.as_mut());
+    walk.list("env", &mut this.env);
+    walk.list("files", &mut this.files);
+});
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3588,9 +4123,11 @@ mod tests {
                 min: None,
                 max: None,
                 sensitive: false,
+                unknown_fields: Default::default(),
             }],
             tty: false,
             timeout: None,
+            unknown_fields: Default::default(),
         }
     }
 
@@ -3641,6 +4178,7 @@ mod tests {
             min: Some(1),
             max: Some(10),
             sensitive: false,
+            unknown_fields: Default::default(),
         };
         assert!(param.validate_value("5").is_ok());
         assert!(param.validate_value("0").unwrap_err().contains(">= 1"));
@@ -3658,6 +4196,7 @@ mod tests {
             params: vec![],
             tty: false,
             timeout: None,
+            unknown_fields: Default::default(),
         }];
         let err = task.validate_actions().unwrap_err().to_string();
         assert!(err.contains("undeclared param"), "got: {err}");
@@ -4136,12 +4675,14 @@ mod tests {
             watch: Some(true),
             on_change: Some(KvInjectionAction::Restart),
             on_delete: Some(KvInjectionAction::None),
+            unknown_fields: Default::default(),
         };
         // Entry only overrides on_change; watch and on_delete inherit.
         let entry = KvInjectionPolicy {
             watch: None,
             on_change: Some(KvInjectionAction::Rollout),
             on_delete: None,
+            unknown_fields: Default::default(),
         };
         let resolved = entry.resolve_with_defaults(&defaults);
         assert!(resolved.watch);
@@ -4155,11 +4696,13 @@ mod tests {
             watch: Some(true),
             on_change: Some(KvInjectionAction::Rollout),
             on_delete: Some(KvInjectionAction::Fail),
+            unknown_fields: Default::default(),
         };
         let entry = KvInjectionPolicy {
             watch: Some(false),
             on_change: None,
             on_delete: None,
+            unknown_fields: Default::default(),
         };
         let resolved = entry.resolve_with_defaults(&defaults);
         assert!(!resolved.watch);
@@ -4545,11 +5088,13 @@ mod tests {
                         path: "/workspace".into(),
                         retain_on_scale_in: None,
                         retain_on_stop: Some(value),
+                        unknown_fields: Default::default(),
                     }),
                     envelope: None,
                     promote: None,
                     placement: None,
                     fence_after: None,
+                    unknown_fields: Default::default(),
                 }),
                 ..TaskConfig::new("sandbox", "container")
             };
@@ -4578,6 +5123,7 @@ mod tests {
                 promote: None,
                 placement: None,
                 fence_after: None,
+                unknown_fields: Default::default(),
             }),
             ..TaskConfig::new("db", "exec")
         };
@@ -4601,6 +5147,7 @@ mod tests {
                 promote: None,
                 placement: None,
                 fence_after: None,
+                unknown_fields: Default::default(),
             }),
             ..TaskConfig::new("db", "exec")
         };
@@ -4624,6 +5171,7 @@ mod tests {
                 promote: None,
                 placement: None,
                 fence_after: None,
+                unknown_fields: Default::default(),
             }),
             ..TaskConfig::new("db", "exec")
         };
@@ -4649,11 +5197,13 @@ mod tests {
                         path: bad_path.into(),
                         retain_on_scale_in: None,
                         retain_on_stop: None,
+                        unknown_fields: Default::default(),
                     }),
                     envelope: None,
                     promote: None,
                     placement: None,
                     fence_after: None,
+                    unknown_fields: Default::default(),
                 }),
                 ..TaskConfig::new("db", "exec")
             };
@@ -4681,6 +5231,7 @@ mod tests {
                 promote: None,
                 placement: None,
                 fence_after: None,
+                unknown_fields: Default::default(),
             }),
             ..TaskConfig::new("sandbox", "container")
         };
@@ -4707,6 +5258,7 @@ mod tests {
                     promote: None,
                     placement: None,
                     fence_after: None,
+                    unknown_fields: Default::default(),
                 }),
                 ..TaskConfig::new("sandbox", "container")
             };
@@ -4832,6 +5384,7 @@ mod tests {
                 promote: None,
                 placement: None,
                 fence_after: None,
+                unknown_fields: Default::default(),
             }),
             ..TaskConfig::new("db", "exec")
         }
@@ -4852,6 +5405,7 @@ mod tests {
                 promote: None,
                 placement: None,
                 fence_after: None,
+                unknown_fields: Default::default(),
             }),
             ..TaskConfig::new("db", "exec")
         };
@@ -4870,6 +5424,7 @@ mod tests {
         let policy = StatefulOnLostConfig {
             self_terminate_after: Some("45s".into()),
             replace_after: None,
+            unknown_fields: Default::default(),
         }
         .resolve()?;
         assert_eq!(policy.self_terminate_after, Duration::from_secs(45));
@@ -4885,6 +5440,7 @@ mod tests {
         let task = slot_task_with_on_lost(StatefulOnLostConfig {
             self_terminate_after: Some("30s".into()),
             replace_after: Some("3m".into()),
+            unknown_fields: Default::default(),
         });
         task.validate_stateful()?;
         let policy = task.stateful.as_ref().unwrap().resolved_on_lost()?;
@@ -4899,6 +5455,7 @@ mod tests {
         let never = slot_task_with_on_lost(StatefulOnLostConfig {
             self_terminate_after: None,
             replace_after: Some("never".into()),
+            unknown_fields: Default::default(),
         });
         never.validate_stateful()?;
         let policy = never.stateful.as_ref().unwrap().resolved_on_lost()?;
@@ -4912,6 +5469,7 @@ mod tests {
             let task = slot_task_with_on_lost(StatefulOnLostConfig {
                 self_terminate_after: Some("90s".into()),
                 replace_after: Some(replace_after.into()),
+                unknown_fields: Default::default(),
             });
             let err = task
                 .validate_stateful()
@@ -4933,6 +5491,7 @@ mod tests {
             let task = slot_task_with_on_lost(StatefulOnLostConfig {
                 self_terminate_after: Some(bad.into()),
                 replace_after: None,
+                unknown_fields: Default::default(),
             });
             let err = task
                 .validate_stateful()
@@ -4945,6 +5504,7 @@ mod tests {
             let task = slot_task_with_on_lost(StatefulOnLostConfig {
                 self_terminate_after: None,
                 replace_after: Some(bad.into()),
+                unknown_fields: Default::default(),
             });
             let err = task
                 .validate_stateful()
@@ -5207,6 +5767,7 @@ mod tests {
                 promote: None,
                 placement: None,
                 fence_after: None,
+                unknown_fields: Default::default(),
             }),
             ..TaskConfig::new("sandbox", "noop")
         };

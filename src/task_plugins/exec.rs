@@ -1171,6 +1171,7 @@ mod tests {
                 signal: "SIGTERM".into(),
                 kill_after: std::time::Duration::from_secs(30),
                 drain: None,
+                unknown_fields: Default::default(),
             }),
             ..TaskConfig::new("drain", "exec")
         };
@@ -1248,6 +1249,7 @@ mod tests {
                 signal: "SIGTERM".into(),
                 kill_after: std::time::Duration::from_secs(1),
                 drain: None,
+                unknown_fields: Default::default(),
             }),
             ..TaskConfig::new("stubborn", "exec")
         };

@@ -4,11 +4,13 @@ use std::vec;
 use clap::value_parser;
 
 use crate::cmd::helpers::{
-    active_namespace, connect_manager_client, friendly_status, job_ref, json_flag,
-    list_namespace_flags, lists_many_namespaces, namespace_flag, namespace_selection, print_table,
+    active_namespace, allow_unknown_fields_flag, connect_manager_client, friendly_status, job_ref,
+    json_flag, list_namespace_flags, lists_many_namespaces, namespace_flag, namespace_selection,
+    print_table,
 };
 use crate::cmd::output::{self, CliError, OutputFormat};
 use crate::prelude::*;
+use crate::structs::spec_fields::UnknownFieldMode;
 use crate::structs::{
     AdvanceRolloutRequest, DestroyJobRequest, GetAllocationLogsRequest, GetJobInfoRequest,
     GetJobScaleStatusRequest, GetJobSpecRequest, GetKvRequest, GetRolloutStatusRequest, JobConfig,
@@ -43,6 +45,7 @@ pub fn config() -> Command {
         .arg(idempotency_arg())
         .arg(wait_flag())
         .arg(timeout_arg())
+        .arg(allow_unknown_fields_flag())
         .arg(namespace_flag())
         .arg(json_flag())
         .args(config_var_args());
@@ -126,6 +129,7 @@ pub fn config() -> Command {
                 .required(true)
                 .value_hint(ValueHint::AnyPath),
         )
+        .arg(allow_unknown_fields_flag())
         .arg(json_flag())
         .args(config_var_args());
 
@@ -165,6 +169,7 @@ pub fn config() -> Command {
                 .required(true)
                 .value_hint(ValueHint::AnyPath),
         )
+        .arg(allow_unknown_fields_flag())
         .arg(namespace_flag())
         .arg(json_flag())
         .args(config_var_args());
@@ -566,16 +571,22 @@ async fn validate_job(arg_matches: &ArgMatches) -> R<()> {
     let resolved = resolve_jobspec_source_async(path).await?;
     let (rendered, _submissions) = render_jobspec(&resolved.path, &vars)?;
 
-    // Parse the rendered jobspec into a JobConfig.
-    let config: JobConfig = match serde_json::from_str(&rendered) {
-        Ok(config) => config,
+    // Parse the rendered jobspec into a JobConfig, with the same unknown-key
+    // rules the manager applies to the submit (`--allow-unknown-fields`).
+    let mode = UnknownFieldMode::from_allow(arg_matches.get_flag("allow-unknown-fields"));
+    let (config, unknown_fields) = match JobConfig::parse_submitted_str(&rendered, mode) {
+        Ok(parsed) => parsed,
         Err(err) => {
+            let text = format!("jobspec is not a valid job configuration: {err:#}");
+            let (message, hint) = crate::cmd::helpers::split_hint(&text);
             return Err(output::fail_local(
                 format,
                 CliError::local(
                     "InvalidArgument",
-                    format!("jobspec is not a valid job configuration: {err}"),
-                    Some("check field names and types against `legion job schema`"),
+                    message,
+                    hint.or(Some(
+                        "check field names and types against `legion job schema`",
+                    )),
                 ),
             ));
         }
@@ -606,7 +617,10 @@ async fn validate_job(arg_matches: &ArgMatches) -> R<()> {
     // `speculativeStart.mode` cannot be honored is capped at `stage` — never
     // silently, because the symptom otherwise is a speedup that quietly did
     // not happen.
-    let mut warnings = speculative_start_warnings(&config);
+    // Unknown keys the flag kept or dropped come first: a dropped key is
+    // intent the submit would lose.
+    let mut warnings = unknown_fields.warnings();
+    warnings.extend(speculative_start_warnings(&config));
     // Valid settings that will not do what the author most likely expects
     // (an idle signal a microVM cannot see, an identity refresh that reboots
     // the guest). `job run` prints the same lines.
@@ -631,6 +645,7 @@ async fn validate_job(arg_matches: &ArgMatches) -> R<()> {
             "tasks": task_count,
             "groups": groups.iter().collect::<Vec<_>>(),
             "warnings": warnings,
+            "unknownFields": unknown_fields,
         }));
     } else {
         println!(
@@ -2027,6 +2042,7 @@ async fn plan_job(arg_matches: &ArgMatches) -> R<()> {
     let request = tonic::Request::new(PlanJobRequest {
         parsed_jobspec: rendered,
         namespace,
+        allow_unknown_fields: arg_matches.get_flag("allow-unknown-fields"),
     });
 
     let response = output::resolve(format, "failed to plan job", client.plan_job(request).await)?;
@@ -2249,8 +2265,8 @@ async fn run_job(arg_matches: &ArgMatches) -> R<()> {
     let namespace = spec_request_namespace(arg_matches, &rendered);
     // Capture the job's canonical id so we can optionally wait for
     // convergence below.
-    let job_name = serde_json::from_str::<JobConfig>(&rendered)
-        .map(|config| {
+    let job_name = JobConfig::parse_submitted_str(&rendered, UnknownFieldMode::Allow)
+        .map(|(config, _)| {
             let (declared, name) = crate::structs::namespace::split_job_id(&config.name);
             let namespace = namespace.as_deref().unwrap_or(declared);
             crate::structs::namespace::job_id(namespace, name)
@@ -2264,6 +2280,7 @@ async fn run_job(arg_matches: &ArgMatches) -> R<()> {
         force_reschedule: arg_matches.get_flag("force-reschedule"),
         idempotency_key,
         namespace,
+        allow_unknown_fields: arg_matches.get_flag("allow-unknown-fields"),
     });
 
     let reply =
@@ -2285,6 +2302,7 @@ async fn run_job(arg_matches: &ArgMatches) -> R<()> {
         output::print_success(&json!({
             "message": reply.message,
             "deduplicated": reply.deduplicated,
+            "warnings": reply.warnings,
             "wait": wait_result,
         }));
     } else {
@@ -2662,16 +2680,34 @@ async fn get_info(arg_matches: &ArgMatches) -> R<()> {
         client.get_job_info(request).await,
     )?;
 
+    let reply = response.into_inner();
     if format.is_json() {
-        print_json(&response.into_inner().job);
+        // The job object, plus `unknownFields` when its latest version was
+        // submitted with --allow-unknown-fields and that kept or dropped
+        // something.
+        let mut value = serde_json::to_value(&reply.job)?;
+        if let (Some(record), Some(object)) = (reply.unknown_fields.as_ref(), value.as_object_mut())
+        {
+            object.insert("unknownFields".into(), serde_json::to_value(record)?);
+        }
+        print_json(&value);
     } else {
-        let job = response.into_inner().job.context("no job found")?;
+        let job = reply.job.context("no job found")?;
         let blocked = job.blocked.clone();
         let backoff_lines = reschedule_backoff_lines(&job.reschedule_backoffs);
         let printable_job: JobPrint = job.into();
         print_table(vec![printable_job]);
         for line in backoff_lines {
             println!("{line}");
+        }
+        // Kept so the escape hatch stays visible rather than habitual
+        // (docs/jobs-tasks-and-scheduling.md, "Unknown fields").
+        if let Some(record) = reply.unknown_fields.as_ref() {
+            let record = crate::structs::spec_fields::UnknownFieldsRecord::from(record);
+            println!(
+                "submitted with --allow-unknown-fields: {}",
+                record.summary()
+            );
         }
         // What a blocked job waits for (docs/scheduler-and-eval-loop.md,
         // "Blocked evals"): it places on its own when that capacity appears.

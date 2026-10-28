@@ -2774,6 +2774,7 @@ mod tests {
             signal: "SIGINT".into(),
             kill_after: std::time::Duration::from_secs(30),
             drain: None,
+            unknown_fields: Default::default(),
         });
 
         let tmp = tempfile::tempdir()?;
@@ -2824,6 +2825,7 @@ mod tests {
             signal: "SIGTERM".into(),
             kill_after: std::time::Duration::from_secs(3),
             drain: None,
+            unknown_fields: Default::default(),
         });
 
         let tmp = tempfile::tempdir()?;

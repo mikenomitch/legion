@@ -2148,6 +2148,14 @@ fn migration_list() -> Vec<M<'static>> {
         INSERT OR IGNORE INTO net_plugin_meta (id, generation) VALUES (1, 0);",
         )
         .down("DROP TABLE IF EXISTS net_plugin; DROP TABLE IF EXISTS net_plugin_meta;"),
+        // Strict jobspec fields (docs/jobs-tasks-and-scheduling.md, "Unknown
+        // fields"): `task_config.pending_extensions` is the JSON object of
+        // unknown task-level keys a submit kept under
+        // `allow_unknown_fields`, NULL when there are none. Appended at the
+        // end, since raft changesets bind columns by position. Control lane,
+        // like the rest of `task_config`. The job-level map and the record
+        // of what the flag kept and dropped ride `job_config.meta`.
+        M::up("ALTER TABLE task_config ADD COLUMN pending_extensions TEXT;").down(""),
     ]
 }
 

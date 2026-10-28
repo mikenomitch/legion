@@ -2650,6 +2650,7 @@ mod tests {
             name: name.into(),
             tasks: vec![task],
             version: None,
+            pending_extensions: Default::default(),
         };
         let noop = |name: &str| TaskConfig::new(name, "noop");
         for bad in [
@@ -2702,6 +2703,7 @@ mod tests {
                 },
             ],
             version: None,
+            pending_extensions: Default::default(),
         };
 
         let err = validate_job_config(&config).unwrap_err();
@@ -2762,6 +2764,7 @@ mod tests {
                 ..TaskConfig::new("api", "exec")
             }],
             version: None,
+            pending_extensions: Default::default(),
         };
 
         let err = validate_job_config(&config).unwrap_err();
@@ -2782,6 +2785,7 @@ mod tests {
                 ..TaskConfig::new("logger", "exec")
             }],
             version: None,
+            pending_extensions: Default::default(),
         };
 
         let err = validate_job_config(&config).unwrap_err();
@@ -2810,6 +2814,7 @@ mod tests {
                 ..TaskConfig::new("box", "sandbox")
             }],
             version: None,
+            pending_extensions: Default::default(),
         };
         let err = validate_job_config(&config(json!({ "mode": "tap", "tap": "tap0" })))
             .expect_err("a hand-named TAP");
@@ -2840,6 +2845,7 @@ mod tests {
                 ..TaskConfig::new("api", "exec")
             }],
             version: None,
+            pending_extensions: Default::default(),
         };
 
         validate_job_config(&config)?;
@@ -2861,6 +2867,7 @@ mod tests {
                 ..TaskConfig::new("api", "exec")
             }],
             version: None,
+            pending_extensions: Default::default(),
         };
 
         let err = validate_job_config(&config).expect_err("unknown strategy should fail");
@@ -2880,6 +2887,7 @@ mod tests {
                 promote: None,
                 placement: None,
                 fence_after: None,
+                unknown_fields: Default::default(),
             }),
             config: json!({"command": ["true"]}),
             ..TaskConfig::new("db", "exec")
@@ -2898,6 +2906,7 @@ mod tests {
             name: "stateful-createfirst".into(),
             tasks: vec![stateful_slot_task()],
             version: None,
+            pending_extensions: Default::default(),
         };
 
         let err = validate_job_config(&config)
@@ -2921,6 +2930,7 @@ mod tests {
             name: "stateful-stopfirst".into(),
             tasks: vec![stateful_slot_task()],
             version: None,
+            pending_extensions: Default::default(),
         };
         validate_job_config(&config)?;
 
@@ -2932,6 +2942,7 @@ mod tests {
             name: "stateful-norollout".into(),
             tasks: vec![stateful_slot_task()],
             version: None,
+            pending_extensions: Default::default(),
         };
         validate_job_config(&no_rollout)?;
         Ok(())
@@ -2941,6 +2952,7 @@ mod tests {
         crate::structs::RolloutSlotsConfig {
             order: Some(crate::structs::RolloutSlotOrder::Sequential),
             update_from,
+            unknown_fields: Default::default(),
         }
     }
 
@@ -2956,6 +2968,7 @@ mod tests {
             name: "stateful-sequential".into(),
             tasks: vec![stateful_slot_task()],
             version: None,
+            pending_extensions: Default::default(),
         };
         validate_job_config(&config)
     }
@@ -2976,6 +2989,7 @@ mod tests {
                 ..TaskConfig::new("api", "exec")
             }],
             version: None,
+            pending_extensions: Default::default(),
         };
         let err = validate_job_config(&config).expect_err("slots on a stateless group");
         assert!(
@@ -3003,11 +3017,13 @@ mod tests {
                     promote: None,
                     placement: None,
                     fence_after: None,
+                    unknown_fields: Default::default(),
                 }),
                 config: json!({"command": ["true"]}),
                 ..TaskConfig::new("sandbox", "exec")
             }],
             version: None,
+            pending_extensions: Default::default(),
         };
         let err = validate_job_config(&keyed).expect_err("slots on a keyed group");
         assert!(err.to_string().contains("slot-mode stateful task"));
@@ -3026,6 +3042,7 @@ mod tests {
             name: "updatefrom-too-high".into(),
             tasks: vec![stateful_slot_task()],
             version: None,
+            pending_extensions: Default::default(),
         };
         let err = validate_job_config(&config).expect_err("updateFrom >= count");
         assert!(
@@ -3055,6 +3072,7 @@ mod tests {
                 },
             ],
             version: None,
+            pending_extensions: Default::default(),
         };
         let err = validate_job_config(&config).expect_err("global slots over a stateless group");
         assert!(
@@ -3083,6 +3101,7 @@ mod tests {
                 },
             ],
             version: None,
+            pending_extensions: Default::default(),
         };
         validate_job_config(&scoped).expect("group-scoped slots block is valid");
     }
@@ -3349,6 +3368,7 @@ mod tests {
             name: "identity-job".into(),
             tasks: vec![task],
             version: None,
+            pending_extensions: Default::default(),
         }
     }
 
@@ -3359,6 +3379,7 @@ mod tests {
             file: Some(WorkloadIdentityFile {
                 path: "/var/run/legion/identity/token".into(),
                 mode: Some("0400".into()),
+                unknown_fields: Default::default(),
             }),
             ..Default::default()
         }
@@ -3402,6 +3423,7 @@ mod tests {
                     file: Some(WorkloadIdentityFile {
                         path: path.into(),
                         mode: Some("0400".into()),
+                        unknown_fields: Default::default(),
                     }),
                     ..Default::default()
                 }],
@@ -3549,6 +3571,7 @@ mod tests {
                     file: Some(WorkloadIdentityFile {
                         path: path.into(),
                         mode: None,
+                        unknown_fields: Default::default(),
                     }),
                     ..file_identity("aws")
                 }],
@@ -3708,6 +3731,7 @@ mod tests {
             name: "trainer".into(),
             tasks,
             version: None,
+            pending_extensions: Default::default(),
         }
     }
 
@@ -3778,6 +3802,7 @@ mod tests {
                 slots: Some(crate::structs::RolloutSlotsConfig {
                     order: Some(crate::structs::RolloutSlotOrder::Sequential),
                     update_from: None,
+                    unknown_fields: Default::default(),
                 }),
                 ..Default::default()
             }),

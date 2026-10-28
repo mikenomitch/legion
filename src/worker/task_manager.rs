@@ -9850,6 +9850,7 @@ mod tests {
                 signal: "SIGTERM".into(),
                 kill_after: std::time::Duration::ZERO,
                 drain: None,
+                unknown_fields: Default::default(),
             }),
             ..TaskConfig::new("stubborn", "exec")
         };
@@ -9892,6 +9893,7 @@ mod tests {
                 signal: "SIGTERM".into(),
                 kill_after: Duration::from_secs(1),
                 drain: None,
+                unknown_fields: Default::default(),
             }),
             ..TaskConfig::new("stubborn", "exec")
         };
@@ -10029,6 +10031,7 @@ mod tests {
                 signal: "SIGTERM".into(),
                 kill_after: std::time::Duration::ZERO,
                 drain: None,
+                unknown_fields: Default::default(),
             }),
             ..TaskConfig::new("victim", "exec")
         };
@@ -10247,6 +10250,7 @@ mod tests {
                 signal: "SIGTERM".into(),
                 kill_after: Duration::from_secs(300),
                 drain: None,
+                unknown_fields: Default::default(),
             }),
             ..TaskConfig::new("stubborn", "exec")
         };
@@ -10419,6 +10423,7 @@ mod tests {
                 signal: "SIGTERM".into(),
                 kill_after: Duration::from_secs(300),
                 drain: None,
+                unknown_fields: Default::default(),
             }),
             ..TaskConfig::new("drain", "exec")
         };
@@ -10468,6 +10473,7 @@ mod tests {
                     signal: "SIGTERM".into(),
                     kill_after: Duration::from_secs(300),
                     drain: None,
+                    unknown_fields: Default::default(),
                 }),
                 config: json!({"image": "alpine", "command": ["/bin/sh", "-c", "sleep 1"]}),
                 ..TaskConfig::new("box", "sandbox")
@@ -11412,6 +11418,7 @@ mod tests {
                 unhealthy_after_count: 3,
                 boot_grace_time: None,
                 unhealthy_after_count_timespan: None,
+                unknown_fields: Default::default(),
             }],
             ..TaskConfig::new("exec-task", "exec")
         };
@@ -11471,6 +11478,7 @@ mod tests {
                 mode: Some("serve".into()),
                 ratify_timeout: Some("10s".into()),
                 on_refused: None,
+                unknown_fields: Default::default(),
             }),
             ..TaskConfig::new("box", "exec")
         };
@@ -11516,6 +11524,7 @@ mod tests {
                 policy: Some(crate::structs::RestartPolicy::Never),
                 delay: Some(Duration::from_secs(5)),
                 success_exit_codes: vec![0, 3],
+                unknown_fields: Default::default(),
             }),
             ..batch.clone()
         };
@@ -11700,6 +11709,7 @@ mod tests {
             unhealthy_after_count: 3,
             boot_grace_time: None,
             unhealthy_after_count_timespan: None,
+            unknown_fields: Default::default(),
         }
     }
 
@@ -11971,6 +11981,7 @@ mod tests {
                 unhealthy_after_count: 2,
                 boot_grace_time: Some(Duration::from_millis(300)),
                 unhealthy_after_count_timespan: None,
+                unknown_fields: Default::default(),
             }],
             ..TaskConfig::new("puller", "exec")
         };
@@ -12034,6 +12045,7 @@ mod tests {
                 unhealthy_after_count: 1,
                 boot_grace_time: Some(Duration::from_millis(500)),
                 unhealthy_after_count_timespan: None,
+                unknown_fields: Default::default(),
             }],
             ..TaskConfig::new("late-listener", "exec")
         };
@@ -12104,6 +12116,7 @@ mod tests {
                 // dead process.
                 boot_grace_time: Some(Duration::from_millis(400)),
                 unhealthy_after_count_timespan: None,
+                unknown_fields: Default::default(),
             }],
             ..TaskConfig::new("crasher", "exec")
         };
