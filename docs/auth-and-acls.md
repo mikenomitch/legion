@@ -207,13 +207,17 @@ A policy is a named JSON array of rules:
   `paths = ["team-a/*"]` sees only `team-a/` keys in `legion kv list`.
 - **Reserved names skip `*`.** In an allow rule, a `namespaces` glob reaches
   a reserved `legion-*` namespace (Legion's own `legion-system`) only when
-  the pattern itself starts with `legion-`, and a `paths` glob reaches a key
-  under `legion/` only when it starts with `legion/`, the way a shell's `*`
-  skips dotfiles. A rule with no `paths`, and a `resources = ["*"]` rule with
-  no `namespaces`, reach what `*` reaches. So `namespaces = ["*"]` and
-  `paths = ["*"]` cover every tenant namespace and key but not what Legion
-  runs for itself; "everything" is `["*", "legion-*"]` and
-  `["*", "legion/*"]`. Deny rules keep plain globs (a deny on `*` still
+  the pattern itself starts with `legion-`, a `pools` glob reaches a
+  reserved `legion-*` pool (the managers' system workers, pool
+  `legion-system`) only when it starts with `legion-`, and a `paths` glob
+  reaches a key under `legion/` only when it starts with `legion/`, the way
+  a shell's `*` skips dotfiles. A rule with no `paths` or no `pools`, and a
+  `resources = ["*"]` rule with no `namespaces`, reach what `*` reaches. So
+  `namespaces = ["*"]`, `pools = ["*"]`, and `paths = ["*"]` cover every
+  tenant namespace, pool, and key but not what Legion runs for itself: a
+  `node` rule with `pools = ["*"]` (or none) does not list, cordon, or
+  drain a manager's system worker, or mint a join token into its pool. "Everything"
+  is `["*", "legion-*"]` and `["*", "legion/*"]`. Deny rules keep plain globs (a deny on `*` still
   denies inside `legion-system`), and management tokens bypass rules. A
   denial inside a reserved name says so in its hint. See [Namespaces,
   Reserved namespaces](namespaces.md#reserved-namespaces).
@@ -415,8 +419,8 @@ instead, which is sound and occasionally conservative:
   held `certs/*` covers `certs/app.example.com`. For `*`-only globs that is
   exact: every name the requested pattern reaches, the held one reaches too.
 - **Reserved names first.** A requested pattern that can reach a reserved
-  name (it starts with `legion-` for namespaces, or `legion/` for KV keys) is
-  covered only by a held pattern with the same prefix. A held `*` does not
+  name (it starts with `legion-` for namespaces and pools, or `legion/` for
+  KV keys) is covered only by a held pattern with the same prefix. A held `*` does not
   reach `legion-system`, so it does not cover a requested `legion-*`:
   without this, a tenant admin could grant a job `exec:write` into Legion's
   own jobs. The error says so when this is why.
