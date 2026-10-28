@@ -1151,7 +1151,7 @@ fn retire_static_port_holders(
                         || network
                             .upstreams
                             .iter()
-                            .any(|upstream| upstream.local_port == port)
+                            .any(|upstream| upstream.local_port == Some(port))
                 })
             })
             .cloned()

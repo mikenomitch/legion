@@ -14,6 +14,7 @@ use std::process::{Child, Command};
 
 pub(crate) mod apple_container;
 pub mod checkpoint;
+pub mod confine;
 mod container;
 mod envelope;
 mod exec;
@@ -1039,6 +1040,16 @@ pub fn allocation_is_gated(allocation: &Allocation) -> bool {
         .is_some_and(|network| network.is_gated())
 }
 
+/// Whether a gated allocation is confined rather than namespaced: placed
+/// on a node with no network namespaces (macOS), where its runtime keeps it
+/// on the node's loopback (internal_docs/plans/macos-gated-plan.md).
+pub fn allocation_is_confined(allocation: &Allocation) -> bool {
+    allocation
+        .network
+        .as_ref()
+        .is_some_and(|network| network.is_confined())
+}
+
 /// The network namespace a gated allocation joins, created now when it does
 /// not exist yet. `None` for an allocation that is not gated.
 ///
@@ -1054,7 +1065,7 @@ pub fn allocation_is_gated(allocation: &Allocation) -> bool {
 /// (no `CAP_SYS_ADMIN`, not Linux) is still a hard stop, never a silent fall
 /// back to host networking.
 pub fn ensure_gated_namespace(allocation: &Allocation) -> R<Option<PathBuf>> {
-    if !allocation_is_gated(allocation) {
+    if !allocation_is_gated(allocation) || allocation_is_confined(allocation) {
         return Ok(None);
     }
     let path = crate::worker::netd::netns::create(allocation.id).with_context(|| {

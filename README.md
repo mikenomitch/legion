@@ -37,11 +37,12 @@ still be happy with at fifty thousand nodes.
 - **One binary, one command per node.** `legion start manager` and
   `legion join <token>` are the whole install.
 - **Batteries included.** [Service discovery](docs/service-discovery.md), a
-  [service mesh with mTLS](docs/network-handlers.md), a
+  [service mesh with mTLS](docs/network-handlers.md#the-mesh) that is one
+  `mesh = true` on a service, a
   [versioned KV store](docs/kv-store.md) with
   [encryption at rest](docs/kv-encryption.md),
-  [rollouts](docs/rollouts.md), [ACLs](docs/auth-and-acls.md) with
-  [namespaces](docs/namespaces.md),
+  [rollouts](docs/rollouts.md), [ACLs](docs/auth-and-acls.md) on by default,
+  [namespaces](docs/namespaces.md) with per-team quotas,
   [workload identity (OIDC)](docs/workload-identity.md), and a [web UI](#web-ui).
 - **Readable job specs.** [Nickel](docs/configuration-language.md) gives you
   types, imports, and functions for DRY specs. You don't need YAML or Helm
@@ -103,7 +104,9 @@ sandboxes.
   artifact fetchers, volumes, node health checks, and key management are all
   [plugins](docs/plugin-system.md). Scheduling plugins read the same
   in-memory state as the built-in policies, so custom placement logic costs
-  no extra round trips.
+  no extra round trips. [Network plugins](docs/network-plugins.md) are WASM
+  modules on the proxy-wasm ABI that run inside the node's datapath, so an
+  existing proxy-wasm filter runs on Legion unchanged.
 - **Any isolation level.** Run plain processes with
   [`exec`](docs/task-runtime-exec.md), OCI images with
   [`container`](docs/task-runtime-container.md), or untrusted code in
@@ -133,9 +136,10 @@ features that make sandboxes work great:
   runtime boots workloads in Firecracker or Cloud Hypervisor on Linux, and
   in Apple's `container` on macOS.
 - **Simple egress control.** Easily define
-  [networking rules](docs/network-handlers.md), egress proxies, and
+  [networking rules](docs/network-handlers.md#policy), egress proxies, and
   [credential injection](docs/network-handlers.md#credential-injection) from
-  outside the sandbox.
+  outside the sandbox. [Network plugins](docs/network-plugins.md) can meter
+  an agent's requests or sign them with a key the sandbox never holds.
 - **A shell in any sandbox.** [`legion exec`](docs/exec-and-actions.md)
   reaches into Linux microVM sandboxes through the guest agent.
 - **Suspend when idle, resume on demand.** A sandbox
@@ -341,20 +345,55 @@ each feature.
 
 Caveat emptor!
 
-### Known security issues
+### Security
 
-Don't run Legion where untrusted workloads share a host with other work, or
-on a network you don't trust. Known gaps:
+A new cluster starts locked down:
+
+- **ACLs are on.** The first management token is written to
+  `<dataDir>/bootstrap-token` and the CLI's token file at first start
+  ([Auth & ACLs](docs/auth-and-acls.md#quick-start)).
+- **The control plane is encrypted.** Workers reach managers over TLS
+  pinned to the cluster CA, managers reach workers over mutual TLS, and Raft
+  peers talk to each other over TLS
+  ([TLS](docs/auth-and-acls.md#tls)).
+- **Linux containers are gated.** A container has no route out except
+  Legion's datapath, which checks every destination against the
+  [host guard](docs/network-handlers.md#the-host-guard), and runs in its own
+  user namespace under a default seccomp profile
+  ([container security](docs/task-runtime-container.md#security)).
+- **Anything that touches the host needs a `host` grant.** `exec` tasks,
+  `exec` health checks, `file://` artifacts, and node credentials all need a
+  `job:write` rule with `host = true`
+  ([host-level jobs](docs/auth-and-acls.md#host-level-jobs)), and naming a
+  KV key in a job needs `kv:read` on it.
+
+Even so, don't run Legion where untrusted workloads share a host with other
+work, or on a network you don't trust. Known gaps:
 
 - **`exec` tasks run on the host, as root unless they set a `user`.**
-  They share the host's network. Submitting one needs a `job:write` rule
-  with `host = true` ([host-level jobs](docs/auth-and-acls.md#host-level-jobs)),
-  because whoever can deploy one is root on every node it lands on. On Linux
-  with cgroup v2 and `nft`, the
+  They share the host's network, and whoever can deploy one is root on every
+  node it lands on. On Linux with cgroup v2, the
   [kernel host guard](docs/network-handlers.md#the-host-guard-in-the-kernel)
-  keeps them off Legion's ports, the cloud metadata service, and other
-  allocations' listeners, but a root task can remove it. Run untrusted code
-  in `container` or `sandbox`, never `exec`.
+  (eBPF, or `nftables` where eBPF can't load) keeps them off Legion's ports,
+  the cloud metadata service, and other allocations' listeners, but a root
+  task can remove it. Run untrusted code in `container` or `sandbox`, never
+  `exec`.
+- **Host-mode egress rules are enforced only where the kernel classifier
+  runs.** On a Linux node with the
+  [kernel classifier](docs/network-handlers.md#the-kernel-classifier), a
+  host-mode task's egress chain is enforced at `connect()`. Elsewhere it
+  covers only traffic that goes through Legion's upstreams and resolver, so
+  a task that dials a raw address bypasses it. Use `network.mode = "gated"`
+  when egress policy must hold.
+- **Gated mode on macOS has not run on real hardware.** Confining `exec`
+  tasks with Seatbelt and Apple containers with `pf` is implemented and
+  unit-tested only ([Gated mode on macOS](docs/network-handlers.md#gated-mode-on-macos)).
+- **The CLI and UI reach the manager in plaintext unless you turn on
+  `server.tls`.** Their tokens cross the network in the clear on a
+  multi-host cluster without it ([TLS](docs/auth-and-acls.md#tls)).
+- **Namespaces are not an isolation boundary.** They scope names, ACLs, and
+  quotas, but put no workload on a separate network, node, or kernel
+  ([Namespaces](docs/namespaces.md)).
 - **Git and OCI artifact fetches are not checked by the host guard.** HTTP
   fetches are, redirects included, but a `git::` or `oci://` source on an
   internal address is fetched by the worker and lands in the task directory
@@ -382,7 +421,7 @@ add:
 - **Something akin to Kubernetes controllers.** Extend Legion with your own
   reconcile loops.
 - **More runtimes.** WASM or remote serverless workloads, for example.
-- **Namespaces, multi-cluster federation, and Windows support.**
+- **Multi-cluster federation and Windows support.**
 
 ## Documentation
 
@@ -412,7 +451,8 @@ start:
   [Running Redis](docs/guides/redis.md) ·
   [Serving TLS Certificates from KV](docs/guides/tls-certificates.md)
 - **Platform services:** [Service Discovery](docs/service-discovery.md) ·
-  [Network Handlers](docs/network-handlers.md) · [KV Store](docs/kv-store.md) ·
+  [Network Handlers](docs/network-handlers.md) ·
+  [Network Plugins](docs/network-plugins.md) · [KV Store](docs/kv-store.md) ·
   [Exec & Actions](docs/exec-and-actions.md) · [The Cluster CA](docs/cluster-ca.md)
 - **Sharing a cluster:** [Namespaces](docs/namespaces.md) ·
   [Auth & ACLs](docs/auth-and-acls.md) ·

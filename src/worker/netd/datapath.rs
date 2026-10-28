@@ -22,10 +22,13 @@
 
 use crate::prelude::*;
 use crate::structs::netpolicy::EffectivePolicy;
+use crate::structs::source::{
+    MATERIAL_CLIENT_CA, MATERIAL_CREDENTIAL, MATERIAL_PLUGIN, MATERIAL_PLUGIN_CREDENTIAL,
+    MATERIAL_POLICY, MATERIAL_PORT_CERT, MATERIAL_UPSTREAM_CA,
+};
 use crate::structs::{
-    AllocNetPolicy, IngressCertificate, IngressCertificateKnown, NetAllocStatus, NetDenial,
-    NetEdgeSample, TaskAllocation, UpstreamCredentialKnown, UpstreamCredentialValue,
-    UpstreamEndpoints,
+    AllocNetPolicy, Material, MaterialRef, NetAllocStatus, NetDenial, NetEdgeSample,
+    TaskAllocation, UpstreamEndpoints,
 };
 use crate::worker::forwarder::{SecretValue, UpstreamForwarder};
 use crate::worker::netd::activity::ActivityLedger;
@@ -33,7 +36,6 @@ use crate::worker::netd::kernel_guard::GuardedAllocation;
 use crate::worker::netd::specs;
 use crate::worker::netd::state::{NetdState, NetdStateStore};
 use crate::worker::netd::tls::MeshIdentity;
-use crate::worker::netd::PolicyLookup;
 use serde::{Deserialize, Serialize};
 
 use std::collections::HashSet;
@@ -69,19 +71,12 @@ pub enum NetdInput {
     Desired(DesiredNetwork),
     /// The node's id (`node` proxy targets, the mesh certificate's name).
     NodeId(String),
-    /// A policy body fetched by hash ([`NetdWants::policy_bodies`]).
-    PolicyBody {
-        hash: String,
-        policy: Box<EffectivePolicy>,
-    },
     /// The node's mesh certificate, issued or re-issued.
     MeshIdentity(MeshIdentity),
-    /// `GetIngressCertificates`' answer to
-    /// [`NetdWants::ingress_certificates`].
-    IngressCertificates(Vec<IngressCertificate>),
-    /// `GetUpstreamCredentials`' answer to
-    /// [`NetdWants::upstream_credentials`]. Values stay in memory only.
-    UpstreamCredentials(Vec<UpstreamCredentialValue>),
+    /// `FetchDatapathMaterial`'s answer to [`NetdWants::material`]: policy
+    /// bodies, KV-held certificates, and credential values. Values stay in
+    /// memory only.
+    Material(Vec<Material>),
     /// The node's interface addresses may have changed: the host guard's
     /// node-address class follows them.
     RefreshNodeAddresses,
@@ -94,14 +89,10 @@ pub enum NetdInput {
 /// holds. Empty lists cost the worker nothing.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct NetdWants {
-    /// Policy hashes assigned without a body yet (`FetchNetPolicy`).
-    pub policy_bodies: Vec<String>,
-    /// Allocations whose ingress chain takes its certificate from KV, with
-    /// the version held (`GetIngressCertificates`).
-    pub ingress_certificates: Vec<IngressCertificateKnown>,
-    /// Declared credential headers, with the version held
-    /// (`GetUpstreamCredentials`).
-    pub upstream_credentials: Vec<UpstreamCredentialKnown>,
+    /// One `FetchDatapathMaterial` request's refs: policy hashes assigned
+    /// without a body yet, allocations whose ingress takes its certificate
+    /// from KV, and declared credential headers, each with the version held.
+    pub material: Vec<MaterialRef>,
 }
 
 /// What the datapath reports on the next heartbeat.
@@ -114,6 +105,8 @@ pub struct NetdReport {
     /// Status of every allocation in the last desired set the datapath was
     /// told about.
     pub statuses: Vec<NetAllocStatus>,
+    /// Every network plugin the node holds, with its module state and health.
+    pub plugins: Vec<crate::structs::NetPluginNodeStatus>,
 }
 
 /// The node datapath behind its boundary.
@@ -163,24 +156,12 @@ impl Netd {
         match input {
             NetdInput::Desired(desired) => self.apply_desired(desired).await,
             NetdInput::NodeId(node_id) => context.set_node_id(&node_id),
-            NetdInput::PolicyBody { hash, policy } => {
-                let Some(cache) = context.cache() else {
-                    return;
-                };
-                match cache.insert_body(&hash, *policy) {
-                    Ok(()) => debug!(hash = %hash, "Fetched network policy body"),
-                    Err(err) => warn!(hash = %hash, error = ?err, "Rejected network policy body"),
-                }
-            }
             NetdInput::MeshIdentity(mesh) => {
                 if let Err(err) = context.set_mesh_identity(mesh) {
                     warn!(error = ?err, "Rejected the node certificate for the mesh");
                 }
             }
-            NetdInput::IngressCertificates(certificates) => {
-                self.apply_ingress_certificates(certificates)
-            }
-            NetdInput::UpstreamCredentials(values) => self.apply_upstream_credentials(values),
+            NetdInput::Material(materials) => self.apply_material(materials),
             NetdInput::RefreshNodeAddresses => context.refresh_node_addresses(),
             NetdInput::KernelGuard(allocations) => {
                 if !context.kernel_guard_active() {
@@ -203,35 +184,58 @@ impl Netd {
         let Some(cache) = context.cache() else {
             return NetdWants::default();
         };
-        let ingress_certificates = desired
-            .iter()
-            .filter(|allocation| {
-                cache
-                    .policy_for(allocation.allocation_id)
-                    .and_then(|policy| policy.ingress.as_ref()?.tls.clone())
-                    .is_some_and(|tls| tls.cert_kv_path().is_some())
-            })
-            .map(|allocation| IngressCertificateKnown {
-                allocation_id: allocation.allocation_id,
-                version: context.kv_cert_version(allocation.allocation_id),
-            })
-            .collect();
-        let upstream_credentials = specs::declared_credentials(desired)
+        let mut material: Vec<MaterialRef> = cache
+            .pending_hashes()
             .into_iter()
-            .map(
-                |(allocation_id, upstream, header)| UpstreamCredentialKnown {
-                    version: context.credential_version(allocation_id, &upstream, &header),
-                    allocation_id,
-                    upstream,
-                    header,
-                },
-            )
+            .map(|hash| MaterialRef {
+                kind: MATERIAL_POLICY.into(),
+                key: hash,
+                ..Default::default()
+            })
             .collect();
-        NetdWants {
-            policy_bodies: cache.pending_hashes(),
-            ingress_certificates,
-            upstream_credentials,
-        }
+        material.extend(specs::declared_tls_material(desired).into_iter().map(
+            |(kind, allocation_id, key)| MaterialRef {
+                kind: kind.into(),
+                allocation_id,
+                version: context.tls_material_version(kind, allocation_id, &key),
+                key,
+                ..Default::default()
+            },
+        ));
+        material.extend(specs::declared_credentials(desired).into_iter().map(
+            |(allocation_id, upstream, header)| MaterialRef {
+                kind: MATERIAL_CREDENTIAL.into(),
+                version: context.credential_version(allocation_id, &upstream, &header),
+                allocation_id,
+                key: upstream,
+                part: header,
+            },
+        ));
+        // Plugins: every one a local allocation references, with the
+        // revision held, then the signing keys the held ones declare. A
+        // plugin nothing references any more is dropped here.
+        let plugins = context.plugins();
+        let mut referenced: Vec<String> = specs::referenced_plugins(desired, context)
+            .into_iter()
+            .collect();
+        referenced.sort();
+        plugins.retain(&referenced.iter().cloned().collect());
+        material.extend(referenced.into_iter().map(|name| MaterialRef {
+            kind: MATERIAL_PLUGIN.into(),
+            version: plugins.held_revision(&name),
+            key: name,
+            ..Default::default()
+        }));
+        material.extend(plugins.wanted_credentials().into_iter().map(
+            |(plugin, credential, version)| MaterialRef {
+                kind: MATERIAL_PLUGIN_CREDENTIAL.into(),
+                version,
+                key: plugin,
+                part: credential,
+                ..Default::default()
+            },
+        ));
+        NetdWants { material }
     }
 
     /// Drain what the next heartbeat reports. Hand it back with
@@ -245,6 +249,10 @@ impl Netd {
                 .unwrap_or_default(),
             edges: context.edges().drain(),
             statuses: self.statuses(),
+            plugins: {
+                context.plugins().export_metrics();
+                context.plugins().report()
+            },
         }
     }
 
@@ -277,11 +285,6 @@ impl Netd {
     /// Whether the kernel host guard runs on this node.
     pub fn kernel_guard_active(&self) -> bool {
         self.forwarder.context().kernel_guard_active()
-    }
-
-    /// Whether the node holds a mesh certificate.
-    pub fn has_mesh_identity(&self) -> bool {
-        self.forwarder.context().mesh_identity().is_some()
     }
 
     /// Save the datapath's inputs when they differ from the last save. Off
@@ -465,7 +468,7 @@ impl Netd {
         mesh_wanted |= desired.iter().any(|allocation| {
             !allocation.network.trim().is_empty()
                 && serde_json::from_str::<crate::structs::AllocNetwork>(&allocation.network)
-                    .map(|network| network.ingress_tls.as_deref() == Some("legion"))
+                    .map(|network| network.serves_mesh())
                     .unwrap_or(false)
         });
         context.set_mesh_wanted(mesh_wanted);
@@ -527,96 +530,199 @@ impl Netd {
         *self.namespaces.lock().unwrap_or_else(|p| p.into_inner()) = wanted;
     }
 
-    /// Keep `certFrom = { kv }` ingress certificates current
-    /// (docs/network-handlers.md, "Certificates from KV"). Fail-static: a bad
-    /// bundle keeps the certificate in hand and only records the problem.
-    fn apply_ingress_certificates(&self, certificates: Vec<IngressCertificate>) {
+    /// Apply one `FetchDatapathMaterial` answer, entry by entry.
+    fn apply_material(&self, materials: Vec<Material>) {
         let context = self.forwarder.context();
-        for certificate in certificates {
-            let allocation_id = certificate.allocation_id;
-            if !certificate.error.is_empty() {
-                context.set_kv_cert_error(allocation_id, certificate.error);
+        for material in materials {
+            let Some(wanted) = material.r#ref.clone() else {
                 continue;
-            }
-            if certificate.unchanged {
-                context.clear_kv_cert_error(allocation_id);
-                continue;
-            }
-            match crate::worker::netd::tls::KvCertificate::from_bundle(
-                &certificate.kv_path,
-                certificate.version,
-                &certificate.bundle_pem,
-            ) {
-                Ok(cert) => {
-                    context.set_kv_cert(allocation_id, cert);
-                    info!(
-                        allocation_id,
-                        kv_path = %certificate.kv_path,
-                        version = certificate.version,
-                        "Installed ingress certificate from KV"
-                    );
+            };
+            match wanted.kind.as_str() {
+                MATERIAL_POLICY => {
+                    let Some(cache) = context.cache() else {
+                        continue;
+                    };
+                    let hash = wanted.key;
+                    if !material.error.is_empty() {
+                        warn!(hash = %hash, error = %material.error, "Failed to fetch network policy body; keeping last known good");
+                        continue;
+                    }
+                    let policy = match serde_json::from_str::<EffectivePolicy>(&material.value) {
+                        Ok(policy) => policy,
+                        Err(err) => {
+                            warn!(hash = %hash, error = ?err, "Invalid network policy body from manager");
+                            continue;
+                        }
+                    };
+                    match cache.insert_body(&hash, policy) {
+                        Ok(()) => debug!(hash = %hash, "Fetched network policy body"),
+                        Err(err) => {
+                            warn!(hash = %hash, error = ?err, "Rejected network policy body")
+                        }
+                    }
                 }
-                Err(err) => context.set_kv_cert_error(
-                    allocation_id,
-                    format!("kv {} {err:#}", certificate.kv_path),
-                ),
+                MATERIAL_PORT_CERT => self.apply_tls_material(MATERIAL_PORT_CERT, wanted, material),
+                MATERIAL_CLIENT_CA => self.apply_tls_material(MATERIAL_CLIENT_CA, wanted, material),
+                MATERIAL_UPSTREAM_CA => {
+                    self.apply_tls_material(MATERIAL_UPSTREAM_CA, wanted, material)
+                }
+                MATERIAL_CREDENTIAL => self.apply_upstream_credential(wanted, material),
+                MATERIAL_PLUGIN => self.apply_plugin(wanted, material),
+                MATERIAL_PLUGIN_CREDENTIAL => {
+                    let plugins = context.plugins();
+                    if material.absent {
+                        plugins.drop_credential(&wanted.key, &wanted.part);
+                    } else if !material.error.is_empty() {
+                        warn!(plugin = %wanted.key, credential = %wanted.part, source = %material.source, error = %material.error, "Failed to fetch a net plugin credential; keeping the last value");
+                    } else if !material.unchanged {
+                        plugins.set_credential(
+                            &wanted.key,
+                            &wanted.part,
+                            material.version,
+                            material.value,
+                        );
+                    }
+                }
+                other => debug!(kind = %other, "Ignoring material of an unknown kind"),
             }
         }
     }
 
-    /// Keep `connect.upstreams[].credentials` current
+    /// Hold a plugin object at the revision the manager sent; its module
+    /// loads in the background. An absent one is dropped (its hops fail with
+    /// "not on this node" and follow `onError`).
+    fn apply_plugin(&self, wanted: MaterialRef, material: Material) {
+        let plugins = self.forwarder.context().plugins().clone();
+        if material.absent {
+            debug!(plugin = %wanted.key, error = %material.error, "Net plugin is gone");
+            plugins.remove(&wanted.key);
+            return;
+        }
+        if !material.error.is_empty() {
+            warn!(plugin = %wanted.key, error = %material.error, "Failed to fetch a net plugin; keeping the last revision");
+            return;
+        }
+        if material.unchanged {
+            // Same revision: a failed load retries after its back-off.
+            if let Some(entry) = plugins.entry(&wanted.key) {
+                plugins.apply(entry.object.clone(), entry.revision);
+            }
+            return;
+        }
+        match serde_json::from_str::<crate::structs::netplugin::NetPluginObject>(&material.value) {
+            Ok(object) => plugins.apply(object, material.version.max(0) as u64),
+            Err(err) => {
+                warn!(plugin = %wanted.key, error = ?err, "Invalid net plugin object from manager")
+            }
+        }
+    }
+
+    /// Keep KV-held TLS material current: a port's certificate, a mutual
+    /// port's client CA, or an external upstream's pinned CA
+    /// (docs/network-handlers.md, "TLS on ports"). Fail-static: a bad value
+    /// keeps what is held and only records the problem.
+    fn apply_tls_material(&self, kind: &'static str, wanted: MaterialRef, material: Material) {
+        use crate::worker::forwarder::HeldTls;
+        let context = self.forwarder.context();
+        let allocation_id = wanted.allocation_id;
+        let key = wanted.key;
+        if !material.error.is_empty() {
+            context.set_tls_material_error(kind, allocation_id, &key, material.error);
+            return;
+        }
+        if material.unchanged {
+            context.clear_tls_material_error(kind, allocation_id, &key);
+            return;
+        }
+        let held = if kind == MATERIAL_PORT_CERT {
+            crate::worker::netd::tls::CertKey::from_bundle(
+                &material.source,
+                material.version,
+                &material.value,
+            )
+            .map(HeldTls::Cert)
+        } else {
+            crate::worker::netd::tls::roots_from_pem(material.value.as_bytes()).map(|roots| {
+                HeldTls::Ca {
+                    source: material.source.clone(),
+                    version: material.version,
+                    roots,
+                }
+            })
+        };
+        match held {
+            Ok(held) => {
+                context.set_tls_material(kind, allocation_id, &key, held);
+                info!(
+                    allocation_id,
+                    kind,
+                    key = %key,
+                    source = %material.source,
+                    version = material.version,
+                    "Installed TLS material from KV"
+                );
+            }
+            Err(err) => context.set_tls_material_error(
+                kind,
+                allocation_id,
+                &key,
+                format!("{} {err:#}", material.source),
+            ),
+        }
+    }
+
+    /// Keep one `connect.upstreams[].credentials` header current
     /// (docs/network-handlers.md, "Credential injection"). Values live in
     /// memory only — never in `netd_state.json`, never in a log line. An
     /// `absent` answer (the key was deleted, or the declaration is gone)
     /// drops the value, so requests on that upstream fail closed with a
     /// `503`; any other error keeps the value in hand.
-    fn apply_upstream_credentials(&self, values: Vec<UpstreamCredentialValue>) {
+    fn apply_upstream_credential(&self, wanted: MaterialRef, material: Material) {
         let context = self.forwarder.context();
-        for value in values {
-            let header = value.header.trim().to_ascii_lowercase();
-            if !value.error.is_empty() {
-                if value.absent {
-                    warn!(
-                        allocation_id = value.allocation_id,
-                        upstream = %value.upstream,
-                        header = %header,
-                        source = %value.source,
-                        error = %value.error,
-                        "Upstream credential is gone; requests on this upstream fail closed"
-                    );
-                }
-                context.set_credential_error(
-                    value.allocation_id,
-                    &value.upstream,
-                    &header,
-                    &value.source,
-                    value.error,
-                    value.absent,
+        let header = wanted.part.trim().to_ascii_lowercase();
+        let upstream = wanted.key;
+        if !material.error.is_empty() {
+            if material.absent {
+                warn!(
+                    allocation_id = wanted.allocation_id,
+                    upstream = %upstream,
+                    header = %header,
+                    source = %material.source,
+                    error = %material.error,
+                    "Upstream credential is gone; requests on this upstream fail closed"
                 );
-                continue;
             }
-            if value.unchanged {
-                context.clear_credential_error(value.allocation_id, &value.upstream, &header);
-                continue;
-            }
-            context.set_credential(
-                value.allocation_id,
-                &value.upstream,
+            context.set_credential_error(
+                wanted.allocation_id,
+                &upstream,
                 &header,
-                &value.source,
-                value.version,
-                SecretValue::new(value.value),
+                &material.source,
+                material.error,
+                material.absent,
             );
-            // The source and version only: never the value.
-            info!(
-                allocation_id = value.allocation_id,
-                upstream = %value.upstream,
-                header = %header,
-                source = %value.source,
-                version = value.version,
-                "Installed upstream credential"
-            );
+            return;
         }
+        if material.unchanged {
+            context.clear_credential_error(wanted.allocation_id, &upstream, &header);
+            return;
+        }
+        context.set_credential(
+            wanted.allocation_id,
+            &upstream,
+            &header,
+            &material.source,
+            material.version,
+            SecretValue::new(material.value),
+        );
+        // The source and version only: never the value.
+        info!(
+            allocation_id = wanted.allocation_id,
+            upstream = %upstream,
+            header = %header,
+            source = %material.source,
+            version = material.version,
+            "Installed upstream credential"
+        );
     }
 }
 
@@ -667,9 +773,9 @@ mod tests {
             job_id: "web".into(),
             task_name: "server".into(),
             task_runtime: "exec".into(),
-            task_connect: json!({ "upstreams": [{ "service": service }] }).to_string(),
+            task_connect: json!({ "upstreams": [{ "to": service }] }).to_string(),
             network: json!({
-                "upstreams": [{ "service": service, "localPort": local_port, "balance": "least_conn" }]
+                "upstreams": [{ "key": service, "localPort": local_port, "balance": "least_conn" }]
             })
             .to_string(),
             ..Default::default()
@@ -711,12 +817,14 @@ mod tests {
             vec![UpstreamSpec {
                 allocation_id: 11,
                 service: "db".into(),
-                local_port,
+                local_port: Some(local_port),
+                http_protocol: false,
                 balance: "least_conn".into(),
                 to: None,
                 http: None,
                 handlers: Vec::new(),
                 credentials: Vec::new(),
+                ca: None,
                 vip: None,
                 canonical_port: None,
                 attachment: Attachment::Host,
@@ -781,28 +889,95 @@ mod tests {
         }))
         .await;
         let wants = netd.wants();
-        assert_eq!(wants.policy_bodies, vec!["abc".to_string()]);
-        assert!(wants.ingress_certificates.is_empty());
         assert_eq!(
-            wants.upstream_credentials,
-            vec![UpstreamCredentialKnown {
-                allocation_id: 21,
-                upstream: "openai".into(),
-                header: "authorization".into(),
-                version: 0,
-            }]
+            wants.material,
+            vec![
+                MaterialRef {
+                    kind: MATERIAL_POLICY.into(),
+                    key: "abc".into(),
+                    ..Default::default()
+                },
+                MaterialRef {
+                    kind: MATERIAL_CREDENTIAL.into(),
+                    allocation_id: 21,
+                    key: "openai".into(),
+                    part: "authorization".into(),
+                    version: 0,
+                },
+            ]
         );
         // The body arrives: nothing left to fetch for policy.
         let policy = EffectivePolicy {
             hash: "abc".into(),
             ..Default::default()
         };
-        netd.send(NetdInput::PolicyBody {
-            hash: "abc".into(),
-            policy: Box::new(policy),
-        })
+        netd.send(NetdInput::Material(vec![Material {
+            r#ref: Some(wants.material[0].clone()),
+            source: "policy abc".into(),
+            value: serde_json::to_string(&policy)?,
+            ..Default::default()
+        }]))
         .await;
-        assert!(netd.wants().policy_bodies.is_empty());
+        assert!(netd
+            .wants()
+            .material
+            .iter()
+            .all(|wanted| wanted.kind != MATERIAL_POLICY));
+        Ok(())
+    }
+
+    /// Fetched material lives in memory only: a credential value applied
+    /// through `NetdInput::Material` is used, and never reaches the state
+    /// file the datapath persists.
+    #[tokio::test]
+    async fn fetched_material_is_never_persisted_test() -> R<()> {
+        let root = TempDir::new()?;
+        let state_path = root.path().join("worker_state.json");
+        let netd = netd(root.path()).with_state_store(NetdStateStore::beside(&state_path));
+        let mut allocation = connect_allocation(41, "openai", free_port().await);
+        allocation.task_connect = json!({ "upstreams": [
+            { "name": "openai", "to": "https://api.openai.com", "credentials": [
+                { "header": "authorization", "from": { "kv": "secrets/openai" } },
+            ] },
+        ] })
+        .to_string();
+        netd.send(NetdInput::Desired(DesiredNetwork {
+            desired: vec![allocation],
+            upstream_endpoints: Vec::new(),
+            net_policies: Vec::new(),
+        }))
+        .await;
+        let wanted = netd.wants().material.remove(0);
+        assert_eq!(wanted.kind, MATERIAL_CREDENTIAL);
+        netd.send(NetdInput::Material(vec![Material {
+            r#ref: Some(wanted),
+            source: "kv secrets/openai".into(),
+            version: 7,
+            value: "sk-live-never-on-disk".into(),
+            ..Default::default()
+        }]))
+        .await;
+        assert_eq!(
+            netd.forwarder
+                .context()
+                .credential_version(41, "openai", "authorization"),
+            7,
+            "the value was applied"
+        );
+        netd.persist();
+        let saved = NetdStateStore::beside(&state_path).path().to_path_buf();
+        for _ in 0..100 {
+            if saved.exists() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let on_disk = std::fs::read_to_string(&saved)?;
+        assert!(
+            on_disk.contains("secrets/openai"),
+            "the declaration is saved"
+        );
+        assert!(!on_disk.contains("sk-live-never-on-disk"), "{on_disk}");
         Ok(())
     }
 

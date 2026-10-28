@@ -567,7 +567,7 @@ unplaced work. A dry run reports a gang that would wait in
 ### Static ports
 
 A task that declares a static port (`network.ports[].static`, or an upstream
-`localPort`) can run once per node. The planner reads the host ports each
+`port`) can run once per node. The planner reads the host ports each
 node's allocations already hold, plus the ports this plan has claimed so
 far, and a node where one of the task's static ports is taken is not a
 candidate for it. The apply transaction makes the same check, so the planner

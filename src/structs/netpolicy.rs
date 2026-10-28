@@ -56,20 +56,11 @@ pub const ON_ERROR_DENY: &str = "deny";
 pub const ON_ERROR_ALLOW: &str = "allow";
 pub const ON_ERRORS: &[&str] = &[ON_ERROR_DENY, ON_ERROR_ALLOW];
 
-/// Handler kinds config validation accepts. The datapath dispatches on
-/// these names: `authz` and `proxy` in `crate::worker::netd::handlers`, `dlp`
-/// and `log` in `crate::worker::netd::http`. A new kind is a name here plus
-/// its arm there.
-pub const HANDLER_AUTHZ: &str = "authz";
-pub const HANDLER_PROXY: &str = "proxy";
-pub const HANDLER_LOG: &str = "log";
-pub const HANDLER_DLP: &str = "dlp";
-pub const HANDLERS: &[&str] = &[HANDLER_AUTHZ, HANDLER_PROXY, HANDLER_LOG, HANDLER_DLP];
+pub use crate::structs::hops::HopConfig;
 
 /// `network.mode` values. `host` is today's networking; `gated` is a namespace
 /// containing loopback and the datapath only; `auto` picks `gated` where the
-/// runtime and platform can and `host` otherwise. `bridge` / `cni/<name>` are
-/// reserved for the datapath plugin and rejected at submit with that reason.
+/// runtime and platform can and `host` otherwise.
 pub const MODE_AUTO: &str = "auto";
 pub const MODE_HOST: &str = "host";
 pub const MODE_GATED: &str = "gated";
@@ -96,19 +87,19 @@ pub fn gated_default_hint(destination: &str) -> String {
     )
 }
 
-/// TLS modes on a chain. Ingress: `off`, `server`, `mutual`. Egress:
-/// `passthrough` (default; rules see SNI only) or `originate` (the task speaks
-/// plaintext to the datapath, which adds TLS to the destination).
-pub const TLS_OFF: &str = "off";
-pub const TLS_SERVER: &str = "server";
-pub const TLS_MUTUAL: &str = "mutual";
-pub const TLS_PASSTHROUGH: &str = "passthrough";
-pub const TLS_ORIGINATE: &str = "originate";
-pub const TLS_MODES_INGRESS: &[&str] = &[TLS_OFF, TLS_SERVER, TLS_MUTUAL];
-pub const TLS_MODES_EGRESS: &[&str] = &[TLS_PASSTHROUGH, TLS_ORIGINATE];
+/// The denial source when a host rule could match an address the kernel
+/// classifier never learned through the allocation's resolver, on a node
+/// that cannot capture the flow for netd to read its name.
+pub const SOURCE_KERNEL_UNLEARNED: &str = "kernel/unlearned";
 
-/// Default per-handler timeout when a hop names none.
-pub const DEFAULT_HANDLER_TIMEOUT: &str = "2s";
+/// The denial source when a captured flow's SNI or `Host` names a host the
+/// address it dialed does not belong to.
+pub const SOURCE_CAPTURE_NAME: &str = "capture/name";
+
+/// The source of the first ingress rule a `service.mesh = true` service's
+/// `service.allow` compiles to.
+pub const SOURCE_SERVICE_ALLOW: &str = "service/allow";
+
 /// Hard cap on an `authz` verdict cache TTL, so a revoked allow cannot outlive
 /// a policy change by more than this.
 pub const MAX_AUTHZ_CACHE: &str = "5m";
@@ -194,7 +185,7 @@ impl NetSelector {
 /// A stored, selector-scoped policy object — what `legion net policy apply`
 /// writes. A task's inline `network.egress` / `network.ingress` is the same
 /// shape with an implicit selector of exactly that task.
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct NetPolicyObject {
     pub name: String,
@@ -211,6 +202,10 @@ pub struct NetPolicyObject {
     /// Optional `network.mode` to impose (`require`) or suggest (`default`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mode: Option<String>,
+    /// Optional `service.mesh` to impose (`require`) or suggest (`default`)
+    /// on the matched tasks' services. Like `mode`, resolved at placement.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mesh: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub egress: Option<ChainConfig>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -267,13 +262,17 @@ impl NetPolicyObject {
             }
         }
         if let Some(chain) = self.egress.as_mut() {
-            chain.normalize_and_validate(&format!("{what} egress"), Direction::Egress)?;
+            chain.normalize_and_validate(&format!("{what} egress"))?;
         }
         if let Some(chain) = self.ingress.as_mut() {
-            chain.normalize_and_validate(&format!("{what} ingress"), Direction::Ingress)?;
+            chain.normalize_and_validate(&format!("{what} ingress"))?;
         }
-        if self.egress.is_none() && self.ingress.is_none() && self.mode.is_none() {
-            bail!("{what}: declares neither egress, ingress, nor mode — nothing to apply");
+        if self.egress.is_none()
+            && self.ingress.is_none()
+            && self.mode.is_none()
+            && self.mesh.is_none()
+        {
+            bail!("{what}: declares neither egress, ingress, mode, nor mesh — nothing to apply");
         }
         Ok(())
     }
@@ -304,7 +303,7 @@ impl Direction {
 /// [`ChainConfig::normalize_and_validate`], so downstream code only ever sees
 /// `rules`.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Default)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ChainConfig {
     /// `tcp` (default) or `http`. Never inferred from the rules.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -313,9 +312,8 @@ pub struct ChainConfig {
     /// when `allow` sugar is used, `allow` otherwise.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub policy: Option<String>,
-    /// `deny` (default) or `allow`: what a failed handler means.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub on_error: Option<String>,
+    /// One NDJSON line per HTTP request in the allocation's
+    /// `net-access.log`.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub access_log: bool,
     /// Sugar: `host`, `host:port`, `cidr`, `cidr:port`, or (HTTP only)
@@ -324,19 +322,18 @@ pub struct ChainConfig {
     pub allow: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub rules: Vec<RuleConfig>,
+    /// Hops that run after the rules allow a flow; each says what a failure
+    /// means with its own `onError`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub handlers: Vec<HandlerConfig>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub tls: Option<TlsConfig>,
+    pub handlers: Vec<HopConfig>,
 }
 
 /// One rule: first match wins.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct RuleConfig {
-    /// Written `when` (`match` is a Nickel keyword; it is still accepted as
-    /// an alias for JSON callers).
-    #[serde(rename = "when", alias = "match", default)]
+    /// Written `when` (`match` is a Nickel keyword).
+    #[serde(rename = "when", default)]
     pub matcher: RuleMatch,
     /// `allow` or `deny`.
     pub action: String,
@@ -393,100 +390,6 @@ impl RuleMatch {
     }
 }
 
-/// One hop of code on the path. `handler` names the kind; the other fields are
-/// per kind and validated per kind.
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Default)]
-#[serde(rename_all = "camelCase")]
-pub struct HandlerConfig {
-    pub handler: String,
-    /// `authz`: the webhook URL.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub url: Option<String>,
-    /// `authz`: verdict cache TTL (capped at [`MAX_AUTHZ_CACHE`]).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub cache: Option<String>,
-    /// `proxy`: a catalog service (any healthy endpoint).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub service: Option<String>,
-    /// `proxy`: a sidecar task's port label in this group.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub port: Option<String>,
-    /// `proxy`: a catalog service, node-local endpoints only.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub node: Option<String>,
-    /// Whether to prepend a PROXY protocol v2 header (`proxy`, default true).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub proxy_protocol: Option<bool>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub timeout: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub on_error: Option<String>,
-    /// Kind-specific settings (`dlp`: `{ maxBytes, patterns, replace }`).
-    #[serde(default, skip_serializing_if = "Value::is_null")]
-    pub config: Value,
-}
-
-/// TLS on a chain. Handlers never see TLS; the datapath terminates or
-/// originates it and hands handlers the verified peer identity.
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Default)]
-#[serde(rename_all = "camelCase")]
-pub struct TlsConfig {
-    pub mode: String,
-    /// `"legion"` (the node's mesh certificate), `{ kv = "<path>" }` (a PEM
-    /// bundle held in KV), or absent (use `certPath`/`keyPath`).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub cert_from: Option<CertFrom>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub cert_path: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub key_path: Option<String>,
-    /// `legion` or a CA bundle path; required for `mutual`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub client_ca: Option<String>,
-    /// Identity globs a `mutual` peer must match.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub require_identity: Vec<String>,
-    /// Egress `originate`: verify the destination against the system roots
-    /// (default) or this bundle.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub ca_path: Option<String>,
-}
-
-/// Where a chain's certificate comes from. The string form is the original
-/// `certFrom = "legion"` and serializes exactly as before, so existing policy
-/// hashes do not move.
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
-#[serde(untagged)]
-pub enum CertFrom {
-    /// `"legion"`: the node's mesh certificate.
-    Named(String),
-    /// `{ kv = "certs/app.example.com" }`: one PEM bundle (certificate chain,
-    /// then private key) held in KV, fetched by the node and hot-swapped
-    /// when the key's version moves.
-    Kv(KvCertSource),
-}
-
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-pub struct KvCertSource {
-    pub kv: String,
-}
-
-impl TlsConfig {
-    /// Whether the chain presents the node's mesh certificate.
-    pub fn cert_from_mesh(&self) -> bool {
-        matches!(&self.cert_from, Some(CertFrom::Named(name)) if name == "legion")
-    }
-
-    /// The KV path of a `certFrom = { kv = ... }` chain.
-    pub fn cert_kv_path(&self) -> Option<&str> {
-        match &self.cert_from {
-            Some(CertFrom::Kv(source)) => Some(source.kv.as_str()),
-            _ => None,
-        }
-    }
-}
-
 impl ChainConfig {
     pub fn protocol_name(&self) -> &str {
         self.protocol.as_deref().unwrap_or(PROTOCOL_TCP)
@@ -498,7 +401,7 @@ impl ChainConfig {
 
     /// Desugar `allow`, fill defaults, and reject anything the datapath could
     /// not honor — with the field and the fix in the message.
-    pub fn normalize_and_validate(&mut self, what: &str, direction: Direction) -> R<()> {
+    pub fn normalize_and_validate(&mut self, what: &str) -> R<()> {
         let protocol = self
             .protocol
             .take()
@@ -559,19 +462,6 @@ impl ChainConfig {
         }
         self.policy = Some(policy);
 
-        let on_error = self
-            .on_error
-            .take()
-            .map(|p| p.trim().to_ascii_lowercase())
-            .unwrap_or_else(|| ON_ERROR_DENY.to_string());
-        if !ON_ERRORS.contains(&on_error.as_str()) {
-            bail!(
-                "{what}.onError must be one of {}, got '{on_error}'",
-                ON_ERRORS.join(", ")
-            );
-        }
-        self.on_error = Some(on_error);
-
         for (index, rule) in self.rules.iter_mut().enumerate() {
             rule.action = rule.action.trim().to_ascii_lowercase();
             if !ACTIONS.contains(&rule.action.as_str()) {
@@ -622,161 +512,13 @@ impl ChainConfig {
             rule.matcher.header = headers;
         }
 
+        let not_http = format!("{what}.protocol is \"tcp\". Set protocol = \"http\", or put it on an upstream whose `to` is http:// or https://");
         for (index, handler) in self.handlers.iter_mut().enumerate() {
-            normalize_handler(&format!("{what}.handlers[{index}]"), handler, is_http)?;
+            handler.normalize(&format!("{what}.handlers[{index}]"), is_http, &not_http)?;
         }
 
-        if let Some(tls) = self.tls.as_mut() {
-            tls.mode = tls.mode.trim().to_ascii_lowercase();
-            let allowed = match direction {
-                Direction::Ingress => TLS_MODES_INGRESS,
-                Direction::Egress => TLS_MODES_EGRESS,
-            };
-            if !allowed.contains(&tls.mode.as_str()) {
-                bail!(
-                    "{what}.tls.mode must be one of {} for {}, got '{}'",
-                    allowed.join(", "),
-                    direction.as_str(),
-                    tls.mode
-                );
-            }
-            match tls.cert_from.as_mut() {
-                Some(CertFrom::Named(from)) => {
-                    *from = from.trim().to_ascii_lowercase();
-                    if from != "legion" {
-                        bail!(
-                            "{what}.tls.certFrom must be \"legion\" or {{ kv = \"<path>\" }} \
-                             (or omit it and set certPath/keyPath)"
-                        );
-                    }
-                }
-                Some(CertFrom::Kv(source)) => {
-                    source.kv = source.kv.trim().to_string();
-                    if source.kv.is_empty() {
-                        bail!("{what}.tls.certFrom.kv cannot be empty");
-                    }
-                    if !matches!(direction, Direction::Ingress) {
-                        bail!("{what}.tls.certFrom = {{ kv }} is only supported on ingress");
-                    }
-                    if tls.cert_path.is_some() || tls.key_path.is_some() {
-                        bail!(
-                            "{what}.tls.certFrom = {{ kv }} replaces certPath/keyPath; set one or \
-                             the other"
-                        );
-                    }
-                }
-                None => {}
-            }
-            let needs_cert = matches!(tls.mode.as_str(), TLS_SERVER | TLS_MUTUAL);
-            if needs_cert
-                && tls.cert_from.is_none()
-                && (tls.cert_path.is_none() || tls.key_path.is_none())
-            {
-                bail!(
-                    "{what}.tls.mode = \"{}\" needs certFrom (\"legion\" or {{ kv = \"<path>\" }}) \
-                     or both certPath and keyPath",
-                    tls.mode
-                );
-            }
-            if tls.mode == TLS_MUTUAL && tls.client_ca.is_none() {
-                bail!(
-                    "{what}.tls.mode = \"mutual\" needs clientCa (\"legion\" or a CA bundle path)"
-                );
-            }
-            if !tls.require_identity.is_empty() && tls.mode != TLS_MUTUAL {
-                bail!("{what}.tls.requireIdentity needs tls.mode = \"mutual\"");
-            }
-        }
         Ok(())
     }
-}
-
-/// Normalize and validate one handler hop. Shared by chains and by
-/// `connect.upstreams[].handlers`, so a handler is spelled identically
-/// wherever it appears. `is_http` says whether the surrounding path parses
-/// HTTP, which body-inspecting handlers need.
-pub fn normalize_handler(hwhat: &str, handler: &mut HandlerConfig, is_http: bool) -> R<()> {
-    handler.handler = handler.handler.trim().to_ascii_lowercase();
-    if !HANDLERS.contains(&handler.handler.as_str()) {
-        bail!(
-            "{hwhat}.handler must be one of {}, got '{}'",
-            HANDLERS.join(", "),
-            handler.handler
-        );
-    }
-    match handler.handler.as_str() {
-        HANDLER_AUTHZ => {
-            let url = handler.url.as_deref().unwrap_or("").trim();
-            if !(url.starts_with("http://") || url.starts_with("https://")) {
-                bail!("{hwhat}: authz needs url = \"http(s)://...\"");
-            }
-            if let Some(cache) = handler.cache.as_deref() {
-                let ttl =
-                    parse_duration(cache).map_err(|err| anyhow::anyhow!("{hwhat}.cache: {err}"))?;
-                let cap = parse_duration(MAX_AUTHZ_CACHE).expect("constant");
-                if ttl > cap {
-                    bail!("{hwhat}.cache must be at most {MAX_AUTHZ_CACHE}");
-                }
-            }
-        }
-        HANDLER_PROXY => {
-            let targets = [
-                handler.service.as_deref(),
-                handler.port.as_deref(),
-                handler.node.as_deref(),
-            ]
-            .iter()
-            .filter(|t| t.is_some_and(|t| !t.trim().is_empty()))
-            .count();
-            if targets != 1 {
-                bail!(
-                    "{hwhat}: proxy needs exactly one of service (any endpoint), port \
-                     (a sidecar's port label), or node (node-local endpoints)"
-                );
-            }
-        }
-        HANDLER_DLP => {
-            if !is_http {
-                bail!("{hwhat}: dlp inspects HTTP bodies, which needs protocol = \"http\"");
-            }
-            if let Some(max) = handler.config.get("maxBytes") {
-                parse_bytes(max)
-                    .map_err(|err| anyhow::anyhow!("{hwhat}.config.maxBytes: {err}"))?;
-            }
-            let patterns = handler
-                .config
-                .get("patterns")
-                .and_then(|p| p.as_array())
-                .cloned()
-                .unwrap_or_default();
-            if patterns.is_empty() {
-                bail!("{hwhat}: dlp needs config.patterns = [\"<regex>\", ...]");
-            }
-            for pattern in &patterns {
-                let Some(pattern) = pattern.as_str() else {
-                    bail!("{hwhat}.config.patterns entries must be strings");
-                };
-                regex::Regex::new(pattern)
-                    .map_err(|err| anyhow::anyhow!("{hwhat}.config.patterns '{pattern}': {err}"))?;
-            }
-        }
-        _ => {}
-    }
-    if let Some(timeout) = handler.timeout.as_deref() {
-        parse_duration(timeout).map_err(|err| anyhow::anyhow!("{hwhat}.timeout: {err}"))?;
-    } else {
-        handler.timeout = Some(DEFAULT_HANDLER_TIMEOUT.to_string());
-    }
-    if let Some(on_error) = handler.on_error.as_mut() {
-        *on_error = on_error.trim().to_ascii_lowercase();
-        if !ON_ERRORS.contains(&on_error.as_str()) {
-            bail!(
-                "{hwhat}.onError must be one of {}, got '{on_error}'",
-                ON_ERRORS.join(", ")
-            );
-        }
-    }
-    Ok(())
 }
 
 /// `host`, `host:port`, `cidr`, `cidr:port`, or `host/path` → one allow rule.
@@ -883,25 +625,14 @@ pub fn validate_inline_chain(
     direction: Direction,
     chain: &mut ChainConfig,
 ) -> R<()> {
-    chain.normalize_and_validate(
-        &format!("task {task_name} network.{}", direction.as_str()),
-        direction,
-    )
+    chain.normalize_and_validate(&format!("task {task_name} network.{}", direction.as_str()))
 }
 
-/// `network.mode` must be a known value; the reserved datapath-plugin modes
-/// name the reason they are rejected.
+/// `network.mode` must be a known value.
 pub fn validate_network_mode(mode: &str) -> R<()> {
     let mode = mode.trim().to_ascii_lowercase();
     if MODES.contains(&mode.as_str()) {
         return Ok(());
-    }
-    if mode == "bridge" || mode.starts_with("cni/") || mode == "cni" {
-        bail!(
-            "network.mode '{mode}' is reserved for the datapath plugin, which is not implemented; \
-             use one of {}",
-            MODES.join(", ")
-        );
     }
     bail!(
         "network.mode must be one of {}, got '{mode}'",
@@ -927,7 +658,7 @@ pub struct EffectiveRule {
 #[serde(rename_all = "camelCase")]
 pub struct EffectiveHandler {
     #[serde(flatten)]
-    pub handler: HandlerConfig,
+    pub handler: HopConfig,
     pub source: String,
 }
 
@@ -937,19 +668,50 @@ pub struct EffectiveHandler {
 pub struct EffectiveChain {
     pub protocol: String,
     pub policy: String,
-    pub on_error: String,
     pub access_log: bool,
+    /// Ingress on a `service.mesh = true` service whose `service.allow` is
+    /// not `*/*`: the verified callers the mesh port admits, checked before
+    /// any rule.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub tls: Option<TlsConfig>,
+    pub callers: Option<EffectiveCallers>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub rules: Vec<EffectiveRule>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub handlers: Vec<EffectiveHandler>,
 }
 
+/// `service.allow`, compiled for the receiving node of a mesh service.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct EffectiveCallers {
+    /// The service's `allow` entries, as written: job globs, bare (the
+    /// service's own namespace) or `ns/job`.
+    pub allow: Vec<String>,
+    /// The job that declares the service, whose namespace a bare entry
+    /// (and an empty list) means.
+    pub owner: String,
+    /// Always [`SOURCE_SERVICE_ALLOW`].
+    pub source: String,
+}
+
 impl EffectiveChain {
     pub fn is_http(&self) -> bool {
         self.protocol == PROTOCOL_HTTP
+    }
+
+    /// Whether a verified mesh caller may reach the service: always, without
+    /// a `callers` check; otherwise only when the job its workload identity
+    /// names passes the service's `allow` (the same rule the endpoint feed
+    /// applies). A node identity (`node:<id>`, a peer that named no
+    /// workload) or no identity is refused.
+    pub fn callers_permit(&self, identity: Option<&str>) -> bool {
+        use crate::structs::network::{allow_permits, identity_job};
+        match &self.callers {
+            None => true,
+            Some(callers) => identity
+                .and_then(identity_job)
+                .is_some_and(|job| allow_permits(&callers.allow, &callers.owner, job)),
+        }
     }
 
     pub fn denies_by_default(&self) -> bool {
@@ -981,6 +743,10 @@ pub struct EffectivePolicy {
     /// Imposed or suggested `network.mode`, if any policy set one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mode: Option<String>,
+    /// The effective `service.mesh`: a `require` policy's, else the task's,
+    /// else a `default` policy's.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mesh: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub egress: Option<EffectiveChain>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -997,7 +763,10 @@ pub struct EffectivePolicy {
 
 impl EffectivePolicy {
     pub fn is_empty(&self) -> bool {
-        self.mode.is_none() && self.egress.is_none() && self.ingress.is_none()
+        self.mode.is_none()
+            && self.mesh.is_none()
+            && self.egress.is_none()
+            && self.ingress.is_none()
     }
 
     fn compute_hash(&mut self) {
@@ -1013,6 +782,13 @@ pub struct InlinePolicy<'a> {
     pub mode: Option<&'a str>,
     pub egress: Option<&'a ChainConfig>,
     pub ingress: Option<&'a ChainConfig>,
+    /// The task's `service.mesh`.
+    pub mesh: Option<bool>,
+    /// The task's `service.allow`: compiled into the ingress chain's
+    /// `callers` when the effective mesh is on and the list is not `*/*`.
+    pub callers: &'a [String],
+    /// The task's canonical job id, which owns `callers`.
+    pub owner: &'a str,
 }
 
 /// Merge the policies matching one task into what the datapath runs.
@@ -1048,19 +824,29 @@ pub fn merge_policies(matching: &[NetPolicyObject], inline: InlinePolicy<'_>) ->
             .find_map(|p| p.mode.clone())
             .or_else(|| inline.mode.map(|m| m.to_string()))
             .or_else(|| default.and_then(|p| p.mode.clone())),
+        mesh: required
+            .iter()
+            .find_map(|p| p.mesh)
+            .or(inline.mesh)
+            .or_else(|| default.and_then(|p| p.mesh)),
         ..Default::default()
     };
 
     for policy in &required {
         out.sources.push(format!("policy/{}", policy.name));
     }
-    if inline.egress.is_some() || inline.ingress.is_some() || inline.mode.is_some() {
+    if inline.egress.is_some()
+        || inline.ingress.is_some()
+        || inline.mode.is_some()
+        || inline.mesh.is_some()
+    {
         out.sources.push("task".to_string());
     }
     if let Some(default) = default {
         let used = (inline.egress.is_none() && default.egress.is_some())
             || (inline.ingress.is_none() && default.ingress.is_some())
-            || (inline.mode.is_none() && default.mode.is_some());
+            || (inline.mode.is_none() && default.mode.is_some())
+            || (inline.mesh.is_none() && default.mesh.is_some());
         if used {
             out.sources.push(format!("policy/{}", default.name));
         }
@@ -1082,6 +868,27 @@ pub fn merge_policies(matching: &[NetPolicyObject], inline: InlinePolicy<'_>) ->
             .and_then(|p| p.ingress.as_ref())
             .map(|c| (default.unwrap().name.as_str(), c)),
     );
+    // The service's own callers, on the mesh only: without it no peer is
+    // verified at the receiving node, so the endpoint feed is the only
+    // enforcement (and `service doctor` says so).
+    // An empty list still closes the service to other namespaces, so only
+    // `*/*` leaves nothing to check.
+    let open = inline.callers.iter().any(|entry| entry.trim() == "*/*");
+    if out.mesh == Some(true) && !open {
+        let chain = out.ingress.get_or_insert_with(|| EffectiveChain {
+            protocol: PROTOCOL_TCP.to_string(),
+            policy: ACTION_ALLOW.to_string(),
+            access_log: false,
+            callers: None,
+            rules: Vec::new(),
+            handlers: Vec::new(),
+        });
+        chain.callers = Some(EffectiveCallers {
+            allow: inline.callers.to_vec(),
+            owner: inline.owner.to_string(),
+            source: SOURCE_SERVICE_ALLOW.to_string(),
+        });
+    }
     out.compute_hash();
     out
 }
@@ -1110,13 +917,11 @@ fn merge_direction(
     let mut merged = EffectiveChain {
         protocol: PROTOCOL_TCP.to_string(),
         policy: ACTION_ALLOW.to_string(),
-        on_error: ON_ERROR_ALLOW.to_string(),
         access_log: false,
-        tls: None,
+        callers: None,
         rules: Vec::new(),
         handlers: Vec::new(),
     };
-    let mut any_required = false;
     let mut required_denies = false;
     let mut last_policy = ACTION_ALLOW.to_string();
     for (source, chain) in &contributing {
@@ -1127,21 +932,9 @@ fn merge_direction(
         if chain.is_http() {
             merged.protocol = PROTOCOL_HTTP.to_string();
         }
-        if chain.on_error.as_deref() == Some(ON_ERROR_DENY) {
-            merged.on_error = ON_ERROR_DENY.to_string();
-        }
         merged.access_log |= chain.access_log;
-        // TLS: a required policy's TLS wins; otherwise the last contributor's
-        // — but never let a task or default override what a required policy
-        // set.
-        if chain.tls.is_some() && (is_required || !any_required) {
-            merged.tls = chain.tls.clone();
-        }
-        if is_required {
-            any_required = true;
-            if chain.policy.as_deref() == Some(ACTION_DENY) {
-                required_denies = true;
-            }
+        if is_required && chain.policy.as_deref() == Some(ACTION_DENY) {
+            required_denies = true;
         }
         last_policy = chain
             .policy
@@ -1227,9 +1020,6 @@ pub enum Verdict {
 }
 
 impl Verdict {
-    pub fn is_allow(&self) -> bool {
-        matches!(self, Verdict::Allow)
-    }
     pub fn as_str(&self) -> &'static str {
         match self {
             Verdict::Allow => "allow",
@@ -1314,6 +1104,20 @@ pub fn evaluate_connect(chain: &EffectiveChain, facts: &ConnectFacts<'_>) -> Ver
         return verdict_for(&entry.rule, &entry.source);
     }
     fallthrough(chain)
+}
+
+/// The source of the rule that makes [`evaluate_connect`] answer
+/// [`Verdict::Defer`]: the first rule whose connect-time parts match and that
+/// needs the request head. `None` when the chain decides at connect.
+pub fn deferring_rule(chain: &EffectiveChain, facts: &ConnectFacts<'_>) -> Option<String> {
+    for entry in &chain.rules {
+        let matcher = &entry.rule.matcher;
+        if !connect_parts_match(matcher, facts.host, facts.ip, facts.port, facts.identity) {
+            continue;
+        }
+        return matcher.needs_request().then(|| entry.source.clone());
+    }
+    None
 }
 
 /// Decide a request from the HTTP head. Connect-time parts are re-checked so
@@ -1570,11 +1374,25 @@ pub fn normalize_labels(labels: &BTreeMap<String, String>) -> R<BTreeMap<String,
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `onError` lives on each hop; a chain-level one is refused rather than
+    /// silently ignored.
+    #[test]
+    fn on_error_is_a_hop_setting_test() {
+        let err = serde_json::from_value::<ChainConfig>(json!({ "onError": "allow" }))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("onError"), "{err}");
+        let c = chain(json!({
+            "handlers": [{ "authz": { "url": "http://x/check" }, "onError": "allow" }]
+        }));
+        assert!(c.handlers[0].fails_open());
+    }
     use serde_json::json;
 
     fn chain(v: Value) -> ChainConfig {
         let mut c: ChainConfig = serde_json::from_value(v).unwrap();
-        c.normalize_and_validate("test", Direction::Egress).unwrap();
+        c.normalize_and_validate("test").unwrap();
         c
     }
 
@@ -1636,10 +1454,7 @@ mod tests {
     fn path_in_tcp_chain_is_rejected_with_the_fix() {
         let mut c: ChainConfig =
             serde_json::from_value(json!({ "allow": ["api.github.com/repos/**"] })).unwrap();
-        let err = c
-            .normalize_and_validate("egress", Direction::Egress)
-            .unwrap_err()
-            .to_string();
+        let err = c.normalize_and_validate("egress").unwrap_err().to_string();
         assert!(err.contains("matches on a path"), "{err}");
         assert!(err.contains("protocol = \"http\""), "{err}");
         // With http it is accepted and the path survives.
@@ -1650,134 +1465,147 @@ mod tests {
     #[test]
     fn protocol_is_never_inferred_and_h2_is_named() {
         let mut c: ChainConfig = serde_json::from_value(json!({ "protocol": "h2" })).unwrap();
-        let err = c
-            .normalize_and_validate("egress", Direction::Egress)
-            .unwrap_err()
-            .to_string();
+        let err = c.normalize_and_validate("egress").unwrap_err().to_string();
         assert!(err.contains("not implemented"), "{err}");
     }
 
     #[test]
     fn unknown_handler_lists_valid_ones() {
-        let mut c: ChainConfig =
-            serde_json::from_value(json!({ "handlers": [{ "handler": "wasm" }] })).unwrap();
-        let err = c
-            .normalize_and_validate("egress", Direction::Egress)
+        let err = serde_json::from_value::<ChainConfig>(json!({ "handlers": [{ "wasm": {} }] }))
             .unwrap_err()
             .to_string();
-        assert!(err.contains("authz, proxy, log, dlp"), "{err}");
+        assert!(err.contains("authz, proxy, dlp"), "{err}");
     }
 
     #[test]
     fn handler_kinds_are_validated_per_kind() {
         for bad in [
-            json!({ "handlers": [{ "handler": "authz" }] }),
-            json!({ "handlers": [{ "handler": "authz", "url": "http://x", "cache": "10m" }] }),
-            json!({ "handlers": [{ "handler": "proxy" }] }),
-            json!({ "handlers": [{ "handler": "proxy", "service": "a", "port": "b" }] }),
-            json!({ "handlers": [{ "handler": "dlp", "config": { "patterns": ["x"] } }] }),
-            json!({ "protocol": "http", "handlers": [{ "handler": "dlp" }] }),
-            json!({ "handlers": [{ "handler": "log", "timeout": "soon" }] }),
+            json!({ "handlers": [{ "authz": { "url": "" } }] }),
+            json!({ "handlers": [{ "authz": { "url": "http://x", "cache": "10m" } }] }),
+            json!({ "handlers": [{ "proxy": {} }] }),
+            json!({ "handlers": [{ "proxy": { "service": "a", "port": "b" } }] }),
+            json!({ "handlers": [{ "dlp": { "patterns": ["x"] } }] }),
+            json!({ "protocol": "http", "handlers": [{ "dlp": { "patterns": [] } }] }),
+            json!({ "handlers": [{ "authz": { "url": "http://x" }, "timeout": "soon" }] }),
         ] {
             let mut c: ChainConfig = serde_json::from_value(bad.clone()).unwrap();
-            assert!(
-                c.normalize_and_validate("egress", Direction::Egress)
-                    .is_err(),
-                "{bad}"
-            );
+            assert!(c.normalize_and_validate("egress").is_err(), "{bad}");
         }
         let c = chain(
-            json!({ "handlers": [{ "handler": "authz", "url": "http://policy/check", "cache": "30s" }] }),
+            json!({ "handlers": [{ "authz": { "url": "http://policy/check", "cache": "30s" } }] }),
         );
         assert_eq!(
             c.handlers[0].timeout.as_deref(),
-            Some(DEFAULT_HANDLER_TIMEOUT)
+            Some(crate::structs::hops::DEFAULT_HOP_TIMEOUT)
         );
     }
 
+    /// TLS lives on ports and upstreams now; a chain that still names it is
+    /// a parse error, never silently ignored.
     #[test]
-    fn tls_modes_are_per_direction() {
-        let mut c: ChainConfig =
-            serde_json::from_value(json!({ "tls": { "mode": "mutual" } })).unwrap();
-        assert!(c
-            .normalize_and_validate("egress", Direction::Egress)
-            .is_err());
-        let mut c: ChainConfig =
-            serde_json::from_value(json!({ "tls": { "mode": "mutual" } })).unwrap();
-        let err = c
-            .normalize_and_validate("ingress", Direction::Ingress)
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("certFrom"), "{err}");
-        let mut c: ChainConfig = serde_json::from_value(
-            json!({ "tls": { "mode": "mutual", "certFrom": "legion", "clientCa": "legion",
-                              "requireIdentity": ["prod:*"] } }),
+    fn chains_carry_no_tls_test() {
+        let err = serde_json::from_value::<ChainConfig>(
+            json!({ "tls": { "mode": "server", "certFrom": "legion" } }),
         )
-        .unwrap();
-        c.normalize_and_validate("ingress", Direction::Ingress)
-            .unwrap();
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("unknown field `tls`"), "{err}");
     }
 
+    /// `mesh` on a policy object: `require` imposes it over the task,
+    /// `default` only fills in for a task that says nothing.
     #[test]
-    fn cert_from_kv_is_ingress_only_and_keeps_the_legion_spelling_test() {
-        let validate = |tls: Value, direction: Direction| {
-            let mut c: ChainConfig = serde_json::from_value(json!({ "tls": tls }))?;
-            c.normalize_and_validate("chain", direction)?;
-            Ok::<_, anyhow::Error>(c)
+    fn mesh_merges_like_mode_test() {
+        let policy = |name: &str, enforcement: &str, mesh: bool| NetPolicyObject {
+            name: name.into(),
+            enforcement: enforcement.into(),
+            mesh: Some(mesh),
+            ..Default::default()
         };
-
-        let c = validate(
-            json!({ "mode": "server", "certFrom": { "kv": " certs/app " } }),
-            Direction::Ingress,
-        )
-        .unwrap();
-        let tls = c.tls.unwrap();
-        assert_eq!(tls.cert_kv_path(), Some("certs/app"));
-        assert!(!tls.cert_from_mesh());
-
-        // The original string form serializes exactly as before, so stored
-        // policy hashes do not move.
-        let c = validate(
-            json!({ "mode": "server", "certFrom": "legion" }),
-            Direction::Ingress,
-        )
-        .unwrap();
-        assert!(c.tls.as_ref().unwrap().cert_from_mesh());
+        let inline = |mesh: Option<bool>| InlinePolicy {
+            mesh,
+            ..Default::default()
+        };
+        assert_eq!(merge_policies(&[], inline(Some(true))).mesh, Some(true));
         assert_eq!(
-            serde_json::to_value(c.tls.unwrap()).unwrap(),
-            json!({ "mode": "server", "certFrom": "legion" })
+            merge_policies(&[policy("d", "default", true)], inline(None)).mesh,
+            Some(true)
         );
+        assert_eq!(
+            merge_policies(&[policy("d", "default", true)], inline(Some(false))).mesh,
+            Some(false)
+        );
+        assert_eq!(
+            merge_policies(&[policy("r", "require", true)], inline(Some(false))).mesh,
+            Some(true)
+        );
+    }
 
-        for (tls, direction, expected) in [
-            (
-                json!({ "mode": "originate", "certFrom": { "kv": "certs/app" } }),
-                Direction::Egress,
-                "only supported on ingress",
-            ),
-            (
-                json!({ "mode": "server", "certFrom": { "kv": "" } }),
-                Direction::Ingress,
-                "cannot be empty",
-            ),
-            (
-                json!({ "mode": "server", "certFrom": { "kv": "certs/app" }, "certPath": "/x" }),
-                Direction::Ingress,
-                "replaces certPath/keyPath",
-            ),
-            (
-                json!({ "mode": "server", "certFrom": "vault" }),
-                Direction::Ingress,
-                "must be \"legion\" or { kv",
-            ),
-        ] {
-            let err = validate(tls, direction).unwrap_err().to_string();
-            assert!(err.contains(expected), "{err}");
+    /// On a mesh service, `service.allow` becomes the ingress chain's first
+    /// check, sourced `service/allow`, judged by the verified caller's job
+    /// with the endpoint feed's own rules. Only `*/*` and non-mesh services
+    /// add nothing: an empty list still closes the service to other
+    /// namespaces.
+    #[test]
+    fn service_allow_compiles_to_callers_on_mesh_services_test() {
+        let allow = vec!["web".to_string(), "payments-*/api".to_string()];
+        let merged = merge_policies(
+            &[],
+            InlinePolicy {
+                mesh: Some(true),
+                callers: &allow,
+                owner: "shared/auth",
+                ..Default::default()
+            },
+        );
+        let callers = merged
+            .ingress
+            .as_ref()
+            .and_then(|c| c.callers.as_ref())
+            .unwrap();
+        assert_eq!(callers.allow, allow);
+        assert_eq!(callers.owner, "shared/auth");
+        assert_eq!(callers.source, SOURCE_SERVICE_ALLOW);
+        let chain = merged.ingress.as_ref().unwrap();
+        assert!(chain.callers_permit(Some("auto:shared/web:web:web")));
+        assert!(chain.callers_permit(Some("auto:payments-eu/api:g:main")));
+        assert!(!chain.callers_permit(Some("auto:other/web:web:web")));
+        assert!(!chain.callers_permit(Some("auto:shared/other:g:t")));
+        assert!(!chain.callers_permit(Some("node:n1")));
+        assert!(!chain.callers_permit(None));
+
+        // An empty list admits the service's own namespace only.
+        let merged = merge_policies(
+            &[],
+            InlinePolicy {
+                mesh: Some(true),
+                owner: "web",
+                ..Default::default()
+            },
+        );
+        let chain = merged.ingress.as_ref().unwrap();
+        assert!(chain.callers_permit(Some("auto:api:g:t")));
+        assert!(!chain.callers_permit(Some("auto:prod/api:g:t")));
+
+        let open = vec!["*/*".to_string()];
+        for (mesh, callers) in [(Some(true), &open), (Some(false), &allow), (None, &allow)] {
+            let merged = merge_policies(
+                &[],
+                InlinePolicy {
+                    mesh,
+                    callers,
+                    ..Default::default()
+                },
+            );
+            assert!(
+                merged
+                    .ingress
+                    .as_ref()
+                    .and_then(|c| c.callers.as_ref())
+                    .is_none(),
+                "{mesh:?} {callers:?}"
+            );
         }
-        // A typo inside the object is a parse error, not a silent miss.
-        assert!(serde_json::from_value::<ChainConfig>(
-            json!({ "tls": { "mode": "server", "certFrom": { "kvv": "certs/app" } } })
-        )
-        .is_err());
     }
 
     #[test]
@@ -1786,9 +1614,9 @@ mod tests {
             "protocol": "http",
             "policy": "deny",
             "rules": [
-                { "match": { "host": "*.pypi.org" }, "action": "allow" },
-                { "match": { "host": "api.github.com", "path": "/repos/**" }, "action": "allow" },
-                { "match": { "cidr": "10.0.0.0/8" }, "action": "deny", "reason": "internal" }
+                { "when": { "host": "*.pypi.org" }, "action": "allow" },
+                { "when": { "host": "api.github.com", "path": "/repos/**" }, "action": "allow" },
+                { "when": { "cidr": "10.0.0.0/8" }, "action": "deny", "reason": "internal" }
             ]
         }));
         let allow = evaluate_connect(
@@ -1835,8 +1663,8 @@ mod tests {
             "protocol": "http",
             "policy": "deny",
             "rules": [
-                { "match": { "header": { "Authorization": "*" } }, "action": "deny", "reason": "no creds" },
-                { "match": { "host": "api.github.com", "path": "/repos/**", "method": ["get"] }, "action": "allow" }
+                { "when": { "header": { "Authorization": "*" } }, "action": "deny", "reason": "no creds" },
+                { "when": { "host": "api.github.com", "path": "/repos/**", "method": ["get"] }, "action": "allow" }
             ]
         }));
         let headers = vec![("authorization".to_string(), "Bearer x".to_string())];
@@ -1895,7 +1723,7 @@ mod tests {
             "org",
             "require",
             10,
-            json!({ "rules": [{ "match": { "host": "bad.example" }, "action": "deny" }] }),
+            json!({ "rules": [{ "when": { "host": "bad.example" }, "action": "deny" }] }),
         );
         let req_high = policy(
             "sec",
@@ -1991,9 +1819,10 @@ mod tests {
         for ok in ["auto", "host", "gated", "GATED"] {
             validate_network_mode(ok).unwrap();
         }
-        let err = validate_network_mode("bridge").unwrap_err().to_string();
-        assert!(err.contains("datapath plugin"), "{err}");
-        assert!(validate_network_mode("wat").is_err());
+        for bad in ["bridge", "cni/calico", "wat"] {
+            let err = validate_network_mode(bad).unwrap_err().to_string();
+            assert!(err.contains("must be one of auto, host, gated"), "{err}");
+        }
     }
 
     #[test]

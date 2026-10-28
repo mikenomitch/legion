@@ -748,6 +748,8 @@ pub struct DeclaredService {
 pub struct DeclaredConsumer {
     pub job_id: String,
     pub task_name: String,
+    /// The task's group, for its workload identity subject.
+    pub group: String,
     pub upstreams: Vec<crate::structs::UpstreamConfig>,
 }
 
@@ -13307,6 +13309,28 @@ impl Store {
         task_id: i64,
         network: Option<&crate::structs::NetworkConfig>,
     ) -> R<bool> {
+        self.policy_declares(tx, node_id, task_id, network, true)
+    }
+
+    /// Whether a stored policy matching this task declares an egress chain.
+    fn policy_declares_egress(
+        &self,
+        tx: &Connection,
+        node_id: &str,
+        task_id: i64,
+        network: Option<&crate::structs::NetworkConfig>,
+    ) -> R<bool> {
+        self.policy_declares(tx, node_id, task_id, network, false)
+    }
+
+    fn policy_declares(
+        &self,
+        tx: &Connection,
+        node_id: &str,
+        task_id: i64,
+        network: Option<&crate::structs::NetworkConfig>,
+        ingress: bool,
+    ) -> R<bool> {
         if self.net_policy_generation().unwrap_or(0) == 0 {
             return Ok(false);
         }
@@ -13336,31 +13360,48 @@ impl Store {
             .list_net_policies()?
             .into_iter()
             .map(|record| record.object)
-            .any(|policy| policy.ingress.is_some() && policy.selector.matches(&facts)))
+            .any(|policy| {
+                let declares = if ingress {
+                    policy.ingress.is_some()
+                } else {
+                    policy.egress.is_some()
+                };
+                declares && policy.selector.matches(&facts)
+            }))
     }
 
-    /// How the allocation's advertised ports terminate TLS — `legion`,
-    /// `byo`, or none — from the effective ingress chain the same merge the
-    /// heartbeat runs would produce for this (job, task, node). Resolved at
-    /// placement because the catalog projection reads it off the allocation
-    /// row for every consumer's endpoint feed.
-    fn ingress_tls_at_placement(
+    /// The port that terminates mesh mTLS, if any: the service's port, when
+    /// the effective `service.mesh` (a `require` policy's, else the task's,
+    /// else a `default` policy's) is on. Resolved at placement because the
+    /// catalog projection reads it off the allocation row for every
+    /// consumer's endpoint feed, and the listener and the catalog must agree.
+    fn mesh_port_at_placement(
         &self,
         tx: &Connection,
         node_id: &str,
         task_id: i64,
         network: Option<&crate::structs::NetworkConfig>,
     ) -> R<Option<String>> {
-        let (runtime, job_id): (String, String) = match tx
+        let (runtime, job_id, service): (String, String, Option<String>) = match tx
             .query_row(
-                "SELECT runtime, job_id FROM task_config WHERE id = ?;",
+                "SELECT runtime, job_id, service FROM task_config WHERE id = ?;",
                 [task_id],
-                |row| Ok((row.get(0)?, row.get(1)?)),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
             .optional()?
         {
             Some(row) => row,
             None => return Ok(None),
+        };
+        let Some(service) = service
+            .as_deref()
+            .filter(|raw| !raw.trim().is_empty())
+            .and_then(|raw| from_str::<crate::structs::ServiceConfig>(raw).ok())
+        else {
+            return Ok(None);
+        };
+        let Some(label) = service.port_label().map(str::to_string) else {
+            return Ok(None);
         };
         let matching: Vec<crate::structs::netpolicy::NetPolicyObject> =
             if self.net_policy_generation().unwrap_or(0) > 0 {
@@ -13378,7 +13419,7 @@ impl Store {
                 self.list_net_policies()?
                     .into_iter()
                     .map(|record| record.object)
-                    .filter(|policy| policy.selector.matches(&facts))
+                    .filter(|policy| policy.selector.matches(&facts) && policy.mesh.is_some())
                     .collect()
             } else {
                 Vec::new()
@@ -13386,28 +13427,11 @@ impl Store {
         let effective = crate::structs::netpolicy::merge_policies(
             &matching,
             crate::structs::netpolicy::InlinePolicy {
-                mode: None,
-                egress: None,
-                ingress: network.and_then(|n| n.ingress.as_ref()),
+                mesh: service.mesh,
+                ..Default::default()
             },
         );
-        Ok(effective
-            .ingress
-            .as_ref()
-            .and_then(|chain| chain.tls.as_ref())
-            .filter(|tls| {
-                matches!(
-                    tls.mode.as_str(),
-                    crate::structs::netpolicy::TLS_SERVER | crate::structs::netpolicy::TLS_MUTUAL
-                )
-            })
-            .map(|tls| {
-                if tls.cert_from_mesh() {
-                    "legion".to_string()
-                } else {
-                    "byo".to_string()
-                }
-            }))
+        Ok((effective.mesh == Some(true)).then_some(label))
     }
 
     /// Open or close the gated-default gate on this store (gated plan Phase
@@ -13595,9 +13619,27 @@ impl Store {
         // A gated container or exec task gets a namespace resolver and
         // ingress listeners whatever it declares (plan §6.12). A gated
         // sandbox is reached over vsock instead, so it gets neither here.
-        let gated_namespace =
-            gated && self.task_runtime(tx, task_id)?.as_deref() != Some("sandbox");
-        if !has_ports && !has_upstreams {
+        let runtime = self.task_runtime(tx, task_id)?;
+        let sandbox = runtime.as_deref() == Some("sandbox");
+        // A gated task on a node without network namespaces (macOS) is
+        // confined instead: its listeners are on the node's loopback and its
+        // runtime keeps it there (internal_docs/plans/macos-gated-plan.md).
+        let confined = gated
+            && crate::structs::network::node_confines_gated(self.node_os(tx, node_id)?.as_deref());
+        let gated_namespace = gated && !sandbox && !confined;
+        // A host-mode task whose egress chain the kernel classifier enforces
+        // needs a resolver of its own: its answers teach the kernel which
+        // addresses a host rule allows (plan §6.A.4, open question 5). A
+        // VIP block's `.1` is that resolver, so such a task gets a block.
+        // Cheapest first: a plain job pays no node read here.
+        let wants_resolver = !gated
+            && !sandbox
+            && (network.as_ref().is_some_and(|n| n.egress.is_some())
+                || self.policy_declares_egress(tx, node_id, task_id, network.as_ref())?)
+            && crate::structs::network::node_supports_vip_blocks(
+                self.node_os(tx, node_id)?.as_deref(),
+            );
+        if !has_ports && !has_upstreams && !wants_resolver && !confined {
             // No ports and no upstreams: the row carries a network only when
             // a mode other than `host` applies (the task asked for `gated`,
             // the node defaults it, or a required policy imposes it), so
@@ -13629,16 +13671,24 @@ impl Store {
             let existing: crate::structs::AllocNetwork = from_str(&raw)
                 .with_context(|| format!("invalid stored allocation network on node {node_id}"))?;
             used.extend(existing.ports.iter().map(|port| port.host_port));
-            // A host-mode ingress twin is a host port too; a gated one lives
-            // in the allocation's own namespace and takes nothing here.
-            if !existing.is_gated() {
+            // A host-mode (or confined) ingress twin is a host port too; a
+            // gated one lives in the allocation's own namespace and takes
+            // nothing here. So does a confined allocation's egress proxy.
+            if !existing.is_gated() || existing.is_confined() {
                 used.extend(existing.ports.iter().filter_map(|port| port.private_port));
             }
             used.extend(
                 existing
+                    .egress_proxy
+                    .as_deref()
+                    .and_then(|addr| addr.parse::<std::net::SocketAddr>().ok())
+                    .map(|addr| addr.port()),
+            );
+            used.extend(
+                existing
                     .upstreams
                     .iter()
-                    .map(|upstream| upstream.local_port),
+                    .filter_map(|upstream| upstream.local_port),
             );
             if let Some(block) = existing.vip_block.as_ref() {
                 used_blocks.insert(block.clone());
@@ -13650,10 +13700,11 @@ impl Store {
         // a VIP on the port the service declared. Only where the platform
         // routes 127/8; a block that cannot be assigned is not a placement
         // failure — the loopback ports still work — so this is best effort.
-        let (vip_block, service_ports) = if has_upstreams
-            && crate::structs::network::node_supports_vip_blocks(
-                self.node_os(tx, node_id)?.as_deref(),
-            ) {
+        let (vip_block, service_ports) = if wants_resolver
+            || (has_upstreams
+                && crate::structs::network::node_supports_vip_blocks(
+                    self.node_os(tx, node_id)?.as_deref(),
+                )) {
             let block = crate::structs::next_vip_block(&used_blocks).ok();
             if block.is_none() {
                 warn!(node_id = %node_id, "No free VIP block; upstreams get loopback ports only");
@@ -13664,12 +13715,11 @@ impl Store {
                     .prepare_cached("SELECT job_id FROM task_config WHERE id = ?;")?
                     .query_row([task_id], |row| row.get(0))?;
                 for upstream in &connect.upstreams {
-                    if upstream.is_external() {
+                    let Some(target) = upstream.service_ref(&consumer_job) else {
                         continue;
-                    }
-                    let target = upstream.service_ref(&consumer_job);
+                    };
                     if let Some(port) = self.declared_service_port(tx, &target)? {
-                        service_ports.insert(upstream.key().to_string(), port);
+                        service_ports.insert(upstream.key(), port);
                     }
                 }
             }
@@ -13678,10 +13728,15 @@ impl Store {
             (None, HashMap::new())
         };
 
-        // An ingress chain — inline, or from a matching stored policy — means
-        // the datapath owns the advertised ports and the task binds private
-        // twins. Decided here because ports are assigned here.
-        let has_ingress = network.as_ref().is_some_and(|n| n.ingress.is_some())
+        // An ingress chain — inline, or from a matching stored policy — a
+        // mesh service, or a port with its own TLS means the datapath owns
+        // the advertised ports and the task binds private twins. Decided here
+        // because ports are assigned here.
+        let mesh_port = self.mesh_port_at_placement(tx, node_id, task_id, network.as_ref())?;
+        let has_ingress = network
+            .as_ref()
+            .is_some_and(|n| n.ingress.is_some() || n.ports.iter().any(|port| port.tls.is_some()))
+            || mesh_port.is_some()
             || self.policy_declares_ingress(tx, node_id, task_id, network.as_ref())?;
         let (ports, upstreams) = crate::structs::assign_allocation_ports_full(
             network.as_ref(),
@@ -13690,9 +13745,13 @@ impl Store {
             &service_ports,
             vip_block.as_deref(),
             // A gated namespace has no other way in: every declared port
-            // gets an ingress listener, chain or not (plan §6.12).
-            has_ingress || gated_namespace,
+            // gets an ingress listener, chain or not (plan §6.12). A confined
+            // task is fronted the same way, with its twins on the host.
+            has_ingress || gated_namespace || confined,
             gated_namespace,
+            // A sandbox's upstreams are relayed over vsock ports keyed by a
+            // loopback port number, so each keeps one.
+            sandbox,
         )
         .with_context(|| format!("failed to assign ports on node {node_id}"))?;
         let address = tx
@@ -13703,11 +13762,19 @@ impl Store {
 
         let resolver = (gated_namespace && vip_block.is_none())
             .then(|| crate::structs::network::GATED_RESOLVER_ADDR.to_string());
-        let ingress_tls = if has_ingress {
-            self.ingress_tls_at_placement(tx, node_id, task_id, network.as_ref())?
-        } else {
-            None
-        };
+        let mut ports = ports;
+        if let Some(label) = mesh_port.as_deref() {
+            for port in ports.iter_mut().filter(|port| port.name == label) {
+                // A port's own `tls` is the task's explicit choice; a
+                // policy-imposed mesh does not override it (submit rejects
+                // the two together on the task itself).
+                port.mesh = port.tls.is_none();
+            }
+        }
+        let egress_proxy = confined
+            .then(|| crate::structs::network::assign_confined_proxy(&used, &ports, &upstreams))
+            .transpose()
+            .with_context(|| format!("failed to assign ports on node {node_id}"))?;
         Ok(Some(crate::structs::AllocNetwork {
             address,
             ports,
@@ -13715,7 +13782,7 @@ impl Store {
             vip_block,
             resolver,
             mode,
-            ingress_tls,
+            egress_proxy,
         }))
     }
 
@@ -15266,9 +15333,12 @@ impl Store {
                 allow: service.allow.clone(),
                 meta: service.meta_strings(),
                 port_label: service.port_label().map(str::to_string),
-                mesh_tls: network
-                    .as_ref()
-                    .is_some_and(|network| network.ingress_tls.as_deref() == Some("legion")),
+                mesh_tls: network.as_ref().is_some_and(|network| {
+                    service
+                        .port_label()
+                        .and_then(|label| network.port(label))
+                        .is_some_and(|port| port.mesh)
+                }),
             });
         }
 
@@ -15318,7 +15388,7 @@ impl Store {
     pub fn declared_consumers(&self) -> R<Vec<DeclaredConsumer>> {
         let conn = self.read_connection()?;
         let mut stmt = conn.prepare(
-            "SELECT tc.name, tc.connect, tc.job_id
+            "SELECT tc.name, tc.connect, tc.job_id, tc.group_name
              FROM task_config tc
              INNER JOIN job_config jc ON jc.id = tc.job_config_id
              INNER JOIN (
@@ -15331,11 +15401,12 @@ impl Store {
                 row.get::<_, String>(0)?,
                 row.get::<_, String>(1)?,
                 row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
             ))
         })?;
         let mut out = Vec::new();
         for row in rows {
-            let (task_name, connect_raw, job_id) = row?;
+            let (task_name, connect_raw, job_id, group) = row?;
             let connect: crate::structs::ConnectConfig = match from_str(&connect_raw) {
                 Ok(connect) => connect,
                 Err(_) => continue,
@@ -15346,6 +15417,7 @@ impl Store {
             out.push(DeclaredConsumer {
                 job_id,
                 task_name,
+                group,
                 upstreams: connect.upstreams,
             });
         }
@@ -26819,6 +26891,7 @@ mod tests {
                     name: "http".into(),
                     static_port: Some(18080),
                     to: None,
+                    tls: None,
                 }],
             });
             task
@@ -26922,6 +26995,7 @@ mod tests {
                 name: "http".into(),
                 static_port: Some(18080),
                 to: None,
+                tls: None,
             }],
         });
         let (job_config_id, task_id) = submit_walk_job(&store, "walk-port-pair", port_task)?;
@@ -30228,6 +30302,7 @@ mod tests {
                 name: "http".into(),
                 static_port: None,
                 to: Some(8080),
+                tls: None,
             }],
             ..Default::default()
         });
@@ -31785,8 +31860,8 @@ mod tests {
         let task = connect_task(
             "api",
             json!([
-                { "service": "db" },
-                { "service": "cache", "localPort": 6379, "balance": "least_conn" },
+                { "to": "db" },
+                { "to": "cache", "port": 6379, "balance": "least_conn" },
             ]),
         );
         submit_service_job(&store, "svc-connect-roundtrip", vec![task])?;
@@ -31796,9 +31871,9 @@ mod tests {
         let (_, stored) = tasks.first().context("missing stored task")?;
         let connect = stored.connect.as_ref().context("connect not persisted")?;
         assert_eq!(connect.upstreams.len(), 2);
-        assert_eq!(connect.upstreams[0].service, "db");
-        assert_eq!(connect.upstreams[0].local_port, None);
-        assert_eq!(connect.upstreams[1].local_port, Some(6379));
+        assert_eq!(connect.upstreams[0].service().as_deref(), Some("db"));
+        assert_eq!(connect.upstreams[0].port, None);
+        assert_eq!(connect.upstreams[1].port, Some(6379));
         assert_eq!(connect.upstreams[1].balance.as_deref(), Some("least_conn"));
         Ok(())
     }
@@ -31807,12 +31882,13 @@ mod tests {
     fn upstream_assignment_gives_distinct_local_ports_per_allocation() -> R<()> {
         let store = setup_store()?;
         store.insert_node(make_node_msg("node-a", "ready"))?;
-        let mut task = connect_task("api", json!([{ "service": "db" }]));
+        let mut task = connect_task("api", json!([{ "to": "db" }]));
         task.network = Some(crate::structs::NetworkConfig {
             ports: vec![crate::structs::PortConfig {
                 name: "http".into(),
                 static_port: None,
                 to: None,
+                tls: None,
             }],
             ..Default::default()
         });
@@ -31827,7 +31903,7 @@ mod tests {
                 .network
                 .as_ref()
                 .and_then(|network| network.upstream("db"))
-                .map(|upstream| upstream.local_port)
+                .and_then(|upstream| upstream.local_port)
                 .context("alloc missing db upstream")
         };
         let first_local = local_port(&first)?;
@@ -31881,7 +31957,7 @@ mod tests {
         store.insert_node(node("linux-node", Some("linux")))?;
         store.insert_node(node("mac-node", Some("macos")))?;
         store.insert_node(node("bare-node", None))?;
-        let task = connect_task("api", json!([{ "service": "db" }]));
+        let task = connect_task("api", json!([{ "to": "db" }]));
         submit_service_job(&store, "svc-vip-os", vec![task])?;
         let task_id = task_id_for(&store, "api", "svc-vip-os")?;
 
@@ -31898,11 +31974,82 @@ mod tests {
         Ok(())
     }
 
+    /// A gated task on a macOS node is confined, not namespaced: it gets
+    /// an egress proxy port of its own, host-port twins for every port, and
+    /// no resolver; two of them never share a port. On Linux the same task
+    /// gets a namespace and none of that.
+    #[test]
+    fn a_gated_task_on_macos_is_confined_with_its_own_proxy_port_test() -> R<()> {
+        let store = setup_store()?;
+        let node = |id: &str, os: &str| {
+            let mut node = make_node_msg(id, "ready");
+            node.fingerprint_attrs = json!({ "os": os }).to_string();
+            node
+        };
+        store.insert_node(node("mac-node", "macos"))?;
+        store.insert_node(node("linux-node", "linux"))?;
+        let mut task = connect_task("api", json!([{ "to": "db" }]));
+        task.network = Some(serde_json::from_value(json!({
+            "mode": "gated",
+            "ports": [{ "name": "http" }],
+        }))?);
+        submit_service_job(&store, "svc-confined", vec![task])?;
+        let task_id = task_id_for(&store, "api", "svc-confined")?;
+
+        let first = store
+            .place_alloc("mac-node", task_id)?
+            .network
+            .context("a gated allocation has a network")?;
+        assert!(first.is_confined(), "{first:?}");
+        let proxy: std::net::SocketAddr = first.egress_proxy.as_deref().unwrap().parse()?;
+        assert_eq!(proxy.ip().to_string(), "127.0.0.1");
+        assert_eq!(first.resolver, None);
+        let twin = first.port("http").and_then(|port| port.private_port);
+        assert!(twin.is_some(), "every port is fronted: {first:?}");
+        let upstream = first
+            .upstream("db")
+            .and_then(|upstream| upstream.local_port);
+        let mut confined = first.confined_ports();
+        confined.sort_unstable();
+        let mut expected = vec![proxy.port(), upstream.unwrap()];
+        expected.sort_unstable();
+        assert_eq!(confined, expected);
+        let env: HashMap<String, String> = first.env_pairs().into_iter().collect();
+        assert_eq!(env["HTTPS_PROXY"], format!("http://{proxy}"));
+
+        let second = store
+            .place_alloc("mac-node", task_id)?
+            .network
+            .context("a gated allocation has a network")?;
+        let taken: HashSet<u16> = [
+            Some(proxy.port()),
+            first.port("http").map(|p| p.host_port),
+            twin,
+            upstream,
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
+        let second_proxy: std::net::SocketAddr = second.egress_proxy.as_deref().unwrap().parse()?;
+        assert!(
+            !taken.contains(&second_proxy.port()),
+            "{taken:?} {second:?}"
+        );
+
+        let linux = store
+            .place_alloc("linux-node", task_id)?
+            .network
+            .context("a gated allocation has a network")?;
+        assert!(linux.is_gated() && !linux.is_confined(), "{linux:?}");
+        assert_eq!(linux.egress_proxy, None);
+        Ok(())
+    }
+
     #[test]
     fn upstream_static_local_port_conflict_fails_placement() -> R<()> {
         let store = setup_store()?;
         store.insert_node(make_node_msg("node-a", "ready"))?;
-        let task = connect_task("api", json!([{ "service": "cache", "localPort": 6379 }]));
+        let task = connect_task("api", json!([{ "to": "cache", "port": 6379 }]));
         submit_service_job(&store, "svc-upstream-static", vec![task])?;
         let task_id = task_id_for(&store, "api", "svc-upstream-static")?;
 
@@ -31912,7 +32059,7 @@ mod tests {
                 .network
                 .as_ref()
                 .and_then(|network| network.upstream("cache"))
-                .map(|upstream| upstream.local_port),
+                .and_then(|upstream| upstream.local_port),
             Some(6379)
         );
 
@@ -31969,7 +32116,7 @@ mod tests {
         submit_service_job(
             &store,
             "svc-connect-added",
-            vec![connect_task("api", json!([{ "service": "db" }]))],
+            vec![connect_task("api", json!([{ "to": "db" }]))],
         )?;
         let v2_id = store.get_job_config("svc-connect-added")?.id();
         assert_ne!(v1_id, v2_id);
@@ -31986,7 +32133,7 @@ mod tests {
             .as_ref()
             .and_then(|network| network.upstream("db"))
             .context("fresh allocation missing db upstream")?;
-        assert!(upstream.local_port >= crate::structs::DYNAMIC_PORT_MIN);
+        assert!(upstream.local_port >= Some(crate::structs::DYNAMIC_PORT_MIN));
         assert_eq!(upstream.balance, crate::structs::DEFAULT_BALANCE);
 
         // Changing an existing connect block is equally disqualifying, while
@@ -31996,14 +32143,14 @@ mod tests {
             "svc-connect-added",
             vec![connect_task(
                 "api",
-                json!([{ "service": "db", "balance": "random" }]),
+                json!([{ "to": "db", "balance": "random" }]),
             )],
         )?;
         let v3_id = store.get_job_config("svc-connect-added")?.id();
         assert!(!store.job_configs_schedule_equivalent(&v2_id, &v3_id)?);
 
         let mut unchanged_connect =
-            connect_task("api", json!([{ "service": "db", "balance": "random" }]));
+            connect_task("api", json!([{ "to": "db", "balance": "random" }]));
         unchanged_connect.config = json!({ "changed": true });
         submit_service_job(&store, "svc-connect-added", vec![unchanged_connect])?;
         let v4_id = store.get_job_config("svc-connect-added")?.id();

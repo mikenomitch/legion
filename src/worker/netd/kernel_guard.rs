@@ -55,6 +55,15 @@ pub struct GuardedAllocation {
     pub vip_block: Option<String>,
     /// Its upstream loopback ports.
     pub loopback_ports: Vec<u16>,
+    /// Its resolver address. The kernel classifier sends its port-53
+    /// traffic there; the `nftables` guard ignores it.
+    pub resolver: Option<std::net::Ipv4Addr>,
+    /// Whether it runs in a gated namespace (the classifier only captures
+    /// for it, never passes).
+    pub gated: bool,
+    /// Whether its sockets are the task's own (`exec`, `container`). A
+    /// sandbox's live in its guest, so netd judges them.
+    pub host_sockets: bool,
 }
 
 /// Everything one rendering of the table depends on. Equal specs render
@@ -466,12 +475,18 @@ mod kernel_guard_test {
                     cgroup: "legion/share/legion-88213".into(),
                     vip_block: Some("127.42.7".into()),
                     loopback_ports: vec![20417],
+                    resolver: None,
+                    gated: false,
+                    host_sockets: true,
                 },
                 GuardedAllocation {
                     allocation_id: 9,
                     cgroup: "legion/reserve/legion-9".into(),
                     vip_block: None,
                     loopback_ports: vec![],
+                    resolver: None,
+                    gated: false,
+                    host_sockets: true,
                 },
             ],
         }
@@ -550,7 +565,7 @@ table inet legion_host_guard {
             { "metainfo": { "json_schema_version": 1 } },
             { "rule": { "family": "inet", "table": TABLE, "chain": "alloc_88213",
                 "comment": DROP_METADATA,
-                "expr": [ { "match": {} }, { "counter": { "packets": 3, "bytes": 180 } }, { "drop": null } ] } },
+                "expr": [ { "when": {} }, { "counter": { "packets": 3, "bytes": 180 } }, { "drop": null } ] } },
             { "rule": { "family": "inet", "table": TABLE, "chain": "alloc_88213",
                 "comment": DROP_METADATA,
                 "expr": [ { "counter": { "packets": 1, "bytes": 80 } } ] } },
@@ -658,6 +673,9 @@ table inet legion_host_guard {
                 cgroup: leaf.clone(),
                 vip_block: None,
                 loopback_ports: vec![],
+                resolver: None,
+                gated: false,
+                host_sockets: true,
             }],
             ..Default::default()
         };

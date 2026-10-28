@@ -38,26 +38,24 @@ use crate::structs::{
     DeleteVolumeRequest, DestroyInstanceReply, DestroyInstanceRequest, DestroyJobReply,
     DestroyJobRequest, ExecClientFrame, FailedAllocation, GetAllocationLogsReply,
     GetAllocationLogsRequest, GetArtifactCredentialReply, GetArtifactCredentialRequest,
-    GetHeartbeatCadenceReply, GetHeartbeatCadenceRequest, GetIngressCertificatesReply,
-    GetIngressCertificatesRequest, GetInstanceReply, GetInstanceRequest, GetJobInfoReply,
-    GetJobInfoRequest, GetJobScaleStatusReply, GetJobScaleStatusRequest, GetJobSpecByConfigRequest,
-    GetJobSpecReply, GetJobSpecRequest, GetJobTemplateReply, GetJobTemplateRequest, GetKvLockReply,
-    GetKvLockRequest, GetKvReply, GetKvRequest, GetLedgerReply, GetLedgerRequest,
-    GetManagerConfigsReply, GetManagerConfigsRequest, GetMeshCaReply, GetMeshCaRequest,
-    GetNodeContentReply, GetNodeContentRequest, GetNodeReply, GetNodeRequest, GetNodeUsageReply,
-    GetNodeUsageRequest, GetNodesReply, GetNodesRequest, GetObservabilityReply,
-    GetObservabilityRequest, GetRaftJoinTokenReply, GetRaftJoinTokenRequest, GetRaftStatusReply,
-    GetRaftStatusRequest, GetRolloutReply, GetRolloutRequest, GetRolloutStatusReply,
-    GetRolloutStatusRequest, GetSchedulerConcurrencyReply, GetSchedulerConcurrencyRequest,
-    GetStateBackupReply, GetStateBackupRequest, GetStateStoreSchemaReply,
-    GetStateStoreSchemaRequest, GetTaskLogsRequest, GetUpstreamCredentialsReply,
-    GetUpstreamCredentialsRequest, GetVolumeReply, GetVolumeRequest, HealthCheckReply,
-    HealthCheckRequest, HeartbeatReply, HeartbeatRequest, IngressCertificate, Instance,
-    InstanceInfo, InstanceMode, InstanceState, IssueBootTicketReply, IssueBootTicketRequest,
-    IssueNodeCertificateReply, IssueNodeCertificateRequest, IssueNodeIdentityTokenReply,
-    IssueNodeIdentityTokenRequest, IssueRaftCommandReply, IssueRaftCommandRequest,
-    IssueWorkloadIdentityTokenReply, IssueWorkloadIdentityTokenRequest, JobConfig,
-    JobSpecHistoryItem, JobTemplate, JobTemplateProvenance, JobTemplateSummary,
+    GetHeartbeatCadenceReply, GetHeartbeatCadenceRequest, GetInstanceReply, GetInstanceRequest,
+    GetJobInfoReply, GetJobInfoRequest, GetJobScaleStatusReply, GetJobScaleStatusRequest,
+    GetJobSpecByConfigRequest, GetJobSpecReply, GetJobSpecRequest, GetJobTemplateReply,
+    GetJobTemplateRequest, GetKvLockReply, GetKvLockRequest, GetKvReply, GetKvRequest,
+    GetLedgerReply, GetLedgerRequest, GetManagerConfigsReply, GetManagerConfigsRequest,
+    GetMeshCaReply, GetMeshCaRequest, GetNodeContentReply, GetNodeContentRequest, GetNodeReply,
+    GetNodeRequest, GetNodeUsageReply, GetNodeUsageRequest, GetNodesReply, GetNodesRequest,
+    GetObservabilityReply, GetObservabilityRequest, GetRaftJoinTokenReply, GetRaftJoinTokenRequest,
+    GetRaftStatusReply, GetRaftStatusRequest, GetRolloutReply, GetRolloutRequest,
+    GetRolloutStatusReply, GetRolloutStatusRequest, GetSchedulerConcurrencyReply,
+    GetSchedulerConcurrencyRequest, GetStateBackupReply, GetStateBackupRequest,
+    GetStateStoreSchemaReply, GetStateStoreSchemaRequest, GetTaskLogsRequest, GetVolumeReply,
+    GetVolumeRequest, HealthCheckReply, HealthCheckRequest, HeartbeatReply, HeartbeatRequest,
+    Instance, InstanceInfo, InstanceMode, InstanceState, IssueBootTicketReply,
+    IssueBootTicketRequest, IssueNodeCertificateReply, IssueNodeCertificateRequest,
+    IssueNodeIdentityTokenReply, IssueNodeIdentityTokenRequest, IssueRaftCommandReply,
+    IssueRaftCommandRequest, IssueWorkloadIdentityTokenReply, IssueWorkloadIdentityTokenRequest,
+    JobConfig, JobSpecHistoryItem, JobTemplate, JobTemplateProvenance, JobTemplateSummary,
     JobTemplateVariable, JobTemplateVersionInfo, KvEntry, KvInjectionAction, KvJobReference,
     KvValueType, LedgerNode, ListBootTicketsReply, ListBootTicketsRequest, ListEventsReply,
     ListEventsRequest, ListExecKeysReply, ListExecKeysRequest, ListInstancesReply,
@@ -84,12 +82,12 @@ use crate::structs::{
     StopRolloutReply, StopRolloutRequest, StreamEventsRequest, Submission, TaskConfig,
     TaskOnUnhealthyConfig, TaskScaleStatus, UpdateNodeDynamicReply, UpdateNodeDynamicRequest,
     UpsertJobTemplateReply, UpsertJobTemplateRequest, UpsertSavedStateQueryReply,
-    UpsertSavedStateQueryRequest, UpstreamCredentialValue, WorkerConfig, WorkerPreRegisterReply,
-    WorkerPreRegisterRequest, WorkerRegisterReply, WorkerRegisterRequest,
+    UpsertSavedStateQueryRequest, WorkerConfig, WorkerPreRegisterReply, WorkerPreRegisterRequest,
+    WorkerRegisterReply, WorkerRegisterRequest,
 };
 use crate::structs::{
-    AllocNetPolicy, DeleteNetPolicyReply, DeleteNetPolicyRequest, FetchNetPolicyReply,
-    FetchNetPolicyRequest, GetNetPolicyObjectReply, GetNetPolicyObjectRequest,
+    AllocNetPolicy, DeleteNetPolicyReply, DeleteNetPolicyRequest, FetchDatapathMaterialReply,
+    FetchDatapathMaterialRequest, GetNetPolicyObjectReply, GetNetPolicyObjectRequest,
     ListNetPoliciesReply, ListNetPoliciesRequest, NetPolicy, ShowNetPolicyReply,
     ShowNetPolicyRequest, TestNetPolicyReply, TestNetPolicyRequest, UpsertNetPolicyReply,
     UpsertNetPolicyRequest,
@@ -109,6 +107,11 @@ use crate::structs::{
     KeyringRewrapProgress, ResetKeyringReply, ResetKeyringRequest, RewrapKvReply, RewrapKvRequest,
     RewrapRootKeyReply, RewrapRootKeyRequest, RotateDataKeyReply, RotateDataKeyRequest,
 };
+use crate::structs::{
+    DeleteNetPluginReply, DeleteNetPluginRequest, GetNetPluginReply, GetNetPluginRequest,
+    GetNetPluginStatusReply, GetNetPluginStatusRequest, ListNetPluginsReply, ListNetPluginsRequest,
+    UpsertNetPluginReply, UpsertNetPluginRequest,
+};
 use crate::task_plugins::validate_job_config;
 use crate::tracing_util::{o11y_enabled, read_recent_observability};
 
@@ -121,9 +124,11 @@ use tonic::{Request, Response, Status, Streaming};
 mod checkpoint_support;
 mod fork_rpcs;
 mod make_room;
+mod material_rpcs;
 mod namespace_policy_rpcs;
 mod namespace_rpcs;
 mod node_content_rpcs;
+mod plugin_rpcs;
 mod session_rpcs;
 mod snapshot_rpcs;
 mod suspend_rpcs;
@@ -1876,7 +1881,7 @@ pub struct ManagerDaemonService {
     /// status checker's ladder through the liveness table.
     heartbeat: crate::structs::HeartbeatConfigFull,
     /// Merged network policies by content hash (docs/network-handlers.md),
-    /// filled by the heartbeat builder and served by `FetchNetPolicy`. In
+    /// filled by the heartbeat builder and served by `FetchDatapathMaterial`. In
     /// memory on purpose: the merge is deterministic, so any manager can
     /// recompute a body from the same inputs after a failover; this is only
     /// a shortcut for the common case. Bounded (`NET_POLICY_CACHE_MAX`).
@@ -1895,6 +1900,9 @@ pub struct ManagerDaemonService {
     /// is at most one heartbeat stale and a failover shows nothing until
     /// the next beat, never a wrong answer.
     net_status: Arc<Mutex<HashMap<String, Vec<crate::structs::NetAllocStatus>>>>,
+    /// Each node's last plugin report (docs/network-plugins.md), in memory
+    /// like `net_status`.
+    net_plugin_status: Arc<Mutex<HashMap<String, Vec<crate::structs::NetPluginNodeStatus>>>>,
     /// How often `StreamEvents` and exec sessions re-check their caller's
     /// credential (`acl::STREAM_REAUTH_INTERVAL`; tests shorten it).
     stream_reauth_interval: Duration,
@@ -1951,6 +1959,7 @@ impl ManagerDaemonService {
             net_policy_cache: Arc::new(Mutex::new(HashMap::new())),
             net_policy_generation: Arc::new(Mutex::new(None)),
             net_status: Arc::new(Mutex::new(HashMap::new())),
+            net_plugin_status: Arc::new(Mutex::new(HashMap::new())),
             net_edges: Arc::new(Mutex::new(HashMap::new())),
             stream_reauth_interval: acl::STREAM_REAUTH_INTERVAL,
             usage: Arc::new(Mutex::new(crate::manager::usage::UsageTable::default())),
@@ -2301,12 +2310,8 @@ impl ManagerDaemonService {
             Status::invalid_argument(format!("Error validating task configs: {e}"))
         })?;
         self.validate_identity_sub_templates(&config)?;
-        let ingress_chains: Vec<_> = config
-            .tasks
-            .iter()
-            .map(|task| task.network.as_ref().and_then(|n| n.ingress.as_ref()))
-            .collect();
-        enforce_kv_cert_read(identity, &ingress_chains)?;
+        enforce_kv_tls_read(identity, &config.tasks)?;
+        self.check_job_plugins(&config.tasks)?;
         enforce_kv_credential_read(
             identity,
             config.tasks.iter().filter_map(|task| task.connect.as_ref()),
@@ -2554,6 +2559,7 @@ impl ManagerDaemonService {
                 .chain(crate::task_plugins::resource_submit_warnings(&config))
                 .chain(crate::structs::suspend::sandbox_submit_warnings(&config))
                 .chain(self.gated_egress_submit_warnings(&config))
+                .chain(self.tcp_upstream_submit_warnings(&config))
                 .chain(crate::task_plugins::container_security_warnings(&config))
                 .collect(),
         })
@@ -2652,6 +2658,35 @@ impl ManagerDaemonService {
     /// matches the task counts as coverage. Its `nodePools` are ignored,
     /// because the pool is not known until placement, so a pool-scoped
     /// object silences the warning rather than raising a false one.
+    /// `tcp` upstreams under an HTTP egress chain that cannot decide them at
+    /// connect (see [`crate::structs::network::tcp_upstream_http_chain_warnings`]),
+    /// with every stored policy whose selector matches the task apart from
+    /// its pool, which is not known before placement.
+    fn tcp_upstream_submit_warnings(&self, config: &JobConfig) -> Vec<String> {
+        let policies = self.store.list_net_policies().unwrap_or_default();
+        crate::structs::network::tcp_upstream_http_chain_warnings(config, |task| {
+            let facts = crate::structs::netpolicy::NetSelectorFacts {
+                node_pool: None,
+                runtime: task.runtime.clone(),
+                job: config.name.clone(),
+                labels: task
+                    .network
+                    .as_ref()
+                    .map(|network| network.labels.clone())
+                    .unwrap_or_default(),
+            };
+            policies
+                .iter()
+                .filter(|record| {
+                    let mut selector = record.object.selector.clone();
+                    selector.node_pools.clear();
+                    selector.matches(&facts)
+                })
+                .map(|record| record.object.clone())
+                .collect()
+        })
+    }
+
     fn gated_egress_submit_warnings(&self, config: &JobConfig) -> Vec<String> {
         let policies = self.store.list_net_policies().unwrap_or_default();
         crate::structs::network::gated_egress_warnings(config, |task| {
@@ -5652,6 +5687,7 @@ impl Manager for ManagerDaemonService {
             warnings: self
                 .gated_egress_submit_warnings(&config)
                 .into_iter()
+                .chain(self.tcp_upstream_submit_warnings(&config))
                 .chain(crate::task_plugins::container_security_warnings(&config))
                 .collect(),
             gang_reports: gang_reports
@@ -8291,6 +8327,7 @@ impl Manager for ManagerDaemonService {
                 status.insert(id.clone(), req.net_status.clone());
             }
         }
+        self.record_net_plugin_status(&id, &req.net_plugins);
         // Measured usage, when this beat carries a report (every 10s from
         // workers with enforcement on). In memory only, never the store.
         {
@@ -10047,13 +10084,14 @@ impl Manager for ManagerDaemonService {
             .normalize_and_validate()
             .map_err(|e| Status::invalid_argument(e.to_string()))?;
         enforce_net_policy_scope(&identity, AclAction::Write, &object)?;
-        enforce_kv_cert_read(&identity, &[object.ingress.as_ref()])?;
+        self.check_policy_plugins(&object)?;
 
-        let affected = self.affected_allocations_for_policy(&object);
+        let (affected, warnings) = self.affected_allocations_for_policy(&object);
         if req.dry_run {
             return Ok(Response::new(UpsertNetPolicyReply {
                 policy: Some(net_policy_to_proto(&object, "", "")),
                 affected_allocations: affected,
+                warnings,
             }));
         }
         let record = self
@@ -10074,6 +10112,7 @@ impl Manager for ManagerDaemonService {
                 &record.updated_at,
             )),
             affected_allocations: affected,
+            warnings,
         }))
     }
 
@@ -10154,6 +10193,46 @@ impl Manager for ManagerDaemonService {
     }
 
     #[instrument(skip_all)]
+    async fn upsert_net_plugin(
+        &self,
+        request: Request<UpsertNetPluginRequest>,
+    ) -> Result<Response<UpsertNetPluginReply>, Status> {
+        self.upsert_net_plugin_rpc(request).await
+    }
+
+    #[instrument(skip_all)]
+    async fn get_net_plugin(
+        &self,
+        request: Request<GetNetPluginRequest>,
+    ) -> Result<Response<GetNetPluginReply>, Status> {
+        self.get_net_plugin_rpc(request).await
+    }
+
+    #[instrument(skip_all)]
+    async fn list_net_plugins(
+        &self,
+        request: Request<ListNetPluginsRequest>,
+    ) -> Result<Response<ListNetPluginsReply>, Status> {
+        self.list_net_plugins_rpc(request).await
+    }
+
+    #[instrument(skip_all)]
+    async fn delete_net_plugin(
+        &self,
+        request: Request<DeleteNetPluginRequest>,
+    ) -> Result<Response<DeleteNetPluginReply>, Status> {
+        self.delete_net_plugin_rpc(request).await
+    }
+
+    #[instrument(skip_all)]
+    async fn get_net_plugin_status(
+        &self,
+        request: Request<GetNetPluginStatusRequest>,
+    ) -> Result<Response<GetNetPluginStatusReply>, Status> {
+        self.get_net_plugin_status_rpc(request).await
+    }
+
+    #[instrument(skip_all)]
     async fn show_net_policy(
         &self,
         request: Request<ShowNetPolicyRequest>,
@@ -10169,7 +10248,8 @@ impl Manager for ManagerDaemonService {
         )?;
         let (task, facts) =
             self.net_policy_task_facts(&req.job_id, &req.task_name, &req.node_pool)?;
-        let (effective, matched) = self.effective_net_policy(&facts, task.network.as_ref());
+        let (effective, matched) =
+            self.effective_net_policy(&facts, task.network.as_ref(), task.service.as_ref());
         let declared_mode = task
             .network
             .as_ref()
@@ -10217,7 +10297,8 @@ impl Manager for ManagerDaemonService {
         )?;
         let (task, facts) =
             self.net_policy_task_facts(&req.job_id, &req.task_name, &req.node_pool)?;
-        let (effective, _) = self.effective_net_policy(&facts, task.network.as_ref());
+        let (effective, _) =
+            self.effective_net_policy(&facts, task.network.as_ref(), task.service.as_ref());
 
         let (direction, chain, target) = if !req.to.trim().is_empty() {
             (
@@ -10331,7 +10412,23 @@ impl Manager for ManagerDaemonService {
         };
         let identity_str = req.identity.trim();
         let identity_opt = (!identity_str.is_empty()).then_some(identity_str);
-        let verdict = if !req.method.trim().is_empty() || path.is_some() {
+        // A mesh service's `service.allow` runs before any rule, for a
+        // verified caller on the mesh port.
+        let callers_denial = chain
+            .callers
+            .as_ref()
+            .filter(|_| direction == "ingress" && identity_opt.is_some())
+            .filter(|_| !chain.callers_permit(identity_opt))
+            .map(|callers| Verdict::Deny {
+                source: callers.source.clone(),
+                reason: Some(format!(
+                    "caller {identity_str} is not in service.allow ({})",
+                    callers.allow.join(", ")
+                )),
+            });
+        let verdict = if let Some(denial) = callers_denial {
+            denial
+        } else if !req.method.trim().is_empty() || path.is_some() {
             if !chain.is_http() {
                 // A tcp chain never sees requests; report the connect verdict.
                 evaluate_connect(
@@ -10404,234 +10501,11 @@ impl Manager for ManagerDaemonService {
         }))
     }
 
-    #[instrument(skip_all)]
-    async fn fetch_net_policy(
+    async fn fetch_datapath_material(
         &self,
-        request: Request<FetchNetPolicyRequest>,
-    ) -> Result<Response<FetchNetPolicyReply>, Status> {
-        // ACL: worker-plane endpoint (nodes fetch the merged policy bodies the
-        // heartbeat reply named for allocations placed on them).
-        let identity = self.authenticate_acl(&request)?;
-        acl::enforce_worker_plane(&identity)?;
-        let req = request.into_inner();
-        acl::enforce_node_binding(&identity, &req.node_id)?;
-        if req.hash.trim().is_empty() {
-            return Err(Status::invalid_argument("hash is required"));
-        }
-        let cached = {
-            let cache = self
-                .net_policy_cache
-                .lock()
-                .unwrap_or_else(|p| p.into_inner());
-            cache.get(&req.hash).cloned()
-        };
-        let policy = match cached {
-            Some(policy) => policy,
-            None => {
-                // A failover or restart emptied the cache: recompute from the
-                // node's desired set, which is what produced the hash.
-                let desired = build_desired_allocations(&self.store, &req.node_id, &[])
-                    .map_err(|e| map_store_error("Error building desired allocations", e))?;
-                let _ = self.build_net_policies(&req.node_id, &desired);
-                let cache = self
-                    .net_policy_cache
-                    .lock()
-                    .unwrap_or_else(|p| p.into_inner());
-                cache.get(&req.hash).cloned().ok_or_else(|| {
-                    Status::not_found(format!("no policy body for hash {}", req.hash))
-                })?
-            }
-        };
-        Ok(Response::new(FetchNetPolicyReply {
-            effective_json: serde_json::to_string(&policy).unwrap_or_default(),
-        }))
-    }
-
-    #[instrument(skip_all, fields(node_id = %request.get_ref().node_id, allocations = request.get_ref().known.len()))]
-    async fn get_ingress_certificates(
-        &self,
-        request: Request<GetIngressCertificatesRequest>,
-    ) -> Result<Response<GetIngressCertificatesReply>, Status> {
-        // ACL: worker-plane endpoint (nodes fetch the KV certificates behind
-        // `certFrom = { kv }` ingress chains of allocations placed on them).
-        // The node never names a KV path: each one is derived below from the
-        // allocation's effective chain, which only a submitter holding
-        // `kv:read` on the path could have declared.
-        let identity = self.authenticate_acl(&request)?;
-        acl::enforce_worker_plane(&identity)?;
-        let req = request.into_inner();
-        acl::enforce_node_binding(&identity, &req.node_id)?;
-
-        let desired = build_desired_allocations(&self.store, &req.node_id, &[])
-            .map_err(|e| map_store_error("Error building desired allocations", e))?;
-        // The same merge the heartbeat ran; it leaves each body in the cache.
-        let hashes: HashMap<i64, String> = self
-            .build_net_policies(&req.node_id, &desired)
-            .into_iter()
-            .map(|assignment| (assignment.allocation_id, assignment.policy_hash))
-            .collect();
-
-        let certificates = req
-            .known
-            .iter()
-            .map(|known| {
-                let mut out = IngressCertificate {
-                    allocation_id: known.allocation_id,
-                    ..Default::default()
-                };
-                let policy = hashes.get(&known.allocation_id).and_then(|hash| {
-                    self.net_policy_cache
-                        .lock()
-                        .unwrap_or_else(|p| p.into_inner())
-                        .get(hash)
-                        .cloned()
-                });
-                let Some(path) = policy
-                    .as_ref()
-                    .and_then(|policy| policy.ingress.as_ref())
-                    .and_then(|chain| chain.tls.as_ref())
-                    .and_then(|tls| tls.cert_kv_path())
-                    .map(str::to_string)
-                else {
-                    out.error =
-                        "allocation is not placed on this node or has no certFrom = { kv } chain"
-                            .into();
-                    return out;
-                };
-                out.kv_path = path.clone();
-                match self.store.get_kv(&path) {
-                    Ok(Some(entry)) => {
-                        out.version = entry.version;
-                        if entry.version == known.version {
-                            out.unchanged = true;
-                        } else if let Err(err) =
-                            crate::worker::netd::tls::validate_bundle(&entry.value)
-                        {
-                            out.error = format!("kv {path} {err:#}");
-                        } else {
-                            out.bundle_pem = entry.value;
-                        }
-                    }
-                    Ok(None) => out.error = format!("kv {path} not found"),
-                    Err(err) => {
-                        warn!(kv_path = %path, error = ?err, "Failed reading ingress certificate");
-                        out.error = format!("kv {path} could not be read");
-                    }
-                }
-                out
-            })
-            .collect();
-        Ok(Response::new(GetIngressCertificatesReply { certificates }))
-    }
-
-    #[instrument(skip_all, fields(node_id = %request.get_ref().node_id, credentials = request.get_ref().known.len()))]
-    async fn get_upstream_credentials(
-        &self,
-        request: Request<GetUpstreamCredentialsRequest>,
-    ) -> Result<Response<GetUpstreamCredentialsReply>, Status> {
-        // ACL: worker-plane endpoint (nodes fetch the KV secrets behind
-        // `connect.upstreams[].credentials` of allocations placed on them).
-        // The node never names a KV path: each one is derived below from the
-        // allocation's own connect declaration, which only a submitter
-        // holding `kv:read` on the path could have written.
-        let identity = self.authenticate_acl(&request)?;
-        acl::enforce_worker_plane(&identity)?;
-        let req = request.into_inner();
-        acl::enforce_node_binding(&identity, &req.node_id)?;
-
-        let desired = build_desired_allocations(&self.store, &req.node_id, &[])
-            .map_err(|e| map_store_error("Error building desired allocations", e))?;
-        let declared: HashMap<i64, crate::structs::ConnectConfig> = desired
-            .iter()
-            .filter(|allocation| !allocation.task_connect.trim().is_empty())
-            .filter_map(|allocation| {
-                serde_json::from_str(&allocation.task_connect)
-                    .ok()
-                    .map(|connect| (allocation.allocation_id, connect))
-            })
-            .collect();
-
-        let credentials = req
-            .known
-            .iter()
-            .map(|known| {
-                let header = known.header.trim().to_ascii_lowercase();
-                let mut out = UpstreamCredentialValue {
-                    allocation_id: known.allocation_id,
-                    upstream: known.upstream.clone(),
-                    header: known.header.clone(),
-                    ..Default::default()
-                };
-                let credential = declared
-                    .get(&known.allocation_id)
-                    .and_then(|connect| {
-                        connect
-                            .upstreams
-                            .iter()
-                            .find(|upstream| upstream.key() == known.upstream)
-                    })
-                    .and_then(|upstream| {
-                        upstream
-                            .credentials
-                            .iter()
-                            .find(|credential| credential.header.eq_ignore_ascii_case(&header))
-                    });
-                let Some(credential) = credential else {
-                    out.error = format!(
-                        "allocation is not placed on this node or upstream {} declares no \
-                         credential for header {header}",
-                        known.upstream
-                    );
-                    out.absent = true;
-                    return out;
-                };
-                out.source = credential.source();
-                if let Some(name) = credential.identity_name() {
-                    self.upstream_identity_token(known, name, &mut out);
-                    return out;
-                }
-                let Some(path) = credential.kv_path().map(str::to_string) else {
-                    out.error = format!(
-                        "upstream {} credential {header} names no provider",
-                        known.upstream
-                    );
-                    out.absent = true;
-                    return out;
-                };
-                match self.store.get_kv(&path) {
-                    Ok(Some(entry)) => {
-                        out.version = entry.version;
-                        if entry.version == known.version {
-                            out.unchanged = true;
-                        } else {
-                            // One trailing line ending (a value put from a
-                            // file) is not part of the secret.
-                            let value = entry.value.trim_end_matches(['\r', '\n']);
-                            if value.contains(['\r', '\n', '\0']) || value.is_empty() {
-                                // A header value cannot carry these; sending
-                                // it would split the request.
-                                out.error = format!(
-                                    "kv {path} is empty or holds a line break or NUL, which \
-                                     an HTTP header cannot carry"
-                                );
-                            } else {
-                                out.value = value.to_string();
-                            }
-                        }
-                    }
-                    Ok(None) => {
-                        out.error = format!("kv {path} not found");
-                        out.absent = true;
-                    }
-                    Err(err) => {
-                        warn!(kv_path = %path, error = ?err, "Failed reading upstream credential");
-                        out.error = format!("kv {path} could not be read");
-                    }
-                }
-                out
-            })
-            .collect();
-        Ok(Response::new(GetUpstreamCredentialsReply { credentials }))
+        request: Request<FetchDatapathMaterialRequest>,
+    ) -> Result<Response<FetchDatapathMaterialReply>, Status> {
+        self.fetch_datapath_material_rpc(request).await
     }
 
     #[instrument(skip_all)]
@@ -10711,12 +10585,10 @@ impl Manager for ManagerDaemonService {
         let mut targets: HashMap<(String, String), String> = HashMap::new();
         for consumer in consumers {
             for upstream in &consumer.upstreams {
-                let service = upstream.key().to_string();
-                let target = if upstream.is_external() {
-                    service.clone()
-                } else {
-                    upstream.service_ref(&consumer.job_id)
-                };
+                let service = upstream.key();
+                let target = upstream
+                    .service_ref(&consumer.job_id)
+                    .unwrap_or_else(|| service.clone());
                 targets.insert((consumer.job_id.clone(), service.clone()), target);
                 // Tagged observed edges for the same (caller, service) are
                 // declared too.
@@ -13365,6 +13237,17 @@ fn derive_node_health(value: &Value) -> Option<bool> {
     }
 }
 
+/// The workload identity subject of a desired allocation, as the endpoint
+/// feed matches `service.allow` against it.
+fn allocation_subject(allocation: &crate::structs::TaskAllocation) -> String {
+    let group = if allocation.task_group.is_empty() {
+        crate::structs::default_task_group()
+    } else {
+        allocation.task_group.clone()
+    };
+    crate::structs::workload_subject(&allocation.job_id, &group, &allocation.task_name)
+}
+
 fn build_desired_allocations(
     store: &Store,
     node_id: &str,
@@ -13479,116 +13362,6 @@ pub(crate) fn desired_payload(
 /// after each stateful task's fence window, its running allocations) down with
 /// it.
 impl ManagerDaemonService {
-    /// The token behind a `from = { identity = "<name>" }` upstream
-    /// credential (docs/network-handlers.md, "Credential injection"): the
-    /// task's identity of that name, minted for the allocation exactly as
-    /// `IssueWorkloadIdentityToken` would. The token the node already holds
-    /// (`known.version` is its expiry) stays until less than half the
-    /// identity's TTL remains, so a steady node mints about twice per TTL.
-    /// The caller has already checked the allocation is on the calling node.
-    fn upstream_identity_token(
-        &self,
-        known: &crate::structs::UpstreamCredentialKnown,
-        identity_name: &str,
-        out: &mut UpstreamCredentialValue,
-    ) {
-        let Some(state) = self.workload_identity.as_ref() else {
-            out.error = "workload identity is not enabled on this manager (set \
-                         workloadIdentity.enabled: true in the manager config)"
-                .to_string();
-            return;
-        };
-        let allocation = match self.store.get_allocation_by_id(known.allocation_id) {
-            Ok(Some(allocation)) => allocation,
-            Ok(None) => {
-                out.error = format!("allocation {} not found", known.allocation_id);
-                out.absent = true;
-                return;
-            }
-            Err(err) => {
-                warn!(allocation_id = known.allocation_id, error = ?err, "Failed loading allocation for an upstream identity");
-                out.error = "allocation could not be loaded".to_string();
-                return;
-            }
-        };
-        let task = match self
-            .store
-            .get_task_configs_for_job_config(&allocation.job_config_id)
-        {
-            Ok(tasks) => tasks
-                .into_iter()
-                .find(|(id, _)| *id == allocation.task_config_id)
-                .map(|(_, task)| task),
-            Err(err) => {
-                warn!(allocation_id = known.allocation_id, error = ?err, "Failed loading task config for an upstream identity");
-                None
-            }
-        };
-        let Some(task) = task else {
-            out.error = "task config could not be loaded".to_string();
-            return;
-        };
-        let Some(identity) = task
-            .identities
-            .iter()
-            .find(|identity| identity.name == identity_name)
-        else {
-            out.error = format!(
-                "task {} declares no identity named {identity_name:?}",
-                task.name
-            );
-            out.absent = true;
-            return;
-        };
-
-        let now = std::time::SystemTime::now();
-        let now_secs = now
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|elapsed| elapsed.as_secs() as i64)
-            .unwrap_or_default();
-        let half_life = (state.token_lifetime(identity).as_secs() / 2) as i64;
-        if known.version > 0 && known.version - now_secs > half_life {
-            out.version = known.version;
-            out.unchanged = true;
-            return;
-        }
-
-        let claims =
-            match claims_for_allocation(&self.store, &allocation, &task, DEF_CLUSTER_REGION) {
-                Ok(claims) => claims,
-                Err(err) => {
-                    error!(error = ?err, "Error deriving workload identity claims for an upstream");
-                    out.error = "failed to derive workload identity claims".to_string();
-                    return;
-                }
-            };
-        match state.issue(&claims, identity, now) {
-            Ok(issued) => {
-                // Lifecycle log only, never the token.
-                info!(
-                    allocation_id = known.allocation_id,
-                    upstream = %known.upstream,
-                    identity = %identity_name,
-                    expires_at = issued.expires_at,
-                    kid = %issued.kid,
-                    "Issued workload identity token for upstream injection"
-                );
-                out.version = issued.expires_at as i64;
-                out.value = issued.token;
-            }
-            Err(err)
-                if crate::manager::workload_identity::SigningKeyUnavailable::in_chain(&err) =>
-            {
-                debug!(error = %err, "No signing key yet for an upstream's workload identity token");
-                out.error = err.to_string();
-            }
-            Err(err) => {
-                error!(error = ?err, "Error signing workload identity token for an upstream");
-                out.error = "failed to sign workload identity token".to_string();
-            }
-        }
-    }
-
     /// Effective network policy for every desired allocation, as content
     /// hashes. Zero store access when the cluster has no policy (cached
     /// generation) and no task on this node declares one.
@@ -13662,7 +13435,12 @@ impl ManagerDaemonService {
                     .map(|n| n.labels.clone())
                     .unwrap_or_default(),
             };
-            let (effective, _) = merge_net_policies(&stored, &facts, network.as_ref());
+            let service: Option<crate::structs::ServiceConfig> =
+                (!allocation.task_service.trim().is_empty())
+                    .then(|| serde_json::from_str(&allocation.task_service).ok())
+                    .flatten();
+            let (effective, _) =
+                merge_net_policies(&stored, &facts, network.as_ref(), service.as_ref());
             // A gated allocation is told about an *empty* policy too, so the
             // node can tell "known: nothing covers it" (`gated-default`) from
             // "pending" (`policy-pending`). Gated by its declaration, by a
@@ -13692,13 +13470,14 @@ impl ManagerDaemonService {
         &self,
         facts: &crate::structs::netpolicy::NetSelectorFacts,
         network: Option<&crate::structs::NetworkConfig>,
+        service: Option<&crate::structs::ServiceConfig>,
     ) -> (crate::structs::netpolicy::EffectivePolicy, Vec<String>) {
         let stored: Vec<crate::structs::netpolicy::NetPolicyObject> = self
             .store
             .list_net_policies()
             .map(|records| records.into_iter().map(|record| record.object).collect())
             .unwrap_or_default();
-        merge_net_policies(&stored, facts, network)
+        merge_net_policies(&stored, facts, network, service)
     }
 
     /// Resolve (job, task) to the task config and its selector facts.
@@ -13772,7 +13551,6 @@ impl ManagerDaemonService {
         desired: &[crate::structs::TaskAllocation],
         policies: &[crate::structs::AllocNetPolicy],
     ) -> Vec<crate::structs::UpstreamEndpoints> {
-        use crate::structs::netpolicy::HANDLER_PROXY;
         let mut wanted: Vec<(i64, String, String)> = Vec::new();
         let by_alloc: HashMap<i64, &str> = policies
             .iter()
@@ -13794,12 +13572,8 @@ impl ManagerDaemonService {
                         .flatten()
                     {
                         for hop in &chain.handlers {
-                            if hop.handler.handler == HANDLER_PROXY {
-                                if let Some(service) =
-                                    hop.handler.service.as_ref().or(hop.handler.node.as_ref())
-                                {
-                                    services.push(service.clone());
-                                }
+                            if let Some(service) = hop.handler.kind.endpoint_need() {
+                                services.push(service.to_string());
                             }
                         }
                     }
@@ -13811,10 +13585,8 @@ impl ManagerDaemonService {
                 {
                     for upstream in &connect.upstreams {
                         for hop in &upstream.handlers {
-                            if hop.handler == HANDLER_PROXY {
-                                if let Some(service) = hop.service.as_ref().or(hop.node.as_ref()) {
-                                    services.push(service.clone());
-                                }
+                            if let Some(service) = hop.kind.endpoint_need() {
+                                services.push(service.to_string());
                             }
                         }
                     }
@@ -13822,8 +13594,9 @@ impl ManagerDaemonService {
             }
             services.sort();
             services.dedup();
+            let caller = allocation_subject(allocation);
             for service in services {
-                wanted.push((allocation.allocation_id, service, allocation.job_id.clone()));
+                wanted.push((allocation.allocation_id, service, caller.clone()));
             }
         }
         if wanted.is_empty() {
@@ -13997,16 +13770,30 @@ impl ManagerDaemonService {
     /// Running allocations whose effective policy would change if `object`
     /// were applied, as `job/task@allocation`. Best effort; used by dry runs
     /// and the applied event.
+    /// The running allocations `object` would apply to, and the advisory
+    /// lines about them (`UpsertNetPolicyReply.warnings`), one per task.
     fn affected_allocations_for_policy(
         &self,
         object: &crate::structs::netpolicy::NetPolicyObject,
-    ) -> Vec<String> {
+    ) -> (Vec<String>, Vec<String>) {
         use crate::structs::netpolicy::NetSelectorFacts;
         let Ok(allocations) = self.store.get_allocs() else {
-            return Vec::new();
+            return (Vec::new(), Vec::new());
         };
+        // The stored set as it would be with `object` written.
+        let mut stored: Vec<crate::structs::netpolicy::NetPolicyObject> = self
+            .store
+            .list_net_policies()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|record| record.object)
+            .filter(|existing| existing.name != object.name)
+            .collect();
+        stored.push(object.clone());
         let mut nodes: HashMap<String, Option<String>> = HashMap::new();
         let mut configs: HashMap<i64, crate::structs::TaskConfig> = HashMap::new();
+        let mut warned: HashSet<i64> = HashSet::new();
+        let mut warnings = Vec::new();
         let mut out = Vec::new();
         for allocation in allocations {
             let pool = nodes
@@ -14043,9 +13830,21 @@ impl ManagerDaemonService {
                     "{}/{}@{}",
                     allocation.job_id, task.name, allocation.id
                 ));
+                if warned.insert(allocation.task_config_id) {
+                    let matching: Vec<_> = stored
+                        .iter()
+                        .filter(|policy| policy.selector.matches(&facts))
+                        .cloned()
+                        .collect();
+                    warnings.extend(
+                        crate::structs::network::task_tcp_upstream_warnings(&task, &matching)
+                            .into_iter()
+                            .map(|line| format!("job {:?} {line}", allocation.job_id)),
+                    );
+                }
             }
         }
-        out
+        (out, warnings)
     }
 }
 
@@ -14054,6 +13853,7 @@ fn merge_net_policies(
     stored: &[crate::structs::netpolicy::NetPolicyObject],
     facts: &crate::structs::netpolicy::NetSelectorFacts,
     network: Option<&crate::structs::NetworkConfig>,
+    service: Option<&crate::structs::ServiceConfig>,
 ) -> (crate::structs::netpolicy::EffectivePolicy, Vec<String>) {
     use crate::structs::netpolicy::{merge_policies, InlinePolicy};
     let matching: Vec<crate::structs::netpolicy::NetPolicyObject> = stored
@@ -14065,6 +13865,9 @@ fn merge_net_policies(
         mode: network.map(|n| n.mode.as_str()).filter(|m| *m != "auto"),
         egress: network.and_then(|n| n.egress.as_ref()),
         ingress: network.and_then(|n| n.ingress.as_ref()),
+        mesh: service.and_then(|s| s.mesh),
+        callers: service.map(|s| s.allow.as_slice()).unwrap_or_default(),
+        owner: &facts.job,
     };
     let effective = merge_policies(&matching, inline);
     let matched = effective
@@ -14078,16 +13881,41 @@ fn merge_net_policies(
 /// Per-pool scope enforcement for a policy object: a caller must hold the
 /// action on every pool the selector names (or on any pool when it names
 /// none, i.e. a cluster-wide policy).
-/// `certFrom = { kv }` hands a KV value to the datapath, so naming one needs
-/// the same right as reading it: `kv:read` on the path. Without this, job
-/// submit (or policy write) access would be a way to read any private key in
-/// KV. Applied to RunJob, template runs, and UpsertNetPolicy.
-fn enforce_kv_cert_read(
+/// A KV-held certificate or CA (`network.ports[].tls.cert`,
+/// `tls.clients.ca`, `connect.upstreams[].ca`) hands a KV value to the
+/// datapath, so naming one needs the same right as reading it: `kv:read` on
+/// the path. Without this, job submit access would be a way to read any
+/// private key in KV. Applied to RunJob and template runs.
+fn enforce_kv_tls_read(
     identity: &crate::structs::AclIdentity,
-    chains: &[Option<&crate::structs::netpolicy::ChainConfig>],
+    tasks: &[TaskConfig],
 ) -> Result<(), Status> {
-    for chain in chains.iter().flatten() {
-        if let Some(path) = chain.tls.as_ref().and_then(|tls| tls.cert_kv_path()) {
+    for task in tasks {
+        let ports = task.network.iter().flat_map(|network| {
+            network.ports.iter().filter_map(|port| {
+                let tls = port.tls.as_ref()?;
+                Some((port.name.as_str(), tls))
+            })
+        });
+        let mut named: Vec<(String, &crate::structs::source::Source)> = Vec::new();
+        for (label, tls) in ports {
+            named.push((format!("network.ports[{label}].tls.cert"), &tls.cert));
+            if let Some(clients) = &tls.clients {
+                named.push((
+                    format!("network.ports[{label}].tls.clients.ca"),
+                    &clients.ca,
+                ));
+            }
+        }
+        for upstream in task.connect.iter().flat_map(|connect| &connect.upstreams) {
+            if let Some(ca) = &upstream.ca {
+                named.push((format!("connect.upstreams[{}].ca", upstream.key()), ca));
+            }
+        }
+        for (field, source) in named {
+            let Some(path) = source.kv_path() else {
+                continue;
+            };
             acl::enforce(
                 identity,
                 AclResource::Kv,
@@ -14098,9 +13926,9 @@ fn enforce_kv_cert_read(
                 Status::new(
                     status.code(),
                     format!(
-                        "{} (ingress tls.certFrom names kv {path}; the submitter needs kv \
-                             read on it)",
-                        status.message()
+                        "{} (task {} {field} names kv {path}; the submitter needs kv read on it)",
+                        status.message(),
+                        task.name
                     ),
                 )
             })?;
@@ -14284,6 +14112,16 @@ fn net_status_json(node_id: &str, status: &crate::structs::NetAllocStatus) -> Va
         "meshIdentity": status.mesh_identity,
         "guestAddress": status.guest_address,
         "guestBridge": status.guest_bridge,
+        "kernel": status.kernel.as_ref().map(|k| json!({
+            "attached": k.attached,
+            "enforced": k.enforced,
+            "capture": k.capture,
+            "rules": k.rules,
+            "reason": k.reason,
+            "passed": k.passed,
+            "redirected": k.redirected,
+            "denied": k.denied,
+        })),
     })
 }
 
@@ -14437,15 +14275,13 @@ fn build_upstream_endpoints(
                 }
             };
         for upstream in &connect.upstreams {
-            // External upstreams dial a fixed destination; the worker reads it
-            // off `AllocUpstream.to` and needs no endpoint feed.
-            if upstream.is_external() {
-                continue;
-            }
             // The service lives in the consumer's own namespace unless the
             // upstream names another (docs/namespaces.md): a bare name never
-            // resolves across a namespace boundary.
-            let target = upstream.service_ref(&allocation.job_id);
+            // resolves across a namespace boundary. External upstreams dial a
+            // fixed destination and need no endpoint feed.
+            let Some(target) = upstream.service_ref(&allocation.job_id) else {
+                continue;
+            };
             let key = (target.clone(), allocation.job_id.clone());
             if !resolved.contains_key(&key) {
                 let rows = match store.service_endpoints(Some(&target)) {
@@ -14457,7 +14293,7 @@ fn build_upstream_endpoints(
                         // stall this node's reconciliation entirely.
                         warn!(
                             allocation_id = allocation.allocation_id,
-                            service = %upstream.service,
+                            service = %target,
                             error = ?err,
                             "Skipping upstream endpoints; service lookup failed"
                         );
@@ -14498,7 +14334,7 @@ fn build_upstream_endpoints(
             let endpoints = resolved.get(&key).cloned().unwrap_or_default();
             debug!(
                 allocation_id = allocation.allocation_id,
-                service = %upstream.service,
+                service = %target,
                 endpoints = endpoints.len(),
                 "Resolved upstream endpoints"
             );
@@ -14506,7 +14342,7 @@ fn build_upstream_endpoints(
             // or `service.namespace` for a crossing), not the catalog name.
             upstreams.push(crate::structs::UpstreamEndpoints {
                 allocation_id: allocation.allocation_id,
-                service: upstream.key().into_owned(),
+                service: upstream.key(),
                 endpoints,
                 for_handler: false,
             });
@@ -14732,7 +14568,7 @@ mod tests {
     use crate::structs::worker_server::Worker;
     use crate::structs::{
         AllocationHealth, Eval, GetAllocationLogsRequest, JobConfig, ListRolloutEventsRequest,
-        NodeMsg, PostWorkReply, PostWorkRequest, PutKvRequest, RestartWorkerReply,
+        MaterialRef, NodeMsg, PostWorkReply, PostWorkRequest, PutKvRequest, RestartWorkerReply,
         RestartWorkerRequest, RunJobRequest, Submission, TaskConfig, UpdateNodeDynamicRequest,
     };
     use futures::StreamExt;
@@ -15281,6 +15117,59 @@ mod tests {
         assert_eq!(test("agents").await?.verdict, "allow");
         store.set_sandbox_gated_default(true);
         assert_eq!(test("agents").await?.source, "gated-default");
+        Ok(())
+    }
+
+    /// On a mesh service, `net policy test --identity` answers for
+    /// `service.allow` first: a caller outside it is denied by
+    /// `service/allow`, one inside it reaches the chain's rules.
+    #[tokio::test]
+    async fn net_policy_test_answers_for_service_allow_on_the_mesh() -> R<()> {
+        let store = setup_store()?;
+        let task: TaskConfig = serde_json::from_value(json!({
+            "name": "api",
+            "runtime": "container",
+            "config": { "image": "alpine", "command": ["sleep", "1"] },
+            "network": { "mode": "host", "ports": [{ "name": "http" }] },
+            "service": { "port": "http", "mesh": true, "allow": ["web", "ops-*/tools"] },
+        }))?;
+        store.handle_job_submit(
+            &JobConfig {
+                priority: Default::default(),
+                name: "api".into(),
+                tasks: vec![task],
+                rollout: None,
+                rollout_by_group: Default::default(),
+                version: None,
+            },
+            &[submission()],
+        )?;
+        let manager = ManagerDaemonService::new(store.clone());
+        let test = |identity: &'static str| {
+            let manager = &manager;
+            async move {
+                manager
+                    .test_net_policy(Request::new(TestNetPolicyRequest {
+                        job_id: "api".into(),
+                        from: "10.0.0.9".into(),
+                        identity: identity.into(),
+                        ..Default::default()
+                    }))
+                    .await
+                    .map(|reply| reply.into_inner())
+            }
+        };
+        let denied = test("global:batch:jobs:worker").await?;
+        assert_eq!(denied.verdict, "deny");
+        assert_eq!(denied.source, "service/allow");
+        assert!(
+            denied.reason.contains("not in service.allow"),
+            "{}",
+            denied.reason
+        );
+        assert_eq!(test("global:web:web:web").await?.verdict, "allow");
+        assert_eq!(test("global:ops-1/tools:g:shell").await?.verdict, "allow");
+        assert_eq!(test("global:ops-1/web:g:t").await?.verdict, "deny");
         Ok(())
     }
 
@@ -17246,11 +17135,118 @@ mod tests {
         Ok(())
     }
 
-    /// The node names allocations, never paths: the manager derives the KV
-    /// path from the allocation's chain, sends the bundle once per version,
-    /// and reports per-allocation problems without failing the call.
+    /// `service.mesh = true` is resolved at placement: the service's port
+    /// gets a datapath listener (a private twin for the task) and the mesh
+    /// flag, and the catalog marks the endpoint mesh, so consumers originate
+    /// mesh TLS. A `default` policy turns it on for a task that says
+    /// nothing; a task's own `mesh = false` beats a `default`.
     #[tokio::test]
-    async fn get_ingress_certificates_derives_the_path_and_skips_unchanged_test() -> R<()> {
+    async fn service_mesh_is_resolved_at_placement_test() -> R<()> {
+        let store = setup_store()?;
+        let manager = ManagerDaemonService::new(store.clone());
+        insert_node(&store, "node-1")?;
+        let place = |job: &'static str, mesh: Option<bool>| {
+            let manager = &manager;
+            let store = &store;
+            async move {
+                let mut service = json!({ "port": "http" });
+                if let Some(mesh) = mesh {
+                    service["mesh"] = json!(mesh);
+                }
+                run_jobspec(
+                    manager,
+                    json!({
+                        "name": job,
+                        "task": {
+                            "runtime": "exec",
+                            "config": { "command": ["sleep", "30"] },
+                            "network": { "mode": "host", "ports": [{ "name": "http" }] },
+                            "service": service,
+                        },
+                    }),
+                )
+                .await?;
+                let job_config_id = store.get_job_config(job)?.id();
+                let (task_id, _) = store
+                    .get_task_configs_for_job_config(&job_config_id)?
+                    .into_iter()
+                    .next()
+                    .context("task config")?;
+                let alloc = store.place_alloc("node-1", task_id)?;
+                let network = alloc.network.context("allocation network")?;
+                let port = network.port("http").context("http port")?.clone();
+                let endpoint_mesh = store
+                    .service_endpoints(None)?
+                    .into_iter()
+                    .find(|row| row.allocation_id == alloc.id)
+                    .map(|row| row.mesh_tls);
+                Ok::<_, anyhow::Error>((port, endpoint_mesh))
+            }
+        };
+
+        let (port, endpoint_mesh) = place("api", Some(true)).await?;
+        assert!(port.mesh, "{port:?}");
+        assert_eq!(
+            endpoint_mesh,
+            Some(true),
+            "the catalog marks the endpoint mesh"
+        );
+        assert!(
+            port.private_port.is_some(),
+            "the datapath owns the port: {port:?}"
+        );
+
+        let (port, _) = place("plain", None).await?;
+        assert!(!port.mesh && port.private_port.is_none(), "{port:?}");
+
+        store.upsert_net_policy(serde_json::from_value(json!({
+            "name": "mesh-everything",
+            "enforcement": "default",
+            "mesh": true,
+        }))?)?;
+        let (port, _) = place("defaulted", None).await?;
+        assert!(port.mesh, "a default policy turns it on: {port:?}");
+        let (port, _) = place("opted-out", Some(false)).await?;
+        assert!(!port.mesh, "the task's own false beats a default: {port:?}");
+        Ok(())
+    }
+
+    /// One `FetchDatapathMaterial` call from node-1.
+    async fn fetch_material(
+        manager: &ManagerDaemonService,
+        refs: Vec<MaterialRef>,
+    ) -> R<Vec<crate::structs::Material>> {
+        Ok(manager
+            .fetch_datapath_material(Request::new(FetchDatapathMaterialRequest {
+                node_id: "node-1".into(),
+                refs,
+            }))
+            .await?
+            .into_inner()
+            .materials)
+    }
+
+    fn credential_ref(
+        allocation_id: i64,
+        upstream: &str,
+        header: &str,
+        version: i64,
+    ) -> MaterialRef {
+        MaterialRef {
+            kind: "credential".into(),
+            allocation_id,
+            key: upstream.into(),
+            part: header.into(),
+            version,
+        }
+    }
+
+    /// The node names (allocation, port), never paths: the manager derives
+    /// the KV path from the allocation's own port declaration, sends the
+    /// bundle once per version, and reports per-port problems without
+    /// failing the call. A client CA on the same port is its own ref.
+    #[tokio::test]
+    async fn material_port_cert_derives_the_path_and_skips_unchanged_test() -> R<()> {
         use crate::manager::mesh_ca::{generate_ca, issue_node_cert};
         let store = setup_store()?;
         let manager = ManagerDaemonService::new(store.clone());
@@ -17266,8 +17262,10 @@ mod tests {
                     "runtime": "exec",
                     "config": { "command": ["sleep", "30"] },
                     "network": {
-                        "ports": [{ "name": "https", "static": 8443 }],
-                        "ingress": { "tls": { "mode": "server", "certFrom": { "kv": "certs/edge" } } },
+                        "ports": [{ "name": "https", "static": 8443, "tls": {
+                            "cert": { "kv": "certs/edge" },
+                            "clients": { "ca": { "kv": "certs/edge-ca" } },
+                        } }],
                     },
                 },
             }),
@@ -17282,30 +17280,51 @@ mod tests {
             .context("task config")?;
         let alloc = store.place_alloc("node-1", task_id)?;
 
+        put_kv_entry(&manager, "certs/edge-ca", &ca_pem).await?;
         let fetch = |known: Vec<(i64, i64)>| {
             let manager = &manager;
             async move {
-                manager
-                    .get_ingress_certificates(Request::new(GetIngressCertificatesRequest {
-                        node_id: "node-1".into(),
-                        known: known
-                            .into_iter()
-                            .map(|(allocation_id, version)| {
-                                crate::structs::IngressCertificateKnown {
-                                    allocation_id,
-                                    version,
-                                }
-                            })
-                            .collect(),
-                    }))
-                    .await
-                    .map(|reply| reply.into_inner().certificates)
+                fetch_material(
+                    manager,
+                    known
+                        .into_iter()
+                        .map(|(allocation_id, version)| MaterialRef {
+                            kind: "port_cert".into(),
+                            allocation_id,
+                            key: "https".into(),
+                            version,
+                            ..Default::default()
+                        })
+                        .collect(),
+                )
+                .await
             }
         };
+        let ca = fetch_material(
+            &manager,
+            vec![
+                MaterialRef {
+                    kind: "client_ca".into(),
+                    allocation_id: alloc.id,
+                    key: "https".into(),
+                    ..Default::default()
+                },
+                MaterialRef {
+                    kind: "client_ca".into(),
+                    allocation_id: alloc.id,
+                    key: "other".into(),
+                    ..Default::default()
+                },
+            ],
+        )
+        .await?;
+        assert_eq!(ca[0].source, "kv certs/edge-ca");
+        assert_eq!(ca[0].value, ca_pem);
+        assert!(ca[1].absent, "{:?}", ca[1]);
 
         let first = fetch(vec![(alloc.id, 0), (alloc.id + 999, 0)]).await?;
-        assert_eq!(first[0].kv_path, "certs/edge");
-        assert_eq!(first[0].bundle_pem, bundle);
+        assert_eq!(first[0].source, "kv certs/edge");
+        assert_eq!(first[0].value, bundle);
         assert!(first[0].error.is_empty(), "{}", first[0].error);
         assert!(
             first[1].error.contains("not placed on this node"),
@@ -17316,14 +17335,14 @@ mod tests {
         let again = fetch(vec![(alloc.id, first[0].version)]).await?;
         assert!(again[0].unchanged);
         assert!(
-            again[0].bundle_pem.is_empty(),
+            again[0].value.is_empty(),
             "no material for an unchanged version"
         );
 
         // A bad put is reported against the allocation, not sent.
         put_kv_entry(&manager, "certs/edge", &cert).await?;
         let bad = fetch(vec![(alloc.id, first[0].version)]).await?;
-        assert!(bad[0].bundle_pem.is_empty());
+        assert!(bad[0].value.is_empty());
         assert!(bad[0].error.contains("no private key"), "{}", bad[0].error);
         Ok(())
     }
@@ -17333,7 +17352,7 @@ mod tests {
     /// declaration, sends the value once per version, and marks a deleted
     /// key or an undeclared header `absent` so the node drops what it holds.
     #[tokio::test]
-    async fn get_upstream_credentials_derives_the_path_and_skips_unchanged_test() -> R<()> {
+    async fn material_credential_derives_the_path_and_skips_unchanged_test() -> R<()> {
         let store = setup_store()?;
         let manager = ManagerDaemonService::new(store.clone());
         put_kv_entry(&manager, "secrets/openai", "sk-live-1\n").await?;
@@ -17371,23 +17390,16 @@ mod tests {
         let fetch = |known: Vec<(i64, &'static str, &'static str, i64)>| {
             let manager = &manager;
             async move {
-                manager
-                    .get_upstream_credentials(Request::new(GetUpstreamCredentialsRequest {
-                        node_id: "node-1".into(),
-                        known: known
-                            .into_iter()
-                            .map(|(allocation_id, upstream, header, version)| {
-                                crate::structs::UpstreamCredentialKnown {
-                                    allocation_id,
-                                    upstream: upstream.into(),
-                                    header: header.into(),
-                                    version,
-                                }
-                            })
-                            .collect(),
-                    }))
-                    .await
-                    .map(|reply| reply.into_inner().credentials)
+                fetch_material(
+                    manager,
+                    known
+                        .into_iter()
+                        .map(|(allocation_id, upstream, header, version)| {
+                            credential_ref(allocation_id, upstream, header, version)
+                        })
+                        .collect(),
+                )
+                .await
             }
         };
 
@@ -17460,7 +17472,7 @@ mod tests {
     /// allocation, the node keeps it while more than half its TTL is left,
     /// and an identity the task does not declare is absent.
     #[tokio::test]
-    async fn get_upstream_credentials_mints_an_identity_token_test() -> R<()> {
+    async fn material_credential_mints_an_identity_token_test() -> R<()> {
         use crate::structs::workload_identity::WorkloadIdentity;
         let store = setup_store()?;
         let wi = wi_state(&store)?;
@@ -17492,18 +17504,12 @@ mod tests {
         let fetch = |version: i64| {
             let manager = &manager;
             async move {
-                manager
-                    .get_upstream_credentials(Request::new(GetUpstreamCredentialsRequest {
-                        node_id: "node-1".into(),
-                        known: vec![crate::structs::UpstreamCredentialKnown {
-                            allocation_id: alloc.id,
-                            upstream: "api".into(),
-                            header: "authorization".into(),
-                            version,
-                        }],
-                    }))
-                    .await
-                    .map(|reply| reply.into_inner().credentials.remove(0))
+                fetch_material(
+                    manager,
+                    vec![credential_ref(alloc.id, "api", "authorization", version)],
+                )
+                .await
+                .map(|mut materials| materials.remove(0))
             }
         };
 
@@ -17536,20 +17542,12 @@ mod tests {
         // Workload identity off on the manager: an error the node reports,
         // not an authoritative absence.
         let disabled = ManagerDaemonService::new(store.clone());
-        let off = disabled
-            .get_upstream_credentials(Request::new(GetUpstreamCredentialsRequest {
-                node_id: "node-1".into(),
-                known: vec![crate::structs::UpstreamCredentialKnown {
-                    allocation_id: alloc.id,
-                    upstream: "api".into(),
-                    header: "authorization".into(),
-                    version: 0,
-                }],
-            }))
-            .await?
-            .into_inner()
-            .credentials
-            .remove(0);
+        let off = fetch_material(
+            &disabled,
+            vec![credential_ref(alloc.id, "api", "authorization", 0)],
+        )
+        .await?
+        .remove(0);
         assert!(off.value.is_empty() && !off.absent);
         assert!(off.error.contains("not enabled"), "{}", off.error);
         Ok(())
@@ -19675,7 +19673,7 @@ mod tests {
             provisional: None,
             allocation_id,
             job_id: job_id.into(),
-            task_connect: json!({ "upstreams": [{ "service": service }] }).to_string(),
+            task_connect: json!({ "upstreams": [{ "to": service }] }).to_string(),
             ..Default::default()
         }
     }

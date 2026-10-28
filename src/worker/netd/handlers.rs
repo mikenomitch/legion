@@ -1,41 +1,47 @@
-//! External handlers — code on the path, only when a chain names it
+//! Handlers — code on the path, only when a chain or an upstream names it
 //! (docs/network-handlers.md, "Handlers").
 //!
-//! Two kinds run here; `log` and `dlp` are built in and live in HTTP mode.
+//! Every hop is one [`Handler`]: a kind from the registry in
+//! [`crate::structs::hops`] with its declared stages and placement. A chain's
+//! hops, then an upstream's own, compile once per policy body into one
+//! [`Pipeline`], and every path runs that same pipeline at the stages it can
+//! see:
 //!
-//! - **`authz`** — a decision webhook. `netd` POSTs the flow's facts as JSON
-//!   (who, where to, and in HTTP mode the request head) and reads back
-//!   `{ "verdict": "allow" | "deny", "reason"?, "ttl"? }`. The verdict is
-//!   cached per (hop, identity, destination[, method, path]) for `cache`
-//!   (default [`DEFAULT_AUTHZ_CACHE`], at most `MAX_AUTHZ_CACHE`), so a
-//!   webhook costs one round trip per new pair, not one per connection. It
-//!   never sees bytes.
-//! - **`proxy`** — hands the flow to something that does see bytes: any
-//!   proxy reachable as a catalog `service`, its `node`-local endpoints, or a
-//!   sidecar task's `port` label in the same job. On TCP the hand-off starts
-//!   with a PROXY protocol v2 header carrying Legion TLVs
-//!   ([`super::proxyproto`]); on HTTP the request goes out in absolute form
-//!   with `Legion-*` headers. To deny, the proxy closes or answers 4xx.
+//! - **connect** — an L4 upstream splice, the gated proxy's `CONNECT` and
+//!   an L4 ingress splice: [`Pipeline::run_connect`] with the
+//!   connect-time facts.
+//! - **request** — an HTTP-mode upstream, an absolute-URI request through the
+//!   gated proxy, HTTP-mode ingress: [`Pipeline::run_request`] with the
+//!   request head.
+//! - **body** — the same HTTP paths: [`Pipeline::check_body`] on the buffered
+//!   body, up to [`Pipeline::body_cap`].
 //!
-//! Every hop has a `timeout` and an `onError`; the default `onError` is
-//! `deny`, so a dead webhook or a proxy with no endpoints fails the chain
-//! closed unless the operator wrote `onError = "allow"`. Health per hop is
-//! reported on the heartbeat (`NetHandlerStatus`) and read by `net doctor`.
+//! The kinds: `authz` (a decision webhook), `proxy` (hand the flow to another
+//! proxy), and `dlp` (reject matching request bodies). Every hop has a
+//! `timeout` and an `onError`; the default is `deny`, so a dead webhook or a
+//! proxy with no endpoints fails the chain closed unless the hop says
+//! `onError = "allow"`. Health per hop is reported on the heartbeat
+//! (`NetHandlerStatus`) and read by `net doctor`.
+//!
+//! There is one list of hops per flow, so a hop a chain declares cannot be
+//! accepted at submit and then skipped by one path.
+
+mod authz;
+mod dlp;
+mod plugin;
+mod proxy;
+
+pub use authz::DEFAULT_AUTHZ_CACHE;
+pub use dlp::DEFAULT_DLP_MAX_BYTES;
 
 use crate::prelude::*;
-use crate::structs::netpolicy::{
-    parse_duration, HandlerConfig, DEFAULT_HANDLER_TIMEOUT, HANDLER_AUTHZ, HANDLER_PROXY,
-    MAX_AUTHZ_CACHE, ON_ERROR_ALLOW,
-};
+use crate::structs::hops::{HandlerEntry, HandlerKind, HopConfig};
+use crate::structs::netpolicy::{EffectiveChain, EffectivePolicy};
 use crate::worker::forwarder::ForwarderContext;
-use crate::worker::netd::metrics as net_metrics;
 use crate::worker::netd::proxyproto::{self, tlv};
 
 use std::net::{IpAddr, SocketAddr};
-use std::time::{Duration, Instant};
 
-/// Verdict cache TTL when a hop names no `cache`.
-pub const DEFAULT_AUTHZ_CACHE: &str = "10s";
 /// Cap on cached verdicts per node; past it the cache is cleared.
 pub const AUTHZ_CACHE_MAX: usize = 4096;
 
@@ -54,6 +60,8 @@ pub struct HopFacts<'a> {
     pub port: u16,
     /// Verified peer identity (ingress with mTLS).
     pub identity: Option<&'a str>,
+    /// The upstream key, on an upstream's path.
+    pub upstream: Option<&'a str>,
     /// HTTP mode only.
     pub method: Option<&'a str>,
     pub path: Option<&'a str>,
@@ -82,314 +90,795 @@ pub enum HopOutcome {
     Proxy(ProxyTarget),
 }
 
-/// One hop with where it came from (`policy/<name>#i`, `task#i`,
-/// `upstream/<key>#i`).
-#[derive(Debug, Clone)]
-pub struct Hop {
+/// One hop on the path. Each kind implements the stages it acts at; the
+/// rest default to doing nothing.
+#[async_trait::async_trait]
+pub trait Handler: Send + Sync {
+    /// The kind's registry row: its name, stages, and placement.
+    fn entry(&self) -> &'static HandlerEntry;
+
+    /// Where the hop came from: `policy/<name>#i`, `task#i`, or
+    /// `upstream/<key>#i`.
+    fn source(&self) -> &str;
+
+    /// Whether a failure of this hop lets the flow through (`onError`).
+    fn fails_open(&self) -> bool {
+        false
+    }
+
+    /// When the flow opens, with the connect-time facts.
+    async fn on_connect(
+        &self,
+        _context: &Arc<ForwarderContext>,
+        _facts: &HopFacts<'_>,
+    ) -> HopOutcome {
+        HopOutcome::Allow
+    }
+
+    /// Per HTTP request, with the request head.
+    async fn on_request(
+        &self,
+        _context: &Arc<ForwarderContext>,
+        _facts: &HopFacts<'_>,
+    ) -> HopOutcome {
+        HopOutcome::Allow
+    }
+
+    /// How much of a request body this hop reads; `None` when it reads none.
+    fn body_cap(&self) -> Option<u64> {
+        None
+    }
+
+    /// Per HTTP request, with the buffered body: `Some(reason)` to deny.
+    fn on_body(&self, _body: &[u8]) -> Option<String> {
+        None
+    }
+
+    /// Per-exchange state for an HTTP path, for kinds that keep any; `None`
+    /// runs the stateless stage methods above.
+    fn exchange(
+        &self,
+        _context: &Arc<ForwarderContext>,
+        _facts: &HopFacts<'_>,
+    ) -> Option<Box<dyn HopExchange>> {
+        None
+    }
+}
+
+/// The body type the HTTP paths answer with.
+pub type BoxError = Box<dyn std::error::Error + Send + Sync>;
+pub type HopBody = http_body_util::combinators::BoxBody<bytes::Bytes, BoxError>;
+
+/// The request head the HTTP-stage hops see, and a plugin may rewrite.
+#[derive(Debug, Clone, Default)]
+pub struct RequestHead {
+    pub method: String,
+    /// The path with its query.
+    pub path: String,
+    pub authority: String,
+    /// `http` or `https`.
+    pub scheme: String,
+    /// Lowercase names, in order.
+    pub headers: Vec<(String, String)>,
+    /// The request carries no body.
+    pub end_of_stream: bool,
+    /// A hop changed `path` or `headers`; the path applies them.
+    pub changed: bool,
+}
+
+impl RequestHead {
+    pub fn path_only(&self) -> &str {
+        self.path.split('?').next().unwrap_or("/")
+    }
+
+    /// Whether a request with these headers has no body.
+    pub fn no_body(headers: &[(String, String)]) -> bool {
+        let length = headers
+            .iter()
+            .find(|(name, _)| name == "content-length")
+            .map(|(_, value)| value.trim() == "0");
+        let chunked = headers.iter().any(|(name, _)| name == "transfer-encoding");
+        !chunked && length.unwrap_or(true)
+    }
+}
+
+/// The response head the `response`-stage hops see, and may rewrite.
+#[derive(Debug, Clone, Default)]
+pub struct ResponseHead {
+    pub status: u16,
+    pub headers: Vec<(String, String)>,
+    pub changed: bool,
+}
+
+/// A response a hop sends instead of the upstream's: a plugin's
+/// `send_local_response`, or the `503` a failed plugin answers with.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LocalResponse {
+    /// The hop that answered (`policy/<name>#<i>`, `task#<i>`, ...).
     pub source: String,
-    pub config: HandlerConfig,
+    pub status: u16,
+    pub headers: Vec<(String, String)>,
+    pub body: Vec<u8>,
+    /// Why, for `Legion-Denied-Reason`, the denial ledger, and the access
+    /// log.
+    pub reason: Option<String>,
 }
 
-fn is_external(handler: &str) -> bool {
-    handler == HANDLER_AUTHZ || handler == HANDLER_PROXY
-}
+impl LocalResponse {
+    /// Whether this answer refuses the request (a 4xx or 5xx), so it is
+    /// recorded as a denial and carries `Legion-Denied-By`.
+    pub fn denies(&self) -> bool {
+        self.status >= 400
+    }
 
-/// The external hops that apply to a flow: the effective chain's for the
-/// direction, then the upstream's own (`connect.upstreams[].handlers`).
-pub fn hops_for(
-    context: &ForwarderContext,
-    allocation_id: i64,
-    direction: &str,
-    upstream_key: Option<&str>,
-    upstream_handlers: &[HandlerConfig],
-) -> Vec<Hop> {
-    let mut hops = Vec::new();
-    if let Some(policy) = context.policy_for(allocation_id) {
-        let chain = if direction == "ingress" {
-            policy.ingress.as_ref()
-        } else {
-            policy.egress.as_ref()
+    pub fn into_response(self) -> hyper::Response<HopBody> {
+        use http_body_util::BodyExt;
+        let status = hyper::StatusCode::from_u16(self.status)
+            .unwrap_or(hyper::StatusCode::SERVICE_UNAVAILABLE);
+        let mut builder = hyper::Response::builder().status(status);
+        let has = |name: &str| {
+            self.headers
+                .iter()
+                .any(|(n, _)| n.eq_ignore_ascii_case(name))
         };
+        let denied_by = !has("legion-denied-by") && self.denies();
+        let reason = !has("legion-denied-reason") && self.denies();
+        let typed = has("content-type");
+        for (name, value) in &self.headers {
+            if let (Ok(name), Ok(value)) = (
+                hyper::header::HeaderName::from_bytes(name.as_bytes()),
+                hyper::header::HeaderValue::from_str(value),
+            ) {
+                builder = builder.header(name, value);
+            }
+        }
+        if denied_by {
+            builder = builder.header("legion-denied-by", self.source.as_str());
+        }
+        if reason {
+            if let Some(Ok(value)) = self
+                .reason
+                .as_deref()
+                .map(hyper::header::HeaderValue::from_str)
+            {
+                builder = builder.header("legion-denied-reason", value);
+            }
+        }
+        if !typed && !self.body.is_empty() && self.body.first() == Some(&b'{') {
+            builder = builder.header("content-type", "application/json");
+        }
+        builder
+            .body(
+                http_body_util::Full::new(bytes::Bytes::from(self.body))
+                    .map_err(|never| match never {})
+                    .boxed(),
+            )
+            .unwrap_or_else(|_| {
+                hyper::Response::builder()
+                    .status(hyper::StatusCode::SERVICE_UNAVAILABLE)
+                    .body(
+                        http_body_util::Empty::new()
+                            .map_err(|never| match never {})
+                            .boxed(),
+                    )
+                    .expect("static response")
+            })
+    }
+}
+
+/// What the HTTP-stage hops decided.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ExchangeOutcome {
+    Continue,
+    Deny {
+        source: String,
+        reason: Option<String>,
+    },
+    /// Hand the request to this proxy instead of the destination.
+    Proxy(ProxyTarget),
+    /// Answer with this instead of sending the request on.
+    Respond(LocalResponse),
+}
+
+/// A hop's state for one HTTP exchange, for kinds that keep any (plugins:
+/// their stream context lives across the request, body, response, and
+/// done stages).
+#[async_trait::async_trait]
+pub trait HopExchange: Send {
+    async fn on_request(
+        &mut self,
+        context: &Arc<ForwarderContext>,
+        facts: &HopFacts<'_>,
+        head: &mut RequestHead,
+    ) -> ExchangeOutcome;
+
+    /// How much of the request body this hop wants buffered.
+    fn body_cap(&self) -> Option<u64> {
+        None
+    }
+
+    /// The buffered request body; the hop may replace it.
+    async fn on_body(
+        &mut self,
+        _context: &Arc<ForwarderContext>,
+        _body: &mut bytes::Bytes,
+    ) -> ExchangeOutcome {
+        ExchangeOutcome::Continue
+    }
+
+    /// Whether the hop acts on the response (head or body) or after it.
+    fn reads_response(&self) -> bool {
+        false
+    }
+
+    /// The response head; `Respond` replaces the response.
+    async fn on_response(
+        &mut self,
+        _context: &Arc<ForwarderContext>,
+        _head: &mut ResponseHead,
+    ) -> ExchangeOutcome {
+        ExchangeOutcome::Continue
+    }
+
+    /// Whether the hop reads the response body.
+    fn reads_response_body(&self) -> bool {
+        false
+    }
+
+    /// One chunk of the response body as it streams (`end` on the last).
+    /// Returns the bytes to pass on, which may be fewer (the hop is holding
+    /// them to see more) or rewritten. `Err` aborts the response.
+    async fn on_response_chunk(
+        &mut self,
+        _context: &Arc<ForwarderContext>,
+        chunk: bytes::Bytes,
+        _end: bool,
+    ) -> Result<bytes::Bytes, String> {
+        Ok(chunk)
+    }
+
+    /// The exchange is over (answered, refused, or abandoned): `status` is
+    /// what the client got, 0 when it never got one.
+    fn on_done(&mut self, _status: u16) {}
+}
+
+/// Build the runtime hop for one configured hop.
+fn build(hop: &HopConfig, source: String) -> Arc<dyn Handler> {
+    match &hop.kind {
+        HandlerKind::Authz(config) => {
+            Arc::new(authz::Authz::new(source, config.clone(), hop.clone()))
+        }
+        HandlerKind::Proxy(config) => {
+            Arc::new(proxy::Proxy::new(source, config.clone(), hop.clone()))
+        }
+        HandlerKind::Dlp(config) => Arc::new(dlp::Dlp::new(source, config.clone(), hop.clone())),
+        HandlerKind::Plugin(config) => {
+            Arc::new(plugin::Plugin::new(source, config.clone(), hop.clone()))
+        }
+    }
+}
+
+/// The hops one flow runs: the chain's, then the upstream's own.
+#[derive(Default)]
+pub struct Pipeline {
+    hops: Vec<Arc<dyn Handler>>,
+}
+
+impl std::fmt::Debug for Pipeline {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_list()
+            .entries(
+                self.hops
+                    .iter()
+                    .map(|hop| (hop.entry().name, hop.source().to_string())),
+            )
+            .finish()
+    }
+}
+
+impl Pipeline {
+    /// Compile a chain's hops (sources already set by the merge) and then an
+    /// upstream's own (`upstream/<key>#i`).
+    pub fn compile(
+        chain: Option<&EffectiveChain>,
+        upstream_key: Option<&str>,
+        upstream: &[HopConfig],
+    ) -> Pipeline {
+        let mut hops: Vec<Arc<dyn Handler>> = Vec::new();
         if let Some(chain) = chain {
             for hop in &chain.handlers {
-                if is_external(&hop.handler.handler) {
-                    hops.push(Hop {
-                        source: hop.source.clone(),
-                        config: hop.handler.clone(),
-                    });
-                }
+                hops.push(build(&hop.handler, hop.source.clone()));
             }
         }
-    }
-    for (index, handler) in upstream_handlers.iter().enumerate() {
-        if is_external(&handler.handler) {
-            hops.push(Hop {
-                source: format!("upstream/{}#{index}", upstream_key.unwrap_or("?")),
-                config: handler.clone(),
-            });
+        for (index, hop) in upstream.iter().enumerate() {
+            hops.push(build(
+                hop,
+                format!("upstream/{}#{index}", upstream_key.unwrap_or("?")),
+            ));
         }
+        Pipeline { hops }
     }
-    hops
-}
 
-fn hop_timeout(config: &HandlerConfig) -> Duration {
-    config
-        .timeout
-        .as_deref()
-        .and_then(|t| parse_duration(t).ok())
-        .unwrap_or_else(|| parse_duration(DEFAULT_HANDLER_TIMEOUT).expect("constant"))
-}
-
-fn fails_open(config: &HandlerConfig) -> bool {
-    config.on_error.as_deref() == Some(ON_ERROR_ALLOW)
-}
-
-/// Run the hops in order. The first `deny` ends the walk; the first `proxy`
-/// takes the flow (hops after it never run — they could not see the bytes
-/// anyway); a failed hop is a deny unless it says `onError = "allow"`.
-pub async fn run(
-    context: &Arc<ForwarderContext>,
-    hops: &[Hop],
-    facts: &HopFacts<'_>,
-) -> HopOutcome {
-    for hop in hops {
-        match hop.config.handler.as_str() {
-            HANDLER_AUTHZ => {
-                if let Some((source, reason)) = authz(context, hop, facts).await {
-                    return HopOutcome::Deny { source, reason };
-                }
-            }
-            HANDLER_PROXY => match resolve_proxy(context, hop, facts) {
-                Ok(target) => return HopOutcome::Proxy(target),
-                Err(reason) => {
-                    if fails_open(&hop.config) {
-                        continue;
-                    }
-                    return HopOutcome::Deny {
-                        source: hop.source.clone(),
-                        reason: Some(reason),
-                    };
-                }
-            },
-            _ => {}
-        }
+    pub fn is_empty(&self) -> bool {
+        self.hops.is_empty()
     }
-    HopOutcome::Allow
-}
 
-/// The webhook's request body.
-fn authz_body(context: &ForwarderContext, facts: &HopFacts<'_>) -> serde_json::Value {
-    let who = context.identity_for(facts.allocation_id);
-    let mut body = json!({
-        "allocation": facts.allocation_id,
-        "job": who.as_ref().map(|w| w.job_id.clone()).unwrap_or_default(),
-        "task": who.as_ref().map(|w| w.task_name.clone()).unwrap_or_default(),
-        "identity": context.identity_string_for(facts.allocation_id),
-        "labels": who.as_ref().map(|w| w.labels.clone()).unwrap_or_default(),
-        "node": context.node_id().unwrap_or_default(),
-        "direction": facts.direction,
-        "protocol": facts.protocol,
-        "destination": facts.destination,
-        "host": facts.host,
-        "ip": facts.ip.map(|ip| ip.to_string()),
-        "port": facts.port,
-        "peerIdentity": facts.identity,
-    });
-    if let Some(method) = facts.method {
-        body["method"] = json!(method);
-        body["path"] = json!(facts.path.unwrap_or("/"));
-        body["headers"] = json!(facts
-            .headers
+    /// The `(kind, source)` of every hop, in order.
+    pub fn describe(&self) -> Vec<(&'static str, String)> {
+        self.hops
             .iter()
-            .filter(|(name, _)| name != "authorization"
-                && name != "cookie"
-                && name != "proxy-authorization")
-            .cloned()
-            .collect::<Vec<_>>());
+            .map(|hop| (hop.entry().name, hop.source().to_string()))
+            .collect()
     }
-    body
+
+    /// Run the hops at `connect`. The first `deny` ends the walk; the first
+    /// `proxy` takes the flow (hops after it could not see the bytes anyway).
+    pub async fn run_connect(
+        &self,
+        context: &Arc<ForwarderContext>,
+        facts: &HopFacts<'_>,
+    ) -> HopOutcome {
+        for hop in &self.hops {
+            match hop.on_connect(context, facts).await {
+                HopOutcome::Allow => {}
+                decided => return decided,
+            }
+        }
+        HopOutcome::Allow
+    }
+
+    /// Whether any hop reads the request body.
+    pub fn reads_body(&self) -> bool {
+        self.hops.iter().any(|hop| hop.body_cap().is_some())
+    }
 }
 
-/// `Some((source, reason))` to deny.
-async fn authz(
-    context: &Arc<ForwarderContext>,
-    hop: &Hop,
-    facts: &HopFacts<'_>,
-) -> Option<(String, Option<String>)> {
-    let url = hop.config.url.clone().unwrap_or_default();
-    // Everything the webhook is told that can change its answer: a verdict
-    // for one allocation (or one webhook) must never answer for another on
-    // this node. The cache is node-wide.
-    let key = format!(
-        "{}|{}|{}|{}|{}|{}|{}|{}|{}",
-        hop.source,
-        url,
-        facts.allocation_id,
-        facts.direction,
-        facts.protocol,
-        facts.identity.unwrap_or(""),
-        facts.destination,
-        facts.method.unwrap_or(""),
-        facts.path.unwrap_or("")
-    );
-    if let Some((allowed, reason)) = context.authz_cached(&key) {
-        net_metrics::handler(HANDLER_AUTHZ, if allowed { "allow" } else { "deny" }, 0.0);
-        return (!allowed).then(|| (hop.source.clone(), reason));
-    }
-    let timeout = hop_timeout(&hop.config);
-    let cap = parse_duration(MAX_AUTHZ_CACHE).expect("constant");
-    let configured_ttl = hop
-        .config
-        .cache
-        .as_deref()
-        .and_then(|c| parse_duration(c).ok())
-        .unwrap_or_else(|| parse_duration(DEFAULT_AUTHZ_CACHE).expect("constant"))
-        .min(cap);
-    let body = authz_body(context, facts).to_string();
-    let started = Instant::now();
-    let outcome: Result<(bool, Option<String>, Option<Duration>), String> = async {
-        let response = context
-            .http_client()
-            .post(&url)
-            .timeout(timeout)
-            .header("content-type", "application/json")
-            .header("legion-handler", "authz")
-            .body(body)
-            .send()
-            .await
-            .map_err(|err| format!("{err}"))?;
-        let status = response.status();
-        let text = response.text().await.map_err(|err| format!("{err}"))?;
-        if !status.is_success() {
-            return Err(format!("webhook answered {}", status.as_u16()));
+/// One HTTP exchange through a pipeline: every hop at every HTTP stage, in
+/// order, with the per-exchange state of the kinds that keep any. The
+/// request, body, response, and done stages all run through it, so a plugin
+/// sees one stream context for the whole exchange.
+pub struct Exchange {
+    context: Arc<ForwarderContext>,
+    pipeline: Arc<Pipeline>,
+    states: Vec<Option<Box<dyn HopExchange>>>,
+    status: u16,
+    done: bool,
+}
+
+impl Pipeline {
+    /// Start an exchange (one HTTP request) through this pipeline.
+    pub fn exchange(
+        self: &Arc<Self>,
+        context: &Arc<ForwarderContext>,
+        facts: &HopFacts<'_>,
+    ) -> Exchange {
+        Exchange {
+            context: context.clone(),
+            states: self
+                .hops
+                .iter()
+                .map(|hop| hop.exchange(context, facts))
+                .collect(),
+            pipeline: self.clone(),
+            status: 0,
+            done: false,
         }
-        let value: serde_json::Value = serde_json::from_str(&text)
-            .map_err(|err| format!("webhook reply is not JSON: {err}"))?;
-        let verdict = value
-            .get("verdict")
-            .and_then(|v| v.as_str())
-            .map(|v| v.trim().to_ascii_lowercase())
-            .ok_or_else(|| "webhook reply has no \"verdict\"".to_string())?;
-        let allowed = match verdict.as_str() {
-            "allow" => true,
-            "deny" => false,
-            other => return Err(format!("webhook verdict {other:?} is not allow|deny")),
+    }
+}
+
+impl Exchange {
+    pub fn is_empty(&self) -> bool {
+        self.pipeline.is_empty()
+    }
+
+    /// The `request` stage. `facts` are the connect-time facts; the head is
+    /// what the hops read and may rewrite.
+    pub async fn request(
+        &mut self,
+        facts: &HopFacts<'_>,
+        head: &mut RequestHead,
+    ) -> ExchangeOutcome {
+        for (index, hop) in self.pipeline.hops.iter().enumerate() {
+            let outcome = match self.states[index].as_mut() {
+                Some(state) => state.on_request(&self.context, facts, head).await,
+                None => {
+                    let view = HopFacts {
+                        method: Some(&head.method),
+                        path: Some(head.path_only()),
+                        headers: &head.headers,
+                        ..facts.clone()
+                    };
+                    match hop.on_request(&self.context, &view).await {
+                        HopOutcome::Allow => ExchangeOutcome::Continue,
+                        HopOutcome::Deny { source, reason } => {
+                            ExchangeOutcome::Deny { source, reason }
+                        }
+                        HopOutcome::Proxy(target) => ExchangeOutcome::Proxy(target),
+                    }
+                }
+            };
+            if outcome != ExchangeOutcome::Continue {
+                return outcome;
+            }
+        }
+        ExchangeOutcome::Continue
+    }
+
+    /// Whether any hop reads the request body.
+    pub fn reads_body(&self) -> bool {
+        self.pipeline.reads_body() || self.states.iter().flatten().any(|s| s.body_cap().is_some())
+    }
+
+    /// The most any body-reading hop wants buffered.
+    pub fn body_cap(&self) -> u64 {
+        let stateful = self
+            .states
+            .iter()
+            .flatten()
+            .filter_map(|s| s.body_cap())
+            .max();
+        let stateless = self
+            .pipeline
+            .hops
+            .iter()
+            .filter_map(|hop| hop.body_cap())
+            .max();
+        stateful
+            .into_iter()
+            .chain(stateless)
+            .max()
+            .unwrap_or(DEFAULT_DLP_MAX_BYTES)
+    }
+
+    /// The `body` stage, on the buffered body; a hop may replace it.
+    pub async fn body(&mut self, body: &mut bytes::Bytes) -> ExchangeOutcome {
+        for (index, hop) in self.pipeline.hops.iter().enumerate() {
+            let outcome = match self.states[index].as_mut() {
+                Some(state) if state.body_cap().is_some() => {
+                    state.on_body(&self.context, body).await
+                }
+                Some(_) => ExchangeOutcome::Continue,
+                None => match hop.on_body(body) {
+                    Some(reason) => ExchangeOutcome::Deny {
+                        source: hop.source().to_string(),
+                        reason: Some(reason),
+                    },
+                    None => ExchangeOutcome::Continue,
+                },
+            };
+            if outcome != ExchangeOutcome::Continue {
+                return outcome;
+            }
+        }
+        ExchangeOutcome::Continue
+    }
+
+    /// When the body could not be buffered: the first body-reading hop that
+    /// fails closed.
+    pub fn body_unreadable_denied_by(&self) -> Option<String> {
+        self.pipeline
+            .hops
+            .iter()
+            .enumerate()
+            .find(|(index, hop)| {
+                let reads = match self.states[*index].as_ref() {
+                    Some(state) => state.body_cap().is_some(),
+                    None => hop.body_cap().is_some(),
+                };
+                reads && !hop.fails_open()
+            })
+            .map(|(_, hop)| hop.source().to_string())
+    }
+
+    /// Remember the status the client got, for the `done` stage.
+    pub fn answered(&mut self, status: u16) {
+        self.status = status;
+    }
+
+    /// The `response` and `done` stages around the upstream's response: the
+    /// hops that read the head run now (a `Respond` replaces the response);
+    /// a hop that reads the body sees it chunk by chunk as it streams, and
+    /// `done` runs when the last byte has gone (or the client went away).
+    pub async fn respond(mut self, response: hyper::Response<HopBody>) -> hyper::Response<HopBody> {
+        if !self.states.iter().flatten().any(|s| s.reads_response()) {
+            self.status = response.status().as_u16();
+            if self.states.iter().all(Option::is_none) {
+                return response;
+            }
+            // Stateful hops still end their exchange (a plugin's `on_done`),
+            // after the response is on its way, not before.
+            let (parts, body) = response.into_parts();
+            return hyper::Response::from_parts(
+                parts,
+                http_body_util::BodyExt::boxed(DoneOnEnd {
+                    inner: body,
+                    exchange: Some(std::sync::Mutex::new(self)),
+                }),
+            );
+        }
+        let (mut parts, body) = response.into_parts();
+        let mut head = ResponseHead {
+            status: parts.status.as_u16(),
+            headers: parts
+                .headers
+                .iter()
+                .map(|(name, value)| {
+                    (
+                        name.as_str().to_ascii_lowercase(),
+                        String::from_utf8_lossy(value.as_bytes()).into_owned(),
+                    )
+                })
+                .collect(),
+            changed: false,
         };
-        let reason = value
-            .get("reason")
-            .and_then(|r| r.as_str())
-            .map(str::to_string);
-        let ttl = value
-            .get("ttl")
-            .and_then(|t| t.as_str())
-            .and_then(|t| parse_duration(t).ok());
-        Ok((allowed, reason, ttl))
-    }
-    .await;
-    let elapsed = started.elapsed().as_secs_f64();
-    match outcome {
-        Ok((allowed, reason, ttl)) => {
-            let ttl = ttl.unwrap_or(configured_ttl).min(cap);
-            context.authz_store(key, allowed, reason.clone(), ttl);
-            context.note_handler(
-                facts.allocation_id,
-                &hop.source,
-                HANDLER_AUTHZ,
-                &url,
-                Ok(()),
-            );
-            net_metrics::handler(
-                HANDLER_AUTHZ,
-                if allowed { "allow" } else { "deny" },
-                elapsed,
-            );
-            (!allowed).then(|| (hop.source.clone(), reason))
+        for state in self.states.iter_mut().flatten() {
+            match state.on_response(&self.context, &mut head).await {
+                ExchangeOutcome::Continue => {}
+                ExchangeOutcome::Respond(local) => {
+                    self.status = local.status;
+                    self.finish();
+                    return local.into_response();
+                }
+                ExchangeOutcome::Deny { source, reason } => {
+                    let local = LocalResponse {
+                        source,
+                        status: 403,
+                        headers: Vec::new(),
+                        body: Vec::new(),
+                        reason,
+                    };
+                    self.status = local.status;
+                    self.finish();
+                    return local.into_response();
+                }
+                ExchangeOutcome::Proxy(_) => {}
+            }
         }
-        Err(err) => {
-            debug!(source = %hop.source, url = %url, error = %err, "authz handler failed");
-            context.note_handler(
-                facts.allocation_id,
-                &hop.source,
-                HANDLER_AUTHZ,
-                &url,
-                Err(err.clone()),
-            );
-            net_metrics::handler(HANDLER_AUTHZ, "error", elapsed);
-            if fails_open(&hop.config) {
-                None
-            } else {
-                Some((hop.source.clone(), Some(format!("authz {url}: {err}"))))
+        if head.changed {
+            if let Ok(status) = hyper::StatusCode::from_u16(head.status) {
+                parts.status = status;
+            }
+            parts.headers.clear();
+            for (name, value) in &head.headers {
+                if let (Ok(name), Ok(value)) = (
+                    hyper::header::HeaderName::from_bytes(name.as_bytes()),
+                    hyper::header::HeaderValue::from_str(value),
+                ) {
+                    parts.headers.append(name, value);
+                }
+            }
+        }
+        self.status = parts.status.as_u16();
+        let reads_body = self
+            .states
+            .iter()
+            .flatten()
+            .any(|s| s.reads_response_body());
+        if reads_body {
+            // A hop may change the body's length.
+            parts.headers.remove(hyper::header::CONTENT_LENGTH);
+        }
+        let body = if reads_body {
+            streamed(self, body)
+        } else {
+            // Only `done` waits on the body: run it when the body ends,
+            // with no task or channel in the way.
+            http_body_util::BodyExt::boxed(DoneOnEnd {
+                inner: body,
+                exchange: Some(std::sync::Mutex::new(self)),
+            })
+        };
+        hyper::Response::from_parts(parts, body)
+    }
+
+    /// Run `done` once.
+    fn finish(&mut self) {
+        if self.done {
+            return;
+        }
+        self.done = true;
+        let status = self.status;
+        for state in self.states.iter_mut().flatten() {
+            state.on_done(status);
+        }
+    }
+}
+
+impl Drop for Exchange {
+    fn drop(&mut self) {
+        self.finish();
+    }
+}
+
+/// A response body that runs `done` when it ends (or is dropped unread).
+struct DoneOnEnd {
+    inner: HopBody,
+    /// In a mutex only so the body is `Sync`; nothing contends for it.
+    exchange: Option<std::sync::Mutex<Exchange>>,
+}
+
+impl hyper::body::Body for DoneOnEnd {
+    type Data = bytes::Bytes;
+    type Error = BoxError;
+
+    fn poll_frame(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Result<hyper::body::Frame<Self::Data>, Self::Error>>> {
+        let polled = std::pin::Pin::new(&mut self.inner).poll_frame(cx);
+        // Dropping the exchange runs `done`: at the end of the body, or when
+        // hyper drops a body it has finished writing.
+        if matches!(polled, std::task::Poll::Ready(None)) {
+            self.exchange.take();
+        }
+        polled
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.inner.is_end_stream()
+    }
+
+    fn size_hint(&self) -> hyper::body::SizeHint {
+        self.inner.size_hint()
+    }
+}
+
+/// The response body, passed through the hops that read it, chunk by
+/// chunk, inside `poll_frame`: no task or channel between the upstream and
+/// the client. `done` runs when hyper drops the body, after the last byte.
+fn streamed(exchange: Exchange, body: HopBody) -> HopBody {
+    http_body_util::BodyExt::boxed(StreamedBody {
+        state: std::sync::Mutex::new(Streamed {
+            inner: body,
+            exchange: Some(exchange),
+            pending: None,
+            ended: false,
+            trailers: None,
+        }),
+    })
+}
+
+type ChunkFuture = std::pin::Pin<
+    Box<dyn std::future::Future<Output = (Exchange, Result<bytes::Bytes, String>)> + Send>,
+>;
+
+/// In a mutex only so the body is `Sync`; only hyper polls it.
+struct StreamedBody {
+    state: std::sync::Mutex<Streamed>,
+}
+
+struct Streamed {
+    inner: HopBody,
+    exchange: Option<Exchange>,
+    /// The hops working on one chunk (usually done on the first poll).
+    pending: Option<ChunkFuture>,
+    ended: bool,
+    trailers: Option<hyper::body::Frame<bytes::Bytes>>,
+}
+
+/// One chunk through every body-reading hop in order.
+fn pump(mut exchange: Exchange, mut chunk: bytes::Bytes, end: bool) -> ChunkFuture {
+    Box::pin(async move {
+        let context = exchange.context.clone();
+        for state in exchange.states.iter_mut().flatten() {
+            if !state.reads_response_body() {
+                continue;
+            }
+            match state.on_response_chunk(&context, chunk, end).await {
+                Ok(out) => chunk = out,
+                Err(reason) => return (exchange, Err(reason)),
+            }
+        }
+        (exchange, Ok(chunk))
+    })
+}
+
+impl hyper::body::Body for StreamedBody {
+    type Data = bytes::Bytes;
+    type Error = BoxError;
+
+    fn poll_frame(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Result<hyper::body::Frame<Self::Data>, Self::Error>>> {
+        use std::task::Poll;
+        let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        let state = &mut *state;
+        loop {
+            if let Some(pending) = state.pending.as_mut() {
+                let (exchange, result) = match pending.as_mut().poll(cx) {
+                    Poll::Ready(done) => done,
+                    Poll::Pending => return Poll::Pending,
+                };
+                state.pending = None;
+                state.exchange = Some(exchange);
+                match result {
+                    Ok(chunk) if !chunk.is_empty() => {
+                        return Poll::Ready(Some(Ok(hyper::body::Frame::data(chunk))))
+                    }
+                    Ok(_) => continue,
+                    // A hop failed mid-stream: abort the response rather
+                    // than end it short.
+                    Err(reason) => return Poll::Ready(Some(Err(reason.into()))),
+                }
+            }
+            if state.ended {
+                return Poll::Ready(state.trailers.take().map(Ok));
+            }
+            let Some(exchange) = state.exchange.take() else {
+                return Poll::Ready(None);
+            };
+            match std::pin::Pin::new(&mut state.inner).poll_frame(cx) {
+                Poll::Pending => {
+                    state.exchange = Some(exchange);
+                    return Poll::Pending;
+                }
+                Poll::Ready(Some(Err(err))) => {
+                    state.exchange = Some(exchange);
+                    return Poll::Ready(Some(Err(err)));
+                }
+                Poll::Ready(Some(Ok(frame))) => match frame.into_data() {
+                    Ok(chunk) => state.pending = Some(pump(exchange, chunk, false)),
+                    Err(trailers) => {
+                        // Trailers end the data: the hops see the end, then
+                        // the trailers go out as they are.
+                        state.trailers = Some(trailers);
+                        state.ended = true;
+                        state.pending = Some(pump(exchange, bytes::Bytes::new(), true));
+                    }
+                },
+                Poll::Ready(None) => {
+                    state.ended = true;
+                    state.pending = Some(pump(exchange, bytes::Bytes::new(), true));
+                }
             }
         }
     }
 }
 
-/// Where a `proxy` hop sends the flow.
-fn resolve_proxy(
-    context: &ForwarderContext,
-    hop: &Hop,
-    facts: &HopFacts<'_>,
-) -> Result<ProxyTarget, String> {
-    let proxy_protocol = hop.config.proxy_protocol.unwrap_or(true);
-    let (label, candidates): (String, Vec<String>) =
-        if let Some(service) = hop.config.service.as_deref() {
-            (
-                format!("service {service}"),
-                context
-                    .handler_endpoints_for(facts.allocation_id, service)
-                    .into_iter()
-                    .map(|e| e.addr)
-                    .collect(),
-            )
-        } else if let Some(service) = hop.config.node.as_deref() {
-            let node = context.node_id();
-            (
-                format!("node-local service {service}"),
-                context
-                    .handler_endpoints_for(facts.allocation_id, service)
-                    .into_iter()
-                    .filter(|e| node.as_deref().is_none_or(|n| n == e.node_id))
-                    .map(|e| e.addr)
-                    .collect(),
-            )
-        } else if let Some(port) = hop.config.port.as_deref() {
-            (
-                format!("port {port}"),
-                context
-                    .sidecar_port(facts.allocation_id, port)
-                    .map(|p| vec![format!("127.0.0.1:{p}")])
-                    .unwrap_or_default(),
-            )
-        } else {
-            (String::from("?"), Vec::new())
+/// One listener's compiled pipeline, rebuilt when the policy body it runs
+/// under changes (a new hash) and reused otherwise.
+#[derive(Default)]
+pub struct PipelineCache {
+    slot: Mutex<Option<(String, Arc<Pipeline>)>>,
+}
+
+impl PipelineCache {
+    /// The pipeline for `direction` under `policy`, plus the upstream's own
+    /// hops.
+    pub fn get(
+        &self,
+        policy: Option<&EffectivePolicy>,
+        direction: &str,
+        upstream_key: Option<&str>,
+        upstream: &[HopConfig],
+    ) -> Arc<Pipeline> {
+        let chain = policy.and_then(|p| {
+            if direction == "ingress" {
+                p.ingress.as_ref()
+            } else {
+                p.egress.as_ref()
+            }
+        });
+        // No policy compiles to the upstream's own hops under the key "";
+        // a policy without a hash (tests) is compiled every time.
+        let key = match policy {
+            None => Some(String::new()),
+            Some(p) if p.hash.is_empty() => None,
+            Some(p) => Some(p.hash.clone()),
         };
-    let target = format!("{label} ({} endpoint(s))", candidates.len());
-    if candidates.is_empty() {
-        let reason = format!("proxy handler {} has no endpoint", label);
-        context.note_handler(
-            facts.allocation_id,
-            &hop.source,
-            HANDLER_PROXY,
-            &target,
-            Err(reason.clone()),
-        );
-        net_metrics::handler(HANDLER_PROXY, "error", 0.0);
-        return Err(reason);
+        let mut slot = self.slot.lock().unwrap_or_else(|p| p.into_inner());
+        if let (Some(key), Some((hash, pipeline))) = (key.as_ref(), slot.as_ref()) {
+            if hash == key {
+                return pipeline.clone();
+            }
+        }
+        let pipeline = Arc::new(Pipeline::compile(chain, upstream_key, upstream));
+        if let Some(key) = key {
+            *slot = Some((key, pipeline.clone()));
+        }
+        pipeline
     }
-    let pick = context.next_handler_pick() % candidates.len();
-    context.note_handler(
-        facts.allocation_id,
-        &hop.source,
-        HANDLER_PROXY,
-        &target,
-        Ok(()),
-    );
-    net_metrics::handler(HANDLER_PROXY, "proxy", 0.0);
-    Ok(ProxyTarget {
-        source: hop.source.clone(),
-        addr: candidates[pick].clone(),
-        proxy_protocol,
-    })
 }
 
 /// The PROXY v2 header a hand-off (or a mesh hop) starts with.
@@ -546,25 +1035,43 @@ mod tests {
         ))
     }
 
-    fn authz_hop(url: &str, on_error: Option<&str>) -> Hop {
-        Hop {
-            source: "policy/p#0".into(),
-            config: HandlerConfig {
-                handler: HANDLER_AUTHZ.into(),
-                url: Some(url.into()),
-                cache: Some("30s".into()),
-                timeout: Some("500ms".into()),
-                on_error: on_error.map(str::to_string),
-                ..Default::default()
-            },
+    fn hop(value: serde_json::Value) -> HopConfig {
+        serde_json::from_value(value).unwrap()
+    }
+
+    /// A pipeline of chain hops, each sourced `policy/p#<i>`.
+    fn chain_pipeline(hops: Vec<HopConfig>) -> Pipeline {
+        let chain = EffectiveChain {
+            protocol: "tcp".into(),
+            policy: "allow".into(),
+            access_log: false,
+            callers: None,
+            rules: Vec::new(),
+            handlers: hops
+                .into_iter()
+                .enumerate()
+                .map(|(i, handler)| crate::structs::netpolicy::EffectiveHandler {
+                    handler,
+                    source: format!("policy/p#{i}"),
+                })
+                .collect(),
+        };
+        Pipeline::compile(Some(&chain), None, &[])
+    }
+
+    fn authz_hop(url: &str, on_error: Option<&str>) -> HopConfig {
+        let mut value = json!({ "authz": { "url": url, "cache": "30s" }, "timeout": "500ms" });
+        if let Some(on_error) = on_error {
+            value["onError"] = json!(on_error);
         }
+        hop(value)
     }
 
     #[tokio::test]
     async fn authz_webhook_allows_denies_and_caches() {
         let url = webhook().await;
         let context = context();
-        let hops = vec![authz_hop(&url, None)];
+        let pipeline = chain_pipeline(vec![authz_hop(&url, None)]);
         let facts = HopFacts {
             allocation_id: 1,
             direction: "egress",
@@ -575,8 +1082,14 @@ mod tests {
             ..Default::default()
         };
         let before = HITS.load(Ordering::Relaxed);
-        assert_eq!(run(&context, &hops, &facts).await, HopOutcome::Allow);
-        assert_eq!(run(&context, &hops, &facts).await, HopOutcome::Allow);
+        assert_eq!(
+            pipeline.run_connect(&context, &facts).await,
+            HopOutcome::Allow
+        );
+        assert_eq!(
+            pipeline.run_connect(&context, &facts).await,
+            HopOutcome::Allow
+        );
         assert_eq!(
             HITS.load(Ordering::Relaxed) - before,
             1,
@@ -588,7 +1101,7 @@ mod tests {
             ..facts.clone()
         };
         assert_eq!(
-            run(&context, &hops, &denied).await,
+            pipeline.run_connect(&context, &denied).await,
             HopOutcome::Deny {
                 source: "policy/p#0".into(),
                 reason: Some("webhook said no".into())
@@ -618,7 +1131,10 @@ mod tests {
             .unwrap()
             .port();
         let dead = format!("http://127.0.0.1:{port}/authz");
-        match run(&context, &[authz_hop(&dead, None)], &facts).await {
+        match chain_pipeline(vec![authz_hop(&dead, None)])
+            .run_connect(&context, &facts)
+            .await
+        {
             HopOutcome::Deny { source, reason } => {
                 assert_eq!(source, "policy/p#0");
                 assert!(reason.unwrap().starts_with("authz http://"));
@@ -626,7 +1142,9 @@ mod tests {
             other => panic!("{other:?}"),
         }
         assert_eq!(
-            run(&context, &[authz_hop(&dead, Some("allow"))], &facts).await,
+            chain_pipeline(vec![authz_hop(&dead, Some("allow"))])
+                .run_connect(&context, &facts)
+                .await,
             HopOutcome::Allow
         );
         let statuses = context.handler_statuses(2);
@@ -635,7 +1153,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn proxy_hop_resolves_service_node_and_port_targets() {
+    async fn proxy_hop_resolves_service_local_and_port_targets() {
         let context = Arc::new(
             ForwarderContext::new(Arc::new(NetPolicyCache::new()), Arc::new(Denials::new()))
                 .with_node_id("node-a".into()),
@@ -667,50 +1185,100 @@ mod tests {
             destination: "api.example:443",
             ..Default::default()
         };
-        let hop = |config: HandlerConfig| Hop {
-            source: "task#0".into(),
-            config,
-        };
-        let service = hop(HandlerConfig {
-            handler: HANDLER_PROXY.into(),
-            service: Some("filter".into()),
-            ..Default::default()
-        });
-        match run(&context, &[service], &facts).await {
+        let upstream = |hops: Vec<HopConfig>| Pipeline::compile(None, Some("api"), &hops);
+        match upstream(vec![hop(json!({ "proxy": { "service": "filter" } }))])
+            .run_connect(&context, &facts)
+            .await
+        {
             HopOutcome::Proxy(target) => {
                 assert!(target.addr.starts_with("10.0.0."));
                 assert!(target.proxy_protocol);
+                assert_eq!(target.source, "upstream/api#0");
             }
             other => panic!("{other:?}"),
         }
-        let node = hop(HandlerConfig {
-            handler: HANDLER_PROXY.into(),
-            node: Some("filter".into()),
-            proxy_protocol: Some(false),
-            ..Default::default()
-        });
         assert_eq!(
-            run(&context, &[node], &facts).await,
+            upstream(vec![hop(
+                json!({ "proxy": { "service": "filter", "local": true, "proxyProtocol": false } })
+            )])
+            .run_connect(&context, &facts)
+            .await,
             HopOutcome::Proxy(ProxyTarget {
-                source: "task#0".into(),
+                source: "upstream/api#0".into(),
                 addr: "10.0.0.2:9000".into(),
                 proxy_protocol: false
             })
         );
-        let missing = hop(HandlerConfig {
-            handler: HANDLER_PROXY.into(),
-            service: Some("nowhere".into()),
-            ..Default::default()
-        });
         assert!(matches!(
-            run(&context, std::slice::from_ref(&missing), &facts).await,
+            upstream(vec![hop(json!({ "proxy": { "service": "nowhere" } }))])
+                .run_connect(&context, &facts)
+                .await,
             HopOutcome::Deny { .. }
         ));
-        let open = hop(HandlerConfig {
-            on_error: Some("allow".into()),
-            ..missing.config
-        });
-        assert_eq!(run(&context, &[open], &facts).await, HopOutcome::Allow);
+        assert_eq!(
+            upstream(vec![hop(
+                json!({ "proxy": { "service": "nowhere" }, "onError": "allow" })
+            )])
+            .run_connect(&context, &facts)
+            .await,
+            HopOutcome::Allow
+        );
+    }
+
+    #[tokio::test]
+    async fn body_hops_run_in_order_and_cap_the_buffer_test() {
+        let pipeline = Arc::new(chain_pipeline(vec![
+            hop(json!({ "dlp": { "patterns": ["sk-[a-z]{4,}"], "maxBytes": 16 } })),
+            hop(json!({ "dlp": { "patterns": ["AKIA"], "maxBytes": 64 }, "onError": "allow" })),
+        ]));
+        assert!(pipeline.reads_body());
+        let context = context();
+        let facts = HopFacts {
+            allocation_id: 1,
+            direction: "egress",
+            protocol: "http",
+            destination: "api.example:443",
+            ..Default::default()
+        };
+        let body = |text: &[u8]| {
+            let pipeline = pipeline.clone();
+            let context = context.clone();
+            let text = bytes::Bytes::copy_from_slice(text);
+            let facts = facts.clone();
+            async move {
+                let mut exchange = pipeline.exchange(&context, &facts);
+                assert_eq!(exchange.body_cap(), 64);
+                assert_eq!(
+                    exchange.body_unreadable_denied_by().as_deref(),
+                    Some("policy/p#0")
+                );
+                let mut text = text;
+                match exchange.body(&mut text).await {
+                    ExchangeOutcome::Continue => None,
+                    ExchangeOutcome::Deny { source, .. } => Some(source),
+                    other => panic!("{other:?}"),
+                }
+            }
+        };
+        assert_eq!(body(b"hello").await, None);
+        assert_eq!(body(b"x sk-abcd").await.as_deref(), Some("policy/p#0"));
+        // Over the first hop's cap, which fails closed.
+        assert_eq!(body(&[b'a'; 32]).await.as_deref(), Some("policy/p#0"));
+    }
+
+    #[test]
+    fn the_cache_recompiles_only_when_the_policy_hash_moves_test() {
+        let cache = PipelineCache::default();
+        let mut policy = EffectivePolicy {
+            hash: "a".into(),
+            ..Default::default()
+        };
+        let first = cache.get(Some(&policy), "egress", None, &[]);
+        let again = cache.get(Some(&policy), "egress", None, &[]);
+        assert!(Arc::ptr_eq(&first, &again));
+        policy.hash = "b".into();
+        let moved = cache.get(Some(&policy), "egress", None, &[]);
+        assert!(!Arc::ptr_eq(&first, &moved));
     }
 
     #[test]

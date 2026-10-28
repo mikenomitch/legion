@@ -10,11 +10,14 @@
 use crate::prelude::*;
 use crate::structs::{AllocNetwork, TaskAllocation, UpstreamEndpoints};
 use crate::worker::balance::Endpoint;
-use crate::worker::forwarder::{CredentialKey, UpstreamForwarder, UpstreamSpec};
+use crate::worker::forwarder::{
+    CredentialKey, PortTermination, TlsMaterialKey, UpstreamForwarder, UpstreamSpec,
+};
 use crate::worker::netd::attach::{guest_socket, Attachment};
 use crate::worker::netd::dns::DnsSpec;
 use crate::worker::netd::ingress::IngressSpec;
 use crate::worker::netd::proxy::ProxySpec;
+use std::collections::HashSet;
 
 use std::path::Path;
 
@@ -69,11 +72,12 @@ pub fn upstream_specs(desired: &[TaskAllocation], alloc_root: &Path) -> Vec<Upst
             let declaration = declared
                 .upstreams
                 .iter()
-                .find(|candidate| candidate.key() == upstream.service);
+                .find(|candidate| candidate.key() == upstream.key);
             specs.push(UpstreamSpec {
                 allocation_id: allocation.allocation_id,
-                service: upstream.service.clone(),
+                service: upstream.key.clone(),
                 local_port: upstream.local_port,
+                http_protocol: declaration.is_some_and(|d| d.is_http()),
                 balance: upstream.balance.clone(),
                 to: upstream.to.clone(),
                 http: declaration.and_then(|d| d.http.clone()),
@@ -81,6 +85,7 @@ pub fn upstream_specs(desired: &[TaskAllocation], alloc_root: &Path) -> Vec<Upst
                 credentials: declaration
                     .map(|d| d.credentials.clone())
                     .unwrap_or_default(),
+                ca: declaration.and_then(|d| d.ca.clone()),
                 vip: upstream.vip.clone().filter(|_| vips),
                 canonical_port: upstream.canonical_port.filter(|_| vips),
                 attachment: attachment.clone(),
@@ -136,10 +141,10 @@ pub fn proxy_specs(desired: &[TaskAllocation], alloc_root: &Path) -> Vec<ProxySp
         .filter_map(|allocation| {
             let network = network_of(allocation)?;
             let attachment = Attachment::of(allocation, &network, alloc_root);
-            attachment.is_gated().then_some(ProxySpec {
+            attachment.is_gated().then(|| ProxySpec {
                 allocation_id: allocation.allocation_id,
+                listen: attachment.egress_proxy(),
                 attachment,
-                listen: None,
             })
         })
         .collect()
@@ -188,6 +193,11 @@ fn allocation_ingress_specs(
             private_port: port.bind_port(),
             dial: dial.clone(),
             bind: None,
+            termination: if port.mesh {
+                Some(PortTermination::Mesh)
+            } else {
+                port.tls.clone().map(PortTermination::Own)
+            },
         })
         .collect()
 }
@@ -251,6 +261,83 @@ pub fn declared_credentials(desired: &[TaskAllocation]) -> Vec<CredentialKey> {
                     upstream.key().to_string(),
                     credential.header.trim().to_ascii_lowercase(),
                 ));
+            }
+        }
+    }
+    keys
+}
+
+/// Every network plugin the desired set references: from each allocation's
+/// effective policy (policy objects and its own inline chains) and its
+/// upstreams' own handlers.
+pub fn referenced_plugins(
+    desired: &[TaskAllocation],
+    context: &crate::worker::forwarder::ForwarderContext,
+) -> HashSet<String> {
+    let mut names = HashSet::new();
+    for allocation in desired {
+        if let Some(policy) = context.policy_for(allocation.allocation_id) {
+            names.extend(crate::structs::netplugin::policy_plugin_names(&policy));
+        }
+        if allocation.task_connect.trim().is_empty() {
+            continue;
+        }
+        if let Ok(connect) =
+            serde_json::from_str::<crate::structs::ConnectConfig>(&allocation.task_connect)
+        {
+            names.extend(crate::structs::netplugin::connect_plugin_names(&connect));
+        }
+    }
+    names
+}
+
+/// The KV-held TLS material the desired set declares: each port's
+/// `tls.cert = { kv }` (`port_cert`) and `tls.clients.ca = { kv }`
+/// (`client_ca`), by port label, and each upstream's `ca = { kv }`
+/// (`upstream_ca`), by upstream key. File sources are read by the node and
+/// are not listed.
+pub fn declared_tls_material(desired: &[TaskAllocation]) -> Vec<TlsMaterialKey> {
+    use crate::structs::source::{MATERIAL_CLIENT_CA, MATERIAL_PORT_CERT, MATERIAL_UPSTREAM_CA};
+    let mut keys = Vec::new();
+    for allocation in desired {
+        if let Ok(network) =
+            serde_json::from_str::<crate::structs::AllocNetwork>(&allocation.network)
+        {
+            for port in &network.ports {
+                let Some(tls) = port.tls.as_ref() else {
+                    continue;
+                };
+                if tls.cert.is_fetched() {
+                    keys.push((
+                        MATERIAL_PORT_CERT,
+                        allocation.allocation_id,
+                        port.name.clone(),
+                    ));
+                }
+                if tls
+                    .clients
+                    .as_ref()
+                    .is_some_and(|clients| clients.ca.is_fetched())
+                {
+                    keys.push((
+                        MATERIAL_CLIENT_CA,
+                        allocation.allocation_id,
+                        port.name.clone(),
+                    ));
+                }
+            }
+        }
+        if let Ok(connect) =
+            serde_json::from_str::<crate::structs::ConnectConfig>(&allocation.task_connect)
+        {
+            for upstream in &connect.upstreams {
+                if upstream.ca.as_ref().is_some_and(|ca| ca.is_fetched()) {
+                    keys.push((
+                        MATERIAL_UPSTREAM_CA,
+                        allocation.allocation_id,
+                        upstream.key(),
+                    ));
+                }
             }
         }
     }
@@ -360,7 +447,10 @@ pub fn net_status(
                     "egress proxy is not bound on the guest's vsock socket {}",
                     guest_socket(scratch, crate::worker::netd::proxy::PROXY_PORT).display()
                 ),
-                None => "egress proxy is not bound inside the namespace".into(),
+                None => match attachment.egress_proxy() {
+                    Some(addr) => format!("egress proxy is not bound on {addr}"),
+                    None => "egress proxy is not bound inside the namespace".into(),
+                },
             });
         }
         if upstreams.len() < expected_upstreams {
@@ -375,12 +465,15 @@ pub fn net_status(
                 for upstream in network
                     .upstreams
                     .iter()
-                    .filter(|upstream| !upstreams.contains(&upstream.service))
+                    .filter(|upstream| !upstreams.contains(&upstream.key))
                 {
+                    let socket = upstream
+                        .local_port
+                        .map(|port| guest_socket(scratch, port).display().to_string())
+                        .unwrap_or_else(|| "(no local port)".to_string());
                     problems.push(format!(
-                        "upstream {} is not bound on the guest's vsock socket {}",
-                        upstream.service,
-                        guest_socket(scratch, upstream.local_port).display()
+                        "upstream {} is not bound on the guest's vsock socket {socket}",
+                        upstream.key,
                     ));
                 }
             }
@@ -422,7 +515,8 @@ pub fn net_status(
         // requests with a 503; one whose refresh failed still injects the
         // previous value.
         problems.extend(context.credential_problems(id));
-        if network.ingress_tls.as_deref() == Some("legion") && context.mesh_identity().is_none() {
+        problems.extend(context.upstream_ca_problems(id));
+        if network.serves_mesh() && context.mesh_identity().is_none() {
             problems.push("mesh certificate not issued yet".into());
         }
         out.push(crate::structs::NetAllocStatus {
@@ -460,6 +554,7 @@ pub fn net_status(
                 .map(|lease| lease.address.to_string())
                 .unwrap_or_default(),
             guest_bridge: lease.map(|lease| lease.bridge).unwrap_or_default(),
+            kernel: context.kernel_status(id),
         });
     }
     out
@@ -476,11 +571,11 @@ mod tests {
         TaskAllocation {
             provisional: None,
             allocation_id,
-            task_connect: json!({ "upstreams": [{ "service": service }] }).to_string(),
+            task_connect: json!({ "upstreams": [{ "to": service }] }).to_string(),
             network: json!({
                 "ports": [{ "name": "http", "hostPort": 20000 }],
                 "upstreams": [{
-                    "service": service,
+                    "key": service,
                     "localPort": local_port,
                     "balance": "least_conn",
                 }],
@@ -524,12 +619,14 @@ mod tests {
             vec![UpstreamSpec {
                 allocation_id: 11,
                 service: "db".into(),
-                local_port: 20003,
+                local_port: Some(20003),
+                http_protocol: false,
                 balance: "least_conn".into(),
                 to: None,
                 http: None,
                 handlers: Vec::new(),
                 credentials: Vec::new(),
+                ca: None,
                 vip: None,
                 canonical_port: None,
                 attachment: Attachment::Host,
@@ -542,7 +639,7 @@ mod tests {
     #[test]
     fn declared_credentials_follow_the_desired_set_test() {
         let connect = json!({ "upstreams": [
-            { "service": "db" },
+            { "to": "db" },
             { "name": "openai", "to": "https://api.openai.com", "credentials": [
                 { "header": "authorization", "prefix": "Bearer ", "from": { "kv": "secrets/openai" } },
                 { "header": "openai-organization", "from": { "kv": "secrets/org" } },
@@ -554,7 +651,7 @@ mod tests {
             allocation_id: 21,
             task_connect: connect,
             network: json!({ "upstreams": [
-                { "service": "openai", "localPort": 20010, "balance": "round_robin", "to": "https://api.openai.com" },
+                { "key": "openai", "localPort": 20010, "balance": "round_robin", "to": "https://api.openai.com" },
             ] })
             .to_string(),
             ..TaskAllocation::default()
@@ -588,7 +685,7 @@ mod tests {
         allocation.network = json!({
             "mode": "gated",
             "upstreams": [{
-                "service": "db",
+                "key": "db",
                 "localPort": 20003,
                 "balance": "least_conn",
                 "vip": "127.42.0.2",
@@ -605,7 +702,7 @@ mod tests {
         };
         let specs = upstream_specs(std::slice::from_ref(&allocation), root.path());
         assert_eq!(specs.len(), 1);
-        assert_eq!(specs[0].listen(), ListenAddr::Unix(socket(20003)));
+        assert_eq!(specs[0].listen(), Some(ListenAddr::Unix(socket(20003))));
         assert!(socket(20003).ends_with(".sandbox/vsock.sock_20003"));
         assert_eq!(
             (
@@ -634,7 +731,7 @@ mod tests {
         allocation.task_config = json!({ "image": "a" }).to_string();
         allocation.network = json!({
             "mode": "gated",
-            "upstreams": [{ "service": "db", "localPort": 20003, "balance": "least_conn" }],
+            "upstreams": [{ "key": "db", "localPort": 20003, "balance": "least_conn" }],
         })
         .to_string();
         let desired = vec![allocation];
@@ -775,13 +872,13 @@ mod tests {
         let unplaced = TaskAllocation {
             provisional: None,
             allocation_id: 2,
-            task_connect: json!({ "upstreams": [{ "service": "db" }] }).to_string(),
+            task_connect: json!({ "upstreams": [{ "to": "db" }] }).to_string(),
             ..TaskAllocation::default()
         };
         let corrupt = TaskAllocation {
             provisional: None,
             allocation_id: 3,
-            task_connect: json!({ "upstreams": [{ "service": "db" }] }).to_string(),
+            task_connect: json!({ "upstreams": [{ "to": "db" }] }).to_string(),
             network: "{not json".into(),
             ..TaskAllocation::default()
         };

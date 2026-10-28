@@ -9,8 +9,8 @@
 //! the way every tool expects:
 //!
 //! - `127.0.0.1:1080` inside the guest is a TCP listener; each connection is
-//!   relayed byte-for-byte to host vsock port 1080, so `HTTP_PROXY`,
-//!   `ALL_PROXY=socks5://…` and `CONNECT` all work unchanged.
+//!   relayed byte-for-byte to host vsock port 1080, so `HTTP_PROXY` and
+//!   `CONNECT` work unchanged.
 //! - `127.0.0.1:53/udp` answers DNS: each query is framed as DNS-over-TCP
 //!   (two-byte length prefix) over a vsock stream to host port 53 and the
 //!   answer is relayed back.

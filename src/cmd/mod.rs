@@ -24,6 +24,7 @@ pub mod mcp;
 pub mod namespace;
 pub mod namespace_policy;
 pub mod net;
+pub mod net_plugin;
 pub mod node;
 pub mod oidc;
 pub mod output;

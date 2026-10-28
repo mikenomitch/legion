@@ -9,10 +9,7 @@
 //! allocation the reply no longer lists loses its policy on that reply.
 
 use crate::prelude::*;
-use crate::structs::netpolicy::{
-    evaluate_connect, evaluate_request, ConnectFacts, EffectiveChain, EffectivePolicy,
-    RequestFacts, Verdict,
-};
+use crate::structs::netpolicy::{evaluate_connect, ConnectFacts, EffectivePolicy, Verdict};
 use crate::structs::{AllocNetPolicy, NetDenial};
 
 use std::collections::{BTreeMap, HashSet};
@@ -242,11 +239,6 @@ pub fn ingress_connect_verdict(
     }
 }
 
-/// Evaluate an HTTP request head against a chain.
-pub fn request_verdict(chain: &EffectiveChain, facts: &RequestFacts<'_>) -> Verdict {
-    evaluate_request(chain, facts)
-}
-
 /// Key a denial folds under.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct DenialKey {
@@ -417,10 +409,11 @@ pub fn identities_from_desired(
                 .map(|network| network.labels)
                 .unwrap_or_default()
         };
-        let group = serde_json::from_str::<serde_json::Value>(&allocation.task_config)
-            .ok()
-            .and_then(|v| v.get("group").and_then(|g| g.as_str()).map(str::to_string))
-            .unwrap_or_else(|| "default".to_string());
+        let group = if allocation.task_group.is_empty() {
+            crate::structs::default_task_group()
+        } else {
+            allocation.task_group.clone()
+        };
         let ports = if allocation.network.trim().is_empty() {
             BTreeMap::new()
         } else {

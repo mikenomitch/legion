@@ -22,17 +22,21 @@
 
 pub mod activity;
 pub mod attach;
+pub mod capture;
 pub mod datapath;
 pub mod dns;
+pub mod egress;
 pub mod graph;
 pub mod guard;
 pub mod guest_agent;
 pub mod handlers;
 pub mod http;
 pub mod ingress;
+pub mod kernel;
 pub mod kernel_guard;
 pub mod listen;
 pub mod netns;
+pub mod plugins;
 pub mod policy;
 pub mod proxy;
 pub mod proxyproto;
@@ -59,11 +63,34 @@ pub mod metrics {
         }
     }
 
+    /// Add `count` connections with one verdict (the kernel classifier's
+    /// counters, read once per heartbeat).
+    pub fn connections(direction: &str, protocol: &str, verdict: &str, count: u64) {
+        crate::manager::telemetry::worker_metrics()
+            .net_conns_total
+            .inc_by(&[direction, protocol, verdict], count);
+        if verdict == "deny" {
+            crate::manager::telemetry::worker_metrics()
+                .net_denied_total
+                .inc_by(&[direction], count);
+        }
+    }
+
     /// Add forwarded bytes for one direction.
     pub fn bytes(direction: &str, count: u64) {
         crate::manager::telemetry::worker_metrics()
             .net_bytes_total
             .inc_by(&[direction], count);
+    }
+
+    /// One plugin callback: `stage` is the pipeline stage, `outcome`
+    /// ok|error.
+    pub fn plugin_call(plugin: &str, stage: &str, outcome: &str, seconds: f64) {
+        let metrics = crate::manager::telemetry::worker_metrics();
+        metrics
+            .net_plugin_calls_total
+            .inc(&[plugin, stage, outcome]);
+        metrics.net_plugin_callback_seconds.observe(seconds);
     }
 
     /// One external handler call: `outcome` is allow|deny|proxy|error.

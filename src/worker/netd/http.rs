@@ -10,10 +10,10 @@
 //!    answered with a `403` whose body and `Legion-Denied-By` header name the
 //!    rule and reason, so a client — an agent in a sandbox, say — can read
 //!    *why* and change its approach instead of retrying.
-//! 2. **Handlers.** `dlp` buffers the request body up to `maxBytes` and
-//!    rejects it when a pattern matches; `log` and the chain's `accessLog`
-//!    write one NDJSON line per request. (`authz` and `proxy` land with the
-//!    external-handlers phase and are skipped here with a debug log.)
+//! 2. **Handlers.** The chain's hops and then the upstream's own run as one
+//!    pipeline ([`crate::worker::netd::handlers::Pipeline`]): `authz` and
+//!    `proxy` with the request head, then `dlp` on the buffered body. The
+//!    chain's `accessLog` writes one NDJSON line per request.
 //! 3. **Traffic management** (`connect.upstreams[].http`): a per-request
 //!    deadline, bounded retries for idempotent methods under a budget, a
 //!    weighted split by service tag, and outlier ejection of endpoints that
@@ -32,14 +32,16 @@
 //! budget, requests have a deadline. Per-request logging stays at `debug`.
 
 use crate::prelude::*;
+use crate::structs::hops::HopConfig;
 use crate::structs::netpolicy::{
-    parse_bytes, parse_duration, EffectiveChain, HandlerConfig, RequestFacts, Verdict, HANDLER_DLP,
-    HANDLER_LOG, PROTOCOL_HTTP,
+    parse_duration, EffectiveChain, RequestFacts, Verdict, PROTOCOL_HTTP,
 };
 use crate::structs::{UpstreamCredential, UpstreamHttpConfig, UpstreamTarget};
 use crate::worker::balance::{Balancer, Endpoint, Outcome};
 use crate::worker::forwarder::ForwarderContext;
-use crate::worker::netd::handlers::{self, HopFacts, HopOutcome, ProxyTarget};
+use crate::worker::netd::handlers::{
+    self, ExchangeOutcome, HopFacts, LocalResponse, PipelineCache, ProxyTarget, RequestHead,
+};
 use crate::worker::netd::metrics as net_metrics;
 
 use bytes::Bytes;
@@ -54,10 +56,12 @@ use std::time::{Duration, Instant};
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
 
+/// Consecutive 5xx answers that eject an endpoint in HTTP mode.
+const OUTLIER_CONSECUTIVE_5XX: u32 = 5;
+/// How long an ejected endpoint is skipped.
+const OUTLIER_EJECT_FOR: Duration = Duration::from_secs(30);
 /// How long an upstream dial may take before it counts as a connect failure.
 const DIAL_TIMEOUT: Duration = Duration::from_secs(2);
-/// Bodies buffered for `dlp` when the handler names no `maxBytes`.
-const DEFAULT_DLP_MAX_BYTES: u64 = 1024 * 1024;
 /// Retry budget window.
 const BUDGET_WINDOW: Duration = Duration::from_secs(60);
 /// Idempotent methods retried by default.
@@ -80,14 +84,6 @@ const HOP_BY_HOP: &[&str] = &[
     "trailer",
     "upgrade",
 ];
-
-/// A compiled `dlp` handler.
-struct Dlp {
-    max_bytes: u64,
-    patterns: Vec<regex::Regex>,
-    on_error_deny: bool,
-    source: String,
-}
 
 /// A retry policy with defaults filled in.
 #[derive(Clone)]
@@ -208,14 +204,20 @@ pub struct HttpSettings {
     outlier_threshold: Option<u32>,
     outlier_eject: Duration,
     outliers: Mutex<HashMap<String, OutlierState>>,
-    dlp: Vec<Dlp>,
-    log_handler: bool,
-    /// The upstream's own handlers (`connect.upstreams[].handlers`); the
-    /// external ones (`authz`, `proxy`) run per request after the chain's.
-    pub handlers: Vec<HandlerConfig>,
+    /// The upstream's own handlers (`connect.upstreams[].handlers`); they run
+    /// per request after the chain's.
+    pub handlers: Vec<HopConfig>,
+    /// The chain's hops plus the upstream's, compiled per policy body.
+    pipelines: PipelineCache,
     /// `connect.upstreams[].credentials`: headers set on every request this
     /// upstream sends, with values from the context's credential store.
     pub credentials: Vec<UpstreamCredential>,
+    /// `connect.upstreams[].ca`: the trust bundle an external `https://`
+    /// upstream is verified against instead of the public roots.
+    pub ca: Option<crate::structs::source::Source>,
+    /// The allocation is gated: its egress requests fail closed while its
+    /// boot gate is shut or its policy has not arrived.
+    pub gated: bool,
 }
 
 /// Headers to set on an outgoing request in place of whatever the task sent
@@ -237,7 +239,7 @@ impl HttpSettings {
         key: String,
         target: Option<UpstreamTarget>,
         config: Option<&UpstreamHttpConfig>,
-        handlers: &[HandlerConfig],
+        handlers: &[HopConfig],
         context: Arc<ForwarderContext>,
         balancer: Arc<dyn Balancer>,
         endpoints: Arc<Mutex<Arc<Vec<Endpoint>>>>,
@@ -257,50 +259,10 @@ impl HttpSettings {
                     .collect::<Vec<_>>()
             })
             .unwrap_or_default();
-        let outlier_threshold = config
-            .and_then(|c| c.outlier.as_ref())
-            .map(|o| o.consecutive_5xx.unwrap_or(5).max(1));
-        let outlier_eject = config
-            .and_then(|c| c.outlier.as_ref())
-            .and_then(|o| o.eject_for.as_deref())
-            .and_then(|d| parse_duration(d).ok())
-            .unwrap_or(Duration::from_secs(30));
-        let mut dlp = Vec::new();
-        let mut log_handler = false;
-        for (index, handler) in handlers.iter().enumerate() {
-            match handler.handler.as_str() {
-                HANDLER_DLP => {
-                    let max_bytes = handler
-                        .config
-                        .get("maxBytes")
-                        .and_then(|m| parse_bytes(m).ok())
-                        .unwrap_or(DEFAULT_DLP_MAX_BYTES);
-                    let patterns = handler
-                        .config
-                        .get("patterns")
-                        .and_then(|p| p.as_array())
-                        .map(|p| {
-                            p.iter()
-                                .filter_map(|v| v.as_str())
-                                .filter_map(|v| regex::Regex::new(v).ok())
-                                .collect::<Vec<_>>()
-                        })
-                        .unwrap_or_default();
-                    dlp.push(Dlp {
-                        max_bytes,
-                        patterns,
-                        on_error_deny: handler.on_error.as_deref() != Some("allow"),
-                        source: format!("upstream/{key}#{index}"),
-                    });
-                }
-                HANDLER_LOG => log_handler = true,
-                other => debug!(
-                    upstream = %key,
-                    handler = other,
-                    "Handler kind is not served on the datapath yet; skipping"
-                ),
-            }
-        }
+        // Outlier ejection has no knob: an endpoint that answers 5xx this
+        // many times in a row is skipped for this long, whatever the balancer.
+        let outlier_threshold = Some(OUTLIER_CONSECUTIVE_5XX);
+        let outlier_eject = OUTLIER_EJECT_FOR;
         HttpSettings {
             allocation_id,
             key,
@@ -320,10 +282,11 @@ impl HttpSettings {
             outlier_threshold,
             outlier_eject,
             outliers: Mutex::new(HashMap::new()),
-            dlp,
-            log_handler,
             handlers: handlers.to_vec(),
+            pipelines: PipelineCache::default(),
             credentials: Vec::new(),
+            ca: None,
+            gated: false,
         }
     }
 
@@ -656,7 +619,7 @@ where
     }
 }
 
-type OutBody = http_body_util::combinators::BoxBody<Bytes, hyper::Error>;
+type OutBody = handlers::HopBody;
 
 fn full(bytes: impl Into<Bytes>) -> OutBody {
     Full::new(bytes.into())
@@ -767,7 +730,11 @@ async fn handle(
     };
     settings.budget.note_request();
 
-    // 1. Policy.
+    // 1. Policy. An egress request to an external target runs the shared
+    // judge: the gate, the host guard on every resolved address, then the
+    // chain per address with the request head, so a CIDR rule sees what the
+    // name resolves to. A catalog service's endpoints are judged at the
+    // gate and by the service name; ingress by its own chain.
     let direction = settings.direction;
     let policy = settings.context.policy_for(settings.allocation_id);
     let chain: Option<&EffectiveChain> = policy.as_ref().and_then(|p| {
@@ -777,30 +744,63 @@ async fn handle(
             p.egress.as_ref()
         }
     });
-    if let Some(chain) = chain {
-        let facts = RequestFacts {
-            host: Some(fact_host.as_str()),
-            ip: fact_host.parse().ok(),
-            port: fact_port,
-            identity: conn.identity.as_deref(),
-            method: &method,
-            path: path.split('?').next().unwrap_or("/"),
-            headers: &headers,
-        };
-        if let Verdict::Deny { source, reason } =
-            crate::structs::netpolicy::evaluate_request(chain, &facts)
+    let path_only = path.split('?').next().unwrap_or("/");
+    let mut judged: Option<Vec<std::net::SocketAddr>> = None;
+    let denial = match (direction, settings.target.as_ref()) {
+        ("egress", Some(target)) => match crate::worker::netd::egress::judge(
+            &settings.context,
+            settings.allocation_id,
+            settings.gated,
+            true,
+            &target.host,
+            target.port,
+            Some((&method, path_only, &headers)),
+        )
+        .await
         {
-            net_metrics::connection(direction, PROTOCOL_HTTP, "deny");
-            settings.context.record_denial(
-                settings.allocation_id,
-                direction,
-                PROTOCOL_HTTP,
-                &destination,
-                &source,
-                reason.as_deref(),
-                &method,
-                facts.path,
-            );
+            Ok(addrs) => {
+                judged = Some(addrs);
+                None
+            }
+            Err(denial) => Some(denial),
+        },
+        _ => crate::worker::netd::egress::gate_block(
+            &settings.context,
+            settings.allocation_id,
+            settings.gated && direction == "egress",
+            policy.as_deref(),
+        )
+        .or_else(|| {
+            let facts = RequestFacts {
+                host: Some(fact_host.as_str()),
+                ip: fact_host.parse().ok(),
+                port: fact_port,
+                identity: conn.identity.as_deref(),
+                method: &method,
+                path: path_only,
+                headers: &headers,
+            };
+            match crate::structs::netpolicy::evaluate_request(chain?, &facts) {
+                Verdict::Deny { source, reason } => {
+                    Some(crate::worker::netd::egress::Denial::new(source, reason))
+                }
+                _ => None,
+            }
+        }),
+    };
+    if let Some(crate::worker::netd::egress::Denial { source, reason }) = denial {
+        net_metrics::connection(direction, PROTOCOL_HTTP, "deny");
+        settings.context.record_denial(
+            settings.allocation_id,
+            direction,
+            PROTOCOL_HTTP,
+            &destination,
+            &source,
+            reason.as_deref(),
+            &method,
+            path_only,
+        );
+        if let Some(chain) = chain {
             access_log(
                 &settings,
                 chain,
@@ -815,20 +815,19 @@ async fn handle(
                 0,
             )
             .await;
-            note_edge_denied(&settings);
-            return denied_response(
-                direction,
-                &settings.key,
-                &destination,
-                &source,
-                reason.as_deref(),
-            );
         }
+        note_edge_denied(&settings);
+        return denied_response(
+            direction,
+            &settings.key,
+            &destination,
+            &source,
+            reason.as_deref(),
+        );
     }
 
-    // 1b. External handlers, with the request head: a webhook may deny, a
-    // proxy may take the request.
-    let path_only = path.split('?').next().unwrap_or("/").to_string();
+    // 1b. Handlers, with the request head: a webhook may deny, a proxy may
+    // take the request, a plugin may answer or rewrite it.
     let hop_facts = HopFacts {
         allocation_id: settings.allocation_id,
         direction,
@@ -838,22 +837,36 @@ async fn handle(
         ip: fact_host.parse().ok(),
         port: fact_port,
         identity: conn.identity.as_deref(),
+        upstream: (direction == "egress").then_some(settings.key.as_str()),
         method: Some(&method),
-        path: Some(&path_only),
+        path: Some(path_only),
         headers: &headers,
     };
-    let hops = handlers::hops_for(
-        &settings.context,
-        settings.allocation_id,
+    let pipeline = settings.pipelines.get(
+        policy.as_deref(),
         direction,
         Some(&settings.key),
         &settings.handlers,
     );
+    let mut exchange = pipeline.exchange(&settings.context, &hop_facts);
+    let mut head = RequestHead {
+        method: method.clone(),
+        path: path.clone(),
+        authority: host_header.clone().unwrap_or_else(|| destination.clone()),
+        scheme: if settings.target.as_ref().is_some_and(|t| t.tls) {
+            "https".into()
+        } else {
+            "http".into()
+        },
+        headers: headers.clone(),
+        end_of_stream: RequestHead::no_body(&headers),
+        changed: false,
+    };
     let mut hand_off: Option<ProxyTarget> = None;
-    if !hops.is_empty() {
-        match handlers::run(&settings.context, &hops, &hop_facts).await {
-            HopOutcome::Allow => {}
-            HopOutcome::Deny { source, reason } => {
+    if !exchange.is_empty() {
+        match exchange.request(&hop_facts, &mut head).await {
+            ExchangeOutcome::Continue => {}
+            ExchangeOutcome::Deny { source, reason } => {
                 net_metrics::connection(direction, PROTOCOL_HTTP, "deny");
                 settings.context.record_denial_for(
                     settings.allocation_id,
@@ -864,7 +877,7 @@ async fn handle(
                     &source,
                     reason.as_deref(),
                     &method,
-                    &path_only,
+                    path_only,
                 );
                 if let Some(chain) = chain {
                     access_log(
@@ -883,6 +896,7 @@ async fn handle(
                     .await;
                 }
                 note_edge_denied(&settings);
+                exchange.answered(403);
                 return denied_response(
                     direction,
                     &settings.key,
@@ -891,7 +905,23 @@ async fn handle(
                     reason.as_deref(),
                 );
             }
-            HopOutcome::Proxy(target) => hand_off = Some(target),
+            ExchangeOutcome::Respond(local) => {
+                return answer_locally(
+                    &settings,
+                    &conn,
+                    chain,
+                    exchange,
+                    local,
+                    &destination,
+                    &method,
+                    &path,
+                    host_header.as_deref(),
+                    started,
+                    0,
+                )
+                .await;
+            }
+            ExchangeOutcome::Proxy(target) => hand_off = Some(target),
         }
     }
 
@@ -930,9 +960,13 @@ async fn handle(
     };
 
     // Split the head from the body. The body is read fully either way (one
-    // upstream connection per request, no streaming yet); `dlp` caps it.
-    let (parts, body) = req.into_parts();
-    let body_bytes: Bytes = if settings.dlp.is_empty() {
+    // upstream connection per request, no streaming yet); the body hops
+    // (`dlp`, a plugin's `body` stage) cap it.
+    let (mut parts, body) = req.into_parts();
+    if head.changed {
+        apply_head(&mut parts, &head);
+    }
+    let body_bytes: Bytes = if !exchange.reads_body() {
         match body.collect().await {
             Ok(collected) => collected.to_bytes(),
             Err(err) => {
@@ -944,51 +978,23 @@ async fn handle(
             }
         }
     } else {
-        let cap = settings
-            .dlp
-            .iter()
-            .map(|d| d.max_bytes)
-            .max()
-            .unwrap_or(DEFAULT_DLP_MAX_BYTES);
-        match Limited::new(body, cap as usize).collect().await {
+        match Limited::new(body, exchange.body_cap() as usize)
+            .collect()
+            .await
+        {
             Ok(collected) => {
-                let bytes = collected.to_bytes();
-                for dlp in &settings.dlp {
-                    if bytes.len() as u64 > dlp.max_bytes {
-                        if dlp.on_error_deny {
-                            net_metrics::connection(direction, PROTOCOL_HTTP, "deny");
-                            settings.context.record_denial(
-                                settings.allocation_id,
-                                direction,
-                                PROTOCOL_HTTP,
-                                &destination,
-                                &dlp.source,
-                                Some("body larger than dlp maxBytes"),
-                                &method,
-                                &path,
-                            );
-                            note_edge_denied(&settings);
-                            return denied_response(
-                                direction,
-                                &settings.key,
-                                &destination,
-                                &dlp.source,
-                                Some("body larger than dlp maxBytes"),
-                            );
-                        }
-                        continue;
-                    }
-                    let text = String::from_utf8_lossy(&bytes);
-                    if let Some(pattern) = dlp.patterns.iter().find(|p| p.is_match(&text)) {
-                        let reason = format!("body matches dlp pattern {}", pattern.as_str());
+                let mut bytes = collected.to_bytes();
+                match exchange.body(&mut bytes).await {
+                    ExchangeOutcome::Continue | ExchangeOutcome::Proxy(_) => {}
+                    ExchangeOutcome::Deny { source, reason } => {
                         net_metrics::connection(direction, PROTOCOL_HTTP, "deny");
                         settings.context.record_denial(
                             settings.allocation_id,
                             direction,
                             PROTOCOL_HTTP,
                             &destination,
-                            &dlp.source,
-                            Some(&reason),
+                            &source,
+                            reason.as_deref(),
                             &method,
                             &path,
                         );
@@ -1001,7 +1007,7 @@ async fn handle(
                                 host_header.as_deref(),
                                 403,
                                 "deny",
-                                Some(&dlp.source),
+                                Some(&source),
                                 started,
                                 bytes.len() as u64,
                                 0,
@@ -1009,40 +1015,52 @@ async fn handle(
                             .await;
                         }
                         note_edge_denied(&settings);
+                        exchange.answered(403);
                         return denied_response(
                             direction,
                             &settings.key,
                             &destination,
-                            &dlp.source,
-                            Some(&reason),
+                            &source,
+                            reason.as_deref(),
                         );
+                    }
+                    ExchangeOutcome::Respond(local) => {
+                        let bytes_in = bytes.len() as u64;
+                        return answer_locally(
+                            &settings,
+                            &conn,
+                            chain,
+                            exchange,
+                            local,
+                            &destination,
+                            &method,
+                            &path,
+                            host_header.as_deref(),
+                            started,
+                            bytes_in,
+                        )
+                        .await;
                     }
                 }
                 bytes
             }
             Err(err) => {
                 // Over the cap, or the client went away mid-body.
-                let deny = settings.dlp.iter().any(|d| d.on_error_deny);
-                debug!(upstream = %settings.key, error = %err, "dlp could not buffer the request body");
-                if deny {
+                debug!(upstream = %settings.key, error = %err, "A body hop could not buffer the request body");
+                if let Some(source) = exchange.body_unreadable_denied_by() {
                     net_metrics::connection(direction, PROTOCOL_HTTP, "deny");
-                    let source = settings
-                        .dlp
-                        .first()
-                        .map(|d| d.source.clone())
-                        .unwrap_or_default();
                     note_edge_denied(&settings);
                     return denied_response(
                         direction,
                         &settings.key,
                         &destination,
                         &source,
-                        Some("request body exceeds dlp maxBytes"),
+                        Some("request body exceeds the body hop's maxBytes"),
                     );
                 }
                 return error_response(
                     StatusCode::PAYLOAD_TOO_LARGE,
-                    "request body exceeds dlp maxBytes".into(),
+                    "request body exceeds the body hop's maxBytes".into(),
                 );
             }
         }
@@ -1098,13 +1116,13 @@ async fn handle(
                     )
                     .await;
                 }
-                response
+                exchange.respond(response).await
             }
             Err(err) => {
                 settings.context.note_handler(
                     settings.allocation_id,
                     &target.source,
-                    crate::structs::netpolicy::HANDLER_PROXY,
+                    "proxy",
                     &target.addr,
                     Err(err.to_string()),
                 );
@@ -1118,49 +1136,21 @@ async fn handle(
         };
     }
 
-    // An external target is resolved once and judged by the host guard
-    // before any attempt; every attempt dials the address that passed, never
-    // the name again (worker-plane-auth plan §6.11).
-    let judged_target: Option<String> = match settings.target.as_ref() {
-        Some(target) if direction == "egress" => {
-            match crate::worker::netd::guard::resolve_and_guard(
-                settings.context.resolver(),
-                settings.context.host_guard(),
-                &target.host,
-                target.port,
-            )
-            .await
-            {
-                Ok(addrs) => Some(addrs[0].to_string()),
-                Err(crate::worker::netd::guard::GuardRefusal::Denied(reason)) => {
-                    let source = crate::structs::host_guard::HOST_GUARD_SOURCE;
-                    net_metrics::connection(direction, PROTOCOL_HTTP, "deny");
-                    settings.context.record_denial(
-                        settings.allocation_id,
-                        direction,
-                        PROTOCOL_HTTP,
-                        &destination,
-                        source,
-                        Some(&reason),
-                        &method,
-                        path.split('?').next().unwrap_or("/"),
-                    );
-                    note_edge_denied(&settings);
-                    return denied_response(
-                        direction,
-                        &settings.key,
-                        &destination,
-                        source,
-                        Some(&reason),
-                    );
-                }
-                Err(crate::worker::netd::guard::GuardRefusal::Unresolved(reason)) => {
-                    net_metrics::connection(direction, PROTOCOL_HTTP, "error");
-                    note_edge_request(&settings, None, None, started, bytes_in);
-                    return error_response(StatusCode::BAD_GATEWAY, reason);
-                }
+    // An external target was resolved once and judged above; every attempt
+    // dials the first address that passed, never the name again
+    // (worker-plane-auth plan §6.11).
+    let judged_target: Option<String> = match (judged, settings.target.as_ref()) {
+        (Some(addrs), Some(target)) => match addrs.first() {
+            Some(addr) => Some(addr.to_string()),
+            None => {
+                net_metrics::connection(direction, PROTOCOL_HTTP, "error");
+                note_edge_request(&settings, None, None, started, bytes_in);
+                return error_response(
+                    StatusCode::BAD_GATEWAY,
+                    format!("{} did not resolve", target.host),
+                );
             }
-        }
+        },
         _ => None,
     };
 
@@ -1309,22 +1299,8 @@ async fn handle(
                         0,
                     )
                     .await;
-                } else if settings.log_handler {
-                    write_access_line(
-                        &settings,
-                        &method,
-                        &path,
-                        host_header.as_deref(),
-                        status.as_u16(),
-                        "allow",
-                        None,
-                        started,
-                        bytes_in,
-                        0,
-                    )
-                    .await;
                 }
-                return response;
+                return exchange.respond(response).await;
             }
             Err(err) => {
                 settings.note_outcome(&addr, None);
@@ -1371,6 +1347,78 @@ async fn handle(
         .await;
     }
     error_response(status, message)
+}
+
+/// A request a hop answered instead of the upstream (a plugin's local
+/// response, or the `503` of a failed plugin): recorded as a denial when it
+/// refuses, logged, and sent.
+#[allow(clippy::too_many_arguments)]
+async fn answer_locally(
+    settings: &Arc<HttpSettings>,
+    conn: &ConnInfo,
+    chain: Option<&EffectiveChain>,
+    mut exchange: handlers::Exchange,
+    local: LocalResponse,
+    destination: &str,
+    method: &str,
+    path: &str,
+    host_header: Option<&str>,
+    started: Instant,
+    bytes_in: u64,
+) -> Response<OutBody> {
+    let direction = settings.direction;
+    let verdict = if local.denies() { "deny" } else { "allow" };
+    net_metrics::connection(direction, PROTOCOL_HTTP, verdict);
+    if local.denies() {
+        settings.context.record_denial_for(
+            settings.allocation_id,
+            conn.identity.as_deref(),
+            direction,
+            PROTOCOL_HTTP,
+            destination,
+            &local.source,
+            local.reason.as_deref(),
+            method,
+            path.split('?').next().unwrap_or("/"),
+        );
+        note_edge_denied(settings);
+    } else {
+        note_edge_request(settings, None, Some(local.status), started, bytes_in);
+    }
+    if let Some(chain) = chain {
+        access_log(
+            settings,
+            chain,
+            method,
+            path,
+            host_header,
+            local.status,
+            verdict,
+            Some(&local.source),
+            started,
+            bytes_in,
+            local.body.len() as u64,
+        )
+        .await;
+    }
+    exchange.answered(local.status);
+    local.into_response()
+}
+
+/// Apply a rewritten request head (a plugin's) to the request that goes on.
+fn apply_head(parts: &mut http::request::Parts, head: &RequestHead) {
+    parts.headers.clear();
+    for (name, value) in &head.headers {
+        if let (Ok(name), Ok(value)) = (
+            hyper::header::HeaderName::from_bytes(name.as_bytes()),
+            hyper::header::HeaderValue::from_str(value),
+        ) {
+            parts.headers.append(name, value);
+        }
+    }
+    if let Ok(uri) = head.path.parse::<hyper::Uri>() {
+        parts.uri = uri;
+    }
 }
 
 /// Service-graph sample for one egress request (docs/network-handlers.md,
@@ -1629,7 +1677,8 @@ async fn open(
                 .map_err(|err| AttemptError::Connect(err.to_string()))?;
             let tls = settings
                 .context
-                .tls_connector()
+                .upstream_tls_connector(settings.allocation_id, &settings.key, settings.ca.as_ref())
+                .map_err(AttemptError::Connect)?
                 .connect(server_name, stream)
                 .await
                 .map_err(|err| AttemptError::Connect(format!("tls: {err}")))?;
@@ -1683,7 +1732,11 @@ fn finish(
     for name in HOP_BY_HOP {
         parts.headers.remove(*name);
     }
-    Response::from_parts(parts, body.boxed())
+    Response::from_parts(
+        parts,
+        body.map_err(|err| Box::new(err) as handlers::BoxError)
+            .boxed(),
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1700,12 +1753,30 @@ async fn access_log(
     bytes_in: u64,
     bytes_out: u64,
 ) {
-    if !chain.access_log && !settings.log_handler {
+    if !chain.access_log {
         return;
     }
     write_access_line(
         settings, method, path, host, status, verdict, source, started, bytes_in, bytes_out,
     )
+    .await;
+}
+
+/// Append one NDJSON line to `<dir>/net-access.log`, off the async runtime.
+pub(crate) async fn append_access_line(dir: PathBuf, line: serde_json::Value) {
+    let path = dir.join("net-access.log");
+    let text = format!("{line}\n");
+    let _ = tokio::task::spawn_blocking(move || {
+        use std::io::Write;
+        let _ = std::fs::create_dir_all(&dir);
+        if let Ok(mut file) = std::fs::OpenOptions::new()
+            .append(true)
+            .create(true)
+            .open(&path)
+        {
+            let _ = file.write_all(text.as_bytes());
+        }
+    })
     .await;
 }
 
@@ -1749,21 +1820,7 @@ async fn write_access_line(
         "bytesOut": bytes_out,
         "durationMs": started.elapsed().as_millis() as u64,
     });
-    let path = dir.join("net-access.log");
-    let dir = dir.clone();
-    let text = format!("{line}\n");
-    let _ = tokio::task::spawn_blocking(move || {
-        use std::io::Write;
-        let _ = std::fs::create_dir_all(&dir);
-        if let Ok(mut file) = std::fs::OpenOptions::new()
-            .append(true)
-            .create(true)
-            .open(&path)
-        {
-            let _ = file.write_all(text.as_bytes());
-        }
-    })
-    .await;
+    append_access_line(dir.clone(), line).await;
 }
 
 #[cfg(test)]
@@ -2098,9 +2155,9 @@ mod integration {
                 "protocol": "http",
                 "policy": "deny",
                 "rules": [
-                    { "match": { "path": "/ok/**" }, "action": "allow" },
-                    { "match": { "path": "/flaky" }, "action": "allow" },
-                    { "match": { "path": "/secret" }, "action": "deny", "reason": "not for you" }
+                    { "when": { "path": "/ok/**" }, "action": "allow" },
+                    { "when": { "path": "/flaky" }, "action": "allow" },
+                    { "when": { "path": "/secret" }, "action": "deny", "reason": "not for you" }
                 ]
             }
         }))
@@ -2141,22 +2198,22 @@ mod integration {
             "timeout": "5s"
         }))
         .unwrap();
-        let dlp: crate::structs::netpolicy::HandlerConfig =
-            serde_json::from_value(serde_json::json!({
-                "handler": "dlp",
-                "config": { "maxBytes": "64Ki", "patterns": ["sk-[A-Za-z0-9]{8,}"] }
-            }))
-            .unwrap();
+        let dlp: crate::structs::hops::HopConfig = serde_json::from_value(serde_json::json!({
+            "dlp": { "maxBytes": "64Ki", "patterns": ["sk-[A-Za-z0-9]{8,}"] }
+        }))
+        .unwrap();
         forwarder
             .sync(&[UpstreamSpec {
                 allocation_id: 7,
                 service: "origin".into(),
-                local_port: port,
+                local_port: Some(port),
+                http_protocol: false,
                 balance: "round_robin".into(),
                 to: Some(format!("http://127.0.0.1:{origin}")),
                 http: Some(http),
                 handlers: vec![dlp],
                 credentials: Vec::new(),
+                ca: None,
                 vip: None,
                 canonical_port: None,
                 attachment: crate::worker::netd::attach::Attachment::Host,
@@ -2227,6 +2284,191 @@ mod integration {
         );
     }
 
+    /// A `dlp` handler declared on the *chain* (here on a policy object) runs
+    /// on an HTTP-mode upstream that declares no handlers of its own, and the
+    /// chain's `accessLog` writes both requests.
+    #[tokio::test]
+    async fn chain_dlp_and_log_handlers_run_on_an_http_upstream_test() {
+        let (origin, _hits) = start_origin(0).await;
+        let mut object: NetPolicyObject = serde_json::from_value(serde_json::json!({
+            "name": "t",
+            "enforcement": "require",
+            "egress": {
+                "protocol": "http",
+                "policy": "allow",
+                "accessLog": true,
+                "handlers": [
+                    { "dlp": { "patterns": ["sk-[A-Za-z0-9]{8,}"] } }
+                ]
+            }
+        }))
+        .unwrap();
+        object.normalize_and_validate().unwrap();
+        let policy = merge_policies(&[object], InlinePolicy::default());
+        let hash = policy.hash.clone();
+        let cache = Arc::new(NetPolicyCache::new());
+        cache.apply_assignments(&[AllocNetPolicy {
+            allocation_id: 8,
+            policy_hash: hash.clone(),
+        }]);
+        cache.insert_body(&hash, policy).unwrap();
+        let guard = crate::structs::host_guard::HostGuard::new(
+            &crate::structs::host_guard::HostGuardConfig {
+                allow: vec![format!("127.0.0.1:{origin}")],
+                deny: vec![],
+            },
+        )
+        .unwrap();
+        let logs = tempfile::tempdir().unwrap();
+        let context = Arc::new(
+            ForwarderContext::new(cache, Arc::new(Denials::new()))
+                .with_host_guard(Arc::new(guard))
+                .with_logs_base_dir(logs.path().to_path_buf()),
+        );
+        let forwarder = UpstreamForwarder::with_context(context);
+        let port = free_port().await;
+        forwarder
+            .sync(&[UpstreamSpec {
+                allocation_id: 8,
+                service: "origin".into(),
+                local_port: Some(port),
+                http_protocol: false,
+                balance: "round_robin".into(),
+                to: Some(format!("http://127.0.0.1:{origin}")),
+                http: None,
+                handlers: Vec::new(),
+                credentials: Vec::new(),
+                ca: None,
+                vip: None,
+                canonical_port: None,
+                attachment: crate::worker::netd::attach::Attachment::Host,
+            }])
+            .await;
+
+        let payload = "{\"key\":\"sk-abcdefghijk\"}";
+        let raw = format!(
+            "POST /upload HTTP/1.1\r\nHost: x\r\nContent-Length: {}\r\n\r\n{payload}",
+            payload.len()
+        );
+        let (status, head, _) = request(port, &raw).await;
+        assert_eq!(status, 403, "{head}");
+        assert!(head.contains("legion-denied-by: policy/t#0"), "{head}");
+
+        let (status, _, body) = request(port, "GET /fine HTTP/1.1\r\nHost: x\r\n\r\n").await;
+        assert_eq!(status, 200, "{body}");
+
+        // The chain's access log has both requests.
+        let log = logs.path().join("8").join("net-access.log");
+        let mut text = String::new();
+        for _ in 0..50 {
+            text = std::fs::read_to_string(&log).unwrap_or_default();
+            if text.lines().count() >= 2 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(text.contains("\"verdict\":\"deny\""), "{text}");
+        assert!(text.contains("\"path\":\"/fine\""), "{text}");
+    }
+
+    /// A plugin on an HTTP-mode upstream, end to end: one hop rewrites the
+    /// path before the origin sees it, a second (the same module, another
+    /// config) rewrites the origin's answer; a trapping one answers `503`.
+    #[tokio::test]
+    async fn plugins_rewrite_requests_and_responses_on_an_http_upstream_test() {
+        let (origin, _hits) = start_origin(0).await;
+        let mut object: NetPolicyObject = serde_json::from_value(serde_json::json!({
+            "name": "t",
+            "enforcement": "require",
+            "egress": {
+                "protocol": "http",
+                "policy": "allow",
+                "handlers": [
+                    { "plugin": { "name": "c", "config": { "mode": "rewrite" } } },
+                    { "plugin": { "name": "c", "config": { "mode": "response" } } }
+                ]
+            }
+        }))
+        .unwrap();
+        object.normalize_and_validate().unwrap();
+        let mut trapping = object.clone();
+        trapping.name = "trap".into();
+        trapping.egress.as_mut().unwrap().handlers = vec![serde_json::from_value(
+            serde_json::json!({ "plugin": { "name": "c", "config": { "mode": "trap" } } }),
+        )
+        .unwrap()];
+        let cache = Arc::new(NetPolicyCache::new());
+        let mut assignments = Vec::new();
+        for (allocation_id, policy) in [(8, object), (9, trapping)] {
+            let policy = merge_policies(&[policy], InlinePolicy::default());
+            assignments.push(AllocNetPolicy {
+                allocation_id,
+                policy_hash: policy.hash.clone(),
+            });
+            cache.insert_body(&policy.hash.clone(), policy).unwrap();
+        }
+        cache.apply_assignments(&assignments);
+        let guard = crate::structs::host_guard::HostGuard::new(
+            &crate::structs::host_guard::HostGuardConfig {
+                allow: vec![format!("127.0.0.1:{origin}")],
+                deny: vec![],
+            },
+        )
+        .unwrap();
+        let context = Arc::new(
+            ForwarderContext::new(cache, Arc::new(Denials::new())).with_host_guard(Arc::new(guard)),
+        );
+        let mut plugin: crate::structs::netplugin::NetPluginObject =
+            serde_json::from_value(serde_json::json!({
+                "name": "c",
+                "module": { "source": "file:///unused", "checksum": format!("sha256:{}", "0".repeat(64)) },
+                "stages": ["request", "response"],
+            }))
+            .unwrap();
+        plugin.normalize_and_validate().unwrap();
+        let bytes = std::fs::read(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/netplugins/conformance.wasm"
+        ))
+        .unwrap();
+        context
+            .plugins()
+            .install_compiled(plugin, 1, &bytes)
+            .unwrap();
+        let forwarder = UpstreamForwarder::with_context(context);
+        let (ok_port, trap_port) = (free_port().await, free_port().await);
+        let spec = |allocation_id, port| UpstreamSpec {
+            allocation_id,
+            service: "origin".into(),
+            local_port: Some(port),
+            http_protocol: false,
+            balance: "round_robin".into(),
+            to: Some(format!("http://127.0.0.1:{origin}")),
+            http: None,
+            handlers: Vec::new(),
+            credentials: Vec::new(),
+            ca: None,
+            vip: None,
+            canonical_port: None,
+            attachment: crate::worker::netd::attach::Attachment::Host,
+        };
+        forwarder
+            .sync(&[spec(8, ok_port), spec(9, trap_port)])
+            .await;
+
+        let (status, head, body) =
+            request(ok_port, "GET /old/thing HTTP/1.1\r\nHost: x\r\n\r\n").await;
+        assert_eq!(status, 200, "{head}");
+        assert!(head.contains("x-plugin: seen"), "{head}");
+        // Chunked: the plugin may change the length, so it is not declared.
+        assert!(body.contains("GET /NEW/THING HOST="), "{body}");
+
+        let (status, head, body) = request(trap_port, "GET / HTTP/1.1\r\nHost: x\r\n\r\n").await;
+        assert_eq!(status, 503, "{head}");
+        assert!(head.contains("legion-denied-by: policy/trap#0"), "{head}");
+        assert!(body.contains("plugin c trapped"), "{body}");
+    }
+
     /// Credential injection: the node sets each declared header from the
     /// value it holds, the task's own value never reaches the origin, and a
     /// header with no value fails closed with a local 503 without dialing.
@@ -2247,12 +2489,14 @@ mod integration {
             .sync(&[UpstreamSpec {
                 allocation_id: 9,
                 service: "openai".into(),
-                local_port: port,
+                local_port: Some(port),
+                http_protocol: false,
                 balance: "round_robin".into(),
                 to: Some(format!("http://127.0.0.1:{origin}")),
                 http: None,
                 handlers: Vec::new(),
                 credentials,
+                ca: None,
                 vip: None,
                 canonical_port: None,
                 attachment: crate::worker::netd::attach::Attachment::Host,
@@ -2382,12 +2626,14 @@ mod integration {
             .sync(&[UpstreamSpec {
                 allocation_id: 9,
                 service: "api".into(),
-                local_port: 20010,
+                local_port: Some(20010),
+                http_protocol: false,
                 balance: "round_robin".into(),
                 to: Some(format!("http://127.0.0.1:{origin}")),
                 http: None,
                 handlers: Vec::new(),
                 credentials,
+                ca: None,
                 vip: None,
                 canonical_port: None,
                 attachment: crate::worker::netd::attach::Attachment::GuestVsock {
@@ -2427,6 +2673,148 @@ mod integration {
         );
     }
 
+    /// A forwarder whose context knows allocation 9 and resolves
+    /// `origin.test` to loopback, where the host guard opens only `origin`.
+    fn judged_context(origin: u16) -> (Arc<NetPolicyCache>, Arc<Denials>, UpstreamForwarder) {
+        let cache = Arc::new(NetPolicyCache::new());
+        let denials = Arc::new(Denials::new());
+        let resolver = crate::worker::netd::guard::test_support::FakeResolver::new();
+        resolver.answer("origin.test", vec![vec!["127.0.0.1".parse().unwrap()]]);
+        let guard = crate::structs::host_guard::HostGuard::new(
+            &crate::structs::host_guard::HostGuardConfig {
+                allow: vec![format!("127.0.0.1:{origin}")],
+                deny: vec![],
+            },
+        )
+        .unwrap();
+        let context = ForwarderContext::new(cache.clone(), denials.clone())
+            .with_resolver(resolver)
+            .with_host_guard(Arc::new(guard));
+        (
+            cache,
+            denials,
+            UpstreamForwarder::with_context(Arc::new(context)),
+        )
+    }
+
+    fn install(cache: &NetPolicyCache, allocation_id: i64, egress: serde_json::Value) {
+        let mut object: NetPolicyObject = serde_json::from_value(serde_json::json!({
+            "name": "t", "enforcement": "require", "egress": egress,
+        }))
+        .unwrap();
+        object.normalize_and_validate().unwrap();
+        let policy = merge_policies(&[object], InlinePolicy::default());
+        let hash = policy.hash.clone();
+        cache.apply_assignments(&[AllocNetPolicy {
+            allocation_id,
+            policy_hash: hash.clone(),
+        }]);
+        cache.insert_body(&hash, policy).unwrap();
+    }
+
+    fn external_spec(
+        allocation_id: i64,
+        port: u16,
+        to: String,
+        attachment: crate::worker::netd::attach::Attachment,
+    ) -> UpstreamSpec {
+        UpstreamSpec {
+            allocation_id,
+            service: "ext".into(),
+            local_port: Some(port),
+            http_protocol: false,
+            balance: "round_robin".into(),
+            to: Some(to),
+            http: None,
+            handlers: Vec::new(),
+            credentials: Vec::new(),
+            ca: None,
+            vip: None,
+            canonical_port: None,
+            attachment,
+        }
+    }
+
+    /// A gated allocation's HTTP-mode upstream fails closed like its L4
+    /// path: nothing is served until its policy arrives.
+    #[tokio::test]
+    async fn a_gated_http_upstream_fails_closed_until_its_policy_arrives_test() {
+        use tokio::net::UnixStream;
+        let (origin, hits) = start_origin(0).await;
+        let (cache, denials, forwarder) = judged_context(origin);
+        let dir = tempfile::tempdir().unwrap();
+        forwarder
+            .sync(&[external_spec(
+                9,
+                20011,
+                format!("http://origin.test:{origin}"),
+                crate::worker::netd::attach::Attachment::GuestVsock {
+                    scratch: dir.path().to_path_buf(),
+                },
+            )])
+            .await;
+        let get = || async {
+            let mut stream = UnixStream::connect(dir.path().join("vsock.sock_20011"))
+                .await
+                .unwrap();
+            stream
+                .write_all(b"GET /x HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
+                .await
+                .unwrap();
+            let mut buf = Vec::new();
+            stream.read_to_end(&mut buf).await.unwrap();
+            String::from_utf8_lossy(&buf).to_ascii_lowercase()
+        };
+        let pending = get().await;
+        assert!(pending.starts_with("http/1.1 403"), "{pending}");
+        assert!(
+            pending.contains("legion-denied-by: policy-pending"),
+            "{pending}"
+        );
+        assert_eq!(hits.load(Ordering::SeqCst), 0, "nothing reached the origin");
+        assert_eq!(denials.drain()[0].source, "policy-pending");
+
+        install(
+            &cache,
+            9,
+            serde_json::json!({ "protocol": "http", "policy": "allow" }),
+        );
+        let served = get().await;
+        assert!(served.starts_with("http/1.1 200"), "{served}");
+    }
+
+    /// A CIDR rule judges the address an HTTP-mode upstream's name resolves
+    /// to, as it does on the L4 path: the name alone does not get past it.
+    #[tokio::test]
+    async fn cidr_rules_judge_an_http_upstreams_resolved_address_test() {
+        let (origin, hits) = start_origin(0).await;
+        let (cache, denials, forwarder) = judged_context(origin);
+        install(
+            &cache,
+            7,
+            serde_json::json!({
+                "protocol": "http",
+                "policy": "allow",
+                "rules": [{ "when": { "cidr": "127.0.0.0/8" }, "action": "deny", "reason": "no loopback" }]
+            }),
+        );
+        let port = free_port().await;
+        forwarder
+            .sync(&[external_spec(
+                7,
+                port,
+                format!("http://origin.test:{origin}"),
+                crate::worker::netd::attach::Attachment::Host,
+            )])
+            .await;
+        let (status, head, _) = request(port, "GET /x HTTP/1.1\r\nHost: x\r\n\r\n").await;
+        assert_eq!(status, 403, "{head}");
+        assert!(head.contains("legion-denied-by: policy/t#0"), "{head}");
+        assert_eq!(hits.load(Ordering::SeqCst), 0);
+        let recorded = denials.drain();
+        assert_eq!(recorded[0].reason, "no loopback", "{recorded:?}");
+    }
+
     #[tokio::test]
     async fn l4_path_is_untouched_without_http() {
         // An external tcp:// upstream with no policy stays a byte splice.
@@ -2437,12 +2825,14 @@ mod integration {
             .sync(&[UpstreamSpec {
                 allocation_id: 8,
                 service: "raw".into(),
-                local_port: port,
+                local_port: Some(port),
+                http_protocol: false,
                 balance: "round_robin".into(),
                 to: Some(format!("tcp://127.0.0.1:{origin}")),
                 http: None,
                 handlers: Vec::new(),
                 credentials: Vec::new(),
+                ca: None,
                 vip: None,
                 canonical_port: None,
                 attachment: crate::worker::netd::attach::Attachment::Host,

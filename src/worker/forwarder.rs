@@ -34,13 +34,13 @@
 //! Choosing *which* endpoint a connection goes to is [`crate::worker::balance`].
 
 use crate::prelude::*;
-use crate::structs::netpolicy::HandlerConfig;
+use crate::structs::hops::HopConfig;
 use crate::structs::netpolicy::{ConnectFacts, Verdict, PROTOCOL_TCP};
 use crate::structs::{parse_upstream_target, UpstreamTarget, UPSTREAM_LOOPBACK_ADDR};
 use crate::structs::{UpstreamCredential, UpstreamHttpConfig};
 use crate::worker::balance::{balancer, default_balancer, Balancer, Endpoint, Outcome};
 use crate::worker::netd::attach::Attachment;
-use crate::worker::netd::handlers::{self, HopFacts, HopOutcome, ProxyTarget};
+use crate::worker::netd::handlers::{self, HopFacts, HopOutcome, PipelineCache, ProxyTarget};
 use crate::worker::netd::http::HttpSettings;
 use crate::worker::netd::listen::{self, dial_tcp, spawn_accept_loop, ListenAddr};
 use crate::worker::netd::policy::{egress_connect_verdict, AllocIdentity};
@@ -80,7 +80,12 @@ pub struct UpstreamSpec {
     /// The upstream key: a catalog service name, or the `name` of an external
     /// upstream (whose destination is `to`).
     pub service: String,
-    pub local_port: u16,
+    /// The loopback port the listener binds, when the upstream has one; the
+    /// VIP is the only address otherwise.
+    pub local_port: Option<u16>,
+    /// Whether the upstream's `to` speaks HTTP (`http://`, `https://`): the
+    /// only thing that puts the listener in HTTP mode.
+    pub http_protocol: bool,
     pub balance: String,
     /// External destination URL (`tcp://`, `tls://`, `http://`, `https://`);
     /// `None` for a catalog service, which is dialed from the endpoint feed.
@@ -88,10 +93,13 @@ pub struct UpstreamSpec {
     /// `connect.upstreams[].http` — turns on HTTP mode with traffic management.
     pub http: Option<UpstreamHttpConfig>,
     /// `connect.upstreams[].handlers` — run in HTTP mode.
-    pub handlers: Vec<HandlerConfig>,
+    pub handlers: Vec<HopConfig>,
     /// `connect.upstreams[].credentials` — headers injected in HTTP mode,
     /// with values from [`ForwarderContext`]'s credential store.
     pub credentials: Vec<UpstreamCredential>,
+    /// `connect.upstreams[].ca` — the trust bundle an external TLS upstream
+    /// is verified against instead of the public roots.
+    pub ca: Option<crate::structs::source::Source>,
     /// Name-is-config: the VIP (`127.42.b.n`) and canonical port this
     /// upstream is also served on, so `<key>.svc.legion:<port>` reaches the
     /// same listener state. `None` on platforms without 127/8 routing.
@@ -111,16 +119,27 @@ impl UpstreamSpec {
         (self.allocation_id, self.service.clone())
     }
 
-    /// Where the upstream's loopback listener binds.
-    pub fn listen(&self) -> ListenAddr {
-        let loopback = UPSTREAM_LOOPBACK_ADDR
-            .parse()
-            .expect("the upstream loopback address parses");
-        self.attachment.listen(loopback, self.local_port)
+    /// Where the upstream's primary listener binds: its loopback port when it
+    /// has one, else its VIP. `None` when it has neither the node can serve.
+    pub fn listen(&self) -> Option<ListenAddr> {
+        match self.local_port {
+            Some(port) => {
+                let loopback = UPSTREAM_LOOPBACK_ADDR
+                    .parse()
+                    .expect("the upstream loopback address parses");
+                Some(self.attachment.listen(loopback, port))
+            }
+            None => self.vip_addr(),
+        }
     }
 
-    /// Where its VIP listener binds, when it has one the node serves.
+    /// Where its second, VIP listener binds: only when the loopback port is
+    /// the primary one and the node serves the VIP.
     fn vip_listen(&self) -> Option<ListenAddr> {
+        self.local_port.and(self.vip_addr())
+    }
+
+    fn vip_addr(&self) -> Option<ListenAddr> {
         let (Some(vip), Some(port)) = (self.vip.as_deref(), self.canonical_port) else {
             return None;
         };
@@ -150,8 +169,13 @@ struct UpstreamShared {
     context: Arc<ForwarderContext>,
     /// The upstream's `http` block, handlers, and credentials, as declared.
     http_config: Option<UpstreamHttpConfig>,
-    handlers: Vec<HandlerConfig>,
+    /// Whether `to` speaks HTTP.
+    http_protocol: bool,
+    handlers: Vec<HopConfig>,
     credentials: Vec<UpstreamCredential>,
+    ca: Option<crate::structs::source::Source>,
+    /// The egress chain's hops plus this upstream's, compiled per policy body.
+    pipelines: PipelineCache,
     /// HTTP-mode state, built on first use (an upstream can enter HTTP mode
     /// through its own declaration or through the effective policy's
     /// `protocol = "http"`, which is only known once policy arrives).
@@ -164,15 +188,44 @@ struct UpstreamShared {
 type HandlerEndpoints = HashMap<(i64, String), Vec<Endpoint>>;
 /// Ingress TLS configs by (allocation, port label): the fingerprint of what
 /// built each, and the result.
+/// Client configs for external upstreams that pin a `ca`, by (allocation,
+/// upstream key): the fingerprint of what built each, and the result.
+type UpstreamTlsConfigs =
+    HashMap<(i64, String), (String, Result<Arc<rustls::ClientConfig>, String>)>;
+
 type IngressTlsConfigs =
     HashMap<(i64, String), (String, Result<Arc<rustls::ServerConfig>, String>)>;
-/// An allocation's KV-held ingress certificate: the last good one (kept when
-/// a later fetch fails, so a bad `kv put` never takes a listener down) and
-/// the latest fetch problem.
+/// KV-held TLS material by (kind, allocation, port label or upstream key):
+/// `port_cert`, `client_ca`, or `upstream_ca` (`structs::source`).
+pub type TlsMaterialKey = (&'static str, i64, String);
+
+/// One piece of KV-held TLS material: the last good value (kept when a later
+/// fetch fails, so a bad `kv put` never takes a listener down) and the
+/// latest fetch problem.
 #[derive(Debug, Default, Clone)]
-pub struct KvCertState {
-    pub cert: Option<Arc<crate::worker::netd::tls::KvCertificate>>,
+pub struct TlsMaterialState {
+    pub held: Option<Arc<HeldTls>>,
     pub error: Option<String>,
+}
+
+/// A fetched certificate (with its key) or CA bundle, validated on arrival.
+#[derive(Debug)]
+pub enum HeldTls {
+    Cert(crate::worker::netd::tls::CertKey),
+    Ca {
+        source: String,
+        version: i64,
+        roots: rustls::RootCertStore,
+    },
+}
+
+impl HeldTls {
+    pub fn version(&self) -> i64 {
+        match self {
+            HeldTls::Cert(cert) => cert.version,
+            HeldTls::Ca { version, .. } => *version,
+        }
+    }
 }
 
 /// A secret value held for credential injection. Debug never prints it, so
@@ -241,6 +294,8 @@ pub struct ForwarderContext {
     /// `authz` verdicts: key → (allowed, reason, expires).
     authz_cache: Mutex<AuthzCache>,
     http_client: OnceLock<reqwest::Client>,
+    /// The node's network plugins (docs/network-plugins.md).
+    plugins: Arc<crate::worker::netd::plugins::PluginHost>,
     /// The node's mesh credential and the client config built from it.
     mesh: RwLock<Option<(Arc<MeshIdentity>, Arc<rustls::ClientConfig>)>>,
     /// Whether anything on this node needs a mesh certificate.
@@ -248,11 +303,14 @@ pub struct ForwarderContext {
     /// Ingress TLS configs per (allocation, port label): the fingerprint of
     /// what built it, and the result (an error is reported as `tls_error`).
     ingress_tls: Mutex<IngressTlsConfigs>,
-    /// `certFrom = { kv }` material per allocation, from
-    /// `GetIngressCertificates`. In memory only.
-    kv_certs: Mutex<HashMap<i64, KvCertState>>,
+    /// KV-held port certificates, client CAs, and upstream CAs, from
+    /// `FetchDatapathMaterial`. In memory only.
+    tls_material: Mutex<HashMap<TlsMaterialKey, TlsMaterialState>>,
+    /// Client configs for external upstreams that pin a `ca`, by (allocation,
+    /// upstream key): the fingerprint of what built each, and the result.
+    upstream_tls: Mutex<UpstreamTlsConfigs>,
     /// `connect.upstreams[].credentials` values, from
-    /// `GetUpstreamCredentials`. In memory only: never persisted, never
+    /// `FetchDatapathMaterial`. In memory only: never persisted, never
     /// logged, never handed to the task.
     credentials: Mutex<HashMap<CredentialKey, CredentialState>>,
     /// Service-graph samples since the last heartbeat.
@@ -270,14 +328,58 @@ pub struct ForwarderContext {
     /// The host guard in the kernel (`netd::kernel_guard`), on a node that
     /// can run it.
     kernel_guard: Option<Mutex<KernelGuardRuntime>>,
+    /// The node-wide capture listener host-mode flows are redirected to
+    /// when only netd can decide them (`netd::capture`).
+    host_capture: RwLock<Option<std::net::SocketAddrV4>>,
+    /// Each gated allocation's in-namespace capture listener.
+    gated_captures: Mutex<HashMap<i64, std::net::SocketAddrV4>>,
 }
 
+/// The shortest time a learned address stays in the kernel, whatever the
+/// record's TTL: a client that caches longer than the TTL must not be cut
+/// off mid-use (plan §6.A.4).
+pub const LEARNED_TTL_FLOOR: Duration = Duration::from_secs(300);
+
 /// The kernel host guard's state on one worker: the table without its
-/// allocations (ports, operator entries), and what is loaded.
-#[derive(Debug)]
+/// allocations (ports, operator entries), and the backend that enforces it.
 pub struct KernelGuardRuntime {
     pub base: crate::worker::netd::kernel_guard::GuardTable,
-    pub guard: crate::worker::netd::kernel_guard::KernelGuard,
+    pub backend: KernelBackend,
+    /// The eBPF backend's per-allocation report, from the last heartbeat.
+    kernel_status: HashMap<i64, crate::structs::NetKernelStatus>,
+    /// Whether the node-wide guard maps hold `base` and these addresses.
+    applied: Option<Vec<std::net::IpAddr>>,
+}
+
+/// The kernel classifier a Linux worker hands [`ForwarderContext::with_kernel`];
+/// other platforms have none.
+#[cfg(target_os = "linux")]
+pub type KernelClassifier = crate::worker::netd::kernel::runtime::KernelNet;
+#[cfg(not(target_os = "linux"))]
+pub type KernelClassifier = ();
+
+/// How the host guard (and, with eBPF, the egress chain) is enforced in
+/// the kernel.
+pub enum KernelBackend {
+    /// The `nftables` table (`netd::kernel_guard`): the guard only.
+    Nft(crate::worker::netd::kernel_guard::KernelGuard),
+    /// The kernel classifier (`netd::kernel`): the guard, host-mode egress
+    /// chains, DNS capture, and the capture redirect.
+    #[cfg(target_os = "linux")]
+    Ebpf(Box<crate::worker::netd::kernel::runtime::KernelNet>),
+}
+
+impl std::fmt::Debug for KernelGuardRuntime {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let backend = match &self.backend {
+            KernelBackend::Nft(_) => "nftables",
+            #[cfg(target_os = "linux")]
+            KernelBackend::Ebpf(_) => "ebpf",
+        };
+        f.debug_struct("KernelGuardRuntime")
+            .field("backend", &backend)
+            .finish_non_exhaustive()
+    }
 }
 
 /// The default guard: no operator overrides, the node's current interface
@@ -325,41 +427,92 @@ impl ForwarderContext {
             handler_pick: AtomicUsize::new(0),
             authz_cache: Mutex::new(HashMap::new()),
             http_client: OnceLock::new(),
+            plugins: Arc::new(crate::worker::netd::plugins::PluginHost::default()),
             mesh: RwLock::new(None),
             mesh_wanted: AtomicBool::new(false),
             ingress_tls: Mutex::new(HashMap::new()),
-            kv_certs: Mutex::new(HashMap::new()),
+            tls_material: Mutex::new(HashMap::new()),
+            upstream_tls: Mutex::new(HashMap::new()),
             credentials: Mutex::new(HashMap::new()),
             edges: Arc::new(crate::worker::netd::graph::EdgeLedger::new()),
             activity: Arc::new(crate::worker::netd::activity::ActivityLedger::new()),
             host_guard: Some(Arc::new(default_host_guard())),
             resolver: None,
             kernel_guard: None,
+            host_capture: RwLock::new(None),
+            gated_captures: Mutex::new(HashMap::new()),
         }
     }
 
-    /// Runs the kernel host guard with `base` (its ports and operator
-    /// entries); the allocations come from each heartbeat.
-    pub fn with_kernel_guard(
+    /// Where host-mode flows only netd can decide are redirected.
+    pub fn set_host_capture(&self, addr: Option<std::net::SocketAddrV4>) {
+        *self.host_capture.write().unwrap_or_else(|p| p.into_inner()) = addr;
+    }
+
+    pub fn host_capture_addr(&self) -> Option<std::net::SocketAddrV4> {
+        *self.host_capture.read().unwrap_or_else(|p| p.into_inner())
+    }
+
+    /// A gated allocation's in-namespace capture listener, or none.
+    pub fn set_gated_capture(&self, allocation_id: i64, addr: Option<std::net::SocketAddrV4>) {
+        let mut captures = lock(&self.gated_captures);
+        match addr {
+            Some(addr) => {
+                captures.insert(allocation_id, addr);
+            }
+            None => {
+                captures.remove(&allocation_id);
+            }
+        }
+    }
+
+    pub fn gated_capture_addr(&self, allocation_id: i64) -> Option<std::net::SocketAddrV4> {
+        lock(&self.gated_captures).get(&allocation_id).copied()
+    }
+
+    /// The kernel backend the worker probed for, when `base` (the host
+    /// guard's table) is set at all: the classifier when it loaded, else the
+    /// `nftables` guard.
+    pub fn with_kernel(
+        self,
+        base: Option<crate::worker::netd::kernel_guard::GuardTable>,
+        classifier: Option<KernelClassifier>,
+    ) -> Self {
+        let Some(base) = base else {
+            return self;
+        };
+        #[cfg(target_os = "linux")]
+        if let Some(net) = classifier {
+            return self.with_kernel_classifier(base, net);
+        }
+        #[cfg(not(target_os = "linux"))]
+        let _ = classifier;
+        self.with_kernel_backend(base, KernelBackend::Nft(Default::default()))
+    }
+
+    /// Runs the kernel classifier (`netd::kernel`) with `base`: the guard,
+    /// host-mode egress chains, DNS capture, and the capture redirect.
+    #[cfg(target_os = "linux")]
+    pub fn with_kernel_classifier(
+        self,
+        base: crate::worker::netd::kernel_guard::GuardTable,
+        net: crate::worker::netd::kernel::runtime::KernelNet,
+    ) -> Self {
+        self.with_kernel_backend(base, KernelBackend::Ebpf(Box::new(net)))
+    }
+
+    fn with_kernel_backend(
         mut self,
         base: crate::worker::netd::kernel_guard::GuardTable,
+        backend: KernelBackend,
     ) -> Self {
         self.kernel_guard = Some(Mutex::new(KernelGuardRuntime {
             base,
-            guard: Default::default(),
+            backend,
+            kernel_status: HashMap::new(),
+            applied: None,
         }));
         self
-    }
-
-    /// [`Self::with_kernel_guard`] when `base` is set.
-    pub fn with_kernel_guard_if(
-        self,
-        base: Option<crate::worker::netd::kernel_guard::GuardTable>,
-    ) -> Self {
-        match base {
-            Some(base) => self.with_kernel_guard(base),
-            None => self,
-        }
     }
 
     /// Whether this node runs the kernel host guard.
@@ -367,9 +520,19 @@ impl ForwarderContext {
         self.kernel_guard.is_some()
     }
 
-    /// Reloads the kernel table for `allocations` when it changed, and
-    /// records drops since the last call as `host-guard` denials for the
-    /// next heartbeat. Blocking: it runs `nft`.
+    /// Whether the kernel classifier (not only the `nftables` guard) runs.
+    pub fn kernel_classifier_active(&self) -> bool {
+        #[cfg(target_os = "linux")]
+        if let Some(runtime) = &self.kernel_guard {
+            return matches!(lock(runtime).backend, KernelBackend::Ebpf(_));
+        }
+        false
+    }
+
+    /// Brings the kernel up to date with `allocations` (the guard's
+    /// classes, and with eBPF each allocation's compiled egress chain), and
+    /// records what the kernel refused since the last call as denials for
+    /// the next heartbeat. Blocking: it runs `nft` or writes BPF maps.
     pub fn reconcile_kernel_guard(
         &self,
         allocations: Vec<crate::worker::netd::kernel_guard::GuardedAllocation>,
@@ -378,46 +541,318 @@ impl ForwarderContext {
             return;
         };
         let mut runtime = lock(runtime);
-        let mut table = runtime.base.clone();
-        table.allocations = allocations;
-        match runtime.guard.reconcile(table) {
-            Ok(true) => debug!(
-                allocations = runtime.guard.allocations(),
-                "Reloaded the kernel host guard"
-            ),
-            Ok(false) => {}
-            Err(err) => {
-                warn!(error = %format!("{err:#}"), "Failed to load the kernel host guard; retrying on the next heartbeat");
-                return;
+        let runtime = &mut *runtime;
+        match &mut runtime.backend {
+            KernelBackend::Nft(guard) => {
+                let mut table = runtime.base.clone();
+                table.allocations = allocations;
+                match guard.reconcile(table) {
+                    Ok(true) => debug!(
+                        allocations = guard.allocations(),
+                        "Reloaded the kernel host guard"
+                    ),
+                    Ok(false) => {}
+                    Err(err) => {
+                        warn!(error = %format!("{err:#}"), "Failed to load the kernel host guard; retrying on the next heartbeat");
+                        return;
+                    }
+                }
+                let counters = match crate::worker::netd::kernel_guard::read_counters() {
+                    Ok(counters) => counters,
+                    Err(err) => {
+                        debug!(error = %format!("{err:#}"), "Could not read the kernel host guard's counters");
+                        return;
+                    }
+                };
+                for (allocation_id, reason, packets) in guard.new_drops(counters) {
+                    self.record_guard_drop(
+                        allocation_id,
+                        &reason,
+                        u32::try_from(packets).unwrap_or(u32::MAX),
+                    );
+                }
+            }
+            #[cfg(target_os = "linux")]
+            KernelBackend::Ebpf(net) => {
+                let addresses: Vec<std::net::IpAddr> = self
+                    .host_guard
+                    .as_ref()
+                    .map(|guard| guard.node_addrs())
+                    .unwrap_or_default();
+                if runtime.applied.as_ref() != Some(&addresses) {
+                    let applied = net
+                        .set_guard(&runtime.base)
+                        .and_then(|()| net.set_local_addresses(&addresses));
+                    match applied {
+                        Ok(()) => runtime.applied = Some(addresses),
+                        Err(err) => {
+                            warn!(error = %format!("{err:#}"), "Failed to load the kernel guard's maps; retrying on the next heartbeat")
+                        }
+                    }
+                }
+                let (kernel, statuses) = self.kernel_allocations(&allocations);
+                if let Err(err) = net.reconcile(&kernel) {
+                    warn!(error = %format!("{err:#}"), "Failed to update the kernel classifier; retrying on the next heartbeat");
+                }
+                runtime.kernel_status = statuses;
+                self.fold_kernel_reports(net, &mut runtime.kernel_status);
             }
         }
-        let counters = match crate::worker::netd::kernel_guard::read_counters() {
-            Ok(counters) => counters,
-            Err(err) => {
-                debug!(error = %format!("{err:#}"), "Could not read the kernel host guard's counters");
-                return;
-            }
+    }
+
+    /// One `host-guard` denial row, as both backends report them.
+    fn record_guard_drop(&self, allocation_id: i64, reason: &str, count: u32) {
+        let Some(denials) = self.denials.as_ref() else {
+            return;
         };
-        for (allocation_id, reason, packets) in runtime.guard.new_drops(counters) {
-            let Some(denials) = self.denials.as_ref() else {
-                return;
+        let who = self.identity_for(allocation_id);
+        denials.record_count(
+            allocation_id,
+            who.as_ref(),
+            "egress",
+            "tcp",
+            reason,
+            crate::structs::host_guard::HOST_GUARD_SOURCE,
+            Some(&format!(
+                "dropped in the kernel: {reason}; allocations may not reach it"
+            )),
+            None,
+            "",
+            "",
+            count,
+        );
+    }
+
+    /// What the classifier should hold for each allocation, and the status
+    /// each gets reported with.
+    #[cfg(target_os = "linux")]
+    fn kernel_allocations(
+        &self,
+        allocations: &[crate::worker::netd::kernel_guard::GuardedAllocation],
+    ) -> (
+        Vec<crate::worker::netd::kernel::runtime::KernelAllocation>,
+        HashMap<i64, crate::structs::NetKernelStatus>,
+    ) {
+        use crate::worker::netd::kernel::compile::compile;
+        let capture = self.host_capture_addr();
+        let mut out = Vec::new();
+        let mut statuses = HashMap::new();
+        for allocation in allocations {
+            let mut status = crate::structs::NetKernelStatus {
+                attached: true,
+                ..Default::default()
             };
-            let who = self.identity_for(allocation_id);
-            denials.record_count(
-                allocation_id,
-                who.as_ref(),
-                "egress",
-                "tcp",
-                &reason,
-                crate::structs::host_guard::HOST_GUARD_SOURCE,
-                Some(&format!(
-                    "dropped in the kernel: {reason}; allocations may not reach it"
-                )),
-                None,
-                "",
-                "",
-                u32::try_from(packets).unwrap_or(u32::MAX),
-            );
+            let policy = self.policy_for(allocation.allocation_id);
+            let chain = match policy.as_ref().and_then(|policy| policy.egress.as_ref()) {
+                Some(chain) if allocation.host_sockets && !allocation.gated => match compile(chain)
+                {
+                    Ok(compiled) => {
+                        status.enforced = true;
+                        status.rules = compiled.rules.len() as u32;
+                        Some(compiled)
+                    }
+                    Err(unsupported) => {
+                        status.reason = format!("egress is judged by netd only: {}", unsupported.0);
+                        None
+                    }
+                },
+                Some(_) if !allocation.host_sockets => {
+                    status.reason =
+                        "a sandbox's sockets live in its guest; netd judges them".into();
+                    None
+                }
+                _ => None,
+            };
+            let capture = if allocation.gated {
+                self.gated_capture_addr(allocation.allocation_id)
+            } else if chain.is_some() {
+                capture
+            } else {
+                None
+            };
+            status.capture = capture.is_some();
+            out.push(crate::worker::netd::kernel::runtime::KernelAllocation {
+                allocation_id: allocation.allocation_id,
+                cgroup: allocation.cgroup.clone(),
+                vip_block: allocation.vip_block.clone(),
+                loopback_ports: allocation.loopback_ports.clone(),
+                resolver: allocation.resolver,
+                gated: allocation.gated,
+                capture,
+                chain,
+            });
+            statuses.insert(allocation.allocation_id, status);
+        }
+        (out, statuses)
+    }
+
+    /// Fold what the classifier saw since the last beat into the denial
+    /// ledger, the connection metrics, the idle ledger, and each
+    /// allocation's counters.
+    #[cfg(target_os = "linux")]
+    fn fold_kernel_reports(
+        &self,
+        net: &mut crate::worker::netd::kernel::runtime::KernelNet,
+        statuses: &mut HashMap<i64, crate::structs::NetKernelStatus>,
+    ) {
+        use crate::worker::netd::kernel::abi;
+        for event in net.events() {
+            let id = event.allocation_id;
+            let destination = event.destination().to_string();
+            let protocol = if event.protocol == 17 { "udp" } else { "tcp" };
+            let reason_for_guard = match event.kind {
+                abi::EV_METADATA => Some(crate::worker::netd::kernel_guard::DROP_METADATA),
+                abi::EV_DENY_LIST => Some(crate::worker::netd::kernel_guard::DROP_DENY),
+                abi::EV_CONTROL => Some(crate::worker::netd::kernel_guard::DROP_CONTROL),
+                abi::EV_DATAPATH => Some(crate::worker::netd::kernel_guard::DROP_DATAPATH),
+                _ => None,
+            };
+            if let Some(reason) = reason_for_guard {
+                self.record_guard_drop(id, reason, 1);
+                continue;
+            }
+            let (source, reason) = match event.kind {
+                abi::EV_RULE => net
+                    .chain(id)
+                    .and_then(|chain| chain.label(event.index))
+                    .map(|(source, reason)| (source.clone(), reason.clone()))
+                    .unwrap_or_else(|| ("policy".to_string(), None)),
+                abi::EV_FALLTHROUGH => (
+                    "fallthrough".to_string(),
+                    Some("no rule matched and chain.policy is deny".to_string()),
+                ),
+                abi::EV_NEEDS_NETD if event.index == abi::INDEX_UNLEARNED => (
+                    crate::structs::netpolicy::SOURCE_KERNEL_UNLEARNED.to_string(),
+                    Some(format!(
+                        "{destination} was not returned by the allocation's resolver for a name \
+                         a host rule allows, and capture is off on this node"
+                    )),
+                ),
+                abi::EV_NEEDS_NETD => (
+                    net.chain(id)
+                        .and_then(|chain| chain.label(event.index))
+                        .map(|(source, _)| source.clone())
+                        .unwrap_or_else(|| "policy".to_string()),
+                    Some("the rule needs the request head, and capture is off on this node".into()),
+                ),
+                abi::EV_RAW_SOCKET => (
+                    crate::structs::host_guard::HOST_GUARD_SOURCE.to_string(),
+                    Some("raw and packet sockets are refused to governed tasks".into()),
+                ),
+                _ => continue,
+            };
+            if let Some(denials) = self.denials.as_ref() {
+                let who = self.identity_for(id);
+                denials.record_count(
+                    id,
+                    who.as_ref(),
+                    "egress",
+                    protocol,
+                    &destination,
+                    &source,
+                    reason.as_deref(),
+                    None,
+                    "",
+                    "",
+                    1,
+                );
+            }
+        }
+        for (id, slot, allowed, count) in net.counters() {
+            let verdict = if slot == abi::SLOT_REDIRECT {
+                "redirect"
+            } else if allowed {
+                "allow"
+            } else {
+                "deny"
+            };
+            crate::worker::netd::metrics::connections("egress", "tcp", verdict, count);
+            // Pass flows never reach netd's ledgers: the graph learns them
+            // from the rule that allowed them.
+            let rule = (slot as usize) < abi::MAX_RULES || slot == abi::SLOT_FALLTHROUGH;
+            if allowed && rule {
+                let target = net
+                    .chain(id)
+                    .and_then(|chain| chain.targets.get(slot as usize).cloned())
+                    .unwrap_or_else(|| "*".to_string());
+                self.edges.record_connections(id, &target, true, count);
+            }
+            if let Some(status) = statuses.get_mut(&id) {
+                match verdict {
+                    "redirect" => status.redirected += count,
+                    "allow" => status.passed += count,
+                    _ => status.denied += count,
+                }
+            }
+        }
+        for (id, (tx, rx)) in net.bytes() {
+            self.activity.touch_external(id);
+            crate::worker::netd::metrics::bytes("egress", tx);
+            crate::worker::netd::metrics::bytes("ingress", rx);
+        }
+    }
+
+    /// The classifier's report for one allocation, when it runs.
+    pub fn kernel_status(&self, allocation_id: i64) -> Option<crate::structs::NetKernelStatus> {
+        let runtime = self.kernel_guard.as_ref()?;
+        lock(runtime).kernel_status.get(&allocation_id).cloned()
+    }
+
+    /// Teach the classifier the addresses an allowed name resolved to, so
+    /// host rules decide at `connect()` (plan §6.A.4). No-op without it.
+    pub fn kernel_learn(
+        &self,
+        allocation_id: i64,
+        name: &str,
+        addresses: &[std::net::IpAddr],
+        ttl: Duration,
+    ) {
+        #[cfg(target_os = "linux")]
+        if let Some(runtime) = &self.kernel_guard {
+            let mut runtime = lock(runtime);
+            if let KernelBackend::Ebpf(net) = &mut runtime.backend {
+                let Some(bits) = net
+                    .chain(allocation_id)
+                    .filter(|chain| chain.has_hosts())
+                    .map(|chain| chain.learned_bits(name))
+                else {
+                    return;
+                };
+                net.learn(allocation_id, addresses, bits, ttl.max(LEARNED_TTL_FLOOR));
+            }
+        }
+        #[cfg(not(target_os = "linux"))]
+        let _ = (allocation_id, name, addresses, ttl);
+    }
+
+    /// The original destination of a flow the classifier redirected, by
+    /// the capture listener's netns cookie and the peer it accepted.
+    pub fn kernel_original_destination(
+        &self,
+        netns: u64,
+        peer: SocketAddr,
+    ) -> Option<(SocketAddr, i64)> {
+        #[cfg(target_os = "linux")]
+        if let Some(runtime) = &self.kernel_guard {
+            if let KernelBackend::Ebpf(net) = &mut lock(runtime).backend {
+                return net.original_destination(netns, peer);
+            }
+        }
+        #[cfg(not(target_os = "linux"))]
+        let _ = (netns, peer);
+        None
+    }
+
+    /// Detach the classifier and remove its pins (clean shutdown).
+    pub fn shutdown_kernel(&self) {
+        #[cfg(target_os = "linux")]
+        if let Some(runtime) = &self.kernel_guard {
+            let mut runtime = lock(runtime);
+            let backend =
+                std::mem::replace(&mut runtime.backend, KernelBackend::Nft(Default::default()));
+            if let KernelBackend::Ebpf(net) = backend {
+                net.shutdown();
+            }
         }
     }
 
@@ -481,6 +916,21 @@ impl ForwarderContext {
     /// Same, after construction (the first heartbeat knows the id).
     pub fn set_node_id(&self, node_id: &str) {
         let _ = self.node_id.set(node_id.to_string());
+        self.plugins.set_node_id(node_id);
+    }
+
+    /// The node's network plugins.
+    pub fn plugins(&self) -> &Arc<crate::worker::netd::plugins::PluginHost> {
+        &self.plugins
+    }
+
+    /// Fetch plugin modules with `loader` (the worker's artifact stager).
+    pub fn with_plugin_loader(
+        mut self,
+        loader: Arc<dyn crate::wasm::module::ModuleLoader>,
+    ) -> Self {
+        self.plugins = Arc::new(crate::worker::netd::plugins::PluginHost::new(Some(loader)));
+        self
     }
 
     pub fn node_id(&self) -> Option<String> {
@@ -511,14 +961,15 @@ impl ForwarderContext {
         lock(&self.handler_endpoints).retain(|(id, _), _| live.contains(id));
         lock(&self.handler_health).retain(|(id, _), _| live.contains(id));
         lock(&self.ingress_tls).retain(|(id, _), _| live.contains(id));
-        lock(&self.kv_certs).retain(|id, _| live.contains(id));
+        lock(&self.tls_material).retain(|(_, id, _), _| live.contains(id));
+        lock(&self.upstream_tls).retain(|(id, _), _| live.contains(id));
         lock(&self.credentials).retain(|(id, _, _), _| live.contains(id));
     }
 
     // ----- credential injection -----------------------------------------
 
     /// The version of the credential held for a header (0 for none): the KV
-    /// version, or an identity token's expiry. What `GetUpstreamCredentials`
+    /// version, or an identity token's expiry. What `FetchDatapathMaterial`
     /// compares against.
     pub fn credential_version(&self, allocation_id: i64, upstream: &str, header: &str) -> i64 {
         lock(&self.credentials)
@@ -638,36 +1089,66 @@ impl ForwarderContext {
         problems
     }
 
-    /// The KV version of the certificate held for an allocation (0 for none),
-    /// what `GetIngressCertificates` compares against.
-    pub fn kv_cert_version(&self, allocation_id: i64) -> i64 {
-        lock(&self.kv_certs)
-            .get(&allocation_id)
-            .and_then(|state| state.cert.as_ref())
-            .map(|cert| cert.version)
+    /// The version of the KV-held TLS material held (0 for none), what
+    /// `FetchDatapathMaterial` compares against.
+    pub fn tls_material_version(&self, kind: &'static str, allocation_id: i64, key: &str) -> i64 {
+        lock(&self.tls_material)
+            .get(&(kind, allocation_id, key.to_string()))
+            .and_then(|state| state.held.as_ref())
+            .map(|held| held.version())
             .unwrap_or(0)
     }
 
-    /// Install a freshly fetched certificate. New connections pick it up via
-    /// the version in the server-config fingerprint; open ones keep theirs.
-    pub fn set_kv_cert(&self, allocation_id: i64, cert: crate::worker::netd::tls::KvCertificate) {
-        lock(&self.kv_certs).insert(
-            allocation_id,
-            KvCertState {
-                cert: Some(Arc::new(cert)),
+    /// The KV-held TLS material for one port or upstream.
+    pub fn tls_material(
+        &self,
+        kind: &'static str,
+        allocation_id: i64,
+        key: &str,
+    ) -> TlsMaterialState {
+        lock(&self.tls_material)
+            .get(&(kind, allocation_id, key.to_string()))
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// Install freshly fetched material. New connections pick it up via the
+    /// version in the config fingerprint; open ones keep theirs.
+    pub fn set_tls_material(
+        &self,
+        kind: &'static str,
+        allocation_id: i64,
+        key: &str,
+        held: HeldTls,
+    ) {
+        lock(&self.tls_material).insert(
+            (kind, allocation_id, key.to_string()),
+            TlsMaterialState {
+                held: Some(Arc::new(held)),
                 error: None,
             },
         );
     }
 
-    /// Record a fetch problem, keeping whatever certificate is held.
-    pub fn set_kv_cert_error(&self, allocation_id: i64, error: String) {
-        lock(&self.kv_certs).entry(allocation_id).or_default().error = Some(error);
+    /// Record a fetch problem, keeping whatever is held.
+    pub fn set_tls_material_error(
+        &self,
+        kind: &'static str,
+        allocation_id: i64,
+        key: &str,
+        error: String,
+    ) {
+        lock(&self.tls_material)
+            .entry((kind, allocation_id, key.to_string()))
+            .or_default()
+            .error = Some(error);
     }
 
     /// Clear a fetch problem after an `unchanged` reply.
-    pub fn clear_kv_cert_error(&self, allocation_id: i64) {
-        if let Some(state) = lock(&self.kv_certs).get_mut(&allocation_id) {
+    pub fn clear_tls_material_error(&self, kind: &'static str, allocation_id: i64, key: &str) {
+        if let Some(state) =
+            lock(&self.tls_material).get_mut(&(kind, allocation_id, key.to_string()))
+        {
             state.error = None;
         }
     }
@@ -823,30 +1304,46 @@ impl ForwarderContext {
             .map(|(_, client)| tokio_rustls::TlsConnector::from(client.clone()))
     }
 
-    /// The server config for an ingress listener's chain, built once per
-    /// (allocation, label, material) and rebuilt when the material changes.
+    /// The server config for an ingress port that terminates TLS, built
+    /// once per (allocation, label, material) and rebuilt when the material
+    /// changes: the node certificate for a mesh port (clients verified
+    /// against the mesh CA), or the port's own `tls`.
     pub fn ingress_server_config(
         &self,
         allocation_id: i64,
         label: &str,
-        tls: &crate::structs::netpolicy::TlsConfig,
+        termination: &PortTermination,
     ) -> Result<Arc<rustls::ServerConfig>, String> {
+        use crate::structs::source::{MATERIAL_CLIENT_CA, MATERIAL_PORT_CERT};
         let mesh = self.mesh_identity();
-        let kv_cert = tls.cert_kv_path().map(|_| {
-            lock(&self.kv_certs)
-                .get(&allocation_id)
-                .cloned()
-                .unwrap_or_default()
-        });
-        let fingerprint = format!(
-            "{}|{}|{}",
-            serde_json::to_string(tls).unwrap_or_default(),
-            mesh.as_ref().map(|m| m.expires_at).unwrap_or(0),
-            kv_cert
+        let (cert_state, ca_state) = match termination {
+            PortTermination::Mesh => (None, None),
+            PortTermination::Own(tls) => (
+                tls.cert
+                    .is_fetched()
+                    .then(|| self.tls_material(MATERIAL_PORT_CERT, allocation_id, label)),
+                tls.clients
+                    .as_ref()
+                    .filter(|clients| clients.ca.is_fetched())
+                    .map(|_| self.tls_material(MATERIAL_CLIENT_CA, allocation_id, label)),
+            ),
+        };
+        let version = |state: &Option<TlsMaterialState>| {
+            state
                 .as_ref()
-                .and_then(|state| state.cert.as_ref())
-                .map(|cert| cert.version)
+                .and_then(|state| state.held.as_ref())
+                .map(|held| held.version())
                 .unwrap_or(0)
+        };
+        let fingerprint = format!(
+            "{}|{}|{}|{}",
+            match termination {
+                PortTermination::Mesh => "mesh".to_string(),
+                PortTermination::Own(tls) => serde_json::to_string(tls).unwrap_or_default(),
+            },
+            mesh.as_ref().map(|m| m.expires_at).unwrap_or(0),
+            version(&cert_state),
+            version(&ca_state),
         );
         let key = (allocation_id, label.to_string());
         {
@@ -857,42 +1354,17 @@ impl ForwarderContext {
                 }
             }
         }
-        let mutual = tls.mode == crate::structs::netpolicy::TLS_MUTUAL;
-        let result: Result<Arc<rustls::ServerConfig>, String> =
-            if let Some(path) = tls.cert_kv_path() {
-                let state = kv_cert.unwrap_or_default();
-                match state.cert {
-                    Some(cert) => cert
-                        .server_config(tls, mesh.as_deref())
-                        .map_err(|err| format!("kv {path}: {err:#}")),
-                    None => Err(state
-                        .error
-                        .unwrap_or_else(|| format!("kv {path}: certificate not fetched yet"))),
-                }
-            } else if tls.cert_from_mesh() {
-                match mesh {
-                    Some(identity) => identity
-                        .server_config(mutual)
-                        .map_err(|err| format!("mesh server config: {err:#}")),
-                    None => Err("mesh certificate not issued yet".to_string()),
-                }
-            } else if mutual && tls.client_ca.as_deref() == Some("legion") {
-                // BYO server cert, mesh clients.
-                match mesh {
-                    Some(identity) => crate::worker::netd::tls::byo_server_config(
-                        &crate::structs::netpolicy::TlsConfig {
-                            client_ca: None,
-                            mode: crate::structs::netpolicy::TLS_SERVER.to_string(),
-                            ..tls.clone()
-                        },
-                    )
-                    .and_then(|_| identity.server_config(true))
-                    .map_err(|err| format!("{err:#}")),
-                    None => Err("mesh certificate not issued yet".to_string()),
-                }
-            } else {
-                crate::worker::netd::tls::byo_server_config(tls).map_err(|err| format!("{err:#}"))
-            };
+        let result = match termination {
+            PortTermination::Mesh => match mesh {
+                Some(identity) => identity
+                    .server_config(true)
+                    .map_err(|err| format!("mesh server config: {err:#}")),
+                None => Err("mesh certificate not issued yet".to_string()),
+            },
+            PortTermination::Own(tls) => {
+                port_server_config(tls, cert_state.as_ref(), ca_state.as_ref())
+            }
+        };
         if let Err(err) = &result {
             debug!(allocation_id, label, error = %err, "Ingress TLS material is not usable");
         }
@@ -902,13 +1374,25 @@ impl ForwarderContext {
 
     /// (ready, error) for the allocation's ingress TLS material.
     pub fn ingress_tls_status(&self, allocation_id: i64) -> (bool, String) {
-        // KV certificates are reported eagerly, from the fetch, rather than
+        use crate::structs::source::{MATERIAL_CLIENT_CA, MATERIAL_PORT_CERT};
+        // KV material is reported eagerly, from the fetch, rather than
         // waiting for the first connection to build a config: a missing key
-        // is not ready, and a failed renewal while an older certificate
-        // still serves is ready with the error attached.
-        if let Some(state) = lock(&self.kv_certs).get(&allocation_id) {
-            if let Some(error) = &state.error {
-                return (state.cert.is_some(), error.clone());
+        // is not ready, and a failed renewal while an older value still
+        // serves is ready with the error attached.
+        {
+            let material = lock(&self.tls_material);
+            let mut held: Vec<_> = material
+                .iter()
+                .filter(|((kind, id, _), _)| {
+                    *id == allocation_id
+                        && (*kind == MATERIAL_PORT_CERT || *kind == MATERIAL_CLIENT_CA)
+                })
+                .collect();
+            held.sort_by(|a, b| a.0.cmp(b.0));
+            for (_, state) in held {
+                if let Some(error) = &state.error {
+                    return (state.held.is_some(), error.clone());
+                }
             }
         }
         let cache = lock(&self.ingress_tls);
@@ -920,6 +1404,38 @@ impl ForwarderContext {
             }
         }
         (true, String::new())
+    }
+
+    /// Problems with the trust bundles external upstreams pin
+    /// (`connect.upstreams[].ca`), for the allocation's status.
+    pub fn upstream_ca_problems(&self, allocation_id: i64) -> Vec<String> {
+        use crate::structs::source::MATERIAL_UPSTREAM_CA;
+        let mut problems: Vec<String> = lock(&self.tls_material)
+            .iter()
+            .filter(|((kind, id, _), _)| *kind == MATERIAL_UPSTREAM_CA && *id == allocation_id)
+            .filter_map(|((_, _, upstream), state)| {
+                let error = state.error.as_deref()?;
+                Some(if state.held.is_some() {
+                    format!("upstream {upstream} ca: verifying with the previous bundle; {error}")
+                } else {
+                    format!("upstream {upstream} ca: {error} (connections on this upstream fail)")
+                })
+            })
+            .collect();
+        problems.extend(
+            lock(&self.upstream_tls)
+                .iter()
+                .filter(|((id, _), _)| *id == allocation_id)
+                .filter_map(|((_, upstream), (_, result))| {
+                    result
+                        .as_ref()
+                        .err()
+                        .map(|err| format!("upstream {upstream} ca: {err}"))
+                }),
+        );
+        problems.sort();
+        problems.dedup();
+        problems
     }
 
     /// Where to write per-allocation access logs.
@@ -1026,7 +1542,7 @@ impl ForwarderContext {
     }
 
     /// A rustls client trusting the Mozilla roots (webpki-roots). Built once
-    /// per process; external upstreams that pin a CA are a later phase.
+    /// per process.
     pub fn tls_connector(&self) -> tokio_rustls::TlsConnector {
         let config = self.tls.get_or_init(|| {
             let mut roots = rustls::RootCertStore::empty();
@@ -1039,6 +1555,110 @@ impl ForwarderContext {
         });
         tokio_rustls::TlsConnector::from(config.clone())
     }
+
+    /// The connector for one external upstream: the public roots, or the
+    /// trust bundle its `ca` pins (from KV or a file on the node). An error
+    /// means the upstream must not dial: a pinned CA that is not usable never
+    /// falls back to the public roots.
+    pub fn upstream_tls_connector(
+        &self,
+        allocation_id: i64,
+        upstream: &str,
+        ca: Option<&crate::structs::source::Source>,
+    ) -> Result<tokio_rustls::TlsConnector, String> {
+        use crate::structs::source::MATERIAL_UPSTREAM_CA;
+        let Some(ca) = ca else {
+            return Ok(self.tls_connector());
+        };
+        let state = ca
+            .is_fetched()
+            .then(|| self.tls_material(MATERIAL_UPSTREAM_CA, allocation_id, upstream));
+        let fingerprint = format!(
+            "{ca}|{}",
+            state
+                .as_ref()
+                .and_then(|state| state.held.as_ref())
+                .map(|held| held.version())
+                .unwrap_or(0)
+        );
+        let key = (allocation_id, upstream.to_string());
+        if let Some((fp, result)) = lock(&self.upstream_tls).get(&key) {
+            if *fp == fingerprint {
+                return result.clone().map(tokio_rustls::TlsConnector::from);
+            }
+        }
+        let result = match (ca.file_paths(), state) {
+            (Some((path, _)), _) => crate::worker::netd::tls::roots_from_file(path)
+                .map(crate::worker::netd::tls::pinned_client_config)
+                .map_err(|err| format!("{err:#}")),
+            (None, Some(state)) => match state.held.as_deref() {
+                Some(HeldTls::Ca { roots, .. }) => Ok(
+                    crate::worker::netd::tls::pinned_client_config(roots.clone()),
+                ),
+                _ => Err(state
+                    .error
+                    .unwrap_or_else(|| format!("{ca}: not fetched yet"))),
+            },
+            (None, None) => Err(format!("{ca}: not a CA source")),
+        };
+        lock(&self.upstream_tls).insert(key, (fingerprint, result.clone()));
+        result.map(tokio_rustls::TlsConnector::from)
+    }
+}
+
+/// How an ingress port terminates TLS.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PortTermination {
+    /// The service's mesh port: the node certificate, clients verified
+    /// against the mesh CA.
+    Mesh,
+    /// The port's own `tls`.
+    Own(crate::structs::network::PortTls),
+}
+
+/// Build a port's own server config from its sources and the fetched state
+/// of the KV-held ones.
+fn port_server_config(
+    tls: &crate::structs::network::PortTls,
+    cert_state: Option<&TlsMaterialState>,
+    ca_state: Option<&TlsMaterialState>,
+) -> Result<Arc<rustls::ServerConfig>, String> {
+    use crate::worker::netd::tls::{roots_from_file, CertKey};
+    let from_files;
+    let cert: &CertKey = match (tls.cert.file_paths(), cert_state) {
+        (Some((cert, key)), _) => {
+            from_files = CertKey::from_files(cert, key).map_err(|err| format!("{err:#}"))?;
+            &from_files
+        }
+        (None, Some(state)) => match state.held.as_deref() {
+            Some(HeldTls::Cert(cert)) => cert,
+            _ => {
+                return Err(state
+                    .error
+                    .clone()
+                    .unwrap_or_else(|| format!("{}: certificate not fetched yet", tls.cert)))
+            }
+        },
+        (None, None) => return Err(format!("{}: not a certificate source", tls.cert)),
+    };
+    let clients = match &tls.clients {
+        None => None,
+        Some(clients) => Some(match (clients.ca.file_paths(), ca_state) {
+            (Some((path, _)), _) => roots_from_file(path).map_err(|err| format!("{err:#}"))?,
+            (None, Some(state)) => match state.held.as_deref() {
+                Some(HeldTls::Ca { roots, .. }) => roots.clone(),
+                _ => {
+                    return Err(state
+                        .error
+                        .clone()
+                        .unwrap_or_else(|| format!("{}: client CA not fetched yet", clients.ca)))
+                }
+            },
+            (None, None) => return Err(format!("{}: not a CA source", clients.ca)),
+        }),
+    };
+    cert.server_config(clients)
+        .map_err(|err| format!("{}: {err:#}", cert.source))
 }
 
 impl UpstreamShared {
@@ -1080,37 +1700,33 @@ impl UpstreamShared {
             target,
             context,
             http_config: spec.http.clone(),
+            http_protocol: spec.http_protocol,
             handlers: spec.handlers.clone(),
             credentials: spec.credentials.clone(),
+            ca: spec.ca.clone(),
+            pipelines: PipelineCache::default(),
             http: OnceLock::new(),
             gated: spec.attachment.is_gated(),
         }
     }
 
-    /// Whether this upstream declares HTTP itself (an `http` block, an
-    /// `http://`/`https://` target, handlers that need bodies, or
-    /// credentials, which need a request head to go in: an upstream with
-    /// credentials is never spliced).
+    /// Whether this upstream speaks HTTP: its `to` scheme says so. Submit
+    /// refuses an `http` block, credentials, or a body-reading handler on an
+    /// upstream that does not, so those never turn HTTP mode on by
+    /// themselves; they are checked here too for a spec written by hand.
     fn declares_http(&self) -> bool {
-        self.http_config.is_some()
-            || !self.credentials.is_empty()
+        self.http_protocol
             || self.target.as_ref().is_some_and(|t| t.http)
-            || self
-                .handlers
-                .iter()
-                .any(|h| h.handler == crate::structs::netpolicy::HANDLER_DLP)
+            || !self.credentials.is_empty()
+            || self.handlers.iter().any(|h| h.kind.entry().needs_http())
     }
 
     /// HTTP-mode settings when this connection must be parsed: the upstream
-    /// declares HTTP, or the allocation's effective egress policy is an HTTP
-    /// chain. `None` means splice bytes.
+    /// speaks HTTP. A policy never changes how a stream is parsed: an HTTP
+    /// chain over a `tcp` upstream is judged with connect-time facts (see
+    /// [`deny_if_policy_says_so`]). `None` means splice bytes.
     fn http_settings(self: &Arc<Self>) -> Option<Arc<HttpSettings>> {
-        let policy_http = self
-            .context
-            .policy_for(self.allocation_id)
-            .and_then(|p| p.egress.as_ref().map(|c| c.is_http()))
-            .unwrap_or(false);
-        if !(self.declares_http() || policy_http) {
+        if !self.declares_http() {
             return None;
         }
         Some(
@@ -1129,6 +1745,8 @@ impl UpstreamShared {
                         self.context.log_dir_for(self.allocation_id),
                     );
                     settings.credentials = self.credentials.clone();
+                    settings.ca = self.ca.clone();
+                    settings.gated = self.gated;
                     Arc::new(settings)
                 })
                 .clone(),
@@ -1371,7 +1989,14 @@ impl UpstreamForwarder {
 
     async fn start_listener(&self, spec: UpstreamSpec, shared: Arc<UpstreamShared>) {
         let key = spec.key();
-        let listen = spec.listen();
+        let Some(listen) = spec.listen() else {
+            warn!(
+                allocation_id = spec.allocation_id,
+                service = %spec.service,
+                "Upstream has neither a loopback port nor a VIP this node serves; not binding"
+            );
+            return;
+        };
         let bound = listen.bind().await.map(|socket| {
             debug!(
                 allocation_id = spec.allocation_id,
@@ -1408,14 +2033,14 @@ impl UpstreamForwarder {
                     debug!(
                         allocation_id = spec.allocation_id,
                         service = %spec.service,
-                        local_port = spec.local_port,
+                        listen = %listen,
                         "Upstream forwarder port still unavailable"
                     );
                 } else {
                     warn!(
                         allocation_id = spec.allocation_id,
                         service = %spec.service,
-                        local_port = spec.local_port,
+                        listen = %listen,
                         error = ?err,
                         "Failed to bind upstream forwarder port; retrying on the next heartbeat"
                     );
@@ -1697,77 +2322,41 @@ async fn forward_external<C>(
     C: SpliceStream,
 {
     let destination = target.addr();
-    // The boot gate before anything else, as everywhere in the datapath.
-    if shared.gated && crate::worker::netd::netns::gate_is_shut(shared.allocation_id) {
-        let facts = ConnectFacts {
-            host: Some(target.host.as_str()),
-            ip: target.host.parse().ok(),
-            port: target.port,
-            identity: None,
-        };
-        deny_if_policy_says_so(&shared, &facts, &destination).await;
-        let _ = client.shutdown().await;
-        return;
-    }
-    // Resolve once, judge every address against the host guard, and dial
-    // only what passed (worker-plane-auth plan §6.11): `to = "tcp://localhost:4747"`
-    // and a name that resolves to the metadata service are refused here.
-    let addrs = match crate::worker::netd::guard::resolve_and_guard(
-        shared.context.resolver(),
-        shared.context.host_guard(),
+    // The gate, the host guard, and policy per resolved address, in the
+    // datapath's one order; only addresses every check passed are dialed.
+    let allowed = match crate::worker::netd::egress::judge(
+        &shared.context,
+        shared.allocation_id,
+        shared.gated,
+        true,
         &target.host,
         target.port,
+        None,
     )
     .await
     {
-        Ok(addrs) => addrs,
-        Err(crate::worker::netd::guard::GuardRefusal::Denied(reason)) => {
-            deny_connection(
-                &shared,
-                &destination,
-                crate::structs::host_guard::HOST_GUARD_SOURCE,
-                Some(&reason),
-            );
-            let _ = client.shutdown().await;
-            return;
-        }
-        Err(crate::worker::netd::guard::GuardRefusal::Unresolved(reason)) => {
+        Ok(allowed) if allowed.is_empty() => {
             debug!(
                 allocation_id = shared.allocation_id,
                 upstream = %shared.service,
-                %reason,
                 "External upstream did not resolve"
             );
             net_metrics::connection("egress", PROTOCOL_TCP, "error");
             let _ = client.shutdown().await;
             return;
         }
-    };
-    // Policy per resolved address: a name rule matches the name, a CIDR
-    // rule the address. Only addresses every check passed are dialed.
-    let mut allowed = Vec::with_capacity(addrs.len());
-    for addr in &addrs {
-        let facts = ConnectFacts {
-            host: Some(target.host.as_str()),
-            ip: Some(addr.ip()),
-            port: target.port,
-            identity: None,
-        };
-        if !policy_denies(&shared, &facts) {
-            allowed.push(*addr);
+        Ok(allowed) => allowed,
+        Err(denial) => {
+            deny_connection(
+                &shared,
+                &destination,
+                &denial.source,
+                denial.reason.as_deref(),
+            );
+            let _ = client.shutdown().await;
+            return;
         }
-    }
-    if allowed.is_empty() {
-        let facts = ConnectFacts {
-            host: Some(target.host.as_str()),
-            ip: addrs.first().map(|addr| addr.ip()),
-            port: target.port,
-            identity: None,
-        };
-        deny_if_policy_says_so(&shared, &facts, &destination).await;
-        let _ = client.shutdown().await;
-        return;
-    }
+    };
     let hop_facts = HopFacts {
         allocation_id: shared.allocation_id,
         direction: "egress",
@@ -1836,7 +2425,24 @@ async fn forward_external<C>(
             return;
         }
     };
-    let connector = shared.context.tls_connector();
+    let connector = match shared.context.upstream_tls_connector(
+        shared.allocation_id,
+        &shared.service,
+        shared.ca.as_ref(),
+    ) {
+        Ok(connector) => connector,
+        Err(err) => {
+            warn!(
+                allocation_id = shared.allocation_id,
+                upstream = %shared.service,
+                error = %err,
+                "External upstream CA is not usable; refusing the connection"
+            );
+            net_metrics::connection("egress", PROTOCOL_TCP, "error");
+            let _ = client.shutdown().await;
+            return;
+        }
+    };
     match tokio::time::timeout(DIAL_TIMEOUT, connector.connect(server_name, upstream)).await {
         Ok(Ok(tls)) => {
             net_metrics::connection("egress", PROTOCOL_TCP, "allow");
@@ -1866,28 +2472,9 @@ async fn forward_external<C>(
     }
 }
 
-/// Evaluate the allocation's egress policy for one destination. Returns true
-/// when the connection must be closed, having recorded the denial and the
-/// metric. No policy (or an allow / defer verdict) returns false.
-/// Whether the allocation's egress verdict (the gate, pending policy, then
-/// the chain) would refuse `facts`, without recording anything.
-fn policy_denies(shared: &Arc<UpstreamShared>, facts: &ConnectFacts<'_>) -> bool {
-    if shared.gated {
-        if crate::worker::netd::netns::gate_is_shut(shared.allocation_id) {
-            return true;
-        }
-        let policy = shared.context.policy_for(shared.allocation_id);
-        if policy.is_none() && !shared.context.policy_known(shared.allocation_id) {
-            return true;
-        }
-    }
-    let policy = shared.context.policy_for(shared.allocation_id);
-    matches!(
-        egress_connect_verdict(policy.as_deref(), facts),
-        Verdict::Deny { .. }
-    )
-}
-
+/// Evaluate the allocation's egress policy for one catalog endpoint.
+/// Returns true when the connection must be closed, having recorded the
+/// denial and the metric. No policy (or an allow verdict) returns false.
 async fn deny_if_policy_says_so(
     shared: &Arc<UpstreamShared>,
     facts: &ConnectFacts<'_>,
@@ -1895,54 +2482,43 @@ async fn deny_if_policy_says_so(
 ) -> bool {
     let policy = shared.context.policy_for(shared.allocation_id);
     // A gated allocation fails closed: while its policy is still pending, or
-    // while its edge-boot gate is shut, nothing leaves.
-    let gated_block = if shared.gated {
-        if crate::worker::netd::netns::gate_is_shut(shared.allocation_id) {
-            Some((
-                "gate".to_string(),
-                Some("network gate is shut until the placement is ratified".to_string()),
-            ))
-        } else if policy.is_none() && !shared.context.policy_known(shared.allocation_id) {
-            Some((
-                "policy-pending".to_string(),
-                Some("network policy has not arrived yet".to_string()),
-            ))
-        } else {
-            None
-        }
-    } else {
-        None
-    };
-    let verdict = match gated_block {
-        Some((source, reason)) => Verdict::Deny { source, reason },
+    // while its edge-boot gate is shut, nothing leaves. A declared upstream
+    // is an explicit allowance, so no chain means allow.
+    let verdict = match crate::worker::netd::egress::gate_block(
+        &shared.context,
+        shared.allocation_id,
+        shared.gated,
+        policy.as_deref(),
+    ) {
+        Some(denial) => Verdict::Deny {
+            source: denial.source,
+            reason: denial.reason,
+        },
         None => egress_connect_verdict(policy.as_deref(), facts),
+    };
+    // An HTTP chain over an upstream that does not speak HTTP: a rule that
+    // needs the request head cannot be decided, so the connection fails
+    // closed, naming the rule and the upstream.
+    let verdict = match verdict {
+        Verdict::Defer => Verdict::Deny {
+            source: policy
+                .as_ref()
+                .and_then(|p| p.egress.as_ref())
+                .and_then(|chain| crate::structs::netpolicy::deferring_rule(chain, facts))
+                .unwrap_or_else(|| "policy".to_string()),
+            reason: Some(format!(
+                "upstream '{}' is tcp://, and the first rule that could match it needs a path, \
+                 method, or header. Hint: allow '{}' by host ahead of path rules, or write \
+                 to = \"http://{}\" if it speaks HTTP",
+                shared.service, shared.service, shared.service
+            )),
+        },
+        other => other,
     };
     match verdict {
         Verdict::Allow | Verdict::Defer => false,
         Verdict::Deny { source, reason } => {
-            debug!(
-                allocation_id = shared.allocation_id,
-                upstream = %shared.service,
-                destination = %destination,
-                source = %source,
-                "Egress connection denied by policy"
-            );
-            net_metrics::connection("egress", PROTOCOL_TCP, "deny");
-            shared.context.edges().record_denied(
-                shared.allocation_id,
-                &shared.service,
-                PROTOCOL_TCP,
-            );
-            shared.context.record_denial(
-                shared.allocation_id,
-                "egress",
-                PROTOCOL_TCP,
-                destination,
-                &source,
-                reason.as_deref(),
-                "",
-                "",
-            );
+            deny_connection(shared, destination, &source, reason.as_deref());
             true
         }
     }
@@ -1951,17 +2527,17 @@ async fn deny_if_policy_says_so(
 /// The external hops that apply to this listener's flows: the effective
 /// egress chain's, then the upstream's own.
 async fn run_hops(shared: &Arc<UpstreamShared>, facts: &HopFacts<'_>) -> HopOutcome {
-    let hops = handlers::hops_for(
-        &shared.context,
-        shared.allocation_id,
-        "egress",
-        Some(&shared.service),
-        &shared.handlers,
-    );
-    if hops.is_empty() {
-        return HopOutcome::Allow;
-    }
-    handlers::run(&shared.context, &hops, facts).await
+    let policy = shared.context.policy_for(shared.allocation_id);
+    shared
+        .pipelines
+        .get(
+            policy.as_deref(),
+            "egress",
+            Some(&shared.service),
+            &shared.handlers,
+        )
+        .run_connect(&shared.context, facts)
+        .await
 }
 
 fn deny_connection(
@@ -1975,7 +2551,7 @@ fn deny_connection(
         upstream = %shared.service,
         destination = %destination,
         source = %source,
-        "Egress connection denied by a handler"
+        "Egress connection denied"
     );
     net_metrics::connection("egress", PROTOCOL_TCP, "deny");
     shared
@@ -2022,7 +2598,7 @@ async fn hand_off<C>(
                 shared.context.note_handler(
                     shared.allocation_id,
                     &target.source,
-                    crate::structs::netpolicy::HANDLER_PROXY,
+                    "proxy",
                     &target.addr,
                     Err(format!("dial {}: {err}", target.addr)),
                 );
@@ -2200,12 +2776,14 @@ mod tests {
         UpstreamSpec {
             allocation_id: 7,
             service: "db".into(),
-            local_port: port,
+            local_port: Some(port),
+            http_protocol: false,
             balance: balance.into(),
             to: None,
             http: None,
             handlers: Vec::new(),
             credentials: Vec::new(),
+            ca: None,
             vip: None,
             canonical_port: None,
             attachment: Attachment::Host,
@@ -2361,13 +2939,17 @@ mod tests {
         forwarder.set_endpoints(7, "db", vec![endpoint(&first), endpoint(&second)]);
 
         // Sequential connections, so each pick happens before the next dial:
-        // round robin must hand them out in order and then wrap.
+        // round robin must hand them out in order and then wrap. Where it
+        // starts is random per listener.
         let mut tags = Vec::new();
         for _ in 0..3 {
             let mut client = connect(port).await;
             tags.push(served_by(&mut client).await);
         }
-        assert_eq!(tags, vec!["a", "b", "a"]);
+        assert!(
+            tags == vec!["a", "b", "a"] || tags == vec!["b", "a", "b"],
+            "{tags:?}"
+        );
     }
 
     #[tokio::test]
@@ -2434,8 +3016,8 @@ mod tests {
         vsock.attachment = Attachment::GuestVsock {
             scratch: scratch.clone(),
         };
-        let path = scratch.join(format!("vsock.sock_{}", vsock.local_port));
-        assert_eq!(vsock.listen(), ListenAddr::Unix(path.clone()));
+        let path = scratch.join(format!("vsock.sock_{}", vsock.local_port.unwrap()));
+        assert_eq!(vsock.listen(), Some(ListenAddr::Unix(path.clone())));
         std::fs::create_dir_all(&scratch).unwrap();
         std::fs::write(&path, b"stale").unwrap();
         let live = spawn_echo("a").await;
@@ -2449,7 +3031,7 @@ mod tests {
         assert_eq!(forwarder.active(), vec![vsock.clone()]);
         forwarder.set_endpoints(7, "db", vec![endpoint(&live)]);
         assert!(
-            TcpListener::bind(("127.0.0.1", vsock.local_port))
+            TcpListener::bind(("127.0.0.1", vsock.local_port.unwrap()))
                 .await
                 .is_ok(),
             "a vsock upstream must not hold the node's loopback port"
@@ -2491,6 +3073,68 @@ mod tests {
 
         forwarder.sync(&[]).await;
         assert!(forwarder.active().is_empty());
+    }
+
+    /// An HTTP `require` chain over a `tcp` upstream: a host rule allows it
+    /// at connect and the bytes are spliced untouched (the endpoint speaks
+    /// first, like a Postgres greeting); a chain whose first rule for it
+    /// needs a path refuses it, naming the rule and the upstream. A policy
+    /// never makes the forwarder parse a `tcp` upstream as HTTP.
+    #[tokio::test]
+    async fn an_http_chain_never_parses_a_tcp_upstream_test() {
+        use crate::structs::netpolicy::{merge_policies, InlinePolicy, NetPolicyObject};
+        use crate::structs::AllocNetPolicy;
+
+        let greeting = spawn_echo("p").await;
+        let cache = Arc::new(crate::worker::netd::NetPolicyCache::new());
+        let denials = Arc::new(Denials::new());
+        let set_policy = |egress: serde_json::Value| {
+            let mut object: NetPolicyObject = serde_json::from_value(serde_json::json!({
+                "name": "web", "enforcement": "require", "egress": egress
+            }))
+            .unwrap();
+            object.normalize_and_validate().unwrap();
+            let body = merge_policies(&[object], InlinePolicy::default());
+            cache.apply_assignments(&[AllocNetPolicy {
+                allocation_id: 7,
+                policy_hash: body.hash.clone(),
+            }]);
+            cache.insert_body(&body.hash.clone(), body).unwrap();
+        };
+        set_policy(
+            serde_json::json!({ "protocol": "http", "allow": ["db", "api.github.com/repos/**"] }),
+        );
+        let forwarder = UpstreamForwarder::with_context(Arc::new(ForwarderContext::new(
+            cache.clone(),
+            denials.clone(),
+        )));
+        let port = free_port().await;
+        forwarder.sync(&[spec(port, "round_robin")]).await;
+        forwarder.set_endpoints(7, "db", vec![endpoint(&greeting)]);
+
+        let mut client = connect(port).await;
+        assert_eq!(served_by(&mut client).await, "p", "spliced, not parsed");
+
+        set_policy(serde_json::json!({
+            "protocol": "http", "policy": "deny",
+            "rules": [{ "when": { "path": "/x/**" }, "action": "allow" }]
+        }));
+        let mut client = connect(port).await;
+        let mut buf = [0u8; 1];
+        let read = tokio::time::timeout(TEST_TIMEOUT, client.read(&mut buf))
+            .await
+            .expect("an undecidable verdict must close the connection promptly");
+        assert_eq!(read.expect("read from forwarder"), 0);
+        let drained = denials.drain();
+        let denial = drained
+            .iter()
+            .find(|d| d.source == "policy/web#0")
+            .unwrap_or_else(|| panic!("{drained:?}"));
+        assert!(
+            denial.reason.contains("upstream 'db' is tcp://"),
+            "{}",
+            denial.reason
+        );
     }
 
     #[tokio::test]
@@ -2552,24 +3196,29 @@ mod tests {
         forwarder.sync(&[spec(port, "least_conn")]).await;
         forwarder.set_endpoints(7, "db", vec![endpoint(&first), endpoint(&second)]);
 
-        // Both endpoints idle: the tie breaks round robin onto the first.
+        // Both endpoints idle: the tie breaks round robin, from a random start.
         let mut held = connect(port).await;
-        assert_eq!(served_by(&mut held).await, "a");
+        let held_by = served_by(&mut held).await;
+        let (held_addr, other) = if held_by == "a" {
+            (first.clone(), "b")
+        } else {
+            (second.clone(), "a")
+        };
         assert_eq!(
-            forwarder.inflight(7, "db").get(&first).copied(),
+            forwarder.inflight(7, "db").get(&held_addr).copied(),
             Some(1),
             "a live connection must count against its endpoint"
         );
 
         // `held` is still open, so the next connection must avoid that endpoint.
         let mut next = connect(port).await;
-        assert_eq!(served_by(&mut next).await, "b");
+        assert_eq!(served_by(&mut next).await, other);
 
         // Closing a connection releases its slot again.
         drop(held);
         wait_until(
             "the closed connection to release its in-flight slot",
-            || !forwarder.inflight(7, "db").contains_key(&first),
+            || !forwarder.inflight(7, "db").contains_key(&held_addr),
         )
         .await;
     }

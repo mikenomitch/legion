@@ -17,7 +17,14 @@ use std::path::PathBuf;
 // plaintext (`http://`) worker address, so exec, logs, and restart against a
 // protocol-2 worker fail with an error naming its version until it is
 // upgraded; dispatch still reaches it through heartbeat replies.
-pub const PROTOCOL_VERSION: u32 = 3;
+//
+// Version 4: the worker fetches every piece of datapath material with one
+// `FetchDatapathMaterial` call (in place of `FetchNetPolicy`,
+// `GetIngressCertificates`, and `GetUpstreamCredentials`), reads mesh and
+// port TLS off `AllocPort.mesh`/`tls`, and names callers by
+// `TaskAllocation.task_group`. A protocol-3 worker's policy bodies,
+// certificates, and credentials stop refreshing until it is upgraded.
+pub const PROTOCOL_VERSION: u32 = 4;
 
 // === Worker → task-runtime environment ===
 // Task runtimes are in-process dylibs with no config channel of their own, so

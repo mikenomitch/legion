@@ -145,8 +145,14 @@ itself, link-local (the cloud metadata service), and other allocations'
 listeners are refused whatever the job's policy says. A task running as root
 can leave the namespace with `setns`, so `gated` contains non-root tasks
 only. The full model, the fail-closed rules, and the limits (no raw UDP, no
-ICMP, no inbound to undeclared ports, Linux only) are in
+ICMP, no inbound to undeclared ports) are in
 [Network Handlers](network-handlers.md#gated-mode).
+
+On macOS, which has no namespaces, a gated `exec` task runs under Seatbelt
+instead: `/usr/bin/sandbox-exec` with a profile that lets it connect only to
+its own egress proxy and upstream ports on `localhost`, with no DNS of its
+own ([Gated mode on macOS](network-handlers.md#gated-mode-on-macos); not yet
+verified on macOS hardware).
 
 ## Capability Summary
 

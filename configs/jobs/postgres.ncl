@@ -142,7 +142,7 @@
   #   # $LEGION_UPSTREAM_POSTGRES (127.0.0.1:<port>) to the healthy Postgres,
   #   # since its host port is dynamic. In a real deployment, inject the
   #   # password from KV instead of inlining it.
-  #   connect = { upstreams = [{ service = "postgres" }] },
+  #   connect = { upstreams = [{ to = "postgres" }] },
   #   config = {
   #     image = "postgres:16-alpine",
   #     command = ["sh", "-c", "pg_dump \"postgres://postgres:legion-demo@$LEGION_UPSTREAM_POSTGRES/legion\" | gzip > \"$LEGION_TASK_DIR/pg-$(date +%F).sql.gz\""],

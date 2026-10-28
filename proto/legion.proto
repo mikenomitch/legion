@@ -1158,7 +1158,7 @@ service Manager {
   // the node's identity on every plane Legion runs between its own
   // processes: the mTLS worker plane listener (what a manager verifies when
   // it dials the node, docs/auth-and-acls.md, "The worker plane") and the
-  // mesh (`certFrom = "legion"`, docs/network-handlers.md, "mTLS").
+  // mesh (`service.mesh = true`, docs/network-handlers.md, "The mesh").
   //
   // The worker generates its key pair locally and sends only a CSR; the
   // private key never crosses the network. The manager has the CSR's public
@@ -1213,84 +1213,61 @@ service Manager {
   rpc IssueNodeCertificate (IssueNodeCertificateRequest)
       returns (IssueNodeCertificateReply);
 
-  // Fetch the KV-held certificates behind `certFrom = { kv = "<path>" }`
-  // ingress chains (docs/network-handlers.md, "Certificates from KV").
+  // Fetch the material a node's datapath needs for the allocations placed
+  // on it, in one call per heartbeat: network-policy bodies by hash, the
+  // KV-held certificates and CA bundles behind `network.ports[].tls` and
+  // `connect.upstreams[].ca`, and the values behind
+  // `connect.upstreams[].credentials` (docs/network-handlers.md). One call
+  // serves every kind, so a new kind of material (or a new place a value
+  // comes from) is a provider on the manager, not a new call.
   //
-  // The worker names allocations, never KV paths. For each allocation the
-  // manager checks that it is placed on the calling node, recomputes its
-  // effective ingress chain (inline chain merged with any policy objects),
-  // takes the KV path from that chain, and reads the entry. So a node can
-  // only ever read a certificate that a job or policy on it declares, and a
-  // job can only declare one its submitter could read (RunJob and
-  // UpsertNetPolicy require `kv:read` on the path).
+  // Each `MaterialRef` names a kind and what it is for, never where the
+  // value lives:
+  // - `policy`: `key` is a content hash from `HeartbeatReply.net_policies`;
+  //   `value` is the `EffectivePolicy` as JSON. Policies are
+  //   content-addressed, so a node running a thousand identical sandboxes
+  //   fetches one body once.
+  // - `port_cert`: `allocation_id` and `key` (a port label) name a port whose
+  //   `tls.cert = { kv }`; `value` is the PEM bundle (chain, leaf first,
+  //   then the private key), validated by the manager first.
+  // - `client_ca`: the same, for the port's `tls.clients.ca = { kv }`;
+  //   `value` is a PEM CA bundle.
+  // - `upstream_ca`: `allocation_id` and `key` (an upstream key) name an
+  //   external upstream whose `ca = { kv }`; `value` is a PEM CA bundle.
+  // - `credential`: `allocation_id`, `key` (the upstream's key), and `part`
+  //   (the header, lower-cased) name one injected header; `value` is the KV
+  //   value or a freshly minted workload-identity token.
   //
-  // Workers call it on their heartbeat loop, only while some allocation on
-  // the node has a KV-backed chain, passing the KV version they already
-  // hold so an unchanged certificate costs no material on the wire. The
-  // worker keeps the material in memory only.
+  // The manager derives every KV path and identity itself, from the
+  // allocation's own declaration (its ports, as placed, and its task's
+  // `connect` block), after checking the allocation is placed on the
+  // calling node. So a node can only ever read material that a job on it
+  // declares, and a job can only declare a KV path its submitter could read
+  // (RunJob and template runs require `kv:read` on it).
   //
-  // Per-allocation problems (not placed here, no KV-backed chain, key
-  // missing, bundle invalid) come back in that allocation's `error` rather
-  // than failing the call, so one broken certificate never blocks the
-  // others.
-  //
-  // Called by the worker for its own node: the caller's authenticated
-  // per-node principal (`node:<node_id>`) must match the request's
-  // `node_id`.
-  //
-  // Errors:
-  // - PermissionDenied: `node_id` does not match the caller's credential.
-  // - Internal: the node's allocations could not be loaded.
-  rpc GetIngressCertificates (GetIngressCertificatesRequest)
-      returns (GetIngressCertificatesReply);
-
-  // Fetch the values behind `connect.upstreams[].credentials`
-  // (docs/network-handlers.md, "Credential injection"): headers the node's
-  // forwarder sets on every request it sends to an external `https://`
-  // upstream, so the task (and anything captured from it: a sandbox's
-  // memory checkpoints, forks, published snapshots) never holds the secret.
-  //
-  // Each credential names one provider:
-  // - `from = { kv = "<path>" }`: the KV value at that path.
-  // - `from = { identity = "<name>" }`: a workload-identity token
-  //   (docs/workload-identity.md) the manager mints for the allocation
-  //   under the task's identity of that name, with that identity's
-  //   audience, TTL, `sub` template, and extra claims.
-  //
-  // The worker names (allocation, upstream, header) triples, never KV paths
-  // or identities. For each one the manager checks that the allocation is
-  // placed on the calling node, reads the allocation's own task `connect`
-  // declaration, finds the upstream and the credential for that header, and
-  // takes the provider from it. So a node can only ever read a secret that a
-  // job placed on it declares, and a job can only declare one its submitter
-  // could read (RunJob and template runs require `kv:read` on every
-  // credential path).
-  //
-  // Workers call it on their heartbeat loop, only while some allocation on
-  // the node declares credentials, passing the version they already hold so
-  // an unchanged value costs no material on the wire. For a KV value the
-  // version is the KV entry's; for an identity token it is the token's
-  // expiry, and the manager mints a new token once less than half the
-  // identity's TTL remains. The worker keeps values in memory only: never in
+  // Workers pass the version they already hold (`MaterialRef.version`): the
+  // KV entry's version, or for an identity token its expiry in unix
+  // seconds, which the manager re-mints once less than half the identity's
+  // TTL remains. An unchanged value comes back `unchanged` with no material
+  // on the wire. Material is held in memory only on the worker: never in
   // its state files, never in a log line.
   //
-  // Per-entry problems (not placed here, no such credential, key missing,
-  // workload identity disabled on the manager) come back in that entry's
-  // `error` rather than failing the call, so one missing secret never blocks
-  // the others. `absent` marks the problems that are authoritative (the key
-  // or the declaration is gone): the worker drops any value it holds and
-  // fails requests on that upstream closed. Any other error, and a failed
-  // call, keeps the last good value.
+  // Per-ref problems (not placed here, no such declaration, key missing,
+  // bundle invalid, workload identity disabled) come back in that ref's
+  // `error` rather than failing the call, so one broken certificate or
+  // missing secret never blocks the others. `absent` marks the
+  // authoritative ones (the key or the declaration is gone): the worker
+  // drops what it holds, so requests that need it fail closed. Any other
+  // error, and a failed call, keeps the last good value (fail-static).
   //
-  // Called by the worker for its own node: the caller's authenticated
-  // per-node principal (`node:<node_id>`) must match the request's
-  // `node_id`.
+  // ACL: worker plane. The caller's authenticated per-node principal
+  // (`node:<node_id>`) must match the request's `node_id`.
   //
   // Errors:
   // - PermissionDenied: `node_id` does not match the caller's credential.
   // - Internal: the node's allocations could not be loaded.
-  rpc GetUpstreamCredentials (GetUpstreamCredentialsRequest)
-      returns (GetUpstreamCredentialsReply);
+  rpc FetchDatapathMaterial (FetchDatapathMaterialRequest)
+      returns (FetchDatapathMaterialReply);
 
   // Worker heartbeat endpoint.
   //
@@ -1917,6 +1894,45 @@ service Manager {
   // reported as `defer`. ACL: `net:read` on the job.
   rpc TestNetPolicy (TestNetPolicyRequest) returns (TestNetPolicyReply);
 
+  // Creates or replaces a network plugin object: a WASM module on the
+  // proxy-wasm ABI that runs inside the node datapath as one more handler
+  // (docs/network-plugins.md). The object names the module (a `.wasm` URL
+  // pinned by `sha256:` checksum), the stages it acts at, who may reference
+  // it (`usableBy`), the node pools it may run on, its limits, the JSON
+  // Schema every reference's `config` must satisfy, the HTTP targets it may
+  // call, and the KV-held keys it may sign with. Validated on write; a
+  // plugin that a stored policy references must keep stages that policy can
+  // run and a schema its config still satisfies, or the write is refused.
+  // Nodes running the plugin pick up the new revision on their next
+  // heartbeat and fetch the module once per node.
+  //
+  // ACL: `net:write`. A `usableBy = "policies"` plugin with `nodePools`
+  // needs it on each pool; one without pools, and every `usableBy = "jobs"`
+  // plugin, and any plugin whose module is a `file://` node path, needs it
+  // unscoped (cluster-wide). Naming a `credentials` KV path also needs
+  // `kv:read` on that path.
+  rpc UpsertNetPlugin (UpsertNetPluginRequest) returns (UpsertNetPluginReply);
+
+  // Fetches one stored plugin object by name, with the policy objects that
+  // reference it. ACL: `net:read`.
+  rpc GetNetPlugin (GetNetPluginRequest) returns (GetNetPluginReply);
+
+  // Lists stored plugin objects by name. ACL: `net:read`.
+  rpc ListNetPlugins (ListNetPluginsRequest) returns (ListNetPluginsReply);
+
+  // Deletes a stored plugin object. Refused while a stored policy object
+  // references it (the error names them). A job that references it keeps
+  // running; its plugin hops fail with "plugin not found" and follow their
+  // `onError` from the next heartbeat. ACL: `net:write`, as for
+  // UpsertNetPlugin.
+  rpc DeleteNetPlugin (DeleteNetPluginRequest) returns (DeleteNetPluginReply);
+
+  // Where a plugin runs and how it is doing, as each node last reported it
+  // on its heartbeat: the revision and module the node holds, whether the
+  // module is fetched and instantiated, calls, errors, the last error, and
+  // the p99 callback time. ACL: `net:read`.
+  rpc GetNetPluginStatus (GetNetPluginStatusRequest) returns (GetNetPluginStatusReply);
+
   // The cluster CA as the answering manager sees it — what an operator
   // hands a non-Legion client that must reach a mesh-TLS port or the worker
   // plane (`legion sandbox start --node`, `legion exec --direct`), or
@@ -1952,14 +1968,6 @@ service Manager {
   //   the trust bundle, wait a heartbeat, switch the signing CA, drop the
   //   old CA a day later; docs/cluster-ca.md#rotation).
   rpc RotateMeshCa (RotateMeshCaRequest) returns (RotateMeshCaReply);
-
-  // Worker plane: fetches the merged policy body for a hash the heartbeat
-  // reply named. Policies are content-addressed so a node running a thousand
-  // identical sandboxes fetches one body once; the worker caches by hash and
-  // keeps the last known good body if a fetch fails (fail-static).
-  //
-  // ACL: worker plane (node token).
-  rpc FetchNetPolicy (FetchNetPolicyRequest) returns (FetchNetPolicyReply);
 
   // Resolves an artifact credential stored in KV for a worker about to fetch.
   //
@@ -5825,137 +5833,79 @@ message IssueNodeCertificateReply {
   int64 expires_at = 4;
 }
 
-// One allocation in a GetIngressCertificates request.
-message IngressCertificateKnown {
-  // The allocation (manager-facing id) whose ingress certificate to fetch.
-  int64 allocation_id = 1;
+// One piece of material a node asks for: what kind, and what it is for.
+// Never where the value lives; the manager derives that (see
+// `FetchDatapathMaterial`).
+message MaterialRef {
+  // `policy`, `port_cert`, `client_ca`, `upstream_ca`, or `credential`.
+  string kind = 1;
 
-  // The KV version of the certificate the worker already holds, or 0 for
-  // none. When it matches the current version the reply is `unchanged`.
-  int64 version = 2;
+  // The allocation (manager-facing id) the material is for. 0 for `policy`,
+  // which is shared by content hash.
+  int64 allocation_id = 2;
+
+  // `policy`: the content hash. `port_cert` and `client_ca`: the port
+  // label. `upstream_ca` and `credential`: the upstream's key (its `name`,
+  // or the catalog service its `to` names).
+  string key = 3;
+
+  // `credential`: the injected header, lower-cased. Empty otherwise.
+  string part = 4;
+
+  // The version the worker already holds, or 0 for none: the KV entry's
+  // version, or an identity token's expiry in unix seconds. Unused for
+  // `policy` (a hash never changes).
+  int64 version = 5;
 }
 
-// Request payload for GetIngressCertificates.
-message GetIngressCertificatesRequest {
-  // The worker node asking. Must match the caller's authenticated per-node
-  // credential.
-  string node_id = 1;
+// The answer for one `MaterialRef`.
+message Material {
+  // The ref this answers, echoed as sent.
+  MaterialRef ref = 1;
 
-  // The allocations on this node with a `certFrom = { kv }` ingress chain.
-  repeated IngressCertificateKnown known = 2;
-}
+  // Where the value comes from, as the declaration names it: `kv
+  // certs/app`, `identity api`, or `policy <hash>`. Set even when `error`
+  // is, so the worker can report which key is at fault.
+  string source = 2;
 
-// One allocation's certificate in a GetIngressCertificates reply.
-message IngressCertificate {
-  // The allocation this certificate is for.
-  int64 allocation_id = 1;
-
-  // The KV path the allocation's effective ingress chain names. Set even
-  // when `error` is, so the worker can report which key is at fault.
-  string kv_path = 2;
-
-  // The KV entry's version. The worker re-fetches when it moves.
+  // The value's current version (see `MaterialRef.version`). The worker
+  // sends it back next time.
   int64 version = 3;
 
-  // True when `version` equals the version the worker sent. No material is
+  // True when the version the worker sent is still current. No value is
   // returned.
   bool unchanged = 4;
 
-  // The PEM bundle: the certificate chain, leaf first, then the private
-  // key. Validated by the manager before it is sent. Treat as a secret:
+  // The material: an `EffectivePolicy` as JSON (`policy`), a PEM bundle
+  // (`port_cert`), a CA bundle (`client_ca`, `upstream_ca`), or a header
+  // value (`credential`). Treat as a secret:
   // never log it, never write it to disk.
-  string bundle_pem = 5;
+  string value = 5;
 
-  // Why no certificate was returned, e.g. "kv certs/app not found" or
-  // "kv certs/app holds no private key". Empty on success.
+  // Why no value was returned. Empty on success.
   string error = 6;
+
+  // True when `error` is authoritative: the key or the declaration is gone,
+  // so the worker drops what it holds instead of keeping it.
+  bool absent = 7;
 }
 
-// Reply payload for GetIngressCertificates.
-message GetIngressCertificatesReply {
-  // One entry per requested allocation, in request order.
-  repeated IngressCertificate certificates = 1;
-}
-
-// One injected header in a GetUpstreamCredentials request: an allocation on
-// the calling node, one of its upstreams, and one credential header on it.
-message UpstreamCredentialKnown {
-  // The allocation (manager-facing id) whose credential to fetch.
-  int64 allocation_id = 1;
-
-  // The upstream's key: the `name` of an external upstream
-  // (`connect.upstreams[].name`), as in `LEGION_UPSTREAM_<NAME>`.
-  string upstream = 2;
-
-  // The injected header, lower-cased (`x-api-key`, `authorization`).
-  string header = 3;
-
-  // The version of the value the worker already holds, or 0 for none: the
-  // KV entry's version for a `kv` credential, the token's expiry (unix
-  // seconds) for an `identity` one. When it is still current the reply is
-  // `unchanged`.
-  int64 version = 4;
-}
-
-// Request payload for GetUpstreamCredentials.
-message GetUpstreamCredentialsRequest {
+// Request payload for FetchDatapathMaterial.
+message FetchDatapathMaterialRequest {
   // The worker node asking. Must match the caller's authenticated per-node
   // credential.
   string node_id = 1;
 
-  // Every credential header declared by an allocation on this node.
-  repeated UpstreamCredentialKnown known = 2;
+  // What the node's datapath needs: policy bodies it holds an assignment
+  // without a body for, and the certificates and credentials its
+  // allocations declare.
+  repeated MaterialRef refs = 2;
 }
 
-// One credential in a GetUpstreamCredentials reply.
-message UpstreamCredentialValue {
-  // The allocation this credential is for.
-  int64 allocation_id = 1;
-
-  // The upstream key, echoed from the request.
-  string upstream = 2;
-
-  // The header, echoed from the request.
-  string header = 3;
-
-  // Where the value comes from, as the allocation's declaration names it:
-  // `kv secrets/openai` or `identity api`. Set even when `error` is, so the
-  // worker can report which key or identity is at fault. Empty when the
-  // declaration is gone.
-  string source = 4;
-
-  // The value's version: the KV entry's version, or the identity token's
-  // expiry in unix seconds. The worker sends it back as
-  // `UpstreamCredentialKnown.version`.
-  int64 version = 5;
-
-  // True when the version the worker sent is still current (the KV entry
-  // has not moved, or the identity token it holds has more than half its
-  // TTL left). No value is returned.
-  bool unchanged = 6;
-
-  // The secret: the raw KV value, or the signed identity token, which the
-  // forwarder sends as the header value after the declared `prefix`. Treat
-  // as a secret: never log it, never write it to disk.
-  string value = 7;
-
-  // Why no value was returned, e.g. "kv secrets/openai not found" or
-  // "workload identity is not enabled on this manager". Empty on success.
-  string error = 8;
-
-  // True when `error` is authoritative rather than transient: the KV key
-  // does not exist, or the allocation is not on this node or no longer
-  // declares this credential. The worker drops any value it holds, so
-  // deleting the key revokes the credential on the next heartbeat. False
-  // for transient problems (a KV read failure, a failed token mint), where
-  // the worker keeps the last good value.
-  bool absent = 9;
-}
-
-// Reply payload for GetUpstreamCredentials.
-message GetUpstreamCredentialsReply {
-  // One entry per requested credential, in request order.
-  repeated UpstreamCredentialValue credentials = 1;
+// Reply payload for FetchDatapathMaterial.
+message FetchDatapathMaterialReply {
+  // One entry per requested ref, in request order.
+  repeated Material materials = 1;
 }
 
 // Request payload for Heartbeat.
@@ -6173,6 +6123,13 @@ message HeartbeatRequest {
   //
   // Default: empty list. Fixed envelopes never send one.
   repeated EnvelopeResize envelope_resizes = 20;
+
+  // The node datapath's network plugins (docs/network-plugins.md): one
+  // entry per plugin a local allocation references, with its revision,
+  // module state, and health. Replaced wholesale per node on every beat and
+  // kept in memory by the manager for GetNetPluginStatus and
+  // `legion net doctor`. Empty on a node that runs no plugin.
+  repeated NetPluginNodeStatus net_plugins = 21;
 }
 
 // One envelope resize a node asks for. See
@@ -6873,7 +6830,7 @@ message HeartbeatReply {
   optional uint32 next_interval_seconds = 7;
 
   // The effective network policy for each desired allocation, as a content
-  // hash. The worker fetches a body it has not seen via `FetchNetPolicy`
+  // hash. The worker fetches a body it has not seen via `FetchDatapathMaterial`
   // and caches it; identical merged policies share one hash and one fetch.
   // An allocation absent from this list has no policy. Delivered every
   // heartbeat, applied only after a successful one, so a manager outage
@@ -7102,9 +7059,11 @@ message UpstreamEndpoints {
   // endpoint list applies to.
   int64 allocation_id = 1;
 
-  // Upstream service name, exactly as written in the task's
-  // `connect.upstreams[].service`. Echoed so the worker can match the list to
-  // one of its listeners without relying on ordering.
+  // The upstream's key: its `connect.upstreams[].name`, or the catalog
+  // service its `to` names when it has no name. This is how the node's
+  // listener is known, so the worker matches the list to one of its
+  // listeners without relying on ordering. For a `proxy` handler's feed
+  // (`for_handler`), the handler's service name.
   string service = 2;
 
   // Endpoints the consumer may dial, already filtered by the manager:
@@ -9175,15 +9134,19 @@ message ServiceSummary {
   // is what clients use to turn an endpoint into a URL.
   map<string, string> meta = 7;
 
-  // Connect intentions declared in the task's `service.allow`: the job IDs
-  // permitted to reach this service through a `connect.upstreams` entry.
+  // Who may call the service, from the task's `service.allow`: bare entries
+  // are job id globs (`web`, `agent-*`), entries with colons are workload
+  // identity globs over `<region>:<job>:<group>:<task>`
+  // (`*:billing:*:worker`).
   //
-  // Empty — the default — means *every* job may connect, and so does a single
-  // `"*"` entry; the two are reported verbatim rather than normalized so
-  // tooling can tell "no policy declared" from "explicitly open". Intentions
-  // gate the connect datapath only: they filter the endpoint list a consuming
-  // allocation receives in `HeartbeatReply.upstream_endpoints`, and never
-  // affect who may *read* the catalog through ListServices/ResolveService.
+  // Empty — the default — means *every* caller may connect, and so does a
+  // single `"*"` entry; the two are reported verbatim rather than normalized
+  // so tooling can tell "no policy declared" from "explicitly open". The list
+  // filters the endpoint list a consuming allocation receives in
+  // `HeartbeatReply.upstream_endpoints`; on a `service.mesh = true` service
+  // the receiving node also refuses a verified caller outside it
+  // (`Legion-Denied-By: service/allow`). It never affects who may *read* the
+  // catalog through ListServices/ResolveService.
   //
   // Reported here so a read-only caller (`job:read`) can explain why its
   // consumer resolves to nothing — `legion service doctor` prints this list —
@@ -9266,8 +9229,8 @@ message ServiceEndpoint {
   string port_label = 12;
 
   // True when the endpoint's advertised port terminates **mesh TLS** — its
-  // task's ingress chain has `tls = { mode = "mutual", certFrom = "legion" }`
-  // (docs/network-handlers.md). A consuming node's datapath then originates
+  // task's service is on the mesh (`service.mesh = true`, or imposed by a
+  // policy object), resolved at placement (docs/network-handlers.md). A consuming node's datapath then originates
   // TLS with its own node certificate and names the consuming workload in a
   // PROXY protocol v2 TLV; a plain client dialing the port directly is
   // refused at the handshake.
@@ -10868,21 +10831,23 @@ message TaskAllocation {
   // this allocation, matching the `AllocNetwork` shape. Workers use it to
   // inject `LEGION_PORT_*` / `LEGION_ADDR_*` environment variables into the
   // task, and — when the task declares upstreams — the `upstreams` array
-  // (`[{"service":"db","localPort":20003,"balance":"least_latency"}]`) carries
-  // the loopback ports the node-local forwarders listen on, surfaced to the
-  // task as `LEGION_UPSTREAM_*`.
+  // (`[{"key":"db","balance":"least_latency","vip":"127.42.7.2",
+  // "canonicalPort":5432}]`) carries each upstream's address: its VIP and
+  // canonical port, plus a `localPort` when it has a loopback port (a pinned
+  // `port`, a node with no VIP block, or a sandbox). The task sees one
+  // address per upstream as `LEGION_UPSTREAM_<KEY>`.
   //
   // Empty string when the task declares no network block and no upstreams.
   string network = 14;
 
   // JSON-encoded `connect` block declared by the task, matching the
-  // `ConnectConfig` shape: `{"upstreams":[{"service":"db"},
-  // {"service":"cache","localPort":6379,"balance":"least_conn"}]}`.
+  // `ConnectConfig` shape: `{"upstreams":[{"to":"db"},
+  // {"to":"http://cache","port":6379,"balance":"least_conn"}]}`.
   //
-  // This is the *declared* form (which services the task dials and with which
-  // balancing strategy); the *assigned* loopback ports live in `network`
-  // alongside the task's host ports, because both come out of the same
-  // per-node port space. The worker starts one loopback TCP forwarder per
+  // This is the *declared* form (what the task dials, over which protocol,
+  // and with which balancing strategy); the *assigned* addresses live in
+  // `network` alongside the task's host ports, because loopback ports come
+  // out of the same per-node port space. The worker starts one forwarder per
   // upstream and load-balances new connections across that service's healthy
   // endpoints, which the manager refreshes every heartbeat in
   // `HeartbeatReply.upstream_endpoints`. An upstream that names no `balance`
@@ -11130,6 +11095,19 @@ message TaskAllocation {
   // far an edge start may get: a node that receives it empty treats the task
   // as `off` and refuses its edge starts.
   string task_speculative_start = 33;
+
+  // The task's group (`tasks[].group`). Together with `job_id` and
+  // `task_name` it forms the workload identity subject
+  // `<region>:<job>:<group>:<task>`: the identity a consuming node names
+  // its workload by on a mesh connection, and what `service.allow` and
+  // ingress `identity` rules match.
+  string task_group = 34;
+
+  // JSON `ServiceConfig` as the task declared it (`name`, `port`, `mesh`,
+  // `allow`, ...). Empty when the task advertises no service. The manager
+  // reads `mesh` and `allow` from it to compile the receiving side's
+  // `service/allow` check into the allocation's ingress policy.
+  string task_service = 35;
 }
 
 // Request payload for PostWork.
@@ -12506,6 +12484,15 @@ message UpsertNetPolicyReply {
   // Running allocations whose effective policy would change, as
   // `job/task@allocation` strings. Populated on dry runs and on writes.
   repeated string affected_allocations = 2;
+
+  // Advisory lines about what the policy would do to running work, one per
+  // affected task, populated on dry runs and on writes. Today: an upstream
+  // whose `to` does not speak HTTP (a bare service name, `tcp://`, or
+  // `tls://`) under an HTTP chain whose first rule for it needs a path,
+  // method, or header. A policy never changes how a stream is parsed, so
+  // such connections are refused at connect; the line names the task, the
+  // upstream, and the rule, and says how to fix it.
+  repeated string warnings = 3;
 }
 
 // Request payload for GetNetPolicyObject.
@@ -12536,6 +12523,154 @@ message DeleteNetPolicyRequest {
 
 // Reply payload for DeleteNetPolicy.
 message DeleteNetPolicyReply {}
+
+// A stored network plugin object (docs/network-plugins.md).
+message NetPlugin {
+  // Unique name; what a `{ plugin = { name = ... } }` hop references.
+  string name = 1;
+
+  // The normalized `NetPluginObject` as JSON: `module`, `stages`,
+  // `usableBy`, `nodePools`, `limits`, `configSchema`, `targets`, and
+  // `credentials` (KV paths only, never values).
+  string object_json = 2;
+
+  // The cluster-wide plugin generation this version was written at. A
+  // revision names one version of one plugin forever, even across a delete
+  // and a re-create; nodes report the revision they run.
+  uint64 revision = 3;
+
+  // RFC 3339 timestamps of the first write and of this version.
+  string created_at = 4;
+  string updated_at = 5;
+
+  // The stages the module acts at, in pipeline order: `connect`,
+  // `request`, `body`, `response`, `done`.
+  repeated string stages = 6;
+
+  // `policies` or `jobs`.
+  string usable_by = 7;
+
+  // The module's `sha256:` checksum.
+  string module_checksum = 8;
+
+  // Stored policy objects whose chains reference this plugin. Filled by
+  // GetNetPlugin and GetNetPluginStatus; empty in list replies.
+  repeated string referenced_by = 9;
+}
+
+// Request payload for UpsertNetPlugin.
+message UpsertNetPluginRequest {
+  // A `NetPluginObject` as JSON, exactly as `legion net plugin apply -f`
+  // reads it (Nickel evaluated to JSON). Validated on write.
+  string object_json = 1;
+
+  // When set, validate (including every referencing policy's config against
+  // the new schema) and report what would be stored, but write nothing.
+  bool dry_run = 2;
+
+  // Optional: retries with the same key (from the same caller) return the
+  // first call's stored plugin with `deduplicated = true` instead of writing
+  // a new revision. Ignored on dry runs.
+  optional string idempotency_key = 3;
+}
+
+// Reply payload for UpsertNetPlugin.
+message UpsertNetPluginReply {
+  // The stored (normalized) plugin. On a dry run, what would be stored,
+  // with `revision` 0.
+  NetPlugin plugin = 1;
+
+  // True when `idempotency_key` matched an earlier call; nothing was
+  // written and `plugin` is that call's result as currently stored.
+  bool deduplicated = 2;
+}
+
+// Request payload for GetNetPlugin.
+message GetNetPluginRequest {
+  string name = 1;
+}
+
+// Reply payload for GetNetPlugin.
+message GetNetPluginReply {
+  NetPlugin plugin = 1;
+}
+
+// Request payload for ListNetPlugins.
+message ListNetPluginsRequest {}
+
+// Reply payload for ListNetPlugins.
+message ListNetPluginsReply {
+  repeated NetPlugin plugins = 1;
+
+  // Monotonic generation of the plugin set; changes on every write.
+  uint64 generation = 2;
+}
+
+// Request payload for DeleteNetPlugin.
+message DeleteNetPluginRequest {
+  string name = 1;
+}
+
+// Reply payload for DeleteNetPlugin.
+message DeleteNetPluginReply {}
+
+// Request payload for GetNetPluginStatus.
+message GetNetPluginStatusRequest {
+  string name = 1;
+}
+
+// Reply payload for GetNetPluginStatus.
+message GetNetPluginStatusReply {
+  // The stored object, with `referenced_by` filled.
+  NetPlugin plugin = 1;
+
+  // One entry per node that holds the plugin, from its last heartbeat. A
+  // plugin no running allocation uses is on no node.
+  repeated NetPluginNodeStatus nodes = 2;
+}
+
+// One node's view of one plugin, reported on every heartbeat
+// (`HeartbeatRequest.net_plugins`) and read back by GetNetPluginStatus,
+// `legion net plugin status`, and `legion net doctor`.
+message NetPluginNodeStatus {
+  // The reporting node. Empty on the heartbeat (the node is the caller);
+  // filled by the manager in GetNetPluginStatus.
+  string node_id = 1;
+
+  // The plugin's name.
+  string plugin = 2;
+
+  // The revision the node holds; 0 before the object reached it.
+  uint64 revision = 3;
+
+  // The module checksum the node runs (`sha256:<hex>`).
+  string module_checksum = 4;
+
+  // `fetching` (the object arrived, the module is being fetched or
+  // compiled), `ready`, or `failed` (see `error`).
+  string state = 5;
+
+  // Why the module is not ready: the fetch, checksum, compile, or
+  // instantiation error. A hop whose plugin is not ready fails with this
+  // reason and follows its `onError`.
+  string error = 6;
+
+  // Callbacks run and callbacks that failed (trap, fuel or deadline
+  // exhausted, memory limit) since the worker started.
+  uint64 calls = 7;
+  uint64 errors = 8;
+
+  // The last callback failure, if any.
+  string last_error = 9;
+
+  // 99th percentile callback time over the last 1024 callbacks, in
+  // microseconds.
+  uint64 p99_micros = 10;
+
+  // Live module instances on the node: one per (scope, config) the plugin
+  // runs under, times the instances its concurrency needed.
+  uint64 instances = 11;
+}
 
 // Request payload for ShowNetPolicy.
 message ShowNetPolicyRequest {
@@ -12592,9 +12727,14 @@ message TestNetPolicyRequest {
   // (`https://api.github.com/user` sets host, port, and path).
   string to = 4;
 
-  // Ingress test: the peer, as `host[:port]` / IP, optionally with an
-  // identity (`prod:default:checkout:web`).
+  // Ingress test: the peer, as `host[:port]` / IP.
   string from = 5;
+
+  // Ingress test: the caller's verified workload identity,
+  // `<region>:<job>:<group>:<task>` (`global:checkout:web:web`), as the mesh
+  // port or a mutual port would see it. On a `service.mesh = true` service
+  // with a closed `service.allow`, an identity outside the list is denied
+  // by `service/allow` before any rule.
   string identity = 6;
 
   // Request-time facts for HTTP chains. Optional.
@@ -12634,22 +12774,6 @@ message TestNetPolicyReply {
   // denial: the guard is changed on the worker (`hostGuard.allow`), not in
   // job policy. Empty otherwise.
   string hint = 7;
-}
-
-// Request payload for FetchNetPolicy (worker plane).
-message FetchNetPolicyRequest {
-  // Node id of the caller. With ACLs enforced it must match the node token
-  // on the request (see `HeartbeatRequest.id`).
-  string node_id = 1;
-
-  // Content hash from `HeartbeatReply.net_policies`.
-  string hash = 2;
-}
-
-// Reply payload for FetchNetPolicy.
-message FetchNetPolicyReply {
-  // The `EffectivePolicy` as JSON. Its `hash` field equals the request hash.
-  string effective_json = 1;
 }
 
 // One allocation's effective policy, by hash.
@@ -12740,9 +12864,10 @@ message NetAllocStatus {
   // upstreams (`authz`, `proxy`), with the health the datapath has observed.
   repeated NetHandlerStatus handlers = 11;
 
-  // Whether the ingress chain's TLS material is loaded: the BYO files parse,
-  // or the node holds a mesh certificate for `certFrom = "legion"`. Always
-  // true when no ingress chain terminates TLS.
+  // Whether the TLS material of every port that terminates TLS is loaded:
+  // a port's own `tls` (its KV-held certificate and client CA have arrived,
+  // or its files parse), or, for the service's mesh port, the node's mesh
+  // certificate. Always true when no port terminates TLS.
   bool tls_ready = 12;
 
   // Why `tls_ready` is false, when it is.
@@ -12760,6 +12885,51 @@ message NetAllocStatus {
 
   // The bridge `guest_address` belongs to. Empty exactly when it is.
   string guest_bridge = 16;
+
+  // The kernel classifier's view of the allocation, on a node whose
+  // `netKernel` attribute is active (docs/network-handlers.md, "The kernel
+  // classifier"). Absent elsewhere, and for an allocation whose cgroup leaf
+  // does not exist yet.
+  optional NetKernelStatus kernel = 17;
+}
+
+// What the kernel classifier holds for one allocation, and what it did with
+// the allocation's flows since the previous report.
+message NetKernelStatus {
+  // The allocation's cgroup leaf is described to the classifier: the host
+  // guard applies, and its port-53 traffic goes to its resolver.
+  bool attached = 1;
+
+  // Its egress chain is compiled into the kernel and enforced at
+  // `connect()`: denied flows fail with `EPERM`, and allowed flows that
+  // nothing reads connect directly. False for a gated allocation (its
+  // namespace is the boundary), a sandbox (its sockets live in its guest),
+  // an allocation with no egress chain, and a chain the kernel cannot hold
+  // (`reason`).
+  bool enforced = 2;
+
+  // Flows only netd can decide (a request-time rule, a host rule for an
+  // address the resolver never returned, a chain with hops) are redirected
+  // to a capture listener rather than refused.
+  bool capture = 3;
+
+  // Compiled connect-time rules.
+  uint32 rules = 4;
+
+  // Why the chain is not enforced in the kernel, when it is not. Empty
+  // otherwise.
+  string reason = 5;
+
+  // Connections passed straight through (no proxy hop) since the previous
+  // report.
+  uint64 passed = 6;
+
+  // Connections redirected to the capture listener since the previous
+  // report.
+  uint64 redirected = 7;
+
+  // Connections refused in the kernel since the previous report.
+  uint64 denied = 8;
 }
 
 // One external handler hop as the datapath sees it.
@@ -12768,7 +12938,7 @@ message NetHandlerStatus {
   // `upstream/<key>#<index>`.
   string source = 1;
 
-  // `authz` or `proxy`.
+  // The handler kind: `authz`, `proxy`, `dlp`, or `plugin`.
   string handler = 2;
 
   // The webhook URL, or the resolved proxy target (`service`, `node`, or

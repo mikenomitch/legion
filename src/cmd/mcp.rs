@@ -817,6 +817,71 @@ fn tool_defs() -> Vec<ToolDef> {
             mutates: true,
         },
         ToolDef {
+            name: "legion_net_plugin_list",
+            description: "List stored network plugin objects (WASM modules on the proxy-wasm ABI): name, stages, usableBy, revision, module checksum.",
+            input_schema: empty_schema,
+            mutates: false,
+        },
+        ToolDef {
+            name: "legion_net_plugin_describe",
+            description: "Fetch one stored network plugin object (module, stages, usableBy, nodePools, limits, configSchema, targets, credential KV paths) and the policy objects that use it.",
+            input_schema: || json!({
+                "type": "object",
+                "properties": { "name": { "type": "string", "description": "Plugin name." } },
+                "required": ["name"],
+                "additionalProperties": false
+            }),
+            mutates: false,
+        },
+        ToolDef {
+            name: "legion_net_plugin_status",
+            description: "Where a network plugin runs and how it is doing, per node: revision held, module state (fetching|ready|failed and why), calls, errors, last error, p99 callback time.",
+            input_schema: || json!({
+                "type": "object",
+                "properties": { "name": { "type": "string", "description": "Plugin name." } },
+                "required": ["name"],
+                "additionalProperties": false
+            }),
+            mutates: false,
+        },
+        ToolDef {
+            name: "legion_net_plugin_test",
+            description: "Run a network plugin against one synthetic HTTP request, locally and without a cluster: a .wasm file on this machine, or a stored plugin by name (its module is fetched). Reports per stage what the plugin did (continue, answered with a status, failed), what it changed, how long it took, and how much fuel it burned. Read-only; sends nothing upstream.",
+            input_schema: || json!({
+                "type": "object",
+                "properties": {
+                    "module": { "type": "string", "description": "A .wasm file path, or a stored plugin's name." },
+                    "request": { "type": "string", "description": "'METHOD URL', e.g. 'POST https://api.github.com/repos/x/issues'." },
+                    "headers": { "type": "object", "additionalProperties": { "type": "string" }, "description": "Request headers." },
+                    "body": { "type": "string", "description": "Request body." },
+                    "labels": { "type": "object", "additionalProperties": { "type": "string" }, "description": "The calling task's network.labels." },
+                    "job": { "type": "string", "description": "The calling job (default legion-plugin-test)." },
+                    "config": { "description": "The reference's config (checked against the plugin's configSchema)." },
+                    "stages": { "type": "string", "description": "Stages for a bare .wasm module (default request,body,response,done)." },
+                    "response_status": { "type": "integer", "description": "The upstream's status for the response stage (default 200)." },
+                    "response_body": { "type": "string", "description": "The upstream's body for the response stage." }
+                },
+                "required": ["module", "request"],
+                "additionalProperties": false
+            }),
+            mutates: false,
+        },
+        ToolDef {
+            name: "legion_net_plugin_apply",
+            description: "Create or replace a network plugin object from its JSON (a NetPluginObject: name, module {source, checksum}, stages, usableBy, nodePools, limits, configSchema, targets, credentials). Nodes running it load the new revision within one heartbeat. Set dry_run to validate (including every policy that uses it) without writing; idempotency_key makes a retry safe.",
+            input_schema: || json!({
+                "type": "object",
+                "properties": {
+                    "object": { "type": "object", "description": "The plugin object (see docs/network-plugins.md)." },
+                    "dry_run": { "type": "boolean", "description": "Validate only (default false)." },
+                    "idempotency_key": { "type": "string", "description": "Retry-safe key (optional)." }
+                },
+                "required": ["object"],
+                "additionalProperties": false
+            }),
+            mutates: true,
+        },
+        ToolDef {
             name: "legion_state_query",
             description: "Run a read-only SQL query against the manager state store. Use legion_state_schema first to learn the tables.",
             input_schema: || json!({
@@ -2298,6 +2363,88 @@ async fn dispatch_tool(name: &str, args: Value) -> Result<Value, String> {
                 object_json: object.to_string(),
                 dry_run,
             }))
+            .await
+        }
+        "legion_net_plugin_list" => {
+            let mut client = connect().await?;
+            grpc(client.list_net_plugins(crate::structs::ListNetPluginsRequest {})).await
+        }
+        "legion_net_plugin_describe" => {
+            let name = str_arg(&args, "name")?;
+            let mut client = connect().await?;
+            grpc(client.get_net_plugin(crate::structs::GetNetPluginRequest { name })).await
+        }
+        "legion_net_plugin_status" => {
+            let name = str_arg(&args, "name")?;
+            let mut client = connect().await?;
+            grpc(client.get_net_plugin_status(crate::structs::GetNetPluginStatusRequest { name }))
+                .await
+        }
+        "legion_net_plugin_test" => {
+            let module = str_arg(&args, "module")?;
+            let request = str_arg(&args, "request")?;
+            let (method, url) = request
+                .trim()
+                .split_once(char::is_whitespace)
+                .ok_or_else(|| format!("request must be 'METHOD URL', got {request:?}"))?;
+            let strings = |key: &str| -> Vec<(String, String)> {
+                args.get(key)
+                    .and_then(Value::as_object)
+                    .map(|map| {
+                        map.iter()
+                            .map(|(k, v)| (k.clone(), v.as_str().unwrap_or_default().to_string()))
+                            .collect()
+                    })
+                    .unwrap_or_default()
+            };
+            let (object, bytes) = crate::cmd::net_plugin::load_for_test(
+                &module,
+                None,
+                opt_str_arg(&args, "stages").as_deref(),
+            )
+            .await
+            .map_err(|err| format!("{err:#}"))?;
+            let config = args.get("config").cloned();
+            object
+                .check_config("config", config.as_ref())
+                .map_err(|err| err.to_string())?;
+            let input = crate::worker::netd::plugins::harness::TestInput {
+                method: method.to_string(),
+                url: url.trim().to_string(),
+                headers: strings("headers"),
+                body: opt_str_arg(&args, "body").map(String::into_bytes),
+                labels: strings("labels").into_iter().collect(),
+                job: opt_str_arg(&args, "job").unwrap_or_else(|| "legion-plugin-test".into()),
+                task: "main".into(),
+                config,
+                response_status: args
+                    .get("response_status")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(200) as u16,
+                response_body: opt_str_arg(&args, "response_body")
+                    .map(String::into_bytes)
+                    .unwrap_or_default(),
+            };
+            let report = crate::worker::netd::plugins::harness::run(object, &bytes, input).await?;
+            serde_json::to_value(report).map_err(|err| err.to_string())
+        }
+        "legion_net_plugin_apply" => {
+            let object = args
+                .get("object")
+                .cloned()
+                .ok_or_else(|| "missing required argument: object".to_string())?;
+            let dry_run = args
+                .get("dry_run")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            let mut client = connect().await?;
+            grpc(
+                client.upsert_net_plugin(crate::structs::UpsertNetPluginRequest {
+                    object_json: object.to_string(),
+                    dry_run,
+                    idempotency_key: opt_str_arg(&args, "idempotency_key"),
+                }),
+            )
             .await
         }
         "legion_service_resolve" => {

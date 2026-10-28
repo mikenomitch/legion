@@ -9,7 +9,7 @@ Legion keeps the certificate in KV instead. KV values are encrypted at rest
 and scoped by ACL path, and two features turn a `kv put` into a live
 rotation:
 
-- **The node serves it** (`certFrom = { kv }`). The node terminates TLS on
+- **The node serves it** (`ports[].tls.cert = { kv }`). The node terminates TLS on
   the task's advertised port with the certificate from KV, and swaps it when
   the key changes. The task speaks plain HTTP and never holds the key.
 - **The task gets it as a file** (`onChange = "update"`). For a task that
@@ -44,10 +44,9 @@ That is all you need to try either consumer below without the renewer.
   runtime = "exec",
   config = { command = ["sh", "-c", "exec python3 -m http.server \"$LEGION_PORT_HTTPS\""] },
   network = {
-    ports = [{ name = "https", static = 8443 }],
-    ingress = {
-      tls = { mode = "server", certFrom = { kv = "certs/app.example.com" } },
-    },
+    ports = [
+      { name = "https", static = 8443, tls = { cert = { kv = "certs/app.example.com" } } },
+    ],
   },
 }
 ```
@@ -58,6 +57,15 @@ connections get it, and open ones keep the old one until they close.
 
 Submitting this job needs `kv:read` on `certs/app.example.com` as well as
 `job:write`, because the job hands that key to the datapath.
+
+To make the port mutual, add the CA client certificates must verify against.
+It can live in KV too, and rotates the same way:
+
+```nickel
+{ name = "https", static = 8443,
+  tls = { cert = { kv = "certs/app.example.com" },
+          clients = { ca = { kv = "certs/app-clients" } } } },
+```
 
 ## Give it to the task
 
@@ -121,18 +129,18 @@ handshakes, and the doctor shows the `legion kv put` that fixes it.
 
 - A new certificate reaches nodes and tasks on their next heartbeat, a few
   seconds in a small cluster.
-- `certFrom = { kv }` works on ingress only. A client CA for `mutual` comes
-  from the mesh (`clientCa = "legion"`) or a path, not from KV.
+- A port's own `tls` and the mesh are exclusive: the service's mesh port
+  (`service.mesh = true`) terminates with the node certificate instead.
 - `onChange = "update"` is for files. Env values cannot change under a
   running process, so a KV-backed env var still needs `restart` or
   `rollout`.
 - The file route renders the private key into the stored job config and the
   worker's state file, and those copies are not encrypted at rest (see
   [KV Encryption at Rest](../kv-encryption.md)). Prefer the node route
-  (`certFrom = { kv }`) where you can. It keeps the key in KV and in node
+  (`ports[].tls.cert = { kv }`) where you can. It keeps the key in KV and in node
   memory only.
 - There is no built-in ACME client. The renewer is a regular job you can
   read and change.
 
-Reference: [Certificates from KV](../network-handlers.md#certificates-from-kv)
+Reference: [Certificates and CAs from KV](../network-handlers.md#certificates-and-cas-from-kv)
 and [Live file updates](../kv-store.md#live-file-updates).
