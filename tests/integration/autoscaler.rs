@@ -38,14 +38,14 @@ pub(crate) const TICK_MS: i64 = 15_000;
 /// Where virtual time starts.
 pub(crate) const T0: i64 = 1_800_000_000_000;
 
-/// A node with two 2400 MHz cores.
-fn node(id: &str) -> NodeMsg {
+/// A node with four 2400 MHz cores, hosting at most `max_allocations`.
+fn node(id: &str, max_allocations: u32) -> NodeMsg {
     NodeMsg {
         id: id.to_string(),
         pool: "default".into(),
         status: "active".into(),
         availability: "available".into(),
-        config_attrs: json!({ "maxAllocations": 20 }).to_string(),
+        config_attrs: json!({ "maxAllocations": max_allocations }).to_string(),
         fingerprint_attrs: json!({
             "memory_total": (16384 * MIB).to_string(),
             "cpus": {
@@ -93,6 +93,11 @@ impl Drop for Harness {
 
 impl Harness {
     pub(crate) async fn start(nodes: usize) -> R<Self> {
+        Self::start_with(nodes, 20).await
+    }
+
+    /// [`Harness::start`] with nodes that host up to `max_allocations` each.
+    pub(crate) async fn start_with(nodes: usize, max_allocations: u32) -> R<Self> {
         let dir = tempfile::tempdir_in(crate::support::scratch_root())?;
         let store = Store::start_storage(&ManagerConfigFull {
             store_path: dir
@@ -104,7 +109,7 @@ impl Harness {
             ..Default::default()
         })?;
         for index in 0..nodes {
-            store.insert_node(node(&format!("n{index}")))?;
+            store.insert_node(node(&format!("n{index}"), max_allocations))?;
         }
         let service = ManagerDaemonService::new(store.clone());
         let usage = service.usage_handle();
@@ -206,6 +211,53 @@ impl Harness {
                     allocation_health: ids
                         .iter()
                         .map(|id| AllocationHealth {
+                            allocation_id: *id,
+                            healthy: true,
+                            status: "running".into(),
+                            artifact_states: None,
+                        })
+                        .collect(),
+                    ..Default::default()
+                })
+                .await
+                .map_err(|status| anyhow::anyhow!("heartbeat: {}", status.message()))?;
+        }
+        self.ticker.tick_at(&self.store, &self.usage, at_ms).await;
+        Ok(())
+    }
+
+    /// Every allocation of every job reports `utilization(job)` of its
+    /// reservation and healthy, one heartbeat per node; then one rollup
+    /// tick folds it (the load test's 10,000 jobs).
+    pub(crate) async fn report_all(
+        &mut self,
+        utilization: impl Fn(&str) -> f64,
+        at_ms: i64,
+    ) -> R<()> {
+        for (node_id, allocations) in self.store.get_allocs_by_node()? {
+            let allocations: Vec<(i64, f64)> = allocations
+                .iter()
+                .map(|allocation| (allocation.id, utilization(&allocation.job_id)))
+                .collect();
+            self.client
+                .heartbeat(HeartbeatRequest {
+                    id: node_id,
+                    usage: Some(UsageReport {
+                        sampled_at_unix_ms: at_ms,
+                        allocations: allocations
+                            .iter()
+                            .map(|(id, utilization)| AllocationUsage {
+                                allocation_id: *id,
+                                cpu_millicores: (utilization * 20.0 / 2400.0 * 1000.0).round() as u64,
+                                memory_current_bytes: 8 * MIB,
+                                ..Default::default()
+                            })
+                            .collect(),
+                        ..Default::default()
+                    }),
+                    allocation_health: allocations
+                        .iter()
+                        .map(|(id, _)| AllocationHealth {
                             allocation_id: *id,
                             healthy: true,
                             status: "running".into(),

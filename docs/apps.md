@@ -56,9 +56,12 @@ the cluster-wide scaling inputs once per interval, and writes counts through
 [node groups](autoscaling.md#node-groups): it asks a provider for nodes,
 mints their join tokens, and drains, terminates, and forgets the nodes it
 scales in. Its grant is `scale:read` and `scale:write` in every namespace,
-`job:read` (to read what a drain would move), and `node:read` and
-`node:write` (node groups): it can resize, drain, and forget nodes, not
-redeploy. Its config takes `interval` (default `"15s"`), `mode`
+`job:read` (to read what a drain would move), `node:read` and
+`node:write` (node groups), and `kv` read and write under its reserved
+`legion/apps/autoscaler/` (its replicas' shard leases): it can resize,
+drain, and forget nodes, not redeploy. `legion app set autoscaler
+--replicas 3` splits the policies between three replicas
+([autoscaling.md, "Replicas"](autoscaling.md#replicas)). Its config takes `interval` (default `"15s"`), `mode`
 (`"dry-run"` forces every policy into dry-run), `plugins`, the metric
 sources, strategies, and targets the operator installs for policies to
 name ([autoscaling.md, "Plugins"](autoscaling.md#plugins)), and

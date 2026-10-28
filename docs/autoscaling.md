@@ -669,16 +669,20 @@ joined), and needs nothing configured: it reaches Legion through its
 allocation's API socket as its own workload identity, which workload
 identity being on by default makes available on a fresh cluster
 ([workload-identity.md](workload-identity.md)). Its grant is `scale:read`
-and `scale:write` and `job:read` in every namespace, and `node:read` and
-`node:write` for node groups (join tokens, drains, forgetting nodes): it
-can resize, and read jobs, but not redeploy.
+and `scale:write` and `job:read` in every namespace, `node:read` and
+`node:write` for node groups (join tokens, drains, forgetting nodes), and
+`kv` under its reserved `legion/apps/autoscaler/` for its replicas' shard
+leases: it can resize, and read jobs, but not redeploy.
 
-It watches policies (`WatchScalingPolicies`: a full set whenever a job,
-a standalone policy, a pause, the defaults, a namespace policy, or its own
-app config changes), reads every target's inputs
-in one batched `GetScalingInputs` per interval, evaluates, writes, and
-reports (`ReportScalingStatus`, which is also its heartbeat). Its config
-(`legion app config set autoscaler -f config.ncl`):
+It watches policies (`WatchScalingPolicies`: the full set once, then the
+changes whenever a job, a standalone policy, a pause, the defaults, a
+namespace policy, or its own app config changes), reads every target's
+inputs in one batched `GetScalingInputs` per 1,000 targets per interval,
+evaluates, writes, and reports (`ReportScalingStatus`, which is also its
+heartbeat). One replica evaluates 10,000 task policies in @@TICK@@ per
+tick ([benchmarks.md](benchmarks.md#the-autoscaler-at-10000-policies));
+more replicas split the policies between them ([Replicas](#replicas)). Its
+config (`legion app config set autoscaler -f config.ncl`):
 
 | Field | Default | Meaning |
 | --- | --- | --- |
@@ -687,12 +691,61 @@ reports (`ReportScalingStatus`, which is also its heartbeat). Its config
 | `plugins` | `{}` | The installed sources, strategies, and targets beyond the built-ins ([Plugins](#plugins)). |
 | `identities` | `[]` | Workload identities its job gets beside its own `legion` one, as a task's `identities` ([workload-identity.md](workload-identity.md)): a token whose audience a cloud trusts, which a plugin exchanges for credentials (the `aws-asg` plugin's `webIdentityTokenFile`). Changing it needs the app's whole grant. |
 
-**When the app is gone, the manager says so.** With no report for three of
-the app's intervals, `legion scaling status` reads
+**When the app is gone, the manager says so.** With no report from any
+replica for three of the app's intervals, `legion scaling status` reads
 `autoscaler: NOT RUNNING since 14:05 UTC (app job legion-system/autoscaler:
 active, 0 allocation(s) placed): nothing is being autoscaled`, and every
 target reads `stale`. A disabled app reads `disabled`. Nothing scales while
 the app is down; nothing else is affected.
+
+### Replicas
+
+One replica runs every policy by default. More spread the work:
+
+```console
+$ legion app set autoscaler --replicas 3
+autoscaler: settings changed (replicas 1 → 3)
+$ legion scaling status
+…
+autoscaler: running 3 replicas (alloc 41: 22 shards, alloc 57: 22 shards, alloc 58: 20 shards), last evaluation 2s ago
+```
+
+That is the whole procedure. Policies hash to **64 shards** (FNV-1a of the
+target's key; every node group shares one shard, so the expander sees every
+group that could host the same work). Each replica holds **leases**, KV
+locks under `legion/apps/autoscaler/` with a 15-second TTL renewed every 5
+seconds, and evaluates only the shards it holds:
+
+- `members/<instance>`: one per live replica;
+- `shards/all`: a lone replica holds this one lease for every shard, so
+  the default costs two lease writes per renewal, not 65;
+- `shards/<n>`: with several replicas, each holds up to `ceil(64 / live)`,
+  gives up what it holds above that, and takes free shards up to it.
+
+When a replica joins, the others shed shards and it takes them on its next
+round; when one dies, its leases expire after one TTL and the others take
+its shards. Its policy watch (`WatchScalingPolicies`) is filtered to the
+shards it holds and sends changes only, and it restarts when its shards
+change. A policy that moves to another replica loses that replica's
+in-memory windows: the new owner holds scale-in for one `down.stabilize`
+(the cold-start hold) while they refill.
+
+**Leases are not fences.** During a hand-over two replicas can both believe
+they own a shard for a moment. Nothing doubles: every write is
+compare-and-set (a task's count against the override version it read; a
+node group's or an external target's action against its action version),
+so the stale replica's write is refused and it re-reads.
+
+The status board copes with several replicas: each target's last
+evaluation names the replica that sent it (`instance` in `legion scaling
+status -j`), `app.replicas` lists every replica with its shards and when it
+last reported, and the app reads NOT RUNNING only when no replica has
+reported for three intervals.
+
+The app's grant includes `kv` read and write on `legion/apps/autoscaler/*`
+for the leases. Keys under `legion/` are reserved: a tenant's `paths =
+["*"]` rule does not reach them, so no one else can take or starve the
+autoscaler's shards.
 
 ## Plugins
 
@@ -731,6 +784,7 @@ Writing one is in [autoscaling-plugins.md](autoscaling-plugins.md).
 | `url` | a plugin served over HTTP: each request is a POST |
 | `config` | the plugin's own settings, sent once at start (addresses, regions, request headers). Stored as written: anyone with `app:read` on the autoscaler can read it |
 | `namespaces` | names or `*`-globs of the namespaces whose policies may use it; default every namespace |
+| `concurrency` | the most calls each replica has in flight to it at once, 1 to 64. Default 8 (the built-ins and `url` plugins) and 1 for a program plugin, which may not set more: it answers one request at a time over its stdio |
 
 Exactly one of `builtin`, `source`/`command`, or `url`. A plugin may not be
 named `legion`, `noop`, or after a built-in strategy. A config with a
@@ -760,7 +814,11 @@ URL. That is the trust boundary:
 **At run time** the autoscaler starts each program plugin on first use and
 keeps it running, with a 10-second timeout per call (120 seconds for
 targets), restarts with backoff when it crashes or times out, and logs
-calls with credentials redacted. Before a policy's config reaches a plugin
+calls with credentials redacted. Identical source queries (the same
+source, query, and window) are asked once per evaluation however many
+policies use them, and no plugin has more than its `concurrency` calls in
+flight, so 10,000 policies on one Prometheus are at most 8 queries at a
+time. Before a policy's config reaches a plugin
 it is checked against the plugin's `policyConfigSchema`; a policy that
 fails it, or that uses a plugin as a kind it does not implement, is held
 `invalid`, with the reason in `legion scaling explain` and a
@@ -1543,10 +1601,11 @@ is trusted, as everywhere else.
 - **No wake on request.** A `min = 0` service wakes only from a check (a
   queue, a schedule); its first request is refused, not held, while it is
   at zero.
-- **Plugins run inside the autoscaler.** They share its single process and
-  its identity's network position; a slow plugin delays the evaluations
-  that use it (each call is bounded by its timeout). Calls to one program
-  plugin are serialized.
+- **Plugins run inside the autoscaler.** They share its process and its
+  identity's network position; a slow plugin delays the evaluations that
+  use it (each call is bounded by its timeout, and waits for a turn under
+  the plugin's `concurrency`). Calls to one program plugin are serialized:
+  serve a busy plugin over `url` instead.
 - **Simulation sees only Legion's history.** Over history, checks on other
   sources and plugin strategies read as missing (supply them with
   `--series`), and pins, pauses, rollouts, and quotas are not replayed.
@@ -1573,12 +1632,22 @@ is trusted, as everywhere else.
   admit is refused by `ScaleTask` rather than capped ahead of time, so the
   target reports `held` with the quota's message instead of scaling to
   exactly what fits.
-- **One autoscaler replica.** When it restarts, its windows start empty: no
-  scale-in for one `down.stabilize`, and the averaging windows refill.
-  While it is down nothing scales, and its UI panels say so.
-- **The job panel's hour is in the app's memory.** A restarted autoscaler
-  draws no series until it has evaluated again; the durable record is the
-  history below it.
+- **Windows live in the replica's memory.** When a replica restarts, or a
+  shard moves to another replica, the windows of its policies start empty:
+  no scale-in for one `down.stabilize`, and the averaging windows refill.
+  While no replica runs nothing scales, and the UI panels say so.
+- **A replica that dies holds its shards for one lease TTL** (15 seconds),
+  plus up to one renewal (5 seconds) before another replica takes them;
+  their policies are not evaluated meanwhile.
+- **The policy watch re-resolves every policy on any change.** Deltas and
+  the shard filter save the wire and the app, not the manager's work: each
+  change (a job submitted anywhere) costs the answering manager one
+  resolution of every policy, per watching replica.
+- **The job panel's hour is in the app's memory**, per replica. A restarted
+  autoscaler, or a replica that just took the job's shard, draws no series
+  until it has evaluated again. With several replicas, one of them answers
+  the view, and it draws the series only for jobs in its own shards; the
+  durable record is the history below it.
 - **Status lives in memory.** The last evaluation of each target, and the
   app's heartbeat, are held by the status-lane leader. A takeover starts
   empty and shows `starting`, then fills on the app's next report.

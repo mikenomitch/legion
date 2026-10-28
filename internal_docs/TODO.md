@@ -4486,7 +4486,7 @@ plan.
         equivalent) and extension points beyond job, group, task, volume,
         port, and service (plan §11)
 
-- [ ] **Autoscaler** (v2 plan, merged in [#57](https://github.com/mikenomitch/legion/pull/57)): [plan](plans/autoscaler-v2-plan.md) (IN EXECUTION; Phases 2, 3, 4, 5b and 6 in Done, Phase 5a below) ·
+- [ ] **Autoscaler** (v2 plan, merged in [#57](https://github.com/mikenomitch/legion/pull/57)): [plan](plans/autoscaler-v2-plan.md) (SHIPPED; Phases 2, 3, 4, 5b, 6 and 7 in Done, Phase 5a below; open follow-ups here) ·
       [calls](calls/autoscaler-v2-plan_calls.md). Supersedes
       [autoscaler-plan.md](plans/autoscaler-plan.md) ·
       [calls](calls/autoscaler-plan_calls.md), whose Phase 1 shipped and is
@@ -4557,10 +4557,11 @@ plan.
   - [x] Phase 4: external plugins and standalone policies (2026-10-28; in
         Done, under *Ecosystem apps*; [calls 63-64, 66-71, 75-81](calls/autoscaler-v2-plan_calls.md)).
   - [ ] Phase 3 and 4 follow-ups, found while building them:
-    - [ ] **One request at a time per plugin program**: a slow strategy
-          serializes every policy that uses it; add a per-plugin
-          `concurrency` setting with request multiplexing
-          ([calls 67](calls/autoscaler-v2-plan_calls.md)).
+    - [ ] **One request at a time per plugin program**: a slow program
+          plugin serializes every policy that uses it. `concurrency` caps a
+          plugin's calls in flight (Phase 7), but a program stays at 1;
+          multiplexing requests by id is open (serving it over `url` is the
+          way out today; [calls 67, 100](calls/autoscaler-v2-plan_calls.md)).
     - [ ] **`app config set autoscaler` does not list the policies a plugin
           change breaks**: removing a plugin, or narrowing its `namespaces`,
           turns the policies that use it `invalid` at the next push instead
@@ -4622,8 +4623,17 @@ plan.
   - [ ] Phase 6 follow-ups: the job panel's series is the app's in-memory
         evaluation log, empty after a restart and per replica
         ([calls 82](calls/autoscaler-v2-plan_calls.md))
-  - [ ] Phase 7: sharded replicas (shard leases, rebalancing) and a
-        10,000-policy load test
+  - [x] Phase 7: sharded replicas and a 10,000-policy load test
+        (2026-10-28; in Done)
+  - [ ] **The policy watch re-resolves every policy on any change**, per
+        watching replica: deltas and the shard filter save the wire and
+        the app, not the manager's resolution (calls 98)
+  - [ ] **A shard that moves loses its windows**: the new owner holds
+        scale-in for one `down.stabilize` while they refill; handing the
+        windows over with the shard is open
+  - [ ] **The load test is in process** (calls 101): a run on the AWS rig,
+        with the app on a manager's system worker and real workers'
+        heartbeats, is open
   - [x] **Hardening:** `GetJobScaleStatus` reports through
         `effective_task_count` (done in Phase 1), which pins and the
         autoscale-aware arbitration (Phase 2) rely on.
@@ -6307,6 +6317,30 @@ findings: [kernel-classifier-findings.md](kernel-classifier-findings.md)
         (`tests/integration/autoscaler.rs`)
   - Deferred: `wake = "on-request"` (in *Deferred from v2* above)
 
+- [x] **Autoscaler Phase 7: sharded replicas** (2026-10-28,
+      [plan](plans/autoscaler-v2-plan.md) §6.9, §8 ·
+      [calls 95-102](calls/autoscaler-v2-plan_calls.md) · docs:
+      [autoscaling.md](../docs/autoscaling.md#replicas),
+      [benchmarks.md](../docs/benchmarks.md#the-autoscaler-at-10000-policies),
+      [apps.md](../docs/apps.md), [kv-store.md](../docs/kv-store.md))
+  - [x] 64 shards (FNV-1a of the target's key; every node group in one),
+        membership and shard leases as KV locks under
+        `legion/apps/autoscaler/` (15s TTL, renewed every 5s), up to
+        `ceil(64 / live)` each, a lone replica on one `shards/all` lease,
+        rebalancing on join and death; `legion app set autoscaler
+        --replicas 3`; the app's grant gains `kv` on its reserved prefix
+  - [x] `WatchScalingPolicies` deltas (`full`, `removed`, `more` parts of
+        at most 1,000) and the shard filter; the app restarts its watch
+        when its shards change; `ListKv` `include_locks` (lock ids redacted)
+  - [x] Per-plugin `concurrency` caps (default 8, 1 for a program plugin);
+        identical source queries were already asked once per evaluation
+  - [x] The status board per replica: `ScalingAppStatus.replicas`,
+        `ScalingTargetStatus.instance`, NOT RUNNING only when no replica
+        reports
+  - [x] Tests: rebalance after a replica dies, one `ScaleTask` and one
+        `target/scale` per decision under a forced overlap, the delta and
+        shard-filtered watch, and the opt-in 10,000-policy load test with
+        its numbers in docs/benchmarks.md
 - [x] **Autoscaler Phase 5b: node groups run by the autoscaler app**
       (2026-10-28, [plan](plans/autoscaler-v2-plan.md) §6.9, §6.11, §8 ·
       [calls 85-94](calls/autoscaler-v2-plan_calls.md) · docs:

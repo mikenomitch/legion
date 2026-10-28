@@ -7,6 +7,12 @@
 //! implements the kind the policy uses it as, and that the config matches
 //! the plugin's `policyConfigSchema`: a plugin never sees a config its
 //! schema refuses.
+//!
+//! Every plugin's calls in flight are capped ([`PluginEntry::concurrency`]:
+//! its `concurrency`, 8 by default, 1 for a program plugin), so a replica
+//! evaluating thousands of policies never asks a Prometheus, an HTTP
+//! endpoint, or a cloud API more than that at once; the rest wait their
+//! turn.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -96,6 +102,8 @@ enum Loaded {
 pub struct PluginHost {
     catalog: PluginCatalog,
     plugins: HashMap<String, Loaded>,
+    /// Each plugin's cap on calls in flight.
+    limits: HashMap<String, Arc<tokio::sync::Semaphore>>,
     noop: NoopTarget,
     schemas: std::sync::Mutex<HashMap<String, Arc<jsonschema::JSONSchema>>>,
     timeout_override: Option<Duration>,
@@ -173,7 +181,12 @@ impl PluginHost {
     fn build(catalog: PluginCatalog, code_root: Option<&Path>, timeout: Option<Duration>) -> Self {
         let client = reqwest::Client::new();
         let mut plugins = HashMap::new();
+        let mut limits = HashMap::new();
         for entry in catalog.entries() {
+            limits.insert(
+                entry.name.clone(),
+                Arc::new(tokio::sync::Semaphore::new(entry.concurrency() as usize)),
+            );
             let loaded = match &entry.install {
                 Install::Builtin(Builtin::Prometheus) => {
                     Loaded::Prometheus(PrometheusSource::new(&entry.config, client.clone()))
@@ -204,6 +217,7 @@ impl PluginHost {
         Self {
             catalog,
             plugins,
+            limits,
             noop: NoopTarget::default(),
             schemas: std::sync::Mutex::new(HashMap::new()),
             timeout_override: timeout,
@@ -213,6 +227,18 @@ impl PluginHost {
     /// The catalog the host was built from.
     pub fn catalog(&self) -> &PluginCatalog {
         &self.catalog
+    }
+
+    /// Wait for a turn to call `name` (none needed for a plugin that is not
+    /// installed, or the implicit `noop`). Held for the whole call.
+    async fn turn(&self, name: &str) -> Option<tokio::sync::OwnedSemaphorePermit> {
+        let limit = self.limits.get(name)?.clone();
+        limit.acquire_owned().await.ok()
+    }
+
+    /// How many more calls `name` may start now (tests, diagnostics).
+    pub fn free_turns(&self, name: &str) -> Option<usize> {
+        self.limits.get(name).map(|limit| limit.available_permits())
     }
 
     fn loaded(&self, name: &str) -> Result<&Loaded, String> {
@@ -321,6 +347,7 @@ impl PluginHost {
         call: &SourceCall<'_>,
         now_ms: i64,
     ) -> Result<SourceReading, String> {
+        let _turn = self.turn(source).await;
         match self.loaded(source)? {
             Loaded::Prometheus(prometheus) => {
                 prometheus.query(call.query, call.window, now_ms).await
@@ -359,6 +386,7 @@ impl PluginHost {
                 "plugin {strategy} is built in, and the builtins are sources and targets"
             ));
         };
+        let _turn = self.turn(strategy).await;
         self.check(strategy, Kind::Strategy, &call.config)
             .await
             .map_err(|problem| problem.to_string())?;
@@ -389,6 +417,7 @@ impl PluginHost {
         if target == NOOP_TARGET {
             return Ok(self.noop.status(policy, start));
         }
+        let _turn = self.turn(target).await;
         match self.loaded(target)? {
             Loaded::Noop(noop) => Ok(noop.status(policy, start)),
             Loaded::Exec(exec) => {
@@ -431,6 +460,7 @@ impl PluginHost {
         }
         let request =
             json!({ "policy": policy, "config": config, "desired": desired, "decision": decision });
+        let _turn = self.turn(target).await;
         match self.loaded(target)? {
             Loaded::Noop(noop) => {
                 noop.scale(policy, desired);
@@ -504,6 +534,7 @@ impl PluginHost {
             "policy": policy, "config": config, "desired": desired,
             "decision": decision, "join": join,
         });
+        let _turn = self.turn(target).await;
         match self.loaded(target)? {
             Loaded::Exec(exec) => exec
                 .run("scale", request)
@@ -536,6 +567,7 @@ impl PluginHost {
     ) -> Result<(), String> {
         let request =
             json!({ "policy": policy, "config": config, "ids": ids, "decision": decision });
+        let _turn = self.turn(target).await;
         match self.loaded(target)? {
             Loaded::Exec(exec) => exec
                 .run("terminate", request)
@@ -672,6 +704,53 @@ pub fn parse_status(result: &Value) -> Result<TargetState, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A plugin never has more calls in flight than its `concurrency`: an
+    /// `http` source capped at 2, asked 5 times at once by an endpoint that
+    /// never answers, has exactly 2 connections open.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_plugin_has_at_most_its_concurrency_in_flight_test() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        let accepted = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = accepted.clone();
+        std::thread::spawn(move || {
+            let mut open = Vec::new();
+            for stream in listener.incoming().flatten() {
+                counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                open.push(stream);
+            }
+        });
+        let catalog = PluginCatalog::from_app_config(&json!({ "plugins": {
+            "slow": {
+                "builtin": "http",
+                "config": { "url": format!("http://127.0.0.1:{port}/metrics"), "timeout": "3s" },
+                "concurrency": 2,
+            },
+        } }))
+        .expect("catalog");
+        let host = Arc::new(PluginHost::new(catalog, None));
+        assert_eq!(host.free_turns("slow"), Some(2));
+        let mut calls = Vec::new();
+        for _ in 0..5 {
+            let host = host.clone();
+            calls.push(tokio::spawn(async move {
+                let call = SourceCall {
+                    policy: "web",
+                    check: "cpu",
+                    query: "/value",
+                    window: Duration::from_secs(60),
+                };
+                host.query("slow", &call, 0).await
+            }));
+        }
+        tokio::time::sleep(Duration::from_millis(700)).await;
+        assert_eq!(accepted.load(std::sync::atomic::Ordering::SeqCst), 2);
+        assert_eq!(host.free_turns("slow"), Some(0));
+        for call in calls {
+            call.abort();
+        }
+    }
 
     #[test]
     fn readings_parse_values_series_and_missing_test() {

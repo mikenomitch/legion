@@ -169,15 +169,30 @@ service Manager {
   // against the layered defaults and the plugins installed in the
   // autoscaler's app config.
   //
-  // The first message is the full set. A new full set follows whenever any
-  // input changes: a job with `autoscale` is submitted, stopped, or
-  // destroyed; a standalone policy is applied or deleted, or its pause
+  // The first message is the full set. Another follows whenever any input
+  // changes: a job with `autoscale` is submitted, stopped, or destroyed; a
+  // standalone policy is applied or deleted, or its pause or action row
   // changes; the cluster's scaling defaults change; a namespace policy's
-  // `autoscale` changes; the autoscaler's plugins change. Each message replaces the previous one; a consumer
-  // never merges. The manager checks for changes about once a second and
-  // sends nothing while nothing changed, so an idle stream costs one small
-  // read per second on the answering manager. Any manager answers: policies
-  // are computed from replicated state.
+  // `autoscale` changes; the autoscaler's plugins change. Without `deltas`
+  // each message is the full set again and replaces the previous one. With
+  // `deltas`, every later message carries only what changed (`full =
+  // false`): new or changed policies, and the keys of removed ones in
+  // `removed`; the consumer merges them into what it holds. With `deltas`,
+  // a change of more than 1,000 policies (the first set of a large
+  // cluster) is split into messages of at most 1,000, all but the last
+  // marked `more`, so no message nears gRPC's 4 MiB default limit. The manager
+  // checks for changes about once a second and sends nothing while nothing
+  // changed, so an idle stream costs one small read per second on the
+  // answering manager. Any manager answers: policies are computed from
+  // replicated state.
+  //
+  // With `shard_count` and `shards`, only the policies in those shards are
+  // sent (docs/autoscaling.md, "Replicas"): a policy's shard is FNV-1a
+  // (64-bit) of its key modulo `shard_count`, where the key is
+  // `<job id>/<group>/<task>` for an autoscaled task, `policy:<id>` for an
+  // external-target standalone policy, and `nodegroups` for every node
+  // group. An autoscaler replica watches the shards it holds a lease on, and
+  // starts a new watch when they change.
   //
   // A policy that no longer resolves (a defaults change applied with
   // `force`, two namespace policies that disagree, or a plugin it names
@@ -2138,7 +2153,11 @@ service Manager {
   // Gets one KV entry by key.
   rpc GetKv (GetKvRequest) returns (GetKvReply);
 
-  // Lists KV entries by prefix.
+  // Lists KV entries by prefix, and with `include_locks` the unexpired
+  // locks under it (owners and expiries, never their lock ids).
+  //
+  // ACL: `kv:read`, gated before anything is read; entries and locks whose
+  // keys the caller cannot read are left out.
   rpc ListKv (ListKvRequest) returns (ListKvReply);
 
   // Deletes one KV entry by key.
@@ -5265,6 +5284,20 @@ message WatchScalingPoliciesRequest {
   // the caller can read, which is what the autoscaler asks for. Jobs the
   // caller lacks `scale:read` on are always left out.
   repeated string namespaces = 1;
+
+  // How many shards policies hash to (the autoscaler uses 64). 0, the
+  // default, sends every policy; with a count, `shards` names which to send.
+  uint32 shard_count = 2;
+
+  // The shards to send, each below `shard_count`. Ignored when
+  // `shard_count` is 0. Empty with a `shard_count` sends nothing but empty
+  // sets (a replica that holds no shard yet).
+  repeated uint32 shards = 3;
+
+  // Send changes, not full sets, after the first message (see
+  // `ScalingPolicySet.full` and `removed`). Default `false`: every message
+  // is the full set.
+  bool deltas = 4;
 }
 
 // One message of WatchScalingPolicies: the complete set of effective task
@@ -5288,6 +5321,26 @@ message ScalingPolicySet {
   // Every standalone policy in scope (`legion scaling apply`), sorted by
   // namespace and name.
   repeated StandaloneScalingPolicy standalone = 5;
+
+  // Whether this message is the full set (always, without `deltas`; the
+  // first message, with them). When false, `policies` and `standalone` hold
+  // only the policies that are new or changed since the previous message,
+  // and `removed` the ones that are gone.
+  bool full = 6;
+
+  // With `deltas`, the keys of policies gone since the previous message
+  // (their job stopped, their task lost `autoscale`, the policy was
+  // deleted, or it left the requested shards): `<job id>/<group>/<task>`
+  // for a task, `policy:<id>` for a standalone policy. Always empty in a
+  // full set.
+  repeated string removed = 7;
+
+  // With `deltas`, a change larger than 1,000 policies is split across
+  // messages: every message but the last of a change has `more = true`
+  // (the first carries `full` and `removed`). Apply them all before acting
+  // on any, so a consumer never acts on half a set. Always false without
+  // `deltas`, where every message is one whole set.
+  bool more = 8;
 }
 
 // One autoscaled task's effective policy.
@@ -5468,6 +5521,15 @@ message ReportScalingStatusRequest {
 
   // The app's build (its `legion` version).
   string version = 5;
+
+  // The shards this replica evaluated (docs/autoscaling.md, "Replicas").
+  // Empty: every shard (a lone replica, which holds them all with one
+  // lease).
+  repeated uint32 shards = 6;
+
+  // How many shards policies hash to (64); 0 from a replica that does not
+  // shard.
+  uint32 shard_count = 7;
 }
 
 // The autoscaler's last evaluation of one target.
@@ -5777,6 +5839,47 @@ message ScalingAppStatus {
 
   // The cluster-wide pause, if one is active.
   ScalingPauseInfo paused_all = 8;
+
+  // Every replica that reported in the last hour, newest report first. The
+  // app is `running` while any of them reported within three of the app's
+  // intervals (the newest report's: a replica replaced by a config change
+  // does not linger as running on its old interval); `instance`,
+  // `interval_seconds`, `mode` and `last_report_unix_ms` above are the
+  // newest report's.
+  repeated ScalingAppReplica replicas = 9;
+}
+
+// One replica of the autoscaler app, as its last report shows it.
+message ScalingAppReplica {
+  // The replica (its allocation, `alloc 41`).
+  string instance = 1;
+
+  // When its last report arrived, unix milliseconds.
+  int64 last_report_unix_ms = 2;
+
+  // Its evaluation interval, seconds.
+  uint32 interval_seconds = 3;
+
+  // Its app-wide mode: `enforce` or `dry-run`.
+  string mode = 4;
+
+  // Its build.
+  string version = 5;
+
+  // The shards it holds; empty means every shard.
+  repeated uint32 shards = 6;
+
+  // How many shards policies hash to (64); 0 from a replica that does not
+  // shard.
+  uint32 shard_count = 7;
+
+  // The targets in its last report.
+  uint32 targets = 8;
+
+  // `running` when it reported within three of the app's intervals,
+  // `stale` otherwise (it died, or lost its leases and stopped reporting; its
+  // shards move to the others within a lease TTL).
+  string state = 9;
 }
 
 // One autoscaled task's live state.
@@ -5861,6 +5964,11 @@ message ScalingTargetStatus {
   // `now` is the count its provider holds, and `decision_json` is the node
   // group's decision, with its victims and protected members).
   string kind = 24;
+
+  // The autoscaler replica whose report this is (`alloc 41`): the one that
+  // holds the target's shard (docs/autoscaling.md, "Replicas"). Empty when
+  // no replica has reported the target.
+  string instance = 25;
 }
 
 // Request payload for GetScaleHistory.
@@ -11542,7 +11650,8 @@ message KvJobReference {
 
 // Request payload for ListKv.
 message ListKvRequest {
-  // Prefix filter; entries with keys beginning with this prefix are returned.
+  // Prefix filter; entries (and, with `include_locks`, locks) with keys
+  // beginning with this prefix are returned.
   //
   // Default empty string matches all keys.
   string prefix = 1;
@@ -11556,12 +11665,25 @@ message ListKvRequest {
   // `legion kv list --values` does) to get them all. Every other field
   // (type, version, timestamps, `encrypted`) is returned either way.
   bool include_values = 2;
+
+  // Also return the unexpired locks under `prefix` in `locks`, filtered by
+  // `kv:read` like the entries. A listed lock's `lock_id` is left empty:
+  // it is the holder's secret (whoever has it can renew or release the
+  // lock), so only the holder, which got it from AcquireKvLock, knows it.
+  // Default `false`. The autoscaler's replicas read their shard leases
+  // this way (docs/autoscaling.md, "Replicas").
+  bool include_locks = 3;
 }
 
 // Reply payload for ListKv.
 message ListKvReply {
   // Matching KV entries.
   repeated KvEntry entries = 1;
+
+  // With `include_locks`, the unexpired locks under the prefix, by key,
+  // each with its `owner`, `acquired_at` and `expires_at` and an empty
+  // `lock_id`. A lock's key need not have an entry.
+  repeated KvLock locks = 2;
 }
 
 // Request payload for DeleteKv.

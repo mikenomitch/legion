@@ -2286,6 +2286,177 @@ one.
 (`runs legion-system job autoscaler`), which is what an operator needs to
 act on a protection.
 
+## 95. A lone replica holds one lease for every shard
+
+*Implementation, Phase 7 (`apps::autoscaler::shards`; deviates from plan
+§6.9).*
+
+**Call.** The plan's shard leases are 64 KV locks. A replica that is the
+only live member holds one lock instead, `legion/apps/autoscaler/shards/all`,
+which covers every shard. With two or more members, each holds individual
+`shards/<n>` locks up to `ceil(64 / members)`; a replica holding `all` when
+another joins takes its share one by one and then releases `all`, and the
+newcomer waits for that before it takes any.
+
+**Alternatives.** 64 shard locks always (the plan); no shard locks at all,
+each replica deriving its shards from the member list (rendezvous hashing).
+
+**Trade-off.** One more state in the lease logic (and a hand-over round
+when the second replica joins).
+
+**Why (performance).** Every lease renewal is a Control-lane raft write.
+With 64 locks renewed every 5 seconds, the default single replica would
+cost every cluster 13 writes a second forever, for nothing; with `all` it
+costs two writes per renewal. Derived ownership without shard locks would
+let two replicas with different views of the member list both take a shard
+for as long as their views differ; the locks make the hand-over explicit.
+
+## 96. Leases are listed with `ListKv`'s `include_locks`
+
+*Implementation, Phase 7 (`ListKvRequest.include_locks`, `Store::list_kv_locks`).*
+
+**Call.** A replica reads every lease in one `ListKv { prefix =
+"legion/apps/autoscaler/", include_locks = true }`: the unexpired locks
+under the prefix with their owner and expiry, filtered by `kv:read` like
+entries. A listed lock's `lock_id` is left empty: only the holder needs it.
+
+**Alternatives.** A new `ListKvLocks` RPC; membership as KV entries with a
+heartbeat timestamp (no locks).
+
+**Trade-off.** `ListKv` answers two things.
+
+**Why (simplicity).** One flag on an existing read, already ACL-filtered
+per key, and no new RPC to classify. Timestamps written by each replica
+would compare clocks across hosts; a lock's expiry is the manager's.
+
+## 97. Shards are FNV-1a of the target's key, and every node group is in one shard
+
+*Implementation, Phase 7 (`autoscaler::shard`).*
+
+**Call.** `shard = fnv1a64(key) % 64`, where the key is
+`<job>/<group>/<task>` for a task target and `policy:<id>` for an external
+target; every node group uses the key `nodegroups`.
+
+**Alternatives.** Hash node groups like other policies; shard by namespace
+(calls entry 13 rejected it).
+
+**Trade-off.** All node groups load one replica.
+
+**Why (correctness).** The expander chooses *one* group per evaluation
+among every group that could host the same pending work; groups on
+different replicas would each grow for the same replicas. A cluster has
+few node groups.
+
+## 98. The policy watch sends deltas, filtered by shard, and restarts when the shards change
+
+*Implementation, Phase 7 (`WatchScalingPoliciesRequest.shard_count`,
+`shards`, `deltas`; `ScalingPolicySet.full`, `removed`; closes calls entry
+46's follow-up).*
+
+**Call.** With `deltas`, the first message is the full set (`full = true`)
+and each later one carries only what changed: new or changed policies, and
+the keys of removed ones (`removed`). A change of more than 1,000 policies
+is split into messages of at most 1,000, all but the last marked `more`,
+and the app applies them together. With `shard_count` and `shards`, only
+policies in those shards are sent. A replica whose shards change restarts
+its watch with the new filter (and so gets a full set).
+
+**Alternatives.** Change the filter in-stream (a bidirectional stream); keep
+full sets and filter in the app.
+
+**Trade-off.** A rebalance costs a full set per changed replica; the
+manager still re-resolves every policy when its fingerprint moves (the
+delta saves the wire and the app, not the resolution).
+
+**Why (performance).** At 10,000 policies a full set is megabytes per
+change, and past gRPC's 4 MiB default message limit; a pause or one job's
+resubmit now sends one entry, and the first set arrives in parts that each
+fit. Restarting on a rebalance is rare (a replica joining or dying) and
+keeps the stream a plain server stream.
+
+## 99. The status board keeps one report per replica; a target belongs to the replica that last reported it
+
+*Implementation, Phase 7 (`manager::scaling_status`;
+`ScalingAppStatus.replicas`, `ScalingTargetStatus.instance`).*
+
+**Call.** The board keeps the newest report per instance and per target.
+The app is `running` while any replica reported within three of its
+intervals, and NOT RUNNING when none has; the app line names every replica
+and its shard count, and each target's status names the replica that sent
+it.
+
+**Alternatives.** Merge replicas into one app report (the newest).
+
+**Trade-off.** A replica that died lingers in `replicas` (marked stale)
+for up to an hour.
+
+**Why (simplicity).** An operator sees which replica owns a target and when
+each last reported, which is what diagnosing a stuck shard needs.
+
+## 100. Plugin concurrency is a cap on in-flight calls, and a program plugin stays at one
+
+*Implementation, Phase 7 (`plugins.<name>.concurrency`; follows up calls
+entry 67).*
+
+**Call.** Every plugin gets a semaphore: `concurrency` in its app-config
+entry (1 to 64) caps its calls in flight; the default is 8 for URL plugins
+and the HTTP and `exec` builtins, and 1 for a program plugin, which may not
+set more (`concurrency > 1 on a program plugin: it answers one request at a
+time; serve it over url to take several`). Identical source queries were
+already asked once per evaluation; that stays.
+
+**Alternatives.** Multiplex requests over one program's stdio by id; start a
+pool of program processes.
+
+**Trade-off.** A slow program plugin still serializes its policies (the
+Phase 4 limitation stands, with the `url` form as the way out).
+
+**Why (simplicity, safety).** The cap is what protects a Prometheus or a
+cloud API from 10,000 policies' worth of queries in one burst; a pool of
+program processes would break plugins that keep state, and multiplexing
+would break single-threaded plugins the protocol promises to support.
+
+## 101. The 10,000-policy number is measured in process, on one machine
+
+*Implementation, Phase 7 (`tests/integration/autoscaler_load.rs`, ignored;
+docs/benchmarks.md).*
+
+**Call.** Acceptance P7's load run submits 10,000 autoscaled jobs to an
+in-process manager, heartbeats usage for every allocation, and times one
+engine's evaluation ticks (inputs, decisions, report) with the built-in
+`legion` source. It is an opt-in test (`--ignored`), and the published
+numbers say which build and machine produced them.
+
+**Alternatives.** A real cluster run on the AWS rig.
+
+**Trade-off.** No network between the app and the manager, and the
+manager's other load (placement, heartbeats from real workers) is absent;
+the numbers bound the autoscaler's own cost, not a cluster's.
+
+**Why (simplicity).** The question P7 asks is whether one replica keeps up
+with its interval; that is the app's CPU and one batched read per 1,000
+targets, which an in-process run measures exactly and repeatably.
+
+## 102. A replica that cannot reach its leases keeps evaluating what it owned
+
+*Implementation, Phase 7 (`Shards::step`).*
+
+**Call.** When a replica cannot take or renew its membership lease (the
+manager is unreachable, or refuses the KV call), it keeps the ownership it
+last published, which for a replica that never held a lease is every
+shard, and tries again next round.
+
+**Alternatives.** Evaluate nothing until the leases answer.
+
+**Trade-off.** While another replica holds the leases, two replicas may
+evaluate the same shards (their writes stay compare-and-set, so nothing
+doubles, but both pay for the evaluation).
+
+**Why (simplicity).** The default is one replica, and a lone replica that
+stopped scaling because a KV call failed would turn a lease problem into
+an autoscaling outage. The leases decide who does the work, never whether
+a write is safe.
+
 ## Ledger: what stands from the superseded plan's calls
 
 The superseded plan's calls are not rewritten (`plans/README.md`). This is

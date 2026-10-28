@@ -19877,6 +19877,26 @@ impl Store {
             .collect())
     }
 
+    /// The unexpired locks whose keys start with `prefix`, by key, lock ids
+    /// included (callers outside the store redact them).
+    #[instrument(err, skip_all)]
+    pub fn list_kv_locks(&self, prefix: &str) -> R<Vec<KvLock>> {
+        let conn = self.read_connection()?;
+        let mut stmt = conn.prepare(
+            "SELECT key, lock_id, owner, acquired_at, expires_at FROM kv_lock \
+             WHERE substr(key, 1, length(?1)) = ?1 ORDER BY key ASC;",
+        )?;
+        let rows = stmt.query_map([prefix], |row| self.kv_lock_from_row(row))?;
+        let now = OffsetDateTime::now_utc();
+        let mut live = Vec::new();
+        for lock in Self::collect_rows(rows)? {
+            if Self::parse_rfc3339(&lock.expires_at)? > now {
+                live.push(lock);
+            }
+        }
+        Ok(live)
+    }
+
     fn list_kv_raw(&self, prefix: &str) -> R<Vec<KvRaw>> {
         let raws = {
             let conn = self.read_connection()?;

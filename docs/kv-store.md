@@ -159,6 +159,13 @@ Optional lock enforcement for mutating operations:
 
 `force` on acquire can take over an existing lock.
 
+`ListKvRequest.include_locks = true` also lists the unexpired locks under
+the prefix (`ListKvReply.locks`): each lock's key, `owner`, `acquired_at`
+and `expires_at`, filtered by `kv:read` like entries. A listed lock's
+`lock_id` is always empty: it is the holder's secret, and whoever has it can
+renew or release the lock. This is how the autoscaler's replicas see each
+other's leases ([autoscaling.md, "Replicas"](autoscaling.md#replicas)).
+
 ## JSON Patch
 
 `patch_kv` requires entry type `json`.

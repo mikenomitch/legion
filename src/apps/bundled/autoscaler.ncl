@@ -36,13 +36,16 @@
   # PauseScaling (scale:write); for node groups, GetCapacityDemand, GetNode
   # and GetNodes (node:read), CreateJoinToken, SetNodeAvailability and
   # ForgetNode (node:write), and the job names on a member (job:read; it
-  # can read jobs, not change them). ReportScalingStatus and
-  # RecordScalingAction are app-plane: the manager accepts them from this
-  # app's identity alone, with no rule needed.
+  # can read jobs, not change them); for its replicas' shard leases,
+  # AcquireKvLock, ReleaseKvLock and ListKv under legion/apps/autoscaler/
+  # (kv, reserved: a tenant's `paths = ["*"]` does not reach it).
+  # ReportScalingStatus and RecordScalingAction are app-plane: the manager
+  # accepts them from this app's identity alone, with no rule needed.
   permissions = [
     { resources = ["scale"], actions = ["read", "write"], namespaces = ["*"] },
     { resources = ["job"], actions = ["read"], namespaces = ["*"] },
     { resources = ["node"], actions = ["read", "write"] },
+    { resources = ["kv"], actions = ["read", "write"], paths = ["legion/apps/autoscaler/*"] },
   ],
   # The autoscaler's UI, as declarative views the SPA, `legion app view`,
   # and `legion_app_view` render (docs/autoscaling.md, "In the UI"). Each
@@ -126,6 +129,12 @@
                 type = "array",
                 items = { type = "string" },
                 description = "Only policies in these namespaces (names or *-globs) may use it. Default: every namespace.",
+              },
+              concurrency = {
+                type = "integer",
+                minimum = 1,
+                maximum = 64,
+                description = "The most calls each replica has in flight to it at once. Default 8, and 1 for a program plugin (source or command), which may not set more: it answers one request at a time.",
               },
             },
           },

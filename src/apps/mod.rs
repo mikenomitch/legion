@@ -610,9 +610,10 @@ mod tests {
     /// status, and history (`scale:read`), count writes and pauses
     /// (`scale:write`), the jobs on a node group's members (`job:read`),
     /// and nodes, their capacity demand, join tokens, drains, and forgets
-    /// for node groups (`node:read`, `node:write`). Its reports and action
-    /// intents are app-plane and need no rule (autoscaler-v2 calls entry
-    /// 37).
+    /// for node groups (`node:read`, `node:write`), and its replicas' shard
+    /// leases under the reserved `legion/apps/autoscaler/` (`kv`). Its
+    /// reports and action intents are app-plane and need no rule
+    /// (autoscaler-v2 calls entry 37).
     #[test]
     fn the_autoscaler_manifest_asks_for_what_it_calls() {
         let manifest = bundled_manifest("autoscaler").expect("bundled");
@@ -623,6 +624,7 @@ mod tests {
                 { "resources": ["scale"], "actions": ["read", "write"], "namespaces": ["*"] },
                 { "resources": ["job"], "actions": ["read"], "namespaces": ["*"] },
                 { "resources": ["node"], "actions": ["read", "write"] },
+                { "resources": ["kv"], "actions": ["read", "write"], "paths": ["legion/apps/autoscaler/*"] },
             ])
         );
         // Its UI: a sidebar page, a job panel, task badges, a node panel,

@@ -19,6 +19,7 @@
 //! | [`plugins`] | The plugins installed in the autoscaler's app config ([`PluginCatalog`](plugins::PluginCatalog)) and who may use them: a policy names a plugin, never a command or a URL. |
 //! | [`policy`] | Standalone policies (`legion scaling apply`): an external target's record, or a node group's. |
 //! | [`signals`] | How raw inputs become an observation: the warmup count and the averaging windows, shared by the live engine and the simulator. |
+//! | [`shard`] | Which of the 64 shards a policy hashes to (FNV-1a of its key), which the policy watch filters by and autoscaler replicas split between them. |
 //! | [`nodes`] | Node-group autoscaling (§6.11): the [`NodeGroupPolicy`] spec, the least-waste [`expand`]er, [`decide`] (scale-up from pending work, join timeouts, scale-in victims, never-victim rules, budget) and the drain state machine [`step_drain`]. |
 //!
 //! # How later phases use it
@@ -51,6 +52,7 @@ pub mod plugins;
 pub mod policy;
 pub mod schedule;
 pub mod signals;
+pub mod shard;
 pub mod simulate;
 pub mod spec;
 pub mod strategies;

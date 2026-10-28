@@ -1,13 +1,22 @@
 //! What the autoscaler app reports (`ReportScalingStatus`; docs/autoscaling.md,
 //! "Knowing whether the autoscaler is running").
 //!
-//! The app sends one report per evaluation tick: its interval, its mode, and
-//! the last evaluation of every target. The manager that leads the status
-//! lane holds the newest report per target in memory, like usage rollups:
-//! nothing is replicated, a failover starts empty, and the next report (one
-//! interval later) refills it. `GetScalingStatus` reads it back, and says
-//! the app is NOT RUNNING once three of its intervals pass with no report,
-//! so `legion scaling status` works, and is honest, with the app down.
+//! Each replica of the app sends one report per evaluation tick: its
+//! instance, interval, mode, the shards it holds, and the last evaluation
+//! of every target it evaluated. The manager that leads the status lane
+//! holds the newest report per replica and per target in memory, like usage
+//! rollups: nothing is replicated, a failover starts empty, and the next
+//! reports (one interval later) refill it. `GetScalingStatus` reads it
+//! back:
+//!
+//! - **The app is running while any replica reports.** It reads NOT
+//!   RUNNING once three of the newest reporter's intervals pass with no
+//!   report from any replica, so `legion scaling status` works, and is
+//!   honest, with the app down.
+//! - **Each target is owned by one replica**: its entry is the newest
+//!   report of it, and names the replica that sent it. A replica that dies
+//!   leaves its targets' entries to go stale until the replica that takes
+//!   its shards reports them.
 
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -23,10 +32,11 @@ pub const MISSED_INTERVALS: u32 = 3;
 /// default tick).
 pub const DEFAULT_INTERVAL: Duration = Duration::from_secs(15);
 
-/// Targets not reported for this long are forgotten (a removed policy).
+/// Targets (and replicas) not reported for this long are forgotten (a
+/// removed policy, a replica that is gone).
 const TARGET_RETENTION: Duration = Duration::from_secs(3600);
 
-/// The newest report from the app as a whole.
+/// The newest report from one replica of the app.
 #[derive(Debug, Clone)]
 pub struct AppReport {
     pub instance: String,
@@ -35,6 +45,23 @@ pub struct AppReport {
     pub version: String,
     pub received: Instant,
     pub received_unix_ms: i64,
+    /// The shards it holds (empty: all of them).
+    pub shards: Vec<u32>,
+    /// How many shards policies hash to (0: the replica does not shard).
+    pub shard_count: u32,
+    /// Targets in its last report.
+    pub targets: u32,
+}
+
+impl AppReport {
+    /// Whether this replica reported within [`MISSED_INTERVALS`] of
+    /// `interval` at `now`. Pass the app's interval
+    /// ([`ScalingStatusBoard::interval`], the newest report's): every
+    /// replica runs the same config, and a replica replaced by a config
+    /// change must not count as running on its old, longer interval.
+    pub fn fresh(&self, now: Instant, interval: Duration) -> bool {
+        now.saturating_duration_since(self.received) < interval * MISSED_INTERVALS
+    }
 }
 
 /// The newest evaluation of one target.
@@ -50,14 +77,16 @@ pub struct TargetEntry {
     pub decision_json: String,
     pub policy_digest: String,
     pub received: Instant,
+    /// The replica that reported it.
+    pub instance: String,
 }
 
 /// Whether the app is running, as the reports show it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AppLiveness {
-    /// A report arrived within [`MISSED_INTERVALS`] intervals.
+    /// A replica reported within [`MISSED_INTERVALS`] of its interval.
     Running,
-    /// None did. `since` is the last report, if any.
+    /// None did.
     NotRunning,
     /// No report yet, and this manager has not held the board for
     /// [`MISSED_INTERVALS`] default intervals: too early to tell.
@@ -67,7 +96,7 @@ pub enum AppLiveness {
 #[derive(Debug)]
 struct Inner {
     created: Instant,
-    app: Option<AppReport>,
+    apps: HashMap<String, AppReport>,
     targets: HashMap<(String, String, String), TargetEntry>,
 }
 
@@ -82,7 +111,7 @@ impl Default for ScalingStatusBoard {
         Self {
             inner: Mutex::new(Inner {
                 created: Instant::now(),
-                app: None,
+                apps: HashMap::new(),
                 targets: HashMap::new(),
             }),
         }
@@ -107,24 +136,33 @@ impl ScalingStatusBoard {
     ) -> u32 {
         let mut inner = self.lock();
         let interval = Duration::from_secs(u64::from(report.interval_seconds.max(1)));
-        inner.app = Some(AppReport {
-            instance: report.instance.clone(),
-            interval,
-            mode: report.mode.clone(),
-            version: report.version.clone(),
-            received: now,
-            received_unix_ms: now_unix_ms,
-        });
+        inner.apps.insert(
+            report.instance.clone(),
+            AppReport {
+                instance: report.instance.clone(),
+                interval,
+                mode: report.mode.clone(),
+                version: report.version.clone(),
+                received: now,
+                received_unix_ms: now_unix_ms,
+                shards: report.shards.clone(),
+                shard_count: report.shard_count,
+                targets: report.targets.len() as u32,
+            },
+        );
         for target in &report.targets {
-            Self::record_target(&mut inner, target, now);
+            Self::record_target(&mut inner, &report.instance, target, now);
         }
         inner
             .targets
             .retain(|_, entry| now.saturating_duration_since(entry.received) < TARGET_RETENTION);
+        inner
+            .apps
+            .retain(|_, app| now.saturating_duration_since(app.received) < TARGET_RETENTION);
         report.targets.len() as u32
     }
 
-    fn record_target(inner: &mut Inner, target: &ScalingTargetReport, now: Instant) {
+    fn record_target(inner: &mut Inner, instance: &str, target: &ScalingTargetReport, now: Instant) {
         let key = key(&target.job_id, &target.task_group, &target.task_name);
         let decision_json = if target.decision_json.is_empty() {
             inner
@@ -146,44 +184,49 @@ impl ScalingStatusBoard {
                 decision_json,
                 policy_digest: target.policy_digest.clone(),
                 received: now,
+                instance: instance.to_string(),
             },
         );
     }
 
-    /// The newest app report, if any.
+    /// The newest report from any replica, if any.
     pub fn app(&self) -> Option<AppReport> {
-        self.lock().app.clone()
+        self.lock()
+            .apps
+            .values()
+            .max_by_key(|app| app.received)
+            .cloned()
     }
 
-    /// The app's interval: reported, or the default.
+    /// Every replica that reported within the retention, newest first.
+    pub fn replicas(&self) -> Vec<AppReport> {
+        let mut apps: Vec<AppReport> = self.lock().apps.values().cloned().collect();
+        apps.sort_by(|a, b| b.received.cmp(&a.received).then(a.instance.cmp(&b.instance)));
+        apps
+    }
+
+    /// The app's interval: the newest reporter's, or the default.
     pub fn interval(&self) -> Duration {
-        self.lock()
-            .app
-            .as_ref()
-            .map_or(DEFAULT_INTERVAL, |app| app.interval)
+        self.app().map_or(DEFAULT_INTERVAL, |app| app.interval)
     }
 
     /// Whether the app is running at `now`. `held_since` is when this manager
     /// started holding the board (it took the status lane); `None` uses the
     /// board's creation.
     pub fn liveness(&self, now: Instant, held_since: Option<Instant>) -> AppLiveness {
+        let interval = self.interval();
         let inner = self.lock();
-        match &inner.app {
-            Some(app) => {
-                if now.saturating_duration_since(app.received) < app.interval * MISSED_INTERVALS {
-                    AppLiveness::Running
-                } else {
-                    AppLiveness::NotRunning
-                }
-            }
-            None => {
-                let since = held_since.unwrap_or(inner.created).max(inner.created);
-                if now.saturating_duration_since(since) < DEFAULT_INTERVAL * MISSED_INTERVALS {
-                    AppLiveness::Starting
-                } else {
-                    AppLiveness::NotRunning
-                }
-            }
+        if inner.apps.values().any(|app| app.fresh(now, interval)) {
+            return AppLiveness::Running;
+        }
+        if !inner.apps.is_empty() {
+            return AppLiveness::NotRunning;
+        }
+        let since = held_since.unwrap_or(inner.created).max(inner.created);
+        if now.saturating_duration_since(since) < DEFAULT_INTERVAL * MISSED_INTERVALS {
+            AppLiveness::Starting
+        } else {
+            AppLiveness::NotRunning
         }
     }
 
@@ -200,7 +243,7 @@ impl ScalingStatusBoard {
     /// Forget everything (tests).
     pub fn clear(&self) {
         let mut inner = self.lock();
-        inner.app = None;
+        inner.apps.clear();
         inner.targets.clear();
     }
 }
@@ -216,6 +259,7 @@ mod tests {
             mode: "enforce".into(),
             targets,
             version: "test".into(),
+            ..Default::default()
         }
     }
 
@@ -269,5 +313,50 @@ mod tests {
         assert_eq!(entry.decision_json, "{\"x\":1}");
         assert!(!board.is_stale(entry.received, now + Duration::from_secs(44)));
         assert!(board.is_stale(entry.received, now + Duration::from_secs(45)));
+    }
+
+    /// Several replicas: running while any reports; each target is the
+    /// newest report of it, naming its replica; NOT RUNNING once none has
+    /// reported for three intervals.
+    #[test]
+    fn replicas_report_their_own_targets_test() {
+        let board = ScalingStatusBoard::default();
+        let start = Instant::now();
+        let from = |instance: &str, shards: Vec<u32>, targets| ReportScalingStatusRequest {
+            instance: instance.into(),
+            interval_seconds: 15,
+            mode: "enforce".into(),
+            targets,
+            version: "test".into(),
+            shards,
+            shard_count: 64,
+        };
+        board.record(&from("alloc-1", vec![1, 2], vec![target("{}")]), start, 1);
+        let mut other = target("{}");
+        other.job_id = "api".into();
+        board.record(
+            &from("alloc-2", vec![3], vec![other]),
+            start + Duration::from_secs(20),
+            2,
+        );
+        let replicas = board.replicas();
+        assert_eq!(
+            replicas.iter().map(|r| r.instance.as_str()).collect::<Vec<_>>(),
+            vec!["alloc-2", "alloc-1"]
+        );
+        assert_eq!(replicas[1].shards, vec![1, 2]);
+        assert_eq!(board.target("web", "default", "web").expect("web").instance, "alloc-1");
+        assert_eq!(board.target("api", "default", "web").expect("api").instance, "alloc-2");
+        // alloc-1 went quiet: still running on alloc-2's reports.
+        let later = start + Duration::from_secs(50);
+        assert!(!replicas[1].fresh(later, board.interval()));
+        assert_eq!(board.liveness(later, None), AppLiveness::Running);
+        // A target moves to the replica that reports it next.
+        board.record(&from("alloc-2", vec![1, 2, 3], vec![target("{}")]), later, 3);
+        assert_eq!(board.target("web", "default", "web").expect("web").instance, "alloc-2");
+        assert_eq!(
+            board.liveness(later + Duration::from_secs(45), None),
+            AppLiveness::NotRunning
+        );
     }
 }

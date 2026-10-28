@@ -1109,7 +1109,7 @@ fn tool_defs() -> Vec<ToolDef> {
         },
         ToolDef {
             name: "legion_scaling_status",
-            description: "Task autoscaling status (docs/autoscaling.md): every autoscaled task's count (`now`), what the autoscaler wants, bounds, mode, state (ok, scaled, held, limited, deferred, pinned, paused, dry-run, missing-data, invalid, stale, not-evaluated), its pin and pause, the last change, and whether the autoscaler app is running (`app.state`: running, not-running, starting, disabled). Pass job for one job, or namespaces (names or globs) to list. Read-only.",
+            description: "Task autoscaling status (docs/autoscaling.md): every autoscaled task's count (`now`), what the autoscaler wants, bounds, mode, state (ok, scaled, held, limited, deferred, pinned, paused, dry-run, missing-data, invalid, stale, not-evaluated), its pin and pause, the last change, the autoscaler replica that evaluated it (`instance`), and whether the autoscaler app is running (`app.state`: running, not-running, starting, disabled; `app.replicas` lists every replica with its shards and last report). Pass job for one job, or namespaces (names or globs) to list. Read-only.",
             input_schema: || json!({
                 "type": "object",
                 "properties": {

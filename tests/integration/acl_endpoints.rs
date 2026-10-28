@@ -1188,6 +1188,7 @@ async fn call_endpoint(
                 ListKvRequest {
                     prefix: String::new(),
                     include_values: true,
+                    include_locks: true,
                 },
                 token,
             ))
@@ -3644,6 +3645,7 @@ async fn kv_path_scoped_policy_limits_kv_access() -> R<()> {
             ListKvRequest {
                 prefix: String::new(),
                 include_values: true,
+                include_locks: false,
             },
             Some(&secret),
         ))
@@ -3661,6 +3663,29 @@ async fn kv_path_scoped_policy_limits_kv_access() -> R<()> {
             .map(|entry| &entry.key)
             .collect::<Vec<_>>(),
     );
+    assert!(reply.locks.is_empty(), "locks only on request");
+
+    // With include_locks: the unexpired locks it may read, never their ids.
+    for key in ["team/leader", "secret/leader"] {
+        svc.store.acquire_kv_lock(key, None, Some("alloc-1"), 60, false)?;
+    }
+    let reply = svc
+        .list_kv(req(
+            ListKvRequest {
+                prefix: String::new(),
+                include_values: false,
+                include_locks: true,
+            },
+            Some(&secret),
+        ))
+        .await?
+        .into_inner();
+    let locks: Vec<(&str, &str, Option<&str>)> = reply
+        .locks
+        .iter()
+        .map(|lock| (lock.key.as_str(), lock.lock_id.as_str(), lock.owner.as_deref()))
+        .collect();
+    assert_eq!(locks, vec![("team/leader", "", Some("alloc-1"))]);
     Ok(())
 }
 

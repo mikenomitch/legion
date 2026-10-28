@@ -11281,8 +11281,26 @@ impl Manager for ManagerDaemonService {
                 &AclScope::path(&entry.key),
             )
         });
+        // Locks on request, readable like entries; a lock id is its
+        // holder's secret and never listed.
+        let locks = if req.include_locks {
+            self.store
+                .list_kv_locks(&req.prefix)
+                .map_err(|e| map_store_error("Error listing kv locks", e))?
+                .into_iter()
+                .filter(|lock| {
+                    identity.allows(AclResource::Kv, AclAction::Read, &AclScope::path(&lock.key))
+                })
+                .map(|lock| crate::structs::KvLock {
+                    lock_id: String::new(),
+                    ..lock
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
 
-        Ok(Response::new(ListKvReply { entries }))
+        Ok(Response::new(ListKvReply { entries, locks }))
     }
 
     #[instrument(skip_all)]

@@ -7,6 +7,8 @@
 //! `PauseScaling`), for task targets, standalone policies, and node groups.
 
 use super::*;
+use std::collections::BTreeMap;
+
 use crate::autoscaler::defaults::ResolvedPolicy;
 use crate::autoscaler::{AutoscaleRecord, EffectivePolicy};
 use crate::manager::autoscale::{
@@ -24,7 +26,7 @@ use crate::structs::{
     GetScalingStatusReply, GetScalingStatusRequest, PauseScalingReply, PauseScalingRequest,
     RecordScalingActionReply, RecordScalingActionRequest, ReportScalingStatusReply,
     ReportScalingStatusRequest, ScaleDecision, ScaleHistoryEntry, ScalePin, ScalingActionIntent,
-    ScalingAppStatus,
+    ScalingAppReplica, ScalingAppStatus,
     ScalingPauseInfo, ScalingPolicy, ScalingPolicyChange, ScalingPolicySet, ScalingProvenanceRow,
     ScalingTargetStatus, StandaloneScalingPolicy, WatchScalingPoliciesRequest,
 };
@@ -779,6 +781,24 @@ impl ManagerDaemonService {
                     .map_err(Status::invalid_argument)?,
             )
         };
+        if let Some(shard) = req
+            .shards
+            .iter()
+            .find(|shard| req.shard_count > 0 && **shard >= req.shard_count)
+        {
+            return Err(Status::invalid_argument(format!(
+                "shard {shard} is not below shard_count {}",
+                req.shard_count
+            )));
+        }
+        let shard_count = req.shard_count;
+        let shards: BTreeSet<u32> = req.shards.iter().copied().collect();
+        // Whether a policy with shard key `key` is in the requested shards.
+        let in_shards = move |key: &str| {
+            shard_count == 0
+                || shards.contains(&crate::autoscaler::shard::shard_of(key, shard_count))
+        };
+        let deltas = req.deltas;
         let store = self.store.clone();
         let (tx, rx) = tokio::sync::mpsc::channel(4);
         tokio::spawn(async move {
@@ -795,7 +815,7 @@ impl ManagerDaemonService {
             let mut poll = tokio::time::interval(POLICY_POLL);
             poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             let mut fingerprint: Option<String> = None;
-            let mut last_sent: Option<(Vec<ScalingPolicy>, Vec<StandaloneScalingPolicy>)> = None;
+            let mut last_sent: Option<BTreeMap<String, WatchEntry>> = None;
             let mut generation = 0u64;
             loop {
                 tokio::select! {
@@ -905,22 +925,43 @@ impl ManagerDaemonService {
                             continue;
                         }
                     };
-                let sent = (policies, standalone);
-                if last_sent.as_ref() == Some(&sent) {
+                let mut entries: BTreeMap<String, WatchEntry> = BTreeMap::new();
+                for policy in policies {
+                    let key = crate::autoscaler::shard::task_key(
+                        &policy.job_id,
+                        &policy.task_group,
+                        &policy.task_name,
+                    );
+                    if in_shards(&key) {
+                        entries.insert(key, WatchEntry::Task(policy));
+                    }
+                }
+                for policy in standalone {
+                    if in_shards(&crate::autoscaler::shard::standalone_key(
+                        &policy.kind,
+                        &policy.id,
+                    )) {
+                        entries.insert(policy_target_key(&policy.id), WatchEntry::Standalone(policy));
+                    }
+                }
+                let Some((full, policies, standalone, removed)) =
+                    watch_message(last_sent.as_ref(), &entries, deltas)
+                else {
                     continue;
-                }
-                generation += 1;
-                let set = ScalingPolicySet {
-                    policies: sent.0.clone(),
-                    generation,
-                    resolved_at_unix_ms: now_ms,
-                    defaults_version: layers.cluster_version,
-                    standalone: sent.1.clone(),
                 };
-                if tx.send(Ok(set)).await.is_err() {
-                    return;
+                for part in watch_parts(full, policies, standalone, removed, deltas) {
+                    generation += 1;
+                    let set = ScalingPolicySet {
+                        generation,
+                        resolved_at_unix_ms: now_ms,
+                        defaults_version: layers.cluster_version,
+                        ..part
+                    };
+                    if tx.send(Ok(set)).await.is_err() {
+                        return;
+                    }
                 }
-                last_sent = Some(sent);
+                last_sent = Some(entries);
             }
         });
         Ok(Response::new(ReceiverStream::new(rx)))
@@ -1723,6 +1764,7 @@ impl ManagerDaemonService {
             error,
             policy_id: id,
             kind: policy.row.kind.clone(),
+            instance: entry.map(|entry| entry.instance).unwrap_or_default(),
             ..Default::default()
         })
     }
@@ -1834,6 +1876,7 @@ impl ManagerDaemonService {
             } else {
                 "task".to_string()
             },
+            instance: entry.map(|entry| entry.instance).unwrap_or_default(),
         })
     }
 
@@ -1847,6 +1890,12 @@ impl ManagerDaemonService {
         let held_since = self.store.scaling_rollups().merge().responsible_since();
         let liveness = board.liveness(now, held_since);
         let report = board.app();
+        let replicas = board.replicas();
+        let interval = board.interval();
+        let live: Vec<&crate::manager::scaling_status::AppReport> = replicas
+            .iter()
+            .filter(|replica| replica.fresh(now, interval))
+            .collect();
         let record = self
             .store
             .get_app(AUTOSCALER_APP)
@@ -1868,11 +1917,41 @@ impl ManagerDaemonService {
                     let ago = report.map_or(0, |report| {
                         now.saturating_duration_since(report.received).as_secs()
                     });
+                    // One replica: `running (alloc 41)`. Several: each
+                    // with how many shards it evaluates.
+                    let who = if live.len() > 1 {
+                        format!(
+                            "running {} replicas ({})",
+                            live.len(),
+                            live.iter()
+                                .map(|replica| format!(
+                                    "{}: {} shards",
+                                    replica.instance,
+                                    if replica.shards.is_empty() {
+                                        crate::autoscaler::shard::SHARDS as usize
+                                    } else {
+                                        replica.shards.len()
+                                    }
+                                ))
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        )
+                    } else {
+                        format!(
+                            "running ({})",
+                            report.map(|report| report.instance.as_str()).unwrap_or("-")
+                        )
+                    };
+                    let stale = replicas.len() - live.len();
                     (
                         "running".to_string(),
                         format!(
-                            "running ({}), last evaluation {ago}s ago{}",
-                            report.map(|report| report.instance.as_str()).unwrap_or("-"),
+                            "{who}, last evaluation {ago}s ago{}{}",
+                            if stale > 0 {
+                                format!(", {stale} replica(s) stopped reporting")
+                            } else {
+                                String::new()
+                            },
                             report
                                 .filter(|report| report.mode == "dry-run")
                                 .map(|_| ", every policy forced to dry-run")
@@ -1918,6 +1997,24 @@ impl ManagerDaemonService {
                 .raft_node_id()
                 .unwrap_or_else(|| "local".to_string()),
             paused_all,
+            replicas: replicas
+                .iter()
+                .map(|replica| ScalingAppReplica {
+                    instance: replica.instance.clone(),
+                    last_report_unix_ms: replica.received_unix_ms,
+                    interval_seconds: replica.interval.as_secs() as u32,
+                    mode: replica.mode.clone(),
+                    version: replica.version.clone(),
+                    shards: replica.shards.clone(),
+                    shard_count: replica.shard_count,
+                    targets: replica.targets,
+                    state: if replica.fresh(now, interval) {
+                        "running".to_string()
+                    } else {
+                        "stale".to_string()
+                    },
+                })
+                .collect(),
         })
     }
 
@@ -2246,4 +2343,175 @@ fn changed_fields(before: &ResolvedPolicy, after: &ResolvedPolicy) -> Vec<String
         .filter(|row| before_rows.get(&row.field) != Some(&row.value))
         .map(|row| row.field)
         .collect()
+}
+
+/// One entry of the watch, by the key a delta names it with.
+#[derive(Debug, Clone, PartialEq)]
+enum WatchEntry {
+    Task(ScalingPolicy),
+    Standalone(StandaloneScalingPolicy),
+}
+
+/// What a watch sends next: the full set, or what changed since the last
+/// message (`None`: nothing changed).
+fn watch_message(
+    last: Option<&BTreeMap<String, WatchEntry>>,
+    now: &BTreeMap<String, WatchEntry>,
+    deltas: bool,
+) -> Option<(bool, Vec<ScalingPolicy>, Vec<StandaloneScalingPolicy>, Vec<String>)> {
+    // Sorted as the full set always was: tasks by job, group, task;
+    // standalone policies by namespace and name.
+    let split = |entries: &mut dyn Iterator<Item = &WatchEntry>| {
+        let mut tasks: Vec<ScalingPolicy> = Vec::new();
+        let mut standalone: Vec<StandaloneScalingPolicy> = Vec::new();
+        for entry in entries {
+            match entry {
+                WatchEntry::Task(policy) => tasks.push(policy.clone()),
+                WatchEntry::Standalone(policy) => standalone.push(policy.clone()),
+            }
+        }
+        tasks.sort_by(|a, b| {
+            (&a.job_id, &a.task_group, &a.task_name).cmp(&(&b.job_id, &b.task_group, &b.task_name))
+        });
+        standalone.sort_by(|a, b| (&a.namespace, &a.name).cmp(&(&b.namespace, &b.name)));
+        (tasks, standalone)
+    };
+    match last {
+        Some(last) if last == now => None,
+        Some(last) if deltas => {
+            let removed: Vec<String> = last
+                .keys()
+                .filter(|key| !now.contains_key(*key))
+                .cloned()
+                .collect();
+            let (tasks, standalone) = split(
+                &mut now
+                    .iter()
+                    .filter(|(key, entry)| last.get(*key) != Some(*entry))
+                    .map(|(_, entry)| entry),
+            );
+            Some((false, tasks, standalone, removed))
+        }
+        _ => {
+            let (tasks, standalone) = split(&mut now.values());
+            Some((true, tasks, standalone, Vec::new()))
+        }
+    }
+}
+
+/// The most policies one message of a delta watch carries.
+const WATCH_CHUNK: usize = 1000;
+
+/// One change as messages: all of it without deltas; with them, at most
+/// [`WATCH_CHUNK`] policies a message, all but the last marked `more`, the
+/// first carrying `full` and `removed`.
+fn watch_parts(
+    full: bool,
+    policies: Vec<ScalingPolicy>,
+    standalone: Vec<StandaloneScalingPolicy>,
+    removed: Vec<String>,
+    deltas: bool,
+) -> Vec<ScalingPolicySet> {
+    if !deltas || policies.len() + standalone.len() <= WATCH_CHUNK {
+        return vec![ScalingPolicySet {
+            policies,
+            standalone,
+            removed,
+            full,
+            ..Default::default()
+        }];
+    }
+    let mut parts = Vec::new();
+    let mut policies = policies.into_iter().peekable();
+    let mut standalone = standalone.into_iter().peekable();
+    let mut removed = Some(removed);
+    loop {
+        let mut part = ScalingPolicySet {
+            full: full && parts.is_empty(),
+            removed: removed.take().unwrap_or_default(),
+            ..Default::default()
+        };
+        while part.policies.len() + part.standalone.len() < WATCH_CHUNK {
+            if let Some(policy) = policies.next() {
+                part.policies.push(policy);
+            } else if let Some(policy) = standalone.next() {
+                part.standalone.push(policy);
+            } else {
+                break;
+            }
+        }
+        part.more = policies.peek().is_some() || standalone.peek().is_some();
+        let done = !part.more;
+        parts.push(part);
+        if done {
+            return parts;
+        }
+    }
+}
+
+#[cfg(test)]
+mod watch_tests {
+    use super::*;
+
+    fn task(job: &str, digest: &str) -> WatchEntry {
+        WatchEntry::Task(ScalingPolicy {
+            job_id: job.into(),
+            task_group: "default".into(),
+            task_name: "web".into(),
+            digest: digest.into(),
+            ..Default::default()
+        })
+    }
+
+    /// Without deltas every message is the whole set; with them, only what
+    /// changed and the keys removed; nothing at all when nothing changed.
+    #[test]
+    fn deltas_carry_changes_and_removals_test() {
+        let first: BTreeMap<String, WatchEntry> = [
+            ("a/default/web".to_string(), task("a", "1")),
+            ("b/default/web".to_string(), task("b", "1")),
+        ]
+        .into_iter()
+        .collect();
+        let (full, tasks, _, removed) = watch_message(None, &first, true).expect("first");
+        assert!(full && removed.is_empty());
+        assert_eq!(tasks.len(), 2);
+        assert!(watch_message(Some(&first), &first, true).is_none());
+        let mut next = first.clone();
+        next.insert("a/default/web".into(), task("a", "2"));
+        next.remove("b/default/web");
+        next.insert("c/default/web".into(), task("c", "1"));
+        let (full, tasks, _, removed) = watch_message(Some(&first), &next, true).expect("delta");
+        assert!(!full);
+        let jobs: Vec<&str> = tasks.iter().map(|policy| policy.job_id.as_str()).collect();
+        assert_eq!(jobs, vec!["a", "c"]);
+        assert_eq!(removed, vec!["b/default/web".to_string()]);
+        let (full, tasks, _, removed) =
+            watch_message(Some(&first), &next, false).expect("whole set");
+        assert!(full && removed.is_empty());
+        assert_eq!(tasks.len(), 2);
+    }
+
+    /// A large change is split, every part but the last marked `more`.
+    #[test]
+    fn large_changes_are_split_test() {
+        let policies: Vec<ScalingPolicy> = (0..2500)
+            .map(|n| ScalingPolicy {
+                job_id: format!("job-{n}"),
+                ..Default::default()
+            })
+            .collect();
+        let parts = watch_parts(true, policies.clone(), Vec::new(), vec!["x".into()], true);
+        let shape: Vec<(bool, usize, usize, bool)> = parts
+            .iter()
+            .map(|part| (part.full, part.policies.len(), part.removed.len(), part.more))
+            .collect();
+        assert_eq!(
+            shape,
+            vec![(true, 1000, 1, true), (false, 1000, 0, true), (false, 500, 0, false)]
+        );
+        let whole = watch_parts(true, policies, Vec::new(), Vec::new(), false);
+        assert_eq!(whole.len(), 1);
+        assert!(!whole[0].more);
+    }
 }

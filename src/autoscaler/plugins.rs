@@ -296,9 +296,30 @@ pub struct PluginEntry {
     /// Namespaces (names or `*`-globs) whose policies may use it; empty
     /// means every namespace.
     pub namespaces: Vec<String>,
+    /// `concurrency` as written: the cap on its calls in flight (0: the
+    /// default, see [`PluginEntry::concurrency`]).
+    pub max_in_flight: u32,
 }
 
+/// The default cap on a plugin's calls in flight: what one replica asks of
+/// a Prometheus, an HTTP endpoint, a URL plugin, or `exec` commands at once.
+pub const DEFAULT_CONCURRENCY: u32 = 8;
+
+/// The highest `concurrency` a plugin may set.
+pub const MAX_CONCURRENCY: u32 = 64;
+
 impl PluginEntry {
+    /// The cap on its calls in flight: `concurrency` when set; otherwise
+    /// [`DEFAULT_CONCURRENCY`], and 1 for a program plugin, which answers
+    /// one request at a time over its stdio.
+    pub fn concurrency(&self) -> u32 {
+        match (&self.install, self.max_in_flight) {
+            (_, n) if n > 0 => n,
+            (Install::Command { .. }, _) => 1,
+            _ => DEFAULT_CONCURRENCY,
+        }
+    }
+
     /// Whether policies in `namespace` may use it.
     pub fn allows(&self, namespace: &str) -> bool {
         self.namespaces.is_empty()
@@ -352,7 +373,7 @@ pub fn valid_name(name: &str) -> bool {
         && chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
 }
 
-const ENTRY_FIELDS: [&str; 7] = [
+const ENTRY_FIELDS: [&str; 8] = [
     "builtin",
     "source",
     "checksum",
@@ -360,6 +381,7 @@ const ENTRY_FIELDS: [&str; 7] = [
     "url",
     "config",
     "namespaces",
+    "concurrency",
 ];
 
 fn parse_entry(name: &str, value: &Value) -> Result<PluginEntry, String> {
@@ -423,6 +445,21 @@ fn parse_entry(name: &str, value: &Value) -> Result<PluginEntry, String> {
             .collect::<Result<_, _>>()?,
         Some(_) => return Err(format!("{at}.namespaces must be a list")),
     };
+    let max_in_flight = match object.get("concurrency") {
+        None | Some(Value::Null) => 0,
+        Some(value) => value
+            .as_u64()
+            .filter(|n| (1..=u64::from(MAX_CONCURRENCY)).contains(n))
+            .ok_or_else(|| {
+                format!("{at}.concurrency must be a whole number from 1 to {MAX_CONCURRENCY}")
+            })? as u32,
+    };
+    if max_in_flight > 1 && (source.is_some() || command.is_some()) {
+        return Err(format!(
+            "{at}.concurrency is {max_in_flight} on a program plugin: it answers one request at \
+             a time over its stdio. Hint: serve it over `url` to take several"
+        ));
+    }
     let modes = [
         builtin.is_some(),
         source.is_some() || command.is_some(),
@@ -479,6 +516,7 @@ fn parse_entry(name: &str, value: &Value) -> Result<PluginEntry, String> {
         install,
         config,
         namespaces,
+        max_in_flight,
     })
 }
 
@@ -771,12 +809,42 @@ mod tests {
                 json!({ "p": { "builtin": "http", "config": { "url": "http://x", "timeout": "soon" } } }),
                 "config.timeout",
             ),
+            (
+                json!({ "p": { "url": "http://x/rpc", "concurrency": 0 } }),
+                "from 1 to 64",
+            ),
+            (
+                json!({ "p": { "url": "http://x/rpc", "concurrency": 65 } }),
+                "from 1 to 64",
+            ),
+            (
+                json!({ "p": { "command": ["x"], "concurrency": 4 } }),
+                "serve it over `url`",
+            ),
         ];
         for (plugins, expected) in cases {
             let err = catalog(plugins.clone()).unwrap_err();
             assert!(err.contains(expected), "{plugins}: {err}");
         }
         assert!(PluginCatalog::from_app_config(&json!({ "plugins": [] })).is_err());
+    }
+
+    #[test]
+    fn concurrency_defaults_by_how_a_plugin_runs_test() -> Result<(), String> {
+        let catalog = catalog(json!({
+            "prom": { "builtin": "prometheus", "config": { "address": "http://p:9090" } },
+            "remote": { "url": "http://forecast:8080/rpc" },
+            "busy": { "url": "http://busy:8080/rpc", "concurrency": 32 },
+            "program": { "command": ["./program"] },
+            "one": { "command": ["./one"], "concurrency": 1 },
+        }))?;
+        let cap = |name: &str| catalog.get(name).map(PluginEntry::concurrency);
+        assert_eq!(cap("prom"), Some(DEFAULT_CONCURRENCY));
+        assert_eq!(cap("remote"), Some(DEFAULT_CONCURRENCY));
+        assert_eq!(cap("busy"), Some(32));
+        assert_eq!(cap("program"), Some(1));
+        assert_eq!(cap("one"), Some(1));
+        Ok(())
     }
 
     #[test]

@@ -35,26 +35,35 @@
 //!    policies: one `GetCapacityDemand` for every group, the expander, the
 //!    node-group engine, and one action intent per acting group.
 //!
+//! **Replicas** ([`shards`]; docs/autoscaling.md, "Replicas"). Policies
+//! hash to 64 shards; each replica holds KV leases on the shards it
+//! evaluates, watches only their policies (as deltas), and evaluates only
+//! them. A lone replica holds one lease for every shard. Leases are not
+//! fences: every write above is compare-and-set, so two replicas that
+//! briefly both own a shard still act once per decision.
+//!
 //! Module map: [`rpc`] (the JSON-RPC transports), [`host`] (every installed
 //! plugin, ready to call), [`builtins`] (`prometheus`, `http`, `exec`,
 //! `noop`), [`conformance`] (`legion scaling plugin test`), [`nodegroups`]
-//! (node groups).
+//! (node groups), [`shards`] (the shard leases).
 
 pub mod builtins;
 pub mod conformance;
 pub mod host;
 pub mod nodegroups;
 pub mod rpc;
+pub mod shards;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::apps::{AppContext, AppFuture};
 use crate::autoscaler::defaults::EffectiveCheck;
 use crate::autoscaler::plugins::PluginCatalog;
+use crate::autoscaler::shard::{self, SHARDS};
 use crate::autoscaler::signals::{Readiness, Windows};
 use crate::autoscaler::strategies::StrategyConfig;
 use crate::autoscaler::{
@@ -66,10 +75,11 @@ use crate::prelude::*;
 use crate::structs::{
     GetScalingInputsRequest, RecordScalingActionRequest, ReportScalingStatusRequest, ScaleDecision,
     ScaleTaskRequest, ScalingActionIntent, ScalingEventFlag, ScalingInputs, ScalingPauseInfo,
-    ScalingPolicy, ScalingTargetReport, ScalingTargetSelector, StandaloneScalingPolicy,
-    WatchScalingPoliciesRequest,
+    ScalingPolicy, ScalingPolicySet, ScalingTargetReport, ScalingTargetSelector,
+    StandaloneScalingPolicy, WatchScalingPoliciesRequest,
 };
 use host::{PluginHost, RecommendCall, SourceCall, SourceReading};
+use shards::{LeaseTiming, Ownership, Shards};
 
 /// The default evaluation interval (plan §6.9).
 pub const DEFAULT_INTERVAL: Duration = Duration::from_secs(15);
@@ -177,6 +187,12 @@ async fn run_body(mut context: AppContext) -> R<()> {
     // The views read the engine's last hour of evaluations, and call
     // Legion as the app (docs/autoscaling.md, "In the UI").
     ui.connect(client, engine.evaluations());
+    // Shard leases first, so the first watch and tick know what this
+    // replica owns (everything, when it is alone).
+    let mut leases = engine.shards(LeaseTiming::default());
+    leases.step().await;
+    let (stop_leases, leases_stopped) = tokio::sync::oneshot::channel();
+    let leases = leases.spawn(leases_stopped);
     let watch = engine.spawn_watch();
     context.set_health(true, "ok: evaluating");
     let mut ticker = tokio::time::interval(options.interval);
@@ -192,6 +208,10 @@ async fn run_body(mut context: AppContext) -> R<()> {
         }
     }
     watch.abort();
+    // Give the shards back, so the other replicas take them now rather
+    // than after the leases expire.
+    let _ = stop_leases.send(());
+    let _ = tokio::time::timeout(Duration::from_secs(5), leases).await;
     info!(app = context.name(), "The autoscaler app is stopping");
     Ok(())
 }
@@ -271,11 +291,50 @@ impl TargetState {
     }
 }
 
-/// Everything `WatchScalingPolicies` last sent.
+/// Everything `WatchScalingPolicies` sent, by the key a delta names an
+/// entry with (`job/group/task`, or `policy:<id>`).
 #[derive(Debug, Clone, Default)]
 struct PolicyCache {
-    tasks: Vec<ScalingPolicy>,
-    standalone: Vec<StandaloneScalingPolicy>,
+    tasks: BTreeMap<String, ScalingPolicy>,
+    standalone: BTreeMap<String, StandaloneScalingPolicy>,
+}
+
+impl PolicyCache {
+    /// Take one message: a full set replaces the cache, a delta updates it.
+    fn apply(&mut self, set: ScalingPolicySet) {
+        if set.full {
+            self.tasks.clear();
+            self.standalone.clear();
+        }
+        for key in &set.removed {
+            self.tasks.remove(key);
+            self.standalone.remove(key);
+        }
+        for policy in set.policies {
+            self.tasks.insert(
+                shard::task_key(&policy.job_id, &policy.task_group, &policy.task_name),
+                policy,
+            );
+        }
+        for policy in set.standalone {
+            self.standalone.insert(
+                crate::manager::autoscale::policy_target_key(&policy.id),
+                policy,
+            );
+        }
+    }
+}
+
+/// How long each part of a tick took.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct TickTimings {
+    /// Reading: external sources and the batched `GetScalingInputs`.
+    pub inputs: Duration,
+    /// Deciding and acting: every policy's pipeline and its writes, the
+    /// standalone targets, and the node groups.
+    pub decide: Duration,
+    /// The `ReportScalingStatus` call.
+    pub report: Duration,
 }
 
 /// The engine: the policy cache, per-target state, the plugins, and one
@@ -295,6 +354,13 @@ pub struct Engine {
     log: Arc<crate::apps::autoscaler_ui::EvaluationLog>,
     /// What the engine keeps per node group between ticks.
     groups: HashMap<String, nodegroups::GroupRuntime>,
+    /// The shards this replica evaluates, which its lease controller
+    /// ([`Engine::shards`]) keeps current. Everything until one runs.
+    ownership: Arc<RwLock<Ownership>>,
+    /// Whether a tick has run: a target first seen after that (a new job,
+    /// or a shard this replica just took over) starts its cold-start hold
+    /// when it is first seen, since its windows start empty then.
+    ticked: bool,
 }
 
 /// What one tick did, for tests and the app's health detail.
@@ -312,6 +378,8 @@ pub struct TickReport {
     pub summaries: BTreeMap<String, String>,
     /// Errors (inputs, writes, plugins, the report).
     pub errors: Vec<String>,
+    /// How long each part took.
+    pub timings: TickTimings,
 }
 
 impl std::fmt::Display for TickReport {
@@ -545,7 +613,39 @@ impl Engine {
             served_by: None,
             log: Default::default(),
             groups: HashMap::new(),
+            ownership: Arc::new(RwLock::new(Ownership::default())),
+            ticked: false,
         }
+    }
+
+    /// When a target first seen at `now_ms` starts its cold-start hold:
+    /// the engine's start on the first tick, then when it is first seen.
+    fn cold_start_ms(&self, now_ms: i64) -> i64 {
+        if self.ticked {
+            now_ms.max(self.started_ms)
+        } else {
+            self.started_ms
+        }
+    }
+
+    /// A shard-lease controller for this engine's instance, publishing what
+    /// it owns into the engine (docs/autoscaling.md, "Replicas"). Run it
+    /// with [`Shards::spawn`], or step it by hand (tests).
+    pub fn shards(&self, timing: LeaseTiming) -> Shards {
+        Shards::new(
+            self.client.clone(),
+            &self.options.instance,
+            timing,
+            self.ownership.clone(),
+        )
+    }
+
+    /// The shards this replica evaluates now.
+    pub fn ownership(&self) -> Ownership {
+        self.ownership
+            .read()
+            .map(|ownership| ownership.clone())
+            .unwrap_or_default()
     }
 
     /// The engine's last hour of evaluations, which the UI views draw.
@@ -558,35 +658,77 @@ impl Engine {
         &self.host
     }
 
-    /// Keep the policy cache current from `WatchScalingPolicies`,
-    /// reconnecting with backoff, until the returned task is aborted.
+    /// Keep the policy cache current from `WatchScalingPolicies` (deltas,
+    /// filtered to the shards this replica owns), reconnecting with backoff,
+    /// and starting over whenever the owned shards change, until the
+    /// returned task is aborted.
     pub fn spawn_watch(&self) -> tokio::task::JoinHandle<()> {
         let mut client = self.client.clone();
         let policies = self.policies.clone();
+        let ownership = self.ownership.clone();
         tokio::spawn(async move {
             let mut backoff = Duration::from_millis(500);
             loop {
-                match client
-                    .watch_scaling_policies(WatchScalingPoliciesRequest::default())
-                    .await
-                {
+                let owned = ownership
+                    .read()
+                    .map(|ownership| ownership.clone())
+                    .unwrap_or_default();
+                let request = WatchScalingPoliciesRequest {
+                    namespaces: Vec::new(),
+                    shard_count: if owned.shards.is_some() {
+                        SHARDS
+                    } else {
+                        0
+                    },
+                    shards: owned.list(),
+                    deltas: true,
+                };
+                match client.watch_scaling_policies(request).await {
                     Ok(response) => {
                         let mut stream = response.into_inner();
                         backoff = Duration::from_millis(500);
+                        let mut check = tokio::time::interval(Duration::from_millis(250));
+                        // The parts of a change split across messages
+                        // (`more`), merged before the engine sees any.
+                        let mut staging: Option<PolicyCache> = None;
                         loop {
-                            match stream.message().await {
+                            let message = tokio::select! {
+                                message = stream.message() => message,
+                                _ = check.tick() => {
+                                    let epoch = ownership.read().map(|o| o.epoch).unwrap_or(0);
+                                    if epoch != owned.epoch {
+                                        debug!("The owned shards changed: restarting the policy watch");
+                                        break;
+                                    }
+                                    continue;
+                                }
+                            };
+                            match message {
                                 Ok(Some(set)) => {
                                     debug!(
                                         policies = set.policies.len(),
                                         standalone = set.standalone.len(),
+                                        removed = set.removed.len(),
+                                        full = set.full,
+                                        more = set.more,
                                         generation = set.generation,
                                         "Scaling policies updated"
                                     );
-                                    if let Ok(mut cache) = policies.write() {
-                                        *cache = Some(PolicyCache {
-                                            tasks: set.policies,
-                                            standalone: set.standalone,
-                                        });
+                                    let mut next = match staging.take() {
+                                        Some(staged) => staged,
+                                        None if set.full => PolicyCache::default(),
+                                        None => policies
+                                            .read()
+                                            .ok()
+                                            .and_then(|cache| cache.clone())
+                                            .unwrap_or_default(),
+                                    };
+                                    let more = set.more;
+                                    next.apply(set);
+                                    if more {
+                                        staging = Some(next);
+                                    } else if let Ok(mut cache) = policies.write() {
+                                        *cache = Some(next);
                                     }
                                 }
                                 Ok(None) => break,
@@ -595,6 +737,11 @@ impl Engine {
                                     break;
                                 }
                             }
+                        }
+                        // An epoch change restarts at once, with a full set.
+                        let epoch = ownership.read().map(|o| o.epoch).unwrap_or(0);
+                        if epoch != owned.epoch {
+                            continue;
                         }
                     }
                     Err(status) => {
@@ -617,7 +764,8 @@ impl Engine {
         })
     }
 
-    /// Replace the policy cache (tests, or a caller with its own source).
+    /// Replace the policy cache's task policies (tests, or a caller with
+    /// its own source).
     pub fn set_policies(&self, policies: Vec<ScalingPolicy>) {
         if let Ok(mut cache) = self.policies.write() {
             let standalone = cache
@@ -625,7 +773,15 @@ impl Engine {
                 .map(|cache| cache.standalone.clone())
                 .unwrap_or_default();
             *cache = Some(PolicyCache {
-                tasks: policies,
+                tasks: policies
+                    .into_iter()
+                    .map(|policy| {
+                        (
+                            shard::task_key(&policy.job_id, &policy.task_group, &policy.task_name),
+                            policy,
+                        )
+                    })
+                    .collect(),
                 standalone,
             });
         }
@@ -636,25 +792,44 @@ impl Engine {
     #[instrument(skip_all, fields(now_ms))]
     pub async fn tick(&mut self, now_ms: i64) -> TickReport {
         let mut report = TickReport::default();
+        let started = Instant::now();
         let cache = self
             .policies
             .read()
             .ok()
             .and_then(|cache| cache.clone())
             .unwrap_or_default();
-        let mut reports = Vec::with_capacity(cache.tasks.len() + cache.standalone.len());
-        let live: BTreeSet<TargetKey> = cache
+        // Only the shards this replica holds: the watch is filtered to them
+        // too, but lags a rebalance by a moment.
+        let owned = self.ownership();
+        let tasks: Vec<&ScalingPolicy> = cache
             .tasks
             .iter()
+            .filter(|(key, _)| owned.owns(shard::shard_of(key, SHARDS)))
+            .map(|(_, policy)| policy)
+            .collect();
+        let standalone_policies: Vec<&StandaloneScalingPolicy> = cache
+            .standalone
+            .values()
+            .filter(|policy| {
+                owned.owns(shard::shard_of(
+                    &shard::standalone_key(&policy.kind, &policy.id),
+                    SHARDS,
+                ))
+            })
+            .collect();
+        let mut reports = Vec::with_capacity(tasks.len() + standalone_policies.len());
+        let live: BTreeSet<TargetKey> = tasks
+            .iter()
             .map(|p| (p.job_id.clone(), p.task_group.clone(), p.task_name.clone()))
-            .chain(cache.standalone.iter().map(|p| standalone_key(&p.id)))
+            .chain(standalone_policies.iter().map(|p| standalone_key(&p.id)))
             .collect();
         self.targets.retain(|key, _| live.contains(key));
         self.log.retain(&live);
 
         // Parse the valid policies; report the invalid ones as held.
         let mut valid: Vec<(&ScalingPolicy, EffectivePolicy)> = Vec::new();
-        for policy in &cache.tasks {
+        for policy in tasks.iter().copied() {
             if policy.state != "ok" {
                 reports.push(plain_report(
                     task_report(policy),
@@ -683,7 +858,7 @@ impl Engine {
         }
         let mut standalone: Vec<(&StandaloneScalingPolicy, EffectivePolicy)> = Vec::new();
         let mut node_groups: Vec<(&StandaloneScalingPolicy, EffectiveNodeGroup)> = Vec::new();
-        for policy in &cache.standalone {
+        for policy in standalone_policies.iter().copied() {
             if policy.state != "ok" {
                 reports.push(plain_report(
                     standalone_report(policy),
@@ -802,6 +977,8 @@ impl Engine {
         if let Some(error) = &input_error {
             report.errors.push(error.clone());
         }
+        let read_at = Instant::now();
+        report.timings.inputs = read_at - started;
 
         for (policy, effective) in &valid {
             let key: TargetKey = (
@@ -920,6 +1097,8 @@ impl Engine {
             report.states.insert(label.clone(), target.state.clone());
             report.summaries.insert(label, target.summary.clone());
         }
+        let decided_at = Instant::now();
+        report.timings.decide = decided_at - read_at;
         let request = ReportScalingStatusRequest {
             instance: self.options.instance.clone(),
             interval_seconds: self.options.interval.as_secs().max(1) as u32,
@@ -929,6 +1108,8 @@ impl Engine {
             },
             targets: reports,
             version: env!("CARGO_PKG_VERSION").to_string(),
+            shards: owned.list(),
+            shard_count: if owned.sharded { SHARDS } else { 0 },
         };
         match self.client.report_scaling_status(request).await {
             Ok(reply) => {
@@ -951,6 +1132,8 @@ impl Engine {
                     .push(format!("reporting status: {}", status.message()));
             }
         }
+        report.timings.report = decided_at.elapsed();
+        self.ticked = true;
         report
     }
 
@@ -1001,7 +1184,7 @@ impl Engine {
         now_ms: i64,
         report: &mut TickReport,
     ) -> Result<(Decision, ScaleDecision, ScalingTargetReport), Box<ScalingTargetReport>> {
-        let started_ms = self.started_ms;
+        let started_ms = self.cold_start_ms(now_ms);
         let host = self.host.clone();
         let effective = inputs.effective;
         let state = self
@@ -1337,7 +1520,7 @@ impl Engine {
             )
             .await
         {
-            let started_ms = self.started_ms;
+            let started_ms = self.cold_start_ms(now_ms);
             let state = self
                 .targets
                 .entry(key.clone())
