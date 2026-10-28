@@ -1029,21 +1029,27 @@ export class RunJobRequest extends Message<RunJobRequest> {
    * most likely meant: `web: task web: unknown field `cuont` (did you mean
    * `count`?)`.
    *
+   * A key an installed app declares at that point is not unknown: it is
+   * checked against the app's schema (see RunJob), and a suggestion can be
+   * one (`did you mean `backup`, the backup app's key?`).
+   *
    * When `true`:
    * - a key directly on an extension point (the job's top level, a task, an
    *   entry in a task's `volumes`, an entry in `network.ports`, or a task's
-   *   `service` block) is kept, unvalidated, in that block's
-   *   `pendingExtensions` map, and stored with the version. Nothing acts on
-   *   it. These are the places where apps will declare their own keys, so a
-   *   key there may belong to an app that is not installed yet;
+   *   `service` block) that no installed app declares is kept, unvalidated,
+   *   in that block's `pendingExtensions` map, and stored with the version.
+   *   These are the places where apps declare their own keys, so a key there
+   *   may belong to an app that is not installed yet: installing one that
+   *   declares it adopts the value (`GetJobInfoReply.extensions`);
    * - a key anywhere else is dropped;
    * - each kept or dropped key is listed in `RunJobReply.warnings`, and the
    *   set is recorded on the job config version this request creates
    *   (`GetJobInfoReply.unknown_fields`, `legion job info`).
    *
    * The flag is about keys Legion does not know. A value Legion knows is
-   * wrong (a bad type, an out-of-range number, an unknown runtime) is still
-   * an error. It does not relax blocks that are strict on their own: the
+   * wrong (a bad type, an out-of-range number, an unknown runtime, a value
+   * that fails an installed app's key's schema) is still an error. It does
+   * not relax blocks that are strict on their own: the
    * network policy blocks (`network.egress`, `network.ingress`, an
    * upstream's `handlers`), value sources (`{ kv = … }`), the runtime's
    * `config`, and the `count`, `gang`, and `schedule` shorthands.
@@ -2308,6 +2314,19 @@ export class GetJobInfoReply extends Message<GetJobInfoReply> {
    */
   unknownFields?: UnknownFieldsRecord;
 
+  /**
+   * The job's values for installed apps' jobspec keys (docs/apps.md,
+   * "Jobspec extensions"), as they read now: every value the latest
+   * version stores, with its effective value and its state against the
+   * apps installed now, then every pending key (kept under
+   * `--allow-unknown-fields`), adopted by an installed app that declares
+   * it or still pending. Values are visible to anyone with `job:read`, so
+   * they never hold secrets.
+   *
+   * @generated from field: repeated legion.JobExtensionValue extensions = 5;
+   */
+  extensions: JobExtensionValue[] = [];
+
   constructor(data?: PartialMessage<GetJobInfoReply>) {
     super();
     proto3.util.initPartial(data, this);
@@ -2320,6 +2339,7 @@ export class GetJobInfoReply extends Message<GetJobInfoReply> {
     { no: 2, name: "template", kind: "message", T: JobTemplateProvenance, opt: true },
     { no: 3, name: "managed_by", kind: "message", T: ManagedByInfo, opt: true },
     { no: 4, name: "unknown_fields", kind: "message", T: UnknownFieldsRecord, opt: true },
+    { no: 5, name: "extensions", kind: "message", T: JobExtensionValue, repeated: true },
   ]);
 
   static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): GetJobInfoReply {
@@ -2336,6 +2356,196 @@ export class GetJobInfoReply extends Message<GetJobInfoReply> {
 
   static equals(a: GetJobInfoReply | PlainMessage<GetJobInfoReply> | undefined, b: GetJobInfoReply | PlainMessage<GetJobInfoReply> | undefined): boolean {
     return proto3.util.equals(GetJobInfoReply, a, b);
+  }
+}
+
+/**
+ * Where a jobspec extension value is written: the group and task for a
+ * task-level point and every point below it, then the volume, port, or
+ * service. All empty for the job point.
+ *
+ * @generated from message legion.ExtensionPath
+ */
+export class ExtensionPath extends Message<ExtensionPath> {
+  /**
+   * @generated from field: string group = 1;
+   */
+  group = "";
+
+  /**
+   * @generated from field: string task = 2;
+   */
+  task = "";
+
+  /**
+   * @generated from field: string volume = 3;
+   */
+  volume = "";
+
+  /**
+   * @generated from field: string port = 4;
+   */
+  port = "";
+
+  /**
+   * @generated from field: string service = 5;
+   */
+  service = "";
+
+  constructor(data?: PartialMessage<ExtensionPath>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.ExtensionPath";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "group", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 2, name: "task", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 3, name: "volume", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 4, name: "port", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 5, name: "service", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): ExtensionPath {
+    return new ExtensionPath().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): ExtensionPath {
+    return new ExtensionPath().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): ExtensionPath {
+    return new ExtensionPath().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: ExtensionPath | PlainMessage<ExtensionPath> | undefined, b: ExtensionPath | PlainMessage<ExtensionPath> | undefined): boolean {
+    return proto3.util.equals(ExtensionPath, a, b);
+  }
+}
+
+/**
+ * One of a job's values for an installed app's jobspec key, as it reads
+ * now (GetJobInfoReply.extensions).
+ *
+ * @generated from message legion.JobExtensionValue
+ */
+export class JobExtensionValue extends Message<JobExtensionValue> {
+  /**
+   * The app that owns it: the app whose key stored it, or the installed app
+   * that claims a pending value. Empty for a pending value no app claims.
+   *
+   * @generated from field: string app = 1;
+   */
+  app = "";
+
+  /**
+   * The extension point the app declared: `job`, `group`, `task`, `volume`,
+   * `port`, or `service`. A `group` value is written on one task of its
+   * group (`path.task`).
+   *
+   * @generated from field: string point = 2;
+   */
+  point = "";
+
+  /**
+   * @generated from field: legion.ExtensionPath path = 3;
+   */
+  path?: ExtensionPath;
+
+  /**
+   * The key as the jobspec wrote it: `backup`, or `apps.backup`.
+   *
+   * @generated from field: string key = 4;
+   */
+  key = "";
+
+  /**
+   * The value as written, as JSON.
+   *
+   * @generated from field: string value_json = 5;
+   */
+  valueJson = "";
+
+  /**
+   * The value with the owning app's current schema defaults filled, as
+   * JSON (the value as written when no installed app owns it).
+   *
+   * @generated from field: string effective_json = 6;
+   */
+  effectiveJson = "";
+
+  /**
+   * `valid` (passes the app's current schema), `invalid` (fails it: an app
+   * upgrade tightened the schema; the job's next submit must conform),
+   * `pending` (kept under `--allow-unknown-fields`, and no installed app
+   * claims it, or the one that does declares `requires`), or `orphaned`
+   * (its app was uninstalled, or no longer declares a key at this point;
+   * resubmitting the job fails unless the key is removed or
+   * `--allow-unknown-fields` is passed).
+   *
+   * @generated from field: string state = 7;
+   */
+  state = "";
+
+  /**
+   * Why it is invalid, pending, or orphaned; `app disabled` when its app is
+   * disabled (nothing acts on the value meanwhile); `adopted from pending`.
+   *
+   * @generated from field: string detail = 8;
+   */
+  detail = "";
+
+  /**
+   * `<app>@<manifest digest>`: the manifest whose schema checked it at
+   * submit. Empty for pending values.
+   *
+   * @generated from field: string validated_by = 9;
+   */
+  validatedBy = "";
+
+  /**
+   * A pending value an installed app claims (adopted when the app was
+   * installed).
+   *
+   * @generated from field: bool adopted = 10;
+   */
+  adopted = false;
+
+  constructor(data?: PartialMessage<JobExtensionValue>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.JobExtensionValue";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "app", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 2, name: "point", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 3, name: "path", kind: "message", T: ExtensionPath },
+    { no: 4, name: "key", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 5, name: "value_json", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 6, name: "effective_json", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 7, name: "state", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 8, name: "detail", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 9, name: "validated_by", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 10, name: "adopted", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): JobExtensionValue {
+    return new JobExtensionValue().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): JobExtensionValue {
+    return new JobExtensionValue().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): JobExtensionValue {
+    return new JobExtensionValue().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: JobExtensionValue | PlainMessage<JobExtensionValue> | undefined, b: JobExtensionValue | PlainMessage<JobExtensionValue> | undefined): boolean {
+    return proto3.util.equals(JobExtensionValue, a, b);
   }
 }
 
@@ -4109,6 +4319,18 @@ export class PlanJobReply extends Message<PlanJobReply> {
    */
   autoscale: AutoscalePlan[] = [];
 
+  /**
+   * The jobspec's values for installed apps' keys (docs/apps.md, "Jobspec
+   * extensions"), each with its effective value (the app's current schema
+   * defaults filled), and its pending keys, as GetJobInfoReply.extensions
+   * reports them. A value that fails its schema fails the plan instead.
+   * The plan does not check a key's `requires` or ask the app; a submit
+   * does.
+   *
+   * @generated from field: repeated legion.JobExtensionValue extensions = 11;
+   */
+  extensions: JobExtensionValue[] = [];
+
   constructor(data?: PartialMessage<PlanJobReply>) {
     super();
     proto3.util.initPartial(data, this);
@@ -4127,6 +4349,7 @@ export class PlanJobReply extends Message<PlanJobReply> {
     { no: 8, name: "warnings", kind: "scalar", T: 9 /* ScalarType.STRING */, repeated: true },
     { no: 9, name: "gang_reports", kind: "message", T: GangReport, repeated: true },
     { no: 10, name: "autoscale", kind: "message", T: AutoscalePlan, repeated: true },
+    { no: 11, name: "extensions", kind: "message", T: JobExtensionValue, repeated: true },
   ]);
 
   static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): PlanJobReply {
@@ -33965,6 +34188,14 @@ export class App extends Message<App> {
    */
   runningOn: string[] = [];
 
+  /**
+   * The jobspec keys the app adds (docs/apps.md, "Jobspec extensions"),
+   * with renames applied: `legion app extensions` lists them.
+   *
+   * @generated from field: repeated legion.AppExtensionKey extension_keys = 24;
+   */
+  extensionKeys: AppExtensionKey[] = [];
+
   constructor(data?: PartialMessage<App>) {
     super();
     proto3.util.initPartial(data, this);
@@ -33996,6 +34227,7 @@ export class App extends Message<App> {
     { no: 21, name: "ui_slots", kind: "scalar", T: 9 /* ScalarType.STRING */, repeated: true },
     { no: 22, name: "notes", kind: "scalar", T: 9 /* ScalarType.STRING */, repeated: true },
     { no: 23, name: "running_on", kind: "scalar", T: 9 /* ScalarType.STRING */, repeated: true },
+    { no: 24, name: "extension_keys", kind: "message", T: AppExtensionKey, repeated: true },
   ]);
 
   static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): App {
@@ -34012,6 +34244,551 @@ export class App extends Message<App> {
 
   static equals(a: App | PlainMessage<App> | undefined, b: App | PlainMessage<App> | undefined): boolean {
     return proto3.util.equals(App, a, b);
+  }
+}
+
+/**
+ * One jobspec key an installed app adds (App.extension_keys,
+ * GetJobSchemaReply.extensions).
+ *
+ * @generated from message legion.AppExtensionKey
+ */
+export class AppExtensionKey extends Message<AppExtensionKey> {
+  /**
+   * The app that declares it, and its version (`bundled` apps report their
+   * build's).
+   *
+   * @generated from field: string app = 1;
+   */
+  app = "";
+
+  /**
+   * @generated from field: string app_version = 2;
+   */
+  appVersion = "";
+
+  /**
+   * The digest of the app's manifest: what `validated_by` stamps name.
+   *
+   * @generated from field: string manifest_digest = 3;
+   */
+  manifestDigest = "";
+
+  /**
+   * Whether the app is enabled. A disabled app's keys are still validated
+   * at submit; nothing acts on the values while it is off.
+   *
+   * @generated from field: bool app_enabled = 4;
+   */
+  appEnabled = false;
+
+  /**
+   * `job`, `group`, `task`, `volume`, `port`, or `service`. A `group` key
+   * is written on one task of the group and applies to the whole group.
+   *
+   * @generated from field: string point = 5;
+   */
+  point = "";
+
+  /**
+   * What job authors write at the point: the declared key, or the
+   * operator's rename (`legion app install --key`). Every key can also be
+   * written in its qualified spelling, `apps.<app>`.
+   *
+   * @generated from field: string key = 6;
+   */
+  key = "";
+
+  /**
+   * The key the manifest declares.
+   *
+   * @generated from field: string declared_key = 7;
+   */
+  declaredKey = "";
+
+  /**
+   * @generated from field: string description = 8;
+   */
+  description = "";
+
+  /**
+   * The value's JSON Schema (draft 7), as JSON.
+   *
+   * @generated from field: string schema_json = 9;
+   */
+  schemaJson = "";
+
+  /**
+   * The manifest's example values, as a JSON array; each passes the
+   * schema.
+   *
+   * @generated from field: string examples_json = 10;
+   */
+  examplesJson = "";
+
+  /**
+   * Whether a submit also asks the app (`POST
+   * /legion/v1/extensions/validate`), failing open when it cannot answer.
+   *
+   * @generated from field: bool validate = 11;
+   */
+  validate = false;
+
+  /**
+   * A permission whoever sets or changes the value must hold on the job
+   * (`net:write`), beyond `job:write`; empty when none.
+   *
+   * @generated from field: string requires = 12;
+   */
+  requires = "";
+
+  /**
+   * A core field of the same name now exists at the point (a Legion
+   * release added it): the core field wins, and job authors write the
+   * app's values as `apps.<app>`.
+   *
+   * @generated from field: bool shadowed = 13;
+   */
+  shadowed = false;
+
+  constructor(data?: PartialMessage<AppExtensionKey>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.AppExtensionKey";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "app", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 2, name: "app_version", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 3, name: "manifest_digest", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 4, name: "app_enabled", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
+    { no: 5, name: "point", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 6, name: "key", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 7, name: "declared_key", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 8, name: "description", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 9, name: "schema_json", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 10, name: "examples_json", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 11, name: "validate", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
+    { no: 12, name: "requires", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 13, name: "shadowed", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): AppExtensionKey {
+    return new AppExtensionKey().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): AppExtensionKey {
+    return new AppExtensionKey().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): AppExtensionKey {
+    return new AppExtensionKey().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: AppExtensionKey | PlainMessage<AppExtensionKey> | undefined, b: AppExtensionKey | PlainMessage<AppExtensionKey> | undefined): boolean {
+    return proto3.util.equals(AppExtensionKey, a, b);
+  }
+}
+
+/**
+ * Request payload for GetJobSchema.
+ *
+ * @generated from message legion.GetJobSchemaRequest
+ */
+export class GetJobSchemaRequest extends Message<GetJobSchemaRequest> {
+  constructor(data?: PartialMessage<GetJobSchemaRequest>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.GetJobSchemaRequest";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): GetJobSchemaRequest {
+    return new GetJobSchemaRequest().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): GetJobSchemaRequest {
+    return new GetJobSchemaRequest().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): GetJobSchemaRequest {
+    return new GetJobSchemaRequest().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: GetJobSchemaRequest | PlainMessage<GetJobSchemaRequest> | undefined, b: GetJobSchemaRequest | PlainMessage<GetJobSchemaRequest> | undefined): boolean {
+    return proto3.util.equals(GetJobSchemaRequest, a, b);
+  }
+}
+
+/**
+ * Reply payload for GetJobSchema.
+ *
+ * @generated from message legion.GetJobSchemaReply
+ */
+export class GetJobSchemaReply extends Message<GetJobSchemaReply> {
+  /**
+   * The cluster's jobspec JSON Schema (draft 7), as JSON: the core schema
+   * with every installed app's keys at their points.
+   *
+   * @generated from field: string schema_json = 1;
+   */
+  schemaJson = "";
+
+  /**
+   * The installed keys, one per app and point.
+   *
+   * @generated from field: repeated legion.AppExtensionKey extensions = 2;
+   */
+  extensions: AppExtensionKey[] = [];
+
+  constructor(data?: PartialMessage<GetJobSchemaReply>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.GetJobSchemaReply";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "schema_json", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 2, name: "extensions", kind: "message", T: AppExtensionKey, repeated: true },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): GetJobSchemaReply {
+    return new GetJobSchemaReply().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): GetJobSchemaReply {
+    return new GetJobSchemaReply().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): GetJobSchemaReply {
+    return new GetJobSchemaReply().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: GetJobSchemaReply | PlainMessage<GetJobSchemaReply> | undefined, b: GetJobSchemaReply | PlainMessage<GetJobSchemaReply> | undefined): boolean {
+    return proto3.util.equals(GetJobSchemaReply, a, b);
+  }
+}
+
+/**
+ * Request payload for WatchAppExtensions.
+ *
+ * @generated from message legion.WatchAppExtensionsRequest
+ */
+export class WatchAppExtensionsRequest extends Message<WatchAppExtensionsRequest> {
+  /**
+   * The shards to watch, each below `shard_count`. Empty watches every
+   * shard.
+   *
+   * @generated from field: repeated uint32 shards = 1;
+   */
+  shards: number[] = [];
+
+  /**
+   * How many shards values split into. 0 (or 1) means one shard: every
+   * value.
+   *
+   * @generated from field: uint32 shard_count = 2;
+   */
+  shardCount = 0;
+
+  /**
+   * The app whose values to watch: empty (or the caller's own name) for an
+   * app's identity; required for a management token.
+   *
+   * @generated from field: string app = 3;
+   */
+  app = "";
+
+  constructor(data?: PartialMessage<WatchAppExtensionsRequest>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.WatchAppExtensionsRequest";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "shards", kind: "scalar", T: 13 /* ScalarType.UINT32 */, repeated: true },
+    { no: 2, name: "shard_count", kind: "scalar", T: 13 /* ScalarType.UINT32 */ },
+    { no: 3, name: "app", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): WatchAppExtensionsRequest {
+    return new WatchAppExtensionsRequest().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): WatchAppExtensionsRequest {
+    return new WatchAppExtensionsRequest().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): WatchAppExtensionsRequest {
+    return new WatchAppExtensionsRequest().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: WatchAppExtensionsRequest | PlainMessage<WatchAppExtensionsRequest> | undefined, b: WatchAppExtensionsRequest | PlainMessage<WatchAppExtensionsRequest> | undefined): boolean {
+    return proto3.util.equals(WatchAppExtensionsRequest, a, b);
+  }
+}
+
+/**
+ * One message of WatchAppExtensions.
+ *
+ * @generated from message legion.AppExtensionEvent
+ */
+export class AppExtensionEvent extends Message<AppExtensionEvent> {
+  /**
+   * True for the first message: `upserts` is every current value, and a
+   * consumer replaces whatever it held.
+   *
+   * @generated from field: bool snapshot = 1;
+   */
+  snapshot = false;
+
+  /**
+   * Values that are new or changed since the previous message.
+   *
+   * @generated from field: repeated legion.AppExtensionValue upserts = 2;
+   */
+  upserts: AppExtensionValue[] = [];
+
+  /**
+   * Values that are gone since the previous message.
+   *
+   * @generated from field: repeated legion.AppExtensionValueRef deletes = 3;
+   */
+  deletes: AppExtensionValueRef[] = [];
+
+  /**
+   * Increases by one with every message on this stream.
+   *
+   * @generated from field: uint64 generation = 4;
+   */
+  generation = protoInt64.zero;
+
+  constructor(data?: PartialMessage<AppExtensionEvent>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.AppExtensionEvent";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "snapshot", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
+    { no: 2, name: "upserts", kind: "message", T: AppExtensionValue, repeated: true },
+    { no: 3, name: "deletes", kind: "message", T: AppExtensionValueRef, repeated: true },
+    { no: 4, name: "generation", kind: "scalar", T: 4 /* ScalarType.UINT64 */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): AppExtensionEvent {
+    return new AppExtensionEvent().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): AppExtensionEvent {
+    return new AppExtensionEvent().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): AppExtensionEvent {
+    return new AppExtensionEvent().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: AppExtensionEvent | PlainMessage<AppExtensionEvent> | undefined, b: AppExtensionEvent | PlainMessage<AppExtensionEvent> | undefined): boolean {
+    return proto3.util.equals(AppExtensionEvent, a, b);
+  }
+}
+
+/**
+ * One of the calling app's values, in one job.
+ *
+ * @generated from message legion.AppExtensionValue
+ */
+export class AppExtensionValue extends Message<AppExtensionValue> {
+  /**
+   * The job's canonical id, its namespace, the version the value comes
+   * from, and the job's status.
+   *
+   * @generated from field: string job_id = 1;
+   */
+  jobId = "";
+
+  /**
+   * @generated from field: string namespace = 2;
+   */
+  namespace = "";
+
+  /**
+   * @generated from field: uint32 config_version = 3;
+   */
+  configVersion = 0;
+
+  /**
+   * @generated from field: string job_status = 4;
+   */
+  jobStatus = "";
+
+  /**
+   * The point the app declared (`group` keys are written on a task).
+   *
+   * @generated from field: string point = 5;
+   */
+  point = "";
+
+  /**
+   * Where in the job: the group and task, then the volume, port, or
+   * service. The app acts only on what carries the value.
+   *
+   * @generated from field: legion.ExtensionPath path = 6;
+   */
+  path?: ExtensionPath;
+
+  /**
+   * The key as written (`backup` or `apps.backup`).
+   *
+   * @generated from field: string key = 7;
+   */
+  key = "";
+
+  /**
+   * The value as written, and with the app's current schema defaults
+   * filled, as JSON.
+   *
+   * @generated from field: string value_json = 8;
+   */
+  valueJson = "";
+
+  /**
+   * @generated from field: string effective_json = 9;
+   */
+  effectiveJson = "";
+
+  /**
+   * `valid` or `invalid` against the app's current schema; `detail` says
+   * why for `invalid`.
+   *
+   * @generated from field: string state = 10;
+   */
+  state = "";
+
+  /**
+   * @generated from field: string detail = 11;
+   */
+  detail = "";
+
+  /**
+   * `<app>@<manifest digest>` that checked it at submit (empty for an
+   * adopted pending value, which no submit checked).
+   *
+   * @generated from field: string validated_by = 12;
+   */
+  validatedBy = "";
+
+  /**
+   * A value kept pending under `--allow-unknown-fields` before the app was
+   * installed, which the app's key claims.
+   *
+   * @generated from field: bool adopted = 13;
+   */
+  adopted = false;
+
+  /**
+   * The shard the value belongs to (0 when the stream is not sharded).
+   *
+   * @generated from field: uint32 shard = 14;
+   */
+  shard = 0;
+
+  constructor(data?: PartialMessage<AppExtensionValue>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.AppExtensionValue";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "job_id", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 2, name: "namespace", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 3, name: "config_version", kind: "scalar", T: 13 /* ScalarType.UINT32 */ },
+    { no: 4, name: "job_status", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 5, name: "point", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 6, name: "path", kind: "message", T: ExtensionPath },
+    { no: 7, name: "key", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 8, name: "value_json", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 9, name: "effective_json", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 10, name: "state", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 11, name: "detail", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 12, name: "validated_by", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 13, name: "adopted", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
+    { no: 14, name: "shard", kind: "scalar", T: 13 /* ScalarType.UINT32 */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): AppExtensionValue {
+    return new AppExtensionValue().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): AppExtensionValue {
+    return new AppExtensionValue().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): AppExtensionValue {
+    return new AppExtensionValue().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: AppExtensionValue | PlainMessage<AppExtensionValue> | undefined, b: AppExtensionValue | PlainMessage<AppExtensionValue> | undefined): boolean {
+    return proto3.util.equals(AppExtensionValue, a, b);
+  }
+}
+
+/**
+ * Identifies a value WatchAppExtensions no longer reports.
+ *
+ * @generated from message legion.AppExtensionValueRef
+ */
+export class AppExtensionValueRef extends Message<AppExtensionValueRef> {
+  /**
+   * @generated from field: string job_id = 1;
+   */
+  jobId = "";
+
+  /**
+   * @generated from field: string point = 2;
+   */
+  point = "";
+
+  /**
+   * @generated from field: legion.ExtensionPath path = 3;
+   */
+  path?: ExtensionPath;
+
+  constructor(data?: PartialMessage<AppExtensionValueRef>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.AppExtensionValueRef";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "job_id", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 2, name: "point", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 3, name: "path", kind: "message", T: ExtensionPath },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): AppExtensionValueRef {
+    return new AppExtensionValueRef().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): AppExtensionValueRef {
+    return new AppExtensionValueRef().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): AppExtensionValueRef {
+    return new AppExtensionValueRef().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: AppExtensionValueRef | PlainMessage<AppExtensionValueRef> | undefined, b: AppExtensionValueRef | PlainMessage<AppExtensionValueRef> | undefined): boolean {
+    return proto3.util.equals(AppExtensionValueRef, a, b);
   }
 }
 
@@ -34145,6 +34922,17 @@ export class InstallAppRequest extends Message<InstallAppRequest> {
    */
   idempotencyKey?: string;
 
+  /**
+   * Jobspec keys to install under another name, `<point>.<declared
+   * key>=<key>` (`--key volume.backup=pgbackup`): how an operator installs
+   * an app whose key another installed app already owns at that point. Job
+   * authors then write the new key; stored values belong to the app, not
+   * the key.
+   *
+   * @generated from field: repeated string keys = 7;
+   */
+  keys: string[] = [];
+
   constructor(data?: PartialMessage<InstallAppRequest>) {
     super();
     proto3.util.initPartial(data, this);
@@ -34159,6 +34947,7 @@ export class InstallAppRequest extends Message<InstallAppRequest> {
     { no: 4, name: "dry_run", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
     { no: 5, name: "config_json", kind: "scalar", T: 9 /* ScalarType.STRING */, opt: true },
     { no: 6, name: "idempotency_key", kind: "scalar", T: 9 /* ScalarType.STRING */, opt: true },
+    { no: 7, name: "keys", kind: "scalar", T: 9 /* ScalarType.STRING */, repeated: true },
   ]);
 
   static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): InstallAppRequest {
@@ -34207,7 +34996,9 @@ export class InstallAppReply extends Message<InstallAppReply> {
 
   /**
    * The install prompt: what the app runs, where, as whom, what it asks
-   * for, and its UI, one line each.
+   * for, and its UI, one line each; then, for an app with jobspec keys, how
+   * the stored values its keys own fare against its schemas, and the
+   * pending values it adopts.
    *
    * @generated from field: repeated string prompt = 4;
    */
@@ -34441,7 +35232,9 @@ export class UpgradeAppReply extends Message<UpgradeAppReply> {
   deduplicated = false;
 
   /**
-   * The new manifest's install prompt.
+   * The new manifest's install prompt, then, for an app with jobspec keys,
+   * every stored value of its keys checked against the new schemas (`14
+   * jobs set backup on volumes; 2 fail this version's schema: …`).
    *
    * @generated from field: repeated string prompt = 6;
    */
@@ -34498,6 +35291,15 @@ export class UninstallAppRequest extends Message<UninstallAppRequest> {
    */
   idempotencyKey?: string;
 
+  /**
+   * Uninstall even though jobs set the app's jobspec keys. Their values
+   * stay stored, flagged `orphaned`; resubmitting such a job fails unless
+   * the key is removed or `--allow-unknown-fields` is passed.
+   *
+   * @generated from field: bool force = 3;
+   */
+  force = false;
+
   constructor(data?: PartialMessage<UninstallAppRequest>) {
     super();
     proto3.util.initPartial(data, this);
@@ -34508,6 +35310,7 @@ export class UninstallAppRequest extends Message<UninstallAppRequest> {
   static readonly fields: FieldList = proto3.util.newFieldList(() => [
     { no: 1, name: "name", kind: "scalar", T: 9 /* ScalarType.STRING */ },
     { no: 2, name: "idempotency_key", kind: "scalar", T: 9 /* ScalarType.STRING */, opt: true },
+    { no: 3, name: "force", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
   ]);
 
   static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): UninstallAppRequest {
@@ -34554,6 +35357,14 @@ export class UninstallAppReply extends Message<UninstallAppReply> {
    */
   deduplicated = false;
 
+  /**
+   * The jobs whose values for the app's keys are now orphaned (with
+   * `force`).
+   *
+   * @generated from field: repeated string orphaned_jobs = 4;
+   */
+  orphanedJobs: string[] = [];
+
   constructor(data?: PartialMessage<UninstallAppReply>) {
     super();
     proto3.util.initPartial(data, this);
@@ -34565,6 +35376,7 @@ export class UninstallAppReply extends Message<UninstallAppReply> {
     { no: 1, name: "message", kind: "scalar", T: 9 /* ScalarType.STRING */ },
     { no: 2, name: "revoked_grants", kind: "scalar", T: 13 /* ScalarType.UINT32 */ },
     { no: 3, name: "deduplicated", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
+    { no: 4, name: "orphaned_jobs", kind: "scalar", T: 9 /* ScalarType.STRING */, repeated: true },
   ]);
 
   static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): UninstallAppReply {
