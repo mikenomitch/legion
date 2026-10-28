@@ -182,6 +182,19 @@ impl AppContext {
         self.ui.action(name, handler);
     }
 
+    /// Serve sandboxed page `name`, declared in the manifest's `ui.pages`
+    /// (docs/apps.md, "Sandboxed pages"): `handler` returns the page's
+    /// single-file HTML, which the SPA mounts in a sandboxed iframe. The
+    /// manager checked the page's permission as the viewer, and the
+    /// framework checks the assertion names this page.
+    pub fn page<F, Fut>(&self, name: &str, handler: F)
+    where
+        F: Fn(ui::PageRequest) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = R<String>> + Send + 'static,
+    {
+        self.ui.page(name, handler);
+    }
+
     /// The app's name.
     pub fn name(&self) -> &str {
         &self.name
@@ -349,7 +362,8 @@ pub async fn run_app(name: &str, options: RunOptions) -> R<()> {
     if verifier.is_none() {
         warn!(
             app = name,
-            "LEGION_ADDR is not set, so this app cannot verify viewer assertions and serves no              views (turn on workloadIdentity.enabled on the managers)"
+            "LEGION_ADDR is not set, so this app cannot verify viewer assertions and serves no \
+             views (turn on workloadIdentity.enabled on the managers)"
         );
     }
     let ui_server = Arc::new(ui::UiServer::new(registry.clone(), verifier));
@@ -502,14 +516,15 @@ pub(crate) async fn serve_port(
                             Err(_) => ui::UiAnswer {
                                 status: 413,
                                 body: json!({ "error": "the request body is too large" }),
+                                html: None,
                             },
                         };
-                        (
-                            StatusCode::from_u16(answer.status)
-                                .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
-                            "application/json",
-                            answer.body.to_string(),
-                        )
+                        let status = StatusCode::from_u16(answer.status)
+                            .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+                        match answer.html {
+                            Some(html) => (status, "text/html; charset=utf-8", html),
+                            None => (status, "application/json", answer.body.to_string()),
+                        }
                     } else {
                         (
                             StatusCode::NOT_FOUND,

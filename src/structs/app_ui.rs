@@ -69,6 +69,19 @@ pub const MAX_MARKDOWN_BYTES: usize = 16 * 1024;
 pub const MAX_TEXT_LEN: usize = 4_096;
 /// Most entries one slot may register.
 pub const MAX_SLOT_ENTRIES: usize = 8;
+/// Where an app serves sandboxed page `<name>` unless the page names
+/// another `bundle`: `GET /legion/v1/pages/<name>`.
+pub const PAGE_PATH_PREFIX: &str = "/legion/v1/pages/";
+/// Largest page bundle: what a worker reads from an app (1 MiB).
+pub const MAX_PAGE_BYTES: usize = 1024 * 1024;
+/// Most sandboxed pages one app may declare.
+pub const MAX_PAGES: usize = 8;
+/// Most RPCs one page may list.
+pub const MAX_PAGE_RPCS: usize = 64;
+/// The gRPC metadata key the SPA stamps on every call it makes for a
+/// sandboxed page (`<app>/<page>`), which the manager checks against the
+/// page's `rpcs` (`crate::manager::app_page_guard`).
+pub const APP_PAGE_HEADER: &str = "legion-app-page";
 /// Most actions one app may declare.
 pub const MAX_ACTIONS: usize = 32;
 /// Most inputs one action may take.
@@ -300,10 +313,267 @@ pub struct UiSpec {
     /// Unset: on page load and on demand only.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub refresh: Option<String>,
-    /// Sandboxed pages (phase A5): stored as written, not served yet.
+    /// Sandboxed pages (tier 2): single-file HTML the SPA mounts in a
+    /// sandboxed iframe, in the sidebar's Apps section.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    #[schemars(with = "Vec<serde_json::Value>")]
-    pub pages: Vec<Value>,
+    pub pages: Vec<PageDecl>,
+}
+
+/// A sandboxed page an app declares (`ui.pages`; apps plan §6.5, tier 2):
+/// a single-file HTML bundle the app serves, which the SPA fetches through
+/// `GetAppPage` and mounts in an `<iframe sandbox="allow-scripts">` with a
+/// strict CSP, listed in the sidebar's Apps section. Its only power is a
+/// `postMessage` bridge that runs the Manager RPCs in `rpcs` as the viewer.
+#[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq, Eq, Default)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PageDecl {
+    /// The page's name: its route (`/apps/<app>/pages/<name>`) and the name
+    /// the viewer assertion carries.
+    pub name: String,
+    /// The sidebar label and the page's title.
+    pub title: String,
+    /// The sidebar icon (an icon name; unknown ones show a default).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub icon: Option<String>,
+    /// Where the app serves the bundle, under `/legion/v1/`. Default
+    /// `/legion/v1/pages/<name>`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bundle: Option<String>,
+    /// The Manager RPCs the page may call through the bridge, as the viewer
+    /// (`RunJob`, `GetJobInfo`). Only the RPCs [`page_rpc_kind`] knows are
+    /// allowed; calls that change something are confirmed by the viewer
+    /// each time.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub rpcs: Vec<String>,
+    /// Who sees the page: checked as the viewer on any scope, like a `nav`
+    /// entry's. Without one, `app:read` on the app suffices.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub permission: Option<UiPermission>,
+}
+
+impl PageDecl {
+    /// The path the bundle is fetched from.
+    pub fn bundle_path(&self) -> String {
+        self.bundle
+            .as_deref()
+            .map(str::trim)
+            .filter(|bundle| !bundle.is_empty())
+            .map(str::to_string)
+            .unwrap_or_else(|| format!("{PAGE_PATH_PREFIX}{}", self.name))
+    }
+
+    /// Whether the page may call `method` through the bridge: it is listed
+    /// in `rpcs`, and pages may call it at all.
+    pub fn allows_rpc(&self, method: &str) -> bool {
+        page_rpc_kind(method).is_some() && self.rpcs.iter().any(|rpc| rpc == method)
+    }
+}
+
+/// What a page-callable RPC does (`ui.pages[].rpcs`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PageRpcKind {
+    /// Reads only. The bridge runs it as the viewer without asking.
+    Read,
+    /// Changes something (or acts with a side effect). The SPA asks the
+    /// viewer before every call, naming the app, the RPC, and the target.
+    Write,
+}
+
+/// The Manager RPCs a sandboxed page may list in `rpcs`, and whether each
+/// one changes anything. Classified by what the call does, not by its ACL
+/// action (`RestoreInstance` needs only `snapshot:read` but creates an
+/// instance). An RPC missing here is refused at install; see
+/// [`page_rpc_refusal`] for why the rest are left out.
+pub const PAGE_RPCS: &[(&str, PageRpcKind)] = {
+    use PageRpcKind::{Read, Write};
+    &[
+        // Jobs and rollouts.
+        ("RunJob", Write),
+        ("GetJobSpec", Read),
+        ("GetJobSpecByConfig", Read),
+        ("ListJobSpecHistory", Read),
+        ("GetJobInfo", Read),
+        ("ListJobs", Read),
+        ("PlanJob", Read),
+        ("StopJob", Write),
+        ("DestroyJob", Write),
+        ("ListRollouts", Read),
+        ("GetRollout", Read),
+        ("GetRolloutStatus", Read),
+        ("ListRolloutEvents", Read),
+        ("AdvanceRollout", Write),
+        ("StopRollout", Write),
+        ("ListJobActions", Read),
+        ("GetAllocationLogs", Read),
+        // Scaling.
+        ("ScaleTask", Write),
+        ("GetJobScaleStatus", Read),
+        ("GetScalingInputs", Read),
+        ("GetScalingDefaults", Read),
+        ("ApplyScalingDefaults", Write),
+        ("GetScalingStatus", Read),
+        ("GetScaleHistory", Read),
+        ("PauseScaling", Write),
+        ("GetCapacityDemand", Read),
+        // Namespaces and templates.
+        ("ListNamespaces", Read),
+        ("GetNamespace", Read),
+        ("ApplyNamespace", Write),
+        ("DeleteNamespace", Write),
+        ("ListNamespacePolicies", Read),
+        ("GetNamespacePolicy", Read),
+        ("ApplyNamespacePolicy", Write),
+        ("DeleteNamespacePolicy", Write),
+        ("ListJobTemplates", Read),
+        ("GetJobTemplate", Read),
+        ("RenderJobTemplate", Read),
+        ("UpsertJobTemplate", Write),
+        ("DeleteJobTemplate", Write),
+        ("RunJobTemplate", Write),
+        // Instances, snapshots, volumes.
+        ("CreateInstance", Write),
+        ("CreateInstances", Write),
+        ("DestroyInstance", Write),
+        ("StopInstance", Write),
+        ("StartInstance", Write),
+        ("SuspendInstance", Write),
+        ("ForkInstance", Write),
+        ("ReplaceInstance", Write),
+        ("PromoteInstance", Write),
+        ("ListInstances", Read),
+        ("GetInstance", Read),
+        ("ListSessionNodes", Read),
+        ("CreateSnapshot", Write),
+        ("ListSnapshots", Read),
+        ("GetSnapshot", Read),
+        ("DeleteSnapshot", Write),
+        ("RestoreInstance", Write),
+        ("SetSnapshotAlias", Write),
+        ("DeleteSnapshotAlias", Write),
+        ("WarmSnapshot", Write),
+        ("ListVolumes", Read),
+        ("GetVolume", Read),
+        ("DeleteVolume", Write),
+        ("ListVolumeDrivers", Read),
+        // Nodes.
+        ("GetNodes", Read),
+        ("GetNode", Read),
+        ("GetNodeUsage", Read),
+        ("ListNodeUsage", Read),
+        ("GetNodeContent", Read),
+        ("GetLedger", Read),
+        ("RestartWorker", Write),
+        ("SetNodeAvailability", Write),
+        ("ForgetNode", Write),
+        ("ListJoinTokens", Read),
+        ("DeleteJoinToken", Write),
+        ("ListBootTickets", Read),
+        // Services and the network.
+        ("ListServices", Read),
+        ("ListServiceEdges", Read),
+        ("ResolveService", Read),
+        ("UpsertNetPolicy", Write),
+        ("GetNetPolicyObject", Read),
+        ("ListNetPolicies", Read),
+        ("DeleteNetPolicy", Write),
+        ("ShowNetPolicy", Read),
+        ("TestNetPolicy", Read),
+        ("UpsertNetPlugin", Write),
+        ("GetNetPlugin", Read),
+        ("ListNetPlugins", Read),
+        ("DeleteNetPlugin", Write),
+        ("GetNetPluginStatus", Read),
+        ("GetMeshCa", Read),
+        ("RotateMeshCa", Write),
+        // KV.
+        ("PutKv", Write),
+        ("GetKv", Read),
+        ("ListKv", Read),
+        ("DeleteKv", Write),
+        ("PatchKv", Write),
+        ("AcquireKvLock", Write),
+        ("RenewKvLock", Write),
+        ("ReleaseKvLock", Write),
+        ("GetKvLock", Read),
+        // Operating the cluster.
+        ("GetManagerConfigs", Read),
+        ("ListManagers", Read),
+        ("GetObservability", Read),
+        ("GetSchedulerConcurrency", Read),
+        ("GetRaftStatus", Read),
+        ("ListRaftHistory", Read),
+        ("GetKeyringStatus", Read),
+        ("RotateDataKey", Write),
+        ("RewrapKv", Write),
+        ("QueryStateStore", Read),
+        ("GetStateStoreSchema", Read),
+        ("ListSavedStateQueries", Read),
+        ("UpsertSavedStateQuery", Write),
+        ("DeleteSavedStateQuery", Write),
+        ("ListEvents", Read),
+        // Access control and apps.
+        ("WhoAmI", Read),
+        ("GetAuthMethods", Read),
+        ("UpsertAclPolicy", Write),
+        ("GetAclPolicy", Read),
+        ("ListAclPolicies", Read),
+        ("DeleteAclPolicy", Write),
+        ("ListAclTokens", Read),
+        ("DeleteAclToken", Write),
+        ("UpsertAclUser", Write),
+        ("ListAclUsers", Read),
+        ("DeleteAclUser", Write),
+        ("ListExecKeys", Read),
+        ("DeleteExecKey", Write),
+        ("ListGrants", Read),
+        ("RevokeGrant", Write),
+        ("ListApps", Read),
+        ("GetApp", Read),
+        ("InstallApp", Write),
+        ("UpgradeApp", Write),
+        ("UninstallApp", Write),
+        ("SetAppEnabled", Write),
+        ("UpdateAppSettings", Write),
+        ("SetAppConfig", Write),
+    ]
+};
+
+/// Whether a page may call `method`, and what it does.
+pub fn page_rpc_kind(method: &str) -> Option<PageRpcKind> {
+    PAGE_RPCS
+        .iter()
+        .find(|(name, _)| *name == method)
+        .map(|(_, kind)| *kind)
+}
+
+/// Why `method` is not available to sandboxed pages.
+pub fn page_rpc_refusal(method: &str) -> String {
+    let why = match method {
+        "Login" | "CreateAclToken" | "CreateJoinToken" | "GetRaftJoinToken" | "MintExecTicket"
+        | "CreateExecKey" | "IssueBootTicket" | "GetStateBackup" => {
+            "returns a credential or the cluster's secrets, which a page must never hold"
+        }
+        "IssueRaftCommand" | "ResetKeyring" | "RewrapRootKey" => {
+            "is a break-glass operator operation; run it from the CLI"
+        }
+        "WatchScalingPolicies" | "StreamEvents" | "ExecAllocation" | "StreamWork" => {
+            "streams, and the bridge carries unary calls only"
+        }
+        "ListUiExtensions" | "GetAppView" | "InvokeAppAction" | "GetAppPage" => {
+            "is how the SPA draws apps; a page reaches its own app's views and actions with \
+             legion.view and legion.action"
+        }
+        "WorkerPreRegister" | "WorkerRegister" | "Heartbeat" | "HealthCheck"
+        | "FetchDatapathMaterial" | "IssueWorkloadIdentityToken" | "IssueNodeIdentityToken"
+        | "IssueNodeCertificate" | "GetArtifactCredential" | "RatifyClaim"
+        | "UpdateNodeDynamic" | "GetHeartbeatCadence" | "ReportScalingStatus"
+        | "RecordScalingAction" => "is called by workers and apps, not by people",
+        _ => {
+            "is not a Manager RPC a page may call (name one like `GetJobInfo`, as \
+             proto/legion.proto spells it)"
+        }
+    };
+    format!("RPC {method:?} {why}")
 }
 
 /// A view or action name: lowercase letters, digits, `-`, `_`, and `.`,
@@ -377,7 +647,14 @@ impl UiSpec {
 
     /// Whether the app registers anything the manager forwards to it.
     pub fn serves_anything(&self) -> bool {
-        Slot::ALL.iter().any(|slot| !self.entries(*slot).is_empty()) || !self.actions.is_empty()
+        Slot::ALL.iter().any(|slot| !self.entries(*slot).is_empty())
+            || !self.actions.is_empty()
+            || !self.pages.is_empty()
+    }
+
+    /// The sandboxed page named `name`.
+    pub fn page(&self, name: &str) -> Option<&PageDecl> {
+        self.pages.iter().find(|page| page.name == name)
     }
 
     /// The action named `name`.
@@ -451,6 +728,23 @@ impl UiSpec {
                 ));
             }
         }
+        if self.pages.len() > MAX_PAGES {
+            return Err(format!("ui.pages: at most {MAX_PAGES} pages"));
+        }
+        let mut pages = std::collections::BTreeSet::new();
+        let mut bundles = std::collections::BTreeSet::new();
+        for (index, page) in self.pages.iter().enumerate() {
+            validate_page(page).map_err(|err| format!("ui.pages[{index}]: {err}"))?;
+            if !pages.insert(page.name.as_str()) {
+                return Err(format!("ui.pages: two pages are named {:?}", page.name));
+            }
+            if !bundles.insert(page.bundle_path()) {
+                return Err(format!(
+                    "ui.pages: two pages are served from {:?}",
+                    page.bundle_path()
+                ));
+            }
+        }
         Ok(())
     }
 
@@ -491,12 +785,7 @@ fn validate_entry(slot: Slot, entry: &SlotEntry) -> Result<(), String> {
         if slot != Slot::Nav {
             return Err("`icon` is for the nav slot".into());
         }
-        let valid = !icon.is_empty()
-            && icon.len() <= 32
-            && icon.chars().all(|c| c.is_ascii_alphanumeric() || c == '-');
-        if !valid {
-            return Err(format!("icon {icon:?} must be a short icon name"));
-        }
+        validate_icon(icon)?;
     }
     match (slot, &entry.view, &entry.badge) {
         (Slot::Task, None, None) => {
@@ -510,6 +799,77 @@ fn validate_entry(slot: Slot, entry: &SlotEntry) -> Result<(), String> {
         return Err("`title` is required".into());
     }
     if let Some(permission) = &entry.permission {
+        permission.parsed()?;
+    }
+    Ok(())
+}
+
+fn validate_icon(icon: &str) -> Result<(), String> {
+    let valid = !icon.is_empty()
+        && icon.len() <= 32
+        && icon.chars().all(|c| c.is_ascii_alphanumeric() || c == '-');
+    if valid {
+        Ok(())
+    } else {
+        Err(format!("icon {icon:?} must be a short icon name"))
+    }
+}
+
+/// A page's bundle path: under `/legion/v1/` (the only prefix a worker
+/// delivers), outside the view and action paths, with no query, fragment,
+/// or `..`.
+fn validate_bundle(bundle: &str) -> Result<(), String> {
+    let rest = bundle.strip_prefix("/legion/v1/").ok_or_else(|| {
+        format!("bundle {bundle:?} must be a path under /legion/v1/ (the app's UI port)")
+    })?;
+    let valid = !rest.is_empty()
+        && bundle.len() <= 256
+        && !bundle.contains("..")
+        && !bundle.contains("//")
+        && bundle
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '/' | '-' | '_' | '.'));
+    if !valid {
+        return Err(format!(
+            "bundle {bundle:?} must be a plain path (letters, digits, '/', '-', '_', '.'), \
+             with no query or '..'"
+        ));
+    }
+    if bundle.starts_with(VIEW_PATH_PREFIX) || bundle.starts_with(ACTION_PATH_PREFIX) {
+        return Err(format!(
+            "bundle {bundle:?} is under {VIEW_PATH_PREFIX} or {ACTION_PATH_PREFIX}, where views \
+             and actions are served"
+        ));
+    }
+    Ok(())
+}
+
+fn validate_page(page: &PageDecl) -> Result<(), String> {
+    validate_ui_name("page", &page.name)?;
+    if page.title.trim().is_empty() {
+        return Err(format!("page {:?} needs a `title`", page.name));
+    }
+    validate_text("title", &page.title, 80)?;
+    if let Some(icon) = &page.icon {
+        validate_icon(icon)?;
+    }
+    validate_bundle(&page.bundle_path()).map_err(|err| format!("page {:?}: {err}", page.name))?;
+    if page.rpcs.len() > MAX_PAGE_RPCS {
+        return Err(format!(
+            "page {:?} lists more than {MAX_PAGE_RPCS} RPCs",
+            page.name
+        ));
+    }
+    let mut seen = std::collections::BTreeSet::new();
+    for rpc in &page.rpcs {
+        if page_rpc_kind(rpc).is_none() {
+            return Err(format!("page {:?}: {}", page.name, page_rpc_refusal(rpc)));
+        }
+        if !seen.insert(rpc.as_str()) {
+            return Err(format!("page {:?} lists {rpc:?} twice", page.name));
+        }
+    }
+    if let Some(permission) = &page.permission {
         permission.parsed()?;
     }
     Ok(())
@@ -839,12 +1199,24 @@ impl ViewContext {
     }
 }
 
+/// The context a page's assertion carries: the `nav` slot's, which is
+/// empty.
+pub fn page_context() -> ViewContext {
+    ViewContext {
+        slot: Slot::Nav.as_str().to_string(),
+        ..Default::default()
+    }
+}
+
 /// What a viewer assertion was signed for.
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum AssertionKind {
     View,
     Action,
+    /// A sandboxed page's bundle (`ui.pages`). Its context is always the
+    /// `nav` slot's: pages live in the sidebar.
+    Page,
 }
 
 impl AssertionKind {
@@ -852,6 +1224,7 @@ impl AssertionKind {
         match self {
             AssertionKind::View => "view",
             AssertionKind::Action => "action",
+            AssertionKind::Page => "page",
         }
     }
 }
@@ -946,8 +1319,11 @@ pub fn assertion_mismatch(
         (AssertionKind::Action, _, _) => {
             Some("the assertion's inputs digest does not match the request's inputs".into())
         }
-        (AssertionKind::View, _, None) => None,
-        (AssertionKind::View, _, Some(_)) => Some("a view assertion carries no inputs".into()),
+        (AssertionKind::View | AssertionKind::Page, _, None) => None,
+        (AssertionKind::View | AssertionKind::Page, _, Some(_)) => Some(format!(
+            "a {} assertion carries no inputs",
+            kind.as_str()
+        )),
     }
 }
 
@@ -1882,6 +2258,118 @@ mod tests {
         assert!(bad(json!({ "refresh": "1s" })).contains("between"));
         // An action without a permission does not parse.
         assert!(UiSpec::parse(&json!({ "actions": [{ "name": "go", "title": "Go" }] })).is_err());
+    }
+
+    /// `ui.pages` is typed and checked at install (apps plan §6.5, tier 2):
+    /// names, titles, bundles under `/legion/v1/`, and an `rpcs` allowlist
+    /// of Manager RPCs pages may call, never one that mints a credential.
+    #[test]
+    fn pages_are_typed_and_their_rpcs_checked() {
+        let ports = vec!["api".to_string()];
+        let ui = UiSpec::parse(&json!({
+            "pages": [
+                { "name": "console", "title": "Console", "icon": "terminal",
+                  "rpcs": ["GetJobInfo", "StopJob"],
+                  "permission": { "resource": "job", "action": "read" } },
+                { "name": "graph", "title": "Graph", "bundle": "/legion/v1/graph.html" },
+            ],
+        }))
+        .expect("parses");
+        ui.validate(&ports).expect("valid");
+        assert!(ui.serves_anything(), "pages are served on the UI port");
+        assert!(ui.validate(&[]).is_err(), "pages need the UI port");
+        let console = ui.page("console").expect("console");
+        assert_eq!(console.bundle_path(), "/legion/v1/pages/console");
+        assert!(console.allows_rpc("GetJobInfo") && console.allows_rpc("StopJob"));
+        assert!(!console.allows_rpc("DestroyJob"), "not listed");
+        assert_eq!(ui.page("graph").unwrap().bundle_path(), "/legion/v1/graph.html");
+        assert_eq!(page_rpc_kind("StopJob"), Some(PageRpcKind::Write));
+        assert_eq!(page_rpc_kind("GetJobInfo"), Some(PageRpcKind::Read));
+        // `RestoreInstance` needs only snapshot:read, but it creates an
+        // instance: it is confirmed like any write.
+        assert_eq!(page_rpc_kind("RestoreInstance"), Some(PageRpcKind::Write));
+
+        let bad = |page: Value| {
+            UiSpec::parse(&json!({ "pages": [page] }))
+                .and_then(|ui| ui.validate(&ports))
+                .expect_err("invalid")
+        };
+        assert!(bad(json!({ "name": "c", "title": "C", "rpcs": ["CreateAclToken"] }))
+            .contains("credential"));
+        assert!(bad(json!({ "name": "c", "title": "C", "rpcs": ["StreamEvents"] }))
+            .contains("unary"));
+        assert!(bad(json!({ "name": "c", "title": "C", "rpcs": ["GetAppView"] }))
+            .contains("legion.view"));
+        assert!(bad(json!({ "name": "c", "title": "C", "rpcs": ["Heartbeat"] }))
+            .contains("workers"));
+        assert!(bad(json!({ "name": "c", "title": "C", "rpcs": ["DropTables"] }))
+            .contains("not a Manager RPC"));
+        assert!(bad(json!({ "name": "c", "title": "C", "rpcs": ["GetJobInfo", "GetJobInfo"] }))
+            .contains("twice"));
+        assert!(bad(json!({ "name": "Console", "title": "C" })).contains("page name"));
+        assert!(bad(json!({ "name": "c", "title": " " })).contains("title"));
+        assert!(bad(json!({ "name": "c", "title": "C", "bundle": "/admin" })).contains("/legion/v1/"));
+        assert!(bad(json!({ "name": "c", "title": "C", "bundle": "/legion/v1/../x" })).contains("plain path"));
+        assert!(bad(json!({ "name": "c", "title": "C", "bundle": "/legion/v1/p?x=1" })).contains("plain path"));
+        assert!(bad(json!({ "name": "c", "title": "C", "bundle": "/legion/v1/views/x" })).contains("views"));
+        assert!(UiSpec::parse(&json!({ "pages": [{ "name": "c", "title": "C", "html": "<b>" }] })).is_err());
+        let twice = UiSpec::parse(&json!({ "pages": [
+            { "name": "c", "title": "C" }, { "name": "c", "title": "D" } ] }))
+        .unwrap()
+        .validate(&ports)
+        .unwrap_err();
+        assert!(twice.contains("two pages"), "{twice}");
+    }
+
+    /// Every RPC pages may call is a unary Manager RPC of this build's
+    /// proto, and none is also on the refused list.
+    #[test]
+    fn page_rpcs_are_unary_manager_rpcs() {
+        let proto = include_str!("../../proto/legion.proto");
+        let manager = proto
+            .split("service Manager {")
+            .nth(1)
+            .and_then(|rest| rest.split("\nservice ").next())
+            .expect("Manager service in proto");
+        // Declarations may wrap: join each `rpc` with what follows until `;`.
+        let mut declarations: BTreeMap<String, String> = BTreeMap::new();
+        let mut current: Option<(String, String)> = None;
+        for line in manager.lines().map(str::trim) {
+            if let Some(rest) = line.strip_prefix("rpc ") {
+                let name = rest
+                    .split(|c: char| c == '(' || c.is_whitespace())
+                    .next()
+                    .unwrap_or_default()
+                    .to_string();
+                current = Some((name, rest.to_string()));
+            } else if let Some((_, text)) = current.as_mut() {
+                text.push(' ');
+                text.push_str(line);
+            }
+            if line.ends_with(';') {
+                if let Some((name, text)) = current.take() {
+                    declarations.insert(name, text);
+                }
+            }
+        }
+        assert!(declarations.len() > 100, "parsed {} RPCs", declarations.len());
+        for (method, _) in PAGE_RPCS {
+            let declaration = declarations
+                .get(*method)
+                .unwrap_or_else(|| panic!("{method} is not a Manager RPC"));
+            assert!(
+                !declaration.contains("stream "),
+                "{method} streams: {declaration}"
+            );
+            assert!(
+                page_rpc_refusal(method).contains("not a Manager RPC"),
+                "{method} is both allowed and refused"
+            );
+        }
+        for refused in ["CreateAclToken", "StreamEvents", "GetAppView", "Heartbeat", "ResetKeyring"] {
+            assert!(declarations.contains_key(refused), "{refused}");
+            assert!(page_rpc_kind(refused).is_none(), "{refused}");
+        }
     }
 
     #[test]

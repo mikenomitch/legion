@@ -210,6 +210,22 @@ async fn list(format: OutputFormat, app: String) -> R<()> {
     }
     println!("{app} shows:");
     for extension in &reply.extensions {
+        let needs = extension
+            .permission
+            .as_ref()
+            .map(|permission| format!(" (needs {}:{})", permission.resource, permission.action))
+            .unwrap_or_default();
+        if !extension.page.is_empty() {
+            println!(
+                "  a {} page in the sidebar, sandboxed{needs}",
+                extension.title
+            );
+            println!(
+                "      opens in the UI only, at /apps/{app}/pages/{}",
+                extension.page
+            );
+            continue;
+        }
         let what = match extension.slot.as_str() {
             "nav" => format!("a {} page in the sidebar", extension.title),
             "overview" => format!("a {} card on the overview", extension.title),
@@ -219,11 +235,6 @@ async fn list(format: OutputFormat, app: String) -> R<()> {
             "task" => format!("a {} panel on task pages, and a badge", extension.title),
             other => other.to_string(),
         };
-        let needs = extension
-            .permission
-            .as_ref()
-            .map(|permission| format!(" (needs {}:{})", permission.resource, permission.action))
-            .unwrap_or_default();
         let view = if extension.view.is_empty() {
             &extension.badge
         } else {

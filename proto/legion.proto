@@ -2535,8 +2535,10 @@ service Manager {
   // Lists the UI extensions installed apps register (docs/apps.md, "Views
   // and actions"; docs/ui-architecture.md, "App extensions"): the pages,
   // overview cards, job and node panels, and task badges the SPA draws from
-  // apps' declarative views. Requires `app:read`; the list is filtered to
-  // the apps the caller may read (`names` selector), and to enabled apps.
+  // apps' declarative views, and the apps' sandboxed pages (`ui.pages`,
+  // listed in the `nav` slot with `page` set). Requires `app:read`; the
+  // list is filtered to the apps the caller may read (`names` selector),
+  // and to enabled apps.
   //
   // Each entry the manifest declares with a `permission` is filtered by it,
   // checked as the caller:
@@ -2546,6 +2548,8 @@ service Manager {
   //   who may see it;
   // - without `context`, on any scope ("does the caller hold it
   //   anywhere?"), which is what the sidebar and overview need at login.
+  //   A sandboxed page's permission is always checked this way, as
+  //   GetAppPage checks it.
   //
   // An entry without a permission needs only `app:read` on its app.
   //
@@ -2632,6 +2636,39 @@ service Manager {
   // declaration, and FailedPrecondition carrying the app's own message when
   // the app reports the action failed (HTTP 4xx other than 401, 403, 404).
   rpc InvokeAppAction (InvokeAppActionRequest) returns (InvokeAppActionReply);
+
+  // Fetches one of an app's sandboxed pages (`ui.pages`; docs/apps.md,
+  // "Sandboxed pages"; apps plan §6.5, tier 2): the single-file HTML bundle
+  // the SPA mounts in an `<iframe sandbox="allow-scripts" srcdoc=...>`
+  // under a strict Content-Security-Policy, and the Manager RPCs the page
+  // may call through the SPA's bridge as the viewer.
+  //
+  // Authorized exactly like GetAppView, before anything reaches the app:
+  // 1. `app:read` on the app;
+  // 2. the page must be declared in the app's manifest;
+  // 3. the page's declared `permission`, if any, checked as the caller on
+  //    any scope (pages live in the sidebar, like a `nav` view).
+  //
+  // Only then does the manager forward `GET <bundle>` (default
+  // `/legion/v1/pages/<page>`) to one running allocation of the app's job,
+  // with a viewer assertion whose `legion.io/viewer` claim has `kind =
+  // "page"`, the page's name, and the `nav` slot's empty context. The answer
+  // must be `200` with a `text/html` content type, UTF-8, and at most 1 MiB;
+  // the manager does not sanitize it (a page is code, confined by the SPA's
+  // sandbox and CSP, not by the manager).
+  //
+  // Errors:
+  // - PermissionDenied: the caller lacks `app:read` or the page's
+  //   permission.
+  // - NotFound: no such app, or the app declares no such page (or answered
+  //   404 for it).
+  // - FailedPrecondition: the app is disabled; workload identity is off on
+  //   this manager; the app refused the viewer assertion; or the answer is
+  //   not UTF-8 HTML within 1 MiB (the message names which).
+  // - Unavailable: no allocation of the app's job is running, or its node
+  //   or port cannot be reached (retryable).
+  // - DeadlineExceeded: the app did not answer within 10 seconds.
+  rpc GetAppPage (GetAppPageRequest) returns (GetAppPageReply);
 
   // Lists the auth methods clients may log in with.
   //
@@ -14015,6 +14052,10 @@ message UiExtension {
   uint32 refresh_seconds = 8;
   // The app's one-line description.
   string app_description = 9;
+  // For `nav`: the sandboxed page this entry opens (`ui.pages[].name`),
+  // fetched with GetAppPage; `view` is then empty. The SPA routes it to
+  // `/apps/<app>/pages/<page>`.
+  string page = 10;
 }
 
 // Request payload for ListUiExtensions.
@@ -14120,6 +14161,46 @@ message InvokeAppActionReply {
   bool deduplicated = 3;
   // The inputs the action ran with, defaults filled in, as JSON.
   string inputs_json = 4;
+}
+
+// Request payload for GetAppPage.
+message GetAppPageRequest {
+  // The app's name.
+  string app = 1;
+  // The page's name (`ui.pages[].name`).
+  string page = 2;
+}
+
+// A Manager RPC a sandboxed page may call through the SPA's bridge.
+message AppPageRpc {
+  // The RPC's name, as `proto/legion.proto` spells it (`GetJobInfo`).
+  string method = 1;
+  // Whether the call changes something. The SPA asks the viewer before
+  // every such call, naming the app, the RPC, and its target; reads run
+  // without asking. Classified by what the call does, not by its ACL action.
+  bool mutating = 2;
+}
+
+// Response payload for GetAppPage.
+message GetAppPageReply {
+  // The app's name.
+  string app = 1;
+  // The page's name.
+  string page = 2;
+  // The page's title (`ui.pages[].title`).
+  string title = 3;
+  // The page's single-file HTML bundle, as the app served it (UTF-8, at
+  // most 1 MiB). The SPA prepends its Content-Security-Policy and the
+  // bridge's script, and mounts it in a sandboxed `srcdoc` iframe.
+  string html = 4;
+  // The RPCs the page may call through the bridge (`ui.pages[].rpcs`), as
+  // the viewer. Every bridged call carries the `legion-app-page: <app>/<page>`
+  // header, and the manager refuses one whose RPC is not on this list.
+  repeated AppPageRpc rpcs = 5;
+  // The allocation that answered.
+  int64 allocation_id = 6;
+  // The node it runs on.
+  string node_id = 7;
 }
 
 // === AUTH METHODS & JOIN TOKENS ===

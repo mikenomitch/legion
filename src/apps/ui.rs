@@ -7,7 +7,9 @@
 //! UI port:
 //!
 //! - `GET /legion/v1/views/<view>?<context>`;
-//! - `POST /legion/v1/actions/<action>` with `{ "context", "inputs" }`.
+//! - `POST /legion/v1/actions/<action>` with `{ "context", "inputs" }`;
+//! - `GET /legion/v1/pages/<page>`: a sandboxed page's single-file HTML
+//!   bundle (tier 2), which the SPA mounts in a sandboxed iframe.
 //!
 //! Only the manager calls these, over the worker plane, after it has
 //! authorized the viewer. Every request carries a **viewer assertion** in
@@ -32,9 +34,9 @@
 
 use crate::prelude::*;
 use crate::structs::app_ui::{
-    assertion_audience, assertion_mismatch, validate_view_value, AppView, AssertionKind,
-    AssertionScope, ViewContext, ViewerAssertion, ACTION_PATH_PREFIX, ASSERTION_CLAIM,
-    ASSERTION_TTL_SECS, VIEW_PATH_PREFIX,
+    assertion_audience, assertion_mismatch, page_context, validate_view_value, AppView,
+    AssertionKind, AssertionScope, ViewContext, ViewerAssertion, ACTION_PATH_PREFIX,
+    ASSERTION_CLAIM, ASSERTION_TTL_SECS, MAX_PAGE_BYTES, PAGE_PATH_PREFIX, VIEW_PATH_PREFIX,
 };
 use futures::future::BoxFuture;
 use jsonwebtoken::{decode, decode_header, Algorithm, DecodingKey, Validation};
@@ -116,6 +118,13 @@ pub struct ActionRequest {
     pub viewer: Viewer,
 }
 
+/// A page request, verified: the page's bundle, for this viewer.
+#[derive(Debug, Clone)]
+pub struct PageRequest {
+    pub page: String,
+    pub viewer: Viewer,
+}
+
 /// What an action answers: a message for the viewer, and optionally a
 /// refreshed view.
 #[derive(Debug, Clone, Default)]
@@ -156,6 +165,7 @@ impl std::error::Error for Refused {}
 type ViewHandler = Arc<dyn Fn(ViewRequest) -> BoxFuture<'static, R<AppView>> + Send + Sync>;
 type ActionHandler =
     Arc<dyn Fn(ActionRequest) -> BoxFuture<'static, R<ActionOutcome>> + Send + Sync>;
+type PageHandler = Arc<dyn Fn(PageRequest) -> BoxFuture<'static, R<String>> + Send + Sync>;
 
 /// The views and actions an app serves. Registrations may happen at any
 /// time, also after the port is up.
@@ -163,6 +173,7 @@ type ActionHandler =
 pub struct UiRegistry {
     views: std::sync::RwLock<HashMap<String, ViewHandler>>,
     actions: std::sync::RwLock<HashMap<String, ActionHandler>>,
+    pages: std::sync::RwLock<HashMap<String, PageHandler>>,
 }
 
 impl UiRegistry {
@@ -189,6 +200,26 @@ impl UiRegistry {
         if let Ok(mut actions) = self.actions.write() {
             actions.insert(name.to_string(), handler);
         }
+    }
+
+    /// Serve sandboxed page `name` (`ui.pages`, at its default bundle path
+    /// `/legion/v1/pages/<name>`) from `handler`, which returns the page's
+    /// single-file HTML. The SPA mounts it in a sandboxed iframe under a
+    /// strict CSP: everything it needs (scripts, styles, images as `data:`
+    /// URLs) is inline, and it reaches Legion only through the bridge.
+    pub fn page<F, Fut>(&self, name: &str, handler: F)
+    where
+        F: Fn(PageRequest) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = R<String>> + Send + 'static,
+    {
+        let handler: PageHandler = Arc::new(move |request| Box::pin(handler(request)));
+        if let Ok(mut pages) = self.pages.write() {
+            pages.insert(name.to_string(), handler);
+        }
+    }
+
+    fn page_handler(&self, name: &str) -> Option<PageHandler> {
+        self.pages.read().ok()?.get(name).cloned()
     }
 
     fn view_handler(&self, name: &str) -> Option<ViewHandler> {
@@ -561,11 +592,13 @@ pub struct UiServer {
     requests: AtomicU64,
 }
 
-/// One answer: an HTTP status and a JSON body.
+/// One answer: an HTTP status and a JSON body, or, for a page, HTML.
 #[derive(Debug, Clone)]
 pub struct UiAnswer {
     pub status: u16,
     pub body: Value,
+    /// A page's bundle, served as `text/html` instead of `body`.
+    pub html: Option<String>,
 }
 
 impl UiAnswer {
@@ -573,6 +606,15 @@ impl UiAnswer {
         UiAnswer {
             status,
             body: json!({ "error": message.into() }),
+            html: None,
+        }
+    }
+
+    fn json(body: Value) -> UiAnswer {
+        UiAnswer {
+            status: 200,
+            body,
+            html: None,
         }
     }
 }
@@ -635,6 +677,11 @@ impl UiServer {
                 return UiAnswer::error(405, "actions are invoked with POST");
             }
             (AssertionKind::Action, name)
+        } else if let Some(name) = path.strip_prefix(PAGE_PATH_PREFIX) {
+            if method != "GET" {
+                return UiAnswer::error(405, "pages are fetched with GET");
+            }
+            (AssertionKind::Page, name)
         } else {
             return UiAnswer::error(404, "not found");
         };
@@ -661,6 +708,10 @@ impl UiServer {
                 Ok(context) => (context, None),
                 Err(err) => return UiAnswer::error(400, err),
             },
+            AssertionKind::Page if !query.is_empty() => {
+                return UiAnswer::error(400, "a page request takes no query")
+            }
+            AssertionKind::Page => (page_context(), None),
             AssertionKind::Action => {
                 #[derive(serde::Deserialize)]
                 #[serde(deny_unknown_fields)]
@@ -715,8 +766,36 @@ impl UiServer {
                     }
                 };
                 match checked_view(&view, slot) {
-                    Ok(body) => UiAnswer { status: 200, body },
+                    Ok(body) => UiAnswer::json(body),
                     Err(err) => UiAnswer::error(500, err),
+                }
+            }
+            AssertionKind::Page => {
+                let Some(handler) = self.registry.page_handler(name) else {
+                    return UiAnswer::error(404, format!("this app serves no page {name:?}"));
+                };
+                match handler(PageRequest {
+                    page: name.to_string(),
+                    viewer,
+                })
+                .await
+                {
+                    Ok(html) if html.len() > MAX_PAGE_BYTES => UiAnswer::error(
+                        500,
+                        format!(
+                            "page {name:?} is {} bytes; a page is at most {MAX_PAGE_BYTES}",
+                            html.len()
+                        ),
+                    ),
+                    Ok(html) => UiAnswer {
+                        status: 200,
+                        body: Value::Null,
+                        html: Some(html),
+                    },
+                    Err(err) => {
+                        warn!(page = name, error = %format!("{err:#}"), "A page failed");
+                        UiAnswer::error(500, format!("{err:#}"))
+                    }
                 }
             }
             AssertionKind::Action => {
@@ -757,7 +836,7 @@ impl UiServer {
                         Err(err) => return UiAnswer::error(500, err),
                     }
                 }
-                UiAnswer { status: 200, body }
+                UiAnswer::json(body)
             }
         }
     }
@@ -1079,6 +1158,52 @@ mod tests {
                 .status,
             403
         );
+    }
+
+    /// A page is served as HTML only to an assertion for that page; a view
+    /// assertion, another page's, or a query is refused.
+    #[tokio::test]
+    async fn pages_need_a_page_assertion() {
+        let issuer = issuer();
+        let server = server(&issuer);
+        server.registry.page("console", |request: PageRequest| async move {
+            Ok(format!("<p>hello {}</p>", request.viewer.principal))
+        });
+        let mut claim = assertion(AssertionKind::Page, "console", None);
+        claim.context = page_context();
+        let token = sign(&issuer, "app:fake", Some(&claim), "va_p", 1_000_090, 1_000_150);
+        let page = server
+            .handle_at("GET", "/legion/v1/pages/console", Some(&token), b"", NOW)
+            .await;
+        assert_eq!(page.status, 200, "{:?}", page.body);
+        assert_eq!(page.html.as_deref(), Some("<p>hello user:alice</p>"));
+        // The same assertion for another page, or with a query.
+        let other = server
+            .handle_at("GET", "/legion/v1/pages/admin", Some(&token), b"", NOW)
+            .await;
+        assert_eq!(other.status, 403, "{:?}", other.body);
+        let query = server
+            .handle_at("GET", "/legion/v1/pages/console?slot=job", Some(&token), b"", NOW)
+            .await;
+        assert_eq!(query.status, 400, "{:?}", query.body);
+        // A view assertion does not fetch a page.
+        let view = sign(
+            &issuer,
+            "app:fake",
+            Some(&assertion(AssertionKind::View, "console", None)),
+            "va_q",
+            1_000_090,
+            1_000_150,
+        );
+        let refused = server
+            .handle_at("GET", "/legion/v1/pages/console", Some(&view), b"", NOW)
+            .await;
+        assert_eq!(refused.status, 403, "{:?}", refused.body);
+        assert!(refused.html.is_none());
+        let missing = server
+            .handle_at("GET", "/legion/v1/pages/console", None, b"", NOW)
+            .await;
+        assert_eq!(missing.status, 401);
     }
 
     /// Without a way to verify, nothing is served.

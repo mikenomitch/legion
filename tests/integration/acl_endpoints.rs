@@ -288,6 +288,7 @@ fn endpoint_table() -> Vec<(&'static str, Plane)> {
         ("ListUiExtensions", Plane::Protected("app:read")),
         ("GetAppView", Plane::Protected("app:read")),
         ("InvokeAppAction", Plane::Protected("app:read")),
+        ("GetAppPage", Plane::Protected("app:read")),
     ]
 }
 
@@ -1876,6 +1877,16 @@ async fn call_endpoint(
                     }),
                     inputs_json: String::new(),
                     idempotency_key: None,
+                },
+                token,
+            ))
+            .await
+            .map(|_| ()),
+        "GetAppPage" => svc
+            .get_app_page(req(
+                GetAppPageRequest {
+                    app: FIXTURE_APP.into(),
+                    page: "console".into(),
                 },
                 token,
             ))

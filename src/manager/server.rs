@@ -12026,6 +12026,14 @@ impl Manager for ManagerDaemonService {
         self.invoke_app_action_rpc(request).await
     }
 
+    #[instrument(skip_all, fields(app = %request.get_ref().app, page = %request.get_ref().page))]
+    async fn get_app_page(
+        &self,
+        request: Request<crate::structs::GetAppPageRequest>,
+    ) -> Result<Response<crate::structs::GetAppPageReply>, Status> {
+        self.get_app_page_rpc(request).await
+    }
+
     #[instrument(skip_all, fields(job))]
     async fn revoke_grant(
         &self,

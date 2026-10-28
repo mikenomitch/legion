@@ -1,7 +1,8 @@
-//! App UI extensions, tier 1 (docs/apps.md, "Views and actions"; apps plan
-//! §6.5, calls entry 11): `ListUiExtensions`, `GetAppView`, and
-//! `InvokeAppAction`, the one data path the SPA, `legion app view`, and the
-//! `legion_app_view` MCP tool share.
+//! App UI extensions (docs/apps.md, "Views and actions" and "Sandboxed
+//! pages"; apps plan §6.5, calls entry 11): `ListUiExtensions`, `GetAppView`,
+//! and `InvokeAppAction`, the one data path the SPA, `legion app view`, and
+//! the `legion_app_view` MCP tool share (tier 1), and `GetAppPage`, which
+//! fetches a sandboxed page's bundle for the SPA (tier 2).
 //!
 //! The manager authorizes before anything reaches an app:
 //!
@@ -22,15 +23,16 @@ use super::*;
 use crate::storage::app_store::AppUiAllocation;
 use crate::structs::app::AppRecord;
 use crate::structs::app_ui::{
-    inputs_digest, resolve_inputs, validate_view, validate_view_value, ActionDecl, AppView,
-    AssertionKind, AssertionScope, Slot, SlotEntry, UiPermission, UiSpec, ViewContext,
-    ViewerAssertion, ACTION_PATH_PREFIX, ASSERTION_CLAIM, ASSERTION_TTL_SECS, VIEWER_HEADER,
-    VIEW_PATH_PREFIX,
+    inputs_digest, page_context, page_rpc_kind, resolve_inputs, validate_view,
+    validate_view_value, ActionDecl, AppView, AssertionKind, AssertionScope, PageRpcKind, Slot,
+    SlotEntry, UiPermission, UiSpec, ViewContext, ViewerAssertion, ACTION_PATH_PREFIX,
+    ASSERTION_CLAIM, ASSERTION_TTL_SECS, MAX_PAGE_BYTES, VIEWER_HEADER, VIEW_PATH_PREFIX,
 };
 use crate::structs::{
-    AppActionInfo, AppHttpHeader, AppViewContext, ForwardAppRequestReply, ForwardAppRequestRequest,
-    GetAppViewReply, GetAppViewRequest, InvokeAppActionReply, InvokeAppActionRequest,
-    ListUiExtensionsReply, ListUiExtensionsRequest, UiExtension,
+    AppActionInfo, AppHttpHeader, AppPageRpc, AppViewContext, ForwardAppRequestReply,
+    ForwardAppRequestRequest, GetAppPageReply, GetAppPageRequest, GetAppViewReply,
+    GetAppViewRequest, InvokeAppActionReply, InvokeAppActionRequest, ListUiExtensionsReply,
+    ListUiExtensionsRequest, UiExtension,
 };
 
 /// Allocations a request is tried on before giving up (only when one could
@@ -319,6 +321,7 @@ impl ManagerDaemonService {
     /// port cannot be dialed) moves on to the next, at most
     /// [`FORWARD_ATTEMPTS`] in all; one that reached the app is never sent
     /// twice.
+    #[allow(clippy::too_many_arguments)]
     async fn forward_to_app(
         &self,
         record: &AppRecord,
@@ -327,6 +330,7 @@ impl ManagerDaemonService {
         path: String,
         assertion: String,
         body: Vec<u8>,
+        accept: &str,
     ) -> Result<(ForwardAppRequestReply, AppUiAllocation), Status> {
         let job_id = record.job_id();
         let allocations = self
@@ -354,7 +358,7 @@ impl ManagerDaemonService {
                     },
                     AppHttpHeader {
                         name: "accept".to_string(),
-                        value: "application/json".to_string(),
+                        value: accept.to_string(),
                     },
                     AppHttpHeader {
                         name: "content-type".to_string(),
@@ -497,6 +501,28 @@ impl ManagerDaemonService {
                         permission: entry.permission.as_ref().map(permission_to_proto),
                         refresh_seconds: refresh,
                         app_description: record.manifest.description.clone(),
+                        page: String::new(),
+                    });
+                }
+            }
+            // Sandboxed pages live in the sidebar, after the app's views.
+            // Their permission is checked on any scope, as GetAppPage does.
+            if slot.is_none_or(|slot| slot == Slot::Nav) {
+                for page in &ui.pages {
+                    if !self.ui_permission_allows(&identity, page.permission.as_ref(), None) {
+                        continue;
+                    }
+                    extensions.push(UiExtension {
+                        app: record.name.clone(),
+                        slot: Slot::Nav.as_str().to_string(),
+                        title: page.title.clone(),
+                        icon: page.icon.clone().unwrap_or_default(),
+                        view: String::new(),
+                        badge: String::new(),
+                        permission: page.permission.as_ref().map(permission_to_proto),
+                        refresh_seconds: 0,
+                        app_description: record.manifest.description.clone(),
+                        page: page.name.clone(),
                     });
                 }
             }
@@ -580,7 +606,7 @@ impl ManagerDaemonService {
         let token = self.sign_viewer_assertion(&identity, &assertion)?;
         let path = format!("{VIEW_PATH_PREFIX}{}?{}", resolved.view, context.to_query());
         let (reply, allocation) = self
-            .forward_to_app(&record, &ui, "GET", path, token, Vec::new())
+            .forward_to_app(&record, &ui, "GET", path, token, Vec::new(), "application/json")
             .await?;
         let what = format!("view {:?}", resolved.view);
         if !(200..300).contains(&reply.status) {
@@ -700,7 +726,15 @@ impl ManagerDaemonService {
         let path = format!("{ACTION_PATH_PREFIX}{action_name}");
         let what = format!("action {action_name:?}");
         let outcome = self
-            .forward_to_app(&record, &ui, "POST", path, token, body.into_bytes())
+            .forward_to_app(
+                &record,
+                &ui,
+                "POST",
+                path,
+                token,
+                body.into_bytes(),
+                "application/json",
+            )
             .await
             .and_then(|(reply, allocation)| {
                 if !(200..300).contains(&reply.status) {
@@ -799,5 +833,108 @@ impl ManagerDaemonService {
                 .map_err(|e| map_store_error("Error recording idempotency", e))?;
         }
         Ok(Response::new(reply))
+    }
+
+    pub(super) async fn get_app_page_rpc(
+        &self,
+        request: Request<GetAppPageRequest>,
+    ) -> Result<Response<GetAppPageReply>, Status> {
+        let name = request.get_ref().app.trim().to_string();
+        let identity = self.check_acl(
+            &request,
+            AclResource::App,
+            AclAction::Read,
+            AclScope::app(&name),
+        )?;
+        let page_name = request.into_inner().page.trim().to_string();
+        let (record, ui) = self.load_ui_app(&name)?;
+        let page = ui.page(&page_name).ok_or_else(|| {
+            Status::not_found(format!(
+                "app {name} declares no page {page_name:?} (`legion app view {name}` lists \
+                 what it shows you)"
+            ))
+        })?;
+        let context = page_context();
+        let (scope, namespaces) =
+            self.enforce_ui_permission(&identity, page.permission.as_ref(), &context)?;
+        let assertion = ViewerAssertion {
+            kind: AssertionKind::Page,
+            app: name.clone(),
+            name: page.name.clone(),
+            principal: identity.principal.clone(),
+            accessor: identity.accessor_id.clone(),
+            permission: page.permission.as_ref().map(UiPermission::label),
+            scope,
+            namespaces,
+            context,
+            inputs: None,
+        };
+        let token = self.sign_viewer_assertion(&identity, &assertion)?;
+        let (reply, allocation) = self
+            .forward_to_app(
+                &record,
+                &ui,
+                "GET",
+                page.bundle_path(),
+                token,
+                Vec::new(),
+                "text/html",
+            )
+            .await?;
+        let what = format!("page {:?}", page.name);
+        if !(200..300).contains(&reply.status) {
+            return Err(app_error(&name, &what, &reply));
+        }
+        let media_type = reply
+            .content_type
+            .split(';')
+            .next()
+            .unwrap_or_default()
+            .trim()
+            .to_ascii_lowercase();
+        if media_type != "text/html" {
+            return Err(Status::failed_precondition(format!(
+                "app {name} answered {what} with {:?}; a page is served as text/html",
+                reply.content_type
+            )));
+        }
+        if reply.body.len() > MAX_PAGE_BYTES {
+            return Err(Status::failed_precondition(format!(
+                "app {name} answered {what} with {} bytes; a page is at most {MAX_PAGE_BYTES}",
+                reply.body.len()
+            )));
+        }
+        let html = String::from_utf8(reply.body).map_err(|_| {
+            Status::failed_precondition(format!(
+                "app {name} answered {what} with something that is not UTF-8"
+            ))
+        })?;
+        debug!(
+            app = %name,
+            page = %page.name,
+            principal = %identity.principal,
+            allocation_id = allocation.id,
+            bytes = html.len(),
+            "Served an app page"
+        );
+        let rpcs = page
+            .rpcs
+            .iter()
+            .filter_map(|method| {
+                page_rpc_kind(method).map(|kind| AppPageRpc {
+                    method: method.clone(),
+                    mutating: kind == PageRpcKind::Write,
+                })
+            })
+            .collect();
+        Ok(Response::new(GetAppPageReply {
+            app: name,
+            page: page.name.clone(),
+            title: page.title.clone(),
+            html,
+            rpcs,
+            allocation_id: allocation.id,
+            node_id: allocation.node_id,
+        }))
     }
 }

@@ -760,6 +760,11 @@ pub async fn run_manager_with(
         .layer(cors)
         .layer(GrpcWebLayer::new())
         .layer(crate::manager::telemetry::GrpcMetricsLayer)
+        // A call the SPA makes for an app's sandboxed page is held to the
+        // page's RPC allowlist (docs/apps.md, "Sandboxed pages").
+        .layer(crate::manager::app_page_guard::AppPageGuardLayer::new(
+            store_for_api.clone(),
+        ))
         // Innermost, on native gRPC: a write a follower rejects as
         // not-the-leader is replayed to the leader and the leader's reply
         // returned, so every manager accepts every request.

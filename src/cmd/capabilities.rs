@@ -1249,6 +1249,14 @@ pub fn catalog() -> Vec<Capability> {
             mutates: true,
             read_only_safe: false,
         },
+        Capability {
+            name: "app.page",
+            cli: "legion app view <APP> (lists the app's sandboxed pages; they open in the UI)",
+            grpc: Some("Manager/GetAppPage"),
+            summary: "Fetch an app's sandboxed page (ui.pages): its single-file HTML bundle and the RPCs it may call through the UI's bridge as you, checked against the page's declared permission before the app is asked. For the UI, which mounts it in a sandboxed iframe.",
+            mutates: false,
+            read_only_safe: true,
+        },
         // --- Service discovery ---
         Capability {
             name: "service.list",
