@@ -57,6 +57,16 @@ pub struct AppJobAllocations {
     pub nodes: Vec<String>,
 }
 
+/// One live allocation of an app's job: where a view or action request can
+/// be delivered (docs/apps.md, "Views and actions").
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AppUiAllocation {
+    pub id: i64,
+    pub node_id: String,
+    /// Its latest health report says healthy.
+    pub healthy: bool,
+}
+
 fn invalid(message: String) -> anyhow::Error {
     anyhow::Error::new(StorageError::InvalidInput { message })
 }
@@ -390,6 +400,32 @@ impl Store {
         }
         counts.nodes.sort();
         Ok(counts)
+    }
+}
+
+impl Store {
+    /// Job `job_id`'s live allocations (not complete, failed, or lost),
+    /// healthy ones first, then newest first: the order a view request
+    /// tries them in.
+    #[instrument(err, skip_all, fields(job_id))]
+    pub fn app_ui_allocations(&self, job_id: &str) -> R<Vec<AppUiAllocation>> {
+        let conn = self.read_connection()?;
+        let mut stmt = conn.prepare(
+            "SELECT a.id, a.node_id, COALESCE(ah.healthy, 0) FROM allocation a
+             INNER JOIN job_config jc ON jc.id = a.job_config_id
+             INNER JOIN job j ON j.id = jc.job_id
+             LEFT JOIN allocation_health ah ON ah.allocation_id = a.id
+             WHERE j.name = ?1 AND a.status NOT IN ('complete', 'failed', 'lost')
+             ORDER BY COALESCE(ah.healthy, 0) DESC, a.id DESC;",
+        )?;
+        let rows = stmt.query_map([job_id], |row| {
+            Ok(AppUiAllocation {
+                id: row.get(0)?,
+                node_id: row.get(1)?,
+                healthy: row.get::<_, i64>(2)? != 0,
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
 }
 

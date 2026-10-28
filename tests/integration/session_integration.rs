@@ -357,6 +357,13 @@ impl Worker for FakeNode {
         Err(Status::unimplemented("fake node"))
     }
 
+    async fn forward_app_request(
+        &self,
+        _request: Request<legion::structs::ForwardAppRequestRequest>,
+    ) -> Result<Response<legion::structs::ForwardAppRequestReply>, Status> {
+        Err(Status::unimplemented("fake node"))
+    }
+
     type ExecTaskStream = tokio_stream::wrappers::ReceiverStream<Result<ExecServerFrame, Status>>;
 
     async fn exec_task(
