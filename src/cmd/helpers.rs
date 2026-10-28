@@ -283,33 +283,44 @@ pub fn load_cli_token(address: &str) -> (Option<String>, TokenSource) {
 /// overwritten, or would replace the identity the task's other clients read.
 pub fn save_cli_token(address: &str, secret: &str) -> R<std::path::PathBuf> {
     let path = cli_token_path(address);
-    if let Some(identity_file) = std::env::var_os(
-        crate::structs::workload_identity::IDENTITY_TOKEN_FILE_ENV,
-    )
-    .map(std::path::PathBuf::from)
-    {
-        let same = |a: &std::path::Path, b: &std::path::Path| {
-            a == b
-                || matches!(
-                    (std::fs::canonicalize(a), std::fs::canonicalize(b)),
-                    (Ok(a), Ok(b)) if a == b
-                )
-        };
-        if same(&path, &identity_file) {
-            bail!(
-                "refusing to store the login token at {}: it is this task's workload identity \
-                 token file ({}), which the worker refreshes. Point LEGION_TOKEN_FILE somewhere \
-                 else, or leave it unset",
-                path.display(),
-                crate::structs::workload_identity::IDENTITY_TOKEN_FILE_ENV
-            );
-        }
-    }
+    refuse_identity_token_file(
+        &path,
+        std::env::var_os(crate::structs::workload_identity::IDENTITY_TOKEN_FILE_ENV)
+            .map(std::path::PathBuf::from)
+            .as_deref(),
+    )?;
     if let Some(parent) = path.parent() {
         crate::util::create_private_dir_all(parent)?;
     }
     crate::util::write_private_file(&path, format!("{secret}\n").as_bytes())?;
     Ok(path)
+}
+
+/// Refuse to store a login token at `path` when it is the task's identity
+/// token file (`identity_file`, from `LEGION_IDENTITY_TOKEN_FILE`), by name
+/// or through a link.
+fn refuse_identity_token_file(
+    path: &std::path::Path,
+    identity_file: Option<&std::path::Path>,
+) -> R<()> {
+    let Some(identity_file) = identity_file else {
+        return Ok(());
+    };
+    let same = path == identity_file
+        || matches!(
+            (std::fs::canonicalize(path), std::fs::canonicalize(identity_file)),
+            (Ok(a), Ok(b)) if a == b
+        );
+    if same {
+        bail!(
+            "refusing to store the login token at {}: it is this task's workload identity token \
+             file ({}), which the worker refreshes. Point LEGION_TOKEN_FILE somewhere else, or \
+             leave it unset",
+            path.display(),
+            crate::structs::workload_identity::IDENTITY_TOKEN_FILE_ENV
+        );
+    }
+    Ok(())
 }
 
 /// What the CLI presented to the manager, for the hint on an
@@ -842,6 +853,60 @@ mod tests {
         // Whatever the input, the key stays one path component.
         let odd = token_file_key("../../etc/passwd");
         assert!(!odd.contains('/'), "{odd}");
+    }
+
+    #[test]
+    fn unix_addresses_name_a_socket_and_a_token_file_of_their_own_test() {
+        assert_eq!(
+            unix_socket_path("unix:///alloc/task/secrets/legion.sock"),
+            Some(std::path::PathBuf::from("/alloc/task/secrets/legion.sock"))
+        );
+        assert_eq!(
+            unix_socket_path("unix:legion.sock"),
+            Some(std::path::PathBuf::from("legion.sock"))
+        );
+        assert_eq!(unix_socket_path("unix://"), None);
+        assert_eq!(unix_socket_path("http://127.0.0.1:4747"), None);
+        let key = token_file_key("unix:///alloc/task/secrets/legion.sock");
+        assert_eq!(key, "unix__alloc_task_secrets_legion.sock");
+        assert!(!key.contains('/'), "{key}");
+        // A client for one opens nothing until its first call.
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        runtime.block_on(async {
+            connect_manager_client_at(
+                "unix:///nonexistent/legion.sock",
+                ClientTimeouts {
+                    connect: Some(Duration::from_secs(1)),
+                    request: None,
+                },
+            )
+            .expect("a unix client builds lazily");
+        });
+    }
+
+    /// `legion login` inside a task never writes over the workload's
+    /// identity token file, by name or through a link.
+    #[test]
+    fn login_never_stores_over_the_identity_token_file_test() -> R<()> {
+        let dir = tempfile::tempdir_in(crate::test_scratch::root())?;
+        let identity = dir.path().join("legion.token");
+        std::fs::write(&identity, "identity")?;
+        let link = dir.path().join("token-link");
+        std::os::unix::fs::symlink(&identity, &link)?;
+        let refused = refuse_identity_token_file(&identity, Some(&identity))
+            .expect_err("the identity token file itself");
+        assert!(
+            refused.to_string().contains("LEGION_IDENTITY_TOKEN_FILE"),
+            "{refused}"
+        );
+        assert!(refuse_identity_token_file(&link, Some(&identity)).is_err());
+        assert!(refuse_identity_token_file(&dir.path().join("login"), Some(&identity)).is_ok());
+        assert!(refuse_identity_token_file(&identity, None).is_ok());
+        assert_eq!(std::fs::read_to_string(&identity)?, "identity");
+        Ok(())
     }
 
     #[test]

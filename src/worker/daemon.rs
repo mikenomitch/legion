@@ -623,7 +623,11 @@ async fn run_worker_with_manager(join: WorkerJoin, name_override: Option<&str>) 
                 .file_delivery_base(allocation.id, &task.name, &task.runtime);
             // The previous process's socket died with it; serve a new one
             // at the same path, which its first re-issue gives a token.
-            if task.identities.iter().any(|identity| identity.is_control_plane()) {
+            if task
+                .identities
+                .iter()
+                .any(|identity| identity.is_control_plane())
+            {
                 identity_manager.serve_api_socket(allocation.id, delivery_base.as_ref(), None);
             }
             let prepared = task

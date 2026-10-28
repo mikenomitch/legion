@@ -1855,6 +1855,121 @@ async fn anonymous_is_denied_on_every_protected_endpoint() -> R<()> {
     Ok(())
 }
 
+/// A node's `namespaces` restriction and `legion.role` come from its
+/// registration's grant, never from what the worker reports (apps plan
+/// calls entry 19): a join token's worker type, the attributes a manager
+/// pinned on its own in-process worker's token, or, on a re-registration
+/// with the node's token, what the node registered with.
+#[tokio::test]
+async fn registration_pins_namespaces_and_role_test() -> R<()> {
+    let store = setup_store()?;
+    seed_fixtures(&store)?;
+    store.insert_worker_type(&WorkerConfig {
+        name: "ci".into(),
+        pool: "ci".into(),
+        namespaces: vec!["ci-*".into()],
+        ..Default::default()
+    })?;
+    let authenticator = enabled_authenticator();
+    let (_, admin) = authenticator
+        .mint_initial_management_token(&store, None)
+        .map_err(|s| anyhow!(s.to_string()))?
+        .expect("a fresh store has no management token");
+    let svc = ManagerDaemonService::with_acl(store.clone(), authenticator.clone());
+    let attrs = |node: &str| -> R<serde_json::Value> { Ok(store.get_node(node)?.config_attrs) };
+
+    // A forged registration through a `ci` token: the restriction and role
+    // it reports are replaced by the type's; other attributes stay.
+    let created = svc
+        .create_join_token(req(
+            CreateJoinTokenRequest {
+                worker_type: "ci".into(),
+                ttl: Some("1h".into()),
+                description: String::new(),
+            },
+            Some(&admin),
+        ))
+        .await?
+        .into_inner();
+    let secret = legion::structs::token::JoinToken::decode(&created.token)?.secret;
+    let forged = serde_json::json!({
+        "namespaces": ["*", "legion-*"],
+        "legion.role": "manager",
+        "region": "eu",
+    });
+    let registered = svc
+        .worker_register(req(
+            WorkerRegisterRequest {
+                name: "ci-1".into(),
+                pool: "ci".into(),
+                config_attrs: forged.to_string(),
+                fingerprint_attrs: "{}".into(),
+                health_checks: "[]".into(),
+                join_token: Some(secret),
+                ..Default::default()
+            },
+            None,
+        ))
+        .await?
+        .into_inner();
+    let ci = attrs("ci-1")?;
+    assert_eq!(ci["namespaces"], serde_json::json!(["ci-*"]), "{ci}");
+    assert!(ci.get("legion.role").is_none(), "{ci}");
+    assert_eq!(ci["region"], "eu", "{ci}");
+
+    // Re-registering with the node's token keeps what it registered with,
+    // whatever it reports now.
+    let node_token = registered.node_token.expect("a node token");
+    svc.worker_register(req(
+        WorkerRegisterRequest {
+            name: "ci-1".into(),
+            pool: "ci".into(),
+            config_attrs: "{}".into(),
+            fingerprint_attrs: "{}".into(),
+            health_checks: "[]".into(),
+            ..Default::default()
+        },
+        Some(&node_token),
+    ))
+    .await?;
+    assert_eq!(attrs("ci-1")?["namespaces"], serde_json::json!(["ci-*"]));
+
+    // A manager's own in-process worker: its token pins the manager's
+    // settings, and a registration reporting none still gets them.
+    let pinned = serde_json::json!({ "namespaces": ["legion-system"], "legion.role": "manager" });
+    let (_, composite) = authenticator
+        .mint_local_worker_join_token(
+            &store,
+            "http://127.0.0.1:4747",
+            "default",
+            Some(std::time::Duration::from_secs(60)),
+            "system worker",
+            &pinned,
+        )
+        .map_err(|s| anyhow!(s.to_string()))?;
+    svc.worker_register(req(
+        WorkerRegisterRequest {
+            name: "legion-system-1".into(),
+            pool: "default".into(),
+            config_attrs: "{}".into(),
+            fingerprint_attrs: "{}".into(),
+            health_checks: "[]".into(),
+            join_token: Some(legion::structs::token::JoinToken::decode(&composite)?.secret),
+            ..Default::default()
+        },
+        None,
+    ))
+    .await?;
+    let system = attrs("legion-system-1")?;
+    assert_eq!(
+        system["namespaces"],
+        serde_json::json!(["legion-system"]),
+        "{system}"
+    );
+    assert_eq!(system["legion.role"], "manager", "{system}");
+    Ok(())
+}
+
 /// End-to-end worker join flow with ACLs enforced: a join token admits a
 /// worker, registration mints a node token for heartbeats, re-registration
 /// rotates it, and revoking the join token closes the door.

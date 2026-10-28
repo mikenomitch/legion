@@ -1386,6 +1386,66 @@ mod tests {
         id.validate("api", false).unwrap();
     }
 
+    /// The `legion` identity needs no delivery of its own: its token always
+    /// goes to `$LEGION_SECRETS_DIR/legion.token`. It alone may declare
+    /// `permissions` and `policies`, which validate like policy rules.
+    #[test]
+    fn control_plane_identity_takes_permissions_and_needs_no_delivery_test() {
+        let rules: Vec<crate::structs::acl::AclRule> = serde_json::from_value(serde_json::json!([
+            { "resources": ["kv"], "actions": ["read", "write"], "paths": ["certs/*"] },
+        ]))
+        .unwrap();
+        let legion = WorkloadIdentity {
+            name: CONTROL_PLANE_IDENTITY_NAME.into(),
+            permissions: rules.clone(),
+            policies: vec!["cert-writer".into()],
+            ..Default::default()
+        };
+        legion.validate("api", false).unwrap();
+        assert!(legion.is_delivered());
+        let delivered = legion.clone().with_default_delivery();
+        assert_eq!(
+            delivered.file.as_ref().map(|file| file.path.as_str()),
+            Some("secrets/legion.token")
+        );
+        // A declared file is kept.
+        let declared = identity(CONTROL_PLANE_IDENTITY_NAME).with_default_delivery();
+        assert_eq!(
+            declared.file.as_ref().map(|file| file.path.as_str()),
+            Some("/var/run/legion/identity/legion/token")
+        );
+        // Any other identity is unchanged, and may not ask.
+        assert!(identity("aws").with_default_delivery() == identity("aws"));
+        let mut aws = identity("aws");
+        aws.permissions = rules;
+        let err = aws.validate("api", false).unwrap_err();
+        assert!(err.to_string().contains("only the reserved"), "{err}");
+
+        // Rules are checked as `legion acl policy apply` checks them.
+        let mut bad = legion.clone();
+        bad.permissions = serde_json::from_value(serde_json::json!([
+            { "resources": ["job"], "actions": ["write"] },
+        ]))
+        .unwrap();
+        let err = bad.validate("api", false).unwrap_err();
+        assert!(
+            err.to_string().contains("must say which namespaces"),
+            "{err}"
+        );
+        let mut bad = legion.clone();
+        bad.permissions = serde_json::from_value(serde_json::json!([
+            { "resources": ["nope"], "actions": ["read"] },
+        ]))
+        .unwrap();
+        assert!(bad.validate("api", false).is_err());
+        // Policy names: none empty, none twice, no grant references.
+        for policies in [vec![""], vec!["a", "a"], vec!["grant:alloc/1"]] {
+            let mut bad = legion.clone();
+            bad.policies = policies.iter().map(|name| name.to_string()).collect();
+            assert!(bad.validate("api", false).is_err(), "{policies:?}");
+        }
+    }
+
     #[test]
     fn duplicate_file_delivery_target_rejected() {
         let mut a = identity("aws");

@@ -46,9 +46,9 @@ use crate::structs::workload_identity::{
     ChangeMode, WorkloadIdentity, IDENTITY_TOKEN_FILE_ENV, MANAGER_ADDR_ENV, SECRETS_DIR_ENV,
     SECRETS_SUBDIR,
 };
-use crate::worker::api_socket::{AllocationSocket, ApiSocketContext};
 use crate::structs::{IssueWorkloadIdentityTokenRequest, TaskAllocation};
 use crate::util::random_string;
+use crate::worker::api_socket::{AllocationSocket, ApiSocketContext};
 use crate::worker::task_manager::WorkerTaskManager;
 
 use rand::Rng;
@@ -279,7 +279,10 @@ impl WorkerIdentityManager {
             .expect("identity api sockets lock")
             .remove(&alloc_id);
         if removed.is_some() {
-            debug!(allocation_id = alloc_id, "Stopped the allocation's API socket");
+            debug!(
+                allocation_id = alloc_id,
+                "Stopped the allocation's API socket"
+            );
         }
     }
 
@@ -625,7 +628,11 @@ pub fn ambient_env(
             .display()
             .to_string(),
     )];
-    if let Some(file) = identity.file.as_ref().filter(|file| !file.path.trim().is_empty()) {
+    if let Some(file) = identity
+        .file
+        .as_ref()
+        .filter(|file| !file.path.trim().is_empty())
+    {
         let declared = Path::new(file.path.trim());
         let in_task = if declared.is_absolute() {
             declared.to_path_buf()
@@ -925,7 +932,10 @@ fn refresh_delay(expires_at: u64, now: u64) -> Duration {
 
 /// The long-running refresh loop for one identity on one allocation. It
 /// wakes at about half the token's remaining TTL, or at once when the
-/// allocation's identity epoch rises (`epoch`).
+/// allocation's identity epoch rises (`epoch`). The `legion` identity's
+/// loop also hands each fresh token to the allocation's API socket
+/// (`socket_token`).
+#[allow(clippy::too_many_arguments)]
 async fn refresh_loop(
     issuer: Arc<dyn TokenIssuer>,
     alloc_id: i64,
@@ -1518,6 +1528,142 @@ mod tests {
         #[cfg(unix)]
         assert_eq!(mode_of(&fallback), 0o400);
         fs::remove_dir_all(fallback.parent().unwrap().parent().unwrap()).ok();
+        Ok(())
+    }
+
+    fn legion_allocation(alloc_id: i64, runtime: &str, env: Value) -> R<TaskAllocation> {
+        let legion = WorkloadIdentity {
+            name: "legion".into(),
+            permissions: serde_json::from_value(json!([
+                { "resources": ["kv"], "actions": ["read"], "paths": ["certs/*"] },
+            ]))?,
+            ..Default::default()
+        };
+        Ok(TaskAllocation {
+            allocation_id: alloc_id,
+            job_id: "job".into(),
+            job_config_id: "jc".into(),
+            node_id: "node-1".into(),
+            task_config_id: 1,
+            task_name: "api".into(),
+            task_runtime: runtime.into(),
+            task_config: json!({ "command": ["sleep", "1"], "env": env }).to_string(),
+            task_identities: serde_json::to_string(&[legion])?,
+            ..Default::default()
+        })
+    }
+
+    /// The `legion` identity with no delivery of its own: its token lands
+    /// in the task's secrets directory, and the task's env says where, in
+    /// the task's own view, without overriding what the job set itself.
+    #[tokio::test]
+    async fn the_legion_identity_gets_a_token_file_and_ambient_env_test() -> R<()> {
+        let dir = tempfile::tempdir_in(crate::test_scratch::root())?;
+        let manager = Arc::new(WorkerIdentityManager::new(FakeIssuer::new(900)));
+
+        // `exec`: the task sees host paths.
+        let task_dir = dir.path().join("exec-task");
+        let mut allocation = legion_allocation(41, "exec", json!({}))?;
+        let base = FileDeliveryBase {
+            in_task_root: None,
+            host_task_dir: task_dir.clone(),
+            host_sockets: true,
+        };
+        let prepared = manager
+            .prepare_task_allocation(&mut allocation, Some(base))
+            .await?;
+        assert_eq!(prepared.len(), 1);
+        let token = task_dir.join("secrets/legion.token");
+        assert!(fs::read_to_string(&token)?.starts_with("tok-"));
+        #[cfg(unix)]
+        assert_eq!(mode_of(&token), 0o400);
+        let config: Value = serde_json::from_str(&allocation.task_config)?;
+        let env = &config["env"];
+        assert_eq!(env["LEGION_SECRETS_DIR"], json!(task_dir.join("secrets")));
+        assert_eq!(env["LEGION_IDENTITY_TOKEN_FILE"], json!(token));
+        // No socket context on this worker: no address.
+        assert!(env.get("LEGION_ADDR").is_none(), "{env}");
+        assert!(env.get("LEGION_TOKEN_FILE").is_none(), "{env}");
+
+        // `container`: the in-task view of the same files, and a job's own
+        // setting wins.
+        let task_dir = dir.path().join("container-task");
+        let mut allocation =
+            legion_allocation(42, "container", json!({ "LEGION_SECRETS_DIR": "/mine" }))?;
+        let base = FileDeliveryBase {
+            in_task_root: Some("/legion/task"),
+            host_task_dir: task_dir.clone(),
+            host_sockets: true,
+        };
+        manager
+            .prepare_task_allocation(&mut allocation, Some(base))
+            .await?;
+        assert!(task_dir.join("secrets/legion.token").exists());
+        let config: Value = serde_json::from_str(&allocation.task_config)?;
+        assert_eq!(config["env"]["LEGION_SECRETS_DIR"], "/mine");
+        assert_eq!(
+            config["env"]["LEGION_IDENTITY_TOKEN_FILE"],
+            "/legion/task/secrets/legion.token"
+        );
+        Ok(())
+    }
+
+    /// With a socket context, the allocation gets its API socket and
+    /// `LEGION_ADDR` points at it; stopping the allocation removes it. A
+    /// sandbox (which cannot reach a host socket) gets the token file only.
+    #[tokio::test]
+    async fn the_legion_identity_gets_an_api_socket_test() -> R<()> {
+        let dir = tempfile::tempdir_in(crate::test_scratch::root())?;
+        let context = ApiSocketContext {
+            channel: tonic::transport::Endpoint::from_static("http://127.0.0.1:9").connect_lazy(),
+            managers: None,
+            peer_check: crate::worker::api_socket::PeerCheck::FileMode,
+        };
+        let manager =
+            Arc::new(WorkerIdentityManager::new(FakeIssuer::new(900)).with_api_sockets(context));
+        let task_dir = dir.path().join("task");
+        let mut allocation = legion_allocation(43, "exec", json!({}))?;
+        let base = FileDeliveryBase {
+            in_task_root: None,
+            host_task_dir: task_dir.clone(),
+            host_sockets: true,
+        };
+        manager
+            .prepare_task_allocation(&mut allocation, Some(base))
+            .await?;
+        let socket = task_dir.join("secrets/legion.sock");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::FileTypeExt;
+            assert!(fs::metadata(&socket)?.file_type().is_socket());
+        }
+        let config: Value = serde_json::from_str(&allocation.task_config)?;
+        assert_eq!(
+            config["env"]["LEGION_ADDR"],
+            json!(format!("unix://{}", socket.display()))
+        );
+        manager.stop(43);
+        assert!(!socket.exists());
+
+        let sandbox_dir = dir.path().join("sandbox-task/identity");
+        fs::create_dir_all(dir.path().join("sandbox-task"))?;
+        let mut allocation = legion_allocation(44, "sandbox", json!({}))?;
+        let base = FileDeliveryBase {
+            in_task_root: Some("/legion/identity"),
+            host_task_dir: sandbox_dir.clone(),
+            host_sockets: false,
+        };
+        manager
+            .prepare_task_allocation(&mut allocation, Some(base))
+            .await?;
+        assert!(sandbox_dir.join("secrets/legion.token").exists());
+        assert!(!sandbox_dir.join("secrets/legion.sock").exists());
+        let config: Value = serde_json::from_str(&allocation.task_config)?;
+        assert!(config["env"].get("LEGION_ADDR").is_none());
+        assert_eq!(
+            config["env"]["LEGION_IDENTITY_TOKEN_FILE"],
+            "/legion/identity/secrets/legion.token"
+        );
         Ok(())
     }
 

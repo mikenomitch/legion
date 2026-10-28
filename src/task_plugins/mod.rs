@@ -1306,9 +1306,15 @@ pub fn validate_job_config(config: &JobConfig) -> R<()> {
             // The job/group/task names become the OIDC `sub` components, so
             // constrain their charset to keep distinct workloads distinct (see
             // validate_subject_field). Only enforced for identity-declaring
-            // tasks so other jobs keep their naming freedom.
+            // tasks so other jobs keep their naming freedom. The job's `sub`
+            // component is its bare name: the namespace is a component of
+            // its own, and the `/` in a canonical id (`team-a/web`) is never
+            // rendered.
             use crate::structs::workload_identity::validate_subject_field;
-            validate_subject_field("job name", &config.name)?;
+            validate_subject_field(
+                "job name",
+                crate::structs::namespace::job_name(&config.name),
+            )?;
             validate_subject_field(&format!("task {} group", task.name), &task.group)?;
             validate_subject_field(&format!("task {} name", task.name), &task.name)?;
 

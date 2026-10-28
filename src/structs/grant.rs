@@ -201,7 +201,9 @@ pub fn resource_named(name: &str) -> Option<AclResource> {
         AclResource::Snapshot,
         AclResource::Namespace,
     ];
-    ALL.iter().copied().find(|resource| resource.as_str() == name)
+    ALL.iter()
+        .copied()
+        .find(|resource| resource.as_str() == name)
 }
 
 fn expand_resources(rule: &AclRule) -> Vec<AclResource> {
@@ -217,9 +219,11 @@ fn expand_resources(rule: &AclRule) -> Vec<AclResource> {
         .collect()
 }
 
+/// `write` first: when both are missing, the error names the one that
+/// matters more.
 fn expand_actions(rule: &AclRule) -> Vec<AclAction> {
     let mut actions = Vec::new();
-    for action in [AclAction::Read, AclAction::Write] {
+    for action in [AclAction::Write, AclAction::Read] {
         if rule
             .actions
             .iter()
@@ -404,8 +408,7 @@ fn holds_deny_on(rules: &[AclRule], resource: AclResource) -> bool {
 fn reserved_is_why(rules: &[AclRule], atom: &Atom<'_>) -> bool {
     let reserved_namespace =
         matches!(&atom.namespace, Pattern::Glob(p) if p.starts_with(RESERVED_NAMESPACE_PREFIX));
-    let reserved_path =
-        matches!(&atom.path, Pattern::Glob(p) if p.starts_with(RESERVED_KV_PREFIX));
+    let reserved_path = matches!(&atom.path, Pattern::Glob(p) if p.starts_with(RESERVED_KV_PREFIX));
     if !reserved_namespace && !reserved_path {
         return false;
     }
@@ -647,7 +650,7 @@ mod grant_test {
             &requested(r#"[{"resources":["kv"],"actions":["read","write"],"paths":["certs/*"]}]"#),
         )
         .expect("not held");
-        assert_eq!(miss.what, "kv:read on certs/*");
+        assert_eq!(miss.what, "kv:write on certs/*");
         assert_eq!(miss.reason, UncoveredReason::NotHeld);
 
         let miss = first_uncovered(

@@ -103,10 +103,6 @@ use crate::structs::{
     UpsertAclPolicyRequest, UpsertAclUserReply, UpsertAclUserRequest, WhoAmIReply, WhoAmIRequest,
 };
 use crate::structs::{
-    JobGrant, ListGrantsReply, ListGrantsRequest, RevokeGrantReply, RevokeGrantRequest,
-    TaskGrantInfo,
-};
-use crate::structs::{
     BackupEncryptionInfo, GetKeyringStatusReply, GetKeyringStatusRequest, KeyringKeyInfo,
     KeyringRewrapProgress, ResetKeyringReply, ResetKeyringRequest, RewrapKvReply, RewrapKvRequest,
     RewrapRootKeyReply, RewrapRootKeyRequest, RotateDataKeyReply, RotateDataKeyRequest,
@@ -115,6 +111,10 @@ use crate::structs::{
     DeleteNetPluginReply, DeleteNetPluginRequest, GetNetPluginReply, GetNetPluginRequest,
     GetNetPluginStatusReply, GetNetPluginStatusRequest, ListNetPluginsReply, ListNetPluginsRequest,
     UpsertNetPluginReply, UpsertNetPluginRequest,
+};
+use crate::structs::{
+    JobGrant, ListGrantsReply, ListGrantsRequest, RevokeGrantReply, RevokeGrantRequest,
+    TaskGrantInfo,
 };
 use crate::task_plugins::validate_job_config;
 use crate::tracing_util::{o11y_enabled, read_recent_observability};
@@ -3048,7 +3048,10 @@ impl ManagerDaemonService {
             RegistrationGrant::Unrestricted => return Ok(reported.to_string()),
             RegistrationGrant::JoinToken { record, .. } => match &record.pinned_attrs {
                 Some(raw) => serde_json::from_str(raw).map_err(|e| {
-                    Status::internal(format!("join token {} pins unreadable attributes: {e}", record.id))
+                    Status::internal(format!(
+                        "join token {} pins unreadable attributes: {e}",
+                        record.id
+                    ))
                 })?,
                 None => {
                     let worker_type = self
@@ -8869,7 +8872,8 @@ impl Manager for ManagerDaemonService {
         let node_id = request.name.clone();
         self.enforce_registration_grant(&grant, None, Some((&node_id, &request.pool)))?;
         self.enforce_fleet_claim(&grant, &node_id, &request.config_attrs)?;
-        request.config_attrs = self.pin_registration_attrs(&grant, &node_id, &request.config_attrs)?;
+        request.config_attrs =
+            self.pin_registration_attrs(&grant, &node_id, &request.config_attrs)?;
 
         // Protocol-version handshake (see docs/upgrades.md): accept workers
         // at or below our protocol version, warn on pre-versioning workers

@@ -2279,6 +2279,7 @@ impl WorkerTaskManager {
         }
         let plugin = self.registry.plugin(runtime)?;
         let mut host = task_dir_in(&self.alloc_dir(allocation_id), task_name);
+        self.ensure_task_dir(allocation_id, task_name, &host);
         let Some(root) = plugin.file_delivery_root() else {
             // The host's own filesystem: an absolute path is the real path,
             // and a relative one is below the task directory.
@@ -2302,6 +2303,31 @@ impl WorkerTaskManager {
             host_task_dir: host,
             host_sockets,
         })
+    }
+
+    /// Make the allocation's task directory, owner-only, when it does not
+    /// exist yet. Identity tokens and the API socket are delivered before
+    /// the task's first launch makes it ([`Self::prepare_instance`] applies
+    /// the same modes then), and nothing delivered may sit in a directory
+    /// other users can reach, even for that moment.
+    fn ensure_task_dir(&self, allocation_id: i64, task_name: &str, task_dir: &std::path::Path) {
+        if task_dir.is_dir() || !crate::structs::job::is_safe_path_component(task_name) {
+            return;
+        }
+        let alloc_dir = self.alloc_dir(allocation_id);
+        let made = std::fs::create_dir_all(task_dir)
+            .map_err(anyhow::Error::from)
+            .and_then(|()| crate::util::restrict_dir_to_traverse_only(&self.alloc_root))
+            .and_then(|()| crate::util::restrict_dir_to_owner(&alloc_dir))
+            .and_then(|()| crate::util::restrict_dir_to_owner(task_dir));
+        if let Err(err) = made {
+            warn!(
+                allocation_id,
+                dir = %task_dir.display(),
+                error = ?err,
+                "Failed to prepare the task directory for identity delivery"
+            );
+        }
     }
 
     /// Root of per-allocation directories (`<state>/allocs/`).

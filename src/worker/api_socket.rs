@@ -262,8 +262,8 @@ impl Proxy {
         let (mut parts, body) = request.into_parts();
         if !parts.headers.contains_key(http::header::AUTHORIZATION) {
             let token = self.token.read().ok().and_then(|token| token.clone());
-            if let Some(value) = token
-                .and_then(|token| http::HeaderValue::from_str(&format!("Bearer {token}")).ok())
+            if let Some(value) =
+                token.and_then(|token| http::HeaderValue::from_str(&format!("Bearer {token}")).ok())
             {
                 parts.headers.insert(http::header::AUTHORIZATION, value);
             }
@@ -362,8 +362,16 @@ mod api_socket_test {
     #[test]
     fn only_the_allocations_own_leaf_is_admitted_test() {
         assert!(in_allocation_leaf("/legion/share/legion-7", "legion", 7));
-        assert!(in_allocation_leaf("/legion/reserve/legion-7", "/legion/", 7));
-        assert!(in_allocation_leaf("/legion/share/legion-7/sub", "legion", 7));
+        assert!(in_allocation_leaf(
+            "/legion/reserve/legion-7",
+            "/legion/",
+            7
+        ));
+        assert!(in_allocation_leaf(
+            "/legion/share/legion-7/sub",
+            "legion",
+            7
+        ));
         // Another allocation, a longer id with the same prefix, the parent
         // itself, and a different parent are all refused.
         assert!(!in_allocation_leaf("/legion/share/legion-8", "legion", 7));

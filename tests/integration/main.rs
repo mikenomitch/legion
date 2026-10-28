@@ -27,6 +27,7 @@ mod support;
 
 mod acl_default_on;
 mod acl_endpoints;
+mod api_socket;
 mod apple_container_idle;
 mod archive_integration;
 mod artifact_staging_integration;
@@ -43,6 +44,7 @@ mod fork_integration;
 mod gang_scheduling;
 mod gated_container_default;
 mod gated_sandbox_default;
+mod grants;
 mod heartbeat_scale_benchmark;
 mod index_truncation_spread;
 mod instance_scale_measure;

@@ -505,14 +505,7 @@ impl Authenticator {
         ttl: Option<Duration>,
         description: &str,
     ) -> Result<(JoinTokenInfo, String), Status> {
-        self.mint_join_token_with(
-            store,
-            advertise_addr,
-            worker_type,
-            ttl,
-            description,
-            None,
-        )
+        self.mint_join_token_with(store, advertise_addr, worker_type, ttl, description, None)
     }
 
     /// [`Self::mint_join_token`] for a manager's own in-process worker: on a
