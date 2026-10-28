@@ -61,7 +61,8 @@ import Raft from './pages/Raft'
 import Templates from './pages/Templates'
 import TemplateDetail from './pages/details/TemplateDetail'
 import AppPage from './pages/AppPage'
-import { appPagePath, uiExtensions } from './utils/appViews'
+import AppSandboxPage from './pages/AppSandboxPage'
+import { navEntryPath, uiExtensions } from './utils/appViews'
 
 // The developer tools carry the heaviest code (the API Explorer ships the
 // generated proto sources as text for its docs), so they load on first
@@ -315,14 +316,14 @@ const Layout = (props: RouteSectionProps) => {
     ]
 
     // Installed apps' pages (the `nav` slot; docs/apps.md, "Views and
-    // actions"): one item per page the viewer may see, between the cluster
-    // and the system sections.
+    // actions" and "Sandboxed pages"): one item per view or sandboxed page
+    // the viewer may see, between the cluster and the system sections.
     const appItems: SidebarItem[] = uiExtensions()
-      .filter((entry) => entry.slot === 'nav' && entry.view)
+      .filter((entry) => entry.slot === 'nav' && (entry.view || entry.page))
       .map((entry) => ({
         kind: 'item',
         label: entry.title,
-        path: appPagePath(entry.app, entry.view),
+        path: navEntryPath(entry),
         title: entry.title,
         copy: entry.appDescription || `From the ${entry.app} app.`,
         icon: hasIcon(entry.icon) ? entry.icon : 'boxes',
@@ -1197,6 +1198,7 @@ const AppRoutes = () => {
       <Route path="/jobs/:namespace/:name/specs/:configId" component={JobSpecDetail} />
       <Route path="/jobs/:namespace/:name/instances/:instanceId" component={InstanceDetail} />
       <Route path="/allocations/:id" component={AllocationDetail} />
+      <Route path="/apps/:app/pages/:page" component={AppSandboxPage} />
       <Route path="/apps/:app/:view" component={AppPage} />
       <Route path="/services" component={Services} />
       <Route path="/services/:namespace/:name" component={ServiceDetail} />

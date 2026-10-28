@@ -135,6 +135,14 @@ export const reloadUiExtensions = () => registry.reload()
 export const appPagePath = (app: string, view: string) =>
   `/apps/${encodeURIComponent(app)}/${encodeURIComponent(view)}`
 
+/** Where an app's sandboxed page (`ui.pages`, tier 2) lives. */
+export const appSandboxPath = (app: string, page: string) =>
+  `/apps/${encodeURIComponent(app)}/pages/${encodeURIComponent(page)}`
+
+/** Where a sidebar entry (a view, or a sandboxed page) opens. */
+export const navEntryPath = (entry: UiExtension) =>
+  entry.page ? appSandboxPath(entry.app, entry.page) : appPagePath(entry.app, entry.view)
+
 /** A unix time, in the viewer's locale. */
 export function formatTime(unixSeconds: number): string {
   if (!Number.isFinite(unixSeconds)) return ''

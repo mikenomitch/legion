@@ -46,7 +46,8 @@ const JOB_SECTIONS = new Map([
 // bare path stays unknown.
 const DETAIL_ONLY_SECTIONS = new Map([
   ['allocations', 'Allocations'],
-  // An app's page (`/apps/<app>/<view>`, the nav slot): there is no index.
+  // An app's page (`/apps/<app>/<view>`, the nav slot, or
+  // `/apps/<app>/pages/<page>`, a sandboxed page): there is no index.
   ['apps', 'Apps'],
 ])
 
@@ -87,6 +88,8 @@ const labelForSegment = (segments: readonly string[], index: number): string => 
   if (previous === 'instances') return decoded
   if (previous === 'allocations') return `#${decoded}`
   if (previous === 'apps') return decoded
+  // `/apps/<app>/pages/<page>`: an app's sandboxed page.
+  if (segments[0] === 'apps' && index === 3) return decoded
 
   // `/jobs/<namespace>/<name>/<section>/<item>`: the namespace, the job,
   // then the job's sections.

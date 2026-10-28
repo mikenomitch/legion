@@ -35167,6 +35167,15 @@ export class UiExtension extends Message<UiExtension> {
    */
   appDescription = "";
 
+  /**
+   * For `nav`: the sandboxed page this entry opens (`ui.pages[].name`),
+   * fetched with GetAppPage; `view` is then empty. The SPA routes it to
+   * `/apps/<app>/pages/<page>`.
+   *
+   * @generated from field: string page = 10;
+   */
+  page = "";
+
   constructor(data?: PartialMessage<UiExtension>) {
     super();
     proto3.util.initPartial(data, this);
@@ -35184,6 +35193,7 @@ export class UiExtension extends Message<UiExtension> {
     { no: 7, name: "permission", kind: "message", T: UiPermission },
     { no: 8, name: "refresh_seconds", kind: "scalar", T: 13 /* ScalarType.UINT32 */ },
     { no: 9, name: "app_description", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 10, name: "page", kind: "scalar", T: 9 /* ScalarType.STRING */ },
   ]);
 
   static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): UiExtension {
@@ -35700,6 +35710,199 @@ export class InvokeAppActionReply extends Message<InvokeAppActionReply> {
 
   static equals(a: InvokeAppActionReply | PlainMessage<InvokeAppActionReply> | undefined, b: InvokeAppActionReply | PlainMessage<InvokeAppActionReply> | undefined): boolean {
     return proto3.util.equals(InvokeAppActionReply, a, b);
+  }
+}
+
+/**
+ * Request payload for GetAppPage.
+ *
+ * @generated from message legion.GetAppPageRequest
+ */
+export class GetAppPageRequest extends Message<GetAppPageRequest> {
+  /**
+   * The app's name.
+   *
+   * @generated from field: string app = 1;
+   */
+  app = "";
+
+  /**
+   * The page's name (`ui.pages[].name`).
+   *
+   * @generated from field: string page = 2;
+   */
+  page = "";
+
+  constructor(data?: PartialMessage<GetAppPageRequest>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.GetAppPageRequest";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "app", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 2, name: "page", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): GetAppPageRequest {
+    return new GetAppPageRequest().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): GetAppPageRequest {
+    return new GetAppPageRequest().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): GetAppPageRequest {
+    return new GetAppPageRequest().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: GetAppPageRequest | PlainMessage<GetAppPageRequest> | undefined, b: GetAppPageRequest | PlainMessage<GetAppPageRequest> | undefined): boolean {
+    return proto3.util.equals(GetAppPageRequest, a, b);
+  }
+}
+
+/**
+ * A Manager RPC a sandboxed page may call through the SPA's bridge.
+ *
+ * @generated from message legion.AppPageRpc
+ */
+export class AppPageRpc extends Message<AppPageRpc> {
+  /**
+   * The RPC's name, as `proto/legion.proto` spells it (`GetJobInfo`).
+   *
+   * @generated from field: string method = 1;
+   */
+  method = "";
+
+  /**
+   * Whether the call changes something. The SPA asks the viewer before
+   * every such call, naming the app, the RPC, and its target; reads run
+   * without asking. Classified by what the call does, not by its ACL action.
+   *
+   * @generated from field: bool mutating = 2;
+   */
+  mutating = false;
+
+  constructor(data?: PartialMessage<AppPageRpc>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.AppPageRpc";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "method", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 2, name: "mutating", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): AppPageRpc {
+    return new AppPageRpc().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): AppPageRpc {
+    return new AppPageRpc().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): AppPageRpc {
+    return new AppPageRpc().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: AppPageRpc | PlainMessage<AppPageRpc> | undefined, b: AppPageRpc | PlainMessage<AppPageRpc> | undefined): boolean {
+    return proto3.util.equals(AppPageRpc, a, b);
+  }
+}
+
+/**
+ * Response payload for GetAppPage.
+ *
+ * @generated from message legion.GetAppPageReply
+ */
+export class GetAppPageReply extends Message<GetAppPageReply> {
+  /**
+   * The app's name.
+   *
+   * @generated from field: string app = 1;
+   */
+  app = "";
+
+  /**
+   * The page's name.
+   *
+   * @generated from field: string page = 2;
+   */
+  page = "";
+
+  /**
+   * The page's title (`ui.pages[].title`).
+   *
+   * @generated from field: string title = 3;
+   */
+  title = "";
+
+  /**
+   * The page's single-file HTML bundle, as the app served it (UTF-8, at
+   * most 1 MiB). The SPA prepends its Content-Security-Policy and the
+   * bridge's script, and mounts it in a sandboxed `srcdoc` iframe.
+   *
+   * @generated from field: string html = 4;
+   */
+  html = "";
+
+  /**
+   * The RPCs the page may call through the bridge (`ui.pages[].rpcs`), as
+   * the viewer. Every bridged call carries the `legion-app-page: <app>/<page>`
+   * header, and the manager refuses one whose RPC is not on this list.
+   *
+   * @generated from field: repeated legion.AppPageRpc rpcs = 5;
+   */
+  rpcs: AppPageRpc[] = [];
+
+  /**
+   * The allocation that answered.
+   *
+   * @generated from field: int64 allocation_id = 6;
+   */
+  allocationId = protoInt64.zero;
+
+  /**
+   * The node it runs on.
+   *
+   * @generated from field: string node_id = 7;
+   */
+  nodeId = "";
+
+  constructor(data?: PartialMessage<GetAppPageReply>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.GetAppPageReply";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "app", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 2, name: "page", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 3, name: "title", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 4, name: "html", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 5, name: "rpcs", kind: "message", T: AppPageRpc, repeated: true },
+    { no: 6, name: "allocation_id", kind: "scalar", T: 3 /* ScalarType.INT64 */ },
+    { no: 7, name: "node_id", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): GetAppPageReply {
+    return new GetAppPageReply().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): GetAppPageReply {
+    return new GetAppPageReply().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): GetAppPageReply {
+    return new GetAppPageReply().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: GetAppPageReply | PlainMessage<GetAppPageReply> | undefined, b: GetAppPageReply | PlainMessage<GetAppPageReply> | undefined): boolean {
+    return proto3.util.equals(GetAppPageReply, a, b);
   }
 }
 
