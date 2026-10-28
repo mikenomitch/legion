@@ -2754,20 +2754,25 @@ async fn dispatch_tool(name: &str, args: Value) -> Result<Value, String> {
             };
             let bound = |key: &str| args.get(key).and_then(Value::as_u64).map(|n| n as u32);
             let mut client = connect().await?;
-            grpc(client.scale_task(crate::structs::ScaleTaskRequest {
-                name,
-                task_group: opt_str_arg(&args, "group"),
-                task_name: opt_str_arg(&args, "task"),
-                count,
-                reset,
-                reason: opt_str_arg(&args, "reason"),
-                idempotency_key: opt_str_arg(&args, "idempotency_key"),
-                pin_for_seconds,
-                min: bound("min"),
-                max: bound("max"),
-                release: args.get("release").and_then(Value::as_bool).unwrap_or(false),
-                ..Default::default()
-            }))
+            grpc(
+                client.scale_task(crate::structs::ScaleTaskRequest {
+                    name,
+                    task_group: opt_str_arg(&args, "group"),
+                    task_name: opt_str_arg(&args, "task"),
+                    count,
+                    reset,
+                    reason: opt_str_arg(&args, "reason"),
+                    idempotency_key: opt_str_arg(&args, "idempotency_key"),
+                    pin_for_seconds,
+                    min: bound("min"),
+                    max: bound("max"),
+                    release: args
+                        .get("release")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false),
+                    ..Default::default()
+                }),
+            )
             .await
         }
         "legion_scaling_status" => {
@@ -2783,33 +2788,43 @@ async fn dispatch_tool(name: &str, args: Value) -> Result<Value, String> {
                 })
                 .unwrap_or_default();
             let mut client = connect().await?;
-            grpc(client.get_scaling_status(crate::structs::GetScalingStatusRequest {
-                job,
-                namespaces,
-                ..Default::default()
-            }))
+            grpc(
+                client.get_scaling_status(crate::structs::GetScalingStatusRequest {
+                    job,
+                    namespaces,
+                    ..Default::default()
+                }),
+            )
             .await
         }
         "legion_scaling_explain" => {
             let job = job_arg(&args, "job")?;
             let mut client = connect().await?;
-            let mut value = grpc(client.get_scaling_status(crate::structs::GetScalingStatusRequest {
-                job,
-                task_group: opt_str_arg(&args, "group"),
-                task_name: opt_str_arg(&args, "task"),
-                detail: true,
-                ..Default::default()
-            }))
+            let mut value = grpc(client.get_scaling_status(
+                crate::structs::GetScalingStatusRequest {
+                    job,
+                    task_group: opt_str_arg(&args, "group"),
+                    task_name: opt_str_arg(&args, "task"),
+                    detail: true,
+                    ..Default::default()
+                },
+            ))
             .await?;
             // The decision and policy travel as JSON text; hand them over
             // as structured data.
             if let Some(targets) = value.get_mut("targets").and_then(Value::as_array_mut) {
                 for target in targets {
                     if let Value::Object(object) = target {
-                        for (text, key) in [("decisionJson", "decision"), ("policyJson", "effectivePolicy")] {
+                        for (text, key) in [
+                            ("decisionJson", "decision"),
+                            ("policyJson", "effectivePolicy"),
+                        ] {
                             let parsed = object
                                 .remove(text)
-                                .and_then(|raw| raw.as_str().and_then(|raw| serde_json::from_str::<Value>(raw).ok()))
+                                .and_then(|raw| {
+                                    raw.as_str()
+                                        .and_then(|raw| serde_json::from_str::<Value>(raw).ok())
+                                })
                                 .unwrap_or(Value::Null);
                             object.insert(key.to_string(), parsed);
                         }
@@ -2821,13 +2836,15 @@ async fn dispatch_tool(name: &str, args: Value) -> Result<Value, String> {
         "legion_scaling_history" => {
             let job = job_arg(&args, "job")?;
             let mut client = connect().await?;
-            grpc(client.get_scale_history(crate::structs::GetScaleHistoryRequest {
-                job,
-                task_group: opt_str_arg(&args, "group"),
-                task_name: opt_str_arg(&args, "task"),
-                limit: args.get("limit").and_then(Value::as_u64).unwrap_or(0) as u32,
-                detail: false,
-            }))
+            grpc(
+                client.get_scale_history(crate::structs::GetScaleHistoryRequest {
+                    job,
+                    task_group: opt_str_arg(&args, "group"),
+                    task_name: opt_str_arg(&args, "task"),
+                    limit: args.get("limit").and_then(Value::as_u64).unwrap_or(0) as u32,
+                    detail: false,
+                }),
+            )
             .await
         }
         "legion_scaling_pause" => {

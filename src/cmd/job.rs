@@ -103,15 +103,10 @@ pub fn config() -> Command {
                 .value_name("REASON")
                 .help("Audit note recorded on the override and in the event stream"),
         )
-        .arg(
-            Arg::new("for")
-                .long("for")
-                .value_name("DURATION")
-                .help(
-                    "Pin the count (or --min/--max) on an autoscaled task for this long, e.g. \
+        .arg(Arg::new("for").long("for").value_name("DURATION").help(
+            "Pin the count (or --min/--max) on an autoscaled task for this long, e.g. \
                      2h; required for --count on an autoscaled task",
-                ),
-        )
+        ))
         .arg(
             Arg::new("min")
                 .long("min")
@@ -135,7 +130,9 @@ pub fn config() -> Command {
                 .long("release")
                 .action(ArgAction::SetTrue)
                 .conflicts_with_all(["count", "reset", "for", "min", "max"])
-                .help("End an autoscaled task's pin now; autoscaling resumes from the current count"),
+                .help(
+                    "End an autoscaled task's pin now; autoscaling resumes from the current count",
+                ),
         )
         .arg(idempotency_arg())
         .arg(namespace_flag())
@@ -758,10 +755,12 @@ pub(crate) fn build_jobspec_schema() -> Value {
         object.remove("title");
         object.insert(
             "description".into(),
-            json!("Task autoscaling (docs/autoscaling.md): `true` for the effective defaults \
+            json!(
+                "Task autoscaling (docs/autoscaling.md): `true` for the effective defaults \
                    (min = count, max = 4 x count, CPU at 70% of the reservation), or a record \
                    overriding some of them. Not on keyed, `count.per`, or batch tasks; at most \
-                   one task per group."),
+                   one task per group."
+            ),
         );
     }
     let text = serde_json::to_string(&autoscale)

@@ -2782,7 +2782,12 @@ async fn app_plane_refuses_tokens_that_are_not_the_autoscaler_test() -> R<()> {
         let status = call_endpoint(&svc, &fixtures, method, Some(&secret))
             .await
             .expect_err("a scale:write token is not the autoscaler");
-        assert_eq!(status.code(), Code::PermissionDenied, "{method}: {}", status.message());
+        assert_eq!(
+            status.code(),
+            Code::PermissionDenied,
+            "{method}: {}",
+            status.message()
+        );
     }
     // Its own job's pause is fine; the cluster-wide one is not.
     call_endpoint(&svc, &fixtures, "PauseScaling", Some(&secret))

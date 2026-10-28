@@ -55,16 +55,16 @@ mod scaling_ops;
 // Task autoscaling's state: scale writes with compare-and-set, pins,
 // history, pauses, the cluster's scaling defaults, policy snapshots.
 mod autoscale_ops;
-pub use autoscale_ops::{
-    covering_pause, HistoryRow, NewHistory, PauseRow, ScaleWrite, ScaleWriteOp,
-    ScaleWriteOutcome, ScalingDefaultsRow, HISTORY_CAP, PAUSE_ANY, TASK_SCALE_COUNTER,
-};
 use crate::storage::persistence::{
     build_persistence_driver, PersistenceDriver, PersistenceRole, PersistenceStatus,
     RaftHistoryEvent, RaftStatus,
 };
 use crate::storage::raft::{capture, ReplicatedOp, ReplicationHandle};
 use crate::storage::Lane;
+pub use autoscale_ops::{
+    covering_pause, HistoryRow, NewHistory, PauseRow, ScaleWrite, ScaleWriteOp, ScaleWriteOutcome,
+    ScalingDefaultsRow, HISTORY_CAP, PAUSE_ANY, TASK_SCALE_COUNTER,
+};
 pub use fork_ops::{alias_target_problem, AliasOutcome, ForkCreated};
 pub use gang_losses::GangLoss;
 pub use gang_members::GangMember;
@@ -11143,7 +11143,11 @@ impl Store {
                 Some(serde_json::to_string(&t.pending_extensions)?)
             };
             let schedule = t.schedule.as_ref().map(ToString::to_string);
-            let autoscale = t.autoscale.as_ref().map(serde_json::to_string).transpose()?;
+            let autoscale = t
+                .autoscale
+                .as_ref()
+                .map(serde_json::to_string)
+                .transpose()?;
             let task_params = named_params! {
                 ":name": t.name,
                 ":runtime": t.runtime,
@@ -11244,7 +11248,7 @@ impl Store {
             .iter()
             .any(crate::manager::autoscale::is_autoscaled)
         {
-            Some(crate::manager::autoscale::AutoscaleLayers::load_tx(&tx)?)
+            Some(crate::manager::autoscale::AutoscaleLayers::load_tx(tx)?)
         } else {
             None
         };
@@ -11281,9 +11285,11 @@ impl Store {
                     }
                 });
                 let rebased = i64::from(spec) != base_count;
-                let moved = next.zip(count).is_some_and(|(next, count)| i64::from(next) != count);
+                let moved = next
+                    .zip(count)
+                    .is_some_and(|(next, count)| i64::from(next) != count);
                 if rebased || moved {
-                    let version = Self::next_scaling_counter_tx(&tx, TASK_SCALE_COUNTER)?;
+                    let version = Self::next_scaling_counter_tx(tx, TASK_SCALE_COUNTER)?;
                     tx.execute(
                         "UPDATE task_scale SET base_count = ?4, count = COALESCE(?5, count), \
                          version = ?6 WHERE job_id = ?1 AND task_group = ?2 AND task_name = ?3;",
@@ -11291,9 +11297,12 @@ impl Store {
                     )?;
                 }
                 if moved && owner.name == t.name {
-                    let (from, to) = (count.unwrap_or_default().max(0) as u32, next.unwrap_or_default());
+                    let (from, to) = (
+                        count.unwrap_or_default().max(0) as u32,
+                        next.unwrap_or_default(),
+                    );
                     Self::insert_history_tx(
-                        &tx,
+                        tx,
                         &job.id,
                         &t.group,
                         &t.name,

@@ -99,7 +99,12 @@ impl ScalingStatusBoard {
     }
 
     /// Take one report. Returns how many targets it carried.
-    pub fn record(&self, report: &ReportScalingStatusRequest, now: Instant, now_unix_ms: i64) -> u32 {
+    pub fn record(
+        &self,
+        report: &ReportScalingStatusRequest,
+        now: Instant,
+        now_unix_ms: i64,
+    ) -> u32 {
         let mut inner = self.lock();
         let interval = Duration::from_secs(u64::from(report.interval_seconds.max(1)));
         inner.app = Some(AppReport {
@@ -242,8 +247,14 @@ mod tests {
             AppLiveness::NotRunning
         );
         board.record(&report(2, vec![target("{\"x\":1}")]), start, 0);
-        assert_eq!(board.liveness(start + Duration::from_secs(5), None), AppLiveness::Running);
-        assert_eq!(board.liveness(start + Duration::from_secs(6), None), AppLiveness::NotRunning);
+        assert_eq!(
+            board.liveness(start + Duration::from_secs(5), None),
+            AppLiveness::Running
+        );
+        assert_eq!(
+            board.liveness(start + Duration::from_secs(6), None),
+            AppLiveness::NotRunning
+        );
     }
 
     /// A report that omits an unchanged decision keeps the last one.

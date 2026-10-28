@@ -161,7 +161,9 @@ impl PauseRow {
             "all" => true,
             "job" => self.job_id == job_id,
             _ => {
-                self.job_id == job_id && self.task_group == task_group && self.task_name == task_name
+                self.job_id == job_id
+                    && self.task_group == task_group
+                    && self.task_name == task_name
             }
         }
     }
@@ -278,7 +280,8 @@ impl Store {
             &write.task_group,
             &write.task_name,
         );
-        let current = Self::task_scale_tx(conn, &write.job_id, &write.task_group, &write.task_name)?;
+        let current =
+            Self::task_scale_tx(conn, &write.job_id, &write.task_group, &write.task_name)?;
         let found = current.as_ref().map_or(0, |row| row.version);
         if let Some(expected) = write.expected_version {
             if expected != found {
@@ -342,8 +345,10 @@ impl Store {
                     .into());
                 }
             }
-            if matches!(op, ScaleWriteOp::Pin { .. } | ScaleWriteOp::Release | ScaleWriteOp::Reset)
-            {
+            if matches!(
+                op,
+                ScaleWriteOp::Pin { .. } | ScaleWriteOp::Release | ScaleWriteOp::Reset
+            ) {
                 return Err(StorageError::InvalidInput {
                     message: "the autoscaler writes counts only; pins, releases, and resets are \
                               a person's"
@@ -610,8 +615,19 @@ impl Store {
             let mut conn = s.write_connection()?;
             let tx = Self::write_tx(&mut conn)?;
             let id = Self::insert_history_tx(
-                &tx, &job_id, &task_group, &task_name, at_ms, from, to, &source, &principal,
-                &kind, false, &history, "",
+                &tx,
+                &job_id,
+                &task_group,
+                &task_name,
+                at_ms,
+                from,
+                to,
+                &source,
+                &principal,
+                &kind,
+                false,
+                &history,
+                "",
             )?;
             tx.commit()?;
             Ok(id)
@@ -912,17 +928,24 @@ mod tests {
     fn compare_and_set_conflicts_test() -> R<()> {
         let (_dir, store) = store()?;
         submit(&store, 2, Some(json!(true)))?;
-        let first = store.apply_scale_write(write(ScaleWriteOp::Set { count: 3 }, Some(0), true, 1))?;
+        let first =
+            store.apply_scale_write(write(ScaleWriteOp::Set { count: 3 }, Some(0), true, 1))?;
         assert!(first.version > 0);
         let err = store
             .apply_scale_write(write(ScaleWriteOp::Set { count: 4 }, Some(0), true, 1))
             .unwrap_err();
         assert!(refusal(err).contains("version conflict"));
         // A person's write in between.
-        let human = store.apply_scale_write(write(ScaleWriteOp::Set { count: 5 }, None, false, 1))?;
+        let human =
+            store.apply_scale_write(write(ScaleWriteOp::Set { count: 5 }, None, false, 1))?;
         assert!(human.version > first.version);
         let err = store
-            .apply_scale_write(write(ScaleWriteOp::Set { count: 6 }, Some(first.version), true, 1))
+            .apply_scale_write(write(
+                ScaleWriteOp::Set { count: 6 },
+                Some(first.version),
+                true,
+                1,
+            ))
             .unwrap_err();
         assert!(refusal(err).contains("version conflict"));
         assert_eq!(store.effective_task_count("web", "default", "api", 2)?, 5);
@@ -934,10 +957,12 @@ mod tests {
     fn versions_survive_delete_and_recreate_test() -> R<()> {
         let (_dir, store) = store()?;
         submit(&store, 2, Some(json!(true)))?;
-        let first = store.apply_scale_write(write(ScaleWriteOp::Set { count: 3 }, None, false, 1))?;
+        let first =
+            store.apply_scale_write(write(ScaleWriteOp::Set { count: 3 }, None, false, 1))?;
         store.apply_scale_write(write(ScaleWriteOp::Reset, None, false, 2))?;
         assert!(store.task_scale_for("web", "default", "api")?.is_none());
-        let again = store.apply_scale_write(write(ScaleWriteOp::Set { count: 3 }, Some(0), false, 3))?;
+        let again =
+            store.apply_scale_write(write(ScaleWriteOp::Set { count: 3 }, Some(0), false, 3))?;
         assert!(again.version > first.version, "{again:?} vs {first:?}");
         Ok(())
     }
@@ -949,7 +974,15 @@ mod tests {
         let (_dir, store) = store()?;
         submit(&store, 2, Some(json!(true)))?;
         store.record_scale_history(
-            "web", "default", "api", 1, 2, 3, "autoscaler", "app", "would",
+            "web",
+            "default",
+            "api",
+            1,
+            2,
+            3,
+            "autoscaler",
+            "app",
+            "would",
             NewHistory {
                 summary: "would".into(),
                 policy_digest: "old".into(),
@@ -957,7 +990,10 @@ mod tests {
                 ..Default::default()
             },
         )?;
-        assert_eq!(store.scaling_policy_snapshot("old")?.as_deref(), Some("{\"old\":true}"));
+        assert_eq!(
+            store.scaling_policy_snapshot("old")?.as_deref(),
+            Some("{\"old\":true}")
+        );
         for at in 2..(HISTORY_CAP + 5) {
             store.apply_scale_write(write(
                 ScaleWriteOp::Set {
@@ -972,7 +1008,10 @@ mod tests {
         assert_eq!(rows.len() as i64, HISTORY_CAP);
         assert!(rows.windows(2).all(|pair| pair[0].id > pair[1].id));
         assert!(rows.iter().all(|row| row.kind == "scaled"));
-        assert!(store.scaling_policy_snapshot("old")?.is_none(), "pruned with its rows");
+        assert!(
+            store.scaling_policy_snapshot("old")?.is_none(),
+            "pruned with its rows"
+        );
         assert!(store.scaling_policy_snapshot("d1")?.is_some());
         Ok(())
     }
@@ -984,7 +1023,11 @@ mod tests {
     fn pause_and_pin_refusals_test() -> R<()> {
         let (_dir, store) = store()?;
         submit(&store, 2, Some(json!(true)))?;
-        for (job, group, task) in [("web", "default", "api"), ("web", "*", "*"), ("*", "*", "*")] {
+        for (job, group, task) in [
+            ("web", "default", "api"),
+            ("web", "*", "*"),
+            ("*", "*", "*"),
+        ] {
             store.set_scaling_pause(job, group, task, None, "incident", "alice", 0)?;
             let err = store
                 .apply_scale_write(write(ScaleWriteOp::Set { count: 3 }, None, true, 10))
@@ -1037,7 +1080,9 @@ mod tests {
         assert!(refusal(err).contains("outside the pinned bounds 10..∞"));
         store.apply_scale_write(write(ScaleWriteOp::Set { count: 14 }, None, true, 300))?;
         store.apply_scale_write(write(ScaleWriteOp::Release, None, false, 400))?;
-        let row = store.task_scale_for("web", "default", "api")?.context("row")?;
+        let row = store
+            .task_scale_for("web", "default", "api")?
+            .context("row")?;
         assert!(row.pin.is_none());
         assert_eq!(row.count, Some(14));
         let kinds: Vec<String> = store
@@ -1057,7 +1102,10 @@ mod tests {
         let mut group = write(ScaleWriteOp::Set { count: 4 }, None, true, 1);
         group.members = vec!["api".into(), "sidecar".into()];
         store.apply_scale_write(group)?;
-        assert_eq!(store.effective_task_count("web", "default", "sidecar", 2)?, 4);
+        assert_eq!(
+            store.effective_task_count("web", "default", "sidecar", 2)?,
+            4
+        );
         assert_eq!(store.effective_task_count("web", "default", "api", 2)?, 4);
         Ok(())
     }

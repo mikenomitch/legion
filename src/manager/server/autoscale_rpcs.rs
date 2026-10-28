@@ -22,8 +22,8 @@ use crate::structs::{
     GetScalingStatusReply, GetScalingStatusRequest, PauseScalingReply, PauseScalingRequest,
     RecordScalingActionReply, RecordScalingActionRequest, ReportScalingStatusReply,
     ReportScalingStatusRequest, ScaleDecision, ScaleHistoryEntry, ScalePin, ScalingAppStatus,
-    ScalingPauseInfo, ScalingPolicy, ScalingPolicyChange, ScalingPolicySet,
-    ScalingProvenanceRow, ScalingTargetStatus, WatchScalingPoliciesRequest,
+    ScalingPauseInfo, ScalingPolicy, ScalingPolicyChange, ScalingPolicySet, ScalingProvenanceRow,
+    ScalingTargetStatus, WatchScalingPoliciesRequest,
 };
 
 /// The bundled autoscaler app's name; its job is `legion-system/autoscaler`.
@@ -212,7 +212,10 @@ fn resolve_scale_target<'a>(
             .iter()
             .find(|task| task.group == group && is_autoscaled(task))
         {
-            return Ok((owner, crate::manager::autoscale::group_members(config, owner)));
+            return Ok((
+                owner,
+                crate::manager::autoscale::group_members(config, owner),
+            ));
         }
     }
     let task = resolve_scalable_task(config, job_id, group, task)?;
@@ -316,7 +319,17 @@ impl ManagerDaemonService {
         else {
             return Ok(false);
         };
-        if !crate::manager::autoscale::in_place_change(&previous, config) {
+        // Compare the stored versions: the store normalizes what it keeps
+        // (resource defaults, say), so the request's config is not what the
+        // previous version is stored as.
+        let Some(next) = self
+            .store
+            .get_job_config_by_id_optional(job_config_id)
+            .map_err(|e| map_store_error("Error loading job config", e))?
+        else {
+            return Ok(false);
+        };
+        if !crate::manager::autoscale::in_place_change(&previous, &next) {
             return Ok(false);
         }
         let rollouts = self
@@ -358,7 +371,8 @@ impl ManagerDaemonService {
         let (layers, targets) = load_targets(&self.store)
             .map_err(|e| map_store_error("Error loading scaling policies", e))?;
         let mut next = layers.clone();
-        next.policies.retain(|existing| existing.name != policy.name);
+        next.policies
+            .retain(|existing| existing.name != policy.name);
         if policy.autoscale.is_some() {
             next.policies.push(policy.clone());
         }
@@ -366,7 +380,9 @@ impl ManagerDaemonService {
         for target in targets
             .iter()
             .filter(|target| target.resolved.is_ok())
-            .filter(|target| policy.matches(crate::structs::namespace::job_namespace(&target.job_id)))
+            .filter(|target| {
+                policy.matches(crate::structs::namespace::job_namespace(&target.job_id))
+            })
         {
             let Some(config) = self
                 .store
@@ -515,8 +531,8 @@ impl ManagerDaemonService {
             if seconds == 0 {
                 return Err(Status::invalid_argument("pin_for_seconds must be above 0"));
             }
-            let until_ms =
-                now_ms.saturating_add(i64::try_from(seconds.saturating_mul(1000)).unwrap_or(i64::MAX));
+            let until_ms = now_ms
+                .saturating_add(i64::try_from(seconds.saturating_mul(1000)).unwrap_or(i64::MAX));
             match inner.count {
                 Some(count) => ScaleWriteOp::Pin {
                     count,
@@ -607,7 +623,9 @@ impl ManagerDaemonService {
         let message = match &op {
             ScaleWriteOp::Reset => {
                 events.scale_reset(&name, &task_group, &task_name, "explicit reset");
-                format!("{label}: {previous} -> {spec_count} (override dropped; spec owns the count)")
+                format!(
+                    "{label}: {previous} -> {spec_count} (override dropped; spec owns the count)"
+                )
             }
             ScaleWriteOp::Release => {
                 events.scale_pinned(
@@ -649,9 +667,7 @@ impl ManagerDaemonService {
                     &source,
                     &summary,
                 );
-                format!(
-                    "{label}: {previous} -> {count} (spec count {spec_count}; override active)"
-                )
+                format!("{label}: {previous} -> {count} (spec count {spec_count}; override active)")
             }
             ScaleWriteOp::Pin {
                 min, max, until_ms, ..
@@ -732,7 +748,12 @@ impl ManagerDaemonService {
         &self,
         request: Request<WatchScalingPoliciesRequest>,
     ) -> Result<Response<ReceiverStream<Result<ScalingPolicySet, Status>>>, Status> {
-        self.check_acl(&request, AclResource::Scale, AclAction::Read, AclScope::any())?;
+        self.check_acl(
+            &request,
+            AclResource::Scale,
+            AclAction::Read,
+            AclScope::any(),
+        )?;
         let credential = self.stream_credential(&request);
         let req = request.into_inner();
         let namespaces = if req.namespaces.is_empty() {
@@ -806,9 +827,8 @@ impl ManagerDaemonService {
                     .iter()
                     .filter(|target| {
                         namespaces.as_ref().is_none_or(|selection| {
-                            selection.matches(crate::structs::namespace::job_namespace(
-                                &target.job_id,
-                            ))
+                            selection
+                                .matches(crate::structs::namespace::job_namespace(&target.job_id))
                         })
                     })
                     .filter(|target| {
@@ -940,13 +960,20 @@ impl ManagerDaemonService {
                 });
             }
         }
-        let invalid = changes.iter().filter(|change| !change.error.is_empty()).count() as u32;
+        let invalid = changes
+            .iter()
+            .filter(|change| !change.error.is_empty())
+            .count() as u32;
         let current = self
             .store
             .scaling_defaults()
             .map_err(|e| map_store_error("Error reading scaling defaults", e))?;
         let current_version = current.as_ref().map_or(0, |row| row.version);
-        let unchanged = current.as_ref().map(|row| row.record.as_str()).unwrap_or("{}") == canonical;
+        let unchanged = current
+            .as_ref()
+            .map(|row| row.record.as_str())
+            .unwrap_or("{}")
+            == canonical;
         let summary = |verb: &str, version: u64| {
             format!(
                 "scaling defaults: {verb}{}; {} polic{} change, {invalid} invalid",
@@ -956,7 +983,11 @@ impl ManagerDaemonService {
                     String::new()
                 },
                 changes.len(),
-                if changes.len() == 1 { "y would" } else { "ies would" },
+                if changes.len() == 1 {
+                    "y would"
+                } else {
+                    "ies would"
+                },
             )
         };
         if inner.dry_run {
@@ -1059,8 +1090,14 @@ impl ManagerDaemonService {
                 .as_ref()
                 .map_or_else(|| "{}".to_string(), |row| row.record.clone()),
             version: row.as_ref().map_or(0, |row| row.version),
-            updated_by: row.as_ref().map(|row| row.updated_by.clone()).unwrap_or_default(),
-            updated_at: row.as_ref().map(|row| row.updated_at.clone()).unwrap_or_default(),
+            updated_by: row
+                .as_ref()
+                .map(|row| row.updated_by.clone())
+                .unwrap_or_default(),
+            updated_at: row
+                .as_ref()
+                .map(|row| row.updated_at.clone())
+                .unwrap_or_default(),
             policies: layers.policy_names(&namespace),
             namespace,
             effective,
@@ -1144,8 +1181,12 @@ impl ManagerDaemonService {
         &self,
         request: Request<GetScalingStatusRequest>,
     ) -> Result<Response<GetScalingStatusReply>, Status> {
-        let identity =
-            self.check_acl(&request, AclResource::Scale, AclAction::Read, AclScope::any())?;
+        let identity = self.check_acl(
+            &request,
+            AclResource::Scale,
+            AclAction::Read,
+            AclScope::any(),
+        )?;
         let req = request.into_inner();
         let job = req.job.trim().to_string();
         if !job.is_empty() {
@@ -1193,7 +1234,9 @@ impl ManagerDaemonService {
                     continue;
                 }
             }
-            if group.as_ref().is_some_and(|group| *group != target.task_group)
+            if group
+                .as_ref()
+                .is_some_and(|group| *group != target.task_group)
                 || task
                     .as_ref()
                     .is_some_and(|task| *task != target.task_name && !target.members.contains(task))
@@ -1213,7 +1256,10 @@ impl ManagerDaemonService {
             );
         }
         let app = self.app_status(&pauses, now, now_ms)?;
-        Ok(Response::new(GetScalingStatusReply { app: Some(app), targets: out }))
+        Ok(Response::new(GetScalingStatusReply {
+            app: Some(app),
+            targets: out,
+        }))
     }
 
     fn target_status(
@@ -1261,7 +1307,13 @@ impl ManagerDaemonService {
             ),
         };
         let (state, want, evaluated, summary, decision) = match (&target.resolved, &entry) {
-            (Err(_), _) => ("invalid".to_string(), effective, 0, error.clone(), String::new()),
+            (Err(_), _) => (
+                "invalid".to_string(),
+                effective,
+                0,
+                error.clone(),
+                String::new(),
+            ),
             (Ok(_), Some(entry)) if board.is_stale(entry.received, now) => (
                 "stale".to_string(),
                 effective,
@@ -1579,7 +1631,8 @@ impl ManagerDaemonService {
             }
         } else {
             let until = inner.for_seconds.map(|seconds| {
-                now_ms.saturating_add(i64::try_from(seconds.saturating_mul(1000)).unwrap_or(i64::MAX))
+                now_ms
+                    .saturating_add(i64::try_from(seconds.saturating_mul(1000)).unwrap_or(i64::MAX))
             });
             self.store
                 .set_scaling_pause(

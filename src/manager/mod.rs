@@ -1,8 +1,8 @@
 pub mod acl;
 pub mod apps;
-pub mod autoscale;
 pub mod archive;
 pub mod auth_method;
+pub mod autoscale;
 pub mod blocked;
 pub mod bootstrap_token;
 pub mod cadence;

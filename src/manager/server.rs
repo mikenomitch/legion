@@ -17994,7 +17994,7 @@ mod tests {
         .await?
         .remove(0);
         assert!(off.value.is_empty() && !off.absent);
-        assert!(off.error.contains("not enabled"), "{}", off.error);
+        assert!(off.error.contains("turned off"), "{}", off.error);
         Ok(())
     }
 

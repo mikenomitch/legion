@@ -15,7 +15,6 @@
 //! [`crate::cmd::output`] envelope.
 
 use crate::autoscaler::{Decision, Stage};
-use clap::value_parser;
 use crate::cmd::helpers::{
     active_namespace, connect_manager_client, json_flag, list_namespace_flags, namespace_flag,
     namespace_selection, print_table, required_job_arg,
@@ -28,6 +27,7 @@ use crate::structs::{
     GetScalingStatusRequest, PauseScalingRequest, ScaleHistoryEntry, ScalingAppStatus,
     ScalingTargetStatus,
 };
+use clap::value_parser;
 use std::path::Path;
 use tabled::Tabled;
 
@@ -259,7 +259,12 @@ fn state_words(target: &ScalingTargetStatus) -> String {
 fn last_words(target: &ScalingTargetStatus) -> String {
     match target.last_change.as_ref() {
         Some(change) if change.kind == "would" => {
-            format!("would {} → {} {}", change.from, change.to, ago(change.at_unix_ms))
+            format!(
+                "would {} → {} {}",
+                change.from,
+                change.to,
+                ago(change.at_unix_ms)
+            )
         }
         Some(change) => format!(
             "{} → {} {} ({})",
@@ -495,7 +500,11 @@ async fn explain(matches: &ArgMatches) -> R<()> {
             } else {
                 "task".to_string()
             },
-            if target.mode.is_empty() { "-" } else { &target.mode },
+            if target.mode.is_empty() {
+                "-"
+            } else {
+                &target.mode
+            },
             target.now,
             target.min,
             target.max,
@@ -583,7 +592,10 @@ async fn explain(matches: &ArgMatches) -> R<()> {
         if show_policy {
             println!(
                 "\n  effective policy {}",
-                target.policy_digest.get(..12).unwrap_or(&target.policy_digest)
+                target
+                    .policy_digest
+                    .get(..12)
+                    .unwrap_or(&target.policy_digest)
             );
             print_table(
                 target
@@ -790,7 +802,10 @@ async fn defaults_get(matches: &ArgMatches) -> R<()> {
         );
     }
     if !reply.error.is_empty() {
-        println!("effective defaults for {}: UNRESOLVABLE: {}", reply.namespace, reply.error);
+        println!(
+            "effective defaults for {}: UNRESOLVABLE: {}",
+            reply.namespace, reply.error
+        );
         return Ok(());
     }
     println!("effective defaults for namespace {}:", reply.namespace);

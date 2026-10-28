@@ -40,9 +40,9 @@ use crate::autoscaler::{
 use crate::cmd::helpers::AuthedManagerClient;
 use crate::prelude::*;
 use crate::structs::{
-    GetScalingInputsRequest, RecordScalingActionRequest, ReportScalingStatusRequest,
-    ScaleDecision, ScaleTaskRequest, ScalingEventFlag, ScalingInputs, ScalingPolicy,
-    ScalingTargetReport, ScalingTargetSelector, WatchScalingPoliciesRequest,
+    GetScalingInputsRequest, RecordScalingActionRequest, ReportScalingStatusRequest, ScaleDecision,
+    ScaleTaskRequest, ScalingEventFlag, ScalingInputs, ScalingPolicy, ScalingTargetReport,
+    ScalingTargetSelector, WatchScalingPoliciesRequest,
 };
 
 /// The default evaluation interval (plan §6.9).
@@ -234,6 +234,10 @@ pub struct Engine {
     started_ms: i64,
     policies: std::sync::Arc<RwLock<Option<Vec<ScalingPolicy>>>>,
     targets: HashMap<TargetKey, TargetState>,
+    /// The manager that took the last report. Reports leave out unchanged
+    /// decisions, so when another manager takes over the status board
+    /// (which starts empty), the next report sends every decision again.
+    served_by: Option<String>,
 }
 
 /// What one tick did, for tests and the app's health detail.
@@ -292,8 +296,7 @@ fn member_reading(input: &ScalingInputs, query: &str) -> Result<f64, String> {
         .unwrap_or("missing");
     match query {
         "task.unplaced" => return Ok(f64::from(input.unplaced_replicas)),
-        "service.rps" | "service.errors" | "service.latency_ms.mean"
-        | "service.latency_ms.max" => {
+        "service.rps" | "service.errors" | "service.latency_ms.mean" | "service.latency_ms.max" => {
             let requests = input
                 .requests
                 .as_ref()
@@ -344,10 +347,9 @@ fn check_reading(check: &EffectiveCheck, members: &[&ScalingInputs]) -> Reading 
         match member_reading(input, &check.query) {
             Ok(value) => {
                 let weight = match check.query.as_str() {
-                    "task.cpu.utilization" => input
-                        .cpu
-                        .as_ref()
-                        .map_or(0.0, |cpu| cpu.reserved_mhz),
+                    "task.cpu.utilization" => {
+                        input.cpu.as_ref().map_or(0.0, |cpu| cpu.reserved_mhz)
+                    }
                     "task.memory.utilization" => input
                         .memory
                         .as_ref()
@@ -384,11 +386,21 @@ fn state_of(decision: &Decision) -> &'static str {
         DecisionKind::Held => {}
     }
     let changed = |stage: Stage| decision.stage(stage).is_some_and(|note| note.changed());
-    let noted = |stage: Stage| decision.stage(stage).is_some_and(|note| !note.note.is_empty());
-    if decision.stage(Stage::Pause).is_some_and(|note| note.note.starts_with("paused")) {
+    let noted = |stage: Stage| {
+        decision
+            .stage(stage)
+            .is_some_and(|note| !note.note.is_empty())
+    };
+    if decision
+        .stage(Stage::Pause)
+        .is_some_and(|note| note.note.starts_with("paused"))
+    {
         return "paused";
     }
-    if decision.stage(Stage::Pin).is_some_and(|note| note.note.contains("pinned")) {
+    if decision
+        .stage(Stage::Pin)
+        .is_some_and(|note| note.note.contains("pinned"))
+    {
         return "pinned";
     }
     if changed(Stage::Rollout) {
@@ -423,6 +435,7 @@ impl Engine {
             started_ms,
             policies: std::sync::Arc::new(RwLock::new(None)),
             targets: HashMap::new(),
+            served_by: None,
         }
     }
 
@@ -593,7 +606,11 @@ impl Engine {
                 .members
                 .iter()
                 .filter_map(|member| {
-                    inputs.get(&(policy.job_id.clone(), policy.task_group.clone(), member.clone()))
+                    inputs.get(&(
+                        policy.job_id.clone(),
+                        policy.task_group.clone(),
+                        member.clone(),
+                    ))
                 })
                 .collect();
             let Some(owner) = inputs.get(&key) else {
@@ -604,7 +621,15 @@ impl Engine {
                 continue;
             };
             let target_report = self
-                .evaluate_target(policy, &effective, &key, owner, &members, now_ms, &mut report)
+                .evaluate_target(
+                    policy,
+                    &effective,
+                    &key,
+                    owner,
+                    &members,
+                    now_ms,
+                    &mut report,
+                )
                 .await;
             report.evaluated += 1;
             reports.push(target_report);
@@ -612,7 +637,10 @@ impl Engine {
 
         for target in &reports {
             report.states.insert(
-                format!("{}/{}/{}", target.job_id, target.task_group, target.task_name),
+                format!(
+                    "{}/{}/{}",
+                    target.job_id, target.task_group, target.task_name
+                ),
                 target.state.clone(),
             );
         }
@@ -626,10 +654,26 @@ impl Engine {
             targets: reports,
             version: env!("CARGO_PKG_VERSION").to_string(),
         };
-        if let Err(status) = self.client.report_scaling_status(request).await {
-            report
-                .errors
-                .push(format!("reporting status: {}", status.message()));
+        match self.client.report_scaling_status(request).await {
+            Ok(reply) => {
+                let served_by = reply.into_inner().served_by;
+                if self.served_by.as_deref() != Some(served_by.as_str()) {
+                    for state in self.targets.values_mut() {
+                        state.reported = None;
+                    }
+                    self.served_by = Some(served_by);
+                }
+            }
+            Err(status) => {
+                // The report may not have landed: send every decision in
+                // full next time.
+                for state in self.targets.values_mut() {
+                    state.reported = None;
+                }
+                report
+                    .errors
+                    .push(format!("reporting status: {}", status.message()));
+            }
         }
         report
     }
@@ -669,14 +713,17 @@ impl Engine {
         report: &mut TickReport,
     ) -> ScalingTargetReport {
         let started_ms = self.started_ms;
-        let state = self.targets.entry(key.clone()).or_insert_with(|| TargetState {
-            policy_state: PolicyState::new(started_ms),
-            readiness: Readiness::default(),
-            reported: None,
-            missing: BTreeSet::new(),
-            last_would: None,
-            samples: BTreeMap::new(),
-        });
+        let state = self
+            .targets
+            .entry(key.clone())
+            .or_insert_with(|| TargetState {
+                policy_state: PolicyState::new(started_ms),
+                readiness: Readiness::default(),
+                reported: None,
+                missing: BTreeSet::new(),
+                last_would: None,
+                samples: BTreeMap::new(),
+            });
         let current = owner.desired_replicas;
         let warming = state
             .readiness
@@ -688,7 +735,7 @@ impl Engine {
             readings: BTreeMap::new(),
             guards: Guards {
                 quota: None,
-                capacity: (owner.unplaced_replicas > 0).then(|| CapacityGuard {
+                capacity: (owner.unplaced_replicas > 0).then_some(CapacityGuard {
                     unplaced: owner.unplaced_replicas,
                     node_group_fits: false,
                     last_scale_out: None,
@@ -760,9 +807,11 @@ impl Engine {
             .filter(|check| check.missing.is_some())
             .map(|check| check.name.clone())
             .collect();
-        for check in decision.checks.iter().filter(|check| {
-            check.missing.is_some() && !state.missing.contains(&check.name)
-        }) {
+        for check in decision
+            .checks
+            .iter()
+            .filter(|check| check.missing.is_some() && !state.missing.contains(&check.name))
+        {
             events.push(ScalingEventFlag {
                 kind: "check_failed".to_string(),
                 message: format!("check {} has {}", check.name, check.detail),
@@ -834,9 +883,10 @@ impl Engine {
                             state.last_would = Some((decision.from, decision.to));
                             report.would += 1;
                         }
-                        Err(status) => report
-                            .errors
-                            .push(format!("recording a dry-run decision: {}", status.message())),
+                        Err(status) => report.errors.push(format!(
+                            "recording a dry-run decision: {}",
+                            status.message()
+                        )),
                     }
                 }
             }
@@ -897,11 +947,23 @@ mod tests {
     fn readiness_counts_warming_replicas_test() {
         let warmup = Duration::from_secs(30);
         let mut readiness = Readiness::default();
-        assert_eq!(readiness.observe(2, 0, warmup), 0, "the first sight is not a rise");
+        assert_eq!(
+            readiness.observe(2, 0, warmup),
+            0,
+            "the first sight is not a rise"
+        );
         assert_eq!(readiness.observe(4, 10_000, warmup), 2);
         assert_eq!(readiness.observe(5, 20_000, warmup), 3);
-        assert_eq!(readiness.observe(5, 40_001, warmup), 1, "the first rise warmed up");
-        assert_eq!(readiness.observe(4, 41_000, warmup), 0, "the newest rise left");
+        assert_eq!(
+            readiness.observe(5, 40_001, warmup),
+            1,
+            "the first rise warmed up"
+        );
+        assert_eq!(
+            readiness.observe(4, 41_000, warmup),
+            0,
+            "the newest rise left"
+        );
         assert_eq!(readiness.observe(4, 60_000, warmup), 0);
     }
 
@@ -939,16 +1001,24 @@ mod tests {
         let check = cpu_check();
         let a = input("a", 1.0, 3000.0);
         let b = input("b", 0.2, 1000.0);
-        assert_eq!(check_reading(&check, &[&a, &b]), Reading::Value((3.0 + 0.2) / 4.0));
+        assert_eq!(
+            check_reading(&check, &[&a, &b]),
+            Reading::Value((3.0 + 0.2) / 4.0)
+        );
         let mut stale = input("web", 0.5, 1000.0);
         stale.freshness = Some(ScalingDataFreshness {
             state: "resyncing".into(),
             ..Default::default()
         });
-        assert!(matches!(check_reading(&check, &[&stale]), Reading::Missing(why) if why.contains("resyncing")));
+        assert!(
+            matches!(check_reading(&check, &[&stale]), Reading::Missing(why) if why.contains("resyncing"))
+        );
         let mut unmeasured = input("web", 0.0, 0.0);
         unmeasured.cpu = Some(ScalingCpuInputs::default());
-        assert!(matches!(check_reading(&check, &[&unmeasured]), Reading::Missing(_)));
+        assert!(matches!(
+            check_reading(&check, &[&unmeasured]),
+            Reading::Missing(_)
+        ));
 
         let mut state = TargetState {
             policy_state: PolicyState::new(0),
@@ -978,19 +1048,31 @@ mod tests {
         // At the ceiling: limited.
         let mut state = PolicyState::new(0);
         let capped = Observation::new(8).reading("cpu", 2.0);
-        assert_eq!(state_of(&evaluate(&policy, &mut state, &capped, 1_000)), "limited");
+        assert_eq!(
+            state_of(&evaluate(&policy, &mut state, &capped, 1_000)),
+            "limited"
+        );
         // Quiet right after a start: held by the cold-start hold.
         let mut state = PolicyState::new(0);
         let quiet = Observation::new(4).reading("cpu", 0.1);
-        assert_eq!(state_of(&evaluate(&policy, &mut state, &quiet, 1_000)), "held");
+        assert_eq!(
+            state_of(&evaluate(&policy, &mut state, &quiet, 1_000)),
+            "held"
+        );
         // Within tolerance: ok.
         let mut state = PolicyState::new(0);
         let steady = Observation::new(4).reading("cpu", 0.7);
-        assert_eq!(state_of(&evaluate(&policy, &mut state, &steady, 1_000)), "ok");
+        assert_eq!(
+            state_of(&evaluate(&policy, &mut state, &steady, 1_000)),
+            "ok"
+        );
         // No data at all.
         let mut state = PolicyState::new(0);
         let blind = Observation::new(4).missing("cpu", "usage is missing");
-        assert_eq!(state_of(&evaluate(&policy, &mut state, &blind, 1_000)), "missing-data");
+        assert_eq!(
+            state_of(&evaluate(&policy, &mut state, &blind, 1_000)),
+            "missing-data"
+        );
         // Paused.
         let mut state = PolicyState::new(0);
         let mut paused = Observation::new(2).reading("cpu", 1.4);
@@ -999,6 +1081,9 @@ mod tests {
             by: "alice".into(),
             reason: String::new(),
         });
-        assert_eq!(state_of(&evaluate(&policy, &mut state, &paused, 1_000)), "paused");
+        assert_eq!(
+            state_of(&evaluate(&policy, &mut state, &paused, 1_000)),
+            "paused"
+        );
     }
 }

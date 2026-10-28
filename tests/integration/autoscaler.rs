@@ -294,7 +294,11 @@ async fn s1_scales_out_under_load_and_back_in_after_the_window_test() -> R<()> {
     for pair in downs.windows(2) {
         assert!(pair[1] - pair[0] >= 4, "faster than 1/min: {counts:?}");
     }
-    assert_eq!(*counts.last().unwrap_or(&0), 2, "back to the floor: {counts:?}");
+    assert_eq!(
+        *counts.last().unwrap_or(&0),
+        2,
+        "back to the floor: {counts:?}"
+    );
     assert_eq!(h.allocation_ids("web")?.len(), 2);
 
     // The durable record: the autoscaler's writes, each with its summary
@@ -318,11 +322,17 @@ async fn s1_scales_out_under_load_and_back_in_after_the_window_test() -> R<()> {
         })
         .await?
         .into_inner();
-    assert_eq!(status.app.as_ref().map(|app| app.state.as_str()), Some("running"));
+    assert_eq!(
+        status.app.as_ref().map(|app| app.state.as_str()),
+        Some("running")
+    );
     let target = &status.targets[0];
     assert_eq!((target.now, target.min, target.max), (2, 2, 8));
     assert!(!target.decision_json.is_empty());
-    assert!(target.policy.iter().any(|row| row.field == "cpu" && row.origin == "built-in"));
+    assert!(target
+        .policy
+        .iter()
+        .any(|row| row.field == "cpu" && row.origin == "built-in"));
     Ok(())
 }
 
@@ -360,7 +370,10 @@ async fn in_place_resubmits_keep_allocation_ids_test() -> R<()> {
     assert_eq!(h.count("web")?, 4);
     let after = h.allocation_ids("web")?;
     assert_eq!(after.len(), 4);
-    assert!(before.iter().all(|id| after.contains(id)), "{before:?} {after:?}");
+    assert!(
+        before.iter().all(|id| after.contains(id)),
+        "{before:?} {after:?}"
+    );
 
     // Lowering count only lowers the floor: the count stays.
     h.run(s1(json!({ "max": 20 }), 2)).await?;
@@ -391,7 +404,11 @@ async fn in_place_resubmits_keep_allocation_ids_test() -> R<()> {
         .await?
         .into_inner();
     assert!(pinned.pinned_until_unix_ms.is_some());
-    assert!(pinned.message.contains("autoscaling pinned until"), "{}", pinned.message);
+    assert!(
+        pinned.message.contains("autoscaling pinned until"),
+        "{}",
+        pinned.message
+    );
     assert_eq!(h.count("web")?, 6);
     // The autoscaler may not move a pinned count.
     let blocked = h
@@ -404,7 +421,11 @@ async fn in_place_resubmits_keep_allocation_ids_test() -> R<()> {
         })
         .await
         .expect_err("pinned");
-    assert!(blocked.message().contains("pinned at 6"), "{}", blocked.message());
+    assert!(
+        blocked.message().contains("pinned at 6"),
+        "{}",
+        blocked.message()
+    );
 
     // A change outside autoscale and count still rolls out.
     let mut changed = s1(json!({ "max": 20 }), 2);
@@ -446,7 +467,11 @@ async fn cas_conflicts_and_pause_all_stop_writes_test() -> R<()> {
         .await
         .expect_err("a stale version loses");
     assert_eq!(stale.code(), tonic::Code::FailedPrecondition);
-    assert!(stale.message().contains("version conflict"), "{}", stale.message());
+    assert!(
+        stale.message().contains("version conflict"),
+        "{}",
+        stale.message()
+    );
     h.drain_evals()?;
     assert_eq!(h.count("web")?, 3);
 
@@ -463,7 +488,10 @@ async fn cas_conflicts_and_pause_all_stop_writes_test() -> R<()> {
         h.report("web", 2.0, at).await?;
         let report = engine.tick(at).await;
         assert_eq!(report.scaled, 0);
-        assert_eq!(report.states.get("web/default/web").map(String::as_str), Some("paused"));
+        assert_eq!(
+            report.states.get("web/default/web").map(String::as_str),
+            Some("paused")
+        );
     }
     let refused = h
         .client
@@ -475,7 +503,11 @@ async fn cas_conflicts_and_pause_all_stop_writes_test() -> R<()> {
         })
         .await
         .expect_err("paused");
-    assert!(refused.message().contains("paused"), "{}", refused.message());
+    assert!(
+        refused.message().contains("paused"),
+        "{}",
+        refused.message()
+    );
     assert_eq!(h.count("web")?, 3);
 
     h.client
@@ -504,14 +536,22 @@ async fn dry_run_records_would_rows_test() -> R<()> {
     let (mut engine, watch) = h.engine(EngineOptions::default()).await?;
     for tick in 0..3 {
         let at = T0 + tick * TICK_MS;
-        h.report("web", 1.4, at).await?;
+        // 130% of the reservation against a 70% target: 2 -> 4 (1.4 would
+        // round up past 4.0 in millicores).
+        h.report("web", 1.3, at).await?;
         let report = engine.tick(at).await;
-        assert_eq!(report.states.get("web/default/web").map(String::as_str), Some("dry-run"));
+        assert_eq!(
+            report.states.get("web/default/web").map(String::as_str),
+            Some("dry-run")
+        );
     }
     watch.abort();
     assert_eq!(h.count("web")?, 2);
     let history = h.history("web").await?;
-    let would: Vec<_> = history.iter().filter(|entry| entry.kind == "would").collect();
+    let would: Vec<_> = history
+        .iter()
+        .filter(|entry| entry.kind == "would")
+        .collect();
     assert_eq!(would.len(), 1, "{history:?}");
     assert!(!would[0].applied);
     assert_eq!((would[0].from, would[0].to), (2, 4));
@@ -567,8 +607,9 @@ async fn defaults_apply_live_and_refuse_invalidating_changes_test() -> R<()> {
         .context("a second set")?;
     assert_eq!(max_of(&next), json!(12), "live, no resubmit");
 
-    // A cluster floor of 7x (14) is above the inherited ceiling of 6x (12).
-    let invalidating = json!({ "max": "6x", "cpu": 0.6, "min": "7x" }).to_string();
+    // A cluster floor of 7x (14) without the 6x ceiling: above the built-in
+    // ceiling of 4x (8).
+    let invalidating = json!({ "cpu": 0.6, "min": "7x" }).to_string();
     let dry = h
         .client
         .apply_scaling_defaults(ApplyScalingDefaultsRequest {
@@ -589,7 +630,11 @@ async fn defaults_apply_live_and_refuse_invalidating_changes_test() -> R<()> {
         .await
         .expect_err("invalidating");
     assert_eq!(refused.code(), tonic::Code::FailedPrecondition);
-    assert!(refused.message().contains("web/default/web"), "{}", refused.message());
+    assert!(
+        refused.message().contains("web/default/web"),
+        "{}",
+        refused.message()
+    );
     h.client
         .apply_scaling_defaults(ApplyScalingDefaultsRequest {
             defaults_json: invalidating,
@@ -601,7 +646,11 @@ async fn defaults_apply_live_and_refuse_invalidating_changes_test() -> R<()> {
         .await??
         .context("a third set")?;
     assert_eq!(held.policies[0].state, "invalid");
-    assert!(held.policies[0].error.contains("min"), "{}", held.policies[0].error);
+    assert!(
+        held.policies[0].error.contains("min"),
+        "{}",
+        held.policies[0].error
+    );
     let status = h
         .client
         .get_scaling_status(GetScalingStatusRequest {
@@ -629,7 +678,11 @@ async fn a_silent_app_reads_not_running_after_three_intervals_test() -> R<()> {
     engine.tick(T0).await;
     watch.abort();
     let state = |reply: &legion::structs::GetScalingStatusReply| {
-        reply.app.as_ref().map(|app| app.state.clone()).unwrap_or_default()
+        reply
+            .app
+            .as_ref()
+            .map(|app| app.state.clone())
+            .unwrap_or_default()
     };
     let status = h
         .client
@@ -644,7 +697,11 @@ async fn a_silent_app_reads_not_running_after_three_intervals_test() -> R<()> {
         .await?
         .into_inner();
     assert_eq!(state(&status), "not-running");
-    let message = status.app.as_ref().map(|app| app.message.clone()).unwrap_or_default();
+    let message = status
+        .app
+        .as_ref()
+        .map(|app| app.message.clone())
+        .unwrap_or_default();
     assert!(message.contains("NOT RUNNING"), "{message}");
     assert_eq!(status.targets[0].state, "stale");
     Ok(())
@@ -669,8 +726,11 @@ fn the_app_runs_on_a_fresh_cluster_and_reads_not_running_when_frozen_test() {
     let _ports = crate::support::DYNAMIC_PORT_GATE.blocking_lock();
     let cluster = crate::system_worker::Cluster::start_with_autoscaler(false);
     let config = cluster.dir().join("autoscaler.json");
-    std::fs::write(&config, json!({ "plugins": {}, "interval": "1s" }).to_string())
-        .expect("write config");
+    std::fs::write(
+        &config,
+        json!({ "plugins": {}, "interval": "1s" }).to_string(),
+    )
+    .expect("write config");
     let set = cluster.cli_json(&[
         "app",
         "config",
@@ -683,9 +743,17 @@ fn the_app_runs_on_a_fresh_cluster_and_reads_not_running_when_frozen_test() {
     let app_state = || {
         let status = cluster.cli_json(&["scaling", "status"]);
         (
-            status["data"]["app"]["state"].as_str().unwrap_or_default().to_string(),
-            status["data"]["app"]["intervalSeconds"].as_u64().unwrap_or_default(),
-            status["data"]["app"]["message"].as_str().unwrap_or_default().to_string(),
+            status["data"]["app"]["state"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string(),
+            status["data"]["app"]["intervalSeconds"]
+                .as_u64()
+                .unwrap_or_default(),
+            status["data"]["app"]["message"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string(),
         )
     };
     cluster.wait_for("the autoscaler to report running at a 1s interval", || {
@@ -700,12 +768,16 @@ fn the_app_runs_on_a_fresh_cluster_and_reads_not_running_when_frozen_test() {
         unsafe { libc::kill(*pid, libc::SIGSTOP) };
     }
     let frozen = Instant::now();
-    cluster.wait_for("the frozen app to read NOT RUNNING", || app_state().0 == "not-running");
+    cluster.wait_for("the frozen app to read NOT RUNNING", || {
+        app_state().0 == "not-running"
+    });
     assert!(frozen.elapsed() < Duration::from_secs(30));
     assert!(app_state().2.contains("NOT RUNNING"));
     for pid in &pids {
         // SAFETY: as above.
         unsafe { libc::kill(*pid, libc::SIGCONT) };
     }
-    cluster.wait_for("the thawed app to report running again", || app_state().0 == "running");
+    cluster.wait_for("the thawed app to report running again", || {
+        app_state().0 == "running"
+    });
 }

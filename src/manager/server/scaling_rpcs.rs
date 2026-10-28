@@ -60,9 +60,7 @@ pub(crate) fn task_scale_statuses(
             let is_autoscaled = crate::manager::autoscale::is_autoscaled(task);
             let policy_summary = match (is_autoscaled, layers.as_ref()) {
                 (true, Some(layers)) => match layers.resolve(job_id, task) {
-                    Ok(Some(resolved)) => {
-                        crate::manager::autoscale::summary_line(&resolved.policy)
-                    }
+                    Ok(Some(resolved)) => crate::manager::autoscale::summary_line(&resolved.policy),
                     Ok(None) => String::new(),
                     Err(err) => format!("invalid: {err}"),
                 },
@@ -73,7 +71,9 @@ pub(crate) fn task_scale_statuses(
                 .flatten();
             let state = match (&entry, is_autoscaled) {
                 (_, false) => String::new(),
-                (Some(entry), true) if board.is_stale(entry.received, std::time::Instant::now()) => {
+                (Some(entry), true)
+                    if board.is_stale(entry.received, std::time::Instant::now()) =>
+                {
                     "stale".to_string()
                 }
                 (Some(entry), true) => entry.state.clone(),

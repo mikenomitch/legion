@@ -2756,10 +2756,19 @@ impl EventRecorder<'_> {
         by: &str,
         reason: &str,
     ) {
-        self.emit(drafts::scale_paused(scope, target, paused, until_ms, by, reason));
+        self.emit(drafts::scale_paused(
+            scope, target, paused, until_ms, by, reason,
+        ));
     }
 
-    pub fn scale_flag(self, kind: &str, job_id: &str, task_group: &str, task_name: &str, message: &str) {
+    pub fn scale_flag(
+        self,
+        kind: &str,
+        job_id: &str,
+        task_group: &str,
+        task_name: &str,
+        message: &str,
+    ) {
         if let Some(draft) = drafts::scale_flag(kind, job_id, task_group, task_name, message) {
             self.emit(draft);
         }

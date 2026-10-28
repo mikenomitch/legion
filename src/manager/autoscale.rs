@@ -132,7 +132,9 @@ impl AutoscaleLayers {
         }
         Self::from_parts(
             defaults.as_ref().map(|(record, _)| record.as_str()),
-            defaults.as_ref().map_or(0, |(_, version)| (*version).max(0) as u64),
+            defaults
+                .as_ref()
+                .map_or(0, |(_, version)| (*version).max(0) as u64),
             policies,
         )
     }
@@ -154,7 +156,11 @@ impl AutoscaleLayers {
 
     /// Resolve one task's `autoscale` against these layers. `Ok(None)` for a
     /// task without autoscaling.
-    pub fn resolve(&self, job_id: &str, task: &TaskConfig) -> Result<Option<ResolvedPolicy>, String> {
+    pub fn resolve(
+        &self,
+        job_id: &str,
+        task: &TaskConfig,
+    ) -> Result<Option<ResolvedPolicy>, String> {
         let Some(spec) = task.autoscale.as_ref().filter(|spec| spec.is_enabled()) else {
             return Ok(None);
         };
@@ -196,7 +202,9 @@ impl AutoscaleLayers {
 
 /// Whether a task has autoscaling on.
 pub fn is_autoscaled(task: &TaskConfig) -> bool {
-    task.autoscale.as_ref().is_some_and(|spec| spec.is_enabled())
+    task.autoscale
+        .as_ref()
+        .is_some_and(|spec| spec.is_enabled())
 }
 
 /// The tasks a policy on `task` moves: the task alone, or every task of its
@@ -219,9 +227,11 @@ pub fn needs_usage(record: &AutoscaleRecord) -> bool {
     }
     record.cpu.is_some()
         || record.memory.is_some()
-        || record.checks.iter().flatten().any(|check| {
-            check.source == LEGION_SOURCE && check.query.ends_with(".utilization")
-        })
+        || record
+            .checks
+            .iter()
+            .flatten()
+            .any(|check| check.source == LEGION_SOURCE && check.query.ends_with(".utilization"))
 }
 
 /// The `autoscale` rules that need only the jobspec. Run by
@@ -283,10 +293,13 @@ pub fn validate_static(config: &JobConfig) -> R<()> {
                 other.count.num
             );
         }
-        if let Some(other) = siblings
-            .iter()
-            .find(|other| other.count.per.is_some() || other.stateful.as_ref().is_some_and(|s| s.mode == InstanceMode::Keyed))
-        {
+        if let Some(other) = siblings.iter().find(|other| {
+            other.count.per.is_some()
+                || other
+                    .stateful
+                    .as_ref()
+                    .is_some_and(|s| s.mode == InstanceMode::Keyed)
+        }) {
             bail!(
                 "{at}: task {} in the same group is keyed or `count.per`, and a group scales as \
                  one unit. Hint: move it to its own group",
@@ -479,7 +492,11 @@ pub fn cpu_reservation(task: &TaskConfig) -> Option<String> {
         return Some(format!(
             "{} core{}",
             fmt_num(cores),
-            if (cores - 1.0).abs() < f64::EPSILON { "" } else { "s" }
+            if (cores - 1.0).abs() < f64::EPSILON {
+                ""
+            } else {
+                "s"
+            }
         ));
     }
     resources
@@ -489,13 +506,11 @@ pub fn cpu_reservation(task: &TaskConfig) -> Option<String> {
 }
 
 fn memory_reservation(task: &TaskConfig) -> Option<String> {
-    task.resources
-        .get("memory")
-        .and_then(|value| match value {
-            Value::Number(number) => number.as_f64().map(|mib| format!("{}MiB", fmt_num(mib))),
-            Value::String(text) => Some(text.clone()),
-            _ => None,
-        })
+    task.resources.get("memory").and_then(|value| match value {
+        Value::Number(number) => number.as_f64().map(|mib| format!("{}MiB", fmt_num(mib))),
+        Value::String(text) => Some(text.clone()),
+        _ => None,
+    })
 }
 
 fn bound_words(bound: Option<CountBound>, name: &str) -> Option<String> {
@@ -609,7 +624,10 @@ pub fn describe(resolved: &ResolvedPolicy, task: &TaskConfig) -> Vec<String> {
     let up_when = if policy.up.stabilize.is_zero() {
         "immediately".to_string()
     } else {
-        format!("after {} above target", format_duration(policy.up.stabilize))
+        format!(
+            "after {} above target",
+            format_duration(policy.up.stabilize)
+        )
     };
     lines.push(format!(
         "up:   {up_when}, at most {} {}{}",
@@ -620,7 +638,10 @@ pub fn describe(resolved: &ResolvedPolicy, task: &TaskConfig) -> Vec<String> {
     let down_when = if policy.down.stabilize.is_zero() {
         "immediately".to_string()
     } else {
-        format!("after {} below target", format_duration(policy.down.stabilize))
+        format!(
+            "after {} below target",
+            format_duration(policy.down.stabilize)
+        )
     };
     lines.push(format!(
         "down: {down_when}, at most {} {}{}",
@@ -748,13 +769,18 @@ mod tests {
                 Some("both set autoscale"),
             ),
             (
-                vec![web(json!({})), web(json!({ "name": "side", "autoscale": false }))],
+                vec![
+                    web(json!({})),
+                    web(json!({ "name": "side", "autoscale": false })),
+                ],
                 None,
             ),
             (
                 vec![
                     web(json!({})),
-                    web(json!({ "name": "side", "autoscale": false, "runtime": "noop", "config": {} })),
+                    web(
+                        json!({ "name": "side", "autoscale": false, "runtime": "noop", "config": {} }),
+                    ),
                 ],
                 Some("(task side of its group) does not report it"),
             ),
@@ -771,9 +797,11 @@ mod tests {
                 Some("has no query 'task.lag'"),
             ),
             (
-                vec![web(json!({ "runtime": "noop", "config": {}, "autoscale": { "checks": [{
+                vec![web(
+                    json!({ "runtime": "noop", "config": {}, "autoscale": { "checks": [{
                     "name": "unplaced", "source": "legion", "query": "task.unplaced",
-                    "strategy": { "name": "pass-through" } }] } }))],
+                    "strategy": { "name": "pass-through" } }] } }),
+                )],
                 None,
             ),
             (
@@ -800,8 +828,8 @@ mod tests {
     #[test]
     fn resolved_rules_and_summary_test() -> R<()> {
         let layers = AutoscaleLayers::default();
-        let resolved = validate_resolved(&job(vec![web(json!({}))]), &layers)
-            .map_err(|err| anyhow!(err))?;
+        let resolved =
+            validate_resolved(&job(vec![web(json!({}))]), &layers).map_err(|err| anyhow!(err))?;
         assert_eq!(resolved.len(), 1);
         assert_eq!(
             resolved[0].summary,
@@ -814,7 +842,10 @@ mod tests {
             ]
         );
         assert!(resolved[0].warnings.is_empty());
-        assert_eq!(summary_line(&resolved[0].resolved.policy), "2..8, cpu 70%, enforce");
+        assert_eq!(
+            summary_line(&resolved[0].resolved.policy),
+            "2..8, cpu 70%, enforce"
+        );
 
         // No cpu reservation: a warning, not an error.
         let bare = job(vec![web(json!({ "resources": { "memory": 64 } }))]);
@@ -822,8 +853,11 @@ mod tests {
         assert!(resolved[0].warnings[0].contains("default cpu reservation"));
 
         // count above an explicit max.
-        let err = validate_resolved(&job(vec![web(json!({ "autoscale": { "max": 1 } }))]), &layers)
-            .unwrap_err();
+        let err = validate_resolved(
+            &job(vec![web(json!({ "autoscale": { "max": 1 } }))]),
+            &layers,
+        )
+        .unwrap_err();
         assert!(err.contains("count 2 is above autoscale.max = 1"), "{err}");
 
         // A gang's floor must hold its quorum.
@@ -835,9 +869,12 @@ mod tests {
 
         // Inherited layers apply live: a cluster default changes the bounds.
         let layers = AutoscaleLayers::from_parts(Some(r#"{"max":"6x","cpu":0.6}"#), 2, Vec::new())?;
-        let resolved = validate_resolved(&job(vec![web(json!({}))]), &layers)
-            .map_err(|err| anyhow!(err))?;
-        assert_eq!(summary_line(&resolved[0].resolved.policy), "2..12, cpu 60%, enforce");
+        let resolved =
+            validate_resolved(&job(vec![web(json!({}))]), &layers).map_err(|err| anyhow!(err))?;
+        assert_eq!(
+            summary_line(&resolved[0].resolved.policy),
+            "2..12, cpu 60%, enforce"
+        );
         Ok(())
     }
 
@@ -868,17 +905,29 @@ mod tests {
         let base = job(vec![web(json!({}))]);
         let with = |extra: Value| job(vec![web(extra)]);
         // Only autoscale changes: in place.
-        assert!(in_place_change(&base, &with(json!({ "autoscale": { "max": 20 } }))));
+        assert!(in_place_change(
+            &base,
+            &with(json!({ "autoscale": { "max": 20 } }))
+        ));
         // Only the count of an autoscaled task: in place.
         assert!(in_place_change(&base, &with(json!({ "count": 4 }))));
         // Both.
-        assert!(in_place_change(&base, &with(json!({ "count": 3, "autoscale": { "max": 9 } }))));
+        assert!(in_place_change(
+            &base,
+            &with(json!({ "count": 3, "autoscale": { "max": 9 } }))
+        ));
         // Removing autoscale with the same count: in place.
         assert!(in_place_change(&base, &with(json!({ "autoscale": false }))));
         // Removing autoscale and changing count: not (Phase 0's rollout).
-        assert!(!in_place_change(&base, &with(json!({ "autoscale": false, "count": 5 }))));
+        assert!(!in_place_change(
+            &base,
+            &with(json!({ "autoscale": false, "count": 5 }))
+        ));
         // Anything else: a rollout.
-        assert!(!in_place_change(&base, &with(json!({ "resources": { "cpu": 600, "memory": 512 } }))));
+        assert!(!in_place_change(
+            &base,
+            &with(json!({ "resources": { "cpu": 600, "memory": 512 } }))
+        ));
         // No autoscale on either side: never in place.
         let plain = job(vec![web(json!({ "autoscale": false }))]);
         let plain_more = job(vec![web(json!({ "autoscale": false, "count": 4 }))]);
