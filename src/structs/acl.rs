@@ -163,7 +163,7 @@ impl AclAction {
 ///
 /// Serialized as JSON inside `AclPolicy.rules_json`. Example:
 /// `{"resources": ["job"], "actions": ["read"], "namespaces": ["default"]}`.
-#[derive(Serialize, Deserialize, Debug, Clone, Default)]
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct AclRule {
     /// Resource types: `job`, `node`, `kv`, `state`, `operator`, `acl`,

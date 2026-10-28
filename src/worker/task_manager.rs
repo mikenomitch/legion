@@ -2273,7 +2273,7 @@ impl WorkerTaskManager {
         allocation_id: i64,
         task_name: &str,
         runtime: &str,
-    ) -> Option<(Option<&'static str>, PathBuf)> {
+    ) -> Option<crate::worker::identity::FileDeliveryBase> {
         if self.registry.load_plugin(runtime, false).is_err() {
             return None;
         }
@@ -2282,12 +2282,26 @@ impl WorkerTaskManager {
         let Some(root) = plugin.file_delivery_root() else {
             // The host's own filesystem: an absolute path is the real path,
             // and a relative one is below the task directory.
-            return Some((None, host));
+            return Some(crate::worker::identity::FileDeliveryBase {
+                in_task_root: None,
+                host_task_dir: host,
+                host_sockets: true,
+            });
         };
-        if let Some(subdir) = plugin.file_delivery_host_subdir() {
-            host.push(subdir);
-        }
-        Some((Some(root), host))
+        // A runtime that projects only a subdirectory (a sandbox guest's
+        // identity files) cannot reach a socket bound on the host.
+        let host_sockets = match plugin.file_delivery_host_subdir() {
+            Some(subdir) => {
+                host.push(subdir);
+                false
+            }
+            None => true,
+        };
+        Some(crate::worker::identity::FileDeliveryBase {
+            in_task_root: Some(root),
+            host_task_dir: host,
+            host_sockets,
+        })
     }
 
     /// Root of per-allocation directories (`<state>/allocs/`).

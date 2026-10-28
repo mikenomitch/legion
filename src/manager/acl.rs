@@ -505,7 +505,14 @@ impl Authenticator {
         ttl: Option<Duration>,
         description: &str,
     ) -> Result<(JoinTokenInfo, String), Status> {
-        self.mint_join_token_with(store, advertise_addr, worker_type, ttl, description, false)
+        self.mint_join_token_with(
+            store,
+            advertise_addr,
+            worker_type,
+            ttl,
+            description,
+            None,
+        )
     }
 
     /// [`Self::mint_join_token`] for a manager's own in-process worker: on a
@@ -513,6 +520,10 @@ impl Authenticator {
     /// leader (`ForwardLaneWrite`) instead of failing, so every manager can
     /// start its system worker, not only the leader. Client RPCs keep the
     /// non-forwarding mint, and follow the leader hint as before.
+    ///
+    /// `pinned_attrs` (a JSON object) are the node attributes a registration
+    /// through this token gets whatever the worker reports: the manager's
+    /// own settings for its worker's `namespaces` and `legion.role`.
     pub fn mint_local_worker_join_token(
         &self,
         store: &Store,
@@ -520,8 +531,16 @@ impl Authenticator {
         worker_type: &str,
         ttl: Option<Duration>,
         description: &str,
+        pinned_attrs: &Value,
     ) -> Result<(JoinTokenInfo, String), Status> {
-        self.mint_join_token_with(store, advertise_addr, worker_type, ttl, description, true)
+        self.mint_join_token_with(
+            store,
+            advertise_addr,
+            worker_type,
+            ttl,
+            description,
+            Some(pinned_attrs.to_string()),
+        )
     }
 
     fn mint_join_token_with(
@@ -531,8 +550,11 @@ impl Authenticator {
         worker_type: &str,
         ttl: Option<Duration>,
         description: &str,
-        forward_to_leader: bool,
+        // Set only for a manager's own in-process worker, whose token is
+        // also the one forwarded to the control leader.
+        pinned_attrs: Option<String>,
     ) -> Result<(JoinTokenInfo, String), Status> {
+        let forward_to_leader = pinned_attrs.is_some();
         let now = OffsetDateTime::now_utc();
         let secret = format!("{JOIN_SECRET_PREFIX}{}", random_hex(24));
         let expires_at = match ttl {
@@ -554,6 +576,7 @@ impl Authenticator {
             created_at: now
                 .format(&Rfc3339)
                 .map_err(|e| Status::internal(format!("clock error: {e}")))?,
+            pinned_attrs,
         };
         // The token pins the CA the managers sign with, so a joining worker
         // can tell its manager from whoever answers at `addr` (plan §6.5).

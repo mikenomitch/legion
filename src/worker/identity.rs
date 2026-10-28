@@ -42,7 +42,11 @@
 
 use crate::prelude::*;
 use crate::structs::manager_client::ManagerClient;
-use crate::structs::workload_identity::{ChangeMode, WorkloadIdentity};
+use crate::structs::workload_identity::{
+    ChangeMode, WorkloadIdentity, IDENTITY_TOKEN_FILE_ENV, MANAGER_ADDR_ENV, SECRETS_DIR_ENV,
+    SECRETS_SUBDIR,
+};
+use crate::worker::api_socket::{AllocationSocket, ApiSocketContext};
 use crate::structs::{IssueWorkloadIdentityTokenRequest, TaskAllocation};
 use crate::util::random_string;
 use crate::worker::task_manager::WorkerTaskManager;
@@ -144,6 +148,23 @@ pub struct PreparedIdentity {
 pub struct FileDeliveryBase {
     pub in_task_root: Option<&'static str>,
     pub host_task_dir: PathBuf,
+    /// Whether a unix socket the worker binds under `host_task_dir` is one
+    /// the task can connect to: true where the task directory is the
+    /// task's own (`exec`, and `container` through its mount), false for a
+    /// sandbox guest, which sees only copied-in files.
+    pub host_sockets: bool,
+}
+
+impl FileDeliveryBase {
+    /// `relative` (below the delivery root) as the task sees it: under the
+    /// runtime's in-task root, or the host path for a runtime that runs on
+    /// the host's filesystem.
+    pub fn in_task_path(&self, relative: &Path) -> PathBuf {
+        match self.in_task_root {
+            Some(root) => Path::new(root).join(relative),
+            None => self.host_task_dir.join(relative),
+        }
+    }
 }
 
 /// Where a token file goes: below a task directory the task can write (so
@@ -176,6 +197,12 @@ pub struct WorkerIdentityManager {
     /// not linger on disk past the workload's life).
     delivered_files: Mutex<HashMap<i64, Vec<PathBuf>>>,
     warned_disabled: AtomicBool,
+    /// How allocations' API sockets reach the managers; `None` serves none
+    /// (tests, and workers built without a manager channel).
+    api_socket_context: Option<ApiSocketContext>,
+    /// The API socket of each allocation that declares the `legion`
+    /// identity, on a runtime that can reach one.
+    api_sockets: Mutex<HashMap<i64, AllocationSocket>>,
 }
 
 impl WorkerIdentityManager {
@@ -186,6 +213,73 @@ impl WorkerIdentityManager {
             epochs: Mutex::new(HashMap::new()),
             delivered_files: Mutex::new(HashMap::new()),
             warned_disabled: AtomicBool::new(false),
+            api_socket_context: None,
+            api_sockets: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Serve a per-allocation API socket to every allocation that declares
+    /// the `legion` identity (docs/workload-identity.md, "The API socket").
+    pub fn with_api_sockets(mut self, context: ApiSocketContext) -> Self {
+        self.api_socket_context = Some(context);
+        self
+    }
+
+    /// Start (or restart) `alloc_id`'s API socket, when this worker serves
+    /// them and the runtime can reach one. `token` is the allocation's
+    /// current `legion` token when the worker holds one; a restored
+    /// allocation's refresher fills it in on its first re-issue.
+    pub fn serve_api_socket(
+        &self,
+        alloc_id: i64,
+        delivery_base: Option<&FileDeliveryBase>,
+        token: Option<String>,
+    ) -> Option<PathBuf> {
+        let context = self.api_socket_context.clone()?;
+        let base = delivery_base.filter(|base| base.host_sockets)?;
+        // An earlier socket for the allocation (a relaunch) goes first: its
+        // drop removes the file the new one binds.
+        self.stop_api_socket(alloc_id);
+        match crate::worker::api_socket::serve(context, alloc_id, &base.host_task_dir, token) {
+            Ok(socket) => {
+                self.api_sockets
+                    .lock()
+                    .expect("identity api sockets lock")
+                    .insert(alloc_id, socket);
+                Some(base.in_task_path(
+                    &Path::new(SECRETS_SUBDIR).join(crate::worker::api_socket::API_SOCKET_NAME),
+                ))
+            }
+            Err(err) => {
+                warn!(
+                    allocation_id = alloc_id,
+                    error = ?err,
+                    "Failed to serve the allocation's API socket; the task can still use its \
+                     token file"
+                );
+                None
+            }
+        }
+    }
+
+    /// The token cell of `alloc_id`'s API socket, for its `legion` identity's
+    /// refresh loop to keep current.
+    fn api_socket_token(&self, alloc_id: i64) -> Option<Arc<std::sync::RwLock<Option<String>>>> {
+        self.api_sockets
+            .lock()
+            .expect("identity api sockets lock")
+            .get(&alloc_id)
+            .map(AllocationSocket::token_cell)
+    }
+
+    fn stop_api_socket(&self, alloc_id: i64) {
+        let removed = self
+            .api_sockets
+            .lock()
+            .expect("identity api sockets lock")
+            .remove(&alloc_id);
+        if removed.is_some() {
+            debug!(allocation_id = alloc_id, "Stopped the allocation's API socket");
         }
     }
 
@@ -213,6 +307,7 @@ impl WorkerIdentityManager {
         let alloc_id = allocation.allocation_id;
         let mut prepared = Vec::new();
         let mut env_injections: Vec<(String, String)> = Vec::new();
+        let mut control_plane_token: Option<String> = None;
 
         for identity in identities {
             let Some(issued) = self.issuer.issue(alloc_id, &identity.name).await? else {
@@ -282,6 +377,9 @@ impl WorkerIdentityManager {
                 expires_at = issued.expires_at,
                 "Delivered workload identity token"
             );
+            if identity.is_control_plane() {
+                control_plane_token = Some(issued.token.clone());
+            }
             prepared.push(PreparedIdentity {
                 identity,
                 expires_at: issued.expires_at,
@@ -292,6 +390,20 @@ impl WorkerIdentityManager {
         if !env_injections.is_empty() {
             inject_env(&mut allocation.task_config, &env_injections)
                 .context("failed to inject identity env vars into task config")?;
+        }
+
+        // The `legion` identity is also the task's way back to Legion: its
+        // API socket and the ambient env that points at it.
+        if let Some(token) = control_plane_token {
+            let identity = prepared
+                .iter()
+                .find(|prepared| prepared.identity.is_control_plane())
+                .map(|prepared| prepared.identity.clone())
+                .expect("a control-plane token came from a prepared identity");
+            let socket = self.serve_api_socket(alloc_id, delivery_base.as_ref(), Some(token));
+            let ambient = ambient_env(&identity, delivery_base.as_ref(), socket.as_deref());
+            inject_env_defaults(&mut allocation.task_config, &ambient)
+                .context("failed to inject the legion identity's env vars into task config")?;
         }
 
         Ok(prepared)
@@ -317,6 +429,13 @@ impl WorkerIdentityManager {
             let issuer = self.issuer.clone();
             let task_manager = task_manager.clone();
             let epoch = epoch.subscribe();
+            // The `legion` identity's fresh token also goes to the API
+            // socket, which attaches it to the task's calls.
+            let socket_token = entry
+                .identity
+                .is_control_plane()
+                .then(|| self.api_socket_token(alloc_id))
+                .flatten();
             handles.push(tokio::spawn(async move {
                 refresh_loop(
                     issuer,
@@ -326,6 +445,7 @@ impl WorkerIdentityManager {
                     entry.delivery_base,
                     task_manager,
                     epoch,
+                    socket_token,
                 )
                 .await;
             }));
@@ -405,6 +525,17 @@ impl WorkerIdentityManager {
         for alloc_id in pruned {
             self.cleanup_files(alloc_id);
         }
+        let stale: Vec<i64> = self
+            .api_sockets
+            .lock()
+            .expect("identity api sockets lock")
+            .keys()
+            .filter(|alloc_id| !live.contains(alloc_id))
+            .copied()
+            .collect();
+        for alloc_id in stale {
+            self.stop_api_socket(alloc_id);
+        }
     }
 
     /// Stop refresh loops for one allocation.
@@ -421,6 +552,7 @@ impl WorkerIdentityManager {
                 }
             }
         }
+        self.stop_api_socket(alloc_id);
         self.cleanup_files(alloc_id);
     }
 
@@ -460,10 +592,58 @@ pub fn parse_identities(raw: &str) -> R<Vec<WorkloadIdentity>> {
     if raw.trim().is_empty() {
         return Ok(Vec::new());
     }
-    let mut identities: Vec<WorkloadIdentity> =
+    let identities: Vec<WorkloadIdentity> =
         serde_json::from_str(raw).context("invalid task identities JSON")?;
-    identities.retain(WorkloadIdentity::is_delivered);
-    Ok(identities)
+    Ok(identities
+        .into_iter()
+        .filter(WorkloadIdentity::is_delivered)
+        .map(WorkloadIdentity::with_default_delivery)
+        .collect())
+}
+
+/// The env the `legion` identity gives a task, in the task's own view
+/// (docs/workload-identity.md, "Ambient env"):
+///
+/// - `LEGION_SECRETS_DIR`: where its token file and API socket live;
+/// - `LEGION_IDENTITY_TOKEN_FILE`: its token file, for clients that cannot
+///   use a socket;
+/// - `LEGION_ADDR=unix://<secrets>/legion.sock`, when the worker serves the
+///   allocation a socket (`api_socket`, already in the task's view).
+///
+/// Nothing for a runtime the worker has no delivery mapping for.
+pub fn ambient_env(
+    identity: &WorkloadIdentity,
+    delivery_base: Option<&FileDeliveryBase>,
+    api_socket: Option<&Path>,
+) -> Vec<(String, String)> {
+    let Some(base) = delivery_base else {
+        return Vec::new();
+    };
+    let mut vars = vec![(
+        SECRETS_DIR_ENV.to_string(),
+        base.in_task_path(Path::new(SECRETS_SUBDIR))
+            .display()
+            .to_string(),
+    )];
+    if let Some(file) = identity.file.as_ref().filter(|file| !file.path.trim().is_empty()) {
+        let declared = Path::new(file.path.trim());
+        let in_task = if declared.is_absolute() {
+            declared.to_path_buf()
+        } else {
+            base.in_task_path(declared)
+        };
+        vars.push((
+            IDENTITY_TOKEN_FILE_ENV.to_string(),
+            in_task.display().to_string(),
+        ));
+    }
+    if let Some(socket) = api_socket {
+        vars.push((
+            MANAGER_ADDR_ENV.to_string(),
+            format!("unix://{}", socket.display()),
+        ));
+    }
+    vars
 }
 
 /// Where the refreshable copy of this identity's token lives: the declared
@@ -705,6 +885,23 @@ fn inject_env(task_config_json: &mut String, vars: &[(String, String)]) -> R<()>
     Ok(())
 }
 
+/// [`inject_env`], leaving any variable the task's own config already sets:
+/// a job that points `LEGION_ADDR` somewhere on purpose keeps it.
+fn inject_env_defaults(task_config_json: &mut String, vars: &[(String, String)]) -> R<()> {
+    let config: Value =
+        serde_json::from_str(task_config_json).context("task config is not valid JSON")?;
+    let declared = config.get("env").and_then(Value::as_object);
+    let missing: Vec<(String, String)> = vars
+        .iter()
+        .filter(|(key, _)| declared.is_none_or(|env| !env.contains_key(key)))
+        .cloned()
+        .collect();
+    if missing.is_empty() {
+        return Ok(());
+    }
+    inject_env(task_config_json, &missing)
+}
+
 fn unix_now() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -737,6 +934,7 @@ async fn refresh_loop(
     delivery_base: Option<FileDeliveryBase>,
     task_manager: Arc<Mutex<WorkerTaskManager>>,
     mut epoch: tokio::sync::watch::Receiver<u64>,
+    socket_token: Option<Arc<std::sync::RwLock<Option<String>>>>,
 ) {
     let mut epoch_open = true;
     loop {
@@ -772,6 +970,11 @@ async fn refresh_loop(
             // good): nothing to refresh anymore.
             None => return,
         };
+        if let Some(cell) = &socket_token {
+            if let Ok(mut current) = cell.write() {
+                *current = Some(issued.token.clone());
+            }
+        }
 
         match apply_refreshed_token(
             &identity,

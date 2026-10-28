@@ -148,6 +148,9 @@ const TABLE_OWNERS: &[(&str, Owner)] = &[
     ("kv_entry", Owner::Lane(Lane::Control)),
     ("kv_lock", Owner::Lane(Lane::Control)),
     ("job_kv_reference", Owner::Lane(Lane::Control)),
+    // Job grants (apps plan §6.4): written by the submit entry that stores
+    // the version they grant, and by revocation.
+    ("job_grant", Owner::Lane(Lane::Control)),
     ("saved_state_query", Owner::Lane(Lane::Control)),
     ("signing_key", Owner::Lane(Lane::Control)),
     // KV encryption keyring (docs/kv-encryption.md): the wrapped data keys.

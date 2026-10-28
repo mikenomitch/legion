@@ -1024,6 +1024,22 @@ pub fn catalog() -> Vec<Capability> {
             mutates: true,
             read_only_safe: false,
         },
+        Capability {
+            name: "acl.grants.list",
+            cli: "legion acl grants list [--job JOB] [--all]",
+            grpc: Some("Manager/ListGrants"),
+            summary: "List job grants: what each job version's `legion` identity was granted at submit, and by whom.",
+            mutates: false,
+            read_only_safe: true,
+        },
+        Capability {
+            name: "acl.grants.revoke",
+            cli: "legion acl grants revoke <JOB> [--version N]",
+            grpc: Some("Manager/RevokeGrant"),
+            summary: "Revoke a job's grants; its workload tokens lose them at their next request.",
+            mutates: true,
+            read_only_safe: false,
+        },
         // --- Service discovery ---
         Capability {
             name: "service.list",

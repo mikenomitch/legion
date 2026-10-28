@@ -651,6 +651,19 @@ fn tool_defs() -> Vec<ToolDef> {
             mutates: false,
         },
         ToolDef {
+            name: "legion_acl_grants_list",
+            description: "List job grants: what each job version's `legion` identity was granted at submit (inline permissions and policy names), who granted it, and whether it was revoked. Needs acl:read.",
+            input_schema: || json!({
+                "type": "object",
+                "properties": {
+                    "job": { "type": "string", "description": "Only this job's grants: its canonical id (`name` in default, else `namespace/name`)." },
+                    "include_revoked": { "type": "boolean", "description": "Also list revoked grants (default false)." }
+                },
+                "additionalProperties": false
+            }),
+            mutates: false,
+        },
+        ToolDef {
             name: "legion_events",
             description: "List recent scheduler events (evals, placements, node/job lifecycle, rollouts). Poll with after_id set to the returned latestId to tail the stream incrementally.",
             input_schema: || json!({
@@ -1709,6 +1722,19 @@ async fn dispatch_tool(name: &str, args: Value) -> Result<Value, String> {
         "legion_acl_whoami" => {
             let mut client = connect().await?;
             grpc(client.who_am_i(crate::structs::WhoAmIRequest {})).await
+        }
+        "legion_acl_grants_list" => {
+            let job = opt_str_arg(&args, "job").filter(|job| !job.trim().is_empty());
+            let include_revoked = args
+                .get("include_revoked")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            let mut client = connect().await?;
+            grpc(client.list_grants(crate::structs::ListGrantsRequest {
+                job,
+                include_revoked,
+            }))
+            .await
         }
         "legion_action_list" => {
             let job = job_arg(&args, "job")?;

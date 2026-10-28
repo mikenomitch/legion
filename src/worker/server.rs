@@ -256,12 +256,6 @@ impl WorkerDaemonService {
                 allocation.allocation_id,
                 &allocation.task_name,
                 &allocation.task_runtime,
-            )
-            .map(
-                |(in_task_root, host_task_dir)| crate::worker::identity::FileDeliveryBase {
-                    in_task_root,
-                    host_task_dir,
-                },
             );
         let prepared = match self.identity.as_ref() {
             Some(identity) => match identity

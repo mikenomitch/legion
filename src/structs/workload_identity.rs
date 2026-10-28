@@ -27,6 +27,29 @@ use crate::prelude::*;
 /// config/authz change rather than a re-architecture.
 pub const CONTROL_PLANE_IDENTITY_NAME: &str = "legion";
 
+/// The directory, relative to the task's delivery root (its task directory
+/// for `exec` and `container`, `/legion/identity` in a sandbox guest), where
+/// the worker puts what the `legion` identity gives a task: its token file
+/// and, where the task can reach a host socket, the API socket. Exported to
+/// the task as [`SECRETS_DIR_ENV`].
+pub const SECRETS_SUBDIR: &str = "secrets";
+
+/// The `legion` identity's token file inside [`SECRETS_SUBDIR`], written
+/// when the identity declares no `file` of its own.
+pub const IDENTITY_TOKEN_FILE_NAME: &str = "legion.token";
+
+/// Env var naming the task's secrets directory (in the task's own view).
+pub const SECRETS_DIR_ENV: &str = "LEGION_SECRETS_DIR";
+
+/// Env var naming the `legion` identity's token file (in the task's own
+/// view). Deliberately not `LEGION_TOKEN_FILE`: `legion login` writes its own
+/// token there, and would overwrite the worker's.
+pub const IDENTITY_TOKEN_FILE_ENV: &str = "LEGION_IDENTITY_TOKEN_FILE";
+
+/// Env var the CLI and the Rust client read the manager address from; the
+/// worker points it at the allocation's API socket (`unix://...`).
+pub const MANAGER_ADDR_ENV: &str = "LEGION_ADDR";
+
 /// JWT claim namespace for Legion-specific scheduling facts.
 pub const LEGION_CLAIM_PREFIX: &str = "legion.io/";
 
@@ -151,6 +174,16 @@ pub struct WorkloadIdentity {
     /// sometimes need different subject shapes per provider).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sub_template: Option<String>,
+    /// What the job may do as itself, on the reserved `legion` identity
+    /// only: inline ACL rules, in the shape `legion acl policy apply` takes.
+    /// Granted at submit only when the submitting token holds every one
+    /// (docs/workload-identity.md, "Permissions").
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub permissions: Vec<crate::structs::acl::AclRule>,
+    /// Names of existing ACL policies to grant as well, on the `legion`
+    /// identity only, under the same check.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub policies: Vec<String>,
 }
 
 impl WorkloadIdentity {
@@ -169,9 +202,30 @@ impl WorkloadIdentity {
     /// Whether the worker delivers this identity's token to the task at all
     /// (env or file). One that is only named by a `connect.upstreams`
     /// credential is not: the manager mints it for the node's forwarder,
-    /// and the task never sees it.
+    /// and the task never sees it. The reserved `legion` identity always is:
+    /// with no `file` of its own, its token goes to
+    /// `$LEGION_SECRETS_DIR/legion.token` ([`Self::with_default_delivery`]).
     pub fn is_delivered(&self) -> bool {
-        self.delivers_env() || self.delivers_file()
+        self.is_control_plane() || self.delivers_env() || self.delivers_file()
+    }
+
+    /// Whether this is the reserved control-plane identity, `legion`.
+    pub fn is_control_plane(&self) -> bool {
+        self.name == CONTROL_PLANE_IDENTITY_NAME
+    }
+
+    /// This identity as the worker delivers it: the `legion` identity with
+    /// no `file` gets one at `secrets/legion.token`, relative to the task's
+    /// delivery root, so its token is always in a known place
+    /// ([`IDENTITY_TOKEN_FILE_ENV`]). Every other identity is unchanged.
+    pub fn with_default_delivery(mut self) -> Self {
+        if self.is_control_plane() && !self.delivers_file() {
+            self.file = Some(WorkloadIdentityFile {
+                path: format!("{SECRETS_SUBDIR}/{IDENTITY_TOKEN_FILE_NAME}"),
+                mode: None,
+            });
+        }
+        self
     }
 
     /// Parse the configured TTL, if any.
@@ -251,6 +305,18 @@ impl WorkloadIdentity {
             }
         }
 
+        if !self.permissions.is_empty() || !self.policies.is_empty() {
+            if !self.is_control_plane() {
+                bail!(
+                    "{scope} sets permissions or policies, which only the reserved \
+                     {CONTROL_PLANE_IDENTITY_NAME:?} identity takes: they are what the job may do \
+                     in Legion itself, and other identities are for other relying parties. Hint: \
+                     move them to an identity named {CONTROL_PLANE_IDENTITY_NAME:?}"
+                );
+            }
+            validate_permissions(&scope, &self.permissions, &self.policies)?;
+        }
+
         if !self.is_delivered() {
             if !injected {
                 bail!(
@@ -318,6 +384,40 @@ impl WorkloadIdentity {
 
         Ok(())
     }
+}
+
+/// Check a `legion` identity's `permissions` (the same rules `legion acl
+/// policy apply` takes, with the same errors) and `policies` (non-empty,
+/// distinct names, none of them a grant reference). Whether the submitter
+/// holds them, and whether the named policies exist, is decided at submit.
+fn validate_permissions(
+    scope: &str,
+    permissions: &[crate::structs::acl::AclRule],
+    policies: &[String],
+) -> R<()> {
+    if !permissions.is_empty() {
+        let rules = serde_json::to_string(permissions)?;
+        crate::structs::acl::parse_rules(&rules)
+            .map_err(|err| anyhow!("{scope} permissions are invalid: {err}"))?;
+    }
+    let mut seen = std::collections::HashSet::new();
+    for policy in policies {
+        let name = policy.trim();
+        if name.is_empty() {
+            bail!("{scope} policies must not contain an empty name");
+        }
+        if name.starts_with(crate::structs::grant::GRANT_POLICY_PREFIX) {
+            bail!(
+                "{scope} names policy {name:?}, but `{}` names are grant references, not \
+                 policies",
+                crate::structs::grant::GRANT_POLICY_PREFIX
+            );
+        }
+        if !seen.insert(name) {
+            bail!("{scope} names policy {name:?} twice");
+        }
+    }
+    Ok(())
 }
 
 /// Maximum length of an identity `name`.

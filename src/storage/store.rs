@@ -122,6 +122,8 @@ pub struct JobSubmitRequest {
     pub config: JobConfig,
     pub subs: Vec<Submission>,
     pub template: Option<JobTemplateProvenance>,
+    /// How the stored version's grant is recorded (`job_grant`).
+    pub grant: crate::storage::acl_store::GrantSource,
 }
 
 /// One eval to enqueue, for the batched [`Store::enqueue_evals`].
@@ -10126,13 +10128,45 @@ impl Store {
     /// [`Self::sync_missing_task_volume_claims`], run from the
     /// node-status-checker loop) once the control rows replicate to it.
     /// Every other error on those halves still fails the submit.
+    ///
+    /// The version's grant (what its `legion` identities may do) is carried
+    /// forward from the version it replaces, when that one's grant asks for
+    /// exactly the same: this is the path Legion's own re-renders take. A
+    /// principal's submit, checked against what they hold, goes through
+    /// [`Self::handle_job_submit_as`] instead.
     #[allow(dead_code)]
     pub fn handle_job_submit(
         &self,
         config: &JobConfig,
         subs: &[Submission],
     ) -> R<JobSubmitOutcome> {
-        self.handle_job_submit_inner(config, subs, None)
+        self.handle_job_submit_inner(
+            config,
+            subs,
+            None,
+            crate::storage::acl_store::GrantSource::CarryForward,
+        )
+    }
+
+    /// [`Self::handle_job_submit`] for a principal's submit that passed the
+    /// grant check (docs/workload-identity.md, "Permissions"): the stored
+    /// version's grant is recorded in `granted_by`'s name, an unchanged
+    /// resubmit included, so a revoked grant is restored by a resubmit from
+    /// someone who holds the access. `template` stamps provenance as
+    /// [`Self::handle_job_submit_from_template`] does.
+    pub fn handle_job_submit_as(
+        &self,
+        config: &JobConfig,
+        subs: &[Submission],
+        template: Option<&JobTemplateProvenance>,
+        granted_by: &str,
+    ) -> R<JobSubmitOutcome> {
+        self.handle_job_submit_inner(
+            config,
+            subs,
+            template,
+            crate::storage::acl_store::GrantSource::Submitter(granted_by.to_string()),
+        )
     }
 
     /// Like `handle_job_submit`, stamping the template that rendered this
@@ -10144,7 +10178,12 @@ impl Store {
         subs: &[Submission],
         template: &JobTemplateProvenance,
     ) -> R<JobSubmitOutcome> {
-        self.handle_job_submit_inner(config, subs, Some(template))
+        self.handle_job_submit_inner(
+            config,
+            subs,
+            Some(template),
+            crate::storage::acl_store::GrantSource::CarryForward,
+        )
     }
 
     fn handle_job_submit_inner(
@@ -10152,11 +10191,13 @@ impl Store {
         config: &JobConfig,
         subs: &[Submission],
         template: Option<&JobTemplateProvenance>,
+        grant: crate::storage::acl_store::GrantSource,
     ) -> R<JobSubmitOutcome> {
         let request = JobSubmitRequest {
             config: config.clone(),
             subs: subs.to_vec(),
             template: template.cloned(),
+            grant,
         };
         // A submit raised from INSIDE another op's capture must stay part of
         // that capture (`replicated` short-circuits there); routing it
@@ -10170,9 +10211,10 @@ impl Store {
                 config,
                 subs,
                 template,
+                grant,
             } = request;
             self.replicated(Lane::Control, "handle_job_submit", move |s| {
-                s.handle_job_submit_apply(&config, &subs, template.as_ref())
+                s.handle_job_submit_apply(&config, &subs, template.as_ref(), &grant)
             })?
         } else {
             let coalescer = Arc::clone(&self.job_submit_coalescer);
@@ -10439,10 +10481,11 @@ impl Store {
         config: &JobConfig,
         subs: &[Submission],
         template: Option<&JobTemplateProvenance>,
+        grant: &crate::storage::acl_store::GrantSource,
     ) -> R<JobSubmitOutcome> {
         let mut conn = self.write_connection()?;
         let tx = Self::write_tx(&mut conn)?;
-        let (outcome, staged) = self.handle_job_submit_tx(&tx, config, subs, template)?;
+        let (outcome, staged) = self.handle_job_submit_tx(&tx, config, subs, template, grant)?;
         tx.commit()
             .map_err(|_| anyhow!("Error committing transaction"))?;
         drop(conn);
@@ -10500,6 +10543,7 @@ impl Store {
                 &request.config,
                 &request.subs,
                 request.template.as_ref(),
+                &request.grant,
             ) {
                 Ok((outcome, staged)) => {
                     if let Err(err) = tx.execute_batch("RELEASE legion_submit_item;") {
@@ -10551,6 +10595,7 @@ impl Store {
                         &request.config,
                         &request.subs,
                         request.template.as_ref(),
+                        &request.grant,
                     )
                 }),
             ];
@@ -10574,6 +10619,7 @@ impl Store {
                                 &request.config,
                                 &request.subs,
                                 request.template.as_ref(),
+                                &request.grant,
                             )
                         })
                     })
@@ -10597,8 +10643,12 @@ impl Store {
         config: &JobConfig,
         subs: &[Submission],
         template: Option<&JobTemplateProvenance>,
+        grant: &crate::storage::acl_store::GrantSource,
     ) -> R<(JobSubmitOutcome, Vec<SchedulerEventRecord>)> {
         let config = self.normalize_job_config(config)?;
+        // What this version's `legion` identities ask for; its grant row is
+        // written in this same transaction, next to the version itself.
+        let requested = crate::structs::grant::requested_grants(&config.tasks);
 
         let mut next_version = 1;
         let mut last_versions_id: Option<String> = None;
@@ -10607,12 +10657,22 @@ impl Store {
         if let Some(latest_job_config) = self.latest_job_config_tx(tx, &config.name)? {
             // if latest_job_config is deep equal to config, return unchanged
             if latest_job_config.is_same_as(&config) {
-                return Ok((
-                    JobSubmitOutcome::Unchanged {
-                        job_config_id: latest_job_config.id(),
-                    },
-                    Vec::new(),
-                ));
+                let job_config_id = latest_job_config.id();
+                // A principal's unchanged resubmit passed the same check, so
+                // it (re)grants; Legion's own re-render of an unchanged
+                // version leaves the grant as it is.
+                if matches!(grant, crate::storage::acl_store::GrantSource::Submitter(_)) {
+                    Self::record_job_grant_tx(
+                        tx,
+                        &config.name,
+                        &job_config_id,
+                        i64::from(latest_job_config.version.unwrap_or(0)),
+                        None,
+                        &requested,
+                        grant,
+                    )?;
+                }
+                return Ok((JobSubmitOutcome::Unchanged { job_config_id }, Vec::new()));
             } else {
                 next_version = latest_job_config.version.unwrap_or(0) + 1;
                 last_versions_id = Some(latest_job_config.id());
@@ -10697,6 +10757,15 @@ impl Store {
                     row.get(0)?,
                 ))
             })?;
+        Self::record_job_grant_tx(
+            tx,
+            &config.name,
+            &job_config_id,
+            i64::from(next_version),
+            last_versions_id.as_deref(),
+            &requested,
+            grant,
+        )?;
 
         for t in &config.tasks {
             let checks = serde_json::to_string(&t.checks)?;
@@ -21430,11 +21499,13 @@ mod tests {
                 config: v1,
                 subs: vec![sub("v1")],
                 template: None,
+                grant: crate::storage::acl_store::GrantSource::CarryForward,
             },
             JobSubmitRequest {
                 config: v2,
                 subs: vec![sub("v2")],
                 template: None,
+                grant: crate::storage::acl_store::GrantSource::CarryForward,
             },
         ];
         let results = store.handle_job_submits_apply(&batch);
@@ -21463,6 +21534,7 @@ mod tests {
             config: latest.clone(),
             subs: vec![sub("v2")],
             template: None,
+            grant: crate::storage::acl_store::GrantSource::CarryForward,
         };
         let fresh = JobSubmitRequest {
             config: JobConfig {
@@ -21478,6 +21550,7 @@ mod tests {
             },
             subs: vec![sub("other")],
             template: None,
+            grant: crate::storage::acl_store::GrantSource::CarryForward,
         };
         let results = store.handle_job_submits_apply(&[unchanged, fresh]);
         assert!(matches!(

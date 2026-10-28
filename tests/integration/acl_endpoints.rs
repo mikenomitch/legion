@@ -249,6 +249,9 @@ fn endpoint_table() -> Vec<(&'static str, Plane)> {
         ("UpsertAclUser", Plane::Protected("acl:write")),
         ("ListAclUsers", Plane::Protected("acl:read")),
         ("DeleteAclUser", Plane::Protected("acl:write")),
+        // Job grants (docs/workload-identity.md, "Permissions"): ACL state.
+        ("ListGrants", Plane::Protected("acl:read")),
+        ("RevokeGrant", Plane::Protected("acl:write")),
     ]
 }
 
@@ -1543,6 +1546,27 @@ async fn call_endpoint(
             ))
             .await
             .map(|_| ()),
+        "ListGrants" => svc
+            .list_grants(req(
+                ListGrantsRequest {
+                    job: Some(JOB_NAME.into()),
+                    include_revoked: true,
+                },
+                token,
+            ))
+            .await
+            .map(|_| ()),
+        "RevokeGrant" => svc
+            .revoke_grant(req(
+                RevokeGrantRequest {
+                    job: JOB_NAME.into(),
+                    version: None,
+                    idempotency_key: None,
+                },
+                token,
+            ))
+            .await
+            .map(|_| ()),
         other => {
             panic!("endpoint_table contains `{other}` but call_endpoint has no builder for it")
         }
@@ -1681,6 +1705,7 @@ fn seed_fixtures(store: &Store) -> R<Fixtures> {
         description: "fixture".into(),
         expires_at: None,
         created_at: "2026-01-01T00:00:00Z".into(),
+        pinned_attrs: None,
     })?;
 
     Ok(Fixtures {

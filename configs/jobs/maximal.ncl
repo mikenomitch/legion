@@ -421,13 +421,38 @@
                 {
                     # Reserved control-plane identity: authenticates back to
                     # Legion itself. Omit `audience` — the manager owns it and
-                    # stamps aud = the cluster issuer.
+                    # stamps aud = the cluster issuer. Declaring it also gives
+                    # the allocation a local API socket and ambient env
+                    # (LEGION_ADDR=unix://$LEGION_SECRETS_DIR/legion.sock,
+                    # LEGION_IDENTITY_TOKEN_FILE), so `legion ...` inside the
+                    # task needs no setup. `file` is optional here: without
+                    # it the token is written to
+                    # $LEGION_SECRETS_DIR/legion.token.
                     name = "legion",
                     file = {
                         path = "/var/run/legion/identity/legion/token",
                         mode = "0400",
                     },
                     changeMode = "noop",
+                    # What the job may do as itself: inline ACL rules, in the
+                    # shape `legion acl policy apply` takes. Granted at submit
+                    # only if the submitting token holds every one of them
+                    # (docs/workload-identity.md, "Permissions"); listed and
+                    # revoked with `legion acl grants`.
+                    permissions = [
+                        { resources = ["kv"], actions = ["read"], paths = ["maximal/*"] },
+                        {
+                            resources = ["job"],
+                            actions = ["read"],
+                            namespaces = ["default"],
+                            names = ["maximal-*"],
+                        },
+                    ],
+                    # Names of existing ACL policies to grant as well, under
+                    # the same check. Commented out because a named policy
+                    # must exist when the job is submitted, and this file
+                    # must submit on a bare cluster.
+                    # policies = ["cert-writer"],
                 },
                 {
                     # Injection only: no env or file, because the "billing"

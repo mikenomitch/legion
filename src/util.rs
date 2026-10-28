@@ -144,6 +144,32 @@ pub fn write_file_beneath(root: &Path, relative: &Path, content: &[u8], mode: u3
     }
 }
 
+/// Open (making when missing) the directory `root/relative` without
+/// following a symlink at any step, the way [`write_file_beneath`] reaches
+/// its directory. For a root worker that creates something other than a
+/// file (a unix socket) in a directory a task can also write: the returned
+/// descriptor names the real directory whatever the task has put in its
+/// path, and `/proc/self/fd/<fd>/<name>` reaches inside it.
+#[cfg(unix)]
+pub fn open_dir_beneath(root: &Path, relative: &Path) -> R<std::os::fd::OwnedFd> {
+    use anyhow::{bail, Context};
+    use std::path::Component;
+    let mut parts = Vec::new();
+    for component in relative.components() {
+        match component {
+            Component::Normal(part) => parts.push(part),
+            Component::CurDir => {}
+            _ => bail!(
+                "{} is not a plain relative path below {}",
+                relative.display(),
+                root.display()
+            ),
+        }
+    }
+    beneath::open_dir(root, &parts)
+        .with_context(|| format!("open {} below {}", relative.display(), root.display()))
+}
+
 #[cfg(unix)]
 mod beneath {
     use std::ffi::{CString, OsStr};
@@ -187,13 +213,9 @@ mod beneath {
         }
     }
 
-    pub(super) fn write(
-        root: &Path,
-        parents: &[&OsStr],
-        file_name: &OsStr,
-        content: &[u8],
-        mode: u32,
-    ) -> std::io::Result<()> {
+    /// `root/parents...`, each step opened with `O_NOFOLLOW` and made when
+    /// missing.
+    pub(super) fn open_dir(root: &Path, parents: &[&OsStr]) -> std::io::Result<OwnedFd> {
         // `root` itself may sit in a directory the task owns (an `exec`
         // task's user owns its allocation directory), so its last component
         // is not followed either. It may not exist yet (a runtime's delivery
@@ -212,6 +234,17 @@ mod beneath {
         for part in parents {
             dir = open_or_make_dir_at(&dir, &cstr(part)?)?;
         }
+        Ok(dir)
+    }
+
+    pub(super) fn write(
+        root: &Path,
+        parents: &[&OsStr],
+        file_name: &OsStr,
+        content: &[u8],
+        mode: u32,
+    ) -> std::io::Result<()> {
+        let dir = open_dir(root, parents)?;
         let tmp_name = cstr(OsStr::new(&format!(
             ".{}.legion-tmp-{}",
             file_name.to_string_lossy(),

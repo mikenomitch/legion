@@ -584,12 +584,32 @@ async fn run_worker_with_manager(join: WorkerJoin, name_override: Option<&str>) 
         })
     };
     // Workload-identity delivery/refresh: tokens are requested from the
-    // manager under this worker's node id.
-    let identity_manager = Arc::new(WorkerIdentityManager::new(Arc::new(ManagerTokenIssuer {
-        client: client.clone(),
-        node_id: name.clone(),
-        credentials: credentials.clone(),
-    })));
+    // manager under this worker's node id. Allocations that declare the
+    // `legion` identity also get an API socket proxied over the same
+    // manager channel (docs/workload-identity.md, "The API socket"). Its
+    // peer check uses cgroup leaves where every task is guaranteed one: the
+    // resource governor enforces, or the kernel host guard runs.
+    let leaves_guaranteed = task_manager
+        .lock()
+        .expect("task manager")
+        .resource_enforcement_enabled()
+        || kernel_guard == crate::worker::netd::kernel_guard::Availability::Active;
+    let api_sockets = crate::worker::api_socket::ApiSocketContext {
+        channel: managers.channel(),
+        managers: Some(managers.clone()),
+        peer_check: crate::worker::api_socket::PeerCheck::for_node(
+            leaves_guaranteed,
+            &enforcement_config.cgroup_parent,
+        ),
+    };
+    let identity_manager = Arc::new(
+        WorkerIdentityManager::new(Arc::new(ManagerTokenIssuer {
+            client: client.clone(),
+            node_id: name.clone(),
+            credentials: credentials.clone(),
+        }))
+        .with_api_sockets(api_sockets),
+    );
     for (allocation, task) in restored_allocations {
         // Restored allocations were issued tokens by a previous worker
         // process; seed their refresh loops with an already-expired token so
@@ -600,13 +620,12 @@ async fn run_worker_with_manager(join: WorkerJoin, name_override: Option<&str>) 
             let delivery_base = task_manager
                 .lock()
                 .expect("task manager")
-                .file_delivery_base(allocation.id, &task.name, &task.runtime)
-                .map(
-                    |(in_task_root, host_task_dir)| crate::worker::identity::FileDeliveryBase {
-                        in_task_root,
-                        host_task_dir,
-                    },
-                );
+                .file_delivery_base(allocation.id, &task.name, &task.runtime);
+            // The previous process's socket died with it; serve a new one
+            // at the same path, which its first re-issue gives a token.
+            if task.identities.iter().any(|identity| identity.is_control_plane()) {
+                identity_manager.serve_api_socket(allocation.id, delivery_base.as_ref(), None);
+            }
             let prepared = task
                 .identities
                 .iter()
@@ -2963,12 +2982,6 @@ async fn heartbeat_tick(
                     allocation.allocation_id,
                     &allocation.task_name,
                     &allocation.task_runtime,
-                )
-                .map(
-                    |(in_task_root, host_task_dir)| crate::worker::identity::FileDeliveryBase {
-                        in_task_root,
-                        host_task_dir,
-                    },
                 );
             match identity_manager
                 .prepare_task_allocation(allocation, delivery_base)
@@ -3201,7 +3214,9 @@ async fn apply_templates(task_manager: &Arc<Mutex<WorkerTaskManager>>, reply: &H
             (running, (base, task_dir))
         };
         let (delivery, task_dir) = base;
-        let (in_task_root, host_task_dir) = delivery.unwrap_or((None, task_dir));
+        let (in_task_root, host_task_dir) = delivery
+            .map(|base| (base.in_task_root, base.host_task_dir))
+            .unwrap_or((None, task_dir));
         let mut env: std::collections::BTreeMap<String, String> = network
             .as_ref()
             .map(|n| n.env_pairs().into_iter().collect())

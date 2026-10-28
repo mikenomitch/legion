@@ -2138,6 +2138,40 @@ service Manager {
   // deleted; deleting the user only prevents future logins.
   rpc DeleteAclUser (DeleteAclUserRequest) returns (DeleteAclUserReply);
 
+  // Lists job grants: what each job config version's `legion` identities
+  // were granted at submit, and by whom (docs/workload-identity.md,
+  // "Permissions"). Requires `acl:read`.
+  //
+  // A job asks for access to Legion itself with `permissions` (inline ACL
+  // rules) and `policies` (policy names) on the reserved `legion` identity
+  // of a task. Every path that stores a job config (RunJob, RunJobTemplate)
+  // grants them only when the submitting token holds every one, and records
+  // the grant with the version, in the submitter's name. A workload's
+  // `legion` token then carries the grant of the version its allocation
+  // runs, resolved when the token is verified. Versions that ask for nothing
+  // have no grant and are not listed.
+  //
+  // Revoked grants are left out unless `include_revoked` is set.
+  rpc ListGrants (ListGrantsRequest) returns (ListGrantsReply);
+
+  // Revokes a job's grants: every version's, or one version's. Requires
+  // `acl:write`.
+  //
+  // A workload token resolves its grant every time it is verified, so the
+  // job's tokens (and ACL tokens minted from them with `legion login
+  // --method legion`) lose the access at their next request; tokens keep
+  // whatever `controlPlaneBindings` give them. Allocations keep running.
+  // Revocation does not stick to the job: the next submit of the job by
+  // someone who holds the access grants it again, as a submit always does.
+  //
+  // Retry-safe: a repeated `idempotency_key` returns the first reply with
+  // `deduplicated` set. Revoking a job with no live grants succeeds and
+  // revokes nothing (`revoked = 0`).
+  //
+  // Errors:
+  // - InvalidArgument: `job` is empty.
+  rpc RevokeGrant (RevokeGrantRequest) returns (RevokeGrantReply);
+
   // Lists the auth methods clients may log in with.
   //
   // Open endpoint: login UIs need this before any credential exists. Only
@@ -11458,6 +11492,102 @@ message DeleteAclUserRequest {
 message DeleteAclUserReply {
   // Human-readable status message.
   string message = 1;
+}
+
+// Request payload for ListGrants.
+message ListGrantsRequest {
+  // Only this job's grants: its canonical id (`namespace/name`, or the bare
+  // name for a job in `default`). Unset or empty lists every job's.
+  optional string job = 1;
+
+  // Also list revoked grants, with who revoked them and when.
+  //
+  // Default: false.
+  bool include_revoked = 2;
+}
+
+// What one task's `legion` identity was granted.
+message TaskGrantInfo {
+  // The task's group.
+  string group = 1;
+
+  // The task's name.
+  string task = 2;
+
+  // The inline rules granted (`permissions` on the identity), as a JSON
+  // array in the shape `legion acl policy apply` takes. `[]` when the
+  // identity named only policies.
+  string permissions_json = 3;
+
+  // The policy names granted (`policies` on the identity). Resolved by name
+  // when a token is verified, so a later edit to a policy applies to the
+  // grant too.
+  repeated string policies = 4;
+}
+
+// One job config version's grant.
+message JobGrant {
+  // The job's canonical id.
+  string job_id = 1;
+
+  // The job config version the grant belongs to; allocations of other
+  // versions resolve those versions' grants.
+  int64 version = 2;
+
+  // The job config id (`<job id>-<version>`).
+  string job_config_id = 3;
+
+  // What each task asking for something was granted.
+  repeated TaskGrantInfo tasks = 4;
+
+  // The principal whose submit was checked and granted it (for example
+  // `userpass:alice`). A version Legion stored itself, re-rendering a job
+  // after a KV change, carries the previous version's grant, and its granter,
+  // when it asks for exactly the same.
+  string granted_by = 5;
+
+  // When the grant was recorded (RFC3339).
+  string granted_at = 6;
+
+  // When the grant was revoked (RFC3339), empty while it is live.
+  string revoked_at = 7;
+
+  // Who revoked it, empty while it is live.
+  string revoked_by = 8;
+}
+
+// Reply payload for ListGrants.
+message ListGrantsReply {
+  // Grants, by job id, newest version first.
+  repeated JobGrant grants = 1;
+}
+
+// Request payload for RevokeGrant.
+message RevokeGrantRequest {
+  // The job's canonical id (`namespace/name`, or the bare name in
+  // `default`). Required.
+  string job = 1;
+
+  // Revoke only this version's grant. Unset revokes every version's, which
+  // is what stops a running job's access whatever version it runs.
+  optional int64 version = 2;
+
+  // Optional key to dedupe retries; a repeat returns the first reply with
+  // `deduplicated = true`.
+  optional string idempotency_key = 3;
+}
+
+// Reply payload for RevokeGrant.
+message RevokeGrantReply {
+  // Human-readable status message.
+  string message = 1;
+
+  // How many live grants this call revoked.
+  uint32 revoked = 2;
+
+  // True when `idempotency_key` matched an earlier call, whose reply this
+  // is.
+  bool deduplicated = 3;
 }
 
 // === AUTH METHODS & JOIN TOKENS ===

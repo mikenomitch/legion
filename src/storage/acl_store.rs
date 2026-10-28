@@ -9,9 +9,10 @@ use crate::storage::errors::StorageError;
 use crate::storage::store::Store;
 use crate::storage::Lane;
 use crate::structs::acl::parse_rules;
+use crate::structs::grant::{parse_grant_policy_ref, TaskGrant, GRANT_POLICY_PREFIX};
 use crate::structs::{AclPolicy, AclTokenInfo, AclUser, ExecKey};
 
-use rusqlite::{named_params, OptionalExtension, Row};
+use rusqlite::{named_params, params, Connection, OptionalExtension, Row};
 use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
 
@@ -67,6 +68,12 @@ pub struct JoinTokenRecord {
     pub description: String,
     pub expires_at: Option<String>,
     pub created_at: String,
+    /// The node config attributes a registration through this token gets
+    /// whatever the worker reports (`namespaces`, `legion.role`), as a JSON
+    /// object. Set for the token a manager mints for its own in-process
+    /// worker; `None` takes them from the worker type.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pinned_attrs: Option<String>,
 }
 
 impl JoinTokenRecord {
@@ -114,6 +121,47 @@ impl AclUserRecord {
     }
 }
 
+/// One job config version's grant: what its tasks' `legion` identities
+/// were granted at submit (docs/workload-identity.md, "Permissions").
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JobGrantRecord {
+    pub job_config_id: String,
+    /// The canonical job id (`namespace/name`, or the bare name in
+    /// `default`).
+    pub job_id: String,
+    pub version: i64,
+    pub tasks: Vec<TaskGrant>,
+    /// The principal whose submit was checked (`userpass:alice`), or the
+    /// version's own grant carried forward by a KV re-render.
+    pub granted_by: String,
+    pub granted_at: String,
+    pub revoked_at: Option<String>,
+    pub revoked_by: Option<String>,
+}
+
+impl JobGrantRecord {
+    pub fn is_revoked(&self) -> bool {
+        self.revoked_at.is_some()
+    }
+}
+
+/// How a submit records the grant of the version it stores.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GrantSource {
+    /// A principal submitted the job and the submit-time check passed: the
+    /// version's grant is theirs. Recorded on every submit, an unchanged one
+    /// included, so a resubmit by someone who holds the access restores a
+    /// revoked grant.
+    Submitter(String),
+    /// Legion stored the version itself (a KV re-render): the previous
+    /// version's grant carries forward when the new version asks for exactly
+    /// the same and it is not revoked; otherwise the version has none.
+    CarryForward,
+}
+
+const JOB_GRANT_COLUMNS: &str =
+    "job_config_id, job_id, version, tasks, granted_by, granted_at, revoked_at, revoked_by";
+
 fn parse_policy_names(raw: String) -> Vec<String> {
     serde_json::from_str(&raw).unwrap_or_default()
 }
@@ -157,6 +205,12 @@ impl Store {
         let name = name.trim();
         if name.is_empty() {
             return Err(invalid_input("policy name must not be empty".into()));
+        }
+        if name.starts_with(GRANT_POLICY_PREFIX) {
+            return Err(invalid_input(format!(
+                "policy names starting with `{GRANT_POLICY_PREFIX}` are reserved: a token carries \
+                 `{GRANT_POLICY_PREFIX}alloc/<id>` for the grant of the job an allocation runs"
+            )));
         }
         parse_rules(rules_json).map_err(|e| invalid_input(format!("invalid policy rules: {e}")))?;
 
@@ -245,6 +299,21 @@ impl Store {
     ) -> R<Vec<crate::structs::acl::AclRule>> {
         let mut rules = Vec::new();
         for name in policy_names {
+            // A grant reference stands for the grant of the job an
+            // allocation runs, read now, so a revoke applies at the next
+            // request: its inline permissions, then its named policies.
+            if let Some(allocation_id) = parse_grant_policy_ref(name) {
+                if let Some(grant) = self.task_grant_for_allocation(allocation_id)? {
+                    rules.extend(grant.permissions);
+                    let named: Vec<String> = grant
+                        .policies
+                        .into_iter()
+                        .filter(|policy| parse_grant_policy_ref(policy).is_none())
+                        .collect();
+                    rules.extend(self.resolve_acl_rules(&named)?);
+                }
+                continue;
+            }
             if let Some(policy) = self.get_acl_policy(name)? {
                 match parse_rules(&policy.rules_json) {
                     Ok(parsed) => rules.extend(parsed),
@@ -253,6 +322,189 @@ impl Store {
             }
         }
         Ok(rules)
+    }
+
+    /// The live grant of the task an allocation runs: its job config
+    /// version's grant, unrevoked, narrowed to the allocation's own task.
+    /// `None` when the allocation is gone, its version has no grant, or the
+    /// grant was revoked. One indexed read; runs on every verification of a
+    /// workload's `legion` token.
+    pub fn task_grant_for_allocation(&self, allocation_id: i64) -> R<Option<TaskGrant>> {
+        let conn = self.read_connection()?;
+        let row: Option<(String, String, String)> = conn
+            .prepare_cached(
+                "SELECT g.tasks, tc.group_name, tc.name
+                 FROM allocation a
+                 JOIN job_grant g ON g.job_config_id = a.job_config_id
+                 JOIN task_config tc ON tc.id = a.task_config_id
+                 WHERE a.id = ?1 AND g.revoked_at IS NULL;",
+            )?
+            .query_row([allocation_id], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+            })
+            .optional()?;
+        let Some((tasks, group, task)) = row else {
+            return Ok(None);
+        };
+        let tasks: Vec<TaskGrant> = serde_json::from_str(&tasks).unwrap_or_else(|err| {
+            warn!(allocation_id, error = %err, "Unreadable job grant; granting nothing");
+            Vec::new()
+        });
+        Ok(tasks
+            .into_iter()
+            .find(|grant| grant.group == group && grant.task == task))
+    }
+
+    /// Grants, newest version first: one job's (by canonical id) or every
+    /// job's. Revoked grants are left out unless `include_revoked`.
+    #[instrument(err, skip_all)]
+    pub fn list_job_grants(
+        &self,
+        job_id: Option<&str>,
+        include_revoked: bool,
+    ) -> R<Vec<JobGrantRecord>> {
+        let conn = self.read_connection()?;
+        let mut sql = format!("SELECT {JOB_GRANT_COLUMNS} FROM job_grant WHERE 1 = 1");
+        if job_id.is_some() {
+            sql.push_str(" AND job_id = ?1");
+        }
+        if !include_revoked {
+            sql.push_str(" AND revoked_at IS NULL");
+        }
+        sql.push_str(" ORDER BY job_id ASC, version DESC;");
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = match job_id {
+            Some(job_id) => stmt.query_map([job_id], Self::job_grant_from_row)?,
+            None => stmt.query_map([], Self::job_grant_from_row)?,
+        };
+        Self::collect_rows(rows)
+    }
+
+    fn job_grant_from_row(row: &Row<'_>) -> rusqlite::Result<JobGrantRecord> {
+        let tasks: String = row.get(3)?;
+        Ok(JobGrantRecord {
+            job_config_id: row.get(0)?,
+            job_id: row.get(1)?,
+            version: row.get(2)?,
+            tasks: serde_json::from_str(&tasks).unwrap_or_default(),
+            granted_by: row.get(4)?,
+            granted_at: row.get(5)?,
+            revoked_at: row.get(6)?,
+            revoked_by: row.get(7)?,
+        })
+    }
+
+    /// Revoke a job's grants: every version's, or one version's. A token
+    /// resolves its grant on every verification, so the job's tokens lose
+    /// the access at their next request. Returns how many grants this
+    /// revoked (already-revoked ones are left as they are).
+    #[instrument(err, skip_all, fields(job_id = job_id))]
+    pub fn revoke_job_grants(
+        &self,
+        job_id: &str,
+        version: Option<i64>,
+        revoked_by: &str,
+    ) -> R<u64> {
+        let job_id = job_id.to_owned();
+        let revoked_by = revoked_by.to_owned();
+        self.replicated(Lane::Control, "revoke_job_grants", move |s| {
+            s.revoke_job_grants_apply(&job_id, version, &revoked_by)
+        })
+    }
+
+    fn revoke_job_grants_apply(
+        &self,
+        job_id: &str,
+        version: Option<i64>,
+        revoked_by: &str,
+    ) -> R<u64> {
+        let now = OffsetDateTime::now_utc().format(&Rfc3339)?;
+        let conn = self.write_connection()?;
+        let revoked = conn.execute(
+            "UPDATE job_grant SET revoked_at = ?1, revoked_by = ?2
+             WHERE job_id = ?3 AND revoked_at IS NULL
+               AND (?4 IS NULL OR version = ?4);",
+            params![now, revoked_by, job_id, version],
+        )?;
+        Ok(revoked as u64)
+    }
+
+    /// Record the grant of the version a submit just stored (or found
+    /// unchanged), inside the submit's own transaction. `tasks` is what the
+    /// version asks for (`crate::structs::grant::requested_grants`); a
+    /// version that asks for nothing gets no row.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn record_job_grant_tx(
+        tx: &Connection,
+        job_id: &str,
+        job_config_id: &str,
+        version: i64,
+        previous_job_config_id: Option<&str>,
+        tasks: &[TaskGrant],
+        source: &GrantSource,
+    ) -> R<()> {
+        if tasks.is_empty() {
+            return Ok(());
+        }
+        let tasks_json = serde_json::to_string(tasks)?;
+        let now = OffsetDateTime::now_utc().format(&Rfc3339)?;
+        match source {
+            GrantSource::Submitter(principal) => {
+                // An unchanged row stays as it is (no write, so a steady
+                // resubmit adds nothing to the log); a revoked one, or one
+                // another principal granted, is granted again by this one.
+                tx.execute(
+                    "INSERT INTO job_grant
+                         (job_config_id, job_id, version, tasks, granted_by, granted_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                     ON CONFLICT(job_config_id) DO UPDATE SET
+                         tasks = excluded.tasks,
+                         granted_by = excluded.granted_by,
+                         granted_at = excluded.granted_at,
+                         revoked_at = NULL,
+                         revoked_by = NULL
+                     WHERE job_grant.tasks IS NOT excluded.tasks
+                        OR job_grant.granted_by IS NOT excluded.granted_by
+                        OR job_grant.revoked_at IS NOT NULL;",
+                    params![job_config_id, job_id, version, tasks_json, principal, now],
+                )?;
+            }
+            GrantSource::CarryForward => {
+                let Some(previous) = previous_job_config_id else {
+                    return Ok(());
+                };
+                let carried: Option<(String, String)> = tx
+                    .query_row(
+                        "SELECT tasks, granted_by FROM job_grant
+                         WHERE job_config_id = ?1 AND revoked_at IS NULL;",
+                        [previous],
+                        |row| Ok((row.get(0)?, row.get(1)?)),
+                    )
+                    .optional()?;
+                let Some((previous_tasks, granted_by)) = carried else {
+                    return Ok(());
+                };
+                let previous_tasks: Vec<TaskGrant> =
+                    serde_json::from_str(&previous_tasks).unwrap_or_default();
+                if previous_tasks != tasks {
+                    warn!(
+                        job_id,
+                        job_config_id,
+                        "A re-rendered job version asks for different permissions than the \
+                         version it replaces; it carries no grant until someone who holds them \
+                         resubmits it"
+                    );
+                    return Ok(());
+                }
+                tx.execute(
+                    "INSERT OR IGNORE INTO job_grant
+                         (job_config_id, job_id, version, tasks, granted_by, granted_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6);",
+                    params![job_config_id, job_id, version, tasks_json, granted_by, now],
+                )?;
+            }
+        }
+        Ok(())
     }
 
     fn acl_token_from_row(row: &Row<'_>) -> rusqlite::Result<AclTokenRecord> {
@@ -433,11 +685,15 @@ impl Store {
             description: row.get(3)?,
             expires_at: row.get(4)?,
             created_at: row.get(5)?,
+            pinned_attrs: row
+                .get::<_, String>(6)
+                .ok()
+                .filter(|attrs| !attrs.is_empty()),
         })
     }
 
     const JOIN_TOKEN_COLUMNS: &'static str =
-        "id, secret_hash, worker_type, description, expires_at, created_at";
+        "id, secret_hash, worker_type, description, expires_at, created_at, pinned_attrs";
 
     #[instrument(err, skip_all, fields(id = record.id, worker_type = record.worker_type))]
     pub fn insert_join_token(&self, record: &JoinTokenRecord) -> R<()> {
@@ -467,8 +723,10 @@ impl Store {
     fn insert_join_token_apply(&self, record: &JoinTokenRecord) -> R<()> {
         let conn = self.write_connection()?;
         conn.execute(
-            "INSERT INTO join_token (id, secret_hash, worker_type, description, expires_at, created_at)
-             VALUES (:id, :secret_hash, :worker_type, :description, :expires_at, :created_at);",
+            "INSERT INTO join_token (id, secret_hash, worker_type, description, expires_at, created_at,
+                                     pinned_attrs)
+             VALUES (:id, :secret_hash, :worker_type, :description, :expires_at, :created_at,
+                     :pinned_attrs);",
             named_params! {
                 ":id": record.id,
                 ":secret_hash": record.secret_hash,
@@ -476,6 +734,7 @@ impl Store {
                 ":description": record.description,
                 ":expires_at": record.expires_at,
                 ":created_at": record.created_at,
+                ":pinned_attrs": record.pinned_attrs.clone().unwrap_or_default(),
             },
         )?;
         Ok(())
@@ -943,6 +1202,7 @@ mod acl_store_test {
             description: "rack 12".into(),
             expires_at: None,
             created_at: "2026-01-01T00:00:00Z".into(),
+            pinned_attrs: None,
         };
         store.insert_join_token(&record)?;
 
@@ -961,6 +1221,7 @@ mod acl_store_test {
             description: String::new(),
             expires_at: Some("2020-01-01T00:00:00Z".into()),
             created_at: "2020-01-01T00:00:00Z".into(),
+            pinned_attrs: None,
         })?;
         let (acl_pruned, join_pruned) = store.prune_expired_credentials()?;
         assert_eq!((acl_pruned, join_pruned), (0, 1));

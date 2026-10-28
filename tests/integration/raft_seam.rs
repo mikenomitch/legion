@@ -88,6 +88,7 @@ const CLASSIFIED_MUTATIONS: &[&str] = &[
     "renew_kv_lock",
     "replace_job_kv_references",
     "request_job_restart",
+    "revoke_job_grants",
     "set_node_availability",
     // Count overrides (`legion job scale`): operator/autoscaler intent,
     // control-owned so the submit-time ownership arbitration rides the
@@ -300,6 +301,7 @@ fn lane_for(method: &str) -> Lane {
         | "renew_kv_lock"
         | "replace_job_kv_references"
         | "request_job_restart"
+        | "revoke_job_grants"
         | "set_node_availability"
         | "set_task_scale_override"
         | "set_task_scale_pending"

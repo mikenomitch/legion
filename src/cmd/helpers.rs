@@ -122,9 +122,59 @@ fn parse_timeout(var: &str, raw: Option<&str>, default: Duration) -> R<Option<Du
 }
 
 /// The manager address the CLI talks to: `LEGION_ADDR`, else
-/// `http://127.0.0.1:4747`.
+/// `http://127.0.0.1:4747`. Inside a task that declares the `legion`
+/// identity the worker sets it to the allocation's API socket,
+/// `unix:///…/legion.sock` (docs/workload-identity.md, "The API socket").
 pub fn manager_address() -> String {
     std::env::var("LEGION_ADDR").unwrap_or_else(|_| DEF_MANAGER_ADDRESS.to_owned())
+}
+
+/// The socket path of a `unix://` manager address (`unix:///path/legion.sock`
+/// or `unix:relative.sock`), or `None` for a network address.
+pub fn unix_socket_path(address: &str) -> Option<std::path::PathBuf> {
+    let rest = address
+        .strip_prefix("unix://")
+        .or_else(|| address.strip_prefix("unix:"))?;
+    (!rest.is_empty()).then(|| std::path::PathBuf::from(rest))
+}
+
+/// A channel to the gRPC server listening on the unix socket at `path`.
+/// The connection opens on the first call. A path longer than a socket
+/// address holds (about 100 bytes, which a deep task directory can exceed)
+/// is reached through its directory's `/proc/self/fd` entry on Linux.
+pub fn unix_socket_channel(path: std::path::PathBuf, connect_timeout: Option<Duration>) -> Channel {
+    // The URI is a placeholder: the connector dials the socket.
+    let mut endpoint = Endpoint::from_static("http://legion.sock")
+        .http2_keep_alive_interval(Duration::from_secs(30))
+        .keep_alive_timeout(Duration::from_secs(10));
+    if let Some(connect) = connect_timeout {
+        endpoint = endpoint.connect_timeout(connect);
+    }
+    endpoint.connect_with_connector_lazy(tower::service_fn(move |_: http::Uri| {
+        let path = path.clone();
+        async move {
+            let stream = connect_unix(&path).await?;
+            Ok::<_, std::io::Error>(hyper_util::rt::TokioIo::new(stream))
+        }
+    }))
+}
+
+async fn connect_unix(path: &std::path::Path) -> std::io::Result<tokio::net::UnixStream> {
+    /// `sun_path` is 108 bytes on Linux (104 on macOS), NUL included.
+    const MAX_SOCKET_PATH: usize = 100;
+    if path.as_os_str().len() <= MAX_SOCKET_PATH || !cfg!(target_os = "linux") {
+        return tokio::net::UnixStream::connect(path).await;
+    }
+    let (Some(dir), Some(name)) = (path.parent(), path.file_name()) else {
+        return tokio::net::UnixStream::connect(path).await;
+    };
+    let dir = std::fs::File::open(dir)?;
+    let via = std::path::Path::new("/proc/self/fd")
+        .join(std::os::fd::AsRawFd::as_raw_fd(&dir).to_string())
+        .join(name);
+    let stream = tokio::net::UnixStream::connect(&via).await;
+    drop(dir);
+    stream
 }
 
 /// A manager address as a token-file name: `host_port`, so
@@ -133,6 +183,20 @@ pub fn manager_address() -> String {
 /// default, and anything outside `[A-Za-z0-9.-]` becomes `_`, so an IPv6
 /// address or a typo can never name a path outside the tokens directory.
 pub fn token_file_key(address: &str) -> String {
+    if let Some(path) = unix_socket_path(address) {
+        // A socket has no host and port; its path names it. `unix_` keeps
+        // it apart from every network address's key.
+        return format!("unix_{}", path.display())
+            .chars()
+            .map(|c| {
+                if c.is_ascii_alphanumeric() || c == '.' || c == '-' {
+                    c
+                } else {
+                    '_'
+                }
+            })
+            .collect();
+    }
     let host_port = match address.parse::<http::Uri>() {
         Ok(uri) if uri.host().is_some() => {
             let host = uri.host().unwrap_or_default().trim_matches(['[', ']']);
@@ -212,8 +276,35 @@ pub fn load_cli_token(address: &str) -> (Option<String>, TokenSource) {
 }
 
 /// Persists a token for future CLI calls to `address` (0600 on unix).
+///
+/// Never over the `legion` identity's token file
+/// (`LEGION_IDENTITY_TOKEN_FILE`): inside a task that file is the worker's,
+/// refreshed on its own schedule, and a login token written there would be
+/// overwritten, or would replace the identity the task's other clients read.
 pub fn save_cli_token(address: &str, secret: &str) -> R<std::path::PathBuf> {
     let path = cli_token_path(address);
+    if let Some(identity_file) = std::env::var_os(
+        crate::structs::workload_identity::IDENTITY_TOKEN_FILE_ENV,
+    )
+    .map(std::path::PathBuf::from)
+    {
+        let same = |a: &std::path::Path, b: &std::path::Path| {
+            a == b
+                || matches!(
+                    (std::fs::canonicalize(a), std::fs::canonicalize(b)),
+                    (Ok(a), Ok(b)) if a == b
+                )
+        };
+        if same(&path, &identity_file) {
+            bail!(
+                "refusing to store the login token at {}: it is this task's workload identity \
+                 token file ({}), which the worker refreshes. Point LEGION_TOKEN_FILE somewhere \
+                 else, or leave it unset",
+                path.display(),
+                crate::structs::workload_identity::IDENTITY_TOKEN_FILE_ENV
+            );
+        }
+    }
     if let Some(parent) = path.parent() {
         crate::util::create_private_dir_all(parent)?;
     }
@@ -242,6 +333,11 @@ fn token_note(address: &str, source: &TokenSource) -> String {
              accept (revoked, expired, or issued by another cluster); run `legion login`, set \
              LEGION_TOKEN, or on the manager's machine use <dataDir>/bootstrap-token",
             path.display()
+        ),
+        TokenSource::Missing(_) if unix_socket_path(address).is_some() => format!(
+            "the CLI sent no token to {address}, so the worker behind that socket attached this \
+             task's `legion` identity, which the manager does not accept (workload identity \
+             disabled, or the job's grant revoked); `legion acl whoami` shows what it holds"
         ),
         TokenSource::Missing(path) => format!(
             "the CLI has no token for {address}: LEGION_TOKEN is unset and {} does not exist; \
@@ -286,6 +382,15 @@ pub fn connect_manager_client_at(
     timeouts: ClientTimeouts,
 ) -> R<AuthedManagerClient> {
     let address = address.to_owned();
+    if let Some(path) = unix_socket_path(&address) {
+        // A local socket (a task's API socket): no TLS, and the worker
+        // behind it attaches the task's identity when the CLI sends no
+        // token of its own.
+        return Ok(ManagerClient::with_interceptor(
+            unix_socket_channel(path, timeouts.connect),
+            auth_interceptor(&address, timeouts.request),
+        ));
+    }
     let mut endpoint = Endpoint::from_shared(address.clone())
         .with_context(|| format!("invalid manager address: {address}"))?
         // Notice a manager that vanished under a long stream (`exec`,

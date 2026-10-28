@@ -103,6 +103,10 @@ use crate::structs::{
     UpsertAclPolicyRequest, UpsertAclUserReply, UpsertAclUserRequest, WhoAmIReply, WhoAmIRequest,
 };
 use crate::structs::{
+    JobGrant, ListGrantsReply, ListGrantsRequest, RevokeGrantReply, RevokeGrantRequest,
+    TaskGrantInfo,
+};
+use crate::structs::{
     BackupEncryptionInfo, GetKeyringStatusReply, GetKeyringStatusRequest, KeyringKeyInfo,
     KeyringRewrapProgress, ResetKeyringReply, ResetKeyringRequest, RewrapKvReply, RewrapKvRequest,
     RewrapRootKeyReply, RewrapRootKeyRequest, RotateDataKeyReply, RotateDataKeyRequest,
@@ -2310,6 +2314,7 @@ impl ManagerDaemonService {
             Status::invalid_argument(format!("Error validating task configs: {e}"))
         })?;
         self.validate_identity_sub_templates(&config)?;
+        self.enforce_identity_grants(identity, &config)?;
         enforce_kv_tls_read(identity, &config.tasks)?;
         self.check_job_plugins(&config.tasks)?;
         enforce_kv_credential_read(
@@ -2336,13 +2341,13 @@ impl ManagerDaemonService {
                 },
             )?;
         let config = config;
-        let submit_outcome = match template {
-            Some(template) => self
-                .store
-                .handle_job_submit_from_template(&config, &subs, template),
-            None => self.store.handle_job_submit(&config, &subs),
-        }
-        .map_err(|e| map_store_error("Error running job", e))?;
+        // The version's grant is recorded in the submitter's name, in the
+        // same entry as the version (`enforce_identity_grants` above checked
+        // they hold it).
+        let submit_outcome = self
+            .store
+            .handle_job_submit_as(&config, &subs, template, &identity.principal)
+            .map_err(|e| map_store_error("Error running job", e))?;
         crate::manager::telemetry::metrics()
             .job_submits_total
             .inc(&[&namespace]);
@@ -2563,6 +2568,88 @@ impl ManagerDaemonService {
                 .chain(crate::task_plugins::container_security_warnings(&config))
                 .collect(),
         })
+    }
+
+    /// What a job's `legion` identities ask for (`permissions`, and the
+    /// rules of the `policies` they name) may be granted only when the
+    /// submitting token holds every one (apps plan §6.4,
+    /// docs/workload-identity.md, "Permissions"). Runs on every path that
+    /// stores a job config, and on every submit, an unchanged resubmit
+    /// included, so nobody launders a grant by resubmitting a job they can
+    /// write. Coverage is [`crate::structs::grant::first_uncovered`].
+    fn enforce_identity_grants(
+        &self,
+        identity: &AclIdentity,
+        config: &JobConfig,
+    ) -> Result<(), Status> {
+        use crate::structs::grant::{first_uncovered, requested_grants, UncoveredReason};
+        const HINT: &str =
+            "Hint: have someone with that access submit this job, or ask for it to be granted \
+             to you";
+        let requested = requested_grants(&config.tasks);
+        for grant in &requested {
+            let who = if config.tasks.len() == 1 {
+                format!("{}: identity 'legion'", config.name)
+            } else {
+                format!("{}: task {}'s identity 'legion'", config.name, grant.task)
+            };
+            let missing = self
+                .store
+                .missing_acl_policies(&grant.policies)
+                .map_err(|e| map_store_error("Error loading ACL policies", e))?;
+            if !missing.is_empty() {
+                return Err(Status::invalid_argument(format!(
+                    "{who} names policies that do not exist: {}\nHint: create them with `legion \
+                     acl policy apply`, or list the permissions inline",
+                    missing.join(", ")
+                )));
+            }
+            let mut asks: Vec<(Option<&str>, Vec<crate::structs::acl::AclRule>)> =
+                vec![(None, grant.permissions.clone())];
+            for policy in &grant.policies {
+                let rules = self
+                    .store
+                    .resolve_acl_rules(std::slice::from_ref(policy))
+                    .map_err(|e| map_store_error("Error loading ACL policies", e))?;
+                asks.push((Some(policy.as_str()), rules));
+            }
+            for (policy, rules) in asks {
+                let Some(miss) = first_uncovered(identity, &rules) else {
+                    continue;
+                };
+                let asks_for = match policy {
+                    Some(policy) => format!("asks for policy {policy}, which grants {}", miss.what),
+                    None => format!("asks for {}", miss.what),
+                };
+                let message = match miss.reason {
+                    UncoveredReason::NotHeld => {
+                        format!("{who} {asks_for}, which your token does not hold")
+                    }
+                    UncoveredReason::Reserved => format!(
+                        "{who} {asks_for}, which your token does not hold (`*` does not reach \
+                         reserved `legion-*` namespaces or `legion/` keys; only a rule that \
+                         names them covers a request for them)"
+                    ),
+                    UncoveredReason::DenyRules => format!(
+                        "{who} {asks_for}; your token holds it, but it also carries deny rules on \
+                         {}, so granting it takes acl:write",
+                        miss.resource
+                    ),
+                };
+                if identity.audit_only {
+                    warn!(
+                        target: "acl_audit",
+                        principal = %identity.principal,
+                        job = %config.name,
+                        enforced = false,
+                        "grant check would deny (audit-only): {message}"
+                    );
+                    continue;
+                }
+                return Err(Status::permission_denied(format!("{message}\n{HINT}")));
+            }
+        }
+        Ok(())
     }
 
     /// `RunJob` after its ACL gate: the idempotency check, the submit, and
@@ -2933,6 +3020,103 @@ impl ManagerDaemonService {
             return Ok(());
         }
         Err(Status::permission_denied(message))
+    }
+
+    /// The registration's config attributes with the keys Legion owns
+    /// pinned (apps plan calls entry 19): a node's `namespaces` restriction
+    /// and its `legion.role` come from what the registration's grant says,
+    /// never from what the worker reports. A worker that forges its
+    /// registration can therefore neither drop its restriction nor claim to
+    /// be a manager's own.
+    ///
+    /// - A join token a manager minted for its own in-process worker carries
+    ///   both (the manager's own `systemWorker` settings, or `--run-worker`'s).
+    /// - Any other join token takes them from its worker type.
+    /// - A node token keeps what the node registered with.
+    /// - ACLs off, a management credential, or an audit-only pass: as
+    ///   reported, since nothing about the caller is proven.
+    fn pin_registration_attrs(
+        &self,
+        grant: &RegistrationGrant,
+        node_id: &str,
+        reported: &str,
+    ) -> Result<String, Status> {
+        use crate::constraints::NODE_NAMESPACES_ATTR;
+        use crate::structs::MANAGER_ROLE_ATTR;
+        const PINNED: [&str; 2] = [NODE_NAMESPACES_ATTR, MANAGER_ROLE_ATTR];
+        let pinned: serde_json::Map<String, Value> = match grant {
+            RegistrationGrant::Unrestricted => return Ok(reported.to_string()),
+            RegistrationGrant::JoinToken { record, .. } => match &record.pinned_attrs {
+                Some(raw) => serde_json::from_str(raw).map_err(|e| {
+                    Status::internal(format!("join token {} pins unreadable attributes: {e}", record.id))
+                })?,
+                None => {
+                    let worker_type = self
+                        .store
+                        .get_worker_type(record.worker_type.clone())
+                        .map_err(|e| map_store_error("Error loading worker type", e))?;
+                    let mut attrs = serde_json::Map::new();
+                    if !worker_type.namespaces.is_empty() {
+                        attrs.insert(
+                            NODE_NAMESPACES_ATTR.to_string(),
+                            json!(worker_type.namespaces),
+                        );
+                    }
+                    if let Some(role) = worker_type.attributes.get(MANAGER_ROLE_ATTR) {
+                        attrs.insert(MANAGER_ROLE_ATTR.to_string(), json!(role));
+                    }
+                    attrs
+                }
+            },
+            RegistrationGrant::Node(_) => {
+                let existing = self
+                    .store
+                    .get_node(node_id)
+                    .map_err(|e| map_store_error("Error loading node", e))?;
+                PINNED
+                    .iter()
+                    .filter_map(|key| {
+                        existing
+                            .config_attrs
+                            .get(*key)
+                            .map(|value| (key.to_string(), value.clone()))
+                    })
+                    .collect()
+            }
+        };
+        let mut attrs: Value = serde_json::from_str(reported).unwrap_or_else(|_| json!({}));
+        if !attrs.is_object() {
+            attrs = json!({});
+        }
+        let object = attrs.as_object_mut().expect("made an object above");
+        for key in PINNED {
+            match pinned.get(key) {
+                Some(value) => {
+                    if object.get(key) != Some(value) {
+                        if object.contains_key(key) {
+                            warn!(
+                                node_id,
+                                attribute = key,
+                                "Registration reported a node attribute Legion pins; using the \
+                                 pinned value"
+                            );
+                        }
+                        object.insert(key.to_string(), value.clone());
+                    }
+                }
+                None => {
+                    if object.remove(key).is_some() {
+                        warn!(
+                            node_id,
+                            attribute = key,
+                            "Registration reported a node attribute its grant does not give; \
+                             dropping it"
+                        );
+                    }
+                }
+            }
+        }
+        Ok(attrs.to_string())
     }
 
     /// A registration's `workerFleet` claim, checked against its grant. The
@@ -8681,10 +8865,11 @@ impl Manager for ManagerDaemonService {
         let identity = self.authenticate_acl(&request)?;
         let grant =
             self.verify_join_for_registration(&identity, request.get_ref().join_token.as_deref())?;
-        let request = request.into_inner();
+        let mut request = request.into_inner();
         let node_id = request.name.clone();
         self.enforce_registration_grant(&grant, None, Some((&node_id, &request.pool)))?;
         self.enforce_fleet_claim(&grant, &node_id, &request.config_attrs)?;
+        request.config_attrs = self.pin_registration_attrs(&grant, &node_id, &request.config_attrs)?;
 
         // Protocol-version handshake (see docs/upgrades.md): accept workers
         // at or below our protocol version, warn on pre-versioning workers
@@ -11627,6 +11812,105 @@ impl Manager for ManagerDaemonService {
     }
 
     #[instrument(skip_all)]
+    async fn list_grants(
+        &self,
+        request: Request<ListGrantsRequest>,
+    ) -> Result<Response<ListGrantsReply>, Status> {
+        // Grants are ACL state: who may do what, and who said so.
+        self.check_acl(
+            &request,
+            AclResource::Acl,
+            AclAction::Read,
+            AclScope::none(),
+        )?;
+        let req = request.into_inner();
+        let job = req
+            .job
+            .as_deref()
+            .map(str::trim)
+            .filter(|job| !job.is_empty());
+        let grants = self
+            .store
+            .list_job_grants(job, req.include_revoked)
+            .map_err(|e| map_store_error("Error listing grants", e))?;
+        Ok(Response::new(ListGrantsReply {
+            grants: grants.into_iter().map(job_grant_to_proto).collect(),
+        }))
+    }
+
+    #[instrument(skip_all, fields(job))]
+    async fn revoke_grant(
+        &self,
+        request: Request<RevokeGrantRequest>,
+    ) -> Result<Response<RevokeGrantReply>, Status> {
+        let identity = self.check_acl(
+            &request,
+            AclResource::Acl,
+            AclAction::Write,
+            AclScope::none(),
+        )?;
+        let req = request.into_inner();
+        let job = req.job.trim().to_string();
+        if job.is_empty() {
+            return Err(Status::invalid_argument("job is required"));
+        }
+        tracing::Span::current().record("job", job.as_str());
+        let idempotency_key = scoped_idempotency_key(
+            &identity,
+            "revoke_grant",
+            req.idempotency_key.as_deref(),
+            &req,
+        );
+        if let Some(recorded) = self
+            .store
+            .idempotency_lookup(&idempotency_key)
+            .map_err(|e| map_store_error("Error checking idempotency", e))?
+        {
+            let mut reply: RevokeGrantReply =
+                serde_json::from_str(&recorded).unwrap_or(RevokeGrantReply {
+                    message: recorded,
+                    ..Default::default()
+                });
+            reply.deduplicated = true;
+            return Ok(Response::new(reply));
+        }
+        let revoked = self
+            .store
+            .revoke_job_grants(&job, req.version, &identity.principal)
+            .map_err(|e| map_store_error("Error revoking grants", e))?;
+        info!(
+            job = %job,
+            revoked,
+            principal = %identity.principal,
+            "Job grants revoked"
+        );
+        let reply = RevokeGrantReply {
+            message: match (revoked, req.version) {
+                (0, _) => format!("job `{job}` had no live grant to revoke"),
+                (_, Some(version)) => format!(
+                    "revoked the grant of job `{job}` version {version}; its tokens lose it at \
+                     their next request"
+                ),
+                (n, None) => format!(
+                    "revoked {n} grant{} of job `{job}`; its tokens lose them at their next \
+                     request",
+                    if n == 1 { "" } else { "s" }
+                ),
+            },
+            revoked: u32::try_from(revoked).unwrap_or(u32::MAX),
+            deduplicated: false,
+        };
+        self.store
+            .idempotency_record(
+                &idempotency_key,
+                "revoke_grant",
+                &serde_json::to_string(&reply).unwrap_or_else(|_| reply.message.clone()),
+            )
+            .map_err(|e| map_store_error("Error recording idempotency", e))?;
+        Ok(Response::new(reply))
+    }
+
+    #[instrument(skip_all)]
     async fn get_auth_methods(
         &self,
         request: Request<GetAuthMethodsRequest>,
@@ -12182,6 +12466,30 @@ struct MintedTicketRecord {
 /// unambiguous whatever the parts contain, and the request's fingerprint
 /// follows the last `#` ([`Store::idempotency_lookup`] refuses a key whose
 /// record carries another one).
+/// A stored grant as the API shows it.
+fn job_grant_to_proto(record: crate::storage::acl_store::JobGrantRecord) -> JobGrant {
+    JobGrant {
+        job_id: record.job_id,
+        version: record.version,
+        job_config_id: record.job_config_id,
+        tasks: record
+            .tasks
+            .into_iter()
+            .map(|task| TaskGrantInfo {
+                group: task.group,
+                task: task.task,
+                permissions_json: serde_json::to_string(&task.permissions)
+                    .unwrap_or_else(|_| "[]".into()),
+                policies: task.policies,
+            })
+            .collect(),
+        granted_by: record.granted_by,
+        granted_at: record.granted_at,
+        revoked_at: record.revoked_at.unwrap_or_default(),
+        revoked_by: record.revoked_by.unwrap_or_default(),
+    }
+}
+
 fn scoped_idempotency_key(
     identity: &AclIdentity,
     operation: &str,

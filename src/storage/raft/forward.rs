@@ -550,6 +550,7 @@ mod tests {
                     description: "system worker (systemWorker)".into(),
                     expires_at: Some("2026-10-28T00:15:00Z".into()),
                     created_at: "2026-10-28T00:00:00Z".into(),
+                    pinned_attrs: None,
                 },
             },
         ];
@@ -587,6 +588,7 @@ mod tests {
                     description: String::new(),
                     expires_at: None,
                     created_at: String::new(),
+                    pinned_attrs: None,
                 },
             }
             .lane(),

@@ -939,6 +939,27 @@ struct InProcessWorker {
     state_dir: Option<std::path::PathBuf>,
 }
 
+impl InProcessWorker {
+    /// The node attributes its registration takes from its join token
+    /// rather than from what the worker reports (apps plan calls entry 19):
+    /// its `namespaces` restriction and `legion.role`. A forged registration
+    /// with this token can neither drop the restriction nor claim another
+    /// role.
+    fn pinned_attrs(&self) -> Value {
+        let mut attrs = serde_json::Map::new();
+        if let Some(namespaces) = &self.local.namespaces {
+            attrs.insert(
+                crate::constraints::NODE_NAMESPACES_ATTR.to_string(),
+                json!(namespaces),
+            );
+        }
+        if let Some(role) = self.local.attributes.get(MANAGER_ROLE_ATTR) {
+            attrs.insert(MANAGER_ROLE_ATTR.to_string(), json!(role));
+        }
+        Value::Object(attrs)
+    }
+}
+
 /// Which in-process worker this manager runs (docs/architecture-managers-
 /// workers.md, "The system worker"):
 ///
@@ -1029,6 +1050,7 @@ async fn in_process_join_credentials(
                         worker.worker_type,
                         Some(Duration::from_secs(15 * 60)),
                         worker.description,
+                        &worker.pinned_attrs(),
                     )
                     .map_err(|e| {
                         anyhow!("failed to mint the in-process worker's join token: {e}")

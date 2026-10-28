@@ -2155,6 +2155,40 @@ fn migration_list() -> Vec<M<'static>> {
         // which reads as "every namespace". Control lane, like the rest of
         // `worker_type`.
         M::up("ALTER TABLE worker_type ADD COLUMN namespaces TEXT NOT NULL DEFAULT '';").down(""),
+        // Job grants (apps plan §6.4, docs/workload-identity.md,
+        // "Permissions"): what each job config version's `legion` identities
+        // were granted at submit, by whom, and whether it was revoked. One
+        // row per version that asks for anything; `tasks` is a JSON array of
+        // `{group, task, permissions, policies}`. A token resolves its
+        // allocation's version's row on every verification, so a revoke
+        // takes effect at the next request. Control lane with `job_config`,
+        // so the row and the version it grants are one entry, and a version
+        // pruned or destroyed takes its grant with it.
+        M::up(
+            "CREATE TABLE IF NOT EXISTS job_grant (
+            job_config_id TEXT PRIMARY KEY,
+            job_id TEXT NOT NULL,
+            version INTEGER NOT NULL,
+            tasks TEXT NOT NULL,
+            granted_by TEXT NOT NULL,
+            granted_at TEXT NOT NULL,
+            revoked_at TEXT,
+            revoked_by TEXT,
+            FOREIGN KEY(job_config_id) REFERENCES job_config(id) ON DELETE CASCADE
+        );
+        CREATE INDEX IF NOT EXISTS idx_job_grant_job ON job_grant(job_id);",
+        )
+        .down(
+            "DROP INDEX IF EXISTS idx_job_grant_job;
+        DROP TABLE IF EXISTS job_grant;",
+        ),
+        // Join tokens a manager mints for its own in-process worker pin the
+        // node's `namespaces` restriction and `legion.role` (JSON object), so
+        // registration takes them from the token rather than from what the
+        // worker reports (apps plan calls entry 19). Empty for tokens minted
+        // by `CreateJoinToken`, whose worker type supplies both.
+        M::up("ALTER TABLE join_token ADD COLUMN pinned_attrs TEXT NOT NULL DEFAULT '';")
+            .down(""),
     ]
 }
 
