@@ -625,16 +625,11 @@ impl AutoscaleRecord {
                         .to_string(),
                 );
             }
-            let mut names = BTreeSet::new();
-            for shorthand in ["cpu", "memory"] {
-                let set = match shorthand {
-                    "cpu" => self.cpu.is_some(),
-                    _ => self.memory.is_some(),
-                };
-                if set {
-                    names.insert(shorthand.to_string());
-                }
-            }
+            let mut names: BTreeSet<String> = [("cpu", self.cpu), ("memory", self.memory)]
+                .into_iter()
+                .filter(|(_, target)| target.is_some())
+                .map(|(name, _)| name.to_string())
+                .collect();
             for (index, check) in checks.iter().enumerate() {
                 check.validate(index)?;
                 if !names.insert(check.name.clone()) {
