@@ -543,8 +543,20 @@ pub struct RollupSender {
     acked: Option<u64>,
     /// What the leader holds from this manager as of `acked`.
     sent: HashMap<RollupKey, Rollup>,
-    /// The sync in flight and the state it leaves the leader in.
-    in_flight: Option<(u64, HashMap<RollupKey, Rollup>)>,
+    /// The sync in flight, and what it changes in `sent` once applied.
+    in_flight: Option<(u64, InFlight)>,
+}
+
+/// What an in-flight sync does to the sender's record of the leader's state.
+/// A delta keeps only its own changes, so a steady tick costs a walk of the
+/// current rollups and no copy of them.
+#[derive(Debug)]
+enum InFlight {
+    Full(HashMap<RollupKey, Rollup>),
+    Delta {
+        upserts: Vec<(RollupKey, Rollup)>,
+        removed: Vec<RollupKey>,
+    },
 }
 
 impl RollupSender {
@@ -576,23 +588,18 @@ impl RollupSender {
     pub fn next_sync(&mut self, current: &HashMap<RollupKey, Rollup>) -> RollupSync {
         self.seq += 1;
         let refresh_ms = ROLLUP_REFRESH.as_millis() as i64;
-        let (full, base_seq, rollups, after) = match self.acked {
+        let (full, base_seq, rollups, in_flight) = match self.acked {
             None => {
-                let mut keys: Vec<&RollupKey> = current.keys().collect();
-                keys.sort();
-                let rollups = keys
-                    .into_iter()
-                    .map(|key| current[key].to_proto(key))
+                let rollups = current
+                    .iter()
+                    .map(|(key, rollup)| rollup.to_proto(key))
                     .collect();
-                (true, 0, rollups, current.clone())
+                (true, 0, rollups, InFlight::Full(current.clone()))
             }
             Some(base) => {
-                let mut after = self.sent.clone();
                 let mut changed: Vec<TargetRollup> = Vec::new();
-                let mut keys: Vec<&RollupKey> = current.keys().collect();
-                keys.sort();
-                for key in keys {
-                    let rollup = &current[key];
+                let mut upserts: Vec<(RollupKey, Rollup)> = Vec::new();
+                for (key, rollup) in current {
                     let resend = match self.sent.get(key) {
                         None => true,
                         Some(previous) => {
@@ -603,23 +610,20 @@ impl RollupSender {
                     };
                     if resend {
                         changed.push(rollup.to_proto(key));
-                        after.insert(key.clone(), rollup.clone());
+                        upserts.push((key.clone(), rollup.clone()));
                     }
                 }
-                let mut gone: Vec<&RollupKey> = self
+                let removed: Vec<RollupKey> = self
                     .sent
                     .keys()
                     .filter(|key| !current.contains_key(*key))
+                    .cloned()
                     .collect();
-                gone.sort();
-                for key in gone {
-                    changed.push(removed_proto(key));
-                    after.remove(key);
-                }
-                (false, base, changed, after)
+                changed.extend(removed.iter().map(removed_proto));
+                (false, base, changed, InFlight::Delta { upserts, removed })
             }
         };
-        self.in_flight = Some((self.seq, after));
+        self.in_flight = Some((self.seq, in_flight));
         RollupSync {
             epoch: self.epoch,
             seq: self.seq,
@@ -631,9 +635,18 @@ impl RollupSender {
 
     /// The leader applied the sync last produced.
     pub fn acked(&mut self) {
-        if let Some((seq, after)) = self.in_flight.take() {
-            self.acked = Some(seq);
-            self.sent = after;
+        let Some((seq, in_flight)) = self.in_flight.take() else {
+            return;
+        };
+        self.acked = Some(seq);
+        match in_flight {
+            InFlight::Full(state) => self.sent = state,
+            InFlight::Delta { upserts, removed } => {
+                for key in &removed {
+                    self.sent.remove(key);
+                }
+                self.sent.extend(upserts);
+            }
         }
     }
 
