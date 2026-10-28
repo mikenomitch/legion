@@ -11,13 +11,14 @@
 {
   interval = "15s",
   plugins = {
-    # A Prometheus server, for teams in the payments namespaces. A tenant's
-    # query reads whatever this server can see, so give each tenant group
-    # its own source if their metrics must not mix.
+    # A Prometheus server, for the payments teams and the media team's render
+    # farm (render-farm.ncl). A tenant's query reads whatever this server can
+    # see, so give each tenant group its own source if their metrics must
+    # not mix.
     team-prom = {
       builtin = "prometheus",
       config = { address = "http://prometheus.internal:9090" },
-      namespaces = ["payments-*"],
+      namespaces = ["payments-*", "media"],
     },
     # A JSON document over HTTP; a check's query is a JSON pointer into it.
     ingest-stats = {
