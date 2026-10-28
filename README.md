@@ -439,7 +439,7 @@ start:
   [Adaptive Scheduler Concurrency](docs/adaptive-scheduler-concurrency.md)
 - **Running workloads:** [Task Runtimes](docs/task-runtime-plugins.md) ·
   [Artifacts](docs/artifacts.md) · [Rollouts](docs/rollouts.md) ·
-  [Scaling Jobs](docs/autoscaling.md) ·
+  [Autoscaling](docs/autoscaling.md) ·
   [Gang Scheduling](docs/gang-scheduling.md) ·
   [Task Supervision](docs/task-supervision.md) ·
   [Resource Enforcement](docs/resource-enforcement.md)

@@ -219,6 +219,13 @@ Important `TaskConfig` fields:
   [Workload Identity](workload-identity.md) for the full spec reference,
   claim details, and provider examples. Tasks without `identities` are
   unaffected.
+- `autoscale`: `true`, or a record overriding some of the effective
+  defaults: the bundled autoscaler then owns the task's live count, holding
+  CPU near 70% of the reservation between `count` and four times `count` by
+  default, and `count` becomes the floor. A resubmit that changes only
+  `autoscale` (or an autoscaled task's `count`) moves the running
+  allocations to the new version without a rollout. See
+  [Autoscaling](autoscaling.md).
 
 ## Task Lists and Dependency Readiness
 

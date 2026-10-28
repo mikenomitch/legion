@@ -242,7 +242,7 @@ the Access page reports it instead.
     the spec count, the override with its source and age, the effective count
     and any pending scale-in. It also has a Desired field with Scale / Reset,
     backed by the same `ScaleTask` RPC as `legion job scale`
-    ([Scaling Jobs](autoscaling.md)). The card is gated by `scale:write`.
+    ([Autoscaling](autoscaling.md)). The card is gated by `scale:write`.
     Keyed stateful tasks are read-only, with the reason in the tooltip. The
     whole card is hidden when `GetJobScaleStatus` is denied.
   - has a **Request vs usage** card (`components/UsageInputsPanel.tsx`), the

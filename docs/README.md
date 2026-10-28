@@ -86,8 +86,10 @@ Plans, roadmaps, to-do lists, and development notes live in
 - [Rollouts](rollouts.md): update strategies, health gating, manual/auto
   progression.
 - [Rollout Strategy Plugins](rollout-strategy-plugins.md)
-- [Scaling Jobs](autoscaling.md): `legion job scale` sets count overrides
-  without a new version or rollout. This is the manual half of the autoscaler.
+- [Autoscaling](autoscaling.md): `autoscale = true` on a task, layered
+  defaults (task, namespace, cluster), the safeguard pipeline, pins and
+  pauses, `legion scaling status|explain|history`; and `legion job scale`,
+  which sets count overrides without a new version or rollout.
 - [Graceful Stop](graceful-stop.md): the signal, grace period, and SIGKILL
   sequence every platform-initiated stop uses, the machine-readable stop
   notice, and why an allocation was removed.
