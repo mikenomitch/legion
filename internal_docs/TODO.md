@@ -2125,6 +2125,19 @@ Plans: [task-runtime-plugins](../docs/task-runtime-plugins.md).
       while network plugins keep wasmi, calls entries 1 and 4). Phase 0
       (measurements on the AWS rig) comes first. The embedding layer in
       [`src/wasm/`](../src/wasm/mod.rs) stays the plugins'.
+- [ ] **Child sessions** ([plan](plans/child-sessions-plan.md) ·
+      [calls](calls/child-sessions-plan_calls.md), PLANNED 2026-10-28): a
+      session that starts and owns sessions of a sibling task
+      (`stateful.children`), with no credential, ended with its parent,
+      charged to its own envelope, attributed by `parent_id`, and reached
+      through its parent (the front-door rule). The isolate runtime's burst
+      (its Phase 5) needs Phase 1.
+- [ ] **Resize: in-place vertical scaling for every unit**
+      ([plan](plans/resize-plan.md) · [calls](calls/resize-plan_calls.md),
+      PLANNED 2026-10-28): change a running allocation's, session's, or
+      isolate's `memory`, `memoryMax`, or `cpu` as an override over the spec,
+      node-local inside an envelope, one compare-and-set otherwise. The
+      actuator for the autoscaler's deferred vertical strategies.
 - [ ] A **`converge`** runtime — idempotent host resources (package, file,
       template, directory, user, service, mount) with per-resource
       `unchanged | changed | failed` reporting, i.e. the Chef-replacement shape —
@@ -4481,7 +4494,8 @@ plan.
         the first request (needs the gateway to route to services),
         `service.concurrency` once netd attributes ingress requests, keyed
         and `count.per` autoscaling, consolidation, predictive and vertical
-        strategies, WASM strategies.
+        strategies (the actuator is planned in
+        [resize-plan.md](plans/resize-plan.md)), WASM strategies.
 - [ ] Ingress proxy / load balancer (also listed under *Networking*)
 - [ ] GitOps helper — deploy to git, job updates automatically
 - [ ] Cert manager (also listed under *Auth, TLS & security*)

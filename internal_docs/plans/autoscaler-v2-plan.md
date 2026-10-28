@@ -291,7 +291,9 @@ config, and reference it from policies by name.
 - **Autoscaling keyed instances and `count.per` tasks.** Both are rejected
   by Phase 0 for reasons that still hold (old calls entry 14).
 - **Vertical scaling** (changing `resources`), and **predictive scaling**
-  (forecasting). The strategy seam admits both later.
+  (forecasting). The strategy seam admits both later. *2026-10-28:* the
+  in-place resize a vertical strategy would call is planned separately in
+  [resize-plan.md](resize-plan.md).
 - **Node consolidation** (repacking running work onto fewer nodes). Scale-in
   removes empty and nearly empty nodes, and nothing more.
 - **Choosing instance types** (Karpenter's flexibility). A node group has one

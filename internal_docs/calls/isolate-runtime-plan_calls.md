@@ -5,7 +5,10 @@ Decisions made while designing
 **Entries are ordered by project impact, highest first, and an entry's
 number is its rank.** These are design-time calls; implementation inserts
 its own at their rank. The research behind them (2026-10-28) is cited in
-the plan's §2 and §6.
+the plan's §2 and §6. Entries 5 and 15 revise the first draft after review
+the same day, and say what they replaced; entries 6 and 7 rest on the
+companion plans' calls, [child sessions](child-sessions-plan_calls.md) and
+[resize](resize-plan_calls.md).
 
 ## 1. The engine is wasmtime; JS and Python run as interpreters inside Wasm, not on V8
 
@@ -29,14 +32,15 @@ config = { image = "js", entry = "handler.js" }   # SpiderMonkey-in-Wasm, not V8
 **Trade-off.** JS throughput. StarlingMonkey in Wasm scores about 1/75 of
 V8's JIT on Octane before weval, which buys back 2 to 3×. CPU-bound JS is
 much slower in an isolate than it would be on V8. Accepted, with two
-answers: CPU-bound JS bursts to a VM running Node with V8's JIT behind a
-hardware boundary (`burst.on = ["limits"]`), and Phase 7 adds V8 as a
-second engine if the trigger below is met.
+answers: CPU-bound JS runs with `tier = "vm"`, on a VM running Node with
+V8's JIT behind a hardware boundary (the reply's `nextTier` says so after
+an isolate run hits its CPU limit), and Phase 7 adds V8 as a second engine
+if the trigger below is met.
 
 **Why (performance at the density end, simplicity, security).**
 - **Start:** 5 µs to a fresh Wasm instance against 0.7 to 5 ms for a V8
   isolate from a snapshot. That is what makes an instance per request
-  affordable, and so what makes the safe lifetime the default (entry 10).
+  affordable, and so what makes the safe lifetime the default (entry 12).
 - **Density:** an idle instance costs only the pages it wrote; a V8
   isolate's floor is megabytes before user code, and V8's 4 GB shared cage
   caps the process. Lifting the cage (IsolateGroups) is unsupported
@@ -54,7 +58,7 @@ second engine if the trigger below is met.
 
 **Revisit (the Phase 7 trigger).** Build V8 when, over a month of Phase 3
 telemetry, more than 20% of JS CPU-seconds come from invocations that
-spend over 10 ms of CPU and those tenants have not moved to burst, *and*
+spend over 10 ms of CPU and those tenants have not moved to `tier = "vm"`, *and*
 upstream supports more than one pointer-compression cage per process.
 
 ---
@@ -121,7 +125,8 @@ $ legion isolate stats code-runner -j
 - (b) Report session isolates in the managers' index like sandbox
   sessions, so `instance list` shows them.
 
-**Trade-off.** No cluster-wide list of isolates; `legion isolate get <id>`
+**Trade-off.** No cluster-wide list of isolates (their child VMs are sandbox
+sessions and are listed like any, with `parent_id`); `legion isolate get <id>`
 asks the node the id names. A node that dies loses its `local` sessions'
 hibernation files, as for any `local` session.
 
@@ -170,44 +175,101 @@ mitigation for an engine CVE) wants the host upgradeable on its own.
 
 ---
 
-## 5. Burst is an attached VM plus replay before egress; a running isolate never migrates
+## 5. One run, one place: the tier is chosen before a run starts, and Legion never re-runs one (revised)
 
-**Call.** Three mechanisms. The guest can call `vm.acquire()` and drive a
-microVM of the task's burst image (exec, files, HTTP). An invocation that
-fails `unsupported` or `limits` is replayed in a VM only if it made no
-egress (`replay = "before-egress"`). A pre-flight import check and a
-per-node memo of code hashes route known VM work to a VM first. Moving a
-live isolate's state into a VM is deferred to Phase 8 research.
+**Call.** Every run happens in exactly one place. `RunIsolate.tier` is
+`isolate`, `vm`, or `auto` (the default), and `auto` decides *before*
+anything runs, from a pre-flight import check and a per-node memo of code
+that needed a VM; a caller that kept a previous reply's `nextTier` asks
+for that tier. A run stopped in an isolate by an
+unsupported call or a limit stays stopped; its reply carries `nextTier =
+"vm"`. A caller who wants the rerun asks for it (`--fallback vm`), and the
+reply says `ranTwice`.
 
 ```console
 $ legion isolate run code-runner --file transcode.py -j
-{"ok":true,"data":{"tier":"vm","burst":{"reason":"unsupported",
- "detail":"subprocess.run: processes are not available in an isolate","replayed":true}, ...}}
+{"ok":true,"data":{"tier":"isolate","stopped":{"reason":"unsupported",
+ "detail":"subprocess.run: processes are not available in an isolate", ...},"nextTier":"vm", ...}}
 ```
 
-**Alternatives.**
-- (a) Continuation migration: hibernate the isolate and resume the same
-  instance inside a VM with more capabilities.
-- (b) Replay always, or never.
-- (c) Burst only by explicit API.
+**This reverses the first draft.** The plan as first written (2026-10-28)
+had Legion replay a failed run in a VM automatically, but only if the run
+had made no outbound request yet (`burst.on = ["unsupported", "limits"]`,
+`replay = "before-egress"`). Review the same day found it confusing:
 
-**Trade-off.** Replay runs code twice, so it is narrow: a snippet that
-called an API and then shelled out fails `isolate_unsupported` instead of
-bursting, unless the author sets `replay = "always"` and owns the
-idempotency. The memo is node-local, so another node relearns with one
-wasted run.
+- whether a snippet burst or failed depended on the order of two lines (an
+  API call then a subprocess failed; the reverse silently re-ran);
+- one call could run in two different Pythons, the isolate's and the VM's;
+- the invocation's size and accounting changed in the middle of the call.
 
-**Why (ease, grounded in prior art).** No production system migrates
-isolate memory into a VM; Cloudflare's Project Think, Containers, Modal,
-Vercel, and Deno all escalate explicitly and hand over files. (a) needs
-host-held sockets re-bound across a machine boundary and identical engine
-versions on both sides. (c) makes every author predict the tier, which is
-the job the agent-platform persona asked not to do. Replay before egress
-is the one automatic rule that is always safe.
+**Alternatives.** (a) The draft's replay before egress. (b) Replay always,
+leaving idempotency to the author. (c) Continuation migration (Phase 8).
+
+**Trade-off.** Code the pre-flight check misses runs in the isolate first
+and stops; the caller pays one round trip to rerun it. The memo and
+`nextTier` bound that to once per code hash.
+
+**Why (ease of reasoning).** "Where did my code run, and how many times" has
+one answer per call, visible in the reply, with no rule that depends on
+what the code did first. A rerun is the caller's decision, so the caller,
+who knows whether the code is safe to run twice, makes it.
 
 ---
 
-## 6. Waiting holds nothing: a host-driven event loop on the stackless callback ABI, fibers as the fallback
+## 6. Burst is composed from child sessions and a declared VM task, not from burst machinery or vertical scaling
+
+**Call.** The VM is an ordinary sibling session task the job declares
+(`runtime = "sandbox"`), listed in `stateful.children`. A VM run takes a
+single-use session of it; an isolate that wants to drive a machine starts
+one as a [child session](child-sessions-plan_calls.md) with `vm.acquire()`.
+Growing either is a [resize](resize-plan_calls.md). Nothing is generated,
+and there is no `burst` block.
+
+```nickel
+config = { image = "python", vm = { task = "machine" } },
+stateful = { mode = "session", envelope = { ... }, children = { tasks = ["machine"] } },
+```
+
+**Alternatives.** (a) The first draft: a `burst` block from which submit
+generated a hidden `<task>-burst` task with a nested envelope, a trigger
+list, and a replay policy. (b) Burst as vertical scaling: an isolate that
+grows past a threshold becomes a VM.
+
+**Trade-off.** Two tasks to write instead of one block, and the shared
+network rules need a Nickel binding to avoid repeating them.
+
+**Why (composability, simplicity).** Each piece is useful without burst:
+child sessions serve an `exec` agent spawning tool sandboxes, resize serves
+the autoscaler, and the VM task is a session task like any other, so
+accounting at burst is "a second unit appears in its own envelope", never
+"a unit changes size". (b) would weld capability to size: most bursts are
+for a subprocess or a native package, not memory, and an isolate that only
+needs memory gets a higher ceiling in microseconds.
+
+---
+
+## 7. A session's address is always its isolate; its VM is reached through it
+
+**Call.** After a session isolate starts a child VM, requests still address
+the isolate's session id; the isolate handles each one or forwards it to
+its VM. Stateless runs have no address to keep: `nextTier` makes the caller
+the memory across nodes. Bulk streams get connection handoff later
+(child-sessions plan, Phase 3).
+
+**Alternatives.** Re-point the session's address at the VM after a burst.
+
+**Trade-off.** An extra local hop through the isolate per forwarded request
+(tens of microseconds), and a network hop when the VM is on another node.
+
+**Why (simplicity).** The full argument is
+[child-sessions calls entry 3](child-sessions-plan_calls.md#3-the-parents-id-is-the-only-address-children-are-reached-through-it):
+re-pointing needs a mutable mapping, two kinds of address, an in-flight
+window, and a VM's wake time on every request, while the isolate costs
+almost nothing to keep in front.
+
+---
+
+## 8. Waiting holds nothing: a host-driven event loop on the stackless callback ABI, fibers as the fallback
 
 **Call.** The host drives each guest's event loop. Guests on the WASI 0.3
 Component Model async callback ABI run a turn, return to the host when
@@ -225,27 +287,27 @@ pooled).
 stack in `component-model-async` was fixed on 2026-10-02
 ([CVE-2026-115384](https://github.com/bytecodealliance/wasmtime/security/advisories/GHSA-32h6-97mm-8q3c)).
 The compiler process validating every component with the newest
-`wasmparser` (entry 9) is the published mitigation and is applied to all
+`wasmparser` (entry 11) is the published mitigation and is applied to all
 modules. Two async paths to test and support.
 
 **Why (performance at density).** With fibers, an isolate awaiting a 20 s
 LLM call pins a slot and a stack, and 10^5 suspended fibers are about 12.5
 GiB of stack address space. With callbacks the isolate is data between
-turns, which is also what lets it hibernate *while it waits* (entry 11).
+turns, which is also what lets it hibernate *while it waits* (entry 13).
 (b) is a Phase 3 proposal with no tiered wasmtime support; (c) costs code
 size and speed on every call.
 
 ---
 
-## 7. A new runtime, `isolate`, that bursts to `sandbox`, not a mode of the `sandbox` runtime
+## 9. A new runtime, `isolate`, that bursts to `sandbox`, not a mode of the `sandbox` runtime
 
 **Call.** The request was "a sandbox runtime with two modes". The plan
-ships it as two runtimes that act as one product: `runtime = "isolate"`
-with a `burst.sandbox` block holding an unchanged `sandbox` config.
+ships it as two runtimes that act as one product: `runtime = "isolate"`,
+whose `config.vm` names a sibling task on the unchanged `sandbox` runtime.
 
 ```nickel
-runtime = "isolate",
-config = { image = "python", burst = { sandbox = { image = "python:3.13-slim" } } },
+{ name = "run", runtime = "isolate", config = { image = "python", vm = { task = "machine" } }, ... },
+{ name = "machine", runtime = "sandbox", config = { image = "python:3.13-slim" }, ... },
 ```
 
 **Alternatives.** `runtime = "sandbox"` with `config.mode = "isolate" |
@@ -265,7 +327,7 @@ reverse.
 
 ---
 
-## 8. Slots use guard pages by default; MPK striping is Phase 6; the layout belongs to the cordon, not the job
+## 10. Slots use guard pages by default; MPK striping is Phase 6; the layout belongs to the cordon, not the job
 
 **Call.** The pooling allocator uses wasmtime's default guard-page layout
 (about 16,000 to 32,000 slots per process); a cordon that needs more runs
@@ -296,7 +358,7 @@ not a per-job dial nobody can audit.
 
 ---
 
-## 9. Code is compiled by a node-local compiler process with Cranelift only, x86-64 first; user `.cwasm` is never loaded
+## 11. Code is compiled by a node-local compiler process with Cranelift only, x86-64 first; user `.cwasm` is never loaded
 
 **Call.** `legion-isolate compile` runs as a short-lived, confined process
 on the node and writes artifacts into the local content store, keyed by
@@ -323,7 +385,7 @@ aarch64 had both April 2026 critical escapes and no continuous fuzzing.
 
 ---
 
-## 10. The default lifetime is one instance per request
+## 12. The default lifetime is one instance per request
 
 **Call.** `lifetime = "request"` by default: a fresh instance per
 invocation, destroyed after. `"tenant"` (reused per tenant key while warm)
@@ -344,7 +406,7 @@ instance the safe default costs almost nothing.
 
 ---
 
-## 11. Idle memory leaves in four tiers, and hibernation happens at turn boundaries
+## 13. Idle memory leaves in four tiers, and hibernation happens at turn boundaries
 
 **Call.** Hot, then paged out (`MADV_PAGEOUT` to zswap/zram/swap) after
 `pageOutAfter`, then hibernated (private pages diffed against the image,
@@ -368,7 +430,7 @@ keeps one model for both tiers.
 
 ---
 
-## 12. Preemption by epoch, yielding at the end of a slice; fuel only on request
+## 14. Preemption by epoch, yielding at the end of a slice; fuel only on request
 
 **Call.** A ticker advances the engine epoch every millisecond; a turn
 that exceeds its 5 ms slice yields to its shard instead of trapping, and
@@ -387,32 +449,37 @@ tenant from starving a shard.
 
 ---
 
-## 13. The memory cap and the admission charge are two numbers
+## 15. Isolates use `resources.memory` and `memoryMax`, not their own cap and charge (revised)
 
-**Call.** `config.limits.memory` is the hard cap a tenant cannot exceed;
-`resources.memory` is what the node assumes one isolate costs when it
-admits against the envelope. The host keeps a measured per-image estimate
-of private pages so an operator can see when the charge is wrong.
+**Call.** An isolate's reservation is `resources.memory` (what the node
+admits against the envelope: its expected private memory) and its ceiling
+is `resources.memoryMax` (the cap on linear memory), the same two fields,
+with the same meaning, as every other runtime. `memoryMax` defaults to 128
+MiB; `memory` defaults to the image's measured idle size.
 
 ```nickel
-config = { limits = { memory = "128MiB" } },   # the cap
-resources = { cpu = 5, memory = 2 },            # the charge
+resources = { cpu = 10, memory = 2, memoryMax = 128 },
 ```
 
-**Alternatives.** One number, charged at the cap, as every other runtime
-does.
+**This revises the first draft,** which had `config.limits.memory` as the
+cap and `resources.memory` as a separate "admission charge": a parallel pair
+that meant the same thing as `memory`/`memoryMax` under different names.
 
-**Trade-off.** Two numbers to explain, and an envelope can be
-over-committed when isolates outgrow their charge, with the cordon's
-cgroup and the hibernation step as the backstop.
+**Alternatives.** (a) The draft's pair. (b) One number, charged at the cap.
 
-**Why (performance).** Charging the cap makes a JS isolate that writes
-2 MiB cost 128 MiB of envelope: 60× less density, for a ceiling nearly no
-isolate reaches.
+**Trade-off.** `memoryMax` means "linear memory size" for an isolate and
+"guest size" for a sandbox; both are the unit's addressable memory, but a
+reader comparing runtimes has to know that.
+
+**Why (simplicity, composability).** One pair of fields across runtimes is
+what lets resize (which changes exactly these fields) and the scheduler
+treat an isolate like any other unit. Against (b): charging the cap makes a
+JS isolate that writes 2 MiB cost 128 MiB of envelope, 60× less density for
+a ceiling nearly no isolate reaches.
 
 ---
 
-## 14. Each host runs one shard per core, shared nothing
+## 16. Each host runs one shard per core, shared nothing
 
 **Call.** A host's isolates are partitioned across pinned shard threads,
 each a single-threaded executor; an isolate runs only on its shard and
@@ -428,7 +495,7 @@ throughput running wasmtime on Seastar's reactor threads.
 
 ---
 
-## 15. The default `js` image is StarlingMonkey; QuickJS is a candidate `js-small`
+## 17. The default `js` image is StarlingMonkey; QuickJS is a candidate `js-small`
 
 **Call.** `image = "js"` is SpiderMonkey compiled to Wasm with weval AOT.
 QuickJS ships as `js-small` only if Phase 0 shows a several-times smaller
@@ -446,7 +513,7 @@ Spin run in production; and weval closes much of the interpreter gap.
 
 ---
 
-## 16. Python is CPython for WASI; heavy packages burst
+## 18. Python is CPython for WASI; heavy packages run in a VM
 
 **Call.** `image = "python"` is CPython built for WASI (componentize-py),
 pre-initialized with the standard library. Native-extension packages are
@@ -456,7 +523,7 @@ is routed to a VM by the pre-flight check.
 **Alternatives.** Pyodide, Cloudflare's choice for Python Workers.
 
 **Trade-off.** Fewer packages than Pyodide's ecosystem; data-science code
-mostly bursts.
+mostly runs in a VM.
 
 **Why (fit).** Pyodide targets Emscripten and a JS host, not WASI, and
 starts in about a second with real packages even with Cloudflare's
@@ -465,11 +532,33 @@ instantiates like any other.
 
 ---
 
-## 17. Default limits: 128 MiB memory, 4 GiB ceiling, 1 MiB output
+## 19. A stopped run is data, not an error
 
-**Call.** `limits.memory` defaults to 128 MiB with a worker-wide ceiling of
-4 GiB; `limits.output` to 1 MiB. `limits.cpu` and `limits.wall` have no
-defaults and are required at submit.
+**Call.** A run that an unsupported call or a limit stopped answers
+`ok: true` with `stopped { reason, limit, detail, hint }` and `nextTier`,
+as a run whose code exits non-zero answers `ok: true` with its `exit`.
+Error envelopes are for requests that did not run: no room, no
+permission, an invalid request. The CLI exits non-zero for both.
+
+**Alternatives.** Typed errors (`isolate_unsupported`, `isolate_limit`) in
+the standard error envelope, with `nextTier` added to it.
+
+**Trade-off.** An agent must look at `data.stopped`, not only at `ok`, to
+know the code did not finish.
+
+**Why (agent-readiness).** The standard envelope's error carries only
+`code`, `message`, `hint`, and `retryable`, and adding a field to it for one
+command would make it non-standard. A stop is also the run's outcome, with
+stdout, stderr, and CPU time an agent needs, which an error envelope would
+drop.
+
+---
+
+## 20. Default limits: `memoryMax` 128 MiB (4 GiB at most), 1 MiB output; CPU and wall required
+
+**Call.** `resources.memoryMax` defaults to 128 MiB with a worker-wide
+maximum of 4 GiB, and `limits.output` to 1 MiB. `limits.cpu` and
+`limits.wall` have no defaults and are required at submit.
 
 **Alternatives.** Defaults for CPU and wall too (Workers: 30 s CPU on paid
 plans).
