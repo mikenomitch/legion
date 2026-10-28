@@ -546,6 +546,7 @@ impl ForwarderContext {
             KernelBackend::Nft(guard) => {
                 let mut table = runtime.base.clone();
                 table.allocations = allocations;
+                let name = table.name();
                 match guard.reconcile(table) {
                     Ok(true) => debug!(
                         allocations = guard.allocations(),
@@ -557,7 +558,7 @@ impl ForwarderContext {
                         return;
                     }
                 }
-                let counters = match crate::worker::netd::kernel_guard::read_counters() {
+                let counters = match crate::worker::netd::kernel_guard::read_counters(&name) {
                     Ok(counters) => counters,
                     Err(err) => {
                         debug!(error = %format!("{err:#}"), "Could not read the kernel host guard's counters");

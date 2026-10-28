@@ -466,12 +466,16 @@ worker for that run, and runs even with `systemWorker.enabled = false`.
 
 Known limitations:
 
-- **One host guard table per host.** On Linux the kernel host guard is one
-  `nftables` table, and the eBPF classifier one pin directory, per host. A
-  manager's system worker and a standalone worker on the same Linux host
-  each rewrite them with their own allocations; run a standalone worker on
-  a manager's host only where that does not matter (a development box), or
-  turn the system worker off there.
+- **Two workers on one host each guard only their own allocations.** On
+  Linux the kernel host guard (`nftables` table) and the eBPF classifier's
+  pin directory are named after the worker's cgroup parent
+  (`legion_host_guard_legion-system` and `/sys/fs/bpf/legion_legion-system`
+  for the system worker; `legion_host_guard` and `/sys/fs/bpf/legion` for a
+  worker with the default parent), so a manager's system worker and a
+  standalone worker on one host keep separate guards instead of overwriting
+  each other's. Each guard covers the sockets of its own worker's
+  allocations; give two workers on one host different cgroup parents (the
+  system worker always uses `legion-system`).
 - **The lend is fixed**, not a share of the host.
 - **Bundled apps are not built yet.** The system worker runs whatever is
   submitted to `legion-system`; nothing is submitted there automatically.
