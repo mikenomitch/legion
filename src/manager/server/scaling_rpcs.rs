@@ -1,9 +1,24 @@
-//! The read half of the scale surface (docs/autoscaling.md): the
-//! `GetJobScaleStatus` rows.
+//! The read half of the scale surface: `GetJobScaleStatus` and
+//! `GetScalingInputs` (docs/autoscaling.md).
+//!
+//! `GetScalingInputs` joins two sources. Replica counts, the desired count,
+//! and rollouts come from the replicated state store, which every manager
+//! holds. Measured usage and requests come from the merged scaling-input
+//! rollups (`crate::manager::scaling_inputs`), which only the status-lane
+//! leader holds, so the RPC is answered there and forwarded by everyone
+//! else.
 
 use super::*;
-use crate::storage::store::TaskScale;
-use crate::structs::TaskScaleStatus;
+use crate::manager::scaling_inputs::{TargetKey, TargetTotals, CPU_HISTOGRAM_BOUNDS, HISTORY_SPAN};
+use crate::storage::store::{ScalingReplicaRow, TaskScale};
+use crate::structs::{
+    GetScalingInputsReply, GetScalingInputsRequest, ScalingCpuInputs, ScalingDataFreshness,
+    ScalingInputs, ScalingInputsPoint, ScalingMemoryInputs, ScalingRequestInputs,
+    ScalingReservation, ScalingTargetSelector, TaskScaleStatus,
+};
+
+/// Most selectors one GetScalingInputs call takes.
+pub(super) const SCALING_TARGETS_MAX: usize = 1000;
 
 /// The GetJobScaleStatus rows for `config`, the job's latest config: every
 /// effective count read through [`Store::effective_task_count`], the one
@@ -43,6 +58,326 @@ pub(crate) fn task_scale_statuses(
             })
         })
         .collect()
+}
+
+/// One job (and an optional narrowing) a request resolved to.
+struct JobSelection {
+    job: String,
+    group: Option<String>,
+    task: Option<String>,
+}
+
+impl JobSelection {
+    fn from_selector(selector: ScalingTargetSelector) -> Self {
+        let narrow = |value: Option<String>| {
+            value
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty())
+        };
+        Self {
+            job: selector.job.trim().to_string(),
+            group: narrow(selector.task_group),
+            task: narrow(selector.task_name),
+        }
+    }
+
+    fn error_entry(&self, error: String) -> ScalingInputs {
+        ScalingInputs {
+            job_id: self.job.clone(),
+            task_group: self.group.clone().unwrap_or_default(),
+            task_name: self.task.clone().unwrap_or_default(),
+            error,
+            ..Default::default()
+        }
+    }
+}
+
+/// What the store says about one task, before the measured inputs join it.
+struct StoreFacts {
+    inputs: ScalingInputs,
+    key: TargetKey,
+    service: Option<String>,
+}
+
+/// The replica counts, desired count, and reservation of every task of one
+/// job the selection names.
+fn store_facts(store: &Store, selection: &JobSelection) -> R<Vec<Result<StoreFacts, String>>> {
+    let Some(config) = store.get_job_config_optional(&selection.job)? else {
+        return Ok(vec![Err("job not found".to_string())]);
+    };
+    let job_id = selection.job.as_str();
+    let tasks: Vec<&TaskConfig> = config
+        .tasks
+        .iter()
+        .filter(|task| {
+            selection
+                .group
+                .as_deref()
+                .is_none_or(|group| task.group == group)
+        })
+        .filter(|task| {
+            selection
+                .task
+                .as_deref()
+                .is_none_or(|name| task.name == name)
+        })
+        .collect();
+    if tasks.is_empty() {
+        return Ok(vec![Err(format!(
+            "no task matches group={} task={}",
+            selection.group.as_deref().unwrap_or("<any>"),
+            selection.task.as_deref().unwrap_or("<any>"),
+        ))]);
+    }
+    let stopped = store
+        .job_lifecycle_flag(job_id)?
+        .is_some_and(|flag| flag == "stopped" || flag == "failed");
+    let replicas = store.scaling_replica_rows(job_id)?;
+    let rollout_active = !store.list_rollouts(Some(job_id), true)?.is_empty();
+    let namespace = crate::structs::namespace::job_namespace(job_id);
+    let mut out = Vec::with_capacity(tasks.len());
+    for task in tasks {
+        let mine: Vec<&ScalingReplicaRow> = replicas
+            .iter()
+            .filter(|row| row.task_group == task.group && row.task_name == task.name)
+            .collect();
+        let placed = mine.len() as u32;
+        let ready = mine.iter().filter(|row| row.healthy).count() as u32;
+        let keyed = task
+            .stateful
+            .as_ref()
+            .is_some_and(|stateful| stateful.mode == InstanceMode::Keyed);
+        let count_scalable = !keyed && task.count.per.is_none();
+        let desired = if stopped {
+            0
+        } else if count_scalable {
+            store.effective_task_count(job_id, &task.group, &task.name, task.count.num)?
+        } else {
+            placed
+        };
+        // Batch and cron tasks end by design: a finished replica is not a
+        // missing one.
+        let runs_forever =
+            task.lifecycle != crate::structs::TaskLifecycle::Batch && task.schedule.is_none();
+        let unplaced = if count_scalable && runs_forever {
+            desired.saturating_sub(placed)
+        } else {
+            0
+        };
+        let request = store.resource_policy.usage_request(&task.resources).ok();
+        let amount = |name: &str| {
+            request
+                .as_ref()
+                .and_then(|request| request.amount(name))
+                .unwrap_or(0.0)
+        };
+        let service = task.service.as_ref().map(|service| {
+            crate::structs::namespace::job_id(namespace, service.service_name(&task.name))
+        });
+        out.push(Ok(StoreFacts {
+            inputs: ScalingInputs {
+                job_id: job_id.to_string(),
+                task_group: task.group.clone(),
+                task_name: task.name.clone(),
+                desired_replicas: desired,
+                count_scalable,
+                placed_replicas: placed,
+                ready_replicas: ready,
+                unplaced_replicas: unplaced,
+                rollout_active,
+                reservation: Some(ScalingReservation {
+                    cpu_mhz: amount("cpu"),
+                    cores: amount("cores"),
+                    memory_mib: amount("memory"),
+                }),
+                ..Default::default()
+            },
+            key: TargetKey::new(job_id, &task.group, &task.name),
+            service,
+        }));
+    }
+    Ok(out)
+}
+
+/// Join measured totals into a task's entry.
+fn fill_measured(
+    inputs: &mut ScalingInputs,
+    totals: Option<&TargetTotals>,
+    service: Option<String>,
+    state: crate::manager::scaling_inputs::DataState,
+) {
+    let totals = totals.cloned().unwrap_or_default();
+    inputs.cpu = Some(ScalingCpuInputs {
+        measured_replicas: totals.replicas,
+        used_millicores: totals.cpu_used_millicores,
+        used_mhz: totals.cpu_used_mhz,
+        reserved_mhz: totals.cpu_reserved_mhz,
+        utilization: totals.cpu_utilization(),
+        max_utilization: totals.cpu_utilization_max,
+        histogram: totals.cpu_histogram.to_vec(),
+        histogram_bounds: CPU_HISTOGRAM_BOUNDS.to_vec(),
+        unmeasurable_replicas: totals.cpu_unmeasurable,
+    });
+    inputs.memory = Some(ScalingMemoryInputs {
+        measured_replicas: totals.replicas,
+        used_mib: totals.memory_used_mib(),
+        reserved_mib: totals.memory_reserved_mib,
+        utilization: totals.memory_utilization(),
+        max_utilization: totals.memory_utilization_max,
+    });
+    inputs.requests = service.map(|service| ScalingRequestInputs {
+        service,
+        requests_per_second: totals.requests_per_second,
+        errors_per_second: totals.errors_per_second,
+        error_ratio: totals.error_ratio(),
+        latency_ms_mean: totals.latency_ms_mean(),
+        latency_ms_max: totals.edge_latency_ms_max,
+        calling_nodes: totals.calling_nodes,
+    });
+    inputs.freshness = Some(ScalingDataFreshness {
+        state: state.as_str().to_string(),
+        sampled_at_unix_ms: totals.sampled_at_unix_ms,
+        age_seconds: u32::try_from(totals.age.as_secs()).unwrap_or(u32::MAX),
+        reporting_nodes: totals.reporting_nodes,
+    });
+}
+
+impl ManagerDaemonService {
+    #[instrument(skip_all, fields(targets = request.get_ref().targets.len()))]
+    pub(super) async fn get_scaling_inputs_rpc(
+        &self,
+        request: Request<GetScalingInputsRequest>,
+    ) -> Result<Response<GetScalingInputsReply>, Status> {
+        // Coarse gate before any lookup, so a credential-less caller cannot
+        // tell a missing job from a forbidden one; per job below.
+        let identity = self.check_acl(
+            &request,
+            AclResource::Scale,
+            AclAction::Read,
+            AclScope::any(),
+        )?;
+        let req = request.into_inner();
+        if req.targets.len() > SCALING_TARGETS_MAX {
+            return Err(Status::invalid_argument(format!(
+                "at most {SCALING_TARGETS_MAX} targets per call; got {}",
+                req.targets.len()
+            )));
+        }
+        // The merged rollups live in the status-lane leader's memory. Any
+        // other manager refuses with the typed not-the-leader error, which
+        // the leader-forward layer turns into the leader's answer.
+        self.store
+            .require_lane_leader(crate::storage::Lane::Status, "GetScalingInputs")
+            .map_err(|e| map_store_error("Error reading scaling inputs", e))?;
+
+        let selections: Vec<JobSelection> = if req.targets.is_empty() {
+            let namespaces = crate::structs::namespace::NamespaceSelection::parse(&req.namespaces)
+                .map_err(Status::invalid_argument)?;
+            let mut jobs: Vec<String> = self
+                .store
+                .get_jobs()
+                .map_err(|e| map_store_error("Error listing jobs", e))?
+                .into_iter()
+                .map(|job| job.id)
+                .filter(|id| namespaces.matches(crate::structs::namespace::job_namespace(id)))
+                .filter(|id| {
+                    identity.allows(
+                        AclResource::Scale,
+                        AclAction::Read,
+                        &self.job_read_scope(id),
+                    )
+                })
+                .collect();
+            jobs.sort();
+            jobs.into_iter()
+                .map(|job| JobSelection {
+                    job,
+                    group: None,
+                    task: None,
+                })
+                .collect()
+        } else {
+            let mut selections = Vec::with_capacity(req.targets.len());
+            for selector in req.targets {
+                let selection = JobSelection::from_selector(selector);
+                if selection.job.is_empty() {
+                    return Err(Status::invalid_argument(
+                        "every target needs a job (targets[].job)",
+                    ));
+                }
+                acl::enforce(
+                    &identity,
+                    AclResource::Scale,
+                    AclAction::Read,
+                    &self.job_read_scope(&selection.job),
+                )?;
+                selections.push(selection);
+            }
+            selections
+        };
+
+        // Store reads first, then one short hold of the merged view.
+        let mut resolved: Vec<Result<StoreFacts, ScalingInputs>> = Vec::new();
+        for selection in &selections {
+            let facts = store_facts(&self.store, selection)
+                .map_err(|e| map_store_error("Error reading scaling inputs", e))?;
+            for fact in facts {
+                resolved.push(fact.map_err(|error| selection.error_entry(error)));
+            }
+        }
+
+        let now = std::time::Instant::now();
+        let history_seconds = u64::from(req.history_seconds).min(HISTORY_SPAN.as_secs());
+        let since_unix_ms = OffsetDateTime::now_utc().unix_timestamp() * 1000
+            - i64::try_from(history_seconds * 1000).unwrap_or(i64::MAX);
+        let merge = self.store.scaling_rollups().merge();
+        let leader_for_seconds = merge
+            .responsible_since()
+            .map_or(0, |since| now.saturating_duration_since(since).as_secs());
+        let inputs = resolved
+            .into_iter()
+            .map(|entry| match entry {
+                Err(error_entry) => error_entry,
+                Ok(StoreFacts {
+                    mut inputs,
+                    key,
+                    service,
+                }) => {
+                    let totals = merge.totals(&key, now);
+                    let state = merge.data_state(totals.is_some(), now);
+                    fill_measured(&mut inputs, totals.as_ref(), service, state);
+                    if history_seconds > 0 {
+                        inputs.history = merge
+                            .history(&key, since_unix_ms)
+                            .into_iter()
+                            .map(|point| ScalingInputsPoint {
+                                at_unix_ms: point.at_unix_ms,
+                                measured_replicas: point.measured_replicas,
+                                cpu_used_mhz: f64::from(point.cpu_used_mhz),
+                                cpu_utilization: f64::from(point.cpu_utilization),
+                                memory_used_mib: f64::from(point.memory_used_mib),
+                                memory_utilization: f64::from(point.memory_utilization),
+                                requests_per_second: f64::from(point.requests_per_second),
+                                errors_per_second: f64::from(point.errors_per_second),
+                                latency_ms_mean: f64::from(point.latency_ms_mean),
+                            })
+                            .collect();
+                    }
+                    inputs
+                }
+            })
+            .collect();
+        drop(merge);
+
+        Ok(Response::new(GetScalingInputsReply {
+            inputs,
+            served_by: self
+                .store
+                .raft_node_id()
+                .unwrap_or_else(|| "local".to_string()),
+            leader_for_seconds,
+        }))
+    }
 }
 
 #[cfg(test)]

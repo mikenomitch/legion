@@ -972,6 +972,11 @@ pub struct Metrics {
     pub liveness_peer_stale: Arc<GaugeVec>,
     /// `legion_liveness_loss_suppressed_total{reason}`
     pub liveness_loss_suppressed_total: Arc<CounterVec>,
+    /// `legion_scaling_rollup_syncs_total{outcome}` (docs/metrics.md,
+    /// "Scaling inputs")
+    pub scaling_rollup_syncs_total: Arc<CounterVec>,
+    /// `legion_scaling_rollup_rows{kind}`
+    pub scaling_rollup_rows: Arc<GaugeVec>,
     /// `legion_liveness_checkpoint_seconds`
     pub liveness_checkpoint_seconds: Arc<Histogram>,
     /// Render order for the exposition endpoint.
@@ -1876,6 +1881,22 @@ impl Metrics {
             },
             series: Series::new(),
         });
+        let scaling_rollup_syncs_total = Arc::new(CounterVec {
+            meta: FamilyMeta {
+                name: "legion_scaling_rollup_syncs_total",
+                help: "Scaling-input rollup ticks, by outcome: local (this manager leads the status lane and merged its own), ok (shipped to the leader), resync (the leader asked for a full set and took it), error (not delivered; the next tick sends a full set).",
+                labels: &["outcome"],
+            },
+            series: Series::new(),
+        });
+        let scaling_rollup_rows = Arc::new(GaugeVec {
+            meta: FamilyMeta {
+                name: "legion_scaling_rollup_rows",
+                help: "Scaling-input rollups, one per (node, task): kind=local is what this manager built from its own workers' reports at the last tick; kind=merged is what it holds from every manager while it leads the status lane (0 elsewhere).",
+                labels: &["kind"],
+            },
+            series: Series::new(),
+        });
         let liveness_checkpoint_seconds = Arc::new(Histogram {
             meta: FamilyMeta {
                 name: "legion_liveness_checkpoint_seconds",
@@ -1902,6 +1923,8 @@ impl Metrics {
             Arc::clone(&liveness_peer_stale) as Arc<dyn RenderMetric>,
             Arc::clone(&liveness_loss_suppressed_total) as Arc<dyn RenderMetric>,
             Arc::clone(&liveness_checkpoint_seconds) as Arc<dyn RenderMetric>,
+            Arc::clone(&scaling_rollup_syncs_total) as Arc<dyn RenderMetric>,
+            Arc::clone(&scaling_rollup_rows) as Arc<dyn RenderMetric>,
             Arc::clone(&allocations) as Arc<dyn RenderMetric>,
             Arc::clone(&namespace_jobs) as Arc<dyn RenderMetric>,
             Arc::clone(&namespace_allocations) as Arc<dyn RenderMetric>,
@@ -2107,6 +2130,8 @@ impl Metrics {
             liveness_peer_stale,
             liveness_loss_suppressed_total,
             liveness_checkpoint_seconds,
+            scaling_rollup_syncs_total,
+            scaling_rollup_rows,
             families,
         }
     }

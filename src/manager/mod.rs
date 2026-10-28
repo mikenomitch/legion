@@ -18,6 +18,7 @@ pub mod oidc_http;
 pub mod origin;
 pub mod rollout;
 pub mod rollout_strategy;
+pub mod scaling_inputs;
 pub mod scheduler;
 pub mod server;
 pub mod sessions;

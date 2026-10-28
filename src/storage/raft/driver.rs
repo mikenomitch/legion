@@ -1399,26 +1399,57 @@ impl MultiRaftDriver {
         observer_manager_id: String,
         node_ids: Vec<String>,
     ) -> crate::storage::liveness::DigestOutcome {
+        self.send_digest(observer_manager_id, node_ids, None)
+            .await
+            .0
+    }
+
+    /// Send this manager's scaling-input rollups to the status-lane leader
+    /// on a digest of their own (no node ids), and report whether the leader
+    /// asked for a full resync (docs/autoscaling.md, "Scaling inputs").
+    pub(crate) async fn send_rollup_digest(
+        &self,
+        observer_manager_id: String,
+        sync: crate::structs::RollupSync,
+    ) -> (crate::storage::liveness::DigestOutcome, bool) {
+        self.send_digest(observer_manager_id, Vec::new(), Some(sync))
+            .await
+    }
+
+    /// One `ReportNodeLiveness` call: the outcome, and the reply's
+    /// `rollup_resync`.
+    async fn send_digest(
+        &self,
+        observer_manager_id: String,
+        node_ids: Vec<String>,
+        rollups: Option<crate::structs::RollupSync>,
+    ) -> (crate::storage::liveness::DigestOutcome, bool) {
         use crate::storage::liveness::DigestOutcome;
 
         let Some(engine) = self.engine.get() else {
-            return DigestOutcome::NoEngine;
+            return (DigestOutcome::NoEngine, false);
         };
         let Some(leader_addr) = self.lane_leader_addr(Lane::Status) else {
-            return DigestOutcome::NoLeader;
+            return (DigestOutcome::NoLeader, false);
         };
         let Ok(secret) = engine
             .cluster_secret
             .parse::<tonic::metadata::MetadataValue<tonic::metadata::Ascii>>()
         else {
-            return DigestOutcome::Error("cluster secret is not valid ascii".into());
+            return (
+                DigestOutcome::Error("cluster secret is not valid ascii".into()),
+                false,
+            );
         };
         let channel = match engine.pool.get(&leader_addr) {
             Ok(channel) => channel,
             Err(err) => {
-                return DigestOutcome::Error(format!(
-                    "malformed status-lane leader address {leader_addr}: {err}"
-                ))
+                return (
+                    DigestOutcome::Error(format!(
+                        "malformed status-lane leader address {leader_addr}: {err}"
+                    )),
+                    false,
+                )
             }
         };
         let mut client = crate::structs::raft_transport_client::RaftTransportClient::new(channel)
@@ -1429,6 +1460,7 @@ impl MultiRaftDriver {
             observer_manager_id,
             observed_at_unix_ms: time::OffsetDateTime::now_utc().unix_timestamp() * 1_000,
             seen_node_ids: node_ids,
+            rollups,
         });
         request.set_timeout(FORWARD_LANE_WRITE_TIMEOUT);
         request
@@ -1438,16 +1470,22 @@ impl MultiRaftDriver {
             Ok(reply) => {
                 let reply = reply.into_inner();
                 if reply.accepted {
-                    DigestOutcome::Accepted {
-                        served_interval: reply
-                            .served_interval_seconds
-                            .filter(|seconds| *seconds > 0)
-                            .map(|seconds| std::time::Duration::from_secs(u64::from(seconds))),
-                    }
+                    (
+                        DigestOutcome::Accepted {
+                            served_interval: reply
+                                .served_interval_seconds
+                                .filter(|seconds| *seconds > 0)
+                                .map(|seconds| std::time::Duration::from_secs(u64::from(seconds))),
+                        },
+                        reply.rollup_resync,
+                    )
                 } else {
-                    DigestOutcome::NotLeader {
-                        leader_hint: reply.leader_hint,
-                    }
+                    (
+                        DigestOutcome::NotLeader {
+                            leader_hint: reply.leader_hint,
+                        },
+                        false,
+                    )
                 }
             }
             // A manager that predates liveness digests answers `Unimplemented`
@@ -1455,9 +1493,9 @@ impl MultiRaftDriver {
             // the identical remedy: finish the roll. Until then the sender
             // falls back to forwarding each heartbeat as a replicated write.
             Err(status) if status.code() == tonic::Code::Unimplemented => {
-                DigestOutcome::Unimplemented
+                (DigestOutcome::Unimplemented, false)
             }
-            Err(status) => DigestOutcome::Error(status.to_string()),
+            Err(status) => (DigestOutcome::Error(status.to_string()), false),
         }
     }
 

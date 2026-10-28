@@ -106,6 +106,35 @@ service Manager {
   // surface; `scale:read`.
   rpc GetJobScaleStatus (GetJobScaleStatusRequest) returns (GetJobScaleStatusReply);
 
+  // Reads what a scaling decision needs about a batch of tasks, cluster-wide,
+  // in one call (docs/autoscaling.md, "Scaling inputs"): replica counts and
+  // readiness, measured CPU and memory against the reservations, request
+  // rate, errors, and latency for a service the task backs, replicas the
+  // scheduler has not placed, whether a rollout is active, and how fresh the
+  // measurements are.
+  //
+  // Measured usage never touches the state store. Each manager rolls up the
+  // usage reports and service-graph samples its own workers send, per
+  // (node, task), and every 10 seconds ships the rollups that changed to the
+  // manager that leads the status lane, on the liveness digest. That manager
+  // merges them (the newest rollup per (node, task) wins, so a node that
+  // moves between managers is never counted twice), keeps one hour of
+  // 10-second totals in memory, and answers this RPC. Any other manager
+  // forwards the request to it, so every manager returns the same answer.
+  // Replica counts, the desired count, and rollouts come from the replicated
+  // state store.
+  //
+  // After the status lane changes hands, the new leader starts empty and
+  // asks every peer for a full resync on its first digest. Until that lands
+  // (about one 10-second interval), targets read
+  // `freshness.state = "resyncing"` and their usage is partial.
+  //
+  // ACL: `scale:read`. The request is gated coarsely before anything is
+  // looked up. A request that names targets is refused whole with
+  // PERMISSION_DENIED when any named job is outside the caller's grant; a
+  // namespace listing (no targets) silently leaves such jobs out.
+  rpc GetScalingInputs (GetScalingInputsRequest) returns (GetScalingInputsReply);
+
   // Permanently removes a stopped job and related records.
   rpc DestroyJob (DestroyJobRequest) returns (DestroyJobReply);
 
@@ -3592,15 +3621,20 @@ message TaskScaleStatus {
   // The spec's `count.num` in the latest job config version.
   uint32 spec_count = 3;
 
-  // The applied override count, when one exists.
+  // The applied override count, when one exists and binds to the current
+  // spec. An override binds only to the spec count it was laid over; a row
+  // laid over a different spec count is not reported here and does not move
+  // `effective_count`.
   optional uint32 override_count = 4;
 
   // A recorded scale-in waiting for the active rollout to finish, when
   // one exists.
   optional uint32 pending_count = 5;
 
-  // The count the scheduler currently converges to
-  // (`override_count` if set, else `spec_count`).
+  // The count the scheduler currently converges to: the binding override
+  // if there is one, else `spec_count`. Read through the same accessor the
+  // scheduler, rollouts, and quota use, so this always agrees with what
+  // placement does.
   uint32 effective_count = 6;
 
   // Who set the override: `operator` today; `autoscaler` when the policy
@@ -3619,6 +3653,305 @@ message TaskScaleStatus {
 message GetJobScaleStatusReply {
   // One entry per task in the job's latest config, spec-order.
   repeated TaskScaleStatus tasks = 1;
+}
+
+// Request payload for GetScalingInputs (docs/autoscaling.md, "Scaling
+// inputs").
+message GetScalingInputsRequest {
+  // The tasks to read. Each selector names a job and optionally narrows it
+  // to one task group and/or task name; a selector that names neither reads
+  // every task of the job. At most 1000 selectors.
+  //
+  // When empty, every job in `namespaces` is read instead.
+  repeated ScalingTargetSelector targets = 1;
+
+  // Used only when `targets` is empty: namespaces to list, as names or
+  // `*`-globs (`["*"]` for every namespace). Empty means `default`. Jobs the
+  // caller lacks `scale:read` on are left out, so `*` widens what is
+  // considered, never what is visible.
+  repeated string namespaces = 2;
+
+  // Also return this many seconds of each target's history, as the
+  // 10-second points the answering manager keeps in memory
+  // (`ScalingInputs.history`, oldest first). 0, the default, returns none.
+  // Values above 3600 (the hour the manager keeps) are clamped to 3600.
+  uint32 history_seconds = 3;
+}
+
+// One job, or one task of it, to read scaling inputs for.
+message ScalingTargetSelector {
+  // Job id (`namespace/name`, or the bare name for a job in `default`).
+  // Required.
+  string job = 1;
+
+  // Narrow to tasks in this group. Unset or empty matches every group.
+  optional string task_group = 2;
+
+  // Narrow to the task with this name. Unset or empty matches every task.
+  optional string task_name = 3;
+}
+
+// Reply payload for GetScalingInputs.
+message GetScalingInputsReply {
+  // One entry per task the request resolved to, in request order (spec
+  // order within a job). A selector that names no existing job or task
+  // yields one entry with `error` set rather than failing the batch.
+  repeated ScalingInputs inputs = 1;
+
+  // The manager that answered: its raft node id, or `local` for a
+  // single-manager cluster. It is the status-lane leader, wherever the
+  // request was sent.
+  string served_by = 2;
+
+  // Seconds since the answering manager took the status lane (or started,
+  // for a single manager). The merged usage is younger than this: a recent
+  // takeover means a recent, possibly partial, resync.
+  uint64 leader_for_seconds = 3;
+}
+
+// The scaling inputs of one task (`job_id`, `task_group`, `task_name`).
+//
+// Replica counts and the desired count are read from the replicated state
+// store when the request is answered. Measured CPU, memory, and requests are
+// the newest rollups the answering manager holds, at most one 10-second
+// rollup interval behind the worker samples they come from; see
+// `freshness`.
+message ScalingInputs {
+  // Canonical job id.
+  string job_id = 1;
+
+  // Task group.
+  string task_group = 2;
+
+  // Task name.
+  string task_name = 3;
+
+  // Set when the selector resolved to nothing: `job not found`, or `no task
+  // matches group=<g> task=<t>`. Every other field is then empty, and the
+  // job and selector fields above echo the request.
+  string error = 4;
+
+  // The count the scheduler converges to (`Store::effective_task_count`:
+  // the binding count override, else the spec's `count`). 0 for a stopped
+  // or failed job. For a task without a scalable count (`count_scalable`
+  // false), the number of placed replicas.
+  uint32 desired_replicas = 5;
+
+  // Whether the task has a count `legion job scale` can change: false for
+  // keyed stateful tasks (no count) and `count.per` tasks.
+  bool count_scalable = 6;
+
+  // Allocations of this task the scheduler has placed, across every version
+  // of the job (a rollout runs old and new replicas side by side).
+  uint32 placed_replicas = 7;
+
+  // Placed replicas whose latest health report says healthy.
+  uint32 ready_replicas = 8;
+
+  // `desired_replicas - placed_replicas`, floored at 0: replicas the
+  // scheduler has not placed, usually for lack of room. Always 0 for tasks
+  // without a scalable count and for batch and cron tasks, whose
+  // allocations end by design.
+  uint32 unplaced_replicas = 9;
+
+  // Whether a rollout of this job is in flight. Scale-in is deferred during
+  // one (docs/autoscaling.md), and new replicas are still warming.
+  bool rollout_active = 10;
+
+  // One replica's reservation in the job's latest spec, after
+  // `taskResourceDefaults`.
+  ScalingReservation reservation = 11;
+
+  // Measured CPU, summed over the replicas that reported.
+  ScalingCpuInputs cpu = 12;
+
+  // Measured memory, summed over the replicas that reported.
+  ScalingMemoryInputs memory = 13;
+
+  // Requests into the service this task backs (its `service` block), from
+  // the service graph. Unset when the task backs no service.
+  //
+  // Recorded on the CALLING side, so only internal callers are counted:
+  // traffic from outside Legion into an advertised port is not seen, and
+  // neither is traffic that bypasses the datapath in `host` mode
+  // (docs/network-handlers.md, "Service graph"). A service backed by several
+  // tasks reports the service's totals on each of them.
+  optional ScalingRequestInputs requests = 14;
+
+  // How current the measured inputs are.
+  ScalingDataFreshness freshness = 15;
+
+  // Up to `history_seconds` of 10-second totals, oldest first. Empty unless
+  // the request asked for history. The answering manager keeps one hour in
+  // memory for at most 4096 tasks; a manager that recently took the status
+  // lane holds only what it has seen since.
+  repeated ScalingInputsPoint history = 16;
+}
+
+// One replica's reservation (GetScalingInputs).
+message ScalingReservation {
+  // CPU in MHz. 0 when the task reserves whole cores (`cores`) instead.
+  double cpu_mhz = 1;
+
+  // Whole cores. 0 when the task reserves MHz. Utilization treats `cores =
+  // N` as N x 1000 millicores, and converts to MHz with each node's clock.
+  double cores = 2;
+
+  // Memory in MiB.
+  double memory_mib = 3;
+}
+
+// Measured CPU of one task (GetScalingInputs), summed over its replicas'
+// latest samples.
+message ScalingCpuInputs {
+  // Replicas with a current usage sample. Only governed runtimes (exec,
+  // container, sandbox) on workers with `resourceEnforcement` on report
+  // usage; others count in `placed_replicas` but never here.
+  uint32 measured_replicas = 1;
+
+  // Measured CPU in millicores (1000 = one core busy), as the workers sample
+  // it.
+  uint64 used_millicores = 2;
+
+  // Measured CPU in MHz: each replica's millicores times its node's
+  // `mhz_per_core`, the arithmetic GetNodeUsage uses. Replicas on nodes that
+  // report no clock speed contribute 0.
+  double used_mhz = 3;
+
+  // The measured replicas' reservations in MHz (a `cores = N` reservation is
+  // N x the node's `mhz_per_core`).
+  double reserved_mhz = 4;
+
+  // Mean utilization against the reservation, over the replicas where it can
+  // be computed: sum of used millicores / sum of reserved millicores. 0.7
+  // means 70% of the reservation. 0 when no replica is measurable.
+  double utilization = 5;
+
+  // The busiest replica's utilization against its reservation.
+  double max_utilization = 6;
+
+  // Per-replica utilization histogram: `histogram[i]` counts replicas whose
+  // utilization is below `histogram_bounds[i]` (and not below the previous
+  // bound). The last bucket has no upper bound and counts everything at or
+  // above the last entry of `histogram_bounds`, so `histogram` has one more
+  // entry than `histogram_bounds`. The bounds are fixed:
+  // 0.1, 0.25, 0.5, 0.7, 0.85, 1.0, 1.5.
+  repeated uint32 histogram = 7;
+
+  // Upper bounds of every bucket but the last; see `histogram`.
+  repeated double histogram_bounds = 8;
+
+  // Measured replicas whose utilization cannot be computed: no CPU
+  // reservation, or an MHz reservation on a node that reports no clock
+  // speed. Counted in `measured_replicas` and `used_millicores`, left out
+  // of `utilization` and `histogram`.
+  uint32 unmeasurable_replicas = 9;
+}
+
+// Measured memory of one task (GetScalingInputs).
+message ScalingMemoryInputs {
+  // Replicas with a current usage sample.
+  uint32 measured_replicas = 1;
+
+  // Current memory (`memory.current`, page cache included), in MiB, summed.
+  double used_mib = 2;
+
+  // The measured replicas' reservations in MiB, summed.
+  double reserved_mib = 3;
+
+  // `used_mib / reserved_mib`; 0 when nothing is reserved.
+  double utilization = 4;
+
+  // The largest single replica's memory against its reservation.
+  double max_utilization = 5;
+}
+
+// Requests into one service (GetScalingInputs), from the caller-side service
+// graph, over the most recent rollup interval of every calling node.
+message ScalingRequestInputs {
+  // The service, as a canonical reference (`namespace/name`, or the bare
+  // name in `default`).
+  string service = 1;
+
+  // Requests (HTTP upstreams) or connections (TCP upstreams) per second that
+  // reached an endpoint, summed over every calling node.
+  double requests_per_second = 2;
+
+  // Of those, 5xx answers plus attempts that reached no endpoint, per
+  // second.
+  double errors_per_second = 3;
+
+  // `errors / (requests + errors)`, the share of attempts that failed, as
+  // `ListServiceEdges` computes `error_rate`; 0 with no attempts.
+  double error_ratio = 4;
+
+  // Mean request latency in milliseconds (HTTP upstreams only); 0 with no
+  // HTTP requests.
+  double latency_ms_mean = 5;
+
+  // The slowest request in the window, milliseconds.
+  uint64 latency_ms_max = 6;
+
+  // Nodes whose callers contributed.
+  uint32 calling_nodes = 7;
+}
+
+// How current one task's measured inputs are (GetScalingInputs).
+message ScalingDataFreshness {
+  // - `current`: rollups for this task are in hand, each confirmed by its
+  //   reporting manager within the last 35 seconds.
+  // - `missing`: no rollup: nothing reports usage for the task (no
+  //   replicas, a runtime that reports no usage, enforcement off), or the
+  //   managers that held its rollups stopped confirming them.
+  // - `resyncing`: the answering manager took the status lane less than one
+  //   rollup interval ago, and peers' full resyncs may not have landed. The
+  //   numbers may be partial; treat them as missing.
+  string state = 1;
+
+  // The newest worker sample among the task's rollups, unix milliseconds
+  // (the worker's clock). 0 when `missing`.
+  int64 sampled_at_unix_ms = 2;
+
+  // Seconds since the least recently confirmed rollup was confirmed by the
+  // manager that holds it, on the answering manager's clock. Usually under
+  // 10.
+  uint32 age_seconds = 3;
+
+  // Nodes with a current rollup for the task: nodes running its replicas,
+  // plus nodes whose callers reach the service it backs.
+  uint32 reporting_nodes = 4;
+}
+
+// One 10-second point of a task's history (GetScalingInputs), the totals the
+// answering manager computed at `at_unix_ms`.
+message ScalingInputsPoint {
+  // When the point was taken, unix milliseconds, answering manager's clock.
+  int64 at_unix_ms = 1;
+
+  // `ScalingCpuInputs.measured_replicas` at the time.
+  uint32 measured_replicas = 2;
+
+  // `ScalingCpuInputs.used_mhz`.
+  double cpu_used_mhz = 3;
+
+  // `ScalingCpuInputs.utilization`.
+  double cpu_utilization = 4;
+
+  // `ScalingMemoryInputs.used_mib`.
+  double memory_used_mib = 5;
+
+  // `ScalingMemoryInputs.utilization`.
+  double memory_utilization = 6;
+
+  // `ScalingRequestInputs.requests_per_second`; 0 when the task backs no
+  // service.
+  double requests_per_second = 7;
+
+  // `ScalingRequestInputs.errors_per_second`.
+  double errors_per_second = 8;
+
+  // `ScalingRequestInputs.latency_ms_mean`.
+  double latency_ms_mean = 9;
 }
 
 // Request payload for DestroyJob.
@@ -12119,6 +12452,12 @@ service RaftTransport {
   // decide liveness at `digestInterval` resolution, and it keeps the message
   // small and the merge trivial.
   //
+  // The same RPC carries the sender's scaling-input rollups (`rollups`,
+  // docs/autoscaling.md "Scaling inputs") every 10 seconds, on a digest of
+  // their own with no node ids, so the liveness digest itself stays as small
+  // and as frequent as it was. Delta-encoded; the reply's `rollup_resync`
+  // asks for a full set.
+  //
   // ACL: manager-plane internal, authenticated by cluster secret metadata —
   // it is not a `Manager` RPC, so it takes no ACL row and
   // `tests/integration/acl_endpoints.rs::every_manager_rpc_is_classified` does not cover
@@ -12311,7 +12650,113 @@ message NodeLivenessDigestRequest {
   // digest. Authoritative for this peer: the leader REPLACES the peer's
   // previous claimed set, so a node that moved managers is not left attributed
   // to the old one.
+  //
+  // A digest that carries only `rollups` leaves this empty, and the leader
+  // then leaves the peer's liveness state untouched: an empty list is not a
+  // liveness observation.
   repeated string seen_node_ids = 4;
+
+  // The sender's scaling-input rollups (docs/autoscaling.md, "Scaling
+  // inputs"), sent every 10 seconds on a digest of their own. Unset on an
+  // ordinary liveness digest.
+  RollupSync rollups = 5;
+}
+
+// One manager's per-(node, task) usage and service-graph rollups, shipped to
+// the status-lane leader on `ReportNodeLiveness` (docs/autoscaling.md,
+// "Scaling inputs").
+//
+// Delta-encoded against what the leader already holds from this sender: a
+// `full` sync replaces everything the sender contributed before, and a delta
+// applies only on top of the sync numbered `base_seq` in the same `epoch`.
+// When the leader cannot apply a delta (it just took the lane, restarted, or
+// missed a sync), it drops it and answers `rollup_resync`, and the sender
+// sends a full set at once.
+message RollupSync {
+  // The sender's rollup session: random, fixed for the life of the sending
+  // process. A new epoch means the leader's state for this sender is void.
+  uint64 epoch = 1;
+
+  // This sync's number, increasing within an epoch.
+  uint64 seq = 2;
+
+  // The sync this delta builds on. Ignored when `full`.
+  uint64 base_seq = 3;
+
+  // True when `rollups` is the sender's complete set.
+  bool full = 4;
+
+  // Rollups added or changed since `base_seq` (or every rollup, when
+  // `full`), plus `removed` entries for (node, task) pairs the sender no
+  // longer reports.
+  repeated TargetRollup rollups = 5;
+}
+
+// Usage and service-graph totals for one task on one node, as one manager
+// saw them in its latest reports (docs/autoscaling.md, "Scaling inputs").
+//
+// The usage half sums the replicas of the task that run on the node. The
+// request half sums what CALLERS on the node sent to the service the task
+// backs, so a node can carry a request half for a task it runs no replica
+// of. The leader keeps the newest rollup per (node, task), by
+// `sampled_at_unix_ms`, whichever manager sent it.
+message TargetRollup {
+  // The node the totals were measured on.
+  string node_id = 1;
+
+  // The task: job id, group, and name.
+  string job_id = 2;
+  string task_group = 3;
+  string task_name = 4;
+
+  // The node's newest usage sample folded in, unix milliseconds on the
+  // worker's clock; for a request-only rollup, when the sender folded the
+  // window, on the sender's clock.
+  int64 sampled_at_unix_ms = 5;
+
+  // The sender no longer reports this (node, task): drop it, unless another
+  // manager's newer rollup has replaced it. Every other field is empty.
+  bool removed = 6;
+
+  // Replicas of the task on the node with a usage sample.
+  uint32 replicas = 7;
+
+  // CPU sums over those replicas: measured millicores; measured MHz (the
+  // node's `mhz_per_core` times millicores / 1000, 0 when the node reports
+  // no clock); reserved MHz (`cores = N` counts as N x `mhz_per_core`).
+  uint64 cpu_used_millicores = 8;
+  double cpu_used_mhz = 9;
+  double cpu_reserved_mhz = 10;
+
+  // Used and reserved millicores over the replicas whose utilization can be
+  // computed (`cores = N` reserves N x 1000), so the leader can divide sums
+  // rather than average ratios.
+  uint64 cpu_util_used_millicores = 11;
+  double cpu_util_reserved_millicores = 12;
+
+  // The busiest replica's utilization, and the per-replica histogram over
+  // `ScalingCpuInputs.histogram_bounds` (one more bucket than bounds).
+  double cpu_utilization_max = 13;
+  repeated uint32 cpu_utilization_histogram = 14;
+
+  // Replicas whose utilization cannot be computed.
+  uint32 cpu_unmeasurable = 15;
+
+  // Memory sums: current bytes, reserved MiB; and the largest single
+  // replica's current memory against its reservation.
+  uint64 memory_used_bytes = 16;
+  double memory_reserved_mib = 17;
+  double memory_utilization_max = 18;
+
+  // Requests into the task's service from callers on this node over
+  // `edge_window_ms`: attempts that reached an endpoint, failures, and the
+  // latency sum and max (HTTP). All 0, with a 0 window, when no caller on the
+  // node reached the service.
+  uint64 edge_requests = 19;
+  uint64 edge_errors = 20;
+  uint64 edge_latency_ms_sum = 21;
+  uint64 edge_latency_ms_max = 22;
+  uint32 edge_window_ms = 23;
 }
 
 // Reply payload for RaftTransport.ReportNodeLiveness.
@@ -12335,6 +12780,12 @@ message NodeLivenessDigestReply {
   // talks to. Absent when the leader has adaptive cadence off or predates
   // this field, and the sender then serves no interval either.
   optional uint32 served_interval_seconds = 4;
+
+  // Set on an accepted digest whose `rollups` the leader could not apply: it
+  // holds no state for this sender (it just took the status lane or
+  // restarted), the epoch changed, or `base_seq` is not the last sync it
+  // applied. The sender answers with a full sync.
+  bool rollup_resync = 5;
 }
 
 // Request envelope for the three openraft protocol RPCs (AppendEntries,

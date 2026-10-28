@@ -41,6 +41,8 @@ mod gang_waits;
 mod gang_losses;
 // Gang members: each gang allocation's rank, size, and leader address.
 mod gang_members;
+// Scaling inputs: the reads behind the rollup loop and GetScalingInputs.
+mod scaling_ops;
 use crate::storage::persistence::{
     build_persistence_driver, PersistenceDriver, PersistenceRole, PersistenceStatus,
     RaftHistoryEvent, RaftStatus,
@@ -57,6 +59,7 @@ pub use reschedule_holds::{
     move_backoff, summarize_reason, FailedMove, FailedRemoval, MovePolicy, MoveVerdict,
     RescheduleHold, MOVE_DELAY_MAX,
 };
+pub use scaling_ops::{ScalingAllocRow, ScalingReplicaRow};
 pub use session_ops::{PromoteSession, PromotedSession};
 pub use snapshot_ops::{
     DeleteSnapshotOutcome, NewSnapshot, RestoreInstanceOutcome, RestorePin, SnapshotFilter,
@@ -1405,6 +1408,11 @@ pub struct Store {
     // Which node runs which session (docs/session-mode.md): soft state like
     // the content index, folded from this manager's workers' heartbeats.
     sessions: Arc<crate::storage::session_index::SessionIndex>,
+    // Scaling inputs (docs/autoscaling.md, "Scaling inputs"): this
+    // manager's edge samples since the last rollup, and, on the status-lane
+    // leader, every manager's merged per-(node, task) rollups. Soft state
+    // like liveness; never written to the store.
+    scaling_rollups: Arc<crate::manager::scaling_inputs::ScalingRollups>,
     // Queued snapshot warms (WarmSnapshot), per node. Leader-local soft
     // state like the content index: best effort, never replicated.
     snapshot_warms: Arc<crate::storage::snapshot_warm::SnapshotWarmQueue>,
@@ -2094,6 +2102,7 @@ impl Store {
             liveness: Arc::new(crate::storage::liveness::LivenessTable::new()),
             content_locations: Arc::new(crate::storage::content_index::ContentLocationIndex::new()),
             sessions: Arc::new(crate::storage::session_index::SessionIndex::new()),
+            scaling_rollups: Arc::new(crate::manager::scaling_inputs::ScalingRollups::new()),
             snapshot_warms: Arc::new(crate::storage::snapshot_warm::SnapshotWarmQueue::new()),
             missed_beats_before_lost: config.heartbeat.missed_beats_before_lost.max(1),
             alloc_scrub_queue: Arc::new(std::sync::Mutex::new(Vec::new())),
@@ -2268,6 +2277,31 @@ impl Store {
         }
     }
 
+    /// Refuse with the typed not-the-leader error unless this manager leads
+    /// `lane`, for a read only the lane's leader can answer (its state lives
+    /// in that manager's memory, like the merged scaling inputs). The
+    /// leader-forward layer replays a request refused this way to the
+    /// leader, so callers of any manager get the leader's answer. Always
+    /// `Ok` outside raft mode.
+    pub(crate) fn require_lane_leader(&self, lane: Lane, what: &str) -> R<()> {
+        let Some(driver) = self
+            .persistence_driver
+            .as_any()
+            .downcast_ref::<crate::storage::raft::driver::MultiRaftDriver>()
+        else {
+            return Ok(());
+        };
+        if driver.is_leader(lane) {
+            return Ok(());
+        }
+        Err(
+            anyhow::Error::new(driver.not_leader_error(lane)).context(format!(
+                "{what} is answered by the {} lane's leader",
+                lane.wire_name()
+            )),
+        )
+    }
+
     /// `host:port` of the manager that leads `lane`, when this node knows one.
     /// `None` outside raft mode and mid-election.
     pub(crate) fn lane_leader_hint(&self, lane: crate::storage::Lane) -> Option<String> {
@@ -2357,6 +2391,29 @@ impl Store {
                     .await
             }
             None => crate::storage::liveness::DigestOutcome::NoEngine,
+        }
+    }
+
+    /// Ship this manager's scaling-input rollups to the status-lane leader on
+    /// the liveness digest RPC (docs/autoscaling.md, "Scaling inputs").
+    /// Returns the outcome and whether the leader asked for a full resync.
+    /// `NoEngine` outside raft mode, where this manager merges its own.
+    pub async fn report_scaling_rollups(
+        &self,
+        observer_manager_id: &str,
+        sync: crate::structs::RollupSync,
+    ) -> (crate::storage::liveness::DigestOutcome, bool) {
+        match self
+            .persistence_driver
+            .as_any()
+            .downcast_ref::<crate::storage::raft::driver::MultiRaftDriver>()
+        {
+            Some(driver) => {
+                driver
+                    .send_rollup_digest(observer_manager_id.to_string(), sync)
+                    .await
+            }
+            None => (crate::storage::liveness::DigestOutcome::NoEngine, false),
         }
     }
 
@@ -8689,6 +8746,11 @@ impl Store {
     /// The session index (see [`crate::storage::session_index`]).
     pub fn sessions(&self) -> &Arc<crate::storage::session_index::SessionIndex> {
         &self.sessions
+    }
+
+    /// Scaling-input rollups (see [`crate::manager::scaling_inputs`]).
+    pub fn scaling_rollups(&self) -> &Arc<crate::manager::scaling_inputs::ScalingRollups> {
+        &self.scaling_rollups
     }
 
     /// The cluster CA provider (docs/cluster-ca.md).

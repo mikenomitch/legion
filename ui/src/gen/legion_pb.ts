@@ -4579,7 +4579,10 @@ export class TaskScaleStatus extends Message<TaskScaleStatus> {
   specCount = 0;
 
   /**
-   * The applied override count, when one exists.
+   * The applied override count, when one exists and binds to the current
+   * spec. An override binds only to the spec count it was laid over; a row
+   * laid over a different spec count is not reported here and does not move
+   * `effective_count`.
    *
    * @generated from field: optional uint32 override_count = 4;
    */
@@ -4594,8 +4597,10 @@ export class TaskScaleStatus extends Message<TaskScaleStatus> {
   pendingCount?: number;
 
   /**
-   * The count the scheduler currently converges to
-   * (`override_count` if set, else `spec_count`).
+   * The count the scheduler currently converges to: the binding override
+   * if there is one, else `spec_count`. Read through the same accessor the
+   * scheduler, rollouts, and quota use, so this always agrees with what
+   * placement does.
    *
    * @generated from field: uint32 effective_count = 6;
    */
@@ -4698,6 +4703,915 @@ export class GetJobScaleStatusReply extends Message<GetJobScaleStatusReply> {
 
   static equals(a: GetJobScaleStatusReply | PlainMessage<GetJobScaleStatusReply> | undefined, b: GetJobScaleStatusReply | PlainMessage<GetJobScaleStatusReply> | undefined): boolean {
     return proto3.util.equals(GetJobScaleStatusReply, a, b);
+  }
+}
+
+/**
+ * Request payload for GetScalingInputs (docs/autoscaling.md, "Scaling
+ * inputs").
+ *
+ * @generated from message legion.GetScalingInputsRequest
+ */
+export class GetScalingInputsRequest extends Message<GetScalingInputsRequest> {
+  /**
+   * The tasks to read. Each selector names a job and optionally narrows it
+   * to one task group and/or task name; a selector that names neither reads
+   * every task of the job. At most 1000 selectors.
+   *
+   * When empty, every job in `namespaces` is read instead.
+   *
+   * @generated from field: repeated legion.ScalingTargetSelector targets = 1;
+   */
+  targets: ScalingTargetSelector[] = [];
+
+  /**
+   * Used only when `targets` is empty: namespaces to list, as names or
+   * `*`-globs (`["*"]` for every namespace). Empty means `default`. Jobs the
+   * caller lacks `scale:read` on are left out, so `*` widens what is
+   * considered, never what is visible.
+   *
+   * @generated from field: repeated string namespaces = 2;
+   */
+  namespaces: string[] = [];
+
+  /**
+   * Also return this many seconds of each target's history, as the
+   * 10-second points the answering manager keeps in memory
+   * (`ScalingInputs.history`, oldest first). 0, the default, returns none.
+   * Values above 3600 (the hour the manager keeps) are clamped to 3600.
+   *
+   * @generated from field: uint32 history_seconds = 3;
+   */
+  historySeconds = 0;
+
+  constructor(data?: PartialMessage<GetScalingInputsRequest>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.GetScalingInputsRequest";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "targets", kind: "message", T: ScalingTargetSelector, repeated: true },
+    { no: 2, name: "namespaces", kind: "scalar", T: 9 /* ScalarType.STRING */, repeated: true },
+    { no: 3, name: "history_seconds", kind: "scalar", T: 13 /* ScalarType.UINT32 */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): GetScalingInputsRequest {
+    return new GetScalingInputsRequest().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): GetScalingInputsRequest {
+    return new GetScalingInputsRequest().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): GetScalingInputsRequest {
+    return new GetScalingInputsRequest().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: GetScalingInputsRequest | PlainMessage<GetScalingInputsRequest> | undefined, b: GetScalingInputsRequest | PlainMessage<GetScalingInputsRequest> | undefined): boolean {
+    return proto3.util.equals(GetScalingInputsRequest, a, b);
+  }
+}
+
+/**
+ * One job, or one task of it, to read scaling inputs for.
+ *
+ * @generated from message legion.ScalingTargetSelector
+ */
+export class ScalingTargetSelector extends Message<ScalingTargetSelector> {
+  /**
+   * Job id (`namespace/name`, or the bare name for a job in `default`).
+   * Required.
+   *
+   * @generated from field: string job = 1;
+   */
+  job = "";
+
+  /**
+   * Narrow to tasks in this group. Unset or empty matches every group.
+   *
+   * @generated from field: optional string task_group = 2;
+   */
+  taskGroup?: string;
+
+  /**
+   * Narrow to the task with this name. Unset or empty matches every task.
+   *
+   * @generated from field: optional string task_name = 3;
+   */
+  taskName?: string;
+
+  constructor(data?: PartialMessage<ScalingTargetSelector>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.ScalingTargetSelector";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "job", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 2, name: "task_group", kind: "scalar", T: 9 /* ScalarType.STRING */, opt: true },
+    { no: 3, name: "task_name", kind: "scalar", T: 9 /* ScalarType.STRING */, opt: true },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): ScalingTargetSelector {
+    return new ScalingTargetSelector().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): ScalingTargetSelector {
+    return new ScalingTargetSelector().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): ScalingTargetSelector {
+    return new ScalingTargetSelector().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: ScalingTargetSelector | PlainMessage<ScalingTargetSelector> | undefined, b: ScalingTargetSelector | PlainMessage<ScalingTargetSelector> | undefined): boolean {
+    return proto3.util.equals(ScalingTargetSelector, a, b);
+  }
+}
+
+/**
+ * Reply payload for GetScalingInputs.
+ *
+ * @generated from message legion.GetScalingInputsReply
+ */
+export class GetScalingInputsReply extends Message<GetScalingInputsReply> {
+  /**
+   * One entry per task the request resolved to, in request order (spec
+   * order within a job). A selector that names no existing job or task
+   * yields one entry with `error` set rather than failing the batch.
+   *
+   * @generated from field: repeated legion.ScalingInputs inputs = 1;
+   */
+  inputs: ScalingInputs[] = [];
+
+  /**
+   * The manager that answered: its raft node id, or `local` for a
+   * single-manager cluster. It is the status-lane leader, wherever the
+   * request was sent.
+   *
+   * @generated from field: string served_by = 2;
+   */
+  servedBy = "";
+
+  /**
+   * Seconds since the answering manager took the status lane (or started,
+   * for a single manager). The merged usage is younger than this: a recent
+   * takeover means a recent, possibly partial, resync.
+   *
+   * @generated from field: uint64 leader_for_seconds = 3;
+   */
+  leaderForSeconds = protoInt64.zero;
+
+  constructor(data?: PartialMessage<GetScalingInputsReply>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.GetScalingInputsReply";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "inputs", kind: "message", T: ScalingInputs, repeated: true },
+    { no: 2, name: "served_by", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 3, name: "leader_for_seconds", kind: "scalar", T: 4 /* ScalarType.UINT64 */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): GetScalingInputsReply {
+    return new GetScalingInputsReply().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): GetScalingInputsReply {
+    return new GetScalingInputsReply().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): GetScalingInputsReply {
+    return new GetScalingInputsReply().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: GetScalingInputsReply | PlainMessage<GetScalingInputsReply> | undefined, b: GetScalingInputsReply | PlainMessage<GetScalingInputsReply> | undefined): boolean {
+    return proto3.util.equals(GetScalingInputsReply, a, b);
+  }
+}
+
+/**
+ * The scaling inputs of one task (`job_id`, `task_group`, `task_name`).
+ *
+ * Replica counts and the desired count are read from the replicated state
+ * store when the request is answered. Measured CPU, memory, and requests are
+ * the newest rollups the answering manager holds, at most one 10-second
+ * rollup interval behind the worker samples they come from; see
+ * `freshness`.
+ *
+ * @generated from message legion.ScalingInputs
+ */
+export class ScalingInputs extends Message<ScalingInputs> {
+  /**
+   * Canonical job id.
+   *
+   * @generated from field: string job_id = 1;
+   */
+  jobId = "";
+
+  /**
+   * Task group.
+   *
+   * @generated from field: string task_group = 2;
+   */
+  taskGroup = "";
+
+  /**
+   * Task name.
+   *
+   * @generated from field: string task_name = 3;
+   */
+  taskName = "";
+
+  /**
+   * Set when the selector resolved to nothing: `job not found`, or `no task
+   * matches group=<g> task=<t>`. Every other field is then empty, and the
+   * job and selector fields above echo the request.
+   *
+   * @generated from field: string error = 4;
+   */
+  error = "";
+
+  /**
+   * The count the scheduler converges to (`Store::effective_task_count`:
+   * the binding count override, else the spec's `count`). 0 for a stopped
+   * or failed job. For a task without a scalable count (`count_scalable`
+   * false), the number of placed replicas.
+   *
+   * @generated from field: uint32 desired_replicas = 5;
+   */
+  desiredReplicas = 0;
+
+  /**
+   * Whether the task has a count `legion job scale` can change: false for
+   * keyed stateful tasks (no count) and `count.per` tasks.
+   *
+   * @generated from field: bool count_scalable = 6;
+   */
+  countScalable = false;
+
+  /**
+   * Allocations of this task the scheduler has placed, across every version
+   * of the job (a rollout runs old and new replicas side by side).
+   *
+   * @generated from field: uint32 placed_replicas = 7;
+   */
+  placedReplicas = 0;
+
+  /**
+   * Placed replicas whose latest health report says healthy.
+   *
+   * @generated from field: uint32 ready_replicas = 8;
+   */
+  readyReplicas = 0;
+
+  /**
+   * `desired_replicas - placed_replicas`, floored at 0: replicas the
+   * scheduler has not placed, usually for lack of room. Always 0 for tasks
+   * without a scalable count and for batch and cron tasks, whose
+   * allocations end by design.
+   *
+   * @generated from field: uint32 unplaced_replicas = 9;
+   */
+  unplacedReplicas = 0;
+
+  /**
+   * Whether a rollout of this job is in flight. Scale-in is deferred during
+   * one (docs/autoscaling.md), and new replicas are still warming.
+   *
+   * @generated from field: bool rollout_active = 10;
+   */
+  rolloutActive = false;
+
+  /**
+   * One replica's reservation in the job's latest spec, after
+   * `taskResourceDefaults`.
+   *
+   * @generated from field: legion.ScalingReservation reservation = 11;
+   */
+  reservation?: ScalingReservation;
+
+  /**
+   * Measured CPU, summed over the replicas that reported.
+   *
+   * @generated from field: legion.ScalingCpuInputs cpu = 12;
+   */
+  cpu?: ScalingCpuInputs;
+
+  /**
+   * Measured memory, summed over the replicas that reported.
+   *
+   * @generated from field: legion.ScalingMemoryInputs memory = 13;
+   */
+  memory?: ScalingMemoryInputs;
+
+  /**
+   * Requests into the service this task backs (its `service` block), from
+   * the service graph. Unset when the task backs no service.
+   *
+   * Recorded on the CALLING side, so only internal callers are counted:
+   * traffic from outside Legion into an advertised port is not seen, and
+   * neither is traffic that bypasses the datapath in `host` mode
+   * (docs/network-handlers.md, "Service graph"). A service backed by several
+   * tasks reports the service's totals on each of them.
+   *
+   * @generated from field: optional legion.ScalingRequestInputs requests = 14;
+   */
+  requests?: ScalingRequestInputs;
+
+  /**
+   * How current the measured inputs are.
+   *
+   * @generated from field: legion.ScalingDataFreshness freshness = 15;
+   */
+  freshness?: ScalingDataFreshness;
+
+  /**
+   * Up to `history_seconds` of 10-second totals, oldest first. Empty unless
+   * the request asked for history. The answering manager keeps one hour in
+   * memory for at most 4096 tasks; a manager that recently took the status
+   * lane holds only what it has seen since.
+   *
+   * @generated from field: repeated legion.ScalingInputsPoint history = 16;
+   */
+  history: ScalingInputsPoint[] = [];
+
+  constructor(data?: PartialMessage<ScalingInputs>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.ScalingInputs";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "job_id", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 2, name: "task_group", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 3, name: "task_name", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 4, name: "error", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 5, name: "desired_replicas", kind: "scalar", T: 13 /* ScalarType.UINT32 */ },
+    { no: 6, name: "count_scalable", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
+    { no: 7, name: "placed_replicas", kind: "scalar", T: 13 /* ScalarType.UINT32 */ },
+    { no: 8, name: "ready_replicas", kind: "scalar", T: 13 /* ScalarType.UINT32 */ },
+    { no: 9, name: "unplaced_replicas", kind: "scalar", T: 13 /* ScalarType.UINT32 */ },
+    { no: 10, name: "rollout_active", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
+    { no: 11, name: "reservation", kind: "message", T: ScalingReservation },
+    { no: 12, name: "cpu", kind: "message", T: ScalingCpuInputs },
+    { no: 13, name: "memory", kind: "message", T: ScalingMemoryInputs },
+    { no: 14, name: "requests", kind: "message", T: ScalingRequestInputs, opt: true },
+    { no: 15, name: "freshness", kind: "message", T: ScalingDataFreshness },
+    { no: 16, name: "history", kind: "message", T: ScalingInputsPoint, repeated: true },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): ScalingInputs {
+    return new ScalingInputs().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): ScalingInputs {
+    return new ScalingInputs().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): ScalingInputs {
+    return new ScalingInputs().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: ScalingInputs | PlainMessage<ScalingInputs> | undefined, b: ScalingInputs | PlainMessage<ScalingInputs> | undefined): boolean {
+    return proto3.util.equals(ScalingInputs, a, b);
+  }
+}
+
+/**
+ * One replica's reservation (GetScalingInputs).
+ *
+ * @generated from message legion.ScalingReservation
+ */
+export class ScalingReservation extends Message<ScalingReservation> {
+  /**
+   * CPU in MHz. 0 when the task reserves whole cores (`cores`) instead.
+   *
+   * @generated from field: double cpu_mhz = 1;
+   */
+  cpuMhz = 0;
+
+  /**
+   * Whole cores. 0 when the task reserves MHz. Utilization treats `cores =
+   * N` as N x 1000 millicores, and converts to MHz with each node's clock.
+   *
+   * @generated from field: double cores = 2;
+   */
+  cores = 0;
+
+  /**
+   * Memory in MiB.
+   *
+   * @generated from field: double memory_mib = 3;
+   */
+  memoryMib = 0;
+
+  constructor(data?: PartialMessage<ScalingReservation>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.ScalingReservation";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "cpu_mhz", kind: "scalar", T: 1 /* ScalarType.DOUBLE */ },
+    { no: 2, name: "cores", kind: "scalar", T: 1 /* ScalarType.DOUBLE */ },
+    { no: 3, name: "memory_mib", kind: "scalar", T: 1 /* ScalarType.DOUBLE */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): ScalingReservation {
+    return new ScalingReservation().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): ScalingReservation {
+    return new ScalingReservation().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): ScalingReservation {
+    return new ScalingReservation().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: ScalingReservation | PlainMessage<ScalingReservation> | undefined, b: ScalingReservation | PlainMessage<ScalingReservation> | undefined): boolean {
+    return proto3.util.equals(ScalingReservation, a, b);
+  }
+}
+
+/**
+ * Measured CPU of one task (GetScalingInputs), summed over its replicas'
+ * latest samples.
+ *
+ * @generated from message legion.ScalingCpuInputs
+ */
+export class ScalingCpuInputs extends Message<ScalingCpuInputs> {
+  /**
+   * Replicas with a current usage sample. Only governed runtimes (exec,
+   * container, sandbox) on workers with `resourceEnforcement` on report
+   * usage; others count in `placed_replicas` but never here.
+   *
+   * @generated from field: uint32 measured_replicas = 1;
+   */
+  measuredReplicas = 0;
+
+  /**
+   * Measured CPU in millicores (1000 = one core busy), as the workers sample
+   * it.
+   *
+   * @generated from field: uint64 used_millicores = 2;
+   */
+  usedMillicores = protoInt64.zero;
+
+  /**
+   * Measured CPU in MHz: each replica's millicores times its node's
+   * `mhz_per_core`, the arithmetic GetNodeUsage uses. Replicas on nodes that
+   * report no clock speed contribute 0.
+   *
+   * @generated from field: double used_mhz = 3;
+   */
+  usedMhz = 0;
+
+  /**
+   * The measured replicas' reservations in MHz (a `cores = N` reservation is
+   * N x the node's `mhz_per_core`).
+   *
+   * @generated from field: double reserved_mhz = 4;
+   */
+  reservedMhz = 0;
+
+  /**
+   * Mean utilization against the reservation, over the replicas where it can
+   * be computed: sum of used millicores / sum of reserved millicores. 0.7
+   * means 70% of the reservation. 0 when no replica is measurable.
+   *
+   * @generated from field: double utilization = 5;
+   */
+  utilization = 0;
+
+  /**
+   * The busiest replica's utilization against its reservation.
+   *
+   * @generated from field: double max_utilization = 6;
+   */
+  maxUtilization = 0;
+
+  /**
+   * Per-replica utilization histogram: `histogram[i]` counts replicas whose
+   * utilization is below `histogram_bounds[i]` (and not below the previous
+   * bound). The last bucket has no upper bound and counts everything at or
+   * above the last entry of `histogram_bounds`, so `histogram` has one more
+   * entry than `histogram_bounds`. The bounds are fixed:
+   * 0.1, 0.25, 0.5, 0.7, 0.85, 1.0, 1.5.
+   *
+   * @generated from field: repeated uint32 histogram = 7;
+   */
+  histogram: number[] = [];
+
+  /**
+   * Upper bounds of every bucket but the last; see `histogram`.
+   *
+   * @generated from field: repeated double histogram_bounds = 8;
+   */
+  histogramBounds: number[] = [];
+
+  /**
+   * Measured replicas whose utilization cannot be computed: no CPU
+   * reservation, or an MHz reservation on a node that reports no clock
+   * speed. Counted in `measured_replicas` and `used_millicores`, left out
+   * of `utilization` and `histogram`.
+   *
+   * @generated from field: uint32 unmeasurable_replicas = 9;
+   */
+  unmeasurableReplicas = 0;
+
+  constructor(data?: PartialMessage<ScalingCpuInputs>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.ScalingCpuInputs";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "measured_replicas", kind: "scalar", T: 13 /* ScalarType.UINT32 */ },
+    { no: 2, name: "used_millicores", kind: "scalar", T: 4 /* ScalarType.UINT64 */ },
+    { no: 3, name: "used_mhz", kind: "scalar", T: 1 /* ScalarType.DOUBLE */ },
+    { no: 4, name: "reserved_mhz", kind: "scalar", T: 1 /* ScalarType.DOUBLE */ },
+    { no: 5, name: "utilization", kind: "scalar", T: 1 /* ScalarType.DOUBLE */ },
+    { no: 6, name: "max_utilization", kind: "scalar", T: 1 /* ScalarType.DOUBLE */ },
+    { no: 7, name: "histogram", kind: "scalar", T: 13 /* ScalarType.UINT32 */, repeated: true },
+    { no: 8, name: "histogram_bounds", kind: "scalar", T: 1 /* ScalarType.DOUBLE */, repeated: true },
+    { no: 9, name: "unmeasurable_replicas", kind: "scalar", T: 13 /* ScalarType.UINT32 */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): ScalingCpuInputs {
+    return new ScalingCpuInputs().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): ScalingCpuInputs {
+    return new ScalingCpuInputs().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): ScalingCpuInputs {
+    return new ScalingCpuInputs().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: ScalingCpuInputs | PlainMessage<ScalingCpuInputs> | undefined, b: ScalingCpuInputs | PlainMessage<ScalingCpuInputs> | undefined): boolean {
+    return proto3.util.equals(ScalingCpuInputs, a, b);
+  }
+}
+
+/**
+ * Measured memory of one task (GetScalingInputs).
+ *
+ * @generated from message legion.ScalingMemoryInputs
+ */
+export class ScalingMemoryInputs extends Message<ScalingMemoryInputs> {
+  /**
+   * Replicas with a current usage sample.
+   *
+   * @generated from field: uint32 measured_replicas = 1;
+   */
+  measuredReplicas = 0;
+
+  /**
+   * Current memory (`memory.current`, page cache included), in MiB, summed.
+   *
+   * @generated from field: double used_mib = 2;
+   */
+  usedMib = 0;
+
+  /**
+   * The measured replicas' reservations in MiB, summed.
+   *
+   * @generated from field: double reserved_mib = 3;
+   */
+  reservedMib = 0;
+
+  /**
+   * `used_mib / reserved_mib`; 0 when nothing is reserved.
+   *
+   * @generated from field: double utilization = 4;
+   */
+  utilization = 0;
+
+  /**
+   * The largest single replica's memory against its reservation.
+   *
+   * @generated from field: double max_utilization = 5;
+   */
+  maxUtilization = 0;
+
+  constructor(data?: PartialMessage<ScalingMemoryInputs>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.ScalingMemoryInputs";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "measured_replicas", kind: "scalar", T: 13 /* ScalarType.UINT32 */ },
+    { no: 2, name: "used_mib", kind: "scalar", T: 1 /* ScalarType.DOUBLE */ },
+    { no: 3, name: "reserved_mib", kind: "scalar", T: 1 /* ScalarType.DOUBLE */ },
+    { no: 4, name: "utilization", kind: "scalar", T: 1 /* ScalarType.DOUBLE */ },
+    { no: 5, name: "max_utilization", kind: "scalar", T: 1 /* ScalarType.DOUBLE */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): ScalingMemoryInputs {
+    return new ScalingMemoryInputs().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): ScalingMemoryInputs {
+    return new ScalingMemoryInputs().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): ScalingMemoryInputs {
+    return new ScalingMemoryInputs().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: ScalingMemoryInputs | PlainMessage<ScalingMemoryInputs> | undefined, b: ScalingMemoryInputs | PlainMessage<ScalingMemoryInputs> | undefined): boolean {
+    return proto3.util.equals(ScalingMemoryInputs, a, b);
+  }
+}
+
+/**
+ * Requests into one service (GetScalingInputs), from the caller-side service
+ * graph, over the most recent rollup interval of every calling node.
+ *
+ * @generated from message legion.ScalingRequestInputs
+ */
+export class ScalingRequestInputs extends Message<ScalingRequestInputs> {
+  /**
+   * The service, as a canonical reference (`namespace/name`, or the bare
+   * name in `default`).
+   *
+   * @generated from field: string service = 1;
+   */
+  service = "";
+
+  /**
+   * Requests (HTTP upstreams) or connections (TCP upstreams) per second that
+   * reached an endpoint, summed over every calling node.
+   *
+   * @generated from field: double requests_per_second = 2;
+   */
+  requestsPerSecond = 0;
+
+  /**
+   * Of those, 5xx answers plus attempts that reached no endpoint, per
+   * second.
+   *
+   * @generated from field: double errors_per_second = 3;
+   */
+  errorsPerSecond = 0;
+
+  /**
+   * `errors / (requests + errors)`, the share of attempts that failed, as
+   * `ListServiceEdges` computes `error_rate`; 0 with no attempts.
+   *
+   * @generated from field: double error_ratio = 4;
+   */
+  errorRatio = 0;
+
+  /**
+   * Mean request latency in milliseconds (HTTP upstreams only); 0 with no
+   * HTTP requests.
+   *
+   * @generated from field: double latency_ms_mean = 5;
+   */
+  latencyMsMean = 0;
+
+  /**
+   * The slowest request in the window, milliseconds.
+   *
+   * @generated from field: uint64 latency_ms_max = 6;
+   */
+  latencyMsMax = protoInt64.zero;
+
+  /**
+   * Nodes whose callers contributed.
+   *
+   * @generated from field: uint32 calling_nodes = 7;
+   */
+  callingNodes = 0;
+
+  constructor(data?: PartialMessage<ScalingRequestInputs>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.ScalingRequestInputs";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "service", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 2, name: "requests_per_second", kind: "scalar", T: 1 /* ScalarType.DOUBLE */ },
+    { no: 3, name: "errors_per_second", kind: "scalar", T: 1 /* ScalarType.DOUBLE */ },
+    { no: 4, name: "error_ratio", kind: "scalar", T: 1 /* ScalarType.DOUBLE */ },
+    { no: 5, name: "latency_ms_mean", kind: "scalar", T: 1 /* ScalarType.DOUBLE */ },
+    { no: 6, name: "latency_ms_max", kind: "scalar", T: 4 /* ScalarType.UINT64 */ },
+    { no: 7, name: "calling_nodes", kind: "scalar", T: 13 /* ScalarType.UINT32 */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): ScalingRequestInputs {
+    return new ScalingRequestInputs().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): ScalingRequestInputs {
+    return new ScalingRequestInputs().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): ScalingRequestInputs {
+    return new ScalingRequestInputs().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: ScalingRequestInputs | PlainMessage<ScalingRequestInputs> | undefined, b: ScalingRequestInputs | PlainMessage<ScalingRequestInputs> | undefined): boolean {
+    return proto3.util.equals(ScalingRequestInputs, a, b);
+  }
+}
+
+/**
+ * How current one task's measured inputs are (GetScalingInputs).
+ *
+ * @generated from message legion.ScalingDataFreshness
+ */
+export class ScalingDataFreshness extends Message<ScalingDataFreshness> {
+  /**
+   * - `current`: rollups for this task are in hand, each confirmed by its
+   *   reporting manager within the last 35 seconds.
+   * - `missing`: no rollup: nothing reports usage for the task (no
+   *   replicas, a runtime that reports no usage, enforcement off), or the
+   *   managers that held its rollups stopped confirming them.
+   * - `resyncing`: the answering manager took the status lane less than one
+   *   rollup interval ago, and peers' full resyncs may not have landed. The
+   *   numbers may be partial; treat them as missing.
+   *
+   * @generated from field: string state = 1;
+   */
+  state = "";
+
+  /**
+   * The newest worker sample among the task's rollups, unix milliseconds
+   * (the worker's clock). 0 when `missing`.
+   *
+   * @generated from field: int64 sampled_at_unix_ms = 2;
+   */
+  sampledAtUnixMs = protoInt64.zero;
+
+  /**
+   * Seconds since the least recently confirmed rollup was confirmed by the
+   * manager that holds it, on the answering manager's clock. Usually under
+   * 10.
+   *
+   * @generated from field: uint32 age_seconds = 3;
+   */
+  ageSeconds = 0;
+
+  /**
+   * Nodes with a current rollup for the task: nodes running its replicas,
+   * plus nodes whose callers reach the service it backs.
+   *
+   * @generated from field: uint32 reporting_nodes = 4;
+   */
+  reportingNodes = 0;
+
+  constructor(data?: PartialMessage<ScalingDataFreshness>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.ScalingDataFreshness";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "state", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 2, name: "sampled_at_unix_ms", kind: "scalar", T: 3 /* ScalarType.INT64 */ },
+    { no: 3, name: "age_seconds", kind: "scalar", T: 13 /* ScalarType.UINT32 */ },
+    { no: 4, name: "reporting_nodes", kind: "scalar", T: 13 /* ScalarType.UINT32 */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): ScalingDataFreshness {
+    return new ScalingDataFreshness().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): ScalingDataFreshness {
+    return new ScalingDataFreshness().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): ScalingDataFreshness {
+    return new ScalingDataFreshness().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: ScalingDataFreshness | PlainMessage<ScalingDataFreshness> | undefined, b: ScalingDataFreshness | PlainMessage<ScalingDataFreshness> | undefined): boolean {
+    return proto3.util.equals(ScalingDataFreshness, a, b);
+  }
+}
+
+/**
+ * One 10-second point of a task's history (GetScalingInputs), the totals the
+ * answering manager computed at `at_unix_ms`.
+ *
+ * @generated from message legion.ScalingInputsPoint
+ */
+export class ScalingInputsPoint extends Message<ScalingInputsPoint> {
+  /**
+   * When the point was taken, unix milliseconds, answering manager's clock.
+   *
+   * @generated from field: int64 at_unix_ms = 1;
+   */
+  atUnixMs = protoInt64.zero;
+
+  /**
+   * `ScalingCpuInputs.measured_replicas` at the time.
+   *
+   * @generated from field: uint32 measured_replicas = 2;
+   */
+  measuredReplicas = 0;
+
+  /**
+   * `ScalingCpuInputs.used_mhz`.
+   *
+   * @generated from field: double cpu_used_mhz = 3;
+   */
+  cpuUsedMhz = 0;
+
+  /**
+   * `ScalingCpuInputs.utilization`.
+   *
+   * @generated from field: double cpu_utilization = 4;
+   */
+  cpuUtilization = 0;
+
+  /**
+   * `ScalingMemoryInputs.used_mib`.
+   *
+   * @generated from field: double memory_used_mib = 5;
+   */
+  memoryUsedMib = 0;
+
+  /**
+   * `ScalingMemoryInputs.utilization`.
+   *
+   * @generated from field: double memory_utilization = 6;
+   */
+  memoryUtilization = 0;
+
+  /**
+   * `ScalingRequestInputs.requests_per_second`; 0 when the task backs no
+   * service.
+   *
+   * @generated from field: double requests_per_second = 7;
+   */
+  requestsPerSecond = 0;
+
+  /**
+   * `ScalingRequestInputs.errors_per_second`.
+   *
+   * @generated from field: double errors_per_second = 8;
+   */
+  errorsPerSecond = 0;
+
+  /**
+   * `ScalingRequestInputs.latency_ms_mean`.
+   *
+   * @generated from field: double latency_ms_mean = 9;
+   */
+  latencyMsMean = 0;
+
+  constructor(data?: PartialMessage<ScalingInputsPoint>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.ScalingInputsPoint";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "at_unix_ms", kind: "scalar", T: 3 /* ScalarType.INT64 */ },
+    { no: 2, name: "measured_replicas", kind: "scalar", T: 13 /* ScalarType.UINT32 */ },
+    { no: 3, name: "cpu_used_mhz", kind: "scalar", T: 1 /* ScalarType.DOUBLE */ },
+    { no: 4, name: "cpu_utilization", kind: "scalar", T: 1 /* ScalarType.DOUBLE */ },
+    { no: 5, name: "memory_used_mib", kind: "scalar", T: 1 /* ScalarType.DOUBLE */ },
+    { no: 6, name: "memory_utilization", kind: "scalar", T: 1 /* ScalarType.DOUBLE */ },
+    { no: 7, name: "requests_per_second", kind: "scalar", T: 1 /* ScalarType.DOUBLE */ },
+    { no: 8, name: "errors_per_second", kind: "scalar", T: 1 /* ScalarType.DOUBLE */ },
+    { no: 9, name: "latency_ms_mean", kind: "scalar", T: 1 /* ScalarType.DOUBLE */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): ScalingInputsPoint {
+    return new ScalingInputsPoint().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): ScalingInputsPoint {
+    return new ScalingInputsPoint().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): ScalingInputsPoint {
+    return new ScalingInputsPoint().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: ScalingInputsPoint | PlainMessage<ScalingInputsPoint> | undefined, b: ScalingInputsPoint | PlainMessage<ScalingInputsPoint> | undefined): boolean {
+    return proto3.util.equals(ScalingInputsPoint, a, b);
   }
 }
 
@@ -30461,9 +31375,22 @@ export class NodeLivenessDigestRequest extends Message<NodeLivenessDigestRequest
    * previous claimed set, so a node that moved managers is not left attributed
    * to the old one.
    *
+   * A digest that carries only `rollups` leaves this empty, and the leader
+   * then leaves the peer's liveness state untouched: an empty list is not a
+   * liveness observation.
+   *
    * @generated from field: repeated string seen_node_ids = 4;
    */
   seenNodeIds: string[] = [];
+
+  /**
+   * The sender's scaling-input rollups (docs/autoscaling.md, "Scaling
+   * inputs"), sent every 10 seconds on a digest of their own. Unset on an
+   * ordinary liveness digest.
+   *
+   * @generated from field: legion.RollupSync rollups = 5;
+   */
+  rollups?: RollupSync;
 
   constructor(data?: PartialMessage<NodeLivenessDigestRequest>) {
     super();
@@ -30477,6 +31404,7 @@ export class NodeLivenessDigestRequest extends Message<NodeLivenessDigestRequest
     { no: 2, name: "observer_manager_id", kind: "scalar", T: 9 /* ScalarType.STRING */ },
     { no: 3, name: "observed_at_unix_ms", kind: "scalar", T: 3 /* ScalarType.INT64 */ },
     { no: 4, name: "seen_node_ids", kind: "scalar", T: 9 /* ScalarType.STRING */, repeated: true },
+    { no: 5, name: "rollups", kind: "message", T: RollupSync },
   ]);
 
   static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): NodeLivenessDigestRequest {
@@ -30493,6 +31421,303 @@ export class NodeLivenessDigestRequest extends Message<NodeLivenessDigestRequest
 
   static equals(a: NodeLivenessDigestRequest | PlainMessage<NodeLivenessDigestRequest> | undefined, b: NodeLivenessDigestRequest | PlainMessage<NodeLivenessDigestRequest> | undefined): boolean {
     return proto3.util.equals(NodeLivenessDigestRequest, a, b);
+  }
+}
+
+/**
+ * One manager's per-(node, task) usage and service-graph rollups, shipped to
+ * the status-lane leader on `ReportNodeLiveness` (docs/autoscaling.md,
+ * "Scaling inputs").
+ *
+ * Delta-encoded against what the leader already holds from this sender: a
+ * `full` sync replaces everything the sender contributed before, and a delta
+ * applies only on top of the sync numbered `base_seq` in the same `epoch`.
+ * When the leader cannot apply a delta (it just took the lane, restarted, or
+ * missed a sync), it drops it and answers `rollup_resync`, and the sender
+ * sends a full set at once.
+ *
+ * @generated from message legion.RollupSync
+ */
+export class RollupSync extends Message<RollupSync> {
+  /**
+   * The sender's rollup session: random, fixed for the life of the sending
+   * process. A new epoch means the leader's state for this sender is void.
+   *
+   * @generated from field: uint64 epoch = 1;
+   */
+  epoch = protoInt64.zero;
+
+  /**
+   * This sync's number, increasing within an epoch.
+   *
+   * @generated from field: uint64 seq = 2;
+   */
+  seq = protoInt64.zero;
+
+  /**
+   * The sync this delta builds on. Ignored when `full`.
+   *
+   * @generated from field: uint64 base_seq = 3;
+   */
+  baseSeq = protoInt64.zero;
+
+  /**
+   * True when `rollups` is the sender's complete set.
+   *
+   * @generated from field: bool full = 4;
+   */
+  full = false;
+
+  /**
+   * Rollups added or changed since `base_seq` (or every rollup, when
+   * `full`), plus `removed` entries for (node, task) pairs the sender no
+   * longer reports.
+   *
+   * @generated from field: repeated legion.TargetRollup rollups = 5;
+   */
+  rollups: TargetRollup[] = [];
+
+  constructor(data?: PartialMessage<RollupSync>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.RollupSync";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "epoch", kind: "scalar", T: 4 /* ScalarType.UINT64 */ },
+    { no: 2, name: "seq", kind: "scalar", T: 4 /* ScalarType.UINT64 */ },
+    { no: 3, name: "base_seq", kind: "scalar", T: 4 /* ScalarType.UINT64 */ },
+    { no: 4, name: "full", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
+    { no: 5, name: "rollups", kind: "message", T: TargetRollup, repeated: true },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): RollupSync {
+    return new RollupSync().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): RollupSync {
+    return new RollupSync().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): RollupSync {
+    return new RollupSync().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: RollupSync | PlainMessage<RollupSync> | undefined, b: RollupSync | PlainMessage<RollupSync> | undefined): boolean {
+    return proto3.util.equals(RollupSync, a, b);
+  }
+}
+
+/**
+ * Usage and service-graph totals for one task on one node, as one manager
+ * saw them in its latest reports (docs/autoscaling.md, "Scaling inputs").
+ *
+ * The usage half sums the replicas of the task that run on the node. The
+ * request half sums what CALLERS on the node sent to the service the task
+ * backs, so a node can carry a request half for a task it runs no replica
+ * of. The leader keeps the newest rollup per (node, task), by
+ * `sampled_at_unix_ms`, whichever manager sent it.
+ *
+ * @generated from message legion.TargetRollup
+ */
+export class TargetRollup extends Message<TargetRollup> {
+  /**
+   * The node the totals were measured on.
+   *
+   * @generated from field: string node_id = 1;
+   */
+  nodeId = "";
+
+  /**
+   * The task: job id, group, and name.
+   *
+   * @generated from field: string job_id = 2;
+   */
+  jobId = "";
+
+  /**
+   * @generated from field: string task_group = 3;
+   */
+  taskGroup = "";
+
+  /**
+   * @generated from field: string task_name = 4;
+   */
+  taskName = "";
+
+  /**
+   * The node's newest usage sample folded in, unix milliseconds on the
+   * worker's clock; for a request-only rollup, when the sender folded the
+   * window, on the sender's clock.
+   *
+   * @generated from field: int64 sampled_at_unix_ms = 5;
+   */
+  sampledAtUnixMs = protoInt64.zero;
+
+  /**
+   * The sender no longer reports this (node, task): drop it, unless another
+   * manager's newer rollup has replaced it. Every other field is empty.
+   *
+   * @generated from field: bool removed = 6;
+   */
+  removed = false;
+
+  /**
+   * Replicas of the task on the node with a usage sample.
+   *
+   * @generated from field: uint32 replicas = 7;
+   */
+  replicas = 0;
+
+  /**
+   * CPU sums over those replicas: measured millicores; measured MHz (the
+   * node's `mhz_per_core` times millicores / 1000, 0 when the node reports
+   * no clock); reserved MHz (`cores = N` counts as N x `mhz_per_core`).
+   *
+   * @generated from field: uint64 cpu_used_millicores = 8;
+   */
+  cpuUsedMillicores = protoInt64.zero;
+
+  /**
+   * @generated from field: double cpu_used_mhz = 9;
+   */
+  cpuUsedMhz = 0;
+
+  /**
+   * @generated from field: double cpu_reserved_mhz = 10;
+   */
+  cpuReservedMhz = 0;
+
+  /**
+   * Used and reserved millicores over the replicas whose utilization can be
+   * computed (`cores = N` reserves N x 1000), so the leader can divide sums
+   * rather than average ratios.
+   *
+   * @generated from field: uint64 cpu_util_used_millicores = 11;
+   */
+  cpuUtilUsedMillicores = protoInt64.zero;
+
+  /**
+   * @generated from field: double cpu_util_reserved_millicores = 12;
+   */
+  cpuUtilReservedMillicores = 0;
+
+  /**
+   * The busiest replica's utilization, and the per-replica histogram over
+   * `ScalingCpuInputs.histogram_bounds` (one more bucket than bounds).
+   *
+   * @generated from field: double cpu_utilization_max = 13;
+   */
+  cpuUtilizationMax = 0;
+
+  /**
+   * @generated from field: repeated uint32 cpu_utilization_histogram = 14;
+   */
+  cpuUtilizationHistogram: number[] = [];
+
+  /**
+   * Replicas whose utilization cannot be computed.
+   *
+   * @generated from field: uint32 cpu_unmeasurable = 15;
+   */
+  cpuUnmeasurable = 0;
+
+  /**
+   * Memory sums: current bytes, reserved MiB; and the largest single
+   * replica's current memory against its reservation.
+   *
+   * @generated from field: uint64 memory_used_bytes = 16;
+   */
+  memoryUsedBytes = protoInt64.zero;
+
+  /**
+   * @generated from field: double memory_reserved_mib = 17;
+   */
+  memoryReservedMib = 0;
+
+  /**
+   * @generated from field: double memory_utilization_max = 18;
+   */
+  memoryUtilizationMax = 0;
+
+  /**
+   * Requests into the task's service from callers on this node over
+   * `edge_window_ms`: attempts that reached an endpoint, failures, and the
+   * latency sum and max (HTTP). All 0, with a 0 window, when no caller on the
+   * node reached the service.
+   *
+   * @generated from field: uint64 edge_requests = 19;
+   */
+  edgeRequests = protoInt64.zero;
+
+  /**
+   * @generated from field: uint64 edge_errors = 20;
+   */
+  edgeErrors = protoInt64.zero;
+
+  /**
+   * @generated from field: uint64 edge_latency_ms_sum = 21;
+   */
+  edgeLatencyMsSum = protoInt64.zero;
+
+  /**
+   * @generated from field: uint64 edge_latency_ms_max = 22;
+   */
+  edgeLatencyMsMax = protoInt64.zero;
+
+  /**
+   * @generated from field: uint32 edge_window_ms = 23;
+   */
+  edgeWindowMs = 0;
+
+  constructor(data?: PartialMessage<TargetRollup>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.TargetRollup";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "node_id", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 2, name: "job_id", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 3, name: "task_group", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 4, name: "task_name", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 5, name: "sampled_at_unix_ms", kind: "scalar", T: 3 /* ScalarType.INT64 */ },
+    { no: 6, name: "removed", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
+    { no: 7, name: "replicas", kind: "scalar", T: 13 /* ScalarType.UINT32 */ },
+    { no: 8, name: "cpu_used_millicores", kind: "scalar", T: 4 /* ScalarType.UINT64 */ },
+    { no: 9, name: "cpu_used_mhz", kind: "scalar", T: 1 /* ScalarType.DOUBLE */ },
+    { no: 10, name: "cpu_reserved_mhz", kind: "scalar", T: 1 /* ScalarType.DOUBLE */ },
+    { no: 11, name: "cpu_util_used_millicores", kind: "scalar", T: 4 /* ScalarType.UINT64 */ },
+    { no: 12, name: "cpu_util_reserved_millicores", kind: "scalar", T: 1 /* ScalarType.DOUBLE */ },
+    { no: 13, name: "cpu_utilization_max", kind: "scalar", T: 1 /* ScalarType.DOUBLE */ },
+    { no: 14, name: "cpu_utilization_histogram", kind: "scalar", T: 13 /* ScalarType.UINT32 */, repeated: true },
+    { no: 15, name: "cpu_unmeasurable", kind: "scalar", T: 13 /* ScalarType.UINT32 */ },
+    { no: 16, name: "memory_used_bytes", kind: "scalar", T: 4 /* ScalarType.UINT64 */ },
+    { no: 17, name: "memory_reserved_mib", kind: "scalar", T: 1 /* ScalarType.DOUBLE */ },
+    { no: 18, name: "memory_utilization_max", kind: "scalar", T: 1 /* ScalarType.DOUBLE */ },
+    { no: 19, name: "edge_requests", kind: "scalar", T: 4 /* ScalarType.UINT64 */ },
+    { no: 20, name: "edge_errors", kind: "scalar", T: 4 /* ScalarType.UINT64 */ },
+    { no: 21, name: "edge_latency_ms_sum", kind: "scalar", T: 4 /* ScalarType.UINT64 */ },
+    { no: 22, name: "edge_latency_ms_max", kind: "scalar", T: 4 /* ScalarType.UINT64 */ },
+    { no: 23, name: "edge_window_ms", kind: "scalar", T: 13 /* ScalarType.UINT32 */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): TargetRollup {
+    return new TargetRollup().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): TargetRollup {
+    return new TargetRollup().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): TargetRollup {
+    return new TargetRollup().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: TargetRollup | PlainMessage<TargetRollup> | undefined, b: TargetRollup | PlainMessage<TargetRollup> | undefined): boolean {
+    return proto3.util.equals(TargetRollup, a, b);
   }
 }
 
@@ -30538,6 +31763,16 @@ export class NodeLivenessDigestReply extends Message<NodeLivenessDigestReply> {
    */
   servedIntervalSeconds?: number;
 
+  /**
+   * Set on an accepted digest whose `rollups` the leader could not apply: it
+   * holds no state for this sender (it just took the status lane or
+   * restarted), the epoch changed, or `base_seq` is not the last sync it
+   * applied. The sender answers with a full sync.
+   *
+   * @generated from field: bool rollup_resync = 5;
+   */
+  rollupResync = false;
+
   constructor(data?: PartialMessage<NodeLivenessDigestReply>) {
     super();
     proto3.util.initPartial(data, this);
@@ -30550,6 +31785,7 @@ export class NodeLivenessDigestReply extends Message<NodeLivenessDigestReply> {
     { no: 2, name: "not_status_leader", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
     { no: 3, name: "leader_hint", kind: "scalar", T: 9 /* ScalarType.STRING */ },
     { no: 4, name: "served_interval_seconds", kind: "scalar", T: 13 /* ScalarType.UINT32 */, opt: true },
+    { no: 5, name: "rollup_resync", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
   ]);
 
   static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): NodeLivenessDigestReply {

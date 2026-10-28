@@ -6277,6 +6277,13 @@ impl Manager for ManagerDaemonService {
         Ok(Response::new(GetJobScaleStatusReply { tasks }))
     }
 
+    async fn get_scaling_inputs(
+        &self,
+        request: Request<crate::structs::GetScalingInputsRequest>,
+    ) -> Result<Response<crate::structs::GetScalingInputsReply>, Status> {
+        self.get_scaling_inputs_rpc(request).await
+    }
+
     #[instrument(skip_all)]
     async fn destroy_job(
         &self,
@@ -8360,6 +8367,12 @@ impl Manager for ManagerDaemonService {
                 .map(|a| (a.allocation_id, (a.job_id.clone(), a.task_name.clone())))
                 .collect();
             self.fold_net_edges(&req.net_edges, &callers);
+            // The same samples, for the scaling-input rollup: a map insert
+            // per sample, resolved to the service's task off this path
+            // (docs/autoscaling.md, "Scaling inputs").
+            self.store
+                .scaling_rollups()
+                .record_edges(&id, &req.net_edges);
         }
         // Reclaim work for this node. Re-sent every heartbeat until the worker
         // confirms, so a worker that dies mid-destroy simply retries.
