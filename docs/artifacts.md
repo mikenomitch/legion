@@ -737,6 +737,11 @@ published part is sealed (encrypted) first. Configure it per worker type with
 }
 ```
 
+The example keeps the credential under the reserved `legion/` KV prefix,
+which suits a cluster-wide secret: a tenant's `paths = ["*"]` rule cannot
+read or overwrite it, and writing it takes a management token or a rule
+whose `paths` starts with `legion/` ([KV store](kv-store.md#data-model)).
+
 **Ambient credentials.** With no `auth`, every client of the store (the
 publisher, [session manifests](session-mode.md), a restoring node's fetches,
 and the manager's [archive](suspend-and-resume.md#archiving-idle-instances) reads)

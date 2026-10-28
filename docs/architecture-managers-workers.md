@@ -443,7 +443,9 @@ What the manager registers:
 - **On every manager, leader or not.** A follower forwards the join token it
   mints for its system worker to the control lane's leader; while the
   cluster has no leader it retries, and the system worker starts once one is
-  elected.
+  elected. During a rolling upgrade, a follower on the new build whose
+  leader predates the system worker retries the same way until the leader
+  is upgraded, logging `In-process worker cannot join yet; retrying`.
 
 **`--run-worker` keeps its meaning**, "this manager also runs everything":
 its worker joins worker type and pool `default` with

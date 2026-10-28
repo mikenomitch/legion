@@ -243,7 +243,7 @@ managers' [system workers](architecture-managers-workers.md#the-system-worker).
 - **The `legion/` KV prefix is reserved the same way.** An allow rule's
   `paths` pattern reaches a key under `legion/` only when it starts with
   `legion/`; `paths = ["*"]`, and a `kv` rule with no `paths`, stop short of
-  it. Legion's own jobs keep leases and state there.
+  it. It is set aside for the leases and state of Legion's own jobs.
 - **Namespace policies skip them too.** A policy whose selector is `["*"]`
   does not govern `legion-system`, so a tenant-wide quota, runtime list, or
   default pool never lands on what Legion runs for itself. A selector

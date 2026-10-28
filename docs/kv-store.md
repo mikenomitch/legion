@@ -20,8 +20,8 @@ Primary objects:
   - `key`, `lock_id`, optional owner
   - acquired/expiry timestamps
 
-**The `legion/` prefix is reserved** for Legion's own jobs (leases and
-state). An ACL `paths` glob reaches a key under it only when the pattern
+**The `legion/` prefix is reserved** for the leases and state of Legion's
+own jobs. An ACL `paths` glob reaches a key under it only when the pattern
 itself starts with `legion/`: `paths = ["*"]`, and a `kv` rule with no
 `paths`, stop short of it ([Auth & ACLs](auth-and-acls.md#policies)). Nothing
 stops a token that does hold `legion/*` from writing there, so keep tenant
