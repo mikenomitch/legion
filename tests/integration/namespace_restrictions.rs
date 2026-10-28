@@ -117,12 +117,13 @@ impl Cluster {
         Ok(())
     }
 
+    // Returns `tonic::Status` as the RPC does.
+    #[allow(clippy::result_large_err)]
     fn plan(&self, namespace: &str, spec: String) -> Result<String, tonic::Status> {
         self.runtime
             .block_on(self.svc.plan_job(Request::new(PlanJobRequest {
                 namespace: Some(namespace.to_string()),
                 parsed_jobspec: spec,
-                ..Default::default()
             })))
             .map(|reply| {
                 let reply = reply.into_inner();
