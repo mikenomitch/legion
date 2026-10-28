@@ -2,8 +2,16 @@
 
 > **Judgement calls:** [legion-apps-plan_calls.md](../calls/legion-apps-plan_calls.md)
 
-**Status: PLANNED** (written 2026-10-19; reconciler and upgrade details,
-jobspec extensions, and strict unknown fields added 2026-10-27). Nothing is built. It has six phases (§8),
+**Status: IN EXECUTION** (written 2026-10-19; reconciler and upgrade
+details, jobspec extensions, and strict unknown fields added 2026-10-27).
+**A1 shipped 2026-10-28** (the `legion-system` namespace, the reserved-glob
+rule, node-side `namespaces`, and the system worker; docs:
+[namespaces.md](../../docs/namespaces.md#reserved-namespaces),
+[architecture-managers-workers.md](../../docs/architecture-managers-workers.md#the-system-worker)).
+Where A1 differs from this text, calls entries 18-28 say how and why; the
+largest differences are that a node's `namespaces` is a config attribute,
+not a column (entry 19), and that the system worker has its own port and
+state directory (entry 20). A2-A6 are not built. It has six phases (§8),
 and each ships alone. The first consumer is the autoscaler
 ([autoscaler-v2-plan.md](autoscaler-v2-plan.md)). GitOps is the second, and
 this plan checks the substrate against it (§6.8). Deliberately deferred:
@@ -1385,7 +1393,9 @@ pre-approved per namespace instead, so GitOps doesn't need the union.
   - `ListGrants`, `RevokeGrant`;
   - `WorkloadIdentity` gains `repeated AclRule permissions` and
     `repeated string policies`;
-  - `Node` gains `repeated string namespaces`.
+  - `Node` gains `repeated string namespaces`. *A1 adds
+    `WorkerConfig.namespaces` instead; the node carries the list as a config
+    attribute (calls entry 19).*
 - **ACL.** A new resource `app` (cluster-scoped, `names` selector). Every
   RPC above goes in `tests/integration/acl_endpoints.rs`. Glob matching
   gains the reserved-prefix rule for `legion-*` namespaces and `legion/` KV
@@ -1401,7 +1411,8 @@ pre-approved per namespace instead, so GitOps doesn't need the union.
     write that stores a version;
   - reconciler status columns on `app` (last digest, last action, last
     error, the held version marker and its reason);
-  - `node.namespaces` (JSON array).
+  - `node.namespaces` (JSON array). *A1 carries it as the node's
+    `namespaces` config attribute instead (calls entry 19).*
   - Bootstrap creates `legion-system` and its namespace policy
     (`pools.default = "legion-system"`).
 - **Scheduler.** A namespace check in `scan_base_eligible` and in the

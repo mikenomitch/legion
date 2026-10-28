@@ -511,8 +511,6 @@ How to use it:
 
 | PR | What it lands | Notes |
 | --- | --- | --- |
-| [#51](https://github.com/mikenomitch/legion/pull/51) | Mesh interfaces: one handler pipeline, a smaller surface, the eBPF kernel classifier, WASM network plugins | Plan [mesh-interfaces-plan.md](plans/mesh-interfaces-plan.md); B1 end-to-end plugin overhead still open below |
-| [#57](https://github.com/mikenomitch/legion/pull/57) | Plans only: the autoscaler as a Legion app (autoscaler-v2), and the Legion apps substrate (system worker, granted identities, UI and jobspec extensions, strict unknown fields) | Supersedes autoscaler-plan.md; nothing built. Ecosystem apps → Legion apps substrate and Autoscaler |
 | [#54](https://github.com/mikenomitch/legion/pull/54) | TODO bugs and gaps, second pass | The items it closes are already checked off and in Done |
 | [#41](https://github.com/mikenomitch/legion/pull/41) | Keep plugins out of the workspace so they build again | Likely also closes "Plugin lockfiles are stale" (Plugin surface) |
 | [#39](https://github.com/mikenomitch/legion/pull/39) | Stop macOS single-process clusters cleanly | Closes "Stopping the macOS manager leaves its Apple containers running" (Cross-cutting) |
@@ -1255,9 +1253,10 @@ How to use it:
 - [ ] Worker groups + taint/toleration equivalent. Pools already act as
       taints: a node's pool must be matched by the task's `permit`, with an
       implicit `pool=default` (`src/constraints.rs:114-175`). What's missing
-      is a soft (prefer-not) form, and a restriction the job can't opt into
-      itself. The node-side `namespaces` restriction is
-      [legion-apps](plans/legion-apps-plan.md) A1.
+      is a soft (prefer-not) form. A restriction the job can't opt into
+      itself shipped as the worker type's `namespaces` list
+      ([legion-apps](plans/legion-apps-plan.md) A1,
+      [docs](../docs/namespaces.md#nodes-that-accept-only-some-namespaces)).
 - [ ] Preemption follow-ups — the feature shipped
       ([plan](plans/preemption-and-eviction-plan.md) ·
       [docs](../docs/preemption-and-eviction.md)); these are what it left open.
@@ -4361,16 +4360,38 @@ replicas is one command on day N. The shared substrate is
 [legion-apps-plan.md](plans/legion-apps-plan.md); each app still needs its own
 plan.
 
-- [ ] **Legion apps substrate** (plan in [#57](https://github.com/mikenomitch/legion/pull/57)): [plan](plans/legion-apps-plan.md) (PLANNED) ·
-      [calls](calls/legion-apps-plan_calls.md)
-  - [ ] A1: the `legion-system` namespace (bootstrapped, `*` globs skip
-        reserved `legion-*` namespaces), node-side `namespaces` restriction on
-        worker types (scheduler filter + blocked-eval wake), and a default-on
-        system worker in each manager (capped lend, pool `legion-system`,
-        `legion.role = manager`, `cpu.max`/`memory.max` on its cgroup parent),
-        with `--run-worker` reshaped as `namespaces = ["*", "legion-*"]`;
-        the `legion/` KV prefix reserved the same way; no root exec tasks or
-        privileged containers in reserved namespaces
+- [ ] **Legion apps substrate**: [plan](plans/legion-apps-plan.md) (IN EXECUTION; A1 shipped, in
+      Done) · [calls](calls/legion-apps-plan_calls.md)
+  - [ ] A1 follow-ups, found while building it:
+    - [ ] **A manager's system worker and a standalone worker on one Linux
+          host overwrite each other's host guard.** The kernel host guard is
+          one `nftables` table (`legion_host_guard`) and the eBPF classifier
+          one pin directory (`/sys/fs/bpf/legion`) per host, and each worker
+          rewrites them with only its own allocations. Name both after the
+          worker's cgroup parent. Documented as a limitation in
+          [architecture-managers-workers.md](../docs/architecture-managers-workers.md#the-system-worker).
+    - [ ] **A hand-written `legion-system` job with no permit does not place
+          on a `--run-worker` dev cluster.** The `legion-system` namespace
+          policy sends it to pool `legion-system` (`pools.default`), and a
+          `--run-worker` manager's worker is in `default`, so plan §6.2's
+          "lands on managers too" holds only with a system worker. A3's
+          rendered permits (both pools, `legion.role = "manager"`) place
+          fine (`tests/integration/system_worker.rs`). Decide whether the
+          policy should allow both pools by default.
+    - [ ] **Verify the system worker's `cpu.max` ceiling on a cgroup v2
+          host** with a busy loop (plan §9 A1). It is unit-tested on a
+          scratch tree (`parent_limits_cap_the_whole_hierarchy_test`); CI and
+          the dev container have no cgroup v2.
+    - [ ] **The `pools` ACL selector does not reserve `legion-system`**:
+          `node:write` with `pools = ["*"]` can cordon or drain the managers'
+          system workers. Apply the reserved rule to pool selectors too, or
+          decide it is fine.
+    - [ ] **A node's `namespaces` and `legion.role` attributes are
+          worker-reported**, like every config attribute: a worker that
+          forges its registration can drop its restriction or claim to be a
+          manager's. Pin both from the join token's worker type at
+          registration before A3 places apps by `legion.role`
+          ([calls entry 19](calls/legion-apps-plan_calls.md)).
   - [ ] A2: `identities[].permissions` / `policies` on the `legion` identity,
         granted at submit only up to what the submitter holds; per-version
         grants with `legion acl grants list|revoke`; a per-allocation API
@@ -4418,7 +4439,7 @@ plan.
         equivalent) and extension points beyond job, group, task, volume,
         port, and service (plan §11)
 
-- [ ] **Autoscaler** (v2 plan in [#57](https://github.com/mikenomitch/legion/pull/57)): [plan](plans/autoscaler-v2-plan.md) (PLANNED) ·
+- [ ] **Autoscaler** (v2 plan, merged in [#57](https://github.com/mikenomitch/legion/pull/57)): [plan](plans/autoscaler-v2-plan.md) (PLANNED) ·
       [calls](calls/autoscaler-v2-plan_calls.md). Supersedes
       [autoscaler-plan.md](plans/autoscaler-plan.md) ·
       [calls](calls/autoscaler-plan_calls.md), whose Phase 1 shipped and is
@@ -6085,6 +6106,32 @@ findings: [kernel-classifier-findings.md](kernel-classifier-findings.md)
       [docs](../docs/workload-identity.md#forks-and-snapshots)). Offline
       verifiers (AWS, GCP, Vault) cannot see the epoch, and login-minted ACL
       tokens are still open (Task runtimes, Phase 6 follow-ups).
+
+## Ecosystem apps
+
+- [x] **Legion apps A1: places to run** (2026-10-28,
+      [plan](plans/legion-apps-plan.md) §8 ·
+      [calls](calls/legion-apps-plan_calls.md) · docs:
+      [namespaces.md](../docs/namespaces.md#reserved-namespaces),
+      [architecture-managers-workers.md](../docs/architecture-managers-workers.md#the-system-worker),
+      [auth-and-acls.md](../docs/auth-and-acls.md#policies))
+  - [x] The `legion-system` namespace, created by the first control leader of
+        an empty store with its namespace policy (`pools.default =
+        "legion-system"`), and undeletable
+  - [x] The reserved-prefix glob rule: allow-rule `namespaces` globs skip
+        `legion-*` and `paths` globs skip `legion/` unless the pattern names
+        the prefix; namespace-policy selectors and node lists follow it;
+        denials inside reserved names say why
+  - [x] Node-side `namespaces` on worker types, checked in the candidate
+        filter, the apply recheck and the blocked-eval wake match, and named
+        in placement failures (`N nodes accept only namespaces [...]`)
+  - [x] A default-on system worker per manager (`systemWorker`): pool and
+        type `legion-system`, `legion.role = "manager"`, the lend as its
+        capacity and its cgroup parent's `cpu.max`/`memory.max`, its own port
+        (4849) and state directory, started on followers too; `--run-worker`
+        reshaped as `namespaces = ["*", "legion-*"]` with no cap
+  - [x] No root `exec` tasks and no privilege-floor opt-out containers in
+        reserved namespaces
 
 ## Auth & ACLs
 

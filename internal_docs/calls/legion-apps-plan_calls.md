@@ -3,8 +3,9 @@
 Decisions made while designing
 [`plans/legion-apps-plan.md`](../plans/legion-apps-plan.md). **Entries are
 ordered by project impact, highest first, and an entry's number is its
-rank.** These are design-time calls. Implementation inserts its own at their
-rank. Autoscaler-specific calls are in
+rank.** Entries 1-17 are design-time calls. Implementation calls start at
+18 (phase A1), appended after the design calls, since none outranks them.
+Autoscaler-specific calls are in
 [autoscaler-v2-plan_calls.md](autoscaler-v2-plan_calls.md).
 
 ## 1. An app is an ordinary job plus a manifest, not a special job type
@@ -736,3 +737,283 @@ more than this grant: it *is* the manager. An operator who doesn't want the
 autoscaler seeds it disabled (`apps = { autoscaler = { enabled = false } }`)
 or runs `legion app disable`.
 
+
+## 18. The reserved-prefix rule only ever narrows: deny rules keep plain globs, a missing selector reaches what `*` reaches, and namespace policies follow it too (A1)
+
+**Call.** Implementing entry 6:
+- Only **allow** rules use the reserved match. A deny rule's `namespaces`
+  and `paths` globs stay plain, so a deny on `*` still denies inside
+  `legion-system`.
+- An allow rule with **no** selector where one could apply reaches what `*`
+  reaches: a `resources = ["*"]` rule with no `namespaces`, and a `kv` rule
+  with no `paths`, stop short of `legion-*` and `legion/` too.
+- **Namespace-policy selectors** follow the rule: a `*` policy does not
+  govern `legion-system`.
+- A denial inside a reserved name adds a hint that says why:
+
+```text
+permission denied: job:write requires a policy granting it in this namespace
+  Hint: this token can write job in *
+  Hint: `*` does not reach reserved `legion-*` namespaces; a rule must name them,
+  as `namespaces = ["legion-system"]` or `["*", "legion-*"]`
+```
+
+**Alternatives.**
+- (a) Apply the reserved match to every glob, deny rules included.
+- (b) Treat a missing selector as "everything", reserved names included
+  (the literal reading of "the rule is about patterns").
+- (c) Leave namespace policies on plain globs, as the plan's text says
+  nothing about them.
+
+**Trade-off.**
+- A `resources = ["*"], actions = ["*"]` policy with no selectors is no
+  longer quite "everything": it misses `legion-system` and `legion/`. Such a
+  policy holds `acl:write`, so its holder can widen it, but it is a surprise
+  to explain.
+- One more rule to learn for policy authors: "`*` skips `legion-` in
+  policies too".
+
+**Why (security boundary, then simplicity).**
+- **Against (a).** A deny that matches less grants more. The rule exists to
+  stop broad grants reaching Legion's own jobs; letting it shrink a deny
+  would turn it into an escalation path.
+- **Against (b).** The broad KV grant people actually write is a `kv` rule
+  with no `paths`. Under (b) it would reach the autoscaler's leases, which
+  is the exact hole entry 6 closes.
+- **Against (c).** A tenant-wide policy with `pools.default` (common) would
+  govern `legion-system` as well and disagree with its own `pools.default =
+  "legion-system"`, making every pool-less `legion-system` job
+  unadmittable. A tenant quota would also start charging Legion's jobs.
+
+## 19. A node's `namespaces` rides as a config attribute the worker reports, not a node column and a `Node` proto field (deviates from plan §7)
+
+**Call.** Worker types store `namespaces` (a new `worker_type` column and
+`WorkerConfig.namespaces`, so pre-registration hands it to the worker). The
+worker writes it into its registration's config attributes as
+`namespaces = [...]`, next to `resources`, `reservedResources` and the
+existing `restriction` block, and the scheduler reads it from there. The
+system worker's `capacity` and `legion.role` ride the same way.
+
+```console
+$ legion node info legion-system-x8f2k1qz -j | jq .data.configAttrs.namespaces
+["legion-system"]
+```
+
+**Alternatives.**
+- (a) The plan's shape: a `node.namespaces` column, `Node`/`NodeMsg` gaining
+  `repeated string namespaces`, set by the manager at registration from the
+  join token's worker type.
+- (b) (a) without the manager-side pinning: the worker reports it in a
+  dedicated `WorkerRegisterRequest` field.
+
+**Trade-off.**
+- The restriction is as trustworthy as any worker-reported attribute: a
+  worker that forges its registration can drop its own restriction, and
+  claim `legion.role = "manager"`. The restriction keeps tenants' jobs off
+  nodes; it does not authenticate nodes. That matters once A3 places apps
+  by `legion.role`, and is a TODO item before then.
+- `namespaces` becomes a reserved attribute key: a worker type's
+  `attributes` may not use it (nor `capacity` or `legion.role`).
+
+**Why (simplicity and performance).**
+- A column means a migration on `node`, a field on two structs with about
+  150 literals between them, and a read-model change. The attribute is read
+  with one map lookup per node in the candidate scan, exactly as the
+  existing `restriction` block is.
+- Pinning (a) cannot work for the in-process worker anyway: its namespaces
+  come from each manager's own `systemWorker` block (entry 24), not from the
+  cluster-wide stored type.
+- Moving to a column with manager-side pinning later is a contained change
+  (the predicate reads one helper, `constraints::node_namespaces`).
+
+## 20. The system worker has its own port (4849) and state directory, so a standalone worker can share its host
+
+**Call.** `systemWorker.port` (default 4849) is where the system worker's
+worker plane listens, and it keeps its state under
+`<data dir>/system-worker/` instead of `<data dir>/workers/`. `--run-worker`
+keeps `LEGION_WORKER_PORT` (4848) and `workers/`, as before.
+
+**Alternatives.**
+- (a) What the plan implies: the in-process worker as it was, on
+  `LEGION_WORKER_PORT` and `<data dir>/workers/`.
+- (b) An ephemeral port.
+
+**Trade-off.**
+- One more port to open between managers in a multi-manager cluster, and one
+  more config field.
+- A manager that switches between the system worker and `--run-worker`
+  registers a new node each way; the old one goes lost.
+
+**Why (simplicity).** With the system worker on by default, (a) breaks the
+most common local setup, `legion start manager` then `legion join` from the
+same checkout: the standalone worker collides on 4848, and finds the system
+worker's id in `workers/` and adopts it (or refuses: "Multiple worker IDs
+found"). (b) would make the host guard and firewall rules unpredictable.
+The host guard's `nftables` table is still one per host; that is recorded as
+a limitation and a TODO item, not fixed here.
+
+## 21. A follower's system worker forwards its join token to the control leader, and waits for a leader rather than failing the start
+
+**Call.** The token a manager mints for its own in-process worker is written
+with `insert_join_token_forwarding`, which forwards the row to the control
+lane's leader on `NotRaftLeader` (a new `ForwardableLaneWrite::InsertJoinToken`
+variant). The CA pin and the mint are retried with backoff (1s to 30s) in the
+worker's own task, so a manager that starts before its cluster has a leader
+starts its worker once one is elected.
+
+**Alternatives.**
+- (a) Keep the old behavior: mint locally and fail the manager's start on
+  error. `--run-worker` on a raft follower has always failed this way.
+- (b) Have the in-process worker skip join tokens (an in-memory credential
+  only its own manager recognizes).
+
+**Trade-off.** A new manager-plane wire message, which a leader that
+predates it cannot decode (the follower retries until the leader is
+upgraded). Client `CreateJoinToken` calls keep the non-forwarding write, so
+the client plane's "follow the leader hint" rule (raft plan D3) holds.
+
+**Why (correctness of the default).** "One system worker per manager, so apps
+fail over across managers" (entry 2) is false if followers cannot start one,
+and with the system worker on by default (a) would make every follower of a
+fresh raft cluster fail to start. (b) breaks the moment the worker
+re-registers through another manager (it learns them all and fails over),
+which is the case the system worker exists for.
+
+## 22. The lend is a `capacity` ceiling on the node's fingerprint, and offers no exclusive cores
+
+**Call.** The system worker registers `capacity = { cpu, memory, cores = 0 }`
+as a config attribute, and `ResourcePool::from_node` caps the fingerprinted
+CPU, memory and cores at it before `reservedResources` and oversubscription.
+
+**Alternatives.**
+- (a) Compute `reservedResources` on the worker as fingerprint minus lend.
+- (b) Rewrite the system worker's fingerprint to the lend.
+
+**Trade-off.**
+- A new scheduler input, read once per node when its free pool is built
+  (not per candidate).
+- Apps on the system worker cannot use `cores`: a `cores` task never places
+  there.
+
+**Why (correctness).** (a) breaks on hosts whose CPU clock is unknown: the
+fingerprint's CPU is then infinite, and infinity minus the lend is still
+infinity, so the lend would cap nothing. (b) makes `legion node info` lie
+about the host. Zero `cores` keeps the system worker's governor from pinning
+host CPUs that a standalone worker's governor on the same host also thinks it
+owns.
+
+## 23. `legion-system` is created whenever a control leader finds it missing, and its policy only together with it
+
+**Call.** Every control-lane leader, at startup and on taking leadership,
+creates `legion-system` if it does not exist, and writes its namespace
+policy in the same entry. A leader that finds the namespace does nothing,
+policy or not.
+
+**Alternatives.**
+- (a) Detect "empty store" explicitly (no jobs, no namespaces) and create
+  them only then.
+- (b) Ensure both every time, recreating a deleted policy.
+- (c) Create the namespace in a schema migration, like `default`.
+
+**Trade-off.** A store from before this change gets the namespace on its
+next leader start, which is more than "empty store" promises; there is no
+installed base, so it does not matter.
+
+**Why (simplicity).** The namespace cannot be deleted, so "missing" only
+ever means "never created": that is the empty-store condition without a
+heuristic for (a). (b) would fight an operator who deliberately edited or
+deleted the policy. (c) runs on every manager independently and would also
+need the policy as raw JSON in SQL; a leader-only write keeps one creation
+path that later phases (seeding bundled apps) extend.
+
+## 24. The `legion-system` worker type is built in and always registered; each manager's own settings apply in process
+
+**Call.** Every control leader stores a built-in worker type `legion-system`
+(pool `legion-system`, `namespaces = ["legion-system"]`, `namePrefix =
+"legion-system"`, `legion.role = "manager"`), whatever its own
+`systemWorker` says. A worker config file may not declare that name. Each
+manager hands its in-process worker its own lend, namespaces, cgroup parent
+and port (`LocalWorkerSettings`), which override the stored type.
+
+**Alternatives.**
+- (a) Store each manager's `systemWorker` settings in the type, last writer
+  wins.
+- (b) Register the type only when the leader's own system worker is on.
+
+**Trade-off.** The stored type says `["legion-system"]` even on a cluster
+whose managers configure other namespaces; a join token minted for
+`legion-system` by hand gives a standalone worker the stored settings, not
+any manager's.
+
+**Why (simplicity).** Manager configs can differ, and the worker type is
+cluster-wide, so (a) makes the lend flip with leadership (the same drift
+entry 16 rejects for app settings). (b) leaves a follower with the system
+worker on unable to pre-register when the leader runs with it off.
+
+## 25. The node-namespace check rides inside `PermitSet`, which now carries the job's namespace
+
+**Call.** `PermitSet::new(permit, namespace)`; `is_permitted` checks the
+permit and then the node's `namespaces`. Every caller (the scan, the index
+walk, the group filter, preemption, the apply recheck, the wake match) gets
+the check without a second call site to forget. `permits_restrictions` is
+the permit alone, for the diagnostic.
+
+**Alternatives.** A separate `accepts_namespace` call next to every
+`is_permitted`, as the plan sketches ("beside `is_permitted`").
+
+**Trade-off.** "Permit" now means slightly more than the jobspec's `permit`
+block.
+
+**Why (correctness, then performance).** Eight places decide whether a task
+may use a node, and missing one (the apply recheck, say)
+would let a stale plan commit onto a refused node. One predicate cannot
+drift. The cost is one attribute lookup per node per task; the
+`candidate_construction` numbers are in the A1 change.
+
+## 26. "Privileged containers" means the container privilege floor's opt-outs
+
+**Call.** In a reserved namespace, submit refuses a container with
+`security.userNamespace = false` or `security.seccomp = "unconfined"`, the
+two opt-outs that make container root host root or remove the syscall
+filter. Host networking, capability adds, and the sandbox runtime's `dev`
+hypervisor are allowed.
+
+**Alternatives.** Refuse every host-level task (`exec` with any user,
+host-network containers, `dev` sandboxes, unknown plugin runtimes), the
+classification `job:write` with `host` uses.
+
+**Trade-off.** An app container on the host network can reach what the
+host guard allows; a `dev` sandbox is a container, not a VM.
+
+**Why (simplicity).** Apps are expected to be `exec` tasks
+(`legion:self`), which are host-level by definition, so "host-level" cannot
+be the line. The line the plan draws is root: these two settings are what
+make a container's root the host's.
+
+## 27. The lend's CPU becomes `cpu.max` over the host's own clock
+
+**Call.** `cpu.max` quota = lend MHz / the host's average MHz per core x the
+100ms period, so 1000 MHz is 40% of a CPU on a 2.5 GHz host. A host that
+reports no plausible clock counts 1000 MHz as one CPU.
+
+**Alternatives.** Read the plan's "1 CPU" literally: 1000 MHz is always one
+CPU's quota.
+
+**Trade-off.** The default lend is less than a whole CPU on most servers.
+
+**Why (consistency).** The scheduler counts the lend in MHz against tasks
+declared in MHz; a kernel ceiling in different units would let the apps it
+placed use more (or less) than it believes it gave them.
+
+## 28. `--run-worker` wins over `systemWorker.enabled = false`
+
+**Call.** The flag always starts its worker; the block is ignored for that
+run.
+
+**Alternatives.** Treat `enabled = false` as "no in-process worker at all",
+the flag included.
+
+**Trade-off.** A config that says "no worker" can be overridden by a flag.
+
+**Why (simplicity).** A command-line flag is the more specific, more recent
+statement of intent, the same precedence `--no-acl` has over `acl.enabled`.
