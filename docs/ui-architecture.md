@@ -245,6 +245,15 @@ the Access page reports it instead.
     ([Scaling Jobs](autoscaling.md)). The card is gated by `scale:write`.
     Keyed stateful tasks are read-only, with the reason in the tooltip. The
     whole card is hidden when `GetJobScaleStatus` is denied.
+  - has a **Request vs usage** card (`components/UsageInputsPanel.tsx`), the
+    `GetScalingInputs` reply `legion job info` prints. Per task, it shows
+    ready/placed replicas with the desired count, an unplaced badge and a
+    rollout badge, measured CPU and memory against the reservation with a
+    utilization meter, requests per second, error ratio, and mean latency
+    into the service the task backs, and the data state (`current` with its
+    age, `missing`, `resyncing`). It is cluster-wide whichever manager the UI
+    talks to, polled with the page, and hidden when `scale:read` is denied
+    ([Scaling inputs](autoscaling.md#scaling-inputs)).
   - marks stateful tasks with a "stateful · slot/keyed" badge (plus storage
     path). For jobs with stateful tasks or live `ListInstances` rows, it
     renders a polled Instances panel (`components/InstancesTable.tsx`: id,
