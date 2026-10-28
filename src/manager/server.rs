@@ -137,6 +137,7 @@ mod namespace_rpcs;
 mod node_content_rpcs;
 mod node_group_rpcs;
 mod plugin_rpcs;
+mod scaling_policy_rpcs;
 mod scaling_rpcs;
 mod session_rpcs;
 mod snapshot_rpcs;
@@ -144,6 +145,7 @@ mod suspend_rpcs;
 mod work_stream;
 pub use make_room::{make_room_sweep, MakeRoomOutcome, MakeRoomState, MAKE_ROOM_COOLDOWN};
 pub(crate) use snapshot_rpcs::snapshot_restore_payload;
+pub(crate) use scaling_rpcs::scaling_replica_counts;
 pub use snapshot_rpcs::{
     checkpoint_part_keys, expire_snapshots, PartKeyUse, CHECKPOINT_CAPABILITY,
 };
@@ -6057,6 +6059,7 @@ impl Manager for ManagerDaemonService {
                         })
                         .collect(),
                     digest: task.resolved.digest.clone(),
+                    policy_json: task.resolved.policy.canonical_json(),
                 })
                 .collect(),
         };
@@ -6527,6 +6530,30 @@ impl Manager for ManagerDaemonService {
         request: Request<crate::structs::PauseScalingRequest>,
     ) -> Result<Response<crate::structs::PauseScalingReply>, Status> {
         self.pause_scaling_rpc(request).await
+    }
+
+    // ACL: scale:write, coarse then on the policy (in the handler).
+    async fn apply_scaling_policy(
+        &self,
+        request: Request<crate::structs::ApplyScalingPolicyRequest>,
+    ) -> Result<Response<crate::structs::ApplyScalingPolicyReply>, Status> {
+        self.apply_scaling_policy_rpc(request).await
+    }
+
+    // ACL: scale:write, coarse then on the policy (in the handler).
+    async fn delete_scaling_policy(
+        &self,
+        request: Request<crate::structs::DeleteScalingPolicyRequest>,
+    ) -> Result<Response<crate::structs::DeleteScalingPolicyReply>, Status> {
+        self.delete_scaling_policy_rpc(request).await
+    }
+
+    // ACL: scale:read, filtered (in the handler).
+    async fn list_scaling_policies(
+        &self,
+        request: Request<crate::structs::ListScalingPoliciesRequest>,
+    ) -> Result<Response<crate::structs::ListScalingPoliciesReply>, Status> {
+        self.list_scaling_policies_rpc(request).await
     }
 
     async fn get_capacity_demand(

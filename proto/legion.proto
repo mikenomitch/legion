@@ -159,22 +159,29 @@ service Manager {
   // counts through ScaleTask (compare-and-set, with the decision attached),
   // and reports what it is doing through ReportScalingStatus. People read
   // that back with GetScalingStatus and GetScaleHistory, and freeze it with
-  // PauseScaling.
+  // PauseScaling. A target that is not a Legion task has a standalone
+  // policy (ApplyScalingPolicy, DeleteScalingPolicy, ListScalingPolicies),
+  // which the app runs through a target plugin installed in its app config
+  // (docs/autoscaling.md, "Standalone policies"; docs/autoscaling-plugins.md).
 
-  // Streams the effective scaling policy of every autoscaled task the caller
-  // may read (`scale:read`), resolved live against the layered defaults.
+  // Streams the effective scaling policy of every autoscaled task, and every
+  // standalone policy, the caller may read (`scale:read`), resolved live
+  // against the layered defaults and the plugins installed in the
+  // autoscaler's app config.
   //
   // The first message is the full set. A new full set follows whenever any
   // input changes: a job with `autoscale` is submitted, stopped, or
-  // destroyed; the cluster's scaling defaults change; a namespace policy's
-  // `autoscale` changes. Each message replaces the previous one; a consumer
+  // destroyed; a standalone policy is applied or deleted, or its pause
+  // changes; the cluster's scaling defaults change; a namespace policy's
+  // `autoscale` changes; the autoscaler's plugins change. Each message replaces the previous one; a consumer
   // never merges. The manager checks for changes about once a second and
   // sends nothing while nothing changed, so an idle stream costs one small
   // read per second on the answering manager. Any manager answers: policies
   // are computed from replicated state.
   //
   // A policy that no longer resolves (a defaults change applied with
-  // `force`, or two namespace policies that disagree) is still sent, with
+  // `force`, two namespace policies that disagree, or a plugin it names
+  // that was removed or closed to its namespace) is still sent, with
   // `state = "invalid"` and the reason in `error`: the autoscaler holds it
   // and reports it, rather than dropping it silently.
   //
@@ -254,16 +261,70 @@ service Manager {
   // ACL: `scale:read` on the job.
   rpc GetScaleHistory (GetScaleHistoryRequest) returns (GetScaleHistoryReply);
 
-  // Pauses autoscaling for one task, every autoscaled task of one job, or
-  // the whole cluster (`all`), optionally for a duration; or resumes it
-  // (`resume`). A pause is replicated state, enforced in two places: the
+  // Pauses autoscaling for one task, every autoscaled task of one job, one
+  // standalone policy (`policy`), or the whole cluster (`all`), optionally
+  // for a duration; or resumes it (`resume`). A pause is replicated state, enforced in two places: the
   // autoscaler skips paused targets, and ScaleTask refuses autoscaler
   // writes to them, so a pause holds even against a misbehaving app. People
   // can still scale a paused task by hand.
   //
-  // ACL: `scale:write` on the job; `operator:write` for `all`. Retry-safe
-  // with `idempotency_key`.
+  // ACL: `scale:write` on the job (or the standalone policy, gated with a
+  // coarse check before its lookup); `operator:write` for `all`.
+  // Retry-safe with `idempotency_key`.
   rpc PauseScaling (PauseScalingRequest) returns (PauseScalingReply);
+
+  // Creates or replaces a standalone scaling policy (`legion scaling
+  // apply`; docs/autoscaling.md, "Standalone policies"): a policy for a
+  // target that is not a Legion task, stored as its own versioned object on
+  // the Control lane. `spec_json` is the policy as written (the CLI
+  // evaluates a Nickel file to it): `name`, `namespace`, `description`,
+  // `target = { plugin, config }`, and the jobspec `autoscale` record's
+  // fields, with `min`, `max` and `checks` required.
+  //
+  // The policy is resolved exactly as the autoscaler will run it (the
+  // layered defaults, then its own fields) and every plugin it names (its
+  // target, each check's source, each plugin strategy) must be installed in
+  // the autoscaler's app config and open to the policy's namespace; a
+  // policy that fails either is refused with INVALID_ARGUMENT naming the
+  // field or the plugin. What only the plugin knows (that it implements
+  // the kind, and its `policyConfigSchema`) is checked by the autoscaler
+  // when it next evaluates the policy, which reports `invalid` with the
+  // reason (`legion scaling apply --wait` waits for that report).
+  //
+  // A node-group policy (`target = { nodes = … }`) is parsed and validated,
+  // and refused with FAILED_PRECONDITION: node groups are not run in this
+  // version.
+  //
+  // `dry_run` validates and returns the diff against the stored version
+  // without writing. Applying an unchanged policy writes nothing and keeps
+  // its version.
+  //
+  // ACL: `scale:write` on the policy's namespace and name (the scope a job
+  // of that name would have), gated with a coarse `scale:write` before the
+  // body is parsed. A node-group policy needs `operator:write` and
+  // `node:write`. Retry-safe with `idempotency_key`.
+  rpc ApplyScalingPolicy (ApplyScalingPolicyRequest) returns (ApplyScalingPolicyReply);
+
+  // Deletes a standalone scaling policy. The autoscaler stops evaluating it
+  // on its next policy update; its history stays until the history cap
+  // (or the policy's name is reused) ages it out. Deleting a policy that
+  // does not exist is NOT_FOUND.
+  //
+  // ACL: a coarse `scale:write` before the lookup, then `scale:write` on the
+  // policy (`operator:write` and `node:write` for a node group), so a
+  // caller cannot tell an existing policy from a missing one. Retry-safe
+  // with `idempotency_key`: a replayed delete reports `deduplicated`.
+  rpc DeleteScalingPolicy (DeleteScalingPolicyRequest) returns (DeleteScalingPolicyReply);
+
+  // Lists scaling policies in the namespaces asked for (`legion scaling
+  // list`): every autoscaled task (kind `task`, or `group` for a multi-task
+  // group) and every standalone policy (kind `external`), with its mode,
+  // bounds, and whether it resolves. Any manager answers: policies are
+  // computed from replicated state.
+  //
+  // ACL: `scale:read`, gated with `AclScope::any()`; entries outside the
+  // caller's grant are left out.
+  rpc ListScalingPolicies (ListScalingPoliciesRequest) returns (ListScalingPoliciesReply);
 
   // How many nodes of each node-group template the pending work needs
   // (docs/autoscaling.md, "Capacity demand"; the `nodegroup.pending` input
@@ -3924,6 +3985,11 @@ message AutoscalePlan {
 
   // The effective policy's digest.
   string digest = 5;
+
+  // The effective policy as canonical JSON (every default filled, every
+  // `"Nx"` resolved): what the autoscaler would run, and what
+  // `legion scaling simulate` replays.
+  string policy_json = 6;
 }
 
 // How one gang task fared in one plan (docs/gang-scheduling.md). The same
@@ -4341,7 +4407,8 @@ message ScalePin {
 
 // A pause covering a target (`legion scaling pause`).
 message ScalingPauseInfo {
-  // What the pause covers: `all` (cluster-wide), `job`, or `task`.
+  // What the pause covers: `all` (cluster-wide), `job`, `task`, or
+  // `policy` (one standalone policy).
   string scope = 1;
 
   // When the pause ends, unix milliseconds; unset holds until
@@ -4726,7 +4793,8 @@ message ScalingInputs {
   // Up to `history_seconds` of 10-second totals, oldest first. Empty unless
   // the request asked for history. The answering manager keeps one hour in
   // memory for at most 4096 tasks; a manager that recently took the status
-  // lane holds only what it has seen since.
+  // lane holds only what it has seen since. An autoscaled task's points also
+  // carry its counts, and it has points while scaled to zero.
   repeated ScalingInputsPoint history = 16;
 
   // The task's override row version, for a compare-and-set ScaleTask
@@ -4904,6 +4972,17 @@ message ScalingInputsPoint {
 
   // `ScalingRequestInputs.latency_ms_mean`.
   double latency_ms_mean = 9;
+
+  // The task's effective count at the point (`ScalingInputs.desired_replicas`).
+  // Recorded for autoscaled tasks only; unset for others.
+  optional uint32 desired_replicas = 10;
+
+  // Its healthy replicas at the point (`ScalingInputs.ready_replicas`):
+  // warming ones included. Autoscaled tasks only.
+  optional uint32 ready_replicas = 11;
+
+  // Its unplaced replicas at the point. Autoscaled tasks only.
+  optional uint32 unplaced_replicas = 12;
 }
 
 // Request payload for WatchScalingPolicies.
@@ -4931,6 +5010,10 @@ message ScalingPolicySet {
   // The version of the cluster's scaling defaults the set was resolved
   // against (0: none set).
   uint64 defaults_version = 4;
+
+  // Every standalone policy in scope (`legion scaling apply`), sorted by
+  // namespace and name.
+  repeated StandaloneScalingPolicy standalone = 5;
 }
 
 // One autoscaled task's effective policy.
@@ -5158,6 +5241,10 @@ message ScalingTargetReport {
 
   // State changes worth an event, at most one of each kind per episode.
   repeated ScalingEventFlag events = 11;
+
+  // A standalone policy's canonical id, when the report is for one; the
+  // job, group and task fields are then empty.
+  string policy = 12;
 }
 
 // A state change the autoscaler reports for the manager to record as an
@@ -5191,18 +5278,29 @@ message RecordScalingActionRequest {
   // Task name.
   string task_name = 3;
 
-  // The action: `would` (a dry-run policy's decision). Other kinds are
-  // refused.
+  // The action:
+  // - `would`: a dry-run policy's decision (`applied = false`);
+  // - `scale`: a standalone policy's change, recorded before the app calls
+  //   the target plugin. Refused with FAILED_PRECONDITION while a pause
+  //   covers the policy, so a pause holds even against a misbehaving app.
+  //   Written as a `scaled` row and a `scale.applied` event;
+  // - `failed`: the target plugin refused or failed the `scale` just
+  //   recorded (`applied = false`, the error in the decision's summary).
+  // `scale` and `failed` need `policy`; task targets change their count
+  // through ScaleTask. Other kinds are refused.
   string kind = 4;
 
   // The count when decided.
   uint32 from = 5;
 
-  // The count the policy would have written.
+  // The count the policy would have written, or wrote.
   uint32 to = 6;
 
   // The decision.
   ScaleDecision decision = 7;
+
+  // A standalone policy's canonical id, instead of a job, group and task.
+  string policy = 8;
 }
 
 // Reply payload for RecordScalingAction.
@@ -5229,6 +5327,11 @@ message GetScalingStatusRequest {
   // Include each target's full last decision and its effective policy with
   // provenance (`legion scaling explain`).
   bool detail = 5;
+
+  // One standalone policy, by canonical id (`namespace/name`, or `name` in
+  // `default`), instead of `job`. Without `job` or `policy`, standalone
+  // policies in `namespaces` are listed after the tasks.
+  string policy = 6;
 }
 
 // Reply payload for GetScalingStatus.
@@ -5345,6 +5448,15 @@ message ScalingTargetStatus {
 
   // The policy in one line (`2..8, cpu 70%, enforce`).
   string policy_summary = 22;
+
+  // A standalone policy's canonical id; the job, group and task fields are
+  // then empty, and `now` is the count its target last reported. (`policy`
+  // is the effective policy's provenance, above.)
+  string policy_id = 23;
+
+  // `task`, `group` (a task's whole group moves together), or `external`
+  // (a standalone policy's target plugin).
+  string kind = 24;
 }
 
 // Request payload for GetScaleHistory.
@@ -5364,6 +5476,9 @@ message GetScaleHistoryRequest {
   // Include each row's full decision and the effective policy its digest
   // resolves to.
   bool detail = 5;
+
+  // A standalone policy's canonical id, instead of `job`.
+  string policy = 6;
 }
 
 // Reply payload for GetScaleHistory.
@@ -5409,7 +5524,8 @@ message ScaleHistoryEntry {
   bool applied = 11;
 
   // `scaled`, `deferred` (a scale-in waiting for a rollout), `would` (a
-  // dry-run decision), `pinned`, `released`, or `reset`.
+  // dry-run decision), `pinned`, `released`, `reset`, or `failed` (a
+  // standalone policy's target refused the change recorded just before).
   string kind = 12;
 
   // The digest of the effective policy that decided; empty for people.
@@ -5423,6 +5539,10 @@ message ScaleHistoryEntry {
 
   // The decision's id, if any.
   string decision_id = 16;
+
+  // A standalone policy's canonical id, when the row is one's; the job,
+  // group and task fields are then empty.
+  string policy = 17;
 }
 
 // Request payload for PauseScaling.
@@ -5450,6 +5570,10 @@ message PauseScalingRequest {
 
   // Optional idempotency key. See `RunJobRequest.idempotency_key`.
   optional string idempotency_key = 8;
+
+  // A standalone policy's canonical id, instead of `job`. Needs
+  // `scale:write` on the policy.
+  string policy = 9;
 }
 
 // Reply payload for PauseScaling.
@@ -5465,6 +5589,209 @@ message PauseScalingReply {
   // When the pause ends, unix milliseconds; unset for "until resumed" and
   // for a resume.
   optional int64 until_unix_ms = 3;
+}
+
+// Request payload for ApplyScalingPolicy.
+message ApplyScalingPolicyRequest {
+  // The policy as JSON (the CLI evaluates a Nickel file to it). See the
+  // RPC's comment and docs/autoscaling.md, "Standalone policies".
+  string spec_json = 1;
+
+  // The namespace the policy belongs to when `spec_json` names none: the
+  // CLI's `-n`, else `default`. A `namespace` in the spec wins.
+  string namespace = 2;
+
+  // Validate, resolve, and diff against the stored version; write nothing.
+  bool dry_run = 3;
+
+  // Optional idempotency key. See `RunJobRequest.idempotency_key`.
+  optional string idempotency_key = 4;
+}
+
+// Reply payload for ApplyScalingPolicy.
+message ApplyScalingPolicyReply {
+  // The policy's canonical id: `name` in `default`, `namespace/name`
+  // elsewhere.
+  string id = 1;
+
+  // `external` (a target plugin) or `nodes` (a node group).
+  string kind = 2;
+
+  // The version now stored: unchanged when the policy was (or, with
+  // `dry_run`, would be). Versions come from a Control-lane counter and
+  // never repeat, across deletes too.
+  uint64 version = 3;
+
+  // The policy did not exist before.
+  bool created = 4;
+
+  // The stored policy changed (or would, with `dry_run`).
+  bool changed = 5;
+
+  // Field-by-field differences against the stored version, `field: old ->
+  // new`, in the effective policy's terms (so a change to an inherited
+  // default shows too). Empty when created or unchanged.
+  repeated string diff = 6;
+
+  // For people: `scaling policy media/render-farm: created (v3)`.
+  string message = 7;
+
+  // A replay of an earlier request with the same idempotency key: nothing
+  // was written and only `message` is set.
+  bool deduplicated = 8;
+
+  // The effective policy the autoscaler will run, as canonical JSON (the
+  // same shape `ScalingPolicy.policy_json` carries).
+  string policy_json = 9;
+
+  // Its digest.
+  string digest = 10;
+
+  // Every field of the effective policy with the level it came from
+  // (built-in, cluster defaults, a namespace policy, or `policy` for the
+  // file itself, shown as `jobspec`).
+  repeated ScalingProvenanceRow provenance = 11;
+
+  // The request was a dry run.
+  bool dry_run = 12;
+}
+
+// Request payload for DeleteScalingPolicy.
+message DeleteScalingPolicyRequest {
+  // The policy's name, or its canonical id (`namespace/name`).
+  string name = 1;
+
+  // The namespace, when `name` is bare: the CLI's `-n`, else `default`.
+  string namespace = 2;
+
+  // Optional idempotency key. See `RunJobRequest.idempotency_key`.
+  optional string idempotency_key = 3;
+}
+
+// Reply payload for DeleteScalingPolicy.
+message DeleteScalingPolicyReply {
+  // For people: `scaling policy media/render-farm: deleted (was v3)`.
+  string message = 1;
+
+  // A replay of an earlier request with the same idempotency key.
+  bool deduplicated = 2;
+
+  // The deleted policy's canonical id.
+  string id = 3;
+}
+
+// Request payload for ListScalingPolicies.
+message ListScalingPoliciesRequest {
+  // Namespaces to list, as names or `*`-globs (`["*"]` for every namespace
+  // the caller can read). Empty means `default`.
+  repeated string namespaces = 1;
+
+  // Also return each standalone policy's spec as written (`spec_json`).
+  bool detail = 2;
+}
+
+// Reply payload for ListScalingPolicies.
+message ListScalingPoliciesReply {
+  // Task targets first (by job, group, task), then standalone policies (by
+  // namespace and name).
+  repeated ScalingPolicySummary policies = 1;
+}
+
+// One scaling policy in a listing.
+message ScalingPolicySummary {
+  // The target's label: `job/group/task` for a task, the canonical policy
+  // id (`namespace/name`, or `name` in `default`) for a standalone policy.
+  string id = 1;
+
+  // `task`, `group` (a task's whole group moves together), or `external`.
+  string kind = 2;
+
+  // The namespace.
+  string namespace = 3;
+
+  // The effective mode: `enforce` or `dry-run`. Empty when invalid.
+  string mode = 4;
+
+  // The effective floor. 0 when invalid.
+  uint32 min = 5;
+
+  // The effective ceiling. 0 when invalid.
+  uint32 max = 6;
+
+  // `ok`, or `invalid` when the policy does not resolve against the current
+  // defaults and installed plugins (see `error`).
+  string state = 7;
+
+  // Why the policy is invalid.
+  string error = 8;
+
+  // What it scales: `web/default/web` for a task, `plugin render-exec` for
+  // an external target.
+  string target = 9;
+
+  // A standalone policy's version; 0 for a task (its job has versions).
+  uint64 version = 10;
+
+  // The policy in one line: `0..50, queue (per-replica 10), enforce`.
+  string summary = 11;
+
+  // A standalone policy's description.
+  string description = 12;
+
+  // Who last applied a standalone policy, and when (unix ms).
+  string updated_by = 13;
+  int64 updated_at_unix_ms = 14;
+
+  // With `detail`: a standalone policy as written.
+  string spec_json = 15;
+}
+
+// A standalone scaling policy, as WatchScalingPolicies delivers it to the
+// autoscaler.
+message StandaloneScalingPolicy {
+  // The canonical id (`namespace/name`, or `name` in `default`).
+  string id = 1;
+
+  // Its namespace.
+  string namespace = 2;
+
+  // Its name.
+  string name = 3;
+
+  // `external`.
+  string kind = 4;
+
+  // The stored version.
+  uint64 version = 5;
+
+  // `ok`, or `invalid` (see `error`): the policy no longer resolves against
+  // the defaults, or a plugin it names was removed from the autoscaler's
+  // app config or no longer allows its namespace. An invalid policy is
+  // held and reported, never acted on.
+  string state = 6;
+
+  // Why it is invalid.
+  string error = 7;
+
+  // The effective policy's digest.
+  string digest = 8;
+
+  // The effective policy as canonical JSON (the shape of
+  // `ScalingPolicy.policy_json`). Empty when invalid.
+  string policy_json = 9;
+
+  // The target plugin.
+  string target_plugin = 10;
+
+  // The target plugin's per-policy config, as JSON (`{}` when unset).
+  string target_config_json = 11;
+
+  // The pause that covers this policy (its own, or the cluster-wide one),
+  // if any.
+  ScalingPauseInfo pause = 12;
+
+  // The policy in one line.
+  string summary = 13;
 }
 
 // Request payload for DestroyJob.

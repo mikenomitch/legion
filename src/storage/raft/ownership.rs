@@ -225,6 +225,7 @@ const TABLE_OWNERS: &[(&str, Owner)] = &[
     ("scale_history", Owner::Lane(Lane::Control)),
     ("scaling_pause", Owner::Lane(Lane::Control)),
     ("scaling_policy_snapshot", Owner::Lane(Lane::Control)),
+    ("scaling_policy", Owner::Lane(Lane::Control)),
     // ── scheduler lane: placement + rollout progression ──────────────────
     ("allocation", Owner::Lane(Lane::Scheduler)),
     ("allocation_epoch", Owner::Lane(Lane::Scheduler)),

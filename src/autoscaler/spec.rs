@@ -902,8 +902,14 @@ mod tests {
             (json!({ "checks": [] }), Some("autoscale.checks is empty")),
             (
                 json!({ "checks": [{ "name": "a", "source": "legion", "query": "q",
-                                     "strategy": { "name": "nope" } }] }),
-                Some("unknown strategy 'nope'"),
+                                     "strategy": { "name": "No Pe" } }] }),
+                Some("unknown strategy 'No Pe'"),
+            ),
+            (
+                // A strategy plugin may read nothing: no query needed.
+                json!({ "checks": [{ "name": "a", "source": "legion",
+                                     "strategy": { "name": "calendar", "replicas": 6 } }] }),
+                None,
             ),
             (
                 json!({ "checks": [{ "name": "a", "source": "legion", "query": "",

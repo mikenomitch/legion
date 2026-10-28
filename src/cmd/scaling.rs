@@ -11,7 +11,16 @@
 //! - `defaults get` / `defaults apply`: the cluster's scaling defaults, and
 //!   the effective defaults for a namespace with provenance;
 //! - `demand`: how many nodes of each node-group template the pending work
-//!   needs ([`crate::cmd::scaling_demand`]).
+//!   needs ([`crate::cmd::scaling_demand`]);
+//! - `apply` / `list` / `delete`: standalone policies, for targets that are
+//!   not Legion tasks ([`crate::cmd::scaling_policy`]);
+//! - `simulate`: a policy over the last hour of history or a CSV series
+//!   ([`crate::cmd::scaling_simulate`]);
+//! - `plugin test`: the scaling-plugin conformance suite
+//!   ([`crate::cmd::scaling_plugin`]).
+//!
+//! `explain`, `history`, `pause` and `resume` take `--standalone` to name a
+//! standalone policy instead of a job.
 //!
 //! Every subcommand takes `--json`/`-j` and emits the standard
 //! [`crate::cmd::output`] envelope.
@@ -62,6 +71,29 @@ fn ago(at_ms: i64) -> String {
     }
 }
 
+fn standalone_arg() -> Arg {
+    Arg::new("standalone")
+        .long("standalone")
+        .action(ArgAction::SetTrue)
+        .conflicts_with_all(["group", "task"])
+        .help("NAME is a standalone policy (legion scaling apply), not a job")
+}
+
+/// The standalone policy the command names, when `--standalone` is set.
+fn standalone_policy(matches: &ArgMatches) -> R<Option<String>> {
+    if matches
+        .try_get_one::<bool>("standalone")
+        .ok()
+        .flatten()
+        .copied()
+        .unwrap_or(false)
+    {
+        Ok(Some(required_job_arg(matches, "job")?))
+    } else {
+        Ok(None)
+    }
+}
+
 fn target_arg() -> [Arg; 2] {
     [
         Arg::new("group")
@@ -80,13 +112,18 @@ pub fn config() -> Command {
         Arg::new("job")
             .value_name("JOB")
             .required(required)
-            .help("Job name (`name` or `namespace/name`)")
+            .help("Job name (`name` or `namespace/name`); with --standalone, a standalone policy's")
     };
     Command::new("scaling")
-        .about("Autoscaling: status, explanations, history, pauses, defaults, and node-group capacity demand (docs/autoscaling.md)")
+        .about("Autoscaling: status, explanations, history, pauses, defaults, standalone policies, simulation, plugins, and node-group capacity demand (docs/autoscaling.md)")
         .subcommand_required(true)
         .arg_required_else_help(true)
         .subcommand(crate::cmd::scaling_demand::demand_command())
+        .subcommand(crate::cmd::scaling_policy::apply_command())
+        .subcommand(crate::cmd::scaling_policy::list_command())
+        .subcommand(crate::cmd::scaling_policy::delete_command())
+        .subcommand(crate::cmd::scaling_simulate::simulate_command())
+        .subcommand(crate::cmd::scaling_plugin::plugin_command())
         .subcommand(
             Command::new("status")
                 .about("Every autoscaled task's count, wanted count, bounds, and state, and whether the autoscaler runs")
@@ -99,6 +136,8 @@ pub fn config() -> Command {
                 .about("Why an autoscaled task is at its count: the last evaluation, stage by stage")
                 .arg(job_arg(true))
                 .args(target_arg())
+                .arg(standalone_arg())
+                .arg(namespace_flag())
                 .arg(
                     Arg::new("policy")
                         .long("policy")
@@ -112,6 +151,8 @@ pub fn config() -> Command {
                 .about("The durable record of a job's count changes, newest first")
                 .arg(job_arg(true))
                 .args(target_arg())
+                .arg(standalone_arg())
+                .arg(namespace_flag())
                 .arg(
                     Arg::new("limit")
                         .long("limit")
@@ -126,12 +167,14 @@ pub fn config() -> Command {
                 .about("Pause autoscaling for a task, a job, or the cluster (--all)")
                 .arg(job_arg(false).required_unless_present("all"))
                 .args(target_arg())
+                .arg(standalone_arg())
+                .arg(namespace_flag())
                 .arg(
                     Arg::new("all")
                         .long("all")
                         .action(ArgAction::SetTrue)
-                        .conflicts_with_all(["job", "group", "task"])
-                        .help("Pause every autoscaled task in the cluster (needs operator:write)"),
+                        .conflicts_with_all(["job", "group", "task", "standalone"])
+                        .help("Pause every autoscaled task and standalone policy in the cluster (needs operator:write)"),
                 )
                 .arg(
                     Arg::new("for")
@@ -153,11 +196,13 @@ pub fn config() -> Command {
                 .about("Resume autoscaling paused at the same scope")
                 .arg(job_arg(false).required_unless_present("all"))
                 .args(target_arg())
+                .arg(standalone_arg())
+                .arg(namespace_flag())
                 .arg(
                     Arg::new("all")
                         .long("all")
                         .action(ArgAction::SetTrue)
-                        .conflicts_with_all(["job", "group", "task"])
+                        .conflicts_with_all(["job", "group", "task", "standalone"])
                         .help("Lift the cluster-wide pause"),
                 )
                 .arg(idempotency_arg())
@@ -215,6 +260,11 @@ pub async fn handle(matches: &ArgMatches) -> R<()> {
             _ => unreachable!("subcommand required"),
         },
         Some(("demand", sub)) => crate::cmd::scaling_demand::handle_demand(sub).await,
+        Some(("apply", sub)) => crate::cmd::scaling_policy::apply(sub).await,
+        Some(("list", sub)) => crate::cmd::scaling_policy::list(sub).await,
+        Some(("delete", sub)) => crate::cmd::scaling_policy::delete(sub).await,
+        Some(("simulate", sub)) => crate::cmd::scaling_simulate::handle_simulate(sub).await,
+        Some(("plugin", sub)) => crate::cmd::scaling_plugin::handle_plugin(sub).await,
         _ => unreachable!("subcommand required"),
     }
 }
@@ -224,6 +274,9 @@ fn opt(matches: &ArgMatches, key: &str) -> Option<String> {
 }
 
 fn label(target: &ScalingTargetStatus) -> String {
+    if !target.policy_id.is_empty() {
+        return target.policy_id.clone();
+    }
     format!(
         "{}/{}/{}",
         target.job_id, target.task_group, target.task_name
@@ -334,7 +387,9 @@ async fn status(matches: &ArgMatches) -> R<()> {
         .iter()
         .map(|target| StatusRow {
             target: label(target),
-            kind: if target.members.len() > 1 {
+            kind: if !target.kind.is_empty() {
+                target.kind.clone()
+            } else if target.members.len() > 1 {
                 "group".to_string()
             } else {
                 "task".to_string()
@@ -352,7 +407,7 @@ async fn status(matches: &ArgMatches) -> R<()> {
         })
         .collect();
     if rows.is_empty() {
-        println!("no autoscaled tasks");
+        println!("no autoscaled tasks or standalone policies");
     } else {
         print_table(rows);
     }
@@ -433,18 +488,26 @@ fn stage_rows(decision: &Decision, decision_id: &str) -> Vec<StageRow> {
 
 async fn explain(matches: &ArgMatches) -> R<()> {
     let format = OutputFormat::from_matches(matches);
+    let standalone = standalone_policy(matches)?;
     let job = required_job_arg(matches, "job")?;
     let mut client = connect_manager_client().await?;
     let reply = output::resolve(
         format,
         "failed to read scaling status",
         client
-            .get_scaling_status(GetScalingStatusRequest {
-                job: job.clone(),
-                task_group: opt(matches, "group"),
-                task_name: opt(matches, "task"),
-                detail: true,
-                ..Default::default()
+            .get_scaling_status(match &standalone {
+                Some(policy) => GetScalingStatusRequest {
+                    policy: policy.clone(),
+                    detail: true,
+                    ..Default::default()
+                },
+                None => GetScalingStatusRequest {
+                    job: job.clone(),
+                    task_group: opt(matches, "group"),
+                    task_name: opt(matches, "task"),
+                    detail: true,
+                    ..Default::default()
+                },
             })
             .await,
     )?
@@ -499,7 +562,9 @@ async fn explain(matches: &ArgMatches) -> R<()> {
         println!(
             "{}   {}   {}   now {}   bounds {}..{}   evaluated {}",
             label(target),
-            if target.members.len() > 1 {
+            if !target.policy_id.is_empty() {
+                "standalone policy".to_string()
+            } else if target.members.len() > 1 {
                 format!("group ({})", target.members.join(", "))
             } else {
                 "task".to_string()
@@ -644,6 +709,7 @@ fn history_change(entry: &ScaleHistoryEntry) -> String {
 
 async fn history(matches: &ArgMatches) -> R<()> {
     let format = OutputFormat::from_matches(matches);
+    let standalone = standalone_policy(matches)?;
     let job = required_job_arg(matches, "job")?;
     let mut client = connect_manager_client().await?;
     let reply = output::resolve(
@@ -651,11 +717,12 @@ async fn history(matches: &ArgMatches) -> R<()> {
         "failed to read scale history",
         client
             .get_scale_history(GetScaleHistoryRequest {
-                job,
+                job: if standalone.is_some() { String::new() } else { job },
                 task_group: opt(matches, "group"),
                 task_name: opt(matches, "task"),
                 limit: matches.get_one::<u32>("limit").copied().unwrap_or(0),
                 detail: format.is_json(),
+                policy: standalone.unwrap_or_default(),
             })
             .await,
     )?
@@ -696,7 +763,11 @@ async fn history(matches: &ArgMatches) -> R<()> {
                 time: chrono::DateTime::<chrono::Utc>::from_timestamp_millis(entry.at_unix_ms)
                     .map(|at| at.format("%m-%d %H:%M:%S").to_string())
                     .unwrap_or_default(),
-                task: format!("{}/{}", entry.task_group, entry.task_name),
+                task: if entry.policy.is_empty() {
+                    format!("{}/{}", entry.task_group, entry.task_name)
+                } else {
+                    entry.policy.clone()
+                },
                 change: history_change(entry),
                 by: if entry.source == "operator" && !entry.principal.is_empty() {
                     entry.principal.clone()
@@ -713,7 +784,12 @@ async fn history(matches: &ArgMatches) -> R<()> {
 async fn pause(matches: &ArgMatches, resume: bool) -> R<()> {
     let format = OutputFormat::from_matches(matches);
     let all = matches.get_flag("all");
-    let job = if all {
+    let standalone = if all {
+        None
+    } else {
+        standalone_policy(matches)?
+    };
+    let job = if all || standalone.is_some() {
         String::new()
     } else {
         required_job_arg(matches, "job")?
@@ -754,6 +830,7 @@ async fn pause(matches: &ArgMatches, resume: bool) -> R<()> {
                 reason: opt(matches, "reason").unwrap_or_default(),
                 resume,
                 idempotency_key: opt(matches, "idempotency-key"),
+                policy: standalone.unwrap_or_default(),
             })
             .await,
     )?

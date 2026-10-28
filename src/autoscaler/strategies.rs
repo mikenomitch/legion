@@ -9,6 +9,13 @@
 //! | `pass-through` | | `ceil(reading)`: the reading *is* the count |
 //! | `fixed` | `value` | `value`, whatever the reading |
 //!
+//! Any other name is a **strategy plugin** installed in the autoscaler's app
+//! config ([`super::plugins`]): `{ name = "calendar", replicas = 6 }` is
+//! [`StrategyConfig::Plugin`], whose settings are the plugin's to check. It
+//! does I/O, so the pipeline does not call it: the autoscaler asks the
+//! plugin first and passes its answer in the
+//! [`Observation`](super::pipeline::Observation).
+//!
 //! A strategy sees one check; merging checks, stabilization, step limits
 //! and bounds all happen later in the [pipeline](super::pipeline).
 //!
@@ -22,6 +29,7 @@
 //! move rather than cause one, and if counting them reverses the direction
 //! or lands inside the tolerance band, the strategy holds.
 
+use std::collections::BTreeMap;
 use std::fmt;
 
 use serde::{Deserialize, Serialize};
@@ -83,11 +91,10 @@ pub trait Strategy {
     fn recommend(&self, input: &StrategyInput) -> Recommendation;
 }
 
-/// A built-in strategy with its settings, as the effective policy carries
-/// it. Serializes as the record it was written as:
+/// A strategy with its settings, as the effective policy carries it.
+/// Serializes as the record it was written as:
 /// `{ "name": "per-replica", "value": 500 }`.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "name", rename_all = "kebab-case")]
+#[derive(Debug, Clone, PartialEq)]
 pub enum StrategyConfig {
     /// See [`TargetValue`].
     TargetValue(TargetValue),
@@ -99,18 +106,97 @@ pub enum StrategyConfig {
     PassThrough(PassThrough),
     /// See [`Fixed`].
     Fixed(Fixed),
+    /// A strategy plugin, by the name it is installed under.
+    Plugin(PluginStrategy),
+}
+
+/// The built-ins' wire form: tagged by `name`.
+#[derive(Serialize, Deserialize)]
+#[serde(tag = "name", rename_all = "kebab-case")]
+enum BuiltinRepr {
+    TargetValue(TargetValue),
+    PerReplica(PerReplica),
+    Threshold(Threshold),
+    PassThrough(PassThrough),
+    Fixed(Fixed),
+}
+
+impl Serialize for StrategyConfig {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let repr = match self {
+            StrategyConfig::TargetValue(s) => BuiltinRepr::TargetValue(s.clone()),
+            StrategyConfig::PerReplica(s) => BuiltinRepr::PerReplica(s.clone()),
+            StrategyConfig::Threshold(s) => BuiltinRepr::Threshold(s.clone()),
+            StrategyConfig::PassThrough(s) => BuiltinRepr::PassThrough(s.clone()),
+            StrategyConfig::Fixed(s) => BuiltinRepr::Fixed(s.clone()),
+            StrategyConfig::Plugin(plugin) => {
+                use serde::ser::SerializeMap;
+                let mut map = serializer.serialize_map(Some(plugin.config.len() + 1))?;
+                map.serialize_entry("name", &plugin.name)?;
+                for (key, value) in &plugin.config {
+                    map.serialize_entry(key, value)?;
+                }
+                return map.end();
+            }
+        };
+        repr.serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for StrategyConfig {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        use serde::de::Error;
+        let value = Value::deserialize(deserializer)?;
+        let name = value
+            .get("name")
+            .and_then(Value::as_str)
+            .ok_or_else(|| D::Error::custom("a strategy needs a name"))?
+            .to_string();
+        if BUILT_IN_STRATEGIES.contains(&name.as_str()) {
+            let repr: BuiltinRepr = serde_json::from_value(value).map_err(D::Error::custom)?;
+            return Ok(match repr {
+                BuiltinRepr::TargetValue(s) => StrategyConfig::TargetValue(s),
+                BuiltinRepr::PerReplica(s) => StrategyConfig::PerReplica(s),
+                BuiltinRepr::Threshold(s) => StrategyConfig::Threshold(s),
+                BuiltinRepr::PassThrough(s) => StrategyConfig::PassThrough(s),
+                BuiltinRepr::Fixed(s) => StrategyConfig::Fixed(s),
+            });
+        }
+        let mut config = BTreeMap::new();
+        if let Value::Object(object) = value {
+            for (key, value) in object {
+                if key != "name" {
+                    config.insert(key, value);
+                }
+            }
+        }
+        Ok(StrategyConfig::Plugin(PluginStrategy { name, config }))
+    }
 }
 
 impl StrategyConfig {
     /// Parse a written strategy record into a typed built-in, with errors
     /// that name the strategy and the setting.
+    ///
+    /// A name that is not built in is a strategy plugin's: it must be a
+    /// valid plugin name, and whether one is installed (and open to the
+    /// policy's namespace) is checked where the plugins are known, at
+    /// submit and apply.
     pub fn from_spec(spec: &StrategySpec) -> Result<StrategyConfig, String> {
         let name = spec.name.trim();
         if !BUILT_IN_STRATEGIES.contains(&name) {
-            return Err(format!(
-                "unknown strategy '{name}'. Hint: the built-in strategies are {}",
-                BUILT_IN_STRATEGIES.join(", ")
-            ));
+            if !super::plugins::valid_name(name) {
+                return Err(format!(
+                    "unknown strategy '{name}'. Hint: the built-in strategies are {}; any other \
+                     name is a strategy plugin installed in the autoscaler's app config, \
+                     written in lowercase letters, digits and `-`",
+                    BUILT_IN_STRATEGIES.join(", ")
+                ));
+            }
+            return Ok(StrategyConfig::Plugin(PluginStrategy {
+                name: name.to_string(),
+                config: spec.config.clone(),
+            }));
         }
         let mut object = serde_json::Map::new();
         for (key, value) in &spec.config {
@@ -155,6 +241,15 @@ impl StrategyConfig {
             StrategyConfig::Threshold(s) => s,
             StrategyConfig::PassThrough(s) => s,
             StrategyConfig::Fixed(s) => s,
+            StrategyConfig::Plugin(s) => s,
+        }
+    }
+
+    /// The plugin, when this is a strategy plugin.
+    pub fn plugin(&self) -> Option<&PluginStrategy> {
+        match self {
+            StrategyConfig::Plugin(plugin) => Some(plugin),
+            _ => None,
         }
     }
 
@@ -181,6 +276,7 @@ impl fmt::Display for StrategyConfig {
             StrategyConfig::Threshold(s) => write!(f, "threshold ({} steps)", s.steps.len()),
             StrategyConfig::PassThrough(_) => f.write_str("pass-through"),
             StrategyConfig::Fixed(s) => write!(f, "fixed {}", s.value),
+            StrategyConfig::Plugin(s) => write!(f, "plugin {}", s.name),
         }
     }
 }
@@ -229,6 +325,28 @@ pub struct ThresholdStep {
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PassThrough {}
+
+/// A strategy plugin: its installed name and the settings the policy wrote
+/// beside it. The plugin checks them against its `policyConfigSchema`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PluginStrategy {
+    /// The name the plugin is installed under.
+    pub name: String,
+    /// Every field of the strategy record but `name`.
+    pub config: BTreeMap<String, Value>,
+}
+
+impl PluginStrategy {
+    /// The settings as one JSON record, as `strategy/recommend` sends them.
+    pub fn config_value(&self) -> Value {
+        Value::Object(
+            self.config
+                .iter()
+                .map(|(key, value)| (key.clone(), value.clone()))
+                .collect(),
+        )
+    }
+}
 
 /// `fixed`: always `value`, whatever the reading. Reads nothing.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -402,6 +520,28 @@ impl Strategy for PassThrough {
             detail: format!("{} (pass-through)", fmt_num(input.reading)),
             within_tolerance: false,
         }
+    }
+}
+
+/// The pipeline never asks a plugin itself (it is pure): it reads the
+/// plugin's answer from the observation. This only says so, for a caller
+/// that recommends without one.
+impl Strategy for PluginStrategy {
+    fn name(&self) -> &'static str {
+        "plugin"
+    }
+
+    /// A plugin reads the check's reading when the check has a query, and
+    /// is asked without one otherwise.
+    fn needs_reading(&self) -> bool {
+        false
+    }
+
+    fn recommend(&self, input: &StrategyInput) -> Recommendation {
+        hold(
+            input.current,
+            format!("strategy plugin {} was not asked", self.name),
+        )
     }
 }
 
@@ -581,17 +721,35 @@ mod tests {
             json!({ "name": "threshold", "steps": [{ "above": 250.0, "add": 2 }] }),
             json!({ "name": "pass-through" }),
             json!({ "name": "fixed", "value": 3 }),
+            json!({ "name": "calendar", "lead": "15m", "replicas": 6 }),
         ];
         for value in cases {
             let config = StrategyConfig::from_spec(&spec(value.clone())).unwrap();
             assert_eq!(serde_json::to_value(&config).unwrap(), value);
+            let back: StrategyConfig = serde_json::from_value(value.clone()).unwrap();
+            assert_eq!(back, config, "{value}");
         }
+        // Any valid plugin name is a strategy plugin; whether it is
+        // installed is the manager's question.
+        let plugin = StrategyConfig::from_spec(&spec(json!({ "name": "calendar", "replicas": 6 })))
+            .unwrap();
+        assert_eq!(plugin.to_string(), "plugin calendar");
+        assert!(!plugin.needs_reading());
+        assert_eq!(
+            plugin.plugin().map(PluginStrategy::config_value),
+            Some(json!({ "replicas": 6 }))
+        );
+        // A built-in's typo is not a plugin: its settings are checked.
+        let err: Result<StrategyConfig, _> =
+            serde_json::from_value(json!({ "name": "per-replica", "valu": 5 }));
+        assert!(err.is_err());
     }
 
     #[test]
     fn strategy_config_errors_table_test() {
         let cases = [
-            (json!({ "name": "magic" }), "unknown strategy 'magic'"),
+            (json!({ "name": "Magic" }), "unknown strategy 'Magic'"),
+            (json!({ "name": "per_replica" }), "any other name is a strategy plugin"),
             (json!({ "name": "per-replica" }), "missing field `value`"),
             (
                 json!({ "name": "per-replica", "value": 0 }),

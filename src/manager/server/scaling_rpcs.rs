@@ -9,7 +9,9 @@
 //! else.
 
 use super::*;
-use crate::manager::scaling_inputs::{TargetKey, TargetTotals, CPU_HISTOGRAM_BOUNDS, HISTORY_SPAN};
+use crate::manager::scaling_inputs::{
+    HistoryPoint, TargetKey, TargetTotals, CPU_HISTOGRAM_BOUNDS, HISTORY_SPAN,
+};
 use crate::storage::store::{ScalingReplicaRow, TaskScale};
 use crate::structs::{
     GetScalingInputsReply, GetScalingInputsRequest, ScalingCpuInputs, ScalingDataFreshness,
@@ -279,6 +281,34 @@ fn store_facts(store: &Store, selection: &JobSelection) -> R<Vec<Result<StoreFac
     Ok(out)
 }
 
+/// Every task of `job_id`'s replica counts (desired, healthy, unplaced), as
+/// `GetScalingInputs` reports them: the history buffer records them on its
+/// points for autoscaled tasks.
+pub(crate) fn scaling_replica_counts(
+    store: &Store,
+    job_id: &str,
+) -> R<Vec<(TargetKey, crate::manager::scaling_inputs::ReplicaCounts)>> {
+    let selection = JobSelection {
+        job: job_id.to_string(),
+        group: None,
+        task: None,
+    };
+    Ok(store_facts(store, &selection)?
+        .into_iter()
+        .flatten()
+        .map(|facts| {
+            (
+                facts.key,
+                crate::manager::scaling_inputs::ReplicaCounts {
+                    desired: facts.inputs.desired_replicas,
+                    healthy: facts.inputs.ready_replicas,
+                    unplaced: facts.inputs.unplaced_replicas,
+                },
+            )
+        })
+        .collect())
+}
+
 /// Join measured totals into a task's entry.
 fn fill_measured(
     inputs: &mut ScalingInputs,
@@ -440,6 +470,9 @@ impl ManagerDaemonService {
                                 requests_per_second: f64::from(point.requests_per_second),
                                 errors_per_second: f64::from(point.errors_per_second),
                                 latency_ms_mean: f64::from(point.latency_ms_mean),
+                                desired_replicas: HistoryPoint::count(point.desired_replicas),
+                                ready_replicas: HistoryPoint::count(point.healthy_replicas),
+                                unplaced_replicas: HistoryPoint::count(point.unplaced_replicas),
                             })
                             .collect();
                     }

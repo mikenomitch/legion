@@ -30,6 +30,8 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use crate::structs::{NetEdgeSample, RollupSync, TargetRollup, UsageReport};
+use crate::util::R;
+use tracing::debug;
 
 /// How often a manager folds and ships its rollups: the worker usage report
 /// interval, so every rollup carries at most one new sample per node.
@@ -696,6 +698,31 @@ pub struct HistoryPoint {
     pub requests_per_second: f32,
     pub errors_per_second: f32,
     pub latency_ms_mean: f32,
+    /// The task's effective count, healthy and unplaced replicas at the
+    /// point, for autoscaled tasks ([`NO_COUNT`] otherwise): what
+    /// `legion scaling simulate` replays.
+    pub desired_replicas: u32,
+    pub healthy_replicas: u32,
+    pub unplaced_replicas: u32,
+}
+
+/// A count a history point did not record (a task that is not autoscaled).
+pub const NO_COUNT: u32 = u32::MAX;
+
+impl HistoryPoint {
+    /// A recorded count, or `None`.
+    pub fn count(value: u32) -> Option<u32> {
+        (value != NO_COUNT).then_some(value)
+    }
+}
+
+/// An autoscaled task's replica counts, as `GetScalingInputs` computes them,
+/// recorded on its history points.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ReplicaCounts {
+    pub desired: u32,
+    pub healthy: u32,
+    pub unplaced: u32,
 }
 
 /// One task's totals across every node, as the leader holds them now.
@@ -777,6 +804,9 @@ impl TargetTotals {
             requests_per_second: self.requests_per_second as f32,
             errors_per_second: self.errors_per_second as f32,
             latency_ms_mean: self.latency_ms_mean() as f32,
+            desired_replicas: NO_COUNT,
+            healthy_replicas: NO_COUNT,
+            unplaced_replicas: NO_COUNT,
         }
     }
 }
@@ -808,6 +838,9 @@ pub struct RollupMerge {
     /// Nodes with an entry, per task: the read index.
     by_target: HashMap<TargetKey, HashSet<String>>,
     history: HashMap<TargetKey, VecDeque<HistoryPoint>>,
+    /// The autoscaled tasks' replica counts for the next history point
+    /// ([`RollupMerge::set_counts`]).
+    counts: HashMap<TargetKey, ReplicaCounts>,
     /// When this manager took the status lane; `None` while it does not
     /// lead it.
     responsible_since: Option<Instant>,
@@ -1064,20 +1097,42 @@ impl RollupMerge {
         }
     }
 
-    /// Append one point per task with rollups, and age out history older
-    /// than [`HISTORY_SPAN`]. New tasks past [`HISTORY_MAX_TARGETS`] get no
-    /// history.
+    /// The autoscaled tasks' replica counts, recorded on the next history
+    /// point of each (and a point for each, rollups or not: a task scaled
+    /// to zero reports no usage, but its count is history too).
+    pub fn set_counts(&mut self, counts: HashMap<TargetKey, ReplicaCounts>) {
+        self.counts = counts;
+    }
+
+    /// Append one point per task with rollups or recorded counts, and age
+    /// out history older than [`HISTORY_SPAN`]. New tasks past
+    /// [`HISTORY_MAX_TARGETS`] get no history.
     pub fn record_history(&mut self, now: Instant, now_unix_ms: i64) {
-        let targets: Vec<TargetKey> = self.by_target.keys().cloned().collect();
+        let mut targets: Vec<TargetKey> = self.by_target.keys().cloned().collect();
+        targets.extend(
+            self.counts
+                .keys()
+                .filter(|target| !self.by_target.contains_key(*target))
+                .cloned(),
+        );
         for target in targets {
-            let Some(totals) = self.totals(&target, now) else {
-                continue;
+            let totals = self.totals(&target, now);
+            let counts = self.counts.get(&target).copied();
+            let mut point = match (totals, counts) {
+                (Some(totals), _) => totals.point(now_unix_ms),
+                (None, Some(_)) => TargetTotals::default().point(now_unix_ms),
+                (None, None) => continue,
             };
+            if let Some(counts) = counts {
+                point.desired_replicas = counts.desired;
+                point.healthy_replicas = counts.healthy;
+                point.unplaced_replicas = counts.unplaced;
+            }
             if !self.history.contains_key(&target) && self.history.len() >= HISTORY_MAX_TARGETS {
                 continue;
             }
             let ring = self.history.entry(target).or_default();
-            ring.push_back(totals.point(now_unix_ms));
+            ring.push_back(point);
             while ring.len() > HISTORY_POINTS {
                 ring.pop_front();
             }
@@ -1103,6 +1158,21 @@ impl RollupMerge {
             })
             .unwrap_or_default()
     }
+}
+
+/// Every autoscaled task's replica counts (desired, healthy, unplaced), the
+/// way `GetScalingInputs` computes them: one read of each autoscaled job
+/// per rollup tick, on the status-lane leader.
+pub fn autoscaled_replica_counts(
+    store: &crate::storage::store::Store,
+) -> R<HashMap<TargetKey, ReplicaCounts>> {
+    let mut counts = HashMap::new();
+    for (job_id, _) in store.autoscaled_job_configs()? {
+        for (key, replicas) in crate::manager::server::scaling_replica_counts(store, &job_id)? {
+            counts.insert(key, replicas);
+        }
+    }
+    Ok(counts)
 }
 
 // ---------------------------------------------------------------------------
@@ -1229,9 +1299,20 @@ impl RollupTicker {
         store: &crate::storage::store::Store,
         usage: &Mutex<crate::manager::usage::UsageTable>,
     ) -> TickOutcome {
-        let now = Instant::now();
         let now_unix_ms = time::OffsetDateTime::now_utc().unix_timestamp_nanos() / 1_000_000;
         let now_unix_ms = i64::try_from(now_unix_ms).unwrap_or(i64::MAX);
+        self.tick_at(store, usage, now_unix_ms).await
+    }
+
+    /// [`RollupTicker::tick`] with history points stamped `now_unix_ms`
+    /// instead of the wall clock (a test's virtual clock).
+    pub async fn tick_at(
+        &mut self,
+        store: &crate::storage::store::Store,
+        usage: &Mutex<crate::manager::usage::UsageTable>,
+        now_unix_ms: i64,
+    ) -> TickOutcome {
+        let now = Instant::now();
         let window = self
             .last_fold
             .map_or(ROLLUP_INTERVAL, |at| now.saturating_duration_since(at))
@@ -1254,7 +1335,16 @@ impl RollupTicker {
             self.was_leader = Some(leader);
         }
         if leader {
+            // The autoscaled tasks' counts, read before the merge's lock.
+            let counts = match autoscaled_replica_counts(store) {
+                Ok(counts) => counts,
+                Err(err) => {
+                    debug!("Scaling history: reading replica counts: {err:#}");
+                    HashMap::new()
+                }
+            };
             let mut merge = store.scaling_rollups().merge();
+            merge.set_counts(counts);
             if merge.responsible_since().is_none() {
                 // Any other manager may hold rollups for nodes that dial it;
                 // only a manager without raft is sure to be alone.

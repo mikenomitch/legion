@@ -848,7 +848,15 @@ pub fn validate_app_config(manifest: &AppManifest, config: &Value) -> Result<(),
     }
     let schema = compile_config_schema(&manifest.config_schema())
         .map_err(|err| format!("the app's config schema {err}"))?;
-    check_config(&schema, config)
+    check_config(&schema, config)?;
+    // The bundled autoscaler's plugins have rules a schema cannot say
+    // (exactly one way to run, a builtin's own config, a valid checksum):
+    // refused here, at `legion app config set`, rather than at the app's
+    // start. Bundled names are reserved, so no installed app is named so.
+    if manifest.name == crate::manager::autoscale::AUTOSCALER_APP {
+        crate::autoscaler::plugins::PluginCatalog::from_app_config(config)?;
+    }
+    Ok(())
 }
 
 fn validate_pointer(pointer: &str) -> Result<(), String> {

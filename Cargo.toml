@@ -26,14 +26,16 @@ include = [
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 # The workspace is this crate plus `guest/`, the in-guest agent that ships as
-# its own static binary (docs/task-runtime-sandbox.md, "The guest agent").
+# its own static binary (docs/task-runtime-sandbox.md, "The guest agent"),
+# and the scaling-plugin SDK (`legion-scaling-plugin`,
+# docs/autoscaling-plugins.md), so `cargo test --all` builds and tests it.
 # The example plugins under `plugins/` are separate crates built by build.rs
 # with their own lockfiles, so they stay out of it.
 [workspace]
 # Not ".": the root package is a member of its own workspace anyway, and
 # listing it makes every path under the root an explicit member, which
 # overrides `exclude` and breaks every plugin build.
-members = ["guest"]
+members = ["guest", "examples/scaling-plugins/rust"]
 exclude = ["plugins"]
 
 [dependencies]

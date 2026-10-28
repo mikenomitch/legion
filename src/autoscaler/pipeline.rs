@@ -8,7 +8,7 @@
 //!
 //! | Stage | What it does |
 //! | --- | --- |
-//! | recommendations | each check's strategy turns its reading into a desired count (tolerance band and the warmup rule live here, see [`strategies`](super::strategies)); a check with no data contributes nothing |
+//! | recommendations | each check's strategy turns its reading into a desired count (tolerance band and the warmup rule live here, see [`strategies`](super::strategies)); a strategy plugin's answer arrives in the observation ([`Observation::recommendations`]); a check with no data contributes nothing |
 //! | [`Stage::Merge`] | the max over checks with data; a `scaleIn = false` check counts only when it wants more than the current count. With `activation` checks: at zero only an active one can wake the target, and a `min = 0` target goes idle (0) once every activation check reads at or below its activation |
 //! | [`Stage::Headroom`] | adds `headroom` replicas |
 //! | [`Stage::Stabilize`] | per direction (HPA): scale-out takes the *lowest* recommendation in `up.stabilize`, scale-in the *highest* in `down.stabilize` |
@@ -67,6 +67,22 @@ pub enum Reading {
     Value(f64),
     /// No data, and why (`timeout`, `no series`, ...).
     Missing(String),
+}
+
+/// A strategy plugin's answer for one check, which the autoscaler fetches
+/// before the pipeline runs (a plugin does I/O; the pipeline is pure).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PluginRecommendation {
+    /// The desired count, when the plugin answered.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub desired: Option<u32>,
+    /// What the plugin said it saw.
+    #[serde(default)]
+    pub note: String,
+    /// Why there is no answer (the plugin failed, timed out, or refused).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
 }
 
 /// An operator pin (`legion job scale --count 12 --for 2h`). Active until
@@ -168,6 +184,10 @@ pub struct Observation {
     /// The active pause, if any.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pause: Option<Pause>,
+    /// Strategy plugins' answers, keyed by check name. A check whose
+    /// strategy is a plugin and has no entry has no data.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub recommendations: BTreeMap<String, PluginRecommendation>,
 }
 
 impl Observation {
@@ -555,6 +575,60 @@ fn outcome_for(
         counted: false,
         active: None,
     };
+    if let Some(plugin) = check.strategy.plugin() {
+        // A strategy plugin: the reading when the check has a query, and
+        // the answer the autoscaler fetched for it.
+        let reading = if check.query.trim().is_empty() {
+            None
+        } else {
+            match obs.readings.get(&check.name) {
+                Some(Reading::Value(value)) if value.is_finite() => Some(*value),
+                Some(Reading::Value(value)) => {
+                    let why = format!("reading {value} is not a number");
+                    outcome.detail = format!("no data ({why})");
+                    outcome.missing = Some(why);
+                    return outcome;
+                }
+                Some(Reading::Missing(why)) => {
+                    outcome.detail = format!("no data ({why})");
+                    outcome.missing = Some(why.clone());
+                    return outcome;
+                }
+                None => {
+                    outcome.detail = "no data (no data)".to_string();
+                    outcome.missing = Some("no data".to_string());
+                    return outcome;
+                }
+            }
+        };
+        match obs.recommendations.get(&check.name) {
+            Some(PluginRecommendation {
+                desired: Some(desired),
+                note,
+                ..
+            }) => {
+                outcome.reading = reading;
+                outcome.desired = Some(*desired);
+                outcome.detail = if note.is_empty() {
+                    format!("plugin {} wants {desired}", plugin.name)
+                } else {
+                    note.clone()
+                };
+                outcome.active = check
+                    .activation
+                    .map(|activation| reading.is_some_and(|value| value > activation));
+            }
+            other => {
+                let why = other
+                    .and_then(|answer| answer.error.clone())
+                    .unwrap_or_else(|| format!("strategy plugin {} did not answer", plugin.name));
+                outcome.reading = reading;
+                outcome.detail = format!("no data ({why})");
+                outcome.missing = Some(why);
+            }
+        }
+        return outcome;
+    }
     let reading = if strategy.needs_reading() {
         let value = match obs.readings.get(&check.name) {
             Some(Reading::Value(value)) if value.is_finite() => Ok(*value),

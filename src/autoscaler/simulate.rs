@@ -14,11 +14,28 @@
 //!   policy's `min`) and moves with every decision that would change it,
 //!   applied or "would" alike, since the point is to see what the policy
 //!   would do. New replicas are not ready until `warmup` has passed, unless
-//!   a row says how many are ready.
+//!   a row says how many are ready. With [`SimOptions::conserve_load`], a
+//!   utilization reading from a row whose `total` differs from the
+//!   simulated count is rescaled to it (the load is conserved: twice the
+//!   replicas at half the utilization), which is what makes following over
+//!   recorded history meaningful.
 //! - **Replay** (`follow = false`): every row's `total` is the count the
-//!   target actually had, and changes between rows are recorded as applied,
-//!   so they spend the step budget exactly as they did live. Use it to check
-//!   that the engine would have made the decisions it made.
+//!   target actually had. The engine's own decisions spend the step budget
+//!   when it makes them, and any other change of the count (a person's
+//!   scale, a pin, a write it did not make) when a row first shows it,
+//!   exactly as the live autoscaler accounts for them. A row's `healthy`
+//!   replicas go through the same warmup rule the live engine applies
+//!   ([`super::signals::Readiness`]). Run over the history the live engine
+//!   saw, with [`SimOptions::window_readings`], a replay of the same policy
+//!   makes the decisions the live engine made.
+//!
+//! # History
+//!
+//! [`history_rows`] turns the manager's 10-second history points
+//! ([`HistorySample`], from `GetScalingInputs`) into rows for a policy: the
+//! `legion` source's readings by check, the target's count and its healthy
+//! and unplaced replicas. Checks on other sources have no history in Legion
+//! and read as missing.
 //!
 //! # CSV
 //!
@@ -41,8 +58,11 @@ use std::io::BufRead;
 
 use chrono::DateTime;
 
-use super::defaults::EffectivePolicy;
-use super::pipeline::{evaluate, Decision, DecisionKind, Observation, PolicyState, Reading};
+use super::defaults::{EffectivePolicy, LEGION_SOURCE};
+use super::pipeline::{
+    evaluate, CapacityGuard, Decision, DecisionKind, Guards, Observation, PolicyState, Reading,
+};
+use super::signals::{Readiness, Windows};
 
 /// One sample of a time series.
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -51,10 +71,17 @@ pub struct SimRow {
     pub at_ms: i64,
     /// Readings by check name; a check with no entry has no data.
     pub readings: BTreeMap<String, Reading>,
-    /// Ready replicas, when the series knows.
+    /// Ready replicas (past warmup), when the series knows.
     pub ready: Option<u32>,
     /// The target's count, when the series knows (required to replay).
     pub total: Option<u32>,
+    /// Healthy replicas, warming ones included: a replay derives the ready
+    /// count from them with the live engine's warmup rule. Wins over
+    /// `ready`.
+    pub healthy: Option<u32>,
+    /// Replicas the scheduler could not place: a replay feeds the capacity
+    /// guard as the live engine does.
+    pub unplaced: Option<u32>,
 }
 
 impl SimRow {
@@ -87,6 +114,13 @@ pub struct SimOptions {
     /// the first row's time, like a freshly started engine. Pass a time at
     /// least one `down.stabilize` earlier to simulate a warm engine.
     pub started_at_ms: Option<i64>,
+    /// Average each check's readings over its `window` by the rows' times,
+    /// as the live engine averages the `legion` source's. For raw samples
+    /// (the manager's history); a CSV's readings are taken as the policy's.
+    pub window_readings: bool,
+    /// Following: rescale a utilization reading (a `legion`
+    /// `*.utilization` check) from the row's `total` to the simulated count.
+    pub conserve_load: bool,
 }
 
 impl Default for SimOptions {
@@ -95,8 +129,119 @@ impl Default for SimOptions {
             start_count: None,
             follow: true,
             started_at_ms: None,
+            window_readings: false,
+            conserve_load: false,
         }
     }
+}
+
+/// One 10-second point of the manager's history for a task
+/// (`GetScalingInputs` with `history_seconds`).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct HistorySample {
+    /// When the point was taken (unix ms, the status-lane leader's clock).
+    pub at_ms: i64,
+    /// The task's effective count, when the manager recorded it (autoscaled
+    /// tasks).
+    pub desired: Option<u32>,
+    /// Its healthy replicas, when recorded.
+    pub healthy: Option<u32>,
+    /// Its unplaced replicas, when recorded.
+    pub unplaced: Option<u32>,
+    /// Replicas that reported usage.
+    pub measured: u32,
+    /// Mean CPU utilization against the reservation.
+    pub cpu_utilization: f64,
+    /// Mean memory utilization against the reservation.
+    pub memory_utilization: f64,
+    /// Requests per second into the service the task backs.
+    pub requests_per_second: f64,
+    /// Errors per second.
+    pub errors_per_second: f64,
+    /// Mean latency.
+    pub latency_ms_mean: f64,
+}
+
+/// The reading a history point holds for a `legion` query, the way the live
+/// engine reads the same numbers.
+fn history_reading(sample: &HistorySample, query: &str) -> Reading {
+    let measured = |value: f64| {
+        if sample.measured == 0 {
+            Reading::Missing("no replica reports measurable usage".to_string())
+        } else {
+            Reading::Value(value)
+        }
+    };
+    match query {
+        "task.cpu.utilization" => measured(sample.cpu_utilization),
+        "task.memory.utilization" => measured(sample.memory_utilization),
+        "task.unplaced" => match sample.unplaced {
+            Some(unplaced) => Reading::Value(f64::from(unplaced)),
+            None => Reading::Missing("the history has no unplaced count".to_string()),
+        },
+        "service.rps" => Reading::Value(sample.requests_per_second),
+        "service.errors" => Reading::Value(sample.errors_per_second),
+        "service.latency_ms.mean" => Reading::Value(sample.latency_ms_mean),
+        other => Reading::Missing(format!("the history does not keep {other}")),
+    }
+}
+
+/// Rows for `policy` from the manager's history. A point without a
+/// recorded count (a task that was not autoscaled then) takes the replicas
+/// that reported usage as its count and its healthy replicas.
+pub fn history_rows(policy: &EffectivePolicy, samples: &[HistorySample]) -> Vec<SimRow> {
+    let checks = policy.all_checks();
+    samples
+        .iter()
+        .map(|sample| {
+            let mut row = SimRow::new(sample.at_ms);
+            row.total = Some(sample.desired.unwrap_or(sample.measured));
+            row.healthy = Some(sample.healthy.unwrap_or(sample.measured));
+            row.unplaced = sample.unplaced;
+            for check in &checks {
+                if check.query.trim().is_empty() {
+                    continue;
+                }
+                let reading = if check.source == LEGION_SOURCE {
+                    history_reading(sample, &check.query)
+                } else {
+                    Reading::Missing(format!(
+                        "source {} has no history in Legion",
+                        check.source
+                    ))
+                };
+                row.readings.insert(check.name.clone(), reading);
+            }
+            row
+        })
+        .collect()
+}
+
+/// Average each reading over its check's window (see
+/// [`SimOptions::window_readings`]).
+fn windowed(
+    policy: &EffectivePolicy,
+    windows: &mut Windows,
+    readings: &BTreeMap<String, Reading>,
+    at_ms: i64,
+) -> BTreeMap<String, Reading> {
+    let checks = policy.all_checks();
+    readings
+        .iter()
+        .map(|(name, reading)| {
+            let reading = match reading {
+                Reading::Value(value) => {
+                    let window = checks
+                        .iter()
+                        .find(|check| &check.name == name)
+                        .map_or(policy.window, |check| check.window);
+                    Reading::Value(windows.add(name, *value, at_ms, window))
+                }
+                missing => missing.clone(),
+            };
+            (name.clone(), reading)
+        })
+        .collect()
 }
 
 /// What a step of a model-driven simulation sees of the simulated target.
@@ -212,16 +357,6 @@ impl<'a> Simulation<'a> {
         self.count = to;
     }
 
-    /// Replay mode: the target is at `total` because it was, not because
-    /// the policy said so. A change since the last sample is recorded as
-    /// applied, so it spends the step budget.
-    fn observe_total(&mut self, now_ms: i64, total: u32) {
-        if total != self.count {
-            self.state.record_applied(now_ms, self.count, total);
-            self.count = total;
-            self.warming.clear();
-        }
-    }
 }
 
 fn check_order(rows: &[SimRow]) -> Result<(), String> {
@@ -261,7 +396,23 @@ pub fn simulate(
     let started = options.started_at_ms.unwrap_or(first.at_ms);
     let mut simulation = Simulation::new(policy, start, started);
     let mut decisions = Vec::with_capacity(rows.len());
+    let mut windows = Windows::default();
+    let mut readiness = Readiness::default();
+    // Replay: the count the engine expects next (after its own decision,
+    // the count it chose); a different count was changed by someone else.
+    let mut expected: Option<u32> = None;
+    let utilization: Vec<String> = policy
+        .all_checks()
+        .into_iter()
+        .filter(|check| check.per_ready_replica())
+        .map(|check| check.name)
+        .collect();
     for row in rows {
+        let mut readings = if options.window_readings {
+            windowed(policy, &mut windows, &row.readings, row.at_ms)
+        } else {
+            row.readings.clone()
+        };
         if !options.follow {
             let total = row.total.ok_or_else(|| {
                 format!(
@@ -269,18 +420,61 @@ pub fn simulate(
                     row.at_ms
                 )
             })?;
-            simulation.observe_total(row.at_ms, total);
-            let ready = row.ready.unwrap_or(total);
+            if let Some(expected) = expected {
+                if expected != total {
+                    simulation.state.record_applied(row.at_ms, expected, total);
+                }
+            }
+            let (ready, warming) = match row.healthy {
+                Some(healthy) => {
+                    let warming = readiness.observe(healthy, row.at_ms, policy.warmup);
+                    (healthy.saturating_sub(warming), warming)
+                }
+                None => {
+                    let ready = row.ready.unwrap_or(total).min(total);
+                    (ready, total - ready)
+                }
+            };
             let obs = Observation {
                 current: total,
-                ready: ready.min(total),
-                warming: total - ready.min(total),
-                readings: row.readings.clone(),
+                ready,
+                warming,
+                readings,
+                guards: Guards {
+                    capacity: row.unplaced.filter(|unplaced| *unplaced > 0).map(|unplaced| {
+                        CapacityGuard {
+                            unplaced,
+                            node_group_fits: false,
+                            last_scale_out: None,
+                        }
+                    }),
+                    ..Default::default()
+                },
                 ..Default::default()
             };
-            decisions.push(evaluate(policy, &mut simulation.state, &obs, row.at_ms));
+            let decision = evaluate(policy, &mut simulation.state, &obs, row.at_ms);
+            if decision.kind == DecisionKind::Applied {
+                simulation
+                    .state
+                    .record_applied(row.at_ms, decision.from, decision.to);
+                expected = Some(decision.to);
+            } else {
+                expected = Some(total);
+            }
+            decisions.push(decision);
         } else {
-            decisions.push(simulation.step(row.at_ms, row.readings.clone(), row.ready));
+            if options.conserve_load {
+                if let Some(total) = row.total.filter(|total| *total > 0) {
+                    let count = simulation.count().max(1);
+                    let factor = f64::from(total) / f64::from(count);
+                    for name in &utilization {
+                        if let Some(Reading::Value(value)) = readings.get_mut(name) {
+                            *value *= factor;
+                        }
+                    }
+                }
+            }
+            decisions.push(simulation.step(row.at_ms, readings, row.ready));
         }
     }
     Ok(decisions)
@@ -571,6 +765,114 @@ time,cpu,ready,total
         let missing_total = vec![SimRow::new(at(0)).reading("cpu", 0.7)];
         let err = simulate(&policy, &missing_total, &options).unwrap_err();
         assert!(err.contains("replay needs every sample's total"), "{err}");
+    }
+
+    /// A replay accounts for counts the way the live engine does: its own
+    /// decision when it makes it, anyone else's change when a row shows it;
+    /// healthy replicas warm through the same rule.
+    #[test]
+    fn replay_attributes_its_own_decisions_when_made_test() {
+        let policy = policy(json!({ "max": 20 }), 2);
+        // 2 → 6 decided at 0s and seen at 15s: one change, at 0s, so at 60s
+        // the +4 budget of the minute is free again.
+        let rows = vec![
+            SimRow {
+                total: Some(2),
+                healthy: Some(2),
+                ..SimRow::new(at(0)).reading("cpu", 2.1)
+            },
+            SimRow {
+                total: Some(6),
+                healthy: Some(6),
+                ..SimRow::new(at(15)).reading("cpu", 0.7)
+            },
+            SimRow {
+                total: Some(6),
+                healthy: Some(6),
+                ..SimRow::new(at(60)).reading("cpu", 1.4)
+            },
+        ];
+        let options = SimOptions {
+            follow: false,
+            started_at_ms: Some(at(-3600)),
+            ..Default::default()
+        };
+        let decisions = simulate(&policy, &rows, &options).unwrap();
+        assert_eq!((decisions[0].from, decisions[0].to), (2, 6));
+        assert_eq!(decisions[0].kind, DecisionKind::Applied);
+        // At 15s the four new replicas are warming (healthy rose by 4).
+        assert_eq!((decisions[1].ready, decisions[1].warming), (2, 4));
+        // At 60s: the step window (1m, exclusive of its start) no longer
+        // holds the change made at 0s, so the whole +100% of 6 is free.
+        assert_eq!(decisions[2].kind, DecisionKind::Applied, "{:#?}", decisions[2]);
+        assert_eq!((decisions[2].ready, decisions[2].to), (6, 12));
+    }
+
+    #[test]
+    fn history_rows_read_the_legion_vocabulary_test() {
+        let policy = policy(
+            json!({ "cpu": 0.7, "checks": [
+                { "name": "unplaced", "source": "legion", "query": "task.unplaced",
+                  "strategy": { "name": "pass-through" } },
+                { "name": "lag", "source": "team-prom", "query": "sum(lag)",
+                  "strategy": { "name": "per-replica", "value": 10 } },
+            ] }),
+            2,
+        );
+        let samples = vec![
+            HistorySample {
+                at_ms: at(0),
+                desired: Some(3),
+                healthy: Some(2),
+                unplaced: Some(1),
+                measured: 2,
+                cpu_utilization: 0.9,
+                ..Default::default()
+            },
+            HistorySample {
+                at_ms: at(10),
+                measured: 0,
+                ..Default::default()
+            },
+        ];
+        let rows = history_rows(&policy, &samples);
+        assert_eq!(rows[0].total, Some(3));
+        assert_eq!(rows[0].healthy, Some(2));
+        assert_eq!(rows[0].readings["cpu"], Reading::Value(0.9));
+        assert_eq!(rows[0].readings["unplaced"], Reading::Value(1.0));
+        assert!(matches!(&rows[0].readings["lag"], Reading::Missing(why) if why.contains("team-prom")));
+        // No recorded count: the measured replicas stand in; no usage is
+        // missing data, not zero.
+        assert_eq!(rows[1].total, Some(0));
+        assert!(matches!(rows[1].readings["cpu"], Reading::Missing(_)));
+    }
+
+    /// Following over history conserves the load: the policy's own larger
+    /// count sees a proportionally lower utilization, so it settles instead
+    /// of climbing on the real (unscaled) target's readings.
+    #[test]
+    fn following_history_conserves_the_load_test() {
+        let policy = policy(json!({ "max": 20 }), 2);
+        // The real target sat at 2 replicas at 1.4 (twice the 0.7 target).
+        let rows: Vec<SimRow> = (0..12)
+            .map(|tick| SimRow {
+                total: Some(2),
+                ..SimRow::new(at(tick * 15)).reading("cpu", 1.4)
+            })
+            .collect();
+        let conserved = SimOptions {
+            started_at_ms: Some(at(-3600)),
+            conserve_load: true,
+            ..Default::default()
+        };
+        let decisions = simulate(&policy, &rows, &conserved).unwrap();
+        assert_eq!(decisions.last().unwrap().to, 4, "{:?}", changes(&decisions));
+        let naive = SimOptions {
+            conserve_load: false,
+            ..conserved
+        };
+        let decisions = simulate(&policy, &rows, &naive).unwrap();
+        assert!(decisions.last().unwrap().to > 4, "{:?}", changes(&decisions));
     }
 
     #[test]

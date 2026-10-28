@@ -109,6 +109,12 @@ fn endpoint_table() -> Vec<(&'static str, Plane)> {
         ("GetScalingStatus", Plane::Protected("scale:read")),
         ("GetScaleHistory", Plane::Protected("scale:read")),
         ("PauseScaling", Plane::Protected("scale:write")),
+        // Standalone policies (`legion scaling apply`): scoped like a job
+        // named after the policy, in its namespace. A node-group policy
+        // also needs operator:write and node:write (checked after parse).
+        ("ApplyScalingPolicy", Plane::Protected("scale:write")),
+        ("DeleteScalingPolicy", Plane::Protected("scale:write")),
+        ("ListScalingPolicies", Plane::Protected("scale:read")),
         // Node autoscaling's demand read: node-scoped (it sizes node
         // groups), and names only the jobs the caller can read.
         ("GetCapacityDemand", Plane::Protected("node:read")),
@@ -388,6 +394,19 @@ fn jobspec(name: &str) -> String {
             "resources": {},
             "constraints": {},
         }],
+    })
+    .to_string()
+}
+
+/// A standalone policy on the built-in `noop` target: valid with no plugin
+/// installed, so the management-token call exercises the whole apply path.
+fn standalone_policy_spec(name: &str) -> String {
+    serde_json::json!({
+        "name": name,
+        "target": { "plugin": "noop" },
+        "min": 1,
+        "max": 3,
+        "checks": [{ "name": "steady", "strategy": { "name": "fixed", "value": 2 } }],
     })
     .to_string()
 }
@@ -727,6 +746,31 @@ async fn call_endpoint(
                 },
                 token,
             ))
+            .await
+            .map(|_| ()),
+        "ApplyScalingPolicy" => svc
+            .apply_scaling_policy(req(
+                ApplyScalingPolicyRequest {
+                    spec_json: standalone_policy_spec(JOB_NAME),
+                    dry_run: true,
+                    ..Default::default()
+                },
+                token,
+            ))
+            .await
+            .map(|_| ()),
+        "DeleteScalingPolicy" => svc
+            .delete_scaling_policy(req(
+                DeleteScalingPolicyRequest {
+                    name: JOB_NAME.into(),
+                    ..Default::default()
+                },
+                token,
+            ))
+            .await
+            .map(|_| ()),
+        "ListScalingPolicies" => svc
+            .list_scaling_policies(req(ListScalingPoliciesRequest::default(), token))
             .await
             .map(|_| ()),
         "GetCapacityDemand" => svc
@@ -2852,6 +2896,115 @@ async fn app_plane_refuses_tokens_that_are_not_the_autoscaler_test() -> R<()> {
         .await
         .expect_err("defaults need operator:write");
     assert_eq!(status.code(), Code::PermissionDenied);
+    Ok(())
+}
+
+/// Standalone scaling policies are scoped like a job named after the
+/// policy: a `scale:write` grant on one name applies and deletes that policy
+/// only, a missing policy outside the grant reads as PermissionDenied (not
+/// NotFound), the list leaves out what the caller cannot read, and a
+/// node-group policy needs operator:write and node:write, not scale.
+#[tokio::test]
+async fn standalone_policies_are_scoped_like_jobs_test() -> R<()> {
+    let (svc, _, management) = setup_enabled()?;
+    for name in ["render", "other"] {
+        svc.apply_scaling_policy(req(
+            ApplyScalingPolicyRequest {
+                spec_json: standalone_policy_spec(name),
+                ..Default::default()
+            },
+            Some(&management),
+        ))
+        .await
+        .map_err(|s| anyhow!(s.to_string()))?;
+    }
+    svc.store.upsert_acl_policy(
+        "render-scaler",
+        "",
+        r#"[{"resources": ["scale"], "namespaces": ["*"], "actions": ["read", "write"], "names": ["render"]}]"#,
+    )?;
+    let (_, secret) = svc
+        .auth
+        .clone()
+        .mint_token(&svc.store, "render", "client", &["render-scaler".into()], None)
+        .map_err(|s| anyhow!(s.to_string()))?;
+
+    let apply = |name: &str, dry_run: bool| ApplyScalingPolicyRequest {
+        spec_json: standalone_policy_spec(name),
+        dry_run,
+        ..Default::default()
+    };
+    svc.apply_scaling_policy(req(apply("render", true), Some(&secret)))
+        .await
+        .expect("its own policy");
+    let status = svc
+        .apply_scaling_policy(req(apply("other", true), Some(&secret)))
+        .await
+        .expect_err("another name");
+    assert_eq!(status.code(), Code::PermissionDenied);
+
+    // Delete checks the precise scope before looking the policy up.
+    for name in ["other", "never-existed"] {
+        let status = svc
+            .delete_scaling_policy(req(
+                DeleteScalingPolicyRequest {
+                    name: name.into(),
+                    ..Default::default()
+                },
+                Some(&secret),
+            ))
+            .await
+            .expect_err("outside the grant");
+        assert_eq!(status.code(), Code::PermissionDenied, "{name}");
+    }
+
+    let listed = svc
+        .list_scaling_policies(req(ListScalingPoliciesRequest::default(), Some(&secret)))
+        .await
+        .map_err(|s| anyhow!(s.to_string()))?
+        .into_inner();
+    let ids: Vec<&str> = listed.policies.iter().map(|p| p.id.as_str()).collect();
+    assert_eq!(ids, vec!["render"]);
+
+    // A node group is cluster-scoped: broad scale:write is not enough.
+    let nodes = serde_json::json!({
+        "name": "workers",
+        "target": { "nodes": { "pool": "default", "plugin": "aws-asg" } },
+        "min": 1,
+        "max": 3,
+    })
+    .to_string();
+    let node_request = |token: &str| {
+        req(
+            ApplyScalingPolicyRequest {
+                spec_json: nodes.clone(),
+                dry_run: true,
+                ..Default::default()
+            },
+            Some(token),
+        )
+    };
+    let status = svc
+        .apply_scaling_policy(node_request(&secret))
+        .await
+        .expect_err("node groups need operator:write");
+    assert_eq!(status.code(), Code::PermissionDenied, "{status:?}");
+    // With the grant it passes the ACL and is refused as not run yet.
+    let status = svc
+        .apply_scaling_policy(node_request(&management))
+        .await
+        .expect_err("node groups run from Phase 5b");
+    assert_eq!(status.code(), Code::FailedPrecondition, "{status:?}");
+
+    svc.delete_scaling_policy(req(
+        DeleteScalingPolicyRequest {
+            name: "render".into(),
+            ..Default::default()
+        },
+        Some(&secret),
+    ))
+    .await
+    .expect("deletes its own");
     Ok(())
 }
 

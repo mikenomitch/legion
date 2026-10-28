@@ -825,3 +825,64 @@ fn scale_to_zero_wakes_by_activation_and_sleeps_when_idle_test() {
     );
     assert_eq!(unknown.to, 1);
 }
+
+/// A strategy plugin's answer is fetched before the pipeline runs and
+/// arrives in the observation; without one, or without the reading its
+/// query needs, the check has no data.
+#[test]
+fn plugin_strategies_vote_with_the_answer_they_gave_test() {
+    let policy = policy(
+        json!({ "max": 10, "checks": [
+            { "name": "window", "source": "legion",
+              "strategy": { "name": "calendar", "replicas": 6 }, "scaleIn": false },
+            { "name": "lag", "source": "team-prom", "query": "sum(lag)",
+              "strategy": { "name": "forecast", "horizon": "1h" } },
+        ] }),
+        2,
+    );
+    let answer = |desired: u32, note: &str| PluginRecommendation {
+        desired: Some(desired),
+        note: note.to_string(),
+        error: None,
+    };
+    let mut obs = Observation::new(2).reading("lag", 120.0);
+    obs.recommendations
+        .insert("window".into(), answer(6, "batch window 02:00"));
+    obs.recommendations.insert("lag".into(), answer(3, ""));
+    let decision = evaluate(&policy, &mut warm(&policy), &obs, at(0));
+    assert_eq!((decision.to, decision.kind), (6, DecisionKind::Applied));
+    assert!(
+        decision.summary.starts_with("window batch window 02:00"),
+        "{}",
+        decision.summary
+    );
+    let lag = &decision.checks[1];
+    assert_eq!((lag.reading, lag.desired), (Some(120.0), Some(3)));
+    assert_eq!(lag.detail, "plugin forecast wants 3");
+
+    // The plugin failed: missing data, with its reason; scale-in holds.
+    let mut failed = Observation::new(6).reading("lag", 120.0);
+    failed.recommendations.insert(
+        "lag".into(),
+        PluginRecommendation {
+            error: Some("plugin forecast: strategy/recommend timed out after 10s".into()),
+            ..Default::default()
+        },
+    );
+    let decision = evaluate(&policy, &mut warm(&policy), &failed, at(0));
+    assert_eq!(decision.kind, DecisionKind::Held);
+    assert!(decision.checks[0].missing.is_some(), "window was not asked");
+    assert!(decision.checks[1]
+        .missing
+        .as_deref()
+        .is_some_and(|why| why.contains("timed out")));
+
+    // A query with no reading is missing before the plugin is considered.
+    let mut unread = Observation::new(2).missing("lag", "the source timed out");
+    unread.recommendations.insert("lag".into(), answer(9, ""));
+    let decision = evaluate(&policy, &mut warm(&policy), &unread, at(0));
+    assert_eq!(
+        decision.checks[1].missing.as_deref(),
+        Some("the source timed out")
+    );
+}

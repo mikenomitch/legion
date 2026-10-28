@@ -2335,6 +2335,27 @@ fn migration_list() -> Vec<M<'static>> {
         ALTER TABLE join_token ADD COLUMN attributes TEXT NOT NULL DEFAULT '';",
         )
         .down(""),
+        // Standalone scaling policies (`legion scaling apply`; autoscaler v2
+        // plan §6.2, §7): one row per policy, its spec as written, on the
+        // Control lane with the rest of the scaling state. `namespace` is
+        // empty for a cluster-scoped policy (a node group). `version` is a
+        // value of the `scaling_policy` counter in `scaling_counter`.
+        M::up(
+            "CREATE TABLE IF NOT EXISTS scaling_policy (
+            namespace TEXT NOT NULL,
+            name TEXT NOT NULL,
+            kind TEXT NOT NULL,
+            version INTEGER NOT NULL,
+            spec TEXT NOT NULL,
+            description TEXT NOT NULL DEFAULT '',
+            created_by TEXT NOT NULL,
+            created_ms INTEGER NOT NULL,
+            updated_by TEXT NOT NULL,
+            updated_ms INTEGER NOT NULL,
+            PRIMARY KEY (namespace, name)
+        );",
+        )
+        .down("DROP TABLE IF EXISTS scaling_policy;"),
     ]
 }
 

@@ -9,7 +9,8 @@ use super::*;
 use crate::autoscaler::defaults::ResolvedPolicy;
 use crate::autoscaler::{AutoscaleRecord, EffectivePolicy};
 use crate::manager::autoscale::{
-    is_autoscaled, summary_line, target_label, targets_for_config, AutoscaleLayers, TargetPolicy,
+    is_autoscaled, policy_of_target_key, policy_target_key, summary_line, target_label,
+    targets_for_config, AutoscaleLayers, TargetPolicy,
 };
 use crate::manager::scaling_status::AppLiveness;
 use crate::storage::store::{
@@ -23,7 +24,7 @@ use crate::structs::{
     RecordScalingActionReply, RecordScalingActionRequest, ReportScalingStatusReply,
     ReportScalingStatusRequest, ScaleDecision, ScaleHistoryEntry, ScalePin, ScalingAppStatus,
     ScalingPauseInfo, ScalingPolicy, ScalingPolicyChange, ScalingPolicySet, ScalingProvenanceRow,
-    ScalingTargetStatus, WatchScalingPoliciesRequest,
+    ScalingTargetStatus, StandaloneScalingPolicy, WatchScalingPoliciesRequest,
 };
 
 /// The bundled autoscaler app's name; its job is `legion-system/autoscaler`.
@@ -77,9 +78,15 @@ pub(super) fn pause_proto(pause: &PauseRow) -> ScalingPauseInfo {
 }
 
 fn history_proto(row: &HistoryRow, policy_json: Option<String>, detail: bool) -> ScaleHistoryEntry {
+    let policy = policy_of_target_key(&row.job_id).map(str::to_string);
     ScaleHistoryEntry {
         id: row.id.max(0) as u64,
-        job_id: row.job_id.clone(),
+        job_id: if policy.is_some() {
+            String::new()
+        } else {
+            row.job_id.clone()
+        },
+        policy: policy.unwrap_or_default(),
         task_group: row.task_group.clone(),
         task_name: row.task_name.clone(),
         at_unix_ms: row.at_ms,
@@ -780,7 +787,7 @@ impl ManagerDaemonService {
             let mut poll = tokio::time::interval(POLICY_POLL);
             poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             let mut fingerprint: Option<String> = None;
-            let mut last_sent: Option<Vec<ScalingPolicy>> = None;
+            let mut last_sent: Option<(Vec<ScalingPolicy>, Vec<StandaloneScalingPolicy>)> = None;
             let mut generation = 0u64;
             loop {
                 tokio::select! {
@@ -803,7 +810,15 @@ impl ManagerDaemonService {
                     let configs = store.autoscaled_job_configs()?;
                     let defaults = store.scaling_defaults()?.map_or(0, |row| row.version);
                     let policies = store.namespace_policy_fingerprint()?;
-                    Ok(format!("{configs:?}|{defaults}|{policies:?}"))
+                    let standalone = store.scaling_policy_fingerprint()?;
+                    let pauses = store.scaling_pause_fingerprint()?;
+                    let plugins = store
+                        .get_app(crate::manager::autoscale::AUTOSCALER_APP)?
+                        .map(|record| record.updated_at)
+                        .unwrap_or_default();
+                    Ok(format!(
+                        "{configs:?}|{defaults}|{policies:?}|{standalone:?}|{pauses:?}|{plugins}"
+                    ))
                 })();
                 let probe = match probe {
                     Ok(probe) => probe,
@@ -840,20 +855,49 @@ impl ManagerDaemonService {
                     })
                     .map(policy_proto)
                     .collect();
-                if last_sent.as_ref() == Some(&policies) {
+                let pauses = store.scaling_pauses().unwrap_or_default();
+                let now_ms = now_unix_ms();
+                let standalone: Vec<StandaloneScalingPolicy> =
+                    match super::scaling_policy_rpcs::load_policies(&store, &layers) {
+                        Ok(loaded) => loaded
+                            .iter()
+                            .filter(|policy| {
+                                namespaces
+                                    .as_ref()
+                                    .is_none_or(|selection| selection.matches(&policy.row.namespace))
+                            })
+                            .filter(|policy| {
+                                identity.allows(
+                                    AclResource::Scale,
+                                    AclAction::Read,
+                                    &AclScope::job(&policy.id()),
+                                )
+                            })
+                            .map(|policy| {
+                                super::scaling_policy_rpcs::standalone_proto(policy, &pauses, now_ms)
+                            })
+                            .collect(),
+                        Err(err) => {
+                            warn!("WatchScalingPolicies: resolving standalone policies: {err:#}");
+                            continue;
+                        }
+                    };
+                let sent = (policies, standalone);
+                if last_sent.as_ref() == Some(&sent) {
                     continue;
                 }
                 generation += 1;
                 let set = ScalingPolicySet {
-                    policies: policies.clone(),
+                    policies: sent.0.clone(),
                     generation,
-                    resolved_at_unix_ms: now_unix_ms(),
+                    resolved_at_unix_ms: now_ms,
                     defaults_version: layers.cluster_version,
+                    standalone: sent.1.clone(),
                 };
                 if tx.send(Ok(set)).await.is_err() {
                     return;
                 }
-                last_sent = Some(policies);
+                last_sent = Some(sent);
             }
         });
         Ok(Response::new(ReceiverStream::new(rx)))
@@ -953,6 +997,40 @@ impl ManagerDaemonService {
             if before_digest != after_digest || !error.is_empty() {
                 changes.push(ScalingPolicyChange {
                     target: target.label(),
+                    before_digest,
+                    after_digest,
+                    error,
+                    fields,
+                });
+            }
+        }
+        // Standalone policies inherit the defaults too.
+        let standalone = super::scaling_policy_rpcs::load_policies(&self.store, &layers)
+            .map_err(|e| map_store_error("Error loading scaling policies", e))?;
+        for policy in &standalone {
+            let Ok(crate::autoscaler::policy::StandaloneSpec::External(spec)) = &policy.spec else {
+                continue;
+            };
+            let after = next.resolve_standalone(spec);
+            let before_digest = policy
+                .resolved
+                .as_ref()
+                .map(|resolved| resolved.digest.clone())
+                .unwrap_or_default();
+            let (after_digest, error, fields) = match &after {
+                Ok(resolved) => (
+                    resolved.digest.clone(),
+                    String::new(),
+                    match &policy.resolved {
+                        Ok(before) => changed_fields(before, resolved),
+                        Err(_) => Vec::new(),
+                    },
+                ),
+                Err(err) => (String::new(), err.clone(), Vec::new()),
+            };
+            if before_digest != after_digest || !error.is_empty() {
+                changes.push(ScalingPolicyChange {
+                    target: policy.id(),
                     before_digest,
                     after_digest,
                     error,
@@ -1116,20 +1194,34 @@ impl ManagerDaemonService {
         self.store
             .require_lane_leader(crate::storage::Lane::Status, "ReportScalingStatus")
             .map_err(|e| map_store_error("Error recording scaling status", e))?;
-        let report = request.into_inner();
+        let mut report = request.into_inner();
+        // A standalone policy's report lives under its policy key.
+        for target in report.targets.iter_mut() {
+            if !target.policy.is_empty() {
+                target.job_id = policy_target_key(&target.policy);
+                target.task_group.clear();
+                target.task_name.clear();
+            }
+        }
         let accepted =
             self.store
                 .scaling_status()
                 .record(&report, std::time::Instant::now(), now_unix_ms());
         for target in &report.targets {
             for flag in &target.events {
-                self.store.events().scale_flag(
-                    &flag.kind,
-                    &target.job_id,
-                    &target.task_group,
-                    &target.task_name,
-                    &flag.message,
-                );
+                if target.policy.is_empty() {
+                    self.store.events().scale_flag(
+                        &flag.kind,
+                        &target.job_id,
+                        &target.task_group,
+                        &target.task_name,
+                        &flag.message,
+                    );
+                } else {
+                    self.store
+                        .events()
+                        .scale_policy_flag(&flag.kind, &target.policy, &flag.message);
+                }
             }
         }
         Ok(Response::new(ReportScalingStatusReply {
@@ -1148,29 +1240,73 @@ impl ManagerDaemonService {
     ) -> Result<Response<RecordScalingActionReply>, Status> {
         let identity = self.enforce_app_plane(&request)?;
         let inner = request.into_inner();
-        if inner.kind != "would" {
-            return Err(Status::invalid_argument(format!(
-                "unknown action kind '{}': this version records `would` (a dry-run decision)",
-                inner.kind
-            )));
+        let policy = inner.policy.trim().to_string();
+        match inner.kind.as_str() {
+            "would" => {}
+            "scale" | "failed" if !policy.is_empty() => {}
+            "scale" | "failed" => {
+                return Err(Status::invalid_argument(format!(
+                    "a `{}` action names a standalone policy (`policy`); a task's count \
+                     changes through ScaleTask",
+                    inner.kind
+                )))
+            }
+            other => {
+                return Err(Status::invalid_argument(format!(
+                    "unknown action kind '{other}': use would (a dry-run decision), or scale or \
+                     failed (a standalone policy's target)"
+                )))
+            }
         }
         let decision = inner.decision.unwrap_or_default();
         check_decision(&decision)?;
+        let now_ms = now_unix_ms();
+        let (job_id, task_group, task_name) = if policy.is_empty() {
+            (inner.job_id.clone(), inner.task_group.clone(), inner.task_name.clone())
+        } else {
+            (policy_target_key(&policy), String::new(), String::new())
+        };
+        if inner.kind == "scale" {
+            // A pause holds even against a misbehaving app.
+            let pauses = self
+                .store
+                .scaling_pauses()
+                .map_err(|e| map_store_error("Error loading pauses", e))?;
+            if let Some(pause) = covering_pause(&pauses, &job_id, "", "", now_ms) {
+                return Err(Status::failed_precondition(format!(
+                    "scaling policy {policy} is paused ({} by {}): the autoscaler may not scale \
+                     it. Hint: `legion scaling resume`",
+                    pause.scope(),
+                    pause.principal
+                )));
+            }
+        }
+        let (kind, applied) = match inner.kind.as_str() {
+            "scale" => ("scaled", true),
+            "failed" => ("failed", false),
+            _ => ("would", false),
+        };
         let history_id = self
             .store
-            .record_scale_history(
-                &inner.job_id,
-                &inner.task_group,
-                &inner.task_name,
-                now_unix_ms(),
+            .record_scale_history_row(
+                &job_id,
+                &task_group,
+                &task_name,
+                now_ms,
                 inner.from,
                 inner.to,
                 "autoscaler",
                 &identity.principal,
-                "would",
+                kind,
+                applied,
                 new_history(Some(&decision)),
             )
             .map_err(|e| map_store_error("Error recording scaling action", e))?;
+        if kind == "scaled" {
+            self.store
+                .events()
+                .scale_policy_applied(&policy, inner.from, inner.to, &decision.summary);
+        }
         Ok(Response::new(RecordScalingActionReply {
             history_id: history_id.max(0) as u64,
         }))
@@ -1189,6 +1325,12 @@ impl ManagerDaemonService {
         )?;
         let req = request.into_inner();
         let job = req.job.trim().to_string();
+        let policy = req.policy.trim().to_string();
+        if !job.is_empty() && !policy.is_empty() {
+            return Err(Status::invalid_argument(
+                "name a job or a standalone policy, not both",
+            ));
+        }
         if !job.is_empty() {
             acl::enforce(
                 &identity,
@@ -1197,10 +1339,18 @@ impl ManagerDaemonService {
                 &self.job_read_scope(&job),
             )?;
         }
+        if !policy.is_empty() {
+            acl::enforce(
+                &identity,
+                AclResource::Scale,
+                AclAction::Read,
+                &AclScope::job(&policy),
+            )?;
+        }
         self.store
             .require_lane_leader(crate::storage::Lane::Status, "GetScalingStatus")
             .map_err(|e| map_store_error("Error reading scaling status", e))?;
-        let namespaces = if job.is_empty() {
+        let namespaces = if job.is_empty() && policy.is_empty() {
             Some(
                 crate::structs::namespace::NamespaceSelection::parse(&req.namespaces)
                     .map_err(Status::invalid_argument)?,
@@ -1208,7 +1358,7 @@ impl ManagerDaemonService {
         } else {
             None
         };
-        let (_, targets) = load_targets(&self.store)
+        let (layers, targets) = load_targets(&self.store)
             .map_err(|e| map_store_error("Error loading scaling policies", e))?;
         let pauses = self
             .store
@@ -1226,7 +1376,7 @@ impl ManagerDaemonService {
         let (group, task) = (narrow(&req.task_group), narrow(&req.task_name));
         let mut out = Vec::new();
         for target in targets {
-            if !job.is_empty() && target.job_id != job {
+            if !policy.is_empty() || (!job.is_empty() && target.job_id != job) {
                 continue;
             }
             if let Some(selection) = namespaces.as_ref() {
@@ -1255,11 +1405,126 @@ impl ManagerDaemonService {
                     .map_err(|e| map_store_error("Error reading scaling status", e))?,
             );
         }
+        if job.is_empty() {
+            let loaded = super::scaling_policy_rpcs::load_policies(&self.store, &layers)
+                .map_err(|e| map_store_error("Error loading scaling policies", e))?;
+            let mut found = false;
+            for standalone in &loaded {
+                let id = standalone.id();
+                if !policy.is_empty() && id != policy {
+                    continue;
+                }
+                if let Some(selection) = namespaces.as_ref() {
+                    if !selection.matches(&standalone.row.namespace) {
+                        continue;
+                    }
+                }
+                if !identity.allows(AclResource::Scale, AclAction::Read, &AclScope::job(&id)) {
+                    continue;
+                }
+                found = true;
+                out.push(
+                    self.standalone_status(standalone, &pauses, now, now_ms, req.detail)
+                        .map_err(|e| map_store_error("Error reading scaling status", e))?,
+                );
+            }
+            if !policy.is_empty() && !found {
+                return Err(Status::not_found(format!(
+                    "scaling policy {policy} not found. Hint: `legion scaling list` shows the \
+                     policies"
+                )));
+            }
+        }
         let app = self.app_status(&pauses, now, now_ms)?;
         Ok(Response::new(GetScalingStatusReply {
             app: Some(app),
             targets: out,
         }))
+    }
+
+    /// One standalone policy's status: what the app last reported for it,
+    /// its bounds and mode, its pause, and its last history row.
+    fn standalone_status(
+        &self,
+        policy: &super::scaling_policy_rpcs::LoadedPolicy,
+        pauses: &[PauseRow],
+        now: std::time::Instant,
+        now_ms: i64,
+        detail: bool,
+    ) -> R<ScalingTargetStatus> {
+        let id = policy.id();
+        let key = policy_target_key(&id);
+        let pause = covering_pause(pauses, &key, "", "", now_ms).map(pause_proto);
+        let last_change = self
+            .store
+            .scale_history(&key, Some(""), Some(""), 1)?
+            .first()
+            .map(|row| history_proto(row, None, false));
+        let board = self.store.scaling_status();
+        let entry = board.target(&key, "", "");
+        let (mode, min, max, digest, error, policy_summary) = match &policy.resolved {
+            Ok(resolved) => (
+                resolved.policy.mode.to_string(),
+                resolved.policy.min,
+                resolved.policy.max,
+                resolved.digest.clone(),
+                String::new(),
+                summary_line(&resolved.policy),
+            ),
+            Err(err) => (
+                String::new(),
+                0,
+                0,
+                String::new(),
+                err.clone(),
+                format!("invalid: {err}"),
+            ),
+        };
+        let (state, current, want, evaluated, summary, decision) = match (&policy.resolved, &entry) {
+            (Err(_), _) => ("invalid".to_string(), 0, 0, 0, error.clone(), String::new()),
+            (Ok(_), Some(entry)) if board.is_stale(entry.received, now) => (
+                "stale".to_string(),
+                entry.current,
+                entry.current,
+                entry.evaluated_at_unix_ms,
+                entry.summary.clone(),
+                entry.decision_json.clone(),
+            ),
+            (Ok(_), Some(entry)) => (
+                entry.state.clone(),
+                entry.current,
+                entry.want,
+                entry.evaluated_at_unix_ms,
+                entry.summary.clone(),
+                entry.decision_json.clone(),
+            ),
+            (Ok(_), None) => ("not-evaluated".to_string(), 0, 0, 0, String::new(), String::new()),
+        };
+        let (policy_rows, policy_json) = match (&policy.resolved, detail) {
+            (Ok(resolved), true) => (provenance_proto(resolved), resolved.policy.canonical_json()),
+            _ => (Vec::new(), String::new()),
+        };
+        Ok(ScalingTargetStatus {
+            mode,
+            now: current,
+            want,
+            min,
+            max,
+            state,
+            last_evaluation_unix_ms: evaluated,
+            summary,
+            last_change,
+            pause,
+            policy_digest: digest,
+            error,
+            decision_json: if detail { decision } else { String::new() },
+            policy: policy_rows,
+            policy_json,
+            policy_summary,
+            policy_id: id,
+            kind: "external".to_string(),
+            ..Default::default()
+        })
     }
 
     fn target_status(
@@ -1363,6 +1628,12 @@ impl ManagerDaemonService {
             policy_json,
             version: row.as_ref().map_or(0, |row| row.version),
             policy_summary,
+            policy_id: String::new(),
+            kind: if target.members.len() > 1 {
+                "group".to_string()
+            } else {
+                "task".to_string()
+            },
         })
     }
 
@@ -1467,18 +1738,24 @@ impl ManagerDaemonService {
         }
     }
 
-    // ACL: scale:read on the job.
+    // ACL: scale:read on the job, or on the standalone policy.
     pub(super) async fn get_scale_history_rpc(
         &self,
         request: Request<GetScaleHistoryRequest>,
     ) -> Result<Response<GetScaleHistoryReply>, Status> {
-        self.check_acl(
-            &request,
-            AclResource::Scale,
-            AclAction::Read,
-            self.job_read_scope(&request.get_ref().job),
-        )?;
-        let req = request.into_inner();
+        let policy = request.get_ref().policy.trim().to_string();
+        let scope = if policy.is_empty() {
+            self.job_read_scope(&request.get_ref().job)
+        } else {
+            AclScope::job(&policy)
+        };
+        self.check_acl(&request, AclResource::Scale, AclAction::Read, scope)?;
+        let mut req = request.into_inner();
+        if !policy.is_empty() {
+            req.job = policy_target_key(&policy);
+            req.task_group = None;
+            req.task_name = None;
+        }
         let limit = match req.limit {
             0 => 50,
             n => n.min(HISTORY_LIMIT_MAX),
@@ -1518,6 +1795,7 @@ impl ManagerDaemonService {
         &self,
         request: Request<PauseScalingRequest>,
     ) -> Result<Response<PauseScalingReply>, Status> {
+        let policy = request.get_ref().policy.trim().to_string();
         let identity = if request.get_ref().all {
             self.check_acl(
                 &request,
@@ -1525,11 +1803,19 @@ impl ManagerDaemonService {
                 AclAction::Write,
                 AclScope::none(),
             )?
+        } else if !policy.is_empty() {
+            // The policy's scope needs no lookup: its id names it.
+            self.check_acl(
+                &request,
+                AclResource::Scale,
+                AclAction::Write,
+                AclScope::job(&policy),
+            )?
         } else {
             let job = request.get_ref().job.trim().to_string();
             if job.is_empty() {
                 return Err(Status::invalid_argument(
-                    "name a job to pause, or set all for the whole cluster",
+                    "name a job or a standalone policy to pause, or set all for the whole cluster",
                 ));
             }
             self.check_acl(
@@ -1564,6 +1850,25 @@ impl ManagerDaemonService {
                 PAUSE_ANY.to_string(),
                 PAUSE_ANY.to_string(),
                 "the whole cluster".to_string(),
+            )
+        } else if !policy.is_empty() {
+            let (namespace, name) = crate::structs::namespace::split_job_id(&policy);
+            if self
+                .store
+                .scaling_policy(namespace, name)
+                .map_err(|e| map_store_error("Error reading scaling policy", e))?
+                .is_none()
+            {
+                return Err(Status::not_found(format!(
+                    "scaling policy {policy} not found. Hint: `legion scaling list` shows the \
+                     policies"
+                )));
+            }
+            (
+                policy_target_key(&policy),
+                String::new(),
+                String::new(),
+                format!("scaling policy {policy}"),
             )
         } else {
             let job = inner.job.trim().to_string();
@@ -1603,6 +1908,8 @@ impl ManagerDaemonService {
         };
         let scope = if inner.all {
             "all"
+        } else if !policy.is_empty() {
+            "policy"
         } else if group == PAUSE_ANY {
             "job"
         } else {
@@ -1672,6 +1979,36 @@ impl ManagerDaemonService {
             until_unix_ms: until,
         }))
     }
+}
+
+/// `field: old -> new` for every field whose effective value differs
+/// between two resolutions (`legion scaling apply --dry-run`'s diff).
+pub(super) fn changed_field_values(before: &ResolvedPolicy, after: &ResolvedPolicy) -> Vec<String> {
+    let before_rows: HashMap<String, String> = before
+        .explain_rows()
+        .into_iter()
+        .map(|row| (row.field, row.value))
+        .collect();
+    let mut lines: Vec<String> = after
+        .explain_rows()
+        .into_iter()
+        .filter_map(|row| match before_rows.get(&row.field) {
+            Some(old) if *old == row.value => None,
+            Some(old) => Some(format!("{}: {old} -> {}", row.field, row.value)),
+            None => Some(format!("{}: (none) -> {}", row.field, row.value)),
+        })
+        .collect();
+    let after_fields: BTreeSet<String> = after
+        .explain_rows()
+        .into_iter()
+        .map(|row| row.field)
+        .collect();
+    for (field, old) in &before_rows {
+        if !after_fields.contains(field) {
+            lines.push(format!("{field}: {old} -> (none)"));
+        }
+    }
+    lines
 }
 
 /// The field paths whose effective value differs between two resolutions.

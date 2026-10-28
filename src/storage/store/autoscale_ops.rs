@@ -139,10 +139,13 @@ pub struct PauseRow {
 }
 
 impl PauseRow {
-    /// `all`, `job`, or `task`.
+    /// `all`, `job`, `task`, or `policy` (a standalone policy, keyed
+    /// `policy:<id>`).
     pub fn scope(&self) -> &'static str {
         if self.job_id == PAUSE_ANY {
             "all"
+        } else if crate::manager::autoscale::policy_of_target_key(&self.job_id).is_some() {
+            "policy"
         } else if self.task_group == PAUSE_ANY {
             "job"
         } else {
@@ -159,7 +162,7 @@ impl PauseRow {
     pub fn covers(&self, job_id: &str, task_group: &str, task_name: &str) -> bool {
         match self.scope() {
             "all" => true,
-            "job" => self.job_id == job_id,
+            "job" | "policy" => self.job_id == job_id,
             _ => {
                 self.job_id == job_id
                     && self.task_group == task_group
@@ -179,7 +182,7 @@ pub fn covering_pause<'a>(
     now_ms: i64,
 ) -> Option<&'a PauseRow> {
     let rank = |pause: &PauseRow| match pause.scope() {
-        "task" => 0,
+        "task" | "policy" => 0,
         "job" => 1,
         _ => 2,
     };
@@ -605,6 +608,30 @@ impl Store {
         kind: &str,
         history: NewHistory,
     ) -> R<i64> {
+        self.record_scale_history_row(
+            job_id, task_group, task_name, at_ms, from, to, source, principal, kind, false,
+            history,
+        )
+    }
+
+    /// Record a history row on its own, `applied` or not: a dry-run
+    /// "would", or a standalone policy's `scaled` and `failed` rows
+    /// (`RecordScalingAction`).
+    #[allow(clippy::too_many_arguments)]
+    pub fn record_scale_history_row(
+        &self,
+        job_id: &str,
+        task_group: &str,
+        task_name: &str,
+        at_ms: i64,
+        from: u32,
+        to: u32,
+        source: &str,
+        principal: &str,
+        kind: &str,
+        applied: bool,
+        history: NewHistory,
+    ) -> R<i64> {
         let (job_id, task_group, task_name) = (
             job_id.to_owned(),
             task_group.to_owned(),
@@ -625,7 +652,7 @@ impl Store {
                 &source,
                 &principal,
                 &kind,
-                false,
+                applied,
                 &history,
                 "",
             )?;

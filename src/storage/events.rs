@@ -1215,7 +1215,7 @@ pub mod drafts {
             ("scale.resumed", "resumed")
         };
         let draft = EventDraft::info(kind, format!("Autoscaling {verb} for {target} by {by}"));
-        let draft = if scope == "all" {
+        let draft = if scope == "all" || scope == "policy" {
             draft
         } else {
             draft.job(target.split_once('/').map_or(target, |(job, _)| job))
@@ -1257,6 +1257,45 @@ pub mod drafts {
             "message": message,
             "source": "autoscaler",
         })))
+    }
+
+    /// `scale.limited`, `scale.flapping`, `scale.check_failed` for a
+    /// standalone scaling policy (`legion scaling apply`): the same state
+    /// changes, named by the policy instead of a job.
+    pub fn scale_policy_flag(kind: &str, policy: &str, message: &str) -> Option<EventDraft> {
+        let (kind, level) = match kind {
+            "limited" => ("scale.limited", "info"),
+            "flapping" => ("scale.flapping", "warn"),
+            "check_failed" => ("scale.check_failed", "warn"),
+            _ => return None,
+        };
+        let text = format!("Scaling policy {policy}: {message}");
+        let draft = if level == "warn" {
+            EventDraft::warn(kind, text)
+        } else {
+            EventDraft::info(kind, text)
+        };
+        Some(draft.meta(json!({
+            "policy": policy,
+            "message": message,
+            "source": "autoscaler",
+        })))
+    }
+
+    /// `scale.applied` for a standalone scaling policy: the autoscaler is
+    /// about to move its target from `previous` to `count`.
+    pub fn scale_policy_applied(policy: &str, previous: u32, count: u32, reason: &str) -> EventDraft {
+        EventDraft::info(
+            "scale.applied",
+            format!("Scaling policy {policy} scaled {previous} -> {count}"),
+        )
+        .meta(json!({
+            "policy": policy,
+            "previous": previous,
+            "count": count,
+            "source": "autoscaler",
+            "reason": reason,
+        }))
     }
 
     /// `scale.reset` — an override was dropped: explicit
@@ -2772,6 +2811,16 @@ impl EventRecorder<'_> {
         if let Some(draft) = drafts::scale_flag(kind, job_id, task_group, task_name, message) {
             self.emit(draft);
         }
+    }
+
+    pub fn scale_policy_flag(self, kind: &str, policy: &str, message: &str) {
+        if let Some(draft) = drafts::scale_policy_flag(kind, policy, message) {
+            self.emit(draft);
+        }
+    }
+
+    pub fn scale_policy_applied(self, policy: &str, previous: u32, count: u32, reason: &str) {
+        self.emit(drafts::scale_policy_applied(policy, previous, count, reason));
     }
 
     pub fn rollout_event(
