@@ -127,11 +127,7 @@ pub fn parse(input: &str) -> Result<Element, String> {
                 .pop()
                 .ok_or_else(|| format!("a closing </{name}> with nothing open"))?;
             if element.name != local(name.trim()) {
-                return Err(format!(
-                    "</{}> closes <{}>",
-                    name.trim(),
-                    element.name
-                ));
+                return Err(format!("</{}> closes <{}>", name.trim(), element.name));
             }
             match stack.last_mut() {
                 Some(parent) => parent.children.push(element),

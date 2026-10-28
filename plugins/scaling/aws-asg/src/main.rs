@@ -99,7 +99,8 @@ impl AwsAsg {
 
 impl Plugin for AwsAsg {
     fn initialize(&mut self, request: Initialize) -> Result<PluginInfo, Error> {
-        let settings = aws::Settings::from_config(&request.config).map_err(Error::invalid_params)?;
+        let settings =
+            aws::Settings::from_config(&request.config).map_err(Error::invalid_params)?;
         self.aws = Some(aws::Aws::new(settings).map_err(Error::new)?);
         let mut info = PluginInfo::new("aws-asg", env!("CARGO_PKG_VERSION"), &[Kind::Target])
             .with_schema(policy_config_schema());
@@ -109,7 +110,10 @@ impl Plugin for AwsAsg {
 
     fn status(&mut self, request: TargetRequest) -> Result<TargetStatus, Error> {
         let config = PolicyConfig::from(&request.config)?;
-        let group = self.aws()?.describe_group(&config.asg).map_err(Error::new)?;
+        let group = self
+            .aws()?
+            .describe_group(&config.asg)
+            .map_err(Error::new)?;
         Ok(TargetStatus {
             count: group.desired,
             ready: Some(group.instances.iter().filter(|i| i.ready()).count() as u32),
@@ -227,14 +231,20 @@ mod tests {
                 reader.read_exact(&mut body).unwrap();
                 let body = String::from_utf8(body).unwrap();
                 let (status, reply) = if target == "AmazonSSM.PutParameter" {
-                    ("200 OK", "{\"Version\":2,\"Tier\":\"Standard\"}".to_string())
+                    (
+                        "200 OK",
+                        "{\"Version\":2,\"Tier\":\"Standard\"}".to_string(),
+                    )
                 } else if body.contains("Action=DescribeAutoScalingGroups") {
                     (
                         "200 OK",
                         include_str!("../fixtures/describe-auto-scaling-groups.xml").to_string(),
                     )
                 } else if body.contains("InstanceId=i-0dead") {
-                    ("400 Bad Request", include_str!("../fixtures/error.xml").to_string())
+                    (
+                        "400 Bad Request",
+                        include_str!("../fixtures/error.xml").to_string(),
+                    )
                 } else {
                     (
                         "200 OK",
@@ -266,7 +276,10 @@ mod tests {
     #[test]
     fn status_scale_and_terminate_against_a_mock_aws_test() {
         std::env::set_var("AWS_ACCESS_KEY_ID", "AKIDEXAMPLE");
-        std::env::set_var("AWS_SECRET_ACCESS_KEY", "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY");
+        std::env::set_var(
+            "AWS_SECRET_ACCESS_KEY",
+            "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY",
+        );
         let (endpoint, seen) = mock_aws(5);
         let mut plugin = AwsAsg::default();
         let init = call(
@@ -280,11 +293,20 @@ mod tests {
         assert_eq!(init["result"]["capabilities"]["nodes"], true, "{init}");
         assert_eq!(init["result"]["kinds"], json!(["target"]));
 
-        let config = json!({ "asg": "legion-workers", "joinTokenParameter": "/legion/workers/join" });
-        let status = call(&mut plugin, 2, "target/status", json!({ "policy": "workers", "config": config }));
+        let config =
+            json!({ "asg": "legion-workers", "joinTokenParameter": "/legion/workers/join" });
+        let status = call(
+            &mut plugin,
+            2,
+            "target/status",
+            json!({ "policy": "workers", "config": config }),
+        );
         assert_eq!(status["result"]["count"], 3, "{status}");
         assert_eq!(status["result"]["ready"], 1);
-        assert_eq!(status["result"]["members"][0], json!({ "id": "i-0abc1234def567890", "state": "running" }));
+        assert_eq!(
+            status["result"]["members"][0],
+            json!({ "id": "i-0abc1234def567890", "state": "running" })
+        );
         assert_eq!(status["result"]["members"][2]["state"], "terminating");
 
         let scale = call(
@@ -304,13 +326,20 @@ mod tests {
         );
         assert_eq!(terminate["result"], json!({}), "{terminate}");
         // No ids: nothing to ask AWS.
-        let nothing = call(&mut plugin, 5, "target/terminate", json!({ "config": config, "ids": [] }));
+        let nothing = call(
+            &mut plugin,
+            5,
+            "target/terminate",
+            json!({ "config": config, "ids": [] }),
+        );
         assert_eq!(nothing["result"], json!({}));
 
         let seen = seen.lock().unwrap();
         let requests = &seen.requests;
         assert_eq!(requests.len(), 5);
-        assert!(requests[0].1.contains("AutoScalingGroupNames.member.1=legion-workers"));
+        assert!(requests[0]
+            .1
+            .contains("AutoScalingGroupNames.member.1=legion-workers"));
         // The token went to SSM, before the resize, as a SecureString.
         assert_eq!(requests[1].0, "AmazonSSM.PutParameter");
         let put: Value = serde_json::from_str(&requests[1].1).unwrap();
@@ -320,12 +349,19 @@ mod tests {
         assert!(requests[2].1.contains("DesiredCapacity=5"));
         assert!(!requests[2].1.contains("legion-join-secret"));
         assert!(requests[3].1.contains("InstanceId=i-0abc1234def567890"));
-        assert!(requests[3].1.contains("ShouldDecrementDesiredCapacity=true"));
+        assert!(requests[3]
+            .1
+            .contains("ShouldDecrementDesiredCapacity=true"));
         assert!(requests[4].1.contains("InstanceId=i-0dead"));
         for (_, _, authorization) in requests.iter() {
-            assert!(authorization.starts_with("AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/"), "{authorization}");
+            assert!(
+                authorization.starts_with("AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/"),
+                "{authorization}"
+            );
         }
-        assert!(requests[0].2.contains("/us-east-1/autoscaling/aws4_request"));
+        assert!(requests[0]
+            .2
+            .contains("/us-east-1/autoscaling/aws4_request"));
         assert!(requests[1].2.contains("/us-east-1/ssm/aws4_request"));
     }
 
@@ -334,7 +370,12 @@ mod tests {
         let mut plugin = AwsAsg::default();
         let status = call(&mut plugin, 1, "target/status", json!({ "config": {} }));
         assert_eq!(status["error"]["code"], -32602);
-        let uninitialized = call(&mut plugin, 2, "target/status", json!({ "config": { "asg": "x" } }));
+        let uninitialized = call(
+            &mut plugin,
+            2,
+            "target/status",
+            json!({ "config": { "asg": "x" } }),
+        );
         assert!(uninitialized["error"]["message"]
             .as_str()
             .unwrap()

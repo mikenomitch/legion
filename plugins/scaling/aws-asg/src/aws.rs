@@ -52,7 +52,9 @@ pub struct Settings {
 }
 
 fn env(name: &str) -> Option<String> {
-    std::env::var(name).ok().filter(|value| !value.trim().is_empty())
+    std::env::var(name)
+        .ok()
+        .filter(|value| !value.trim().is_empty())
 }
 
 impl Settings {
@@ -64,7 +66,9 @@ impl Settings {
                 Some(Value::String(value)) if !value.trim().is_empty() => {
                     Ok(Some(value.trim().to_string()))
                 }
-                Some(other) => Err(format!("config.{key} must be a non-empty string, got {other}")),
+                Some(other) => Err(format!(
+                    "config.{key} must be a non-empty string, got {other}"
+                )),
             }
         };
         let region = text("region")?
@@ -75,16 +79,14 @@ impl Settings {
             (Some(file), Some(role)) => Some((PathBuf::from(expand_env(&file)?), role)),
             (None, None) => None,
             _ => {
-                return Err(
-                    "config.webIdentityTokenFile and config.roleArn go together".to_string()
-                )
+                return Err("config.webIdentityTokenFile and config.roleArn go together".to_string())
             }
         };
         let imds_endpoint = match config.get("imds") {
             Some(Value::Bool(false)) => None,
-            None | Some(Value::Null) | Some(Value::Bool(true)) => Some(
-                text("imdsEndpoint")?.unwrap_or_else(|| "http://169.254.169.254".to_string()),
-            ),
+            None | Some(Value::Null) | Some(Value::Bool(true)) => {
+                Some(text("imdsEndpoint")?.unwrap_or_else(|| "http://169.254.169.254".to_string()))
+            }
             Some(other) => return Err(format!("config.imds must be a boolean, got {other}")),
         };
         Ok(Self {
@@ -197,7 +199,9 @@ pub fn parse_group(doc: &Element, name: &str) -> Result<Group, String> {
     let group = groups
         .children_named("member")
         .find(|member| member.text_of("AutoScalingGroupName") == Some(name))
-        .ok_or_else(|| format!("no Auto Scaling group named {name:?} in this account and region"))?;
+        .ok_or_else(|| {
+            format!("no Auto Scaling group named {name:?} in this account and region")
+        })?;
     let instances = group
         .child("Instances")
         .map(|instances| {
@@ -205,8 +209,14 @@ pub fn parse_group(doc: &Element, name: &str) -> Result<Group, String> {
                 .children_named("member")
                 .map(|member| Instance {
                     id: member.text_of("InstanceId").unwrap_or_default().to_string(),
-                    lifecycle: member.text_of("LifecycleState").unwrap_or_default().to_string(),
-                    health: member.text_of("HealthStatus").unwrap_or_default().to_string(),
+                    lifecycle: member
+                        .text_of("LifecycleState")
+                        .unwrap_or_default()
+                        .to_string(),
+                    health: member
+                        .text_of("HealthStatus")
+                        .unwrap_or_default()
+                        .to_string(),
                 })
                 .filter(|instance| !instance.id.is_empty())
                 .collect()
@@ -249,7 +259,9 @@ pub fn parse_sts_credentials(doc: &Element) -> Result<(Credentials, Option<i64>)
             secret_access_key: field("SecretAccessKey")?,
             session_token: Some(field("SessionToken")?),
         },
-        credentials.text_of("Expiration").and_then(sigv4::parse_iso8601),
+        credentials
+            .text_of("Expiration")
+            .and_then(sigv4::parse_iso8601),
     ))
 }
 
@@ -292,11 +304,6 @@ impl Aws {
         })
     }
 
-    /// The settings.
-    pub fn settings(&self) -> &Settings {
-        &self.settings
-    }
-
     /// Current credentials, from the cache or the chain.
     pub fn credentials(&mut self) -> Result<Credentials, String> {
         if let Some((credentials, expires)) = &self.cached {
@@ -323,15 +330,18 @@ impl Aws {
                 None,
             ));
         }
-        if let (Some(file), Some(role)) = (env("AWS_WEB_IDENTITY_TOKEN_FILE"), env("AWS_ROLE_ARN")) {
+        if let (Some(file), Some(role)) = (env("AWS_WEB_IDENTITY_TOKEN_FILE"), env("AWS_ROLE_ARN"))
+        {
             return self.assume_role_with_web_identity(&PathBuf::from(file), &role);
         }
         if let Some(imds) = &self.settings.imds_endpoint {
             return self.instance_profile(imds);
         }
-        Err("no AWS credentials: set config.webIdentityTokenFile and config.roleArn, \
+        Err(
+            "no AWS credentials: set config.webIdentityTokenFile and config.roleArn, \
              AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY, or run on an instance with a profile"
-            .to_string())
+                .to_string(),
+        )
     }
 
     /// STS `AssumeRoleWithWebIdentity` with the token in `file` (read
@@ -347,13 +357,19 @@ impl Aws {
             ("Action".into(), "AssumeRoleWithWebIdentity".into()),
             ("Version".into(), STS_VERSION.into()),
             ("RoleArn".into(), role.to_string()),
-            ("RoleSessionName".into(), self.settings.role_session_name.clone()),
+            (
+                "RoleSessionName".into(),
+                self.settings.role_session_name.clone(),
+            ),
             ("WebIdentityToken".into(), token.trim().to_string()),
         ]);
         let response = self
             .http
             .post(&self.settings.sts_endpoint)
-            .header("content-type", "application/x-www-form-urlencoded; charset=utf-8")
+            .header(
+                "content-type",
+                "application/x-www-form-urlencoded; charset=utf-8",
+            )
             .body(body)
             .send()
             .map_err(|err| format!("STS AssumeRoleWithWebIdentity: {err}"))?;
@@ -387,7 +403,9 @@ impl Aws {
             .map_err(|err| fail(err.to_string()))?;
         let get = |path: &str| {
             self.http
-                .get(format!("{imds}/latest/meta-data/iam/security-credentials/{path}"))
+                .get(format!(
+                    "{imds}/latest/meta-data/iam/security-credentials/{path}"
+                ))
                 .header("x-aws-ec2-metadata-token", token.trim())
                 .timeout(Duration::from_secs(2))
                 .send()
@@ -434,8 +452,8 @@ impl Aws {
         body: String,
     ) -> Result<(reqwest::StatusCode, String), String> {
         let credentials = self.credentials()?;
-        let url = reqwest::Url::parse(endpoint)
-            .map_err(|err| format!("endpoint {endpoint:?}: {err}"))?;
+        let url =
+            reqwest::Url::parse(endpoint).map_err(|err| format!("endpoint {endpoint:?}: {err}"))?;
         let host = host_of(&url)?;
         let signed = sigv4::sign(
             &credentials,
@@ -467,7 +485,11 @@ impl Aws {
             ("Action".to_string(), action.to_string()),
             ("Version".to_string(), AUTOSCALING_VERSION.to_string()),
         ];
-        pairs.extend(params.iter().map(|(key, value)| (key.to_string(), value.clone())));
+        pairs.extend(
+            params
+                .iter()
+                .map(|(key, value)| (key.to_string(), value.clone())),
+        );
         let endpoint = self.settings.autoscaling_endpoint.clone();
         let (status, text) = self.signed_post(
             &endpoint,
@@ -497,7 +519,12 @@ impl Aws {
     }
 
     /// `SetDesiredCapacity`.
-    pub fn set_desired(&mut self, name: &str, desired: u32, honor_cooldown: bool) -> Result<(), String> {
+    pub fn set_desired(
+        &mut self,
+        name: &str,
+        desired: u32,
+        honor_cooldown: bool,
+    ) -> Result<(), String> {
         self.autoscaling(
             "SetDesiredCapacity",
             &[
@@ -539,8 +566,14 @@ impl Aws {
             &endpoint,
             "ssm",
             &[
-                ("content-type".to_string(), "application/x-amz-json-1.1".to_string()),
-                ("x-amz-target".to_string(), "AmazonSSM.PutParameter".to_string()),
+                (
+                    "content-type".to_string(),
+                    "application/x-amz-json-1.1".to_string(),
+                ),
+                (
+                    "x-amz-target".to_string(),
+                    "AmazonSSM.PutParameter".to_string(),
+                ),
             ],
             body,
         )?;
@@ -617,7 +650,10 @@ mod tests {
         let doc = xml::parse(STS).unwrap();
         let (credentials, expires) = parse_sts_credentials(&doc).unwrap();
         assert_eq!(credentials.access_key_id, "ASIAEXAMPLEKEYID");
-        assert_eq!(credentials.session_token.as_deref(), Some("FwoGZXIvYXdzEXAMPLE"));
+        assert_eq!(
+            credentials.session_token.as_deref(),
+            Some("FwoGZXIvYXdzEXAMPLE")
+        );
         assert_eq!(expires, sigv4::parse_iso8601("2026-10-28T13:00:00Z"));
     }
 
@@ -628,7 +664,10 @@ mod tests {
             settings.autoscaling_endpoint,
             "https://autoscaling.eu-west-1.amazonaws.com"
         );
-        assert_eq!(settings.imds_endpoint.as_deref(), Some("http://169.254.169.254"));
+        assert_eq!(
+            settings.imds_endpoint.as_deref(),
+            Some("http://169.254.169.254")
+        );
         let federated = Settings::from_config(&json!({
             "region": "us-east-1", "imds": false,
             "webIdentityTokenFile": "/secrets/aws/token",
@@ -651,10 +690,7 @@ mod tests {
             expand_env("$AWS_ASG_TEST_TASK_DIR/secrets/aws.token").unwrap(),
             "/task/secrets/aws.token"
         );
-        assert_eq!(
-            expand_env("${AWS_ASG_TEST_TASK_DIR}/t").unwrap(),
-            "/task/t"
-        );
+        assert_eq!(expand_env("${AWS_ASG_TEST_TASK_DIR}/t").unwrap(), "/task/t");
         assert_eq!(expand_env("/abs/t").unwrap(), "/abs/t");
         assert!(expand_env("$AWS_ASG_TEST_UNSET_VAR/t").is_err());
         assert!(Settings::from_config(&json!({ "region": 5 })).is_err());

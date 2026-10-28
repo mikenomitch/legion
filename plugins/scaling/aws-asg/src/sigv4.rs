@@ -116,7 +116,11 @@ pub struct Request<'a> {
 }
 
 /// The canonical request (step 1 of SigV4).
-pub fn canonical_request(request: &Request<'_>, amz_date: &str, session_token: Option<&str>) -> (String, String) {
+pub fn canonical_request(
+    request: &Request<'_>,
+    amz_date: &str,
+    session_token: Option<&str>,
+) -> (String, String) {
     let mut query: Vec<(String, String)> = request
         .query
         .iter()
@@ -305,7 +309,11 @@ mod tests {
                 payload: b"",
             },
         );
-        let authorization = &headers.iter().find(|(name, _)| name == "authorization").unwrap().1;
+        let authorization = &headers
+            .iter()
+            .find(|(name, _)| name == "authorization")
+            .unwrap()
+            .1;
         assert_eq!(
             authorization,
             "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20150830/us-east-1/service/aws4_request, \
@@ -341,9 +349,9 @@ mod tests {
             "f536975d06c0309214f805bb90ccff089219ecd68b2577efef23edd43b7e1a59"
         );
         let headers = sign(&example(), "us-east-1", "iam", "20150830T123600Z", &request);
-        assert!(headers[1]
-            .1
-            .ends_with("Signature=5d672d79c15b13162d9279b0855cfba6789a8edb4c82c400e06b5924a6f2b5d7"));
+        assert!(headers[1].1.ends_with(
+            "Signature=5d672d79c15b13162d9279b0855cfba6789a8edb4c82c400e06b5924a6f2b5d7"
+        ));
     }
 
     /// Temporary credentials sign their session token too.
@@ -365,8 +373,16 @@ mod tests {
                 payload: b"Action=DescribeAutoScalingGroups",
             },
         );
-        assert_eq!(headers[1], ("x-amz-security-token".to_string(), "FQoGZXIvYXdz".to_string()));
-        assert!(headers[2].1.contains("SignedHeaders=host;x-amz-date;x-amz-security-token"));
+        assert_eq!(
+            headers[1],
+            (
+                "x-amz-security-token".to_string(),
+                "FQoGZXIvYXdz".to_string()
+            )
+        );
+        assert!(headers[2]
+            .1
+            .contains("SignedHeaders=host;x-amz-date;x-amz-security-token"));
         assert!(!format!("{credentials:?}").contains("wJalr"));
         assert!(!format!("{credentials:?}").contains("FQoG"));
     }
@@ -380,7 +396,10 @@ mod tests {
         );
         assert_eq!(amz_date(1_440_938_160), "20150830T123600Z");
         assert_eq!(parse_iso8601("2015-08-30T12:36:00Z"), Some(1_440_938_160));
-        assert_eq!(parse_iso8601("2015-08-30T12:36:00.000Z"), Some(1_440_938_160));
+        assert_eq!(
+            parse_iso8601("2015-08-30T12:36:00.000Z"),
+            Some(1_440_938_160)
+        );
         assert_eq!(parse_iso8601("2024-02-29T00:00:00Z"), Some(1_709_164_800));
         assert_eq!(amz_date(1_709_164_800), "20240229T000000Z");
         assert_eq!(parse_iso8601("yesterday"), None);
