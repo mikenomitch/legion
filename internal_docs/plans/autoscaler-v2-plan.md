@@ -298,14 +298,25 @@ config, and reference it from policies by name.
   shape.
 - **A new raft lane.** Policy objects and scale history ride Control, where
   `task_scale` already lives (old calls entry 5).
-- **WASM plugins.** There is no WASM runtime in the tree (no `wasmtime`,
-  `wasmer`, or `wasmi` in `Cargo.lock`). The out-of-process protocol covers
-  every plugin kind now. A pure-function strategy ABI can follow once a
-  registry needs to distribute untrusted logic.
+- **WASM strategies, for now.** Legion now embeds `wasmi` for network
+  plugins, through a layer meant to be shared by other embedders
+  (`src/wasm`, `docs/network-plugins.md`). That layer provides fuel and
+  memory caps, modules fetched by URL and `sha256:`, and WASI with no
+  sockets or filesystem.
+  - A strategy is a pure function, so it could run there later. That is
+    the safest way to let tenants, or a registry, supply their own count
+    logic, and nothing blocks it now.
+  - Sources and targets need network I/O, which that layer deliberately
+    doesn't provide, so the JSON-RPC protocol (§6.8) stays the one
+    mechanism that covers all three kinds.
 
 ## 5. Background: what exists today
 
-Code recon, verified against the tree on 2026-10-19.
+Code recon, verified against the tree on 2026-10-19, at commit `0f5672a`.
+Line numbers refer to that commit. `main` has moved since: proto citations
+are now about 40 lines lower, and some `src/` ones a few dozen. The symbols
+are named so they can be found again. The facts below were re-checked after
+merging `main` on 2026-10-28.
 
 **Phase 0 (shipped).**
 - RPCs: `ScaleTask` and `GetJobScaleStatus` (`proto/legion.proto:92-107`,
@@ -414,7 +425,10 @@ entry 1).
 - Three exec-JSON seams exist: volumes, the keyring root-key provider, and
   the cluster-CA provider. The latter two go through
   `util::run_json_command` (`src/util.rs:465`).
-- No gRPC or WASM plugin ABI exists.
+- There is no gRPC plugin ABI. WASM exists for one kind: network plugins on
+  the proxy-wasm ABI, run by `wasmi` through a shared embedding layer
+  (`src/wasm`, `docs/network-plugins.md`), which a future `wasm` task
+  runtime is meant to reuse.
 - Legion already speaks JSON-RPC 2.0 over stdio for `legion mcp serve`.
 
 **Events.** Best-effort, capped at 10,000 rows, "not an audit log"

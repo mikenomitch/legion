@@ -220,8 +220,11 @@ the same traits in-process.
   against Prometheus.
 - **(b)** gRPC needs codegen in the plugin's language for no benefit at
   these call rates.
-- **(c)** WASM has no runtime in the tree, and can't do the network I/O that
-  sources and targets exist for.
+- **(c)** Legion now embeds WASM (`wasmi`, `src/wasm`, for network plugins),
+  but that layer deliberately offers no sockets. It can't do the network
+  I/O that sources and targets exist for, so it could only ever cover
+  strategies. One protocol for all three kinds beats two half-measures. WASM
+  strategies remain a good later addition on that layer (plan §4).
 
 JSON-RPC over stdio is the smallest thing any language can implement in an
 afternoon (persona: integration author). The HTTP transport makes

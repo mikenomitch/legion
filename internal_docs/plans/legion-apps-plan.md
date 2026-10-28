@@ -305,6 +305,10 @@ natively by the SPA from JSON the app returns.
 
 ## 5. Background: what exists today
 
+Line numbers refer to commit `0f5672a` (2026-10-19), where the recon was
+done. `main` has moved since, so some have drifted, but the symbols are
+named and the facts were re-checked after merging `main` on 2026-10-28.
+
 - **Manager as worker**: `--run-worker` mints a 15-minute join token and runs
   `run_worker_local` with `worker_type: "default"` and `in_process: true`
   (`src/manager/daemon.rs:496-530,783-802`). `in_process` only changes
