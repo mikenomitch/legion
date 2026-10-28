@@ -43,12 +43,18 @@ mod gang_losses;
 mod gang_members;
 // Scaling inputs: the reads behind the rollup loop and GetScalingInputs.
 mod scaling_ops;
+// GetCapacityDemand's pending work, and ForgetNode (autoscaler v2 plan
+// §6.11).
+mod demand_ops;
+mod forget_ops;
 use crate::storage::persistence::{
     build_persistence_driver, PersistenceDriver, PersistenceRole, PersistenceStatus,
     RaftHistoryEvent, RaftStatus,
 };
 use crate::storage::raft::{capture, ReplicatedOp, ReplicationHandle};
 use crate::storage::Lane;
+pub use demand_ops::{PendingTaskRow, PendingWork};
+pub use forget_ops::ForgetOutcome;
 pub use fork_ops::{alias_target_problem, AliasOutcome, ForkCreated};
 pub use gang_losses::GangLoss;
 pub use gang_members::GangMember;

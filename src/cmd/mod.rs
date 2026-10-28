@@ -30,6 +30,8 @@ pub mod oidc;
 pub mod output;
 pub mod raft;
 pub mod sandbox;
+pub mod scaling;
+pub mod scaling_demand;
 pub mod scheduler;
 pub mod service;
 pub mod session;
@@ -64,6 +66,7 @@ fn base_cli() -> Command {
         .subcommand(template::config())
         .subcommand(instance::config())
         .subcommand(node::config())
+        .subcommand(scaling::config())
         .subcommand(start::config())
         .subcommand(join_token::config())
         .subcommand(boot_ticket::config())

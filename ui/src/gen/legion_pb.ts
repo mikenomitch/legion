@@ -706,6 +706,23 @@ export class WorkerRegisterRequest extends Message<WorkerRegisterRequest> {
    */
   capabilities: string[] = [];
 
+  /**
+   * Per-host node attributes from `legion join --attr k=v` (and `legion
+   * start worker --attr`), such as the machine's provider id:
+   * `legion.provider-id = "i-0abc"`. Merged into the node's attributes over
+   * its worker type's, and under the join token's: token, then `--attr`,
+   * then worker type. Keys under the reserved `legion.` prefix are refused
+   * with InvalidArgument, except the per-host ones (`legion.provider-id`),
+   * and so are keys Legion reads as node structure (`namespaces`,
+   * `resources`, ...). At most 64 entries; keys up to 128 bytes, values up
+   * to 1024. See docs/auth-and-acls.md, "Node attributes from the join".
+   *
+   * Default: empty.
+   *
+   * @generated from field: map<string, string> join_attributes = 10;
+   */
+  joinAttributes: { [key: string]: string } = {};
+
   constructor(data?: PartialMessage<WorkerRegisterRequest>) {
     super();
     proto3.util.initPartial(data, this);
@@ -723,6 +740,7 @@ export class WorkerRegisterRequest extends Message<WorkerRegisterRequest> {
     { no: 7, name: "build_version", kind: "scalar", T: 9 /* ScalarType.STRING */ },
     { no: 8, name: "protocol_version", kind: "scalar", T: 13 /* ScalarType.UINT32 */ },
     { no: 9, name: "capabilities", kind: "scalar", T: 9 /* ScalarType.STRING */, repeated: true },
+    { no: 10, name: "join_attributes", kind: "map", K: 9 /* ScalarType.STRING */, V: {kind: "scalar", T: 9 /* ScalarType.STRING */} },
   ]);
 
   static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): WorkerRegisterRequest {
@@ -4913,6 +4931,769 @@ export class GetScalingInputsReply extends Message<GetScalingInputsReply> {
 
   static equals(a: GetScalingInputsReply | PlainMessage<GetScalingInputsReply> | undefined, b: GetScalingInputsReply | PlainMessage<GetScalingInputsReply> | undefined): boolean {
     return proto3.util.equals(GetScalingInputsReply, a, b);
+  }
+}
+
+/**
+ * Request payload for GetCapacityDemand.
+ *
+ * @generated from message legion.GetCapacityDemandRequest
+ */
+export class GetCapacityDemandRequest extends Message<GetCapacityDemandRequest> {
+  /**
+   * The node-group templates to size, each answered on its own. At least
+   * one, at most 64, with distinct names.
+   *
+   * @generated from field: repeated legion.NodeGroupTemplate templates = 1;
+   */
+  templates: NodeGroupTemplate[] = [];
+
+  constructor(data?: PartialMessage<GetCapacityDemandRequest>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.GetCapacityDemandRequest";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "templates", kind: "message", T: NodeGroupTemplate, repeated: true },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): GetCapacityDemandRequest {
+    return new GetCapacityDemandRequest().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): GetCapacityDemandRequest {
+    return new GetCapacityDemandRequest().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): GetCapacityDemandRequest {
+    return new GetCapacityDemandRequest().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: GetCapacityDemandRequest | PlainMessage<GetCapacityDemandRequest> | undefined, b: GetCapacityDemandRequest | PlainMessage<GetCapacityDemandRequest> | undefined): boolean {
+    return proto3.util.equals(GetCapacityDemandRequest, a, b);
+  }
+}
+
+/**
+ * One node group's template: what a new member would look like.
+ *
+ * The synthetic node is built in this order, each step overriding the last:
+ * 1. `like_node` (a copy of that member: its pool, attributes, fingerprint
+ *    and capacity), or else what a node of `worker_type` registers as: the
+ *    type's pool, `namespaces`, attributes, custom `resources`,
+ *    `reservedResources`, `maxAllocations` and oversubscription;
+ * 2. `pool`, when set;
+ * 3. `shape`: `cpu`, `memory` and `cores` become the node's capacity (with
+ *    no member to copy, the shape is the whole machine; on a copy it can
+ *    only lower it), and its attributes and resources are added;
+ * 4. `legion.nodegroup = <name>`, which every member of a node group
+ *    carries (its join token stamps it), so constraints on it are honored.
+ *
+ * @generated from message legion.NodeGroupTemplate
+ */
+export class NodeGroupTemplate extends Message<NodeGroupTemplate> {
+  /**
+   * The node group's name: echoed in the reply, and the value of the
+   * template node's `legion.nodegroup` attribute. Required.
+   *
+   * @generated from field: string name = 1;
+   */
+  name = "";
+
+  /**
+   * The worker type members join as. Default: `default`. A type that does
+   * not exist contributes nothing (the shape alone describes the node).
+   *
+   * @generated from field: string worker_type = 2;
+   */
+  workerType = "";
+
+  /**
+   * The pool members join. Default: the worker type's pool, else
+   * `default`.
+   *
+   * @generated from field: optional string pool = 3;
+   */
+  pool?: string;
+
+  /**
+   * A member's size and attributes. Optional when `like_node` is set.
+   *
+   * @generated from field: legion.NodeGroupShape shape = 4;
+   */
+  shape?: NodeGroupShape;
+
+  /**
+   * An existing node to copy: its observed capacity and attributes are a
+   * better template than a declared shape once one member has joined.
+   *
+   * @generated from field: optional string like_node = 5;
+   */
+  likeNode?: string;
+
+  /**
+   * Members already asked for that have not joined yet. They absorb pending
+   * work before any template is sized, so a group that was just asked to
+   * grow is not asked again for the same replicas. Default: 0.
+   *
+   * @generated from field: uint32 upcoming = 6;
+   */
+  upcoming = 0;
+
+  constructor(data?: PartialMessage<NodeGroupTemplate>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.NodeGroupTemplate";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "name", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 2, name: "worker_type", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 3, name: "pool", kind: "scalar", T: 9 /* ScalarType.STRING */, opt: true },
+    { no: 4, name: "shape", kind: "message", T: NodeGroupShape },
+    { no: 5, name: "like_node", kind: "scalar", T: 9 /* ScalarType.STRING */, opt: true },
+    { no: 6, name: "upcoming", kind: "scalar", T: 13 /* ScalarType.UINT32 */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): NodeGroupTemplate {
+    return new NodeGroupTemplate().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): NodeGroupTemplate {
+    return new NodeGroupTemplate().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): NodeGroupTemplate {
+    return new NodeGroupTemplate().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: NodeGroupTemplate | PlainMessage<NodeGroupTemplate> | undefined, b: NodeGroupTemplate | PlainMessage<NodeGroupTemplate> | undefined): boolean {
+    return proto3.util.equals(NodeGroupTemplate, a, b);
+  }
+}
+
+/**
+ * A member's size and attributes, as `GetCapacityDemand` builds its node.
+ *
+ * @generated from message legion.NodeGroupShape
+ */
+export class NodeGroupShape extends Message<NodeGroupShape> {
+  /**
+   * CPU in MHz (all cores together), the unit task `cpu` reservations use.
+   * Unset: unbounded.
+   *
+   * @generated from field: optional uint64 cpu = 1;
+   */
+  cpu?: bigint;
+
+  /**
+   * Memory in MiB. Unset: unbounded.
+   *
+   * @generated from field: optional uint64 memory = 2;
+   */
+  memory?: bigint;
+
+  /**
+   * Whole cores, for tasks that reserve `cores`. Unset: unbounded.
+   *
+   * @generated from field: optional uint32 cores = 3;
+   */
+  cores?: number;
+
+  /**
+   * Node attributes every member has (`arch = "amd64"`), seen by
+   * constraints and `distinct`. `legion.nodegroup` is set from the
+   * template's name and may not be given here.
+   *
+   * @generated from field: map<string, string> attributes = 4;
+   */
+  attributes: { [key: string]: string } = {};
+
+  /**
+   * Custom resources a member offers, as a JSON object in a worker type's
+   * `resources` form: `{"gpu": 2}` or `{"gpu": ["g0", "g1"]}`. Default:
+   * empty.
+   *
+   * @generated from field: string resources_json = 5;
+   */
+  resourcesJson = "";
+
+  /**
+   * The most allocations one member takes. Unset: the worker type's, else
+   * unbounded.
+   *
+   * @generated from field: optional uint32 max_allocations = 6;
+   */
+  maxAllocations?: number;
+
+  constructor(data?: PartialMessage<NodeGroupShape>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.NodeGroupShape";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "cpu", kind: "scalar", T: 4 /* ScalarType.UINT64 */, opt: true },
+    { no: 2, name: "memory", kind: "scalar", T: 4 /* ScalarType.UINT64 */, opt: true },
+    { no: 3, name: "cores", kind: "scalar", T: 13 /* ScalarType.UINT32 */, opt: true },
+    { no: 4, name: "attributes", kind: "map", K: 9 /* ScalarType.STRING */, V: {kind: "scalar", T: 9 /* ScalarType.STRING */} },
+    { no: 5, name: "resources_json", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 6, name: "max_allocations", kind: "scalar", T: 13 /* ScalarType.UINT32 */, opt: true },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): NodeGroupShape {
+    return new NodeGroupShape().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): NodeGroupShape {
+    return new NodeGroupShape().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): NodeGroupShape {
+    return new NodeGroupShape().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: NodeGroupShape | PlainMessage<NodeGroupShape> | undefined, b: NodeGroupShape | PlainMessage<NodeGroupShape> | undefined): boolean {
+    return proto3.util.equals(NodeGroupShape, a, b);
+  }
+}
+
+/**
+ * Reply payload for GetCapacityDemand.
+ *
+ * @generated from message legion.GetCapacityDemandReply
+ */
+export class GetCapacityDemandReply extends Message<GetCapacityDemandReply> {
+  /**
+   * One entry per template, in request order.
+   *
+   * @generated from field: repeated legion.NodeGroupDemand groups = 1;
+   */
+  groups: NodeGroupDemand[] = [];
+
+  /**
+   * The pending work considered, one entry per job task group that is short
+   * (a task group's tasks place together, so they are one unit). Ordered by
+   * job, then group. `NodeGroupDemand.refusals` and `unfittable` point here
+   * by index.
+   *
+   * @generated from field: repeated legion.PendingCapacity pending = 2;
+   */
+  pending: PendingCapacity[] = [];
+
+  /**
+   * Pending replicas no single template can host, with every template's
+   * failing rule.
+   *
+   * @generated from field: repeated legion.UnfittableCapacity unfittable = 3;
+   */
+  unfittable: UnfittableCapacity[] = [];
+
+  /**
+   * Jobs short of their count whose eval is still pending or in flight:
+   * the scheduler has not tried the capacity that exists, so they are not
+   * demand yet. Names of jobs the caller cannot read are left out (see
+   * `awaiting_scheduler_redacted`).
+   *
+   * @generated from field: repeated string awaiting_scheduler = 4;
+   */
+  awaitingScheduler: string[] = [];
+
+  /**
+   * How many `awaiting_scheduler` jobs were left out because the caller
+   * lacks `job:read` on them.
+   *
+   * @generated from field: uint32 awaiting_scheduler_redacted = 5;
+   */
+  awaitingSchedulerRedacted = 0;
+
+  /**
+   * Set when the pending work was larger than one call simulates (20,000
+   * replicas): the rest is listed in `pending` but was not packed, so node
+   * counts are a floor.
+   *
+   * @generated from field: bool truncated = 6;
+   */
+  truncated = false;
+
+  /**
+   * RFC3339 time the answer was computed.
+   *
+   * @generated from field: string computed_at = 7;
+   */
+  computedAt = "";
+
+  constructor(data?: PartialMessage<GetCapacityDemandReply>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.GetCapacityDemandReply";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "groups", kind: "message", T: NodeGroupDemand, repeated: true },
+    { no: 2, name: "pending", kind: "message", T: PendingCapacity, repeated: true },
+    { no: 3, name: "unfittable", kind: "message", T: UnfittableCapacity, repeated: true },
+    { no: 4, name: "awaiting_scheduler", kind: "scalar", T: 9 /* ScalarType.STRING */, repeated: true },
+    { no: 5, name: "awaiting_scheduler_redacted", kind: "scalar", T: 13 /* ScalarType.UINT32 */ },
+    { no: 6, name: "truncated", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
+    { no: 7, name: "computed_at", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): GetCapacityDemandReply {
+    return new GetCapacityDemandReply().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): GetCapacityDemandReply {
+    return new GetCapacityDemandReply().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): GetCapacityDemandReply {
+    return new GetCapacityDemandReply().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: GetCapacityDemandReply | PlainMessage<GetCapacityDemandReply> | undefined, b: GetCapacityDemandReply | PlainMessage<GetCapacityDemandReply> | undefined): boolean {
+    return proto3.util.equals(GetCapacityDemandReply, a, b);
+  }
+}
+
+/**
+ * One template's answer.
+ *
+ * @generated from message legion.NodeGroupDemand
+ */
+export class NodeGroupDemand extends Message<NodeGroupDemand> {
+  /**
+   * The node group's name, from the request.
+   *
+   * @generated from field: string name = 1;
+   */
+  name = "";
+
+  /**
+   * New nodes of this template the pending work it can host needs: the
+   * `nodegroup.pending` input. 0 when it can host none of it (see
+   * `refusals`) or the upcoming nodes already absorb it.
+   *
+   * @generated from field: uint32 nodes = 2;
+   */
+  nodes = 0;
+
+  /**
+   * Pending replicas those nodes would host.
+   *
+   * @generated from field: uint32 replicas = 3;
+   */
+  replicas = 0;
+
+  /**
+   * Pending replicas this template's upcoming nodes absorbed (they are not
+   * in `replicas`).
+   *
+   * @generated from field: uint32 absorbed = 4;
+   */
+  absorbed = 0;
+
+  /**
+   * CPU the hosted replicas reserve, MHz.
+   *
+   * @generated from field: double cpu_requested_mhz = 5;
+   */
+  cpuRequestedMhz = 0;
+
+  /**
+   * Memory the hosted replicas reserve, MiB.
+   *
+   * @generated from field: double memory_requested_mib = 6;
+   */
+  memoryRequestedMib = 0;
+
+  /**
+   * CPU the `nodes` new nodes offer, MHz. 0 when the template does not
+   * bound CPU.
+   *
+   * @generated from field: double cpu_capacity_mhz = 7;
+   */
+  cpuCapacityMhz = 0;
+
+  /**
+   * Memory the `nodes` new nodes offer, MiB. 0 when the template does not
+   * bound memory.
+   *
+   * @generated from field: double memory_capacity_mib = 8;
+   */
+  memoryCapacityMib = 0;
+
+  /**
+   * Pending work this template cannot host, and why.
+   *
+   * @generated from field: repeated legion.CapacityRefusal refusals = 9;
+   */
+  refusals: CapacityRefusal[] = [];
+
+  /**
+   * The pool of the synthetic node the template was sized as, for checking
+   * what the manager understood.
+   *
+   * @generated from field: string node_pool = 10;
+   */
+  nodePool = "";
+
+  /**
+   * The synthetic node's config attributes, as a JSON object.
+   *
+   * @generated from field: string node_attributes_json = 11;
+   */
+  nodeAttributesJson = "";
+
+  constructor(data?: PartialMessage<NodeGroupDemand>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.NodeGroupDemand";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "name", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 2, name: "nodes", kind: "scalar", T: 13 /* ScalarType.UINT32 */ },
+    { no: 3, name: "replicas", kind: "scalar", T: 13 /* ScalarType.UINT32 */ },
+    { no: 4, name: "absorbed", kind: "scalar", T: 13 /* ScalarType.UINT32 */ },
+    { no: 5, name: "cpu_requested_mhz", kind: "scalar", T: 1 /* ScalarType.DOUBLE */ },
+    { no: 6, name: "memory_requested_mib", kind: "scalar", T: 1 /* ScalarType.DOUBLE */ },
+    { no: 7, name: "cpu_capacity_mhz", kind: "scalar", T: 1 /* ScalarType.DOUBLE */ },
+    { no: 8, name: "memory_capacity_mib", kind: "scalar", T: 1 /* ScalarType.DOUBLE */ },
+    { no: 9, name: "refusals", kind: "message", T: CapacityRefusal, repeated: true },
+    { no: 10, name: "node_pool", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 11, name: "node_attributes_json", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): NodeGroupDemand {
+    return new NodeGroupDemand().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): NodeGroupDemand {
+    return new NodeGroupDemand().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): NodeGroupDemand {
+    return new NodeGroupDemand().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: NodeGroupDemand | PlainMessage<NodeGroupDemand> | undefined, b: NodeGroupDemand | PlainMessage<NodeGroupDemand> | undefined): boolean {
+    return proto3.util.equals(NodeGroupDemand, a, b);
+  }
+}
+
+/**
+ * Why a template cannot host some pending replicas.
+ *
+ * @generated from message legion.CapacityRefusal
+ */
+export class CapacityRefusal extends Message<CapacityRefusal> {
+  /**
+   * Index into `GetCapacityDemandReply.pending`.
+   *
+   * @generated from field: uint32 pending_index = 1;
+   */
+  pendingIndex = 0;
+
+  /**
+   * Replicas refused.
+   *
+   * @generated from field: uint32 replicas = 2;
+   */
+  replicas = 0;
+
+  /**
+   * The failing rule: `permit` (pool or restrictions), `namespace` (the
+   * node's `namespaces`), `constraint`, `volume-driver`, `resources` (one
+   * replica is larger than an empty node), `distinct` (no value left for
+   * more replicas), `static-port` (members of one group claim the same
+   * port), `gang` (the quorum cannot place together), or `invalid` (the
+   * task does not parse).
+   *
+   * @generated from field: string rule = 3;
+   */
+  rule = "";
+
+  /**
+   * What failed, in words: `one replica needs memory 16384 > 8192 per
+   * node`.
+   *
+   * @generated from field: string detail = 4;
+   */
+  detail = "";
+
+  constructor(data?: PartialMessage<CapacityRefusal>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.CapacityRefusal";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "pending_index", kind: "scalar", T: 13 /* ScalarType.UINT32 */ },
+    { no: 2, name: "replicas", kind: "scalar", T: 13 /* ScalarType.UINT32 */ },
+    { no: 3, name: "rule", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 4, name: "detail", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): CapacityRefusal {
+    return new CapacityRefusal().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): CapacityRefusal {
+    return new CapacityRefusal().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): CapacityRefusal {
+    return new CapacityRefusal().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: CapacityRefusal | PlainMessage<CapacityRefusal> | undefined, b: CapacityRefusal | PlainMessage<CapacityRefusal> | undefined): boolean {
+    return proto3.util.equals(CapacityRefusal, a, b);
+  }
+}
+
+/**
+ * One unit of pending work: a job's task group short of its count.
+ *
+ * @generated from message legion.PendingCapacity
+ */
+export class PendingCapacity extends Message<PendingCapacity> {
+  /**
+   * Canonical job id. Empty when `redacted`.
+   *
+   * @generated from field: string job_id = 1;
+   */
+  jobId = "";
+
+  /**
+   * The job's namespace.
+   *
+   * @generated from field: string namespace = 2;
+   */
+  namespace = "";
+
+  /**
+   * The task group. Empty when `redacted`.
+   *
+   * @generated from field: string task_group = 3;
+   */
+  taskGroup = "";
+
+  /**
+   * The group's short tasks. Empty when `redacted`.
+   *
+   * @generated from field: repeated string tasks = 4;
+   */
+  tasks: string[] = [];
+
+  /**
+   * The count the group should have.
+   *
+   * @generated from field: uint32 desired = 5;
+   */
+  desired = 0;
+
+  /**
+   * Allocations it has, across config versions.
+   *
+   * @generated from field: uint32 placed = 6;
+   */
+  placed = 0;
+
+  /**
+   * Replicas waiting (`desired - placed`).
+   *
+   * @generated from field: uint32 pending = 7;
+   */
+  pending = 0;
+
+  /**
+   * For a gang: its quorum, which places together.
+   *
+   * @generated from field: optional uint32 gang_quorum = 8;
+   */
+  gangQuorum?: number;
+
+  /**
+   * What one replica reserves (every short task of the group together), as
+   * a JSON object of normalized resources (`{"cpu": 500, "memory": 256}`).
+   *
+   * @generated from field: string resources_json = 9;
+   */
+  resourcesJson = "";
+
+  /**
+   * Replicas the upcoming nodes absorbed.
+   *
+   * @generated from field: uint32 absorbed = 10;
+   */
+  absorbed = 0;
+
+  /**
+   * Set when the caller lacks `job:read` on the job: the names are left
+   * out, the counts and rules are kept.
+   *
+   * @generated from field: bool redacted = 11;
+   */
+  redacted = false;
+
+  constructor(data?: PartialMessage<PendingCapacity>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.PendingCapacity";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "job_id", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 2, name: "namespace", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 3, name: "task_group", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 4, name: "tasks", kind: "scalar", T: 9 /* ScalarType.STRING */, repeated: true },
+    { no: 5, name: "desired", kind: "scalar", T: 13 /* ScalarType.UINT32 */ },
+    { no: 6, name: "placed", kind: "scalar", T: 13 /* ScalarType.UINT32 */ },
+    { no: 7, name: "pending", kind: "scalar", T: 13 /* ScalarType.UINT32 */ },
+    { no: 8, name: "gang_quorum", kind: "scalar", T: 13 /* ScalarType.UINT32 */, opt: true },
+    { no: 9, name: "resources_json", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 10, name: "absorbed", kind: "scalar", T: 13 /* ScalarType.UINT32 */ },
+    { no: 11, name: "redacted", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): PendingCapacity {
+    return new PendingCapacity().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): PendingCapacity {
+    return new PendingCapacity().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): PendingCapacity {
+    return new PendingCapacity().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: PendingCapacity | PlainMessage<PendingCapacity> | undefined, b: PendingCapacity | PlainMessage<PendingCapacity> | undefined): boolean {
+    return proto3.util.equals(PendingCapacity, a, b);
+  }
+}
+
+/**
+ * Pending replicas no single template can host.
+ *
+ * @generated from message legion.UnfittableCapacity
+ */
+export class UnfittableCapacity extends Message<UnfittableCapacity> {
+  /**
+   * Index into `GetCapacityDemandReply.pending`.
+   *
+   * @generated from field: uint32 pending_index = 1;
+   */
+  pendingIndex = 0;
+
+  /**
+   * Replicas no template can host (pending minus the most any one
+   * template hosts).
+   *
+   * @generated from field: uint32 replicas = 2;
+   */
+  replicas = 0;
+
+  /**
+   * Each template's failing rule for them.
+   *
+   * @generated from field: repeated legion.TemplateRefusal reasons = 3;
+   */
+  reasons: TemplateRefusal[] = [];
+
+  constructor(data?: PartialMessage<UnfittableCapacity>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.UnfittableCapacity";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "pending_index", kind: "scalar", T: 13 /* ScalarType.UINT32 */ },
+    { no: 2, name: "replicas", kind: "scalar", T: 13 /* ScalarType.UINT32 */ },
+    { no: 3, name: "reasons", kind: "message", T: TemplateRefusal, repeated: true },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): UnfittableCapacity {
+    return new UnfittableCapacity().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): UnfittableCapacity {
+    return new UnfittableCapacity().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): UnfittableCapacity {
+    return new UnfittableCapacity().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: UnfittableCapacity | PlainMessage<UnfittableCapacity> | undefined, b: UnfittableCapacity | PlainMessage<UnfittableCapacity> | undefined): boolean {
+    return proto3.util.equals(UnfittableCapacity, a, b);
+  }
+}
+
+/**
+ * One template's reason, in `UnfittableCapacity`.
+ *
+ * @generated from message legion.TemplateRefusal
+ */
+export class TemplateRefusal extends Message<TemplateRefusal> {
+  /**
+   * The template.
+   *
+   * @generated from field: string template = 1;
+   */
+  template = "";
+
+  /**
+   * The rule (see `CapacityRefusal.rule`).
+   *
+   * @generated from field: string rule = 2;
+   */
+  rule = "";
+
+  /**
+   * What failed.
+   *
+   * @generated from field: string detail = 3;
+   */
+  detail = "";
+
+  constructor(data?: PartialMessage<TemplateRefusal>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.TemplateRefusal";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "template", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 2, name: "rule", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 3, name: "detail", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): TemplateRefusal {
+    return new TemplateRefusal().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): TemplateRefusal {
+    return new TemplateRefusal().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): TemplateRefusal {
+    return new TemplateRefusal().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: TemplateRefusal | PlainMessage<TemplateRefusal> | undefined, b: TemplateRefusal | PlainMessage<TemplateRefusal> | undefined): boolean {
+    return proto3.util.equals(TemplateRefusal, a, b);
   }
 }
 
@@ -17986,6 +18767,153 @@ export class SetNodeAvailabilityReply extends Message<SetNodeAvailabilityReply> 
 }
 
 /**
+ * Request payload for ForgetNode.
+ *
+ * @generated from message legion.ForgetNodeRequest
+ */
+export class ForgetNodeRequest extends Message<ForgetNodeRequest> {
+  /**
+   * The node to forget. Required.
+   *
+   * @generated from field: string node_id = 1;
+   */
+  nodeId = "";
+
+  /**
+   * Forget it whatever the guard says: the machine is gone for good. See
+   * `ForgetNode` for what that does to its allocations and volumes.
+   * Default: false.
+   *
+   * @generated from field: bool force = 2;
+   */
+  force = false;
+
+  /**
+   * Optional idempotency key. See `RunJobRequest.idempotency_key`. A
+   * repeat of a forget that succeeded replays its result instead of
+   * answering NotFound.
+   *
+   * @generated from field: optional string idempotency_key = 3;
+   */
+  idempotencyKey?: string;
+
+  constructor(data?: PartialMessage<ForgetNodeRequest>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.ForgetNodeRequest";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "node_id", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 2, name: "force", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
+    { no: 3, name: "idempotency_key", kind: "scalar", T: 9 /* ScalarType.STRING */, opt: true },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): ForgetNodeRequest {
+    return new ForgetNodeRequest().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): ForgetNodeRequest {
+    return new ForgetNodeRequest().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): ForgetNodeRequest {
+    return new ForgetNodeRequest().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: ForgetNodeRequest | PlainMessage<ForgetNodeRequest> | undefined, b: ForgetNodeRequest | PlainMessage<ForgetNodeRequest> | undefined): boolean {
+    return proto3.util.equals(ForgetNodeRequest, a, b);
+  }
+}
+
+/**
+ * Reply payload for ForgetNode.
+ *
+ * @generated from message legion.ForgetNodeReply
+ */
+export class ForgetNodeReply extends Message<ForgetNodeReply> {
+  /**
+   * Human-readable status message: `"Forgot node <id>"`.
+   *
+   * @generated from field: string message = 1;
+   */
+  message = "";
+
+  /**
+   * True when replayed from a recorded result for the request's
+   * `idempotency_key` rather than applied fresh; the counts below are 0
+   * then.
+   *
+   * @generated from field: bool deduplicated = 2;
+   */
+  deduplicated = false;
+
+  /**
+   * Allocations removed with the node (only with `force`).
+   *
+   * @generated from field: uint32 allocations_removed = 3;
+   */
+  allocationsRemoved = 0;
+
+  /**
+   * Node tokens revoked (normally 1; 0 for a node that never had one, such
+   * as one registered with ACLs off).
+   *
+   * @generated from field: uint32 tokens_revoked = 4;
+   */
+  tokensRevoked = 0;
+
+  /**
+   * Node-local volumes still pinned to the forgotten node (only with
+   * `force`). Their instances cannot be placed until an operator replaces
+   * them (`legion instance replace`).
+   *
+   * @generated from field: uint32 volumes_orphaned = 5;
+   */
+  volumesOrphaned = 0;
+
+  /**
+   * Snapshots stored on the node, now marked lost.
+   *
+   * @generated from field: uint32 snapshots_lost = 6;
+   */
+  snapshotsLost = 0;
+
+  constructor(data?: PartialMessage<ForgetNodeReply>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "legion.ForgetNodeReply";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "message", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 2, name: "deduplicated", kind: "scalar", T: 8 /* ScalarType.BOOL */ },
+    { no: 3, name: "allocations_removed", kind: "scalar", T: 13 /* ScalarType.UINT32 */ },
+    { no: 4, name: "tokens_revoked", kind: "scalar", T: 13 /* ScalarType.UINT32 */ },
+    { no: 5, name: "volumes_orphaned", kind: "scalar", T: 13 /* ScalarType.UINT32 */ },
+    { no: 6, name: "snapshots_lost", kind: "scalar", T: 13 /* ScalarType.UINT32 */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): ForgetNodeReply {
+    return new ForgetNodeReply().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): ForgetNodeReply {
+    return new ForgetNodeReply().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): ForgetNodeReply {
+    return new ForgetNodeReply().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: ForgetNodeReply | PlainMessage<ForgetNodeReply> | undefined, b: ForgetNodeReply | PlainMessage<ForgetNodeReply> | undefined): boolean {
+    return proto3.util.equals(ForgetNodeReply, a, b);
+  }
+}
+
+/**
  * Request payload for GetLedger.
  *
  * Empty request; full ledger is returned.
@@ -29756,6 +30684,36 @@ export class CreateJoinTokenRequest extends Message<CreateJoinTokenRequest> {
    */
   description = "";
 
+  /**
+   * The most nodes that may register with this token. Each new node that
+   * registers with it uses it once; a node re-registering under its own
+   * name (a restart that fell back to the join token, or a node that was
+   * marked lost rejoining) does not. Once spent, the token refuses new
+   * nodes with PERMISSION_DENIED. A node that `ForgetNode` removed is new
+   * again, so a spent token cannot bring it back.
+   *
+   * Default: unset (no limit). 0 is refused with InvalidArgument.
+   *
+   * @generated from field: optional uint32 max_uses = 4;
+   */
+  maxUses?: number;
+
+  /**
+   * Node attributes stamped on every node that registers with this token
+   * (`legion.nodegroup = "workers-general"`). They take precedence over the
+   * worker's `--attr` values and its worker type's attributes, and survive
+   * the node's restarts. Keys Legion reads as node structure (`namespaces`,
+   * `resources`, `restriction`, ...) and `legion.role` and `legion.join`
+   * are refused with InvalidArgument. At most 64 entries; keys up to 128
+   * bytes, values up to 1024. See docs/auth-and-acls.md, "Node attributes
+   * from the join".
+   *
+   * Default: empty.
+   *
+   * @generated from field: map<string, string> attributes = 5;
+   */
+  attributes: { [key: string]: string } = {};
+
   constructor(data?: PartialMessage<CreateJoinTokenRequest>) {
     super();
     proto3.util.initPartial(data, this);
@@ -29767,6 +30725,8 @@ export class CreateJoinTokenRequest extends Message<CreateJoinTokenRequest> {
     { no: 1, name: "worker_type", kind: "scalar", T: 9 /* ScalarType.STRING */ },
     { no: 2, name: "ttl", kind: "scalar", T: 9 /* ScalarType.STRING */, opt: true },
     { no: 3, name: "description", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 4, name: "max_uses", kind: "scalar", T: 13 /* ScalarType.UINT32 */, opt: true },
+    { no: 5, name: "attributes", kind: "map", K: 9 /* ScalarType.STRING */, V: {kind: "scalar", T: 9 /* ScalarType.STRING */} },
   ]);
 
   static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): CreateJoinTokenRequest {
@@ -29827,6 +30787,27 @@ export class JoinTokenInfo extends Message<JoinTokenInfo> {
    */
   createdAt = "";
 
+  /**
+   * The most nodes that may register with this token. Unset: no limit.
+   *
+   * @generated from field: optional uint32 max_uses = 6;
+   */
+  maxUses?: number;
+
+  /**
+   * New nodes that have registered with this token so far.
+   *
+   * @generated from field: uint32 uses = 7;
+   */
+  uses = 0;
+
+  /**
+   * Node attributes stamped on every node that registers with it.
+   *
+   * @generated from field: map<string, string> attributes = 8;
+   */
+  attributes: { [key: string]: string } = {};
+
   constructor(data?: PartialMessage<JoinTokenInfo>) {
     super();
     proto3.util.initPartial(data, this);
@@ -29840,6 +30821,9 @@ export class JoinTokenInfo extends Message<JoinTokenInfo> {
     { no: 3, name: "description", kind: "scalar", T: 9 /* ScalarType.STRING */ },
     { no: 4, name: "expires_at", kind: "scalar", T: 9 /* ScalarType.STRING */, opt: true },
     { no: 5, name: "created_at", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 6, name: "max_uses", kind: "scalar", T: 13 /* ScalarType.UINT32 */, opt: true },
+    { no: 7, name: "uses", kind: "scalar", T: 13 /* ScalarType.UINT32 */ },
+    { no: 8, name: "attributes", kind: "map", K: 9 /* ScalarType.STRING */, V: {kind: "scalar", T: 9 /* ScalarType.STRING */} },
   ]);
 
   static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): JoinTokenInfo {

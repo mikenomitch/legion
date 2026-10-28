@@ -2189,6 +2189,17 @@ fn migration_list() -> Vec<M<'static>> {
         // by `CreateJoinToken`, whose worker type supplies both.
         M::up("ALTER TABLE join_token ADD COLUMN pinned_attrs TEXT NOT NULL DEFAULT '';")
             .down(""),
+        // Join tokens for node groups (autoscaler v2 plan §6.11): `max_uses`
+        // caps the new nodes a token may introduce (NULL: no limit), `uses`
+        // counts them, and `attributes` (a JSON object, empty for none) is
+        // stamped on every node that registers with it. Control lane, like
+        // the rest of `join_token`.
+        M::up(
+            "ALTER TABLE join_token ADD COLUMN max_uses INTEGER;
+        ALTER TABLE join_token ADD COLUMN uses INTEGER NOT NULL DEFAULT 0;
+        ALTER TABLE join_token ADD COLUMN attributes TEXT NOT NULL DEFAULT '';",
+        )
+        .down(""),
     ]
 }
 

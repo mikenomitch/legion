@@ -505,7 +505,43 @@ impl Authenticator {
         ttl: Option<Duration>,
         description: &str,
     ) -> Result<(JoinTokenInfo, String), Status> {
-        self.mint_join_token_with(store, advertise_addr, worker_type, ttl, description, None)
+        self.mint_join_token_with(
+            store,
+            advertise_addr,
+            worker_type,
+            ttl,
+            description,
+            None,
+            None,
+            Default::default(),
+        )
+    }
+
+    /// [`Self::mint_join_token`] with a use limit and attributes stamped on
+    /// every node that registers with it (`CreateJoinToken.max_uses` and
+    /// `attributes`). The attributes must already be checked
+    /// (`check_join_attributes`).
+    #[allow(clippy::too_many_arguments)]
+    pub fn mint_join_token_for_nodes(
+        &self,
+        store: &Store,
+        advertise_addr: &str,
+        worker_type: &str,
+        ttl: Option<Duration>,
+        description: &str,
+        max_uses: Option<u32>,
+        attributes: std::collections::BTreeMap<String, String>,
+    ) -> Result<(JoinTokenInfo, String), Status> {
+        self.mint_join_token_with(
+            store,
+            advertise_addr,
+            worker_type,
+            ttl,
+            description,
+            None,
+            max_uses,
+            attributes,
+        )
     }
 
     /// [`Self::mint_join_token`] for a manager's own in-process worker: on a
@@ -533,9 +569,12 @@ impl Authenticator {
             ttl,
             description,
             Some(pinned_attrs.to_string()),
+            None,
+            Default::default(),
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn mint_join_token_with(
         &self,
         store: &Store,
@@ -546,6 +585,8 @@ impl Authenticator {
         // Set only for a manager's own in-process worker, whose token is
         // also the one forwarded to the control leader.
         pinned_attrs: Option<String>,
+        max_uses: Option<u32>,
+        attributes: std::collections::BTreeMap<String, String>,
     ) -> Result<(JoinTokenInfo, String), Status> {
         let forward_to_leader = pinned_attrs.is_some();
         let now = OffsetDateTime::now_utc();
@@ -570,6 +611,9 @@ impl Authenticator {
                 .format(&Rfc3339)
                 .map_err(|e| Status::internal(format!("clock error: {e}")))?,
             pinned_attrs,
+            max_uses,
+            uses: 0,
+            attributes,
         };
         // The token pins the CA the managers sign with, so a joining worker
         // can tell its manager from whoever answers at `addr` (plan §6.5).

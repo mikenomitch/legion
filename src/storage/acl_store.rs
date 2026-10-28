@@ -74,6 +74,32 @@ pub struct JoinTokenRecord {
     /// worker; `None` takes them from the worker type.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pinned_attrs: Option<String>,
+    /// The most new nodes that may register with the token (`None`: no
+    /// limit).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_uses: Option<u32>,
+    /// New nodes that have registered with it.
+    #[serde(default)]
+    pub uses: u32,
+    /// Node attributes stamped on every node that registers with it.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub attributes: std::collections::BTreeMap<String, String>,
+}
+
+/// What [`Store::consume_join_token_use`] did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JoinTokenUse {
+    /// The use was counted; the token has now been used this many times.
+    Counted(u32),
+    /// The token is spent: it has been used `uses` of `max_uses` times.
+    Exhausted {
+        /// Uses so far.
+        uses: u32,
+        /// The limit.
+        max_uses: u32,
+    },
+    /// The token no longer exists (revoked or pruned meanwhile).
+    Missing,
 }
 
 impl JoinTokenRecord {
@@ -84,6 +110,9 @@ impl JoinTokenRecord {
             description: self.description.clone(),
             expires_at: self.expires_at.clone(),
             created_at: self.created_at.clone(),
+            max_uses: self.max_uses,
+            uses: self.uses,
+            attributes: self.attributes.clone().into_iter().collect(),
         }
     }
 
@@ -689,11 +718,25 @@ impl Store {
                 .get::<_, String>(6)
                 .ok()
                 .filter(|attrs| !attrs.is_empty()),
+            max_uses: row
+                .get::<_, Option<i64>>(7)?
+                .map(|max| u32::try_from(max).unwrap_or(u32::MAX)),
+            uses: u32::try_from(row.get::<_, i64>(8)?).unwrap_or(u32::MAX),
+            attributes: {
+                let raw: String = row.get(9)?;
+                if raw.is_empty() {
+                    Default::default()
+                } else {
+                    // An unreadable row stamps nothing rather than failing
+                    // every lookup of the token.
+                    serde_json::from_str(&raw).unwrap_or_default()
+                }
+            },
         })
     }
 
-    const JOIN_TOKEN_COLUMNS: &'static str =
-        "id, secret_hash, worker_type, description, expires_at, created_at, pinned_attrs";
+    const JOIN_TOKEN_COLUMNS: &'static str = "id, secret_hash, worker_type, description, \
+         expires_at, created_at, pinned_attrs, max_uses, uses, attributes";
 
     #[instrument(err, skip_all, fields(id = record.id, worker_type = record.worker_type))]
     pub fn insert_join_token(&self, record: &JoinTokenRecord) -> R<()> {
@@ -724,9 +767,9 @@ impl Store {
         let conn = self.write_connection()?;
         conn.execute(
             "INSERT INTO join_token (id, secret_hash, worker_type, description, expires_at, created_at,
-                                     pinned_attrs)
+                                     pinned_attrs, max_uses, uses, attributes)
              VALUES (:id, :secret_hash, :worker_type, :description, :expires_at, :created_at,
-                     :pinned_attrs);",
+                     :pinned_attrs, :max_uses, :uses, :attributes);",
             named_params! {
                 ":id": record.id,
                 ":secret_hash": record.secret_hash,
@@ -735,9 +778,53 @@ impl Store {
                 ":expires_at": record.expires_at,
                 ":created_at": record.created_at,
                 ":pinned_attrs": record.pinned_attrs.clone().unwrap_or_default(),
+                ":max_uses": record.max_uses.map(i64::from),
+                ":uses": i64::from(record.uses),
+                ":attributes": if record.attributes.is_empty() {
+                    String::new()
+                } else {
+                    serde_json::to_string(&record.attributes)?
+                },
             },
         )?;
         Ok(())
+    }
+
+    /// Count one new node's registration against a join token, refusing
+    /// it when the token's `max_uses` is spent. Check and increment are one
+    /// replicated write, so two registrations racing for a token's last use
+    /// cannot both get it.
+    #[instrument(err, skip_all, fields(id))]
+    pub fn consume_join_token_use(&self, id: &str) -> R<JoinTokenUse> {
+        let id = id.to_owned();
+        self.replicated(Lane::Control, "consume_join_token_use", move |s| {
+            s.consume_join_token_use_apply(&id)
+        })
+    }
+
+    fn consume_join_token_use_apply(&self, id: &str) -> R<JoinTokenUse> {
+        let conn = self.write_connection()?;
+        let counted = conn.execute(
+            "UPDATE join_token SET uses = uses + 1
+             WHERE id = ?1 AND (max_uses IS NULL OR uses < max_uses);",
+            [id],
+        )?;
+        let row: Option<(i64, Option<i64>)> = conn
+            .query_row(
+                "SELECT uses, max_uses FROM join_token WHERE id = ?1;",
+                [id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        let as_u32 = |value: i64| u32::try_from(value).unwrap_or(u32::MAX);
+        Ok(match (counted, row) {
+            (_, None) => JoinTokenUse::Missing,
+            (0, Some((uses, max))) => JoinTokenUse::Exhausted {
+                uses: as_u32(uses),
+                max_uses: max.map(as_u32).unwrap_or(0),
+            },
+            (_, Some((uses, _))) => JoinTokenUse::Counted(as_u32(uses)),
+        })
     }
 
     /// Resolves a presented join secret to its record via SHA-256 hash.
@@ -1203,6 +1290,9 @@ mod acl_store_test {
             expires_at: None,
             created_at: "2026-01-01T00:00:00Z".into(),
             pinned_attrs: None,
+            max_uses: None,
+            uses: 0,
+            attributes: Default::default(),
         };
         store.insert_join_token(&record)?;
 
@@ -1222,6 +1312,9 @@ mod acl_store_test {
             expires_at: Some("2020-01-01T00:00:00Z".into()),
             created_at: "2020-01-01T00:00:00Z".into(),
             pinned_attrs: None,
+            max_uses: None,
+            uses: 0,
+            attributes: Default::default(),
         })?;
         let (acl_pruned, join_pruned) = store.prune_expired_credentials()?;
         assert_eq!((acl_pruned, join_pruned), (0, 1));

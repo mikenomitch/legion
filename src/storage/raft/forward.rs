@@ -551,6 +551,9 @@ mod tests {
                     expires_at: Some("2026-10-28T00:15:00Z".into()),
                     created_at: "2026-10-28T00:00:00Z".into(),
                     pinned_attrs: None,
+                    max_uses: None,
+                    uses: 0,
+                    attributes: Default::default(),
                 },
             },
         ];
@@ -589,6 +592,9 @@ mod tests {
                     expires_at: None,
                     created_at: String::new(),
                     pinned_attrs: None,
+                    max_uses: None,
+                    uses: 0,
+                    attributes: Default::default(),
                 },
             }
             .lane(),

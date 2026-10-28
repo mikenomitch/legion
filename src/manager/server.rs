@@ -132,6 +132,7 @@ mod material_rpcs;
 mod namespace_policy_rpcs;
 mod namespace_rpcs;
 mod node_content_rpcs;
+mod node_group_rpcs;
 mod plugin_rpcs;
 mod scaling_rpcs;
 mod session_rpcs;
@@ -2915,7 +2916,7 @@ impl ManagerDaemonService {
         }
         match self.auth.verify_join_secret(&self.store, join_token) {
             Ok(record) => Ok(RegistrationGrant::JoinToken {
-                record,
+                record: Box::new(record),
                 caller_node: acl::worker_node_id(identity).map(str::to_string),
             }),
             Err(status) if self.auth.audit_only => {
@@ -6471,6 +6472,20 @@ impl Manager for ManagerDaemonService {
         self.get_scaling_inputs_rpc(request).await
     }
 
+    async fn get_capacity_demand(
+        &self,
+        request: Request<crate::structs::GetCapacityDemandRequest>,
+    ) -> Result<Response<crate::structs::GetCapacityDemandReply>, Status> {
+        self.get_capacity_demand_rpc(request).await
+    }
+
+    async fn forget_node(
+        &self,
+        request: Request<crate::structs::ForgetNodeRequest>,
+    ) -> Result<Response<crate::structs::ForgetNodeReply>, Status> {
+        self.forget_node_rpc(request).await
+    }
+
     #[instrument(skip_all)]
     async fn destroy_job(
         &self,
@@ -8862,12 +8877,26 @@ impl Manager for ManagerDaemonService {
         let identity = self.authenticate_acl(&request)?;
         let grant =
             self.verify_join_for_registration(&identity, request.get_ref().join_token.as_deref())?;
+        let presented = self.presented_join_token(&grant, request.get_ref().join_token.as_deref());
         let mut request = request.into_inner();
         let node_id = request.name.clone();
         self.enforce_registration_grant(&grant, None, Some((&node_id, &request.pool)))?;
         self.enforce_fleet_claim(&grant, &node_id, &request.config_attrs)?;
+        crate::structs::check_join_attributes(
+            &request.join_attributes,
+            crate::structs::JoinAttrSource::Host,
+        )
+        .map_err(Status::invalid_argument)?;
         request.config_attrs =
             self.pin_registration_attrs(&grant, &node_id, &request.config_attrs)?;
+        // Token, then `--attr`, then the worker type (node_group_rpcs).
+        request.config_attrs = self.apply_join_attributes(
+            &grant,
+            presented.as_ref(),
+            &node_id,
+            &request.config_attrs,
+            &request.join_attributes,
+        )?;
 
         // Protocol-version handshake (see docs/upgrades.md): accept workers
         // at or below our protocol version, warn on pre-versioning workers
@@ -8947,6 +8976,11 @@ impl Manager for ManagerDaemonService {
             health_checks: request.health_checks,
         };
 
+        // Last, so a registration refused for anything else does not spend
+        // one of the token's uses.
+        if let Some(token) = &presented {
+            self.consume_join_use(token, &node_id)?;
+        }
         self.store
             .insert_node(node_msg)
             .map_err(|e| map_store_error("Error registering worker", e))?;
@@ -11957,14 +11991,23 @@ impl Manager for ManagerDaemonService {
                     .map_err(|e| Status::invalid_argument(format!("invalid ttl `{raw}`: {e}")))?,
             ),
         };
-        let (info, token) = self.auth.mint_join_token(
+        let (max_uses, attributes) = Self::join_token_limits(req.max_uses, req.attributes)?;
+        let (info, token) = self.auth.mint_join_token_for_nodes(
             &self.store,
             &self.advertise_addr,
             &worker_type,
             ttl,
             &req.description,
+            max_uses,
+            attributes,
         )?;
-        info!(id = %info.id, worker_type = %info.worker_type, "Join token created");
+        info!(
+            id = %info.id,
+            worker_type = %info.worker_type,
+            max_uses = ?info.max_uses,
+            attributes = info.attributes.len(),
+            "Join token created"
+        );
         if let Some(warning) = &self.join_address_warning {
             warn!(id = %info.id, "Join token names a loopback manager address: {warning}");
         }
@@ -12548,7 +12591,7 @@ enum RegistrationGrant {
     /// live node, unless the caller also presented that node's own token
     /// (`caller_node`).
     JoinToken {
-        record: crate::storage::acl_store::JoinTokenRecord,
+        record: Box<crate::storage::acl_store::JoinTokenRecord>,
         caller_node: Option<String>,
     },
     /// A node token: may only re-register its own node, in its current pool.
@@ -18447,6 +18490,7 @@ mod tests {
                 worker_type: "default".into(),
                 ttl: Some("1h".into()),
                 description: "warning test".into(),
+                ..Default::default()
             })
         };
         let warning = crate::structs::ServerConfigFull {

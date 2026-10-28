@@ -815,6 +815,7 @@ pub async fn run_manager_with(
                     advertise_addr: local_worker_advertise,
                     in_process: true,
                     local: Some(worker.local),
+                    join_attributes: Default::default(),
                 },
                 None,
             )
