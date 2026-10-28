@@ -262,10 +262,11 @@ impl Harness {
         Some(format!("ops-key-{next}"))
     }
 
-    /// Committed raft entries so far, across every lane this store runs.
+    /// Committed raft entries so far, across every lane this store runs,
+    /// from the state machine's applied marker (exact once a write returns;
+    /// the engine's metrics lag it, see `Store::raft_applied_entries`).
     fn entries(&self) -> R<u64> {
-        let status = self.store().raft_status().context("raft status")?;
-        Ok(status.lanes.iter().map(|lane| lane.applied_index).sum())
+        self.store().raft_applied_entries()
     }
 
     /// Run `body` and count what it committed.

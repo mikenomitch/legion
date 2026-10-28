@@ -572,12 +572,12 @@ impl Cluster {
     }
 
     /// The applied index summed over every raft lane: what "no raft entry"
-    /// is measured against.
+    /// is measured against. Read from the state machine's applied marker,
+    /// which is exact once a write returns; the raft engine's metrics
+    /// (`raft_status`) are published a moment later, and a count taken from
+    /// them right after a write could miss it and then see it "appear".
     fn raft_entries(&self) -> u64 {
-        self.store()
-            .raft_status()
-            .map(|status| status.lanes.iter().map(|lane| lane.applied_index).sum())
-            .unwrap_or_default()
+        self.store().raft_applied_entries().unwrap_or_default()
     }
 
     async fn create(

@@ -3103,6 +3103,33 @@ impl Store {
         Ok(max_index)
     }
 
+    /// The raft log entries this store has applied, summed over its lanes,
+    /// as the state machine recorded them in `raft_applied` (`0` for a
+    /// non-raft store).
+    ///
+    /// The marker commits in the same transaction as each entry's effects,
+    /// so this is exact the moment a replicated write returns. The
+    /// `applied_index` of [`Self::raft_status`] comes from the raft
+    /// engine's metrics, which are published a moment after the apply: a
+    /// count taken right after a write can miss it, and a later count then
+    /// sees one entry "appear" from nowhere. Tests that count the entries
+    /// an operation writes read this instead.
+    pub fn raft_applied_entries(&self) -> R<u64> {
+        let conn = self.read_connection()?;
+        let mut stmt = conn.prepare("SELECT last_applied FROM raft_applied;")?;
+        let rows = stmt.query_map([], |row| row.get::<_, Option<Vec<u8>>>(0))?;
+        let mut total = 0u64;
+        for row in rows {
+            let Some(bytes) = row? else {
+                continue;
+            };
+            let log_id: openraft::LogId<u64> = serde_json::from_slice(&bytes)
+                .context("failed decoding raft_applied last_applied")?;
+            total += log_id.index;
+        }
+        Ok(total)
+    }
+
     /// Write a consistent point-in-time backup of the state database to
     /// `out` (or a timestamped default under `<storePath>/backups/`) via
     /// `VACUUM INTO`, and return where it landed, its size, and the raft
