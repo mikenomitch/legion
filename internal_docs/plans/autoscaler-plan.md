@@ -1,6 +1,17 @@
 # Built-In Autoscaler Plan
 
-**Status: IN EXECUTION.** Phase 1 (`legion job scale` + count overrides —
+> **SUPERSEDED (2026-10-19) by [autoscaler-v2-plan.md](autoscaler-v2-plan.md)**
+> and its substrate, [legion-apps-plan.md](legion-apps-plan.md). Phase 1 below
+> shipped and is still accurate; v2 treats it as its Phase 0. Phases 2-7 are
+> replaced. The autoscaler now runs as a Legion app (a job hosted on the
+> managers' system workers), not as an in-core loop, and it gains
+> JSON-RPC plugins, UI extensions, and a different `autoscale` default. Which
+> of this plan's calls stand is tabled in
+> the ledger at the end of
+> [autoscaler-v2-plan_calls.md](../calls/autoscaler-v2-plan_calls.md#ledger-what-stands-from-the-superseded-plans-calls).
+> The text below is kept unedited as history.
+
+**Status (historical): IN EXECUTION.** Phase 1 (`legion job scale` + count overrides —
 §6.1/§6.2/§8.1) shipped 2026-07-30 with docs in
 [docs/autoscaling.md](../../docs/autoscaling.md); deviations from this plan
 are recorded in the [calls doc](../calls/autoscaler-plan_calls.md) (notably:
