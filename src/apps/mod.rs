@@ -11,7 +11,10 @@
 //!   reconciler renders into the job, resolved by the worker to a path the
 //!   task can open);
 //! - serve the app's HTTP port (`$LEGION_PORT_API`, the manifest's `api`
-//!   port) with `/healthz`, answering from the health the app body sets;
+//!   port) with `/healthz`, answering from the health the app body sets, and
+//!   the views and actions the body registers ([`AppContext::view`],
+//!   [`AppContext::action`]; [`ui`]), each request's viewer assertion
+//!   verified before a handler runs;
 //! - hand the body an [`AppContext`] that connects to Legion through
 //!   `LEGION_ADDR` (the allocation's API socket, authenticated as the app's
 //!   `legion` identity);
@@ -23,6 +26,7 @@
 //! below, and seeded on clusters by the first Control leader.
 
 pub mod autoscaler;
+pub mod ui;
 
 use crate::prelude::*;
 use crate::structs::app::{AppManifest, APP_CONFIG_ENV, APP_NAME_ENV};
@@ -118,13 +122,13 @@ pub fn is_bundled(name: &str) -> bool {
 
 /// The health an app reports on `/healthz`.
 #[derive(Debug, Clone)]
-struct Health {
+pub(crate) struct Health {
     healthy: bool,
     detail: String,
 }
 
-/// What an app body gets: its name, config, health, a way to reach
-/// Legion, and the stop signal.
+/// What an app body gets: its name, config, health, its UI registry, a way
+/// to reach Legion, and the stop signal.
 #[derive(Clone)]
 pub struct AppContext {
     name: String,
@@ -132,10 +136,52 @@ pub struct AppContext {
     config_path: Option<PathBuf>,
     listen: SocketAddr,
     health: Arc<std::sync::RwLock<Health>>,
+    ui: Arc<ui::UiRegistry>,
     stop: tokio::sync::watch::Receiver<bool>,
 }
 
 impl AppContext {
+    /// Serve view `name` (docs/apps.md, "Writing views"): the manifest's
+    /// `ui` block registers it in a slot, the manager authorizes each
+    /// viewer, and the framework verifies the request's viewer assertion
+    /// before `handler` runs. `handler` gets the slot's context and the
+    /// viewer, and returns a `legion-view/1` document
+    /// ([`crate::structs::app_ui::AppView`]), validated before it leaves.
+    /// Register at any time; a request for a view not registered yet is
+    /// answered 404.
+    ///
+    /// ```ignore
+    /// context.view("job", |request| async move {
+    ///     let job = request.context.job_id().unwrap_or_default();
+    ///     Ok(AppView::new(vec![Block::Notice(NoticeBlock {
+    ///         tone: Tone::Info,
+    ///         title: None,
+    ///         text: format!("{job} is not autoscaled"),
+    ///     })]))
+    /// });
+    /// ```
+    pub fn view<F, Fut>(&self, name: &str, handler: F)
+    where
+        F: Fn(ui::ViewRequest) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = R<crate::structs::app_ui::AppView>> + Send + 'static,
+    {
+        self.ui.view(name, handler);
+    }
+
+    /// Serve action `name`, declared in the manifest's `ui.actions`. The
+    /// manager checked the action's permission as the viewer on the context,
+    /// and the inputs against their declared types; the framework checks the
+    /// assertion binds this context and these inputs, and runs each
+    /// assertion once. Act only on `request.context`. Return
+    /// [`ui::Refused`] as the error to refuse with a message the viewer sees.
+    pub fn action<F, Fut>(&self, name: &str, handler: F)
+    where
+        F: Fn(ui::ActionRequest) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = R<ui::ActionOutcome>> + Send + 'static,
+    {
+        self.ui.action(name, handler);
+    }
+
     /// The app's name.
     pub fn name(&self) -> &str {
         &self.name
@@ -297,20 +343,31 @@ pub async fn run_app(name: &str, options: RunOptions) -> R<()> {
         healthy: true,
         detail: "starting".to_string(),
     }));
+    let app_name = std::env::var(APP_NAME_ENV).unwrap_or_else(|_| name.to_string());
+    let registry = Arc::new(ui::UiRegistry::default());
+    let verifier = ui::AssertionVerifier::from_env(&app_name).map(Arc::new);
+    if verifier.is_none() {
+        warn!(
+            app = name,
+            "LEGION_ADDR is not set, so this app cannot verify viewer assertions and serves no              views (turn on workloadIdentity.enabled on the managers)"
+        );
+    }
+    let ui_server = Arc::new(ui::UiServer::new(registry.clone(), verifier));
     let server_health = health.clone();
     tokio::spawn(async move {
-        if let Err(err) = serve_http(listener, server_health).await {
+        if let Err(err) = serve_port(listener, Some(server_health), Some(ui_server)).await {
             error!(error = ?err, "the app's HTTP listener stopped");
         }
     });
 
     let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
     let context = AppContext {
-        name: std::env::var(APP_NAME_ENV).unwrap_or_else(|_| name.to_string()),
+        name: app_name,
         config,
         config_path: path,
         listen,
         health,
+        ui: registry,
         stop: stop_rx,
     };
     info!(
@@ -372,14 +429,16 @@ async fn stop_signal() -> &'static str {
     }
 }
 
-/// The app's HTTP port: `/healthz` from the body's health. The UI views and
-/// actions (`/legion/v1/…`, apps plan §6.5) arrive with phase A4.
-async fn serve_http(
+/// The app's HTTP port: `/healthz` from the body's health (always 200 when
+/// `health` is `None`), and the UI views and actions under `/legion/v1/`
+/// (apps plan §6.5; [`ui::UiServer`]).
+pub(crate) async fn serve_port(
     listener: tokio::net::TcpListener,
-    health: Arc<std::sync::RwLock<Health>>,
+    health: Option<Arc<std::sync::RwLock<Health>>>,
+    ui: Option<Arc<ui::UiServer>>,
 ) -> R<()> {
     use bytes::Bytes;
-    use http_body_util::Full;
+    use http_body_util::{BodyExt, Full, Limited};
     use hyper::{Response, StatusCode};
     use hyper_util::rt::TokioIo;
     loop {
@@ -391,32 +450,76 @@ async fn serve_http(
             }
         };
         let health = health.clone();
+        let ui = ui.clone();
         tokio::spawn(async move {
             let service = hyper::service::service_fn(move |request: hyper::Request<_>| {
                 let health = health.clone();
+                let ui = ui.clone();
                 async move {
-                    let (status, body) = match request.uri().path() {
-                        "/healthz" => {
-                            let health =
-                                health
+                    let path = request.uri().path().to_string();
+                    let (status, content_type, body) = if path == "/healthz" {
+                        let health =
+                            match &health {
+                                Some(health) => health
                                     .read()
                                     .map(|health| health.clone())
                                     .unwrap_or(Health {
                                         healthy: false,
                                         detail: "health state poisoned".into(),
-                                    });
-                            let status = if health.healthy {
-                                StatusCode::OK
-                            } else {
-                                StatusCode::SERVICE_UNAVAILABLE
+                                    }),
+                                None => Health {
+                                    healthy: true,
+                                    detail: "ok".into(),
+                                },
                             };
-                            (status, format!("{}\n", health.detail))
-                        }
-                        _ => (StatusCode::NOT_FOUND, "not found\n".to_string()),
+                        let status = if health.healthy {
+                            StatusCode::OK
+                        } else {
+                            StatusCode::SERVICE_UNAVAILABLE
+                        };
+                        (status, "text/plain", format!("{}\n", health.detail))
+                    } else if let (Some(ui), true) = (&ui, path.starts_with("/legion/v1/")) {
+                        let method = request.method().as_str().to_string();
+                        let path_and_query = request
+                            .uri()
+                            .path_and_query()
+                            .map(|value| value.as_str().to_string())
+                            .unwrap_or(path.clone());
+                        let assertion = request
+                            .headers()
+                            .get(crate::structs::app_ui::VIEWER_HEADER)
+                            .and_then(|value| value.to_str().ok())
+                            .map(str::to_string);
+                        let body = Limited::new(request.into_body(), ui::MAX_ACTION_BODY)
+                            .collect()
+                            .await
+                            .map(|collected| collected.to_bytes());
+                        let answer = match body {
+                            Ok(body) => {
+                                ui.handle(&method, &path_and_query, assertion.as_deref(), &body)
+                                    .await
+                            }
+                            Err(_) => ui::UiAnswer {
+                                status: 413,
+                                body: json!({ "error": "the request body is too large" }),
+                            },
+                        };
+                        (
+                            StatusCode::from_u16(answer.status)
+                                .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
+                            "application/json",
+                            answer.body.to_string(),
+                        )
+                    } else {
+                        (
+                            StatusCode::NOT_FOUND,
+                            "text/plain",
+                            "not found\n".to_string(),
+                        )
                     };
                     let response = Response::builder()
                         .status(status)
-                        .header("content-type", "text/plain")
+                        .header("content-type", content_type)
                         .body(Full::new(Bytes::from(body)))
                         .expect("static response parts");
                     Ok::<_, std::convert::Infallible>(response)
@@ -522,7 +625,7 @@ mod tests {
             healthy: true,
             detail: "ok".into(),
         }));
-        tokio::spawn(serve_http(listener, health.clone()));
+        tokio::spawn(serve_port(listener, Some(health.clone()), None));
         let get = |path: &'static str| async move {
             use tokio::io::{AsyncReadExt, AsyncWriteExt};
             let mut stream = tokio::net::TcpStream::connect(addr).await?;
