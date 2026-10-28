@@ -542,6 +542,16 @@ mod tests {
                     to: [("cpu".to_string(), 1500.0)].into(),
                 },
             },
+            ForwardableLaneWrite::InsertJoinToken {
+                record: crate::storage::acl_store::JoinTokenRecord {
+                    id: "jt-1".into(),
+                    secret_hash: "hash".into(),
+                    worker_type: "legion-system".into(),
+                    description: "system worker (systemWorker)".into(),
+                    expires_at: Some("2026-10-28T00:15:00Z".into()),
+                    created_at: "2026-10-28T00:00:00Z".into(),
+                },
+            },
         ];
         for op in ops {
             let bytes = serde_json::to_vec(&op).expect("encode");
@@ -564,6 +574,20 @@ mod tests {
             ForwardableLaneWrite::SyncNodeAvailability {
                 ids: Vec::new(),
                 availability: String::new()
+            }
+            .lane(),
+            Lane::Control
+        );
+        assert_eq!(
+            ForwardableLaneWrite::InsertJoinToken {
+                record: crate::storage::acl_store::JoinTokenRecord {
+                    id: String::new(),
+                    secret_hash: String::new(),
+                    worker_type: String::new(),
+                    description: String::new(),
+                    expires_at: None,
+                    created_at: String::new(),
+                },
             }
             .lane(),
             Lane::Control

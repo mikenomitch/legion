@@ -522,7 +522,8 @@ pub async fn run_manager_with(
         ),
         None => info!(
             "systemWorker.enabled = false: this manager runs no worker, so jobs in \
-             legion-system run on workers that accept that namespace"
+             legion-system need a worker whose pool they permit and whose type accepts \
+             that namespace"
         ),
     }
     if let Some(dir) = in_process
@@ -531,7 +532,8 @@ pub async fn run_manager_with(
     {
         crate::constants::set_worker_state_dir(dir);
     }
-    // The worker's task needs both after the API server has taken them.
+    // The in-process worker's task needs its own handles: the API server
+    // takes these by value below.
     let in_process_store = store.clone();
     let in_process_authenticator = authenticator.clone();
 
