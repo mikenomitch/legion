@@ -107,6 +107,22 @@
     ],
     # How often the SPA re-fetches the views (at least 5s).
     refresh = "10s",
+    # Sandboxed pages, for UIs the view blocks cannot draw: single-file HTML
+    # the app serves (at `bundle`, default /legion/v1/pages/<name>), mounted
+    # by the SPA in an opaque-origin iframe with a strict CSP, in the
+    # sidebar. `rpcs` is what the page may call as its viewer through the
+    # bridge; writes (RunJob here) are confirmed by the viewer every time.
+    # A page can read whatever its viewer can through these RPCs, so the
+    # install prompt lists them (docs/apps.md, "Sandboxed pages").
+    pages = [
+      {
+        name = "console",
+        title = "GitOps console",
+        icon = "gitBranch",
+        rpcs = ["ListJobs", "GetJobInfo", "RunJob"],
+        permission = { resource = "job", action = "read" },
+      },
+    ],
   },
 
   # Jobspec keys the app adds (apps plan §6.6). Stored; resolved by a later

@@ -2033,11 +2033,18 @@ mod app_tests {
                 "nav".to_string(),
                 "overview".to_string(),
                 "job".to_string(),
-                "task".to_string()
+                "task".to_string(),
+                "pages".to_string()
             ]
         );
         let ui = manifest.ui_spec().expect("the ui block parses");
         assert_eq!(ui.port(), "api");
+        let console = ui.page("console").expect("the console page");
+        assert!(console.allows_rpc("RunJob"));
+        assert!(manifest.ui_summary().contains(
+            &"a GitOps console page (sandboxed; calls ListJobs, GetJobInfo, RunJob as the viewer)"
+                .to_string()
+        ));
         assert_eq!(
             ui.action("sync-now").map(|action| action.mutating()),
             Some(true)

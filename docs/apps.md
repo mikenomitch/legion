@@ -7,8 +7,9 @@ install from a manifest. It is three things:
 2. a **grant**: what that job's `legion` identity may do in Legion
    ([Workload Identity: Permissions](workload-identity.md#permissions));
 3. **registrations**: the UI it adds (pages, panels, badges, and actions,
-   drawn from the app's declarative views; see
-   [Views and actions](#views-and-actions)) and the jobspec keys it adds
+   drawn from the app's declarative views, and sandboxed pages for what the
+   views cannot draw; see [Views and actions](#views-and-actions) and
+   [Sandboxed pages](#sandboxed-pages)) and the jobspec keys it adds
    (stored now, resolved by a later release; see
    [Limitations](#limitations)).
 
@@ -52,10 +53,14 @@ The **autoscaler** acts on every task with `autoscale` in its jobspec
 ([autoscaling.md](autoscaling.md)): it watches the effective policies, reads
 the cluster-wide scaling inputs once per interval, and writes counts through
 `ScaleTask`, reporting each evaluation back to the manager. Its grant is
-`scale:read` and `scale:write` in every namespace: it can resize, not
-redeploy. Its config takes `interval` (default `"15s"`) and `mode`
-(`"dry-run"` forces every policy into dry-run). When it stops reporting,
-`legion scaling status` says `NOT RUNNING`.
+`scale:read` and `scale:write` in every namespace, and `node:read` for its
+node-group panel: it can resize, not redeploy. Its config takes `interval`
+(default `"15s"`) and `mode` (`"dry-run"` forces every policy into dry-run).
+When it stops reporting, `legion scaling status` says `NOT RUNNING`. Its UI
+is built from app views: an Autoscaling page in the sidebar, a panel on
+every autoscaled job's page, a badge on each autoscaled task, and a
+node-group panel on node pages
+([autoscaling.md, "In the UI"](autoscaling.md#in-the-ui)).
 
 **Installed apps** come from a manifest file or URL (`legion app install`).
 They carry their own `version`, run their own code (an artifact or an image,
@@ -105,7 +110,7 @@ A manifest is Nickel or JSON. Unknown fields are errors.
     { resources = ["template"], actions = ["read"] },
     { resources = ["kv"], actions = ["read"], paths = ["legion/apps/gitops/*"] },
   ],
-  ui = { ... },                          # pages, panels, badges, actions (Views and actions)
+  ui = { ... },                          # pages, panels, badges, actions, sandboxed pages (Views and actions)
   extensions = [ ... ],                  # jobspec keys (stored; see Limitations)
   config = {
     schema = { type = "object", properties = { repos = { type = "array" } } },
@@ -448,6 +453,13 @@ Limits:
   legion-system/<app>` shows every version's grant and its granter, and the
   app events name who installed, upgraded, changed, enabled, or disabled an
   app.
+- **App code never runs in the UI's origin.** Views are data the SPA draws.
+  A sandboxed page runs in an opaque-origin iframe that holds no token and
+  reaches Legion only through the bridge, as its viewer, within its `rpcs`,
+  with every write confirmed. What a page *can* do is read what its viewer
+  can read through those RPCs and send it elsewhere
+  ([What the sandbox does not stop](#what-the-sandbox-does-not-stop)), so a
+  page's app is trusted with its viewers' read access.
 
 ## ACLs
 
@@ -470,6 +482,7 @@ with a `names` selector, matched against app names:
 | `ListUiExtensions` | `app:read` (filtered by `names`, and by each entry's permission) |
 | `GetAppView` | `app:read` on the app, and the entry's permission on the context |
 | `InvokeAppAction` | `app:read` on the app, and the action's permission on the context |
+| `GetAppPage` | `app:read` on the app, and the page's permission on any scope |
 
 Every mutating RPC takes `idempotency_key`, and a repeat returns the first
 reply with `deduplicated` set (`--idempotency-key` on the CLI).
@@ -478,8 +491,10 @@ reply with `deduplicated` set (`--idempotency-key` on the CLI).
 
 Apps appear in the UI through **declarative views**: an app answers a
 request for a view with a small JSON document (`legion-view/1`) built from a
-closed set of blocks, and the SPA draws it with Legion's own components. No
-app code ever runs in the UI. The same views print in the terminal
+closed set of blocks, and the SPA draws it with Legion's own components. A
+view carries no code: an app's own code reaches the browser only as a
+[sandboxed page](#sandboxed-pages), outside the SPA's origin. The same views
+print in the terminal
 (`legion app view`) and reach agents (`legion_app_view`), so whatever a
 person sees on a panel, an agent can read.
 
@@ -751,6 +766,192 @@ message.
 | `NotFound` | no such app, or no such view in that slot, or no such action | `legion app view <app>` lists what it shows |
 | `DeadlineExceeded` | the app took more than 10 seconds | |
 
+## Sandboxed pages
+
+Some UIs do not fit the block set: an editor, a graph you can drag, a log
+viewer. For those an app declares **sandboxed pages**: its own single-file
+HTML, which the SPA mounts in a locked-down iframe in the sidebar's **Apps**
+section. A page runs the app's own JavaScript, but never in the SPA's origin,
+where the operator's token lives. Its only way to Legion is a `postMessage`
+**bridge** that runs the Manager RPCs the manifest lists, as the viewer, and
+asks the viewer before every call that changes something.
+
+```nickel
+ui = {
+  port = "api",
+  pages = [
+    { name = "console", title = "GitOps console", icon = "gitBranch",
+      rpcs = ["ListJobs", "GetJobInfo", "RunJob"],
+      permission = { resource = "job", action = "read" } },
+  ],
+}
+```
+
+| Field | Meaning |
+| --- | --- |
+| `name` | The page's name: lowercase letters, digits, `-`, `_`, `.`, at most 64. It opens at `/apps/<app>/pages/<name>`. |
+| `title` | The sidebar label and the page's title. Required. |
+| `icon` | A sidebar icon name; an unknown one shows a default. |
+| `bundle` | Where the app serves the page, under `/legion/v1/` on its `ui.port`. Default `/legion/v1/pages/<name>`. No query, no `..`, not under `/legion/v1/views/` or `/legion/v1/actions/`. |
+| `rpcs` | The Manager RPCs the page may call through the bridge, as `proto/legion.proto` spells them (`GetJobInfo`). At most 64. Default: none. |
+| `permission` | `{ resource, action }`: who sees the page, checked as the viewer on any scope, like a `nav` view. Without one, `app:read` on the app suffices. |
+
+An app declares at most 8 pages. The install and upgrade prompts list each
+page with its `rpcs` (`UI: a GitOps console page (sandboxed; calls ListJobs,
+GetJobInfo, RunJob as the viewer)`), so whoever installs the app sees what
+its pages may do with a viewer's access.
+
+### Which RPCs a page may call
+
+`rpcs` is checked at install against a fixed list of the Manager RPCs pages
+may call, each classified by what it does:
+
+- **Reads** (`GetJobInfo`, `ListJobs`, `GetScalingStatus`, `GetKv`, ...)
+  run as the viewer without asking.
+- **Writes** (`RunJob`, `StopJob`, `ScaleTask`, `PutKv`, ...) are confirmed
+  by the viewer every time. Classified by effect, not by ACL action:
+  `RestoreInstance` needs only `snapshot:read`, but it creates an instance,
+  so it is confirmed.
+- **Refused**, so an install that lists one fails with the reason:
+  - RPCs that return a credential or the cluster's secrets (`Login`,
+    `CreateAclToken`, `CreateJoinToken`, `GetRaftJoinToken`,
+    `MintExecTicket`, `CreateExecKey`, `IssueBootTicket`,
+    `GetStateBackup`): a page must never hold one;
+  - break-glass operations (`IssueRaftCommand`, `ResetKeyring`,
+    `RewrapRootKey`);
+  - streaming RPCs (`StreamEvents`, `WatchScalingPolicies`,
+    `ExecAllocation`);
+  - the UI plumbing (`ListUiExtensions`, `GetAppView`, `InvokeAppAction`,
+    `GetAppPage`): a page reaches its own app's views and actions with
+    `legion.view` and `legion.action`;
+  - worker- and app-plane RPCs (`Heartbeat`, `ReportScalingStatus`, ...).
+
+  An RPC added to Legion later is refused until it is classified.
+
+```
+error: app gitops: ui.pages[0]: page "console": RPC "CreateAclToken" returns a credential or the cluster's secrets, which a page must never hold
+```
+
+### How a page is served
+
+The SPA fetches a page with `GetAppPage`, which the manager authorizes
+exactly like a view, before anything reaches the app: `app:read` on the app,
+then the page's `permission` as the viewer. It then forwards `GET <bundle>`
+to one running allocation of the app's job, with a viewer assertion whose
+claim has `kind = "page"`, the page's name, and the `nav` slot's empty
+context ([The viewer assertion](#the-viewer-assertion)). The app answers
+`200`, `text/html`, UTF-8, at most 1 MiB. The manager does not sanitize the
+HTML: a page is code, confined by the browser, not by the manager.
+
+With the Rust framework an app serves a page from `AppContext::page` (or
+`UiRegistry::page`), which checks the assertion is for that page:
+
+```rust
+context.page("console", |request: PageRequest| async move {
+    Ok(include_str!("console.html").to_string())
+});
+```
+
+### The sandbox
+
+The SPA mounts the bundle as `<iframe sandbox="allow-scripts" srcdoc=…>`,
+and prepends (right after a leading doctype, so the page keeps standards
+mode) this Content-Security-Policy and the bridge's script:
+
+```
+default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src data:; connect-src 'none'; form-action 'none'; base-uri 'none'
+```
+
+- The frame has an **opaque origin** (no `allow-same-origin`): it cannot
+  read the SPA's storage, cookies, or DOM, and has no storage of its own;
+  `localStorage` throws `SecurityError`.
+- It **cannot open a connection** (`connect-src 'none'`: no `fetch`,
+  XHR, WebSocket, or EventSource) or **load anything** from elsewhere:
+  scripts, styles, and images must be inline (`data:` images).
+- It **cannot submit a form** (no `allow-forms`, and `form-action 'none'`),
+  open a window (no `allow-popups`), show `alert` or `confirm` (no
+  `allow-modals`), or navigate the SPA (no `allow-top-navigation`).
+- A page may add its own CSP `<meta>`; policies only ever narrow.
+
+### The bridge
+
+The prepended script defines `window.legion`:
+
+| | |
+| --- | --- |
+| `legion.call(method, request)` | Run a Manager RPC as the viewer. `request` is the request message as proto3 JSON (`{ name: "web" }`); resolves to the reply as JSON. Only RPCs in the page's `rpcs`; a write is confirmed first. |
+| `legion.view(name, context)` | Render one of the app's own views (`GetAppView`), resolving to `{ title, document, actions }`. `context` is a slot context (`{ slot: "job", job: "web" }`); default `{ slot: "nav" }`. |
+| `legion.action(name, inputs, context)` | Run one of the app's own actions (`InvokeAppAction`) on a `job`, `task`, or `node` context; always confirmed. Resolves to `{ message, document }`. |
+| `legion.navigate(route)` | Move the SPA to an in-app route (`/jobs/default/web`). |
+| `legion.theme`, `legion.onTheme(fn)` | `"light"` or `"dark"`, and a listener for changes. |
+| `legion.app`, `legion.page`, `legion.rpcs` | The page's app, its name, and its allowlist. |
+
+A refusal rejects with an `Error` whose `code` is `not_allowed` (the RPC is
+not in `rpcs`), `cancelled` (the viewer said no), `invalid_argument`,
+`unimplemented`, `resource_exhausted` (more than 16 calls in flight, or 4
+confirmations waiting), or the gRPC status in snake case
+(`permission_denied`, `not_found`, ...).
+
+```html
+<!doctype html>
+<title>GitOps console</title>
+<ul id="jobs"></ul>
+<script>
+  legion.call('ListJobs', {}).then((reply) => {
+    for (const job of reply.jobs ?? []) {
+      const item = document.createElement('li');
+      item.textContent = job.name;
+      document.getElementById('jobs').append(item);
+    }
+  });
+</script>
+```
+
+**Every write asks.** The SPA, not the page, draws the confirmation, outside
+the frame, naming the app, the RPC, and its target: `gitops wants to run
+RunJob on team-a/web as you`, with the request below. The page waits for the
+answer; nothing is sent until the viewer says yes.
+
+**The allowlist is checked twice.** The SPA refuses an RPC outside `rpcs`
+before anything is sent, and stamps every call it does send with the
+`legion-app-page: <app>/<page>` header. The manager checks that header
+against the app's **current** manifest and refuses (`PermissionDenied`) an
+RPC the page does not list, so an upgrade that narrows `rpcs` holds even for
+a page that is already open, and a bug in the SPA cannot widen a page's
+reach. The manager logs each such call with the page. Neither check
+authorizes the viewer: every call is still the viewer's own, checked
+against the viewer's ACLs like any other.
+
+**Only the page is heard.** The SPA accepts a message only from the page's
+own frame (its window, in the opaque origin) and only while the frame still
+holds the bundle it was given: once the page navigates its frame anywhere
+else, the bridge closes and the SPA says so.
+
+### What the sandbox does not stop
+
+A page **can leak whatever its viewer can read through its allowlisted
+RPCs**. Nothing in a CSP reliably stops a frame from navigating itself to an
+outside URL carrying data in the query string, so a page that calls
+`GetKv` can send what it read to its author. The bridge closes when the
+frame navigates, but whatever the page read before that is gone.
+
+So treat a page's app as **trusted with its viewers' read access** through
+the RPCs it lists, and read the install prompt's `rpcs` with that in mind.
+Writes are different: each one needs the viewer's yes, every time. And a
+page never holds a token: the most it can do is what its viewer could do,
+narrowed by its `rpcs`, while its viewer has it open.
+
+### Failures
+
+| What the viewer sees | Why | What to do |
+| --- | --- | --- |
+| `You may not see this page.` | no `app:read`, or not the page's `permission` | grant it; the app saw nothing |
+| `... could not serve this page: ... answered ... with "application/json"; a page is served as text/html` | the app's answer is not HTML | serve `text/html` |
+| `... a page is at most 1048576` | the bundle is over 1 MiB | inline less |
+| `not_allowed` in the page | the RPC is not in the page's `rpcs` | add it to the manifest (and upgrade) |
+| `permission_denied` in the page | the viewer lacks the RPC's permission, or the manager refused an RPC the current manifest does not list | |
+| `The page left the bundle ...; its bridge to Legion is closed` | the page navigated its frame | reload |
+
 ## Inside an app
 
 The app's tasks get, in their environment:
@@ -814,6 +1015,7 @@ manager ([Metrics](metrics.md)).
 | `legion app view <app>` | `ListUiExtensions` (what the app shows you, and where) |
 | `legion app view <app> <slot> [ctx…] [--view V] [--group G]` | `GetAppView` (`job <job>`, `task <job> <task>`, `node <node>`, `nav`, `overview`) |
 | (the UI's action buttons) | `InvokeAppAction` |
+| (the UI's sandboxed pages) | `GetAppPage` |
 | `legion app run <app> [--listen ADDR] [--config F]` | (the in-task entrypoint) |
 
 Every command but `run` takes `--json`; `legion app view -j` returns the
@@ -835,9 +1037,16 @@ them, and which allocation answered. The MCP server exposes
   `FailedPrecondition` and apps serve no views.
 - **Sandbox apps cannot serve views yet.** A sandbox task has no API
   socket, so the framework cannot fetch the cluster's keys.
-- **Tier 1 only.** Apps draw with the block set; sandboxed pages for UIs it
-  cannot express (editors, graphs) are not built yet, and a manifest's
-  `ui.pages` is stored without being served.
+- **A sandboxed page can leak what its viewer can read** through its
+  allowlisted RPCs, by navigating its own frame to a URL that carries the
+  data ([What the sandbox does not stop](#what-the-sandbox-does-not-stop)).
+  Install a page's app only if you would trust it with that.
+- **Pages are single files in the sidebar.** No remote scripts, styles,
+  fonts, or images (only `data:` images), no network, at most 1 MiB, and no
+  page in a job, task, or node slot yet. They open only in the UI; the
+  terminal and MCP list them without rendering them.
+- **The bridge carries unary calls.** Streaming RPCs
+  (`StreamEvents`, `WatchScalingPolicies`) are not available to pages.
 - **Actions run from the UI.** The terminal and MCP read views and list
   their actions; there is no `legion app` command or MCP tool that runs one
   yet (`InvokeAppAction` is a public RPC).

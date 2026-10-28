@@ -76,7 +76,8 @@ Routes in `App.tsx`:
   `/observability` (shown only when the manager reports o11y enabled),
   `/testing` (unlisted component fixtures, see below)
 - `/apps/:app/:view` (an installed app's page; no index, see
-  [App extensions](#app-extensions))
+  [App extensions](#app-extensions)) and `/apps/:app/pages/:page` (an app's
+  sandboxed page, see [Sandboxed pages](#sandboxed-pages))
 - anything else renders a not-found card naming the path
 
 A shared layout provides the grouped sidebar nav, a slim topbar
@@ -774,8 +775,51 @@ and a view it returns replaces the drawn one; the panel then re-fetches.
 
 The browser never talks to an app: every view and action is a gRPC-Web call
 to the manager, which authorizes as the viewer, forwards with a signed viewer
-assertion, and validates the answer. Tier 2 (sandboxed single-file pages for
-UIs the blocks cannot express) is not built.
+assertion, and validates the answer.
+
+The bundled autoscaler's UI is built this way, with no page of its own in
+the SPA: its sidebar page, job panel, task badges, and node-group panel are
+its views ([autoscaling.md, "In the UI"](autoscaling.md#in-the-ui)).
+
+### Sandboxed pages
+
+An app's sandboxed page (tier 2, `ui.pages`;
+[Apps: Sandboxed pages](apps.md#sandboxed-pages)) is the one place app code
+runs in the browser, and it runs outside the SPA's origin.
+
+| Piece | Where |
+| --- | --- |
+| the sidebar item (a `nav` entry with `page` set) and the route `/apps/:app/pages/:page` | `App.tsx`, `pages/AppSandboxPage.tsx` |
+| the frame, the bridge's message handling, and the confirmation dialog | `components/apps/SandboxedPage.tsx` |
+| the CSP, the sandbox flags, the bridge script, and the request helpers | `utils/appBridge.ts` |
+
+- **Fetch.** `GetAppPage` (authorized as the viewer like a view) returns the
+  bundle and the page's RPC allowlist, each RPC marked read or write.
+- **Mount.** `<iframe sandbox="allow-scripts" srcdoc=… referrerpolicy=
+  "no-referrer">`. The `srcdoc` is the bundle with the CSP `<meta>` and the
+  bridge `<script>` inserted first (after a leading doctype):
+  `default-src 'none'; script-src 'unsafe-inline'; style-src
+  'unsafe-inline'; img-src data:; connect-src 'none'; form-action 'none';
+  base-uri 'none'`. The opaque origin keeps the page away from
+  `localStorage`, where the token lives, and from the SPA's DOM.
+- **Bridge.** The page posts `{ legion: "legion-bridge/1", id, op, ... }` to
+  its parent; the SPA answers `{ legion, id, ok, result | error }` and posts
+  `{ legion, event: "theme", theme }` when the theme changes. A message is
+  heard only if its `source` is the page's own frame window and its origin is
+  `"null"` (opaque), and only while the frame holds its first document: the
+  frame's second `load` (the page navigated away) closes the bridge for good.
+  At most 16 calls run at once, and 4 confirmations wait.
+- **Calls.** `call` is refused unless the RPC is in the allowlist and unary.
+  The request is parsed from proto3 JSON with the generated message type
+  (`Manager.methods`), a write waits for the dialog, and the call goes out
+  through `managerClient` (so it carries the viewer's token) with the
+  `legion-app-page: <app>/<page>` header, which the manager checks against
+  the page's current manifest. The reply goes back as proto3 JSON. `view` and
+  `action` use `GetAppView` and `InvokeAppAction` for the page's own app;
+  every action is confirmed. `navigate` takes in-app routes only.
+- **Confirmation.** A modal the SPA draws over everything, outside the frame,
+  naming the app, the RPC (or action), and the target taken from the request
+  (`job`, `name`, `node`, `path`, ...), with the request itself below.
 
 ## Namespaces
 
@@ -936,5 +980,8 @@ without touching the transport.
 - `npm run typecheck`: `tsc --noEmit`. `npm run build` typechecks and
   bundles.
 - `npm run gen`: regenerate `src/gen` from `proto/legion.proto`.
+- `npm run test:smoke` (after `npm run build`): the Playwright smoke tests
+  in `ui/tests/smoke`, against a fake manager in the browser
+  ([Testing: UI smoke tests](testing-and-benchmarks.md#ui-smoke-tests)).
 - CI (`.github/workflows/ci.yml`, job `ui-build`) runs the drift check, the
   typecheck and the build whenever `ui/**` or the proto changes.

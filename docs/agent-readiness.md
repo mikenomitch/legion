@@ -794,6 +794,13 @@ declared permission on the context) before the app is asked, so a
 nothing. Running an action (`InvokeAppAction`) is mutating, audited as
 `app.action`, and takes an idempotency key; agents read views only for now.
 
+An app may also ship **sandboxed pages** (`ui.pages`), single-file HTML the
+UI mounts in an iframe ([Apps: Sandboxed pages](apps.md#sandboxed-pages)).
+They are for people: `legion app view <app>` lists them, and
+`GetAppPage` (capability `app.page`) returns the bundle, but there is no MCP
+tool, because an agent cannot run a page. Everything a page does is an
+ordinary Manager RPC an agent can call itself.
+
 ## 7. State store introspection + saved query library
 
 The SQL state store is the agent's main introspection tool. It is read-only by
