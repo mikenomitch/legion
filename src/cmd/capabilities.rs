@@ -1265,6 +1265,38 @@ pub fn catalog() -> Vec<Capability> {
             mutates: true,
             read_only_safe: false,
         },
+        Capability {
+            name: "app.views",
+            cli: "legion app view <APP>",
+            grpc: Some("Manager/ListUiExtensions"),
+            summary: "List what an app shows you in the UI, and where: sidebar pages, overview cards, job and node panels, task badges, filtered by each one's declared permission.",
+            mutates: false,
+            read_only_safe: true,
+        },
+        Capability {
+            name: "app.view",
+            cli: "legion app view <APP> <nav|overview|job|task|node> [CTX...] [--view VIEW]",
+            grpc: Some("Manager/GetAppView"),
+            summary: "Render an app's declarative view (what its UI panel shows) as text, or its validated legion-view/1 JSON with -j; checked as you against the view's declared permission before the app is asked.",
+            mutates: false,
+            read_only_safe: true,
+        },
+        Capability {
+            name: "app.action",
+            cli: "legion app view <APP> <job|task|node> <CTX...> (lists the view's actions; they run from the UI)",
+            grpc: Some("Manager/InvokeAppAction"),
+            summary: "Run an action an app declares (a button in its view) on a job, task, or node, checked as you against the action's declared permission there; audited as an app.action event and retry-safe with an idempotency key.",
+            mutates: true,
+            read_only_safe: false,
+        },
+        Capability {
+            name: "app.page",
+            cli: "legion app view <APP> (lists the app's sandboxed pages; they open in the UI)",
+            grpc: Some("Manager/GetAppPage"),
+            summary: "Fetch an app's sandboxed page (ui.pages): its single-file HTML bundle and the RPCs it may call through the UI's bridge as you, checked against the page's declared permission before the app is asked. For the UI, which mounts it in a sandboxed iframe.",
+            mutates: false,
+            read_only_safe: true,
+        },
         // --- Service discovery ---
         Capability {
             name: "service.list",

@@ -207,8 +207,11 @@ pub struct AppManifest {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     #[schemars(with = "Vec<serde_json::Map<String, Value>>")]
     pub permissions: Vec<AclRule>,
-    /// UI registrations (apps plan §6.5). Stored as written; rendered from
-    /// phase A4 on.
+    /// UI registrations (apps plan §6.5; docs/apps.md, "Views and
+    /// actions"): slots, views, actions, the port they are served on, and
+    /// the refresh interval. Typed as `crate::structs::app_ui::UiSpec` and
+    /// checked at install; kept as JSON here so a record round-trips as
+    /// written.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ui: Option<Value>,
     /// Jobspec extension keys (apps plan §6.6). Stored as written; resolved
@@ -333,6 +336,10 @@ impl AppManifest {
             if !ui.is_object() {
                 return Err(format!("app {}: `ui` must be a record", self.name));
             }
+            let spec = crate::structs::app_ui::UiSpec::parse(ui)
+                .map_err(|err| format!("app {}: {err}", self.name))?;
+            spec.validate(&self.port_labels())
+                .map_err(|err| format!("app {}: {err}", self.name))?;
         }
         if let Some(extensions) = &self.extensions {
             if !extensions.is_array() && !extensions.is_object() {
@@ -479,6 +486,33 @@ impl AppManifest {
             parts.push(format!("{count} ({})", described.join("; ")));
         }
         parts
+    }
+
+    /// The port labels the app's tasks declare (`network.ports[].name`).
+    pub fn port_labels(&self) -> Vec<String> {
+        let mut job = self.job.clone();
+        let mut labels = Vec::new();
+        for_each_task(&mut job, |task| {
+            let ports = task
+                .get("network")
+                .and_then(|network| network.get("ports"))
+                .and_then(Value::as_array);
+            for port in ports.into_iter().flatten() {
+                if let Some(name) = port.get("name").and_then(Value::as_str) {
+                    if !labels.iter().any(|label| label == name) {
+                        labels.push(name.to_string());
+                    }
+                }
+            }
+        });
+        labels
+    }
+
+    /// The parsed `ui` block (empty when the manifest has none). Manifests
+    /// are validated at install, so an error here is a record written by an
+    /// older build.
+    pub fn ui_spec(&self) -> Result<crate::structs::app_ui::UiSpec, String> {
+        crate::structs::app_ui::UiSpec::of(self.ui.as_ref())
     }
 
     /// The UI slots the manifest registers (`nav`, `job`, ...), for `legion
@@ -2003,7 +2037,25 @@ mod app_tests {
         manifest.validate(false).expect("valid");
         assert_eq!(
             manifest.ui_slots(),
-            vec!["nav".to_string(), "job".to_string()]
+            vec![
+                "nav".to_string(),
+                "overview".to_string(),
+                "job".to_string(),
+                "task".to_string(),
+                "pages".to_string()
+            ]
+        );
+        let ui = manifest.ui_spec().expect("the ui block parses");
+        assert_eq!(ui.port(), "api");
+        let console = ui.page("console").expect("the console page");
+        assert!(console.allows_rpc("RunJob"));
+        assert!(manifest.ui_summary().contains(
+            &"a GitOps console page (sandboxed; calls ListJobs, GetJobInfo, RunJob as the viewer)"
+                .to_string()
+        ));
+        assert_eq!(
+            ui.action("sync-now").map(|action| action.mutating()),
+            Some(true)
         );
         let rendered = render_app_job(&record(manifest), NO_MARKER).expect("renders");
         serde_json::from_value::<crate::structs::JobConfig>(rendered.jobspec).expect("a jobspec");

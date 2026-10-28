@@ -1950,6 +1950,65 @@ line on stderr.
 **Why (extensibility).** A plugin should compile without Legion's build, and
 CI must not need the network.
 
+## 82. The autoscaler's UI is app views in their own module, reading the app's evaluation log
+
+*Implementation, Phase 6.*
+
+**Call.** The job panel, task badge, Autoscaling sidebar page and
+node-group panel are views registered by `src/apps/autoscaler_ui.rs`, with
+small hooks in the engine. The job panel's hour of replicas against the
+signal comes from the app's in-memory evaluation log, not from
+`GetScalingInputs` history.
+
+```console
+$ legion app view autoscaler job web
+```
+
+**Alternatives.** Draw the series from the manager's rollup history.
+
+**Trade-off.** The series is empty after an app restart, and per replica
+until sharding shares it.
+
+**Why (correctness).** It shows the exact reading the policy decided on,
+for any source, plugins included.
+
+## 83. Pause, Resume and Release buttons run with the app's grant
+
+*Implementation, Phase 6.*
+
+**Call.** The panel offers Pause (with a duration), Resume, and Release.
+The action runs as the app, with `by <viewer>` in the reason; the
+`app.action` event names the viewer. Resume is an addition to the plan's
+sketch.
+
+**Alternatives.** Pause and Release only; act as the viewer.
+
+**Trade-off.** The pause's recorded principal is the app's; the viewer is
+in the reason and the event.
+
+**Why (ease).** Without Resume, a pause made from the UI could only be
+lifted from the CLI; app actions run as the app by design (apps calls
+entry 68).
+
+## 84. The sidebar page declares `scale:read`, and the grant gains `node:read`
+
+*Implementation, Phase 6.*
+
+**Call.** The Autoscaling page needs `scale:read` somewhere and lists only
+the viewer's namespaces; the node-group panel needs `node:read` on the
+node's pool, so the app's grant gains `node:read`, adopted on upgrade by
+`legion:bootstrap`. The node panel shows what exists: the join-token
+group, the provider id, pool members, and capacity demand for nodes like
+it (cached 30 seconds); a node in no group shows nothing.
+
+**Alternatives.** No permission on the page (every `app:read` viewer sees
+every policy).
+
+**Trade-off.** The app can read every node.
+
+**Why (security).** Without the permission the assertion carries no
+namespaces to filter by.
+
 ## Ledger: what stands from the superseded plan's calls
 
 The superseded plan's calls are not rewritten (`plans/README.md`). This is

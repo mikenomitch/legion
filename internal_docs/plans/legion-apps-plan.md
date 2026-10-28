@@ -40,7 +40,16 @@ docs: [jobs-tasks-and-scheduling.md](../../docs/jobs-tasks-and-scheduling.md#unk
 Calls entries 58-67 record where A6a differs: every `JobConfig` parse is
 strict (entry 58), network policy blocks and value sources stay strict even
 with the flag (entry 59), and free-form maps such as `resources` are not
-checked (entry 60). A4, A5 and A6b are not built. It has six phases (§8),
+checked (entry 60). **A4 and A5 shipped 2026-10-28** (app views and
+actions in the `nav`, `overview`, `job`, `task`, and `node` slots, authorized
+as the viewer and forwarded with a signed viewer assertion over a narrow
+worker-plane RPC; `legion app view`; and sandboxed single-file pages behind a
+`postMessage` bridge with an allowlist the manager re-checks; docs:
+[apps.md](../../docs/apps.md#views-and-actions)). Calls entries 68-84 record
+where they differ: running an action needs `app:read` plus the action's
+declared permission rather than `app:write` (entry 68), the forward is its
+own RPC until the reverse proxy lands (entry 70), and pages live only in the
+sidebar (entry 82). A6b is not built. It has six phases (§8),
 and each ships alone. The first consumer is the autoscaler
 ([autoscaler-v2-plan.md](autoscaler-v2-plan.md)). GitOps is the second, and
 this plan checks the substrate against it (§6.8). Deliberately deferred:

@@ -393,6 +393,33 @@ pub fn connect_manager_client_at(
     address: &str,
     timeouts: ClientTimeouts,
 ) -> R<AuthedManagerClient> {
+    let interceptor = auth_interceptor(address, timeouts.request);
+    connect_with_interceptor(address, timeouts, interceptor)
+}
+
+/// A client for the manager at `address` that presents `token` rather than
+/// the CLI's own (`LEGION_TOKEN`, the token file): a caller acting as one
+/// identity among several, such as a test playing an app and its viewers.
+pub fn connect_manager_client_with_token(
+    address: &str,
+    token: &str,
+    timeouts: ClientTimeouts,
+) -> R<AuthedManagerClient> {
+    let token = format!("Bearer {}", token.trim())
+        .parse::<MetadataValue<Ascii>>()
+        .context("the token has non-ASCII characters")?;
+    let interceptor = AuthInterceptor {
+        token: Some(token),
+        request_timeout: timeouts.request,
+    };
+    connect_with_interceptor(address, timeouts, interceptor)
+}
+
+fn connect_with_interceptor(
+    address: &str,
+    timeouts: ClientTimeouts,
+    interceptor: AuthInterceptor,
+) -> R<AuthedManagerClient> {
     let address = address.to_owned();
     if let Some(path) = unix_socket_path(&address) {
         // A local socket (a task's API socket): no TLS, and the worker
@@ -400,7 +427,7 @@ pub fn connect_manager_client_at(
         // token of its own.
         return Ok(ManagerClient::with_interceptor(
             unix_socket_channel(path, timeouts.connect),
-            auth_interceptor(&address, timeouts.request),
+            interceptor,
         ));
     }
     let mut endpoint = Endpoint::from_shared(address.clone())
@@ -441,10 +468,7 @@ pub fn connect_manager_client_at(
     };
 
     let channel = endpoint.connect_lazy();
-    Ok(ManagerClient::with_interceptor(
-        channel,
-        auth_interceptor(&address, timeouts.request),
-    ))
+    Ok(ManagerClient::with_interceptor(channel, interceptor))
 }
 
 /// A client for one worker's plane (port 4848), for the commands that talk

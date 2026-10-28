@@ -102,6 +102,7 @@ Even with `--allow-write`, `legion_state_query` stays read-only.
 | `legion_acl_grants_list` | no | Job grants: what each job version's `legion` identity was granted at submit (inline `permissions` and `policies`), who granted it, and whether it was revoked (`include_revoked`). `job` narrows to one job's canonical id. Needs `acl:read`. Revoking is `legion acl grants revoke` on the CLI, not an MCP tool. |
 | `legion_app_list` | no | Installed [apps](apps.md) (Legion's add-ons): each app's version, source, status (`running`, `degraded`, `pending`, `stopped`, with `statusDetail` saying why), placement, replicas running against desired (`running`, `desired`), the nodes it runs on, and its UI slots. Needs `app:read`; the list is filtered by the `names` selector. |
 | `legion_app_status` | no | One app (`app`): its record (`manifest`, `settings`, `config`), its grant (`grant.rules`, who approved it), its job's status, the app reconciler's last action and error (`reconcile`), its build marker and what it waits for (`reconcile.markerReason`), and `notes` (no system worker, workload identity off). Changing an app (install, config, settings) is `legion app` on the CLI, not an MCP tool. |
+| `legion_app_view` | no | One of an app's declarative views ([Apps: Views and actions](apps.md#views-and-actions)): what its panel on a job, task, or node page, its sidebar page, or its overview card shows a person, as JSON. Takes `app`, `slot` (`nav`, `overview`, `job`, `task`, `node`), the slot's context (`job` with `namespace`, `task`, `group`, `node`), and optionally `view`. Returns `document` (the validated `legion-view/1` blocks), `actions` (each with `allowed` and `mutating`), and which allocation answered. Checked as the caller: `app:read` and the view's declared permission on the context, before the app is asked. The same data as `legion app view -j`. Actions are not run over MCP. |
 | `legion_events` | no | List scheduler events. Poll with `after_id` to tail. `instance_id` narrows to one stateful instance (its own events plus its allocations'), `allocation_id` to one allocation. |
 | `legion_job_logs` | no | Fetch captured task stdout/stderr for a job, including allocations removed in the last 24 hours (`removed`, `removalCause`). |
 | `legion_state_query` | no | Read-only SQL against the state store. |
@@ -771,6 +772,36 @@ Every refusal uses the standard error envelope, with `retryable` and a
 `Retry-After` header when waiting longer would help (`wake_timeout`,
 `manager_unavailable`). `legion instance get -j` shows the task's `wake`
 block and, while the instance runs, its `endpoints`.
+
+## 6d. Reading what an app's panel shows (`legion app view`)
+
+Apps add panels to the UI as declarative views, never as code
+([Apps: Views and actions](apps.md#views-and-actions)). The same views are
+data an agent can read: whatever a person sees on a panel, an agent sees too.
+
+```bash
+legion app view gitops                       # what the app shows you, and where
+legion app view gitops job web -j            # the job panel for `web`, as JSON
+legion app view gitops task web sync -j      # a task's badge view
+legion app view gitops node wkr-3 -j         # the node panel
+```
+
+`-j` (and the `legion_app_view` MCP tool) returns the validated
+`legion-view/1` document under `document` (typed blocks: `stats`, `series`,
+`table`, `timeline`, `keyValue`, `notice`, `markdown`, `actions`), plus
+`actions`, each with `allowed` (whether you hold its permission there) and
+`mutating`. Every read is checked as the caller (`app:read`, then the view's
+declared permission on the context) before the app is asked, so a
+`PERMISSION_DENIED` means the view is not yours to see, and the app saw
+nothing. Running an action (`InvokeAppAction`) is mutating, audited as
+`app.action`, and takes an idempotency key; agents read views only for now.
+
+An app may also ship **sandboxed pages** (`ui.pages`), single-file HTML the
+UI mounts in an iframe ([Apps: Sandboxed pages](apps.md#sandboxed-pages)).
+They are for people: `legion app view <app>` lists them, and
+`GetAppPage` (capability `app.page`) returns the bundle, but there is no MCP
+tool, because an agent cannot run a page. Everything a page does is an
+ordinary Manager RPC an agent can call itself.
 
 ## 7. State store introspection + saved query library
 

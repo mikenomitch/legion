@@ -601,6 +601,63 @@ strategies (missing too), pins, pauses, rollouts, and the namespace quota.
 History covers at most the last hour, from when the answering manager took
 the status lane, and only tasks with usage or `autoscale`.
 
+### In the UI
+
+The autoscaler's UI is built from its own app views
+([apps.md, "Views and actions"](apps.md#views-and-actions)), so the SPA,
+the terminal, and agents all see the same thing:
+
+| Where | What | Who sees it |
+| --- | --- | --- |
+| **Autoscaling** in the sidebar's Apps section | every autoscaled task you may read: target (linking to its job), mode, now, want, bounds, state, the last change, and why; counts of policies, pending changes, pauses, pins, and targets needing attention; whether the autoscaler is running | `scale:read` somewhere; rows only from namespaces where you hold it |
+| a panel on an autoscaled **job's page** | per autoscaled task: now, want, bounds (with the policy in one line), state (with the last evaluation's why), and mode; an hour of replicas against the signal its first check reads, with the target; the job's last 20 scaling decisions, by people and the autoscaler; pauses and pins; **Pause**, **Resume**, and **Release the pin** | `scale:read` on the job |
+| a badge on an autoscaled **task's row** | `auto 6 · 2..8` (`auto 6→8` while it wants a change; `paused`, `pinned`, `dry-run 4 (would 7)`, `autoscale invalid`) | `scale:read` on the job |
+| a panel on a **node's page**, for a node in a node group | the group its join token stamped (`legion.nodegroup`), the token, its provider id and scale-in protection; the group's members in the node's pool; and how many nodes like it the pending work would need ([Capacity demand](#capacity-demand)) | `node:read` on the node's pool |
+
+A job with no autoscaled task, and a node in no group, draw nothing.
+
+```console
+$ legion app view autoscaler job web
+Autoscaling
+
+  Now: 6   Want: 6   Bounds: 2..8   State: ok (ok)   Mode: enforce
+    Bounds: 2..8, cpu 70%, enforce
+    State: cpu 0.71 vs 0.70 (6 ready)
+
+Replicas vs cpu (1h)
+  replicas     ▁▁▁▁▁▁▁▁▁▁▁▁████████████████████████████ now 6, min 4, max 6
+  cpu          ██████████▇▇▇▆▆▅▃▃▃▂▂▂▂▂▂▂▂▂▂▂▂▂▂▂▂▂▂▂▂▂▂ now 71%, min 70%, max 91%
+  cpu target   ▁▁                                       now 70%, min 70%, max 70%
+
+Decisions
+  2026-10-28 14:02:25Z  4 → 6
+                        cpu 0.91 vs 0.70 (4 ready) (by autoscaler)
+
+Actions: Pause…
+
+  pause (Pause autoscaling): needs scale:write; you may run it from the UI
+```
+
+- **The hour of evaluations is the app's memory.** The engine keeps the
+  last hour of each target's evaluations (the count, what it wanted, and
+  each check's reading) and the panel draws them. A restarted autoscaler
+  starts the hour afresh, and the panel says it has no evaluations yet. The
+  decisions below it are the durable [history](#seeing-what-it-did-and-why).
+- **The actions act on the panel's job, as the autoscaler.** The manager
+  checks `scale:write` on the job as you, and records an `app.action`
+  event naming you; the app then calls `PauseScaling` or `ScaleTask`
+  (`release`) with its own grant, with `paused from the UI by <you>` as the
+  reason. **Pause** takes a duration (default 1 hour) and pauses every
+  autoscaled task of the job; **Resume** lifts the job's pause (a
+  cluster-wide pause is lifted with `legion scaling resume --all`);
+  **Release the pin** ends every pin on the job's autoscaled tasks.
+- **Node groups are shown, not scaled.** The node panel reports a group's
+  membership and its capacity demand; nothing adds or removes nodes yet
+  ([Known limitations](#known-limitations)).
+- The views refresh every 10 seconds while open. `legion app view
+  autoscaler` lists them; `legion app view autoscaler job web` and the
+  `legion_app_view` MCP tool render them.
+
 ### Where it runs
 
 The autoscaler is the bundled app `autoscaler`, the job
@@ -610,7 +667,8 @@ joined), and needs nothing configured: it reaches Legion through its
 allocation's API socket as its own workload identity, which workload
 identity being on by default makes available on a fresh cluster
 ([workload-identity.md](workload-identity.md)). Its grant is `scale:read`
-and `scale:write` in every namespace: it can resize, not redeploy.
+and `scale:write` in every namespace, and `node:read` for its node-group
+panel: it can resize, not redeploy.
 
 It watches policies (`WatchScalingPolicies`: a full set whenever a job,
 a standalone policy, a pause, the defaults, a namespace policy, or its own
@@ -1190,6 +1248,8 @@ a job without the right to redeploy it. See [auth-and-acls.md](auth-and-acls.md)
 | `GetScalingDefaults` | `scale:read` on the namespace |
 | `ApplyScalingDefaults` | `operator:write` |
 | `ReportScalingStatus`, `RecordScalingAction` | app-plane: only the bundled autoscaler's own identity (or a management token) |
+| the UI's panels, badges, and page (`GetAppView` on the `autoscaler` app) | `app:read` on `autoscaler`, and `scale:read` on the job (`node:read` on the node's pool for the node panel; `scale:read` somewhere for the sidebar page) |
+| the UI's Pause, Resume, and Release (`InvokeAppAction`) | `app:read` on `autoscaler`, and `scale:write` on the job |
 
 A standalone policy is scoped like a job of the same name in its
 namespace: a rule with `names = ["render-*"]` on `scale` covers the
@@ -1328,7 +1388,10 @@ is trusted, as everywhere else.
   exactly what fits.
 - **One autoscaler replica.** When it restarts, its windows start empty: no
   scale-in for one `down.stabilize`, and the averaging windows refill.
-  While it is down nothing scales.
+  While it is down nothing scales, and its UI panels say so.
+- **The job panel's hour is in the app's memory.** A restarted autoscaler
+  draws no series until it has evaluated again; the durable record is the
+  history below it.
 - **Status lives in memory.** The last evaluation of each target, and the
   app's heartbeat, are held by the status-lane leader. A takeover starts
   empty and shows `starting`, then fills on the app's next report.

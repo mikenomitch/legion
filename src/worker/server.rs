@@ -367,6 +367,27 @@ impl Worker for WorkerDaemonService {
         Ok(Response::new(GetTaskLogsReply { streams }))
     }
 
+    /// Deliver one app view or action request to a local app allocation's
+    /// UI port (docs/apps.md, "Views and actions").
+    #[instrument(skip_all, fields(allocation_id = request.get_ref().allocation_id))]
+    async fn forward_app_request(
+        &self,
+        request: Request<crate::structs::ForwardAppRequestRequest>,
+    ) -> Result<Response<crate::structs::ForwardAppRequestReply>, Status> {
+        // Caller class: manager only.
+        crate::worker::plane::require_manager(&request, "ForwardAppRequest")?;
+        let request = request.into_inner();
+        crate::worker::app_forward::check_request(&request)?;
+        let target = self
+            .task_manager
+            .lock()
+            .map_err(|_| Status::internal("Task manager lock poisoned"))?
+            .app_forward_target(request.allocation_id, &request.job_id, &request.port)?;
+        crate::worker::app_forward::deliver(&target, &request)
+            .await
+            .map(Response::new)
+    }
+
     type ExecTaskStream = ExecTaskStream;
 
     #[instrument(skip_all)]

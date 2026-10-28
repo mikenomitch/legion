@@ -15,7 +15,7 @@
       runtime = "exec",
       config = { command = ["legion:self", "app", "run", "autoscaler"] },
       resources = { cpu = 200, memory = 256 },
-      # The app's HTTP port: `/healthz` now, the UI views later. Not a
+      # The app's HTTP port: `/healthz`, and the UI views below. Not a
       # catalog service.
       network = { ports = [{ name = "api" }] },
       checks = [
@@ -31,15 +31,54 @@
       ],
     },
   },
-  # Exactly what the app calls: WatchScalingPolicies and GetScalingInputs
-  # (scale:read) and ScaleTask (scale:write). ReportScalingStatus and
+  # Exactly what the app calls: WatchScalingPolicies, GetScalingInputs,
+  # GetScalingStatus, and GetScaleHistory (scale:read); ScaleTask and
+  # PauseScaling (scale:write); and, for the node-group panel, GetNode,
+  # GetNodes, and GetCapacityDemand (node:read). ReportScalingStatus and
   # RecordScalingAction are app-plane: the manager accepts them from this
-  # app's identity alone, with no rule needed. Node groups and sharding add
-  # node and kv rules when the app calls those APIs.
+  # app's identity alone, with no rule needed. Node-group scaling and
+  # sharding add node:write and kv rules when the app calls those APIs.
   permissions = [
     { resources = ["scale"], actions = ["read", "write"], namespaces = ["*"] },
+    { resources = ["node"], actions = ["read"] },
   ],
-  ui = { port = "api" },
+  # The autoscaler's UI, as declarative views the SPA, `legion app view`,
+  # and `legion_app_view` render (docs/autoscaling.md, "In the UI"). Each
+  # entry is shown only to viewers holding its permission: on the job for
+  # the panel and badges, on the node's pool for the node-group panel, and
+  # somewhere for the sidebar page, which then lists only the namespaces
+  # the viewer may read.
+  ui = {
+    port = "api",
+    nav = [
+      { title = "Autoscaling", icon = "gauge", view = "policies",
+        permission = { resource = "scale", action = "read" } },
+    ],
+    job = [
+      { title = "Autoscaling", view = "job",
+        permission = { resource = "scale", action = "read" } },
+    ],
+    task = [
+      { badge = "task-badge", permission = { resource = "scale", action = "read" } },
+    ],
+    node = [
+      { title = "Node group", view = "node",
+        permission = { resource = "node", action = "read" } },
+    ],
+    actions = [
+      { name = "pause", title = "Pause autoscaling",
+        confirm = "Pause autoscaling for every autoscaled task of {job}? People can still scale it by hand.",
+        inputs = { for = { type = "duration", default = "1h", label = "For" } },
+        permission = { resource = "scale", action = "write" } },
+      { name = "resume", title = "Resume autoscaling",
+        confirm = "Resume autoscaling for {job}?",
+        permission = { resource = "scale", action = "write" } },
+      { name = "release", title = "Release the pin",
+        confirm = "Release the pin on {job}? The autoscaler takes the count over again, at its normal rate.",
+        permission = { resource = "scale", action = "write" } },
+    ],
+    refresh = "10s",
+  },
   config = {
     schema = {
       type = "object",

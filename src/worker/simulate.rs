@@ -766,6 +766,16 @@ impl Worker for SimWorkerService {
         ))
     }
 
+    async fn forward_app_request(
+        &self,
+        request: Request<crate::structs::ForwardAppRequestRequest>,
+    ) -> Result<Response<crate::structs::ForwardAppRequestReply>, Status> {
+        crate::worker::plane::require_manager(&request, "ForwardAppRequest")?;
+        Err(Status::unimplemented(
+            "simulated workers run no tasks, so they host no app to forward to",
+        ))
+    }
+
     type ExecTaskStream = crate::worker::exec::ExecTaskStream;
 
     async fn exec_task(

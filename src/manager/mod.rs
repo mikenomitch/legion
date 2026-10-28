@@ -1,4 +1,6 @@
 pub mod acl;
+pub mod app_forward;
+pub mod app_page_guard;
 pub mod apps;
 pub mod archive;
 pub mod auth_method;

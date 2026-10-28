@@ -137,6 +137,37 @@ ulimit -n 65536
 cargo test --all --locked
 ```
 
+### UI smoke tests
+
+The SPA has no unit-test runner. Its smoke tests drive the built UI in a
+real browser instead, against a fake manager that answers the SPA's
+gRPC-Web calls inside the browser (Playwright's request routing), so no
+Legion process is needed:
+
+```bash
+cd ui
+npm ci
+npm run build
+npm run test:smoke                 # every suite
+npm run test:smoke -- app-pages    # one suite
+```
+
+The runner (`ui/tests/smoke/run.cjs`) serves `ui/dist` with `vite preview`
+on port 4179 (`SMOKE_PORT` overrides it) and runs each suite in Chromium.
+It needs the `playwright` package and its Chromium, which the UI does not
+depend on: `npm install -g playwright && npx playwright install chromium`.
+The suites:
+
+| Suite | Covers |
+| --- | --- |
+| `app-views` | app views (tier 1): the sidebar's Apps entry, the block renderer on an app page and the `/testing` fixture, a mutating action's confirmation and inputs, hostile text staying text |
+| `app-pages` | sandboxed pages (tier 2): the iframe's sandbox and CSP, an allowlisted call as the viewer with the `legion-app-page` header, a refused RPC outside the allowlist, the confirmation of a mutating call (cancel and confirm), no storage, DOM, network, or forms from the page, messages from other windows ignored, `legion.navigate`, the bridge closing after the frame navigates |
+| `autoscaler-panel` | the autoscaler's job panel and sidebar page as the SPA draws them |
+
+A suite is a module exporting `async ({ browser, base, check }) => {}`, and
+`ui/tests/smoke/support.cjs` has the protobuf encoder and the fake manager.
+They are not in CI: they need a browser the CI image does not have.
+
 ## Benchmark Coverage
 
 Benchmark code lives under `benchmarks/`:

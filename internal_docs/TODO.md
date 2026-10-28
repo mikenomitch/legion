@@ -4361,7 +4361,7 @@ replicas is one command on day N. The shared substrate is
 plan.
 
 - [ ] **Legion apps substrate**: [plan](plans/legion-apps-plan.md) (IN EXECUTION; A1, A2,
-      A3 and A6a shipped, in Done) · [calls](calls/legion-apps-plan_calls.md)
+      A3, A4, A5 and A6a shipped, in Done) · [calls](calls/legion-apps-plan_calls.md)
   - [ ] A1 follow-ups, found while building it:
     - [ ] **A manager's system worker and a standalone worker on one Linux
           host overwrite each other's host guard.** The kernel host guard is
@@ -4434,14 +4434,28 @@ plan.
           retries a failing or parked app once, then backs off from scratch.
     - [ ] **`legion app config get` prints JSON, not Nickel**
           ([calls entry 57](calls/legion-apps-plan_calls.md)).
-    - [ ] **The UI does not know apps yet**: `ui/src/gen` has the new RPCs,
-          but no page uses them (A4 builds the UI side).
-  - [ ] A4: UI tier 1, declarative views in `nav`/`overview`/`job`/`task`/`node`
-        slots, served by `GetAppView`/`InvokeAppAction` (authorized as the
-        viewer, forwarded with a signed viewer assertion), plus
-        `legion app view` and `legion_app_view`
-  - [ ] A5: UI tier 2, sandboxed single-file pages with a postMessage bridge
-        (RPC allowlist, viewer identity, strict CSP)
+  - [ ] A4/A5 follow-ups, found while building them:
+    - [ ] **No Apps index page or stopped-app overview finding**, and the
+          plan §6.7 `health` view is not built.
+    - [ ] **No command or MCP tool runs an app action**; the terminal and
+          agents read views only ([calls 78](calls/legion-apps-plan_calls.md)).
+    - [ ] **Sandbox apps cannot serve views or pages**: no API socket to
+          fetch the keys that verify the viewer assertion
+          ([calls 69](calls/legion-apps-plan_calls.md)).
+    - [ ] **`legion app test`** (check that a third-party app refuses bad
+          assertions, plan §6.5) is not built
+          ([calls 78](calls/legion-apps-plan_calls.md)).
+    - [ ] **Pages only in the sidebar**: pages in job, task, and node slots
+          are deferred ([calls 82](calls/legion-apps-plan_calls.md)).
+    - [ ] **`PAGE_RPCS` must classify every new page-callable RPC**, or
+          pages can't call it ([calls 80](calls/legion-apps-plan_calls.md)).
+    - [ ] **The UI smoke tests are not in CI** (`npm run test:smoke`
+          needs Playwright and a browser;
+          [calls 84](calls/legion-apps-plan_calls.md)).
+    - [ ] **Fold `ForwardAppRequest` into the reverse proxy's
+          `ProxyTunnel`** when that plan ships, and list it in the
+          worker-plane-auth plan §6.1
+          ([calls 70](calls/legion-apps-plan_calls.md)).
   - [ ] A6b: jobspec extensions. Natural extension keys that apps declare
         at fixed points (job, group via a task, task, volume, port,
         service), validated against the app's JSON Schema (the task-runtime
@@ -4534,9 +4548,6 @@ plan.
     - [ ] **An `autoscale` edit during a rollout restarts the rollout**
           instead of applying in place
           ([calls 47](calls/autoscaler-v2-plan_calls.md)).
-    - [ ] **The UI shows nothing of autoscaling**: the regenerated client
-          has the new RPCs; the job page's Scale card does not use them
-          (Phase 6 builds the panels as app extensions).
     - [ ] **Cluster scaling defaults keep no version history**: only the
           current record and its version; a history row's digest still
           resolves to the exact policy through `scaling_policy_snapshot`.
@@ -4602,7 +4613,11 @@ plan.
           `nodegroup.scale_in` events
     - [ ] Lost-node GC: forgetting nodes that stayed lost past a deadline
           (`legion node forget` is the manual path today)
-  - [ ] Phase 6: autoscaler UI as app extensions (needs apps A4)
+  - [x] Phase 6: the autoscaler's UI as app views (2026-10-28; in Done)
+  - [ ] Phase 6 follow-ups: the job panel's series is the app's in-memory
+        evaluation log, empty after a restart and per replica
+        ([calls 82](calls/autoscaler-v2-plan_calls.md)); the node-group
+        panel shows node-group policy state only once Phase 5b runs them
   - [ ] Phase 7: sharded replicas (shard leases, rebalancing) and a
         10,000-policy load test
   - [x] **Hardening:** `GetJobScaleStatus` reports through
@@ -6288,6 +6303,15 @@ findings: [kernel-classifier-findings.md](kernel-classifier-findings.md)
         (`tests/integration/autoscaler.rs`)
   - Deferred: `wake = "on-request"` (in *Deferred from v2* above)
 
+- [x] **Autoscaler Phase 6: the autoscaler's UI as app views** (2026-10-28,
+      [plan](plans/autoscaler-v2-plan.md) §6.14, §8 ·
+      [calls 82-84](calls/autoscaler-v2-plan_calls.md) · docs:
+      [autoscaling.md](../docs/autoscaling.md#in-the-ui))
+  - [x] The Autoscaling sidebar page (filtered by the viewer's
+        namespaces), the job panel (now/want/bounds, an hour of replicas
+        against the signal, history, Pause/Resume/Release), the task badge
+        (`auto 6 · 2..8`), and the node-group panel; rendered by the SPA,
+        `legion app view autoscaler …`, and `legion_app_view`
 - [x] **Autoscaler Phase 4: plugins and standalone policies** (2026-10-28,
       [plan](plans/autoscaler-v2-plan.md) §6.2, §6.7, §6.13, §8 ·
       [calls 63-64, 66-71, 75-81](calls/autoscaler-v2-plan_calls.md) ·
@@ -6422,6 +6446,33 @@ findings: [kernel-classifier-findings.md](kernel-classifier-findings.md)
         config_changed|reconciled|reconcile_failed`), `legion_apps{status}`,
         the `legion_app_list` and `legion_app_status` MCP tools, capability
         entries
+- [x] **Legion apps A4: UI tier 1** (2026-10-28,
+      [plan](plans/legion-apps-plan.md) §6.5, §8 ·
+      [calls 68-79](calls/legion-apps-plan_calls.md) · docs:
+      [apps.md](../docs/apps.md#views-and-actions),
+      [ui-architecture.md](../docs/ui-architecture.md),
+      [auth-and-acls.md](../docs/auth-and-acls.md),
+      [agent-readiness.md](../docs/agent-readiness.md))
+  - [x] The typed manifest `ui` block (slots `nav`, `overview`, `job`,
+        `task`, `node`; actions with typed inputs and permissions) and the
+        closed `legion-view/1` block set with its validator
+  - [x] `ListUiExtensions`, `GetAppView`, `InvokeAppAction` (as the viewer,
+        idempotency keys, `app.action` events), the signed viewer assertion,
+        and the worker-plane forward `ForwardAppRequest`
+  - [x] The app framework's views, actions and assertion verification
+        (`AppContext::view`/`action`), `legion app view`, `legion_app_view`
+  - [x] SPA slot outlets: the Apps sidebar section and app pages, homepage
+        cards, job/task/node panels, task badges
+- [x] **Legion apps A5: sandboxed pages** (2026-10-28,
+      [plan](plans/legion-apps-plan.md) §6.5, §8 ·
+      [calls 80-84](calls/legion-apps-plan_calls.md) · docs:
+      [apps.md](../docs/apps.md), [ui-architecture.md](../docs/ui-architecture.md))
+  - [x] `ui.pages` and `GetAppPage`; pages as sidebar entries
+  - [x] The `srcdoc` iframe host (`sandbox="allow-scripts"`, the plan's
+        CSP), the `postMessage` bridge (`legion.call|view|action|navigate`)
+        with the `PAGE_RPCS` allowlist re-checked by the manager and an
+        SPA-owned confirmation for every write
+  - [x] Playwright smoke tests (`npm run test:smoke` in `ui/`)
 - [x] **Legion apps A6a: strict jobspec fields** (2026-10-28,
       [plan](plans/legion-apps-plan.md) §6.6, §8 ·
       [calls 58-67](calls/legion-apps-plan_calls.md) · docs:

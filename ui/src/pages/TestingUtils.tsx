@@ -27,6 +27,9 @@ import {
 import { forkPlan, resumeBlocker, stopBlocker, suspendPlan } from '../utils/instances'
 import { snapshotBudgets } from '../utils/usage'
 import { GetNodeUsageReply, SnapshotBudget, SuspendedCapacity } from '../gen/legion_pb'
+import { ViewBlocks } from '../components/apps/ViewBlocks'
+import { autoscalerActions, autoscalerJobView } from '../fixtures/appViews'
+import { viewContext } from '../utils/appViews'
 
 /*
  * Unlisted page (/testing) that renders components from fixture data, so a
@@ -99,6 +102,12 @@ export default function TestingUtils() {
         title="Component fixtures"
         subtitle="Views rendered from fixture data, for shapes a dev cluster cannot produce. Nothing on this page talks to the manager."
       />
+
+      <Fixture title="App view: every block" note="An app job panel (docs/apps.md, The view schema), drawn from a fixture document. The action buttons would call InvokeAppAction.">
+        <SectionCard title={autoscalerJobView.title} description="From the autoscaler app">
+          <ViewBlocks app="autoscaler" document={autoscalerJobView} actions={autoscalerActions} context={viewContext('job', { namespace: 'default', job: 'web' })} />
+        </SectionCard>
+      </Fixture>
 
       <Fixture title="Worker usage: oversubscribed and under pressure" note="w-03 at ×1.5 with the response acting. The pressure order lists ranked allocations only.">
         <NodeUsageCard usage={pressuredNode} />

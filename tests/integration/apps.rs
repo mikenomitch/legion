@@ -716,7 +716,8 @@ async fn a_third_party_app_installs_reconciles_and_uninstalls_test() -> R<()> {
         "placement": "managers",
         "job": { "task": { "name": "sync", "runtime": "exec",
             "artifacts": ["https://example.com/gitops/0.2.0/legion-gitops-linux-amd64.tar.gz"],
-            "config": { "command": ["legion-gitops"] } } },
+            "config": { "command": ["legion-gitops"] },
+            "network": { "ports": [{ "name": "api" }] } } },
         "permissions": [
             { "resources": ["job"], "actions": ["read", "write"], "namespaces": ["team-*"] },
             { "resources": ["template"], "actions": ["read"] },

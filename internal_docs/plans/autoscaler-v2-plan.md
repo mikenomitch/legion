@@ -16,7 +16,9 @@ manager keeps) and Phase 4 (the `legion-scaling/1` plugin protocol, plugins
 installed through the autoscaler's app config, the `exec` and `noop`
 targets, standalone `ScalingPolicy` objects with `legion scaling
 apply|list|delete`, `legion scaling plugin test`, the Rust SDK and example
-plugins) shipped 2026-10-28 (calls entries 63-81). Phases 5b, 6 and 7 are in
+plugins) shipped 2026-10-28 (calls entries 63-81), and so did Phase 6 (the
+autoscaler's UI as app views: the Autoscaling page, the job panel, the task
+badge, the node-group panel; calls entries 82-84). Phases 5b and 7 are in
 progress. Deliberately left from 3 and 4: `wake = "on-request"` (entry 73),
 node-group policies at `scaling apply` (refused until 5b, entry 69), and
 per-plugin concurrency (entry 67). (Written 2026-10-19; layered defaults, in-place policy edits, and

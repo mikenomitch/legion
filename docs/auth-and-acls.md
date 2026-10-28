@@ -122,7 +122,7 @@ reports `aclEnabled: false`.
 | `net` | network policy and plugin objects ([Network Handlers](network-handlers.md), [Network Plugins](network-plugins.md)) | list policies, show or test a job's effective policy (scope by job name); list, describe, and read the status of plugins | apply or delete a policy. Scope with `pools`, which is matched against the policy's own `selector.nodePools`, so a pool's admin can set posture for their pool without cluster-wide write. Apply or delete a plugin: a `usableBy = "policies"` plugin's `nodePools` scope it the same way; a cluster-wide one, or any `usableBy = "jobs"` plugin, needs unscoped write. |
 | `snapshot` | instance snapshots ([Suspend and Resume](suspend-and-resume.md)) | list, inspect, warm a published one onto nodes, restore an instance from one, and create instances from one (restore and create also need `job:write`) | create (including `--publish`), delete, and name snapshots, suspend with a memory checkpoint, and fork (fork also needs `job:write`) (scope by job name and namespace) |
 | `namespace` | namespace objects ([Namespaces](namespaces.md)) | get a namespace (listing is per item: any allow in a namespace shows it) | create, update, and delete namespaces whose names match (scope with `namespaces`). A cascade delete also needs `job:write` there. |
-| `app` | [apps](apps.md): Legion's add-ons | list and show apps (scope with `names`, matched against app names) | install, upgrade, uninstall, enable, disable, and change settings and config. Installing and upgrading also need every permission the manifest asks for, and a config change that touches a code field needs the app's whole grant: `app:write` alone never hands out an app's grant. Cluster-scoped. |
+| `app` | [apps](apps.md): Legion's add-ons | list and show apps (scope with `names`, matched against app names), and see their views and sandboxed pages and run their actions, each also checked against the view's, page's, or action's own declared permission ([Apps: Who sees what](apps.md#who-sees-what)) | install, upgrade, uninstall, enable, disable, and change settings and config. Installing and upgrading also need every permission the manifest asks for, and a config change that touches a code field needs the app's whole grant: `app:write` alone never hands out an app's grant. Cluster-scoped. |
 
 Actions are `read` and `write`. `write` does not imply `read`, so grant both.
 Grant `state:read` sparingly, since it can read every table in the state
@@ -486,6 +486,34 @@ minted from it), or a management token. Anyone else gets `PermissionDenied`
 cannot forge the autoscaler's status. `ScaleTask`'s `source = "autoscaler"`
 is honored on the same test ([autoscaling.md](autoscaling.md#access-control)).
 
+### App views and the viewer assertion
+
+An app's grant is the app's power, not its viewers'. A button on an app's
+panel is pressed by a viewer who may hold much less, so the manager
+authorizes every view and action **as the viewer** before the app is asked:
+`app:read` on the app, then the permission the view or action declares,
+checked on the job, task, or node it is shown for. Only then does it forward
+the request to the app, with a **viewer assertion**: a 60-second JWT signed
+with the workload-identity key, `aud = app:<name>`, naming the viewer, the
+permission checked, and the context. The app verifies it and acts only on
+that context, so a viewer can press a button only where they hold the
+permission the manifest declares for it; that the declaration fits what the
+action does is part of what an installer approves. Every action is recorded
+as an `app.action` event. [Apps: Views and actions](apps.md#views-and-actions) has the details.
+
+An app's **sandboxed page** is fetched the same way (`GetAppPage`: `app:read`
+on the app, then the page's declared permission, then a viewer assertion
+for the page), and then runs in the browser, in an opaque-origin iframe that
+holds no token. It reaches Legion only through the SPA, which makes each
+call **as the viewer** with the viewer's own token: only the RPCs the page's
+manifest lists, with every write confirmed by the viewer first. The SPA
+stamps those calls `legion-app-page: <app>/<page>`, and the manager refuses
+one whose RPC the page's current manifest does not list. That header narrows
+what a page may ask for; it never widens what the viewer may do, which the
+RPC's own ACL check decides as for any call. A page can still read what its
+viewer can read through its RPCs and send it elsewhere
+([Apps: What the sandbox does not stop](apps.md#what-the-sandbox-does-not-stop)).
+
 ### Tokens
 
 Tokens are opaque secrets (`lgn_…`), and the manager stores only a SHA-256
@@ -816,8 +844,9 @@ manager's private key never leaves the managers:
 
 - The listener is always mutual TLS with the node's certificate from the
   cluster CA.
-- `PostWork`, `GetTaskLogs`, `RestartWorker`, and `StopSessions` admit only a
-  caller that presents a manager certificate (`legion://manager/<id>`). `ExecTask` admits
+- `PostWork`, `GetTaskLogs`, `RestartWorker`, `StopSessions`, and
+  `ForwardAppRequest` admit only a caller that presents a manager certificate
+  (`legion://manager/<id>`). `ExecTask` admits
   a manager, or a holder of an exec ticket on a worker that opts in to
   [direct exec](exec-and-actions.md#direct-exec). `StartClaim` admits a holder
   of a valid boot ticket.

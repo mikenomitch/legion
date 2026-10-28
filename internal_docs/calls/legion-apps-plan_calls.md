@@ -5,8 +5,9 @@ Decisions made while designing
 ordered by project impact, highest first, and an entry's number is its
 rank.** Entries 1-17 are design-time calls. Implementation calls start at
 18 (phase A1, entries 18-28) and continue at 29 (phase A2, entries 29-41),
-42 (phase A3, entries 42-57), and 58 (phase A6a, strict fields, entries
-58-67), appended after the design calls, since none outranks them; each
+42 (phase A3, entries 42-57), 58 (phase A6a, strict fields, entries
+58-67), 68 (phase A4, UI tier 1, entries 68-79), and 80 (phase A5,
+sandboxed pages, entries 80-84), appended after the design calls, since none outranks them; each
 phase's entries are ranked among themselves.
 Autoscaler-specific calls are in
 [autoscaler-v2-plan_calls.md](autoscaler-v2-plan_calls.md).
@@ -1802,3 +1803,255 @@ status` and the reconcile event.
 was validated at install. An unknown key in it is a manifest bug or real
 version skew, and the build marker (calls entry 45) already keeps a new
 manifest from running on an older manager.
+
+## 68. Running an app action needs `app:read` plus the action's declared permission, not `app:write` (A4, deviates from plan §6.5 and entry 11)
+
+**Call.** `InvokeAppAction` is gated on `app:read` on the app, then the
+permission the action declares in the manifest, checked on the context it
+is pressed in (the job, task, or node).
+
+```nickel
+actions = [{ name = "pause", permission = { resource = "scale", action = "write" } }]
+```
+
+**Alternatives.** `app:write` on the app, plus the declared permission.
+
+**Trade-off.** The manifest's declaration alone decides who may press a
+button; an installer must read it, and the install prompt shows it.
+
+**Why (simplicity, least privilege).** `app:write` reconfigures, upgrades,
+or disables an app cluster-wide. Requiring it would push operators to hand
+that to everyone who should be able to press Pause.
+
+## 69. Views are authorized as the viewer and forwarded with a signed viewer assertion bound to the context (A4)
+
+**Call.** The manager checks `app:read` and the entry's declared
+permission as the viewer, then forwards with a 60-second ES256 JWT signed
+with the cluster's workload-identity key: `aud = app:<name>`, `jti`, and a
+`legion.io/viewer` claim naming the principal, the permission checked, its
+scope, the viewer's namespaces for `nav`/`overview`, the exact context, and
+for actions the SHA-256 of the inputs' canonical JSON. The app framework
+refuses a missing, expired, wrong-audience, foreign-key or claimless
+assertion (401) and a kind, name, context or inputs mismatch (403), and
+uses each action assertion once.
+
+**Alternatives.** A per-app HMAC secret; reserving `app:*` audiences on
+job identity tokens.
+
+**Trade-off.** Views need workload identity (on by default since the
+autoscaler's Phase 2) and an API socket to fetch the keys, so sandbox apps
+cannot serve views yet.
+
+**Why (security).** Jobs cannot set `legion.io/` claims, so a job identity
+token minted with audience `app:x` is still refused, and a captured action
+request cannot be replayed against the app's port.
+
+## 70. The forward is a narrow unary worker RPC, not a general proxy (A4)
+
+**Call.** `Worker.ForwardAppRequest` (manager caller class only) carries
+one HTTP/1.1 request to an allocation's declared port: `legion-system`
+jobs only, paths under `/legion/v1/`, three headers, a 256 KiB body, a
+1 MiB answer within 10 seconds, dialed the way ingress dials a task. The
+manager tries the next allocation (up to three, healthy first) only when
+the request never reached one, and never retries after it may have.
+
+**Alternatives.** Build the reverse-proxy plan's `ProxyTunnel` now.
+
+**Trade-off.** One more worker RPC, to fold into `ProxyTunnel` when that
+lands; a failure mid-exchange is not retried.
+
+**Why (security, simplicity).** The smallest surface that keeps the
+worker-plane-auth model, and no action can run twice.
+
+## 71. The manager validates every view, and the framework validates before sending (A4)
+
+**Call.** A view must match the closed `legion-view/1` block set; the
+manager refuses an answer outside it (unknown blocks or fields, raw HTML,
+non-http(s) links, images) with FailedPrecondition, even though the
+framework already checked it. Markdown is a CommonMark subset rendered as
+DOM nodes, never `innerHTML`; `<` followed by a letter, `/`, `!` or `?` is
+refused, so `a<b` and autolinks are refused too.
+
+**Alternatives.** Trust the framework's check.
+
+**Trade-off.** Validation runs twice, and some harmless text is refused.
+
+**Why (security).** Third-party apps need not use Legion's framework; the
+manager is the trust boundary for the SPA, the CLI, and MCP.
+
+## 72. Permission scopes depend on the slot (A4)
+
+**Call.** On `job` and `task` slots a namespaced permission is checked on
+that job; on `node` slots a `node` permission is checked on the node's
+pool (after a coarse check) and a namespaced one needs cluster-wide
+authority; on `nav` and `overview` any grant somewhere passes, and the
+assertion carries the viewer's matching namespaces for the app to filter.
+
+**Alternatives.** Require cluster-wide authority on `nav` and `overview`.
+
+**Trade-off.** An app must filter its sidebar and overview rows itself.
+
+**Why (ease).** Team-scoped viewers still get a useful sidebar page, with
+no extra RPC for the app.
+
+## 73. App errors never reach the caller as an auth error (A4)
+
+**Call.** The app's 401/403 become FailedPrecondition ("refused the viewer
+assertion"), 404 NotFound, other 4xx FailedPrecondition with the app's
+message, 5xx Unavailable.
+
+**Alternatives.** Pass the app's status through.
+
+**Trade-off.** A caller can't tell an app's refusal from other
+preconditions without reading the message.
+
+**Why (correctness).** A PermissionDenied would mislead the caller about
+their own access, which the manager already decided.
+
+## 74. The manifest's `ui` block is typed and strict at install (A4, deviates from A3's "stored as written")
+
+**Call.** Unknown `ui` fields are install errors, `ui.port` (default
+`api`) must be a port the app's job declares, and every action needs a
+`permission`. Confirmation placeholders are `{job}`, `{task}`, `{node}`,
+not the plan's `%{job}`, which Nickel interpolates.
+
+**Alternatives.** Store as written and fail at view time; `%%{job}`.
+
+**Trade-off.** A3's opaque storage of `ui` changes shape.
+
+**Why (ease).** Errors surface at install, where the author is.
+
+## 75. A task badge is a top-level `badge` in the view document (A4)
+
+**Call.** A `task` slot entry names a `badge` view that answers
+`{ badge = { text, tone } }` (or nothing); a task entry may also carry a
+panel `view`.
+
+**Alternatives.** A badge block in the block set.
+
+**Trade-off.** One special field outside the blocks.
+
+**Why (simplicity).** A badge is not drawable in a panel, and the block
+set stays the plan's eight.
+
+## 76. `app.action` events go on the app's job, and views are not audited (A4)
+
+**Call.** Every action, including a denied one (after `app:read` passes),
+is an `app.action` event on the app's job with the context in `meta`.
+Viewing is not recorded.
+
+**Alternatives.** Scope events to the context's job; audit views.
+
+**Trade-off.** A job's own event stream doesn't show actions pressed on
+its panel.
+
+**Why (consistency).** All app events live on the app's job.
+
+## 77. Views are polled at `ui.refresh`, never more often than every 5 seconds (A4)
+
+**Call.** Unset `refresh` means no polling.
+
+**Alternatives.** Streamed views.
+
+**Trade-off.** Panels lag by up to one refresh.
+
+**Why (simplicity).** Unary forwards only; streaming waits on the reverse
+proxy.
+
+## 78. No action command or MCP tool; `legion app test` deferred (A4)
+
+**Call.** `legion app view` and `legion_app_view` read views and list
+actions, but nothing outside the UI runs an action (`InvokeAppAction` is
+public). The plan's `legion app test` (checking that a third-party app
+refuses bad assertions) is not built.
+
+**Alternatives.** `legion app action`; an MCP write tool.
+
+**Trade-off.** Terminal users and agents can read but not press buttons.
+
+**Why (scope).** The plan names neither; the RPC is enough for scripts.
+
+## 79. An in-process forwarder seam carries the integration tests (A4)
+
+**Call.** The `AppForwarder` trait lets tests deliver to a framework-built
+fake app in process; the worker's lookup of a real allocation is covered
+by its NotFound case.
+
+**Alternatives.** A real-binary test with a runnable fake app.
+
+**Trade-off.** Less end-to-end coverage of `app_forward_target`.
+
+**Why (speed).** The scenarios run in seconds without a worker.
+
+## 80. Page-callable RPCs are a closed allowlist classified by effect (A5)
+
+**Call.** A sandboxed page may name only RPCs in `PAGE_RPCS`, each marked
+read or write by what it does (`RestoreInstance` is a write). Refused
+outright: RPCs that return credentials (`Login`, `CreateAclToken`,
+`CreateJoinToken`, `GetRaftJoinToken`, `MintExecTicket`, `CreateExecKey`,
+`IssueBootTicket`, `GetStateBackup`), break-glass, streaming, UI plumbing,
+and worker- or app-plane RPCs.
+
+**Alternatives.** Derive read/write from the ACL action or the method
+name.
+
+**Trade-off.** A new RPC is unavailable to pages until someone classifies
+it.
+
+**Why (security).** Safe by default.
+
+## 81. The manager re-checks a bridged call against the page's current manifest (A5)
+
+**Call.** The SPA stamps bridged calls with `legion-app-page: <app>/<page>`;
+a manager layer refuses a stamped call the page's current `rpcs` don't
+list, or whose app is disabled. The viewer's ACL still decides every call.
+
+**Alternatives.** Enforce the allowlist in the SPA alone.
+
+**Trade-off.** One store read per bridged call; the header is the SPA's
+own claim, so this is not an authorization boundary.
+
+**Why (defense in depth).** An SPA bug can't widen a page's reach, an
+upgrade that narrows `rpcs` applies to pages already open, and bridged
+calls appear in the manager's logs.
+
+## 82. Pages are a sibling RPC, live only in the sidebar, and confirm every action (A5)
+
+**Call.** `GetAppPage` fetches a page's single-file HTML (UTF-8, at most
+1 MiB) with the same authorization as a view and its own assertion kind.
+Pages appear as `nav` entries with an empty context; job, task, and node
+pages are deferred. `legion.action` therefore takes an explicit context,
+and every page action shows the SPA's confirmation.
+
+**Alternatives.** Extend `GetAppView`; pages in every slot.
+
+**Trade-off.** One more RPC to classify; read-only actions are confirmed
+too.
+
+**Why (simplicity, safety).** A page is HTML, not a view document, and the
+bridge can't see an action's declared effect.
+
+## 83. The bridge closes on the frame's second load (A5)
+
+**Call.** The SPA answers only messages whose `source` is the page's frame
+and whose origin is `"null"`, and only until the frame loads a second
+time; after that the bridge is closed for good. The CSP is the plan's,
+inserted after a leading doctype (standards mode).
+
+**Alternatives.** Keep the bridge open across navigations.
+
+**Trade-off.** A page that reloads itself loses the bridge.
+
+**Why (security).** Content the frame navigates to never gets answers.
+
+## 84. No MCP tool for pages, and the smoke tests stay out of CI (A5)
+
+**Call.** Agents get views (`legion_app_view`), not pages. The Playwright
+smoke tests (`npm run test:smoke`, 52 checks) are committed but not run in
+CI, and Playwright is not a UI dependency.
+
+**Alternatives.** Install a browser in CI.
+
+**Trade-off.** UI regressions are caught only when someone runs them.
+
+**Why (cost).** CI has no browser, and an agent can't run HTML anyway.

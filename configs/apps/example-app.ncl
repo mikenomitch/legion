@@ -44,8 +44,9 @@
       ],
       config = { command = ["./legion-gitops"] },
       resources = { cpu = 200, memory = 128 },
-      # The app's HTTP port: health now, UI views later. Not a catalog
-      # service.
+      # The app's HTTP port: health, and the views and actions below
+      # (`ui.port`). Not a catalog service: the worker delivers the
+      # manager's requests to it locally.
       network = { ports = [{ name = "api" }] },
       checks = [
         {
@@ -72,22 +73,56 @@
     { resources = ["kv"], actions = ["read", "write"], paths = ["legion/apps/gitops/*"] },
   ],
 
-  # UI registrations (apps plan §6.5). Stored and listed by `legion app list`
-  # (UI column); rendered by a later release.
+  # UI registrations (docs/apps.md, "Views and actions"). The SPA draws the
+  # app's declarative views (legion-view/1 JSON) in these slots, and
+  # `legion app view gitops job web` prints them. The manager checks each
+  # entry's `permission` as the viewer, on the job, task, or node in context,
+  # before it asks the app anything; a viewer without it sees nothing.
   ui = {
+    # The port label the app serves views and actions on (default "api").
     port = "api",
-    nav = [{ title = "GitOps", view = "repos" }],
+    # A page in the sidebar's Apps section. No context: views only.
+    nav = [{ title = "GitOps", icon = "gitBranch", view = "repos" }],
+    # A card on the cluster overview.
+    overview = [{ title = "GitOps sync", view = "summary" }],
+    # A panel on job pages, for viewers holding job:read on that job.
     job = [
       { title = "Sync", view = "job-sync", permission = { resource = "job", action = "read" } },
     ],
+    # A badge on task rows (the `badge` view answers `{ badge = { text } }`).
+    task = [{ badge = "task-source", permission = { resource = "job", action = "read" } }],
+    # Buttons a view's `actions` block can show. Pressed on a job, task, or
+    # node (never in nav or overview), checked as the viewer, audited as
+    # `app.action`, and confirmed first when the permission is a write.
     actions = [
       {
         name = "sync-now",
         title = "Sync now",
+        confirm = "Sync {job} from its repository now?",
+        # Typed inputs: string, number, duration, enum (with `values`),
+        # boolean. They can never name another target.
+        inputs = { mode = { type = "enum", values = ["apply", "dry-run"], default = "apply" } },
         permission = { resource = "job", action = "write" },
       },
     ],
+    # How often the SPA re-fetches the views (at least 5s).
     refresh = "10s",
+    # Sandboxed pages, for UIs the view blocks cannot draw: single-file HTML
+    # the app serves (at `bundle`, default /legion/v1/pages/<name>), mounted
+    # by the SPA in an opaque-origin iframe with a strict CSP, in the
+    # sidebar. `rpcs` is what the page may call as its viewer through the
+    # bridge; writes (RunJob here) are confirmed by the viewer every time.
+    # A page can read whatever its viewer can through these RPCs, so the
+    # install prompt lists them (docs/apps.md, "Sandboxed pages").
+    pages = [
+      {
+        name = "console",
+        title = "GitOps console",
+        icon = "gitBranch",
+        rpcs = ["ListJobs", "GetJobInfo", "RunJob"],
+        permission = { resource = "job", action = "read" },
+      },
+    ],
   },
 
   # Jobspec keys the app adds (apps plan §6.6). Stored; resolved by a later

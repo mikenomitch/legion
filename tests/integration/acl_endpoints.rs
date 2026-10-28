@@ -289,6 +289,12 @@ fn endpoint_table() -> Vec<(&'static str, Plane)> {
         ("SetAppEnabled", Plane::Protected("app:write")),
         ("UpdateAppSettings", Plane::Protected("app:write")),
         ("SetAppConfig", Plane::Protected("app:write")),
+        // App views and actions: `app:read`, then the entry's or action's
+        // declared permission as the caller on the context.
+        ("ListUiExtensions", Plane::Protected("app:read")),
+        ("GetAppView", Plane::Protected("app:read")),
+        ("InvokeAppAction", Plane::Protected("app:read")),
+        ("GetAppPage", Plane::Protected("app:read")),
     ]
 }
 
@@ -1879,6 +1885,52 @@ async fn call_endpoint(
                     name: FIXTURE_APP.into(),
                     config_json: "{}".into(),
                     idempotency_key: None,
+                },
+                token,
+            ))
+            .await
+            .map(|_| ()),
+        "ListUiExtensions" => svc
+            .list_ui_extensions(req(ListUiExtensionsRequest::default(), token))
+            .await
+            .map(|_| ()),
+        "GetAppView" => svc
+            .get_app_view(req(
+                GetAppViewRequest {
+                    app: FIXTURE_APP.into(),
+                    view: String::new(),
+                    context: Some(AppViewContext {
+                        slot: "job".into(),
+                        job: JOB_NAME.into(),
+                        ..Default::default()
+                    }),
+                },
+                token,
+            ))
+            .await
+            .map(|_| ()),
+        "InvokeAppAction" => svc
+            .invoke_app_action(req(
+                InvokeAppActionRequest {
+                    app: FIXTURE_APP.into(),
+                    action: "go".into(),
+                    context: Some(AppViewContext {
+                        slot: "job".into(),
+                        job: JOB_NAME.into(),
+                        ..Default::default()
+                    }),
+                    inputs_json: String::new(),
+                    idempotency_key: None,
+                },
+                token,
+            ))
+            .await
+            .map(|_| ()),
+        "GetAppPage" => svc
+            .get_app_page(req(
+                GetAppPageRequest {
+                    app: FIXTURE_APP.into(),
+                    page: "console".into(),
                 },
                 token,
             ))

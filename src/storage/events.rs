@@ -1686,6 +1686,48 @@ pub mod drafts {
         .meta(json!({ "app": name, "error": error, "refused": refused }))
     }
 
+    /// `app.action` — someone pressed an app's action (docs/apps.md, "Views
+    /// and actions"): who, which action, where (the context), and the
+    /// outcome: `ok`, `failed` (the app or the forward failed), or `denied`
+    /// (the caller lacks the action's permission there; the app saw no
+    /// request). Scoped to the app's job, like every app event; the
+    /// context's job is in `meta.context`.
+    pub fn app_action(
+        name: &str,
+        action: &str,
+        by: &str,
+        context: &crate::structs::app_ui::ViewContext,
+        outcome: &str,
+        detail: &str,
+    ) -> EventDraft {
+        let target = match (context.job_id(), context.node.as_str()) {
+            (Some(job), _) if !context.task.is_empty() => format!("{job} task {}", context.task),
+            (Some(job), _) => job,
+            (None, node) if !node.is_empty() => format!("node {node}"),
+            _ => context.slot.clone(),
+        };
+        let message = if detail.is_empty() {
+            format!("App {name}: {by} ran {action} on {target}: {outcome}")
+        } else {
+            format!("App {name}: {by} ran {action} on {target}: {outcome} ({detail})")
+        };
+        let draft = if outcome == "ok" {
+            EventDraft::info("app.action", message)
+        } else {
+            EventDraft::warn("app.action", message)
+        };
+        draft
+            .job(&crate::structs::app::app_job_id(name))
+            .meta(json!({
+                "app": name,
+                "action": action,
+                "by": by,
+                "context": context,
+                "outcome": outcome,
+                "detail": detail,
+            }))
+    }
+
     /// A namespace was deleted.
     pub fn namespace_deleted(name: &str) -> EventDraft {
         EventDraft::info("namespace.deleted", format!("Namespace {name} deleted"))
@@ -2946,6 +2988,20 @@ impl EventRecorder<'_> {
 
     pub fn app_reconcile_failed(self, name: &str, error: &str, refused: bool) {
         self.emit(drafts::app_reconcile_failed(name, error, refused));
+    }
+
+    pub fn app_action(
+        self,
+        name: &str,
+        action: &str,
+        by: &str,
+        context: &crate::structs::app_ui::ViewContext,
+        outcome: &str,
+        detail: &str,
+    ) {
+        self.emit(drafts::app_action(
+            name, action, by, context, outcome, detail,
+        ));
     }
 
     pub fn volume_mounted(self, volume: &crate::structs::Volume, node_id: &str, path: &str) {

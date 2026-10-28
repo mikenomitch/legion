@@ -2593,6 +2593,144 @@ service Manager {
   //   the app's grant.
   rpc SetAppConfig (SetAppConfigRequest) returns (SetAppConfigReply);
 
+  // Lists the UI extensions installed apps register (docs/apps.md, "Views
+  // and actions"; docs/ui-architecture.md, "App extensions"): the pages,
+  // overview cards, job and node panels, and task badges the SPA draws from
+  // apps' declarative views, and the apps' sandboxed pages (`ui.pages`,
+  // listed in the `nav` slot with `page` set). Requires `app:read`; the
+  // list is filtered to the apps the caller may read (`names` selector),
+  // and to enabled apps.
+  //
+  // Each entry the manifest declares with a `permission` is filtered by it,
+  // checked as the caller:
+  // - with `context` set, on that context's scope (the job's namespace and
+  //   name for `job` and `task` slots; the node's pool for `node`), exactly
+  //   as GetAppView will check it, so the SPA shows a panel only to viewers
+  //   who may see it;
+  // - without `context`, on any scope ("does the caller hold it
+  //   anywhere?"), which is what the sidebar and overview need at login.
+  //   A sandboxed page's permission is always checked this way, as
+  //   GetAppPage checks it.
+  //
+  // An entry without a permission needs only `app:read` on its app.
+  //
+  // Nothing is forwarded to any app: this answers from the installed
+  // manifests alone.
+  //
+  // Errors:
+  // - InvalidArgument: an unknown `slot`, or a `context` whose slot is not
+  //   `slot` or that does not fit its slot (see AppViewContext).
+  rpc ListUiExtensions (ListUiExtensionsRequest) returns (ListUiExtensionsReply);
+
+  // Renders one of an app's declarative views (`legion app view`, the
+  // `legion_app_view` MCP tool, and every app panel in the SPA). The one
+  // data path for all three (apps plan §6.5).
+  //
+  // The manager authorizes before anything reaches the app:
+  // 1. `app:read` on the app;
+  // 2. the view must be registered in the context's slot;
+  // 3. the entry's declared `permission`, checked as the caller on the
+  //    context's scope (on any scope for `nav` and `overview`). A caller
+  //    without it is refused here, and the app sees no request at all.
+  //
+  // Only then does it forward `GET /legion/v1/views/<view>?<context>` to
+  // one running allocation of the app's job, over the worker plane
+  // (`Worker.ForwardAppRequest`), to the port the manifest's `ui.port`
+  // names. The request carries a **viewer assertion** in the
+  // `Legion-Viewer` header: a JWT signed with the cluster's
+  // workload-identity key, `aud = app:<name>`, living 60 seconds, whose
+  // `legion.io/viewer` claim names the caller (principal, accessor id), the
+  // permission checked and where, and the context exactly as the query
+  // carries it. Apps must refuse a request whose assertion is missing,
+  // expired, for another audience, or for another context; the app
+  // framework does (docs/apps.md, "The viewer assertion").
+  //
+  // The answer is validated against the view schema (`legion-view/1`: the
+  // closed block set, no unknown fields, no raw HTML, links only to
+  // `http(s)` or in-app routes) before it is returned. A view may answer
+  // `{ "hidden": true }`: nothing to show for this context.
+  //
+  // Errors:
+  // - InvalidArgument: a context that does not fit its slot.
+  // - PermissionDenied: the caller lacks `app:read` or the entry's
+  //   permission on the context.
+  // - NotFound: no such app, or the app registers no such view in that
+  //   slot (or the app answered 404 for it).
+  // - FailedPrecondition: the app is disabled; workload identity is off on
+  //   this manager (`workloadIdentity.enabled`), so no assertion can be
+  //   signed; or the app answered with a view that fails the schema, or
+  //   refused the assertion (the message names which).
+  // - Unavailable: no allocation of the app's job is running, or its node
+  //   or port cannot be reached (retryable).
+  // - DeadlineExceeded: the app did not answer within 10 seconds.
+  rpc GetAppView (GetAppViewRequest) returns (GetAppViewReply);
+
+  // Invokes an action an app declares (`ui.actions`), the button in a
+  // view's `actions` block. Mutating, retry-safe with `idempotency_key`,
+  // and audited: every invocation that passes `app:read` records an
+  // `app.action` event (app, action, caller, context, outcome `ok`,
+  // `failed`, or `denied`).
+  //
+  // Authorization, before anything reaches the app:
+  // 1. `app:read` on the app;
+  // 2. the action must be declared, and the context must have a scope
+  //    (`job`, `task`, or `node`): actions are never pressed on the
+  //    sidebar or the overview;
+  // 3. the action's declared `permission` (required on every action),
+  //    checked as the caller on the context's scope. `app:write` is not
+  //    needed: the declared permission is what the button may do, and
+  //    `app:write` would let every operator who presses it reconfigure the
+  //    app.
+  //
+  // `inputs_json` is checked against the action's typed inputs (string,
+  // number, duration, enum, boolean); unknown inputs are refused and
+  // defaults filled in. The manager then forwards `POST
+  // /legion/v1/actions/<action>` with `{ "context": {...}, "inputs":
+  // {...} }` and a viewer assertion that also carries the SHA-256 of the
+  // inputs' canonical JSON, so an app acts only on the context and inputs
+  // the manager authorized.
+  //
+  // The app answers `{ "message": "...", "view": {...} }`; `view`, when
+  // present, is a refreshed view, validated like GetAppView's.
+  //
+  // Errors: as GetAppView, plus InvalidArgument for inputs that fail their
+  // declaration, and FailedPrecondition carrying the app's own message when
+  // the app reports the action failed (HTTP 4xx other than 401, 403, 404).
+  rpc InvokeAppAction (InvokeAppActionRequest) returns (InvokeAppActionReply);
+
+  // Fetches one of an app's sandboxed pages (`ui.pages`; docs/apps.md,
+  // "Sandboxed pages"; apps plan §6.5, tier 2): the single-file HTML bundle
+  // the SPA mounts in an `<iframe sandbox="allow-scripts" srcdoc=...>`
+  // under a strict Content-Security-Policy, and the Manager RPCs the page
+  // may call through the SPA's bridge as the viewer.
+  //
+  // Authorized exactly like GetAppView, before anything reaches the app:
+  // 1. `app:read` on the app;
+  // 2. the page must be declared in the app's manifest;
+  // 3. the page's declared `permission`, if any, checked as the caller on
+  //    any scope (pages live in the sidebar, like a `nav` view).
+  //
+  // Only then does the manager forward `GET <bundle>` (default
+  // `/legion/v1/pages/<page>`) to one running allocation of the app's job,
+  // with a viewer assertion whose `legion.io/viewer` claim has `kind =
+  // "page"`, the page's name, and the `nav` slot's empty context. The answer
+  // must be `200` with a `text/html` content type, UTF-8, and at most 1 MiB;
+  // the manager does not sanitize it (a page is code, confined by the SPA's
+  // sandbox and CSP, not by the manager).
+  //
+  // Errors:
+  // - PermissionDenied: the caller lacks `app:read` or the page's
+  //   permission.
+  // - NotFound: no such app, or the app declares no such page (or answered
+  //   404 for it).
+  // - FailedPrecondition: the app is disabled; workload identity is off on
+  //   this manager; the app refused the viewer assertion; or the answer is
+  //   not UTF-8 HTML within 1 MiB (the message names which).
+  // - Unavailable: no allocation of the app's job is running, or its node
+  //   or port cannot be reached (retryable).
+  // - DeadlineExceeded: the app did not answer within 10 seconds.
+  rpc GetAppPage (GetAppPageRequest) returns (GetAppPageReply);
+
   // Lists the auth methods clients may log in with.
   //
   // Open endpoint: login UIs need this before any credential exists. Only
@@ -12096,6 +12234,36 @@ service Worker {
   // check above, with the check named.
   rpc ExecTask (stream ExecClientFrame) returns (stream ExecServerFrame);
 
+  // Delivers one HTTP request to an app allocation's UI port and returns
+  // the answer: the unary subset of a worker-plane tunnel that app views
+  // and actions need (docs/apps.md, "Views and actions";
+  // Manager.GetAppView). Caller class: manager. The manager has already
+  // authorized the viewer and put a signed viewer assertion in the
+  // request's `legion-viewer` header; the worker adds nothing and checks
+  // nothing about the viewer.
+  //
+  // What the worker does check, so this is not a general proxy:
+  // - the allocation runs on this node, now, and its job is the request's
+  //   `job_id`, in the reserved `legion-system` namespace (apps only);
+  // - the allocation declares the port label `port`;
+  // - the method is GET or POST, the path starts with `/legion/v1/`, only
+  //   the `legion-viewer`, `content-type`, and `accept` headers pass, and
+  //   the body is at most 256 KiB.
+  //
+  // It then dials the port the way the ingress datapath does (loopback,
+  // inside the task's network namespace when it is gated; a sandbox guest
+  // over vsock or its bridge address), never a caller-named address, sends
+  // one HTTP/1.1 request, and reads at most 1 MiB of answer within 10
+  // seconds.
+  //
+  // Errors: Unauthenticated without a manager certificate; InvalidArgument
+  // for a request outside the limits above; NotFound when the allocation
+  // does not run here or runs another job; FailedPrecondition when the job
+  // is not an app's or the port is not declared; Unavailable when the port
+  // cannot be dialed; DeadlineExceeded when the app does not answer in
+  // time.
+  rpc ForwardAppRequest (ForwardAppRequestRequest) returns (ForwardAppRequestReply);
+
   // Starts work on this node from a boot ticket, without any call to a
   // manager on the critical path (docs/edge-boot.md). Caller class: ticket.
   //
@@ -12878,6 +13046,44 @@ message JobActionParam {
 // Reply payload for ListJobActions.
 message ListJobActionsReply {
   repeated JobAction actions = 1;
+}
+
+// One HTTP header of a forwarded app request or answer.
+message AppHttpHeader {
+  // The header's name, lowercase.
+  string name = 1;
+  // Its value.
+  string value = 2;
+}
+
+// Request payload for Worker.ForwardAppRequest.
+message ForwardAppRequestRequest {
+  // The app allocation to deliver to (the manager's id).
+  int64 allocation_id = 1;
+  // The job the manager expects it to run (`legion-system/<app>`); the
+  // worker refuses an allocation running anything else.
+  string job_id = 2;
+  // The port label (`network.ports[].name`) to deliver to: the manifest's
+  // `ui.port`.
+  string port = 3;
+  // `GET` or `POST`.
+  string method = 4;
+  // The path and query, starting `/legion/v1/`.
+  string path = 5;
+  // Headers: `legion-viewer`, `content-type`, `accept`; others are dropped.
+  repeated AppHttpHeader headers = 6;
+  // The body (POST), at most 256 KiB.
+  bytes body = 7;
+}
+
+// Response payload for Worker.ForwardAppRequest.
+message ForwardAppRequestReply {
+  // The app's HTTP status.
+  uint32 status = 1;
+  // Its `content-type`.
+  string content_type = 2;
+  // Its body, at most 1 MiB.
+  bytes body = 3;
 }
 
 // Selects which captured stream(s) to read for a task.
@@ -14111,6 +14317,218 @@ message SetAppConfigReply {
 
   // True when `idempotency_key` matched an earlier call.
   bool deduplicated = 4;
+}
+
+// === APP UI EXTENSIONS (docs/apps.md, "Views and actions") ===
+
+// Where an app view or action is shown, and what it is about. The manager
+// checks a declared permission on this context, and the viewer assertion
+// carries it to the app exactly as the request does. Which fields a slot
+// takes:
+// - `nav`, `overview`: none;
+// - `job`: `namespace` (default `default`) and `job`;
+// - `task`: `namespace`, `job`, `task`, and `group` when the task has one;
+// - `node`: `node`.
+//
+// Any other field set for the slot is InvalidArgument.
+message AppViewContext {
+  // `nav`, `overview`, `job`, `task`, or `node`.
+  string slot = 1;
+  // The job's namespace (`job` and `task`).
+  string namespace = 2;
+  // The job's bare name, or its canonical id `namespace/name` (split into
+  // `namespace` and `job` on the way in).
+  string job = 3;
+  // The task's group (`task`, optional).
+  string group = 4;
+  // The task's name (`task`).
+  string task = 5;
+  // The node's id (`node`).
+  string node = 6;
+}
+
+// A permission a UI extension or action declares: an ACL resource and
+// action, checked as the viewer.
+message UiPermission {
+  // An ACL resource: `job`, `scale`, `node`, ...
+  string resource = 1;
+  // `read` or `write`.
+  string action = 2;
+}
+
+// One UI registration the caller may see.
+message UiExtension {
+  // The app that registers it.
+  string app = 1;
+  // `nav`, `overview`, `job`, `task`, or `node`.
+  string slot = 2;
+  // The page's, card's, or panel's title (the sidebar label for `nav`).
+  // Empty for a task entry that only shows a badge.
+  string title = 3;
+  // The sidebar icon name (`nav`); the SPA uses a default for one it does
+  // not know.
+  string icon = 4;
+  // The view to fetch with GetAppView. Empty for a task entry that only
+  // shows a badge.
+  string view = 5;
+  // For `task`: the view whose `badge` the task row shows.
+  string badge = 6;
+  // The permission the entry declares, when it declares one.
+  UiPermission permission = 7;
+  // How often the SPA re-fetches the app's views, in seconds (the
+  // manifest's `ui.refresh`); 0 means on page load and on demand only.
+  uint32 refresh_seconds = 8;
+  // The app's one-line description.
+  string app_description = 9;
+  // For `nav`: the sandboxed page this entry opens (`ui.pages[].name`),
+  // fetched with GetAppPage; `view` is then empty. The SPA routes it to
+  // `/apps/<app>/pages/<page>`.
+  string page = 10;
+}
+
+// Request payload for ListUiExtensions.
+message ListUiExtensionsRequest {
+  // Only this slot's entries; empty for every slot.
+  string slot = 1;
+  // When set, entries are filtered by their permission on this context;
+  // `context.slot` must equal `slot`.
+  AppViewContext context = 2;
+  // Only this app's entries; empty for every app.
+  string app = 3;
+}
+
+// Response payload for ListUiExtensions.
+message ListUiExtensionsReply {
+  // The entries, by app name, then slot, then declaration order.
+  repeated UiExtension extensions = 1;
+}
+
+// Request payload for GetAppView.
+message GetAppViewRequest {
+  // The app's name.
+  string app = 1;
+  // The view's name. Empty picks the first entry the caller may see in the
+  // context's slot (its view, or a task entry's badge view).
+  string view = 2;
+  // Where the view is shown. Required (its `slot` at least).
+  AppViewContext context = 3;
+}
+
+// An action a view's `actions` block offers: its declaration, and whether
+// the caller may invoke it on this context.
+message AppActionInfo {
+  // The action's name, for InvokeAppAction.
+  string name = 1;
+  // Its title, the default button label.
+  string title = 2;
+  // The confirmation to show, with `{job}` and the other context
+  // placeholders filled in. Empty when none is needed: a `write` action
+  // always has one (its own, or "<title>?").
+  string confirm = 3;
+  // The declared inputs, as a JSON object keyed by input name:
+  // `{ "for": { "type": "duration", "default": "1h" } }`. Types are
+  // `string`, `number`, `duration`, `enum` (with `values`), and `boolean`.
+  string inputs_json = 4;
+  // The permission InvokeAppAction checks as the caller.
+  UiPermission permission = 5;
+  // Whether the caller holds it on this context. The SPA disables the
+  // button otherwise; the check runs again on invocation.
+  bool allowed = 6;
+  // Whether the action is a `write`.
+  bool mutating = 7;
+}
+
+// Response payload for GetAppView.
+message GetAppViewReply {
+  // The app's name.
+  string app = 1;
+  // The view that was rendered.
+  string view = 2;
+  // The context, normalized (namespace filled in, `ns/job` split).
+  AppViewContext context = 3;
+  // The view document, validated, as JSON: `{ "view": "legion-view/1",
+  // "title"?, "badge"?, "hidden"?, "blocks": [...] }` (docs/apps.md, "The
+  // view schema").
+  string view_json = 4;
+  // The entry's title; the document's own `title` overrides it.
+  string title = 5;
+  // The actions the document's `actions` blocks reference.
+  repeated AppActionInfo actions = 6;
+  // The app's `ui.refresh`, in seconds; 0 for none.
+  uint32 refresh_seconds = 7;
+  // The allocation that answered.
+  int64 allocation_id = 8;
+  // The node it runs on.
+  string node_id = 9;
+}
+
+// Request payload for InvokeAppAction.
+message InvokeAppActionRequest {
+  // The app's name.
+  string app = 1;
+  // The action's name (`ui.actions[].name`).
+  string action = 2;
+  // Where it was pressed: a `job`, `task`, or `node` context.
+  AppViewContext context = 3;
+  // The inputs, as a JSON object; empty or `{}` for the defaults.
+  string inputs_json = 4;
+  // Optional client key for retry-safe submission: a repeated key from the
+  // same caller with the same arguments returns the first successful
+  // reply with `deduplicated` set, and the app sees one request.
+  optional string idempotency_key = 5;
+}
+
+// Response payload for InvokeAppAction.
+message InvokeAppActionReply {
+  // What the app says happened.
+  string message = 1;
+  // A refreshed view the app returned, validated, as JSON; empty when it
+  // returned none.
+  string view_json = 2;
+  // True when `idempotency_key` matched an earlier call.
+  bool deduplicated = 3;
+  // The inputs the action ran with, defaults filled in, as JSON.
+  string inputs_json = 4;
+}
+
+// Request payload for GetAppPage.
+message GetAppPageRequest {
+  // The app's name.
+  string app = 1;
+  // The page's name (`ui.pages[].name`).
+  string page = 2;
+}
+
+// A Manager RPC a sandboxed page may call through the SPA's bridge.
+message AppPageRpc {
+  // The RPC's name, as `proto/legion.proto` spells it (`GetJobInfo`).
+  string method = 1;
+  // Whether the call changes something. The SPA asks the viewer before
+  // every such call, naming the app, the RPC, and its target; reads run
+  // without asking. Classified by what the call does, not by its ACL action.
+  bool mutating = 2;
+}
+
+// Response payload for GetAppPage.
+message GetAppPageReply {
+  // The app's name.
+  string app = 1;
+  // The page's name.
+  string page = 2;
+  // The page's title (`ui.pages[].title`).
+  string title = 3;
+  // The page's single-file HTML bundle, as the app served it (UTF-8, at
+  // most 1 MiB). The SPA prepends its Content-Security-Policy and the
+  // bridge's script, and mounts it in a sandboxed `srcdoc` iframe.
+  string html = 4;
+  // The RPCs the page may call through the bridge (`ui.pages[].rpcs`), as
+  // the viewer. Every bridged call carries the `legion-app-page: <app>/<page>`
+  // header, and the manager refuses one whose RPC is not on this list.
+  repeated AppPageRpc rpcs = 5;
+  // The allocation that answered.
+  int64 allocation_id = 6;
+  // The node it runs on.
+  string node_id = 7;
 }
 
 // === AUTH METHODS & JOIN TOKENS ===
