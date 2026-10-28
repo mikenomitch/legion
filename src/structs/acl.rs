@@ -150,6 +150,29 @@ impl AclResource {
     pub fn is_namespaced(&self) -> bool {
         Self::namespaced().contains(&self.as_str())
     }
+
+    /// The resource a rule names (`job`, `scale`, ...), if it is one.
+    pub fn parse(name: &str) -> Option<AclResource> {
+        [
+            AclResource::Job,
+            AclResource::Node,
+            AclResource::Kv,
+            AclResource::State,
+            AclResource::Operator,
+            AclResource::Acl,
+            AclResource::Exec,
+            AclResource::Action,
+            AclResource::Template,
+            AclResource::Scale,
+            AclResource::Boot,
+            AclResource::Net,
+            AclResource::Snapshot,
+            AclResource::Namespace,
+            AclResource::App,
+        ]
+        .into_iter()
+        .find(|resource| resource.as_str() == name)
+    }
 }
 
 /// Actions ACL rules can grant. `write` does not imply `read`.
@@ -164,6 +187,15 @@ impl AclAction {
         match self {
             AclAction::Read => "read",
             AclAction::Write => "write",
+        }
+    }
+
+    /// `read` or `write`.
+    pub fn parse(name: &str) -> Option<AclAction> {
+        match name {
+            "read" => Some(AclAction::Read),
+            "write" => Some(AclAction::Write),
+            _ => None,
         }
     }
 }
